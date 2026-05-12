@@ -37,6 +37,7 @@ pub struct WalletsHandler {
     pub chains: ChainRegistry,
     pub tx_engine: TxEngine,
     pub address_book: Arc<AddressBook>,
+    pub mempool_indexes: Arc<std::collections::BTreeMap<String, Arc<beth_mempool::PendingTxIndex>>>,
 }
 
 impl WalletsHandler {
@@ -51,7 +52,16 @@ impl WalletsHandler {
             chains,
             tx_engine,
             address_book: Arc::new(address_book),
+            mempool_indexes: Arc::new(std::collections::BTreeMap::new()),
         }
+    }
+
+    pub fn with_mempool_indexes(
+        mut self,
+        indexes: std::collections::BTreeMap<String, Arc<beth_mempool::PendingTxIndex>>,
+    ) -> Self {
+        self.mempool_indexes = Arc::new(indexes);
+        self
     }
 
     fn wallet_dir_entries() -> Vec<Entry> {
@@ -304,6 +314,9 @@ impl WalletsHandler {
             [s] if s == "balance" || s == "balance.eth" || s == "balance.raw" || s == "nonce" => {
                 Ok(Entry::file(s))
             }
+            [s] if s == "pending_external.jsonl" || s == "nonce_conflicts.json" => {
+                Ok(Entry::file(s))
+            }
             [s] if s == "outbox" => Ok(Entry::dir("outbox")),
             [s, ..] if s == "outbox" => self.lookup_outbox(_wallet, chain, &rest[1..]).await,
             _ => Err(HandlerError::not_found(rest.join("/"))),
@@ -395,6 +408,34 @@ impl WalletsHandler {
                 let bytes = std::fs::read(&path).map_err(HandlerError::Io)?;
                 Ok(bytes)
             }
+            [s] if s == "pending_external.jsonl" => {
+                // v1: best-effort; outbox cross-ref lands in Phase 3.
+                let idx = match self.mempool_indexes.get(chain) {
+                    Some(i) => i,
+                    None => return Ok(Vec::new()),
+                };
+                let mut out = Vec::new();
+                for tx in idx
+                    .snapshot()
+                    .into_iter()
+                    .filter(|t| t.from == info.address)
+                {
+                    serde_json::to_writer(&mut out, &tx).map_err(err_be)?;
+                    out.push(b'\n');
+                }
+                Ok(out)
+            }
+            [s] if s == "nonce_conflicts.json" => {
+                let observed = match self.mempool_indexes.get(chain) {
+                    Some(i) => i.observed_nonces(info.address),
+                    None => Vec::new(),
+                };
+                let body = serde_json::json!({
+                    "address": beth_proto::checksum_address(&info.address),
+                    "observed_nonces": observed,
+                });
+                serde_json::to_vec_pretty(&body).map_err(err_be)
+            }
             _ => Err(HandlerError::NotAFile(rest.join("/"))),
         }
     }
@@ -416,6 +457,8 @@ impl WalletsHandler {
                 Entry::file("balance.eth"),
                 Entry::file("balance.raw"),
                 Entry::file("nonce"),
+                Entry::file("pending_external.jsonl"),
+                Entry::file("nonce_conflicts.json"),
                 Entry::dir("outbox"),
             ]),
             [s] if s == "outbox" => Ok(Self::outbox_dir_entries()),
@@ -1173,5 +1216,111 @@ mod tests {
         let entries = f.handler.list(&p).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"0001-21699"), "names={names:?}");
+    }
+
+    #[tokio::test]
+    async fn pending_external_includes_index_txs_for_wallet_address() {
+        let f = make_handler_with_chain(true);
+        use alloy::primitives::{B256, Bytes, U256};
+        use beth_mempool::{PendingTx, PendingTxIndex, TxFees};
+
+        let idx = PendingTxIndex::new(8);
+        let mut other = [0u8; 20];
+        other[0] = 9;
+        let other_addr = Address::from(other);
+
+        let mut h1 = [0u8; 32];
+        h1[0] = 1;
+        idx.insert(PendingTx {
+            hash: B256::from(h1),
+            from: f.wallet_addr,
+            to: None,
+            nonce: 0,
+            value: U256::ZERO,
+            gas_limit: 21_000,
+            fees: TxFees::Legacy { gas_price: 1 },
+            input: Bytes::new(),
+            observed_at: std::time::SystemTime::now(),
+        });
+        let mut h2 = [0u8; 32];
+        h2[0] = 2;
+        idx.insert(PendingTx {
+            hash: B256::from(h2),
+            from: other_addr,
+            to: None,
+            nonce: 0,
+            value: U256::ZERO,
+            gas_limit: 21_000,
+            fees: TxFees::Legacy { gas_price: 1 },
+            input: Bytes::new(),
+            observed_at: std::time::SystemTime::now(),
+        });
+
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("anvil".to_string(), idx);
+        let handler = f.handler.clone().with_mempool_indexes(map);
+
+        let p = VfsPath::parse(&format!(
+            "/{}/chains/anvil/pending_external.jsonl",
+            f.wallet_name
+        ))
+        .unwrap();
+        let body = handler.read(&p).await.unwrap();
+        let lines: Vec<&[u8]> = body
+            .split(|c| *c == b'\n')
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(lines.len(), 1, "only the wallet's own tx should appear");
+    }
+
+    #[tokio::test]
+    async fn nonce_conflicts_reports_observed_nonces_for_wallet_address() {
+        let f = make_handler_with_chain(true);
+        use alloy::primitives::{B256, Bytes, U256};
+        use beth_mempool::{PendingTx, PendingTxIndex, TxFees};
+
+        let idx = PendingTxIndex::new(8);
+        for (hash_b, nonce) in [(1u8, 3u64), (2u8, 5u64)] {
+            let mut h = [0u8; 32];
+            h[0] = hash_b;
+            idx.insert(PendingTx {
+                hash: B256::from(h),
+                from: f.wallet_addr,
+                to: None,
+                nonce,
+                value: U256::ZERO,
+                gas_limit: 21_000,
+                fees: TxFees::Legacy { gas_price: 1 },
+                input: Bytes::new(),
+                observed_at: std::time::SystemTime::now(),
+            });
+        }
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("anvil".to_string(), idx);
+        let handler = f.handler.clone().with_mempool_indexes(map);
+
+        let p = VfsPath::parse(&format!(
+            "/{}/chains/anvil/nonce_conflicts.json",
+            f.wallet_name
+        ))
+        .unwrap();
+        let body = handler.read(&p).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["observed_nonces"], serde_json::json!([3, 5]));
+        // checksum address is non-empty hex
+        assert!(v["address"].as_str().unwrap().starts_with("0x"));
+    }
+
+    #[tokio::test]
+    async fn pending_external_returns_empty_when_no_index_for_chain() {
+        let f = make_handler_with_chain(true);
+        // Don't install any mempool index.
+        let p = VfsPath::parse(&format!(
+            "/{}/chains/anvil/pending_external.jsonl",
+            f.wallet_name
+        ))
+        .unwrap();
+        let body = f.handler.read(&p).await.unwrap();
+        assert!(body.is_empty());
     }
 }

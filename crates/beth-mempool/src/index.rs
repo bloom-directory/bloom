@@ -114,6 +114,18 @@ impl PendingTxIndex {
             .map(|((_, n), _)| *n)
             .collect()
     }
+
+    /// Full snapshot of all currently-indexed pending txs. Used by the
+    /// VFS `wallets/<w>/chains/<c>/pending_external.jsonl` handler to
+    /// filter txs that look like they were sent from a managed wallet.
+    pub fn snapshot(&self) -> Vec<PendingTx> {
+        self.inner
+            .read()
+            .by_hash
+            .values()
+            .map(|r| r.tx.clone())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -196,6 +208,16 @@ mod tests {
         addr[0] = 7;
         let ns = idx.observed_nonces(Address::from(addr));
         assert_eq!(ns, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn snapshot_returns_all_indexed_txs() {
+        let idx = PendingTxIndex::new(8);
+        idx.insert(make_tx(1, 1, 0));
+        idx.insert(make_tx(2, 1, 1));
+        idx.insert(make_tx(3, 2, 0));
+        let snap = idx.snapshot();
+        assert_eq!(snap.len(), 3);
     }
 
     #[test]
