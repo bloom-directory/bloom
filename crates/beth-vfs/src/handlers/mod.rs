@@ -16,6 +16,7 @@ pub mod watch;
 
 pub use addressbook::AddressBookHandler;
 pub use chains::ChainsHandler;
+pub use chains_mempool::MempoolHandler;
 pub use defi::DefiHandler;
 pub use docs::DocsHandler;
 pub use ens::EnsHandler;

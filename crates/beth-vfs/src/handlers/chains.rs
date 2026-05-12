@@ -92,6 +92,11 @@ pub struct ChainsHandler {
     /// daemon process is the natural lifetime bound.
     revert_cache:
         Arc<PlMutex<std::collections::HashMap<(String, alloy::primitives::B256), DecodedRevert>>>,
+    /// Per-chain mempool handlers. Empty by default; populated by the
+    /// daemon via [`with_mempool_handlers`] when mempool providers are
+    /// configured. Keys are chain names (e.g., "ethereum").
+    mempool_handlers:
+        Arc<std::collections::BTreeMap<String, Arc<super::chains_mempool::MempoolHandler>>>,
 }
 
 impl ChainsHandler {
@@ -108,6 +113,7 @@ impl ChainsHandler {
             nft_cache: Arc::new(NftKindCache::new()),
             revert_decoder: Arc::new(DecoderChain::new()),
             revert_cache: Arc::new(PlMutex::new(std::collections::HashMap::new())),
+            mempool_handlers: Arc::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -153,6 +159,17 @@ impl ChainsHandler {
     /// the historical wiring (Etherscan for metadata + history).
     pub fn with_backends(mut self, backends: BackendsConfig) -> Self {
         self.backends = backends;
+        self
+    }
+
+    /// Builder: install per-chain mempool handlers. Empty by default.
+    /// When populated, `chains/<chain>/mempool/...` is delegated to the
+    /// per-chain `MempoolHandler`.
+    pub fn with_mempool_handlers(
+        mut self,
+        handlers: std::collections::BTreeMap<String, Arc<super::chains_mempool::MempoolHandler>>,
+    ) -> Self {
+        self.mempool_handlers = Arc::new(handlers);
         self
     }
 
@@ -590,6 +607,10 @@ impl ChainsHandler {
                 Some("current.json") => Ok(Entry::file("current.json")),
                 _ => Err(HandlerError::not_found(path.to_string_path())),
             },
+            "mempool" => match self.mempool_handlers.get(chain.as_str()) {
+                Some(h) => h.lookup(path).await,
+                None => Err(HandlerError::not_found(path.to_string_path())),
+            },
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
     }
@@ -908,6 +929,10 @@ impl ChainsHandler {
                 let body = serde_json::json!({ "gas_price_wei": gp });
                 Ok(serde_json::to_vec_pretty(&body).unwrap())
             }
+            "mempool" => match self.mempool_handlers.get(chain.as_str()) {
+                Some(h) => h.read(path).await,
+                None => Err(HandlerError::NotAFile(path.to_string_path())),
+            },
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
     }
@@ -925,18 +950,24 @@ impl ChainsHandler {
         let chain = &segs[0];
         let _client = self.client(chain)?;
         match segs.len() {
-            1 => Ok(vec![
-                Entry::file("chain_id"),
-                Entry::dir("head"),
-                Entry::dir("blocks"),
-                Entry::dir("addresses"),
-                Entry::dir("tx"),
-                Entry::dir("gas"),
-                // `contracts/` always advertised — `nft/`, `storage/`
-                // and `proxy/` work over RPC without etherscan; the
-                // etherscan-only subtrees gate themselves.
-                Entry::dir("contracts"),
-            ]),
+            1 => {
+                let mut entries = vec![
+                    Entry::file("chain_id"),
+                    Entry::dir("head"),
+                    Entry::dir("blocks"),
+                    Entry::dir("addresses"),
+                    Entry::dir("tx"),
+                    Entry::dir("gas"),
+                    // `contracts/` always advertised — `nft/`, `storage/`
+                    // and `proxy/` work over RPC without etherscan; the
+                    // etherscan-only subtrees gate themselves.
+                    Entry::dir("contracts"),
+                ];
+                if self.mempool_handlers.contains_key(chain.as_str()) {
+                    entries.push(Entry::dir("mempool"));
+                }
+                Ok(entries)
+            }
             2 if segs[1] == "head" => Ok(vec![
                 Entry::file("number"),
                 Entry::file("hash"),
@@ -987,6 +1018,12 @@ impl ChainsHandler {
             n if n >= 3 && segs[1] == "contracts" => {
                 let client = self.client(chain)?;
                 self.list_contracts(segs, &client).await
+            }
+            n if n >= 2 && segs[1] == "mempool" => {
+                match self.mempool_handlers.get(chain.as_str()) {
+                    Some(h) => h.list(path).await,
+                    None => Err(HandlerError::not_found(path.to_string_path())),
+                }
             }
             _ => Ok(Vec::new()),
         }
@@ -2723,5 +2760,55 @@ mod tests {
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         // Only `admin` from PROXY_ADMIN_ABI.
         assert_eq!(names, vec!["admin.sig", "admin.read", "admin.tx"]);
+    }
+
+    // ---- mempool delegation tests ----------------------------------------
+
+    fn make_mempool_handler() -> Arc<crate::handlers::chains_mempool::MempoolHandler> {
+        Arc::new(crate::handlers::chains_mempool::MempoolHandler::new(
+            "anvil",
+            "mock",
+            beth_mempool::PendingTxIndex::new(8),
+        ))
+    }
+
+    #[tokio::test]
+    async fn mempool_lookup_delegates_when_handler_present() {
+        let mut handlers = std::collections::BTreeMap::new();
+        handlers.insert("anvil".to_string(), make_mempool_handler());
+        let h = ChainsHandler::new(anvil_registry()).with_mempool_handlers(handlers);
+        let p = VfsPath::parse("anvil/mempool/status.json").unwrap();
+        let entry = h.lookup(&p).await.unwrap();
+        assert_eq!(entry.name, "status.json");
+    }
+
+    #[tokio::test]
+    async fn mempool_lookup_returns_not_found_without_handler() {
+        let h = ChainsHandler::new(anvil_registry());
+        let p = VfsPath::parse("anvil/mempool/status.json").unwrap();
+        let err = h.lookup(&p).await.unwrap_err();
+        assert!(matches!(err, HandlerError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn chain_root_listing_includes_mempool_when_handler_present() {
+        let mut handlers = std::collections::BTreeMap::new();
+        handlers.insert("anvil".to_string(), make_mempool_handler());
+        let h_with = ChainsHandler::new(anvil_registry()).with_mempool_handlers(handlers);
+        let p = VfsPath::parse("anvil").unwrap();
+        let entries = h_with.list(&p).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"mempool"),
+            "expected mempool in listing, got: {names:?}"
+        );
+
+        let h_without = ChainsHandler::new(anvil_registry());
+        let entries_without = h_without.list(&p).await.unwrap();
+        let names_without: Vec<&str> = entries_without.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            !names_without.contains(&"mempool"),
+            "mempool should not appear without handler"
+        );
     }
 }
