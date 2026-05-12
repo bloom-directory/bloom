@@ -10,6 +10,19 @@ use tokio::sync::broadcast;
 use crate::index::PendingTxIndex;
 use crate::provider::{MempoolProvider, PendingTx};
 
+/// Sink for events observed by a `MempoolStream` reconnect loop.
+/// Implementors react to each transaction and to subscription state
+/// transitions. The default `MempoolStream` impl just updates the
+/// shared `PendingTxIndex` and broadcasts on its internal channel,
+/// preserving the original behavior for callers that don't need the
+/// richer surface (tests, future consumers).
+pub trait MempoolSink: Send + Sync {
+    fn ingest(&self, tx: PendingTx);
+    fn set_subscribed(&self) {}
+    fn set_disconnected(&self) {}
+    fn increment_dropped(&self, _n: u64) {}
+}
+
 #[derive(Clone)]
 pub struct MempoolStream {
     pub tx: broadcast::Sender<PendingTx>,
@@ -25,14 +38,22 @@ impl MempoolStream {
     }
 }
 
+impl MempoolSink for MempoolStream {
+    fn ingest(&self, tx: PendingTx) {
+        self.index.insert(tx.clone());
+        let _ = self.tx.send(tx);
+    }
+}
+
 /// Spawn a tokio task that subscribes via `provider`, reconnects on
-/// disconnect (1s → 30s exponential backoff), and broadcasts every
-/// observed PendingTx. Returns a oneshot Sender; drop it or send `()`
-/// to ask the task to stop after its current iteration.
+/// disconnect (1s → 30s exponential backoff), and calls `sink` for
+/// every observed PendingTx and state transition. Returns a oneshot
+/// Sender; drop it or send `()` to ask the task to stop after its
+/// current iteration.
 pub fn spawn(
     chain_name: String,
     provider: Arc<dyn MempoolProvider>,
-    stream: MempoolStream,
+    sink: Arc<dyn MempoolSink>,
 ) -> tokio::sync::oneshot::Sender<()> {
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
@@ -45,17 +66,18 @@ pub fn spawn(
                     match connect {
                         Ok(mut s) => {
                             backoff = Duration::from_secs(1);
+                            sink.set_subscribed();
                             tracing::info!(chain = %chain_name, provider = provider.id(), "mempool.subscribed");
                             loop {
                                 tokio::select! {
                                     _ = &mut shutdown_rx => return,
                                     next = s.next() => match next {
                                         Some(tx) => {
-                                            stream.index.insert(tx.clone());
-                                            let _ = stream.tx.send(tx);
+                                            sink.ingest(tx);
                                         }
                                         None => {
                                             tracing::warn!(chain = %chain_name, "mempool.disconnected");
+                                            sink.set_disconnected();
                                             break;
                                         }
                                     }
@@ -64,6 +86,7 @@ pub fn spawn(
                         }
                         Err(e) => {
                             tracing::warn!(chain = %chain_name, error = %e, "mempool.subscribe_failed");
+                            sink.set_disconnected();
                         }
                     }
                 }
@@ -106,9 +129,13 @@ mod tests {
         let provider: Arc<dyn MempoolProvider> =
             Arc::new(MockMempoolProvider::new("mock", vec![fx(1), fx(2)]));
         let index = PendingTxIndex::new(8);
-        let stream = MempoolStream::new(index.clone());
+        let stream = Arc::new(MempoolStream::new(index.clone()));
         let mut rx = stream.tx.subscribe();
-        let _shutdown = spawn("ethereum".into(), provider, stream);
+        let _shutdown = spawn(
+            "ethereum".into(),
+            provider,
+            stream.clone() as Arc<dyn MempoolSink>,
+        );
         let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .unwrap()

@@ -124,41 +124,52 @@ impl Daemon {
                 warn!(chain = %chain_name, "daemon.mempool_skipped: chain not configured");
                 continue;
             }
-            let idx = beth_mempool::PendingTxIndex::new(mc.max_index_size);
+
+            // Resolve the provider before allocating any state, so an
+            // unknown provider id doesn't leave a half-mounted handler.
+            let provider: Arc<dyn beth_mempool::MempoolProvider> = match mc.provider.as_str() {
+                "alchemy" => Arc::new(
+                    beth_mempool::providers::alchemy::AlchemyProvider::new(mc.ws_url.clone()),
+                ),
+                "generic_eth_subscribe" => Arc::new(
+                    beth_mempool::providers::generic_eth_subscribe::GenericEthSubscribeProvider::new(
+                        mc.ws_url.clone(),
+                    ),
+                ),
+                other => {
+                    warn!(
+                        chain = %chain_name,
+                        provider = %other,
+                        "daemon.mempool_skipped: unknown provider"
+                    );
+                    continue;
+                }
+            };
+
+            // Clamp max_index_size = 0 → 1 so PendingTxIndex::new never
+            // asserts. A zero value in config is almost certainly a mistake.
+            let size = mc.max_index_size.max(1);
+            if size != mc.max_index_size {
+                warn!(
+                    chain = %chain_name,
+                    configured = mc.max_index_size,
+                    "daemon.mempool_max_index_size_clamped_to_1"
+                );
+            }
+            let idx = beth_mempool::PendingTxIndex::new(size);
             let handler = Arc::new(beth_vfs::handlers::MempoolHandler::new(
                 chain_name.clone(),
                 mc.provider.clone(),
                 idx.clone(),
             ));
             mempool_indexes.insert(chain_name.clone(), idx.clone());
-            mempool_handlers.insert(chain_name.clone(), handler);
-
-            let provider_result: Result<Arc<dyn beth_mempool::MempoolProvider>, DaemonError> =
-                match mc.provider.as_str() {
-                    "alchemy" => Ok(Arc::new(
-                        beth_mempool::providers::alchemy::AlchemyProvider::new(mc.ws_url.clone()),
-                    )),
-                    "generic_eth_subscribe" => Ok(Arc::new(
-                        beth_mempool::providers::generic_eth_subscribe::GenericEthSubscribeProvider::new(
-                            mc.ws_url.clone(),
-                        ),
-                    )),
-                    other => {
-                        warn!(
-                            chain = %chain_name,
-                            provider = %other,
-                            "daemon.mempool_skipped: unknown provider"
-                        );
-                        continue;
-                    }
-                };
-            let provider = provider_result?;
+            mempool_handlers.insert(chain_name.clone(), handler.clone());
 
             // Spawning the stream needs a tokio runtime; mirror the
             // watch-executor pattern and only spawn when one is current.
             if tokio::runtime::Handle::try_current().is_ok() {
-                let stream = beth_mempool::MempoolStream::new(idx);
-                let shutdown = beth_mempool::stream::spawn(chain_name.clone(), provider, stream);
+                let sink: Arc<dyn beth_mempool::stream::MempoolSink> = handler.clone();
+                let shutdown = beth_mempool::stream::spawn(chain_name.clone(), provider, sink);
                 mempool_shutdown.push(shutdown);
                 debug!(chain = %chain_name, provider = %mc.provider, "daemon.mempool_spawned");
             } else {
@@ -724,8 +735,14 @@ ws_url = "wss://example.invalid"
         // The chain has no real RPC; daemon still boots because chain
         // creation is best-effort (see existing chain_skipped path).
         let daemon = Daemon::from_home(home).expect("daemon boots");
-        // No mempool index should be registered: the bogus chain entry
-        // was skipped, and ethereum has no [mempool.ethereum] section.
+        // Confirm the config was actually parsed with the bogus_chain entry
+        // (so we know the skip path was exercised, not just absent).
+        assert!(
+            daemon.config.mempool.contains_key("bogus_chain"),
+            "expected bogus_chain in parsed config"
+        );
+        // No mempool shutdown handle: the bogus chain was skipped because
+        // it doesn't appear in [chains.*].
         assert!(daemon.mempool_shutdown.lock().is_empty());
     }
 

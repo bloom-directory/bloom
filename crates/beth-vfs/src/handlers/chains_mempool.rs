@@ -143,6 +143,24 @@ impl MempoolHandler {
     }
 }
 
+impl beth_mempool::stream::MempoolSink for MempoolHandler {
+    fn ingest(&self, tx: PendingTx) {
+        MempoolHandler::ingest(self, tx);
+    }
+
+    fn set_subscribed(&self) {
+        self.set_state(SubscriptionState::Subscribed);
+    }
+
+    fn set_disconnected(&self) {
+        self.set_state(SubscriptionState::Disconnected);
+    }
+
+    fn increment_dropped(&self, n: u64) {
+        MempoolHandler::increment_dropped(self, n);
+    }
+}
+
 #[async_trait]
 impl Handler for MempoolHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
