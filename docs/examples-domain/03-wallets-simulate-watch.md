@@ -1,6 +1,6 @@
 # Wallets, Simulate, Watch
 
-Cheatsheet for the three write-heavy surfaces of the `/eth/` VFS.
+Cheatsheet for the three write-heavy surfaces of the `/bloom/` VFS.
 Every command below is a plain `cat`, `ls`, `echo > path`, or `tail -f`
 against the mounted filesystem. Mainnet broadcasts are gated by
 `block_mainnet_broadcast = true` in `config.toml` (the kill-switch);
@@ -12,7 +12,7 @@ runnable flows here use `anvil` or `base` so they are safe by default.
 ### List, create, import, watch
 
 ```sh
-ls /eth/wallets/
+ls /bloom/wallets/
 ```
 
 `new` is a writable file. The body can be plain text (a wallet name)
@@ -20,17 +20,17 @@ or a TOML spec.
 
 ```sh
 # Shorthand: plain name = create a local wallet called 'alice'.
-echo alice > /eth/wallets/new
+echo alice > /bloom/wallets/new
 
 # Full TOML form for a fresh local wallet.
-cat <<'EOF' > /eth/wallets/new
+cat <<'EOF' > /bloom/wallets/new
 name = "alice"
 kind = "local"
 passphrase = "devonly"
 EOF
 
 # Import an existing private key (BLOOM_PASSPHRASE applies if 'passphrase' is omitted).
-cat <<'EOF' > /eth/wallets/new
+cat <<'EOF' > /bloom/wallets/new
 name = "imported"
 kind = "import"
 private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
@@ -38,7 +38,7 @@ passphrase = "devonly"
 EOF
 
 # Watch-only (no private key, signing is disabled).
-cat <<'EOF' > /eth/wallets/new
+cat <<'EOF' > /bloom/wallets/new
 name = "vitalik"
 kind = "watch"
 address = "0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045"
@@ -56,16 +56,16 @@ runnable examples assume.
 ### Per-wallet leaves
 
 ```sh
-cat /eth/wallets/alice/address          # 0x... (EIP-55 checksum)
-cat /eth/wallets/alice/public_key       # 0x04... uncompressed secp256k1
-cat /eth/wallets/alice/kind             # local | watch
-cat /eth/wallets/alice/policy.toml      # current policy
+cat /bloom/wallets/alice/address          # 0x... (EIP-55 checksum)
+cat /bloom/wallets/alice/public_key       # 0x04... uncompressed secp256k1
+cat /bloom/wallets/alice/kind             # local | watch
+cat /bloom/wallets/alice/policy.toml      # current policy
 
 # Per-chain native balance + nonce.
-cat /eth/wallets/alice/chains/base/balance       # raw wei
-cat /eth/wallets/alice/chains/base/balance.eth   # human "0.123 ETH"
-cat /eth/wallets/alice/chains/base/balance.raw   # same as balance
-cat /eth/wallets/alice/chains/base/nonce
+cat /bloom/wallets/alice/chains/base/balance       # raw wei
+cat /bloom/wallets/alice/chains/base/balance.eth   # human "0.123 ETH"
+cat /bloom/wallets/alice/chains/base/balance.raw   # same as balance
+cat /bloom/wallets/alice/chains/base/nonce
 ```
 
 `policy.toml` is read-only via this surface — edit `~/.bloom/keystore/<wallet>/policy.toml`
@@ -77,8 +77,8 @@ chain-rooted reader at
 For example, alice's USDC balance on Base:
 
 ```sh
-ALICE=$(cat /eth/wallets/alice/address)
-cat /eth/chains/base/addresses/$ALICE/tokens/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913/balance.formatted
+ALICE=$(cat /bloom/wallets/alice/address)
+cat /bloom/chains/base/addresses/$ALICE/tokens/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913/balance.formatted
 ```
 
 ### Signing
@@ -88,17 +88,17 @@ All three sign endpoints write the resulting hex signature to a
 
 ```sh
 # EIP-191 personal_sign over a UTF-8 message.
-echo -n 'gm bloom' > /eth/wallets/alice/sign/message
+echo -n 'gm bloom' > /bloom/wallets/alice/sign/message
 cat ~/.bloom/keystore/alice/sign/message.sig
 
 # Raw 32-byte hash (must be 0x-hex, exactly 32 bytes).
 echo -n '0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8' \
-  > /eth/wallets/alice/sign/hash
+  > /bloom/wallets/alice/sign/hash
 cat ~/.bloom/keystore/alice/sign/hash.sig
 
 # EIP-712 typed data — body is the standard RPC JSON shape. Example:
 # an EIP-2612 permit for USDC on mainnet (chainId 1).
-cat <<'EOF' > /eth/wallets/alice/sign/typed_data
+cat <<'EOF' > /bloom/wallets/alice/sign/typed_data
 {
   "types": {
     "EIP712Domain": [
@@ -153,10 +153,10 @@ JSON, or TOML.
 ```sh
 # Native send, shell shorthand.
 echo 'send 0.01 eth to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on anvil' \
-  > /eth/wallets/alice/chains/anvil/outbox/new.tx
+  > /bloom/wallets/alice/chains/anvil/outbox/new.tx
 
 # Native send, JSON.
-cat <<'EOF' > /eth/wallets/alice/chains/anvil/outbox/new.tx
+cat <<'EOF' > /bloom/wallets/alice/chains/anvil/outbox/new.tx
 {
   "kind": "send",
   "to": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
@@ -168,7 +168,7 @@ EOF
 # ERC-20 transfer, JSON. Token + value with a unit triggers ERC-20 encoding.
 # The engine resolves the token, encodes transfer(address,uint256),
 # and renders the plan as a token transfer (TokenRef in plan.md).
-cat <<'EOF' > /eth/wallets/alice/chains/base/outbox/new.tx
+cat <<'EOF' > /bloom/wallets/alice/chains/base/outbox/new.tx
 {
   "kind": "send",
   "to": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
@@ -180,7 +180,7 @@ EOF
 
 # Generic call against an arbitrary contract via ABI signature + args.
 # Example: WETH deposit() with 0.05 ETH attached on Base.
-cat <<'EOF' > /eth/wallets/alice/chains/base/outbox/new.tx
+cat <<'EOF' > /bloom/wallets/alice/chains/base/outbox/new.tx
 {
   "kind": "call",
   "contract": "0x4200000000000000000000000000000000000006",
@@ -200,12 +200,12 @@ error — nothing lands in `pending/`.
 ### Review
 
 ```sh
-ls /eth/wallets/alice/chains/anvil/outbox/pending/
+ls /bloom/wallets/alice/chains/anvil/outbox/pending/
 # 0001-21699/
 
-ID=$(ls /eth/wallets/alice/chains/anvil/outbox/pending/ | head -n1)
+ID=$(ls /bloom/wallets/alice/chains/anvil/outbox/pending/ | head -n1)
 
-cat /eth/wallets/alice/chains/anvil/outbox/pending/$ID/plan.md
+cat /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/plan.md
 ```
 
 `plan.md` is rendered from the `StagedTx` and looks like:
@@ -237,8 +237,8 @@ slot renders `transfer ERC-721 …` / `transfer ERC-1155 …`.
 ```sh
 # The full StagedTx JSON. (Note: the on-disk file is intent.json — there
 # is no separate tx.json; the staged record carries every field.)
-cat /eth/wallets/alice/chains/anvil/outbox/pending/$ID/intent.json
-cat /eth/wallets/alice/chains/anvil/outbox/pending/$ID/policy_check.json
+cat /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/intent.json
+cat /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/policy_check.json
 ```
 
 ### Confirm (broadcast)
@@ -249,11 +249,11 @@ The wallet must be unlocked. Empty bodies are rejected.
 
 ```sh
 # Plain confirm.
-echo y > /eth/wallets/alice/chains/anvil/outbox/pending/$ID/confirm
+echo y > /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/confirm
 
 # Override token to bypass soft-policy warnings (Warn outcome only;
 # Deny is never overridable).
-echo override > /eth/wallets/alice/chains/anvil/outbox/pending/$ID/confirm
+echo override > /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/confirm
 ```
 
 After a successful broadcast the daemon moves the directory to
@@ -261,15 +261,15 @@ After a successful broadcast the daemon moves the directory to
 artefacts:
 
 ```sh
-ls /eth/wallets/alice/chains/anvil/outbox/sent/$ID/
+ls /bloom/wallets/alice/chains/anvil/outbox/sent/$ID/
 # intent.json   plan.md   policy_check.json   tx_hash
 
-cat /eth/wallets/alice/chains/anvil/outbox/sent/$ID/tx_hash
+cat /bloom/wallets/alice/chains/anvil/outbox/sent/$ID/tx_hash
 # 0xabc...
 
 # The receipt itself is exposed under the chain reader, keyed by hash:
-HASH=$(cat /eth/wallets/alice/chains/anvil/outbox/sent/$ID/tx_hash)
-cat /eth/chains/anvil/tx/$HASH/receipt
+HASH=$(cat /bloom/wallets/alice/chains/anvil/outbox/sent/$ID/tx_hash)
+cat /bloom/chains/anvil/tx/$HASH/receipt
 ```
 
 Note: there is no `receipt.json` written by the outbox. The status of
@@ -286,13 +286,13 @@ non-empty body and require the wallet to be unlocked.
 # Replace: bumped fees plus a substituted intent body. Same nonce, the
 # original record stays in place; the engine writes replacement_intent.json
 # and replacement_tx_hash alongside.
-cat <<'EOF' > /eth/wallets/alice/chains/anvil/outbox/pending/$ID/replace
+cat <<'EOF' > /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/replace
 send 0.02 eth to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on anvil
 EOF
 
 # Cancel: fires a self-send replacement at the same nonce with a >=10%
 # fee bump. Body is any non-empty token, conventionally 'y'.
-echo y > /eth/wallets/alice/chains/anvil/outbox/pending/$ID/cancel
+echo y > /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/cancel
 ```
 
 ### Mainnet broadcast
@@ -310,11 +310,11 @@ Sessions are in-memory. Lifetime is the daemon process.
 ### Create a session
 
 ```sh
-ls /eth/simulate/
+ls /bloom/simulate/
 # new   last
 
 # Native send simulation (no signing, no broadcast).
-cat <<'EOF' > /eth/simulate/new
+cat <<'EOF' > /bloom/simulate/new
 {
   "kind": "send",
   "from": "0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045",
@@ -324,8 +324,8 @@ cat <<'EOF' > /eth/simulate/new
 }
 EOF
 
-ID=$(cat /eth/simulate/last)   # sim-0001
-ls /eth/simulate/$ID/
+ID=$(cat /bloom/simulate/last)   # sim-0001
+ls /bloom/simulate/$ID/
 # intent.json   plan.md   simulation.json   state-override.json   trace.json
 ```
 
@@ -336,10 +336,10 @@ ignores it.
 ### Read results
 
 ```sh
-cat /eth/simulate/$ID/simulation.json   # SimResult: success, gas_used, return_data_hex, ...
-cat /eth/simulate/$ID/plan.md           # short markdown summary
-cat /eth/simulate/$ID/trace.json        # debug_traceCall, or {"unsupported": "..."}
-cat /eth/simulate/$ID/intent.json
+cat /bloom/simulate/$ID/simulation.json   # SimResult: success, gas_used, return_data_hex, ...
+cat /bloom/simulate/$ID/plan.md           # short markdown summary
+cat /bloom/simulate/$ID/trace.json        # debug_traceCall, or {"unsupported": "..."}
+cat /bloom/simulate/$ID/intent.json
 ```
 
 ### State overrides
@@ -353,7 +353,7 @@ synchronously against the original intent. The shape is the standard
 # Force USDC balance for vitalik.eth to 1,000,000.000000 (1e12 raw).
 # USDC stores balances in slot 9; storage keys are the keccak256 of
 # (address || slot) padded.
-cat <<'EOF' > /eth/simulate/$ID/state-override.json
+cat <<'EOF' > /bloom/simulate/$ID/state-override.json
 {
   "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48": {
     "stateDiff": {
@@ -364,19 +364,19 @@ cat <<'EOF' > /eth/simulate/$ID/state-override.json
 EOF
 
 # Re-read the result.
-cat /eth/simulate/$ID/simulation.json
+cat /bloom/simulate/$ID/simulation.json
 ```
 
 A simpler override — zero out a sender's native balance to test that
 your transfer reverts with insufficient funds — is the canonical demo:
 
 ```sh
-cat <<'EOF' > /eth/simulate/$ID/state-override.json
+cat <<'EOF' > /bloom/simulate/$ID/state-override.json
 {
   "0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045": { "balance": "0x0" }
 }
 EOF
-cat /eth/simulate/$ID/simulation.json
+cat /bloom/simulate/$ID/simulation.json
 # {"success": false, "revert_reason": "insufficient funds ...", ...}
 ```
 
@@ -387,7 +387,7 @@ no separate `eth_call/<to>/<calldata>` path. Stage a `call` intent with
 the calldata you want, attach overrides, and read `simulation.json`:
 
 ```sh
-cat <<'EOF' > /eth/simulate/new
+cat <<'EOF' > /bloom/simulate/new
 {
   "kind": "call",
   "contract": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
@@ -403,8 +403,8 @@ cat <<'EOF' > /eth/simulate/new
   }
 }
 EOF
-ID=$(cat /eth/simulate/last)
-cat /eth/simulate/$ID/simulation.json   # return_data_hex carries the balance
+ID=$(cat /bloom/simulate/last)
+cat /bloom/simulate/$ID/simulation.json   # return_data_hex carries the balance
 ```
 
 NFT intents are not simulated through `/simulate` — they go through
@@ -431,11 +431,11 @@ a consumer's point of view the live / history files look identical.
 ### Subscribe (one example per kind)
 
 ```sh
-ls /eth/watch/
+ls /bloom/watch/
 # new
 
 # 1. Balance watch on vitalik.eth.
-cat <<'EOF' > /eth/watch/new
+cat <<'EOF' > /bloom/watch/new
 kind = "balance"
 wallet = "alice"
 address = "0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045"
@@ -445,14 +445,14 @@ note = "any balance change"
 EOF
 
 # 2. Block watch.
-cat <<'EOF' > /eth/watch/new
+cat <<'EOF' > /bloom/watch/new
 kind = "block"
 wallet = "alice"
 chain = "base"
 EOF
 
 # 3. Gas-price watch (fires when below 25 gwei).
-cat <<'EOF' > /eth/watch/new
+cat <<'EOF' > /bloom/watch/new
 kind = "gas_price"
 wallet = "alice"
 chain = "ethereum"
@@ -461,7 +461,7 @@ EOF
 
 # 4. Event watch — WETH Transfer on mainnet.
 # topic0 = keccak256("Transfer(address,address,uint256)")
-cat <<'EOF' > /eth/watch/new
+cat <<'EOF' > /bloom/watch/new
 kind = "event"
 wallet = "alice"
 chain = "ethereum"
@@ -473,7 +473,7 @@ EOF
 Listing then shows the allocated ids:
 
 ```sh
-ls /eth/watch/
+ls /bloom/watch/
 # new   w-0001   w-0002   w-0003   w-0004
 ```
 
@@ -481,14 +481,14 @@ ls /eth/watch/
 
 ```sh
 # Stream live JSONL as records are appended.
-tail -f /eth/watch/w-0001/live
+tail -f /bloom/watch/w-0001/live
 
 # Most-recent rotated archive (when live overflowed 1 MiB).
-cat /eth/watch/w-0001/history.jsonl
+cat /bloom/watch/w-0001/history.jsonl
 
 # Older archives are numbered.
-cat /eth/watch/w-0001/history.jsonl.1
-ls /eth/watch/w-0001/
+cat /bloom/watch/w-0001/history.jsonl.1
+ls /bloom/watch/w-0001/
 # spec.toml   live   history.jsonl   history.jsonl.1   delete
 ```
 
@@ -498,7 +498,7 @@ The spec is round-trippable as TOML at `spec.toml`. The id, wallet,
 created-time millis, kind, and optional note all live on the spec:
 
 ```sh
-cat /eth/watch/w-0001/spec.toml
+cat /bloom/watch/w-0001/spec.toml
 # id = "w-0001"
 # wallet = "alice"
 # created_ms = "1731177900000"
@@ -520,7 +520,7 @@ each `live` / `history` record.
 ### Delete
 
 ```sh
-echo y > /eth/watch/w-0001/delete
+echo y > /bloom/watch/w-0001/delete
 ```
 
 Removes the spec from the registry and the per-watch directory.

@@ -5,12 +5,12 @@
 # or by tests/docker/run.sh --enso-live (live mainnet mode).
 #
 # What this proves
-#   The agent-facing surface (NFS mount at /eth/) end-to-ends a real
+#   The agent-facing surface (NFS mount at /bloom/) end-to-ends a real
 #   DeFi intent: ETH -> aBaseUSDC via Enso shortcut -> Aave V3 supply.
 #   Every step except the wallet unlock (in-process by design) is
-#   driven through plain filesystem ops on /eth/ — no `bloom vfs write`
+#   driven through plain filesystem ops on /bloom/ — no `bloom vfs write`
 #   short-circuits, no `bloom ipc call`. If this test passes, an agent
-#   with shell access to /eth/ can place real DeFi trades.
+#   with shell access to /bloom/ can place real DeFi trades.
 #
 # Modes (selected by BLOOM_TEST_MODE; default "fork")
 #   fork  — broadcasts land on an anvil --fork-url=Base sidecar.
@@ -150,7 +150,7 @@ fi
 # of the route.
 INTENT_BODY=$(printf '{"intent":"swap %s ETH to %s on base","chain":"%s","slippage_bps":500}' \
     "$SWAP_AMOUNT_ETH" "$AUSDC" "$CHAIN")
-log "POST intent (via /eth write): $INTENT_BODY"
+log "POST intent (via /bloom write): $INTENT_BODY"
 
 # Snapshot the pending set so we can diff it after confirmation and
 # learn the staged id. This used to be impossible — `BloomFs::getattr`

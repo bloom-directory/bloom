@@ -42,7 +42,7 @@ The agent never imports a Web3 SDK. It writes files.
 ### In scope (target v1)
 
 - A single Rust daemon (`bloom` / `bloom`) exposing a virtual
-  filesystem at a configurable mount path (default `/eth`).
+  filesystem at a configurable mount path (default `/bloom`).
 - Mount via NFSv4.1 + `embednfs` on Linux and macOS 26+ (same
   approach as bloom; NFS is friendlier than FUSE for cross-platform,
   user-mode, and macOS-without-system-extension reasons).
@@ -91,7 +91,7 @@ The agent never imports a Web3 SDK. It writes files.
                  ┌──────────────────────────────────────┐
    kernel NFS    │  embednfs (FileSystem trait impl)    │
    client at     │              = mount                 │
-   /eth          └────────────────┬─────────────────────┘
+   /bloom        └────────────────┬─────────────────────┘
                                   │
                                   ▼
         ┌──────────────────────────────────────────────────┐
@@ -152,7 +152,7 @@ This is the heart of the spec. The path layout is the API.
 ### 3.1 Top-level layout
 
 ```
-/eth/
+/bloom/
 ├── chains/                # read-only chain views
 │   ├── ethereum/          # mainnet
 │   ├── optimism/
@@ -755,9 +755,9 @@ writing `cancel` issues a self-send replacement tx.
 The agent should be able to do:
 
 ```sh
-tail -f /eth/wallets/alice/chains/ethereum/inbox
-tail -f /eth/chains/ethereum/contracts/0xUNI/events/Swap/live
-tail -f /eth/watch/whale-alerts/live
+tail -f /bloom/wallets/alice/chains/ethereum/inbox
+tail -f /bloom/chains/ethereum/contracts/0xUNI/events/Swap/live
+tail -f /bloom/watch/whale-alerts/live
 ```
 
 Implementation:
@@ -782,9 +782,9 @@ bridge rotation cleanly.
 
 ```
 bloom init                          # config + first wallet, prompt passphrase
-bloom up                            # start daemon, mount /eth
+bloom up                            # start daemon, mount /bloom
 bloom down                          # graceful stop, unmount
-bloom status                        # mirror of /eth/status/daemon.json
+bloom status                        # mirror of /bloom/status/daemon.json
 bloom wallet new <name>             # generate or import
 bloom wallet import <name> <key|file|mnemonic>
 bloom wallet list
@@ -795,12 +795,12 @@ bloom send <wallet> <amount> <to>   # convenience over outbox
 bloom watch <spec>                  # convenience over watch/new
 bloom chain add <name> --rpc <url> --etherscan <url>  # custom chain
 bloom doctor                        # prints diagnostics, RPC health
-bloom tail <path>                   # follows a /eth path
+bloom tail <path>                   # follows a /bloom path
 bloom whois <addr>                  # resolves ENS / contract name
 ```
 
 The CLI is a thin wrapper over the FS; everything `bloom` does is also
-doable by writing files into `/eth`.
+doable by writing files into `/bloom`.
 
 ---
 
@@ -1053,8 +1053,8 @@ These are ideas worth surfacing in iteration. None are committed.
 14. **Notification subsystem.** `watch/<name>/notify.toml` says where
     to ping (webhook, mac OS notification, email, ntfy.sh) when an
     event matches. Agents already have file events; humans need pings.
-15. **Schema-versioned paths.** Top-level `/eth/v1/...` so the layout
-    can evolve without breaking scripts; `/eth/latest -> v1`.
+15. **Schema-versioned paths.** Top-level `/bloom/v1/...` so the layout
+    can evolve without breaking scripts; `/bloom/latest -> v1`.
 16. **A Petname directory.** Per bloom's later vision: stable, signed
     human names for contracts and addresses. Useful in plan.md.
 17. **A WASM "petal" runner.** Agents could drop a small WASM module

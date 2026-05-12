@@ -153,7 +153,7 @@ impl WatchHandler {
     async fn read_inner(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let segs = path.segments();
         if segs.len() == 1 && segs[0] == "new" {
-            return Ok(b"# write a TOML watch spec to subscribe\n# examples (one of the kinds):\n#   printf 'kind = \"head\"\\nchain = \"anvil\"\\n' > /eth/watch/new\n#   printf 'kind = \"addr\"\\nchain = \"anvil\"\\naddress = \"0x...\"\\n' > /eth/watch/new\n#   printf 'kind = \"log\"\\nchain = \"anvil\"\\naddress = \"0x...\"\\ntopics = []\\n' > /eth/watch/new\n# optional: id = \"...\", wallet = \"...\", note = \"...\"\n".to_vec());
+            return Ok(b"# write a TOML watch spec to subscribe\n# examples (one of the kinds):\n#   printf 'kind = \"head\"\\nchain = \"anvil\"\\n' > /bloom/watch/new\n#   printf 'kind = \"addr\"\\nchain = \"anvil\"\\naddress = \"0x...\"\\n' > /bloom/watch/new\n#   printf 'kind = \"log\"\\nchain = \"anvil\"\\naddress = \"0x...\"\\ntopics = []\\n' > /bloom/watch/new\n# optional: id = \"...\", wallet = \"...\", note = \"...\"\n".to_vec());
         }
         match segs.len() {
             2 => {

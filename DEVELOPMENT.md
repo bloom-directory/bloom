@@ -74,7 +74,7 @@ bloom ipc call lookup --params '{"path":"/status/version"}'
 # binary the docker tests use (or `Daemon::mount(path).await` from your own
 # binary). The kernel-mounted tree appears at the path you supply.
 cargo build --release -p bloom-mount --features mount --example mount_demo
-./target/release/examples/mount_demo /tmp/eth                  # mounts at /tmp/eth
+./target/release/examples/mount_demo /tmp/bloom                  # mounts at /tmp/bloom
 ```
 
 The IPC socket lives at `$BLOOM_HOME/run/bloom.sock` (mode 0600, created on
@@ -215,7 +215,7 @@ Coverage per mode:
 |------|---------------|----------|
 | `--workspace` | single container | The unit-test suite passes on Linux as well as macOS. CI-shape regression for OS-specific code. |
 | `--mount` (default) | single privileged container | NFS server + kernel mount: `ls`, `cat /status/version`, `cat /tools/keccak/abc`, `write /watch/new`. Regression-tests the WRITE-stability bug that returned EREMOTEIO. |
-| `--fork` | compose: anvil-fork sidecar + driver | End-to-end wallet flow over the mount: stage → confirm → broadcast → poll receipt → fee-bump replace; chain reads under `/eth/chains/base/{head,tx,gas,blocks}`. |
+| `--fork` | compose: anvil-fork sidecar + driver | End-to-end wallet flow over the mount: stage → confirm → broadcast → poll receipt → fee-bump replace; chain reads under `/bloom/chains/base/{head,tx,gas,blocks}`. |
 | `--enso` | compose: anvil-fork + driver | Full DeFi intent: post NL intent → confirm session → poll outbox → broadcast → assert aBaseUSDC > 0. Generous 5% slippage and 300s gas-estimation budget to absorb fork drift. |
 | `--enso-live` | single privileged container | Same flow against real Base mainnet, plus a balance-neutral unwind (redeem aBaseUSDC → ETH). Mounts `$BLOOM_LIVE_HOME` read-only and copies the keystore to a throwaway home. |
 

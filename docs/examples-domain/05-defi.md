@@ -2,7 +2,7 @@
 
 The `defi/intents/<wallet>/` surface is an "intent compiler" that turns a natural-language or JSON DeFi request into one or more concrete `RawIntent`s using the Enso Shortcuts API, and then forwards them — on confirm — into the same wallet outbox the rest of bloom uses. The full lifecycle is: write an intent under `defi/intents/<wallet>/new` to open a session; review the routed plan, full Enso response, prepared `RawIntent`s, and an `eth_call` simulation under `defi/intents/<wallet>/<id>/`; write to that session's `confirm` to stage the resulting tx (or `[approve, swap]` pair) into `wallets/<wallet>/chains/<chain>/outbox/pending/<tx-id>/`; then write to the outbox's own `confirm` to actually broadcast. There are always two confirms — one to commit the route into the outbox, one to actually broadcast each pending tx — and the second confirm is where ordering, gas, and policy checks live. Sessions are in-memory only and evaporate on daemon restart; the outbox entry is the durable artefact.
 
-All paths below are rooted at `/eth/`. Mainnet broadcast is gated by `block_mainnet_broadcast=false` and per-chain `allow_broadcast=true` in daemon config; the `ethereum` examples below are written as if those are off (demonstration; broadcast disabled by default), and the `base` examples assume per-chain broadcast was opted in.
+All paths below are rooted at `/bloom/`. Mainnet broadcast is gated by `block_mainnet_broadcast=false` and per-chain `allow_broadcast=true` in daemon config; the `ethereum` examples below are written as if those are off (demonstration; broadcast disabled by default), and the `base` examples assume per-chain broadcast was opted in.
 
 ## Session layout
 
@@ -28,24 +28,24 @@ This walks the whole pipeline end to end. USDC is an ERC-20, so the auto-approve
 
 ```
 # 1) Open a session by writing an NL intent. Default chain is `ethereum`.
-echo 'swap 100 usdc to eth' > /eth/defi/intents/alice/new
+echo 'swap 100 usdc to eth' > /bloom/defi/intents/alice/new
 
 # 2) See which sessions exist for this wallet (plus the writable `new` file).
-ls /eth/defi/intents/alice/
+ls /bloom/defi/intents/alice/
 # -> new
 #    0001-12345
 
 # 3) Inspect what's inside the session.
-ls /eth/defi/intents/alice/0001-12345/
+ls /bloom/defi/intents/alice/0001-12345/
 # -> intent.txt  route.json  plan.md  tx.json  simulation.json  confirm
 
 # 4) Read the original intent verbatim.
-cat /eth/defi/intents/alice/0001-12345/intent.txt
+cat /bloom/defi/intents/alice/0001-12345/intent.txt
 # swap 100 usdc to eth
 
 # 5) Read the human plan. Because USDC is ERC-20 and current allowance to the
 #    Enso router is below 100e6, the plan announces an auto-approve step.
-cat /eth/defi/intents/alice/0001-12345/plan.md
+cat /bloom/defi/intents/alice/0001-12345/plan.md
 # # DeFi intent
 #
 # Intent:    swap 100 usdc to eth
@@ -68,7 +68,7 @@ cat /eth/defi/intents/alice/0001-12345/plan.md
 # wallet's outbox; review there before broadcasting.
 
 # 6) Read the full Enso response (calldata, value, route description, gas).
-cat /eth/defi/intents/alice/0001-12345/route.json
+cat /bloom/defi/intents/alice/0001-12345/route.json
 # {
 #   "tx": {
 #     "to":   "0x<EnsoRouter>",
@@ -84,7 +84,7 @@ cat /eth/defi/intents/alice/0001-12345/route.json
 
 # 7) Read the ordered RawIntent list that will be staged. For ERC-20 -> ETH
 #    with insufficient allowance this is `[approve(token,spender,max), raw]`.
-cat /eth/defi/intents/alice/0001-12345/tx.json
+cat /bloom/defi/intents/alice/0001-12345/tx.json
 # [
 #   {
 #     "body": {
@@ -114,32 +114,32 @@ cat /eth/defi/intents/alice/0001-12345/tx.json
 
 # 8) Optional: dry-run via eth_call. Reverts get tiered-decoded into a
 #    structured `decoded_error`. Reads recompute on each cat.
-cat /eth/defi/intents/alice/0001-12345/simulation.json
+cat /bloom/defi/intents/alice/0001-12345/simulation.json
 # { "success": true, "return_data": "0x...", "gas_estimate": "210000" }
 
 # 9) First confirm: stage both intents into the wallet outbox.
-echo y > /eth/defi/intents/alice/0001-12345/confirm
+echo y > /bloom/defi/intents/alice/0001-12345/confirm
 
 # 10) The outbox now has two pending entries (approve, then swap). The
 #     daemon writes intent.json + plan.md + policy_check.json per id and
 #     advertises confirm/replace/cancel as writable control files.
-ls /eth/wallets/alice/chains/ethereum/outbox/pending/
+ls /bloom/wallets/alice/chains/ethereum/outbox/pending/
 # -> 0001-...   (approve)
 #    0002-...   (swap)
 
-ls /eth/wallets/alice/chains/ethereum/outbox/pending/0001-.../
+ls /bloom/wallets/alice/chains/ethereum/outbox/pending/0001-.../
 # -> intent.json  plan.md  policy_check.json  confirm  replace  cancel
 
-cat /eth/wallets/alice/chains/ethereum/outbox/pending/0001-.../plan.md
+cat /bloom/wallets/alice/chains/ethereum/outbox/pending/0001-.../plan.md
 # (per-tx plan: signed payload preview, gas, policy notes)
 
 # 11) Second confirm — the actual broadcast. The approve must broadcast and
 #     mine before the swap; review both, then confirm in order.
-echo y > /eth/wallets/alice/chains/ethereum/outbox/pending/0001-.../confirm
-echo y > /eth/wallets/alice/chains/ethereum/outbox/pending/0002-.../confirm
+echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/0001-.../confirm
+echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/0002-.../confirm
 
 # 12) After broadcast, entries migrate to outbox/sent/.
-ls /eth/wallets/alice/chains/ethereum/outbox/sent/
+ls /bloom/wallets/alice/chains/ethereum/outbox/sent/
 ```
 
 Note: this is the `ethereum` flow, gated as "demonstration; broadcast disabled by default" until both `block_mainnet_broadcast=false` (daemon-wide) and `allow_broadcast=true` (per-chain) are set in config. The first nine steps work locally regardless; only step 11 actually hits the network.
@@ -150,14 +150,14 @@ The handler accepts either a single-line NL string or a JSON body with `intent`,
 
 ```
 echo '{"intent":"swap 100 usdc to eth","chain":"ethereum"}' \
-  > /eth/defi/intents/alice/new
+  > /bloom/defi/intents/alice/new
 ```
 
 The handler is happy with `kind: "enso"` for symmetry with the wallet outbox parser (`{"kind":"enso","intent":"..."}`), but `kind` is optional. There is no addresses-only JSON form on the `defi/intents` surface — to feed an explicit token address, embed it in the NL string and the parser will treat it as a hex token (and consult `erc20_decimals()` for human-unit amounts):
 
 ```
 echo 'swap 100 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 to ETH' \
-  > /eth/defi/intents/alice/new
+  > /bloom/defi/intents/alice/new
 ```
 
 ## Overriding slippage
@@ -166,9 +166,9 @@ The default is 50 bps (0.5%). Override with the JSON form:
 
 ```
 echo '{"intent":"swap 100 usdc to eth","slippage_bps":100}' \
-  > /eth/defi/intents/alice/new
+  > /bloom/defi/intents/alice/new
 
-cat /eth/defi/intents/alice/0002-.../plan.md | grep Slippage
+cat /bloom/defi/intents/alice/0002-.../plan.md | grep Slippage
 # Slippage:  100 bps
 ```
 
@@ -185,21 +185,21 @@ an `approve(EnsoRouter, max)` is auto-prepended.
 
 ```
 # NL form
-echo 'swap 100 usdc to eth' > /eth/defi/intents/alice/new
+echo 'swap 100 usdc to eth' > /bloom/defi/intents/alice/new
 
 # JSON-explicit equivalent (slippage default 50 bps)
 echo '{"intent":"swap 100 usdc to eth","chain":"ethereum"}' \
-  > /eth/defi/intents/alice/new
+  > /bloom/defi/intents/alice/new
 
-cat /eth/defi/intents/alice/<id>/tx.json
+cat /bloom/defi/intents/alice/<id>/tx.json
 # [ { "body": { "Approve": { "token": "0xA0b86991...", "spender": "0x<EnsoRouter>",
 #                            "amount": "max" } }, "chain": "ethereum", ... },
 #   { "body": { "Raw":     { "to":    "0x<EnsoRouter>", "value": "0",
 #                            "data":  "0x..." } },                       ... } ]
 
-echo y > /eth/defi/intents/alice/<id>/confirm
-echo y > /eth/wallets/alice/chains/ethereum/outbox/pending/<approve-id>/confirm
-echo y > /eth/wallets/alice/chains/ethereum/outbox/pending/<swap-id>/confirm
+echo y > /bloom/defi/intents/alice/<id>/confirm
+echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/<approve-id>/confirm
+echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/<swap-id>/confirm
 ```
 
 (demonstration; broadcast disabled by default)
@@ -211,19 +211,19 @@ check entirely and produces a single `[swap]` intent. `tx.value` carries the
 ETH amount.
 
 ```
-echo 'swap 0.5 eth to usdc' > /eth/defi/intents/alice/new
+echo 'swap 0.5 eth to usdc' > /bloom/defi/intents/alice/new
 
 # JSON-explicit equivalent
 echo '{"intent":"swap 0.5 eth to usdc","chain":"ethereum"}' \
-  > /eth/defi/intents/alice/new
+  > /bloom/defi/intents/alice/new
 
-cat /eth/defi/intents/alice/<id>/tx.json
+cat /bloom/defi/intents/alice/<id>/tx.json
 # [ { "body": { "Raw": { "to":    "0x<EnsoRouter>",
 #                        "value": "500000000000000000",
 #                        "data":  "0x..." } }, "chain": "ethereum", ... } ]
 
-echo y > /eth/defi/intents/alice/<id>/confirm
-echo y > /eth/wallets/alice/chains/ethereum/outbox/pending/<swap-id>/confirm
+echo y > /bloom/defi/intents/alice/<id>/confirm
+echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/<swap-id>/confirm
 ```
 
 (demonstration; broadcast disabled by default)
@@ -240,24 +240,24 @@ field.
 ```
 # NL form, chain via 'on base'
 echo 'swap 100 usdc to 0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb on base' \
-  > /eth/defi/intents/alice/new
+  > /bloom/defi/intents/alice/new
 
 # JSON-explicit equivalent
 echo '{"intent":"swap 100 usdc to 0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb","chain":"base"}' \
-  > /eth/defi/intents/alice/new
+  > /bloom/defi/intents/alice/new
 
-cat /eth/defi/intents/alice/<id>/plan.md
+cat /bloom/defi/intents/alice/<id>/plan.md
 # Chain:     base (id 8453)
 # Token in:  0x833589fcd6edb6e08f4c7c32d4f71b54bda02913  amount=100000000 (raw)
 # Token out: 0x50c5725949a6f0c72e6c4a641f24049a917db0cb  amountOut=...
 
 # Auto-approve fires because USDC is ERC-20.
-cat /eth/defi/intents/alice/<id>/tx.json
+cat /bloom/defi/intents/alice/<id>/tx.json
 # [ approve(USDC -> EnsoRouter, max), raw(swap) ]
 
-echo y > /eth/defi/intents/alice/<id>/confirm
-echo y > /eth/wallets/alice/chains/base/outbox/pending/<approve-id>/confirm
-echo y > /eth/wallets/alice/chains/base/outbox/pending/<swap-id>/confirm
+echo y > /bloom/defi/intents/alice/<id>/confirm
+echo y > /bloom/wallets/alice/chains/base/outbox/pending/<approve-id>/confirm
+echo y > /bloom/wallets/alice/chains/base/outbox/pending/<swap-id>/confirm
 ```
 
 This is the chain to use for end-to-end exercise: per-chain `allow_broadcast=true`
@@ -272,11 +272,11 @@ target since the symbol table doesn't include `STETH`:
 
 ```
 echo 'swap 1 eth to 0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84' \
-  > /eth/defi/intents/alice/new
+  > /bloom/defi/intents/alice/new
 
 # JSON-explicit equivalent
 echo '{"intent":"swap 1 eth to 0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84","chain":"ethereum"}' \
-  > /eth/defi/intents/alice/new
+  > /bloom/defi/intents/alice/new
 ```
 
 Whether Enso routes this as a Lido `submit()` or a market buy depends on

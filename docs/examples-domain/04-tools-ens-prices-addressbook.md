@@ -1,6 +1,6 @@
 # Tools, ENS, Prices, Addressbook
 
-VFS is mounted at `/eth/`. All paths below are relative to that mount.
+VFS is mounted at `/bloom/`. All paths below are relative to that mount.
 
 ## Tools
 
@@ -12,7 +12,7 @@ Sessions auto-expire after 5 minutes of idle.
 ### keccak
 
 ```sh
-cat /eth/tools/keccak/hello%20world
+cat /bloom/tools/keccak/hello%20world
 # 0x47173285a8d7341e5e972fc677286384f802f8ef42a5ec5f03bbfa254cb01fad
 ```
 
@@ -24,17 +24,17 @@ back with `/` (so `keccak/a/b` hashes the literal string `a/b`).
 4-byte function selector (the first 4 bytes of `keccak(sig)`).
 
 ```sh
-cat /eth/tools/selector/transfer(address,uint256)
+cat /bloom/tools/selector/transfer(address,uint256)
 # 0xa9059cbb
 
-cat /eth/tools/selector/approve(address,uint256)
+cat /bloom/tools/selector/approve(address,uint256)
 # 0x095ea7b3
 ```
 
 Note the full event-topic form is just `keccak`:
 
 ```sh
-cat /eth/tools/keccak/Transfer(address,address,uint256)
+cat /bloom/tools/keccak/Transfer(address,address,uint256)
 # 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef
 ```
 
@@ -43,28 +43,28 @@ cat /eth/tools/keccak/Transfer(address,address,uint256)
 EIP-55 checksum a lowercase or any-case address.
 
 ```sh
-cat /eth/tools/address/checksum/0xd8da6bf26964af9d7eed9e03e53415d37aa96045
+cat /bloom/tools/address/checksum/0xd8da6bf26964af9d7eed9e03e53415d37aa96045
 # 0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045
 ```
 
 ### sha256, blake3
 
 ```sh
-cat /eth/tools/sha256/hello%20world
-cat /eth/tools/blake3/hello%20world
+cat /bloom/tools/sha256/hello%20world
+cat /bloom/tools/blake3/hello%20world
 ```
 
 ### hex / base64
 
 ```sh
-cat /eth/tools/hex/encode/hello
+cat /bloom/tools/hex/encode/hello
 # 0x68656c6c6f
-cat /eth/tools/hex/decode/0x68656c6c6f
+cat /bloom/tools/hex/decode/0x68656c6c6f
 # hello
 
-cat /eth/tools/base64/encode/hello
+cat /bloom/tools/base64/encode/hello
 # aGVsbG8=
-cat /eth/tools/base64/decode/aGVsbG8=
+cat /bloom/tools/base64/decode/aGVsbG8=
 # hello
 ```
 
@@ -76,13 +76,13 @@ cat /eth/tools/base64/decode/aGVsbG8=
 takes a u256 and a decimals count and produces a human-readable scalar.
 
 ```sh
-cat /eth/tools/unit/parse/1.5/eth
+cat /bloom/tools/unit/parse/1.5/eth
 # 1500000000000000000
 
-cat /eth/tools/unit/parse/25/gwei
+cat /bloom/tools/unit/parse/25/gwei
 # 25000000000
 
-cat /eth/tools/unit/format/1500000000000000000/18
+cat /bloom/tools/unit/format/1500000000000000000/18
 # 1.5
 ```
 
@@ -92,29 +92,29 @@ Write the input JSON to `in.json` under any session id, then read the result.
 
 ```sh
 echo '{"sig":"transfer(address,uint256)","args":["0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045","1000000"]}' \
-  > /eth/tools/abi/encode/s1/in.json
-cat /eth/tools/abi/encode/s1/out.hex
+  > /bloom/tools/abi/encode/s1/in.json
+cat /bloom/tools/abi/encode/s1/out.hex
 # 0xa9059cbb000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa960450000000000000000000000000000000000000000000000000000000000000f4240
 ```
 
 ```sh
 echo '{"types":["address","uint256"],"data":"0x000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa960450000000000000000000000000000000000000000000000000000000000000f4240"}' \
-  > /eth/tools/abi/decode/s1/in.json
-cat /eth/tools/abi/decode/s1/out.json
+  > /bloom/tools/abi/decode/s1/in.json
+cat /bloom/tools/abi/decode/s1/out.json
 ```
 
-`ls /eth/tools/abi/encode/` lists live session ids; `ls /eth/tools/abi/encode/s1/`
+`ls /bloom/tools/abi/encode/` lists live session ids; `ls /bloom/tools/abi/encode/s1/`
 shows `in.json` and `out.hex`.
 
 ### rlp (encode / decode) — session
 
 ```sh
-echo '{"value":["0x83","0xff",["0x01"]]}' > /eth/tools/rlp/encode/r1/in.json
-cat /eth/tools/rlp/encode/r1/out.hex
+echo '{"value":["0x83","0xff",["0x01"]]}' > /bloom/tools/rlp/encode/r1/in.json
+cat /bloom/tools/rlp/encode/r1/out.hex
 # 0xc6818381ffc101
 
-echo '{"data":"0xc6818381ffc101"}' > /eth/tools/rlp/decode/r1/in.json
-cat /eth/tools/rlp/decode/r1/out.json
+echo '{"data":"0xc6818381ffc101"}' > /bloom/tools/rlp/decode/r1/in.json
+cat /bloom/tools/rlp/decode/r1/out.json
 ```
 
 ### eip712/hash — session
@@ -139,8 +139,8 @@ cat > /tmp/mail.json <<'JSON'
   }
 }
 JSON
-cp /tmp/mail.json /eth/tools/eip712/hash/m1/in.json
-cat /eth/tools/eip712/hash/m1/out.hex
+cp /tmp/mail.json /bloom/tools/eip712/hash/m1/in.json
+cat /bloom/tools/eip712/hash/m1/out.hex
 # 0x25c3d40a39e639a4d0b6e4d2ace5e1281e039c88494d97d8d08f99a6ea75d775
 ```
 
@@ -148,13 +148,13 @@ cat /eth/tools/eip712/hash/m1/out.hex
 
 The `ens/` surface is forward-only and read-only. Reverse resolution is not
 mounted here — it lives at `chains/<chain>/addresses/<addr>/ens` (per spec
-§3.2). Listing `/eth/ens/` returns names looked up in this session only;
+§3.2). Listing `/bloom/ens/` returns names looked up in this session only;
 agents can `cat` any `*.eth` name without listing it first.
 
 ### Forward (resolve to address)
 
 ```sh
-cat /eth/ens/vitalik.eth/address
+cat /bloom/ens/vitalik.eth/address
 # 0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045
 ```
 
@@ -165,7 +165,7 @@ Unresolved names return the literal string `unresolved`.
 Routed through the chain handler:
 
 ```sh
-cat /eth/chains/mainnet/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/ens
+cat /bloom/chains/mainnet/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/ens
 ```
 
 ### Text records
@@ -173,17 +173,17 @@ cat /eth/chains/mainnet/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/ens
 Any text key is accepted; unset keys return `not set`.
 
 ```sh
-cat /eth/ens/vitalik.eth/text/url
-cat /eth/ens/vitalik.eth/text/com.twitter
-cat /eth/ens/brantly.eth/text/email
+cat /bloom/ens/vitalik.eth/text/url
+cat /bloom/ens/vitalik.eth/text/com.twitter
+cat /bloom/ens/brantly.eth/text/email
 ```
 
 `avatar` is exposed both as a top-level file (a shortcut for the `avatar` text
 record) and via the `text/` directory:
 
 ```sh
-cat /eth/ens/vitalik.eth/avatar
-# (same as) cat /eth/ens/vitalik.eth/text/avatar
+cat /bloom/ens/vitalik.eth/avatar
+# (same as) cat /bloom/ens/vitalik.eth/text/avatar
 ```
 
 ### Contenthash
@@ -191,13 +191,13 @@ cat /eth/ens/vitalik.eth/avatar
 EIP-1577 contenthash, returned as `0x`-prefixed hex (no codec decoding).
 
 ```sh
-cat /eth/ens/ens.eth/content_hash
+cat /bloom/ens/ens.eth/content_hash
 ```
 
 ### Listing a name's surface
 
 ```sh
-ls /eth/ens/vitalik.eth/
+ls /bloom/ens/vitalik.eth/
 # address  avatar  content_hash  text
 ```
 
@@ -223,11 +223,11 @@ Coin segment forms:
 scalar price as text.
 
 ```sh
-cat /eth/prices/spot/eth.usd
-cat /eth/prices/spot/btc.usd
-cat /eth/prices/spot/usdc.usd
+cat /bloom/prices/spot/eth.usd
+cat /bloom/prices/spot/btc.usd
+cat /bloom/prices/spot/usdc.usd
 
-cat /eth/prices/spot/eth
+cat /bloom/prices/spot/eth
 # {"price": ..., "symbol": "ETH", "decimals": 18, "timestamp": ..., "confidence": ...}
 ```
 
@@ -237,8 +237,8 @@ cat /eth/prices/spot/eth
 variant on this path.
 
 ```sh
-cat /eth/prices/change_24h/eth
-cat /eth/prices/change_24h/usdc
+cat /bloom/prices/change_24h/eth
+cat /bloom/prices/change_24h/usdc
 ```
 
 ## Addressbook
@@ -249,10 +249,10 @@ the EIP-55 checksum address with a trailing newline. Writes register or delete.
 ### List & read
 
 ```sh
-ls /eth/addressbook/
+ls /bloom/addressbook/
 # new  vitalik  weth  usdc
 
-cat /eth/addressbook/vitalik
+cat /bloom/addressbook/vitalik
 # 0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045
 ```
 
@@ -265,12 +265,12 @@ Either write the address directly to the alias file, or post `alias=0x…` to
 `new`:
 
 ```sh
-echo "0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045" > /eth/addressbook/vitalik
-echo "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" > /eth/addressbook/weth
-echo "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" > /eth/addressbook/usdc
+echo "0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045" > /bloom/addressbook/vitalik
+echo "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" > /bloom/addressbook/weth
+echo "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" > /bloom/addressbook/usdc
 
 # Alternative form via the `new` endpoint:
-echo "vitalik=0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045" > /eth/addressbook/new
+echo "vitalik=0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045" > /bloom/addressbook/new
 ```
 
 The address is checksum-normalised on write.
@@ -280,7 +280,7 @@ The address is checksum-normalised on write.
 Write `delete` (case-insensitive) or an empty body to the alias file:
 
 ```sh
-echo "delete" > /eth/addressbook/vitalik
+echo "delete" > /bloom/addressbook/vitalik
 # or
-: > /eth/addressbook/vitalik
+: > /bloom/addressbook/vitalik
 ```

@@ -68,9 +68,9 @@ enum IpcCmd {
 
 #[derive(Subcommand, Debug)]
 enum VfsCmd {
-    /// `cat /eth/<path>` — read a file via the VFS.
+    /// `cat /bloom/<path>` — read a file via the VFS.
     Cat { path: String },
-    /// `ls /eth/<path>` — list a directory via the VFS.
+    /// `ls /bloom/<path>` — list a directory via the VFS.
     Ls { path: String },
     /// Write data to a writable VFS path. Reads from stdin if `--data` is omitted.
     Write {

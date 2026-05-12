@@ -155,7 +155,7 @@ pub struct EnsoConfig {
 }
 
 fn default_mount_path() -> String {
-    "/eth".to_string()
+    "/bloom".to_string()
 }
 fn default_nfs_listen() -> String {
     "127.0.0.1:12049".to_string()
@@ -302,7 +302,7 @@ mod tests {
     fn local_default_shape() {
         let cfg = Config::local_default();
         assert_eq!(cfg.default_chain, "anvil");
-        assert_eq!(cfg.mount_path, "/eth");
+        assert_eq!(cfg.mount_path, "/bloom");
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.block_mainnet_broadcast);
         assert!(cfg.etherscan.is_none());

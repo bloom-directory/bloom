@@ -10,52 +10,52 @@ anvil --port 8545
 bloom wallet new alice --passphrase 'devonly'
 
 # 3. Inspect chain
-cat /eth/chains/anvil/head/number
-cat /eth/chains/anvil/chain_id
+cat /bloom/chains/anvil/head/number
+cat /bloom/chains/anvil/chain_id
 
 # 4. Stage a send
 echo '{"to":"0x70997970C51812dc3A010C7d01b50e0d17dc79C8","value":"0.1 eth","chain":"anvil"}' \
-  > /eth/wallets/alice/chains/anvil/outbox/new.tx
+  > /bloom/wallets/alice/chains/anvil/outbox/new.tx
 
 # 5. Inspect plan
-ls /eth/wallets/alice/chains/anvil/outbox/pending/
-cat /eth/wallets/alice/chains/anvil/outbox/pending/0001-*/plan.md
+ls /bloom/wallets/alice/chains/anvil/outbox/pending/
+cat /bloom/wallets/alice/chains/anvil/outbox/pending/0001-*/plan.md
 
 # 6. Confirm
-echo y > /eth/wallets/alice/chains/anvil/outbox/pending/0001-*/confirm
+echo y > /bloom/wallets/alice/chains/anvil/outbox/pending/0001-*/confirm
 
 # 7. Inspect receipt
-ls /eth/wallets/alice/chains/anvil/outbox/sent/
+ls /bloom/wallets/alice/chains/anvil/outbox/sent/
 ```
 
 ## Tools
 
 ```sh
-cat /eth/tools/keccak/abc                     # hex digest
-cat /eth/tools/address/checksum/0xabc...      # EIP-55 form
-cat /eth/tools/unit/parse/1.5/eth             # → 1500000000000000000
-cat /eth/tools/unit/format/1500000000000000000/18  # → 1.5
+cat /bloom/tools/keccak/abc                     # hex digest
+cat /bloom/tools/address/checksum/0xabc...      # EIP-55 form
+cat /bloom/tools/unit/parse/1.5/eth             # → 1500000000000000000
+cat /bloom/tools/unit/format/1500000000000000000/18  # → 1.5
 ```
 
 ## NFTs (ERC-721 / ERC-1155)
 
 ```sh
 # CryptoPunks #5822 — collection view (RPC-only, no etherscan needed):
-cat /eth/chains/ethereum/contracts/0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb/nft/kind
-cat /eth/chains/ethereum/contracts/0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb/nft/name
-cat /eth/chains/ethereum/contracts/0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb/nft/owner_of/5822
+cat /bloom/chains/ethereum/contracts/0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb/nft/kind
+cat /bloom/chains/ethereum/contracts/0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb/nft/name
+cat /bloom/chains/ethereum/contracts/0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb/nft/owner_of/5822
 
 # BoredApe #1 — per-holder view (history needs an etherscan API key):
-cat /eth/chains/ethereum/addresses/0xd8da6bf26964af9d7eed9e03e53415d37aa96045/nfts/erc721_txs
-cat /eth/chains/ethereum/addresses/0xd8da6bf26964af9d7eed9e03e53415d37aa96045/nfts/owned.json
+cat /bloom/chains/ethereum/addresses/0xd8da6bf26964af9d7eed9e03e53415d37aa96045/nfts/erc721_txs
+cat /bloom/chains/ethereum/addresses/0xd8da6bf26964af9d7eed9e03e53415d37aa96045/nfts/owned.json
 
 # Per-token detail (auto-detects ERC-1155 and substitutes the {id}
 # placeholder in the metadata URI):
-cat /eth/chains/ethereum/addresses/0x.../nfts/0x.../1/owner
-cat /eth/chains/ethereum/addresses/0x.../nfts/0x.../1/uri
-cat /eth/chains/ethereum/addresses/0x.../nfts/0x.../1/metadata.json
-cat /eth/chains/ethereum/addresses/0x.../nfts/0x.../1/is_owner       # true/false
-cat /eth/chains/ethereum/addresses/0x.../nfts/0x.../1/balance         # always 1 for ERC-721
+cat /bloom/chains/ethereum/addresses/0x.../nfts/0x.../1/owner
+cat /bloom/chains/ethereum/addresses/0x.../nfts/0x.../1/uri
+cat /bloom/chains/ethereum/addresses/0x.../nfts/0x.../1/metadata.json
+cat /bloom/chains/ethereum/addresses/0x.../nfts/0x.../1/is_owner       # true/false
+cat /bloom/chains/ethereum/addresses/0x.../nfts/0x.../1/balance         # always 1 for ERC-721
 ```
 
 `metadata.json` follows `data:`, `ipfs://`, and `http(s)://` URIs (1 MiB
@@ -78,16 +78,16 @@ echo '{
   "contract": "0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb",
   "to":       "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
   "token_id": "1234"
-}' > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 
 # Same intent in shell form:
 echo 'nft transfer 0xb47e3...3bbb #1234 to 0x70997...79C8' \
-  > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+  > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 
 # 2. Per-token approve (ERC-721 only; ERC-1155 has no per-token approval
 #    and the engine rejects it with a clear error):
 echo 'nft approve 0xb47e3...3bbb #1234 operator 0x111...111' \
-  > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+  > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 
 # 3. setApprovalForAll — operator-wide. This always trips a policy WARN
 #    so the resulting plan.md flags the broad scope before you confirm.
@@ -96,7 +96,7 @@ echo '{
   "contract": "0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb",
   "operator": "0x1111111111111111111111111111111111111111",
   "approved": true
-}' > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 
 # 4. ERC-1155 transfer with explicit amount:
 echo '{
@@ -106,13 +106,13 @@ echo '{
   "token_id": "0x...id...",
   "standard": "erc1155",
   "amount":   "3"
-}' > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 ```
 
 Inspect the plan before confirming — it shows the decoded NFT action,
 the contract / counterparty, the token id, and any policy warnings:
 
 ```sh
-cat /eth/wallets/alice/chains/ethereum/outbox/pending/0001-*/plan.md
-echo y > /eth/wallets/alice/chains/ethereum/outbox/pending/0001-*/confirm
+cat /bloom/wallets/alice/chains/ethereum/outbox/pending/0001-*/plan.md
+echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/0001-*/confirm
 ```

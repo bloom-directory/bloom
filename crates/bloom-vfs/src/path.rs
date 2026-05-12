@@ -8,7 +8,7 @@ use std::fmt;
 /// become VFS path segments. The kernel splits paths on `/` and hands us
 /// each component verbatim, so users embed bytes that the shell/kernel
 /// can't pass literally (notably space, `?`, `#`, etc.) using percent-
-/// escapes — `cat /eth/tools/keccak/hello%20world` should hash the
+/// escapes — `cat /bloom/tools/keccak/hello%20world` should hash the
 /// six-byte string `hello world`, not the literal ASCII `hello%20world`.
 ///
 /// Decoding rules:

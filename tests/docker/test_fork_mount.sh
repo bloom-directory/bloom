@@ -3,13 +3,13 @@
 #
 # Sibling of test_enso_aave.sh, but limited to the wallet/outbox +
 # chain read surface. No Enso, no DeFi route. The point is to prove
-# that an agent with shell access to /eth/ can:
+# that an agent with shell access to /bloom/ can:
 #
-#   1. Stage a plain native-ETH transfer via /eth/wallets/<w>/chains/<c>/outbox/new.tx
-#   2. Broadcast it via /eth/wallets/<w>/chains/<c>/outbox/pending/<id>/confirm
+#   1. Stage a plain native-ETH transfer via /bloom/wallets/<w>/chains/<c>/outbox/new.tx
+#   2. Broadcast it via /bloom/wallets/<w>/chains/<c>/outbox/pending/<id>/confirm
 #   3. Stage a SECOND tx and replace it (same nonce, bumped fees + fresh
-#      calldata) via /eth/wallets/<w>/chains/<c>/outbox/pending/<id>/replace
-#   4. Read tx receipt + chain head + gas via /eth/chains/<c>/...
+#      calldata) via /bloom/wallets/<w>/chains/<c>/outbox/pending/<id>/replace
+#   4. Read tx receipt + chain head + gas via /bloom/chains/<c>/...
 #
 # All writes go through the kernel NFS mount; nothing uses `bloom ipc
 # call` shortcuts. If this passes, the fork-mode mount surface is

@@ -18,7 +18,7 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 LOG_PREFIX=mount-test
 
-# This test mounts at /mnt/bloom (not the chain tests' /eth) so the
+# This test mounts at /mnt/bloom (not the chain tests' /bloom) so the
 # sentinel sits at /mnt/.bloom-mounted. Override before sourcing.
 MNT=/mnt/bloom
 SENTINEL=/mnt/.bloom-mounted
@@ -66,7 +66,7 @@ echo "::endgroup::"
 # client routinely upgrades small writes to DATA_SYNC/FILE_SYNC, and
 # the embednfs server enforces `actual_stability >= requested`. The
 # adapter used to hard-code UNSTABLE in its WRITE reply, so a single
-# `printf '%s' BODY > /eth/<writable>` failed with EREMOTEIO (the
+# `printf '%s' BODY > /bloom/<writable>` failed with EREMOTEIO (the
 # kernel-side surface of NFS4ERR_SERVERFAULT) — even though the
 # handler had already accepted the body. The fix lives in
 # `crates/bloom-mount/src/adapter.rs::write` (honour the requested

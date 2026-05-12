@@ -69,7 +69,7 @@ struct Cache {
     /// keyed by `(name, kind, sub)` where `sub` is the text key for text
     /// records, otherwise empty.
     entries: HashMap<(String, &'static str, String), CachedEntry>,
-    /// Names looked up in this process (so `ls /eth/ens/` shows
+    /// Names looked up in this process (so `ls /bloom/ens/` shows
     /// something useful). Persistent enumeration of the global ENS name
     /// space is impossible.
     seen_names: Vec<String>,
@@ -416,14 +416,14 @@ mod tests {
 
     // --- Shape B (directory) contract pins ----------------------------
     //
-    // EXAMPLES.md §11 documents `/eth/ens/<name>/` as a *directory*
+    // EXAMPLES.md §11 documents `/bloom/ens/<name>/` as a *directory*
     // containing `address`, `avatar`, `content_hash`, `text/`. These
     // tests pin that shape so a future refactor can't silently flip
     // `<name>` into a file (which would break `cat <name>/address`).
 
     #[tokio::test]
     async fn name_is_a_directory_not_a_file() {
-        // The user-reported "bug" was that `/eth/ens/vitalik.eth`
+        // The user-reported "bug" was that `/bloom/ens/vitalik.eth`
         // reads as a directory. That is the documented contract —
         // every example uses `<name>/<field>`. Pin it.
         let h = EnsHandler::new(None);
@@ -556,7 +556,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_name_dir_matches_examples_md() {
-        // EXAMPLES.md §11: `ls /eth/ens/vitalik.eth/` →
+        // EXAMPLES.md §11: `ls /bloom/ens/vitalik.eth/` →
         //   address  avatar  content_hash  text
         let h = EnsHandler::new(None);
         let entries = h

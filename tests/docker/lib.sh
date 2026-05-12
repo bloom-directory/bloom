@@ -19,10 +19,10 @@ require_env() {
 }
 
 # ---------- shared mount layout ----------
-# The chain tests (enso, fork) mount at /eth so user-facing paths read
-# `/eth/wallets/...`. The basic mount test overrides MNT/SENTINEL before
+# The chain tests (enso, fork) mount at /bloom so user-facing paths read
+# `/bloom/wallets/...`. The basic mount test overrides MNT/SENTINEL before
 # sourcing this file. PIDFILE/LOGFILE are stable across all of them.
-: "${MNT:=/eth}"
+: "${MNT:=/bloom}"
 : "${SENTINEL:=/.bloom-mounted}"
 : "${PIDFILE:=/tmp/mount_demo.pid}"
 : "${LOGFILE:=/tmp/mount_demo.log}"

@@ -1,6 +1,6 @@
 # NFT examples (ERC-721 / ERC-1155)
 
-These examples assume the bloom VFS is mounted at `/eth/`. The NFT
+These examples assume the bloom VFS is mounted at `/bloom/`. The NFT
 surface lives under two trees on every chain:
 
 - `chains/<chain>/contracts/<a>/nft/...` — collection-level views.
@@ -30,16 +30,16 @@ hits Etherscan or an external HTTP fetch is annotated inline.
 
 ```sh
 # BAYC: ERC-165 detection + name + symbol + supply (RPC-only).
-cat /eth/chains/ethereum/contracts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/nft/kind
+cat /bloom/chains/ethereum/contracts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/nft/kind
 # => erc721
 
-cat /eth/chains/ethereum/contracts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/nft/name
+cat /bloom/chains/ethereum/contracts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/nft/name
 # => BoredApeYachtClub
 
-cat /eth/chains/ethereum/contracts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/nft/symbol
+cat /bloom/chains/ethereum/contracts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/nft/symbol
 # => BAYC
 
-cat /eth/chains/ethereum/contracts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/nft/total_supply
+cat /bloom/chains/ethereum/contracts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/nft/total_supply
 # => 10000   (or "unknown" if the contract does not expose totalSupply)
 ```
 
@@ -50,14 +50,14 @@ the literal string `unknown` rather than erroring.
 ERC-1155 collection on the OpenSea Shared Storefront:
 
 ```sh
-cat /eth/chains/ethereum/contracts/0x495f947276749Ce646f68AC8c248420045cb7b5e/nft/kind
+cat /bloom/chains/ethereum/contracts/0x495f947276749Ce646f68AC8c248420045cb7b5e/nft/kind
 # => erc1155
 ```
 
 CryptoPunks — note the caveat:
 
 ```sh
-cat /eth/chains/ethereum/contracts/0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb/nft/kind
+cat /bloom/chains/ethereum/contracts/0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb/nft/kind
 # => erc721 (it does answer ERC-165, but its `transferFrom` is non-standard;
 #    `nft_transfer` will encode the standard ERC-721 selector which the
 #    contract does NOT implement. Use the dedicated CryptoPunks methods
@@ -71,14 +71,14 @@ leaf names are the token id in decimal:
 
 ```sh
 # CryptoPunks #5822 owner.
-cat /eth/chains/ethereum/contracts/0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb/nft/owner_of/5822
+cat /bloom/chains/ethereum/contracts/0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb/nft/owner_of/5822
 
 # Pudgy Penguins #6873 tokenURI (just the URI string, not the metadata).
-cat /eth/chains/ethereum/contracts/0xBd3531dA5CF5857e7CfAA92426877b022e612cf8/nft/token_uri/6873
+cat /bloom/chains/ethereum/contracts/0xBd3531dA5CF5857e7CfAA92426877b022e612cf8/nft/token_uri/6873
 
 # Nouns #1 owner — Nouns DAO holds the auctioneer pattern, the owner is
 # the winning bidder (or the treasury for unsold auctions).
-cat /eth/chains/ethereum/contracts/0x9C8fF314C9Bc7F6e59A9d9225Fb22946427eDC03/nft/owner_of/1
+cat /bloom/chains/ethereum/contracts/0x9C8fF314C9Bc7F6e59A9d9225Fb22946427eDC03/nft/owner_of/1
 ```
 
 For ERC-1155, `owner_of` returns the literal `not applicable` (1155
@@ -92,7 +92,7 @@ marketplace on a given collection:
 
 ```sh
 # Has vitalik.eth approved the OpenSea conduit (example operator) on BAYC?
-cat /eth/chains/ethereum/contracts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/nft/is_approved_for_all/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/0x1E0049783F008A0085193E00003D00cd54003c71
+cat /bloom/chains/ethereum/contracts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/nft/is_approved_for_all/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/0x1E0049783F008A0085193E00003D00cd54003c71
 # => true / false
 ```
 
@@ -105,17 +105,17 @@ These three top-level leaves rely on Etherscan (`backends.address_history`):
 ```sh
 # Vitalik's ERC-721 transfer history.
 # requires backends.address_history = "etherscan"
-cat /eth/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nfts/erc721_txs
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nfts/erc721_txs
 
 # Pranksy's ERC-1155 transfer history.
 # requires backends.address_history = "etherscan"
-cat /eth/chains/ethereum/addresses/0xd387a6e4e84a6c86bd90c158c6028a58cc8ac459/nfts/erc1155_txs
+cat /bloom/chains/ethereum/addresses/0xd387a6e4e84a6c86bd90c158c6028a58cc8ac459/nfts/erc1155_txs
 
 # Best-effort holdings: reduces in/out from the ERC-721 history. Carries
 # a "caveat" field flagging that this is not authoritative — out-of-band
 # transfers, missed history, or reorgs will skew the result. Page-capped.
 # requires backends.address_history = "etherscan"
-cat /eth/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nfts/owned.json
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nfts/owned.json
 ```
 
 Output schema for `owned.json`:
@@ -143,25 +143,25 @@ the URI over HTTP/IPFS. These are valid for any holder-context path
 
 ```sh
 # The actual on-chain owner.
-cat /eth/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nfts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/1/owner
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nfts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/1/owner
 
 # Token URI (just the URI).
-cat /eth/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nfts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/1/uri
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nfts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/1/uri
 
 # Pretty-printed metadata. Fetches the URI over HTTP / IPFS / data:.
 # Caps: 1 MiB body, 5s total timeout. ipfs:// is rewritten to
 # https://ipfs.io/ipfs/<cid>. data: URIs are decoded inline (base64
 # or URL-encoded JSON).
 # external HTTP fetch
-cat /eth/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nfts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/1/metadata.json
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nfts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/1/metadata.json
 
 # `balance` is always 0 or 1 for ERC-721; `is_owner` is the boolean form.
-cat /eth/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nfts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/1/balance
-cat /eth/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nfts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/1/is_owner
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nfts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/1/balance
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nfts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/1/is_owner
 
 # Per-token approved operator (ERC-721 only). For ERC-1155 this leaf
 # returns the literal "not applicable".
-cat /eth/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nfts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/1/approved
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nfts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/1/approved
 ```
 
 ### ERC-1155 example: OpenSea Shared Storefront, large hex id
@@ -176,15 +176,15 @@ ERC-1155 metadata spec.
 ```sh
 # Token id 0x000000000000000000000000000000000000000000000000000000000000000a
 # is decimal 10. URI for token id 10 on OpenSea Shared Storefront:
-cat /eth/chains/ethereum/addresses/0xd387a6e4e84a6c86bd90c158c6028a58cc8ac459/nfts/0x495f947276749Ce646f68AC8c248420045cb7b5e/10/uri
+cat /bloom/chains/ethereum/addresses/0xd387a6e4e84a6c86bd90c158c6028a58cc8ac459/nfts/0x495f947276749Ce646f68AC8c248420045cb7b5e/10/uri
 
 # Pranksy's balance of that id.
-cat /eth/chains/ethereum/addresses/0xd387a6e4e84a6c86bd90c158c6028a58cc8ac459/nfts/0x495f947276749Ce646f68AC8c248420045cb7b5e/10/balance
+cat /bloom/chains/ethereum/addresses/0xd387a6e4e84a6c86bd90c158c6028a58cc8ac459/nfts/0x495f947276749Ce646f68AC8c248420045cb7b5e/10/balance
 
 # Metadata: if the contract's URI is "https://api.opensea.io/api/v1/metadata/0x495f.../{id}",
 # bloom fetches "https://api.opensea.io/api/v1/metadata/0x495f.../000...000000000a".
 # external HTTP fetch
-cat /eth/chains/ethereum/addresses/0xd387a6e4e84a6c86bd90c158c6028a58cc8ac459/nfts/0x495f947276749Ce646f68AC8c248420045cb7b5e/10/metadata.json
+cat /bloom/chains/ethereum/addresses/0xd387a6e4e84a6c86bd90c158c6028a58cc8ac459/nfts/0x495f947276749Ce646f68AC8c248420045cb7b5e/10/metadata.json
 ```
 
 ### Base mainnet — same shape
@@ -192,7 +192,7 @@ cat /eth/chains/ethereum/addresses/0xd387a6e4e84a6c86bd90c158c6028a58cc8ac459/nf
 ```sh
 # An ERC-721 collection on Base. Same per-token leaves apply; only the
 # chain segment changes.
-cat /eth/chains/base/contracts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/nft/kind
+cat /bloom/chains/base/contracts/0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D/nft/kind
 ```
 
 ---
@@ -224,7 +224,7 @@ echo '{
   "contract": "0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D",
   "to":       "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
   "token_id": "1"
-}' > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 ```
 
 Legacy unsafe transfer (skips `onERC721Received` callback):
@@ -236,7 +236,7 @@ echo '{
   "to":       "vitalik.eth",
   "token_id": "1234",
   "safe":     false
-}' > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 ```
 
 ### `nft_transfer` — ERC-721, shell shorthand
@@ -247,11 +247,11 @@ The shell parser accepts `nft transfer <contract> <token_id> to <addr>
 ```sh
 # Same as the JSON BAYC #1 transfer above.
 echo 'nft transfer 0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D 1 to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on ethereum' \
-  > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+  > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 
 # Pudgy Penguins #6873 to vitalik.eth.
 echo 'nft transfer 0xBd3531dA5CF5857e7CfAA92426877b022e612cf8 6873 to vitalik.eth on ethereum' \
-  > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+  > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 ```
 
 ### `nft_transfer` — ERC-1155 with amount and optional data
@@ -270,7 +270,7 @@ echo '{
   "token_id": "10",
   "standard": "erc1155",
   "amount":   "3"
-}' > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 
 # Same with optional `data` payload (forwarded to onERC1155Received).
 echo '{
@@ -281,7 +281,7 @@ echo '{
   "standard": "erc1155",
   "amount":   "1",
   "data":     "0xdeadbeef"
-}' > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 ```
 
 Shell shorthand for ERC-1155 (the `amount <n>` clause flips the
@@ -289,7 +289,7 @@ standard hint to erc1155, so no JSON is needed):
 
 ```sh
 echo 'nft transfer 0x495f947276749Ce646f68AC8c248420045cb7b5e 10 amount 3 to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on ethereum' \
-  > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+  > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 ```
 
 ### `nft_approve` — ERC-721 per-token
@@ -309,11 +309,11 @@ echo '{
   "contract": "0x8a90CAb2b38dba80c64b7734e58Ee1dB38B8992e",
   "operator": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
   "token_id": "1234"
-}' > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 
 # Equivalent shell shorthand:
 echo 'nft approve 0x8a90CAb2b38dba80c64b7734e58Ee1dB38B8992e 1234 to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on ethereum' \
-  > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+  > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 
 # Revoke: pass the zero address as operator.
 echo '{
@@ -321,7 +321,7 @@ echo '{
   "contract": "0x8a90CAb2b38dba80c64b7734e58Ee1dB38B8992e",
   "operator": "0x0000000000000000000000000000000000000000",
   "token_id": "1234"
-}' > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 ```
 
 Rejection example — the OpenSea Shared Storefront is ERC-1155, so a
@@ -333,12 +333,12 @@ echo '{
   "contract": "0x495f947276749Ce646f68AC8c248420045cb7b5e",
   "operator": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
   "token_id": "10"
-}' > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 
 # Inspect the failure: the failed/ slot will hold the rejected intent
 # with the engine error. Nothing lands in pending/.
-ls /eth/wallets/alice/chains/ethereum/outbox/failed/
-cat /eth/wallets/alice/chains/ethereum/outbox/failed/0001-*/error
+ls /bloom/wallets/alice/chains/ethereum/outbox/failed/
+cat /bloom/wallets/alice/chains/ethereum/outbox/failed/0001-*/error
 # => ERC-1155 has no per-token approval; use nft_approve_all
 ```
 
@@ -362,12 +362,12 @@ echo '{
   "contract": "0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D",
   "operator": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
   "approved": true
-}' > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 
 # Shell shorthand (note: verb is `set_approval_for_all`, with operator
 # before the boolean):
 echo 'nft set_approval_for_all 0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 true on ethereum' \
-  > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+  > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 
 # Revoke a previously-granted operator-wide approval (no WARN).
 echo '{
@@ -375,7 +375,7 @@ echo '{
   "contract": "0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D",
   "operator": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
   "approved": false
-}' > /eth/wallets/alice/chains/ethereum/outbox/new.tx
+}' > /bloom/wallets/alice/chains/ethereum/outbox/new.tx
 ```
 
 ### Inspect the plan, then confirm
@@ -386,16 +386,16 @@ counterparty, token id, ERC-1155 amount when set, and any policy
 checks (including the `nft.approve_all` WARN):
 
 ```sh
-ls /eth/wallets/alice/chains/ethereum/outbox/pending/
+ls /bloom/wallets/alice/chains/ethereum/outbox/pending/
 # 0001-7f3c.../
 
-cat /eth/wallets/alice/chains/ethereum/outbox/pending/0001-*/plan.md
+cat /bloom/wallets/alice/chains/ethereum/outbox/pending/0001-*/plan.md
 
 # Confirm.
-echo y > /eth/wallets/alice/chains/ethereum/outbox/pending/0001-*/confirm
+echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/0001-*/confirm
 
 # Receipt lands under sent/.
-ls /eth/wallets/alice/chains/ethereum/outbox/sent/
+ls /bloom/wallets/alice/chains/ethereum/outbox/sent/
 ```
 
 If a policy WARN surfaced a write-override requirement, the daemon

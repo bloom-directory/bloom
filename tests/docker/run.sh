@@ -16,7 +16,7 @@
 #                   shared docker-compose stack (anvil-fork sidecar +
 #                   bloom-test-enso driver, selected via the `enso`
 #                   profile). Drives the Enso -> Aave intent flow end
-#                   to end through the NFS mount at /eth/. Requires
+#                   to end through the NFS mount at /bloom/. Requires
 #                   BLOOM_ENSO_KEY in the environment.
 #   --enso-live   — same Enso -> Aave flow but against Base mainnet,
 #                   broadcasting from the live keystore at $BLOOM_LIVE_HOME

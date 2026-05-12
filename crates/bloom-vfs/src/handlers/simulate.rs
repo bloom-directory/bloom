@@ -764,7 +764,7 @@ impl SimulateHandler {
         let segs = path.segments();
         match segs.len() {
             1 if segs[0] == "new" => {
-                Ok(b"# write a JSON simulate envelope to allocate a session\n# example:\n#   echo '{\"intent\":{\"chain\":\"anvil\",\"to\":\"0x...\",\"data\":\"0x...\"}}' > /eth/simulate/new\n# read the resulting session id from /eth/simulate/last\n".to_vec())
+                Ok(b"# write a JSON simulate envelope to allocate a session\n# example:\n#   echo '{\"intent\":{\"chain\":\"anvil\",\"to\":\"0x...\",\"data\":\"0x...\"}}' > /bloom/simulate/new\n# read the resulting session id from /bloom/simulate/last\n".to_vec())
             }
             1 if segs[0] == "last" => {
                 let g = self.sessions.read();

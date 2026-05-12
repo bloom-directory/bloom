@@ -3,7 +3,7 @@
 A short Anvil-backed walkthrough of the `bloom` CLI. The CLI's `vfs`
 subcommands are the v1 substitute for the optional NFS mount: every
 `cat` / `ls` / `write` here is what an agent would otherwise do
-through the mounted `/eth/` tree.
+through the mounted `/bloom/` tree.
 
 ## Prerequisites
 
@@ -96,7 +96,7 @@ an NFS mount this would be:
 
 ```sh
 echo 'send 0.01 eth to 0xabc... on anvil' \
-  > /eth/wallets/alice/chains/anvil/outbox/new.tx
+  > /bloom/wallets/alice/chains/anvil/outbox/new.tx
 ```
 
 Without the mount, the equivalent is:

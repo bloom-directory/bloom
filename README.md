@@ -59,7 +59,7 @@ Two ways to drive the VFS:
 
 ## Filesystem layout
 
-The VFS is rooted at `/eth/` (the default NFS mount path) with these
+The VFS is rooted at `/bloom/` (the default NFS mount path) with these
 top-level trees:
 
 - `chains/<chain>/` — read-only chain views: head, blocks, addresses,
@@ -191,4 +191,4 @@ map and live-network verification log.
 
 ## License
 
-Licensed under either of MIT or Apache-2.0 at your option.
+Licensed under the MIT License. See [LICENSE](./LICENSE).
