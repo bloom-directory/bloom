@@ -41,6 +41,10 @@ pub struct Config {
     pub etherscan: Option<EtherscanConfig>,
     #[serde(default)]
     pub enso: Option<EnsoConfig>,
+    #[serde(default)]
+    pub mempool: BTreeMap<String, MempoolChainConfig>,
+    #[serde(default)]
+    pub private_rpc: BTreeMap<String, PrivateRpcChainConfig>,
     /// Kill-switch: never permit broadcast to mainnet chain ids regardless
     /// of per-chain `allow_broadcast`.
     #[serde(default = "default_mainnet_block")]
@@ -154,6 +158,24 @@ pub struct EnsoConfig {
     pub api_url: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MempoolChainConfig {
+    /// Provider id — must match a `beth_mempool::providers::*` adapter
+    /// id: `"alchemy"` or `"generic_eth_subscribe"`.
+    pub provider: String,
+    pub ws_url: String,
+    #[serde(default = "default_max_index_size")]
+    pub max_index_size: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PrivateRpcChainConfig {
+    #[serde(default)]
+    pub mev_blocker_url: Option<String>,
+    #[serde(default)]
+    pub flashbots_url: Option<String>,
+}
+
 fn default_mount_path() -> String {
     "/eth".to_string()
 }
@@ -174,6 +196,9 @@ fn default_enso_url() -> String {
 }
 fn default_mainnet_block() -> bool {
     true
+}
+fn default_max_index_size() -> usize {
+    50_000
 }
 fn default_contract_metadata_backend() -> Backend {
     Backend::Etherscan
@@ -204,6 +229,8 @@ impl Config {
             chains,
             etherscan: None,
             enso: None,
+            mempool: BTreeMap::new(),
+            private_rpc: BTreeMap::new(),
             block_mainnet_broadcast: true,
             backends: BackendsConfig::default(),
         }
@@ -620,5 +647,72 @@ api_key = "ENKEY"
         let en = cfg.enso.expect("enso parsed");
         assert_eq!(en.api_key, "ENKEY");
         assert_eq!(en.api_url, "https://api.enso.finance");
+    }
+
+    #[test]
+    fn mempool_chain_config_round_trips_through_toml() {
+        let mut cfg = Config::local_default();
+        cfg.mempool.insert(
+            "ethereum".to_string(),
+            MempoolChainConfig {
+                provider: "alchemy".into(),
+                ws_url: "wss://eth-mainnet.example/v2/key".into(),
+                max_index_size: 25_000,
+            },
+        );
+        let s = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&s).unwrap();
+        assert_configs_equivalent(&cfg, &back);
+        let m = back.mempool.get("ethereum").unwrap();
+        assert_eq!(m.provider, "alchemy");
+        assert_eq!(m.max_index_size, 25_000);
+    }
+
+    #[test]
+    fn private_rpc_chain_config_round_trips_through_toml() {
+        let mut cfg = Config::local_default();
+        cfg.private_rpc.insert(
+            "ethereum".to_string(),
+            PrivateRpcChainConfig {
+                mev_blocker_url: Some("https://rpc.mevblocker.io".into()),
+                flashbots_url: Some("https://rpc.flashbots.net/fast".into()),
+            },
+        );
+        let s = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&s).unwrap();
+        assert_configs_equivalent(&cfg, &back);
+        let r = back.private_rpc.get("ethereum").unwrap();
+        assert_eq!(
+            r.mev_blocker_url.as_deref(),
+            Some("https://rpc.mevblocker.io")
+        );
+        assert_eq!(
+            r.flashbots_url.as_deref(),
+            Some("https://rpc.flashbots.net/fast")
+        );
+    }
+
+    #[test]
+    fn mempool_max_index_size_uses_default_when_omitted() {
+        let toml_src = r#"
+mount_path = "/eth"
+nfs_listen_addr = "127.0.0.1:12049"
+default_chain = "anvil"
+stage_ttl = "1h"
+block_mainnet_broadcast = true
+
+[chains.anvil]
+name = "anvil"
+chain_id = 31337
+rpc_urls = ["http://127.0.0.1:8545"]
+allow_broadcast = true
+
+[mempool.ethereum]
+provider = "alchemy"
+ws_url = "wss://example"
+"#;
+        let cfg: Config = toml::from_str(toml_src).unwrap();
+        let m = cfg.mempool.get("ethereum").unwrap();
+        assert_eq!(m.max_index_size, 50_000);
     }
 }
