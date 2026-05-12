@@ -34,6 +34,12 @@ pub struct Policy {
     pub per_chain: BTreeMap<String, PolicyCaps>,
     #[serde(default)]
     pub automation: PolicyAutomation,
+    #[serde(default)]
+    pub private: PrivatePolicy,
+    #[serde(default)]
+    pub mev: MevPolicy,
+    #[serde(default)]
+    pub bump: BumpPolicy,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -115,6 +121,73 @@ pub struct PolicyAutomation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivatePolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_private_provider")]
+    pub provider: String,
+}
+
+impl Default for PrivatePolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_private_provider(),
+        }
+    }
+}
+
+fn default_private_provider() -> String {
+    "mev_blocker".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MevPolicy {
+    #[serde(default = "default_max_slippage_bps")]
+    pub max_slippage_bps: u32,
+    #[serde(default)]
+    pub fail_on_high_risk: bool,
+}
+
+impl Default for MevPolicy {
+    fn default() -> Self {
+        Self {
+            max_slippage_bps: 100,
+            fail_on_high_risk: false,
+        }
+    }
+}
+
+fn default_max_slippage_bps() -> u32 {
+    100
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BumpPolicy {
+    #[serde(default = "default_stuck_after_secs")]
+    pub stuck_after_secs: u64,
+    #[serde(default = "default_basefee_overrun_pct")]
+    pub basefee_overrun_pct: u32,
+}
+
+impl Default for BumpPolicy {
+    fn default() -> Self {
+        Self {
+            stuck_after_secs: 90,
+            basefee_overrun_pct: 20,
+        }
+    }
+}
+
+fn default_stuck_after_secs() -> u64 {
+    90
+}
+
+fn default_basefee_overrun_pct() -> u32 {
+    20
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyCheck {
     pub rule: String,
     pub outcome: PolicyOutcome,
@@ -177,5 +250,44 @@ mod tests {
             PolicyCaps::most_restrictive(&a, &b).max_value_eth,
             Some(0.5)
         );
+    }
+
+    #[test]
+    fn policy_defaults_when_new_sections_missing() {
+        let toml_src = "[caps]\nmax_value_eth = 0.1\n";
+        let p: Policy = toml::from_str(toml_src).unwrap();
+        assert!(!p.private.enabled);
+        assert_eq!(p.private.provider, "mev_blocker");
+        assert_eq!(p.mev.max_slippage_bps, 100);
+        assert!(!p.mev.fail_on_high_risk);
+        assert_eq!(p.bump.stuck_after_secs, 90);
+        assert_eq!(p.bump.basefee_overrun_pct, 20);
+    }
+
+    #[test]
+    fn policy_parses_new_sections_when_present() {
+        let toml_src = r#"
+[caps]
+max_value_eth = 0.1
+
+[private]
+enabled = true
+provider = "flashbots"
+
+[mev]
+max_slippage_bps = 250
+fail_on_high_risk = true
+
+[bump]
+stuck_after_secs = 30
+basefee_overrun_pct = 50
+"#;
+        let p: Policy = toml::from_str(toml_src).unwrap();
+        assert!(p.private.enabled);
+        assert_eq!(p.private.provider, "flashbots");
+        assert_eq!(p.mev.max_slippage_bps, 250);
+        assert!(p.mev.fail_on_high_risk);
+        assert_eq!(p.bump.stuck_after_secs, 30);
+        assert_eq!(p.bump.basefee_overrun_pct, 50);
     }
 }
