@@ -336,6 +336,7 @@ impl Handler for MempoolHandler {
                             break;
                         }
                         Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                            self.increment_dropped(n);
                             let lagged = serde_json::json!({"kind": "lagged", "skipped": n});
                             serde_json::to_writer(&mut out, &lagged)
                                 .map_err(|e| HandlerError::backend(e.to_string()))?;

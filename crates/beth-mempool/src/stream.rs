@@ -115,7 +115,9 @@ mod tests {
             hash: B256::from(h),
             from: Address::ZERO,
             to: None,
-            nonce: 0,
+            // Distinct nonce per fixture: same-(addr, nonce) inserts collapse
+            // to a single index entry, which would mask the count assertion.
+            nonce: b as u64,
             value: U256::ZERO,
             gas_limit: 21_000,
             fees: TxFees::Legacy { gas_price: 1 },

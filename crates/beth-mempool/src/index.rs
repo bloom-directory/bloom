@@ -52,6 +52,17 @@ impl PendingTxIndex {
             return;
         }
 
+        // Nonce-replacement: an earlier tx with the same (from, nonce) but a
+        // different hash is being superseded. Drop the stale hash from
+        // by_hash/order so len()/snapshot() reflect one tx per (addr, nonce);
+        // otherwise the stale entry would only age out via LRU.
+        if let Some(&prior) = g.by_addr_nonce.get(&(from, nonce))
+            && prior != hash
+        {
+            g.by_hash.remove(&prior);
+            g.order.retain(|h| h != &prior);
+        }
+
         while g.order.len() >= self.capacity {
             if let Some(victim) = g.order.pop_front() {
                 if let Some(rec) = g.by_hash.remove(&victim) {
@@ -231,9 +242,19 @@ mod tests {
         let got = idx.lookup_by_addr_nonce(b.from, 5).unwrap();
         assert_eq!(got.tx.hash, b.hash);
 
-        // Removing the older hash a must NOT delete the by_addr_nonce entry
-        // that points at b.
-        idx.remove(&a.hash);
+        // Same-nonce replacement drops the stale hash entirely — len() must
+        // not over-report and the old hash must not be reachable.
+        assert_eq!(idx.len(), 1);
+        assert!(idx.lookup_by_hash(&a.hash).is_none());
+        assert_eq!(
+            idx.evictions_total(),
+            0,
+            "replacement is not a capacity eviction"
+        );
+
+        // Removing the (now absent) older hash a must be a no-op and leave
+        // the by_addr_nonce entry pointing at b intact.
+        assert!(idx.remove(&a.hash).is_none());
         let still = idx.lookup_by_addr_nonce(b.from, 5).unwrap();
         assert_eq!(still.tx.hash, b.hash);
     }
