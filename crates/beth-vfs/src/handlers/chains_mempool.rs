@@ -221,7 +221,7 @@ impl Handler for MempoolHandler {
                     .parse()
                     .map_err(|e: alloy::hex::FromHexError| HandlerError::invalid(e.to_string()))?;
                 let observed = self.index.observed_nonces(addr);
-                let next_unused = observed.last().map(|n| n + 1).unwrap_or(0);
+                let next_unused = observed.last().map(|n| n.saturating_add(1)).unwrap_or(0);
                 let body = serde_json::json!({
                     "observed": observed,
                     "next_unused": next_unused,
