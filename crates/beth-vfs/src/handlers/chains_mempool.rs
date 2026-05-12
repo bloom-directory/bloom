@@ -16,6 +16,18 @@ use crate::path::VfsPath;
 
 const RECENT_RING_CAPACITY: usize = 500;
 
+fn is_hash_segment(s: &str) -> bool {
+    s.len() == 66 && s.starts_with("0x") && s[2..].chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn parse_hash(s: &str) -> Result<alloy::primitives::B256, HandlerError> {
+    let bytes = alloy::hex::decode(&s[2..]).map_err(|e| HandlerError::invalid(e.to_string()))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| HandlerError::invalid("hash must be 32 bytes"))?;
+    Ok(alloy::primitives::B256::from(arr))
+}
+
 struct RingBuffer {
     items: std::collections::VecDeque<PendingTx>,
     capacity: usize,
@@ -175,6 +187,13 @@ impl Handler for MempoolHandler {
                     .map_err(|e: alloy::hex::FromHexError| HandlerError::invalid(e.to_string()))?;
                 Ok(Entry::read_only_file("recent.jsonl"))
             }
+            [_chain, "mempool", hash] if is_hash_segment(hash) => Ok(Entry::dir(hash)),
+            [_chain, "mempool", hash, leaf]
+                if is_hash_segment(hash)
+                    && matches!(*leaf, "tx.json" | "decoded.json" | "status") =>
+            {
+                Ok(Entry::read_only_file(leaf))
+            }
             _ => Err(HandlerError::NotFound(path.to_string_path())),
         }
     }
@@ -190,6 +209,9 @@ impl Handler for MempoolHandler {
                 Entry::dir("by_address"),
                 Entry::dir("by_pool"),
             ]),
+            [_chain, "mempool", hash] if is_hash_segment(hash) => Ok(Vec::new()),
+            [_chain, "mempool", "by_address", _addr] => Ok(Vec::new()),
+            [_chain, "mempool", "by_pool", _pool] => Ok(Vec::new()),
             _ => Err(HandlerError::NotADir(path.to_string_path())),
         }
     }
@@ -298,6 +320,26 @@ impl Handler for MempoolHandler {
                     }
                 }
                 Ok(out)
+            }
+            [_chain, "mempool", hash, leaf] if is_hash_segment(hash) => {
+                let h_bytes = parse_hash(hash)?;
+                let rec = self
+                    .index
+                    .lookup_by_hash(&h_bytes)
+                    .ok_or_else(|| HandlerError::not_found(path.to_string_path()))?;
+                match *leaf {
+                    "tx.json" => serde_json::to_vec_pretty(&rec.tx)
+                        .map_err(|e| HandlerError::backend(e.to_string())),
+                    "decoded.json" => {
+                        let decoded = beth_mempool::decode_swap_path(&rec.tx.input)
+                            .map(|p| serde_json::json!({"kind": "swap", "path": p}))
+                            .unwrap_or(serde_json::Value::Null);
+                        serde_json::to_vec_pretty(&decoded)
+                            .map_err(|e| HandlerError::backend(e.to_string()))
+                    }
+                    "status" => Ok(b"pending\n".to_vec()),
+                    _ => Err(HandlerError::not_found(path.to_string_path())),
+                }
             }
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
@@ -487,5 +529,32 @@ mod tests {
             .filter(|s| !s.is_empty())
             .collect();
         assert_eq!(lines.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tx_hash_subtree_returns_tx_json_and_status() {
+        let h = make_handler();
+        let t = fixture_tx(0xab);
+        let hash = t.hash;
+        h.ingest(t.clone());
+        let hex_hash = format!("0x{}", alloy::hex::encode(hash.as_slice()));
+        let p_tx = VfsPath::parse(&format!("ethereum/mempool/{hex_hash}/tx.json")).unwrap();
+        let p_st = VfsPath::parse(&format!("ethereum/mempool/{hex_hash}/status")).unwrap();
+        let body_tx = h.read(&p_tx).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_tx).unwrap();
+        assert_eq!(v["nonce"], 0);
+        let body_st = h.read(&p_st).await.unwrap();
+        assert_eq!(String::from_utf8(body_st).unwrap().trim(), "pending");
+    }
+
+    #[tokio::test]
+    async fn tx_hash_subtree_not_found_for_unknown_hash() {
+        let h = make_handler();
+        let p = VfsPath::parse(
+            "ethereum/mempool/0x0000000000000000000000000000000000000000000000000000000000000000/tx.json",
+        )
+        .unwrap();
+        let err = h.read(&p).await.unwrap_err();
+        assert!(matches!(err, HandlerError::NotFound(_)) || format!("{err:?}").contains("not"));
     }
 }
