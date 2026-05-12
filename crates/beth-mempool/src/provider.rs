@@ -1,4 +1,6 @@
-//! `MempoolProvider` trait + the `PendingTx` domain type.
+//! Core domain types for mempool observability: [`TxFees`] and [`PendingTx`].
+//!
+//! The `MempoolProvider` trait and implementations arrive in Tasks 1.4–1.5.
 
 use alloy::primitives::{Address, B256, Bytes, U256};
 use serde::{Deserialize, Serialize};
@@ -129,5 +131,16 @@ mod tests {
         let back: PendingTx = serde_json::from_str(&s).unwrap();
         assert_eq!(back.nonce, 7);
         assert_eq!(back.gas_limit, 21_000);
+        assert_eq!(back.fees, tx.fees);
+    }
+
+    #[test]
+    fn tx_fees_legacy_round_trips_through_json_at_u128_max() {
+        let f = TxFees::Legacy {
+            gas_price: u128::MAX,
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        let back: TxFees = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, f);
     }
 }
