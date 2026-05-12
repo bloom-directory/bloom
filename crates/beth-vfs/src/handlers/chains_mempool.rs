@@ -555,6 +555,22 @@ mod tests {
         )
         .unwrap();
         let err = h.read(&p).await.unwrap_err();
-        assert!(matches!(err, HandlerError::NotFound(_)) || format!("{err:?}").contains("not"));
+        assert!(matches!(err, HandlerError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn tx_hash_subtree_decoded_json_returns_null_for_unknown_calldata() {
+        let h = make_handler();
+        let t = fixture_tx(0xcd); // input is Bytes::new(), not a known swap selector
+        let hash = t.hash;
+        h.ingest(t);
+        let hex_hash = format!("0x{}", alloy::hex::encode(hash.as_slice()));
+        let p = VfsPath::parse(&format!("ethereum/mempool/{hex_hash}/decoded.json")).unwrap();
+        let body = h.read(&p).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v.is_null(),
+            "expected JSON null for non-DEX calldata, got: {v}"
+        );
     }
 }
