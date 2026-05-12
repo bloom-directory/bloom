@@ -57,6 +57,8 @@ impl PrivateRpcProvider for MevBlockerProvider {
             .send()
             .await
             .map_err(|e| PrivateRpcError::Transport(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| PrivateRpcError::Transport(e.to_string()))?
             .json()
             .await
             .map_err(|e| PrivateRpcError::Transport(e.to_string()))?;
@@ -86,10 +88,14 @@ impl PrivateRpcProvider for MevBlockerProvider {
             .send()
             .await
             .map_err(|e| PrivateRpcError::Transport(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| PrivateRpcError::Transport(e.to_string()))?
             .json()
             .await
             .map_err(|e| PrivateRpcError::Transport(e.to_string()))?;
-        if resp.get("result").is_some() {
+        if resp.get("error").is_some() {
+            Ok(HealthStatus::Unhealthy)
+        } else if resp.get("result").is_some() {
             Ok(HealthStatus::Healthy)
         } else {
             Ok(HealthStatus::Degraded)
