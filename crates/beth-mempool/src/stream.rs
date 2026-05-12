@@ -68,7 +68,10 @@ pub fn spawn(
                     }
                 }
             }
-            tokio::time::sleep(backoff).await;
+            tokio::select! {
+                _ = &mut shutdown_rx => return,
+                _ = tokio::time::sleep(backoff) => {}
+            }
             backoff = (backoff * 2).min(max_backoff);
         }
     });
