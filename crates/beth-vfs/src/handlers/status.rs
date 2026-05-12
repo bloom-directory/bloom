@@ -54,6 +54,20 @@ const CHAIN_CACHE_TTL: Duration = Duration::from_secs(2);
 /// Cap on how many recent audit entries `status/audit/last` returns.
 const AUDIT_LAST_N: usize = 10;
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MempoolBackendStatus {
+    pub provider: String,
+    pub subscribed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_to: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PrivateRpcBackendStatus {
+    pub last_status: String, // "healthy" | "degraded" | "unhealthy"
+    pub last_probed_at: u64, // unix secs
+}
+
 #[derive(Clone)]
 pub struct StatusHandler {
     pub chains: ChainRegistry,
@@ -68,6 +82,9 @@ pub struct StatusHandler {
     pub started_at: SystemTime,
     pub version: String,
     chain_cache: Arc<RwLock<std::collections::HashMap<String, ChainProbeCache>>>,
+    mempool_statuses: Arc<RwLock<std::collections::BTreeMap<String, MempoolBackendStatus>>>,
+    private_rpc_healths:
+        Arc<RwLock<std::collections::BTreeMap<(String, String), PrivateRpcBackendStatus>>>,
 }
 
 #[derive(Clone)]
@@ -141,7 +158,28 @@ impl StatusHandler {
             started_at,
             version: version.into(),
             chain_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            mempool_statuses: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+            private_rpc_healths: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
         }
+    }
+
+    /// Replace the per-chain mempool status snapshot. Used by the daemon
+    /// to publish what `MempoolStream` is doing (Task 4.6).
+    pub fn with_mempool_statuses(
+        self,
+        map: std::collections::BTreeMap<String, MempoolBackendStatus>,
+    ) -> Self {
+        *self.mempool_statuses.write() = map;
+        self
+    }
+
+    /// Replace the per-(chain, provider) private-RPC health snapshot.
+    pub fn with_private_rpc_healths(
+        self,
+        map: std::collections::BTreeMap<(String, String), PrivateRpcBackendStatus>,
+    ) -> Self {
+        *self.private_rpc_healths.write() = map;
+        self
     }
 
     fn started_unix_ms(&self) -> u128 {
@@ -513,7 +551,8 @@ impl StatusHandler {
             [a, leaf] if a == "wallets" && leaf == "count" => Ok(Entry::file(leaf)),
             [a, leaf] if a == "outbox" && leaf == "pending_count" => Ok(Entry::file(leaf)),
             [a, leaf] if a == "backends" => {
-                if leaf == "summary.json" || self.backends.get(leaf).is_some() {
+                let extra = matches!(leaf.as_str(), "mempool" | "private_rpc");
+                if leaf == "summary.json" || extra || self.backends.get(leaf).is_some() {
                     Ok(Entry::file(leaf))
                 } else {
                     Err(HandlerError::not_found(path.to_string_path()))
@@ -647,6 +686,24 @@ impl StatusHandler {
                     .collect();
                 Ok(serde_json::to_vec_pretty(&serde_json::Value::Object(map)).unwrap())
             }
+            [a, leaf] if a == "backends" && leaf == "mempool" => {
+                let map = self.mempool_statuses.read().clone();
+                serde_json::to_vec_pretty(&map).map_err(|e| HandlerError::backend(e.to_string()))
+            }
+            [a, leaf] if a == "backends" && leaf == "private_rpc" => {
+                let map = self.private_rpc_healths.read();
+                let mut nested: std::collections::BTreeMap<
+                    String,
+                    std::collections::BTreeMap<String, PrivateRpcBackendStatus>,
+                > = std::collections::BTreeMap::new();
+                for ((chain, prov), v) in map.iter() {
+                    nested
+                        .entry(chain.clone())
+                        .or_default()
+                        .insert(prov.clone(), v.clone());
+                }
+                serde_json::to_vec_pretty(&nested).map_err(|e| HandlerError::backend(e.to_string()))
+            }
             [a, leaf] if a == "backends" => match self.backends.get(leaf) {
                 Some(b) => Ok(format!("{}\n", b.as_str()).into_bytes()),
                 None => Err(HandlerError::NotAFile(path.to_string_path())),
@@ -738,6 +795,8 @@ impl StatusHandler {
                     .map(|(k, _)| Entry::file(k))
                     .collect();
                 entries.push(Entry::file("summary.json"));
+                entries.push(Entry::file("mempool"));
+                entries.push(Entry::file("private_rpc"));
                 Ok(entries)
             }
             _ => Err(HandlerError::NotADir(path.to_string_path())),
@@ -1115,5 +1174,71 @@ mod tests {
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"endpoints"), "missing endpoints dir");
         assert!(names.contains(&"rpc_url"), "missing rpc_url leaf");
+    }
+
+    #[tokio::test]
+    async fn backends_mempool_returns_provider_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = make_handler(dir.path());
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "ethereum".to_string(),
+            MempoolBackendStatus {
+                provider: "alchemy".into(),
+                subscribed: true,
+                fallback_to: None,
+            },
+        );
+        let h = h.with_mempool_statuses(map);
+        let body = h
+            .read(&VfsPath::parse("backends/mempool").unwrap())
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ethereum"]["provider"], "alchemy");
+        assert_eq!(v["ethereum"]["subscribed"], true);
+    }
+
+    #[tokio::test]
+    async fn backends_private_rpc_returns_nested_per_chain_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = make_handler(dir.path());
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            ("ethereum".to_string(), "mev_blocker".to_string()),
+            PrivateRpcBackendStatus {
+                last_status: "healthy".into(),
+                last_probed_at: 1_700_000_000,
+            },
+        );
+        map.insert(
+            ("ethereum".to_string(), "flashbots".to_string()),
+            PrivateRpcBackendStatus {
+                last_status: "degraded".into(),
+                last_probed_at: 1_700_000_001,
+            },
+        );
+        let h = h.with_private_rpc_healths(map);
+        let body = h
+            .read(&VfsPath::parse("backends/private_rpc").unwrap())
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ethereum"]["mev_blocker"]["last_status"], "healthy");
+        assert_eq!(v["ethereum"]["flashbots"]["last_status"], "degraded");
+        assert_eq!(
+            v["ethereum"]["mev_blocker"]["last_probed_at"],
+            1_700_000_000
+        );
+    }
+
+    #[tokio::test]
+    async fn backends_list_includes_mempool_and_private_rpc() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = make_handler(dir.path());
+        let entries = h.list(&VfsPath::parse("backends").unwrap()).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"mempool"), "missing mempool entry");
+        assert!(names.contains(&"private_rpc"), "missing private_rpc entry");
     }
 }
