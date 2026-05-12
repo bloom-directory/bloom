@@ -71,6 +71,9 @@ pub struct Daemon {
     pub vfs: Vfs,
     pub watch_registry: Arc<WatchRegistry>,
     pub watch_executor: Arc<WatchExecutor>,
+    /// Shutdown handles for spawned mempool subscription tasks. Dropping
+    /// these signals each task to exit at its next iteration.
+    pub mempool_shutdown: Arc<parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 impl Daemon {
@@ -97,6 +100,70 @@ impl Daemon {
         let chains = ChainRegistry::default();
         for c in clients {
             chains.add(c);
+        }
+
+        // Build per-chain mempool indexes + handlers from [mempool.<chain>]
+        // config. Each entry creates an LRU index, a VFS handler, and
+        // spawns a long-lived subscription task. Handles are kept in
+        // `mempool_shutdown` and signaled when the daemon's
+        // BackgroundTasks is dropped.
+        let mut mempool_indexes: std::collections::BTreeMap<
+            String,
+            Arc<beth_mempool::PendingTxIndex>,
+        > = Default::default();
+        let mut mempool_handlers: std::collections::BTreeMap<
+            String,
+            Arc<beth_vfs::handlers::MempoolHandler>,
+        > = Default::default();
+        let mut mempool_shutdown: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+
+        for (chain_name, mc) in &config.mempool {
+            // Skip chains not in the registry — we warn but don't fail
+            // because a stale config entry shouldn't tank daemon boot.
+            if chains.get(chain_name).is_none() {
+                warn!(chain = %chain_name, "daemon.mempool_skipped: chain not configured");
+                continue;
+            }
+            let idx = beth_mempool::PendingTxIndex::new(mc.max_index_size);
+            let handler = Arc::new(beth_vfs::handlers::MempoolHandler::new(
+                chain_name.clone(),
+                mc.provider.clone(),
+                idx.clone(),
+            ));
+            mempool_indexes.insert(chain_name.clone(), idx.clone());
+            mempool_handlers.insert(chain_name.clone(), handler);
+
+            let provider_result: Result<Arc<dyn beth_mempool::MempoolProvider>, DaemonError> =
+                match mc.provider.as_str() {
+                    "alchemy" => Ok(Arc::new(
+                        beth_mempool::providers::alchemy::AlchemyProvider::new(mc.ws_url.clone()),
+                    )),
+                    "generic_eth_subscribe" => Ok(Arc::new(
+                        beth_mempool::providers::generic_eth_subscribe::GenericEthSubscribeProvider::new(
+                            mc.ws_url.clone(),
+                        ),
+                    )),
+                    other => {
+                        warn!(
+                            chain = %chain_name,
+                            provider = %other,
+                            "daemon.mempool_skipped: unknown provider"
+                        );
+                        continue;
+                    }
+                };
+            let provider = provider_result?;
+
+            // Spawning the stream needs a tokio runtime; mirror the
+            // watch-executor pattern and only spawn when one is current.
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let stream = beth_mempool::MempoolStream::new(idx);
+                let shutdown = beth_mempool::stream::spawn(chain_name.clone(), provider, stream);
+                mempool_shutdown.push(shutdown);
+                debug!(chain = %chain_name, provider = %mc.provider, "daemon.mempool_spawned");
+            } else {
+                debug!(chain = %chain_name, "daemon.mempool_spawn_deferred: no tokio runtime");
+            }
         }
 
         let keystore =
@@ -174,6 +241,52 @@ impl Daemon {
         tx_engine =
             tx_engine.with_price_oracle(Arc::new(price_oracle::PricesOracle::new(prices.clone())));
 
+        // Wire mempool indexes into TxEngine (drives nonce-conflict
+        // checks + cancel.tx targeting). Done before private-RPC
+        // registration so any future ordering invariants hold.
+        for (chain_name, idx) in &mempool_indexes {
+            tx_engine.set_mempool_index(chain_name.clone(), idx.clone());
+        }
+
+        // Build per-chain private RPC providers from [private_rpc.<chain>].
+        for (chain_name, rc) in &config.private_rpc {
+            let Some(client) = chains.get(chain_name) else {
+                warn!(chain = %chain_name, "daemon.private_rpc_skipped: chain not configured");
+                continue;
+            };
+            let chain_id = client.spec().chain_id;
+            if let Some(url) = &rc.mev_blocker_url {
+                match beth_mempool::providers::mev_blocker::MevBlockerProvider::new(url.clone()) {
+                    Ok(p) => {
+                        let arc_p: Arc<dyn beth_mempool::PrivateRpcProvider> = Arc::new(p);
+                        if let Err(e) = tx_engine.register_private_rpc(chain_id, arc_p) {
+                            warn!(chain = %chain_name, error = %e, "daemon.private_rpc_register_failed");
+                        } else {
+                            debug!(chain = %chain_name, provider = "mev_blocker", "daemon.private_rpc_registered");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(chain = %chain_name, error = %e, "daemon.mev_blocker_init_failed")
+                    }
+                }
+            }
+            if let Some(url) = &rc.flashbots_url {
+                match beth_mempool::providers::flashbots::FlashbotsProvider::new(url.clone()) {
+                    Ok(p) => {
+                        let arc_p: Arc<dyn beth_mempool::PrivateRpcProvider> = Arc::new(p);
+                        if let Err(e) = tx_engine.register_private_rpc(chain_id, arc_p) {
+                            warn!(chain = %chain_name, error = %e, "daemon.private_rpc_register_failed");
+                        } else {
+                            debug!(chain = %chain_name, provider = "flashbots", "daemon.private_rpc_registered");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(chain = %chain_name, error = %e, "daemon.flashbots_init_failed")
+                    }
+                }
+            }
+        }
+
         // Build the tiered revert decoder once and share it across every
         // handler that needs to attribute revert returndata. Builtin
         // decoders (Solidity Error/Panic) are always installed; the
@@ -215,6 +328,7 @@ impl Daemon {
                         .with_etherscan(etherscan_arc.clone())
                         .with_ens(ens_client.clone())
                         .with_backends(config.backends)
+                        .with_mempool_handlers(mempool_handlers)
                         .with_revert_decoder(decoder_chain.clone()),
                 ) as _,
             )
@@ -355,6 +469,7 @@ impl Daemon {
             vfs,
             watch_registry,
             watch_executor,
+            mempool_shutdown: Arc::new(parking_lot::Mutex::new(mempool_shutdown)),
         })
     }
 
@@ -368,9 +483,13 @@ impl Daemon {
         }
     }
 
-    /// Stop background workers cleanly. Currently shuts down the watch
-    /// executor's polling task; safe to call multiple times.
+    /// Stop background workers cleanly. Signals all spawned mempool
+    /// subscription tasks and shuts down the watch executor's polling
+    /// task; safe to call multiple times.
     pub async fn shutdown(&self) {
+        for s in self.mempool_shutdown.lock().drain(..) {
+            let _ = s.send(());
+        }
         self.watch_executor.stop().await;
     }
 
@@ -571,6 +690,43 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), d.shutdown())
             .await
             .expect("shutdown timed out");
+    }
+
+    #[test]
+    fn daemon_boots_without_mempool_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = HomeDir::at(tmp.path());
+        let daemon = Daemon::from_home(home).expect("daemon boots");
+        assert!(daemon.config.mempool.is_empty());
+        assert!(daemon.config.private_rpc.is_empty());
+    }
+
+    #[tokio::test]
+    async fn daemon_skips_mempool_for_unknown_chain() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = HomeDir::at(tmp.path());
+        home.ensure().unwrap();
+        // Write a config with a mempool entry pointing at a chain not in [chains.*]
+        let config_toml = r#"
+default_chain = "ethereum"
+[chains.ethereum]
+name = "ethereum"
+chain_id = 1
+rpc_urls = ["http://127.0.0.1:8545"]
+native_symbol = "ETH"
+native_decimals = 18
+
+[mempool.bogus_chain]
+provider = "alchemy"
+ws_url = "wss://example.invalid"
+"#;
+        std::fs::write(home.config_path(), config_toml).unwrap();
+        // The chain has no real RPC; daemon still boots because chain
+        // creation is best-effort (see existing chain_skipped path).
+        let daemon = Daemon::from_home(home).expect("daemon boots");
+        // No mempool index should be registered: the bogus chain entry
+        // was skipped, and ethereum has no [mempool.ethereum] section.
+        assert!(daemon.mempool_shutdown.lock().is_empty());
     }
 
     /// Fix #3: the spawned sweeper drops expired pending entries into

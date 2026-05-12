@@ -20,6 +20,7 @@ bytecode-decompile = ["beth-revert/bytecode-decompile"]
 beth-proto.workspace = true
 beth-keystore.workspace = true
 beth-chain.workspace = true
+beth-mempool.workspace = true
 beth-tx.workspace = true
 beth-vfs.workspace = true
 beth-tools.workspace = true
