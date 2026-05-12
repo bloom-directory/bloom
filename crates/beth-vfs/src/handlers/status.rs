@@ -558,6 +558,14 @@ impl StatusHandler {
                     Err(HandlerError::not_found(path.to_string_path()))
                 }
             }
+            [a, leaf] if a == "private_rpc" => {
+                let map = self.private_rpc_healths.read();
+                if map.iter().any(|((_, prov), _)| prov == leaf) {
+                    Ok(Entry::file(leaf))
+                } else {
+                    Err(HandlerError::not_found(path.to_string_path()))
+                }
+            }
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
     }
@@ -708,6 +716,15 @@ impl StatusHandler {
                 Some(b) => Ok(format!("{}\n", b.as_str()).into_bytes()),
                 None => Err(HandlerError::NotAFile(path.to_string_path())),
             },
+            [a, provider] if a == "private_rpc" => {
+                let map = self.private_rpc_healths.read();
+                let any = map.iter().find(|((_, p), _)| p == provider).map(|(_, v)| v);
+                match any {
+                    Some(v) => serde_json::to_vec_pretty(v)
+                        .map_err(|e| HandlerError::backend(e.to_string())),
+                    None => Err(HandlerError::not_found(path.to_string_path())),
+                }
+            }
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
     }
@@ -1229,6 +1246,45 @@ mod tests {
         assert_eq!(
             v["ethereum"]["mev_blocker"]["last_probed_at"],
             1_700_000_000
+        );
+    }
+
+    #[tokio::test]
+    async fn private_rpc_provider_leaf_returns_status_or_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = make_handler(dir.path());
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            ("ethereum".to_string(), "flashbots".to_string()),
+            PrivateRpcBackendStatus {
+                last_status: "healthy".into(),
+                last_probed_at: 1_700_000_000,
+            },
+        );
+        map.insert(
+            ("ethereum".to_string(), "mev_blocker".to_string()),
+            PrivateRpcBackendStatus {
+                last_status: "degraded".into(),
+                last_probed_at: 1_700_000_001,
+            },
+        );
+        let h = h.with_private_rpc_healths(map);
+
+        let body = h
+            .read(&VfsPath::parse("private_rpc/flashbots").unwrap())
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["last_status"], "healthy");
+        assert_eq!(v["last_probed_at"], 1_700_000_000);
+
+        let err = h
+            .read(&VfsPath::parse("private_rpc/unknown").unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HandlerError::NotFound(_)),
+            "expected NotFound, got: {err:?}"
         );
     }
 
