@@ -213,7 +213,7 @@ drives a native ETH send and an ERC-20 transfer through the
 stage-confirm-broadcast loop on a local devnet. Optional Uniswap V2 /
 Enso scenarios on a mainnet fork run when `BETH_MAINNET_RPC` is set.
 
-`tests/docker/run.sh` is the dockerized harness with five modes:
+`tests/docker/run.sh` is the dockerized harness with six modes:
 
 - `--mount` (default) — privileged container exercising the NFS
   kernel mount (`tests/docker/test.sh`).
@@ -224,6 +224,11 @@ Enso scenarios on a mainnet fork run when `BETH_MAINNET_RPC` is set.
   reads through the mount. No Enso key required.
 - `--enso` — `docker compose --profile enso`: same anvil fork, runs
   the full Enso → Aave intent flow. Requires `BETH_ENSO_KEY`.
+- `--mempool` — `docker compose --profile mempool`: spins up an
+  in-container WebSocket mock that emulates Alchemy's
+  `alchemy_pendingTransactions` feed and asserts the daemon's
+  `chains/<c>/mempool/{status.json,recent.jsonl}` surface populates.
+  No external keys required.
 - `--enso-live` — runs the Enso + Aave flow against Base **mainnet**
   with real funds through the mounted filesystem surface. Gated on
   a sourced `test.env` with `BETH_ENSO_KEY`, `BETH_LIVE_HOME`,
@@ -233,3 +238,41 @@ Shared scaffolding (logging, mount lifecycle, pending-stage helpers,
 receipt assertions, deterministic Anvil constants) lives in
 `tests/docker/lib.sh`; the unified `docker-compose.yml` selects modes
 via Compose profiles.
+
+## Watch the mempool
+
+If you have a WebSocket-capable RPC for a chain (an Alchemy key, or
+any Geth/Erigon node with WS enabled), add a `[mempool.<chain>]`
+section to `~/.bloom-eth/config.toml`:
+
+```toml
+[mempool.ethereum]
+provider = "alchemy"
+ws_url = "wss://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+```
+
+`provider = "generic_eth_subscribe"` works against any node that
+implements `eth_subscribe("newPendingTransactions")`.
+
+Restart the daemon, then tail the live mempool:
+
+```sh
+beth vfs cat /eth/chains/ethereum/mempool/status.json   # subscription + counts
+beth vfs cat /eth/chains/ethereum/mempool/live          # blocks until next pending tx
+beth vfs cat /eth/chains/ethereum/mempool/recent.jsonl | head
+beth vfs cat /eth/chains/ethereum/mempool/by_address/0xYourAddress/pending.jsonl
+```
+
+To opt a wallet into private orderflow (mainnet only):
+
+```toml
+# wallets/<name>/policy.toml
+[private]
+enabled = true
+provider = "mev_blocker"   # or "flashbots"
+```
+
+Future broadcasts from that wallet on chain id 1 route through the
+configured private RPC instead of the public one. Non-mainnet chains
+return an explicit `PrivateNotSupportedOnChain` error rather than
+silently broadcasting publicly.
