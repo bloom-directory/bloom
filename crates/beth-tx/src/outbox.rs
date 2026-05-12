@@ -179,6 +179,27 @@ impl Outbox {
         Ok(path)
     }
 
+    /// Write a `mev_risk.json` artefact next to a pending tx with the
+    /// stage-time output of `beth_mempool::heuristic::evaluate`. The
+    /// pending dir must already exist (typically written by
+    /// `write_pending` immediately before). Mirrors
+    /// [`Self::write_nonce_conflict`].
+    pub fn write_mev_risk(
+        &self,
+        wallet: &str,
+        chain: &str,
+        id: &str,
+        report: &beth_mempool::MevRiskReport,
+    ) -> Result<PathBuf, OutboxError> {
+        let dir = self
+            .state_dir(wallet, chain, OutboxState::Pending)?
+            .join(id);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("mev_risk.json");
+        fs::write(&path, serde_json::to_vec_pretty(report)?)?;
+        Ok(path)
+    }
+
     /// Search for `id` across pending/sent/failed and return the first hit.
     /// Prefer [`Self::read_in_state`] when the caller knows where the entry
     /// is supposed to be — this method exists for diagnostics and is the
@@ -579,6 +600,39 @@ mod tests {
         let ob = Outbox::new(dir.path()).unwrap();
         let total = ob.sum_usd_since("alice", 0).unwrap();
         assert_eq!(total, 0.0);
+    }
+
+    #[test]
+    fn write_mev_risk_writes_to_pending_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let staged = fake_staged("0001-mev");
+        ob.write_pending(&staged, "p").unwrap();
+
+        let report = beth_mempool::MevRiskReport {
+            risk: beth_mempool::MevRisk::Low,
+            checks: vec![],
+            advice: String::new(),
+        };
+        let path = ob
+            .write_mev_risk("alice", "anvil", "0001-mev", &report)
+            .unwrap();
+
+        let expected = dir
+            .path()
+            .join("alice")
+            .join("anvil")
+            .join("pending")
+            .join("0001-mev")
+            .join("mev_risk.json");
+        assert_eq!(path, expected);
+        assert!(path.exists());
+
+        let read_body: beth_mempool::MevRiskReport =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(read_body.risk, beth_mempool::MevRisk::Low);
+        assert!(read_body.checks.is_empty());
+        assert!(read_body.advice.is_empty());
     }
 
     #[test]

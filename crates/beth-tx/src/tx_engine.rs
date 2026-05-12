@@ -90,6 +90,54 @@ type TokenCache = Arc<RwLock<HashMap<(u64, Address), TokenMeta>>>;
 /// nonce conflicts with externally-observed mempool entries.
 type MempoolIndexes = Arc<RwLock<BTreeMap<String, Arc<beth_mempool::PendingTxIndex>>>>;
 
+/// Stub `QuoteOracle` for stage-time MEV heuristics. It holds a
+/// `ChainClient` reference so a real implementation can `eth_call` a
+/// quoter contract, but the current version always returns `None`
+/// (the heuristic then degrades to the `amount_out_min == 0` check
+/// only). Phase 4+ will wire this to a real quoter.
+struct EthCallQuoteOracle<'a> {
+    _chain: &'a ChainClient,
+}
+
+impl beth_mempool::QuoteOracle for EthCallQuoteOracle<'_> {
+    fn quote(&self, _amount_in: U256, _path: &[Address]) -> Option<U256> {
+        None
+    }
+}
+
+/// Build the `HeuristicConfig` from the active policy. Kept as a free
+/// function so unit tests can exercise it without constructing a
+/// `TxEngine`.
+pub(crate) fn mev_cfg_from_policy(policy: &Policy) -> beth_mempool::HeuristicConfig {
+    beth_mempool::HeuristicConfig {
+        max_slippage_bps: policy.mev.max_slippage_bps,
+        // Match `HeuristicConfig::default()` — 1e18 (one whole token /
+        // ETH worth of input). The threshold only fires together with
+        // `amountOutMin == 0`, so it's a sanity gate, not a primary
+        // signal.
+        zero_min_amount_in_threshold: U256::from(10u64).pow(U256::from(18u64)),
+    }
+}
+
+/// Run the stage-time MEV/sandwich heuristic. The `ChainClient` is
+/// held only by the (currently stub) quoter so the function stays
+/// synchronous and safe to call without a live RPC.
+pub(crate) fn evaluate_mev_risk(
+    chain: &ChainClient,
+    data_bytes: &[u8],
+    value_wei: U256,
+    policy: &Policy,
+) -> beth_mempool::MevRiskReport {
+    let cfg = mev_cfg_from_policy(policy);
+    let quoter = EthCallQuoteOracle { _chain: chain };
+    beth_mempool::heuristic::evaluate(
+        &alloy::primitives::Bytes::copy_from_slice(data_bytes),
+        value_wei,
+        &cfg,
+        &quoter,
+    )
+}
+
 #[derive(Debug, Clone)]
 struct TokenMeta {
     address: Address,
@@ -593,6 +641,23 @@ impl TxEngine {
         // Build a request to estimate gas; choose 1559 vs legacy fields.
         let data_bytes = decode_data(&data_hex)?;
 
+        // Stage-time MEV/sandwich heuristic. Computed up-front so that
+        // when `policy.mev.fail_on_high_risk` is set we can deny before
+        // any pending-dir write happens (high-risk denials don't leave
+        // a partially-written stage on disk). The artefact write below
+        // — after `write_pending` — only runs when we keep going.
+        let mev_report = evaluate_mev_risk(chain, &data_bytes, value_wei, policy);
+        if policy.mev.fail_on_high_risk && matches!(mev_report.risk, beth_mempool::MevRisk::High) {
+            debug!(
+                wallet,
+                chain = %spec.name,
+                reason = "mev_high_risk",
+                advice = %mev_report.advice,
+                "tx.policy_denied"
+            );
+            return Err(TxEngineError::PolicyDenied);
+        }
+
         // Open a pinned read session for the nonce + code reads so the
         // staging fanout sees a self-consistent block even when the
         // layered fallback transport rotates upstreams between calls.
@@ -839,6 +904,8 @@ impl TxEngine {
             self.outbox
                 .write_nonce_conflict(&staged.wallet, &staged.chain, &staged.id, &body)?;
         }
+        self.outbox
+            .write_mev_risk(&staged.wallet, &staged.chain, &staged.id, &mev_report)?;
         debug!(id=%staged.id, wallet=%staged.wallet, chain=%staged.chain, "tx.stage");
         Ok(staged)
     }
@@ -1506,6 +1573,62 @@ mod tests {
         assert_eq!(body["external_observed_at"], 1_700_000_000);
         let advice = body["advice"].as_str().unwrap();
         assert!(advice.contains(hash_str));
+    }
+
+    // -------------------------------------------------------------------
+    // MEV-heuristic helpers. These exercise the policy→config mapping and
+    // the synchronous `evaluate_mev_risk` shim that wraps
+    // `beth_mempool::heuristic::evaluate` with the stub quoter; the full
+    // `stage()` path is covered elsewhere and needs a live RPC.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn mev_cfg_from_policy_uses_policy_slippage_and_default_threshold() {
+        let mut policy = beth_proto::Policy::default();
+        policy.mev.max_slippage_bps = 250;
+        let cfg = mev_cfg_from_policy(&policy);
+        assert_eq!(cfg.max_slippage_bps, 250);
+        assert_eq!(
+            cfg.zero_min_amount_in_threshold,
+            U256::from(10u64).pow(U256::from(18u64))
+        );
+    }
+
+    #[test]
+    fn evaluate_mev_risk_high_on_zero_amount_out_min() {
+        // The fixture decodes a swap with amountOutMin = 0 and an
+        // amountIn well above 1e18. Even with the stub quoter (always
+        // returns None) this must classify as High via the
+        // amount_out_min_zero check, independent of the slippage path.
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let hex_str = std::fs::read_to_string(format!(
+            "{manifest_dir}/../beth-mempool/tests/fixtures/uniswap_v2_zero_min.hex"
+        ))
+        .unwrap();
+        let cd = alloy::hex::decode(hex_str.trim()).unwrap();
+
+        let spec = beth_proto::ChainSpec {
+            name: "anvil".into(),
+            chain_id: 31337,
+            // Unreachable URL — the stub quoter doesn't hit the chain.
+            rpc_urls: vec!["http://127.0.0.1:1".into()],
+            rpc_endpoints: Vec::new(),
+            allow_broadcast: true,
+            etherscan_api_url: None,
+            display_name: None,
+            native_symbol: "ETH".into(),
+            native_decimals: 18,
+            legacy_tx: false,
+        };
+        let chain = beth_chain::ChainClient::new(spec).unwrap();
+        let policy = beth_proto::Policy::default();
+        let report = evaluate_mev_risk(&chain, &cd, U256::ZERO, &policy);
+        assert_eq!(report.risk, beth_mempool::MevRisk::High);
+        assert!(
+            report.checks.iter().any(|s| s == "amount_out_min_zero"),
+            "expected amount_out_min_zero in checks, got {:?}",
+            report.checks
+        );
     }
 
     /// Helpers shared by the confirm-flow regression tests below. They
