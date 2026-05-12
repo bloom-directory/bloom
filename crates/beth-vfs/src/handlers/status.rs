@@ -29,6 +29,7 @@
 //!   `proxy_detection`); each returns one of `etherscan`, `rpc`, `indexer`.
 //! - `status/backends/summary.json`              — JSON map of all of the above
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -82,9 +83,8 @@ pub struct StatusHandler {
     pub started_at: SystemTime,
     pub version: String,
     chain_cache: Arc<RwLock<std::collections::HashMap<String, ChainProbeCache>>>,
-    mempool_statuses: Arc<RwLock<std::collections::BTreeMap<String, MempoolBackendStatus>>>,
-    private_rpc_healths:
-        Arc<RwLock<std::collections::BTreeMap<(String, String), PrivateRpcBackendStatus>>>,
+    mempool_statuses: Arc<RwLock<BTreeMap<String, MempoolBackendStatus>>>,
+    private_rpc_healths: Arc<RwLock<BTreeMap<(String, String), PrivateRpcBackendStatus>>>,
 }
 
 #[derive(Clone)]
@@ -158,17 +158,14 @@ impl StatusHandler {
             started_at,
             version: version.into(),
             chain_cache: Arc::new(RwLock::new(std::collections::HashMap::new())),
-            mempool_statuses: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
-            private_rpc_healths: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+            mempool_statuses: Arc::new(RwLock::new(BTreeMap::new())),
+            private_rpc_healths: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
     /// Replace the per-chain mempool status snapshot. Used by the daemon
     /// to publish what `MempoolStream` is doing (Task 4.6).
-    pub fn with_mempool_statuses(
-        self,
-        map: std::collections::BTreeMap<String, MempoolBackendStatus>,
-    ) -> Self {
+    pub fn with_mempool_statuses(self, map: BTreeMap<String, MempoolBackendStatus>) -> Self {
         *self.mempool_statuses.write() = map;
         self
     }
@@ -176,7 +173,7 @@ impl StatusHandler {
     /// Replace the per-(chain, provider) private-RPC health snapshot.
     pub fn with_private_rpc_healths(
         self,
-        map: std::collections::BTreeMap<(String, String), PrivateRpcBackendStatus>,
+        map: BTreeMap<(String, String), PrivateRpcBackendStatus>,
     ) -> Self {
         *self.private_rpc_healths.write() = map;
         self
@@ -473,7 +470,8 @@ impl StatusHandler {
                 || s == "policies"
                 || s == "wallets"
                 || s == "outbox"
-                || s == "backends" =>
+                || s == "backends"
+                || s == "private_rpc" =>
             {
                 Ok(Entry::dir(s))
             }
@@ -700,10 +698,8 @@ impl StatusHandler {
             }
             [a, leaf] if a == "backends" && leaf == "private_rpc" => {
                 let map = self.private_rpc_healths.read();
-                let mut nested: std::collections::BTreeMap<
-                    String,
-                    std::collections::BTreeMap<String, PrivateRpcBackendStatus>,
-                > = std::collections::BTreeMap::new();
+                let mut nested: BTreeMap<String, BTreeMap<String, PrivateRpcBackendStatus>> =
+                    BTreeMap::new();
                 for ((chain, prov), v) in map.iter() {
                     nested
                         .entry(chain.clone())
@@ -744,6 +740,7 @@ impl StatusHandler {
                 Entry::dir("wallets"),
                 Entry::dir("outbox"),
                 Entry::dir("backends"),
+                Entry::dir("private_rpc"),
             ]),
             [a] if a == "chains" => Ok(self
                 .chains
@@ -816,6 +813,16 @@ impl StatusHandler {
                 entries.push(Entry::file("private_rpc"));
                 Ok(entries)
             }
+            [a] if a == "private_rpc" => {
+                // Deduplicate provider names across chains so the
+                // listing matches the lookup arm (which returns the
+                // first matching `PrivateRpcBackendStatus` regardless
+                // of chain).
+                let map = self.private_rpc_healths.read();
+                let unique: std::collections::BTreeSet<String> =
+                    map.keys().map(|(_, prov)| prov.clone()).collect();
+                Ok(unique.into_iter().map(|p| Entry::file(&p)).collect())
+            }
             _ => Err(HandlerError::NotADir(path.to_string_path())),
         }
     }
@@ -840,8 +847,19 @@ impl StatusHandler {
             Some("version" | "started_at" | "home") => Some(Duration::from_secs(86_400)),
             Some("uptime" | "daemon.json") => Some(Duration::from_secs(2)),
             Some("policies") => Some(Duration::from_secs(60)),
-            // Backend declarations are static for the daemon's lifetime.
-            Some("backends") => Some(Duration::from_secs(86_400)),
+            // `backends/*` is mostly static config (per-feature backend
+            // declaration + `summary.json`), but `backends/mempool` and
+            // `backends/private_rpc` are live JSON snapshots updated at
+            // runtime by the daemon — keep those on the same 5s cap as
+            // the chain probes so they don't go stale behind a 24h TTL.
+            Some("backends") => match segs.get(1).map(|s| s.as_str()) {
+                Some("mempool" | "private_rpc") => Some(Duration::from_secs(5)),
+                _ => Some(Duration::from_secs(86_400)),
+            },
+            // Per-provider private RPC status is live, matching the
+            // `backends/private_rpc` JSON view above so cached reads
+            // can't diverge between the two surfaces.
+            Some("private_rpc") => Some(Duration::from_secs(5)),
             _ => None,
         }
     }
@@ -1197,7 +1215,7 @@ mod tests {
     async fn backends_mempool_returns_provider_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let h = make_handler(dir.path());
-        let mut map = std::collections::BTreeMap::new();
+        let mut map = BTreeMap::new();
         map.insert(
             "ethereum".to_string(),
             MempoolBackendStatus {
@@ -1220,7 +1238,7 @@ mod tests {
     async fn backends_private_rpc_returns_nested_per_chain_provider() {
         let dir = tempfile::tempdir().unwrap();
         let h = make_handler(dir.path());
-        let mut map = std::collections::BTreeMap::new();
+        let mut map = BTreeMap::new();
         map.insert(
             ("ethereum".to_string(), "mev_blocker".to_string()),
             PrivateRpcBackendStatus {
@@ -1253,7 +1271,7 @@ mod tests {
     async fn private_rpc_provider_leaf_returns_status_or_not_found() {
         let dir = tempfile::tempdir().unwrap();
         let h = make_handler(dir.path());
-        let mut map = std::collections::BTreeMap::new();
+        let mut map = BTreeMap::new();
         map.insert(
             ("ethereum".to_string(), "flashbots".to_string()),
             PrivateRpcBackendStatus {
@@ -1296,5 +1314,53 @@ mod tests {
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"mempool"), "missing mempool entry");
         assert!(names.contains(&"private_rpc"), "missing private_rpc entry");
+    }
+
+    #[tokio::test]
+    async fn top_level_list_includes_private_rpc() {
+        // The `private_rpc/` subtree is navigable independently of
+        // `backends/private_rpc`, so it must appear in the root listing
+        // alongside the other status surfaces.
+        let dir = tempfile::tempdir().unwrap();
+        let h = make_handler(dir.path());
+        let entries = h.list(&VfsPath::parse("").unwrap()).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"private_rpc"),
+            "missing private_rpc top-level entry; got: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn private_rpc_lists_providers_deduped_across_chains() {
+        // `private_rpc/<provider>` reads return the first matching
+        // entry regardless of chain, so listing the directory must
+        // return one entry per *unique provider name* — not one per
+        // (chain, provider) tuple.
+        let dir = tempfile::tempdir().unwrap();
+        let h = make_handler(dir.path());
+        let mut map = BTreeMap::new();
+        for ((chain, prov), ts) in [
+            (("ethereum".to_string(), "flashbots".to_string()), 1u64),
+            (("ethereum".to_string(), "mev_blocker".to_string()), 2u64),
+            (("polygon".to_string(), "flashbots".to_string()), 3u64),
+        ] {
+            map.insert(
+                (chain, prov),
+                PrivateRpcBackendStatus {
+                    last_status: "healthy".into(),
+                    last_probed_at: ts,
+                },
+            );
+        }
+        let h = h.with_private_rpc_healths(map);
+
+        let entries = h
+            .list(&VfsPath::parse("private_rpc").unwrap())
+            .await
+            .unwrap();
+        let mut names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["flashbots", "mev_blocker"]);
     }
 }
