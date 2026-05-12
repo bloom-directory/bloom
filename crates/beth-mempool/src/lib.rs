@@ -10,7 +10,9 @@ pub mod provider;
 pub mod stream;
 
 pub use bump::compute_replacement_fees;
-pub use heuristic::{HeuristicConfig, MevRisk, MevRiskReport, QuoteOracle, StaticQuoter, evaluate};
+pub use heuristic::{
+    HeuristicConfig, MevRisk, MevRiskReport, QuoteOracle, StaticQuoter, decode_swap_path, evaluate,
+};
 pub use index::PendingTxIndex;
 pub use private::{
     HealthStatus, MAINNET_CHAIN_ID, MockPrivateRpcProvider, PrivateRpcError, PrivateRpcProvider,

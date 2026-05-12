@@ -75,6 +75,19 @@ impl QuoteOracle for StaticQuoter {
     }
 }
 
+/// If the calldata decodes as a known DEX swap, return the addresses
+/// in the path. `path[0]` is the input token; the router address
+/// itself is the contract being called and is not in this list.
+pub fn decode_swap_path(calldata: &Bytes) -> Option<Vec<Address>> {
+    if let Ok(c) = IUniswapV2Router::swapExactTokensForTokensCall::abi_decode(calldata) {
+        return Some(c.path.into_iter().collect());
+    }
+    if let Ok(c) = IUniswapV2Router::swapExactETHForTokensCall::abi_decode(calldata) {
+        return Some(c.path.into_iter().collect());
+    }
+    None
+}
+
 pub fn evaluate(
     calldata: &Bytes,
     value: U256,
@@ -210,5 +223,13 @@ mod tests {
         let r = evaluate(&cd, U256::ZERO, &cfg, &q);
         assert_eq!(r.risk, MevRisk::High);
         assert!(r.checks.iter().any(|s| s == "amount_out_min_zero"));
+    }
+
+    #[test]
+    fn decode_swap_path_returns_path_addresses() {
+        let cd = load_fixture("uniswap_v2_swap.hex");
+        let path = decode_swap_path(&cd).unwrap();
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0].as_slice()[0], 0); // tokenA leading zeros
     }
 }

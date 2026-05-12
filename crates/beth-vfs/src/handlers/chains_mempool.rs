@@ -163,6 +163,18 @@ impl Handler for MempoolHandler {
                 Ok(Entry::read_only_file("nonces.json"))
             }
             [_chain, "mempool", "by_pool"] => Ok(Entry::dir("by_pool")),
+            [_chain, "mempool", "by_pool", pool] => {
+                let _: alloy::primitives::Address = pool
+                    .parse()
+                    .map_err(|e: alloy::hex::FromHexError| HandlerError::invalid(e.to_string()))?;
+                Ok(Entry::dir(pool))
+            }
+            [_chain, "mempool", "by_pool", pool, "recent.jsonl"] => {
+                let _: alloy::primitives::Address = pool
+                    .parse()
+                    .map_err(|e: alloy::hex::FromHexError| HandlerError::invalid(e.to_string()))?;
+                Ok(Entry::read_only_file("recent.jsonl"))
+            }
             _ => Err(HandlerError::NotFound(path.to_string_path())),
         }
     }
@@ -227,6 +239,25 @@ impl Handler for MempoolHandler {
                     "next_unused": next_unused,
                 });
                 serde_json::to_vec_pretty(&body).map_err(|e| HandlerError::backend(e.to_string()))
+            }
+            [_chain, "mempool", "by_pool", pool, "recent.jsonl"] => {
+                let pool: alloy::primitives::Address = pool
+                    .parse()
+                    .map_err(|e: alloy::hex::FromHexError| HandlerError::invalid(e.to_string()))?;
+                let items = self.recent.read().snapshot();
+                let mut out = Vec::new();
+                for it in &items {
+                    let to_match = it.to == Some(pool);
+                    let path_match = beth_mempool::decode_swap_path(&it.input)
+                        .map(|p| p.contains(&pool))
+                        .unwrap_or(false);
+                    if to_match || path_match {
+                        serde_json::to_writer(&mut out, it)
+                            .map_err(|e| HandlerError::backend(e.to_string()))?;
+                        out.push(b'\n');
+                    }
+                }
+                Ok(out)
             }
             [_chain, "mempool", "live"] => {
                 let mut rx = self.live_tx.subscribe();
@@ -431,5 +462,30 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["next_unused"], 7);
         assert_eq!(v["observed"], serde_json::json!([4, 6]));
+    }
+
+    #[tokio::test]
+    async fn by_pool_includes_txs_with_pool_in_swap_path() {
+        let h = make_handler();
+        let mut pool_bytes = [0u8; 20];
+        pool_bytes[19] = 2; // matches the second address in uniswap_v2_swap.hex (0x00…02)
+        let pool = Address::from(pool_bytes);
+        let mut t = fixture_tx(1);
+        t.input = Bytes::from(
+            alloy::hex::decode(
+                std::fs::read_to_string("../beth-mempool/tests/fixtures/uniswap_v2_swap.hex")
+                    .unwrap()
+                    .trim(),
+            )
+            .unwrap(),
+        );
+        h.ingest(t);
+        let p = VfsPath::parse(&format!("ethereum/mempool/by_pool/{pool:?}/recent.jsonl")).unwrap();
+        let body = h.read(&p).await.unwrap();
+        let lines: Vec<&[u8]> = body
+            .split(|c| *c == b'\n')
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(lines.len(), 1);
     }
 }
