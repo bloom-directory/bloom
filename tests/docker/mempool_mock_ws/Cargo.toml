@@ -1,0 +1,23 @@
+# Stand-alone test-support binary. Intentionally NOT part of the main
+# workspace — the empty [workspace] table below prevents Cargo from
+# rolling it up into the root workspace when built with
+# `cargo build --manifest-path tests/docker/mempool_mock_ws/Cargo.toml`.
+[workspace]
+
+[package]
+name = "mempool-mock-ws"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "mempool-mock-ws"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
+tokio-tungstenite = "0.24"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"

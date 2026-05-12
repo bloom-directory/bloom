@@ -3,7 +3,7 @@
 # integration suite.
 #
 # Usage:
-#   ./tests/docker/run.sh [--rebuild] [--workspace|--mount|--enso|--enso-live|--fork]
+#   ./tests/docker/run.sh [--rebuild] [--workspace|--mount|--enso|--enso-live|--fork|--mempool]
 #
 # Modes:
 #   default       — runs tests/docker/test.sh (NFS mount integration test).
@@ -32,6 +32,12 @@
 #                   native-ETH send via the wallet outbox, then exercises
 #                   the chain read paths (head/tx/blocks/gas) against the
 #                   resulting hash. No Enso key required.
+#   --mempool     — runs tests/docker/test_mempool_mock.sh inside the same
+#                   docker-compose stack via the `mempool` profile. Spins
+#                   up an in-container WS mock server that emulates
+#                   alchemy_pendingTransactions and asserts the daemon's
+#                   chains/base/mempool/{status.json,recent.jsonl} surface
+#                   populates within ~5 seconds. No Enso key required.
 #
 # `--rebuild` forces `docker build --no-cache`. The default reuses the
 # cached image so iterative loops stay fast. The named docker volume
@@ -48,13 +54,14 @@ CARGO_CACHE_VOLUME=bloom-eth-cargo-cache
 
 usage() {
     cat <<EOF
-Usage: $0 [--rebuild] [--workspace|--mount|--enso|--enso-live|--fork]
+Usage: $0 [--rebuild] [--workspace|--mount|--enso|--enso-live|--fork|--mempool]
 
 Default mode runs the NFS mount integration test.
 --workspace runs \`cargo test --workspace --lib\` inside the same image.
 --enso runs the Enso -> Aave integration test against an anvil fork.
 --enso-live runs the same flow against Base mainnet (spends real ETH).
 --fork runs the wallet outbox + chain reads test against an anvil fork.
+--mempool runs the mempool mock WS + daemon ingestion test.
 --rebuild forces \`docker build --no-cache\`.
 EOF
 }
@@ -130,6 +137,7 @@ for arg in "$@"; do
         --enso) MODE=enso ;;
         --enso-live) MODE=enso-live ;;
         --fork) MODE=fork ;;
+        --mempool) MODE=mempool ;;
         -h|--help)
             usage
             exit 0
@@ -173,6 +181,9 @@ case "$MODE" in
         ;;
     fork)
         run_compose_profile fork
+        ;;
+    mempool)
+        run_compose_profile mempool
         ;;
     enso-live)
         # No anvil sidecar: the daemon points at a real Base RPC and

@@ -92,6 +92,42 @@ services:
       - RUST_LOG=info
     command: ["bash", "tests/docker/test_fork_mount.sh"]
 
+  # ---------- mempool profile ------------------------------------------------
+  # Sidecar that emulates Alchemy's alchemy_pendingTransactions WebSocket feed
+  # by cycling through tests/docker/mempool_mock_ws/fixture.json.
+  mempool-mock:
+    image: ${BETH_TEST_IMAGE:-bloom-eth-mount-test:latest}
+    container_name: beth-mempool-mock
+    profiles: ["mempool"]
+    entrypoint: ["mempool-mock-ws"]
+    environment:
+      - MOCK_LISTEN_ADDR=0.0.0.0:9551
+      - MOCK_FIXTURE_PATH=/workspace/tests/docker/mempool_mock_ws/fixture.json
+    volumes:
+      - ${REPO_ROOT}:/workspace:ro
+    healthcheck:
+      test: ["CMD-SHELL", "(echo > /dev/tcp/127.0.0.1/9551) >/dev/null 2>&1 || exit 1"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+      start_period: 2s
+
+  beth-test-mempool:
+    <<: *beth-test
+    profiles: ["mempool"]
+    container_name: beth-mempool-driver
+    depends_on:
+      anvil-fork:
+        condition: service_healthy
+      mempool-mock:
+        condition: service_healthy
+    environment:
+      - BETH_TEST_WALLET_PASSPHRASE=test
+      - BASE_FORK_INTERNAL_URL=http://anvil-fork:8545
+      - MEMPOOL_MOCK_WS_URL=ws://mempool-mock:9551
+      - RUST_LOG=info
+    command: ["bash", "tests/docker/test_mempool_mock.sh"]
+
 volumes:
   bloom-eth-cargo-cache:
     # Pin the literal name so this volume is the same one the
