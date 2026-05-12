@@ -1,0 +1,40 @@
+[package]
+name = "beth-mempool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Mempool observability + private orderflow + MEV heuristic for bloom-eth"
+
+[features]
+default = ["alchemy", "generic_eth_subscribe", "mev_blocker", "flashbots"]
+alchemy = ["dep:reqwest", "dep:tokio-tungstenite"]
+generic_eth_subscribe = ["dep:tokio-tungstenite"]
+mev_blocker = ["dep:reqwest"]
+flashbots = ["dep:reqwest"]
+# Opt-in: enables tests that hit real Alchemy / MEV-Blocker / Flashbots
+# endpoints. Never enabled in CI.
+live-providers = []
+
+[dependencies]
+beth-proto.workspace = true
+beth-chain.workspace = true
+beth-tools.workspace = true
+alloy.workspace = true
+alloy-dyn-abi.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
+tracing.workspace = true
+parking_lot.workspace = true
+futures.workspace = true
+hex.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tracing-subscriber.workspace = true
+tempfile.workspace = true

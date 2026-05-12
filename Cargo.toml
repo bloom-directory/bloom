@@ -7,6 +7,7 @@ members = [
   "crates/beth-rpc",
   "crates/beth-tx",
   "crates/beth-keystore",
+  "crates/beth-mempool",
   "crates/beth-defi",
   "crates/beth-watch",
   "crates/beth-mount",
