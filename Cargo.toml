@@ -68,6 +68,7 @@ alloy = { version = "2", features = ["full", "signer-local", "rpc-types", "provi
 alloy-dyn-abi = { version = "1.5", features = ["eip712"] }
 
 # Internal crates
+beth-mempool  = { path = "crates/beth-mempool" }
 beth-proto    = { path = "crates/beth-proto" }
 beth-keystore = { path = "crates/beth-keystore" }
 beth-rpc      = { path = "crates/beth-rpc" }

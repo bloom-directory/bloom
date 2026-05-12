@@ -6,6 +6,7 @@ license.workspace = true
 description = "Path router and handlers for bloom-eth virtual filesystem"
 
 [dependencies]
+beth-mempool.workspace = true
 beth-proto.workspace = true
 beth-keystore.workspace = true
 beth-chain.workspace = true

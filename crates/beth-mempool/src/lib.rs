@@ -9,4 +9,10 @@ pub mod private;
 pub mod provider;
 pub mod stream;
 
-// pub use re-exports added as types land in later tasks (Tasks 1.2–1.7).
+pub use bump::compute_replacement_fees;
+pub use heuristic::{HeuristicConfig, MevRisk, MevRiskReport, QuoteOracle, StaticQuoter, evaluate};
+pub use index::PendingTxIndex;
+pub use private::{
+    HealthStatus, MAINNET_CHAIN_ID, MockPrivateRpcProvider, PrivateRpcError, PrivateRpcProvider,
+};
+pub use provider::{MempoolError, MempoolProvider, MockMempoolProvider, PendingTx, TxFees};
