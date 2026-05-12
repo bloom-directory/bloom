@@ -71,6 +71,9 @@ impl MempoolProvider for GenericEthSubscribeProvider {
                 observed_at: SystemTime::now(),
             })
         });
+        // `sink` is dropped here intentionally: tungstenite keeps the read
+        // half live after the write half is dropped, so the subscription
+        // continues until the returned stream itself is dropped.
         Ok(Box::pin(stream))
     }
 }
