@@ -15,8 +15,8 @@ pub use heuristic::{
     HeuristicConfig, MevRisk, MevRiskReport, QuoteOracle, StaticQuoter, decode_swap_path, evaluate,
 };
 pub use index::PendingTxIndex;
-pub use stream::MempoolStream;
 pub use private::{
     HealthStatus, MAINNET_CHAIN_ID, MockPrivateRpcProvider, PrivateRpcError, PrivateRpcProvider,
 };
 pub use provider::{MempoolError, MempoolProvider, MockMempoolProvider, PendingTx, TxFees};
+pub use stream::MempoolStream;

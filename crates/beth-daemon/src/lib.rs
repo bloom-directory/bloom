@@ -26,6 +26,7 @@ use beth_revert::{
 };
 use beth_tx::outbox::Outbox;
 use beth_tx::tx_engine::TxEngine;
+use beth_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use beth_vfs::handlers::{
     AddressBookHandler, ChainsHandler, DefiHandler, DocsHandler, EnsHandler, PricesHandler,
     SimulateHandler, StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
@@ -74,6 +75,10 @@ pub struct Daemon {
     /// Shutdown handles for spawned mempool subscription tasks. Dropping
     /// these signals each task to exit at its next iteration.
     pub mempool_shutdown: Arc<parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
+    /// Shutdown handles for the bump scanner and the backends probe task.
+    /// Sent on shutdown; safe even when no scanner / probe was spawned.
+    pub bump_shutdown: Arc<parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
+    pub probe_shutdown: Arc<parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 impl Daemon {
@@ -260,6 +265,11 @@ impl Daemon {
         }
 
         // Build per-chain private RPC providers from [private_rpc.<chain>].
+        // We also stash each successfully-registered provider so the
+        // backends probe task can call `health()` on them every 60s
+        // and publish results into the StatusHandler.
+        let mut private_rpc_probes: Vec<(String, Arc<dyn beth_mempool::PrivateRpcProvider>)> =
+            Vec::new();
         for (chain_name, rc) in &config.private_rpc {
             let Some(client) = chains.get(chain_name) else {
                 warn!(chain = %chain_name, "daemon.private_rpc_skipped: chain not configured");
@@ -270,10 +280,11 @@ impl Daemon {
                 match beth_mempool::providers::mev_blocker::MevBlockerProvider::new(url.clone()) {
                     Ok(p) => {
                         let arc_p: Arc<dyn beth_mempool::PrivateRpcProvider> = Arc::new(p);
-                        if let Err(e) = tx_engine.register_private_rpc(chain_id, arc_p) {
+                        if let Err(e) = tx_engine.register_private_rpc(chain_id, arc_p.clone()) {
                             warn!(chain = %chain_name, error = %e, "daemon.private_rpc_register_failed");
                         } else {
                             debug!(chain = %chain_name, provider = "mev_blocker", "daemon.private_rpc_registered");
+                            private_rpc_probes.push((chain_name.clone(), arc_p));
                         }
                     }
                     Err(e) => {
@@ -285,10 +296,11 @@ impl Daemon {
                 match beth_mempool::providers::flashbots::FlashbotsProvider::new(url.clone()) {
                     Ok(p) => {
                         let arc_p: Arc<dyn beth_mempool::PrivateRpcProvider> = Arc::new(p);
-                        if let Err(e) = tx_engine.register_private_rpc(chain_id, arc_p) {
+                        if let Err(e) = tx_engine.register_private_rpc(chain_id, arc_p.clone()) {
                             warn!(chain = %chain_name, error = %e, "daemon.private_rpc_register_failed");
                         } else {
                             debug!(chain = %chain_name, provider = "flashbots", "daemon.private_rpc_registered");
+                            private_rpc_probes.push((chain_name.clone(), arc_p));
                         }
                     }
                     Err(e) => {
@@ -331,6 +343,42 @@ impl Daemon {
         debug!("revert.decoder.heimdall_skipped: feature 'bytecode-decompile' off");
         let decoder_chain = Arc::new(decoder_chain);
 
+        // Seed initial mempool backend statuses from the handlers we just
+        // built. Subsequent live updates come from the probe task below.
+        let mut initial_mempool_statuses: std::collections::BTreeMap<String, MempoolBackendStatus> =
+            std::collections::BTreeMap::new();
+        for (chain_name, handler) in &mempool_handlers {
+            initial_mempool_statuses.insert(
+                chain_name.clone(),
+                MempoolBackendStatus {
+                    provider: handler.provider_id().to_string(),
+                    subscribed: handler.is_subscribed(),
+                    fallback_to: None,
+                },
+            );
+        }
+
+        let status_handler = Arc::new(
+            StatusHandler::with_backends(
+                chains.clone(),
+                keystore.clone(),
+                tx_engine.clone(),
+                audit_arc.clone(),
+                Some(prices.clone()),
+                Some(home.cache_dir().join("etherscan")),
+                config
+                    .etherscan
+                    .as_ref()
+                    .map(|c| !c.api_key.is_empty())
+                    .unwrap_or(false),
+                config.backends,
+                home.root().to_path_buf(),
+                SystemTime::now(),
+                env!("CARGO_PKG_VERSION"),
+            )
+            .with_mempool_statuses(initial_mempool_statuses),
+        );
+
         let mut vfs_builder = Vfs::builder()
             .mount(
                 "chains",
@@ -339,40 +387,24 @@ impl Daemon {
                         .with_etherscan(etherscan_arc.clone())
                         .with_ens(ens_client.clone())
                         .with_backends(config.backends)
-                        .with_mempool_handlers(mempool_handlers)
+                        .with_mempool_handlers(mempool_handlers.clone())
                         .with_revert_decoder(decoder_chain.clone()),
                 ) as _,
             )
             .mount(
                 "wallets",
-                Arc::new(WalletsHandler::new(
-                    keystore.clone(),
-                    chains.clone(),
-                    tx_engine.clone(),
-                    address_book.clone(),
-                )) as _,
+                Arc::new(
+                    WalletsHandler::new(
+                        keystore.clone(),
+                        chains.clone(),
+                        tx_engine.clone(),
+                        address_book.clone(),
+                    )
+                    .with_mempool_indexes(mempool_indexes.clone()),
+                ) as _,
             )
             .mount("tools", Arc::new(ToolsHandler::new()) as _)
-            .mount(
-                "status",
-                Arc::new(StatusHandler::with_backends(
-                    chains.clone(),
-                    keystore.clone(),
-                    tx_engine.clone(),
-                    audit_arc.clone(),
-                    Some(prices.clone()),
-                    Some(home.cache_dir().join("etherscan")),
-                    config
-                        .etherscan
-                        .as_ref()
-                        .map(|c| !c.api_key.is_empty())
-                        .unwrap_or(false),
-                    config.backends,
-                    home.root().to_path_buf(),
-                    SystemTime::now(),
-                    env!("CARGO_PKG_VERSION"),
-                )) as _,
-            )
+            .mount("status", status_handler.clone() as _)
             .mount("docs", Arc::new(DocsHandler::new()) as _)
             .mount(
                 "simulate",
@@ -458,6 +490,94 @@ impl Daemon {
             warn!("watch.executor.skipped: no tokio runtime; call Daemon::start_workers later");
         }
 
+        // Spawn the bump scanner if any chain has a mempool index. The
+        // scanner walks the outbox every 30s and emits `bump.tx` /
+        // `cancel.tx` / `bump_advice.json` artefacts next to stuck txs.
+        let mut bump_shutdown: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+        if !mempool_indexes.is_empty() && tokio::runtime::Handle::try_current().is_ok() {
+            let shared_indexes: beth_tx::bump_scanner::MempoolIndexes =
+                Arc::new(parking_lot::RwLock::new(mempool_indexes.clone()));
+            let basefee: Arc<dyn beth_tx::bump_scanner::BasefeeProvider> =
+                Arc::new(ChainBasefeeProvider {
+                    chains: chains.clone(),
+                });
+            let scanner = Arc::new(beth_tx::bump_scanner::BumpScanner::new(
+                tx_engine.outbox.clone(),
+                shared_indexes,
+                basefee,
+                beth_tx::bump_scanner::BumpScannerConfig::default(),
+            ));
+            let shutdown = scanner.spawn();
+            bump_shutdown.push(shutdown);
+            debug!("daemon.bump_scanner_spawned");
+        }
+
+        // Spawn the backends probe task. Every 60s it:
+        //   * refreshes `status/backends/mempool` from the live handler state
+        //   * calls `health()` on each registered private RPC and writes the
+        //     result into `status/backends/private_rpc`.
+        let mut probe_shutdown: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
+        let probe_needed = !mempool_handlers.is_empty() || !private_rpc_probes.is_empty();
+        if probe_needed && tokio::runtime::Handle::try_current().is_ok() {
+            let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+            probe_shutdown.push(tx);
+            let status_for_probe = status_handler.clone();
+            let mempool_handlers_for_probe = mempool_handlers.clone();
+            let probes = private_rpc_probes.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(60));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // Initial tick fires immediately so the first probe runs
+                // at boot, not 60s later.
+                loop {
+                    // Refresh mempool snapshot from handler state.
+                    let mut mempool_map: std::collections::BTreeMap<String, MempoolBackendStatus> =
+                        std::collections::BTreeMap::new();
+                    for (chain_name, h) in &mempool_handlers_for_probe {
+                        mempool_map.insert(
+                            chain_name.clone(),
+                            MempoolBackendStatus {
+                                provider: h.provider_id().to_string(),
+                                subscribed: h.is_subscribed(),
+                                fallback_to: None,
+                            },
+                        );
+                    }
+                    status_for_probe.replace_mempool_statuses(mempool_map);
+
+                    // Probe private RPC health.
+                    let mut health_map: std::collections::BTreeMap<
+                        (String, String),
+                        PrivateRpcBackendStatus,
+                    > = std::collections::BTreeMap::new();
+                    for (chain, provider) in &probes {
+                        let probed_at = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let status = match provider.health().await {
+                            Ok(_) => "healthy".to_string(),
+                            Err(_) => "unhealthy".to_string(),
+                        };
+                        health_map.insert(
+                            (chain.clone(), provider.id().to_string()),
+                            PrivateRpcBackendStatus {
+                                last_status: status,
+                                last_probed_at: probed_at,
+                            },
+                        );
+                    }
+                    status_for_probe.replace_private_rpc_healths(health_map);
+
+                    tokio::select! {
+                        _ = &mut rx => return,
+                        _ = ticker.tick() => {}
+                    }
+                }
+            });
+            debug!("daemon.backends_probe_spawned");
+        }
+
         info!(
             home = %home.root().display(),
             chains = ?config.chains.keys().collect::<Vec<_>>(),
@@ -481,6 +601,8 @@ impl Daemon {
             watch_registry,
             watch_executor,
             mempool_shutdown: Arc::new(parking_lot::Mutex::new(mempool_shutdown)),
+            bump_shutdown: Arc::new(parking_lot::Mutex::new(bump_shutdown)),
+            probe_shutdown: Arc::new(parking_lot::Mutex::new(probe_shutdown)),
         })
     }
 
@@ -495,10 +617,17 @@ impl Daemon {
     }
 
     /// Stop background workers cleanly. Signals all spawned mempool
-    /// subscription tasks and shuts down the watch executor's polling
-    /// task; safe to call multiple times.
+    /// subscription tasks, the bump scanner, and the backends probe,
+    /// then shuts down the watch executor's polling task. Safe to call
+    /// multiple times.
     pub async fn shutdown(&self) {
         for s in self.mempool_shutdown.lock().drain(..) {
+            let _ = s.send(());
+        }
+        for s in self.bump_shutdown.lock().drain(..) {
+            let _ = s.send(());
+        }
+        for s in self.probe_shutdown.lock().drain(..) {
             let _ = s.send(());
         }
         self.watch_executor.stop().await;
@@ -608,6 +737,21 @@ impl Drop for BackgroundTasks {
 
 /// Pick an ENS-capable chain client from the registry. Prefers chain id 1
 /// (mainnet); falls back to Sepolia / Goerli / Holesky.
+/// Adapter that reads the current basefee for a chain via the
+/// registered RPC pool. Used by the bump scanner's stuck-tx trigger.
+struct ChainBasefeeProvider {
+    chains: ChainRegistry,
+}
+
+#[async_trait::async_trait]
+impl beth_tx::bump_scanner::BasefeeProvider for ChainBasefeeProvider {
+    async fn basefee_wei(&self, chain: &str) -> Option<u128> {
+        let client = self.chains.get(chain)?;
+        let fh = client.fee_history(1).await.ok()?;
+        fh.base_fee_per_gas.last().copied()
+    }
+}
+
 fn pick_ens_client(chains: &ChainRegistry) -> Option<EnsClient> {
     for name in chains.list_names() {
         let Some(c) = chains.get(&name) else {
@@ -744,6 +888,57 @@ ws_url = "wss://example.invalid"
         // No mempool shutdown handle: the bogus chain was skipped because
         // it doesn't appear in [chains.*].
         assert!(daemon.mempool_shutdown.lock().is_empty());
+    }
+
+    /// Boots a daemon with one valid mempool chain and verifies that the
+    /// bump scanner and backends probe tasks were both spawned (their
+    /// shutdown senders are non-empty), and that the StatusHandler's
+    /// `status/backends/mempool` reads back a non-empty snapshot.
+    #[tokio::test]
+    async fn daemon_wires_bump_scanner_and_backends_probe_for_mempool_chain() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = HomeDir::at(tmp.path());
+        home.ensure().unwrap();
+        let config_toml = r#"
+default_chain = "ethereum"
+[chains.ethereum]
+name = "ethereum"
+chain_id = 1
+rpc_urls = ["http://127.0.0.1:8545"]
+native_symbol = "ETH"
+native_decimals = 18
+
+[mempool.ethereum]
+provider = "alchemy"
+ws_url = "wss://example.invalid"
+"#;
+        std::fs::write(home.config_path(), config_toml).unwrap();
+        let daemon = Daemon::from_home(home).expect("daemon boots");
+
+        assert!(
+            !daemon.bump_shutdown.lock().is_empty(),
+            "bump scanner should be spawned when at least one mempool chain is configured"
+        );
+        assert!(
+            !daemon.probe_shutdown.lock().is_empty(),
+            "backends probe should be spawned when at least one mempool chain is configured"
+        );
+
+        let path = beth_vfs::VfsPath::parse("status/backends/mempool").unwrap();
+        let body = daemon
+            .vfs
+            .read(&path)
+            .await
+            .expect("status/backends/mempool readable");
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(
+            s.contains("ethereum") && s.contains("alchemy"),
+            "expected mempool snapshot to mention ethereum + alchemy; got: {s}"
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), daemon.shutdown())
+            .await
+            .expect("shutdown timed out");
     }
 
     /// Fix #3: the spawned sweeper drops expired pending entries into

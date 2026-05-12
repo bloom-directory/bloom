@@ -109,6 +109,14 @@ impl MempoolHandler {
         *self.state.write() = state;
     }
 
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    pub fn is_subscribed(&self) -> bool {
+        matches!(*self.state.read(), SubscriptionState::Subscribed)
+    }
+
     pub fn note_event(&self) {
         *self.last_event_at.write() = SystemTime::now();
     }

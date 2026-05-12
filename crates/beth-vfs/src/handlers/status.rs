@@ -179,6 +179,22 @@ impl StatusHandler {
         self
     }
 
+    /// Live update of the per-chain mempool status snapshot from a
+    /// background probe task. The inner field is already shared, so an
+    /// existing `Arc<StatusHandler>` mount picks up the change on the
+    /// next read.
+    pub fn replace_mempool_statuses(&self, map: BTreeMap<String, MempoolBackendStatus>) {
+        *self.mempool_statuses.write() = map;
+    }
+
+    /// Live update of the per-(chain, provider) private-RPC health snapshot.
+    pub fn replace_private_rpc_healths(
+        &self,
+        map: BTreeMap<(String, String), PrivateRpcBackendStatus>,
+    ) {
+        *self.private_rpc_healths.write() = map;
+    }
+
     fn started_unix_ms(&self) -> u128 {
         self.started_at
             .duration_since(UNIX_EPOCH)

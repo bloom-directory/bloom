@@ -517,22 +517,26 @@ pub trait MempoolProvider: Send + Sync {
 }
 
 /// Conformance test suite. Any `MempoolProvider` implementation
-/// should be exercised via `provider_test_suite!(MyProvider, build_fn)`
-/// where `build_fn` is a `fn() -> MyProvider`.
+/// should be exercised via `provider_test_suite!(MyProvider, build_fn, suite_mod_name)`
+/// where `build_fn` is a `fn() -> MyProvider` and `suite_mod_name` is a unique
+/// identifier for the generated test module.
 ///
-/// The suite runs three checks:
+/// Note: the `${ty}` metavariable expression form (macro_metavar_expr) is not yet
+/// stable in Rust 1.91; the explicit `$mod_name:ident` fallback is used instead.
+///
+/// The suite runs two checks:
 ///   1. `id()` is non-empty.
 ///   2. `subscribe()` returns a stream that yields at least 1 item
 ///      when the upstream produces items.
-///   3. Duplicate hashes are not re-emitted after a successful
-///      reconnect (only enforced for providers that explicitly
-///      implement dedup; see Phase 4).
+///
+/// (A future dedup-after-reconnect check is deferred to Phase 4, where it
+/// will be exercised against `MempoolStream` rather than individual providers.)
 #[macro_export]
 macro_rules! provider_test_suite {
-    ($t:ty, $build:expr) => {
+    ($t:ty, $build:expr, $mod_name:ident) => {
         #[allow(non_snake_case)]
-        mod __provider_test_suite_for_${ty} {
-            use super::*;
+        mod $mod_name {
+            use $crate::provider::{MempoolProvider, PendingTx};
 
             #[tokio::test]
             async fn id_is_non_empty() {
@@ -544,15 +548,13 @@ macro_rules! provider_test_suite {
             async fn subscribe_yields_when_upstream_has_items() {
                 use futures::StreamExt;
                 let p: $t = $build();
-                let mut s =
-                    <$t as $crate::provider::MempoolProvider>::subscribe(&p).await.unwrap();
-                let first = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    s.next(),
-                )
-                .await
-                .expect("provider must yield first item within 2s")
-                .expect("stream ended before yielding any item");
+                let mut s = <$t as $crate::provider::MempoolProvider>::subscribe(&p)
+                    .await
+                    .unwrap();
+                let first = tokio::time::timeout(std::time::Duration::from_secs(2), s.next())
+                    .await
+                    .expect("provider must yield first item within 2s")
+                    .expect("stream ended before yielding any item");
                 assert_ne!(first.hash, alloy::primitives::B256::ZERO);
             }
         }
@@ -560,7 +562,9 @@ macro_rules! provider_test_suite {
 }
 ```
 
-Note: the `${ty}` token is a metavariable expression — if your toolchain rejects it, replace `__provider_test_suite_for_${ty}` with a fixed module name passed in as an extra macro arg `$mod_name:ident`. Stable Rust 1.85+ supports this via `macro_metavar_expr`; if not, fall back to the explicit form.
+Note: the macro takes a third `$mod_name:ident` argument because the `${ty}` metavariable
+expression (macro_metavar_expr) is not stable on Rust 1.91. Each caller must supply a
+unique module identifier, e.g. `provider_test_suite!(MockMempoolProvider, build_fn, mock_provider_conformance)`.
 
 - [ ] **Step 2: Build the crate**
 
@@ -909,7 +913,7 @@ pub enum MevRisk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MevRiskReport {
     pub risk: MevRisk,
-    pub checks: Vec<&'static str>,
+    pub checks: Vec<String>,
     pub advice: String,
 }
 
@@ -955,11 +959,11 @@ pub fn evaluate(
     quoter: &dyn QuoteOracle,
 ) -> MevRiskReport {
     // Try Uniswap V2 swapExactTokensForTokens.
-    if let Ok(c) = IUniswapV2Router::swapExactTokensForTokensCall::abi_decode(calldata, true) {
+    if let Ok(c) = IUniswapV2Router::swapExactTokensForTokensCall::abi_decode(calldata) {
         return evaluate_swap(c.amountIn, c.amountOutMin, &c.path, cfg, quoter);
     }
     // Try Uniswap V2 swapExactETHForTokens — amountIn comes from `value`.
-    if let Ok(c) = IUniswapV2Router::swapExactETHForTokensCall::abi_decode(calldata, true) {
+    if let Ok(c) = IUniswapV2Router::swapExactETHForTokensCall::abi_decode(calldata) {
         return evaluate_swap(value, c.amountOutMin, &c.path, cfg, quoter);
     }
 
@@ -1036,7 +1040,7 @@ mod tests {
         let q = StaticQuoter(U256::ZERO);
         let r = evaluate(&Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]), U256::ZERO, &cfg, &q);
         assert_eq!(r.risk, MevRisk::Low);
-        assert!(r.checks.contains(&"calldata_not_a_known_swap"));
+        assert!(r.checks.iter().any(|s| s == "calldata_not_a_known_swap"));
     }
 
     #[test]
@@ -1047,7 +1051,7 @@ mod tests {
         let cd = load_fixture("uniswap_v2_swap.hex");
         let r = evaluate(&cd, U256::ZERO, &cfg, &q);
         assert_eq!(r.risk, MevRisk::High);
-        assert!(r.checks.contains(&"slippage_exposure"));
+        assert!(r.checks.iter().any(|s| s == "slippage_exposure"));
     }
 
     #[test]
@@ -1067,7 +1071,7 @@ mod tests {
         let cd = load_fixture("uniswap_v2_zero_min.hex");
         let r = evaluate(&cd, U256::ZERO, &cfg, &q);
         assert_eq!(r.risk, MevRisk::High);
-        assert!(r.checks.contains(&"amount_out_min_zero"));
+        assert!(r.checks.iter().any(|s| s == "amount_out_min_zero"));
     }
 }
 ```
@@ -1792,10 +1796,10 @@ In `crates/beth-mempool/src/heuristic.rs`, add (above `evaluate`):
 /// in the path. `path[0]` is the input token; the router address
 /// itself is the contract being called and is not in this list.
 pub fn decode_swap_path(calldata: &Bytes) -> Option<Vec<Address>> {
-    if let Ok(c) = IUniswapV2Router::swapExactTokensForTokensCall::abi_decode(calldata, true) {
+    if let Ok(c) = IUniswapV2Router::swapExactTokensForTokensCall::abi_decode(calldata) {
         return Some(c.path.into_iter().collect());
     }
-    if let Ok(c) = IUniswapV2Router::swapExactETHForTokensCall::abi_decode(calldata, true) {
+    if let Ok(c) = IUniswapV2Router::swapExactETHForTokensCall::abi_decode(calldata) {
         return Some(c.path.into_iter().collect());
     }
     None
