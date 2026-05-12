@@ -143,6 +143,25 @@ impl Handler for MempoolHandler {
             [_chain, "mempool", "recent.jsonl"] => Ok(Entry::read_only_file("recent.jsonl")),
             [_chain, "mempool", "live"] => Ok(Entry::read_only_file("live")),
             [_chain, "mempool", "by_address"] => Ok(Entry::dir("by_address")),
+            [_chain, "mempool", "by_address", addr] => {
+                // Validate the address segment is a real address before claiming the dir exists.
+                let _: alloy::primitives::Address = addr
+                    .parse()
+                    .map_err(|e: alloy::hex::FromHexError| HandlerError::invalid(e.to_string()))?;
+                Ok(Entry::dir(addr))
+            }
+            [_chain, "mempool", "by_address", addr, "pending.jsonl"] => {
+                let _: alloy::primitives::Address = addr
+                    .parse()
+                    .map_err(|e: alloy::hex::FromHexError| HandlerError::invalid(e.to_string()))?;
+                Ok(Entry::read_only_file("pending.jsonl"))
+            }
+            [_chain, "mempool", "by_address", addr, "nonces.json"] => {
+                let _: alloy::primitives::Address = addr
+                    .parse()
+                    .map_err(|e: alloy::hex::FromHexError| HandlerError::invalid(e.to_string()))?;
+                Ok(Entry::read_only_file("nonces.json"))
+            }
             [_chain, "mempool", "by_pool"] => Ok(Entry::dir("by_pool")),
             _ => Err(HandlerError::NotFound(path.to_string_path())),
         }
@@ -180,6 +199,34 @@ impl Handler for MempoolHandler {
                     out.push(b'\n');
                 }
                 Ok(out)
+            }
+            [_chain, "mempool", "by_address", addr, "pending.jsonl"] => {
+                let addr: alloy::primitives::Address = addr
+                    .parse()
+                    .map_err(|e: alloy::hex::FromHexError| HandlerError::invalid(e.to_string()))?;
+                let items = self.recent.read().snapshot();
+                let mut out = Vec::new();
+                for it in items
+                    .iter()
+                    .filter(|t| t.from == addr || t.to == Some(addr))
+                {
+                    serde_json::to_writer(&mut out, it)
+                        .map_err(|e| HandlerError::backend(e.to_string()))?;
+                    out.push(b'\n');
+                }
+                Ok(out)
+            }
+            [_chain, "mempool", "by_address", addr, "nonces.json"] => {
+                let addr: alloy::primitives::Address = addr
+                    .parse()
+                    .map_err(|e: alloy::hex::FromHexError| HandlerError::invalid(e.to_string()))?;
+                let observed = self.index.observed_nonces(addr);
+                let next_unused = observed.last().map(|n| n + 1).unwrap_or(0);
+                let body = serde_json::json!({
+                    "observed": observed,
+                    "next_unused": next_unused,
+                });
+                serde_json::to_vec_pretty(&body).map_err(|e| HandlerError::backend(e.to_string()))
             }
             [_chain, "mempool", "live"] => {
                 let mut rx = self.live_tx.subscribe();
@@ -335,5 +382,54 @@ mod tests {
                 a
             })
         );
+    }
+
+    #[tokio::test]
+    async fn by_address_pending_filters_by_from_or_to() {
+        let h = make_handler();
+        let mut from_a = [0u8; 20];
+        from_a[0] = 1;
+        let a = Address::from(from_a);
+        let mut t1 = fixture_tx(1);
+        t1.from = a;
+        let mut t2 = fixture_tx(2);
+        t2.to = Some(a);
+        let mut t3 = fixture_tx(3); // unrelated
+        let mut other = [0u8; 20];
+        other[0] = 9;
+        t3.from = Address::from(other);
+        h.ingest(t1);
+        h.ingest(t2);
+        h.ingest(t3);
+        let p =
+            VfsPath::parse(&format!("ethereum/mempool/by_address/{a:?}/pending.jsonl")).unwrap();
+        let body = h.read(&p).await.unwrap();
+        let lines: Vec<&[u8]> = body
+            .split(|c| *c == b'\n')
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn by_address_nonces_json_reports_observed_and_next_unused() {
+        let h = make_handler();
+        let mut a = [0u8; 20];
+        a[0] = 1;
+        let addr = Address::from(a);
+        let mut t1 = fixture_tx(1);
+        t1.from = addr;
+        t1.nonce = 4;
+        let mut t2 = fixture_tx(2);
+        t2.from = addr;
+        t2.nonce = 6;
+        h.ingest(t1);
+        h.ingest(t2);
+        let p =
+            VfsPath::parse(&format!("ethereum/mempool/by_address/{addr:?}/nonces.json")).unwrap();
+        let body = h.read(&p).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["next_unused"], 7);
+        assert_eq!(v["observed"], serde_json::json!([4, 6]));
     }
 }
