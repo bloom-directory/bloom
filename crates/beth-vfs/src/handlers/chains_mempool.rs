@@ -71,6 +71,7 @@ pub struct MempoolHandler {
     dropped: AtomicU64,
     last_event_at: RwLock<SystemTime>,
     recent: RwLock<RingBuffer>,
+    live_tx: tokio::sync::broadcast::Sender<PendingTx>,
 }
 
 impl MempoolHandler {
@@ -88,6 +89,7 @@ impl MempoolHandler {
             dropped: AtomicU64::new(0),
             last_event_at: RwLock::new(SystemTime::now()),
             recent: RwLock::new(RingBuffer::new(RECENT_RING_CAPACITY)),
+            live_tx: tokio::sync::broadcast::channel(4096).0,
         }
     }
 
@@ -105,7 +107,8 @@ impl MempoolHandler {
 
     pub fn ingest(&self, tx: PendingTx) {
         self.recent.write().push(tx.clone());
-        self.index.insert(tx);
+        self.index.insert(tx.clone());
+        let _ = self.live_tx.send(tx);
         self.note_event();
     }
 
@@ -138,6 +141,7 @@ impl Handler for MempoolHandler {
             [_chain, "mempool"] => Ok(Entry::dir("mempool")),
             [_chain, "mempool", "status.json"] => Ok(Entry::read_only_file("status.json")),
             [_chain, "mempool", "recent.jsonl"] => Ok(Entry::read_only_file("recent.jsonl")),
+            [_chain, "mempool", "live"] => Ok(Entry::read_only_file("live")),
             [_chain, "mempool", "by_address"] => Ok(Entry::dir("by_address")),
             [_chain, "mempool", "by_pool"] => Ok(Entry::dir("by_pool")),
             _ => Err(HandlerError::NotFound(path.to_string_path())),
@@ -151,6 +155,7 @@ impl Handler for MempoolHandler {
             [_chain, "mempool"] => Ok(vec![
                 Entry::read_only_file("status.json"),
                 Entry::read_only_file("recent.jsonl"),
+                Entry::read_only_file("live"),
                 Entry::dir("by_address"),
                 Entry::dir("by_pool"),
             ]),
@@ -173,6 +178,46 @@ impl Handler for MempoolHandler {
                     serde_json::to_writer(&mut out, it)
                         .map_err(|e| HandlerError::backend(e.to_string()))?;
                     out.push(b'\n');
+                }
+                Ok(out)
+            }
+            [_chain, "mempool", "live"] => {
+                let mut rx = self.live_tx.subscribe();
+                let mut out = Vec::new();
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
+                while let Some(remaining) =
+                    deadline.checked_duration_since(tokio::time::Instant::now())
+                {
+                    let recv = tokio::time::timeout(remaining, rx.recv()).await;
+                    match recv {
+                        Ok(Ok(tx)) => {
+                            serde_json::to_writer(&mut out, &tx)
+                                .map_err(|e| HandlerError::backend(e.to_string()))?;
+                            out.push(b'\n');
+                            // Drain a 200ms burst window to coalesce.
+                            let burst_end =
+                                tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+                            while let Ok(Ok(more)) = tokio::time::timeout(
+                                burst_end.duration_since(tokio::time::Instant::now()),
+                                rx.recv(),
+                            )
+                            .await
+                            {
+                                serde_json::to_writer(&mut out, &more)
+                                    .map_err(|e| HandlerError::backend(e.to_string()))?;
+                                out.push(b'\n');
+                            }
+                            break;
+                        }
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                            let lagged = serde_json::json!({"kind": "lagged", "skipped": n});
+                            serde_json::to_writer(&mut out, &lagged)
+                                .map_err(|e| HandlerError::backend(e.to_string()))?;
+                            out.push(b'\n');
+                        }
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                        Err(_) => break,
+                    }
                 }
                 Ok(out)
             }
@@ -232,6 +277,32 @@ mod tests {
             input: Bytes::new(),
             observed_at: std::time::SystemTime::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn live_tail_emits_ingested_items() {
+        let h = Arc::new(make_handler());
+        let h2 = Arc::clone(&h);
+        let reader = tokio::spawn(async move {
+            let p = VfsPath::parse("ethereum/mempool/live").unwrap();
+            h2.read(&p).await.unwrap()
+        });
+        // Give the reader a chance to subscribe before we publish.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        h.ingest(fixture_tx(7));
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+            .await
+            .expect("reader timeout")
+            .expect("join");
+        let lines: Vec<&[u8]> = body
+            .split(|c| *c == b'\n')
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(!lines.is_empty());
+        let first: PendingTx = serde_json::from_slice(lines[0]).unwrap();
+        let mut expected = [0u8; 32];
+        expected[0] = 7;
+        assert_eq!(first.hash, B256::from(expected));
     }
 
     #[tokio::test]
