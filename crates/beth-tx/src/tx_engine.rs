@@ -2,7 +2,7 @@
 //! then on confirm sign and broadcast. Also handles same-nonce
 //! replacement / cancel txs and a legacy (non-1559) build path.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -86,6 +86,10 @@ pub enum TxEngineError {
 /// In-memory cache for ERC-20 metadata keyed by `(chain_id, address)`.
 type TokenCache = Arc<RwLock<HashMap<(u64, Address), TokenMeta>>>;
 
+/// Per-chain map of pending-tx indexes used at stage time to detect
+/// nonce conflicts with externally-observed mempool entries.
+type MempoolIndexes = Arc<RwLock<BTreeMap<String, Arc<beth_mempool::PendingTxIndex>>>>;
+
 #[derive(Debug, Clone)]
 struct TokenMeta {
     address: Address,
@@ -107,8 +111,7 @@ pub struct TxEngine {
     /// Per-chain pending-tx indexes for the nonce-conflict check at
     /// stage time. Populated externally (by the daemon, after the
     /// mempool subsystem starts) via [`Self::set_mempool_index`].
-    mempool_indexes:
-        Arc<RwLock<std::collections::BTreeMap<String, Arc<beth_mempool::PendingTxIndex>>>>,
+    mempool_indexes: MempoolIndexes,
 }
 
 impl TxEngine {
@@ -120,7 +123,7 @@ impl TxEngine {
             token_cache: Arc::new(RwLock::new(HashMap::new())),
             resolver: None,
             price_oracle: None,
-            mempool_indexes: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+            mempool_indexes: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -154,16 +157,17 @@ impl TxEngine {
         let observed_at = rec
             .tx
             .observed_at
-            .duration_since(std::time::UNIX_EPOCH)
+            .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let hex_hash = hex::encode(rec.tx.hash.as_slice());
+        let hash_str = format!("0x{hex_hash}");
         Some(serde_json::json!({
             "conflict_nonce": nonce,
-            "external_hash": format!("0x{hex_hash}"),
+            "external_hash": &hash_str,
             "external_observed_at": observed_at,
             "advice": format!(
-                "external tx 0x{hex_hash} is pending at this nonce; use a different nonce or wait for it to mine/drop"
+                "external tx {hash_str} is pending at this nonce; use a different nonce or wait for it to mine/drop"
             ),
         }))
     }
@@ -1346,6 +1350,8 @@ const _PARSE_UNITS: fn(&str, u8) -> Result<U256, beth_proto::units::UnitError> =
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use beth_proto::TxStatus;
 
@@ -1445,7 +1451,7 @@ mod tests {
             gas_limit: 21_000,
             fees: beth_mempool::TxFees::Legacy { gas_price: 1 },
             input: Bytes::new(),
-            observed_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(observed_secs),
+            observed_at: UNIX_EPOCH + Duration::from_secs(observed_secs),
         }
     }
 
