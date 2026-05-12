@@ -7,12 +7,39 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use beth_mempool::PendingTxIndex;
+use beth_mempool::{PendingTx, PendingTxIndex};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
+
+const RECENT_RING_CAPACITY: usize = 500;
+
+struct RingBuffer {
+    items: std::collections::VecDeque<PendingTx>,
+    capacity: usize,
+}
+
+impl RingBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            items: std::collections::VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn push(&mut self, tx: PendingTx) {
+        if self.items.len() == self.capacity {
+            self.items.pop_front();
+        }
+        self.items.push_back(tx);
+    }
+
+    fn snapshot(&self) -> Vec<PendingTx> {
+        self.items.iter().cloned().collect()
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum SubscriptionState {
@@ -43,6 +70,7 @@ pub struct MempoolHandler {
     state: RwLock<SubscriptionState>,
     dropped: AtomicU64,
     last_event_at: RwLock<SystemTime>,
+    recent: RwLock<RingBuffer>,
 }
 
 impl MempoolHandler {
@@ -59,6 +87,7 @@ impl MempoolHandler {
             state: RwLock::new(SubscriptionState::Disconnected),
             dropped: AtomicU64::new(0),
             last_event_at: RwLock::new(SystemTime::now()),
+            recent: RwLock::new(RingBuffer::new(RECENT_RING_CAPACITY)),
         }
     }
 
@@ -72,6 +101,12 @@ impl MempoolHandler {
 
     pub fn increment_dropped(&self, n: u64) {
         self.dropped.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn ingest(&self, tx: PendingTx) {
+        self.recent.write().push(tx.clone());
+        self.index.insert(tx);
+        self.note_event();
     }
 
     fn status(&self) -> MempoolStatus {
@@ -102,6 +137,7 @@ impl Handler for MempoolHandler {
             [chain] => Ok(Entry::dir(chain)),
             [_chain, "mempool"] => Ok(Entry::dir("mempool")),
             [_chain, "mempool", "status.json"] => Ok(Entry::read_only_file("status.json")),
+            [_chain, "mempool", "recent.jsonl"] => Ok(Entry::read_only_file("recent.jsonl")),
             [_chain, "mempool", "by_address"] => Ok(Entry::dir("by_address")),
             [_chain, "mempool", "by_pool"] => Ok(Entry::dir("by_pool")),
             _ => Err(HandlerError::NotFound(path.to_string_path())),
@@ -114,6 +150,7 @@ impl Handler for MempoolHandler {
         match strs.as_slice() {
             [_chain, "mempool"] => Ok(vec![
                 Entry::read_only_file("status.json"),
+                Entry::read_only_file("recent.jsonl"),
                 Entry::dir("by_address"),
                 Entry::dir("by_pool"),
             ]),
@@ -128,6 +165,16 @@ impl Handler for MempoolHandler {
             [_chain, "mempool", "status.json"] => {
                 let s = self.status();
                 serde_json::to_vec_pretty(&s).map_err(|e| HandlerError::backend(e.to_string()))
+            }
+            [_chain, "mempool", "recent.jsonl"] => {
+                let items = self.recent.read().snapshot();
+                let mut out = Vec::new();
+                for it in &items {
+                    serde_json::to_writer(&mut out, it)
+                        .map_err(|e| HandlerError::backend(e.to_string()))?;
+                    out.push(b'\n');
+                }
+                Ok(out)
             }
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
@@ -166,5 +213,56 @@ mod tests {
         let body = h.read(&p).await.unwrap();
         let s: MempoolStatus = serde_json::from_slice(&body).unwrap();
         assert!(s.subscribed);
+    }
+
+    use alloy::primitives::{Address, B256, Bytes, U256};
+    use beth_mempool::TxFees;
+
+    fn fixture_tx(hash_byte: u8) -> PendingTx {
+        let mut h = [0u8; 32];
+        h[0] = hash_byte;
+        PendingTx {
+            hash: B256::from(h),
+            from: Address::ZERO,
+            to: None,
+            nonce: 0,
+            value: U256::ZERO,
+            gas_limit: 21_000,
+            fees: TxFees::Legacy { gas_price: 1 },
+            input: Bytes::new(),
+            observed_at: std::time::SystemTime::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn recent_jsonl_returns_ingested_items_in_order() {
+        let h = make_handler();
+        h.ingest(fixture_tx(1));
+        h.ingest(fixture_tx(2));
+        let p = VfsPath::parse("ethereum/mempool/recent.jsonl").unwrap();
+        let body = h.read(&p).await.unwrap();
+        let lines: Vec<&[u8]> = body
+            .split(|c| *c == b'\n')
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        let first: PendingTx = serde_json::from_slice(lines[0]).unwrap();
+        let second: PendingTx = serde_json::from_slice(lines[1]).unwrap();
+        assert_eq!(
+            first.hash,
+            B256::from({
+                let mut a = [0u8; 32];
+                a[0] = 1;
+                a
+            })
+        );
+        assert_eq!(
+            second.hash,
+            B256::from({
+                let mut a = [0u8; 32];
+                a[0] = 2;
+                a
+            })
+        );
     }
 }
