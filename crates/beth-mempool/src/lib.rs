@@ -7,6 +7,7 @@ pub mod heuristic;
 pub mod index;
 pub mod private;
 pub mod provider;
+pub mod providers;
 pub mod stream;
 
 pub use bump::compute_replacement_fees;
