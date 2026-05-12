@@ -91,7 +91,7 @@ mod system_time_secs {
 }
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
+use futures::stream::{self, BoxStream};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -136,9 +136,6 @@ macro_rules! provider_test_suite {
     ($t:ty, $build:expr, $mod_name:ident) => {
         #[allow(non_snake_case)]
         mod $mod_name {
-            #[allow(unused_imports)]
-            use $crate::provider::{MempoolProvider, PendingTx};
-
             #[tokio::test]
             async fn id_is_non_empty() {
                 let p: $t = $build();
@@ -161,8 +158,6 @@ macro_rules! provider_test_suite {
         }
     };
 }
-
-use futures::stream;
 
 /// In-memory mock that yields a fixed sequence of `PendingTx`s. Used
 /// by integration tests in this crate and by `beth-vfs` / `beth-tx`
