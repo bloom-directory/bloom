@@ -136,6 +136,7 @@ macro_rules! provider_test_suite {
     ($t:ty, $build:expr, $mod_name:ident) => {
         #[allow(non_snake_case)]
         mod $mod_name {
+            #[allow(unused_imports)]
             use $crate::provider::{MempoolProvider, PendingTx};
 
             #[tokio::test]
@@ -159,6 +160,48 @@ macro_rules! provider_test_suite {
             }
         }
     };
+}
+
+use futures::stream;
+
+/// In-memory mock that yields a fixed sequence of `PendingTx`s. Used
+/// by integration tests in this crate and by `beth-vfs` / `beth-tx`
+/// integration suites.
+pub struct MockMempoolProvider {
+    id: &'static str,
+    fixtures: Vec<PendingTx>,
+    delivers_bodies: bool,
+}
+
+impl MockMempoolProvider {
+    pub fn new(id: &'static str, fixtures: Vec<PendingTx>) -> Self {
+        Self {
+            id,
+            fixtures,
+            delivers_bodies: true,
+        }
+    }
+
+    pub fn with_hashes_only(mut self) -> Self {
+        self.delivers_bodies = false;
+        self
+    }
+}
+
+#[async_trait]
+impl MempoolProvider for MockMempoolProvider {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    async fn subscribe(&self) -> Result<BoxStream<'static, PendingTx>, MempoolError> {
+        let items = self.fixtures.clone();
+        Ok(Box::pin(stream::iter(items)))
+    }
+
+    fn delivers_bodies(&self) -> bool {
+        self.delivers_bodies
+    }
 }
 
 #[cfg(test)]
@@ -214,4 +257,37 @@ mod tests {
         let back: TxFees = serde_json::from_str(&s).unwrap();
         assert_eq!(back, f);
     }
+
+    fn one_fixture() -> Vec<PendingTx> {
+        vec![PendingTx {
+            hash: B256::from([1u8; 32]),
+            from: Address::from([2u8; 20]),
+            to: None,
+            nonce: 0,
+            value: U256::ZERO,
+            gas_limit: 21_000,
+            fees: TxFees::Legacy { gas_price: 1 },
+            input: Bytes::new(),
+            observed_at: SystemTime::now(),
+        }]
+    }
+
+    #[tokio::test]
+    async fn mock_yields_fixture_items() {
+        use futures::StreamExt;
+        let p = MockMempoolProvider::new("mock", one_fixture());
+        let mut s = p.subscribe().await.unwrap();
+        let first = s.next().await.unwrap();
+        assert_eq!(first.hash, B256::from([1u8; 32]));
+    }
+
+    fn build_mock() -> crate::provider::MockMempoolProvider {
+        crate::provider::MockMempoolProvider::new("mock", one_fixture())
+    }
+
+    crate::provider_test_suite!(
+        crate::provider::MockMempoolProvider,
+        super::build_mock,
+        mock_provider_conformance
+    );
 }
