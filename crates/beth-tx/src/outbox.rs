@@ -158,6 +158,27 @@ impl Outbox {
         Ok(dir)
     }
 
+    /// Write a `nonce_conflict.json` artefact next to a pending tx, used
+    /// when stage detects that `(from, nonce)` collides with an
+    /// externally-observed pending tx in the mempool index. The pending
+    /// dir must already exist (typically written by `write_pending`
+    /// immediately before).
+    pub fn write_nonce_conflict(
+        &self,
+        wallet: &str,
+        chain: &str,
+        id: &str,
+        body: &serde_json::Value,
+    ) -> Result<PathBuf, OutboxError> {
+        let dir = self
+            .state_dir(wallet, chain, OutboxState::Pending)?
+            .join(id);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("nonce_conflict.json");
+        fs::write(&path, serde_json::to_vec_pretty(body)?)?;
+        Ok(path)
+    }
+
     /// Search for `id` across pending/sent/failed and return the first hit.
     /// Prefer [`Self::read_in_state`] when the caller knows where the entry
     /// is supposed to be — this method exists for diagnostics and is the
@@ -558,5 +579,37 @@ mod tests {
         let ob = Outbox::new(dir.path()).unwrap();
         let total = ob.sum_usd_since("alice", 0).unwrap();
         assert_eq!(total, 0.0);
+    }
+
+    #[test]
+    fn write_nonce_conflict_writes_to_pending_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let staged = fake_staged("0001-conflict");
+        ob.write_pending(&staged, "p").unwrap();
+
+        let body = serde_json::json!({
+            "conflict_nonce": 7,
+            "external_hash": "0xabababababababababababababababababababababababababababababababab",
+            "external_observed_at": 1_700_000_000u64,
+            "advice": "use a different nonce",
+        });
+        let path = ob
+            .write_nonce_conflict("alice", "anvil", "0001-conflict", &body)
+            .unwrap();
+
+        let expected = dir
+            .path()
+            .join("alice")
+            .join("anvil")
+            .join("pending")
+            .join("0001-conflict")
+            .join("nonce_conflict.json");
+        assert_eq!(path, expected);
+        assert!(path.exists());
+
+        let read_body: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(read_body, body);
     }
 }

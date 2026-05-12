@@ -104,6 +104,11 @@ pub struct TxEngine {
     token_cache: TokenCache,
     resolver: Option<Arc<dyn RecipientResolver>>,
     price_oracle: Option<crate::oracle::DynPriceOracle>,
+    /// Per-chain pending-tx indexes for the nonce-conflict check at
+    /// stage time. Populated externally (by the daemon, after the
+    /// mempool subsystem starts) via [`Self::set_mempool_index`].
+    mempool_indexes:
+        Arc<RwLock<std::collections::BTreeMap<String, Arc<beth_mempool::PendingTxIndex>>>>,
 }
 
 impl TxEngine {
@@ -115,7 +120,52 @@ impl TxEngine {
             token_cache: Arc::new(RwLock::new(HashMap::new())),
             resolver: None,
             price_oracle: None,
+            mempool_indexes: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
         }
+    }
+
+    /// Register the `PendingTxIndex` for `chain`. Calling stage on this
+    /// chain will then surface a `nonce_conflict.json` artefact if the
+    /// staged `(from, nonce)` collides with an externally-observed
+    /// pending tx.
+    pub fn set_mempool_index(
+        &self,
+        chain: impl Into<String>,
+        idx: Arc<beth_mempool::PendingTxIndex>,
+    ) {
+        self.mempool_indexes.write().insert(chain.into(), idx);
+    }
+
+    /// Build the nonce-conflict JSON body if `(from, nonce)` collides
+    /// with an externally observed pending tx on this chain. Returns
+    /// `None` when no index is registered for the chain, or when no
+    /// collision is found.
+    pub(crate) fn build_nonce_conflict_body(
+        &self,
+        chain_name: &str,
+        from: Address,
+        nonce: u64,
+    ) -> Option<serde_json::Value> {
+        let rec = self
+            .mempool_indexes
+            .read()
+            .get(chain_name)?
+            .lookup_by_addr_nonce(from, nonce)?;
+        let observed_at = rec
+            .tx
+            .observed_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let hex_hash = hex::encode(rec.tx.hash.as_slice());
+        Some(serde_json::json!({
+            "conflict_nonce": nonce,
+            "external_hash": format!("0x{hex_hash}"),
+            "external_observed_at": observed_at,
+            "advice": format!(
+                "external tx 0x{hex_hash} is pending at this nonce; use a different nonce or wait for it to mine/drop"
+            ),
+        }))
     }
 
     /// Wire a name resolver (typically an ENS adapter) for recipients.
@@ -559,6 +609,10 @@ impl TxEngine {
             Some(n) => n,
             None => session.nonce(from).await?,
         };
+        // Check for an externally-observed pending tx at this (from, nonce).
+        // Body is computed up-front but written only after write_pending
+        // creates the pending dir.
+        let conflict_body = self.build_nonce_conflict_body(&spec.name, from, nonce);
         let gas_price = match chain.gas_price().await {
             Ok(g) => g,
             Err(e) => {
@@ -777,6 +831,10 @@ impl TxEngine {
         let plan =
             beth_proto::PlanRender::render(&staged, &spec.native_symbol, spec.native_decimals);
         self.outbox.write_pending(&staged, &plan)?;
+        if let Some(body) = conflict_body {
+            self.outbox
+                .write_nonce_conflict(&staged.wallet, &staged.chain, &staged.id, &body)?;
+        }
         debug!(id=%staged.id, wallet=%staged.wallet, chain=%staged.chain, "tx.stage");
         Ok(staged)
     }
@@ -1361,6 +1419,87 @@ mod tests {
     fn resolve_token_unknown_symbol_errors() {
         let err = TxEngine::resolve_token_address("MOCK", 1).unwrap_err();
         assert!(matches!(err, TxEngineError::Token(_)));
+    }
+
+    // -------------------------------------------------------------------
+    // Nonce-conflict body tests. These exercise the index lookup +
+    // body shape directly; the full stage() path is covered elsewhere
+    // and requires a live RPC.
+    // -------------------------------------------------------------------
+
+    fn make_pending_tx(
+        addr: Address,
+        nonce: u64,
+        hash_byte: u8,
+        observed_secs: u64,
+    ) -> beth_mempool::PendingTx {
+        use alloy::primitives::{B256, Bytes, U256};
+        let mut hash = [0u8; 32];
+        hash.fill(hash_byte);
+        beth_mempool::PendingTx {
+            hash: B256::from(hash),
+            from: addr,
+            to: None,
+            nonce,
+            value: U256::ZERO,
+            gas_limit: 21_000,
+            fees: beth_mempool::TxFees::Legacy { gas_price: 1 },
+            input: Bytes::new(),
+            observed_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(observed_secs),
+        }
+    }
+
+    fn nonce_conflict_engine() -> (TxEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = crate::outbox::Outbox::new(dir.path()).unwrap();
+        let engine = TxEngine::new(outbox, 60_000, false);
+        (engine, dir)
+    }
+
+    #[test]
+    fn build_nonce_conflict_body_returns_none_when_no_index() {
+        let (engine, _dir) = nonce_conflict_engine();
+        let addr = "0x0000000000000000000000000000000000000001"
+            .parse::<Address>()
+            .unwrap();
+        assert!(engine.build_nonce_conflict_body("anvil", addr, 0).is_none());
+    }
+
+    #[test]
+    fn build_nonce_conflict_body_returns_none_when_no_match() {
+        let (engine, _dir) = nonce_conflict_engine();
+        let idx = beth_mempool::PendingTxIndex::new(8);
+        engine.set_mempool_index("anvil", idx);
+        let addr = "0x0000000000000000000000000000000000000001"
+            .parse::<Address>()
+            .unwrap();
+        assert!(engine.build_nonce_conflict_body("anvil", addr, 7).is_none());
+    }
+
+    #[test]
+    fn build_nonce_conflict_body_returns_some_when_match() {
+        let (engine, _dir) = nonce_conflict_engine();
+        let idx = beth_mempool::PendingTxIndex::new(8);
+        let addr = "0x0000000000000000000000000000000000000001"
+            .parse::<Address>()
+            .unwrap();
+        idx.insert(make_pending_tx(addr, 7, 0xAB, 1_700_000_000));
+        engine.set_mempool_index("anvil", idx);
+
+        let body = engine
+            .build_nonce_conflict_body("anvil", addr, 7)
+            .expect("expected nonce conflict body");
+        assert_eq!(body["conflict_nonce"], 7);
+        let hash_str = body["external_hash"].as_str().unwrap();
+        assert!(
+            hash_str.starts_with("0xabab"),
+            "external_hash should start with 0xabab, got {hash_str}"
+        );
+        // Length: "0x" + 64 hex chars.
+        assert_eq!(hash_str.len(), 66);
+        assert_eq!(body["external_observed_at"], 1_700_000_000);
+        let advice = body["advice"].as_str().unwrap();
+        assert!(advice.contains(hash_str));
     }
 
     /// Helpers shared by the confirm-flow regression tests below. They

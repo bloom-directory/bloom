@@ -10,6 +10,7 @@ beth-proto.workspace = true
 beth-chain.workspace = true
 beth-rpc.workspace = true
 beth-keystore.workspace = true
+beth-mempool.workspace = true
 beth-tools.workspace = true
 serde.workspace = true
 serde_json.workspace = true
