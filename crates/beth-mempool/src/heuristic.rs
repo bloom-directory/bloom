@@ -80,10 +80,10 @@ impl QuoteOracle for StaticQuoter {
 /// itself is the contract being called and is not in this list.
 pub fn decode_swap_path(calldata: &Bytes) -> Option<Vec<Address>> {
     if let Ok(c) = IUniswapV2Router::swapExactTokensForTokensCall::abi_decode(calldata) {
-        return Some(c.path.into_iter().collect());
+        return Some(c.path);
     }
     if let Ok(c) = IUniswapV2Router::swapExactETHForTokensCall::abi_decode(calldata) {
-        return Some(c.path.into_iter().collect());
+        return Some(c.path);
     }
     None
 }
@@ -230,6 +230,11 @@ mod tests {
         let cd = load_fixture("uniswap_v2_swap.hex");
         let path = decode_swap_path(&cd).unwrap();
         assert_eq!(path.len(), 2);
-        assert_eq!(path[0].as_slice()[0], 0); // tokenA leading zeros
+        let mut a1 = [0u8; 20];
+        a1[19] = 1;
+        let mut a2 = [0u8; 20];
+        a2[19] = 2;
+        assert_eq!(path[0], Address::from(a1));
+        assert_eq!(path[1], Address::from(a2));
     }
 }
