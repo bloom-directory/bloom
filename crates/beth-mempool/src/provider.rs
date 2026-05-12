@@ -136,7 +136,7 @@ macro_rules! provider_test_suite {
     ($t:ty, $build:expr, $mod_name:ident) => {
         #[allow(non_snake_case)]
         mod $mod_name {
-            use super::*;
+            use $crate::provider::{MempoolProvider, PendingTx};
 
             #[tokio::test]
             async fn id_is_non_empty() {
