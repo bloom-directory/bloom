@@ -31,8 +31,8 @@ tracing.workspace = true
 parking_lot.workspace = true
 futures.workspace = true
 hex.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
+reqwest = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
