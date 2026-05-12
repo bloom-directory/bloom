@@ -55,9 +55,14 @@ impl PendingTxIndex {
         while g.order.len() >= self.capacity {
             if let Some(victim) = g.order.pop_front() {
                 if let Some(rec) = g.by_hash.remove(&victim) {
-                    g.by_addr_nonce.remove(&(rec.tx.from, rec.tx.nonce));
+                    // Guard: only drop the secondary index entry if it still
+                    // points at this victim. A nonce-replacement insert may have
+                    // re-pointed (addr, nonce) at a newer hash.
+                    if g.by_addr_nonce.get(&(rec.tx.from, rec.tx.nonce)) == Some(&victim) {
+                        g.by_addr_nonce.remove(&(rec.tx.from, rec.tx.nonce));
+                    }
+                    g.evictions_total += 1;
                 }
-                g.evictions_total += 1;
             } else {
                 break;
             }
@@ -81,7 +86,9 @@ impl PendingTxIndex {
     pub fn remove(&self, hash: &B256) -> Option<PendingTxRecord> {
         let mut g = self.inner.write();
         let rec = g.by_hash.remove(hash)?;
-        g.by_addr_nonce.remove(&(rec.tx.from, rec.tx.nonce));
+        if g.by_addr_nonce.get(&(rec.tx.from, rec.tx.nonce)) == Some(hash) {
+            g.by_addr_nonce.remove(&(rec.tx.from, rec.tx.nonce));
+        }
         g.order.retain(|h| h != hash);
         Some(rec)
     }
@@ -102,14 +109,10 @@ impl PendingTxIndex {
     /// the VFS `by_address/<a>/nonces.json` handler.
     pub fn observed_nonces(&self, addr: Address) -> Vec<u64> {
         let g = self.inner.read();
-        let mut out: Vec<u64> = g
-            .by_addr_nonce
+        g.by_addr_nonce
             .range((addr, 0)..=(addr, u64::MAX))
             .map(|((_, n), _)| *n)
-            .collect();
-        out.sort_unstable();
-        out.dedup();
-        out
+            .collect()
     }
 }
 
@@ -193,5 +196,23 @@ mod tests {
         addr[0] = 7;
         let ns = idx.observed_nonces(Address::from(addr));
         assert_eq!(ns, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn nonce_replacement_keeps_secondary_index_consistent() {
+        let idx = PendingTxIndex::new(8);
+        let a = make_tx(1, 7, 5); // (addr=7, nonce=5) -> hash a
+        let b = make_tx(2, 7, 5); // same (addr, nonce), new hash b
+        idx.insert(a.clone());
+        idx.insert(b.clone());
+        // by_addr_nonce should now point at b's hash:
+        let got = idx.lookup_by_addr_nonce(b.from, 5).unwrap();
+        assert_eq!(got.tx.hash, b.hash);
+
+        // Removing the older hash a must NOT delete the by_addr_nonce entry
+        // that points at b.
+        idx.remove(&a.hash);
+        let still = idx.lookup_by_addr_nonce(b.from, 5).unwrap();
+        assert_eq!(still.tx.hash, b.hash);
     }
 }
