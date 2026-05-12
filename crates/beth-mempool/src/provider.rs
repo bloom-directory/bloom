@@ -90,6 +90,77 @@ mod system_time_secs {
     }
 }
 
+use async_trait::async_trait;
+use futures::stream::BoxStream;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum MempoolError {
+    #[error("websocket transport error: {0}")]
+    Transport(String),
+    #[error("provider returned malformed data: {0}")]
+    Decode(String),
+    #[error("provider not configured")]
+    NotConfigured,
+}
+
+#[async_trait]
+pub trait MempoolProvider: Send + Sync {
+    fn id(&self) -> &'static str;
+
+    /// Open a long-lived subscription. The returned stream lives until
+    /// the caller drops it; the provider is responsible for cleanup.
+    async fn subscribe(&self) -> Result<BoxStream<'static, PendingTx>, MempoolError>;
+
+    /// True = stream already includes full tx fields; False = the
+    /// stream yields hash-only `PendingTx`s with `input.is_empty()`
+    /// and the daemon must follow up via `eth_getTransactionByHash`
+    /// before storing in the index.
+    fn delivers_bodies(&self) -> bool;
+}
+
+/// Conformance test suite. Any `MempoolProvider` implementation
+/// should be exercised via `provider_test_suite!(MyProvider, build_fn, suite_mod_name)`
+/// where `build_fn` is a `fn() -> MyProvider` and `suite_mod_name` is a unique
+/// identifier for the generated test module.
+///
+/// Note: the `${ty}` metavariable expression form (macro_metavar_expr) is not yet
+/// stable in Rust 1.91; the explicit `$mod_name:ident` fallback is used instead.
+///
+/// The suite runs two checks:
+///   1. `id()` is non-empty.
+///   2. `subscribe()` returns a stream that yields at least 1 item
+///      when the upstream produces items.
+#[macro_export]
+macro_rules! provider_test_suite {
+    ($t:ty, $build:expr, $mod_name:ident) => {
+        #[allow(non_snake_case)]
+        mod $mod_name {
+            use super::*;
+
+            #[tokio::test]
+            async fn id_is_non_empty() {
+                let p: $t = $build();
+                assert!(!<$t as $crate::provider::MempoolProvider>::id(&p).is_empty());
+            }
+
+            #[tokio::test]
+            async fn subscribe_yields_when_upstream_has_items() {
+                use futures::StreamExt;
+                let p: $t = $build();
+                let mut s = <$t as $crate::provider::MempoolProvider>::subscribe(&p)
+                    .await
+                    .unwrap();
+                let first = tokio::time::timeout(std::time::Duration::from_secs(2), s.next())
+                    .await
+                    .expect("provider must yield first item within 2s")
+                    .expect("stream ended before yielding any item");
+                assert_ne!(first.hash, alloy::primitives::B256::ZERO);
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
