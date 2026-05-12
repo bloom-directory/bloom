@@ -87,6 +87,8 @@ pub enum TxEngineError {
     PrivateNotSupportedOnChain(String),
     #[error("private RPC broadcast failed: {0}")]
     PrivateBroadcast(String),
+    #[error("private RPC provider {provider} does not support chain {chain_id}")]
+    PrivateProviderChainMismatch { provider: String, chain_id: u64 },
 }
 
 /// In-memory cache for ERC-20 metadata keyed by `(chain_id, address)`.
@@ -207,13 +209,25 @@ impl TxEngine {
     /// Register a `PrivateRpcProvider` for `chain_id`. The provider's
     /// `id()` becomes the lookup key alongside `chain_id`, matching the
     /// `policy.private.provider` string written by the user.
+    ///
+    /// Returns `Err(PrivateProviderChainMismatch)` if `chain_id` is not
+    /// listed in `provider.supported_chains()`, catching misconfiguration
+    /// before any tx is submitted.
     pub fn register_private_rpc(
         &self,
         chain_id: u64,
         provider: Arc<dyn beth_mempool::PrivateRpcProvider>,
-    ) {
-        let id = provider.id().to_string();
-        self.private_rpcs.write().insert((chain_id, id), provider);
+    ) -> Result<(), TxEngineError> {
+        if !provider.supported_chains().contains(&chain_id) {
+            return Err(TxEngineError::PrivateProviderChainMismatch {
+                provider: provider.id().to_string(),
+                chain_id,
+            });
+        }
+        self.private_rpcs
+            .write()
+            .insert((chain_id, provider.id().to_string()), provider);
+        Ok(())
     }
 
     /// Submit a signed raw tx via the configured private RPC provider
@@ -228,6 +242,8 @@ impl TxEngine {
         provider_id: &str,
         raw: &alloy::primitives::Bytes,
     ) -> Result<alloy::primitives::B256, TxEngineError> {
+        // Take the lock, clone the Arc out, drop the guard before .await — no
+        // lock is held across the network call.
         let provider = self
             .private_rpcs
             .read()
@@ -2179,7 +2195,9 @@ mod tests {
     async fn submit_via_private_routes_to_registered_provider() {
         let (engine, _spec, _dir) = fake_engine(60_000);
         let mock = Arc::new(beth_mempool::MockPrivateRpcProvider::new("mev_blocker"));
-        engine.register_private_rpc(beth_mempool::MAINNET_CHAIN_ID, mock.clone());
+        engine
+            .register_private_rpc(beth_mempool::MAINNET_CHAIN_ID, mock.clone())
+            .expect("register_private_rpc");
 
         let raw = alloy::primitives::Bytes::from_static(b"\x01\x02\x03");
         let hash = engine
@@ -2198,7 +2216,9 @@ mod tests {
     async fn submit_via_private_errors_when_not_configured() {
         let (engine, _spec, _dir) = fake_engine(60_000);
         let mock = Arc::new(beth_mempool::MockPrivateRpcProvider::new("mev_blocker"));
-        engine.register_private_rpc(beth_mempool::MAINNET_CHAIN_ID, mock);
+        engine
+            .register_private_rpc(beth_mempool::MAINNET_CHAIN_ID, mock)
+            .expect("register_private_rpc");
 
         let raw = alloy::primitives::Bytes::from_static(b"\x01\x02\x03");
         let r = engine
@@ -2221,8 +2241,12 @@ mod tests {
         let (engine, _spec, _dir) = fake_engine(60_000);
         let mev_blocker = Arc::new(beth_mempool::MockPrivateRpcProvider::new("mev_blocker"));
         let flashbots = Arc::new(beth_mempool::MockPrivateRpcProvider::new("flashbots"));
-        engine.register_private_rpc(beth_mempool::MAINNET_CHAIN_ID, mev_blocker.clone());
-        engine.register_private_rpc(beth_mempool::MAINNET_CHAIN_ID, flashbots.clone());
+        engine
+            .register_private_rpc(beth_mempool::MAINNET_CHAIN_ID, mev_blocker.clone())
+            .expect("register_private_rpc mev_blocker");
+        engine
+            .register_private_rpc(beth_mempool::MAINNET_CHAIN_ID, flashbots.clone())
+            .expect("register_private_rpc flashbots");
 
         let raw_a = alloy::primitives::Bytes::from_static(b"\xaa");
         let raw_b = alloy::primitives::Bytes::from_static(b"\xbb");
@@ -2237,6 +2261,26 @@ mod tests {
 
         assert_eq!(mev_blocker.submissions(), vec![raw_a]);
         assert_eq!(flashbots.submissions(), vec![raw_b]);
+    }
+
+    /// Registering a provider under a chain id it does not declare in
+    /// `supported_chains()` is rejected at the registration call. This
+    /// catches misconfiguration in the daemon wiring before any tx is
+    /// ever submitted.
+    #[tokio::test]
+    async fn register_private_rpc_rejects_unsupported_chain() {
+        let (engine, _spec, _dir) = fake_engine(60_000);
+        let mock = Arc::new(beth_mempool::MockPrivateRpcProvider::new("mev_blocker"));
+        // MockPrivateRpcProvider reports &[MAINNET_CHAIN_ID] (= 1).
+        // Registering against an unsupported chain must fail.
+        let r = engine.register_private_rpc(5, mock);
+        match r {
+            Err(TxEngineError::PrivateProviderChainMismatch { provider, chain_id }) => {
+                assert_eq!(provider, "mev_blocker");
+                assert_eq!(chain_id, 5);
+            }
+            other => panic!("expected PrivateProviderChainMismatch, got {other:?}"),
+        }
     }
 
     /// Private routing is mainnet-only. When `policy.private.enabled` is
