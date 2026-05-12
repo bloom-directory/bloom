@@ -58,6 +58,9 @@ pub struct PendingTx {
     pub observed_at: SystemTime,
 }
 
+// serde_json supports u128 directly, but serde's internally-tagged
+// enum (#[serde(tag = "kind")]) routes through a `Content` deserializer
+// that doesn't implement `deserialize_u128`, so we string-encode here.
 mod u128_as_str {
     use serde::{Deserialize, Deserializer, Serializer};
     pub fn serialize<S: Serializer>(v: &u128, s: S) -> Result<S::Ok, S::Error> {
