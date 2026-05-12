@@ -605,7 +605,7 @@ impl WalletsHandler {
                     .map_err(|_| HandlerError::PermissionDenied)?;
                 let _ = self
                     .tx_engine
-                    .cancel(wallet, chain, id, &client, &signer, 10)
+                    .cancel(wallet, chain, id, &client, &signer, 10, &info.policy)
                     .await
                     .map_err(err_be)?;
                 Ok(())
@@ -644,6 +644,7 @@ impl WalletsHandler {
                         10,
                         Some(intent),
                         Some(self.address_book.as_ref()),
+                        &info.policy,
                     )
                     .await
                     .map_err(err_be)?;

@@ -81,6 +81,12 @@ pub enum TxEngineError {
     Signer(String),
     #[error("token: {0}")]
     Token(String),
+    #[error("private RPC provider {0} not configured")]
+    PrivateProviderNotConfigured(String),
+    #[error("private RPC not supported on chain {0}")]
+    PrivateNotSupportedOnChain(String),
+    #[error("private RPC broadcast failed: {0}")]
+    PrivateBroadcast(String),
 }
 
 /// In-memory cache for ERC-20 metadata keyed by `(chain_id, address)`.
@@ -89,6 +95,10 @@ type TokenCache = Arc<RwLock<HashMap<(u64, Address), TokenMeta>>>;
 /// Per-chain map of pending-tx indexes used at stage time to detect
 /// nonce conflicts with externally-observed mempool entries.
 type MempoolIndexes = Arc<RwLock<BTreeMap<String, Arc<beth_mempool::PendingTxIndex>>>>;
+
+/// Per-(chain_id, provider_id) map of configured private RPC providers
+/// used by `broadcast` when `policy.private.enabled == true`.
+type PrivateRpcs = Arc<RwLock<BTreeMap<(u64, String), Arc<dyn beth_mempool::PrivateRpcProvider>>>>;
 
 /// Stub `QuoteOracle` for stage-time MEV heuristics. It holds a
 /// `ChainClient` reference so a real implementation can `eth_call` a
@@ -160,6 +170,12 @@ pub struct TxEngine {
     /// stage time. Populated externally (by the daemon, after the
     /// mempool subsystem starts) via [`Self::set_mempool_index`].
     mempool_indexes: MempoolIndexes,
+    /// Per-(chain_id, provider_id) map of configured private RPC
+    /// providers. Populated externally via
+    /// [`Self::register_private_rpc`]; used by `broadcast` to route
+    /// signed raw txs privately when `policy.private.enabled` is set
+    /// (mainnet only — see `MAINNET_CHAIN_ID`).
+    private_rpcs: PrivateRpcs,
 }
 
 impl TxEngine {
@@ -172,6 +188,7 @@ impl TxEngine {
             resolver: None,
             price_oracle: None,
             mempool_indexes: Arc::new(RwLock::new(BTreeMap::new())),
+            private_rpcs: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
 
@@ -185,6 +202,42 @@ impl TxEngine {
         idx: Arc<beth_mempool::PendingTxIndex>,
     ) {
         self.mempool_indexes.write().insert(chain.into(), idx);
+    }
+
+    /// Register a `PrivateRpcProvider` for `chain_id`. The provider's
+    /// `id()` becomes the lookup key alongside `chain_id`, matching the
+    /// `policy.private.provider` string written by the user.
+    pub fn register_private_rpc(
+        &self,
+        chain_id: u64,
+        provider: Arc<dyn beth_mempool::PrivateRpcProvider>,
+    ) {
+        let id = provider.id().to_string();
+        self.private_rpcs.write().insert((chain_id, id), provider);
+    }
+
+    /// Submit a signed raw tx via the configured private RPC provider
+    /// keyed by `(chain_id, provider_id)`. Returns the hash returned by
+    /// the provider on success, or a typed error if the provider is not
+    /// configured or the submission fails. Kept `pub(crate)` so unit
+    /// tests can exercise it without going through the full broadcast
+    /// path (which requires a live chain).
+    pub(crate) async fn submit_via_private(
+        &self,
+        chain_id: u64,
+        provider_id: &str,
+        raw: &alloy::primitives::Bytes,
+    ) -> Result<alloy::primitives::B256, TxEngineError> {
+        let provider = self
+            .private_rpcs
+            .read()
+            .get(&(chain_id, provider_id.to_string()))
+            .cloned()
+            .ok_or_else(|| TxEngineError::PrivateProviderNotConfigured(provider_id.to_string()))?;
+        provider
+            .submit(raw)
+            .await
+            .map_err(|e| TxEngineError::PrivateBroadcast(e.to_string()))
     }
 
     /// Build the nonce-conflict JSON body if `(from, nonce)` collides
@@ -991,7 +1044,7 @@ impl TxEngine {
             return Err(TxEngineError::BroadcastDisabled(spec.name.clone()));
         }
 
-        let tx_hash = self.broadcast(&staged, chain, signer).await?;
+        let tx_hash = self.broadcast(&staged, chain, signer, policy).await?;
         info!(id=%staged.id, hash=%format!("{:#x}", tx_hash), "tx.broadcast");
 
         staged.status = TxStatus::Sent;
@@ -1014,12 +1067,18 @@ impl TxEngine {
         Ok(staged)
     }
 
-    /// Build, sign and broadcast a single concrete `StagedTx`.
+    /// Build, sign and broadcast a single concrete `StagedTx`. When
+    /// `policy.private.enabled` is set and the staged chain is mainnet,
+    /// routes through the registered `PrivateRpcProvider` instead of
+    /// `ChainClient::send_raw`. Private routing on any non-mainnet
+    /// chain is rejected (callers must gate by chain or disable private
+    /// for testnets in policy).
     async fn broadcast(
         &self,
         staged: &StagedTx,
         chain: &ChainClient,
         signer: &PrivateKeySigner,
+        policy: &Policy,
     ) -> Result<alloy::primitives::B256, TxEngineError> {
         let to_addr: Address = staged
             .to
@@ -1071,7 +1130,17 @@ impl TxEngine {
         let mut buf = Vec::new();
         alloy::eips::Encodable2718::encode_2718(&tx_envelope, &mut buf);
         let raw = Bytes::from(buf);
-        Ok(chain.send_raw(raw).await?)
+        let hash = if policy.private.enabled && staged.chain_id == beth_mempool::MAINNET_CHAIN_ID {
+            self.submit_via_private(staged.chain_id, &policy.private.provider, &raw)
+                .await?
+        } else if policy.private.enabled {
+            return Err(TxEngineError::PrivateNotSupportedOnChain(
+                chain.spec().name.clone(),
+            ));
+        } else {
+            chain.send_raw(raw).await?
+        };
+        Ok(hash)
     }
 
     /// Issue a same-nonce replacement tx with bumped fees. The original
@@ -1079,6 +1148,7 @@ impl TxEngine {
     /// already-broadcast txs cannot be replaced through this path
     /// (fix #2 / #10). Floors `bump_pct` at 10 to satisfy the mempool's
     /// >= 10% rule.
+    #[allow(clippy::too_many_arguments)]
     pub async fn replace(
         &self,
         wallet: &str,
@@ -1087,6 +1157,7 @@ impl TxEngine {
         chain: &ChainClient,
         signer: &PrivateKeySigner,
         bump_pct: u32,
+        policy: &Policy,
     ) -> Result<StagedTx, TxEngineError> {
         self.replace_with_intent(
             wallet,
@@ -1097,6 +1168,7 @@ impl TxEngine {
             bump_pct,
             None,
             None,
+            policy,
         )
         .await
     }
@@ -1119,6 +1191,7 @@ impl TxEngine {
         bump_pct: u32,
         substitute: Option<RawIntent>,
         address_book: Option<&AddressBook>,
+        policy: &Policy,
     ) -> Result<StagedTx, TxEngineError> {
         let bump = bump_pct.max(10);
         let entry =
@@ -1151,7 +1224,7 @@ impl TxEngine {
         }
         bump_fees_in_place(&mut bumped, bump);
 
-        let tx_hash = self.broadcast(&bumped, chain, signer).await?;
+        let tx_hash = self.broadcast(&bumped, chain, signer, policy).await?;
         bumped.tx_hash = Some(format!("{:#x}", tx_hash));
         bumped.status = TxStatus::Sent;
 
@@ -1176,6 +1249,7 @@ impl TxEngine {
 
     /// Issue a same-nonce self-send to cancel the original. Refuses if the
     /// original is no longer pending (fix #2 / #10).
+    #[allow(clippy::too_many_arguments)]
     pub async fn cancel(
         &self,
         wallet: &str,
@@ -1184,6 +1258,7 @@ impl TxEngine {
         chain: &ChainClient,
         signer: &PrivateKeySigner,
         bump_pct: u32,
+        policy: &Policy,
     ) -> Result<StagedTx, TxEngineError> {
         let bump = bump_pct.max(10);
         let entry =
@@ -1200,7 +1275,7 @@ impl TxEngine {
         cancel_tx.token = None;
         bump_fees_in_place(&mut cancel_tx, bump);
 
-        let tx_hash = self.broadcast(&cancel_tx, chain, signer).await?;
+        let tx_hash = self.broadcast(&cancel_tx, chain, signer, policy).await?;
         cancel_tx.tx_hash = Some(format!("{:#x}", tx_hash));
         cancel_tx.status = TxStatus::Cancelled;
 
@@ -2094,5 +2169,73 @@ mod tests {
             Ok(_) => panic!("unexpected broadcast success on unreachable RPC"),
             Err(_) => {}
         }
+    }
+
+    /// `submit_via_private` looks up the registered provider by
+    /// `(chain_id, provider_id)` and forwards the raw bytes. The mock
+    /// records every submission so we can verify routing without a
+    /// live chain.
+    #[tokio::test]
+    async fn submit_via_private_routes_to_registered_provider() {
+        let (engine, _spec, _dir) = fake_engine(60_000);
+        let mock = Arc::new(beth_mempool::MockPrivateRpcProvider::new("mev_blocker"));
+        engine.register_private_rpc(beth_mempool::MAINNET_CHAIN_ID, mock.clone());
+
+        let raw = alloy::primitives::Bytes::from_static(b"\x01\x02\x03");
+        let hash = engine
+            .submit_via_private(beth_mempool::MAINNET_CHAIN_ID, "mev_blocker", &raw)
+            .await
+            .expect("submit_via_private");
+        assert_eq!(hash, alloy::primitives::keccak256(&raw));
+        assert_eq!(mock.submissions().len(), 1);
+        assert_eq!(mock.submissions()[0], raw);
+    }
+
+    /// When the requested provider id is not registered for the given
+    /// chain id, the helper returns `PrivateProviderNotConfigured` and
+    /// does NOT silently fall through to public broadcast.
+    #[tokio::test]
+    async fn submit_via_private_errors_when_not_configured() {
+        let (engine, _spec, _dir) = fake_engine(60_000);
+        let mock = Arc::new(beth_mempool::MockPrivateRpcProvider::new("mev_blocker"));
+        engine.register_private_rpc(beth_mempool::MAINNET_CHAIN_ID, mock);
+
+        let raw = alloy::primitives::Bytes::from_static(b"\x01\x02\x03");
+        let r = engine
+            .submit_via_private(beth_mempool::MAINNET_CHAIN_ID, "flashbots", &raw)
+            .await;
+        match r {
+            Err(TxEngineError::PrivateProviderNotConfigured(id)) => {
+                assert_eq!(id, "flashbots");
+            }
+            other => panic!("expected PrivateProviderNotConfigured, got {other:?}"),
+        }
+    }
+
+    /// The registry is keyed by `(chain_id, provider_id)`, so two
+    /// providers registered on the same chain must be reachable
+    /// independently and only the one keyed by the requested id should
+    /// see the submission.
+    #[tokio::test]
+    async fn register_private_rpc_uses_provider_id_as_key() {
+        let (engine, _spec, _dir) = fake_engine(60_000);
+        let mev_blocker = Arc::new(beth_mempool::MockPrivateRpcProvider::new("mev_blocker"));
+        let flashbots = Arc::new(beth_mempool::MockPrivateRpcProvider::new("flashbots"));
+        engine.register_private_rpc(beth_mempool::MAINNET_CHAIN_ID, mev_blocker.clone());
+        engine.register_private_rpc(beth_mempool::MAINNET_CHAIN_ID, flashbots.clone());
+
+        let raw_a = alloy::primitives::Bytes::from_static(b"\xaa");
+        let raw_b = alloy::primitives::Bytes::from_static(b"\xbb");
+        engine
+            .submit_via_private(beth_mempool::MAINNET_CHAIN_ID, "mev_blocker", &raw_a)
+            .await
+            .expect("submit mev_blocker");
+        engine
+            .submit_via_private(beth_mempool::MAINNET_CHAIN_ID, "flashbots", &raw_b)
+            .await
+            .expect("submit flashbots");
+
+        assert_eq!(mev_blocker.submissions(), vec![raw_a]);
+        assert_eq!(flashbots.submissions(), vec![raw_b]);
     }
 }

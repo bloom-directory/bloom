@@ -204,7 +204,15 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
 
     // Replace with +15% fees.
     let replaced = engine
-        .replace("alice", "anvil", &staged.id, &chain, &signer, 15)
+        .replace(
+            "alice",
+            "anvil",
+            &staged.id,
+            &chain,
+            &signer,
+            15,
+            &Policy::permissive(),
+        )
         .await
         .map_err(|e| anyhow!("replace: {e}"))?;
     assert_eq!(replaced.nonce, original_nonce, "nonce must match");
