@@ -11,6 +11,29 @@ use beth_proto::{StagedTx, TxStatus};
 use parking_lot::RwLock;
 use thiserror::Error;
 
+/// A parsed view of a `<root>/<wallet>/<chain>/sent/<id>/intent.json` entry.
+/// Used by background scanners (e.g. `BumpScanner`) that walk all sent entries.
+#[derive(Debug, Clone)]
+pub struct SentEntry {
+    pub wallet: String,
+    pub chain: String,
+    /// Outbox id (e.g. `"0001-12345"`), NOT the tx hash.
+    pub id: String,
+    /// Parsed from `staged.tx_hash`; entries without a hash are skipped.
+    pub hash: alloy::primitives::B256,
+    pub from: alloy::primitives::Address,
+    pub to: alloy::primitives::Address,
+    pub value: alloy::primitives::U256,
+    /// Raw hex string from `staged.data_hex`.
+    pub data: String,
+    pub nonce: u64,
+    pub fees: beth_mempool::TxFees,
+    /// Directory modification time — used as a proxy for when the tx was sent.
+    pub sent_at: std::time::SystemTime,
+    /// `true` when `staged.status` is `Success` or `Reverted`.
+    pub mined: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum OutboxError {
     #[error("io: {0}")]
@@ -298,6 +321,80 @@ impl Outbox {
         Ok(target)
     }
 
+    /// Public accessor for `<root>/<wallet>/<chain>/sent/<id>/`.
+    /// Used by external scanners (e.g. `bump_scanner`) that need to write
+    /// sibling artefacts next to a persisted sent entry.
+    pub fn sent_dir(&self, wallet: &str, chain: &str, id: &str) -> Result<PathBuf, OutboxError> {
+        Ok(self.state_dir(wallet, chain, OutboxState::Sent)?.join(id))
+    }
+
+    /// Walk every `<root>/<wallet>/<chain>/sent/<id>/` directory and
+    /// return a `SentEntry` per entry whose `intent.json` parses and
+    /// has a `tx_hash` set. Malformed entries are skipped with a
+    /// `tracing::warn!`. This is best-effort and intended for
+    /// background scanners.
+    pub fn walk_all_sent(&self) -> Result<Vec<SentEntry>, OutboxError> {
+        let mut out = Vec::new();
+        if !self.inner.root.exists() {
+            return Ok(out);
+        }
+        for w in fs::read_dir(&self.inner.root)? {
+            let w = w?;
+            if !w.file_type()?.is_dir() {
+                continue;
+            }
+            let wname = match w.file_name().into_string() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            for c in fs::read_dir(w.path())? {
+                let c = c?;
+                if !c.file_type()?.is_dir() {
+                    continue;
+                }
+                let cname = match c.file_name().into_string() {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                let sent = c.path().join("sent");
+                if !sent.exists() {
+                    continue;
+                }
+                for ent in fs::read_dir(&sent)? {
+                    let ent = ent?;
+                    let dir = ent.path();
+                    let intent_path = dir.join("intent.json");
+                    if !intent_path.exists() {
+                        continue;
+                    }
+                    match parse_sent_entry(&wname, &cname, &dir, &intent_path) {
+                        Some(se) => out.push(se),
+                        None => tracing::warn!(
+                            path = %dir.display(),
+                            "outbox.walk_sent.skip_malformed"
+                        ),
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Write a sibling artefact file next to an existing sent entry.
+    /// Creates the directory if needed (e.g. after an external
+    /// `fs::rename` that didn't pre-create the target).
+    pub fn write_sent_sibling(
+        &self,
+        entry: &SentEntry,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), OutboxError> {
+        let dir = self.sent_dir(&entry.wallet, &entry.chain, &entry.id)?;
+        fs::create_dir_all(&dir)?;
+        self.write_artefact(&dir, name, bytes)?;
+        Ok(())
+    }
+
     pub fn write_artefact(&self, dir: &Path, name: &str, body: &[u8]) -> Result<(), OutboxError> {
         if name.contains('/') || name.contains('\\') {
             return Err(OutboxError::InvalidId(name.into()));
@@ -441,6 +538,61 @@ impl Outbox {
         }
         Ok(total)
     }
+}
+
+/// Parse a single `<root>/<wallet>/<chain>/sent/<id>/intent.json` into a
+/// [`SentEntry`]. Returns `None` if the file can't be parsed or is missing
+/// required fields (no `tx_hash`, unparseable addresses, no fee fields).
+fn parse_sent_entry(
+    wallet: &str,
+    chain: &str,
+    dir: &Path,
+    intent_path: &Path,
+) -> Option<SentEntry> {
+    let bytes = fs::read(intent_path).ok()?;
+    let staged: StagedTx = serde_json::from_slice(&bytes).ok()?;
+    let hash_str = staged.tx_hash.as_deref()?; // skip if no hash
+    let hash: alloy::primitives::B256 = hash_str.parse().ok()?;
+    let from: alloy::primitives::Address = staged.from.parse().ok()?;
+    let to: alloy::primitives::Address = staged.to.parse().ok()?;
+    let value: alloy::primitives::U256 = staged.value_wei.parse().ok()?;
+    let fees = if let Some(mfp) = staged.max_fee_per_gas.as_deref() {
+        let max_fee_per_gas = mfp.parse::<u128>().ok()?;
+        let max_priority_fee_per_gas = staged
+            .max_priority_fee_per_gas
+            .as_deref()
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(0);
+        beth_mempool::TxFees::Eip1559 {
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+        }
+    } else if let Some(gp) = staged.gas_price.as_deref() {
+        beth_mempool::TxFees::Legacy {
+            gas_price: gp.parse::<u128>().ok()?,
+        }
+    } else {
+        return None;
+    };
+    let sent_at = fs::metadata(dir)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .unwrap_or_else(std::time::SystemTime::now);
+    let mined = matches!(staged.status, TxStatus::Success | TxStatus::Reverted);
+    Some(SentEntry {
+        wallet: wallet.to_string(),
+        chain: chain.to_string(),
+        id: staged.id,
+        hash,
+        from,
+        to,
+        value,
+        data: staged.data_hex,
+        nonce: staged.nonce,
+        fees,
+        sent_at,
+        mined,
+    })
 }
 
 #[cfg(test)]
