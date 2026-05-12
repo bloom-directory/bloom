@@ -2238,4 +2238,28 @@ mod tests {
         assert_eq!(mev_blocker.submissions(), vec![raw_a]);
         assert_eq!(flashbots.submissions(), vec![raw_b]);
     }
+
+    /// Private routing is mainnet-only. When `policy.private.enabled` is
+    /// set on any non-mainnet chain, `broadcast` must reject before
+    /// touching the RPC.
+    #[tokio::test]
+    async fn broadcast_rejects_private_on_non_mainnet() {
+        let (engine, spec, _dir) = fake_engine(60_000);
+        let chain = beth_chain::ChainClient::new(spec.clone()).unwrap();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let mut policy = beth_proto::Policy::default();
+        policy.private.enabled = true;
+        policy.private.provider = "mev_blocker".into();
+
+        // fake_staged_1559 uses chain_id 31337 (anvil) — not mainnet.
+        let staged = fake_staged_1559("0001-private-testnet");
+
+        let r = engine.broadcast(&staged, &chain, &signer, &policy).await;
+        match r {
+            Err(TxEngineError::PrivateNotSupportedOnChain(name)) => {
+                assert_eq!(name, "anvil");
+            }
+            other => panic!("expected PrivateNotSupportedOnChain, got {other:?}"),
+        }
+    }
 }
