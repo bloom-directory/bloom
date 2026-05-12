@@ -186,6 +186,30 @@ mod tests {
             .await
             .expect("timeout waiting for first pending tx")
             .expect("stream ended before yielding");
-        assert!(tx.nonce >= 0); // sanity
+        assert_ne!(tx.hash, alloy::primitives::B256::ZERO);
+    }
+
+    #[test]
+    fn decode_alchemy_pending_parses_legacy_payload() {
+        // Pre-1559 txs use `gasPrice` instead of maxFeePerGas/maxPriorityFeePerGas.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{
+            "hash":"0x1111111111111111111111111111111111111111111111111111111111111111",
+            "from":"0x2222222222222222222222222222222222222222",
+            "to":"0x3333333333333333333333333333333333333333",
+            "nonce":"0x7",
+            "value":"0x0",
+            "gas":"0x5208",
+            "gasPrice":"0x3b9aca00",
+            "input":"0x"
+        }"#,
+        )
+        .unwrap();
+        let tx = decode_alchemy_pending(&v).unwrap();
+        assert_eq!(tx.nonce, 7);
+        match tx.fees {
+            TxFees::Legacy { gas_price } => assert_eq!(gas_price, 1_000_000_000),
+            other => panic!("expected legacy fees, got {other:?}"),
+        }
     }
 }
