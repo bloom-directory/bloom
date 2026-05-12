@@ -85,8 +85,25 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | Prices (DefiLlama, keyless) | `prices/{spot/<coin>(.usd),change_24h/<coin>}` | shipped | `crates/beth-vfs/src/handlers/prices.rs` + `crates/beth-prices/src/lib.rs` |
 | ENS forward resolution surface | `ens/<name>.eth` | shipped | ENS handler (forward resolve via `crates/beth-ens` against the canonical mainnet registry) |
 | NFTs (`addresses/<a>/nfts/...`, `contracts/<a>/nft/...`) | — | shipped | `crates/beth-vfs/src/handlers/chains_nfts.rs` + chains.rs routing. Per-holder views (`erc721_txs`, `erc1155_txs`, `owned.json`, per-token `owner/uri/metadata.json/balance/is_owner/approved`) and collection views (`kind`, `name`, `symbol`, `total_supply`, `owner_of/<id>`, `token_uri/<id>`, `is_approved_for_all/<o>/<op>`). ERC-721 vs ERC-1155 auto-detected via ERC-165 (cached). ERC-1155 `{id}` placeholder substitution applied; metadata.json supports `data:`, `ipfs://`, `http(s)://`. ChainClient NFT helpers in `crates/beth-chain/src/lib.rs`; ERC-1155 transfer history via `crates/beth-etherscan/src/lib.rs::get_nft1155_tx`. Writes (transfers / per-token approve / set-approval-for-all) flow through the wallet outbox — see the wallets row. |
-| Mempool (`chains/<c>/mempool/...`) | — | deferred | Spec §3.2 surface; depends on provider-specific APIs. |
+| Mempool (`chains/<c>/mempool/...`) | `chains/<c>/mempool/{status.json,live,recent.jsonl,by_address/<a>/...,by_pool/<a>/recent.jsonl,<hash>/{tx,decoded,status}}` | shipped | `crates/beth-mempool/` + `crates/beth-vfs/src/handlers/chains_mempool.rs`; per-chain `[mempool.<chain>]` config selects WS provider (`alchemy`, `generic_eth_subscribe`). See "Mempool, private orderflow, gas-bump, MEV warnings" section below for the full per-path map. |
 | Contract methods / events / storage / proxy subtrees | `chains/<c>/contracts/<a>/{methods,events,storage,proxy}/...` | shipped | `crates/beth-vfs/src/handlers/chains_contracts.rs` — ABI-driven `methods/<m>.{read,tx,sig}` (writable JSON body, eth_call + decode, no broadcast), `events/<e>/{recent,query,live}` (eth_getLogs + alloy log decoding, per-(chain,addr,event) live cursor), `storage/<slot>` and `proxy/{implementation,admin,beacon}` (EIP-1967 + EIP-1822). Methods/events gated behind `contract_metadata = etherscan` (ABI source); storage/proxy stay RPC-only. ABI cache TTL 60s. |
+
+### Mempool, private orderflow, gas-bump, MEV warnings
+
+| Surface | Backend | Implementation |
+|---|---|---|
+| `chains/<c>/mempool/status.json` | rpc (alchemy / generic) | `beth-vfs/src/handlers/chains_mempool.rs` |
+| `chains/<c>/mempool/live` | rpc | `chains_mempool::live` |
+| `chains/<c>/mempool/recent.jsonl` | rpc | `chains_mempool::recent_jsonl` |
+| `chains/<c>/mempool/by_address/<a>/...` | rpc | `chains_mempool::by_address` |
+| `chains/<c>/mempool/by_pool/<a>/recent.jsonl` | rpc | `chains_mempool::by_pool` |
+| `chains/<c>/mempool/<hash>/{tx,decoded,status}` | rpc | `chains_mempool::tx_hash_subtree` |
+| `wallets/<w>/chains/<c>/pending_external.jsonl` | rpc | `beth-vfs/src/handlers/wallets.rs` |
+| `wallets/<w>/outbox/sent/<h>/{bump.tx,cancel.tx,bump_advice.json}` | local | `beth-tx::bump_scanner` |
+| `wallets/<w>/outbox/pending/<id>/{mev_risk.json,nonce_conflict.json}` | local | `beth-tx::tx_engine::stage` |
+| `status/backends/{mempool,private_rpc}` | local | `beth-vfs/src/handlers/status.rs` |
+
+Verified end-to-end via `tests/docker/run.sh --mempool`.
 
 ## §4 — Daemon
 
@@ -177,8 +194,11 @@ data or rely on their own internal caches, e.g. the etherscan client).
    authoritative — see the `caveat` field in the response). Mint
    intents are not modelled separately; mints are issued via the
    generic `call` intent against the contract's mint method.
-2. **Mempool subtree** (`chains/<c>/mempool/...`) — not implemented;
-   depends on provider-specific APIs.
+2. **MEV heuristic is stage-time, heuristic-only.** No
+   post-broadcast detection in v1 — once a tx is broadcast we do not
+   re-scan for sandwich victims. Stage-time analysis flags risky
+   intents at `pending/<id>/mev_risk.json`. See
+   `docs/specs/2026-05-12-mempool-and-private-orderflow-design.md`.
 3. **Embedded block indexer** — activity / history rely on Etherscan
    v2; without an `[etherscan]` config block, those paths return
    `NotFound`.

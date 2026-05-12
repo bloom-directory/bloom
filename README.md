@@ -63,7 +63,10 @@ The VFS is rooted at `/eth/` (the default NFS mount path) with these
 top-level trees:
 
 - `chains/<chain>/` — read-only chain views: head, blocks, addresses,
-  ERC-20 balances, txs, receipts, gas, etherscan-backed history. The
+  ERC-20 balances, txs, receipts, gas, etherscan-backed history, plus
+  `mempool/{status.json,live,recent.jsonl,by_address/<a>/...,by_pool/<a>/recent.jsonl,<hash>/{tx,decoded,status}}`
+  when `[mempool.<chain>]` is configured with a WebSocket provider
+  (`alchemy` or `generic_eth_subscribe`). The
   contract surface lives under `chains/<c>/contracts/<a>/`:
   - `source`, `abi` — verified Etherscan source / ABI (cached 7 days).
   - `methods/<name>.{read,tx,sig}` — ABI-driven calldata. `.read`
@@ -133,6 +136,11 @@ map and live-network verification log.
   rolling-24h USD totals priced via DefiLlama), recipient allow /
   deny lists, contract-call gating, and an automation surface
   (`auto_confirm_below_eth`, configurable override sentinel).
+- **Private orderflow opt-in.** Setting `private = true` in a wallet's
+  `policy.toml` routes broadcasts through a configured private RPC
+  (MEV-Blocker by default, or Flashbots Protect) on mainnet chains
+  instead of the public RPC. On non-mainnet chains the broadcast is
+  rejected rather than silently falling back to public.
 
 ## Limitations
 
@@ -164,9 +172,14 @@ map and live-network verification log.
   today returns a clear "not yet implemented" error. The live config
   is readable at `status/backends/<feature>` and
   `status/backends/summary.json`.
-- **Mempool surface not implemented.** The spec's `chains/<c>/mempool/`
-  tree is not wired up — it depends on provider-specific APIs
-  (Alchemy / Blocknative).
+- **Private orderflow is mainnet-only.** `private = true` in a
+  wallet's policy routes broadcast through MEV-Blocker (default) or
+  Flashbots Protect. On other chains the broadcast returns a
+  PrivateNotSupportedOnChain error rather than silently falling back
+  to public.
+- **MEV heuristic is stage-time, heuristic-only.** No post-broadcast
+  detection in v1. See
+  [`docs/specs/2026-05-12-mempool-and-private-orderflow-design.md`](./docs/specs/2026-05-12-mempool-and-private-orderflow-design.md).
 - **Watch executor is poll-based.** `beth-chain` is HTTP-only, so the
   executor polls every 2s. No websocket fast path yet; per-spec
   latency is bounded by the tick interval.
