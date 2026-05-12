@@ -361,7 +361,13 @@ impl Outbox {
                     continue;
                 }
                 for ent in fs::read_dir(&sent)? {
-                    let ent = ent?;
+                    let ent = match ent {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::warn!(error = %e, path = %sent.display(), "outbox.walk_sent.readdir_entry_failed");
+                            continue;
+                        }
+                    };
                     let dir = ent.path();
                     let intent_path = dir.join("intent.json");
                     if !intent_path.exists() {
@@ -369,10 +375,9 @@ impl Outbox {
                     }
                     match parse_sent_entry(&wname, &cname, &dir, &intent_path) {
                         Some(se) => out.push(se),
-                        None => tracing::warn!(
-                            path = %dir.display(),
-                            "outbox.walk_sent.skip_malformed"
-                        ),
+                        None => {
+                            tracing::warn!(path = %dir.display(), "outbox.walk_sent.skip_malformed")
+                        }
                     }
                 }
             }

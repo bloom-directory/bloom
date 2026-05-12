@@ -320,9 +320,7 @@ mod tests {
 
         // No bump.tx should exist.
         let entries = outbox.walk_all_sent().unwrap();
-        // walk_all_sent skips entries without a tx_hash, but our seeded one has one;
-        // however mined=true means it was parsed but skipped by consider().
-        // Verify no bump artefact was written.
+        assert_eq!(entries.len(), 1, "expected exactly one seeded entry");
         for entry in &entries {
             let bump_path = outbox
                 .sent_dir("alice", "ethereum", &entry.id)

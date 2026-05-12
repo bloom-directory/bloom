@@ -46,6 +46,7 @@ use parking_lot::RwLock;
 use thiserror::Error;
 use tracing::{debug, info};
 
+use crate::bump_scanner::MempoolIndexes;
 use crate::intent_parser::ParseError;
 use crate::outbox::{Outbox, OutboxError, OutboxState};
 use crate::policy_engine;
@@ -93,10 +94,6 @@ pub enum TxEngineError {
 
 /// In-memory cache for ERC-20 metadata keyed by `(chain_id, address)`.
 type TokenCache = Arc<RwLock<HashMap<(u64, Address), TokenMeta>>>;
-
-/// Per-chain map of pending-tx indexes used at stage time to detect
-/// nonce conflicts with externally-observed mempool entries.
-type MempoolIndexes = Arc<RwLock<BTreeMap<String, Arc<beth_mempool::PendingTxIndex>>>>;
 
 /// Per-(chain_id, provider_id) map of configured private RPC providers
 /// used by `broadcast` when `policy.private.enabled == true`.
