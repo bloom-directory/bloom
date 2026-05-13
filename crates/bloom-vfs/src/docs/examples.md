@@ -1,5 +1,15 @@
 # Examples
 
+These examples assume the VFS is mounted. Start a mount-enabled daemon first:
+
+```sh
+bloom serve --mount              # /bloom on Linux, /Volumes/bloom on macOS
+bloom serve --mount /tmp/bloom   # explicit mount path
+```
+
+If the tree is not mounted, use the equivalent `bloom vfs cat`, `bloom vfs ls`,
+and `bloom vfs write` commands against paths without the mount prefix.
+
 ## Local Anvil round-trip
 
 ```sh

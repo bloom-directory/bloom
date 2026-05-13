@@ -4,6 +4,11 @@ bloom exposes Ethereum workflows as a virtual filesystem. Prefer inspecting the
 tree with normal filesystem tools when it is mounted, or with `bloom vfs` when it
 is not mounted.
 
+To mount the tree, run a mount-enabled build as `bloom serve --mount`. With no
+path argument, the mount point is `/bloom` on Linux and `/Volumes/bloom` on
+macOS; pass `bloom serve --mount <path>` to choose another existing directory.
+Mounting uses the platform NFS client and may require elevated privileges.
+
 Useful commands:
 
 - `bloom vfs ls /` lists the VFS root.

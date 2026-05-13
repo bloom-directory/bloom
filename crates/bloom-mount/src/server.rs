@@ -30,6 +30,21 @@ use crate::{MountConfig, MountError, MountHandle, build_mount_args};
 const MOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const UMOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn unmount_args(path: &Path) -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        vec![
+            "-l".to_string(),
+            "-f".to_string(),
+            path.display().to_string(),
+        ]
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        vec!["-f".to_string(), path.display().to_string()]
+    }
+}
+
 fn run_command_with_timeout(
     cmd_name: &str,
     args: &[String],
@@ -102,10 +117,9 @@ impl Drop for NfsMountHandle {
         let already = *self.unmounted.lock();
         if !already {
             let mp = self.mount_path.clone();
+            let args = unmount_args(&mp);
             if let Err(e) = std::process::Command::new("umount")
-                .arg("-l")
-                .arg("-f")
-                .arg(&mp)
+                .args(&args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
@@ -135,7 +149,7 @@ impl MountHandle for NfsMountHandle {
         }
         let mp = self.mount_path.clone();
         let status = tokio::task::spawn_blocking(move || {
-            let args = vec!["-l".to_string(), "-f".to_string(), mp.display().to_string()];
+            let args = unmount_args(&mp);
             run_command_with_timeout("umount", &args, UMOUNT_COMMAND_TIMEOUT)
         })
         .await
@@ -438,6 +452,17 @@ mod tests {
             second.is_ok(),
             "second unmount should be a no-op, got {second:?}"
         );
+    }
+
+    #[test]
+    fn unmount_args_are_platform_compatible() {
+        let args = unmount_args(Path::new("/tmp/bloom"));
+        assert!(args.contains(&"-f".to_string()));
+        assert_eq!(args.last().map(String::as_str), Some("/tmp/bloom"));
+        #[cfg(target_os = "linux")]
+        assert!(args.contains(&"-l".to_string()));
+        #[cfg(not(target_os = "linux"))]
+        assert!(!args.contains(&"-l".to_string()));
     }
 
     /// Aborting the server task as part of `unmount` should cause the

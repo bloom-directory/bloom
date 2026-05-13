@@ -2,6 +2,21 @@
 
 This is the help file vendored into the daemon.
 
+## Running
+
+Use `bloom serve` for a long-running daemon with JSON-RPC IPC only. To expose
+the same VFS through the kernel NFS client, use a binary built with the `mount`
+feature and pass `--mount`:
+
+```sh
+bloom serve --mount              # /bloom on Linux, /Volumes/bloom on macOS
+bloom serve --mount /tmp/bloom   # explicit mount path
+```
+
+The mount point must already exist and the platform mount command may require
+elevated privileges. Without a mount, the same paths are available through
+`bloom vfs ls`, `bloom vfs cat`, and `bloom vfs write`.
+
 ## Top-level layout
 
 - `chains/<chain>/` — read-only chain views: head, blocks, tx, addresses,

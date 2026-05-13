@@ -53,14 +53,17 @@ Two ways to drive the VFS:
   detect the socket and route through it, sharing daemon state (unlock
   cache, watches, defi sessions, etherscan cache). `bloom ipc call <method>`
   speaks the JSON-RPC directly.
-- **NFS mount** (optional) — build with `cargo build --features bloom-daemon/mount`
-  and call `Daemon::mount(path).await` to expose the VFS as a real
-  POSIX filesystem over the kernel NFS client.
+- **NFS mount** (optional) — build with `cargo build -p bloom --features mount`
+  or use a full-feature release binary, then run `bloom serve --mount [PATH]`
+  to expose the VFS as a real POSIX filesystem over the kernel NFS client.
+  With no path, the mount point defaults to `/bloom` on Linux and
+  `/Volumes/bloom` on macOS. The mount point must already exist and the
+  platform mount command may require elevated privileges.
 
 ## Filesystem layout
 
-The VFS is rooted at `/bloom/` (the default NFS mount path) with these
-top-level trees:
+The VFS is rooted at the selected mount path (for example `/bloom/` on
+Linux or `/Volumes/bloom/` on macOS) with these top-level trees:
 
 - `chains/<chain>/` — read-only chain views: head, blocks, addresses,
   ERC-20 balances, txs, receipts, gas, etherscan-backed history. The
