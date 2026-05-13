@@ -20,6 +20,13 @@ use clap::{Parser, Subcommand};
 use tracing::{debug, info, trace};
 use tracing_subscriber::EnvFilter;
 
+#[cfg(target_os = "linux")]
+const DEFAULT_MOUNT_PATH: &str = "/bloom";
+#[cfg(target_os = "macos")]
+const DEFAULT_MOUNT_PATH: &str = "/Volumes/bloom";
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const DEFAULT_MOUNT_PATH: &str = "/bloom";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "bloom",
@@ -45,10 +52,19 @@ enum Cmd {
     /// Wallet management.
     #[command(subcommand)]
     Wallet(WalletCmd),
-    /// Run the daemon as a long-lived process. The NFS mount adapter is
-    /// feature-gated and currently a stub; this exists so that the
-    /// invocation contract is stable.
-    Serve,
+    /// Run the daemon as a long-lived process.
+    Serve {
+        /// Mount the VFS for the lifetime of the daemon.
+        ///
+        /// With no PATH, defaults to /bloom on Linux and /Volumes/bloom on macOS.
+        #[arg(
+            long,
+            value_name = "PATH",
+            num_args = 0..=1,
+            default_missing_value = DEFAULT_MOUNT_PATH
+        )]
+        mount: Option<PathBuf>,
+    },
     /// Talk to a running `bloom serve` over its UDS JSON-RPC socket.
     #[command(subcommand)]
     Ipc(IpcCmd),
@@ -356,21 +372,25 @@ async fn run(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Serve => {
+        Cmd::Serve { mount } => {
             let d = Daemon::from_home(home).context("build daemon")?;
             // Spawn the outbox expiry sweeper for the lifetime of the
             // serve command (fix #3). The handle is dropped (and the task
             // signalled to stop) right before the function returns.
             let sweeper = d.spawn_background_tasks();
+            let mount_handle = mount_bloom(&d, mount.as_deref()).await?;
             let chains: Vec<String> = d.chains.list_names();
             println!(
                 "bloom serve: home={} chains={:?}",
                 d.home.root().display(),
                 chains
             );
+            if let Some(mount_path) = mount.as_deref() {
+                println!("mount: {}", mount_path.display());
+            }
             let socket = default_socket_path(d.home.root());
             println!("ipc socket: {}", socket.display());
-            info!(home = %d.home.root().display(), chains = ?chains, socket = %socket.display(), "cli.serve.starting");
+            info!(home = %d.home.root().display(), chains = ?chains, socket = %socket.display(), mount = ?mount, "cli.serve.starting");
             let server = IpcServer::new(d.vfs.clone(), env!("CARGO_PKG_VERSION"), chains);
             let server2 = server.clone();
             // Trigger graceful shutdown on Ctrl-C.
@@ -379,12 +399,15 @@ async fn run(cli: Cli) -> Result<()> {
                 info!("cli.serve.ctrl_c_received");
                 server2.trigger_shutdown();
             });
-            server.serve(&socket).await.context("ipc serve")?;
+            let serve_result = server.serve(&socket).await.context("ipc serve");
             shutdown.abort();
             // Stop the outbox expiry sweeper (fix #3) and any other
             // daemon-owned workers (watch executor, etc., fix #6).
+            let unmount_result = unmount_bloom(mount_handle).await;
             sweeper.shutdown().await;
             d.shutdown().await;
+            serve_result?;
+            unmount_result?;
             info!("cli.serve.shutdown_complete");
             println!("shutting down");
             Ok(())
@@ -408,4 +431,47 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
     }
+}
+
+#[cfg(feature = "mount")]
+async fn mount_bloom(
+    daemon: &Daemon,
+    mount: Option<&std::path::Path>,
+) -> Result<Option<bloom_mount::NfsMountHandle>> {
+    match mount {
+        Some(path) => daemon
+            .mount(path)
+            .await
+            .map(Some)
+            .with_context(|| format!("mount bloom vfs at {}", path.display())),
+        None => Ok(None),
+    }
+}
+
+#[cfg(not(feature = "mount"))]
+async fn mount_bloom(daemon: &Daemon, mount: Option<&std::path::Path>) -> Result<Option<()>> {
+    let _ = daemon;
+    match mount {
+        Some(path) => anyhow::bail!(
+            "mount support is not enabled in this build; rebuild with --features mount (release binaries are built with --all-features): {}",
+            path.display()
+        ),
+        None => Ok(None),
+    }
+}
+
+#[cfg(feature = "mount")]
+async fn unmount_bloom(handle: Option<bloom_mount::NfsMountHandle>) -> Result<()> {
+    if let Some(handle) = handle {
+        bloom_mount::MountHandle::unmount(&handle)
+            .await
+            .context("unmount bloom vfs")?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "mount"))]
+async fn unmount_bloom(handle: Option<()>) -> Result<()> {
+    let _ = handle;
+    Ok(())
 }

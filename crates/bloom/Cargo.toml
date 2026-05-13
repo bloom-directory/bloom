@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [features]
 default = []
+# Enable the embedded NFS mount adapter through the daemon crate.
+mount = ["bloom-daemon/mount", "dep:bloom-mount"]
 # Pass-through for the heimdall-rs decompile decoder. Build with
 # `cargo build --features bytecode-decompile` to enable.
 bytecode-decompile = ["bloom-daemon/bytecode-decompile"]
@@ -18,6 +20,7 @@ bytecode-decompile = ["bloom-daemon/bytecode-decompile"]
 [dependencies]
 bloom-proto.workspace = true
 bloom-daemon.workspace = true
+bloom-mount = { workspace = true, optional = true }
 bloom-keystore.workspace = true
 bloom-chain.workspace = true
 bloom-tx.workspace = true

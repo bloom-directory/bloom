@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.asset_name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset_name: bloom-linux-x86_64.tar.gz
+            os: ubuntu-latest
+            binary: bloom
+            archive: tar.gz
+          - asset_name: bloom-linux-aarch64.tar.gz
+            os: ubuntu-24.04-arm
+            binary: bloom
+            archive: tar.gz
+          - asset_name: bloom-macos-x86_64.tar.gz
+            os: macos-13
+            binary: bloom
+            archive: tar.gz
+          - asset_name: bloom-macos-aarch64.tar.gz
+            os: macos-latest
+            binary: bloom
+            archive: tar.gz
+          - asset_name: bloom-windows-x86_64.zip
+            os: windows-latest
+            binary: bloom.exe
+            archive: zip
+          - asset_name: bloom-windows-aarch64.zip
+            os: windows-11-arm
+            binary: bloom.exe
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Build full-feature binary
+        run: cargo build --release -p bloom --all-features --locked
+
+      - name: Stage package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p package dist
+          cp "target/release/${{ matrix.binary }}" package/
+          cp README.md LICENSE package/
+
+      - name: Create tarball
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: tar -czf "dist/${{ matrix.asset_name }}" -C package .
+
+      - name: Create zip
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: Compress-Archive -Path package/* -DestinationPath "dist/${{ matrix.asset_name }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  publish:
+    name: publish latest release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum bloom-* > SHA256SUMS
+
+      - name: Move latest tag
+        run: |
+          git tag --force latest "$GITHUB_SHA"
+          git push --force origin refs/tags/latest
+
+      - name: Publish latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes_file="$(mktemp)"
+          cat > "$notes_file" <<EOF
+          Automated full-feature build for ${GITHUB_SHA}.
+
+          Stable download URLs use the \`latest\` tag, for example:
+
+          \`\`\`
+          https://github.com/${GITHUB_REPOSITORY}/releases/download/latest/bloom-linux-x86_64.tar.gz
+          \`\`\`
+          EOF
+
+          if gh release view latest >/dev/null 2>&1; then
+            gh release edit latest \
+              --target "$GITHUB_SHA" \
+              --title "Latest master build" \
+              --notes-file "$notes_file" \
+              --latest
+          else
+            gh release create latest \
+              --target "$GITHUB_SHA" \
+              --title "Latest master build" \
+              --notes-file "$notes_file" \
+              --latest
+          fi
+
+          gh release upload latest dist/* --clobber
