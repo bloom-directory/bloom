@@ -1,0 +1,33 @@
+[package]
+name = "bloom-it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "End-to-end integration tests for bloom"
+publish = false
+
+[features]
+default = []
+# Forwards to bloom-revert/bytecode-decompile so the heimdall-fallback
+# integration test (`tests/revert_decoding_fallbacks.rs`) compiles.
+bytecode-decompile = ["bloom-revert/bytecode-decompile"]
+
+[dependencies]
+bloom-proto.workspace = true
+bloom-keystore.workspace = true
+bloom-chain.workspace = true
+bloom-watch.workspace = true
+bloom-tx.workspace = true
+bloom-vfs.workspace = true
+bloom-daemon.workspace = true
+bloom-revert.workspace = true
+alloy.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time", "io-util"] }
+serde_json.workspace = true
+hex.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+reqwest.workspace = true
+futures.workspace = true

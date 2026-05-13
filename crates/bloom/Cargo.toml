@@ -1,0 +1,47 @@
+[package]
+name = "bloom"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "bloom daemon and CLI"
+
+[[bin]]
+name = "bloom"
+path = "src/main.rs"
+
+[features]
+default = []
+# Enable the embedded NFS mount adapter through the daemon crate.
+mount = ["bloom-daemon/mount", "dep:bloom-mount"]
+# Pass-through for the heimdall-rs decompile decoder. Build with
+# `cargo build --features bytecode-decompile` to enable.
+bytecode-decompile = ["bloom-daemon/bytecode-decompile"]
+
+[dependencies]
+bloom-proto.workspace = true
+bloom-daemon.workspace = true
+bloom-mount = { workspace = true, optional = true }
+bloom-keystore.workspace = true
+bloom-chain.workspace = true
+bloom-tx.workspace = true
+bloom-vfs.workspace = true
+bloom-tools.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+dirs.workspace = true
+shellexpand.workspace = true
+hex.workspace = true
+alloy.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile.workspace = true
+async-trait.workspace = true

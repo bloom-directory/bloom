@@ -14,15 +14,15 @@
 #                   because the workspace unit tests don't mount.
 #   --enso        — runs tests/docker/test_enso_aave.sh inside the
 #                   shared docker-compose stack (anvil-fork sidecar +
-#                   beth-test-enso driver, selected via the `enso`
+#                   bloom-test-enso driver, selected via the `enso`
 #                   profile). Drives the Enso -> Aave intent flow end
-#                   to end through the NFS mount at /eth/. Requires
-#                   BETH_ENSO_KEY in the environment.
+#                   to end through the NFS mount at /bloom/. Requires
+#                   BLOOM_ENSO_KEY in the environment.
 #   --enso-live   — same Enso -> Aave flow but against Base mainnet,
-#                   broadcasting from the live keystore at $BETH_LIVE_HOME
-#                   under the wallet $BETH_LIVE_DEST1. SPENDS REAL ETH on
+#                   broadcasting from the live keystore at $BLOOM_LIVE_HOME
+#                   under the wallet $BLOOM_LIVE_DEST1. SPENDS REAL ETH on
 #                   every run (default 0.001 ETH; override with
-#                   BETH_SWAP_AMOUNT_ETH). The live keystore is mounted
+#                   BLOOM_SWAP_AMOUNT_ETH). The live keystore is mounted
 #                   read-only and copied into a throwaway home inside
 #                   the container — the canonical keystore is never
 #                   written to from this script.
@@ -41,16 +41,16 @@
 #
 # `--rebuild` forces `docker build --no-cache`. The default reuses the
 # cached image so iterative loops stay fast. The named docker volume
-# `bloom-eth-cargo-cache` (mounted at /tmp/cargo-target inside the
+# `bloom-cargo-cache` (mounted at /tmp/cargo-target inside the
 # container) persists incremental compile artifacts across runs — wipe
-# it with `docker volume rm bloom-eth-cargo-cache` if you ever need a
+# it with `docker volume rm bloom-cargo-cache` if you ever need a
 # truly cold rebuild.
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-IMAGE_TAG=bloom-eth-mount-test:latest
+IMAGE_TAG=bloom-mount-test:latest
 COMPOSE_FILE="$REPO_ROOT/tests/docker/docker-compose.yml"
-CARGO_CACHE_VOLUME=bloom-eth-cargo-cache
+CARGO_CACHE_VOLUME=bloom-cargo-cache
 
 usage() {
     cat <<EOF
@@ -97,16 +97,16 @@ compose_cmd() {
 }
 
 # Run a profile under the consolidated compose stack. The driver service
-# the profile exposes is always named beth-test-<profile> so we can pin
+# the profile exposes is always named bloom-test-<profile> so we can pin
 # `--exit-code-from` to the right thing without another arg.
 run_compose_profile() {
     local profile=$1
-    local service="beth-test-$profile"
+    local service="bloom-test-$profile"
 
     compose_cmd
     echo "::group::docker compose up ($profile)"
     export REPO_ROOT
-    export BETH_TEST_IMAGE="$IMAGE_TAG"
+    export BLOOM_TEST_IMAGE="$IMAGE_TAG"
     export BASE_FORK_RPC_URL="${BASE_FORK_RPC_URL:-https://base-rpc.publicnode.com}"
 
     "${COMPOSE[@]}" -f "$COMPOSE_FILE" --profile "$profile" \
@@ -175,8 +175,8 @@ case "$MODE" in
         cmd=(bash tests/docker/test_workspace.sh)
         ;;
     enso)
-        require_env BETH_ENSO_KEY
-        export BETH_ENSO_KEY
+        require_env BLOOM_ENSO_KEY
+        export BLOOM_ENSO_KEY
         run_compose_profile enso
         ;;
     fork)
@@ -189,17 +189,17 @@ case "$MODE" in
         # No anvil sidecar: the daemon points at a real Base RPC and
         # the broadcast lands on Base mainnet. Single privileged
         # `docker run` so the in-container kernel can mount NFS.
-        require_env BETH_ENSO_KEY BETH_LIVE_HOME BETH_LIVE_DEST1 BETH_PASSPHRASE
-        if [[ ! -d "$BETH_LIVE_HOME/keystore" ]]; then
-            echo "BETH_LIVE_HOME=$BETH_LIVE_HOME has no keystore/ subdir." >&2
+        require_env BLOOM_ENSO_KEY BLOOM_LIVE_HOME BLOOM_LIVE_DEST1 BLOOM_PASSPHRASE
+        if [[ ! -d "$BLOOM_LIVE_HOME/keystore" ]]; then
+            echo "BLOOM_LIVE_HOME=$BLOOM_LIVE_HOME has no keystore/ subdir." >&2
             echo "  the live wallet must already exist before this test runs." >&2
             exit 2
         fi
-        SWAP_AMOUNT_ETH="${BETH_SWAP_AMOUNT_ETH:-0.001}"
-        BASE_RPC_URL="${BETH_BASE_RPC_URL:-https://base-rpc.publicnode.com}"
+        SWAP_AMOUNT_ETH="${BLOOM_SWAP_AMOUNT_ETH:-0.001}"
+        BASE_RPC_URL="${BLOOM_BASE_RPC_URL:-https://base-rpc.publicnode.com}"
         echo "::group::docker run (enso-live)"
-        echo "  wallet: $BETH_LIVE_DEST1" >&2
-        echo "  swap:   $SWAP_AMOUNT_ETH ETH (override via BETH_SWAP_AMOUNT_ETH)" >&2
+        echo "  wallet: $BLOOM_LIVE_DEST1" >&2
+        echo "  swap:   $SWAP_AMOUNT_ETH ETH (override via BLOOM_SWAP_AMOUNT_ETH)" >&2
         echo "  rpc:    $BASE_RPC_URL" >&2
         echo "  NOTE:   this broadcasts to Base mainnet and spends real ETH." >&2
         # The live keystore is mounted read-only; the test script
@@ -210,13 +210,13 @@ case "$MODE" in
             --security-opt seccomp=unconfined \
             -v "$REPO_ROOT":/workspace \
             -v "$CARGO_CACHE_VOLUME":/tmp/cargo-target \
-            -v "$BETH_LIVE_HOME":/beth-live-home:ro \
-            -e BETH_TEST_MODE=live \
-            -e BETH_ENSO_KEY \
-            -e BETH_PASSPHRASE \
-            -e BETH_LIVE_DEST1 \
-            -e BETH_BASE_RPC_URL="$BASE_RPC_URL" \
-            -e BETH_SWAP_AMOUNT_ETH="$SWAP_AMOUNT_ETH" \
+            -v "$BLOOM_LIVE_HOME":/bloom-live-home:ro \
+            -e BLOOM_TEST_MODE=live \
+            -e BLOOM_ENSO_KEY \
+            -e BLOOM_PASSPHRASE \
+            -e BLOOM_LIVE_DEST1 \
+            -e BLOOM_BASE_RPC_URL="$BASE_RPC_URL" \
+            -e BLOOM_SWAP_AMOUNT_ETH="$SWAP_AMOUNT_ETH" \
             -e RUST_LOG="${RUST_LOG:-info}" \
             -w /workspace \
             "$IMAGE_TAG" \

@@ -49,11 +49,11 @@ the existing VFS, tx engine, and policy surfaces:
 
 ### 3.1 Existing infrastructure we build on
 
-- **`beth-rpc` already classifies WS endpoints** (`endpoint.rs:18`,
+- **`bloom-rpc` already classifies WS endpoints** (`endpoint.rs:18`,
   `is_subscription_capable`) and the watch executor already maintains
   a `subscribe_*` long-poll task with WS-to-HTTP-poll fallback
-  (`beth-watch/src/executor.rs:444`). We re-use the same pattern.
-- **`beth-tx::outbox` already implements** `replace` and `cancel`
+  (`bloom-watch/src/executor.rs:444`). We re-use the same pattern.
+- **`bloom-tx::outbox` already implements** `replace` and `cancel`
   state transitions (lines 240–281). The bump scanner produces inputs
   to those transitions; it doesn't duplicate them.
 - **`policy_engine.rs` already gates staging** with per-tx ETH/USD
@@ -92,7 +92,7 @@ rotate-mode without re-architecting.
 One new crate, three existing crates extended.
 
 ```
-beth-mempool (NEW)
+bloom-mempool (NEW)
 ├── provider.rs       MempoolProvider trait + adapters
 │                       - AlchemyProvider (full bodies, alchemy_pendingTransactions)
 │                       - GenericEthSubscribeProvider (hashes only; follows up via RpcPool)
@@ -104,11 +104,11 @@ beth-mempool (NEW)
 ├── heuristic.rs      Stage-time MEV/sandwich heuristic (pure fn)
 └── lib.rs
 
-beth-rpc (EXTEND)
+bloom-rpc (EXTEND)
 └── endpoint.rs       Add EndpointKind::PrivateRpc so the pool can route
                       a signed raw tx via a non-pool endpoint.
 
-beth-tx (EXTEND)
+bloom-tx (EXTEND)
 ├── tx_engine.rs      Wire MEV heuristic into stage()
                       Wire nonce-conflict check against PendingTxIndex
                       Wire private routing into broadcast()
@@ -121,7 +121,7 @@ beth-tx (EXTEND)
 ├── policy_engine.rs  New TOML tables: [private], [mev], [bump]
 └── bump.rs (NEW)     BumpScanner: detects stuck txs, writes bump.tx artefacts
 
-beth-vfs (EXTEND)
+bloom-vfs (EXTEND)
 └── handlers/
     └── chains_mempool.rs (NEW)
                       chains/<chain>/mempool/{status.json, live, recent.jsonl,
@@ -130,9 +130,9 @@ beth-vfs (EXTEND)
 ```
 
 **Why one new crate, not two:** read-side (mempool stream + index)
-and the heuristic / private-RPC trait don't depend on `beth-tx`.
-Keeping them in `beth-mempool` means `beth-tx` depends on
-`beth-mempool` (cleanly), but not the other way. Two crates would
+and the heuristic / private-RPC trait don't depend on `bloom-tx`.
+Keeping them in `bloom-mempool` means `bloom-tx` depends on
+`bloom-mempool` (cleanly), but not the other way. Two crates would
 force a circular dep or an unproductive leaf-node split.
 
 ### 4.2 Lifecycle
@@ -249,7 +249,7 @@ pub struct PendingTx {
 
 Initial impls: `AlchemyProvider`, `GenericEthSubscribeProvider`. Both
 share a thin reconnect-with-backoff wrapper that mirrors the
-WS-to-poll handover in `beth-watch/src/executor.rs:444`.
+WS-to-poll handover in `bloom-watch/src/executor.rs:444`.
 
 ### 6.2 `PrivateRpcProvider`
 
@@ -276,7 +276,7 @@ the same JSON-RPC surface, so the shared HTTP layer is tiny.
 
 ### 6.3 Wiring
 
-- `beth-daemon` builds
+- `bloom-daemon` builds
   `BTreeMap<ChainId, Arc<dyn MempoolProvider>>` and
   `BTreeMap<(ChainId, ProviderId), Arc<dyn PrivateRpcProvider>>`
   from config at startup.
@@ -321,7 +321,7 @@ match exists, write `pending/<id>/nonce_conflict.json`:
 broadcast. The agent reads `nonce_conflict.json` and decides. Hard
 rejection is one bool flag away if we need it later.
 
-### 7.2 MEV heuristic (`beth-mempool::heuristic::evaluate`)
+### 7.2 MEV heuristic (`bloom-mempool::heuristic::evaluate`)
 
 Pure function. Two cheap checks:
 
@@ -367,7 +367,7 @@ Non-mainnet + `private.enabled = true` → returns
 `BroadcastError::PrivateNotSupportedOnChain` with a message naming
 the chain.
 
-### 7.4 Bump scanner (`beth-tx::bump::BumpScanner`)
+### 7.4 Bump scanner (`bloom-tx::bump::BumpScanner`)
 
 Background task running every 30 s (configurable). For each
 `outbox/<wallet>/<chain>/sent/<hash>/` entry without `mined.json`:
@@ -441,7 +441,7 @@ every watch with the firehose or special-case `Mempool` everywhere.
   `evictions_total`.
 
 **Long-poll `live` handlers** follow the existing pattern from
-`beth-vfs/src/handlers/watch.rs` and the per-handler cursor in
+`bloom-vfs/src/handlers/watch.rs` and the per-handler cursor in
 `events/<name>/live`: per-reader cursor in memory, no on-disk
 state, no replay on reconnect.
 
@@ -492,7 +492,7 @@ clear "not configured" error other absent-backend trees do.
 
 ## 10. Testing Strategy
 
-### 10.1 Feature flags (Cargo, on `beth-mempool`)
+### 10.1 Feature flags (Cargo, on `bloom-mempool`)
 
 | Feature | Pulls | Default? |
 |---|---|---|
@@ -515,7 +515,7 @@ clear "not configured" error other absent-backend trees do.
      must pass subscribe → mock stream → 100 PendingTx → assert
      delivered + dedupe.
 
-2. **In-process integration** (extend `beth-it`):
+2. **In-process integration** (extend `bloom-it`):
    - `MockMempoolProvider` (fixture-fed stream) for VFS handler
      end-to-end tests.
    - `MockPrivateRpcProvider` (captures submitted raw txs) for
@@ -563,7 +563,7 @@ Built so phases land independently — each is a useful PR that
 doesn't depend on later phases shipping.
 
 **Phase 1 — Foundation (no external deps yet)**
-1. New crate `beth-mempool` skeleton (Cargo, lib.rs, error types).
+1. New crate `bloom-mempool` skeleton (Cargo, lib.rs, error types).
 2. `PendingTxIndex` + `provider_test_suite!()` macro.
 3. `MempoolProvider` trait + `MockMempoolProvider` (fixture-fed).
 4. `PrivateRpcProvider` trait + `MockPrivateRpcProvider`.
@@ -571,7 +571,7 @@ doesn't depend on later phases shipping.
 6. `bump::compute_replacement_fees` + unit tests.
 
 **Phase 2 — VFS surface**
-1. `beth-vfs/src/handlers/chains_mempool.rs` with the read tree.
+1. `bloom-vfs/src/handlers/chains_mempool.rs` with the read tree.
 2. Wallet-side artefacts: `pending_external.jsonl`,
    `nonce_conflicts.json`, `mev_risk.json`, `nonce_conflict.json`,
    `bump.tx`, `bump_advice.json`, `cancel.tx`.
@@ -584,7 +584,7 @@ doesn't depend on later phases shipping.
 2. Nonce-conflict check in `tx_engine::stage`.
 3. MEV heuristic call in `tx_engine::stage`.
 4. Private routing branch in `tx_engine::broadcast`.
-5. `BumpScanner` task spawned by `beth-daemon`.
+5. `BumpScanner` task spawned by `bloom-daemon`.
 6. End-to-end mock integration tests for each path.
 
 **Phase 4 — Real providers**

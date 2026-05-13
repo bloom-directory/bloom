@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 # tests/docker/test_enso_aave.sh — dockerized Enso -> Aave integration
-# test driver. Runs *inside* the beth-test-enso container brought up by
+# test driver. Runs *inside* the bloom-test-enso container brought up by
 # tests/docker/docker-compose.yml under the `enso` profile (fork mode)
 # or by tests/docker/run.sh --enso-live (live mainnet mode).
 #
 # What this proves
-#   The agent-facing surface (NFS mount at /eth/) end-to-ends a real
+#   The agent-facing surface (NFS mount at /bloom/) end-to-ends a real
 #   DeFi intent: ETH -> aBaseUSDC via Enso shortcut -> Aave V3 supply.
 #   Every step except the wallet unlock (in-process by design) is
-#   driven through plain filesystem ops on /eth/ — no `beth vfs write`
-#   short-circuits, no `beth ipc call`. If this test passes, an agent
-#   with shell access to /eth/ can place real DeFi trades.
+#   driven through plain filesystem ops on /bloom/ — no `bloom vfs write`
+#   short-circuits, no `bloom ipc call`. If this test passes, an agent
+#   with shell access to /bloom/ can place real DeFi trades.
 #
-# Modes (selected by BETH_TEST_MODE; default "fork")
+# Modes (selected by BLOOM_TEST_MODE; default "fork")
 #   fork  — broadcasts land on an anvil --fork-url=Base sidecar.
 #           Throwaway state, no real funds.
-#   live  — broadcasts land on Base mainnet via $BETH_BASE_RPC_URL.
-#           Spends real ETH from $BETH_LIVE_DEST1. The keystore is
-#           expected at /beth-live-home/keystore (mounted read-only by
+#   live  — broadcasts land on Base mainnet via $BLOOM_BASE_RPC_URL.
+#           Spends real ETH from $BLOOM_LIVE_DEST1. The keystore is
+#           expected at /bloom-live-home/keystore (mounted read-only by
 #           run.sh --enso-live) and is COPIED into a throwaway home
 #           before the daemon starts so the canonical keystore is
 #           never written to.
@@ -28,23 +28,23 @@
 #   bash tests/docker/run.sh --enso-live    # mainnet, spends real ETH
 #
 # Required env (fork mode — set by docker-compose.yml's enso profile)
-#   BETH_ENSO_KEY              Enso v1 API key
-#   BETH_TEST_WALLET_PASSPHRASE   passphrase for the imported test wallet
+#   BLOOM_ENSO_KEY              Enso v1 API key
+#   BLOOM_TEST_WALLET_PASSPHRASE   passphrase for the imported test wallet
 #   BASE_FORK_INTERNAL_URL     RPC URL the daemon hits (anvil-fork:8545)
 #
 # Required env (live mode — set by run.sh --enso-live)
-#   BETH_TEST_MODE=live        selects this branch
-#   BETH_ENSO_KEY              Enso v1 API key
-#   BETH_PASSPHRASE            passphrase for the live keystore
-#   BETH_LIVE_DEST1            sender address (must exist as `dest1`
-#                              under /beth-live-home/keystore)
-#   BETH_BASE_RPC_URL          real Base RPC the daemon broadcasts to
-#   BETH_SWAP_AMOUNT_ETH       optional, defaults to 0.001
+#   BLOOM_TEST_MODE=live        selects this branch
+#   BLOOM_ENSO_KEY              Enso v1 API key
+#   BLOOM_PASSPHRASE            passphrase for the live keystore
+#   BLOOM_LIVE_DEST1            sender address (must exist as `dest1`
+#                              under /bloom-live-home/keystore)
+#   BLOOM_BASE_RPC_URL          real Base RPC the daemon broadcasts to
+#   BLOOM_SWAP_AMOUNT_ETH       optional, defaults to 0.001
 #
 # Idempotency
 #   Fork mode wipes the home dir per run and the anvil fork is fresh
 #   each `docker compose up`. Live mode wipes only the throwaway
-#   /tmp/beth-enso-home; the canonical $BETH_LIVE_HOME on the host is
+#   /tmp/bloom-enso-home; the canonical $BLOOM_LIVE_HOME on the host is
 #   read-only-mounted and never modified.
 
 set -euo pipefail
@@ -53,12 +53,12 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 LOG_PREFIX=enso-test
 source "$SCRIPT_DIR/lib.sh"
 
-MODE="${BETH_TEST_MODE:-fork}"
+MODE="${BLOOM_TEST_MODE:-fork}"
 
 # MNT/PIDFILE/LOGFILE/SENTINEL come from lib.sh defaults.
 # DEST1/ANVIL_KEY/USDC/AUSDC come from lib.sh fixtures (fork mode keeps
 # DEST1 as Anvil account[0]; live mode overrides below).
-HOME_DIR=/tmp/beth-enso-home
+HOME_DIR=/tmp/bloom-enso-home
 WALLET=dest1
 CHAIN=base
 
@@ -66,10 +66,10 @@ CHAIN=base
 case "$MODE" in
     fork)
         SWAP_AMOUNT_ETH=0.05
-        WALLET_PASSPHRASE="${BETH_TEST_WALLET_PASSPHRASE:-}"
+        WALLET_PASSPHRASE="${BLOOM_TEST_WALLET_PASSPHRASE:-}"
         IMPORT_KEY="$ANVIL_KEY"
-        [[ -n "${BETH_ENSO_KEY:-}" ]] || fail "BETH_ENSO_KEY not set"
-        [[ -n "$WALLET_PASSPHRASE" ]] || fail "BETH_TEST_WALLET_PASSPHRASE not set"
+        [[ -n "${BLOOM_ENSO_KEY:-}" ]] || fail "BLOOM_ENSO_KEY not set"
+        [[ -n "$WALLET_PASSPHRASE" ]] || fail "BLOOM_TEST_WALLET_PASSPHRASE not set"
         [[ -n "${BASE_FORK_INTERNAL_URL:-}" ]] \
             || fail "BASE_FORK_INTERNAL_URL not set"
         RPC_URL="$BASE_FORK_INTERNAL_URL"
@@ -77,18 +77,18 @@ case "$MODE" in
         BLOCK_MAINNET_BROADCAST=false
         ;;
     live)
-        DEST1="${BETH_LIVE_DEST1:-}"
-        SWAP_AMOUNT_ETH="${BETH_SWAP_AMOUNT_ETH:-0.001}"
-        WALLET_PASSPHRASE="${BETH_PASSPHRASE:-}"
+        DEST1="${BLOOM_LIVE_DEST1:-}"
+        SWAP_AMOUNT_ETH="${BLOOM_SWAP_AMOUNT_ETH:-0.001}"
+        WALLET_PASSPHRASE="${BLOOM_PASSPHRASE:-}"
         # No key import in live mode — the keystore is the source of
-        # truth and was created by `beth wallet create` long ago.
+        # truth and was created by `bloom wallet create` long ago.
         IMPORT_KEY=
-        [[ -n "${BETH_ENSO_KEY:-}" ]] || fail "BETH_ENSO_KEY not set"
-        [[ -n "$DEST1" ]]             || fail "BETH_LIVE_DEST1 not set"
-        [[ -n "$WALLET_PASSPHRASE" ]] || fail "BETH_PASSPHRASE not set"
-        [[ -n "${BETH_BASE_RPC_URL:-}" ]] \
-            || fail "BETH_BASE_RPC_URL not set"
-        RPC_URL="$BETH_BASE_RPC_URL"
+        [[ -n "${BLOOM_ENSO_KEY:-}" ]] || fail "BLOOM_ENSO_KEY not set"
+        [[ -n "$DEST1" ]]             || fail "BLOOM_LIVE_DEST1 not set"
+        [[ -n "$WALLET_PASSPHRASE" ]] || fail "BLOOM_PASSPHRASE not set"
+        [[ -n "${BLOOM_BASE_RPC_URL:-}" ]] \
+            || fail "BLOOM_BASE_RPC_URL not set"
+        RPC_URL="$BLOOM_BASE_RPC_URL"
         CHAIN_DISPLAY="Base (mainnet)"
         # block_mainnet_broadcast guards against unexpected broadcasts
         # to a chain id that matches a known mainnet. Live mode wants
@@ -98,14 +98,14 @@ case "$MODE" in
         warn "           swap = $SWAP_AMOUNT_ETH ETH (real funds)"
         ;;
     *)
-        fail "unknown BETH_TEST_MODE='$MODE' (expected fork|live)"
+        fail "unknown BLOOM_TEST_MODE='$MODE' (expected fork|live)"
         ;;
 esac
 
 prepare_home_dir "$HOME_DIR"
 [[ "$MODE" == "live" ]] && prepare_live_home "$HOME_DIR" "$WALLET"
 
-write_base_config "$HOME_DIR" "$RPC_URL" "$CHAIN_DISPLAY" "$BLOCK_MAINNET_BROADCAST" "$BETH_ENSO_KEY"
+write_base_config "$HOME_DIR" "$RPC_URL" "$CHAIN_DISPLAY" "$BLOCK_MAINNET_BROADCAST" "$BLOOM_ENSO_KEY"
 build_mount_demo
 
 # ---------- top up the test wallet on the fork ----------
@@ -118,11 +118,11 @@ if [[ "$MODE" == "fork" ]]; then
     top_up_anvil_balance "$BASE_FORK_INTERNAL_URL" "$DEST1"
 fi
 
-# BETH_TEST_WALLET_KEY is only set in fork mode where mount_demo
+# BLOOM_TEST_WALLET_KEY is only set in fork mode where mount_demo
 # imports an Anvil-derived key under the name "dest1". In live mode the
 # keystore was copied in above, so we leave the import key empty —
 # mount_demo will skip the import branch and just unlock the existing
-# entry with BETH_TEST_WALLET_PASSPHRASE.
+# entry with BLOOM_TEST_WALLET_PASSPHRASE.
 start_mount_demo "$MNT" "$HOME_DIR" "$PIDFILE" "$LOGFILE" "$WALLET" "$IMPORT_KEY" "$WALLET_PASSPHRASE"
 trap 'cleanup_mount_demo "$MNT" "$PIDFILE" "$LOGFILE"' EXIT
 wait_for_mount "$SENTINEL" "$DAEMON_PID" "$LOGFILE" 90
@@ -150,10 +150,10 @@ fi
 # of the route.
 INTENT_BODY=$(printf '{"intent":"swap %s ETH to %s on base","chain":"%s","slippage_bps":500}' \
     "$SWAP_AMOUNT_ETH" "$AUSDC" "$CHAIN")
-log "POST intent (via /eth write): $INTENT_BODY"
+log "POST intent (via /bloom write): $INTENT_BODY"
 
 # Snapshot the pending set so we can diff it after confirmation and
-# learn the staged id. This used to be impossible — `BethFs::getattr`
+# learn the staged id. This used to be impossible — `BloomFs::getattr`
 # returned a stable `change` attribute, so once the kernel cached the
 # empty listing it never refreshed. Now `dir_change` hashes the actual
 # listing, so a daemon-side write moves the change attribute and the

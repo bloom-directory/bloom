@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Acceptance scenario for bloom-eth.
+# Acceptance scenario for bloom.
 #
 # Drives the four happy paths from §11.4 of the design doc using only
-# `beth` CLI calls (which exercise the same code paths as VFS writes).
+# `bloom` CLI calls (which exercise the same code paths as VFS writes).
 #
 # 1. Native ETH send (Anvil, local-only)
 # 2. ERC-20 transfer (deploys MockERC20, transfers, verifies balance)
-# 3. Uniswap V2 swap (mainnet fork; skipped if BETH_MAINNET_RPC unset)
+# 3. Uniswap V2 swap (mainnet fork; skipped if BLOOM_MAINNET_RPC unset)
 # 4. Enso intent (mainnet fork + Enso key; skipped if either unset)
 #
 # Requirements: foundry (anvil + cast + forge) on PATH, jq, and the
-# bloom-eth workspace built (`cargo build --release -p beth`).
+# bloom workspace built (`cargo build --release -p bloom`).
 #
 # Exit codes:
 #   0 = all required scenarios passed
@@ -22,8 +22,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "$REPO_ROOT/scripts/lib.sh"
 
-BETH_BIN="${BETH_BIN:-$REPO_ROOT/target/release/beth}"
-HOME_DIR="$(mktemp -d -t beth-acceptance.XXXXXX)"
+BLOOM_BIN="${BLOOM_BIN:-$REPO_ROOT/target/release/bloom}"
+HOME_DIR="$(mktemp -d -t bloom-acceptance.XXXXXX)"
 trap 'rm -rf "$HOME_DIR"; pkill -P $$ anvil 2>/dev/null || true' EXIT
 
 # ---------------------------------------------------------------- helpers
@@ -31,7 +31,7 @@ log() { printf '\033[1;36m[acceptance]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[fail]\033[0m %s\n' "$*"; exit 1; }
 ok()   { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
 
-beth() { RUST_LOG=error "$BETH_BIN" --home "$HOME_DIR" "$@" 2>/dev/null; }
+bloom() { RUST_LOG=error "$BLOOM_BIN" --home "$HOME_DIR" "$@" 2>/dev/null; }
 
 # Anvil's default mnemonic — first account, 10000 ETH.
 ANVIL_KEY=$ANVIL_KEY_0
@@ -40,7 +40,7 @@ DEST_ADDR=$ANVIL_ADDR_1
 
 # ---------------------------------------------------------------- main
 REQUIRE_CMD_EXIT=2
-require_cmd anvil cast jq "$BETH_BIN"
+require_cmd anvil cast jq "$BLOOM_BIN"
 
 log "home dir: $HOME_DIR"
 
@@ -51,9 +51,9 @@ ANVIL_PID=$!
 sleep 1
 cast chain-id --rpc-url http://127.0.0.1:8545 >/dev/null 2>&1 || fail "anvil not reachable"
 
-# 0a. Wire bloom-eth config: a single 'local' chain pointing at anvil.
-log "init beth home"
-beth init >/dev/null
+# 0a. Wire bloom config: a single 'local' chain pointing at anvil.
+log "init bloom home"
+bloom init >/dev/null
 
 # Patch config.toml — replace mainnet entry with anvil-local.
 cat > "$HOME_DIR/config.toml" <<EOF
@@ -74,16 +74,16 @@ EOF
 
 # 0b. Import the anvil key.
 log "importing anvil key"
-BETH_PASSPHRASE="acceptance-pass" beth wallet import alice "$ANVIL_KEY" --passphrase acceptance-pass >/dev/null
-beth wallet list
+BLOOM_PASSPHRASE="acceptance-pass" bloom wallet import alice "$ANVIL_KEY" --passphrase acceptance-pass >/dev/null
+bloom wallet list
 
 # ============================================================== 1. native
 log "scenario 1: native ETH send"
 INTENT='{"to":"'"$DEST_ADDR"'","value":"0.5 ETH","chain":"local"}'
-STAGED=$(BETH_PASSPHRASE=acceptance-pass beth wallet stage alice local --intent "$INTENT")
+STAGED=$(BLOOM_PASSPHRASE=acceptance-pass bloom wallet stage alice local --intent "$INTENT")
 log "staged id: $STAGED"
 BEFORE=$(cast balance "$DEST_ADDR" --rpc-url http://127.0.0.1:8545)
-BETH_PASSPHRASE=acceptance-pass beth wallet confirm alice local "$STAGED" --passphrase acceptance-pass --text y
+BLOOM_PASSPHRASE=acceptance-pass bloom wallet confirm alice local "$STAGED" --passphrase acceptance-pass --text y
 sleep 1
 AFTER=$(cast balance "$DEST_ADDR" --rpc-url http://127.0.0.1:8545)
 [ "$AFTER" != "$BEFORE" ] || fail "native send: balance unchanged"
@@ -142,9 +142,9 @@ SOL
   log "token deployed: $TOKEN_ADDR"
 
   ERC20_INTENT='{"chain":"local","token":"'"$TOKEN_ADDR"'","to":"'"$DEST_ADDR"'","value":"100"}'
-  STAGED=$(BETH_PASSPHRASE=acceptance-pass beth wallet stage alice local --intent "$ERC20_INTENT")
+  STAGED=$(BLOOM_PASSPHRASE=acceptance-pass bloom wallet stage alice local --intent "$ERC20_INTENT")
   log "erc20 staged id: $STAGED"
-  BETH_PASSPHRASE=acceptance-pass beth wallet confirm alice local "$STAGED" --passphrase acceptance-pass --text y
+  BLOOM_PASSPHRASE=acceptance-pass bloom wallet confirm alice local "$STAGED" --passphrase acceptance-pass --text y
   sleep 1
   TOKEN_BAL=$(cast call "$TOKEN_ADDR" "balanceOf(address)(uint256)" "$DEST_ADDR" --rpc-url http://127.0.0.1:8545)
   [ "$TOKEN_BAL" != "0" ] || fail "erc20: dest balance still zero"
@@ -153,19 +153,19 @@ SOL
 fi
 
 # ============================================================== 3. Uniswap V2 (fork)
-if [ -n "${BETH_MAINNET_RPC:-}" ]; then
+if [ -n "${BLOOM_MAINNET_RPC:-}" ]; then
   log "scenario 3: Uniswap V2 swap (skipping in basic acceptance — see docs)"
   ok "scenario 3 documented as TODO; requires mainnet fork harness"
 else
-  log "scenario 3: skipped (BETH_MAINNET_RPC not set)"
+  log "scenario 3: skipped (BLOOM_MAINNET_RPC not set)"
 fi
 
 # ============================================================== 4. Enso (fork)
-if [ -n "${BETH_ENSO_KEY:-}" ] && [ -n "${BETH_MAINNET_RPC:-}" ]; then
+if [ -n "${BLOOM_ENSO_KEY:-}" ] && [ -n "${BLOOM_MAINNET_RPC:-}" ]; then
   log "scenario 4: Enso intent (skipping in basic acceptance)"
   ok "scenario 4 documented as TODO"
 else
-  log "scenario 4: skipped (BETH_ENSO_KEY or BETH_MAINNET_RPC not set)"
+  log "scenario 4: skipped (BLOOM_ENSO_KEY or BLOOM_MAINNET_RPC not set)"
 fi
 
 ok "acceptance complete"

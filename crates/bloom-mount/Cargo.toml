@@ -1,0 +1,43 @@
+[package]
+name = "bloom-mount"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NFS mount adapter for bloom (off by default for portability)"
+
+[features]
+default = []
+# Enable the embedded NFS server. Off by default because it pulls a git
+# dependency. With `--features mount` the [`serve_nfs`] entry point spins
+# up an embedded NFSv4.1 server bound to a localhost port and shells out
+# to the platform `mount` command so the running daemon's VFS shows up
+# as a real filesystem mount.
+mount = ["dep:embednfs", "dep:bloom-vfs", "dep:bytes", "dep:lru", "dep:futures"]
+# Back-compat alias for the original feature name. New callers should
+# prefer `mount`; both pull the same code in.
+nfs = ["mount"]
+
+[dependencies]
+bloom-proto.workspace = true
+# bloom-vfs is only needed when the `mount` feature is on — that is
+# where the NFS-to-VFS adapter lives. Default builds keep it out so the
+# stub surface compiles on platforms that can't link an NFS server.
+bloom-vfs = { workspace = true, optional = true }
+serde.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+bytes = { version = "1", optional = true }
+lru = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+
+# Embedded NFSv4.1 server. Pinned to the same revision bloom uses; once
+# the upstream gets a crates.io release we can flip this to a registry
+# dep. Marked optional so non-mount builds don't fetch the git source.
+embednfs = { git = "https://github.com/bloom-directory/embednfs.git", rev = "a9c835304edc5e338e082b0ac3a499aefdfd68e7", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

@@ -4,7 +4,7 @@
 
 **Goal:** Implement mempool observability, nonce-conflict detection, gas-bump suggestions, private orderflow routing, and stage-time MEV/sandwich warnings, addressing README.md:167 and the v1 non-goal at `docs/specs/2026-05-08-bloom-eth-design.md:78`.
 
-**Architecture:** One new crate (`beth-mempool`) owns the read-side mempool stream + index + provider traits + heuristic. `beth-tx`, `beth-rpc`, `beth-vfs`, and `beth-daemon` are extended to wire the new logic into staging, broadcast, the VFS, and the daemon lifecycle. Provider abstractions (`MempoolProvider`, `PrivateRpcProvider`) keep external dependencies behind feature flags. Reference spec: `docs/specs/2026-05-12-mempool-and-private-orderflow-design.md`.
+**Architecture:** One new crate (`bloom-mempool`) owns the read-side mempool stream + index + provider traits + heuristic. `bloom-tx`, `bloom-rpc`, `bloom-vfs`, and `bloom-daemon` are extended to wire the new logic into staging, broadcast, the VFS, and the daemon lifecycle. Provider abstractions (`MempoolProvider`, `PrivateRpcProvider`) keep external dependencies behind feature flags. Reference spec: `docs/specs/2026-05-12-mempool-and-private-orderflow-design.md`.
 
 **Tech Stack:** Rust 2024, tokio, alloy, async-trait, parking_lot, serde, tracing, reqwest (for private-RPC POSTs), futures (for streams). All existing workspace deps; no new top-level workspace deps.
 
@@ -16,34 +16,34 @@
 - **Commits:** one commit per task, with a `feat(<crate>)`, `fix(<crate>)`, `test(<crate>)`, or `docs(<crate>)` prefix matching the existing repo style.
 - **Test fixtures:** put new hand-crafted calldata + RPC fixtures under `crates/<crate>/tests/fixtures/` per existing convention.
 - **Workspace lints:** `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings` after every task before commit.
-- **Mainnet chain id constant:** `pub const MAINNET_CHAIN_ID: u64 = 1;` lives in `beth-mempool/src/private.rs`.
+- **Mainnet chain id constant:** `pub const MAINNET_CHAIN_ID: u64 = 1;` lives in `bloom-mempool/src/private.rs`.
 
 ---
 
 # Phase 1 — Foundation (no external deps)
 
-Produces a buildable `beth-mempool` crate with traits, mocks, the pending-tx index, the MEV heuristic, and the bump-fee math. Phase 1 must compile and test green standalone; no other crate depends on it yet.
+Produces a buildable `bloom-mempool` crate with traits, mocks, the pending-tx index, the MEV heuristic, and the bump-fee math. Phase 1 must compile and test green standalone; no other crate depends on it yet.
 
 ---
 
-### Task 1.1: Create `beth-mempool` crate skeleton
+### Task 1.1: Create `bloom-mempool` crate skeleton
 
 **Files:**
-- Create: `crates/beth-mempool/Cargo.toml`
-- Create: `crates/beth-mempool/src/lib.rs`
+- Create: `crates/bloom-mempool/Cargo.toml`
+- Create: `crates/bloom-mempool/src/lib.rs`
 - Modify: `Cargo.toml` (workspace members)
 
 - [ ] **Step 1: Add crate to workspace members**
 
-Modify the `members = [...]` block in `/Users/joshua/code/bloom-eth/Cargo.toml` to include `"crates/beth-mempool"`. Place it alphabetically between `"crates/beth-keystore"` and `"crates/beth-mount"`.
+Modify the `members = [...]` block in `/Users/joshua/code/bloom-eth/Cargo.toml` to include `"crates/bloom-mempool"`. Place it alphabetically between `"crates/bloom-keystore"` and `"crates/bloom-mount"`.
 
 - [ ] **Step 2: Write the crate Cargo.toml**
 
-Create `crates/beth-mempool/Cargo.toml`:
+Create `crates/bloom-mempool/Cargo.toml`:
 
 ```toml
 [package]
-name = "beth-mempool"
+name = "bloom-mempool"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -60,9 +60,9 @@ flashbots = ["dep:reqwest"]
 live-providers = []
 
 [dependencies]
-beth-proto.workspace = true
-beth-chain.workspace = true
-beth-tools.workspace = true
+bloom-proto.workspace = true
+bloom-chain.workspace = true
+bloom-tools.workspace = true
 alloy.workspace = true
 alloy-dyn-abi.workspace = true
 async-trait.workspace = true
@@ -86,7 +86,7 @@ tempfile.workspace = true
 
 - [ ] **Step 3: Write the lib.rs skeleton**
 
-Create `crates/beth-mempool/src/lib.rs`:
+Create `crates/bloom-mempool/src/lib.rs`:
 
 ```rust
 //! Mempool observability + private orderflow + MEV heuristic.
@@ -110,22 +110,22 @@ pub use provider::{MempoolError, MempoolProvider, MockMempoolProvider, PendingTx
 Create empty stub files so the crate compiles:
 
 ```bash
-mkdir -p crates/beth-mempool/src
+mkdir -p crates/bloom-mempool/src
 for f in bump.rs heuristic.rs index.rs private.rs provider.rs stream.rs; do
-  echo "//! stub" > crates/beth-mempool/src/$f
+  echo "//! stub" > crates/bloom-mempool/src/$f
 done
 ```
 
 - [ ] **Step 4: Verify the crate compiles**
 
-Run: `cargo build -p beth-mempool`
+Run: `cargo build -p bloom-mempool`
 Expected: success with warnings only (unused modules).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add Cargo.toml crates/beth-mempool/
-git commit -m "feat(beth-mempool): crate skeleton"
+git add Cargo.toml crates/bloom-mempool/
+git commit -m "feat(bloom-mempool): crate skeleton"
 ```
 
 ---
@@ -133,12 +133,12 @@ git commit -m "feat(beth-mempool): crate skeleton"
 ### Task 1.2: `PendingTx` domain type + `TxFees`
 
 **Files:**
-- Modify: `crates/beth-mempool/src/provider.rs`
-- Test: `crates/beth-mempool/src/provider.rs` (inline `#[cfg(test)]`)
+- Modify: `crates/bloom-mempool/src/provider.rs`
+- Test: `crates/bloom-mempool/src/provider.rs` (inline `#[cfg(test)]`)
 
 - [ ] **Step 1: Write the failing test**
 
-Replace the stub in `crates/beth-mempool/src/provider.rs` with:
+Replace the stub in `crates/bloom-mempool/src/provider.rs` with:
 
 ```rust
 //! `MempoolProvider` trait + the `PendingTx` domain type.
@@ -242,15 +242,15 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they pass**
 
-Run: `cargo test -p beth-mempool --lib provider::tests`
+Run: `cargo test -p bloom-mempool --lib provider::tests`
 Expected: 3 tests pass.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cargo fmt --all && cargo clippy -p beth-mempool --all-targets -- -D warnings
-git add crates/beth-mempool/src/provider.rs
-git commit -m "feat(beth-mempool): PendingTx + TxFees domain types"
+cargo fmt --all && cargo clippy -p bloom-mempool --all-targets -- -D warnings
+git add crates/bloom-mempool/src/provider.rs
+git commit -m "feat(bloom-mempool): PendingTx + TxFees domain types"
 ```
 
 ---
@@ -258,12 +258,12 @@ git commit -m "feat(beth-mempool): PendingTx + TxFees domain types"
 ### Task 1.3: `PendingTxIndex` (bounded LRU keyed by hash + by (addr, nonce))
 
 **Files:**
-- Modify: `crates/beth-mempool/src/index.rs`
-- Test: `crates/beth-mempool/src/index.rs` (inline)
+- Modify: `crates/bloom-mempool/src/index.rs`
+- Test: `crates/bloom-mempool/src/index.rs` (inline)
 
 - [ ] **Step 1: Write the failing test first**
 
-Replace `crates/beth-mempool/src/index.rs` with:
+Replace `crates/bloom-mempool/src/index.rs` with:
 
 ```rust
 //! Bounded in-memory index of observed pending txs.
@@ -464,15 +464,15 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they pass**
 
-Run: `cargo test -p beth-mempool --lib index::tests`
+Run: `cargo test -p bloom-mempool --lib index::tests`
 Expected: 5 tests pass.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cargo fmt --all && cargo clippy -p beth-mempool --all-targets -- -D warnings
-git add crates/beth-mempool/src/index.rs
-git commit -m "feat(beth-mempool): bounded LRU PendingTxIndex"
+cargo fmt --all && cargo clippy -p bloom-mempool --all-targets -- -D warnings
+git add crates/bloom-mempool/src/index.rs
+git commit -m "feat(bloom-mempool): bounded LRU PendingTxIndex"
 ```
 
 ---
@@ -480,11 +480,11 @@ git commit -m "feat(beth-mempool): bounded LRU PendingTxIndex"
 ### Task 1.4: `MempoolProvider` trait + `provider_test_suite!` macro
 
 **Files:**
-- Modify: `crates/beth-mempool/src/provider.rs`
+- Modify: `crates/bloom-mempool/src/provider.rs`
 
 - [ ] **Step 1: Add the trait, error type, and conformance macro**
 
-Append to `crates/beth-mempool/src/provider.rs` (above the `#[cfg(test)]` block):
+Append to `crates/bloom-mempool/src/provider.rs` (above the `#[cfg(test)]` block):
 
 ```rust
 use async_trait::async_trait;
@@ -568,15 +568,15 @@ unique module identifier, e.g. `provider_test_suite!(MockMempoolProvider, build_
 
 - [ ] **Step 2: Build the crate**
 
-Run: `cargo build -p beth-mempool`
+Run: `cargo build -p bloom-mempool`
 Expected: success.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cargo fmt --all && cargo clippy -p beth-mempool --all-targets -- -D warnings
-git add crates/beth-mempool/src/provider.rs
-git commit -m "feat(beth-mempool): MempoolProvider trait + conformance macro"
+cargo fmt --all && cargo clippy -p bloom-mempool --all-targets -- -D warnings
+git add crates/bloom-mempool/src/provider.rs
+git commit -m "feat(bloom-mempool): MempoolProvider trait + conformance macro"
 ```
 
 ---
@@ -584,17 +584,17 @@ git commit -m "feat(beth-mempool): MempoolProvider trait + conformance macro"
 ### Task 1.5: `MockMempoolProvider` (fixture-fed)
 
 **Files:**
-- Modify: `crates/beth-mempool/src/provider.rs`
+- Modify: `crates/bloom-mempool/src/provider.rs`
 
 - [ ] **Step 1: Add the mock and a test that uses the conformance macro**
 
-Append to `crates/beth-mempool/src/provider.rs` (above the existing `#[cfg(test)]` block):
+Append to `crates/bloom-mempool/src/provider.rs` (above the existing `#[cfg(test)]` block):
 
 ```rust
 use futures::stream;
 
 /// In-memory mock that yields a fixed sequence of `PendingTx`s. Used
-/// by integration tests in this crate and by `beth-vfs` / `beth-tx`
+/// by integration tests in this crate and by `bloom-vfs` / `bloom-tx`
 /// integration suites.
 pub struct MockMempoolProvider {
     id: &'static str,
@@ -659,15 +659,15 @@ Now extend the existing `#[cfg(test)]` block to include the conformance suite in
 
 - [ ] **Step 2: Run tests to verify they pass**
 
-Run: `cargo test -p beth-mempool --lib provider::tests`
+Run: `cargo test -p bloom-mempool --lib provider::tests`
 Expected: at least 4 tests pass (the 3 from Task 1.2 + `mock_yields_fixture_items`).
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cargo fmt --all && cargo clippy -p beth-mempool --all-targets -- -D warnings
-git add crates/beth-mempool/src/provider.rs
-git commit -m "feat(beth-mempool): MockMempoolProvider fixture provider"
+cargo fmt --all && cargo clippy -p bloom-mempool --all-targets -- -D warnings
+git add crates/bloom-mempool/src/provider.rs
+git commit -m "feat(bloom-mempool): MockMempoolProvider fixture provider"
 ```
 
 ---
@@ -675,11 +675,11 @@ git commit -m "feat(beth-mempool): MockMempoolProvider fixture provider"
 ### Task 1.6: `PrivateRpcProvider` trait + error type
 
 **Files:**
-- Modify: `crates/beth-mempool/src/private.rs`
+- Modify: `crates/bloom-mempool/src/private.rs`
 
 - [ ] **Step 1: Replace stub with the trait, error, and chain constant**
 
-Replace `crates/beth-mempool/src/private.rs` with:
+Replace `crates/bloom-mempool/src/private.rs` with:
 
 ```rust
 //! Private orderflow — pluggable provider trait + mock for tests.
@@ -738,15 +738,15 @@ mod tests {
 
 - [ ] **Step 2: Verify it compiles**
 
-Run: `cargo build -p beth-mempool && cargo test -p beth-mempool --lib private::tests`
+Run: `cargo build -p bloom-mempool && cargo test -p bloom-mempool --lib private::tests`
 Expected: success; 1 test passes.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cargo fmt --all && cargo clippy -p beth-mempool --all-targets -- -D warnings
-git add crates/beth-mempool/src/private.rs
-git commit -m "feat(beth-mempool): PrivateRpcProvider trait + error types"
+cargo fmt --all && cargo clippy -p bloom-mempool --all-targets -- -D warnings
+git add crates/bloom-mempool/src/private.rs
+git commit -m "feat(bloom-mempool): PrivateRpcProvider trait + error types"
 ```
 
 ---
@@ -754,18 +754,18 @@ git commit -m "feat(beth-mempool): PrivateRpcProvider trait + error types"
 ### Task 1.7: `MockPrivateRpcProvider` (captures submitted txs)
 
 **Files:**
-- Modify: `crates/beth-mempool/src/private.rs`
+- Modify: `crates/bloom-mempool/src/private.rs`
 
 - [ ] **Step 1: Add the mock and a test**
 
-Append to `crates/beth-mempool/src/private.rs`:
+Append to `crates/bloom-mempool/src/private.rs`:
 
 ```rust
 use alloy::primitives::keccak256;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-/// Captures all submitted raw txs in memory. Used by `beth-tx`
+/// Captures all submitted raw txs in memory. Used by `bloom-tx`
 /// integration tests to assert that the broadcast routes correctly
 /// when a wallet has `private.enabled = true`.
 pub struct MockPrivateRpcProvider {
@@ -842,15 +842,15 @@ Extend the `#[cfg(test)]` block:
 
 - [ ] **Step 2: Run tests**
 
-Run: `cargo test -p beth-mempool --lib private::tests`
+Run: `cargo test -p bloom-mempool --lib private::tests`
 Expected: 3 tests pass.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cargo fmt --all && cargo clippy -p beth-mempool --all-targets -- -D warnings
-git add crates/beth-mempool/src/private.rs
-git commit -m "feat(beth-mempool): MockPrivateRpcProvider"
+cargo fmt --all && cargo clippy -p bloom-mempool --all-targets -- -D warnings
+git add crates/bloom-mempool/src/private.rs
+git commit -m "feat(bloom-mempool): MockPrivateRpcProvider"
 ```
 
 ---
@@ -858,21 +858,21 @@ git commit -m "feat(beth-mempool): MockPrivateRpcProvider"
 ### Task 1.8: MEV/sandwich heuristic + DEX router fixtures
 
 **Files:**
-- Modify: `crates/beth-mempool/src/heuristic.rs`
-- Create: `crates/beth-mempool/tests/fixtures/uniswap_v2_swap.hex`
-- Create: `crates/beth-mempool/tests/fixtures/uniswap_v2_zero_min.hex`
+- Modify: `crates/bloom-mempool/src/heuristic.rs`
+- Create: `crates/bloom-mempool/tests/fixtures/uniswap_v2_swap.hex`
+- Create: `crates/bloom-mempool/tests/fixtures/uniswap_v2_zero_min.hex`
 
 - [ ] **Step 1: Write the fixtures (hex calldata)**
 
 Build the fixtures from the Uniswap V2 router `swapExactTokensForTokens` selector `0x38ed1739` with hand-built args. Write two files:
 
-`crates/beth-mempool/tests/fixtures/uniswap_v2_swap.hex` — a swap where `amountIn = 1e18`, `amountOutMin = 95e16` (95% — 500 bps slippage), `path = [tokenA, tokenB]`, `to = 0x...`, `deadline = u64::MAX`. Use the existing `beth-tools` `abi.encode` helper at the REPL or generate via `cast calldata 'swapExactTokensForTokens(uint256,uint256,address[],address,uint256)' 1000000000000000000 950000000000000000 '[0x0000000000000000000000000000000000000001,0x0000000000000000000000000000000000000002]' 0x0000000000000000000000000000000000000003 18446744073709551615` and paste the resulting hex (without `0x`) into the file.
+`crates/bloom-mempool/tests/fixtures/uniswap_v2_swap.hex` — a swap where `amountIn = 1e18`, `amountOutMin = 95e16` (95% — 500 bps slippage), `path = [tokenA, tokenB]`, `to = 0x...`, `deadline = u64::MAX`. Use the existing `bloom-tools` `abi.encode` helper at the REPL or generate via `cast calldata 'swapExactTokensForTokens(uint256,uint256,address[],address,uint256)' 1000000000000000000 950000000000000000 '[0x0000000000000000000000000000000000000001,0x0000000000000000000000000000000000000002]' 0x0000000000000000000000000000000000000003 18446744073709551615` and paste the resulting hex (without `0x`) into the file.
 
-`crates/beth-mempool/tests/fixtures/uniswap_v2_zero_min.hex` — same but `amountOutMin = 0` and `amountIn = 5e18`.
+`crates/bloom-mempool/tests/fixtures/uniswap_v2_zero_min.hex` — same but `amountOutMin = 0` and `amountIn = 5e18`.
 
 - [ ] **Step 2: Write the failing test**
 
-Replace `crates/beth-mempool/src/heuristic.rs` with:
+Replace `crates/bloom-mempool/src/heuristic.rs` with:
 
 ```rust
 //! Stage-time MEV/sandwich heuristic. Pure function over a staged tx.
@@ -936,7 +936,7 @@ impl Default for HeuristicConfig {
 }
 
 /// Quote oracle — abstracted so tests can inject a deterministic
-/// quoter. Production wires this to `beth-prices` or a direct
+/// quoter. Production wires this to `bloom-prices` or a direct
 /// `eth_call` against a known quoter contract.
 pub trait QuoteOracle: Send + Sync {
     /// Returns the expected output amount for `amount_in` of `path[0]`
@@ -1078,15 +1078,15 @@ mod tests {
 
 - [ ] **Step 3: Run tests**
 
-Run: `cargo test -p beth-mempool --lib heuristic::tests`
+Run: `cargo test -p bloom-mempool --lib heuristic::tests`
 Expected: 4 tests pass. If fixture decoding fails, regenerate the hex using `cast calldata` (see Step 1) and check the file contains no trailing newline issues.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cargo fmt --all && cargo clippy -p beth-mempool --all-targets -- -D warnings
-git add crates/beth-mempool/src/heuristic.rs crates/beth-mempool/tests/fixtures/
-git commit -m "feat(beth-mempool): stage-time MEV/sandwich slippage heuristic"
+cargo fmt --all && cargo clippy -p bloom-mempool --all-targets -- -D warnings
+git add crates/bloom-mempool/src/heuristic.rs crates/bloom-mempool/tests/fixtures/
+git commit -m "feat(bloom-mempool): stage-time MEV/sandwich slippage heuristic"
 ```
 
 ---
@@ -1094,11 +1094,11 @@ git commit -m "feat(beth-mempool): stage-time MEV/sandwich slippage heuristic"
 ### Task 1.9: `bump::compute_replacement_fees` — EIP-1559 +12.5% math
 
 **Files:**
-- Modify: `crates/beth-mempool/src/bump.rs`
+- Modify: `crates/bloom-mempool/src/bump.rs`
 
 - [ ] **Step 1: Write the failing test first**
 
-Replace `crates/beth-mempool/src/bump.rs` with:
+Replace `crates/bloom-mempool/src/bump.rs` with:
 
 ```rust
 //! Gas-bump fee math (EIP-1559 MIN_REPLACEMENT_FEE_INCREASE = 12.5%).
@@ -1210,15 +1210,15 @@ mod tests {
 
 - [ ] **Step 2: Run tests**
 
-Run: `cargo test -p beth-mempool --lib bump::tests`
+Run: `cargo test -p bloom-mempool --lib bump::tests`
 Expected: 6 tests pass.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cargo fmt --all && cargo clippy -p beth-mempool --all-targets -- -D warnings
-git add crates/beth-mempool/src/bump.rs
-git commit -m "feat(beth-mempool): EIP-1559 +12.5%% replacement-fee math"
+cargo fmt --all && cargo clippy -p bloom-mempool --all-targets -- -D warnings
+git add crates/bloom-mempool/src/bump.rs
+git commit -m "feat(bloom-mempool): EIP-1559 +12.5%% replacement-fee math"
 ```
 
 ---
@@ -1232,27 +1232,27 @@ Produces the `chains/<chain>/mempool/` read tree and the new wallet-side artefac
 ### Task 2.1: `chains_mempool.rs` handler skeleton (status.json only)
 
 **Files:**
-- Create: `crates/beth-vfs/src/handlers/chains_mempool.rs`
-- Modify: `crates/beth-vfs/src/handlers/mod.rs`
-- Modify: `crates/beth-vfs/Cargo.toml` (add `beth-mempool` dep)
+- Create: `crates/bloom-vfs/src/handlers/chains_mempool.rs`
+- Modify: `crates/bloom-vfs/src/handlers/mod.rs`
+- Modify: `crates/bloom-vfs/Cargo.toml` (add `bloom-mempool` dep)
 
 - [ ] **Step 1: Add the dependency**
 
-In `crates/beth-vfs/Cargo.toml`, under `[dependencies]`, add:
+In `crates/bloom-vfs/Cargo.toml`, under `[dependencies]`, add:
 
 ```toml
-beth-mempool.workspace = true
+bloom-mempool.workspace = true
 ```
 
 And in the workspace `Cargo.toml` `[workspace.dependencies]`:
 
 ```toml
-beth-mempool = { path = "crates/beth-mempool" }
+bloom-mempool = { path = "crates/bloom-mempool" }
 ```
 
 - [ ] **Step 2: Add module declaration**
 
-In `crates/beth-vfs/src/handlers/mod.rs`, add (alphabetically among existing `pub mod` lines):
+In `crates/bloom-vfs/src/handlers/mod.rs`, add (alphabetically among existing `pub mod` lines):
 
 ```rust
 pub mod chains_mempool;
@@ -1260,17 +1260,17 @@ pub mod chains_mempool;
 
 - [ ] **Step 3: Write the failing test first (in-crate integration test)**
 
-Create `crates/beth-vfs/src/handlers/chains_mempool.rs`:
+Create `crates/bloom-vfs/src/handlers/chains_mempool.rs`:
 
 ```rust
 //! Handler for `chains/<chain>/mempool/...`. Backed by a
-//! `MempoolStream` from `beth-mempool` (or a `MockMempoolProvider`
+//! `MempoolStream` from `bloom-mempool` (or a `MockMempoolProvider`
 //! in tests).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use beth_mempool::{PendingTxIndex, PendingTx};
+use bloom_mempool::{PendingTxIndex, PendingTx};
 use serde::{Deserialize, Serialize};
 
 use crate::handler::{Entry, Handler, HandlerError};
@@ -1404,19 +1404,19 @@ mod tests {
 }
 ```
 
-If `VfsPath::parse` doesn't exist under that name, check `crates/beth-vfs/src/path.rs` for the correct constructor — likely `VfsPath::from_str` or `try_from`. Use whichever the existing handlers use (grep `crates/beth-vfs/src/handlers/chains.rs` for `VfsPath::` to confirm).
+If `VfsPath::parse` doesn't exist under that name, check `crates/bloom-vfs/src/path.rs` for the correct constructor — likely `VfsPath::from_str` or `try_from`. Use whichever the existing handlers use (grep `crates/bloom-vfs/src/handlers/chains.rs` for `VfsPath::` to confirm).
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test -p beth-vfs --lib handlers::chains_mempool::tests`
+Run: `cargo test -p bloom-vfs --lib handlers::chains_mempool::tests`
 Expected: 2 tests pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cargo fmt --all && cargo clippy -p beth-vfs --all-targets -- -D warnings
-git add crates/beth-vfs/Cargo.toml crates/beth-vfs/src/handlers/mod.rs crates/beth-vfs/src/handlers/chains_mempool.rs Cargo.toml
-git commit -m "feat(beth-vfs): chains_mempool handler skeleton with status.json"
+cargo fmt --all && cargo clippy -p bloom-vfs --all-targets -- -D warnings
+git add crates/bloom-vfs/Cargo.toml crates/bloom-vfs/src/handlers/mod.rs crates/bloom-vfs/src/handlers/chains_mempool.rs Cargo.toml
+git commit -m "feat(bloom-vfs): chains_mempool handler skeleton with status.json"
 ```
 
 ---
@@ -1424,7 +1424,7 @@ git commit -m "feat(beth-vfs): chains_mempool handler skeleton with status.json"
 ### Task 2.2: `recent.jsonl` ring buffer
 
 **Files:**
-- Modify: `crates/beth-vfs/src/handlers/chains_mempool.rs`
+- Modify: `crates/bloom-vfs/src/handlers/chains_mempool.rs`
 
 - [ ] **Step 1: Extend the handler with a ring buffer**
 
@@ -1497,7 +1497,7 @@ Add to the `tests` module:
 
 ```rust
     use alloy::primitives::{Address, B256, Bytes, U256};
-    use beth_mempool::{PendingTx, TxFees};
+    use bloom_mempool::{PendingTx, TxFees};
 
     fn fixture_tx(hash_byte: u8) -> PendingTx {
         let mut h = [0u8; 32];
@@ -1533,15 +1533,15 @@ Add to the `tests` module:
 
 - [ ] **Step 3: Run tests**
 
-Run: `cargo test -p beth-vfs --lib handlers::chains_mempool::tests`
+Run: `cargo test -p bloom-vfs --lib handlers::chains_mempool::tests`
 Expected: 3 tests pass.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cargo fmt --all && cargo clippy -p beth-vfs --all-targets -- -D warnings
-git add crates/beth-vfs/src/handlers/chains_mempool.rs
-git commit -m "feat(beth-vfs): chains_mempool recent.jsonl ring buffer"
+cargo fmt --all && cargo clippy -p bloom-vfs --all-targets -- -D warnings
+git add crates/bloom-vfs/src/handlers/chains_mempool.rs
+git commit -m "feat(bloom-vfs): chains_mempool recent.jsonl ring buffer"
 ```
 
 ---
@@ -1549,7 +1549,7 @@ git commit -m "feat(beth-vfs): chains_mempool recent.jsonl ring buffer"
 ### Task 2.3: `live` long-poll tail
 
 **Files:**
-- Modify: `crates/beth-vfs/src/handlers/chains_mempool.rs`
+- Modify: `crates/bloom-vfs/src/handlers/chains_mempool.rs`
 
 - [ ] **Step 1: Add a broadcast sender to the handler**
 
@@ -1661,15 +1661,15 @@ Add:
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test -p beth-vfs --lib handlers::chains_mempool::tests`
+Run: `cargo test -p bloom-vfs --lib handlers::chains_mempool::tests`
 Expected: 4 tests pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-cargo fmt --all && cargo clippy -p beth-vfs --all-targets -- -D warnings
-git add crates/beth-vfs/src/handlers/chains_mempool.rs
-git commit -m "feat(beth-vfs): chains_mempool live long-poll tail"
+cargo fmt --all && cargo clippy -p bloom-vfs --all-targets -- -D warnings
+git add crates/bloom-vfs/src/handlers/chains_mempool.rs
+git commit -m "feat(bloom-vfs): chains_mempool live long-poll tail"
 ```
 
 ---
@@ -1677,7 +1677,7 @@ git commit -m "feat(beth-vfs): chains_mempool live long-poll tail"
 ### Task 2.4: `by_address/<addr>/{pending.jsonl, nonces.json}`
 
 **Files:**
-- Modify: `crates/beth-vfs/src/handlers/chains_mempool.rs`
+- Modify: `crates/bloom-vfs/src/handlers/chains_mempool.rs`
 
 - [ ] **Step 1: Add read branches**
 
@@ -1768,15 +1768,15 @@ Confirm the alloy `Address` `Debug` impl prints in `0x…` form; if not, use `fo
 
 - [ ] **Step 3: Run tests**
 
-Run: `cargo test -p beth-vfs --lib handlers::chains_mempool::tests`
+Run: `cargo test -p bloom-vfs --lib handlers::chains_mempool::tests`
 Expected: 6 tests pass.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cargo fmt --all && cargo clippy -p beth-vfs --all-targets -- -D warnings
-git add crates/beth-vfs/src/handlers/chains_mempool.rs
-git commit -m "feat(beth-vfs): chains_mempool by_address/<a>/{pending,nonces}"
+cargo fmt --all && cargo clippy -p bloom-vfs --all-targets -- -D warnings
+git add crates/bloom-vfs/src/handlers/chains_mempool.rs
+git commit -m "feat(bloom-vfs): chains_mempool by_address/<a>/{pending,nonces}"
 ```
 
 ---
@@ -1784,12 +1784,12 @@ git commit -m "feat(beth-vfs): chains_mempool by_address/<a>/{pending,nonces}"
 ### Task 2.5: `by_pool/<addr>/recent.jsonl`
 
 **Files:**
-- Modify: `crates/beth-vfs/src/handlers/chains_mempool.rs`
-- Modify: `crates/beth-mempool/src/heuristic.rs` (export the swap-decode helper)
+- Modify: `crates/bloom-vfs/src/handlers/chains_mempool.rs`
+- Modify: `crates/bloom-mempool/src/heuristic.rs` (export the swap-decode helper)
 
-- [ ] **Step 1: Export a helper in `beth-mempool` that extracts the `path`/router target**
+- [ ] **Step 1: Export a helper in `bloom-mempool` that extracts the `path`/router target**
 
-In `crates/beth-mempool/src/heuristic.rs`, add (above `evaluate`):
+In `crates/bloom-mempool/src/heuristic.rs`, add (above `evaluate`):
 
 ```rust
 /// If the calldata decodes as a known DEX swap, return the addresses
@@ -1830,7 +1830,7 @@ In `chains_mempool.rs` `read()`:
                 let mut out = Vec::new();
                 for it in &items {
                     let to_match = it.to == Some(pool);
-                    let path_match = beth_mempool::heuristic::decode_swap_path(&it.input)
+                    let path_match = bloom_mempool::heuristic::decode_swap_path(&it.input)
                         .map(|p| p.contains(&pool))
                         .unwrap_or(false);
                     if to_match || path_match {
@@ -1843,7 +1843,7 @@ In `chains_mempool.rs` `read()`:
             }
 ```
 
-Also re-export `heuristic` in `beth-mempool/src/lib.rs`:
+Also re-export `heuristic` in `bloom-mempool/src/lib.rs`:
 
 ```rust
 pub use heuristic::{HeuristicConfig, MevRisk, MevRiskReport, QuoteOracle, StaticQuoter, evaluate, decode_swap_path};
@@ -1863,7 +1863,7 @@ Add to `chains_mempool.rs` tests:
         let mut t = fixture_tx(1);
         t.input = Bytes::from(
             hex::decode(
-                std::fs::read_to_string("../beth-mempool/tests/fixtures/uniswap_v2_swap.hex")
+                std::fs::read_to_string("../bloom-mempool/tests/fixtures/uniswap_v2_swap.hex")
                     .unwrap()
                     .trim(),
             )
@@ -1878,19 +1878,19 @@ Add to `chains_mempool.rs` tests:
     }
 ```
 
-If `hex` isn't already a dev-dep in `beth-vfs`, add it. The fixture path relative to the crate root may need adjusting (run `cargo test` and follow the error).
+If `hex` isn't already a dev-dep in `bloom-vfs`, add it. The fixture path relative to the crate root may need adjusting (run `cargo test` and follow the error).
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test -p beth-vfs --lib handlers::chains_mempool::tests && cargo test -p beth-mempool --lib heuristic::tests`
+Run: `cargo test -p bloom-vfs --lib handlers::chains_mempool::tests && cargo test -p bloom-mempool --lib heuristic::tests`
 Expected: 7 + 5 tests pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
-git add crates/beth-mempool/src/heuristic.rs crates/beth-mempool/src/lib.rs crates/beth-vfs/src/handlers/chains_mempool.rs crates/beth-vfs/Cargo.toml
-git commit -m "feat(beth-vfs): chains_mempool by_pool/<addr>/recent.jsonl"
+git add crates/bloom-mempool/src/heuristic.rs crates/bloom-mempool/src/lib.rs crates/bloom-vfs/src/handlers/chains_mempool.rs crates/bloom-vfs/Cargo.toml
+git commit -m "feat(bloom-vfs): chains_mempool by_pool/<addr>/recent.jsonl"
 ```
 
 ---
@@ -1898,7 +1898,7 @@ git commit -m "feat(beth-vfs): chains_mempool by_pool/<addr>/recent.jsonl"
 ### Task 2.6: `<tx_hash>/{tx.json, decoded.json, status}`
 
 **Files:**
-- Modify: `crates/beth-vfs/src/handlers/chains_mempool.rs`
+- Modify: `crates/bloom-vfs/src/handlers/chains_mempool.rs`
 
 - [ ] **Step 1: Add JIT directory entries + read branches**
 
@@ -1934,7 +1934,7 @@ In `read()`, after existing branches, add:
                     "tx.json" => Ok(serde_json::to_vec_pretty(&rec.tx)
                         .map_err(|e| HandlerError::backend(e.to_string()))?),
                     "decoded.json" => {
-                        let decoded = beth_mempool::decode_swap_path(&rec.tx.input)
+                        let decoded = bloom_mempool::decode_swap_path(&rec.tx.input)
                             .map(|p| serde_json::json!({"kind": "swap", "path": p}))
                             .unwrap_or(serde_json::Value::Null);
                         Ok(serde_json::to_vec_pretty(&decoded)
@@ -1994,15 +1994,15 @@ fn parse_hash(s: &str) -> Result<alloy::primitives::B256, HandlerError> {
 
 - [ ] **Step 3: Run tests**
 
-Run: `cargo test -p beth-vfs --lib handlers::chains_mempool::tests`
+Run: `cargo test -p bloom-vfs --lib handlers::chains_mempool::tests`
 Expected: 9 tests pass.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cargo fmt --all && cargo clippy -p beth-vfs --all-targets -- -D warnings
-git add crates/beth-vfs/src/handlers/chains_mempool.rs
-git commit -m "feat(beth-vfs): chains_mempool <hash>/{tx,decoded,status}"
+cargo fmt --all && cargo clippy -p bloom-vfs --all-targets -- -D warnings
+git add crates/bloom-vfs/src/handlers/chains_mempool.rs
+git commit -m "feat(bloom-vfs): chains_mempool <hash>/{tx,decoded,status}"
 ```
 
 ---
@@ -2010,19 +2010,19 @@ git commit -m "feat(beth-vfs): chains_mempool <hash>/{tx,decoded,status}"
 ### Task 2.7: `wallets/<w>/chains/<c>/pending_external.jsonl` and `nonce_conflicts.json`
 
 **Files:**
-- Modify: `crates/beth-vfs/src/handlers/wallets.rs`
+- Modify: `crates/bloom-vfs/src/handlers/wallets.rs`
 - Test: same file (inline)
 
 - [ ] **Step 1: Locate the existing wallet/chain handler**
 
-Read `crates/beth-vfs/src/handlers/wallets.rs` to find the `match` arm that serves `wallets/<w>/chains/<c>/...`. The new branches go alongside `balance`, `nonce`, `activity/recent.jsonl`.
+Read `crates/bloom-vfs/src/handlers/wallets.rs` to find the `match` arm that serves `wallets/<w>/chains/<c>/...`. The new branches go alongside `balance`, `nonce`, `activity/recent.jsonl`.
 
 - [ ] **Step 2: Add a constructor parameter that takes the per-chain `PendingTxIndex`**
 
 The `WalletsHandler` struct (or whatever it's called — check the file) needs access to the per-chain index. Add a field:
 
 ```rust
-    mempool_indexes: std::collections::BTreeMap<String, std::sync::Arc<beth_mempool::PendingTxIndex>>,
+    mempool_indexes: std::collections::BTreeMap<String, std::sync::Arc<bloom_mempool::PendingTxIndex>>,
 ```
 
 Constructor signature gets an additional argument; default is an empty map. Update the daemon-side wiring in Phase 3 / Phase 4.
@@ -2093,15 +2093,15 @@ Fill in the body using the same setup pattern as the existing test (likely invol
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test -p beth-vfs --lib && cargo test -p beth-mempool --lib`
+Run: `cargo test -p bloom-vfs --lib && cargo test -p bloom-mempool --lib`
 Expected: all green.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
-git add crates/beth-mempool/src/index.rs crates/beth-vfs/src/handlers/wallets.rs
-git commit -m "feat(beth-vfs): wallet pending_external + nonce_conflicts views"
+git add crates/bloom-mempool/src/index.rs crates/bloom-vfs/src/handlers/wallets.rs
+git commit -m "feat(bloom-vfs): wallet pending_external + nonce_conflicts views"
 ```
 
 ---
@@ -2109,11 +2109,11 @@ git commit -m "feat(beth-vfs): wallet pending_external + nonce_conflicts views"
 ### Task 2.8: `status/backends/mempool` and `status/backends/private_rpc`
 
 **Files:**
-- Modify: `crates/beth-vfs/src/handlers/status.rs`
+- Modify: `crates/bloom-vfs/src/handlers/status.rs`
 
 - [ ] **Step 1: Locate the existing status/backends handler**
 
-Read `crates/beth-vfs/src/handlers/status.rs` to find the existing backend declaration leaves (`contract_metadata`, `address_history`, `event_logs`, `storage_reads`, `proxy_detection`). The new leaves go alongside.
+Read `crates/bloom-vfs/src/handlers/status.rs` to find the existing backend declaration leaves (`contract_metadata`, `address_history`, `event_logs`, `storage_reads`, `proxy_detection`). The new leaves go alongside.
 
 - [ ] **Step 2: Add data sources**
 
@@ -2182,15 +2182,15 @@ Mirror the existing tests in `status.rs` — find one that exercises `backends/c
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test -p beth-vfs --lib handlers::status::tests`
+Run: `cargo test -p bloom-vfs --lib handlers::status::tests`
 Expected: existing tests still pass + new tests pass.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-cargo fmt --all && cargo clippy -p beth-vfs --all-targets -- -D warnings
-git add crates/beth-vfs/src/handlers/status.rs
-git commit -m "feat(beth-vfs): status/backends/{mempool,private_rpc} + status/private_rpc/<p>"
+cargo fmt --all && cargo clippy -p bloom-vfs --all-targets -- -D warnings
+git add crates/bloom-vfs/src/handlers/status.rs
+git commit -m "feat(bloom-vfs): status/backends/{mempool,private_rpc} + status/private_rpc/<p>"
 ```
 
 ---
@@ -2204,13 +2204,13 @@ Wires the new logic into `tx_engine::stage`, `tx_engine::broadcast`, and adds th
 ### Task 3.1: Policy schema additions
 
 **Files:**
-- Modify: `crates/beth-tx/src/policy_engine.rs`
-- Modify: `crates/beth-proto/src/...` (where `Policy` struct lives)
+- Modify: `crates/bloom-tx/src/policy_engine.rs`
+- Modify: `crates/bloom-proto/src/...` (where `Policy` struct lives)
 
 - [ ] **Step 1: Locate Policy struct**
 
 ```bash
-grep -rn "pub struct Policy" crates/beth-proto/src/
+grep -rn "pub struct Policy" crates/bloom-proto/src/
 ```
 
 - [ ] **Step 2: Add the new fields with backward-compatible defaults**
@@ -2319,15 +2319,15 @@ basefee_overrun_pct = 50
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test -p beth-proto --lib && cargo test -p beth-tx --lib`
+Run: `cargo test -p bloom-proto --lib && cargo test -p bloom-tx --lib`
 Expected: existing tests still pass + new tests pass.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
-git add crates/beth-proto/ crates/beth-tx/src/policy_engine.rs
-git commit -m "feat(beth-proto): policy [private] [mev] [bump] schema"
+git add crates/bloom-proto/ crates/bloom-tx/src/policy_engine.rs
+git commit -m "feat(bloom-proto): policy [private] [mev] [bump] schema"
 ```
 
 ---
@@ -2335,12 +2335,12 @@ git commit -m "feat(beth-proto): policy [private] [mev] [bump] schema"
 ### Task 3.2: Nonce-conflict check in `tx_engine::stage`
 
 **Files:**
-- Modify: `crates/beth-tx/src/tx_engine.rs`
-- Modify: `crates/beth-tx/Cargo.toml`
+- Modify: `crates/bloom-tx/src/tx_engine.rs`
+- Modify: `crates/bloom-tx/Cargo.toml`
 
 - [ ] **Step 1: Add the dependency**
 
-In `crates/beth-tx/Cargo.toml`, add `beth-mempool.workspace = true` under `[dependencies]`.
+In `crates/bloom-tx/Cargo.toml`, add `bloom-mempool.workspace = true` under `[dependencies]`.
 
 - [ ] **Step 2: Add an optional `PendingTxIndex` parameter to `stage`**
 
@@ -2352,7 +2352,7 @@ In `TxEngine`'s definition (search for `impl TxEngine`):
 pub struct TxEngine {
     // ... existing fields
     mempool_indexes: parking_lot::RwLock<
-        std::collections::BTreeMap<String, std::sync::Arc<beth_mempool::PendingTxIndex>>,
+        std::collections::BTreeMap<String, std::sync::Arc<bloom_mempool::PendingTxIndex>>,
     >,
 }
 ```
@@ -2360,14 +2360,14 @@ pub struct TxEngine {
 Add a setter:
 
 ```rust
-    pub fn set_mempool_index(&self, chain: impl Into<String>, idx: std::sync::Arc<beth_mempool::PendingTxIndex>) {
+    pub fn set_mempool_index(&self, chain: impl Into<String>, idx: std::sync::Arc<bloom_mempool::PendingTxIndex>) {
         self.mempool_indexes.write().insert(chain.into(), idx);
     }
 ```
 
 - [ ] **Step 3: Add a `NonceConflict` artefact writer in `outbox`**
 
-In `crates/beth-tx/src/outbox.rs`, add a method to `Outbox` that writes `pending/<id>/nonce_conflict.json`:
+In `crates/bloom-tx/src/outbox.rs`, add a method to `Outbox` that writes `pending/<id>/nonce_conflict.json`:
 
 ```rust
     pub fn write_nonce_conflict(
@@ -2429,12 +2429,12 @@ You will need to thread the `staged_id` into a position where the conflict file 
 
 - [ ] **Step 5: Write the failing test**
 
-In `crates/beth-tx/src/tx_engine.rs` (the inline `#[cfg(test)]` block at the bottom of the file):
+In `crates/bloom-tx/src/tx_engine.rs` (the inline `#[cfg(test)]` block at the bottom of the file):
 
 ```rust
     #[tokio::test]
     async fn stage_writes_nonce_conflict_when_index_has_same_addr_nonce() {
-        use beth_mempool::{PendingTx, PendingTxIndex, TxFees};
+        use bloom_mempool::{PendingTx, PendingTxIndex, TxFees};
         use alloy::primitives::{Bytes, U256};
         // Existing test scaffolding lives in this file — search for an
         // existing test that calls `engine.stage(...)` and copy its
@@ -2475,15 +2475,15 @@ Find `make_engine_for_test` / `make_send_eth_intent` analogues in the existing f
 
 - [ ] **Step 6: Run tests**
 
-Run: `cargo test -p beth-tx --lib tx_engine::tests::stage_writes_nonce_conflict`
+Run: `cargo test -p bloom-tx --lib tx_engine::tests::stage_writes_nonce_conflict`
 Expected: passes.
 
 - [ ] **Step 7: Commit**
 
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
-git add crates/beth-tx/
-git commit -m "feat(beth-tx): nonce-conflict detection in stage via PendingTxIndex"
+git add crates/bloom-tx/
+git commit -m "feat(bloom-tx): nonce-conflict detection in stage via PendingTxIndex"
 ```
 
 ---
@@ -2491,12 +2491,12 @@ git commit -m "feat(beth-tx): nonce-conflict detection in stage via PendingTxInd
 ### Task 3.3: MEV heuristic call in `tx_engine::stage`
 
 **Files:**
-- Modify: `crates/beth-tx/src/tx_engine.rs`
-- Modify: `crates/beth-tx/src/outbox.rs`
+- Modify: `crates/bloom-tx/src/tx_engine.rs`
+- Modify: `crates/bloom-tx/src/outbox.rs`
 
 - [ ] **Step 1: Add `write_mev_risk` to Outbox**
 
-In `crates/beth-tx/src/outbox.rs`:
+In `crates/bloom-tx/src/outbox.rs`:
 
 ```rust
     pub fn write_mev_risk(
@@ -2504,7 +2504,7 @@ In `crates/beth-tx/src/outbox.rs`:
         wallet: &str,
         chain: &str,
         id: &str,
-        report: &beth_mempool::MevRiskReport,
+        report: &bloom_mempool::MevRiskReport,
     ) -> Result<(), OutboxError> {
         let dir = self.pending_dir(wallet, chain, id);
         std::fs::create_dir_all(&dir)?;
@@ -2514,7 +2514,7 @@ In `crates/beth-tx/src/outbox.rs`:
     }
 ```
 
-- [ ] **Step 2: Add a `QuoteOracle` adapter that uses `beth-prices` + a chain client**
+- [ ] **Step 2: Add a `QuoteOracle` adapter that uses `bloom-prices` + a chain client**
 
 Inside `tx_engine.rs`:
 
@@ -2523,7 +2523,7 @@ struct EthCallQuoteOracle<'a> {
     chain: &'a ChainClient,
 }
 
-impl<'a> beth_mempool::QuoteOracle for EthCallQuoteOracle<'a> {
+impl<'a> bloom_mempool::QuoteOracle for EthCallQuoteOracle<'a> {
     fn quote(&self, _amount_in: alloy::primitives::U256, _path: &[alloy::primitives::Address]) -> Option<alloy::primitives::U256> {
         // v1: best-effort — return None until the chain quoter contract
         // address is wired in via config. The heuristic treats None as
@@ -2540,18 +2540,18 @@ This is intentionally a stub for Phase 3; a follow-up task (Phase 4 final or fol
 After the existing simulate step, before `outbox.write_pending`:
 
 ```rust
-        let mev_cfg = beth_mempool::HeuristicConfig {
+        let mev_cfg = bloom_mempool::HeuristicConfig {
             max_slippage_bps: policy.mev.max_slippage_bps,
             zero_min_amount_in_threshold: alloy::primitives::U256::from(10u64).pow(alloy::primitives::U256::from(18u64)),
         };
         let quoter = EthCallQuoteOracle { chain };
-        let mev_report = beth_mempool::heuristic::evaluate(
+        let mev_report = bloom_mempool::heuristic::evaluate(
             &alloy::primitives::Bytes::from(decode_data(&data_hex).unwrap_or_default()),
             value_wei,
             &mev_cfg,
             &quoter,
         );
-        if policy.mev.fail_on_high_risk && matches!(mev_report.risk, beth_mempool::MevRisk::High) {
+        if policy.mev.fail_on_high_risk && matches!(mev_report.risk, bloom_mempool::MevRisk::High) {
             return Err(TxEngineError::PolicyDenied(format!(
                 "mev heuristic risk=high: {}",
                 mev_report.advice
@@ -2589,15 +2589,15 @@ Fill in with the patterns from existing stage tests.
 
 - [ ] **Step 5: Run tests**
 
-Run: `cargo test -p beth-tx --lib`
+Run: `cargo test -p bloom-tx --lib`
 Expected: green.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
-git add crates/beth-tx/
-git commit -m "feat(beth-tx): MEV heuristic at stage time, writes mev_risk.json"
+git add crates/bloom-tx/
+git commit -m "feat(bloom-tx): MEV heuristic at stage time, writes mev_risk.json"
 ```
 
 ---
@@ -2605,13 +2605,13 @@ git commit -m "feat(beth-tx): MEV heuristic at stage time, writes mev_risk.json"
 ### Task 3.4: Private routing in `tx_engine::broadcast`
 
 **Files:**
-- Modify: `crates/beth-tx/src/tx_engine.rs`
+- Modify: `crates/bloom-tx/src/tx_engine.rs`
 
 - [ ] **Step 1: Add the private-RPC registry to `TxEngine`**
 
 ```rust
     private_rpcs: parking_lot::RwLock<
-        std::collections::BTreeMap<(u64, String), std::sync::Arc<dyn beth_mempool::PrivateRpcProvider>>,
+        std::collections::BTreeMap<(u64, String), std::sync::Arc<dyn bloom_mempool::PrivateRpcProvider>>,
     >,
 ```
 
@@ -2621,7 +2621,7 @@ Setter:
     pub fn register_private_rpc(
         &self,
         chain_id: u64,
-        provider: std::sync::Arc<dyn beth_mempool::PrivateRpcProvider>,
+        provider: std::sync::Arc<dyn bloom_mempool::PrivateRpcProvider>,
     ) {
         self.private_rpcs
             .write()
@@ -2635,7 +2635,7 @@ Locate the existing `broadcast` (or wherever `send_raw` is called) and add:
 
 ```rust
         let chain_id = chain.chain_id().await?;
-        let hash = if policy.private.enabled && chain_id == beth_mempool::MAINNET_CHAIN_ID {
+        let hash = if policy.private.enabled && chain_id == bloom_mempool::MAINNET_CHAIN_ID {
             let map = self.private_rpcs.read();
             let provider = map.get(&(chain_id, policy.private.provider.clone()))
                 .cloned()
@@ -2666,7 +2666,7 @@ Add error variants:
 ```rust
     #[tokio::test]
     async fn broadcast_routes_private_when_policy_enabled_on_mainnet() {
-        use beth_mempool::MockPrivateRpcProvider;
+        use bloom_mempool::MockPrivateRpcProvider;
         let (engine, chain, wallet, from) = make_engine_for_test_on_mainnet().await;
         let mock = std::sync::Arc::new(MockPrivateRpcProvider::new("mev_blocker"));
         engine.register_private_rpc(1, mock.clone());
@@ -2690,15 +2690,15 @@ Use the existing broadcast test as a template (search `async fn` in the test mod
 
 - [ ] **Step 4: Run tests**
 
-Run: `cargo test -p beth-tx --lib`
+Run: `cargo test -p bloom-tx --lib`
 Expected: green.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
-git add crates/beth-tx/
-git commit -m "feat(beth-tx): private routing via PrivateRpcProvider in broadcast"
+git add crates/bloom-tx/
+git commit -m "feat(bloom-tx): private routing via PrivateRpcProvider in broadcast"
 ```
 
 ---
@@ -2706,12 +2706,12 @@ git commit -m "feat(beth-tx): private routing via PrivateRpcProvider in broadcas
 ### Task 3.5: `BumpScanner` background task
 
 **Files:**
-- Create: `crates/beth-tx/src/bump_scanner.rs`
-- Modify: `crates/beth-tx/src/lib.rs`
+- Create: `crates/bloom-tx/src/bump_scanner.rs`
+- Modify: `crates/bloom-tx/src/lib.rs`
 
 - [ ] **Step 1: Write the scanner**
 
-Create `crates/beth-tx/src/bump_scanner.rs`:
+Create `crates/bloom-tx/src/bump_scanner.rs`:
 
 ```rust
 //! Background scanner: walks outbox/sent/<hash>/ entries, identifies
@@ -2720,7 +2720,7 @@ Create `crates/beth-tx/src/bump_scanner.rs`:
 use std::sync::Arc;
 use std::time::Duration;
 
-use beth_mempool::{PendingTxIndex, TxFees};
+use bloom_mempool::{PendingTxIndex, TxFees};
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 
@@ -2799,7 +2799,7 @@ impl BumpScanner {
             return Ok(());
         }
 
-        let bumped = beth_mempool::bump::compute_replacement_fees(entry.fees);
+        let bumped = bloom_mempool::bump::compute_replacement_fees(entry.fees);
         let bump_tx = serde_json::json!({
             "to": entry.to,
             "value": entry.value,
@@ -2855,7 +2855,7 @@ impl BumpScanner {
 }
 ```
 
-Add `pub mod bump_scanner;` and `pub use bump_scanner::*;` to `crates/beth-tx/src/lib.rs`.
+Add `pub mod bump_scanner;` and `pub use bump_scanner::*;` to `crates/bloom-tx/src/lib.rs`.
 
 You will need to add `walk_all_sent`, `write_sent_sibling`, and a `SentEntry` struct to `outbox.rs`:
 
@@ -2870,7 +2870,7 @@ pub struct SentEntry {
     pub value: alloy::primitives::U256,
     pub data: String,
     pub nonce: u64,
-    pub fees: beth_mempool::TxFees,
+    pub fees: bloom_mempool::TxFees,
     pub sent_at: std::time::SystemTime,
     pub mined: Option<u64>,
 }
@@ -2950,15 +2950,15 @@ You will need to write the `seed_sent_entry` and `seeded_hash` helpers — they 
 
 - [ ] **Step 3: Run tests**
 
-Run: `cargo test -p beth-tx --lib bump_scanner`
+Run: `cargo test -p bloom-tx --lib bump_scanner`
 Expected: green.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
-git add crates/beth-tx/
-git commit -m "feat(beth-tx): BumpScanner background task with bump.tx + cancel.tx artefacts"
+git add crates/bloom-tx/
+git commit -m "feat(bloom-tx): BumpScanner background task with bump.tx + cancel.tx artefacts"
 ```
 
 ---
@@ -2972,13 +2972,13 @@ Replaces the mocks from Phase 1 with real adapters: Alchemy + generic eth_subscr
 ### Task 4.1: `AlchemyProvider`
 
 **Files:**
-- Create: `crates/beth-mempool/src/providers/alchemy.rs`
-- Create: `crates/beth-mempool/src/providers/mod.rs`
-- Modify: `crates/beth-mempool/src/lib.rs`
+- Create: `crates/bloom-mempool/src/providers/alchemy.rs`
+- Create: `crates/bloom-mempool/src/providers/mod.rs`
+- Modify: `crates/bloom-mempool/src/lib.rs`
 
 - [ ] **Step 1: Add the providers module**
 
-Create `crates/beth-mempool/src/providers/mod.rs`:
+Create `crates/bloom-mempool/src/providers/mod.rs`:
 
 ```rust
 //! Real `MempoolProvider` adapters. Each is feature-gated.
@@ -2990,11 +2990,11 @@ pub mod alchemy;
 pub mod generic_eth_subscribe;
 ```
 
-Add `pub mod providers;` to `crates/beth-mempool/src/lib.rs`.
+Add `pub mod providers;` to `crates/bloom-mempool/src/lib.rs`.
 
 - [ ] **Step 2: Implement `AlchemyProvider`**
 
-Create `crates/beth-mempool/src/providers/alchemy.rs`:
+Create `crates/bloom-mempool/src/providers/alchemy.rs`:
 
 ```rust
 //! Alchemy mempool provider — subscribes via WebSocket to
@@ -3117,15 +3117,15 @@ mod tests {
 
 - [ ] **Step 3: Run tests**
 
-Run: `cargo test -p beth-mempool --features alchemy --lib providers::alchemy::tests`
+Run: `cargo test -p bloom-mempool --features alchemy --lib providers::alchemy::tests`
 Expected: pass.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cargo fmt --all && cargo clippy -p beth-mempool --all-targets -- -D warnings
-git add crates/beth-mempool/src/providers/
-git commit -m "feat(beth-mempool): AlchemyProvider for alchemy_pendingTransactions"
+cargo fmt --all && cargo clippy -p bloom-mempool --all-targets -- -D warnings
+git add crates/bloom-mempool/src/providers/
+git commit -m "feat(bloom-mempool): AlchemyProvider for alchemy_pendingTransactions"
 ```
 
 ---
@@ -3133,7 +3133,7 @@ git commit -m "feat(beth-mempool): AlchemyProvider for alchemy_pendingTransactio
 ### Task 4.2: `GenericEthSubscribeProvider`
 
 **Files:**
-- Create: `crates/beth-mempool/src/providers/generic_eth_subscribe.rs`
+- Create: `crates/bloom-mempool/src/providers/generic_eth_subscribe.rs`
 
 - [ ] **Step 1: Implement the provider**
 
@@ -3228,10 +3228,10 @@ mod tests {
 - [ ] **Step 3: Run tests + commit**
 
 ```bash
-cargo test -p beth-mempool --features generic_eth_subscribe --lib providers::generic_eth_subscribe
-cargo fmt --all && cargo clippy -p beth-mempool --all-targets -- -D warnings
-git add crates/beth-mempool/src/providers/generic_eth_subscribe.rs crates/beth-mempool/src/providers/mod.rs
-git commit -m "feat(beth-mempool): GenericEthSubscribeProvider (hashes-only)"
+cargo test -p bloom-mempool --features generic_eth_subscribe --lib providers::generic_eth_subscribe
+cargo fmt --all && cargo clippy -p bloom-mempool --all-targets -- -D warnings
+git add crates/bloom-mempool/src/providers/generic_eth_subscribe.rs crates/bloom-mempool/src/providers/mod.rs
+git commit -m "feat(bloom-mempool): GenericEthSubscribeProvider (hashes-only)"
 ```
 
 ---
@@ -3239,8 +3239,8 @@ git commit -m "feat(beth-mempool): GenericEthSubscribeProvider (hashes-only)"
 ### Task 4.3: `MevBlockerProvider`
 
 **Files:**
-- Create: `crates/beth-mempool/src/providers/mev_blocker.rs`
-- Modify: `crates/beth-mempool/src/providers/mod.rs`
+- Create: `crates/bloom-mempool/src/providers/mev_blocker.rs`
+- Modify: `crates/bloom-mempool/src/providers/mod.rs`
 
 - [ ] **Step 1: Add gating + implementation**
 
@@ -3352,10 +3352,10 @@ If `alloy::primitives::FromHexError` is not the actual error type returned by `<
 - [ ] **Step 2: Run tests + commit**
 
 ```bash
-cargo test -p beth-mempool --features mev_blocker --lib providers::mev_blocker
-cargo fmt --all && cargo clippy -p beth-mempool --all-targets -- -D warnings
-git add crates/beth-mempool/src/providers/mev_blocker.rs crates/beth-mempool/src/providers/mod.rs
-git commit -m "feat(beth-mempool): MevBlockerProvider for private orderflow"
+cargo test -p bloom-mempool --features mev_blocker --lib providers::mev_blocker
+cargo fmt --all && cargo clippy -p bloom-mempool --all-targets -- -D warnings
+git add crates/bloom-mempool/src/providers/mev_blocker.rs crates/bloom-mempool/src/providers/mod.rs
+git commit -m "feat(bloom-mempool): MevBlockerProvider for private orderflow"
 ```
 
 ---
@@ -3363,11 +3363,11 @@ git commit -m "feat(beth-mempool): MevBlockerProvider for private orderflow"
 ### Task 4.4: `FlashbotsProvider`
 
 **Files:**
-- Create: `crates/beth-mempool/src/providers/flashbots.rs`
+- Create: `crates/bloom-mempool/src/providers/flashbots.rs`
 
 - [ ] **Step 1: Implement (near-identical to MEV-Blocker)**
 
-Create `crates/beth-mempool/src/providers/flashbots.rs`. **Copy** the entire body of `mev_blocker.rs` verbatim, then:
+Create `crates/bloom-mempool/src/providers/flashbots.rs`. **Copy** the entire body of `mev_blocker.rs` verbatim, then:
 
 - Replace `pub const DEFAULT_URL: &str = "https://rpc.mevblocker.io";` with `pub const DEFAULT_URL: &str = "https://rpc.flashbots.net/fast";`
 - Replace `pub struct MevBlockerProvider` with `pub struct FlashbotsProvider`
@@ -3382,10 +3382,10 @@ The skill says "repeat the code — the engineer may be reading tasks out of ord
 - [ ] **Step 2: Run tests + commit**
 
 ```bash
-cargo test -p beth-mempool --features flashbots --lib providers::flashbots
-cargo fmt --all && cargo clippy -p beth-mempool --all-targets -- -D warnings
-git add crates/beth-mempool/src/providers/flashbots.rs
-git commit -m "feat(beth-mempool): FlashbotsProvider for private orderflow"
+cargo test -p bloom-mempool --features flashbots --lib providers::flashbots
+cargo fmt --all && cargo clippy -p bloom-mempool --all-targets -- -D warnings
+git add crates/bloom-mempool/src/providers/flashbots.rs
+git commit -m "feat(bloom-mempool): FlashbotsProvider for private orderflow"
 ```
 
 ---
@@ -3393,11 +3393,11 @@ git commit -m "feat(beth-mempool): FlashbotsProvider for private orderflow"
 ### Task 4.5: `MempoolStream` task with reconnect
 
 **Files:**
-- Modify: `crates/beth-mempool/src/stream.rs`
+- Modify: `crates/bloom-mempool/src/stream.rs`
 
 - [ ] **Step 1: Replace stub**
 
-Replace `crates/beth-mempool/src/stream.rs` with:
+Replace `crates/bloom-mempool/src/stream.rs` with:
 
 ```rust
 //! Long-lived mempool subscription task. Owns the per-chain
@@ -3511,10 +3511,10 @@ mod tests {
 - [ ] **Step 3: Run + commit**
 
 ```bash
-cargo test -p beth-mempool --lib stream::tests
-cargo fmt --all && cargo clippy -p beth-mempool --all-targets -- -D warnings
-git add crates/beth-mempool/src/stream.rs
-git commit -m "feat(beth-mempool): MempoolStream task with reconnect/backoff"
+cargo test -p bloom-mempool --lib stream::tests
+cargo fmt --all && cargo clippy -p bloom-mempool --all-targets -- -D warnings
+git add crates/bloom-mempool/src/stream.rs
+git commit -m "feat(bloom-mempool): MempoolStream task with reconnect/backoff"
 ```
 
 ---
@@ -3522,15 +3522,15 @@ git commit -m "feat(beth-mempool): MempoolStream task with reconnect/backoff"
 ### Task 4.6: Daemon wiring — build provider maps from config
 
 **Files:**
-- Modify: `crates/beth-daemon/src/...` (find the startup module)
-- Modify: `crates/beth-proto/src/config.rs` (add mempool + private_rpc config sections)
+- Modify: `crates/bloom-daemon/src/...` (find the startup module)
+- Modify: `crates/bloom-proto/src/config.rs` (add mempool + private_rpc config sections)
 
 - [ ] **Step 1: Add config sections**
 
-Find the `Config` struct in `beth-proto`:
+Find the `Config` struct in `bloom-proto`:
 
 ```bash
-grep -rn "pub struct Config" crates/beth-proto/src/
+grep -rn "pub struct Config" crates/bloom-proto/src/
 ```
 
 Add fields:
@@ -3565,45 +3565,45 @@ Tests: round-trip via `toml::from_str`. Mirror the existing config tests in the 
 
 - [ ] **Step 2: Wire builders in the daemon**
 
-In `beth-daemon`, find where `Daemon::new` (or similar) wires up handlers + tx engine. Add:
+In `bloom-daemon`, find where `Daemon::new` (or similar) wires up handlers + tx engine. Add:
 
 ```rust
 use std::sync::Arc;
-use beth_mempool::{PendingTxIndex, MempoolStream, PrivateRpcProvider};
+use bloom_mempool::{PendingTxIndex, MempoolStream, PrivateRpcProvider};
 
 // Build mempool indexes and streams per configured chain.
 let mut mempool_indexes: std::collections::BTreeMap<String, Arc<PendingTxIndex>> = Default::default();
-let mut mempool_handlers: std::collections::BTreeMap<String, Arc<beth_vfs::handlers::chains_mempool::MempoolHandler>> = Default::default();
+let mut mempool_handlers: std::collections::BTreeMap<String, Arc<bloom_vfs::handlers::chains_mempool::MempoolHandler>> = Default::default();
 let mut shutdown_tx: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
 
 for (chain, mc) in &config.mempool {
     let idx = PendingTxIndex::new(mc.max_index_size);
     mempool_indexes.insert(chain.clone(), idx.clone());
-    let handler = Arc::new(beth_vfs::handlers::chains_mempool::MempoolHandler::new(
+    let handler = Arc::new(bloom_vfs::handlers::chains_mempool::MempoolHandler::new(
         chain.clone(), mc.provider.clone(), idx.clone(),
     ));
     mempool_handlers.insert(chain.clone(), handler.clone());
 
-    let provider: Arc<dyn beth_mempool::MempoolProvider> = match mc.provider.as_str() {
+    let provider: Arc<dyn bloom_mempool::MempoolProvider> = match mc.provider.as_str() {
         #[cfg(feature = "mempool-alchemy")]
-        "alchemy" => Arc::new(beth_mempool::providers::alchemy::AlchemyProvider::new(&mc.ws_url)),
+        "alchemy" => Arc::new(bloom_mempool::providers::alchemy::AlchemyProvider::new(&mc.ws_url)),
         #[cfg(feature = "mempool-generic")]
-        "generic_eth_subscribe" => Arc::new(beth_mempool::providers::generic_eth_subscribe::GenericEthSubscribeProvider::new(&mc.ws_url)),
+        "generic_eth_subscribe" => Arc::new(bloom_mempool::providers::generic_eth_subscribe::GenericEthSubscribeProvider::new(&mc.ws_url)),
         other => return Err(anyhow::anyhow!("unknown mempool provider: {other}")),
     };
-    let stream = beth_mempool::MempoolStream::new(idx);
-    shutdown_tx.push(beth_mempool::stream::spawn(chain.clone(), provider, stream));
+    let stream = bloom_mempool::MempoolStream::new(idx);
+    shutdown_tx.push(bloom_mempool::stream::spawn(chain.clone(), provider, stream));
 }
 
 // Build private RPC providers per configured chain.
 let mut private_rpcs: Vec<(u64, Arc<dyn PrivateRpcProvider>)> = Vec::new();
 for (chain, rc) in &config.private_rpc {
-    let chain_id = lookup_chain_id_from_name(chain)?;  // existing helper in beth-daemon
+    let chain_id = lookup_chain_id_from_name(chain)?;  // existing helper in bloom-daemon
     if let Some(url) = &rc.mev_blocker_url {
-        private_rpcs.push((chain_id, Arc::new(beth_mempool::providers::mev_blocker::MevBlockerProvider::new(url)?)));
+        private_rpcs.push((chain_id, Arc::new(bloom_mempool::providers::mev_blocker::MevBlockerProvider::new(url)?)));
     }
     if let Some(url) = &rc.flashbots_url {
-        private_rpcs.push((chain_id, Arc::new(beth_mempool::providers::flashbots::FlashbotsProvider::new(url)?)));
+        private_rpcs.push((chain_id, Arc::new(bloom_mempool::providers::flashbots::FlashbotsProvider::new(url)?)));
     }
 }
 
@@ -3621,19 +3621,19 @@ for (chain_name, handler) in &mempool_handlers {
 }
 ```
 
-Adapt the function/method names to whatever `beth-daemon` actually exposes (search the file).
+Adapt the function/method names to whatever `bloom-daemon` actually exposes (search the file).
 
-Also enable the new Cargo features in `crates/beth-daemon/Cargo.toml`:
+Also enable the new Cargo features in `crates/bloom-daemon/Cargo.toml`:
 
 ```toml
-beth-mempool = { workspace = true, features = ["alchemy", "generic_eth_subscribe", "mev_blocker", "flashbots"] }
+bloom-mempool = { workspace = true, features = ["alchemy", "generic_eth_subscribe", "mev_blocker", "flashbots"] }
 ```
 
 (Use the feature names as declared in Task 1.1, not the placeholder `mempool-alchemy` shown above — fix the cfg attributes to match.)
 
 - [ ] **Step 3: Tests**
 
-Add a smoke test in `beth-daemon` that exercises a daemon with a `[mempool.anvil]` config pointed at a generic eth_subscribe provider (using the existing anvil test fixture if one exists). If the daemon doesn't have direct test scaffolding for this, skip the test and rely on Phase 5's Docker integration.
+Add a smoke test in `bloom-daemon` that exercises a daemon with a `[mempool.anvil]` config pointed at a generic eth_subscribe provider (using the existing anvil test fixture if one exists). If the daemon doesn't have direct test scaffolding for this, skip the test and rely on Phase 5's Docker integration.
 
 - [ ] **Step 4: Run + commit**
 
@@ -3641,8 +3641,8 @@ Add a smoke test in `beth-daemon` that exercises a daemon with a `[mempool.anvil
 cargo build --workspace
 cargo test --workspace --lib
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
-git add crates/beth-proto/ crates/beth-daemon/
-git commit -m "feat(beth-daemon): wire mempool indexes + streams + private RPCs from config"
+git add crates/bloom-proto/ crates/bloom-daemon/
+git commit -m "feat(bloom-daemon): wire mempool indexes + streams + private RPCs from config"
 ```
 
 ---
@@ -3650,18 +3650,18 @@ git commit -m "feat(beth-daemon): wire mempool indexes + streams + private RPCs 
 ### Task 4.7: Live-providers smoke tests (opt-in)
 
 **Files:**
-- Create: `crates/beth-mempool/tests/it_alchemy_smoke.rs`
-- Create: `crates/beth-mempool/tests/it_private_rpc_health.rs`
+- Create: `crates/bloom-mempool/tests/it_alchemy_smoke.rs`
+- Create: `crates/bloom-mempool/tests/it_private_rpc_health.rs`
 
 - [ ] **Step 1: Write the gated tests**
 
-Create `crates/beth-mempool/tests/it_alchemy_smoke.rs`:
+Create `crates/bloom-mempool/tests/it_alchemy_smoke.rs`:
 
 ```rust
 #![cfg(feature = "live-providers")]
 
-use beth_mempool::providers::alchemy::AlchemyProvider;
-use beth_mempool::provider::MempoolProvider;
+use bloom_mempool::providers::alchemy::AlchemyProvider;
+use bloom_mempool::provider::MempoolProvider;
 use futures::StreamExt;
 use std::time::Duration;
 
@@ -3679,13 +3679,13 @@ async fn alchemy_yields_at_least_one_pending_tx_in_30s() {
 }
 ```
 
-Create `crates/beth-mempool/tests/it_private_rpc_health.rs`:
+Create `crates/bloom-mempool/tests/it_private_rpc_health.rs`:
 
 ```rust
 #![cfg(feature = "live-providers")]
 
-use beth_mempool::providers::{flashbots::FlashbotsProvider, mev_blocker::MevBlockerProvider};
-use beth_mempool::private::{HealthStatus, PrivateRpcProvider};
+use bloom_mempool::providers::{flashbots::FlashbotsProvider, mev_blocker::MevBlockerProvider};
+use bloom_mempool::private::{HealthStatus, PrivateRpcProvider};
 
 #[tokio::test]
 async fn mev_blocker_health_returns_healthy() {
@@ -3704,7 +3704,7 @@ async fn flashbots_health_returns_healthy() {
         eprintln!("skipping: set RUN_PRIVATE_RPC_HEALTH=1 to run");
         return;
     }
-    let p = FlashbotsProvider::new(beth_mempool::providers::flashbots::DEFAULT_URL).unwrap();
+    let p = FlashbotsProvider::new(bloom_mempool::providers::flashbots::DEFAULT_URL).unwrap();
     let h = p.health().await.unwrap();
     assert!(matches!(h, HealthStatus::Healthy | HealthStatus::Degraded));
 }
@@ -3712,14 +3712,14 @@ async fn flashbots_health_returns_healthy() {
 
 - [ ] **Step 2: Verify they compile under the feature**
 
-Run: `cargo check -p beth-mempool --features live-providers --tests`
+Run: `cargo check -p bloom-mempool --features live-providers --tests`
 Expected: success.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add crates/beth-mempool/tests/
-git commit -m "test(beth-mempool): opt-in live-providers smoke tests"
+git add crates/bloom-mempool/tests/
+git commit -m "test(bloom-mempool): opt-in live-providers smoke tests"
 ```
 
 ---
@@ -3761,7 +3761,7 @@ Wire the flag so it:
 2. Configures the daemon's `[mempool.anvil]` section to point at `ws://mempool-mock:9551`.
 3. Runs the existing fork-mode harness with an additional assertion step: the test client reads `/eth/chains/anvil/mempool/live` and expects to see the same hashes the mock fixture emitted.
 
-The new assertion can be a one-shot CLI invocation: `beth vfs cat chains/anvil/mempool/live | head -n 3` and grep for at least one expected hash prefix.
+The new assertion can be a one-shot CLI invocation: `bloom vfs cat chains/anvil/mempool/live | head -n 3` and grep for at least one expected hash prefix.
 
 - [ ] **Step 4: Run the harness locally**
 
@@ -3814,16 +3814,16 @@ Add a new section under the per-surface map:
 
 | Surface | Backend | Implementation |
 |---|---|---|
-| `chains/<c>/mempool/status.json` | rpc (alchemy / generic) | `beth-vfs/src/handlers/chains_mempool.rs` |
+| `chains/<c>/mempool/status.json` | rpc (alchemy / generic) | `bloom-vfs/src/handlers/chains_mempool.rs` |
 | `chains/<c>/mempool/live` | rpc | `chains_mempool::live` |
 | `chains/<c>/mempool/recent.jsonl` | rpc | `chains_mempool::recent_jsonl` |
 | `chains/<c>/mempool/by_address/<a>/...` | rpc | `chains_mempool::by_address` |
 | `chains/<c>/mempool/by_pool/<a>/recent.jsonl` | rpc | `chains_mempool::by_pool` |
 | `chains/<c>/mempool/<hash>/{tx,decoded,status}` | rpc | `chains_mempool::tx_hash_subtree` |
-| `wallets/<w>/chains/<c>/pending_external.jsonl` | rpc | `beth-vfs/src/handlers/wallets.rs` |
-| `wallets/<w>/outbox/sent/<h>/{bump.tx,cancel.tx,bump_advice.json}` | local | `beth-tx::bump_scanner` |
-| `wallets/<w>/outbox/pending/<id>/{mev_risk.json,nonce_conflict.json}` | local | `beth-tx::tx_engine::stage` |
-| `status/backends/{mempool,private_rpc}` | local | `beth-vfs/src/handlers/status.rs` |
+| `wallets/<w>/chains/<c>/pending_external.jsonl` | rpc | `bloom-vfs/src/handlers/wallets.rs` |
+| `wallets/<w>/outbox/sent/<h>/{bump.tx,cancel.tx,bump_advice.json}` | local | `bloom-tx::bump_scanner` |
+| `wallets/<w>/outbox/pending/<id>/{mev_risk.json,nonce_conflict.json}` | local | `bloom-tx::tx_engine::stage` |
+| `status/backends/{mempool,private_rpc}` | local | `bloom-vfs/src/handlers/status.rs` |
 
 Verified end-to-end via `tests/docker/run.sh --mempool-mock`.
 ```
@@ -3862,9 +3862,9 @@ ws_url = "wss://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
 Restart the daemon, then tail the live mempool:
 
 ```sh
-beth vfs cat /eth/chains/ethereum/mempool/live    # blocks until next pending tx
-beth vfs cat /eth/chains/ethereum/mempool/recent.jsonl | head
-beth vfs cat /eth/chains/ethereum/mempool/by_address/0xYourAddress/pending.jsonl
+bloom vfs cat /eth/chains/ethereum/mempool/live    # blocks until next pending tx
+bloom vfs cat /eth/chains/ethereum/mempool/recent.jsonl | head
+bloom vfs cat /eth/chains/ethereum/mempool/by_address/0xYourAddress/pending.jsonl
 ```
 
 To opt a wallet into private orderflow (mainnet only):

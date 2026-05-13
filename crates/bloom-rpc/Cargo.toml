@@ -1,0 +1,22 @@
+[package]
+name = "bloom-rpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Layered RPC engine (retry + fallback + throttle) for bloom"
+
+[dependencies]
+bloom-proto.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+url.workspace = true
+alloy.workspace = true
+tower = "0.5"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json.workspace = true

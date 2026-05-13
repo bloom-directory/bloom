@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# In-container driver: build and run the bloom-eth workspace unit tests.
+# In-container driver: build and run the bloom workspace unit tests.
 #
 # This is the dockerized equivalent of `cargo test --workspace --lib`,
 # pinned to the same rust:bookworm image used by the NFS mount test so
@@ -30,7 +30,7 @@ CARGO_FLAGS=(
 )
 
 # Allow the caller to inject extra cargo args via $EXTRA_CARGO_ARGS for
-# ad-hoc filtering ("--package beth-tx", etc.) without editing the script.
+# ad-hoc filtering ("--package bloom-tx", etc.) without editing the script.
 if [ -n "${EXTRA_CARGO_ARGS:-}" ]; then
     # word-splitting is intentional here
     # shellcheck disable=SC2206

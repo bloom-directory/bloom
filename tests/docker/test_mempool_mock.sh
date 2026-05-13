@@ -6,14 +6,14 @@
 # mempool-mock-ws sidecar (which emulates Alchemy's alchemy_pendingTransactions
 # WebSocket subscription).
 #
-# Driven inside a beth-test-mempool container brought up by
+# Driven inside a bloom-test-mempool container brought up by
 # tests/docker/docker-compose.yml under the `mempool` profile
 # (see run.sh --mempool).
 #
 # Required env (set by docker-compose.yml's mempool profile):
 #   BASE_FORK_INTERNAL_URL      RPC URL the daemon hits (anvil-fork:8545)
 #   MEMPOOL_MOCK_WS_URL         WS URL of the mock server (ws://mempool-mock:9551)
-#   BETH_TEST_WALLET_PASSPHRASE passphrase for the test wallet
+#   BLOOM_TEST_WALLET_PASSPHRASE passphrase for the test wallet
 
 set -euo pipefail
 
@@ -23,12 +23,12 @@ source "$SCRIPT_DIR/lib.sh"
 
 # MNT/PIDFILE/LOGFILE/SENTINEL come from lib.sh defaults.
 # DEST1/ANVIL_KEY come from lib.sh fixtures.
-HOME_DIR=/tmp/beth-mempool-home
+HOME_DIR=/tmp/bloom-mempool-home
 WALLET=dest1
 CHAIN=base
 
-WALLET_PASSPHRASE="${BETH_TEST_WALLET_PASSPHRASE:-}"
-[[ -n "$WALLET_PASSPHRASE" ]] || fail "BETH_TEST_WALLET_PASSPHRASE not set"
+WALLET_PASSPHRASE="${BLOOM_TEST_WALLET_PASSPHRASE:-}"
+[[ -n "$WALLET_PASSPHRASE" ]] || fail "BLOOM_TEST_WALLET_PASSPHRASE not set"
 [[ -n "${BASE_FORK_INTERNAL_URL:-}" ]] || fail "BASE_FORK_INTERNAL_URL not set"
 [[ -n "${MEMPOOL_MOCK_WS_URL:-}" ]] || fail "MEMPOOL_MOCK_WS_URL not set"
 RPC_URL="$BASE_FORK_INTERNAL_URL"

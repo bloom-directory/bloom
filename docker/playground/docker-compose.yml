@@ -1,14 +1,14 @@
-# Playground stack for bloom-eth.
+# Playground stack for bloom.
 #
 # Brings up an anvil node so the user can broadcast real transactions
-# locally without ever touching mainnet. The host-side beth binary
+# locally without ever touching mainnet. The host-side bloom binary
 # (started by scripts/play.sh) talks to this node over the published
 # 8545 port. Base mainnet is configured separately in the play home as
 # read-only.
 services:
   anvil:
     image: ghcr.io/foundry-rs/foundry:latest
-    container_name: beth-play-anvil
+    container_name: bloom-play-anvil
     # Foundry's image entrypoint defers to `anvil` via the `cast`/`anvil`
     # multitool. Overriding entrypoint+command keeps the invocation
     # explicit.

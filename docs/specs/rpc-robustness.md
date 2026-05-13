@@ -2,18 +2,18 @@
 
 Status: ratified — implementation in progress
 Date: 2026-05-09
-Workspace: `beth` (root `/home/joshua/code/beth`)
+Workspace: `bloom` (root `/home/joshua/code/bloom`)
 
 ## Decisions ratified
 
 These overrides win over any conflicting recommendation later in the document:
 
-1. **New crate `crates/beth-rpc`** — not a submodule in `beth-chain`. All paths
-   under `crates/beth-chain/src/rpc/` in §C.1 and §E read instead as
-   `crates/beth-rpc/src/`. `beth-chain` adds `beth-rpc` as a workspace dep.
+1. **New crate `crates/bloom-rpc`** — not a submodule in `bloom-chain`. All paths
+   under `crates/bloom-chain/src/rpc/` in §C.1 and §E read instead as
+   `crates/bloom-rpc/src/`. `bloom-chain` adds `bloom-rpc` as a workspace dep.
 2. **Tx-staging sessions are always-on.** No `[backends] tx_session` config knob.
    `TxEngine::stage_*` unconditionally opens a session.
-3. **Reorg-dedupe ring buffer in `beth-watch`** — last 64 blocks of
+3. **Reorg-dedupe ring buffer in `bloom-watch`** — last 64 blocks of
    `(blockHash, logIndex)`. Applies on both WS and poll paths so handover is
    transparent.
 4. **`transport-throttle` feature enabled** — `governor` enters the build.
@@ -33,17 +33,17 @@ layer that supports:
    silently observe a different chain head when a request fails over.
 
 The work must keep `ChainClient`'s public API stable for the dozens of
-call sites in `beth-vfs`, `beth-tx`, `beth-watch`, `beth-ens`,
-`beth-revert`, `beth-defi`, `beth-daemon`. Behind that API the transport
+call sites in `bloom-vfs`, `bloom-tx`, `bloom-watch`, `bloom-ens`,
+`bloom-revert`, `bloom-defi`, `bloom-daemon`. Behind that API the transport
 becomes a stack: `RpcClient` over `tower::ServiceBuilder` of
-`(retry → fallback → throttle? → http|ws)` plus a thin Beth-side
+`(retry → fallback → throttle? → http|ws)` plus a thin Bloom-side
 "session" layer for state pinning.
 
 ---
 
 ## A. Current state audit
 
-### A.1 `crates/beth-chain/src/lib.rs`
+### A.1 `crates/bloom-chain/src/lib.rs`
 
 **Construction (line 125–144).** `ChainClient::new(spec: ChainSpec)`:
 
@@ -94,12 +94,12 @@ abstraction must keep `provider()` returning *something* that satisfies
 (`AllEndpointsFailed`) without breaking matchers — every match on the
 type uses `Err(_)` or wildcards.
 
-**No retry/timeout/backoff** lives in `beth-chain`. The only existing
-timeout is in `beth-vfs/src/handlers/status.rs:191` (a `PING_TIMEOUT`
+**No retry/timeout/backoff** lives in `bloom-chain`. The only existing
+timeout is in `bloom-vfs/src/handlers/status.rs:191` (a `PING_TIMEOUT`
 guard around `client.block_number()` for the status probe). That probe
 caches per-chain in a 5-minute TTL.
 
-### A.2 `crates/beth-watch/src/executor.rs`
+### A.2 `crates/bloom-watch/src/executor.rs`
 
 The polling loop:
 
@@ -131,7 +131,7 @@ available the executor stays on the wall-clock interval.
 ### A.3 Provider/transport instantiation across the workspace
 
 ```
-crates/beth-chain/src/lib.rs:138    RootProvider::<Ethereum>::new_http(url)   // sole real instantiation
+crates/bloom-chain/src/lib.rs:138    RootProvider::<Ethereum>::new_http(url)   // sole real instantiation
 ```
 
 `grep` finds no other `ProviderBuilder::new`, `WsConnect`, `new_ws`,
@@ -143,13 +143,13 @@ flows everywhere.
 
 ### A.4 Existing health / timeout / retry handling
 
-- **None inside `beth-chain`.**
-- `beth-vfs/src/handlers/status.rs` has its own `probe_chain` with a
+- **None inside `bloom-chain`.**
+- `bloom-vfs/src/handlers/status.rs` has its own `probe_chain` with a
   `PING_TIMEOUT` and 5-minute cache. This is observation only, not a
   health driver.
-- `beth-etherscan/src/lib.rs` configures a `request_timeout` on its
+- `bloom-etherscan/src/lib.rs` configures a `request_timeout` on its
   reqwest client (15 s default). That is not RPC-relevant.
-- Daemon (`crates/beth-daemon/src/lib.rs:90-100`) builds clients in a
+- Daemon (`crates/bloom-daemon/src/lib.rs:90-100`) builds clients in a
   loop and `warn!` skips on error. After construction nothing else
   monitors them.
 - Watch executor only logs `warn!("watch.spec.error")` and continues —
@@ -196,10 +196,10 @@ you observe a regression. alloy makes no guarantee here.
 1. **Vendor-specific health labels.** `RateLimitRetryPolicy` already
    covers the common patterns, but: Infura's `-32005` daily-cap, the
    Alchemy CU-exhaustion error string, public-RPC 503 patterns are
-   inconsistently surfaced across providers. We need to layer Beth
+   inconsistently surfaced across providers. We need to layer Bloom
    policy on top of `RateLimitRetryPolicy.or(...)`.
 2. **State drift / cross-provider consistency.** No primitive. Must be
-   a Beth-owned layer.
+   a Bloom-owned layer.
 3. **Sticky sessions.** `FallbackService` re-evaluates the top-N every
    call. We want a way to say "stick to one transport for these N
    calls" for read consistency.
@@ -208,26 +208,26 @@ you observe a regression. alloy makes no guarantee here.
    `0.0` (initial neutral). We want a periodic `eth_blockNumber`
    probe so we don't fail over to a dead URL on the first user call.
 5. **WS lifecycle.** WS reconnect is built into `alloy-pubsub` for
-   transient drops, but Beth needs to *demote* a provider to poll if
+   transient drops, but Bloom needs to *demote* a provider to poll if
    WS is permanently broken (not just every reconnect).
 6. **Per-provider weights.** alloy fallback doesn't accept weights,
    only top-N count.
 
 ### B.3 Recommendation: extend with a wrapping layer in a new module
 
-**Pick:** Add a new module `crates/beth-chain/src/rpc/` (no new crate
+**Pick:** Add a new module `crates/bloom-chain/src/rpc/` (no new crate
 yet). Build the alloy layer stack inside `ChainClient::new`. Add a
 **`Session` type** for state-drift control. Defer a separate
-`beth-rpc` crate until we either (a) want pub use beyond beth, or
+`bloom-rpc` crate until we either (a) want pub use beyond bloom, or
 (b) the module exceeds ~1500 lines.
 
 Rationale:
 
-- `beth-chain` is already the only consumer of `RootProvider`.
-  Extracting now creates a circular concern: `beth-chain` would
+- `bloom-chain` is already the only consumer of `RootProvider`.
+  Extracting now creates a circular concern: `bloom-chain` would
   re-export the new crate's types verbatim because the call sites
   call `client.balance()`, not `pool.balance()`.
-- Putting the pool inside `beth-chain` keeps the diff small. The new
+- Putting the pool inside `bloom-chain` keeps the diff small. The new
   module pattern (file per concern: `rpc/transport.rs`,
   `rpc/health.rs`, `rpc/session.rs`) signals "this could be its own
   crate" if usage grows.
@@ -240,9 +240,9 @@ Tradeoffs:
 
 | Approach                     | Pro | Con |
 |------------------------------|-----|-----|
-| Use alloy `FallbackLayer` directly, no Beth code | minimum work, ~50 LOC change | no state-drift solution; rate-limit policy stuck on default; no active probes |
-| Wrapping module in `beth-chain` (recommended) | one place to evolve; reuses alloy primitives where they suffice | mixes "RPC engine" concerns into a crate that also has chain semantics |
-| New `beth-rpc` crate | clean boundary, reusable | premature; forces every other crate to add a dep just for `Provider` shape |
+| Use alloy `FallbackLayer` directly, no Bloom code | minimum work, ~50 LOC change | no state-drift solution; rate-limit policy stuck on default; no active probes |
+| Wrapping module in `bloom-chain` (recommended) | one place to evolve; reuses alloy primitives where they suffice | mixes "RPC engine" concerns into a crate that also has chain semantics |
+| New `bloom-rpc` crate | clean boundary, reusable | premature; forces every other crate to add a dep just for `Provider` shape |
 
 ---
 
@@ -251,31 +251,31 @@ Tradeoffs:
 ### C.1 Module / file layout
 
 ```
-crates/beth-chain/src/
+crates/bloom-chain/src/
 ├── lib.rs                       // ChainClient (slimmed: kept signatures, body delegates to rpc::*)
 └── rpc/
     ├── mod.rs                   // pub use's; the "engine" surface
     ├── transport.rs             // builds the alloy ServiceBuilder stack per chain
     ├── endpoint.rs              // EndpointSpec, parsing, scheme detection (http/https/ws/wss)
     ├── health.rs                // EndpointHealth, scoring, cooldowns, probe loop
-    ├── policy.rs                // BethRetryPolicy: extends RateLimitRetryPolicy.or(...)
+    ├── policy.rs                // BloomRetryPolicy: extends RateLimitRetryPolicy.or(...)
     ├── session.rs               // Session type for block-pinned reads
     └── tests.rs                 // unit tests against MockTransport
 ```
 
-`crates/beth-watch/src/`
+`crates/bloom-watch/src/`
 - `executor.rs` — gain a fast-path that prefers `subscribe_blocks` /
   `subscribe_logs` when the chain's primary transport is WS-capable;
   the existing tick loop becomes the fallback.
 
-`crates/beth-proto/src/chain.rs`
+`crates/bloom-proto/src/chain.rs`
 - Extend `ChainSpec` with optional `rpc_endpoints: Vec<EndpointSpec>`
   (richer schema), keeping `rpc_urls: Vec<String>` for backward
   compatibility — see §C.7.
 
 ### C.2 Type sketches
 
-#### `EndpointSpec` (in `beth-proto/src/chain.rs`)
+#### `EndpointSpec` (in `bloom-proto/src/chain.rs`)
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,7 +355,7 @@ pub struct EndpointHealth {
 ```
 
 Note: alloy's `FallbackService` already tracks success/latency
-internally, but those metrics are private to the layer. Beth keeps a
+internally, but those metrics are private to the layer. Bloom keeps a
 parallel `EndpointHealth` view because:
 
 - We want active probes (alloy's metrics only update on traffic).
@@ -365,17 +365,17 @@ parallel `EndpointHealth` view because:
   unconditionally (alloy's failover continues to query a hot endpoint
   in parallel).
 
-#### `BethRetryPolicy` (in `rpc/policy.rs`)
+#### `BloomRetryPolicy` (in `rpc/policy.rs`)
 
 ```rust
 use alloy::transports::layers::{RateLimitRetryPolicy, RetryPolicy};
 
 #[derive(Debug, Clone, Default)]
-pub struct BethRetryPolicy {
+pub struct BloomRetryPolicy {
     inner: RateLimitRetryPolicy,
 }
 
-impl RetryPolicy for BethRetryPolicy {
+impl RetryPolicy for BloomRetryPolicy {
     fn should_retry(&self, e: &TransportError) -> bool {
         if self.inner.should_retry(e) { return true; }
         // Vendor-specific patterns alloy doesn't already cover:
@@ -466,10 +466,10 @@ internals change.
   - `pub fn supports_subscriptions(&self) -> bool` — `true` if any
     endpoint is `ws://` or `wss://`.
 
-Call sites in `beth-watch`, `beth-tx`, `beth-vfs`, `beth-ens`,
-`beth-defi`, `beth-revert` do not change.
+Call sites in `bloom-watch`, `bloom-tx`, `bloom-vfs`, `bloom-ens`,
+`bloom-defi`, `bloom-revert` do not change.
 
-### C.4 `beth-watch` WS fast path
+### C.4 `bloom-watch` WS fast path
 
 ```rust
 // Pseudocode for executor::start_block_subscription
@@ -510,7 +510,7 @@ clock.
 The transport stack per endpoint:
 
 ```
-[RetryBackoffLayer with BethRetryPolicy]
+[RetryBackoffLayer with BloomRetryPolicy]
  ↓
 [ThrottleLayer (only if endpoint.max_rps is Some)]
  ↓
@@ -525,21 +525,21 @@ The fallback fan-out wraps a `Vec<S>` of these stacks:
 [ Vec<endpoint stack #0>, Vec<endpoint stack #1>, ... ]
 ```
 
-Detection signals (all consumed by `BethRetryPolicy::should_retry`):
+Detection signals (all consumed by `BloomRetryPolicy::should_retry`):
 
 | Signal | Source | Action |
 |--------|--------|--------|
 | HTTP 429                              | `HttpError::is_rate_limit_err` | retry with `backoff_hint` (parsed from body or default 1 s) |
 | HTTP 503                              | `HttpError::is_temporarily_unavailable` | retry |
-| HTTP 408 / 502 / 504                  | new in `BethRetryPolicy`       | retry |
+| HTTP 408 / 502 / 504                  | new in `BloomRetryPolicy`       | retry |
 | JSON-RPC `-32005` (`rate limited`)    | alloy `is_retry_err`           | retry, parse `try again in Xms` |
 | JSON-RPC `-32007` (QuickNode rate)    | alloy                          | retry |
 | JSON-RPC `429`                        | alloy                          | retry |
 | Infura `data.rate.backoff_seconds`    | alloy `backoff_hint`           | sleep then retry |
-| Alchemy "exceeded its compute units"  | new in `BethRetryPolicy`       | retry once, then mark cooldown |
+| Alchemy "exceeded its compute units"  | new in `BloomRetryPolicy`       | retry once, then mark cooldown |
 | Generic "over rate limit"             | new                            | retry |
 
-Cooldowns (Beth-side, separate from alloy's per-call retry):
+Cooldowns (Bloom-side, separate from alloy's per-call retry):
 
 - After **N** rate-limit events from one endpoint within window **W**
   (defaults: N=3, W=10 s), set
@@ -558,7 +558,7 @@ hybrid.**
 - **Default for one-shot reads:** stay with `FallbackLayer`'s
   parallel-top-N. State drift between two consecutive reads is
   expected; that's the same semantics every alloy user gets today.
-  Most Beth read paths (VFS leaf reads, watch sampling) tolerate
+  Most Bloom read paths (VFS leaf reads, watch sampling) tolerate
   this — they look at one number and present it.
 - **Read sessions** (block-pinning): `ChainClient::open_session()`
   freezes a `(block_number, block_hash)` pair. All session-scoped
@@ -567,11 +567,11 @@ hybrid.**
   different provider's chain, the call will error out cleanly with
   `eth_blockHash not found` and we mark the session degraded.
   Use this for any logical operation that fans out to >1 RPC call:
-    - `beth-tx::TxEngine::stage_*` — pin once, read nonce + balance +
+    - `bloom-tx::TxEngine::stage_*` — pin once, read nonce + balance +
       gas-price + chain-id + code from the same block.
     - `simulate.rs::eth_call` chains.
-    - `beth-vfs/handlers/chains.rs` aggregate "address summary" pages.
-- **Sticky tail** (sticky session): when `beth-watch` opens a
+    - `bloom-vfs/handlers/chains.rs` aggregate "address summary" pages.
+- **Sticky tail** (sticky session): when `bloom-watch` opens a
   `subscribe_blocks` stream, the resulting `WatchTail` sticks to that
   transport. Failover happens only at stream re-establishment, not on
   every event. This avoids reordering and missed-log races where two
@@ -629,7 +629,7 @@ Eviction policy:
 
 ### C.8 Configuration shape
 
-The user's `~/.bloom-eth/config.toml` today:
+The user's `~/.bloom/config.toml` today:
 
 ```toml
 [chains.base]
@@ -679,7 +679,7 @@ URL/endpoint must exist.
 ### C.9 `provider()` accessor
 
 The current `pub fn provider(&self) -> Arc<RootProvider<Ethereum>>` is
-called by `beth-ens` and `beth-watch`. Keep the signature. The new
+called by `bloom-ens` and `bloom-watch`. Keep the signature. The new
 internals build `RootProvider::new(rpc_client)` where `rpc_client` was
 constructed from a layered `ServiceBuilder`. `RootProvider<Ethereum>`
 is a `pub struct` parameterised by network — its concrete type doesn't
@@ -691,7 +691,7 @@ change, only the inner transport.
 
 ### D.1 Unit (no network)
 
-Located in `crates/beth-chain/src/rpc/tests.rs`. Use alloy's
+Located in `crates/bloom-chain/src/rpc/tests.rs`. Use alloy's
 `MockTransport` (the same testing tool `alloy-transport`'s own
 `fallback.rs` uses).
 
@@ -715,12 +715,12 @@ Located in `crates/beth-chain/src/rpc/tests.rs`. Use alloy's
 
 ### D.2 Integration against anvil
 
-Anvil supports HTTP and WS. `crates/beth-it/tests/` already runs
+Anvil supports HTTP and WS. `crates/bloom-it/tests/` already runs
 real anvil for several scenarios (`anvil_e2e.rs`, `erc20_e2e.rs`).
 
 New test files:
 
-- `crates/beth-it/tests/rpc_failover.rs`:
+- `crates/bloom-it/tests/rpc_failover.rs`:
   - Spawn two anvil instances, each on its own port.
   - Build `ChainSpec` with both URLs.
   - Issue 50 sequential `block_number()` calls.
@@ -728,7 +728,7 @@ New test files:
   - Assert the next call still succeeds (hits anvil #2) within < 1 s.
   - Assert `client.endpoints()` shows anvil #1 cooled down.
 
-- `crates/beth-it/tests/rpc_ws_subscriptions.rs`:
+- `crates/bloom-it/tests/rpc_ws_subscriptions.rs`:
   - Spawn anvil with `--port 0`, get the ws URL.
   - `subscribe_blocks()`, mine 3 blocks via anvil RPC (`anvil_mine`),
     assert 3 headers received within 5 s.
@@ -736,7 +736,7 @@ New test files:
     in-scope) or surfaces a `BackendGone` and the watch loop falls
     back to poll.
 
-- `crates/beth-it/tests/rpc_state_drift.rs`:
+- `crates/bloom-it/tests/rpc_state_drift.rs`:
   - Spawn anvil A and B. Mine 5 blocks on A, 3 on B.
   - Build a `ChainSpec` with both. Open a session.
   - Assert `session.block_number()` matches whichever anvil "won" the
@@ -785,11 +785,11 @@ matters where called out; otherwise parallelisable.
 ### WP-1: Endpoint schema + back-compat shim — INDEPENDENT, START FIRST
 
 **Touches:**
-- `crates/beth-proto/src/chain.rs`: add `EndpointSpec`, add
+- `crates/bloom-proto/src/chain.rs`: add `EndpointSpec`, add
   `ChainSpec::rpc_endpoints`, add `ChainSpec::endpoints()` derivation.
-- `crates/beth-proto/src/config.rs::Config::validate`: relax the
+- `crates/bloom-proto/src/config.rs::Config::validate`: relax the
   "rpc_urls non-empty" check to "either rpc_urls or rpc_endpoints".
-- `crates/beth-proto/src/chain.rs` tests: add round-trip tests for
+- `crates/bloom-proto/src/chain.rs` tests: add round-trip tests for
   the new field, including a TOML containing only `rpc_endpoints`,
   only `rpc_urls`, and both.
 
@@ -804,31 +804,31 @@ matters where called out; otherwise parallelisable.
 ### WP-2: alloy stack + multi-endpoint failover — DEPENDS ON WP-1
 
 **Touches:**
-- `crates/beth-chain/src/rpc/mod.rs`, `transport.rs`, `policy.rs`,
+- `crates/bloom-chain/src/rpc/mod.rs`, `transport.rs`, `policy.rs`,
   `endpoint.rs`, `health.rs` (new files; `health.rs` here is a stub —
   full implementation in WP-3).
-- `crates/beth-chain/src/lib.rs::ChainClient::new`: replace
+- `crates/bloom-chain/src/lib.rs::ChainClient::new`: replace
   `RootProvider::<Ethereum>::new_http(url)` with the layered stack.
-- `crates/beth-chain/Cargo.toml`: enable `transport-throttle` feature
+- `crates/bloom-chain/Cargo.toml`: enable `transport-throttle` feature
   on `alloy` (workspace `alloy.features`). Confirm `governor` pulls
   cleanly under our toolchain (1.85 stable).
 
 **Tests added:** in `rpc/tests.rs`: `retry_policy_extends_alloy`,
 `fallback_with_two_endpoints`. In
-`crates/beth-it/tests/rpc_failover.rs`: full anvil-killed scenario.
+`crates/bloom-it/tests/rpc_failover.rs`: full anvil-killed scenario.
 
 **Leaves alone:** every method body on `ChainClient` (signatures
-unchanged), `beth-watch`, `beth-tx`, `beth-vfs`.
+unchanged), `bloom-watch`, `bloom-tx`, `bloom-vfs`.
 
 ### WP-3: active health + cooldown observability — DEPENDS ON WP-2
 
 **Touches:**
-- `crates/beth-chain/src/rpc/health.rs`: full `EndpointHealth`,
+- `crates/bloom-chain/src/rpc/health.rs`: full `EndpointHealth`,
   scoring, cooldown state machine, active probe loop spawned in
   `ChainClient::new`.
-- `crates/beth-chain/src/lib.rs`: add `pub fn endpoints(&self) ->
+- `crates/bloom-chain/src/lib.rs`: add `pub fn endpoints(&self) ->
   Vec<EndpointHealthSnapshot>`.
-- `crates/beth-vfs/src/handlers/status.rs`: new VFS leaves
+- `crates/bloom-vfs/src/handlers/status.rs`: new VFS leaves
   `chains/<n>/endpoints/<idx>/{url,score,cooldown_until,latency_ms,success_rate}`.
   Existing `chains/<n>/{rpc_url,connected,block_number}` keep working
   by reading from the first/winning endpoint.
@@ -839,20 +839,20 @@ unchanged), `beth-watch`, `beth-tx`, `beth-vfs`.
 **Leaves alone:** the alloy stack from WP-2; only adds a sibling probe
 task that doesn't intercept calls.
 
-### WP-4: WebSocket subscriptions in `beth-watch` — INDEPENDENT OF WP-3, NEEDS WP-2
+### WP-4: WebSocket subscriptions in `bloom-watch` — INDEPENDENT OF WP-3, NEEDS WP-2
 
 **Touches:**
-- `crates/beth-chain/src/lib.rs`: add
+- `crates/bloom-chain/src/lib.rs`: add
   `pub fn supports_subscriptions(&self) -> bool`.
-- `crates/beth-watch/src/executor.rs`: split `start` into
+- `crates/bloom-watch/src/executor.rs`: split `start` into
   `start_block_loop`, `start_log_loop`, etc., each one preferring
   `subscribe_*` then falling back to the existing tick path. Reuse
   the existing `process_spec` body for the poll fallback.
-- `crates/beth-watch/Cargo.toml`: no new deps (alloy `full` already
+- `crates/bloom-watch/Cargo.toml`: no new deps (alloy `full` already
   has `pubsub`).
 
 **Tests added:**
-- `crates/beth-it/tests/rpc_ws_subscriptions.rs`.
+- `crates/bloom-it/tests/rpc_ws_subscriptions.rs`.
 - Unit: a test that uses a fake `RpcClient` reporting
   `supports_subscriptions == false` and asserts the existing poll
   loop kicks in unchanged.
@@ -864,22 +864,22 @@ sampling code (they keep the poll body but become triggered by
 ### WP-5: `Session` for state-pinned reads — DEPENDS ON WP-2, OPTIONALLY WP-3
 
 **Touches:**
-- `crates/beth-chain/src/rpc/session.rs`: full `Session` impl.
-- `crates/beth-chain/src/lib.rs`: `pub async fn open_session(&self)`.
-- `crates/beth-tx/src/tx_engine.rs::TxEngine::stage_*`: opt-in
+- `crates/bloom-chain/src/rpc/session.rs`: full `Session` impl.
+- `crates/bloom-chain/src/lib.rs`: `pub async fn open_session(&self)`.
+- `crates/bloom-tx/src/tx_engine.rs::TxEngine::stage_*`: opt-in
   conversion of the multi-call bundle (`nonce + balance + gas_price +
   code + chain_id`) to use a session. Behind a feature flag /
   config toggle, defaulted on. The user can revert to the current
   best-effort semantics by setting `[backends] tx_session = false`
   (new optional field).
-- `crates/beth-it/tests/rpc_state_drift.rs`: new integration test.
+- `crates/bloom-it/tests/rpc_state_drift.rs`: new integration test.
 
 **Tests added:** `session_pins_hash_across_calls`,
 `session_degrades_when_hash_unavailable`,
 `tx_engine_stages_are_consistent_across_provider_failover`.
 
-**Leaves alone:** `beth-watch` (uses sticky-stream, not sessions),
-read paths in `beth-vfs` that don't span calls.
+**Leaves alone:** `bloom-watch` (uses sticky-stream, not sessions),
+read paths in `bloom-vfs` that don't span calls.
 
 ### Sequencing diagram
 
@@ -898,10 +898,10 @@ WP-3, WP-4, WP-5 can run in parallel after WP-2 lands.
 
 ### F.1 Decisions the user owns
 
-1. **New crate or stay in `beth-chain`?** Recommendation: stay in
-   `beth-chain` under `rpc/` for the first cut. If the module exceeds
-   ~1500 LOC or `beth-defi` / `beth-ens` start wanting it standalone,
-   extract to `beth-rpc` later. Either path works; downstream code
+1. **New crate or stay in `bloom-chain`?** Recommendation: stay in
+   `bloom-chain` under `rpc/` for the first cut. If the module exceeds
+   ~1500 LOC or `bloom-defi` / `bloom-ens` start wanting it standalone,
+   extract to `bloom-rpc` later. Either path works; downstream code
    doesn't care because everyone goes through `ChainClient`.
 2. **Aggregator/quorum mode.** Punted to Future Work. The user
    accepted this would only be triggered if pinning was too hard.
@@ -931,8 +931,8 @@ WP-3, WP-4, WP-5 can run in parallel after WP-2 lands.
 - **`RootProvider<Ethereum>` exposure stability.** alloy 2.x is
   pre-1.0. If alloy bumps and `RootProvider` becomes `RootProvider<N,
   T>`, our `pub fn provider() -> Arc<RootProvider<Ethereum>>` will
-  break the leak we exposed to `beth-ens` and `beth-watch`. Consider
-  hiding behind a sealed trait `pub trait BethProvider:
+  break the leak we exposed to `bloom-ens` and `bloom-watch`. Consider
+  hiding behind a sealed trait `pub trait BloomProvider:
   alloy::providers::Provider<Ethereum>` so we can change the
   underlying type without API churn. **Not required for v1**, but
   worth a docstring warning.
@@ -947,7 +947,7 @@ WP-3, WP-4, WP-5 can run in parallel after WP-2 lands.
 - **`debug_traceCall` failover safety.** Some endpoints (Alchemy free
   tier, Infura) reject `debug_traceCall` with `method not supported`.
   The fallback layer treats this as a failure and rotates. Per
-  `BethRetryPolicy`, "method not supported" should NOT be retried —
+  `BloomRetryPolicy`, "method not supported" should NOT be retried —
   it's deterministic. Audit the alloy policy: by default it does
   not retry method-not-supported, so we are safe, but worth a unit
   test to pin behaviour.
@@ -959,7 +959,7 @@ WP-3, WP-4, WP-5 can run in parallel after WP-2 lands.
   `ChainSpec::endpoints()` for forward compatibility, but doing so is
   a separate cleanup that doesn't block functional work. Status
   handler's `redact_url` becomes "redact each endpoint URL" — easy.
-- `crates/beth-chain/src/lib.rs::tests::missing_endpoints_error`
+- `crates/bloom-chain/src/lib.rs::tests::missing_endpoints_error`
   expects an error when `rpc_urls` is empty. After WP-1, with
   `rpc_endpoints` also empty, the same error fires. Update assertion
   to test both paths.
@@ -983,7 +983,7 @@ WP-3, WP-4, WP-5 can run in parallel after WP-2 lands.
   `EndpointSpec`'s URL parser. Useful for self-hosted reth.
 - **Persistent health log.** Today `EndpointHealth` lives in memory.
   A future patch can write a small jsonl history into
-  `~/.bloom-eth/rpc-health/<chain>.jsonl` so operators can audit
+  `~/.bloom/rpc-health/<chain>.jsonl` so operators can audit
   flap patterns across daemon restarts.
 - **Operator-driven cooldown override.** A VFS write to
   `chains/<n>/endpoints/<idx>/cooldown` that pauses an endpoint for

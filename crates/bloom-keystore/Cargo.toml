@@ -1,0 +1,26 @@
+[package]
+name = "bloom-keystore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Encrypted local keystore for bloom"
+
+[dependencies]
+bloom-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+blake3.workspace = true
+argon2.workspace = true
+chacha20poly1305.workspace = true
+zeroize.workspace = true
+rand.workspace = true
+alloy.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

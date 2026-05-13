@@ -1,9 +1,9 @@
 # Quickstart
 
-A short Anvil-backed walkthrough of the `beth` CLI. The CLI's `vfs`
+A short Anvil-backed walkthrough of the `bloom` CLI. The CLI's `vfs`
 subcommands are the v1 substitute for the optional NFS mount: every
 `cat` / `ls` / `write` here is what an agent would otherwise do
-through the mounted `/eth/` tree.
+through the mounted `/bloom/` tree.
 
 ## Prerequisites
 
@@ -14,11 +14,11 @@ through the mounted `/eth/` tree.
 
 ## 1. Initialise a fresh home
 
-`BETH_HOME` overrides the home directory (default `~/.bloom-eth`).
+`BLOOM_HOME` overrides the home directory (default `~/.bloom`).
 Using a tmp path keeps the demo isolated.
 
 ```sh
-BETH_HOME=/tmp/beth-demo cargo run -p beth -- init
+BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- init
 ```
 
 This prints the home dir, config path, and configured chains. The
@@ -38,7 +38,7 @@ ignore them and create our own wallet.
 
 ## 3. Create a wallet
 
-The keystore encrypts the key with `BETH_PASSPHRASE` (argon2id +
+The keystore encrypts the key with `BLOOM_PASSPHRASE` (argon2id +
 chacha20poly1305). For a demo, any passphrase works.
 
 The CLI shortcut and the VFS write are equivalent — wallets are
@@ -46,47 +46,47 @@ first-class VFS citizens:
 
 ```sh
 # CLI shortcut
-BETH_HOME=/tmp/beth-demo BETH_PASSPHRASE=devonly \
-  cargo run -p beth -- wallet new alice --passphrase devonly
+BLOOM_HOME=/tmp/bloom-demo BLOOM_PASSPHRASE=devonly \
+  cargo run -p bloom -- wallet new alice --passphrase devonly
 
 # Equivalent VFS write (what an agent would do over the mount).
 # Plain text body = create a local wallet with that name.
-BETH_HOME=/tmp/beth-demo BETH_PASSPHRASE=devonly \
-  cargo run -p beth -- vfs write /wallets/new --data 'alice'
+BLOOM_HOME=/tmp/bloom-demo BLOOM_PASSPHRASE=devonly \
+  cargo run -p bloom -- vfs write /wallets/new --data 'alice'
 
 # Full TOML form for import / watch:
 #   name = "alice"
 #   kind = "import"        # or "local" (default) | "watch"
 #   private_key = "0x..."  # required for import
 #   address = "0x..."      # required for watch
-#   passphrase = "..."     # optional; falls back to BETH_PASSPHRASE
+#   passphrase = "..."     # optional; falls back to BLOOM_PASSPHRASE
 ```
 
 You'll get back something like `created wallet 'alice': 0x...`. List
 wallets to confirm:
 
 ```sh
-BETH_HOME=/tmp/beth-demo cargo run -p beth -- wallet list
+BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- wallet list
 ```
 
 ## 4. Inspect the chain through the VFS
 
-The same paths an agent would `cat` over NFS work via `beth vfs cat`:
+The same paths an agent would `cat` over NFS work via `bloom vfs cat`:
 
 ```sh
-BETH_HOME=/tmp/beth-demo \
-  cargo run -p beth -- vfs cat /chains/anvil/head/number
+BLOOM_HOME=/tmp/bloom-demo \
+  cargo run -p bloom -- vfs cat /chains/anvil/head/number
 
-BETH_HOME=/tmp/beth-demo \
-  cargo run -p beth -- vfs ls /chains/anvil/head
+BLOOM_HOME=/tmp/bloom-demo \
+  cargo run -p bloom -- vfs ls /chains/anvil/head
 ```
 
 Status, docs, and the keyless DefiLlama oracle are also reachable:
 
 ```sh
-BETH_HOME=/tmp/beth-demo cargo run -p beth -- vfs cat /docs/README.md
-BETH_HOME=/tmp/beth-demo cargo run -p beth -- vfs cat /status/daemon.json
-BETH_HOME=/tmp/beth-demo cargo run -p beth -- vfs cat /prices/spot/eth.usd
+BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- vfs cat /docs/README.md
+BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- vfs cat /status/daemon.json
+BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- vfs cat /prices/spot/eth.usd
 ```
 
 ## 5. Stage a transaction
@@ -96,13 +96,13 @@ an NFS mount this would be:
 
 ```sh
 echo 'send 0.01 eth to 0xabc... on anvil' \
-  > /eth/wallets/alice/chains/anvil/outbox/new.tx
+  > /bloom/wallets/alice/chains/anvil/outbox/new.tx
 ```
 
 Without the mount, the equivalent is:
 
 ```sh
-BETH_HOME=/tmp/beth-demo cargo run -p beth -- vfs write \
+BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- vfs write \
   /wallets/alice/chains/anvil/outbox/new.tx \
   --data 'send 0.01 eth to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on anvil'
 ```
@@ -115,11 +115,11 @@ checks, and writes a `pending/<id>/` directory under the same outbox.
 List pending entries and read the human-readable plan:
 
 ```sh
-BETH_HOME=/tmp/beth-demo \
-  cargo run -p beth -- vfs ls /wallets/alice/chains/anvil/outbox/pending
+BLOOM_HOME=/tmp/bloom-demo \
+  cargo run -p bloom -- vfs ls /wallets/alice/chains/anvil/outbox/pending
 
-BETH_HOME=/tmp/beth-demo \
-  cargo run -p beth -- vfs cat /wallets/alice/chains/anvil/outbox/pending/<id>/plan.md
+BLOOM_HOME=/tmp/bloom-demo \
+  cargo run -p bloom -- vfs cat /wallets/alice/chains/anvil/outbox/pending/<id>/plan.md
 ```
 
 Confirm by writing any non-empty content to the `confirm` file. Because
@@ -128,18 +128,18 @@ unlock is process-scoped — use `wallet confirm` to unlock and broadcast
 in one shot:
 
 ```sh
-BETH_HOME=/tmp/beth-demo \
-  cargo run -p beth -- wallet confirm alice anvil <id> \
+BLOOM_HOME=/tmp/bloom-demo \
+  cargo run -p bloom -- wallet confirm alice anvil <id> \
     --passphrase devonly --text y
 ```
 
-When `beth serve` is running, the unlock survives across calls and you
+When `bloom serve` is running, the unlock survives across calls and you
 can write to `…/pending/<id>/confirm` directly:
 
 ```sh
-BETH_HOME=/tmp/beth-demo cargo run -p beth -- wallet unlock alice \
+BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- wallet unlock alice \
   --passphrase devonly
-BETH_HOME=/tmp/beth-demo cargo run -p beth -- vfs write \
+BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- vfs write \
   /wallets/alice/chains/anvil/outbox/pending/<id>/confirm --data y
 ```
 
@@ -150,15 +150,15 @@ it expire after the configured TTL) cancels the stage.
 
 ## What's shipped
 
-- **One-shot CLI** — `beth vfs cat|ls|write` and `beth wallet
+- **One-shot CLI** — `bloom vfs cat|ls|write` and `bloom wallet
   new|import|list|unlock|stage|confirm` build the in-process daemon
   per invocation.
-- **Long-running daemon** — `beth serve` exposes a UDS JSON-RPC at
-  `~/.bloom-eth/run/beth.sock`. Talk to it with `beth ipc call
-  <method>` (raw JSON-RPC) or any `beth vfs` call (auto-routes through
+- **Long-running daemon** — `bloom serve` exposes a UDS JSON-RPC at
+  `~/.bloom/run/bloom.sock`. Talk to it with `bloom ipc call
+  <method>` (raw JSON-RPC) or any `bloom vfs` call (auto-routes through
   the socket when it exists).
 - **NFS mount adapter** — feature-gated. Build with
-  `cargo build --features beth-daemon/mount` and call
+  `cargo build --features bloom-daemon/mount` and call
   `Daemon::mount(path)` to expose the VFS over NFSv4.
 - **Watch executor** — write a TOML spec to `watch/new`, tail
   `watch/<id>/live` for the running state, or read
@@ -176,7 +176,7 @@ it expire after the configured TTL) cancels the stage.
   exposed at `ens/<name>.eth`.
 - **DeFi intents** — `defi/intents/<wallet>/...` (Enso shortcuts).
   Mounted whenever an `[enso]` block is present in `config.toml`.
-  Requires an Enso API key (`BETH_ENSO_KEY` or `ENSO_API_KEY`); the
+  Requires an Enso API key (`BLOOM_ENSO_KEY` or `ENSO_API_KEY`); the
   client returns `MissingKey` otherwise. ERC-20 token-in routes
   auto-stage an `approve(spender, max)` ahead of the swap when
   needed; default slippage is 50 bps.
@@ -199,11 +199,11 @@ For an interactive experience with two preconfigured chains
 scripts/play.sh
 ```
 
-It builds `beth` in release mode, starts Anvil in Docker, writes a
-playground config to `~/.bloom-eth-play/config.toml`, imports
+It builds `bloom` in release mode, starts Anvil in Docker, writes a
+playground config to `~/.bloom-play/config.toml`, imports
 `alice` / `bob` / `carol` from Anvil's deterministic mnemonic
-(passphrase `play`), runs `beth serve` in the background, and drops
-you into a subshell with a `beth` shell function pinned to the play
+(passphrase `play`), runs `bloom serve` in the background, and drops
+you into a subshell with a `bloom` shell function pinned to the play
 home. Exit the subshell to tear everything down.
 
 ## End-to-end acceptance
@@ -211,7 +211,7 @@ home. Exit the subshell to tear everything down.
 `scripts/acceptance.sh` boots Anvil, imports the funded test key, and
 drives a native ETH send and an ERC-20 transfer through the
 stage-confirm-broadcast loop on a local devnet. Optional Uniswap V2 /
-Enso scenarios on a mainnet fork run when `BETH_MAINNET_RPC` is set.
+Enso scenarios on a mainnet fork run when `BLOOM_MAINNET_RPC` is set.
 
 `tests/docker/run.sh` is the dockerized harness with six modes:
 
@@ -223,7 +223,7 @@ Enso scenarios on a mainnet fork run when `BETH_MAINNET_RPC` is set.
   spins up an anvil fork of Base, exercises wallet/outbox + chain
   reads through the mount. No Enso key required.
 - `--enso` — `docker compose --profile enso`: same anvil fork, runs
-  the full Enso → Aave intent flow. Requires `BETH_ENSO_KEY`.
+  the full Enso → Aave intent flow. Requires `BLOOM_ENSO_KEY`.
 - `--mempool` — `docker compose --profile mempool`: spins up an
   in-container WebSocket mock that emulates Alchemy's
   `alchemy_pendingTransactions` feed and asserts the daemon's
@@ -231,8 +231,8 @@ Enso scenarios on a mainnet fork run when `BETH_MAINNET_RPC` is set.
   No external keys required.
 - `--enso-live` — runs the Enso + Aave flow against Base **mainnet**
   with real funds through the mounted filesystem surface. Gated on
-  a sourced `test.env` with `BETH_ENSO_KEY`, `BETH_LIVE_HOME`,
-  `BETH_LIVE_DEST1`, and `BETH_PASSPHRASE`.
+  a sourced `test.env` with `BLOOM_ENSO_KEY`, `BLOOM_LIVE_HOME`,
+  `BLOOM_LIVE_DEST1`, and `BLOOM_PASSPHRASE`.
 
 Shared scaffolding (logging, mount lifecycle, pending-stage helpers,
 receipt assertions, deterministic Anvil constants) lives in
@@ -257,10 +257,10 @@ implements `eth_subscribe("newPendingTransactions")`.
 Restart the daemon, then tail the live mempool:
 
 ```sh
-beth vfs cat /eth/chains/ethereum/mempool/status.json   # subscription + counts
-beth vfs cat /eth/chains/ethereum/mempool/live          # blocks until next pending tx
-beth vfs cat /eth/chains/ethereum/mempool/recent.jsonl | head
-beth vfs cat /eth/chains/ethereum/mempool/by_address/0xYourAddress/pending.jsonl
+bloom vfs cat /eth/chains/ethereum/mempool/status.json   # subscription + counts
+bloom vfs cat /eth/chains/ethereum/mempool/live          # blocks until next pending tx
+bloom vfs cat /eth/chains/ethereum/mempool/recent.jsonl | head
+bloom vfs cat /eth/chains/ethereum/mempool/by_address/0xYourAddress/pending.jsonl
 ```
 
 To opt a wallet into private orderflow (mainnet only):
