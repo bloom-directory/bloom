@@ -2,7 +2,7 @@
 **/*.rs.bk
 Cargo.lock
 .DS_Store
-~/.bloom-eth
+~/.bloom
 .env
 test.env
 *.local.toml

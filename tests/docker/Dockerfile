@@ -1,4 +1,4 @@
-# Dockerfile for the bloom-eth NFS mount integration test.
+# Dockerfile for the bloom NFS mount integration test.
 #
 # Mirrors the bloom approach: rust:bookworm + nfs-common provides the
 # mount.nfs4 binary so the in-process embednfs server can be attached

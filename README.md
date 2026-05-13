@@ -1,13 +1,13 @@
-# bloom-eth
+# bloom
 
-`bloom-eth` (binary: `beth`) presents Ethereum and EVM L2s as a virtual
+`bloom` (binary: `bloom`) presents Ethereum and EVM L2s as a virtual
 filesystem: reads are blockchain queries, writes are transaction intents,
 and `tail -f` is a live event stream. A single Rust daemon owns the
 plumbing — RPC, signing, broadcast, caching — and exposes it as POSIX
 paths so an agent can drive onchain workflows with `cat`, `ls`, and
 `echo` instead of a Web3 SDK.
 
-**Status:** v1 functional. Long-running daemon (`beth serve`) with a UDS
+**Status:** v1 functional. Long-running daemon (`bloom serve`) with a UDS
 JSON-RPC IPC, in-process VFS, and an optional NFSv4 mount adapter. Live
 verified end-to-end on Base mainnet (`tests/docker/run.sh --enso-live`).
 
@@ -17,23 +17,23 @@ The workspace is split into 15 crates:
 
 | Crate | Responsibility |
 |-------|----------------|
-| `beth` | CLI binary; thin client + driver of the in-process daemon. |
-| `beth-daemon` | Wires the daemon: home dir, config, chains, keystore, VFS, IPC, ENS adapter, watch executor. |
-| `beth-vfs` | Path router, handler trait, per-path caching, vendored docs, 11 handler modules. |
-| `beth-chain` | RPC pool and per-chain engine (head, blocks, addresses, ERC-20). |
-| `beth-tx` | Tx engine: stage, simulate, sign, broadcast, nonce manager, policy enforcement. |
-| `beth-keystore` | Encrypted local key storage (argon2id + chacha20poly1305) and signer. |
-| `beth-defi` | Enso Shortcuts client + natural-language intent parser. |
-| `beth-watch` | Subscription registry + polling executor task with rotated event logs. |
-| `beth-mount` | NFSv4 mount adapter (feature `mount`). |
-| `beth-tools` | Pure helpers: keccak / sha256 / blake3 / hex / base64 / ABI / RLP / EIP-712 hash. |
-| `beth-etherscan` | Etherscan v2 multichain client + on-disk TTL cache. |
-| `beth-ens` | ENS namehash + forward / reverse / text / contenthash resolution. |
-| `beth-prices` | DefiLlama keyless price oracle. |
-| `beth-proto` | Shared types: paths, configs (`Config`/`BackendsConfig`), audit records, address book, intents, policy, plan, units. |
-| `beth-it` | Integration-test harness crate. |
+| `bloom` | CLI binary; thin client + driver of the in-process daemon. |
+| `bloom-daemon` | Wires the daemon: home dir, config, chains, keystore, VFS, IPC, ENS adapter, watch executor. |
+| `bloom-vfs` | Path router, handler trait, per-path caching, vendored docs, 11 handler modules. |
+| `bloom-chain` | RPC pool and per-chain engine (head, blocks, addresses, ERC-20). |
+| `bloom-tx` | Tx engine: stage, simulate, sign, broadcast, nonce manager, policy enforcement. |
+| `bloom-keystore` | Encrypted local key storage (argon2id + chacha20poly1305) and signer. |
+| `bloom-defi` | Enso Shortcuts client + natural-language intent parser. |
+| `bloom-watch` | Subscription registry + polling executor task with rotated event logs. |
+| `bloom-mount` | NFSv4 mount adapter (feature `mount`). |
+| `bloom-tools` | Pure helpers: keccak / sha256 / blake3 / hex / base64 / ABI / RLP / EIP-712 hash. |
+| `bloom-etherscan` | Etherscan v2 multichain client + on-disk TTL cache. |
+| `bloom-ens` | ENS namehash + forward / reverse / text / contenthash resolution. |
+| `bloom-prices` | DefiLlama keyless price oracle. |
+| `bloom-proto` | Shared types: paths, configs (`Config`/`BackendsConfig`), audit records, address book, intents, policy, plan, units. |
+| `bloom-it` | Integration-test harness crate. |
 
-See `docs/specs/2026-05-08-bloom-eth-design.md` for the full design and
+See `docs/specs/2026-05-08-bloom-design.md` for the full design and
 `docs/AUDIT.md` for the per-section spec-to-artifact map.
 
 ## Build and run
@@ -41,26 +41,29 @@ See `docs/specs/2026-05-08-bloom-eth-design.md` for the full design and
 ```sh
 cargo build --workspace
 cargo test --workspace --lib
-cargo run -p beth -- status
+cargo run -p bloom -- status
 ```
 
 Two ways to drive the VFS:
 
-- **One-shot CLI** — every `beth vfs cat|ls|write` invocation builds the
+- **One-shot CLI** — every `bloom vfs cat|ls|write` invocation builds the
   in-process daemon, performs the op, and exits. No socket needed.
-- **Long-running daemon** — `beth serve` listens on a UDS JSON-RPC
-  socket at `~/.bloom-eth/run/beth.sock`. Subsequent `beth vfs` calls
+- **Long-running daemon** — `bloom serve` listens on a UDS JSON-RPC
+  socket at `~/.bloom/run/bloom.sock`. Subsequent `bloom vfs` calls
   detect the socket and route through it, sharing daemon state (unlock
-  cache, watches, defi sessions, etherscan cache). `beth ipc call <method>`
+  cache, watches, defi sessions, etherscan cache). `bloom ipc call <method>`
   speaks the JSON-RPC directly.
-- **NFS mount** (optional) — build with `cargo build --features beth-daemon/mount`
-  and call `Daemon::mount(path).await` to expose the VFS as a real
-  POSIX filesystem over the kernel NFS client.
+- **NFS mount** (optional) — build with `cargo build -p bloom --features mount`
+  or use a full-feature release binary, then run `bloom serve --mount [PATH]`
+  to expose the VFS as a real POSIX filesystem over the kernel NFS client.
+  With no path, the mount point defaults to `/bloom` on Linux and
+  `/Volumes/bloom` on macOS. The mount point must already exist and the
+  platform mount command may require elevated privileges.
 
 ## Filesystem layout
 
-The VFS is rooted at `/eth/` (the default NFS mount path) with these
-top-level trees:
+The VFS is rooted at the selected mount path (for example `/bloom/` on
+Linux or `/Volumes/bloom/` on macOS) with these top-level trees:
 
 - `chains/<chain>/` — read-only chain views: head, blocks, addresses,
   ERC-20 balances, txs, receipts, gas, etherscan-backed history. The
@@ -106,7 +109,7 @@ top-level trees:
   counts, policy flags, wallet/outbox counts, and the live
   `status/backends/<feature>` declaration of which data source
   (etherscan / rpc / indexer) each surface is wired to.
-- `docs/` — in-tree help, vendored from `crates/beth-vfs/src/docs/`.
+- `docs/` — in-tree help, vendored from `crates/bloom-vfs/src/docs/`.
 
 See [QUICKSTART.md](./QUICKSTART.md) for an Anvil-backed walkthrough
 and [docs/AUDIT.md](./docs/AUDIT.md) for the per-surface implementation
@@ -116,7 +119,7 @@ map and live-network verification log.
 
 - **Mainnet broadcasts disabled by default.** Set
   `block_mainnet_broadcast = false` plus a per-chain `allow_broadcast =
-  true` in `~/.bloom-eth/config.toml` to opt a chain into broadcasting.
+  true` in `~/.bloom/config.toml` to opt a chain into broadcasting.
 - **Private keys are never readable through the FS.** The keystore
   lives outside the mount; only `address` and `public_key` are
   exposed.
@@ -138,7 +141,7 @@ map and live-network verification log.
 
 - **Single-user daemon.** No daemon-level auth or multi-tenant
   isolation; the mount inherits the OS user's permissions on
-  `~/.bloom-eth`. Multi-user mode is a stretch goal in the spec.
+  `~/.bloom`. Multi-user mode is a stretch goal in the spec.
 - **Mainnet broadcast disabled by default.** A live tx requires both
   the global `block_mainnet_broadcast = false` (config default already
   blocks mainnet) and a per-chain `allow_broadcast = true`. Forgetting
@@ -167,7 +170,7 @@ map and live-network verification log.
 - **Mempool surface not implemented.** The spec's `chains/<c>/mempool/`
   tree is not wired up — it depends on provider-specific APIs
   (Alchemy / Blocknative).
-- **Watch executor is poll-based.** `beth-chain` is HTTP-only, so the
+- **Watch executor is poll-based.** `bloom-chain` is HTTP-only, so the
   executor polls every 2s. No websocket fast path yet; per-spec
   latency is bounded by the tick interval.
 - **NFT surface ships in both directions.** Reads:
@@ -191,4 +194,4 @@ map and live-network verification log.
 
 ## License
 
-Licensed under either of MIT or Apache-2.0 at your option.
+Licensed under the MIT License. See [LICENSE](./LICENSE).

@@ -1,0 +1,23 @@
+[package]
+name = "bloom-etherscan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bloom-proto = { workspace = true }
+alloy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tempfile = { workspace = true }

@@ -1,0 +1,49 @@
+[package]
+name = "bloom-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Daemon library wiring VFS + chain + tx + mount for bloom"
+
+[features]
+default = []
+# Forward to bloom-mount/mount: enables `Daemon::mount(path)` and pulls
+# in the embednfs server. Off by default so the default daemon build
+# stays portable (no embednfs git dep, no kernel NFS tooling).
+mount = ["bloom-mount/mount"]
+# Forward to bloom-revert/bytecode-decompile: appends the heimdall-rs
+# decompile fallback to the revert-decoder chain. Heavy build (heimdall
+# pulls a lot of git deps) so opt-in only.
+bytecode-decompile = ["bloom-revert/bytecode-decompile"]
+
+[dependencies]
+bloom-proto.workspace = true
+bloom-keystore.workspace = true
+bloom-chain.workspace = true
+bloom-tx.workspace = true
+bloom-vfs.workspace = true
+bloom-tools.workspace = true
+bloom-defi.workspace = true
+bloom-watch.workspace = true
+bloom-mount.workspace = true
+bloom-ens.workspace = true
+bloom-etherscan.workspace = true
+bloom-prices.workspace = true
+bloom-revert.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+parking_lot.workspace = true
+alloy.workspace = true
+url.workspace = true
+base64.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

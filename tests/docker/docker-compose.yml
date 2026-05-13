@@ -15,8 +15,8 @@
 # but every broadcast lands on a throwaway fork. BASE_FORK_RPC_URL
 # overrides the upstream when the public RPC rate-limits.
 
-x-beth-test: &beth-test
-  image: ${BETH_TEST_IMAGE:-bloom-eth-mount-test:latest}
+x-bloom-test: &bloom-test
+  image: ${BLOOM_TEST_IMAGE:-bloom-mount-test:latest}
   depends_on:
     anvil-fork:
       condition: service_healthy
@@ -36,13 +36,13 @@ x-beth-test: &beth-test
     # Persist /tmp/cargo-target across `--rm` runs so the second test
     # invocation onwards only pays for incremental compiles. Volume name
     # mirrors the one tests/docker/run.sh uses for the non-compose paths.
-    - bloom-eth-cargo-cache:/tmp/cargo-target
+    - bloom-cargo-cache:/tmp/cargo-target
   working_dir: /workspace
 
 services:
   anvil-fork:
     image: ghcr.io/foundry-rs/foundry:latest
-    container_name: beth-anvil
+    container_name: bloom-anvil
     entrypoint: ["anvil"]
     command:
       - --fork-url
@@ -58,7 +58,7 @@ services:
       - --silent
     ports:
       # Exposed for host-side debugging (cast, curl, etc.). Not
-      # required by the in-network beth-test client.
+      # required by the in-network bloom-test client.
       - "127.0.0.1:8546:8545"
     healthcheck:
       test:
@@ -71,32 +71,32 @@ services:
       retries: 60
       start_period: 5s
 
-  beth-test-enso:
-    <<: *beth-test
+  bloom-test-enso:
+    <<: *bloom-test
     profiles: ["enso"]
-    container_name: beth-enso-driver
+    container_name: bloom-enso-driver
     environment:
-      - BETH_ENSO_KEY
-      - BETH_TEST_WALLET_PASSPHRASE=test
+      - BLOOM_ENSO_KEY
+      - BLOOM_TEST_WALLET_PASSPHRASE=test
       - BASE_FORK_INTERNAL_URL=http://anvil-fork:8545
       - RUST_LOG=info
     command: ["bash", "tests/docker/test_enso_aave.sh"]
 
-  beth-test-fork:
-    <<: *beth-test
+  bloom-test-fork:
+    <<: *bloom-test
     profiles: ["fork"]
-    container_name: beth-fork-driver
+    container_name: bloom-fork-driver
     environment:
-      - BETH_TEST_WALLET_PASSPHRASE=test
+      - BLOOM_TEST_WALLET_PASSPHRASE=test
       - BASE_FORK_INTERNAL_URL=http://anvil-fork:8545
       - RUST_LOG=info
     command: ["bash", "tests/docker/test_fork_mount.sh"]
 
 volumes:
-  bloom-eth-cargo-cache:
+  bloom-cargo-cache:
     # Pin the literal name so this volume is the same one the
     # non-compose paths in tests/docker/run.sh (--mount, --workspace,
-    # --enso-live) mount as `bloom-eth-cargo-cache`. Without this,
-    # compose would mangle it to `<project>_bloom-eth-cargo-cache` and
+    # --enso-live) mount as `bloom-cargo-cache`. Without this,
+    # compose would mangle it to `<project>_bloom-cargo-cache` and
     # the cargo cache wouldn't carry over between modes.
-    name: bloom-eth-cargo-cache
+    name: bloom-cargo-cache

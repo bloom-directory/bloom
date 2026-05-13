@@ -1,0 +1,43 @@
+[package]
+name = "bloom-revert"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tiered EVM revert returndata decoder (selector match → ABI decode)."
+
+[features]
+default = []
+# Enables the heimdall-rs bytecode-decompile fallback decoder.
+# Heavy: pulls in the heimdall-rs git deps (~hundreds of crates) and
+# extends `cargo build` time considerably; off by default so a stock
+# build stays light.
+bytecode-decompile = ["dep:heimdall-decompiler"]
+
+[dependencies]
+alloy.workspace = true
+alloy-dyn-abi.workspace = true
+async-trait.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha3.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+tracing.workspace = true
+
+bloom-chain.workspace = true
+bloom-etherscan.workspace = true
+
+# heimdall pinned to rev a981d489 (HEAD of main on 2026-05-09).
+# Bumping requires re-validating against bloom-revert's heimdall.rs decoder
+# — the public surface (`decompile`, `DecompileResult.abi`, `DecompilerArgsBuilder`)
+# is the integration point.
+heimdall-decompiler = { git = "https://github.com/Jon-Becker/heimdall-rs", rev = "a981d489d106ef648b862c1a1bfe1eab8af769b9", optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing-subscriber.workspace = true
+wiremock = "0.6"

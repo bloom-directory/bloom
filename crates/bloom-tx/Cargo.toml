@@ -1,0 +1,27 @@
+[package]
+name = "bloom-tx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tx engine, intent parser, policy for bloom"
+
+[dependencies]
+bloom-proto.workspace = true
+bloom-chain.workspace = true
+bloom-rpc.workspace = true
+bloom-keystore.workspace = true
+bloom-tools.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+hex.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+alloy.workspace = true
+parking_lot.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

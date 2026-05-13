@@ -19,11 +19,11 @@ require_env() {
 }
 
 # ---------- shared mount layout ----------
-# The chain tests (enso, fork) mount at /eth so user-facing paths read
-# `/eth/wallets/...`. The basic mount test overrides MNT/SENTINEL before
+# The chain tests (enso, fork) mount at /bloom so user-facing paths read
+# `/bloom/wallets/...`. The basic mount test overrides MNT/SENTINEL before
 # sourcing this file. PIDFILE/LOGFILE are stable across all of them.
-: "${MNT:=/eth}"
-: "${SENTINEL:=/.beth-mounted}"
+: "${MNT:=/bloom}"
+: "${SENTINEL:=/.bloom-mounted}"
 : "${PIDFILE:=/tmp/mount_demo.pid}"
 : "${LOGFILE:=/tmp/mount_demo.log}"
 
@@ -51,12 +51,12 @@ prepare_home_dir() {
 # it. Bails if the requested wallet is missing.
 prepare_live_home() {
     local home_dir=$1 wallet=$2
-    [[ -d /beth-live-home/keystore ]] \
-        || fail "/beth-live-home/keystore missing (mount via run.sh --enso-live)"
+    [[ -d /bloom-live-home/keystore ]] \
+        || fail "/bloom-live-home/keystore missing (mount via run.sh --enso-live)"
     log "copying live keystore -> $home_dir/keystore (in-container, throwaway)"
-    cp -r /beth-live-home/keystore "$home_dir/keystore"
+    cp -r /bloom-live-home/keystore "$home_dir/keystore"
     [[ -d "$home_dir/keystore/$wallet" ]] \
-        || fail "no '$wallet' entry under /beth-live-home/keystore"
+        || fail "no '$wallet' entry under /bloom-live-home/keystore"
 }
 
 write_base_config() {
@@ -93,7 +93,7 @@ build_mount_demo() {
     log "cargo build --release --features mount --example mount_demo"
     cargo build \
         --release \
-        --package beth-daemon \
+        --package bloom-daemon \
         --features mount \
         --example mount_demo >&2
 
@@ -117,7 +117,7 @@ top_up_anvil_balance() {
 
 # Spawn mount_demo. When `wallet` is empty the test-fixture env vars are
 # omitted entirely (mount_demo treats *unset* differently from *set to
-# empty* — an empty BETH_TEST_WALLET_NAME would otherwise trip the
+# empty* — an empty BLOOM_TEST_WALLET_NAME would otherwise trip the
 # unlock branch with a blank name).
 start_mount_demo() {
     local mnt=$1 home_dir=$2 pidfile=$3 logfile=$4
@@ -125,9 +125,9 @@ start_mount_demo() {
 
     log "spawning mount_demo (mount=$mnt home=$home_dir)"
     if [[ -n "$wallet" ]]; then
-        BETH_TEST_WALLET_NAME="$wallet" \
-        BETH_TEST_WALLET_KEY="$import_key" \
-        BETH_TEST_WALLET_PASSPHRASE="$passphrase" \
+        BLOOM_TEST_WALLET_NAME="$wallet" \
+        BLOOM_TEST_WALLET_KEY="$import_key" \
+        BLOOM_TEST_WALLET_PASSPHRASE="$passphrase" \
         RUST_LOG="${RUST_LOG:-info}" \
             "$EXAMPLE_BIN" "$mnt" "$home_dir" >"$logfile" 2>&1 &
     else

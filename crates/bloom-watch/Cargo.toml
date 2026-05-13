@@ -1,0 +1,25 @@
+[package]
+name = "bloom-watch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Subscriptions and live tails for bloom"
+
+[dependencies]
+bloom-proto.workspace = true
+bloom-chain.workspace = true
+alloy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time"] }
+tracing-subscriber.workspace = true

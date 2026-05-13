@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# In-container driver for the bloom-eth NFS mount integration test.
+# In-container driver for the bloom NFS mount integration test.
 #
 # Runs inside the Dockerfile next to this script. Steps:
 #   1. Build the `mount_demo` example (the only thing that pulls in
 #      embednfs); skip a full workspace build to keep the test loop
 #      tight.
-#   2. Spawn the example pointing at /mnt/beth with a fresh home dir.
-#   3. Wait for the .beth-mounted sentinel the example drops.
+#   2. Spawn the example pointing at /mnt/bloom with a fresh home dir.
+#   3. Wait for the .bloom-mounted sentinel the example drops.
 #   4. Exercise a few VFS paths through the kernel mount.
 #   5. SIGTERM the example so it unmounts cleanly, then exit.
 #
@@ -18,13 +18,13 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 LOG_PREFIX=mount-test
 
-# This test mounts at /mnt/beth (not the chain tests' /eth) so the
-# sentinel sits at /mnt/.beth-mounted. Override before sourcing.
-MNT=/mnt/beth
-SENTINEL=/mnt/.beth-mounted
+# This test mounts at /mnt/bloom (not the chain tests' /bloom) so the
+# sentinel sits at /mnt/.bloom-mounted. Override before sourcing.
+MNT=/mnt/bloom
+SENTINEL=/mnt/.bloom-mounted
 source "$SCRIPT_DIR/lib.sh"
 
-HOME_DIR=/tmp/beth-home
+HOME_DIR=/tmp/bloom-home
 
 prepare_home_dir "$HOME_DIR"
 build_mount_demo
@@ -66,10 +66,10 @@ echo "::endgroup::"
 # client routinely upgrades small writes to DATA_SYNC/FILE_SYNC, and
 # the embednfs server enforces `actual_stability >= requested`. The
 # adapter used to hard-code UNSTABLE in its WRITE reply, so a single
-# `printf '%s' BODY > /eth/<writable>` failed with EREMOTEIO (the
+# `printf '%s' BODY > /bloom/<writable>` failed with EREMOTEIO (the
 # kernel-side surface of NFS4ERR_SERVERFAULT) — even though the
 # handler had already accepted the body. The fix lives in
-# `crates/beth-mount/src/adapter.rs::write` (honour the requested
+# `crates/bloom-mount/src/adapter.rs::write` (honour the requested
 # stability level after an eager flush).
 #
 # `watch/new` is a good test target: the handler accepts a small

@@ -1,22 +1,22 @@
 [workspace]
 members = [
-  "crates/beth",
-  "crates/beth-daemon",
-  "crates/beth-vfs",
-  "crates/beth-chain",
-  "crates/beth-rpc",
-  "crates/beth-tx",
-  "crates/beth-keystore",
-  "crates/beth-defi",
-  "crates/beth-watch",
-  "crates/beth-mount",
-  "crates/beth-proto",
-  "crates/beth-tools",
-  "crates/beth-etherscan",
-  "crates/beth-ens",
-  "crates/beth-prices",
-  "crates/beth-revert",
-  "crates/beth-it",
+  "crates/bloom",
+  "crates/bloom-daemon",
+  "crates/bloom-vfs",
+  "crates/bloom-chain",
+  "crates/bloom-rpc",
+  "crates/bloom-tx",
+  "crates/bloom-keystore",
+  "crates/bloom-defi",
+  "crates/bloom-watch",
+  "crates/bloom-mount",
+  "crates/bloom-proto",
+  "crates/bloom-tools",
+  "crates/bloom-etherscan",
+  "crates/bloom-ens",
+  "crates/bloom-prices",
+  "crates/bloom-revert",
+  "crates/bloom-it",
 ]
 resolver = "2"
 
@@ -24,8 +24,8 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/bloom-directory/bloom-eth"
+license = "MIT"
+repository = "https://github.com/bloom-directory/bloom"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -66,21 +66,21 @@ alloy = { version = "2", features = ["full", "signer-local", "rpc-types", "provi
 alloy-dyn-abi = { version = "1.5", features = ["eip712"] }
 
 # Internal crates
-beth-proto    = { path = "crates/beth-proto" }
-beth-keystore = { path = "crates/beth-keystore" }
-beth-rpc      = { path = "crates/beth-rpc" }
-beth-chain    = { path = "crates/beth-chain" }
-beth-tx       = { path = "crates/beth-tx" }
-beth-vfs      = { path = "crates/beth-vfs" }
-beth-tools    = { path = "crates/beth-tools" }
-beth-defi     = { path = "crates/beth-defi" }
-beth-watch    = { path = "crates/beth-watch" }
-beth-mount    = { path = "crates/beth-mount" }
-beth-etherscan = { path = "crates/beth-etherscan" }
-beth-ens      = { path = "crates/beth-ens" }
-beth-prices   = { path = "crates/beth-prices" }
-beth-revert   = { path = "crates/beth-revert" }
-beth-daemon   = { path = "crates/beth-daemon" }
+bloom-proto    = { path = "crates/bloom-proto" }
+bloom-keystore = { path = "crates/bloom-keystore" }
+bloom-rpc      = { path = "crates/bloom-rpc" }
+bloom-chain    = { path = "crates/bloom-chain" }
+bloom-tx       = { path = "crates/bloom-tx" }
+bloom-vfs      = { path = "crates/bloom-vfs" }
+bloom-tools    = { path = "crates/bloom-tools" }
+bloom-defi     = { path = "crates/bloom-defi" }
+bloom-watch    = { path = "crates/bloom-watch" }
+bloom-mount    = { path = "crates/bloom-mount" }
+bloom-etherscan = { path = "crates/bloom-etherscan" }
+bloom-ens      = { path = "crates/bloom-ens" }
+bloom-prices   = { path = "crates/bloom-prices" }
+bloom-revert   = { path = "crates/bloom-revert" }
+bloom-daemon   = { path = "crates/bloom-daemon" }
 
 [profile.release]
 lto = "thin"
