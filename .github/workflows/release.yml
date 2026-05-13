@@ -35,14 +35,6 @@ jobs:
             os: macos-latest
             binary: bloom
             archive: tar.gz
-          - asset_name: bloom-windows-x86_64.zip
-            os: windows-latest
-            binary: bloom.exe
-            archive: zip
-          - asset_name: bloom-windows-aarch64.zip
-            os: windows-11-arm
-            binary: bloom.exe
-            archive: zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -65,11 +57,6 @@ jobs:
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: tar -czf "dist/${{ matrix.asset_name }}" -C package .
-
-      - name: Create zip
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: Compress-Archive -Path package/* -DestinationPath "dist/${{ matrix.asset_name }}"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
