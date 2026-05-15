@@ -8,6 +8,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 pub const MAINNET_CHAIN_ID: u64 = 1;
+pub const SEPOLIA_CHAIN_ID: u64 = 11155111;
 
 #[derive(Debug, Error)]
 pub enum PrivateRpcError {
@@ -30,8 +31,7 @@ pub enum HealthStatus {
 pub trait PrivateRpcProvider: Send + Sync {
     fn id(&self) -> &'static str;
 
-    /// The chain ids this provider can serve. v1 implementations
-    /// return `&[MAINNET_CHAIN_ID]`.
+    /// The chain ids this provider can serve.
     fn supported_chains(&self) -> &'static [u64];
 
     /// Submit a signed raw tx privately. MUST return the tx hash on
@@ -105,6 +105,11 @@ mod tests {
     #[test]
     fn mainnet_chain_id_is_one() {
         assert_eq!(MAINNET_CHAIN_ID, 1);
+    }
+
+    #[test]
+    fn sepolia_chain_id_matches_public_chain_id() {
+        assert_eq!(SEPOLIA_CHAIN_ID, 11155111);
     }
 
     #[tokio::test]

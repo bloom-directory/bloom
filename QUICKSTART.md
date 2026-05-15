@@ -263,7 +263,7 @@ bloom vfs cat /eth/chains/ethereum/mempool/recent.jsonl | head
 bloom vfs cat /eth/chains/ethereum/mempool/by_address/0xYourAddress/pending.jsonl
 ```
 
-To opt a wallet into private orderflow (mainnet only):
+To opt a wallet into private orderflow:
 
 ```toml
 # wallets/<name>/policy.toml
@@ -272,7 +272,33 @@ enabled = true
 provider = "mev_blocker"   # or "flashbots"
 ```
 
-Future broadcasts from that wallet on chain id 1 route through the
-configured private RPC instead of the public one. Non-mainnet chains
-return an explicit `PrivateNotSupportedOnChain` error rather than
-silently broadcasting publicly.
+Future broadcasts from that wallet on supported chains route through
+the configured private RPC instead of the public one. The current
+Flashbots adapter supports Ethereum mainnet and Sepolia; MEV-Blocker
+is mainnet-only. Unsupported chains return an explicit
+`PrivateNotSupportedOnChain` error rather than silently broadcasting
+publicly.
+
+To run the opt-in Sepolia live send test, fund the same keystore wallet
+used by `--enso-live` with Sepolia ETH, then run:
+
+```sh
+set -a && source test.env && set +a
+BLOOM_RUN_SEPOLIA_PRIVATE_SEND=1 \
+BLOOM_SEPOLIA_RPC_URL="https://your-sepolia-rpc" \
+cargo test -p bloom-mempool --features live-providers \
+  --test it_flashbots_sepolia_send -- --nocapture
+```
+
+Required env: `BLOOM_LIVE_HOME`/`BETH_LIVE_HOME`,
+`BLOOM_LIVE_DEST1`/`BETH_LIVE_DEST1`,
+`BLOOM_PASSPHRASE`/`BETH_PASSPHRASE`,
+`BLOOM_SEPOLIA_RPC_URL`/`BETH_SEPOLIA_RPC_URL`, and
+`BLOOM_RUN_SEPOLIA_PRIVATE_SEND=1`. Optional env:
+`BLOOM_LIVE_WALLET`/`BETH_LIVE_WALLET` (defaults to `dest1`),
+`BLOOM_SEPOLIA_RECIPIENT`/`BETH_SEPOLIA_RECIPIENT`,
+`BLOOM_SEPOLIA_TRANSFER_WEI`/`BETH_SEPOLIA_TRANSFER_WEI`
+(defaults to `100000000000000`),
+`BLOOM_SEPOLIA_PRIORITY_FEE_WEI`/`BETH_SEPOLIA_PRIORITY_FEE_WEI`,
+`BLOOM_SEPOLIA_MAX_FEE_PER_GAS_WEI`/`BETH_SEPOLIA_MAX_FEE_PER_GAS_WEI`,
+and `BLOOM_SEPOLIA_FLASHBOTS_URL`/`BETH_SEPOLIA_FLASHBOTS_URL`.

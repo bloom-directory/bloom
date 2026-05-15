@@ -1081,11 +1081,9 @@ impl TxEngine {
     }
 
     /// Build, sign and broadcast a single concrete `StagedTx`. When
-    /// `policy.private.enabled` is set and the staged chain is mainnet,
-    /// routes through the registered `PrivateRpcProvider` instead of
-    /// `ChainClient::send_raw`. Private routing on any non-mainnet
-    /// chain is rejected (callers must gate by chain or disable private
-    /// for testnets in policy).
+    /// `policy.private.enabled` is set and the staged chain is supported
+    /// by Bloom's private-orderflow policy, routes through the registered
+    /// `PrivateRpcProvider` instead of `ChainClient::send_raw`.
     async fn broadcast(
         &self,
         staged: &StagedTx,
@@ -1143,13 +1141,17 @@ impl TxEngine {
         let mut buf = Vec::new();
         alloy::eips::Encodable2718::encode_2718(&tx_envelope, &mut buf);
         let raw = Bytes::from(buf);
-        let hash = if policy.private.enabled && staged.chain_id == bloom_mempool::MAINNET_CHAIN_ID {
+        let hash = if policy.private.enabled {
+            if !matches!(
+                staged.chain_id,
+                bloom_mempool::MAINNET_CHAIN_ID | bloom_mempool::SEPOLIA_CHAIN_ID
+            ) {
+                return Err(TxEngineError::PrivateNotSupportedOnChain(
+                    chain.spec().name.clone(),
+                ));
+            }
             self.submit_via_private(staged.chain_id, &policy.private.provider, &raw)
                 .await?
-        } else if policy.private.enabled {
-            return Err(TxEngineError::PrivateNotSupportedOnChain(
-                chain.spec().name.clone(),
-            ));
         } else {
             chain.send_raw(raw).await?
         };
@@ -2280,9 +2282,46 @@ mod tests {
         }
     }
 
-    /// Private routing is mainnet-only. When `policy.private.enabled` is
-    /// set on any non-mainnet chain, `broadcast` must reject before
-    /// touching the RPC.
+    /// Sepolia is the live low-risk exercise path for Flashbots Protect.
+    /// When a provider explicitly declares Sepolia support, broadcast
+    /// should route privately instead of falling through to public RPC.
+    #[tokio::test]
+    async fn broadcast_routes_private_on_sepolia_when_provider_supports_it() {
+        static SEPOLIA_ONLY: &[u64] = &[bloom_mempool::SEPOLIA_CHAIN_ID];
+
+        let (engine, mut spec, _dir) = fake_engine(60_000);
+        spec.name = "sepolia".into();
+        spec.chain_id = bloom_mempool::SEPOLIA_CHAIN_ID;
+        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let mut policy = bloom_proto::Policy::default();
+        policy.private.enabled = true;
+        policy.private.provider = "flashbots".into();
+
+        let mock = Arc::new(
+            bloom_mempool::MockPrivateRpcProvider::new("flashbots")
+                .with_supported_chains(SEPOLIA_ONLY),
+        );
+        engine
+            .register_private_rpc(bloom_mempool::SEPOLIA_CHAIN_ID, mock.clone())
+            .expect("register sepolia private provider");
+
+        let mut staged = fake_staged_1559("0001-private-sepolia");
+        staged.chain = "sepolia".into();
+        staged.chain_id = bloom_mempool::SEPOLIA_CHAIN_ID;
+
+        let hash = engine
+            .broadcast(&staged, &chain, &signer, &policy)
+            .await
+            .expect("private sepolia broadcast");
+
+        assert_eq!(mock.submissions().len(), 1);
+        assert_eq!(hash, alloy::primitives::keccak256(&mock.submissions()[0]));
+    }
+
+    /// Private routing is allowlisted by chain. When `policy.private.enabled`
+    /// is set on an unsupported local/test chain, `broadcast` must reject
+    /// before touching the RPC.
     #[tokio::test]
     async fn broadcast_rejects_private_on_non_mainnet() {
         let (engine, spec, _dir) = fake_engine(60_000);

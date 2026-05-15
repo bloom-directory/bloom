@@ -17,6 +17,7 @@ pub use heuristic::{
 pub use index::PendingTxIndex;
 pub use private::{
     HealthStatus, MAINNET_CHAIN_ID, MockPrivateRpcProvider, PrivateRpcError, PrivateRpcProvider,
+    SEPOLIA_CHAIN_ID,
 };
 pub use provider::{MempoolError, MempoolProvider, MockMempoolProvider, PendingTx, TxFees};
 pub use stream::MempoolStream;

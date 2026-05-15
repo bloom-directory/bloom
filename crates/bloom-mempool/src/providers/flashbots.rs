@@ -6,9 +6,12 @@
 use alloy::primitives::{B256, Bytes};
 use async_trait::async_trait;
 
-use crate::private::{HealthStatus, MAINNET_CHAIN_ID, PrivateRpcError, PrivateRpcProvider};
+use crate::private::{
+    HealthStatus, MAINNET_CHAIN_ID, PrivateRpcError, PrivateRpcProvider, SEPOLIA_CHAIN_ID,
+};
 
 pub const DEFAULT_URL: &str = "https://rpc.flashbots.net/fast";
+pub const SEPOLIA_URL: &str = "https://rpc-sepolia.flashbots.net";
 
 pub struct FlashbotsProvider {
     url: String,
@@ -39,7 +42,7 @@ impl PrivateRpcProvider for FlashbotsProvider {
     }
 
     fn supported_chains(&self) -> &'static [u64] {
-        &[MAINNET_CHAIN_ID]
+        &[MAINNET_CHAIN_ID, SEPOLIA_CHAIN_ID]
     }
 
     async fn submit(&self, signed_raw_tx: &Bytes) -> Result<B256, PrivateRpcError> {
@@ -111,7 +114,7 @@ mod tests {
     fn id_and_supported_chains() {
         let p = FlashbotsProvider::default_endpoint().unwrap();
         assert_eq!(p.id(), "flashbots");
-        assert_eq!(p.supported_chains(), &[MAINNET_CHAIN_ID]);
+        assert_eq!(p.supported_chains(), &[MAINNET_CHAIN_ID, SEPOLIA_CHAIN_ID]);
     }
 
     #[cfg(feature = "live-providers")]
