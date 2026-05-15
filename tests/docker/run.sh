@@ -37,7 +37,7 @@
 #                   up an in-container WS mock server that emulates
 #                   alchemy_pendingTransactions and asserts the daemon's
 #                   chains/base/mempool/{status.json,recent.jsonl} surface
-#                   populates within ~5 seconds. No Enso key required.
+#                   populates within ~30 seconds. No Enso key required.
 #
 # `--rebuild` forces `docker build --no-cache`. The default reuses the
 # cached image so iterative loops stay fast. The named docker volume

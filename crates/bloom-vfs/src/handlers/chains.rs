@@ -931,7 +931,7 @@ impl ChainsHandler {
             }
             "mempool" => match self.mempool_handlers.get(chain.as_str()) {
                 Some(h) => h.read(path).await,
-                None => Err(HandlerError::NotAFile(path.to_string_path())),
+                None => Err(HandlerError::not_found(path.to_string_path())),
             },
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }

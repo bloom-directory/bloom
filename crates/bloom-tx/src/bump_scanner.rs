@@ -1,5 +1,5 @@
 //! Background scanner: walks outbox sent entries, identifies stuck txs,
-//! and writes stageable `bump.tx`, `cancel.tx`, and `bump_advice.json`
+//! and writes advisory `bump.tx`, `cancel.tx`, and `bump_advice.json`
 //! artefacts next to each stuck entry.
 //!
 //! A tx is "stuck" if EITHER:
@@ -8,6 +8,16 @@
 //!   `stuck_after` seconds since it was sent.
 //!
 //! The scanner only writes artefact files — it does NOT broadcast.
+//!
+//! **Artefact format (advisory):** `bump.tx` / `cancel.tx` carry a
+//! `kind: "bump"|"cancel"`, `replaces`, `nonce`, and a `fees` block with
+//! the bumped (+12.5 %) `max_fee_per_gas` / `max_priority_fee_per_gas`.
+//! This is **not** a valid `RawIntent` and cannot be staged directly by
+//! copying the file into `outbox/new.tx`. The design spec calls for
+//! making them stage-able by extending `RawIntent` with explicit fee
+//! overrides; that work is tracked as follow-up. For now, agents must
+//! read the advisory, synthesise a fresh send-style intent at the
+//! advised fees, and stage that through the normal flow.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

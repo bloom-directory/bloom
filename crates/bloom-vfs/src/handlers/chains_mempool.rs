@@ -323,15 +323,17 @@ impl Handler for MempoolHandler {
                             // Drain a 200ms burst window to coalesce.
                             let burst_end =
                                 tokio::time::Instant::now() + std::time::Duration::from_millis(200);
-                            while let Ok(Ok(more)) = tokio::time::timeout(
-                                burst_end.duration_since(tokio::time::Instant::now()),
-                                rx.recv(),
-                            )
-                            .await
+                            while let Some(remaining) =
+                                burst_end.checked_duration_since(tokio::time::Instant::now())
                             {
-                                serde_json::to_writer(&mut out, &more)
-                                    .map_err(|e| HandlerError::backend(e.to_string()))?;
-                                out.push(b'\n');
+                                match tokio::time::timeout(remaining, rx.recv()).await {
+                                    Ok(Ok(more)) => {
+                                        serde_json::to_writer(&mut out, &more)
+                                            .map_err(|e| HandlerError::backend(e.to_string()))?;
+                                        out.push(b'\n');
+                                    }
+                                    _ => break,
+                                }
                             }
                             break;
                         }

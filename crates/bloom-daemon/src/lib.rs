@@ -151,6 +151,23 @@ impl Daemon {
                 }
             };
 
+            // Hash-only providers (delivers_bodies() == false) would push
+            // zeroed `from/nonce/fees/input` records into the index, which
+            // breaks by-address filtering and nonce-conflict detection.
+            // Until tx-body enrichment via an RPC pool is wired in, refuse
+            // to register such providers rather than silently emit broken
+            // data.
+            if !provider.delivers_bodies() {
+                warn!(
+                    chain = %chain_name,
+                    provider = %mc.provider,
+                    "daemon.mempool_skipped: provider does not deliver full tx bodies; \
+                     by-address index and nonce-conflict detection would be broken. \
+                     Configure a body-delivering provider (e.g. \"alchemy\")."
+                );
+                continue;
+            }
+
             // Clamp max_index_size = 0 → 1 so PendingTxIndex::new never
             // asserts. A zero value in config is almost certainly a mistake.
             let size = mc.max_index_size.max(1);
@@ -493,6 +510,16 @@ impl Daemon {
         // Spawn the bump scanner if any chain has a mempool index. The
         // scanner walks the outbox every 30s and emits `bump.tx` /
         // `cancel.tx` / `bump_advice.json` artefacts next to stuck txs.
+        //
+        // TODO(per-wallet bump policy): the scanner currently uses
+        // `BumpScannerConfig::default()` (stuck_after = 90s,
+        // basefee_overrun_pct = 20). Per-wallet `Policy.bump.*` is not yet
+        // honoured because the scanner is global and walks all wallets,
+        // while policy lives per-wallet under `<wallet>/policy.toml`.
+        // Wiring this would require either (a) loading every wallet's
+        // policy at startup into a wallet→config map, or (b) reading the
+        // wallet's policy at each scan tick. Tracked as follow-up; see
+        // PR #14 review for details.
         let mut bump_shutdown: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
         if !mempool_indexes.is_empty() && tokio::runtime::Handle::try_current().is_ok() {
             let shared_indexes: bloom_tx::bump_scanner::MempoolIndexes =
@@ -556,7 +583,9 @@ impl Daemon {
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
                         let status = match provider.health().await {
-                            Ok(_) => "healthy".to_string(),
+                            Ok(bloom_mempool::HealthStatus::Healthy) => "healthy".to_string(),
+                            Ok(bloom_mempool::HealthStatus::Degraded) => "degraded".to_string(),
+                            Ok(bloom_mempool::HealthStatus::Unhealthy) => "unhealthy".to_string(),
                             Err(_) => "unhealthy".to_string(),
                         };
                         health_map.insert(

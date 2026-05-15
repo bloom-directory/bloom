@@ -28,7 +28,10 @@ pub struct SentEntry {
     pub data: String,
     pub nonce: u64,
     pub fees: bloom_mempool::TxFees,
-    /// Directory modification time — used as a proxy for when the tx was sent.
+    /// `intent.json` mtime — used as a stable proxy for when the tx was
+    /// sent. The directory's mtime is unreliable because background
+    /// scanners (e.g. `BumpScanner`) write sibling artefacts into the
+    /// same dir, which would otherwise reset dwell calculations.
     pub sent_at: std::time::SystemTime,
     /// `true` when `staged.status` is `Success` or `Reverted`.
     pub mined: bool,
@@ -579,7 +582,13 @@ fn parse_sent_entry(
     } else {
         return None;
     };
-    let sent_at = fs::metadata(dir)
+    // intent.json is written once at entry creation and never modified;
+    // its mtime is therefore a stable proxy for when the tx was sent.
+    // The directory's mtime is unsuitable because BumpScanner writes
+    // sibling artefacts (bump.tx, cancel.tx, bump_advice.json) into the
+    // same dir on every scan, which would reset dwell-based stuck
+    // detection.
+    let sent_at = fs::metadata(dir.join("intent.json"))
         .ok()
         .and_then(|m| m.modified().ok())
         .unwrap_or_else(std::time::SystemTime::now);
