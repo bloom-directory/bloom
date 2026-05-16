@@ -66,8 +66,7 @@ pub trait BasefeeProvider: Send + Sync {
 /// `policy.bump` in a wallet's `policy.toml`. The `interval` from the
 /// global config is shared across wallets (the scanner is one task);
 /// only the trigger thresholds vary per wallet.
-pub type WalletPolicyLookup =
-    Arc<dyn Fn(&str) -> (Duration, u32) + Send + Sync>;
+pub type WalletPolicyLookup = Arc<dyn Fn(&str) -> (Duration, u32) + Send + Sync>;
 
 /// Background scanner that identifies stuck transactions and writes
 /// `bump.tx` / `cancel.tx` / `bump_advice.json` artefacts.

@@ -378,8 +378,7 @@ impl WalletsHandler {
                 Err(_) => continue,
             };
             for id in ids {
-                let Ok(entry) = self.tx_engine.outbox.read_in_state(wallet, chain, &id, st)
-                else {
+                let Ok(entry) = self.tx_engine.outbox.read_in_state(wallet, chain, &id, st) else {
                     continue;
                 };
                 if let Some(h) = entry.staged.tx_hash.as_deref() {
@@ -399,10 +398,7 @@ impl WalletsHandler {
         wallet: &str,
         chain: &str,
         state: OutboxState,
-    ) -> (
-        Vec<u64>,
-        std::collections::BTreeMap<u64, Vec<String>>,
-    ) {
+    ) -> (Vec<u64>, std::collections::BTreeMap<u64, Vec<String>>) {
         let mut by_nonce: std::collections::BTreeMap<u64, Vec<String>> =
             std::collections::BTreeMap::new();
         let mut nonces: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
@@ -532,10 +528,7 @@ impl WalletsHandler {
                 let mut conflicts: Vec<serde_json::Value> = Vec::new();
                 let mut outbox_by_nonce: std::collections::BTreeMap<u64, Vec<String>> =
                     std::collections::BTreeMap::new();
-                for (n, hs) in pending_by_nonce
-                    .iter()
-                    .chain(sent_by_nonce.iter())
-                {
+                for (n, hs) in pending_by_nonce.iter().chain(sent_by_nonce.iter()) {
                     outbox_by_nonce
                         .entry(*n)
                         .or_default()

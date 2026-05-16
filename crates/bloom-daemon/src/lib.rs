@@ -142,9 +142,9 @@ impl Daemon {
             // it anyway; refusing here at the match keeps the failure
             // mode obvious from the config surface.
             let provider: Arc<dyn bloom_mempool::MempoolProvider> = match mc.provider.as_str() {
-                "alchemy" => Arc::new(
-                    bloom_mempool::providers::alchemy::AlchemyProvider::new(mc.ws_url.clone()),
-                ),
+                "alchemy" => Arc::new(bloom_mempool::providers::alchemy::AlchemyProvider::new(
+                    mc.ws_url.clone(),
+                )),
                 other => {
                     warn!(
                         chain = %chain_name,
