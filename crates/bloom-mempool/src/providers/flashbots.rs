@@ -11,7 +11,7 @@ use crate::private::{
 };
 
 pub const DEFAULT_URL: &str = "https://rpc.flashbots.net/fast";
-pub const SEPOLIA_URL: &str = "https://rpc-sepolia.flashbots.net";
+pub const SEPOLIA_URL: &str = "https://relay-sepolia.flashbots.net";
 
 pub struct FlashbotsProvider {
     url: String,

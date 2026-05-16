@@ -115,6 +115,8 @@ const KEYSTORE_VERSION: u8 = 1;
 const ARGON2_M_COST: u32 = 64 * 1024;
 const ARGON2_T_COST: u32 = 3;
 const ARGON2_P_COST: u32 = 1;
+const KEYSTORE_AAD: &[u8] = b"bloom-keystore-v1";
+const LEGACY_BETH_KEYSTORE_AAD: &[u8] = b"beth-keystore-v1";
 
 #[derive(Clone)]
 pub struct Keystore {
@@ -505,7 +507,7 @@ fn encrypt_key(plaintext: &[u8], passphrase: &str) -> Result<EncryptedFile, Keys
             nonce,
             Payload {
                 msg: plaintext,
-                aad: b"bloom-keystore-v1",
+                aad: KEYSTORE_AAD,
             },
         )
         .map_err(|e| KeystoreError::Aead(e.to_string()))?;
@@ -535,15 +537,12 @@ fn decrypt_key(enc: &EncryptedFile, passphrase: &str) -> Result<[u8; 32], Keysto
     let mut key = derive_key(passphrase, &salt, enc)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
     let nonce = Nonce::from_slice(&nonce_b);
-    let pt = cipher
-        .decrypt(
-            nonce,
-            Payload {
-                msg: &ct,
-                aad: b"bloom-keystore-v1",
-            },
-        )
-        .map_err(|e| KeystoreError::Aead(e.to_string()))?;
+    let pt = decrypt_with_aad(&cipher, nonce, &ct, KEYSTORE_AAD).or_else(|_| {
+        // Pre-rename live keystores were written by `beth` and used the
+        // legacy AAD string. Keep reads backward-compatible; newly written
+        // keys continue to use the Bloom AAD above.
+        decrypt_with_aad(&cipher, nonce, &ct, LEGACY_BETH_KEYSTORE_AAD)
+    })?;
     key.zeroize();
     if pt.len() != 32 {
         return Err(KeystoreError::Malformed(format!(
@@ -554,6 +553,23 @@ fn decrypt_key(enc: &EncryptedFile, passphrase: &str) -> Result<[u8; 32], Keysto
     let mut out = [0u8; 32];
     out.copy_from_slice(&pt);
     Ok(out)
+}
+
+fn decrypt_with_aad(
+    cipher: &ChaCha20Poly1305,
+    nonce: &Nonce,
+    ciphertext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, KeystoreError> {
+    cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|e| KeystoreError::Aead(e.to_string()))
 }
 
 #[cfg(test)]
@@ -586,6 +602,39 @@ mod tests {
         let (_dir, ks) = temp_store();
         ks.create_local("bob", "right").unwrap();
         assert!(ks.unlock("bob", "wrong").is_err());
+    }
+
+    #[test]
+    fn decrypt_accepts_legacy_beth_aad() {
+        let mut salt = [0u8; 32];
+        salt[0] = 1;
+        let nonce_bytes = [2u8; 12];
+        let mut enc = EncryptedFile {
+            v: KEYSTORE_VERSION,
+            salt_hex: hex::encode(salt),
+            nonce_hex: hex::encode(nonce_bytes),
+            m_cost: ARGON2_M_COST,
+            t_cost: ARGON2_T_COST,
+            p_cost: ARGON2_P_COST,
+            ciphertext_hex: String::new(),
+        };
+        let mut key = derive_key("legacy-pass", &salt, &enc).unwrap();
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let plaintext = [7u8; 32];
+        let ciphertext = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: &plaintext,
+                    aad: LEGACY_BETH_KEYSTORE_AAD,
+                },
+            )
+            .unwrap();
+        key.zeroize();
+        enc.ciphertext_hex = hex::encode(ciphertext);
+
+        assert_eq!(decrypt_key(&enc, "legacy-pass").unwrap(), plaintext);
     }
 
     #[test]

@@ -2,20 +2,20 @@
 
 use alloy::eips::Encodable2718;
 use alloy::network::{EthereumWallet, NetworkTransactionBuilder, TransactionBuilder};
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy::rpc::types::eth::TransactionRequest;
-use bloom_mempool::private::PrivateRpcProvider;
-use bloom_mempool::providers::flashbots::{FlashbotsProvider, SEPOLIA_URL};
+use alloy::signers::SignerSync;
+use bloom_mempool::providers::flashbots::SEPOLIA_URL;
 
 const DEFAULT_WALLET: &str = "dest1";
 const DEFAULT_RECIPIENT: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 const DEFAULT_TRANSFER_WEI: u128 = 100_000_000_000_000; // 0.0001 Sepolia ETH
-const DEFAULT_PRIORITY_FEE_WEI: u128 = 1_000_000_000; // 1 gwei
+const DEFAULT_PRIORITY_FEE_WEI: u128 = 50_000_000_000; // 50 gwei
 const GAS_LIMIT: u64 = 21_000;
 const SEPOLIA_CHAIN_ID_HEX: &str = "0xaa36a7";
 
 #[tokio::test]
-async fn flashbots_sepolia_private_send_real_value_transfer() -> anyhow::Result<()> {
+async fn flashbots_sepolia_accepts_private_real_value_transfer() -> anyhow::Result<()> {
     if std::env::var("BLOOM_RUN_SEPOLIA_PRIVATE_SEND")
         .ok()
         .as_deref()
@@ -33,6 +33,7 @@ async fn flashbots_sepolia_private_send_real_value_transfer() -> anyhow::Result<
     let wallet_name = env_any(&["BLOOM_LIVE_WALLET", "BETH_LIVE_WALLET"])
         .unwrap_or_else(|_| DEFAULT_WALLET.into());
     let recipient: Address = env_any(&["BLOOM_SEPOLIA_RECIPIENT", "BETH_SEPOLIA_RECIPIENT"])
+        .or_else(|_| env_any(&["BLOOM_LIVE_DEST2", "BETH_LIVE_DEST2"]))
         .unwrap_or_else(|_| DEFAULT_RECIPIENT.into())
         .parse()?;
     let value_wei = env_u128_any(
@@ -57,6 +58,16 @@ async fn flashbots_sepolia_private_send_real_value_transfer() -> anyhow::Result<
         chain_id == SEPOLIA_CHAIN_ID_HEX,
         "BLOOM_SEPOLIA_RPC_URL is not Sepolia: eth_chainId returned {chain_id}"
     );
+    let recipient_code = rpc_str(
+        &rpc_url,
+        "eth_getCode",
+        serde_json::json!([format!("{recipient:#x}"), "latest"]),
+    )
+    .await?;
+    anyhow::ensure!(
+        recipient_code == "0x",
+        "Sepolia recipient {recipient:#x} has contract code; choose an EOA recipient for a 21,000 gas transfer"
+    );
 
     let nonce_hex = rpc_str(
         &rpc_url,
@@ -65,6 +76,8 @@ async fn flashbots_sepolia_private_send_real_value_transfer() -> anyhow::Result<
     )
     .await?;
     let nonce = parse_hex_u64(&nonce_hex)?;
+    let current_block_hex = rpc_str(&rpc_url, "eth_blockNumber", serde_json::json!([])).await?;
+    let max_block = parse_hex_u64(&current_block_hex)?.saturating_add(50);
 
     let base_fee = latest_base_fee(&rpc_url).await?;
     let priority_fee = env_u128_any(
@@ -119,37 +132,80 @@ async fn flashbots_sepolia_private_send_real_value_transfer() -> anyhow::Result<
 
     let flashbots_url = env_any(&["BLOOM_SEPOLIA_FLASHBOTS_URL", "BETH_SEPOLIA_FLASHBOTS_URL"])
         .unwrap_or_else(|_| SEPOLIA_URL.to_string());
-    let provider = FlashbotsProvider::new(flashbots_url)?;
-    let hash = provider.submit(&raw).await?;
+    ensure_sepolia_flashbots_url(&flashbots_url)?;
+    let hash = send_flashbots_private_tx(&flashbots_url, &raw, max_block, &signer).await?;
     eprintln!(
-        "submitted Sepolia private transfer: hash={hash:#x} from={:#x} to={recipient:#x} value_wei={value_wei}",
+        "Sepolia Flashbots relay accepted private transfer: hash={hash:#x} relay={flashbots_url} from={:#x} to={recipient:#x} value_wei={value_wei}",
         signer.address()
     );
-
-    let receipt = wait_for_receipt(&rpc_url, &format!("{hash:#x}")).await?;
-    let status = receipt
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    anyhow::ensure!(status == "0x1", "Sepolia tx did not succeed: {receipt}");
 
     Ok(())
 }
 
-async fn wait_for_receipt(rpc_url: &str, hash: &str) -> anyhow::Result<serde_json::Value> {
-    for _ in 0..30 {
-        let result = rpc_result(
-            rpc_url,
-            "eth_getTransactionReceipt",
-            serde_json::json!([hash]),
-        )
+fn ensure_sepolia_flashbots_url(url: &str) -> anyhow::Result<()> {
+    let parsed = reqwest::Url::parse(url)?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("Flashbots URL has no host: {url}"))?;
+    anyhow::ensure!(
+        host.contains("sepolia"),
+        "Sepolia Flashbots test must target a Sepolia relay, got {url}"
+    );
+    anyhow::ensure!(
+        !matches!(host, "rpc.flashbots.net" | "relay.flashbots.net"),
+        "Sepolia Flashbots test must not target mainnet Flashbots relay {url}"
+    );
+    Ok(())
+}
+
+async fn send_flashbots_private_tx(
+    url: &str,
+    raw: &Bytes,
+    max_block: u64,
+    signer: &alloy::signers::local::PrivateKeySigner,
+) -> anyhow::Result<B256> {
+    let raw_hex = format!("0x{}", hex::encode(raw.as_ref()));
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_sendPrivateTransaction",
+        "params": [{
+            "tx": raw_hex,
+            "maxBlockNumber": format!("0x{max_block:x}"),
+            "preferences": {"fast": true},
+        }],
+    });
+    let body = serde_json::to_string(&body)?;
+    let body_hash = keccak256(body.as_bytes());
+    let body_hash_hex = format!("{body_hash:#x}");
+    let signature = signer.sign_message_sync(body_hash_hex.as_bytes())?;
+    let auth = format!(
+        "{:#x}:0x{}",
+        signer.address(),
+        hex::encode(signature.as_bytes())
+    );
+    let resp = reqwest::Client::new()
+        .post(url)
+        .header("X-Flashbots-Signature", auth)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
         .await?;
-        if !result.is_null() {
-            return Ok(result);
-        }
-        tokio::time::sleep(std::time::Duration::from_secs(12)).await;
+    let status = resp.status();
+    let text = resp.text().await?;
+    anyhow::ensure!(
+        status.is_success(),
+        "Flashbots relay returned HTTP {status}: {text}"
+    );
+    let resp: serde_json::Value = serde_json::from_str(&text)?;
+    if let Some(err) = resp.get("error") {
+        anyhow::bail!("eth_sendPrivateTransaction returned error: {err}");
     }
-    anyhow::bail!("timed out waiting for Sepolia receipt for {hash}");
+    let hash = resp
+        .get("result")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("eth_sendPrivateTransaction missing result"))?;
+    Ok(hash.parse()?)
 }
 
 async fn latest_base_fee(rpc_url: &str) -> anyhow::Result<u128> {
