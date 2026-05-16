@@ -132,31 +132,38 @@ impl Daemon {
 
             // Resolve the provider before allocating any state, so an
             // unknown provider id doesn't leave a half-mounted handler.
+            //
+            // `generic_eth_subscribe` exists at the crate level but isn't
+            // enabled here: it's hash-only, and without tx-body enrichment
+            // via `eth_getTransactionByHash` (a follow-up) it would push
+            // zeroed `from/nonce/fees/input` records into the index,
+            // breaking by-address filtering and nonce-conflict detection.
+            // The defensive `delivers_bodies()` check below would refuse
+            // it anyway; refusing here at the match keeps the failure
+            // mode obvious from the config surface.
             let provider: Arc<dyn bloom_mempool::MempoolProvider> = match mc.provider.as_str() {
                 "alchemy" => Arc::new(
                     bloom_mempool::providers::alchemy::AlchemyProvider::new(mc.ws_url.clone()),
-                ),
-                "generic_eth_subscribe" => Arc::new(
-                    bloom_mempool::providers::generic_eth_subscribe::GenericEthSubscribeProvider::new(
-                        mc.ws_url.clone(),
-                    ),
                 ),
                 other => {
                     warn!(
                         chain = %chain_name,
                         provider = %other,
-                        "daemon.mempool_skipped: unknown provider"
+                        "daemon.mempool_skipped: unknown or unsupported provider \
+                         (only \"alchemy\" is currently enabled at the daemon layer; \
+                         hash-only providers like generic_eth_subscribe are pending \
+                         tx-body enrichment)"
                     );
                     continue;
                 }
             };
 
-            // Hash-only providers (delivers_bodies() == false) would push
-            // zeroed `from/nonce/fees/input` records into the index, which
-            // breaks by-address filtering and nonce-conflict detection.
-            // Until tx-body enrichment via an RPC pool is wired in, refuse
-            // to register such providers rather than silently emit broken
-            // data.
+            // Defence in depth: even though the match above only admits
+            // body-delivering providers today, this guards against a
+            // future provider being added to the match without honouring
+            // the `delivers_bodies()` contract. A hash-only provider
+            // would push zeroed records into the index and break
+            // by-address filtering and nonce-conflict detection.
             if !provider.delivers_bodies() {
                 warn!(
                     chain = %chain_name,
@@ -511,15 +518,13 @@ impl Daemon {
         // scanner walks the outbox every 30s and emits `bump.tx` /
         // `cancel.tx` / `bump_advice.json` artefacts next to stuck txs.
         //
-        // TODO(per-wallet bump policy): the scanner currently uses
-        // `BumpScannerConfig::default()` (stuck_after = 90s,
-        // basefee_overrun_pct = 20). Per-wallet `Policy.bump.*` is not yet
-        // honoured because the scanner is global and walks all wallets,
-        // while policy lives per-wallet under `<wallet>/policy.toml`.
-        // Wiring this would require either (a) loading every wallet's
-        // policy at startup into a wallet→config map, or (b) reading the
-        // wallet's policy at each scan tick. Tracked as follow-up; see
-        // PR #14 review for details.
+        // Per-wallet `policy.bump.stuck_after_secs` and `basefee_overrun_pct`
+        // are honoured via a lookup closure that reads each tx entry's
+        // wallet's `policy.toml` at scan time. Unknown wallets fall back
+        // to the scanner's global defaults (the same values exposed by
+        // `BumpPolicy::default()` — they're kept in sync). Reading on
+        // each scan tick (rather than caching at startup) means policy
+        // edits take effect on the next pass without a daemon restart.
         let mut bump_shutdown: Vec<tokio::sync::oneshot::Sender<()>> = Vec::new();
         if !mempool_indexes.is_empty() && tokio::runtime::Handle::try_current().is_ok() {
             let shared_indexes: bloom_tx::bump_scanner::MempoolIndexes =
@@ -528,12 +533,33 @@ impl Daemon {
                 Arc::new(ChainBasefeeProvider {
                     chains: chains.clone(),
                 });
-            let scanner = Arc::new(bloom_tx::bump_scanner::BumpScanner::new(
-                tx_engine.outbox.clone(),
-                shared_indexes,
-                basefee,
-                bloom_tx::bump_scanner::BumpScannerConfig::default(),
-            ));
+            let cfg = bloom_tx::bump_scanner::BumpScannerConfig::default();
+            let default_stuck_after = cfg.stuck_after;
+            let default_overrun = cfg.basefee_overrun_pct;
+            let ks_for_lookup = keystore.clone();
+            let wallet_policy: bloom_tx::bump_scanner::WalletPolicyLookup =
+                Arc::new(move |wallet: &str| {
+                    match ks_for_lookup.info(wallet) {
+                        Ok(info) => (
+                            Duration::from_secs(info.policy.bump.stuck_after_secs),
+                            info.policy.bump.basefee_overrun_pct,
+                        ),
+                        // Unknown wallet / missing policy.toml / parse error:
+                        // fall back to global defaults rather than skipping
+                        // the entry. A bad policy.toml shouldn't disable
+                        // bump detection for that wallet's stuck txs.
+                        Err(_) => (default_stuck_after, default_overrun),
+                    }
+                });
+            let scanner = Arc::new(
+                bloom_tx::bump_scanner::BumpScanner::new(
+                    tx_engine.outbox.clone(),
+                    shared_indexes,
+                    basefee,
+                    cfg,
+                )
+                .with_wallet_policy(wallet_policy),
+            );
             let shutdown = scanner.spawn();
             bump_shutdown.push(shutdown);
             debug!("daemon.bump_scanner_spawned");
@@ -554,8 +580,13 @@ impl Daemon {
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(60));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                // Initial tick fires immediately so the first probe runs
-                // at boot, not 60s later.
+                // `tokio::time::interval` fires its first `tick()` immediately;
+                // consume that initial tick here so the loop body's "do work
+                // then await tick" structure doesn't double-fire at boot
+                // (probe → immediate-tick-returns → probe again).
+                // The first iteration of the loop below still runs the probe
+                // at boot — we just don't queue an immediate second pass.
+                ticker.tick().await;
                 loop {
                     // Refresh mempool snapshot from handler state.
                     let mut mempool_map: std::collections::BTreeMap<String, MempoolBackendStatus> =

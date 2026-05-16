@@ -32,6 +32,7 @@ use crate::outbox::{Outbox, SentEntry};
 pub type MempoolIndexes = Arc<RwLock<BTreeMap<String, Arc<PendingTxIndex>>>>;
 
 /// Configuration for [`BumpScanner`].
+#[derive(Clone)]
 pub struct BumpScannerConfig {
     /// How often the background task wakes up to scan. Default: 30 s.
     pub interval: Duration,
@@ -60,6 +61,14 @@ pub trait BasefeeProvider: Send + Sync {
     async fn basefee_wei(&self, chain: &str) -> Option<u128>;
 }
 
+/// Per-wallet policy lookup. Returns `(stuck_after, basefee_overrun_pct)`
+/// for a wallet — the two fields the scanner derives from
+/// `policy.bump` in a wallet's `policy.toml`. The `interval` from the
+/// global config is shared across wallets (the scanner is one task);
+/// only the trigger thresholds vary per wallet.
+pub type WalletPolicyLookup =
+    Arc<dyn Fn(&str) -> (Duration, u32) + Send + Sync>;
+
 /// Background scanner that identifies stuck transactions and writes
 /// `bump.tx` / `cancel.tx` / `bump_advice.json` artefacts.
 pub struct BumpScanner {
@@ -67,6 +76,10 @@ pub struct BumpScanner {
     indexes: MempoolIndexes,
     basefee_provider: Arc<dyn BasefeeProvider>,
     cfg: BumpScannerConfig,
+    /// Per-wallet override for the trigger thresholds. When `None`,
+    /// `cfg.stuck_after` / `cfg.basefee_overrun_pct` are used for every
+    /// wallet (back-compat: tests + existing call sites).
+    wallet_policy: Option<WalletPolicyLookup>,
 }
 
 impl BumpScanner {
@@ -81,6 +94,23 @@ impl BumpScanner {
             indexes,
             basefee_provider,
             cfg,
+            wallet_policy: None,
+        }
+    }
+
+    /// Plumb a per-wallet policy lookup. The closure receives the wallet
+    /// name (as stored on `SentEntry.wallet`) and returns
+    /// `(stuck_after, basefee_overrun_pct)`. Errors / unknown wallets
+    /// should fall back to the global default inside the closure.
+    pub fn with_wallet_policy(mut self, lookup: WalletPolicyLookup) -> Self {
+        self.wallet_policy = Some(lookup);
+        self
+    }
+
+    fn trigger_thresholds(&self, wallet: &str) -> (Duration, u32) {
+        match &self.wallet_policy {
+            Some(f) => f(wallet),
+            None => (self.cfg.stuck_after, self.cfg.basefee_overrun_pct),
         }
     }
 
@@ -98,11 +128,13 @@ impl BumpScanner {
             return Ok(());
         }
 
+        let (stuck_after, basefee_overrun_pct) = self.trigger_thresholds(&entry.wallet);
+
         let basefee = self.basefee_provider.basefee_wei(&entry.chain).await;
         let max_fee = entry.fees.max_fee_per_gas();
         let basefee_trigger = matches!(
             basefee,
-            Some(bf) if bf > max_fee.saturating_mul(100 + self.cfg.basefee_overrun_pct as u128) / 100
+            Some(bf) if bf > max_fee.saturating_mul(100 + basefee_overrun_pct as u128) / 100
         );
 
         let still_pending = self
@@ -113,7 +145,7 @@ impl BumpScanner {
             .is_some();
 
         let dwell = entry.sent_at.elapsed().unwrap_or_default();
-        let dwell_trigger = still_pending && dwell > self.cfg.stuck_after;
+        let dwell_trigger = still_pending && dwell > stuck_after;
 
         if !(basefee_trigger || dwell_trigger) {
             return Ok(());

@@ -26,20 +26,26 @@ pub fn compute_replacement_fees(original: TxFees) -> TxFees {
 
 /// Multiply `v` by 1.125, rounding up.
 ///   bumped = ceil(v * 9 / 8)
+///
+/// Post-condition: the returned value is strictly greater than `v` for
+/// any `v < u128::MAX`. When `v == u128::MAX` (or when `v * 9` would
+/// overflow `u128`), we saturate at `u128::MAX` — still `>= v`, which is
+/// the best we can do without a wider integer type.
 fn bump_125(v: u128) -> u128 {
-    let bumped = v.saturating_mul(9) / 8;
-    // Ceil: if there's any remainder, add 1. Detect by checking
-    // whether the truncated quotient × 8 equals v × 9.
-    let exact = v.saturating_mul(9);
-    if bumped.saturating_mul(8) == exact {
-        // Bumped was exact, but EIP-1559 requires STRICTLY > original
-        // when v > 0. Bumped is already > v for any v > 0 (since 9/8 > 1),
-        // so no adjustment needed here. However, when v = 0 we return 1
-        // to keep the post-condition `bumped > v` after a stuck tx with
-        // zero priority fee.
-        if v == 0 { 1 } else { bumped }
-    } else {
-        bumped + 1
+    match v.checked_mul(9) {
+        Some(nine_v) => {
+            // Normal path: ceil(nine_v / 8)
+            let bumped = nine_v / 8;
+            let rem = nine_v % 8;
+            let result = if rem > 0 { bumped + 1 } else { bumped };
+            // EIP-1559 requires strictly greater than v. For v > 0, 9v/8 > v
+            // always holds; for v == 0, return 1 so we still increase.
+            if v == 0 { 1 } else { result }
+        }
+        // Overflow — saturate at u128::MAX (still >= v). Using saturating
+        // arithmetic here previously produced `u128::MAX / 8 ≈ 2^125`,
+        // which is actually smaller than `v` when `v > 2^125`.
+        None => u128::MAX,
     }
 }
 
@@ -109,6 +115,19 @@ mod tests {
         });
         match f {
             TxFees::Legacy { gas_price } => assert!(gas_price > near_max),
+            _ => panic!("expected legacy"),
+        }
+    }
+
+    #[test]
+    fn very_large_overflow_saturates_to_max_and_does_not_decrease() {
+        let v = u128::MAX / 2; // v * 9 overflows
+        let f = compute_replacement_fees(TxFees::Legacy { gas_price: v });
+        match f {
+            TxFees::Legacy { gas_price } => {
+                assert!(gas_price >= v, "bumped result must not be less than input");
+                assert_eq!(gas_price, u128::MAX, "expected saturation at u128::MAX");
+            }
             _ => panic!("expected legacy"),
         }
     }

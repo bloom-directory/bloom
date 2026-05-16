@@ -258,7 +258,7 @@ Restart the daemon, then tail the live mempool:
 
 ```sh
 bloom vfs cat /eth/chains/ethereum/mempool/status.json   # subscription + counts
-bloom vfs cat /eth/chains/ethereum/mempool/live          # blocks until next pending tx
+bloom vfs cat /eth/chains/ethereum/mempool/live          # long-polls up to ~25s; returns one or more JSON lines when txs arrive, or an empty body if the deadline elapses
 bloom vfs cat /eth/chains/ethereum/mempool/recent.jsonl | head
 bloom vfs cat /eth/chains/ethereum/mempool/by_address/0xYourAddress/pending.jsonl
 ```

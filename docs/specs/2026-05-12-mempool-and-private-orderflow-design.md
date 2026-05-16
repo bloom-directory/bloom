@@ -18,9 +18,13 @@ the existing VFS, tx engine, and policy surfaces:
    fallback).
 2. **Nonce-conflict detection & external-pending visibility** for
    managed wallets — derived from the mempool index.
-3. **Gas-bump suggestions** — a background scanner that surfaces a
-   stageable `bump.tx` next to any stuck `sent/<hash>/` entry. Never
-   auto-broadcasts; same stage-confirm invariant as every other tx.
+3. **Gas-bump suggestions** — a background scanner that surfaces an
+   advisory `bump.tx` next to any stuck `sent/<hash>/` entry. The
+   artefact describes the recommended replacement (bumped fees, same
+   nonce) but is not directly stage-able as a `RawIntent` today;
+   stage-ability would require extending `RawIntent` with explicit
+   fee overrides (a follow-up). Never auto-broadcasts; same
+   stage-confirm invariant as every other tx.
 4. **Private orderflow** — per-wallet `private.enabled = true` flag
    that routes broadcast through a `PrivateRpcProvider` (MEV-Blocker
    default, Flashbots Protect second). Mainnet-only — enforced by
@@ -35,7 +39,9 @@ the existing VFS, tx engine, and policy surfaces:
   `mev_sendBundle`). The spec assumes single-tx private submission
   only.
 - **Auto-bumping** — the daemon never resubmits a tx on its own. The
-  bump scanner only writes a stageable artefact.
+  bump scanner only writes an advisory artefact (see §6 — not directly
+  stageable as `RawIntent` today; an agent reads the advice and
+  synthesises a fresh send-style intent).
 - **Post-broadcast MEV detection** — no fingerprinting of mined blocks
   for sandwich evidence. Heuristic is stage-time-only.
 - **Cross-pending-cross-check** — the MEV heuristic does not consult
@@ -119,7 +125,7 @@ bloom-tx (EXTEND)
                         sent/<hash>/bump_advice.json
                         sent/<hash>/cancel.tx
 ├── policy_engine.rs  New TOML tables: [private], [mev], [bump]
-└── bump.rs (NEW)     BumpScanner: detects stuck txs, writes bump.tx artefacts
+└── bump.rs (NEW)     BumpScanner: detects stuck txs, writes advisory bump.tx artefacts
 
 bloom-vfs (EXTEND)
 └── handlers/
@@ -150,7 +156,8 @@ force a circular dep or an unproductive leaf-node split.
    policy has `private.enabled = true` AND the chain is mainnet.
 5. A background `BumpScanner` walks `outbox/sent/` per wallet; for
    each tx still in mempool past the policy threshold or with base
-   fee climbed past `maxFeePerGas`, writes `sent/<hash>/bump.tx`.
+   fee climbed past `maxFeePerGas`, writes an advisory
+   `sent/<hash>/bump.tx` describing the recommended replacement.
    Never auto-broadcasts.
 
 ## 5. VFS Surface
@@ -200,9 +207,14 @@ wallets/<w>/outbox/
 │   ├── nonce_conflict.json      # NEW — present only if a conflict was detected
 │   └── … (existing artefacts)
 └── sent/<hash>/
-    ├── bump.tx                  # NEW — stageable replacement
+    ├── bump.tx                  # NEW — advisory: describes the recommended
+                                   replacement (bumped fees, same nonce). Not
+                                   directly stage-able as RawIntent; the agent
+                                   reads the advisory and synthesizes a fresh
+                                   send-style intent via outbox/new.tx.
     ├── bump_advice.json         # NEW — why a bump is suggested
-    ├── cancel.tx                # NEW — alternative: 0-value self-send at bumped fees
+    ├── cancel.tx                # NEW — advisory: alternative 0-value self-send
+                                   at bumped fees, same shape as bump.tx
     └── … (existing artefacts)
 ```
 
@@ -380,18 +392,24 @@ Background task running every 30 s (configurable). For each
   OR
   `current_basefee > maxFeePerGas * (1 + policy.bump.basefee_overrun_pct/100)`.
 
-On trigger, write a stageable tx file (same schema as
-`outbox/new.tx`) to `sent/<hash>/bump.tx` with `maxFeePerGas` and
-`maxPriorityFeePerGas` each bumped by **+12.5 %** (EIP-1559
-`MIN_REPLACEMENT_FEE_INCREASE`, rounded up) over the original, same
-`nonce`. Sibling `bump_advice.json` explains why. Sibling
-`cancel.tx` is the same shape with `to = wallet_address`,
-`value = 0`, `data = "0x"`, same `nonce`, same bumped fees — a
-self-send replacement that lets the agent reclaim the nonce slot
-instead of pushing the original tx through.
+On trigger, write an advisory tx file (descriptive shape, NOT a
+directly-stageable `RawIntent` today — see Limitations below) to
+`sent/<hash>/bump.tx` with `maxFeePerGas` and `maxPriorityFeePerGas`
+each bumped by **+12.5 %** (EIP-1559 `MIN_REPLACEMENT_FEE_INCREASE`,
+rounded up) over the original, same `nonce`. Sibling
+`bump_advice.json` explains why. Sibling `cancel.tx` is the same
+shape with `to = wallet_address`, `value = 0`, `data = "0x"`, same
+`nonce`, same bumped fees — a self-send replacement that lets the
+agent reclaim the nonce slot instead of pushing the original tx
+through.
 
-To broadcast a bump, the agent copies/cats `bump.tx` into
-`outbox/new.tx` → gets a fresh `pending/<id>` → writes `confirm`.
+**Limitation (advisory-only today):** `RawIntent` does not currently
+accept explicit fee overrides, so an agent cannot simply copy
+`bump.tx` into `outbox/new.tx` and expect identical fees on the wire.
+Today the agent reads `bump.tx` for the recommended fees + nonce,
+then synthesises a fresh send-style intent via the normal staging
+path. Direct stage-ability (extending `RawIntent` with explicit
+`maxFeePerGas` / `maxPriorityFeePerGas` overrides) is a follow-up.
 This keeps stage-confirm intact.
 
 ## 8. Streaming & Watch Wiring

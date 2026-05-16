@@ -366,6 +366,69 @@ impl WalletsHandler {
         }
     }
 
+    /// Collect the set of tx hashes (lowercased `0x...` hex) that bloom
+    /// itself has staged or sent for `(wallet, chain)`. Used to filter
+    /// the mempool-index snapshot so we don't double-count our own txs
+    /// as "external pending" / "nonce conflict".
+    fn bloom_staged_hashes(&self, wallet: &str, chain: &str) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
+        for st in [OutboxState::Pending, OutboxState::Sent] {
+            let ids = match self.tx_engine.outbox.list(wallet, chain, st) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            for id in ids {
+                let Ok(entry) = self.tx_engine.outbox.read_in_state(wallet, chain, &id, st)
+                else {
+                    continue;
+                };
+                if let Some(h) = entry.staged.tx_hash.as_deref() {
+                    out.insert(h.to_lowercase());
+                }
+            }
+        }
+        out
+    }
+
+    /// Read bloom's outbox view of nonces for `(wallet, chain)` in the
+    /// given state. Returns `(sorted_unique_nonces, nonce -> hashes)`
+    /// where the hash list contains only entries that already have a
+    /// `tx_hash` (pending entries may not).
+    fn bloom_outbox_nonces(
+        &self,
+        wallet: &str,
+        chain: &str,
+        state: OutboxState,
+    ) -> (
+        Vec<u64>,
+        std::collections::BTreeMap<u64, Vec<String>>,
+    ) {
+        let mut by_nonce: std::collections::BTreeMap<u64, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let mut nonces: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        let ids = match self.tx_engine.outbox.list(wallet, chain, state) {
+            Ok(v) => v,
+            Err(_) => return (Vec::new(), by_nonce),
+        };
+        for id in ids {
+            let Ok(entry) = self
+                .tx_engine
+                .outbox
+                .read_in_state(wallet, chain, &id, state)
+            else {
+                continue;
+            };
+            nonces.insert(entry.staged.nonce);
+            if let Some(h) = entry.staged.tx_hash.as_deref() {
+                by_nonce
+                    .entry(entry.staged.nonce)
+                    .or_default()
+                    .push(h.to_lowercase());
+            }
+        }
+        (nonces.into_iter().collect(), by_nonce)
+    }
+
     async fn read_chain(
         &self,
         wallet: &str,
@@ -410,30 +473,102 @@ impl WalletsHandler {
                 Ok(bytes)
             }
             [s] if s == "pending_external.jsonl" => {
-                // v1: best-effort; outbox cross-ref lands in Phase 3.
+                // Cross-reference against the outbox so we don't surface
+                // bloom's own txs as "external pending". A tx is external
+                // iff its hash is NOT in the union of pending+sent outbox
+                // entries for this wallet+chain (pending entries may have
+                // no hash yet — those are dropped from the exclusion set).
                 let idx = match self.mempool_indexes.get(chain) {
                     Some(i) => i,
                     None => return Ok(Vec::new()),
                 };
+                let own_hashes = self.bloom_staged_hashes(wallet, chain);
                 let mut out = Vec::new();
                 for tx in idx
                     .snapshot()
                     .into_iter()
                     .filter(|t| t.from == info.address)
                 {
+                    let hex = format!("{:?}", tx.hash).to_lowercase();
+                    if own_hashes.contains(&hex) {
+                        continue;
+                    }
                     serde_json::to_writer(&mut out, &tx).map_err(err_be)?;
                     out.push(b'\n');
                 }
                 Ok(out)
             }
             [s] if s == "nonce_conflicts.json" => {
-                let observed = match self.mempool_indexes.get(chain) {
-                    Some(i) => i.observed_nonces(info.address),
-                    None => Vec::new(),
+                // A real conflict is a (nonce, hash) the mempool index
+                // observed for this wallet that doesn't match any of
+                // bloom's own outbox entries at that nonce. Report the
+                // raw observed_nonces set for backward compat, and add
+                // the outbox-side view + the computed conflict list.
+                let (observed, mempool_by_nonce) = match self.mempool_indexes.get(chain) {
+                    Some(i) => {
+                        let snap = i.snapshot();
+                        let observed = i.observed_nonces(info.address);
+                        // (nonce -> hash) for this address in the mempool.
+                        // Multiple entries at the same nonce are possible
+                        // (replacements). We surface them all as candidate
+                        // conflicts and let the dedupe against our own
+                        // hashes filter them out below.
+                        let mut by_nonce: std::collections::BTreeMap<u64, Vec<String>> =
+                            std::collections::BTreeMap::new();
+                        for tx in snap.into_iter().filter(|t| t.from == info.address) {
+                            let hex = format!("{:?}", tx.hash).to_lowercase();
+                            by_nonce.entry(tx.nonce).or_default().push(hex);
+                        }
+                        (observed, by_nonce)
+                    }
+                    None => (Vec::new(), std::collections::BTreeMap::new()),
                 };
+                let (pending_nonces, pending_by_nonce) =
+                    self.bloom_outbox_nonces(wallet, chain, OutboxState::Pending);
+                let (sent_nonces, sent_by_nonce) =
+                    self.bloom_outbox_nonces(wallet, chain, OutboxState::Sent);
+                // Union of nonces we ourselves staged or sent: any nonce
+                // the mempool also sees here is a candidate for conflict.
+                let mut conflicts: Vec<serde_json::Value> = Vec::new();
+                let mut outbox_by_nonce: std::collections::BTreeMap<u64, Vec<String>> =
+                    std::collections::BTreeMap::new();
+                for (n, hs) in pending_by_nonce
+                    .iter()
+                    .chain(sent_by_nonce.iter())
+                {
+                    outbox_by_nonce
+                        .entry(*n)
+                        .or_default()
+                        .extend(hs.iter().cloned());
+                }
+                for (nonce, mempool_hashes) in mempool_by_nonce.iter() {
+                    let Some(outbox_hashes) = outbox_by_nonce.get(nonce) else {
+                        continue;
+                    };
+                    for mh in mempool_hashes {
+                        // Only flag when the mempool's hash isn't one of
+                        // our own — i.e. someone else (or a re-broadcast
+                        // we don't recognise) is occupying our nonce.
+                        if outbox_hashes.iter().any(|oh| oh == mh) {
+                            continue;
+                        }
+                        // Pick any outbox hash at this nonce for the
+                        // report; callers can cross-reference if they
+                        // want more detail.
+                        let outbox_hash = outbox_hashes.first().cloned();
+                        conflicts.push(serde_json::json!({
+                            "nonce": nonce,
+                            "mempool_hash": mh,
+                            "outbox_hash": outbox_hash,
+                        }));
+                    }
+                }
                 let body = serde_json::json!({
                     "address": bloom_proto::checksum_address(&info.address),
                     "observed_nonces": observed,
+                    "outbox_pending_nonces": pending_nonces,
+                    "outbox_sent_nonces": sent_nonces,
+                    "conflicts": conflicts,
                 });
                 serde_json::to_vec_pretty(&body).map_err(err_be)
             }

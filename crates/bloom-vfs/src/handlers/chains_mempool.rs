@@ -213,11 +213,21 @@ impl Handler for MempoolHandler {
                     .map_err(|e: alloy::hex::FromHexError| HandlerError::invalid(e.to_string()))?;
                 Ok(Entry::read_only_file("recent.jsonl"))
             }
-            [_chain, "mempool", hash] if is_hash_segment(hash) => Ok(Entry::dir(hash)),
+            [_chain, "mempool", hash] if is_hash_segment(hash) => {
+                let parsed_hash = parse_hash(hash)?;
+                if self.index.lookup_by_hash(&parsed_hash).is_none() {
+                    return Err(HandlerError::NotFound(path.to_string_path()));
+                }
+                Ok(Entry::dir(hash))
+            }
             [_chain, "mempool", hash, leaf]
                 if is_hash_segment(hash)
                     && matches!(*leaf, "tx.json" | "decoded.json" | "status") =>
             {
+                let parsed_hash = parse_hash(hash)?;
+                if self.index.lookup_by_hash(&parsed_hash).is_none() {
+                    return Err(HandlerError::NotFound(path.to_string_path()));
+                }
                 Ok(Entry::read_only_file(leaf))
             }
             _ => Err(HandlerError::NotFound(path.to_string_path())),
@@ -235,9 +245,24 @@ impl Handler for MempoolHandler {
                 Entry::dir("by_address"),
                 Entry::dir("by_pool"),
             ]),
-            [_chain, "mempool", hash] if is_hash_segment(hash) => Ok(Vec::new()),
-            [_chain, "mempool", "by_address", _addr] => Ok(Vec::new()),
-            [_chain, "mempool", "by_pool", _pool] => Ok(Vec::new()),
+            [_chain, "mempool", hash] if is_hash_segment(hash) => {
+                let parsed_hash = parse_hash(hash)?;
+                if self.index.lookup_by_hash(&parsed_hash).is_none() {
+                    return Err(HandlerError::NotFound(path.to_string_path()));
+                }
+                Ok(vec![
+                    Entry::read_only_file("tx.json"),
+                    Entry::read_only_file("decoded.json"),
+                    Entry::read_only_file("status"),
+                ])
+            }
+            [_chain, "mempool", "by_address", _addr] => Ok(vec![
+                Entry::read_only_file("pending.jsonl"),
+                Entry::read_only_file("nonces.json"),
+            ]),
+            [_chain, "mempool", "by_pool", _pool] => {
+                Ok(vec![Entry::read_only_file("recent.jsonl")])
+            }
             _ => Err(HandlerError::NotADir(path.to_string_path())),
         }
     }
@@ -264,7 +289,7 @@ impl Handler for MempoolHandler {
                 let addr: alloy::primitives::Address = addr
                     .parse()
                     .map_err(|e: alloy::hex::FromHexError| HandlerError::invalid(e.to_string()))?;
-                let items = self.recent.read().snapshot();
+                let items = self.index.snapshot();
                 let mut out = Vec::new();
                 for it in items
                     .iter()

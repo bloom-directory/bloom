@@ -729,13 +729,23 @@ impl StatusHandler {
                 None => Err(HandlerError::NotAFile(path.to_string_path())),
             },
             [a, provider] if a == "private_rpc" => {
+                // Return a deterministic, per-chain view for this
+                // provider rather than the first matching entry across
+                // all chains. The map is keyed by chain name so
+                // callers can see how the same provider behaves on
+                // each configured chain. `BTreeMap` keeps the output
+                // ordering stable across reads.
                 let map = self.private_rpc_healths.read();
-                let any = map.iter().find(|((_, p), _)| p == provider).map(|(_, v)| v);
-                match any {
-                    Some(v) => serde_json::to_vec_pretty(v)
-                        .map_err(|e| HandlerError::backend(e.to_string())),
-                    None => Err(HandlerError::not_found(path.to_string_path())),
+                let by_chain: BTreeMap<String, PrivateRpcBackendStatus> = map
+                    .iter()
+                    .filter(|((_, p), _)| p == provider)
+                    .map(|((chain, _), v)| (chain.clone(), v.clone()))
+                    .collect();
+                if by_chain.is_empty() {
+                    return Err(HandlerError::not_found(path.to_string_path()));
                 }
+                serde_json::to_vec_pretty(&by_chain)
+                    .map_err(|e| HandlerError::backend(e.to_string()))
             }
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
@@ -830,10 +840,10 @@ impl StatusHandler {
                 Ok(entries)
             }
             [a] if a == "private_rpc" => {
-                // Deduplicate provider names across chains so the
-                // listing matches the lookup arm (which returns the
-                // first matching `PrivateRpcBackendStatus` regardless
-                // of chain).
+                // Deduplicate provider names across chains: one entry
+                // per unique provider, since `private_rpc/<provider>`
+                // returns a per-chain map for that provider rather
+                // than a single chain's status.
                 let map = self.private_rpc_healths.read();
                 let unique: std::collections::BTreeSet<String> =
                     map.keys().map(|(_, prov)| prov.clone()).collect();
@@ -1284,7 +1294,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn private_rpc_provider_leaf_returns_status_or_not_found() {
+    async fn private_rpc_provider_leaf_returns_per_chain_map_or_not_found() {
+        // `private_rpc/<provider>` must return a deterministic
+        // `BTreeMap<chain, PrivateRpcBackendStatus>` so per-chain
+        // differences aren't hidden when the same provider is
+        // configured on multiple chains. Missing providers still
+        // yield `NotFound`.
         let dir = tempfile::tempdir().unwrap();
         let h = make_handler(dir.path());
         let mut map = BTreeMap::new();
@@ -1293,6 +1308,13 @@ mod tests {
             PrivateRpcBackendStatus {
                 last_status: "healthy".into(),
                 last_probed_at: 1_700_000_000,
+            },
+        );
+        map.insert(
+            ("sepolia".to_string(), "flashbots".to_string()),
+            PrivateRpcBackendStatus {
+                last_status: "degraded".into(),
+                last_probed_at: 1_700_000_002,
             },
         );
         map.insert(
@@ -1309,8 +1331,21 @@ mod tests {
             .await
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["last_status"], "healthy");
-        assert_eq!(v["last_probed_at"], 1_700_000_000);
+        assert_eq!(v["ethereum"]["last_status"], "healthy");
+        assert_eq!(v["ethereum"]["last_probed_at"], 1_700_000_000);
+        assert_eq!(v["sepolia"]["last_status"], "degraded");
+        assert_eq!(v["sepolia"]["last_probed_at"], 1_700_000_002);
+        // Other providers must not leak into this provider's view.
+        assert!(v.get("mev_blocker").is_none());
+
+        // Single-chain provider still returns a map (with one entry),
+        // not a bare status object, so the shape is uniform.
+        let body = h
+            .read(&VfsPath::parse("private_rpc/mev_blocker").unwrap())
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["ethereum"]["last_status"], "degraded");
 
         let err = h
             .read(&VfsPath::parse("private_rpc/unknown").unwrap())
