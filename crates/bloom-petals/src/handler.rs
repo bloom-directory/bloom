@@ -244,6 +244,9 @@ fn map_err(e: PetalError) -> HandlerError {
         PetalError::ModeCapMismatch { mode, cap } => {
             HandlerError::invalid(format!("mode/cap mismatch: mode={mode:?} disallows cap={cap}"))
         }
+        PetalError::ModeConflict { existing } => {
+            HandlerError::invalid(format!("mode conflict: existing={existing}"))
+        }
     }
 }
 
@@ -260,7 +263,7 @@ mod tests {
         let reg = Arc::new(NameRegistry::open(dir.path().join("reg")).unwrap());
         let mut caps = BTreeSet::new();
         caps.insert(Capability::VfsRead);
-        let (r, _) = store.install(b"\x00asm\x01\x00\x00\x00", Some("greet"), &caps).unwrap();
+        let (r, _) = store.install(b"\x00asm\x01\x00\x00\x00", Some("greet"), &caps, crate::meta::PetalMode::Local).unwrap();
         let h = PetalsHandler::new(store, reg.clone());
         reg.set("greet", &r.hash).unwrap();
         (dir, h, r.hash)

@@ -18,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::error::PetalError;
-use crate::meta::{Capability, PetalMeta};
+use crate::meta::{Capability, PetalMeta, PetalMode};
 
 const OBJECTS: &str = "objects";
 const META: &str = "meta";
@@ -70,6 +70,7 @@ impl PetalStore {
         wasm: &[u8],
         name: Option<&str>,
         caps: &BTreeSet<Capability>,
+        mode: PetalMode,
     ) -> Result<(InstallResult, PetalMeta), PetalError> {
         let hash = hex::encode(blake3::hash(wasm).as_bytes());
         let obj_path = self.object_path(&hash);
@@ -79,16 +80,22 @@ impl PetalStore {
             atomic_write(&obj_path, wasm)?;
         }
 
-        // Merge metadata.
         let mut meta = match self.load_meta(&hash) {
-            Ok(m) => m,
+            Ok(existing) => {
+                if existing.mode != mode {
+                    return Err(PetalError::ModeConflict {
+                        existing: existing.mode,
+                    });
+                }
+                existing
+            }
             Err(PetalError::NotFound(_)) => PetalMeta {
                 hash: hash.clone(),
                 size: wasm.len() as u64,
                 installed_at_ms: now_ms(),
                 name: None,
                 caps: BTreeSet::new(),
-                mode: Default::default(),
+                mode,
             },
             Err(e) => return Err(e),
         };
@@ -96,7 +103,6 @@ impl PetalStore {
             meta.name = Some(n.to_string());
         }
         meta.caps.extend(caps.iter().copied());
-        // Size is authoritative from the bytes we just hashed.
         meta.size = wasm.len() as u64;
         self.write_meta(&meta)?;
 
@@ -198,6 +204,7 @@ pub fn is_valid_hex_hash(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::meta::PetalMode;
     use tempfile::TempDir;
 
     fn store() -> (TempDir, PetalStore) {
@@ -212,7 +219,7 @@ mod tests {
         let mut caps = BTreeSet::new();
         caps.insert(Capability::VfsRead);
         let (r, m) = store
-            .install(b"hello-wasm", Some("greet"), &caps)
+            .install(b"hello-wasm", Some("greet"), &caps, PetalMode::Local)
             .unwrap();
         assert_eq!(r.size, 10);
         assert!(!r.already_present);
@@ -226,10 +233,10 @@ mod tests {
         let (_d, store) = store();
         let mut caps_a = BTreeSet::new();
         caps_a.insert(Capability::VfsRead);
-        let (r1, _) = store.install(b"x", Some("a"), &caps_a).unwrap();
+        let (r1, _) = store.install(b"x", Some("a"), &caps_a, PetalMode::Local).unwrap();
         let mut caps_b = BTreeSet::new();
         caps_b.insert(Capability::VfsWrite);
-        let (r2, m) = store.install(b"x", Some("b"), &caps_b).unwrap();
+        let (r2, m) = store.install(b"x", Some("b"), &caps_b, PetalMode::Local).unwrap();
         assert_eq!(r1.hash, r2.hash);
         assert!(r2.already_present);
         // Name overwritten on second install.
@@ -249,7 +256,7 @@ mod tests {
     #[test]
     fn list_hashes_filters_non_hash_entries() {
         let (d, store) = store();
-        let (r, _) = store.install(b"abc", None, &BTreeSet::new()).unwrap();
+        let (r, _) = store.install(b"abc", None, &BTreeSet::new(), PetalMode::Local).unwrap();
         // Drop a stray file that does NOT look like a hash.
         std::fs::write(d.path().join(OBJECTS).join("README"), b"junk").unwrap();
         let hashes = store.list_hashes().unwrap();
@@ -263,5 +270,44 @@ mod tests {
         assert!(!is_valid_hex_hash(&"a".repeat(65)));
         assert!(!is_valid_hex_hash(&"A".repeat(64)));
         assert!(!is_valid_hex_hash(&"g".repeat(64)));
+    }
+
+    #[test]
+    fn install_records_mode() {
+        let (_d, store) = store();
+        let (_r, m) = store
+            .install(b"abc", Some("a"), &BTreeSet::new(), PetalMode::Onchain)
+            .unwrap();
+        assert_eq!(m.mode, PetalMode::Onchain);
+    }
+
+    #[test]
+    fn install_same_hash_different_mode_returns_mode_conflict() {
+        let (_d, store) = store();
+        let (_r, _m) = store
+            .install(b"xyz", None, &BTreeSet::new(), PetalMode::Local)
+            .unwrap();
+        let err = store
+            .install(b"xyz", None, &BTreeSet::new(), PetalMode::Onchain)
+            .unwrap_err();
+        assert!(
+            matches!(err, PetalError::ModeConflict { existing } if existing == PetalMode::Local),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn install_same_hash_same_mode_is_idempotent() {
+        let (_d, store) = store();
+        let (r1, _) = store
+            .install(b"qqq", Some("a"), &BTreeSet::new(), PetalMode::Local)
+            .unwrap();
+        let (r2, m) = store
+            .install(b"qqq", Some("b"), &BTreeSet::new(), PetalMode::Local)
+            .unwrap();
+        assert_eq!(r1.hash, r2.hash);
+        assert!(r2.already_present);
+        assert_eq!(m.name.as_deref(), Some("b"));
+        assert_eq!(m.mode, PetalMode::Local);
     }
 }

@@ -22,6 +22,8 @@ pub enum PetalError {
     Serde(String),
     #[error("mode/cap mismatch: mode={mode} disallows cap={cap}")]
     ModeCapMismatch { mode: crate::meta::PetalMode, cap: String },
+    #[error("mode conflict: petal already installed as {existing}; uninstall first")]
+    ModeConflict { existing: crate::meta::PetalMode },
 }
 
 impl PetalError {
