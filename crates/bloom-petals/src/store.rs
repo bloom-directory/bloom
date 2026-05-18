@@ -175,6 +175,39 @@ impl PetalStore {
         }
         Ok(out)
     }
+
+    /// Remove an installed petal's object and metadata. Returns `true`
+    /// if anything was removed, `false` if the hash was not installed.
+    /// The caller is responsible for clearing any registry entries that
+    /// point at this hash.
+    pub fn uninstall(&self, hash: &str) -> Result<bool, PetalError> {
+        let obj_path = self.object_path(hash);
+        let meta_path = self.meta_path(hash);
+        let had = obj_path.exists() || meta_path.exists();
+        for p in [&obj_path, &meta_path] {
+            match std::fs::remove_file(p) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(PetalError::Io(e)),
+            }
+        }
+        Ok(had)
+    }
+
+    /// List hashes whose meta records have the given mode. Ignores
+    /// objects with missing metadata (which would be a corruption).
+    pub fn list_hashes_by_mode(&self, mode: PetalMode) -> Result<Vec<String>, PetalError> {
+        let mut out = Vec::new();
+        for hash in self.list_hashes()? {
+            match self.load_meta(&hash) {
+                Ok(m) if m.mode == mode => out.push(hash),
+                Ok(_) => {}
+                Err(PetalError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
 }
 
 fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
@@ -311,5 +344,36 @@ mod tests {
         assert!(r2.already_present);
         assert_eq!(m.name.as_deref(), Some("b"));
         assert_eq!(m.mode, PetalMode::Local);
+    }
+
+    #[test]
+    fn uninstall_removes_object_and_meta() {
+        let (_d, store) = store();
+        let (r, _) = store.install(b"toremove", None, &BTreeSet::new(), PetalMode::Local).unwrap();
+        assert!(store.contains(&r.hash));
+        let removed = store.uninstall(&r.hash).unwrap();
+        assert!(removed);
+        assert!(!store.contains(&r.hash));
+        assert!(matches!(store.load_meta(&r.hash), Err(PetalError::NotFound(_))));
+    }
+
+    #[test]
+    fn uninstall_missing_returns_false() {
+        let (_d, store) = store();
+        let absent = "0".repeat(64);
+        assert!(!store.uninstall(&absent).unwrap());
+    }
+
+    #[test]
+    fn list_hashes_by_mode_filters_correctly() {
+        let (_d, store) = store();
+        let (rl, _) = store.install(b"local-bytes", None, &BTreeSet::new(), PetalMode::Local).unwrap();
+        let mut chain = BTreeSet::new();
+        chain.insert(Capability::ChainRead);
+        let (rc, _) = store.install(b"onchain-bytes", None, &chain, PetalMode::Onchain).unwrap();
+        let locals = store.list_hashes_by_mode(PetalMode::Local).unwrap();
+        let onchain = store.list_hashes_by_mode(PetalMode::Onchain).unwrap();
+        assert_eq!(locals, vec![rl.hash]);
+        assert_eq!(onchain, vec![rc.hash]);
     }
 }
