@@ -53,6 +53,9 @@ pub struct StoreData {
     host: Arc<dyn PetalHost>,
     caps: BTreeSet<Capability>,
     petal_hash: String,
+    // Threaded for task 8 (deterministic engine knobs) and future
+    // attestation work; not yet consumed inside the VM body.
+    #[allow(dead_code)]
     mode: crate::meta::PetalMode,
 }
 
@@ -111,6 +114,7 @@ impl PetalVm {
 
     /// Run a petal end-to-end: instantiate, call `_start`, collect
     /// captured stdout/stderr, return.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         &self,
         wasm: &[u8],
@@ -335,15 +339,9 @@ fn link_onchain_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
                     Some(m) => m,
                     None => return HostError::Invalid("no exported memory".into()).as_wasm_code(),
                 };
-                // Argument layout is chain followed by path, both as
-                // utf-8 byte slices. To keep the wasm ABI tight we
-                // declared just (chain_ptr, chain_len). Path is encoded
-                // as a separate sub-slice the wasm wrote in the chain
-                // buffer with a NUL separator, OR (preferred) we
-                // pass an additional pair. For v1 we use a single
-                // utf-8 buffer of the form "<chain>\0<path>" so we
-                // don't change the WAT ABI for this task. See vm.rs
-                // for the parsing.
+                // The wasm-facing buffer is a single utf-8 blob of the
+                // form `<chain>\0<path>`. This keeps the import at 5
+                // params instead of 7; exactly one NUL is required.
                 let raw = match read_bytes(&mem, &mut caller, chain_ptr, chain_len) {
                     Ok(b) => b,
                     Err(c) => return c,
@@ -727,5 +725,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.exit_code, 0);
+    }
+
+    const LOCAL_TRIES_CHAIN_READ: &str = r#"
+        (module
+          (import "bloom" "chain_read_at"
+            (func $chain_read_at (param i32 i32 i64 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (func (export "_start") nop)
+        )
+    "#;
+
+    #[tokio::test]
+    async fn local_vm_refuses_to_link_chain_imports() {
+        let vm = PetalVm::new().unwrap();
+        let out = vm
+            .run(
+                &wat(LOCAL_TRIES_CHAIN_READ),
+                Vec::new(),
+                BTreeSet::new(),
+                Arc::new(DenyHost),
+                "h",
+                PetalMode::Local,
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        // Instantiation should fail (linker has no bloom.chain_read_at in local mode).
+        assert_eq!(out.exit_code, 127);
     }
 }

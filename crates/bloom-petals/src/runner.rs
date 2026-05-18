@@ -95,6 +95,12 @@ impl PetalRunner {
     /// (starting with `\0asm`) or WAT source — WAT is compiled in
     /// memory before hashing, so the on-disk hash is always the
     /// canonical wasm.
+    ///
+    /// `(mode, caps)` is validated against [`validate_mode_caps`] before
+    /// any bytes are parsed: a `Local` petal cannot declare `chain.read`
+    /// and an `Onchain` petal cannot declare `vfs.*`. Re-installing the
+    /// same hash under a different mode is rejected with `ModeConflict`
+    /// by the store.
     pub fn install(
         &self,
         bytes: &[u8],
