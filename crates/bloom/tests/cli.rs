@@ -40,6 +40,7 @@ fn help_lists_all_subcommands() {
         .stdout(predicate::str::contains("wallet"))
         .stdout(predicate::str::contains("serve"))
         .stdout(predicate::str::contains("ipc"))
+        .stdout(predicate::str::contains("petals"))
         .stdout(predicate::str::contains("init"));
 }
 
@@ -305,4 +306,149 @@ fn vfs_routes_via_ipc_when_socket_exists() {
         std::thread::sleep(Duration::from_millis(20));
     }
     server_thread.join().expect("ipc server thread panicked");
+}
+
+/// End-to-end petals smoke test: install a WAT module from a file,
+/// confirm `petals ls` shows it under both its hash and its petname, then
+/// `petals run` it and check that WASI stdout reaches the parent process.
+/// The WAT writes a fixed string via `fd_write` and exits 0, so a success
+/// here proves the wasmtime engine, WASI shims, and the runner are wired
+/// through the daemon end to end.
+#[test]
+fn petals_install_then_ls_then_run() {
+    let home = fresh_home();
+    let wat_path = home.path().join("hello.wat");
+    // Self-contained WASI petal: writes 21 bytes to fd 1 (stdout), exits 0.
+    // The iovec table at offset 32 points at the string at offset 0.
+    let wat = r#"
+        (module
+          (import "wasi_snapshot_preview1" "fd_write"
+            (func $fd_write (param i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "proc_exit"
+            (func $exit (param i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 0) "hello from cli petal\n")
+          (data (i32.const 32) "\00\00\00\00\15\00\00\00")
+          (func (export "_start")
+            (call $fd_write (i32.const 1) (i32.const 32) (i32.const 1) (i32.const 48))
+            drop
+            (call $exit (i32.const 0)))
+        )
+    "#;
+    std::fs::write(&wat_path, wat).unwrap();
+
+    let install = bloom_cmd(home.path())
+        .args([
+            "petals",
+            "install",
+            wat_path.to_str().unwrap(),
+            "--name",
+            "hello",
+        ])
+        .assert()
+        .success();
+    let install_out = String::from_utf8(install.get_output().stdout.clone()).unwrap();
+    let hash_line = install_out
+        .lines()
+        .find(|l| l.starts_with("hash: "))
+        .expect("install stdout must include a hash line");
+    let hash = hash_line.trim_start_matches("hash: ").trim();
+    assert_eq!(hash.len(), 64, "expected 64-char hex hash, got {hash:?}");
+
+    let ls = bloom_cmd(home.path())
+        .args(["petals", "ls"])
+        .assert()
+        .success();
+    let ls_out = String::from_utf8(ls.get_output().stdout.clone()).unwrap();
+    // ls prints the first 12 chars of the hash plus the petname.
+    let short = &hash[..12];
+    assert!(
+        ls_out.contains(short),
+        "petals ls should mention installed hash {short}; got:\n{ls_out}"
+    );
+    assert!(
+        ls_out.contains("name=hello"),
+        "petals ls should show name=hello; got:\n{ls_out}"
+    );
+
+    // Run via the petname.
+    let run_by_name = bloom_cmd(home.path())
+        .args(["petals", "run", "hello"])
+        .assert()
+        .success();
+    let stdout_name = String::from_utf8(run_by_name.get_output().stdout.clone()).unwrap();
+    assert_eq!(
+        stdout_name, "hello from cli petal\n",
+        "stdout from petal didn't match"
+    );
+
+    // Run via the bare hash.
+    let run_by_hash = bloom_cmd(home.path())
+        .args(["petals", "run", hash])
+        .assert()
+        .success();
+    let stdout_hash = String::from_utf8(run_by_hash.get_output().stdout.clone()).unwrap();
+    assert_eq!(stdout_hash, "hello from cli petal\n");
+}
+
+/// `bloom petals name <name> <hash>` binds a petname, and `name <name>`
+/// with no hash unbinds it. Verified by reading `public/<name>` via the
+/// VFS subcommand, which goes through the PetalsHandler we mounted in
+/// `bloom-daemon`.
+#[test]
+fn petals_name_bind_unbind_reflects_in_vfs() {
+    let home = fresh_home();
+    let wat_path = home.path().join("noop.wat");
+    // Minimal valid wasm module: `(module)` compiles to 8 bytes. We use
+    // a slightly fuller WAT just so it survives a wasmtime parse.
+    let wat = r#"(module (memory (export "memory") 1) (func (export "_start")))"#;
+    std::fs::write(&wat_path, wat).unwrap();
+
+    let install = bloom_cmd(home.path())
+        .args(["petals", "install", wat_path.to_str().unwrap()])
+        .assert()
+        .success();
+    let install_out = String::from_utf8(install.get_output().stdout.clone()).unwrap();
+    let hash = install_out
+        .lines()
+        .find(|l| l.starts_with("hash: "))
+        .unwrap()
+        .trim_start_matches("hash: ")
+        .trim()
+        .to_string();
+
+    // Bind a new petname.
+    bloom_cmd(home.path())
+        .args(["petals", "name", "greet", &hash])
+        .assert()
+        .success();
+
+    // `vfs ls /public` should expose the petname as a symlink. We just
+    // check the entry is listed; symlink targets aren't shown by the ls
+    // formatter, but the daemon-side handler emits the entry.
+    let ls = bloom_cmd(home.path())
+        .args(["vfs", "ls", "/public"])
+        .assert()
+        .success();
+    let ls_out = String::from_utf8(ls.get_output().stdout.clone()).unwrap();
+    assert!(
+        ls_out.lines().any(|l| l.starts_with("greet")),
+        "expected 'greet' entry under /public; got:\n{ls_out}"
+    );
+
+    // Unbind by omitting the hash.
+    bloom_cmd(home.path())
+        .args(["petals", "name", "greet"])
+        .assert()
+        .success();
+
+    let ls_after = bloom_cmd(home.path())
+        .args(["vfs", "ls", "/public"])
+        .assert()
+        .success();
+    let ls_after_out = String::from_utf8(ls_after.get_output().stdout.clone()).unwrap();
+    assert!(
+        !ls_after_out.lines().any(|l| l.starts_with("greet")),
+        "expected 'greet' entry removed; got:\n{ls_after_out}"
+    );
 }

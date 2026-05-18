@@ -26,6 +26,7 @@ bloom-chain.workspace = true
 bloom-tx.workspace = true
 bloom-vfs.workspace = true
 bloom-tools.workspace = true
+bloom-petals.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

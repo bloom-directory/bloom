@@ -18,6 +18,7 @@ use bloom_defi::EnsoClient;
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
 use bloom_keystore::Keystore;
+use bloom_petals::{NameRegistry, PetalRunner, PetalStore, PetalVm, PetalsHandler};
 use bloom_prices::PricesClient;
 use bloom_proto::{AddressBook, AuditLog, Config, HomeDir};
 use bloom_revert::{
@@ -70,6 +71,7 @@ pub struct Daemon {
     pub address_book: Arc<AddressBook>,
     pub audit: Arc<AuditLog>,
     pub vfs: Vfs,
+    pub petals: PetalRunner,
     pub watch_registry: Arc<WatchRegistry>,
     pub watch_executor: Arc<WatchExecutor>,
     /// Shutdown handles for spawned mempool subscription tasks. Dropping
@@ -403,7 +405,28 @@ impl Daemon {
             .with_mempool_statuses(initial_mempool_statuses),
         );
 
+        // Build the petals runtime: content-addressed store under
+        // `~/.bloom/petals/store`, name registry under
+        // `~/.bloom/petals/registry`, and a wasmtime engine. The handler
+        // exposed at `public/` reads from both, while the runner glues
+        // them together for IPC-driven install/run.
+        let petals_root = home.root().join("petals");
+        let petal_store = PetalStore::open(petals_root.join("store"))
+            .map_err(|e| DaemonError::Audit(format!("petals store: {e}")))?;
+        let petal_registry = Arc::new(
+            NameRegistry::open(petals_root.join("registry"))
+                .map_err(|e| DaemonError::Audit(format!("petals registry: {e}")))?,
+        );
+        let petal_vm =
+            PetalVm::new().map_err(|e| DaemonError::Audit(format!("petals vm: {e}")))?;
+        let petals = PetalRunner::new(petal_store.clone(), petal_registry.clone(), petal_vm);
+        debug!(root = %petals_root.display(), "daemon.petals_initialised");
+
         let mut vfs_builder = Vfs::builder()
+            .mount(
+                "public",
+                Arc::new(PetalsHandler::new(petal_store, petal_registry)) as _,
+            )
             .mount(
                 "chains",
                 Arc::new(
@@ -658,6 +681,7 @@ impl Daemon {
             address_book: address_book_arc,
             audit: audit_arc,
             vfs,
+            petals,
             watch_registry,
             watch_executor,
             mempool_shutdown: Arc::new(parking_lot::Mutex::new(mempool_shutdown)),
@@ -847,6 +871,7 @@ mod tests {
         assert!(d.vfs.handler("prices").is_some());
         assert!(d.vfs.handler("addressbook").is_some());
         assert!(d.vfs.handler("ens").is_some());
+        assert!(d.vfs.handler("public").is_some());
     }
 
     /// A pre-existing watch spec on disk should be loaded into the

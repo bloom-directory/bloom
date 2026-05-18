@@ -68,6 +68,9 @@ enum Cmd {
     /// Talk to a running `bloom serve` over its UDS JSON-RPC socket.
     #[command(subcommand)]
     Ipc(IpcCmd),
+    /// Manage wasm petals: install, run, list, name.
+    #[command(subcommand)]
+    Petals(PetalsCmd),
     /// Initialise ~/.bloom with default config + dirs.
     Init,
 }
@@ -93,6 +96,43 @@ enum VfsCmd {
         path: String,
         #[arg(long)]
         data: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PetalsCmd {
+    /// Install a wasm (or WAT) module at `<path>`. Accepts `-` for stdin.
+    Install {
+        /// Path to a `.wasm` or `.wat` file, or `-` for stdin.
+        path: String,
+        /// Petname to bind to the resulting hash.
+        #[arg(long)]
+        name: Option<String>,
+        /// Capabilities to grant. Repeat to grant multiple, e.g.
+        /// `--cap vfs.read --cap vfs.write`.
+        #[arg(long = "cap", value_name = "CAP")]
+        caps: Vec<String>,
+    },
+    /// Run a petal by petname or hash.
+    Run {
+        /// Petname or 64-char hex hash.
+        name_or_hash: String,
+        /// File to feed to the petal as stdin (default: empty). `-` means
+        /// read from this process's stdin.
+        #[arg(long)]
+        input: Option<String>,
+        /// Restrict capabilities for this run to the listed set
+        /// (intersected with the petal's declared caps). Without this
+        /// flag, the petal runs with all of its declared caps.
+        #[arg(long = "cap", value_name = "CAP")]
+        cap_mask: Vec<String>,
+    },
+    /// List installed petals.
+    Ls,
+    /// Bind `<name>` to `<hash>`. Omit `<hash>` to remove the binding.
+    Name {
+        name: String,
+        hash: Option<String>,
     },
 }
 
@@ -391,7 +431,8 @@ async fn run(cli: Cli) -> Result<()> {
             let socket = default_socket_path(d.home.root());
             println!("ipc socket: {}", socket.display());
             info!(home = %d.home.root().display(), chains = ?chains, socket = %socket.display(), mount = ?mount, "cli.serve.starting");
-            let server = IpcServer::new(d.vfs.clone(), env!("CARGO_PKG_VERSION"), chains);
+            let server = IpcServer::new(d.vfs.clone(), env!("CARGO_PKG_VERSION"), chains)
+                .with_petals(d.petals.clone());
             let server2 = server.clone();
             // Trigger graceful shutdown on Ctrl-C.
             let shutdown = tokio::spawn(async move {
@@ -412,6 +453,7 @@ async fn run(cli: Cli) -> Result<()> {
             println!("shutting down");
             Ok(())
         }
+        Cmd::Petals(cmd) => run_petals(home, cmd).await,
         Cmd::Ipc(IpcCmd::Call { method, params }) => {
             let socket = default_socket_path(home.root());
             if !socket.exists() {
@@ -430,6 +472,140 @@ async fn run(cli: Cli) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
+    }
+}
+
+async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
+    use std::collections::BTreeSet;
+    use std::io::Read;
+
+    use bloom_petals::{Capability, RunOptions, VfsHost};
+
+    let d = Daemon::from_home(home).context("build daemon")?;
+    let vfs_arc = std::sync::Arc::new(d.vfs.clone());
+
+    match cmd {
+        PetalsCmd::Install { path, name, caps } => {
+            let bytes = if path == "-" {
+                let mut buf = Vec::new();
+                std::io::stdin().read_to_end(&mut buf).context("read stdin")?;
+                buf
+            } else {
+                std::fs::read(&path).with_context(|| format!("read {path}"))?
+            };
+            let mut cap_set: BTreeSet<Capability> = BTreeSet::new();
+            for c in &caps {
+                let cap = Capability::parse(c)
+                    .ok_or_else(|| anyhow::anyhow!("unknown capability: {c:?}"))?;
+                cap_set.insert(cap);
+            }
+            let (result, meta) = d
+                .petals
+                .install(&bytes, name.as_deref(), &cap_set)
+                .context("install petal")?;
+            println!("hash: {}", result.hash);
+            println!("size: {} bytes", result.size);
+            if result.already_present {
+                println!("note: already installed (caps unioned with existing)");
+            }
+            if let Some(n) = &meta.name {
+                println!("name: {n}");
+            }
+            if !meta.caps.is_empty() {
+                let cs: Vec<&str> = meta.caps.iter().map(|c| c.as_str()).collect();
+                println!("caps: {}", cs.join(", "));
+            }
+            Ok(())
+        }
+        PetalsCmd::Run {
+            name_or_hash,
+            input,
+            cap_mask,
+        } => {
+            let stdin = match input.as_deref() {
+                Some("-") => {
+                    let mut buf = Vec::new();
+                    std::io::stdin().read_to_end(&mut buf).context("read stdin")?;
+                    buf
+                }
+                Some(p) => std::fs::read(p).with_context(|| format!("read {p}"))?,
+                None => Vec::new(),
+            };
+            let cap_mask = if cap_mask.is_empty() {
+                None
+            } else {
+                let mut s: BTreeSet<Capability> = BTreeSet::new();
+                for c in &cap_mask {
+                    let cap = Capability::parse(c)
+                        .ok_or_else(|| anyhow::anyhow!("unknown capability: {c:?}"))?;
+                    s.insert(cap);
+                }
+                Some(s)
+            };
+            let host = std::sync::Arc::new(VfsHost::new(vfs_arc.clone()));
+            let out = d
+                .petals
+                .run(&name_or_hash, stdin, host, cap_mask, RunOptions::default())
+                .await
+                .context("run petal")?;
+            use std::io::Write;
+            // Stream stdout/stderr to the user verbatim so they can pipe
+            // a petal's output. Exit code goes to the parent process.
+            std::io::stdout().write_all(&out.stdout).ok();
+            std::io::stderr().write_all(&out.stderr).ok();
+            if out.exit_code != 0 {
+                anyhow::bail!("petal exited with code {}", out.exit_code);
+            }
+            Ok(())
+        }
+        PetalsCmd::Ls => {
+            let names = d.petals.registry().snapshot();
+            let mut name_for_hash: std::collections::BTreeMap<String, String> = Default::default();
+            for (n, h) in &names {
+                name_for_hash.entry(h.clone()).or_insert(n.clone());
+            }
+            let hashes = d.petals.store().list_hashes().context("list petals")?;
+            if hashes.is_empty() {
+                println!("(no petals installed)");
+                return Ok(());
+            }
+            for h in hashes {
+                let meta = d.petals.store().load_meta(&h).context("load meta")?;
+                let n = name_for_hash.get(&h).map(String::as_str).unwrap_or("-");
+                let caps: Vec<&str> = meta.caps.iter().map(|c| c.as_str()).collect();
+                println!(
+                    "{}  {:>7}  caps=[{}]  name={}",
+                    &meta.hash[..12],
+                    meta.size,
+                    caps.join(","),
+                    n
+                );
+            }
+            Ok(())
+        }
+        PetalsCmd::Name { name, hash } => match hash {
+            Some(h) => {
+                d.petals
+                    .registry()
+                    .set(&name, &h)
+                    .with_context(|| format!("bind name {name} -> {h}"))?;
+                println!("bound {name} -> {h}");
+                Ok(())
+            }
+            None => {
+                let removed = d
+                    .petals
+                    .registry()
+                    .unset(&name)
+                    .with_context(|| format!("unset name {name}"))?;
+                if removed {
+                    println!("removed name {name}");
+                } else {
+                    println!("name {name} was not bound");
+                }
+                Ok(())
+            }
+        },
     }
 }
 
