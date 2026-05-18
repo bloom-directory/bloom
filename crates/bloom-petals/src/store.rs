@@ -180,6 +180,10 @@ impl PetalStore {
     /// if anything was removed, `false` if the hash was not installed.
     /// The caller is responsible for clearing any registry entries that
     /// point at this hash.
+    ///
+    /// Not safe under concurrent mutation: the `had` snapshot is taken
+    /// before the removes, and a non-NotFound IO error between the two
+    /// unlinks can leave the store with only one of the two files.
     pub fn uninstall(&self, hash: &str) -> Result<bool, PetalError> {
         let obj_path = self.object_path(hash);
         let meta_path = self.meta_path(hash);
