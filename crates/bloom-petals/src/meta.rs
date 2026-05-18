@@ -14,7 +14,7 @@ pub enum Capability {
     /// May call `bloom_vfs_write`.
     #[serde(rename = "vfs.write")]
     VfsWrite,
-    /// May read on-chain state.
+    /// May call `bloom_chain_read_at`.
     #[serde(rename = "chain.read")]
     ChainRead,
 }
