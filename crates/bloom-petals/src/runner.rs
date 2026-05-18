@@ -98,6 +98,8 @@ impl PetalRunner {
                 .map_err(|_| PetalError::InvalidWasm("not wasm and not utf-8 WAT".into()))?;
             wat::parse_str(s).map_err(|e| PetalError::InvalidWasm(format!("wat: {e}")))?
         };
+        // TODO(task-7): plumb a `mode` parameter through PetalRunner::install
+        // and call validate_mode_caps before forwarding to the store.
         let (result, meta) = self.store.install(&wasm, name, caps, crate::meta::PetalMode::Local)?;
         if let Some(n) = name {
             self.registry.set(n, &result.hash)?;

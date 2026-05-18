@@ -76,10 +76,8 @@ impl PetalStore {
         let obj_path = self.object_path(&hash);
         let already_present = obj_path.exists();
 
-        if !already_present {
-            atomic_write(&obj_path, wasm)?;
-        }
-
+        // Check the mode constraint before writing — a cross-mode reinstall
+        // should fail without touching the object dir.
         let mut meta = match self.load_meta(&hash) {
             Ok(existing) => {
                 if existing.mode != mode {
@@ -99,6 +97,10 @@ impl PetalStore {
             },
             Err(e) => return Err(e),
         };
+
+        if !already_present {
+            atomic_write(&obj_path, wasm)?;
+        }
         if let Some(n) = name {
             meta.name = Some(n.to_string());
         }
