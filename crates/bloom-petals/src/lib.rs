@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attestation;
 pub mod error;
 pub mod handler;
 pub mod host;
@@ -19,6 +20,7 @@ pub mod runner;
 pub mod store;
 pub mod vm;
 
+pub use attestation::{PetalAttestation, blake3_hex};
 pub use error::PetalError;
 pub use handler::PetalsHandler;
 pub use host::{HostError, PetalHost};
