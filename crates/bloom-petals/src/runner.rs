@@ -246,6 +246,42 @@ impl PetalRunner {
         };
         Ok((out, att))
     }
+
+    /// Re-run an onchain petal against the same stdin and check whether
+    /// the output hash matches `expected_output_hash`. Returns the
+    /// resulting [`ReplayOutcome`] regardless of match status; only
+    /// non-onchain petals or run failures surface as errors.
+    pub async fn replay(
+        &self,
+        name_or_hash: &str,
+        stdin: Vec<u8>,
+        expected_output_hash: &str,
+        host: Arc<dyn PetalHost>,
+        opts: RunOptions,
+    ) -> Result<ReplayOutcome, PetalError> {
+        let hash = self.resolve(name_or_hash)?;
+        let meta = self.store.load_meta(&hash)?;
+        if meta.mode != crate::meta::PetalMode::Onchain {
+            return Err(PetalError::Vm("replay only valid for onchain petals".into()));
+        }
+        let (run, att) = self.run_attested(name_or_hash, stdin, host, None, opts).await?;
+        let att = att.expect("onchain run must produce attestation");
+        let matched = att.output_hash == expected_output_hash;
+        Ok(ReplayOutcome {
+            matched,
+            actual_output_hash: att.output_hash.clone(),
+            run,
+            attestation: att,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplayOutcome {
+    pub matched: bool,
+    pub actual_output_hash: String,
+    pub run: RunOutput,
+    pub attestation: crate::attestation::PetalAttestation,
 }
 
 #[cfg(test)]
@@ -379,5 +415,57 @@ mod tests {
         assert!(removed);
         assert!(!r.store().contains(&res.hash));
         assert!(r.registry().lookup("byename").is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_match_returns_ok_with_expected_hash() {
+        let (_d, r) = runner();
+        let (_res, _) = r
+            .install(ONCHAIN_NOOP.as_bytes(), Some("rnoop"), &BTreeSet::new(), crate::meta::PetalMode::Onchain)
+            .unwrap();
+        let stdin = b"x".to_vec();
+        let (_out, att) = r
+            .run_attested("rnoop", stdin.clone(), Arc::new(crate::host::DenyHost), None, RunOptions::default())
+            .await
+            .unwrap();
+        let expected = att.unwrap().output_hash;
+        let outcome = r
+            .replay("rnoop", stdin.clone(), &expected, Arc::new(crate::host::DenyHost), RunOptions::default())
+            .await
+            .unwrap();
+        assert!(outcome.matched);
+        assert_eq!(outcome.actual_output_hash, expected);
+    }
+
+    #[tokio::test]
+    async fn replay_mismatch_returns_outcome_with_flag_false() {
+        let (_d, r) = runner();
+        let (_res, _) = r
+            .install(ONCHAIN_NOOP.as_bytes(), Some("rnoop2"), &BTreeSet::new(), crate::meta::PetalMode::Onchain)
+            .unwrap();
+        let outcome = r
+            .replay(
+                "rnoop2",
+                b"input".to_vec(),
+                "0".repeat(64).as_str(),
+                Arc::new(crate::host::DenyHost),
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.matched);
+    }
+
+    #[tokio::test]
+    async fn replay_refuses_local_petal() {
+        let (_d, r) = runner();
+        let (_res, _) = r
+            .install(HELLO_WAT.as_bytes(), Some("loc"), &BTreeSet::new(), crate::meta::PetalMode::Local)
+            .unwrap();
+        let err = r
+            .replay("loc", Vec::new(), &"0".repeat(64), Arc::new(crate::host::DenyHost), RunOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PetalError::Vm(_)), "{err:?}");
     }
 }

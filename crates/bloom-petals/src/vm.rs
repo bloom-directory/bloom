@@ -74,7 +74,7 @@ impl Default for RunOptions {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RunOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
