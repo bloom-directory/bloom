@@ -110,6 +110,20 @@ mod tests {
         }
     }
 
+    /// The wasm-facing error codes are part of the host ABI: changing them
+    /// would silently break already-installed onchain petals. Pin the exact
+    /// numeric assignments so a careless swap gets caught at test time.
+    #[test]
+    fn error_codes_are_pinned() {
+        assert_eq!(HostError::NotFound("x".into()).as_wasm_code(), -1);
+        assert_eq!(HostError::Denied("x".into()).as_wasm_code(), -2);
+        assert_eq!(HostError::Invalid("x".into()).as_wasm_code(), -3);
+        assert_eq!(HostError::Backend("x".into()).as_wasm_code(), -4);
+        assert_eq!(HostError::BlockNotPinnable.as_wasm_code(), -5);
+        assert_eq!(HostError::ChainUnavailable("eth".into()).as_wasm_code(), -6);
+        assert_eq!(HostError::ChainPathUnknown("p".into()).as_wasm_code(), -7);
+    }
+
     #[tokio::test]
     async fn deny_host_denies_chain_read() {
         let h = DenyHost;
