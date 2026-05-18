@@ -280,6 +280,14 @@ impl IpcServer {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_petal_err(id, e),
             },
+            "petals.uninstall" => match self.do_petals_uninstall(&req.params).await {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => map_petal_err(id, e),
+            },
+            "petals.replay" => match self.do_petals_replay(&req.params).await {
+                Ok(v) => Response::ok(id, v),
+                Err(e) => map_petal_err(id, e),
+            },
             other => {
                 debug!(method = %other, "ipc.dispatch.method_not_found");
                 Response::err(id, -32601, format!("method not found: {other}"))
@@ -338,8 +346,15 @@ impl IpcServer {
         };
         let name = params.get("name").and_then(|v| v.as_str());
         let caps = parse_caps(params.get("caps"))?;
-        // TODO(task-14): accept "mode" in the IPC params and forward it here.
-        let (result, meta) = runner.install(&bytes, name, &caps, bloom_petals::PetalMode::Local)?;
+        let mode = match params.get("mode").and_then(|v| v.as_str()) {
+            None => bloom_petals::PetalMode::Local,
+            Some("local") => bloom_petals::PetalMode::Local,
+            Some("onchain") => bloom_petals::PetalMode::Onchain,
+            Some(other) => {
+                return Err(PetalError::vm(format!("install: unknown mode {other:?}")));
+            }
+        };
+        let (result, meta) = runner.install(&bytes, name, &caps, mode)?;
         Ok(json!({
             "hash": result.hash,
             "size": result.size,
@@ -347,6 +362,7 @@ impl IpcServer {
             "name": meta.name,
             "caps": meta.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
             "installed_at_ms": meta.installed_at_ms,
+            "mode": meta.mode_str(),
         }))
     }
 
@@ -371,15 +387,22 @@ impl IpcServer {
             _ => None,
         };
         let host = Arc::new(VfsHost::new(self.vfs_arc.clone()));
-        let out = runner
-            .run(target, stdin, host, cap_mask, RunOptions::default())
+        let (out, att) = runner
+            .run_attested(target, stdin, host, cap_mask, RunOptions::default())
             .await?;
-        Ok(json!({
+        let meta = runner.store().load_meta(&runner.resolve(target)?)?;
+        let mut body = json!({
             "exit_code": out.exit_code,
             "stdout_b64": B64.encode(&out.stdout),
             "stderr_b64": B64.encode(&out.stderr),
             "fuel_consumed": out.fuel_consumed,
-        }))
+            "mode": meta.mode_str(),
+        });
+        if let Some(a) = att {
+            body["attestation"] = serde_json::to_value(&a)
+                .map_err(|e| PetalError::Serde(e.to_string()))?;
+        }
+        Ok(body)
     }
 
     async fn do_petals_list(&self) -> Result<Value, PetalError> {
@@ -438,6 +461,46 @@ impl IpcServer {
             }
         }
     }
+
+    async fn do_petals_uninstall(&self, params: &Value) -> Result<Value, PetalError> {
+        let runner = self.petals()?;
+        let hash = params
+            .get("hash")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| PetalError::vm("missing 'hash'"))?;
+        let removed = runner.uninstall(hash)?;
+        Ok(json!({ "removed": removed }))
+    }
+
+    async fn do_petals_replay(&self, params: &Value) -> Result<Value, PetalError> {
+        let runner = self.petals()?;
+        let target = params
+            .get("name_or_hash")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| PetalError::vm("missing 'name_or_hash'"))?;
+        let stdin = if let Some(s) = params.get("stdin_b64").and_then(|v| v.as_str()) {
+            B64.decode(s).map_err(|e| PetalError::vm(format!("stdin_b64: {e}")))?
+        } else if let Some(s) = params.get("input").and_then(|v| v.as_str()) {
+            s.as_bytes().to_vec()
+        } else {
+            Vec::new()
+        };
+        let expect = params
+            .get("expect_output_hash")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| PetalError::vm("missing 'expect_output_hash'"))?;
+        let host = Arc::new(VfsHost::new(self.vfs_arc.clone()));
+        let outcome = runner
+            .replay(target, stdin, expect, host, RunOptions::default())
+            .await?;
+        Ok(json!({
+            "matched": outcome.matched,
+            "actual_output_hash": outcome.actual_output_hash,
+            "exit_code": outcome.run.exit_code,
+            "attestation": serde_json::to_value(&outcome.attestation)
+                .map_err(|e| PetalError::Serde(e.to_string()))?,
+        }))
+    }
 }
 
 fn parse_caps(v: Option<&Value>) -> Result<BTreeSet<Capability>, PetalError> {
@@ -457,7 +520,7 @@ fn parse_caps(v: Option<&Value>) -> Result<BTreeSet<Capability>, PetalError> {
             .ok_or_else(|| PetalError::vm("'caps' entries must be strings"))?;
         out.insert(Capability::parse(s).ok_or_else(|| {
             PetalError::vm(format!(
-                "unknown capability {s:?}; expected 'vfs.read' or 'vfs.write'"
+                "unknown capability {s:?}; expected 'vfs.read', 'vfs.write', or 'chain.read'"
             ))
         })?);
     }

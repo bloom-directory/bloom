@@ -80,6 +80,10 @@ impl PetalMeta {
     pub fn has_cap(&self, cap: Capability) -> bool {
         self.caps.contains(&cap)
     }
+
+    pub fn mode_str(&self) -> &'static str {
+        self.mode.as_str()
+    }
 }
 
 /// Validate that a (mode, caps) pair is allowed at install time.
