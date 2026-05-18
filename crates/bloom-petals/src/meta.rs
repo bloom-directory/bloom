@@ -14,6 +14,9 @@ pub enum Capability {
     /// May call `bloom_vfs_write`.
     #[serde(rename = "vfs.write")]
     VfsWrite,
+    /// May read on-chain state.
+    #[serde(rename = "chain.read")]
+    ChainRead,
 }
 
 impl Capability {
@@ -21,6 +24,7 @@ impl Capability {
         match self {
             Capability::VfsRead => "vfs.read",
             Capability::VfsWrite => "vfs.write",
+            Capability::ChainRead => "chain.read",
         }
     }
 
@@ -28,6 +32,7 @@ impl Capability {
         match s {
             "vfs.read" => Some(Capability::VfsRead),
             "vfs.write" => Some(Capability::VfsWrite),
+            "chain.read" => Some(Capability::ChainRead),
             _ => None,
         }
     }
@@ -70,8 +75,10 @@ mod tests {
     fn capability_string_roundtrip() {
         assert_eq!(Capability::VfsRead.as_str(), "vfs.read");
         assert_eq!(Capability::VfsWrite.as_str(), "vfs.write");
+        assert_eq!(Capability::ChainRead.as_str(), "chain.read");
         assert_eq!(Capability::parse("vfs.read"), Some(Capability::VfsRead));
         assert_eq!(Capability::parse("vfs.write"), Some(Capability::VfsWrite));
+        assert_eq!(Capability::parse("chain.read"), Some(Capability::ChainRead));
         assert_eq!(Capability::parse("nope"), None);
     }
 
