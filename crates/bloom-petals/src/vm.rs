@@ -539,6 +539,14 @@ mod tests {
             self.store.lock().insert(path.into(), bytes.to_vec());
             Ok(())
         }
+        async fn chain_read_at(
+            &self,
+            _chain: &str,
+            _path: &str,
+            _block: u64,
+        ) -> Result<Vec<u8>, HostError> {
+            Err(HostError::Denied("MockHost".into()))
+        }
     }
 
     #[tokio::test]

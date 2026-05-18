@@ -45,6 +45,17 @@ impl PetalHost for VfsHost {
             VfsPath::parse(path).map_err(|e| HostError::Invalid(format!("path: {e}")))?;
         self.vfs.write(&path, bytes).await.map_err(host_from_handler)
     }
+
+    async fn chain_read_at(
+        &self,
+        _chain: &str,
+        _path: &str,
+        _block: u64,
+    ) -> Result<Vec<u8>, HostError> {
+        Err(HostError::Denied(
+            "VfsHost: chain reads belong on the VFS for local petals".into(),
+        ))
+    }
 }
 
 fn host_from_handler(e: HandlerError) -> HostError {
