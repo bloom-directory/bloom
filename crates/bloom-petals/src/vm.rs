@@ -108,6 +108,14 @@ impl PetalVm {
         // Reasonable defaults for production. Cranelift compiles
         // modules just-in-time on the first instantiate.
         config.cranelift_opt_level(wasmtime::OptLevel::Speed);
+        // Cross-machine determinism cheap-knobs. NaN canonicalization
+        // makes float ops bit-identical across CPUs that follow the
+        // IEEE spec differently. wasm_relaxed_simd_deterministic forces
+        // a single profile of the relaxed-SIMD ops. Engine-version
+        // determinism is NOT addressed here.
+        config.cranelift_nan_canonicalization(true);
+        config.wasm_relaxed_simd(true);
+        config.relaxed_simd_deterministic(true);
         let engine = Engine::new(&config).map_err(|e| PetalError::vm(e.to_string()))?;
         Ok(Self { engine })
     }
@@ -753,5 +761,11 @@ mod tests {
             .unwrap();
         // Instantiation should fail (linker has no bloom.chain_read_at in local mode).
         assert_eq!(out.exit_code, 127);
+    }
+
+    #[test]
+    fn vm_construction_with_deterministic_knobs_succeeds() {
+        let vm = PetalVm::new().unwrap();
+        drop(vm);
     }
 }
