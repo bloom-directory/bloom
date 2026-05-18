@@ -159,6 +159,22 @@ impl PetalRunner {
         Ok((result, meta))
     }
 
+    /// Remove an installed petal and any petname pointing at it.
+    /// Returns true if anything was removed.
+    pub fn uninstall(&self, hash: &str) -> Result<bool, PetalError> {
+        let to_unset: Vec<String> = self
+            .registry
+            .snapshot()
+            .into_iter()
+            .filter_map(|(n, h)| if h == hash { Some(n) } else { None })
+            .collect();
+        let removed = self.store.uninstall(hash)?;
+        for n in to_unset {
+            self.registry.unset(&n)?;
+        }
+        Ok(removed)
+    }
+
     /// Resolve a `name_or_hash` to a content hash. Hashes win — if a
     /// caller passes a 64-char hex that happens to be a name, the
     /// hash interpretation is used.
@@ -349,5 +365,19 @@ mod tests {
             .await
             .unwrap();
         assert!(att.is_none(), "local runs do not produce attestations");
+    }
+
+    #[tokio::test]
+    async fn uninstall_removes_object_meta_and_petname() {
+        let (_d, r) = runner();
+        let (res, _) = r
+            .install(HELLO_WAT.as_bytes(), Some("byename"), &BTreeSet::new(), crate::meta::PetalMode::Local)
+            .unwrap();
+        assert!(r.store().contains(&res.hash));
+        assert_eq!(r.registry().lookup("byename"), Some(res.hash.clone()));
+        let removed = r.uninstall(&res.hash).unwrap();
+        assert!(removed);
+        assert!(!r.store().contains(&res.hash));
+        assert!(r.registry().lookup("byename").is_none());
     }
 }
