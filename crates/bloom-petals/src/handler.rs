@@ -65,21 +65,18 @@ impl Handler for PetalsHandler {
             [seg] if seg == NAMES_DIR => Ok(Entry::dir(NAMES_DIR)),
             [seg] if seg == LOCAL_DIR => Ok(Entry::dir(LOCAL_DIR)),
             [seg] if seg == ONCHAIN_DIR => Ok(Entry::dir(ONCHAIN_DIR)),
-            [first, rest @ ..] if first == NAMES_DIR => match rest {
-                [name] => {
-                    validate_name(name).map_err(map_err)?;
-                    let entry = match self.registry.lookup(name) {
-                        Some(_) => {
-                            let mut e = Entry::writable_file(name);
-                            e.size = 64;
-                            e
-                        }
-                        None => Entry::writable_file(name),
-                    };
-                    Ok(entry)
-                }
-                _ => Err(HandlerError::NotFound(path.to_string_path())),
-            },
+            [first, name] if first == NAMES_DIR => {
+                validate_name(name).map_err(map_err)?;
+                let entry = match self.registry.lookup(name) {
+                    Some(_) => {
+                        let mut e = Entry::writable_file(name);
+                        e.size = 64;
+                        e
+                    }
+                    None => Entry::writable_file(name),
+                };
+                Ok(entry)
+            }
             [mode_seg, hash, rest @ ..] if is_mode_dir(mode_seg) && is_valid_hex_hash(hash) => {
                 let expected_mode = mode_for_seg(mode_seg);
                 let meta = self.store.load_meta(hash).map_err(map_err)?;
@@ -120,20 +117,17 @@ impl Handler for PetalsHandler {
 
     async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         match path.segments() {
-            [first, rest @ ..] if first == NAMES_DIR => match rest {
-                [name] => {
-                    validate_name(name).map_err(map_err)?;
-                    match self.registry.lookup(name) {
-                        Some(hash) => {
-                            let mut out = hash.into_bytes();
-                            out.push(b'\n');
-                            Ok(out)
-                        }
-                        None => Err(HandlerError::NotFound(path.to_string_path())),
+            [first, name] if first == NAMES_DIR => {
+                validate_name(name).map_err(map_err)?;
+                match self.registry.lookup(name) {
+                    Some(hash) => {
+                        let mut out = hash.into_bytes();
+                        out.push(b'\n');
+                        Ok(out)
                     }
+                    None => Err(HandlerError::NotFound(path.to_string_path())),
                 }
-                _ => Err(HandlerError::NotAFile(path.to_string_path())),
-            },
+            }
             [mode_seg, hash, child] if is_mode_dir(mode_seg) && is_valid_hex_hash(hash) => {
                 let expected_mode = mode_for_seg(mode_seg);
                 let meta = self.store.load_meta(hash).map_err(map_err)?;
@@ -159,28 +153,25 @@ impl Handler for PetalsHandler {
 
     async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
         match path.segments() {
-            [first, rest @ ..] if first == NAMES_DIR => match rest {
-                [name] => {
-                    validate_name(name).map_err(map_err)?;
-                    let body = std::str::from_utf8(data)
-                        .map_err(|_| HandlerError::invalid("name body not utf-8"))?
-                        .trim();
-                    if body.is_empty() {
-                        self.registry.unset(name).map_err(map_err)?;
-                        return Ok(());
-                    }
-                    if !is_valid_hex_hash(body) {
-                        return Err(HandlerError::invalid(format!(
-                            "expected 64-char hex hash, got {body:?}"
-                        )));
-                    }
-                    if !self.store.contains(body) {
-                        return Err(HandlerError::NotFound(format!("petal {body}")));
-                    }
-                    self.registry.set(name, body).map_err(map_err)
+            [first, name] if first == NAMES_DIR => {
+                validate_name(name).map_err(map_err)?;
+                let body = std::str::from_utf8(data)
+                    .map_err(|_| HandlerError::invalid("name body not utf-8"))?
+                    .trim();
+                if body.is_empty() {
+                    self.registry.unset(name).map_err(map_err)?;
+                    return Ok(());
                 }
-                _ => Err(HandlerError::PermissionDenied),
-            },
+                if !is_valid_hex_hash(body) {
+                    return Err(HandlerError::invalid(format!(
+                        "expected 64-char hex hash, got {body:?}"
+                    )));
+                }
+                if !self.store.contains(body) {
+                    return Err(HandlerError::NotFound(format!("petal {body}")));
+                }
+                self.registry.set(name, body).map_err(map_err)
+            }
             _ => Err(HandlerError::PermissionDenied),
         }
     }
@@ -208,10 +199,10 @@ impl Handler for PetalsHandler {
                     out.push(Entry::dir(&hash));
                 }
                 for (name, hash) in self.registry.snapshot() {
-                    if let Ok(meta) = self.store.load_meta(&hash) {
-                        if meta.mode == mode {
-                            out.push(Entry::symlink(&name, &hash));
-                        }
+                    if let Ok(meta) = self.store.load_meta(&hash)
+                        && meta.mode == mode
+                    {
+                        out.push(Entry::symlink(&name, &hash));
                     }
                 }
                 Ok(out)
