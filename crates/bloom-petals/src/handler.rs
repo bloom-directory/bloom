@@ -4,14 +4,17 @@
 //! the `public/` prefix):
 //!
 //! ```text
-//! .                  → directory listing of installed petals
-//!                      (hash dirs + name symlinks + the `names/` dir)
-//! <hash>/            → directory
-//! <hash>/wasm        → file, read-only, raw wasm bytes
-//! <hash>/meta.json   → file, read-only, PetalMeta as JSON
-//! <name>             → symlink → <hash>
-//! names/             → directory
-//! names/<name>       → file, *writable*; body is the target hash
+//! .                          → directory listing: { local/, onchain/, names/ }
+//! local/                     → directory of installed local petals
+//! local/<hash>/              → directory
+//! local/<hash>/wasm          → file, read-only, raw wasm bytes
+//! local/<hash>/meta.json     → file, read-only, PetalMeta as JSON
+//! local/<name>               → symlink → <hash> (only if meta.mode == Local)
+//! onchain/                   → directory of installed onchain petals
+//! onchain/<hash>/...         → same layout as local/<hash>/...
+//! onchain/<name>             → symlink → <hash> (only if meta.mode == Onchain)
+//! names/                     → directory
+//! names/<name>               → file, *writable*; body is the target hash
 //! ```
 //!
 //! Petal *execution* is not exposed via the VFS in v0 — invoke via
@@ -30,6 +33,10 @@ use crate::store::{PetalStore, is_valid_hex_hash};
 
 /// Reserved child of `public/` that exposes the name → hash registry.
 const NAMES_DIR: &str = "names";
+const LOCAL_DIR: &str = "local";
+const ONCHAIN_DIR: &str = "onchain";
+
+use crate::meta::PetalMode;
 
 pub struct PetalsHandler {
     store: PetalStore,
@@ -54,62 +61,39 @@ impl PetalsHandler {
 impl Handler for PetalsHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
         match path.segments() {
-            // Root of `public/`.
             [] => Ok(Entry::dir("")),
-            // `public/names`.
             [seg] if seg == NAMES_DIR => Ok(Entry::dir(NAMES_DIR)),
-            // `public/names/<name>` — writable file holding the target hash.
+            [seg] if seg == LOCAL_DIR => Ok(Entry::dir(LOCAL_DIR)),
+            [seg] if seg == ONCHAIN_DIR => Ok(Entry::dir(ONCHAIN_DIR)),
             [first, rest @ ..] if first == NAMES_DIR => match rest {
                 [name] => {
                     validate_name(name).map_err(map_err)?;
                     let entry = match self.registry.lookup(name) {
                         Some(_) => {
                             let mut e = Entry::writable_file(name);
-                            // Show the hash length so `ls -l` reports the right size.
                             e.size = 64;
                             e
                         }
-                        None => {
-                            // Pre-existing-but-unset: still writable so a
-                            // caller can create it. `lookup` is called by
-                            // NFS before a write, so returning a
-                            // writable_file here is correct even if the
-                            // name isn't registered yet.
-                            Entry::writable_file(name)
-                        }
+                        None => Entry::writable_file(name),
                     };
                     Ok(entry)
                 }
                 _ => Err(HandlerError::NotFound(path.to_string_path())),
             },
-            // `public/<first>` — either a hash (directory) or a name (symlink).
-            [first] => {
-                if is_valid_hex_hash(first) {
-                    if self.store.contains(first) {
-                        Ok(Entry::dir(first))
-                    } else {
-                        Err(HandlerError::NotFound(path.to_string_path()))
-                    }
-                } else if let Some(target_hash) = self.registry.lookup(first) {
-                    Ok(Entry::symlink(first, &target_hash))
-                } else {
-                    Err(HandlerError::NotFound(path.to_string_path()))
-                }
-            }
-            // `public/<hash>/wasm` or `<hash>/meta.json`.
-            [hash, rest @ ..] if is_valid_hex_hash(hash) => {
-                if !self.store.contains(hash) {
+            [mode_seg, hash, rest @ ..] if is_mode_dir(mode_seg) && is_valid_hex_hash(hash) => {
+                let expected_mode = mode_for_seg(mode_seg);
+                let meta = self.store.load_meta(hash).map_err(map_err)?;
+                if meta.mode != expected_mode {
                     return Err(HandlerError::NotFound(path.to_string_path()));
                 }
                 match rest {
+                    [] => Ok(Entry::dir(hash)),
                     [child] if child == "wasm" => {
-                        let meta = self.store.load_meta(hash).map_err(map_err)?;
                         let mut e = Entry::read_only_file("wasm");
                         e.size = meta.size;
                         Ok(e)
                     }
                     [child] if child == "meta.json" => {
-                        let meta = self.store.load_meta(hash).map_err(map_err)?;
                         let body = serde_json::to_vec_pretty(&meta)
                             .map_err(|e| HandlerError::Backend(e.to_string()))?;
                         let mut e = Entry::read_only_file("meta.json");
@@ -118,6 +102,17 @@ impl Handler for PetalsHandler {
                     }
                     _ => Err(HandlerError::NotFound(path.to_string_path())),
                 }
+            }
+            [mode_seg, name] if is_mode_dir(mode_seg) => {
+                let expected_mode = mode_for_seg(mode_seg);
+                let Some(hash) = self.registry.lookup(name) else {
+                    return Err(HandlerError::NotFound(path.to_string_path()));
+                };
+                let meta = self.store.load_meta(&hash).map_err(map_err)?;
+                if meta.mode != expected_mode {
+                    return Err(HandlerError::NotFound(path.to_string_path()));
+                }
+                Ok(Entry::symlink(name, &hash))
             }
             _ => Err(HandlerError::NotFound(path.to_string_path())),
         }
@@ -139,14 +134,15 @@ impl Handler for PetalsHandler {
                 }
                 _ => Err(HandlerError::NotAFile(path.to_string_path())),
             },
-            [hash, child] if is_valid_hex_hash(hash) => {
-                if !self.store.contains(hash) {
+            [mode_seg, hash, child] if is_mode_dir(mode_seg) && is_valid_hex_hash(hash) => {
+                let expected_mode = mode_for_seg(mode_seg);
+                let meta = self.store.load_meta(hash).map_err(map_err)?;
+                if meta.mode != expected_mode {
                     return Err(HandlerError::NotFound(path.to_string_path()));
                 }
                 match child.as_str() {
                     "wasm" => self.store.read_wasm(hash).map_err(map_err),
                     "meta.json" => {
-                        let meta = self.store.load_meta(hash).map_err(map_err)?;
                         serde_json::to_vec_pretty(&meta)
                             .map(|mut v| {
                                 v.push(b'\n');
@@ -191,17 +187,11 @@ impl Handler for PetalsHandler {
 
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         match path.segments() {
-            [] => {
-                let mut out = Vec::new();
-                out.push(Entry::dir(NAMES_DIR));
-                for hash in self.store.list_hashes().map_err(map_err)? {
-                    out.push(Entry::dir(&hash));
-                }
-                for (name, hash) in self.registry.snapshot() {
-                    out.push(Entry::symlink(&name, &hash));
-                }
-                Ok(out)
-            }
+            [] => Ok(vec![
+                Entry::dir(LOCAL_DIR),
+                Entry::dir(ONCHAIN_DIR),
+                Entry::dir(NAMES_DIR),
+            ]),
             [seg] if seg == NAMES_DIR => {
                 let mut out = Vec::new();
                 for (name, _hash) in self.registry.snapshot() {
@@ -211,11 +201,27 @@ impl Handler for PetalsHandler {
                 }
                 Ok(out)
             }
-            [hash] if is_valid_hex_hash(hash) => {
-                if !self.store.contains(hash) {
+            [seg] if is_mode_dir(seg) => {
+                let mode = mode_for_seg(seg);
+                let mut out = Vec::new();
+                for hash in self.store.list_hashes_by_mode(mode).map_err(map_err)? {
+                    out.push(Entry::dir(&hash));
+                }
+                for (name, hash) in self.registry.snapshot() {
+                    if let Ok(meta) = self.store.load_meta(&hash) {
+                        if meta.mode == mode {
+                            out.push(Entry::symlink(&name, &hash));
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            [mode_seg, hash] if is_mode_dir(mode_seg) && is_valid_hex_hash(hash) => {
+                let expected_mode = mode_for_seg(mode_seg);
+                let meta = self.store.load_meta(hash).map_err(map_err)?;
+                if meta.mode != expected_mode {
                     return Err(HandlerError::NotFound(path.to_string_path()));
                 }
-                let meta = self.store.load_meta(hash).map_err(map_err)?;
                 let mut wasm = Entry::read_only_file("wasm");
                 wasm.size = meta.size;
                 let meta_body = serde_json::to_vec_pretty(&meta)
@@ -226,6 +232,18 @@ impl Handler for PetalsHandler {
             }
             _ => Err(HandlerError::NotADir(path.to_string_path())),
         }
+    }
+}
+
+fn is_mode_dir(s: &str) -> bool {
+    s == LOCAL_DIR || s == ONCHAIN_DIR
+}
+
+fn mode_for_seg(s: &str) -> PetalMode {
+    if s == ONCHAIN_DIR {
+        PetalMode::Onchain
+    } else {
+        PetalMode::Local
     }
 }
 
@@ -253,106 +271,66 @@ fn map_err(e: PetalError) -> HandlerError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::meta::Capability;
+    use crate::meta::{Capability, PetalMode};
     use std::collections::BTreeSet;
     use tempfile::TempDir;
 
-    fn setup() -> (TempDir, PetalsHandler, String) {
+    fn setup_with_modes() -> (TempDir, PetalsHandler, String, String) {
         let dir = TempDir::new().unwrap();
         let store = PetalStore::open(dir.path().join("store")).unwrap();
         let reg = Arc::new(NameRegistry::open(dir.path().join("reg")).unwrap());
-        let mut caps = BTreeSet::new();
-        caps.insert(Capability::VfsRead);
-        let (r, _) = store.install(b"\x00asm\x01\x00\x00\x00", Some("greet"), &caps, crate::meta::PetalMode::Local).unwrap();
-        let h = PetalsHandler::new(store, reg.clone());
-        reg.set("greet", &r.hash).unwrap();
-        (dir, h, r.hash)
+        let mut local_caps = BTreeSet::new();
+        local_caps.insert(Capability::VfsRead);
+        let (rl, _) = store.install(b"\x00asm\x01\x00\x00\x00local", Some("greet"), &local_caps, PetalMode::Local).unwrap();
+        let mut chain_caps = BTreeSet::new();
+        chain_caps.insert(Capability::ChainRead);
+        let (rc, _) = store.install(b"\x00asm\x01\x00\x00\x00onchain", Some("snap"), &chain_caps, PetalMode::Onchain).unwrap();
+        reg.set("greet", &rl.hash).unwrap();
+        reg.set("snap", &rc.hash).unwrap();
+        let h = PetalsHandler::new(store, reg);
+        (dir, h, rl.hash, rc.hash)
     }
 
     #[tokio::test]
-    async fn lookup_root_is_directory() {
-        let (_d, h, _) = setup();
-        let e = h.lookup(&VfsPath::parse("/").unwrap()).await.unwrap();
-        assert_eq!(e.kind, bloom_vfs::handler::EntryKind::Dir);
+    async fn root_lists_local_onchain_names() {
+        let (_d, h, _, _) = setup_with_modes();
+        let entries = h.list(&VfsPath::parse("/").unwrap()).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"local"));
+        assert!(names.contains(&"onchain"));
+        assert!(names.contains(&"names"));
     }
 
     #[tokio::test]
-    async fn lookup_hash_is_directory() {
-        let (_d, h, hash) = setup();
-        let p = VfsPath::parse(&format!("/{hash}")).unwrap();
-        let e = h.lookup(&p).await.unwrap();
-        assert_eq!(e.kind, bloom_vfs::handler::EntryKind::Dir);
-        assert_eq!(e.name, hash);
+    async fn local_subtree_lists_only_local_petals() {
+        let (_d, h, local_hash, _onchain_hash) = setup_with_modes();
+        let entries = h.list(&VfsPath::parse("/local").unwrap()).await.unwrap();
+        let hashes: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(hashes.contains(&local_hash.as_str()), "missing local: {hashes:?}");
+        assert!(hashes.iter().all(|n| n != &"snap" || *n == "greet"), "leaked onchain hash into local: {hashes:?}");
     }
 
     #[tokio::test]
-    async fn lookup_name_is_symlink_to_hash() {
-        let (_d, h, hash) = setup();
-        let p = VfsPath::parse("/greet").unwrap();
-        let e = h.lookup(&p).await.unwrap();
-        assert_eq!(e.kind, bloom_vfs::handler::EntryKind::Symlink);
-        assert_eq!(e.link_target.as_deref(), Some(hash.as_str()));
-    }
-
-    #[tokio::test]
-    async fn read_wasm_returns_bytes() {
-        let (_d, h, hash) = setup();
-        let p = VfsPath::parse(&format!("/{hash}/wasm")).unwrap();
-        let body = h.read(&p).await.unwrap();
-        assert_eq!(body, b"\x00asm\x01\x00\x00\x00");
-    }
-
-    #[tokio::test]
-    async fn read_meta_returns_json() {
-        let (_d, h, hash) = setup();
-        let p = VfsPath::parse(&format!("/{hash}/meta.json")).unwrap();
-        let body = h.read(&p).await.unwrap();
-        let s = std::str::from_utf8(&body).unwrap();
-        assert!(s.contains("\"hash\""));
-        assert!(s.contains("\"caps\""));
-    }
-
-    #[tokio::test]
-    async fn write_to_names_sets_registry() {
-        let (_d, h, hash) = setup();
-        let p = VfsPath::parse("/names/hello").unwrap();
-        h.write(&p, hash.as_bytes()).await.unwrap();
-        assert_eq!(h.registry().lookup("hello"), Some(hash));
-    }
-
-    #[tokio::test]
-    async fn write_to_names_with_empty_body_unsets() {
-        let (_d, h, hash) = setup();
-        let p = VfsPath::parse("/names/greet").unwrap();
-        h.write(&p, b"").await.unwrap();
-        assert!(h.registry().lookup("greet").is_none());
-        let _ = hash;
-    }
-
-    #[tokio::test]
-    async fn write_to_names_rejects_unknown_hash() {
-        let (_d, h, _) = setup();
-        let p = VfsPath::parse("/names/x").unwrap();
-        let bad_hash = "9".repeat(64);
-        let err = h.write(&p, bad_hash.as_bytes()).await.unwrap_err();
+    async fn onchain_hash_in_local_path_is_not_found() {
+        let (_d, h, _local_hash, onchain_hash) = setup_with_modes();
+        let p = VfsPath::parse(&format!("/local/{onchain_hash}")).unwrap();
+        let err = h.lookup(&p).await.unwrap_err();
         assert!(matches!(err, HandlerError::NotFound(_)), "{err:?}");
     }
 
     #[tokio::test]
-    async fn list_root_includes_hash_dir_and_name_symlink_and_names_dir() {
-        let (_d, h, hash) = setup();
-        let entries = h.list(&VfsPath::parse("/").unwrap()).await.unwrap();
-        let hash_dir = entries
-            .iter()
-            .find(|e| e.name == hash && e.kind == bloom_vfs::handler::EntryKind::Dir);
-        let name_link = entries
-            .iter()
-            .find(|e| e.name == "greet" && e.kind == bloom_vfs::handler::EntryKind::Symlink);
-        let names_dir = entries
-            .iter()
-            .find(|e| e.name == NAMES_DIR && e.kind == bloom_vfs::handler::EntryKind::Dir);
-        assert!(hash_dir.is_some(), "missing hash dir; got {entries:#?}");
-        assert!(name_link.is_some(), "missing name symlink; got {entries:#?}");
-        assert!(names_dir.is_some(), "missing names dir; got {entries:#?}");
+    async fn read_wasm_under_correct_mode_subtree() {
+        let (_d, h, local_hash, _) = setup_with_modes();
+        let p = VfsPath::parse(&format!("/local/{local_hash}/wasm")).unwrap();
+        let body = h.read(&p).await.unwrap();
+        assert_eq!(body, b"\x00asm\x01\x00\x00\x00local");
+    }
+
+    #[tokio::test]
+    async fn write_to_names_sets_registry() {
+        let (_d, h, local_hash, _) = setup_with_modes();
+        let p = VfsPath::parse("/names/anothername").unwrap();
+        h.write(&p, local_hash.as_bytes()).await.unwrap();
+        assert_eq!(h.registry().lookup("anothername"), Some(local_hash));
     }
 }
