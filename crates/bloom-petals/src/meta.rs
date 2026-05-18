@@ -35,17 +35,12 @@ impl Capability {
 
 /// What execution surface a petal targets. Drives which host imports
 /// the VM links and which WASI capabilities the ctx exposes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PetalMode {
+    #[default]
     Local,
     Onchain,
-}
-
-impl Default for PetalMode {
-    fn default() -> Self {
-        PetalMode::Local
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,16 +92,31 @@ mod tests {
         assert_eq!(m2.hash, "abc");
         assert_eq!(m2.size, 42);
         assert_eq!(m2.name.as_deref(), Some("hello"));
-        assert!(m2.has_cap(Capability::VfsRead));
-        assert!(!m2.has_cap(Capability::VfsWrite));
+        assert!(m2.has_cap(Capability::VfsRead), "VfsRead cap should survive roundtrip");
+        assert!(!m2.has_cap(Capability::VfsWrite), "VfsWrite should not be present");
+        assert_eq!(m2.mode, PetalMode::Local, "default mode should roundtrip as Local");
+    }
+
+    #[test]
+    fn meta_serde_roundtrip_preserves_onchain_mode() {
+        let m = PetalMeta {
+            hash: "abc".into(),
+            size: 1,
+            installed_at_ms: 1,
+            name: None,
+            caps: BTreeSet::new(),
+            mode: PetalMode::Onchain,
+        };
+        let m2: PetalMeta = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(m2.mode, PetalMode::Onchain, "Onchain mode should survive roundtrip");
     }
 
     #[test]
     fn meta_serde_defaults_empty_caps_and_no_name() {
         let s = r#"{"hash":"x","size":1,"installed_at_ms":2}"#;
         let m: PetalMeta = serde_json::from_str(s).unwrap();
-        assert!(m.name.is_none());
-        assert!(m.caps.is_empty());
+        assert!(m.name.is_none(), "name should default to None");
+        assert!(m.caps.is_empty(), "caps should default to empty");
     }
 
     #[test]
