@@ -48,6 +48,21 @@ pub enum PetalMode {
     Onchain,
 }
 
+impl PetalMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PetalMode::Local => "local",
+            PetalMode::Onchain => "onchain",
+        }
+    }
+}
+
+impl std::fmt::Display for PetalMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PetalMeta {
     pub hash: String,
@@ -71,16 +86,19 @@ impl PetalMeta {
 ///
 /// - `Local` may declare `{vfs.read, vfs.write}`; `chain.read` is rejected.
 /// - `Onchain` may declare `{chain.read}`; vfs caps are rejected.
+///
+/// Returns `Err` on the first offending capability; the remaining caps
+/// are not inspected.
 pub fn validate_mode_caps(
     mode: PetalMode,
     caps: &BTreeSet<Capability>,
 ) -> Result<(), crate::error::PetalError> {
     for cap in caps {
-        let ok = match (mode, *cap) {
-            (PetalMode::Local, Capability::VfsRead | Capability::VfsWrite) => true,
-            (PetalMode::Onchain, Capability::ChainRead) => true,
-            _ => false,
-        };
+        let ok = matches!(
+            (mode, *cap),
+            (PetalMode::Local, Capability::VfsRead | Capability::VfsWrite)
+                | (PetalMode::Onchain, Capability::ChainRead)
+        );
         if !ok {
             return Err(crate::error::PetalError::ModeCapMismatch {
                 mode,
@@ -172,35 +190,50 @@ mod tests {
         use crate::error::PetalError;
 
         let empty = BTreeSet::new();
-        assert!(validate_mode_caps(PetalMode::Local, &empty).is_ok());
-        assert!(validate_mode_caps(PetalMode::Onchain, &empty).is_ok());
+        assert!(validate_mode_caps(PetalMode::Local, &empty).is_ok(), "Local + {{}} should be ok");
+        assert!(validate_mode_caps(PetalMode::Onchain, &empty).is_ok(), "Onchain + {{}} should be ok");
 
         let mut vfs_read = BTreeSet::new();
         vfs_read.insert(Capability::VfsRead);
-        assert!(validate_mode_caps(PetalMode::Local, &vfs_read).is_ok());
-        assert!(matches!(
-            validate_mode_caps(PetalMode::Onchain, &vfs_read),
-            Err(PetalError::ModeCapMismatch { .. })
-        ));
+        assert!(validate_mode_caps(PetalMode::Local, &vfs_read).is_ok(), "Local + {{vfs.read}} should be ok");
+        match validate_mode_caps(PetalMode::Onchain, &vfs_read) {
+            Err(PetalError::ModeCapMismatch { mode, cap }) => {
+                assert_eq!(mode, PetalMode::Onchain);
+                assert_eq!(cap, "vfs.read");
+            }
+            other => panic!("Onchain + {{vfs.read}} should error with ModeCapMismatch, got {other:?}"),
+        }
 
         let mut chain_read = BTreeSet::new();
         chain_read.insert(Capability::ChainRead);
-        assert!(validate_mode_caps(PetalMode::Onchain, &chain_read).is_ok());
-        assert!(matches!(
-            validate_mode_caps(PetalMode::Local, &chain_read),
-            Err(PetalError::ModeCapMismatch { .. })
-        ));
+        assert!(validate_mode_caps(PetalMode::Onchain, &chain_read).is_ok(), "Onchain + {{chain.read}} should be ok");
+        match validate_mode_caps(PetalMode::Local, &chain_read) {
+            Err(PetalError::ModeCapMismatch { mode, cap }) => {
+                assert_eq!(mode, PetalMode::Local);
+                assert_eq!(cap, "chain.read");
+            }
+            other => panic!("Local + {{chain.read}} should error with ModeCapMismatch, got {other:?}"),
+        }
 
+        // Mixed caps: BTreeSet iterates in Capability sort order
+        // (VfsRead < VfsWrite < ChainRead per the enum declaration order),
+        // so Local rejects on the first non-VFS cap and Onchain rejects on the first non-chain cap.
         let mut mixed = BTreeSet::new();
         mixed.insert(Capability::ChainRead);
         mixed.insert(Capability::VfsRead);
-        assert!(matches!(
-            validate_mode_caps(PetalMode::Local, &mixed),
-            Err(PetalError::ModeCapMismatch { .. })
-        ));
-        assert!(matches!(
-            validate_mode_caps(PetalMode::Onchain, &mixed),
-            Err(PetalError::ModeCapMismatch { .. })
-        ));
+        match validate_mode_caps(PetalMode::Local, &mixed) {
+            Err(PetalError::ModeCapMismatch { mode, cap }) => {
+                assert_eq!(mode, PetalMode::Local);
+                assert_eq!(cap, "chain.read", "Local should reject the chain.read entry");
+            }
+            other => panic!("Local + mixed should error with ModeCapMismatch, got {other:?}"),
+        }
+        match validate_mode_caps(PetalMode::Onchain, &mixed) {
+            Err(PetalError::ModeCapMismatch { mode, cap }) => {
+                assert_eq!(mode, PetalMode::Onchain);
+                assert_eq!(cap, "vfs.read", "Onchain should reject the vfs.read entry");
+            }
+            other => panic!("Onchain + mixed should error with ModeCapMismatch, got {other:?}"),
+        }
     }
 }
