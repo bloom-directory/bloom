@@ -110,9 +110,12 @@ impl PetalVm {
         config.cranelift_opt_level(wasmtime::OptLevel::Speed);
         // Cross-machine determinism cheap-knobs. NaN canonicalization
         // makes float ops bit-identical across CPUs that follow the
-        // IEEE spec differently. wasm_relaxed_simd_deterministic forces
-        // a single profile of the relaxed-SIMD ops. Engine-version
-        // determinism is NOT addressed here.
+        // IEEE spec differently. `wasm_relaxed_simd(true)` is the
+        // prerequisite that turns the feature on; `relaxed_simd_
+        // deterministic(true)` then pins it to a single profile (so
+        // enabling the feature does not widen what a petal can observe
+        // across hosts). Engine-version determinism is NOT addressed
+        // here.
         config.cranelift_nan_canonicalization(true);
         config.wasm_relaxed_simd(true);
         config.relaxed_simd_deterministic(true);
