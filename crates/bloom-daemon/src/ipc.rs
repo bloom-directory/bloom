@@ -424,6 +424,7 @@ impl IpcServer {
                 "name": name_for_hash.get(&meta.hash).cloned(),
                 "caps": meta.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
                 "installed_at_ms": meta.installed_at_ms,
+                "mode": meta.mode_str(),
             }));
         }
         Ok(Value::Array(out))
