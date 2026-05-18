@@ -53,6 +53,7 @@ pub struct StoreData {
     host: Arc<dyn PetalHost>,
     caps: BTreeSet<Capability>,
     petal_hash: String,
+    mode: crate::meta::PetalMode,
 }
 
 #[derive(Debug, Clone)]
@@ -117,14 +118,12 @@ impl PetalVm {
         caps: BTreeSet<Capability>,
         host: Arc<dyn PetalHost>,
         petal_hash: &str,
+        mode: crate::meta::PetalMode,
         opts: RunOptions,
     ) -> Result<RunOutput, PetalError> {
         let module =
             Module::new(&self.engine, wasm).map_err(|e| PetalError::InvalidWasm(e.to_string()))?;
 
-        // Capture stdout/stderr into in-memory pipes. We clone the
-        // handles before moving them into the WASI ctx so we can read
-        // them back after the run.
         let stdout = MemoryOutputPipe::new(STDOUT_CAP);
         let stderr = MemoryOutputPipe::new(STDOUT_CAP);
 
@@ -133,6 +132,16 @@ impl PetalVm {
             .stdin(MemoryInputPipe::new(stdin))
             .stdout(stdout.clone())
             .stderr(stderr.clone());
+        // v1 caveat: wasmtime-wasi 26's default WasiCtx exposes the
+        // host wall/monotonic clock and a secure RNG, and the builder
+        // does not expose a one-call "deny clock/random" switch. So
+        // onchain petals that *call* clock_time_get/random_get today
+        // will succeed with non-deterministic values. The replay
+        // tooling will catch this as an output_hash mismatch; a
+        // follow-up task wires deterministic clock+RNG via
+        // `wall_clock(...)` / `secure_random(...)` for onchain mode.
+        // (`mode` is still threaded into the linker dispatch and
+        // StoreData below — only the WASI ctx is symmetric in v1.)
         let wasi_ctx = wasi_builder.build_p1();
 
         let mut store = Store::new(
@@ -142,6 +151,7 @@ impl PetalVm {
                 host,
                 caps,
                 petal_hash: petal_hash.to_string(),
+                mode,
             },
         );
         store
@@ -154,9 +164,8 @@ impl PetalVm {
         });
 
         let mut linker = Linker::<StoreData>::new(&self.engine);
-        preview1::add_to_linker_async(&mut linker, |s: &mut StoreData| &mut s.wasi)
-            .map_err(|e| PetalError::vm(e.to_string()))?;
-        add_bloom_host(&mut linker).map_err(|e| PetalError::vm(e.to_string()))?;
+        link_wasi_for_mode(&mut linker, mode).map_err(|e| PetalError::vm(e.to_string()))?;
+        link_imports_for_mode(&mut linker, mode).map_err(|e| PetalError::vm(e.to_string()))?;
 
         let exit_code = run_command(&mut store, &linker, &module).await;
         let fuel_consumed = opts.fuel.saturating_sub(store.get_fuel().unwrap_or(0));
@@ -208,7 +217,25 @@ async fn run_command(
     }
 }
 
-fn add_bloom_host(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
+fn link_wasi_for_mode(linker: &mut Linker<StoreData>, _mode: crate::meta::PetalMode) -> anyhow::Result<()> {
+    // v1 wires the full preview-1 linker for both modes. The mode
+    // split is enforced by the bloom.* host-import set (no vfs_* in
+    // onchain mode; no chain_read_at in local mode). A follow-up will
+    // narrow the onchain WASI surface by overriding clock/random with
+    // deterministic implementations.
+    preview1::add_to_linker_async(linker, |s: &mut StoreData| &mut s.wasi)?;
+    Ok(())
+}
+
+fn link_imports_for_mode(linker: &mut Linker<StoreData>, mode: crate::meta::PetalMode) -> anyhow::Result<()> {
+    use crate::meta::PetalMode;
+    match mode {
+        PetalMode::Local => link_local_imports(linker),
+        PetalMode::Onchain => link_onchain_imports(linker),
+    }
+}
+
+fn link_local_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     linker.func_wrap_async(
         "bloom",
         "vfs_read",
@@ -279,6 +306,75 @@ fn add_bloom_host(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
                 let host = caller.data().host.clone();
                 match host.vfs_write(&path, &bytes).await {
                     Ok(()) => 0,
+                    Err(e) => e.as_wasm_code(),
+                }
+            })
+        },
+    )?;
+    Ok(())
+}
+
+fn link_onchain_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
+    linker.func_wrap_async(
+        "bloom",
+        "chain_read_at",
+        |mut caller: Caller<'_, StoreData>,
+         params: (i32, i32, i64, i32, i32)|
+         -> Box<dyn std::future::Future<Output = i32> + Send + '_> {
+            let (chain_ptr, chain_len, block, dst_ptr, dst_max) = params;
+            Box::new(async move {
+                let cap_ok = caller.data().caps.contains(&Capability::ChainRead);
+                if !cap_ok {
+                    log_denied(caller.data(), "chain_read_at");
+                    return HostError::Denied("chain.read".into()).as_wasm_code();
+                }
+                if block == 0 {
+                    return HostError::BlockNotPinnable.as_wasm_code();
+                }
+                let mem = match get_memory(&mut caller) {
+                    Some(m) => m,
+                    None => return HostError::Invalid("no exported memory".into()).as_wasm_code(),
+                };
+                // Argument layout is chain followed by path, both as
+                // utf-8 byte slices. To keep the wasm ABI tight we
+                // declared just (chain_ptr, chain_len). Path is encoded
+                // as a separate sub-slice the wasm wrote in the chain
+                // buffer with a NUL separator, OR (preferred) we
+                // pass an additional pair. For v1 we use a single
+                // utf-8 buffer of the form "<chain>\0<path>" so we
+                // don't change the WAT ABI for this task. See vm.rs
+                // for the parsing.
+                let raw = match read_bytes(&mem, &mut caller, chain_ptr, chain_len) {
+                    Ok(b) => b,
+                    Err(c) => return c,
+                };
+                let (chain_bytes, path_bytes) = match raw.split(|b| *b == 0).collect::<Vec<_>>().as_slice() {
+                    [c, p] => (c.to_vec(), p.to_vec()),
+                    _ => return HostError::Invalid("chain_read_at: expected <chain>\\0<path> buffer".into()).as_wasm_code(),
+                };
+                let chain = match String::from_utf8(chain_bytes) {
+                    Ok(s) => s,
+                    Err(_) => return HostError::Invalid("chain not utf-8".into()).as_wasm_code(),
+                };
+                let path = match String::from_utf8(path_bytes) {
+                    Ok(s) => s,
+                    Err(_) => return HostError::Invalid("path not utf-8".into()).as_wasm_code(),
+                };
+                let host = caller.data().host.clone();
+                match host.chain_read_at(&chain, &path, block as u64).await {
+                    Ok(bytes) => {
+                        if dst_max < 0 {
+                            return HostError::Invalid("dst_max < 0".into()).as_wasm_code();
+                        }
+                        let need = bytes.len();
+                        if need > dst_max as usize {
+                            return -((need as i32).saturating_add(PetalVm::OVERFLOW_BIAS));
+                        }
+                        if let Err(c) = write_bytes(&mem, &mut caller, dst_ptr, &bytes) {
+                            return c;
+                        }
+                        need as i32
+                    }
                     Err(e) => e.as_wasm_code(),
                 }
             })
@@ -398,6 +494,7 @@ impl Default for PetalVm {
 mod tests {
     use super::*;
     use crate::host::DenyHost;
+    use crate::meta::PetalMode;
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::collections::HashMap;
@@ -432,6 +529,7 @@ mod tests {
                 BTreeSet::new(),
                 Arc::new(DenyHost),
                 "deadbeef",
+                PetalMode::Local,
                 RunOptions::default(),
             )
             .await
@@ -474,6 +572,7 @@ mod tests {
                 BTreeSet::new(),
                 Arc::new(DenyHost),
                 "deadbeef",
+                PetalMode::Local,
                 RunOptions::default(),
             )
             .await
@@ -529,23 +628,15 @@ mod tests {
     #[async_trait]
     impl PetalHost for MockHost {
         async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
-            self.store
-                .lock()
-                .get(path)
-                .cloned()
-                .ok_or_else(|| HostError::NotFound(path.into()))
+            self.store.lock().get(path).cloned().ok_or_else(|| HostError::NotFound(path.into()))
         }
         async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
             self.store.lock().insert(path.into(), bytes.to_vec());
             Ok(())
         }
-        async fn chain_read_at(
-            &self,
-            _chain: &str,
-            _path: &str,
-            _block: u64,
-        ) -> Result<Vec<u8>, HostError> {
-            Err(HostError::Denied("MockHost".into()))
+        async fn chain_read_at(&self, chain: &str, path: &str, block: u64) -> Result<Vec<u8>, HostError> {
+            let key = format!("@{block}:{chain}/{path}");
+            self.store.lock().get(&key).cloned().ok_or_else(|| HostError::NotFound(key))
         }
     }
 
@@ -561,6 +652,7 @@ mod tests {
                 BTreeSet::new(), // no caps
                 host,
                 "h",
+                PetalMode::Local,
                 RunOptions::default(),
             )
             .await
@@ -583,10 +675,57 @@ mod tests {
                 caps,
                 host,
                 "h",
+                PetalMode::Local,
                 RunOptions::default(),
             )
             .await
             .unwrap();
         assert_eq!(out.stdout, vec![5u8]); // "VALUE".len()
+    }
+
+    const ONCHAIN_TRIES_VFS_READ: &str = r#"
+        (module
+          (import "bloom" "vfs_read"
+            (func $vfs_read (param i32 i32 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (func (export "_start") nop)
+        )
+    "#;
+
+    #[tokio::test]
+    async fn onchain_vm_refuses_to_link_vfs_imports() {
+        let vm = PetalVm::new().unwrap();
+        let out = vm
+            .run(
+                &wat(ONCHAIN_TRIES_VFS_READ),
+                Vec::new(),
+                BTreeSet::new(),
+                Arc::new(DenyHost),
+                "h",
+                PetalMode::Onchain,
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        // Instantiation should fail (linker has no bloom.vfs_read in onchain mode).
+        assert_eq!(out.exit_code, 127);
+    }
+
+    #[tokio::test]
+    async fn local_run_takes_mode_parameter_and_keeps_working() {
+        let vm = PetalVm::new().unwrap();
+        let out = vm
+            .run(
+                &wat(NOOP_WASI),
+                Vec::new(),
+                BTreeSet::new(),
+                Arc::new(DenyHost),
+                "h",
+                PetalMode::Local,
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0);
     }
 }

@@ -22,7 +22,7 @@ pub mod vm;
 pub use error::PetalError;
 pub use handler::PetalsHandler;
 pub use host::{HostError, PetalHost};
-pub use meta::{Capability, PetalMeta};
+pub use meta::{Capability, PetalMeta, PetalMode};
 pub use registry::{NameRegistry, validate_name};
 pub use runner::{PetalRunner, VfsHost};
 pub use store::{InstallResult, PetalStore};

@@ -499,9 +499,10 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("unknown capability: {c:?}"))?;
                 cap_set.insert(cap);
             }
+            // TODO(task-15): accept --mode and forward it here.
             let (result, meta) = d
                 .petals
-                .install(&bytes, name.as_deref(), &cap_set)
+                .install(&bytes, name.as_deref(), &cap_set, bloom_petals::PetalMode::Local)
                 .context("install petal")?;
             println!("hash: {}", result.hash);
             println!("size: {} bytes", result.size);

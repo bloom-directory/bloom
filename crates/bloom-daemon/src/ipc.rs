@@ -338,7 +338,8 @@ impl IpcServer {
         };
         let name = params.get("name").and_then(|v| v.as_str());
         let caps = parse_caps(params.get("caps"))?;
-        let (result, meta) = runner.install(&bytes, name, &caps)?;
+        // TODO(task-14): accept "mode" in the IPC params and forward it here.
+        let (result, meta) = runner.install(&bytes, name, &caps, bloom_petals::PetalMode::Local)?;
         Ok(json!({
             "hash": result.hash,
             "size": result.size,
@@ -499,6 +500,14 @@ fn map_petal_err(id: Value, e: PetalError) -> Response {
         PetalError::Vm(s) => (-32000, format!("vm: {s}")),
         PetalError::Io(e) => (-32001, format!("io: {e}")),
         PetalError::Serde(s) => (-32602, format!("serde: {s}")),
+        PetalError::ModeCapMismatch { mode, cap } => (
+            -32602,
+            format!("mode/cap mismatch: mode={mode} disallows cap={cap}"),
+        ),
+        PetalError::ModeConflict { existing } => (
+            -32008,
+            format!("mode conflict: petal already installed as {existing}; uninstall first"),
+        ),
     };
     debug!(code, message = %msg, "ipc.petal_err");
     Response::err(id, code, msg)
