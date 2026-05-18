@@ -427,13 +427,13 @@ fn petals_name_bind_unbind_reflects_in_vfs() {
     // check the entry is listed; symlink targets aren't shown by the ls
     // formatter, but the daemon-side handler emits the entry.
     let ls = bloom_cmd(home.path())
-        .args(["vfs", "ls", "/public"])
+        .args(["vfs", "ls", "/public/local"])
         .assert()
         .success();
     let ls_out = String::from_utf8(ls.get_output().stdout.clone()).unwrap();
     assert!(
         ls_out.lines().any(|l| l.starts_with("greet")),
-        "expected 'greet' entry under /public; got:\n{ls_out}"
+        "expected 'greet' entry under /public/local; got:\n{ls_out}"
     );
 
     // Unbind by omitting the hash.
@@ -443,7 +443,7 @@ fn petals_name_bind_unbind_reflects_in_vfs() {
         .success();
 
     let ls_after = bloom_cmd(home.path())
-        .args(["vfs", "ls", "/public"])
+        .args(["vfs", "ls", "/public/local"])
         .assert()
         .success();
     let ls_after_out = String::from_utf8(ls_after.get_output().stdout.clone()).unwrap();
