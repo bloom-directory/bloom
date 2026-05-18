@@ -70,6 +70,41 @@ fn host_from_handler(e: HandlerError) -> HostError {
     }
 }
 
+/// Wraps any `PetalHost` and records the maximum `block` argument seen
+/// across `chain_read_at` calls. Used by `PetalRunner::run_attested` to
+/// stamp `block_pin` into the attestation tuple.
+pub struct BlockTrackingHost {
+    inner: Arc<dyn PetalHost>,
+    max_block: parking_lot::Mutex<Option<u64>>,
+}
+
+impl BlockTrackingHost {
+    pub fn new(inner: Arc<dyn PetalHost>) -> Self {
+        Self { inner, max_block: parking_lot::Mutex::new(None) }
+    }
+
+    pub fn max_block(&self) -> Option<u64> {
+        *self.max_block.lock()
+    }
+}
+
+#[async_trait]
+impl PetalHost for BlockTrackingHost {
+    async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+        self.inner.vfs_read(path).await
+    }
+    async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
+        self.inner.vfs_write(path, bytes).await
+    }
+    async fn chain_read_at(&self, chain: &str, path: &str, block: u64) -> Result<Vec<u8>, HostError> {
+        {
+            let mut m = self.max_block.lock();
+            *m = Some(match *m { Some(prev) => prev.max(block), None => block });
+        }
+        self.inner.chain_read_at(chain, path, block).await
+    }
+}
+
 /// Single source of truth for installing and running petals.
 #[derive(Clone)]
 pub struct PetalRunner {
@@ -159,6 +194,42 @@ impl PetalRunner {
         };
         self.vm.run(&wasm, stdin, caps, host, &hash, meta.mode, opts).await
     }
+
+    /// Run a petal and, when the petal is onchain, also return a
+    /// `PetalAttestation` summarizing (input_hash, output_hash, block_pin).
+    pub async fn run_attested(
+        &self,
+        name_or_hash: &str,
+        stdin: Vec<u8>,
+        host: Arc<dyn PetalHost>,
+        cap_mask: Option<BTreeSet<Capability>>,
+        opts: RunOptions,
+    ) -> Result<(RunOutput, Option<crate::attestation::PetalAttestation>), PetalError> {
+        let hash = self.resolve(name_or_hash)?;
+        let wasm = self.store.read_wasm(&hash)?;
+        let meta = self.store.load_meta(&hash)?;
+        let caps = match cap_mask {
+            Some(mask) => meta.caps.intersection(&mask).copied().collect(),
+            None => meta.caps.clone(),
+        };
+        let tracker = Arc::new(BlockTrackingHost::new(host));
+        let stdin_hash = crate::attestation::blake3_hex(&stdin);
+        let out = self
+            .vm
+            .run(&wasm, stdin.clone(), caps, tracker.clone(), &hash, meta.mode, opts)
+            .await?;
+        let att = match meta.mode {
+            crate::meta::PetalMode::Onchain => Some(crate::attestation::PetalAttestation {
+                petal_hash: hash.clone(),
+                input_hash: stdin_hash,
+                output_hash: crate::attestation::blake3_hex(&out.stdout),
+                block_pin: tracker.max_block(),
+                wasmtime_version: env!("CARGO_PKG_VERSION").to_string(),
+            }),
+            crate::meta::PetalMode::Local => None,
+        };
+        Ok((out, att))
+    }
 }
 
 #[cfg(test)]
@@ -224,5 +295,59 @@ mod tests {
             r.resolve("nope").unwrap_err(),
             PetalError::NotFound(_)
         ));
+    }
+
+    const ONCHAIN_NOOP: &str = r#"
+        (module
+          (import "wasi_snapshot_preview1" "proc_exit"
+            (func $exit (param i32)))
+          (memory (export "memory") 1)
+          (func (export "_start")
+            i32.const 0
+            call $exit)
+        )
+    "#;
+
+    #[tokio::test]
+    async fn onchain_run_returns_attestation_with_input_and_output_hashes() {
+        let (_d, r) = runner();
+        let (res, _) = r
+            .install(
+                ONCHAIN_NOOP.as_bytes(),
+                Some("noop"),
+                &BTreeSet::new(),
+                crate::meta::PetalMode::Onchain,
+            )
+            .unwrap();
+        let stdin = b"hello".to_vec();
+        let (out, att) = r
+            .run_attested(
+                "noop",
+                stdin.clone(),
+                Arc::new(crate::host::DenyHost),
+                None,
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0);
+        let att = att.expect("onchain run must produce attestation");
+        assert_eq!(att.petal_hash, res.hash);
+        assert_eq!(att.input_hash, crate::attestation::blake3_hex(&stdin));
+        assert_eq!(att.output_hash, crate::attestation::blake3_hex(&out.stdout));
+        assert!(att.block_pin.is_none(), "noop petal makes no chain reads");
+    }
+
+    #[tokio::test]
+    async fn local_run_returns_no_attestation() {
+        let (_d, r) = runner();
+        let (_res, _) = r
+            .install(HELLO_WAT.as_bytes(), Some("hello"), &BTreeSet::new(), crate::meta::PetalMode::Local)
+            .unwrap();
+        let (_out, att) = r
+            .run_attested("hello", Vec::new(), Arc::new(crate::host::DenyHost), None, RunOptions::default())
+            .await
+            .unwrap();
+        assert!(att.is_none(), "local runs do not produce attestations");
     }
 }
