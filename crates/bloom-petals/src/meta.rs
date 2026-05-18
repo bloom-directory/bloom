@@ -67,6 +67,30 @@ impl PetalMeta {
     }
 }
 
+/// Validate that a (mode, caps) pair is allowed at install time.
+///
+/// - `Local` may declare `{vfs.read, vfs.write}`; `chain.read` is rejected.
+/// - `Onchain` may declare `{chain.read}`; vfs caps are rejected.
+pub fn validate_mode_caps(
+    mode: PetalMode,
+    caps: &BTreeSet<Capability>,
+) -> Result<(), crate::error::PetalError> {
+    for cap in caps {
+        let ok = match (mode, *cap) {
+            (PetalMode::Local, Capability::VfsRead | Capability::VfsWrite) => true,
+            (PetalMode::Onchain, Capability::ChainRead) => true,
+            _ => false,
+        };
+        if !ok {
+            return Err(crate::error::PetalError::ModeCapMismatch {
+                mode,
+                cap: cap.as_str().to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +165,42 @@ mod tests {
         let s = r#"{"hash":"x","size":1,"installed_at_ms":2}"#;
         let m: PetalMeta = serde_json::from_str(s).unwrap();
         assert_eq!(m.mode, PetalMode::Local);
+    }
+
+    #[test]
+    fn validate_mode_caps_matrix() {
+        use crate::error::PetalError;
+
+        let empty = BTreeSet::new();
+        assert!(validate_mode_caps(PetalMode::Local, &empty).is_ok());
+        assert!(validate_mode_caps(PetalMode::Onchain, &empty).is_ok());
+
+        let mut vfs_read = BTreeSet::new();
+        vfs_read.insert(Capability::VfsRead);
+        assert!(validate_mode_caps(PetalMode::Local, &vfs_read).is_ok());
+        assert!(matches!(
+            validate_mode_caps(PetalMode::Onchain, &vfs_read),
+            Err(PetalError::ModeCapMismatch { .. })
+        ));
+
+        let mut chain_read = BTreeSet::new();
+        chain_read.insert(Capability::ChainRead);
+        assert!(validate_mode_caps(PetalMode::Onchain, &chain_read).is_ok());
+        assert!(matches!(
+            validate_mode_caps(PetalMode::Local, &chain_read),
+            Err(PetalError::ModeCapMismatch { .. })
+        ));
+
+        let mut mixed = BTreeSet::new();
+        mixed.insert(Capability::ChainRead);
+        mixed.insert(Capability::VfsRead);
+        assert!(matches!(
+            validate_mode_caps(PetalMode::Local, &mixed),
+            Err(PetalError::ModeCapMismatch { .. })
+        ));
+        assert!(matches!(
+            validate_mode_caps(PetalMode::Onchain, &mixed),
+            Err(PetalError::ModeCapMismatch { .. })
+        ));
     }
 }

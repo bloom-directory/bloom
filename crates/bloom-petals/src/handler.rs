@@ -241,6 +241,9 @@ fn map_err(e: PetalError) -> HandlerError {
         PetalError::Vm(s) => HandlerError::Backend(format!("vm: {s}")),
         PetalError::Io(e) => HandlerError::Io(e),
         PetalError::Serde(s) => HandlerError::Backend(format!("serde: {s}")),
+        PetalError::ModeCapMismatch { mode, cap } => {
+            HandlerError::invalid(format!("mode/cap mismatch: mode={mode:?} disallows cap={cap}"))
+        }
     }
 }
 

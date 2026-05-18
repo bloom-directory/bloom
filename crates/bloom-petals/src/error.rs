@@ -20,6 +20,8 @@ pub enum PetalError {
     Io(#[from] std::io::Error),
     #[error("serde: {0}")]
     Serde(String),
+    #[error("mode/cap mismatch: mode={mode:?} disallows cap={cap}")]
+    ModeCapMismatch { mode: crate::meta::PetalMode, cap: String },
 }
 
 impl PetalError {
