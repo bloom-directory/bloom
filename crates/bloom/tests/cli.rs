@@ -452,3 +452,112 @@ fn petals_name_bind_unbind_reflects_in_vfs() {
         "expected 'greet' entry removed; got:\n{ls_after_out}"
     );
 }
+
+#[test]
+fn install_onchain_with_chain_read_cap_lists_mode() {
+    let home = fresh_home();
+    let wat_path = home.path().join("echo.wat");
+    std::fs::write(&wat_path, include_str!("fixtures/onchain_echo.wat")).unwrap();
+    bloom_cmd(home.path())
+        .args([
+            "petals", "install", wat_path.to_str().unwrap(),
+            "--name", "echo",
+            "--cap", "chain.read",
+            "--mode", "onchain",
+        ])
+        .assert()
+        .success();
+    bloom_cmd(home.path())
+        .args(["petals", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("onchain"))
+        .stdout(predicate::str::contains("echo"));
+}
+
+#[test]
+fn install_onchain_with_vfs_cap_fails_with_mode_cap_mismatch() {
+    let home = fresh_home();
+    let wat_path = home.path().join("echo.wat");
+    std::fs::write(&wat_path, include_str!("fixtures/onchain_echo.wat")).unwrap();
+    bloom_cmd(home.path())
+        .args([
+            "petals", "install", wat_path.to_str().unwrap(),
+            "--name", "x",
+            "--cap", "vfs.read",
+            "--mode", "onchain",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("mode/cap"));
+}
+
+#[test]
+fn install_same_hash_two_modes_returns_mode_conflict() {
+    let home = fresh_home();
+    let wat_path = home.path().join("echo.wat");
+    std::fs::write(&wat_path, include_str!("fixtures/onchain_echo.wat")).unwrap();
+    // First install: local.
+    bloom_cmd(home.path())
+        .args([
+            "petals", "install", wat_path.to_str().unwrap(),
+            "--mode", "local",
+        ])
+        .assert()
+        .success();
+    // Same bytes, onchain mode → ModeConflict.
+    bloom_cmd(home.path())
+        .args([
+            "petals", "install", wat_path.to_str().unwrap(),
+            "--cap", "chain.read",
+            "--mode", "onchain",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("mode conflict"));
+}
+
+#[test]
+fn replay_matches_then_mismatches_on_tampered_expect() {
+    let home = fresh_home();
+    let wat_path = home.path().join("echo.wat");
+    std::fs::write(&wat_path, include_str!("fixtures/onchain_echo.wat")).unwrap();
+    bloom_cmd(home.path())
+        .args([
+            "petals", "install", wat_path.to_str().unwrap(),
+            "--name", "echo",
+            "--cap", "chain.read",
+            "--mode", "onchain",
+        ])
+        .assert()
+        .success();
+    // The echo WAT reads the first 16 bytes of stdin and writes them out.
+    // For a 16-byte input, the output is byte-identical, so we can compute
+    // the expected BLAKE3 output hash directly without needing to parse
+    // any attestation JSON out of the CLI.
+    let input: &[u8] = b"hello world!!!!!"; // exactly 16 bytes
+    assert_eq!(input.len(), 16);
+    let input_path = home.path().join("in.bin");
+    std::fs::write(&input_path, input).unwrap();
+    let expected = hex::encode(blake3::hash(input).as_bytes());
+    // Matching replay → success.
+    bloom_cmd(home.path())
+        .args([
+            "petals", "replay", "echo",
+            "--input", input_path.to_str().unwrap(),
+            "--expect", &expected,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("match: "));
+    // Tampered expect → mismatch failure with structured stderr.
+    bloom_cmd(home.path())
+        .args([
+            "petals", "replay", "echo",
+            "--input", input_path.to_str().unwrap(),
+            "--expect", &"0".repeat(64),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("mismatch"));
+}
