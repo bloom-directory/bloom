@@ -26,6 +26,6 @@ pub use handler::PetalsHandler;
 pub use host::{HostError, PetalHost};
 pub use meta::{Capability, PetalMeta, PetalMode};
 pub use registry::{NameRegistry, validate_name};
-pub use runner::{PetalRunner, VfsHost};
+pub use runner::{BlockTrackingHost, PetalRunner, VfsHost};
 pub use store::{InstallResult, PetalStore};
 pub use vm::{PetalVm, RunOptions, RunOutput};

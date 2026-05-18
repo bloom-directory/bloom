@@ -220,7 +220,7 @@ impl PetalRunner {
             .await?;
         let att = match meta.mode {
             crate::meta::PetalMode::Onchain => Some(crate::attestation::PetalAttestation {
-                petal_hash: hash.clone(),
+                petal_hash: hash,
                 input_hash: stdin_hash,
                 output_hash: crate::attestation::blake3_hex(&out.stdout),
                 block_pin: tracker.max_block(),
