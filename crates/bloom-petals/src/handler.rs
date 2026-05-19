@@ -256,6 +256,8 @@ fn map_err(e: PetalError) -> HandlerError {
         PetalError::ModeConflict { existing } => {
             HandlerError::invalid(format!("mode conflict: existing={existing}"))
         }
+        PetalError::ModeUnsupported(s) => HandlerError::invalid(format!("mode unsupported: {s}")),
+        PetalError::ChainCall(s) => HandlerError::Backend(format!("chain call: {s}")),
     }
 }
 

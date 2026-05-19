@@ -1,0 +1,21 @@
+[package]
+name = "bloom-dex-factory"
+version = "0.1.0"
+edition = "2024"
+description = "Uniswap-v2-style DEX factory petal for bloom-chain: deploys pair petals and maintains the pair registry"
+license = "MIT"
+
+[lib]
+name = "bloom_dex_factory"
+crate-type = ["cdylib"]
+
+[build-dependencies]
+blake3 = { version = "1", default-features = false }
+
+[dependencies]
+bloom-dex-abi   = { workspace = true, default-features = false }
+bloom-petal-sdk = { workspace = true }
+
+# blake3 is used in host-side unit tests (non-wasm32) to verify selectors.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+blake3 = { version = "1", default-features = false }

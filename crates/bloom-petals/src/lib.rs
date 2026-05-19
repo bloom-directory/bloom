@@ -7,10 +7,15 @@
 //! `public/`; the [`PetalVm`] runs them with WASI stdio and an
 //! optional `bloom` host module (`vfs_read` / `vfs_write`) gated by
 //! per-petal capabilities.
+//!
+//! The `chain_vm` module adds a third execution mode (`PetalMode::Chain`)
+//! for deterministic smart-contract execution under bloom-chain BFT
+//! consensus (chain spec §7.5–§7.9).
 
 #![forbid(unsafe_code)]
 
 pub mod attestation;
+pub mod chain_vm;
 pub mod error;
 pub mod handler;
 pub mod host;
@@ -21,6 +26,9 @@ pub mod store;
 pub mod vm;
 
 pub use attestation::{PetalAttestation, blake3_hex};
+pub use chain_vm::{
+    BlockCtx, ChainCallInput, ChainCallOutput, ChainEntry, ChainCtx, LogEntry,
+};
 pub use error::PetalError;
 pub use handler::PetalsHandler;
 pub use host::{HostError, PetalHost};

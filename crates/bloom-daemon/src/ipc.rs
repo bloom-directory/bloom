@@ -572,6 +572,8 @@ fn map_petal_err(id: Value, e: PetalError) -> Response {
             -32008,
             format!("mode conflict: petal already installed as {existing}; uninstall first"),
         ),
+        PetalError::ModeUnsupported(s) => (-32009, format!("mode unsupported: {s}")),
+        PetalError::ChainCall(s) => (-32010, format!("chain call: {s}")),
     };
     debug!(code, message = %msg, "ipc.petal_err");
     Response::err(id, code, msg)

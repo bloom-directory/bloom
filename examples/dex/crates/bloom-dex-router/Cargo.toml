@@ -1,0 +1,14 @@
+[package]
+name = "bloom-dex-router"
+version = "0.1.0"
+edition = "2024"
+description = "Uniswap-v2-style DEX router petal for bloom-chain"
+license = "MIT"
+
+[lib]
+name = "bloom_dex_router"
+crate-type = ["cdylib"]
+
+[dependencies]
+bloom-dex-abi   = { workspace = true, default-features = false }
+bloom-petal-sdk = { workspace = true }

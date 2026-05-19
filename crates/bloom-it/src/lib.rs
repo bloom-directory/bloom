@@ -6,6 +6,8 @@
 //! helpers here so each test only needs the bits specific to its
 //! scenario.
 
+pub mod chain_harness;
+
 use std::net::TcpListener;
 use std::process::Stdio;
 use std::time::Duration;

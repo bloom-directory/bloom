@@ -20,6 +20,10 @@ bytecode-decompile = ["bloom-daemon/bytecode-decompile"]
 [dependencies]
 bloom-proto.workspace = true
 bloom-daemon.workspace = true
+bloom-chain-node = { path = "../bloom-chain-node" }
+bloom-chain-types = { path = "../bloom-chain-types" }
+blake3.workspace = true
+wat.workspace = true
 bloom-mount = { workspace = true, optional = true }
 bloom-keystore.workspace = true
 bloom-chain.workspace = true

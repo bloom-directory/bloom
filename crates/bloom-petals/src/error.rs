@@ -24,6 +24,10 @@ pub enum PetalError {
     ModeCapMismatch { mode: crate::meta::PetalMode, cap: String },
     #[error("mode conflict: petal already installed as {existing}; uninstall first")]
     ModeConflict { existing: crate::meta::PetalMode },
+    #[error("operation not supported in this petal mode: {0}")]
+    ModeUnsupported(String),
+    #[error("chain call error: {0}")]
+    ChainCall(String),
 }
 
 impl PetalError {

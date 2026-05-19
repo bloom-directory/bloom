@@ -1,0 +1,18 @@
+[package]
+name = "bloom-dex-wloom"
+version = "0.1.0"
+edition = "2024"
+description = "Wrapped native LOOM ERC-20 petal for bloom-chain DEX (wETH9 analog)"
+license = "MIT"
+
+[lib]
+name = "bloom_dex_wloom"
+crate-type = ["cdylib"]
+
+[dependencies]
+bloom-dex-abi  = { workspace = true, default-features = false }
+bloom-petal-sdk = { workspace = true }
+
+[dev-dependencies]
+# Used by host-target unit tests to compute expected blake3 digests.
+blake3 = { workspace = true }

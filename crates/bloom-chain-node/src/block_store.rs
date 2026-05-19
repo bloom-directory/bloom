@@ -1,0 +1,93 @@
+//! Flat-file block store: `<bloom_home>/chain/blocks/<height>`.
+//!
+//! Each file contains one SSZ-encoded `Block`.  Rolling-window prune at
+//! 512 blocks (2× the 256-block state-blob retention window per spec §14).
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use bloom_chain_types::block::Block;
+use bloom_chain_types::ssz::{Decode, Encode};
+use tracing::debug;
+
+/// Rolling window: blocks older than this many blocks are eligible for pruning.
+const PRUNE_WINDOW: u64 = 512;
+
+/// Block store backed by plain files under `<root>/`.
+pub struct BlockStore {
+    root: PathBuf,
+}
+
+impl BlockStore {
+    /// Open (or create) the block store at `root`.
+    pub fn open(root: &Path) -> Result<Self> {
+        std::fs::create_dir_all(root)
+            .with_context(|| format!("create block store dir: {}", root.display()))?;
+        Ok(BlockStore { root: root.to_path_buf() })
+    }
+
+    fn path_for(&self, height: u64) -> PathBuf {
+        self.root.join(height.to_string())
+    }
+
+    /// Store a block at `height`.
+    pub fn put(&self, height: u64, block: &Block) -> Result<()> {
+        let path = self.path_for(height);
+        let bytes = block.as_ssz_bytes();
+        std::fs::write(&path, &bytes)
+            .with_context(|| format!("write block {height}: {}", path.display()))?;
+        debug!(height, bytes = bytes.len(), "block_store.put");
+        Ok(())
+    }
+
+    /// Retrieve a block by height.  Returns `None` if not present.
+    pub fn get(&self, height: u64) -> Result<Option<Block>> {
+        let path = self.path_for(height);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let block = Block::from_ssz_bytes(&bytes)
+                    .map_err(|e| anyhow::anyhow!("block {height} SSZ decode: {:?}", e))?;
+                Ok(Some(block))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("read block {height}")),
+        }
+    }
+
+    /// Return the latest stored height, or `None` if the store is empty.
+    pub fn latest_height(&self) -> Result<Option<u64>> {
+        let mut max: Option<u64> = None;
+        for entry in std::fs::read_dir(&self.root)
+            .with_context(|| format!("read block store dir: {}", self.root.display()))?
+        {
+            let entry = entry?;
+            if let Ok(name) = entry.file_name().into_string() {
+                if let Ok(h) = name.parse::<u64>() {
+                    max = Some(max.map_or(h, |m: u64| m.max(h)));
+                }
+            }
+        }
+        Ok(max)
+    }
+
+    /// Prune blocks older than `current_height - PRUNE_WINDOW`.
+    pub fn prune(&self, current_height: u64) -> Result<()> {
+        if current_height < PRUNE_WINDOW {
+            return Ok(());
+        }
+        let prune_before = current_height - PRUNE_WINDOW;
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if let Ok(name) = entry.file_name().into_string() {
+                if let Ok(h) = name.parse::<u64>() {
+                    if h < prune_before {
+                        let path = entry.path();
+                        let _ = std::fs::remove_file(&path);
+                        debug!(height = h, "block_store.pruned");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}

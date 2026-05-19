@@ -247,6 +247,15 @@ fn link_imports_for_mode(linker: &mut Linker<StoreData>, mode: crate::meta::Peta
     match mode {
         PetalMode::Local => link_local_imports(linker),
         PetalMode::Onchain => link_onchain_imports(linker),
+        PetalMode::Chain => {
+            // Chain mode uses its own engine/store type (ChainStoreData) and
+            // is driven via PetalVm::run_chain_call, not via PetalVm::run.
+            // If someone calls PetalVm::run with Chain mode, return an error
+            // rather than silently running with no imports.
+            Err(anyhow::anyhow!(
+                "PetalMode::Chain is not supported via PetalVm::run; use PetalVm::run_chain_call"
+            ))
+        }
     }
 }
 

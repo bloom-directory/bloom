@@ -1,0 +1,14 @@
+[package]
+name = "bloom-dex-pair"
+version = "0.1.0"
+edition = "2024"
+description = "Uniswap-v2-style AMM pair petal with embedded LP token for bloom-chain DEX"
+license = "MIT"
+
+[lib]
+name = "bloom_dex_pair"
+crate-type = ["cdylib"]
+
+[dependencies]
+bloom-dex-abi   = { workspace = true, default-features = false }
+bloom-petal-sdk = { workspace = true }

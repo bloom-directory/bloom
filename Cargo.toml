@@ -19,6 +19,21 @@ members = [
   "crates/bloom-revert",
   "crates/bloom-petals",
   "crates/bloom-it",
+  "crates/bloom-chain-types",
+  "crates/bloom-chain-state",
+  "crates/bloom-chain-consensus",
+  "crates/bloom-chain-node",
+  "crates/bloom-petal-sdk",
+  # ---- example apps (not part of the protocol) ----
+  "examples/dex/crates/bloom-dex-abi",
+  "examples/dex/crates/bloom-dex-erc20",
+  "examples/dex/crates/bloom-dex-factory",
+  "examples/dex/crates/bloom-dex-pair",
+  "examples/dex/crates/bloom-dex-wloom",
+  "examples/dex/crates/bloom-dex-router",
+  "examples/dex/crates/bloom-dex-reentrancy",
+  "examples/dex/crates/bloom-dex-cli",
+  "examples/dex/tests/bloom-dex-it",
 ]
 resolver = "2"
 
@@ -54,6 +69,8 @@ argon2 = "0.5"
 chacha20poly1305 = "0.10"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 rand = "0.8"
+ml-dsa = { version = "0.1.0", features = ["getrandom", "zeroize"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 url = "2"
@@ -89,6 +106,14 @@ bloom-prices   = { path = "crates/bloom-prices" }
 bloom-revert   = { path = "crates/bloom-revert" }
 bloom-petals   = { path = "crates/bloom-petals" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
+bloom-chain-types = { path = "crates/bloom-chain-types" }
+bloom-chain-state = { path = "crates/bloom-chain-state" }
+bloom-chain-node = { path = "crates/bloom-chain-node" }
+bloom-petal-sdk   = { path = "crates/bloom-petal-sdk" }
+# ---- example DEX crates (not part of the protocol) ----
+bloom-dex-abi     = { path = "examples/dex/crates/bloom-dex-abi", default-features = false }
+bloom-dex-factory = { path = "examples/dex/crates/bloom-dex-factory" }
+bloom-dex-pair    = { path = "examples/dex/crates/bloom-dex-pair" }
 
 [profile.release]
 lto = "thin"

@@ -1,0 +1,27 @@
+[package]
+name = "bloom-dex-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reference DEX driver — example dapp for bloom-chain. Not part of the protocol."
+
+[[bin]]
+name = "bloom-dex"
+path = "src/main.rs"
+
+[dependencies]
+bloom-proto.workspace = true
+bloom-chain-node = { path = "../../../../crates/bloom-chain-node" }
+bloom-chain-types = { path = "../../../../crates/bloom-chain-types" }
+bloom-keystore.workspace = true
+bloom-dex-abi = { workspace = true, default-features = false, features = ["std"] }
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+hex.workspace = true
+blake3.workspace = true

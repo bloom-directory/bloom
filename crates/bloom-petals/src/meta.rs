@@ -46,6 +46,10 @@ pub enum PetalMode {
     #[default]
     Local,
     Onchain,
+    /// Deterministic smart-contract mode under bloom-chain BFT consensus.
+    /// No WASI, no VFS; only the `chain.*` host imports defined in
+    /// bloom-chain spec §7.6.
+    Chain,
 }
 
 impl PetalMode {
@@ -53,6 +57,7 @@ impl PetalMode {
         match self {
             PetalMode::Local => "local",
             PetalMode::Onchain => "onchain",
+            PetalMode::Chain => "chain",
         }
     }
 }
@@ -90,6 +95,7 @@ impl PetalMeta {
 ///
 /// - `Local` may declare `{vfs.read, vfs.write}`; `chain.read` is rejected.
 /// - `Onchain` may declare `{chain.read}`; vfs caps are rejected.
+/// - `Chain` declares no capabilities (all access is via chain host imports).
 ///
 /// Returns `Err` on the first offending capability; the remaining caps
 /// are not inspected.
@@ -103,7 +109,8 @@ pub fn validate_mode_caps(
             (PetalMode::Local, Capability::VfsRead | Capability::VfsWrite)
                 | (PetalMode::Onchain, Capability::ChainRead)
         );
-        if !ok {
+        // Chain mode has no declared capabilities — any cap is an error.
+        if !ok || mode == PetalMode::Chain {
             return Err(crate::error::PetalError::ModeCapMismatch {
                 mode,
                 cap: cap.as_str().to_string(),
@@ -176,10 +183,50 @@ mod tests {
     fn petal_mode_serde_roundtrips_as_lowercase() {
         assert_eq!(serde_json::to_string(&PetalMode::Local).unwrap(), "\"local\"");
         assert_eq!(serde_json::to_string(&PetalMode::Onchain).unwrap(), "\"onchain\"");
+        assert_eq!(serde_json::to_string(&PetalMode::Chain).unwrap(), "\"chain\"");
         let m: PetalMode = serde_json::from_str("\"local\"").unwrap();
         assert_eq!(m, PetalMode::Local);
         let m: PetalMode = serde_json::from_str("\"onchain\"").unwrap();
         assert_eq!(m, PetalMode::Onchain);
+        let m: PetalMode = serde_json::from_str("\"chain\"").unwrap();
+        assert_eq!(m, PetalMode::Chain);
+    }
+
+    #[test]
+    fn meta_serde_roundtrip_preserves_chain_mode() {
+        let m = PetalMeta {
+            hash: "abc".into(),
+            size: 1,
+            installed_at_ms: 1,
+            name: None,
+            caps: BTreeSet::new(),
+            mode: PetalMode::Chain,
+        };
+        let m2: PetalMeta = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(m2.mode, PetalMode::Chain, "Chain mode should survive roundtrip");
+    }
+
+    #[test]
+    fn chain_mode_rejects_any_cap() {
+        use crate::error::PetalError;
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::VfsRead);
+        match validate_mode_caps(PetalMode::Chain, &caps) {
+            Err(PetalError::ModeCapMismatch { mode, cap }) => {
+                assert_eq!(mode, PetalMode::Chain);
+                assert_eq!(cap, "vfs.read");
+            }
+            other => panic!("Chain + {{vfs.read}} should error, got {other:?}"),
+        }
+        let mut caps2 = BTreeSet::new();
+        caps2.insert(Capability::ChainRead);
+        match validate_mode_caps(PetalMode::Chain, &caps2) {
+            Err(PetalError::ModeCapMismatch { mode, cap }) => {
+                assert_eq!(mode, PetalMode::Chain);
+                assert_eq!(cap, "chain.read");
+            }
+            other => panic!("Chain + {{chain.read}} should error, got {other:?}"),
+        }
     }
 
     #[test]

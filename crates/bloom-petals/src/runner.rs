@@ -242,7 +242,7 @@ impl PetalRunner {
                 block_pin: tracker.max_block(),
                 wasmtime_version: env!("CARGO_PKG_VERSION").to_string(),
             }),
-            crate::meta::PetalMode::Local => None,
+            crate::meta::PetalMode::Local | crate::meta::PetalMode::Chain => None,
         };
         Ok((out, att))
     }
@@ -261,7 +261,7 @@ impl PetalRunner {
     ) -> Result<ReplayOutcome, PetalError> {
         let hash = self.resolve(name_or_hash)?;
         let meta = self.store.load_meta(&hash)?;
-        if meta.mode != crate::meta::PetalMode::Onchain {
+        if !matches!(meta.mode, crate::meta::PetalMode::Onchain) {
             return Err(PetalError::Vm("replay only valid for onchain petals".into()));
         }
         let (run, att) = self.run_attested(name_or_hash, stdin, host, None, opts).await?;

@@ -1,0 +1,634 @@
+//! Tendermint-style BFT state machine (spec §9.2, §9.3).
+//!
+//! This module is a pure state-transition function — it receives `Event`s and
+//! produces `Action`s. No I/O, no async, no side effects.
+//!
+//! # Locking rules (Buchman 2016 ch. 3)
+//! If a validator precommits for `(h, r, hash)` it locks on that block.  It
+//! must prevote the locked hash at subsequent rounds unless 2f+1 prevotes for
+//! a different block at a higher round unlock it.
+//!
+//! # Round advancement
+//! - **Propose timeout**: broadcast nil-prevote, advance step to Prevote.
+//! - **Prevote timeout** (no 2f+1 for any single hash): broadcast nil-precommit,
+//!   advance step to Precommit.
+//! - **Precommit timeout** (no 2f+1 for any single hash): advance round,
+//!   reset to Propose step with next proposer.
+
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use bloom_chain_types::{
+    block::Block,
+    types::Hash32,
+    vote::{Commit, Proposal, Vote, VoteKind},
+};
+
+use crate::validator_set::ValidatorSet;
+
+// ---------------------------------------------------------------------------
+// Step
+// ---------------------------------------------------------------------------
+
+/// The current step within a height/round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    Propose,
+    Prevote,
+    Precommit,
+    Commit,
+}
+
+// ---------------------------------------------------------------------------
+// TimeoutKind
+// ---------------------------------------------------------------------------
+
+/// Identifies which timeout a `Tick` event is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeoutKind {
+    Propose,
+    Prevote,
+    Precommit,
+}
+
+// ---------------------------------------------------------------------------
+// Event
+// ---------------------------------------------------------------------------
+
+/// An external event delivered to the state machine.
+#[derive(Debug)]
+pub enum Event {
+    /// A timeout has fired.
+    Tick(TimeoutKind),
+    /// A proposal was received from the network (or self).
+    ReceiveProposal(Proposal),
+    /// A vote (prevote or precommit) was received.
+    ReceiveVote(Vote),
+}
+
+// ---------------------------------------------------------------------------
+// ProposalOrVote
+// ---------------------------------------------------------------------------
+
+/// What to broadcast: either a full proposal or a single vote.
+#[derive(Debug, Clone)]
+pub enum ProposalOrVote {
+    Proposal(Proposal),
+    Vote(Vote),
+}
+
+// ---------------------------------------------------------------------------
+// Action
+// ---------------------------------------------------------------------------
+
+/// An output action produced by the state machine.
+#[derive(Debug)]
+pub enum Action {
+    /// Broadcast a message to all peers (and deliver to self).
+    Broadcast(ProposalOrVote),
+    /// The block at this height is final.  Persist it and advance height.
+    Commit(Box<Block>, Commit),
+    /// Schedule a timeout.
+    StartTimeout(TimeoutKind, Duration),
+}
+
+// ---------------------------------------------------------------------------
+// VoteTally
+// ---------------------------------------------------------------------------
+
+/// Aggregates votes for a single (height, round, kind) bucket.
+///
+/// Tracks per-block-hash accumulated voting power and detects 2f+1 events.
+#[derive(Clone, Debug, Default)]
+pub struct VoteTally {
+    /// block_hash → accumulated voting_power of validators that voted for it.
+    /// `None` key means nil-vote.
+    per_hash: BTreeMap<Option<Hash32>, u64>,
+    /// Set of validator addresses that have already voted in this slot.
+    voted: std::collections::HashSet<bloom_chain_types::types::Address>,
+}
+
+impl VoteTally {
+    /// Record a vote.  Returns the cumulative voting power for the voted hash
+    /// after adding this vote.  Duplicate votes (same validator) are ignored —
+    /// the first vote counts; equivocations are not punished in v0.
+    pub fn record(&mut self, validator: bloom_chain_types::types::Address, power: u64, hash: Option<Hash32>) -> u64 {
+        if self.voted.contains(&validator) {
+            // Already voted — ignore equivocation silently in v0.
+            return self.per_hash.get(&hash).copied().unwrap_or(0);
+        }
+        self.voted.insert(validator);
+        let entry = self.per_hash.entry(hash).or_insert(0);
+        *entry += power;
+        *entry
+    }
+
+    /// Return the accumulated power for a specific block hash (or nil).
+    pub fn power_for(&self, hash: Option<Hash32>) -> u64 {
+        self.per_hash.get(&hash).copied().unwrap_or(0)
+    }
+
+    /// Return the block hash (if any) that has accumulated >= `quorum` power.
+    /// Returns `None` if no single hash has reached quorum yet.
+    pub fn quorum_hash(&self, quorum: u64) -> Option<Option<Hash32>> {
+        for (hash, &power) in &self.per_hash {
+            if power >= quorum {
+                return Some(*hash);
+            }
+        }
+        None
+    }
+
+    /// Returns `true` if any hash (including nil) has reached quorum.
+    pub fn has_quorum(&self, quorum: u64) -> bool {
+        self.quorum_hash(quorum).is_some()
+    }
+
+    /// Total power recorded so far across all hashes.
+    pub fn total_power(&self) -> u64 {
+        self.per_hash.values().sum()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConsensusState
+// ---------------------------------------------------------------------------
+
+const TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The Tendermint-style BFT state machine for a single local validator.
+///
+/// One `ConsensusState` per validator per node.  Multiple instances can be
+/// driven synchronously in tests.
+pub struct ConsensusState {
+    /// Current block height (1-based; genesis block is height 0, first consensus height is 1).
+    pub height: u64,
+    /// Current round within this height (0-based).
+    pub round: u32,
+    /// Current step within this round.
+    pub step: Step,
+
+    /// Buchman locking: `Some((round, hash))` if this validator has precommitted
+    /// for a block in this height.
+    pub locked_block: Option<(u32, Hash32)>,
+    /// Best known polka: `Some((round, hash))` if 2f+1 prevotes seen for a block
+    /// at that round.
+    pub valid_block: Option<(u32, Hash32)>,
+
+    /// The proposal received for the current round, if any.
+    pub proposal: Option<Proposal>,
+
+    /// Prevote tallies: round → VoteTally.
+    pub prevotes: BTreeMap<u32, VoteTally>,
+    /// Precommit tallies: round → VoteTally.
+    pub precommits: BTreeMap<u32, VoteTally>,
+
+    /// The full set of votes received (for building the Commit).
+    all_precommit_votes: BTreeMap<u32, Vec<Vote>>,
+
+    /// The local validator's address.
+    local_address: bloom_chain_types::types::Address,
+
+    /// Reference to the validator set (shared read-only).
+    validator_set: ValidatorSet,
+
+    /// The committed block for the current height (set when Commit action fires).
+    pub committed_block: Option<Block>,
+}
+
+impl ConsensusState {
+    /// Construct a new state machine at the given height, starting at round 0 / Propose.
+    pub fn new(
+        height: u64,
+        local_address: bloom_chain_types::types::Address,
+        validator_set: ValidatorSet,
+    ) -> Self {
+        Self {
+            height,
+            round: 0,
+            step: Step::Propose,
+            locked_block: None,
+            valid_block: None,
+            proposal: None,
+            prevotes: BTreeMap::new(),
+            precommits: BTreeMap::new(),
+            all_precommit_votes: BTreeMap::new(),
+            local_address,
+            validator_set,
+            committed_block: None,
+        }
+    }
+
+    /// Is this validator the proposer for the current `(height, round)`?
+    pub fn is_proposer(&self) -> bool {
+        self.validator_set
+            .proposer_for(self.height, self.round)
+            .address
+            == self.local_address
+    }
+
+    /// Reset the state machine to begin consensus at `new_height`, round 0,
+    /// step Propose.  Returns a single `StartTimeout(Propose, TIMEOUT)` action
+    /// so the caller can drive the new round.
+    ///
+    /// All per-height state (locked/valid block, proposal, votes, committed
+    /// block) is cleared.  The validator set is preserved.
+    pub fn enter_next_height(&mut self, new_height: u64) -> Vec<Action> {
+        self.height = new_height;
+        self.round = 0;
+        self.step = Step::Propose;
+        self.locked_block = None;
+        self.valid_block = None;
+        self.proposal = None;
+        self.prevotes.clear();
+        self.precommits.clear();
+        self.all_precommit_votes.clear();
+        self.committed_block = None;
+        vec![Action::StartTimeout(TimeoutKind::Propose, TIMEOUT)]
+    }
+
+    // ---------------------------------------------------------------------------
+    // Main event handler
+    // ---------------------------------------------------------------------------
+
+    /// Process one event, returning a list of actions to perform.
+    pub fn handle(&mut self, event: Event, blocks: &BTreeMap<Hash32, Block>) -> Vec<Action> {
+        match event {
+            Event::Tick(kind) => self.on_tick(kind, blocks),
+            Event::ReceiveProposal(p) => self.on_proposal(p, blocks),
+            Event::ReceiveVote(v) => self.on_vote(v, blocks),
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Tick handler
+    // ---------------------------------------------------------------------------
+
+    fn on_tick(&mut self, kind: TimeoutKind, blocks: &BTreeMap<Hash32, Block>) -> Vec<Action> {
+        match kind {
+            TimeoutKind::Propose => {
+                // Propose timeout: if we're still in Propose step, broadcast nil-prevote.
+                if self.step != Step::Propose {
+                    return vec![];
+                }
+                self.step = Step::Prevote;
+                let actions = vec![
+                    Action::Broadcast(ProposalOrVote::Vote(self.make_prevote(None))),
+                    Action::StartTimeout(TimeoutKind::Prevote, TIMEOUT),
+                ];
+                actions
+            }
+            TimeoutKind::Prevote => {
+                // Prevote timeout: no 2f+1 for any hash → nil-precommit.
+                if self.step != Step::Prevote {
+                    return vec![];
+                }
+                self.step = Step::Precommit;
+                let actions = vec![
+                    Action::Broadcast(ProposalOrVote::Vote(self.make_precommit(None))),
+                    Action::StartTimeout(TimeoutKind::Precommit, TIMEOUT),
+                ];
+                actions
+            }
+            TimeoutKind::Precommit => {
+                // Precommit timeout: no 2f+1 → advance round.
+                if self.step != Step::Precommit {
+                    return vec![];
+                }
+                self.advance_round(blocks)
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Proposal handler
+    // ---------------------------------------------------------------------------
+
+    fn on_proposal(&mut self, p: Proposal, _blocks: &BTreeMap<Hash32, Block>) -> Vec<Action> {
+        if p.height != self.height || p.round != self.round {
+            return vec![];
+        }
+        if self.step != Step::Propose {
+            return vec![];
+        }
+        // Verify the proposer is the expected one.
+        let expected_proposer = self.validator_set.proposer_for(self.height, self.round);
+        if p.proposer != expected_proposer.address {
+            return vec![];
+        }
+
+        self.proposal = Some(p.clone());
+        self.step = Step::Prevote;
+
+        // Determine what to prevote:
+        // - If locked on a different block and no polka-round override: prevote locked.
+        // - If locked on the proposed block: prevote it.
+        // - If not locked: prevote the proposal (we trust the proposer has a valid block).
+        let prevote_hash = self.choose_prevote_hash(p.block_hash, p.pol_round);
+        let prevote = self.make_prevote(prevote_hash);
+
+        vec![
+            Action::Broadcast(ProposalOrVote::Vote(prevote)),
+            Action::StartTimeout(TimeoutKind::Prevote, TIMEOUT),
+        ]
+    }
+
+    /// Choose what hash to prevote given the proposed block hash and pol_round.
+    fn choose_prevote_hash(&self, proposed: Hash32, pol_round: i32) -> Option<Hash32> {
+        if let Some((locked_round, locked_hash)) = self.locked_block {
+            // We're locked.
+            if locked_hash == proposed {
+                // Prevote the proposed block (same as what we're locked on).
+                return Some(proposed);
+            }
+            // Locked on a different block.
+            // Unlock condition: 2f+1 prevotes for the proposed block at a higher round
+            // (pol_round > locked_round and pol_round is valid).
+            if pol_round >= 0 {
+                let pol_round_u = pol_round as u32;
+                if pol_round_u > locked_round {
+                    let quorum = self.validator_set.quorum();
+                    let tally = self.prevotes.get(&pol_round_u);
+                    let polka_power = tally
+                        .map(|t| t.power_for(Some(proposed)))
+                        .unwrap_or(0);
+                    if polka_power >= quorum {
+                        // Unlocked — prevote the new proposal.
+                        return Some(proposed);
+                    }
+                }
+            }
+            // Stay locked.
+            Some(locked_hash)
+        } else {
+            // Not locked — prevote the proposal.
+            Some(proposed)
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Vote handler
+    // ---------------------------------------------------------------------------
+
+    fn on_vote(&mut self, v: Vote, blocks: &BTreeMap<Hash32, Block>) -> Vec<Action> {
+        if v.height != self.height {
+            return vec![];
+        }
+
+        let power = self.validator_set.voting_power_of(&v.validator);
+        if power == 0 {
+            // Unknown validator — ignore.
+            return vec![];
+        }
+
+        let quorum = self.validator_set.quorum();
+        let mut actions = Vec::new();
+
+        match v.kind {
+            VoteKind::Prevote => {
+                let tally = self.prevotes.entry(v.round).or_default();
+                tally.record(v.validator, power, v.block_hash);
+
+                // Check for 2f+1 prevotes for a non-nil hash in the current round.
+                if v.round == self.round && self.step == Step::Prevote {
+                    if let Some(Some(hash)) = tally.quorum_hash(quorum) {
+                        // 2f+1 prevotes for a concrete block — update valid_block.
+                        self.valid_block = Some((self.round, hash));
+                        // Precommit for it.
+                        self.step = Step::Precommit;
+                        let precommit = self.make_precommit(Some(hash));
+                        // Lock on this block.
+                        self.locked_block = Some((self.round, hash));
+                        actions.push(Action::Broadcast(ProposalOrVote::Vote(precommit)));
+                        actions.push(Action::StartTimeout(TimeoutKind::Precommit, TIMEOUT));
+                    } else if let Some(None) = tally.quorum_hash(quorum) {
+                        // 2f+1 nil-prevotes — unlock and nil-precommit.
+                        self.locked_block = None;
+                        self.step = Step::Precommit;
+                        let precommit = self.make_precommit(None);
+                        actions.push(Action::Broadcast(ProposalOrVote::Vote(precommit)));
+                        actions.push(Action::StartTimeout(TimeoutKind::Precommit, TIMEOUT));
+                    }
+                }
+
+                // For past rounds: if 2f+1 prevotes arrive late and we haven't advanced yet,
+                // update valid_block for the proposer's benefit in the next round.
+                if v.round < self.round
+                    && let Some(Some(hash)) = self.prevotes.get(&v.round).and_then(|t| t.quorum_hash(quorum))
+                    && self.valid_block.map(|(r, _)| r).unwrap_or(0) < v.round
+                {
+                    self.valid_block = Some((v.round, hash));
+                }
+            }
+            VoteKind::Precommit => {
+                // Store for later Commit construction.
+                self.all_precommit_votes
+                    .entry(v.round)
+                    .or_default()
+                    .push(v.clone());
+
+                let tally = self.precommits.entry(v.round).or_default();
+                tally.record(v.validator, power, v.block_hash);
+
+                // Check for 2f+1 precommits for a concrete hash.
+                if let Some(Some(hash)) = tally.quorum_hash(quorum)
+                    && self.step != Step::Commit
+                    && let Some(block) = blocks.get(&hash)
+                {
+                    self.step = Step::Commit;
+                    let commit_votes: Vec<Vote> = self
+                        .all_precommit_votes
+                        .get(&v.round)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|vote| vote.block_hash == Some(hash))
+                        .collect();
+                    let commit = Commit {
+                        height: self.height,
+                        round: v.round,
+                        block_hash: hash,
+                        votes: commit_votes,
+                    };
+                    self.committed_block = Some(block.clone());
+                    actions.push(Action::Commit(Box::new(block.clone()), commit));
+                }
+            }
+        }
+
+        actions
+    }
+
+    // ---------------------------------------------------------------------------
+    // Round advancement
+    // ---------------------------------------------------------------------------
+
+    fn advance_round(&mut self, _blocks: &BTreeMap<Hash32, Block>) -> Vec<Action> {
+        self.round += 1;
+        self.step = Step::Propose;
+        self.proposal = None;
+
+        let actions = vec![Action::StartTimeout(TimeoutKind::Propose, TIMEOUT)];
+
+        // If this validator is the new proposer, they need to build and broadcast.
+        // The engine layer handles building; here we just signal a propose timeout
+        // starts.  If this validator is the proposer, engine will inject a proposal.
+        actions
+    }
+
+    // ---------------------------------------------------------------------------
+    // Vote constructors (unsigned stubs — the engine fills in the real sig)
+    // ---------------------------------------------------------------------------
+
+    fn make_prevote(&self, hash: Option<Hash32>) -> Vote {
+        Vote {
+            height: self.height,
+            round: self.round,
+            kind: VoteKind::Prevote,
+            block_hash: hash,
+            validator: self.local_address,
+            sig: bloom_chain_types::types::SigBytes(vec![]),
+        }
+    }
+
+    fn make_precommit(&self, hash: Option<Hash32>) -> Vote {
+        Vote {
+            height: self.height,
+            round: self.round,
+            kind: VoteKind::Precommit,
+            block_hash: hash,
+            validator: self.local_address,
+            sig: bloom_chain_types::types::SigBytes(vec![]),
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Accessors
+    // ---------------------------------------------------------------------------
+
+    pub fn validator_set(&self) -> &ValidatorSet {
+        &self.validator_set
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bloom_chain_types::{
+        block::{Block, BlockHeader},
+        types::{Address, Hash32, PubKeyBytes, SigBytes},
+        vote::{Commit, Proposal},
+    };
+
+    use crate::validator_set::ValidatorSet;
+
+    fn make_addr(seed: u8) -> Address {
+        Address([seed; 32])
+    }
+
+    fn make_validator_set() -> ValidatorSet {
+        ValidatorSet::new(vec![
+            crate::validator_set::Validator {
+                address: make_addr(0),
+                pubkey: PubKeyBytes(vec![0; 4]),
+                voting_power: 100,
+            },
+            crate::validator_set::Validator {
+                address: make_addr(1),
+                pubkey: PubKeyBytes(vec![1; 4]),
+                voting_power: 100,
+            },
+            crate::validator_set::Validator {
+                address: make_addr(2),
+                pubkey: PubKeyBytes(vec![2; 4]),
+                voting_power: 100,
+            },
+            crate::validator_set::Validator {
+                address: make_addr(3),
+                pubkey: PubKeyBytes(vec![3; 4]),
+                voting_power: 100,
+            },
+        ])
+        .unwrap()
+    }
+
+    fn make_block(hash_seed: u8) -> (Hash32, Block) {
+        let header = BlockHeader {
+            chain_id: "bloomchain.v0".to_string(),
+            height: 1,
+            parent_hash: Hash32([0; 32]),
+            timestamp_ms: 1_747_526_400_000,
+            proposer: make_addr(0),
+            txs_root: Hash32([hash_seed; 32]),
+            state_root: Hash32([hash_seed; 32]),
+            receipts_root: Hash32([hash_seed; 32]),
+            validator_set_hash: Hash32([hash_seed; 32]),
+            fuel_used: 0,
+            fuel_limit: 30_000_000,
+        };
+        let hash = header.block_hash();
+        let block = Block {
+            header,
+            txs: vec![],
+            commit: Commit {
+                height: 0,
+                round: 0,
+                block_hash: Hash32([0; 32]),
+                votes: vec![],
+            },
+        };
+        (hash, block)
+    }
+
+    #[test]
+    fn propose_timeout_emits_nil_prevote() {
+        let vs = make_validator_set();
+        let mut sm = ConsensusState::new(1, make_addr(1), vs);
+        let blocks = BTreeMap::new();
+        let actions = sm.handle(Event::Tick(TimeoutKind::Propose), &blocks);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::Broadcast(ProposalOrVote::Vote(v)) if v.block_hash.is_none())));
+    }
+
+    #[test]
+    fn receive_proposal_emits_prevote() {
+        // validator 1 is proposer for height=1, round=0 (idx=(1+0)%4=1).
+        // We run from addr(2)'s perspective to test proposal receipt.
+        let mut sm = ConsensusState::new(1, make_addr(2), make_validator_set());
+        let (hash, block) = make_block(0xAA);
+        let mut blocks = BTreeMap::new();
+        blocks.insert(hash, block);
+
+        let proposal = Proposal {
+            height: 1,
+            round: 0,
+            block_hash: hash,
+            pol_round: -1,
+            proposer: make_addr(1), // proposer for (height=1, round=0)
+            sig: SigBytes(vec![]),
+        };
+
+        let actions = sm.handle(Event::ReceiveProposal(proposal), &blocks);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::Broadcast(ProposalOrVote::Vote(v)) if v.block_hash == Some(hash))));
+    }
+
+    #[test]
+    fn vote_tally_quorum_detection() {
+        let mut tally = VoteTally::default();
+        let hash = Some(Hash32([0xBB; 32]));
+        tally.record(make_addr(0), 100, hash);
+        tally.record(make_addr(1), 100, hash);
+        // 200 < 267 (quorum for 4 × 100)
+        assert!(!tally.has_quorum(267));
+        tally.record(make_addr(2), 100, hash);
+        // 300 >= 267
+        assert!(tally.has_quorum(267));
+    }
+}

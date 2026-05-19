@@ -1,0 +1,23 @@
+[package]
+name = "bloom-dex-it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "End-to-end integration tests for the bloom-dex reference dapp"
+publish = false
+
+[dependencies]
+bloom-it = { path = "../../../../crates/bloom-it" }
+bloom-chain-node = { path = "../../../../crates/bloom-chain-node" }
+bloom-keystore.workspace = true
+anyhow.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time", "io-util"] }
+serde_json.workspace = true
+hex.workspace = true
+tempfile.workspace = true
+blake3.workspace = true
+# Test-only: needed for U256 math in `uniswap_get_amount_out` to match the
+# router's exact widening-multiply behavior. The intermediate
+# `amount_in_with_fee * reserve_out` overflows u128 at production-scale
+# reserves (~1e23 * ~1e24).
+primitive-types = "0.12"

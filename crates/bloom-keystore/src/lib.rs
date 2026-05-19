@@ -22,6 +22,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod xdsa;
+#[cfg(test)]
+mod xdsa_tests;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -65,6 +69,278 @@ pub enum KeystoreError {
     Signer(String),
     #[error("policy parse error: {0}")]
     Policy(String),
+}
+
+/// Signing algorithm for a wallet.
+///
+/// New wallets default to `Xdsa` (bloom-chain native).  Existing wallets
+/// without an `algorithm` field in their envelope default to `Secp256k1`
+/// for backward compatibility.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Algorithm {
+    /// secp256k1 / ECDSA — Ethereum-interop wallets.
+    #[default]
+    Secp256k1,
+    /// Composite ML-DSA-65 + Ed25519 — bloom-chain native wallets.
+    Xdsa,
+}
+
+impl std::fmt::Display for Algorithm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Algorithm::Secp256k1 => f.write_str("secp256k1"),
+            Algorithm::Xdsa => f.write_str("xdsa"),
+        }
+    }
+}
+
+/// An on-disk address that distinguishes the two key types.
+///
+/// Ethereum wallets carry a 20-byte `Address`; bloom-chain xDSA wallets
+/// carry a 32-byte BLAKE3 digest derived from the composite public key per
+/// chain spec §4.3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalletAddress {
+    /// 20-byte Ethereum-style address (secp256k1 wallets).
+    Ethereum(Address),
+    /// 32-byte bloom-chain address (xDSA wallets).
+    BloomChain([u8; 32]),
+}
+
+impl std::fmt::Display for WalletAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WalletAddress::Ethereum(a) => write!(f, "{}", checksum_address(a)),
+            WalletAddress::BloomChain(b) => write!(f, "{}", hex::encode(b)),
+        }
+    }
+}
+
+// ─── xDSA on-disk keystore helpers ───────────────────────────────────────────
+//
+// xDSA wallets use the same directory layout as secp256k1 wallets, with two
+// differences:
+//
+//   • `encrypted.key` envelope: the `algorithm` field (added in v2) is set
+//     to "xdsa".  Old envelopes without the field default to "secp256k1".
+//   • Plaintext of the encrypted blob: 64 bytes (`mldsa_seed || ed25519_seed`)
+//     instead of 32 bytes.
+//   • `address` file: 64 hex chars (32-byte BLAKE3 digest) instead of 42 chars.
+//   • `pubkey` file: hex-encoded 1984-byte composite public key.
+
+/// On-disk envelope for an encrypted private key (v2 adds `algorithm`).
+#[derive(Debug, Serialize, Deserialize)]
+struct EncryptedFileV2 {
+    /// Format version.  1 = secp256k1-only (legacy).  2 = algorithm-tagged.
+    v: u8,
+    /// Algorithm.  Absent in v=1 files; defaults to secp256k1 on load.
+    #[serde(default, skip_serializing_if = "is_secp256k1")]
+    algorithm: Algorithm,
+    /// Hex-encoded 32-byte salt for argon2.
+    salt_hex: String,
+    /// Hex-encoded 12-byte nonce for chacha20-poly1305.
+    nonce_hex: String,
+    /// Argon2id `m_cost` (KiB).
+    m_cost: u32,
+    /// Argon2id `t_cost` (iterations).
+    t_cost: u32,
+    /// Argon2id `p_cost` (parallelism).
+    p_cost: u32,
+    /// Hex ciphertext.
+    ciphertext_hex: String,
+}
+
+fn is_secp256k1(a: &Algorithm) -> bool {
+    *a == Algorithm::Secp256k1
+}
+
+/// Argon2id parameters for xDSA keystore (spec §4 / chain spec §13).
+const XDSA_ARGON2_M_COST: u32 = 65536; // 64 MiB
+const XDSA_ARGON2_T_COST: u32 = 3;
+const XDSA_ARGON2_P_COST: u32 = 4;
+
+const XDSA_KEYSTORE_AAD: &[u8] = b"bloom-keystore-xdsa-v2";
+
+fn derive_key_v2(passphrase: &str, salt: &[u8], enc: &EncryptedFileV2) -> Result<[u8; 32], KeystoreError> {
+    let argon = Argon2::new(
+        argon2::Algorithm::Argon2id,
+        argon2::Version::V0x13,
+        argon2::Params::new(enc.m_cost, enc.t_cost, enc.p_cost, Some(32))
+            .map_err(|e| KeystoreError::Argon2(e.to_string()))?,
+    );
+    let mut key = [0u8; 32];
+    argon
+        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .map_err(|e| KeystoreError::Argon2(e.to_string()))?;
+    Ok(key)
+}
+
+fn encrypt_xdsa_key(secret_bytes: &[u8], passphrase: &str) -> Result<EncryptedFileV2, KeystoreError> {
+    let mut salt = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut salt);
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let enc = EncryptedFileV2 {
+        v: 2,
+        algorithm: Algorithm::Xdsa,
+        salt_hex: hex::encode(salt),
+        nonce_hex: hex::encode(nonce_bytes),
+        m_cost: XDSA_ARGON2_M_COST,
+        t_cost: XDSA_ARGON2_T_COST,
+        p_cost: XDSA_ARGON2_P_COST,
+        ciphertext_hex: String::new(),
+    };
+    let mut key = derive_key_v2(passphrase, &salt, &enc)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(
+            nonce,
+            Payload {
+                msg: secret_bytes,
+                aad: XDSA_KEYSTORE_AAD,
+            },
+        )
+        .map_err(|e| KeystoreError::Aead(e.to_string()))?;
+    key.zeroize();
+    Ok(EncryptedFileV2 {
+        ciphertext_hex: hex::encode(&ciphertext),
+        ..enc
+    })
+}
+
+fn decrypt_xdsa_key(enc: &EncryptedFileV2, passphrase: &str) -> Result<Vec<u8>, KeystoreError> {
+    let salt = hex::decode(&enc.salt_hex)
+        .map_err(|e| KeystoreError::Malformed(format!("xdsa salt: {e}")))?;
+    let nonce_b = hex::decode(&enc.nonce_hex)
+        .map_err(|e| KeystoreError::Malformed(format!("xdsa nonce: {e}")))?;
+    if nonce_b.len() != 12 {
+        return Err(KeystoreError::Malformed("xdsa nonce length".into()));
+    }
+    let ct = hex::decode(&enc.ciphertext_hex)
+        .map_err(|e| KeystoreError::Malformed(format!("xdsa ciphertext: {e}")))?;
+    let mut key = derive_key_v2(passphrase, &salt, enc)?;
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+    let nonce = Nonce::from_slice(&nonce_b);
+    let pt = cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &ct,
+                aad: XDSA_KEYSTORE_AAD,
+            },
+        )
+        .map_err(|e| KeystoreError::Aead(e.to_string()))?;
+    key.zeroize();
+    Ok(pt)
+}
+
+// ─── XdsaWallet: algorithm-tagged xDSA wallet operations ─────────────────────
+
+/// A loaded and decrypted xDSA wallet (secret key in memory).
+pub struct XdsaWallet {
+    pub name: String,
+    pub address: WalletAddress,
+    pub public_key: xdsa::XdsaPublicKey,
+    secret: xdsa::XdsaSecretKey,
+}
+
+impl XdsaWallet {
+    /// Sign a message with the xDSA secret key.
+    pub fn sign(&self, msg: &[u8]) -> xdsa::XdsaSignature {
+        self.secret.sign(msg)
+    }
+
+    /// The wallet's 32-byte bloom-chain address bytes.
+    pub fn address_bytes(&self) -> [u8; 32] {
+        match &self.address {
+            WalletAddress::BloomChain(b) => *b,
+            _ => unreachable!("xDSA wallet always has a BloomChain address"),
+        }
+    }
+}
+
+/// Create a new xDSA wallet on disk and return its info.
+///
+/// Layout under `dir/<name>/`:
+/// - `encrypted.key` — JSON `EncryptedFileV2` with algorithm = "xdsa"
+/// - `pubkey`        — hex-encoded 1984-byte composite public key
+/// - `address`       — hex-encoded 32-byte BLAKE3 address
+/// - `kind`          — "local"
+/// - `algorithm`     — "xdsa"
+/// - `policy.toml`   — default policy
+pub fn create_xdsa_wallet(
+    keystore_root: &Path,
+    name: &str,
+    passphrase: &str,
+) -> Result<(WalletAddress, xdsa::XdsaPublicKey), KeystoreError> {
+    Keystore::validate_name(name)?;
+    let dir = keystore_root.join(name);
+    if dir.exists() {
+        return Err(KeystoreError::AlreadyExists(name.into()));
+    }
+    fs::create_dir_all(&dir).map_err(|source| KeystoreError::Io {
+        path: dir.clone(),
+        source,
+    })?;
+
+    let (sk, pk) = xdsa::XdsaSecretKey::generate();
+    let secret_bytes = sk.to_bytes();
+    let encrypted = encrypt_xdsa_key(secret_bytes.as_slice(), passphrase)?;
+    let blob = serde_json::to_vec(&encrypted)
+        .map_err(|e| KeystoreError::Malformed(e.to_string()))?;
+    write_atomic(&dir.join("encrypted.key"), &blob)?;
+
+    let addr_bytes = xdsa::derive_address(&pk);
+    let addr_hex = hex::encode(addr_bytes);
+    let pk_hex = hex::encode(&pk.0);
+
+    write_atomic(&dir.join("address"), addr_hex.as_bytes())?;
+    write_atomic(&dir.join("pubkey"), pk_hex.as_bytes())?;
+    write_atomic(&dir.join("kind"), b"local")?;
+    write_atomic(&dir.join("algorithm"), b"xdsa")?;
+    let default_policy = Policy::default();
+    write_atomic(
+        &dir.join("policy.toml"),
+        toml::to_string_pretty(&default_policy)
+            .map_err(|e| KeystoreError::Policy(e.to_string()))?
+            .as_bytes(),
+    )?;
+
+    Ok((WalletAddress::BloomChain(addr_bytes), pk))
+}
+
+/// Load and decrypt an xDSA wallet from disk.
+pub fn load_xdsa_wallet(
+    keystore_root: &Path,
+    name: &str,
+    passphrase: &str,
+) -> Result<XdsaWallet, KeystoreError> {
+    Keystore::validate_name(name)?;
+    let dir = keystore_root.join(name);
+    if !dir.exists() {
+        return Err(KeystoreError::NotFound(name.into()));
+    }
+
+    let blob = fs::read(dir.join("encrypted.key")).map_err(|source| KeystoreError::Io {
+        path: dir.join("encrypted.key"),
+        source,
+    })?;
+    let enc: EncryptedFileV2 = serde_json::from_slice(&blob)
+        .map_err(|e| KeystoreError::Malformed(e.to_string()))?;
+
+    let secret_bytes = decrypt_xdsa_key(&enc, passphrase)?;
+    let sk = xdsa::XdsaSecretKey::from_bytes(&secret_bytes)?;
+    let pk = sk.public_key();
+    let addr_bytes = xdsa::derive_address(&pk);
+
+    Ok(XdsaWallet {
+        name: name.into(),
+        address: WalletAddress::BloomChain(addr_bytes),
+        public_key: pk,
+        secret: sk,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

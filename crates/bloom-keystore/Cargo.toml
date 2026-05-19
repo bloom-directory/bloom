@@ -21,6 +21,8 @@ alloy.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
 toml.workspace = true
+ml-dsa.workspace = true
+ed25519-dalek.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

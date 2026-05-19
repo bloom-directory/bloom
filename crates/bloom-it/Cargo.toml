@@ -16,6 +16,7 @@ bytecode-decompile = ["bloom-revert/bytecode-decompile"]
 bloom-proto.workspace = true
 bloom-keystore.workspace = true
 bloom-chain.workspace = true
+bloom-chain-node = { path = "../bloom-chain-node" }
 bloom-watch.workspace = true
 bloom-tx.workspace = true
 bloom-vfs.workspace = true
@@ -28,6 +29,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", 
 serde_json.workspace = true
 hex.workspace = true
 tempfile.workspace = true
+toml.workspace = true
 tracing-subscriber.workspace = true
 reqwest.workspace = true
 futures.workspace = true
+blake3.workspace = true

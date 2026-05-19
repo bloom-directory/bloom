@@ -1,0 +1,18 @@
+[package]
+name = "bloom-dex-reentrancy"
+version = "0.1.0"
+edition = "2024"
+description = "Cross-petal reentrancy lock helper for bloom-chain DEX pair petals"
+license = "MIT"
+
+[lib]
+name = "bloom_dex_reentrancy"
+crate-type = ["cdylib"]
+
+[dependencies]
+bloom-dex-abi   = { workspace = true, default-features = false }
+bloom-petal-sdk = { workspace = true }
+
+# blake3 is available on the host side for unit tests (non-wasm32 builds).
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+blake3 = { version = "1", default-features = false }

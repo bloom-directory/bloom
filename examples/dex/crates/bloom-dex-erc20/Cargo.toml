@@ -1,0 +1,14 @@
+[package]
+name = "bloom-dex-erc20"
+version = "0.1.0"
+edition = "2024"
+description = "ERC-20 fungible token petal for bloom-chain DEX"
+license = "MIT"
+
+[lib]
+name = "bloom_dex_erc20"
+crate-type = ["cdylib"]
+
+[dependencies]
+bloom-dex-abi  = { workspace = true, default-features = false }
+bloom-petal-sdk = { workspace = true }

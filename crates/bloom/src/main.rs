@@ -8,6 +8,10 @@
 
 #![forbid(unsafe_code)]
 
+mod commands {
+    pub mod chain;
+}
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -19,6 +23,8 @@ use bloom_vfs::{VfsPath, handler::Handler};
 use clap::{Parser, Subcommand};
 use tracing::{debug, info, trace};
 use tracing_subscriber::EnvFilter;
+
+use commands::chain::ChainCmd;
 
 #[cfg(target_os = "linux")]
 const DEFAULT_MOUNT_PATH: &str = "/bloom";
@@ -73,6 +79,9 @@ enum Cmd {
     Petals(PetalsCmd),
     /// Initialise ~/.bloom with default config + dirs.
     Init,
+    /// Sovereign bloom-chain: init, run-validator, submit, deploy, call, query.
+    #[command(subcommand)]
+    Chain(ChainCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -476,6 +485,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Petals(cmd) => run_petals(home, cmd).await,
+        Cmd::Chain(cmd) => commands::chain::run_chain(&home, cmd).await,
         Cmd::Ipc(IpcCmd::Call { method, params }) => {
             let socket = default_socket_path(home.root());
             if !socket.exists() {

@@ -1,4 +1,4 @@
-/target
+target/
 **/*.rs.bk
 .DS_Store
 ~/.bloom
@@ -7,3 +7,4 @@ test.env
 *.local.toml
 .worktrees/
 .claude/worktrees/
+.claude/scheduled_tasks.lock
