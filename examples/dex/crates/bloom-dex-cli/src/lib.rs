@@ -887,12 +887,7 @@ fn load_wallet_key(chain_dir: &Path) -> Result<(
     let sk = bloom_keystore::xdsa::XdsaSecretKey::from_bytes(&key_bytes)
         .map_err(|e| anyhow!("decode validator key: {e}"))?;
     let pk = sk.public_key();
-    let addr = {
-        let mut h = blake3::Hasher::new();
-        h.update(b"bloom-chain.v0.addr:");
-        h.update(&pk.0);
-        Address(*h.finalize().as_bytes())
-    };
+    let addr = Address::from_pubkey_bytes(&pk.0);
     Ok((sk, pk, addr))
 }
 

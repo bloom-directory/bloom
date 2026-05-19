@@ -35,7 +35,7 @@ threshold-MPC keys) are explicitly deferred — see §2.
   required in v1+.
 - **Score-weighted LOOM emission to petals.** Block emission goes flat
   to the proposing validator + a small fee-sharing slice to the rest of
-  the set (see §11). The full whitepaper formulae (utility / trust
+  the set (see §12). The full whitepaper formulae (utility / trust
   indices, effective petal count, halving curve) land in v1+.
 - **Invariant / pruning / challenger workflow.** No staking on petals,
   no slashing, no governance. Defer to v1+.
@@ -304,7 +304,7 @@ For each tx `t` in a block, in order:
 6. Append a `Receipt` to the block's receipts list.
 
 The order matters and is part of the consensus protocol. After all txs
-are applied, the LOOM emission for the block (§11) is minted and
+are applied, the LOOM emission for the block (§12) is minted and
 credited; then the new `state_root` is computed.
 
 ## 7. Transaction model
@@ -545,15 +545,193 @@ struct Receipt {
 `receipts_root` is the BLAKE3 Merkle root of `ssz_encode(receipt)` for
 each tx, in tx order.
 
-## 9. Consensus: Tendermint-style BFT over a fixed set
+## 9. Validation boundary
 
-### 9.1 Validator set
+Every block or consensus message entering a v0 node passes through one
+narrow validation boundary BEFORE it reaches `ConsensusState` (the
+per-validator state machine) or `apply_block` (the state-transition
+function). The boundary is the single, exhaustive checkpoint where v0
+authenticates inputs and refuses anything malformed, forged, or
+out-of-context. Inside the boundary, code may assume the invariants
+listed below hold; outside it, nothing is trusted.
+
+This section enumerates the boundary; subsequent sections describe what
+runs inside it.
+
+### 9.1 What the boundary covers
+
+#### (a) Signature verification
+
+- xDSA signatures on `Vote` (Prevote / Precommit) and `Proposal` are
+  verified at ingress against the declared validator's pubkey before the
+  message can transition `ConsensusState`. See
+  `crates/bloom-chain-consensus/src/auth.rs` (`verify_vote_sig`,
+  `verify_proposal_sig`); the dispatch points are
+  `crates/bloom-chain-node/src/node.rs::Frame::Vote` and `Frame::Proposal`.
+- Outbound consensus messages are signed by `ConsensusEngine::sign_actions`
+  in `crates/bloom-chain-consensus/src/engine.rs`. The engine is the
+  single chokepoint — every `Action::Broadcast` returned by `step`,
+  `maybe_propose`, `try_resume_pending_proposal`, or `enter_next_height`
+  is signed before the caller sees it.
+- Tx signatures are verified by the mempool admission path
+  (`Mempool::admit` in `crates/bloom-chain-consensus/src/mempool.rs`)
+  AND re-verified by the apply-time validation boundary
+  (`validate_block_for_apply` in
+  `crates/bloom-chain-node/src/consensus_driver.rs`) for every tx in
+  every block, regardless of whether this node produced the block.
+  Re-verification at apply is non-redundant: a malicious proposer can
+  build a block out of txs that never traversed `Mempool::admit`, and
+  catch-up sync receives whole blocks from peers without any prior
+  admit step. Forged-sig and forged-sender txs are therefore caught at
+  the boundary before any state transition runs.
+- `tx.chain_id` equality with the local chain id is enforced inside
+  the boundary for every tx in every committed block — rejecting
+  cross-chain replay of a legitimately-signed tx into the wrong chain.
+  The header `chain_id` check alone is insufficient because the
+  proposer controls the header independently of the body.
+
+#### (b) Block header / body root checks
+
+- The header's `chain_id`, `proposer`, `validator_set_hash`, and
+  `fuel_limit` are checked against this node's configured chain.
+- `txs_root` is recomputed from `block.txs` and compared to the header;
+  any tampering of the body forces a mismatch.
+- `receipts_root` is recomputed from the receipts produced by replaying
+  the block locally and compared to the header. A divergent state
+  transition surfaces here.
+- See `crates/bloom-chain-node/src/consensus_driver.rs::apply_block` and
+  the catch-up path in `crates/bloom-chain-node/src/node.rs`
+  (`Frame::BlockResponse`). Both paths share `apply_block`; catch-up
+  does NOT take a faster route.
+
+#### (c) Commit quorum
+
+- Every block we apply (live or catch-up) carries a `Commit` of 2f+1
+  matching precommits. Each precommit is xDSA-verified against its
+  declared signer, signers must be unique members of the active
+  validator set, and the total voting power must reach the 2f+1
+  threshold.
+- Every commit vote must satisfy `vote.round == commit.round`.
+  Tendermint safety requires the 2f+1 quorum to come from a single
+  (height, round) tuple — locking and the line-of-prevotes argument
+  break otherwise. An attacker who collects one valid precommit per
+  round across rounds 0..n for the same `block_hash` and assembles
+  them into a single `Commit` must be rejected; this enforcement is
+  inside `validate_block_for_apply`.
+- An empty-commit body (the proposer's initial dissemination of its own
+  block, before round precommits land) is recognised and explicitly
+  skipped by the catch-up apply path; only the consensus state machine
+  may admit a block with an empty commit, by collecting 2f+1 precommits
+  itself.
+
+#### (d) Parent / height continuity
+
+- `block.header.parent_hash` must equal the `block_hash` of the locally
+  stored block at `block.header.height - 1`. Catch-up requests refuse
+  to apply forward-gap blocks.
+- `block.header.height` must equal `engine.height()` exactly at
+  apply-time. Replays of already-applied heights are dropped.
+- `ConsensusState::on_proposal` refuses to transition to Prevote until
+  the proposed `block_hash` is present in `engine.blocks`; unknown-block
+  proposals are stashed (`ConsensusState.pending_proposal`) and replayed
+  by `try_resume_pending_proposal` once the block frame arrives. This
+  closes the "prevote a block we have not validated" hole.
+- `enter_next_height` retains blocks for heights ≥ `new_height` to
+  avoid wiping the body of the next proposal that arrived ahead of the
+  height transition.
+
+#### (e) Tx sender derivation
+
+- `Address` derivation uses one canonical domain tag — `bloom-chain.v0.addr:`
+  — defined by `Address::from_pubkey_bytes` in
+  `crates/bloom-chain-types/src/types.rs`. The same function is used by
+  `bloom-keystore::xdsa` (account-creation) and the chain validation
+  path.
+- `Mempool::admit` rejects any tx whose declared `sender` is not
+  `Address::from_pubkey_bytes(tx.pubkey)`. The check runs after sig
+  verify; without it, a valid signature over a forged `sender` would
+  pass.
+- `apply_block` re-derives the sender for every tx and compares,
+  closing the gap for blocks that bypass the local mempool.
+
+#### (f) State-transition output integrity
+
+- Per-tx ordering inside `apply_block_state_transitions`
+  (`crates/bloom-chain-node/src/consensus_driver.rs`): the executor's
+  `output.write_set` is applied BEFORE refund credit and proposer fee
+  credit, so the absolute-set write_set entries cannot clobber the
+  settlement balances. `WriteSet` is absolute, not delta — see
+  `crates/bloom-chain-state/src/state.rs`.
+- Nested `petal.call` and `host.deploy` snapshots are checkpointed
+  (`StateSnapshot::clone` before the inner call); on revert, trap, or
+  out-of-fuel, the parent's snapshot is restored from the checkpoint,
+  not from the mutated child. Reverted child writes and value transfers
+  can never leak into the parent, regardless of whether the parent
+  inspects the return code.
+- Wasm runtime is bounded by a `wasmtime::ResourceLimiter`
+  (`ChainLimiter` in `crates/bloom-petals/src/chain_vm.rs`): per-store
+  memory growth cap, table cap, and instance / memory / table count
+  caps. Static-validation bounds at module load are augmented with this
+  runtime cap so a `memory.grow` cannot escape.
+- Reverts surface uniformly: the single authoritative revert path is
+  `ChainCallOutput { revert_reason: Some(_) }` returned by
+  `run_chain_call`; `PetalExecutor` consumes that and emits a failed
+  receipt. The `Err` arm is reserved for genuine engine faults
+  (traps, out-of-fuel, link errors).
+- `StateSnapshot::get_code` consults the in-flight `WriteSet::code`
+  staged map before falling back to the committed `CodeStore`, so
+  same-tx deploy-then-call patterns work and `init` may call back into
+  its own freshly-staged code. Snapshots do not share staged code
+  across siblings.
+
+### 9.2 Restart replay
+
+A node that restarts re-enters the boundary for every block in
+`block_store` it has not yet replayed onto the in-memory state. The
+replay walks blocks in height order, calling the same
+`apply_block_state_transitions` as live consensus — there is no separate
+"warm-replay" path that could drift. Transfers, deploys, storage
+writes, fee accounting, receipts, and code installs are all
+reconstructed by replaying the canonical tx effects, not by reading any
+out-of-band proposer emission log.
+
+### 9.3 What is NOT inside the boundary
+
+- The mempool ordering / fairness policy is policy, not validation: a
+  block with a "bad" tx ordering produces the same boundary verdict as
+  a well-ordered one. Per-sender nonce contiguity inside a block IS a
+  boundary check (`apply_block` rejects a block that contains nonce N+1
+  for a sender without nonce N), but the mempool selector enforces the
+  same contiguity proactively to avoid wasted blocks.
+- Wasm gas / fuel accounting is a state-transition concern, not a
+  validity concern. A block whose txs collectively consume more than
+  `fuel_limit` is rejected at the boundary; per-tx fuel accounting is
+  re-derived inside `apply_block`.
+- Network framing (`Frame::*` SSZ wire format) is checked by the
+  transport layer, not the boundary. Malformed frames are dropped before
+  reaching the boundary.
+
+### 9.4 Operational consequences
+
+- New consensus message types or new on-chain effects MUST extend the
+  boundary explicitly. Adding a "trusted fast path" that bypasses any
+  of (a)–(f) is a regression and must not pass review.
+- Adversarial regression tests live in
+  `crates/bloom-chain-consensus/tests/` and
+  `crates/bloom-chain-node/tests/`. Each fix that re-establishes a
+  missing boundary check ships with a test that fails on master and
+  passes on the post-fix branch; see the file index in those directories
+  for the current set.
+
+## 10. Consensus: Tendermint-style BFT over a fixed set
+
+### 10.1 Validator set
 
 Fixed at genesis. Each validator has an `Address`, a `CompositePubKey`,
 and a `voting_power` (u64). Total power `Vt = Σ vp_i`. BFT quorum is
 `2 * Vt / 3 + 1`. Rotation is v1+.
 
-### 9.2 Round structure
+### 10.2 Round structure
 
 For each height `h`:
 1. **Propose** (timeout 500 ms): the proposer for `(h, round)` —
@@ -576,7 +754,7 @@ worst-case timeouts; rounds are not required to complete inside one
 second of wall clock. If the network is healthy, propose → prevote →
 precommit → commit happens well inside the slot.
 
-### 9.3 Locking
+### 10.3 Locking
 
 A validator that precommits for a block at `(h, r)` locks on that
 block: it must prevote for the same block at `(h, r+1, r+2, ...)`
@@ -584,7 +762,7 @@ unless `2f+1` prevotes for nil unlock it. Standard Tendermint locking
 rules apply; the spec follows Buchman 2016 ("Tendermint: Byzantine
 Fault Tolerance in the Age of Blockchains") chapter 3.
 
-### 9.4 Safety / liveness
+### 10.4 Safety / liveness
 
 Safety: no two blocks at the same height can both gather 2f+1
 precommits (standard Tendermint argument). Liveness: in the partially
@@ -593,7 +771,7 @@ some round eventually completes. v0 assumes honest validators and a
 healthy network — under crashes or partitions, the chain halts rather
 than forks.
 
-### 9.5 Mempool & block construction
+### 10.5 Mempool & block construction
 
 The proposer for height `h` selects up to `fuel_limit / min_tx_fuel`
 txs from its local mempool, ordered by `(fee_per_unit DESC, nonce ASC
@@ -601,16 +779,16 @@ per sender)`. Txs are sequentially applied during the propose step to
 fill `state_root` and `receipts_root`. Mempool sync between
 validators uses the same TCP gossip transport.
 
-## 10. Networking
+## 11. Networking
 
-### 10.1 Transport
+### 11.1 Transport
 
 Plain TCP. Each validator listens on a configured port; the validator
 set in genesis includes each validator's `(addr, host:port)`.
 Validators maintain persistent connections to every other validator,
 reconnecting with exponential backoff on drop.
 
-### 10.2 Framing
+### 11.2 Framing
 
 Length-prefixed frames:
 
@@ -630,7 +808,7 @@ decode).
 4 BlockResponse, 5 StateBlobRequest, 6 StateBlobResponse, 7 Ping,
 8 Pong.
 
-### 10.3 Sync
+### 11.3 Sync
 
 A starting node loads genesis, then requests the chain head from a
 peer (`BlockRequest{height: latest}`), walks forward applying blocks
@@ -638,7 +816,7 @@ and fetching state blobs only at checkpoints (every 64 blocks) to
 bound replay cost. v0 assumes all validators are bootstrapping from
 the same genesis; non-validator client sync is a v1 concern.
 
-### 10.4 Future: PQ-libp2p
+### 11.4 Future: PQ-libp2p
 
 The transport is a single `Transport` trait in `bloom-chain-node`.
 Swapping to a PQ-libp2p fork later is a one-implementation change
@@ -647,16 +825,16 @@ TCP only — because validators are running in trusted environments per
 the honest-validator assumption. Adding noise-protocol or TLS later
 does not change consensus semantics.
 
-## 11. LOOM emission and fees
+## 12. LOOM emission and fees
 
-### 11.1 Per-block emission
+### 12.1 Per-block emission
 
 A fixed `B0 = 10 LOOM` (10 * 10^18 bloomweis) is minted at the end of
 every block and credited to the proposer of that block. v0 ignores
 the whitepaper's halving / utility-weighted / trust-weighted formulae
 entirely.
 
-### 11.2 Fee accounting
+### 12.2 Fee accounting
 
 Tx fees (fuel × price) accrue to the proposer. There is no fee
 sharing with other validators in v0 — proposing is the only way to
@@ -664,12 +842,12 @@ earn LOOM, which under round-robin rotation is uniform across the
 set anyway. v1 adds fee sharing and score-weighted distribution to
 petals.
 
-### 11.3 Burning
+### 12.3 Burning
 
 No burning in v0. (Whitepaper §LOOM has burning as part of slashing
 and challenger arbitration, both deferred.)
 
-## 12. CLI surface
+## 13. CLI surface
 
 All under `bloom chain`:
 
@@ -694,7 +872,7 @@ running node over RPC; the RPC channel is a UDS socket under
 `<bloom_home>/chain/rpc.sock` by default with the same JSON-RPC
 framing as the existing daemon IPC.
 
-## 13. Interaction with existing bloom-eth surfaces
+## 14. Interaction with existing bloom-eth surfaces
 
 - **Wallet keys.** Existing `bloom wallet` commands gain an
   `--algo {secp256k1,xdsa}` flag. xDSA is the default for newly created
@@ -709,7 +887,7 @@ framing as the existing daemon IPC.
 - **VFS.** No `chains/bloom/` surface in v0 (explicit non-goal). All
   chain interaction is via `bloom chain ...` subcommands or direct RPC.
 
-## 14. Storage layout
+## 15. Storage layout
 
 ```
 <bloom_home>/chain/
@@ -727,7 +905,7 @@ framing as the existing daemon IPC.
 (512 blocks) — old blocks are recoverable from any peer that's still
 pinning them.
 
-## 15. v0 acceptance
+## 16. v0 acceptance
 
 A local 4-validator network on one machine:
 1. `cargo run -p bloom -- chain init` × 4 with shared genesis.
@@ -750,7 +928,7 @@ A local 4-validator network on one machine:
 5. Assert LOOM accounting balances: `sum(balances) + sum(pending
    fees) = sum(genesis allocations) + 10 LOOM * blocks_produced`.
 
-## 16. Open questions / future work
+## 17. Open questions / future work
 
 - **Validator-to-non-validator sync.** v0 hand-waves this; a real
   light-client / RPC-follower mode is v1.

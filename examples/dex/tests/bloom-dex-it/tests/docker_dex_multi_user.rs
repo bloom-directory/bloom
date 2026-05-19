@@ -518,10 +518,7 @@ fn wallet_addr_for_home(home: &Path) -> Result<[u8; 32]> {
     let sk = bloom_keystore::xdsa::XdsaSecretKey::from_bytes(&bytes)
         .map_err(|e| anyhow!("decode xdsa key: {e}"))?;
     let pk = sk.public_key();
-    let mut h = blake3::Hasher::new();
-    h.update(b"bloom-chain.v0.addr:");
-    h.update(&pk.0);
-    Ok(*h.finalize().as_bytes())
+    Ok(bloom_keystore::xdsa::derive_address(&pk))
 }
 
 /// Run `bloom chain transfer` from `from_home` to `to_addr` for `amount`.

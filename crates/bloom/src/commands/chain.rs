@@ -25,6 +25,13 @@ pub enum ChainCmd {
         /// Path to an existing genesis file to copy (default: generate skeleton).
         #[arg(long, value_name = "FILE")]
         genesis: Option<PathBuf>,
+        /// Overwrite an existing `keystore/validator.xdsa` if present.
+        ///
+        /// Without this flag, `chain init` refuses to clobber an existing
+        /// validator key — accidental re-init on a populated node home would
+        /// otherwise replace the operator's secret material in place.
+        #[arg(long)]
+        force: bool,
     },
     /// Run a validator node (long-running).
     RunValidator {
@@ -168,7 +175,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
 
     match cmd {
         // ── init ──────────────────────────────────────────────────────────────
-        ChainCmd::Init { genesis } => {
+        ChainCmd::Init { genesis, force } => {
             std::fs::create_dir_all(chain_dir.join("keystore"))
                 .context("create chain keystore dir")?;
             std::fs::create_dir_all(chain_dir.join("blocks"))
@@ -202,19 +209,19 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             let sk_bytes = sk.to_bytes();
             let pk_bytes = pk.0.clone();
 
-            // Derive address.
-            let addr_bytes = {
-                let mut h = blake3::Hasher::new();
-                h.update(b"bloom-chain.v0.addr:");
-                h.update(&pk_bytes);
-                *h.finalize().as_bytes()
-            };
+            // Derive address (spec §4.3 — canonical helper).
+            let addr_bytes =
+                bloom_chain_types::types::Address::from_pubkey_bytes(&pk_bytes).0;
             let addr_hex = hex::encode(addr_bytes);
 
             // Write key file (unencrypted seed for v0 — v1 should use passphrase).
+            //
+            // Refuses to overwrite an existing key unless `--force` is set
+            // (review 2026-05-19 #9). Mode 0o600 is set on Unix so the secret
+            // is never world- or group-readable.
             let key_path = chain_dir.join("keystore").join("validator.xdsa");
-            std::fs::write(&key_path, sk_bytes.as_slice())
-                .context("write validator key")?;
+            write_secret_key_file(&key_path, sk_bytes.as_slice(), force)
+                .with_context(|| format!("write validator key: {}", key_path.display()))?;
 
             println!("validator address : {addr_hex}");
             println!("validator key     : {}", key_path.display());
@@ -228,43 +235,8 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
         // ── run-validator ─────────────────────────────────────────────────────
         ChainCmd::RunValidator { config } => {
             let config_path = config.unwrap_or_else(|| chain_dir.join("config.toml"));
-            let config_text = std::fs::read_to_string(&config_path)
-                .with_context(|| format!("read config: {}", config_path.display()))?;
-            let node_cfg: bloom_chain_node::NodeConfig = toml::from_str(&config_text)
-                .context("parse config.toml")?;
-
-            let genesis_path = node_cfg
-                .genesis_path
-                .as_deref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| chain_dir.join("genesis.toml"));
-            let genesis = bloom_chain_node::Genesis::from_file(&genesis_path)?;
-
-            // Load validator key.
-            let key_path = chain_dir.join("keystore").join("validator.xdsa");
-            let key_bytes =
-                std::fs::read(&key_path).with_context(|| format!("read key: {}", key_path.display()))?;
-            let sk = bloom_keystore::xdsa::XdsaSecretKey::from_bytes(&key_bytes)
-                .map_err(|e| anyhow::anyhow!("decode validator key: {e}"))?;
-            let pk = sk.public_key();
-            let validator_address = {
-                let mut h = blake3::Hasher::new();
-                h.update(b"bloom-chain.v0.addr:");
-                h.update(&pk.0);
-                let out = *h.finalize().as_bytes();
-                bloom_chain_types::types::Address(out)
-            };
-
-            let run_config = bloom_chain_node::NodeRunConfig {
-                chain_id: genesis.chain_id.clone(),
-                validator_address,
-                genesis,
-                listen_addr: node_cfg.listen_addr.clone(),
-                rpc_tcp_addr: node_cfg.rpc_tcp_addr.clone(),
-                bloom_home: home.root().to_path_buf(),
-                fuel_limit: node_cfg.fuel_limit.unwrap_or(30_000_000),
-            };
-
+            let (node_cfg, run_config) =
+                load_validator_run_config(home.root(), &chain_dir, &config_path)?;
             let node = bloom_chain_node::Node::new(run_config);
             println!("starting bloom chain validator at {}", node_cfg.listen_addr);
             node.run().await
@@ -541,6 +513,150 @@ wasmtime_version = "26"
 "#
 }
 
+/// Write a validator secret-key file with strict permissions and an explicit
+/// no-overwrite rule (review 2026-05-19 #9).
+///
+/// - Refuses to overwrite an existing file unless `force` is set; the error
+///   message names the path and points the caller at `--force`.
+/// - On Unix, creates the file with mode 0o600 atomically (the mode is
+///   passed to `open(2)` before the secret is written, so the file never
+///   exists on disk with a wider mode). If the file already exists and
+///   `force` is set, we re-set the mode explicitly after writing because
+///   `truncate(2)` doesn't change the existing mode.
+/// - On non-Unix platforms the chmod is skipped; we still honor the no-
+///   overwrite check.
+fn write_secret_key_file(
+    path: &std::path::Path,
+    bytes: &[u8],
+    force: bool,
+) -> Result<()> {
+    use std::io::Write;
+
+    if path.exists() && !force {
+        anyhow::bail!(
+            "refusing to overwrite existing key at {}; pass --force to replace",
+            path.display()
+        );
+    }
+
+    // Ensure the parent directory exists; callers usually create it earlier,
+    // but be defensive so we don't silently fail on a malformed home.
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create key parent dir: {}", parent.display()))?;
+    }
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let mut f = opts
+        .open(path)
+        .with_context(|| format!("open key for write: {}", path.display()))?;
+    f.write_all(bytes)
+        .with_context(|| format!("write key bytes: {}", path.display()))?;
+    f.sync_all()
+        .with_context(|| format!("fsync key: {}", path.display()))?;
+    drop(f);
+
+    // If the file pre-existed (force-replace path), `OpenOptions::mode` only
+    // applies on create; tighten permissions explicitly so a previously
+    // 0644-permission file becomes 0600 after re-init.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(path, perms)
+            .with_context(|| format!("chmod 0600 key: {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+/// Load `config.toml` + genesis + the home keystore secret, derive the
+/// validator address from the keystore pubkey, and verify it matches
+/// `config.validator_address` (review 2026-05-19 #15).
+///
+/// A drift between the declared `validator_address` in `config.toml` and
+/// the key actually on disk would otherwise let a node sign votes with a
+/// key that doesn't match the address it announces to peers — wallets,
+/// validators, and the validator set hash would all disagree.
+///
+/// Returns `(NodeConfig, NodeRunConfig)` so the caller can spawn the
+/// long-running validator runtime, and so this function is callable from
+/// tests without needing the tokio runtime.
+pub(crate) fn load_validator_run_config(
+    bloom_home: &std::path::Path,
+    chain_dir: &std::path::Path,
+    config_path: &std::path::Path,
+) -> Result<(bloom_chain_node::NodeConfig, bloom_chain_node::NodeRunConfig)> {
+    let config_text = std::fs::read_to_string(config_path)
+        .with_context(|| format!("read config: {}", config_path.display()))?;
+    let node_cfg: bloom_chain_node::NodeConfig =
+        toml::from_str(&config_text).context("parse config.toml")?;
+
+    // Load validator key from `<chain_dir>/keystore/validator.xdsa` BEFORE
+    // loading genesis: the address-mismatch check is the cheaper failure
+    // mode, and surfacing it before genesis validation gives a clearer error
+    // (and makes the test seam viable without a fully-populated genesis).
+    let key_path = chain_dir.join("keystore").join("validator.xdsa");
+    let key_bytes = std::fs::read(&key_path)
+        .with_context(|| format!("read key: {}", key_path.display()))?;
+    let sk = bloom_keystore::xdsa::XdsaSecretKey::from_bytes(&key_bytes)
+        .map_err(|e| anyhow::anyhow!("decode validator key: {e}"))?;
+    let pk = sk.public_key();
+    let derived =
+        bloom_chain_types::types::Address::from_pubkey_bytes(&pk.0);
+
+    // Reconcile config.validator_address with derive(keystore_pubkey).
+    //
+    // We accept the same string formats `parse_b1_address` accepts (b1-prefixed
+    // OR raw 64-char hex) so the config can use either form.
+    let declared = bloom_chain_node::genesis::parse_b1_address(
+        &node_cfg.validator_address,
+    )
+    .with_context(|| {
+        format!(
+            "parse config.validator_address {:?}",
+            node_cfg.validator_address
+        )
+    })?;
+    if declared != derived {
+        anyhow::bail!(
+            "validator_address mismatch: config declares {} but keystore at {} \
+             derives {} — refusing to run with a key that doesn't match the \
+             declared identity",
+            hex::encode(declared.0),
+            key_path.display(),
+            hex::encode(derived.0),
+        );
+    }
+
+    let genesis_path = node_cfg
+        .genesis_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| chain_dir.join("genesis.toml"));
+    let genesis = bloom_chain_node::Genesis::from_file(&genesis_path)?;
+
+    let run_config = bloom_chain_node::NodeRunConfig {
+        chain_id: genesis.chain_id.clone(),
+        validator_address: derived,
+        validator_secret_key: std::sync::Arc::new(sk),
+        genesis,
+        listen_addr: node_cfg.listen_addr.clone(),
+        rpc_tcp_addr: node_cfg.rpc_tcp_addr.clone(),
+        bloom_home: bloom_home.to_path_buf(),
+        fuel_limit: node_cfg.fuel_limit.unwrap_or(30_000_000),
+    };
+    Ok((node_cfg, run_config))
+}
+
 /// Load a `.wasm` or `.wat` file, converting WAT if necessary.
 fn load_wasm(path: &str) -> Result<Vec<u8>> {
     let raw = std::fs::read(path).with_context(|| format!("read {path}"))?;
@@ -567,13 +683,7 @@ fn load_wallet_key(
     let sk = bloom_keystore::xdsa::XdsaSecretKey::from_bytes(&key_bytes)
         .map_err(|e| anyhow::anyhow!("decode validator key: {e}"))?;
     let pk = sk.public_key();
-    let addr = {
-        let mut h = blake3::Hasher::new();
-        h.update(b"bloom-chain.v0.addr:");
-        h.update(&pk.0);
-        let out = *h.finalize().as_bytes();
-        bloom_chain_types::types::Address(out)
-    };
+    let addr = bloom_chain_types::types::Address::from_pubkey_bytes(&pk.0);
     Ok((sk, pk, addr))
 }
 
@@ -818,16 +928,15 @@ fn provision_testnet(
         let (sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
         let sk_bytes = sk.to_bytes();
 
-        // Address = blake3("bloom-chain.v0.addr:" || pubkey)
-        let addr_bytes = {
-            let mut h = blake3::Hasher::new();
-            h.update(b"bloom-chain.v0.addr:");
-            h.update(&pk.0);
-            *h.finalize().as_bytes()
-        };
+        // Address = blake3("bloom-chain.v0.addr:" || pubkey) — canonical helper.
+        let addr_bytes =
+            bloom_chain_types::types::Address::from_pubkey_bytes(&pk.0).0;
 
         let key_path = chain_dir.join("keystore").join("validator.xdsa");
-        std::fs::write(&key_path, sk_bytes.as_slice())
+        // Testnet provisioning creates fresh per-validator home dirs, so the
+        // path should never already exist — but write with mode 0o600 so the
+        // secret never lands on disk with the umask-default 0644.
+        write_secret_key_file(&key_path, sk_bytes.as_slice(), false)
             .with_context(|| format!("write key for home{i}"))?;
 
         // Default per-validator port window: 127.0.0.1:{base+i}.
@@ -962,4 +1071,194 @@ fn pick_free_port_window(count: u16) -> Result<u16> {
         return Ok(first_port);
     }
     anyhow::bail!("could not find a free TCP port window of size {count}")
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: build a minimal valid genesis.toml for the unit tests.
+    fn write_minimal_genesis(path: &std::path::Path, chain_id: &str) {
+        let g = format!(
+            r#"chain_id = "{chain_id}"
+genesis_time_ms = 1747526400000
+validators = []
+allocations = []
+"#
+        );
+        std::fs::write(path, g).unwrap();
+    }
+
+    /// review 2026-05-19 #9 — `write_secret_key_file` refuses to overwrite
+    /// an existing path unless `force` is set.
+    #[test]
+    fn write_secret_key_file_refuses_overwrite_without_force() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("k");
+        write_secret_key_file(&path, b"first", false).expect("initial write");
+        let err = write_secret_key_file(&path, b"second", false)
+            .expect_err("second write must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to overwrite") && msg.contains("--force"),
+            "unexpected error: {msg}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+
+        write_secret_key_file(&path, b"second", true).expect("force write");
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+    }
+
+    /// review 2026-05-19 #9 — freshly written secrets must be mode 0o600
+    /// on Unix.
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_key_file_uses_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("k");
+        write_secret_key_file(&path, b"data", false).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0o600, got 0o{mode:o}");
+    }
+
+    /// review 2026-05-19 #9 — `--force` re-write must restore mode 0o600
+    /// even when the pre-existing file was wider.
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_key_file_force_resets_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("k");
+        // Pre-seed the file with deliberately wide perms (0o644).
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        write_secret_key_file(&path, b"new", true).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected force-write to chmod 0600, got 0o{mode:o}");
+    }
+
+    /// review 2026-05-19 #15 — `run-validator` must reject a config whose
+    /// declared `validator_address` doesn't match the keystore-derived
+    /// address, with an error message naming both addresses.
+    #[test]
+    fn load_validator_run_config_rejects_address_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let chain_dir = home.join("chain");
+        let keystore = chain_dir.join("keystore");
+        std::fs::create_dir_all(&keystore).unwrap();
+
+        // Real key — derive its address (the "truthful" one).
+        let (sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
+        let derived = bloom_chain_types::types::Address::from_pubkey_bytes(&pk.0);
+        let key_path = keystore.join("validator.xdsa");
+        std::fs::write(&key_path, sk.to_bytes().as_slice()).unwrap();
+
+        // Declare a *different* validator_address (all-0x11) in config.toml.
+        let bogus = bloom_chain_types::types::Address([0x11u8; 32]);
+        let config = bloom_chain_node::NodeConfig {
+            validator_address: hex::encode(bogus.0),
+            listen_addr: "127.0.0.1:0".into(),
+            rpc_tcp_addr: None,
+            genesis_path: None,
+            log_level: Some("warn".into()),
+            fuel_limit: Some(30_000_000),
+            wasmtime_version: Some("test".into()),
+        };
+        let config_path = chain_dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            toml::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+        write_minimal_genesis(&chain_dir.join("genesis.toml"), "bloomchain.test");
+
+        let err = match load_validator_run_config(home, &chain_dir, &config_path) {
+            Ok(_) => panic!("mismatch must be rejected"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("validator_address mismatch"),
+            "expected mismatch error, got: {msg}"
+        );
+        assert!(
+            msg.contains(&hex::encode(bogus.0)),
+            "error must name declared address: {msg}"
+        );
+        assert!(
+            msg.contains(&hex::encode(derived.0)),
+            "error must name derived address: {msg}"
+        );
+        assert!(
+            msg.contains(&key_path.display().to_string()),
+            "error must name keystore path: {msg}"
+        );
+    }
+
+    /// review 2026-05-19 #15 — a config that *does* match the keystore
+    /// derivation passes the reconciliation check.
+    #[test]
+    fn load_validator_run_config_accepts_matching_address() {
+        use base64::Engine as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let chain_dir = home.join("chain");
+        let keystore = chain_dir.join("keystore");
+        std::fs::create_dir_all(&keystore).unwrap();
+
+        let (sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
+        let derived = bloom_chain_types::types::Address::from_pubkey_bytes(&pk.0);
+        let key_path = keystore.join("validator.xdsa");
+        std::fs::write(&key_path, sk.to_bytes().as_slice()).unwrap();
+
+        let config = bloom_chain_node::NodeConfig {
+            validator_address: hex::encode(derived.0),
+            listen_addr: "127.0.0.1:0".into(),
+            rpc_tcp_addr: None,
+            genesis_path: None,
+            log_level: Some("warn".into()),
+            fuel_limit: Some(30_000_000),
+            wasmtime_version: Some("test".into()),
+        };
+        let config_path = chain_dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            toml::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+        // Genesis must list the local validator so `Genesis::from_file`
+        // doesn't reject "empty validator set".
+        let pk_b64 = base64::engine::general_purpose::STANDARD.encode(&pk.0);
+        let genesis = format!(
+            r#"chain_id = "bloomchain.test"
+genesis_time_ms = 1747526400000
+allocations = []
+
+[[validators]]
+address = "{}"
+pubkey = "{}"
+voting_power = 100
+host = "127.0.0.1:26656"
+"#,
+            hex::encode(derived.0),
+            pk_b64
+        );
+        std::fs::write(&chain_dir.join("genesis.toml"), genesis).unwrap();
+
+        let (loaded_cfg, run_cfg) =
+            load_validator_run_config(home, &chain_dir, &config_path)
+                .expect("matching config should load");
+        assert_eq!(loaded_cfg.validator_address, hex::encode(derived.0));
+        assert_eq!(run_cfg.validator_address, derived);
+    }
 }

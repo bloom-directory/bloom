@@ -56,6 +56,11 @@ use crate::{
 pub struct NodeRunConfig {
     pub chain_id: String,
     pub validator_address: Address,
+    /// The validator's xDSA secret key, used to sign outbound Vote / Proposal
+    /// messages. Must correspond to the pubkey listed for `validator_address`
+    /// in the genesis validator set, or peers will reject our messages as
+    /// forgeries.
+    pub validator_secret_key: Arc<bloom_keystore::xdsa::XdsaSecretKey>,
     pub genesis: Genesis,
     pub listen_addr: String,
     /// Optional JSON-RPC TCP listener (`host:port`). When `Some`, the node
@@ -118,21 +123,31 @@ impl Node {
             cfg.genesis.apply_to_state(&mut state);
         } else {
             // TODO(v1): reload full state from last state blob.
-            // For v0 scaffolding, we rebuild from genesis and replay committed
-            // blocks.  This is acceptable for small networks.
+            // For v0 we rebuild from genesis and re-execute every committed
+            // block. Master replayed only the proposer LOOM emission and
+            // dropped every tx effect (deploys, transfers, storage writes,
+            // fees, refunds, receipt-derivable state) — a validator that
+            // restarted at height N silently lost all of state H ∈ [1, N]
+            // except the cumulative block-emission balance, then diverged
+            // from peers on the next state_root (review 2026-05-19 #4).
+            //
+            // Replay reuses the exact same state-transition path as live
+            // apply (`apply_block_state_transitions`), so the rebuilt state
+            // is byte-identical to a node that never restarted.
             info!(height = ?latest_height, "node.startup: rebuilding state from genesis+blocks");
             cfg.genesis.apply_to_state(&mut state);
             if let Some(top) = latest_height {
+                let replay_executor = crate::petal_executor::ChainPetalExecutor;
                 for h in 1..=top {
                     if let Some(block) = block_store.get(h).context("replay block")? {
-                        // Simplified replay: just apply emission to proposer.
-                        // Full re-execution is handled by the consensus driver.
-                        let proposer = block.header.proposer;
-                        let mut prop = state.get_account(&proposer).unwrap_or_else(|| {
-                            crate::consensus_driver::empty_account()
-                        });
-                        prop.loom += BLOCK_EMISSION;
-                        state.set_account(proposer, prop);
+                        let (fuel_used, _receipts) =
+                            crate::consensus_driver::apply_block_state_transitions(
+                                &mut state,
+                                &replay_executor,
+                                &block,
+                                BLOCK_EMISSION,
+                            );
+                        debug!(height = h, txs = block.txs.len(), fuel_used, "node.startup.replayed_block");
                     }
                 }
             }
@@ -218,6 +233,13 @@ impl Node {
                 }
             });
 
+        // Build the xDSA signer from the validator secret key. Without this,
+        // every outbound Vote/Proposal would carry an empty `sig` and peers
+        // running the post-2026-05-19 ingress check would drop them all.
+        let signer: Arc<dyn bloom_chain_consensus::signer::Signer> =
+            Arc::new(crate::consensus_driver::XdsaSigner::new(Arc::clone(
+                &cfg.validator_secret_key,
+            )));
         let engine: ConsensusEngine<XdsaVerifier> = ConsensusEngine::new(
             starting_height,
             local_address,
@@ -225,6 +247,7 @@ impl Node {
             XdsaVerifier::default(),
             Some(block_builder),
             fuel_limit_cfg,
+            Some(signer),
         );
 
         // ── 4. Channels ───────────────────────────────────────────────────────
@@ -343,6 +366,31 @@ impl Node {
                 match frame {
                     Frame::Proposal(p) => {
                         debug!(peer = %peer_addr, height = p.height, round = p.round, "frame.proposal recv");
+                        // Authentication boundary (review 2026-05-19 #1):
+                        // every Proposal must be xDSA-verified against the
+                        // proposer's pubkey in the validator set BEFORE it
+                        // enters the state machine. Unverified messages would
+                        // let a peer forge proposals from any validator.
+                        //
+                        // Snapshot the validator set out of the engine guard
+                        // before verifying — xDSA verify is the slow path and
+                        // must not block engine progress on every inbound msg.
+                        let validator_set =
+                            { driver_ev.engine.lock().validator_set.clone() };
+                        if !bloom_chain_consensus::auth::verify_proposal_sig(
+                            &p,
+                            &validator_set,
+                            &crate::consensus_driver::XdsaVerifier,
+                        ) {
+                            warn!(
+                                peer = %peer_addr,
+                                height = p.height,
+                                round = p.round,
+                                proposer = ?p.proposer,
+                                "frame.proposal rejected: invalid signature"
+                            );
+                            continue;
+                        }
                         let my_height = { driver_ev.engine.lock().height() };
                         if p.height > my_height {
                             // We're behind. Ask this peer for the gap.
@@ -374,6 +422,32 @@ impl Node {
                     }
                     Frame::Vote(v) => {
                         debug!(peer = %peer_addr, height = v.height, round = v.round, kind = ?v.kind, "frame.vote recv");
+                        // Authentication boundary (review 2026-05-19 #1):
+                        // every Vote (prevote and precommit) must be
+                        // xDSA-verified against the voter's pubkey in the
+                        // validator set BEFORE it enters the state machine.
+                        // Forged votes otherwise count toward quorum totals.
+                        //
+                        // Snapshot the validator set out of the engine guard
+                        // before verifying — xDSA verify is the slow path and
+                        // must not block engine progress on every inbound msg.
+                        let validator_set =
+                            { driver_ev.engine.lock().validator_set.clone() };
+                        if !bloom_chain_consensus::auth::verify_vote_sig(
+                            &v,
+                            &validator_set,
+                            &crate::consensus_driver::XdsaVerifier,
+                        ) {
+                            warn!(
+                                peer = %peer_addr,
+                                height = v.height,
+                                round = v.round,
+                                kind = ?v.kind,
+                                validator = ?v.validator,
+                                "frame.vote rejected: invalid signature"
+                            );
+                            continue;
+                        }
                         let my_height = { driver_ev.engine.lock().height() };
                         if v.height > my_height {
                             // We're behind. Ask this peer for the gap.
@@ -453,6 +527,22 @@ impl Node {
                         // before us seeing precommits).
                         let block_height = block.header.height;
                         { driver_ev.engine.lock().register_block(block.clone()); }
+                        // If we stashed a proposal earlier because its block
+                        // was unknown (review 2026-05-19 #3 gate), now that
+                        // the block is registered the state machine can
+                        // resume — emit prevote + arm Prevote timeout.
+                        let resume_actions = {
+                            driver_ev.engine.lock().try_resume_pending_proposal()
+                        };
+                        if !resume_actions.is_empty() {
+                            process_actions(
+                                Arc::clone(&driver_ev),
+                                Arc::clone(&peer_pool_ev),
+                                Arc::clone(&timeout_tx_ev),
+                                resume_actions,
+                            )
+                            .await;
+                        }
                         // If we received a block ahead of our current height,
                         // re-request the single block we're actually waiting
                         // for. Without this, a BlockResponse for height H+5
@@ -480,7 +570,22 @@ impl Node {
                         // glitch, restart, slow start) can never re-join the
                         // network — there's no other mechanism that drives a
                         // behind validator forward.
+                        //
+                        // Only attempt catch-up if the block carries a real
+                        // commit. The proposer's *initial* block dissemination
+                        // is broadcast via `Frame::BlockResponse` BEFORE its
+                        // commit is built — at that point `block.commit.votes`
+                        // is empty, validation correctly rejects it, and the
+                        // normal consensus path (Proposal + Votes) is what
+                        // drives state forward. Skipping silently keeps the
+                        // log clean and avoids noisy "sync.apply_block failed"
+                        // entries on the happy path.
+                        let has_commit = !block.commit.votes.is_empty()
+                            && block.commit.height == block.header.height;
                         loop {
+                            if !has_commit {
+                                break;
+                            }
                             let my_height = { driver_ev.engine.lock().height() };
                             if block_height != my_height {
                                 break;
@@ -700,16 +805,27 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                         }
                     }
                 }
-                Action::Commit(block, _commit) => {
+                Action::Commit(block, commit) => {
                     let height = block.header.height;
-                    if let Err(e) = driver.apply_block(&block) {
+                    // Fold the freshly-built Commit (the 2f+1 precommits
+                    // that finalised this block) into the block itself
+                    // before applying. The state machine builds the
+                    // Commit at quorum time, but the proposer-built
+                    // block carries an empty commit field — without
+                    // this fold, the validation boundary would reject
+                    // every block for missing quorum, and peers that
+                    // later sync from us would receive uncommitted
+                    // blocks (review 2026-05-19 #2).
+                    let mut block_with_commit = (*block).clone();
+                    block_with_commit.commit = commit;
+                    if let Err(e) = driver.apply_block(&block_with_commit) {
                         error!(err = %e, height, "apply_block failed");
                         continue;
                     }
                     // Drop the just-committed txs from the in-memory mempool
                     // so they aren't re-selected on the next block.
                     {
-                        driver.engine.lock().mempool.remove_included(&block.txs);
+                        driver.engine.lock().mempool.remove_included(&block_with_commit.txs);
                     }
                     // Schedule the next height after TIMEOUT_COMMIT.  This
                     // enforces the 1s block cadence: without it, healthy

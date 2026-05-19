@@ -54,6 +54,37 @@ impl BlockStore {
         }
     }
 
+    /// Retrieve a block by its `header.block_hash()`.  Returns `None` if no
+    /// block in the store matches.
+    ///
+    /// v0 walks the on-disk window (≤ 512 blocks) instead of maintaining a
+    /// dedicated hash → height index — at this size a linear scan is
+    /// cheaper than the durability story for a separate index. If the
+    /// retention window grows, this should become an LRU-backed index.
+    pub fn get_by_hash(
+        &self,
+        block_hash: &bloom_chain_types::types::Hash32,
+    ) -> Result<Option<Block>> {
+        for entry in std::fs::read_dir(&self.root)
+            .with_context(|| format!("read block store dir: {}", self.root.display()))?
+        {
+            let entry = entry?;
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            let Ok(height) = name.parse::<u64>() else {
+                continue;
+            };
+            // Re-use `get` so SSZ decode failures surface with the height.
+            if let Some(block) = self.get(height)? {
+                if &block.header.block_hash() == block_hash {
+                    return Ok(Some(block));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Return the latest stored height, or `None` if the store is empty.
     pub fn latest_height(&self) -> Result<Option<u64>> {
         let mut max: Option<u64> = None;

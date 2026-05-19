@@ -178,6 +178,19 @@ pub struct ConsensusState {
     /// The proposal received for the current round, if any.
     pub proposal: Option<Proposal>,
 
+    /// A proposal that was received but whose block body is not yet present
+    /// in the engine's `blocks` map. Stored so the node can re-attempt
+    /// prevoting once `BlockResponse` (or any other source) supplies the
+    /// missing body. Cleared on round/height transitions and on successful
+    /// dispatch.
+    ///
+    /// Without this cache, the unknown-block proposal gate at [`on_proposal`]
+    /// silently drops the proposal — if the proposer's initial block
+    /// broadcast was received out-of-order with the proposal frame, the
+    /// validator stalls until the next round, even though the block arrived
+    /// moments later.
+    pub pending_proposal: Option<Proposal>,
+
     /// Prevote tallies: round → VoteTally.
     pub prevotes: BTreeMap<u32, VoteTally>,
     /// Precommit tallies: round → VoteTally.
@@ -210,6 +223,7 @@ impl ConsensusState {
             locked_block: None,
             valid_block: None,
             proposal: None,
+            pending_proposal: None,
             prevotes: BTreeMap::new(),
             precommits: BTreeMap::new(),
             all_precommit_votes: BTreeMap::new(),
@@ -240,11 +254,41 @@ impl ConsensusState {
         self.locked_block = None;
         self.valid_block = None;
         self.proposal = None;
+        self.pending_proposal = None;
         self.prevotes.clear();
         self.precommits.clear();
         self.all_precommit_votes.clear();
         self.committed_block = None;
         vec![Action::StartTimeout(TimeoutKind::Propose, TIMEOUT)]
+    }
+
+    /// If a proposal was previously stashed because its block was unknown,
+    /// and the block is now in `blocks`, re-run `on_proposal` against it.
+    /// Returns any actions emitted by the resumed handler — typically a
+    /// prevote broadcast and a Prevote timeout. Returns an empty vec if
+    /// there is no pending proposal or the block is still missing.
+    ///
+    /// Called by the node after a `Frame::BlockResponse` registers a new
+    /// block. Without this, a validator that received a proposal frame
+    /// before the matching block frame would silently drop the proposal
+    /// and stall its consensus round.
+    pub fn try_resume_pending_proposal(
+        &mut self,
+        blocks: &BTreeMap<Hash32, Block>,
+    ) -> Vec<Action> {
+        let Some(p) = self.pending_proposal.as_ref() else {
+            return vec![];
+        };
+        // Stale across height/round/step transitions — drop.
+        if p.height != self.height || p.round != self.round || self.step != Step::Propose {
+            self.pending_proposal = None;
+            return vec![];
+        }
+        if !blocks.contains_key(&p.block_hash) {
+            return vec![];
+        }
+        let p = self.pending_proposal.take().unwrap();
+        self.on_proposal(p, blocks)
     }
 
     // ---------------------------------------------------------------------------
@@ -304,7 +348,7 @@ impl ConsensusState {
     // Proposal handler
     // ---------------------------------------------------------------------------
 
-    fn on_proposal(&mut self, p: Proposal, _blocks: &BTreeMap<Hash32, Block>) -> Vec<Action> {
+    fn on_proposal(&mut self, p: Proposal, blocks: &BTreeMap<Hash32, Block>) -> Vec<Action> {
         if p.height != self.height || p.round != self.round {
             return vec![];
         }
@@ -316,6 +360,18 @@ impl ConsensusState {
         if p.proposer != expected_proposer.address {
             return vec![];
         }
+        // Refuse to prevote a block we have not yet seen. Stash the proposal
+        // so the node can replay it once `BlockResponse` (or any other
+        // source) registers the missing body — see
+        // [`try_resume_pending_proposal`]. Prevoting on an unknown hash
+        // makes us attest to a body we have not validated — exactly the
+        // surface the 2026-05-19 review flagged at state_machine.rs:307.
+        if !blocks.contains_key(&p.block_hash) {
+            self.pending_proposal = Some(p);
+            return vec![];
+        }
+        // Block is here — clear any stale pending entry for this round.
+        self.pending_proposal = None;
 
         self.proposal = Some(p.clone());
         self.step = Step::Prevote;

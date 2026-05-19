@@ -61,9 +61,12 @@ impl PetalExecutor for ChainPetalExecutor {
         block_number: u64,
         timestamp_ms: u64,
         _proposer: Address,
+        parent_hash: Hash32,
     ) -> ExecOutput {
-        // TODO: thread real parent_hash through the executor signature.
-        let parent_hash = Hash32([0u8; 32]);
+        // `parent_hash` is the committing block's parent block hash —
+        // surfaced to chain-mode petals as `chain::block.prevhash`
+        // (review 2026-05-19 #13). Threaded in by
+        // `apply_block_state_transitions` from `block.header.parent_hash`.
         let block_ctx = PetalBlockCtx { number: block_number, timestamp_ms, prevhash: parent_hash };
 
         match &tx.kind {

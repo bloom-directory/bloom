@@ -5,6 +5,7 @@
 //! live in `bloom-chain-node`.  It produces `Action`s; someone else delivers them.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use bloom_chain_types::{
     block::Block,
@@ -15,7 +16,8 @@ use bloom_chain_types::{
 use crate::{
     error::ConsensusError,
     mempool::Mempool,
-    state_machine::{Action, ConsensusState, Event},
+    signer::Signer,
+    state_machine::{Action, ConsensusState, Event, ProposalOrVote},
     validator_set::ValidatorSet,
     verifier::SigVerifier,
 };
@@ -46,6 +48,10 @@ pub struct ConsensusEngine<V: SigVerifier> {
     block_builder: Option<BlockBuilder<V>>,
     /// Block fuel limit (passed to the block builder).
     fuel_limit: u64,
+    /// Optional signer for outbound Vote/Proposal messages. When `None`,
+    /// emitted messages keep the empty `sig` produced by the state machine
+    /// (test-only path; the production node always supplies one).
+    signer: Option<Arc<dyn Signer>>,
 }
 
 impl<V: SigVerifier> ConsensusEngine<V> {
@@ -64,6 +70,7 @@ impl<V: SigVerifier> ConsensusEngine<V> {
         verifier: V,
         block_builder: Option<BlockBuilder<V>>,
         fuel_limit: u64,
+        signer: Option<Arc<dyn Signer>>,
     ) -> Self {
         let state = ConsensusState::new(height, local_address, validator_set.clone());
         let mempool = Mempool::new(verifier);
@@ -75,6 +82,7 @@ impl<V: SigVerifier> ConsensusEngine<V> {
             blocks: BTreeMap::new(),
             block_builder,
             fuel_limit,
+            signer,
         }
     }
 
@@ -91,7 +99,37 @@ impl<V: SigVerifier> ConsensusEngine<V> {
         // they want to advance past the propose timeout.  However, if the caller
         // wants the engine to immediately produce a proposal (e.g. happy path),
         // they should call `maybe_propose()` separately.
-        self.state.handle(event, &self.blocks)
+        let mut actions = self.state.handle(event, &self.blocks);
+        self.sign_actions(&mut actions);
+        actions
+    }
+
+    /// Walk `actions` and sign any outbound Vote / Proposal using the configured
+    /// [`Signer`]. No-op if no signer is configured (test path).
+    ///
+    /// This is the only place outbound consensus messages acquire a signature.
+    /// Keeping it inside the engine guarantees that every action that leaves
+    /// the engine — whether via `step`, `maybe_propose`, or `enter_next_height`
+    /// — is already signed, so the broadcast path in the node cannot
+    /// accidentally emit an unsigned message.
+    fn sign_actions(&self, actions: &mut [Action]) {
+        let Some(signer) = self.signer.as_ref() else {
+            return;
+        };
+        for action in actions.iter_mut() {
+            if let Action::Broadcast(pov) = action {
+                match pov {
+                    ProposalOrVote::Vote(v) => {
+                        let digest = v.signing_digest();
+                        v.sig = signer.sign(&digest.0);
+                    }
+                    ProposalOrVote::Proposal(p) => {
+                        let digest = p.signing_digest();
+                        p.sig = signer.sign(&digest.0);
+                    }
+                }
+            }
+        }
     }
 
     /// If this validator is the proposer for the current (height, round),
@@ -109,7 +147,7 @@ impl<V: SigVerifier> ConsensusEngine<V> {
         self.blocks.insert(hash, block.clone());
 
         use bloom_chain_types::vote::Proposal;
-        let proposal = Proposal {
+        let mut proposal = Proposal {
             height,
             round: self.state.round,
             block_hash: hash,
@@ -117,7 +155,11 @@ impl<V: SigVerifier> ConsensusEngine<V> {
             proposer: self.local_address,
             sig: bloom_chain_types::types::SigBytes(vec![]),
         };
-        Some(Action::Broadcast(crate::state_machine::ProposalOrVote::Proposal(proposal)))
+        if let Some(signer) = self.signer.as_ref() {
+            let digest = proposal.signing_digest();
+            proposal.sig = signer.sign(&digest.0);
+        }
+        Some(Action::Broadcast(ProposalOrVote::Proposal(proposal)))
     }
 
     /// Register a block so the state machine can commit it when 2f+1 precommits arrive.
@@ -126,18 +168,43 @@ impl<V: SigVerifier> ConsensusEngine<V> {
         self.blocks.insert(hash, block);
     }
 
+    /// Re-attempt a previously-stashed proposal whose block has now arrived.
+    /// See [`crate::state_machine::ConsensusState::try_resume_pending_proposal`].
+    /// Returns the actions emitted by the state machine (signed in-place).
+    pub fn try_resume_pending_proposal(&mut self) -> Vec<Action> {
+        let mut actions = self.state.try_resume_pending_proposal(&self.blocks);
+        self.sign_actions(&mut actions);
+        actions
+    }
+
     /// Look up a registered block by hash.
     pub fn get_registered_block(&self, hash: &Hash32) -> Option<Block> {
         self.blocks.get(hash).cloned()
     }
 
-    /// Reset the engine to begin consensus at `new_height`.  Clears the known
-    /// blocks map and delegates per-height state reset to `ConsensusState`.
+    /// Reset the engine to begin consensus at `new_height`.  Prunes only the
+    /// blocks for heights strictly below `new_height` from the known-blocks
+    /// map and delegates per-height state reset to `ConsensusState`.
     /// Returns the actions emitted by the state machine (a `StartTimeout` for
     /// the Propose step).
+    ///
+    /// Critical: blocks for `new_height` and beyond MUST be preserved. The
+    /// proposer broadcasts the body for height N+1 right before its
+    /// Proposal frame; with 1s blocks and async networking, that body can
+    /// land at peers while they're still finalising height N. Clearing the
+    /// whole map at the height boundary would lose those bodies — and the
+    /// review #3 unknown-block gate (state_machine::on_proposal) would then
+    /// silently stash the matching proposal forever, stalling consensus
+    /// until a round timeout fires nil-prevote, repeatedly. This was the
+    /// failure mode reproduced by the four-validator smoke test where a
+    /// single trailing validator fell behind at height ~3 and never
+    /// recovered.
     pub fn enter_next_height(&mut self, new_height: u64) -> Vec<Action> {
-        self.blocks.clear();
-        self.state.enter_next_height(new_height)
+        self.blocks
+            .retain(|_, b| b.header.height >= new_height);
+        let mut actions = self.state.enter_next_height(new_height);
+        self.sign_actions(&mut actions);
+        actions
     }
 
     /// Admit a transaction into the mempool.

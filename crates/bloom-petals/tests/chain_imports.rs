@@ -178,14 +178,14 @@ const REVERT_WITH_REASON: &str = r#"
 #[test]
 fn petal_revert_reason_byte_exact_match() {
     let input = make_input(wat(REVERT_WITH_REASON), ChainEntry::Call);
-    // petal.revert causes run_chain_call to return Err(ChainCall(...))
-    let err = run(input).unwrap_err();
-    match err {
-        PetalError::ChainCall(reason) => {
-            assert_eq!(reason, "oops!", "revert reason should match exactly");
-        }
-        other => panic!("expected ChainCall error, got {other:?}"),
-    }
+    // After review #12: revert is surfaced as a successful `ChainCallOutput`
+    // with `revert_reason: Some(bytes)`. `Err` is reserved for genuine
+    // traps / out-of-fuel / engine errors. The executor decides whether to
+    // commit the snapshot (it doesn't, for reverts).
+    let out = run(input).expect("revert must surface as Ok with revert_reason set");
+    let reason = out.revert_reason.expect("revert must populate revert_reason");
+    assert_eq!(reason, b"oops!".to_vec(), "revert reason should match exactly");
+    assert!(out.return_data.is_none(), "revert path should not also set return_data");
 }
 
 // ---------------------------------------------------------------------------
@@ -322,17 +322,11 @@ fn validate_chain_wasm_accepts_valid_module() {
 
 const MSG_VALUE_RETURN: &str = r#"
 (module
-  (import "chain" "msg.value"    (func $mv  (result i64 i64)))
+  (import "chain" "msg.value"    (func $mv  (param i32)))
   (import "chain" "petal.return" (func $ret (param i32 i32)))
   (memory (export "memory") 1)
   (func (export "call") (param i32 i32) (result i32)
-    (local $lo i64)
-    (local $hi i64)
-    (call $mv)
-    local.set $hi
-    local.set $lo
-    (i64.store (i32.const 0) (local.get $lo))
-    (i64.store (i32.const 8) (local.get $hi))
+    (call $mv (i32.const 0))
     (call $ret (i32.const 0) (i32.const 16))
     i32.const 0)
 )
@@ -340,17 +334,14 @@ const MSG_VALUE_RETURN: &str = r#"
 
 #[test]
 fn msg_value_lo_hi_correct() {
-    // Value = 0xDEAD_BEEF_CAFE_0000_1111_2222_3333_4444
     let value: u128 = 0xDEAD_BEEF_CAFE_0000_1111_2222_3333_4444;
     let mut input = make_input(wat(MSG_VALUE_RETURN), ChainEntry::Call);
     input.msg_value = value;
     let out = run(input).unwrap();
     let data = out.return_data.unwrap();
     assert_eq!(data.len(), 16);
-    let lo = i64::from_le_bytes(data[0..8].try_into().unwrap()) as u128;
-    let hi = i64::from_le_bytes(data[8..16].try_into().unwrap()) as u128;
-    let reconstructed = (hi << 64) | (lo & 0xFFFF_FFFF_FFFF_FFFF);
-    assert_eq!(reconstructed, value, "reconstructed value should match original");
+    let reconstructed = u128::from_le_bytes(data.as_slice().try_into().unwrap());
+    assert_eq!(reconstructed, value, "16-byte LE u128 must round-trip");
 }
 
 // ---------------------------------------------------------------------------
@@ -717,4 +708,125 @@ fn block_prevhash_is_exposed() {
     input.block.prevhash = prevhash;
     let out = run(input).unwrap();
     assert_eq!(out.return_data, Some(prevhash.0.to_vec()));
+}
+
+// ---------------------------------------------------------------------------
+// Test 19 (review #14): staged code is visible to `petal.call` within the
+// same tx — specifically, an `init` function whose body invokes `petal.call`
+// against its own freshly-staged address must succeed.
+//
+// On master, `StateSnapshot::get_code` only read from the committed base
+// state, so the self-call from init would fail with `code not found` even
+// though the code had been staged moments earlier via `snapshot.insert_code`.
+//
+// This test mirrors the lifecycle that `ChainPetalExecutor::execute_tx` runs
+// for a `TxKind::Deploy`:
+//   1. Stage the wasm via `snapshot.insert_code`.
+//   2. Stage the new account with `code_hash = petal_hash`.
+//   3. Invoke `init` against that snapshot.
+// Inside init, the petal performs `petal.call(self_addr)`, which forces the
+// chain VM to resolve the callee's wasm via `snapshot.get_code`.
+//
+// `init` reads its own address from calldata (calldata = self_addr || magic).
+// The `call` body returns a 4-byte magic value via `petal.return`.
+// `init` then propagates that 4-byte payload up to the test via `petal.return`.
+// ---------------------------------------------------------------------------
+
+const SELF_CALL_FROM_INIT: &str = r#"
+(module
+  (import "chain" "msg.calldata.read" (func $cdread (param i32 i32 i32) (result i32)))
+  (import "chain" "petal.call"        (func $call (param i32 i32 i32 i32 i64 i64 i32 i32) (result i64)))
+  (import "chain" "petal.return"      (func $ret (param i32 i32)))
+  (memory (export "memory") 1)
+  ;; layout:
+  ;;   0..32   = self address (read from calldata offset 0)
+  ;;   32..36  = retdata buffer for sub-call
+  ;;   64..68  = magic value the `call` entry returns
+  (data (i32.const 64) "\de\ad\be\ef")
+  (func (export "init") (param i32 i32) (result i32)
+    (local $rc i64)
+    ;; Read 32 bytes of self-address from calldata into memory[0..32].
+    (drop (call $cdread (i32.const 0) (i32.const 0) (i32.const 32)))
+    ;; petal.call(self_addr, no calldata, value=0, retdata buf at 32, max 4).
+    (local.set $rc
+      (call $call
+        (i32.const 0)  (i32.const 32)   ;; target_ptr, target_len
+        (i32.const 0)  (i32.const 0)    ;; calldata_ptr, calldata_len
+        (i64.const 0)  (i64.const 0)    ;; value lo/hi
+        (i32.const 32) (i32.const 4)    ;; retdata buf, max 4
+      ))
+    ;; If the call returned negative, propagate that as the revert path —
+    ;; we want the test to see the failure clearly, but petal.call only
+    ;; returns an i64 — convert to bytes and return them so the test can
+    ;; inspect the code on failure.
+    (i64.store (i32.const 80) (local.get $rc))
+    ;; Return the 4 bytes the sub-call wrote into memory[32..36].
+    (call $ret (i32.const 32) (i32.const 4))
+    i32.const 0)
+  (func (export "call") (param i32 i32) (result i32)
+    ;; Return the 4-byte magic from memory[64..68].
+    (call $ret (i32.const 64) (i32.const 4))
+    i32.const 0)
+)
+"#;
+
+#[test]
+fn init_can_self_call_staged_code() {
+    let wasm = wat(SELF_CALL_FROM_INIT);
+
+    // Compute the petal hash the chain VM will assign to this wasm.
+    let petal_hash = blake3_tagged(tags::PETAL, &wasm);
+
+    // The "deploy address" — for this isolated test we pick an arbitrary
+    // address; in the real flow it'd come from §7.7. We then mirror the
+    // deploy executor's snapshot-staging steps.
+    let self_addr = make_address(0x42);
+
+    let state = State::new();
+    let mut snap = state.snapshot();
+
+    // Stage the code in the snapshot (mirrors `snap.insert_code` in
+    // ChainPetalExecutor::execute_tx for TxKind::Deploy).
+    let staged_hash = snap.insert_code(wasm.clone());
+    assert_eq!(staged_hash, petal_hash, "hash formula must match VM expectation");
+
+    // Stage the account so the sub-call can resolve `code_hash` from the
+    // snapshot (mirrors `snap.set_account(addr, acct {code_hash:..})`).
+    let acct = Account {
+        nonce: 0,
+        loom: 0,
+        code_hash: Some(petal_hash),
+        storage_root: Hash32([0u8; 32]),
+    };
+    snap.set_account(self_addr, acct);
+
+    // Pre-fix sanity: the staged code MUST be visible to get_code, otherwise
+    // the inner petal.call will trap with "code not found".
+    assert!(
+        snap.get_code(&petal_hash).is_some(),
+        "regression: staged code must be visible to snapshot.get_code (review #14)"
+    );
+
+    // Run init against the staged snapshot — exactly like the deploy executor.
+    let input = ChainCallInput {
+        wasm,
+        entry: ChainEntry::Init,
+        contract_address: self_addr,
+        msg_sender: make_address(0x02),
+        msg_value: 0,
+        // calldata = self address, so init can pass it to petal.call.
+        calldata: self_addr.0.to_vec(),
+        block: default_block(),
+        fuel: 50_000_000,
+        snapshot: snap,
+    };
+
+    let out = run(input).unwrap_or_else(|e| panic!("init self-call must succeed; got {e:?}"));
+    // init propagated the sub-call's return data (4 magic bytes from `call`).
+    assert_eq!(
+        out.return_data,
+        Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        "init must receive the magic bytes from its self-call's `call` return"
+    );
+    assert!(out.revert_reason.is_none(), "no revert expected");
 }

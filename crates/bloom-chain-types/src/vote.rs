@@ -178,6 +178,32 @@ pub struct Proposal {
     pub sig: SigBytes,
 }
 
+impl Proposal {
+    /// Returns the signing digest for this proposal (spec §9):
+    /// `blake3("bloom-chain.v0.proposal:" || ssz_encode(proposal_without_sig))`
+    pub fn signing_digest(&self) -> Hash32 {
+        let mut buf = Vec::new();
+        encode_proposal_presig(self, &mut buf);
+        blake3_tagged(tags::PROPOSAL, &buf)
+    }
+}
+
+/// Encode the pre-signature portion of a Proposal (all fields except `sig`).
+fn encode_proposal_presig(proposal: &Proposal, buf: &mut Vec<u8>) {
+    // Fields: height (8) + round (4) + block_hash (32) + pol_round (4) + proposer (32).
+    // All fixed-length, so encode flat (no offsets needed).
+    let fixed_len = 8 + 4 + 32 + 4 + 32usize;
+    let mut enc = SszEncoder::container(buf, fixed_len);
+    enc.append(&proposal.height);
+    enc.append(&proposal.round);
+    enc.append(&proposal.block_hash);
+    enc.append_parameterized(true, |b| {
+        b.extend_from_slice(&proposal.pol_round.to_le_bytes());
+    });
+    enc.append(&proposal.proposer);
+    enc.finalize();
+}
+
 impl Encode for Proposal {
     fn is_ssz_fixed_len() -> bool {
         false

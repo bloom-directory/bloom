@@ -2047,6 +2047,7 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
+ "wat",
  "zbase32",
 ]
 
@@ -2299,6 +2300,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "blake3",
+ "bloom-chain-types",
  "bloom-proto",
  "chacha20poly1305",
  "ed25519-dalek",

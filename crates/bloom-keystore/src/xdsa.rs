@@ -312,20 +312,17 @@ impl XdsaSignature {
 
 // ─── address derivation ───────────────────────────────────────────────────────
 
-/// Address-derivation domain tag for bloom-chain accounts (spec §4.3).
-const ADDR_DOMAIN: &[u8] = b"addr:account:";
-
 /// Derive a 32-byte bloom-chain address from an xDSA composite public key.
 ///
-/// `address = blake3("addr:account:" || pubkey_bytes)[..32]`
+/// Delegates to [`bloom_chain_types::types::Address::from_pubkey_bytes`], which
+/// is the single canonical implementation of spec §4.3:
+/// `address = BLAKE3("bloom-chain.v0.addr:" || pk_composite)`.
 ///
-/// This matches chain spec §4.3 and the existing fingerprint pattern in the
-/// prior-art memo §1.
+/// Previously this used an `addr:account:` domain tag, which silently disagreed
+/// with the chain-side derivation and made wallet addresses invalid as tx
+/// senders.
 pub fn derive_address(pk: &XdsaPublicKey) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(ADDR_DOMAIN);
-    hasher.update(&pk.0);
-    *hasher.finalize().as_bytes()
+    bloom_chain_types::types::Address::from_pubkey_bytes(&pk.0).0
 }
 
 #[cfg(test)]
@@ -440,6 +437,41 @@ mod tests {
         let (_, pk1) = XdsaSecretKey::generate();
         let (_, pk2) = XdsaSecretKey::generate();
         assert_ne!(derive_address(&pk1), derive_address(&pk2));
+    }
+
+    /// Regression for the 2026-05-19 review (#10): wallet-side and chain-side
+    /// address derivation must agree on a single canonical domain tag.
+    ///
+    /// Pre-fix, `derive_address` used `b"addr:account:"`, while the chain
+    /// (`bloom-chain-node::consensus_driver::apply_block` sender check, and the
+    /// spec at §4.3) used `b"bloom-chain.v0.addr:"`. The mismatch meant every
+    /// keystore-created wallet had an address that the chain rejected with
+    /// `sender mismatch`, even though both sides looked correct in isolation.
+    ///
+    /// This test will fail on master, where the two derivations disagree.
+    #[test]
+    fn keystore_address_matches_chain_canonical_derivation() {
+        let (_, pk) = XdsaSecretKey::generate();
+        let keystore_addr = derive_address(&pk);
+        let chain_addr =
+            bloom_chain_types::types::Address::from_pubkey_bytes(&pk.0).0;
+        assert_eq!(
+            keystore_addr, chain_addr,
+            "wallet derive_address() and Address::from_pubkey_bytes() must \
+             agree — drift between them silently makes wallets invalid as tx \
+             senders"
+        );
+
+        // Pin the canonical tag explicitly so any future drift trips this
+        // test, not a downstream consensus regression.
+        let mut h = blake3::Hasher::new();
+        h.update(b"bloom-chain.v0.addr:");
+        h.update(&pk.0);
+        let expected = *h.finalize().as_bytes();
+        assert_eq!(
+            keystore_addr, expected,
+            "canonical domain tag is `bloom-chain.v0.addr:` per spec §4.3"
+        );
     }
 
     // ── error path: bad lengths ───────────────────────────────────────────────

@@ -273,25 +273,46 @@ impl RpcServer {
 
     fn handle_query_block(&self, params: &Value) -> Result<Value> {
         // Params: { "height": <u64> } or { "hash": "<hex>" }
-        if let Some(h) = params.get("height").and_then(Value::as_u64) {
-            match self.block_store.get(h)? {
-                None => Ok(json!(null)),
-                Some(block) => Ok(json!({
-                    "height": block.header.height,
-                    "hash": hex::encode(&block.header.block_hash().0),
-                    "parent_hash": hex::encode(&block.header.parent_hash.0),
-                    "timestamp_ms": block.header.timestamp_ms,
-                    "proposer": hex::encode(&block.header.proposer.0),
-                    "txs_root": hex::encode(&block.header.txs_root.0),
-                    "state_root": hex::encode(&block.header.state_root.0),
-                    "fuel_used": block.header.fuel_used,
-                    "fuel_limit": block.header.fuel_limit,
-                    "tx_count": block.txs.len(),
-                    "tx_hashes": block.txs.iter().map(|t| hex::encode(&t.tx_hash().0)).collect::<Vec<_>>(),
-                })),
+        //
+        // The CLI accepts either form (`bloom chain query block <h_or_hash>`,
+        // spec §12). Hash lookup walks the on-disk block-store window via
+        // `BlockStore::get_by_hash` — v0 retention is ≤ 512 blocks so a
+        // linear scan is fine.
+        let block = if let Some(h) = params.get("height").and_then(Value::as_u64) {
+            self.block_store.get(h)?
+        } else if let Some(hash_str) = params.get("hash").and_then(Value::as_str) {
+            let hash_bytes = hex::decode(hash_str).context("decode block hash hex")?;
+            if hash_bytes.len() != 32 {
+                return Err(anyhow!(
+                    "block hash must be 32 bytes (got {})",
+                    hash_bytes.len()
+                ));
             }
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&hash_bytes);
+            let block_hash = Hash32(h);
+            self.block_store.get_by_hash(&block_hash)?
         } else {
-            Err(anyhow!("chain_query_block: provide 'height' (hash lookup is v1+)"))
+            return Err(anyhow!(
+                "chain_query_block: provide either 'height' or 'hash'"
+            ));
+        };
+
+        match block {
+            None => Ok(json!(null)),
+            Some(block) => Ok(json!({
+                "height": block.header.height,
+                "hash": hex::encode(&block.header.block_hash().0),
+                "parent_hash": hex::encode(&block.header.parent_hash.0),
+                "timestamp_ms": block.header.timestamp_ms,
+                "proposer": hex::encode(&block.header.proposer.0),
+                "txs_root": hex::encode(&block.header.txs_root.0),
+                "state_root": hex::encode(&block.header.state_root.0),
+                "fuel_used": block.header.fuel_used,
+                "fuel_limit": block.header.fuel_limit,
+                "tx_count": block.txs.len(),
+                "tx_hashes": block.txs.iter().map(|t| hex::encode(&t.tx_hash().0)).collect::<Vec<_>>(),
+            })),
         }
     }
 

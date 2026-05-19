@@ -65,6 +65,20 @@ impl<V: SigVerifier> Mempool<V> {
             return Err(ConsensusError::InvalidSignature);
         }
 
+        // 1b. Sender must derive from the signing pubkey (spec §4.3).
+        //
+        // Without this check, a tx could carry a valid signature over its
+        // body while claiming an arbitrary `sender` address — letting an
+        // attacker forge sender identity at admission time (review item #11,
+        // 2026-05-19 consensus hardening). The chain-apply path in
+        // `consensus_driver::apply_block` already enforces this; mirroring
+        // it here drops forged-sender txs at the mempool boundary so they
+        // never propagate via gossip.
+        let derived = Address::from_pubkey_bytes(&tx.pubkey.0);
+        if derived != tx.sender {
+            return Err(ConsensusError::AddressMismatch);
+        }
+
         // 2. Nonce must be >= current_nonce + 1.
         //
         // We accept *future* nonces (not just the strict next-nonce) because
@@ -165,45 +179,78 @@ impl<V: SigVerifier> Mempool<V> {
             txs.sort_by_key(|t| t.nonce);
         }
 
-        // For each sender, walk forward from applied+1, stop at the first gap.
-        // Build a flat candidate list of eligible txs.
-        let mut eligible: Vec<&Tx> = Vec::new();
+        // Per-sender stride: walk each sender forward from its applied-nonce+1,
+        // discarding stale slots and stopping at the first gap. The remaining
+        // slice is the sender's "contiguous run" — the only nonce-prefix we may
+        // ever include in this block.
+        //
+        // Selection then proceeds head-only: at each step we look at the head
+        // of every sender's remaining run, pick the highest-fee one whose
+        // max_fuel fits the remaining budget, and advance that sender's
+        // pointer by one. If a sender's head does NOT fit the budget, that
+        // sender is dropped entirely — including a later (higher-fee) nonce
+        // without its predecessor would produce an invalid block. This is the
+        // fix for review item #8 (2026-05-19 consensus hardening): the prior
+        // implementation flattened the eligible txs and greedy-picked by fee
+        // globally, which could include (S, nonce 2) without (S, nonce 1)
+        // under fuel pressure.
+        let mut heads: Vec<&[&Tx]> = Vec::with_capacity(by_sender.len());
         for (addr, txs) in &by_sender {
-            let mut expected = applied_nonce_for(addr) + 1;
-            for tx in txs {
-                if tx.nonce < expected {
-                    continue; // stale slot already on-chain
-                }
-                if tx.nonce != expected {
-                    break; // gap — hold the rest until predecessors fill in
-                }
-                eligible.push(tx);
+            let applied = applied_nonce_for(addr);
+            let mut expected = applied + 1;
+            // Skip stale txs already on-chain.
+            let mut start = 0;
+            while start < txs.len() && txs[start].nonce < expected {
+                start += 1;
+            }
+            // Walk the contiguous run.
+            let mut end = start;
+            while end < txs.len() && txs[end].nonce == expected {
                 expected += 1;
+                end += 1;
+            }
+            if start < end {
+                heads.push(&txs[start..end]);
             }
         }
 
-        // Order eligibles by fee DESC, with nonce ASC then sender as tiebreaker.
-        // Note: ordering across senders is fine because per-sender we already
-        // walked sequentially; reshuffling for fee priority only changes which
-        // senders go in first, never the per-sender ordering.
-        eligible.sort_by(|a, b| {
-            b.fee_per_unit
-                .cmp(&a.fee_per_unit)
-                .then(a.nonce.cmp(&b.nonce))
-                .then(a.sender.cmp(&b.sender))
-        });
-
-        // Greedy fill respecting fuel_limit, but re-sort by (sender, nonce ASC)
-        // before returning so apply_block sees per-sender txs in nonce order
-        // (apply_block's strict-next-nonce check requires this).
         let mut selected: Vec<Tx> = Vec::new();
         let mut fuel_used: u64 = 0;
-        for tx in eligible {
-            if fuel_used.saturating_add(tx.max_fuel) <= fuel_limit {
-                fuel_used += tx.max_fuel;
-                selected.push(tx.clone());
+        loop {
+            // Find the highest-fee head across senders that still fits the
+            // remaining fuel budget. Tiebreakers: lower nonce, then sender
+            // bytes — matches the legacy `select_for_block` ordering for
+            // determinism.
+            let mut best: Option<usize> = None;
+            for (i, run) in heads.iter().enumerate() {
+                let Some(head) = run.first() else { continue };
+                if fuel_used.saturating_add(head.max_fuel) > fuel_limit {
+                    continue;
+                }
+                let pick = match best {
+                    None => true,
+                    Some(j) => {
+                        let cur = heads[j].first().expect("non-empty by construction");
+                        head.fee_per_unit
+                            .cmp(&cur.fee_per_unit)
+                            .then(cur.nonce.cmp(&head.nonce))
+                            .then(cur.sender.cmp(&head.sender))
+                            .is_gt()
+                    }
+                };
+                if pick {
+                    best = Some(i);
+                }
             }
+            let Some(i) = best else { break };
+            let head = heads[i][0];
+            fuel_used += head.max_fuel;
+            selected.push(head.clone());
+            heads[i] = &heads[i][1..];
         }
+
+        // Re-sort by (sender, nonce ASC) so apply_block sees per-sender txs
+        // in nonce order (apply_block's strict-next-nonce check requires this).
         selected.sort_by(|a, b| a.sender.cmp(&b.sender).then(a.nonce.cmp(&b.nonce)));
         selected
     }
@@ -258,10 +305,17 @@ mod tests {
         Address([seed; 32])
     }
 
+    /// Derive a fake address from a seed in the same way `admit`'s
+    /// sender-derivation check does, so a tx built with the matching pubkey
+    /// passes the check. (`admit` calls `Address::from_pubkey_bytes(&pubkey)`.)
+    fn addr_from_seed(seed: u8) -> Address {
+        Address::from_pubkey_bytes(&[seed; 4])
+    }
+
     fn make_tx(sender: u8, nonce: u64, fee: u64, max_fuel: u64) -> Tx {
         Tx {
             chain_id: "bloomchain.v0".to_string(),
-            sender: addr(sender),
+            sender: addr_from_seed(sender),
             nonce,
             max_fuel,
             fee_per_unit: fee,
@@ -381,8 +435,8 @@ mod tests {
         // Both fee=10, nonce=1 — ordering is deterministic by sender.
         // Just assert both are present.
         let senders: Vec<_> = selected.iter().map(|t| t.sender).collect();
-        assert!(senders.contains(&addr(1)));
-        assert!(senders.contains(&addr(2)));
+        assert!(senders.contains(&addr_from_seed(1)));
+        assert!(senders.contains(&addr_from_seed(2)));
     }
 
     #[test]

@@ -29,6 +29,8 @@ zbase32 = "0.1"
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# Used by adversarial test fixtures (e.g. `prevhash_threading.rs`).
+wat = "1"
 
 [lints.rust]
 unsafe_code = "forbid"

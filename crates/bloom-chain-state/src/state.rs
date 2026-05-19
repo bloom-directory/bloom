@@ -70,8 +70,14 @@ pub struct WriteSet {
     pub(crate) accounts: BTreeMap<Address, AccountDelta>,
     /// Per-contract storage changes: `(address, slot) -> delta`.
     pub(crate) storage: BTreeMap<Address, BTreeMap<[u8; 32], StorageDelta>>,
-    /// Newly inserted wasm blobs.
-    pub(crate) code: Vec<Vec<u8>>,
+    /// Newly inserted wasm blobs, keyed by petal hash for in-tx lookup.
+    ///
+    /// Stored as a map (rather than the legacy `Vec<Vec<u8>>`) so that
+    /// `StateSnapshot::get_code` can consult staged code before falling back
+    /// to the committed base state. This is required to support same-tx
+    /// patterns like "deploy then call" or an `init` that self-calls — the
+    /// staged code must be visible within the snapshot that staged it.
+    pub(crate) code: BTreeMap<Hash32, Vec<u8>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +251,7 @@ impl State {
             }
         }
 
-        for wasm in ws.code {
+        for (_hash, wasm) in ws.code {
             self.code.insert(&wasm);
         }
 
@@ -273,6 +279,13 @@ impl Default for State {
 ///
 /// Writes accumulate in the embedded `WriteSet`.  Call `commit()` to extract
 /// them for `State::apply`, or `revert()` to discard.
+///
+/// `Clone` is provided so callers (e.g. the chain VM's nested `petal.call`
+/// path) can checkpoint a snapshot before handing it to a sub-call and roll
+/// back to the unmodified copy if the sub-call reverts or traps. The base
+/// `State` and `WriteSet` are both deeply cloned; this is acceptable for v0
+/// because per-call WriteSets are small.
+#[derive(Clone)]
 pub struct StateSnapshot {
     generation: u64,
     /// A full clone of the base state at snapshot time (read-through).
@@ -337,12 +350,21 @@ impl StateSnapshot {
     pub fn insert_code(&mut self, wasm: Vec<u8>) -> Hash32 {
         // Compute hash immediately (same formula as CodeStore::insert)
         let hash = bloom_chain_types::digest::blake3_tagged(tags::PETAL, &wasm);
-        self.write_set.code.push(wasm);
+        self.write_set.code.insert(hash, wasm);
         hash
     }
 
-    /// Read code (from base state only — staged code not yet retrievable by hash).
+    /// Read code, consulting staged inserts before the committed base state.
+    ///
+    /// The snapshot invariant is preserved: staged code is only visible to
+    /// observers that hold (or share) this snapshot's `write_set`. A snapshot
+    /// taken at height N never sees code staged by a different snapshot — each
+    /// `State::snapshot()` call produces an independent `WriteSet`, so pending
+    /// deploys from a *future* tx cannot leak into a snapshot taken now.
     pub fn get_code(&self, hash: &Hash32) -> Option<&[u8]> {
+        if let Some(bytes) = self.write_set.code.get(hash) {
+            return Some(bytes.as_slice());
+        }
         self.base.get_code(hash)
     }
 

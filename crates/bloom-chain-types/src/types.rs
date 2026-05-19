@@ -24,6 +24,21 @@ use ssz::{Decode, DecodeError, Encode};
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 pub struct Address(pub [u8; 32]);
 
+impl Address {
+    /// Spec §4.3 address derivation:
+    /// `address = BLAKE3("bloom-chain.v0.addr:" || pk_composite)`.
+    ///
+    /// This is the single canonical derivation. All chain-side and wallet-side
+    /// callers must use this — any inline duplicate of the domain tag is a
+    /// drift hazard.
+    pub fn from_pubkey_bytes(pk_bytes: &[u8]) -> Self {
+        let mut h = blake3::Hasher::new();
+        h.update(crate::digest::tags::ADDR.as_bytes());
+        h.update(pk_bytes);
+        Address(*h.finalize().as_bytes())
+    }
+}
+
 impl fmt::Debug for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Address({})", self)

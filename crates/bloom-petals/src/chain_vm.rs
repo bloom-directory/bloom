@@ -555,6 +555,19 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
                 None => return HostError::NotFound("code not found".into()).as_wasm_code() as i64,
             };
 
+            // Checkpoint-then-restore for nested-call revert isolation
+            // (review 2026-05-19 #6).
+            //
+            // We clone the parent's snapshot BEFORE the value transfer
+            // so that on revert/trap we can restore exactly the parent's
+            // pre-call view — including rolling back the value transfer.
+            // The clone is taken here (and not after the value transfer)
+            // because a reverted child must not retain the LOOM credit;
+            // the parent must end up with its pre-call balance.
+            //
+            // StateSnapshot is `Clone`; the per-call WriteSet is small.
+            let parent_snapshot_checkpoint = caller.data().chain_ctx.snapshot.clone();
+
             // LOOM transfer (caller → target) before executing.
             if value_loom > 0 {
                 let caller_addr = caller.data().chain_ctx.contract_address;
@@ -587,23 +600,10 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
             let fuel_remaining = caller.get_fuel().unwrap_or(0);
 
             // Take ownership of the snapshot to pass to the callee.
-            // We swap it out with a dummy, run the callee, then swap back with
-            // the (mutated) snapshot from the callee output.
+            // We swap it out with a dummy, run the callee, then swap back
+            // with the (mutated) snapshot from the callee output on
+            // success, or with the checkpoint on error.
             let snap = {
-                // We can't move out of &mut through data_mut() without a swap.
-                // Use std::mem::replace with a fresh snapshot taken from the
-                // base state. This is sound because the callee writes flow
-                // through the returned snapshot.
-                //
-                // We need a placeholder snapshot. We build one by taking a
-                // snapshot of the base state inside the existing snapshot.
-                // Actually: bloom-chain-state's StateSnapshot doesn't expose a
-                // way to take a sub-snapshot. So we move the live snapshot out
-                // using a placeholder trick.
-                //
-                // Approach: temporarily replace with a dummy snapshot of an
-                // empty state, run the sub-call with the real snapshot, then
-                // put the result back.
                 let dummy = bloom_chain_state::State::new().snapshot();
                 std::mem::replace(&mut caller.data_mut().chain_ctx.snapshot, dummy)
             };
@@ -623,7 +623,8 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
             let engine = match chain_engine() {
                 Ok(e) => e,
                 Err(_) => {
-                    // Restore snapshot from dummy — we can't do anything meaningful.
+                    // Restore parent's pre-call view (value transfer reverts too).
+                    caller.data_mut().chain_ctx.snapshot = parent_snapshot_checkpoint;
                     return HostError::Backend("engine error".into()).as_wasm_code() as i64;
                 }
             };
@@ -632,7 +633,9 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
 
             match sub_result {
                 Ok(out) => {
-                    // Restore the mutated snapshot.
+                    // Success: keep the callee's mutated snapshot — the
+                    // callee's writes (and the pre-call value transfer)
+                    // are now part of the parent's view.
                     caller.data_mut().chain_ctx.snapshot = out.snapshot;
                     // Append callee logs.
                     caller.data_mut().chain_ctx.logs.extend(out.logs);
@@ -663,26 +666,22 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
                     }
                 }
                 Err(e) => {
-                    // Sub-call failed. Restore dummy snapshot (writes are lost).
-                    // We have no way to restore the real snapshot since it was
-                    // consumed — the caller's state is whatever the dummy was.
-                    // This is the correct revert semantics: sub-call failure
-                    // rolls back sub-call writes.
-                    //
-                    // Actually we need to restore the real snapshot that was passed
-                    // to the sub-call but may have been reverted inside it.
-                    // The `Err` path in dispatch_chain_call_sync returns the snapshot
-                    // back inside the error for exactly this case.
+                    // Sub-call failed — discard the callee's (mutated)
+                    // snapshot and restore the parent's pre-call
+                    // checkpoint. This rolls back ALL child writes,
+                    // including the value transfer and any storage
+                    // mutations the child performed before reverting.
+                    // Critically, this holds even if the parent ignores
+                    // the negative return code and continues executing.
+                    caller.data_mut().chain_ctx.snapshot = parent_snapshot_checkpoint;
                     match e {
-                        SubCallError::Reverted { snapshot, reason } => {
-                            // Revert: sub-call writes are discarded; restore caller snapshot.
-                            caller.data_mut().chain_ctx.snapshot = *snapshot;
-                            // Store the sub-call's revert reason so callers can inspect it.
+                        SubCallError::Reverted { reason, .. } => {
+                            // Surface the sub-call's revert reason so
+                            // callers can inspect it.
                             caller.data_mut().chain_ctx.return_data = reason;
                             HostError::Backend("callee reverted".into()).as_wasm_code() as i64
                         }
-                        SubCallError::Trapped { snapshot, .. } => {
-                            caller.data_mut().chain_ctx.snapshot = *snapshot;
+                        SubCallError::Trapped { .. } => {
                             HostError::Backend("callee trapped".into()).as_wasm_code() as i64
                         }
                     }
@@ -967,6 +966,10 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
                 return HostError::Backend("address collision: already deployed".into()).as_wasm_code() as i64;
             }
 
+            // Checkpoint BEFORE the spawn so a failed init rolls back the
+            // staged account too (review 2026-05-19 #6).
+            let parent_snapshot_checkpoint = caller.data().chain_ctx.snapshot.clone();
+
             // Spawn the new account with code_hash set.
             let new_account = Account {
                 nonce: 0,
@@ -983,7 +986,10 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
             // Get the wasm bytes for the init call.
             let wasm_bytes: Vec<u8> = match caller.data().chain_ctx.snapshot.get_code(&petal_hash) {
                 Some(b) => b.to_vec(),
-                None => return HostError::NotFound("code not found".into()).as_wasm_code() as i64,
+                None => {
+                    caller.data_mut().chain_ctx.snapshot = parent_snapshot_checkpoint;
+                    return HostError::NotFound("code not found".into()).as_wasm_code() as i64;
+                }
             };
 
             let depth = caller.data().chain_ctx.call_depth;
@@ -1010,14 +1016,17 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
 
             let engine = match chain_engine() {
                 Ok(e) => e,
-                Err(_) => return HostError::Backend("engine error".into()).as_wasm_code() as i64,
+                Err(_) => {
+                    caller.data_mut().chain_ctx.snapshot = parent_snapshot_checkpoint;
+                    return HostError::Backend("engine error".into()).as_wasm_code() as i64;
+                }
             };
 
             match dispatch_chain_call_sync(engine, sub_input, depth + 1) {
                 Ok(out) => {
                     // Charge init fuel.
                     let _ = consume_fuel(&mut caller, out.fuel_used);
-                    // Restore snapshot.
+                    // Keep the post-init mutated snapshot (account spawn + init writes).
                     caller.data_mut().chain_ctx.snapshot = out.snapshot;
                     caller.data_mut().chain_ctx.logs.extend(out.logs);
 
@@ -1031,19 +1040,11 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
                     }
                     0
                 }
-                Err(e) => {
-                    let snap = match e {
-                        SubCallError::Reverted { snapshot, .. } | SubCallError::Trapped { snapshot, .. } => {
-                            *snapshot
-                        }
-                    };
-                    // Undo the account spawn — restore to pre-deploy snapshot (without the new account).
-                    caller.data_mut().chain_ctx.snapshot = snap;
-                    caller
-                        .data_mut()
-                        .chain_ctx
-                        .snapshot
-                        .remove_account(deployed_address);
+                Err(_e) => {
+                    // Failed init: restore parent's pre-deploy checkpoint —
+                    // this rolls back BOTH the staged account and any init
+                    // writes the child may have done before reverting.
+                    caller.data_mut().chain_ctx.snapshot = parent_snapshot_checkpoint;
                     HostError::Backend("init failed".into()).as_wasm_code() as i64
                 }
             }
@@ -1060,6 +1061,64 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
 enum SubCallError {
     Reverted { snapshot: Box<StateSnapshot>, reason: Option<Vec<u8>> },
     Trapped { snapshot: Box<StateSnapshot>, error: Option<String> },
+}
+
+// ---------------------------------------------------------------------------
+// Resource limiter (review 2026-05-19 #7)
+// ---------------------------------------------------------------------------
+
+/// Per-instance cap on linear-memory growth for chain-mode petals.
+///
+/// Static validation in `validate_chain_wasm` rejects modules whose declared
+/// memory min/max pages exceed 256 (16 MiB). But a module can pass static
+/// validation with `(memory 1)` and then issue `memory.grow` at runtime to
+/// blow past that cap. The `ResourceLimiter` enforces the same 256-page
+/// (16 MiB) bound at runtime, returning `Ok(false)` from `memory_growing`
+/// when the requested size would exceed it. wasmtime then raises an
+/// "OutOfMemory" trap, which propagates up as a `SubCallError::Trapped`
+/// and triggers the parent's revert-on-error path (see review #6).
+const CHAIN_MAX_MEMORY_PAGES: usize = 256;
+
+/// Per-instance cap on indirect-call table growth for chain-mode petals.
+///
+/// Tables aren't currently a major attack vector (modules can't reflectively
+/// inject entries), but bounding growth keeps memory use predictable.
+const CHAIN_MAX_TABLE_ELEMENTS: usize = 10_000;
+
+/// Per-instance cap on instance/memory/table counts. The chain-mode
+/// dispatcher creates exactly one instance per `dispatch_chain_call_sync`
+/// call and one memory per instance, but nested `petal.call` may create
+/// new stores; the limiter is scoped to a single store, so these are tight.
+const CHAIN_MAX_INSTANCES: usize = 1;
+const CHAIN_MAX_TABLES: usize = 16;
+const CHAIN_MAX_MEMORIES: usize = 1;
+
+struct ChainLimiter;
+
+impl wasmtime::ResourceLimiter for ChainLimiter {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> anyhow::Result<bool> {
+        // `desired` is in bytes; convert to pages.
+        let desired_pages = desired.div_ceil(64 * 1024);
+        Ok(desired_pages <= CHAIN_MAX_MEMORY_PAGES)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> anyhow::Result<bool> {
+        Ok(desired <= CHAIN_MAX_TABLE_ELEMENTS)
+    }
+
+    fn instances(&self) -> usize { CHAIN_MAX_INSTANCES }
+    fn tables(&self) -> usize { CHAIN_MAX_TABLES }
+    fn memories(&self) -> usize { CHAIN_MAX_MEMORIES }
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,6 +1160,15 @@ fn dispatch_chain_call_sync(
         snapshot: Box::new(bloom_chain_state::State::new().snapshot()),
         error: Some(format!("set_fuel: {e}")),
     })?;
+    // Install the runtime ResourceLimiter so `memory.grow` past the static
+    // validation cap (256 pages / 16 MiB) traps instead of succeeding
+    // (review 2026-05-19 #7). Chain-mode only — host-mode petals use
+    // `MemLimiter` in `vm.rs`.
+    store.limiter(|_| {
+        // Box-leak a small zero-sized limiter for this store. Same pattern
+        // as the host-mode limiter; there is no per-store state to maintain.
+        Box::leak(Box::new(ChainLimiter))
+    });
 
     let mut linker = Linker::<ChainStoreData>::new(engine);
     link_chain_imports(&mut linker).map_err(|e| SubCallError::Trapped {
@@ -1204,17 +1272,40 @@ impl PetalVm {
     }
 
     /// Run a petal in chain-mode (synchronous, deterministic).
+    ///
+    /// Revert / trap reconciliation (review 2026-05-19 #12):
+    /// - Success → `Ok(ChainCallOutput { revert_reason: None, .. })`.
+    /// - `petal.revert` (or any sub-call surfacing a revert at top-level) →
+    ///   `Ok(ChainCallOutput { revert_reason: Some(bytes), .. })`. The
+    ///   embedded `snapshot` carries the mutated writes — the executor is
+    ///   responsible for *discarding* it (the natural revert: just drop
+    ///   the snapshot instead of `commit()`-ing it).
+    /// - Genuine wasm trap / out-of-fuel / engine error →
+    ///   `Err(PetalError::ChainCall(detail))`.
+    ///
+    /// This funnels both `petal_executor.rs` revert paths into one
+    /// authoritative code path: the executor only needs to check
+    /// `out.revert_reason.is_some()` for the revert case; the trap case
+    /// is the `Err` arm.
     pub fn run_chain_call(input: ChainCallInput) -> Result<ChainCallOutput, PetalError> {
         let engine = chain_engine()?;
-        dispatch_chain_call_sync(engine, input, 0).map_err(|e| match e {
-            SubCallError::Reverted { reason, .. } => PetalError::ChainCall(
-                reason
-                    .and_then(|r| String::from_utf8(r).ok())
-                    .unwrap_or_else(|| "reverted".into()),
-            ),
-            SubCallError::Trapped { error, .. } => PetalError::ChainCall(
+        match dispatch_chain_call_sync(engine, input, 0) {
+            Ok(out) => Ok(out),
+            Err(SubCallError::Reverted { snapshot, reason }) => {
+                // Surface revert as a successful `ChainCallOutput` carrying
+                // the reason. The snapshot it travels with is the mutated
+                // child snapshot — the executor will not commit it.
+                Ok(ChainCallOutput {
+                    return_data: None,
+                    revert_reason: Some(reason.unwrap_or_default()),
+                    fuel_used: 0,
+                    logs: Vec::new(),
+                    snapshot: *snapshot,
+                })
+            }
+            Err(SubCallError::Trapped { error, .. }) => Err(PetalError::ChainCall(
                 error.map(|s| format!("trapped: {s}")).unwrap_or_else(|| "trapped".into()),
-            ),
-        })
+            )),
+        }
     }
 }

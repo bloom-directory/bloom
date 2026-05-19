@@ -151,3 +151,72 @@ fn snapshot_empty_account_removes_entry() {
     state.apply(snap.commit()).unwrap();
     assert_eq!(state.get_account(&addr(1)), None);
 }
+
+// ---------------------------------------------------------------------------
+// Staged code is visible via get_code within the same snapshot (review #14).
+//
+// Regression test for the "same-tx deploy-then-call" bug: code inserted with
+// `StateSnapshot::insert_code` must be retrievable by `StateSnapshot::get_code`
+// *before* the write set has been committed to the base state, so that a tx
+// can deploy a petal and then immediately invoke a method on it (or have its
+// init self-call) within the same execution frame.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn snapshot_get_code_sees_staged_insert() {
+    let state = State::new();
+    let mut snap = state.snapshot();
+
+    let wasm = b"fake wasm bytes for staged-code test".to_vec();
+    let hash = snap.insert_code(wasm.clone());
+
+    // Before commit: staged code must be readable via the snapshot.
+    let fetched = snap.get_code(&hash).expect("staged code must be visible via snapshot");
+    assert_eq!(fetched, wasm.as_slice(), "staged code bytes must round-trip");
+}
+
+#[test]
+fn snapshot_staged_code_does_not_leak_to_base() {
+    // A snapshot that stages new code must NOT mutate the underlying base
+    // state until the write set is applied — staged deploys are tx-scoped.
+    let state = State::new();
+    let mut snap = state.snapshot();
+    let wasm = b"another fake wasm".to_vec();
+    let hash = snap.insert_code(wasm);
+
+    // The base state has no record of this code.
+    assert!(state.get_code(&hash).is_none(), "staged code must not leak into base state");
+}
+
+#[test]
+fn parallel_snapshots_do_not_share_staged_code() {
+    // Two independent snapshots taken at the same height must not see each
+    // other's staged code — preserving the snapshot invariant that future-tx
+    // pending deploys never bleed into a concurrent snapshot.
+    let state = State::new();
+    let mut snap_a = state.snapshot();
+    let snap_b = state.snapshot();
+
+    let wasm_a = b"snap-a wasm".to_vec();
+    let hash_a = snap_a.insert_code(wasm_a);
+
+    // snap_b must NOT see snap_a's staged code.
+    assert!(
+        snap_b.get_code(&hash_a).is_none(),
+        "staged code in snap_a must not be visible to snap_b"
+    );
+}
+
+#[test]
+fn committed_code_is_visible_to_new_snapshots() {
+    // After commit, the staged code lives in the base store and any newly
+    // taken snapshot sees it.
+    let mut state = State::new();
+    let mut snap = state.snapshot();
+    let wasm = b"persisted wasm".to_vec();
+    let hash = snap.insert_code(wasm.clone());
+    state.apply(snap.commit()).unwrap();
+
+    let snap2 = state.snapshot();
+    assert_eq!(snap2.get_code(&hash), Some(wasm.as_slice()));
+}
