@@ -2106,6 +2106,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-contract"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bloom-chain-abi",
+ "bloom-contract-macros",
+ "bloom-petal-sdk",
+]
+
+[[package]]
+name = "bloom-contract-build"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "bloom-contract-metadata",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bloom-contract-macros"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "bloom-contract-metadata"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bloom-daemon"
 version = "0.1.0"
 dependencies = [

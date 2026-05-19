@@ -1,0 +1,13 @@
+[package]
+name = "bloom-contract-metadata"
+version = "0.1.0"
+edition = "2024"
+description = "Serde-shaped contract manifest schema for bloom-contract."
+license = "MIT"
+
+[lib]
+name = "bloom_contract_metadata"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
