@@ -24,6 +24,7 @@ extern crate alloc;
 pub mod u256;
 pub mod encode;
 pub mod decode;
+pub mod dyn_codec;
 pub mod dispatch;
 pub mod selector;
 pub mod event;
@@ -31,6 +32,7 @@ pub mod storage;
 
 pub use decode::{AbiError, Buf};
 pub use dispatch::DispatchError;
+pub use dyn_codec::MAX_DYN_LEN;
 pub use encode::{AbiEncodeError, Encoder};
 pub use event::{event_signature_topic, event_topic};
 pub use selector::selector;

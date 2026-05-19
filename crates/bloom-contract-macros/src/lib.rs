@@ -10,6 +10,28 @@
 
 use proc_macro::TokenStream;
 
+mod derives;
+
+/// `#[derive(AbiEncode)]` — sequential field encoding for structs;
+/// discriminant-prefixed encoding for enums.
+#[proc_macro_derive(AbiEncode, attributes(abi))]
+pub fn derive_abi_encode(input: TokenStream) -> TokenStream {
+    derives::derive_abi_encode(input)
+}
+
+/// `#[derive(AbiDecode)]` — symmetric counterpart to `AbiEncode`.
+#[proc_macro_derive(AbiDecode, attributes(abi))]
+pub fn derive_abi_decode(input: TokenStream) -> TokenStream {
+    derives::derive_abi_decode(input)
+}
+
+/// `#[derive(AbiType)]` — generates `ABI_TYPE` string + structured schema for
+/// manifest emission.
+#[proc_macro_derive(AbiType, attributes(abi))]
+pub fn derive_abi_type(input: TokenStream) -> TokenStream {
+    derives::derive_abi_type(input)
+}
+
 /// `#[bloom::contract]` — top-level attribute placed on a `mod` containing
 /// the contract's storage struct, init fn, event types, error enum, and
 /// handler methods. Phase 1 stub: passes the input through unchanged.

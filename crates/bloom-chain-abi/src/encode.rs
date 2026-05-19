@@ -118,6 +118,9 @@ impl Default for Encoder {
 pub enum AbiEncodeError {
     /// `Vec<Address>` path exceeds the `u16` length prefix maximum.
     TooManyAddresses(usize),
+    /// A dynamic field (string / bytes / vec) exceeds the `u16` length prefix
+    /// maximum (`u16::MAX` bytes / items).
+    TooLong(usize),
 }
 
 #[cfg(feature = "std")]
@@ -126,6 +129,9 @@ impl std::fmt::Display for AbiEncodeError {
         match self {
             AbiEncodeError::TooManyAddresses(n) => {
                 write!(f, "too many addresses: {n} (max {})", u16::MAX)
+            }
+            AbiEncodeError::TooLong(n) => {
+                write!(f, "dynamic field too long: {n} (max {})", u16::MAX)
             }
         }
     }
@@ -137,6 +143,9 @@ impl core::fmt::Display for AbiEncodeError {
         match self {
             AbiEncodeError::TooManyAddresses(n) => {
                 write!(f, "too many addresses: {n}")
+            }
+            AbiEncodeError::TooLong(n) => {
+                write!(f, "dynamic field too long: {n}")
             }
         }
     }

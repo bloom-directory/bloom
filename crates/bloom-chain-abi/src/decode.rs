@@ -24,6 +24,10 @@ pub enum AbiError {
     Overflow,
     /// Strict decoding failure: trailing bytes after the final expected field.
     TrailingBytes { remaining: usize },
+    /// A `string`-tagged field did not contain valid UTF-8.
+    InvalidUtf8,
+    /// A `Result`/`Option` discriminant byte was outside the valid set.
+    InvalidDiscriminant(u8),
 }
 
 #[cfg(feature = "std")]
@@ -40,6 +44,10 @@ impl std::fmt::Display for AbiError {
             AbiError::Overflow => write!(f, "arithmetic overflow in narrowing conversion"),
             AbiError::TrailingBytes { remaining } => {
                 write!(f, "trailing bytes after decode: {remaining}")
+            }
+            AbiError::InvalidUtf8 => write!(f, "invalid utf-8 in string-typed field"),
+            AbiError::InvalidDiscriminant(b) => {
+                write!(f, "invalid discriminant byte: {b}")
             }
         }
     }
@@ -143,6 +151,23 @@ impl<'a> Buf<'a> {
             out.push(self.read_address()?);
         }
         Ok(out)
+    }
+
+    /// Borrow the underlying byte slice (read-only).
+    pub fn data(&self) -> &'a [u8] {
+        self.data
+    }
+
+    /// Advance the cursor by `n` bytes. Panics if the cursor would pass the
+    /// end of the buffer — callers must check `remaining()` first.
+    pub fn advance(&mut self, n: usize) {
+        debug_assert!(self.pos + n <= self.data.len());
+        self.pos += n;
+    }
+
+    /// Read 2 raw bytes (used by `dyn_codec` helpers).
+    pub fn read_u16_bytes(&mut self) -> Result<[u8; 2], AbiError> {
+        self.read_exact::<2>()
     }
 
     /// Read all remaining bytes from the buffer as a raw `Vec<u8>`.
