@@ -10,12 +10,8 @@
 //!
 //! # init calldata
 //! `token0 (32B) || token1 (32B) || reentrancy_addr (32B) || pair_self_addr (32B)` — 128 bytes total.
-//! The first two are the sorted token addresses. The third is the address of
-//! the deployed `bloom-dex-reentrancy` petal. The fourth is this petal's own
-//! address (pre-computed by the factory via chain spec §7.7 before deploying).
-//! The pair stores `pair_self_addr` in `K_SELF` so that `mint`, `burn`, and
-//! `swap` can call `token.balanceOf(self)` (the chain has no `msg.self` import).
-//! Callers (the factory) MUST pass all 128 bytes; shorter calldata reverts.
+//! Decoded via the chain-owned ABI macro (`pair::parse_init`), which strictly
+//! rejects any length other than 128.
 //!
 //! # Storage keys (all are `blake3(domain_tag)` or `blake3(domain_tag || args)`)
 //!
@@ -28,6 +24,7 @@
 //! | `K_K_LAST`      | `"pair.k_last"`                     | U256               |
 //! | `K_LOCK`        | `"pair.lock"`                       | u8 (0 or 1)        |
 //! | `K_REENTRANCY`  | `"pair.reentrancy"`                 | Address (32 B)     |
+//! | `K_SELF`        | `"pair.self"`                       | Address (32 B)     |
 //! | `K_TOTAL`       | `"erc20.total_supply"`              | U256               |
 //! | `K_BAL(addr)`   | `"erc20.balance:" || addr`          | U256               |
 //! | `K_ALLOW(o,s)`  | `"erc20.allowance:" || owner || sp` | U256               |
@@ -43,14 +40,17 @@
 //!   `pair.lock_check_and_set()` — reverts if lock==1, else sets lock=1.
 //!   `pair._mint_inner / _burn_inner / _swap_inner` (the real logic).
 //!   `pair.lock_clear()` — clears lock=0.
-//! This means the actual logic for mint/burn/swap runs from `_*_inner`
-//! selectors, not the public-facing ones. The public `pair.mint`, etc. are
-//! just the entry gates that arm and forward through reentrancy.
 //!
-//! NOTE: Because the chain's call-depth limit provides a backstop, and to
-//! keep the implementation self-contained (without the reentrancy petal
-//! deployed and wired up in unit tests), the lock is also checked inline at
-//! the start of each `_*_inner` call for belt-and-suspenders safety.
+//! These three internal selectors are declared `#[internal]` in the
+//! `contract!` block, so the macro-generated dispatcher rejects calls whose
+//! `msg::sender()` is not the configured reentrancy petal address.
+//!
+//! # ABI
+//!
+//! Selectors, calldata decoding, and init parsing are produced by the
+//! chain-owned `bloom_chain_abi::contract!` macro below. The canonical method
+//! strings match DEX v0 spec §4.1, so peer petals (router, reentrancy) keep
+//! dispatching to byte-identical selectors.
 //!
 //! # Constants
 //! - `MINIMUM_LIQUIDITY = 1000` — locked to address(0) on first mint.
@@ -62,12 +62,39 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
-use bloom_dex_abi::{
-    events,
-    selectors,
-    u256::U256,
-};
-use bloom_petal_sdk::{block, crypto, log, msg, petal, state};
+use bloom_chain_abi::{DispatchError, U256, contract};
+use bloom_dex_abi::{events, selectors};
+use bloom_petal_sdk::{LoomValue, block, crypto, log, msg, petal, state};
+
+// ---------------------------------------------------------------------------
+// Chain-owned ABI declaration
+// ---------------------------------------------------------------------------
+
+contract! {
+    contract Pair {
+        init(token0: Address, token1: Address, reentrancy_addr: Address, pair_self_addr: Address);
+
+        fn token0() -> Address;
+        fn token1() -> Address;
+        fn get_reserves();
+        fn mint(to: Address);
+        fn burn(to: Address);
+        fn swap(amount0_out: U256, amount1_out: U256, to: Address);
+        fn skim(to: Address);
+        fn sync();
+
+        #[internal]
+        fn lock_check_and_set();
+        #[internal]
+        fn lock_clear();
+        #[internal]
+        fn _mint_inner(to: Address);
+        #[internal]
+        fn _burn_inner(to: Address);
+        #[internal]
+        fn _swap_inner(amount0_out: U256, amount1_out: U256, to: Address);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -82,11 +109,6 @@ const ZERO_ADDR: [u8; 32] = [0u8; 32];
 // ---------------------------------------------------------------------------
 // Storage key derivation
 // ---------------------------------------------------------------------------
-//
-// Keys are 32-byte BLAKE3 digests. We compute them at runtime via the host
-// `crypto.blake3` import (which is available even in guest code). In practice
-// the keys are constants — the host import is cheap and the wasm JIT will
-// likely CSE repeated calls.
 
 fn key(tag: &[u8]) -> [u8; 32] {
     crypto::blake3(tag)
@@ -112,6 +134,9 @@ fn k_lock() -> [u8; 32] {
 }
 fn k_reentrancy() -> [u8; 32] {
     key(b"pair.reentrancy")
+}
+fn k_self() -> [u8; 32] {
+    key(b"pair.self")
 }
 
 // ERC-20 / LP token keys — shared namespace with bloom-dex-erc20 (spec §6.1).
@@ -183,38 +208,6 @@ fn write_bool(skey: &[u8; 32], v: bool) {
     let mut slot = [0u8; 32];
     slot[31] = v as u8;
     state::write(skey, &slot);
-}
-
-// ---------------------------------------------------------------------------
-// Internal selectors (from shared bloom-dex-abi registry; used for reentrancy gate)
-// ---------------------------------------------------------------------------
-//
-// These selectors are only callable by the reentrancy petal — there is no way
-// for an external caller to forge them since the reentrancy petal address is
-// the only one that gets to drive the flow.
-//
-// The selectors are imported from bloom_dex_abi::selectors rather than
-// computed inline, so they are guaranteed to match what the reentrancy petal
-// encodes when building calldata.
-
-fn sel_lock_check_and_set() -> [u8; 4] {
-    selectors::PAIR_LOCK_CHECK_AND_SET
-}
-
-fn sel_lock_clear() -> [u8; 4] {
-    selectors::PAIR_LOCK_CLEAR
-}
-
-fn sel_mint_inner() -> [u8; 4] {
-    selectors::PAIR_MINT_INNER
-}
-
-fn sel_burn_inner() -> [u8; 4] {
-    selectors::PAIR_BURN_INNER
-}
-
-fn sel_swap_inner() -> [u8; 4] {
-    selectors::PAIR_SWAP_INNER
 }
 
 // ---------------------------------------------------------------------------
@@ -318,7 +311,7 @@ fn token_balance_of(token_addr: &[u8; 32], target_addr: &[u8; 32]) -> U256 {
     cd.extend_from_slice(&selectors::ERC20_BALANCE_OF);
     cd.extend_from_slice(target_addr);
 
-    let ret = petal::call(token_addr, &cd, &[0u8; 32])
+    let ret = petal::call(token_addr, &cd, LoomValue::ZERO)
         .unwrap_or_else(|_| petal::revert("pair: token.balanceOf call failed"));
 
     if ret.len() < 32 {
@@ -329,25 +322,6 @@ fn token_balance_of(token_addr: &[u8; 32], target_addr: &[u8; 32]) -> U256 {
     U256(v)
 }
 
-/// Transfer `amount` of `token` from `from` to `to` via ERC-20 transferFrom.
-/// Used when pulling tokens on behalf of a user (router / pair internal use).
-#[allow(dead_code)]
-fn token_transfer_from(
-    token_addr: &[u8; 32],
-    from: &[u8; 32],
-    to: &[u8; 32],
-    amount: U256,
-) {
-    let mut cd = Vec::with_capacity(4 + 32 + 32 + 32);
-    cd.extend_from_slice(&selectors::ERC20_TRANSFER_FROM);
-    cd.extend_from_slice(from);
-    cd.extend_from_slice(to);
-    cd.extend_from_slice(&amount.0);
-
-    petal::call(token_addr, &cd, &[0u8; 32])
-        .unwrap_or_else(|_| petal::revert("pair: transferFrom failed"));
-}
-
 /// Transfer `amount` of `token` to `to` via ERC-20 transfer.
 fn token_transfer(token_addr: &[u8; 32], to: &[u8; 32], amount: U256) {
     let mut cd = Vec::with_capacity(4 + 32 + 32);
@@ -355,7 +329,7 @@ fn token_transfer(token_addr: &[u8; 32], to: &[u8; 32], amount: U256) {
     cd.extend_from_slice(to);
     cd.extend_from_slice(&amount.0);
 
-    petal::call(token_addr, &cd, &[0u8; 32])
+    petal::call(token_addr, &cd, LoomValue::ZERO)
         .unwrap_or_else(|_| petal::revert("pair: token.transfer failed"));
 }
 
@@ -363,7 +337,7 @@ fn token_transfer(token_addr: &[u8; 32], to: &[u8; 32], amount: U256) {
 // Reentrancy guard helpers
 // ---------------------------------------------------------------------------
 
-fn reentrancy_addr() -> [u8; 32] {
+fn read_reentrancy_addr() -> [u8; 32] {
     read_addr(&k_reentrancy())
 }
 
@@ -374,13 +348,9 @@ fn reentrancy_addr() -> [u8; 32] {
 ///   2. Call the `_*_inner` selector with the forwarded calldata.
 ///   3. Call `pair.lock_clear()`.
 ///
-/// This function is thus the gateway: calling it triggers the full protected
-/// call chain. It does NOT return normally; control passes through the
-/// reentrancy petal which eventually calls the `_inner` variant. Because the
-/// chain call is synchronous, by the time `petal::call` returns here, the
-/// inner logic has already executed.
+/// Returns the inner method's raw return data so the caller can forward it.
 fn reentrancy_enter(self_addr: &[u8; 32], calldata: &[u8]) -> Vec<u8> {
-    let raddr = reentrancy_addr();
+    let raddr = read_reentrancy_addr();
 
     // Calldata for reentrancy.enter(address callee, bytes calldata):
     // selector(4) || callee(32) || calldata_bytes
@@ -389,7 +359,7 @@ fn reentrancy_enter(self_addr: &[u8; 32], calldata: &[u8]) -> Vec<u8> {
     cd.extend_from_slice(self_addr);
     cd.extend_from_slice(calldata);
 
-    petal::call(&raddr, &cd, &[0u8; 32])
+    petal::call(&raddr, &cd, LoomValue::ZERO)
         .unwrap_or_else(|_| petal::revert("pair: reentrancy.enter failed"))
 }
 
@@ -402,19 +372,6 @@ fn reentrancy_enter(self_addr: &[u8; 32], calldata: &[u8]) -> Vec<u8> {
 fn do_mint_inner(to: &[u8; 32]) -> Vec<u8> {
     let token0 = read_addr(&k_token0());
     let token1 = read_addr(&k_token1());
-
-    // We need our own address to query our token balances.
-    // The reentrancy petal calls us back, so msg.sender is the reentrancy petal.
-    // We stored self_addr in K_REENTRANCY flow; but we can get our own address
-    // by asking what was passed to reentrancy.enter as `callee`. The cleanest
-    // approach: store a "self" slot in init, or use msg.sender from the top-level
-    // call (stored transiently). Instead, we use a well-known pattern: the pair
-    // queries balances using the address stored in the call's own context.
-    //
-    // Since we don't have a `self_address()` host import, we reconstruct the
-    // self address by reading msg.sender at the `call()` boundary when we are
-    // the callee. But here in the _inner context, msg.sender is the reentrancy
-    // petal. We need to store self_addr in init. Let's use K_SELF.
     let self_addr = read_addr(&k_self());
 
     // Balances AFTER the user deposited tokens (caller transferred in before calling).
@@ -555,7 +512,7 @@ fn do_burn_inner(to: &[u8; 32]) -> Vec<u8> {
 }
 
 /// Inner swap logic.
-fn do_swap_inner(amount0_out: U256, amount1_out: U256, to: &[u8; 32]) -> Vec<u8> {
+fn do_swap_inner(amount0_out: U256, amount1_out: U256, to: &[u8; 32]) {
     if amount0_out.is_zero() && amount1_out.is_zero() {
         petal::revert("pair: insufficient output amount");
     }
@@ -665,62 +622,30 @@ fn do_swap_inner(amount0_out: U256, amount1_out: U256, to: &[u8; 32]) -> Vec<u8>
         to,
     );
     log::emit(&[events::PAIR_SWAP_EVENT], &data);
-
-    Vec::new()
 }
 
 // ---------------------------------------------------------------------------
-// K_SELF — store this petal's own address in init so _inner calls can use it
+// petal entry points (init + call wired into the macro-generated codec)
 // ---------------------------------------------------------------------------
 
-fn k_self() -> [u8; 32] {
-    key(b"pair.self")
+bloom_petal_sdk::petal! {
+    init => do_init,
+    call => do_call,
 }
 
-// ---------------------------------------------------------------------------
-// Wasm entry points
-//
-// We define entry points directly rather than via the `petal!` macro because
-// edition 2024 requires `#[unsafe(no_mangle)]` and the macro emits the older
-// `#[no_mangle]` form.
-// ---------------------------------------------------------------------------
+/// Decode the 128-byte pair init payload and write config slots.
+fn do_init(calldata: alloc::vec::Vec<u8>) {
+    let args = match pair::parse_init(&calldata) {
+        Ok(a) => a,
+        Err(_) => petal::revert("pair: init calldata must be 128 bytes"),
+    };
 
-#[unsafe(no_mangle)]
-pub extern "C" fn init(calldata_ptr: i32, calldata_len: i32) -> i32 {
-    let _ = (calldata_ptr, calldata_len);
-    let cd = msg::calldata();
-    do_init(cd);
-    0
-}
+    state::write(&k_token0(), &args.token0);
+    state::write(&k_token1(), &args.token1);
+    state::write(&k_reentrancy(), &args.reentrancy_addr);
+    state::write(&k_self(), &args.pair_self_addr);
 
-#[unsafe(no_mangle)]
-pub extern "C" fn call(calldata_ptr: i32, calldata_len: i32) -> i32 {
-    let _ = (calldata_ptr, calldata_len);
-    let cd = msg::calldata();
-    do_call(cd)
-}
-
-fn do_init(calldata: Vec<u8>) {
-    // Required: token0 (32B) || token1 (32B) || reentrancy_addr (32B) || pair_self_addr (32B) = 128 bytes.
-    // The factory pre-computes pair_self_addr via chain spec §7.7 before calling host.deploy.
-    if calldata.len() < 128 {
-        petal::revert("pair: init calldata must be 128 bytes");
-    }
-    let mut t0 = [0u8; 32];
-    let mut t1 = [0u8; 32];
-    let mut ra = [0u8; 32];
-    let mut sa = [0u8; 32];
-    t0.copy_from_slice(&calldata[0..32]);
-    t1.copy_from_slice(&calldata[32..64]);
-    ra.copy_from_slice(&calldata[64..96]);
-    sa.copy_from_slice(&calldata[96..128]);
-
-    state::write(&k_token0(), &t0);
-    state::write(&k_token1(), &t1);
-    state::write(&k_reentrancy(), &ra);
-    state::write(&k_self(), &sa);
-
-    // Store initial reserves (already zero by default, but be explicit).
+    // Initial reserves zero (explicit).
     write_u128(&k_reserve0(), 0);
     write_u128(&k_reserve1(), 0);
 
@@ -731,17 +656,46 @@ fn do_init(calldata: Vec<u8>) {
     write_bool(&k_lock(), false);
 }
 
-fn do_call(calldata: Vec<u8>) -> i32 {
+/// Route a method call. ERC-20 selectors (shared LP-token surface) are
+/// dispatched inline because they live in the `erc20.*` ABI namespace and are
+/// not part of the macro-generated `pair.*` dispatcher. All `pair.*` and
+/// `pair._*_inner` / `pair.lock_*` selectors flow through `pair::dispatch`.
+fn do_call(calldata: alloc::vec::Vec<u8>) -> i32 {
     if calldata.len() < 4 {
         petal::revert("pair: calldata too short");
     }
     let sel: [u8; 4] = [calldata[0], calldata[1], calldata[2], calldata[3]];
     let args = &calldata[4..];
 
-    // ---- ERC-20 / LP token surface ----
+    // ---- ERC-20 / LP token surface (shared erc20.* namespace) ----
+    if let Some(rc) = dispatch_erc20(sel, args) {
+        return rc;
+    }
 
+    // ---- pair.* selectors via the chain-owned ABI dispatcher ----
+    let mut handler = PairHandler;
+    let caller = msg::sender();
+    match pair::dispatch(&mut handler, &caller, &calldata) {
+        Ok(_) => {
+            // The handler diverges via `petal::return_data` before reaching
+            // this point for every `pair.*` selector. The dispatcher's empty
+            // return is unreachable for any well-formed call, but in case
+            // future maintenance adds a void method we return empty data here.
+            petal::return_data(&[]);
+        }
+        Err(DispatchError::ShortCalldata) => petal::revert("pair: calldata too short"),
+        Err(DispatchError::UnknownSelector(_)) => petal::revert("pair: unknown selector"),
+        Err(DispatchError::Decode(_)) => petal::revert("pair: bad args"),
+        Err(DispatchError::Unauthorized) => petal::revert("pair: unauthorized"),
+        Err(DispatchError::Handler(m)) => petal::revert(m),
+    }
+}
+
+/// Dispatch ERC-20 selectors; returns `Some(rc)` if handled. Each branch
+/// diverges via `petal::return_data` or `petal::revert`, so the wrapping
+/// `Option<i32>` is just a phantom for the type system.
+fn dispatch_erc20(sel: [u8; 4], args: &[u8]) -> Option<i32> {
     if sel == selectors::ERC20_NAME {
-        // Returns "BloomDexPair LP" as bytes32 (NUL-padded ASCII left-aligned).
         let name = b"BloomDexPair LP";
         let mut slot = [0u8; 32];
         slot[..name.len()].copy_from_slice(name);
@@ -756,7 +710,6 @@ fn do_call(calldata: Vec<u8>) -> i32 {
     }
 
     if sel == selectors::ERC20_DECIMALS {
-        // 18 in the low byte of a 32-byte slot.
         let mut slot = [0u8; 32];
         slot[31] = 18;
         petal::return_data(&slot);
@@ -768,7 +721,6 @@ fn do_call(calldata: Vec<u8>) -> i32 {
     }
 
     if sel == selectors::ERC20_BALANCE_OF {
-        // args: address (32B)
         if args.len() < 32 {
             petal::revert("pair: balanceOf bad args");
         }
@@ -779,7 +731,6 @@ fn do_call(calldata: Vec<u8>) -> i32 {
     }
 
     if sel == selectors::ERC20_ALLOWANCE {
-        // args: owner (32B) || spender (32B)
         if args.len() < 64 {
             petal::revert("pair: allowance bad args");
         }
@@ -792,7 +743,6 @@ fn do_call(calldata: Vec<u8>) -> i32 {
     }
 
     if sel == selectors::ERC20_APPROVE {
-        // args: spender (32B) || amount (32B)
         if args.len() < 64 {
             petal::revert("pair: approve bad args");
         }
@@ -813,7 +763,6 @@ fn do_call(calldata: Vec<u8>) -> i32 {
     }
 
     if sel == selectors::ERC20_TRANSFER {
-        // args: to (32B) || amount (32B)
         if args.len() < 64 {
             petal::revert("pair: transfer bad args");
         }
@@ -830,7 +779,6 @@ fn do_call(calldata: Vec<u8>) -> i32 {
     }
 
     if sel == selectors::ERC20_TRANSFER_FROM {
-        // args: from (32B) || to (32B) || amount (32B)
         if args.len() < 96 {
             petal::revert("pair: transferFrom bad args");
         }
@@ -843,7 +791,6 @@ fn do_call(calldata: Vec<u8>) -> i32 {
         let amount = U256(amt_b);
         let caller = msg::sender();
 
-        // Spend allowance (unless caller == from).
         if caller != from {
             let allow = read_u256(&k_allowance(&from, &caller));
             let new_allow = allow
@@ -858,19 +805,35 @@ fn do_call(calldata: Vec<u8>) -> i32 {
         petal::return_data(&ret);
     }
 
-    // ---- Pair-specific surface ----
+    None
+}
 
-    if sel == selectors::PAIR_TOKEN0 {
+// ---------------------------------------------------------------------------
+// Handler — business logic for `pair.*` selectors
+//
+// Each method diverges via `petal::return_data` (or `petal::revert`) once its
+// payload is ready. The returned `Ok(())` is dead code after the diverging
+// call but is required to satisfy the trait signature.
+// ---------------------------------------------------------------------------
+
+struct PairHandler;
+
+impl pair::Handler for PairHandler {
+    fn reentrancy_addr(&self) -> [u8; 32] {
+        read_reentrancy_addr()
+    }
+
+    fn token0(&mut self) -> Result<[u8; 32], &'static str> {
         let v = read_addr(&k_token0());
         petal::return_data(&v);
     }
 
-    if sel == selectors::PAIR_TOKEN1 {
+    fn token1(&mut self) -> Result<[u8; 32], &'static str> {
         let v = read_addr(&k_token1());
         petal::return_data(&v);
     }
 
-    if sel == selectors::PAIR_GET_RESERVES {
+    fn get_reserves(&mut self) -> Result<(), &'static str> {
         // Returns: reserve0 (16B) || reserve1 (16B) || block_timestamp_low64 (8B)
         // Packed into 40 bytes.
         let (r0, r1) = get_reserves_raw();
@@ -882,74 +845,43 @@ fn do_call(calldata: Vec<u8>) -> i32 {
         petal::return_data(&out);
     }
 
-    if sel == selectors::PAIR_MINT {
-        // args: to (32B)
-        if args.len() < 32 {
-            petal::revert("pair: mint bad args");
-        }
-        let mut to = [0u8; 32];
-        to.copy_from_slice(&args[..32]);
-
-        // Route through reentrancy petal.
+    fn mint(&mut self, to: [u8; 32]) -> Result<(), &'static str> {
+        // Route through reentrancy petal: builds _mint_inner(to) calldata.
         let self_addr = read_addr(&k_self());
-        // Re-encode calldata as _mint_inner(to) for the reentrancy petal to forward.
         let mut inner_cd = Vec::with_capacity(4 + 32);
-        inner_cd.extend_from_slice(&sel_mint_inner());
+        inner_cd.extend_from_slice(&pair::SEL__MINT_INNER);
         inner_cd.extend_from_slice(&to);
-
         let ret = reentrancy_enter(&self_addr, &inner_cd);
         petal::return_data(&ret);
     }
 
-    if sel == selectors::PAIR_BURN {
-        // args: to (32B)
-        if args.len() < 32 {
-            petal::revert("pair: burn bad args");
-        }
-        let mut to = [0u8; 32];
-        to.copy_from_slice(&args[..32]);
-
+    fn burn(&mut self, to: [u8; 32]) -> Result<(), &'static str> {
         let self_addr = read_addr(&k_self());
         let mut inner_cd = Vec::with_capacity(4 + 32);
-        inner_cd.extend_from_slice(&sel_burn_inner());
+        inner_cd.extend_from_slice(&pair::SEL__BURN_INNER);
         inner_cd.extend_from_slice(&to);
-
         let ret = reentrancy_enter(&self_addr, &inner_cd);
         petal::return_data(&ret);
     }
 
-    if sel == selectors::PAIR_SWAP {
-        // args: amount0Out (32B) || amount1Out (32B) || to (32B)
-        if args.len() < 96 {
-            petal::revert("pair: swap bad args");
-        }
-        let mut a0out_b = [0u8; 32];
-        let mut a1out_b = [0u8; 32];
-        let mut to = [0u8; 32];
-        a0out_b.copy_from_slice(&args[..32]);
-        a1out_b.copy_from_slice(&args[32..64]);
-        to.copy_from_slice(&args[64..96]);
-
+    fn swap(
+        &mut self,
+        amount0_out: U256,
+        amount1_out: U256,
+        to: [u8; 32],
+    ) -> Result<(), &'static str> {
         let self_addr = read_addr(&k_self());
         let mut inner_cd = Vec::with_capacity(4 + 32 + 32 + 32);
-        inner_cd.extend_from_slice(&sel_swap_inner());
-        inner_cd.extend_from_slice(&a0out_b);
-        inner_cd.extend_from_slice(&a1out_b);
+        inner_cd.extend_from_slice(&pair::SEL__SWAP_INNER);
+        inner_cd.extend_from_slice(&amount0_out.0);
+        inner_cd.extend_from_slice(&amount1_out.0);
         inner_cd.extend_from_slice(&to);
-
         reentrancy_enter(&self_addr, &inner_cd);
         petal::return_data(&[]);
     }
 
-    if sel == selectors::PAIR_SKIM {
-        // args: to (32B)
+    fn skim(&mut self, to: [u8; 32]) -> Result<(), &'static str> {
         // Transfers surplus balances (above reserves) to `to`.
-        if args.len() < 32 {
-            petal::revert("pair: skim bad args");
-        }
-        let mut to = [0u8; 32];
-        to.copy_from_slice(&args[..32]);
-
         let token0 = read_addr(&k_token0());
         let token1 = read_addr(&k_token1());
         let self_addr = read_addr(&k_self());
@@ -976,8 +908,7 @@ fn do_call(calldata: Vec<u8>) -> i32 {
         petal::return_data(&[]);
     }
 
-    if sel == selectors::PAIR_SYNC {
-        // Sync reserves to current balances.
+    fn sync(&mut self) -> Result<(), &'static str> {
         let token0 = read_addr(&k_token0());
         let token1 = read_addr(&k_token1());
         let self_addr = read_addr(&k_self());
@@ -997,76 +928,42 @@ fn do_call(calldata: Vec<u8>) -> i32 {
         petal::return_data(&[]);
     }
 
-    // ---- Internal reentrancy gate selectors ----
-    // These are only meant to be called by the reentrancy petal.
+    // ---- #[internal] reentrancy gate selectors ----
 
-    {
-        let sel_lcs = sel_lock_check_and_set();
-        if sel == sel_lcs {
-            if read_bool(&k_lock()) {
-                petal::revert("pair: locked");
-            }
-            write_bool(&k_lock(), true);
-            petal::return_data(&[1u8]); // success
+    fn lock_check_and_set(&mut self) -> Result<(), &'static str> {
+        if read_bool(&k_lock()) {
+            petal::revert("pair: locked");
         }
+        write_bool(&k_lock(), true);
+        petal::return_data(&[1u8]);
     }
 
-    {
-        let sel_lc = sel_lock_clear();
-        if sel == sel_lc {
-            write_bool(&k_lock(), false);
-            petal::return_data(&[1u8]);
-        }
+    fn lock_clear(&mut self) -> Result<(), &'static str> {
+        write_bool(&k_lock(), false);
+        petal::return_data(&[1u8]);
     }
 
-    // ---- Inner method selectors (called by reentrancy petal) ----
+    // ---- #[internal] inner methods (full AMM logic) ----
 
-    {
-        let smi = sel_mint_inner();
-        if sel == smi {
-            // args: to (32B)
-            if args.len() < 32 {
-                petal::revert("pair: _mint_inner bad args");
-            }
-            let mut to = [0u8; 32];
-            to.copy_from_slice(&args[..32]);
-            let ret = do_mint_inner(&to);
-            petal::return_data(&ret);
-        }
+    fn _mint_inner(&mut self, to: [u8; 32]) -> Result<(), &'static str> {
+        let ret = do_mint_inner(&to);
+        petal::return_data(&ret);
     }
 
-    {
-        let sbi = sel_burn_inner();
-        if sel == sbi {
-            if args.len() < 32 {
-                petal::revert("pair: _burn_inner bad args");
-            }
-            let mut to = [0u8; 32];
-            to.copy_from_slice(&args[..32]);
-            let ret = do_burn_inner(&to);
-            petal::return_data(&ret);
-        }
+    fn _burn_inner(&mut self, to: [u8; 32]) -> Result<(), &'static str> {
+        let ret = do_burn_inner(&to);
+        petal::return_data(&ret);
     }
 
-    {
-        let ssi = sel_swap_inner();
-        if sel == ssi {
-            if args.len() < 96 {
-                petal::revert("pair: _swap_inner bad args");
-            }
-            let mut a0out_b = [0u8; 32];
-            let mut a1out_b = [0u8; 32];
-            let mut to = [0u8; 32];
-            a0out_b.copy_from_slice(&args[..32]);
-            a1out_b.copy_from_slice(&args[32..64]);
-            to.copy_from_slice(&args[64..96]);
-            let ret = do_swap_inner(U256(a0out_b), U256(a1out_b), &to);
-            petal::return_data(&ret);
-        }
+    fn _swap_inner(
+        &mut self,
+        amount0_out: U256,
+        amount1_out: U256,
+        to: [u8; 32],
+    ) -> Result<(), &'static str> {
+        do_swap_inner(amount0_out, amount1_out, &to);
+        petal::return_data(&[]);
     }
-
-    // Unknown selector.
-    petal::revert("pair: unknown selector");
 }
 
 // ---------------------------------------------------------------------------
@@ -1076,7 +973,6 @@ fn do_call(calldata: Vec<u8>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bloom_dex_abi::u256::U256;
 
     // Helper: compute swap output using the Uniswap v2 formula via U256.
     // a_out = (a_in * 997 * r_out) / (r_in * 1000 + a_in * 997)
@@ -1131,6 +1027,78 @@ mod tests {
         lhs >= rhs
     }
 
+    // ---- Selector parity tests ----
+
+    #[test]
+    fn pair_selectors_match_dex_v0_canonical_strings() {
+        fn crate_sel(method: &[u8]) -> [u8; 4] {
+            let h = blake3::hash(method);
+            let b = h.as_bytes();
+            [b[0], b[1], b[2], b[3]]
+        }
+        assert_eq!(pair::SEL_TOKEN0,             crate_sel(b"pair.token0()"));
+        assert_eq!(pair::SEL_TOKEN1,             crate_sel(b"pair.token1()"));
+        assert_eq!(pair::SEL_GET_RESERVES,       crate_sel(b"pair.get_reserves()"));
+        assert_eq!(pair::SEL_MINT,               crate_sel(b"pair.mint(address)"));
+        assert_eq!(pair::SEL_BURN,               crate_sel(b"pair.burn(address)"));
+        assert_eq!(pair::SEL_SWAP,               crate_sel(b"pair.swap(u256,u256,address)"));
+        assert_eq!(pair::SEL_SKIM,               crate_sel(b"pair.skim(address)"));
+        assert_eq!(pair::SEL_SYNC,               crate_sel(b"pair.sync()"));
+        assert_eq!(pair::SEL_LOCK_CHECK_AND_SET, crate_sel(b"pair.lock_check_and_set()"));
+        assert_eq!(pair::SEL_LOCK_CLEAR,         crate_sel(b"pair.lock_clear()"));
+        assert_eq!(pair::SEL__MINT_INNER,        crate_sel(b"pair._mint_inner(address)"));
+        assert_eq!(pair::SEL__BURN_INNER,        crate_sel(b"pair._burn_inner(address)"));
+        assert_eq!(pair::SEL__SWAP_INNER,        crate_sel(b"pair._swap_inner(u256,u256,address)"));
+    }
+
+    #[test]
+    fn pair_selectors_match_legacy_dex_abi_constants() {
+        // The chain-ABI macro must emit byte-identical selectors to the old
+        // bloom-dex-abi build.rs table so peer contracts (router, reentrancy)
+        // keep dispatching to the same handlers without code changes.
+        assert_eq!(pair::SEL_TOKEN0,             bloom_dex_abi::selectors::PAIR_TOKEN0);
+        assert_eq!(pair::SEL_TOKEN1,             bloom_dex_abi::selectors::PAIR_TOKEN1);
+        assert_eq!(pair::SEL_GET_RESERVES,       bloom_dex_abi::selectors::PAIR_GET_RESERVES);
+        assert_eq!(pair::SEL_MINT,               bloom_dex_abi::selectors::PAIR_MINT);
+        assert_eq!(pair::SEL_BURN,               bloom_dex_abi::selectors::PAIR_BURN);
+        assert_eq!(pair::SEL_SWAP,               bloom_dex_abi::selectors::PAIR_SWAP);
+        assert_eq!(pair::SEL_SKIM,               bloom_dex_abi::selectors::PAIR_SKIM);
+        assert_eq!(pair::SEL_SYNC,               bloom_dex_abi::selectors::PAIR_SYNC);
+        assert_eq!(pair::SEL_LOCK_CHECK_AND_SET, bloom_dex_abi::selectors::PAIR_LOCK_CHECK_AND_SET);
+        assert_eq!(pair::SEL_LOCK_CLEAR,         bloom_dex_abi::selectors::PAIR_LOCK_CLEAR);
+        assert_eq!(pair::SEL__MINT_INNER,        bloom_dex_abi::selectors::PAIR_MINT_INNER);
+        assert_eq!(pair::SEL__BURN_INNER,        bloom_dex_abi::selectors::PAIR_BURN_INNER);
+        assert_eq!(pair::SEL__SWAP_INNER,        bloom_dex_abi::selectors::PAIR_SWAP_INNER);
+    }
+
+    #[test]
+    fn init_payload_is_exactly_128_bytes() {
+        let t0 = [0x01u8; 32];
+        let t1 = [0x02u8; 32];
+        let ra = [0x03u8; 32];
+        let sa = [0x04u8; 32];
+        let payload = pair::init_calldata(&t0, &t1, &ra, &sa);
+        assert_eq!(payload.len(), 128, "pair init must be 128 bytes");
+        assert_eq!(&payload[0..32],   &t0);
+        assert_eq!(&payload[32..64],  &t1);
+        assert_eq!(&payload[64..96],  &ra);
+        assert_eq!(&payload[96..128], &sa);
+
+        let parsed = pair::parse_init(&payload).unwrap();
+        assert_eq!(parsed.token0, t0);
+        assert_eq!(parsed.token1, t1);
+        assert_eq!(parsed.reentrancy_addr, ra);
+        assert_eq!(parsed.pair_self_addr, sa);
+    }
+
+    #[test]
+    fn init_payload_rejects_wrong_length() {
+        let short = [0u8; 127];
+        assert!(pair::parse_init(&short).is_err());
+        let long = [0u8; 129];
+        assert!(pair::parse_init(&long).is_err());
+    }
+
     // ---- Swap formula tests ----
 
     #[test]
@@ -1161,16 +1129,9 @@ mod tests {
 
         let got = swap_out(a_in, r_in, r_out);
 
-        // Manual: (1e15 * 997 * 1e18) / (1e18 * 1000 + 1e15 * 997)
-        //       = 997e33 / (1e21 + 997e15) = 997e33 / 1_000_997e15
-        // ≈ 996_006_981_039_903 ≈ 9.96e14
         assert!(got > 0);
-        // The output should be slightly less than a_in due to the fee.
         assert!(got < a_in, "output should be less than input (fee)");
-        // Check ~0.3% fee: got ≈ a_in * 0.997 (ignoring slippage for balanced pool).
-        // For a balanced pool with small trades, slippage ≈ 0, so got ≈ a_in * 0.997.
         let approx_no_slippage = a_in * 997 / 1000;
-        // Allow 0.1% tolerance for slippage.
         let tolerance = a_in / 1000;
         assert!(
             got >= approx_no_slippage - tolerance,
@@ -1189,9 +1150,7 @@ mod tests {
 
         let got = swap_out(a_in, r_in, r_out);
 
-        // ≈ a_in * 997 / 1000 (balanced pool, tiny slippage)
-        let approx = 996_006_981_039_903_216u128; // computed by hand
-        // Allow 1 token of tolerance for integer rounding.
+        let approx = 996_006_981_039_903_216u128;
         assert!(
             (got as i128 - approx as i128).abs() <= 1,
             "expected ≈{approx}, got {got}"
@@ -1201,19 +1160,15 @@ mod tests {
 
     #[test]
     fn swap_invariant_check_u256() {
-        // Test the U256 invariant check directly.
         let r_in = 1_000_000u128;
         let r_out = 2_000_000u128;
         let a_in = 500u128;
         let a_out = swap_out(a_in, r_in, r_out);
 
-        // Verify k-check passes.
         assert!(invariant_holds_after_swap(r_in, r_out, a_in, a_out));
 
-        // One extra unit of output should fail.
         let a_out_too_much = a_out + 1;
         if r_out > a_out_too_much {
-            // Only test if we don't go negative.
             assert!(!invariant_holds_after_swap(r_in, r_out, a_in, a_out_too_much));
         }
     }
@@ -1246,22 +1201,15 @@ mod tests {
 
     #[test]
     fn sqrt_non_perfect() {
-        // sqrt(2) = 1
         assert_eq!(U256::from_u64(2).sqrt(), U256::from_u64(1));
-        // sqrt(3) = 1
         assert_eq!(U256::from_u64(3).sqrt(), U256::from_u64(1));
-        // sqrt(8) = 2
         assert_eq!(U256::from_u64(8).sqrt(), U256::from_u64(2));
-        // sqrt(10) = 3
         assert_eq!(U256::from_u64(10).sqrt(), U256::from_u64(3));
-        // sqrt(15) = 3
         assert_eq!(U256::from_u64(15).sqrt(), U256::from_u64(3));
     }
 
     #[test]
     fn sqrt_large_number() {
-        // 1e21 * 1e21 = 1e42; sqrt = 1e21.
-        // Use u128 to stay within U256.
         let r: u128 = 1_000_000_000_000_000_000_000; // 1e21
         let sq = U256::from_u128(r)
             .checked_mul(U256::from_u128(r))
@@ -1272,8 +1220,6 @@ mod tests {
 
     #[test]
     fn sqrt_min_liquidity_scenario() {
-        // First mint: 1e21 of each token. Product = 1e42. sqrt = 1e21.
-        // liquidity = sqrt(1e21 * 1e21) - 1000 = 1e21 - 1000.
         let amount0 = U256::from_u128(1_000_000_000_000_000_000_000u128);
         let amount1 = U256::from_u128(1_000_000_000_000_000_000_000u128);
         let product = amount0.checked_mul(amount1).unwrap();
@@ -1289,13 +1235,9 @@ mod tests {
 
     #[test]
     fn mint_liquidity_second_mint() {
-        // After first mint of (1e18, 1e18), totalSupply = 1e18 - 1000.
-        // Second mint of (5e17, 5e17):
-        // liq0 = 5e17 * (1e18 - 1000) / 1e18 ≈ 5e17 - 500
-        // liq1 = same
         let r0 = 1_000_000_000_000_000_000u128;
         let r1 = 1_000_000_000_000_000_000u128;
-        let ts = r0 - 1000; // total supply after first mint
+        let ts = r0 - 1000;
         let amount0 = 500_000_000_000_000_000u128;
         let amount1 = 500_000_000_000_000_000u128;
 
@@ -1309,7 +1251,6 @@ mod tests {
         let liq1 = a1_u.checked_mul(ts_u).unwrap().checked_div(r1_u).unwrap();
         let liq = if liq0 < liq1 { liq0 } else { liq1 };
 
-        // Should be ≈ 5e17 - 500 (due to MINIMUM_LIQUIDITY lock).
         let expected = U256::from_u128(amount0 * ts / r0);
         assert_eq!(liq, expected);
         assert!(liq > U256::ZERO);
@@ -1317,19 +1258,15 @@ mod tests {
 
     #[test]
     fn burn_amounts() {
-        // totalSupply = 1e18 - 1000, reserves = (1e21, 1e21).
-        // LP tokens burned = 1e17.
-        // amount0 = 1e17 * 1e21 / (1e18 - 1000) ≈ 1e20
         let total = U256::from_u128(1_000_000_000_000_000_000u128 - 1000);
-        let lp = U256::from_u128(100_000_000_000_000_000u128); // 1e17
-        let bal0 = U256::from_u128(1_000_000_000_000_000_000_000u128); // 1e21
+        let lp = U256::from_u128(100_000_000_000_000_000u128);
+        let bal0 = U256::from_u128(1_000_000_000_000_000_000_000u128);
         let bal1 = bal0;
 
         let amt0 = lp.checked_mul(bal0).unwrap().checked_div(total).unwrap();
         let amt1 = lp.checked_mul(bal1).unwrap().checked_div(total).unwrap();
 
-        // Both should be approximately 1e20.
-        let approx = U256::from_u128(100_000_000_000_000_100_000u128); // slightly above 1e20
+        let approx = U256::from_u128(100_000_000_000_000_100_000u128);
         assert!(amt0 <= approx);
         assert!(amt0 >= U256::from_u128(99_999_999_000_000_000_000u128));
         assert_eq!(amt0, amt1);

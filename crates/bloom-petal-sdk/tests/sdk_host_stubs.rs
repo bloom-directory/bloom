@@ -25,7 +25,7 @@ fn public_api_shapes() {
 
     // msg module
     let _sender_fn: fn() -> [u8; 32] = bloom_petal_sdk::msg::sender;
-    let _value_fn: fn() -> [u8; 32] = bloom_petal_sdk::msg::value;
+    let _value_fn: fn() -> bloom_petal_sdk::LoomValue = bloom_petal_sdk::msg::value;
     let _cd_fn: fn() -> alloc::vec::Vec<u8> = bloom_petal_sdk::msg::calldata;
 
     // log module
@@ -45,7 +45,7 @@ fn public_api_shapes() {
     let _call_fn: fn(
         &[u8; 32],
         &[u8],
-        &[u8; 32],
+        bloom_petal_sdk::LoomValue,
     ) -> Result<alloc::vec::Vec<u8>, i32> = bloom_petal_sdk::petal::call;
     // return_data and revert are `-> !` so we just verify the module exists.
     // We cannot take a fn pointer to a diverging fn in a type annotation easily,

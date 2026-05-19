@@ -2011,6 +2011,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-chain-abi"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bloom-chain-abi-macros",
+]
+
+[[package]]
+name = "bloom-chain-abi-macros"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "bloom-chain-consensus"
 version = "0.1.0"
 dependencies = [
@@ -2138,6 +2156,7 @@ name = "bloom-dex-abi"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "bloom-chain-abi",
 ]
 
 [[package]]
@@ -2165,6 +2184,8 @@ dependencies = [
 name = "bloom-dex-erc20"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "bloom-chain-abi",
  "bloom-dex-abi",
  "bloom-petal-sdk",
 ]
@@ -2174,6 +2195,7 @@ name = "bloom-dex-factory"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "bloom-chain-abi",
  "bloom-dex-abi",
  "bloom-petal-sdk",
 ]
@@ -2198,6 +2220,8 @@ dependencies = [
 name = "bloom-dex-pair"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "bloom-chain-abi",
  "bloom-dex-abi",
  "bloom-petal-sdk",
 ]
@@ -2207,6 +2231,7 @@ name = "bloom-dex-reentrancy"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "bloom-chain-abi",
  "bloom-dex-abi",
  "bloom-petal-sdk",
 ]
@@ -2215,6 +2240,8 @@ dependencies = [
 name = "bloom-dex-router"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "bloom-chain-abi",
  "bloom-dex-abi",
  "bloom-petal-sdk",
 ]
@@ -2224,6 +2251,7 @@ name = "bloom-dex-wloom"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "bloom-chain-abi",
  "bloom-dex-abi",
  "bloom-petal-sdk",
 ]

@@ -12,11 +12,11 @@ name = "bloom_dex_abi"
 blake3 = { version = "1", default-features = false }
 
 [dependencies]
-# No runtime deps needed — selectors are generated at build time.
+bloom-chain-abi = { workspace = true }
 
 [features]
 default = ["std"]
-std = []
+std = ["bloom-chain-abi/std"]
 
 [dev-dependencies]
 # nothing extra needed; tests use std

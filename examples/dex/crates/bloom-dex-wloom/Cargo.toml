@@ -10,6 +10,7 @@ name = "bloom_dex_wloom"
 crate-type = ["cdylib"]
 
 [dependencies]
+bloom-chain-abi = { workspace = true, default-features = false }
 bloom-dex-abi  = { workspace = true, default-features = false }
 bloom-petal-sdk = { workspace = true }
 

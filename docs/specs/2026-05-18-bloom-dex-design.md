@@ -73,41 +73,58 @@ on a 4-byte selector (§4).
 
 ## 4. Calldata encoding
 
-bloom-chain has no Solidity ABI. The DEX defines a single thin
-encoding rule used by every petal:
+The DEX does NOT define its own calldata encoding. Encoding,
+selector hashing, strict decoding, and dispatcher generation all
+live in the chain-owned `bloom-chain-abi` crate; see **chain spec
+§7.10 (Canonical ABI for petal calldata)** for the full
+specification. Every DEX petal declares its ABI via the
+`bloom_chain_abi::contract!` macro, which emits client-side
+call builders, a typed `Handler` trait, and a strict dispatcher
+from a single declaration.
 
-```
-calldata := selector (4 bytes) || args (concatenated, fixed-width)
-```
+The remainder of this section enumerates the canonical method
+strings the DEX uses — i.e. the inputs to `blake3(...)[..4]` selector
+derivation defined in chain spec §7.10.2. The chain governs HOW;
+the DEX only chooses the per-petal method list.
 
-- **Selector** = first 4 bytes of `blake3("erc20.transfer(addr,u256)")`
-  (or whatever the canonical method string is). All method strings
-  are listed in §4.1 below.
-- **Argument widths** are fixed and unpadded:
-  - `Address` = 32 bytes (chain spec §4.3).
-  - `u256` = 32 bytes, big-endian. (LOOM and token balances are
-    `u256` for ERC-20 compatibility, even though native LOOM
-    balances at the chain level are `u128` — pair / LP / router
-    math operates on `u256` to avoid overflow on intermediate
-    products. Conversion at the wLOOM boundary clamps to `u128`.)
-  - `u128` = 16 bytes, big-endian.
-  - `u64` = 8 bytes, big-endian.
-  - `bool` = 1 byte (0 / 1).
-  - `bytes32` = 32 bytes.
-  - `Vec<Address>` (paths only) = `u16` big-endian length, then
-    `length * 32` bytes.
-- Fixed-width arrays have no length prefix. Variable-length args
-  are only used in the router's path arg and use the `u16`-length
-  prefix above. Anything else is rejected by the petal.
+Width and type conventions (recapped from chain spec §7.10.1 for
+reference):
+- `Address` = 32 bytes (chain spec §4.3).
+- `u256` = 32 bytes big-endian. (LOOM and token balances are
+  `u256` for ERC-20 compatibility, even though native LOOM
+  balances at the chain level are `u128` — pair / LP / router
+  math operates on `u256` to avoid overflow on intermediate
+  products. Conversion at the wLOOM boundary clamps to `u128`
+  via `LoomValue::try_from_be_u256_bytes`, which reverts on
+  overflow rather than silently truncating.)
+- `u128` = 16 bytes big-endian.
+- `u64` = 8 bytes big-endian.
+- `bool` = 1 byte (0 / 1).
+- `bytes32` = 32 bytes.
+- `Vec<Address>` (paths only) = `u16` big-endian length + `length * 32` bytes.
+- `bytes` (variable-length tail, used only by
+  `reentrancy.enter`) = raw remainder of calldata, no length
+  prefix; chain spec §7.10.1 restricts it to the LAST
+  positional argument of a method.
 
-Petals revert (chain spec §7.6 `petal.revert`) on any
-selector/arg-shape mismatch.
+Strict decoding (chain spec §7.10.4) means every dispatcher
+rejects trailing bytes, unknown selectors, short calldata, and
+out-of-range typed values. The DEX inherits this behaviour
+automatically through `contract!`.
 
 Return data:
 - ERC-20 read methods return their natural width (e.g.
   `balanceOf -> u256` → 32 bytes raw).
 - Write methods return either 1 byte `1` for `true` or 32-byte
   `u256` for amounts (see per-method tables below).
+- Multi-value returns (`pair.burn → (u256,u256)`,
+  `router.add_liquidity → (u256,u256,u256)`, `router.swap_* →
+  Vec<u256>`) are NOT expressible in `contract!`'s return slot
+  (chain spec §7.10.6); those methods declare a void macro
+  return and emit `petal.return` from the handler with a manually
+  constructed payload via `bloom_chain_abi::Encoder`. The
+  canonical signature string for selector hashing still reflects
+  only the argument list, never the return.
 - Revert reason strings are UTF-8 bytes passed to `petal.revert`.
 
 ### 4.1 Method strings (canonical, hashed for selectors)

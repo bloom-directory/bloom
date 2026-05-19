@@ -9,10 +9,8 @@ license = "MIT"
 name = "bloom_dex_factory"
 crate-type = ["cdylib"]
 
-[build-dependencies]
-blake3 = { version = "1", default-features = false }
-
 [dependencies]
+bloom-chain-abi = { workspace = true, default-features = false }
 bloom-dex-abi   = { workspace = true, default-features = false }
 bloom-petal-sdk = { workspace = true }
 

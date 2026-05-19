@@ -675,13 +675,22 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
                     // the negative return code and continues executing.
                     caller.data_mut().chain_ctx.snapshot = parent_snapshot_checkpoint;
                     match e {
-                        SubCallError::Reverted { reason, .. } => {
+                        SubCallError::Reverted { reason, fuel_used, .. } => {
+                            // DoS-hardening 2026-05-19: even though the
+                            // child reverted (and its writes are rolled
+                            // back), the parent's fuel meter MUST be
+                            // debited by what the child actually burned.
+                            // Otherwise burn-then-revert is free.
+                            let _ = consume_fuel(&mut caller, fuel_used);
                             // Surface the sub-call's revert reason so
                             // callers can inspect it.
                             caller.data_mut().chain_ctx.return_data = reason;
                             HostError::Backend("callee reverted".into()).as_wasm_code() as i64
                         }
-                        SubCallError::Trapped { .. } => {
+                        SubCallError::Trapped { fuel_used, .. } => {
+                            // Same hardening for traps: a trapped child
+                            // burned real work and the parent pays for it.
+                            let _ = consume_fuel(&mut caller, fuel_used);
                             HostError::Backend("callee trapped".into()).as_wasm_code() as i64
                         }
                     }
@@ -1040,11 +1049,20 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
                     }
                     0
                 }
-                Err(_e) => {
+                Err(e) => {
                     // Failed init: restore parent's pre-deploy checkpoint —
                     // this rolls back BOTH the staged account and any init
                     // writes the child may have done before reverting.
                     caller.data_mut().chain_ctx.snapshot = parent_snapshot_checkpoint;
+                    // DoS-hardening 2026-05-19: charge the parent for the
+                    // fuel the failed init actually burned. Otherwise a
+                    // deploy whose `init` runs a fuel-bomb and reverts is
+                    // free to the caller.
+                    let fuel_used = match &e {
+                        SubCallError::Reverted { fuel_used, .. } => *fuel_used,
+                        SubCallError::Trapped { fuel_used, .. } => *fuel_used,
+                    };
+                    let _ = consume_fuel(&mut caller, fuel_used);
                     HostError::Backend("init failed".into()).as_wasm_code() as i64
                 }
             }
@@ -1059,8 +1077,8 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
 // ---------------------------------------------------------------------------
 
 enum SubCallError {
-    Reverted { snapshot: Box<StateSnapshot>, reason: Option<Vec<u8>> },
-    Trapped { snapshot: Box<StateSnapshot>, error: Option<String> },
+    Reverted { snapshot: Box<StateSnapshot>, reason: Option<Vec<u8>>, fuel_used: u64 },
+    Trapped { snapshot: Box<StateSnapshot>, error: Option<String>, fuel_used: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,6 +1154,7 @@ fn dispatch_chain_call_sync(
     let module = Module::new(engine, &input.wasm).map_err(|e| SubCallError::Trapped {
         snapshot: Box::new(bloom_chain_state::State::new().snapshot()),
         error: Some(format!("module load: {e}")),
+        fuel_used: 0,
     })?;
 
     let petal_hash = blake3_tagged(tags::PETAL, &input.wasm);
@@ -1159,6 +1178,7 @@ fn dispatch_chain_call_sync(
     store.set_fuel(input.fuel).map_err(|e| SubCallError::Trapped {
         snapshot: Box::new(bloom_chain_state::State::new().snapshot()),
         error: Some(format!("set_fuel: {e}")),
+        fuel_used: 0,
     })?;
     // Install the runtime ResourceLimiter so `memory.grow` past the static
     // validation cap (256 pages / 16 MiB) traps instead of succeeding
@@ -1174,17 +1194,25 @@ fn dispatch_chain_call_sync(
     link_chain_imports(&mut linker).map_err(|e| SubCallError::Trapped {
         snapshot: Box::new(bloom_chain_state::State::new().snapshot()),
         error: Some(format!("link imports: {e}")),
+        fuel_used: 0,
     })?;
 
     let instance = match linker.instantiate(&mut store, &module) {
         Ok(i) => i,
         Err(e) => {
             let err_msg = format!("instantiate: {e}");
+            // Instantiation may execute `start`/global-init code that burns
+            // fuel, so capture the real `fuel_used` for the caller's meter.
+            let fuel_used = input.fuel.saturating_sub(store.get_fuel().unwrap_or(0));
             let snap = std::mem::replace(
                 &mut store.data_mut().chain_ctx.snapshot,
                 bloom_chain_state::State::new().snapshot(),
             );
-            return Err(SubCallError::Trapped { snapshot: Box::new(snap), error: Some(err_msg) });
+            return Err(SubCallError::Trapped {
+                snapshot: Box::new(snap),
+                error: Some(err_msg),
+                fuel_used,
+            });
         }
     };
 
@@ -1197,11 +1225,16 @@ fn dispatch_chain_call_sync(
         Ok(f) => f,
         Err(e) => {
             let err_msg = format!("get_typed_func('{entry_name}'): {e}");
+            let fuel_used = input.fuel.saturating_sub(store.get_fuel().unwrap_or(0));
             let snap = std::mem::replace(
                 &mut store.data_mut().chain_ctx.snapshot,
                 bloom_chain_state::State::new().snapshot(),
             );
-            return Err(SubCallError::Trapped { snapshot: Box::new(snap), error: Some(err_msg) });
+            return Err(SubCallError::Trapped {
+                snapshot: Box::new(snap),
+                error: Some(err_msg),
+                fuel_used,
+            });
         }
     };
 
@@ -1234,10 +1267,18 @@ fn dispatch_chain_call_sync(
         }
         Err(e) => {
             // Trap. Check if it was triggered by petal.return or petal.revert.
+            //
+            // `fuel_used` is carried back on EVERY revert / trap variant
+            // (DoS-hardening 2026-05-19): the caller must be billed the
+            // real work the child performed, identical to the success
+            // path. Otherwise an adversary can repeatedly call a contract
+            // that burns fuel and reverts, costing validators real work
+            // without paying for it.
             if revert_reason_opt.is_some() {
                 return Err(SubCallError::Reverted {
                     snapshot: Box::new(snapshot),
                     reason: revert_reason_opt,
+                    fuel_used,
                 });
             }
             if return_data_opt.is_some() {
@@ -1256,6 +1297,7 @@ fn dispatch_chain_call_sync(
             Err(SubCallError::Trapped {
                 snapshot: Box::new(snapshot),
                 error: Some(format!("{e:?}")),
+                fuel_used,
             })
         }
     }
@@ -1291,14 +1333,21 @@ impl PetalVm {
         let engine = chain_engine()?;
         match dispatch_chain_call_sync(engine, input, 0) {
             Ok(out) => Ok(out),
-            Err(SubCallError::Reverted { snapshot, reason }) => {
+            Err(SubCallError::Reverted { snapshot, reason, fuel_used }) => {
                 // Surface revert as a successful `ChainCallOutput` carrying
                 // the reason. The snapshot it travels with is the mutated
                 // child snapshot — the executor will not commit it.
+                //
+                // CRITICAL (DoS-hardening 2026-05-19): `fuel_used` is the
+                // real fuel the child burned before reverting — NOT zero.
+                // A reverting contract must not look "free" to the caller;
+                // otherwise an adversary can call a fuel-burning + reverting
+                // contract repeatedly, costing validators real work without
+                // paying for it.
                 Ok(ChainCallOutput {
                     return_data: None,
                     revert_reason: Some(reason.unwrap_or_default()),
-                    fuel_used: 0,
+                    fuel_used,
                     logs: Vec::new(),
                     snapshot: *snapshot,
                 })

@@ -33,10 +33,14 @@
 //! v1 will add `host.try_call` for a finally-clause pattern so the lock is
 //! cleared even on inner reverts.
 //!
-//! # Public ABI
+//! # ABI
 //!
-//! - `reentrancy.enter(address callee, bytes inner_calldata)` — the single
-//!   exported method. Selector from `bloom_dex_abi::selectors::REENTRANCY_ENTER`.
+//! Selectors, calldata encoding, return packing, and dispatch are all generated
+//! by the chain-owned `bloom_chain_abi::contract!` macro below. The single
+//! exported method is `reentrancy.enter(address,bytes)` whose calldata layout
+//! is `selector || target (32B) || inner_calldata (raw, no length prefix)` —
+//! the macro's `bytes` argument is rest-of-buffer, matching the wire format
+//! the pair petal currently produces.
 //!
 //! # Revert prefix
 //!
@@ -48,84 +52,22 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use bloom_chain_abi::{DispatchError, contract};
 use bloom_dex_abi::selectors;
-use bloom_petal_sdk::{msg, petal};
+use bloom_petal_sdk::{LoomValue, msg, petal};
+
+// ---------------------------------------------------------------------------
+// Chain-owned ABI declaration
+// ---------------------------------------------------------------------------
+
+contract! {
+    contract Reentrancy {
+        fn enter(target: Address, inner: bytes);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Petal entry points
-// ---------------------------------------------------------------------------
-
-/// `init` — no parameters; reentrancy petal has no constructor state.
-fn do_init(_calldata: Vec<u8>) {
-    // Stateless: no initialisation needed.
-}
-
-/// `call` — dispatches on the 4-byte selector.
-fn do_call(calldata: Vec<u8>) -> i32 {
-    if calldata.len() < 4 {
-        petal::revert("reentrancy: calldata too short");
-    }
-    let sel: [u8; 4] = [calldata[0], calldata[1], calldata[2], calldata[3]];
-
-    if sel == selectors::REENTRANCY_ENTER {
-        handle_enter(&calldata[4..]);
-    } else {
-        petal::revert("reentrancy: unknown selector");
-    }
-    // handle_* always exits via petal::return_data or petal::revert.
-    0
-}
-
-/// `reentrancy.enter(address target, bytes inner_calldata)`
-///
-/// Calldata layout (args after selector):
-///   target (32B) || inner_calldata (variable)
-///
-/// - Reverts `"reentrancy: caller != target"` if `msg.sender != target`.
-/// - Calls `pair.lock_check_and_set()` on `target` — reverts `"pair: locked"` if held.
-/// - Forwards `inner_calldata` to `target` via `petal.call`, propagating any revert.
-/// - On success, calls `pair.lock_clear()` to release the lock.
-/// - Returns the return data from the inner call.
-fn handle_enter(args: &[u8]) {
-    if args.len() < 32 {
-        petal::revert("reentrancy: enter: bad args");
-    }
-
-    let mut target = [0u8; 32];
-    target.copy_from_slice(&args[..32]);
-
-    let inner_calldata = &args[32..];
-
-    // The pair calls `reentrancy.enter(self, ...)` — verify msg.sender == target.
-    let caller = msg::sender();
-    if caller != target {
-        petal::revert("reentrancy: caller != target");
-    }
-
-    // Zero LOOM value for all petal.call invocations.
-    let zero_value = [0u8; 32];
-
-    // Step 1: acquire lock in the pair (reverts "pair: locked" if already set).
-    let mut lock_cd = Vec::with_capacity(4);
-    lock_cd.extend_from_slice(&selectors::PAIR_LOCK_CHECK_AND_SET);
-    petal::call(&target, &lock_cd, &zero_value)
-        .unwrap_or_else(|_| petal::revert("reentrancy: lock_check_and_set failed"));
-
-    // Step 2: forward the inner call — reverts propagate naturally (lock_clear skipped in v0).
-    let ret = petal::call(&target, inner_calldata, &zero_value)
-        .unwrap_or_else(|_| petal::revert("reentrancy: inner call failed"));
-
-    // Step 3: release the lock unconditionally on the success path.
-    let mut clear_cd = Vec::with_capacity(4);
-    clear_cd.extend_from_slice(&selectors::PAIR_LOCK_CLEAR);
-    petal::call(&target, &clear_cd, &zero_value)
-        .unwrap_or_else(|_| petal::revert("reentrancy: lock_clear failed"));
-
-    petal::return_data(&ret);
-}
-
-// ---------------------------------------------------------------------------
-// Wasm entry points
 // ---------------------------------------------------------------------------
 
 bloom_petal_sdk::petal! {
@@ -133,20 +75,96 @@ bloom_petal_sdk::petal! {
     call => do_call,
 }
 
+/// `init` — no parameters; reentrancy petal has no constructor state.
+fn do_init(_calldata: Vec<u8>) {
+    // Stateless: no initialisation needed.
+}
+
+/// `call` — routes a method call through the macro-generated dispatcher and
+/// translates `DispatchError` into the petal-SDK revert ABI. The `enter`
+/// handler exits via `petal::return_data` / `petal::revert` directly, so the
+/// `Ok(_)` branch is only reached if the dispatcher itself returns (it won't
+/// for our diverging handler).
+fn do_call(calldata: Vec<u8>) -> i32 {
+    let mut handler = ReentrancyHandler;
+    let caller = msg::sender();
+    match reentrancy::dispatch(&mut handler, &caller, &calldata) {
+        Ok(data) => petal::return_data(&data),
+        Err(DispatchError::ShortCalldata) => petal::revert("reentrancy: calldata too short"),
+        Err(DispatchError::UnknownSelector(_)) => petal::revert("reentrancy: unknown selector"),
+        Err(DispatchError::Decode(_)) => petal::revert("reentrancy: bad args"),
+        Err(DispatchError::Unauthorized) => petal::revert("reentrancy: unauthorized"),
+        Err(DispatchError::Handler(m)) => petal::revert(m),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handler — diverges via petal::return_data on the success path
+// ---------------------------------------------------------------------------
+
+struct ReentrancyHandler;
+
+impl reentrancy::Handler for ReentrancyHandler {
+    /// `reentrancy.enter(address target, bytes inner_calldata)`
+    ///
+    /// - Reverts `"reentrancy: caller != target"` if `msg.sender != target`.
+    /// - Calls `pair.lock_check_and_set()` on `target` — reverts `"pair: locked"` if held.
+    /// - Forwards `inner_calldata` to `target` via `petal.call`, propagating any revert.
+    /// - On success, calls `pair.lock_clear()` to release the lock.
+    /// - Exits via `petal::return_data(ret)` (does not return to the dispatcher).
+    fn enter(
+        &mut self,
+        target: [u8; 32],
+        inner: Vec<u8>,
+    ) -> Result<(), &'static str> {
+        // The pair calls `reentrancy.enter(self, ...)` — verify msg.sender == target.
+        let caller = msg::sender();
+        if caller != target {
+            petal::revert("reentrancy: caller != target");
+        }
+
+        // Zero LOOM value for all petal.call invocations.
+        let zero_value = LoomValue::ZERO;
+
+        // Step 1: acquire lock in the pair (reverts "pair: locked" if already set).
+        let mut lock_cd = Vec::with_capacity(4);
+        lock_cd.extend_from_slice(&selectors::PAIR_LOCK_CHECK_AND_SET);
+        petal::call(&target, &lock_cd, zero_value)
+            .unwrap_or_else(|_| petal::revert("reentrancy: lock_check_and_set failed"));
+
+        // Step 2: forward the inner call — reverts propagate naturally
+        // (lock_clear skipped in v0).
+        let ret = petal::call(&target, &inner, zero_value)
+            .unwrap_or_else(|_| petal::revert("reentrancy: inner call failed"));
+
+        // Step 3: release the lock unconditionally on the success path.
+        let mut clear_cd = Vec::with_capacity(4);
+        clear_cd.extend_from_slice(&selectors::PAIR_LOCK_CLEAR);
+        petal::call(&target, &clear_cd, zero_value)
+            .unwrap_or_else(|_| petal::revert("reentrancy: lock_clear failed"));
+
+        petal::return_data(&ret);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Host-side unit tests (cfg(test), non-wasm32 only)
 //
 // These tests verify:
-// - Selector dispatch wiring (REENTRANCY_ENTER is the only valid selector).
-// - Calldata layout for enter: 4-byte selector + 32-byte target + variable inner.
-// - The shared PAIR_LOCK_CHECK_AND_SET / PAIR_LOCK_CLEAR / PAIR_*_INNER selectors
-//   are stable and not colliding with REENTRANCY_ENTER.
+// - Selector parity: the macro-emitted SEL_ENTER matches the canonical
+//   blake3("reentrancy.enter(address,bytes)") string and the legacy
+//   bloom_dex_abi::selectors::REENTRANCY_ENTER constant.
+// - Calldata layout for enter: 4-byte selector + 32-byte target + variable
+//   raw inner bytes (no length prefix) — the macro's `bytes` tail format.
+// - The shared PAIR_LOCK_CHECK_AND_SET / PAIR_LOCK_CLEAR / PAIR_*_INNER
+//   selectors are stable and do not collide with REENTRANCY_ENTER.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     extern crate std;
-    use alloc::vec::Vec;
+
+    use super::*;
 
     // ---------------------------------------------------------------------------
     // Selector helpers (host-side: use blake3 crate directly for verification)
@@ -159,27 +177,51 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Calldata builders
+    // Calldata builders — use the macro-generated client builder.
     // ---------------------------------------------------------------------------
 
-    /// Build enter calldata: REENTRANCY_ENTER selector || target (32B) || inner_calldata.
+    /// Build enter calldata via the chain-ABI client helper. The macro emits
+    /// `selector || target (32B) || inner (raw tail)`, which is exactly the
+    /// wire format the pair petal currently constructs by hand.
     fn cd_enter(target: [u8; 32], inner: &[u8]) -> Vec<u8> {
-        use bloom_dex_abi::selectors;
-        let mut cd = Vec::with_capacity(4 + 32 + inner.len());
-        cd.extend_from_slice(&selectors::REENTRANCY_ENTER);
-        cd.extend_from_slice(&target);
-        cd.extend_from_slice(inner);
-        cd
+        reentrancy::calls::enter(&target, inner)
     }
 
     // ---------------------------------------------------------------------------
-    // Tests
+    // Selector parity tests (chain-ABI macro vs. canonical strings & legacy)
     // ---------------------------------------------------------------------------
 
-    /// REENTRANCY_ENTER selector matches direct blake3 computation.
+    /// SEL_ENTER matches blake3("reentrancy.enter(address,bytes)")[..4].
+    #[test]
+    fn reentrancy_selectors_match_dex_v0_canonical_strings() {
+        assert_eq!(
+            reentrancy::SEL_ENTER,
+            bloom_chain_abi::selector("reentrancy.enter(address,bytes)"),
+            "SEL_ENTER must match canonical blake3 selector",
+        );
+        // SIG follows the domain.method(...) convention.
+        assert_eq!(reentrancy::SIG_ENTER, "reentrancy.enter(address,bytes)");
+    }
+
+    /// SEL_ENTER must be byte-identical to the legacy bloom_dex_abi constant
+    /// so peer contracts (pair) keep dispatching to the same handler without
+    /// any code changes during the rest of the migration.
+    #[test]
+    fn reentrancy_selectors_match_legacy_dex_abi_constants() {
+        assert_eq!(
+            reentrancy::SEL_ENTER,
+            bloom_dex_abi::selectors::REENTRANCY_ENTER,
+            "macro SEL_ENTER must equal legacy REENTRANCY_ENTER",
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Pre-existing selector tests — still required by the v0 spec.
+    // ---------------------------------------------------------------------------
+
+    /// REENTRANCY_ENTER (legacy constant) matches direct blake3 computation.
     #[test]
     fn reentrancy_enter_selector_stable() {
-        use bloom_dex_abi::selectors;
         let expected = blake3_sel(b"reentrancy.enter(address,bytes)");
         assert_eq!(
             selectors::REENTRANCY_ENTER,
@@ -191,7 +233,6 @@ mod tests {
     /// Shared pair internal selectors match their canonical method strings.
     #[test]
     fn pair_internal_selectors_stable() {
-        use bloom_dex_abi::selectors;
         assert_eq!(
             selectors::PAIR_LOCK_CHECK_AND_SET,
             blake3_sel(b"pair.lock_check_and_set()"),
@@ -222,7 +263,6 @@ mod tests {
     /// All five new PAIR_*_INNER selectors are distinct from REENTRANCY_ENTER.
     #[test]
     fn new_selectors_do_not_collide_with_reentrancy_enter() {
-        use bloom_dex_abi::selectors;
         let enter = selectors::REENTRANCY_ENTER;
         assert_ne!(selectors::PAIR_LOCK_CHECK_AND_SET, enter);
         assert_ne!(selectors::PAIR_LOCK_CLEAR, enter);
@@ -234,7 +274,6 @@ mod tests {
     /// All five new PAIR_*_INNER selectors are mutually distinct.
     #[test]
     fn new_selectors_are_mutually_distinct() {
-        use bloom_dex_abi::selectors;
         use std::collections::HashSet;
         let set: HashSet<[u8; 4]> = [
             selectors::PAIR_LOCK_CHECK_AND_SET,
@@ -250,6 +289,7 @@ mod tests {
     }
 
     /// enter calldata: 4-byte selector + 32-byte target + N-byte inner.
+    /// This verifies the macro's `bytes` tail layout — no length prefix.
     #[test]
     fn enter_calldata_layout() {
         let target = [0xAAu8; 32];
@@ -258,10 +298,10 @@ mod tests {
 
         assert_eq!(cd.len(), 4 + 32 + inner.len(), "enter calldata length");
 
-        use bloom_dex_abi::selectors;
-        assert_eq!(&cd[..4], &selectors::REENTRANCY_ENTER, "selector prefix");
+        assert_eq!(&cd[..4], &reentrancy::SEL_ENTER, "selector prefix (chain-ABI)");
+        assert_eq!(&cd[..4], &selectors::REENTRANCY_ENTER, "selector prefix (legacy)");
         assert_eq!(&cd[4..36], &target, "target address");
-        assert_eq!(&cd[36..], inner, "inner calldata suffix");
+        assert_eq!(&cd[36..], inner, "inner calldata suffix (no length prefix)");
     }
 
     /// enter calldata with empty inner: 4 + 32 = 36 bytes.
@@ -272,10 +312,11 @@ mod tests {
         assert_eq!(cd.len(), 36, "enter with empty inner must be 36 bytes");
     }
 
-    /// enter calldata with a realistic _mint_inner payload.
+    /// enter calldata with a realistic _mint_inner payload — exact wire layout
+    /// the pair currently produces by hand. The macro must reproduce it byte
+    /// for byte so the rest of the migration can land incrementally.
     #[test]
     fn enter_calldata_mint_inner_payload() {
-        use bloom_dex_abi::selectors;
         let target = [0x01u8; 32];
         let recipient = [0x02u8; 32];
 
@@ -297,7 +338,6 @@ mod tests {
     /// Verify no selector collision between REENTRANCY_ENTER and all known DEX selectors.
     #[test]
     fn no_collision_with_all_dex_selectors() {
-        use bloom_dex_abi::selectors;
         use std::collections::HashSet;
 
         let all_selectors: &[[u8; 4]] = &[
@@ -339,7 +379,7 @@ mod tests {
     }
 
     /// Verify caller-must-equal-target check is in place conceptually
-    /// (the dispatch rejects unknown selectors before entering handle_enter).
+    /// (the dispatch rejects unknown selectors before entering the handler).
     #[test]
     fn short_calldata_rejected_at_length_guard() {
         // 3 bytes is less than the required 4-byte selector minimum.

@@ -1,0 +1,19 @@
+[package]
+name = "bloom-chain-abi"
+version = "0.1.0"
+edition = "2024"
+description = "Canonical chain-owned ABI: primitive encoders/decoders, selector hashing, event topics"
+license = "MIT"
+
+[lib]
+name = "bloom_chain_abi"
+
+[dependencies]
+blake3 = { version = "1", default-features = false }
+bloom-chain-abi-macros = { workspace = true }
+
+[features]
+default = ["std"]
+std = ["blake3/std"]
+
+[dev-dependencies]

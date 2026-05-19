@@ -10,9 +10,10 @@ name = "bloom_dex_reentrancy"
 crate-type = ["cdylib"]
 
 [dependencies]
+bloom-chain-abi = { workspace = true, default-features = false }
 bloom-dex-abi   = { workspace = true, default-features = false }
 bloom-petal-sdk = { workspace = true }
 
-# blake3 is available on the host side for unit tests (non-wasm32 builds).
+# blake3 is used in host-side unit tests (non-wasm32) to verify selectors.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 blake3 = { version = "1", default-features = false }

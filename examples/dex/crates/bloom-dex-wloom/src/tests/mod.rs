@@ -487,3 +487,35 @@ fn calldata_encoding_withdraw() {
     };
     assert_eq!(decoded, amount);
 }
+
+// ---------------------------------------------------------------------------
+// Selector parity — the chain-ABI macro must emit byte-identical selectors
+// to (a) the DEX v0 canonical strings and (b) the legacy bloom-dex-abi
+// constants so that the router and other peer contracts continue to dispatch
+// to the same handlers after migration.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn wloom_selectors_match_dex_v0_canonical_strings() {
+    fn crate_sel(method: &[u8]) -> [u8; 4] {
+        let h = ::blake3::hash(method);
+        let b = h.as_bytes();
+        [b[0], b[1], b[2], b[3]]
+    }
+    assert_eq!(
+        crate::wloom::SEL_DEPOSIT,
+        crate_sel(b"wloom.deposit()"),
+    );
+    assert_eq!(
+        crate::wloom::SEL_WITHDRAW,
+        crate_sel(b"wloom.withdraw(u256)"),
+    );
+}
+
+#[test]
+fn wloom_selectors_match_legacy_dex_abi_constants() {
+    // Byte-equality with the build.rs-generated table in bloom-dex-abi so
+    // peer contracts (router etc.) keep dispatching to the same handlers.
+    assert_eq!(crate::wloom::SEL_DEPOSIT,  selectors::WLOOM_DEPOSIT);
+    assert_eq!(crate::wloom::SEL_WITHDRAW, selectors::WLOOM_WITHDRAW);
+}

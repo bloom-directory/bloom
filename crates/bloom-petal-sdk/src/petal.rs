@@ -3,6 +3,7 @@
 use alloc::vec::Vec;
 
 use crate::imports;
+use crate::value::LoomValue;
 
 /// Maximum return-data buffer size for `call` (64 KiB).
 const MAX_RETDATA: usize = 65536;
@@ -11,22 +12,27 @@ const MAX_RETDATA: usize = 65536;
 ///
 /// - `callee` — 32-byte instance address of the target petal.
 /// - `calldata` — encoded calldata (selector + ABI-encoded args).
-/// - `value_loom` — 32-byte big-endian u256 LOOM to attach; use `&[0u8;32]`
-///   for zero-value calls.
+/// - `value_loom` — native LOOM to attach as a [`LoomValue`] (u128-wide).
+///   Use [`LoomValue::ZERO`] for zero-value calls.
 ///
 /// Returns `Ok(retdata)` on success (up to 64 KiB of return data).
 /// Returns `Err(code)` if the callee reverted or trapped (negative code).
-pub fn call(callee: &[u8; 32], calldata: &[u8], value_loom: &[u8; 32]) -> Result<Vec<u8>, i32> {
-    // Decode the u128 LOOM value from the 32-byte big-endian representation.
-    // The chain spec stores LOOM as u128; the upper 16 bytes of the 32-byte
-    // field must be zero in practice. We pass lo/hi as i64 to the host.
-    let mut lo_bytes = [0u8; 8];
-    let mut hi_bytes = [0u8; 8];
-    lo_bytes.copy_from_slice(&value_loom[24..32]);
-    hi_bytes.copy_from_slice(&value_loom[16..24]);
-    // Note: value_loom[0..16] should be zero for valid u128 LOOM values.
-    let lo = i64::from_be_bytes(lo_bytes);
-    let hi = i64::from_be_bytes(hi_bytes);
+///
+/// The value width matches the native LOOM type on the chain
+/// (`bloom_chain_types::Loom` is a `u128`). The previous surface accepted a
+/// 32-byte big-endian u256 and silently truncated the upper 16 bytes; that
+/// foot-gun has been removed — callers holding a u256 representation MUST
+/// convert via [`LoomValue::try_from_be_u256_bytes`] and handle the
+/// `Overflow` case explicitly.
+pub fn call(
+    callee: &[u8; 32],
+    calldata: &[u8],
+    value_loom: LoomValue,
+) -> Result<Vec<u8>, i32> {
+    // Split the u128 into two i64 halves for the host import.
+    let v = value_loom.to_u128();
+    let lo = i64::from_ne_bytes((v as u64).to_ne_bytes());
+    let hi = i64::from_ne_bytes(((v >> 64) as u64).to_ne_bytes());
 
     let mut retbuf = Vec::with_capacity(MAX_RETDATA);
     retbuf.resize(MAX_RETDATA, 0u8);
@@ -66,5 +72,64 @@ pub fn return_data(data: &[u8]) -> ! {
 pub fn revert(msg: &str) -> ! {
     unsafe {
         imports::petal_revert(msg.as_ptr() as i32, msg.len() as i32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! These tests live alongside the SDK call surface and verify the
+    //! `LoomValue`-typed signature. They cannot exercise the host import
+    //! (which panics on non-wasm32) but they confirm the value path is
+    //! lossless at the type boundary and that overflow on the u256
+    //! conversion is surfaced rather than silently truncated.
+    use super::*;
+    use crate::value::{LoomValue, LoomValueError};
+
+    #[test]
+    fn call_signature_takes_loom_value() {
+        // Compile-time confirmation that the new signature compiles with
+        // a `LoomValue` argument (not `&[u8; 32]`).
+        let _f: fn(&[u8; 32], &[u8], LoomValue) -> Result<alloc::vec::Vec<u8>, i32> = call;
+    }
+
+    #[test]
+    fn u128_max_is_representable_at_api_boundary() {
+        // u128::MAX is representable as a LoomValue — the type encodes the
+        // full natural width of LOOM. This means it can be passed to
+        // `petal::call` without any narrowing.
+        let v = LoomValue::from_u128(u128::MAX);
+        assert_eq!(v.to_u128(), u128::MAX);
+    }
+
+    #[test]
+    fn u128_max_plus_one_rejected_not_truncated() {
+        // A 32-byte u256 with a single bit set in the high half cannot be
+        // converted to a LoomValue — it MUST error, never silently truncate.
+        let mut bytes = [0u8; 32];
+        bytes[15] = 1; // 2^128
+        assert_eq!(
+            LoomValue::try_from_be_u256_bytes(&bytes),
+            Err(LoomValueError::Overflow),
+        );
+    }
+
+    #[test]
+    fn one_loom_round_trips_through_call_boundary() {
+        // 1 LOOM = 10^18 bloomweis — round-trips losslessly.
+        let one_loom = 1_000_000_000_000_000_000u128;
+        let v = LoomValue::from_u128(one_loom);
+        let bytes = v.to_be_u256_bytes();
+        let v2 = LoomValue::try_from_be_u256_bytes(&bytes).expect("1 LOOM fits");
+        assert_eq!(v, v2);
+        assert_eq!(v2.to_u128(), one_loom);
+    }
+
+    #[test]
+    fn zero_round_trips_through_call_boundary() {
+        let z = LoomValue::ZERO;
+        let bytes = z.to_be_u256_bytes();
+        let z2 = LoomValue::try_from_be_u256_bytes(&bytes).expect("zero fits");
+        assert_eq!(z, z2);
+        assert!(z2.is_zero());
     }
 }

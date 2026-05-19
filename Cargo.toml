@@ -24,6 +24,8 @@ members = [
   "crates/bloom-chain-consensus",
   "crates/bloom-chain-node",
   "crates/bloom-petal-sdk",
+  "crates/bloom-chain-abi",
+  "crates/bloom-chain-abi-macros",
   # ---- example apps (not part of the protocol) ----
   "examples/dex/crates/bloom-dex-abi",
   "examples/dex/crates/bloom-dex-erc20",
@@ -110,6 +112,8 @@ bloom-chain-types = { path = "crates/bloom-chain-types" }
 bloom-chain-state = { path = "crates/bloom-chain-state" }
 bloom-chain-node = { path = "crates/bloom-chain-node" }
 bloom-petal-sdk   = { path = "crates/bloom-petal-sdk" }
+bloom-chain-abi   = { path = "crates/bloom-chain-abi", default-features = false }
+bloom-chain-abi-macros = { path = "crates/bloom-chain-abi-macros" }
 # ---- example DEX crates (not part of the protocol) ----
 bloom-dex-abi     = { path = "examples/dex/crates/bloom-dex-abi", default-features = false }
 bloom-dex-factory = { path = "examples/dex/crates/bloom-dex-factory" }

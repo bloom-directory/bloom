@@ -18,6 +18,9 @@ pub mod msg;
 pub mod log;
 pub mod crypto;
 pub mod host;
+pub mod value;
+
+pub use value::{LoomValue, LoomValueError};
 
 // ---------------------------------------------------------------------------
 // wasm32-only runtime support

@@ -1,0 +1,18 @@
+[package]
+name = "bloom-chain-abi-macros"
+version = "0.1.0"
+edition = "2024"
+description = "Proc-macros for bloom-chain-abi: contract! and events!"
+license = "MIT"
+
+[lib]
+name = "bloom_chain_abi_macros"
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+blake3 = { version = "1" }
+
+[dev-dependencies]

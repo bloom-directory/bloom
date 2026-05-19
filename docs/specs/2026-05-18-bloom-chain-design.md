@@ -473,6 +473,190 @@ Numbers are v0 defaults; tunable in genesis. The runtime stops a tx
 when fuel hits zero and reverts; the tx pays its full max-fee
 reservation regardless.
 
+### 7.10 Canonical ABI for petal calldata
+
+`Tx.kind` for `Call` and `Deploy` carries a `calldata: Vec<u8>` or
+`init_args: Vec<u8>` payload that the chain dispatches into a wasm
+petal's `call` / `init` entry point. The interpretation of those bytes
+is defined by a single, chain-owned ABI specified in this section.
+Petals do not invent their own encoding, do not hand-roll selectors,
+and do not depend on a per-application encoder crate.
+
+The reference implementation lives in `crates/bloom-chain-abi` (host +
+guest, `no_std`-compatible) and `crates/bloom-chain-abi-macros` (the
+`contract!` proc-macro). Example applications (`examples/dex/...`) use
+these crates exclusively and do not declare additional ABI primitives.
+
+#### 7.10.1 Primitive types
+
+The ABI is fixed-width, big-endian, and non-self-describing. Decoders
+know the field list a priori from the method's declared signature.
+
+| Type           | Wire encoding                                       |
+|----------------|-----------------------------------------------------|
+| `address`      | 32 bytes — a chain address                          |
+| `bytes32`      | 32 bytes — opaque hash/identifier                   |
+| `u256`         | 32 bytes big-endian                                 |
+| `u128`         | 16 bytes big-endian                                 |
+| `u64`          | 8 bytes big-endian                                  |
+| `bool`         | 1 byte: `0x00` = false, `0x01` = true; any other value is a decode error |
+| `Vec<Address>` | 2-byte BE length prefix (`u16`) followed by `length * 32` address bytes |
+| `bytes`        | Variable-length raw payload that consumes the **rest** of the buffer. No length prefix. Only valid as the LAST positional argument of a method. |
+
+There is no dynamic-offset / pointer indirection (as in Solidity ABI).
+Every field is either fixed-width or terminates the buffer.
+
+#### 7.10.2 Method selector
+
+The 4-byte selector that prefixes a `Call.calldata` payload is:
+
+```
+SEL_method = blake3("<domain>.<method>(<types>)")[..4]
+```
+
+where:
+- `<domain>` is the contract's domain string (lowercase, snake_case),
+- `<method>` is the method name as declared,
+- `<types>` is the comma-separated canonical signature of the method's
+  argument types, in declaration order (using the `sig` column from
+  §7.10.1 — e.g. `address,u256,bytes`).
+
+Examples (from the v0 DEX):
+- `blake3("factory.create_pair(address,address)")[..4]`
+- `blake3("router.swap_exact_tokens_for_tokens(u256,u256,Vec<Address>,address,u64)")[..4]`
+- `blake3("reentrancy.enter(address,bytes)")[..4]`
+
+Selectors are deterministic and never need to be looked up at runtime
+from a registry. `contract!` emits each method's `SEL_*` and `SIG_*`
+constants at compile time.
+
+#### 7.10.3 Calldata layout
+
+For a `Call`:
+
+```
+calldata = SEL_method (4B) || arg0_bytes || arg1_bytes || ... || argN_bytes
+```
+
+For a `Deploy` (`init_args`):
+
+```
+init_args = arg0_bytes || arg1_bytes || ... || argN_bytes
+```
+
+No selector prefixes `init_args` — `init` is unique per petal, and the
+chain routes init to the petal's `init` export directly.
+
+#### 7.10.4 Strict decoding
+
+The chain ABI is **strict by default**:
+
+- The dispatcher decodes exactly the declared argument list.
+- After the final declared field, the dispatcher MUST call
+  `Buf::expect_eof` (or equivalent) and reject any trailing bytes with
+  `AbiError::TrailingBytes { remaining }`. The `contract!` macro emits
+  this check automatically.
+- Calldata shorter than 4 bytes is rejected with
+  `DispatchError::ShortCalldata`.
+- An unrecognised 4-byte selector is rejected with
+  `DispatchError::UnknownSelector([..])`.
+- Per-type validity is enforced (e.g. `bool != 0|1` errors, `Vec`
+  length prefix exceeding remaining bytes errors).
+
+`init_args` is decoded with the same `expect_eof` discipline: extra
+bytes past the final init argument fail the deploy.
+
+Strict decoding means trailing-byte griefing, selector aliasing, and
+overlong-payload bugs are not representable on the dispatch path.
+
+The single exception is `bytes` (the variable-length tail type): it
+consumes whatever remains in the buffer, so `expect_eof` after it is
+trivially satisfied. This is the only way to express
+"forwarded inner calldata" without a length prefix.
+
+#### 7.10.5 Internal-method authorization
+
+Methods declared `#[internal]` in `contract!` participate in the
+standard selector table but the dispatcher rejects them with
+`DispatchError::Unauthorized` whenever the caller (the on-chain
+address that issued the `petal.call`) does not equal the contract's
+declared reentrancy address. The contract supplies this address via a
+`reentrancy_addr(&self) -> [u8; 32]` trait method that the macro
+inserts into `Handler` whenever any method is marked `#[internal]`.
+
+This is the v0 pattern that the example DEX's pair petal uses to
+expose its `_mint_inner` / `_burn_inner` / `_swap_inner` /
+`lock_check_and_set` / `lock_clear` selectors only to the reentrancy
+orchestrator. The chain enforces the rule at the dispatcher boundary,
+not in per-contract code.
+
+#### 7.10.6 Returns and reverts
+
+A dispatched method returns either:
+
+- A typed result (encoded by the dispatcher into the petal's
+  `petal.return` payload), or
+- `Err(&'static str)` from the handler — translated into
+  `petal.revert` with the message as the revert reason.
+
+Multi-value returns (e.g. `(u256, u256, u256)` for liquidity output
+amounts) are not directly expressible in `contract!`'s return-type
+slot in v0; contracts that need them declare the method with a void
+return and emit `petal.return` directly inside the handler with a
+manually-constructed payload (using `bloom_chain_abi::Encoder`). The
+canonical signature for hashing still reflects the conceptual return
+shape but the dispatcher does not depend on it.
+
+#### 7.10.7 Domain separation
+
+Selector collisions across petals are made statistically negligible by
+including the domain in the canonical signature string. Two contracts
+exporting methods with identical names but different domains produce
+different 4-byte prefixes. Within a single contract, the macro
+disallows duplicate method names (the Rust compiler rejects duplicate
+trait methods).
+
+A `bytes32`-collision attack would require finding two distinct
+`(domain, method, types)` triples whose BLAKE3 first-four-bytes match
+— ~2^32 work on the attacker side. Pair-internal selectors include the
+leading `_` to make collisions with public methods detectable in
+review.
+
+#### 7.10.8 Surface
+
+`bloom-chain-abi` exports:
+
+- `U256`, `Encoder`, `Buf`, `AbiError`, `AbiEncodeError`,
+  `DispatchError` — types used by host and guest.
+- `selector(method_sig: &str) -> [u8; 4]` and
+  `event_topic(sig: &str) -> [u8; 4]` — BLAKE3-first-four hashers.
+- `contract!` macro (re-exported from `bloom-chain-abi-macros`) — the
+  declarative DSL that emits:
+  - Per-method `SEL_*` and `SIG_*` constants.
+  - `mod calls { fn method(...) -> Vec<u8> }` client-side call builders.
+  - `trait Handler` — typed handler interface that the petal
+    implements; one `fn` per method with primitive Rust arguments
+    (`Result<Ret, &'static str>` returns).
+  - `fn dispatch<H: Handler>(handler: &mut H, caller: &[u8; 32],
+    calldata: &[u8]) -> Result<Vec<u8>, DispatchError>` — the strict
+    dispatcher.
+  - Optional `init_calldata(...)`, `parse_init`, and `InitArgs` for
+    constructors.
+
+Every petal in `examples/dex/...` is a `contract! { ... }` declaration
+plus a `Handler` impl plus a `do_call` that routes through
+`dispatch`. No example uses `blake3` directly to compute a selector at
+build time, and no example hand-rolls a `match` over `&calldata[..4]`.
+
+#### 7.10.9 Versioning
+
+`contract!` produces a stable wire format per a given combination of
+declared types and method signatures. Adding or renaming a method
+changes its selector but does not affect the others. Changing an
+argument list (type or order) changes only that method's selector.
+There is no global "ABI version" — clients pin selectors directly by
+including the appropriate `contract!` module from the petal crate.
+
 ## 8. Block model
 
 ### 8.1 Header
