@@ -12,7 +12,9 @@ pub use crate::storage::{Map, Slot, StorageValue, VecStore};
 pub use crate::types::{Address, Hash32, U256};
 
 // Attribute macros — re-exported from the proc-macro crate for ergonomic use.
+// `storage`, `event`, `error`, etc. live in the macro namespace; the
+// homonymous *modules* (`storage`, `error`) stay accessible via their full
+// paths.
 pub use bloom_contract_macros::{
-    AbiDecode, AbiEncode, AbiType, contract, error as error_macro, event, init,
-    interface as interface_macro, storage as storage_attr,
+    AbiDecode, AbiEncode, AbiType, contract, error, event, init, interface, storage,
 };

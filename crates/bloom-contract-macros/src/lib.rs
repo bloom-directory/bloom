@@ -11,6 +11,7 @@
 use proc_macro::TokenStream;
 
 mod derives;
+mod storage_attr;
 
 /// `#[derive(AbiEncode)]` — sequential field encoding for structs;
 /// discriminant-prefixed encoding for enums.
@@ -40,10 +41,12 @@ pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
 
-/// `#[storage]` — placed on the contract's state struct. Phase 1 stub.
+/// `#[storage]` — placed on the contract's state struct. Generates the
+/// `load(ctx) -> Result<Self>` constructor and a `SCHEMA` constant used by
+/// the build crate at manifest-emission time.
 #[proc_macro_attribute]
-pub fn storage(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    item
+pub fn storage(attr: TokenStream, item: TokenStream) -> TokenStream {
+    storage_attr::expand(attr, item)
 }
 
 /// `#[event]` — placed on an event struct. Phase 1 stub.

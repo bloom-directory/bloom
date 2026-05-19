@@ -34,8 +34,7 @@ pub mod prelude;
 // write `#[bloom_contract::contract]` directly. The recommended usage path is
 // `use bloom_contract::prelude::*;` followed by the bare `#[contract]`.
 pub use bloom_contract_macros::{
-    AbiDecode, AbiEncode, AbiType, contract, error as error_macro, event, init,
-    interface as interface_macro, storage as storage_attr,
+    AbiDecode, AbiEncode, AbiType, contract, error, event, init, interface, storage,
 };
 
 #[doc(hidden)]
