@@ -1,19 +1,20 @@
 //! `bloom dex ...` — DEX subcommand tree (v0 acceptance demo driver).
 //!
 //! High-level glue around `bloom chain deploy` + `bloom chain call`. These
-//! subcommands build the calldata for the six DEX petals (erc20, pair,
-//! factory, router, wloom, reentrancy) and submit Deploy/Call txs through
-//! the running node's UDS JSON-RPC.
+//! subcommands build the calldata for the five DEX petals (erc20, pair,
+//! factory, router, wloom) and submit Deploy/Call txs through the running
+//! node's UDS JSON-RPC.
 //!
 //! v0 acceptance flow (per DEX spec §15):
-//!   1. `bloom dex deploy-suite`        — bootstraps pair wasm, deploys reentrancy + wloom + factory + router; writes `dex.toml`.
+//!   1. `bloom dex deploy-suite`        — bootstraps pair wasm, deploys wloom + factory + router; writes `dex.toml`.
 //!   2. `bloom dex deploy-token`        — deploys a fresh ERC-20 petal.
 //!   3. `bloom dex create-pair`         — creates a pair via factory.
 //!   4. `bloom dex add-liquidity`       — approves + addLiquidity.
 //!   5. `bloom dex swap`                — swapExactTokensForTokens.
 //!   6. `bloom dex remove-liquidity`    — approves LP + removeLiquidity.
 //!
-//! Calldata encoding lives in `bloom_dex_abi`; this module re-uses it.
+//! Calldata encoding uses `bloom_chain_abi::Encoder` and selectors derived
+//! from canonical DEX v0 signature strings via `bloom_chain_abi::selector`.
 //!
 //! The dispatcher writes a `dex.toml` registry under `<bloom_home>/chain/`
 //! that subsequent subcommands read for the factory / router / wloom /
@@ -27,8 +28,8 @@ use bloom_chain_node::rpc::RpcClient;
 use bloom_chain_types::ssz::Encode;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
-use bloom_dex_abi::encode::Encoder;
-use bloom_dex_abi::selectors;
+use bloom_chain_abi::Encoder;
+use bloom_chain_abi::selector as abi_selector;
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -39,14 +40,14 @@ use serde_json::json;
 
 #[derive(Subcommand, Debug)]
 pub enum DexCmd {
-    /// Deploy reentrancy + wloom + factory + router; bootstrap pair wasm; write `dex.toml`.
+    /// Deploy wloom + factory + router; bootstrap pair wasm; write `dex.toml`.
     DeploySuite {
-        /// Path to a directory containing the six DEX wasm artifacts.
+        /// Path to a directory containing the five DEX wasm artifacts.
         ///
         /// Expected filenames:
-        ///   bloom_dex_reentrancy.wasm, bloom_dex_wloom.wasm,
-        ///   bloom_dex_pair.wasm,       bloom_dex_factory.wasm,
-        ///   bloom_dex_router.wasm,     bloom_dex_erc20.wasm
+        ///   bloom_dex_wloom.wasm,  bloom_dex_pair.wasm,
+        ///   bloom_dex_factory.wasm, bloom_dex_router.wasm,
+        ///   bloom_dex_erc20.wasm
         #[arg(long, value_name = "DIR")]
         wasm_dir: PathBuf,
         /// Address that will be set as factory `fee_to_setter`.
@@ -181,7 +182,6 @@ struct DexRegistry {
     pair_petal_hash: Option<String>,
     /// Bootstrap pair instance address (the throwaway from §5 bootstrap).
     pair_bootstrap_addr: Option<String>,
-    reentrancy_addr: Option<String>,
     wloom_addr: Option<String>,
     factory_addr: Option<String>,
     router_addr: Option<String>,
@@ -343,15 +343,16 @@ async fn deploy_suite(
     // ── 1. Bootstrap pair wasm via dummy Deploy ──────────────────────────
     //
     // Per DEX spec §5, the pair wasm must be registered in `code_root`
-    // before factory.createPair can `host.deploy` instances of it. Since
-    // pair init now mandates 128B (post-reconciliation), we bootstrap with
-    // a 128B zero-init that's a valid pair but never used. The bootstrap
-    // instance lives at a predictable dead address; v1 may add
-    // TxKind::UploadCode to skip this dead state (Task #16).
+    // before factory.createPair can `host.deploy` instances of it. Phase B
+    // shrank the pair init to 96B (drop `reentrancy_addr` — guard moved into
+    // `#[nonreentrant]`), so we bootstrap with a 96B zero-init that's a
+    // valid pair but never used. The bootstrap instance lives at a
+    // predictable dead address; v1 may add TxKind::UploadCode to skip this
+    // dead state (Task #16).
     let pair_wasm = read_wasm(&wasm_dir.join("bloom_dex_pair.wasm"))?;
     let pair_petal_hash = petal_hash_of(&pair_wasm);
     let pair_bootstrap_salt = [0u8; 32];
-    let pair_bootstrap_init = vec![0u8; 128];
+    let pair_bootstrap_init = vec![0u8; 96];
     let pair_bootstrap_addr =
         deploy_addr(&sender, &pair_bootstrap_salt, &pair_petal_hash);
     submit_deploy(
@@ -367,25 +368,7 @@ async fn deploy_suite(
     .await
     .context("bootstrap pair wasm")?;
 
-    // ── 2. Deploy reentrancy ─────────────────────────────────────────────
-    let reentrancy_wasm = read_wasm(&wasm_dir.join("bloom_dex_reentrancy.wasm"))?;
-    let reentrancy_hash = petal_hash_of(&reentrancy_wasm);
-    let reentrancy_salt = [1u8; 32];
-    let reentrancy_addr = deploy_addr(&sender, &reentrancy_salt, &reentrancy_hash);
-    submit_deploy(
-        client,
-        &sk,
-        &pk,
-        sender,
-        &chain_id,
-        &reentrancy_wasm,
-        reentrancy_salt,
-        Vec::new(),
-    )
-    .await
-    .context("deploy reentrancy")?;
-
-    // ── 3. Deploy wLOOM ──────────────────────────────────────────────────
+    // ── 2. Deploy wLOOM ──────────────────────────────────────────────────
     let wloom_wasm = read_wasm(&wasm_dir.join("bloom_dex_wloom.wasm"))?;
     let wloom_hash = petal_hash_of(&wloom_wasm);
     let wloom_salt = [2u8; 32];
@@ -403,17 +386,19 @@ async fn deploy_suite(
     .await
     .context("deploy wLOOM")?;
 
-    // ── 4. Deploy factory ────────────────────────────────────────────────
+    // ── 3. Deploy factory ────────────────────────────────────────────────
     //
-    // init = pair_petal_hash (32) || reentrancy_addr (32) || fee_to_setter
-    //        (32) || factory_self_addr (32) — 128 bytes.
+    // Init payload (Phase D, post-migration):
+    //   pair_petal_hash (32) || fee_to_setter (32) || factory_self_addr (32)
+    // for a total of 96 bytes. The reentrancy guard moved into the
+    // `#[nonreentrant]` attribute on the pair, so the factory no longer
+    // tracks a reentrancy petal address.
     let factory_wasm = read_wasm(&wasm_dir.join("bloom_dex_factory.wasm"))?;
     let factory_hash = petal_hash_of(&factory_wasm);
     let factory_salt = [3u8; 32];
     let factory_addr_arr = deploy_addr(&sender, &factory_salt, &factory_hash);
-    let mut factory_init = Vec::with_capacity(128);
+    let mut factory_init = Vec::with_capacity(96);
     factory_init.extend_from_slice(&pair_petal_hash);
-    factory_init.extend_from_slice(&reentrancy_addr.0);
     factory_init.extend_from_slice(&fee_to_setter.0);
     factory_init.extend_from_slice(&factory_addr_arr.0);
     submit_deploy(
@@ -429,7 +414,7 @@ async fn deploy_suite(
     .await
     .context("deploy factory")?;
 
-    // ── 5. Deploy router ─────────────────────────────────────────────────
+    // ── 4. Deploy router ─────────────────────────────────────────────────
     //
     // init = factory_addr (32) || wloom_addr (32) || router_self_addr (32) — 96 bytes.
     let router_wasm = read_wasm(&wasm_dir.join("bloom_dex_router.wasm"))?;
@@ -453,11 +438,10 @@ async fn deploy_suite(
     .await
     .context("deploy router")?;
 
-    // ── 6. Persist registry ──────────────────────────────────────────────
+    // ── 5. Persist registry ──────────────────────────────────────────────
     let reg = DexRegistry {
         pair_petal_hash: Some(hex::encode(pair_petal_hash)),
         pair_bootstrap_addr: Some(hex::encode(pair_bootstrap_addr.0)),
-        reentrancy_addr: Some(hex::encode(reentrancy_addr.0)),
         wloom_addr: Some(hex::encode(wloom_addr.0)),
         factory_addr: Some(hex::encode(factory_addr_arr.0)),
         router_addr: Some(hex::encode(router_addr_arr.0)),
@@ -469,7 +453,6 @@ async fn deploy_suite(
         serde_json::to_string_pretty(&json!({
             "pair_petal_hash":    hex::encode(pair_petal_hash),
             "pair_bootstrap_addr": hex::encode(pair_bootstrap_addr.0),
-            "reentrancy_addr":    hex::encode(reentrancy_addr.0),
             "wloom_addr":         hex::encode(wloom_addr.0),
             "factory_addr":       hex::encode(factory_addr_arr.0),
             "router_addr":        hex::encode(router_addr_arr.0),
@@ -560,7 +543,8 @@ async fn create_pair(
     let a = parse_addr(&token_a)?;
     let b = parse_addr(&token_b)?;
 
-    let mut e = Encoder::with_selector(selectors::FACTORY_CREATE_PAIR);
+    let mut e =
+        Encoder::with_selector(abi_selector("factory.create_pair(address,address)"));
     e.push_address(&a.0);
     e.push_address(&b.0);
     let calldata = e.finish();
@@ -615,7 +599,9 @@ async fn add_liquidity(
     submit_erc20_approve(client, &sk, &pk, sender, &chain_id, b, router_addr, &amt_b).await?;
 
     // 3. router.add_liquidity(a, b, amt_a, amt_b, min_a, min_b, to, deadline)
-    let mut e = Encoder::with_selector(selectors::ROUTER_ADD_LIQUIDITY);
+    let mut e = Encoder::with_selector(abi_selector(
+        "router.add_liquidity(address,address,u256,u256,u256,u256,address,u64)",
+    ));
     e.push_address(&a.0)
         .push_address(&b.0)
         .push_u256_bytes(&amt_a)
@@ -679,7 +665,9 @@ async fn swap_exact_tokens(
     .await?;
 
     // 2. router.swap_exact_tokens_for_tokens(amount_in, min_out, path, to, deadline)
-    let mut e = Encoder::with_selector(selectors::ROUTER_SWAP_EXACT_TOKENS_FOR_TOKENS);
+    let mut e = Encoder::with_selector(abi_selector(
+        "router.swap_exact_tokens_for_tokens(u256,u256,Vec<Address>,address,u64)",
+    ));
     e.push_u256_bytes(&in_amt).push_u256_bytes(&min_out_v);
     e.push_address_vec(&path_addrs)
         .map_err(|err| anyhow!("encode swap path: {err}"))?;
@@ -748,7 +736,9 @@ async fn remove_liquidity(
     submit_erc20_approve(client, &sk, &pk, sender, &chain_id, pair_addr, router_addr, &liq).await?;
 
     // 2. router.remove_liquidity(a, b, liquidity, min_a, min_b, to, deadline)
-    let mut e = Encoder::with_selector(selectors::ROUTER_REMOVE_LIQUIDITY);
+    let mut e = Encoder::with_selector(abi_selector(
+        "router.remove_liquidity(address,address,u256,u256,u256,address,u64)",
+    ));
     e.push_address(&a.0)
         .push_address(&b.0)
         .push_u256_bytes(&liq)
@@ -1098,7 +1088,8 @@ async fn submit_erc20_approve(
     spender: Address,
     amount: &[u8; 32],
 ) -> Result<()> {
-    let mut e = Encoder::with_selector(selectors::ERC20_APPROVE);
+    let mut e =
+        Encoder::with_selector(abi_selector("erc20.approve(address,u256)"));
     e.push_address(&spender.0).push_u256_bytes(amount);
     submit_call(client, sk, pk, sender, chain_id, token, e.finish(), 0, 2_000_000).await
 }

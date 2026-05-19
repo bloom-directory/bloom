@@ -1,0 +1,5 @@
+error: `bytes` event fields are deferred to v1
+ --> tests/ui/bytes_in_event.rs:7:20
+  |
+7 |         event Blob(payload: bytes);
+  |                    ^^^^^^^

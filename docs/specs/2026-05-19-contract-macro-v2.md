@@ -152,12 +152,19 @@ event PairCreated(
 );
 ```
 
-**Topic.** First topic is `blake3(canonical_sig)[..4]` where
-`canonical_sig = "Name(t1,t2,…)"` with the same lowercase type-name table
-as method signatures (`address`, `u256`, `u128`, `u64`, `bool`, `bytes`).
-Each `#[indexed]` field becomes an additional 32-byte topic in declaration
-order; non-indexed fields are concatenated into the data blob using the
-calldata encoder.
+**Topic.** First (and currently only) topic is `blake3(canonical_sig)[..4]`
+where `canonical_sig = "Name(t1,t2,…)"` with the same lowercase type-name
+table as method signatures (`address`, `u256`, `u128`, `u64`, `bool`,
+`bytes`).
+
+**Indexed-vs-data encoding (v0).** `bloom_petal_sdk::log::emit` accepts
+only 4-byte topics today, so the macro encodes `#[indexed]` fields as
+32-byte chunks **prepended to the data blob** in declaration order, with
+non-indexed fields concatenated after. This matches the existing DEX
+`pack_*` wire format byte-for-byte and is the migration path
+`bloom-dex-abi::events::pack_*` callers see. A later spec can extend the
+host import to accept a separate `&[[u8; 32]]` topics slice without
+breaking the macro's caller-facing API (`emit_transfer(from, to, value)`).
 
 **Generated surface.** For each event, the macro emits a `pub fn
 emit_<snake_name>(...)` taking each field by reference, in declaration
@@ -208,6 +215,22 @@ The lock is **not** cleared on revert. The transaction is atomic at the
 chain level: a revert rolls the lock write back along with everything
 else. This matches the current cross-petal guard's revert behaviour and
 removes the need for `try_call` / `host.try_call` for the v0 cut.
+
+**Divergent return contract.** The post-handler clear is only reachable
+on the success path *if the handler returns normally*. Petal SDK
+terminators (`petal::return_data`, `petal::revert`) are divergent
+(`-> !`) — they end wasm guest execution without ever returning to the
+macro dispatcher. For success-path divergent returns the macro therefore
+also emits a helper inside the contract's `abi` module:
+
+```rust
+pub fn nonreentrant_lock_clear() { /* writes zeros to the lock slot */ }
+```
+
+User handlers that diverge on the success path **must** call
+`<contract>::abi::nonreentrant_lock_clear()` immediately before
+`petal::return_data(...)`. Revert paths require no explicit clear
+(transaction rollback handles them).
 
 **Effects on the DEX.**
 

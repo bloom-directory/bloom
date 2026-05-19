@@ -17,3 +17,4 @@ default = ["std"]
 std = ["blake3/std"]
 
 [dev-dependencies]
+blake3 = { version = "1" }

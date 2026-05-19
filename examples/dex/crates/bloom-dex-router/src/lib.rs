@@ -6,11 +6,14 @@
 //! `getAmountIn`, `getAmountsOut`, `getAmountsIn`) are computed in-petal
 //! without state writes.
 //!
-//! The router stores exactly three config values at `init` time:
-//!   - `K_FACTORY` — the factory petal address
-//!   - `K_WLOOM`   — the wrapped-LOOM petal address
-//!   - `K_SELF`    — the router's own pre-computed address (required for LOOM-output
-//!                   swaps which temporarily receive wLOOM into the router before unwrapping)
+//! The router stores exactly three config values at `init` time, all declared
+//! inline in the `contract!` `storage { ... }` block below:
+//!   - `factory`   — the factory petal address (slot tag `"router.factory"`)
+//!   - `wloom`     — the wrapped-LOOM petal address (slot tag `"router.wloom"`)
+//!   - `self_addr` — the router's own pre-computed address, slot tag
+//!                   `"router.self"` (required for LOOM-output swaps which
+//!                   temporarily receive wLOOM into the router before
+//!                   unwrapping)
 //!
 //! # init calldata
 //!
@@ -49,20 +52,30 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use bloom_chain_abi::{DispatchError, Encoder, U256, contract};
-use bloom_dex_abi::selectors;
-use bloom_petal_sdk::{block, crypto, msg, petal, state, LoomValue};
+use bloom_chain_abi::{DispatchError, U256, contract};
+use bloom_dex_erc20::erc20;
+use bloom_dex_factory::factory;
+use bloom_dex_pair::pair;
+use bloom_dex_wloom::wloom;
+use bloom_petal_sdk::{LoomValue, block, msg, petal};
 
 // ---------------------------------------------------------------------------
 // Chain-owned ABI declaration
 // ---------------------------------------------------------------------------
 //
+// Storage, init signature, and selectors are declared inline below.
 // Methods with non-u256 single-value returns (Vec<u256>, multiple u256s, etc.)
 // are declared with a void return; their handlers emit raw payloads via
 // `petal::return_data`.
 
 contract! {
     contract Router {
+        storage {
+            factory:    Address @ "router.factory";
+            wloom:      Address @ "router.wloom";
+            self_addr:  Address @ "router.self";
+        }
+
         init(factory_addr: Address, wloom_addr: Address, router_self_addr: Address);
 
         // Pure quoting helpers — single u256 returns, fully macro-encoded.
@@ -161,38 +174,29 @@ contract! {
 }
 
 // ---------------------------------------------------------------------------
-// Storage keys
+// Storage accessors
 // ---------------------------------------------------------------------------
-
-fn k_factory() -> [u8; 32] {
-    crypto::blake3(b"router.factory")
-}
-
-fn k_wloom() -> [u8; 32] {
-    crypto::blake3(b"router.wloom")
-}
-
-fn k_self() -> [u8; 32] {
-    crypto::blake3(b"router.self")
-}
-
-// ---------------------------------------------------------------------------
-// Storage helpers
-// ---------------------------------------------------------------------------
+//
+// The macro-generated `router::abi::storage` module owns the three scalar
+// Address slots: `factory`, `wloom`, `self_addr` (tags `"router.factory"`,
+// `"router.wloom"`, `"router.self"`). Production code paths read/write them
+// directly via `router::abi::storage::<field>()` / `set_<field>(v)`. The
+// small wrappers below give the rest of this file an ergonomic name for
+// each load.
 
 fn load_factory() -> [u8; 32] {
-    state::read(&k_factory()).unwrap_or([0u8; 32])
+    router::abi::storage::factory()
 }
 
 fn load_wloom() -> [u8; 32] {
-    state::read(&k_wloom()).unwrap_or([0u8; 32])
+    router::abi::storage::wloom()
 }
 
-/// Return this petal's own address, stored at init time (K_SELF slot).
+/// Return this petal's own address, stored at init time.
 /// Used by removeLiquidityLOOM / LOOM-output swaps, which must temporarily
 /// receive wLOOM into the router before unwrapping to native LOOM.
 fn self_address() -> [u8; 32] {
-    state::read(&k_self()).unwrap_or([0u8; 32])
+    router::abi::storage::self_addr()
 }
 
 // ---------------------------------------------------------------------------
@@ -212,9 +216,9 @@ fn do_init(calldata: Vec<u8>) {
         Ok(a) => a,
         Err(_) => petal::revert("router: bad init"),
     };
-    state::write(&k_factory(), &args.factory_addr);
-    state::write(&k_wloom(), &args.wloom_addr);
-    state::write(&k_self(), &args.router_self_addr);
+    router::abi::storage::set_factory(&args.factory_addr);
+    router::abi::storage::set_wloom(&args.wloom_addr);
+    router::abi::storage::set_self_addr(&args.router_self_addr);
 }
 
 /// Routes a method call through the macro-generated dispatcher and translates
@@ -316,20 +320,22 @@ pub fn get_amount_in(amount_out: U256, reserve_in: U256, reserve_out: U256) -> U
 }
 
 // ---------------------------------------------------------------------------
-// Inter-petal call helpers (selectors still come from the legacy dex-abi
-// table while sibling contracts are mid-migration; selector parity tests
-// below assert byte-for-byte equality between the two sources).
+// Inter-petal call helpers
 // ---------------------------------------------------------------------------
+//
+// All cross-petal calldata is built via the callee's macro-emitted
+// `<petal>::abi::call::<method>(args...)` helper. Those helpers prepend the
+// canonical selector and encode the arguments in the same byte layout the
+// pre-migration hand-rolled `Encoder` chains produced, so the wire format is
+// preserved bit-for-bit.
 
 /// Zero LOOM attachment for value-free inter-petal calls.
 const ZERO_VALUE: LoomValue = LoomValue::ZERO;
 
 /// Call `factory.get_pair(tokenA, tokenB)` and return the pair address.
-fn factory_get_pair(factory: &[u8; 32], token_a: &[u8; 32], token_b: &[u8; 32]) -> [u8; 32] {
-    let mut cd = Encoder::with_selector(selectors::FACTORY_GET_PAIR);
-    cd.push_address(token_a);
-    cd.push_address(token_b);
-    let ret = petal::call(factory, &cd.finish(), ZERO_VALUE)
+fn factory_get_pair(factory_addr: &[u8; 32], token_a: &[u8; 32], token_b: &[u8; 32]) -> [u8; 32] {
+    let cd = factory::abi::call::get_pair(token_a, token_b);
+    let ret = petal::call(factory_addr, &cd, ZERO_VALUE)
         .unwrap_or_else(|_| petal::revert("router: factory.get_pair failed"));
     if ret.len() < 32 {
         petal::revert("router: factory.get_pair bad return");
@@ -340,11 +346,9 @@ fn factory_get_pair(factory: &[u8; 32], token_a: &[u8; 32], token_b: &[u8; 32]) 
 }
 
 /// Call `factory.create_pair(tokenA, tokenB)` and return the new pair address.
-fn factory_create_pair(factory: &[u8; 32], token_a: &[u8; 32], token_b: &[u8; 32]) -> [u8; 32] {
-    let mut cd = Encoder::with_selector(selectors::FACTORY_CREATE_PAIR);
-    cd.push_address(token_a);
-    cd.push_address(token_b);
-    let ret = petal::call(factory, &cd.finish(), ZERO_VALUE)
+fn factory_create_pair(factory_addr: &[u8; 32], token_a: &[u8; 32], token_b: &[u8; 32]) -> [u8; 32] {
+    let cd = factory::abi::call::create_pair(token_a, token_b);
+    let ret = petal::call(factory_addr, &cd, ZERO_VALUE)
         .unwrap_or_else(|_| petal::revert("router: factory.create_pair failed"));
     if ret.len() < 32 {
         petal::revert("router: factory.create_pair bad return");
@@ -356,23 +360,23 @@ fn factory_create_pair(factory: &[u8; 32], token_a: &[u8; 32], token_b: &[u8; 32
 
 /// Get or create a pair, returning its address.
 fn ensure_pair(
-    factory: &[u8; 32],
+    factory_addr: &[u8; 32],
     token_a: &[u8; 32],
     token_b: &[u8; 32],
 ) -> [u8; 32] {
-    let pair = factory_get_pair(factory, token_a, token_b);
-    if pair == [0u8; 32] {
-        factory_create_pair(factory, token_a, token_b)
+    let pair_addr = factory_get_pair(factory_addr, token_a, token_b);
+    if pair_addr == [0u8; 32] {
+        factory_create_pair(factory_addr, token_a, token_b)
     } else {
-        pair
+        pair_addr
     }
 }
 
 /// Call `pair.get_reserves()` — returns `(reserve0: u128, reserve1: u128)`.
 /// The return is packed: 16 bytes reserve0 | 16 bytes reserve1 | 8 bytes timestamp.
-fn pair_get_reserves(pair: &[u8; 32]) -> (u128, u128) {
-    let cd = Encoder::with_selector(selectors::PAIR_GET_RESERVES).finish();
-    let ret = petal::call(pair, &cd, ZERO_VALUE)
+fn pair_get_reserves(pair_addr: &[u8; 32]) -> (u128, u128) {
+    let cd = pair::abi::call::get_reserves();
+    let ret = petal::call(pair_addr, &cd, ZERO_VALUE)
         .unwrap_or_else(|_| petal::revert("router: pair.get_reserves failed"));
     if ret.len() < 32 {
         petal::revert("router: pair.get_reserves bad return");
@@ -385,9 +389,9 @@ fn pair_get_reserves(pair: &[u8; 32]) -> (u128, u128) {
 }
 
 /// Call `pair.token0()` — returns the canonical token0 address.
-fn pair_token0(pair: &[u8; 32]) -> [u8; 32] {
-    let cd = Encoder::with_selector(selectors::PAIR_TOKEN0).finish();
-    let ret = petal::call(pair, &cd, ZERO_VALUE)
+fn pair_token0(pair_addr: &[u8; 32]) -> [u8; 32] {
+    let cd = pair::abi::call::token0();
+    let ret = petal::call(pair_addr, &cd, ZERO_VALUE)
         .unwrap_or_else(|_| petal::revert("router: pair.token0 failed"));
     if ret.len() < 32 {
         petal::revert("router: pair.token0 bad return");
@@ -404,19 +408,15 @@ fn token_transfer_from(
     to: &[u8; 32],
     amount: U256,
 ) {
-    let mut cd = Encoder::with_selector(selectors::ERC20_TRANSFER_FROM);
-    cd.push_address(from);
-    cd.push_address(to);
-    cd.push_u256(amount);
-    petal::call(token, &cd.finish(), ZERO_VALUE)
+    let cd = erc20::abi::call::transfer_from(from, to, amount);
+    petal::call(token, &cd, ZERO_VALUE)
         .unwrap_or_else(|_| petal::revert("router: transferFrom failed"));
 }
 
 /// Call `pair.mint(to)` — returns `u256 liquidity`.
-fn pair_mint(pair: &[u8; 32], to: &[u8; 32]) -> U256 {
-    let mut cd = Encoder::with_selector(selectors::PAIR_MINT);
-    cd.push_address(to);
-    let ret = petal::call(pair, &cd.finish(), ZERO_VALUE)
+fn pair_mint(pair_addr: &[u8; 32], to: &[u8; 32]) -> U256 {
+    let cd = pair::abi::call::mint(to);
+    let ret = petal::call(pair_addr, &cd, ZERO_VALUE)
         .unwrap_or_else(|_| petal::revert("router: pair.mint failed"));
     if ret.len() < 32 {
         petal::revert("router: pair.mint bad return");
@@ -427,10 +427,9 @@ fn pair_mint(pair: &[u8; 32], to: &[u8; 32]) -> U256 {
 }
 
 /// Call `pair.burn(to)` — returns `(u256 amount0, u256 amount1)`.
-fn pair_burn(pair: &[u8; 32], to: &[u8; 32]) -> (U256, U256) {
-    let mut cd = Encoder::with_selector(selectors::PAIR_BURN);
-    cd.push_address(to);
-    let ret = petal::call(pair, &cd.finish(), ZERO_VALUE)
+fn pair_burn(pair_addr: &[u8; 32], to: &[u8; 32]) -> (U256, U256) {
+    let cd = pair::abi::call::burn(to);
+    let ret = petal::call(pair_addr, &cd, ZERO_VALUE)
         .unwrap_or_else(|_| petal::revert("router: pair.burn failed"));
     if ret.len() < 64 {
         petal::revert("router: pair.burn bad return");
@@ -443,30 +442,26 @@ fn pair_burn(pair: &[u8; 32], to: &[u8; 32]) -> (U256, U256) {
 }
 
 /// Call `pair.swap(amount0Out, amount1Out, to)`.
-fn pair_swap(pair: &[u8; 32], amount0_out: U256, amount1_out: U256, to: &[u8; 32]) {
-    let mut cd = Encoder::with_selector(selectors::PAIR_SWAP);
-    cd.push_u256(amount0_out);
-    cd.push_u256(amount1_out);
-    cd.push_address(to);
-    petal::call(pair, &cd.finish(), ZERO_VALUE)
+fn pair_swap(pair_addr: &[u8; 32], amount0_out: U256, amount1_out: U256, to: &[u8; 32]) {
+    let cd = pair::abi::call::swap(amount0_out, amount1_out, to);
+    petal::call(pair_addr, &cd, ZERO_VALUE)
         .unwrap_or_else(|_| petal::revert("router: pair.swap failed"));
 }
 
 /// Transfer LP tokens from `from` to `pair` (LP is represented by pair itself).
-fn transfer_lp_to_pair(pair: &[u8; 32], from: &[u8; 32], liquidity: U256) {
-    // LP token is the pair itself; use ERC20_TRANSFER_FROM.
-    let mut cd = Encoder::with_selector(selectors::ERC20_TRANSFER_FROM);
-    cd.push_address(from);
-    cd.push_address(pair);
-    cd.push_u256(liquidity);
-    petal::call(pair, &cd.finish(), ZERO_VALUE)
+///
+/// LP tokens implement the ERC-20 surface (the pair petal's embedded LP
+/// token), so the calldata is the standard `erc20.transfer_from` payload.
+fn transfer_lp_to_pair(pair_addr: &[u8; 32], from: &[u8; 32], liquidity: U256) {
+    let cd = erc20::abi::call::transfer_from(from, pair_addr, liquidity);
+    petal::call(pair_addr, &cd, ZERO_VALUE)
         .unwrap_or_else(|_| petal::revert("router: LP transferFrom failed"));
 }
 
 /// Call `wloom.deposit()` with `value_loom`.
-fn wloom_deposit(wloom: &[u8; 32], value_loom: LoomValue) {
-    let cd = Encoder::with_selector(selectors::WLOOM_DEPOSIT).finish();
-    petal::call(wloom, &cd, value_loom)
+fn wloom_deposit(wloom_addr: &[u8; 32], value_loom: LoomValue) {
+    let cd = wloom::abi::call::deposit();
+    petal::call(wloom_addr, &cd, value_loom)
         .unwrap_or_else(|_| petal::revert("router: wloom.deposit failed"));
 }
 
@@ -484,10 +479,9 @@ fn loom_value_from_u256(amount: U256, ctx: &str) -> LoomValue {
 }
 
 /// Call `wloom.withdraw(amount)`.
-fn wloom_withdraw(wloom: &[u8; 32], amount: U256) {
-    let mut cd = Encoder::with_selector(selectors::WLOOM_WITHDRAW);
-    cd.push_u256(amount);
-    petal::call(wloom, &cd.finish(), ZERO_VALUE)
+fn wloom_withdraw(wloom_addr: &[u8; 32], amount: U256) {
+    let cd = wloom::abi::call::withdraw(amount);
+    petal::call(wloom_addr, &cd, ZERO_VALUE)
         .unwrap_or_else(|_| petal::revert("router: wloom.withdraw failed"));
 }
 
@@ -817,10 +811,8 @@ impl router::Handler for RouterHandler {
 
         // Transfer wLOOM from router (self) to pair — router already holds the deposit.
         {
-            let mut cd = Encoder::with_selector(selectors::ERC20_TRANSFER);
-            cd.push_address(&pair);
-            cd.push_u256(amount_loom);
-            petal::call(&wloom, &cd.finish(), ZERO_VALUE)
+            let cd = erc20::abi::call::transfer(&pair, amount_loom);
+            petal::call(&wloom, &cd, ZERO_VALUE)
                 .unwrap_or_else(|_| petal::revert("router: wloom transfer to pair failed"));
         }
 
@@ -928,10 +920,8 @@ impl router::Handler for RouterHandler {
 
         // Transfer tokens directly to `to`.
         {
-            let mut cd = Encoder::with_selector(selectors::ERC20_TRANSFER);
-            cd.push_address(&to);
-            cd.push_u256(amount_token);
-            petal::call(&token, &cd.finish(), ZERO_VALUE)
+            let cd = erc20::abi::call::transfer(&to, amount_token);
+            petal::call(&token, &cd, ZERO_VALUE)
                 .unwrap_or_else(|_| petal::revert("router: token transfer to `to` failed"));
         }
 
@@ -1043,10 +1033,8 @@ impl router::Handler for RouterHandler {
             petal::revert("router: swapExactLOOM: first pair not found");
         }
         {
-            let mut cd = Encoder::with_selector(selectors::ERC20_TRANSFER);
-            cd.push_address(&first_pair);
-            cd.push_u256(amounts[0]);
-            petal::call(&wloom, &cd.finish(), ZERO_VALUE)
+            let cd = erc20::abi::call::transfer(&first_pair, amounts[0]);
+            petal::call(&wloom, &cd, ZERO_VALUE)
                 .unwrap_or_else(|_| petal::revert("router: wloom transfer failed"));
         }
 
@@ -1171,10 +1159,8 @@ impl router::Handler for RouterHandler {
             petal::revert("router: swapLOOMForExact: first pair not found");
         }
         {
-            let mut cd = Encoder::with_selector(selectors::ERC20_TRANSFER);
-            cd.push_address(&first_pair);
-            cd.push_u256(loom_needed);
-            petal::call(&wloom, &cd.finish(), ZERO_VALUE)
+            let cd = erc20::abi::call::transfer(&first_pair, loom_needed);
+            petal::call(&wloom, &cd, ZERO_VALUE)
                 .unwrap_or_else(|_| petal::revert("router: wloom transfer failed"));
         }
 
@@ -1378,80 +1364,62 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Selector parity — guards against ABI drift between chain-owned ABI
-    // (macro-emitted) and the legacy bloom-dex-abi build.rs table.
+    // Selector parity — pins macro-emitted selectors to their canonical
+    // method strings, guarding against ABI drift.
     // ---------------------------------------------------------------------
 
     #[test]
     fn router_selectors_match_dex_v0_canonical_strings() {
-        bloom_dex_abi::assert_selector_parity! {
-            router::SEL_ADD_LIQUIDITY                =>
-                b"router.add_liquidity(address,address,u256,u256,u256,u256,address,u64)",
-            router::SEL_ADD_LIQUIDITY_LOOM           =>
-                b"router.add_liquidity_loom(address,u256,u256,u256,address,u64)",
-            router::SEL_REMOVE_LIQUIDITY             =>
-                b"router.remove_liquidity(address,address,u256,u256,u256,address,u64)",
-            router::SEL_REMOVE_LIQUIDITY_LOOM        =>
-                b"router.remove_liquidity_loom(address,u256,u256,u256,address,u64)",
-            router::SEL_SWAP_EXACT_TOKENS_FOR_TOKENS =>
-                b"router.swap_exact_tokens_for_tokens(u256,u256,Vec<Address>,address,u64)",
-            router::SEL_SWAP_TOKENS_FOR_EXACT_TOKENS =>
-                b"router.swap_tokens_for_exact_tokens(u256,u256,Vec<Address>,address,u64)",
-            router::SEL_SWAP_EXACT_LOOM_FOR_TOKENS   =>
-                b"router.swap_exact_loom_for_tokens(u256,Vec<Address>,address,u64)",
-            router::SEL_SWAP_TOKENS_FOR_EXACT_LOOM   =>
-                b"router.swap_tokens_for_exact_loom(u256,u256,Vec<Address>,address,u64)",
-            router::SEL_SWAP_EXACT_TOKENS_FOR_LOOM   =>
-                b"router.swap_exact_tokens_for_loom(u256,u256,Vec<Address>,address,u64)",
-            router::SEL_SWAP_LOOM_FOR_EXACT_TOKENS   =>
-                b"router.swap_loom_for_exact_tokens(u256,Vec<Address>,address,u64)",
-            router::SEL_QUOTE                        => b"router.quote(u256,u256,u256)",
-            router::SEL_GET_AMOUNT_OUT               => b"router.get_amount_out(u256,u256,u256)",
-            router::SEL_GET_AMOUNT_IN                => b"router.get_amount_in(u256,u256,u256)",
-            router::SEL_GET_AMOUNTS_OUT              => b"router.get_amounts_out(u256,Vec<Address>)",
-            router::SEL_GET_AMOUNTS_IN               => b"router.get_amounts_in(u256,Vec<Address>)",
+        fn _expected(method: &[u8]) -> [u8; 4] {
+            let h = blake3::hash(method);
+            let b = h.as_bytes();
+            [b[0], b[1], b[2], b[3]]
         }
-    }
-
-    #[test]
-    fn router_selectors_match_legacy_dex_abi_constants() {
-        // The chain-ABI macro must emit byte-identical selectors to the old
-        // bloom-dex-abi build.rs table, so peer contracts (factory, pair,
-        // wloom, erc20) keep dispatching the router's outbound calls and so
-        // off-chain CLI tooling can keep its hard-coded constants.
-        assert_eq!(router::SEL_ADD_LIQUIDITY, bloom_dex_abi::selectors::ROUTER_ADD_LIQUIDITY);
-        assert_eq!(router::SEL_ADD_LIQUIDITY_LOOM, bloom_dex_abi::selectors::ROUTER_ADD_LIQUIDITY_LOOM);
-        assert_eq!(router::SEL_REMOVE_LIQUIDITY, bloom_dex_abi::selectors::ROUTER_REMOVE_LIQUIDITY);
-        assert_eq!(router::SEL_REMOVE_LIQUIDITY_LOOM, bloom_dex_abi::selectors::ROUTER_REMOVE_LIQUIDITY_LOOM);
+        assert_eq!(
+            router::SEL_ADD_LIQUIDITY,
+            _expected(b"router.add_liquidity(address,address,u256,u256,u256,u256,address,u64)"),
+        );
+        assert_eq!(
+            router::SEL_ADD_LIQUIDITY_LOOM,
+            _expected(b"router.add_liquidity_loom(address,u256,u256,u256,address,u64)"),
+        );
+        assert_eq!(
+            router::SEL_REMOVE_LIQUIDITY,
+            _expected(b"router.remove_liquidity(address,address,u256,u256,u256,address,u64)"),
+        );
+        assert_eq!(
+            router::SEL_REMOVE_LIQUIDITY_LOOM,
+            _expected(b"router.remove_liquidity_loom(address,u256,u256,u256,address,u64)"),
+        );
         assert_eq!(
             router::SEL_SWAP_EXACT_TOKENS_FOR_TOKENS,
-            bloom_dex_abi::selectors::ROUTER_SWAP_EXACT_TOKENS_FOR_TOKENS,
+            _expected(b"router.swap_exact_tokens_for_tokens(u256,u256,Vec<Address>,address,u64)"),
         );
         assert_eq!(
             router::SEL_SWAP_TOKENS_FOR_EXACT_TOKENS,
-            bloom_dex_abi::selectors::ROUTER_SWAP_TOKENS_FOR_EXACT_TOKENS,
+            _expected(b"router.swap_tokens_for_exact_tokens(u256,u256,Vec<Address>,address,u64)"),
         );
         assert_eq!(
             router::SEL_SWAP_EXACT_LOOM_FOR_TOKENS,
-            bloom_dex_abi::selectors::ROUTER_SWAP_EXACT_LOOM_FOR_TOKENS,
+            _expected(b"router.swap_exact_loom_for_tokens(u256,Vec<Address>,address,u64)"),
         );
         assert_eq!(
             router::SEL_SWAP_TOKENS_FOR_EXACT_LOOM,
-            bloom_dex_abi::selectors::ROUTER_SWAP_TOKENS_FOR_EXACT_LOOM,
+            _expected(b"router.swap_tokens_for_exact_loom(u256,u256,Vec<Address>,address,u64)"),
         );
         assert_eq!(
             router::SEL_SWAP_EXACT_TOKENS_FOR_LOOM,
-            bloom_dex_abi::selectors::ROUTER_SWAP_EXACT_TOKENS_FOR_LOOM,
+            _expected(b"router.swap_exact_tokens_for_loom(u256,u256,Vec<Address>,address,u64)"),
         );
         assert_eq!(
             router::SEL_SWAP_LOOM_FOR_EXACT_TOKENS,
-            bloom_dex_abi::selectors::ROUTER_SWAP_LOOM_FOR_EXACT_TOKENS,
+            _expected(b"router.swap_loom_for_exact_tokens(u256,Vec<Address>,address,u64)"),
         );
-        assert_eq!(router::SEL_QUOTE, bloom_dex_abi::selectors::ROUTER_QUOTE);
-        assert_eq!(router::SEL_GET_AMOUNT_OUT, bloom_dex_abi::selectors::ROUTER_GET_AMOUNT_OUT);
-        assert_eq!(router::SEL_GET_AMOUNT_IN, bloom_dex_abi::selectors::ROUTER_GET_AMOUNT_IN);
-        assert_eq!(router::SEL_GET_AMOUNTS_OUT, bloom_dex_abi::selectors::ROUTER_GET_AMOUNTS_OUT);
-        assert_eq!(router::SEL_GET_AMOUNTS_IN, bloom_dex_abi::selectors::ROUTER_GET_AMOUNTS_IN);
+        assert_eq!(router::SEL_QUOTE, _expected(b"router.quote(u256,u256,u256)"));
+        assert_eq!(router::SEL_GET_AMOUNT_OUT, _expected(b"router.get_amount_out(u256,u256,u256)"));
+        assert_eq!(router::SEL_GET_AMOUNT_IN, _expected(b"router.get_amount_in(u256,u256,u256)"));
+        assert_eq!(router::SEL_GET_AMOUNTS_OUT, _expected(b"router.get_amounts_out(u256,Vec<Address>)"));
+        assert_eq!(router::SEL_GET_AMOUNTS_IN, _expected(b"router.get_amounts_in(u256,Vec<Address>)"));
     }
 
     #[test]

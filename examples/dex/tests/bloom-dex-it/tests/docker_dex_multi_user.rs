@@ -160,7 +160,7 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     let pair_petal_hash = json_hex(&suite, "pair_petal_hash")?;
 
     // `bloom-dex deploy-suite` writes a `dex.toml` registry in Alice's home
-    // recording the factory/router/wloom/reentrancy addresses. Bob's and
+    // recording the factory/router/wloom addresses. Bob's and
     // Carol's CLIs need the same registry to resolve `--router` / `--factory`
     // defaults on `swap` etc. Share Alice's registry across all user homes.
     let alice_registry = alice.home.join("chain").join("dex.toml");
@@ -443,9 +443,15 @@ fn bloom_bin() -> PathBuf {
     PathBuf::from(manifest_dir).join("../../../../target/release/bloom")
 }
 
-/// Create a fresh user identity:
+/// Create (or reuse) a user identity:
 ///   1. Make `<users_root>/<name>/chain/keystore/`
-///   2. Run `bloom chain init` to generate an xDSA keypair in that home
+///   2. If `validator.xdsa` does not yet exist, run `bloom chain init` to
+///      generate an xDSA keypair in that home. If it does exist (the test
+///      harness is retrying after a transient failure in `add-liquidity`
+///      or similar), reuse it — `bloom chain init` now refuses to overwrite
+///      an existing keystore (consensus-hardening review 2026-05-19 #9),
+///      and forcing a fresh identity would break the LOOM-conservation
+///      accounting which is keyed off these addresses.
 ///   3. Copy the shared genesis.toml into the user's chain dir
 ///   4. Return `User` with the rpc_tcp endpoint pointing at one validator
 fn create_user(
@@ -458,18 +464,21 @@ fn create_user(
     let chain_dir = home.join("chain");
     std::fs::create_dir_all(chain_dir.join("keystore"))?;
 
-    let status = Command::new(bloom_bin())
-        .args([
-            "--home", home.to_str().unwrap(),
-            "chain", "init",
-            "--genesis", shared_genesis.to_str().unwrap(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("invoke bloom chain init")?;
-    if !status.success() {
-        bail!("bloom chain init failed for {name}");
+    let key_path = chain_dir.join("keystore").join("validator.xdsa");
+    if !key_path.exists() {
+        let status = Command::new(bloom_bin())
+            .args([
+                "--home", home.to_str().unwrap(),
+                "chain", "init",
+                "--genesis", shared_genesis.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .status()
+            .context("invoke bloom chain init")?;
+        if !status.success() {
+            bail!("bloom chain init failed for {name}");
+        }
     }
 
     let user_genesis = chain_dir.join("genesis.toml");

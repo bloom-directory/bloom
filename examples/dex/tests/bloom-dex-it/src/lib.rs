@@ -33,9 +33,8 @@ use bloom_chain_node::rpc::RpcClient;
 // Binary + wasm location
 // ---------------------------------------------------------------------------
 
-/// The six DEX wasm artifacts produced by `cargo build --target wasm32-unknown-unknown -p bloom-dex-*`.
+/// The five DEX wasm artifacts produced by `cargo build --target wasm32-unknown-unknown -p bloom-dex-*`.
 pub const DEX_WASMS: &[&str] = &[
-    "bloom_dex_reentrancy.wasm",
     "bloom_dex_wloom.wasm",
     "bloom_dex_pair.wasm",
     "bloom_dex_factory.wasm",

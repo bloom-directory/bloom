@@ -1,0 +1,5 @@
+error: combining #[internal] and #[nonreentrant] on the same fn is not allowed
+ --> tests/ui/internal_plus_nonreentrant.rs:8:11
+  |
+8 |         #[nonreentrant]
+  |           ^^^^^^^^^^^^

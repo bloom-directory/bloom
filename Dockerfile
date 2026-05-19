@@ -70,7 +70,6 @@ RUN cargo build --release --target wasm32-unknown-unknown \
         -p bloom-dex-factory \
         -p bloom-dex-pair \
         -p bloom-dex-wloom \
-        -p bloom-dex-reentrancy \
         -p bloom-dex-router
 
 # Stage outputs into /out so the runtime COPY is dead-simple.
@@ -79,7 +78,7 @@ RUN set -eux; \
     cp target/release/bloom        /out/bin/bloom; \
     cp target/release/bloom-dex    /out/bin/bloom-dex; \
     for w in bloom_dex_erc20 bloom_dex_factory bloom_dex_pair \
-             bloom_dex_wloom bloom_dex_reentrancy bloom_dex_router; do \
+             bloom_dex_wloom bloom_dex_router; do \
         cp "target/wasm32-unknown-unknown/release/${w}.wasm" "/out/wasm/${w}.wasm"; \
     done; \
     ls -la /out/bin /out/wasm

@@ -8,7 +8,7 @@
 //! Flow:
 //!   1. provision 4-validator network via `bloom chain testnet`
 //!   2. spawn all 4; wait for height ≥ 2
-//!   3. `bloom dex deploy-suite` → reentrancy + wloom + factory + router
+//!   3. `bloom dex deploy-suite` → wloom + factory + router
 //!   4. `bloom dex deploy-token TKA` and `bloom dex deploy-token TKB`
 //!   5. `bloom dex create-pair TKA TKB`
 //!   6. `bloom dex add-liquidity ...` → assert reserves and LP supply
@@ -67,7 +67,7 @@ async fn dex_v0_acceptance_end_to_end() -> Result<()> {
         .await
         .map_err(|_| anyhow!("validators failed to reach height 2"))??;
 
-    // ── 3. deploy-suite (5 deploys: pair-bootstrap, reentrancy, wloom, factory, router) ──
+    // ── 3. deploy-suite (4 deploys: pair-bootstrap, wloom, factory, router) ──
     let suite_out = run_bloom_dex(
         &home_0,
         &["deploy-suite", "--wasm-dir", wasm_dir.to_str().unwrap()],

@@ -11,8 +11,15 @@ crate-type = ["cdylib"]
 
 [dependencies]
 bloom-chain-abi = { workspace = true, default-features = false }
-bloom-dex-abi   = { workspace = true, default-features = false }
 bloom-petal-sdk = { workspace = true }
+
+# Sibling DEX petals — depended on only for their macro-emitted `abi::call`
+# helpers (selector + calldata builders). The link does not pull in their
+# init/call entry points because we only reference items under `<petal>::abi`.
+bloom-dex-factory = { path = "../bloom-dex-factory" }
+bloom-dex-pair    = { path = "../bloom-dex-pair" }
+bloom-dex-erc20   = { path = "../bloom-dex-erc20" }
+bloom-dex-wloom   = { path = "../../../wloom" }
 
 # blake3 is used in host-side unit tests (non-wasm32) to verify selectors.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

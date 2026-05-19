@@ -1,15 +1,18 @@
 # bloom-dex — a Uniswap-v2-style DEX as bloom-chain petals
 
 **Status:** draft
-**Date:** 2026-05-18
+**Date:** 2026-05-18 (revised 2026-05-19 for contract-macro v2)
 **Owners:** —
 **Addresses:** The v0 application layer on top of [bloom-chain]
 ([2026-05-18-bloom-chain-design.md](2026-05-18-bloom-chain-design.md)).
 A constant-product AMM expressed as a small set of wasm petals: an
 ERC-20-shaped token petal, a pair petal, a factory petal, a router
-petal, a wrapped-LOOM petal, and a reentrancy-guard helper petal. No
-flash swaps, no fee-to, no on-chain governance, no oracles — that is
-all v1+.
+petal, and a wrapped-LOOM petal. Reentrancy protection is now a
+language-level concern provided by the `#[nonreentrant]` attribute on
+`bloom_chain_abi::contract!` (see
+[2026-05-19-contract-macro-v2.md](2026-05-19-contract-macro-v2.md) §C);
+the separate reentrancy-guard helper petal is gone. No flash swaps,
+no fee-to, no on-chain governance, no oracles — that is all v1+.
 
 ## 1. Goals
 
@@ -52,18 +55,17 @@ all v1+.
 
 ## 3. Petal inventory
 
-Six wasm petals total. Each is content-addressed by its BLAKE3 hash;
+Five wasm petals total. Each is content-addressed by its BLAKE3 hash;
 deploying instantiates `(petal_hash, instance_address)` per the
 chain spec's `Deploy` tx kind.
 
 | Petal | Crate | Role |
 |-------|-------|------|
-| `bloom-dex-erc20` | `crates/bloom-dex-erc20` | Generic ERC-20-shaped fungible token. Used for both test tokens and as the **base class** of `bloom-dex-pair`'s LP token (the LP token is the pair instance itself). |
-| `bloom-dex-pair` | `crates/bloom-dex-pair` | Single-pair AMM. Holds reserves, exposes `mint` / `burn` / `swap` / `skim` / `sync`. Also acts as its own LP token (ERC-20 surface inlined). |
-| `bloom-dex-factory` | `crates/bloom-dex-factory` | Deploys pairs deterministically. Registers `pair_address(tokenA, tokenB)`. Owns the canonical `pair` petal hash. |
-| `bloom-dex-router` | `crates/bloom-dex-router` | Stateless. `addLiquidity` / `removeLiquidity` / `swapExactTokensForTokens` / `swapTokensForExactTokens`, plus their `*ETH` variants over wrapped LOOM. |
-| `bloom-dex-wloom` | `crates/bloom-dex-wloom` | Wrapped native LOOM. `deposit` (payable, mints), `withdraw` (burns, sends native). Mirrors WETH9 semantics. |
-| `bloom-dex-reentrancy` | `crates/bloom-dex-reentrancy` | Library petal with a single guarded-call helper. The pair's `mint` / `burn` / `swap` route through it. (See §8.) |
+| `bloom-dex-erc20` | `examples/dex/crates/bloom-dex-erc20` | Generic ERC-20-shaped fungible token. Used for both test tokens and as the **base class** of `bloom-dex-pair`'s LP token (the LP token is the pair instance itself). |
+| `bloom-dex-pair` | `examples/dex/crates/bloom-dex-pair` | Single-pair AMM. Holds reserves, exposes `mint` / `burn` / `swap` / `skim` / `sync`. Also acts as its own LP token (ERC-20 surface inlined). `mint` / `burn` / `swap` carry `#[nonreentrant]` (see §8). |
+| `bloom-dex-factory` | `examples/dex/crates/bloom-dex-factory` | Deploys pairs deterministically. Registers `pair_address(tokenA, tokenB)`. Owns the canonical `pair` petal hash. |
+| `bloom-dex-router` | `examples/dex/crates/bloom-dex-router` | Stateless. `addLiquidity` / `removeLiquidity` / `swapExactTokensForTokens` / `swapTokensForExactTokens`, plus their `*LOOM` variants over wrapped LOOM. |
+| `bloom-dex-wloom` | `examples/wloom` | Wrapped native LOOM. `deposit` (payable, mints), `withdraw` (burns, sends native). Mirrors WETH9 semantics. Lives at the workspace top level — independent of the DEX. |
 
 Each petal compiles to one `*.wasm` artifact under
 `target/wasm32-unknown-unknown/release/`. The `init` entry point
@@ -102,10 +104,10 @@ reference):
 - `bool` = 1 byte (0 / 1).
 - `bytes32` = 32 bytes.
 - `Vec<Address>` (paths only) = `u16` big-endian length + `length * 32` bytes.
-- `bytes` (variable-length tail, used only by
-  `reentrancy.enter`) = raw remainder of calldata, no length
-  prefix; chain spec §7.10.1 restricts it to the LAST
-  positional argument of a method.
+- `bytes` (variable-length tail) = raw remainder of calldata, no
+  length prefix; chain spec §7.10.1 restricts it to the LAST
+  positional argument of a method. Currently unused in v0 — the
+  reentrancy.enter callsite that used it has been removed (see §8).
 
 Strict decoding (chain spec §7.10.4) means every dispatcher
 rejects trailing bytes, unknown selectors, short calldata, and
@@ -200,10 +202,10 @@ encoding is two `Address`es: `t0 || t1`.)
   LOOM to `msg.sender` via the chain's value-transfer mechanism
   (see §7).
 
-**Reentrancy** (`bloom-dex-reentrancy`):
-- `reentrancy.enter(address callee, bytes calldata)` — sets a
-  lock slot, forwards via `petal.call`, clears the lock on
-  return. Reverts if already locked. (See §8.)
+**Reentrancy.** No dedicated petal. The pair's `mint` / `burn` /
+`swap` carry the `#[nonreentrant]` attribute, which makes the
+chain-ABI macro wrap each method with a check-and-set of a contract-
+wide auto-managed lock slot (see §8 and contract-macro v2 spec §C).
 
 ## 5. Address derivation
 
@@ -256,12 +258,12 @@ entry point (chain spec §7.8) with the supplied `init_calldata`.
 
 Pre-requirement: the pair wasm must already exist in the chain's
 `code_root`. Operators upload it once during chain bootstrap via a
-single tx-level `Deploy` whose `init_args` is exactly 128 bytes of
-zero (`token0 = token1 = reentrancy = self = 0x00..`). Pair `init`
-tolerates a zero-only payload — it writes zero slots to the
-bootstrap instance, leaves reserves at zero, and never gets called
-again because `create_pair` derives a different address for every
-real (tokenA, tokenB) deployment. The resulting bootstrap instance
+single tx-level `Deploy` whose `init_args` is exactly 96 bytes of
+zero (`token0 = token1 = self = 0x00..`). Pair `init` tolerates a
+zero-only payload — it writes zero slots to the bootstrap instance,
+leaves reserves at zero, and never gets called again because
+`create_pair` derives a different address for every real
+(tokenA, tokenB) deployment. The resulting bootstrap instance
 address is therefore inert; only the `petal_hash` registration in
 `code_root` is what matters. The factory is constructed with
 `pair_petal_hash` baked in as a constant.
@@ -297,28 +299,33 @@ differ.
 
 ### 6.2 Pair AMM (`bloom-dex-pair`)
 
-**init calldata:** `token0 (32B) || token1 (32B) || reentrancy_addr (32B) || pair_self_addr (32B)` — 128 bytes, no fallback.
+**init calldata:** `token0 (32B) || token1 (32B) || pair_self_addr (32B)` — 96 bytes, no fallback.
 The factory pre-computes `pair_self_addr` via chain spec §7.7 before calling `host.deploy`.
-The pair stores `pair_self_addr` in `K_SELF` so it can call `token.balanceOf(self)`
+The pair stores `pair_self_addr` in the `self_addr` slot so it can call `token.balanceOf(self)`
 (the chain has no `msg.self` host import).
+
+Storage is declared inline in the pair's `contract!` block; slot keys
+below are the canonical derivations the chain-ABI storage runtime
+produces from each `@ "tag"` (scalar) or `@ "tag:"` (mapping) override
+plus the auto-tagged fields `pair.<field>`.
 
 | Slot | Key | Value |
 |------|-----|-------|
 | `token0` | `blake3("pair.token0")` | Address (32 bytes) |
 | `token1` | `blake3("pair.token1")` | Address |
-| `reentrancy` | `blake3("pair.reentrancy")` | Address |
-| `self` | `blake3("pair.self")` | Address — this petal's own address |
+| `self_addr` | `blake3("pair.self")` | Address — this petal's own address |
 | `reserve0` | `blake3("pair.reserve0")` | u128 (left-padded to 32) |
 | `reserve1` | `blake3("pair.reserve1")` | u128 |
 | `k_last` | `blake3("pair.k_last")` | u256 (kept for future feeTo; always written but read-only in v0) |
-| `lock` | `blake3("pair.lock")` | u8 (0/1) — reentrancy guard; set/cleared by `bloom-dex-reentrancy` via internal selectors |
 
-**Internal selectors** (callable only by the reentrancy petal, registered in `bloom-dex-abi`):
-- `pair.lock_check_and_set()` — reverts `"pair: locked"` if lock==1, otherwise sets lock=1.
-- `pair.lock_clear()` — unconditionally clears lock=0.
-- `pair._mint_inner(address)` — mint inner logic (LP issuance).
-- `pair._burn_inner(address)` — burn inner logic (LP redemption).
-- `pair._swap_inner(u256,u256,address)` — swap inner logic (k-invariant check).
+Plus the ERC-20 / LP token slots from §6.1 (`total_supply`,
+`balances:`, `allowances:`) which the pair re-uses verbatim.
+
+**Reentrancy lock.** The pair no longer stores a `lock` slot under
+its own namespace. The `#[nonreentrant]` attribute on
+`mint` / `burn` / `swap` makes the macro auto-manage a
+reserved slot at `blake3("__macro.nonreentrant.pair")` — opaque to
+user code, but invariant across deploys of the same petal hash. See §8.
 
 `get_reserves` packs `reserve0` (u128, 16 bytes), `reserve1` (u128,
 16 bytes), and the current `block.timestamp` low 64 bits into one
@@ -326,24 +333,26 @@ return slot for cheaper reads.
 
 ### 6.3 Factory (`bloom-dex-factory`)
 
-**init calldata:** `pair_petal_hash (32B) || reentrancy_addr (32B) || fee_to_setter (32B) || factory_self_addr (32B)` — 128 bytes, no fallback.
-`factory_self_addr` is the factory's own pre-computed CREATE2 address, stored in `K_SELF`.
-The factory uses `K_SELF` in `createPair` to pre-compute the pair address via chain spec §7.7
-before calling `host.deploy`, so the pair's 128B init calldata can include `pair_self_addr`.
+**init calldata:** `pair_petal_hash (32B) || fee_to_setter (32B) || factory_self_addr (32B)` — 96 bytes, no fallback.
+`factory_self_addr` is the factory's own pre-computed CREATE2 address, stored in the `self_addr` slot.
+The factory uses `self_addr` in `createPair` to pre-compute the pair address via chain spec §7.7
+before calling `host.deploy`, so the pair's 96B init calldata can include `pair_self_addr`.
 
-`createPair` builds 128B pair init: `t0 || t1 || reentrancy_addr || pair_address` where
+`createPair` builds 96B pair init: `t0 || t1 || pair_address` where
 `pair_address = blake3("bloom-chain.v0.addr:deploy:" || factory_self || ":" || salt || ":" || pair_petal_hash)`.
 
 | Slot | Key | Value |
 |------|-----|-------|
 | `pair_petal_hash` | `blake3("factory.pair_petal_hash")` | bytes32 |
-| `reentrancy` | `blake3("factory.reentrancy")` | Address |
 | `fee_to` | `blake3("factory.fee_to")` | Address (zero in v0) |
 | `fee_to_setter` | `blake3("factory.fee_to_setter")` | Address |
-| `self` | `blake3("factory.self")` | Address — factory's own address |
-| `get_pair(t0,t1)` | `blake3("factory.pair:" \|\| t0 \|\| t1)` | Address (zero if unset) — stored for both orderings |
+| `self_addr` | `blake3("factory.self")` | Address — factory's own address |
+| `get_pair(t0,t1)` | `blake3("factory.pair_of:" \|\| t0 \|\| t1)` | Address (zero if unset) — stored for both orderings |
 | `all_pairs_length` | `blake3("factory.all_pairs.len")` | u64 |
 | `all_pairs[i]` | `blake3("factory.all_pairs:" \|\| u64_be(i))` | Address |
+
+The factory no longer stores a `reentrancy` address; the cross-petal
+reentrancy guard is gone (§8).
 
 ### 6.4 Wrapped LOOM (`bloom-dex-wloom`)
 
@@ -353,9 +362,7 @@ Same as ERC-20 §6.1, with `name = "Wrapped LOOM"`, `symbol =
 `withdraw` does the reverse and triggers a native LOOM transfer
 (see §7).
 
-### 6.5 Reentrancy guard (`bloom-dex-reentrancy`)
-
-**init calldata:** none — stateless petal, no constructor parameters.
+### 6.5 Router (`bloom-dex-router`)
 
 **init calldata for router (`bloom-dex-router`):**
 `factory_addr (32B) || wloom_addr (32B) || router_self_addr (32B)` — 96 bytes, no fallback.
@@ -363,15 +370,6 @@ The 64-byte form is rejected with `"router: bad init"`. The `deploy-suite` CLI M
 pass 96 bytes with the router's CREATE2-precomputed address as the third field.
 `router_self_addr` is required for LOOM-output swaps which temporarily receive
 wLOOM into the router before unwrapping it to native LOOM.
-
-The lock slot is held by the **pair** at `blake3("pair.lock")`. The reentrancy
-petal is a stateless orchestrator — it owns no storage. It acquires and releases
-the lock by calling back into the pair's internal selectors:
-- `pair.lock_check_and_set()` — first call on entry; reverts if lock already set.
-- `pair.lock_clear()` — called on the success path to release.
-
-This keeps the lock per-pair without cross-pair contention and avoids state in
-the reentrancy petal itself.
 
 ## 7. Native LOOM ↔ wrapped LOOM bridge
 
@@ -398,59 +396,66 @@ choose to.
 ## 8. Reentrancy and locking
 
 v2 pair contracts in Solidity use a `lock` modifier around `mint`,
-`burn`, and `swap`. We replicate this without a modifier system.
+`burn`, and `swap`. The chain-ABI macro provides the equivalent as a
+function-level attribute. The DEX uses it directly; there is no
+dedicated reentrancy petal and no cross-petal `enter` indirection.
 
-**Lock state lives in the pair** (`blake3("pair.lock")`). The
-reentrancy petal is a stateless orchestrator — all lock reads/writes
-happen inside the pair via internal selectors registered in `bloom-dex-abi`.
+### 8.1 The `#[nonreentrant]` attribute
 
-### 8.1 Enter flow
+```rust
+contract! {
+    contract Pair {
+        // …storage, events…
 
-1. On entry to `pair.mint` / `pair.burn` / `pair.swap`, the pair
-   re-encodes the request as an inner selector (e.g. `pair._mint_inner`)
-   and calls `reentrancy.enter(self_addr, inner_calldata)` via `petal.call`.
-2. The reentrancy petal (`bloom-dex-reentrancy`):
-   a. Verifies `msg.sender == target` — only the pair may call `enter` for itself.
-   b. Calls `pair.lock_check_and_set()` on the pair. That internal selector
-      reverts `"pair: locked"` if `lock == 1`, otherwise atomically sets
-      `lock = 1`.
-   c. Calls `target` with `inner_calldata` — forwarding to `pair._mint_inner`,
-      `pair._burn_inner`, or `pair._swap_inner`. Any revert from the inner
-      call propagates out of `enter`.
-   d. On success, calls `pair.lock_clear()` to set `lock = 0`.
-3. Any reentrant `petal.call` chain back into the same pair's public
-   entry point that calls `enter` again will hit `lock_check_and_set`
-   and revert `"pair: locked"`.
+        #[nonreentrant]
+        fn mint(to: Address);
 
-### 8.2 v0 revert behaviour (known limitation)
+        #[nonreentrant]
+        fn burn(to: Address);
 
-WASM reverts unwind stack frames synchronously. If the inner call in
-step 2c reverts, control propagates out of `enter` and `lock_clear`
-(step 2d) is **skipped**. However, this is safe in v0 because each
-transaction is atomic: a revert rolls back ALL state changes for the
-tx, including the `lock_check_and_set` write. So the lock is never
-durably persisted after a failed transaction.
+        #[nonreentrant]
+        fn swap(amount0_out: U256, amount1_out: U256, to: Address);
+    }
+}
+```
 
-The `petal.call` depth cap of 16 (chain spec §16) is a backstop;
-the per-pair lock is the primary defence.
+The macro wraps each `#[nonreentrant]` method with a contract-wide
+lock check-and-set at the dispatcher boundary. The lock slot is a
+single auto-managed key derived as
+`blake3("__macro.nonreentrant.<contract_snake>")` — for the pair
+that is `blake3("__macro.nonreentrant.pair")`. The reserved
+`__macro.` tag prefix is enforced by the macro parser; user code
+cannot declare any storage under it (contract-macro v2 spec §B).
 
-v1 will add `host.try_call` for a finally-clause pattern so that
-`lock_clear` fires even on inner reverts, making lock-release
-unconditional regardless of tx revert semantics.
+### 8.2 Enter / exit semantics
 
-### 8.3 Internal selector registry
+On entry to a `#[nonreentrant]` method the macro-generated
+dispatcher:
 
-The five internal selectors live in `bloom-dex-abi::selectors` (registered
-in `bloom-dex-abi/build.rs`) so both the pair and the reentrancy petal
-reference the same compiled constants:
+1. Reads the lock slot. If `slot[31] == 1`, the dispatcher reverts
+   `"pair: reentrant call"` immediately.
+2. Writes `slot[31] = 1` (set the lock).
+3. Invokes the user handler.
+4. **Success path:** writes `slot[31] = 0` (clear the lock).
 
-| Constant | Method string |
-|----------|---------------|
-| `PAIR_LOCK_CHECK_AND_SET` | `pair.lock_check_and_set()` |
-| `PAIR_LOCK_CLEAR` | `pair.lock_clear()` |
-| `PAIR_MINT_INNER` | `pair._mint_inner(address)` |
-| `PAIR_BURN_INNER` | `pair._burn_inner(address)` |
-| `PAIR_SWAP_INNER` | `pair._swap_inner(u256,u256,address)` |
+The pair handlers terminate via the divergent `petal::return_data`
+SDK call, which never returns control to the dispatcher. For those
+methods the user code calls `pair::abi::nonreentrant_lock_clear()`
+(emitted by the macro inside the contract's `abi` module)
+immediately before `petal::return_data(...)`. The divergent-return
+contract is documented in the contract-macro v2 spec §C.
+
+### 8.3 Revert behaviour
+
+If a `#[nonreentrant]` handler reverts (via `petal::revert(...)` or
+any host trap), the surrounding transaction is rolled back at the
+chain level — including the lock-set write. The lock is never
+durably observable after a failed transaction. This matches the
+behaviour of the prior cross-petal guard and removes the need for
+`host.try_call` / a finally-clause primitive in v0.
+
+The `petal.call` depth cap of 16 (chain spec §16) remains as a
+backstop.
 
 ## 9. AMM math
 
@@ -505,23 +510,34 @@ returning silent zeros.
 
 ## 10. Events / logs
 
-Each petal emits logs via `log.emit` (chain spec §7.6). Topics are
-4-byte BLAKE3 selectors of the event signature; topic and data
-encoding mirror Solidity logs at the surface level so a client SDK
-can decode them with the existing eth log shape.
+Each petal declares its events inline in its `contract!` block; the
+chain-ABI macro emits per-event topic constants (`<EVENT>_TOPIC`,
+4 bytes) and an `emit_<event>(...)` function inside the contract's
+`abi::events` module. Topics are 4-byte BLAKE3 selectors of the
+canonical event signature (chain spec §7.10.2; identical derivation
+to method selectors).
+
+Indexed fields are tagged with `#[indexed]` in the declaration. In
+v0 the underlying `log.emit` host import accepts a single 4-byte
+topic, so indexed field values are encoded as 32-byte chunks at the
+head of the log's data blob (the topic remains the event-signature
+prefix). Downstream consumers read indexed values by position. This
+matches the pre-migration wire format and a future v1+ chain
+upgrade can promote them to multi-topic logs without changing the
+DSL.
 
 ERC-20:
-- `Transfer(address from, address to, u256 value)`
-- `Approval(address owner, address spender, u256 value)`
+- `Transfer(#[indexed] from: Address, #[indexed] to: Address, value: U256)`
+- `Approval(#[indexed] owner: Address, #[indexed] spender: Address, value: U256)`
 
 Pair:
-- `Mint(address sender, u256 amount0, u256 amount1)`
-- `Burn(address sender, u256 amount0, u256 amount1, address to)`
-- `Swap(address sender, u256 a0in, u256 a1in, u256 a0out, u256 a1out, address to)`
-- `Sync(u128 reserve0, u128 reserve1)`
+- `Mint(#[indexed] sender: Address, amount0: U256, amount1: U256)`
+- `Burn(#[indexed] sender: Address, amount0: U256, amount1: U256, #[indexed] to: Address)`
+- `Swap(#[indexed] sender: Address, a0_in: U256, a1_in: U256, a0_out: U256, a1_out: U256, #[indexed] to: Address)`
+- `Sync(reserve0: u128, reserve1: u128)`
 
 Factory:
-- `PairCreated(address token0, address token1, address pair, u64 index)`
+- `PairCreated(#[indexed] token0: Address, #[indexed] token1: Address, pair: Address, all_pairs_length: u64)`
 
 ## 11. CLI surface (DEX-specific)
 
@@ -556,9 +572,13 @@ bloom dex remove-liquidity --token-a <addr> --token-b <addr>
                            --to <addr> --deadline <u64>
 ```
 
-All commands compile their calldata via `bloom-dex-abi` (a small
-crate that mirrors §4 in Rust) and submit `Call` txs via the
-existing chain RPC.
+All commands compile their calldata via each target petal's
+`abi::call::*` module (emitted by the `contract!` macro in the petal
+crate) and submit `Call` txs via the existing chain RPC. The
+historical `bloom-dex-abi` aggregation crate has been deleted in
+favour of importing directly from `bloom-dex-factory`,
+`bloom-dex-pair`, `bloom-dex-router`, `bloom-dex-erc20`, and
+`bloom-dex-wloom`.
 
 ## 12. Interaction with bloom-chain
 

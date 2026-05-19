@@ -27,11 +27,12 @@ pub mod decode;
 pub mod dispatch;
 pub mod selector;
 pub mod event;
+pub mod storage;
 
 pub use decode::{AbiError, Buf};
 pub use dispatch::DispatchError;
 pub use encode::{AbiEncodeError, Encoder};
-pub use event::event_topic;
+pub use event::{event_signature_topic, event_topic};
 pub use selector::selector;
 pub use u256::U256;
 

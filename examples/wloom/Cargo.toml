@@ -7,13 +7,16 @@ license = "MIT"
 
 [lib]
 name = "bloom_dex_wloom"
-crate-type = ["cdylib"]
+# `rlib` is added alongside `cdylib` so sibling DEX petals (router) can
+# `use bloom_dex_wloom::wloom` to access the macro-emitted `abi::call::*`
+# calldata builders. The `cdylib` artefact is still the wasm petal that
+# ships on-chain.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bloom-chain-abi = { workspace = true, default-features = false }
-bloom-dex-abi  = { workspace = true, default-features = false }
 bloom-petal-sdk = { workspace = true }
 
 [dev-dependencies]
-# Used by host-target unit tests to compute expected blake3 digests.
+# Used by host-target unit tests to compute expected blake3 digests + storage keys.
 blake3 = { workspace = true }

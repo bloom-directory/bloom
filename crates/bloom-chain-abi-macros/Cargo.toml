@@ -16,3 +16,13 @@ proc-macro2 = "1"
 blake3 = { version = "1" }
 
 [dev-dependencies]
+# Tests live in `tests/` and exercise the proc-macro end-to-end. They need
+# `bloom-chain-abi` (which re-exports `contract!`), `bloom-petal-sdk` (host
+# imports referenced by macro-generated storage/event code), `proptest` for
+# fuzz parity, `trybuild` for compile-fail tests, and `blake3` to compute
+# expected selectors / topics.
+bloom-chain-abi = { workspace = true }
+bloom-petal-sdk = { workspace = true }
+proptest = "1"
+trybuild = "1"
+blake3 = "1"

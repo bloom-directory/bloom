@@ -28,13 +28,11 @@ members = [
   "crates/bloom-chain-abi-macros",
   "crates/bloom-test-util",
   # ---- example apps (not part of the protocol) ----
-  "examples/dex/crates/bloom-dex-abi",
+  "examples/wloom",
   "examples/dex/crates/bloom-dex-erc20",
   "examples/dex/crates/bloom-dex-factory",
   "examples/dex/crates/bloom-dex-pair",
-  "examples/dex/crates/bloom-dex-wloom",
   "examples/dex/crates/bloom-dex-router",
-  "examples/dex/crates/bloom-dex-reentrancy",
   "examples/dex/crates/bloom-dex-cli",
   "examples/dex/tests/bloom-dex-it",
 ]
@@ -116,7 +114,6 @@ bloom-petal-sdk   = { path = "crates/bloom-petal-sdk" }
 bloom-chain-abi   = { path = "crates/bloom-chain-abi", default-features = false }
 bloom-chain-abi-macros = { path = "crates/bloom-chain-abi-macros" }
 # ---- example DEX crates (not part of the protocol) ----
-bloom-dex-abi     = { path = "examples/dex/crates/bloom-dex-abi", default-features = false }
 bloom-dex-factory = { path = "examples/dex/crates/bloom-dex-factory" }
 bloom-dex-pair    = { path = "examples/dex/crates/bloom-dex-pair" }
 

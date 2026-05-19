@@ -7,12 +7,20 @@ license = "MIT"
 
 [lib]
 name = "bloom_dex_pair"
-crate-type = ["cdylib"]
+# `rlib` is added alongside `cdylib` so sibling DEX petals (router) can
+# `use bloom_dex_pair::pair` to access the macro-emitted `abi::call::*`
+# calldata builders. The `cdylib` artefact is still the wasm petal that
+# ships on-chain.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bloom-chain-abi = { workspace = true, default-features = false }
-bloom-dex-abi   = { workspace = true, default-features = false }
 bloom-petal-sdk = { workspace = true }
+
+# Sibling DEX petal — depended on only for its macro-emitted ERC-20 selector
+# constants (`erc20::SEL_*`). The link does not pull in its init/call entry
+# points because we only reference items under `erc20::SEL_*`.
+bloom-dex-erc20 = { path = "../bloom-dex-erc20" }
 
 # blake3 is used in host-side unit tests (non-wasm32) to verify selectors.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
