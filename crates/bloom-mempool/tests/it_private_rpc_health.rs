@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 #![cfg(feature = "live-providers")]
 
 use bloom_mempool::private::{HealthStatus, PrivateRpcProvider};

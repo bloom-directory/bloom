@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! Test: encode/decode roundtrip for Proposal, Tx, and Vote frames.
 //!
 //! Writes a frame via `write_frame`, reads it back via `read_frame`, and

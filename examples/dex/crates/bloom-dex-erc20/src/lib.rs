@@ -704,20 +704,17 @@ mod tests {
 
     #[test]
     fn erc20_selectors_match_dex_v0_canonical_strings() {
-        fn crate_sel(method: &[u8]) -> [u8; 4] {
-            let h = blake3::hash(method);
-            let b = h.as_bytes();
-            [b[0], b[1], b[2], b[3]]
+        bloom_dex_abi::assert_selector_parity! {
+            erc20::SEL_TOTAL_SUPPLY  => b"erc20.total_supply()",
+            erc20::SEL_BALANCE_OF    => b"erc20.balance_of(address)",
+            erc20::SEL_ALLOWANCE     => b"erc20.allowance(address,address)",
+            erc20::SEL_TRANSFER      => b"erc20.transfer(address,u256)",
+            erc20::SEL_TRANSFER_FROM => b"erc20.transfer_from(address,address,u256)",
+            erc20::SEL_APPROVE       => b"erc20.approve(address,u256)",
+            erc20::SEL_NAME          => b"erc20.name()",
+            erc20::SEL_SYMBOL        => b"erc20.symbol()",
+            super::sel_decimals()    => b"erc20.decimals()",
         }
-        assert_eq!(erc20::SEL_TOTAL_SUPPLY,  crate_sel(b"erc20.total_supply()"));
-        assert_eq!(erc20::SEL_BALANCE_OF,    crate_sel(b"erc20.balance_of(address)"));
-        assert_eq!(erc20::SEL_ALLOWANCE,     crate_sel(b"erc20.allowance(address,address)"));
-        assert_eq!(erc20::SEL_TRANSFER,      crate_sel(b"erc20.transfer(address,u256)"));
-        assert_eq!(erc20::SEL_TRANSFER_FROM, crate_sel(b"erc20.transfer_from(address,address,u256)"));
-        assert_eq!(erc20::SEL_APPROVE,       crate_sel(b"erc20.approve(address,u256)"));
-        assert_eq!(erc20::SEL_NAME,          crate_sel(b"erc20.name()"));
-        assert_eq!(erc20::SEL_SYMBOL,        crate_sel(b"erc20.symbol()"));
-        assert_eq!(super::sel_decimals(),      crate_sel(b"erc20.decimals()"));
     }
 
     #[test]

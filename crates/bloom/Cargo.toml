@@ -51,3 +51,4 @@ predicates = "3"
 tempfile.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
+bloom-test-util = { path = "../bloom-test-util" }

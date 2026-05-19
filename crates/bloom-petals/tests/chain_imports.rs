@@ -1,3 +1,5 @@
+//! Category: wasm-guest
+//!
 //! Integration tests for chain-mode host imports.
 //!
 //! Each test builds a minimal WAT module, wires it through `PetalVm::run_chain_call`,
@@ -14,24 +16,15 @@ use bloom_petals::{
     BlockCtx, ChainCallInput, ChainCallOutput, ChainEntry, PetalError, PetalVm,
 };
 
+mod common;
+use common::{block_at, make_address, wat};
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn make_address(b: u8) -> Address {
-    Address([b; 32])
-}
-
-fn make_hash32(b: u8) -> Hash32 {
-    Hash32([b; 32])
-}
-
 fn default_block() -> BlockCtx {
-    BlockCtx {
-        number: 42,
-        timestamp_ms: 1_700_000_000_000,
-        prevhash: make_hash32(0xAB),
-    }
+    block_at(42)
 }
 
 fn make_input(wasm: Vec<u8>, entry: ChainEntry) -> ChainCallInput {
@@ -47,10 +40,6 @@ fn make_input(wasm: Vec<u8>, entry: ChainEntry) -> ChainCallInput {
         fuel: 10_000_000,
         snapshot: state.snapshot(),
     }
-}
-
-fn wat(src: &str) -> Vec<u8> {
-    wat::parse_str(src).expect("valid WAT")
 }
 
 fn run(input: ChainCallInput) -> Result<ChainCallOutput, PetalError> {
@@ -92,29 +81,7 @@ fn petal_return_sets_return_data() {
 //         should use "existing slot" fuel pricing.
 // ---------------------------------------------------------------------------
 
-const STATE_WRITE_READ: &str = r#"
-(module
-  (import "chain" "state.write" (func $write (param i32 i32 i32 i32) (result i32)))
-  (import "chain" "state.read"  (func $read  (param i32 i32 i32) (result i64)))
-  (import "chain" "petal.return" (func $ret (param i32 i32)))
-  (memory (export "memory") 1)
-  ;; key:  32 bytes of 0x01 at offset 0
-  ;; val:  32 bytes of 0xFF at offset 32
-  ;; out:  32 bytes at offset 64 (for read result)
-  (data (i32.const 0)  "\01\01\01\01\01\01\01\01\01\01\01\01\01\01\01\01\01\01\01\01\01\01\01\01\01\01\01\01\01\01\01\01")
-  (data (i32.const 32) "\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff\ff")
-  (func (export "call") (param i32 i32) (result i32)
-    ;; first write (new slot — 5000 fuel)
-    (drop (call $write (i32.const 0) (i32.const 32) (i32.const 32) (i32.const 32)))
-    ;; second write to same key (existing slot — 1500 fuel)
-    (drop (call $write (i32.const 0) (i32.const 32) (i32.const 32) (i32.const 32)))
-    ;; read back
-    (drop (call $read (i32.const 0) (i32.const 32) (i32.const 64)))
-    ;; return 32 bytes from offset 64
-    (call $ret (i32.const 64) (i32.const 32))
-    i32.const 0)
-)
-"#;
+const STATE_WRITE_READ: &str = include_str!("fixtures/state_write_read.wat");
 
 #[test]
 fn state_write_read_roundtrip() {

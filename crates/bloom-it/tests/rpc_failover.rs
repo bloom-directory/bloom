@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! Integration test for the multi-endpoint failover path introduced in
 //! WP-2 of the RPC robustness overhaul.
 //!

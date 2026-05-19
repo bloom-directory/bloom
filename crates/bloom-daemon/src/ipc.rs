@@ -642,36 +642,13 @@ impl IpcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
+    use bloom_test_util::mocks::SingleFileHandler;
     use std::sync::Arc;
 
-    struct StubHandler;
-
-    #[async_trait]
-    impl Handler for StubHandler {
-        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
-            if p.is_root() {
-                Ok(Entry::dir(""))
-            } else if p.segments().last().map(|s| s.as_str()) == Some("greet") {
-                Ok(Entry::file("greet"))
-            } else {
-                Err(HandlerError::NotFound(p.to_string_path()))
-            }
-        }
-        async fn read(&self, _p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
-            Ok(b"hi\n".to_vec())
-        }
-        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
-            if p.is_root() {
-                Ok(vec![Entry::file("greet")])
-            } else {
-                Err(HandlerError::NotADir(p.to_string_path()))
-            }
-        }
-    }
-
     fn vfs() -> Vfs {
-        Vfs::builder().mount("stub", Arc::new(StubHandler)).build()
+        Vfs::builder()
+            .mount("stub", Arc::new(SingleFileHandler::new("greet", b"hi\n".to_vec())))
+            .build()
     }
 
     #[tokio::test]

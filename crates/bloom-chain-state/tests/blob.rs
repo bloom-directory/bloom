@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! Tests for the state-blob serialisation and BlobStore retention.
 
 use bloom_chain_state::{Account, BlobStore, State};

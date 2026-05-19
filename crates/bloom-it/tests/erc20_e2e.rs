@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! Integration tests for the ERC-20 + replace/cancel paths in
 //! `bloom_tx::TxEngine`.
 //!

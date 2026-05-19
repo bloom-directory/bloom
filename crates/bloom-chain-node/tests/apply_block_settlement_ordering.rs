@@ -1,3 +1,5 @@
+//! Category: adversarial
+//!
 //! Regression coverage for the 2026-05-19 review #5 — `apply_block`
 //! settlement ordering.
 //!
@@ -17,21 +19,17 @@
 use bloom_chain_node::consensus_driver::{apply_block_state_transitions, NoopExecutor};
 use bloom_chain_state::{Account, State};
 use bloom_chain_types::{
-    block::{Block, BlockHeader},
+    block::Block,
     tx::{Tx, TxKind},
     types::{Address, Hash32, PubKeyBytes, SigBytes},
-    vote::Commit,
 };
+use bloom_test_util::{make_addr, BlockBuilder};
 
 // Block emission is intentionally zero in these tests so the proposer
 // balance after the block is purely the result of fee/refund settlement
 // and write-set application; the spec emission credit is tested
 // elsewhere.
 const ZERO_EMISSION: u128 = 0;
-
-fn make_addr(seed: u8) -> Address {
-    Address([seed; 32])
-}
 
 fn make_transfer_tx(
     sender: Address,
@@ -55,28 +53,10 @@ fn make_transfer_tx(
 }
 
 fn make_block(height: u64, proposer: Address, txs: Vec<Tx>) -> Block {
-    Block {
-        header: BlockHeader {
-            chain_id: "bloom-chain.v0".to_string(),
-            height,
-            parent_hash: Hash32([0u8; 32]),
-            timestamp_ms: 1_747_526_400_000 + height * 1_000,
-            proposer,
-            txs_root: Hash32([0u8; 32]),
-            state_root: Hash32([0u8; 32]),
-            receipts_root: Hash32([0u8; 32]),
-            validator_set_hash: Hash32([0u8; 32]),
-            fuel_used: 0,
-            fuel_limit: 30_000_000,
-        },
-        txs,
-        commit: Commit {
-            height: 0,
-            round: 0,
-            block_hash: Hash32([0u8; 32]),
-            votes: vec![],
-        },
-    }
+    BlockBuilder::at(height)
+        .proposer(proposer)
+        .txs(txs)
+        .build()
 }
 
 fn fund(state: &mut State, addr: Address, loom: u128) {

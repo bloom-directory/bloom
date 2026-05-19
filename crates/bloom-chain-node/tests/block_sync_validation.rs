@@ -1,3 +1,5 @@
+//! Category: adversarial
+//!
 //! Regression coverage for the 2026-05-19 review #2 — catch-up block sync
 //! must run the same validation boundary as live consensus.
 //!
@@ -13,116 +15,46 @@
 
 use std::sync::Arc;
 
-use bloom_chain_consensus::{
-    signer::Signer,
-    validator_set::{Validator, ValidatorSet},
-};
-use bloom_chain_node::consensus_driver::{
-    compute_txs_root, validate_block_for_apply, XdsaSigner, XdsaVerifier,
-};
+use bloom_chain_consensus::{signer::Signer, validator_set::ValidatorSet};
+use bloom_chain_node::consensus_driver::{validate_block_for_apply, XdsaSigner, XdsaVerifier};
 use bloom_chain_types::{
-    block::{Block, BlockHeader},
+    block::Block,
     tx::{Tx, TxKind},
     types::{Address, Hash32, PubKeyBytes, SigBytes},
-    vote::{Commit, Vote, VoteKind},
+};
+use bloom_test_util::{
+    make_validator_set_signed, make_validator_with_keypair, BlockBuilder, TestValidator,
 };
 
-struct Val {
-    sk: Arc<bloom_keystore::xdsa::XdsaSecretKey>,
-    pk: bloom_keystore::xdsa::XdsaPublicKey,
-    addr: Address,
-}
-
-fn make_val() -> Val {
-    let (sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
-    let addr = bloom_chain_types::types::Address::from_pubkey_bytes(&pk.0);
-    Val {
-        sk: Arc::new(sk),
-        pk,
-        addr,
-    }
-}
-
-fn validator_set(vals: &[&Val]) -> ValidatorSet {
-    ValidatorSet::new(
-        vals.iter()
-            .map(|v| Validator {
-                address: v.addr,
-                pubkey: PubKeyBytes(v.pk.0.clone()),
-                voting_power: 100,
-            })
-            .collect(),
-    )
-    .unwrap()
-}
-
-/// Build a block whose header is internally consistent (txs_root computed
-/// from txs, validator_set_hash matches the set, etc.) and a commit
-/// signed by `signers` (subset of `vset`). Caller-supplied tweaks let
-/// individual tests mutate single fields to test rejection paths.
+/// Build a block with computed txs_root and validator_set_hash plus a
+/// xDSA-signed commit from `signers`. Equivalent to
+/// `BlockBuilder::at(...).with_computed_roots(vset).signed_by(signers)`
+/// with the per-test parent/proposer/chain-id tweaks the rejection paths
+/// need.
 fn make_block(
     chain_id: &str,
     height: u64,
     parent_hash: Hash32,
     proposer: Address,
     vset: &ValidatorSet,
-    signers: &[&Val],
+    signers: &[&TestValidator],
 ) -> Block {
-    let txs = vec![];
-    let txs_root = compute_txs_root(&txs);
-    let validator_set_hash = vset.validator_set_hash();
-
-    let header = BlockHeader {
-        chain_id: chain_id.to_string(),
-        height,
-        parent_hash,
-        timestamp_ms: 1_747_526_400_000 + height * 1_000,
-        proposer,
-        txs_root,
-        state_root: Hash32([0xBB; 32]),
-        receipts_root: Hash32([0xCC; 32]),
-        validator_set_hash,
-        fuel_used: 0,
-        fuel_limit: 30_000_000,
-    };
-    let block_hash = header.block_hash();
-
-    let votes: Vec<Vote> = signers
-        .iter()
-        .map(|s| {
-            let mut v = Vote {
-                height,
-                round: 0,
-                kind: VoteKind::Precommit,
-                block_hash: Some(block_hash),
-                validator: s.addr,
-                sig: SigBytes(vec![]),
-            };
-            let digest = v.signing_digest();
-            v.sig = XdsaSigner::new(Arc::clone(&s.sk)).sign(&digest.0);
-            v
-        })
-        .collect();
-
-    Block {
-        header,
-        txs,
-        commit: Commit {
-            height,
-            round: 0,
-            block_hash,
-            votes,
-        },
-    }
+    BlockBuilder::at(height)
+        .chain_id(chain_id)
+        .parent_hash(parent_hash)
+        .proposer(proposer)
+        .with_computed_roots(vset)
+        .signed_by(signers)
+        .build()
 }
 
 #[test]
 fn well_formed_block_with_quorum_accepted() {
-    let v1 = make_val();
-    let v2 = make_val();
-    let v3 = make_val();
-    let v4 = make_val();
-    let vset = validator_set(&[&v1, &v2, &v3, &v4]);
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
     // 4 × 100 = 400 power; quorum = 2*400/3 + 1 = 267. 3 signers = 300.
     let block = make_block(
         "bloom-chain.v0",
@@ -145,11 +77,11 @@ fn well_formed_block_with_quorum_accepted() {
 
 #[test]
 fn block_with_tampered_txs_root_is_rejected() {
-    let v1 = make_val();
-    let v2 = make_val();
-    let v3 = make_val();
-    let v4 = make_val();
-    let vset = validator_set(&[&v1, &v2, &v3, &v4]);
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
     let mut block = make_block(
         "bloom-chain.v0",
         5,
@@ -177,11 +109,11 @@ fn block_with_tampered_txs_root_is_rejected() {
 
 #[test]
 fn block_with_wrong_parent_hash_is_rejected() {
-    let v1 = make_val();
-    let v2 = make_val();
-    let v3 = make_val();
-    let v4 = make_val();
-    let vset = validator_set(&[&v1, &v2, &v3, &v4]);
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
     let block = make_block(
         "bloom-chain.v0",
         5,
@@ -208,11 +140,11 @@ fn block_with_wrong_parent_hash_is_rejected() {
 
 #[test]
 fn block_with_wrong_validator_set_hash_is_rejected() {
-    let v1 = make_val();
-    let v2 = make_val();
-    let v3 = make_val();
-    let v4 = make_val();
-    let vset = validator_set(&[&v1, &v2, &v3, &v4]);
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
     let mut block = make_block(
         "bloom-chain.v0",
         5,
@@ -239,11 +171,11 @@ fn block_with_wrong_validator_set_hash_is_rejected() {
 
 #[test]
 fn block_with_wrong_chain_id_is_rejected() {
-    let v1 = make_val();
-    let v2 = make_val();
-    let v3 = make_val();
-    let v4 = make_val();
-    let vset = validator_set(&[&v1, &v2, &v3, &v4]);
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
     // The block claims a different chain — could be a packet from a
     // testnet leaking into mainnet, or a deliberate cross-chain replay.
     let block = make_block(
@@ -268,11 +200,11 @@ fn block_with_wrong_chain_id_is_rejected() {
 
 #[test]
 fn block_with_insufficient_commit_quorum_is_rejected() {
-    let v1 = make_val();
-    let v2 = make_val();
-    let v3 = make_val();
-    let v4 = make_val();
-    let vset = validator_set(&[&v1, &v2, &v3, &v4]);
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
     // Only TWO signers — 200 power, below quorum (267).
     let block = make_block(
         "bloom-chain.v0",
@@ -300,12 +232,12 @@ fn block_with_insufficient_commit_quorum_is_rejected() {
 
 #[test]
 fn block_with_commit_vote_from_non_validator_is_rejected() {
-    let v1 = make_val();
-    let v2 = make_val();
-    let v3 = make_val();
-    let v4 = make_val();
-    let mallory = make_val();
-    let vset = validator_set(&[&v1, &v2, &v3, &v4]);
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let mallory = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
     // Three legit signers (quorum-meeting), plus a vote from an address
     // that is NOT in the validator set. The non-validator vote must be
     // rejected outright — counting it would let a peer fabricate quorum
@@ -339,11 +271,11 @@ fn block_with_commit_vote_from_non_validator_is_rejected() {
 
 #[test]
 fn block_with_forged_commit_signature_is_rejected() {
-    let v1 = make_val();
-    let v2 = make_val();
-    let v3 = make_val();
-    let v4 = make_val();
-    let vset = validator_set(&[&v1, &v2, &v3, &v4]);
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
     let mut block = make_block(
         "bloom-chain.v0",
         5,
@@ -370,11 +302,11 @@ fn block_with_forged_commit_signature_is_rejected() {
 
 #[test]
 fn block_with_wrong_height_in_header_is_rejected() {
-    let v1 = make_val();
-    let v2 = make_val();
-    let v3 = make_val();
-    let v4 = make_val();
-    let vset = validator_set(&[&v1, &v2, &v3, &v4]);
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
     let block = make_block(
         "bloom-chain.v0",
         5,
@@ -398,11 +330,11 @@ fn block_with_wrong_height_in_header_is_rejected() {
 
 #[test]
 fn block_with_commit_for_different_block_hash_falls_below_quorum() {
-    let v1 = make_val();
-    let v2 = make_val();
-    let v3 = make_val();
-    let v4 = make_val();
-    let vset = validator_set(&[&v1, &v2, &v3, &v4]);
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
     let mut block = make_block(
         "bloom-chain.v0",
         5,
@@ -473,61 +405,26 @@ fn make_signed_tx(sk: &bloom_keystore::xdsa::XdsaSecretKey, chain_id: &str) -> T
     tx
 }
 
-/// Variant of `make_block` that carries a single tx and recomputes the
-/// header's `txs_root` so block-level integrity is preserved (the test
-/// then probes the per-tx checks specifically).
+/// Variant of `make_block` that carries a single tx with computed
+/// txs_root and a signed commit — same as [`make_block`] but with an
+/// arbitrary tx vector instead of an empty one.
 fn make_block_with_tx(
     chain_id: &str,
     height: u64,
     parent_hash: Hash32,
     proposer: Address,
     vset: &ValidatorSet,
-    signers: &[&Val],
+    signers: &[&TestValidator],
     tx: Tx,
 ) -> Block {
-    let txs = vec![tx];
-    let txs_root = compute_txs_root(&txs);
-    let validator_set_hash = vset.validator_set_hash();
-    let header = BlockHeader {
-        chain_id: chain_id.to_string(),
-        height,
-        parent_hash,
-        timestamp_ms: 1_747_526_400_000 + height * 1_000,
-        proposer,
-        txs_root,
-        state_root: Hash32([0xBB; 32]),
-        receipts_root: Hash32([0xCC; 32]),
-        validator_set_hash,
-        fuel_used: 0,
-        fuel_limit: 30_000_000,
-    };
-    let block_hash = header.block_hash();
-    let votes: Vec<Vote> = signers
-        .iter()
-        .map(|s| {
-            let mut v = Vote {
-                height,
-                round: 0,
-                kind: VoteKind::Precommit,
-                block_hash: Some(block_hash),
-                validator: s.addr,
-                sig: SigBytes(vec![]),
-            };
-            let digest = v.signing_digest();
-            v.sig = XdsaSigner::new(Arc::clone(&s.sk)).sign(&digest.0);
-            v
-        })
-        .collect();
-    Block {
-        header,
-        txs,
-        commit: Commit {
-            height,
-            round: 0,
-            block_hash,
-            votes,
-        },
-    }
+    BlockBuilder::at(height)
+        .chain_id(chain_id)
+        .parent_hash(parent_hash)
+        .proposer(proposer)
+        .txs(vec![tx])
+        .with_computed_roots(vset)
+        .signed_by(signers)
+        .build()
 }
 
 #[test]
@@ -536,11 +433,11 @@ fn block_with_forged_tx_signature_is_rejected() {
     // bytes in the signature to break it (or any other body change after
     // signing). On master, validate_block_for_apply never touched the tx
     // sig, so the block applied. Post-fix, this MUST reject the block.
-    let v1 = make_val();
-    let v2 = make_val();
-    let v3 = make_val();
-    let v4 = make_val();
-    let vset = validator_set(&[&v1, &v2, &v3, &v4]);
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
     let (sk_sender, _pk_sender) = bloom_keystore::xdsa::XdsaSecretKey::generate();
 
     let mut tx = make_signed_tx(&sk_sender, "bloom-chain.v0");
@@ -583,11 +480,11 @@ fn block_with_cross_chain_tx_is_rejected() {
     // chain_id check alone is insufficient: the header could be honest
     // while the body is replayed. Mempool admission would have caught
     // it, but the proposer never goes through admit for its own block.
-    let v1 = make_val();
-    let v2 = make_val();
-    let v3 = make_val();
-    let v4 = make_val();
-    let vset = validator_set(&[&v1, &v2, &v3, &v4]);
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
     let (sk_sender, _pk_sender) = bloom_keystore::xdsa::XdsaSecretKey::generate();
 
     // Genuinely signed for the wrong chain — sig is valid against that
@@ -635,11 +532,11 @@ fn commit_with_votes_from_different_rounds_is_rejected() {
     // pattern (a single round either reaches commit or aborts), so the
     // boundary now refuses any commit whose vote.round disagrees with
     // commit.round.
-    let v1 = make_val();
-    let v2 = make_val();
-    let v3 = make_val();
-    let v4 = make_val();
-    let vset = validator_set(&[&v1, &v2, &v3, &v4]);
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
 
     // Three signers — 300 power, well above quorum of 267.
     let mut block = make_block(

@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! End-to-end test: drive [`WatchExecutor`] against a real anvil node.
 //!
 //! Marked `#[ignore]` so the default `cargo test` does not attempt to

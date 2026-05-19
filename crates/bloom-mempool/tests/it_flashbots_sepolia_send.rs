@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 #![cfg(feature = "live-providers")]
 
 use alloy::eips::Encodable2718;

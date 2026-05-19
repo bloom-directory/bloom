@@ -1,3 +1,5 @@
+//! Category: smoke
+//!
 #![cfg(feature = "live-providers")]
 
 use bloom_mempool::provider::MempoolProvider;

@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! Host-target (non-wasm32) compile smoke test for bloom-petal-sdk.
 //!
 //! Confirms that:

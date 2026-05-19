@@ -1,3 +1,5 @@
+//! Category: adversarial
+//!
 //! Regression coverage for the 2026-05-19 DoS-hardening review item:
 //! a chain-mode petal that burns fuel and then reverts must bill the
 //! caller for the work it actually performed. If revert paths zero out
@@ -12,20 +14,11 @@ use bloom_chain_state::{Account, State};
 use bloom_chain_types::{Address, Hash32};
 use bloom_petals::{BlockCtx, ChainCallInput, ChainEntry, PetalVm};
 
-fn make_address(b: u8) -> Address {
-    Address([b; 32])
-}
+mod common;
+use common::{block_with, make_address, wat};
 
 fn default_block() -> BlockCtx {
-    BlockCtx {
-        number: 1,
-        timestamp_ms: 1_700_000_000_000,
-        prevhash: Hash32([0xCD; 32]),
-    }
-}
-
-fn wat(src: &str) -> Vec<u8> {
-    wat::parse_str(src).expect("valid WAT")
+    block_with(1, 0xCD)
 }
 
 // ---------------------------------------------------------------------------
@@ -39,41 +32,7 @@ fn wat(src: &str) -> Vec<u8> {
 // iterations of a 3-instruction inner body burns hundreds of thousands of
 // fuel units against wasmtime's default 1-unit-per-instruction metering.
 // ---------------------------------------------------------------------------
-const BURN_THEN_REVERT_OR_RETURN: &str = r#"
-(module
-  (import "chain" "msg.calldata.read" (func $cdread (param i32 i32 i32) (result i32)))
-  (import "chain" "petal.revert"      (func $revert (param i32 i32)))
-  (import "chain" "petal.return"      (func $ret    (param i32 i32)))
-  (memory (export "memory") 1)
-  (data (i32.const 0)   "\00")                              ;; calldata byte slot
-  (data (i32.const 16)  "burned-and-reverted")              ;; 19 bytes, revert reason
-  (data (i32.const 64)  "\aa")                              ;; success return byte
-  (func (export "init") (param i32 i32) (result i32)
-    i32.const 0)
-  (func (export "call") (param i32 i32) (result i32)
-    (local $i i32)
-    ;; Read 1 byte of calldata into [0..1].
-    (drop (call $cdread (i32.const 0) (i32.const 0) (i32.const 1)))
-    ;; Counted loop: i = 0; while (i < 50000) { i += 1; }
-    (local.set $i (i32.const 0))
-    (block $done
-      (loop $top
-        (br_if $done (i32.ge_s (local.get $i) (i32.const 50000)))
-        (local.set $i (i32.add (local.get $i) (i32.const 1)))
-        (br $top)))
-    ;; Branch on calldata[0].
-    (if (i32.eq (i32.load8_u (i32.const 0)) (i32.const 1))
-      (then
-        ;; Revert with 19-byte reason at offset 16.
-        (call $revert (i32.const 16) (i32.const 19))
-        (unreachable))
-      (else
-        ;; Return 1 byte at offset 64.
-        (call $ret (i32.const 64) (i32.const 1))
-        (unreachable)))
-    i32.const 0)
-)
-"#;
+const BURN_THEN_REVERT_OR_RETURN: &str = include_str!("fixtures/burn_then_revert_or_return.wat");
 
 fn run_burner(calldata: Vec<u8>) -> bloom_petals::ChainCallOutput {
     let state = State::new();

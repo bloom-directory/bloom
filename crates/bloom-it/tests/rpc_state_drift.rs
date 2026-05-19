@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! Integration test for the block-pinning session introduced in WP-5
 //! of the RPC robustness overhaul.
 //!

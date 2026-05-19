@@ -1,3 +1,5 @@
+//! Category: adversarial
+//!
 //! Regression coverage for the 2026-05-19 review #1 — consensus message
 //! authentication at ingress.
 //!
@@ -17,52 +19,28 @@ use std::sync::Arc;
 use bloom_chain_consensus::{
     auth::{verify_proposal_sig, verify_vote_sig},
     signer::Signer,
-    validator_set::{Validator, ValidatorSet},
 };
 use bloom_chain_node::consensus_driver::{XdsaSigner, XdsaVerifier};
 use bloom_chain_types::{
-    types::{Address, Hash32, PubKeyBytes, SigBytes},
+    types::{Hash32, SigBytes},
     vote::{Proposal, Vote, VoteKind},
 };
-
-fn make_validator() -> (
-    Arc<bloom_keystore::xdsa::XdsaSecretKey>,
-    bloom_keystore::xdsa::XdsaPublicKey,
-    Address,
-) {
-    let (sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
-    let addr = bloom_chain_types::types::Address::from_pubkey_bytes(&pk.0);
-    (Arc::new(sk), pk, addr)
-}
-
-fn make_validator_set(entries: &[(&bloom_keystore::xdsa::XdsaPublicKey, &Address)]) -> ValidatorSet {
-    ValidatorSet::new(
-        entries
-            .iter()
-            .map(|(pk, addr)| Validator {
-                address: **addr,
-                pubkey: PubKeyBytes(pk.0.clone()),
-                voting_power: 100,
-            })
-            .collect(),
-    )
-    .unwrap()
-}
+use bloom_test_util::{make_validator_set_signed, make_validator_with_keypair};
 
 #[test]
 fn signed_vote_verifies_against_validator_set() {
-    let (sk, pk, addr) = make_validator();
-    let vset = make_validator_set(&[(&pk, &addr)]);
+    let v = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v], 100);
 
     let mut vote = Vote {
         height: 7,
         round: 0,
         kind: VoteKind::Prevote,
         block_hash: Some(Hash32([0x11; 32])),
-        validator: addr,
+        validator: v.addr,
         sig: SigBytes(vec![]),
     };
-    let signer = XdsaSigner::new(sk);
+    let signer = XdsaSigner::new(Arc::clone(&v.sk));
     let digest = vote.signing_digest();
     vote.sig = signer.sign(&digest.0);
 
@@ -74,18 +52,18 @@ fn signed_vote_verifies_against_validator_set() {
 
 #[test]
 fn signed_proposal_verifies_against_validator_set() {
-    let (sk, pk, addr) = make_validator();
-    let vset = make_validator_set(&[(&pk, &addr)]);
+    let v = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v], 100);
 
     let mut proposal = Proposal {
         height: 9,
         round: 1,
         block_hash: Hash32([0x55; 32]),
         pol_round: -1,
-        proposer: addr,
+        proposer: v.addr,
         sig: SigBytes(vec![]),
     };
-    let signer = XdsaSigner::new(sk);
+    let signer = XdsaSigner::new(Arc::clone(&v.sk));
     let digest = proposal.signing_digest();
     proposal.sig = signer.sign(&digest.0);
 
@@ -97,18 +75,18 @@ fn signed_proposal_verifies_against_validator_set() {
 
 #[test]
 fn forged_vote_signature_rejected() {
-    let (sk, pk, addr) = make_validator();
-    let vset = make_validator_set(&[(&pk, &addr)]);
+    let v = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v], 100);
 
     let mut vote = Vote {
         height: 7,
         round: 0,
         kind: VoteKind::Prevote,
         block_hash: Some(Hash32([0x11; 32])),
-        validator: addr,
+        validator: v.addr,
         sig: SigBytes(vec![]),
     };
-    let signer = XdsaSigner::new(sk);
+    let signer = XdsaSigner::new(Arc::clone(&v.sk));
     let digest = vote.signing_digest();
     vote.sig = signer.sign(&digest.0);
 
@@ -122,18 +100,18 @@ fn forged_vote_signature_rejected() {
 
 #[test]
 fn forged_proposal_signature_rejected() {
-    let (sk, pk, addr) = make_validator();
-    let vset = make_validator_set(&[(&pk, &addr)]);
+    let v = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v], 100);
 
     let mut proposal = Proposal {
         height: 9,
         round: 1,
         block_hash: Hash32([0x55; 32]),
         pol_round: -1,
-        proposer: addr,
+        proposer: v.addr,
         sig: SigBytes(vec![]),
     };
-    let signer = XdsaSigner::new(sk);
+    let signer = XdsaSigner::new(Arc::clone(&v.sk));
     let digest = proposal.signing_digest();
     proposal.sig = signer.sign(&digest.0);
     proposal.sig.0[100] ^= 0xFF;
@@ -146,8 +124,8 @@ fn forged_proposal_signature_rejected() {
 
 #[test]
 fn empty_vote_signature_rejected() {
-    let (_, pk, addr) = make_validator();
-    let vset = make_validator_set(&[(&pk, &addr)]);
+    let v = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v], 100);
 
     // Empty sig: what the pre-fix engine emitted at engine.rs:118.
     let vote = Vote {
@@ -155,7 +133,7 @@ fn empty_vote_signature_rejected() {
         round: 0,
         kind: VoteKind::Prevote,
         block_hash: Some(Hash32([0x11; 32])),
-        validator: addr,
+        validator: v.addr,
         sig: SigBytes(vec![]),
     };
     assert!(
@@ -169,20 +147,19 @@ fn empty_vote_signature_rejected() {
 fn vote_signed_by_a_different_validators_key_is_rejected() {
     // Alice and Bob both validators; Bob tries to forge a vote claiming to be
     // from Alice but signs it with his own key.
-    let (alice_sk, alice_pk, alice_addr) = make_validator();
-    let (bob_sk, bob_pk, bob_addr) = make_validator();
-    let vset = make_validator_set(&[(&alice_pk, &alice_addr), (&bob_pk, &bob_addr)]);
-    let _ = alice_sk;
+    let alice = make_validator_with_keypair();
+    let bob = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&alice, &bob], 100);
 
     let mut forged = Vote {
         height: 7,
         round: 0,
         kind: VoteKind::Precommit,
         block_hash: Some(Hash32([0xAB; 32])),
-        validator: alice_addr, // Claims to be Alice...
+        validator: alice.addr, // Claims to be Alice...
         sig: SigBytes(vec![]),
     };
-    let bob_signer = XdsaSigner::new(bob_sk);
+    let bob_signer = XdsaSigner::new(Arc::clone(&bob.sk));
     let digest = forged.signing_digest();
     forged.sig = bob_signer.sign(&digest.0); // ...but signed by Bob.
 
@@ -195,22 +172,21 @@ fn vote_signed_by_a_different_validators_key_is_rejected() {
 
 #[test]
 fn vote_from_unknown_validator_is_rejected() {
-    let (alice_sk, alice_pk, alice_addr) = make_validator();
-    let vset = make_validator_set(&[(&alice_pk, &alice_addr)]);
+    let alice = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&alice], 100);
 
     // Carol generates a key and tries to vote — she is not in the validator
     // set, so even a correctly-signed vote must be rejected.
-    let (carol_sk, _carol_pk, carol_addr) = make_validator();
-    let _ = alice_sk;
+    let carol = make_validator_with_keypair();
     let mut vote = Vote {
         height: 7,
         round: 0,
         kind: VoteKind::Prevote,
         block_hash: Some(Hash32([0x11; 32])),
-        validator: carol_addr,
+        validator: carol.addr,
         sig: SigBytes(vec![]),
     };
-    let signer = XdsaSigner::new(carol_sk);
+    let signer = XdsaSigner::new(Arc::clone(&carol.sk));
     let digest = vote.signing_digest();
     vote.sig = signer.sign(&digest.0);
 
@@ -231,13 +207,13 @@ fn engine_emits_signed_votes_when_signer_is_set() {
         ConsensusEngine,
     };
 
-    let (sk, pk, addr) = make_validator();
-    let vset = make_validator_set(&[(&pk, &addr)]);
-    let signer: Arc<dyn Signer> = Arc::new(XdsaSigner::new(sk));
+    let v = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v], 100);
+    let signer: Arc<dyn Signer> = Arc::new(XdsaSigner::new(Arc::clone(&v.sk)));
 
     let mut engine: ConsensusEngine<XdsaVerifier> = ConsensusEngine::new(
         1,
-        addr,
+        v.addr,
         vset.clone(),
         XdsaVerifier::default(),
         None,

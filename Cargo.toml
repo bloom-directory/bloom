@@ -26,6 +26,7 @@ members = [
   "crates/bloom-petal-sdk",
   "crates/bloom-chain-abi",
   "crates/bloom-chain-abi-macros",
+  "crates/bloom-test-util",
   # ---- example apps (not part of the protocol) ----
   "examples/dex/crates/bloom-dex-abi",
   "examples/dex/crates/bloom-dex-erc20",

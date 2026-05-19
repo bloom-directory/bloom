@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! Regression coverage for the 2026-05-19 review #16 — block-query-by-hash
 //! must work end-to-end through the JSON-RPC server, returning the same
 //! header/body shape as the by-height variant.
@@ -11,7 +13,6 @@
 
 use std::sync::Arc;
 
-use bloom_chain_consensus::validator_set::{Validator, ValidatorSet};
 use bloom_chain_node::block_store::BlockStore;
 use bloom_chain_node::mempool_persist::MempoolPersist;
 use bloom_chain_node::receipt_store::ReceiptStore;
@@ -19,20 +20,25 @@ use bloom_chain_node::{RpcClient, RpcServer};
 use bloom_chain_state::State;
 use bloom_chain_types::{
     block::{Block, BlockHeader},
-    types::{Address, Hash32, PubKeyBytes},
+    types::Hash32,
     vote::Commit,
 };
+use bloom_test_util::{make_addr, make_validator_set_signed, make_validator_with_keypair};
 use parking_lot::Mutex;
 use serde_json::json;
 
 fn make_block(height: u64) -> Block {
+    // Custom shape: zero-roots except a height-dependent state_root, so
+    // every height produces a distinct block_hash without dragging in a
+    // tx list or validator set. The bloom-test-util BlockBuilder uses
+    // sentinel 0xAA/0xBB/0xCC/0xDD which would erase the height signal.
     Block {
         header: BlockHeader {
             chain_id: "bloomchain.test".to_string(),
             height,
             parent_hash: Hash32([(height as u8).wrapping_sub(1); 32]),
             timestamp_ms: 1_747_526_400_000 + height * 1_000,
-            proposer: Address([0x55u8; 32]),
+            proposer: make_addr(0x55),
             txs_root: Hash32([0u8; 32]),
             state_root: Hash32([(height as u8); 32]),
             receipts_root: Hash32([0u8; 32]),
@@ -65,17 +71,10 @@ async fn chain_query_block_by_hash_matches_by_height() {
     );
     let state = Arc::new(Mutex::new(State::new()));
 
-    // RpcServer requires a validator set — synthesise a single-validator set
-    // from a real xDSA pubkey so it shape-validates.
-    let (_sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
-    let val_addr = Address::from_pubkey_bytes(&pk.0);
-    let vs = ValidatorSet::new(vec![Validator {
-        address: val_addr,
-        pubkey: PubKeyBytes(pk.0.clone()),
-        voting_power: 100,
-    }])
-    .expect("build ValidatorSet");
-    let validator_set = Arc::new(vs);
+    // RpcServer requires a validator set — synthesise a single-validator
+    // set from a real xDSA pubkey so it shape-validates.
+    let v = make_validator_with_keypair();
+    let validator_set = Arc::new(make_validator_set_signed(&[&v], 100));
 
     // We never submit anything in this test; the channel just has to exist.
     let (tx_submit, _rx) = tokio::sync::mpsc::channel(8);

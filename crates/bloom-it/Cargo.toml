@@ -22,6 +22,7 @@ bloom-tx.workspace = true
 bloom-vfs.workspace = true
 bloom-daemon.workspace = true
 bloom-revert.workspace = true
+bloom-test-util = { path = "../bloom-test-util" }
 alloy.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true

@@ -1,3 +1,5 @@
+//! Category: docker-acceptance
+//!
 //! `docker_dex_multi_user.rs` — multi-user DEX acceptance test against a
 //! docker-compose 4-validator network.
 //!
@@ -28,10 +30,15 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde_json::{Value, json};
 use tokio::time::{sleep, timeout};
 
 use bloom_chain_node::rpc::RpcClient;
+use bloom_dex_it::{
+    current_height, derive_pair_addr, json_hex, last_json_object, locate_wasm_dir, mul_u256,
+    pro_rata, query_account_loom, query_erc20_balance, query_nonce, query_pair_reserves,
+    query_storage_u128, reserves_by_token, run_bloom_dex, uniswap_get_amount_out, wait_for_height,
+    wallet_addr_for_home,
+};
 
 // ---------------------------------------------------------------------------
 // Constants — keep in sync with scripts/test-docker-dex.sh
@@ -147,7 +154,7 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     }
 
     // ── 4. Alice deploys the DEX suite + two ERC-20s + creates a pool ────
-    let suite_out = run_bloom_dex(&alice, &["deploy-suite", "--wasm-dir", wasm_dir.to_str().unwrap()])?;
+    let suite_out = dex_as(&alice, &["deploy-suite", "--wasm-dir", wasm_dir.to_str().unwrap()])?;
     let suite = last_json_object(&suite_out)?;
     let factory_addr = json_hex(&suite, "factory_addr")?;
     let pair_petal_hash = json_hex(&suite, "pair_petal_hash")?;
@@ -168,7 +175,7 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     let erc20_wasm = wasm_dir.join("bloom_dex_erc20.wasm");
     let erc20_wasm_s = erc20_wasm.to_str().unwrap();
 
-    let tka_out = run_bloom_dex(
+    let tka_out = dex_as(
         &alice,
         &[
             "deploy-token",
@@ -181,7 +188,7 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     )?;
     let tka = json_hex(&last_json_object(&tka_out)?, "token_address")?;
 
-    let tkb_out = run_bloom_dex(
+    let tkb_out = dex_as(
         &alice,
         &[
             "deploy-token",
@@ -194,7 +201,7 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     )?;
     let tkb = json_hex(&last_json_object(&tkb_out)?, "token_address")?;
 
-    run_bloom_dex(
+    dex_as(
         &alice,
         &[
             "create-pair",
@@ -205,7 +212,7 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     let pair_addr = derive_pair_addr(&factory_addr, &tka, &tkb, &pair_petal_hash);
 
     // ── 5. Alice seeds the pool with liquidity ────────────────────────────
-    run_bloom_dex(
+    dex_as(
         &alice,
         &[
             "add-liquidity",
@@ -260,7 +267,7 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     let (tka_res_pre_bob, tkb_res_pre_bob) = reserves_by_token(&tka, &tkb, r0_pre_bob, r1_pre_bob);
 
     let bob_nonce_before = query_nonce(&validator_clients[1], &bob.addr).await?;
-    run_bloom_dex(
+    dex_as(
         &bob,
         &[
             "swap",
@@ -311,7 +318,7 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
         reserves_by_token(&tka, &tkb, r0_pre_carol, r1_pre_carol);
 
     let carol_nonce_before = query_nonce(&validator_clients[2], &carol.addr).await?;
-    run_bloom_dex(
+    dex_as(
         &carol,
         &[
             "swap",
@@ -357,7 +364,7 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     let expected_b_out = pro_rata(alice_lp, tkb_res_pre_burn, total_lp);
 
     let alice_nonce_before = query_nonce(&validator_clients[0], &alice.addr).await?;
-    run_bloom_dex(
+    dex_as(
         &alice,
         &[
             "remove-liquidity",
@@ -415,7 +422,7 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Docker-test-only helpers
 // ---------------------------------------------------------------------------
 
 fn compose_tmpdir() -> Result<PathBuf> {
@@ -428,42 +435,12 @@ fn compose_tmpdir() -> Result<PathBuf> {
     Ok(p)
 }
 
-fn locate_wasm_dir() -> Result<PathBuf> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let candidate = PathBuf::from(manifest_dir)
-        .join("../../../../target/wasm32-unknown-unknown/release");
-    let canon = candidate
-        .canonicalize()
-        .with_context(|| format!("wasm dir {} not found — build DEX petals first", candidate.display()))?;
-    for name in [
-        "bloom_dex_reentrancy.wasm",
-        "bloom_dex_wloom.wasm",
-        "bloom_dex_pair.wasm",
-        "bloom_dex_factory.wasm",
-        "bloom_dex_router.wasm",
-        "bloom_dex_erc20.wasm",
-    ] {
-        if !canon.join(name).exists() {
-            bail!("missing {} in {}", name, canon.display());
-        }
-    }
-    Ok(canon)
-}
-
 fn bloom_bin() -> PathBuf {
     if let Ok(p) = std::env::var("BLOOM_BIN") {
         return PathBuf::from(p);
     }
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     PathBuf::from(manifest_dir).join("../../../../target/release/bloom")
-}
-
-fn bloom_dex_bin() -> PathBuf {
-    if let Ok(p) = std::env::var("BLOOM_DEX_BIN") {
-        return PathBuf::from(p);
-    }
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    PathBuf::from(manifest_dir).join("../../../../target/release/bloom-dex")
 }
 
 /// Create a fresh user identity:
@@ -481,8 +458,6 @@ fn create_user(
     let chain_dir = home.join("chain");
     std::fs::create_dir_all(chain_dir.join("keystore"))?;
 
-    // Use `bloom chain init` to mint a keypair into this home. We pass the
-    // shared genesis so the user's signing domain (chain_id) matches.
     let status = Command::new(bloom_bin())
         .args([
             "--home", home.to_str().unwrap(),
@@ -497,7 +472,6 @@ fn create_user(
         bail!("bloom chain init failed for {name}");
     }
 
-    // Make sure the user's genesis.toml matches the network exactly.
     let user_genesis = chain_dir.join("genesis.toml");
     std::fs::copy(shared_genesis, &user_genesis)
         .with_context(|| format!("copy genesis to {}", user_genesis.display()))?;
@@ -509,16 +483,6 @@ fn create_user(
         addr,
         rpc_tcp: format!("127.0.0.1:{}", host_rpc_port),
     })
-}
-
-fn wallet_addr_for_home(home: &Path) -> Result<[u8; 32]> {
-    let key_path = home.join("chain/keystore/validator.xdsa");
-    let bytes = std::fs::read(&key_path)
-        .with_context(|| format!("read {}", key_path.display()))?;
-    let sk = bloom_keystore::xdsa::XdsaSecretKey::from_bytes(&bytes)
-        .map_err(|e| anyhow!("decode xdsa key: {e}"))?;
-    let pk = sk.public_key();
-    Ok(bloom_keystore::xdsa::derive_address(&pk))
 }
 
 /// Run `bloom chain transfer` from `from_home` to `to_addr` for `amount`.
@@ -548,39 +512,20 @@ fn run_bloom_chain_transfer(
     Ok(())
 }
 
-/// Run `bloom-dex <args>` with the user's home + their TCP RPC endpoint.
-fn run_bloom_dex(user: &User, args: &[&str]) -> Result<String> {
-    let bin = bloom_dex_bin();
-    let mut cmd = Command::new(&bin);
-    cmd.env("BLOOM_RPC_TCP", &user.rpc_tcp)
-        .arg("--home").arg(&user.home);
-    for a in args {
-        cmd.arg(a);
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd.output().with_context(|| format!("invoke {} {:?}", bin.display(), args))?;
-    if !out.status.success() {
-        bail!(
-            "bloom-dex (as {}) {:?} failed: stdout={} stderr={}",
-            user.name,
-            args,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+/// Thin convenience wrapper: run `bloom-dex` as a particular `User`, setting
+/// `BLOOM_RPC_TCP` so the CLI dials that user's validator over TCP.
+fn dex_as(user: &User, args: &[&str]) -> Result<String> {
+    let out = run_bloom_dex(&user.home, args, Some(&user.rpc_tcp))
+        .with_context(|| format!("bloom-dex as {} {:?}", user.name, args))?;
+    Ok(out)
 }
 
 /// Send ERC-20 tokens by calling token.transfer(to, amount) via `bloom chain call`.
-/// ERC-20 calldata format: blake3("erc20.transfer:")[..4] || abi(to, amount)
-/// We bypass that complexity by using the dex CLI's swap path which only
-/// supports ABI we know is wired. For seeding, use `bloom chain call` with
-/// hand-constructed calldata.
 fn erc20_transfer(from: &User, token: &[u8; 32], to: &[u8; 32], amount: u128) -> Result<()> {
     // ERC-20 transfer calldata: 4-byte selector + 32-byte `to` + 32-byte u256 amount.
-    // Per DEX spec §4.1 + bloom-dex-abi, the canonical method string for the
-    // erc20.transfer selector is "erc20.transfer(address,u256)" — NOT the
-    // Solidity-style "transfer(address,uint256)". The contract's dispatcher
+    // The canonical method string for the erc20.transfer selector is
+    // "erc20.transfer(address,u256)" — NOT the Solidity-style
+    // "transfer(address,uint256)". The contract's dispatcher
     // (bloom-dex-erc20::lib.rs `call`) traps with "erc20: unknown selector"
     // if these don't match.
     let sig_full = *blake3::hash(b"erc20.transfer(address,u256)").as_bytes();
@@ -613,40 +558,8 @@ fn erc20_transfer(from: &User, token: &[u8; 32], to: &[u8; 32], amount: u128) ->
 }
 
 // ---------------------------------------------------------------------------
-// Chain query helpers (TCP)
+// Convergence waiters (docker-test-only — depend on TX_TIMEOUT)
 // ---------------------------------------------------------------------------
-
-async fn current_height(client: &RpcClient) -> Result<u64> {
-    let v = client.call("chain_tip", json!({})).await?;
-    Ok(v.get("height").and_then(Value::as_u64).unwrap_or(0))
-}
-
-async fn wait_for_height(client: &RpcClient, target: u64) -> Result<()> {
-    loop {
-        match client.call("chain_query_block", json!({ "height": target })).await {
-            Ok(v) if !v.is_null() => return Ok(()),
-            _ => sleep(Duration::from_millis(250)).await,
-        }
-    }
-}
-
-async fn query_nonce(client: &RpcClient, addr: &[u8; 32]) -> Result<u64> {
-    let v = client.call("chain_query_account", json!({ "address": hex::encode(addr) })).await?;
-    if v.is_null() {
-        return Ok(0);
-    }
-    let n = v.get("nonce").and_then(Value::as_u64).unwrap_or(0);
-    Ok(n)
-}
-
-async fn query_account_loom(client: &RpcClient, addr: &[u8; 32]) -> Result<u128> {
-    let v = client.call("chain_query_account", json!({ "address": hex::encode(addr) })).await?;
-    if v.is_null() {
-        return Ok(0);
-    }
-    let s = v.get("loom").and_then(Value::as_str).ok_or_else(|| anyhow!("missing loom"))?;
-    Ok(s.parse::<u128>().context("parse loom u128")?)
-}
 
 async fn wait_for_account_loom(client: &RpcClient, addr: &[u8; 32], min: u128) -> Result<()> {
     let deadline = std::time::Instant::now() + TX_TIMEOUT;
@@ -668,9 +581,6 @@ async fn wait_for_account_loom(client: &RpcClient, addr: &[u8; 32], min: u128) -
 }
 
 /// Wait until `client`'s view of `addr`'s nonce reaches at least `target`.
-/// Useful after a user submits a tx via *their* validator (which advances
-/// that validator's view), to ensure the *query* validator has applied the
-/// same block before we read derived state (token balances, reserves, …).
 async fn wait_for_nonce_at_least(client: &RpcClient, addr: &[u8; 32], target: u64) -> Result<()> {
     let deadline = std::time::Instant::now() + TX_TIMEOUT;
     loop {
@@ -708,40 +618,6 @@ async fn wait_for_erc20_balance(client: &RpcClient, token: &[u8; 32], holder: &[
         }
         sleep(Duration::from_millis(250)).await;
     }
-}
-
-async fn query_pair_reserves(client: &RpcClient, pair: &[u8; 32]) -> Result<(u128, u128)> {
-    let r0 = query_storage_u128(client, pair, blake3::hash(b"pair.reserve0").as_bytes()).await?;
-    let r1 = query_storage_u128(client, pair, blake3::hash(b"pair.reserve1").as_bytes()).await?;
-    Ok((r0, r1))
-}
-
-async fn query_erc20_balance(client: &RpcClient, token: &[u8; 32], holder: &[u8; 32]) -> Result<u128> {
-    let mut tag = Vec::with_capacity(14 + 32);
-    tag.extend_from_slice(b"erc20.balance:");
-    tag.extend_from_slice(holder);
-    let key = blake3::hash(&tag);
-    query_storage_u128(client, token, key.as_bytes()).await
-}
-
-async fn query_storage_u128(client: &RpcClient, addr: &[u8; 32], key: &[u8; 32]) -> Result<u128> {
-    let v = client
-        .call(
-            "chain_query_state",
-            json!({
-                "address": hex::encode(addr),
-                "key": hex::encode(key),
-            }),
-        )
-        .await?;
-    let hex_s = v.get("value").and_then(Value::as_str).ok_or_else(|| anyhow!("missing storage value"))?;
-    let bytes = hex::decode(hex_s).context("decode storage value")?;
-    if bytes.len() != 32 {
-        bail!("storage value not 32 bytes: {}", bytes.len());
-    }
-    let mut buf = [0u8; 16];
-    buf.copy_from_slice(&bytes[16..32]);
-    Ok(u128::from_be_bytes(buf))
 }
 
 /// Read `(height, sum_of_loom)` such that the height before and after the
@@ -794,146 +670,4 @@ async fn sum_loom_all_accounts(
             .ok_or_else(|| anyhow!("loom sum overflow"))?;
     }
     Ok(sum)
-}
-
-// ---------------------------------------------------------------------------
-// Math helpers (mirror chain_dex_demo)
-// ---------------------------------------------------------------------------
-
-/// Uniswap-v2 get_amount_out with 0.3% fee.
-/// Resolve `(tka_reserve, tkb_reserve)` from on-chain `(reserve0, reserve1)`,
-/// using the Uniswap-v2 token-sort convention (`token0 = min(addr_a, addr_b)`).
-/// `bloom-dex-pair` mirrors this; without this resolution the test's expected
-/// amount-out math will be reversed whenever TKB's address sorts before TKA's.
-fn reserves_by_token(
-    tka: &[u8; 32],
-    tkb: &[u8; 32],
-    reserve0: u128,
-    reserve1: u128,
-) -> (u128, u128) {
-    if tka.as_slice() < tkb.as_slice() {
-        // TKA is token0
-        (reserve0, reserve1)
-    } else {
-        // TKB is token0
-        (reserve1, reserve0)
-    }
-}
-
-/// `floor(numerator * reserve / total_lp)` in U256 — the LP-burn pro-rata
-/// payout formula. Same overflow concerns as `uniswap_get_amount_out`.
-fn pro_rata(numerator: u128, reserve: u128, total_lp: u128) -> u128 {
-    use primitive_types::U256;
-    let n = U256::from(numerator) * U256::from(reserve);
-    let d = U256::from(total_lp.max(1));
-    (n / d).as_u128()
-}
-
-fn uniswap_get_amount_out(amount_in: u128, reserve_in: u128, reserve_out: u128) -> u128 {
-    // Mirror the router's exact arithmetic, which uses U256 throughout so the
-    // intermediate `amount_in_with_fee * reserve_out` doesn't overflow at
-    // production-scale reserves (~1e23 ⨯ ~1e24 = ~1e47, ~155 bits — well past
-    // u128). The result *does* fit in u128 for our test pool, so we narrow on
-    // the way out.
-    use primitive_types::U256;
-    let amount_in_u = U256::from(amount_in);
-    let reserve_in_u = U256::from(reserve_in);
-    let reserve_out_u = U256::from(reserve_out);
-    let amount_in_with_fee = amount_in_u * U256::from(997u64);
-    let numerator = amount_in_with_fee * reserve_out_u;
-    let denominator = reserve_in_u * U256::from(1000u64) + amount_in_with_fee;
-    let out = numerator / denominator;
-    out.as_u128()
-}
-
-fn mul_u256(a: u128, b: u128) -> (u128, u128) {
-    const MASK: u128 = u64::MAX as u128;
-    let a_lo = a & MASK;
-    let a_hi = a >> 64;
-    let b_lo = b & MASK;
-    let b_hi = b >> 64;
-
-    let p00 = a_lo * b_lo;
-    let p01 = a_lo * b_hi;
-    let p10 = a_hi * b_lo;
-    let p11 = a_hi * b_hi;
-
-    let c0 = p00 & MASK;
-    let r0 = p00 >> 64;
-
-    let s1 = r0 + (p01 & MASK) + (p10 & MASK);
-    let c1 = s1 & MASK;
-    let r1 = s1 >> 64;
-
-    let s2 = r1 + (p01 >> 64) + (p10 >> 64) + (p11 & MASK);
-    let c2 = s2 & MASK;
-    let r2 = s2 >> 64;
-
-    let c3 = r2 + (p11 >> 64);
-
-    let lo = (c1 << 64) | c0;
-    let hi = (c3 << 64) | c2;
-    (hi, lo)
-}
-
-fn derive_pair_addr(
-    factory: &[u8; 32],
-    t_a: &[u8; 32],
-    t_b: &[u8; 32],
-    pair_petal_hash: &[u8; 32],
-) -> [u8; 32] {
-    let (lo, hi) = if t_a <= t_b { (t_a, t_b) } else { (t_b, t_a) };
-    let salt = {
-        let mut h = blake3::Hasher::new();
-        h.update(b"dex.pair.salt:");
-        h.update(lo);
-        h.update(hi);
-        *h.finalize().as_bytes()
-    };
-    let mut h = blake3::Hasher::new();
-    h.update(b"bloom-chain.v0.addr:deploy:");
-    h.update(factory);
-    h.update(b":");
-    h.update(&salt);
-    h.update(b":");
-    h.update(pair_petal_hash);
-    *h.finalize().as_bytes()
-}
-
-fn last_json_object(text: &str) -> Result<Value> {
-    let mut depth = 0i32;
-    let mut last_start: Option<usize> = None;
-    let mut last_complete: Option<(usize, usize)> = None;
-    for (i, c) in text.char_indices() {
-        if c == '{' {
-            if depth == 0 {
-                last_start = Some(i);
-            }
-            depth += 1;
-        } else if c == '}' {
-            depth -= 1;
-            if depth == 0 {
-                if let Some(s) = last_start {
-                    last_complete = Some((s, i + 1));
-                }
-                last_start = None;
-            }
-        }
-    }
-    let (s, e) = last_complete.ok_or_else(|| anyhow!("no JSON object in output: {text}"))?;
-    serde_json::from_str(&text[s..e]).with_context(|| format!("parse JSON: {}", &text[s..e]))
-}
-
-fn json_hex(v: &Value, field: &str) -> Result<[u8; 32]> {
-    let s = v
-        .get(field)
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("field `{field}` missing in {v:?}"))?;
-    let bytes = hex::decode(s).with_context(|| format!("hex decode {field}"))?;
-    if bytes.len() != 32 {
-        bail!("field `{field}` not 32 bytes: {} bytes", bytes.len());
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
 }

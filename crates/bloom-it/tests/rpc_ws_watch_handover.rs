@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! Integration test for the WS-to-poll handover in `bloom-watch`.
 //!
 //! Scenario:

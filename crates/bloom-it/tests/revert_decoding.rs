@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! End-to-end test for the tiered revert-decoding pipeline.
 //!
 //! Runs against a real `anvil` instance: deploys a hand-rolled `Reverter`

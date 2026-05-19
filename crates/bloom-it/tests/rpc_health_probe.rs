@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! Integration test for the active health probe loop introduced in
 //! WP-3 of the RPC robustness overhaul.
 //!

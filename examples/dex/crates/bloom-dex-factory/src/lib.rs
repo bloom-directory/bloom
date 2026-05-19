@@ -342,19 +342,16 @@ mod tests {
 
     #[test]
     fn factory_selectors_match_dex_v0_canonical_strings() {
-        fn crate_sel(method: &[u8]) -> [u8; 4] {
-            let h = blake3::hash(method);
-            let b = h.as_bytes();
-            [b[0], b[1], b[2], b[3]]
+        bloom_dex_abi::assert_selector_parity! {
+            factory::SEL_CREATE_PAIR        => b"factory.create_pair(address,address)",
+            factory::SEL_GET_PAIR           => b"factory.get_pair(address,address)",
+            factory::SEL_ALL_PAIRS          => b"factory.all_pairs(u64)",
+            factory::SEL_ALL_PAIRS_LENGTH   => b"factory.all_pairs_length()",
+            factory::SEL_FEE_TO             => b"factory.fee_to()",
+            factory::SEL_FEE_TO_SETTER      => b"factory.fee_to_setter()",
+            factory::SEL_SET_FEE_TO         => b"factory.set_fee_to(address)",
+            factory::SEL_SET_FEE_TO_SETTER  => b"factory.set_fee_to_setter(address)",
         }
-        assert_eq!(factory::SEL_CREATE_PAIR,        crate_sel(b"factory.create_pair(address,address)"));
-        assert_eq!(factory::SEL_GET_PAIR,           crate_sel(b"factory.get_pair(address,address)"));
-        assert_eq!(factory::SEL_ALL_PAIRS,          crate_sel(b"factory.all_pairs(u64)"));
-        assert_eq!(factory::SEL_ALL_PAIRS_LENGTH,   crate_sel(b"factory.all_pairs_length()"));
-        assert_eq!(factory::SEL_FEE_TO,             crate_sel(b"factory.fee_to()"));
-        assert_eq!(factory::SEL_FEE_TO_SETTER,      crate_sel(b"factory.fee_to_setter()"));
-        assert_eq!(factory::SEL_SET_FEE_TO,         crate_sel(b"factory.set_fee_to(address)"));
-        assert_eq!(factory::SEL_SET_FEE_TO_SETTER,  crate_sel(b"factory.set_fee_to_setter(address)"));
     }
 
     #[test]

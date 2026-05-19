@@ -1,3 +1,5 @@
+//! Category: macro-DSL
+//!
 //! Integration tests for the `contract!` proc-macro.
 //!
 //! Each test declares a small contract DSL, then exercises the emitted

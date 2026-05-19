@@ -1,3 +1,5 @@
+//! Category: property
+//!
 //! Property-based tests for the `Trie` commitment scheme.
 
 use bloom_chain_state::trie::{Trie, TrieKind};

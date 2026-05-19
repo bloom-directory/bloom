@@ -1,63 +1,19 @@
+//! Category: integration
+//!
 //! Happy-path test: 4 validators drive one height to commit.
 //!
 //! Validator 0 proposes at (h=1, r=0) — index = (1+0)%4 = 1, so actually
 //! validator 1 is the proposer.  We drive all 4 instances through propose →
 //! prevote → precommit → commit and assert they all reach the same block hash.
 
-use std::collections::BTreeMap;
-
-use bloom_chain_consensus::{
-    state_machine::{Action, ConsensusState, Event, ProposalOrVote},
-    validator_set::{Validator, ValidatorSet},
-};
+use bloom_chain_consensus::state_machine::Action;
 use bloom_chain_types::{
-    block::{Block, BlockHeader},
-    types::{Address, Hash32, PubKeyBytes, SigBytes},
-    vote::{Commit, Proposal, Vote, VoteKind},
+    types::SigBytes,
+    vote::Proposal,
 };
-
-fn make_addr(seed: u8) -> Address {
-    Address([seed; 32])
-}
-
-fn make_validator_set() -> ValidatorSet {
-    ValidatorSet::new(
-        (0u8..4)
-            .map(|i| Validator {
-                address: make_addr(i),
-                pubkey: PubKeyBytes(vec![i; 4]),
-                voting_power: 100,
-            })
-            .collect(),
-    )
-    .unwrap()
-}
-
-fn make_block(height: u64, proposer: u8) -> Block {
-    let header = BlockHeader {
-        chain_id: "bloomchain.v0".to_string(),
-        height,
-        parent_hash: Hash32([0; 32]),
-        timestamp_ms: 1_747_526_400_000 + height * 1_000,
-        proposer: make_addr(proposer),
-        txs_root: Hash32([0xAA; 32]),
-        state_root: Hash32([0xBB; 32]),
-        receipts_root: Hash32([0xCC; 32]),
-        validator_set_hash: Hash32([0xDD; 32]),
-        fuel_used: 0,
-        fuel_limit: 30_000_000,
-    };
-    Block {
-        header,
-        txs: vec![],
-        commit: Commit {
-            height: height.saturating_sub(1),
-            round: 0,
-            block_hash: Hash32([0; 32]),
-            votes: vec![],
-        },
-    }
-}
+use bloom_test_util::{
+    make_addr, make_validator_set_fake, BlockBuilder, MultiValidatorMailbox,
+};
 
 #[test]
 fn four_validators_reach_same_commit() {
@@ -67,17 +23,16 @@ fn four_validators_reach_same_commit() {
     let proposer_idx = 1u8;
 
     // Build the canonical block.
-    let block = make_block(height, proposer_idx);
+    let block = BlockBuilder::at(height)
+        .proposer(make_addr(proposer_idx))
+        .build();
     let block_hash = block.header.block_hash();
 
-    // Build block store shared across all state machines (read-only in tests).
-    let mut blocks: BTreeMap<Hash32, Block> = BTreeMap::new();
-    blocks.insert(block_hash, block.clone());
-
-    // Instantiate 4 state machines.
-    let mut sms: Vec<ConsensusState> = (0u8..4)
-        .map(|i| ConsensusState::new(height, make_addr(i), make_validator_set()))
-        .collect();
+    // Instantiate 4 state machines via the mailbox helper.
+    let vset = make_validator_set_fake(4, 100);
+    let addrs: Vec<_> = (0u8..4).map(make_addr).collect();
+    let mut mb = MultiValidatorMailbox::new(height, &addrs, vset);
+    mb.insert_block(block_hash, block);
 
     // --- Step 1: Proposer (validator 1) proposes ---
     let proposal = Proposal {
@@ -89,18 +44,8 @@ fn four_validators_reach_same_commit() {
         sig: SigBytes(vec![]),
     };
 
-    // Deliver proposal to all 4.
-    let mut all_prevotes: Vec<Vote> = Vec::new();
-    for sm in sms.iter_mut() {
-        let actions = sm.handle(Event::ReceiveProposal(proposal.clone()), &blocks);
-        for action in actions {
-            if let Action::Broadcast(ProposalOrVote::Vote(v)) = action
-                && v.kind == VoteKind::Prevote
-            {
-                all_prevotes.push(v);
-            }
-        }
-    }
+    let actions = mb.broadcast_proposal(proposal);
+    let all_prevotes = MultiValidatorMailbox::prevotes_in(actions);
 
     // All 4 should have prevoted the block hash.
     assert_eq!(all_prevotes.len(), 4, "all 4 should have prevoted");
@@ -110,17 +55,12 @@ fn four_validators_reach_same_commit() {
     );
 
     // --- Step 2: Deliver all prevotes to all 4 SMs ---
-    let mut all_precommits: Vec<Vote> = Vec::new();
+    let mut all_precommits = Vec::new();
     for vote in all_prevotes.iter() {
-        for sm in sms.iter_mut() {
-            let actions = sm.handle(Event::ReceiveVote(vote.clone()), &blocks);
-            for action in actions {
-                if let Action::Broadcast(ProposalOrVote::Vote(v)) = action
-                    && v.kind == VoteKind::Precommit
-                    && v.block_hash == Some(block_hash)
-                {
-                    all_precommits.push(v);
-                }
+        let actions = mb.broadcast_vote(vote.clone());
+        for v in MultiValidatorMailbox::precommits_in(actions) {
+            if v.block_hash == Some(block_hash) {
+                all_precommits.push(v);
             }
         }
     }
@@ -138,16 +78,13 @@ fn four_validators_reach_same_commit() {
     let mut commit_count = 0usize;
     let mut committed_hashes = std::collections::HashSet::new();
     for vote in unique_precommits.iter() {
-        for sm in sms.iter_mut() {
-            let actions = sm.handle(Event::ReceiveVote(vote.clone()), &blocks);
-            for action in actions {
-                if let Action::Commit(committed_block, commit) = action {
-                    commit_count += 1;
-                    committed_hashes.insert(committed_block.header.block_hash());
-                    assert_eq!(commit.block_hash, block_hash);
-                    assert_eq!(commit.height, height);
-                }
-
+        let actions = mb.broadcast_vote(vote.clone());
+        for action in actions {
+            if let Action::Commit(committed_block, commit) = action {
+                commit_count += 1;
+                committed_hashes.insert(committed_block.header.block_hash());
+                assert_eq!(commit.block_hash, block_hash);
+                assert_eq!(commit.height, height);
             }
         }
     }

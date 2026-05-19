@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! Tests for the snapshot / commit / revert pattern.
 
 use bloom_chain_state::{Account, State, StateError};

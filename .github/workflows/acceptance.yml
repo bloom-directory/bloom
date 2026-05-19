@@ -1,0 +1,52 @@
+name: acceptance
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_LOG: warn
+
+jobs:
+  ignored-tests:
+    name: cargo test -- --ignored
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build workspace (release-ish; debug is fine for acceptance)
+        run: cargo build --workspace --tests
+      - name: Run --ignored acceptance tests
+        run: cargo test --workspace -- --ignored
+
+  docker-dex:
+    name: docker DEX acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check docker availability
+        id: docker
+        run: |
+          if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::docker not available on runner; skipping docker DEX gate"
+          fi
+      - name: Install Rust toolchain
+        if: steps.docker.outputs.available == 'true'
+        run: rustup show
+      - name: Cache cargo
+        if: steps.docker.outputs.available == 'true'
+        uses: Swatinem/rust-cache@v2
+      - name: Run docker DEX acceptance
+        if: steps.docker.outputs.available == 'true'
+        run: scripts/test-docker-dex.sh

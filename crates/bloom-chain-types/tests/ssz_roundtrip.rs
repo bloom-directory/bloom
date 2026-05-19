@@ -1,3 +1,5 @@
+//! Category: property
+//!
 //! End-to-end SSZ round-trip property tests and golden vectors.
 
 use bloom_chain_types::frame::{decode_frame, encode_frame, FrameError, MAX_PAYLOAD_LEN};

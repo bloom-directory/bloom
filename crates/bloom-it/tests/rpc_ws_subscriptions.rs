@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! Integration test for the WebSocket subscription fast path
 //! introduced in WP-4 of the RPC robustness overhaul.
 //!

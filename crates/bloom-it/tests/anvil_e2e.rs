@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! End-to-end integration test for the bloom stage-confirm flow.
 //!
 //! Runs against a real `anvil` instance spawned as a child process. Marked

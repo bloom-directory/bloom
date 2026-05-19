@@ -1382,74 +1382,35 @@ mod tests {
     // (macro-emitted) and the legacy bloom-dex-abi build.rs table.
     // ---------------------------------------------------------------------
 
-    fn crate_sel(method: &[u8]) -> [u8; 4] {
-        let h = blake3::hash(method);
-        let b = h.as_bytes();
-        [b[0], b[1], b[2], b[3]]
-    }
-
     #[test]
     fn router_selectors_match_dex_v0_canonical_strings() {
-        // Liquidity
-        assert_eq!(
-            router::SEL_ADD_LIQUIDITY,
-            crate_sel(b"router.add_liquidity(address,address,u256,u256,u256,u256,address,u64)"),
-        );
-        assert_eq!(
-            router::SEL_ADD_LIQUIDITY_LOOM,
-            crate_sel(b"router.add_liquidity_loom(address,u256,u256,u256,address,u64)"),
-        );
-        assert_eq!(
-            router::SEL_REMOVE_LIQUIDITY,
-            crate_sel(b"router.remove_liquidity(address,address,u256,u256,u256,address,u64)"),
-        );
-        assert_eq!(
-            router::SEL_REMOVE_LIQUIDITY_LOOM,
-            crate_sel(b"router.remove_liquidity_loom(address,u256,u256,u256,address,u64)"),
-        );
-        // Swaps
-        assert_eq!(
-            router::SEL_SWAP_EXACT_TOKENS_FOR_TOKENS,
-            crate_sel(b"router.swap_exact_tokens_for_tokens(u256,u256,Vec<Address>,address,u64)"),
-        );
-        assert_eq!(
-            router::SEL_SWAP_TOKENS_FOR_EXACT_TOKENS,
-            crate_sel(b"router.swap_tokens_for_exact_tokens(u256,u256,Vec<Address>,address,u64)"),
-        );
-        assert_eq!(
-            router::SEL_SWAP_EXACT_LOOM_FOR_TOKENS,
-            crate_sel(b"router.swap_exact_loom_for_tokens(u256,Vec<Address>,address,u64)"),
-        );
-        assert_eq!(
-            router::SEL_SWAP_TOKENS_FOR_EXACT_LOOM,
-            crate_sel(b"router.swap_tokens_for_exact_loom(u256,u256,Vec<Address>,address,u64)"),
-        );
-        assert_eq!(
-            router::SEL_SWAP_EXACT_TOKENS_FOR_LOOM,
-            crate_sel(b"router.swap_exact_tokens_for_loom(u256,u256,Vec<Address>,address,u64)"),
-        );
-        assert_eq!(
-            router::SEL_SWAP_LOOM_FOR_EXACT_TOKENS,
-            crate_sel(b"router.swap_loom_for_exact_tokens(u256,Vec<Address>,address,u64)"),
-        );
-        // Pure quoting
-        assert_eq!(router::SEL_QUOTE, crate_sel(b"router.quote(u256,u256,u256)"));
-        assert_eq!(
-            router::SEL_GET_AMOUNT_OUT,
-            crate_sel(b"router.get_amount_out(u256,u256,u256)"),
-        );
-        assert_eq!(
-            router::SEL_GET_AMOUNT_IN,
-            crate_sel(b"router.get_amount_in(u256,u256,u256)"),
-        );
-        assert_eq!(
-            router::SEL_GET_AMOUNTS_OUT,
-            crate_sel(b"router.get_amounts_out(u256,Vec<Address>)"),
-        );
-        assert_eq!(
-            router::SEL_GET_AMOUNTS_IN,
-            crate_sel(b"router.get_amounts_in(u256,Vec<Address>)"),
-        );
+        bloom_dex_abi::assert_selector_parity! {
+            router::SEL_ADD_LIQUIDITY                =>
+                b"router.add_liquidity(address,address,u256,u256,u256,u256,address,u64)",
+            router::SEL_ADD_LIQUIDITY_LOOM           =>
+                b"router.add_liquidity_loom(address,u256,u256,u256,address,u64)",
+            router::SEL_REMOVE_LIQUIDITY             =>
+                b"router.remove_liquidity(address,address,u256,u256,u256,address,u64)",
+            router::SEL_REMOVE_LIQUIDITY_LOOM        =>
+                b"router.remove_liquidity_loom(address,u256,u256,u256,address,u64)",
+            router::SEL_SWAP_EXACT_TOKENS_FOR_TOKENS =>
+                b"router.swap_exact_tokens_for_tokens(u256,u256,Vec<Address>,address,u64)",
+            router::SEL_SWAP_TOKENS_FOR_EXACT_TOKENS =>
+                b"router.swap_tokens_for_exact_tokens(u256,u256,Vec<Address>,address,u64)",
+            router::SEL_SWAP_EXACT_LOOM_FOR_TOKENS   =>
+                b"router.swap_exact_loom_for_tokens(u256,Vec<Address>,address,u64)",
+            router::SEL_SWAP_TOKENS_FOR_EXACT_LOOM   =>
+                b"router.swap_tokens_for_exact_loom(u256,u256,Vec<Address>,address,u64)",
+            router::SEL_SWAP_EXACT_TOKENS_FOR_LOOM   =>
+                b"router.swap_exact_tokens_for_loom(u256,u256,Vec<Address>,address,u64)",
+            router::SEL_SWAP_LOOM_FOR_EXACT_TOKENS   =>
+                b"router.swap_loom_for_exact_tokens(u256,Vec<Address>,address,u64)",
+            router::SEL_QUOTE                        => b"router.quote(u256,u256,u256)",
+            router::SEL_GET_AMOUNT_OUT               => b"router.get_amount_out(u256,u256,u256)",
+            router::SEL_GET_AMOUNT_IN                => b"router.get_amount_in(u256,u256,u256)",
+            router::SEL_GET_AMOUNTS_OUT              => b"router.get_amounts_out(u256,Vec<Address>)",
+            router::SEL_GET_AMOUNTS_IN               => b"router.get_amounts_in(u256,Vec<Address>)",
+        }
     }
 
     #[test]

@@ -497,19 +497,10 @@ fn calldata_encoding_withdraw() {
 
 #[test]
 fn wloom_selectors_match_dex_v0_canonical_strings() {
-    fn crate_sel(method: &[u8]) -> [u8; 4] {
-        let h = ::blake3::hash(method);
-        let b = h.as_bytes();
-        [b[0], b[1], b[2], b[3]]
+    bloom_dex_abi::assert_selector_parity! {
+        crate::wloom::SEL_DEPOSIT  => b"wloom.deposit()",
+        crate::wloom::SEL_WITHDRAW => b"wloom.withdraw(u256)",
     }
-    assert_eq!(
-        crate::wloom::SEL_DEPOSIT,
-        crate_sel(b"wloom.deposit()"),
-    );
-    assert_eq!(
-        crate::wloom::SEL_WITHDRAW,
-        crate_sel(b"wloom.withdraw(u256)"),
-    );
 }
 
 #[test]

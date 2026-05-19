@@ -1,3 +1,5 @@
+//! Category: CLI-subprocess
+//!
 //! CLI smoke tests for the `bloom` binary.
 //!
 //! Each test allocates a fresh `tempfile::tempdir()` home and invokes the
@@ -203,42 +205,20 @@ fn wallet_new_via_env_passphrase() {
 #[test]
 fn vfs_routes_via_ipc_when_socket_exists() {
     use bloom_daemon::ipc::{IpcServer, default_socket_path};
-    use bloom_vfs::handler::{Entry, Handler, HandlerError};
-    use bloom_vfs::{Vfs, VfsPath};
+    use bloom_test_util::mocks::SingleFileHandler;
+    use bloom_vfs::Vfs;
 
     // A trivial in-memory handler that the production daemon never mounts;
     // if the CLI's `vfs ls /probe` returns this entry, the request must
     // have gone through our test server.
-    struct ProbeHandler;
-    #[async_trait::async_trait]
-    impl Handler for ProbeHandler {
-        async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
-            if p.is_root() {
-                Ok(Entry::dir(""))
-            } else if p.segments().len() == 1 && p.segments()[0] == "marker" {
-                Ok(Entry::file("marker"))
-            } else {
-                Err(HandlerError::not_found(p.to_string_path()))
-            }
-        }
-        async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
-            if p.is_root() {
-                Ok(vec![Entry::file("marker")])
-            } else {
-                Err(HandlerError::NotADir(p.to_string_path()))
-            }
-        }
-        async fn read(&self, _p: &VfsPath) -> Result<Vec<u8>, HandlerError> {
-            Ok(b"ipc-only-marker\n".to_vec())
-        }
-    }
+    let probe = SingleFileHandler::new("marker", b"ipc-only-marker\n".to_vec());
 
     let home = fresh_home();
     let socket = default_socket_path(home.path());
     std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
 
     let vfs = Vfs::builder()
-        .mount("probe", std::sync::Arc::new(ProbeHandler))
+        .mount("probe", std::sync::Arc::new(probe))
         .build();
 
     // Build a Tokio runtime for the server in a dedicated thread; the

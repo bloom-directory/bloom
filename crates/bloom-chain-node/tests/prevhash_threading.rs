@@ -1,3 +1,5 @@
+//! Category: adversarial
+//!
 //! Regression coverage for review 2026-05-19 #13 — `block.prevhash`
 //! threading into `PetalExecutor`.
 //!
@@ -24,12 +26,11 @@ use bloom_chain_node::{
 };
 use bloom_chain_state::{Account, State};
 use bloom_chain_types::{
-    block::{Block, BlockHeader},
     digest::{blake3_tagged, tags},
     tx::{Tx, TxKind},
     types::{Address, Hash32, PubKeyBytes, SigBytes},
-    vote::Commit,
 };
+use bloom_test_util::{make_addr, BlockBuilder};
 
 const ZERO_EMISSION: u128 = 0;
 
@@ -58,7 +59,7 @@ fn prevhash_visible_to_petal() {
     // ── 1. Mint a sender keypair so the tx passes sender-derivation. ─────
     let (sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
     let sender = Address::from_pubkey_bytes(&pk.0);
-    let proposer = Address([0x77; 32]);
+    let proposer = make_addr(0x77);
 
     // ── 2. Pre-deploy the petal directly into state (no Deploy tx
     //       needed for this test). ───────────────────────────────────────
@@ -114,28 +115,11 @@ fn prevhash_visible_to_petal() {
     // ── 5. Build a block whose header carries the known parent_hash.
     //       (apply_block_state_transitions reads block.header.parent_hash
     //       and threads it into the executor.) ─────────────────────────────
-    let block = Block {
-        header: BlockHeader {
-            chain_id: "bloom-chain.v0".to_string(),
-            height: 2,
-            parent_hash: known_parent_hash,
-            timestamp_ms: 1_747_526_400_000,
-            proposer,
-            txs_root: Hash32([0u8; 32]),
-            state_root: Hash32([0u8; 32]),
-            receipts_root: Hash32([0u8; 32]),
-            validator_set_hash: Hash32([0u8; 32]),
-            fuel_used: 0,
-            fuel_limit: 30_000_000,
-        },
-        txs: vec![tx_unsigned],
-        commit: Commit {
-            height: 0,
-            round: 0,
-            block_hash: Hash32([0u8; 32]),
-            votes: vec![],
-        },
-    };
+    let block = BlockBuilder::at(2)
+        .parent_hash(known_parent_hash)
+        .proposer(proposer)
+        .txs(vec![tx_unsigned])
+        .build();
 
     let (_fuel, receipts) = apply_block_state_transitions(
         &mut state,

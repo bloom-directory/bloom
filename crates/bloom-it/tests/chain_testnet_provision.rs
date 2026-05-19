@@ -1,3 +1,5 @@
+//! Category: CLI-subprocess
+//!
 //! `chain_testnet_provision.rs` — fast non-network smoke test for the
 //! `bloom chain testnet` provisioner.
 //!

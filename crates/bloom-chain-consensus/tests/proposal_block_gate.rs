@@ -1,3 +1,5 @@
+//! Category: adversarial
+//!
 //! Regression coverage for the 2026-05-19 review #3 — `on_proposal` must
 //! refuse to transition to Prevote until the proposed `block_hash` is present
 //! in the blocks map.
@@ -15,57 +17,18 @@
 
 use std::collections::BTreeMap;
 
-use bloom_chain_consensus::{
-    state_machine::{Action, ConsensusState, Event, ProposalOrVote},
-    validator_set::{Validator, ValidatorSet},
-};
+use bloom_chain_consensus::state_machine::{Action, ConsensusState, Event, ProposalOrVote};
 use bloom_chain_types::{
-    block::{Block, BlockHeader},
-    types::{Address, Hash32, PubKeyBytes, SigBytes},
-    vote::{Commit, Proposal, VoteKind},
+    block::Block,
+    types::{Hash32, SigBytes},
+    vote::{Proposal, VoteKind},
 };
-
-fn make_addr(seed: u8) -> Address {
-    Address([seed; 32])
-}
-
-fn make_validator_set() -> ValidatorSet {
-    ValidatorSet::new(
-        (0u8..4)
-            .map(|i| Validator {
-                address: make_addr(i),
-                pubkey: PubKeyBytes(vec![i; 4]),
-                voting_power: 100,
-            })
-            .collect(),
-    )
-    .unwrap()
-}
+use bloom_test_util::{make_addr, make_validator_set_fake, BlockBuilder};
 
 fn make_block(height: u64, proposer: u8) -> Block {
-    let header = BlockHeader {
-        chain_id: "bloomchain.v0".to_string(),
-        height,
-        parent_hash: Hash32([0; 32]),
-        timestamp_ms: 1_747_526_400_000 + height * 1_000,
-        proposer: make_addr(proposer),
-        txs_root: Hash32([0xAA; 32]),
-        state_root: Hash32([0xBB; 32]),
-        receipts_root: Hash32([0xCC; 32]),
-        validator_set_hash: Hash32([0xDD; 32]),
-        fuel_used: 0,
-        fuel_limit: 30_000_000,
-    };
-    Block {
-        header,
-        txs: vec![],
-        commit: Commit {
-            height: height.saturating_sub(1),
-            round: 0,
-            block_hash: Hash32([0; 32]),
-            votes: vec![],
-        },
-    }
+    BlockBuilder::at(height)
+        .proposer(make_addr(proposer))
+        .build()
 }
 
 #[test]
@@ -79,7 +42,7 @@ fn proposal_for_unknown_block_does_not_emit_prevote() {
     let blocks: BTreeMap<Hash32, Block> = BTreeMap::new();
 
     // Validator 0 (not the proposer) receives the proposal.
-    let mut sm = ConsensusState::new(height, make_addr(0), make_validator_set());
+    let mut sm = ConsensusState::new(height, make_addr(0), make_validator_set_fake(4, 100));
     let proposal = Proposal {
         height,
         round: 0,
@@ -116,7 +79,7 @@ fn proposal_with_known_block_still_emits_prevote() {
     let mut blocks: BTreeMap<Hash32, Block> = BTreeMap::new();
     blocks.insert(block_hash, block.clone());
 
-    let mut sm = ConsensusState::new(height, make_addr(0), make_validator_set());
+    let mut sm = ConsensusState::new(height, make_addr(0), make_validator_set_fake(4, 100));
     let proposal = Proposal {
         height,
         round: 0,
@@ -160,7 +123,7 @@ fn pending_proposal_replays_when_block_arrives() {
 
     // Step 1: proposal arrives FIRST, blocks map empty → gate stashes.
     let mut blocks: BTreeMap<Hash32, Block> = BTreeMap::new();
-    let mut sm = ConsensusState::new(height, make_addr(0), make_validator_set());
+    let mut sm = ConsensusState::new(height, make_addr(0), make_validator_set_fake(4, 100));
     let proposal = Proposal {
         height,
         round: 0,
@@ -207,7 +170,7 @@ fn try_resume_is_noop_when_block_still_missing() {
     let other_block = make_block(2, 2);
     let other_hash = other_block.header.block_hash();
 
-    let mut sm = ConsensusState::new(height, make_addr(0), make_validator_set());
+    let mut sm = ConsensusState::new(height, make_addr(0), make_validator_set_fake(4, 100));
     let proposal = Proposal {
         height,
         round: 0,

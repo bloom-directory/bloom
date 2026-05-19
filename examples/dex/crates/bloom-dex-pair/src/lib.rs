@@ -1031,24 +1031,21 @@ mod tests {
 
     #[test]
     fn pair_selectors_match_dex_v0_canonical_strings() {
-        fn crate_sel(method: &[u8]) -> [u8; 4] {
-            let h = blake3::hash(method);
-            let b = h.as_bytes();
-            [b[0], b[1], b[2], b[3]]
+        bloom_dex_abi::assert_selector_parity! {
+            pair::SEL_TOKEN0             => b"pair.token0()",
+            pair::SEL_TOKEN1             => b"pair.token1()",
+            pair::SEL_GET_RESERVES       => b"pair.get_reserves()",
+            pair::SEL_MINT               => b"pair.mint(address)",
+            pair::SEL_BURN               => b"pair.burn(address)",
+            pair::SEL_SWAP               => b"pair.swap(u256,u256,address)",
+            pair::SEL_SKIM               => b"pair.skim(address)",
+            pair::SEL_SYNC               => b"pair.sync()",
+            pair::SEL_LOCK_CHECK_AND_SET => b"pair.lock_check_and_set()",
+            pair::SEL_LOCK_CLEAR         => b"pair.lock_clear()",
+            pair::SEL__MINT_INNER        => b"pair._mint_inner(address)",
+            pair::SEL__BURN_INNER        => b"pair._burn_inner(address)",
+            pair::SEL__SWAP_INNER        => b"pair._swap_inner(u256,u256,address)",
         }
-        assert_eq!(pair::SEL_TOKEN0,             crate_sel(b"pair.token0()"));
-        assert_eq!(pair::SEL_TOKEN1,             crate_sel(b"pair.token1()"));
-        assert_eq!(pair::SEL_GET_RESERVES,       crate_sel(b"pair.get_reserves()"));
-        assert_eq!(pair::SEL_MINT,               crate_sel(b"pair.mint(address)"));
-        assert_eq!(pair::SEL_BURN,               crate_sel(b"pair.burn(address)"));
-        assert_eq!(pair::SEL_SWAP,               crate_sel(b"pair.swap(u256,u256,address)"));
-        assert_eq!(pair::SEL_SKIM,               crate_sel(b"pair.skim(address)"));
-        assert_eq!(pair::SEL_SYNC,               crate_sel(b"pair.sync()"));
-        assert_eq!(pair::SEL_LOCK_CHECK_AND_SET, crate_sel(b"pair.lock_check_and_set()"));
-        assert_eq!(pair::SEL_LOCK_CLEAR,         crate_sel(b"pair.lock_clear()"));
-        assert_eq!(pair::SEL__MINT_INNER,        crate_sel(b"pair._mint_inner(address)"));
-        assert_eq!(pair::SEL__BURN_INNER,        crate_sel(b"pair._burn_inner(address)"));
-        assert_eq!(pair::SEL__SWAP_INNER,        crate_sel(b"pair._swap_inner(u256,u256,address)"));
     }
 
     #[test]

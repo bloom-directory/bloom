@@ -1,3 +1,5 @@
+//! Category: adversarial
+//!
 //! Adversarial regression coverage for the 2026-05-19 consensus-hardening
 //! review items #6 (nested `petal.call` revert isolation), #7 (wasmtime
 //! ResourceLimiter caps `memory.grow` at runtime), and #12 (single,
@@ -15,20 +17,11 @@ use bloom_petals::{
     BlockCtx, ChainCallInput, ChainEntry, PetalError, PetalVm,
 };
 
-fn make_address(b: u8) -> Address {
-    Address([b; 32])
-}
+mod common;
+use common::{block_at, make_address, wat};
 
 fn default_block() -> BlockCtx {
-    BlockCtx {
-        number: 7,
-        timestamp_ms: 1_700_000_000_000,
-        prevhash: Hash32([0xAB; 32]),
-    }
-}
-
-fn wat(src: &str) -> Vec<u8> {
-    wat::parse_str(src).expect("valid WAT")
+    block_at(7)
 }
 
 // ---------------------------------------------------------------------------
@@ -218,19 +211,7 @@ fn revert_child_writes_dont_leak() {
 
 /// Petal whose `call` issues `memory.grow(1024)` — well past the 256-page
 /// (16 MiB) chain-mode cap.
-const MEMORY_GROW_OVER_CAP: &str = r#"
-(module
-  (memory (export "memory") 1)
-  (func (export "call") (param i32 i32) (result i32)
-    ;; memory.grow returns the previous size, or -1 on failure.
-    ;; We don't even need to check — if the limiter rejects, the next
-    ;; load/store would still pass; we want a HARD trap. The simplest way
-    ;; is to insist the grow succeeded by trapping if it returned -1.
-    (if (i32.eq (memory.grow (i32.const 1024)) (i32.const -1))
-      (then (unreachable)))
-    i32.const 0)
-)
-"#;
+const MEMORY_GROW_OVER_CAP: &str = include_str!("fixtures/memory_grow_over_cap.wat");
 
 #[test]
 fn wasm_memory_grow_caught_at_runtime() {

@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! Integration tests for the accounts trie and state root.
 
 use bloom_chain_state::{Account, AccountsTrie, State};

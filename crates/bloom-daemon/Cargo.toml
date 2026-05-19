@@ -49,3 +49,4 @@ futures.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+bloom-test-util = { path = "../bloom-test-util" }

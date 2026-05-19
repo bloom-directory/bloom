@@ -29,12 +29,33 @@ fail() { printf '\033[1;31m[docker-dex:fail]\033[0m %s\n' "$*" >&2; exit 1; }
 require_cmd docker cargo
 detect_docker_compose
 
+# Validator count is parameterised; default 4 matches the static
+# docker-compose.yml. Any other count generates a fresh compose file via
+# scripts/gen-docker-compose.sh. Currently the bloom-dex-it docker test
+# itself assumes 4 validators (val0..val3, host ports 18545..18548) — see
+# `HOST_RPC_PORTS` in tests/docker_dex_multi_user.rs — so non-default N
+# only exercises the chain stack, not the DEX driver.
+BLOOM_VALIDATOR_COUNT="${BLOOM_VALIDATOR_COUNT:-4}"
+log "validators: $BLOOM_VALIDATOR_COUNT"
+
+# Retry knob for the known-flaky DEX driver. The chain stack itself is
+# stable; the flake is in `dex_v0_acceptance_end_to_end` style nonce-race
+# territory and disappears on retry without code changes (Memory IDs
+# 1671-1674).
+BLOOM_DOCKER_DEX_RETRIES="${BLOOM_DOCKER_DEX_RETRIES:-2}"
+
 # Resolve tmpdir (host-side homes for validators).
 BLOOM_DOCKER_TMPDIR="${BLOOM_DOCKER_TMPDIR:-$(mktemp -d -t bloom-docker-dex.XXXX)}"
 export BLOOM_DOCKER_TMPDIR
 log "tmpdir: $BLOOM_DOCKER_TMPDIR"
 
-COMPOSE_FILE="$REPO_ROOT/docker-compose.yml"
+if [ "$BLOOM_VALIDATOR_COUNT" = "4" ]; then
+    COMPOSE_FILE="$REPO_ROOT/docker-compose.yml"
+else
+    COMPOSE_FILE="$BLOOM_DOCKER_TMPDIR/docker-compose.gen.yml"
+    log "generating compose file for $BLOOM_VALIDATOR_COUNT validators: $COMPOSE_FILE"
+    "$REPO_ROOT/scripts/gen-docker-compose.sh" "$BLOOM_VALIDATOR_COUNT" > "$COMPOSE_FILE"
+fi
 
 BLOOM_BIN="$REPO_ROOT/target/release/bloom"
 BLOOM_DEX_BIN="$REPO_ROOT/target/release/bloom-dex"
@@ -76,11 +97,17 @@ if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
     [ -x "$BLOOM_BIN" ]     || fail "bloom binary missing: $BLOOM_BIN"
     [ -x "$BLOOM_DEX_BIN" ] || fail "bloom-dex binary missing: $BLOOM_DEX_BIN"
 
-    log "provisioning 4-validator testnet under $BLOOM_DOCKER_TMPDIR"
+    # Comma-separated peer-host list: val0,val1,...,val(N-1)
+    peer_hosts=""
+    for i in $(seq 0 $((BLOOM_VALIDATOR_COUNT - 1))); do
+        [ -z "$peer_hosts" ] && peer_hosts="val$i" || peer_hosts="$peer_hosts,val$i"
+    done
+
+    log "provisioning $BLOOM_VALIDATOR_COUNT-validator testnet under $BLOOM_DOCKER_TMPDIR"
     "$BLOOM_BIN" chain testnet \
-        --validators 4 \
+        --validators "$BLOOM_VALIDATOR_COUNT" \
         --output-dir "$BLOOM_DOCKER_TMPDIR" \
-        --peer-hosts val0,val1,val2,val3 \
+        --peer-hosts "$peer_hosts" \
         --listen-addr 0.0.0.0:26656 \
         --rpc-tcp-addr 0.0.0.0:8545 \
         --allocation 1000000000000000000000000
@@ -91,16 +118,17 @@ if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
     # Poll the per-container healthcheck instead of relying on `compose up
     # --wait`, which isn't available in older compose plugins (2.0.0-beta.1
     # rejects the flag).
-    log "waiting for val0..val3 to report healthy"
+    log "waiting for val0..val$((BLOOM_VALIDATOR_COUNT - 1)) to report healthy"
     deadline=$(( $(date +%s) + 180 ))
     while :; do
         unhealthy=()
-        for name in bloom-val0 bloom-val1 bloom-val2 bloom-val3; do
+        for i in $(seq 0 $((BLOOM_VALIDATOR_COUNT - 1))); do
+            name="bloom-val$i"
             state=$(docker inspect --format='{{.State.Health.Status}}' "$name" 2>/dev/null || echo missing)
             [ "$state" = "healthy" ] || unhealthy+=("$name=$state")
         done
         if [ "${#unhealthy[@]}" -eq 0 ]; then
-            log "all 4 validators healthy"
+            log "all $BLOOM_VALIDATOR_COUNT validators healthy"
             break
         fi
         now=$(date +%s)
@@ -115,10 +143,27 @@ else
     [ -x "$BLOOM_DEX_BIN" ] || fail "bloom-dex binary missing: $BLOOM_DEX_BIN"
 fi
 
-log "running bloom-dex-it::docker_dex_multi_user"
-BLOOM_DOCKER_TMPDIR="$BLOOM_DOCKER_TMPDIR" \
-BLOOM_BIN="$BLOOM_BIN" \
-BLOOM_DEX_BIN="$BLOOM_DEX_BIN" \
-RUST_LOG="${RUST_LOG:-warn}" \
-    cargo test --release -p bloom-dex-it --test docker_dex_multi_user \
-    -- --ignored --nocapture
+log "running bloom-dex-it::docker_dex_multi_user (up to $BLOOM_DOCKER_DEX_RETRIES retries)"
+
+attempt=0
+test_rc=0
+while :; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -gt 1 ]; then
+        log "retry $((attempt - 1))/$((BLOOM_DOCKER_DEX_RETRIES - 1)) — flake on a stable chain; transient nonce-race territory"
+    fi
+    test_rc=0
+    BLOOM_DOCKER_TMPDIR="$BLOOM_DOCKER_TMPDIR" \
+    BLOOM_BIN="$BLOOM_BIN" \
+    BLOOM_DEX_BIN="$BLOOM_DEX_BIN" \
+    RUST_LOG="${RUST_LOG:-warn}" \
+        cargo test --release -p bloom-dex-it --test docker_dex_multi_user \
+        -- --ignored --nocapture || test_rc=$?
+    if [ "$test_rc" -eq 0 ]; then
+        [ "$attempt" -gt 1 ] && log "passed on retry $((attempt - 1))"
+        break
+    fi
+    if [ "$attempt" -ge "$BLOOM_DOCKER_DEX_RETRIES" ]; then
+        fail "docker DEX test failed after $attempt attempt(s) (rc=$test_rc)"
+    fi
+done

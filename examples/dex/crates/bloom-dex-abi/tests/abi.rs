@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! Integration tests for bloom-dex-abi.
 //!
 //! Covers:

@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! Live integration test against an Ethereum mainnet RPC.
 //!
 //! Skipped unless `BLOOM_MAINNET_RPC` is set. Also `#[ignore]`d so it

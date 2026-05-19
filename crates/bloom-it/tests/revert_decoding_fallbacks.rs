@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! End-to-end test for the heimdall bytecode-decompile fallback.
 //!
 //! Mirrors `revert_decoding.rs` but runs without an Etherscan ABI

@@ -1,3 +1,5 @@
+//! Category: integration
+//!
 //! Test: parse a minimal genesis.toml with one validator.
 //!
 //! Writes a tmpdir genesis, parses it, and asserts ValidatorSet.len() == 1.

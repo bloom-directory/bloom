@@ -27,6 +27,7 @@ hex     = "0.4"
 zbase32 = "0.1"
 
 [dev-dependencies]
+bloom-test-util = { path = "../bloom-test-util" }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 # Used by adversarial test fixtures (e.g. `prevhash_threading.rs`).

@@ -1,3 +1,5 @@
+//! Category: smoke
+//!
 //! `chain_smoke.rs` — 4-validator local network smoke test (spec §15 minus DEX).
 //!
 //! Acceptance: spawn four validator nodes via `bloom chain run-validator`,

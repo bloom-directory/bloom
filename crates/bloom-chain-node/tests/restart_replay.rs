@@ -1,3 +1,5 @@
+//! Category: adversarial
+//!
 //! Regression coverage for the 2026-05-19 review #4 — restart must replay
 //! full committed state, not just the proposer LOOM emission.
 //!
@@ -16,17 +18,13 @@
 use bloom_chain_node::consensus_driver::{apply_block_state_transitions, NoopExecutor};
 use bloom_chain_state::State;
 use bloom_chain_types::{
-    block::{Block, BlockHeader},
+    block::Block,
     tx::{Tx, TxKind},
     types::{Address, Hash32, PubKeyBytes, SigBytes},
-    vote::Commit,
 };
+use bloom_test_util::{make_addr, BlockBuilder};
 
 const BLOCK_EMISSION: u128 = 10_000_000_000_000_000_000u128;
-
-fn make_addr(seed: u8) -> Address {
-    Address([seed; 32])
-}
 
 fn make_transfer_tx(
     sender: Address,
@@ -51,28 +49,12 @@ fn make_transfer_tx(
 }
 
 fn make_block(height: u64, proposer: Address, txs: Vec<Tx>) -> Block {
-    Block {
-        header: BlockHeader {
-            chain_id: "bloom-chain.v0".to_string(),
-            height,
-            parent_hash: Hash32([0u8; 32]),
-            timestamp_ms: 1_747_526_400_000 + height * 1_000,
-            proposer,
-            txs_root: Hash32([0u8; 32]), // validation is the caller's job; replay doesn't check
-            state_root: Hash32([0u8; 32]),
-            receipts_root: Hash32([0u8; 32]),
-            validator_set_hash: Hash32([0u8; 32]),
-            fuel_used: 0,
-            fuel_limit: 30_000_000,
-        },
-        txs,
-        commit: Commit {
-            height: 0,
-            round: 0,
-            block_hash: Hash32([0u8; 32]),
-            votes: vec![],
-        },
-    }
+    // Replay doesn't validate block roots; use the BlockBuilder default
+    // sentinel roots (0xAA/0xBB/0xCC/0xDD).
+    BlockBuilder::at(height)
+        .proposer(proposer)
+        .txs(txs)
+        .build()
 }
 
 #[test]

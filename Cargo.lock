@@ -1972,6 +1972,7 @@ dependencies = [
  "bloom-mount",
  "bloom-petals",
  "bloom-proto",
+ "bloom-test-util",
  "bloom-tools",
  "bloom-tx",
  "bloom-vfs",
@@ -2034,6 +2035,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "bloom-chain-types",
+ "bloom-test-util",
  "ethereum_ssz",
  "serde",
  "tempfile",
@@ -2053,6 +2055,7 @@ dependencies = [
  "bloom-chain-types",
  "bloom-keystore",
  "bloom-petals",
+ "bloom-test-util",
  "clap",
  "hex",
  "parking_lot 0.12.5",
@@ -2117,6 +2120,7 @@ dependencies = [
  "bloom-prices",
  "bloom-proto",
  "bloom-revert",
+ "bloom-test-util",
  "bloom-tools",
  "bloom-tx",
  "bloom-vfs",
@@ -2307,6 +2311,7 @@ dependencies = [
  "bloom-keystore",
  "bloom-proto",
  "bloom-revert",
+ "bloom-test-util",
  "bloom-tx",
  "bloom-vfs",
  "bloom-watch",
@@ -2498,6 +2503,23 @@ dependencies = [
  "tower",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "bloom-test-util"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "bloom-chain-consensus",
+ "bloom-chain-state",
+ "bloom-chain-types",
+ "bloom-keystore",
+ "bloom-vfs",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
