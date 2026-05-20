@@ -291,6 +291,54 @@ impl ConsensusState {
         self.on_proposal(p, blocks)
     }
 
+    /// Re-check precommit tallies for a freshly-registered block hash. If any
+    /// round at the current height has already reached 2f+1 precommits for
+    /// `hash` while we lacked the block body, emit the deferred `Commit`
+    /// action now.
+    ///
+    /// Without this, a validator that received the precommit quorum before
+    /// the matching block body (TCP reordering, restart, slow peer) records
+    /// the quorum in its tally but never emits `Action::Commit` — the
+    /// quorum-check in `on_vote` only fires on receipt of each individual
+    /// precommit, and `try_resume_pending_proposal` only replays the prevote
+    /// path. Called by the node after every `register_block`.
+    pub fn try_commit_with_block(
+        &mut self,
+        hash: Hash32,
+        blocks: &BTreeMap<Hash32, Block>,
+    ) -> Vec<Action> {
+        if self.step == Step::Commit {
+            return vec![];
+        }
+        let Some(block) = blocks.get(&hash) else {
+            return vec![];
+        };
+        let quorum = self.validator_set.quorum();
+        let matching_round = self.precommits.iter().find_map(|(round, tally)| {
+            matches!(tally.quorum_hash(quorum), Some(Some(qh)) if qh == hash).then_some(*round)
+        });
+        let Some(round) = matching_round else {
+            return vec![];
+        };
+        self.step = Step::Commit;
+        let commit_votes: Vec<Vote> = self
+            .all_precommit_votes
+            .get(&round)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|v| v.block_hash == Some(hash))
+            .collect();
+        let commit = Commit {
+            height: self.height,
+            round,
+            block_hash: hash,
+            votes: commit_votes,
+        };
+        self.committed_block = Some(block.clone());
+        vec![Action::Commit(Box::new(block.clone()), commit)]
+    }
+
     // ---------------------------------------------------------------------------
     // Main event handler
     // ---------------------------------------------------------------------------

@@ -125,7 +125,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             /// Build the topic list (TOPIC0 + each `#[indexed]` field's
             /// 32-byte topic) and the ABI-encoded data payload, then forward
-            /// to `ctx.emit_raw`.
+            /// to the host log import via `Context::__emit_raw`.
             pub fn emit(
                 &self,
                 ctx: &mut ::bloom_contract::context::Context,
@@ -139,7 +139,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #(#data_pushes)*
                 let data = enc.finish();
 
-                ctx.emit_raw(&topics, &data);
+                ctx.__emit_raw(&topics, &data);
                 ::core::result::Result::Ok(())
             }
         }

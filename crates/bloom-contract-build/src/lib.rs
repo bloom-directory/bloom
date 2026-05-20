@@ -27,9 +27,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use bloom_contract_metadata::{Limits, Manifest};
+use bloom_contract_metadata::{
+    CompilerInfo, ImportEntry, InterfaceManifest, Limits, Manifest, SCHEMA_VERSION, SlotAlgo,
+};
 use thiserror::Error;
-use wasmparser::{ExternalKind, Parser, Payload};
+use wasmparser::{ExternalKind, Parser, Payload, TypeRef, ValType};
 
 /// Output of a successful build.
 #[derive(Clone, Debug)]
@@ -168,8 +170,16 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
 /// artifact.
 #[derive(Clone, Debug)]
 pub struct WasmInspection {
-    /// `<module>.<name>` for every wasm import the module declares.
-    pub imports: Vec<String>,
+    /// Structured imports: `(module, name, signature)`. Signature is the
+    /// wasm function type formatted as `"(param tys) -> (result tys)"`,
+    /// or `None` for non-function imports (memories, tables, globals).
+    pub imports: Vec<ImportEntry>,
+    /// Interface metadata records extracted from the `bloom_interfaces`
+    /// custom section, if any. Each `#[bloom::interface]` declaration
+    /// emits one record there at link time so the build crate can
+    /// preserve the full method list in the manifest without re-running
+    /// the macro.
+    pub interface_records: Vec<InterfaceManifest>,
 }
 
 /// Hard caps for the deterministic profile (spec §10 + §11).
@@ -191,11 +201,19 @@ pub fn validate_wasm(bytes: &[u8]) -> Result<WasmInspection, BuildError> {
             bytes.len()
         )));
     }
-    let mut imports: Vec<String> = Vec::new();
+    let mut types: Vec<String> = Vec::new();
+    let mut imports: Vec<ImportEntry> = Vec::new();
+    let mut interface_records: Vec<InterfaceManifest> = Vec::new();
     let parser = Parser::new(0);
     for payload in parser.parse_all(bytes) {
         let payload = payload.map_err(|e| BuildError::Validation(e.to_string()))?;
         match payload {
+            Payload::TypeSection(reader) => {
+                for rec in reader.into_iter_err_on_gc_types() {
+                    let func = rec.map_err(|e| BuildError::Validation(e.to_string()))?;
+                    types.push(format_func_type(&func));
+                }
+            }
             Payload::ImportSection(reader) => {
                 for import in reader {
                     let import = import.map_err(|e| BuildError::Validation(e.to_string()))?;
@@ -205,7 +223,15 @@ pub fn validate_wasm(bytes: &[u8]) -> Result<WasmInspection, BuildError> {
                             import.module, import.name
                         )));
                     }
-                    imports.push(format!("{}.{}", import.module, import.name));
+                    let signature = match import.ty {
+                        TypeRef::Func(idx) => types.get(idx as usize).cloned(),
+                        _ => None,
+                    };
+                    imports.push(ImportEntry {
+                        module: import.module.into(),
+                        name: import.name.into(),
+                        signature,
+                    });
                 }
             }
             Payload::ExportSection(reader) => {
@@ -255,10 +281,82 @@ pub fn validate_wasm(bytes: &[u8]) -> Result<WasmInspection, BuildError> {
                     }
                 }
             }
+            Payload::CustomSection(reader) if reader.name() == "bloom_interfaces" => {
+                interface_records = parse_interface_records(reader.data())
+                    .map_err(|e| BuildError::Manifest(format!("bloom_interfaces: {e}")))?;
+            }
             _ => {}
         }
     }
-    Ok(WasmInspection { imports })
+    Ok(WasmInspection { imports, interface_records })
+}
+
+/// Render a wasm function type as `"(param_tys) -> (result_tys)"`.
+fn format_func_type(ft: &wasmparser::FuncType) -> String {
+    let mut s = String::new();
+    s.push('(');
+    let mut first = true;
+    for p in ft.params() {
+        if !first {
+            s.push(' ');
+        }
+        first = false;
+        s.push_str(val_type_str(p));
+    }
+    s.push_str(") -> (");
+    let mut first = true;
+    for r in ft.results() {
+        if !first {
+            s.push(' ');
+        }
+        first = false;
+        s.push_str(val_type_str(r));
+    }
+    s.push(')');
+    s
+}
+
+fn val_type_str(v: &ValType) -> &'static str {
+    match v {
+        ValType::I32 => "i32",
+        ValType::I64 => "i64",
+        ValType::F32 => "f32",
+        ValType::F64 => "f64",
+        ValType::V128 => "v128",
+        ValType::Ref(_) => "ref",
+    }
+}
+
+/// Decode a length-prefixed list of JSON `InterfaceManifest` records.
+///
+/// Wire form per record: `<u16-le len>` followed by `len` JSON bytes.
+/// `#[bloom::interface]` emits one such record per trait declaration via
+/// a `#[link_section = "bloom_interfaces"]` static; multiple records get
+/// concatenated by the linker.
+fn parse_interface_records(data: &[u8]) -> Result<Vec<InterfaceManifest>, String> {
+    let mut out: Vec<InterfaceManifest> = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        if i + 2 > data.len() {
+            return Err(format!("truncated length prefix at offset {i}"));
+        }
+        let len = u16::from_le_bytes([data[i], data[i + 1]]) as usize;
+        i += 2;
+        if i + len > data.len() {
+            return Err(format!(
+                "truncated record at offset {} (len {}, remaining {})",
+                i - 2,
+                len,
+                data.len() - i
+            ));
+        }
+        let rec_bytes = &data[i..i + len];
+        let rec: InterfaceManifest =
+            serde_json::from_slice(rec_bytes).map_err(|e| format!("decode record: {e}"))?;
+        out.push(rec);
+        i += len;
+    }
+    Ok(out)
 }
 
 /// Wasmparser's `Operator` enum carries one variant per opcode; the
@@ -288,33 +386,99 @@ pub fn extract_manifest_section(bytes: &[u8]) -> Result<Option<Vec<u8>>, BuildEr
     Ok(None)
 }
 
+/// Read every `InterfaceManifest` record embedded in `bloom_interfaces`.
+///
+/// Unlike [`validate_wasm`], this performs no determinism checks — just
+/// walks the wasm for the one custom section. Client-codegen tooling
+/// runs in less-constrained host contexts where the binary may already
+/// have been validated upstream.
+pub fn extract_interface_records(bytes: &[u8]) -> Result<Vec<InterfaceManifest>, BuildError> {
+    let parser = Parser::new(0);
+    for payload in parser.parse_all(bytes) {
+        let payload = payload.map_err(|e| BuildError::Manifest(e.to_string()))?;
+        if let Payload::CustomSection(reader) = payload {
+            if reader.name() == "bloom_interfaces" {
+                return parse_interface_records(reader.data())
+                    .map_err(|e| BuildError::Manifest(format!("bloom_interfaces: {e}")));
+            }
+        }
+    }
+    Ok(Vec::new())
+}
+
 // ===========================================================================
 // Manifest finalisation
 // ===========================================================================
 
 /// Decode the embedded manifest skeleton and fold in the runtime-derived
-/// fields (`wasm_hash`, `source_hash`, `imports`, `limits`).
+/// fields:
+///
+/// - `wasm_hash` / `source_hash` come from the freshly-built artifact.
+/// - `imports` is the structured `(module, name, signature)` triple the
+///   wasm actually links — exact import verification means the build
+///   crate, not the macro, owns this field.
+/// - `interfaces` are the records the `#[bloom::interface]` macro embeds
+///   in the `bloom_interfaces` custom section; the contract macro emits
+///   only their names in the skeleton, and we resolve them to full
+///   `InterfaceManifest` records here so the manifest carries the
+///   complete method list.
+/// - `compiler` is `rustc --version` + framework version + target triple
+///   gathered by `emit_artifacts`.
+///
+/// Schema-version is forced to the current `SCHEMA_VERSION` so older
+/// macro skeletons (still emitting v1) are normalised on the way out.
 pub fn finalise_manifest(
     skeleton: &[u8],
     wasm_hash_hex: String,
     source_hash_hex: String,
-    imports: Vec<String>,
+    imports: Vec<ImportEntry>,
+    interface_records: Vec<InterfaceManifest>,
+    compiler: CompilerInfo,
 ) -> Result<Manifest, BuildError> {
     // The skeleton carries extra keys the on-disk schema doesn't model
-    // yet (e.g. `interfaces`, `signature` on events/errors). Decode via
-    // `serde_json::Value` first so unknown keys round-trip without
-    // exploding when the schema grows.
+    // (`signature` on events/errors, `kind` object on storage fields).
+    // Decode via `serde_json::Value` first so we can normalise before
+    // handing to `serde_json::from_value`.
     let mut value: serde_json::Value = serde_json::from_slice(skeleton)
         .map_err(|e| BuildError::Manifest(format!("skeleton JSON: {e}")))?;
     let obj = value
         .as_object_mut()
         .ok_or_else(|| BuildError::Manifest("skeleton root is not an object".into()))?;
+
+    obj.insert(
+        "schema_version".into(),
+        serde_json::Value::Number(SCHEMA_VERSION.into()),
+    );
     obj.insert("wasm_hash".into(), serde_json::Value::String(wasm_hash_hex));
     obj.insert("source_hash".into(), serde_json::Value::String(source_hash_hex));
     obj.insert(
         "imports".into(),
-        serde_json::Value::Array(imports.into_iter().map(serde_json::Value::String).collect()),
+        serde_json::to_value(&imports).map_err(|e| BuildError::Manifest(e.to_string()))?,
     );
+    obj.insert(
+        "compiler".into(),
+        serde_json::to_value(&compiler).map_err(|e| BuildError::Manifest(e.to_string()))?,
+    );
+
+    // Resolve declared interface names to the full records emitted by
+    // `#[bloom::interface]` (carrying domain + method descriptors). The
+    // skeleton lists only names — the build crate is the only stage that
+    // sees the wasm custom section.
+    let declared_names = take_interface_names(obj);
+    let resolved = resolve_interfaces(&declared_names, &interface_records)?;
+    obj.insert(
+        "interfaces".into(),
+        serde_json::to_value(&resolved).map_err(|e| BuildError::Manifest(e.to_string()))?,
+    );
+
+    if let Some(storage) = obj.get_mut("storage").and_then(|v| v.as_object_mut()) {
+        if let Some(fields) = storage.get_mut("fields").and_then(|v| v.as_array_mut()) {
+            for entry in fields {
+                normalise_storage_field(entry)?;
+            }
+        }
+    }
+
     // Limits aren't user-configurable yet; force the on-disk default.
     let limits = Limits::default();
     obj.insert(
@@ -325,6 +489,113 @@ pub fn finalise_manifest(
     let manifest: Manifest = serde_json::from_value(value)
         .map_err(|e| BuildError::Manifest(format!("decode finalised manifest: {e}")))?;
     Ok(manifest)
+}
+
+/// Extract the skeleton's `interfaces: [name, ...]` array, leaving the
+/// key absent so the structured replacement can be inserted by the
+/// caller. Tolerates missing/empty/non-string entries — anything the
+/// macro can't supply at expansion time is simply skipped.
+fn take_interface_names(obj: &mut serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    let raw = obj.remove("interfaces");
+    let arr = match raw {
+        Some(serde_json::Value::Array(a)) => a,
+        _ => return Vec::new(),
+    };
+    arr.into_iter()
+        .filter_map(|v| match v {
+            serde_json::Value::String(s) => Some(s),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Match the contract's declared interfaces against the records the
+/// `#[bloom::interface]` macro embedded in the wasm. Order follows the
+/// declaration order; missing records are an error — the build crate
+/// can't synthesise method descriptors on its own.
+fn resolve_interfaces(
+    declared: &[String],
+    records: &[InterfaceManifest],
+) -> Result<Vec<InterfaceManifest>, BuildError> {
+    let mut out = Vec::with_capacity(declared.len());
+    for name in declared {
+        let rec = records.iter().find(|r| &r.name == name).ok_or_else(|| {
+            BuildError::Manifest(format!(
+                "interface `{name}` declared by contract but no `bloom_interfaces` record found"
+            ))
+        })?;
+        out.push(rec.clone());
+    }
+    Ok(out)
+}
+
+/// Convert macro-emitted storage entries (`kind: {kind, ty, key_ty, ...}`)
+/// to the on-disk shape (`ty: "<canonical>"`, `slot_algorithm: SlotAlgo`).
+///
+/// We compute `slot_algorithm` from the macro-emitted hints when present
+/// (`kind.kind == "map"` ⇒ `blake3-map-v1`, `compat_tag` ⇒
+/// `blake3-compat-v1`, etc.) and default the rest to `blake3-storage-v1`.
+fn normalise_storage_field(entry: &mut serde_json::Value) -> Result<(), BuildError> {
+    let obj = entry.as_object_mut().ok_or_else(|| {
+        BuildError::Manifest("storage field entry is not an object".into())
+    })?;
+
+    let has_compat = obj.contains_key("compat_tag");
+    let kind = obj.remove("kind");
+
+    let (ty_string, algo) = match kind {
+        Some(serde_json::Value::Object(k)) => {
+            let kind_tag = k.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let algo = match (kind_tag, has_compat) {
+                ("map", true) => SlotAlgo::MAP_COMPAT_V1,
+                ("map", false) => SlotAlgo::MAP_V1,
+                ("vec", _) => SlotAlgo::VEC_V1,
+                (_, true) => SlotAlgo::COMPAT_V1,
+                _ => SlotAlgo::STORAGE_V1,
+            };
+            let ty = match kind_tag {
+                "scalar" => k
+                    .get("ty")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                "map" => format!(
+                    "map<{},{}>",
+                    k.get("key_ty").and_then(|v| v.as_str()).unwrap_or("?"),
+                    k.get("value_ty").and_then(|v| v.as_str()).unwrap_or("?"),
+                ),
+                "vec" => format!(
+                    "vec<{}>",
+                    k.get("ty").and_then(|v| v.as_str()).unwrap_or("?"),
+                ),
+                _ => k
+                    .get("ty")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+            };
+            (ty, algo)
+        }
+        // Macro already emitted the canonical shape (`ty: String`).
+        _ => {
+            let existing = obj
+                .get("ty")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
+            let algo = if has_compat { SlotAlgo::COMPAT_V1 } else { SlotAlgo::STORAGE_V1 };
+            (existing, algo)
+        }
+    };
+
+    obj.insert("ty".into(), serde_json::Value::String(ty_string));
+    if !obj.contains_key("slot_algorithm") {
+        obj.insert(
+            "slot_algorithm".into(),
+            serde_json::json!({ "version": 1, "rule": algo }),
+        );
+    }
+    Ok(())
 }
 
 /// Verify a published manifest matches a wasm: hashes line up and the
@@ -342,10 +613,29 @@ pub fn verify_manifest_against_wasm(manifest: &Manifest, wasm: &[u8]) -> Result<
     }
     let insp = validate_wasm(wasm)?;
     for live in &insp.imports {
-        if !manifest.imports.iter().any(|m| m == live) {
-            return Err(BuildError::Manifest(format!(
-                "wasm imports `{live}` but manifest does not declare it"
-            )));
+        let declared = manifest
+            .imports
+            .iter()
+            .find(|m| m.module == live.module && m.name == live.name);
+        let declared = match declared {
+            Some(d) => d,
+            None => {
+                return Err(BuildError::Manifest(format!(
+                    "wasm imports `{}.{}` but manifest does not declare it",
+                    live.module, live.name
+                )));
+            }
+        };
+        // If the manifest pins a signature, the wasm must match it. A
+        // missing signature on either side is treated as a wildcard — older
+        // (v1) manifests didn't capture this field at all.
+        if let (Some(want), Some(got)) = (&declared.signature, &live.signature) {
+            if want != got {
+                return Err(BuildError::Manifest(format!(
+                    "import `{}.{}` signature mismatch: manifest={} wasm={}",
+                    live.module, live.name, want, got
+                )));
+            }
         }
     }
     Ok(())
@@ -468,6 +758,8 @@ pub fn emit_artifacts(crate_dir: &Path, out_dir: &Path, profile: Profile) -> Res
         wasm_hash_hex.clone(),
         source_hash_hex.clone(),
         inspection.imports,
+        inspection.interface_records,
+        detect_compiler_info(),
     )?;
 
     let name = manifest.contract.name.replace('-', "_");
@@ -489,6 +781,40 @@ pub fn emit_artifacts(crate_dir: &Path, out_dir: &Path, profile: Profile) -> Res
         wasm_path,
         manifest_path,
     })
+}
+
+// ===========================================================================
+// Compiler provenance
+// ===========================================================================
+
+/// Gather build-time provenance for the manifest's `compiler` block.
+///
+/// `rustc` is detected by running `rustc --version` (trimmed); failure
+/// falls back to an empty string rather than aborting the build — the
+/// build can succeed without provenance, the manifest just records less.
+/// `framework_version` is this crate's `CARGO_PKG_VERSION`, which moves
+/// in lockstep with `bloom-contract` since they share a workspace
+/// `[package].version`. `target` is fixed at `wasm32-unknown-unknown`
+/// because the build pipeline only emits petals.
+fn detect_compiler_info() -> CompilerInfo {
+    let rustc = Command::new("rustc")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|out| {
+            if out.status.success() {
+                String::from_utf8(out.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    CompilerInfo {
+        rustc,
+        framework_version: env!("CARGO_PKG_VERSION").to_string(),
+        target: "wasm32-unknown-unknown".to_string(),
+    }
 }
 
 // ===========================================================================
@@ -568,7 +894,36 @@ mod tests {
         )
         .unwrap();
         let insp = validate_wasm(&bytes).unwrap();
-        assert_eq!(insp.imports, vec!["chain.state_read".to_string()]);
+        assert_eq!(insp.imports.len(), 1);
+        assert_eq!(insp.imports[0].module, "chain");
+        assert_eq!(insp.imports[0].name, "state_read");
+        // Function signature is recorded so the manifest can verify it.
+        assert_eq!(
+            insp.imports[0].signature.as_deref(),
+            Some("(i32 i32 i32) -> ()"),
+        );
+    }
+
+    #[test]
+    fn validate_wasm_extracts_interface_records() {
+        // Wire form: <u16-le len><JSON> per record, concatenated.
+        let rec1 =
+            r#"{"name":"Erc20","domain":"erc20","methods":[]}"#;
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&(rec1.len() as u16).to_le_bytes());
+        blob.extend_from_slice(rec1.as_bytes());
+        // `(@custom)` in wat doesn't take binary, but it does take a
+        // string with escapes — encode raw bytes via \xx escapes.
+        let mut wat = String::from("(module (@custom \"bloom_interfaces\" \"");
+        for b in &blob {
+            wat.push_str(&format!("\\{:02x}", b));
+        }
+        wat.push_str("\"))");
+        let bytes = wat::parse_str(&wat).unwrap();
+        let insp = validate_wasm(&bytes).unwrap();
+        assert_eq!(insp.interface_records.len(), 1);
+        assert_eq!(insp.interface_records[0].name, "Erc20");
+        assert_eq!(insp.interface_records[0].domain, "erc20");
     }
 
     #[test]
@@ -617,7 +972,81 @@ mod tests {
 
     #[test]
     fn finalise_manifest_round_trips_through_serde() {
-        // Construct a minimal skeleton with the fields the macro emits.
+        // Skeleton mirrors what `#[bloom::contract]` emits — note the
+        // legacy storage `kind: {kind, ty}` shape; `finalise_manifest`
+        // normalises it to the on-disk `ty: String` form.
+        let skeleton = serde_json::json!({
+            "schema_version": 1,
+            "contract": { "name": "demo", "domain": "demo", "version": "0.1.0" },
+            "abi": { "methods": [] },
+            "storage": {
+                "fields": [
+                    { "name": "owner", "kind": { "kind": "scalar", "ty": "address" }, "slot": "00".repeat(32) },
+                    {
+                        "name": "balances",
+                        "kind": { "kind": "map", "key_ty": "address", "value_ty": "u256" },
+                        "slot": "00".repeat(32),
+                    },
+                ]
+            },
+            "events": [],
+            "errors": [],
+            "interfaces": ["Erc20"],
+            "imports": [],
+            "limits": { "max_memory_pages": 0, "max_wasm_bytes": 0 },
+            "wasm_hash": "",
+            "source_hash": "",
+        });
+        let bytes = serde_json::to_vec(&skeleton).unwrap();
+        let imports = vec![
+            ImportEntry {
+                module: "chain".into(),
+                name: "state_read".into(),
+                signature: Some("(i32 i32) -> (i32)".into()),
+            },
+            ImportEntry {
+                module: "chain".into(),
+                name: "state_write".into(),
+                signature: None,
+            },
+        ];
+        let records = vec![InterfaceManifest {
+            name: "Erc20".into(),
+            domain: "erc20".into(),
+            methods: vec![],
+        }];
+        let compiler = CompilerInfo {
+            rustc: "rustc test".into(),
+            framework_version: "0.1.0".into(),
+            target: "wasm32-unknown-unknown".into(),
+        };
+        let m = finalise_manifest(
+            &bytes,
+            "aa".repeat(32),
+            "bb".repeat(32),
+            imports.clone(),
+            records.clone(),
+            compiler.clone(),
+        )
+        .unwrap();
+        assert_eq!(m.schema_version, SCHEMA_VERSION);
+        assert_eq!(m.contract.name, "demo");
+        assert_eq!(m.wasm_hash, "aa".repeat(32));
+        assert_eq!(m.source_hash, "bb".repeat(32));
+        assert_eq!(m.imports, imports);
+        assert_eq!(m.interfaces, records);
+        assert_eq!(m.compiler, compiler);
+        // Storage normalisation: scalar → ty, map → ty + map-v1 algo.
+        assert_eq!(m.storage.fields[0].ty, "address");
+        assert_eq!(m.storage.fields[0].slot_algorithm.rule, SlotAlgo::STORAGE_V1);
+        assert_eq!(m.storage.fields[1].ty, "map<address,u256>");
+        assert_eq!(m.storage.fields[1].slot_algorithm.rule, SlotAlgo::MAP_V1);
+        assert_eq!(m.limits.max_memory_pages, 256);
+        assert_eq!(m.limits.max_wasm_bytes, 262_144);
+    }
+
+    #[test]
+    fn finalise_manifest_errors_on_unresolved_interface() {
         let skeleton = serde_json::json!({
             "schema_version": 1,
             "contract": { "name": "demo", "domain": "demo", "version": "0.1.0" },
@@ -625,50 +1054,30 @@ mod tests {
             "storage": { "fields": [] },
             "events": [],
             "errors": [],
-            "interfaces": [],
+            "interfaces": ["Erc20"],
             "imports": [],
             "limits": { "max_memory_pages": 0, "max_wasm_bytes": 0 },
             "wasm_hash": "",
             "source_hash": "",
         });
         let bytes = serde_json::to_vec(&skeleton).unwrap();
-        let m = finalise_manifest(
+        let err = finalise_manifest(
             &bytes,
             "aa".repeat(32),
             "bb".repeat(32),
-            vec!["chain.state_read".into(), "chain.state_write".into()],
+            vec![],
+            vec![],
+            CompilerInfo::default(),
         )
-        .unwrap();
-        assert_eq!(m.contract.name, "demo");
-        assert_eq!(m.wasm_hash, "aa".repeat(32));
-        assert_eq!(m.source_hash, "bb".repeat(32));
-        assert_eq!(
-            m.imports,
-            vec!["chain.state_read".to_string(), "chain.state_write".to_string()]
-        );
-        assert_eq!(m.limits.max_memory_pages, 256);
-        assert_eq!(m.limits.max_wasm_bytes, 262_144);
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Erc20"), "got: {msg}");
     }
 
     #[test]
     fn verify_manifest_rejects_mismatched_hash() {
         let wasm = wat::parse_str("(module)").unwrap();
-        let manifest = Manifest {
-            schema_version: 1,
-            contract: bloom_contract_metadata::ContractMeta {
-                name: "demo".into(),
-                domain: "demo".into(),
-                version: "0.1.0".into(),
-            },
-            abi: Default::default(),
-            storage: Default::default(),
-            events: vec![],
-            errors: vec![],
-            imports: vec![],
-            limits: Limits::default(),
-            wasm_hash: "00".repeat(32),
-            source_hash: "11".repeat(32),
-        };
+        let manifest = demo_manifest("00".repeat(32), "11".repeat(32));
         let err = verify_manifest_against_wasm(&manifest, &wasm).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("wasm_hash mismatch"), "got: {msg}");
@@ -676,27 +1085,16 @@ mod tests {
 
     #[test]
     fn manifest_hash_is_deterministic() {
-        let m = Manifest {
-            schema_version: 1,
-            contract: bloom_contract_metadata::ContractMeta {
-                name: "demo".into(),
-                domain: "demo".into(),
-                version: "0.1.0".into(),
-            },
-            abi: Default::default(),
-            storage: Default::default(),
-            events: vec![],
-            errors: vec![],
-            imports: vec!["chain.state.read".into()],
-            limits: Limits::default(),
-            wasm_hash: "aa".repeat(32),
-            source_hash: "bb".repeat(32),
-        };
+        let mut m = demo_manifest("aa".repeat(32), "bb".repeat(32));
+        m.imports = vec![ImportEntry {
+            module: "chain".into(),
+            name: "state_read".into(),
+            signature: None,
+        }];
         let h1 = manifest_hash(&m);
         let h2 = manifest_hash(&m);
         assert_eq!(h1, h2);
 
-        // Changing any field changes the hash.
         let mut m2 = m.clone();
         m2.wasm_hash = "cc".repeat(32);
         assert_ne!(manifest_hash(&m), manifest_hash(&m2));
@@ -705,22 +1103,47 @@ mod tests {
     #[test]
     fn verify_manifest_accepts_matching_hash() {
         let wasm = wat::parse_str("(module)").unwrap();
-        let manifest = Manifest {
-            schema_version: 1,
+        let manifest = demo_manifest(hex_encode(&wasm_hash(&wasm)), "11".repeat(32));
+        verify_manifest_against_wasm(&manifest, &wasm).unwrap();
+    }
+
+    #[test]
+    fn verify_manifest_flags_signature_drift() {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "chain" "state_read" (func (param i32 i32 i32))))"#,
+        )
+        .unwrap();
+        let mut manifest = demo_manifest(hex_encode(&wasm_hash(&wasm)), "11".repeat(32));
+        manifest.imports = vec![ImportEntry {
+            module: "chain".into(),
+            name: "state_read".into(),
+            // Drift: wasm has 3-arg signature, manifest claims 2-arg.
+            signature: Some("(i32 i32) -> (i32)".into()),
+        }];
+        let err = verify_manifest_against_wasm(&manifest, &wasm).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("signature mismatch"), "got: {msg}");
+    }
+
+    fn demo_manifest(wasm_hash_hex: String, source_hash_hex: String) -> Manifest {
+        Manifest {
+            schema_version: SCHEMA_VERSION,
             contract: bloom_contract_metadata::ContractMeta {
                 name: "demo".into(),
                 domain: "demo".into(),
                 version: "0.1.0".into(),
             },
+            compiler: CompilerInfo::default(),
             abi: Default::default(),
             storage: Default::default(),
             events: vec![],
             errors: vec![],
+            interfaces: vec![],
             imports: vec![],
             limits: Limits::default(),
-            wasm_hash: hex_encode(&wasm_hash(&wasm)),
-            source_hash: "11".repeat(32),
-        };
-        verify_manifest_against_wasm(&manifest, &wasm).unwrap();
+            wasm_hash: wasm_hash_hex,
+            source_hash: source_hash_hex,
+        }
     }
 }

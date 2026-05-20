@@ -142,7 +142,7 @@ pub fn build_skeleton_json(
     let interface_names: Vec<String> = interfaces.iter().map(|i| i.to_string()).collect();
 
     let manifest = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "contract": {
             "name": module.ident.to_string(),
             "domain": domain,
@@ -152,6 +152,11 @@ pub fn build_skeleton_json(
         "storage": { "fields": storage_fields },
         "events": event_entries,
         "errors": error_entries,
+        // Macro can't resolve `<I as ContractInterface>::METHODS` at
+        // expansion time (consts are link-time). It emits just the
+        // declared trait names here; the build crate resolves each name
+        // to a full `InterfaceManifest` record by reading the
+        // `bloom_interfaces` custom section the interface macro embedded.
         "interfaces": interface_names,
         "imports": [],
         "limits": { "max_memory_pages": 256, "max_wasm_bytes": 262144 },

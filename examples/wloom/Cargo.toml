@@ -17,7 +17,11 @@ crate-type = ["cdylib", "rlib"]
 bloom-contract = { workspace = true, default-features = false }
 bloom-chain-abi = { workspace = true, default-features = false }
 bloom-petal-sdk = { workspace = true }
-bloom-dex-erc20 = { path = "../dex/crates/bloom-dex-erc20", default-features = false }
+bloom-dex-erc20 = { path = "../dex/crates/bloom-dex-erc20", default-features = false, features = ["no-entrypoint"] }
+
+[features]
+# See bloom-dex-erc20/Cargo.toml for rationale.
+no-entrypoint = []
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 blake3 = { version = "1", default-features = false }

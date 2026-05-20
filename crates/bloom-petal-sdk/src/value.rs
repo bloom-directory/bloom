@@ -109,6 +109,28 @@ impl From<LoomValue> for u128 {
     }
 }
 
+// `LoomValue` ↔ `U256` bridge.
+//
+// LoomValue is `u128`-wide; the ABI surface uses `U256`. Widening is
+// infallible; narrowing is fallible because a `U256` above `u128::MAX`
+// has no native LOOM representation.
+
+impl From<LoomValue> for bloom_chain_abi::U256 {
+    #[inline]
+    fn from(v: LoomValue) -> Self {
+        bloom_chain_abi::U256::from_u128(v.0)
+    }
+}
+
+impl core::convert::TryFrom<bloom_chain_abi::U256> for LoomValue {
+    type Error = LoomValueError;
+
+    #[inline]
+    fn try_from(v: bloom_chain_abi::U256) -> core::result::Result<Self, Self::Error> {
+        LoomValue::try_from_be_u256_bytes(&v.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -45,10 +45,10 @@ use alloc::vec::Vec;
 
 use bloom_contract::context::LoomValue;
 use bloom_contract::prelude::*;
-use bloom_dex_erc20::calls as erc20_calls;
-use bloom_dex_factory::calls as factory_calls;
-use bloom_dex_pair::calls as pair_calls;
-use bloom_dex_wloom::calls as wloom_calls;
+use bloom_dex_erc20::{Erc20, Erc20Calls};
+use bloom_dex_factory::{Factory, FactoryCalls};
+use bloom_dex_pair::{Pair, PairCalls};
+use bloom_dex_wloom::{Wloom, WloomCalls};
 
 // ---------------------------------------------------------------------------
 // Router interface — DEX spec §4.1 surface.
@@ -288,7 +288,6 @@ pub fn compute_liquidity_amounts(
 #[bloom_contract::contract(domain = "router", interfaces(Router))]
 pub mod router {
     use super::*;
-    use bloom_petal_sdk::value::LoomValue as SdkLoomValue;
 
     // -----------------------------------------------------------------------
     // Storage — three Address scalars with compat_tag slots preserved from
@@ -312,9 +311,9 @@ pub mod router {
     #[init]
     pub fn init(ctx: &mut Context, cfg: InitConfig) -> Result<()> {
         let state = State::load(ctx)?;
-        state.factory.store(&cfg.factory_addr);
-        state.wloom.store(&cfg.wloom_addr);
-        state.self_addr.store(&cfg.router_self_addr);
+        state.factory.store(ctx, &cfg.factory_addr);
+        state.wloom.store(ctx, &cfg.wloom_addr);
+        state.self_addr.store(ctx, &cfg.router_self_addr);
         Ok(())
     }
 
@@ -363,7 +362,7 @@ pub mod router {
         amount_in: U256,
         path: Vec<Address>,
     ) -> Result<Vec<U256>> {
-        let factory = State::load(ctx)?.factory.load();
+        let factory = State::load(ctx)?.factory.load(ctx);
         compute_amounts_out(ctx, &factory, amount_in, &path)
     }
 
@@ -372,7 +371,7 @@ pub mod router {
         amount_out: U256,
         path: Vec<Address>,
     ) -> Result<Vec<U256>> {
-        let factory = State::load(ctx)?.factory.load();
+        let factory = State::load(ctx)?.factory.load(ctx);
         compute_amounts_in(ctx, &factory, amount_out, &path)
     }
 
@@ -393,7 +392,7 @@ pub mod router {
     ) -> Result<(U256, U256, U256)> {
         check_deadline(ctx, deadline)?;
 
-        let factory = State::load(ctx)?.factory.load();
+        let factory = State::load(ctx)?.factory.load(ctx);
         let pair = ensure_pair(ctx, &factory, &token_a, &token_b)?;
 
         let (reserve_a, reserve_b) = reserves_in_order(ctx, &pair, &token_a)?;
@@ -428,11 +427,11 @@ pub mod router {
         check_deadline(ctx, deadline)?;
 
         let state = State::load(ctx)?;
-        let factory = state.factory.load();
-        let wloom = state.wloom.load();
+        let factory = state.factory.load(ctx);
+        let wloom = state.wloom.load(ctx);
 
         let value = ctx.value();
-        let amount_loom_desired = U256::from_u128(value.to_u128());
+        let amount_loom_desired = U256::from(value);
 
         // Wrap all msg.value into wLOOM (minted to router).
         wloom_deposit(ctx, &wloom, value)?;
@@ -452,8 +451,8 @@ pub mod router {
         token_transfer_from(ctx, &token, &sender, &pair, amount_token)?;
 
         // Router already holds the wrapped LOOM — transfer it onward to the pair.
-        let cd = erc20_calls::transfer(pair.as_bytes(), amount_loom);
-        ctx.raw_call(&wloom, &cd, LoomValue::ZERO)
+        ctx.call::<Erc20>(wloom)
+            .transfer(ctx, pair, amount_loom)
             .map_err(|_| ContractError::from_str("router: wloom transfer to pair failed"))?;
 
         let liquidity = pair_mint(ctx, &pair, &to)?;
@@ -481,7 +480,7 @@ pub mod router {
     ) -> Result<(U256, U256)> {
         check_deadline(ctx, deadline)?;
 
-        let factory = State::load(ctx)?.factory.load();
+        let factory = State::load(ctx)?.factory.load(ctx);
         let pair = factory_get_pair(ctx, &factory, &token_a, &token_b)?;
         if pair == Address::ZERO {
             return Err(ContractError::from_str(
@@ -526,9 +525,9 @@ pub mod router {
         check_deadline(ctx, deadline)?;
 
         let state = State::load(ctx)?;
-        let factory = state.factory.load();
-        let wloom = state.wloom.load();
-        let router_self = state.self_addr.load();
+        let factory = state.factory.load(ctx);
+        let wloom = state.wloom.load(ctx);
+        let router_self = state.self_addr.load(ctx);
 
         let pair = factory_get_pair(ctx, &factory, &token, &wloom)?;
         if pair == Address::ZERO {
@@ -561,8 +560,8 @@ pub mod router {
         }
 
         // Forward tokens directly to `to`.
-        let cd = erc20_calls::transfer(to.as_bytes(), amount_token);
-        ctx.raw_call(&token, &cd, LoomValue::ZERO)
+        ctx.call::<Erc20>(token)
+            .transfer(ctx, to, amount_token)
             .map_err(|_| ContractError::from_str("router: token transfer to `to` failed"))?;
 
         wloom_withdraw(ctx, &wloom, amount_wloom)?;
@@ -585,7 +584,7 @@ pub mod router {
     ) -> Result<Vec<U256>> {
         check_deadline(ctx, deadline)?;
 
-        let factory = State::load(ctx)?.factory.load();
+        let factory = State::load(ctx)?.factory.load(ctx);
         let amounts = compute_amounts_out(ctx, &factory, amount_in, &path)?;
 
         let last = *amounts
@@ -621,7 +620,7 @@ pub mod router {
     ) -> Result<Vec<U256>> {
         check_deadline(ctx, deadline)?;
 
-        let factory = State::load(ctx)?.factory.load();
+        let factory = State::load(ctx)?.factory.load(ctx);
         let amounts = compute_amounts_in(ctx, &factory, amount_out, &path)?;
 
         if amounts[0] > amount_in_max {
@@ -655,8 +654,8 @@ pub mod router {
         check_deadline(ctx, deadline)?;
 
         let state = State::load(ctx)?;
-        let wloom = state.wloom.load();
-        let factory = state.factory.load();
+        let wloom = state.wloom.load(ctx);
+        let factory = state.factory.load(ctx);
 
         if path.is_empty() || path[0] != wloom {
             return Err(ContractError::from_str(
@@ -665,7 +664,7 @@ pub mod router {
         }
 
         let value = ctx.value();
-        let amount_in = U256::from_u128(value.to_u128());
+        let amount_in = U256::from(value);
 
         wloom_deposit(ctx, &wloom, value)?;
 
@@ -685,8 +684,8 @@ pub mod router {
                 "router: swapExactLOOM: first pair not found",
             ));
         }
-        let cd = erc20_calls::transfer(first_pair.as_bytes(), amounts[0]);
-        ctx.raw_call(&wloom, &cd, LoomValue::ZERO)
+        ctx.call::<Erc20>(wloom)
+            .transfer(ctx, first_pair, amounts[0])
             .map_err(|_| ContractError::from_str("router: wloom transfer failed"))?;
 
         internal_swap(ctx, &factory, &amounts, &path, &to)?;
@@ -705,9 +704,9 @@ pub mod router {
         check_deadline(ctx, deadline)?;
 
         let state = State::load(ctx)?;
-        let wloom = state.wloom.load();
-        let factory = state.factory.load();
-        let router_self = state.self_addr.load();
+        let wloom = state.wloom.load(ctx);
+        let factory = state.factory.load(ctx);
+        let router_self = state.self_addr.load(ctx);
 
         if path.is_empty() || *path.last().unwrap() != wloom {
             return Err(ContractError::from_str(
@@ -752,9 +751,9 @@ pub mod router {
         check_deadline(ctx, deadline)?;
 
         let state = State::load(ctx)?;
-        let wloom = state.wloom.load();
-        let factory = state.factory.load();
-        let router_self = state.self_addr.load();
+        let wloom = state.wloom.load(ctx);
+        let factory = state.factory.load(ctx);
+        let router_self = state.self_addr.load(ctx);
 
         if path.is_empty() || *path.last().unwrap() != wloom {
             return Err(ContractError::from_str(
@@ -800,8 +799,8 @@ pub mod router {
         check_deadline(ctx, deadline)?;
 
         let state = State::load(ctx)?;
-        let wloom = state.wloom.load();
-        let factory = state.factory.load();
+        let wloom = state.wloom.load(ctx);
+        let factory = state.factory.load(ctx);
 
         if path.is_empty() || path[0] != wloom {
             return Err(ContractError::from_str(
@@ -810,7 +809,7 @@ pub mod router {
         }
 
         let value = ctx.value();
-        let msg_value = U256::from_u128(value.to_u128());
+        let msg_value = U256::from(value);
 
         let amounts = compute_amounts_in(ctx, &factory, amount_out, &path)?;
         let loom_needed = amounts[0];
@@ -829,8 +828,8 @@ pub mod router {
                 "router: swapLOOMForExact: first pair not found",
             ));
         }
-        let cd = erc20_calls::transfer(first_pair.as_bytes(), loom_needed);
-        ctx.raw_call(&wloom, &cd, LoomValue::ZERO)
+        ctx.call::<Erc20>(wloom)
+            .transfer(ctx, first_pair, loom_needed)
             .map_err(|_| ContractError::from_str("router: wloom transfer failed"))?;
 
         internal_swap(ctx, &factory, &amounts, &path, &to)?;
@@ -864,11 +863,9 @@ pub mod router {
         token_a: &Address,
         token_b: &Address,
     ) -> Result<Address> {
-        let cd = factory_calls::get_pair(token_a.as_bytes(), token_b.as_bytes());
-        let ret = ctx
-            .raw_call(factory, &cd, LoomValue::ZERO)
-            .map_err(|_| ContractError::from_str("router: factory.get_pair failed"))?;
-        decode_addr(&ret, "router: factory.get_pair bad return")
+        ctx.call::<Factory>(*factory)
+            .get_pair(ctx, *token_a, *token_b)
+            .map_err(|_| ContractError::from_str("router: factory.get_pair failed"))
     }
 
     pub(crate) fn factory_create_pair(
@@ -877,11 +874,9 @@ pub mod router {
         token_a: &Address,
         token_b: &Address,
     ) -> Result<Address> {
-        let cd = factory_calls::create_pair(token_a.as_bytes(), token_b.as_bytes());
-        let ret = ctx
-            .raw_call(factory, &cd, LoomValue::ZERO)
-            .map_err(|_| ContractError::from_str("router: factory.create_pair failed"))?;
-        decode_addr(&ret, "router: factory.create_pair bad return")
+        ctx.call::<Factory>(*factory)
+            .create_pair(ctx, *token_a, *token_b)
+            .map_err(|_| ContractError::from_str("router: factory.create_pair failed"))
     }
 
     pub(crate) fn ensure_pair(
@@ -902,26 +897,17 @@ pub mod router {
         ctx: &mut Context,
         pair: &Address,
     ) -> Result<(u128, u128)> {
-        let cd = pair_calls::get_reserves();
-        let ret = ctx
-            .raw_call(pair, &cd, LoomValue::ZERO)
+        let (r0, r1, _ts) = ctx
+            .call::<Pair>(*pair)
+            .get_reserves(ctx)
             .map_err(|_| ContractError::from_str("router: pair.get_reserves failed"))?;
-        if ret.len() < 32 {
-            return Err(ContractError::from_str("router: pair.get_reserves bad return"));
-        }
-        let mut r0 = [0u8; 16];
-        let mut r1 = [0u8; 16];
-        r0.copy_from_slice(&ret[..16]);
-        r1.copy_from_slice(&ret[16..32]);
-        Ok((u128::from_be_bytes(r0), u128::from_be_bytes(r1)))
+        Ok((r0, r1))
     }
 
     pub(crate) fn pair_token0(ctx: &mut Context, pair: &Address) -> Result<Address> {
-        let cd = pair_calls::token0();
-        let ret = ctx
-            .raw_call(pair, &cd, LoomValue::ZERO)
-            .map_err(|_| ContractError::from_str("router: pair.token0 failed"))?;
-        decode_addr(&ret, "router: pair.token0 bad return")
+        ctx.call::<Pair>(*pair)
+            .token0(ctx)
+            .map_err(|_| ContractError::from_str("router: pair.token0 failed"))
     }
 
     pub(crate) fn token_transfer_from(
@@ -931,8 +917,8 @@ pub mod router {
         to: &Address,
         amount: U256,
     ) -> Result<()> {
-        let cd = erc20_calls::transfer_from(from.as_bytes(), to.as_bytes(), amount);
-        ctx.raw_call(token, &cd, LoomValue::ZERO)
+        ctx.call::<Erc20>(*token)
+            .transfer_from(ctx, *from, *to, amount)
             .map_err(|_| ContractError::from_str("router: transferFrom failed"))?;
         Ok(())
     }
@@ -942,11 +928,9 @@ pub mod router {
         pair: &Address,
         to: &Address,
     ) -> Result<U256> {
-        let cd = pair_calls::mint(to.as_bytes());
-        let ret = ctx
-            .raw_call(pair, &cd, LoomValue::ZERO)
-            .map_err(|_| ContractError::from_str("router: pair.mint failed"))?;
-        decode_u256(&ret, "router: pair.mint bad return")
+        ctx.call::<Pair>(*pair)
+            .mint(ctx, *to)
+            .map_err(|_| ContractError::from_str("router: pair.mint failed"))
     }
 
     pub(crate) fn pair_burn(
@@ -954,18 +938,9 @@ pub mod router {
         pair: &Address,
         to: &Address,
     ) -> Result<(U256, U256)> {
-        let cd = pair_calls::burn(to.as_bytes());
-        let ret = ctx
-            .raw_call(pair, &cd, LoomValue::ZERO)
-            .map_err(|_| ContractError::from_str("router: pair.burn failed"))?;
-        if ret.len() < 64 {
-            return Err(ContractError::from_str("router: pair.burn bad return"));
-        }
-        let mut a = [0u8; 32];
-        let mut b = [0u8; 32];
-        a.copy_from_slice(&ret[..32]);
-        b.copy_from_slice(&ret[32..64]);
-        Ok((U256(a), U256(b)))
+        ctx.call::<Pair>(*pair)
+            .burn(ctx, *to)
+            .map_err(|_| ContractError::from_str("router: pair.burn failed"))
     }
 
     pub(crate) fn pair_swap(
@@ -975,10 +950,9 @@ pub mod router {
         amount1_out: U256,
         to: &Address,
     ) -> Result<()> {
-        let cd = pair_calls::swap(amount0_out, amount1_out, to.as_bytes());
-        ctx.raw_call(pair, &cd, LoomValue::ZERO)
-            .map_err(|_| ContractError::from_str("router: pair.swap failed"))?;
-        Ok(())
+        ctx.call::<Pair>(*pair)
+            .swap(ctx, amount0_out, amount1_out, *to)
+            .map_err(|_| ContractError::from_str("router: pair.swap failed"))
     }
 
     pub(crate) fn transfer_lp_to_pair(
@@ -988,8 +962,8 @@ pub mod router {
         liquidity: U256,
     ) -> Result<()> {
         // LP tokens live on the pair petal itself.
-        let cd = erc20_calls::transfer_from(from.as_bytes(), pair.as_bytes(), liquidity);
-        ctx.raw_call(pair, &cd, LoomValue::ZERO)
+        ctx.call::<Erc20>(*pair)
+            .transfer_from(ctx, *from, *pair, liquidity)
             .map_err(|_| ContractError::from_str("router: LP transferFrom failed"))?;
         Ok(())
     }
@@ -999,10 +973,10 @@ pub mod router {
         wloom: &Address,
         value: LoomValue,
     ) -> Result<()> {
-        let cd = wloom_calls::deposit();
-        ctx.raw_call(wloom, &cd, value)
-            .map_err(|_| ContractError::from_str("router: wloom.deposit failed"))?;
-        Ok(())
+        ctx.call::<Wloom>(*wloom)
+            .with_value(value)
+            .deposit(ctx)
+            .map_err(|_| ContractError::from_str("router: wloom.deposit failed"))
     }
 
     pub(crate) fn wloom_withdraw(
@@ -1010,22 +984,22 @@ pub mod router {
         wloom: &Address,
         amount: U256,
     ) -> Result<()> {
-        let cd = wloom_calls::withdraw(amount);
-        ctx.raw_call(wloom, &cd, LoomValue::ZERO)
-            .map_err(|_| ContractError::from_str("router: wloom.withdraw failed"))?;
-        Ok(())
+        ctx.call::<Wloom>(*wloom)
+            .withdraw(ctx, amount)
+            .map_err(|_| ContractError::from_str("router: wloom.withdraw failed"))
     }
 
     pub(crate) fn loom_value_from_u256(amount: U256) -> Result<LoomValue> {
-        amount
-            .to_u128_checked()
-            .map(SdkLoomValue::from_u128)
-            .ok_or_else(|| ContractError::from_str("router: LOOM value exceeds u128"))
+        LoomValue::try_from(amount)
+            .map_err(|_| ContractError::from_str("router: LOOM value exceeds u128"))
     }
 
     pub(crate) fn send_loom(ctx: &mut Context, to: &Address, amount: U256) -> Result<()> {
+        // Native LOOM transfers go through `__call_raw` with empty calldata —
+        // there's no interface to mediate "send value to address", so this is
+        // the one sanctioned use of the raw escape hatch in the router.
         let v = loom_value_from_u256(amount)?;
-        ctx.raw_call(to, &[], v)
+        ctx.__call_raw(to, &[], v)
             .map_err(|_| ContractError::from_str("router: LOOM transfer failed"))?;
         Ok(())
     }
@@ -1127,24 +1101,6 @@ pub mod router {
             pair_swap(ctx, &pair, amount0_out, amount1_out, &next_to)?;
         }
         Ok(())
-    }
-
-    fn decode_addr(ret: &[u8], err_msg: &'static str) -> Result<Address> {
-        if ret.len() < 32 {
-            return Err(ContractError::from_str(err_msg));
-        }
-        let mut a = [0u8; 32];
-        a.copy_from_slice(&ret[..32]);
-        Ok(Address(a))
-    }
-
-    fn decode_u256(ret: &[u8], err_msg: &'static str) -> Result<U256> {
-        if ret.len() < 32 {
-            return Err(ContractError::from_str(err_msg));
-        }
-        let mut a = [0u8; 32];
-        a.copy_from_slice(&ret[..32]);
-        Ok(U256(a))
     }
 }
 

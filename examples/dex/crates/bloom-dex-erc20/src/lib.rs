@@ -156,19 +156,19 @@ pub mod erc20 {
     pub fn init(ctx: &mut Context, cfg: InitConfig) -> Result<()> {
         let state = State::load(ctx)?;
 
-        state.name.store(&str_to_bytes32_right(cfg.name.as_str()));
-        state.symbol.store(&str_to_bytes32_right(cfg.symbol.as_str()));
+        state.name.store(ctx, &str_to_bytes32_right(cfg.name.as_str()));
+        state.symbol.store(ctx, &str_to_bytes32_right(cfg.symbol.as_str()));
         // Widen u8 → u64 so the SlotEncode writes the same low-byte pattern
         // the legacy macro wrote when decimals was declared `u64`.
-        state.decimals.store(&(cfg.decimals as u64));
+        state.decimals.store(ctx, &(cfg.decimals as u64));
 
         if !cfg.initial_supply.is_zero() {
-            let prev = state.balances.get(&cfg.initial_holder)?;
+            let prev = state.balances.get(ctx, &cfg.initial_holder)?;
             let new = prev
                 .checked_add(cfg.initial_supply)
                 .ok_or_else(|| ContractError::from_str("erc20: mint overflow"))?;
-            state.balances.set(&cfg.initial_holder, &new)?;
-            state.total_supply.store(&cfg.initial_supply);
+            state.balances.set(ctx, &cfg.initial_holder, &new)?;
+            state.total_supply.store(ctx, &cfg.initial_supply);
 
             Transfer {
                 from: Address::ZERO,
@@ -187,27 +187,27 @@ pub mod erc20 {
 
     #[view]
     pub fn total_supply(ctx: &Context) -> Result<U256> {
-        Ok(State::load(ctx)?.total_supply.load())
+        Ok(State::load(ctx)?.total_supply.load(ctx))
     }
 
     #[view]
     pub fn balance_of(ctx: &Context, owner: Address) -> Result<U256> {
-        State::load(ctx)?.balances.get(&owner)
+        State::load(ctx)?.balances.get(ctx, &owner)
     }
 
     #[view]
     pub fn allowance(ctx: &Context, owner: Address, spender: Address) -> Result<U256> {
-        State::load(ctx)?.allowances.get(&(owner, spender))
+        State::load(ctx)?.allowances.get(ctx, &(owner, spender))
     }
 
     #[view]
     pub fn name(ctx: &Context) -> Result<Hash32> {
-        Ok(State::load(ctx)?.name.load())
+        Ok(State::load(ctx)?.name.load(ctx))
     }
 
     #[view]
     pub fn symbol(ctx: &Context) -> Result<Hash32> {
-        Ok(State::load(ctx)?.symbol.load())
+        Ok(State::load(ctx)?.symbol.load(ctx))
     }
 
     /// Returns the single-byte decimals value. The legacy `contract!` macro
@@ -216,7 +216,7 @@ pub mod erc20 {
     /// matching the legacy hand-rolled `petal::return_data(&[d])`.
     #[view]
     pub fn decimals(ctx: &Context) -> Result<u8> {
-        Ok(State::load(ctx)?.decimals.load() as u8)
+        Ok(State::load(ctx)?.decimals.load(ctx) as u8)
     }
 
     // -----------------------------------------------------------------------
@@ -226,7 +226,7 @@ pub mod erc20 {
     pub fn transfer(ctx: &mut Context, to: Address, amount: U256) -> Result<bool> {
         let state = State::load(ctx)?;
         let sender = ctx.sender();
-        do_transfer(&state, &sender, &to, amount)?;
+        do_transfer(ctx, &state, &sender, &to, amount)?;
         Transfer { from: sender, to, value: amount }.emit(ctx)?;
         Ok(true)
     }
@@ -240,15 +240,15 @@ pub mod erc20 {
         let state = State::load(ctx)?;
         let caller = ctx.sender();
 
-        let current = state.allowances.get(&(from, caller))?;
+        let current = state.allowances.get(ctx, &(from, caller))?;
         if current != U256_MAX {
             let new_allow = current
                 .checked_sub(amount)
                 .ok_or_else(|| ContractError::from_str("erc20: insufficient allowance"))?;
-            state.allowances.set(&(from, caller), &new_allow)?;
+            state.allowances.set(ctx, &(from, caller), &new_allow)?;
         }
 
-        do_transfer(&state, &from, &to, amount)?;
+        do_transfer(ctx, &state, &from, &to, amount)?;
         Transfer { from, to, value: amount }.emit(ctx)?;
         Ok(true)
     }
@@ -256,7 +256,7 @@ pub mod erc20 {
     pub fn approve(ctx: &mut Context, spender: Address, value: U256) -> Result<bool> {
         let state = State::load(ctx)?;
         let owner = ctx.sender();
-        state.allowances.set(&(owner, spender), &value)?;
+        state.allowances.set(ctx, &(owner, spender), &value)?;
         Approval { owner, spender, value }.emit(ctx)?;
         Ok(true)
     }
@@ -267,6 +267,7 @@ pub mod erc20 {
     // -----------------------------------------------------------------------
 
     pub(crate) fn do_transfer(
+        ctx: &mut Context,
         state: &State,
         from: &Address,
         to: &Address,
@@ -275,16 +276,16 @@ pub mod erc20 {
         if amount.is_zero() {
             return Ok(());
         }
-        let bal_from = state.balances.get(from)?;
+        let bal_from = state.balances.get(ctx, from)?;
         let new_from = bal_from
             .checked_sub(amount)
             .ok_or_else(|| ContractError::from_str("erc20: insufficient balance"))?;
-        state.balances.set(from, &new_from)?;
-        let bal_to = state.balances.get(to)?;
+        state.balances.set(ctx, from, &new_from)?;
+        let bal_to = state.balances.get(ctx, to)?;
         let new_to = bal_to
             .checked_add(amount)
             .ok_or_else(|| ContractError::from_str("erc20: balance overflow"))?;
-        state.balances.set(to, &new_to)?;
+        state.balances.set(ctx, to, &new_to)?;
         Ok(())
     }
 

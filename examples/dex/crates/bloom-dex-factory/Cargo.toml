@@ -18,6 +18,10 @@ bloom-contract = { workspace = true, default-features = false }
 bloom-chain-abi = { workspace = true, default-features = false }
 bloom-petal-sdk = { workspace = true }
 
+[features]
+# See bloom-dex-erc20/Cargo.toml for rationale.
+no-entrypoint = []
+
 # Host-side parity tests hash canonical method/event signature strings with
 # blake3 directly (no separate ABI crate). Production code paths use nothing
 # from this section.

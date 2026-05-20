@@ -288,6 +288,33 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Compile-time conformance check: for every declared interface,
+    // call `bloom_contract::interface::assert_conforms` from a const
+    // context — it panics (i.e. fails compilation) when the local
+    // `SELECTORS` table doesn't cover every method the interface
+    // declares with matching argument types. See
+    // `bloom_contract::interface::check_conformance` for the precise
+    // matching rule.
+    let conformance_check: TokenStream2 = if interfaces.is_empty() {
+        quote! {}
+    } else {
+        let module_id = &module_ident;
+        let check_calls = interfaces.iter().map(|i| {
+            quote! {
+                ::bloom_contract::interface::assert_conforms(
+                    <#i as ::bloom_contract::interface::ContractInterface>::METHODS,
+                    #module_id::__bloom::SELECTORS,
+                );
+            }
+        });
+        quote! {
+            #[doc(hidden)]
+            const _: () = {
+                #(#check_calls)*
+            };
+        }
+    };
+
     // Push dispatcher into the module body so generated names are siblings
     // of user-defined items (and the user's `use super::*;` can resolve
     // them when needed).
@@ -304,19 +331,37 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     // claim the same symbol). Gate them on `wasm32` so host-side tests can
     // declare several contract modules side-by-side and the framework
     // itself stays exercise-able without per-contract build scripts.
+    //
+    // The `no-entrypoint` feature flag follows Solana / Anchor convention:
+    // a contract crate is also a usable library (typed `ContractRef` calls,
+    // shared types). When another contract depends on it as a library, the
+    // dependent sets `features = ["no-entrypoint"]` so the dep's wasm export
+    // symbols don't leak into the dependent's cdylib (rust-lld duplicate
+    // symbol on `init` / `call`). Each contract crate must define the
+    // feature in its Cargo.toml: `[features] no-entrypoint = []`.
+    // Signature must match the chain VM's `get_typed_func::<(i32, i32), i32>`
+    // probe (see `bloom-petals::chain_vm::run_chain_petal`). The `ptr` / `len`
+    // pair is the calldata window the host hands to the petal, but the SDK
+    // re-reads it through `msg_calldata_*` host imports, so the args are
+    // accepted-but-ignored here. The return value is a status code reserved
+    // for future use; `0` means clean exit.
     let exports: TokenStream2 = quote! {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(feature = "no-entrypoint")))]
         #[doc(hidden)]
         #[unsafe(export_name = "init")]
-        pub extern "C" fn #init_export() {
+        pub extern "C" fn #init_export(calldata_ptr: i32, calldata_len: i32) -> i32 {
+            let _ = (calldata_ptr, calldata_len);
             #module_ident::__bloom::__dispatch_init();
+            0
         }
 
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(feature = "no-entrypoint")))]
         #[doc(hidden)]
         #[unsafe(export_name = "call")]
-        pub extern "C" fn #call_export() {
+        pub extern "C" fn #call_export(calldata_ptr: i32, calldata_len: i32) -> i32 {
+            let _ = (calldata_ptr, calldata_len);
             #module_ident::__bloom::__dispatch_call();
+            0
         }
 
         // Off-wasm: keep a non-exported alias of each shim so host-side
@@ -325,14 +370,18 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
         // engine.
         #[cfg(not(target_arch = "wasm32"))]
         #[doc(hidden)]
-        pub extern "C" fn #init_export() {
+        pub extern "C" fn #init_export(calldata_ptr: i32, calldata_len: i32) -> i32 {
+            let _ = (calldata_ptr, calldata_len);
             #module_ident::__bloom::__dispatch_init();
+            0
         }
 
         #[cfg(not(target_arch = "wasm32"))]
         #[doc(hidden)]
-        pub extern "C" fn #call_export() {
+        pub extern "C" fn #call_export(calldata_ptr: i32, calldata_len: i32) -> i32 {
+            let _ = (calldata_ptr, calldata_len);
             #module_ident::__bloom::__dispatch_call();
+            0
         }
     };
 
@@ -365,6 +414,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
         #module
         #exports
         #manifest_section
+        #conformance_check
     }
     .into()
 }

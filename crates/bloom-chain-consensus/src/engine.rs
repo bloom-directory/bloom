@@ -168,6 +168,16 @@ impl<V: SigVerifier> ConsensusEngine<V> {
         self.blocks.insert(hash, block);
     }
 
+    /// Re-check precommit tallies for a block whose body just landed. If 2f+1
+    /// precommits for `hash` were recorded earlier (before the body was
+    /// registered), emit the deferred `Commit` action now.
+    /// See [`crate::state_machine::ConsensusState::try_commit_with_block`].
+    pub fn try_commit_with_block(&mut self, hash: Hash32) -> Vec<Action> {
+        let mut actions = self.state.try_commit_with_block(hash, &self.blocks);
+        self.sign_actions(&mut actions);
+        actions
+    }
+
     /// Re-attempt a previously-stashed proposal whose block has now arrived.
     /// See [`crate::state_machine::ConsensusState::try_resume_pending_proposal`].
     /// Returns the actions emitted by the state machine (signed in-place).

@@ -174,8 +174,8 @@ fn wasm_export_symbols_exist() {
     // `__bloom_call_<mod>()`. Taking a function pointer is enough to confirm
     // they were generated — we don't call them (they would invoke host
     // imports that panic on non-wasm targets).
-    let _init: extern "C" fn() = __bloom_init_demo;
-    let _call: extern "C" fn() = __bloom_call_demo;
+    let _init: extern "C" fn(i32, i32) -> i32 = __bloom_init_demo;
+    let _call: extern "C" fn(i32, i32) -> i32 = __bloom_call_demo;
 }
 
 // ---------------------------------------------------------------------------

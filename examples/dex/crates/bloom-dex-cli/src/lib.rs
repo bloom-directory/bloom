@@ -29,7 +29,9 @@ use bloom_chain_types::ssz::Encode;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
 use bloom_chain_abi::Encoder;
-use bloom_chain_abi::selector as abi_selector;
+use bloom_dex_erc20::Erc20;
+use bloom_dex_factory::Factory;
+use bloom_dex_router::Router;
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -537,8 +539,7 @@ async fn create_pair(
     let a = parse_addr(&token_a)?;
     let b = parse_addr(&token_b)?;
 
-    let mut e =
-        Encoder::with_selector(abi_selector("factory.create_pair(address,address)"));
+    let mut e = Encoder::with_selector(Factory::SEL_CREATE_PAIR);
     e.push_address(&a.0);
     e.push_address(&b.0);
     let calldata = e.finish();
@@ -593,9 +594,7 @@ async fn add_liquidity(
     submit_erc20_approve(client, &sk, &pk, sender, &chain_id, b, router_addr, &amt_b).await?;
 
     // 3. router.add_liquidity(a, b, amt_a, amt_b, min_a, min_b, to, deadline)
-    let mut e = Encoder::with_selector(abi_selector(
-        "router.add_liquidity(address,address,u256,u256,u256,u256,address,u64)",
-    ));
+    let mut e = Encoder::with_selector(Router::SEL_ADD_LIQUIDITY);
     e.push_address(&a.0)
         .push_address(&b.0)
         .push_u256_bytes(&amt_a)
@@ -659,9 +658,7 @@ async fn swap_exact_tokens(
     .await?;
 
     // 2. router.swap_exact_tokens_for_tokens(amount_in, min_out, path, to, deadline)
-    let mut e = Encoder::with_selector(abi_selector(
-        "router.swap_exact_tokens_for_tokens(u256,u256,vec<address>,address,u64)",
-    ));
+    let mut e = Encoder::with_selector(Router::SEL_SWAP_EXACT_TOKENS_FOR_TOKENS);
     e.push_u256_bytes(&in_amt).push_u256_bytes(&min_out_v);
     e.push_address_vec(&path_addrs)
         .map_err(|err| anyhow!("encode swap path: {err}"))?;
@@ -730,9 +727,7 @@ async fn remove_liquidity(
     submit_erc20_approve(client, &sk, &pk, sender, &chain_id, pair_addr, router_addr, &liq).await?;
 
     // 2. router.remove_liquidity(a, b, liquidity, min_a, min_b, to, deadline)
-    let mut e = Encoder::with_selector(abi_selector(
-        "router.remove_liquidity(address,address,u256,u256,u256,address,u64)",
-    ));
+    let mut e = Encoder::with_selector(Router::SEL_REMOVE_LIQUIDITY);
     e.push_address(&a.0)
         .push_address(&b.0)
         .push_u256_bytes(&liq)
@@ -1083,8 +1078,7 @@ async fn submit_erc20_approve(
     spender: Address,
     amount: &[u8; 32],
 ) -> Result<()> {
-    let mut e =
-        Encoder::with_selector(abi_selector("erc20.approve(address,u256)"));
+    let mut e = Encoder::with_selector(Erc20::SEL_APPROVE);
     e.push_address(&spender.0).push_u256_bytes(amount);
     submit_call(client, sk, pk, sender, chain_id, token, e.finish(), 0, 2_000_000).await
 }

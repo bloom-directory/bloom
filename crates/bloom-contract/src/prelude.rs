@@ -9,7 +9,7 @@ pub use crate::context::Context;
 pub use crate::error::{ContractError, Error, Result};
 pub use crate::interface::{ContractInterface, ContractRef};
 pub use crate::storage::{Map, Slot, StorageValue, VecStore};
-pub use crate::types::{Address, Hash32, U256};
+pub use crate::types::{Address, Bytes32String, Hash32, U256};
 
 // Attribute macros — re-exported from the proc-macro crate for ergonomic use.
 // `storage`, `event`, `error`, etc. live in the macro namespace; the

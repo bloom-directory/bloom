@@ -97,6 +97,12 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     let trait_method_sigs = methods.iter().map(|m| m.trait_method_signature());
     let trait_method_impls = methods.iter().map(|m| m.trait_method_impl(&trait_ident));
 
+    // Emit a `bloom_interfaces` custom-section record so the build crate
+    // can resolve declared interface names to full method descriptors at
+    // build time. Wire form: `<u16-le len><JSON bytes>` per record; the
+    // linker concatenates one section per interface in the final wasm.
+    let interface_record_static = build_interface_record_static(&trait_ident, &domain, &methods);
+
     quote! {
         // Marker type — the original `pub trait Erc20 { ... }` is replaced
         // by a zero-variant enum because `ContractRef<I>` and the
@@ -132,9 +138,80 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
         {
             #(#trait_method_impls)*
         }
+
+        #interface_record_static
     }
     .into()
 }
+
+/// Emit the `#[link_section = "bloom_interfaces"]` byte array carrying
+/// the JSON `InterfaceManifest` record for this trait. The record is
+/// length-prefixed (`<u16-le><JSON>`) so the build crate can decode a
+/// concatenated stream of records from multiple interfaces.
+fn build_interface_record_static(
+    trait_ident: &Ident,
+    domain: &str,
+    methods: &[MethodSpec],
+) -> TokenStream2 {
+    use serde_json::json;
+
+    let method_records: Vec<serde_json::Value> = methods
+        .iter()
+        .map(|m| {
+            let sel_hex: String = m
+                .selector
+                .iter()
+                .flat_map(|b| {
+                    let hi = HEX[(b >> 4) as usize] as char;
+                    let lo = HEX[(b & 0x0f) as usize] as char;
+                    [hi, lo]
+                })
+                .collect();
+            json!({
+                "name": m.name,
+                "signature": m.signature,
+                "selector": sel_hex,
+            })
+        })
+        .collect();
+    let record = json!({
+        "name": trait_ident.to_string(),
+        "domain": domain,
+        "methods": method_records,
+    });
+    let json_bytes = serde_json::to_vec(&record).expect("interface record serializes");
+
+    let len = json_bytes.len();
+    if len > u16::MAX as usize {
+        return syn::Error::new_spanned(
+            trait_ident,
+            "interface record exceeds 64 KiB — too many methods for the manifest custom section",
+        )
+        .to_compile_error();
+    }
+
+    // Wire form: <u16-le len><JSON bytes>.
+    let len_lo = (len & 0xff) as u8;
+    let len_hi = ((len >> 8) & 0xff) as u8;
+    let mut blob: Vec<u8> = Vec::with_capacity(2 + len);
+    blob.push(len_lo);
+    blob.push(len_hi);
+    blob.extend_from_slice(&json_bytes);
+
+    let total_len = blob.len();
+    let bytes_lits = blob.iter().map(|b| quote::quote! { #b });
+    let static_ident = format_ident!("__BLOOM_INTERFACE_{}", trait_ident);
+
+    quote! {
+        #[cfg(target_arch = "wasm32")]
+        #[doc(hidden)]
+        #[unsafe(link_section = "bloom_interfaces")]
+        #[used]
+        static #static_ident: [u8; #total_len] = [#(#bytes_lits),*];
+    }
+}
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
 
 // ===========================================================================
 // Method specs
@@ -273,10 +350,10 @@ impl MethodSpec {
                 __enc.push_bytes(&#trait_ident::#sel_const);
                 #(#encode_args)*
                 let __cd: ::bloom_contract::__private::Vec<u8> = __enc.finish();
-                let __ret = ctx.raw_call(
+                let __ret = ctx.__call_raw(
                     &self.address,
                     &__cd,
-                    ::bloom_petal_sdk::value::LoomValue::ZERO,
+                    self.value,
                 )?;
                 let mut __buf = ::bloom_contract::abi::Buf::new(&__ret);
                 let __value =

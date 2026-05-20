@@ -193,11 +193,11 @@ pub mod factory {
     #[init]
     pub fn init(ctx: &mut Context, cfg: InitConfig) -> Result<()> {
         let state = State::load(ctx)?;
-        state.pair_petal_hash.store(&cfg.pair_petal_hash);
-        state.fee_to.store(&Address::ZERO);
-        state.fee_to_setter.store(&cfg.fee_to_setter);
-        state.self_addr.store(&cfg.factory_self_addr);
-        state.all_pairs_len.store(&0u64);
+        state.pair_petal_hash.store(ctx, &cfg.pair_petal_hash);
+        state.fee_to.store(ctx, &Address::ZERO);
+        state.fee_to_setter.store(ctx, &cfg.fee_to_setter);
+        state.self_addr.store(ctx, &cfg.factory_self_addr);
+        state.all_pairs_len.store(ctx, &0u64);
         Ok(())
     }
 
@@ -208,32 +208,32 @@ pub mod factory {
     #[view]
     pub fn get_pair(ctx: &Context, token_a: Address, token_b: Address) -> Result<Address> {
         let (t0, t1) = sort_tokens(&token_a, &token_b);
-        State::load(ctx)?.pair_of.get(&(t0, t1))
+        State::load(ctx)?.pair_of.get(ctx, &(t0, t1))
     }
 
     #[view]
     pub fn all_pairs(ctx: &Context, index: u64) -> Result<Address> {
         let state = State::load(ctx)?;
-        let count = state.all_pairs_len.load();
+        let count = state.all_pairs_len.load(ctx);
         if index >= count {
             return Err(ContractError::from_str("factory: allPairs: index out of bounds"));
         }
-        state.all_pairs_at.get(&index)
+        state.all_pairs_at.get(ctx, &index)
     }
 
     #[view]
     pub fn all_pairs_length(ctx: &Context) -> Result<u64> {
-        Ok(State::load(ctx)?.all_pairs_len.load())
+        Ok(State::load(ctx)?.all_pairs_len.load(ctx))
     }
 
     #[view]
     pub fn fee_to(ctx: &Context) -> Result<Address> {
-        Ok(State::load(ctx)?.fee_to.load())
+        Ok(State::load(ctx)?.fee_to.load(ctx))
     }
 
     #[view]
     pub fn fee_to_setter(ctx: &Context) -> Result<Address> {
-        Ok(State::load(ctx)?.fee_to_setter.load())
+        Ok(State::load(ctx)?.fee_to_setter.load(ctx))
     }
 
     // -----------------------------------------------------------------------
@@ -256,13 +256,13 @@ pub mod factory {
 
         let state = State::load(ctx)?;
 
-        if state.pair_of.get(&(t0, t1))? != Address::ZERO {
+        if state.pair_of.get(ctx, &(t0, t1))? != Address::ZERO {
             return Err(ContractError::from_str("factory: pair exists"));
         }
 
         let salt = pair_salt(&t0, &t1);
-        let pair_hash = state.pair_petal_hash.load();
-        let factory_self = state.self_addr.load();
+        let pair_hash = state.pair_petal_hash.load(ctx);
+        let factory_self = state.self_addr.load(ctx);
         let precomputed_pair_addr = compute_pair_address(&factory_self, &salt, &pair_hash);
 
         // Pair init: t0 || t1 || pair_self_addr (96 bytes).
@@ -282,13 +282,13 @@ pub mod factory {
         let pair_addr = Address::from(pair_addr_bytes);
 
         // Store pair in both directions; append to allPairs.
-        state.pair_of.set(&(t0, t1), &pair_addr)?;
-        state.pair_of.set(&(t1, t0), &pair_addr)?;
+        state.pair_of.set(ctx, &(t0, t1), &pair_addr)?;
+        state.pair_of.set(ctx, &(t1, t0), &pair_addr)?;
 
-        let count = state.all_pairs_len.load();
-        state.all_pairs_at.set(&count, &pair_addr)?;
+        let count = state.all_pairs_len.load(ctx);
+        state.all_pairs_at.set(ctx, &count, &pair_addr)?;
         let new_count = count + 1;
-        state.all_pairs_len.store(&new_count);
+        state.all_pairs_len.store(ctx, &new_count);
 
         PairCreated {
             token0: t0,
@@ -303,23 +303,23 @@ pub mod factory {
 
     pub fn set_fee_to(ctx: &mut Context, addr: Address) -> Result<()> {
         let state = State::load(ctx)?;
-        let setter = state.fee_to_setter.load();
+        let setter = state.fee_to_setter.load(ctx);
         if ctx.sender() != setter {
             return Err(ContractError::from_str("factory: setFeeTo: not feeToSetter"));
         }
-        state.fee_to.store(&addr);
+        state.fee_to.store(ctx, &addr);
         Ok(())
     }
 
     pub fn set_fee_to_setter(ctx: &mut Context, addr: Address) -> Result<()> {
         let state = State::load(ctx)?;
-        let setter = state.fee_to_setter.load();
+        let setter = state.fee_to_setter.load(ctx);
         if ctx.sender() != setter {
             return Err(ContractError::from_str(
                 "factory: setFeeToSetter: not feeToSetter",
             ));
         }
-        state.fee_to_setter.store(&addr);
+        state.fee_to_setter.store(ctx, &addr);
         Ok(())
     }
 }

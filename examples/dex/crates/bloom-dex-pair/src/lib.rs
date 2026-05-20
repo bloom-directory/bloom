@@ -43,9 +43,8 @@
 
 extern crate alloc;
 
-use bloom_contract::context::LoomValue;
 use bloom_contract::prelude::*;
-use bloom_dex_erc20::{Erc20, calls as erc20_calls};
+use bloom_dex_erc20::{Erc20, Erc20Calls};
 
 // ---------------------------------------------------------------------------
 // Pair interface — AMM-specific surface (separate from the ERC-20 interface
@@ -101,31 +100,15 @@ const MINIMUM_LIQUIDITY: u128 = 1_000;
 /// `u256::MAX` sentinel: an allowance equal to this is treated as unlimited.
 const U256_MAX: U256 = U256([0xff; 32]);
 
-/// ASCII bytes of the LP token name (right-padded into a `Hash32` slot;
-/// matches the legacy `slot[..name.len()].copy_from_slice(name)` layout).
-const NAME_BYTES: &[u8] = b"BloomDexPair LP";
-
-/// ASCII bytes of the LP token symbol (right-padded into a `Hash32` slot).
-const SYMBOL_BYTES: &[u8] = b"BDPL";
-
 /// LP token decimals.
 const DECIMALS: u8 = 18;
 
-/// Right-align `bytes` (≤ 32 bytes) into a 32-byte slot so the leading bytes
-/// hold the ASCII data and the trailing bytes are zero — the legacy pair's
-/// name/symbol layout (mirror image of the wLOOM left-aligned convention).
-const fn pad_right_32(bytes: &[u8]) -> Hash32 {
-    let mut slot = [0u8; 32];
-    let mut i = 0;
-    while i < bytes.len() {
-        slot[i] = bytes[i];
-        i += 1;
-    }
-    Hash32(slot)
-}
+/// LP token name (right-padded into a 32-byte slot — pair's convention:
+/// ASCII first, zeros trailing. Mirror of wLOOM's left-padded layout).
+const NAME_SLOT: Bytes32String = Bytes32String::pad_right("BloomDexPair LP");
 
-const NAME_SLOT: Hash32 = pad_right_32(NAME_BYTES);
-const SYMBOL_SLOT: Hash32 = pad_right_32(SYMBOL_BYTES);
+/// LP token symbol (right-padded into a 32-byte slot).
+const SYMBOL_SLOT: Bytes32String = Bytes32String::pad_right("BDPL");
 
 // ---------------------------------------------------------------------------
 // Contract body
@@ -235,12 +218,12 @@ pub mod pair {
     #[init]
     pub fn init(ctx: &mut Context, cfg: InitConfig) -> Result<()> {
         let state = State::load(ctx)?;
-        state.token0.store(&cfg.token0);
-        state.token1.store(&cfg.token1);
-        state.self_addr.store(&cfg.pair_self_addr);
-        state.reserve0.store(&0u128);
-        state.reserve1.store(&0u128);
-        state.total_supply.store(&U256::ZERO);
+        state.token0.store(ctx, &cfg.token0);
+        state.token1.store(ctx, &cfg.token1);
+        state.self_addr.store(ctx, &cfg.pair_self_addr);
+        state.reserve0.store(ctx, &0u128);
+        state.reserve1.store(ctx, &0u128);
+        state.total_supply.store(ctx, &U256::ZERO);
         Ok(())
     }
 
@@ -250,12 +233,12 @@ pub mod pair {
 
     #[view]
     pub fn name(_ctx: &Context) -> Result<Hash32> {
-        Ok(NAME_SLOT)
+        Ok(NAME_SLOT.into())
     }
 
     #[view]
     pub fn symbol(_ctx: &Context) -> Result<Hash32> {
-        Ok(SYMBOL_SLOT)
+        Ok(SYMBOL_SLOT.into())
     }
 
     #[view]
@@ -265,17 +248,17 @@ pub mod pair {
 
     #[view]
     pub fn total_supply(ctx: &Context) -> Result<U256> {
-        Ok(State::load(ctx)?.total_supply.load())
+        Ok(State::load(ctx)?.total_supply.load(ctx))
     }
 
     #[view]
     pub fn balance_of(ctx: &Context, owner: Address) -> Result<U256> {
-        State::load(ctx)?.balances.get(&owner)
+        State::load(ctx)?.balances.get(ctx, &owner)
     }
 
     #[view]
     pub fn allowance(ctx: &Context, owner: Address, spender: Address) -> Result<U256> {
-        State::load(ctx)?.allowances.get(&(owner, spender))
+        State::load(ctx)?.allowances.get(ctx, &(owner, spender))
     }
 
     // -----------------------------------------------------------------------
@@ -285,7 +268,7 @@ pub mod pair {
     pub fn transfer(ctx: &mut Context, to: Address, amount: U256) -> Result<bool> {
         let state = State::load(ctx)?;
         let sender = ctx.sender();
-        erc20_do_transfer(&state, &sender, &to, amount)?;
+        erc20_do_transfer(ctx, &state, &sender, &to, amount)?;
         Transfer { from: sender, to, value: amount }.emit(ctx)?;
         Ok(true)
     }
@@ -300,16 +283,16 @@ pub mod pair {
         let caller = ctx.sender();
 
         if caller != from {
-            let current = state.allowances.get(&(from, caller))?;
+            let current = state.allowances.get(ctx, &(from, caller))?;
             if current != U256_MAX {
                 let new_allow = current
                     .checked_sub(amount)
                     .ok_or_else(|| ContractError::from_str("pair: insufficient allowance"))?;
-                state.allowances.set(&(from, caller), &new_allow)?;
+                state.allowances.set(ctx, &(from, caller), &new_allow)?;
             }
         }
 
-        erc20_do_transfer(&state, &from, &to, amount)?;
+        erc20_do_transfer(ctx, &state, &from, &to, amount)?;
         Transfer { from, to, value: amount }.emit(ctx)?;
         Ok(true)
     }
@@ -317,7 +300,7 @@ pub mod pair {
     pub fn approve(ctx: &mut Context, spender: Address, value: U256) -> Result<bool> {
         let state = State::load(ctx)?;
         let owner = ctx.sender();
-        state.allowances.set(&(owner, spender), &value)?;
+        state.allowances.set(ctx, &(owner, spender), &value)?;
         Approval { owner, spender, value }.emit(ctx)?;
         Ok(true)
     }
@@ -328,12 +311,12 @@ pub mod pair {
 
     #[view]
     pub fn token0(ctx: &Context) -> Result<Address> {
-        Ok(State::load(ctx)?.token0.load())
+        Ok(State::load(ctx)?.token0.load(ctx))
     }
 
     #[view]
     pub fn token1(ctx: &Context) -> Result<Address> {
-        Ok(State::load(ctx)?.token1.load())
+        Ok(State::load(ctx)?.token1.load(ctx))
     }
 
     /// Returns `(reserve0, reserve1, block_timestamp_low64)` — encoded as 40
@@ -343,8 +326,8 @@ pub mod pair {
     pub fn get_reserves(ctx: &Context) -> Result<(u128, u128, u64)> {
         let state = State::load(ctx)?;
         Ok((
-            state.reserve0.load(),
-            state.reserve1.load(),
+            state.reserve0.load(ctx),
+            state.reserve1.load(ctx),
             block::timestamp(),
         ))
     }
@@ -356,17 +339,17 @@ pub mod pair {
     #[nonreentrant]
     pub fn mint(ctx: &mut Context, to: Address) -> Result<U256> {
         let state = State::load(ctx)?;
-        let token0 = state.token0.load();
-        let token1 = state.token1.load();
-        let self_addr = state.self_addr.load();
+        let token0 = state.token0.load(ctx);
+        let token1 = state.token1.load(ctx);
+        let self_addr = state.self_addr.load(ctx);
 
         // Balances after the user deposited tokens (caller transferred in
         // before calling mint).
         let bal0 = token_balance_of(ctx, &token0, &self_addr)?;
         let bal1 = token_balance_of(ctx, &token1, &self_addr)?;
 
-        let r0 = state.reserve0.load();
-        let r1 = state.reserve1.load();
+        let r0 = state.reserve0.load(ctx);
+        let r1 = state.reserve1.load(ctx);
         let r0_u = U256::from_u128(r0);
         let r1_u = U256::from_u128(r1);
 
@@ -377,7 +360,7 @@ pub mod pair {
             .checked_sub(r1_u)
             .ok_or_else(|| ContractError::from_str("pair: mint amount1 underflow"))?;
 
-        let total_supply = state.total_supply.load();
+        let total_supply = state.total_supply.load(ctx);
 
         let liquidity = if total_supply.is_zero() {
             // First mint: liquidity = sqrt(amount0 * amount1) - MINIMUM_LIQUIDITY.
@@ -406,7 +389,7 @@ pub mod pair {
                 .ok_or_else(|| ContractError::from_str("pair: mint liq1 overflow"))?
                 .checked_div(r1_u)
                 .ok_or_else(|| ContractError::from_str("pair: mint liq1 div zero"))?;
-            if liq0 < liq1 { liq0 } else { liq1 }
+            liq0.min(liq1)
         };
 
         if liquidity.is_zero() {
@@ -421,7 +404,7 @@ pub mod pair {
         let new_r1 = bal1
             .to_u128_checked()
             .ok_or_else(|| ContractError::from_str("pair: reserve1 overflow u128"))?;
-        update_reserves(&state, new_r0, new_r1);
+        update_reserves(ctx, &state, new_r0, new_r1);
         Sync { reserve0: new_r0, reserve1: new_r1 }.emit(ctx)?;
 
         let sender = ctx.sender();
@@ -433,19 +416,19 @@ pub mod pair {
     #[nonreentrant]
     pub fn burn(ctx: &mut Context, to: Address) -> Result<(U256, U256)> {
         let state = State::load(ctx)?;
-        let token0 = state.token0.load();
-        let token1 = state.token1.load();
-        let self_addr = state.self_addr.load();
+        let token0 = state.token0.load(ctx);
+        let token1 = state.token1.load(ctx);
+        let self_addr = state.self_addr.load(ctx);
 
         let bal0 = token_balance_of(ctx, &token0, &self_addr)?;
         let bal1 = token_balance_of(ctx, &token1, &self_addr)?;
 
-        let lp_bal = state.balances.get(&self_addr)?;
+        let lp_bal = state.balances.get(ctx, &self_addr)?;
         if lp_bal.is_zero() {
             return Err(ContractError::from_str("pair: burn insufficient LP"));
         }
 
-        let total_supply = state.total_supply.load();
+        let total_supply = state.total_supply.load(ctx);
 
         let amount0 = lp_bal
             .checked_mul(bal0)
@@ -475,7 +458,7 @@ pub mod pair {
         let new_r1 = token_balance_of(ctx, &token1, &self_addr)?
             .to_u128_checked()
             .ok_or_else(|| ContractError::from_str("pair: post-burn reserve1 overflow"))?;
-        update_reserves(&state, new_r0, new_r1);
+        update_reserves(ctx, &state, new_r0, new_r1);
         Sync { reserve0: new_r0, reserve1: new_r1 }.emit(ctx)?;
 
         let sender = ctx.sender();
@@ -496,8 +479,8 @@ pub mod pair {
         }
 
         let state = State::load(ctx)?;
-        let r0 = state.reserve0.load();
-        let r1 = state.reserve1.load();
+        let r0 = state.reserve0.load(ctx);
+        let r1 = state.reserve1.load(ctx);
         let r0_u = U256::from_u128(r0);
         let r1_u = U256::from_u128(r1);
 
@@ -505,9 +488,9 @@ pub mod pair {
             return Err(ContractError::from_str("pair: insufficient liquidity"));
         }
 
-        let token0 = state.token0.load();
-        let token1 = state.token1.load();
-        let self_addr = state.self_addr.load();
+        let token0 = state.token0.load(ctx);
+        let token1 = state.token1.load(ctx);
+        let self_addr = state.self_addr.load(ctx);
 
         // Optimistic transfer-out before invariant check.
         if !amount0_out.is_zero() {
@@ -576,7 +559,7 @@ pub mod pair {
         let new_r1 = bal1
             .to_u128_checked()
             .ok_or_else(|| ContractError::from_str("pair: swap reserve1 overflow u128"))?;
-        update_reserves(&state, new_r0, new_r1);
+        update_reserves(ctx, &state, new_r0, new_r1);
         Sync { reserve0: new_r0, reserve1: new_r1 }.emit(ctx)?;
 
         let sender = ctx.sender();
@@ -595,11 +578,11 @@ pub mod pair {
 
     pub fn skim(ctx: &mut Context, to: Address) -> Result<()> {
         let state = State::load(ctx)?;
-        let token0 = state.token0.load();
-        let token1 = state.token1.load();
-        let self_addr = state.self_addr.load();
-        let r0_u = U256::from_u128(state.reserve0.load());
-        let r1_u = U256::from_u128(state.reserve1.load());
+        let token0 = state.token0.load(ctx);
+        let token1 = state.token1.load(ctx);
+        let self_addr = state.self_addr.load(ctx);
+        let r0_u = U256::from_u128(state.reserve0.load(ctx));
+        let r1_u = U256::from_u128(state.reserve1.load(ctx));
 
         let bal0 = token_balance_of(ctx, &token0, &self_addr)?;
         let bal1 = token_balance_of(ctx, &token1, &self_addr)?;
@@ -621,9 +604,9 @@ pub mod pair {
 
     pub fn sync(ctx: &mut Context) -> Result<()> {
         let state = State::load(ctx)?;
-        let token0 = state.token0.load();
-        let token1 = state.token1.load();
-        let self_addr = state.self_addr.load();
+        let token0 = state.token0.load(ctx);
+        let token1 = state.token1.load(ctx);
+        let self_addr = state.self_addr.load(ctx);
 
         let bal0 = token_balance_of(ctx, &token0, &self_addr)?;
         let bal1 = token_balance_of(ctx, &token1, &self_addr)?;
@@ -634,7 +617,7 @@ pub mod pair {
         let new_r1 = bal1
             .to_u128_checked()
             .ok_or_else(|| ContractError::from_str("pair: sync reserve1 overflow"))?;
-        update_reserves(&state, new_r0, new_r1);
+        update_reserves(ctx, &state, new_r0, new_r1);
         Sync { reserve0: new_r0, reserve1: new_r1 }.emit(ctx)?;
         Ok(())
     }
@@ -644,6 +627,7 @@ pub mod pair {
     // -----------------------------------------------------------------------
 
     pub(crate) fn erc20_do_transfer(
+        ctx: &mut Context,
         state: &State,
         from: &Address,
         to: &Address,
@@ -652,16 +636,16 @@ pub mod pair {
         if from == to {
             return Ok(());
         }
-        let bal_from = state.balances.get(from)?;
+        let bal_from = state.balances.get(ctx, from)?;
         let new_from = bal_from
             .checked_sub(amount)
             .ok_or_else(|| ContractError::from_str("pair: transfer exceeds balance"))?;
-        state.balances.set(from, &new_from)?;
-        let bal_to = state.balances.get(to)?;
+        state.balances.set(ctx, from, &new_from)?;
+        let bal_to = state.balances.get(ctx, to)?;
         let new_to = bal_to
             .checked_add(amount)
             .ok_or_else(|| ContractError::from_str("pair: transfer overflow"))?;
-        state.balances.set(to, &new_to)?;
+        state.balances.set(ctx, to, &new_to)?;
         Ok(())
     }
 
@@ -671,17 +655,17 @@ pub mod pair {
         to: &Address,
         amount: U256,
     ) -> Result<()> {
-        let total = state.total_supply.load();
+        let total = state.total_supply.load(ctx);
         let new_total = total
             .checked_add(amount)
             .ok_or_else(|| ContractError::from_str("pair: mint overflow"))?;
-        state.total_supply.store(&new_total);
+        state.total_supply.store(ctx, &new_total);
 
-        let bal = state.balances.get(to)?;
+        let bal = state.balances.get(ctx, to)?;
         let new_bal = bal
             .checked_add(amount)
             .ok_or_else(|| ContractError::from_str("pair: mint balance overflow"))?;
-        state.balances.set(to, &new_bal)?;
+        state.balances.set(ctx, to, &new_bal)?;
 
         Transfer { from: Address::ZERO, to: *to, value: amount }.emit(ctx)?;
         Ok(())
@@ -693,30 +677,30 @@ pub mod pair {
         from: &Address,
         amount: U256,
     ) -> Result<()> {
-        let total = state.total_supply.load();
+        let total = state.total_supply.load(ctx);
         let new_total = total
             .checked_sub(amount)
             .ok_or_else(|| ContractError::from_str("pair: burn underflow total"))?;
-        state.total_supply.store(&new_total);
+        state.total_supply.store(ctx, &new_total);
 
-        let bal = state.balances.get(from)?;
+        let bal = state.balances.get(ctx, from)?;
         let new_bal = bal
             .checked_sub(amount)
             .ok_or_else(|| ContractError::from_str("pair: burn exceeds balance"))?;
-        state.balances.set(from, &new_bal)?;
+        state.balances.set(ctx, from, &new_bal)?;
 
         Transfer { from: *from, to: Address::ZERO, value: amount }.emit(ctx)?;
         Ok(())
     }
 
-    pub(crate) fn update_reserves(state: &State, r0: u128, r1: u128) {
-        state.reserve0.store(&r0);
-        state.reserve1.store(&r1);
+    pub(crate) fn update_reserves(ctx: &mut Context, state: &State, r0: u128, r1: u128) {
+        state.reserve0.store(ctx, &r0);
+        state.reserve1.store(ctx, &r1);
         // k_last = r0 * r1 (stored as U256 for future feeTo reactivation).
         let k = U256::from_u128(r0)
             .checked_mul(U256::from_u128(r1))
             .unwrap_or(U256::ZERO);
-        state.k_last.store(&k);
+        state.k_last.store(ctx, &k);
     }
 
     /// Query `token.balance_of(target_addr)` via a cross-contract call.
@@ -725,16 +709,9 @@ pub mod pair {
         token_addr: &Address,
         target_addr: &Address,
     ) -> Result<U256> {
-        let cd = erc20_calls::balance_of(target_addr.as_bytes());
-        let ret = ctx
-            .raw_call(token_addr, &cd, LoomValue::ZERO)
-            .map_err(|_| ContractError::from_str("pair: token.balance_of call failed"))?;
-        if ret.len() < 32 {
-            return Err(ContractError::from_str("pair: token.balance_of bad return"));
-        }
-        let mut v = [0u8; 32];
-        v.copy_from_slice(&ret[..32]);
-        Ok(U256(v))
+        ctx.call::<Erc20>(*token_addr)
+            .balance_of(ctx, *target_addr)
+            .map_err(|_| ContractError::from_str("pair: token.balance_of call failed"))
     }
 
     /// Transfer `amount` of `token` to `to` via ERC-20 `transfer`.
@@ -744,10 +721,10 @@ pub mod pair {
         to: &Address,
         amount: U256,
     ) -> Result<()> {
-        let cd = erc20_calls::transfer(to.as_bytes(), amount);
-        ctx.raw_call(token_addr, &cd, LoomValue::ZERO)
-            .map_err(|_| ContractError::from_str("pair: token.transfer failed"))?;
-        Ok(())
+        ctx.call::<Erc20>(*token_addr)
+            .transfer(ctx, *to, amount)
+            .map(|_| ())
+            .map_err(|_| ContractError::from_str("pair: token.transfer failed"))
     }
 }
 
@@ -1182,7 +1159,7 @@ mod tests {
 
         let liq0 = a0_u.checked_mul(ts_u).unwrap().checked_div(r0_u).unwrap();
         let liq1 = a1_u.checked_mul(ts_u).unwrap().checked_div(r1_u).unwrap();
-        let liq = if liq0 < liq1 { liq0 } else { liq1 };
+        let liq = liq0.min(liq1);
 
         let expected = U256::from_u128(amount0 * ts / r0);
         assert_eq!(liq, expected);

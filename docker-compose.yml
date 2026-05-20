@@ -26,6 +26,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # Host networking for the BuildKit step: the default BuildKit network
+      # has intermittent DNS resolution failures when rustup tries to fetch
+      # https://static.rust-lang.org/dist/channel-rust-stable.toml.sha256
+      # during `cargo chef prepare`. The host's DNS is verified working, so
+      # we punch through. This only affects build time, not container runtime.
+      network: host
     container_name: bloom-val0
     hostname: val0
     command: ["--home", "/home/bloom", "chain", "run-validator"]
@@ -51,6 +57,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # Host networking for the BuildKit step: the default BuildKit network
+      # has intermittent DNS resolution failures when rustup tries to fetch
+      # https://static.rust-lang.org/dist/channel-rust-stable.toml.sha256
+      # during `cargo chef prepare`. The host's DNS is verified working, so
+      # we punch through. This only affects build time, not container runtime.
+      network: host
     container_name: bloom-val1
     hostname: val1
     command: ["--home", "/home/bloom", "chain", "run-validator"]
@@ -76,11 +88,20 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # Host networking for the BuildKit step: the default BuildKit network
+      # has intermittent DNS resolution failures when rustup tries to fetch
+      # https://static.rust-lang.org/dist/channel-rust-stable.toml.sha256
+      # during `cargo chef prepare`. The host's DNS is verified working, so
+      # we punch through. This only affects build time, not container runtime.
+      network: host
     container_name: bloom-val2
     hostname: val2
     command: ["--home", "/home/bloom", "chain", "run-validator"]
     environment:
-      RUST_LOG: ${RUST_LOG:-warn}
+      # Debug-level logging on val2 only so we can capture what it was doing
+      # when it stopped logging at height 19 in the prior run. The other
+      # validators stay at the default level to keep noise down.
+      RUST_LOG: "info,bloom_chain_node=debug,bloom_chain_consensus=debug,bloom_petals=debug"
       RUST_BACKTRACE: "1"
     volumes:
       - ${BLOOM_DOCKER_TMPDIR}/home2:/home/bloom
@@ -101,6 +122,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # Host networking for the BuildKit step: the default BuildKit network
+      # has intermittent DNS resolution failures when rustup tries to fetch
+      # https://static.rust-lang.org/dist/channel-rust-stable.toml.sha256
+      # during `cargo chef prepare`. The host's DNS is verified working, so
+      # we punch through. This only affects build time, not container runtime.
+      network: host
     container_name: bloom-val3
     hostname: val3
     command: ["--home", "/home/bloom", "chain", "run-validator"]

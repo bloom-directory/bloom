@@ -58,6 +58,7 @@ use bloom_petal_sdk::state;
 pub use bloom_chain_abi::storage::{slot_mapping, slot_scalar};
 
 use crate::abi::{AbiEncode, AbiEncodeError, AbiError, Encoder};
+use crate::context::Context;
 use crate::error::{ContractError, Result};
 use crate::types::{Address, Hash32, U256};
 
@@ -248,6 +249,11 @@ impl SlotEncode for Hash32 {
     fn from_slot(slot: Slot) -> Self { Hash32(slot) }
 }
 
+impl SlotEncode for crate::types::Bytes32String {
+    fn to_slot(&self) -> Slot { self.0 }
+    fn from_slot(slot: Slot) -> Self { crate::types::Bytes32String(slot) }
+}
+
 impl SlotEncode for Slot {
     fn to_slot(&self) -> Slot { *self }
     fn from_slot(slot: Slot) -> Self { slot }
@@ -279,7 +285,12 @@ impl<T> StorageValue<T> {
 
 impl<T: SlotEncode> StorageValue<T> {
     /// Read the stored value (zero/default for unset slots).
-    pub fn load(&self) -> T {
+    ///
+    /// Takes `&Context` so a `#[view]` handler — which holds the
+    /// context immutably — can still read storage, but the borrow
+    /// checker rejects any storage write from the same body.
+    pub fn load(&self, ctx: &Context) -> T {
+        let _ = ctx;
         match state::read(&self.slot) {
             Some(bytes) => T::from_slot(bytes),
             None => T::from_slot([0u8; 32]),
@@ -287,12 +298,19 @@ impl<T: SlotEncode> StorageValue<T> {
     }
 
     /// Overwrite the stored value.
-    pub fn store(&self, v: &T) {
+    ///
+    /// Takes `&mut Context`, which a `#[view]` handler cannot supply
+    /// — so attempting to mutate storage from a view body is a
+    /// compile error, not a runtime check.
+    pub fn store(&self, ctx: &mut Context, v: &T) {
+        let _ = ctx;
         state::write(&self.slot, &v.to_slot());
     }
 
-    /// Reset the slot to the default zero state.
-    pub fn clear(&self) {
+    /// Reset the slot to the default zero state. Requires
+    /// `&mut Context` for the same reason as `store`.
+    pub fn clear(&self, ctx: &mut Context) {
+        let _ = ctx;
         state::delete(&self.slot);
     }
 }
@@ -337,22 +355,27 @@ impl<K: AbiEncode, V: SlotEncode> Map<K, V> {
     }
 
     /// Read the stored value for `key`. Returns the type's zero for unset
-    /// slots (mirroring chain semantics §6.2).
-    pub fn get(&self, key: &K) -> Result<V> {
+    /// slots (mirroring chain semantics §6.2). `&Context` borrow gates
+    /// reads through the context handle.
+    pub fn get(&self, ctx: &Context, key: &K) -> Result<V> {
+        let _ = ctx;
         let slot = self.slot(key).map_err(map_encode_err)?;
         let bytes = state::read(&slot).unwrap_or([0u8; 32]);
         Ok(V::from_slot(bytes))
     }
 
-    /// Overwrite the value at `key`.
-    pub fn set(&self, key: &K, value: &V) -> Result<()> {
+    /// Overwrite the value at `key`. `&mut Context` enforces that
+    /// `#[view]` handlers can't reach this method.
+    pub fn set(&self, ctx: &mut Context, key: &K, value: &V) -> Result<()> {
+        let _ = ctx;
         let slot = self.slot(key).map_err(map_encode_err)?;
         state::write(&slot, &value.to_slot());
         Ok(())
     }
 
-    /// Delete the slot for `key`.
-    pub fn remove(&self, key: &K) -> Result<()> {
+    /// Delete the slot for `key`. `&mut Context` for the same reason.
+    pub fn remove(&self, ctx: &mut Context, key: &K) -> Result<()> {
+        let _ = ctx;
         let slot = self.slot(key).map_err(map_encode_err)?;
         state::delete(&slot);
         Ok(())
@@ -389,15 +412,20 @@ impl<T> VecStore<T> {
 }
 
 impl<T: SlotEncode> VecStore<T> {
-    pub fn len(&self) -> u64 {
+    /// Number of elements currently stored. Reads the length slot.
+    pub fn len(&self, ctx: &Context) -> u64 {
+        let _ = ctx;
         let slot = state::read(&self.len_slot).unwrap_or([0u8; 32]);
         u64::from_slot(slot)
     }
 
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn is_empty(&self, ctx: &Context) -> bool {
+        self.len(ctx) == 0
+    }
 
-    pub fn get(&self, index: u64) -> Option<T> {
-        if index >= self.len() {
+    /// Read the value at `index`. Returns `None` if `index >= len`.
+    pub fn get(&self, ctx: &Context, index: u64) -> Option<T> {
+        if index >= self.len(ctx) {
             return None;
         }
         let slot = self.element_slot(index);
@@ -405,15 +433,18 @@ impl<T: SlotEncode> VecStore<T> {
         Some(T::from_slot(bytes))
     }
 
-    pub fn push(&self, value: &T) {
-        let len = self.len();
+    /// Append `value` at the next index and bump the length slot.
+    /// `&mut Context` keeps view handlers out.
+    pub fn push(&self, ctx: &mut Context, value: &T) {
+        let len = self.len(ctx);
         let slot = self.element_slot(len);
         state::write(&slot, &value.to_slot());
         state::write(&self.len_slot, &(len + 1).to_slot());
     }
 
-    pub fn set(&self, index: u64, value: &T) -> Result<()> {
-        if index >= self.len() {
+    /// Overwrite the element at `index`. `&mut Context` required.
+    pub fn set(&self, ctx: &mut Context, index: u64, value: &T) -> Result<()> {
+        if index >= self.len(ctx) {
             return Err(out_of_bounds());
         }
         let slot = self.element_slot(index);

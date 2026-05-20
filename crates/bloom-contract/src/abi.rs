@@ -132,6 +132,7 @@ abi_type_const!(u128, "u128", TypeSchema::U128);
 abi_type_const!(U256, "u256", TypeSchema::U256);
 abi_type_const!(Address, "address", TypeSchema::Address);
 abi_type_const!(Hash32, "bytes32", TypeSchema::Hash32);
+abi_type_const!(crate::types::Bytes32String, "bytes32", TypeSchema::Hash32);
 
 impl AbiEncode for bool {
     fn encode_into(&self, enc: &mut Encoder) -> Result<(), AbiEncodeError> {
@@ -254,6 +255,18 @@ impl AbiEncode for Hash32 {
 impl AbiDecode for Hash32 {
     fn decode(buf: &mut Buf<'_>) -> Result<Self, AbiError> {
         buf.read_bytes32().map(Hash32)
+    }
+}
+
+impl AbiEncode for crate::types::Bytes32String {
+    fn encode_into(&self, enc: &mut Encoder) -> Result<(), AbiEncodeError> {
+        enc.push_bytes32(&self.0);
+        Ok(())
+    }
+}
+impl AbiDecode for crate::types::Bytes32String {
+    fn decode(buf: &mut Buf<'_>) -> Result<Self, AbiError> {
+        buf.read_bytes32().map(crate::types::Bytes32String)
     }
 }
 
@@ -420,6 +433,7 @@ impl AbiArrayElement for u128 {}
 impl AbiArrayElement for U256 {}
 impl AbiArrayElement for Address {}
 impl AbiArrayElement for Hash32 {}
+impl AbiArrayElement for crate::types::Bytes32String {}
 impl AbiArrayElement for String {}
 impl<T: AbiType> AbiArrayElement for Option<T> {}
 impl<T: AbiType> AbiArrayElement for Vec<T> {}

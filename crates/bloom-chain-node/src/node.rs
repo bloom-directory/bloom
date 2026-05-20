@@ -290,10 +290,23 @@ impl Node {
             block_emission: BLOCK_EMISSION,
         });
 
-        // Timeout delivery channel: Action::StartTimeout spawns a task that
-        // sleeps then sends the kind to this channel; a separate task drives
-        // the engine via `step(Event::Tick(kind))`.
-        let (timeout_tx, mut timeout_rx) = mpsc::channel::<TimeoutKind>(64);
+        // Timeout delivery channel: `Action::StartTimeout` spawns a task that
+        // sleeps then sends `(kind, height, round)` to this channel; a separate
+        // task drives the engine via `step(Event::Tick(kind))`.
+        //
+        // The `(height, round)` pair is the engine state captured at the
+        // moment the timer was *scheduled*. The consumer compares it against
+        // the engine's *current* `(height, round)` and silently drops the
+        // tick if they no longer match. Without this guard, stale timers
+        // from earlier rounds/heights bleed across transitions: when a
+        // Precommit scheduled at h=N r=R fires 500ms later, the engine may
+        // already be at h=N r=R+1 in step Precommit again — `on_tick` would
+        // see `step == Precommit` and call `advance_round`, skipping rounds
+        // arbitrarily. Caught by the 4-validator docker DEX acceptance test
+        // at h=29 (val2 reached r=8+ in milliseconds while other validators
+        // were still at r=0–1).
+        let (timeout_tx, mut timeout_rx) =
+            mpsc::channel::<(TimeoutKind, u64, u32)>(64);
         let timeout_tx = Arc::new(timeout_tx);
 
         // ── 7. RPC server ─────────────────────────────────────────────────────
@@ -526,6 +539,7 @@ impl Node {
                         // get here via the normal happy-path (proposer broadcast
                         // before us seeing precommits).
                         let block_height = block.header.height;
+                        let block_hash = block.header.block_hash();
                         { driver_ev.engine.lock().register_block(block.clone()); }
                         // If we stashed a proposal earlier because its block
                         // was unknown (review 2026-05-19 #3 gate), now that
@@ -540,6 +554,27 @@ impl Node {
                                 Arc::clone(&peer_pool_ev),
                                 Arc::clone(&timeout_tx_ev),
                                 resume_actions,
+                            )
+                            .await;
+                        }
+                        // If 2f+1 precommits for this block already arrived
+                        // before its body did (reordered or proposer's
+                        // BlockResponse delayed), the precommit tally has
+                        // quorum but `on_vote`'s commit gate was skipped
+                        // because `blocks.get(&hash)` returned None. Re-check
+                        // now that the body is registered — without this,
+                        // a single TCP reorder strands the validator until a
+                        // round timeout, and chain-sync only kicks in once
+                        // it has fallen multiple blocks behind.
+                        let commit_actions = {
+                            driver_ev.engine.lock().try_commit_with_block(block_hash)
+                        };
+                        if !commit_actions.is_empty() {
+                            process_actions(
+                                Arc::clone(&driver_ev),
+                                Arc::clone(&peer_pool_ev),
+                                Arc::clone(&timeout_tx_ev),
+                                commit_actions,
                             )
                             .await;
                         }
@@ -662,8 +697,28 @@ impl Node {
         let peer_pool_to = Arc::clone(&peer_pool);
         let timeout_tx_to = Arc::clone(&timeout_tx);
         tokio::spawn(async move {
-            while let Some(kind) = timeout_rx.recv().await {
-                let actions = { driver_to.engine.lock().step(Event::Tick(kind)) };
+            while let Some((kind, ts_height, ts_round)) = timeout_rx.recv().await {
+                // Drop ticks whose (height, round) no longer match the engine.
+                // This handles the case where a timer was scheduled for an
+                // earlier round and the engine has since advanced — without
+                // this guard, an `on_tick(Precommit)` whose `step==Precommit`
+                // would call `advance_round` and skip the current round even
+                // though the proposer has not actually timed out.
+                let actions = {
+                    let mut eng = driver_to.engine.lock();
+                    if eng.height() != ts_height || eng.round() != ts_round {
+                        debug!(
+                            ?kind,
+                            ts_height,
+                            ts_round,
+                            cur_height = eng.height(),
+                            cur_round = eng.round(),
+                            "consensus.timeout stale, dropping"
+                        );
+                        continue;
+                    }
+                    eng.step(Event::Tick(kind))
+                };
                 process_actions(
                     Arc::clone(&driver_to),
                     Arc::clone(&peer_pool_to),
@@ -745,7 +800,7 @@ const TIMEOUT_COMMIT: Duration = Duration::from_secs(1);
 fn process_actions<E: crate::consensus_driver::PetalExecutor>(
     driver: Arc<ConsensusDriver<E>>,
     peer_pool: Arc<PeerPool>,
-    timeout_tx: Arc<mpsc::Sender<TimeoutKind>>,
+    timeout_tx: Arc<mpsc::Sender<(TimeoutKind, u64, u32)>>,
     actions: Vec<Action>,
 ) -> BoxFut<'static, ()> {
     Box::pin(async move {
@@ -827,24 +882,46 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                     {
                         driver.engine.lock().mempool.remove_included(&block_with_commit.txs);
                     }
-                    // Schedule the next height after TIMEOUT_COMMIT.  This
-                    // enforces the 1s block cadence: without it, healthy
-                    // consensus rounds would commit back-to-back at hundreds
-                    // of blocks/sec.  We spawn so the calling task (often
-                    // the inbound vote loop) is not blocked for 1s.
+                    // Enter the next height IMMEDIATELY. The state machine
+                    // returns a `StartTimeout(Propose, 500ms)` we deliberately
+                    // discard — we'll arm the propose timer after a full
+                    // TIMEOUT_COMMIT (1s) below.
+                    //
+                    // The previous design slept for TIMEOUT_COMMIT *before*
+                    // calling `enter_next_height`, which left the engine at
+                    // height H while peers (committed slightly earlier) were
+                    // already broadcasting proposals and votes for H+1. The
+                    // inbound-frame gate at `frame.vote recv` / `frame.proposal
+                    // recv` drops frames whose height > my_height, so an
+                    // entire round of votes for H+1 vanished. The validator
+                    // then sat in Propose step until its 500ms propose
+                    // timeout fired nil-prevote, by which point the rest of
+                    // the network had moved on — repeated for every height,
+                    // the trailing validator never recovers. Caught by the
+                    // 4-validator docker DEX acceptance test (val2 stuck at
+                    // height 13).
+                    let _drop_propose_timeout = {
+                        driver.engine.lock().enter_next_height(height + 1)
+                    };
+                    // After TIMEOUT_COMMIT: arm the propose timer and let the
+                    // local validator (if it's the proposer for h+1 r=0) build
+                    // a block. The 1s gap enforces the block cadence; inbound
+                    // frames for h+1 arriving during the gap are accepted
+                    // because engine.height is already h+1.
                     let driver_c = Arc::clone(&driver);
                     let peer_pool_c = Arc::clone(&peer_pool);
                     let timeout_tx_c = Arc::clone(&timeout_tx);
                     tokio::spawn(async move {
                         tokio::time::sleep(TIMEOUT_COMMIT).await;
-                        let next_actions = {
-                            driver_c.engine.lock().enter_next_height(height + 1)
-                        };
+                        let kickoff = vec![Action::StartTimeout(
+                            TimeoutKind::Propose,
+                            Duration::from_millis(500),
+                        )];
                         process_actions(
                             Arc::clone(&driver_c),
                             Arc::clone(&peer_pool_c),
                             Arc::clone(&timeout_tx_c),
-                            next_actions,
+                            kickoff,
                         )
                         .await;
                         let maybe_action = { driver_c.engine.lock().maybe_propose() };
@@ -860,11 +937,19 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                     });
                 }
                 Action::StartTimeout(kind, dur) => {
-                    debug!(?kind, ?dur, "consensus.timeout scheduled");
+                    // Capture the engine's (height, round) at schedule time so
+                    // the consumer can drop the tick if the engine has moved on
+                    // by the time the timer fires. See the channel declaration
+                    // above for the round-skip failure this guards against.
+                    let (h, r) = {
+                        let eng = driver.engine.lock();
+                        (eng.height(), eng.round())
+                    };
+                    debug!(?kind, ?dur, h, r, "consensus.timeout scheduled");
                     let tx = Arc::clone(&timeout_tx);
                     tokio::spawn(async move {
                         tokio::time::sleep(dur).await;
-                        let _ = tx.send(kind).await;
+                        let _ = tx.send((kind, h, r)).await;
                     });
                 }
             }

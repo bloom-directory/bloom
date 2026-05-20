@@ -21,10 +21,14 @@ bloom-petal-sdk = { workspace = true }
 # hand-rolled `calls` modules. Linking does not pull in their petal entry
 # points because the router only references items under `<crate>::calls` and
 # their interface marker types.
-bloom-dex-factory = { path = "../bloom-dex-factory", default-features = false }
-bloom-dex-pair    = { path = "../bloom-dex-pair",    default-features = false }
-bloom-dex-erc20   = { path = "../bloom-dex-erc20",   default-features = false }
-bloom-dex-wloom   = { path = "../../../wloom",       default-features = false }
+bloom-dex-factory = { path = "../bloom-dex-factory", default-features = false, features = ["no-entrypoint"] }
+bloom-dex-pair    = { path = "../bloom-dex-pair",    default-features = false, features = ["no-entrypoint"] }
+bloom-dex-erc20   = { path = "../bloom-dex-erc20",   default-features = false, features = ["no-entrypoint"] }
+bloom-dex-wloom   = { path = "../../../wloom",       default-features = false, features = ["no-entrypoint"] }
+
+[features]
+# See bloom-dex-erc20/Cargo.toml for rationale.
+no-entrypoint = []
 
 # blake3 is used in host-side unit tests (non-wasm32) to verify selectors.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

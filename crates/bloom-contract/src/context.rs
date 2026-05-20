@@ -21,10 +21,11 @@ use core::marker::PhantomData;
 
 use alloc::vec::Vec;
 
-use bloom_petal_sdk::{block, msg, petal};
+use bloom_petal_sdk::{block, host, msg, petal};
 pub use bloom_petal_sdk::value::LoomValue;
 
 use crate::error::{ContractError, Result};
+use crate::interface::{ContractInterface, ContractRef};
 use crate::types::Address;
 
 /// Per-invocation runtime context.
@@ -78,10 +79,76 @@ impl Context {
         msg::calldata()
     }
 
-    /// Perform a typed cross-contract call. `&mut` because the callee can
-    /// mutate state; the dispatcher rolls back the callee on revert via
-    /// snapshot semantics, so this is safe for nested calls.
-    pub fn raw_call(
+    // -----------------------------------------------------------------
+    // Typed cross-contract gateway
+    // -----------------------------------------------------------------
+
+    /// Construct a typed [`ContractRef<I>`] for a deployed contract at
+    /// `address`. The returned ref exposes the interface's `<I>Calls`
+    /// extension trait methods — each one takes `&mut Context`, so
+    /// nested calls are spelled as `factory.create_pair(ctx, ...)`
+    /// rather than `ctx.raw_call(&factory, &cd, ...)`.
+    ///
+    /// This is the spec-level entry point users should reach for. The
+    /// raw byte-level call helper is intentionally `#[doc(hidden)]` —
+    /// it exists so the interface macro can implement `<I>Calls`
+    /// without going through `Context` itself, but contract authors
+    /// shouldn't touch it.
+    #[inline]
+    pub fn call<I: ContractInterface>(&mut self, address: Address) -> ContractRef<I> {
+        let _ = self; // future-proof: keeps the `&mut` binding in scope
+        ContractRef::<I>::new(address)
+    }
+
+    /// Deploy a fresh contract instance from a petal hash, returning a
+    /// typed [`ContractRef<I>`] for the resulting address.
+    ///
+    /// - `petal_hash` is the chain-known hash of the petal blob (the
+    ///   `wasm_hash` recorded on `Account.code_hash`).
+    /// - `salt` is the caller-supplied 32-byte tag baked into the
+    ///   deterministic address derivation (see spec §7.7).
+    /// - `init` is the ABI-encoded init payload — typically built with
+    ///   `AbiEncode` then handed to the contract's `#[init]` handler.
+    ///
+    /// Errors propagate the host's error code as a `ContractError` so
+    /// `?` works in handler bodies without ad-hoc decoders.
+    pub fn deploy<I: ContractInterface>(
+        &mut self,
+        petal_hash: &[u8; 32],
+        salt: &[u8; 32],
+        init: &[u8],
+    ) -> Result<ContractRef<I>> {
+        let _ = self;
+        match host::deploy(petal_hash, salt, init) {
+            Ok(addr) => Ok(ContractRef::<I>::new(Address::from(addr))),
+            Err(code) => {
+                let mut data = Vec::with_capacity(16);
+                data.extend_from_slice(b"deploy_failed:");
+                data.extend_from_slice(&code.to_be_bytes());
+                Err(ContractError::new(data))
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Internal byte-level primitives
+    // -----------------------------------------------------------------
+    //
+    // Renamed to `__call_raw` / `__emit_raw` and marked `#[doc(hidden)]`
+    // so they don't appear in user-facing API docs. The interface
+    // macro's generated `<I>Calls` impls reach for these by name, and
+    // the event macro's `emit()` body does the same — they're plumbing
+    // that the framework itself owns. Contract authors should call
+    // `ctx.call::<I>(addr).method(ctx, ...)` instead of `ctx.raw_call`,
+    // and `MyEvent { ... }.emit(ctx)` instead of `ctx.emit_raw`.
+
+    /// Internal: perform a raw, untyped petal call.
+    ///
+    /// Used by `#[bloom::interface]` to implement typed call methods;
+    /// new contracts should reach the chain through
+    /// [`Context::call`] + the interface's extension trait, not this.
+    #[doc(hidden)]
+    pub fn __call_raw(
         &mut self,
         to: &Address,
         calldata: &[u8],
@@ -99,11 +166,14 @@ impl Context {
         }
     }
 
-    /// Emit a log entry under `topics` with `data` as the payload.
+    /// Internal: emit a log entry under raw topic bytes.
     ///
-    /// Topics are 32 bytes apiece. The `#[event]` macro builds the topic
-    /// list and ABI-encoded data; user code rarely calls this directly.
-    pub fn emit_raw(&mut self, topics: &[[u8; 32]], data: &[u8]) {
+    /// Called by the `#[event]` macro's `emit()` body. Contract authors
+    /// should construct the event struct and call `event.emit(ctx)`
+    /// instead of touching this directly.
+    #[doc(hidden)]
+    pub fn __emit_raw(&mut self, topics: &[[u8; 32]], data: &[u8]) {
         bloom_petal_sdk::log::emit_topics32(topics, data);
     }
 }
+

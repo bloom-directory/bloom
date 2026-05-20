@@ -68,6 +68,17 @@ teardown() {
     local rc=$?
     [ "$TEARDOWN_RAN" -eq 1 ] && return 0
     TEARDOWN_RAN=1
+    # Capture per-validator logs to BLOOM_DOCKER_LOG_DIR (default
+    # /tmp/bloom-dex-run) before teardown wipes the containers, regardless
+    # of whether the run passed or failed. Failing runs *also* dump a
+    # tail of the multiplexed compose log for at-a-glance diagnosis.
+    local log_dir="${BLOOM_DOCKER_LOG_DIR:-/tmp/bloom-dex-run}"
+    mkdir -p "$log_dir" || true
+    for i in $(seq 0 $((BLOOM_VALIDATOR_COUNT - 1))); do
+        name="bloom-val$i"
+        docker logs "$name" >"$log_dir/val$i.log" 2>&1 || true
+    done
+    log "captured per-validator logs to $log_dir/val{0..$((BLOOM_VALIDATOR_COUNT - 1))}.log"
     if [ "$rc" -ne 0 ]; then
         log "test failed (exit $rc) — dumping recent compose logs"
         (cd "$REPO_ROOT" && "${DC[@]}" -f "$COMPOSE_FILE" logs --tail=600) \

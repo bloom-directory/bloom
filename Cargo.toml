@@ -30,6 +30,7 @@ members = [
   "crates/bloom-contract-macros",
   "crates/bloom-contract-metadata",
   "crates/bloom-contract-build",
+  "crates/bloom-client-codegen",
   "crates/bloom-test-util",
   # ---- example apps (not part of the protocol) ----
   "examples/wloom",
@@ -122,6 +123,7 @@ bloom-contract    = { path = "crates/bloom-contract", default-features = false }
 bloom-contract-macros = { path = "crates/bloom-contract-macros" }
 bloom-contract-metadata = { path = "crates/bloom-contract-metadata" }
 bloom-contract-build = { path = "crates/bloom-contract-build" }
+bloom-client-codegen = { path = "crates/bloom-client-codegen" }
 # ---- example DEX crates (not part of the protocol) ----
 bloom-dex-factory = { path = "examples/dex/crates/bloom-dex-factory" }
 bloom-dex-pair    = { path = "examples/dex/crates/bloom-dex-pair" }

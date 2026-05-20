@@ -16,6 +16,9 @@ impl U256 {
     /// Zero.
     pub const ZERO: U256 = U256([0u8; 32]);
 
+    /// Maximum representable value (`2^256 - 1`).
+    pub const MAX: U256 = U256([0xff; 32]);
+
     /// Construct from a `u64`.
     pub fn from_u64(v: u64) -> Self {
         let mut b = [0u8; 32];
@@ -49,6 +52,28 @@ impl U256 {
     /// Raw bytes (big-endian).
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Return the larger of `self` and `other`.
+    pub fn max(self, other: Self) -> Self {
+        if self >= other { self } else { other }
+    }
+
+    /// Return the smaller of `self` and `other`.
+    pub fn min(self, other: Self) -> Self {
+        if self <= other { self } else { other }
+    }
+}
+
+impl From<u64> for U256 {
+    fn from(v: u64) -> Self {
+        U256::from_u64(v)
+    }
+}
+
+impl From<u128> for U256 {
+    fn from(v: u128) -> Self {
+        U256::from_u128(v)
     }
 }
 
@@ -174,6 +199,21 @@ impl U256 {
     /// Checked remainder. Returns `None` if `rhs` is zero.
     pub fn checked_rem(self, rhs: Self) -> Option<Self> {
         divmod_be(&self.0, &rhs.0).map(|(_, r)| U256(r))
+    }
+
+    /// Saturating addition. Returns `U256::MAX` on overflow.
+    pub fn saturating_add(self, rhs: Self) -> Self {
+        self.checked_add(rhs).unwrap_or(U256::MAX)
+    }
+
+    /// Saturating subtraction. Returns `U256::ZERO` on underflow.
+    pub fn saturating_sub(self, rhs: Self) -> Self {
+        self.checked_sub(rhs).unwrap_or(U256::ZERO)
+    }
+
+    /// Saturating multiplication. Returns `U256::MAX` on overflow.
+    pub fn saturating_mul(self, rhs: Self) -> Self {
+        self.checked_mul(rhs).unwrap_or(U256::MAX)
     }
 
     /// Integer square root via Babylonian iteration. Always succeeds (returns
@@ -354,5 +394,60 @@ mod tests {
         b[15] = 1;
         let v = U256(b);
         assert_eq!(v.to_u128_checked(), None);
+    }
+
+    #[test]
+    fn from_u64_via_into() {
+        let v: U256 = 42u64.into();
+        assert_eq!(v, U256::from_u64(42));
+    }
+
+    #[test]
+    fn from_u128_via_into() {
+        let v: U256 = 42u128.into();
+        assert_eq!(v, U256::from_u128(42));
+    }
+
+    #[test]
+    fn min_max() {
+        let a = U256::from_u64(1);
+        let b = U256::from_u64(2);
+        assert_eq!(a.min(b), a);
+        assert_eq!(a.max(b), b);
+        assert_eq!(b.min(a), a);
+        assert_eq!(b.max(a), b);
+        assert_eq!(a.min(a), a);
+        assert_eq!(a.max(a), a);
+    }
+
+    #[test]
+    fn saturating_add_saturates_at_max() {
+        let max = U256::MAX;
+        let one = U256::from_u64(1);
+        assert_eq!(max.saturating_add(one), U256::MAX);
+        assert_eq!(one.saturating_add(one), U256::from_u64(2));
+    }
+
+    #[test]
+    fn saturating_sub_saturates_at_zero() {
+        let zero = U256::ZERO;
+        let one = U256::from_u64(1);
+        assert_eq!(zero.saturating_sub(one), U256::ZERO);
+        assert_eq!(U256::from_u64(5).saturating_sub(U256::from_u64(2)), U256::from_u64(3));
+    }
+
+    #[test]
+    fn saturating_mul_saturates_at_max() {
+        let hi = {
+            let mut b = [0u8; 32];
+            b[15] = 1;
+            U256(b)
+        };
+        assert_eq!(hi.saturating_mul(hi), U256::MAX);
+    }
+
+    #[test]
+    fn max_const_matches_all_ones() {
+        assert_eq!(U256::MAX.0, [0xff; 32]);
     }
 }

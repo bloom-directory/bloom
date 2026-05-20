@@ -16,6 +16,8 @@ bloom-chain-types = { path = "../../../../crates/bloom-chain-types" }
 bloom-keystore.workspace = true
 bloom-chain-abi = { workspace = true, default-features = false, features = ["std"] }
 bloom-dex-erc20 = { path = "../bloom-dex-erc20", default-features = false }
+bloom-dex-factory = { workspace = true }
+bloom-dex-router = { path = "../bloom-dex-router", default-features = false }
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

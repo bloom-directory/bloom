@@ -66,31 +66,15 @@ pub trait Wloom {
 /// and is not decremented by `transfer_from` (standard ERC-20 convention).
 const U256_MAX: U256 = U256([0xff; 32]);
 
-/// ASCII bytes of the on-chain name (right-padded into a `Hash32` slot).
-const NAME_BYTES: &[u8] = b"Wrapped LOOM";
-
-/// ASCII bytes of the on-chain symbol (right-padded into a `Hash32` slot).
-const SYMBOL_BYTES: &[u8] = b"wLOOM";
-
 /// Token decimal places. Returned as a single byte via `AbiEncode for u8`.
 const DECIMALS: u8 = 18;
 
-/// Right-align `bytes` (≤ 32 bytes) into a 32-byte slot so the trailing
-/// bytes hold the ASCII data (zeros to the left). Matches the legacy
-/// `name_bytes32` / `symbol_bytes32` layout used by the chain-ABI macro.
-const fn pad_left_32(bytes: &[u8]) -> Hash32 {
-    let mut slot = [0u8; 32];
-    let offset = 32 - bytes.len();
-    let mut i = 0;
-    while i < bytes.len() {
-        slot[offset + i] = bytes[i];
-        i += 1;
-    }
-    Hash32(slot)
-}
+/// On-chain name (left-padded into a 32-byte slot — wLOOM layout
+/// convention: zeros first, ASCII trailing).
+const NAME_SLOT: Bytes32String = Bytes32String::pad_left("Wrapped LOOM");
 
-const NAME_SLOT: Hash32 = pad_left_32(NAME_BYTES);
-const SYMBOL_SLOT: Hash32 = pad_left_32(SYMBOL_BYTES);
+/// On-chain symbol (left-padded into a 32-byte slot).
+const SYMBOL_SLOT: Bytes32String = Bytes32String::pad_left("wLOOM");
 
 // ---------------------------------------------------------------------------
 // Contract body
@@ -144,7 +128,7 @@ pub mod wloom {
     #[init]
     pub fn init(ctx: &mut Context) -> Result<()> {
         let state = State::load(ctx)?;
-        state.total_supply.store(&U256::ZERO);
+        state.total_supply.store(ctx, &U256::ZERO);
         Ok(())
     }
 
@@ -154,12 +138,12 @@ pub mod wloom {
 
     #[view]
     pub fn name(_ctx: &Context) -> Result<Hash32> {
-        Ok(NAME_SLOT)
+        Ok(NAME_SLOT.into())
     }
 
     #[view]
     pub fn symbol(_ctx: &Context) -> Result<Hash32> {
-        Ok(SYMBOL_SLOT)
+        Ok(SYMBOL_SLOT.into())
     }
 
     #[view]
@@ -169,17 +153,17 @@ pub mod wloom {
 
     #[view]
     pub fn total_supply(ctx: &Context) -> Result<U256> {
-        Ok(State::load(ctx)?.total_supply.load())
+        Ok(State::load(ctx)?.total_supply.load(ctx))
     }
 
     #[view]
     pub fn balance_of(ctx: &Context, owner: Address) -> Result<U256> {
-        State::load(ctx)?.balances.get(&owner)
+        State::load(ctx)?.balances.get(ctx, &owner)
     }
 
     #[view]
     pub fn allowance(ctx: &Context, owner: Address, spender: Address) -> Result<U256> {
-        State::load(ctx)?.allowances.get(&(owner, spender))
+        State::load(ctx)?.allowances.get(ctx, &(owner, spender))
     }
 
     // -----------------------------------------------------------------------
@@ -189,7 +173,7 @@ pub mod wloom {
     pub fn transfer(ctx: &mut Context, to: Address, amount: U256) -> Result<bool> {
         let state = State::load(ctx)?;
         let sender = ctx.sender();
-        do_transfer(&state, &sender, &to, amount)?;
+        do_transfer(ctx, &state, &sender, &to, amount)?;
         Transfer { from: sender, to, value: amount }.emit(ctx)?;
         Ok(true)
     }
@@ -203,15 +187,15 @@ pub mod wloom {
         let state = State::load(ctx)?;
         let caller = ctx.sender();
 
-        let current = state.allowances.get(&(from, caller))?;
+        let current = state.allowances.get(ctx, &(from, caller))?;
         if current != U256_MAX {
             let new_allow = current
                 .checked_sub(amount)
                 .ok_or_else(|| ContractError::from_str("wloom: insufficient allowance"))?;
-            state.allowances.set(&(from, caller), &new_allow)?;
+            state.allowances.set(ctx, &(from, caller), &new_allow)?;
         }
 
-        do_transfer(&state, &from, &to, amount)?;
+        do_transfer(ctx, &state, &from, &to, amount)?;
         Transfer { from, to, value: amount }.emit(ctx)?;
         Ok(true)
     }
@@ -219,7 +203,7 @@ pub mod wloom {
     pub fn approve(ctx: &mut Context, spender: Address, value: U256) -> Result<bool> {
         let state = State::load(ctx)?;
         let owner = ctx.sender();
-        state.allowances.set(&(owner, spender), &value)?;
+        state.allowances.set(ctx, &(owner, spender), &value)?;
         Approval { owner, spender, value }.emit(ctx)?;
         Ok(true)
     }
@@ -241,22 +225,22 @@ pub mod wloom {
     pub fn deposit(ctx: &mut Context) -> Result<()> {
         let sender = ctx.sender();
         let value = ctx.value();
-        let amount = U256::from_u128(value.to_u128());
+        let amount = U256::from(value);
 
         if !amount.is_zero() {
             let state = State::load(ctx)?;
 
-            let ts = state.total_supply.load();
+            let ts = state.total_supply.load(ctx);
             let new_ts = ts
                 .checked_add(amount)
                 .ok_or_else(|| ContractError::from_str("wloom: total supply overflow"))?;
-            state.total_supply.store(&new_ts);
+            state.total_supply.store(ctx, &new_ts);
 
-            let bal = state.balances.get(&sender)?;
+            let bal = state.balances.get(ctx, &sender)?;
             let new_bal = bal
                 .checked_add(amount)
                 .ok_or_else(|| ContractError::from_str("wloom: balance overflow"))?;
-            state.balances.set(&sender, &new_bal)?;
+            state.balances.set(ctx, &sender, &new_bal)?;
 
             Deposit { dst: sender, value: amount }.emit(ctx)?;
             Transfer { from: Address::ZERO, to: sender, value: amount }.emit(ctx)?;
@@ -278,17 +262,17 @@ pub mod wloom {
         let sender = ctx.sender();
         let state = State::load(ctx)?;
 
-        let bal = state.balances.get(&sender)?;
+        let bal = state.balances.get(ctx, &sender)?;
         let new_bal = bal
             .checked_sub(amount)
             .ok_or_else(|| ContractError::from_str("wloom: insufficient balance"))?;
-        state.balances.set(&sender, &new_bal)?;
+        state.balances.set(ctx, &sender, &new_bal)?;
 
-        let ts = state.total_supply.load();
+        let ts = state.total_supply.load(ctx);
         let new_ts = ts
             .checked_sub(amount)
             .ok_or_else(|| ContractError::from_str("wloom: total supply underflow"))?;
-        state.total_supply.store(&new_ts);
+        state.total_supply.store(ctx, &new_ts);
 
         Withdrawal { src: sender, value: amount }.emit(ctx)?;
         Transfer { from: sender, to: Address::ZERO, value: amount }.emit(ctx)?;
@@ -296,9 +280,9 @@ pub mod wloom {
         // wLOOM mints are gated through deposits, so any in-supply balance
         // fits in u128 (the native LOOM type). The explicit conversion guards
         // any future path that could put a >u128 amount here.
-        let value = LoomValue::try_from_be_u256_bytes(&amount.0)
+        let value = LoomValue::try_from(amount)
             .map_err(|_| ContractError::from_str("wloom: withdraw amount exceeds u128"))?;
-        ctx.raw_call(&sender, &[], value)
+        ctx.__call_raw(&sender, &[], value)
             .map_err(|_| ContractError::from_str("wloom: native LOOM transfer failed"))?;
         Ok(())
     }
@@ -309,6 +293,7 @@ pub mod wloom {
     // -----------------------------------------------------------------------
 
     pub(crate) fn do_transfer(
+        ctx: &mut Context,
         state: &State,
         from: &Address,
         to: &Address,
@@ -317,16 +302,16 @@ pub mod wloom {
         if amount.is_zero() {
             return Ok(());
         }
-        let bal_from = state.balances.get(from)?;
+        let bal_from = state.balances.get(ctx, from)?;
         let new_from = bal_from
             .checked_sub(amount)
             .ok_or_else(|| ContractError::from_str("wloom: insufficient balance"))?;
-        state.balances.set(from, &new_from)?;
-        let bal_to = state.balances.get(to)?;
+        state.balances.set(ctx, from, &new_from)?;
+        let bal_to = state.balances.get(ctx, to)?;
         let new_to = bal_to
             .checked_add(amount)
             .ok_or_else(|| ContractError::from_str("wloom: balance overflow"))?;
-        state.balances.set(to, &new_to)?;
+        state.balances.set(ctx, to, &new_to)?;
         Ok(())
     }
 }

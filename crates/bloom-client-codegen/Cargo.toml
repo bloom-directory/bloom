@@ -1,0 +1,17 @@
+[package]
+name = "bloom-client-codegen"
+version = "0.1.0"
+edition = "2024"
+description = "Generate typed off-chain calldata builders from a compiled contract's bloom_interfaces wasm custom section."
+license = "MIT"
+
+[lib]
+name = "bloom_client_codegen"
+
+[dependencies]
+bloom-contract-metadata = { workspace = true }
+bloom-contract-build = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+wat = { workspace = true }

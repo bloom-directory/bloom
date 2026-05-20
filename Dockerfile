@@ -28,7 +28,13 @@ WORKDIR /build
 ENV CARGO_TERM_COLOR=always \
     CARGO_NET_RETRY=10 \
     RUST_BACKTRACE=1
+# Pre-install all components that the workspace's rust-toolchain.toml lists
+# (channel = "stable", components = ["rustfmt", "clippy"]). Without this,
+# the first cargo invocation in the planner stage triggers a rustup channel
+# sync to install the missing components — which fails inside BuildKit when
+# its DNS path is flaky, killing the build before cargo even starts.
 RUN rustup target add wasm32-unknown-unknown \
+ && rustup component add rustfmt clippy \
  && cargo install cargo-chef --locked --version ^0.1
 
 # ----------------------------------------------------------------------------
@@ -64,13 +70,24 @@ RUN rustup target add wasm32-unknown-unknown
 # Host binaries.
 RUN cargo build --release -p bloom -p bloom-dex-cli
 
-# DEX petal wasm artefacts.
-RUN cargo build --release --target wasm32-unknown-unknown \
-        -p bloom-dex-erc20 \
-        -p bloom-dex-factory \
-        -p bloom-dex-pair \
-        -p bloom-dex-wloom \
-        -p bloom-dex-router
+# DEX petal wasm artefacts. We build each contract in its own `cargo build`
+# invocation rather than a single multi-package build. Why: each contract
+# crate uses `crate-type = ["cdylib", "rlib"]` (cdylib for the on-chain
+# petal, rlib for sibling petals to import the typed `ContractRef` gateway)
+# and the framework's `#[bloom::contract]` macro emits `init` / `call` wasm
+# exports gated on `not(feature = "no-entrypoint")`. Sibling crates depend
+# with `features = ["no-entrypoint"]` so the dep's exports don't leak into
+# the dependent's cdylib. A single multi-package `cargo build` UNIFIES
+# features across packages — so e.g. erc20 (a root target here AND a dep
+# of pair/router/wloom) would be built with `no-entrypoint = ON`, producing
+# an erc20.wasm with no entry points and no functional contract. Separate
+# invocations resolve features per-package, so each contract's own wasm
+# keeps its entry points while sibling deps stay quiet.
+RUN cargo build --release --target wasm32-unknown-unknown -p bloom-dex-erc20
+RUN cargo build --release --target wasm32-unknown-unknown -p bloom-dex-factory
+RUN cargo build --release --target wasm32-unknown-unknown -p bloom-dex-pair
+RUN cargo build --release --target wasm32-unknown-unknown -p bloom-dex-wloom
+RUN cargo build --release --target wasm32-unknown-unknown -p bloom-dex-router
 
 # Stage outputs into /out so the runtime COPY is dead-simple.
 RUN set -eux; \
