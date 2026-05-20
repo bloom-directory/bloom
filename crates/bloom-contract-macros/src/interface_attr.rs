@@ -45,6 +45,8 @@ use syn::{
     PathArguments, ReturnType, TraitItem, TraitItemFn, Type, parse_macro_input,
 };
 
+use crate::sig::build_method_signature;
+
 pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     let trait_decl = parse_macro_input!(item as ItemTrait);
     let trait_ident = trait_decl.ident.clone();
@@ -310,53 +312,6 @@ fn extract_ok_type(ty: &Type) -> syn::Result<Type> {
         ty,
         "interface method return type must be `Result<T>` or `Result<T, E>`",
     ))
-}
-
-fn build_method_signature(domain: &str, method: &str, args: &[Type]) -> String {
-    let mut s = String::new();
-    s.push_str(domain);
-    s.push('.');
-    s.push_str(method);
-    s.push('(');
-    let mut first = true;
-    for ty in args {
-        if !first {
-            s.push(',');
-        }
-        first = false;
-        render_type(&mut s, ty);
-    }
-    s.push(')');
-    s
-}
-
-/// Render a Rust type into the canonical ABI signature form: lowercased
-/// last-segment ident, with angle-bracketed generic args expanded
-/// recursively. `Vec<Address>` → `vec<address>`, `Option<U256>` → `option<u256>`.
-fn render_type(s: &mut String, ty: &Type) {
-    if let Type::Path(tp) = ty {
-        if let Some(seg) = tp.path.segments.last() {
-            s.push_str(&seg.ident.to_string().to_ascii_lowercase());
-            if let PathArguments::AngleBracketed(ab) = &seg.arguments {
-                s.push('<');
-                let mut first = true;
-                for arg in &ab.args {
-                    if !first {
-                        s.push(',');
-                    }
-                    first = false;
-                    if let GenericArgument::Type(t) = arg {
-                        render_type(s, t);
-                    } else {
-                        s.push('?');
-                    }
-                }
-                s.push('>');
-            }
-            return;
-        }
-    }
-    s.push('?');
 }
 
 fn screaming_snake(s: &str) -> String {

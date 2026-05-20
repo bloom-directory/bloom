@@ -85,6 +85,10 @@ pub enum TypeSchema {
     BytesFixed { len: u32 },
     /// Variable-length vector of homogenous elements.
     Vec(Box<TypeSchema>),
+    /// Variable-length vector with a static byte/element cap.
+    VecN { elem: Box<TypeSchema>, max: u32 },
+    /// Fixed-length array of homogenous elements (`[T; N]` / `ArrayN<T, N>`).
+    Array { elem: Box<TypeSchema>, len: u32 },
     /// Heterogeneous tuple.
     Tuple(Vec<TypeSchema>),
     /// Optional `T`, length-prefixed `0`/`1`.
@@ -346,8 +350,80 @@ impl<T: AbiDecode> AbiDecode for Option<T> {
     }
 }
 
+// `Result<T, E>` — encoded as `0u8 || T` for `Ok(T)`, `1u8 || E` for `Err(E)`.
+//
+// This is the wire form used by returning typed errors from a handler when
+// the caller wants to disambiguate without re-decoding revert bytes. Most
+// `#[bloom::contract]` handlers return `Result<T, ContractError>` which
+// short-circuits to `petal.revert` and never round-trips through the
+// `AbiEncode` impl below; this impl matters when `Result<T, E>` appears
+// inside a return tuple or struct (e.g. `Result<u256, Erc20Error>` as a
+// nested type).
+impl<T: AbiType, E: AbiType> AbiType for core::result::Result<T, E> {
+    const ABI_TYPE: &'static str = "result";
+    fn schema() -> TypeSchema {
+        TypeSchema::Result {
+            ok: alloc::boxed::Box::new(T::schema()),
+            err: alloc::boxed::Box::new(E::schema()),
+        }
+    }
+}
+impl<T: AbiEncode, E: AbiEncode> AbiEncode for core::result::Result<T, E> {
+    fn encode_into(&self, enc: &mut Encoder) -> Result<(), AbiEncodeError> {
+        match self {
+            Ok(v) => {
+                enc.push_bytes(&[0u8]);
+                v.encode_into(enc)
+            }
+            Err(e) => {
+                enc.push_bytes(&[1u8]);
+                e.encode_into(enc)
+            }
+        }
+    }
+}
+impl<T: AbiDecode, E: AbiDecode> AbiDecode for core::result::Result<T, E> {
+    fn decode(buf: &mut Buf<'_>) -> Result<Self, AbiError> {
+        let tag = u8::decode(buf)?;
+        match tag {
+            0 => Ok(Ok(T::decode(buf)?)),
+            1 => Ok(Err(E::decode(buf)?)),
+            other => Err(AbiError::InvalidDiscriminant(other)),
+        }
+    }
+}
+
 // `[u8; N]` — fixed-length byte arrays. Used by event topic arrays and
-// `BytesN<N>` internals.
+// `BytesN<N>` internals. Encodes byte-for-byte (no length prefix) because
+// the length is part of the type.
+//
+// `[T; N]` for general `T` uses the same "no length prefix" rule but encodes
+// each element through its `AbiEncode` impl. These two impls overlap on
+// `[u8; N]` — we keep the byte path as a thin specialization because the
+// `bytes_fixed` schema label is hard-coded into the wire format for events
+// (topic arrays) and `BytesN<N>`. To avoid the impl collision Rust would
+// flag on `[u8; N]`, the general path lives behind a marker trait so it
+// only fires for non-`u8` element types.
+
+/// Marker trait — element types eligible for the general `[T; N]` impl.
+///
+/// `u8` deliberately *does not* implement this so `[u8; N]` keeps its
+/// dedicated `bytes_fixed` form. Everything else with `AbiType` does, via
+/// the blanket impl below.
+pub trait AbiArrayElement: AbiType {}
+
+impl AbiArrayElement for bool {}
+impl AbiArrayElement for u16 {}
+impl AbiArrayElement for u32 {}
+impl AbiArrayElement for u64 {}
+impl AbiArrayElement for u128 {}
+impl AbiArrayElement for U256 {}
+impl AbiArrayElement for Address {}
+impl AbiArrayElement for Hash32 {}
+impl AbiArrayElement for String {}
+impl<T: AbiType> AbiArrayElement for Option<T> {}
+impl<T: AbiType> AbiArrayElement for Vec<T> {}
+
 impl<const N: usize> AbiType for [u8; N] {
     const ABI_TYPE: &'static str = "bytes_fixed";
     fn schema() -> TypeSchema {
@@ -372,6 +448,48 @@ impl<const N: usize> AbiDecode for [u8; N] {
         buf.advance(N);
         Ok(arr)
     }
+}
+
+/// General fixed-length array `[T; N]` for any `T: AbiArrayElement`.
+///
+/// `T = u8` uses the byte-specialized impl above so existing `bytes_fixed`
+/// encoded payloads stay byte-for-byte the same.
+impl<T: AbiArrayElement, const N: usize> AbiType for ArrayN<T, N> {
+    const ABI_TYPE: &'static str = "array";
+    fn schema() -> TypeSchema {
+        TypeSchema::Array { elem: alloc::boxed::Box::new(T::schema()), len: N as u32 }
+    }
+}
+impl<T: AbiEncode + AbiArrayElement, const N: usize> AbiEncode for ArrayN<T, N> {
+    fn encode_into(&self, enc: &mut Encoder) -> Result<(), AbiEncodeError> {
+        for elem in &self.0 {
+            elem.encode_into(enc)?;
+        }
+        Ok(())
+    }
+}
+impl<T: AbiDecode + AbiArrayElement + Default + Copy, const N: usize> AbiDecode
+    for ArrayN<T, N>
+{
+    fn decode(buf: &mut Buf<'_>) -> Result<Self, AbiError> {
+        let mut arr: [T; N] = [T::default(); N];
+        for slot in arr.iter_mut() {
+            *slot = T::decode(buf)?;
+        }
+        Ok(ArrayN(arr))
+    }
+}
+
+/// Newtype wrapper around `[T; N]` enabling the general element-encoded
+/// fixed-length array codec. `[u8; N]` keeps its `bytes_fixed` form via the
+/// dedicated impl above; for any other element type, wrap in `ArrayN`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArrayN<T, const N: usize>(pub [T; N]);
+
+impl<T, const N: usize> ArrayN<T, N> {
+    pub fn new(inner: [T; N]) -> Self { Self(inner) }
+    pub fn into_inner(self) -> [T; N] { self.0 }
+    pub fn as_array(&self) -> &[T; N] { &self.0 }
 }
 
 // ---------------------------------------------------------------------------
@@ -464,6 +582,63 @@ impl<const N: usize> AbiDecode for StringN<N> {
             return Err(AbiError::TrailingBytes { remaining: s.len() - N });
         }
         Ok(Self(s))
+    }
+}
+
+/// A variable-length vector with a static element-count cap of `N`.
+///
+/// Wire format is identical to `Vec<T>` (u16-LE length + N encoded elements);
+/// the manifest schema records the cap so off-chain validators can reject
+/// over-sized calldata without instantiating the contract.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct VecN<T, const N: usize>(pub Vec<T>);
+
+impl<T, const N: usize> VecN<T, N> {
+    pub fn new(items: Vec<T>) -> Result<Self, AbiEncodeError> {
+        if items.len() > N {
+            return Err(AbiEncodeError::TooLong(items.len()));
+        }
+        Ok(Self(items))
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        self.0.as_slice()
+    }
+
+    pub fn into_inner(self) -> Vec<T> {
+        self.0
+    }
+}
+
+impl<T: AbiType, const N: usize> AbiType for VecN<T, N> {
+    const ABI_TYPE: &'static str = "vec";
+    fn schema() -> TypeSchema {
+        TypeSchema::VecN { elem: Box::new(T::schema()), max: N as u32 }
+    }
+}
+impl<T: AbiEncode, const N: usize> AbiEncode for VecN<T, N> {
+    fn encode_into(&self, enc: &mut Encoder) -> Result<(), AbiEncodeError> {
+        if self.0.len() > N {
+            return Err(AbiEncodeError::TooLong(self.0.len()));
+        }
+        enc.push_u16_len(self.0.len())?;
+        for item in &self.0 {
+            item.encode_into(enc)?;
+        }
+        Ok(())
+    }
+}
+impl<T: AbiDecode, const N: usize> AbiDecode for VecN<T, N> {
+    fn decode(buf: &mut Buf<'_>) -> Result<Self, AbiError> {
+        let n = buf.read_u16_len()?;
+        if n > N {
+            return Err(AbiError::VecOverflow { count: n, available: buf.remaining() });
+        }
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(T::decode(buf)?);
+        }
+        Ok(Self(out))
     }
 }
 
@@ -607,5 +782,79 @@ mod tests {
     #[test]
     fn schema_version_is_v1() {
         assert_eq!(ABI_SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn result_ok_branch_roundtrips() {
+        let v: core::result::Result<u64, u32> = Ok(0xDEAD_BEEF);
+        let bytes = v.encode().unwrap();
+        assert_eq!(bytes[0], 0u8);
+        let back: core::result::Result<u64, u32> = AbiDecode::decode_from(&bytes).unwrap();
+        assert_eq!(back, Ok(0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn result_err_branch_roundtrips() {
+        let v: core::result::Result<u64, u32> = Err(42);
+        let bytes = v.encode().unwrap();
+        assert_eq!(bytes[0], 1u8);
+        let back: core::result::Result<u64, u32> = AbiDecode::decode_from(&bytes).unwrap();
+        assert_eq!(back, Err(42));
+    }
+
+    #[test]
+    fn result_rejects_invalid_discriminant() {
+        let bytes = [2u8, 0, 0, 0, 0, 0, 0, 0, 0]; // tag=2 is neither Ok(0) nor Err(_)
+        let res: Result<core::result::Result<u64, u32>, AbiError> =
+            <core::result::Result<u64, u32> as AbiDecode>::decode_from(&bytes);
+        assert!(matches!(res, Err(AbiError::InvalidDiscriminant(2))));
+    }
+
+    #[test]
+    fn arrayn_roundtrip_u64() {
+        let arr = ArrayN::<u64, 3>::new([0x0102_0304_0506_0708, 0x0FEDCBA987654321, 0]);
+        let bytes = arr.encode().unwrap();
+        // 3 u64 elements * 8 bytes — no length prefix.
+        assert_eq!(bytes.len(), 24);
+        let back = ArrayN::<u64, 3>::decode_from(&bytes).unwrap();
+        assert_eq!(back, arr);
+    }
+
+    #[test]
+    fn arrayn_schema_records_length() {
+        match <ArrayN<u64, 5> as AbiType>::schema() {
+            TypeSchema::Array { len, .. } => assert_eq!(len, 5),
+            other => panic!("expected Array schema, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vecn_roundtrip_under_cap() {
+        let v = VecN::<u32, 4>::new(vec![1, 2, 3]).unwrap();
+        let bytes = v.encode().unwrap();
+        let back = VecN::<u32, 4>::decode_from(&bytes).unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[test]
+    fn vecn_rejects_oversize_on_construction() {
+        let res = VecN::<u32, 2>::new(vec![1, 2, 3]);
+        assert!(matches!(res, Err(AbiEncodeError::TooLong(3))));
+    }
+
+    #[test]
+    fn vecn_rejects_oversize_on_decode() {
+        // Build wire bytes for a Vec of 3 elements (3 > N=2 cap).
+        let raw = Vec::<u32>::from([1, 2, 3]).encode().unwrap();
+        let res = <VecN<u32, 2> as AbiDecode>::decode_from(&raw);
+        assert!(matches!(res, Err(AbiError::VecOverflow { count: 3, .. })));
+    }
+
+    #[test]
+    fn vecn_schema_records_max() {
+        match <VecN<u64, 8> as AbiType>::schema() {
+            TypeSchema::VecN { max, .. } => assert_eq!(max, 8),
+            other => panic!("expected VecN schema, got {other:?}"),
+        }
     }
 }

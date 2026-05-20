@@ -52,6 +52,7 @@ use syn::{
 };
 
 use crate::manifest::{self, ManifestMethod, Mutability as ManifestMutability};
+use crate::sig::build_method_signature;
 
 pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut module = parse_macro_input!(item as ItemMod);
@@ -677,53 +678,6 @@ fn extract_result_ok(ty: &Type) -> Option<Type> {
     } else {
         None
     }
-}
-
-fn build_method_signature(domain: &str, method: &str, args: &[Type]) -> String {
-    let mut s = String::new();
-    s.push_str(domain);
-    s.push('.');
-    s.push_str(method);
-    s.push('(');
-    let mut first = true;
-    for ty in args {
-        if !first {
-            s.push(',');
-        }
-        first = false;
-        render_type(&mut s, ty);
-    }
-    s.push(')');
-    s
-}
-
-/// Render a Rust type into the canonical ABI signature form: lowercased
-/// last-segment ident, with angle-bracketed generic args expanded
-/// recursively. `Vec<Address>` → `vec<address>`, `Option<U256>` → `option<u256>`.
-fn render_type(s: &mut String, ty: &Type) {
-    if let Type::Path(tp) = ty {
-        if let Some(seg) = tp.path.segments.last() {
-            s.push_str(&seg.ident.to_string().to_ascii_lowercase());
-            if let PathArguments::AngleBracketed(ab) = &seg.arguments {
-                s.push('<');
-                let mut first = true;
-                for arg in &ab.args {
-                    if !first {
-                        s.push(',');
-                    }
-                    first = false;
-                    if let GenericArgument::Type(t) = arg {
-                        render_type(s, t);
-                    } else {
-                        s.push('?');
-                    }
-                }
-                s.push('>');
-            }
-            return;
-        }
-    }
-    s.push('?');
 }
 
 fn screaming_snake(s: &str) -> String {

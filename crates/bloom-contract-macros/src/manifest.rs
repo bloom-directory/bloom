@@ -467,17 +467,13 @@ fn build_variant_signature(domain: &str, enum_name: &str, variant: &str, fields:
 // Shared formatting helpers
 // ===========================================================================
 
-/// Lowercase canonical type label — matches what the inner macros write
-/// into their signatures (`u256`, `address`, struct idents lowercased,
-/// etc.). Fallback `"?"` is intentional — the build tool sees the raw
-/// label and the user gets a chance to spot mismatches in the manifest.
+/// Canonical type label — matches the form selectors and topics are
+/// hashed against. `Vec<U256>` → `vec<u256>`, `(u8, u16)` → `(u8,u16)`,
+/// `[u8; 32]` → `[u8;32]`. Fallback `"?"` is intentional — the build tool
+/// sees the raw label and the user gets a chance to spot mismatches in
+/// the manifest.
 pub fn ty_label(ty: &Type) -> String {
-    if let Type::Path(tp) = ty {
-        if let Some(seg) = tp.path.segments.last() {
-            return seg.ident.to_string().to_ascii_lowercase();
-        }
-    }
-    "?".to_string()
+    crate::sig::type_label(ty)
 }
 
 fn hex_4(b: [u8; 4]) -> String {
