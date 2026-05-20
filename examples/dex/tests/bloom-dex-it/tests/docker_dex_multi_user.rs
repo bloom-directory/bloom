@@ -104,6 +104,13 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     // Pick val0 as our query client (any validator works after gossip).
     let client0 = &validator_clients[0];
 
+    eprintln!("================================================================");
+    eprintln!("  bloom DEX integration test  —  4-validator docker stack");
+    eprintln!("================================================================");
+    eprintln!("[stack] all 4 validators ready at height >= 2");
+    eprintln!("        endpoints: val0=127.0.0.1:{} val1=127.0.0.1:{} val2=127.0.0.1:{} val3=127.0.0.1:{}",
+        HOST_RPC_PORTS[0], HOST_RPC_PORTS[1], HOST_RPC_PORTS[2], HOST_RPC_PORTS[3]);
+
     // ── 2. Resolve treasury (validator 0) + create 3 user identities ──────
     let treasury_home = tmpdir.join("home0");
     let treasury_addr = wallet_addr_for_home(&treasury_home)?;
@@ -113,6 +120,12 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     let alice = create_user("alice", &users_root, &genesis_path, HOST_RPC_PORTS[0])?;
     let bob = create_user("bob", &users_root, &genesis_path, HOST_RPC_PORTS[1])?;
     let carol = create_user("carol", &users_root, &genesis_path, HOST_RPC_PORTS[2])?;
+
+    eprintln!();
+    eprintln!("[users] alice = {}  (signs via val0)", fmt_addr(&alice.addr));
+    eprintln!("        bob   = {}  (signs via val1)", fmt_addr(&bob.addr));
+    eprintln!("        carol = {}  (signs via val2)", fmt_addr(&carol.addr));
+    eprintln!("        treasury (val0 genesis allocation) = {}", fmt_addr(&treasury_addr));
 
     // ── 3. Fund each user from the treasury (validator 0 holds genesis) ──
     let treasury_rpc = format!("127.0.0.1:{}", HOST_RPC_PORTS[0]);
@@ -135,6 +148,9 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
             wait_for_account_loom(c, &user.addr, USER_LOOM_FUND).await?;
         }
     }
+
+    eprintln!();
+    eprintln!("[fund]  each user funded with {} LOOM from treasury", fmt_amount(USER_LOOM_FUND));
 
     // Capture an *atomic* (height, sum) snapshot. The chain commits a block
     // every second, so sum_loom_all_accounts() may straddle a commit and read
@@ -211,6 +227,13 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     )?;
     let pair_addr = derive_pair_addr(&factory_addr, &tka, &tkb, &pair_petal_hash);
 
+    eprintln!();
+    eprintln!("[deploy] alice deploys DEX suite:");
+    eprintln!("         factory = {}", fmt_addr(&factory_addr));
+    eprintln!("         TKA     = {}  (supply 1,000,000 * 1e18)", fmt_addr(&tka));
+    eprintln!("         TKB     = {}  (supply 1,000,000 * 1e18)", fmt_addr(&tkb));
+    eprintln!("         pair    = {}  (TKA/TKB)", fmt_addr(&pair_addr));
+
     // ── 5. Alice seeds the pool with liquidity ────────────────────────────
     dex_as(
         &alice,
@@ -230,6 +253,14 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     if alice_lp == 0 {
         bail!("alice has zero LP after add-liquidity");
     }
+
+    let (tka_res_init, tkb_res_init) = reserves_by_token(&tka, &tkb, r0_a, r1_a);
+    eprintln!();
+    eprintln!("[lp+]   alice adds liquidity:");
+    eprintln!("        deposit         : {} TKA  +  {} TKB", fmt_amount(ALICE_LIQ_A), fmt_amount(ALICE_LIQ_B));
+    eprintln!("        pool reserves   : {} TKA  /  {} TKB", fmt_amount(tka_res_init), fmt_amount(tkb_res_init));
+    eprintln!("        alice LP tokens : {}", fmt_amount(alice_lp));
+    eprintln!("        k_init = TKA*TKB = {:?}", k_init);
 
     // Alice's TKA / TKB right after seeding the pool. NOTE: this is captured
     // *before* the seed transfers to Bob / Carol below — those flow out of
@@ -255,6 +286,11 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     for c in &validator_clients {
         wait_for_erc20_balance(c, &tkb, &carol.addr, carol_seed_tkb).await?;
     }
+
+    eprintln!();
+    eprintln!("[seed]  alice transfers tokens to traders so they can swap:");
+    eprintln!("        alice -> bob   : {} TKA  (10x bob's swap-in)", fmt_amount(bob_seed_tka));
+    eprintln!("        alice -> carol : {} TKB  (10x carol's swap-in)", fmt_amount(carol_seed_tkb));
 
     // ── 7. Bob: swap TKA -> TKB ───────────────────────────────────────────
     let bob_tkb_before = query_erc20_balance(client0, &tkb, &bob.addr).await?;
@@ -310,6 +346,16 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
         );
     }
 
+    let (tka_res_post_bob, tkb_res_post_bob) = reserves_by_token(&tka, &tkb, r0_post_bob, r1_post_bob);
+    eprintln!();
+    eprintln!("[swap-1] bob:  TKA -> TKB");
+    eprintln!("         reserves pre  : {} TKA  /  {} TKB", fmt_amount(tka_res_pre_bob), fmt_amount(tkb_res_pre_bob));
+    eprintln!("         amount in     : {} TKA", fmt_amount(bob_tka_in));
+    eprintln!("         amount out    : {} TKB   (uniswap-v2 0.3% fee; expected exactly {})",
+        fmt_amount(bob_tkb_out), fmt_amount(expected_bob_out));
+    eprintln!("         reserves post : {} TKA  /  {} TKB", fmt_amount(tka_res_post_bob), fmt_amount(tkb_res_post_bob));
+    eprintln!("         k after bob   = {:?}   (>= k_init OK)", k_post_bob);
+
     // ── 8. Carol: swap TKB -> TKA ─────────────────────────────────────────
     let carol_tka_before = query_erc20_balance(client0, &tka, &carol.addr).await?;
     let carol_tkb_before = query_erc20_balance(client0, &tkb, &carol.addr).await?;
@@ -352,6 +398,17 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
             "carol TKA out mismatch: got {carol_tka_out} expected {expected_carol_out}"
         );
     }
+
+    let (tka_res_post_carol, tkb_res_post_carol) =
+        reserves_by_token(&tka, &tkb, r0_post_carol, r1_post_carol);
+    eprintln!();
+    eprintln!("[swap-2] carol: TKB -> TKA");
+    eprintln!("         reserves pre  : {} TKA  /  {} TKB", fmt_amount(tka_res_pre_carol), fmt_amount(tkb_res_pre_carol));
+    eprintln!("         amount in     : {} TKB", fmt_amount(carol_tkb_in));
+    eprintln!("         amount out    : {} TKA   (uniswap-v2 0.3% fee; expected exactly {})",
+        fmt_amount(carol_tka_out), fmt_amount(expected_carol_out));
+    eprintln!("         reserves post : {} TKA  /  {} TKB", fmt_amount(tka_res_post_carol), fmt_amount(tkb_res_post_carol));
+    eprintln!("         k after carol = {:?}   (>= k after bob OK)", k_post_carol);
 
     // ── 9. Alice removes all liquidity; must come out >= initial deposits ─
     let (r0_pre_burn, r1_pre_burn) = query_pair_reserves(client0, &pair_addr).await?;
@@ -402,6 +459,18 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
         );
     }
 
+    eprintln!();
+    eprintln!("[lp-]   alice burns all LP and redeems:");
+    eprintln!("        LP burned       : {}", fmt_amount(alice_lp));
+    eprintln!("        expected payout : {} TKA  +  {} TKB  (pro-rata of reserves)",
+        fmt_amount(expected_a_out), fmt_amount(expected_b_out));
+    eprintln!("        actual payout   : {} TKA  +  {} TKB",
+        fmt_amount(burn_amount0_tka), fmt_amount(burn_amount1_tkb));
+    eprintln!("        fee accrual     : pair paid {} > seeded {}  (delta {} from 0.3% LP fees on bob+carol)",
+        fmt_amount(total_paid_to_alice),
+        fmt_amount(total_seeded),
+        fmt_amount(total_paid_to_alice - total_seeded));
+
     // ── 10. LOOM conservation across all accounts ─────────────────────────
     let (end_height, end_total_loom) =
         atomic_height_and_loom_sum(client0, &treasury_addr, &[&alice, &bob, &carol]).await?;
@@ -414,10 +483,22 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
         );
     }
 
-    eprintln!(
-        "docker_dex_multi_user_acceptance: OK \
-         (blocks committed during test = {blocks_committed}, k_init={k_init:?}, k_final={k_post_carol:?})"
-    );
+    eprintln!();
+    eprintln!("[chain] LOOM conservation:");
+    eprintln!("        start sum (h={}) = {}", start_height, fmt_amount(start_total_loom));
+    eprintln!("        end   sum (h={}) = {}", end_height, fmt_amount(end_total_loom));
+    eprintln!("        delta = {} blocks * {} LOOM/block = {} LOOM",
+        blocks_committed,
+        fmt_amount(BLOCK_EMISSION),
+        fmt_amount((blocks_committed as u128) * BLOCK_EMISSION));
+
+    eprintln!();
+    eprintln!("================================================================");
+    eprintln!("  PASS  docker_dex_multi_user_acceptance");
+    eprintln!("        blocks committed during test : {}", blocks_committed);
+    eprintln!("        k_init  : {:?}", k_init);
+    eprintln!("        k_final : {:?}", k_post_carol);
+    eprintln!("================================================================");
     Ok(())
 }
 
@@ -679,4 +760,25 @@ async fn sum_loom_all_accounts(
             .ok_or_else(|| anyhow!("loom sum overflow"))?;
     }
     Ok(sum)
+}
+
+/// Format an 18-decimal fixed-point integer as a human-readable decimal,
+/// trimming trailing zeros. Used for trade-transcript prints only.
+fn fmt_amount(wei: u128) -> String {
+    const SCALE: u128 = 1_000_000_000_000_000_000;
+    let whole = wei / SCALE;
+    let frac = wei % SCALE;
+    if frac == 0 {
+        format!("{}", whole)
+    } else {
+        let s = format!("{:018}", frac);
+        let trimmed = s.trim_end_matches('0');
+        format!("{}.{}", whole, trimmed)
+    }
+}
+
+/// Short hex preview: `0xaabbcc…ddee`. For transcript prints only.
+fn fmt_addr(a: &[u8; 32]) -> String {
+    let h = hex::encode(a);
+    format!("0x{}..{}", &h[..6], &h[h.len() - 4..])
 }
