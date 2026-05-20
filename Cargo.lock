@@ -2528,6 +2528,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-resource"
+version = "0.1.0"
+dependencies = [
+ "bloom-chain-types",
+ "bloom-objects",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bloom-revert"
 version = "0.1.0"
 dependencies = [
