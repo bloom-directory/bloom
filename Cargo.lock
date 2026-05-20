@@ -2139,6 +2139,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "toml 0.8.23",
  "wasmparser 0.218.1",
  "wat",
 ]
@@ -2474,6 +2475,7 @@ dependencies = [
  "blake3",
  "bloom-chain-state",
  "bloom-chain-types",
+ "bloom-objects",
  "bloom-proto",
  "bloom-vfs",
  "futures",
@@ -2534,6 +2536,17 @@ dependencies = [
  "bloom-chain-types",
  "bloom-objects",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bloom-resource-macros"
+version = "0.1.0"
+dependencies = [
+ "bloom-objects",
+ "bloom-resource",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

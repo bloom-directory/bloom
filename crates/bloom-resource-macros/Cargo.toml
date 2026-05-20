@@ -1,0 +1,21 @@
+[package]
+name = "bloom-resource-macros"
+version = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+description = "Proc-macros for the Bloom-native contracts framework: #[bloom::petal], #[object], #[capability], #[invariant]."
+
+[lib]
+name = "bloom_resource_macros"
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
+bloom-objects = { workspace = true }
+
+[dev-dependencies]
+bloom-resource = { workspace = true }
