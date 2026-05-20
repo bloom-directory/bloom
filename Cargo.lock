@@ -2578,6 +2578,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-script"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bloom-chain-types",
+ "bloom-objects",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bloom-test-util"
 version = "0.1.0"
 dependencies = [
