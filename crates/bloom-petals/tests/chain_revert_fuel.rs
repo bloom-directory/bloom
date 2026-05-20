@@ -159,6 +159,7 @@ fn run_parent(child_mode_byte: u8) -> bloom_petals::ChainCallOutput {
             loom: 1_000_000,
             code_hash: Some(parent_hash),
             storage_root: Hash32([0u8; 32]),
+            manifest_hash: None,
         },
     );
     state.set_account(
@@ -168,6 +169,7 @@ fn run_parent(child_mode_byte: u8) -> bloom_petals::ChainCallOutput {
             loom: 0,
             code_hash: Some(child_hash),
             storage_root: Hash32([0u8; 32]),
+            manifest_hash: None,
         },
     );
 

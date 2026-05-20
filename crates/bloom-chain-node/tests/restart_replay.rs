@@ -82,6 +82,7 @@ fn replay_reproduces_full_transfer_chain() {
                 loom: initial_balance,
                 code_hash: None,
                 storage_root: Hash32([0u8; 32]),
+                manifest_hash: None,
             },
         );
     }
@@ -119,6 +120,7 @@ fn replay_reproduces_full_transfer_chain() {
                 loom: initial_balance,
                 code_hash: None,
                 storage_root: Hash32([0u8; 32]),
+                manifest_hash: None,
             },
         );
     }
@@ -184,6 +186,7 @@ fn master_style_replay_diverges() {
                 loom: initial_balance,
                 code_hash: None,
                 storage_root: Hash32([0u8; 32]),
+                manifest_hash: None,
             },
         );
     }
@@ -206,6 +209,7 @@ fn master_style_replay_diverges() {
                 loom: initial_balance,
                 code_hash: None,
                 storage_root: Hash32([0u8; 32]),
+                manifest_hash: None,
             },
         );
     }
@@ -216,6 +220,7 @@ fn master_style_replay_diverges() {
             loom: 0,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
+            manifest_hash: None,
         });
     prop_acct.loom += BLOCK_EMISSION;
     master_replayed.set_account(proposer, prop_acct);

@@ -21,10 +21,17 @@ pub enum TxKind {
     /// Transfer native LOOM from sender to `to`.
     Transfer { to: Address, amount_loom: u128 },
     /// Deploy a new wasm petal (contract).
+    ///
+    /// `manifest_hash` is an optional v1 anchor (bloom-rust-contracts
+    /// Phase 8) — the blake3 of an off-chain manifest the deployer
+    /// commits to. The chain stores it in `Account.manifest_hash` and
+    /// makes it readable via the `chain.code.manifest_hash` host
+    /// import; it never interprets the bytes.
     Deploy {
         wasm: Vec<u8>,
         salt: [u8; 32],
         init_args: Vec<u8>,
+        manifest_hash: Option<Hash32>,
     },
     /// Call an existing petal.
     Call {
@@ -55,10 +62,13 @@ impl Encode for TxKind {
                 wasm,
                 salt: _,
                 init_args,
+                manifest_hash: _,
             } => {
-                // Variable: salt(32) is fixed, wasm and init_args are variable.
-                // Body = 2 offsets (4 each) + 32 (salt) + wasm.len() + init_args.len()
-                4 + 4 + 32 + wasm.len() + init_args.len()
+                // Variable: salt(32) and manifest_present(1) + manifest_hash(32)
+                // are fixed; wasm and init_args are variable.
+                // Body = 2 offsets (4 each) + 32 (salt) + 33 (manifest) +
+                //        wasm.len() + init_args.len()
+                4 + 4 + 32 + 33 + wasm.len() + init_args.len()
             }
             TxKind::Call {
                 calldata,
@@ -82,15 +92,32 @@ impl Encode for TxKind {
                 wasm,
                 salt,
                 init_args,
+                manifest_hash,
             } => {
                 buf.push(TX_KIND_DEPLOY);
-                // Container with salt (fixed), wasm (variable), init_args (variable).
-                // Fixed portion: 2 variable offsets (4 bytes each) + 32 bytes salt = 40 bytes.
-                let fixed_len = 4 + 4 + 32usize;
+                // Container with:
+                //   wasm           (variable)
+                //   salt           (fixed 32)
+                //   init_args      (variable)
+                //   manifest_hash  (fixed 33: 1-byte tag + 32-byte hash)
+                // Fixed portion: 2 variable offsets (4) + salt (32) + manifest (33) = 73.
+                let fixed_len = 4 + 4 + 32 + 33usize;
                 let mut enc = SszEncoder::container(buf, fixed_len);
                 enc.append(wasm);
                 enc.append_parameterized(true, |b| b.extend_from_slice(salt));
                 enc.append(init_args);
+                enc.append_parameterized(true, |b| {
+                    match manifest_hash {
+                        None => {
+                            b.push(0u8);
+                            b.extend_from_slice(&[0u8; 32]);
+                        }
+                        Some(h) => {
+                            b.push(1u8);
+                            b.extend_from_slice(&h.0);
+                        }
+                    }
+                });
                 enc.finalize();
             }
             TxKind::Call {
@@ -139,11 +166,13 @@ impl Decode for TxKind {
                 Ok(TxKind::Transfer { to, amount_loom })
             }
             TX_KIND_DEPLOY => {
-                // Container: wasm (var), salt (fixed 32), init_args (var)
+                // Container: wasm (var), salt (fixed 32), init_args (var),
+                // manifest_hash (fixed 33: 1-byte tag + 32-byte hash).
                 let mut builder = SszDecoderBuilder::new(rest);
                 builder.register_type::<Vec<u8>>()?;
                 builder.register_type_parameterized(true, 32)?;
                 builder.register_type::<Vec<u8>>()?;
+                builder.register_type_parameterized(true, 33)?;
                 let mut decoder = builder.build()?;
                 let wasm: Vec<u8> = decoder.decode_next()?;
                 let salt_bytes: Vec<u8> =
@@ -157,10 +186,32 @@ impl Decode for TxKind {
                 let mut salt = [0u8; 32];
                 salt.copy_from_slice(&salt_bytes);
                 let init_args: Vec<u8> = decoder.decode_next()?;
+                let manifest_bytes: Vec<u8> =
+                    decoder.decode_next_with(|b| Ok(b.to_vec()))?;
+                if manifest_bytes.len() != 33 {
+                    return Err(DecodeError::InvalidByteLength {
+                        len: manifest_bytes.len(),
+                        expected: 33,
+                    });
+                }
+                let manifest_hash = match manifest_bytes[0] {
+                    0 => None,
+                    1 => {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&manifest_bytes[1..33]);
+                        Some(Hash32(arr))
+                    }
+                    other => {
+                        return Err(DecodeError::BytesInvalid(format!(
+                            "invalid manifest_hash discriminant: {other}"
+                        )));
+                    }
+                };
                 Ok(TxKind::Deploy {
                     wasm,
                     salt,
                     init_args,
+                    manifest_hash,
                 })
             }
             TX_KIND_CALL => {
@@ -397,6 +448,7 @@ mod tests {
                 wasm: vec![0x00, 0x61, 0x73, 0x6d],
                 salt: [0xAA; 32],
                 init_args: vec![1, 2, 3],
+                manifest_hash: None,
             },
             pubkey: PubKeyBytes(vec![5u8; 16]),
             sig: SigBytes(vec![6u8; 16]),
@@ -404,6 +456,34 @@ mod tests {
         let bytes = tx.as_ssz_bytes();
         let decoded = Tx::from_ssz_bytes(&bytes).expect("decode should succeed");
         assert_eq!(tx, decoded);
+    }
+
+    #[test]
+    fn tx_deploy_with_manifest_hash_ssz_roundtrip() {
+        let tx = Tx {
+            chain_id: "bloomchain.v0".to_string(),
+            sender: Address([1u8; 32]),
+            nonce: 2,
+            max_fuel: 5_000_000,
+            fee_per_unit: 2,
+            kind: TxKind::Deploy {
+                wasm: vec![0x00, 0x61, 0x73, 0x6d],
+                salt: [0xAA; 32],
+                init_args: vec![1, 2, 3],
+                manifest_hash: Some(Hash32([0xEF; 32])),
+            },
+            pubkey: PubKeyBytes(vec![5u8; 16]),
+            sig: SigBytes(vec![6u8; 16]),
+        };
+        let bytes = tx.as_ssz_bytes();
+        let decoded = Tx::from_ssz_bytes(&bytes).expect("decode should succeed");
+        assert_eq!(tx, decoded);
+        match decoded.kind {
+            TxKind::Deploy { manifest_hash, .. } => {
+                assert_eq!(manifest_hash, Some(Hash32([0xEF; 32])));
+            }
+            _ => panic!("expected Deploy"),
+        }
     }
 
     #[test]

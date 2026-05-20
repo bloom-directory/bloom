@@ -74,6 +74,7 @@ fn prevhash_visible_to_petal() {
             loom: 0,
             code_hash: Some(petal_hash),
             storage_root: Hash32([0u8; 32]),
+            manifest_hash: None,
         },
     );
 
@@ -86,6 +87,7 @@ fn prevhash_visible_to_petal() {
             loom: initial,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
+            manifest_hash: None,
         },
     );
 

@@ -109,6 +109,16 @@ unsafe extern "C" {
     #[link_name = "crypto.blake3"]
     pub fn crypto_blake3(in_ptr: i32, in_len: i32, out_ptr: i32) -> i32;
 
+    // ---- code ----
+
+    /// Read the optional manifest anchor for the account at `addr_ptr[0..32]`.
+    /// Writes a 33-byte response at `out_ptr`:
+    ///   byte 0   — 1 if an anchor is set, 0 otherwise
+    ///   bytes 1..33 — the 32-byte manifest hash (zero when byte 0 is 0)
+    /// Returns 0 on success, negative on error.
+    #[link_name = "code.manifest_hash"]
+    pub fn code_manifest_hash(addr_ptr: i32, out_ptr: i32) -> i32;
+
     // ---- host.deploy ----
 
     /// Petal-initiated deploy. `hash_ptr[0..hash_len]` is the 32-byte petal
@@ -198,6 +208,11 @@ pub mod stubs {
     #[inline(never)]
     pub unsafe fn crypto_blake3(in_ptr: i32, in_len: i32, out_ptr: i32) -> i32 {
         panic!("crypto_blake3: not available outside wasm32")
+    }
+    #[inline(never)]
+    pub unsafe fn code_manifest_hash(addr_ptr: i32, out_ptr: i32) -> i32 {
+        let _ = (addr_ptr, out_ptr);
+        panic!("code_manifest_hash: not available outside wasm32")
     }
     #[inline(never)]
     pub unsafe fn host_deploy(

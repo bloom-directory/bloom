@@ -44,6 +44,11 @@ pub struct ArtifactSet {
     /// `blake3` of the canonical src/ tree, lowercase hex — also stored
     /// on the manifest.
     pub source_hash: String,
+    /// `blake3` of the canonical (compact serde_json) manifest bytes,
+    /// lowercase hex. This is the value users pass to
+    /// `bloom chain deploy --manifest-hash` so the on-chain
+    /// `Account.manifest_hash` anchor matches.
+    pub manifest_hash: String,
     /// On-disk paths the build emitted.
     pub wasm_path: PathBuf,
     pub manifest_path: PathBuf,
@@ -90,6 +95,21 @@ pub enum BuildError {
 /// Compute the canonical wasm hash (`blake3` of the module bytes).
 pub fn wasm_hash(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
+}
+
+/// Compute the canonical `manifest_hash` — `blake3(serde_json::to_vec(manifest))`.
+///
+/// This is the on-chain anchor a user passes to
+/// `bloom chain deploy --manifest-hash` so a deployed account's
+/// `Account.manifest_hash` (Phase 8) can be verified against a published
+/// `.manifest.json` byte-for-byte.
+///
+/// Stability: `serde_json::to_vec` emits struct fields in declaration order
+/// (no whitespace, no key reordering), so the byte form of any given
+/// `Manifest` is deterministic across builds.
+pub fn manifest_hash(manifest: &Manifest) -> [u8; 32] {
+    let bytes = serde_json::to_vec(manifest).expect("Manifest serializes");
+    *blake3::hash(&bytes).as_bytes()
 }
 
 /// Compute the canonical source hash for a crate at `crate_dir`.
@@ -458,11 +478,14 @@ pub fn emit_artifacts(crate_dir: &Path, out_dir: &Path, profile: Profile) -> Res
         .map_err(|e| BuildError::Manifest(format!("serialize manifest: {e}")))?;
     fs::write(&manifest_path, manifest_json)?;
 
+    let manifest_hash_hex = hex_encode(&manifest_hash(&manifest));
+
     Ok(ArtifactSet {
         wasm,
         manifest,
         wasm_hash: wasm_hash_hex,
         source_hash: source_hash_hex,
+        manifest_hash: manifest_hash_hex,
         wasm_path,
         manifest_path,
     })
@@ -649,6 +672,34 @@ mod tests {
         let err = verify_manifest_against_wasm(&manifest, &wasm).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("wasm_hash mismatch"), "got: {msg}");
+    }
+
+    #[test]
+    fn manifest_hash_is_deterministic() {
+        let m = Manifest {
+            schema_version: 1,
+            contract: bloom_contract_metadata::ContractMeta {
+                name: "demo".into(),
+                domain: "demo".into(),
+                version: "0.1.0".into(),
+            },
+            abi: Default::default(),
+            storage: Default::default(),
+            events: vec![],
+            errors: vec![],
+            imports: vec!["chain.state.read".into()],
+            limits: Limits::default(),
+            wasm_hash: "aa".repeat(32),
+            source_hash: "bb".repeat(32),
+        };
+        let h1 = manifest_hash(&m);
+        let h2 = manifest_hash(&m);
+        assert_eq!(h1, h2);
+
+        // Changing any field changes the hash.
+        let mut m2 = m.clone();
+        m2.wasm_hash = "cc".repeat(32);
+        assert_ne!(manifest_hash(&m), manifest_hash(&m2));
     }
 
     #[test]

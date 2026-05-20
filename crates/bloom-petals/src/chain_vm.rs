@@ -896,6 +896,55 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
     )?;
 
     // -----------------------------------------------------------------------
+    // chain.code.manifest_hash(addr_ptr, out_ptr) -> i32
+    //
+    // Writes a 33-byte answer at `out_ptr`:
+    //   byte 0: 0 = no anchor, 1 = anchor present
+    //   bytes 1..33: the 32-byte manifest hash (zeroed when byte 0 is 0)
+    //
+    // Returns 0 on success or a HostError code on failure. The query is
+    // safe for non-existent addresses — those return present=0 with a
+    // zero hash, matching the `Account::manifest_hash == None` view.
+    // (bloom-rust-contracts Phase 8 — on-chain manifest anchor read.)
+    // Fuel: 200
+    // -----------------------------------------------------------------------
+    linker.func_wrap(
+        "chain",
+        "code.manifest_hash",
+        |mut caller: Caller<'_, ChainStoreData>, addr_ptr: i32, out_ptr: i32| -> i32 {
+            if consume_fuel(&mut caller, 200).is_err() {
+                return HostError::Backend("out of fuel".into()).as_wasm_code();
+            }
+
+            let mem = match get_chain_memory(&mut caller) {
+                Some(m) => m,
+                None => return HostError::Invalid("no memory".into()).as_wasm_code(),
+            };
+
+            let addr_bytes = match read_chain_bytes(&mem, &mut caller, addr_ptr, 32) {
+                Ok(b) => b,
+                Err(c) => return c,
+            };
+            let mut addr_arr = [0u8; 32];
+            addr_arr.copy_from_slice(&addr_bytes);
+            let target = Address(addr_arr);
+
+            let mut out = [0u8; 33];
+            if let Some(acct) = caller.data().chain_ctx.snapshot.get_account(&target)
+                && let Some(h) = acct.manifest_hash
+            {
+                out[0] = 1;
+                out[1..33].copy_from_slice(&h.0);
+            }
+
+            match write_chain_bytes(&mem, &mut caller, out_ptr, &out) {
+                Ok(()) => 0,
+                Err(c) => c,
+            }
+        },
+    )?;
+
+    // -----------------------------------------------------------------------
     // chain.host.deploy(hash_ptr, hash_len, salt_ptr, salt_len,
     //                   init_ptr, init_len, out_addr_ptr) -> i64
     // Fuel: 10000 + init's used fuel
@@ -979,12 +1028,15 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
             // staged account too (review 2026-05-19 #6).
             let parent_snapshot_checkpoint = caller.data().chain_ctx.snapshot.clone();
 
-            // Spawn the new account with code_hash set.
+            // Spawn the new account with code_hash set. Cross-contract
+            // deploys via `chain.code.deploy` do not carry a manifest
+            // anchor — only top-level `TxKind::Deploy` does.
             let new_account = Account {
                 nonce: 0,
                 loom: 0,
                 code_hash: Some(petal_hash),
                 storage_root: Hash32([0u8; 32]),
+                manifest_hash: None,
             };
             caller
                 .data_mut()

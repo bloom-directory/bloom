@@ -18,6 +18,7 @@ pub mod msg;
 pub mod log;
 pub mod crypto;
 pub mod host;
+pub mod code;
 pub mod value;
 
 pub use value::{LoomValue, LoomValueError};

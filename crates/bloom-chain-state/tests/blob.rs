@@ -23,6 +23,7 @@ fn build_nontrivial_state() -> State {
             loom: 1_000_000,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
+            manifest_hash: None,
         },
     );
     s.set_account(
@@ -32,6 +33,7 @@ fn build_nontrivial_state() -> State {
             loom: 500,
             code_hash: Some(Hash32([0xDE; 32])),
             storage_root: Hash32([0u8; 32]),
+            manifest_hash: None,
         },
     );
 

@@ -18,8 +18,8 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
-use bloom_contract_build::{Profile, emit_artifacts, verify_manifest_against_wasm};
+use anyhow::{Context, Result, anyhow};
+use bloom_contract_build::{Profile, emit_artifacts, manifest_hash, verify_manifest_against_wasm};
 use bloom_contract_metadata::Manifest;
 use clap::Subcommand;
 
@@ -44,6 +44,12 @@ pub enum ContractCmd {
         manifest: PathBuf,
         /// Path to `<name>.wasm`.
         wasm: PathBuf,
+        /// Optional expected on-chain `manifest_hash` anchor (lowercase
+        /// hex, 64 chars). When supplied, the locally-computed hash of
+        /// the manifest is compared byte-for-byte and verification fails
+        /// on any mismatch.
+        #[arg(long, value_name = "HEX")]
+        expected_manifest_hash: Option<String>,
     },
 }
 
@@ -62,25 +68,58 @@ pub fn run(cmd: ContractCmd) -> Result<()> {
             println!("contract: {}", artifacts.manifest.contract.name);
             println!("wasm:     {}", artifacts.wasm_path.display());
             println!("manifest: {}", artifacts.manifest_path.display());
-            println!("wasm_hash:   {}", artifacts.wasm_hash);
-            println!("source_hash: {}", artifacts.source_hash);
+            println!("wasm_hash:     {}", artifacts.wasm_hash);
+            println!("source_hash:   {}", artifacts.source_hash);
+            println!("manifest_hash: {}", artifacts.manifest_hash);
             println!("size: {} bytes", artifacts.wasm.len());
             println!("imports: {}", artifacts.manifest.imports.len());
+            println!();
+            println!(
+                "next: bloom chain deploy --wasm {} --manifest-hash {}",
+                artifacts.wasm_path.display(),
+                artifacts.manifest_hash,
+            );
             Ok(())
         }
-        ContractCmd::Verify { manifest, wasm } => {
+        ContractCmd::Verify {
+            manifest,
+            wasm,
+            expected_manifest_hash,
+        } => {
             let manifest_bytes = std::fs::read(&manifest)
                 .with_context(|| format!("read manifest {}", manifest.display()))?;
-            let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
+            let manifest_obj: Manifest = serde_json::from_slice(&manifest_bytes)
                 .with_context(|| format!("decode manifest {}", manifest.display()))?;
             let wasm_bytes = std::fs::read(&wasm)
                 .with_context(|| format!("read wasm {}", wasm.display()))?;
-            verify_manifest_against_wasm(&manifest, &wasm_bytes)
+            verify_manifest_against_wasm(&manifest_obj, &wasm_bytes)
                 .context("manifest does not match wasm")?;
+
+            let actual_manifest_hash = hex_encode(&manifest_hash(&manifest_obj));
+            if let Some(expected) = expected_manifest_hash {
+                let expected = expected.trim().to_ascii_lowercase();
+                if expected != actual_manifest_hash {
+                    return Err(anyhow!(
+                        "manifest_hash mismatch:\n  expected: {expected}\n  actual:   {actual_manifest_hash}",
+                    ));
+                }
+            }
+
             println!("ok: manifest matches wasm");
-            println!("contract: {}", manifest.contract.name);
-            println!("wasm_hash: {}", manifest.wasm_hash);
+            println!("contract: {}", manifest_obj.contract.name);
+            println!("wasm_hash:     {}", manifest_obj.wasm_hash);
+            println!("manifest_hash: {}", actual_manifest_hash);
             Ok(())
         }
     }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const NIBBLE: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        s.push(NIBBLE[(*byte >> 4) as usize] as char);
+        s.push(NIBBLE[(*byte & 0x0f) as usize] as char);
+    }
+    s
 }

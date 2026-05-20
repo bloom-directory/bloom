@@ -54,6 +54,12 @@ pub enum ChainCmd {
         /// 32-byte hex salt (default: all zeros).
         #[arg(long, value_name = "HEX")]
         salt: Option<String>,
+        /// Optional 32-byte hex blake3 anchor for an off-chain manifest
+        /// (bloom-rust-contracts Phase 8). Stored in `Account.manifest_hash`
+        /// and readable via the `chain.code.manifest_hash` host import; the
+        /// chain does not interpret the bytes.
+        #[arg(long, value_name = "HEX")]
+        manifest_hash: Option<String>,
     },
     /// Build, sign, and submit a Call tx.
     Call {
@@ -269,10 +275,11 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             wasm_or_wat,
             init_args,
             salt,
+            manifest_hash,
         } => {
             use bloom_chain_types::{
                 tx::{Tx, TxKind},
-                types::{Address, PubKeyBytes, SigBytes},
+                types::{Address, Hash32, PubKeyBytes, SigBytes},
             };
             use bloom_chain_types::ssz::Encode;
 
@@ -295,6 +302,18 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
                 })
                 .transpose()?
                 .unwrap_or([0u8; 32]);
+            let manifest_hash_opt: Option<Hash32> = manifest_hash
+                .as_deref()
+                .map(|h| {
+                    let b = hex::decode(h).context("decode manifest-hash hex")?;
+                    if b.len() != 32 {
+                        anyhow::bail!("manifest-hash must be 32 bytes");
+                    }
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&b);
+                    Ok::<_, anyhow::Error>(Hash32(arr))
+                })
+                .transpose()?;
 
             let (sk, pk, sender) = load_wallet_key(&chain_dir)?;
             let chain_id = load_chain_id(&chain_dir)?;
@@ -310,6 +329,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
                     wasm: wasm_bytes,
                     salt: salt_bytes,
                     init_args: init_args_bytes,
+                    manifest_hash: manifest_hash_opt,
                 },
                 10_000_000,
                 1,

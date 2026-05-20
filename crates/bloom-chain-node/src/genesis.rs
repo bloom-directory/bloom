@@ -164,6 +164,7 @@ impl Genesis {
                 loom: *amount,
                 code_hash: None,
                 storage_root: Hash32([0u8; 32]),
+                manifest_hash: None,
             };
             state.set_account(*addr, acct);
         }

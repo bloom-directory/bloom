@@ -95,6 +95,7 @@ mod tests {
             loom: 500,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
+            manifest_hash: None,
         };
         trie.set(addr(1), account.clone());
         assert_eq!(trie.get(&addr(1)), Some(account));
@@ -117,6 +118,7 @@ mod tests {
             loom: 100,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
+            manifest_hash: None,
         };
         trie.set(addr(3), account);
         trie.remove(&addr(3));
@@ -135,6 +137,7 @@ mod tests {
                 loom: 100,
                 code_hash: None,
                 storage_root: Hash32([0u8; 32]),
+                manifest_hash: None,
             },
         );
         let r1 = trie.root();
@@ -147,6 +150,7 @@ mod tests {
                 loom: 200,
                 code_hash: None,
                 storage_root: Hash32([0u8; 32]),
+                manifest_hash: None,
             },
         );
         let r2 = trie.root();

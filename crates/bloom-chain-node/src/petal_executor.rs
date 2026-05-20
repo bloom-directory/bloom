@@ -86,7 +86,7 @@ impl PetalExecutor for ChainPetalExecutor {
                 }
             }
 
-            TxKind::Deploy { wasm, salt, init_args } => {
+            TxKind::Deploy { wasm, salt, init_args, manifest_hash } => {
                 if let Err(e) = PetalVm::validate_for_chain(wasm) {
                     return ExecOutput {
                         success: false,
@@ -113,11 +113,15 @@ impl PetalExecutor for ChainPetalExecutor {
                     };
                 }
 
-                // Stage account + code in the snapshot; invoke init.
+                // Stage account + code in the snapshot; invoke init. The
+                // deployer's manifest anchor (if present) lands in the
+                // account here, before `init` runs, so a contract can read
+                // its own anchor inside `init` via the chain.code import.
                 let mut snap = state.snapshot();
                 snap.insert_code(wasm.clone());
                 let mut acct = snap.get_account(&addr).unwrap_or_else(empty_account);
                 acct.code_hash = Some(petal_hash);
+                acct.manifest_hash = *manifest_hash;
                 snap.set_account(addr, acct);
 
                 let input = ChainCallInput {

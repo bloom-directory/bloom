@@ -585,6 +585,7 @@ fn host_deploy_collision_returns_error() {
         loom: 0,
         code_hash: Some(child_hash),
         storage_root: Hash32([0u8; 32]),
+        manifest_hash: None,
     };
     state.set_account(collision_addr, colliding_account);
 
@@ -764,6 +765,7 @@ fn init_can_self_call_staged_code() {
         loom: 0,
         code_hash: Some(petal_hash),
         storage_root: Hash32([0u8; 32]),
+        manifest_hash: None,
     };
     snap.set_account(self_addr, acct);
 
@@ -796,4 +798,96 @@ fn init_can_self_call_staged_code() {
         "init must receive the magic bytes from its self-call's `call` return"
     );
     assert!(out.revert_reason.is_none(), "no revert expected");
+}
+
+// ---------------------------------------------------------------------------
+// Test 20 (Phase 8): `chain.code.manifest_hash` returns the on-chain manifest
+// anchor recorded on the target account, or `0x00 || 0..32` when absent.
+//
+// The petal reads the target address from calldata[0..32], calls the import
+// with a 33-byte output buffer, then returns those 33 bytes.
+// ---------------------------------------------------------------------------
+
+const CODE_MANIFEST_HASH_READ: &str = r#"
+(module
+  (import "chain" "msg.calldata.read"   (func $cdread (param i32 i32 i32) (result i32)))
+  (import "chain" "code.manifest_hash"  (func $mh     (param i32 i32) (result i32)))
+  (import "chain" "petal.return"        (func $ret    (param i32 i32)))
+  (memory (export "memory") 1)
+  (func (export "call") (param i32 i32) (result i32)
+    ;; Read 32-byte target address from calldata[0..32] into memory[0..32].
+    (drop (call $cdread (i32.const 0) (i32.const 0) (i32.const 32)))
+    ;; Call code.manifest_hash(addr_ptr=0, out_ptr=64). Drop the i32 rc.
+    (drop (call $mh (i32.const 0) (i32.const 64)))
+    ;; Return the 33-byte response.
+    (call $ret (i32.const 64) (i32.const 33))
+    i32.const 0)
+)
+"#;
+
+#[test]
+fn code_manifest_hash_returns_some_when_anchor_set() {
+    let target = make_address(0xC0);
+    let anchor = Hash32([0xAB; 32]);
+
+    let mut state = State::new();
+    let acct = Account {
+        nonce: 0,
+        loom: 0,
+        code_hash: None,
+        storage_root: Hash32([0u8; 32]),
+        manifest_hash: Some(anchor),
+    };
+    state.set_account(target, acct);
+
+    let mut input = make_input(wat(CODE_MANIFEST_HASH_READ), ChainEntry::Call);
+    input.calldata = target.0.to_vec();
+    input.snapshot = state.snapshot();
+
+    let out = run(input).unwrap();
+    let data = out.return_data.expect("must return the 33-byte response");
+    assert_eq!(data.len(), 33);
+    assert_eq!(data[0], 1, "discriminant must be 1 when manifest_hash is Some");
+    assert_eq!(&data[1..33], &anchor.0, "trailing bytes must equal the recorded hash");
+}
+
+#[test]
+fn code_manifest_hash_returns_none_when_anchor_absent() {
+    // Account exists but has manifest_hash = None.
+    let target = make_address(0xC1);
+    let mut state = State::new();
+    let acct = Account {
+        nonce: 0,
+        loom: 0,
+        code_hash: None,
+        storage_root: Hash32([0u8; 32]),
+        manifest_hash: None,
+    };
+    state.set_account(target, acct);
+
+    let mut input = make_input(wat(CODE_MANIFEST_HASH_READ), ChainEntry::Call);
+    input.calldata = target.0.to_vec();
+    input.snapshot = state.snapshot();
+
+    let out = run(input).unwrap();
+    let data = out.return_data.expect("must return the 33-byte response");
+    assert_eq!(data.len(), 33);
+    assert_eq!(data[0], 0, "discriminant must be 0 when manifest_hash is None");
+    assert_eq!(&data[1..33], &[0u8; 32], "trailing bytes must be zeroed when absent");
+}
+
+#[test]
+fn code_manifest_hash_returns_none_for_unknown_account() {
+    // No account exists at the target address — host import must still write
+    // the 33-byte "absent" response (not a host error).
+    let target = make_address(0xC2);
+
+    let mut input = make_input(wat(CODE_MANIFEST_HASH_READ), ChainEntry::Call);
+    input.calldata = target.0.to_vec();
+
+    let out = run(input).unwrap();
+    let data = out.return_data.expect("must return the 33-byte response");
+    assert_eq!(data.len(), 33);
+    assert_eq!(data[0], 0, "unknown account must read back as absent");
+    assert_eq!(&data[1..33], &[0u8; 32]);
 }

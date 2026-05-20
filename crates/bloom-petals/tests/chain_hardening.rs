@@ -132,6 +132,7 @@ fn revert_child_writes_dont_leak() {
             loom: parent_initial_loom,
             code_hash: Some(parent_hash),
             storage_root: Hash32([0u8; 32]),
+            manifest_hash: None,
         },
     );
     state.set_account(
@@ -141,6 +142,7 @@ fn revert_child_writes_dont_leak() {
             loom: 0,
             code_hash: Some(child_hash),
             storage_root: Hash32([0u8; 32]),
+            manifest_hash: None,
         },
     );
 

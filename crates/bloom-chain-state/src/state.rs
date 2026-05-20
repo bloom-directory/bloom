@@ -403,6 +403,7 @@ mod tests {
             loom,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
+            manifest_hash: None,
         }
     }
 

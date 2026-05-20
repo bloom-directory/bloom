@@ -559,14 +559,10 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
 // Default-like helper for Account
 // ---------------------------------------------------------------------------
 
-/// Return an empty account (nonce=0, loom=0, no code, zero storage_root).
+/// Return an empty account (nonce=0, loom=0, no code, zero storage_root,
+/// no manifest anchor).
 pub(crate) fn empty_account() -> Account {
-    Account {
-        nonce: 0,
-        loom: 0,
-        code_hash: None,
-        storage_root: Hash32([0u8; 32]),
-    }
+    Account::empty()
 }
 
 // ---------------------------------------------------------------------------

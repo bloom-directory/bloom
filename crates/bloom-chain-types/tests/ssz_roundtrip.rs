@@ -53,7 +53,8 @@ fn arb_tx_kind() -> impl Strategy<Value = TxKind> {
             .prop_map(|(wasm, salt, init_args)| TxKind::Deploy {
                 wasm,
                 salt,
-                init_args
+                init_args,
+                manifest_hash: None,
             }),
         (arb_address(), arb_vec_u8(32), any::<u128>()).prop_map(
             |(to, calldata, value_loom)| TxKind::Call {

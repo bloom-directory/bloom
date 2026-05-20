@@ -1018,6 +1018,7 @@ async fn submit_deploy(
             wasm: wasm.to_vec(),
             salt,
             init_args,
+            manifest_hash: None,
         },
     );
     let tx_hash = tx.tx_hash();
