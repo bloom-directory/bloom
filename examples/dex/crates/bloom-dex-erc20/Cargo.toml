@@ -2,18 +2,19 @@
 name = "bloom-dex-erc20"
 version = "0.1.0"
 edition = "2024"
-description = "ERC-20 fungible token petal for bloom-chain DEX"
+description = "ERC-20 fungible token petal for bloom-chain DEX (bloom-contract framework)"
 license = "MIT"
 
 [lib]
 name = "bloom_dex_erc20"
-# `rlib` is added alongside `cdylib` so sibling DEX petals (router) can
-# `use bloom_dex_erc20::erc20` to access the macro-emitted `abi::call::*`
-# calldata builders. The `cdylib` artefact is still the wasm petal that
-# ships on-chain.
+# `rlib` is added alongside `cdylib` so sibling DEX petals (router, pair)
+# can `use bloom_dex_erc20::{Erc20, Erc20Calls}` for typed cross-contract
+# calls and `bloom_dex_erc20::calls::*` for legacy hand-rolled calldata
+# builders. The `cdylib` artefact is the wasm petal that ships on-chain.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+bloom-contract = { workspace = true, default-features = false }
 bloom-chain-abi = { workspace = true, default-features = false }
 bloom-petal-sdk = { workspace = true }
 

@@ -53,7 +53,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use bloom_chain_abi::{DispatchError, U256, contract};
-use bloom_dex_erc20::erc20;
+use bloom_dex_erc20::calls as erc20_calls;
 use bloom_dex_factory::factory;
 use bloom_dex_pair::pair;
 use bloom_dex_wloom::wloom;
@@ -408,7 +408,7 @@ fn token_transfer_from(
     to: &[u8; 32],
     amount: U256,
 ) {
-    let cd = erc20::abi::call::transfer_from(from, to, amount);
+    let cd = erc20_calls::transfer_from(from, to, amount);
     petal::call(token, &cd, ZERO_VALUE)
         .unwrap_or_else(|_| petal::revert("router: transferFrom failed"));
 }
@@ -453,7 +453,7 @@ fn pair_swap(pair_addr: &[u8; 32], amount0_out: U256, amount1_out: U256, to: &[u
 /// LP tokens implement the ERC-20 surface (the pair petal's embedded LP
 /// token), so the calldata is the standard `erc20.transfer_from` payload.
 fn transfer_lp_to_pair(pair_addr: &[u8; 32], from: &[u8; 32], liquidity: U256) {
-    let cd = erc20::abi::call::transfer_from(from, pair_addr, liquidity);
+    let cd = erc20_calls::transfer_from(from, pair_addr, liquidity);
     petal::call(pair_addr, &cd, ZERO_VALUE)
         .unwrap_or_else(|_| petal::revert("router: LP transferFrom failed"));
 }
@@ -811,7 +811,7 @@ impl router::Handler for RouterHandler {
 
         // Transfer wLOOM from router (self) to pair — router already holds the deposit.
         {
-            let cd = erc20::abi::call::transfer(&pair, amount_loom);
+            let cd = erc20_calls::transfer(&pair, amount_loom);
             petal::call(&wloom, &cd, ZERO_VALUE)
                 .unwrap_or_else(|_| petal::revert("router: wloom transfer to pair failed"));
         }
@@ -920,7 +920,7 @@ impl router::Handler for RouterHandler {
 
         // Transfer tokens directly to `to`.
         {
-            let cd = erc20::abi::call::transfer(&to, amount_token);
+            let cd = erc20_calls::transfer(&to, amount_token);
             petal::call(&token, &cd, ZERO_VALUE)
                 .unwrap_or_else(|_| petal::revert("router: token transfer to `to` failed"));
         }
@@ -1033,7 +1033,7 @@ impl router::Handler for RouterHandler {
             petal::revert("router: swapExactLOOM: first pair not found");
         }
         {
-            let cd = erc20::abi::call::transfer(&first_pair, amounts[0]);
+            let cd = erc20_calls::transfer(&first_pair, amounts[0]);
             petal::call(&wloom, &cd, ZERO_VALUE)
                 .unwrap_or_else(|_| petal::revert("router: wloom transfer failed"));
         }
@@ -1159,7 +1159,7 @@ impl router::Handler for RouterHandler {
             petal::revert("router: swapLOOMForExact: first pair not found");
         }
         {
-            let cd = erc20::abi::call::transfer(&first_pair, loom_needed);
+            let cd = erc20_calls::transfer(&first_pair, loom_needed);
             petal::call(&wloom, &cd, ZERO_VALUE)
                 .unwrap_or_else(|_| petal::revert("router: wloom transfer failed"));
         }

@@ -2215,6 +2215,7 @@ dependencies = [
  "bloom-chain-abi",
  "bloom-chain-node",
  "bloom-chain-types",
+ "bloom-dex-erc20",
  "bloom-keystore",
  "bloom-proto",
  "clap",
@@ -2233,6 +2234,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "bloom-chain-abi",
+ "bloom-contract",
  "bloom-petal-sdk",
 ]
 

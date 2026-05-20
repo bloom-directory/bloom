@@ -63,7 +63,11 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 use bloom_chain_abi::{DispatchError, U256, contract};
-use bloom_dex_erc20::erc20 as erc20_abi;
+// The migrated bloom-dex-erc20 exposes its selector constants on the `Erc20`
+// interface marker and its calldata builders under `calls::*`. Pair claims
+// the same ERC-20 surface as its own LP token, so it re-uses these symbols
+// directly for inline dispatch.
+use bloom_dex_erc20::{Erc20, calls as erc20_calls};
 use bloom_petal_sdk::{LoomValue, block, msg, petal};
 
 /// Selector for `erc20.decimals()`. Hand-dispatched because the chain-ABI
@@ -224,9 +228,7 @@ fn emit_sync(r0: u128, r1: u128) {
 /// Query `token.balanceOf(target_addr)` by calling the token petal.
 /// Returns the U256 balance from the return data.
 fn token_balance_of(token_addr: &[u8; 32], target_addr: &[u8; 32]) -> U256 {
-    let mut cd = Vec::with_capacity(4 + 32);
-    cd.extend_from_slice(&erc20_abi::SEL_BALANCE_OF);
-    cd.extend_from_slice(target_addr);
+    let cd = erc20_calls::balance_of(target_addr);
 
     let ret = petal::call(token_addr, &cd, LoomValue::ZERO)
         .unwrap_or_else(|_| petal::revert("pair: token.balanceOf call failed"));
@@ -241,10 +243,7 @@ fn token_balance_of(token_addr: &[u8; 32], target_addr: &[u8; 32]) -> U256 {
 
 /// Transfer `amount` of `token` to `to` via ERC-20 transfer.
 fn token_transfer(token_addr: &[u8; 32], to: &[u8; 32], amount: U256) {
-    let mut cd = Vec::with_capacity(4 + 32 + 32);
-    cd.extend_from_slice(&erc20_abi::SEL_TRANSFER);
-    cd.extend_from_slice(to);
-    cd.extend_from_slice(&amount.0);
+    let cd = erc20_calls::transfer(to, amount);
 
     petal::call(token_addr, &cd, LoomValue::ZERO)
         .unwrap_or_else(|_| petal::revert("pair: token.transfer failed"));
@@ -575,14 +574,14 @@ fn do_call(calldata: alloc::vec::Vec<u8>) -> i32 {
 /// diverges via `petal::return_data` or `petal::revert`, so the wrapping
 /// `Option<i32>` is just a phantom for the type system.
 fn dispatch_erc20(sel: [u8; 4], args: &[u8]) -> Option<i32> {
-    if sel == erc20_abi::SEL_NAME {
+    if sel == Erc20::SEL_NAME {
         let name = b"BloomDexPair LP";
         let mut slot = [0u8; 32];
         slot[..name.len()].copy_from_slice(name);
         petal::return_data(&slot);
     }
 
-    if sel == erc20_abi::SEL_SYMBOL {
+    if sel == Erc20::SEL_SYMBOL {
         let sym = b"BDPL";
         let mut slot = [0u8; 32];
         slot[..sym.len()].copy_from_slice(sym);
@@ -595,12 +594,12 @@ fn dispatch_erc20(sel: [u8; 4], args: &[u8]) -> Option<i32> {
         petal::return_data(&slot);
     }
 
-    if sel == erc20_abi::SEL_TOTAL_SUPPLY {
+    if sel == Erc20::SEL_TOTAL_SUPPLY {
         let v = pair::abi::storage::total_supply();
         petal::return_data(&v.0);
     }
 
-    if sel == erc20_abi::SEL_BALANCE_OF {
+    if sel == Erc20::SEL_BALANCE_OF {
         if args.len() < 32 {
             petal::revert("pair: balanceOf bad args");
         }
@@ -610,7 +609,7 @@ fn dispatch_erc20(sel: [u8; 4], args: &[u8]) -> Option<i32> {
         petal::return_data(&v.0);
     }
 
-    if sel == erc20_abi::SEL_ALLOWANCE {
+    if sel == Erc20::SEL_ALLOWANCE {
         if args.len() < 64 {
             petal::revert("pair: allowance bad args");
         }
@@ -622,7 +621,7 @@ fn dispatch_erc20(sel: [u8; 4], args: &[u8]) -> Option<i32> {
         petal::return_data(&v.0);
     }
 
-    if sel == erc20_abi::SEL_APPROVE {
+    if sel == Erc20::SEL_APPROVE {
         if args.len() < 64 {
             petal::revert("pair: approve bad args");
         }
@@ -641,7 +640,7 @@ fn dispatch_erc20(sel: [u8; 4], args: &[u8]) -> Option<i32> {
         petal::return_data(&ret);
     }
 
-    if sel == erc20_abi::SEL_TRANSFER {
+    if sel == Erc20::SEL_TRANSFER {
         if args.len() < 64 {
             petal::revert("pair: transfer bad args");
         }
@@ -657,7 +656,7 @@ fn dispatch_erc20(sel: [u8; 4], args: &[u8]) -> Option<i32> {
         petal::return_data(&ret);
     }
 
-    if sel == erc20_abi::SEL_TRANSFER_FROM {
+    if sel == Erc20::SEL_TRANSFER_FROM {
         if args.len() < 96 {
             petal::revert("pair: transferFrom bad args");
         }

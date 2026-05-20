@@ -488,23 +488,17 @@ async fn deploy_token(
     let supply_u256 = parse_u256_decimal(&supply)?;
     let salt_bytes = parse_salt_or_random(salt.as_deref())?;
 
-    // ERC-20 init payload:
-    //   name_len (u16 BE) || name_bytes || symbol_len (u16 BE) || symbol_bytes ||
-    //   decimals (u8) || initial_supply (u256, 32B) || initial_holder (32B)
-    if name.len() > 32 {
-        bail!("name longer than 32 bytes");
-    }
-    if symbol.len() > 32 {
-        bail!("symbol longer than 32 bytes");
-    }
-    let mut init = Vec::new();
-    init.extend_from_slice(&(name.len() as u16).to_be_bytes());
-    init.extend_from_slice(name.as_bytes());
-    init.extend_from_slice(&(symbol.len() as u16).to_be_bytes());
-    init.extend_from_slice(symbol.as_bytes());
-    init.push(decimals);
-    init.extend_from_slice(&supply_u256);
-    init.extend_from_slice(&holder.0);
+    // ERC-20 init payload — encoded via the bloom-contract ABI through the
+    // canonical helper in bloom-dex-erc20 so the wire layout has exactly one
+    // source of truth.
+    let init = bloom_dex_erc20::encode_init_payload(
+        &name,
+        &symbol,
+        decimals,
+        bloom_chain_abi::U256(supply_u256),
+        holder.0,
+    )
+    .map_err(|e| anyhow::anyhow!("encode erc20 init: {e:?}"))?;
 
     let petal_hash = petal_hash_of(&wasm_bytes);
     let token_addr = deploy_addr(&sender, &salt_bytes, &petal_hash);
