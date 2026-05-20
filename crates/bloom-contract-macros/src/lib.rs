@@ -15,6 +15,7 @@ mod derives;
 mod error_attr;
 mod event_attr;
 mod interface_attr;
+mod manifest;
 mod storage_attr;
 
 /// `#[derive(AbiEncode)]` — sequential field encoding for structs;

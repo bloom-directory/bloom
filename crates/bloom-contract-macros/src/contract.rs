@@ -41,9 +41,12 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
-    Attribute, FnArg, Ident, Item, ItemFn, ItemMod, LitStr, Pat, Type, Visibility,
+    AngleBracketedGenericArguments, Attribute, FnArg, GenericArgument, Ident, Item, ItemFn,
+    ItemMod, LitByteStr, LitStr, Pat, PathArguments, ReturnType, Type, Visibility,
     parse_macro_input,
 };
+
+use crate::manifest::{self, ManifestMethod, Mutability as ManifestMutability};
 
 pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut module = parse_macro_input!(item as ItemMod);
@@ -291,9 +294,35 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Build the partial manifest (everything that can be derived
+    // statically — methods, storage layout, events, errors, interfaces)
+    // and embed its JSON bytes in a `bloom_manifest` custom wasm section.
+    // The `bloom contract build` tool reads the section back, fills in
+    // `wasm_hash` / `source_hash` / `imports`, and emits the on-disk
+    // `<name>.manifest.json`.
+    let manifest_methods: Vec<ManifestMethod> =
+        handlers.iter().map(|h| h.to_manifest_method()).collect();
+    let manifest_json = manifest::build_skeleton_json(&module, &domain, &manifest_methods, &interfaces);
+    let manifest_bytes = LitByteStr::new(manifest_json.as_bytes(), proc_macro2::Span::call_site());
+    let manifest_len = manifest_json.len();
+    let manifest_static_ident = format_ident!("__BLOOM_MANIFEST_{}", module_ident);
+
+    let manifest_section: TokenStream2 = quote! {
+        // The link-section attribute is honoured by the wasm32 backend
+        // (it produces a custom section with the given name). On host
+        // targets we omit the section to avoid object-format quirks; the
+        // manifest is wasm-only metadata anyway.
+        #[cfg(target_arch = "wasm32")]
+        #[doc(hidden)]
+        #[used]
+        #[unsafe(link_section = "bloom_manifest")]
+        pub static #manifest_static_ident: [u8; #manifest_len] = *#manifest_bytes;
+    };
+
     quote! {
         #module
         #exports
+        #manifest_section
     }
     .into()
 }
@@ -309,6 +338,9 @@ struct HandlerSpec {
     signature: String,
     arg_idents: Vec<Ident>,
     arg_types: Vec<Type>,
+    /// The `T` inside the handler's `Result<T, E>` return type, if it can be
+    /// extracted. The manifest's `outputs` field uses this.
+    ok_type: Option<Type>,
     takes_mut_ctx: bool,
     view: bool,
     payable: bool,
@@ -349,6 +381,11 @@ impl HandlerSpec {
         let mut selector = [0u8; 4];
         selector.copy_from_slice(&h.as_bytes()[..4]);
 
+        let ok_type = match &f.sig.output {
+            ReturnType::Default => None,
+            ReturnType::Type(_, t) => extract_result_ok(t),
+        };
+
         Some(Self {
             name,
             fn_ident: f.sig.ident.clone(),
@@ -356,11 +393,30 @@ impl HandlerSpec {
             signature,
             arg_idents,
             arg_types,
+            ok_type,
             takes_mut_ctx,
             view: has_marker(&f.attrs, "view"),
             payable: has_marker(&f.attrs, "payable"),
             nonreentrant: has_marker(&f.attrs, "nonreentrant"),
         })
+    }
+
+    fn to_manifest_method(&self) -> ManifestMethod {
+        ManifestMethod {
+            name: self.name.clone(),
+            signature: self.signature.clone(),
+            selector: self.selector,
+            mutability: if self.view {
+                ManifestMutability::View
+            } else if self.payable {
+                ManifestMutability::Payable
+            } else {
+                ManifestMutability::Mutating
+            },
+            arg_idents: self.arg_idents.iter().map(|i| i.to_string()).collect(),
+            arg_types: self.arg_types.clone(),
+            return_type: self.ok_type.clone(),
+        }
     }
 
     fn selector_const(&self) -> TokenStream2 {
@@ -557,6 +613,29 @@ fn has_marker(attrs: &[Attribute], name: &str) -> bool {
 
 fn strip_marker(attrs: &mut Vec<Attribute>, name: &str) {
     attrs.retain(|a| !a.path().is_ident(name));
+}
+
+/// Extract `T` from `Result<T>` or `Result<T, E>`. Returns `None` for
+/// other return shapes — the manifest then records an empty `outputs` list.
+fn extract_result_ok(ty: &Type) -> Option<Type> {
+    let tp = match ty {
+        Type::Path(t) => t,
+        _ => return None,
+    };
+    let seg = tp.path.segments.last()?;
+    if seg.ident != "Result" {
+        return None;
+    }
+    let ab = match &seg.arguments {
+        PathArguments::AngleBracketed(AngleBracketedGenericArguments { args, .. }) => args,
+        _ => return None,
+    };
+    let first = ab.first()?;
+    if let GenericArgument::Type(t) = first {
+        Some(t.clone())
+    } else {
+        None
+    }
 }
 
 fn build_method_signature(domain: &str, method: &str, args: &[Type]) -> String {

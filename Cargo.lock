@@ -1967,6 +1967,8 @@ dependencies = [
  "bloom-chain",
  "bloom-chain-node",
  "bloom-chain-types",
+ "bloom-contract-build",
+ "bloom-contract-metadata",
  "bloom-daemon",
  "bloom-keystore",
  "bloom-mount",
@@ -2125,7 +2127,10 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
+ "wasmparser 0.218.1",
+ "wat",
 ]
 
 [[package]]
@@ -2135,6 +2140,7 @@ dependencies = [
  "blake3",
  "proc-macro2",
  "quote",
+ "serde_json",
  "syn 2.0.117",
 ]
 

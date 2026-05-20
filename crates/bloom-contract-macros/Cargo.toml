@@ -14,3 +14,4 @@ syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
 blake3 = { version = "1" }
+serde_json = { workspace = true }

@@ -10,6 +10,7 @@
 
 mod commands {
     pub mod chain;
+    pub mod contract;
 }
 
 use std::path::PathBuf;
@@ -25,6 +26,7 @@ use tracing::{debug, info, trace};
 use tracing_subscriber::EnvFilter;
 
 use commands::chain::ChainCmd;
+use commands::contract::ContractCmd;
 
 #[cfg(target_os = "linux")]
 const DEFAULT_MOUNT_PATH: &str = "/bloom";
@@ -82,6 +84,9 @@ enum Cmd {
     /// Sovereign bloom-chain: init, run-validator, submit, deploy, call, query.
     #[command(subcommand)]
     Chain(ChainCmd),
+    /// Build & verify Bloom Rust smart contracts.
+    #[command(subcommand)]
+    Contract(ContractCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -486,6 +491,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Petals(cmd) => run_petals(home, cmd).await,
         Cmd::Chain(cmd) => commands::chain::run_chain(&home, cmd).await,
+        Cmd::Contract(cmd) => commands::contract::run(cmd),
         Cmd::Ipc(IpcCmd::Call { method, params }) => {
             let socket = default_socket_path(home.root());
             if !socket.exists() {
