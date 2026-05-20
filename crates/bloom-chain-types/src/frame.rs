@@ -211,7 +211,7 @@ mod tests {
         let buf: Vec<u8> = too_big
             .iter()
             .copied()
-            .chain(std::iter::repeat(0u8).take(MAX_PAYLOAD_LEN + 1))
+            .chain(std::iter::repeat_n(0u8, MAX_PAYLOAD_LEN + 1))
             .collect();
         assert!(matches!(
             decode_frame(&buf),

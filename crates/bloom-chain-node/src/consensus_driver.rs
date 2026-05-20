@@ -24,10 +24,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use bloom_chain_consensus::{
-    Action, ConsensusEngine,
+    ConsensusEngine,
     auth::verify_vote_sig,
     signer::Signer,
-    state_machine::TimeoutKind,
     validator_set::ValidatorSet,
     verifier::SigVerifier,
 };
@@ -510,11 +509,10 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
             // already reflects the pre-execution max-fee debit, so
             // settling on top of the post-write_set balance produces the
             // same numbers minus the clobber hazard. Review 2026-05-19 #5.
-            if let Some(ws) = output.write_set {
-                if let Err(e) = state.apply(ws) {
+            if let Some(ws) = output.write_set
+                && let Err(e) = state.apply(ws) {
                     warn!(err = %e, "apply write_set failed");
                 }
-            }
 
             // Refund unused fuel.
             let mut sender = state.get_account(&tx.sender).unwrap_or_else(empty_account);
@@ -663,7 +661,7 @@ impl<E: PetalExecutor> ConsensusDriver<E> {
         };
 
         // Persist block and update indices.
-        let blob_data = serde_json::to_vec(&hex::encode(&state_root.0)).unwrap_or_default();
+        let blob_data = serde_json::to_vec(&hex::encode(state_root.0)).unwrap_or_default();
         let blob_hash = self.blob_store.put(&blob_data)?;
         self.state_index.put(height, &state_root, &blob_hash)?;
         self.block_store.put(height, block)?;
@@ -693,7 +691,7 @@ impl<E: PetalExecutor> ConsensusDriver<E> {
             height,
             txs = block.txs.len(),
             fuel_used = total_fuel_used,
-            state_root = %hex::encode(&state_root.0),
+            state_root = %hex::encode(state_root.0),
             "block.committed"
         );
         Ok(())

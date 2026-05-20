@@ -34,8 +34,7 @@ pub fn call(
     let lo = i64::from_ne_bytes((v as u64).to_ne_bytes());
     let hi = i64::from_ne_bytes(((v >> 64) as u64).to_ne_bytes());
 
-    let mut retbuf = Vec::with_capacity(MAX_RETDATA);
-    retbuf.resize(MAX_RETDATA, 0u8);
+    let mut retbuf = vec![0; MAX_RETDATA];
 
     let result = unsafe {
         imports::petal_call(
@@ -101,6 +100,7 @@ mod tests {
     fn call_signature_takes_loom_value() {
         // Compile-time confirmation that the new signature compiles with
         // a `LoomValue` argument (not `&[u8; 32]`).
+        #[allow(clippy::type_complexity)]
         let _f: fn(&[u8; 32], &[u8], LoomValue) -> Result<alloc::vec::Vec<u8>, i32> = call;
     }
 

@@ -169,12 +169,11 @@ fn build_variant_signature(
     s.push('(');
     let mut first = true;
     let push_ty = |s: &mut String, ty: &syn::Type| {
-        if let syn::Type::Path(tp) = ty {
-            if let Some(seg) = tp.path.segments.last() {
+        if let syn::Type::Path(tp) = ty
+            && let Some(seg) = tp.path.segments.last() {
                 s.push_str(&seg.ident.to_string().to_ascii_lowercase());
                 return;
             }
-        }
         s.push('?');
     };
     match fields {

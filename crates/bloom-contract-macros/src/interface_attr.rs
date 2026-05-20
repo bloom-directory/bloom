@@ -370,21 +370,16 @@ impl MethodSpec {
 // ===========================================================================
 
 fn extract_ok_type(ty: &Type) -> syn::Result<Type> {
-    if let Type::Path(tp) = ty {
-        if let Some(seg) = tp.path.segments.last() {
-            if seg.ident == "Result" {
-                if let PathArguments::AngleBracketed(AngleBracketedGenericArguments {
+    if let Type::Path(tp) = ty
+        && let Some(seg) = tp.path.segments.last()
+            && seg.ident == "Result"
+                && let PathArguments::AngleBracketed(AngleBracketedGenericArguments {
                     args,
                     ..
                 }) = &seg.arguments
-                {
-                    if let Some(GenericArgument::Type(t)) = args.first() {
+                    && let Some(GenericArgument::Type(t)) = args.first() {
                         return Ok(t.clone());
                     }
-                }
-            }
-        }
-    }
     Err(syn::Error::new_spanned(
         ty,
         "interface method return type must be `Result<T>` or `Result<T, E>`",

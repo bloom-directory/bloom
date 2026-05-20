@@ -881,14 +881,13 @@ fn emit_contract(c: ContractInput) -> Result<TokenStream2> {
 
     // Validate Bytes positioning: only ever the LAST argument; never a return.
     for m in &c.methods {
-        if let Some(ret) = &m.ret {
-            if matches!(ret, AbiType::Bytes) {
+        if let Some(ret) = &m.ret
+            && matches!(ret, AbiType::Bytes) {
                 return Err(syn::Error::new(
                     m.name.span(),
                     "`bytes` is not a valid return type (raw return payloads bypass the ABI)",
                 ));
             }
-        }
         for (i, a) in m.args.iter().enumerate() {
             if matches!(a.ty, AbiType::Bytes) && i + 1 != m.args.len() {
                 return Err(syn::Error::new(

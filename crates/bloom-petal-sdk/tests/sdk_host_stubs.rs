@@ -14,6 +14,7 @@
 
 /// Verify public API types are accessible and have the expected signatures.
 #[test]
+#[allow(clippy::type_complexity)]
 fn public_api_shapes() {
     // state module
     let _read_fn: fn(&[u8; 32]) -> Option<[u8; 32]> = bloom_petal_sdk::state::read;

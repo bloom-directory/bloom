@@ -19,7 +19,7 @@ fn genesis_load_one_validator() {
     let pk_bytes = vec![0u8; 1984];
     let pk_b64 = {
         // Minimal base64 encoding (standard alphabet).
-        use std::fmt::Write as FmtWrite;
+        
         let mut out = String::new();
         let enc_table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut i = 0;
@@ -27,7 +27,7 @@ fn genesis_load_one_validator() {
             let b0 = pk_bytes[i] as usize;
             let b1 = pk_bytes[i + 1] as usize;
             let b2 = pk_bytes[i + 2] as usize;
-            out.push(enc_table[(b0 >> 2)] as char);
+            out.push(enc_table[b0 >> 2] as char);
             out.push(enc_table[((b0 & 3) << 4) | (b1 >> 4)] as char);
             out.push(enc_table[((b1 & 0xf) << 2) | (b2 >> 6)] as char);
             out.push(enc_table[b2 & 0x3f] as char);

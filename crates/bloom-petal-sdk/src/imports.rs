@@ -143,7 +143,7 @@ unsafe extern "C" {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(target_arch = "wasm32"))]
-#[allow(unused_variables)]
+#[allow(unused_variables, clippy::missing_safety_doc, clippy::too_many_arguments)]
 pub mod stubs {
     #[inline(never)]
     pub unsafe fn state_read(key_ptr: i32, key_len: i32, out_ptr: i32) -> i64 {

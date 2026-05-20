@@ -29,7 +29,7 @@ impl StateBlobStore {
     }
 
     fn path_for(&self, hash: &Hash32) -> PathBuf {
-        self.root.join(hex::encode(&hash.0))
+        self.root.join(hex::encode(hash.0))
     }
 
     /// Store a blob, keyed by its BLAKE3 hash.
@@ -53,7 +53,7 @@ impl StateBlobStore {
         match std::fs::read(&path) {
             Ok(data) => Ok(Some(data)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("read blob {}", hex::encode(&hash.0))),
+            Err(e) => Err(e).with_context(|| format!("read blob {}", hex::encode(hash.0))),
         }
     }
 
@@ -68,7 +68,7 @@ impl StateBlobStore {
     /// keeps the `BLOB_RETENTION` most recently modified files.
     pub fn gc(&self, pinned: &[Hash32]) -> Result<()> {
         let pinned_set: std::collections::HashSet<String> =
-            pinned.iter().map(|h| hex::encode(&h.0)).collect();
+            pinned.iter().map(|h| hex::encode(h.0)).collect();
 
         // Collect all blob files with their modification time.
         let mut entries: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();

@@ -231,7 +231,7 @@ proptest! {
 fn decode_frame_rejects_oversized() {
     let len_bytes = ((MAX_PAYLOAD_LEN + 1) as u32).to_be_bytes();
     let mut buf: Vec<u8> = len_bytes.to_vec();
-    buf.extend(std::iter::repeat(0u8).take(MAX_PAYLOAD_LEN + 1));
+    buf.extend(std::iter::repeat_n(0u8, MAX_PAYLOAD_LEN + 1));
     assert!(matches!(
         decode_frame(&buf),
         Err(FrameError::FrameLengthTooLarge { .. })

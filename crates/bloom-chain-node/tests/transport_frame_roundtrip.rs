@@ -7,7 +7,6 @@
 
 use bloom_chain_node::transport::{Frame, read_frame, write_frame};
 use bloom_chain_types::{
-    ssz::Encode,
     tx::{Tx, TxKind},
     types::{Address, Hash32, PubKeyBytes, SigBytes},
     vote::{Proposal, Vote, VoteKind},

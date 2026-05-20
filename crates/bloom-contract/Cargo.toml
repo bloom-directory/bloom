@@ -17,3 +17,4 @@ blake3 = { version = "1", default-features = false }
 [features]
 default = ["std"]
 std = ["bloom-chain-abi/std", "blake3/std"]
+no-entrypoint = []

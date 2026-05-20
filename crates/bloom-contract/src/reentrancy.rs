@@ -50,11 +50,10 @@ impl Guard {
     /// the lock is already held.
     pub fn acquire() -> Self {
         let slot = lock_slot();
-        if let Some(v) = state::read(&slot) {
-            if v != [0u8; 32] {
+        if let Some(v) = state::read(&slot)
+            && v != [0u8; 32] {
                 petal::revert("reentrancy");
             }
-        }
         let mut held = [0u8; 32];
         held[31] = 1;
         state::write(&slot, &held);

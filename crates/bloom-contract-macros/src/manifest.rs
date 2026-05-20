@@ -184,11 +184,10 @@ fn parse_domain_arg(attr: &Attribute) -> Option<String> {
     };
     let mut out: Option<String> = None;
     let _ = list.parse_nested_meta(|nested| {
-        if nested.path.is_ident("domain") {
-            if let Ok(v) = nested.value().and_then(|s| s.parse::<LitStr>()) {
+        if nested.path.is_ident("domain")
+            && let Ok(v) = nested.value().and_then(|s| s.parse::<LitStr>()) {
                 out = Some(v.value());
             }
-        }
         Ok(())
     });
     out
@@ -250,11 +249,10 @@ fn parse_storage_compat_tag(attrs: &[Attribute]) -> Option<String> {
         if let Meta::List(list) = &a.meta {
             let mut tag: Option<String> = None;
             let _ = list.parse_nested_meta(|nested| {
-                if nested.path.is_ident("compat_tag") {
-                    if let Ok(v) = nested.value().and_then(|s| s.parse::<LitStr>()) {
+                if nested.path.is_ident("compat_tag")
+                    && let Ok(v) = nested.value().and_then(|s| s.parse::<LitStr>()) {
                         tag = Some(v.value());
                     }
-                }
                 Ok(())
             });
             return tag;
@@ -283,9 +281,9 @@ fn classify_storage_shape(ty: &Type) -> Option<StorageShape<'_>> {
                 })
                 .collect();
             return match (name.as_str(), args.as_slice()) {
-                ("StorageValue", [t]) => Some(StorageShape::Scalar(*t)),
-                ("Map", [k, v]) => Some(StorageShape::Map(*k, *v)),
-                ("VecStore", [t]) => Some(StorageShape::Vec(*t)),
+                ("StorageValue", [t]) => Some(StorageShape::Scalar(t)),
+                ("Map", [k, v]) => Some(StorageShape::Map(k, v)),
+                ("VecStore", [t]) => Some(StorageShape::Vec(t)),
                 _ => None,
             };
         }

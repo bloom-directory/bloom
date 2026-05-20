@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use bloom_chain_node::rpc::RpcClient;
-use clap::{Parser, Subcommand};
+use clap::Subcommand;
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
@@ -278,8 +278,8 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             manifest_hash,
         } => {
             use bloom_chain_types::{
-                tx::{Tx, TxKind},
-                types::{Address, Hash32, PubKeyBytes, SigBytes},
+                tx::TxKind,
+                types::Hash32,
             };
             use bloom_chain_types::ssz::Encode;
 
@@ -351,10 +351,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             value,
             max_fuel,
         } => {
-            use bloom_chain_types::{
-                tx::{Tx, TxKind},
-                types::Address,
-            };
+            use bloom_chain_types::tx::TxKind;
             use bloom_chain_types::ssz::Encode;
 
             let to = parse_address_cli(&addr)?;
@@ -442,10 +439,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
 
         // ── transfer ──────────────────────────────────────────────────────────
         ChainCmd::Transfer { to, amount } => {
-            use bloom_chain_types::{
-                tx::{Tx, TxKind},
-                types::Address,
-            };
+            use bloom_chain_types::tx::TxKind;
             use bloom_chain_types::ssz::Encode;
 
             let to_addr = parse_address_cli(&to)?;
@@ -712,6 +706,7 @@ fn load_wallet_key(
 /// [`fetch_nonce`] and reading `chain_id` from the local genesis with
 /// [`load_chain_id`]; baking either of those in would produce txs that get
 /// silently rejected by the mempool.
+#[allow(clippy::too_many_arguments)]
 fn build_and_sign_tx(
     sk: &bloom_keystore::xdsa::XdsaSecretKey,
     pk: &bloom_keystore::xdsa::XdsaPublicKey,
@@ -857,6 +852,7 @@ fn parse_address_cli(s: &str) -> Result<bloom_chain_types::types::Address> {
 ///     `home<i>/chain/keystore/validator.xdsa`.
 ///   - Derives the validator address via
 ///     `blake3("bloom-chain.v0.addr:" || pubkey)`.
+///
 /// Builds one shared `GenesisFile` carrying all N validators (with
 /// `host = 127.0.0.1:base+i`) and per-validator pre-funded allocations,
 /// then writes it to every `home<i>/chain/genesis.toml`.
@@ -1273,7 +1269,7 @@ host = "127.0.0.1:26656"
             hex::encode(derived.0),
             pk_b64
         );
-        std::fs::write(&chain_dir.join("genesis.toml"), genesis).unwrap();
+        std::fs::write(chain_dir.join("genesis.toml"), genesis).unwrap();
 
         let (loaded_cfg, run_cfg) =
             load_validator_run_config(home, &chain_dir, &config_path)

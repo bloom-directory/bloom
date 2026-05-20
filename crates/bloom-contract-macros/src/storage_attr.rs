@@ -89,13 +89,12 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Strip our per-field `#[storage(...)]` attributes from the emitted struct
     // so the compiler doesn't see an unknown attribute on a plain struct field.
     let mut sanitized = input.clone();
-    if let Data::Struct(s) = &mut sanitized.data {
-        if let Fields::Named(n) = &mut s.fields {
+    if let Data::Struct(s) = &mut sanitized.data
+        && let Fields::Named(n) = &mut s.fields {
             for f in n.named.iter_mut() {
                 f.attrs.retain(|a| !a.path().is_ident("storage"));
             }
         }
-    }
 
     let domain_lit = LitStr::new(&domain, proc_macro2::Span::call_site());
 

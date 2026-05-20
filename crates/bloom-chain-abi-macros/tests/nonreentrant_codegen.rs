@@ -25,6 +25,7 @@ fn nonreentrant_selector_is_emitted() {
 }
 
 #[test]
+#[allow(clippy::type_complexity)]
 fn dispatcher_signature_is_unchanged() {
     let _: fn(
         &mut GuardedStub,

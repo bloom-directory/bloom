@@ -247,7 +247,7 @@ impl RpcServer {
             .await
             .map_err(|_| anyhow!("mempool admission worker dropped reply"))?
         {
-            Ok(()) => Ok(json!({ "tx_hash": hex::encode(&tx_hash.0) })),
+            Ok(()) => Ok(json!({ "tx_hash": hex::encode(tx_hash.0) })),
             Err(msg) => Err(anyhow!("mempool admit rejected: {msg}")),
         }
     }
@@ -265,8 +265,8 @@ impl RpcServer {
             Some(acct) => Ok(json!({
                 "nonce": acct.nonce,
                 "loom": acct.loom.to_string(),
-                "code_hash": acct.code_hash.map(|h| hex::encode(&h.0)),
-                "storage_root": hex::encode(&acct.storage_root.0),
+                "code_hash": acct.code_hash.map(|h| hex::encode(h.0)),
+                "storage_root": hex::encode(acct.storage_root.0),
             })),
         }
     }
@@ -302,16 +302,16 @@ impl RpcServer {
             None => Ok(json!(null)),
             Some(block) => Ok(json!({
                 "height": block.header.height,
-                "hash": hex::encode(&block.header.block_hash().0),
-                "parent_hash": hex::encode(&block.header.parent_hash.0),
+                "hash": hex::encode(block.header.block_hash().0),
+                "parent_hash": hex::encode(block.header.parent_hash.0),
                 "timestamp_ms": block.header.timestamp_ms,
-                "proposer": hex::encode(&block.header.proposer.0),
-                "txs_root": hex::encode(&block.header.txs_root.0),
-                "state_root": hex::encode(&block.header.state_root.0),
+                "proposer": hex::encode(block.header.proposer.0),
+                "txs_root": hex::encode(block.header.txs_root.0),
+                "state_root": hex::encode(block.header.state_root.0),
                 "fuel_used": block.header.fuel_used,
                 "fuel_limit": block.header.fuel_limit,
                 "tx_count": block.txs.len(),
-                "tx_hashes": block.txs.iter().map(|t| hex::encode(&t.tx_hash().0)).collect::<Vec<_>>(),
+                "tx_hashes": block.txs.iter().map(|t| hex::encode(t.tx_hash().0)).collect::<Vec<_>>(),
             })),
         }
     }
@@ -375,7 +375,7 @@ impl RpcServer {
 
         let state = self.state.lock();
         let value = state.storage_read(&addr, &key);
-        Ok(json!({ "value": hex::encode(&value) }))
+        Ok(json!({ "value": hex::encode(value) }))
     }
 
     fn handle_ls_validators(&self) -> Result<Value> {
@@ -385,7 +385,7 @@ impl RpcServer {
             .iter()
             .map(|v| {
                 json!({
-                    "address": hex::encode(&v.address.0),
+                    "address": hex::encode(v.address.0),
                     "pubkey_len": v.pubkey.0.len(),
                     "voting_power": v.voting_power,
                 })

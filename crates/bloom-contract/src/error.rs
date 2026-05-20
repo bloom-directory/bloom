@@ -47,6 +47,7 @@ impl ContractError {
 
     /// Wrap a static reason string. Encoded as `b"reason:" || msg.as_bytes()`
     /// so an indexer can distinguish from typed errors.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(msg: &str) -> Self {
         let mut data = Vec::with_capacity(7 + msg.len());
         data.extend_from_slice(b"reason:");

@@ -1,3 +1,4 @@
+#![allow(clippy::too_many_arguments)]
 //! `bloom dex ...` — DEX subcommand tree (v0 acceptance demo driver).
 //!
 //! High-level glue around `bloom chain deploy` + `bloom chain call`. These

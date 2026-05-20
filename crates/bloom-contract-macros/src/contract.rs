@@ -117,8 +117,8 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
                 continue;
             }
             let is_fallback = has_marker(&f.attrs, "fallback");
-            if matches!(f.vis, Visibility::Public(_)) && !has_marker(&f.attrs, "internal") {
-                if let Some(spec) = HandlerSpec::from_fn(f, &domain) {
+            if matches!(f.vis, Visibility::Public(_)) && !has_marker(&f.attrs, "internal")
+                && let Some(spec) = HandlerSpec::from_fn(f, &domain) {
                     if is_fallback {
                         if fallback_name.is_some() {
                             return syn::Error::new_spanned(
@@ -141,7 +141,6 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                     handlers.push(spec);
                 }
-            }
             // Strip method-level marker attributes regardless of branch so
             // the emitted module compiles.
             for marker in ["view", "payable", "nonreentrant", "internal", "fallback"] {

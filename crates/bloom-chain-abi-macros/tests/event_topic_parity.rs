@@ -132,7 +132,7 @@ proptest! {
         let topic_runtime = bloom_chain_abi::event_topic(&sig);
         let topic_helper = bloom_chain_abi::event_signature_topic(
             &name,
-            &types.iter().copied().collect::<Vec<_>>(),
+            &types.to_vec(),
         );
         let full = blake3::hash(sig.as_bytes());
 

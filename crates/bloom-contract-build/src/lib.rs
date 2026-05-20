@@ -260,13 +260,12 @@ pub fn validate_wasm(bytes: &[u8]) -> Result<WasmInspection, BuildError> {
                             mem.initial
                         )));
                     }
-                    if let Some(max) = mem.maximum {
-                        if max > u64::from(MAX_MEMORY_PAGES) {
+                    if let Some(max) = mem.maximum
+                        && max > u64::from(MAX_MEMORY_PAGES) {
                             return Err(BuildError::Validation(format!(
                                 "memory max pages {max} exceeds cap of {MAX_MEMORY_PAGES}"
                             )));
                         }
-                    }
                 }
             }
             Payload::CodeSectionEntry(body) => {
@@ -379,11 +378,10 @@ pub fn extract_manifest_section(bytes: &[u8]) -> Result<Option<Vec<u8>>, BuildEr
     let parser = Parser::new(0);
     for payload in parser.parse_all(bytes) {
         let payload = payload.map_err(|e| BuildError::Manifest(e.to_string()))?;
-        if let Payload::CustomSection(reader) = payload {
-            if reader.name() == "bloom_manifest" {
+        if let Payload::CustomSection(reader) = payload
+            && reader.name() == "bloom_manifest" {
                 return Ok(Some(reader.data().to_vec()));
             }
-        }
     }
     Ok(None)
 }
@@ -398,12 +396,11 @@ pub fn extract_interface_records(bytes: &[u8]) -> Result<Vec<InterfaceManifest>,
     let parser = Parser::new(0);
     for payload in parser.parse_all(bytes) {
         let payload = payload.map_err(|e| BuildError::Manifest(e.to_string()))?;
-        if let Payload::CustomSection(reader) = payload {
-            if reader.name() == "bloom_interfaces" {
+        if let Payload::CustomSection(reader) = payload
+            && reader.name() == "bloom_interfaces" {
                 return parse_interface_records(reader.data())
                     .map_err(|e| BuildError::Manifest(format!("bloom_interfaces: {e}")));
             }
-        }
     }
     Ok(Vec::new())
 }
@@ -473,13 +470,12 @@ pub fn finalise_manifest(
         serde_json::to_value(&resolved).map_err(|e| BuildError::Manifest(e.to_string()))?,
     );
 
-    if let Some(storage) = obj.get_mut("storage").and_then(|v| v.as_object_mut()) {
-        if let Some(fields) = storage.get_mut("fields").and_then(|v| v.as_array_mut()) {
+    if let Some(storage) = obj.get_mut("storage").and_then(|v| v.as_object_mut())
+        && let Some(fields) = storage.get_mut("fields").and_then(|v| v.as_array_mut()) {
             for entry in fields {
                 normalise_storage_field(entry)?;
             }
         }
-    }
 
     // Limits aren't user-configurable yet; force the on-disk default.
     let limits = Limits::default();
@@ -631,14 +627,13 @@ pub fn verify_manifest_against_wasm(manifest: &Manifest, wasm: &[u8]) -> Result<
         // If the manifest pins a signature, the wasm must match it. A
         // missing signature on either side is treated as a wildcard — older
         // (v1) manifests didn't capture this field at all.
-        if let (Some(want), Some(got)) = (&declared.signature, &live.signature) {
-            if want != got {
+        if let (Some(want), Some(got)) = (&declared.signature, &live.signature)
+            && want != got {
                 return Err(BuildError::Manifest(format!(
                     "import `{}.{}` signature mismatch: manifest={} wasm={}",
                     live.module, live.name, want, got
                 )));
             }
-        }
     }
     Ok(())
 }
@@ -724,13 +719,11 @@ fn wasm_candidates(crate_dir: &Path, profile: Profile, wasm_name: &str) -> Resul
     let mut cur = crate_dir.parent();
     while let Some(p) = cur {
         let candidate_toml = p.join("Cargo.toml");
-        if candidate_toml.is_file() {
-            if let Ok(body) = fs::read_to_string(&candidate_toml) {
-                if body.contains("[workspace]") {
+        if candidate_toml.is_file()
+            && let Ok(body) = fs::read_to_string(&candidate_toml)
+                && body.contains("[workspace]") {
                     out.push(p.join(&subpath));
                 }
-            }
-        }
         cur = p.parent();
     }
     Ok(out)

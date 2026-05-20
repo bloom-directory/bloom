@@ -11,7 +11,7 @@
 //! the revert branch) and pass on the fixed code.
 
 use bloom_chain_state::{Account, State};
-use bloom_chain_types::{Address, Hash32};
+use bloom_chain_types::Hash32;
 use bloom_petals::{BlockCtx, ChainCallInput, ChainEntry, PetalVm};
 
 mod common;

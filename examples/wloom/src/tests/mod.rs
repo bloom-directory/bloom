@@ -157,18 +157,19 @@ fn selector_window_is_four_bytes() {
 
 #[test]
 fn selectors_are_unique() {
-    let mut selectors: Vec<[u8; 4]> = Vec::new();
-    selectors.push(Wloom::SEL_DEPOSIT);
-    selectors.push(Wloom::SEL_WITHDRAW);
-    selectors.push(bloom_dex_erc20::Erc20::SEL_TOTAL_SUPPLY);
-    selectors.push(bloom_dex_erc20::Erc20::SEL_BALANCE_OF);
-    selectors.push(bloom_dex_erc20::Erc20::SEL_ALLOWANCE);
-    selectors.push(bloom_dex_erc20::Erc20::SEL_TRANSFER);
-    selectors.push(bloom_dex_erc20::Erc20::SEL_TRANSFER_FROM);
-    selectors.push(bloom_dex_erc20::Erc20::SEL_APPROVE);
-    selectors.push(bloom_dex_erc20::Erc20::SEL_NAME);
-    selectors.push(bloom_dex_erc20::Erc20::SEL_SYMBOL);
-    selectors.push(bloom_dex_erc20::Erc20::SEL_DECIMALS);
+    let selectors: Vec<[u8; 4]> = vec![
+        Wloom::SEL_DEPOSIT,
+        Wloom::SEL_WITHDRAW,
+        bloom_dex_erc20::Erc20::SEL_TOTAL_SUPPLY,
+        bloom_dex_erc20::Erc20::SEL_BALANCE_OF,
+        bloom_dex_erc20::Erc20::SEL_ALLOWANCE,
+        bloom_dex_erc20::Erc20::SEL_TRANSFER,
+        bloom_dex_erc20::Erc20::SEL_TRANSFER_FROM,
+        bloom_dex_erc20::Erc20::SEL_APPROVE,
+        bloom_dex_erc20::Erc20::SEL_NAME,
+        bloom_dex_erc20::Erc20::SEL_SYMBOL,
+        bloom_dex_erc20::Erc20::SEL_DECIMALS,
+    ];
 
     let mut deduped: Vec<[u8; 4]> = selectors.clone();
     deduped.sort();

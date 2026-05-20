@@ -23,13 +23,12 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use bloom_chain_consensus::ValidatorSet;
 use bloom_chain_consensus::validator_set::Validator;
 use bloom_chain_state::{Account, State};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes};
 use serde::{Deserialize, Serialize};
-use bloom_chain_types::ssz::Encode;
 
 use crate::error::NodeError;
 
@@ -181,15 +180,13 @@ impl Genesis {
 /// (useful in dev / test contexts before the display format is finalised).
 pub fn parse_b1_address(s: &str) -> Result<Address> {
     // Allow raw hex for dev convenience.
-    if s.len() == 64 {
-        if let Ok(bytes) = hex::decode(s) {
-            if bytes.len() == 32 {
+    if s.len() == 64
+        && let Ok(bytes) = hex::decode(s)
+            && bytes.len() == 32 {
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&bytes);
                 return Ok(Address(arr));
             }
-        }
-    }
 
     // Strip b1 prefix.
     let rest = s
@@ -219,7 +216,7 @@ pub fn parse_b1_address(s: &str) -> Result<Address> {
 }
 
 fn base64_decode(s: &str) -> Result<Vec<u8>> {
-    use std::io::Read;
+    
     // Use the standard base64 alphabet.
     // We avoid pulling in the `base64` crate; use std's built-in decoder via
     // a simple wrapper.  Since the keystore already uses base64 via alloy, we

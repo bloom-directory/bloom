@@ -193,7 +193,7 @@ pub fn generate_client(iface: &InterfaceManifest) -> Result<String, CodegenError
 
     let struct_name = format!("{}Client", iface.name);
 
-    out.push_str(&format!("#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n"));
+    out.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n");
     out.push_str(&format!("pub struct {struct_name} {{\n    pub address: [u8; 32],\n}}\n\n"));
 
     out.push_str(&format!("impl {struct_name} {{\n"));

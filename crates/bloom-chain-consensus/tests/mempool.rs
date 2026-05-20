@@ -183,23 +183,24 @@ fn remove_included_only_removes_matching_txs() {
 // ---------------------------------------------------------------------------
 // Adversarial: forged-sender admission
 // ---------------------------------------------------------------------------
+//
+// Review item #11 (2026-05-19 consensus hardening): a tx that carries a
+// validly-signed body but whose `sender` field does NOT derive from the
+// signing pubkey must be rejected at the mempool boundary.
+//
+// Pre-fix, `Mempool::admit` accepted such a tx (signature verifies fine,
+// nonce/balance checks both reference `tx.sender` rather than the derived
+// address), letting an attacker propagate a tx that claims a sender it has
+// no key for. The chain-apply path already rejected it with `sender mismatch`
+// in `consensus_driver::apply_block`, but only after gossip had already paid
+// the network cost.
+//
+// This test passes the signature check (NoopVerifier) and constructs a tx
+// whose `pubkey` would derive to address X via
+// `Address::from_pubkey_bytes`, but mutates `sender` to a different,
+// attacker-chosen address before calling `admit`. The mempool must reject
+// with `AddressMismatch`.
 
-/// Review item #11 (2026-05-19 consensus hardening): a tx that carries a
-/// validly-signed body but whose `sender` field does NOT derive from the
-/// signing pubkey must be rejected at the mempool boundary.
-///
-/// Pre-fix, `Mempool::admit` accepted such a tx (signature verifies fine,
-/// nonce/balance checks both reference `tx.sender` rather than the derived
-/// address), letting an attacker propagate a tx that claims a sender it has
-/// no key for. The chain-apply path already rejected it with `sender mismatch`
-/// in `consensus_driver::apply_block`, but only after gossip had already paid
-/// the network cost.
-///
-/// This test passes the signature check (NoopVerifier) and constructs a tx
-/// whose `pubkey` would derive to address X via
-/// `Address::from_pubkey_bytes`, but mutates `sender` to a different,
-/// attacker-chosen address before calling `admit`. The mempool must reject
-/// with `AddressMismatch`.
 // ---------------------------------------------------------------------------
 // Adversarial: per-sender nonce contiguity under fuel pressure
 // ---------------------------------------------------------------------------
@@ -288,7 +289,7 @@ fn select_for_block_under_tight_fuel_never_skips_predecessor() {
     // The valid picks here are (S, 1) [fee 1] or (T, 1) [fee 50]. Either is
     // legal per-block; given fee priority among eligible heads, expect (T, 1).
     assert!(
-        (tx.sender == t && tx.nonce == 1) || (tx.sender == s && tx.nonce == 1),
+        (tx.sender == t || tx.sender == s) && tx.nonce == 1,
         "expected an eligible nonce-1 head, got sender={:?} nonce={}",
         tx.sender,
         tx.nonce

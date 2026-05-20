@@ -1266,6 +1266,7 @@ fn link_new_host_import_stubs(linker: &mut Linker<ChainStoreData>) -> anyhow::Re
 // Sub-call error type (carries snapshot back on failure for revert semantics)
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 enum SubCallError {
     Reverted { snapshot: Box<StateSnapshot>, reason: Option<Vec<u8>>, fuel_used: u64 },
     Trapped { snapshot: Box<StateSnapshot>, error: Option<String>, fuel_used: u64 },

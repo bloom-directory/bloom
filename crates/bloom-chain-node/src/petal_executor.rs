@@ -150,7 +150,7 @@ impl PetalExecutor for ChainPetalExecutor {
                         } else {
                             let ws = out.snapshot.commit();
                             tracing::info!(
-                                addr = %hex::encode(&addr.0),
+                                addr = %hex::encode(addr.0),
                                 fuel_used = out.fuel_used,
                                 "deploy committed"
                             );
@@ -236,7 +236,7 @@ impl PetalExecutor for ChainPetalExecutor {
                     Ok(out) => {
                         if let Some(reason) = out.revert_reason {
                             warn!(
-                                to = %hex::encode(&to.0),
+                                to = %hex::encode(to.0),
                                 fuel_used = out.fuel_used,
                                 reason = %String::from_utf8_lossy(&reason),
                                 "call reverted"
@@ -260,7 +260,7 @@ impl PetalExecutor for ChainPetalExecutor {
                         }
                     }
                     Err(e) => {
-                        warn!(to = %hex::encode(&to.0), err = %e, "call trapped");
+                        warn!(to = %hex::encode(to.0), err = %e, "call trapped");
                         ExecOutput {
                             success: false,
                             fuel_used: tx.max_fuel,
@@ -280,7 +280,7 @@ impl PetalExecutor for ChainPetalExecutor {
             // real PTB interpreter.
             TxKind::SubmitPtb { .. } => {
                 warn!(
-                    sender = %hex::encode(&tx.sender.0),
+                    sender = %hex::encode(tx.sender.0),
                     "SubmitPtb rejected: NotYetActivated (Phase 1)"
                 );
                 ExecOutput {

@@ -245,7 +245,7 @@ pub async fn query_account_loom(client: &RpcClient, addr: &[u8; 32]) -> Result<u
         .get("loom")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("missing loom in account"))?;
-    Ok(s.parse::<u128>().context("parse loom u128")?)
+    s.parse::<u128>().context("parse loom u128")
 }
 
 pub async fn query_pair_reserves(

@@ -40,7 +40,7 @@ impl MempoolPersist {
         self.db
             .insert(&key, val)
             .context("mempool_persist.put")?;
-        debug!(sender = %hex::encode(&tx.sender.0), nonce = tx.nonce, "mempool_persist.put");
+        debug!(sender = %hex::encode(tx.sender.0), nonce = tx.nonce, "mempool_persist.put");
         Ok(())
     }
 

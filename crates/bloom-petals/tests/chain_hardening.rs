@@ -10,7 +10,7 @@
 
 use bloom_chain_state::{Account, State};
 use bloom_chain_types::{
-    Address, Hash32,
+    Hash32,
     digest::{blake3_tagged, tags},
 };
 use bloom_petals::{
@@ -240,8 +240,7 @@ fn wasm_memory_grow_caught_at_runtime() {
     // is missing (master) or (b) trap on the `unreachable` after grow
     // returned -1 (post-fix).
     let err = PetalVm::run_chain_call(input)
-        .err()
-        .expect("memory.grow over cap must trap (review #7)");
+        .expect_err("memory.grow over cap must trap (review #7)");
     match err {
         PetalError::ChainCall(msg) => {
             assert!(

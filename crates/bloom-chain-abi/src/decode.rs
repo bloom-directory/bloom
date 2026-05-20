@@ -246,8 +246,8 @@ mod tests {
         e.push_bool(false);
         let out = e.finish();
         let mut buf = Buf::new(&out);
-        assert_eq!(buf.read_bool().unwrap(), true);
-        assert_eq!(buf.read_bool().unwrap(), false);
+        assert!(buf.read_bool().unwrap());
+        assert!(!buf.read_bool().unwrap());
     }
 
     #[test]

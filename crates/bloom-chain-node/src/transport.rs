@@ -21,7 +21,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use bloom_chain_types::{
     block::Block,
-    frame::{MAX_PAYLOAD_LEN, MsgType, decode_wire_frame, encode_wire_frame},
+    frame::{MAX_PAYLOAD_LEN, MsgType, encode_wire_frame},
     tx::Tx,
     types::Hash32,
     vote::{Proposal, Vote},
@@ -177,6 +177,7 @@ fn decode_payload(msg_type: MsgType, payload: &[u8]) -> Result<Frame> {
 
 /// A single entry in the peer pool.
 struct PeerState {
+    #[allow(dead_code)]
     addr: String,
     /// Channel for sending encoded wire frames to the background writer task.
     tx: mpsc::Sender<Vec<u8>>,
@@ -227,7 +228,7 @@ impl PeerPool {
         loop {
             debug!(peer = %addr, "peer_pool.connecting");
             match TcpStream::connect(&addr).await {
-                Ok(mut stream) => {
+                Ok(stream) => {
                     info!(peer = %addr, "peer_pool.connected");
                     backoff = initial_backoff; // reset on success
 
@@ -260,7 +261,7 @@ impl PeerPool {
                     // Reader half: reconstruct TcpStream from owned halves is
                     // not directly possible; use a small bridge.
                     // We use tokio::io::join for reading.
-                    let mut read_buf = vec![0u8; MAX_PAYLOAD_LEN + 37];
+                    let read_buf = vec![0u8; MAX_PAYLOAD_LEN + 37];
                     let _ = read_buf; // suppress unused warning
 
                     // Simplified reader: read raw bytes in a loop.

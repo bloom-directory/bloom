@@ -70,13 +70,12 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let mut sanitized = input.clone();
-    if let Data::Struct(s) = &mut sanitized.data {
-        if let Fields::Named(n) = &mut s.fields {
+    if let Data::Struct(s) = &mut sanitized.data
+        && let Fields::Named(n) = &mut s.fields {
             for f in n.named.iter_mut() {
                 f.attrs.retain(|a| !a.path().is_ident("indexed"));
             }
         }
-    }
 
     let indexed: Vec<&Field> = fields.iter().filter(|f| has_indexed(f)).collect();
     let non_indexed: Vec<&Field> = fields.iter().filter(|f| !has_indexed(f)).collect();
@@ -177,10 +176,9 @@ fn type_canonical_name(ty: &syn::Type) -> String {
     // conventions ("u256", "address", ...). For composite types this is
     // best-effort; full canonicalization happens at host time via the
     // type's `AbiType::schema()`.
-    if let syn::Type::Path(tp) = ty {
-        if let Some(seg) = tp.path.segments.last() {
+    if let syn::Type::Path(tp) = ty
+        && let Some(seg) = tp.path.segments.last() {
             return seg.ident.to_string().to_ascii_lowercase();
         }
-    }
     "?".to_string()
 }

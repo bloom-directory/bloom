@@ -13,7 +13,7 @@
 //! 6. Spawn the 1s block-tick scheduler.
 //! 7. Graceful shutdown on Ctrl-C / SIGTERM.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -21,7 +21,6 @@ use anyhow::{Context, Result};
 use bloom_chain_consensus::{
     Action, ConsensusEngine, Mempool,
     state_machine::{Event, TimeoutKind},
-    ValidatorSet,
 };
 use bloom_chain_state::State;
 use bloom_chain_types::{
@@ -40,9 +39,9 @@ use crate::{
     block_store::BlockStore,
     consensus_driver::{BLOCK_EMISSION, ConsensusDriver, XdsaVerifier},
     petal_executor::ChainPetalExecutor,
-    genesis::{Genesis, NodeConfig},
+    genesis::Genesis,
     mempool_persist::MempoolPersist,
-    rpc::{RpcClient, RpcServer},
+    rpc::RpcServer,
     state_blob::StateBlobStore,
     state_index::StateIndex,
     transport::{Frame, PeerPool, accept_loop},
@@ -244,7 +243,7 @@ impl Node {
             starting_height,
             local_address,
             validator_set.clone(),
-            XdsaVerifier::default(),
+            XdsaVerifier,
             Some(block_builder),
             fuel_limit_cfg,
             Some(signer),
@@ -617,6 +616,7 @@ impl Node {
                         // entries on the happy path.
                         let has_commit = !block.commit.votes.is_empty()
                             && block.commit.height == block.header.height;
+                        #[allow(clippy::never_loop)]
                         loop {
                             if !has_commit {
                                 break;
@@ -817,13 +817,12 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                             let block_opt = {
                                 driver.engine.lock().get_registered_block(&p.block_hash)
                             };
-                            if let Some(block) = block_opt {
-                                if let Err(e) =
+                            if let Some(block) = block_opt
+                                && let Err(e) =
                                     peer_pool.broadcast(&Frame::BlockResponse(block)).await
                                 {
                                     warn!(err = %e, "block broadcast failed");
                                 }
-                            }
 
                             // Now broadcast the proposal itself + deliver to self.
                             let self_actions = {

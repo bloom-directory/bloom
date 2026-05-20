@@ -37,6 +37,7 @@
 //! signature strings by hand.
 
 #![cfg_attr(target_arch = "wasm32", no_std)]
+#![allow(clippy::doc_overindented_list_items, clippy::too_many_arguments)]
 
 extern crate alloc;
 
