@@ -2448,6 +2448,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-objects"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bloom-chain-types",
+ "hex",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bloom-petal-sdk"
 version = "0.1.0"
 dependencies = [

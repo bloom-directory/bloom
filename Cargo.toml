@@ -26,6 +26,7 @@ members = [
   "crates/bloom-petal-sdk",
   "crates/bloom-chain-abi",
   "crates/bloom-chain-abi-macros",
+  "crates/bloom-objects",
   "crates/bloom-contract",
   "crates/bloom-contract-macros",
   "crates/bloom-contract-metadata",
@@ -119,6 +120,7 @@ bloom-chain-node = { path = "crates/bloom-chain-node" }
 bloom-petal-sdk   = { path = "crates/bloom-petal-sdk" }
 bloom-chain-abi   = { path = "crates/bloom-chain-abi", default-features = false }
 bloom-chain-abi-macros = { path = "crates/bloom-chain-abi-macros" }
+bloom-objects     = { path = "crates/bloom-objects" }
 bloom-contract    = { path = "crates/bloom-contract", default-features = false }
 bloom-contract-macros = { path = "crates/bloom-contract-macros" }
 bloom-contract-metadata = { path = "crates/bloom-contract-metadata" }

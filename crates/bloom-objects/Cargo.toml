@@ -1,0 +1,17 @@
+[package]
+name = "bloom-objects"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared object-model types for Bloom-native contracts (Object/TypeTag/Owner/Ability + codec extensions + host-import declarations)"
+
+[dependencies]
+blake3.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+bloom-chain-types.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
