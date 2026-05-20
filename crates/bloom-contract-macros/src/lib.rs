@@ -14,6 +14,7 @@ mod contract;
 mod derives;
 mod error_attr;
 mod event_attr;
+mod interface_attr;
 mod storage_attr;
 
 /// `#[derive(AbiEncode)]` — sequential field encoding for structs;
@@ -76,9 +77,11 @@ pub fn init(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
 
-/// `#[bloom::interface]` — placed on a trait declaration to expose an ABI
-/// domain. Phase 1 stub.
+/// `#[bloom::interface]` — placed on a trait declaration to describe a
+/// cross-contract ABI surface. Emits selector constants, an
+/// `InterfaceMethod` descriptor table, and a typed
+/// `ContractRef<Trait>` inherent impl for cross-contract calls.
 #[proc_macro_attribute]
-pub fn interface(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    item
+pub fn interface(attr: TokenStream, item: TokenStream) -> TokenStream {
+    interface_attr::expand(attr, item)
 }

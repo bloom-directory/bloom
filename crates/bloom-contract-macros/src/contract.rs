@@ -136,7 +136,9 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // -- Build the dispatch table -------------------------------------------
     let selector_consts = handlers.iter().map(|h| h.selector_const());
-    let dispatch_arms = handlers.iter().map(|h| h.dispatch_arm());
+    let invoke_fns = handlers.iter().map(|h| h.invoke_fn());
+    let primary_arms = handlers.iter().map(|h| h.primary_arm());
+    let name_arms = handlers.iter().map(|h| h.name_match_arm());
     let selector_descriptors = handlers.iter().map(|h| h.descriptor());
     let handler_count = handlers.len();
 
@@ -146,6 +148,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .map(|i| LitStr::new(&i.to_string(), proc_macro2::Span::call_site()))
         .collect();
+    let interface_idents = &interfaces;
 
     // -- Generated runtime items appended to the module body ---------------
     let dispatcher_module: TokenStream2 = quote! {
@@ -154,7 +157,10 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
         /// `#[bloom::contract]` and can change between versions.
         pub mod __bloom {
             use super::*;
+            #[allow(unused_imports)]
             use ::bloom_contract::__private::Vec as __Vec;
+            #[allow(unused_imports)]
+            use ::bloom_contract::interface::ContractInterface as __ContractInterface;
 
             /// Contract domain — prefix for selectors, storage slots, and
             /// event signatures.
@@ -163,9 +169,22 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// Source-level module identifier.
             pub const MODULE_NAME: &str = #module_str_lit;
 
-            /// Interfaces this contract claims to implement (Phase 5 routes
-            /// their selectors through the dispatcher).
+            /// Interfaces this contract claims to implement. The dispatcher
+            /// folds every interface's selectors into the routing table so
+            /// callers can reach handlers through either the contract's own
+            /// domain or any declared interface domain.
             pub const INTERFACES: &[&str] = &[#(#interfaces_lit_strs),*];
+
+            /// `ContractInterface::METHODS` slices for every declared
+            /// interface, in declaration order. Empty when no interfaces
+            /// were listed.
+            pub const INTERFACE_METHODS: &[
+                &[::bloom_contract::interface::InterfaceMethod]
+            ] = &[
+                #(
+                    <#interface_idents as ::bloom_contract::interface::ContractInterface>::METHODS,
+                )*
+            ];
 
             #(#selector_consts)*
 
@@ -177,6 +196,9 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             pub const SELECTOR_COUNT: usize = #handler_count;
 
+            // -- Per-handler invoke functions ---------------------------------
+            #(#invoke_fns)*
+
             /// Decode the init payload, invoke `#[init]`, and forward the
             /// result to `petal.return`/`petal.revert`.
             #[doc(hidden)]
@@ -185,9 +207,9 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #init_call
             }
 
-            /// Read calldata, peel the 4-byte selector, match against the
-            /// generated table, decode args, run the handler, encode the
-            /// return value, forward to `petal.return`/`petal.revert`.
+            /// Read calldata, peel the 4-byte selector, route through the
+            /// primary selector table, then fall back to interface-aliased
+            /// dispatch before reverting.
             #[doc(hidden)]
             pub fn __dispatch_call() {
                 let calldata = ::bloom_petal_sdk::msg::calldata();
@@ -198,9 +220,25 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
                 sel.copy_from_slice(&calldata[..4]);
                 let args = &calldata[4..];
                 match sel {
-                    #(#dispatch_arms)*
-                    _ => ::bloom_petal_sdk::petal::revert("unknown selector"),
+                    #(#primary_arms)*
+                    _ => {}
                 }
+                // Interface fallthrough — a method declared on a listed
+                // interface routes to the local handler of the same name,
+                // letting the contract surface its own domain plus every
+                // ERC-20-style interface it implements without hand-rolled
+                // dispatch.
+                for __table in INTERFACE_METHODS {
+                    for __m in *__table {
+                        if __m.selector == sel {
+                            match __m.name {
+                                #(#name_arms)*
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                ::bloom_petal_sdk::petal::revert("unknown selector");
             }
         }
     };
@@ -215,15 +253,39 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     let init_export = format_ident!("__bloom_init_{}", module_ident);
     let call_export = format_ident!("__bloom_call_{}", module_ident);
 
+    // The wasm `init` / `call` exports are entry points for the chain's
+    // VM. On host targets they collide with each other when more than one
+    // `#[bloom::contract]` lives in the same binary (every contract would
+    // claim the same symbol). Gate them on `wasm32` so host-side tests can
+    // declare several contract modules side-by-side and the framework
+    // itself stays exercise-able without per-contract build scripts.
     let exports: TokenStream2 = quote! {
+        #[cfg(target_arch = "wasm32")]
         #[doc(hidden)]
         #[unsafe(export_name = "init")]
         pub extern "C" fn #init_export() {
             #module_ident::__bloom::__dispatch_init();
         }
 
+        #[cfg(target_arch = "wasm32")]
         #[doc(hidden)]
         #[unsafe(export_name = "call")]
+        pub extern "C" fn #call_export() {
+            #module_ident::__bloom::__dispatch_call();
+        }
+
+        // Off-wasm: keep a non-exported alias of each shim so host-side
+        // tests can take a function pointer (`__bloom_init_<mod>`) to verify
+        // the dispatcher generated correctly without instantiating a wasm
+        // engine.
+        #[cfg(not(target_arch = "wasm32"))]
+        #[doc(hidden)]
+        pub extern "C" fn #init_export() {
+            #module_ident::__bloom::__dispatch_init();
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        #[doc(hidden)]
         pub extern "C" fn #call_export() {
             #module_ident::__bloom::__dispatch_call();
         }
@@ -309,13 +371,25 @@ impl HandlerSpec {
         }
     }
 
-    fn dispatch_arm(&self) -> TokenStream2 {
-        let const_ident = format_ident!("SEL_{}", screaming_snake(&self.name));
+    fn const_ident(&self) -> Ident {
+        format_ident!("SEL_{}", screaming_snake(&self.name))
+    }
+
+    fn invoke_ident(&self) -> Ident {
+        format_ident!("__invoke_{}", self.name)
+    }
+
+    /// Build a free fn `fn __invoke_<name>(args: &[u8]) -> !` containing the
+    /// per-handler dispatch body (payability check, arg decode, optional
+    /// reentrancy guard, handler call, return/revert encoding). Both the
+    /// main selector match and the interface-fallthrough loop call into this
+    /// fn so the body lives in exactly one place.
+    fn invoke_fn(&self) -> TokenStream2 {
         let fn_ident = &self.fn_ident;
+        let invoke_ident = self.invoke_ident();
         let arg_idents = &self.arg_idents;
         let arg_types = &self.arg_types;
 
-        // Decode args one-by-one from the buf.
         let decode_args = arg_idents.iter().zip(arg_types.iter()).map(|(id, ty)| {
             quote! {
                 let #id: #ty = match <#ty as ::bloom_contract::abi::AbiDecode>::decode(&mut buf) {
@@ -333,7 +407,6 @@ impl HandlerSpec {
             quote! { &__ctx }
         };
 
-        // Non-payable methods revert on non-zero value.
         let payability_check = if self.payable {
             quote! {}
         } else {
@@ -357,13 +430,14 @@ impl HandlerSpec {
         };
 
         quote! {
-            #const_ident => {
+            #[doc(hidden)]
+            fn #invoke_ident(args: &[u8]) -> ! {
                 #payability_check
                 let mut buf = ::bloom_contract::abi::Buf::new(args);
                 #(#decode_args)*
                 let mut __ctx = ::bloom_contract::context::Context::new();
                 #acquire_guard
-                let __result = #fn_ident(#ctx_arg, #(#arg_idents),*);
+                let __result = super::#fn_ident(#ctx_arg, #(#arg_idents),*);
                 match __result {
                     ::core::result::Result::Ok(__v) => {
                         let mut __enc = ::bloom_contract::abi::Encoder::new();
@@ -375,10 +449,6 @@ impl HandlerSpec {
                         ::bloom_petal_sdk::petal::return_data(&__bytes);
                     }
                     ::core::result::Result::Err(__e) => {
-                        // Typed-error payload is `selector_4 || abi_payload`;
-                        // forward verbatim. On the revert path the chain rolls
-                        // back the reentrancy lock acquired above, so we don't
-                        // call release here.
                         let __bytes: __Vec<u8> =
                             ::bloom_contract::error::Error::encode_revert(&__e);
                         ::bloom_contract::dispatch::revert_with_bytes(&__bytes);
@@ -386,6 +456,18 @@ impl HandlerSpec {
                 }
             }
         }
+    }
+
+    fn primary_arm(&self) -> TokenStream2 {
+        let const_ident = self.const_ident();
+        let invoke_ident = self.invoke_ident();
+        quote! { #const_ident => #invoke_ident(args), }
+    }
+
+    fn name_match_arm(&self) -> TokenStream2 {
+        let name_lit = LitStr::new(&self.name, proc_macro2::Span::call_site());
+        let invoke_ident = self.invoke_ident();
+        quote! { #name_lit => #invoke_ident(args), }
     }
 
     fn descriptor(&self) -> TokenStream2 {

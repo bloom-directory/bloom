@@ -22,6 +22,7 @@
 //! integration crate once a contract example has been migrated.
 
 use bloom_contract::dispatch::{Mutability, SelectorEntry};
+use bloom_contract::interface::ContractInterface;
 use bloom_contract::prelude::*;
 
 #[error(domain = "demo")]
@@ -175,6 +176,68 @@ fn wasm_export_symbols_exist() {
     // imports that panic on non-wasm targets).
     let _init: extern "C" fn() = __bloom_init_demo;
     let _call: extern "C" fn() = __bloom_call_demo;
+}
+
+// ---------------------------------------------------------------------------
+// Interface integration — a contract that declares `interfaces(...)` folds
+// every listed interface's METHODS into a runtime fallthrough table so
+// callers can reach handlers through either the contract's own domain or
+// any declared interface domain. The dispatcher's runtime behaviour is
+// covered by the wasm integration suite — here we just verify the metadata
+// the macro emits is plumbed correctly.
+// ---------------------------------------------------------------------------
+
+#[interface(domain = "minttoken")]
+pub trait Mintable {
+    fn mint(to: Address, amount: U256) -> Result<bool>;
+    fn burn(amount: U256) -> Result<bool>;
+}
+
+#[contract(domain = "vault", interfaces(Mintable))]
+mod vault {
+    use super::{DemoError, Mintable};
+    use bloom_contract::prelude::*;
+
+    #[storage]
+    pub struct State {
+        pub _placeholder: StorageValue<U256>,
+    }
+
+    #[init]
+    pub fn init(_ctx: &mut Context) -> Result<(), DemoError> {
+        Ok(())
+    }
+
+    pub fn mint(_ctx: &mut Context, _to: Address, _amount: U256) -> Result<bool, DemoError> {
+        Ok(true)
+    }
+
+    pub fn burn(_ctx: &mut Context, _amount: U256) -> Result<bool, DemoError> {
+        Ok(true)
+    }
+}
+
+#[test]
+fn declared_interfaces_appear_in_metadata_table() {
+    assert_eq!(vault::__bloom::INTERFACES, &["Mintable"]);
+    assert_eq!(vault::__bloom::INTERFACE_METHODS.len(), 1);
+
+    let methods = vault::__bloom::INTERFACE_METHODS[0];
+    assert_eq!(methods.len(), 2);
+    assert_eq!(methods[0].name, "mint");
+    assert_eq!(methods[1].name, "burn");
+    assert_eq!(methods, <Mintable as ContractInterface>::METHODS);
+}
+
+#[test]
+fn vault_handlers_remain_addressable_under_native_selectors() {
+    // The contract's own selectors are derived from `vault.method(types)`,
+    // independent of any interface aliasing — verified here so a regression
+    // that folds the interface domain into the primary table would fail.
+    let mint = vault::__bloom::SELECTORS.iter().find(|e| e.name == "mint").unwrap();
+    assert_eq!(mint.signature, "vault.mint(address,u256)");
+    let h = blake3::hash(mint.signature.as_bytes());
+    assert_eq!(mint.selector, h.as_bytes()[..4]);
 }
 
 extern crate alloc;
