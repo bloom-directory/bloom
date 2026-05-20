@@ -33,6 +33,8 @@ use bloom_contract_metadata::{
 use thiserror::Error;
 use wasmparser::{ExternalKind, Parser, Payload, TypeRef, ValType};
 
+pub mod petals_lock;
+
 /// Output of a successful build.
 #[derive(Clone, Debug)]
 pub struct ArtifactSet {
