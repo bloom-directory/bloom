@@ -43,6 +43,18 @@ pub enum TrieKind {
     Storage,
     /// Code trie — keyed by petal hash, valued at raw wasm bytes.
     Code,
+    /// Per-account Object trie (spec §16.3, Phase 1).
+    ///
+    /// Keyed by 32-byte object id, valued at the canonical
+    /// `bloom_objects::store::object_leaf_value` encoding. Empty in
+    /// Phase 1 because no PTBs execute yet, but the variant exists so
+    /// the commitment scheme is stable.
+    Object,
+    /// Per-account OwnershipIndex trie (spec §16.3, Phase 1).
+    ///
+    /// Keyed by `blake3_tagged(OWNERSHIP_LEAF, owner || object_id)`,
+    /// valued at the SSZ-encoded ownership record. Empty in Phase 1.
+    OwnershipIndex,
 }
 
 impl TrieKind {
@@ -52,6 +64,8 @@ impl TrieKind {
             TrieKind::Accounts => tags::ACCOUNTS_ROOT,
             TrieKind::Storage => tags::STORAGE_KEY,
             TrieKind::Code => tags::CODE_ROOT,
+            TrieKind::Object => tags::OBJECT_ROOT,
+            TrieKind::OwnershipIndex => tags::OWNERSHIP_ROOT,
         }
     }
 
@@ -61,6 +75,8 @@ impl TrieKind {
             TrieKind::Accounts => tags::ACCOUNTS_ROOT,
             TrieKind::Storage => tags::STORAGE_VALUE,
             TrieKind::Code => tags::PETAL,
+            TrieKind::Object => tags::OBJECT_LEAF,
+            TrieKind::OwnershipIndex => tags::OWNERSHIP_LEAF,
         }
     }
 }
@@ -199,5 +215,55 @@ mod tests {
         s.insert(key(1), b"payload".to_vec());
 
         assert_ne!(a.root(), s.root());
+    }
+
+    #[test]
+    fn object_trie_empty_root_is_zero() {
+        let t = Trie::new(TrieKind::Object);
+        assert_eq!(t.root(), Hash32([0u8; 32]));
+    }
+
+    #[test]
+    fn ownership_index_empty_root_is_zero() {
+        let t = Trie::new(TrieKind::OwnershipIndex);
+        assert_eq!(t.root(), Hash32([0u8; 32]));
+    }
+
+    #[test]
+    fn object_and_ownership_have_distinct_roots() {
+        let mut o = Trie::new(TrieKind::Object);
+        o.insert(key(1), b"payload".to_vec());
+
+        let mut oi = Trie::new(TrieKind::OwnershipIndex);
+        oi.insert(key(1), b"payload".to_vec());
+
+        assert_ne!(o.root(), oi.root());
+    }
+
+    #[test]
+    fn object_and_accounts_have_distinct_roots() {
+        let mut o = Trie::new(TrieKind::Object);
+        o.insert(key(7), b"shared".to_vec());
+
+        let mut a = Trie::new(TrieKind::Accounts);
+        a.insert(key(7), b"shared".to_vec());
+
+        assert_ne!(o.root(), a.root());
+    }
+
+    #[test]
+    fn new_trie_kind_tags_match_canonical_strings() {
+        // Pin the wire-level strings so they cannot drift from
+        // bloom_objects::store::OBJECT_ROOT_TAG / OBJECT_LEAF_TAG etc.
+        assert_eq!(TrieKind::Object.root_tag(), "bloom-chain.v0.object_root:");
+        assert_eq!(TrieKind::Object.value_tag(), "bloom-chain.v0.object_leaf:");
+        assert_eq!(
+            TrieKind::OwnershipIndex.root_tag(),
+            "bloom-chain.v0.ownership_root:"
+        );
+        assert_eq!(
+            TrieKind::OwnershipIndex.value_tag(),
+            "bloom-chain.v0.ownership_leaf:"
+        );
     }
 }

@@ -1,10 +1,22 @@
 //! Top-level `State` struct and snapshot/commit semantics.
 //!
-//! # State root (spec §6.1)
+//! # State root (spec §6.1, widened by §16.3)
+//!
+//! Phase 1 widens the state_root payload to 128 bytes so that the
+//! commitment is forward-compatible with the Bloom-native contracts
+//! framework before any PTBs run:
 //!
 //! ```text
-//! state_root = blake3_tagged("state_root:", accounts_root || code_root)
+//! state_root = blake3_tagged(
+//!     "state_root:",
+//!     accounts_root || code_root || object_root || ownership_index_root
+//! )
 //! ```
+//!
+//! In Phase 1 the Object and OwnershipIndex tries are empty
+//! (`object_root == ownership_index_root == 0`), so the new commitment
+//! differs from the legacy 64-byte one for the same content. This is
+//! the one intentional break called out by spec §16.3.
 //!
 //! Receipts are NOT included in the state root — they are in the block header's
 //! separate `receipts_root` field (spec §6.1 note).
@@ -96,6 +108,17 @@ pub struct State {
     pub(crate) accounts: AccountsTrie,
     pub(crate) storage: BTreeMap<Address, StorageTrie>,
     pub(crate) code: CodeStore,
+    /// Object trie root (spec §16.3, Phase 1).
+    ///
+    /// Always `Hash32([0u8; 32])` in Phase 1 because no PTBs execute
+    /// yet. The field exists so the state-root commitment is stable
+    /// across the Phase 1 → Phase 2 cutover. Phase 2 will populate
+    /// this from a live `bloom_objects::store::ObjectTrie`.
+    pub(crate) object_root: Hash32,
+    /// OwnershipIndex trie root (spec §16.3, Phase 1).
+    ///
+    /// Always `Hash32([0u8; 32])` in Phase 1; see `object_root` above.
+    pub(crate) ownership_index_root: Hash32,
 }
 
 impl State {
@@ -106,6 +129,8 @@ impl State {
             accounts: AccountsTrie::new(),
             storage: BTreeMap::new(),
             code: CodeStore::new(),
+            object_root: Hash32([0u8; 32]),
+            ownership_index_root: Hash32([0u8; 32]),
         }
     }
 
@@ -196,12 +221,38 @@ impl State {
         self.code.root()
     }
 
-    /// Compute the `state_root` per spec §6.1:
-    /// `blake3_tagged("state_root:", accounts_root || code_root)`.
+    /// The Object trie root (spec §16.3).
+    ///
+    /// Always zero in Phase 1; populated by the executor in Phase 2.
+    pub fn object_root(&self) -> Hash32 {
+        self.object_root
+    }
+
+    /// The OwnershipIndex trie root (spec §16.3).
+    ///
+    /// Always zero in Phase 1; populated by the executor in Phase 2.
+    pub fn ownership_index_root(&self) -> Hash32 {
+        self.ownership_index_root
+    }
+
+    /// Compute the `state_root` per spec §6.1, widened by §16.3:
+    ///
+    /// ```text
+    /// state_root = blake3_tagged(
+    ///     "state_root:",
+    ///     accounts_root || code_root || object_root || ownership_index_root
+    /// )
+    /// ```
+    ///
+    /// In Phase 1 the last two roots are zero, but they are still
+    /// included in the preimage so the commitment is stable across
+    /// the Phase 1 → Phase 2 activation.
     pub fn state_root(&self) -> Hash32 {
-        let mut payload = [0u8; 64];
-        payload[..32].copy_from_slice(&self.accounts_root().0);
-        payload[32..].copy_from_slice(&self.code_root().0);
+        let mut payload = [0u8; 128];
+        payload[0..32].copy_from_slice(&self.accounts_root().0);
+        payload[32..64].copy_from_slice(&self.code_root().0);
+        payload[64..96].copy_from_slice(&self.object_root.0);
+        payload[96..128].copy_from_slice(&self.ownership_index_root.0);
         blake3_tagged(tags::STATE_ROOT, &payload)
     }
 
@@ -448,6 +499,45 @@ mod tests {
             state.apply(snap2.commit()),
             Err(StateError::StaleSnapshot)
         ));
+    }
+
+    #[test]
+    fn phase1_object_and_ownership_roots_are_zero() {
+        // Spec §16.3: Phase 1 keeps both new tries empty.
+        let s = State::new();
+        assert_eq!(s.object_root(), Hash32([0u8; 32]));
+        assert_eq!(s.ownership_index_root(), Hash32([0u8; 32]));
+    }
+
+    #[test]
+    fn state_root_payload_is_128_bytes() {
+        // Recompute the expected commitment over the canonical 128-byte
+        // payload and verify it matches `State::state_root` exactly.
+        let s = State::new();
+        let mut payload = [0u8; 128];
+        payload[0..32].copy_from_slice(&s.accounts_root().0);
+        payload[32..64].copy_from_slice(&s.code_root().0);
+        payload[64..96].copy_from_slice(&s.object_root().0);
+        payload[96..128].copy_from_slice(&s.ownership_index_root().0);
+        let expected = blake3_tagged(tags::STATE_ROOT, &payload);
+        assert_eq!(s.state_root(), expected);
+    }
+
+    #[test]
+    fn state_root_changes_when_new_roots_change() {
+        // Two states identical in accounts+code+storage but with
+        // different `object_root` values must produce different
+        // state_roots (the new roots are actually in the preimage).
+        let mut s = State::new();
+        s.set_account(addr(1), acct(100));
+        let baseline = s.state_root();
+
+        let mut s2 = State::new();
+        s2.set_account(addr(1), acct(100));
+        // Forcibly set a non-zero object_root via the crate-internal
+        // field. (Phase 1 never does this in real execution.)
+        s2.object_root = Hash32([0x11u8; 32]);
+        assert_ne!(baseline, s2.state_root());
     }
 
     #[test]
