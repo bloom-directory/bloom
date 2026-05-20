@@ -36,6 +36,11 @@
 //!   releases on every exit path (Ok and Err).
 //! - `#[internal]` — handler is omitted from the public dispatch table; it
 //!   can still be called from inside the contract module.
+//! - `#[fallback]` — at most one per contract. The dispatcher routes
+//!   calldata shorter than the 4-byte selector window (typically a bare-value
+//!   transfer) into this method instead of reverting. The method MUST take
+//!   no calldata args beyond the implicit `&mut Context` and is usually
+//!   `#[payable]` (a wETH-style `deposit`).
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -93,6 +98,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let mut init_idx: Option<usize> = None;
     let mut handlers: Vec<HandlerSpec> = Vec::new();
+    let mut fallback_name: Option<String> = None;
 
     for (idx, item) in content.iter_mut().enumerate() {
         if let Item::Fn(f) = item {
@@ -109,14 +115,35 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
                 init_idx = Some(idx);
                 continue;
             }
+            let is_fallback = has_marker(&f.attrs, "fallback");
             if matches!(f.vis, Visibility::Public(_)) && !has_marker(&f.attrs, "internal") {
                 if let Some(spec) = HandlerSpec::from_fn(f, &domain) {
+                    if is_fallback {
+                        if fallback_name.is_some() {
+                            return syn::Error::new_spanned(
+                                &f.sig.ident,
+                                "#[bloom::contract] only supports a single `#[fallback]` method",
+                            )
+                            .to_compile_error()
+                            .into();
+                        }
+                        if !spec.arg_idents.is_empty() {
+                            return syn::Error::new_spanned(
+                                &f.sig.ident,
+                                "#[fallback] method must take no calldata args \
+                                 (calldata is shorter than a selector when fallback fires)",
+                            )
+                            .to_compile_error()
+                            .into();
+                        }
+                        fallback_name = Some(spec.name.clone());
+                    }
                     handlers.push(spec);
                 }
             }
             // Strip method-level marker attributes regardless of branch so
             // the emitted module compiles.
-            for marker in ["view", "payable", "nonreentrant", "internal"] {
+            for marker in ["view", "payable", "nonreentrant", "internal", "fallback"] {
                 strip_marker(&mut f.attrs, marker);
             }
         }
@@ -152,6 +179,20 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
         .map(|i| LitStr::new(&i.to_string(), proc_macro2::Span::call_site()))
         .collect();
     let interface_idents = &interfaces;
+
+    // Calldata shorter than the 4-byte selector window either routes into the
+    // designated `#[fallback]` method (typically a wETH-style `deposit`) or
+    // reverts. Picking which is a contract-level choice, frozen at compile
+    // time.
+    let short_calldata_branch: TokenStream2 = match &fallback_name {
+        Some(name) => {
+            let invoke_ident = format_ident!("__invoke_{}", name);
+            quote! { #invoke_ident(&[]); }
+        }
+        None => quote! {
+            ::bloom_petal_sdk::petal::revert("calldata too short");
+        },
+    };
 
     // -- Generated runtime items appended to the module body ---------------
     let dispatcher_module: TokenStream2 = quote! {
@@ -217,7 +258,7 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
             pub fn __dispatch_call() {
                 let calldata = ::bloom_petal_sdk::msg::calldata();
                 if calldata.len() < 4 {
-                    ::bloom_petal_sdk::petal::revert("calldata too short");
+                    #short_calldata_branch
                 }
                 let mut sel = [0u8; 4];
                 sel.copy_from_slice(&calldata[..4]);

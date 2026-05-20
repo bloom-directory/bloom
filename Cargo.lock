@@ -2292,6 +2292,8 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "bloom-chain-abi",
+ "bloom-contract",
+ "bloom-dex-erc20",
  "bloom-petal-sdk",
 ]
 

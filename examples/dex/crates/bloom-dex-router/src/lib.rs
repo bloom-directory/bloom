@@ -56,7 +56,7 @@ use bloom_chain_abi::{DispatchError, U256, contract};
 use bloom_dex_erc20::calls as erc20_calls;
 use bloom_dex_factory::factory;
 use bloom_dex_pair::pair;
-use bloom_dex_wloom::wloom;
+use bloom_dex_wloom::calls as wloom_calls;
 use bloom_petal_sdk::{LoomValue, block, msg, petal};
 
 // ---------------------------------------------------------------------------
@@ -460,7 +460,7 @@ fn transfer_lp_to_pair(pair_addr: &[u8; 32], from: &[u8; 32], liquidity: U256) {
 
 /// Call `wloom.deposit()` with `value_loom`.
 fn wloom_deposit(wloom_addr: &[u8; 32], value_loom: LoomValue) {
-    let cd = wloom::abi::call::deposit();
+    let cd = wloom_calls::deposit();
     petal::call(wloom_addr, &cd, value_loom)
         .unwrap_or_else(|_| petal::revert("router: wloom.deposit failed"));
 }
@@ -480,7 +480,7 @@ fn loom_value_from_u256(amount: U256, ctx: &str) -> LoomValue {
 
 /// Call `wloom.withdraw(amount)`.
 fn wloom_withdraw(wloom_addr: &[u8; 32], amount: U256) {
-    let cd = wloom::abi::call::withdraw(amount);
+    let cd = wloom_calls::withdraw(amount);
     petal::call(wloom_addr, &cd, ZERO_VALUE)
         .unwrap_or_else(|_| petal::revert("router: wloom.withdraw failed"));
 }
