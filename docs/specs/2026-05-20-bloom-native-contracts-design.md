@@ -96,6 +96,7 @@ Three primitives:
 | Per-contract storage slots | Object store, typed records keyed by `ObjectId` |
 | Nested synchronous calls | PTB commands; outputs flow forward via use-references |
 | `msg.value` plumbing | LOOM is just another `Coin<T>` |
+| Wallet-side multi-hop routing | On-chain `/bloom/dex/router` petal with `quote_Nhop`/`swap_Nhop` |
 
 ### 3.2 What this preserves
 
@@ -156,36 +157,86 @@ defaults. Capabilities are typically `key + store + copy` if duplicable,
   Lets a `Pool<A,B>` "own" its reserve coins, an LP-position object,
   etc.
 
-### 4.4 Linearity
+### 4.4 Linearity bookkeeping
 
-The PTB executor tracks every object it creates, takes, or borrows.
-At tx-end:
-- Every object produced by some command and not consumed by another
-  command must be either transferred, deposited into another object,
-  destroyed via a `delete` call on its defining petal, or shared/frozen.
-- Borrows (`&Pool`, `&mut Pool`) end with the command that took them;
-  the underlying object remains in the store.
-- Coin merging is the canonical "consume two, produce one" example.
+The PTB executor maintains a per-tx **borrow table** with two object
+states:
 
-Linearity errors (orphan objects) are detected before commit; the PTB
-reverts with `LinearityViolation(object_id)`.
+- **Transient** — produced by a command, not yet consumed. Lives only
+  in executor memory; never touches the trie.
+- **Persistent** — currently stored in the object trie. Loaded into the
+  borrow table when borrowed.
+
+Each row carries: `ObjectId`, `TypeTag`, `Owner`, `version`,
+`payload_bytes`, `access_mode` (ReadOnly | Mutable | Consume),
+`origin_command_idx`, and a `dirty` flag.
+
+State transitions per command:
+
+| Action | Effect on borrow table |
+|---|---|
+| `object.create` | Insert new transient row (random ObjectId per §4.1). |
+| `object.borrow(id, mode)` | Load persistent row from trie (or transient row by id); set `access_mode`. Mutable/Consume require ownership check. |
+| `object.mutate` | Set `dirty = true` on the row; update `payload_bytes`. |
+| `object.transfer` | Set `Owner`; clear `dirty` flag relative to old owner; reassign owner-index entry on commit. |
+| `object.share` / `freeze` | Set `Owner = Shared/Immutable`. |
+| `object.delete` | Drop the row; mark trie slot for deletion on commit. |
+| Consume by passing to a function arg with `mode=Consume` | Drop the row at end-of-command. |
+
+At end-of-command, the executor runs the **diff-check**:
+
+1. Any row whose `dirty = true` while `access_mode = ReadOnly` →
+   `IllegalMutation` revert.
+2. Any row with `access_mode = Mutable` whose `version` did not
+   increment but whose `payload_bytes` changed → version-bump it (the
+   bloom-resource runtime is supposed to call `object.mutate`, which
+   sets `dirty`).
+3. Run attached invariants (§12.2).
+
+At tx-end, the executor runs the **linearity check**:
+
+1. Every transient row must have been consumed, transferred, shared,
+   frozen, or deleted by tx-end.
+2. Orphan = `LinearityViolation(object_id)` revert.
+3. Borrows of persistent objects with `mode=ReadOnly` or `mode=Mutable`
+   are not linearity-tracked (the underlying objects stay in the
+   store). `mode=Consume` requires the borrowed object to be consumed
+   or re-emitted.
+
+Coin merging is the canonical "consume two, produce one" example;
+`SplitCoins` / `MergeCoins` PTB commands are sugar over the same
+transient/persistent flow.
 
 ### 4.5 Object store
 
-The object store replaces the per-account sparse-Merkle-tree of 32-byte
-slots in chain spec §6.2 for any account that holds objects under the
-new model.
+The object store replaces the per-account 32-byte-slot storage tries
+for any account that holds objects under the new model.
 
-- Primary index: `ObjectId → Object`
-- Secondary index: `Owner → [ObjectId]` (for "what does Alice own?")
-- Type index: `TypeTag → [ObjectId]` (for "list all pools")
+**Two new `TrieKind` variants** in `bloom-chain-state` (mirroring the
+existing `Accounts` / `Storage` / `Code` shape):
 
-Indices are kept under their own Merkle commitments and folded into the
-chain state root.
+| Variant | Key | Value | Tags |
+|---|---|---|---|
+| `Object` | `ObjectId` (32B) | SSZ-encoded `Object` | root: `"bloom-chain.v0.object_root:"`, leaf: `"bloom-chain.v0.object_leaf:"` |
+| `OwnershipIndex` | `(owner_kind: u8, owner_id: 32B)` | SSZ list of owned `ObjectId`s (sorted) | root: `"bloom-chain.v0.ownership_root:"`, leaf: `"bloom-chain.v0.ownership_leaf:"` |
 
-Legacy accounts (those with `code_hash != None` deployed under the old
-`Deploy` tx kind) keep their existing storage trie. New deploys use the
-object store.
+Both use the existing **BLAKE3-tagged-sorted-leaf** commitment
+algorithm — a `BTreeMap` whose root is computed as
+`blake3_tagged(root_tag, len_u64_le || (key || blake3_tagged(leaf_tag,
+value))*)`. Empty tries commit to `Hash32([0; 32])`.
+
+This is a **placeholder** — chain spec §6.2 already documents the
+v1 SMT swap-in path; we inherit it. v0 has O(N) root-recomputation per
+block in the worst case, which is acknowledged and accepted for the
+foundation phase.
+
+**No type-index in the on-chain commitment.** "List all pools" is an
+off-chain query served by indexers from receipts; baking a third trie
+kind for explorer queries is not justified for v0.
+
+Legacy accounts (those deployed under the old `Deploy` tx kind) keep
+their existing `TrieKind::Storage` trie. New-framework petals do not
+allocate per-account storage tries — all their state lives as objects.
 
 ## 5. Capabilities
 
@@ -293,36 +344,46 @@ are not special tx kinds.
 ### 7.2 Validation pipeline (chain-side, in order)
 
 1. **Signature check.** One xDSA verify per distinct signer over
-   `blake3("bloom-ptb.v0:" || canonical_encoding(PtbTx without signatures))`.
+   `blake3_tagged("bloom-chain.v0.ptb_hash:", canonical_encoding(PtbTx
+   without signatures))`.
 2. **Expiry.** `current_block <= expiry_block`.
-3. **Petal resolution.** For each `PetalRef`: in v0 the `hash` field is
-   required; chain verifies the wasm at `path` resolves to that hash
-   (or fetches by hash if the path is unset). Future: consult resolution
-   policy.
+3. **Petal resolution.** For each `PetalRef`: in v0 the `hash` field
+   is required; chain verifies the wasm at `path` resolves to that
+   hash (or fetches by hash if the path is unset). Future: consult
+   resolution policy.
 4. **Function-signature typecheck.** Each command's `args` typecheck
-   against the petal's declared function signature, including generic
-   instantiation. No 4-byte selector dispatch — the function is looked
-   up by name, and the typed args must match exactly.
+   against the petal manifest's declared function signature, including
+   generic instantiation and `ArgKind` (Signer | Const | Object |
+   TypeArg). No 4-byte selector dispatch — function lookup is by name.
 5. **Object version + access check.** Each `Object(id, expected_version,
    mode)` arg: load the object, verify `version == expected_version`,
-   verify `mode` is permitted (Owned objects: only the owner can take
-   Mutable or Consume; Shared: any signer can take Mutable; Immutable:
-   ReadOnly only).
-6. **Gas reservation.** Reserve `gas_budget * gas_price` LOOM from the
-   first signer's `Coin<LOOM>` (canonical "gas-payer" object — see §9).
-7. **Execute commands in order.** Each command runs in the wasm VM with
-   typed args; outputs are linearly tracked.
-8. **Invariant check.** After every `MoveCmd`, run that function's
-   declared invariants over its `&mut` args. Violation = revert.
-9. **Linearity check.** At tx-end, every object produced by some command
-   must be consumed by another command or transferred / shared / frozen
-   / deleted.
-10. **Commit.** Apply object writes, version bumps, ownership changes;
-    emit receipt.
+   verify `mode` is permitted (Owned: only the owner can take Mutable
+   or Consume; Shared: any signer can take Mutable; Immutable:
+   ReadOnly only; Object-owned: borrow chain to a root accessible to
+   the signer must exist).
+6. **Gas-payer prep.** Lock the PTB's `gas_payer: ObjectId`, verify
+   `Owner::Address(first_signer)` and `T = LOOM`, split off
+   `gas_budget * gas_price` bloomweis into a runtime-held reservation
+   (§9.4).
+7. **Execute commands in order.** For each command:
+   - Load borrow-table rows for all `Object(...)` args; run command
+     in wasm VM; outputs become transient rows.
+   - **Diff-check.** Any `dirty` row with `access_mode = ReadOnly` →
+     revert.
+   - **Invariant check (§12.2).** Run each attached `__inv_<n>` export.
+8. **Linearity check (tx-end).** Every transient row must have been
+   consumed, transferred, shared, frozen, or deleted. Orphan →
+   `LinearityViolation(object_id)` revert.
+9. **`Account.loom` reconciliation.** For every address whose
+   `Coin<LOOM>` ownership changed, recompute the cache.
+10. **Commit.** Persist transient rows to the `Object` trie; update
+    `OwnershipIndex`; bump versions; emit receipt; refund unused gas
+    into a new `Coin<LOOM>` owned by first signer (merged into the
+    gas-payer if still owned).
 
 Any failure between (1) and (10) reverts the entire PTB. Gas-reservation
 failures forfeit the reserved amount to the proposer (anti-DoS); other
-failures refund unused gas.
+failures refund unused gas after deducting fuel actually burned.
 
 ### 7.3 Execution semantics
 
@@ -344,45 +405,235 @@ model use this to simulate before signing.
 
 ## 8. Petal manifest
 
-The wasm custom section format is extended (additively) over the current
-`bloom-contract-metadata` schema. New manifest items:
+### 8.1 Layout
 
-- `module_path: String` — the canonical `/bloom/...` install path
-- `parent_version: Option<ContentHash>` — for upgrade lineage
-- `object_types: Vec<ObjectTypeDecl>` — name, abilities, field schema
-- `functions: Vec<FunctionDecl>` — name, generics, arg types, return types,
-  required signer count, required capabilities, declared invariants
-- `capability_types: Vec<CapabilityDecl>`
-- `invariant_predicates: Vec<InvariantDecl>` — declared name, target
-  type/function, predicate AST, wasm export name for the runtime check
-- `required_host_imports: Vec<String>` — must be a subset of the
-  chain-allowed import list
+New-framework petals carry their manifest as a wasm **custom section**,
+not as a JSON sidecar. Section name: `bloom_petal_manifest_v0`.
+Payload: a `PetalManifestV0` struct encoded with `bloom-chain-abi`'s
+canonical codec (the same codec used for object payloads on the wire).
 
-The existing manifest items (`abi_methods`, `storage`, `events`,
-`errors`) are kept for legacy compatibility but become empty for petals
-that opt into the new model via `#[bloom::petal]` (see §11).
+A JSON sidecar `<petal>.petal.json` is still emitted by the build
+pipeline as a debugging / explorer convenience, but it is *derived*
+from the custom section and is not chain-authoritative. The chain
+verifies a petal by computing `blake3` of the custom section bytes and
+comparing against the path's `OwnerCap<Path>`-bound hash.
+
+### 8.2 Schema (canonical-codec)
+
+```rust
+struct PetalManifestV0 {
+    schema_version: u32,                  // = 1 for this layout
+    module_path: VfsPath,                 // "/bloom/dex/pool"
+    framework_version: SemVer,            // bloom-resource crate version
+    parent_version: Option<ContentHash>,  // upgrade lineage
+    object_types: Vec<ObjectTypeDecl>,
+    capability_types: Vec<CapabilityDecl>,
+    functions: Vec<FunctionDecl>,
+    invariants: Vec<InvariantDecl>,
+    required_host_imports: Vec<HostImportDecl>,
+    external_type_refs: Vec<ExternalTypeRef>,  // see §13 path resolution
+    fuel_hints: FuelHints,                     // declared upper bounds, opt-in
+}
+
+struct ObjectTypeDecl {
+    name: String,
+    abilities: AbilitySet,                // bitfield: key/store/copy/drop
+    type_params: Vec<TypeParamDecl>,      // phantom vs. resource
+    fields: Vec<FieldDecl>,
+}
+
+struct TypeParamDecl {
+    name: String,
+    kind: TypeParamKind,                  // Phantom | Resource
+    bounds: Vec<TypeTag>,                 // future use
+}
+
+struct FunctionDecl {
+    name: String,
+    type_params: Vec<TypeParamDecl>,
+    args: Vec<ArgDecl>,                   // see ArgKind below
+    returns: Vec<TypeTag>,
+    required_signers: u8,                 // count of distinct Signer args
+    required_capabilities: Vec<TypeTag>,  // capability args, by type
+    attached_invariants: Vec<InvariantIdx>,
+}
+
+enum ArgKind {
+    Signer,
+    Const(TypeTag),
+    Object { ty: TypeTag, mode: AccessMode },
+    TypeArg(TypeParamIdx),
+}
+
+struct InvariantDecl {
+    name: String,
+    target: InvariantTarget,              // ObjectType | FunctionExit
+    predicate: PredicateAst,              // machine-readable form
+    wasm_export: String,                  // "__inv_<idx>"
+}
+
+struct HostImportDecl {
+    module: String,                       // "object", "cap", "signer", "ptb"
+    name: String,                         // "borrow", "read", ...
+    signature: WasmFuncSig,               // arg types + return type
+}
+
+struct ExternalTypeRef {
+    placeholder: String,                  // "$external_0"
+    declared_petal_path: VfsPath,         // where the type lives
+    declared_type_name: String,
+    declared_content_hash: Option<ContentHash>,  // pinned at publish time
+}
+```
+
+`TypeTag` is recursive (`Concrete(...) | Generic(idx) | External(ref_idx)`)
+so generic instantiation flows through the manifest unambiguously.
+
+### 8.3 Build pipeline
+
+`bloom contract build` for a new-framework petal:
+
+1. Compile the crate to wasm.
+2. Walk the `#[bloom::petal]` AST (via the proc-macro) to collect the
+   manifest struct in memory.
+3. Resolve `external_type_refs` against the workspace `petals.lock`
+   (a Cargo-lock-shaped file pinning each external petal path to a
+   content hash).
+4. Canonical-encode the manifest; embed as `bloom_petal_manifest_v0`
+   custom section. Strip any leftover legacy `bloom_interfaces` section.
+5. Emit the derived `.petal.json` sidecar.
+6. Record `wasm_hash = blake3(final_wasm_bytes)` in the build report.
+
+### 8.4 Coexistence with legacy manifest
+
+Legacy `bloom-contract`-style petals continue to carry the JSON sidecar
+`Manifest` from `bloom-contract-metadata` (schema_version 2). The chain
+distinguishes by inspecting the wasm: if the
+`bloom_petal_manifest_v0` custom section exists, the petal is treated
+as new-framework and the legacy sidecar is ignored even if present.
 
 ## 9. Native LOOM unification
 
 LOOM becomes `Coin<LOOM>` — a regular `Coin<phantom T>` from the
-fungible petal at `/bloom/core/fungible`. Concrete impact:
+fungible petal at `/bloom/core/fungible`.
 
-- **Genesis** allocates a single `Coin<LOOM>` object to each initial
-  holder. The accounts trie's `loom: u128` field on `Account` becomes
-  derived (sum of LOOM coins owned by the address).
-- **Gas payment** uses a designated `Coin<LOOM>` referenced in the PTB
-  as the *gas-payer object*. The reserved amount is split off pre-execution;
-  the change object is created post-execution.
-- **`msg.value` semantics** no longer exist. To pay value, you pass a
-  `Coin<LOOM>` argument into the function.
-- **wLOOM goes away.** Any swap that wants to trade LOOM for USDC just
-  passes a `Coin<LOOM>` into `pool::swap`.
-- **The fungible petal at `/bloom/core/fungible` is the same one used
-  for every other token.** No special petal for native value.
+### 9.1 LOOM marker type
 
-Legacy accounts (those interacting via the old `Call` tx kind) continue
-to see the `loom: u128` view via a compatibility layer that re-aggregates
-their `Coin<LOOM>` objects on read.
+The `LOOM` witness type lives inside `bloom-petal-fungible` rather than
+in its own petal:
+
+```rust
+// crates/bloom-petal-fungible/src/lib.rs
+#[bloom::petal(path = "/bloom/core/fungible")]
+pub mod fungible {
+    /// Phantom-only marker; never instantiated. Has no abilities, so it
+    /// can only appear in `Coin<LOOM>` / `Balance<LOOM>` positions.
+    #[object(no_abilities)]
+    pub struct LOOM {}
+
+    /// Mint the initial LOOM supply. Gated by `EpochZero`, which only
+    /// the genesis pipeline ever holds; the cap is dropped after
+    /// genesis closes, making this entry point permanently unreachable.
+    pub fn mint_genesis(
+        _: &EpochZero,
+        amount: u128,
+        recipient: Address,
+    ) -> Coin<LOOM> { ... }
+}
+```
+
+### 9.2 `Account.loom` as denormalized cache
+
+The 122-byte `Account` SSZ layout (chain spec §5.1, including
+`loom: u128`) is preserved. After phase 2, `loom` is no longer the
+source of truth — it is a denormalized cache of:
+
+```
+sum(coin.value for coin in coins_owned_by(addr) where T = LOOM)
+```
+
+Every state-transition that creates, splits, merges, transfers, or
+destroys a `Coin<LOOM>` whose owner is `Owner::Address(addr)` updates
+`accounts[addr].loom` inside the same command's diff-check. A
+chain-level invariant `accounts[addr].loom == sum(...)` is enforced at
+end-of-block in v0 (full sweep in tests, sampled in steady state).
+
+Reasoning: keeps O(1) balance reads for RPC/explorers, preserves SSZ
+wire format, avoids an end-of-block O(N) scan.
+
+### 9.3 Genesis allocation
+
+Fresh genesis (no migration path — chain is unlaunched):
+
+1. Genesis config lists `(address, amount)` pairs.
+2. For each pair, the genesis pipeline mints a single `Coin<LOOM>`
+   object via `fungible::mint_genesis`, with
+   `owner = Owner::Address(address)`, and writes
+   `accounts[address].loom = amount`.
+3. The `EpochZero` capability is consumed (it is linear, no-drop) at
+   the end of the genesis flow, so no further `mint_genesis` calls
+   are possible without a governance petal that mints fresh
+   capabilities.
+
+Per-holder at genesis: one Coin<LOOM> object. Users split/merge
+afterward via fungible petal commands.
+
+### 9.4 Gas-payer model
+
+Every `PtbTx` carries a `gas_payer: ObjectId` referring to a
+`Coin<LOOM>` owned by the first signer. Pre-execution:
+
+1. Lock `gas_payer`; verify `Owner::Address(sender)` and `T = LOOM`.
+2. Reserve `gas_budget * gas_price` bloomweis by splitting that amount
+   into a runtime-held "gas reservation" coin (transient, never
+   persisted as an object).
+3. Execute the PTB.
+4. Refund unused gas into a new `Coin<LOOM>` owned by the sender; if
+   `gas_payer` is still owned by the sender at tx-end, the refund coin
+   is merged back into it for nicer UX.
+
+Insufficient `gas_payer.value`: hard fail pre-execution. v1 may add an
+optional sponsor field.
+
+### 9.5 Legacy `TxKind::Transfer` and `TxKind::Call` compat shim
+
+`TxKind::Transfer` and `TxKind::Call` stay on the wire through phase 3
+(per §17). They are translated by the chain into synthetic PTBs before
+dispatch:
+
+- `Transfer { to, amount_loom }` →
+  ```
+  let payer = select_coin(sender, LOOM, amount_loom + gas);
+  SplitCoins(payer, [Const(amount_loom)]) -> $pay;
+  fungible::transfer<LOOM>(Use(0,0), to);
+  ```
+- `Call { to, value, calldata, ... }` with `value > 0` →
+  prepend a `SplitCoins` from `select_coin(sender, LOOM, value)` and
+  thread the resulting `Coin<LOOM>` into the legacy `Call` dispatch
+  surface. The legacy callee sees the value as a `Coin<LOOM>` arg via
+  a compat trampoline; pre-migration petals that read `msg.value`
+  continue to do so against the runtime-aggregated owner balance.
+
+`select_coin(addr, T, min_amount)` is a chain-level helper, not a
+petal function — it has to be deterministic across validators and
+runs pre-wasm. Algorithm: take the largest matching coin owned by
+`addr`; tiebreak by ascending `ObjectId`. If no single coin covers
+`min_amount`, the chain synthesizes a `MergeCoins` of the largest few
+owned coins first.
+
+### 9.6 What goes away
+
+- `msg.value` plumbing in new petals — pass `Coin<LOOM>` arguments.
+- wLOOM — `Coin<LOOM>` is already an object.
+- Any per-account "native vs. token" branching.
+
+### 9.7 Removal timeline (cross-ref §17)
+
+| Phase | LOOM state |
+|---|---|
+| 2 | Genesis emits `Coin<LOOM>`; `Account.loom` becomes derived cache. |
+| 3 | New petals use `Coin<LOOM>` only. Legacy `Transfer`/`Call` shim runs unchanged. |
+| 4 | `TxKind::Transfer` and `TxKind::Call` removed; only `TxKind::SubmitPtb` remains. `Account.loom` retained as cache for SSZ stability. |
 
 ## 10. Petal publishing and upgrades
 
@@ -417,12 +668,13 @@ pub mod pool {
     use bloom_fungible::{Coin, MintCap};
 
     #[object(abilities = "key, store")]
-    pub struct Pool<phantom A, phantom B> {
+    pub struct Pool<phantom A, phantom B, phantom S: SwapStrategy> {
         id: UID,
         reserve_a: Coin<A>,
         reserve_b: Coin<B>,
         lp_supply: u128,
-        strategy: Strategy<A, B>,
+        params: S::Params,            // e.g. ConstantProduct::Params { fee_bps }
+        k_last: u128,
     }
 
     #[object(abilities = "key, store")]
@@ -432,50 +684,123 @@ pub mod pool {
         amount: u128,
     }
 
-    pub fn new<A, B>(
+    pub fn new<A, B, S: SwapStrategy>(
         coin_a: Coin<A>,
         coin_b: Coin<B>,
-        strategy: Strategy<A, B>,
-    ) -> (Pool<A, B>, LpPosition<A, B>) { ... }
+        params: S::Params,
+    ) -> (Pool<A, B, S>, LpPosition<A, B>) { ... }
 
     #[invariant("reserve_product_non_decreasing",
-                |p: &Pool<A, B>| p.reserve_a.amount() * p.reserve_b.amount() >= p.k_last())]
-    pub fn swap_a_for_b<A, B>(
-        pool: &mut Pool<A, B>,
+                |p: &Pool<A, B, S>| S::k(p) >= p.k_last)]
+    pub fn swap_a_for_b<A, B, S: SwapStrategy>(
+        pool: &mut Pool<A, B, S>,
         coin_in: Coin<A>,
         min_out: u128,
     ) -> Coin<B> { ... }
 
-    pub fn add_liquidity<A, B>(
-        pool: &mut Pool<A, B>,
+    pub fn add_liquidity<A, B, S: SwapStrategy>(
+        pool: &mut Pool<A, B, S>,
         coin_a: Coin<A>,
         coin_b: Coin<B>,
     ) -> LpPosition<A, B> { ... }
 
-    pub fn remove_liquidity<A, B>(
-        pool: &mut Pool<A, B>,
+    pub fn remove_liquidity<A, B, S: SwapStrategy>(
+        pool: &mut Pool<A, B, S>,
         position: LpPosition<A, B>,
     ) -> (Coin<A>, Coin<B>) { ... }
 }
 ```
 
+### 11.1 Macro emission
+
 The macro emits:
-- A wasm export per `pub fn` that the PTB executor can call by name
-- A manifest entry per `pub fn` and per `#[object]` / `#[capability]`
-- A wasm closure export per `#[invariant]` that the runtime calls at
-  function exit
+- One wasm export per `pub fn`, named `__petal_<fn_name>`. The export
+  signature is uniform: `(args_ptr: i32, args_len: i32, ret_ptr: i32,
+  ret_cap: i32) -> i32` — the body deserializes args via canonical-codec
+  from the runtime-provided buffer, dispatches to the Rust impl, and
+  serializes return values back. The return `i32` is `0` on success,
+  non-zero on petal-side abort (typed error code).
+- One wasm closure export per `#[invariant]`, named `__inv_<n>` with
+  signature `(scope_ptr: i32, scope_len: i32) -> i32`. Returns `1`
+  (ok) or `0` (violated). Scope buffer is canonical-encoded
+  `(invariant_args...)`.
+- One manifest entry per `pub fn`, `#[object]`, `#[capability]`,
+  `#[invariant]`, declared host import, and external type reference.
 - A `bloom-resource` runtime that handles object marshaling, linearity
-  bookkeeping, and capability checks
+  bookkeeping, capability checks, and the args/ret buffer codec.
 
-Generic functions are monomorphized at PTB execution time per
-`type_args` — the wasm is generic-aware via type-tag arguments,
-mirroring how Move handles type parameters.
+### 11.2 Generics (phantom + non-phantom)
 
-There is no `#[bloom::contract]` in the new framework. There is no
-`storage` block; state is the function arguments. There are no
-`#[event]` macros — events become object emissions or capability
-witnesses (TBD: thin event-object type for log-only emissions, kept
-minimal in v0).
+The macro accepts two kinds of type parameters, declared at the type
+parameter syntax level:
+
+```rust
+// Phantom: T appears only in TypeTags, never in field bytes / args.
+#[object(abilities = "key, store")]
+pub struct Coin<phantom T> {
+    id: UID,
+    value: u128,
+}
+
+// Non-phantom: T appears in payload bytes; uses the Resource<T> wrapper.
+#[object(abilities = "key, store")]
+pub struct Box<T> {
+    id: UID,
+    contents: Resource<T>,         // *not* plain T
+}
+
+pub fn unbox<T>(b: Box<T>) -> Resource<T> { b.contents }
+```
+
+`Resource<T>` is a runtime-typed wrapper over canonical-encoded bytes
++ a TypeTag. The macro **rejects plain `T` in field or arg position**;
+non-phantom generic state must go through `Resource<T>`. This keeps
+the type system honest while letting v0 ship without a full
+monomorphizing toolchain.
+
+`Resource<T>` is provided by `bloom-resource`:
+```rust
+pub struct Resource<T> {
+    type_tag: TypeTag,
+    bytes: Vec<u8>,
+    _marker: PhantomData<T>,
+}
+impl<T> Resource<T> {
+    pub fn into<U: BloomType>(self) -> Result<U, TypeMismatch>;
+    pub fn from<U: BloomType>(value: U) -> Self;
+}
+```
+
+Generic functions are monomorphized **at PTB execution time** per
+`type_args`: the chain sees one wasm export and passes type tags as
+prefix args. The macro generates argument-decode logic that branches
+on `TypeTag` only at boundary points (e.g. extracting a `u128` from a
+`Resource<U64>`). Per-instantiation wasm bloat is avoided; the price
+is a small dispatch overhead per call. Per-publish monomorphization is
+deferred to v1 if profiling demands it.
+
+### 11.3 Build pipeline (cross-ref §8.3)
+
+`#[bloom::petal]` is the entry point; the macro runs during the
+crate's normal `cargo build`. The `bloom contract build` command
+wraps the cargo invocation, then:
+
+1. Strips debug symbols and runs `wasm-opt -O3 --strip-debug`.
+2. Embeds the manifest custom section.
+3. Resolves `external_type_refs` against `petals.lock`.
+4. Computes `blake3(wasm_bytes)`; records in build report.
+5. Optionally publishes via the publishing PTB (§10).
+
+### 11.4 What's absent
+
+- No `#[bloom::contract]` macro in the new framework.
+- No `storage` block — state is function arguments and object fields.
+- No `#[event]` macros in v0. **Events resolved (§18):** for v0 we
+  emit logs via a thin `log.emit` host import (legacy semantics, kept
+  as a parallel surface) plus a typed `Event<T>` object-as-immutable
+  wrapper for petals that want structured indexable emissions. The
+  choice is per-petal; mixed petals are fine. v1 collapses to one
+  surface after profiling.
 
 ## 12. Invariants
 
@@ -484,10 +809,10 @@ minimal in v0).
 ```rust
 #[invariant(
     name = "reserve_product_non_decreasing",
-    target = "Pool<A, B>",
-    pred = |p: &Pool<A, B>| p.reserve_a.amount() * p.reserve_b.amount() >= p.k_last()
+    target = "Pool<A, B, S>",
+    pred = |p: &Pool<A, B, S>| S::k(p) >= p.k_last
 )]
-pub fn swap_a_for_b<A, B>(...) -> Coin<B> { ... }
+pub fn swap_a_for_b<A, B, S: SwapStrategy>(...) -> Coin<B> { ... }
 ```
 
 The macro emits:
@@ -497,15 +822,33 @@ The macro emits:
 
 ### 12.2 Runtime checking
 
-After each `MoveCmd`, the PTB executor:
-- For every `&mut` arg whose type has invariants declared in any of the
-  current command's function-attached invariants: call the corresponding
-  `__inv_<idx>` wasm export with the arg
-- If the closure returns 0 (false): revert with
-  `InvariantViolation { petal, function, invariant_name }`
+After each `MoveCmd` returns successfully, the PTB executor walks the
+function's `attached_invariants` from the manifest, in declaration
+order:
 
-This is *runtime* invariant enforcement, not the paper's social arbitration.
-The manifest AST is what the social system reads.
+```
+for inv in fn_decl.attached_invariants:
+    scope = canonical_encode(collect_invariant_args(inv, cmd_args, cmd_returns))
+    rc = wasm_call(petal_instance, inv.wasm_export, scope)
+    if rc == 0:
+        revert(InvariantViolation { petal, function, invariant_name: inv.name })
+```
+
+`collect_invariant_args` picks out the `&mut`, `&`, and return slots
+that the invariant's `PredicateAst` references. The wasm export
+signature is fixed (§11.1) so the runtime never needs per-invariant
+glue.
+
+Invariants execute inside the same wasm instance as the function
+they're attached to. They consume fuel (declared as 500 + 4*scope_len
+per check). They cannot mutate state — the bloom-resource runtime
+gives the closure a `&` view of the scope and rejects any
+`object.mutate` / `object.create` / `object.transfer` calls during
+invariant execution (host-side flag).
+
+This is *runtime* invariant enforcement, not the paper's social
+arbitration. The manifest's `PredicateAst` is what the social system
+reads.
 
 ### 12.3 Social layer
 
@@ -522,21 +865,58 @@ has something to read.
 
 ## 13. Path resolution and pinning
 
+### 13.1 PTB-side: pinned content hashes
+
 In v0, every `PetalRef` in a PTB MUST set the `hash` field. The chain
 resolves:
 
 1. Look up wasm by `hash` in the code root.
-2. If `path` is set: verify the path-binding in the VFS commits to that
-   hash. Else: any path is acceptable.
+2. If `path` is set: verify the path-binding in the VFS commits to
+   that hash. Else: any path is acceptable.
 3. If neither path nor hash resolves: revert `PetalNotFound`.
 
-The PTB encoding reserves space for a `resolution_policy: Option<PolicyRef>`
-field that v0 ignores. v1+ enables unpinned references by consulting the
-policy. The policy itself is just an object (e.g. `Policy { min_stake: u128,
+The PTB encoding reserves space for a
+`resolution_policy: Option<PolicyRef>` field that v0 ignores. v1+
+enables unpinned references by consulting the policy. The policy
+itself is just an object (e.g. `Policy { min_stake: u128,
 min_trust_score: u16 }`) signed by the user.
 
-This means: **agents and wallets ship pinning by default in v0.** Path
-lookup is informational. The staking-policy story lands in v1.
+**Agents and wallets ship pinning by default in v0.** Path lookup is
+informational. The staking-policy story lands in v1.
+
+### 13.2 Build-side: `petals.lock`
+
+Cross-petal type references (e.g. `bloom-petal-dex-pool` referencing
+`Coin<T>` defined in `bloom-petal-fungible`) are resolved at build
+time, not at PTB validation time. The workspace root carries a
+`petals.lock` file shaped like `Cargo.lock`:
+
+```toml
+[[petal]]
+path = "/bloom/core/fungible"
+content_hash = "blake3:abcd...1234"
+manifest_blake3 = "blake3:ef01...beef"
+emitted_by = "bloom-petal-fungible 0.1.0"
+
+[[petal]]
+path = "/bloom/dex/pool"
+content_hash = "..."
+depends_on = ["/bloom/core/fungible", "/bloom/core/cap"]
+```
+
+`bloom contract build` for a petal:
+
+1. Loads `petals.lock` from the workspace root.
+2. For each `external_type_refs` entry the macro emitted, resolves the
+   placeholder against the lock entry for the referenced petal.
+3. Substitutes the placeholder with the resolved `content_hash` in the
+   final manifest custom section.
+4. Errors if a referenced petal is missing from the lock.
+
+`petals.lock` is committed to the repo. Updates happen via `bloom
+contract update` (analogous to `cargo update`). The chain does not
+read `petals.lock`; it only sees the resolved hashes that ended up in
+each petal's manifest.
 
 ## 14. The DEX, redesigned
 
@@ -545,8 +925,9 @@ lookup is informational. The staking-policy story lands in v1.
 ```
 /bloom/core/fungible        Coin<T>, supply caps, mint/burn ops
 /bloom/core/cap             Capability primitives
-/bloom/dex/pool             Pool<A,B>, LpPosition<A,B>, swap_*, add/remove_liquidity
-/bloom/dex/strategy/cpmm    Strategy::ConstantProduct (default)
+/bloom/dex/pool             Pool<A,B,S>, LpPosition<A,B>, swap, add/remove_liquidity
+/bloom/dex/strategy/cpmm    Strategy = ConstantProduct
+/bloom/dex/router           Multi-hop helpers (quote_Nhop, swap_Nhop) for N = 1..3
 ```
 
 v1+ adds:
@@ -554,24 +935,86 @@ v1+ adds:
 /bloom/dex/strategy/stable    Stableswap
 /bloom/dex/strategy/weighted  Balancer-style
 /bloom/dex/strategy/clmm      Concentrated liquidity
+/bloom/dex/router-N           Higher-arity routers if profiling demands them
 ```
 
-### 14.2 What's gone
+Shared math lives in a workspace crate `bloom-dex-math` (not a petal).
+Both `bloom-petal-dex-cpmm` and `bloom-petal-dex-router` link it at
+compile time. No `petal.call` host import in v0 — keeping multi-hop
+math inlined avoids cross-petal call overhead and keeps the router
+self-contained.
+
+### 14.2 Pool / Strategy separation
+
+`Pool<A, B, S>` is parameterized by a `Strategy` *type*, not a runtime
+object:
+
+```rust
+#[object(abilities = "key, store")]
+pub struct Pool<phantom A, phantom B, phantom S: SwapStrategy> {
+    id: UID,
+    reserve_a: Coin<A>,
+    reserve_b: Coin<B>,
+    lp_supply: u128,
+    params: S::Params,                   // strategy-specific (fee bps, etc.)
+    k_last: u128,                        // for invariant checking
+}
+```
+
+The strategy is picked at pool-creation time and frozen in the type
+tag, so `Pool<USDC, LOOM, ConstantProduct>` and
+`Pool<USDC, LOOM, Stableswap>` are *distinct types* — the router and
+indexers can tell them apart without inspecting payload bytes.
+
+`SwapStrategy` is a trait in `bloom-dex-math` exposing pure functions
+(`quote`, `apply_swap`, `add_liquidity`, etc.). The pool petal calls
+into the trait directly; no host import.
+
+### 14.3 Router petal
+
+`/bloom/dex/router` exposes `quote_Nhop` and `swap_Nhop` for arity N ∈
+{1, 2, 3} (covers >99% of real DEX volume). Each operates on a
+fixed-arity tuple of `&mut Pool<...>` references and threads coins
+through them with linear types:
+
+```rust
+pub fn swap_2hop<A, B, C, S1, S2>(
+    pool_ab: &mut Pool<A, B, S1>,
+    pool_bc: &mut Pool<B, C, S2>,
+    coin_in: Coin<A>,
+    min_out: u128,
+) -> Coin<C> {
+    let mid = pool::swap_a_for_b(pool_ab, coin_in, 0);
+    pool::swap_a_for_b(pool_bc, mid, min_out)
+}
+```
+
+The `0` intermediate min-out is safe because the outer `min_out` is
+the actual user-facing slippage bound. The router carries a function
+attached invariant `all_pools_k_non_decreasing` that re-validates each
+touched pool's CPMM invariant after the chain of swaps.
+
+Mixed-strategy paths (e.g. CPMM → Stableswap) are expressible because
+each pool's strategy is a separate type parameter. The router does
+*not* attempt arbitrary-N composition in v0 — paths longer than 3
+hops compose at the PTB level by chaining `swap_3hop` outputs.
+
+### 14.4 What's gone
 
 - `bloom-dex-erc20` — replaced by `Coin<phantom T>` from
   `/bloom/core/fungible`. Token "deploys" become "create a `(MintCap<T>,
   BurnCap<T>, Supply<T>)` triple via `fungible::create_currency<T>`."
-  No allowances. No transfers via approval. No `transfer_from` dance.
-- `bloom-dex-factory` — replaced by `pool::new<A, B>`. No factory
-  contract. The pool is a *shared object* the user passes around. Many
-  pools can exist for the same `(A,B)` pair; clients prefer the one
+  No allowances. No `transfer_from` dance.
+- `bloom-dex-factory` — replaced by `pool::new<A, B, S>`. No factory
+  contract. The pool is a *shared object* the user passes around.
+  Many pools can exist for the same `(A,B,S)`; clients prefer the one
   with the highest staked LP / trust score (v1 staking).
-- `bloom-dex-router` — replaced by users assembling PTBs directly.
-  Multi-hop = more commands. Helpers for common patterns live in the
-  CLI / SDK, not as an onchain petal.
+- `bloom-dex-router` (the legacy chain VM one) — replaced by the
+  petal at `/bloom/dex/router`. Multi-hop math is on-chain, not in
+  wallets or CLIs (no wallet-enshrinement). Wallets just submit PTBs.
 - `examples/wloom` — gone. LOOM is `Coin<LOOM>`.
 
-### 14.3 A user swap
+### 14.5 A user swap
 
 ```
 PTB {
@@ -581,7 +1024,8 @@ PTB {
     Move(
       petal: PetalRef { path: "/bloom/dex/pool", hash: Some(0xabc...) },
       function: "swap_a_for_b",
-      type_args: [TypeTag::Coin(USDC), TypeTag::Coin(LOOM)],
+      type_args: [TypeTag::Coin(USDC), TypeTag::Coin(LOOM),
+                  TypeTag::ConstantProduct],
       args: [
         Object(pool_usdc_loom_id, version=42, Mutable),
         Use(0, 0),                       // $coin_in
@@ -605,7 +1049,7 @@ Compared to the current `swap_exact_tokens_for_tokens`:
 - Wallet can show "you will spend ≤1 USDC, receive ≥0.95 LOOM"
   *from the bundle alone*, no contract simulation needed for the bound
 
-### 14.4 Adding liquidity
+### 14.6 Adding liquidity
 
 ```
 PTB {
@@ -616,7 +1060,7 @@ PTB {
     Move(
       petal: PetalRef { path: "/bloom/dex/pool", hash: Some(0xabc...) },
       function: "add_liquidity",
-      type_args: [USDC, LOOM],
+      type_args: [USDC, LOOM, ConstantProduct],
       args: [
         Object(pool_id, v=42, Mutable),
         Use(0, 0),
@@ -633,12 +1077,15 @@ PTB {
 `remove_liquidity`. No "LP tokens are ERC-20" anymore — LP positions
 are just objects.
 
-### 14.5 Pool creation
+### 14.7 Pool creation
 
 Pool creation is a normal PTB. Any signer can create a pool for any
 pair; the chain does not dedupe. Clients (the DEX UI, agents) prefer
 pools by staking / trust score (v1 staking). This avoids enshrining
 "the canonical pool per pair" at the protocol level.
+
+Strategy is a *type parameter*, not a runtime object, so pool creation
+takes the seeds + the strategy's `Params` (a `Const`):
 
 ```
 PTB {
@@ -647,19 +1094,19 @@ PTB {
     SplitCoins(bob_usdc, [Const(1_000_000)]) -> $usdc_seed,
     SplitCoins(bob_loom, [Const(500_000)])   -> $loom_seed,
     Move(
-      petal: PetalRef { path: "/bloom/dex/strategy/cpmm", hash: ... },
-      function: "new",
-      type_args: [USDC, LOOM],
-      args: [Const(30 /* fee bps */)],
-    ) -> $strategy,
-    Move(
       petal: PetalRef { path: "/bloom/dex/pool", hash: ... },
       function: "new",
-      type_args: [USDC, LOOM],
-      args: [Use(0, 0), Use(1, 0), Use(2, 0)],
+      type_args: [USDC, LOOM, ConstantProduct],
+      args: [
+        Use(0, 0),                            // $usdc_seed
+        Use(1, 0),                            // $loom_seed
+        Const(ConstantProduct::Params {       // canonical-codec encoded
+          fee_bps: 30,
+        }),
+      ],
     ) -> ($pool, $lp_position),
-    TransferObjects([Use(3, 0)], Owner::Shared),
-    TransferObjects([Use(3, 1)], Owner::Address(bob)),
+    TransferObjects([Use(2, 0)], Owner::Shared),
+    TransferObjects([Use(2, 1)], Owner::Address(bob)),
   ],
   ...
 }
@@ -670,15 +1117,21 @@ PTB {
 ```
 crates/
   bloom-objects/               object store types, host imports, codec extensions
-  bloom-resource/              runtime: linearity, capabilities, object marshaling
+  bloom-resource/              runtime: linearity, capabilities, marshaling, Resource<T>
   bloom-resource-macros/       #[bloom::petal], #[object], #[capability], #[invariant]
   bloom-script/                PTB types, encoding/decoding, dispatcher, validator
-  bloom-petal-fungible/        /bloom/core/fungible (Coin<T>, MintCap, BurnCap)
+  bloom-dex-math/              SwapStrategy trait + pure math (CPMM today; stable/etc. later)
+  bloom-petal-fungible/        /bloom/core/fungible (Coin<T>, MintCap, BurnCap, LOOM)
   bloom-petal-cap/             /bloom/core/cap (capability primitives)
-  bloom-petal-dex-pool/        /bloom/dex/pool
+  bloom-petal-dex-pool/        /bloom/dex/pool (Pool<A, B, S>, LpPosition<A, B>)
   bloom-petal-dex-cpmm/        /bloom/dex/strategy/cpmm
+  bloom-petal-dex-router/      /bloom/dex/router (quote_Nhop, swap_Nhop, N = 1..3)
   bloom-petal-dex-it/          new integration tests (parallel to current ones)
 ```
+
+`bloom-dex-math` is a normal workspace crate (not a petal); both
+`bloom-petal-dex-cpmm` and `bloom-petal-dex-router` link it at compile
+time so multi-hop math stays self-contained without cross-petal calls.
 
 Workspace `Cargo.toml` adds these as members. Existing crates stay.
 
@@ -692,49 +1145,95 @@ Workspace `Cargo.toml` adds these as members. Existing crates stay.
 
 ### 16.2 New host imports
 
-Added to the chain-mode import allowlist:
+All new host imports live under the `object`, `cap`, `signer`, and
+`ptb` modules and are added to the chain-mode import allowlist.
+Signatures are wasm value-type tuples; "handle" is `i32` (an opaque
+runtime-local index into the executor's borrow table, never the raw
+ObjectId).
 
-- `object.borrow(id_ptr, mode) -> handle`
-- `object.read(handle, dst_ptr) -> u32`
-- `object.mutate(handle, src_ptr, src_len)`
-- `object.transfer(handle, owner_kind, owner_ptr)`
-- `object.share(handle)`
-- `object.freeze(handle)`
-- `object.delete(handle)`
-- `object.create(type_tag_ptr, type_tag_len, payload_ptr, payload_len) -> handle`
-- `cap.check(cap_id_ptr, type_tag_ptr) -> i32`
-- `signer.index() -> u16`
-- `signer.address(idx, out_ptr)`
-- `ptb.command_output(cmd_idx, ret_idx, out_ptr, out_len)`
+| Import | Signature | Notes |
+|---|---|---|
+| `object.borrow` | `(id_ptr i32, mode i32) -> handle i32` | `mode`: 0=ReadOnly, 1=Mutable, 2=Consume. Pre-resolved against the PTB's `Object(...)` arg slots; mismatched mode aborts. |
+| `object.read` | `(handle i32, dst_ptr i32, dst_cap i32) -> len i32` | Negative return = buffer too small (caller resizes and retries). |
+| `object.mutate` | `(handle i32, src_ptr i32, src_len i32) -> i32` | Requires `Mutable` borrow. Updates the executor's transient state; not persisted until tx-end commit. |
+| `object.create` | `(type_tag_ptr i32, type_tag_len i32, payload_ptr i32, payload_len i32) -> handle i32` | Creator petal must be the type-defining petal; runtime checks. |
+| `object.transfer` | `(handle i32, owner_kind i32, owner_payload_ptr i32, owner_payload_len i32) -> i32` | `owner_kind`: 0=Address, 1=Object, 2=Shared, 3=Immutable. Drops `Shared`/`Immutable`-incoming handles. |
+| `object.share` | `(handle i32) -> i32` | Shorthand for `transfer(_, Shared, _)`. |
+| `object.freeze` | `(handle i32) -> i32` | Shorthand for `transfer(_, Immutable, _)`. |
+| `object.delete` | `(handle i32) -> i32` | Permanently removes; only the type-defining petal can call. |
+| `cap.check` | `(cap_handle i32, type_tag_ptr i32, type_tag_len i32) -> i32` | Returns 1 if the borrowed object's type tag matches and abilities include the cap marker; 0 otherwise. |
+| `signer.index` | `() -> i32` | Returns the current command's "primary signer" index, or -1 if none. |
+| `signer.address` | `(idx i32, out_ptr i32) -> i32` | Writes 32-byte PQ address. Returns 0/-1. |
+| `ptb.command_output` | `(cmd_idx i32, ret_idx i32, out_ptr i32, out_cap i32) -> len i32` | Read a typed return from an earlier command; used by the runtime to thread `Use(...)` references, rarely called from user code. |
+| `log.emit` | `(topic_ptr i32, topic_len i32, data_ptr i32, data_len i32) -> i32` | Legacy-style log emission. Optional per-petal surface (§11.4). |
+
+Encoding for `id_ptr` / `type_tag_ptr` / `payload_ptr`: canonical-codec
+bytes as produced by `bloom-chain-abi`. The runtime never asks the
+guest to allocate — guest passes pre-allocated buffers and lengths.
 
 Existing legacy imports (`state.read`, `state.write`, `petal.call`,
 etc.) keep working for legacy petals. New-framework petals are linked
-only against the new imports.
+only against the new imports — the build pipeline rejects new-framework
+wasm that imports legacy symbols.
 
 ### 16.3 State root composition
 
-The chain state root becomes:
+The chain state root grows from a 64-byte payload (accounts + code) to
+a 128-byte payload (accounts + code + objects + ownership):
+
 ```
-root = blake3(
-  "bloom-chain.v0.state:" ||
-  accounts_root || code_root || object_root || ownership_index_root
+root = blake3_tagged(
+  "bloom-chain.v0.state_root:",
+  accounts_root              // unchanged
+  || code_root               // unchanged
+  || object_root             // new
+  || ownership_index_root    // new
 )
 ```
 
-`object_root` and `ownership_index_root` are new. `accounts_root` and
-`code_root` are unchanged. Legacy account storage tries remain reachable
-under the existing path.
+`object_root` and `ownership_index_root` are two new `TrieKind`
+variants in `bloom-chain-state`:
+
+- `TrieKind::Object` — primary index `ObjectId -> Object` (SSZ-encoded).
+  Tag: `"bloom-chain.v0.object_root:"` / leaves
+  `"bloom-chain.v0.object_leaf:"`.
+- `TrieKind::OwnershipIndex` — secondary index
+  `(owner_kind, owner_id) -> sorted_list<ObjectId>`. Tag:
+  `"bloom-chain.v0.ownership_root:"` / leaves
+  `"bloom-chain.v0.ownership_leaf:"`.
+
+Both reuse the existing **BLAKE3-tagged-sorted-leaf placeholder**
+commitment (a `BTreeMap<key, value>` whose root is
+`blake3_tagged(root_tag, len_u64_le || (key || blake3_tagged(value_tag,
+value))*)`). This matches the existing `Accounts` / `Storage` / `Code`
+trie kinds and means there is no new commitment primitive in v0; the
+v1 SMT swap-in path documented in `bloom-chain-state/src/trie.rs`
+applies uniformly.
+
+Type-index queries ("list all pools of shape X") are served by an
+**off-chain** index built from receipts; the chain does not commit to
+them. This avoids a third new trie kind for a query that explorers and
+wallets, not consensus, need.
+
+Legacy account storage tries remain reachable under the existing path
+(`TrieKind::Storage`); new-framework petals do not allocate storage
+tries.
 
 ### 16.4 Fuel accounting
 
 - `object.borrow`: 200 fuel
 - `object.read`: 100 + 4 * len
-- `object.mutate`: 1500 + 4 * len (new), 1000 (existing)
+- `object.mutate`: 1500 + 4 * len
 - `object.create`: 5000 + 4 * len
 - `object.transfer`: 500
 - `object.share` / `freeze` / `delete`: 500
+- `object.delete`: 500
 - `cap.check`: 100
+- `signer.index` / `signer.address`: 50
 - `ptb.command_output`: 100 + 4 * len
+- `log.emit`: 200 + 4 * (topic_len + data_len)
+- Invariant check: 500 + 4 * scope_len per declared invariant
+- Linearity diff-check at command end: 100 per touched object
 
 PTB-level overhead: 200 fuel per command + 100 per arg + 50 per signer
 verification (amortized).
@@ -743,33 +1242,46 @@ Block-level fuel limit remains 30M.
 
 ## 17. Migration plan
 
-### Phase 1 — Foundation (current PR cycle)
-- `bloom-objects`, `bloom-resource`, `bloom-resource-macros`, `bloom-script`
-- `TxKind::SubmitPtb` wired into the chain (rejected for now, no-op)
-- New host imports defined, wired into VM linker but unused
+### Phase 1 — Foundation
+- `bloom-objects`, `bloom-resource`, `bloom-resource-macros`,
+  `bloom-script`, `bloom-dex-math` (CPMM only).
+- Two new `TrieKind` variants (`Object`, `OwnershipIndex`) wired into
+  `bloom-chain-state`; state-root payload grows to 128 bytes.
+- `TxKind::SubmitPtb(PtbTx)` defined and wired through the chain;
+  initially rejected (returns `NotYetActivated` receipt).
+- New host imports defined and wired into the VM linker, gated off by
+  a feature flag so they're unreachable until phase 2.
+- `petals.lock` plumbing in `bloom contract build`; manifest custom
+  section emitted by the macro.
 
 ### Phase 2 — Fungible petal + first PTBs
-- `bloom-petal-fungible`
-- `bloom-petal-cap`
-- Activate `TxKind::SubmitPtb` execution
-- Genesis LOOM migration: at chain bootstrap, convert per-account
-  `loom: u128` into `Coin<LOOM>` objects
-- Compatibility shim: legacy reads of `account.loom` aggregate the
-  owner's `Coin<LOOM>` objects
+- `bloom-petal-fungible` (including `LOOM` marker) and
+  `bloom-petal-cap`.
+- Activate `TxKind::SubmitPtb` execution.
+- Genesis: emit one `Coin<LOOM>` per allocated address; consume the
+  `EpochZero` capability at end of genesis flow.
+- `Account.loom` becomes a denormalized cache maintained by the
+  runtime; end-of-block reconciliation invariant active.
 
 ### Phase 3 — DEX rewrite
-- `bloom-petal-dex-pool`, `bloom-petal-dex-cpmm`
-- New integration tests in `bloom-petal-dex-it`
+- `bloom-petal-dex-pool` (parameterized `Pool<A, B, S>`),
+  `bloom-petal-dex-cpmm`, `bloom-petal-dex-router` (with
+  `quote_Nhop`/`swap_Nhop` for N ∈ {1, 2, 3}).
+- New integration tests in `bloom-petal-dex-it`.
 - Multi-validator docker e2e test mirroring the current
-  `docker_dex_multi_user.rs`
+  `docker_dex_multi_user.rs`, exercising the router on a 2-hop path.
 
 ### Phase 4 — Parity + deprecation flag
 - All current docker DEX e2e scenarios pass under the new framework
+  (parallel suite, both green).
+- `TxKind::Transfer` and `TxKind::Call` compat shims continue to run;
+  scheduled for removal in phase 5.
 - Old `bloom-contract*` and `examples/dex/*` and `examples/wloom`
-  marked `#[deprecated(since = "...", note = "...")]`
-- Documentation updated to point new contracts at the new framework
+  marked `#[deprecated(since = "...", note = "...")]`.
+- Documentation updated to point new contracts at the new framework.
 
 ### Phase 5 (v1+) — Old framework removal
+- Drop `TxKind::Transfer` and `TxKind::Call` from the wire format.
 - Separate decision after a soak period; not part of this spec.
 
 ### Throughout
@@ -777,27 +1289,44 @@ Block-level fuel limit remains 30M.
   stays green at every commit.
 - Existing docker DEX multi-user test stays green at every commit.
 
-## 18. Open questions / TBD (to resolve during implementation)
+## 18. Open questions resolved in this revision
 
-- **Event objects vs. log emissions.** The new framework has no
-  `#[event]` macro. Approach A: every "log" is an immutable object
-  created and frozen in one command. Approach B: keep the legacy
-  `log.emit` host import as a parallel surface for cheap append-only
-  emissions. Resolve in Phase 2 PR.
-- **Generic monomorphization granularity.** Move runs generic functions
-  at one-bytecode-per-monomorphization at call time. We can either
-  match (more fuel per call) or bake instantiation at publish time
-  (larger code root). Resolve in Phase 1 PR after prototype.
-- **Object ownership transitions across object owners.** When `Pool<A,B>`
-  contains `Coin<A>` and `Coin<B>` as object-owned children, the
-  ownership update flow needs precise rules to keep the ownership
-  index trie consistent. Specify rigorously in Phase 1 PR.
-- **Gas-payer object selection.** The PTB references the gas-payer
-  `Coin<LOOM>` explicitly. If insufficient, who pays? v0: hard fail
-  pre-execution. v1: optional sponsor field.
-- **Capability revocation.** If a capability is leaked, can the issuer
-  revoke? v0: only by ownership transfer (issuer must already hold a
-  cap-management cap). v1: explicit revocation lists.
+- **Event objects vs. log emissions** — **Both.** v0 ships `log.emit`
+  as a thin parallel host import (§16.2) and a typed `Event<T>` object
+  pattern (immutable, frozen at create-time) for petals that want
+  structured indexable emissions. The choice is per-petal. v1 may
+  collapse to one surface based on indexer feedback.
+- **Generic monomorphization granularity** — **Call-time
+  monomorphization with `Resource<T>` for non-phantom positions
+  (§11.2).** One wasm export per generic `pub fn`; type tags flow as
+  prefix args; `Resource<T>` carries runtime-typed payloads. No
+  publish-time bytecode explosion. Profiling may justify
+  publish-time instantiation in v1.
+- **Object ownership transitions across object-owned children** —
+  **Resolved in §4.4 (borrow table) and §4.5 (`OwnershipIndex` trie).**
+  When a `Pool<A,B,S>` is consumed, its object-owned children are
+  loaded as transient rows and must be re-homed by tx-end (each child
+  needs an explicit `transfer` / `share` / `freeze` / `delete`).
+  The `OwnershipIndex` re-keys at commit.
+- **Gas-payer object selection** — **Resolved in §9.4.** The PTB names
+  the gas-payer `Coin<LOOM>` explicitly. Insufficient value = hard
+  fail pre-execution in v0. v1: optional sponsor field.
+- **Capability revocation** — **v0: no explicit revocation.** Issuers
+  who want revocability hold a `RevokeCap<Cap>` and pass it into a
+  `cap::revoke` function that flips a stored bool inside the
+  capability's payload; checking petals consult that bool. v1: native
+  revocation lists with shorter on-chain costs.
+
+## 18.1 Open questions deferred to v1+
+
+- **Resolution policy schema.** §13 reserves the field; the policy
+  object type and staking integration land in v1.
+- **Parallel PTB scheduling.** Object versioning enables it; scheduler
+  design is v1+.
+- **Wire-format break to drop `Account.loom` and `Account.code_hash`
+  after phase 4.** Decision deferred pending operational data.
+- **zkVM proofs.** Host imports are zk-friendly; proof generation
+  is v1+.
 
 ## 19. v0 acceptance
 
@@ -807,18 +1336,39 @@ Block-level fuel limit remains 30M.
    pass unchanged. Existing docker DEX e2e passes unchanged.
 3. **Fungible petal works.** A PTB creates a currency, mints, splits,
    merges, transfers, burns. Linearity enforced (orphan = revert).
-4. **DEX pool works.** A PTB creates a CPMM pool, adds liquidity, swaps,
-   removes liquidity. Invariant violation reverts. `k` non-decreasing
-   over many swaps.
-5. **Capability auth works.** Mint without `&MintCap` reverts. Transfer
-   a cap; new holder can mint; old holder cannot.
-6. **Multi-validator parity.** Four-validator docker run executes a
-   swap PTB end-to-end and all validators agree on state root.
-7. **Atomicity.** A PTB whose second swap reverts rolls back the first
-   swap's state changes.
-8. **No `msg.sender` in new petals.** Grep for `msg.sender` /
-   `msg::sender` in new-framework crates: zero matches.
-9. **No `u256` in new petals.** Grep for `U256` / `u256` in new-framework
-   crates: zero matches except where explicitly bridging legacy types.
-10. **Determinism.** Same PTB sequence on same initial state produces
+4. **`Account.loom` cache consistency.** After arbitrary PTB sequences
+   touching `Coin<LOOM>`, the end-of-block invariant
+   `accounts[addr].loom == sum(coin.value for coin owned by addr where
+   T = LOOM)` holds for every address.
+5. **Legacy `Transfer` compat shim.** A `TxKind::Transfer` and a
+   `TxKind::SubmitPtb` performing the equivalent `Coin<LOOM>` split +
+   transfer produce identical state roots.
+6. **DEX pool works.** A PTB creates a `Pool<USDC, LOOM,
+   ConstantProduct>`, adds liquidity, swaps, removes liquidity.
+   Invariant violation reverts. `k` non-decreasing over many swaps.
+7. **Router multi-hop works.** A PTB invokes
+   `router::swap_2hop<A, B, C, ConstantProduct, ConstantProduct>` and
+   the `all_pools_k_non_decreasing` invariant holds across all
+   touched pools.
+8. **No wallet-enshrined swap logic.** Wallets / CLIs construct PTBs
+   that reference the `/bloom/dex/router` petal for any swap longer
+   than 1 hop; multi-hop math does not exist in wallet code.
+9. **Capability auth works.** Mint without `&MintCap` reverts.
+   Transfer a cap; new holder can mint; old holder cannot.
+10. **Multi-validator parity.** Four-validator docker run executes a
+    swap PTB end-to-end and all validators agree on state root.
+11. **Atomicity.** A PTB whose second swap reverts rolls back the
+    first swap's state changes.
+12. **Manifest custom section round-trip.** For every new-framework
+    petal: extracting `bloom_petal_manifest_v0`, canonical-decoding,
+    and re-encoding yields byte-identical output.
+13. **`petals.lock` resolution.** `bloom contract build` fails closed
+    when a cross-petal type reference is missing from the lock; passes
+    when present.
+14. **No `msg.sender` in new petals.** Grep for `msg.sender` /
+    `msg::sender` in new-framework crates: zero matches.
+15. **No `u256` in new petals.** Grep for `U256` / `u256` in
+    new-framework crates: zero matches except where explicitly
+    bridging legacy types.
+16. **Determinism.** Same PTB sequence on same initial state produces
     same state root on independent validator runs.
