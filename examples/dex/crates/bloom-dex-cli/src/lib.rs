@@ -660,7 +660,7 @@ async fn swap_exact_tokens(
 
     // 2. router.swap_exact_tokens_for_tokens(amount_in, min_out, path, to, deadline)
     let mut e = Encoder::with_selector(abi_selector(
-        "router.swap_exact_tokens_for_tokens(u256,u256,Vec<Address>,address,u64)",
+        "router.swap_exact_tokens_for_tokens(u256,u256,vec<address>,address,u64)",
     ));
     e.push_u256_bytes(&in_amt).push_u256_bytes(&min_out_v);
     e.push_address_vec(&path_addrs)
