@@ -287,6 +287,9 @@ fn tx_value(tx: &Tx) -> u128 {
         TxKind::Transfer { amount_loom, .. } => *amount_loom,
         TxKind::Call { value_loom, .. } => *value_loom,
         TxKind::Deploy { .. } => 0,
+        // PTBs (spec §16.1) do not carry a legacy-level LOOM value; gas
+        // and value flow are handled by the petal executor.
+        TxKind::SubmitPtb { .. } => 0,
     }
 }
 

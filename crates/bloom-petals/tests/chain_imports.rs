@@ -891,3 +891,118 @@ fn code_manifest_hash_returns_none_for_unknown_account() {
     assert_eq!(data[0], 0, "unknown account must read back as absent");
     assert_eq!(&data[1..33], &[0u8; 32]);
 }
+
+// ---------------------------------------------------------------------------
+// Bloom-native contracts (spec §16.2): new host imports — Phase 1 stubs.
+//
+// These tests confirm that:
+// 1. validate_chain_wasm now accepts imports from the new modules
+//    (object/cap/signer/ptb/log).
+// 2. Calls to the stubs return `NOT_YET_ACTIVATED_CODE` (-100) and burn
+//    a small amount of fuel — i.e. the imports are gated off but the
+//    surface is callable, exactly as spec §17 requires for Phase 1.
+// ---------------------------------------------------------------------------
+
+const OBJECT_BORROW_CALL: &str = r#"
+(module
+  (import "object" "borrow" (func $borrow (param i32 i32) (result i32)))
+  (import "chain" "petal.return" (func $ret (param i32 i32)))
+  (memory (export "memory") 1)
+  (func (export "call") (param i32 i32) (result i32)
+    ;; Call object.borrow(0, 0) and store the i32 result at offset 0.
+    (i32.store (i32.const 0) (call $borrow (i32.const 0) (i32.const 0)))
+    (call $ret (i32.const 0) (i32.const 4))
+    i32.const 0)
+)
+"#;
+
+#[test]
+fn validate_chain_wasm_accepts_new_modules() {
+    // Every new module from spec §16.2 must pass `validate_for_chain`.
+    let cases = [
+        ("object", "borrow", "(param i32 i32) (result i32)"),
+        ("cap", "check", "(param i32 i32 i32) (result i32)"),
+        ("signer", "index", "(result i32)"),
+        ("ptb", "command_output", "(param i32 i32 i32 i32) (result i32)"),
+        ("log", "emit", "(param i32 i32 i32 i32) (result i32)"),
+    ];
+    for (module, name, sig) in cases {
+        let wat_src = format!(
+            r#"
+(module
+  (import "{module}" "{name}" (func {sig}))
+  (memory (export "memory") 1)
+  (func (export "call") (param i32 i32) (result i32) i32.const 0)
+)
+"#
+        );
+        let wasm = wat(&wat_src);
+        PetalVm::validate_for_chain(&wasm)
+            .unwrap_or_else(|e| panic!("module {module}.{name} should validate: {e:?}"));
+    }
+}
+
+#[test]
+fn object_borrow_stub_returns_not_yet_activated() {
+    // object.borrow is a 2-arg stub. The petal calls it, then returns
+    // the raw i32 result. We expect the well-known -100 code.
+    let input = make_input(wat(OBJECT_BORROW_CALL), ChainEntry::Call);
+    let out = run(input).unwrap();
+    let data = out.return_data.expect("return_data");
+    assert_eq!(data.len(), 4);
+    let code = i32::from_le_bytes(data.try_into().unwrap());
+    assert_eq!(
+        code, -100,
+        "Phase 1 object.borrow must return NOT_YET_ACTIVATED_CODE"
+    );
+    // The stub burns 1 unit per call — fuel_used should be non-zero.
+    assert!(out.fuel_used >= 1, "stub must charge at least 1 fuel");
+}
+
+const SIGNER_INDEX_CALL: &str = r#"
+(module
+  (import "signer" "index" (func $idx (result i32)))
+  (import "chain" "petal.return" (func $ret (param i32 i32)))
+  (memory (export "memory") 1)
+  (func (export "call") (param i32 i32) (result i32)
+    (i32.store (i32.const 0) (call $idx))
+    (call $ret (i32.const 0) (i32.const 4))
+    i32.const 0)
+)
+"#;
+
+#[test]
+fn signer_index_stub_returns_not_yet_activated() {
+    // signer.index is the nullary (0-arg) shape. Confirm the 0-arity
+    // branch of `link_new_host_import_stubs` is wired correctly.
+    let input = make_input(wat(SIGNER_INDEX_CALL), ChainEntry::Call);
+    let out = run(input).unwrap();
+    let data = out.return_data.expect("return_data");
+    assert_eq!(data.len(), 4);
+    let code = i32::from_le_bytes(data.try_into().unwrap());
+    assert_eq!(code, -100);
+}
+
+const PTB_COMMAND_OUTPUT_CALL: &str = r#"
+(module
+  (import "ptb" "command_output"
+    (func $co (param i32 i32 i32 i32) (result i32)))
+  (import "chain" "petal.return" (func $ret (param i32 i32)))
+  (memory (export "memory") 1)
+  (func (export "call") (param i32 i32) (result i32)
+    (i32.store (i32.const 0)
+      (call $co (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+    (call $ret (i32.const 0) (i32.const 4))
+    i32.const 0)
+)
+"#;
+
+#[test]
+fn ptb_command_output_stub_returns_not_yet_activated() {
+    // 4-arg arity branch.
+    let input = make_input(wat(PTB_COMMAND_OUTPUT_CALL), ChainEntry::Call);
+    let out = run(input).unwrap();
+    let data = out.return_data.expect("return_data");
+    let code = i32::from_le_bytes(data.try_into().unwrap());
+    assert_eq!(code, -100);
+}

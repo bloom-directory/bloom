@@ -271,6 +271,26 @@ impl PetalExecutor for ChainPetalExecutor {
                     }
                 }
             }
+
+            // Phase 1 (spec §16.1, §17): the SubmitPtb variant exists on
+            // the wire so the chain types are forward-compatible, but
+            // execution is intentionally gated off. The dispatcher
+            // rejects every PTB with a `NotYetActivated` revert receipt
+            // that consumes no fuel. Phase 2 replaces this arm with the
+            // real PTB interpreter.
+            TxKind::SubmitPtb { .. } => {
+                warn!(
+                    sender = %hex::encode(&tx.sender.0),
+                    "SubmitPtb rejected: NotYetActivated (Phase 1)"
+                );
+                ExecOutput {
+                    success: false,
+                    fuel_used: 0,
+                    return_data: b"NotYetActivated: SubmitPtb (Phase 1)".to_vec(),
+                    logs: vec![],
+                    write_set: None,
+                }
+            }
         }
     }
 }

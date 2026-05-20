@@ -466,6 +466,9 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
             TxKind::Call { value_loom, .. } => *value_loom,
             TxKind::Transfer { amount_loom, .. } => *amount_loom,
             TxKind::Deploy { .. } => 0,
+            // PTBs (spec §16.1) do not carry a legacy-level LOOM value;
+            // the petal executor handles gas/value flow at PTB dispatch.
+            TxKind::SubmitPtb { .. } => 0,
         };
         let required = max_fee + value;
         let balance = sender_acct.as_ref().map(|a| a.loom).unwrap_or(0);

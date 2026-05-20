@@ -168,10 +168,21 @@ fn chain_engine() -> Result<&'static Engine, PetalError> {
 // Wasm validation
 // ---------------------------------------------------------------------------
 
+/// Allow-list of import modules a chain-mode petal may declare.
+///
+/// `"chain"` is the legacy v0 surface. The five new modules
+/// (`object`, `cap`, `signer`, `ptb`, `log`) are the spec §16.2
+/// Bloom-native surface — they are accepted at validate-time so that
+/// Phase 2 petals load, but every imported symbol in those modules is
+/// installed as a `NotYetActivated` trap stub in Phase 1.
+const CHAIN_ALLOWED_IMPORT_MODULES: &[&str] = &[
+    "chain", "object", "cap", "signer", "ptb", "log",
+];
+
 /// Validate a wasm binary for deploy-time admission as a chain-mode petal.
 ///
 /// Rejects:
-/// - Any import whose module is not `"chain"`.
+/// - Any import whose module is not in `CHAIN_ALLOWED_IMPORT_MODULES`.
 /// - Any function export whose name is not in `{"init", "call"}`.
 /// - A `memory` export with min pages > 256 or max pages > 256 (16 MiB cap).
 ///
@@ -189,7 +200,7 @@ pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
             Payload::ImportSection(reader) => {
                 for import in reader {
                     let import = import.map_err(|e| PetalError::InvalidWasm(e.to_string()))?;
-                    if import.module != "chain" {
+                    if !CHAIN_ALLOWED_IMPORT_MODULES.contains(&import.module) {
                         return Err(PetalError::InvalidWasm(format!(
                             "chain petal imports from disallowed module '{}' (function '{}')",
                             import.module, import.name
@@ -1120,6 +1131,133 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
             }
         },
     )?;
+
+    // -----------------------------------------------------------------------
+    // Bloom-native contracts (spec §16.2) — Phase 1 stubs.
+    //
+    // Every import in `bloom_objects::host_imports::NEW_HOST_IMPORTS`
+    // is installed as a trap closure that consumes 1 unit of fuel
+    // (cheap-to-skip, but non-zero so an infinite loop calling stubs
+    // still exhausts fuel) and then returns `NOT_YET_ACTIVATED_CODE`
+    // for an i32-result import, or signals a wasm trap for the
+    // few imports that have wider-than-i32 conceptual results.
+    //
+    // The current §16.2 table is uniformly `i32`-result, so we use the
+    // simple "return error code" path. If §16.2 ever grows imports
+    // with `i64` or `(i32, i32)` results we add specialised stubs here.
+    // -----------------------------------------------------------------------
+    link_new_host_import_stubs(linker)?;
+
+    Ok(())
+}
+
+/// Negative wasm error code returned by every Phase-1 stub for the new
+/// Bloom-native host surface (spec §16.2).
+///
+/// `-100` is chosen to sit comfortably below the existing host-error
+/// codes (`-1..-7`) and any code the petal-side macros use for their
+/// own diagnostics (high-bit `0x4000_0000` per `bloom_resource::error`).
+/// A petal that calls one of these imports during Phase 1 will read
+/// this code and surface `PetalError::NotYetActivated` to the user.
+pub const NOT_YET_ACTIVATED_CODE: i32 = -100;
+
+/// Install Phase-1 stubs for every entry in
+/// `bloom_objects::host_imports::NEW_HOST_IMPORTS`.
+///
+/// Each stub:
+/// 1. Charges 1 unit of fuel (so an attacker can't busy-loop calling
+///    stubs for free — the eventual `out of fuel` trap still fires).
+/// 2. Returns the `NOT_YET_ACTIVATED_CODE` error code.
+///
+/// All §16.2 imports today have an `i32` result. The match below is
+/// keyed on arity (0..=4) and closes over the import name only.
+fn link_new_host_import_stubs(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<()> {
+    use bloom_objects::host_imports::NEW_HOST_IMPORTS;
+
+    for h in NEW_HOST_IMPORTS {
+        // Sanity-check: the §16.2 table is uniformly i32 → i32 today.
+        debug_assert!(
+            h.results.len() == 1,
+            "host import {}.{} has non-singular result arity {}",
+            h.module,
+            h.name,
+            h.results.len()
+        );
+
+        let module = h.module;
+        let name = h.name;
+
+        match h.params.len() {
+            0 => {
+                linker.func_wrap(
+                    module,
+                    name,
+                    move |mut caller: Caller<'_, ChainStoreData>| -> i32 {
+                        let _ = consume_fuel(&mut caller, 1);
+                        NOT_YET_ACTIVATED_CODE
+                    },
+                )?;
+            }
+            1 => {
+                linker.func_wrap(
+                    module,
+                    name,
+                    move |mut caller: Caller<'_, ChainStoreData>, _a: i32| -> i32 {
+                        let _ = consume_fuel(&mut caller, 1);
+                        NOT_YET_ACTIVATED_CODE
+                    },
+                )?;
+            }
+            2 => {
+                linker.func_wrap(
+                    module,
+                    name,
+                    move |mut caller: Caller<'_, ChainStoreData>,
+                          _a: i32,
+                          _b: i32|
+                          -> i32 {
+                        let _ = consume_fuel(&mut caller, 1);
+                        NOT_YET_ACTIVATED_CODE
+                    },
+                )?;
+            }
+            3 => {
+                linker.func_wrap(
+                    module,
+                    name,
+                    move |mut caller: Caller<'_, ChainStoreData>,
+                          _a: i32,
+                          _b: i32,
+                          _c: i32|
+                          -> i32 {
+                        let _ = consume_fuel(&mut caller, 1);
+                        NOT_YET_ACTIVATED_CODE
+                    },
+                )?;
+            }
+            4 => {
+                linker.func_wrap(
+                    module,
+                    name,
+                    move |mut caller: Caller<'_, ChainStoreData>,
+                          _a: i32,
+                          _b: i32,
+                          _c: i32,
+                          _d: i32|
+                          -> i32 {
+                        let _ = consume_fuel(&mut caller, 1);
+                        NOT_YET_ACTIVATED_CODE
+                    },
+                )?;
+            }
+            n => {
+                anyhow::bail!(
+                    "unsupported arity {n} for Phase-1 stub of {module}.{name}; \
+                     update link_new_host_import_stubs"
+                );
+            }
+        }
+    }
 
     Ok(())
 }
