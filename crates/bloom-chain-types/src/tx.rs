@@ -15,7 +15,16 @@ use crate::types::{
 // TxKind
 // ---------------------------------------------------------------------------
 
-/// The variant of a bloom-chain transaction (spec §7.1).
+/// The variant of a bloom-chain transaction (spec §7.1, §16.1).
+///
+/// Variant selectors are part of the wire format and must remain stable:
+///
+/// | selector | variant       |
+/// |----------|---------------|
+/// | 0        | `Transfer`    |
+/// | 1        | `Deploy`      |
+/// | 2        | `Call`        |
+/// | 3        | `SubmitPtb`   |
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum TxKind {
     /// Transfer native LOOM from sender to `to`.
@@ -39,13 +48,33 @@ pub enum TxKind {
         calldata: Vec<u8>,
         value_loom: u128,
     },
+    /// Submit a Programmable Transaction Block (spec §16.1, Phase 1).
+    ///
+    /// # Why an opaque byte vector
+    ///
+    /// The structured PTB type (`bloom_script::types::PtbTx`) lives in
+    /// the `bloom-script` crate, which already depends on
+    /// `bloom-chain-types` for [`Hash32`]. Embedding `PtbTx` here
+    /// directly would form a dependency cycle.
+    ///
+    /// The wire format is unaffected: `ptb_bytes` is the canonical
+    /// PTB encoding (as produced by `bloom_script::encode_ptb`),
+    /// length-prefixed by the SSZ container framing here. Higher
+    /// layers (mempool, executor) decode via `bloom_script::decode_ptb`.
+    ///
+    /// Through Phase 1 the dispatcher returns a `NotYetActivated`
+    /// revert receipt for this variant; Phase 2 activates real
+    /// execution.
+    SubmitPtb { ptb_bytes: Vec<u8> },
 }
 
 /// Selector byte written as the first byte of a `TxKind` SSZ encoding.
-/// Matches SSZ union convention: 0 = Transfer, 1 = Deploy, 2 = Call.
+/// Matches SSZ union convention: 0 = Transfer, 1 = Deploy, 2 = Call,
+/// 3 = SubmitPtb (spec §16.1).
 const TX_KIND_TRANSFER: u8 = 0;
 const TX_KIND_DEPLOY: u8 = 1;
 const TX_KIND_CALL: u8 = 2;
+const TX_KIND_SUBMIT_PTB: u8 = 3;
 
 impl Encode for TxKind {
     fn is_ssz_fixed_len() -> bool {
@@ -77,6 +106,12 @@ impl Encode for TxKind {
             } => {
                 // to (32, fixed) + offset for calldata (4) + value_loom (16) + calldata.len()
                 32 + 4 + 16 + calldata.len()
+            }
+            TxKind::SubmitPtb { ptb_bytes } => {
+                // Single variable field: just the canonical PTB byte vector,
+                // encoded as a top-level Vec<u8> in SSZ (length-prefixed by
+                // the outer container framing in `from_ssz_bytes`).
+                ptb_bytes.len()
             }
         }
     }
@@ -133,6 +168,17 @@ impl Encode for TxKind {
                 enc.append(calldata);
                 enc.append(value_loom);
                 enc.finalize();
+            }
+            TxKind::SubmitPtb { ptb_bytes } => {
+                buf.push(TX_KIND_SUBMIT_PTB);
+                // Single variable field after the selector: the canonical
+                // PTB bytes encoded as a bare SSZ Vec<u8>. The framing of
+                // the outer `Tx` container already covers length-prefix
+                // via the variable-field offset machinery, so here we
+                // just append the raw bytes directly. Decode mirrors this
+                // by reading the post-selector remainder as the full
+                // ptb_bytes payload.
+                buf.extend_from_slice(ptb_bytes);
             }
         }
     }
@@ -230,10 +276,29 @@ impl Decode for TxKind {
                     value_loom,
                 })
             }
+            TX_KIND_SUBMIT_PTB => {
+                // The rest of the bytes are the canonical PTB byte vector.
+                // No further framing — the outer SSZ container has already
+                // length-delimited the kind's payload.
+                Ok(TxKind::SubmitPtb {
+                    ptb_bytes: rest.to_vec(),
+                })
+            }
             _ => Err(DecodeError::BytesInvalid(format!(
                 "unknown TxKind selector: {selector}"
             ))),
         }
+    }
+}
+
+impl TxKind {
+    /// Returns `true` iff this transaction is a `SubmitPtb` (spec §16.1).
+    ///
+    /// Convenience for executor / mempool gating during Phase 1, where
+    /// the variant exists on the wire but execution returns a
+    /// `NotYetActivated` revert.
+    pub fn is_submit_ptb(&self) -> bool {
+        matches!(self, TxKind::SubmitPtb { .. })
     }
 }
 
@@ -531,5 +596,120 @@ mod tests {
             tx.tx_hash(),
             "signing digest and tx hash must use distinct domain tags"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // SubmitPtb (spec §16.1, Phase 1 stub)
+    // -----------------------------------------------------------------------
+
+    fn sample_submit_ptb_tx() -> Tx {
+        Tx {
+            chain_id: "bloomchain.v0".to_string(),
+            sender: Address([0x42u8; 32]),
+            nonce: 7,
+            max_fuel: 100_000,
+            fee_per_unit: 1,
+            kind: TxKind::SubmitPtb {
+                // Opaque canonical PTB bytes. The decoder treats this as
+                // a black box; only `bloom-script::decode_ptb` interprets.
+                ptb_bytes: vec![0x01, 0x02, 0x03, 0x04, 0x05],
+            },
+            pubkey: PubKeyBytes(vec![0xAAu8; 16]),
+            sig: SigBytes(vec![0xBBu8; 16]),
+        }
+    }
+
+    #[test]
+    fn tx_submit_ptb_ssz_roundtrip() {
+        let tx = sample_submit_ptb_tx();
+        let bytes = tx.as_ssz_bytes();
+        let decoded = Tx::from_ssz_bytes(&bytes).expect("decode should succeed");
+        assert_eq!(tx, decoded);
+        match &decoded.kind {
+            TxKind::SubmitPtb { ptb_bytes } => {
+                assert_eq!(ptb_bytes, &[0x01, 0x02, 0x03, 0x04, 0x05]);
+            }
+            other => panic!("expected SubmitPtb, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tx_submit_ptb_kind_alone_ssz_roundtrip() {
+        // The TxKind enum encodes selector + payload independently of
+        // the outer Tx envelope; verify the union directly.
+        let kind = TxKind::SubmitPtb {
+            ptb_bytes: b"hello-ptb".to_vec(),
+        };
+        let bytes = kind.as_ssz_bytes();
+        // First byte must be the selector (3).
+        assert_eq!(bytes[0], TX_KIND_SUBMIT_PTB);
+        let decoded = TxKind::from_ssz_bytes(&bytes).expect("decode");
+        assert_eq!(kind, decoded);
+    }
+
+    #[test]
+    fn tx_submit_ptb_empty_payload_roundtrip() {
+        // Zero-length canonical PTB bytes still round-trip cleanly.
+        let kind = TxKind::SubmitPtb { ptb_bytes: vec![] };
+        let bytes = kind.as_ssz_bytes();
+        let decoded = TxKind::from_ssz_bytes(&bytes).expect("decode");
+        assert_eq!(kind, decoded);
+    }
+
+    #[test]
+    fn tx_submit_ptb_selector_is_three() {
+        // Wire-format anchor: spec §16.1 pins the selector at 3.
+        assert_eq!(TX_KIND_SUBMIT_PTB, 3);
+    }
+
+    #[test]
+    fn tx_submit_ptb_does_not_collide_with_existing_selectors() {
+        // Defence-in-depth: the four selectors must stay distinct and
+        // contiguous (0..=3). Adding a fifth in the future requires a
+        // matching update here.
+        let selectors = [
+            TX_KIND_TRANSFER,
+            TX_KIND_DEPLOY,
+            TX_KIND_CALL,
+            TX_KIND_SUBMIT_PTB,
+        ];
+        let mut sorted = selectors;
+        sorted.sort_unstable();
+        assert_eq!(sorted, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn tx_submit_ptb_hash_is_stable() {
+        let tx = sample_submit_ptb_tx();
+        let h1 = tx.tx_hash();
+        let h2 = tx.tx_hash();
+        assert_eq!(h1, h2, "tx_hash must be deterministic for SubmitPtb");
+        // And the signing digest is independently stable + distinct.
+        assert_ne!(
+            tx.signing_digest(),
+            tx.tx_hash(),
+            "TX vs TX_HASH domain tags must keep digests apart"
+        );
+    }
+
+    #[test]
+    fn is_submit_ptb_helper() {
+        let transfer = TxKind::Transfer {
+            to: Address([0u8; 32]),
+            amount_loom: 0,
+        };
+        let ptb = TxKind::SubmitPtb { ptb_bytes: vec![1, 2, 3] };
+        assert!(!transfer.is_submit_ptb());
+        assert!(ptb.is_submit_ptb());
+    }
+
+    #[test]
+    fn unknown_selector_still_rejected() {
+        // Defence: an unknown selector byte must error, not silently
+        // round-trip as a new variant.
+        let bad = [99u8, 0u8, 0u8, 0u8];
+        let err = TxKind::from_ssz_bytes(&bad).expect_err("must reject unknown selector");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("unknown TxKind selector"), "got: {msg}");
     }
 }
