@@ -54,7 +54,7 @@ use alloc::vec::Vec;
 
 use bloom_chain_abi::{DispatchError, U256, contract};
 use bloom_dex_erc20::calls as erc20_calls;
-use bloom_dex_factory::factory;
+use bloom_dex_factory::calls as factory_calls;
 use bloom_dex_pair::pair;
 use bloom_dex_wloom::calls as wloom_calls;
 use bloom_petal_sdk::{LoomValue, block, msg, petal};
@@ -334,7 +334,7 @@ const ZERO_VALUE: LoomValue = LoomValue::ZERO;
 
 /// Call `factory.get_pair(tokenA, tokenB)` and return the pair address.
 fn factory_get_pair(factory_addr: &[u8; 32], token_a: &[u8; 32], token_b: &[u8; 32]) -> [u8; 32] {
-    let cd = factory::abi::call::get_pair(token_a, token_b);
+    let cd = factory_calls::get_pair(token_a, token_b);
     let ret = petal::call(factory_addr, &cd, ZERO_VALUE)
         .unwrap_or_else(|_| petal::revert("router: factory.get_pair failed"));
     if ret.len() < 32 {
@@ -347,7 +347,7 @@ fn factory_get_pair(factory_addr: &[u8; 32], token_a: &[u8; 32], token_b: &[u8; 
 
 /// Call `factory.create_pair(tokenA, tokenB)` and return the new pair address.
 fn factory_create_pair(factory_addr: &[u8; 32], token_a: &[u8; 32], token_b: &[u8; 32]) -> [u8; 32] {
-    let cd = factory::abi::call::create_pair(token_a, token_b);
+    let cd = factory_calls::create_pair(token_a, token_b);
     let ret = petal::call(factory_addr, &cd, ZERO_VALUE)
         .unwrap_or_else(|_| petal::revert("router: factory.create_pair failed"));
     if ret.len() < 32 {
