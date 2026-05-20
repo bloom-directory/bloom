@@ -25,8 +25,11 @@ pub mod types;
 pub mod abi;
 pub mod storage;
 pub mod context;
+pub mod events;
 pub mod interface;
 pub mod error;
+pub mod dispatch;
+pub mod reentrancy;
 pub mod panic;
 pub mod prelude;
 

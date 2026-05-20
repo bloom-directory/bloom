@@ -75,6 +75,18 @@ pub fn revert(msg: &str) -> ! {
     }
 }
 
+/// Revert with an arbitrary-bytes payload (not necessarily UTF-8).
+///
+/// The chain-mode host import `petal.revert` stores `revert_data` verbatim;
+/// the `revert(&str)` wrapper above is only a typed convenience. Typed
+/// contract errors (selector + ABI payload) flow through this entry point so
+/// indexers can decode them by selector.
+pub fn revert_bytes(data: &[u8]) -> ! {
+    unsafe {
+        imports::petal_revert(data.as_ptr() as i32, data.len() as i32);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! These tests live alongside the SDK call surface and verify the

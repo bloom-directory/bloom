@@ -10,7 +10,10 @@
 
 use proc_macro::TokenStream;
 
+mod contract;
 mod derives;
+mod error_attr;
+mod event_attr;
 mod storage_attr;
 
 /// `#[derive(AbiEncode)]` — sequential field encoding for structs;
@@ -35,10 +38,11 @@ pub fn derive_abi_type(input: TokenStream) -> TokenStream {
 
 /// `#[bloom::contract]` — top-level attribute placed on a `mod` containing
 /// the contract's storage struct, init fn, event types, error enum, and
-/// handler methods. Phase 1 stub: passes the input through unchanged.
+/// handler methods. Scans the module body and emits `init` / `call` wasm
+/// exports plus a `__bloom` submodule with the selector table.
 #[proc_macro_attribute]
-pub fn contract(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    item
+pub fn contract(attr: TokenStream, item: TokenStream) -> TokenStream {
+    contract::expand(attr, item)
 }
 
 /// `#[storage]` — placed on the contract's state struct. Generates the
@@ -49,16 +53,21 @@ pub fn storage(attr: TokenStream, item: TokenStream) -> TokenStream {
     storage_attr::expand(attr, item)
 }
 
-/// `#[event]` — placed on an event struct. Phase 1 stub.
+/// `#[event]` — placed on an event struct. Derives `AbiEncode`/`AbiDecode`/
+/// `AbiType`, emits the `TOPIC0` constant (compile-time blake3 of the event
+/// signature), and generates `emit(&self, ctx)` for the hot path.
 #[proc_macro_attribute]
-pub fn event(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    item
+pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
+    event_attr::expand(attr, item)
 }
 
-/// `#[error]` — placed on the contract's error enum. Phase 1 stub.
+/// `#[error]` — placed on the contract's error enum. Implements
+/// `bloom_contract::error::Error`, derives per-variant 4-byte selectors
+/// (compile-time blake3), and exposes a `VARIANTS` const for manifest
+/// emission.
 #[proc_macro_attribute]
-pub fn error(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    item
+pub fn error(attr: TokenStream, item: TokenStream) -> TokenStream {
+    error_attr::expand(attr, item)
 }
 
 /// `#[init]` — placed on the contract's initialiser. Phase 1 stub.

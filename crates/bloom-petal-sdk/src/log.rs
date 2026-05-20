@@ -2,6 +2,28 @@
 
 use crate::imports;
 
+/// Emit a log entry under `topics` — each topic is the full 32 bytes the host
+/// expects. `#[bloom::contract]` events use this form for native 32-byte
+/// topic-0 derivation; the [`emit`] sibling preserves the legacy 4-byte
+/// padded encoding used by the v0 `contract!` macro.
+pub fn emit_topics32(topics: &[[u8; 32]], data: &[u8]) {
+    let mut topic_buf: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(topics.len() * 32);
+    for t in topics {
+        topic_buf.extend_from_slice(t);
+    }
+    let result = unsafe {
+        imports::log_emit(
+            topic_buf.as_ptr() as i32,
+            topics.len() as i32,
+            data.as_ptr() as i32,
+            data.len() as i32,
+        )
+    };
+    if result < 0 {
+        crate::petal::revert("log_emit failed");
+    }
+}
+
 /// Emit a log entry attached to the current tx's receipt.
 ///
 /// `topics` — slice of 4-byte topic selectors (each `[u8; 4]`, typically a
