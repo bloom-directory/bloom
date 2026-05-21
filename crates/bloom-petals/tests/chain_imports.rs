@@ -284,6 +284,36 @@ fn validate_chain_wasm_accepts_valid_module() {
 }
 
 // ---------------------------------------------------------------------------
+// PTB-mode petals export `__petal_<fn>` and `__inv_<n>` (spec §16.2); the
+// chain admission step must accept them so bloom-resource-macros-built
+// petals can be deployed via `TxKind::Deploy`.
+// ---------------------------------------------------------------------------
+
+const PTB_PETAL_EXPORTS: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "init") (param i32 i32))
+  (func (export "call") (param i32 i32) (result i32)
+    i32.const 0)
+  (func (export "__petal_mint") (param i32 i32) (result i32)
+    i32.const 0)
+  (func (export "__inv_0") (param i32 i32) (result i32)
+    i32.const 0)
+  (func (export "__alloc") (param i32) (result i32)
+    i32.const 0)
+  (func (export "__dealloc") (param i32 i32))
+  (func (export "__bloom_manifest_ptr") (result i32)
+    i32.const 0)
+)
+"#;
+
+#[test]
+fn validate_chain_wasm_accepts_ptb_petal_exports() {
+    let wasm = wat(PTB_PETAL_EXPORTS);
+    PetalVm::validate_for_chain(&wasm).unwrap();
+}
+
+// ---------------------------------------------------------------------------
 // Test 10: msg.value returns the lo/hi pair correctly.
 // ---------------------------------------------------------------------------
 
@@ -974,7 +1004,7 @@ const SIGNER_INDEX_CALL: &str = r#"
 #[test]
 fn signer_index_stub_returns_not_yet_activated() {
     // signer.index is the nullary (0-arg) shape. Confirm the 0-arity
-    // branch of `link_new_host_import_stubs` is wired correctly.
+    // branch of `link_new_host_imports` is wired correctly.
     let input = make_input(wat(SIGNER_INDEX_CALL), ChainEntry::Call);
     let out = run(input).unwrap();
     let data = out.return_data.expect("return_data");

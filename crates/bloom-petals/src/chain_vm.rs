@@ -95,9 +95,20 @@ pub struct ChainStoreData {
 // Public entry-point types
 // ---------------------------------------------------------------------------
 
+/// Which exported function the chain VM should invoke.
 pub enum ChainEntry {
+    /// Legacy v0 deploy-time `init` export.
     Init,
+    /// Legacy v0 `call` export (used by the legacy
+    /// `TxKind::Call` / `TxKind::Deploy` paths).
     Call,
+    /// PTB-mode Move command: invoke the export with the given name.
+    ///
+    /// Bloom-native petals (spec §16.2) export one function per
+    /// `#[bloom::petal]` function decl, named `__petal_<fn_name>`.
+    /// PTB-mode dispatch routes `MoveCmd::function = "name"` into this
+    /// variant after prefixing the export name.
+    Function(String),
 }
 
 pub struct ChainCallInput {
@@ -183,13 +194,31 @@ const CHAIN_ALLOWED_IMPORT_MODULES: &[&str] = &[
 ///
 /// Rejects:
 /// - Any import whose module is not in `CHAIN_ALLOWED_IMPORT_MODULES`.
-/// - Any function export whose name is not in `{"init", "call"}`.
+/// - Any function export whose name is not in `{"init", "call"}` and
+///   does not match the PTB petal export naming convention
+///   (`__petal_*`, `__inv_*`, `__alloc`, `__dealloc`,
+///   `__bloom_manifest_*`).
 /// - A `memory` export with min pages > 256 or max pages > 256 (16 MiB cap).
 ///
 /// LLVM/Rust wasm32 builds routinely emit non-function exports such as
 /// `__heap_base`, `__data_end`, and `__indirect_function_table`. Those are
 /// inert globals/tables — they're not callable host entry points — so we
 /// only enforce the entry-point allow-list on Function exports.
+///
+/// PTB-mode petals (spec §16.2) emit one `__petal_<fn>` export per
+/// public function and `__inv_<n>` exports for attached invariants;
+/// both naming patterns are permitted to keep the legacy
+/// `TxKind::Deploy` admission path forward-compatible with bloom-native
+/// petals.
+/// Whether `name` matches one of the PTB-mode petal export naming
+/// conventions emitted by `bloom-resource-macros` (spec §16.2).
+fn is_ptb_petal_export(name: &str) -> bool {
+    name.starts_with("__petal_")
+        || name.starts_with("__inv_")
+        || matches!(name, "__alloc" | "__dealloc")
+        || name.starts_with("__bloom_manifest_")
+}
+
 pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
     use wasmparser::{ExternalKind, Parser, Payload};
 
@@ -214,9 +243,11 @@ pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
                     match (export.kind, export.name) {
                         (ExternalKind::Func, "init") | (ExternalKind::Func, "call") => {}
                         (ExternalKind::Func, other) => {
-                            return Err(PetalError::InvalidWasm(format!(
-                                "chain petal exports disallowed function '{other}'"
-                            )));
+                            if !is_ptb_petal_export(other) {
+                                return Err(PetalError::InvalidWasm(format!(
+                                    "chain petal exports disallowed function '{other}'"
+                                )));
+                            }
                         }
                         // Non-function exports (globals, tables, memory) are
                         // harmless: they aren't callable host entry points.
@@ -1146,7 +1177,7 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
     // simple "return error code" path. If §16.2 ever grows imports
     // with `i64` or `(i32, i32)` results we add specialised stubs here.
     // -----------------------------------------------------------------------
-    link_new_host_import_stubs(linker)?;
+    link_new_host_imports(linker)?;
 
     Ok(())
 }
@@ -1171,7 +1202,7 @@ pub const NOT_YET_ACTIVATED_CODE: i32 = -100;
 ///
 /// All §16.2 imports today have an `i32` result. The match below is
 /// keyed on arity (0..=4) and closes over the import name only.
-fn link_new_host_import_stubs(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<()> {
+fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<()> {
     use bloom_objects::host_imports::NEW_HOST_IMPORTS;
 
     for h in NEW_HOST_IMPORTS {
@@ -1253,7 +1284,7 @@ fn link_new_host_import_stubs(linker: &mut Linker<ChainStoreData>) -> anyhow::Re
             n => {
                 anyhow::bail!(
                     "unsupported arity {n} for Phase-1 stub of {module}.{name}; \
-                     update link_new_host_import_stubs"
+                     update link_new_host_imports"
                 );
             }
         }
@@ -1407,10 +1438,12 @@ fn dispatch_chain_call_sync(
         }
     };
 
-    let entry_name = match input.entry {
-        ChainEntry::Init => "init",
-        ChainEntry::Call => "call",
+    let entry_name = match &input.entry {
+        ChainEntry::Init => "init".to_string(),
+        ChainEntry::Call => "call".to_string(),
+        ChainEntry::Function(name) => name.clone(),
     };
+    let entry_name: &str = &entry_name;
 
     let func = match instance.get_typed_func::<(i32, i32), i32>(&mut store, entry_name) {
         Ok(f) => f,
