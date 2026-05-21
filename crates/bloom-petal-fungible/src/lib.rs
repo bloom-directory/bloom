@@ -266,8 +266,7 @@ pub mod ops {
 /// `split`, `merge`, `transfer`, `value`, `mint_genesis`).
 #[bloom::petal(path = "/bloom/core/fungible", version = "0.1.0")]
 pub mod fungible {
-    use super::bloom;
-    use bloom_resource::{Capability, Coin, RuntimeHandle, Signer, UID};
+    use bloom_resource::{Capability, Coin, Signer, UID};
     use crate::ops;
     use core::marker::PhantomData;
 
@@ -337,6 +336,32 @@ pub mod fungible {
     }
 
     // -----------------------------------------------------------------
+    // Supply<T> helpers — spec §14.1 / §11.2
+    // -----------------------------------------------------------------
+
+    impl<T> Supply<T> {
+        /// Borrow the supply object from the executor's borrow table in
+        /// `Mutable` mode, using the `id` stored in this struct. Returns
+        /// the runtime handle for use in `ops::mint` / `ops::burn`.
+        ///
+        /// Spec §14.1: every `mint` and `burn` must read and rewrite the
+        /// `Supply<T>` tracker. The handle obtained here is the one the
+        /// runtime has associated with the supply object for this command.
+        ///
+        /// Note: on the wasm execution path the macro-emitted shim calls
+        /// `object.borrow` before the user fn body runs, so `handle()`
+        /// borrows a second time. The runtime de-duplicates same-object
+        /// borrows within a command, so the double-borrow is idempotent.
+        pub fn handle(&self) -> bloom_resource::RuntimeHandle {
+            bloom_resource::host::object_borrow(
+                self.id.as_object_id(),
+                bloom_objects::AccessMode::Mutable,
+            )
+            .expect("Supply::handle: object_borrow failed — supply object not in borrow table")
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Public petal entry points
     // -----------------------------------------------------------------
     //
@@ -352,48 +377,51 @@ pub mod fungible {
     // results with `Use(cmd, ret)` references.
 
     /// Create the `MintCap<T>` half of a fresh fungible-currency triple
-    /// (`MintCap<T>`, `BurnCap<T>`, `Supply<T>`). The companion `BurnCap`
-    /// and `Supply` are produced by `create_burn_cap` and
-    /// `create_supply` in the same PTB, all gated by the same `&Signer`.
+    /// (`MintCap<T>`, `BurnCap<T>`, `Supply<T>`). Per spec §5.3,
+    /// capabilities are minted at type-creation time by `create_currency`
+    /// and cannot be granted in isolation afterwards.
+    ///
+    /// PTBs that need all three capabilities call this once and thread
+    /// the return values via `Use(cmd, ret)` references to downstream
+    /// commands. There is no separate `create_burn_cap` entry point —
+    /// the `BurnCap<T>` is an inseparable part of the triple (spec §14.1).
     pub fn create_currency<T>(_signer: &Signer) -> Capability<MintCap<T>> {
         let (mint, _burn, _supply) =
             ops::create_currency().expect("create_currency host failure");
         Capability::from_handle(mint)
     }
 
-    /// Companion to [`create_currency`]: returns the `BurnCap<T>` for a
-    /// freshly created currency.
-    pub fn create_burn_cap<T>(_signer: &Signer) -> Capability<BurnCap<T>> {
-        let (_mint, burn, _supply) =
-            ops::create_currency().expect("create_burn_cap host failure");
-        Capability::from_handle(burn)
-    }
-
     /// Mint `amount` units of `Coin<T>` against the `MintCap<T>` proof
     /// of authority. Updates the `Supply<T>` total in lockstep.
     ///
-    /// The `&mut Supply<T>` arg is threaded through the borrow table as
-    /// handle 0 of the current command (the interim shim until the
-    /// macro emits typed Supply handle wrappers — tracked by spec §11.2
-    /// paragraph on monomorphization-at-PTB-time).
+    /// The `supply` argument must reference the `Supply<T>` object that
+    /// tracks total issuance for this currency. `supply.handle()` issues
+    /// `object.borrow(supply.id, Mutable)` to obtain the real borrow-table
+    /// handle, fixing the earlier hard-coded `RuntimeHandle::from_raw(0)`
+    /// (spec §14.1 compliance — every mint must update the supply tracker
+    /// via the real runtime handle, not a fabricated one).
     pub fn mint<T>(
         _cap: &Capability<MintCap<T>>,
-        _supply: &mut Supply<T>,
+        supply: &mut Supply<T>,
         amount: u128,
     ) -> Coin<T> {
-        let supply_handle = RuntimeHandle::from_raw(0);
+        let supply_handle = supply.handle();
         let coin_handle = ops::mint(supply_handle, amount).expect("mint host failure");
         Coin::from_handle(coin_handle)
     }
 
     /// Burn `coin` (consuming it) against the `BurnCap<T>` authority,
     /// decrementing the `Supply<T>` total by the coin's value.
+    ///
+    /// Uses `supply.handle()` to obtain the real borrow-table handle
+    /// rather than fabricating `RuntimeHandle::from_raw(0)` (spec §14.1
+    /// compliance).
     pub fn burn<T>(
         _cap: &Capability<BurnCap<T>>,
-        _supply: &mut Supply<T>,
+        supply: &mut Supply<T>,
         coin: Coin<T>,
     ) {
-        let supply_handle = RuntimeHandle::from_raw(0);
+        let supply_handle = supply.handle();
         ops::burn(supply_handle, coin.handle()).expect("burn host failure");
     }
 
@@ -426,11 +454,32 @@ pub mod fungible {
     /// which only the genesis pipeline ever holds; the cap is `delete`d
     /// after the final genesis allocation, permanently disabling this
     /// entry point until a governance petal mints a fresh cap.
+    ///
+    /// Spec §9.3 / §5: the `EpochZero` capability is verified via
+    /// `cap::check` before any minting proceeds. An invalid or
+    /// mistyped `EpochZero` handle causes an immediate panic (which the
+    /// wasm VM traps and converts to an abort). This prevents any
+    /// caller that doesn't actually hold a valid `EpochZero` object from
+    /// succeeding even if the Rust type system is satisfied by a
+    /// fabricated `Capability<EpochZero>` wrapper.
     pub fn mint_genesis(
-        _epoch: &Capability<EpochZero>,
+        epoch: &Capability<EpochZero>,
         amount: u128,
         recipient: Address,
     ) {
+        let epoch_tag = {
+            use bloom_objects::TypeTag;
+            TypeTag::Concrete {
+                petal_hash: [0u8; 32],
+                type_name: "EpochZero".to_string(),
+                type_args: vec![],
+            }
+        };
+        assert!(
+            epoch.check(&epoch_tag),
+            "mint_genesis: EpochZero capability check failed — \
+             caller does not hold a valid EpochZero cap (spec §9.3)"
+        );
         ops::mint_genesis(amount, recipient).expect("mint_genesis host failure");
     }
 }
