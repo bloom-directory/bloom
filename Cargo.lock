@@ -2499,6 +2499,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-petal-dex-router"
+version = "0.1.0"
+dependencies = [
+ "bloom-dex-math",
+ "bloom-objects",
+ "bloom-petal-dex-pool",
+ "bloom-resource",
+ "bloom-resource-macros",
+]
+
+[[package]]
 name = "bloom-petal-fungible"
 version = "0.1.0"
 dependencies = [
