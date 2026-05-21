@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(deprecated)]
 //! Integration tests for the `#[storage]` attribute macro.
 //!
 //! The macro generates `load(ctx) -> Result<Self>` and a `SCHEMA` const that

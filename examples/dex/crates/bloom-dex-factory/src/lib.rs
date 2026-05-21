@@ -1,3 +1,8 @@
+#![deprecated(
+    since = "0.2.0",
+    note = "use bloom-resource framework — see docs/specs/2026-05-20-bloom-native-contracts-design.md"
+)]
+#![allow(deprecated)]
 //! bloom-dex-factory — Uniswap-v2-style DEX factory petal.
 //!
 //! Keeps a registry of deployed pair petals and deploys new ones on demand

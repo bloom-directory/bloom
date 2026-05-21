@@ -7,6 +7,7 @@
 //! Mirrors the historical `bloom dex …` subcommand tree.
 
 #![forbid(unsafe_code)]
+#![allow(deprecated)]
 
 use std::path::PathBuf;
 use std::process::ExitCode;

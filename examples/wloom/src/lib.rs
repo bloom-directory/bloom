@@ -1,3 +1,8 @@
+#![deprecated(
+    since = "0.2.0",
+    note = "use bloom-resource framework — see docs/specs/2026-05-20-bloom-native-contracts-design.md"
+)]
+#![allow(deprecated)]
 //! bloom-dex-wloom — Wrapped LOOM (wLOOM) petal for bloom-chain DEX.
 //!
 //! Mirrors WETH9 semantics: wraps native LOOM as an ERC-20 token. Single

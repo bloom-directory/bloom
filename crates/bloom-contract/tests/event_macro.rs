@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(deprecated)]
 //! Integration tests for the `#[event]` attribute macro.
 //!
 //! `Context::emit_raw` panics on the host (its host import is unavailable),

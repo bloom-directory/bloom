@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(deprecated)]
 //! Integration tests for the `#[error]` attribute macro.
 
 use bloom_contract::error::{Error as ErrorTrait, ErrorVariantDescriptor};

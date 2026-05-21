@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(deprecated)]
 //! Integration tests for the `#[bloom::contract]` attribute macro.
 //!
 //! Host-side tests can't actually exercise `__dispatch_call` because the

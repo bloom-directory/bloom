@@ -1,3 +1,8 @@
+#![deprecated(
+    since = "0.2.0",
+    note = "use bloom-resource framework — see docs/specs/2026-05-20-bloom-native-contracts-design.md"
+)]
+#![allow(deprecated)]
 //! bloom-dex-router — stateless Uniswap-v2-style router petal for bloom-chain.
 //!
 //! Phase 7e of the bloom-rust-contracts migration. The router was the last

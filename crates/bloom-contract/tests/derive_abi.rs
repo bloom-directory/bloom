@@ -2,6 +2,8 @@
 //! proc-macros. Lives outside `src/` so the derives can resolve
 //! `::bloom_contract::*` paths via the public crate name.
 
+#![allow(deprecated)]
+
 use bloom_contract::prelude::*;
 
 #[derive(Debug, PartialEq, Eq, AbiEncode, AbiDecode, AbiType)]

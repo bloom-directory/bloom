@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![allow(deprecated)]
 //! Integration tests for the `#[bloom::interface]` attribute macro.
 //!
 //! We can't run `ContractRef::method(ctx, ...)` host-side — `ctx.raw_call`

@@ -1,5 +1,8 @@
 //! Proc-macro entry points for the `bloom-contract` framework.
 //!
+//! **DEPRECATED** since 0.2.0: use the `bloom-resource` framework instead.
+//! See `docs/specs/2026-05-20-bloom-native-contracts-design.md`.
+//!
 //! Phase 1 ships stubs that accept the attribute syntax and pass the input
 //! through unchanged. Each follow-up phase implements the real expansion:
 //!
@@ -21,12 +24,20 @@ mod storage_attr;
 
 /// `#[derive(AbiEncode)]` — sequential field encoding for structs;
 /// discriminant-prefixed encoding for enums.
+#[deprecated(
+    since = "0.2.0",
+    note = "use bloom-resource framework — see docs/specs/2026-05-20-bloom-native-contracts-design.md"
+)]
 #[proc_macro_derive(AbiEncode, attributes(abi))]
 pub fn derive_abi_encode(input: TokenStream) -> TokenStream {
     derives::derive_abi_encode(input)
 }
 
 /// `#[derive(AbiDecode)]` — symmetric counterpart to `AbiEncode`.
+#[deprecated(
+    since = "0.2.0",
+    note = "use bloom-resource framework — see docs/specs/2026-05-20-bloom-native-contracts-design.md"
+)]
 #[proc_macro_derive(AbiDecode, attributes(abi))]
 pub fn derive_abi_decode(input: TokenStream) -> TokenStream {
     derives::derive_abi_decode(input)
@@ -34,6 +45,10 @@ pub fn derive_abi_decode(input: TokenStream) -> TokenStream {
 
 /// `#[derive(AbiType)]` — generates `ABI_TYPE` string + structured schema for
 /// manifest emission.
+#[deprecated(
+    since = "0.2.0",
+    note = "use bloom-resource framework — see docs/specs/2026-05-20-bloom-native-contracts-design.md"
+)]
 #[proc_macro_derive(AbiType, attributes(abi))]
 pub fn derive_abi_type(input: TokenStream) -> TokenStream {
     derives::derive_abi_type(input)
@@ -43,6 +58,10 @@ pub fn derive_abi_type(input: TokenStream) -> TokenStream {
 /// the contract's storage struct, init fn, event types, error enum, and
 /// handler methods. Scans the module body and emits `init` / `call` wasm
 /// exports plus a `__bloom` submodule with the selector table.
+#[deprecated(
+    since = "0.2.0",
+    note = "use bloom-resource framework — see docs/specs/2026-05-20-bloom-native-contracts-design.md"
+)]
 #[proc_macro_attribute]
 pub fn contract(attr: TokenStream, item: TokenStream) -> TokenStream {
     contract::expand(attr, item)
@@ -51,6 +70,10 @@ pub fn contract(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `#[storage]` — placed on the contract's state struct. Generates the
 /// `load(ctx) -> Result<Self>` constructor and a `SCHEMA` constant used by
 /// the build crate at manifest-emission time.
+#[deprecated(
+    since = "0.2.0",
+    note = "use bloom-resource framework — see docs/specs/2026-05-20-bloom-native-contracts-design.md"
+)]
 #[proc_macro_attribute]
 pub fn storage(attr: TokenStream, item: TokenStream) -> TokenStream {
     storage_attr::expand(attr, item)
@@ -59,6 +82,10 @@ pub fn storage(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `#[event]` — placed on an event struct. Derives `AbiEncode`/`AbiDecode`/
 /// `AbiType`, emits the `TOPIC0` constant (compile-time blake3 of the event
 /// signature), and generates `emit(&self, ctx)` for the hot path.
+#[deprecated(
+    since = "0.2.0",
+    note = "use bloom-resource framework — see docs/specs/2026-05-20-bloom-native-contracts-design.md"
+)]
 #[proc_macro_attribute]
 pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
     event_attr::expand(attr, item)
@@ -68,12 +95,20 @@ pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `bloom_contract::error::Error`, derives per-variant 4-byte selectors
 /// (compile-time blake3), and exposes a `VARIANTS` const for manifest
 /// emission.
+#[deprecated(
+    since = "0.2.0",
+    note = "use bloom-resource framework — see docs/specs/2026-05-20-bloom-native-contracts-design.md"
+)]
 #[proc_macro_attribute]
 pub fn error(attr: TokenStream, item: TokenStream) -> TokenStream {
     error_attr::expand(attr, item)
 }
 
 /// `#[init]` — placed on the contract's initialiser. Phase 1 stub.
+#[deprecated(
+    since = "0.2.0",
+    note = "use bloom-resource framework — see docs/specs/2026-05-20-bloom-native-contracts-design.md"
+)]
 #[proc_macro_attribute]
 pub fn init(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
@@ -83,6 +118,10 @@ pub fn init(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// cross-contract ABI surface. Emits selector constants, an
 /// `InterfaceMethod` descriptor table, and a typed
 /// `ContractRef<Trait>` inherent impl for cross-contract calls.
+#[deprecated(
+    since = "0.2.0",
+    note = "use bloom-resource framework — see docs/specs/2026-05-20-bloom-native-contracts-design.md"
+)]
 #[proc_macro_attribute]
 pub fn interface(attr: TokenStream, item: TokenStream) -> TokenStream {
     interface_attr::expand(attr, item)

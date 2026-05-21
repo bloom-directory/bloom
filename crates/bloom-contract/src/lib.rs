@@ -1,5 +1,8 @@
 //! bloom-contract — Solana/Anchor-style Rust framework for Bloom petals.
 //!
+//! **DEPRECATED** since 0.2.0: use the `bloom-resource` framework instead.
+//! See `docs/specs/2026-05-20-bloom-native-contracts-design.md`.
+//!
 //! This crate is the public runtime surface that `#[bloom::contract]` modules
 //! depend on. It re-exports the canonical types ([`Address`], [`Hash32`],
 //! [`U256`]) and the user-facing primitives (storage handles, ABI traits,
@@ -18,6 +21,11 @@
 //! feature unlocks formatting/debug helpers.
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![deprecated(
+    since = "0.2.0",
+    note = "use bloom-resource framework — see docs/specs/2026-05-20-bloom-native-contracts-design.md"
+)]
+#![allow(deprecated)] // this crate IS the deprecated framework; silence internal cascades
 
 extern crate alloc;
 

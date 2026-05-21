@@ -1,4 +1,9 @@
 #![allow(clippy::too_many_arguments)]
+#![deprecated(
+    since = "0.2.0",
+    note = "use bloom-resource framework — see docs/specs/2026-05-20-bloom-native-contracts-design.md"
+)]
+#![allow(deprecated)]
 //! `bloom dex ...` — DEX subcommand tree (v0 acceptance demo driver).
 //!
 //! High-level glue around `bloom chain deploy` + `bloom chain call`. These

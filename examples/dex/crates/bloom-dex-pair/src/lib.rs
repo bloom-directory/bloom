@@ -1,3 +1,8 @@
+#![deprecated(
+    since = "0.2.0",
+    note = "use bloom-resource framework — see docs/specs/2026-05-20-bloom-native-contracts-design.md"
+)]
+#![allow(deprecated)]
 //! bloom-dex-pair — Uniswap-v2-style AMM pair petal.
 //!
 //! The pair is both the AMM and its own LP token (ERC-20 surface inlined into

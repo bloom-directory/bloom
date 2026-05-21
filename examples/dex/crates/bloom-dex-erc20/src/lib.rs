@@ -1,3 +1,8 @@
+#![deprecated(
+    since = "0.2.0",
+    note = "use bloom-resource framework — see docs/specs/2026-05-20-bloom-native-contracts-design.md"
+)]
+#![allow(deprecated)]
 //! bloom-dex-erc20 — ERC-20 fungible token, written against the
 //! `bloom-contract` framework.
 //!
