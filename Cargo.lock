@@ -2481,6 +2481,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-petal-it"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "bloom-chain-node",
+ "bloom-chain-state",
+ "bloom-chain-types",
+ "bloom-objects",
+ "bloom-petal-fungible",
+ "bloom-petals",
+ "bloom-resource",
+ "bloom-script",
+ "tracing-subscriber",
+ "wat",
+]
+
+[[package]]
 name = "bloom-petal-sdk"
 version = "0.1.0"
 dependencies = [

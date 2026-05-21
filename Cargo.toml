@@ -38,6 +38,7 @@ members = [
   "crates/bloom-contract-build",
   "crates/bloom-client-codegen",
   "crates/bloom-test-util",
+  "crates/bloom-petal-it",
   # ---- example apps (not part of the protocol) ----
   "examples/wloom",
   "examples/dex/crates/bloom-dex-erc20",
