@@ -2489,6 +2489,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-petal-dex-it"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "bloom-chain-node",
+ "bloom-chain-state",
+ "bloom-chain-types",
+ "bloom-dex-math",
+ "bloom-objects",
+ "bloom-petal-fungible",
+ "bloom-resource",
+ "bloom-script",
+ "tracing-subscriber",
+ "wat",
+]
+
+[[package]]
 name = "bloom-petal-dex-pool"
 version = "0.1.0"
 dependencies = [

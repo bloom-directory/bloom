@@ -43,6 +43,7 @@ members = [
   "crates/bloom-petal-dex-cpmm",
   "crates/bloom-petal-dex-pool",
   "crates/bloom-petal-dex-router",
+  "crates/bloom-petal-dex-it",
   # ---- example apps (not part of the protocol) ----
   "examples/wloom",
   "examples/dex/crates/bloom-dex-erc20",

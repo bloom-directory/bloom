@@ -1,0 +1,26 @@
+[package]
+name = "bloom-petal-dex-it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Integration tests for the bloom DEX petal suite (pool + cpmm + router)"
+publish = false
+
+[dependencies]
+bloom-chain-node  = { path = "../bloom-chain-node" }
+bloom-chain-state = { path = "../bloom-chain-state" }
+bloom-chain-types = { path = "../bloom-chain-types" }
+bloom-objects     = { path = "../bloom-objects" }
+bloom-script      = { path = "../bloom-script" }
+bloom-resource    = { path = "../bloom-resource" }
+bloom-petal-fungible = { path = "../bloom-petal-fungible" }
+bloom-dex-math    = { path = "../bloom-dex-math" }
+blake3            = "1"
+anyhow            = "1"
+wat               = "1"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[lints.rust]
+unsafe_code = "forbid"
