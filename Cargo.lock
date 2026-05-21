@@ -2282,6 +2282,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-dex-math"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bloom-dex-pair"
 version = "0.1.0"
 dependencies = [
