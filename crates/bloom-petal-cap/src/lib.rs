@@ -85,7 +85,7 @@ pub fn is_active_logic(
 pub mod cap {
     use super::*;
     use bloom_objects::{Owner, TypeTag};
-    use bloom_resource::{ArgReader, Capability, RetWriter, Signer, UID, host};
+    use bloom_resource::{ArgReader, Capability, RetWriter, RuntimeHandle, Signer, UID, host};
     // Re-export the attribute-style proc-macros under unqualified names
     // so the petal macro's `attr.path().is_ident("object")` matcher
     // recognizes them. (It currently only matches single-segment paths;
@@ -116,6 +116,11 @@ pub mod cap {
         expires_at_block: u64,
         /// Set by [`revoke`] — once true the cap is permanently inactive.
         revoked: bool,
+        /// Runtime borrow-table handle assigned by `host::object_create`.
+        /// Populated in [`new`] and threaded through to every subsequent
+        /// host call so we never need the `INVALID` sentinel fallback.
+        #[allow(dead_code)]
+        handle: RuntimeHandle,
         _marker: PhantomData<T>,
     }
 
@@ -130,6 +135,10 @@ pub mod cap {
         /// the manifest but unused inside the petal body.
         #[allow(dead_code)]
         id: UID,
+        /// Runtime borrow-table handle for this RevokeCap, assigned by
+        /// `host::object_create` in [`new`].
+        #[allow(dead_code)]
+        handle: RuntimeHandle,
         _marker: PhantomData<T>,
     }
 
@@ -158,21 +167,18 @@ pub mod cap {
                 inner_kind: INNER_KIND_OPEN,
                 expires_at_block: 0,
                 revoked: false,
+                // Thread the runtime-allocated handle into the struct so
+                // transfer/destroy/push_cap_payload can use it directly
+                // without falling back to INVALID.
+                handle: cap_handle,
                 _marker: PhantomData,
             },
             RevokeCap {
                 id: UID::from_bytes([0u8; 32]),
+                handle: rev_handle,
                 _marker: PhantomData,
             },
         )
-        .pipe(|tup| {
-            // Borrow-table side effect: leave both handles attached to
-            // the host borrow table so the executor can transfer them
-            // back to the signer or thread them into a subsequent PTB
-            // command. The user-facing return shape is the typed pair.
-            let _ = (cap_handle, rev_handle);
-            tup
-        })
     }
 
     // -----------------------------------------------------------------
@@ -231,19 +237,16 @@ pub mod cap {
     /// the petal-side wrapper; the chain rewrites the owner row in the
     /// object store.
     pub fn transfer<T>(cap: Cap<T>, to: Address) {
-        // Re-borrow the cap to push its current payload (no-op in
-        // practice; the executor already holds the latest state), then
-        // hand it off.
-        let handle = lookup_cap_handle::<T>(&cap);
-        let _ = host::object_transfer(handle, &Owner::Address(to));
+        // Use the runtime handle stored in the cap struct — populated by
+        // `new` from the `host::object_create` return value.
+        let _ = host::object_transfer(cap.handle, &Owner::Address(to));
     }
 
     /// Permanently delete the cap. The `RevokeCap<T>` is *not* deleted
     /// — issuers who want to fully wipe out a delegation should also
     /// `destroy` the revoke cap.
     pub fn destroy<T>(cap: Cap<T>) {
-        let handle = lookup_cap_handle::<T>(&cap);
-        let _ = host::object_delete(handle);
+        let _ = host::object_delete(cap.handle);
     }
 
     // -----------------------------------------------------------------
@@ -315,44 +318,14 @@ pub mod cap {
         host::object_create(&revoke_cap_type_tag(), &[])
     }
 
-    /// Look up the borrow-table handle the executor assigned to this
-    /// `Cap<T>` argument.
-    ///
-    /// In v0 the executor passes the handle out-of-band via the
-    /// borrow table, not as a field on `Cap<T>`. We retrieve it from
-    /// the cap's `id` if and when the on-chain `id_to_handle` index
-    /// lands; until then we fall back to `INVALID` so a clippy-clean
-    /// stub compiles. TODO(spec §8.2 follow-up): wire
-    /// `object_borrow(id, mode)` into the petal body once the
-    /// macro-emitted shim hands us the handle directly.
-    fn lookup_cap_handle<T>(_cap: &Cap<T>) -> bloom_resource::RuntimeHandle {
-        bloom_resource::RuntimeHandle::INVALID
-    }
-
     /// Push the cap's current Rust-side fields into the borrow-table
     /// payload via `object.mutate`. The user-visible wrapper for every
     /// `&mut Cap<T>` mutation routes through here.
     fn push_cap_payload<T>(cap: &Cap<T>) {
         let payload = encode_cap_payload(cap.inner_kind, cap.expires_at_block, cap.revoked);
-        let handle = lookup_cap_handle::<T>(cap);
-        let _ = host::object_mutate(handle, &payload);
+        let _ = host::object_mutate(cap.handle, &payload);
     }
 
-    // -----------------------------------------------------------------
-    // Tiny tuple-pipe shim — avoids `tap` as a dep
-    // -----------------------------------------------------------------
-
-    trait Pipe {
-        fn pipe<F, R>(self, f: F) -> R
-        where
-            F: FnOnce(Self) -> R,
-            Self: Sized,
-        {
-            f(self)
-        }
-    }
-
-    impl<T> Pipe for T {}
 }
 
 // The `#[bloom::petal]` macro re-emits the module body unchanged
