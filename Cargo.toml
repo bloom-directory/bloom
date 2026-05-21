@@ -40,11 +40,6 @@ members = [
   "crates/bloom-client-codegen",
   "crates/bloom-test-util",
   "crates/bloom-petal-it",
-  "crates/bloom-dex-math",
-  "crates/bloom-petal-dex-cpmm",
-  "crates/bloom-petal-dex-pool",
-  "crates/bloom-petal-dex-router",
-  "crates/bloom-petal-dex-it",
   # ---- example apps (not part of the protocol) ----
   "examples/wloom",
   "examples/dex/crates/bloom-dex-erc20",
@@ -53,6 +48,11 @@ members = [
   "examples/dex/crates/bloom-dex-router",
   "examples/dex/crates/bloom-dex-cli",
   "examples/dex/tests/bloom-dex-it",
+  "examples/petal-dex/crates/bloom-dex-math",
+  "examples/petal-dex/crates/bloom-petal-dex-cpmm",
+  "examples/petal-dex/crates/bloom-petal-dex-pool",
+  "examples/petal-dex/crates/bloom-petal-dex-router",
+  "examples/petal-dex/tests/bloom-petal-dex-it",
 ]
 resolver = "2"
 
@@ -139,10 +139,6 @@ bloom-petal-manifest = { path = "crates/bloom-petal-manifest" }
 bloom-script      = { path = "crates/bloom-script" }
 bloom-petal-fungible = { path = "crates/bloom-petal-fungible", version = "0.1.0" }
 bloom-petal-cap   = { path = "crates/bloom-petal-cap", version = "0.1.0" }
-bloom-dex-math    = { path = "crates/bloom-dex-math" }
-bloom-petal-dex-cpmm = { path = "crates/bloom-petal-dex-cpmm", version = "0.1.0" }
-bloom-petal-dex-pool = { path = "crates/bloom-petal-dex-pool" }
-bloom-petal-dex-router = { path = "crates/bloom-petal-dex-router" }
 bloom-contract    = { path = "crates/bloom-contract", default-features = false }
 bloom-contract-macros = { path = "crates/bloom-contract-macros" }
 bloom-contract-metadata = { path = "crates/bloom-contract-metadata" }
@@ -151,6 +147,11 @@ bloom-client-codegen = { path = "crates/bloom-client-codegen" }
 # ---- example DEX crates (not part of the protocol) ----
 bloom-dex-factory = { path = "examples/dex/crates/bloom-dex-factory" }
 bloom-dex-pair    = { path = "examples/dex/crates/bloom-dex-pair" }
+# ---- example petal DEX crates (not part of the protocol) ----
+bloom-dex-math    = { path = "examples/petal-dex/crates/bloom-dex-math" }
+bloom-petal-dex-cpmm = { path = "examples/petal-dex/crates/bloom-petal-dex-cpmm", version = "0.1.0" }
+bloom-petal-dex-pool = { path = "examples/petal-dex/crates/bloom-petal-dex-pool" }
+bloom-petal-dex-router = { path = "examples/petal-dex/crates/bloom-petal-dex-router" }
 
 [profile.release]
 lto = "thin"
