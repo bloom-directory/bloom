@@ -27,7 +27,8 @@ use bloom_chain_types::{
     tx::{Tx, TxKind},
     types::{Address, Hash32},
 };
-use bloom_objects::OwnershipIndexKey;
+use bloom_objects::{Object, ObjectId, Owner, OwnershipIndexKey, OWNER_KIND_ADDRESS};
+use bloom_petal_fungible::ops::{coin_payload, type_tag_coin_loom};
 use bloom_petals::{BlockCtx as PetalBlockCtx, ChainCallInput, ChainEntry, PetalVm};
 use bloom_script::{
     executor::{LogEntry as PtbLogEntry, PtbExecutor},
@@ -38,6 +39,7 @@ use bloom_script::{
 use tracing::warn;
 
 use crate::chain_petal_runner::ChainPetalRunner;
+use crate::coin_select::select_coin_loom;
 use crate::consensus_driver::{ExecOutput, PetalExecutor, empty_account};
 use crate::ptb_chain_iface::PtbChainAdapter;
 
@@ -296,6 +298,25 @@ fn execute_tx_impl(
                 let mut to_acct = snap.get_account(to).unwrap_or_else(empty_account);
                 to_acct.loom += amount_loom;
                 snap.set_account(*to, to_acct);
+
+                // ── PTB compat shim ─────────────────────────────────────────
+                // Keep Coin<LOOM> objects in sync with the Account.loom update.
+                // If select_coin_loom returns Insufficient we warn and continue
+                // (legacy Account.loom is the authoritative source of truth in
+                // Phase 2/3; Phase 4 removal will tighten this).
+                //
+                // TODO(phase4): make Coin<LOOM> insufficient a hard revert once
+                // the legacy Account.loom path is removed.
+                if *amount_loom > 0 {
+                    apply_coin_loom_transfer(
+                        &mut snap,
+                        tx.sender,
+                        *to,
+                        *amount_loom,
+                        &tx.tx_hash(),
+                    );
+                }
+
                 let ws = snap.commit();
                 ExecOutput {
                     success: true,
@@ -422,6 +443,15 @@ fn execute_tx_impl(
                             let mut to_acct = snap.get_account(to).unwrap_or_else(empty_account);
                             to_acct.loom += value_loom;
                             snap.set_account(*to, to_acct);
+
+                            // PTB compat shim: keep Coin<LOOM> objects in sync.
+                            apply_coin_loom_transfer(
+                                &mut snap,
+                                tx.sender,
+                                *to,
+                                *value_loom,
+                                &tx.tx_hash(),
+                            );
                         }
                         return ExecOutput {
                             success: true,
@@ -439,6 +469,17 @@ fn execute_tx_impl(
                     let mut to_acct = snap.get_account(to).unwrap_or_else(empty_account);
                     to_acct.loom += value_loom;
                     snap.set_account(*to, to_acct);
+
+                    // PTB compat shim: keep Coin<LOOM> objects in sync.
+                    // This runs BEFORE the VM call so the Coin<LOOM> credit
+                    // and Account.loom credit land together in the writeset.
+                    apply_coin_loom_transfer(
+                        &mut snap,
+                        tx.sender,
+                        *to,
+                        *value_loom,
+                        &tx.tx_hash(),
+                    );
                 }
 
                 let input = ChainCallInput {
@@ -708,6 +749,99 @@ fn execute_tx_impl(
                 }
             }
         }
+}
+
+/// PTB compat shim: adjust Coin<LOOM> objects to match a legacy
+/// `Account.loom` debit/credit pair.
+///
+/// Steps:
+/// 1. Call `select_coin_loom` to pick sender coins.
+/// 2. Delete consumed coins from the snapshot; shrink the split remainder.
+/// 3. Mint a new `Coin<LOOM>` owned by `to` with value `amount`.
+/// 4. Update ownership indices for both `sender` and `to`.
+///
+/// If `sender` lacks sufficient `Coin<LOOM>` (e.g. the coins are already
+/// diverged from `Account.loom`), this logs a warning and returns
+/// without modifying the object world. The `Account.loom` update in the
+/// caller is the source of truth and proceeds regardless.
+///
+/// TODO(phase4): tighten to a hard revert once the legacy Account.loom
+/// path is removed.
+fn apply_coin_loom_transfer(
+    snap: &mut bloom_chain_state::StateSnapshot,
+    sender: Address,
+    to: Address,
+    amount: u128,
+    tx_hash: &Hash32,
+) {
+    use crate::coin_select::CoinSelection;
+
+    let coin_type = type_tag_coin_loom();
+
+    // 1. Select sender coins.
+    let selection: CoinSelection = match select_coin_loom(snap, sender, amount) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                sender = %hex::encode(sender.0),
+                to = %hex::encode(to.0),
+                amount = amount,
+                err = %e,
+                "legacy Transfer/Call Coin<LOOM> state diverged — \
+                 Account.loom updated but Coin<LOOM> objects unchanged; \
+                 TODO(phase4): remove legacy Account.loom path"
+            );
+            return;
+        }
+    };
+
+    // 2a. Delete fully-consumed coins and remove from sender's ownership index.
+    let sender_okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: sender.0 };
+    let mut sender_owned = snap.get_ownership(&sender_okey).unwrap_or_default();
+    for id in &selection.consumed {
+        snap.delete_object(*id);
+        sender_owned.retain(|x| x != id);
+    }
+
+    // 2b. If last coin is split: update its payload to the remainder value.
+    if let Some((id, new_value)) = selection.split_remainder
+        && let Some(mut obj) = snap.get_object(&id)
+    {
+        obj.payload = coin_payload(new_value);
+        obj.version += 1;
+        snap.insert_object(obj);
+        // The split coin stays in sender_owned — we keep it.
+    }
+
+    snap.set_ownership(sender_okey, sender_owned);
+
+    // 3. Mint a new Coin<LOOM> owned by `to`.
+    //
+    // Deterministic ObjectId: blake3("bloom.legacy.transfer" || tx_hash)
+    // Each Transfer tx is 1-to-1 with exactly one mint, so the tx hash
+    // as the sole input is collision-free across distinct txs.
+    let new_coin_id = {
+        let mut h = blake3::Hasher::new();
+        h.update(b"bloom.legacy.transfer");
+        h.update(&tx_hash.0);
+        ObjectId(*h.finalize().as_bytes())
+    };
+
+    let new_coin = Object {
+        id: new_coin_id,
+        type_tag: coin_type,
+        owner: Owner::Address(to.0),
+        version: 0,
+        payload: coin_payload(amount),
+    };
+    snap.insert_object(new_coin);
+
+    // 4. Update ownership index for `to`.
+    let to_okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: to.0 };
+    let mut to_owned = snap.get_ownership(&to_okey).unwrap_or_default();
+    let pos = to_owned.partition_point(|id| id.0 < new_coin_id.0);
+    to_owned.insert(pos, new_coin_id);
+    snap.set_ownership(to_okey, to_owned);
 }
 
 // suppress unused-import lints when Account isn't needed in some configs
