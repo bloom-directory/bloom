@@ -25,6 +25,7 @@
 #![forbid(unsafe_code)]
 
 pub mod block_store;
+pub mod chain_petal_runner;
 pub mod consensus_driver;
 pub mod error;
 pub mod genesis;

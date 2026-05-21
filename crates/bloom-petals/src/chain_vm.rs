@@ -2283,7 +2283,7 @@ mod ptb_host_import_tests {
     use bloom_chain_state::State;
     use bloom_chain_types::Address;
     use bloom_objects::{AccessMode, Object, ObjectId, Owner, TypeTag};
-    use bloom_script::{BorrowRow, host_ctx::PtbHostCtx};
+    use bloom_script::host_ctx::PtbHostCtx;
     use std::sync::{Arc, Mutex};
 
     fn parse(src: &str) -> Vec<u8> {
