@@ -120,6 +120,23 @@ pub fn seed_coin(state: &mut State, id: ObjectId, owner: Address, value: u128) {
 // ---------------------------------------------------------------------------
 
 /// Wrap `ptb` as a `TxKind::SubmitPtb` transaction, drive it through
+/// the `ChainPetalExecutorWithManifests` executor with an **empty**
+/// override map (so `PtbChainAdapter::load_manifest` falls through to
+/// the wasm custom-section path — the production manifest source —
+/// for every petal hash), apply the write set on success, and return
+/// the `ExecOutput`.
+///
+/// See `bloom-petal-it`'s `submit_ptb_chain_auth` doc-comment for
+/// rationale; this is a verbatim DEX-side mirror.
+pub fn submit_ptb_chain_auth(
+    state: &mut State,
+    sender: Address,
+    ptb: PtbTx,
+) -> ExecOutput {
+    submit_ptb(state, sender, ptb, HashMap::new())
+}
+
+/// Wrap `ptb` as a `TxKind::SubmitPtb` transaction, drive it through
 /// `ChainPetalExecutorWithManifests`, **apply the write set on success**,
 /// and return the `ExecOutput`.
 pub fn submit_ptb(
@@ -166,6 +183,68 @@ pub fn submit_ptb(
 /// Parse a WAT source string into wasm bytes. Panics on malformed WAT.
 pub fn wat_to_wasm(src: &str) -> Vec<u8> {
     wat::parse_str(src).expect("valid WAT")
+}
+
+/// Append a `bloom_petal_manifest_v0` custom section carrying
+/// `manifest_bytes` to `wasm`. See [`crate::dex_harness`] / the
+/// `bloom-petal-it` mirror for the rationale: this pairs a real,
+/// chain-authoritative manifest (as the macro emits into the wasm
+/// custom section) with a hand-written WAT body so tests don't need
+/// `wasm32-unknown-unknown` at compile time.
+pub fn append_manifest_section(mut wasm: Vec<u8>, manifest_bytes: &[u8]) -> Vec<u8> {
+    let name = "bloom_petal_manifest_v0";
+    let mut body = Vec::new();
+    leb128(&mut body, name.len() as u64);
+    body.extend_from_slice(name.as_bytes());
+    body.extend_from_slice(manifest_bytes);
+    wasm.push(0x00);
+    leb128(&mut wasm, body.len() as u64);
+    wasm.extend_from_slice(&body);
+    wasm
+}
+
+/// Convenience: compile `wat_src` and append the
+/// `bloom_petal_manifest_v0` custom section in one call.
+pub fn wrap_with_real_manifest(wat_src: &str, manifest_bytes: &[u8]) -> Vec<u8> {
+    let base = wat_to_wasm(wat_src);
+    append_manifest_section(base, manifest_bytes)
+}
+
+fn leb128(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(b);
+            return;
+        } else {
+            out.push(b | 0x80);
+        }
+    }
+}
+
+/// The canonical-encoded `PetalManifestV0` bytes embedded in the real
+/// `/bloom/core/fungible` petal.
+pub fn real_fungible_manifest_bytes() -> &'static [u8] {
+    bloom_petal_fungible::fungible::__bloom_manifest_bytes()
+}
+
+/// Canonical `PetalManifestV0` bytes embedded in the real
+/// `/bloom/dex/pool` petal.
+pub fn real_pool_manifest_bytes() -> &'static [u8] {
+    bloom_petal_dex_pool::pool::__bloom_manifest_bytes()
+}
+
+/// Canonical `PetalManifestV0` bytes embedded in the real
+/// `/bloom/dex/strategy/cpmm` petal.
+pub fn real_cpmm_manifest_bytes() -> &'static [u8] {
+    bloom_petal_dex_cpmm::cpmm::__bloom_manifest_bytes()
+}
+
+/// Canonical `PetalManifestV0` bytes embedded in the real
+/// `/bloom/dex/router` petal.
+pub fn real_router_manifest_bytes() -> &'static [u8] {
+    bloom_petal_dex_router::router::__bloom_manifest_bytes()
 }
 
 // ---------------------------------------------------------------------------

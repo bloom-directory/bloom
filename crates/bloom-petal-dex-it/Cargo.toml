@@ -7,17 +7,21 @@ description = "Integration tests for the bloom DEX petal suite (pool + cpmm + ro
 publish = false
 
 [dependencies]
-bloom-chain-node  = { path = "../bloom-chain-node" }
-bloom-chain-state = { path = "../bloom-chain-state" }
-bloom-chain-types = { path = "../bloom-chain-types" }
-bloom-objects     = { path = "../bloom-objects" }
-bloom-script      = { path = "../bloom-script" }
-bloom-resource    = { path = "../bloom-resource" }
+bloom-chain-node     = { path = "../bloom-chain-node" }
+bloom-chain-state    = { path = "../bloom-chain-state" }
+bloom-chain-types    = { path = "../bloom-chain-types" }
+bloom-objects        = { path = "../bloom-objects" }
+bloom-script         = { path = "../bloom-script" }
+bloom-resource       = { path = "../bloom-resource" }
 bloom-petal-fungible = { path = "../bloom-petal-fungible" }
-bloom-dex-math    = { path = "../bloom-dex-math" }
-blake3            = "1"
-anyhow            = "1"
-wat               = "1"
+bloom-petal-manifest = { path = "../bloom-petal-manifest" }
+bloom-petal-dex-pool   = { path = "../bloom-petal-dex-pool",   features = ["no-entrypoint"] }
+bloom-petal-dex-cpmm   = { path = "../bloom-petal-dex-cpmm",   features = ["no-entrypoint"] }
+bloom-petal-dex-router = { path = "../bloom-petal-dex-router", features = ["no-entrypoint"] }
+bloom-dex-math       = { path = "../bloom-dex-math" }
+blake3               = "1"
+anyhow               = "1"
+wat                  = "1"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

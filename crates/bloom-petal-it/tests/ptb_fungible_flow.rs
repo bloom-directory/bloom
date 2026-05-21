@@ -238,25 +238,81 @@ fn smoke_ptb_log_emit_succeeds() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3 (ignored): Full fungible-petal wasm split+transfer.
+// Test 3: Chain-authoritative manifest typecheck end-to-end.
 //
-// PREREQUISITE: run
-//   cargo build -p bloom-petal-fungible --target wasm32-unknown-unknown --release
-// so that the wasm binary exists at
-//   target/wasm32-unknown-unknown/release/bloom_petal_fungible.wasm
-// relative to the workspace root. Without that binary this test will panic
-// on the assert below.
+// Previously `#[ignore]`d pending `wasm32-unknown-unknown` + a pre-built
+// fungible petal wasm. With `wrap_with_real_manifest` we now pair a tiny
+// WAT body (no wasm32 toolchain required) with the **real** canonical
+// `PetalManifestV0` bytes the macro emits for `/bloom/core/fungible` —
+// the validator sees the same chain-authoritative manifest the
+// production node would extract from the real petal's wasm custom
+// section. This exercises `PtbChainAdapter::load_manifest`'s layer-2
+// (wasm custom-section parse + project) path.
+//
+// We invoke `value<LOOM>(&alice_coin)` — a simple read-only function
+// from the real fungible manifest — to assert:
+//   1. The validator finds `value` in the real manifest.
+//   2. Type-arg substitution turns the manifest's `Coin<T>` arg into
+//      `Coin<LOOM>` and matches against `alice_coin.type_tag`.
+//   3. The PTB executes end-to-end without revert.
 // ---------------------------------------------------------------------------
 
+use bloom_petal_it::harness::{real_fungible_manifest_bytes, submit_ptb_chain_auth, wrap_with_real_manifest};
+use bloom_objects::TypeTag;
+
 #[test]
-#[ignore = "requires pre-built bloom_petal_fungible.wasm (cargo build -p bloom-petal-fungible --target wasm32-unknown-unknown --release)"]
-fn full_fungible_petal_split_and_transfer() {
-    let wasm_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/wasm32-unknown-unknown/release/bloom_petal_fungible.wasm");
+fn fungible_value_call_typechecks_against_real_manifest() {
+    let alice = addr(0xA1);
+    let mut state = build_state(&[(alice, 1000)]);
+    let alice_coin_id = genesis_coin_id(alice, 0);
+
+    // WAT body: export `__petal_value` as a noop (returns 0). The
+    // validator only sees the manifest, so the WAT body content
+    // doesn't matter for this typecheck — we just need an exported
+    // function the executor can dispatch into.
+    let wat = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "__petal_value") (param i32 i32) (result i32)
+    i32.const 0)
+)
+"#;
+    let wasm = wrap_with_real_manifest(wat, real_fungible_manifest_bytes());
+    let petal_hash = state.insert_code(&wasm);
+    state.set_vfs_binding("/bloom/core/fungible".to_string(), petal_hash);
+
+    // `value<T>(coin: &Coin<T>)` → manifest declares one Object arg with
+    // type `Coin<Generic{0}>`, mode ReadOnly. We call with type_args=[LOOM]
+    // so the substituted expected type is `Coin<LOOM>` — alice's coin.
+    let loom_tag = TypeTag::Concrete {
+        petal_hash: [0u8; 32],
+        type_name: "LOOM".to_string(),
+        type_args: vec![],
+    };
+
+    let ptb = PtbTx {
+        signers: vec![alice.0],
+        commands: vec![Command::Move(MoveCmd {
+            petal: PetalRef { path: String::new(), hash: Some(petal_hash) },
+            function: "value".to_string(),
+            type_args: vec![loom_tag],
+            args: vec![Arg::Object {
+                id: alice_coin_id,
+                expected_version: ExpectedVersion(0),
+                access_mode: AccessMode::ReadOnly,
+            }],
+        })],
+        gas_payer: alice_coin_id,
+        gas_budget: 200_000,
+        gas_price: 0,
+        expiry_block: 100,
+        signatures: vec![PqSignature(vec![0u8; 64])],
+    };
+
+    let out = submit_ptb_chain_auth(&mut state, alice, ptb);
     assert!(
-        wasm_path.exists(),
-        "wasm not found at {}; run cargo build -p bloom-petal-fungible --target wasm32-unknown-unknown --release first",
-        wasm_path.display()
+        out.success,
+        "value<LOOM>(&alice_coin) against real manifest must typecheck and run; revert: {}",
+        String::from_utf8_lossy(&out.return_data)
     );
-    // Full test implementation would use the wasm bytes here.
 }

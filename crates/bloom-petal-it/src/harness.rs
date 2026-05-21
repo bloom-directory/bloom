@@ -131,6 +131,40 @@ pub fn seed_coin(state: &mut State, id: ObjectId, owner: Address, value: u128) {
 // ---------------------------------------------------------------------------
 
 /// Wrap `ptb` as a `TxKind::SubmitPtb` transaction, drive it through
+/// the `ChainPetalExecutorWithManifests` executor with an **empty**
+/// override map, apply the write set on success, and return the
+/// `ExecOutput`.
+///
+/// "Chain-authoritative" here means the manifest is decoded entirely
+/// from the `bloom_petal_manifest_v0` custom section of each petal's
+/// on-chain wasm bytes (layer 2 of `PtbChainAdapter::load_manifest`),
+/// exactly like the production node — the empty override map
+/// short-circuits layer 1. This pairs well with
+/// [`wrap_with_real_manifest`], which compiles a WAT body and
+/// appends the real macro-emitted canonical manifest bytes.
+///
+/// Note: this still uses the test-only `AlwaysOkVerifier` for PTB
+/// signatures (the production verifier requires real Ed25519
+/// signatures; constructing valid post-quantum sigs in a test fixture
+/// is out of scope for these integration tests, and signature
+/// verification has its own coverage in
+/// `crates/bloom-chain-node/tests/ptb_signature_rejection.rs`).
+///
+/// `state` is mutated in-place when the tx succeeds. On revert the
+/// state is unchanged (atomic).
+pub fn submit_ptb_chain_auth(
+    state: &mut State,
+    sender: Address,
+    ptb: PtbTx,
+) -> ExecOutput {
+    // Empty override map → PtbChainAdapter falls through to the
+    // wasm custom-section path for every petal hash. The executor's
+    // signature verifier is the test-only `AlwaysOkVerifier`, which
+    // matches the manifest-only flavour of other tests in this crate.
+    submit_ptb(state, sender, ptb, HashMap::new())
+}
+
+/// Wrap `ptb` as a `TxKind::SubmitPtb` transaction, drive it through
 /// `ChainPetalExecutorWithManifests` (using `manifests` for Move-command
 /// typechecks), **apply the write set on success**, and return the
 /// `ExecOutput`.
@@ -182,6 +216,63 @@ pub fn submit_ptb(
 /// every fixture in this crate is statically valid.
 pub fn wat_to_wasm(src: &str) -> Vec<u8> {
     wat::parse_str(src).expect("valid WAT")
+}
+
+/// Append a `bloom_petal_manifest_v0` custom section carrying
+/// `manifest_bytes` to `wasm`. The caller is expected to pass canonical
+/// manifest bytes — typically the output of one of the real petals'
+/// macro-emitted `__bloom_manifest_bytes()` accessors.
+///
+/// This gives integration tests a "best of both worlds" fixture: a
+/// chain-authoritative manifest (decoded by `PtbChainAdapter::new` via
+/// the wasm custom-section path, identical to production), paired with
+/// a hand-written WAT body that emulates the wasm-side `__petal_<fn>`
+/// exports without needing a `wasm32-unknown-unknown` toolchain at test
+/// time.
+///
+/// The append is byte-level (matches the `wasm_with_custom` helper used
+/// in `bloom-chain-node`'s adapter tests); we don't re-parse the wasm.
+pub fn append_manifest_section(mut wasm: Vec<u8>, manifest_bytes: &[u8]) -> Vec<u8> {
+    let name = "bloom_petal_manifest_v0";
+    // Body = name_len (LEB128) | name | payload.
+    let mut body = Vec::new();
+    leb128(&mut body, name.len() as u64);
+    body.extend_from_slice(name.as_bytes());
+    body.extend_from_slice(manifest_bytes);
+    // Section: id 0 (custom) | LEB128 body_len | body.
+    wasm.push(0x00);
+    leb128(&mut wasm, body.len() as u64);
+    wasm.extend_from_slice(&body);
+    wasm
+}
+
+/// Convenience: compile `wat_src` and append the
+/// `bloom_petal_manifest_v0` custom section in one call.
+pub fn wrap_with_real_manifest(wat_src: &str, manifest_bytes: &[u8]) -> Vec<u8> {
+    let base = wat_to_wasm(wat_src);
+    append_manifest_section(base, manifest_bytes)
+}
+
+fn leb128(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(b);
+            return;
+        } else {
+            out.push(b | 0x80);
+        }
+    }
+}
+
+/// The canonical-encoded `PetalManifestV0` bytes embedded in the real
+/// `/bloom/core/fungible` petal — i.e. the exact same blob the macro
+/// emits into the wasm `bloom_petal_manifest_v0` custom section. Use
+/// with [`wrap_with_real_manifest`] to build a chain-authoritative
+/// fixture for the fungible petal.
+pub fn real_fungible_manifest_bytes() -> &'static [u8] {
+    bloom_petal_fungible::fungible::__bloom_manifest_bytes()
 }
 
 // ---------------------------------------------------------------------------

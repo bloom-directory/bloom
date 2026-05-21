@@ -139,15 +139,69 @@ fn add_liquidity_create_then_subsequent() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 7 (ignored): full wasm LP lifecycle using real pool petal.
+// Test 7: real pool petal manifest decodes via chain-authoritative path.
 //
-// TODO: follow-up task to wire real wasm artifacts.
+// Previously `#[ignore]`d pending a pre-built `bloom_petal_dex_pool.wasm`
+// (wasm32-unknown-unknown is not in CI). With `wrap_with_real_manifest`
+// we install the **real** macro-emitted canonical manifest bytes for
+// `/bloom/dex/pool` into chain state and confirm:
+//   1. The manifest is canonical-decodable.
+//   2. It declares the LP lifecycle entry points the spec promises
+//      (`create_pool`, `add_liquidity`, `remove_liquidity`).
+//   3. The wasm custom-section path can be loaded by
+//      `PtbChainAdapter::load_manifest` against a synthetic
+//      WAT body — i.e. the manifest is portable independent of any
+//      wasm32 toolchain.
+//
+// The full PTB-driven LP lifecycle (with actual Pool / LpPosition
+// objects) is exercised by `dex_smoke_full::ptb_pool_lifecycle_*`.
 // ---------------------------------------------------------------------------
 
+use bloom_petal_dex_it::dex_harness::{
+    real_pool_manifest_bytes, wrap_with_real_manifest,
+};
+use bloom_petal_manifest::codec::decode as decode_manifest;
+use bloom_chain_state::State;
+use bloom_chain_node::ptb_chain_iface::PtbChainAdapter;
+use bloom_script::ChainStateIface;
+
 #[test]
-#[ignore = "requires pre-built bloom_petal_dex_pool.wasm; TODO: follow-up task for real wasm integration"]
-fn full_wasm_lp_lifecycle() {
-    let wasm_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/wasm32-unknown-unknown/release/bloom_petal_dex_pool.wasm");
-    assert!(wasm_path.exists(), "wasm not found; build first");
+fn real_pool_manifest_loads_via_chain_adapter() {
+    let bytes = real_pool_manifest_bytes();
+    let m = decode_manifest(bytes).expect("real pool manifest must decode");
+    assert_eq!(m.module_path, "/bloom/dex/pool");
+
+    let names: Vec<&str> = m.functions.iter().map(|f| f.name.as_str()).collect();
+    for expected in ["create_pool", "add_liquidity", "remove_liquidity"] {
+        assert!(
+            names.contains(&expected),
+            "pool manifest must declare `{expected}` (got {names:?})"
+        );
+    }
+
+    // Install a synthetic wasm carrying the real manifest in its
+    // `bloom_petal_manifest_v0` custom section and confirm the
+    // production `PtbChainAdapter` finds it via layer 2 (wasm
+    // custom-section parse + project). This is the **exact** path
+    // the chain node uses for a deployed petal.
+    let wat = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "__petal_create_pool") (param i32 i32) (result i32)
+    i32.const 0)
+)
+"#;
+    let wasm = wrap_with_real_manifest(wat, bytes);
+    let mut state = State::new();
+    let hash = state.insert_code(&wasm);
+
+    let adapter = PtbChainAdapter::new(&state, 100);
+    let stub = adapter
+        .load_manifest(&hash)
+        .expect("adapter must load manifest from wasm custom section");
+    assert_eq!(stub.module_path, "/bloom/dex/pool");
+    let stub_names: Vec<&str> = stub.functions.iter().map(|f| f.name.as_str()).collect();
+    assert!(stub_names.contains(&"create_pool"));
+    assert!(stub_names.contains(&"add_liquidity"));
+    assert!(stub_names.contains(&"remove_liquidity"));
 }

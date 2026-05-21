@@ -186,21 +186,71 @@ fn apply_swap_zero_fee_correctness() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 4 (ignored): full wasm single-hop using real bloom-petal-dex-router.
+// Test 4: real DEX cpmm manifest end-to-end via chain-authoritative path.
 //
-// PREREQUISITE: cargo build -p bloom-petal-dex-router --target wasm32-unknown-unknown --release
-// TODO: wire real wasm in a follow-up task once build.rs wasm artifact production is set up.
+// Previously `#[ignore]`d pending a pre-built `bloom_petal_dex_router.wasm`
+// (wasm32-unknown-unknown is not in CI). With `wrap_with_real_manifest`
+// we pair a tiny WAT body with the **real** macro-emitted canonical
+// manifest bytes for `/bloom/dex/strategy/cpmm`, install it in `state`,
+// and invoke the nullary `version()` function. The validator decodes
+// the manifest from the wasm custom section via `PtbChainAdapter`
+// (layer 2, the production path) — identical to what the chain node
+// does for any deployed petal.
+//
+// This proves end-to-end:
+//   1. The cpmm petal's macro-emitted manifest is canonical-decodable.
+//   2. `PtbChainAdapter::load_manifest` finds it via the custom section.
+//   3. Validator typechecks a real petal function call against it.
+//   4. The PTB executes (WAT noop body) without revert.
 // ---------------------------------------------------------------------------
 
+use bloom_petal_dex_it::dex_harness::{
+    real_cpmm_manifest_bytes, submit_ptb_chain_auth, wrap_with_real_manifest,
+};
+
 #[test]
-#[ignore = "requires pre-built bloom_petal_dex_router.wasm; TODO: follow-up task for real wasm integration"]
-fn full_wasm_single_hop_swap() {
-    let wasm_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/wasm32-unknown-unknown/release/bloom_petal_dex_router.wasm");
+fn cpmm_version_call_uses_real_manifest_via_wasm_section() {
+    let alice = addr(0xA1);
+    let mut state = build_state(&[(alice, 1_000_000)]);
+    let gas_payer = genesis_coin_id(alice, 0);
+
+    // WAT body exporting `__petal_version` as a noop returning 0.
+    // The real manifest declares `version()` with no args and `u32`
+    // return — the validator only inspects the manifest, so the WAT
+    // body content is irrelevant for the typecheck. The bytes appended
+    // by `wrap_with_real_manifest` are the canonical-encoded
+    // `PetalManifestV0` the macro emits for `/bloom/dex/strategy/cpmm`.
+    let wat = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "__petal_version") (param i32 i32) (result i32)
+    i32.const 0)
+)
+"#;
+    let wasm = wrap_with_real_manifest(wat, real_cpmm_manifest_bytes());
+    let petal_hash = state.insert_code(&wasm);
+    state.set_vfs_binding("/bloom/dex/strategy/cpmm".to_string(), petal_hash);
+
+    let ptb = PtbTx {
+        signers: vec![alice.0],
+        commands: vec![Command::Move(MoveCmd {
+            petal: PetalRef { path: String::new(), hash: Some(petal_hash) },
+            function: "version".to_string(),
+            type_args: vec![],
+            args: vec![],
+        })],
+        gas_payer,
+        gas_budget: 200_000,
+        gas_price: 0,
+        expiry_block: 100,
+        signatures: vec![PqSignature(vec![0u8; 64])],
+    };
+
+    let out = submit_ptb_chain_auth(&mut state, alice, ptb);
     assert!(
-        wasm_path.exists(),
-        "wasm not found at {}; build first",
-        wasm_path.display()
+        out.success,
+        "cpmm.version() against real manifest must succeed; revert: {}",
+        String::from_utf8_lossy(&out.return_data)
     );
 }
 

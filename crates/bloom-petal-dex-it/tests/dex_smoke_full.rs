@@ -120,20 +120,98 @@ fn multi_token_scale_swap() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3 (ignored): Full PTB flow with 3 users, real wasm petals.
+// Test 3: real DEX petal manifests are all loadable side-by-side.
 //
-// Build allocations for 3 users with Coin<USDC>, Coin<LOOM>, Coin<DAI>.
-// Submit PTBs: create_pool → add_liquidity → swap_exact_in → remove_liquidity.
-// Assert end-of-flow Coin balances.
+// Previously `#[ignore]`d pending pre-built DEX petal wasms (the
+// wasm32-unknown-unknown toolchain is not in CI). With
+// `wrap_with_real_manifest` we install **all three** real DEX petal
+// manifests (`/bloom/dex/pool`, `/bloom/dex/strategy/cpmm`,
+// `/bloom/dex/router`) into a single `State`, then drive a PTB that
+// invokes the nullary `cpmm.version()` entry against the chain
+// adapter's wasm custom-section path. Asserting that the executor
+// resolves the right manifest by hash (and not by VFS path collision
+// or override) gives end-to-end coverage of the multi-petal
+// manifest-resolution shape that the production node sees in a real
+// DEX deployment.
 //
-// TODO: follow-up task to wire real wasm artifacts once build.rs integration is set up.
+// Per-petal lifecycle math is covered in `dex_smoke_full::full_dex_flow_math`
+// (test 1 above) and `lp_lifecycle.rs`. Full PTB-driven create_pool /
+// swap flows depend on cross-petal `Use(cmd, ret)` typed-slot tracking
+// for `Pool<A, B, S>` returns; that's the next follow-up.
 // ---------------------------------------------------------------------------
 
+use bloom_petal_dex_it::dex_harness::{
+    addr, build_state, genesis_coin_id, real_cpmm_manifest_bytes, real_pool_manifest_bytes,
+    real_router_manifest_bytes, submit_ptb_chain_auth, wrap_with_real_manifest,
+};
+use bloom_script::{Command, MoveCmd, PetalRef, PqSignature, PtbTx};
+
 #[test]
-#[ignore = "requires pre-built DEX petal wasms; TODO: follow-up task for real wasm PTB integration"]
-fn full_ptb_three_user_dex_flow() {
-    // This test will exercise the complete on-chain DEX flow once real wasm petals
-    // are available. The math validation above (full_dex_flow_math) covers the
-    // computation correctness; this test would cover the PTB encoding/dispatch path.
-    todo!("wire real wasm petals from build artifacts")
+fn three_dex_petal_manifests_coexist_via_chain_adapter() {
+    let alice = addr(0xA1);
+    let mut state = build_state(&[(alice, 1_000_000_000)]);
+    let gas_payer = genesis_coin_id(alice, 0);
+
+    // Install pool, cpmm, router all carrying their real manifests.
+    let pool_wat = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "__petal_create_pool") (param i32 i32) (result i32)
+    i32.const 0)
+)
+"#;
+    let pool_wasm = wrap_with_real_manifest(pool_wat, real_pool_manifest_bytes());
+    let pool_hash = state.insert_code(&pool_wasm);
+    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_hash);
+
+    let cpmm_wat = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "__petal_version") (param i32 i32) (result i32)
+    i32.const 0)
+)
+"#;
+    let cpmm_wasm = wrap_with_real_manifest(cpmm_wat, real_cpmm_manifest_bytes());
+    let cpmm_hash = state.insert_code(&cpmm_wasm);
+    state.set_vfs_binding("/bloom/dex/strategy/cpmm".to_string(), cpmm_hash);
+
+    let router_wat = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "__petal_quote_1hop") (param i32 i32) (result i32)
+    i32.const 0)
+)
+"#;
+    let router_wasm = wrap_with_real_manifest(router_wat, real_router_manifest_bytes());
+    let router_hash = state.insert_code(&router_wasm);
+    state.set_vfs_binding("/bloom/dex/router".to_string(), router_hash);
+
+    assert_ne!(pool_hash, cpmm_hash, "different wasms must hash differently");
+    assert_ne!(cpmm_hash, router_hash, "different wasms must hash differently");
+    assert_ne!(pool_hash, router_hash, "different wasms must hash differently");
+
+    // PTB calls cpmm.version() — pinning by hash forces the adapter
+    // to resolve the cpmm manifest from its specific wasm custom
+    // section (not from pool or router).
+    let ptb = PtbTx {
+        signers: vec![alice.0],
+        commands: vec![Command::Move(MoveCmd {
+            petal: PetalRef { path: String::new(), hash: Some(cpmm_hash) },
+            function: "version".to_string(),
+            type_args: vec![],
+            args: vec![],
+        })],
+        gas_payer,
+        gas_budget: 200_000,
+        gas_price: 0,
+        expiry_block: 100,
+        signatures: vec![PqSignature(vec![0u8; 64])],
+    };
+
+    let out = submit_ptb_chain_auth(&mut state, alice, ptb);
+    assert!(
+        out.success,
+        "cpmm.version() must succeed when pool/cpmm/router manifests coexist; revert: {}",
+        String::from_utf8_lossy(&out.return_data)
+    );
 }
