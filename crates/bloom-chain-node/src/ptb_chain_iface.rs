@@ -5,30 +5,44 @@
 //! compile-time dependency on the chain crate. This adapter is the
 //! single production implementation.
 //!
-//! ## Phase 1 limitations
+//! ## Manifest resolution (chain-authoritative)
 //!
-//! - [`load_object`] reads from the in-memory `objects` map maintained
-//!   on [`bloom_chain_state::State`] (spec §16.3 Phase 1; no merkleisation yet).
-//! - [`load_manifest`] always returns `None` unless an in-memory
-//!   manifest registry is supplied (see [`PtbChainAdapter::with_manifests`]).
-//! - [`resolve_path`] always returns `None`; the on-chain VFS path index
-//!   is not yet exposed by `bloom-chain-state`. The validator treats an
-//!   unbound path as permissive, so pure-hash PetalRefs still validate.
+//! [`load_manifest`] consults two layers, in order:
 //!
-//! PTBs whose validation step requires any of these will fail with the
-//! appropriate `PtbError` (`ObjectNotFound`, `PetalNotFound`,
-//! `PetalNotPinned`) — which is exactly the conservative, fail-closed
-//! behaviour we want.
+//! 1. **Optional overrides map** — supplied by `with_overrides(...)` and
+//!    consulted first. Tests use this to inject hand-written
+//!    `PetalManifestStub`s for petals that aren't real wasm (e.g.
+//!    validator unit tests that exercise typecheck logic against
+//!    synthetic manifests). Production never sets this.
+//!
+//! 2. **On-chain wasm custom section** — the adapter pulls the wasm by
+//!    content hash via `state.get_code(...)`, walks it for the
+//!    `bloom_petal_manifest_v0` custom section (emitted by
+//!    `#[bloom::petal]`, spec §8.1 / §11.1), decodes the bytes via the
+//!    canonical codec, and projects them down to the validator's
+//!    `PetalManifestStub` via
+//!    [`bloom_petal_manifest::to_petal_manifest_stub`].
+//!
+//! Decoded stubs are memoised inside the adapter's lifetime so a PTB
+//! with multiple commands hitting the same petal pays the wasm-walk
+//! cost only once.
+//!
+//! [`load_object`] reads from the in-memory `objects` map maintained on
+//! [`bloom_chain_state::State`] (spec §16.3 Phase 1; no merkleisation
+//! yet). [`resolve_path`] consults `State::vfs_lookup`, populated by
+//! `TxKind::Deploy` after a successful manifest decode.
 //!
 //! [`load_object`]: ChainStateIface::load_object
 //! [`load_manifest`]: ChainStateIface::load_manifest
 //! [`resolve_path`]: ChainStateIface::resolve_path
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use bloom_chain_state::State;
 use bloom_chain_types::Hash32;
 use bloom_objects::{Object, ObjectId};
+use bloom_petal_manifest::{extract_petal_manifest_v0, to_petal_manifest_stub};
 use bloom_script::{ChainStateIface, PetalManifestStub};
 
 /// Adapter wrapping a borrowed [`State`] for PTB validation / execution.
@@ -36,28 +50,64 @@ use bloom_script::{ChainStateIface, PetalManifestStub};
 /// `current_block` is supplied by the caller because the block height
 /// is part of the executor's per-tx context (`apply_block` passes it
 /// in), not a property of `State` itself.
+///
+/// The adapter memoises decoded `PetalManifestStub`s for the duration
+/// of its borrow so a multi-command PTB doesn't repeatedly walk the
+/// same wasm.
 pub struct PtbChainAdapter<'a> {
     state: &'a State,
     current_block: u64,
-    manifests: Option<&'a HashMap<Hash32, PetalManifestStub>>,
+    /// Optional test-only override map. Consulted before the wasm
+    /// custom-section path so tests can inject synthetic stubs for
+    /// petals that aren't real wasm.
+    overrides: Option<&'a HashMap<Hash32, PetalManifestStub>>,
+    /// Per-adapter cache of stubs decoded from wasm custom sections.
+    /// Keyed by petal content hash. `None` means "we tried and it
+    /// wasn't a v0 manifest"; absence means "we haven't tried yet".
+    manifest_cache: RefCell<HashMap<Hash32, Option<PetalManifestStub>>>,
 }
 
 impl<'a> PtbChainAdapter<'a> {
-    /// Build an adapter without a manifest registry. `load_manifest`
-    /// returns `None` for every petal hash.
+    /// Build a production adapter without test overrides.
+    /// `load_manifest` resolves entirely from wasm custom sections.
     pub fn new(state: &'a State, current_block: u64) -> Self {
-        Self { state, current_block, manifests: None }
+        Self {
+            state,
+            current_block,
+            overrides: None,
+            manifest_cache: RefCell::new(HashMap::new()),
+        }
     }
 
-    /// Build an adapter with an injected manifest registry. Tests use
-    /// this to stub out manifest lookup until the on-chain manifest
-    /// store lands.
+    /// Build an adapter with an injected test-only override map.
+    ///
+    /// The overrides are consulted **before** the on-chain wasm
+    /// custom-section path so a test can stub out a petal's manifest
+    /// without needing a real wasm artefact. Production code paths use
+    /// [`PtbChainAdapter::new`].
+    pub fn with_overrides(
+        state: &'a State,
+        current_block: u64,
+        overrides: &'a HashMap<Hash32, PetalManifestStub>,
+    ) -> Self {
+        Self {
+            state,
+            current_block,
+            overrides: Some(overrides),
+            manifest_cache: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Back-compat alias for [`PtbChainAdapter::with_overrides`].
+    ///
+    /// Existing test code reads more naturally as `with_manifests` —
+    /// keep the old spelling.
     pub fn with_manifests(
         state: &'a State,
         current_block: u64,
-        manifests: &'a HashMap<Hash32, PetalManifestStub>,
+        overrides: &'a HashMap<Hash32, PetalManifestStub>,
     ) -> Self {
-        Self { state, current_block, manifests: Some(manifests) }
+        Self::with_overrides(state, current_block, overrides)
     }
 }
 
@@ -71,12 +121,31 @@ impl ChainStateIface for PtbChainAdapter<'_> {
     }
 
     fn load_manifest(&self, hash: &Hash32) -> Option<PetalManifestStub> {
-        self.manifests.and_then(|m| m.get(hash).cloned())
+        // Layer 1: test-only overrides take precedence.
+        if let Some(map) = self.overrides
+            && let Some(stub) = map.get(hash)
+        {
+            return Some(stub.clone());
+        }
+
+        // Layer 2: wasm custom-section parse + project, memoised.
+        {
+            let cache = self.manifest_cache.borrow();
+            if let Some(slot) = cache.get(hash) {
+                return slot.clone();
+            }
+        }
+
+        let stub = self.state.get_code(hash).and_then(|wasm| {
+            let m = extract_petal_manifest_v0(wasm)?;
+            Some(to_petal_manifest_stub(&m))
+        });
+        self.manifest_cache.borrow_mut().insert(*hash, stub.clone());
+        stub
     }
 
-    fn resolve_path(&self, _path: &str) -> Option<Hash32> {
-        // VFS path index not exposed by `bloom-chain-state` yet.
-        None
+    fn resolve_path(&self, path: &str) -> Option<Hash32> {
+        self.state.vfs_lookup(path)
     }
 
     fn current_block(&self) -> u64 {
@@ -127,34 +196,122 @@ mod tests {
     }
 
     #[test]
-    fn resolve_path_returns_none_until_vfs_lands() {
-        let state = State::new();
+    fn resolve_path_reads_from_state_vfs() {
+        let mut state = State::new();
+        state.set_vfs_binding("/bloom/test".into(), Hash32([0xAB; 32]));
         let adapter = PtbChainAdapter::new(&state, 0);
-        assert!(adapter.resolve_path("/anything").is_none());
+        assert_eq!(adapter.resolve_path("/bloom/test"), Some(Hash32([0xAB; 32])));
+        assert!(adapter.resolve_path("/missing").is_none());
     }
 
     #[test]
-    fn load_manifest_returns_none_without_registry() {
+    fn load_manifest_returns_none_without_wasm_or_overrides() {
         let state = State::new();
         let adapter = PtbChainAdapter::new(&state, 0);
         assert!(adapter.load_manifest(&Hash32([0u8; 32])).is_none());
     }
 
     #[test]
-    fn load_manifest_returns_from_registry_when_present() {
+    fn load_manifest_returns_from_overrides_when_present() {
         let state = State::new();
-        let mut manifests = HashMap::new();
-        manifests.insert(
+        let mut overrides = HashMap::new();
+        overrides.insert(
             Hash32([7u8; 32]),
             PetalManifestStub {
                 module_path: "/test/petal".to_string(),
                 ..Default::default()
             },
         );
-        let adapter = PtbChainAdapter::with_manifests(&state, 0, &manifests);
+        let adapter = PtbChainAdapter::with_overrides(&state, 0, &overrides);
         let m = adapter.load_manifest(&Hash32([7u8; 32])).unwrap();
         assert_eq!(m.module_path, "/test/petal");
         assert!(adapter.load_manifest(&Hash32([0u8; 32])).is_none());
+    }
+
+    #[test]
+    fn load_manifest_parses_wasm_custom_section() {
+        use bloom_petal_manifest::codec;
+        use bloom_petal_manifest::types::{PetalManifestV0, SemVer};
+
+        // Build a minimal wasm with a `bloom_petal_manifest_v0` section.
+        let manifest = PetalManifestV0 {
+            schema_version: 1,
+            module_path: "/bloom/test/petal".into(),
+            framework_version: SemVer::new(0, 1, 0),
+            ..Default::default()
+        };
+        let manifest_bytes = codec::encode(&manifest).unwrap();
+        let wasm = wasm_with_custom("bloom_petal_manifest_v0", &manifest_bytes);
+
+        let mut state = State::new();
+        let hash = state.insert_code(&wasm);
+
+        let adapter = PtbChainAdapter::new(&state, 0);
+        let stub = adapter
+            .load_manifest(&hash)
+            .expect("manifest must decode from wasm custom section");
+        assert_eq!(stub.module_path, "/bloom/test/petal");
+    }
+
+    #[test]
+    fn load_manifest_caches_repeated_lookups() {
+        // Ensures the adapter only parses each wasm once across multiple
+        // load_manifest calls for the same hash.
+        use bloom_petal_manifest::codec;
+        use bloom_petal_manifest::types::{PetalManifestV0, SemVer};
+
+        let manifest = PetalManifestV0 {
+            schema_version: 1,
+            module_path: "/bloom/test/petal".into(),
+            framework_version: SemVer::new(0, 1, 0),
+            ..Default::default()
+        };
+        let manifest_bytes = codec::encode(&manifest).unwrap();
+        let wasm = wasm_with_custom("bloom_petal_manifest_v0", &manifest_bytes);
+
+        let mut state = State::new();
+        let hash = state.insert_code(&wasm);
+
+        let adapter = PtbChainAdapter::new(&state, 0);
+        for _ in 0..3 {
+            let stub = adapter.load_manifest(&hash).unwrap();
+            assert_eq!(stub.module_path, "/bloom/test/petal");
+        }
+        // Cache hit semantics: at minimum verify the entry is present.
+        assert!(adapter.manifest_cache.borrow().contains_key(&hash));
+    }
+
+    #[test]
+    fn overrides_win_over_wasm_section() {
+        use bloom_petal_manifest::codec;
+        use bloom_petal_manifest::types::{PetalManifestV0, SemVer};
+
+        let real = PetalManifestV0 {
+            schema_version: 1,
+            module_path: "/wasm/path".into(),
+            framework_version: SemVer::new(0, 1, 0),
+            ..Default::default()
+        };
+        let wasm = wasm_with_custom(
+            "bloom_petal_manifest_v0",
+            &codec::encode(&real).unwrap(),
+        );
+
+        let mut state = State::new();
+        let hash = state.insert_code(&wasm);
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            hash,
+            PetalManifestStub {
+                module_path: "/override/path".into(),
+                ..Default::default()
+            },
+        );
+
+        let adapter = PtbChainAdapter::with_overrides(&state, 0, &overrides);
+        let stub = adapter.load_manifest(&hash).unwrap();
+        assert_eq!(stub.module_path, "/override/path");
     }
 
     #[test]
@@ -165,5 +322,34 @@ mod tests {
         let adapter = PtbChainAdapter::new(&state, 0);
         assert_eq!(adapter.load_petal(&hash).as_deref(), Some(&wasm[..]));
         assert!(adapter.load_petal(&Hash32([0u8; 32])).is_none());
+    }
+
+    /// Build a minimal wasm with a custom section. Hand-emit the header
+    /// + LEB-encoded section so we don't need a wasm-building dep.
+    fn wasm_with_custom(name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"\0asm");
+        out.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        out.push(0x00);
+        let mut body = Vec::new();
+        leb128(&mut body, name.len() as u64);
+        body.extend_from_slice(name.as_bytes());
+        body.extend_from_slice(payload);
+        leb128(&mut out, body.len() as u64);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    fn leb128(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                return;
+            } else {
+                out.push(b | 0x80);
+            }
+        }
     }
 }

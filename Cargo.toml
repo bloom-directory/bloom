@@ -29,6 +29,7 @@ members = [
   "crates/bloom-objects",
   "crates/bloom-resource",
   "crates/bloom-resource-macros",
+  "crates/bloom-petal-manifest",
   "crates/bloom-script",
   "crates/bloom-petal-fungible",
   "crates/bloom-petal-cap",
@@ -134,6 +135,7 @@ bloom-chain-abi-macros = { path = "crates/bloom-chain-abi-macros" }
 bloom-objects     = { path = "crates/bloom-objects" }
 bloom-resource    = { path = "crates/bloom-resource" }
 bloom-resource-macros = { path = "crates/bloom-resource-macros" }
+bloom-petal-manifest = { path = "crates/bloom-petal-manifest" }
 bloom-script      = { path = "crates/bloom-script" }
 bloom-petal-fungible = { path = "crates/bloom-petal-fungible", version = "0.1.0" }
 bloom-petal-cap   = { path = "crates/bloom-petal-cap", version = "0.1.0" }

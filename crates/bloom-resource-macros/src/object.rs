@@ -33,7 +33,7 @@ use syn::spanned::Spanned;
 
 use crate::ast::{attr_is_named, ident, parse_ident_list, parse_str_value, struct_name};
 use crate::error::err_spanned;
-use crate::manifest::{FieldDecl, ObjectTypeDecl, TypeParamDecl, TypeParamKind};
+use bloom_petal_manifest::types::{FieldDecl, ObjectTypeDecl, TypeParamDecl, TypeParamKind};
 use crate::type_tag::TypeTagCtx;
 
 /// Output of parsing an `#[object(...)]` attribute on a struct.

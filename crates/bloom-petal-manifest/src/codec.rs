@@ -1,4 +1,4 @@
-//! Canonical encoder / decoder for [`crate::manifest::PetalManifestV0`].
+//! Canonical encoder / decoder for [`crate::types::PetalManifestV0`].
 //!
 //! Wire format (deterministic, BE):
 //! - 4-byte BE counts for lists.
@@ -7,10 +7,10 @@
 //! - `TypeTag` via [`bloom_objects::TypeTag::encode_into`].
 //!
 //! The codec is symmetric (round-trip preserves bytes). The validator-side
-//! projection (`bloom_script::chain_iface::PetalManifestStub`) is built
-//! by a host-side helper that consumes the decoded manifest; it cannot
-//! live in this proc-macro crate because Rust forbids non-macro public
-//! items in `proc-macro = true` crates. See spec §8 / §11.4.
+//! projection ([`bloom_script::PetalManifestStub`]) is built by
+//! [`crate::stub::to_petal_manifest_stub`] from a decoded manifest, so
+//! both the proc-macros (compile-time encode) and the chain node
+//! (runtime decode + project) share the same canonical schema.
 
 use bloom_objects::codec::{
     self, CodecError, read_bytes32, read_string, read_u16_be, read_u32_be, read_u64_be, read_u8,
@@ -18,7 +18,7 @@ use bloom_objects::codec::{
 };
 use bloom_objects::{AbilitySet, AccessMode, TypeTag};
 
-use crate::manifest::{
+use crate::types::{
     ArgDecl, ArgKind, CapabilityDecl, ExternalTypeRef, FieldDecl, FuelHints, FunctionDecl,
     HostImportDecl, InvariantDecl, InvariantTarget, ObjectTypeDecl, PetalManifestV0, PredicateAst,
     SemVer, TypeParamDecl, TypeParamKind, WasmFuncSig, WasmValType,
@@ -517,7 +517,7 @@ fn read_fuel_hints(rdr: &mut &[u8]) -> Result<FuelHints, CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::*;
+    use crate::types::*;
 
     fn sample() -> PetalManifestV0 {
         PetalManifestV0 {

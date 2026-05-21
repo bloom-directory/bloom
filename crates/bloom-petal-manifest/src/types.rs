@@ -2,9 +2,9 @@
 //! `#[bloom::petal]` as a wasm custom section (spec §8, §8.2).
 //!
 //! These types are pure data; no `syn`/`quote` dependencies. The
-//! canonical codec lives in [`crate::manifest_codec`], and a
-//! `to_petal_manifest_stub` conversion in that same module produces the
-//! validator's lean view (`bloom_script::chain_iface::PetalManifestStub`).
+//! canonical codec lives in [`crate::codec`], and a
+//! [`crate::stub::to_petal_manifest_stub`] conversion produces the
+//! validator's lean view ([`bloom_script::PetalManifestStub`]).
 
 use bloom_objects::{AbilitySet, AccessMode, TypeTag};
 

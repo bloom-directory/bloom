@@ -2062,6 +2062,7 @@ dependencies = [
  "bloom-keystore",
  "bloom-objects",
  "bloom-petal-fungible",
+ "bloom-petal-manifest",
  "bloom-petals",
  "bloom-script",
  "bloom-test-util",
@@ -2555,6 +2556,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-petal-manifest"
+version = "0.1.0"
+dependencies = [
+ "bloom-chain-types",
+ "bloom-objects",
+ "bloom-script",
+ "wasmparser 0.218.1",
+]
+
+[[package]]
 name = "bloom-petal-sdk"
 version = "0.1.0"
 dependencies = [
@@ -2640,6 +2651,7 @@ name = "bloom-resource-macros"
 version = "0.1.0"
 dependencies = [
  "bloom-objects",
+ "bloom-petal-manifest",
  "bloom-resource",
  "proc-macro2",
  "quote",

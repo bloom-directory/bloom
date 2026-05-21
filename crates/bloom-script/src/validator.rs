@@ -7,11 +7,13 @@
 
 use std::collections::HashMap;
 
-use bloom_objects::{AccessMode, Object, ObjectId, Owner, TypeTag};
+use bloom_objects::{
+    AccessMode, Object, ObjectId, Owner, TypeTag, ValidationOutcome, validate_canonical_bytes,
+};
 
 use crate::chain_iface::{ArgDeclStub, ChainStateIface, FunctionDeclStub, PetalManifestStub};
 use crate::error::PtbError;
-use crate::types::{Arg, Command, ExpectedVersion, MoveCmd, PtbTx};
+use crate::types::{Arg, Command, ExpectedVersion, MoveCmd, PtbTx, UseRef};
 
 /// Verifies an xDSA signature against (`digest`, `pubkey`).
 ///
@@ -116,45 +118,73 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
         }
     }
 
-    // Step 4: function-signature typecheck (after manifests are loaded).
-    for (cmd_idx, cmd) in tx.commands.iter().enumerate() {
-        if let Command::Move(m) = cmd {
-            // Safety: step 3 above already inserted a manifest for any
-            // pinned-hash MoveCmd. Unpinned refs already returned
-            // PetalNotPinned.
-            let hash = m
-                .petal
-                .hash
-                .ok_or_else(|| PtbError::PetalNotPinned {
-                    path: m.petal.path.clone(),
-                })?;
-            let manifest = manifests.get(&hash.0).ok_or(PtbError::PetalNotFound { hash })?;
-            typecheck_move_cmd(m, manifest, cmd_idx)?;
-        }
-    }
-
-    // Step 5: object version + access check.
+    // Steps 4 + 5 (unified): strict typecheck + object version/access.
+    //
+    // We walk commands in order so that every `Arg::Use { cmd_idx, ret_idx }`
+    // can be checked against the upstream command's declared return
+    // slot type. Per-command return types are tracked in
+    // `cmd_return_types` (one outer entry per executed command; inner
+    // `Option<TypeTag>` per return slot — `None` means "unknown / opaque
+    // built-in output" and the slot accepts any consumer type).
     let mut objects: HashMap<[u8; 32], Object> = HashMap::new();
     let first_signer_addr = tx.signers[0];
-    for cmd in &tx.commands {
-        if let Command::Move(m) = cmd {
-            for arg in &m.args {
-                if let Arg::Object {
-                    id,
-                    expected_version,
-                    access_mode,
-                } = arg
-                {
-                    check_object_arg(
-                        ctx.chain,
+    let mut cmd_return_types: Vec<Vec<Option<TypeTag>>> = Vec::with_capacity(tx.commands.len());
+    for (cmd_idx, cmd) in tx.commands.iter().enumerate() {
+        match cmd {
+            Command::Move(m) => {
+                let hash = m
+                    .petal
+                    .hash
+                    .ok_or_else(|| PtbError::PetalNotPinned {
+                        path: m.petal.path.clone(),
+                    })?;
+                let manifest =
+                    manifests.get(&hash.0).ok_or(PtbError::PetalNotFound { hash })?;
+                // Pre-load every Object arg for both shape-check and
+                // type-against-manifest matching.
+                for arg in &m.args {
+                    if let Arg::Object {
                         id,
-                        *expected_version,
-                        *access_mode,
-                        &first_signer_addr,
-                        &mut objects,
-                    )?;
+                        expected_version,
+                        access_mode,
+                    } = arg
+                    {
+                        check_object_arg(
+                            ctx.chain,
+                            id,
+                            *expected_version,
+                            *access_mode,
+                            &first_signer_addr,
+                            &mut objects,
+                        )?;
+                    }
                 }
+                typecheck_move_cmd(m, manifest, cmd_idx, &cmd_return_types, &objects)?;
+                // Record the declared return types of this command so
+                // later `Use` references can typecheck against them.
+                let f = manifest
+                    .function(&m.function)
+                    .expect("function presence verified by typecheck_move_cmd");
+                cmd_return_types.push(
+                    f.returns
+                        .iter()
+                        .map(|t| Some(substitute_type_args(t, &m.type_args)))
+                        .collect(),
+                );
             }
+            // Built-ins: the executor materialises outputs for these
+            // (32-byte object ids for the linear builtins, 32-byte
+            // wasm hash for Publish/Upgrade). The validator does not
+            // yet propagate concrete types for these slots — `None`
+            // means "accept any consumer type" at the upstream end.
+            Command::TransferObjects { .. } => cmd_return_types.push(vec![]),
+            Command::MergeCoins(_) => cmd_return_types.push(vec![None]),
+            Command::SplitCoins { amounts, .. } => {
+                cmd_return_types.push(vec![None; amounts.len()]);
+            }
+            Command::MakeMoveVec { .. } => cmd_return_types.push(vec![None]),
+            Command::Publish(_) => cmd_return_types.push(vec![None, None]),
+            Command::UpgradePetal(_) => cmd_return_types.push(vec![None]),
         }
     }
 
@@ -244,7 +274,9 @@ fn resolve_petal(
 fn typecheck_move_cmd(
     cmd: &MoveCmd,
     manifest: &PetalManifestStub,
-    _cmd_idx: usize,
+    cmd_idx: usize,
+    cmd_return_types: &[Vec<Option<TypeTag>>],
+    objects: &HashMap<[u8; 32], Object>,
 ) -> Result<(), PtbError> {
     let hash = cmd
         .petal
@@ -278,17 +310,35 @@ fn typecheck_move_cmd(
     for (i, (arg, decl)) in cmd.args.iter().zip(f.args.iter()).enumerate() {
         match (arg, decl) {
             (Arg::Signer(_), ArgDeclStub::Signer) => {}
-            (Arg::Const(_), ArgDeclStub::Const(_)) => {
-                // Type-checking the bytes against the declared TypeTag
-                // is the petal runtime's job — at PTB-validation time
-                // we only know it's "a Const" vs. "not a Const".
+            (Arg::Const(bytes), ArgDeclStub::Const(declared_tag)) => {
+                // Apply generic substitution so a `Const T` in the
+                // manifest is checked against the concrete `T` the
+                // caller chose for this MoveCmd.
+                let expected = substitute_type_args(declared_tag, &cmd.type_args);
+                match validate_canonical_bytes(&expected, bytes) {
+                    ValidationOutcome::Ok | ValidationOutcome::Unknown => {}
+                    ValidationOutcome::Invalid(reason) => {
+                        return Err(PtbError::TypeMismatch {
+                            function: cmd.function.clone(),
+                            arg_idx: i,
+                            reason: format!(
+                                "Const bytes do not match declared type {}: {reason}",
+                                type_tag_label(&expected)
+                            ),
+                        });
+                    }
+                }
             }
             (
                 Arg::Object {
+                    id,
                     access_mode: amode,
                     ..
                 },
-                ArgDeclStub::Object { mode, .. },
+                ArgDeclStub::Object {
+                    ty: declared_ty,
+                    mode,
+                },
             ) => {
                 if amode != mode {
                     return Err(PtbError::TypeMismatch {
@@ -299,12 +349,60 @@ fn typecheck_move_cmd(
                         ),
                     });
                 }
+                // Compare the on-chain object's type_tag against the
+                // declared arg type, applying the caller's
+                // type_args substitution. `objects` has been
+                // pre-populated by the caller for every Arg::Object.
+                let Some(obj) = objects.get(&id.0) else {
+                    return Err(PtbError::ObjectNotFound { id: *id });
+                };
+                let expected = substitute_type_args(declared_ty, &cmd.type_args);
+                if !type_tags_match(&obj.type_tag, &expected) {
+                    return Err(PtbError::TypeMismatch {
+                        function: cmd.function.clone(),
+                        arg_idx: i,
+                        reason: format!(
+                            "object {} has type {}, declared arg type is {}",
+                            hex_encode(&id.0),
+                            type_tag_label(&obj.type_tag),
+                            type_tag_label(&expected),
+                        ),
+                    });
+                }
             }
-            (Arg::Use { .. }, ArgDeclStub::Object { .. } | ArgDeclStub::Const(_)) => {
-                // A `Use` may stand in for an Object or a Const arg
-                // (it's the result of an earlier command). Detailed
-                // type matching happens once the executor has produced
-                // the upstream value; here we accept the shape.
+            (
+                Arg::Use { cmd_idx: u_cmd, ret_idx: u_ret },
+                ArgDeclStub::Object {
+                    ty: declared_ty, ..
+                },
+            )
+            | (
+                Arg::Use { cmd_idx: u_cmd, ret_idx: u_ret },
+                ArgDeclStub::Const(declared_ty),
+            ) => {
+                let upstream = resolve_use_type(
+                    cmd_return_types,
+                    UseRef {
+                        cmd_idx: *u_cmd,
+                        ret_idx: *u_ret,
+                    },
+                    cmd_idx,
+                )?;
+                if let Some(actual) = upstream {
+                    let expected = substitute_type_args(declared_ty, &cmd.type_args);
+                    if !type_tags_match(&actual, &expected) {
+                        return Err(PtbError::TypeMismatch {
+                            function: cmd.function.clone(),
+                            arg_idx: i,
+                            reason: format!(
+                                "Use({u_cmd},{u_ret}) returns {}, declared arg type is {}",
+                                type_tag_label(&actual),
+                                type_tag_label(&expected),
+                            ),
+                        });
+                    }
+                }
+                // `None` upstream (built-in output): no signal, accept.
             }
             (Arg::TypeArg(_), ArgDeclStub::TypeArg(_)) => {}
             (a, d) => {
@@ -318,6 +416,126 @@ fn typecheck_move_cmd(
     }
 
     Ok(())
+}
+
+/// Resolve a `Use` reference to its upstream return type slot.
+///
+/// Returns `Ok(Some(_))` if the upstream command has a typed return
+/// slot at that position; `Ok(None)` if the upstream is a built-in
+/// command whose slot is opaque to the validator; `Err(DanglingUse)`
+/// if the (cmd_idx, ret_idx) pair does not name a real slot.
+fn resolve_use_type(
+    cmd_return_types: &[Vec<Option<TypeTag>>],
+    u: UseRef,
+    referring_cmd_idx: usize,
+) -> Result<Option<TypeTag>, PtbError> {
+    // Forward / self references are not allowed; only earlier commands
+    // can be referenced.
+    if (u.cmd_idx as usize) >= referring_cmd_idx {
+        return Err(PtbError::DanglingUse {
+            cmd_idx: u.cmd_idx,
+            ret_idx: u.ret_idx,
+        });
+    }
+    let slots = cmd_return_types
+        .get(u.cmd_idx as usize)
+        .ok_or(PtbError::DanglingUse {
+            cmd_idx: u.cmd_idx,
+            ret_idx: u.ret_idx,
+        })?;
+    let slot = slots
+        .get(u.ret_idx as usize)
+        .ok_or(PtbError::DanglingUse {
+            cmd_idx: u.cmd_idx,
+            ret_idx: u.ret_idx,
+        })?;
+    Ok(slot.clone())
+}
+
+/// Apply a function-level type-arg substitution to a `TypeTag`,
+/// replacing each `TypeTag::Generic { idx }` with `type_args[idx]`.
+/// Generics with `idx >= type_args.len()` are left as-is (the validator
+/// already rejects arity mismatches before reaching here, but
+/// substitution stays total).
+fn substitute_type_args(t: &TypeTag, type_args: &[TypeTag]) -> TypeTag {
+    match t {
+        TypeTag::Generic { idx } => type_args
+            .get(*idx as usize)
+            .cloned()
+            .unwrap_or_else(|| t.clone()),
+        TypeTag::Concrete {
+            petal_hash,
+            type_name,
+            type_args: inner,
+        } => TypeTag::Concrete {
+            petal_hash: *petal_hash,
+            type_name: type_name.clone(),
+            type_args: inner
+                .iter()
+                .map(|x| substitute_type_args(x, type_args))
+                .collect(),
+        },
+        TypeTag::External { .. } => t.clone(),
+    }
+}
+
+/// Structural compare between two `TypeTag`s.
+///
+/// Equality is exact except that a self-referential `petal_hash` of
+/// `[0u8; 32]` on the declared side matches any concrete petal hash on
+/// the on-chain side. This mirrors the macro emission convention (the
+/// macros cannot know their own wasm hash at expansion time, so they
+/// stamp `[0u8; 32]` and the chain treats it as "self").
+fn type_tags_match(actual: &TypeTag, declared: &TypeTag) -> bool {
+    match (actual, declared) {
+        (
+            TypeTag::Concrete {
+                petal_hash: ah,
+                type_name: an,
+                type_args: aa,
+            },
+            TypeTag::Concrete {
+                petal_hash: dh,
+                type_name: dn,
+                type_args: da,
+            },
+        ) => {
+            if an != dn || aa.len() != da.len() {
+                return false;
+            }
+            if dh != &[0u8; 32] && ah != dh {
+                return false;
+            }
+            aa.iter().zip(da.iter()).all(|(a, d)| type_tags_match(a, d))
+        }
+        (TypeTag::Generic { idx: a }, TypeTag::Generic { idx: b }) => a == b,
+        (TypeTag::External { ref_idx: a }, TypeTag::External { ref_idx: b }) => a == b,
+        _ => false,
+    }
+}
+
+/// Compact human-readable label for diagnostic messages.
+fn type_tag_label(t: &TypeTag) -> String {
+    match t {
+        TypeTag::Concrete {
+            type_name,
+            type_args,
+            ..
+        } => {
+            if type_args.is_empty() {
+                type_name.clone()
+            } else {
+                let inner = type_args
+                    .iter()
+                    .map(type_tag_label)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{type_name}<{inner}>")
+            }
+        }
+        TypeTag::Generic { idx } => format!("T{idx}"),
+        TypeTag::External { ref_idx } => format!("$external_{ref_idx}"),
+    }
 }
 
 fn arg_label(a: &Arg) -> &'static str {
@@ -911,5 +1129,410 @@ mod tests {
         let mut payload = vec![0u8; 32];
         payload.extend_from_slice(&v.to_be_bytes());
         assert_eq!(decode_coin_value(&payload).unwrap(), v);
+    }
+
+    // -----------------------------------------------------------------
+    // P1-3: strict typecheck (Const bytes, Use slots, Object types)
+    // -----------------------------------------------------------------
+
+    fn concrete(name: &str) -> TypeTag {
+        TypeTag::Concrete {
+            petal_hash: [0u8; 32],
+            type_name: name.to_string(),
+            type_args: vec![],
+        }
+    }
+
+    fn install_fn(chain: &MockChain, name: &str, args: Vec<ArgDeclStub>, returns: Vec<TypeTag>) {
+        let mut m = sample_manifest();
+        m.functions.push(FunctionDeclStub {
+            name: name.to_string(),
+            type_params: vec![],
+            args,
+            returns,
+            attached_invariants: vec![],
+        });
+        chain.put_petal(Hash32([0xAB; 32]), vec![], m);
+    }
+
+    /// Const bytes whose length matches the declared `u64` shape are
+    /// accepted; bytes of the wrong length are rejected with
+    /// `TypeMismatch`.
+    #[test]
+    fn strict_typecheck_const_u64_correct_length_accepted() {
+        let (chain, signer, gas_id) = setup();
+        install_fn(
+            &chain,
+            "f",
+            vec![ArgDeclStub::Const(concrete("u64"))],
+            vec![],
+        );
+        let mut tx = sample_ptb(signer, gas_id, 100);
+        if let Command::Move(m) = &mut tx.commands[0] {
+            m.function = "f".to_string();
+            m.args = vec![Arg::Const(vec![0u8; 8])];
+        }
+        let verifier = AlwaysOkVerifier;
+        assert!(validate_ptb(&tx, &ctx(&chain, &verifier)).is_ok());
+    }
+
+    #[test]
+    fn strict_typecheck_const_u64_too_short_rejected() {
+        let (chain, signer, gas_id) = setup();
+        install_fn(
+            &chain,
+            "f",
+            vec![ArgDeclStub::Const(concrete("u64"))],
+            vec![],
+        );
+        let mut tx = sample_ptb(signer, gas_id, 100);
+        if let Command::Move(m) = &mut tx.commands[0] {
+            m.function = "f".to_string();
+            // 4 bytes — too short for u64 (8 bytes).
+            m.args = vec![Arg::Const(vec![0u8; 4])];
+        }
+        let verifier = AlwaysOkVerifier;
+        let err = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap_err();
+        assert!(
+            matches!(err, PtbError::TypeMismatch { ref reason, .. } if reason.contains("u64")),
+            "expected TypeMismatch mentioning u64, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn strict_typecheck_const_object_id_wrong_length_rejected() {
+        let (chain, signer, gas_id) = setup();
+        install_fn(
+            &chain,
+            "f",
+            vec![ArgDeclStub::Const(concrete("ObjectId"))],
+            vec![],
+        );
+        let mut tx = sample_ptb(signer, gas_id, 100);
+        if let Command::Move(m) = &mut tx.commands[0] {
+            m.function = "f".to_string();
+            m.args = vec![Arg::Const(vec![0u8; 31])];
+        }
+        let verifier = AlwaysOkVerifier;
+        let err = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap_err();
+        assert!(
+            matches!(err, PtbError::TypeMismatch { .. }),
+            "expected TypeMismatch, got {err:?}"
+        );
+    }
+
+    /// Unknown (petal-defined) Const types are accepted unconditionally
+    /// — the runtime is the final arbiter.
+    #[test]
+    fn strict_typecheck_const_unknown_type_accepts_any_bytes() {
+        let (chain, signer, gas_id) = setup();
+        install_fn(
+            &chain,
+            "f",
+            vec![ArgDeclStub::Const(concrete("Pool"))],
+            vec![],
+        );
+        let mut tx = sample_ptb(signer, gas_id, 100);
+        if let Command::Move(m) = &mut tx.commands[0] {
+            m.function = "f".to_string();
+            m.args = vec![Arg::Const(vec![1, 2, 3])];
+        }
+        let verifier = AlwaysOkVerifier;
+        assert!(validate_ptb(&tx, &ctx(&chain, &verifier)).is_ok());
+    }
+
+    /// A `Use` slot referring to a non-existent command (forward
+    /// reference) is rejected with `DanglingUse`.
+    #[test]
+    fn strict_typecheck_use_forward_reference_rejected() {
+        let (chain, signer, gas_id) = setup();
+        install_fn(
+            &chain,
+            "f",
+            vec![ArgDeclStub::Const(concrete("u64"))],
+            vec![],
+        );
+        let mut tx = sample_ptb(signer, gas_id, 100);
+        if let Command::Move(m) = &mut tx.commands[0] {
+            m.function = "f".to_string();
+            m.args = vec![Arg::Use {
+                cmd_idx: 5,
+                ret_idx: 0,
+            }];
+        }
+        let verifier = AlwaysOkVerifier;
+        assert!(matches!(
+            validate_ptb(&tx, &ctx(&chain, &verifier)),
+            Err(PtbError::DanglingUse { .. })
+        ));
+    }
+
+    /// A `Use` slot referring to a real upstream command whose declared
+    /// return type does not match the downstream arg's declared type
+    /// is rejected.
+    #[test]
+    fn strict_typecheck_use_slot_type_mismatch_rejected() {
+        let (chain, signer, gas_id) = setup();
+        // Function "producer" returns u64; function "consumer" takes a
+        // Const u128. Hooking them up with a Use should fail.
+        let mut m = sample_manifest();
+        m.functions.push(FunctionDeclStub {
+            name: "producer".to_string(),
+            type_params: vec![],
+            args: vec![],
+            returns: vec![concrete("u64")],
+            attached_invariants: vec![],
+        });
+        m.functions.push(FunctionDeclStub {
+            name: "consumer".to_string(),
+            type_params: vec![],
+            args: vec![ArgDeclStub::Const(concrete("u128"))],
+            returns: vec![],
+            attached_invariants: vec![],
+        });
+        chain.put_petal(Hash32([0xAB; 32]), vec![], m);
+        let tx = PtbTx {
+            signers: vec![signer],
+            commands: vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/bloom/dex/pool".to_string(),
+                        hash: Some(Hash32([0xAB; 32])),
+                    },
+                    function: "producer".to_string(),
+                    type_args: vec![],
+                    args: vec![],
+                }),
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/bloom/dex/pool".to_string(),
+                        hash: Some(Hash32([0xAB; 32])),
+                    },
+                    function: "consumer".to_string(),
+                    type_args: vec![],
+                    args: vec![Arg::Use {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    }],
+                }),
+            ],
+            gas_payer: gas_id,
+            gas_budget: 100,
+            gas_price: 1,
+            expiry_block: 100,
+            signatures: vec![PqSignature(vec![0xCC; 8])],
+        };
+        let verifier = AlwaysOkVerifier;
+        let err = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap_err();
+        assert!(
+            matches!(err, PtbError::TypeMismatch { ref reason, .. } if reason.contains("u64") && reason.contains("u128")),
+            "expected TypeMismatch citing u64/u128, got {err:?}"
+        );
+    }
+
+    /// A `Use` slot whose upstream type matches the consumer's declared
+    /// type is accepted.
+    #[test]
+    fn strict_typecheck_use_slot_type_match_accepted() {
+        let (chain, signer, gas_id) = setup();
+        let mut m = sample_manifest();
+        m.functions.push(FunctionDeclStub {
+            name: "producer".to_string(),
+            type_params: vec![],
+            args: vec![],
+            returns: vec![concrete("u64")],
+            attached_invariants: vec![],
+        });
+        m.functions.push(FunctionDeclStub {
+            name: "consumer".to_string(),
+            type_params: vec![],
+            args: vec![ArgDeclStub::Const(concrete("u64"))],
+            returns: vec![],
+            attached_invariants: vec![],
+        });
+        chain.put_petal(Hash32([0xAB; 32]), vec![], m);
+        let tx = PtbTx {
+            signers: vec![signer],
+            commands: vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/bloom/dex/pool".to_string(),
+                        hash: Some(Hash32([0xAB; 32])),
+                    },
+                    function: "producer".to_string(),
+                    type_args: vec![],
+                    args: vec![],
+                }),
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/bloom/dex/pool".to_string(),
+                        hash: Some(Hash32([0xAB; 32])),
+                    },
+                    function: "consumer".to_string(),
+                    type_args: vec![],
+                    args: vec![Arg::Use {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    }],
+                }),
+            ],
+            gas_payer: gas_id,
+            gas_budget: 100,
+            gas_price: 1,
+            expiry_block: 100,
+            signatures: vec![PqSignature(vec![0xCC; 8])],
+        };
+        let verifier = AlwaysOkVerifier;
+        assert!(validate_ptb(&tx, &ctx(&chain, &verifier)).is_ok());
+    }
+
+    /// An Object arg whose on-chain `type_tag` does not match the
+    /// manifest's declared arg type is rejected with `TypeMismatch`.
+    #[test]
+    fn strict_typecheck_object_type_mismatch_rejected() {
+        let (chain, signer, gas_id) = setup();
+        let target_id = ObjectId([0xAA; 32]);
+        chain.put_object(Object {
+            id: target_id,
+            type_tag: concrete("Pool"),
+            owner: Owner::Shared,
+            version: 0,
+            payload: vec![],
+        });
+        let mut m = sample_manifest();
+        m.functions.push(FunctionDeclStub {
+            name: "touch".to_string(),
+            type_params: vec![],
+            args: vec![ArgDeclStub::Object {
+                ty: concrete("Vault"), // wrong type vs. on-chain "Pool"
+                mode: AccessMode::Mutable,
+            }],
+            returns: vec![],
+            attached_invariants: vec![],
+        });
+        chain.put_petal(Hash32([0xAB; 32]), vec![], m);
+        let mut tx = sample_ptb(signer, gas_id, 100);
+        if let Command::Move(mc) = &mut tx.commands[0] {
+            mc.function = "touch".to_string();
+            mc.args = vec![Arg::Object {
+                id: target_id,
+                expected_version: ExpectedVersion(0),
+                access_mode: AccessMode::Mutable,
+            }];
+        }
+        let verifier = AlwaysOkVerifier;
+        let err = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap_err();
+        assert!(
+            matches!(err, PtbError::TypeMismatch { ref reason, .. } if reason.contains("Pool") && reason.contains("Vault")),
+            "expected TypeMismatch citing Pool/Vault, got {err:?}"
+        );
+    }
+
+    /// An Object arg whose on-chain type matches the manifest's declared
+    /// type is accepted. Self-petal-hash (`[0u8; 32]`) in the manifest
+    /// matches any concrete hash on the object's type.
+    #[test]
+    fn strict_typecheck_object_self_petal_hash_matches_any() {
+        let (chain, signer, gas_id) = setup();
+        let target_id = ObjectId([0xAA; 32]);
+        chain.put_object(Object {
+            id: target_id,
+            // Object emitted by some real petal — non-zero hash.
+            type_tag: TypeTag::Concrete {
+                petal_hash: [0xAB; 32],
+                type_name: "Pool".to_string(),
+                type_args: vec![],
+            },
+            owner: Owner::Shared,
+            version: 0,
+            payload: vec![],
+        });
+        let mut m = sample_manifest();
+        m.functions.push(FunctionDeclStub {
+            name: "touch".to_string(),
+            type_params: vec![],
+            args: vec![ArgDeclStub::Object {
+                // Self-referential manifest entry: hash = zero.
+                ty: concrete("Pool"),
+                mode: AccessMode::Mutable,
+            }],
+            returns: vec![],
+            attached_invariants: vec![],
+        });
+        chain.put_petal(Hash32([0xAB; 32]), vec![], m);
+        let mut tx = sample_ptb(signer, gas_id, 100);
+        if let Command::Move(mc) = &mut tx.commands[0] {
+            mc.function = "touch".to_string();
+            mc.args = vec![Arg::Object {
+                id: target_id,
+                expected_version: ExpectedVersion(0),
+                access_mode: AccessMode::Mutable,
+            }];
+        }
+        let verifier = AlwaysOkVerifier;
+        assert!(validate_ptb(&tx, &ctx(&chain, &verifier)).is_ok());
+    }
+
+    /// Generic substitution works: a `Const T` decl with `T = u64` and
+    /// 8 bytes is accepted; the same with 4 bytes is rejected.
+    #[test]
+    fn strict_typecheck_generic_substitution_match() {
+        let (chain, signer, gas_id) = setup();
+        let mut m = sample_manifest();
+        m.functions.push(FunctionDeclStub {
+            name: "gf".to_string(),
+            type_params: vec![crate::chain_iface::TypeParamDeclStub {
+                name: "T".to_string(),
+                phantom: false,
+            }],
+            args: vec![ArgDeclStub::Const(TypeTag::Generic { idx: 0 })],
+            returns: vec![],
+            attached_invariants: vec![],
+        });
+        chain.put_petal(Hash32([0xAB; 32]), vec![], m);
+        let mut tx = sample_ptb(signer, gas_id, 100);
+        if let Command::Move(mc) = &mut tx.commands[0] {
+            mc.function = "gf".to_string();
+            mc.type_args = vec![concrete("u64")];
+            mc.args = vec![Arg::Const(vec![0u8; 8])];
+        }
+        let verifier = AlwaysOkVerifier;
+        assert!(validate_ptb(&tx, &ctx(&chain, &verifier)).is_ok());
+
+        // Now break it: same generic substitution but wrong byte length.
+        if let Command::Move(mc) = &mut tx.commands[0] {
+            mc.args = vec![Arg::Const(vec![0u8; 4])];
+        }
+        let err = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap_err();
+        assert!(
+            matches!(err, PtbError::TypeMismatch { ref reason, .. } if reason.contains("u64")),
+            "expected TypeMismatch citing u64 after substitution, got {err:?}"
+        );
+    }
+
+    /// A tampered `PetalRef` — correct path, mutated hash — is rejected
+    /// once the chain's VFS binds the path to a different hash.
+    /// (P0-1 cross-check: hash pinning must be honoured.)
+    #[test]
+    fn rejects_tampered_petal_ref_with_correct_path() {
+        let (chain, signer, gas_id) = setup();
+        // Chain VFS binds the path to 0xAB; the PTB embeds 0xCC for the
+        // same path.
+        let mut tx = sample_ptb(signer, gas_id, 100);
+        if let Command::Move(m) = &mut tx.commands[0] {
+            m.petal.hash = Some(Hash32([0xCC; 32]));
+        }
+        let verifier = AlwaysOkVerifier;
+        let err = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap_err();
+        // Either we hit PetalNotFound (the chain doesn't know 0xCC)
+        // or PetalPathHashMismatch (the binding contradicts). Both
+        // count as "tampering rejected".
+        assert!(
+            matches!(
+                err,
+                PtbError::PetalNotFound { .. } | PtbError::PetalPathHashMismatch { .. }
+            ),
+            "expected PetalNotFound or PetalPathHashMismatch, got {err:?}"
+        );
     }
 }

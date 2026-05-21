@@ -25,7 +25,7 @@ use syn::{
 
 use crate::ast::{attr_is_named, parse_str_value};
 use crate::error::err_spanned;
-use crate::manifest::{InvariantDecl, InvariantTarget, PredicateAst};
+use bloom_petal_manifest::types::{InvariantDecl, InvariantTarget, PredicateAst};
 
 /// Parsed `#[invariant(...)]` attribute.
 #[derive(Debug, Clone)]

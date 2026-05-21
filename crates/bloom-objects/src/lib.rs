@@ -14,6 +14,8 @@
 //! - [`abilities`] — `AbilitySet` bitfield + `AccessMode` enum.
 //! - [`codec`] — variable-length codec extensions over `bloom-chain-abi`.
 //! - [`host_imports`] — host-import name + signature declarations (data only).
+//! - [`primitive`] — canonical-bytes validator for primitive `TypeTag`
+//!   payloads, used by the PTB validator's strict typecheck pass.
 //! - [`store`] — key/value types for the two new chain-state tries.
 //!
 //! Spec: `docs/specs/2026-05-20-bloom-native-contracts-design.md`
@@ -27,6 +29,7 @@ pub mod codec;
 pub mod host_imports;
 pub mod id;
 pub mod object;
+pub mod primitive;
 pub mod store;
 pub mod type_tag;
 
@@ -37,6 +40,7 @@ pub use id::{OBJECT_ID_TAG, ObjectId};
 pub use object::{
     OWNER_KIND_ADDRESS, OWNER_KIND_IMMUTABLE, OWNER_KIND_OBJECT, OWNER_KIND_SHARED, Object, Owner,
 };
+pub use primitive::{ValidationOutcome, validate_canonical_bytes};
 pub use store::{
     OBJECT_LEAF_TAG, OBJECT_ROOT_TAG, OWNERSHIP_LEAF_TAG, OWNERSHIP_ROOT_TAG, ObjectTrieKey,
     ObjectTrieValue, OwnershipIndexKey, OwnershipIndexValue,

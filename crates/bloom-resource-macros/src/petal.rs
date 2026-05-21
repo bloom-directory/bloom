@@ -38,7 +38,7 @@ use crate::codegen::{
 };
 use crate::error::err_spanned;
 use crate::invariant::InvariantAttr;
-use crate::manifest::{
+use bloom_petal_manifest::types::{
     ArgDecl, ArgKind, FunctionDecl, PetalManifestV0, SCHEMA_VERSION, SemVer, TypeParamDecl,
     TypeParamKind,
 };

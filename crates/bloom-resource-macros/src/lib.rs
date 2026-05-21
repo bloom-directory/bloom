@@ -35,8 +35,6 @@ mod capability;
 mod codegen;
 mod error;
 mod invariant;
-mod manifest;
-mod manifest_codec;
 mod object;
 mod petal;
 mod type_tag;
@@ -73,7 +71,7 @@ pub fn capability(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Attribute applied to a function declaration to register a
 /// PTB-time invariant. Emits a `__inv_<idx>` wasm export and pushes
-/// an [`crate::manifest::InvariantDecl`] into the manifest (spec §12).
+/// an [`InvariantDecl`](bloom_petal_manifest::types::InvariantDecl) into the manifest (spec §12).
 #[proc_macro_attribute]
 pub fn invariant(attr: TokenStream, item: TokenStream) -> TokenStream {
     invariant::expand(attr.into(), item.into())

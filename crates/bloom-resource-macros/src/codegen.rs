@@ -17,8 +17,8 @@ use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
 use syn::{GenericArgument, Ident, PathArguments, Type, TypePath};
 
-use crate::manifest::{ArgKind, PetalManifestV0};
-use crate::manifest_codec;
+use bloom_petal_manifest::codec as manifest_codec;
+use bloom_petal_manifest::types::{ArgKind, PetalManifestV0};
 
 // ---------------------------------------------------------------------------
 // Manifest blob embedding
@@ -70,7 +70,7 @@ pub(crate) fn emit_manifest_section(
 // ---------------------------------------------------------------------------
 
 /// Per-argument information [`emit_petal_shim`] needs to lower the
-/// per-arg decode → user-fn dispatch glue. Parallels [`crate::manifest::ArgDecl`]
+/// per-arg decode → user-fn dispatch glue. Parallels [`ArgDecl`](bloom_petal_manifest::types::ArgDecl)
 /// but additionally carries the raw `syn::Type` so we can dispatch on
 /// the inner type shape (`Coin<T>` / `Capability<T>` / primitive / …).
 #[derive(Clone, Debug)]
@@ -671,7 +671,7 @@ pub(crate) fn emit_manifest_accessor(section_ident: &Ident) -> TokenStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::*;
+    use bloom_petal_manifest::types::*;
 
     fn empty_manifest() -> PetalManifestV0 {
         PetalManifestV0 {

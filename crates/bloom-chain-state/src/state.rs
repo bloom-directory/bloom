@@ -209,6 +209,22 @@ pub struct State {
     /// row to keep the table sparse. Root is computed on demand by
     /// [`State::ownership_index_root`].
     pub(crate) ownership: BTreeMap<OwnershipIndexKey, Vec<ObjectId>>,
+    /// VFS path → petal content hash bindings (spec §7.2 path/hash
+    /// pinning, §11.1 module_path).
+    ///
+    /// Populated by `TxKind::Deploy` (which decodes the wasm's
+    /// `bloom_petal_manifest_v0` custom section to read the declared
+    /// `module_path`) and by genesis (for built-in petals seeded at
+    /// chain-init time).
+    ///
+    /// **Phase 1 caveat:** this is a derived in-memory index, **not**
+    /// committed into `state_root`. Two honest replays from the same
+    /// transaction history produce identical VFS bindings, so consensus
+    /// remains deterministic, but a light client that only sees the
+    /// state root cannot prove a path binding. A state-root-committed
+    /// VFS is a Phase 2 followup (would extend the state-root preimage,
+    /// which is a consensus break we're not paying for in this fix).
+    pub(crate) vfs: BTreeMap<String, Hash32>,
 }
 
 impl State {
@@ -221,6 +237,7 @@ impl State {
             code: CodeStore::new(),
             objects: BTreeMap::new(),
             ownership: BTreeMap::new(),
+            vfs: BTreeMap::new(),
         }
     }
 
@@ -342,6 +359,40 @@ impl State {
         } else {
             self.ownership.insert(key, ids);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // VFS path → petal-hash index (spec §7.2 / §11.1, Phase 1 in-memory)
+    // -----------------------------------------------------------------------
+
+    /// Bind `path` to `hash`. Replaces any prior binding for the path.
+    ///
+    /// Called by `TxKind::Deploy` (after decoding the wasm's manifest
+    /// custom section) and by genesis (for the well-known LOOM
+    /// fungible petal). Not state-root-committed — see the `vfs` field
+    /// docs.
+    pub fn set_vfs_binding(&mut self, path: String, hash: Hash32) {
+        if path.is_empty() {
+            return;
+        }
+        self.vfs.insert(path, hash);
+    }
+
+    /// Look up the petal hash bound to `path`, if any.
+    ///
+    /// The PTB validator uses this to verify that a `PetalRef`'s
+    /// `(path, hash)` pair agrees with the on-chain VFS binding
+    /// (spec §7.2 step 3). An unbound path returns `None`, which the
+    /// validator treats permissively (pure-hash PetalRefs still
+    /// validate).
+    pub fn vfs_lookup(&self, path: &str) -> Option<Hash32> {
+        self.vfs.get(path).copied()
+    }
+
+    /// Iterate every VFS binding in path-sorted order. Useful for
+    /// snapshot tooling.
+    pub fn iter_vfs(&self) -> impl Iterator<Item = (&String, &Hash32)> {
+        self.vfs.iter()
     }
 
     // -----------------------------------------------------------------------

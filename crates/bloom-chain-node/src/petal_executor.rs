@@ -49,24 +49,29 @@ use crate::ptb_chain_iface::PtbChainAdapter;
 /// (e.g. `Arc::new(ChainPetalExecutor)` in `node.rs`,
 /// `&ChainPetalExecutor` in test fixtures) remain source-compatible.
 ///
-/// PTB-mode `Command::Move` dispatch needs a per-petal manifest stub
-/// for the validator's typecheck. Production currently has no
-/// in-state manifest registry — TODO(task#36 / spec §16.5) — so the
-/// default unit-struct flow ships with an empty registry, and any
-/// `Move`-bearing PTB reverts at validation. Tests that need to
-/// exercise §16.2 host imports thread a manifest map through
-/// [`ChainPetalExecutorWithManifests`] (a thin wrapper that
-/// `impl PetalExecutor`s by delegating into the same code path).
+/// PTB-mode `Command::Move` dispatch is **chain-authoritative**: the
+/// validator's typecheck pulls each referenced petal's manifest by
+/// decoding the `bloom_petal_manifest_v0` wasm custom section (spec
+/// §8.1, §11.1) on demand via [`PtbChainAdapter::new`]. No external
+/// manifest registry is required.
 pub struct ChainPetalExecutor;
 
-/// Test wrapper around [`ChainPetalExecutor`] that injects a
-/// per-petal manifest registry into the SubmitPtb dispatch path.
+/// **Test-only** wrapper around [`ChainPetalExecutor`] that injects a
+/// per-petal manifest override map into the SubmitPtb dispatch path.
 ///
-/// Drives the same `execute_tx` body as the unit-struct flow with
-/// the only difference being the manifest source consulted by the
-/// PTB validator.
+/// Production code uses [`ChainPetalExecutor`] directly, which derives
+/// manifests from each petal's wasm custom section. This wrapper
+/// exists for tests that need to validate PTBs against petals which
+/// either:
+/// - aren't real wasm (e.g. validator unit tests with mock manifests), or
+/// - need a synthetic manifest that diverges from the petal's embedded
+///   section (e.g. negative-path tests).
+///
+/// The override map is consulted **before** the wasm custom-section
+/// path inside [`PtbChainAdapter::with_overrides`].
 pub struct ChainPetalExecutorWithManifests {
-    /// Per-petal manifest registry consulted by the PTB validator.
+    /// Per-petal manifest override map consulted by the PTB validator
+    /// in lieu of (or in addition to) the wasm custom section.
     pub manifests: HashMap<Hash32, PetalManifestStub>,
 }
 
@@ -264,8 +269,8 @@ impl PetalExecutor for ChainPetalExecutor {
         proposer: Address,
         parent_hash: Hash32,
     ) -> ExecOutput {
-        // Unit-struct executor: no manifest registry, so any
-        // `Move`-bearing PTB reverts at validation.
+        // Production path: manifests resolve from each petal's wasm
+        // custom section. `None` overrides ⇒ wasm-only resolution.
         execute_tx_impl(
             tx,
             state,
@@ -273,7 +278,7 @@ impl PetalExecutor for ChainPetalExecutor {
             timestamp_ms,
             proposer,
             parent_hash,
-            &HashMap::new(),
+            None,
         )
     }
 }
@@ -295,14 +300,15 @@ impl PetalExecutor for ChainPetalExecutorWithManifests {
             timestamp_ms,
             proposer,
             parent_hash,
-            &self.manifests,
+            Some(&self.manifests),
         )
     }
 }
 
-/// Shared `PetalExecutor::execute_tx` body. The trailing
-/// `manifests` parameter is the per-petal manifest registry the PTB
-/// validator consults during `Command::Move` typechecks.
+/// Shared `PetalExecutor::execute_tx` body. The trailing `manifests`
+/// parameter is an optional per-petal manifest **override** map the
+/// PTB validator consults *before* the wasm custom-section path
+/// during `Command::Move` typechecks. Production passes `None`.
 fn execute_tx_impl(
     tx: &Tx,
     state: &mut State,
@@ -310,7 +316,7 @@ fn execute_tx_impl(
     timestamp_ms: u64,
     _proposer: Address,
     parent_hash: Hash32,
-    manifests: &HashMap<Hash32, PetalManifestStub>,
+    manifests: Option<&HashMap<Hash32, PetalManifestStub>>,
 ) -> ExecOutput {
         // `parent_hash` is the committing block's parent block hash —
         // surfaced to chain-mode petals as `chain::block.prevhash`
@@ -405,6 +411,17 @@ fn execute_tx_impl(
                     ptb_ctx: None,
                 };
 
+                // Decode the petal's manifest custom section (if
+                // present) so we can bind `module_path → petal_hash` in
+                // the VFS index. New-framework petals always carry one;
+                // legacy framework petals don't, in which case we leave
+                // the VFS index untouched (the petal is reachable only
+                // by pure-hash refs).
+                let vfs_binding: Option<(String, Hash32)> =
+                    bloom_petal_manifest::extract_petal_manifest_v0(wasm)
+                        .filter(|m| !m.module_path.is_empty())
+                        .map(|m| (m.module_path, petal_hash));
+
                 match PetalVm::run_chain_call(input) {
                     Ok(out) => {
                         if let Some(reason) = out.revert_reason {
@@ -418,6 +435,14 @@ fn execute_tx_impl(
                             }
                         } else {
                             let ws = out.snapshot.commit();
+                            // VFS binding survives the deploy only if
+                            // init succeeded. We apply it directly to
+                            // `state` after the write-set commits (the
+                            // VFS is a derived index, not part of the
+                            // committed state root).
+                            if let Some((path, hash)) = vfs_binding {
+                                state.set_vfs_binding(path, hash);
+                            }
                             tracing::info!(
                                 addr = %hex::encode(addr.0),
                                 fuel_used = out.fuel_used,
@@ -605,11 +630,14 @@ fn execute_tx_impl(
                         let signers = ptb.signers.clone();
 
                         let validated = {
-                            let adapter = PtbChainAdapter::with_manifests(
-                                state,
-                                block_number,
-                                manifests,
-                            );
+                            let adapter = match manifests {
+                                Some(m) => PtbChainAdapter::with_overrides(
+                                    state,
+                                    block_number,
+                                    m,
+                                ),
+                                None => PtbChainAdapter::new(state, block_number),
+                            };
                             let verifier = AlwaysOkVerifier;
                             let ctx = ValidationContext {
                                 current_block: block_number,
@@ -674,12 +702,14 @@ fn execute_tx_impl(
                         // operate on the *same* borrow table the host
                         // imports mutate.
                         let report = {
-                            let adapter =
-                                PtbChainAdapter::with_manifests(
+                            let adapter = match manifests {
+                                Some(m) => PtbChainAdapter::with_overrides(
                                     state,
                                     block_number,
-                                    manifests,
-                                );
+                                    m,
+                                ),
+                                None => PtbChainAdapter::new(state, block_number),
+                            };
                             let mut exec = PtbExecutor::with_ctx_arc(
                                 &adapter,
                                 &runner,

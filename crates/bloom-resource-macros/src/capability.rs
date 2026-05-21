@@ -13,7 +13,7 @@ use syn::{Attribute, GenericParam, ItemStruct, Meta};
 
 use crate::ast::{attr_is_named, ident, parse_ident_list, parse_str_value, struct_name};
 use crate::error::err_spanned;
-use crate::manifest::{CapabilityDecl, TypeParamDecl, TypeParamKind};
+use bloom_petal_manifest::types::{CapabilityDecl, TypeParamDecl, TypeParamKind};
 use syn::spanned::Spanned;
 
 /// Parsed `#[capability(...)]` attribute.
