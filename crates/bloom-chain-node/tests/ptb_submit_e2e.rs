@@ -484,7 +484,13 @@ fn out_of_fuel_reverts_atomically() {
     );
 
     assert!(!out.success, "out-of-fuel must revert");
-    assert!(out.write_set.is_none(), "revert must drop write set");
+    // P0-5: the revert path now emits a write set carrying the
+    // gas-payer Coin<LOOM> debit + proposer credit. PTB-side state
+    // mutations are still dropped — only the gas accounting is kept.
+    assert!(
+        out.write_set.is_some(),
+        "revert must still settle gas via a write set (P0-5)"
+    );
     assert!(out.logs.is_empty(), "revert must drop logs");
 
     let reason = String::from_utf8_lossy(&out.return_data);

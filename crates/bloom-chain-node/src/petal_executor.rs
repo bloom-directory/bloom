@@ -28,7 +28,7 @@ use bloom_chain_types::{
     types::{Address, Hash32},
 };
 use bloom_objects::{Object, ObjectId, Owner, OwnershipIndexKey, OWNER_KIND_ADDRESS};
-use bloom_petal_fungible::ops::{coin_payload, type_tag_coin_loom};
+use bloom_petal_fungible::ops::{coin_payload, decode_coin_value, rewrite_value, type_tag_coin_loom};
 use bloom_petals::{BlockCtx as PetalBlockCtx, ChainCallInput, ChainEntry, PetalVm};
 use bloom_script::{
     executor::{LogEntry as PtbLogEntry, PtbExecutor},
@@ -337,7 +337,7 @@ fn execute_tx_impl(
     state: &mut State,
     block_number: u64,
     timestamp_ms: u64,
-    _proposer: Address,
+    proposer: Address,
     parent_hash: Hash32,
     manifests: Option<&HashMap<Hash32, PetalManifestStub>>,
     verifier: &dyn SignatureVerifier,
@@ -698,7 +698,54 @@ fn execute_tx_impl(
                             c.signers = signers;
                             Arc::new(Mutex::new(c))
                         };
-                        let snapshot = state.snapshot();
+                        let mut snapshot = state.snapshot();
+
+                        // P0-5: pre-execution gas reservation (spec §7.2
+                        // step 6 + §9.4). The validator already verified
+                        // that the gas-payer `Coin<LOOM>` exists, is
+                        // owned by the first signer, and holds at least
+                        // `gas_budget * gas_price`. Debit the full
+                        // reservation from the coin *before* the PTB
+                        // sees the snapshot so the VM can't observe an
+                        // un-reserved gas-payer balance. Stash the
+                        // pre-execution object so the revert path can
+                        // settle off the original — not whatever the
+                        // PTB might have mutated mid-flight.
+                        //
+                        // When `gas_budget * gas_price == 0` (e.g.
+                        // free-tier PTBs used in tests / micro-tx
+                        // fixtures) we skip the gas plumbing entirely:
+                        // no debit, no refund, no proposer credit. The
+                        // gas-payer object is left untouched so the
+                        // revert path matches the historical contract
+                        // (write_set = None on revert).
+                        let gas_payer_id = ptb.gas_payer;
+                        let gas_budget = ptb.gas_budget;
+                        let gas_price = ptb.gas_price;
+                        let reservation = (gas_budget as u128)
+                            .saturating_mul(gas_price);
+                        let pre_exec_gas_payer = validated
+                            .objects
+                            .get(&gas_payer_id.0)
+                            .cloned()
+                            .expect("validator inserted gas_payer object");
+                        if reservation > 0 {
+                            // Apply pre-debit. `version` is monotonic on
+                            // every mutation (spec §4.4).
+                            let pre_value =
+                                decode_coin_value(&pre_exec_gas_payer.payload)
+                                    .expect("validator decoded coin value");
+                            let debited = pre_value.saturating_sub(reservation);
+                            let new_payload =
+                                rewrite_value(&pre_exec_gas_payer.payload, debited)
+                                    .expect("rewrite Coin<LOOM> payload");
+                            let mut debited_obj = pre_exec_gas_payer.clone();
+                            debited_obj.version =
+                                debited_obj.version.saturating_add(1);
+                            debited_obj.payload = new_payload;
+                            snapshot.insert_object(debited_obj);
+                        }
+
                         let petals_owned = ChainPetalRunner::petals_from_validated(
                             &validated.petals,
                         );
@@ -758,8 +805,32 @@ fn execute_tx_impl(
                         // through the calls.
                         let mut snapshot = runner.into_snapshot();
 
+                        // Clamp fuel actually charged to the inner
+                        // budget — defence-in-depth in case the
+                        // executor accidentally reports more than the
+                        // cap. The reservation we pre-debited is
+                        // `gas_budget * gas_price`, so charging more
+                        // would underflow the refund.
+                        let charged_fuel =
+                            report.fuel_used.min(gas_budget);
+
                         if !report.success {
-                            // Revert: drop everything.
+                            // Revert: drop every PTB-side mutation —
+                            // EXCEPT the gas accounting, which must
+                            // still settle. The pre-execution snapshot
+                            // already debited the gas-payer Coin<LOOM>
+                            // by the full reservation; on revert we
+                            // burn the entire `gas_budget * gas_price`
+                            // to the proposer (no refund, even if
+                            // `report.fuel_used < gas_budget`). Build a
+                            // fresh snapshot off `state` so the
+                            // intermediate writes the PTB made are
+                            // discarded but the gas debit + proposer
+                            // credit still land in the WriteSet.
+                            //
+                            // For zero-reservation PTBs the write_set
+                            // stays `None` — matches the historical
+                            // contract atomic-revert tests rely on.
                             let reason = report
                                 .reverted_with
                                 .as_ref()
@@ -770,12 +841,41 @@ fn execute_tx_impl(
                                 reason = %reason,
                                 "SubmitPtb reverted"
                             );
+                            // Drop the in-flight snapshot.
+                            drop(snapshot);
+                            let ws_out = if reservation > 0 {
+                                let mut gas_snap = state.snapshot();
+                                let mut debited =
+                                    pre_exec_gas_payer.clone();
+                                let pre_value =
+                                    decode_coin_value(&debited.payload)
+                                        .expect("decode pre-exec coin value");
+                                let new_value =
+                                    pre_value.saturating_sub(reservation);
+                                debited.payload =
+                                    rewrite_value(&debited.payload, new_value)
+                                        .expect("rewrite coin payload");
+                                debited.version =
+                                    debited.version.saturating_add(1);
+                                gas_snap.insert_object(debited);
+                                // Credit proposer the full burn.
+                                // Saturating-cast to i128 for safety
+                                // (reservation is bounded by the
+                                // validator's coin-value check).
+                                gas_snap.apply_loom_delta(
+                                    proposer,
+                                    reservation.min(i128::MAX as u128) as i128,
+                                );
+                                Some(gas_snap.commit())
+                            } else {
+                                None
+                            };
                             return ExecOutput {
                                 success: false,
-                                fuel_used: report.fuel_used,
+                                fuel_used: charged_fuel,
                                 return_data: reason.into_bytes(),
                                 logs: vec![],
-                                write_set: None,
+                                write_set: ws_out,
                             };
                         }
 
@@ -810,6 +910,66 @@ fn execute_tx_impl(
                                 .apply_loom_delta(Address(d.address), d.delta);
                         }
 
+                        // P0-5: settle inner gas. The reservation was
+                        // already debited from the gas-payer Coin<LOOM>
+                        // pre-execution. Refund the unused portion to
+                        // the (possibly mutated) gas-payer object, and
+                        // credit the proposer with the burnt portion.
+                        // If the PTB itself deleted the gas-payer
+                        // object we keep the full burn (no refund) but
+                        // still credit the proposer the burnt amount,
+                        // matching the spec's settlement boundary.
+                        let burnt = (charged_fuel as u128)
+                            .saturating_mul(gas_price);
+                        let refund = reservation.saturating_sub(burnt);
+                        if refund > 0 {
+                            if let Some(mut current) =
+                                snapshot.get_object(&gas_payer_id)
+                            {
+                                match decode_coin_value(&current.payload) {
+                                    Ok(cur_value) => {
+                                        let new_value =
+                                            cur_value.saturating_add(refund);
+                                        match rewrite_value(
+                                            &current.payload,
+                                            new_value,
+                                        ) {
+                                            Ok(new_payload) => {
+                                                current.payload = new_payload;
+                                                current.version = current
+                                                    .version
+                                                    .saturating_add(1);
+                                                snapshot.insert_object(current);
+                                            }
+                                            Err(e) => warn!(
+                                                err = ?e,
+                                                gas_payer = %hex::encode(gas_payer_id.0),
+                                                "PTB gas refund: rewrite_value failed; skipping refund"
+                                            ),
+                                        }
+                                    }
+                                    Err(e) => warn!(
+                                        err = ?e,
+                                        gas_payer = %hex::encode(gas_payer_id.0),
+                                        "PTB gas refund: decode_coin_value failed; skipping refund"
+                                    ),
+                                }
+                            } else {
+                                warn!(
+                                    gas_payer = %hex::encode(gas_payer_id.0),
+                                    "PTB gas refund: gas-payer object deleted by PTB; skipping refund"
+                                );
+                            }
+                        }
+                        // Proposer credit (always — burnt or full
+                        // burn). saturating_cast i128 for safety.
+                        if burnt > 0 {
+                            snapshot.apply_loom_delta(
+                                proposer,
+                                burnt.min(i128::MAX as u128) as i128,
+                            );
+                        }
+
                         let ws = snapshot.commit();
                         let logs: Vec<Log> = report
                             .logs
@@ -826,7 +986,7 @@ fn execute_tx_impl(
 
                         ExecOutput {
                             success: true,
-                            fuel_used: report.fuel_used,
+                            fuel_used: charged_fuel,
                             return_data,
                             logs,
                             write_set: Some(ws),

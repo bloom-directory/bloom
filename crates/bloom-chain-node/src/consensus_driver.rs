@@ -459,15 +459,115 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
             continue;
         }
 
-        // 3. Max-fee reservation.
+        // 3. SubmitPtb outer/inner gas reconciliation (P0-5, spec §7.2 +
+        //    §9.4). PTBs run on the gas-payer `Coin<LOOM>` object — not
+        //    on the sender's `Account.loom`. We still gate execution on
+        //    the outer envelope's `tx.max_fuel` / `tx.fee_per_unit`
+        //    caps so a malicious sender can't squeeze unlimited VM work
+        //    out of a tiny outer fuel budget. Specifically:
+        //
+        //      tx.max_fuel      >= ptb.gas_budget   (cap covers inner budget)
+        //      tx.fee_per_unit  >= ptb.gas_price    (price covers inner price)
+        //
+        //    Together these guarantee
+        //      outer_max_fee = tx.max_fuel * tx.fee_per_unit
+        //                    >= ptb.gas_budget * ptb.gas_price.
+        //    If the inner budget exceeds either outer cap we reject at
+        //    consensus — Receipt(success=false, fuel_used=0), no debit,
+        //    no execution. Otherwise sender's `Account.loom` is left
+        //    untouched (Option A): the petal executor settles gas
+        //    against the gas-payer `Coin<LOOM>` and credits the
+        //    proposer via a `apply_loom_delta` in its WriteSet.
+        if let TxKind::SubmitPtb { ptb_bytes } = &tx.kind {
+            match bloom_script::decode_ptb(ptb_bytes) {
+                Err(e) => {
+                    // Bump nonce so a re-submission can advance, mirroring
+                    // the policy below for the executor-side decode revert
+                    // (sender already passed sender-derivation + nonce).
+                    let mut acct = sender_acct.unwrap_or_else(empty_account);
+                    acct.nonce += 1;
+                    state.set_account(tx.sender, acct);
+                    receipts.push(Receipt {
+                        tx_hash: tx.tx_hash(),
+                        success: false,
+                        fuel_used: 0,
+                        return_data:
+                            format!("ptb decode error: {e}").into_bytes(),
+                        logs: vec![],
+                    });
+                    continue;
+                }
+                Ok(ptb) => {
+                    let outer_max_fuel_ok = tx.max_fuel >= ptb.gas_budget;
+                    let outer_price_ok =
+                        (tx.fee_per_unit as u128) >= ptb.gas_price;
+                    if !outer_max_fuel_ok || !outer_price_ok {
+                        let mut acct = sender_acct.unwrap_or_else(empty_account);
+                        acct.nonce += 1;
+                        state.set_account(tx.sender, acct);
+                        let reason = format!(
+                            "outer/inner gas cap mismatch: \
+                             tx.max_fuel={} ptb.gas_budget={} \
+                             tx.fee_per_unit={} ptb.gas_price={}",
+                            tx.max_fuel,
+                            ptb.gas_budget,
+                            tx.fee_per_unit,
+                            ptb.gas_price,
+                        );
+                        receipts.push(Receipt {
+                            tx_hash: tx.tx_hash(),
+                            success: false,
+                            fuel_used: 0,
+                            return_data: reason.into_bytes(),
+                            logs: vec![],
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            // Bump nonce; sender's loom stays put.
+            {
+                let mut acct = sender_acct.unwrap_or_else(empty_account);
+                acct.nonce += 1;
+                state.set_account(tx.sender, acct);
+            }
+
+            // 4. Execute via PetalExecutor. All gas settlement
+            //    (gas-payer Coin<LOOM> debit + refund + proposer
+            //    credit) lives in the executor's WriteSet.
+            let output = executor
+                .execute_tx(tx, state, height, timestamp_ms, proposer, parent_hash);
+
+            // Apply whatever the executor produced. On revert the
+            // executor still emits a write_set that carries the
+            // burnt-gas accounting (gas-payer debit + proposer
+            // credit), so we apply it unconditionally rather than
+            // gating on `output.success`.
+            if let Some(ws) = output.write_set
+                && let Err(e) = state.apply(ws) {
+                    warn!(err = %e, "apply write_set failed (SubmitPtb)");
+                }
+
+            total_fuel_used += output.fuel_used;
+            receipts.push(Receipt {
+                tx_hash: tx.tx_hash(),
+                success: output.success,
+                fuel_used: output.fuel_used,
+                logs: output.logs,
+                return_data: output.return_data,
+            });
+            continue;
+        }
+
+        // 3. Max-fee reservation (non-PTB txs).
         let max_fee = tx.max_fuel as u128 * tx.fee_per_unit as u128;
         let value = match &tx.kind {
             TxKind::Call { value_loom, .. } => *value_loom,
             TxKind::Transfer { amount_loom, .. } => *amount_loom,
             TxKind::Deploy { .. } => 0,
-            // PTBs (spec §16.1) do not carry a legacy-level LOOM value;
-            // the petal executor handles gas/value flow at PTB dispatch.
-            TxKind::SubmitPtb { .. } => 0,
+            // Handled in the SubmitPtb early-continue branch above.
+            TxKind::SubmitPtb { .. } => unreachable!(),
         };
         let required = max_fee + value;
         let balance = sender_acct.as_ref().map(|a| a.loom).unwrap_or(0);
