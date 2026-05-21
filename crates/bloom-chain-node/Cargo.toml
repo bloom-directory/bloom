@@ -10,6 +10,8 @@ bloom-chain-types  = { path = "../bloom-chain-types" }
 bloom-chain-state  = { path = "../bloom-chain-state" }
 bloom-chain-consensus = { path = "../bloom-chain-consensus" }
 bloom-petals       = { path = "../bloom-petals" }
+bloom-script       = { path = "../bloom-script" }
+bloom-objects      = { path = "../bloom-objects" }
 bloom-keystore     = { path = "../bloom-keystore" }
 tokio   = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs", "net", "io-util"] }
 serde   = { version = "1", features = ["derive"] }

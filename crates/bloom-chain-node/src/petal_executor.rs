@@ -25,9 +25,13 @@ use bloom_chain_types::{
     types::{Address, Hash32},
 };
 use bloom_petals::{BlockCtx as PetalBlockCtx, ChainCallInput, ChainEntry, PetalVm};
+use bloom_script::{
+    AlwaysOkVerifier, ValidationContext, loom_coin_type_tag, validate_ptb,
+};
 use tracing::warn;
 
 use crate::consensus_driver::{ExecOutput, PetalExecutor, empty_account};
+use crate::ptb_chain_iface::PtbChainAdapter;
 
 /// Production chain-mode executor.
 pub struct ChainPetalExecutor;
@@ -272,23 +276,78 @@ impl PetalExecutor for ChainPetalExecutor {
                 }
             }
 
-            // Phase 1 (spec §16.1, §17): the SubmitPtb variant exists on
-            // the wire so the chain types are forward-compatible, but
-            // execution is intentionally gated off. The dispatcher
-            // rejects every PTB with a `NotYetActivated` revert receipt
-            // that consumes no fuel. Phase 2 replaces this arm with the
-            // real PTB interpreter.
-            TxKind::SubmitPtb { .. } => {
-                warn!(
-                    sender = %hex::encode(tx.sender.0),
-                    "SubmitPtb rejected: NotYetActivated (Phase 1)"
-                );
-                ExecOutput {
-                    success: false,
-                    fuel_used: 0,
-                    return_data: b"NotYetActivated: SubmitPtb (Phase 1)".to_vec(),
-                    logs: vec![],
-                    write_set: None,
+            // PTB dispatch (spec §16.2). The PTB wire bytes are decoded
+            // here; structural decode failures revert atomically with
+            // no fuel consumed beyond the spec-mandated minimum (zero —
+            // the PTB never reached execution). Downstream commits in
+            // this branch wire validator + executor + host imports.
+            TxKind::SubmitPtb { ptb_bytes } => {
+                match bloom_script::decode_ptb(ptb_bytes) {
+                    Err(e) => {
+                        warn!(
+                            sender = %hex::encode(tx.sender.0),
+                            err = %e,
+                            "SubmitPtb decode failed"
+                        );
+                        ExecOutput {
+                            success: false,
+                            fuel_used: 0,
+                            return_data: format!("ptb decode error: {e}").into_bytes(),
+                            logs: vec![],
+                            write_set: None,
+                        }
+                    }
+                    Ok(ptb) => {
+                        // Phase 1 wiring: validate against current
+                        // chain state. The verifier is `AlwaysOk` until
+                        // the PQ-key registry lands (the 32-byte
+                        // `PqPubkey` is a key *identifier*, not the
+                        // full key; the real verifier resolves it
+                        // through an on-chain map).
+                        let adapter = PtbChainAdapter::new(state, block_number);
+                        let verifier = AlwaysOkVerifier;
+                        // Phase 1 LOOM coin type is keyed on the
+                        // all-zero hash until genesis pins the
+                        // fungible petal's content hash.
+                        let loom_coin_type = loom_coin_type_tag(Hash32([0u8; 32]));
+                        let ctx = ValidationContext {
+                            current_block: block_number,
+                            chain: &adapter,
+                            verifier: &verifier,
+                            loom_coin_type,
+                        };
+                        match validate_ptb(&ptb, &ctx) {
+                            Err(e) => {
+                                warn!(
+                                    sender = %hex::encode(tx.sender.0),
+                                    err = %e,
+                                    "SubmitPtb validation failed"
+                                );
+                                ExecOutput {
+                                    success: false,
+                                    fuel_used: 0,
+                                    return_data: format!("ptb validation error: {e}")
+                                        .into_bytes(),
+                                    logs: vec![],
+                                    write_set: None,
+                                }
+                            }
+                            Ok(_validated) => {
+                                // TODO(task#31): executor + host-import wiring.
+                                warn!(
+                                    sender = %hex::encode(tx.sender.0),
+                                    "SubmitPtb validated but executor not yet wired"
+                                );
+                                ExecOutput {
+                                    success: false,
+                                    fuel_used: 0,
+                                    return_data: b"ptb execution not yet wired".to_vec(),
+                                    logs: vec![],
+                                    write_set: None,
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

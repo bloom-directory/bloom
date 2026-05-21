@@ -31,6 +31,7 @@ pub mod genesis;
 pub mod mempool_persist;
 pub mod node;
 pub mod petal_executor;
+pub mod ptb_chain_iface;
 pub mod receipt_store;
 pub mod rpc;
 pub mod state_blob;
