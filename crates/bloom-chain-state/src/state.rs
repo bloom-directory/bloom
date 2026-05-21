@@ -44,6 +44,7 @@ use bloom_chain_types::{
     Address, Hash32,
     digest::{blake3_tagged, tags},
 };
+use bloom_objects::{Object, ObjectId, OwnershipIndexKey};
 
 use crate::{
     account::Account,
@@ -71,9 +72,40 @@ pub enum StorageDelta {
     Delete,
 }
 
+/// An object trie delta (spec §16.3): insertion / update with the full
+/// canonical `Object` payload, or an explicit deletion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObjectDelta {
+    /// Insert or update the object record.
+    Set(Object),
+    /// Delete the object from the trie.
+    Remove,
+}
+
+/// An ownership-index trie delta (spec §16.3): a re-keyed list of
+/// `ObjectId`s for a given `OwnershipIndexKey`, or a deletion of the
+/// row (empty list ⇒ delete to keep the trie sparse).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OwnershipDelta {
+    /// Replace the row with this sorted list of owned `ObjectId`s.
+    Set(Vec<ObjectId>),
+    /// Drop the row entirely.
+    Remove,
+}
+
 /// A set of mutations produced by committing a `StateSnapshot`.
 ///
 /// Apply to a `State` via [`State::apply`].
+///
+/// PTB-specific fields (spec §16.3, Phase 1):
+/// - `object_writes` / `object_deletes` — `Object` trie diffs.
+/// - `ownership_changes` — `OwnershipIndex` trie diffs.
+/// - `loom_deltas` — signed `loom` adjustments folded into the
+///   accounts trie at apply time.
+///
+/// The trie *roots* (`object_root` / `ownership_index_root`) stay zero
+/// in Phase 1 — the data lives in-memory in `State`. Phase 2 will
+/// merkleise the same fields without touching this struct.
 #[derive(Clone, Debug, Default)]
 pub struct WriteSet {
     /// Generation of the state this write set was produced from.
@@ -90,6 +122,58 @@ pub struct WriteSet {
     /// patterns like "deploy then call" or an `init` that self-calls — the
     /// staged code must be visible within the snapshot that staged it.
     pub(crate) code: BTreeMap<Hash32, Vec<u8>>,
+    /// Object trie diffs keyed by `ObjectId` (spec §16.3).
+    pub(crate) objects: BTreeMap<ObjectId, ObjectDelta>,
+    /// OwnershipIndex trie diffs keyed by `OwnershipIndexKey`.
+    pub(crate) ownership: BTreeMap<OwnershipIndexKey, OwnershipDelta>,
+    /// Per-account signed `loom` deltas (spec §9.2). Multiple deltas
+    /// for the same address inside one snapshot are accumulated.
+    pub(crate) loom_deltas: BTreeMap<Address, i128>,
+}
+
+impl WriteSet {
+    /// All `Object` records being inserted or updated in this write set.
+    ///
+    /// Convenience accessor for the PTB executor's commit step (and for
+    /// tests). Order is `BTreeMap` iteration order over `ObjectId`.
+    pub fn object_writes(&self) -> Vec<&Object> {
+        self.objects
+            .values()
+            .filter_map(|d| match d {
+                ObjectDelta::Set(o) => Some(o),
+                ObjectDelta::Remove => None,
+            })
+            .collect()
+    }
+
+    /// All `ObjectId`s being removed from the object trie.
+    pub fn object_deletes(&self) -> Vec<ObjectId> {
+        self.objects
+            .iter()
+            .filter_map(|(id, d)| match d {
+                ObjectDelta::Remove => Some(*id),
+                ObjectDelta::Set(_) => None,
+            })
+            .collect()
+    }
+
+    /// All ownership rows being rewritten in this write set
+    /// (`(key, new sorted-list)`). `Remove` deltas are surfaced as
+    /// empty lists.
+    pub fn ownership_changes(&self) -> Vec<(OwnershipIndexKey, Vec<ObjectId>)> {
+        self.ownership
+            .iter()
+            .map(|(k, d)| match d {
+                OwnershipDelta::Set(ids) => (*k, ids.clone()),
+                OwnershipDelta::Remove => (*k, Vec::new()),
+            })
+            .collect()
+    }
+
+    /// Snapshot of accumulated signed Loom deltas.
+    pub fn loom_deltas(&self) -> &BTreeMap<Address, i128> {
+        &self.loom_deltas
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -108,12 +192,23 @@ pub struct State {
     pub(crate) accounts: AccountsTrie,
     pub(crate) storage: BTreeMap<Address, StorageTrie>,
     pub(crate) code: CodeStore,
+    /// In-memory Object table backing the `Object` trie (spec §16.3).
+    ///
+    /// Populated by `WriteSet::object_writes` / `object_deletes`. Phase 1
+    /// keeps this as a plain map; Phase 2 will merkleise it.
+    pub(crate) objects: BTreeMap<ObjectId, Object>,
+    /// In-memory OwnershipIndex backing the `OwnershipIndex` trie.
+    ///
+    /// Populated by `WriteSet::ownership_changes`. Empty lists evict the
+    /// row to keep the table sparse.
+    pub(crate) ownership: BTreeMap<OwnershipIndexKey, Vec<ObjectId>>,
     /// Object trie root (spec §16.3, Phase 1).
     ///
-    /// Always `Hash32([0u8; 32])` in Phase 1 because no PTBs execute
-    /// yet. The field exists so the state-root commitment is stable
-    /// across the Phase 1 → Phase 2 cutover. Phase 2 will populate
-    /// this from a live `bloom_objects::store::ObjectTrie`.
+    /// Always `Hash32([0u8; 32])` in Phase 1 because the merkleisation
+    /// algorithm is Phase 2 work. The field exists so the state-root
+    /// commitment is stable across the Phase 1 → Phase 2 cutover.
+    /// Phase 2 will populate this from a live
+    /// `bloom_objects::store::ObjectTrie` keyed on `objects` above.
     pub(crate) object_root: Hash32,
     /// OwnershipIndex trie root (spec §16.3, Phase 1).
     ///
@@ -129,6 +224,8 @@ impl State {
             accounts: AccountsTrie::new(),
             storage: BTreeMap::new(),
             code: CodeStore::new(),
+            objects: BTreeMap::new(),
+            ownership: BTreeMap::new(),
             object_root: Hash32([0u8; 32]),
             ownership_index_root: Hash32([0u8; 32]),
         }
@@ -205,6 +302,53 @@ impl State {
     /// Get wasm bytes by petal hash.
     pub fn get_code(&self, hash: &Hash32) -> Option<&[u8]> {
         self.code.get(hash)
+    }
+
+    // -----------------------------------------------------------------------
+    // Object trie access (spec §16.3, Phase 1 in-memory)
+    // -----------------------------------------------------------------------
+
+    /// Read an object by id (returns `None` if not present).
+    pub fn get_object(&self, id: &ObjectId) -> Option<Object> {
+        self.objects.get(id).cloned()
+    }
+
+    /// Insert / overwrite an object.
+    ///
+    /// Real PTB code paths land here only through `State::apply`
+    /// (a committed `WriteSet`). Direct invocation is reserved for
+    /// genesis fixtures and tests.
+    pub fn set_object(&mut self, obj: Object) {
+        self.objects.insert(obj.id, obj);
+    }
+
+    /// Remove an object by id.
+    pub fn remove_object(&mut self, id: &ObjectId) {
+        self.objects.remove(id);
+    }
+
+    /// Iterate every object currently stored, in `ObjectId` order.
+    pub fn iter_objects(&self) -> impl Iterator<Item = (&ObjectId, &Object)> {
+        self.objects.iter()
+    }
+
+    // -----------------------------------------------------------------------
+    // OwnershipIndex trie access (spec §16.3, Phase 1 in-memory)
+    // -----------------------------------------------------------------------
+
+    /// Read the sorted list of `ObjectId`s for an owner key.
+    pub fn get_ownership(&self, key: &OwnershipIndexKey) -> Option<Vec<ObjectId>> {
+        self.ownership.get(key).cloned()
+    }
+
+    /// Set the ownership row for `key` to `ids`. An empty list deletes
+    /// the row to keep the table sparse.
+    pub fn set_ownership(&mut self, key: OwnershipIndexKey, ids: Vec<ObjectId>) {
+        if ids.is_empty() {
+            self.ownership.remove(&key);
+        } else {
+            self.ownership.insert(key, ids);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -306,6 +450,47 @@ impl State {
             self.code.insert(&wasm);
         }
 
+        // PTB extensions (spec §16.3) — Phase 1 in-memory storage.
+        for (id, delta) in ws.objects {
+            match delta {
+                ObjectDelta::Set(obj) => {
+                    self.objects.insert(id, obj);
+                }
+                ObjectDelta::Remove => {
+                    self.objects.remove(&id);
+                }
+            }
+        }
+        for (key, delta) in ws.ownership {
+            match delta {
+                OwnershipDelta::Set(ids) => {
+                    if ids.is_empty() {
+                        self.ownership.remove(&key);
+                    } else {
+                        self.ownership.insert(key, ids);
+                    }
+                }
+                OwnershipDelta::Remove => {
+                    self.ownership.remove(&key);
+                }
+            }
+        }
+        // Apply signed Loom deltas after account-level Set/Remove ops,
+        // so a snapshot that did `set_account(...)` followed by
+        // `apply_loom_delta(...)` reflects the delta on top of the new
+        // balance (which is the order `StateSnapshot::apply_loom_delta`
+        // already enforces via its in-snapshot read-modify-write).
+        for (addr, delta) in ws.loom_deltas {
+            let mut acct = self.accounts.get(&addr).unwrap_or_else(Account::empty);
+            if delta >= 0 {
+                acct.loom = acct.loom.saturating_add(delta as u128);
+            } else {
+                let mag = (-delta) as u128;
+                acct.loom = acct.loom.saturating_sub(mag);
+            }
+            self.accounts.set(addr, acct);
+        }
+
         self.generation += 1;
         Ok(())
     }
@@ -346,12 +531,33 @@ pub struct StateSnapshot {
 
 impl StateSnapshot {
     /// Read an account, respecting any pending writes in this snapshot.
+    ///
+    /// The order is: account Set/Remove delta wins (if present), else
+    /// base; *then* any pending `loom_deltas` adjustment is folded on
+    /// top so callers in the same snapshot see the up-to-date balance.
     pub fn get_account(&self, addr: &Address) -> Option<Account> {
-        match self.write_set.accounts.get(addr) {
+        let base_acct = match self.write_set.accounts.get(addr) {
             Some(AccountDelta::Set(a)) => Some(a.clone()),
             Some(AccountDelta::Remove) => None,
             None => self.base.accounts.get(addr),
+        };
+        let loom_delta = self
+            .write_set
+            .loom_deltas
+            .get(addr)
+            .copied()
+            .unwrap_or(0);
+        if loom_delta == 0 {
+            return base_acct;
         }
+        let mut acct = base_acct.unwrap_or_else(Account::empty);
+        if loom_delta >= 0 {
+            acct.loom = acct.loom.saturating_add(loom_delta as u128);
+        } else {
+            let mag = (-loom_delta) as u128;
+            acct.loom = acct.loom.saturating_sub(mag);
+        }
+        if acct.is_empty() { None } else { Some(acct) }
     }
 
     /// Stage an account write.
@@ -417,6 +623,76 @@ impl StateSnapshot {
             return Some(bytes.as_slice());
         }
         self.base.get_code(hash)
+    }
+
+    // ----------------------------------------------------------------
+    // Object trie access (PTB executor / chain VM use this)
+    // ----------------------------------------------------------------
+
+    /// Read an object, respecting any pending writes/deletes in this snapshot.
+    pub fn get_object(&self, id: &ObjectId) -> Option<Object> {
+        match self.write_set.objects.get(id) {
+            Some(ObjectDelta::Set(o)) => Some(o.clone()),
+            Some(ObjectDelta::Remove) => None,
+            None => self.base.get_object(id),
+        }
+    }
+
+    /// Stage an object insert / update.
+    pub fn insert_object(&mut self, obj: Object) {
+        self.write_set
+            .objects
+            .insert(obj.id, ObjectDelta::Set(obj));
+    }
+
+    /// Stage an object delete.
+    pub fn delete_object(&mut self, id: ObjectId) {
+        self.write_set
+            .objects
+            .insert(id, ObjectDelta::Remove);
+    }
+
+    // ----------------------------------------------------------------
+    // OwnershipIndex access
+    // ----------------------------------------------------------------
+
+    /// Read an ownership row, respecting any pending writes/deletes
+    /// in this snapshot.
+    pub fn get_ownership(&self, key: &OwnershipIndexKey) -> Option<Vec<ObjectId>> {
+        match self.write_set.ownership.get(key) {
+            Some(OwnershipDelta::Set(ids)) => Some(ids.clone()),
+            Some(OwnershipDelta::Remove) => None,
+            None => self.base.get_ownership(key),
+        }
+    }
+
+    /// Stage an ownership-row rewrite. Empty `ids` deletes the row.
+    pub fn set_ownership(&mut self, key: OwnershipIndexKey, ids: Vec<ObjectId>) {
+        if ids.is_empty() {
+            self.write_set.ownership.insert(key, OwnershipDelta::Remove);
+        } else {
+            self.write_set.ownership.insert(key, OwnershipDelta::Set(ids));
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Loom deltas (spec §9.2 — signed adjustments)
+    // ----------------------------------------------------------------
+
+    /// Stage a signed Loom adjustment for `addr`.
+    ///
+    /// Snapshot reads via `get_account` reflect the cumulative delta
+    /// (overlaid on the base balance via [`get_account`]). `State::apply`
+    /// folds the total into the live account in a single pass after the
+    /// account-level Set/Remove deltas, so a snapshot that does
+    /// `set_account(...)` followed by `apply_loom_delta(...)` ends up
+    /// with the delta applied on top of the explicit set value.
+    /// Multiple deltas accumulate additively.
+    ///
+    /// [`get_account`]: Self::get_account
+    pub fn apply_loom_delta(&mut self, addr: Address, delta: i128) {
+        let entry = self.write_set.loom_deltas.entry(addr).or_insert(0);
+        *entry = entry.saturating_add(delta);
     }
 
     /// Extract the accumulated write set for application to the parent state.
@@ -556,5 +832,146 @@ mod tests {
         state.apply(snap.commit()).unwrap();
         // Live state should reflect the committed write
         assert_eq!(state.get_account(&addr(1)).unwrap().loom, 200);
+    }
+
+    // ------------------------------------------------------------------
+    // PTB extensions (spec §16.3): object writes, object deletes,
+    // ownership re-keys, Loom deltas.
+    //
+    // Phase 1 keeps the *trie roots* (`object_root` and
+    // `ownership_index_root`) at zero — the data lives in the in-memory
+    // state maps but is not yet merkleised. Phase 2 will compute roots
+    // over the same fields.
+    // ------------------------------------------------------------------
+
+    use bloom_objects::{Object, ObjectId, Owner, OwnershipIndexKey, TypeTag};
+
+    fn sample_object(id_byte: u8, owner: Owner, version: u64) -> Object {
+        Object {
+            id: ObjectId([id_byte; 32]),
+            type_tag: TypeTag::Concrete {
+                petal_hash: [0u8; 32],
+                type_name: "Coin".to_string(),
+                type_args: vec![],
+            },
+            owner,
+            version,
+            payload: vec![1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn snapshot_insert_object_round_trips_via_state() {
+        let mut state = State::new();
+        let mut snap = state.snapshot();
+        let obj = sample_object(0xA1, Owner::Address([0x11u8; 32]), 1);
+        let id = obj.id;
+        snap.insert_object(obj.clone());
+        // Snapshot read sees staged write before commit.
+        assert_eq!(snap.get_object(&id).as_ref(), Some(&obj));
+        state.apply(snap.commit()).unwrap();
+        assert_eq!(state.get_object(&id).as_ref(), Some(&obj));
+    }
+
+    #[test]
+    fn snapshot_delete_object_removes_from_state() {
+        let mut state = State::new();
+        let obj = sample_object(0xA2, Owner::Address([0x11u8; 32]), 1);
+        let id = obj.id;
+        // Seed the base state with the object via an initial commit.
+        let mut snap = state.snapshot();
+        snap.insert_object(obj.clone());
+        state.apply(snap.commit()).unwrap();
+        assert!(state.get_object(&id).is_some());
+
+        let mut snap2 = state.snapshot();
+        snap2.delete_object(id);
+        // Snapshot read sees deletion.
+        assert!(snap2.get_object(&id).is_none());
+        state.apply(snap2.commit()).unwrap();
+        assert!(state.get_object(&id).is_none());
+    }
+
+    #[test]
+    fn snapshot_set_ownership_round_trips_via_state() {
+        let mut state = State::new();
+        let key = OwnershipIndexKey {
+            owner_kind: bloom_objects::OWNER_KIND_ADDRESS,
+            owner_id: [0x22u8; 32],
+        };
+        let id_a = ObjectId([1u8; 32]);
+        let id_b = ObjectId([2u8; 32]);
+        let mut snap = state.snapshot();
+        snap.set_ownership(key, vec![id_a, id_b]);
+        // Snapshot read.
+        let v = snap.get_ownership(&key).expect("staged ownership entry");
+        assert_eq!(v, vec![id_a, id_b]);
+        state.apply(snap.commit()).unwrap();
+        assert_eq!(state.get_ownership(&key), Some(vec![id_a, id_b]));
+
+        // Clearing via empty list deletes.
+        let mut snap2 = state.snapshot();
+        snap2.set_ownership(key, vec![]);
+        state.apply(snap2.commit()).unwrap();
+        assert!(state.get_ownership(&key).is_none());
+    }
+
+    #[test]
+    fn snapshot_apply_loom_delta_modifies_balance() {
+        let mut state = State::new();
+        state.set_account(addr(1), acct(100));
+        let mut snap = state.snapshot();
+        snap.apply_loom_delta(addr(1), 50);
+        // Snapshot read reflects the credit.
+        assert_eq!(snap.get_account(&addr(1)).unwrap().loom, 150);
+        state.apply(snap.commit()).unwrap();
+        assert_eq!(state.get_account(&addr(1)).unwrap().loom, 150);
+
+        // Debit.
+        let mut snap2 = state.snapshot();
+        snap2.apply_loom_delta(addr(1), -30);
+        state.apply(snap2.commit()).unwrap();
+        assert_eq!(state.get_account(&addr(1)).unwrap().loom, 120);
+    }
+
+    #[test]
+    fn snapshot_apply_loom_delta_creates_account_when_absent() {
+        let mut state = State::new();
+        let mut snap = state.snapshot();
+        snap.apply_loom_delta(addr(7), 42);
+        state.apply(snap.commit()).unwrap();
+        assert_eq!(state.get_account(&addr(7)).unwrap().loom, 42);
+    }
+
+    #[test]
+    fn phase1_object_root_stays_zero_after_object_writes() {
+        // Spec §16.3 Phase 1: object_root/ownership_index_root remain
+        // at zero even after object writes land — the data is held in
+        // memory; merkleisation is Phase 2 work.
+        let mut state = State::new();
+        let mut snap = state.snapshot();
+        snap.insert_object(sample_object(0xA1, Owner::Shared, 1));
+        snap.set_ownership(
+            OwnershipIndexKey {
+                owner_kind: bloom_objects::OWNER_KIND_ADDRESS,
+                owner_id: [0u8; 32],
+            },
+            vec![ObjectId([1u8; 32])],
+        );
+        state.apply(snap.commit()).unwrap();
+        assert_eq!(state.object_root(), Hash32([0u8; 32]));
+        assert_eq!(state.ownership_index_root(), Hash32([0u8; 32]));
+    }
+
+    #[test]
+    fn write_set_carries_object_writes_and_deletes() {
+        let state = State::new();
+        let mut snap = state.snapshot();
+        let obj = sample_object(0xA1, Owner::Shared, 1);
+        snap.insert_object(obj.clone());
+        snap.delete_object(ObjectId([0xBB; 32]));
+        let ws = snap.commit();
+        assert!(ws.object_writes().iter().any(|o| o.id == obj.id));
+        assert!(ws.object_deletes().contains(&ObjectId([0xBB; 32])));
     }
 }

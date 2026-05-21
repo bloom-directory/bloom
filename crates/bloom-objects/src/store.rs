@@ -62,7 +62,7 @@ pub fn decode_object_trie_value(bytes: &[u8]) -> Result<Object, CodecError> {
 ///
 /// `Shared` and `Immutable` owners are not indexed (no `owner_id`),
 /// per spec §4.5.
-#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
 pub struct OwnershipIndexKey {
     /// Owner kind discriminant (see `OWNER_KIND_*` in [`crate::object`]).
     pub owner_kind: u8,

@@ -2086,6 +2086,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "bloom-chain-types",
+ "bloom-objects",
  "ethereum_ssz",
  "hex",
  "proptest",
