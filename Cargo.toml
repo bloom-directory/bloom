@@ -41,6 +41,7 @@ members = [
   "crates/bloom-petal-it",
   "crates/bloom-dex-math",
   "crates/bloom-petal-dex-cpmm",
+  "crates/bloom-petal-dex-pool",
   # ---- example apps (not part of the protocol) ----
   "examples/wloom",
   "examples/dex/crates/bloom-dex-erc20",
@@ -136,6 +137,7 @@ bloom-petal-fungible = { path = "crates/bloom-petal-fungible", version = "0.1.0"
 bloom-petal-cap   = { path = "crates/bloom-petal-cap", version = "0.1.0" }
 bloom-dex-math    = { path = "crates/bloom-dex-math" }
 bloom-petal-dex-cpmm = { path = "crates/bloom-petal-dex-cpmm", version = "0.1.0" }
+bloom-petal-dex-pool = { path = "crates/bloom-petal-dex-pool" }
 bloom-contract    = { path = "crates/bloom-contract", default-features = false }
 bloom-contract-macros = { path = "crates/bloom-contract-macros" }
 bloom-contract-metadata = { path = "crates/bloom-contract-metadata" }
