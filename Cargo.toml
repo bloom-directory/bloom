@@ -30,6 +30,7 @@ members = [
   "crates/bloom-resource",
   "crates/bloom-resource-macros",
   "crates/bloom-script",
+  "crates/bloom-petal-cap",
   "crates/bloom-contract",
   "crates/bloom-contract-macros",
   "crates/bloom-contract-metadata",
@@ -127,6 +128,7 @@ bloom-objects     = { path = "crates/bloom-objects" }
 bloom-resource    = { path = "crates/bloom-resource" }
 bloom-resource-macros = { path = "crates/bloom-resource-macros" }
 bloom-script      = { path = "crates/bloom-script" }
+bloom-petal-cap   = { path = "crates/bloom-petal-cap", version = "0.1.0" }
 bloom-contract    = { path = "crates/bloom-contract", default-features = false }
 bloom-contract-macros = { path = "crates/bloom-contract-macros" }
 bloom-contract-metadata = { path = "crates/bloom-contract-metadata" }

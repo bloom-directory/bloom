@@ -19,3 +19,12 @@ bloom-objects = { workspace = true }
 
 [dev-dependencies]
 bloom-resource = { workspace = true }
+
+# The macro-emitted petal shim is gated on `feature = "no-entrypoint"`
+# so downstream library consumers can suppress the wasm exports. The
+# feature lives on the petal *crates* (e.g. `bloom-petal-cap`), not on
+# this proc-macro crate. Tell `--check-cfg` about it so fixtures that
+# expand the macro under this crate's own compilation context don't
+# trip the `unexpected_cfgs` lint.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("no-entrypoint"))'] }

@@ -86,7 +86,11 @@ pub(crate) fn emit_petal_shim(fn_decl: &FunctionDecl) -> TokenStream {
         /// Auto-generated wasm export shim for `#[bloom::petal]` fn
         /// (spec §11.1). Returns `PetalError::Unsupported` until the
         /// per-arg/per-return marshaling lands.
-        #[cfg(target_arch = "wasm32")]
+        ///
+        /// Gated on `not(feature = "no-entrypoint")` so that downstream
+        /// crates depending on this petal as a library can suppress the
+        /// wasm export symbols and avoid duplicate-export link errors.
+        #[cfg(all(target_arch = "wasm32", not(feature = "no-entrypoint")))]
         #[unsafe(export_name = #export_name)]
         pub extern "C" fn #shim_ident(
             _args_ptr: i32,

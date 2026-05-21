@@ -2459,6 +2459,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-petal-cap"
+version = "0.1.0"
+dependencies = [
+ "bloom-objects",
+ "bloom-resource",
+ "bloom-resource-macros",
+]
+
+[[package]]
 name = "bloom-petal-sdk"
 version = "0.1.0"
 dependencies = [
