@@ -134,6 +134,16 @@ pub mod ops {
         TypeTag::Generic { idx: 0 }
     }
 
+    /// The canonical `TypeTag` for `Coin<LOOM>` with the zero
+    /// `petal_hash` sentinel (used at genesis before the fungible petal
+    /// is deployed; see spec §9.3 and the EpochZero note).
+    ///
+    /// Both the `Coin` and `LOOM` type tags carry `petal_hash = [0u8;32]`
+    /// — the on-chain sentinel for "fungible petal, not yet hashed".
+    pub fn type_tag_coin_loom() -> TypeTag {
+        type_tag_with_arg("Coin", &type_tag_no_args("LOOM"))
+    }
+
     // -----------------------------------------------------------------
     // Operations
     // -----------------------------------------------------------------

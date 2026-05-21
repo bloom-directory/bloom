@@ -2061,6 +2061,7 @@ dependencies = [
  "bloom-chain-types",
  "bloom-keystore",
  "bloom-objects",
+ "bloom-petal-fungible",
  "bloom-petals",
  "bloom-script",
  "bloom-test-util",

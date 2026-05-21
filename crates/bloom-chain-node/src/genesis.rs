@@ -28,6 +28,8 @@ use bloom_chain_consensus::ValidatorSet;
 use bloom_chain_consensus::validator_set::Validator;
 use bloom_chain_state::{Account, State};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes};
+use bloom_objects::{Object, ObjectId, Owner, OwnershipIndexKey, OWNER_KIND_ADDRESS};
+use bloom_petal_fungible::ops::{coin_payload, type_tag_coin_loom};
 use serde::{Deserialize, Serialize};
 
 use crate::error::NodeError;
@@ -156,8 +158,24 @@ impl Genesis {
     }
 
     /// Apply allocations to an empty `State`, producing the genesis state.
+    ///
+    /// For each allocation this method:
+    /// 1. Writes `Account.loom = amount` (the derived cache, spec §9.2).
+    /// 2. Emits a `Coin<LOOM>` object with a deterministic `ObjectId`
+    ///    and transfers it to the recipient (equivalent to what running
+    ///    `bloom_petal_fungible::ops::mint_genesis` on-chain would produce,
+    ///    but written directly to avoid running wasm at genesis).
+    ///
+    /// `ObjectId` derivation (one deterministic id per allocation):
+    /// `blake3("bloom.genesis.loom" || genesis_hash || idx_le32)`
+    ///
+    /// // EpochZero is implicit at genesis: the linear cap is consumed by
+    /// // this genesis pipeline, not by an on-chain wasm call.
     pub fn apply_to_state(&self, state: &mut State) {
-        for (addr, amount) in &self.allocations {
+        let coin_type = type_tag_coin_loom();
+
+        for (idx, (addr, amount)) in self.allocations.iter().enumerate() {
+            // ── 1. Account.loom cache (spec §9.2) ─────────────────────────
             let acct = Account {
                 nonce: 0,
                 loom: *amount,
@@ -166,6 +184,40 @@ impl Genesis {
                 manifest_hash: None,
             };
             state.set_account(*addr, acct);
+
+            // ── 2. Coin<LOOM> object ───────────────────────────────────────
+            //
+            // Derive a deterministic ObjectId:
+            // blake3("bloom.genesis.loom" || genesis_hash_bytes || idx_le32)
+            let coin_id = {
+                let mut h = blake3::Hasher::new();
+                h.update(b"bloom.genesis.loom");
+                h.update(&self.genesis_hash.0);
+                h.update(&(idx as u32).to_le_bytes());
+                ObjectId(*h.finalize().as_bytes())
+            };
+
+            let owner = Owner::Address(addr.0);
+            let obj = Object {
+                id: coin_id,
+                type_tag: coin_type.clone(),
+                owner: owner.clone(),
+                version: 0,
+                // coin_payload encodes ObjectId([0;32]) placeholder + u128 value
+                payload: coin_payload(*amount),
+            };
+            state.set_object(obj);
+
+            // Update the OwnershipIndex for this recipient.
+            let okey = OwnershipIndexKey {
+                owner_kind: OWNER_KIND_ADDRESS,
+                owner_id: addr.0,
+            };
+            let mut owned = state.get_ownership(&okey).unwrap_or_default();
+            // Insert coin_id maintaining sorted order.
+            let pos = owned.partition_point(|id| id.0 < coin_id.0);
+            owned.insert(pos, coin_id);
+            state.set_ownership(okey, owned);
         }
     }
 }
@@ -307,5 +359,176 @@ impl Default for NodeConfig {
             fuel_limit: Some(30_000_000),
             wasmtime_version: Some(env!("CARGO_PKG_VERSION").into()),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bloom_chain_consensus::ValidatorSet;
+    use bloom_chain_consensus::validator_set::Validator;
+    use bloom_chain_types::types::PubKeyBytes;
+    use bloom_objects::{OWNER_KIND_ADDRESS, OwnershipIndexKey};
+    use bloom_petal_fungible::ops::{decode_coin_value, type_tag_coin_loom};
+
+    /// Build a minimal `Genesis` (no file I/O needed) with `n` allocations.
+    fn make_genesis(allocations: Vec<([u8; 32], u128)>) -> Genesis {
+        let pk = PubKeyBytes(vec![0u8; 1984]);
+        let addr = Address([0xAAu8; 32]);
+        let validator = Validator {
+            address: addr,
+            pubkey: pk,
+            voting_power: 1,
+        };
+        let validator_set = ValidatorSet::new(vec![validator]).unwrap();
+
+        let allocs: Vec<(Address, u128)> = allocations
+            .into_iter()
+            .map(|(a, v)| (Address(a), v))
+            .collect();
+
+        let genesis_hash = Hash32([0x42u8; 32]);
+        Genesis {
+            chain_id: "bloomchain.test".into(),
+            genesis_time_ms: 0,
+            validator_set,
+            peer_addrs: vec![],
+            allocations: allocs,
+            genesis_hash,
+        }
+    }
+
+    #[test]
+    fn genesis_emits_coin_loom_objects_for_each_allocation() {
+        let addr_a = [0x01u8; 32];
+        let addr_b = [0x02u8; 32];
+        let addr_c = [0x03u8; 32];
+        let amount_a: u128 = 1_000_000;
+        let amount_b: u128 = 2_000_000;
+        let amount_c: u128 = 3_000_000;
+
+        let genesis = make_genesis(vec![
+            (addr_a, amount_a),
+            (addr_b, amount_b),
+            (addr_c, amount_c),
+        ]);
+
+        let mut state = State::new();
+
+        // TDD: run apply_to_state and assert expected state.
+        genesis.apply_to_state(&mut state);
+
+        let coin_type = type_tag_coin_loom();
+
+        for (idx, (raw_addr, expected_amount)) in
+            [(addr_a, amount_a), (addr_b, amount_b), (addr_c, amount_c)]
+                .iter()
+                .enumerate()
+        {
+            let addr = Address(*raw_addr);
+
+            // 1. Account.loom cache must still match the allocation amount.
+            let acct = state.get_account(&addr).expect("account must exist");
+            assert_eq!(
+                acct.loom, *expected_amount,
+                "Account.loom cache mismatch for idx {idx}"
+            );
+
+            // 2. A Coin<LOOM> object must exist with deterministic id.
+            let coin_id = {
+                let mut h = blake3::Hasher::new();
+                h.update(b"bloom.genesis.loom");
+                h.update(&genesis.genesis_hash.0);
+                h.update(&(idx as u32).to_le_bytes());
+                ObjectId(*h.finalize().as_bytes())
+            };
+
+            let obj = state
+                .get_object(&coin_id)
+                .unwrap_or_else(|| panic!("Coin<LOOM> object missing for idx {idx}"));
+
+            // 3. TypeTag must be Coin<LOOM>.
+            assert_eq!(obj.type_tag, coin_type, "TypeTag mismatch for idx {idx}");
+
+            // 4. Payload must decode to the expected value.
+            let decoded_value = decode_coin_value(&obj.payload)
+                .unwrap_or_else(|_| panic!("payload decode failed for idx {idx}"));
+            assert_eq!(
+                decoded_value, *expected_amount,
+                "coin value mismatch for idx {idx}"
+            );
+
+            // 5. Ownership entry must resolve to Owner::Address(addr).
+            assert_eq!(
+                obj.owner,
+                Owner::Address(*raw_addr),
+                "owner mismatch for idx {idx}"
+            );
+
+            // 6. OwnershipIndex must contain the coin_id for this address.
+            let okey = OwnershipIndexKey {
+                owner_kind: OWNER_KIND_ADDRESS,
+                owner_id: *raw_addr,
+            };
+            let owned = state.get_ownership(&okey).expect("ownership entry must exist");
+            assert!(
+                owned.contains(&coin_id),
+                "OwnershipIndex missing coin_id for idx {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn genesis_coin_ids_are_unique_across_allocations() {
+        // Same address, different amounts: ids must still be unique (indexed by idx).
+        let addr = [0xBBu8; 32];
+        let genesis = make_genesis(vec![(addr, 100), (addr, 200)]);
+        let mut state = State::new();
+        genesis.apply_to_state(&mut state);
+
+        let id0 = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"bloom.genesis.loom");
+            h.update(&genesis.genesis_hash.0);
+            h.update(&0u32.to_le_bytes());
+            ObjectId(*h.finalize().as_bytes())
+        };
+        let id1 = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"bloom.genesis.loom");
+            h.update(&genesis.genesis_hash.0);
+            h.update(&1u32.to_le_bytes());
+            ObjectId(*h.finalize().as_bytes())
+        };
+        assert_ne!(id0, id1, "coin ids must differ across allocation indices");
+        assert!(state.get_object(&id0).is_some());
+        assert!(state.get_object(&id1).is_some());
+    }
+
+    #[test]
+    fn genesis_loom_cache_matches_coin_value() {
+        let addr = [0xCCu8; 32];
+        let amount: u128 = 999_999_999_999_999_999;
+        let genesis = make_genesis(vec![(addr, amount)]);
+        let mut state = State::new();
+        genesis.apply_to_state(&mut state);
+
+        let acct = state.get_account(&Address(addr)).unwrap();
+        assert_eq!(acct.loom, amount);
+
+        let coin_id = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"bloom.genesis.loom");
+            h.update(&genesis.genesis_hash.0);
+            h.update(&0u32.to_le_bytes());
+            ObjectId(*h.finalize().as_bytes())
+        };
+        let obj = state.get_object(&coin_id).unwrap();
+        let value = decode_coin_value(&obj.payload).unwrap();
+        assert_eq!(value, amount, "loom cache and coin payload must agree");
     }
 }
