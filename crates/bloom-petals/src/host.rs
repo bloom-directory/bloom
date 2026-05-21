@@ -128,7 +128,8 @@ mod tests {
     async fn deny_host_denies_chain_read() {
         let h = DenyHost;
         assert!(matches!(
-            h.chain_read_at("eth", "chains/eth/state/0x0/balance", 1).await,
+            h.chain_read_at("eth", "chains/eth/state/0x0/balance", 1)
+                .await,
             Err(HostError::Denied(_))
         ));
     }

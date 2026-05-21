@@ -210,7 +210,12 @@ impl BlockBuilder {
                 state_root,
                 receipts_root,
                 validator_set_hash,
-            } => (txs_root(&self.txs), state_root, receipts_root, validator_set_hash),
+            } => (
+                txs_root(&self.txs),
+                state_root,
+                receipts_root,
+                validator_set_hash,
+            ),
         };
 
         let header = BlockHeader {
@@ -302,9 +307,7 @@ mod tests {
     fn computed_roots_use_validator_set_hash() {
         let v = make_validator_with_keypair();
         let vset = make_validator_set_signed(&[&v], 100);
-        let b = BlockBuilder::at(5)
-            .with_computed_roots(&vset)
-            .build();
+        let b = BlockBuilder::at(5).with_computed_roots(&vset).build();
         assert_eq!(b.header.validator_set_hash, vset.validator_set_hash());
         assert_eq!(b.header.txs_root, txs_root(&[]));
     }

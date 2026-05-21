@@ -31,8 +31,6 @@ fn dispatcher_signature_is_unchanged() {
         &mut GuardedStub,
         &[u8; 32],
         &[u8],
-    ) -> Result<
-        ::std::vec::Vec<u8>,
-        ::bloom_chain_abi::DispatchError,
-    > = guarded::dispatch::<GuardedStub>;
+    ) -> Result<::std::vec::Vec<u8>, ::bloom_chain_abi::DispatchError> =
+        guarded::dispatch::<GuardedStub>;
 }

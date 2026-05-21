@@ -24,8 +24,8 @@
 
 use bloom_objects::{AccessMode, ObjectId, Owner};
 use bloom_petal_fungible::ops;
+use bloom_resource::host::{HostCall, HostResponse, test_hooks};
 use bloom_resource::{Capability, PetalError, RuntimeHandle, UID};
-use bloom_resource::host::{test_hooks, HostCall, HostResponse};
 use core::marker::PhantomData;
 
 /// Reset the mock host before every test.
@@ -290,9 +290,7 @@ fn merge_deletes_other_and_sums_into_dst() {
     let other_c = other_bytes.clone();
     test_hooks::set_responder(move |call| match call {
         HostCall::ObjectRead { handle } if *handle == dst => HostResponse::Bytes(dst_c.clone()),
-        HostCall::ObjectRead { handle } if *handle == other => {
-            HostResponse::Bytes(other_c.clone())
-        }
+        HostCall::ObjectRead { handle } if *handle == other => HostResponse::Bytes(other_c.clone()),
         HostCall::ObjectDelete { .. } | HostCall::ObjectMutate { .. } => HostResponse::Status(0),
         other => panic!("unexpected call {other:?}"),
     });
@@ -476,7 +474,10 @@ fn supply_handle_borrows_by_supply_id() {
 
     // Calling handle() must borrow by id and return supply_handle.
     let got = supply.handle();
-    assert_eq!(got, supply_handle, "handle() must return the borrow-table handle for the supply's id");
+    assert_eq!(
+        got, supply_handle,
+        "handle() must return the borrow-table handle for the supply's id"
+    );
 }
 
 #[test]
@@ -506,7 +507,10 @@ fn mint_entry_point_uses_supply_handle_not_zero() {
         HostCall::ObjectCreate { .. } => HostResponse::Handle(RuntimeHandle::from_raw(99)),
         // mutate supply → ok
         HostCall::ObjectMutate { handle, .. } => {
-            assert_eq!(*handle, supply_handle, "mutate must target supply_handle, not handle 0");
+            assert_eq!(
+                *handle, supply_handle,
+                "mutate must target supply_handle, not handle 0"
+            );
             HostResponse::Status(0)
         }
         other => panic!("unexpected call {other:?}"),

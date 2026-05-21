@@ -55,11 +55,7 @@ use bloom_chain_types::{
 };
 use ssz::Encode;
 
-use crate::{
-    account::Account,
-    error::StateError,
-    state::State,
-};
+use crate::{account::Account, error::StateError, state::State};
 
 const MAGIC: &[u8; 8] = b"BLMSTATE";
 const VERSION: u8 = 0;
@@ -99,7 +95,9 @@ fn read_u64_le(buf: &[u8], off: &mut usize) -> Result<u64, StateError> {
 
 fn read_bytes32(buf: &[u8], off: &mut usize) -> Result<[u8; 32], StateError> {
     if buf.len() < *off + 32 {
-        return Err(StateError::BlobDecode("unexpected EOF reading [u8;32]".into()));
+        return Err(StateError::BlobDecode(
+            "unexpected EOF reading [u8;32]".into(),
+        ));
     }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&buf[*off..*off + 32]);
@@ -186,7 +184,9 @@ impl State {
         let version = bytes[off];
         off += 1;
         if version != VERSION {
-            return Err(StateError::BlobDecode(format!("unsupported version: {version}")));
+            return Err(StateError::BlobDecode(format!(
+                "unsupported version: {version}"
+            )));
         }
 
         let _height = read_u64_le(bytes, &mut off)?;
@@ -208,7 +208,9 @@ impl State {
         for _ in 0..account_count {
             let addr_bytes = read_bytes32(bytes, &mut off)?;
             if bytes.len() < off + Account::SSZ_LEN {
-                return Err(StateError::BlobDecode("unexpected EOF reading account".into()));
+                return Err(StateError::BlobDecode(
+                    "unexpected EOF reading account".into(),
+                ));
             }
             let account = Account::from_ssz_bytes_impl(&bytes[off..off + Account::SSZ_LEN])
                 .map_err(|e| StateError::Ssz(format!("{e:?}")))?;
@@ -295,8 +297,7 @@ impl BlobStore {
 
     /// Open a sled-backed blob store at the given path.
     pub fn open(path: &std::path::Path) -> Result<Self, StateError> {
-        let db = sled::open(path)
-            .map_err(|e| StateError::BlobStore(format!("sled open: {e}")))?;
+        let db = sled::open(path).map_err(|e| StateError::BlobStore(format!("sled open: {e}")))?;
 
         // Rebuild insertion order from sled (alphabetic key order ≠ insertion order,
         // so we cannot fully recover order after restart — we start fresh).

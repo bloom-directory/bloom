@@ -161,8 +161,12 @@ pub mod erc20 {
     pub fn init(ctx: &mut Context, cfg: InitConfig) -> Result<()> {
         let state = State::load(ctx)?;
 
-        state.name.store(ctx, &str_to_bytes32_right(cfg.name.as_str()));
-        state.symbol.store(ctx, &str_to_bytes32_right(cfg.symbol.as_str()));
+        state
+            .name
+            .store(ctx, &str_to_bytes32_right(cfg.name.as_str()));
+        state
+            .symbol
+            .store(ctx, &str_to_bytes32_right(cfg.symbol.as_str()));
         // Widen u8 → u64 so the SlotEncode writes the same low-byte pattern
         // the legacy macro wrote when decimals was declared `u64`.
         state.decimals.store(ctx, &(cfg.decimals as u64));
@@ -232,7 +236,12 @@ pub mod erc20 {
         let state = State::load(ctx)?;
         let sender = ctx.sender();
         do_transfer(ctx, &state, &sender, &to, amount)?;
-        Transfer { from: sender, to, value: amount }.emit(ctx)?;
+        Transfer {
+            from: sender,
+            to,
+            value: amount,
+        }
+        .emit(ctx)?;
         Ok(true)
     }
 
@@ -254,7 +263,12 @@ pub mod erc20 {
         }
 
         do_transfer(ctx, &state, &from, &to, amount)?;
-        Transfer { from, to, value: amount }.emit(ctx)?;
+        Transfer {
+            from,
+            to,
+            value: amount,
+        }
+        .emit(ctx)?;
         Ok(true)
     }
 
@@ -262,7 +276,12 @@ pub mod erc20 {
         let state = State::load(ctx)?;
         let owner = ctx.sender();
         state.allowances.set(ctx, &(owner, spender), &value)?;
-        Approval { owner, spender, value }.emit(ctx)?;
+        Approval {
+            owner,
+            spender,
+            value,
+        }
+        .emit(ctx)?;
         Ok(true)
     }
 
@@ -407,12 +426,24 @@ mod tests {
             let b = h.as_bytes();
             [b[0], b[1], b[2], b[3]]
         }
-        assert_eq!(Erc20::SEL_TOTAL_SUPPLY,   expected(b"erc20.total_supply()"));
-        assert_eq!(Erc20::SEL_BALANCE_OF,     expected(b"erc20.balance_of(address)"));
-        assert_eq!(Erc20::SEL_ALLOWANCE,      expected(b"erc20.allowance(address,address)"));
-        assert_eq!(Erc20::SEL_TRANSFER,       expected(b"erc20.transfer(address,u256)"));
-        assert_eq!(Erc20::SEL_TRANSFER_FROM,  expected(b"erc20.transfer_from(address,address,u256)"));
-        assert_eq!(Erc20::SEL_APPROVE,        expected(b"erc20.approve(address,u256)"));
+        assert_eq!(Erc20::SEL_TOTAL_SUPPLY, expected(b"erc20.total_supply()"));
+        assert_eq!(
+            Erc20::SEL_BALANCE_OF,
+            expected(b"erc20.balance_of(address)")
+        );
+        assert_eq!(
+            Erc20::SEL_ALLOWANCE,
+            expected(b"erc20.allowance(address,address)")
+        );
+        assert_eq!(
+            Erc20::SEL_TRANSFER,
+            expected(b"erc20.transfer(address,u256)")
+        );
+        assert_eq!(
+            Erc20::SEL_TRANSFER_FROM,
+            expected(b"erc20.transfer_from(address,address,u256)")
+        );
+        assert_eq!(Erc20::SEL_APPROVE, expected(b"erc20.approve(address,u256)"));
     }
 
     #[test]

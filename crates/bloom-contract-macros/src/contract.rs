@@ -117,30 +117,32 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
                 continue;
             }
             let is_fallback = has_marker(&f.attrs, "fallback");
-            if matches!(f.vis, Visibility::Public(_)) && !has_marker(&f.attrs, "internal")
-                && let Some(spec) = HandlerSpec::from_fn(f, &domain) {
-                    if is_fallback {
-                        if fallback_name.is_some() {
-                            return syn::Error::new_spanned(
-                                &f.sig.ident,
-                                "#[bloom::contract] only supports a single `#[fallback]` method",
-                            )
-                            .to_compile_error()
-                            .into();
-                        }
-                        if !spec.arg_idents.is_empty() {
-                            return syn::Error::new_spanned(
-                                &f.sig.ident,
-                                "#[fallback] method must take no calldata args \
-                                 (calldata is shorter than a selector when fallback fires)",
-                            )
-                            .to_compile_error()
-                            .into();
-                        }
-                        fallback_name = Some(spec.name.clone());
+            if matches!(f.vis, Visibility::Public(_))
+                && !has_marker(&f.attrs, "internal")
+                && let Some(spec) = HandlerSpec::from_fn(f, &domain)
+            {
+                if is_fallback {
+                    if fallback_name.is_some() {
+                        return syn::Error::new_spanned(
+                            &f.sig.ident,
+                            "#[bloom::contract] only supports a single `#[fallback]` method",
+                        )
+                        .to_compile_error()
+                        .into();
                     }
-                    handlers.push(spec);
+                    if !spec.arg_idents.is_empty() {
+                        return syn::Error::new_spanned(
+                            &f.sig.ident,
+                            "#[fallback] method must take no calldata args \
+                                 (calldata is shorter than a selector when fallback fires)",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+                    fallback_name = Some(spec.name.clone());
                 }
+                handlers.push(spec);
+            }
             // Strip method-level marker attributes regardless of branch so
             // the emitted module compiles.
             for marker in ["view", "payable", "nonreentrant", "internal", "fallback"] {
@@ -392,7 +394,8 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     // `<name>.manifest.json`.
     let manifest_methods: Vec<ManifestMethod> =
         handlers.iter().map(|h| h.to_manifest_method()).collect();
-    let manifest_json = manifest::build_skeleton_json(&module, &domain, &manifest_methods, &interfaces);
+    let manifest_json =
+        manifest::build_skeleton_json(&module, &domain, &manifest_methods, &interfaces);
     let manifest_bytes = LitByteStr::new(manifest_json.as_bytes(), proc_macro2::Span::call_site());
     let manifest_len = manifest_json.len();
     let manifest_static_ident = format_ident!("__BLOOM_MANIFEST_{}", module_ident);

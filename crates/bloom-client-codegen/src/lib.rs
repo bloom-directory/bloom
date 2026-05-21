@@ -37,16 +37,28 @@ pub enum CodegenError {
     /// The interface method's canonical signature is not parseable
     /// (missing `(`, unbalanced parens, etc.).
     #[error("malformed signature `{signature}` on method `{method}`: {reason}")]
-    BadSignature { method: String, signature: String, reason: &'static str },
+    BadSignature {
+        method: String,
+        signature: String,
+        reason: &'static str,
+    },
 
     /// The signature names an argument type the codegen doesn't know
     /// how to emit. New types should be added to [`ArgType`].
     #[error("unsupported argument type `{ty}` in method `{method}` (signature: `{signature}`)")]
-    UnsupportedType { method: String, signature: String, ty: String },
+    UnsupportedType {
+        method: String,
+        signature: String,
+        ty: String,
+    },
 
     /// Selector hex did not parse to a 4-byte value.
     #[error("method `{method}` has invalid selector `{selector}`: {reason}")]
-    BadSelector { method: String, selector: String, reason: &'static str },
+    BadSelector {
+        method: String,
+        selector: String,
+        reason: &'static str,
+    },
 
     /// Underlying wasm read / parse failure when extracting interface
     /// records from a binary.
@@ -136,20 +148,21 @@ struct ParsedSig<'a> {
     args: Vec<&'a str>,
 }
 
-fn parse_signature<'a>(
-    method: &str,
-    signature: &'a str,
-) -> Result<ParsedSig<'a>, CodegenError> {
-    let open = signature.find('(').ok_or_else(|| CodegenError::BadSignature {
-        method: method.into(),
-        signature: signature.into(),
-        reason: "missing `(`",
-    })?;
-    let close = signature.rfind(')').ok_or_else(|| CodegenError::BadSignature {
-        method: method.into(),
-        signature: signature.into(),
-        reason: "missing `)`",
-    })?;
+fn parse_signature<'a>(method: &str, signature: &'a str) -> Result<ParsedSig<'a>, CodegenError> {
+    let open = signature
+        .find('(')
+        .ok_or_else(|| CodegenError::BadSignature {
+            method: method.into(),
+            signature: signature.into(),
+            reason: "missing `(`",
+        })?;
+    let close = signature
+        .rfind(')')
+        .ok_or_else(|| CodegenError::BadSignature {
+            method: method.into(),
+            signature: signature.into(),
+            reason: "missing `)`",
+        })?;
     if close < open {
         return Err(CodegenError::BadSignature {
             method: method.into(),
@@ -194,7 +207,9 @@ pub fn generate_client(iface: &InterfaceManifest) -> Result<String, CodegenError
     let struct_name = format!("{}Client", iface.name);
 
     out.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n");
-    out.push_str(&format!("pub struct {struct_name} {{\n    pub address: [u8; 32],\n}}\n\n"));
+    out.push_str(&format!(
+        "pub struct {struct_name} {{\n    pub address: [u8; 32],\n}}\n\n"
+    ));
 
     out.push_str(&format!("impl {struct_name} {{\n"));
     out.push_str(&format!(
@@ -380,9 +395,7 @@ mod tests {
     fn emits_typed_args_in_declaration_order() {
         let src = generate_client(&erc20_iface()).expect("codegen ok");
         assert!(
-            src.contains(
-                "pub fn transfer_calldata(arg0: [u8; 32], arg1: ::bloom_chain_abi::U256)"
-            ),
+            src.contains("pub fn transfer_calldata(arg0: [u8; 32], arg1: ::bloom_chain_abi::U256)"),
             "got:\n{src}"
         );
         assert!(src.contains("e.push_address(&arg0);"));
@@ -436,7 +449,10 @@ mod tests {
             methods: vec![entry("f", "bad.f", "00000000")],
         };
         let err = generate_client(&iface).expect_err("should fail");
-        assert!(matches!(err, CodegenError::BadSignature { .. }), "got {err:?}");
+        assert!(
+            matches!(err, CodegenError::BadSignature { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -447,7 +463,10 @@ mod tests {
             methods: vec![entry("f", "bad.f()", "0102")],
         };
         let err = generate_client(&iface).expect_err("should fail");
-        assert!(matches!(err, CodegenError::BadSelector { .. }), "got {err:?}");
+        assert!(
+            matches!(err, CodegenError::BadSelector { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -473,7 +492,9 @@ mod tests {
         assert_eq!(ifaces[0].name, "Erc20");
 
         let src = generate_client(&ifaces[0]).expect("codegen ok");
-        assert!(src.contains("pub fn transfer_calldata(arg0: [u8; 32], arg1: ::bloom_chain_abi::U256)"));
+        assert!(
+            src.contains("pub fn transfer_calldata(arg0: [u8; 32], arg1: ::bloom_chain_abi::U256)")
+        );
         assert!(src.contains("pub const SEL_TRANSFER: [u8; 4] = [0xde, 0xad, 0xbe, 0xef];"));
     }
 

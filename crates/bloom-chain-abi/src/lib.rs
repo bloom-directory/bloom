@@ -21,14 +21,14 @@
 
 extern crate alloc;
 
-pub mod u256;
-pub mod encode;
 pub mod decode;
-pub mod dyn_codec;
 pub mod dispatch;
-pub mod selector;
+pub mod dyn_codec;
+pub mod encode;
 pub mod event;
+pub mod selector;
 pub mod storage;
+pub mod u256;
 
 pub use decode::{AbiError, Buf};
 pub use dispatch::DispatchError;

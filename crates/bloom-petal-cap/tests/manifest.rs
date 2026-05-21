@@ -255,10 +255,7 @@ fn manifest_exposes_required_capabilities_on_revoke() {
         revoke.required_capabilities
     );
     match &revoke.required_capabilities[0] {
-        TypeTag::Concrete {
-            type_name,
-            ..
-        } => {
+        TypeTag::Concrete { type_name, .. } => {
             assert_eq!(type_name, "RevokeCap");
         }
         other => panic!("expected Concrete RevokeCap tag, got {:?}", other),
@@ -278,8 +275,10 @@ fn manifest_records_required_signer_on_new() {
         new_fn.required_signers, 1,
         "new<T>(_signer: &Signer, ...) must declare 1 required signer"
     );
-    assert!(matches!(new_fn.args.first(), Some(a) if a.kind == 0),
-        "first arg of `new` must be the Signer");
+    assert!(
+        matches!(new_fn.args.first(), Some(a) if a.kind == 0),
+        "first arg of `new` must be the Signer"
+    );
 }
 
 #[test]

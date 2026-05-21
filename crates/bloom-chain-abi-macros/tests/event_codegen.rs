@@ -17,8 +17,7 @@ impl bar::Handler for BarStub {}
 fn event_emit_fns_have_expected_shapes() {
     // We don't invoke them — `log::emit` panics on host — but referencing
     // their fn-pointer types proves they exist with the correct shape.
-    let _: fn(&[u8; 32], &[u8; 32], &bloom_chain_abi::U256) =
-        bar::abi::events::emit_transfer;
+    let _: fn(&[u8; 32], &[u8; 32], &bloom_chain_abi::U256) = bar::abi::events::emit_transfer;
     let _: fn(u128, u128) = bar::abi::events::emit_sync;
 }
 

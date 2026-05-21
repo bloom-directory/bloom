@@ -49,8 +49,14 @@ impl demo::Handler for DemoStub {}
 #[test]
 fn every_emitted_topic_matches_blake3_of_sig() {
     let pairs: &[(&[u8; 4], &str)] = &[
-        (&demo::abi::events::TRANSFER_TOPIC, demo::abi::events::TRANSFER_SIG),
-        (&demo::abi::events::APPROVAL_TOPIC, demo::abi::events::APPROVAL_SIG),
+        (
+            &demo::abi::events::TRANSFER_TOPIC,
+            demo::abi::events::TRANSFER_SIG,
+        ),
+        (
+            &demo::abi::events::APPROVAL_TOPIC,
+            demo::abi::events::APPROVAL_SIG,
+        ),
         (&demo::abi::events::MINT_TOPIC, demo::abi::events::MINT_SIG),
         (&demo::abi::events::BURN_TOPIC, demo::abi::events::BURN_SIG),
         (&demo::abi::events::SWAP_TOPIC, demo::abi::events::SWAP_SIG),

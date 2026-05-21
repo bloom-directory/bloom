@@ -180,7 +180,11 @@ mod tests {
 
     #[test]
     fn access_mode_roundtrip() {
-        for m in [AccessMode::ReadOnly, AccessMode::Mutable, AccessMode::Consume] {
+        for m in [
+            AccessMode::ReadOnly,
+            AccessMode::Mutable,
+            AccessMode::Consume,
+        ] {
             assert_eq!(AccessMode::from_byte(m.as_byte()).unwrap(), m);
         }
     }

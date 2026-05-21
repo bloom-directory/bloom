@@ -95,7 +95,8 @@ pub fn build_skeleton_json(
                     let derive_input = struct_to_derive_input(s);
                     let storage_domain = parse_domain_arg(storage_attr)
                         .unwrap_or_else(|| pascal_to_snake(&s.ident.to_string()));
-                    if let Some(mut fields) = collect_storage_fields(&derive_input, &storage_domain) {
+                    if let Some(mut fields) = collect_storage_fields(&derive_input, &storage_domain)
+                    {
                         storage_fields.append(&mut fields);
                     }
                 } else if let Some(event_attr) = find_attr(&s.attrs, "event") {
@@ -185,9 +186,10 @@ fn parse_domain_arg(attr: &Attribute) -> Option<String> {
     let mut out: Option<String> = None;
     let _ = list.parse_nested_meta(|nested| {
         if nested.path.is_ident("domain")
-            && let Ok(v) = nested.value().and_then(|s| s.parse::<LitStr>()) {
-                out = Some(v.value());
-            }
+            && let Ok(v) = nested.value().and_then(|s| s.parse::<LitStr>())
+        {
+            out = Some(v.value());
+        }
         Ok(())
     });
     out
@@ -227,7 +229,8 @@ fn collect_storage_fields(input: &DeriveInput, domain: &str) -> Option<Vec<Value
         };
         let name = ident.to_string();
         let compat = parse_storage_compat_tag(&field.attrs);
-        let (shape, kind_json, slot_hex) = classify_storage_field(&field.ty, domain, &name, compat.as_deref())?;
+        let (shape, kind_json, slot_hex) =
+            classify_storage_field(&field.ty, domain, &name, compat.as_deref())?;
         let _ = shape;
         let mut entry = serde_json::Map::new();
         entry.insert("name".into(), Value::String(name));
@@ -250,9 +253,10 @@ fn parse_storage_compat_tag(attrs: &[Attribute]) -> Option<String> {
             let mut tag: Option<String> = None;
             let _ = list.parse_nested_meta(|nested| {
                 if nested.path.is_ident("compat_tag")
-                    && let Ok(v) = nested.value().and_then(|s| s.parse::<LitStr>()) {
-                        tag = Some(v.value());
-                    }
+                    && let Ok(v) = nested.value().and_then(|s| s.parse::<LitStr>())
+                {
+                    tag = Some(v.value());
+                }
                 Ok(())
             });
             return tag;
@@ -408,9 +412,7 @@ fn build_error_variant_entry(domain: &str, enum_name: &str, variant: &Variant) -
             .unnamed
             .iter()
             .enumerate()
-            .map(|(i, f)| {
-                json!({ "name": format!("_{i}"), "ty": ty_label(&f.ty) })
-            })
+            .map(|(i, f)| json!({ "name": format!("_{i}"), "ty": ty_label(&f.ty) }))
             .collect(),
         Fields::Named(n) => n
             .named
@@ -431,7 +433,12 @@ fn build_error_variant_entry(domain: &str, enum_name: &str, variant: &Variant) -
     })
 }
 
-fn build_variant_signature(domain: &str, enum_name: &str, variant: &str, fields: &Fields) -> String {
+fn build_variant_signature(
+    domain: &str,
+    enum_name: &str,
+    variant: &str,
+    fields: &Fields,
+) -> String {
     let mut s = String::new();
     if !domain.is_empty() {
         s.push_str(domain);

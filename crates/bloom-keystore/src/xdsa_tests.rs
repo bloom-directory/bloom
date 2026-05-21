@@ -8,10 +8,9 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
-        Keystore, WalletAddress, WalletKind,
-        create_xdsa_wallet, load_xdsa_wallet,
+        Keystore, WalletAddress, WalletKind, create_xdsa_wallet, load_xdsa_wallet,
         xdsa::{
-            XdsaPublicKey, XdsaSecretKey, XdsaSignature, XDSA_PK_LEN, XDSA_SIG_LEN, derive_address,
+            XDSA_PK_LEN, XDSA_SIG_LEN, XdsaPublicKey, XdsaSecretKey, XdsaSignature, derive_address,
         },
     };
 
@@ -79,7 +78,8 @@ mod tests {
         // Sign with loaded key and verify with stored pubkey.
         let msg = b"hello bloom-chain";
         let sig = wallet.sign(msg);
-        pk.verify(msg, &sig).expect("loaded wallet must produce valid sig");
+        pk.verify(msg, &sig)
+            .expect("loaded wallet must produce valid sig");
     }
 
     // ── wrong passphrase is rejected ────────────────────────────────────────
@@ -106,7 +106,8 @@ mod tests {
         assert_eq!(info.kind, WalletKind::Local);
 
         // Unlock it — must succeed.
-        ks.unlock("legacy", "pass").expect("secp256k1 wallet must unlock");
+        ks.unlock("legacy", "pass")
+            .expect("secp256k1 wallet must unlock");
         assert!(ks.is_unlocked("legacy"));
 
         // The signer is available.
@@ -126,7 +127,10 @@ mod tests {
         let json_str = std::str::from_utf8(&blob).unwrap();
 
         // v=2 and algorithm=xdsa must be present.
-        assert!(json_str.contains("\"v\":2"), "version must be 2: {json_str}");
+        assert!(
+            json_str.contains("\"v\":2"),
+            "version must be 2: {json_str}"
+        );
         assert!(
             json_str.contains("\"algorithm\":\"xdsa\""),
             "algorithm must be xdsa: {json_str}"

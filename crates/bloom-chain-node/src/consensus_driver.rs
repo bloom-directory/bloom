@@ -24,10 +24,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use bloom_chain_consensus::{
-    ConsensusEngine,
-    auth::verify_vote_sig,
-    signer::Signer,
-    validator_set::ValidatorSet,
+    ConsensusEngine, auth::verify_vote_sig, signer::Signer, validator_set::ValidatorSet,
     verifier::SigVerifier,
 };
 use bloom_chain_state::{Account, State, WriteSet};
@@ -43,12 +40,8 @@ use parking_lot::Mutex;
 use tracing::{info, warn};
 
 use crate::{
-    block_store::BlockStore,
-    mempool_persist::MempoolPersist,
-    receipt_store::ReceiptStore,
-    state_blob::StateBlobStore,
-    state_index::StateIndex,
-    transport::PeerPool,
+    block_store::BlockStore, mempool_persist::MempoolPersist, receipt_store::ReceiptStore,
+    state_blob::StateBlobStore, state_index::StateIndex, transport::PeerPool,
 };
 
 // ---------------------------------------------------------------------------
@@ -491,16 +484,14 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
                         tx_hash: tx.tx_hash(),
                         success: false,
                         fuel_used: 0,
-                        return_data:
-                            format!("ptb decode error: {e}").into_bytes(),
+                        return_data: format!("ptb decode error: {e}").into_bytes(),
                         logs: vec![],
                     });
                     continue;
                 }
                 Ok(ptb) => {
                     let outer_max_fuel_ok = tx.max_fuel >= ptb.gas_budget;
-                    let outer_price_ok =
-                        (tx.fee_per_unit as u128) >= ptb.gas_price;
+                    let outer_price_ok = (tx.fee_per_unit as u128) >= ptb.gas_price;
                     if !outer_max_fuel_ok || !outer_price_ok {
                         let mut acct = sender_acct.unwrap_or_else(empty_account);
                         acct.nonce += 1;
@@ -509,10 +500,7 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
                             "outer/inner gas cap mismatch: \
                              tx.max_fuel={} ptb.gas_budget={} \
                              tx.fee_per_unit={} ptb.gas_price={}",
-                            tx.max_fuel,
-                            ptb.gas_budget,
-                            tx.fee_per_unit,
-                            ptb.gas_price,
+                            tx.max_fuel, ptb.gas_budget, tx.fee_per_unit, ptb.gas_price,
                         );
                         receipts.push(Receipt {
                             tx_hash: tx.tx_hash(),
@@ -536,8 +524,8 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
             // 4. Execute via PetalExecutor. All gas settlement
             //    (gas-payer Coin<LOOM> debit + refund + proposer
             //    credit) lives in the executor's WriteSet.
-            let output = executor
-                .execute_tx(tx, state, height, timestamp_ms, proposer, parent_hash);
+            let output =
+                executor.execute_tx(tx, state, height, timestamp_ms, proposer, parent_hash);
 
             // Apply whatever the executor produced. On revert the
             // executor still emits a write_set that carries the
@@ -545,9 +533,10 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
             // credit), so we apply it unconditionally rather than
             // gating on `output.success`.
             if let Some(ws) = output.write_set
-                && let Err(e) = state.apply(ws) {
-                    warn!(err = %e, "apply write_set failed (SubmitPtb)");
-                }
+                && let Err(e) = state.apply(ws)
+            {
+                warn!(err = %e, "apply write_set failed (SubmitPtb)");
+            }
 
             total_fuel_used += output.fuel_used;
             receipts.push(Receipt {
@@ -610,9 +599,10 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
             // settling on top of the post-write_set balance produces the
             // same numbers minus the clobber hazard. Review 2026-05-19 #5.
             if let Some(ws) = output.write_set
-                && let Err(e) = state.apply(ws) {
-                    warn!(err = %e, "apply write_set failed");
-                }
+                && let Err(e) = state.apply(ws)
+            {
+                warn!(err = %e, "apply write_set failed");
+            }
 
             // Refund unused fuel.
             let mut sender = state.get_account(&tx.sender).unwrap_or_else(empty_account);
@@ -715,8 +705,9 @@ impl<E: PetalExecutor> ConsensusDriver<E> {
         block: &Block,
         expected_height: u64,
     ) -> std::result::Result<(), String> {
-        let parent =
-            self.expected_parent_hash(expected_height).map_err(|e| e.to_string())?;
+        let parent = self
+            .expected_parent_hash(expected_height)
+            .map_err(|e| e.to_string())?;
         let validator_set = { self.engine.lock().validator_set.clone() };
         validate_block_for_apply(
             block,

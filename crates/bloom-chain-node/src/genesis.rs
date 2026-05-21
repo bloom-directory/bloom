@@ -28,7 +28,7 @@ use bloom_chain_consensus::ValidatorSet;
 use bloom_chain_consensus::validator_set::Validator;
 use bloom_chain_state::{Account, State};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes};
-use bloom_objects::{Object, ObjectId, Owner, OwnershipIndexKey, OWNER_KIND_ADDRESS};
+use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
 use bloom_petal_fungible::ops::{coin_payload, type_tag_coin_loom};
 use serde::{Deserialize, Serialize};
 
@@ -94,9 +94,8 @@ pub struct Genesis {
 impl Genesis {
     /// Parse and validate a genesis TOML file.
     pub fn from_file(path: &Path) -> Result<Self, NodeError> {
-        let text = std::fs::read_to_string(path).map_err(|e| {
-            NodeError::Genesis(format!("read {}: {e}", path.display()))
-        })?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| NodeError::Genesis(format!("read {}: {e}", path.display())))?;
         let raw: GenesisFile = toml::from_str(&text)
             .map_err(|e| NodeError::Genesis(format!("parse genesis.toml: {e}")))?;
         Self::from_raw(raw)
@@ -137,10 +136,9 @@ impl Genesis {
         for alloc in &raw.allocations {
             let addr = parse_b1_address(&alloc.address)
                 .map_err(|e| NodeError::Genesis(format!("allocation address: {e}")))?;
-            let amount: u128 = alloc
-                .amount
-                .parse()
-                .map_err(|e| NodeError::Genesis(format!("allocation amount '{}': {e}", alloc.amount)))?;
+            let amount: u128 = alloc.amount.parse().map_err(|e| {
+                NodeError::Genesis(format!("allocation amount '{}': {e}", alloc.amount))
+            })?;
             allocations.push((addr, amount));
         }
 
@@ -234,11 +232,12 @@ pub fn parse_b1_address(s: &str) -> Result<Address> {
     // Allow raw hex for dev convenience.
     if s.len() == 64
         && let Ok(bytes) = hex::decode(s)
-            && bytes.len() == 32 {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                return Ok(Address(arr));
-            }
+        && bytes.len() == 32
+    {
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        return Ok(Address(arr));
+    }
 
     // Strip b1 prefix.
     let rest = s
@@ -253,8 +252,8 @@ pub fn parse_b1_address(s: &str) -> Result<Address> {
 
     // Decode base32 (RFC 4648 lower, no padding).
     // Use zbase32's decode_full_bytes_str helper (same as bloom-chain-types uses).
-    let bytes = zbase32::decode_full_bytes_str(payload_b32)
-        .map_err(|e| anyhow!("base32 decode: {e}"))?;
+    let bytes =
+        zbase32::decode_full_bytes_str(payload_b32).map_err(|e| anyhow!("base32 decode: {e}"))?;
 
     if bytes.len() != 32 {
         return Err(anyhow!(
@@ -268,7 +267,6 @@ pub fn parse_b1_address(s: &str) -> Result<Address> {
 }
 
 fn base64_decode(s: &str) -> Result<Vec<u8>> {
-    
     // Use the standard base64 alphabet.
     // We avoid pulling in the `base64` crate; use std's built-in decoder via
     // a simple wrapper.  Since the keystore already uses base64 via alloy, we
@@ -474,7 +472,9 @@ mod tests {
                 owner_kind: OWNER_KIND_ADDRESS,
                 owner_id: *raw_addr,
             };
-            let owned = state.get_ownership(&okey).expect("ownership entry must exist");
+            let owned = state
+                .get_ownership(&okey)
+                .expect("ownership entry must exist");
             assert!(
                 owned.contains(&coin_id),
                 "OwnershipIndex missing coin_id for idx {idx}"

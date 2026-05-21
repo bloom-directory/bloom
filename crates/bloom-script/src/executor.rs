@@ -389,9 +389,7 @@ impl<'c> PtbExecutor<'c> {
             Command::TransferObjects { uses, owner } => {
                 self.exec_transfer(uses, owner.clone(), cmd_idx, ownership_changes)
             }
-            Command::SplitCoins { src, amounts } => {
-                self.exec_split_coins(src, amounts, cmd_idx)
-            }
+            Command::SplitCoins { src, amounts } => self.exec_split_coins(src, amounts, cmd_idx),
             Command::MergeCoins(uses) => self.exec_merge_coins(uses, cmd_idx),
             Command::MakeMoveVec { ty, uses } => self.exec_make_vec_inner(ty, uses, cmd_idx),
             Command::Publish(p) => self.exec_publish(p, cmd_idx, report),
@@ -438,19 +436,16 @@ impl<'c> PtbExecutor<'c> {
         let outputs_snapshot = self.with_ctx(|ctx| ctx.command_outputs.clone());
         let args_buf = marshal_args(&m.args, &outputs_snapshot)?;
 
-        let hash = m
-            .petal
-            .hash
-            .ok_or_else(|| PtbError::PetalNotPinned {
-                path: m.petal.path.clone(),
-            })?;
+        let hash = m.petal.hash.ok_or_else(|| PtbError::PetalNotPinned {
+            path: m.petal.path.clone(),
+        })?;
 
         // Petal call: DO NOT hold the ctx lock here. The wasm host
         // imports (chain_vm.rs) reach back into `ctx` via the same
         // Arc<Mutex>; deadlock if we held it.
-        let result = self
-            .petal_runner
-            .call(&hash, &m.function, &m.type_args, &args_buf, *fuel_remaining)?;
+        let result =
+            self.petal_runner
+                .call(&hash, &m.function, &m.type_args, &args_buf, *fuel_remaining)?;
         *fuel_remaining = fuel_remaining.saturating_sub(result.fuel_used);
 
         // Decode the return buffer: same length-prefixed-blobs format
@@ -550,29 +545,25 @@ impl<'c> PtbExecutor<'c> {
                 .borrow_table
                 .get(&src_id)
                 .ok_or(PtbError::ObjectNotFound { id: src_id })?;
-            let v = decode_coin_value(&src_row.payload_bytes).map_err(|_| {
-                PtbError::BuiltinFailed {
+            let v =
+                decode_coin_value(&src_row.payload_bytes).map_err(|_| PtbError::BuiltinFailed {
                     cmd_idx,
                     reason: "SplitCoins src has invalid Coin payload".to_string(),
-                }
-            })?;
+                })?;
             let prefix: [u8; 32] = src_row.payload_bytes[..32].try_into().unwrap();
             Ok::<_, PtbError>((v, src_row.type_tag.clone(), src_row.owner.clone(), prefix))
         })?;
 
         let total_out: u128 = amounts.iter().try_fold(0u128, |acc, a| {
-            acc.checked_add(*a)
-                .ok_or_else(|| PtbError::BuiltinFailed {
-                    cmd_idx,
-                    reason: "SplitCoins amount overflow".to_string(),
-                })
+            acc.checked_add(*a).ok_or_else(|| PtbError::BuiltinFailed {
+                cmd_idx,
+                reason: "SplitCoins amount overflow".to_string(),
+            })
         })?;
         if total_out > value {
             return Err(PtbError::BuiltinFailed {
                 cmd_idx,
-                reason: format!(
-                    "SplitCoins: total {total_out} exceeds source value {value}"
-                ),
+                reason: format!("SplitCoins: total {total_out} exceeds source value {value}"),
             });
         }
         value -= total_out;
@@ -790,13 +781,10 @@ fn revert(mut report: ExecutionReport, err: PtbError) -> ExecutionReport {
 fn marshal_args(args: &[Arg], command_outputs: &[Vec<Vec<u8>>]) -> Result<Vec<u8>, PtbError> {
     // Format: count (u32 BE) then for each arg: tag (u8) + length-prefixed payload.
     let mut buf = Vec::new();
-    let count: u32 = args
-        .len()
-        .try_into()
-        .map_err(|_| PtbError::BuiltinFailed {
-            cmd_idx: 0,
-            reason: "too many args".to_string(),
-        })?;
+    let count: u32 = args.len().try_into().map_err(|_| PtbError::BuiltinFailed {
+        cmd_idx: 0,
+        reason: "too many args".to_string(),
+    })?;
     buf.extend_from_slice(&count.to_be_bytes());
     for arg in args {
         match arg {
@@ -843,13 +831,10 @@ fn marshal_args(args: &[Arg], command_outputs: &[Vec<Vec<u8>>]) -> Result<Vec<u8
             Arg::TypeArg(t) => {
                 buf.push(4);
                 let enc = t.encode_canonical().map_err(PtbError::Codec)?;
-                let len: u32 = enc
-                    .len()
-                    .try_into()
-                    .map_err(|_| PtbError::BuiltinFailed {
-                        cmd_idx: 0,
-                        reason: "TypeArg encoding too large".to_string(),
-                    })?;
+                let len: u32 = enc.len().try_into().map_err(|_| PtbError::BuiltinFailed {
+                    cmd_idx: 0,
+                    reason: "TypeArg encoding too large".to_string(),
+                })?;
                 buf.extend_from_slice(&len.to_be_bytes());
                 buf.extend_from_slice(&enc);
             }
@@ -1062,7 +1047,8 @@ mod tests {
             }
         }
         fn set(&mut self, petal: Hash32, func: &str, ret_buf: Vec<u8>, fuel: u64) {
-            self.canned.insert((petal, func.to_string()), (ret_buf, fuel));
+            self.canned
+                .insert((petal, func.to_string()), (ret_buf, fuel));
         }
     }
 
@@ -1144,11 +1130,7 @@ mod tests {
         buf
     }
 
-    fn run(
-        chain: &MockChain,
-        runner: &MockPetalRunner,
-        tx: PtbTx,
-    ) -> ExecutionReport {
+    fn run(chain: &MockChain, runner: &MockPetalRunner, tx: PtbTx) -> ExecutionReport {
         let verifier = AlwaysOkVerifier;
         let ctx = ValidationContext {
             current_block: chain.block,
@@ -1525,7 +1507,10 @@ mod tests {
         );
         let report = run(&chain, &runner, tx);
         assert!(!report.success);
-        assert!(report.object_writes.is_empty(), "writes must be discarded on revert");
+        assert!(
+            report.object_writes.is_empty(),
+            "writes must be discarded on revert"
+        );
     }
 
     #[test]
@@ -1634,7 +1619,9 @@ mod tests {
         chain.put_petal(petal, vec![], manifest.clone());
         let mut runner = MockPetalRunner::new();
         runner.set(petal, "f", build_outputs(&[]), 1);
-        runner.inv.insert((petal, "__inv_0".to_string()), (false, 1));
+        runner
+            .inv
+            .insert((petal, "__inv_0".to_string()), (false, 1));
         let tx = sample_signed_ptb(
             signer,
             gas_id,
@@ -1968,7 +1955,11 @@ mod tests {
         assert!(
             report.object_writes.iter().any(|o| o.id == new_id),
             "host-created object missing from report.object_writes: {:?}",
-            report.object_writes.iter().map(|o| o.id).collect::<Vec<_>>()
+            report
+                .object_writes
+                .iter()
+                .map(|o| o.id)
+                .collect::<Vec<_>>()
         );
     }
 

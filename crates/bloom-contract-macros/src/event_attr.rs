@@ -60,22 +60,20 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         },
         _ => {
-            return syn::Error::new_spanned(
-                &input.ident,
-                "#[event] only supports structs",
-            )
-            .to_compile_error()
-            .into();
+            return syn::Error::new_spanned(&input.ident, "#[event] only supports structs")
+                .to_compile_error()
+                .into();
         }
     };
 
     let mut sanitized = input.clone();
     if let Data::Struct(s) = &mut sanitized.data
-        && let Fields::Named(n) = &mut s.fields {
-            for f in n.named.iter_mut() {
-                f.attrs.retain(|a| !a.path().is_ident("indexed"));
-            }
+        && let Fields::Named(n) = &mut s.fields
+    {
+        for f in n.named.iter_mut() {
+            f.attrs.retain(|a| !a.path().is_ident("indexed"));
         }
+    }
 
     let indexed: Vec<&Field> = fields.iter().filter(|f| has_indexed(f)).collect();
     let non_indexed: Vec<&Field> = fields.iter().filter(|f| !has_indexed(f)).collect();
@@ -150,7 +148,11 @@ fn has_indexed(f: &Field) -> bool {
     f.attrs.iter().any(|a| a.path().is_ident("indexed"))
 }
 
-fn build_signature(domain: &str, name: &str, fields: &syn::punctuated::Punctuated<Field, syn::Token![,]>) -> String {
+fn build_signature(
+    domain: &str,
+    name: &str,
+    fields: &syn::punctuated::Punctuated<Field, syn::Token![,]>,
+) -> String {
     // `Domain::Name(t1,t2,t3)`. Empty domain elides the `Domain::` prefix.
     let mut s = String::new();
     if !domain.is_empty() {
@@ -177,8 +179,9 @@ fn type_canonical_name(ty: &syn::Type) -> String {
     // best-effort; full canonicalization happens at host time via the
     // type's `AbiType::schema()`.
     if let syn::Type::Path(tp) = ty
-        && let Some(seg) = tp.path.segments.last() {
-            return seg.ident.to_string().to_ascii_lowercase();
-        }
+        && let Some(seg) = tp.path.segments.last()
+    {
+        return seg.ident.to_string().to_ascii_lowercase();
+    }
     "?".to_string()
 }

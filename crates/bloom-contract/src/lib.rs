@@ -29,17 +29,17 @@
 
 extern crate alloc;
 
-pub mod types;
 pub mod abi;
-pub mod storage;
 pub mod context;
+pub mod dispatch;
+pub mod error;
 pub mod events;
 pub mod interface;
-pub mod error;
-pub mod dispatch;
-pub mod reentrancy;
 pub mod panic;
 pub mod prelude;
+pub mod reentrancy;
+pub mod storage;
+pub mod types;
 
 // Re-export attribute macros from the sibling proc-macro crate so users can
 // write `#[bloom_contract::contract]` directly. The recommended usage path is
@@ -52,6 +52,6 @@ pub use bloom_contract_macros::{
 pub mod __private {
     pub use alloc::boxed::Box;
     pub use alloc::vec::Vec;
-    pub use core::result::Result;
     pub use bloom_chain_abi as chain_abi;
+    pub use core::result::Result;
 }

@@ -30,11 +30,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+use bloom_chain_abi::Encoder;
 use bloom_chain_node::rpc::RpcClient;
 use bloom_chain_types::ssz::Encode;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
-use bloom_chain_abi::Encoder;
 use bloom_dex_erc20::Erc20;
 use bloom_dex_factory::Factory;
 use bloom_dex_router::Router;
@@ -361,8 +361,7 @@ async fn deploy_suite(
     let pair_petal_hash = petal_hash_of(&pair_wasm);
     let pair_bootstrap_salt = [0u8; 32];
     let pair_bootstrap_init = vec![0u8; 96];
-    let pair_bootstrap_addr =
-        deploy_addr(&sender, &pair_bootstrap_salt, &pair_petal_hash);
+    let pair_bootstrap_addr = deploy_addr(&sender, &pair_bootstrap_salt, &pair_petal_hash);
     submit_deploy(
         client,
         &sk,
@@ -511,7 +510,17 @@ async fn deploy_token(
     let petal_hash = petal_hash_of(&wasm_bytes);
     let token_addr = deploy_addr(&sender, &salt_bytes, &petal_hash);
 
-    submit_deploy(client, &sk, &pk, sender, &chain_id, &wasm_bytes, salt_bytes, init).await?;
+    submit_deploy(
+        client,
+        &sk,
+        &pk,
+        sender,
+        &chain_id,
+        &wasm_bytes,
+        salt_bytes,
+        init,
+    )
+    .await?;
 
     println!(
         "{}",
@@ -550,7 +559,18 @@ async fn create_pair(
     e.push_address(&b.0);
     let calldata = e.finish();
 
-    submit_call(client, &sk, &pk, sender, &chain_id, factory_addr, calldata, 0, 5_000_000).await?;
+    submit_call(
+        client,
+        &sk,
+        &pk,
+        sender,
+        &chain_id,
+        factory_addr,
+        calldata,
+        0,
+        5_000_000,
+    )
+    .await?;
     Ok(())
 }
 
@@ -610,7 +630,18 @@ async fn add_liquidity(
         .push_address(&to.0)
         .push_u64(deadline);
     let calldata = e.finish();
-    submit_call(client, &sk, &pk, sender, &chain_id, router_addr, calldata, 0, 8_000_000).await?;
+    submit_call(
+        client,
+        &sk,
+        &pk,
+        sender,
+        &chain_id,
+        router_addr,
+        calldata,
+        0,
+        8_000_000,
+    )
+    .await?;
     Ok(())
 }
 
@@ -670,7 +701,18 @@ async fn swap_exact_tokens(
         .map_err(|err| anyhow!("encode swap path: {err}"))?;
     e.push_address(&to.0).push_u64(deadline);
     let calldata = e.finish();
-    submit_call(client, &sk, &pk, sender, &chain_id, router_addr, calldata, 0, 8_000_000).await?;
+    submit_call(
+        client,
+        &sk,
+        &pk,
+        sender,
+        &chain_id,
+        router_addr,
+        calldata,
+        0,
+        8_000_000,
+    )
+    .await?;
     Ok(())
 }
 
@@ -730,7 +772,17 @@ async fn remove_liquidity(
     let pair_addr = deploy_addr(&factory_addr, &salt, &pair_hash);
 
     // 1. approve(router, liquidity) on the pair LP token (pair is itself the LP token)
-    submit_erc20_approve(client, &sk, &pk, sender, &chain_id, pair_addr, router_addr, &liq).await?;
+    submit_erc20_approve(
+        client,
+        &sk,
+        &pk,
+        sender,
+        &chain_id,
+        pair_addr,
+        router_addr,
+        &liq,
+    )
+    .await?;
 
     // 2. router.remove_liquidity(a, b, liquidity, min_a, min_b, to, deadline)
     let mut e = Encoder::with_selector(Router::SEL_REMOVE_LIQUIDITY);
@@ -742,7 +794,18 @@ async fn remove_liquidity(
         .push_address(&to.0)
         .push_u64(deadline);
     let calldata = e.finish();
-    submit_call(client, &sk, &pk, sender, &chain_id, router_addr, calldata, 0, 8_000_000).await?;
+    submit_call(
+        client,
+        &sk,
+        &pk,
+        sender,
+        &chain_id,
+        router_addr,
+        calldata,
+        0,
+        8_000_000,
+    )
+    .await?;
     Ok(())
 }
 
@@ -780,7 +843,11 @@ fn deploy_addr(deployer: &Address, salt: &[u8; 32], petal_hash: &[u8; 32]) -> Ad
 /// Factory's pair salt: `blake3("dex.pair.salt:" || sorted(t0, t1))`.
 /// Must match `bloom_dex_factory::pair_salt` (DEX spec §5.1).
 fn pair_salt(t_a: &Address, t_b: &Address) -> [u8; 32] {
-    let (a, b) = if t_a.0 <= t_b.0 { (t_a, t_b) } else { (t_b, t_a) };
+    let (a, b) = if t_a.0 <= t_b.0 {
+        (t_a, t_b)
+    } else {
+        (t_b, t_a)
+    };
     let mut h = blake3::Hasher::new();
     h.update(b"dex.pair.salt:");
     h.update(&a.0);
@@ -789,8 +856,7 @@ fn pair_salt(t_a: &Address, t_b: &Address) -> [u8; 32] {
 }
 
 fn parse_addr(s: &str) -> Result<Address> {
-    bloom_chain_node::genesis::parse_b1_address(s)
-        .with_context(|| format!("parse address {s:?}"))
+    bloom_chain_node::genesis::parse_b1_address(s).with_context(|| format!("parse address {s:?}"))
 }
 
 fn parse_u256_decimal(s: &str) -> Result<[u8; 32]> {
@@ -861,14 +927,16 @@ fn resolve_addr<F: Fn(&DexRegistry) -> Option<String>>(
     parse_addr(&hex_s)
 }
 
-fn load_wallet_key(chain_dir: &Path) -> Result<(
+fn load_wallet_key(
+    chain_dir: &Path,
+) -> Result<(
     bloom_keystore::xdsa::XdsaSecretKey,
     bloom_keystore::xdsa::XdsaPublicKey,
     Address,
 )> {
     let key_path = chain_dir.join("keystore").join("validator.xdsa");
-    let key_bytes = std::fs::read(&key_path)
-        .with_context(|| format!("read key {}", key_path.display()))?;
+    let key_bytes =
+        std::fs::read(&key_path).with_context(|| format!("read key {}", key_path.display()))?;
     let sk = bloom_keystore::xdsa::XdsaSecretKey::from_bytes(&key_bytes)
         .map_err(|e| anyhow!("decode validator key: {e}"))?;
     let pk = sk.public_key();
@@ -904,7 +972,10 @@ async fn wait_for_nonce(
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            bail!("timed out waiting for nonce {expected} on {} (still at {cur})", hex::encode(addr.0));
+            bail!(
+                "timed out waiting for nonce {expected} on {} (still at {cur})",
+                hex::encode(addr.0)
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
@@ -926,11 +997,17 @@ async fn wait_for_tx_receipt(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         let res = client
-            .call("chain_query_tx", json!({ "tx_hash": hex::encode(tx_hash.0) }))
+            .call(
+                "chain_query_tx",
+                json!({ "tx_hash": hex::encode(tx_hash.0) }),
+            )
             .await
             .context("rpc chain_query_tx")?;
         if !res.is_null() {
-            let success = res.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+            let success = res
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if success {
                 return Ok(());
             }
@@ -1086,6 +1163,16 @@ async fn submit_erc20_approve(
 ) -> Result<()> {
     let mut e = Encoder::with_selector(Erc20::SEL_APPROVE);
     e.push_address(&spender.0).push_u256_bytes(amount);
-    submit_call(client, sk, pk, sender, chain_id, token, e.finish(), 0, 2_000_000).await
+    submit_call(
+        client,
+        sk,
+        pk,
+        sender,
+        chain_id,
+        token,
+        e.finish(),
+        0,
+        2_000_000,
+    )
+    .await
 }
-

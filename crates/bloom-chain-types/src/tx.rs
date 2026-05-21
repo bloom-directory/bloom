@@ -7,9 +7,7 @@ use serde::{Deserialize, Serialize};
 use ssz::{Decode, DecodeError, Encode, SszDecoderBuilder, SszEncoder};
 
 use crate::digest::{blake3_tagged, tags};
-use crate::types::{
-    decode_string, encode_string, Address, Hash32, PubKeyBytes, SigBytes,
-};
+use crate::types::{Address, Hash32, PubKeyBytes, SigBytes, decode_string, encode_string};
 
 // ---------------------------------------------------------------------------
 // TxKind
@@ -141,16 +139,14 @@ impl Encode for TxKind {
                 enc.append(wasm);
                 enc.append_parameterized(true, |b| b.extend_from_slice(salt));
                 enc.append(init_args);
-                enc.append_parameterized(true, |b| {
-                    match manifest_hash {
-                        None => {
-                            b.push(0u8);
-                            b.extend_from_slice(&[0u8; 32]);
-                        }
-                        Some(h) => {
-                            b.push(1u8);
-                            b.extend_from_slice(&h.0);
-                        }
+                enc.append_parameterized(true, |b| match manifest_hash {
+                    None => {
+                        b.push(0u8);
+                        b.extend_from_slice(&[0u8; 32]);
+                    }
+                    Some(h) => {
+                        b.push(1u8);
+                        b.extend_from_slice(&h.0);
                     }
                 });
                 enc.finalize();
@@ -221,8 +217,7 @@ impl Decode for TxKind {
                 builder.register_type_parameterized(true, 33)?;
                 let mut decoder = builder.build()?;
                 let wasm: Vec<u8> = decoder.decode_next()?;
-                let salt_bytes: Vec<u8> =
-                    decoder.decode_next_with(|b| Ok(b.to_vec()))?;
+                let salt_bytes: Vec<u8> = decoder.decode_next_with(|b| Ok(b.to_vec()))?;
                 if salt_bytes.len() != 32 {
                     return Err(DecodeError::InvalidByteLength {
                         len: salt_bytes.len(),
@@ -232,8 +227,7 @@ impl Decode for TxKind {
                 let mut salt = [0u8; 32];
                 salt.copy_from_slice(&salt_bytes);
                 let init_args: Vec<u8> = decoder.decode_next()?;
-                let manifest_bytes: Vec<u8> =
-                    decoder.decode_next_with(|b| Ok(b.to_vec()))?;
+                let manifest_bytes: Vec<u8> = decoder.decode_next_with(|b| Ok(b.to_vec()))?;
                 if manifest_bytes.len() != 33 {
                     return Err(DecodeError::InvalidByteLength {
                         len: manifest_bytes.len(),
@@ -698,7 +692,9 @@ mod tests {
             to: Address([0u8; 32]),
             amount_loom: 0,
         };
-        let ptb = TxKind::SubmitPtb { ptb_bytes: vec![1, 2, 3] };
+        let ptb = TxKind::SubmitPtb {
+            ptb_bytes: vec![1, 2, 3],
+        };
         assert!(!transfer.is_submit_ptb());
         assert!(ptb.is_submit_ptb());
     }

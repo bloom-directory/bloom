@@ -2,11 +2,11 @@
 //!
 //! Tests for the state-blob serialisation and BlobStore retention.
 
-use bloom_chain_state::{Account, BlobStore, State};
 use bloom_chain_state::blob::MAX_RETAINED_BLOBS;
-use bloom_chain_types::{Address, Hash32};
+use bloom_chain_state::{Account, BlobStore, State};
 use bloom_chain_types::digest::blake3_tagged;
 use bloom_chain_types::digest::tags;
+use bloom_chain_types::{Address, Hash32};
 
 fn addr(b: u8) -> Address {
     Address([b; 32])
@@ -62,8 +62,8 @@ fn blob_roundtrip_state_root_matches() {
     let recomputed = blake3_tagged(tags::PETAL, &blob_bytes);
     assert_eq!(blob_hash, recomputed);
 
-    let recovered = State::from_blob(&blob_bytes, expected_root)
-        .expect("round-trip should succeed");
+    let recovered =
+        State::from_blob(&blob_bytes, expected_root).expect("round-trip should succeed");
 
     assert_eq!(recovered.state_root(), expected_root);
 }
@@ -76,10 +76,7 @@ fn blob_accounts_preserved() {
     let (blob_bytes, _) = state.to_blob(1, Hash32([0u8; 32]));
     let recovered = State::from_blob(&blob_bytes, expected_root).unwrap();
 
-    assert_eq!(
-        recovered.get_account(&addr(1)).unwrap().loom,
-        1_000_000
-    );
+    assert_eq!(recovered.get_account(&addr(1)).unwrap().loom, 1_000_000);
     assert_eq!(recovered.get_account(&addr(2)).unwrap().nonce, 1);
     assert_eq!(recovered.get_account(&addr(3)), None);
 }
@@ -92,8 +89,14 @@ fn blob_storage_preserved() {
     let (blob_bytes, _) = state.to_blob(1, Hash32([0u8; 32]));
     let recovered = State::from_blob(&blob_bytes, expected_root).unwrap();
 
-    assert_eq!(recovered.storage_read(&addr(2), &[0x11u8; 32]), [0x22u8; 32]);
-    assert_eq!(recovered.storage_read(&addr(2), &[0x33u8; 32]), [0x44u8; 32]);
+    assert_eq!(
+        recovered.storage_read(&addr(2), &[0x11u8; 32]),
+        [0x22u8; 32]
+    );
+    assert_eq!(
+        recovered.storage_read(&addr(2), &[0x33u8; 32]),
+        [0x44u8; 32]
+    );
 }
 
 // ---------------------------------------------------------------------------

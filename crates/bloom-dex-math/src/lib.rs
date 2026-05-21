@@ -173,14 +173,8 @@ impl SwapStrategy for ConstantProduct {
                 return Err(MathError::ZeroReserves);
             }
 
-            let mint_a = amount_a
-                .checked_mul(lp_supply)
-                .ok_or(MathError::Overflow)?
-                / reserve_a;
-            let mint_b = amount_b
-                .checked_mul(lp_supply)
-                .ok_or(MathError::Overflow)?
-                / reserve_b;
+            let mint_a = amount_a.checked_mul(lp_supply).ok_or(MathError::Overflow)? / reserve_a;
+            let mint_b = amount_b.checked_mul(lp_supply).ok_or(MathError::Overflow)? / reserve_b;
 
             let lp_minted = mint_a.min(mint_b);
             if lp_minted == 0 {
@@ -321,13 +315,14 @@ mod tests {
         // fee = 30bps. Use 6-decimal precision (1 USDC = 1_000_000) to stay in u128 range.
         // Note: 1_600_000e6 * 1e6 = 1.6e18 which is well under u128::MAX (~3.4e38).
         let one_eth = 1_000_000_000_000_000_000u128; // 1e18 (18-decimal ETH)
-        let one_usdc = 1_000_000u128;                // 1e6 (6-decimal USDC)
-        let reserve_eth = 1_000 * one_eth;           // 1000 ETH
-        let reserve_usdc = 1_600_000 * one_usdc;     // 1_600_000 USDC
-        let amount_in = one_eth;                     // 1 ETH
+        let one_usdc = 1_000_000u128; // 1e6 (6-decimal USDC)
+        let reserve_eth = 1_000 * one_eth; // 1000 ETH
+        let reserve_usdc = 1_600_000 * one_usdc; // 1_600_000 USDC
+        let amount_in = one_eth; // 1 ETH
 
         // reserve_usdc (1.6e12) * amount_in_with_fee (~1e18) = ~1.6e30 < u128::MAX (3.4e38) ✓
-        let out = ConstantProduct::quote(reserve_eth, reserve_usdc, amount_in, &params(30)).unwrap();
+        let out =
+            ConstantProduct::quote(reserve_eth, reserve_usdc, amount_in, &params(30)).unwrap();
 
         // amount_in_with_fee = 1e18 * 9970 / 10000 = 997_000_000_000_000_000
         // numerator = 1_600_000_000_000 * 997_000_000_000_000_000 ≈ 1.595e30
@@ -385,7 +380,10 @@ mod tests {
         // k should be approximately preserved (or slightly higher due to fee)
         let k_before = reserve_in * reserve_out;
         let k_after = new_ri * new_ro;
-        assert!(k_after >= k_before, "k decreased: before={k_before} after={k_after}");
+        assert!(
+            k_after >= k_before,
+            "k decreased: before={k_before} after={k_after}"
+        );
     }
 
     #[test]
@@ -395,8 +393,7 @@ mod tests {
         let ro = 200_000u128;
         let ai = 500u128;
 
-        let (new_ri, new_ro, _) =
-            ConstantProduct::apply_swap(ri, ro, ai, &params(0)).unwrap();
+        let (new_ri, new_ro, _) = ConstantProduct::apply_swap(ri, ro, ai, &params(0)).unwrap();
 
         let k_before = ri * ro;
         let k_after = new_ri * new_ro;
@@ -429,8 +426,7 @@ mod tests {
 
     #[test]
     fn add_liquidity_initial_non_square() {
-        let (_, _, lp_minted) =
-            ConstantProduct::add_liquidity(0, 0, 100, 200, 0).unwrap();
+        let (_, _, lp_minted) = ConstantProduct::add_liquidity(0, 0, 100, 200, 0).unwrap();
         // sqrt(100 * 200) = sqrt(20_000) = 141 (floor)
         assert_eq!(lp_minted, 141);
     }

@@ -64,12 +64,9 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
         },
         _ => {
-            return syn::Error::new_spanned(
-                &input.ident,
-                "#[storage] only supports structs",
-            )
-            .to_compile_error()
-            .into();
+            return syn::Error::new_spanned(&input.ident, "#[storage] only supports structs")
+                .to_compile_error()
+                .into();
         }
     };
 
@@ -90,11 +87,12 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     // so the compiler doesn't see an unknown attribute on a plain struct field.
     let mut sanitized = input.clone();
     if let Data::Struct(s) = &mut sanitized.data
-        && let Fields::Named(n) = &mut s.fields {
-            for f in n.named.iter_mut() {
-                f.attrs.retain(|a| !a.path().is_ident("storage"));
-            }
+        && let Fields::Named(n) = &mut s.fields
+    {
+        for f in n.named.iter_mut() {
+            f.attrs.retain(|a| !a.path().is_ident("storage"));
         }
+    }
 
     let domain_lit = LitStr::new(&domain, proc_macro2::Span::call_site());
 
@@ -392,4 +390,3 @@ fn pascal_to_snake(s: &str) -> String {
     }
     out
 }
-

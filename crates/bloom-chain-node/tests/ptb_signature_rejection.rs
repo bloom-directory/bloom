@@ -26,9 +26,7 @@
 //!    original signature, submit, assert revert with a
 //!    `BadSignature`-flavoured reason and no write set.
 
-use bloom_chain_node::{
-    consensus_driver::PetalExecutor, petal_executor::ChainPetalExecutor,
-};
+use bloom_chain_node::{consensus_driver::PetalExecutor, petal_executor::ChainPetalExecutor};
 use bloom_chain_state::State;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
@@ -214,11 +212,16 @@ fn rejects_flipped_signature_byte() {
         out.write_set.is_none(),
         "tampered-signature revert must drop the write set",
     );
-    assert!(out.logs.is_empty(), "tampered-signature revert must drop logs");
+    assert!(
+        out.logs.is_empty(),
+        "tampered-signature revert must drop logs"
+    );
 
     let reason = String::from_utf8_lossy(&out.return_data).to_lowercase();
     assert!(
-        reason.contains("signature") || reason.contains("badsignature") || reason.contains("signer"),
+        reason.contains("signature")
+            || reason.contains("badsignature")
+            || reason.contains("signer"),
         "expected a signature-failure revert reason, got: {reason}",
     );
 }
@@ -285,7 +288,9 @@ fn rejects_wrong_pubkey() {
 
     let reason = String::from_utf8_lossy(&out.return_data).to_lowercase();
     assert!(
-        reason.contains("signature") || reason.contains("badsignature") || reason.contains("signer"),
+        reason.contains("signature")
+            || reason.contains("badsignature")
+            || reason.contains("signer"),
         "expected a signature-failure revert reason, got: {reason}",
     );
 }

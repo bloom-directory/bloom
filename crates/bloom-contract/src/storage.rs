@@ -77,9 +77,16 @@ pub type Slot = [u8; 32];
 /// so the manifest emitter can render them without re-parsing source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StorageKind {
-    Scalar { ty: &'static str },
-    Map { key_ty: &'static str, value_ty: &'static str },
-    Vec { ty: &'static str },
+    Scalar {
+        ty: &'static str,
+    },
+    Map {
+        key_ty: &'static str,
+        value_ty: &'static str,
+    },
+    Vec {
+        ty: &'static str,
+    },
 }
 
 /// One entry in a contract's `Self::SCHEMA`.
@@ -165,8 +172,12 @@ pub trait SlotEncode: Sized {
 }
 
 impl SlotEncode for U256 {
-    fn to_slot(&self) -> Slot { self.0 }
-    fn from_slot(slot: Slot) -> Self { U256(slot) }
+    fn to_slot(&self) -> Slot {
+        self.0
+    }
+    fn from_slot(slot: Slot) -> Self {
+        U256(slot)
+    }
 }
 
 impl SlotEncode for u128 {
@@ -227,7 +238,9 @@ impl SlotEncode for u8 {
         s[31] = *self;
         s
     }
-    fn from_slot(slot: Slot) -> Self { slot[31] }
+    fn from_slot(slot: Slot) -> Self {
+        slot[31]
+    }
 }
 
 impl SlotEncode for bool {
@@ -236,27 +249,45 @@ impl SlotEncode for bool {
         s[31] = if *self { 1 } else { 0 };
         s
     }
-    fn from_slot(slot: Slot) -> Self { slot[31] != 0 }
+    fn from_slot(slot: Slot) -> Self {
+        slot[31] != 0
+    }
 }
 
 impl SlotEncode for Address {
-    fn to_slot(&self) -> Slot { self.0 }
-    fn from_slot(slot: Slot) -> Self { Address(slot) }
+    fn to_slot(&self) -> Slot {
+        self.0
+    }
+    fn from_slot(slot: Slot) -> Self {
+        Address(slot)
+    }
 }
 
 impl SlotEncode for Hash32 {
-    fn to_slot(&self) -> Slot { self.0 }
-    fn from_slot(slot: Slot) -> Self { Hash32(slot) }
+    fn to_slot(&self) -> Slot {
+        self.0
+    }
+    fn from_slot(slot: Slot) -> Self {
+        Hash32(slot)
+    }
 }
 
 impl SlotEncode for crate::types::Bytes32String {
-    fn to_slot(&self) -> Slot { self.0 }
-    fn from_slot(slot: Slot) -> Self { crate::types::Bytes32String(slot) }
+    fn to_slot(&self) -> Slot {
+        self.0
+    }
+    fn from_slot(slot: Slot) -> Self {
+        crate::types::Bytes32String(slot)
+    }
 }
 
 impl SlotEncode for Slot {
-    fn to_slot(&self) -> Slot { *self }
-    fn from_slot(slot: Slot) -> Self { slot }
+    fn to_slot(&self) -> Slot {
+        *self
+    }
+    fn from_slot(slot: Slot) -> Self {
+        slot
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -276,11 +307,16 @@ pub struct StorageValue<T> {
 impl<T> StorageValue<T> {
     #[inline]
     pub const fn new(slot: Slot) -> Self {
-        Self { slot, _marker: PhantomData }
+        Self {
+            slot,
+            _marker: PhantomData,
+        }
     }
 
     #[inline]
-    pub const fn slot(&self) -> &Slot { &self.slot }
+    pub const fn slot(&self) -> &Slot {
+        &self.slot
+    }
 }
 
 impl<T: SlotEncode> StorageValue<T> {
@@ -334,11 +370,16 @@ pub struct Map<K, V> {
 impl<K, V> Map<K, V> {
     #[inline]
     pub const fn new(prefix: &'static [u8]) -> Self {
-        Self { prefix, _marker: PhantomData }
+        Self {
+            prefix,
+            _marker: PhantomData,
+        }
     }
 
     #[inline]
-    pub const fn prefix(&self) -> &[u8] { self.prefix }
+    pub const fn prefix(&self) -> &[u8] {
+        self.prefix
+    }
 }
 
 impl<K: AbiEncode, V: SlotEncode> Map<K, V> {
@@ -399,7 +440,10 @@ pub struct VecStore<T> {
 impl<T> VecStore<T> {
     #[inline]
     pub const fn new(len_slot: Slot) -> Self {
-        Self { len_slot, _marker: PhantomData }
+        Self {
+            len_slot,
+            _marker: PhantomData,
+        }
     }
 
     /// Derive the slot for the element at `index`.

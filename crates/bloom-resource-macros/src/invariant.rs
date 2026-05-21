@@ -19,9 +19,7 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{
-    Attribute, BinOp, Expr, ExprBinary, ExprClosure, ExprField, ExprPath, ItemFn, Meta,
-};
+use syn::{Attribute, BinOp, Expr, ExprBinary, ExprClosure, ExprField, ExprPath, ItemFn, Meta};
 
 use crate::ast::{attr_is_named, parse_str_value};
 use crate::error::err_spanned;
@@ -51,10 +49,12 @@ impl InvariantAttr {
         let attr_text = format!("#[invariant({})]", attr);
         let attrs: Vec<Attribute> =
             syn::parse::Parser::parse_str(Attribute::parse_outer, &attr_text)?;
-        let outer = attrs
-            .into_iter()
-            .next()
-            .ok_or_else(|| syn::Error::new(proc_macro2::Span::call_site(), "expected `#[invariant(...)]`"))?;
+        let outer = attrs.into_iter().next().ok_or_else(|| {
+            syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "expected `#[invariant(...)]`",
+            )
+        })?;
 
         let mut name: Option<String> = None;
         let mut target: Option<String> = None;
@@ -101,11 +101,7 @@ impl InvariantAttr {
 /// Build the manifest [`InvariantDecl`] from the attribute + the
 /// host function. `idx` is the invariant's slot in the petal's
 /// invariant table (used to derive the `__inv_<idx>` export name).
-pub(crate) fn build_decl(
-    attr: &InvariantAttr,
-    host_fn: &ItemFn,
-    idx: u16,
-) -> InvariantDecl {
+pub(crate) fn build_decl(attr: &InvariantAttr, host_fn: &ItemFn, idx: u16) -> InvariantDecl {
     let target = match &attr.target {
         Some(t) => InvariantTarget::ObjectType { name: t.clone() },
         None => InvariantTarget::FunctionExit {
@@ -155,8 +151,7 @@ pub(crate) fn predicate_ast_of(expr: &Expr) -> PredicateAst {
 
         // `S::k(p) >= p.k_last` — pool-style invariant (spec §12.1).
         if matches!(op, BinOp::Ge(_)) {
-            if let (Some(strategy), Some(field)) =
-                (strategy_call_param(left), field_name_of(right))
+            if let (Some(strategy), Some(field)) = (strategy_call_param(left), field_name_of(right))
             {
                 return PredicateAst::StrategyKNonDecreasing {
                     strategy_param: strategy,
@@ -213,10 +208,7 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenS
     // Embed the user-provided name as a string constant for later
     // collection by `#[bloom::petal]`.
     let fn_ident = &parsed.sig.ident;
-    let name_const = syn::Ident::new(
-        &format!("__BLOOM_INV_{}__NAME", fn_ident),
-        fn_ident.span(),
-    );
+    let name_const = syn::Ident::new(&format!("__BLOOM_INV_{}__NAME", fn_ident), fn_ident.span());
     let name_str = attr.name.clone();
 
     Ok(quote! {
@@ -272,19 +264,13 @@ mod tests {
     #[test]
     fn predicate_field_le_recognized() {
         let e: Expr = syn::parse2(quote! { |p: &Pool| p.a <= p.b }).unwrap();
-        assert!(matches!(
-            predicate_ast_of(&e),
-            PredicateAst::FieldLe { .. }
-        ));
+        assert!(matches!(predicate_ast_of(&e), PredicateAst::FieldLe { .. }));
     }
 
     #[test]
     fn predicate_field_eq_recognized() {
         let e: Expr = syn::parse2(quote! { |p: &Pool| p.a == p.b }).unwrap();
-        assert!(matches!(
-            predicate_ast_of(&e),
-            PredicateAst::FieldEq { .. }
-        ));
+        assert!(matches!(predicate_ast_of(&e), PredicateAst::FieldEq { .. }));
     }
 
     #[test]
@@ -316,11 +302,7 @@ mod tests {
 
     #[test]
     fn expand_emits_name_constant() {
-        let toks = expand(
-            quote! { name = "x" },
-            quote! { pub fn swap() {} },
-        )
-        .unwrap();
+        let toks = expand(quote! { name = "x" }, quote! { pub fn swap() {} }).unwrap();
         let s = toks.to_string();
         assert!(s.contains("__BLOOM_INV_swap__NAME"));
         assert!(s.contains("\"x\""));

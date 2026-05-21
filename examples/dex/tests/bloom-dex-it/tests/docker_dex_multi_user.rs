@@ -108,8 +108,10 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     eprintln!("  bloom DEX integration test  —  4-validator docker stack");
     eprintln!("================================================================");
     eprintln!("[stack] all 4 validators ready at height >= 2");
-    eprintln!("        endpoints: val0=127.0.0.1:{} val1=127.0.0.1:{} val2=127.0.0.1:{} val3=127.0.0.1:{}",
-        HOST_RPC_PORTS[0], HOST_RPC_PORTS[1], HOST_RPC_PORTS[2], HOST_RPC_PORTS[3]);
+    eprintln!(
+        "        endpoints: val0=127.0.0.1:{} val1=127.0.0.1:{} val2=127.0.0.1:{} val3=127.0.0.1:{}",
+        HOST_RPC_PORTS[0], HOST_RPC_PORTS[1], HOST_RPC_PORTS[2], HOST_RPC_PORTS[3]
+    );
 
     // ── 2. Resolve treasury (validator 0) + create 3 user identities ──────
     let treasury_home = tmpdir.join("home0");
@@ -122,10 +124,19 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     let carol = create_user("carol", &users_root, &genesis_path, HOST_RPC_PORTS[2])?;
 
     eprintln!();
-    eprintln!("[users] alice = {}  (signs via val0)", fmt_addr(&alice.addr));
+    eprintln!(
+        "[users] alice = {}  (signs via val0)",
+        fmt_addr(&alice.addr)
+    );
     eprintln!("        bob   = {}  (signs via val1)", fmt_addr(&bob.addr));
-    eprintln!("        carol = {}  (signs via val2)", fmt_addr(&carol.addr));
-    eprintln!("        treasury (val0 genesis allocation) = {}", fmt_addr(&treasury_addr));
+    eprintln!(
+        "        carol = {}  (signs via val2)",
+        fmt_addr(&carol.addr)
+    );
+    eprintln!(
+        "        treasury (val0 genesis allocation) = {}",
+        fmt_addr(&treasury_addr)
+    );
 
     // ── 3. Fund each user from the treasury (validator 0 holds genesis) ──
     let treasury_rpc = format!("127.0.0.1:{}", HOST_RPC_PORTS[0]);
@@ -150,7 +161,10 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     }
 
     eprintln!();
-    eprintln!("[fund]  each user funded with {} LOOM from treasury", fmt_amount(USER_LOOM_FUND));
+    eprintln!(
+        "[fund]  each user funded with {} LOOM from treasury",
+        fmt_amount(USER_LOOM_FUND)
+    );
 
     // Capture an *atomic* (height, sum) snapshot. The chain commits a block
     // every second, so sum_loom_all_accounts() may straddle a commit and read
@@ -158,8 +172,8 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     // height before and after the sum agree.
     let (start_height, start_total_loom) =
         atomic_height_and_loom_sum(client0, &treasury_addr, &[&alice, &bob, &carol]).await?;
-    let expected_start = (N_VALIDATORS as u128 * GENESIS_ALLOCATION)
-        + (start_height as u128) * BLOCK_EMISSION;
+    let expected_start =
+        (N_VALIDATORS as u128 * GENESIS_ALLOCATION) + (start_height as u128) * BLOCK_EMISSION;
     if start_total_loom != expected_start {
         bail!(
             "loom conservation precheck failed: sum={} expected={} (height={})",
@@ -170,7 +184,10 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     }
 
     // ── 4. Alice deploys the DEX suite + two ERC-20s + creates a pool ────
-    let suite_out = dex_as(&alice, &["deploy-suite", "--wasm-dir", wasm_dir.to_str().unwrap()])?;
+    let suite_out = dex_as(
+        &alice,
+        &["deploy-suite", "--wasm-dir", wasm_dir.to_str().unwrap()],
+    )?;
     let suite = last_json_object(&suite_out)?;
     let factory_addr = json_hex(&suite, "factory_addr")?;
     let pair_petal_hash = json_hex(&suite, "pair_petal_hash")?;
@@ -182,7 +199,8 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     let alice_registry = alice.home.join("chain").join("dex.toml");
     for u in [&bob, &carol] {
         let dest_dir = u.home.join("chain");
-        std::fs::create_dir_all(&dest_dir).with_context(|| format!("mkdir {}", dest_dir.display()))?;
+        std::fs::create_dir_all(&dest_dir)
+            .with_context(|| format!("mkdir {}", dest_dir.display()))?;
         let dest = dest_dir.join("dex.toml");
         std::fs::copy(&alice_registry, &dest)
             .with_context(|| format!("copy dex.toml to {}", dest.display()))?;
@@ -195,11 +213,16 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
         &alice,
         &[
             "deploy-token",
-            "--wasm", erc20_wasm_s,
-            "--name", "TKA",
-            "--symbol", "TKA",
-            "--supply", ERC20_SUPPLY,
-            "--salt", "00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa",
+            "--wasm",
+            erc20_wasm_s,
+            "--name",
+            "TKA",
+            "--symbol",
+            "TKA",
+            "--supply",
+            ERC20_SUPPLY,
+            "--salt",
+            "00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa00aa",
         ],
     )?;
     let tka = json_hex(&last_json_object(&tka_out)?, "token_address")?;
@@ -208,11 +231,16 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
         &alice,
         &[
             "deploy-token",
-            "--wasm", erc20_wasm_s,
-            "--name", "TKB",
-            "--symbol", "TKB",
-            "--supply", ERC20_SUPPLY,
-            "--salt", "00bb00bb00bb00bb00bb00bb00bb00bb00bb00bb00bb00bb00bb00bb00bb00bb",
+            "--wasm",
+            erc20_wasm_s,
+            "--name",
+            "TKB",
+            "--symbol",
+            "TKB",
+            "--supply",
+            ERC20_SUPPLY,
+            "--salt",
+            "00bb00bb00bb00bb00bb00bb00bb00bb00bb00bb00bb00bb00bb00bb00bb00bb",
         ],
     )?;
     let tkb = json_hex(&last_json_object(&tkb_out)?, "token_address")?;
@@ -221,8 +249,10 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
         &alice,
         &[
             "create-pair",
-            "--factory", &hex::encode(factory_addr),
-            &hex::encode(tka), &hex::encode(tkb),
+            "--factory",
+            &hex::encode(factory_addr),
+            &hex::encode(tka),
+            &hex::encode(tkb),
         ],
     )?;
     let pair_addr = derive_pair_addr(&factory_addr, &tka, &tkb, &pair_petal_hash);
@@ -230,8 +260,14 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     eprintln!();
     eprintln!("[deploy] alice deploys DEX suite:");
     eprintln!("         factory = {}", fmt_addr(&factory_addr));
-    eprintln!("         TKA     = {}  (supply 1,000,000 * 1e18)", fmt_addr(&tka));
-    eprintln!("         TKB     = {}  (supply 1,000,000 * 1e18)", fmt_addr(&tkb));
+    eprintln!(
+        "         TKA     = {}  (supply 1,000,000 * 1e18)",
+        fmt_addr(&tka)
+    );
+    eprintln!(
+        "         TKB     = {}  (supply 1,000,000 * 1e18)",
+        fmt_addr(&tkb)
+    );
     eprintln!("         pair    = {}  (TKA/TKB)", fmt_addr(&pair_addr));
 
     // ── 5. Alice seeds the pool with liquidity ────────────────────────────
@@ -239,9 +275,12 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
         &alice,
         &[
             "add-liquidity",
-            "--amount-a", &ALICE_LIQ_A.to_string(),
-            "--amount-b", &ALICE_LIQ_B.to_string(),
-            &hex::encode(tka), &hex::encode(tkb),
+            "--amount-a",
+            &ALICE_LIQ_A.to_string(),
+            "--amount-b",
+            &ALICE_LIQ_B.to_string(),
+            &hex::encode(tka),
+            &hex::encode(tkb),
         ],
     )?;
     let (r0_a, r1_a) = query_pair_reserves(client0, &pair_addr).await?;
@@ -257,8 +296,16 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     let (tka_res_init, tkb_res_init) = reserves_by_token(&tka, &tkb, r0_a, r1_a);
     eprintln!();
     eprintln!("[lp+]   alice adds liquidity:");
-    eprintln!("        deposit         : {} TKA  +  {} TKB", fmt_amount(ALICE_LIQ_A), fmt_amount(ALICE_LIQ_B));
-    eprintln!("        pool reserves   : {} TKA  /  {} TKB", fmt_amount(tka_res_init), fmt_amount(tkb_res_init));
+    eprintln!(
+        "        deposit         : {} TKA  +  {} TKB",
+        fmt_amount(ALICE_LIQ_A),
+        fmt_amount(ALICE_LIQ_B)
+    );
+    eprintln!(
+        "        pool reserves   : {} TKA  /  {} TKB",
+        fmt_amount(tka_res_init),
+        fmt_amount(tkb_res_init)
+    );
     eprintln!("        alice LP tokens : {}", fmt_amount(alice_lp));
     eprintln!("        k_init = TKA*TKB = {:?}", k_init);
 
@@ -289,8 +336,14 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
 
     eprintln!();
     eprintln!("[seed]  alice transfers tokens to traders so they can swap:");
-    eprintln!("        alice -> bob   : {} TKA  (10x bob's swap-in)", fmt_amount(bob_seed_tka));
-    eprintln!("        alice -> carol : {} TKB  (10x carol's swap-in)", fmt_amount(carol_seed_tkb));
+    eprintln!(
+        "        alice -> bob   : {} TKA  (10x bob's swap-in)",
+        fmt_amount(bob_seed_tka)
+    );
+    eprintln!(
+        "        alice -> carol : {} TKB  (10x carol's swap-in)",
+        fmt_amount(carol_seed_tkb)
+    );
 
     // ── 7. Bob: swap TKA -> TKB ───────────────────────────────────────────
     let bob_tkb_before = query_erc20_balance(client0, &tkb, &bob.addr).await?;
@@ -307,9 +360,12 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
         &bob,
         &[
             "swap",
-            "--amount-in", &BOB_SWAP_IN.to_string(),
-            "--min-out", "0",
-            "--path", &format!("{},{}", hex::encode(tka), hex::encode(tkb)),
+            "--amount-in",
+            &BOB_SWAP_IN.to_string(),
+            "--min-out",
+            "0",
+            "--path",
+            &format!("{},{}", hex::encode(tka), hex::encode(tkb)),
         ],
     )?;
     // The swap CLI returns after val1 (Bob's RPC) has applied the swap.
@@ -338,22 +394,33 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
         bail!("bob TKA in mismatch: got {bob_tka_in} expected {BOB_SWAP_IN}");
     }
     // Bob: TKA → TKB, so reserve_in is the TKA-side reserve.
-    let expected_bob_out =
-        uniswap_get_amount_out(BOB_SWAP_IN, tka_res_pre_bob, tkb_res_pre_bob);
+    let expected_bob_out = uniswap_get_amount_out(BOB_SWAP_IN, tka_res_pre_bob, tkb_res_pre_bob);
     if bob_tkb_out != expected_bob_out {
         bail!(
             "bob TKB out mismatch: got {bob_tkb_out} expected {expected_bob_out} (within 0% — exact match required)"
         );
     }
 
-    let (tka_res_post_bob, tkb_res_post_bob) = reserves_by_token(&tka, &tkb, r0_post_bob, r1_post_bob);
+    let (tka_res_post_bob, tkb_res_post_bob) =
+        reserves_by_token(&tka, &tkb, r0_post_bob, r1_post_bob);
     eprintln!();
     eprintln!("[swap-1] bob:  TKA -> TKB");
-    eprintln!("         reserves pre  : {} TKA  /  {} TKB", fmt_amount(tka_res_pre_bob), fmt_amount(tkb_res_pre_bob));
+    eprintln!(
+        "         reserves pre  : {} TKA  /  {} TKB",
+        fmt_amount(tka_res_pre_bob),
+        fmt_amount(tkb_res_pre_bob)
+    );
     eprintln!("         amount in     : {} TKA", fmt_amount(bob_tka_in));
-    eprintln!("         amount out    : {} TKB   (uniswap-v2 0.3% fee; expected exactly {})",
-        fmt_amount(bob_tkb_out), fmt_amount(expected_bob_out));
-    eprintln!("         reserves post : {} TKA  /  {} TKB", fmt_amount(tka_res_post_bob), fmt_amount(tkb_res_post_bob));
+    eprintln!(
+        "         amount out    : {} TKB   (uniswap-v2 0.3% fee; expected exactly {})",
+        fmt_amount(bob_tkb_out),
+        fmt_amount(expected_bob_out)
+    );
+    eprintln!(
+        "         reserves post : {} TKA  /  {} TKB",
+        fmt_amount(tka_res_post_bob),
+        fmt_amount(tkb_res_post_bob)
+    );
     eprintln!("         k after bob   = {:?}   (>= k_init OK)", k_post_bob);
 
     // ── 8. Carol: swap TKB -> TKA ─────────────────────────────────────────
@@ -368,9 +435,12 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
         &carol,
         &[
             "swap",
-            "--amount-in", &CAROL_SWAP_IN.to_string(),
-            "--min-out", "0",
-            "--path", &format!("{},{}", hex::encode(tkb), hex::encode(tka)),
+            "--amount-in",
+            &CAROL_SWAP_IN.to_string(),
+            "--min-out",
+            "0",
+            "--path",
+            &format!("{},{}", hex::encode(tkb), hex::encode(tka)),
         ],
     )?;
     // Same +2 as Bob: `swap` is approve + swap_exact_tokens_for_tokens.
@@ -394,27 +464,44 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     let expected_carol_out =
         uniswap_get_amount_out(CAROL_SWAP_IN, tkb_res_pre_carol, tka_res_pre_carol);
     if carol_tka_out != expected_carol_out {
-        bail!(
-            "carol TKA out mismatch: got {carol_tka_out} expected {expected_carol_out}"
-        );
+        bail!("carol TKA out mismatch: got {carol_tka_out} expected {expected_carol_out}");
     }
 
     let (tka_res_post_carol, tkb_res_post_carol) =
         reserves_by_token(&tka, &tkb, r0_post_carol, r1_post_carol);
     eprintln!();
     eprintln!("[swap-2] carol: TKB -> TKA");
-    eprintln!("         reserves pre  : {} TKA  /  {} TKB", fmt_amount(tka_res_pre_carol), fmt_amount(tkb_res_pre_carol));
+    eprintln!(
+        "         reserves pre  : {} TKA  /  {} TKB",
+        fmt_amount(tka_res_pre_carol),
+        fmt_amount(tkb_res_pre_carol)
+    );
     eprintln!("         amount in     : {} TKB", fmt_amount(carol_tkb_in));
-    eprintln!("         amount out    : {} TKA   (uniswap-v2 0.3% fee; expected exactly {})",
-        fmt_amount(carol_tka_out), fmt_amount(expected_carol_out));
-    eprintln!("         reserves post : {} TKA  /  {} TKB", fmt_amount(tka_res_post_carol), fmt_amount(tkb_res_post_carol));
-    eprintln!("         k after carol = {:?}   (>= k after bob OK)", k_post_carol);
+    eprintln!(
+        "         amount out    : {} TKA   (uniswap-v2 0.3% fee; expected exactly {})",
+        fmt_amount(carol_tka_out),
+        fmt_amount(expected_carol_out)
+    );
+    eprintln!(
+        "         reserves post : {} TKA  /  {} TKB",
+        fmt_amount(tka_res_post_carol),
+        fmt_amount(tkb_res_post_carol)
+    );
+    eprintln!(
+        "         k after carol = {:?}   (>= k after bob OK)",
+        k_post_carol
+    );
 
     // ── 9. Alice removes all liquidity; must come out >= initial deposits ─
     let (r0_pre_burn, r1_pre_burn) = query_pair_reserves(client0, &pair_addr).await?;
     let (tka_res_pre_burn, tkb_res_pre_burn) =
         reserves_by_token(&tka, &tkb, r0_pre_burn, r1_pre_burn);
-    let total_lp = query_storage_u128(client0, &pair_addr, blake3::hash(b"erc20.total_supply").as_bytes()).await?;
+    let total_lp = query_storage_u128(
+        client0,
+        &pair_addr,
+        blake3::hash(b"erc20.total_supply").as_bytes(),
+    )
+    .await?;
     // Pro-rata payout: alice_lp / total_lp of each token. Use U256 to avoid
     // overflow when alice_lp * reserve exceeds u128.
     let expected_a_out = pro_rata(alice_lp, tka_res_pre_burn, total_lp);
@@ -425,8 +512,10 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
         &alice,
         &[
             "remove-liquidity",
-            "--liquidity", &alice_lp.to_string(),
-            &hex::encode(tka), &hex::encode(tkb),
+            "--liquidity",
+            &alice_lp.to_string(),
+            &hex::encode(tka),
+            &hex::encode(tkb),
         ],
     )?;
     // remove-liquidity emits 2 txs (approve + burn) so nonce advances by 2.
@@ -441,7 +530,8 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     let burn_amount1_tkb = alice_tkb_final + carol_seed_tkb - alice_tkb_pre_seed;
 
     // Alice should reclaim ~r0_pre_burn (since she owns all LP minus locked MIN).
-    if burn_amount0_tka < expected_a_out * 99 / 100 || burn_amount1_tkb < expected_b_out * 99 / 100 {
+    if burn_amount0_tka < expected_a_out * 99 / 100 || burn_amount1_tkb < expected_b_out * 99 / 100
+    {
         bail!(
             "alice burn output below 99% of pro-rata expectation: \
              got A={burn_amount0_tka} B={burn_amount1_tkb} expected ~A={expected_a_out} B={expected_b_out}"
@@ -462,14 +552,22 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
     eprintln!();
     eprintln!("[lp-]   alice burns all LP and redeems:");
     eprintln!("        LP burned       : {}", fmt_amount(alice_lp));
-    eprintln!("        expected payout : {} TKA  +  {} TKB  (pro-rata of reserves)",
-        fmt_amount(expected_a_out), fmt_amount(expected_b_out));
-    eprintln!("        actual payout   : {} TKA  +  {} TKB",
-        fmt_amount(burn_amount0_tka), fmt_amount(burn_amount1_tkb));
-    eprintln!("        fee accrual     : pair paid {} > seeded {}  (delta {} from 0.3% LP fees on bob+carol)",
+    eprintln!(
+        "        expected payout : {} TKA  +  {} TKB  (pro-rata of reserves)",
+        fmt_amount(expected_a_out),
+        fmt_amount(expected_b_out)
+    );
+    eprintln!(
+        "        actual payout   : {} TKA  +  {} TKB",
+        fmt_amount(burn_amount0_tka),
+        fmt_amount(burn_amount1_tkb)
+    );
+    eprintln!(
+        "        fee accrual     : pair paid {} > seeded {}  (delta {} from 0.3% LP fees on bob+carol)",
         fmt_amount(total_paid_to_alice),
         fmt_amount(total_seeded),
-        fmt_amount(total_paid_to_alice - total_seeded));
+        fmt_amount(total_paid_to_alice - total_seeded)
+    );
 
     // ── 10. LOOM conservation across all accounts ─────────────────────────
     let (end_height, end_total_loom) =
@@ -485,17 +583,30 @@ async fn docker_dex_multi_user_acceptance() -> Result<()> {
 
     eprintln!();
     eprintln!("[chain] LOOM conservation:");
-    eprintln!("        start sum (h={}) = {}", start_height, fmt_amount(start_total_loom));
-    eprintln!("        end   sum (h={}) = {}", end_height, fmt_amount(end_total_loom));
-    eprintln!("        delta = {} blocks * {} LOOM/block = {} LOOM",
+    eprintln!(
+        "        start sum (h={}) = {}",
+        start_height,
+        fmt_amount(start_total_loom)
+    );
+    eprintln!(
+        "        end   sum (h={}) = {}",
+        end_height,
+        fmt_amount(end_total_loom)
+    );
+    eprintln!(
+        "        delta = {} blocks * {} LOOM/block = {} LOOM",
         blocks_committed,
         fmt_amount(BLOCK_EMISSION),
-        fmt_amount((blocks_committed as u128) * BLOCK_EMISSION));
+        fmt_amount((blocks_committed as u128) * BLOCK_EMISSION)
+    );
 
     eprintln!();
     eprintln!("================================================================");
     eprintln!("  PASS  docker_dex_multi_user_acceptance");
-    eprintln!("        blocks committed during test : {}", blocks_committed);
+    eprintln!(
+        "        blocks committed during test : {}",
+        blocks_committed
+    );
     eprintln!("        k_init  : {:?}", k_init);
     eprintln!("        k_final : {:?}", k_post_carol);
     eprintln!("================================================================");
@@ -549,9 +660,12 @@ fn create_user(
     if !key_path.exists() {
         let status = Command::new(bloom_bin())
             .args([
-                "--home", home.to_str().unwrap(),
-                "chain", "init",
-                "--genesis", shared_genesis.to_str().unwrap(),
+                "--home",
+                home.to_str().unwrap(),
+                "chain",
+                "init",
+                "--genesis",
+                shared_genesis.to_str().unwrap(),
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -585,10 +699,14 @@ fn run_bloom_chain_transfer(
 ) -> Result<()> {
     let mut cmd = Command::new(bloom_bin());
     cmd.env("BLOOM_RPC_TCP", rpc_tcp)
-        .arg("--home").arg(from_home)
-        .arg("chain").arg("transfer")
-        .arg("--to").arg(hex::encode(to_addr))
-        .arg("--amount").arg(amount.to_string())
+        .arg("--home")
+        .arg(from_home)
+        .arg("chain")
+        .arg("transfer")
+        .arg("--to")
+        .arg(hex::encode(to_addr))
+        .arg("--amount")
+        .arg(amount.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let out = cmd.output().context("invoke bloom chain transfer")?;
@@ -630,13 +748,17 @@ fn erc20_transfer(from: &User, token: &[u8; 32], to: &[u8; 32], amount: u128) ->
 
     let mut cmd = Command::new(bloom_bin());
     cmd.env("BLOOM_RPC_TCP", &from.rpc_tcp)
-        .arg("--home").arg(&from.home)
-        .arg("chain").arg("call")
+        .arg("--home")
+        .arg(&from.home)
+        .arg("chain")
+        .arg("call")
         .arg(hex::encode(token))
         .arg(hex::encode(&calldata))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let out = cmd.output().context("invoke bloom chain call (erc20 transfer)")?;
+    let out = cmd
+        .output()
+        .context("invoke bloom chain call (erc20 transfer)")?;
     if !out.status.success() {
         bail!(
             "erc20 transfer failed: stdout={} stderr={}",
@@ -690,10 +812,17 @@ async fn wait_for_nonce_at_least(client: &RpcClient, addr: &[u8; 32], target: u6
     }
 }
 
-async fn wait_for_erc20_balance(client: &RpcClient, token: &[u8; 32], holder: &[u8; 32], min: u128) -> Result<()> {
+async fn wait_for_erc20_balance(
+    client: &RpcClient,
+    token: &[u8; 32],
+    holder: &[u8; 32],
+    min: u128,
+) -> Result<()> {
     let deadline = std::time::Instant::now() + TX_TIMEOUT;
     loop {
-        let bal = query_erc20_balance(client, token, holder).await.unwrap_or(0);
+        let bal = query_erc20_balance(client, token, holder)
+            .await
+            .unwrap_or(0);
         if bal >= min {
             return Ok(());
         }

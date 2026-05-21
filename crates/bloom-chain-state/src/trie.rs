@@ -30,8 +30,8 @@
 use std::collections::BTreeMap;
 
 use bloom_chain_types::{
-    digest::{blake3_tagged, tags},
     Hash32,
+    digest::{blake3_tagged, tags},
 };
 
 /// Selects domain-separation tags for a trie instance.

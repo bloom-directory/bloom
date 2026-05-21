@@ -19,7 +19,7 @@ fn genesis_load_one_validator() {
     let pk_bytes = vec![0u8; 1984];
     let pk_b64 = {
         // Minimal base64 encoding (standard alphabet).
-        
+
         let mut out = String::new();
         let enc_table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut i = 0;
@@ -70,7 +70,9 @@ amount  = "1000000000000000000000"
     );
 
     let mut tmpfile = NamedTempFile::new().expect("tmpfile");
-    tmpfile.write_all(toml_content.as_bytes()).expect("write genesis");
+    tmpfile
+        .write_all(toml_content.as_bytes())
+        .expect("write genesis");
     tmpfile.flush().expect("flush");
 
     let genesis = Genesis::from_file(tmpfile.path()).expect("parse genesis");

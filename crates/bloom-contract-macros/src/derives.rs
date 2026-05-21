@@ -38,7 +38,8 @@ pub fn derive_abi_encode(input: TokenStream) -> TokenStream {
                 Ok(())
             }
         }
-    }.into()
+    }
+    .into()
 }
 
 pub fn derive_abi_decode(input: TokenStream) -> TokenStream {
@@ -61,7 +62,8 @@ pub fn derive_abi_decode(input: TokenStream) -> TokenStream {
                 #body
             }
         }
-    }.into()
+    }
+    .into()
 }
 
 pub fn derive_abi_type(input: TokenStream) -> TokenStream {
@@ -74,7 +76,8 @@ pub fn derive_abi_type(input: TokenStream) -> TokenStream {
     let (abi_type_str, schema_expr) = match &input.data {
         Data::Struct(s) => {
             if transparent {
-                let ty = transparent_inner_type(s).expect("transparent struct must have exactly one field");
+                let ty = transparent_inner_type(s)
+                    .expect("transparent struct must have exactly one field");
                 (
                     quote! { <#ty as ::bloom_contract::abi::AbiType>::ABI_TYPE },
                     quote! { <#ty as ::bloom_contract::abi::AbiType>::schema() },
@@ -114,7 +117,8 @@ pub fn derive_abi_type(input: TokenStream) -> TokenStream {
                 #schema_expr
             }
         }
-    }.into()
+    }
+    .into()
 }
 
 // ---------------------------------------------------------------------------
@@ -246,8 +250,8 @@ fn struct_schema(s: &DataStruct) -> (TokenStream2, TokenStream2) {
         }
         Fields::Unnamed(u) => {
             let entries = u.unnamed.iter().enumerate().map(|(i, f)| {
-                let ident_str = ::std::boxed::Box::leak(format!("_{i}").into_boxed_str())
-                    as &'static str;
+                let ident_str =
+                    ::std::boxed::Box::leak(format!("_{i}").into_boxed_str()) as &'static str;
                 let ty = &f.ty;
                 quote! {
                     v.push((#ident_str, <#ty as ::bloom_contract::abi::AbiType>::schema()));
@@ -277,8 +281,10 @@ fn encode_enum(e: &DataEnum, name: &Ident) -> TokenStream2 {
                 let binds = (0..u.unnamed.len())
                     .map(|j| syn::Ident::new(&format!("__v{j}"), proc_macro2::Span::call_site()))
                     .collect::<Vec<_>>();
-                let writes = binds.iter().map(|b| quote! {
-                    ::bloom_contract::abi::AbiEncode::encode_into(#b, enc)?;
+                let writes = binds.iter().map(|b| {
+                    quote! {
+                        ::bloom_contract::abi::AbiEncode::encode_into(#b, enc)?;
+                    }
                 });
                 quote! {
                     #name::#v_ident(#(#binds),*) => {
@@ -288,9 +294,15 @@ fn encode_enum(e: &DataEnum, name: &Ident) -> TokenStream2 {
                 }
             }
             Fields::Named(n) => {
-                let binds = n.named.iter().map(|f| f.ident.clone().unwrap()).collect::<Vec<_>>();
-                let writes = binds.iter().map(|b| quote! {
-                    ::bloom_contract::abi::AbiEncode::encode_into(#b, enc)?;
+                let binds = n
+                    .named
+                    .iter()
+                    .map(|f| f.ident.clone().unwrap())
+                    .collect::<Vec<_>>();
+                let writes = binds.iter().map(|b| {
+                    quote! {
+                        ::bloom_contract::abi::AbiEncode::encode_into(#b, enc)?;
+                    }
                 });
                 quote! {
                     #name::#v_ident { #(#binds),* } => {
@@ -318,8 +330,8 @@ fn decode_enum(e: &DataEnum, name: &Ident) -> TokenStream2 {
                     let ty = &f.ty;
                     quote! { let #id = <#ty as ::bloom_contract::abi::AbiDecode>::decode(buf)?; }
                 });
-                let idents = (0..u.unnamed.len()).map(|j|
-                    syn::Ident::new(&format!("__v{j}"), proc_macro2::Span::call_site()));
+                let idents = (0..u.unnamed.len())
+                    .map(|j| syn::Ident::new(&format!("__v{j}"), proc_macro2::Span::call_site()));
                 quote! {
                     #disc => {
                         #(#reads)*

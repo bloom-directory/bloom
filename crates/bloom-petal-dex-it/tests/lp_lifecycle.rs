@@ -19,8 +19,7 @@ use bloom_dex_math::{ConstantProduct, SwapStrategy, integer_sqrt};
 
 #[test]
 fn create_pool_initial_mint_uses_sqrt() {
-    let (taken_a, taken_b, lp_minted) =
-        ConstantProduct::add_liquidity(0, 0, 400, 900, 0).unwrap();
+    let (taken_a, taken_b, lp_minted) = ConstantProduct::add_liquidity(0, 0, 400, 900, 0).unwrap();
 
     assert_eq!(taken_a, 400, "all amount_a deposited on initial mint");
     assert_eq!(taken_b, 900, "all amount_b deposited on initial mint");
@@ -131,8 +130,7 @@ fn add_liquidity_create_then_subsequent() {
     assert_eq!(lp1, 100, "initial lp = sqrt(100*100) = 100");
 
     // Step 2: subsequent deposit (pool now has reserve_a=100, reserve_b=100, lp=100)
-    let (taken_a, taken_b, lp2) =
-        ConstantProduct::add_liquidity(100, 100, 50, 50, lp1).unwrap();
+    let (taken_a, taken_b, lp2) = ConstantProduct::add_liquidity(100, 100, 50, 50, lp1).unwrap();
     assert_eq!(lp2, 50, "subsequent lp proportional = 50");
     assert_eq!(taken_a, 50);
     assert_eq!(taken_b, 50);
@@ -157,12 +155,10 @@ fn add_liquidity_create_then_subsequent() {
 // objects) is exercised by `dex_smoke_full::ptb_pool_lifecycle_*`.
 // ---------------------------------------------------------------------------
 
-use bloom_petal_dex_it::dex_harness::{
-    real_pool_manifest_bytes, wrap_with_real_manifest,
-};
-use bloom_petal_manifest::codec::decode as decode_manifest;
-use bloom_chain_state::State;
 use bloom_chain_node::ptb_chain_iface::PtbChainAdapter;
+use bloom_chain_state::State;
+use bloom_petal_dex_it::dex_harness::{real_pool_manifest_bytes, wrap_with_real_manifest};
+use bloom_petal_manifest::codec::decode as decode_manifest;
 use bloom_script::ChainStateIface;
 
 #[test]

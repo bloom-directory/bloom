@@ -11,9 +11,7 @@
 //! and value encoders defined here once it grows the two new
 //! `TrieKind` variants.
 
-use crate::codec::{
-    self, CodecError, read_bytes32, read_u32_be, write_bytes32, write_u32_be,
-};
+use crate::codec::{self, CodecError, read_bytes32, read_u32_be, write_bytes32, write_u32_be};
 use crate::id::ObjectId;
 use crate::object::Object;
 
@@ -233,5 +231,4 @@ mod tests {
         assert_eq!(OWNERSHIP_ROOT_TAG, "bloom-chain.v0.ownership_root:");
         assert_eq!(OWNERSHIP_LEAF_TAG, "bloom-chain.v0.ownership_leaf:");
     }
-
 }

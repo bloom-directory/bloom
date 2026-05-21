@@ -249,14 +249,20 @@ mod tests {
         let mut rdr: &[u8] = &[0u8];
         assert!(matches!(
             read_u32_be(&mut rdr),
-            Err(CodecError::UnexpectedEof { needed: 4, available: 1 })
+            Err(CodecError::UnexpectedEof {
+                needed: 4,
+                available: 1
+            })
         ));
     }
 
     #[test]
     fn trailing_bytes_detection() {
         let rdr: &[u8] = &[0u8, 1, 2];
-        assert_eq!(expect_eof(rdr), Err(CodecError::TrailingBytes { remaining: 3 }));
+        assert_eq!(
+            expect_eof(rdr),
+            Err(CodecError::TrailingBytes { remaining: 3 })
+        );
     }
 
     #[test]

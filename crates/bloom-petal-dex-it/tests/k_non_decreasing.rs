@@ -31,7 +31,7 @@ fn params(fee_bps: u16) -> ConstantProductParams {
 fn k_non_decreasing_100_swaps_with_fee() {
     let p = params(30);
 
-    let mut reserve_in  = 1_000_000u128;
+    let mut reserve_in = 1_000_000u128;
     let mut reserve_out = 1_000_000u128;
     let mut k_prev = reserve_in * reserve_out;
 
@@ -56,9 +56,9 @@ fn k_non_decreasing_100_swaps_with_fee() {
              (ri={reserve_in}, ro={reserve_out}, ai={amount_in})"
         );
 
-        reserve_in  = new_ri;
+        reserve_in = new_ri;
         reserve_out = new_ro;
-        k_prev      = k_new;
+        k_prev = k_new;
     }
 }
 
@@ -70,7 +70,7 @@ fn k_non_decreasing_100_swaps_with_fee() {
 fn k_non_decreasing_200_swaps_stress() {
     let p = params(30);
 
-    let mut reserve_in  = 1_000_000u128;
+    let mut reserve_in = 1_000_000u128;
     let mut reserve_out = 1_000_000u128;
     let mut k_prev = reserve_in * reserve_out;
 
@@ -89,9 +89,9 @@ fn k_non_decreasing_200_swaps_stress() {
                     k_new >= k_prev,
                     "k decreased at swap {i}: k_prev={k_prev} k_new={k_new}"
                 );
-                reserve_in  = new_ri;
+                reserve_in = new_ri;
                 reserve_out = new_ro;
-                k_prev      = k_new;
+                k_prev = k_new;
             }
             // InsufficientLiquidity / MaxOutExceeded can occur near pool drain —
             // not a k violation, just end the run.
@@ -112,7 +112,7 @@ fn k_non_decreasing_200_swaps_stress() {
 fn k_non_decreasing_100_swaps_zero_fee() {
     let p = params(0);
 
-    let mut reserve_in  = 1_000_000u128;
+    let mut reserve_in = 1_000_000u128;
     let mut reserve_out = 1_000_000u128;
     let mut k_prev = reserve_in * reserve_out;
 
@@ -130,9 +130,9 @@ fn k_non_decreasing_100_swaps_zero_fee() {
                     k_new >= k_prev,
                     "k decreased at swap {i} (zero fee): k_prev={k_prev} k_new={k_new}"
                 );
-                reserve_in  = new_ri;
+                reserve_in = new_ri;
                 reserve_out = new_ro;
-                k_prev      = k_new;
+                k_prev = k_new;
             }
             Err(_) => break,
         }

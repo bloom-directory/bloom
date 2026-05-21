@@ -37,10 +37,7 @@ fn blake3_selector(sig: &str) -> [u8; 4] {
 #[test]
 fn wloom_selectors_match_dex_v0_canonical_strings() {
     assert_eq!(Wloom::SEL_DEPOSIT, blake3_selector("wloom.deposit()"));
-    assert_eq!(
-        Wloom::SEL_WITHDRAW,
-        blake3_selector("wloom.withdraw(u256)"),
-    );
+    assert_eq!(Wloom::SEL_WITHDRAW, blake3_selector("wloom.withdraw(u256)"),);
 }
 
 #[test]
@@ -97,11 +94,7 @@ fn storage_slot_parity_allowance_mapping_tuple_key() {
     // the concatenated address pair under the legacy prefix.
     let owner = Address::from([0x11u8; 32]);
     let spender = Address::from([0x22u8; 32]);
-    let expected = blake3_slot(&[
-        b"wloom.allowance:",
-        owner.as_bytes(),
-        spender.as_bytes(),
-    ]);
+    let expected = blake3_slot(&[b"wloom.allowance:", owner.as_bytes(), spender.as_bytes()]);
 
     use bloom_contract::storage::Map;
     use bloom_contract::types::U256 as ContractU256;

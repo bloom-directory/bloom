@@ -26,22 +26,22 @@
 
 use std::collections::HashMap;
 
-use bloom_chain_node::petal_executor::ChainPetalExecutorWithManifests;
 use bloom_chain_node::consensus_driver::PetalExecutor;
+use bloom_chain_node::petal_executor::ChainPetalExecutorWithManifests;
 use bloom_chain_state::State;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
 use bloom_objects::{AccessMode, Object, ObjectId, Owner};
-use bloom_script::ExpectedVersion;
 use bloom_petal_fungible::ops::type_tag_coin_loom;
+use bloom_script::ExpectedVersion;
 use bloom_script::{
-    ArgDeclStub, Command, FunctionDeclStub, Arg, MoveCmd, PetalManifestStub, PetalRef,
-    PqSignature, PtbTx, UseRef, encode_ptb,
+    Arg, ArgDeclStub, Command, FunctionDeclStub, MoveCmd, PetalManifestStub, PetalRef, PqSignature,
+    PtbTx, UseRef, encode_ptb,
 };
 
 use bloom_petal_it::harness::{
-    addr, build_state, genesis_coin_id, ptb_coin_payload, ptb_decode_coin_value,
-    single_manifest, wat_to_wasm,
+    addr, build_state, genesis_coin_id, ptb_coin_payload, ptb_decode_coin_value, single_manifest,
+    wat_to_wasm,
 };
 
 // ---------------------------------------------------------------------------
@@ -66,7 +66,14 @@ fn submit_raw(
         sig: SigBytes(vec![0u8; 64]),
     };
     let exec = ChainPetalExecutorWithManifests::new(manifests);
-    exec.execute_tx(&tx, state, 100, 1_700_000_000_000, addr(0xAA), Hash32([0u8; 32]))
+    exec.execute_tx(
+        &tx,
+        state,
+        100,
+        1_700_000_000_000,
+        addr(0xAA),
+        Hash32([0u8; 32]),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +149,10 @@ fn linearity_violation_reverts_atomically() {
         commands: vec![
             // cmd 0: load alice's coin → returns coin id in slot 0
             Command::Move(MoveCmd {
-                petal: PetalRef { path: String::new(), hash: Some(petal_hash) },
+                petal: PetalRef {
+                    path: String::new(),
+                    hash: Some(petal_hash),
+                },
                 function: "load_coin".to_string(),
                 type_args: vec![],
                 args: vec![Arg::Object {
@@ -153,7 +163,10 @@ fn linearity_violation_reverts_atomically() {
             }),
             // cmd 1: SplitCoins — produces orphaned transient coin
             Command::SplitCoins {
-                src: UseRef { cmd_idx: 0, ret_idx: 0 },
+                src: UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                },
                 amounts: vec![300],
             },
             // Intentionally NO TransferObjects → linearity violation at tx end.
@@ -180,10 +193,15 @@ fn linearity_violation_reverts_atomically() {
     // State root must be unchanged (petal code insertion changed code_root,
     // but object_root and ownership_root must be unchanged by the reverted PTB).
     // We check that Alice's coin still exists and has the original value.
-    let alice_coin = state.get_object(&alice_coin_id).expect("alice's coin must be unchanged");
+    let alice_coin = state
+        .get_object(&alice_coin_id)
+        .expect("alice's coin must be unchanged");
     // Decode using the PTB-path 16-byte format (value at bytes[0..16]).
     let alice_val = ptb_decode_coin_value(&alice_coin.payload);
-    assert_eq!(alice_val, 1000, "alice's coin value must be unchanged after revert");
+    assert_eq!(
+        alice_val, 1000,
+        "alice's coin value must be unchanged after revert"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -232,12 +250,15 @@ fn fabricated_gas_payer_wrong_owner_reverts() {
     let ptb = PtbTx {
         signers: vec![alice.0],
         commands: vec![Command::Move(MoveCmd {
-            petal: PetalRef { path: String::new(), hash: Some(petal_hash) },
+            petal: PetalRef {
+                path: String::new(),
+                hash: Some(petal_hash),
+            },
             function: "noop".to_string(),
             type_args: vec![],
             args: vec![],
         })],
-        gas_payer: carol_coin_id,  // carol's coin, not alice's
+        gas_payer: carol_coin_id, // carol's coin, not alice's
         gas_budget: 1_000,
         gas_price: 0,
         expiry_block: 100,
@@ -252,8 +273,11 @@ fn fabricated_gas_payer_wrong_owner_reverts() {
 
     let reason = String::from_utf8_lossy(&out.return_data).to_lowercase();
     assert!(
-        reason.contains("gas") || reason.contains("cap") || reason.contains("payer")
-            || reason.contains("owner") || reason.contains("signer"),
+        reason.contains("gas")
+            || reason.contains("cap")
+            || reason.contains("payer")
+            || reason.contains("owner")
+            || reason.contains("signer"),
         "revert reason must mention gas/cap/payer/owner/signer; got: {reason}"
     );
 }
@@ -286,7 +310,10 @@ fn nonexistent_gas_payer_reverts() {
     let ptb = PtbTx {
         signers: vec![alice.0],
         commands: vec![Command::Move(MoveCmd {
-            petal: PetalRef { path: String::new(), hash: Some(petal_hash) },
+            petal: PetalRef {
+                path: String::new(),
+                hash: Some(petal_hash),
+            },
             function: "noop".to_string(),
             type_args: vec![],
             args: vec![],
@@ -306,7 +333,9 @@ fn nonexistent_gas_payer_reverts() {
 
     let reason = String::from_utf8_lossy(&out.return_data).to_lowercase();
     assert!(
-        reason.contains("not found") || reason.contains("gas") || reason.contains("object")
+        reason.contains("not found")
+            || reason.contains("gas")
+            || reason.contains("object")
             || reason.contains("payer"),
         "revert reason must mention not-found/gas/object/payer; got: {reason}"
     );
@@ -338,18 +367,27 @@ fn revert_atomicity_state_is_unchanged() {
 
     // Helper: check invariants.
     let check = |state: &State, label: &str| {
-        let coin = state.get_object(&alice_coin_id).expect("alice's coin must still exist");
+        let coin = state
+            .get_object(&alice_coin_id)
+            .expect("alice's coin must still exist");
         // Use PTB-path 16-byte decode (value at bytes[0..16]).
         let val = ptb_decode_coin_value(&coin.payload);
         assert_eq!(val, 1000, "{label}: alice's coin value must still be 1000");
-        assert_eq!(coin.owner, Owner::Address(alice.0), "{label}: alice must still own the coin");
+        assert_eq!(
+            coin.owner,
+            Owner::Address(alice.0),
+            "{label}: alice must still own the coin"
+        );
 
         let okey = bloom_objects::OwnershipIndexKey {
             owner_kind: OWNER_KIND_ADDRESS,
             owner_id: alice.0,
         };
         let owned = state.get_ownership(&okey).unwrap_or_default();
-        assert!(owned.contains(&alice_coin_id), "{label}: alice's ownership index must be intact");
+        assert!(
+            owned.contains(&alice_coin_id),
+            "{label}: alice's ownership index must be intact"
+        );
     };
 
     // Revert 1: fabricated gas payer.
@@ -358,7 +396,10 @@ fn revert_atomicity_state_is_unchanged() {
         let ptb = PtbTx {
             signers: vec![alice.0],
             commands: vec![Command::Move(MoveCmd {
-                petal: PetalRef { path: String::new(), hash: Some(petal_hash) },
+                petal: PetalRef {
+                    path: String::new(),
+                    hash: Some(petal_hash),
+                },
                 function: "noop".to_string(),
                 type_args: vec![],
                 args: vec![],
@@ -400,7 +441,10 @@ fn revert_atomicity_state_is_unchanged() {
             signers: vec![alice.0],
             commands: vec![
                 Command::Move(MoveCmd {
-                    petal: PetalRef { path: String::new(), hash: Some(coin_petal_hash) },
+                    petal: PetalRef {
+                        path: String::new(),
+                        hash: Some(coin_petal_hash),
+                    },
                     function: "load_coin".to_string(),
                     type_args: vec![],
                     args: vec![Arg::Object {
@@ -410,7 +454,10 @@ fn revert_atomicity_state_is_unchanged() {
                     }],
                 }),
                 Command::SplitCoins {
-                    src: UseRef { cmd_idx: 0, ret_idx: 0 },
+                    src: UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    },
                     amounts: vec![100],
                 },
                 // No TransferObjects → linearity violation.
@@ -442,7 +489,10 @@ fn revert_atomicity_state_is_unchanged() {
         let ptb = PtbTx {
             signers: vec![alice.0],
             commands: vec![Command::Move(MoveCmd {
-                petal: PetalRef { path: String::new(), hash: Some(petal_hash) },
+                petal: PetalRef {
+                    path: String::new(),
+                    hash: Some(petal_hash),
+                },
                 function: "noop".to_string(),
                 type_args: vec![],
                 args: vec![],

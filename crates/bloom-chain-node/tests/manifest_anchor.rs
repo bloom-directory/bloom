@@ -9,8 +9,7 @@
 //! the executor, snapshot commit, or SSZ encoding surfaces here.
 
 use bloom_chain_node::{
-    consensus_driver::apply_block_state_transitions,
-    petal_executor::ChainPetalExecutor,
+    consensus_driver::apply_block_state_transitions, petal_executor::ChainPetalExecutor,
 };
 use bloom_chain_state::{Account, State};
 use bloom_chain_types::{
@@ -18,7 +17,7 @@ use bloom_chain_types::{
     tx::{Tx, TxKind},
     types::{Address, Hash32, PubKeyBytes, SigBytes},
 };
-use bloom_test_util::{make_addr, BlockBuilder};
+use bloom_test_util::{BlockBuilder, make_addr};
 
 const ZERO_EMISSION: u128 = 0;
 

@@ -21,8 +21,7 @@
 //! header's `parent_hash`.
 
 use bloom_chain_node::{
-    consensus_driver::apply_block_state_transitions,
-    petal_executor::ChainPetalExecutor,
+    consensus_driver::apply_block_state_transitions, petal_executor::ChainPetalExecutor,
 };
 use bloom_chain_state::{Account, State};
 use bloom_chain_types::{
@@ -30,7 +29,7 @@ use bloom_chain_types::{
     tx::{Tx, TxKind},
     types::{Address, Hash32, PubKeyBytes, SigBytes},
 };
-use bloom_test_util::{make_addr, BlockBuilder};
+use bloom_test_util::{BlockBuilder, make_addr};
 
 const ZERO_EMISSION: u128 = 0;
 
@@ -109,10 +108,10 @@ fn prevhash_visible_to_petal() {
         sig: SigBytes(vec![0u8; 64]),
     };
     let _ = sk; // Tx signatures aren't checked in
-                // apply_block_state_transitions — sender derivation +
-                // nonce + balance are. Keep `sk` referenced so the test
-                // documents the production lifecycle even though we
-                // don't sign here.
+    // apply_block_state_transitions — sender derivation +
+    // nonce + balance are. Keep `sk` referenced so the test
+    // documents the production lifecycle even though we
+    // don't sign here.
 
     // ── 5. Build a block whose header carries the known parent_hash.
     //       (apply_block_state_transitions reads block.header.parent_hash
@@ -123,12 +122,8 @@ fn prevhash_visible_to_petal() {
         .txs(vec![tx_unsigned])
         .build();
 
-    let (_fuel, receipts) = apply_block_state_transitions(
-        &mut state,
-        &ChainPetalExecutor,
-        &block,
-        ZERO_EMISSION,
-    );
+    let (_fuel, receipts) =
+        apply_block_state_transitions(&mut state, &ChainPetalExecutor, &block, ZERO_EMISSION);
     assert_eq!(receipts.len(), 1, "exactly one tx receipt");
     let r = &receipts[0];
     assert!(

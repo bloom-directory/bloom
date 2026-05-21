@@ -18,17 +18,17 @@ use bloom_chain_types::Hash32;
 use bloom_objects::{
     AccessMode, ObjectId, Owner, TypeTag,
     codec::{
-        self, CodecError, read_bytes, read_bytes32, read_string, read_u8, read_u16_be,
-        read_u32_be, read_u64_be, write_bytes, write_bytes32, write_string, write_u8, write_u16_be,
+        self, CodecError, read_bytes, read_bytes32, read_string, read_u8, read_u16_be, read_u32_be,
+        read_u64_be, write_bytes, write_bytes32, write_string, write_u8, write_u16_be,
         write_u32_be, write_u64_be,
     },
 };
 
 use crate::types::{
-    Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PqSignature, PtbTx, PublishCmd, TAG_ARG_CONST,
-    TAG_ARG_OBJECT, TAG_ARG_SIGNER, TAG_ARG_TYPEARG, TAG_ARG_USE, TAG_CMD_MAKE_VEC, TAG_CMD_MERGE,
-    TAG_CMD_MOVE, TAG_CMD_PUBLISH, TAG_CMD_SPLIT, TAG_CMD_TRANSFER, TAG_CMD_UPGRADE, UpgradeCmd,
-    UseRef,
+    Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PqSignature, PtbTx, PublishCmd,
+    TAG_ARG_CONST, TAG_ARG_OBJECT, TAG_ARG_SIGNER, TAG_ARG_TYPEARG, TAG_ARG_USE, TAG_CMD_MAKE_VEC,
+    TAG_CMD_MERGE, TAG_CMD_MOVE, TAG_CMD_PUBLISH, TAG_CMD_SPLIT, TAG_CMD_TRANSFER, TAG_CMD_UPGRADE,
+    UpgradeCmd, UseRef,
 };
 
 // ---------------------------------------------------------------------------

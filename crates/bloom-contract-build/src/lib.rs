@@ -261,11 +261,12 @@ pub fn validate_wasm(bytes: &[u8]) -> Result<WasmInspection, BuildError> {
                         )));
                     }
                     if let Some(max) = mem.maximum
-                        && max > u64::from(MAX_MEMORY_PAGES) {
-                            return Err(BuildError::Validation(format!(
-                                "memory max pages {max} exceeds cap of {MAX_MEMORY_PAGES}"
-                            )));
-                        }
+                        && max > u64::from(MAX_MEMORY_PAGES)
+                    {
+                        return Err(BuildError::Validation(format!(
+                            "memory max pages {max} exceeds cap of {MAX_MEMORY_PAGES}"
+                        )));
+                    }
                 }
             }
             Payload::CodeSectionEntry(body) => {
@@ -273,7 +274,9 @@ pub fn validate_wasm(bytes: &[u8]) -> Result<WasmInspection, BuildError> {
                     .get_operators_reader()
                     .map_err(|e| BuildError::Validation(e.to_string()))?;
                 while !reader.eof() {
-                    let op = reader.read().map_err(|e| BuildError::Validation(e.to_string()))?;
+                    let op = reader
+                        .read()
+                        .map_err(|e| BuildError::Validation(e.to_string()))?;
                     if is_floating_point_op(&op) {
                         return Err(BuildError::Validation(format!(
                             "floating-point op disallowed: {:?}",
@@ -289,7 +292,10 @@ pub fn validate_wasm(bytes: &[u8]) -> Result<WasmInspection, BuildError> {
             _ => {}
         }
     }
-    Ok(WasmInspection { imports, interface_records })
+    Ok(WasmInspection {
+        imports,
+        interface_records,
+    })
 }
 
 /// Render a wasm function type as `"(param_tys) -> (result_tys)"`.
@@ -379,9 +385,10 @@ pub fn extract_manifest_section(bytes: &[u8]) -> Result<Option<Vec<u8>>, BuildEr
     for payload in parser.parse_all(bytes) {
         let payload = payload.map_err(|e| BuildError::Manifest(e.to_string()))?;
         if let Payload::CustomSection(reader) = payload
-            && reader.name() == "bloom_manifest" {
-                return Ok(Some(reader.data().to_vec()));
-            }
+            && reader.name() == "bloom_manifest"
+        {
+            return Ok(Some(reader.data().to_vec()));
+        }
     }
     Ok(None)
 }
@@ -397,10 +404,11 @@ pub fn extract_interface_records(bytes: &[u8]) -> Result<Vec<InterfaceManifest>,
     for payload in parser.parse_all(bytes) {
         let payload = payload.map_err(|e| BuildError::Manifest(e.to_string()))?;
         if let Payload::CustomSection(reader) = payload
-            && reader.name() == "bloom_interfaces" {
-                return parse_interface_records(reader.data())
-                    .map_err(|e| BuildError::Manifest(format!("bloom_interfaces: {e}")));
-            }
+            && reader.name() == "bloom_interfaces"
+        {
+            return parse_interface_records(reader.data())
+                .map_err(|e| BuildError::Manifest(format!("bloom_interfaces: {e}")));
+        }
     }
     Ok(Vec::new())
 }
@@ -449,7 +457,10 @@ pub fn finalise_manifest(
         serde_json::Value::Number(SCHEMA_VERSION.into()),
     );
     obj.insert("wasm_hash".into(), serde_json::Value::String(wasm_hash_hex));
-    obj.insert("source_hash".into(), serde_json::Value::String(source_hash_hex));
+    obj.insert(
+        "source_hash".into(),
+        serde_json::Value::String(source_hash_hex),
+    );
     obj.insert(
         "imports".into(),
         serde_json::to_value(&imports).map_err(|e| BuildError::Manifest(e.to_string()))?,
@@ -471,11 +482,12 @@ pub fn finalise_manifest(
     );
 
     if let Some(storage) = obj.get_mut("storage").and_then(|v| v.as_object_mut())
-        && let Some(fields) = storage.get_mut("fields").and_then(|v| v.as_array_mut()) {
-            for entry in fields {
-                normalise_storage_field(entry)?;
-            }
+        && let Some(fields) = storage.get_mut("fields").and_then(|v| v.as_array_mut())
+    {
+        for entry in fields {
+            normalise_storage_field(entry)?;
         }
+    }
 
     // Limits aren't user-configurable yet; force the on-disk default.
     let limits = Limits::default();
@@ -534,9 +546,9 @@ fn resolve_interfaces(
 /// (`kind.kind == "map"` ⇒ `blake3-map-v1`, `compat_tag` ⇒
 /// `blake3-compat-v1`, etc.) and default the rest to `blake3-storage-v1`.
 fn normalise_storage_field(entry: &mut serde_json::Value) -> Result<(), BuildError> {
-    let obj = entry.as_object_mut().ok_or_else(|| {
-        BuildError::Manifest("storage field entry is not an object".into())
-    })?;
+    let obj = entry
+        .as_object_mut()
+        .ok_or_else(|| BuildError::Manifest("storage field entry is not an object".into()))?;
 
     let has_compat = obj.contains_key("compat_tag");
     let kind = obj.remove("kind");
@@ -581,7 +593,11 @@ fn normalise_storage_field(entry: &mut serde_json::Value) -> Result<(), BuildErr
                 .and_then(|v| v.as_str())
                 .unwrap_or("?")
                 .to_string();
-            let algo = if has_compat { SlotAlgo::COMPAT_V1 } else { SlotAlgo::STORAGE_V1 };
+            let algo = if has_compat {
+                SlotAlgo::COMPAT_V1
+            } else {
+                SlotAlgo::STORAGE_V1
+            };
             (existing, algo)
         }
     };
@@ -628,12 +644,13 @@ pub fn verify_manifest_against_wasm(manifest: &Manifest, wasm: &[u8]) -> Result<
         // missing signature on either side is treated as a wildcard — older
         // (v1) manifests didn't capture this field at all.
         if let (Some(want), Some(got)) = (&declared.signature, &live.signature)
-            && want != got {
-                return Err(BuildError::Manifest(format!(
-                    "import `{}.{}` signature mismatch: manifest={} wasm={}",
-                    live.module, live.name, want, got
-                )));
-            }
+            && want != got
+        {
+            return Err(BuildError::Manifest(format!(
+                "import `{}.{}` signature mismatch: manifest={} wasm={}",
+                live.module, live.name, want, got
+            )));
+        }
     }
     Ok(())
 }
@@ -664,7 +681,9 @@ pub fn build_crate(crate_dir: &Path, profile: Profile) -> Result<Vec<u8>, BuildE
     }
     cmd.arg("--manifest-path").arg(crate_dir.join("Cargo.toml"));
     cmd.env("CARGO_TERM_COLOR", "never");
-    let output = cmd.output().map_err(|e| BuildError::Cargo(format!("spawn cargo: {e}")))?;
+    let output = cmd
+        .output()
+        .map_err(|e| BuildError::Cargo(format!("spawn cargo: {e}")))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(BuildError::Cargo(format!(
@@ -681,7 +700,11 @@ pub fn build_crate(crate_dir: &Path, profile: Profile) -> Result<Vec<u8>, BuildE
     }
     Err(BuildError::Cargo(format!(
         "wasm artifact not found; looked at: {}",
-        candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     )))
 }
 
@@ -709,8 +732,16 @@ fn read_crate_name(crate_dir: &Path) -> Result<String, BuildError> {
     )))
 }
 
-fn wasm_candidates(crate_dir: &Path, profile: Profile, wasm_name: &str) -> Result<Vec<PathBuf>, BuildError> {
-    let subpath = format!("target/wasm32-unknown-unknown/{}/{}", profile.cargo_dir_name(), wasm_name);
+fn wasm_candidates(
+    crate_dir: &Path,
+    profile: Profile,
+    wasm_name: &str,
+) -> Result<Vec<PathBuf>, BuildError> {
+    let subpath = format!(
+        "target/wasm32-unknown-unknown/{}/{}",
+        profile.cargo_dir_name(),
+        wasm_name
+    );
     let mut out = vec![crate_dir.join(&subpath)];
 
     // If the crate is a workspace member, the target dir is at the
@@ -721,9 +752,10 @@ fn wasm_candidates(crate_dir: &Path, profile: Profile, wasm_name: &str) -> Resul
         let candidate_toml = p.join("Cargo.toml");
         if candidate_toml.is_file()
             && let Ok(body) = fs::read_to_string(&candidate_toml)
-                && body.contains("[workspace]") {
-                    out.push(p.join(&subpath));
-                }
+            && body.contains("[workspace]")
+        {
+            out.push(p.join(&subpath));
+        }
         cur = p.parent();
     }
     Ok(out)
@@ -735,7 +767,11 @@ fn wasm_candidates(crate_dir: &Path, profile: Profile, wasm_name: &str) -> Resul
 
 /// Build a contract crate end-to-end: compile, validate, extract +
 /// finalise the manifest, write artifacts to `out_dir`.
-pub fn emit_artifacts(crate_dir: &Path, out_dir: &Path, profile: Profile) -> Result<ArtifactSet, BuildError> {
+pub fn emit_artifacts(
+    crate_dir: &Path,
+    out_dir: &Path,
+    profile: Profile,
+) -> Result<ArtifactSet, BuildError> {
     fs::create_dir_all(out_dir)?;
 
     let wasm = build_crate(crate_dir, profile)?;
@@ -841,7 +877,10 @@ mod tests {
     fn hex_encode_is_lowercase() {
         let h = wasm_hash(b"x");
         let s = hex_encode(&h);
-        assert!(s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+        assert!(
+            s.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
         assert_eq!(s.len(), 64);
     }
 
@@ -902,8 +941,7 @@ mod tests {
     #[test]
     fn validate_wasm_extracts_interface_records() {
         // Wire form: <u16-le len><JSON> per record, concatenated.
-        let rec1 =
-            r#"{"name":"Erc20","domain":"erc20","methods":[]}"#;
+        let rec1 = r#"{"name":"Erc20","domain":"erc20","methods":[]}"#;
         let mut blob = Vec::new();
         blob.extend_from_slice(&(rec1.len() as u16).to_le_bytes());
         blob.extend_from_slice(rec1.as_bytes());
@@ -950,10 +988,9 @@ mod tests {
     #[test]
     fn extract_manifest_section_reads_custom_section() {
         // Construct a tiny wasm with a `bloom_manifest` custom section.
-        let bytes = wat::parse_str(
-            r#"(module (@custom "bloom_manifest" "{\"hello\":\"world\"}"))"#,
-        )
-        .unwrap();
+        let bytes =
+            wat::parse_str(r#"(module (@custom "bloom_manifest" "{\"hello\":\"world\"}"))"#)
+                .unwrap();
         let section = extract_manifest_section(&bytes).unwrap().unwrap();
         assert_eq!(section, b"{\"hello\":\"world\"}");
     }
@@ -1033,7 +1070,10 @@ mod tests {
         assert_eq!(m.compiler, compiler);
         // Storage normalisation: scalar → ty, map → ty + map-v1 algo.
         assert_eq!(m.storage.fields[0].ty, "address");
-        assert_eq!(m.storage.fields[0].slot_algorithm.rule, SlotAlgo::STORAGE_V1);
+        assert_eq!(
+            m.storage.fields[0].slot_algorithm.rule,
+            SlotAlgo::STORAGE_V1
+        );
         assert_eq!(m.storage.fields[1].ty, "map<address,u256>");
         assert_eq!(m.storage.fields[1].slot_algorithm.rule, SlotAlgo::MAP_V1);
         assert_eq!(m.limits.max_memory_pages, 256);

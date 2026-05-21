@@ -78,7 +78,10 @@ fn full_dex_flow_math() {
     reserve_b = new_rb;
 
     // Verify k invariant (with fee, k should be >= original)
-    assert!(reserve_a * reserve_b >= 1500 * 1500, "k must not decrease after swap");
+    assert!(
+        reserve_a * reserve_b >= 1500 * 1500,
+        "k must not decrease after swap"
+    );
 
     // Step 4: bob removes half his LP
     let bob_lp_to_burn = bob_lp / 2; // 250
@@ -92,8 +95,14 @@ fn full_dex_flow_math() {
     // Bob gets back more value than he put in on A-side (due to charlie's swap adding A)
     let bob_a_in = taken_a_bob / 2; // he's only burning half
     let bob_b_in = taken_b_bob / 2;
-    assert!(a_out_bob > bob_a_in, "bob gains A due to charlie's swap (IL in reverse)");
-    assert!(b_out_bob < bob_b_in, "bob gets back less B due to B being bought by charlie");
+    assert!(
+        a_out_bob > bob_a_in,
+        "bob gains A due to charlie's swap (IL in reverse)"
+    );
+    assert!(
+        b_out_bob < bob_b_in,
+        "bob gets back less B due to B being bought by charlie"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -109,8 +118,8 @@ fn full_dex_flow_math() {
 #[test]
 fn multi_token_scale_swap() {
     let reserve_usdc = 1_000_000u128; // 1 USDC (6 dec)
-    let reserve_loom = 1_000u128;     // scaled
-    let amount_in    = 100_000u128;   // 0.1 USDC
+    let reserve_loom = 1_000u128; // scaled
+    let amount_in = 100_000u128; // 0.1 USDC
 
     let out = ConstantProduct::quote(reserve_usdc, reserve_loom, amount_in, &params(30)).unwrap();
 
@@ -186,9 +195,18 @@ fn three_dex_petal_manifests_coexist_via_chain_adapter() {
     let router_hash = state.insert_code(&router_wasm);
     state.set_vfs_binding("/bloom/dex/router".to_string(), router_hash);
 
-    assert_ne!(pool_hash, cpmm_hash, "different wasms must hash differently");
-    assert_ne!(cpmm_hash, router_hash, "different wasms must hash differently");
-    assert_ne!(pool_hash, router_hash, "different wasms must hash differently");
+    assert_ne!(
+        pool_hash, cpmm_hash,
+        "different wasms must hash differently"
+    );
+    assert_ne!(
+        cpmm_hash, router_hash,
+        "different wasms must hash differently"
+    );
+    assert_ne!(
+        pool_hash, router_hash,
+        "different wasms must hash differently"
+    );
 
     // PTB calls cpmm.version() — pinning by hash forces the adapter
     // to resolve the cpmm manifest from its specific wasm custom
@@ -196,7 +214,10 @@ fn three_dex_petal_manifests_coexist_via_chain_adapter() {
     let ptb = PtbTx {
         signers: vec![alice.0],
         commands: vec![Command::Move(MoveCmd {
-            petal: PetalRef { path: String::new(), hash: Some(cpmm_hash) },
+            petal: PetalRef {
+                path: String::new(),
+                hash: Some(cpmm_hash),
+            },
             function: "version".to_string(),
             type_args: vec![],
             args: vec![],

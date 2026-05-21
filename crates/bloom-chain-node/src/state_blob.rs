@@ -25,7 +25,9 @@ impl StateBlobStore {
     pub fn open(root: &Path) -> Result<Self> {
         std::fs::create_dir_all(root)
             .with_context(|| format!("create state_blobs dir: {}", root.display()))?;
-        Ok(StateBlobStore { root: root.to_path_buf() })
+        Ok(StateBlobStore {
+            root: root.to_path_buf(),
+        })
     }
 
     fn path_for(&self, hash: &Hash32) -> PathBuf {

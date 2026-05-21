@@ -142,8 +142,10 @@ fn nonreentrant_flag_is_recorded() {
 
 #[test]
 fn selectors_are_distinct_across_handlers() {
-    let sels: alloc::vec::Vec<[u8; 4]> =
-        demo::__bloom::SELECTORS.iter().map(|e| e.selector).collect();
+    let sels: alloc::vec::Vec<[u8; 4]> = demo::__bloom::SELECTORS
+        .iter()
+        .map(|e| e.selector)
+        .collect();
     for i in 0..sels.len() {
         for j in (i + 1)..sels.len() {
             assert_ne!(sels[i], sels[j], "selectors collide at {i}/{j}");
@@ -235,7 +237,10 @@ fn vault_handlers_remain_addressable_under_native_selectors() {
     // The contract's own selectors are derived from `vault.method(types)`,
     // independent of any interface aliasing — verified here so a regression
     // that folds the interface domain into the primary table would fail.
-    let mint = vault::__bloom::SELECTORS.iter().find(|e| e.name == "mint").unwrap();
+    let mint = vault::__bloom::SELECTORS
+        .iter()
+        .find(|e| e.name == "mint")
+        .unwrap();
     assert_eq!(mint.signature, "vault.mint(address,u256)");
     let h = blake3::hash(mint.signature.as_bytes());
     assert_eq!(mint.selector, h.as_bytes()[..4]);

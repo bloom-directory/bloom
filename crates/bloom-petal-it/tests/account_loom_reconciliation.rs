@@ -11,7 +11,7 @@ use bloom_chain_node::petal_executor::ChainPetalExecutor;
 use bloom_chain_state::State;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
-use bloom_objects::{OwnershipIndexKey, OWNER_KIND_ADDRESS};
+use bloom_objects::{OWNER_KIND_ADDRESS, OwnershipIndexKey};
 use bloom_petal_fungible::ops::{decode_coin_value, type_tag_coin_loom};
 
 use bloom_petal_it::harness::{addr, build_state};
@@ -26,7 +26,10 @@ use bloom_petal_it::harness::{addr, build_state};
 /// format) and `type_tag_coin_loom()`. Skips objects whose type tag doesn't
 /// match `Coin<LOOM>`.
 fn sum_coin_loom(state: &State, owner: Address) -> u128 {
-    let okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: owner.0 };
+    let okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: owner.0,
+    };
     let owned = state.get_ownership(&okey).unwrap_or_default();
     let coin_type = type_tag_coin_loom();
     owned
@@ -40,13 +43,11 @@ fn sum_coin_loom(state: &State, owner: Address) -> u128 {
 /// Assert the reconciliation invariant for `addr`:
 ///   account.loom == sum(Coin<LOOM> owned by addr)
 fn assert_reconciled(state: &State, owner: Address, label: &str) {
-    let account_loom = state
-        .get_account(&owner)
-        .map(|a| a.loom)
-        .unwrap_or(0);
+    let account_loom = state.get_account(&owner).map(|a| a.loom).unwrap_or(0);
     let coin_total = sum_coin_loom(state, owner);
     assert_eq!(
-        account_loom, coin_total,
+        account_loom,
+        coin_total,
         "{label}: account.loom ({account_loom}) != sum(Coin<LOOM>) ({coin_total}) \
          for addr {addr:?}",
         addr = owner.0
@@ -63,7 +64,9 @@ fn assert_reconciled(state: &State, owner: Address, label: &str) {
 fn exec_transfer(state: &mut State, sender: Address, to: Address, amount: u128) {
     // Step 3 (block driver): debit sender's account.loom.
     {
-        let mut sender_acct = state.get_account(&sender).expect("sender must have an account");
+        let mut sender_acct = state
+            .get_account(&sender)
+            .expect("sender must have an account");
         assert!(
             sender_acct.loom >= amount,
             "sender account.loom {loom} < transfer amount {amount}",
@@ -81,20 +84,18 @@ fn exec_transfer(state: &mut State, sender: Address, to: Address, amount: u128) 
         nonce: 0,
         max_fuel: 1_000,
         fee_per_unit: 0,
-        kind: TxKind::Transfer { to, amount_loom: amount },
+        kind: TxKind::Transfer {
+            to,
+            amount_loom: amount,
+        },
         pubkey: PubKeyBytes(vec![0u8; 32]),
         sig: SigBytes(vec![0u8; 64]),
     };
-    let out = ChainPetalExecutor.execute_tx(
-        &tx,
-        state,
-        1,
-        0,
-        addr(0xFF),
-        Hash32([0u8; 32]),
-    );
+    let out = ChainPetalExecutor.execute_tx(&tx, state, 1, 0, addr(0xFF), Hash32([0u8; 32]));
     assert!(out.success, "Transfer must succeed");
-    state.apply(out.write_set.unwrap()).expect("apply must not fail");
+    state
+        .apply(out.write_set.unwrap())
+        .expect("apply must not fail");
 }
 
 // ---------------------------------------------------------------------------
@@ -106,18 +107,14 @@ fn exec_transfer(state: &mut State, sender: Address, to: Address, amount: u128) 
 
 #[test]
 fn reconciliation_genesis_3_allocations() {
-    let alice  = addr(0xA1);
-    let bob    = addr(0xB2);
+    let alice = addr(0xA1);
+    let bob = addr(0xB2);
     let charlie = addr(0xC3);
 
-    let state = build_state(&[
-        (alice,   1_000),
-        (bob,     2_000),
-        (charlie, 3_000),
-    ]);
+    let state = build_state(&[(alice, 1_000), (bob, 2_000), (charlie, 3_000)]);
 
-    assert_reconciled(&state, alice,   "genesis alice");
-    assert_reconciled(&state, bob,     "genesis bob");
+    assert_reconciled(&state, alice, "genesis alice");
+    assert_reconciled(&state, bob, "genesis bob");
     assert_reconciled(&state, charlie, "genesis charlie");
 }
 
@@ -131,18 +128,26 @@ fn reconciliation_genesis_3_allocations() {
 #[test]
 fn reconciliation_after_single_transfer() {
     let alice = addr(0xA1);
-    let bob   = addr(0xB2);
+    let bob = addr(0xB2);
 
     let mut state = build_state(&[(alice, 1_000)]);
 
     exec_transfer(&mut state, alice, bob, 300);
 
     assert_reconciled(&state, alice, "after transfer: alice");
-    assert_reconciled(&state, bob,   "after transfer: bob");
+    assert_reconciled(&state, bob, "after transfer: bob");
 
     // Spot-check values.
-    assert_eq!(sum_coin_loom(&state, alice), 700, "alice Coin<LOOM> sum must be 700");
-    assert_eq!(sum_coin_loom(&state, bob),   300, "bob Coin<LOOM> sum must be 300");
+    assert_eq!(
+        sum_coin_loom(&state, alice),
+        700,
+        "alice Coin<LOOM> sum must be 700"
+    );
+    assert_eq!(
+        sum_coin_loom(&state, bob),
+        300,
+        "bob Coin<LOOM> sum must be 300"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -158,8 +163,8 @@ fn reconciliation_after_single_transfer() {
 
 #[test]
 fn reconciliation_5_sequential_transfers_3_addresses() {
-    let alice   = addr(0xA1);
-    let bob     = addr(0xB2);
+    let alice = addr(0xA1);
+    let bob = addr(0xB2);
     let charlie = addr(0xC3);
 
     let initial = 10_000u128;
@@ -167,19 +172,18 @@ fn reconciliation_5_sequential_transfers_3_addresses() {
 
     // We need bob and charlie to have non-zero balances before they
     // can send; seed the early transfers from alice.
-    exec_transfer(&mut state, alice, bob,     1_000);
-    exec_transfer(&mut state, alice, charlie,   500);  // give charlie some first
-    exec_transfer(&mut state, bob,   charlie,   400);
-    exec_transfer(&mut state, alice, charlie,   300);
-    exec_transfer(&mut state, alice, bob,       200);
+    exec_transfer(&mut state, alice, bob, 1_000);
+    exec_transfer(&mut state, alice, charlie, 500); // give charlie some first
+    exec_transfer(&mut state, bob, charlie, 400);
+    exec_transfer(&mut state, alice, charlie, 300);
+    exec_transfer(&mut state, alice, bob, 200);
 
-    assert_reconciled(&state, alice,   "after 5 transfers: alice");
-    assert_reconciled(&state, bob,     "after 5 transfers: bob");
+    assert_reconciled(&state, alice, "after 5 transfers: alice");
+    assert_reconciled(&state, bob, "after 5 transfers: bob");
     assert_reconciled(&state, charlie, "after 5 transfers: charlie");
 
     // Conservation: total must equal 10_000.
-    let total = sum_coin_loom(&state, alice)
-        + sum_coin_loom(&state, bob)
-        + sum_coin_loom(&state, charlie);
+    let total =
+        sum_coin_loom(&state, alice) + sum_coin_loom(&state, bob) + sum_coin_loom(&state, charlie);
     assert_eq!(total, initial, "total LOOM must be conserved: got {total}");
 }

@@ -56,7 +56,10 @@ fn top_level_revert_bills_real_fuel_used() {
     // Sibling baseline: same wasm, success branch. fuel_used here is the
     // ground-truth cost of running the loop + epilogue.
     let ok_out = run_burner(vec![0x00]);
-    assert!(ok_out.revert_reason.is_none(), "success branch must not revert");
+    assert!(
+        ok_out.revert_reason.is_none(),
+        "success branch must not revert"
+    );
     assert_eq!(ok_out.return_data.as_deref(), Some(&[0xAA_u8][..]));
     let ok_fuel = ok_out.fuel_used;
     assert!(
@@ -95,7 +98,8 @@ fn top_level_revert_bills_real_fuel_used() {
         rev_out.fuel_used >= lo && rev_out.fuel_used <= hi,
         "revert fuel ({}) should be in the same ballpark as success fuel ({}); \
          range [{lo}, {hi}]",
-        rev_out.fuel_used, ok_fuel,
+        rev_out.fuel_used,
+        ok_fuel,
     );
 }
 
@@ -198,9 +202,15 @@ fn run_parent(child_mode_byte: u8) -> bloom_petals::ChainCallOutput {
 #[test]
 fn sub_call_revert_bills_parent_for_child_fuel() {
     let ok_parent = run_parent(0x00);
-    assert!(ok_parent.revert_reason.is_none(), "success-child case must not revert at parent");
+    assert!(
+        ok_parent.revert_reason.is_none(),
+        "success-child case must not revert at parent"
+    );
     let ok_fuel = ok_parent.fuel_used;
-    assert!(ok_fuel >= 50_000, "loop in child must burn measurable fuel; got {ok_fuel}");
+    assert!(
+        ok_fuel >= 50_000,
+        "loop in child must burn measurable fuel; got {ok_fuel}"
+    );
 
     let rev_parent = run_parent(0x01);
     assert!(
@@ -223,6 +233,7 @@ fn sub_call_revert_bills_parent_for_child_fuel() {
          parent fuel after child-success ({}); range [{lo}, {hi}]. \
          Significantly smaller means the sub-call host did NOT bill the \
          parent for the reverted child's burn — the DoS bug.",
-        rev_fuel, ok_fuel,
+        rev_fuel,
+        ok_fuel,
     );
 }

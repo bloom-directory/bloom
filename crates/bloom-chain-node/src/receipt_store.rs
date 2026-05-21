@@ -38,7 +38,10 @@ impl ReceiptStore {
         let height_root = root.join("_height");
         std::fs::create_dir_all(&height_root)
             .with_context(|| format!("create receipt height dir: {}", height_root.display()))?;
-        Ok(ReceiptStore { root: root.to_path_buf(), height_root })
+        Ok(ReceiptStore {
+            root: root.to_path_buf(),
+            height_root,
+        })
     }
 
     fn path_for(&self, tx_hash: &Hash32) -> PathBuf {
@@ -55,8 +58,16 @@ impl ReceiptStore {
         let bytes = receipt.as_ssz_bytes();
         std::fs::write(&path, &bytes)
             .with_context(|| format!("write receipt {}", path.display()))?;
-        std::fs::write(self.height_path_for(&receipt.tx_hash), height.to_string().as_bytes())
-            .with_context(|| format!("write receipt height sidecar for {}", hex::encode(receipt.tx_hash.0)))?;
+        std::fs::write(
+            self.height_path_for(&receipt.tx_hash),
+            height.to_string().as_bytes(),
+        )
+        .with_context(|| {
+            format!(
+                "write receipt height sidecar for {}",
+                hex::encode(receipt.tx_hash.0)
+            )
+        })?;
         debug!(tx_hash = %hex::encode(receipt.tx_hash.0), height, "receipt_store.put");
         Ok(())
     }
@@ -87,7 +98,10 @@ impl ReceiptStore {
             let Some(name) = name.to_str() else { continue };
             // Read sidecar to learn the recorded height.
             let h: u64 = match std::fs::read_to_string(entry.path()) {
-                Ok(s) => match s.trim().parse() { Ok(h) => h, Err(_) => continue },
+                Ok(s) => match s.trim().parse() {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                },
                 Err(_) => continue,
             };
             if h < prune_before {
@@ -111,7 +125,11 @@ mod tests {
             tx_hash: Hash32([byte; 32]),
             success,
             fuel_used: 12_345,
-            return_data: if success { b"ok".to_vec() } else { b"reverted: insufficient balance".to_vec() },
+            return_data: if success {
+                b"ok".to_vec()
+            } else {
+                b"reverted: insufficient balance".to_vec()
+            },
             logs: vec![Log {
                 address: Address([byte; 32]),
                 topics: vec![Hash32([0xAA; 32])],
@@ -146,7 +164,13 @@ mod tests {
         store.put(10, &old).unwrap();
         store.put(1000, &new_).unwrap();
         store.prune(1000).unwrap();
-        assert!(store.get(&old.tx_hash).unwrap().is_none(), "old receipt should be pruned");
-        assert!(store.get(&new_.tx_hash).unwrap().is_some(), "recent receipt should remain");
+        assert!(
+            store.get(&old.tx_hash).unwrap().is_none(),
+            "old receipt should be pruned"
+        );
+        assert!(
+            store.get(&new_.tx_hash).unwrap().is_some(),
+            "recent receipt should remain"
+        );
     }
 }

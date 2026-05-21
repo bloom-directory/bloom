@@ -10,15 +10,15 @@
 
 extern crate alloc;
 
-pub mod imports;
-pub mod state;
-pub mod petal;
 pub mod block;
-pub mod msg;
-pub mod log;
+pub mod code;
 pub mod crypto;
 pub mod host;
-pub mod code;
+pub mod imports;
+pub mod log;
+pub mod msg;
+pub mod petal;
+pub mod state;
 pub mod value;
 
 pub use value::{LoomValue, LoomValueError};

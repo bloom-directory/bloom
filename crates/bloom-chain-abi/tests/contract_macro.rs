@@ -183,7 +183,10 @@ fn trailing_bytes_rejected_by_dispatcher() {
     let caller = [0u8; 32];
     let err = demo::dispatch(&mut stub, &caller, &calldata).unwrap_err();
     assert!(
-        matches!(err, DispatchError::Decode(AbiError::TrailingBytes { remaining: 1 })),
+        matches!(
+            err,
+            DispatchError::Decode(AbiError::TrailingBytes { remaining: 1 })
+        ),
         "expected TrailingBytes, got {err:?}",
     );
 }
@@ -198,7 +201,7 @@ fn short_calldata_rejected() {
 
 #[test]
 fn unknown_selector_rejected() {
-    let calldata = [0x00, 0x00, 0x00, 0x00, /* no args */];
+    let calldata = [0x00, 0x00, 0x00, 0x00 /* no args */];
     let mut stub = Stub::new();
     let caller = [0u8; 32];
     let err = demo::dispatch(&mut stub, &caller, &calldata).unwrap_err();

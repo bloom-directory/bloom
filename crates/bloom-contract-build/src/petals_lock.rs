@@ -174,8 +174,7 @@ impl PetalsLockFile {
             #[serde(default)]
             petal: Vec<PetalsLockEntry>,
         }
-        let wire: Wire = toml::from_str(text)
-            .map_err(|e| PetalsLockError::Parse(e.to_string()))?;
+        let wire: Wire = toml::from_str(text).map_err(|e| PetalsLockError::Parse(e.to_string()))?;
         let mut file = PetalsLockFile::new();
         for entry in wire.petal {
             file.insert(entry)?;
@@ -271,10 +270,12 @@ fn decode_blake3_field(
     field: &str,
     raw: &str,
 ) -> Result<[u8; 32], PetalsLockError> {
-    let stripped = raw.strip_prefix(HASH_PREFIX).ok_or_else(|| PetalsLockError::BadHash {
-        path: petal_path.into(),
-        msg: format!("{field}: missing `{HASH_PREFIX}` prefix in `{raw}`"),
-    })?;
+    let stripped = raw
+        .strip_prefix(HASH_PREFIX)
+        .ok_or_else(|| PetalsLockError::BadHash {
+            path: petal_path.into(),
+            msg: format!("{field}: missing `{HASH_PREFIX}` prefix in `{raw}`"),
+        })?;
     if stripped.len() != 64 {
         return Err(PetalsLockError::BadHash {
             path: petal_path.into(),
@@ -347,7 +348,9 @@ mod tests {
     fn duplicate_path_is_rejected() {
         let mut lock = PetalsLockFile::new();
         lock.insert(mk_entry("/bloom/core/fungible", 0xab)).unwrap();
-        let err = lock.insert(mk_entry("/bloom/core/fungible", 0xab)).unwrap_err();
+        let err = lock
+            .insert(mk_entry("/bloom/core/fungible", 0xab))
+            .unwrap_err();
         assert!(matches!(err, PetalsLockError::Duplicate(_)));
     }
 

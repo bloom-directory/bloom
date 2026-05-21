@@ -174,8 +174,14 @@ fn snapshot_get_code_sees_staged_insert() {
     let hash = snap.insert_code(wasm.clone());
 
     // Before commit: staged code must be readable via the snapshot.
-    let fetched = snap.get_code(&hash).expect("staged code must be visible via snapshot");
-    assert_eq!(fetched, wasm.as_slice(), "staged code bytes must round-trip");
+    let fetched = snap
+        .get_code(&hash)
+        .expect("staged code must be visible via snapshot");
+    assert_eq!(
+        fetched,
+        wasm.as_slice(),
+        "staged code bytes must round-trip"
+    );
 }
 
 #[test]
@@ -188,7 +194,10 @@ fn snapshot_staged_code_does_not_leak_to_base() {
     let hash = snap.insert_code(wasm);
 
     // The base state has no record of this code.
-    assert!(state.get_code(&hash).is_none(), "staged code must not leak into base state");
+    assert!(
+        state.get_code(&hash).is_none(),
+        "staged code must not leak into base state"
+    );
 }
 
 #[test]

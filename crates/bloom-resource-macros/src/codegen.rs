@@ -258,7 +258,11 @@ fn emit_arg_decode(local: &Ident, arg: &ShimArgAst) -> (TokenStream, TokenStream
                     Err(_) => return Err(::bloom_resource::PetalError::InvalidArgs),
                 };
             };
-            let expr = if arg.is_ref { quote! { &#local } } else { quote! { #local } };
+            let expr = if arg.is_ref {
+                quote! { &#local }
+            } else {
+                quote! { #local }
+            };
             (decode, expr)
         }
         ArgKind::Const(_) => {
@@ -282,7 +286,11 @@ fn emit_arg_decode(local: &Ident, arg: &ShimArgAst) -> (TokenStream, TokenStream
                     Err(_) => return Err(::bloom_resource::PetalError::InvalidArgs),
                 };
             };
-            let expr = if arg.is_ref { quote! { &#local } } else { quote! { #local } };
+            let expr = if arg.is_ref {
+                quote! { &#local }
+            } else {
+                quote! { #local }
+            };
             (decode, expr)
         }
         ArgKind::Object { mode, .. } => {
@@ -771,4 +779,3 @@ mod tests {
         assert!(s.contains("from_handle"));
     }
 }
-

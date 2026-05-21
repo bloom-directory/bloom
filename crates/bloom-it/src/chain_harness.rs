@@ -6,6 +6,5 @@
 //! `bloom-it` tests (`chain_smoke`, `chain_testnet_provision`, etc).
 
 pub use bloom_test_util::provision::{
-    bloom_bin, pick_free_port, provision_network, spawn_validator, ChainNodeConfig,
-    ChainNodeGuard,
+    ChainNodeConfig, ChainNodeGuard, bloom_bin, pick_free_port, provision_network, spawn_validator,
 };

@@ -143,7 +143,11 @@ unsafe extern "C" {
 // ---------------------------------------------------------------------------
 
 #[cfg(not(target_arch = "wasm32"))]
-#[allow(unused_variables, clippy::missing_safety_doc, clippy::too_many_arguments)]
+#[allow(
+    unused_variables,
+    clippy::missing_safety_doc,
+    clippy::too_many_arguments
+)]
 pub mod stubs {
     #[inline(never)]
     pub unsafe fn state_read(key_ptr: i32, key_len: i32, out_ptr: i32) -> i64 {
@@ -159,8 +163,14 @@ pub mod stubs {
     }
     #[inline(never)]
     pub unsafe fn petal_call(
-        target_ptr: i32, target_len: i32, cd_ptr: i32, cd_len: i32,
-        value_lo: i64, value_hi: i64, retdata_ptr: i32, retdata_max: i32,
+        target_ptr: i32,
+        target_len: i32,
+        cd_ptr: i32,
+        cd_len: i32,
+        value_lo: i64,
+        value_hi: i64,
+        retdata_ptr: i32,
+        retdata_max: i32,
     ) -> i64 {
         panic!("petal_call: not available outside wasm32")
     }
@@ -216,8 +226,13 @@ pub mod stubs {
     }
     #[inline(never)]
     pub unsafe fn host_deploy(
-        hash_ptr: i32, hash_len: i32, salt_ptr: i32, salt_len: i32,
-        init_ptr: i32, init_len: i32, out_addr_ptr: i32,
+        hash_ptr: i32,
+        hash_len: i32,
+        salt_ptr: i32,
+        salt_len: i32,
+        init_ptr: i32,
+        init_len: i32,
+        out_addr_ptr: i32,
     ) -> i64 {
         panic!("host_deploy: not available outside wasm32")
     }

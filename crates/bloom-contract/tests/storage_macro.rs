@@ -15,9 +15,7 @@
 //! 7+); on the host `state::read/write` panic, so we stay clear of them here.
 
 use bloom_contract::prelude::*;
-use bloom_contract::storage::{
-    StorageEntry, StorageKind, slot_for_compat_tag, slot_for_field,
-};
+use bloom_contract::storage::{StorageEntry, StorageKind, slot_for_compat_tag, slot_for_field};
 
 #[storage(domain = "erc20")]
 pub struct Erc20State {

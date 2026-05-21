@@ -2,12 +2,12 @@
 //!
 //! End-to-end SSZ round-trip property tests and golden vectors.
 
-use bloom_chain_types::frame::{decode_frame, encode_frame, FrameError, MAX_PAYLOAD_LEN};
-use bloom_chain_types::receipt::{receipts_root, Log, Receipt};
+use bloom_chain_types::frame::{FrameError, MAX_PAYLOAD_LEN, decode_frame, encode_frame};
+use bloom_chain_types::receipt::{Log, Receipt, receipts_root};
+use bloom_chain_types::ssz::{Decode, Encode};
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
 use bloom_chain_types::vote::{Vote, VoteKind};
-use bloom_chain_types::ssz::{Decode, Encode};
 
 use proptest::prelude::*;
 
@@ -41,28 +41,23 @@ fn arb_sig() -> impl Strategy<Value = SigBytes> {
 
 fn arb_tx_kind() -> impl Strategy<Value = TxKind> {
     prop_oneof![
-        (arb_address(), any::<u128>()).prop_map(|(to, amount_loom)| TxKind::Transfer {
-            to,
-            amount_loom
-        }),
-        (
-            arb_vec_u8(64),
-            arb_bytes32(),
-            arb_vec_u8(32)
-        )
-            .prop_map(|(wasm, salt, init_args)| TxKind::Deploy {
+        (arb_address(), any::<u128>())
+            .prop_map(|(to, amount_loom)| TxKind::Transfer { to, amount_loom }),
+        (arb_vec_u8(64), arb_bytes32(), arb_vec_u8(32)).prop_map(|(wasm, salt, init_args)| {
+            TxKind::Deploy {
                 wasm,
                 salt,
                 init_args,
                 manifest_hash: None,
-            }),
-        (arb_address(), arb_vec_u8(32), any::<u128>()).prop_map(
-            |(to, calldata, value_loom)| TxKind::Call {
+            }
+        }),
+        (arb_address(), arb_vec_u8(32), any::<u128>()).prop_map(|(to, calldata, value_loom)| {
+            TxKind::Call {
                 to,
                 calldata,
-                value_loom
+                value_loom,
             }
-        ),
+        }),
     ]
 }
 
@@ -108,16 +103,14 @@ fn arb_vote() -> impl Strategy<Value = Vote> {
         arb_address(),
         arb_sig(),
     )
-        .prop_map(
-            |(height, round, kind, block_hash, validator, sig)| Vote {
-                height,
-                round,
-                kind,
-                block_hash,
-                validator,
-                sig,
-            },
-        )
+        .prop_map(|(height, round, kind, block_hash, validator, sig)| Vote {
+            height,
+            round,
+            kind,
+            block_hash,
+            validator,
+            sig,
+        })
 }
 
 fn arb_log() -> impl Strategy<Value = Log> {
@@ -270,8 +263,7 @@ fn golden_tx_hash() {
     // Golden value — generated from a reference run and locked here.
     // If you change the SSZ layout or domain tags, update this constant and
     // leave a comment explaining the reason.
-    const GOLDEN_TX_HASH: &str =
-        "d5f746e6ba76f13687a8e5a7996656f2bef98489c0c350e7e531ffcdc4876d50";
+    const GOLDEN_TX_HASH: &str = "d5f746e6ba76f13687a8e5a7996656f2bef98489c0c350e7e531ffcdc4876d50";
 
     assert_eq!(
         hash_hex, GOLDEN_TX_HASH,

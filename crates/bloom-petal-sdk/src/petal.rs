@@ -24,11 +24,7 @@ const MAX_RETDATA: usize = 65536;
 /// foot-gun has been removed — callers holding a u256 representation MUST
 /// convert via [`LoomValue::try_from_be_u256_bytes`] and handle the
 /// `Overflow` case explicitly.
-pub fn call(
-    callee: &[u8; 32],
-    calldata: &[u8],
-    value_loom: LoomValue,
-) -> Result<Vec<u8>, i32> {
+pub fn call(callee: &[u8; 32], calldata: &[u8], value_loom: LoomValue) -> Result<Vec<u8>, i32> {
     // Split the u128 into two i64 halves for the host import.
     let v = value_loom.to_u128();
     let lo = i64::from_ne_bytes((v as u64).to_ne_bytes());

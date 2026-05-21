@@ -51,12 +51,9 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     let data = match &input.data {
         Data::Enum(e) => e,
         _ => {
-            return syn::Error::new_spanned(
-                &input.ident,
-                "#[error] only supports enums",
-            )
-            .to_compile_error()
-            .into();
+            return syn::Error::new_spanned(&input.ident, "#[error] only supports enums")
+                .to_compile_error()
+                .into();
         }
     };
 
@@ -67,7 +64,8 @@ pub fn expand(attr: TokenStream, item: TokenStream) -> TokenStream {
     for variant in &data.variants {
         let v_ident = &variant.ident;
         let v_name = v_ident.to_string();
-        let signature = build_variant_signature(&domain, &name.to_string(), &v_name, &variant.fields);
+        let signature =
+            build_variant_signature(&domain, &name.to_string(), &v_name, &variant.fields);
         let sig_lit = LitStr::new(&signature, proc_macro2::Span::call_site());
 
         // Compile-time blake3 of the canonical signature → first 4 bytes.
@@ -170,10 +168,11 @@ fn build_variant_signature(
     let mut first = true;
     let push_ty = |s: &mut String, ty: &syn::Type| {
         if let syn::Type::Path(tp) = ty
-            && let Some(seg) = tp.path.segments.last() {
-                s.push_str(&seg.ident.to_string().to_ascii_lowercase());
-                return;
-            }
+            && let Some(seg) = tp.path.segments.last()
+        {
+            s.push_str(&seg.ident.to_string().to_ascii_lowercase());
+            return;
+        }
         s.push('?');
     };
     match fields {

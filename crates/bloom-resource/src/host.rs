@@ -109,7 +109,6 @@ mod raw {
             data_len: i32,
         ) -> i32;
     }
-
 }
 
 // On wasm32 we re-export the raw symbols under a stable internal alias
@@ -473,9 +472,8 @@ pub fn object_read(handle: RuntimeHandle) -> Result<Vec<u8>, PetalError> {
         let needed = (-written) as usize;
         let mut buf2: Vec<u8> = Vec::with_capacity(needed);
         // SAFETY: same invariant as above; we now own `needed` capacity.
-        let written2 = unsafe {
-            host_extern::object_read(handle.as_raw(), buf2.as_mut_ptr(), needed as i32)
-        };
+        let written2 =
+            unsafe { host_extern::object_read(handle.as_raw(), buf2.as_mut_ptr(), needed as i32) };
         if written2 < 0 {
             return Err(PetalError::HostImportFailed);
         }
@@ -509,16 +507,14 @@ pub fn object_mutate(handle: RuntimeHandle, new_payload: &[u8]) -> Result<(), Pe
         let len = i32::try_from(new_payload.len()).map_err(|_| PetalError::InvalidArgs)?;
         // SAFETY: `new_payload` is a borrowed slice; we pass its ptr+len
         // to the host which is only allowed to read.
-        let code = unsafe { host_extern::object_mutate(handle.as_raw(), new_payload.as_ptr(), len) };
+        let code =
+            unsafe { host_extern::object_mutate(handle.as_raw(), new_payload.as_ptr(), len) };
         status_to_result(code)
     }
 }
 
 /// Create a new object of the given type with the given payload.
-pub fn object_create(
-    type_tag: &TypeTag,
-    payload: &[u8],
-) -> Result<RuntimeHandle, PetalError> {
+pub fn object_create(type_tag: &TypeTag, payload: &[u8]) -> Result<RuntimeHandle, PetalError> {
     let type_tag_bytes = type_tag
         .encode_canonical()
         .map_err(|_| PetalError::InvalidArgs)?;
@@ -544,12 +540,7 @@ pub fn object_create(
         // SAFETY: both buffers are borrowed for the duration of the
         // call; the host is only allowed to read.
         let code = unsafe {
-            host_extern::object_create(
-                type_tag_bytes.as_ptr(),
-                tlen,
-                payload.as_ptr(),
-                plen,
-            )
+            host_extern::object_create(type_tag_bytes.as_ptr(), tlen, payload.as_ptr(), plen)
         };
         handle_to_result(code)
     }
@@ -696,9 +687,8 @@ pub fn cap_check(handle: RuntimeHandle, expected_type_tag: &TypeTag) -> bool {
             return false;
         };
         // SAFETY: `type_tag_bytes` lives for the duration of the call.
-        let code = unsafe {
-            host_extern::cap_check(handle.as_raw(), type_tag_bytes.as_ptr(), tlen)
-        };
+        let code =
+            unsafe { host_extern::cap_check(handle.as_raw(), type_tag_bytes.as_ptr(), tlen) };
         code == 1
     }
 }
@@ -832,9 +822,8 @@ pub fn log_emit(topic: &[u8], data: &[u8]) {
         let data_len = data.len() as i32;
         // SAFETY: both buffers are borrowed for the duration of the
         // call; the host only reads.
-        let _ = unsafe {
-            host_extern::log_emit(topic.as_ptr(), topic_len, data.as_ptr(), data_len)
-        };
+        let _ =
+            unsafe { host_extern::log_emit(topic.as_ptr(), topic_len, data.as_ptr(), data_len) };
     }
 }
 
@@ -1147,11 +1136,7 @@ mod tests {
         fresh();
         test_hooks::set_responder(test_hooks::ok_responder());
         let _ = object_borrow(&ObjectId([0; 32]), AccessMode::Mutable).unwrap();
-        let _ = object_create(
-            &TypeTag::Generic { idx: 0 },
-            b"",
-        )
-        .unwrap();
+        let _ = object_create(&TypeTag::Generic { idx: 0 }, b"").unwrap();
         object_mutate(RuntimeHandle::from_raw(0), b"x").unwrap();
         object_transfer(RuntimeHandle::from_raw(0), &Owner::Shared).unwrap();
         object_share(RuntimeHandle::from_raw(0)).unwrap();

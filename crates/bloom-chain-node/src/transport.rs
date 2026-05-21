@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use bloom_chain_types::ssz::{Decode, Encode};
 use bloom_chain_types::{
     block::Block,
     frame::{MAX_PAYLOAD_LEN, MsgType, encode_wire_frame},
@@ -27,7 +28,6 @@ use bloom_chain_types::{
     vote::{Proposal, Vote},
 };
 use parking_lot::Mutex;
-use bloom_chain_types::ssz::{Decode, Encode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -117,11 +117,11 @@ fn encode_frame_payload(frame: &Frame) -> Result<(MsgType, Vec<u8>)> {
         Frame::Proposal(p) => Ok((MsgType::Proposal, p.as_ssz_bytes())),
         Frame::Vote(v) => Ok((MsgType::Vote, v.as_ssz_bytes())),
         Frame::Tx(t) => Ok((MsgType::Tx, t.as_ssz_bytes())),
-        Frame::BlockRequest { height } => Ok((MsgType::BlockRequest, height.to_be_bytes().to_vec())),
-        Frame::BlockResponse(b) => Ok((MsgType::BlockResponse, b.as_ssz_bytes())),
-        Frame::StateBlobRequest { hash } => {
-            Ok((MsgType::StateBlobRequest, hash.0.to_vec()))
+        Frame::BlockRequest { height } => {
+            Ok((MsgType::BlockRequest, height.to_be_bytes().to_vec()))
         }
+        Frame::BlockResponse(b) => Ok((MsgType::BlockResponse, b.as_ssz_bytes())),
+        Frame::StateBlobRequest { hash } => Ok((MsgType::StateBlobRequest, hash.0.to_vec())),
         Frame::StateBlobResponse(data) => Ok((MsgType::StateBlobResponse, data.clone())),
         Frame::Ping => Ok((MsgType::Ping, vec![])),
         Frame::Pong => Ok((MsgType::Pong, vec![])),
@@ -136,13 +136,12 @@ fn decode_payload(msg_type: MsgType, payload: &[u8]) -> Result<Frame> {
             Ok(Frame::Proposal(p))
         }
         MsgType::Vote => {
-            let v = Vote::from_ssz_bytes(payload)
-                .map_err(|e| anyhow!("Vote SSZ decode: {:?}", e))?;
+            let v =
+                Vote::from_ssz_bytes(payload).map_err(|e| anyhow!("Vote SSZ decode: {:?}", e))?;
             Ok(Frame::Vote(v))
         }
         MsgType::Tx => {
-            let t = Tx::from_ssz_bytes(payload)
-                .map_err(|e| anyhow!("Tx SSZ decode: {:?}", e))?;
+            let t = Tx::from_ssz_bytes(payload).map_err(|e| anyhow!("Tx SSZ decode: {:?}", e))?;
             Ok(Frame::Tx(t))
         }
         MsgType::BlockRequest => {
@@ -153,8 +152,8 @@ fn decode_payload(msg_type: MsgType, payload: &[u8]) -> Result<Frame> {
             Ok(Frame::BlockRequest { height })
         }
         MsgType::BlockResponse => {
-            let b = Block::from_ssz_bytes(payload)
-                .map_err(|e| anyhow!("Block SSZ decode: {:?}", e))?;
+            let b =
+                Block::from_ssz_bytes(payload).map_err(|e| anyhow!("Block SSZ decode: {:?}", e))?;
             Ok(Frame::BlockResponse(b))
         }
         MsgType::StateBlobRequest => {
@@ -199,10 +198,7 @@ impl PeerPool {
     ///
     /// `peer_addrs`: list of `host:port` strings to maintain connections to.
     /// `inbound_tx`: channel where decoded inbound frames are forwarded.
-    pub fn new(
-        peer_addrs: Vec<String>,
-        inbound_tx: mpsc::Sender<(String, Frame)>,
-    ) -> Arc<Self> {
+    pub fn new(peer_addrs: Vec<String>, inbound_tx: mpsc::Sender<(String, Frame)>) -> Arc<Self> {
         let pool = Arc::new(PeerPool {
             peers: Arc::new(Mutex::new(BTreeMap::new())),
             inbound_tx,
@@ -238,7 +234,10 @@ impl PeerPool {
                         let mut peers = self.peers.lock();
                         peers.insert(
                             addr.clone(),
-                            PeerState { addr: addr.clone(), tx: send_tx },
+                            PeerState {
+                                addr: addr.clone(),
+                                tx: send_tx,
+                            },
                         );
                     }
 
@@ -247,8 +246,7 @@ impl PeerPool {
                     let addr_clone = addr.clone();
 
                     // Writer half
-                    let (mut read_half, mut write_half) =
-                        stream.into_split();
+                    let (mut read_half, mut write_half) = stream.into_split();
 
                     let write_task = tokio::spawn(async move {
                         while let Some(data) = send_rx.recv().await {
@@ -368,10 +366,7 @@ impl PeerPool {
 }
 
 /// Accept inbound TCP connections from peers and forward frames to `inbound_tx`.
-pub async fn accept_loop(
-    listener: TcpListener,
-    inbound_tx: mpsc::Sender<(String, Frame)>,
-) {
+pub async fn accept_loop(listener: TcpListener, inbound_tx: mpsc::Sender<(String, Frame)>) {
     loop {
         match listener.accept().await {
             Ok((mut stream, peer_addr)) => {

@@ -26,6 +26,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use bloom_chain_consensus::ValidatorSet;
 use bloom_chain_state::State;
+use bloom_chain_types::ssz::Decode;
 use bloom_chain_types::{
     tx::Tx,
     types::{Address, Hash32},
@@ -33,7 +34,6 @@ use bloom_chain_types::{
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use bloom_chain_types::ssz::Decode;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tracing::{debug, error, warn};
@@ -234,8 +234,7 @@ impl RpcServer {
             return Err(anyhow!("chain_submit_tx: missing 'tx_hex' param"));
         };
 
-        let tx =
-            Tx::from_ssz_bytes(&tx_bytes).map_err(|e| anyhow!("SSZ decode tx: {:?}", e))?;
+        let tx = Tx::from_ssz_bytes(&tx_bytes).map_err(|e| anyhow!("SSZ decode tx: {:?}", e))?;
 
         let tx_hash = tx.tx_hash();
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -337,7 +336,9 @@ impl RpcServer {
                 // Decode return_data as UTF-8 if possible — petal-side revert
                 // reasons are emitted as plain strings, so this lets the CLI
                 // surface them without forcing every caller to hex-decode.
-                let return_text = std::str::from_utf8(&r.return_data).ok().map(|s| s.to_string());
+                let return_text = std::str::from_utf8(&r.return_data)
+                    .ok()
+                    .map(|s| s.to_string());
                 Ok(json!({
                     "tx_hash": hex::encode(r.tx_hash.0),
                     "success": r.success,

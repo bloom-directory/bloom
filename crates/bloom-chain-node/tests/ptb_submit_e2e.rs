@@ -26,15 +26,11 @@
 use std::collections::HashMap;
 
 use bloom_chain_node::consensus_driver::PetalExecutor;
-use bloom_chain_node::petal_executor::{
-    ChainPetalExecutor, ChainPetalExecutorWithManifests,
-};
+use bloom_chain_node::petal_executor::{ChainPetalExecutor, ChainPetalExecutorWithManifests};
 use bloom_chain_state::State;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
-use bloom_objects::{
-    OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey, TypeTag,
-};
+use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey, TypeTag};
 use bloom_script::{
     chain_iface::{ArgDeclStub, FunctionDeclStub, PetalManifestStub},
     encode_ptb, loom_coin_type_tag,
@@ -125,7 +121,10 @@ fn validator_rejected_ptb_reverts_atomically() {
     );
 
     assert!(!out.success, "validator-rejected PTB must revert");
-    assert!(out.write_set.is_none(), "validator rejection must drop write set");
+    assert!(
+        out.write_set.is_none(),
+        "validator rejection must drop write set"
+    );
     assert!(out.logs.is_empty(), "validator rejection must drop logs");
 
     let reason = String::from_utf8_lossy(&out.return_data);
@@ -320,17 +319,17 @@ fn signer_address_zero_resolves_to_first_signer() {
         "expected PTB success, got revert: {}",
         String::from_utf8_lossy(&out.return_data)
     );
-    assert!(out.write_set.is_some(), "successful PTB must emit a write set");
+    assert!(
+        out.write_set.is_some(),
+        "successful PTB must emit a write set"
+    );
 
     // The petal returned the 32 raw signer bytes via `petal.return`.
     // The runner stores that buffer in `PetalCallResult.ret_buf` and the
     // executor's `unmarshal_outputs` parses it as the marshalled
     // return-slot envelope. Either way the signer bytes must appear
     // somewhere in the byte stream so an indexer can recover them.
-    let signer_window = out
-        .return_data
-        .windows(32)
-        .any(|w| w == signer);
+    let signer_window = out.return_data.windows(32).any(|w| w == signer);
     assert!(
         signer_window,
         "expected signer bytes 0x7A..7A somewhere in return_data, got {} bytes: {:?}",
@@ -411,10 +410,14 @@ fn log_emit_round_trips_topics_and_data() {
         log.address.0, petal_hash.0,
         "log.address must be the emitting petal's hash",
     );
-    assert_eq!(log.topics.len(), 1, "expected one topic, got {:?}", log.topics);
     assert_eq!(
-        log.topics[0].0,
-        [0xCDu8; 32],
+        log.topics.len(),
+        1,
+        "expected one topic, got {:?}",
+        log.topics
+    );
+    assert_eq!(
+        log.topics[0].0, [0xCDu8; 32],
         "topic bytes must round-trip verbatim",
     );
     assert_eq!(
@@ -615,9 +618,7 @@ fn object_create_then_transfer_round_trips_through_unified_ctx() {
         type_name: new_obj_type_name.to_string(),
         type_args: vec![],
     };
-    let tag_bytes = new_obj_type
-        .encode_canonical()
-        .expect("encode type tag");
+    let tag_bytes = new_obj_type.encode_canonical().expect("encode type tag");
     assert_eq!(
         tag_bytes.len(),
         38,
@@ -702,15 +703,13 @@ fn object_create_then_transfer_round_trips_through_unified_ctx() {
     // owner. Before the P0-2 fix this lookup returned `None` because
     // the host-import borrow row never made it into the executor's
     // drain step.
-    let stored = state
-        .get_object(&new_id)
-        .unwrap_or_else(|| {
-            panic!(
-                "host-created object missing from State; \
+    let stored = state.get_object(&new_id).unwrap_or_else(|| {
+        panic!(
+            "host-created object missing from State; \
                  ids present: {:?}",
-                state.iter_objects().map(|(id, _)| *id).collect::<Vec<_>>()
-            )
-        });
+            state.iter_objects().map(|(id, _)| *id).collect::<Vec<_>>()
+        )
+    });
     assert_eq!(
         stored.owner,
         Owner::Address(recipient),

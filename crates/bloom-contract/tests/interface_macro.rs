@@ -68,10 +68,22 @@ fn selectors_match_blake3_of_signature() {
 
 #[test]
 fn per_method_const_matches_descriptor_table() {
-    assert_eq!(Erc20::SEL_BALANCE_OF, expected_selector("erc20.balance_of(address)"));
-    assert_eq!(Erc20::SEL_TOTAL_SUPPLY, expected_selector("erc20.total_supply()"));
-    assert_eq!(Erc20::SEL_TRANSFER, expected_selector("erc20.transfer(address,u256)"));
-    assert_eq!(Erc20::SEL_APPROVE, expected_selector("erc20.approve(address,u256)"));
+    assert_eq!(
+        Erc20::SEL_BALANCE_OF,
+        expected_selector("erc20.balance_of(address)")
+    );
+    assert_eq!(
+        Erc20::SEL_TOTAL_SUPPLY,
+        expected_selector("erc20.total_supply()")
+    );
+    assert_eq!(
+        Erc20::SEL_TRANSFER,
+        expected_selector("erc20.transfer(address,u256)")
+    );
+    assert_eq!(
+        Erc20::SEL_APPROVE,
+        expected_selector("erc20.approve(address,u256)")
+    );
 }
 
 #[test]
@@ -97,21 +109,12 @@ fn contract_ref_constructs_and_exposes_address() {
 // `petal.call`, which panics off-wasm.
 #[test]
 fn typed_call_methods_are_implemented_via_calls_trait() {
-    let _balance_of: fn(
-        &ContractRef<Erc20>,
-        &mut Context,
-        Address,
-    ) -> Result<U256> = <ContractRef<Erc20> as Erc20Calls>::balance_of;
+    let _balance_of: fn(&ContractRef<Erc20>, &mut Context, Address) -> Result<U256> =
+        <ContractRef<Erc20> as Erc20Calls>::balance_of;
 
-    let _transfer: fn(
-        &ContractRef<Erc20>,
-        &mut Context,
-        Address,
-        U256,
-    ) -> Result<bool> = <ContractRef<Erc20> as Erc20Calls>::transfer;
+    let _transfer: fn(&ContractRef<Erc20>, &mut Context, Address, U256) -> Result<bool> =
+        <ContractRef<Erc20> as Erc20Calls>::transfer;
 
-    let _total_supply: fn(
-        &ContractRef<Erc20>,
-        &mut Context,
-    ) -> Result<U256> = <ContractRef<Erc20> as Erc20Calls>::total_supply;
+    let _total_supply: fn(&ContractRef<Erc20>, &mut Context) -> Result<U256> =
+        <ContractRef<Erc20> as Erc20Calls>::total_supply;
 }

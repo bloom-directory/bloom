@@ -82,10 +82,10 @@ impl From<bloom_dex_math::MathError> for RouterError {
 /// imports directly and return `Err(RouterError)` on failure rather than
 /// panicking. The `#[bloom::petal]` entry points are thin `expect`-wrappers.
 pub mod ops {
-    use bloom_objects::ObjectId;
-    use bloom_resource::{RuntimeHandle, abi::RetWriter, host};
     use bloom_dex_math::SwapStrategy;
+    use bloom_objects::ObjectId;
     use bloom_petal_dex_pool::{ParamCodec, payload};
+    use bloom_resource::{RuntimeHandle, abi::RetWriter, host};
 
     use crate::RouterError;
 
@@ -98,9 +98,7 @@ pub mod ops {
     type PoolData = (u128, u128, u128, u128, Vec<u8>, Vec<u8>);
 
     /// Read and decode a pool handle's payload into [`PoolData`].
-    pub fn read_pool(
-        pool_handle: RuntimeHandle,
-    ) -> Result<PoolData, RouterError> {
+    pub fn read_pool(pool_handle: RuntimeHandle) -> Result<PoolData, RouterError> {
         let raw = host::object_read(pool_handle).map_err(|_| RouterError::PoolPayloadDecode)?;
         let (reserve_a, reserve_b, lp_supply, k_last, params_bytes) =
             payload::decode_pool(&raw).ok_or(RouterError::PoolPayloadDecode)?;
@@ -123,14 +121,8 @@ pub mod ops {
         let mut id_bytes = [0u8; 32];
         id_bytes.copy_from_slice(&raw_bytes[..32]);
         let id = ObjectId(id_bytes);
-        let new_payload = payload::pool_payload(
-            &id,
-            reserve_a,
-            reserve_b,
-            lp_supply,
-            k_last,
-            params_bytes,
-        );
+        let new_payload =
+            payload::pool_payload(&id, reserve_a, reserve_b, lp_supply, k_last, params_bytes);
         host::object_mutate(pool_handle, &new_payload).map_err(|_| RouterError::PoolPayloadDecode)
     }
 
@@ -186,13 +178,11 @@ pub mod ops {
         S: SwapStrategy,
         S::Params: ParamCodec,
     {
-        let (reserve_a, reserve_b, lp_supply, _k_last, params_bytes, raw) =
-            read_pool(pool_handle)?;
+        let (reserve_a, reserve_b, lp_supply, _k_last, params_bytes, raw) = read_pool(pool_handle)?;
 
         let params = S::Params::decode(&params_bytes).ok_or(RouterError::ParamDecode)?;
 
-        let coin_bytes = host::object_read(coin_in_handle)
-            .map_err(|_| RouterError::EmptyInput)?;
+        let coin_bytes = host::object_read(coin_in_handle).map_err(|_| RouterError::EmptyInput)?;
         let amount_in = decode_coin_value(&coin_bytes)?;
 
         if amount_in == 0 {
@@ -244,10 +234,7 @@ pub mod ops {
     // ── Quote helpers (pure, no host writes) ─────────────────────────────────
 
     /// Compute quoted output for a single hop A→B (read-only).
-    pub fn quote_one<S>(
-        pool_handle: RuntimeHandle,
-        amount_in: u128,
-    ) -> Result<u128, RouterError>
+    pub fn quote_one<S>(pool_handle: RuntimeHandle, amount_in: u128) -> Result<u128, RouterError>
     where
         S: SwapStrategy,
         S::Params: ParamCodec,
@@ -280,9 +267,9 @@ pub mod ops {
 /// `bloom-dex-math::SwapStrategy::apply_swap`.
 #[bloom::petal(path = "/bloom/dex/router", version = "0.1.0")]
 pub mod router {
-    use bloom_resource::{Coin, RuntimeHandle};
     use bloom_dex_math::SwapStrategy;
     use bloom_petal_dex_pool::{ParamCodec, pool::Pool};
+    use bloom_resource::{Coin, RuntimeHandle};
 
     use crate::ops;
 
@@ -292,16 +279,12 @@ pub mod router {
     ///
     /// Returns `amount_out` for the given `amount_in`. Reads the pool reserves
     /// and strategy params, calls `S::quote`, and returns the result.
-    pub fn quote_1hop<A, B, S: SwapStrategy>(
-        _pool: &Pool<A, B, S>,
-        amount_in: u128,
-    ) -> u128
+    pub fn quote_1hop<A, B, S: SwapStrategy>(_pool: &Pool<A, B, S>, amount_in: u128) -> u128
     where
         S::Params: ParamCodec,
     {
         let pool_handle = RuntimeHandle::from_raw(0);
-        ops::quote_one::<S>(pool_handle, amount_in)
-            .expect("quote_1hop: host failure")
+        ops::quote_one::<S>(pool_handle, amount_in).expect("quote_1hop: host failure")
     }
 
     // ── quote_2hop ───────────────────────────────────────────────────────────
@@ -322,10 +305,9 @@ pub mod router {
         let pool1_handle = RuntimeHandle::from_raw(0);
         let pool2_handle = RuntimeHandle::from_raw(1);
 
-        let mid = ops::quote_one::<S1>(pool1_handle, amount_in)
-            .expect("quote_2hop: pool1 quote failure");
-        ops::quote_one::<S2>(pool2_handle, mid)
-            .expect("quote_2hop: pool2 quote failure")
+        let mid =
+            ops::quote_one::<S1>(pool1_handle, amount_in).expect("quote_2hop: pool1 quote failure");
+        ops::quote_one::<S2>(pool2_handle, mid).expect("quote_2hop: pool2 quote failure")
     }
 
     // ── quote_3hop ───────────────────────────────────────────────────────────
@@ -349,12 +331,11 @@ pub mod router {
         let pool2_handle = RuntimeHandle::from_raw(1);
         let pool3_handle = RuntimeHandle::from_raw(2);
 
-        let mid1 = ops::quote_one::<S1>(pool1_handle, amount_in)
-            .expect("quote_3hop: pool1 quote failure");
-        let mid2 = ops::quote_one::<S2>(pool2_handle, mid1)
-            .expect("quote_3hop: pool2 quote failure");
-        ops::quote_one::<S3>(pool3_handle, mid2)
-            .expect("quote_3hop: pool3 quote failure")
+        let mid1 =
+            ops::quote_one::<S1>(pool1_handle, amount_in).expect("quote_3hop: pool1 quote failure");
+        let mid2 =
+            ops::quote_one::<S2>(pool2_handle, mid1).expect("quote_3hop: pool2 quote failure");
+        ops::quote_one::<S3>(pool3_handle, mid2).expect("quote_3hop: pool3 quote failure")
     }
 
     // ── swap_1hop ────────────────────────────────────────────────────────────
@@ -373,8 +354,7 @@ pub mod router {
     {
         let pool_handle = RuntimeHandle::from_raw(0);
         let (_amount_out, coin_out_handle) =
-            ops::hop::<S>(pool_handle, coin_in.handle(), min_out)
-                .expect("swap_1hop: host failure");
+            ops::hop::<S>(pool_handle, coin_in.handle(), min_out).expect("swap_1hop: host failure");
         Coin::from_handle(coin_out_handle)
     }
 
@@ -401,8 +381,7 @@ pub mod router {
 
         // Hop 1: A→B (min_out=0; slippage checked at final output).
         let (_mid_amount, coin_mid_handle) =
-            ops::hop::<S1>(pool1_handle, coin_in.handle(), 0)
-                .expect("swap_2hop: hop 1 failure");
+            ops::hop::<S1>(pool1_handle, coin_in.handle(), 0).expect("swap_2hop: hop 1 failure");
 
         // Hop 2: B→C (min_out = user's slippage bound).
         let (_final_amount, coin_out_handle) =
@@ -438,13 +417,11 @@ pub mod router {
 
         // Hop 1: A→B.
         let (_mid1_amount, coin_mid1_handle) =
-            ops::hop::<S1>(pool1_handle, coin_in.handle(), 0)
-                .expect("swap_3hop: hop 1 failure");
+            ops::hop::<S1>(pool1_handle, coin_in.handle(), 0).expect("swap_3hop: hop 1 failure");
 
         // Hop 2: B→C.
         let (_mid2_amount, coin_mid2_handle) =
-            ops::hop::<S2>(pool2_handle, coin_mid1_handle, 0)
-                .expect("swap_3hop: hop 2 failure");
+            ops::hop::<S2>(pool2_handle, coin_mid1_handle, 0).expect("swap_3hop: hop 2 failure");
 
         // Hop 3: C→D (min_out = user's slippage bound).
         let (_final_amount, coin_out_handle) =

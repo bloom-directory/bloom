@@ -9,8 +9,8 @@
 //! - `External = 2` → 2-byte BE manifest external-type-ref index.
 
 use crate::codec::{
-    self, CodecError, read_bytes32, read_string, read_u16_be, read_u8, write_bytes32, write_string,
-    write_u16_be, write_u8,
+    self, CodecError, read_bytes32, read_string, read_u8, read_u16_be, write_bytes32, write_string,
+    write_u8, write_u16_be,
 };
 
 /// Variant tag byte for `TypeTag::Concrete`.

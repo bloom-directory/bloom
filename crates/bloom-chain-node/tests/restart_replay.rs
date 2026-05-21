@@ -15,14 +15,14 @@
 //! restarted node's state is byte-identical to a node that never
 //! restarted.
 
-use bloom_chain_node::consensus_driver::{apply_block_state_transitions, NoopExecutor};
+use bloom_chain_node::consensus_driver::{NoopExecutor, apply_block_state_transitions};
 use bloom_chain_state::State;
 use bloom_chain_types::{
     block::Block,
     tx::{Tx, TxKind},
     types::{Address, Hash32, PubKeyBytes, SigBytes},
 };
-use bloom_test_util::{make_addr, BlockBuilder};
+use bloom_test_util::{BlockBuilder, make_addr};
 
 const BLOCK_EMISSION: u128 = 10_000_000_000_000_000_000u128;
 
@@ -51,10 +51,7 @@ fn make_transfer_tx(
 fn make_block(height: u64, proposer: Address, txs: Vec<Tx>) -> Block {
     // Replay doesn't validate block roots; use the BlockBuilder default
     // sentinel roots (0xAA/0xBB/0xCC/0xDD).
-    BlockBuilder::at(height)
-        .proposer(proposer)
-        .txs(txs)
-        .build()
+    BlockBuilder::at(height).proposer(proposer).txs(txs).build()
 }
 
 #[test]
@@ -91,7 +88,13 @@ fn replay_reproduces_full_transfer_chain() {
     let block1 = make_block(
         1,
         proposer,
-        vec![make_transfer_tx(sender, pk_bytes.clone(), recipient, 100, 1)],
+        vec![make_transfer_tx(
+            sender,
+            pk_bytes.clone(),
+            recipient,
+            100,
+            1,
+        )],
     );
     // Block 2: sender → recipient transfer of 50.
     let block2 = make_block(
@@ -144,7 +147,10 @@ fn replay_reproduces_full_transfer_chain() {
         "sender loom must match after replay (master bug: transfers dropped)"
     );
     assert_eq!(
-        replayed.get_account(&recipient).map(|a| a.loom).unwrap_or(0),
+        replayed
+            .get_account(&recipient)
+            .map(|a| a.loom)
+            .unwrap_or(0),
         live_recipient_loom,
         "recipient loom must match after replay (master bug: transfers dropped)"
     );
@@ -213,15 +219,16 @@ fn master_style_replay_diverges() {
             },
         );
     }
-    let mut prop_acct = master_replayed
-        .get_account(&proposer)
-        .unwrap_or(bloom_chain_state::Account {
-            nonce: 0,
-            loom: 0,
-            code_hash: None,
-            storage_root: Hash32([0u8; 32]),
-            manifest_hash: None,
-        });
+    let mut prop_acct =
+        master_replayed
+            .get_account(&proposer)
+            .unwrap_or(bloom_chain_state::Account {
+                nonce: 0,
+                loom: 0,
+                code_hash: None,
+                storage_root: Hash32([0u8; 32]),
+                manifest_hash: None,
+            });
     prop_acct.loom += BLOCK_EMISSION;
     master_replayed.set_account(proposer, prop_acct);
 

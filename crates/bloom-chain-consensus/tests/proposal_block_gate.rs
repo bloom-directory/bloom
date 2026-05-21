@@ -23,7 +23,7 @@ use bloom_chain_types::{
     types::{Hash32, SigBytes},
     vote::{Proposal, VoteKind},
 };
-use bloom_test_util::{make_addr, make_validator_set_fake, BlockBuilder};
+use bloom_test_util::{BlockBuilder, make_addr, make_validator_set_fake};
 
 fn make_block(height: u64, proposer: u8) -> Block {
     BlockBuilder::at(height)
@@ -140,8 +140,14 @@ fn pending_proposal_replays_when_block_arrives() {
             _ => None,
         })
         .collect();
-    assert!(initial_prevotes.is_empty(), "gate must stash when block unknown");
-    assert!(sm.pending_proposal.is_some(), "pending_proposal must hold the stashed proposal");
+    assert!(
+        initial_prevotes.is_empty(),
+        "gate must stash when block unknown"
+    );
+    assert!(
+        sm.pending_proposal.is_some(),
+        "pending_proposal must hold the stashed proposal"
+    );
 
     // Step 2: block arrives, register it, then resume.
     blocks.insert(block_hash, block.clone());
@@ -154,7 +160,10 @@ fn pending_proposal_replays_when_block_arrives() {
         })
         .expect("resume must emit the previously-stashed prevote");
     assert_eq!(prevote.block_hash, Some(block_hash));
-    assert!(sm.pending_proposal.is_none(), "pending_proposal must clear after successful resume");
+    assert!(
+        sm.pending_proposal.is_none(),
+        "pending_proposal must clear after successful resume"
+    );
 }
 
 #[test]
@@ -186,6 +195,12 @@ fn try_resume_is_noop_when_block_still_missing() {
     let mut blocks: BTreeMap<Hash32, Block> = BTreeMap::new();
     blocks.insert(other_hash, other_block);
     let actions = sm.try_resume_pending_proposal(&blocks);
-    assert!(actions.is_empty(), "unrelated block must not satisfy the pending proposal");
-    assert!(sm.pending_proposal.is_some(), "pending_proposal must remain stashed");
+    assert!(
+        actions.is_empty(),
+        "unrelated block must not satisfy the pending proposal"
+    );
+    assert!(
+        sm.pending_proposal.is_some(),
+        "pending_proposal must remain stashed"
+    );
 }

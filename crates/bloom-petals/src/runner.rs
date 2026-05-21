@@ -35,15 +35,16 @@ impl VfsHost {
 #[async_trait]
 impl PetalHost for VfsHost {
     async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
-        let path =
-            VfsPath::parse(path).map_err(|e| HostError::Invalid(format!("path: {e}")))?;
+        let path = VfsPath::parse(path).map_err(|e| HostError::Invalid(format!("path: {e}")))?;
         self.vfs.read(&path).await.map_err(host_from_handler)
     }
 
     async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
-        let path =
-            VfsPath::parse(path).map_err(|e| HostError::Invalid(format!("path: {e}")))?;
-        self.vfs.write(&path, bytes).await.map_err(host_from_handler)
+        let path = VfsPath::parse(path).map_err(|e| HostError::Invalid(format!("path: {e}")))?;
+        self.vfs
+            .write(&path, bytes)
+            .await
+            .map_err(host_from_handler)
     }
 
     async fn chain_read_at(
@@ -80,7 +81,10 @@ pub struct BlockTrackingHost {
 
 impl BlockTrackingHost {
     pub fn new(inner: Arc<dyn PetalHost>) -> Self {
-        Self { inner, max_block: parking_lot::Mutex::new(None) }
+        Self {
+            inner,
+            max_block: parking_lot::Mutex::new(None),
+        }
     }
 
     pub fn max_block(&self) -> Option<u64> {
@@ -96,10 +100,18 @@ impl PetalHost for BlockTrackingHost {
     async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
         self.inner.vfs_write(path, bytes).await
     }
-    async fn chain_read_at(&self, chain: &str, path: &str, block: u64) -> Result<Vec<u8>, HostError> {
+    async fn chain_read_at(
+        &self,
+        chain: &str,
+        path: &str,
+        block: u64,
+    ) -> Result<Vec<u8>, HostError> {
         {
             let mut m = self.max_block.lock();
-            *m = Some(match *m { Some(prev) => prev.max(block), None => block });
+            *m = Some(match *m {
+                Some(prev) => prev.max(block),
+                None => block,
+            });
         }
         self.inner.chain_read_at(chain, path, block).await
     }
@@ -115,7 +127,11 @@ pub struct PetalRunner {
 
 impl PetalRunner {
     pub fn new(store: PetalStore, registry: Arc<NameRegistry>, vm: PetalVm) -> Self {
-        Self { store, registry, vm }
+        Self {
+            store,
+            registry,
+            vm,
+        }
     }
 
     pub fn store(&self) -> &PetalStore {
@@ -208,7 +224,9 @@ impl PetalRunner {
             Some(mask) => meta.caps.intersection(&mask).copied().collect(),
             None => meta.caps.clone(),
         };
-        self.vm.run(&wasm, stdin, caps, host, &hash, meta.mode, opts).await
+        self.vm
+            .run(&wasm, stdin, caps, host, &hash, meta.mode, opts)
+            .await
     }
 
     /// Run a petal and, when the petal is onchain, also return a
@@ -232,7 +250,15 @@ impl PetalRunner {
         let stdin_hash = crate::attestation::blake3_hex(&stdin);
         let out = self
             .vm
-            .run(&wasm, stdin.clone(), caps, tracker.clone(), &hash, meta.mode, opts)
+            .run(
+                &wasm,
+                stdin.clone(),
+                caps,
+                tracker.clone(),
+                &hash,
+                meta.mode,
+                opts,
+            )
             .await?;
         let att = match meta.mode {
             crate::meta::PetalMode::Onchain => Some(crate::attestation::PetalAttestation {
@@ -262,9 +288,13 @@ impl PetalRunner {
         let hash = self.resolve(name_or_hash)?;
         let meta = self.store.load_meta(&hash)?;
         if !matches!(meta.mode, crate::meta::PetalMode::Onchain) {
-            return Err(PetalError::Vm("replay only valid for onchain petals".into()));
+            return Err(PetalError::Vm(
+                "replay only valid for onchain petals".into(),
+            ));
         }
-        let (run, att) = self.run_attested(name_or_hash, stdin, host, None, opts).await?;
+        let (run, att) = self
+            .run_attested(name_or_hash, stdin, host, None, opts)
+            .await?;
         let att = att.expect("onchain run must produce attestation");
         let matched = att.output_hash == expected_output_hash;
         Ok(ReplayOutcome {
@@ -317,7 +347,12 @@ mod tests {
     async fn install_from_wat_then_run_by_name() {
         let (_d, r) = runner();
         let (res, _meta) = r
-            .install(HELLO_WAT.as_bytes(), Some("hello"), &BTreeSet::new(), crate::meta::PetalMode::Local)
+            .install(
+                HELLO_WAT.as_bytes(),
+                Some("hello"),
+                &BTreeSet::new(),
+                crate::meta::PetalMode::Local,
+            )
             .unwrap();
         // Registry now maps `hello` to the installed hash.
         assert_eq!(r.registry().lookup("hello"), Some(res.hash.clone()));
@@ -339,7 +374,12 @@ mod tests {
     async fn resolve_prefers_hash_then_name() {
         let (_d, r) = runner();
         let (res, _) = r
-            .install(HELLO_WAT.as_bytes(), Some("aname"), &BTreeSet::new(), crate::meta::PetalMode::Local)
+            .install(
+                HELLO_WAT.as_bytes(),
+                Some("aname"),
+                &BTreeSet::new(),
+                crate::meta::PetalMode::Local,
+            )
             .unwrap();
         assert_eq!(r.resolve(&res.hash).unwrap(), res.hash);
         assert_eq!(r.resolve("aname").unwrap(), res.hash);
@@ -394,10 +434,21 @@ mod tests {
     async fn local_run_returns_no_attestation() {
         let (_d, r) = runner();
         let (_res, _) = r
-            .install(HELLO_WAT.as_bytes(), Some("hello"), &BTreeSet::new(), crate::meta::PetalMode::Local)
+            .install(
+                HELLO_WAT.as_bytes(),
+                Some("hello"),
+                &BTreeSet::new(),
+                crate::meta::PetalMode::Local,
+            )
             .unwrap();
         let (_out, att) = r
-            .run_attested("hello", Vec::new(), Arc::new(crate::host::DenyHost), None, RunOptions::default())
+            .run_attested(
+                "hello",
+                Vec::new(),
+                Arc::new(crate::host::DenyHost),
+                None,
+                RunOptions::default(),
+            )
             .await
             .unwrap();
         assert!(att.is_none(), "local runs do not produce attestations");
@@ -407,7 +458,12 @@ mod tests {
     async fn uninstall_removes_object_meta_and_petname() {
         let (_d, r) = runner();
         let (res, _) = r
-            .install(HELLO_WAT.as_bytes(), Some("byename"), &BTreeSet::new(), crate::meta::PetalMode::Local)
+            .install(
+                HELLO_WAT.as_bytes(),
+                Some("byename"),
+                &BTreeSet::new(),
+                crate::meta::PetalMode::Local,
+            )
             .unwrap();
         assert!(r.store().contains(&res.hash));
         assert_eq!(r.registry().lookup("byename"), Some(res.hash.clone()));
@@ -421,16 +477,33 @@ mod tests {
     async fn replay_match_returns_ok_with_expected_hash() {
         let (_d, r) = runner();
         let (_res, _) = r
-            .install(ONCHAIN_NOOP.as_bytes(), Some("rnoop"), &BTreeSet::new(), crate::meta::PetalMode::Onchain)
+            .install(
+                ONCHAIN_NOOP.as_bytes(),
+                Some("rnoop"),
+                &BTreeSet::new(),
+                crate::meta::PetalMode::Onchain,
+            )
             .unwrap();
         let stdin = b"x".to_vec();
         let (_out, att) = r
-            .run_attested("rnoop", stdin.clone(), Arc::new(crate::host::DenyHost), None, RunOptions::default())
+            .run_attested(
+                "rnoop",
+                stdin.clone(),
+                Arc::new(crate::host::DenyHost),
+                None,
+                RunOptions::default(),
+            )
             .await
             .unwrap();
         let expected = att.unwrap().output_hash;
         let outcome = r
-            .replay("rnoop", stdin.clone(), &expected, Arc::new(crate::host::DenyHost), RunOptions::default())
+            .replay(
+                "rnoop",
+                stdin.clone(),
+                &expected,
+                Arc::new(crate::host::DenyHost),
+                RunOptions::default(),
+            )
             .await
             .unwrap();
         assert!(outcome.matched);
@@ -441,7 +514,12 @@ mod tests {
     async fn replay_mismatch_returns_outcome_with_flag_false() {
         let (_d, r) = runner();
         let (_res, _) = r
-            .install(ONCHAIN_NOOP.as_bytes(), Some("rnoop2"), &BTreeSet::new(), crate::meta::PetalMode::Onchain)
+            .install(
+                ONCHAIN_NOOP.as_bytes(),
+                Some("rnoop2"),
+                &BTreeSet::new(),
+                crate::meta::PetalMode::Onchain,
+            )
             .unwrap();
         let outcome = r
             .replay(
@@ -460,10 +538,21 @@ mod tests {
     async fn replay_refuses_local_petal() {
         let (_d, r) = runner();
         let (_res, _) = r
-            .install(HELLO_WAT.as_bytes(), Some("loc"), &BTreeSet::new(), crate::meta::PetalMode::Local)
+            .install(
+                HELLO_WAT.as_bytes(),
+                Some("loc"),
+                &BTreeSet::new(),
+                crate::meta::PetalMode::Local,
+            )
             .unwrap();
         let err = r
-            .replay("loc", Vec::new(), &"0".repeat(64), Arc::new(crate::host::DenyHost), RunOptions::default())
+            .replay(
+                "loc",
+                Vec::new(),
+                &"0".repeat(64),
+                Arc::new(crate::host::DenyHost),
+                RunOptions::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, PetalError::Vm(_)), "{err:?}");

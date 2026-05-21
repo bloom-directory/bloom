@@ -343,7 +343,13 @@ mod tests {
         let mut mp = Mempool::new(NoopVerifier);
         // current_nonce=2 means tx with nonce 1 (or 2) is stale — already on-chain.
         let err = mp.admit(make_tx(1, 2, 10, 1000), 2, 1_000_000).unwrap_err();
-        assert!(matches!(err, ConsensusError::NonceMismatch { expected: 3, got: 2 }));
+        assert!(matches!(
+            err,
+            ConsensusError::NonceMismatch {
+                expected: 3,
+                got: 2
+            }
+        ));
     }
 
     #[test]

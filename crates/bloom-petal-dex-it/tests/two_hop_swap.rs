@@ -65,14 +65,16 @@ fn two_hop_apply_swap_reserve_updates() {
 
     // Hop 2: B→C (uses out_1 as amount_in)
     // The second pool starts at its own reserves (1000/1000), independent of pool 1.
-    let (new_rb2, new_rc, out_2) =
-        ConstantProduct::apply_swap(1000, 1000, out_1, &p).unwrap();
+    let (new_rb2, new_rc, out_2) = ConstantProduct::apply_swap(1000, 1000, out_1, &p).unwrap();
     assert_eq!(out_2, 81, "final output must be 81");
     assert_eq!(new_rb2, 1090, "pool 2 reserve_in = 1000 + 90 = 1090");
     assert_eq!(new_rc, 919, "pool 2 reserve_out = 1000 - 81 = 919");
 
     // Verify k invariant holds for both hops
-    assert!(new_ra * new_rb_after_hop1 >= 1000 * 1000, "pool1 k must not decrease");
+    assert!(
+        new_ra * new_rb_after_hop1 >= 1000 * 1000,
+        "pool1 k must not decrease"
+    );
     assert!(new_rb2 * new_rc >= 1000 * 1000, "pool2 k must not decrease");
 }
 
@@ -123,8 +125,8 @@ use bloom_petal_dex_it::dex_harness::{
     addr, build_state, genesis_coin_id, real_router_manifest_bytes, submit_ptb_chain_auth,
     wrap_with_real_manifest,
 };
-use bloom_script::{Command, MoveCmd, PetalRef, PqSignature, PtbTx};
 use bloom_petal_manifest::codec::decode as decode_manifest;
+use bloom_script::{Command, MoveCmd, PetalRef, PqSignature, PtbTx};
 
 #[test]
 fn router_manifest_decodes_and_publishes_via_wasm_section() {
@@ -135,7 +137,9 @@ fn router_manifest_decodes_and_publishes_via_wasm_section() {
     assert_eq!(m.module_path, "/bloom/dex/router");
     let names: Vec<&str> = m.functions.iter().map(|f| f.name.as_str()).collect();
     assert!(
-        names.iter().any(|n| n.starts_with("quote_") || n.starts_with("swap_")),
+        names
+            .iter()
+            .any(|n| n.starts_with("quote_") || n.starts_with("swap_")),
         "router manifest must declare quote_/swap_ entry points (got {names:?})"
     );
 
@@ -182,7 +186,10 @@ fn router_manifest_decodes_and_publishes_via_wasm_section() {
     let ptb = PtbTx {
         signers: vec![alice.0],
         commands: vec![Command::Move(MoveCmd {
-            petal: PetalRef { path: String::new(), hash: Some(cpmm_hash) },
+            petal: PetalRef {
+                path: String::new(),
+                hash: Some(cpmm_hash),
+            },
             function: "version".to_string(),
             type_args: vec![],
             args: vec![],

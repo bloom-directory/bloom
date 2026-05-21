@@ -277,7 +277,12 @@ impl State {
         let trie = self.storage.entry(addr).or_default();
         trie.write(key, value);
         // Prune empty tries
-        if self.storage.get(&addr).map(|t| t.is_empty()).unwrap_or(false) {
+        if self
+            .storage
+            .get(&addr)
+            .map(|t| t.is_empty())
+            .unwrap_or(false)
+        {
             self.storage.remove(&addr);
         }
     }
@@ -287,7 +292,12 @@ impl State {
         if let Some(trie) = self.storage.get_mut(addr) {
             trie.delete(key);
         }
-        if self.storage.get(addr).map(|t| t.is_empty()).unwrap_or(false) {
+        if self
+            .storage
+            .get(addr)
+            .map(|t| t.is_empty())
+            .unwrap_or(false)
+        {
             self.storage.remove(addr);
         }
     }
@@ -631,12 +641,7 @@ impl StateSnapshot {
             Some(AccountDelta::Remove) => None,
             None => self.base.accounts.get(addr),
         };
-        let loom_delta = self
-            .write_set
-            .loom_deltas
-            .get(addr)
-            .copied()
-            .unwrap_or(0);
+        let loom_delta = self.write_set.loom_deltas.get(addr).copied().unwrap_or(0);
         if loom_delta == 0 {
             return base_acct;
         }
@@ -655,7 +660,9 @@ impl StateSnapshot {
         if account.is_empty() {
             self.write_set.accounts.insert(addr, AccountDelta::Remove);
         } else {
-            self.write_set.accounts.insert(addr, AccountDelta::Set(account));
+            self.write_set
+                .accounts
+                .insert(addr, AccountDelta::Set(account));
         }
     }
 
@@ -730,16 +737,12 @@ impl StateSnapshot {
 
     /// Stage an object insert / update.
     pub fn insert_object(&mut self, obj: Object) {
-        self.write_set
-            .objects
-            .insert(obj.id, ObjectDelta::Set(obj));
+        self.write_set.objects.insert(obj.id, ObjectDelta::Set(obj));
     }
 
     /// Stage an object delete.
     pub fn delete_object(&mut self, id: ObjectId) {
-        self.write_set
-            .objects
-            .insert(id, ObjectDelta::Remove);
+        self.write_set.objects.insert(id, ObjectDelta::Remove);
     }
 
     // ----------------------------------------------------------------
@@ -761,7 +764,9 @@ impl StateSnapshot {
         if ids.is_empty() {
             self.write_set.ownership.insert(key, OwnershipDelta::Remove);
         } else {
-            self.write_set.ownership.insert(key, OwnershipDelta::Set(ids));
+            self.write_set
+                .ownership
+                .insert(key, OwnershipDelta::Set(ids));
         }
     }
 

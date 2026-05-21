@@ -15,9 +15,8 @@ use crate::imports;
 /// `Err(code)` on host-side failure (negative wasm error code).
 pub fn manifest_hash(addr: &[u8; 32]) -> Result<Option<[u8; 32]>, i32> {
     let mut out = [0u8; 33];
-    let result = unsafe {
-        imports::code_manifest_hash(addr.as_ptr() as i32, out.as_mut_ptr() as i32)
-    };
+    let result =
+        unsafe { imports::code_manifest_hash(addr.as_ptr() as i32, out.as_mut_ptr() as i32) };
     if result < 0 {
         return Err(result);
     }

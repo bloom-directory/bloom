@@ -35,16 +35,14 @@ use bloom_chain_node::petal_executor::{ChainPetalExecutor, ChainPetalExecutorWit
 use bloom_chain_state::State;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
-use bloom_objects::{AccessMode, OwnershipIndexKey, OWNER_KIND_ADDRESS};
+use bloom_objects::{AccessMode, OWNER_KIND_ADDRESS, OwnershipIndexKey};
 use bloom_petal_fungible::ops::{decode_coin_value, type_tag_coin_loom};
 use bloom_script::{
-    ArgDeclStub, Arg, Command, ExpectedVersion, FunctionDeclStub, MoveCmd, PetalManifestStub,
+    Arg, ArgDeclStub, Command, ExpectedVersion, FunctionDeclStub, MoveCmd, PetalManifestStub,
     PetalRef, PqSignature, PtbTx, UseRef, encode_ptb,
 };
 
-use bloom_petal_it::harness::{
-    addr, build_state, genesis_coin_id, wat_to_wasm,
-};
+use bloom_petal_it::harness::{addr, build_state, genesis_coin_id, wat_to_wasm};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -52,7 +50,10 @@ use bloom_petal_it::harness::{
 
 /// Sum all `Coin<LOOM>` values owned by `owner` via the ownership index.
 fn sum_coin_loom(state: &State, owner: Address) -> u128 {
-    let okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: owner.0 };
+    let okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: owner.0,
+    };
     let owned = state.get_ownership(&okey).unwrap_or_default();
     let coin_type = type_tag_coin_loom();
     owned
@@ -65,7 +66,10 @@ fn sum_coin_loom(state: &State, owner: Address) -> u128 {
 
 /// Count owned `Coin<LOOM>` objects for an address.
 fn count_coin_loom(state: &State, owner: Address) -> usize {
-    let okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: owner.0 };
+    let okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: owner.0,
+    };
     let owned = state.get_ownership(&okey).unwrap_or_default();
     let coin_type = type_tag_coin_loom();
     owned
@@ -83,20 +87,18 @@ fn apply_transfer(state: &mut State, sender: Address, to: Address, amount: u128)
         nonce: 0,
         max_fuel: 1_000,
         fee_per_unit: 0,
-        kind: TxKind::Transfer { to, amount_loom: amount },
+        kind: TxKind::Transfer {
+            to,
+            amount_loom: amount,
+        },
         pubkey: PubKeyBytes(vec![0u8; 32]),
         sig: SigBytes(vec![0u8; 64]),
     };
-    let out = ChainPetalExecutor.execute_tx(
-        &tx,
-        state,
-        1,
-        0,
-        addr(0xFF),
-        Hash32([0u8; 32]),
-    );
+    let out = ChainPetalExecutor.execute_tx(&tx, state, 1, 0, addr(0xFF), Hash32([0u8; 32]));
     assert!(out.success, "Transfer must succeed");
-    state.apply(out.write_set.unwrap()).expect("apply must not fail");
+    state
+        .apply(out.write_set.unwrap())
+        .expect("apply must not fail");
 }
 
 /// Build a WAT petal that returns `coin_id` as a 32-byte slot (40-byte envelope).
@@ -124,12 +126,7 @@ fn coin_loader_wat(coin_id: bloom_objects::ObjectId) -> String {
 ///   cmd 0 Move(load_coin, Arg::Object(alice_coin, Mutable)) → returns alice_coin_id
 ///   cmd 1 SplitCoins(Use(0,0), [amount]) → transient Coin<LOOM>(amount)
 ///   cmd 2 TransferObjects([Use(1,0)], bob) → delivers amount-coin to bob
-fn apply_ptb_split_transfer(
-    state: &mut State,
-    alice: Address,
-    bob: Address,
-    amount: u128,
-) {
+fn apply_ptb_split_transfer(state: &mut State, alice: Address, bob: Address, amount: u128) {
     let alice_coin_id = genesis_coin_id(alice, 0);
 
     let wasm = wat_to_wasm(&coin_loader_wat(alice_coin_id));
@@ -159,7 +156,10 @@ fn apply_ptb_split_transfer(
         commands: vec![
             // cmd 0: load alice's coin → returns alice_coin_id in slot 0
             Command::Move(MoveCmd {
-                petal: PetalRef { path: String::new(), hash: Some(petal_hash) },
+                petal: PetalRef {
+                    path: String::new(),
+                    hash: Some(petal_hash),
+                },
                 function: "load_coin".to_string(),
                 type_args: vec![],
                 args: vec![Arg::Object {
@@ -170,12 +170,18 @@ fn apply_ptb_split_transfer(
             }),
             // cmd 1: SplitCoins(alice_coin, [amount]) → transient Coin<LOOM>(amount)
             Command::SplitCoins {
-                src: UseRef { cmd_idx: 0, ret_idx: 0 },
+                src: UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                },
                 amounts: vec![amount],
             },
             // cmd 2: TransferObjects([split_result], bob)
             Command::TransferObjects {
-                uses: vec![UseRef { cmd_idx: 1, ret_idx: 0 }],
+                uses: vec![UseRef {
+                    cmd_idx: 1,
+                    ret_idx: 0,
+                }],
                 owner: bloom_objects::Owner::Address(bob.0),
             },
         ],
@@ -212,7 +218,9 @@ fn apply_ptb_split_transfer(
         "PTB must succeed; revert: {}",
         String::from_utf8_lossy(&out.return_data)
     );
-    state.apply(out.write_set.unwrap()).expect("apply must not fail");
+    state
+        .apply(out.write_set.unwrap())
+        .expect("apply must not fail");
 }
 
 // ---------------------------------------------------------------------------
@@ -231,7 +239,7 @@ fn apply_ptb_split_transfer(
 #[test]
 fn transfer_and_ptb_structural_equivalence() {
     let alice = addr(0xA1);
-    let bob   = addr(0xB2);
+    let bob = addr(0xB2);
 
     // State A: apply TxKind::Transfer
     let mut state_a = build_state(&[(alice, 1_000)]);
@@ -296,5 +304,5 @@ fn transfer_and_ptb_structural_equivalence() {
 
     // ── Spot-check expected values ────────────────────────────────────────────
     assert_eq!(alice_coins_a, 700, "alice must have 700 total Coin<LOOM>");
-    assert_eq!(bob_coins_a,   300, "bob must have 300 total Coin<LOOM>");
+    assert_eq!(bob_coins_a, 300, "bob must have 300 total Coin<LOOM>");
 }

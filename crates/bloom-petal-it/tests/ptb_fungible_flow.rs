@@ -22,17 +22,17 @@
 
 use std::collections::HashMap;
 
-use bloom_chain_node::petal_executor::ChainPetalExecutorWithManifests;
 use bloom_chain_node::consensus_driver::PetalExecutor;
+use bloom_chain_node::petal_executor::ChainPetalExecutorWithManifests;
 use bloom_chain_state::State;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
-use bloom_objects::{AccessMode, Owner, OwnershipIndexKey, OWNER_KIND_ADDRESS};
-use bloom_script::ExpectedVersion;
+use bloom_objects::{AccessMode, OWNER_KIND_ADDRESS, Owner, OwnershipIndexKey};
 use bloom_petal_fungible::ops::type_tag_coin_loom;
+use bloom_script::ExpectedVersion;
 use bloom_script::{
-    ArgDeclStub, Command, Arg, FunctionDeclStub, MoveCmd, PetalManifestStub, PetalRef,
-    PqSignature, PtbTx, UseRef, encode_ptb,
+    Arg, ArgDeclStub, Command, FunctionDeclStub, MoveCmd, PetalManifestStub, PetalRef, PqSignature,
+    PtbTx, UseRef, encode_ptb,
 };
 
 use bloom_petal_it::harness::{
@@ -61,7 +61,14 @@ fn submit_and_apply(
         sig: SigBytes(vec![0u8; 64]),
     };
     let exec = ChainPetalExecutorWithManifests::new(manifests);
-    let out = exec.execute_tx(&tx, state, 100, 1_700_000_000_000, addr(0xAA), Hash32([0u8; 32]));
+    let out = exec.execute_tx(
+        &tx,
+        state,
+        100,
+        1_700_000_000_000,
+        addr(0xAA),
+        Hash32([0u8; 32]),
+    );
     if out.success
         && let Some(ws) = out.write_set.clone()
     {
@@ -88,7 +95,7 @@ fn submit_and_apply(
 #[test]
 fn move_split_transfer_happy_path() {
     let alice = addr(0xA1);
-    let bob   = addr(0xB2);
+    let bob = addr(0xB2);
 
     let mut state = build_state(&[(alice, 1000)]);
     let alice_coin_id = genesis_coin_id(alice, 0);
@@ -136,7 +143,10 @@ fn move_split_transfer_happy_path() {
         commands: vec![
             // cmd 0: Move → returns alice_coin_id in slot 0
             Command::Move(MoveCmd {
-                petal: PetalRef { path: String::new(), hash: Some(petal_hash) },
+                petal: PetalRef {
+                    path: String::new(),
+                    hash: Some(petal_hash),
+                },
                 function: "load_coin".to_string(),
                 type_args: vec![],
                 args: vec![Arg::Object {
@@ -147,12 +157,18 @@ fn move_split_transfer_happy_path() {
             }),
             // cmd 1: SplitCoins(alice_coin, [300])
             Command::SplitCoins {
-                src: UseRef { cmd_idx: 0, ret_idx: 0 },
+                src: UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                },
                 amounts: vec![300],
             },
             // cmd 2: TransferObjects([split_result], bob)
             Command::TransferObjects {
-                uses: vec![UseRef { cmd_idx: 1, ret_idx: 0 }],
+                uses: vec![UseRef {
+                    cmd_idx: 1,
+                    ret_idx: 0,
+                }],
                 owner: Owner::Address(bob.0),
             },
         ],
@@ -171,19 +187,36 @@ fn move_split_transfer_happy_path() {
     );
 
     // Alice's coin should be 700.
-    let alice_coin = state.get_object(&alice_coin_id).expect("alice's coin must still exist");
+    let alice_coin = state
+        .get_object(&alice_coin_id)
+        .expect("alice's coin must still exist");
     let alice_val = ptb_decode_coin_value(&alice_coin.payload);
     assert_eq!(alice_val, 700, "alice must have Coin<LOOM>(700)");
 
     // Bob should own one Coin<LOOM>(300).
-    let bob_okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: bob.0 };
-    let bob_owned = state.get_ownership(&bob_okey).expect("bob ownership index must exist");
+    let bob_okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: bob.0,
+    };
+    let bob_owned = state
+        .get_ownership(&bob_okey)
+        .expect("bob ownership index must exist");
     assert_eq!(bob_owned.len(), 1, "bob must own exactly one coin");
-    let bob_coin = state.get_object(&bob_owned[0]).expect("bob's coin must exist");
+    let bob_coin = state
+        .get_object(&bob_owned[0])
+        .expect("bob's coin must exist");
     let bob_val = ptb_decode_coin_value(&bob_coin.payload);
     assert_eq!(bob_val, 300, "bob must have Coin<LOOM>(300)");
-    assert_eq!(bob_coin.type_tag, type_tag_coin_loom(), "bob's coin must be Coin<LOOM>");
-    assert_eq!(bob_coin.owner, Owner::Address(bob.0), "bob's coin owner must be bob");
+    assert_eq!(
+        bob_coin.type_tag,
+        type_tag_coin_loom(),
+        "bob's coin must be Coin<LOOM>"
+    );
+    assert_eq!(
+        bob_coin.owner,
+        Owner::Address(bob.0),
+        "bob's coin owner must be bob"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -215,7 +248,10 @@ fn smoke_ptb_log_emit_succeeds() {
     let ptb = PtbTx {
         signers: vec![alice.0],
         commands: vec![Command::Move(MoveCmd {
-            petal: PetalRef { path: String::new(), hash: Some(petal_hash) },
+            petal: PetalRef {
+                path: String::new(),
+                hash: Some(petal_hash),
+            },
             function: "emit".to_string(),
             type_args: vec![],
             args: vec![],
@@ -234,7 +270,10 @@ fn smoke_ptb_log_emit_succeeds() {
         String::from_utf8_lossy(&out.return_data)
     );
     assert_eq!(out.logs.len(), 1, "expected exactly one log entry");
-    assert_eq!(out.logs[0].data, b"petal-it-ok", "log data must round-trip verbatim");
+    assert_eq!(
+        out.logs[0].data, b"petal-it-ok",
+        "log data must round-trip verbatim"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -257,8 +296,10 @@ fn smoke_ptb_log_emit_succeeds() {
 //   3. The PTB executes end-to-end without revert.
 // ---------------------------------------------------------------------------
 
-use bloom_petal_it::harness::{real_fungible_manifest_bytes, submit_ptb_chain_auth, wrap_with_real_manifest};
 use bloom_objects::TypeTag;
+use bloom_petal_it::harness::{
+    real_fungible_manifest_bytes, submit_ptb_chain_auth, wrap_with_real_manifest,
+};
 
 #[test]
 fn fungible_value_call_typechecks_against_real_manifest() {
@@ -293,7 +334,10 @@ fn fungible_value_call_typechecks_against_real_manifest() {
     let ptb = PtbTx {
         signers: vec![alice.0],
         commands: vec![Command::Move(MoveCmd {
-            petal: PetalRef { path: String::new(), hash: Some(petal_hash) },
+            petal: PetalRef {
+                path: String::new(),
+                hash: Some(petal_hash),
+            },
             function: "value".to_string(),
             type_args: vec![loom_tag],
             args: vec![Arg::Object {

@@ -435,7 +435,10 @@ mod tests {
         let zero = U256::ZERO;
         let one = U256::from_u64(1);
         assert_eq!(zero.saturating_sub(one), U256::ZERO);
-        assert_eq!(U256::from_u64(5).saturating_sub(U256::from_u64(2)), U256::from_u64(3));
+        assert_eq!(
+            U256::from_u64(5).saturating_sub(U256::from_u64(2)),
+            U256::from_u64(3)
+        );
     }
 
     #[test]

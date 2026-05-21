@@ -63,10 +63,10 @@ fn two_hop_all_pools_k_non_decreasing_50_swaps() {
             "pool2 k decreased at 2-hop {i}: k_prev={k2_prev} k_new={k2_new}"
         );
 
-        p1_ri  = new_p1_ri;
-        p1_ro  = new_p1_ro;
-        p2_ri  = new_p2_ri;
-        p2_ro  = new_p2_ro;
+        p1_ri = new_p1_ri;
+        p1_ro = new_p1_ro;
+        p2_ri = new_p2_ri;
+        p2_ro = new_p2_ro;
         k1_prev = k1_new;
         k2_prev = k2_new;
     }
@@ -113,10 +113,10 @@ fn two_hop_asymmetric_pools_k_non_decreasing() {
         assert!(k1_new >= k1_prev, "pool1 k decreased at swap {i}");
         assert!(k2_new >= k2_prev, "pool2 k decreased at swap {i}");
 
-        p1_ri  = new_p1_ri;
-        p1_ro  = new_p1_ro;
-        p2_ri  = new_p2_ri;
-        p2_ro  = new_p2_ro;
+        p1_ri = new_p1_ri;
+        p1_ro = new_p1_ro;
+        p2_ri = new_p2_ri;
+        p2_ro = new_p2_ro;
         k1_prev = k1_new;
         k2_prev = k2_new;
     }
@@ -156,13 +156,19 @@ fn two_hop_zero_fee_k_non_decreasing() {
         let k1_new = new_p1_ri * new_p1_ro;
         let k2_new = new_p2_ri * new_p2_ro;
 
-        assert!(k1_new >= k1_prev, "pool1 k decreased at swap {i} (zero fee)");
-        assert!(k2_new >= k2_prev, "pool2 k decreased at swap {i} (zero fee)");
+        assert!(
+            k1_new >= k1_prev,
+            "pool1 k decreased at swap {i} (zero fee)"
+        );
+        assert!(
+            k2_new >= k2_prev,
+            "pool2 k decreased at swap {i} (zero fee)"
+        );
 
-        p1_ri  = new_p1_ri;
-        p1_ro  = new_p1_ro;
-        p2_ri  = new_p2_ri;
-        p2_ro  = new_p2_ro;
+        p1_ri = new_p1_ri;
+        p1_ro = new_p1_ro;
+        p2_ri = new_p2_ri;
+        p2_ro = new_p2_ro;
         k1_prev = k1_new;
         k2_prev = k2_new;
     }

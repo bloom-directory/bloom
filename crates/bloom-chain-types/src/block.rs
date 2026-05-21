@@ -5,7 +5,7 @@ use ssz::{Decode, DecodeError, Encode, SszDecoderBuilder, SszEncoder};
 
 use crate::digest::{blake3_tagged, tags};
 use crate::tx::Tx;
-use crate::types::{decode_string, encode_string, Address, Hash32};
+use crate::types::{Address, Hash32, decode_string, encode_string};
 use crate::vote::Commit;
 
 // ---------------------------------------------------------------------------
@@ -78,17 +78,17 @@ impl Decode for BlockHeader {
 
     fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut builder = SszDecoderBuilder::new(bytes);
-        builder.register_type::<Vec<u8>>()?;  // chain_id
-        builder.register_type::<u64>()?;      // height
-        builder.register_type::<Hash32>()?;   // parent_hash
-        builder.register_type::<u64>()?;      // timestamp_ms
-        builder.register_type::<Address>()?;  // proposer
-        builder.register_type::<Hash32>()?;   // txs_root
-        builder.register_type::<Hash32>()?;   // state_root
-        builder.register_type::<Hash32>()?;   // receipts_root
-        builder.register_type::<Hash32>()?;   // validator_set_hash
-        builder.register_type::<u64>()?;      // fuel_used
-        builder.register_type::<u64>()?;      // fuel_limit
+        builder.register_type::<Vec<u8>>()?; // chain_id
+        builder.register_type::<u64>()?; // height
+        builder.register_type::<Hash32>()?; // parent_hash
+        builder.register_type::<u64>()?; // timestamp_ms
+        builder.register_type::<Address>()?; // proposer
+        builder.register_type::<Hash32>()?; // txs_root
+        builder.register_type::<Hash32>()?; // state_root
+        builder.register_type::<Hash32>()?; // receipts_root
+        builder.register_type::<Hash32>()?; // validator_set_hash
+        builder.register_type::<u64>()?; // fuel_used
+        builder.register_type::<u64>()?; // fuel_limit
 
         let mut decoder = builder.build()?;
         let chain_id_bytes: Vec<u8> = decoder.decode_next()?;
@@ -128,7 +128,10 @@ impl Encode for Block {
 
     fn ssz_bytes_len(&self) -> usize {
         // All three fields are variable-length.
-        4 + 4 + 4 + self.header.ssz_bytes_len() + self.txs.ssz_bytes_len()
+        4 + 4
+            + 4
+            + self.header.ssz_bytes_len()
+            + self.txs.ssz_bytes_len()
             + self.commit.ssz_bytes_len()
     }
 

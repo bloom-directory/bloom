@@ -88,9 +88,7 @@ impl<T> core::fmt::Debug for Resource<T> {
 
 impl<T> PartialEq for Resource<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.type_tag == other.type_tag
-            && self.bytes == other.bytes
-            && self.handle == other.handle
+        self.type_tag == other.type_tag && self.bytes == other.bytes && self.handle == other.handle
     }
 }
 

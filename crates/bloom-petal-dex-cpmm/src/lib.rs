@@ -27,9 +27,9 @@ pub use bloom_dex_math::{ConstantProduct, ConstantProductParams, MathError, Swap
 /// custom section (spec §8) listing the types and entry points below.
 #[bloom::petal(path = "/bloom/dex/strategy/cpmm", version = "0.1.0")]
 pub mod cpmm {
+    use bloom_dex_math::SwapStrategy as _;
     #[allow(unused_imports)]
     use bloom_resource_macros::{capability, object};
-    use bloom_dex_math::SwapStrategy as _;
 
     // -----------------------------------------------------------------
     // Type declarations
@@ -110,13 +110,9 @@ mod tests {
         // Use the same values as the bloom-dex-math basic test:
         // reserve_in=1000, reserve_out=1000, amount_in=100, fee=30bps → 90
         let preview = cpmm::cpmm_quote_preview(1000, 1000, 100, 30);
-        let expected = ConstantProduct::quote(
-            1000,
-            1000,
-            100,
-            &ConstantProductParams { fee_bps: 30 },
-        )
-        .unwrap();
+        let expected =
+            ConstantProduct::quote(1000, 1000, 100, &ConstantProductParams { fee_bps: 30 })
+                .unwrap();
         assert_eq!(preview, expected);
         assert_eq!(preview, 90);
     }

@@ -31,10 +31,10 @@ use bloom_chain_node::petal_executor::ChainPetalExecutorWithManifests;
 use bloom_chain_state::State;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
-use bloom_objects::{AccessMode, OwnershipIndexKey, OWNER_KIND_ADDRESS};
+use bloom_objects::{AccessMode, OWNER_KIND_ADDRESS, OwnershipIndexKey};
 use bloom_petal_fungible::ops::{decode_coin_value, type_tag_coin_loom};
 use bloom_script::{
-    ArgDeclStub, Arg, Command, ExpectedVersion, FunctionDeclStub, MoveCmd, PetalManifestStub,
+    Arg, ArgDeclStub, Command, ExpectedVersion, FunctionDeclStub, MoveCmd, PetalManifestStub,
     PetalRef, PqSignature, PtbTx, UseRef, encode_ptb,
 };
 
@@ -48,7 +48,10 @@ use bloom_petal_dex_it::dex_harness::{
 
 /// Sum all `Coin<LOOM>` values owned by `owner`.
 fn sum_coin_loom(state: &State, owner: Address) -> u128 {
-    let okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: owner.0 };
+    let okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: owner.0,
+    };
     let owned = state.get_ownership(&okey).unwrap_or_default();
     let coin_type = type_tag_coin_loom();
     owned
@@ -78,7 +81,14 @@ fn submit_raw(
         sig: SigBytes(vec![0u8; 64]),
     };
     let exec = ChainPetalExecutorWithManifests::new(manifests);
-    exec.execute_tx(&tx, state, 100, 1_700_000_000_000, addr(0xAA), Hash32([0u8; 32]))
+    exec.execute_tx(
+        &tx,
+        state,
+        100,
+        1_700_000_000_000,
+        addr(0xAA),
+        Hash32([0u8; 32]),
+    )
 }
 
 /// WAT petal that deliberately aborts (returns non-zero exit code).
@@ -163,14 +173,20 @@ fn ptb_second_command_abort_rolls_back_first() {
             ..Default::default()
         },
     );
-    manifests.insert(abort_hash, single_manifest(abort_hash, "deliberate_abort")[&abort_hash].clone());
+    manifests.insert(
+        abort_hash,
+        single_manifest(abort_hash, "deliberate_abort")[&abort_hash].clone(),
+    );
 
     let ptb = PtbTx {
         signers: vec![alice.0],
         commands: vec![
             // cmd 0: Move(load_coin) → returns alice_coin_id in slot 0
             Command::Move(MoveCmd {
-                petal: PetalRef { path: String::new(), hash: Some(loader_hash) },
+                petal: PetalRef {
+                    path: String::new(),
+                    hash: Some(loader_hash),
+                },
                 function: "load_coin".to_string(),
                 type_args: vec![],
                 args: vec![Arg::Object {
@@ -181,12 +197,18 @@ fn ptb_second_command_abort_rolls_back_first() {
             }),
             // cmd 1: SplitCoins(alice_coin, [100]) — produces transient coin
             Command::SplitCoins {
-                src: UseRef { cmd_idx: 0, ret_idx: 0 },
+                src: UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                },
                 amounts: vec![100],
             },
             // cmd 2: Move(deliberate_abort) — aborts, rolling back the whole PTB
             Command::Move(MoveCmd {
-                petal: PetalRef { path: String::new(), hash: Some(abort_hash) },
+                petal: PetalRef {
+                    path: String::new(),
+                    hash: Some(abort_hash),
+                },
                 function: "deliberate_abort".to_string(),
                 type_args: vec![],
                 args: vec![],
@@ -203,7 +225,10 @@ fn ptb_second_command_abort_rolls_back_first() {
 
     // ── Core atomicity assertions ─────────────────────────────────────────────
     assert!(!out.success, "PTB with deliberate abort must fail");
-    assert!(out.write_set.is_none(), "failed PTB must produce no write set");
+    assert!(
+        out.write_set.is_none(),
+        "failed PTB must produce no write set"
+    );
     assert!(out.logs.is_empty(), "failed PTB must produce no logs");
 
     // ── State unchanged ────────────────────────────────────────────────────────
@@ -212,7 +237,10 @@ fn ptb_second_command_abort_rolls_back_first() {
         .get_object(&alice_coin_id)
         .expect("alice's coin must still exist after revert");
     let alice_val = ptb_decode_coin_value(&alice_coin.payload);
-    assert_eq!(alice_val, 1_000, "alice's coin value must be 1000 after revert");
+    assert_eq!(
+        alice_val, 1_000,
+        "alice's coin value must be 1000 after revert"
+    );
 
     // alice's account.loom must be unchanged.
     let alice_loom_after = state.get_account(&alice).map(|a| a.loom).unwrap_or(0);
@@ -229,7 +257,10 @@ fn ptb_second_command_abort_rolls_back_first() {
     );
 
     // Ownership index must be unchanged: alice still owns exactly her genesis coin.
-    let okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: alice.0 };
+    let okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: alice.0,
+    };
     let owned = state.get_ownership(&okey).unwrap_or_default();
     assert!(
         owned.contains(&alice_coin_id),
@@ -287,7 +318,10 @@ fn ptb_orphaned_split_coin_rolls_back() {
         commands: vec![
             // cmd 0: load alice's coin
             Command::Move(MoveCmd {
-                petal: PetalRef { path: String::new(), hash: Some(loader_hash) },
+                petal: PetalRef {
+                    path: String::new(),
+                    hash: Some(loader_hash),
+                },
                 function: "load_coin".to_string(),
                 type_args: vec![],
                 args: vec![Arg::Object {
@@ -298,7 +332,10 @@ fn ptb_orphaned_split_coin_rolls_back() {
             }),
             // cmd 1: SplitCoins — produces orphaned transient coin
             Command::SplitCoins {
-                src: UseRef { cmd_idx: 0, ret_idx: 0 },
+                src: UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                },
                 amounts: vec![200],
             },
             // NO TransferObjects → linearity violation at tx-end.
@@ -316,10 +353,19 @@ fn ptb_orphaned_split_coin_rolls_back() {
     assert!(out.write_set.is_none(), "revert must produce no write set");
 
     // Alice's coin unchanged.
-    let alice_coin = state.get_object(&alice_coin_id).expect("alice's coin must exist");
+    let alice_coin = state
+        .get_object(&alice_coin_id)
+        .expect("alice's coin must exist");
     let alice_val = ptb_decode_coin_value(&alice_coin.payload);
-    assert_eq!(alice_val, 1_000, "alice's coin must be 1000 after linearity revert");
+    assert_eq!(
+        alice_val, 1_000,
+        "alice's coin must be 1000 after linearity revert"
+    );
 
     // alice total unchanged.
-    assert_eq!(sum_coin_loom(&state, alice), 1_000, "alice total Coin<LOOM> must be 1000");
+    assert_eq!(
+        sum_coin_loom(&state, alice),
+        1_000,
+        "alice total Coin<LOOM> must be 1000"
+    );
 }

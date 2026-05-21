@@ -13,9 +13,7 @@ use bloom_chain_types::{
     Hash32,
     digest::{blake3_tagged, tags},
 };
-use bloom_petals::{
-    BlockCtx, ChainCallInput, ChainEntry, PetalError, PetalVm,
-};
+use bloom_petals::{BlockCtx, ChainCallInput, ChainEntry, PetalError, PetalVm};
 
 mod common;
 use common::{block_at, make_address, wat};
@@ -167,7 +165,8 @@ fn revert_child_writes_dont_leak() {
         ptb_ctx: None,
     };
 
-    let out = PetalVm::run_chain_call(input).expect("parent run must succeed (it ignores the negative rc)");
+    let out = PetalVm::run_chain_call(input)
+        .expect("parent run must succeed (it ignores the negative rc)");
 
     // The parent ignored the negative rc and returned normally; the
     // returned 8 bytes are the rc the child triggered. Sanity check:
@@ -175,7 +174,10 @@ fn revert_child_writes_dont_leak() {
     let rc_bytes = out.return_data.as_deref().unwrap();
     assert_eq!(rc_bytes.len(), 8, "parent returns the 8-byte rc");
     let rc = i64::from_le_bytes(rc_bytes.try_into().unwrap());
-    assert!(rc < 0, "petal.call should have surfaced a negative rc for a reverted child; got {rc}");
+    assert!(
+        rc < 0,
+        "petal.call should have surfaced a negative rc for a reverted child; got {rc}"
+    );
 
     // Now interrogate the post-call snapshot. The child's storage slot
     // must NOT contain the [0x01; 32] write — it must read back as zero.
@@ -189,7 +191,9 @@ fn revert_child_writes_dont_leak() {
 
     // The value transfer must also have rolled back: parent retains its
     // initial balance, child retains 0.
-    let parent_acct = snap.get_account(&parent_addr).expect("parent account exists");
+    let parent_acct = snap
+        .get_account(&parent_addr)
+        .expect("parent account exists");
     assert_eq!(
         parent_acct.loom, parent_initial_loom,
         "parent's LOOM must be restored after the child reverted the value transfer"
@@ -241,8 +245,8 @@ fn wasm_memory_grow_caught_at_runtime() {
     // The petal will either (a) succeed and grow memory if the limiter
     // is missing (master) or (b) trap on the `unreachable` after grow
     // returned -1 (post-fix).
-    let err = PetalVm::run_chain_call(input)
-        .expect_err("memory.grow over cap must trap (review #7)");
+    let err =
+        PetalVm::run_chain_call(input).expect_err("memory.grow over cap must trap (review #7)");
     match err {
         PetalError::ChainCall(msg) => {
             assert!(
@@ -291,7 +295,10 @@ fn single_revert_path_smoke() {
 
     let out = PetalVm::run_chain_call(input)
         .expect("top-level revert must come back as Ok with revert_reason set, not Err");
-    let reason = out.revert_reason.as_deref().expect("revert_reason must be populated");
+    let reason = out
+        .revert_reason
+        .as_deref()
+        .expect("revert_reason must be populated");
     assert_eq!(reason, b"smoke-reason", "revert reason must match exactly");
     assert!(
         out.return_data.is_none(),

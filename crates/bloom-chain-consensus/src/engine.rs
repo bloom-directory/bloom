@@ -27,8 +27,7 @@ use crate::{
 /// The node provides this closure; the engine calls it when this validator
 /// is the round proposer.  The closure may call `mempool.select_for_block`
 /// and populate the block fields from the current state.
-pub type BlockBuilder<V> =
-    Box<dyn Fn(u64, &mut Mempool<V>, u64) -> Block + Send + Sync + 'static>;
+pub type BlockBuilder<V> = Box<dyn Fn(u64, &mut Mempool<V>, u64) -> Block + Send + Sync + 'static>;
 
 /// The top-level consensus engine for a single local validator.
 ///
@@ -210,8 +209,7 @@ impl<V: SigVerifier> ConsensusEngine<V> {
     /// single trailing validator fell behind at height ~3 and never
     /// recovered.
     pub fn enter_next_height(&mut self, new_height: u64) -> Vec<Action> {
-        self.blocks
-            .retain(|_, b| b.header.height >= new_height);
+        self.blocks.retain(|_, b| b.header.height >= new_height);
         let mut actions = self.state.enter_next_height(new_height);
         self.sign_actions(&mut actions);
         actions

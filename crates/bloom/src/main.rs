@@ -149,10 +149,7 @@ enum PetalsCmd {
     /// List installed petals.
     Ls,
     /// Bind `<name>` to `<hash>`. Omit `<hash>` to remove the binding.
-    Name {
-        name: String,
-        hash: Option<String>,
-    },
+    Name { name: String, hash: Option<String> },
     /// Remove an installed petal (and any petname pointing at it).
     Uninstall {
         /// 64-char hex content hash of the petal to remove.
@@ -523,10 +520,17 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
     let vfs_arc = std::sync::Arc::new(d.vfs.clone());
 
     match cmd {
-        PetalsCmd::Install { path, name, caps, mode } => {
+        PetalsCmd::Install {
+            path,
+            name,
+            caps,
+            mode,
+        } => {
             let bytes = if path == "-" {
                 let mut buf = Vec::new();
-                std::io::stdin().read_to_end(&mut buf).context("read stdin")?;
+                std::io::stdin()
+                    .read_to_end(&mut buf)
+                    .context("read stdin")?;
                 buf
             } else {
                 std::fs::read(&path).with_context(|| format!("read {path}"))?
@@ -569,7 +573,9 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
             let stdin = match input.as_deref() {
                 Some("-") => {
                     let mut buf = Vec::new();
-                    std::io::stdin().read_to_end(&mut buf).context("read stdin")?;
+                    std::io::stdin()
+                        .read_to_end(&mut buf)
+                        .context("read stdin")?;
                     buf
                 }
                 Some(p) => std::fs::read(p).with_context(|| format!("read {p}"))?,
@@ -660,10 +666,16 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
             }
             Ok(())
         }
-        PetalsCmd::Replay { name_or_hash, input, expect } => {
+        PetalsCmd::Replay {
+            name_or_hash,
+            input,
+            expect,
+        } => {
             let stdin = if input == "-" {
                 let mut buf = Vec::new();
-                std::io::stdin().read_to_end(&mut buf).context("read stdin")?;
+                std::io::stdin()
+                    .read_to_end(&mut buf)
+                    .context("read stdin")?;
                 buf
             } else {
                 std::fs::read(&input).with_context(|| format!("read {input}"))?

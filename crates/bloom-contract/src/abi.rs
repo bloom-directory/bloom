@@ -78,17 +78,29 @@ pub enum TypeSchema {
     U8,
     Bool,
     /// UTF-8 string with optional max byte length.
-    String { max: Option<u32> },
+    String {
+        max: Option<u32>,
+    },
     /// Arbitrary byte sequence with optional max length.
-    Bytes { max: Option<u32> },
+    Bytes {
+        max: Option<u32>,
+    },
     /// Fixed-length byte array.
-    BytesFixed { len: u32 },
+    BytesFixed {
+        len: u32,
+    },
     /// Variable-length vector of homogenous elements.
     Vec(Box<TypeSchema>),
     /// Variable-length vector with a static byte/element cap.
-    VecN { elem: Box<TypeSchema>, max: u32 },
+    VecN {
+        elem: Box<TypeSchema>,
+        max: u32,
+    },
     /// Fixed-length array of homogenous elements (`[T; N]` / `ArrayN<T, N>`).
-    Array { elem: Box<TypeSchema>, len: u32 },
+    Array {
+        elem: Box<TypeSchema>,
+        len: u32,
+    },
     /// Heterogeneous tuple.
     Tuple(Vec<TypeSchema>),
     /// Optional `T`, length-prefixed `0`/`1`.
@@ -118,7 +130,9 @@ macro_rules! abi_type_const {
     ($t:ty, $name:expr, $schema:expr) => {
         impl AbiType for $t {
             const ABI_TYPE: &'static str = $name;
-            fn schema() -> TypeSchema { $schema }
+            fn schema() -> TypeSchema {
+                $schema
+            }
         }
     };
 }
@@ -156,7 +170,10 @@ impl AbiDecode for u8 {
     fn decode(buf: &mut Buf<'_>) -> Result<Self, AbiError> {
         let avail = buf.remaining();
         if avail < 1 {
-            return Err(AbiError::UnexpectedEof { needed: 1, available: avail });
+            return Err(AbiError::UnexpectedEof {
+                needed: 1,
+                available: avail,
+            });
         }
         let pos = buf.position();
         let b = buf.data()[pos];
@@ -188,7 +205,10 @@ impl AbiDecode for u32 {
     fn decode(buf: &mut Buf<'_>) -> Result<Self, AbiError> {
         let avail = buf.remaining();
         if avail < 4 {
-            return Err(AbiError::UnexpectedEof { needed: 4, available: avail });
+            return Err(AbiError::UnexpectedEof {
+                needed: 4,
+                available: avail,
+            });
         }
         let pos = buf.position();
         let mut arr = [0u8; 4];
@@ -278,10 +298,14 @@ impl AbiType for () {
     }
 }
 impl AbiEncode for () {
-    fn encode_into(&self, _enc: &mut Encoder) -> Result<(), AbiEncodeError> { Ok(()) }
+    fn encode_into(&self, _enc: &mut Encoder) -> Result<(), AbiEncodeError> {
+        Ok(())
+    }
 }
 impl AbiDecode for () {
-    fn decode(_buf: &mut Buf<'_>) -> Result<Self, AbiError> { Ok(()) }
+    fn decode(_buf: &mut Buf<'_>) -> Result<Self, AbiError> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -454,7 +478,10 @@ impl<const N: usize> AbiDecode for [u8; N] {
     fn decode(buf: &mut Buf<'_>) -> Result<Self, AbiError> {
         let avail = buf.remaining();
         if avail < N {
-            return Err(AbiError::UnexpectedEof { needed: N, available: avail });
+            return Err(AbiError::UnexpectedEof {
+                needed: N,
+                available: avail,
+            });
         }
         let mut arr = [0u8; N];
         let pos = buf.position();
@@ -471,7 +498,10 @@ impl<const N: usize> AbiDecode for [u8; N] {
 impl<T: AbiArrayElement, const N: usize> AbiType for ArrayN<T, N> {
     const ABI_TYPE: &'static str = "array";
     fn schema() -> TypeSchema {
-        TypeSchema::Array { elem: alloc::boxed::Box::new(T::schema()), len: N as u32 }
+        TypeSchema::Array {
+            elem: alloc::boxed::Box::new(T::schema()),
+            len: N as u32,
+        }
     }
 }
 impl<T: AbiEncode + AbiArrayElement, const N: usize> AbiEncode for ArrayN<T, N> {
@@ -482,9 +512,7 @@ impl<T: AbiEncode + AbiArrayElement, const N: usize> AbiEncode for ArrayN<T, N> 
         Ok(())
     }
 }
-impl<T: AbiDecode + AbiArrayElement + Default + Copy, const N: usize> AbiDecode
-    for ArrayN<T, N>
-{
+impl<T: AbiDecode + AbiArrayElement + Default + Copy, const N: usize> AbiDecode for ArrayN<T, N> {
     fn decode(buf: &mut Buf<'_>) -> Result<Self, AbiError> {
         let mut arr: [T; N] = [T::default(); N];
         for slot in arr.iter_mut() {
@@ -501,9 +529,15 @@ impl<T: AbiDecode + AbiArrayElement + Default + Copy, const N: usize> AbiDecode
 pub struct ArrayN<T, const N: usize>(pub [T; N]);
 
 impl<T, const N: usize> ArrayN<T, N> {
-    pub fn new(inner: [T; N]) -> Self { Self(inner) }
-    pub fn into_inner(self) -> [T; N] { self.0 }
-    pub fn as_array(&self) -> &[T; N] { &self.0 }
+    pub fn new(inner: [T; N]) -> Self {
+        Self(inner)
+    }
+    pub fn into_inner(self) -> [T; N] {
+        self.0
+    }
+    pub fn as_array(&self) -> &[T; N] {
+        &self.0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -577,7 +611,9 @@ impl<const N: usize> StringN<N> {
 impl<const N: usize> AbiType for StringN<N> {
     const ABI_TYPE: &'static str = "string";
     fn schema() -> TypeSchema {
-        TypeSchema::String { max: Some(N as u32) }
+        TypeSchema::String {
+            max: Some(N as u32),
+        }
     }
 }
 impl<const N: usize> AbiEncode for StringN<N> {
@@ -593,7 +629,9 @@ impl<const N: usize> AbiDecode for StringN<N> {
     fn decode(buf: &mut Buf<'_>) -> Result<Self, AbiError> {
         let s = buf.read_string()?;
         if s.len() > N {
-            return Err(AbiError::TrailingBytes { remaining: s.len() - N });
+            return Err(AbiError::TrailingBytes {
+                remaining: s.len() - N,
+            });
         }
         Ok(Self(s))
     }
@@ -627,7 +665,10 @@ impl<T, const N: usize> VecN<T, N> {
 impl<T: AbiType, const N: usize> AbiType for VecN<T, N> {
     const ABI_TYPE: &'static str = "vec";
     fn schema() -> TypeSchema {
-        TypeSchema::VecN { elem: Box::new(T::schema()), max: N as u32 }
+        TypeSchema::VecN {
+            elem: Box::new(T::schema()),
+            max: N as u32,
+        }
     }
 }
 impl<T: AbiEncode, const N: usize> AbiEncode for VecN<T, N> {
@@ -646,7 +687,10 @@ impl<T: AbiDecode, const N: usize> AbiDecode for VecN<T, N> {
     fn decode(buf: &mut Buf<'_>) -> Result<Self, AbiError> {
         let n = buf.read_u16_len()?;
         if n > N {
-            return Err(AbiError::VecOverflow { count: n, available: buf.remaining() });
+            return Err(AbiError::VecOverflow {
+                count: n,
+                available: buf.remaining(),
+            });
         }
         let mut out = Vec::with_capacity(n);
         for _ in 0..n {
@@ -672,7 +716,9 @@ impl<const N: usize> BytesN<N> {
 impl<const N: usize> AbiType for BytesN<N> {
     const ABI_TYPE: &'static str = "bytes";
     fn schema() -> TypeSchema {
-        TypeSchema::Bytes { max: Some(N as u32) }
+        TypeSchema::Bytes {
+            max: Some(N as u32),
+        }
     }
 }
 impl<const N: usize> AbiEncode for BytesN<N> {
@@ -688,7 +734,9 @@ impl<const N: usize> AbiDecode for BytesN<N> {
     fn decode(buf: &mut Buf<'_>) -> Result<Self, AbiError> {
         let b = buf.read_bytes_var()?;
         if b.len() > N {
-            return Err(AbiError::TrailingBytes { remaining: b.len() - N });
+            return Err(AbiError::TrailingBytes {
+                remaining: b.len() - N,
+            });
         }
         Ok(Self(b))
     }

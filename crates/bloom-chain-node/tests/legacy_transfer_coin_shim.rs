@@ -15,7 +15,7 @@ use bloom_chain_node::petal_executor::ChainPetalExecutor;
 use bloom_chain_state::State;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
-use bloom_objects::{Object, ObjectId, Owner, OwnershipIndexKey, OWNER_KIND_ADDRESS};
+use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
 use bloom_petal_fungible::ops::{coin_payload, decode_coin_value, type_tag_coin_loom};
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -32,7 +32,10 @@ fn transfer_tx(sender: Address, to: Address, amount: u128) -> Tx {
         nonce: 1,
         max_fuel: 1_000,
         fee_per_unit: 0,
-        kind: TxKind::Transfer { to, amount_loom: amount },
+        kind: TxKind::Transfer {
+            to,
+            amount_loom: amount,
+        },
         pubkey: PubKeyBytes(vec![0u8; 32]),
         sig: SigBytes(vec![0u8; 64]),
     }
@@ -57,7 +60,10 @@ fn seed_single_coin(state: &mut State, owner: Address, value: u128) -> ObjectId 
         payload: coin_payload(value),
     };
     state.set_object(obj);
-    let okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: owner.0 };
+    let okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: owner.0,
+    };
     let mut owned = state.get_ownership(&okey).unwrap_or_default();
     if !owned.contains(&coin_id) {
         owned.push(coin_id);
@@ -134,40 +140,71 @@ fn transfer_splits_sender_coin_and_mints_receiver_coin() {
     // execute_tx credits bob; alice stays at whatever apply_block left her at
     // (we seeded 1000, alice is untouched by the executor — her debit happens
     // in apply_block, which we bypassed).
-    let bob_acct = state.get_account(&bob).expect("bob must have an account now");
+    let bob_acct = state
+        .get_account(&bob)
+        .expect("bob must have an account now");
     assert_eq!(bob_acct.loom, 300, "bob.loom should be 300 after Transfer");
 
     // ── Coin<LOOM> checks ───────────────────────────────────────────────────
     // Alice's original coin should now have value 700 (1000 - 300).
-    let alice_coin = state.get_object(&alice_coin_id)
+    let alice_coin = state
+        .get_object(&alice_coin_id)
         .expect("alice's coin must still exist (split remainder)");
-    let alice_coin_value = decode_coin_value(&alice_coin.payload)
-        .expect("alice coin payload must decode");
-    assert_eq!(alice_coin_value, 700, "alice's coin value should be 700 (split remainder)");
+    let alice_coin_value =
+        decode_coin_value(&alice_coin.payload).expect("alice coin payload must decode");
+    assert_eq!(
+        alice_coin_value, 700,
+        "alice's coin value should be 700 (split remainder)"
+    );
 
     // Bob should have exactly one Coin<LOOM> object.
-    let bob_okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: bob.0 };
-    let bob_owned = state.get_ownership(&bob_okey).expect("bob should have an ownership entry");
+    let bob_okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: bob.0,
+    };
+    let bob_owned = state
+        .get_ownership(&bob_okey)
+        .expect("bob should have an ownership entry");
     assert_eq!(bob_owned.len(), 1, "bob should own exactly one coin");
 
     let bob_coin_id = bob_owned[0];
-    let bob_coin = state.get_object(&bob_coin_id).expect("bob's coin must exist");
-    let bob_coin_value = decode_coin_value(&bob_coin.payload)
-        .expect("bob coin payload must decode");
+    let bob_coin = state
+        .get_object(&bob_coin_id)
+        .expect("bob's coin must exist");
+    let bob_coin_value =
+        decode_coin_value(&bob_coin.payload).expect("bob coin payload must decode");
     assert_eq!(bob_coin_value, 300, "bob's coin should have value 300");
 
     // Coin types must be Coin<LOOM>.
     let coin_type = type_tag_coin_loom();
-    assert_eq!(alice_coin.type_tag, coin_type, "alice's coin must be Coin<LOOM>");
-    assert_eq!(bob_coin.type_tag, coin_type, "bob's coin must be Coin<LOOM>");
+    assert_eq!(
+        alice_coin.type_tag, coin_type,
+        "alice's coin must be Coin<LOOM>"
+    );
+    assert_eq!(
+        bob_coin.type_tag, coin_type,
+        "bob's coin must be Coin<LOOM>"
+    );
 
     // Bob's coin must be owned by bob.
-    assert_eq!(bob_coin.owner, Owner::Address(bob.0), "bob's coin owner must be bob");
+    assert_eq!(
+        bob_coin.owner,
+        Owner::Address(bob.0),
+        "bob's coin owner must be bob"
+    );
 
     // Alice's ownership index must still contain her (split) coin.
-    let alice_okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: alice.0 };
-    let alice_owned = state.get_ownership(&alice_okey).expect("alice's ownership entry must exist");
-    assert!(alice_owned.contains(&alice_coin_id), "alice's ownership index must still contain her coin");
+    let alice_okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: alice.0,
+    };
+    let alice_owned = state
+        .get_ownership(&alice_okey)
+        .expect("alice's ownership entry must exist");
+    assert!(
+        alice_owned.contains(&alice_coin_id),
+        "alice's ownership index must still contain her coin"
+    );
 }
 
 /// Edge case: exact-match transfer consumes alice's coin entirely.
@@ -178,13 +215,16 @@ fn transfer_exact_match_deletes_sender_coin() {
     let bob = addr(0xB2);
 
     let mut state = State::new();
-    state.set_account(alice, bloom_chain_state::Account {
-        nonce: 0,
-        loom: 300,
-        code_hash: None,
-        storage_root: Hash32([0u8; 32]),
-        manifest_hash: None,
-    });
+    state.set_account(
+        alice,
+        bloom_chain_state::Account {
+            nonce: 0,
+            loom: 300,
+            code_hash: None,
+            storage_root: Hash32([0u8; 32]),
+            manifest_hash: None,
+        },
+    );
     let alice_coin_id = seed_single_coin(&mut state, alice, 300);
 
     let tx = transfer_tx(alice, bob, 300);
@@ -194,20 +234,33 @@ fn transfer_exact_match_deletes_sender_coin() {
     state.apply(out.write_set.unwrap()).unwrap();
 
     // Alice's coin should be deleted.
-    assert!(state.get_object(&alice_coin_id).is_none(), "alice's coin should be deleted");
+    assert!(
+        state.get_object(&alice_coin_id).is_none(),
+        "alice's coin should be deleted"
+    );
 
     // Alice's ownership index should be empty (no coins remain).
-    let alice_okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: alice.0 };
+    let alice_okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: alice.0,
+    };
     let alice_owned = state.get_ownership(&alice_okey).unwrap_or_default();
-    assert!(!alice_owned.contains(&alice_coin_id), "alice's deleted coin must not appear in ownership");
+    assert!(
+        !alice_owned.contains(&alice_coin_id),
+        "alice's deleted coin must not appear in ownership"
+    );
 
     // Bob has a coin of value 300.
-    let bob_okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: bob.0 };
-    let bob_owned = state.get_ownership(&bob_okey).expect("bob should have an ownership entry");
+    let bob_okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: bob.0,
+    };
+    let bob_owned = state
+        .get_ownership(&bob_okey)
+        .expect("bob should have an ownership entry");
     assert_eq!(bob_owned.len(), 1);
-    let bob_coin_val = decode_coin_value(
-        &state.get_object(&bob_owned[0]).unwrap().payload
-    ).unwrap();
+    let bob_coin_val =
+        decode_coin_value(&state.get_object(&bob_owned[0]).unwrap().payload).unwrap();
     assert_eq!(bob_coin_val, 300);
 }
 
@@ -221,20 +274,26 @@ fn transfer_without_coin_loom_still_succeeds() {
 
     let mut state = State::new();
     // Alice has Account.loom but NO Coin<LOOM> object (diverged state).
-    state.set_account(alice, bloom_chain_state::Account {
-        nonce: 0,
-        loom: 1000,
-        code_hash: None,
-        storage_root: Hash32([0u8; 32]),
-        manifest_hash: None,
-    });
+    state.set_account(
+        alice,
+        bloom_chain_state::Account {
+            nonce: 0,
+            loom: 1000,
+            code_hash: None,
+            storage_root: Hash32([0u8; 32]),
+            manifest_hash: None,
+        },
+    );
 
     let tx = transfer_tx(alice, bob, 300);
     let exec = ChainPetalExecutor;
     let out = exec.execute_tx(&tx, &mut state, 1, 0, addr(0xFF), Hash32([0u8; 32]));
 
     // The legacy Transfer must still succeed even though Coin<LOOM> is missing.
-    assert!(out.success, "Transfer must succeed even with missing Coin<LOOM>");
+    assert!(
+        out.success,
+        "Transfer must succeed even with missing Coin<LOOM>"
+    );
     state.apply(out.write_set.unwrap()).unwrap();
 
     // Bob gets Account.loom credit.
@@ -242,7 +301,13 @@ fn transfer_without_coin_loom_still_succeeds() {
     assert_eq!(bob_acct.loom, 300);
 
     // But bob has NO Coin<LOOM> (shim diverged, no coins to debit from alice).
-    let bob_okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: bob.0 };
+    let bob_okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: bob.0,
+    };
     let bob_owned = state.get_ownership(&bob_okey).unwrap_or_default();
-    assert!(bob_owned.is_empty(), "bob must have no Coin<LOOM> objects when shim diverged");
+    assert!(
+        bob_owned.is_empty(),
+        "bob must have no Coin<LOOM> objects when shim diverged"
+    );
 }

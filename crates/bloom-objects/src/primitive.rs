@@ -13,7 +13,7 @@
 //! declared [`TypeTag`]. Callers map the outcome onto their own error
 //! types.
 
-use crate::codec::{CodecError, read_u16_be, read_u8};
+use crate::codec::{CodecError, read_u8, read_u16_be};
 use crate::type_tag::TypeTag;
 
 /// Outcome of validating a byte string against a declared [`TypeTag`].
@@ -70,11 +70,7 @@ pub fn validate_canonical_bytes(tag: &TypeTag, bytes: &[u8]) -> ValidationOutcom
     }
 }
 
-fn validate_concrete(
-    name: &str,
-    type_args: &[TypeTag],
-    bytes: &[u8],
-) -> ValidationOutcome {
+fn validate_concrete(name: &str, type_args: &[TypeTag], bytes: &[u8]) -> ValidationOutcome {
     match (name, type_args.len()) {
         ("u8", 0) | ("i8", 0) | ("bool", 0) => {
             if bytes.len() == 1 {
@@ -90,9 +86,11 @@ fn validate_concrete(
         ("u32", 0) | ("i32", 0) => exact_len(bytes, 4, "u32/i32 require exactly 4 bytes"),
         ("u64", 0) | ("i64", 0) => exact_len(bytes, 8, "u64/i64 require exactly 8 bytes"),
         ("u128", 0) | ("i128", 0) => exact_len(bytes, 16, "u128/i128 require exactly 16 bytes"),
-        ("Address", 0) | ("ObjectId", 0) | ("Hash32", 0) => {
-            exact_len(bytes, 32, "Address/ObjectId/Hash32 require exactly 32 bytes")
-        }
+        ("Address", 0) | ("ObjectId", 0) | ("Hash32", 0) => exact_len(
+            bytes,
+            32,
+            "Address/ObjectId/Hash32 require exactly 32 bytes",
+        ),
         ("String", 0) => {
             // Canonical String encoding: 2-byte BE length prefix + UTF-8.
             let mut rdr: &[u8] = bytes;

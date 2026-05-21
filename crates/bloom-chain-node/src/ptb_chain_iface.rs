@@ -200,7 +200,10 @@ mod tests {
         let mut state = State::new();
         state.set_vfs_binding("/bloom/test".into(), Hash32([0xAB; 32]));
         let adapter = PtbChainAdapter::new(&state, 0);
-        assert_eq!(adapter.resolve_path("/bloom/test"), Some(Hash32([0xAB; 32])));
+        assert_eq!(
+            adapter.resolve_path("/bloom/test"),
+            Some(Hash32([0xAB; 32]))
+        );
         assert!(adapter.resolve_path("/missing").is_none());
     }
 
@@ -292,10 +295,7 @@ mod tests {
             framework_version: SemVer::new(0, 1, 0),
             ..Default::default()
         };
-        let wasm = wasm_with_custom(
-            "bloom_petal_manifest_v0",
-            &codec::encode(&real).unwrap(),
-        );
+        let wasm = wasm_with_custom("bloom_petal_manifest_v0", &codec::encode(&real).unwrap());
 
         let mut state = State::new();
         let hash = state.insert_code(&wasm);

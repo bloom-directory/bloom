@@ -21,8 +21,10 @@ use bloom_chain_node::{
 use bloom_chain_state::{Account, State};
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
-use bloom_objects::{Object, ObjectId, Owner, OwnershipIndexKey, OWNER_KIND_ADDRESS};
-use bloom_petal_fungible::ops::{coin_payload, decode_coin_value as fungible_decode_coin_value, type_tag_coin_loom};
+use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
+use bloom_petal_fungible::ops::{
+    coin_payload, decode_coin_value as fungible_decode_coin_value, type_tag_coin_loom,
+};
 use bloom_script::{FunctionDeclStub, PetalManifestStub, encode_ptb, types::PtbTx};
 
 // ---------------------------------------------------------------------------
@@ -86,7 +88,10 @@ pub fn build_state(allocations: &[(Address, u128)]) -> State {
         state.set_object(obj.clone());
 
         // Ownership index.
-        let okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: addr.0 };
+        let okey = OwnershipIndexKey {
+            owner_kind: OWNER_KIND_ADDRESS,
+            owner_id: addr.0,
+        };
         let mut owned = state.get_ownership(&okey).unwrap_or_default();
         let pos = owned.partition_point(|id| id.0 < coin_id.0);
         owned.insert(pos, coin_id);
@@ -119,7 +124,10 @@ pub fn seed_coin(state: &mut State, id: ObjectId, owner: Address, value: u128) {
     };
     state.set_object(obj.clone());
 
-    let okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: owner.0 };
+    let okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: owner.0,
+    };
     let mut owned = state.get_ownership(&okey).unwrap_or_default();
     let pos = owned.partition_point(|id| id.0 < obj.id.0);
     owned.insert(pos, obj.id);
@@ -152,11 +160,7 @@ pub fn seed_coin(state: &mut State, id: ObjectId, owner: Address, value: u128) {
 ///
 /// `state` is mutated in-place when the tx succeeds. On revert the
 /// state is unchanged (atomic).
-pub fn submit_ptb_chain_auth(
-    state: &mut State,
-    sender: Address,
-    ptb: PtbTx,
-) -> ExecOutput {
+pub fn submit_ptb_chain_auth(state: &mut State, sender: Address, ptb: PtbTx) -> ExecOutput {
     // Empty override map → PtbChainAdapter falls through to the
     // wasm custom-section path for every petal hash. The executor's
     // signature verifier is the test-only `AlwaysOkVerifier`, which
@@ -202,7 +206,9 @@ pub fn submit_ptb(
     if out.success
         && let Some(ws) = out.write_set.clone()
     {
-        state.apply(ws).expect("apply write_set must not fail in harness");
+        state
+            .apply(ws)
+            .expect("apply write_set must not fail in harness");
     }
 
     out
@@ -297,10 +303,7 @@ pub fn manifest_nullary(fn_name: &str) -> PetalManifestStub {
 }
 
 /// Build a one-entry manifest registry for a single petal.
-pub fn single_manifest(
-    hash: Hash32,
-    fn_name: &str,
-) -> HashMap<Hash32, PetalManifestStub> {
+pub fn single_manifest(hash: Hash32, fn_name: &str) -> HashMap<Hash32, PetalManifestStub> {
     let mut m = HashMap::new();
     m.insert(hash, manifest_nullary(fn_name));
     m

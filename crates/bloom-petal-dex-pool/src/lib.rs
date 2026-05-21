@@ -104,7 +104,7 @@ pub mod payload {
     /// `None` if the buffer is too short / malformed.
     pub fn decode_pool(bytes: &[u8]) -> Option<(u128, u128, u128, u128, Vec<u8>)> {
         let mut r = ArgReader::new(bytes);
-        r.read_object_id().ok()?;          // skip id
+        r.read_object_id().ok()?; // skip id
         let reserve_a = r.read_u128().ok()?;
         let reserve_b = r.read_u128().ok()?;
         let lp_supply = r.read_u128().ok()?;
@@ -133,7 +133,7 @@ pub mod payload {
     /// Returns `(pool_id, shares)` or `None` on malformed input.
     pub fn decode_lp(bytes: &[u8]) -> Option<(ObjectId, u128)> {
         let mut r = ArgReader::new(bytes);
-        r.read_object_id().ok()?;          // skip own id
+        r.read_object_id().ok()?; // skip own id
         let pool_id = r.read_object_id().ok()?;
         let shares = r.read_u128().ok()?;
         Some((pool_id, shares))
@@ -213,10 +213,10 @@ mod tags {
 /// The `#[bloom::petal]` entry points in `mod pool` are thin `expect`-wrappers
 /// over these, exactly mirroring the `bloom-petal-fungible` split.
 pub mod ops {
-    use bloom_objects::ObjectId;
-    use bloom_resource::{PetalError, RuntimeHandle, abi::RetWriter};
-    use bloom_resource::host;
     use bloom_dex_math::SwapStrategy;
+    use bloom_objects::ObjectId;
+    use bloom_resource::host;
+    use bloom_resource::{PetalError, RuntimeHandle, abi::RetWriter};
 
     use crate::{ParamCodec, PoolError, payload, tags};
 
@@ -247,14 +247,8 @@ pub mod ops {
         let mut id_bytes = [0u8; 32];
         id_bytes.copy_from_slice(&existing_bytes[..32]);
         let id = ObjectId(id_bytes);
-        let new_payload = payload::pool_payload(
-            &id,
-            reserve_a,
-            reserve_b,
-            lp_supply,
-            k_last,
-            params_bytes,
-        );
+        let new_payload =
+            payload::pool_payload(&id, reserve_a, reserve_b, lp_supply, k_last, params_bytes);
         host::object_mutate(pool_handle, &new_payload)
     }
 
@@ -273,10 +267,10 @@ pub mod ops {
         S::Params: ParamCodec,
     {
         // Read coin values.
-        let a_bytes = host::object_read(coin_a_handle)
-            .map_err(|_| PoolError::InsufficientLiquidity)?;
-        let b_bytes = host::object_read(coin_b_handle)
-            .map_err(|_| PoolError::InsufficientLiquidity)?;
+        let a_bytes =
+            host::object_read(coin_a_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
+        let b_bytes =
+            host::object_read(coin_b_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
         let value_a = decode_coin_value(&a_bytes)?;
         let value_b = decode_coin_value(&b_bytes)?;
 
@@ -326,15 +320,15 @@ pub mod ops {
         S: SwapStrategy,
         S::Params: ParamCodec,
     {
-        let pool_raw = host::object_read(pool_handle)
-            .map_err(|_| PoolError::InsufficientLiquidity)?;
+        let pool_raw =
+            host::object_read(pool_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
         let (reserve_a, reserve_b, lp_supply, _k_last, params_bytes) =
             payload::decode_pool(&pool_raw).ok_or(PoolError::InsufficientLiquidity)?;
 
-        let a_bytes = host::object_read(coin_a_handle)
-            .map_err(|_| PoolError::InsufficientLiquidity)?;
-        let b_bytes = host::object_read(coin_b_handle)
-            .map_err(|_| PoolError::InsufficientLiquidity)?;
+        let a_bytes =
+            host::object_read(coin_a_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
+        let b_bytes =
+            host::object_read(coin_b_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
         let value_a = decode_coin_value(&a_bytes)?;
         let value_b = decode_coin_value(&b_bytes)?;
 
@@ -370,11 +364,7 @@ pub mod ops {
             b.copy_from_slice(&pool_raw[..32]);
             ObjectId(b)
         };
-        let lp_payload = payload::lp_payload(
-            &ObjectId([0u8; 32]),
-            &pool_id_bytes,
-            lp_minted,
-        );
+        let lp_payload = payload::lp_payload(&ObjectId([0u8; 32]), &pool_id_bytes, lp_minted);
         let lp_handle = host::object_create(&tags::lp_position_tag(), &lp_payload)
             .map_err(|_| PoolError::InsufficientLiquidity)?;
 
@@ -415,18 +405,16 @@ pub mod ops {
         S: SwapStrategy,
         S::Params: ParamCodec,
     {
-        let pool_raw = host::object_read(pool_handle)
-            .map_err(|_| PoolError::InsufficientLiquidity)?;
+        let pool_raw =
+            host::object_read(pool_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
         let (reserve_a, reserve_b, lp_supply, _k_last, params_bytes) =
             payload::decode_pool(&pool_raw).ok_or(PoolError::InsufficientLiquidity)?;
 
-        let lp_bytes = host::object_read(lp_handle)
-            .map_err(|_| PoolError::WrongPool)?;
+        let lp_bytes = host::object_read(lp_handle).map_err(|_| PoolError::WrongPool)?;
         let (_pool_id, shares) = payload::decode_lp(&lp_bytes).ok_or(PoolError::WrongPool)?;
 
-        let (amount_a, amount_b) =
-            S::remove_liquidity(reserve_a, reserve_b, lp_supply, shares)
-                .map_err(PoolError::MathFailed)?;
+        let (amount_a, amount_b) = S::remove_liquidity(reserve_a, reserve_b, lp_supply, shares)
+            .map_err(PoolError::MathFailed)?;
 
         let new_reserve_a = reserve_a
             .checked_sub(amount_a)
@@ -480,16 +468,17 @@ pub mod ops {
         S: SwapStrategy,
         S::Params: ParamCodec,
     {
-        let pool_raw = host::object_read(pool_handle)
-            .map_err(|_| PoolError::InsufficientLiquidity)?;
+        let pool_raw =
+            host::object_read(pool_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
         let (reserve_a, reserve_b, lp_supply, _k_last, params_bytes) =
             payload::decode_pool(&pool_raw).ok_or(PoolError::InsufficientLiquidity)?;
 
-        let params = S::Params::decode(&params_bytes)
-            .ok_or(PoolError::MathFailed(bloom_dex_math::MathError::ZeroReserves))?;
+        let params = S::Params::decode(&params_bytes).ok_or(PoolError::MathFailed(
+            bloom_dex_math::MathError::ZeroReserves,
+        ))?;
 
-        let in_bytes = host::object_read(coin_in_handle)
-            .map_err(|_| PoolError::InsufficientLiquidity)?;
+        let in_bytes =
+            host::object_read(coin_in_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
         let amount_in = decode_coin_value(&in_bytes)?;
 
         let (_new_ri, _new_ro, amount_out) =
@@ -544,16 +533,17 @@ pub mod ops {
         S: SwapStrategy,
         S::Params: ParamCodec,
     {
-        let pool_raw = host::object_read(pool_handle)
-            .map_err(|_| PoolError::InsufficientLiquidity)?;
+        let pool_raw =
+            host::object_read(pool_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
         let (reserve_a, reserve_b, lp_supply, _k_last, params_bytes) =
             payload::decode_pool(&pool_raw).ok_or(PoolError::InsufficientLiquidity)?;
 
-        let params = S::Params::decode(&params_bytes)
-            .ok_or(PoolError::MathFailed(bloom_dex_math::MathError::ZeroReserves))?;
+        let params = S::Params::decode(&params_bytes).ok_or(PoolError::MathFailed(
+            bloom_dex_math::MathError::ZeroReserves,
+        ))?;
 
-        let in_bytes = host::object_read(coin_in_handle)
-            .map_err(|_| PoolError::InsufficientLiquidity)?;
+        let in_bytes =
+            host::object_read(coin_in_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
         let amount_in = decode_coin_value(&in_bytes)?;
 
         // B→A swap: reserve_in=reserve_b, reserve_out=reserve_a.
@@ -610,24 +600,24 @@ pub mod ops {
         S: SwapStrategy,
         S::Params: ParamCodec,
     {
-        let pool_raw = host::object_read(pool_handle)
-            .map_err(|_| PoolError::InsufficientLiquidity)?;
+        let pool_raw =
+            host::object_read(pool_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
         let (reserve_a, reserve_b, lp_supply, _k_last, params_bytes) =
             payload::decode_pool(&pool_raw).ok_or(PoolError::InsufficientLiquidity)?;
 
-        let params = S::Params::decode(&params_bytes)
-            .ok_or(PoolError::MathFailed(bloom_dex_math::MathError::ZeroReserves))?;
+        let params = S::Params::decode(&params_bytes).ok_or(PoolError::MathFailed(
+            bloom_dex_math::MathError::ZeroReserves,
+        ))?;
 
         if amount_out == 0 || amount_out >= reserve_b {
             return Err(PoolError::InsufficientLiquidity);
         }
 
         // Compute exact amount_in required for `amount_out`.
-        let exact_in =
-            compute_exact_in_for_out::<S>(reserve_a, reserve_b, amount_out, &params)?;
+        let exact_in = compute_exact_in_for_out::<S>(reserve_a, reserve_b, amount_out, &params)?;
 
-        let max_in_bytes = host::object_read(max_in_handle)
-            .map_err(|_| PoolError::InsufficientLiquidity)?;
+        let max_in_bytes =
+            host::object_read(max_in_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
         let max_in_value = decode_coin_value(&max_in_bytes)?;
 
         if max_in_value < exact_in {
@@ -677,8 +667,8 @@ pub mod ops {
 
     /// Read `(reserve_a, reserve_b)` from a pool handle (read-only quote helper).
     pub fn reserves(pool_handle: RuntimeHandle) -> Result<(u128, u128), PoolError> {
-        let pool_raw = host::object_read(pool_handle)
-            .map_err(|_| PoolError::InsufficientLiquidity)?;
+        let pool_raw =
+            host::object_read(pool_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
         let (reserve_a, reserve_b, ..) =
             payload::decode_pool(&pool_raw).ok_or(PoolError::InsufficientLiquidity)?;
         Ok((reserve_a, reserve_b))
@@ -749,7 +739,9 @@ pub mod ops {
                 Err(e) => return Err(PoolError::MathFailed(e)),
             }
         }
-        Err(PoolError::MathFailed(bloom_dex_math::MathError::InsufficientLiquidity))
+        Err(PoolError::MathFailed(
+            bloom_dex_math::MathError::InsufficientLiquidity,
+        ))
     }
 }
 
@@ -759,12 +751,12 @@ pub mod ops {
 /// public entry points for pool lifecycle operations.
 #[bloom::petal(path = "/bloom/dex/pool", version = "0.1.0")]
 pub mod pool {
-    use bloom_resource::{Coin, UID};
-    use bloom_objects::ObjectId;
     use bloom_dex_math::SwapStrategy;
+    use bloom_objects::ObjectId;
+    use bloom_resource::{Coin, UID};
     use core::marker::PhantomData;
 
-    use crate::{ops, ParamCodec};
+    use crate::{ParamCodec, ops};
 
     // ── On-chain object declarations ─────────────────────────────────────────
 
@@ -852,9 +844,8 @@ pub mod pool {
         let params = S::Params::decode(&params_bytes)
             .expect("create_pool: invalid params_bytes — could not decode S::Params");
 
-        let (pool_h, lp_h) =
-            ops::create_pool::<S>(coin_a.handle(), coin_b.handle(), &params)
-                .expect("create_pool host failure");
+        let (pool_h, lp_h) = ops::create_pool::<S>(coin_a.handle(), coin_b.handle(), &params)
+            .expect("create_pool host failure");
         let _ = pool_h;
         let _ = lp_h;
         // The macro shim returns the on-chain objects via the ret buffer;
@@ -898,9 +889,8 @@ pub mod pool {
         // is a placeholder that works on the wasm path where handle 0 is the
         // pool arg; host-side tests should call `ops::add_liquidity` directly.
         let pool_handle = bloom_resource::RuntimeHandle::from_raw(0);
-        let (lp_h, la, lb) =
-            ops::add_liquidity::<S>(pool_handle, coin_a.handle(), coin_b.handle())
-                .expect("add_liquidity host failure");
+        let (lp_h, la, lb) = ops::add_liquidity::<S>(pool_handle, coin_a.handle(), coin_b.handle())
+            .expect("add_liquidity host failure");
         let _ = lp_h;
         let lp = LpPosition {
             id: UID::default(),
@@ -956,9 +946,8 @@ pub mod pool {
         S::Params: ParamCodec,
     {
         let pool_handle = bloom_resource::RuntimeHandle::from_raw(0);
-        let out_h =
-            ops::swap_exact_in_reverse::<S>(pool_handle, coin_in.handle(), min_out)
-                .expect("swap_exact_in_reverse host failure");
+        let out_h = ops::swap_exact_in_reverse::<S>(pool_handle, coin_in.handle(), min_out)
+            .expect("swap_exact_in_reverse host failure");
         Coin::from_handle(out_h)
     }
 
@@ -975,17 +964,14 @@ pub mod pool {
         S::Params: ParamCodec,
     {
         let pool_handle = bloom_resource::RuntimeHandle::from_raw(0);
-        let (cb_h, la) =
-            ops::swap_exact_out::<S>(pool_handle, max_in.handle(), amount_out)
-                .expect("swap_exact_out host failure");
+        let (cb_h, la) = ops::swap_exact_out::<S>(pool_handle, max_in.handle(), amount_out)
+            .expect("swap_exact_out host failure");
         (Coin::from_handle(cb_h), la.map(Coin::from_handle))
     }
 
     /// Read `(reserve_a, reserve_b)` from a pool (read-only; for off-chain
     /// quoting).
-    pub fn reserves<A, B, S: SwapStrategy>(
-        _pool: &Pool<A, B, S>,
-    ) -> (u128, u128)
+    pub fn reserves<A, B, S: SwapStrategy>(_pool: &Pool<A, B, S>) -> (u128, u128)
     where
         S::Params: ParamCodec,
     {

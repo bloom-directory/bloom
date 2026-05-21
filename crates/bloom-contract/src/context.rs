@@ -21,8 +21,8 @@ use core::marker::PhantomData;
 
 use alloc::vec::Vec;
 
-use bloom_petal_sdk::{block, host, msg, petal};
 pub use bloom_petal_sdk::value::LoomValue;
+use bloom_petal_sdk::{block, host, msg, petal};
 
 use crate::error::{ContractError, Result};
 use crate::interface::{ContractInterface, ContractRef};
@@ -43,7 +43,9 @@ impl Context {
     /// Construct a fresh context handle. Cheap (zero-sized).
     #[inline]
     pub const fn new() -> Self {
-        Self { _private: PhantomData }
+        Self {
+            _private: PhantomData,
+        }
     }
 
     /// 32-byte address of the immediate caller of the current method.
@@ -176,4 +178,3 @@ impl Context {
         bloom_petal_sdk::log::emit_topics32(topics, data);
     }
 }
-

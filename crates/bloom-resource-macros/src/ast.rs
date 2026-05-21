@@ -73,9 +73,11 @@ pub(crate) fn parse_u64_value(meta: &MetaNameValue) -> syn::Result<u64> {
 /// `MetaNameValue`s, preserving source order.
 pub(crate) fn parse_kv_attr(attr: &Attribute) -> syn::Result<Vec<MetaNameValue>> {
     match &attr.meta {
-        Meta::List(list) => list.parse_args_with(
-            syn::punctuated::Punctuated::<MetaNameValue, syn::Token![,]>::parse_terminated,
-        ).map(|p| p.into_iter().collect()),
+        Meta::List(list) => list
+            .parse_args_with(
+                syn::punctuated::Punctuated::<MetaNameValue, syn::Token![,]>::parse_terminated,
+            )
+            .map(|p| p.into_iter().collect()),
         Meta::Path(_) => Ok(Vec::new()),
         Meta::NameValue(_) => Err(err_spanned(attr, "expected attribute list `(...)`")),
     }
@@ -92,7 +94,10 @@ pub(crate) fn parse_ident_list(raw: &str, span: Span) -> syn::Result<Vec<String>
         }
         // Validate it's a syntactic identifier.
         if !is_valid_ident(t) {
-            return Err(syn::Error::new(span, format!("`{}` is not a valid identifier", t)));
+            return Err(syn::Error::new(
+                span,
+                format!("`{}` is not a valid identifier", t),
+            ));
         }
         out.push(t.to_string());
     }

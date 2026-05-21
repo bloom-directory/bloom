@@ -18,7 +18,9 @@ pub struct Coin<T> {
 
 impl<T> core::fmt::Debug for Coin<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Coin").field("handle", &self.handle).finish()
+        f.debug_struct("Coin")
+            .field("handle", &self.handle)
+            .finish()
     }
 }
 
@@ -104,7 +106,9 @@ impl<T> core::hash::Hash for Balance<T> {
 }
 impl<T> core::fmt::Debug for Balance<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Balance").field("value", &self.value).finish()
+        f.debug_struct("Balance")
+            .field("value", &self.value)
+            .finish()
     }
 }
 

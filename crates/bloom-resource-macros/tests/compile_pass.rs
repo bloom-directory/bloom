@@ -7,7 +7,7 @@
 //! each fixture uses a distinct mod name (`minimal`, `cap`, `inv_test`).
 
 #![allow(dead_code)] // fixture petal structs/fns are exercised purely by their
-                     // macro expansion; we don't call them at runtime.
+// macro expansion; we don't call them at runtime.
 
 mod minimal_test {
     include!("fixtures/minimal_petal.rs");
@@ -55,10 +55,7 @@ mod dispatch_test {
 
     /// Drive a host-side mirror shim with the given args buffer.
     /// Returns the rc and the encoded return bytes the shim appended.
-    fn drive_safe_shim(
-        shim: fn(&[u8], &mut Vec<u8>) -> i32,
-        args: &[u8],
-    ) -> (i32, Vec<u8>) {
+    fn drive_safe_shim(shim: fn(&[u8], &mut Vec<u8>) -> i32, args: &[u8]) -> (i32, Vec<u8>) {
         let mut ret_buf: Vec<u8> = Vec::new();
         let rc = shim(args, &mut ret_buf);
         (rc, ret_buf)

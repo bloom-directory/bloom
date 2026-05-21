@@ -57,9 +57,9 @@ use bloom_chain_types::{Hash32, types::Address};
 use bloom_objects::TypeTag;
 use bloom_petals::{BlockCtx, ChainCallInput, ChainEntry, PetalVm};
 use bloom_script::{
+    PtbError,
     executor::{InvariantResult, PetalCallResult, PetalRunner},
     host_ctx::PtbHostCtx,
-    PtbError,
 };
 
 /// Real-chain implementation of [`PetalRunner`].
@@ -111,10 +111,10 @@ impl ChainPetalRunner {
     }
 
     /// Convert from the validator's `[u8;32]`-keyed petals map.
-    pub fn petals_from_validated(map: &std::collections::HashMap<[u8; 32], Vec<u8>>) -> BTreeMap<Hash32, Vec<u8>> {
-        map.iter()
-            .map(|(k, v)| (Hash32(*k), v.clone()))
-            .collect()
+    pub fn petals_from_validated(
+        map: &std::collections::HashMap<[u8; 32], Vec<u8>>,
+    ) -> BTreeMap<Hash32, Vec<u8>> {
+        map.iter().map(|(k, v)| (Hash32(*k), v.clone())).collect()
     }
 
     /// Consume the runner and return the final snapshot. Used by the
@@ -156,9 +156,7 @@ impl ChainPetalRunner {
         // back here; on revert / trap we restore the pre-call clone
         // so the executor's rollback semantics align.
         let mut snap_slot = self.snapshot.lock().expect("snapshot mutex poisoned");
-        let pre_call = snap_slot
-            .take()
-            .expect("ChainPetalRunner snapshot missing");
+        let pre_call = snap_slot.take().expect("ChainPetalRunner snapshot missing");
         let checkpoint = pre_call.clone();
 
         let input = ChainCallInput {
@@ -296,18 +294,16 @@ mod tests {
     fn unknown_petal_hash_surfaces_petal_not_found() {
         let snap = State::new().snapshot();
         let ctx = Arc::new(Mutex::new(PtbHostCtx::new()));
-        let runner = ChainPetalRunner::new(
-            BTreeMap::new(),
-            ctx,
-            snap,
-            block_ctx(),
-            Address([0u8; 32]),
-        );
+        let runner =
+            ChainPetalRunner::new(BTreeMap::new(), ctx, snap, block_ctx(), Address([0u8; 32]));
         let hash = Hash32([0xAB; 32]);
         let err = runner
             .call(&hash, "anything", &[], &[], 1_000_000)
             .unwrap_err();
-        assert!(matches!(err, PtbError::PetalNotFound { .. }), "got: {err:?}");
+        assert!(
+            matches!(err, PtbError::PetalNotFound { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -319,13 +315,8 @@ mod tests {
         state.set_account(Address([0x42; 32]), acct);
         let snap = state.snapshot();
         let ctx = Arc::new(Mutex::new(PtbHostCtx::new()));
-        let runner = ChainPetalRunner::new(
-            BTreeMap::new(),
-            ctx,
-            snap,
-            block_ctx(),
-            Address([0u8; 32]),
-        );
+        let runner =
+            ChainPetalRunner::new(BTreeMap::new(), ctx, snap, block_ctx(), Address([0u8; 32]));
         let final_snap = runner.into_snapshot();
         // The snapshot must round-trip the account state we loaded.
         let acct = final_snap.get_account(&Address([0x42; 32])).unwrap();
@@ -339,7 +330,13 @@ mod tests {
         input.insert([0x11u8; 32], vec![1, 2, 3]);
         input.insert([0x22u8; 32], vec![4, 5, 6]);
         let out = ChainPetalRunner::petals_from_validated(&input);
-        assert_eq!(out.get(&Hash32([0x11; 32])).map(|v| v.as_slice()), Some([1, 2, 3].as_slice()));
-        assert_eq!(out.get(&Hash32([0x22; 32])).map(|v| v.as_slice()), Some([4, 5, 6].as_slice()));
+        assert_eq!(
+            out.get(&Hash32([0x11; 32])).map(|v| v.as_slice()),
+            Some([1, 2, 3].as_slice())
+        );
+        assert_eq!(
+            out.get(&Hash32([0x22; 32])).map(|v| v.as_slice()),
+            Some([4, 5, 6].as_slice())
+        );
     }
 }

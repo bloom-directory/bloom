@@ -61,8 +61,7 @@ pub fn run(cmd: ContractCmd) -> Result<()> {
             dev,
         } => {
             let profile = if dev { Profile::Dev } else { Profile::Release };
-            let out_dir = out_dir
-                .unwrap_or_else(|| crate_dir.join("target").join("bloom"));
+            let out_dir = out_dir.unwrap_or_else(|| crate_dir.join("target").join("bloom"));
             let artifacts = emit_artifacts(&crate_dir, &out_dir, profile)
                 .with_context(|| format!("build contract {}", crate_dir.display()))?;
             println!("contract: {}", artifacts.manifest.contract.name);
@@ -90,8 +89,8 @@ pub fn run(cmd: ContractCmd) -> Result<()> {
                 .with_context(|| format!("read manifest {}", manifest.display()))?;
             let manifest_obj: Manifest = serde_json::from_slice(&manifest_bytes)
                 .with_context(|| format!("decode manifest {}", manifest.display()))?;
-            let wasm_bytes = std::fs::read(&wasm)
-                .with_context(|| format!("read wasm {}", wasm.display()))?;
+            let wasm_bytes =
+                std::fs::read(&wasm).with_context(|| format!("read wasm {}", wasm.display()))?;
             verify_manifest_against_wasm(&manifest_obj, &wasm_bytes)
                 .context("manifest does not match wasm")?;
 

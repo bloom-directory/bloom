@@ -37,8 +37,14 @@ pub struct Approval {
 
 #[test]
 fn event_signature_uses_domain_prefix() {
-    assert_eq!(Transfer::EVENT_SIGNATURE, "erc20::Transfer(address,address,u256)");
-    assert_eq!(Approval::EVENT_SIGNATURE, "erc20::Approval(address,address,u256)");
+    assert_eq!(
+        Transfer::EVENT_SIGNATURE,
+        "erc20::Transfer(address,address,u256)"
+    );
+    assert_eq!(
+        Approval::EVENT_SIGNATURE,
+        "erc20::Approval(address,address,u256)"
+    );
 }
 
 #[test]

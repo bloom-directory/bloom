@@ -13,8 +13,8 @@
 //! (runtime decode + project) share the same canonical schema.
 
 use bloom_objects::codec::{
-    self, CodecError, read_bytes32, read_string, read_u16_be, read_u32_be, read_u64_be, read_u8,
-    write_bytes32, write_string, write_u16_be, write_u32_be, write_u64_be, write_u8,
+    self, CodecError, read_bytes32, read_string, read_u8, read_u16_be, read_u32_be, read_u64_be,
+    write_bytes32, write_string, write_u8, write_u16_be, write_u32_be, write_u64_be,
 };
 use bloom_objects::{AbilitySet, AccessMode, TypeTag};
 
@@ -95,7 +95,8 @@ fn write_list<T, F>(buf: &mut Vec<u8>, items: &[T], mut w: F) -> Result<(), Code
 where
     F: FnMut(&mut Vec<u8>, &T) -> Result<(), CodecError>,
 {
-    let len: u32 = u32::try_from(items.len()).map_err(|_| CodecError::LengthOverflow(items.len() as u64))?;
+    let len: u32 =
+        u32::try_from(items.len()).map_err(|_| CodecError::LengthOverflow(items.len() as u64))?;
     write_u32_be(buf, len);
     for item in items {
         w(buf, item)?;
@@ -675,7 +676,11 @@ mod tests {
 
     #[test]
     fn arg_kind_object_round_trips_each_mode() {
-        for mode in [AccessMode::ReadOnly, AccessMode::Mutable, AccessMode::Consume] {
+        for mode in [
+            AccessMode::ReadOnly,
+            AccessMode::Mutable,
+            AccessMode::Consume,
+        ] {
             let m = PetalManifestV0 {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDecl {
@@ -755,10 +760,7 @@ mod tests {
         let m = PetalManifestV0 {
             module_path: "/p".to_string(),
             fuel_hints: FuelHints {
-                per_function: vec![
-                    ("a".to_string(), 1_000),
-                    ("b".to_string(), 2_000),
-                ],
+                per_function: vec![("a".to_string(), 1_000), ("b".to_string(), 2_000)],
                 default: Some(5_000),
             },
             ..Default::default()

@@ -26,9 +26,7 @@ pub mod store;
 pub mod vm;
 
 pub use attestation::{PetalAttestation, blake3_hex};
-pub use chain_vm::{
-    BlockCtx, ChainCallInput, ChainCallOutput, ChainEntry, ChainCtx, LogEntry,
-};
+pub use chain_vm::{BlockCtx, ChainCallInput, ChainCallOutput, ChainCtx, ChainEntry, LogEntry};
 pub use error::PetalError;
 pub use handler::PetalsHandler;
 pub use host::{HostError, PetalHost};

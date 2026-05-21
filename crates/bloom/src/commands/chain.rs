@@ -184,8 +184,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
         ChainCmd::Init { genesis, force } => {
             std::fs::create_dir_all(chain_dir.join("keystore"))
                 .context("create chain keystore dir")?;
-            std::fs::create_dir_all(chain_dir.join("blocks"))
-                .context("create chain blocks dir")?;
+            std::fs::create_dir_all(chain_dir.join("blocks")).context("create chain blocks dir")?;
             std::fs::create_dir_all(chain_dir.join("state_blobs"))
                 .context("create chain state_blobs dir")?;
 
@@ -197,8 +196,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
                 println!("copied genesis: {}", genesis_dest.display());
             } else {
                 let skeleton = genesis_skeleton();
-                std::fs::write(&genesis_dest, skeleton)
-                    .context("write genesis.toml skeleton")?;
+                std::fs::write(&genesis_dest, skeleton).context("write genesis.toml skeleton")?;
                 println!("wrote genesis skeleton: {}", genesis_dest.display());
             }
 
@@ -216,8 +214,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             let pk_bytes = pk.0.clone();
 
             // Derive address (spec §4.3 — canonical helper).
-            let addr_bytes =
-                bloom_chain_types::types::Address::from_pubkey_bytes(&pk_bytes).0;
+            let addr_bytes = bloom_chain_types::types::Address::from_pubkey_bytes(&pk_bytes).0;
             let addr_hex = hex::encode(addr_bytes);
 
             // Write key file (unencrypted seed for v0 — v1 should use passphrase).
@@ -261,10 +258,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
 
             let client = make_client();
             let result = client
-                .call(
-                    "chain_submit_tx",
-                    json!({ "tx_hex": hex::encode(&bytes) }),
-                )
+                .call("chain_submit_tx", json!({ "tx_hex": hex::encode(&bytes) }))
                 .await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
@@ -277,11 +271,8 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             salt,
             manifest_hash,
         } => {
-            use bloom_chain_types::{
-                tx::TxKind,
-                types::Hash32,
-            };
             use bloom_chain_types::ssz::Encode;
+            use bloom_chain_types::{tx::TxKind, types::Hash32};
 
             let wasm_bytes = load_wasm(&wasm_or_wat)?;
             let init_args_bytes = init_args
@@ -336,7 +327,10 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             )?;
             let tx_hash = tx.tx_hash();
             let result = client
-                .call("chain_submit_tx", json!({ "tx_hex": hex::encode(tx.as_ssz_bytes()) }))
+                .call(
+                    "chain_submit_tx",
+                    json!({ "tx_hex": hex::encode(tx.as_ssz_bytes()) }),
+                )
                 .await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             wait_for_nonce(&client, &sender, nonce, std::time::Duration::from_secs(30)).await?;
@@ -351,8 +345,8 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             value,
             max_fuel,
         } => {
-            use bloom_chain_types::tx::TxKind;
             use bloom_chain_types::ssz::Encode;
+            use bloom_chain_types::tx::TxKind;
 
             let to = parse_address_cli(&addr)?;
             let calldata = hex::decode(&calldata_hex).context("decode calldata hex")?;
@@ -369,13 +363,20 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
                 sender,
                 &chain_id,
                 nonce,
-                TxKind::Call { to, calldata, value_loom },
+                TxKind::Call {
+                    to,
+                    calldata,
+                    value_loom,
+                },
                 fuel,
                 1,
             )?;
             let tx_hash = tx.tx_hash();
             let result = client
-                .call("chain_submit_tx", json!({ "tx_hex": hex::encode(tx.as_ssz_bytes()) }))
+                .call(
+                    "chain_submit_tx",
+                    json!({ "tx_hex": hex::encode(tx.as_ssz_bytes()) }),
+                )
                 .await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             wait_for_nonce(&client, &sender, nonce, std::time::Duration::from_secs(30)).await?;
@@ -439,8 +440,8 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
 
         // ── transfer ──────────────────────────────────────────────────────────
         ChainCmd::Transfer { to, amount } => {
-            use bloom_chain_types::tx::TxKind;
             use bloom_chain_types::ssz::Encode;
+            use bloom_chain_types::tx::TxKind;
 
             let to_addr = parse_address_cli(&to)?;
             let (sk, pk, sender) = load_wallet_key(&chain_dir)?;
@@ -539,11 +540,7 @@ wasmtime_version = "26"
 ///   `truncate(2)` doesn't change the existing mode.
 /// - On non-Unix platforms the chmod is skipped; we still honor the no-
 ///   overwrite check.
-fn write_secret_key_file(
-    path: &std::path::Path,
-    bytes: &[u8],
-    force: bool,
-) -> Result<()> {
+fn write_secret_key_file(path: &std::path::Path, bytes: &[u8], force: bool) -> Result<()> {
     use std::io::Write;
 
     if path.exists() && !force {
@@ -608,7 +605,10 @@ pub(crate) fn load_validator_run_config(
     bloom_home: &std::path::Path,
     chain_dir: &std::path::Path,
     config_path: &std::path::Path,
-) -> Result<(bloom_chain_node::NodeConfig, bloom_chain_node::NodeRunConfig)> {
+) -> Result<(
+    bloom_chain_node::NodeConfig,
+    bloom_chain_node::NodeRunConfig,
+)> {
     let config_text = std::fs::read_to_string(config_path)
         .with_context(|| format!("read config: {}", config_path.display()))?;
     let node_cfg: bloom_chain_node::NodeConfig =
@@ -619,27 +619,24 @@ pub(crate) fn load_validator_run_config(
     // mode, and surfacing it before genesis validation gives a clearer error
     // (and makes the test seam viable without a fully-populated genesis).
     let key_path = chain_dir.join("keystore").join("validator.xdsa");
-    let key_bytes = std::fs::read(&key_path)
-        .with_context(|| format!("read key: {}", key_path.display()))?;
+    let key_bytes =
+        std::fs::read(&key_path).with_context(|| format!("read key: {}", key_path.display()))?;
     let sk = bloom_keystore::xdsa::XdsaSecretKey::from_bytes(&key_bytes)
         .map_err(|e| anyhow::anyhow!("decode validator key: {e}"))?;
     let pk = sk.public_key();
-    let derived =
-        bloom_chain_types::types::Address::from_pubkey_bytes(&pk.0);
+    let derived = bloom_chain_types::types::Address::from_pubkey_bytes(&pk.0);
 
     // Reconcile config.validator_address with derive(keystore_pubkey).
     //
     // We accept the same string formats `parse_b1_address` accepts (b1-prefixed
     // OR raw 64-char hex) so the config can use either form.
-    let declared = bloom_chain_node::genesis::parse_b1_address(
-        &node_cfg.validator_address,
-    )
-    .with_context(|| {
-        format!(
-            "parse config.validator_address {:?}",
-            node_cfg.validator_address
-        )
-    })?;
+    let declared = bloom_chain_node::genesis::parse_b1_address(&node_cfg.validator_address)
+        .with_context(|| {
+            format!(
+                "parse config.validator_address {:?}",
+                node_cfg.validator_address
+            )
+        })?;
     if declared != derived {
         anyhow::bail!(
             "validator_address mismatch: config declares {} but keystore at {} \
@@ -800,11 +797,17 @@ async fn wait_for_tx_receipt(
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let res = client
-            .call("chain_query_tx", json!({ "tx_hash": hex::encode(tx_hash.0) }))
+            .call(
+                "chain_query_tx",
+                json!({ "tx_hash": hex::encode(tx_hash.0) }),
+            )
             .await
             .context("rpc chain_query_tx")?;
         if !res.is_null() {
-            let success = res.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+            let success = res
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if success {
                 return Ok(());
             }
@@ -836,8 +839,7 @@ async fn wait_for_tx_receipt(
 
 /// Parse an address from CLI (hex or b1-prefixed).
 fn parse_address_cli(s: &str) -> Result<bloom_chain_types::types::Address> {
-    bloom_chain_node::genesis::parse_b1_address(s)
-        .with_context(|| format!("parse address: {s:?}"))
+    bloom_chain_node::genesis::parse_b1_address(s).with_context(|| format!("parse address: {s:?}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -893,9 +895,10 @@ fn provision_testnet(
     // If `--listen-addr` is set, derive the listen port from it so peer-host
     // rewriting (below) uses the same port across all validators.
     let listen_addr_port: Option<u16> = match listen_addr_override {
-        Some(s) => Some(parse_port_from_host_port(s).with_context(|| {
-            format!("parse port from --listen-addr {s:?}")
-        })?),
+        Some(s) => Some(
+            parse_port_from_host_port(s)
+                .with_context(|| format!("parse port from --listen-addr {s:?}"))?,
+        ),
         None => None,
     };
 
@@ -945,8 +948,7 @@ fn provision_testnet(
         let sk_bytes = sk.to_bytes();
 
         // Address = blake3("bloom-chain.v0.addr:" || pubkey) — canonical helper.
-        let addr_bytes =
-            bloom_chain_types::types::Address::from_pubkey_bytes(&pk.0).0;
+        let addr_bytes = bloom_chain_types::types::Address::from_pubkey_bytes(&pk.0).0;
 
         let key_path = chain_dir.join("keystore").join("validator.xdsa");
         // Testnet provisioning creates fresh per-validator home dirs, so the
@@ -1007,8 +1009,7 @@ fn provision_testnet(
             })
             .collect(),
     };
-    let genesis_toml =
-        toml::to_string_pretty(&genesis).context("serialize shared genesis.toml")?;
+    let genesis_toml = toml::to_string_pretty(&genesis).context("serialize shared genesis.toml")?;
 
     // Second pass: write shared genesis + per-node config + collect manifest.
     let mut manifest = Vec::with_capacity(nodes.len());
@@ -1116,8 +1117,8 @@ allocations = []
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("k");
         write_secret_key_file(&path, b"first", false).expect("initial write");
-        let err = write_secret_key_file(&path, b"second", false)
-            .expect_err("second write must error");
+        let err =
+            write_secret_key_file(&path, b"second", false).expect_err("second write must error");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("refusing to overwrite") && msg.contains("--force"),
@@ -1159,7 +1160,10 @@ allocations = []
         );
         write_secret_key_file(&path, b"new", true).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "expected force-write to chmod 0600, got 0o{mode:o}");
+        assert_eq!(
+            mode, 0o600,
+            "expected force-write to chmod 0600, got 0o{mode:o}"
+        );
     }
 
     /// review 2026-05-19 #15 — `run-validator` must reject a config whose
@@ -1191,11 +1195,7 @@ allocations = []
             wasmtime_version: Some("test".into()),
         };
         let config_path = chain_dir.join("config.toml");
-        std::fs::write(
-            &config_path,
-            toml::to_string_pretty(&config).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
         write_minimal_genesis(&chain_dir.join("genesis.toml"), "bloomchain.test");
 
         let err = match load_validator_run_config(home, &chain_dir, &config_path) {
@@ -1247,11 +1247,7 @@ allocations = []
             wasmtime_version: Some("test".into()),
         };
         let config_path = chain_dir.join("config.toml");
-        std::fs::write(
-            &config_path,
-            toml::to_string_pretty(&config).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
         // Genesis must list the local validator so `Genesis::from_file`
         // doesn't reject "empty validator set".
         let pk_b64 = base64::engine::general_purpose::STANDARD.encode(&pk.0);
@@ -1271,9 +1267,8 @@ host = "127.0.0.1:26656"
         );
         std::fs::write(chain_dir.join("genesis.toml"), genesis).unwrap();
 
-        let (loaded_cfg, run_cfg) =
-            load_validator_run_config(home, &chain_dir, &config_path)
-                .expect("matching config should load");
+        let (loaded_cfg, run_cfg) = load_validator_run_config(home, &chain_dir, &config_path)
+            .expect("matching config should load");
         assert_eq!(loaded_cfg.validator_address, hex::encode(derived.0));
         assert_eq!(run_cfg.validator_address, derived);
     }

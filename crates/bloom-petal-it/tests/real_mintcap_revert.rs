@@ -37,9 +37,7 @@
 use bloom_chain_state::State;
 use bloom_objects::{AccessMode, Object, ObjectId, Owner, TypeTag};
 use bloom_script::ExpectedVersion;
-use bloom_script::{
-    Arg, Command, MoveCmd, PetalRef, PqSignature, PtbTx,
-};
+use bloom_script::{Arg, Command, MoveCmd, PetalRef, PqSignature, PtbTx};
 
 use bloom_petal_fungible::ops::cap_payload;
 use bloom_petal_it::harness::{
@@ -127,7 +125,10 @@ fn mint_genesis_wrong_typed_cap_reverts_with_typemismatch() {
     let ptb = PtbTx {
         signers: vec![alice.0],
         commands: vec![Command::Move(MoveCmd {
-            petal: PetalRef { path: String::new(), hash: Some(petal_hash) },
+            petal: PetalRef {
+                path: String::new(),
+                hash: Some(petal_hash),
+            },
             function: "mint_genesis".to_string(),
             type_args: vec![],
             args: vec![
@@ -205,7 +206,10 @@ fn mint_genesis_with_real_epoch_zero_cap_typechecks_ok() {
     let ptb = PtbTx {
         signers: vec![alice.0],
         commands: vec![Command::Move(MoveCmd {
-            petal: PetalRef { path: String::new(), hash: Some(petal_hash) },
+            petal: PetalRef {
+                path: String::new(),
+                hash: Some(petal_hash),
+            },
             function: "mint_genesis".to_string(),
             type_args: vec![],
             args: vec![

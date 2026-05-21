@@ -33,6 +33,4 @@ pub mod types;
 pub use codec::{decode, decode_from, encode, encode_into};
 pub use extract::{extract_petal_manifest_v0, extract_petal_manifest_v0_bytes};
 pub use stub::to_petal_manifest_stub;
-pub use types::{
-    MANIFEST_CUSTOM_SECTION, PetalManifestV0, SCHEMA_VERSION,
-};
+pub use types::{MANIFEST_CUSTOM_SECTION, PetalManifestV0, SCHEMA_VERSION};

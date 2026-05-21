@@ -23,7 +23,9 @@ impl BlockStore {
     pub fn open(root: &Path) -> Result<Self> {
         std::fs::create_dir_all(root)
             .with_context(|| format!("create block store dir: {}", root.display()))?;
-        Ok(BlockStore { root: root.to_path_buf() })
+        Ok(BlockStore {
+            root: root.to_path_buf(),
+        })
     }
 
     fn path_for(&self, height: u64) -> PathBuf {
@@ -77,9 +79,10 @@ impl BlockStore {
             };
             // Re-use `get` so SSZ decode failures surface with the height.
             if let Some(block) = self.get(height)?
-                && &block.header.block_hash() == block_hash {
-                    return Ok(Some(block));
-                }
+                && &block.header.block_hash() == block_hash
+            {
+                return Ok(Some(block));
+            }
         }
         Ok(None)
     }
@@ -92,9 +95,10 @@ impl BlockStore {
         {
             let entry = entry?;
             if let Ok(name) = entry.file_name().into_string()
-                && let Ok(h) = name.parse::<u64>() {
-                    max = Some(max.map_or(h, |m: u64| m.max(h)));
-                }
+                && let Ok(h) = name.parse::<u64>()
+            {
+                max = Some(max.map_or(h, |m: u64| m.max(h)));
+            }
         }
         Ok(max)
     }
@@ -109,11 +113,12 @@ impl BlockStore {
             let entry = entry?;
             if let Ok(name) = entry.file_name().into_string()
                 && let Ok(h) = name.parse::<u64>()
-                    && h < prune_before {
-                        let path = entry.path();
-                        let _ = std::fs::remove_file(&path);
-                        debug!(height = h, "block_store.pruned");
-                    }
+                && h < prune_before
+            {
+                let path = entry.path();
+                let _ = std::fs::remove_file(&path);
+                debug!(height = h, "block_store.pruned");
+            }
         }
         Ok(())
     }

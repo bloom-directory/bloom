@@ -182,8 +182,20 @@ mod tests {
         for (got, want) in NEW_HOST_IMPORTS.iter().zip(EXPECTED.iter()) {
             assert_eq!(got.module, want.0);
             assert_eq!(got.name, want.1);
-            assert_eq!(got.params.len(), want.2, "params for {}.{}", got.module, got.name);
-            assert_eq!(got.results.len(), want.3, "results for {}.{}", got.module, got.name);
+            assert_eq!(
+                got.params.len(),
+                want.2,
+                "params for {}.{}",
+                got.module,
+                got.name
+            );
+            assert_eq!(
+                got.results.len(),
+                want.3,
+                "results for {}.{}",
+                got.module,
+                got.name
+            );
             for ty in got.params.iter().chain(got.results.iter()) {
                 assert_eq!(*ty, WasmValType::I32);
             }

@@ -25,7 +25,9 @@ async fn loopback_pair() -> (TcpStream, TcpStream) {
 /// Send a frame over one half, receive on the other, assert equality.
 async fn roundtrip(frame: Frame) {
     let (mut tx_stream, mut rx_stream) = loopback_pair().await;
-    write_frame(&mut tx_stream, &frame).await.expect("write_frame");
+    write_frame(&mut tx_stream, &frame)
+        .await
+        .expect("write_frame");
     drop(tx_stream);
     let decoded = read_frame(&mut rx_stream)
         .await

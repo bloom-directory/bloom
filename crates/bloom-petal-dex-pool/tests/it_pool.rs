@@ -19,8 +19,8 @@
 
 use bloom_dex_math::{ConstantProduct, ConstantProductParams, SwapStrategy, integer_sqrt};
 use bloom_objects::ObjectId;
-use bloom_petal_dex_pool::payload;
 use bloom_petal_dex_pool::ParamCodec;
+use bloom_petal_dex_pool::payload;
 
 // ─── 1. Pool payload round-trips ─────────────────────────────────────────────
 
@@ -36,8 +36,7 @@ fn pool_payload_round_trip_basic() {
     let encoded =
         payload::pool_payload(&id, reserve_a, reserve_b, lp_supply, k_last, &params_bytes);
 
-    let (ra, rb, lps, kl, pb) =
-        payload::decode_pool(&encoded).expect("decode_pool should succeed");
+    let (ra, rb, lps, kl, pb) = payload::decode_pool(&encoded).expect("decode_pool should succeed");
 
     assert_eq!(ra, reserve_a);
     assert_eq!(rb, reserve_b);
@@ -52,8 +51,7 @@ fn pool_payload_round_trip_zero_reserves() {
     let params_bytes = ConstantProductParams { fee_bps: 0 }.encode();
     let encoded = payload::pool_payload(&id, 0, 0, 0, 0, &params_bytes);
 
-    let (ra, rb, lps, kl, _pb) =
-        payload::decode_pool(&encoded).expect("decode_pool with zeros");
+    let (ra, rb, lps, kl, _pb) = payload::decode_pool(&encoded).expect("decode_pool with zeros");
 
     assert_eq!(ra, 0);
     assert_eq!(rb, 0);
@@ -73,8 +71,7 @@ fn pool_payload_round_trip_large_values() {
     let encoded =
         payload::pool_payload(&id, reserve_a, reserve_b, lp_supply, k_last, &params_bytes);
 
-    let (ra, rb, lps, kl, pb) =
-        payload::decode_pool(&encoded).expect("decode_pool large values");
+    let (ra, rb, lps, kl, pb) = payload::decode_pool(&encoded).expect("decode_pool large values");
 
     assert_eq!(ra, reserve_a);
     assert_eq!(rb, reserve_b);
@@ -86,7 +83,10 @@ fn pool_payload_round_trip_large_values() {
 #[test]
 fn decode_pool_rejects_short_buffer() {
     let short = vec![0u8; 10];
-    assert!(payload::decode_pool(&short).is_none(), "short buffer should fail");
+    assert!(
+        payload::decode_pool(&short).is_none(),
+        "short buffer should fail"
+    );
 }
 
 // ─── 2. LpPosition payload round-trips ───────────────────────────────────────
@@ -98,8 +98,7 @@ fn lp_payload_round_trip_basic() {
     let shares = 600u128;
 
     let encoded = payload::lp_payload(&id, &pool_id, shares);
-    let (got_pool_id, got_shares) =
-        payload::decode_lp(&encoded).expect("decode_lp should succeed");
+    let (got_pool_id, got_shares) = payload::decode_lp(&encoded).expect("decode_lp should succeed");
 
     assert_eq!(got_pool_id, pool_id);
     assert_eq!(got_shares, shares);
@@ -112,8 +111,7 @@ fn lp_payload_round_trip_max_shares() {
     let shares = u128::MAX;
 
     let encoded = payload::lp_payload(&id, &pool_id, shares);
-    let (got_pool_id, got_shares) =
-        payload::decode_lp(&encoded).expect("decode_lp max shares");
+    let (got_pool_id, got_shares) = payload::decode_lp(&encoded).expect("decode_lp max shares");
 
     assert_eq!(got_pool_id, pool_id);
     assert_eq!(got_shares, shares);
@@ -125,13 +123,20 @@ fn lp_payload_encoded_length_is_80_bytes() {
     let pool_id = ObjectId([0u8; 32]);
     let encoded = payload::lp_payload(&id, &pool_id, 0);
     // 32 (id) + 32 (pool_id) + 16 (shares u128) = 80
-    assert_eq!(encoded.len(), 80, "LpPosition payload must be exactly 80 bytes");
+    assert_eq!(
+        encoded.len(),
+        80,
+        "LpPosition payload must be exactly 80 bytes"
+    );
 }
 
 #[test]
 fn decode_lp_rejects_short_buffer() {
     let short = vec![0u8; 40];
-    assert!(payload::decode_lp(&short).is_none(), "short buffer should fail");
+    assert!(
+        payload::decode_lp(&short).is_none(),
+        "short buffer should fail"
+    );
 }
 
 // ─── 3. ParamCodec for ConstantProductParams ──────────────────────────────────
@@ -186,18 +191,24 @@ fn constant_product_params_decode_rejects_empty() {
 #[test]
 fn create_pool_initial_lp_matches_sqrt() {
     let cases: &[(u128, u128)] = &[
-        (400, 900),     // sqrt(360_000) = 600
-        (100, 200),     // sqrt(20_000) = 141
-        (1, 1),         // sqrt(1) = 1
+        (400, 900),             // sqrt(360_000) = 600
+        (100, 200),             // sqrt(20_000) = 141
+        (1, 1),                 // sqrt(1) = 1
         (1_000_000, 1_000_000), // sqrt(1e12) = 1_000_000
-        (1234, 5678),   // arbitrary
+        (1234, 5678),           // arbitrary
     ];
 
     for &(a, b) in cases {
         let (taken_a, taken_b, lp_minted) =
             ConstantProduct::add_liquidity(0, 0, a, b, 0).expect("add_liquidity should succeed");
-        assert_eq!(taken_a, a, "all of coin_a should be taken on initial deposit");
-        assert_eq!(taken_b, b, "all of coin_b should be taken on initial deposit");
+        assert_eq!(
+            taken_a, a,
+            "all of coin_a should be taken on initial deposit"
+        );
+        assert_eq!(
+            taken_b, b,
+            "all of coin_b should be taken on initial deposit"
+        );
         let expected_lp = integer_sqrt(a.checked_mul(b).expect("no overflow in test"));
         assert_eq!(
             lp_minted, expected_lp,
@@ -220,11 +231,16 @@ fn pool_error_display_variants() {
     use bloom_petal_dex_pool::PoolError;
 
     assert_eq!(PoolError::SlippageExceeded.to_string(), "slippage exceeded");
-    assert_eq!(PoolError::InsufficientLiquidity.to_string(), "insufficient liquidity");
+    assert_eq!(
+        PoolError::InsufficientLiquidity.to_string(),
+        "insufficient liquidity"
+    );
     assert_eq!(PoolError::WrongPool.to_string(), "wrong pool");
-    assert!(PoolError::MathFailed(bloom_dex_math::MathError::Overflow)
-        .to_string()
-        .contains("overflow"));
+    assert!(
+        PoolError::MathFailed(bloom_dex_math::MathError::Overflow)
+            .to_string()
+            .contains("overflow")
+    );
 }
 
 // ─── 6. PoolError From<MathError> ────────────────────────────────────────────
@@ -234,5 +250,8 @@ fn pool_error_from_math_error() {
     use bloom_petal_dex_pool::PoolError;
 
     let e: PoolError = bloom_dex_math::MathError::ZeroReserves.into();
-    assert!(matches!(e, PoolError::MathFailed(bloom_dex_math::MathError::ZeroReserves)));
+    assert!(matches!(
+        e,
+        PoolError::MathFailed(bloom_dex_math::MathError::ZeroReserves)
+    ));
 }

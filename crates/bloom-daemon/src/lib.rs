@@ -417,8 +417,7 @@ impl Daemon {
             NameRegistry::open(petals_root.join("registry"))
                 .map_err(|e| DaemonError::Audit(format!("petals registry: {e}")))?,
         );
-        let petal_vm =
-            PetalVm::new().map_err(|e| DaemonError::Audit(format!("petals vm: {e}")))?;
+        let petal_vm = PetalVm::new().map_err(|e| DaemonError::Audit(format!("petals vm: {e}")))?;
         let petals = PetalRunner::new(petal_store.clone(), petal_registry.clone(), petal_vm);
         debug!(root = %petals_root.display(), "daemon.petals_initialised");
 

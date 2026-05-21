@@ -157,8 +157,8 @@ pub mod cap {
     /// revoke cap private.
     pub fn new<T>(_signer: &Signer) -> (Cap<T>, RevokeCap<T>) {
         // Encode an "Open" Cap<T> payload + RevokeCap<T> payload.
-        let cap_handle = create_cap::<T>(INNER_KIND_OPEN, 0, false)
-            .expect("host: failed to create Cap<T>");
+        let cap_handle =
+            create_cap::<T>(INNER_KIND_OPEN, 0, false).expect("host: failed to create Cap<T>");
         let rev_handle = create_revoke_cap::<T>().expect("host: failed to create RevokeCap<T>");
 
         (
@@ -226,7 +226,12 @@ pub mod cap {
     /// `true` iff the cap currently honours auth requests at
     /// `current_block`.
     pub fn is_active<T>(cap: &Cap<T>, current_block: u64) -> bool {
-        super::is_active_logic(cap.inner_kind, cap.expires_at_block, cap.revoked, current_block)
+        super::is_active_logic(
+            cap.inner_kind,
+            cap.expires_at_block,
+            cap.revoked,
+            current_block,
+        )
     }
 
     // -----------------------------------------------------------------
@@ -287,8 +292,8 @@ pub mod cap {
     /// Decode a canonical `Cap<T>` payload. Returns `(inner_kind,
     /// expires_at_block, revoked)`.
     #[allow(dead_code)] // exercised on the chain-side; not called from
-                       // this petal's hot path yet (the user's `&mut
-                       // Cap<T>` already holds the decoded fields).
+    // this petal's hot path yet (the user's `&mut
+    // Cap<T>` already holds the decoded fields).
     fn decode_cap_payload(buf: &[u8]) -> Option<(u8, u64, bool)> {
         let mut r = ArgReader::new(buf);
         let kind = r.read_u8().ok()?;
@@ -325,7 +330,6 @@ pub mod cap {
         let payload = encode_cap_payload(cap.inner_kind, cap.expires_at_block, cap.revoked);
         let _ = host::object_mutate(cap.handle, &payload);
     }
-
 }
 
 // The `#[bloom::petal]` macro re-emits the module body unchanged

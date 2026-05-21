@@ -23,13 +23,11 @@ use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
 use bloom_objects::AccessMode;
 use bloom_script::{
-    ArgDeclStub, Arg, Command, ExpectedVersion, FunctionDeclStub, MoveCmd, PetalManifestStub,
+    Arg, ArgDeclStub, Command, ExpectedVersion, FunctionDeclStub, MoveCmd, PetalManifestStub,
     PetalRef, PqSignature, PtbTx, UseRef, encode_ptb,
 };
 
-use bloom_petal_it::harness::{
-    addr, build_state, genesis_coin_id, wat_to_wasm,
-};
+use bloom_petal_it::harness::{addr, build_state, genesis_coin_id, wat_to_wasm};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -43,20 +41,18 @@ fn apply_transfer(state: &mut State, sender: Address, to: Address, amount: u128)
         nonce: 0,
         max_fuel: 1_000,
         fee_per_unit: 0,
-        kind: TxKind::Transfer { to, amount_loom: amount },
+        kind: TxKind::Transfer {
+            to,
+            amount_loom: amount,
+        },
         pubkey: PubKeyBytes(vec![0u8; 32]),
         sig: SigBytes(vec![0u8; 64]),
     };
-    let out = ChainPetalExecutor.execute_tx(
-        &tx,
-        state,
-        1,
-        0,
-        addr(0xFF),
-        Hash32([0u8; 32]),
-    );
+    let out = ChainPetalExecutor.execute_tx(&tx, state, 1, 0, addr(0xFF), Hash32([0u8; 32]));
     assert!(out.success, "Transfer must succeed");
-    state.apply(out.write_set.unwrap()).expect("apply must not fail");
+    state
+        .apply(out.write_set.unwrap())
+        .expect("apply must not fail");
 }
 
 /// WAT petal: takes a coin as Arg::Object (Mutable), returns its id.
@@ -118,7 +114,10 @@ fn apply_ptb_split_transfer(
         commands: vec![
             // cmd 0: load alice's coin → slot 0 = alice_coin_id
             Command::Move(MoveCmd {
-                petal: PetalRef { path: String::new(), hash: Some(petal_hash) },
+                petal: PetalRef {
+                    path: String::new(),
+                    hash: Some(petal_hash),
+                },
                 function: "load_coin".to_string(),
                 type_args: vec![],
                 args: vec![Arg::Object {
@@ -129,12 +128,18 @@ fn apply_ptb_split_transfer(
             }),
             // cmd 1: SplitCoins(alice_coin, [amount])
             Command::SplitCoins {
-                src: UseRef { cmd_idx: 0, ret_idx: 0 },
+                src: UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                },
                 amounts: vec![amount],
             },
             // cmd 2: TransferObjects([split], bob)
             Command::TransferObjects {
-                uses: vec![UseRef { cmd_idx: 1, ret_idx: 0 }],
+                uses: vec![UseRef {
+                    cmd_idx: 1,
+                    ret_idx: 0,
+                }],
                 owner: bloom_objects::Owner::Address(bob.0),
             },
         ],
@@ -171,7 +176,9 @@ fn apply_ptb_split_transfer(
         "PTB must succeed; revert: {}",
         String::from_utf8_lossy(&out.return_data)
     );
-    state.apply(out.write_set.unwrap()).expect("apply must not fail");
+    state
+        .apply(out.write_set.unwrap())
+        .expect("apply must not fail");
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +197,7 @@ fn apply_ptb_split_transfer(
 #[test]
 fn determinism_same_tx_sequence_same_state_root() {
     let alice = addr(0xA1);
-    let bob   = addr(0xB2);
+    let bob = addr(0xB2);
 
     // We need to insert the WAT petal into each state independently.
     // The petal hash is content-addressed, so the same WAT bytes produce
@@ -248,7 +255,7 @@ fn determinism_same_tx_sequence_same_state_root() {
 #[test]
 fn determinism_5_transfers_same_state_root() {
     let alice = addr(0xA1);
-    let bob   = addr(0xB2);
+    let bob = addr(0xB2);
 
     let amounts = [100u128, 50, 200, 75, 25];
 
@@ -278,14 +285,14 @@ fn determinism_5_transfers_same_state_root() {
 
 #[test]
 fn determinism_3_address_exchange_same_state_root() {
-    let alice   = addr(0xA1);
-    let bob     = addr(0xB2);
+    let alice = addr(0xA1);
+    let bob = addr(0xB2);
     let charlie = addr(0xC3);
 
     let apply_sequence = || {
         let mut state = build_state(&[(alice, 5_000), (bob, 3_000), (charlie, 2_000)]);
-        apply_transfer(&mut state, alice, bob,     500);
-        apply_transfer(&mut state, bob,   charlie, 200);
+        apply_transfer(&mut state, alice, bob, 500);
+        apply_transfer(&mut state, bob, charlie, 200);
         apply_transfer(&mut state, charlie, alice, 100);
         apply_transfer(&mut state, alice, charlie, 300);
         state.state_root()

@@ -12,10 +12,10 @@ use std::collections::HashMap;
 
 use bloom_chain_types::types::Hash32;
 use bloom_dex_math::{ConstantProduct, ConstantProductParams, SwapStrategy};
-use bloom_objects::{AccessMode, Owner, OwnershipIndexKey, OWNER_KIND_ADDRESS};
+use bloom_objects::{AccessMode, OWNER_KIND_ADDRESS, Owner, OwnershipIndexKey};
 use bloom_petal_fungible::ops::type_tag_coin_loom;
 use bloom_script::{
-    ArgDeclStub, Arg, Command, ExpectedVersion, FunctionDeclStub, MoveCmd, PetalManifestStub,
+    Arg, ArgDeclStub, Command, ExpectedVersion, FunctionDeclStub, MoveCmd, PetalManifestStub,
     PetalRef, PqSignature, PtbTx, UseRef,
 };
 
@@ -61,7 +61,7 @@ fn apply_swap_matches_hand_calc() {
 #[test]
 fn ptb_single_hop_swap_shape() {
     let alice = addr(0xA1);
-    let bob   = addr(0xB2);
+    let bob = addr(0xB2);
 
     let mut state = build_state(&[(alice, 1000)]);
     let alice_coin_id = genesis_coin_id(alice, 0);
@@ -112,7 +112,10 @@ fn ptb_single_hop_swap_shape() {
         commands: vec![
             // cmd 0: load alice's coin into borrow table; returns coin id in slot 0
             Command::Move(MoveCmd {
-                petal: PetalRef { path: String::new(), hash: Some(petal_hash) },
+                petal: PetalRef {
+                    path: String::new(),
+                    hash: Some(petal_hash),
+                },
                 function: "load_coin".to_string(),
                 type_args: vec![],
                 args: vec![Arg::Object {
@@ -123,12 +126,18 @@ fn ptb_single_hop_swap_shape() {
             }),
             // cmd 1: SplitCoins(alice_coin_ref, [90]) — simulates swap output
             Command::SplitCoins {
-                src: UseRef { cmd_idx: 0, ret_idx: 0 },
+                src: UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                },
                 amounts: vec![90],
             },
             // cmd 2: TransferObjects([split_result], bob) — deliver to recipient
             Command::TransferObjects {
-                uses: vec![UseRef { cmd_idx: 1, ret_idx: 0 }],
+                uses: vec![UseRef {
+                    cmd_idx: 1,
+                    ret_idx: 0,
+                }],
                 owner: Owner::Address(bob.0),
             },
         ],
@@ -147,15 +156,24 @@ fn ptb_single_hop_swap_shape() {
     );
 
     // Alice's coin debited by 90 (the simulated swap amount).
-    let alice_coin = state.get_object(&alice_coin_id).expect("alice coin must exist");
+    let alice_coin = state
+        .get_object(&alice_coin_id)
+        .expect("alice coin must exist");
     let alice_val = ptb_decode_coin_value(&alice_coin.payload);
     assert_eq!(alice_val, 910, "alice must have Coin<LOOM>(910) after swap");
 
     // Bob receives the 90-token split.
-    let bob_okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: bob.0 };
-    let bob_owned = state.get_ownership(&bob_okey).expect("bob ownership must exist");
+    let bob_okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: bob.0,
+    };
+    let bob_owned = state
+        .get_ownership(&bob_okey)
+        .expect("bob ownership must exist");
     assert_eq!(bob_owned.len(), 1, "bob must own exactly one coin");
-    let bob_coin = state.get_object(&bob_owned[0]).expect("bob coin must exist");
+    let bob_coin = state
+        .get_object(&bob_owned[0])
+        .expect("bob coin must exist");
     let bob_val = ptb_decode_coin_value(&bob_coin.payload);
     assert_eq!(bob_val, 90, "bob must have Coin<LOOM>(90)");
     assert_eq!(bob_coin.owner, Owner::Address(bob.0));
@@ -182,7 +200,10 @@ fn apply_swap_zero_fee_correctness() {
     // k invariant: k_after >= k_before
     let k_before = 500u128 * 2000;
     let k_after = new_ri * new_ro;
-    assert!(k_after >= k_before, "k must not decrease: before={k_before} after={k_after}");
+    assert!(
+        k_after >= k_before,
+        "k must not decrease: before={k_before} after={k_after}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -234,7 +255,10 @@ fn cpmm_version_call_uses_real_manifest_via_wasm_section() {
     let ptb = PtbTx {
         signers: vec![alice.0],
         commands: vec![Command::Move(MoveCmd {
-            petal: PetalRef { path: String::new(), hash: Some(petal_hash) },
+            petal: PetalRef {
+                path: String::new(),
+                hash: Some(petal_hash),
+            },
             function: "version".to_string(),
             type_args: vec![],
             args: vec![],
@@ -284,7 +308,10 @@ fn smoke_ptb_log_emit_succeeds() {
     let ptb = PtbTx {
         signers: vec![alice.0],
         commands: vec![Command::Move(MoveCmd {
-            petal: PetalRef { path: String::new(), hash: Some(petal_hash) },
+            petal: PetalRef {
+                path: String::new(),
+                hash: Some(petal_hash),
+            },
             function: "emit".to_string(),
             type_args: vec![],
             args: vec![],

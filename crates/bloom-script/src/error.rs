@@ -4,8 +4,8 @@
 //! (steps 7–10) maps to a distinct `PtbError` variant so receipts can
 //! pinpoint the failure cause without inspecting logs.
 
-use bloom_objects::{AccessMode, CodecError, ObjectId};
 use bloom_chain_types::Hash32;
+use bloom_objects::{AccessMode, CodecError, ObjectId};
 use thiserror::Error;
 
 /// Errors returned by the PTB validator and executor.

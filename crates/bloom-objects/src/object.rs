@@ -3,8 +3,8 @@
 use bloom_chain_types::Address;
 
 use crate::codec::{
-    self, CodecError, read_bytes, read_bytes32, read_u64_be, read_u8, write_bytes, write_bytes32,
-    write_u64_be, write_u8,
+    self, CodecError, read_bytes, read_bytes32, read_u8, read_u64_be, write_bytes, write_bytes32,
+    write_u8, write_u64_be,
 };
 use crate::id::ObjectId;
 use crate::type_tag::TypeTag;

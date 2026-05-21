@@ -16,14 +16,14 @@
 use std::sync::Arc;
 
 use bloom_chain_consensus::{signer::Signer, validator_set::ValidatorSet};
-use bloom_chain_node::consensus_driver::{validate_block_for_apply, XdsaSigner, XdsaVerifier};
+use bloom_chain_node::consensus_driver::{XdsaSigner, XdsaVerifier, validate_block_for_apply};
 use bloom_chain_types::{
     block::Block,
     tx::{Tx, TxKind},
     types::{Address, Hash32, PubKeyBytes, SigBytes},
 };
 use bloom_test_util::{
-    make_validator_set_signed, make_validator_with_keypair, BlockBuilder, TestValidator,
+    BlockBuilder, TestValidator, make_validator_set_signed, make_validator_with_keypair,
 };
 
 /// Build a block with computed txs_root and validator_set_hash plus a

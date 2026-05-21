@@ -132,14 +132,12 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
     for (cmd_idx, cmd) in tx.commands.iter().enumerate() {
         match cmd {
             Command::Move(m) => {
-                let hash = m
-                    .petal
-                    .hash
-                    .ok_or_else(|| PtbError::PetalNotPinned {
-                        path: m.petal.path.clone(),
-                    })?;
-                let manifest =
-                    manifests.get(&hash.0).ok_or(PtbError::PetalNotFound { hash })?;
+                let hash = m.petal.hash.ok_or_else(|| PtbError::PetalNotPinned {
+                    path: m.petal.path.clone(),
+                })?;
+                let manifest = manifests
+                    .get(&hash.0)
+                    .ok_or(PtbError::PetalNotFound { hash })?;
                 // Pre-load every Object arg for both shape-check and
                 // type-against-manifest matching.
                 for arg in &m.args {
@@ -278,18 +276,16 @@ fn typecheck_move_cmd(
     cmd_return_types: &[Vec<Option<TypeTag>>],
     objects: &HashMap<[u8; 32], Object>,
 ) -> Result<(), PtbError> {
-    let hash = cmd
-        .petal
-        .hash
-        .ok_or_else(|| PtbError::PetalNotPinned {
-            path: cmd.petal.path.clone(),
-        })?;
-    let f: &FunctionDeclStub = manifest.function(&cmd.function).ok_or_else(|| {
-        PtbError::UnknownFunction {
-            function: cmd.function.clone(),
-            petal_hash: hash,
-        }
+    let hash = cmd.petal.hash.ok_or_else(|| PtbError::PetalNotPinned {
+        path: cmd.petal.path.clone(),
     })?;
+    let f: &FunctionDeclStub =
+        manifest
+            .function(&cmd.function)
+            .ok_or_else(|| PtbError::UnknownFunction {
+                function: cmd.function.clone(),
+                petal_hash: hash,
+            })?;
 
     if cmd.type_args.len() != f.type_params.len() {
         return Err(PtbError::TypeArgCountMismatch {
@@ -344,9 +340,7 @@ fn typecheck_move_cmd(
                     return Err(PtbError::TypeMismatch {
                         function: cmd.function.clone(),
                         arg_idx: i,
-                        reason: format!(
-                            "access mode {amode:?} does not match declared {mode:?}"
-                        ),
+                        reason: format!("access mode {amode:?} does not match declared {mode:?}"),
                     });
                 }
                 // Compare the on-chain object's type_tag against the
@@ -371,13 +365,19 @@ fn typecheck_move_cmd(
                 }
             }
             (
-                Arg::Use { cmd_idx: u_cmd, ret_idx: u_ret },
+                Arg::Use {
+                    cmd_idx: u_cmd,
+                    ret_idx: u_ret,
+                },
                 ArgDeclStub::Object {
                     ty: declared_ty, ..
                 },
             )
             | (
-                Arg::Use { cmd_idx: u_cmd, ret_idx: u_ret },
+                Arg::Use {
+                    cmd_idx: u_cmd,
+                    ret_idx: u_ret,
+                },
                 ArgDeclStub::Const(declared_ty),
             ) => {
                 let upstream = resolve_use_type(
@@ -443,12 +443,10 @@ fn resolve_use_type(
             cmd_idx: u.cmd_idx,
             ret_idx: u.ret_idx,
         })?;
-    let slot = slots
-        .get(u.ret_idx as usize)
-        .ok_or(PtbError::DanglingUse {
-            cmd_idx: u.cmd_idx,
-            ret_idx: u.ret_idx,
-        })?;
+    let slot = slots.get(u.ret_idx as usize).ok_or(PtbError::DanglingUse {
+        cmd_idx: u.cmd_idx,
+        ret_idx: u.ret_idx,
+    })?;
     Ok(slot.clone())
 }
 

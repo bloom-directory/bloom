@@ -44,9 +44,9 @@ use bloom_resource_macros as bloom;
 /// (or `()`) and the host-import error as a [`bloom_resource::PetalError`].
 pub mod ops {
     use bloom_objects::{AccessMode, ObjectId, Owner, TypeTag};
-    use bloom_resource::{PetalError, RuntimeHandle};
     use bloom_resource::abi::RetWriter;
     use bloom_resource::host;
+    use bloom_resource::{PetalError, RuntimeHandle};
 
     // -----------------------------------------------------------------
     // Payload helpers
@@ -172,9 +172,7 @@ pub mod ops {
     pub fn mint(supply_handle: RuntimeHandle, amount: u128) -> Result<RuntimeHandle, PetalError> {
         let supply_bytes = host::object_read(supply_handle)?;
         let current = decode_supply_total(&supply_bytes)?;
-        let next = current
-            .checked_add(amount)
-            .ok_or(PetalError::Custom(1))?;
+        let next = current.checked_add(amount).ok_or(PetalError::Custom(1))?;
 
         let coin_handle = host::object_create(
             &type_tag_with_arg("Coin", &type_tag_t()),
@@ -188,7 +186,10 @@ pub mod ops {
 
     /// Burn `coin` (consuming it) and decrement the running
     /// `Supply<T>` total by the coin's value.
-    pub fn burn(supply_handle: RuntimeHandle, coin_handle: RuntimeHandle) -> Result<(), PetalError> {
+    pub fn burn(
+        supply_handle: RuntimeHandle,
+        coin_handle: RuntimeHandle,
+    ) -> Result<(), PetalError> {
         let coin_bytes = host::object_read(coin_handle)?;
         let coin_value = decode_coin_value(&coin_bytes)?;
 
@@ -255,10 +256,8 @@ pub mod ops {
     /// transferred to `recipient` (spec §9.3 genesis flow).
     pub fn mint_genesis(amount: u128, recipient: [u8; 32]) -> Result<(), PetalError> {
         let loom_tag = type_tag_no_args("LOOM");
-        let coin_handle = host::object_create(
-            &type_tag_with_arg("Coin", &loom_tag),
-            &coin_payload(amount),
-        )?;
+        let coin_handle =
+            host::object_create(&type_tag_with_arg("Coin", &loom_tag), &coin_payload(amount))?;
         host::object_transfer(coin_handle, &Owner::Address(recipient))
     }
 
@@ -276,8 +275,8 @@ pub mod ops {
 /// `split`, `merge`, `transfer`, `value`, `mint_genesis`).
 #[bloom::petal(path = "/bloom/core/fungible", version = "0.1.0")]
 pub mod fungible {
-    use bloom_resource::{Capability, Coin, Signer, UID};
     use crate::ops;
+    use bloom_resource::{Capability, Coin, Signer, UID};
     use core::marker::PhantomData;
 
     /// 32-byte post-quantum chain address; the recipient of a transfer
@@ -396,8 +395,7 @@ pub mod fungible {
     /// commands. There is no separate `create_burn_cap` entry point —
     /// the `BurnCap<T>` is an inseparable part of the triple (spec §14.1).
     pub fn create_currency<T>(_signer: &Signer) -> Capability<MintCap<T>> {
-        let (mint, _burn, _supply) =
-            ops::create_currency().expect("create_currency host failure");
+        let (mint, _burn, _supply) = ops::create_currency().expect("create_currency host failure");
         Capability::from_handle(mint)
     }
 
@@ -410,11 +408,7 @@ pub mod fungible {
     /// handle, fixing the earlier hard-coded `RuntimeHandle::from_raw(0)`
     /// (spec §14.1 compliance — every mint must update the supply tracker
     /// via the real runtime handle, not a fabricated one).
-    pub fn mint<T>(
-        _cap: &Capability<MintCap<T>>,
-        supply: &mut Supply<T>,
-        amount: u128,
-    ) -> Coin<T> {
+    pub fn mint<T>(_cap: &Capability<MintCap<T>>, supply: &mut Supply<T>, amount: u128) -> Coin<T> {
         let supply_handle = supply.handle();
         let coin_handle = ops::mint(supply_handle, amount).expect("mint host failure");
         Coin::from_handle(coin_handle)
@@ -426,11 +420,7 @@ pub mod fungible {
     /// Uses `supply.handle()` to obtain the real borrow-table handle
     /// rather than fabricating `RuntimeHandle::from_raw(0)` (spec §14.1
     /// compliance).
-    pub fn burn<T>(
-        _cap: &Capability<BurnCap<T>>,
-        supply: &mut Supply<T>,
-        coin: Coin<T>,
-    ) {
+    pub fn burn<T>(_cap: &Capability<BurnCap<T>>, supply: &mut Supply<T>, coin: Coin<T>) {
         let supply_handle = supply.handle();
         ops::burn(supply_handle, coin.handle()).expect("burn host failure");
     }
@@ -472,11 +462,7 @@ pub mod fungible {
     /// caller that doesn't actually hold a valid `EpochZero` object from
     /// succeeding even if the Rust type system is satisfied by a
     /// fabricated `Capability<EpochZero>` wrapper.
-    pub fn mint_genesis(
-        epoch: &Capability<EpochZero>,
-        amount: u128,
-        recipient: Address,
-    ) {
+    pub fn mint_genesis(epoch: &Capability<EpochZero>, amount: u128, recipient: Address) {
         let epoch_tag = {
             use bloom_objects::TypeTag;
             TypeTag::Concrete {

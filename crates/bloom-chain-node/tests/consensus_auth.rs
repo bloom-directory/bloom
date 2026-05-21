@@ -203,8 +203,8 @@ fn engine_emits_signed_votes_when_signer_is_set() {
     // and assert that prevote carries a real signature (not the empty bytes
     // emitted on master).
     use bloom_chain_consensus::{
-        state_machine::{Action, Event, ProposalOrVote, TimeoutKind},
         ConsensusEngine,
+        state_machine::{Action, Event, ProposalOrVote, TimeoutKind},
     };
 
     let v = make_validator_with_keypair();

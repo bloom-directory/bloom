@@ -172,7 +172,10 @@ pub struct StorageField {
 }
 
 fn default_slot_algo() -> SlotAlgo {
-    SlotAlgo { version: 1, rule: SlotAlgo::STORAGE_V1.into() }
+    SlotAlgo {
+        version: 1,
+        rule: SlotAlgo::STORAGE_V1.into(),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,7 +217,10 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_memory_pages: 256, max_wasm_bytes: 262_144 }
+        Self {
+            max_memory_pages: 256,
+            max_wasm_bytes: 262_144,
+        }
     }
 }
 

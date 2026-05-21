@@ -33,8 +33,8 @@ use syn::spanned::Spanned;
 
 use crate::ast::{attr_is_named, ident, parse_ident_list, parse_str_value, struct_name};
 use crate::error::err_spanned;
-use bloom_petal_manifest::types::{FieldDecl, ObjectTypeDecl, TypeParamDecl, TypeParamKind};
 use crate::type_tag::TypeTagCtx;
+use bloom_petal_manifest::types::{FieldDecl, ObjectTypeDecl, TypeParamDecl, TypeParamKind};
 
 /// Output of parsing an `#[object(...)]` attribute on a struct.
 #[derive(Debug, Clone, Default)]
@@ -57,10 +57,8 @@ impl ObjectAttr {
             return Ok(Self::default());
         }
         let attr_text = format!("#[object({})]", attr);
-        let attrs: Vec<Attribute> = syn::parse::Parser::parse_str(
-            Attribute::parse_outer,
-            &attr_text,
-        )?;
+        let attrs: Vec<Attribute> =
+            syn::parse::Parser::parse_str(Attribute::parse_outer, &attr_text)?;
         let outer = attrs.into_iter().next().ok_or_else(|| {
             syn::Error::new(proc_macro2::Span::call_site(), "expected `#[object(...)]`")
         })?;
@@ -116,18 +114,14 @@ impl ObjectAttr {
 /// Parse an ability list string like `"key, store, copy"` into an
 /// `AbilitySet`. Delegates to `AbilitySet::from_str_list`.
 fn parse_abilities(raw: &str, span: &impl syn::spanned::Spanned) -> syn::Result<AbilitySet> {
-    AbilitySet::from_str_list(raw).map_err(|e| {
-        syn::Error::new(span.span(), format!("invalid ability list: {}", e))
-    })
+    AbilitySet::from_str_list(raw)
+        .map_err(|e| syn::Error::new(span.span(), format!("invalid ability list: {}", e)))
 }
 
 /// Build the [`ObjectTypeDecl`] that the petal-level macro will fold
 /// into the manifest. Used in tests and (transitively) from
 /// [`expand`].
-pub(crate) fn build_decl(
-    item: &ItemStruct,
-    attr: &ObjectAttr,
-) -> syn::Result<ObjectTypeDecl> {
+pub(crate) fn build_decl(item: &ItemStruct, attr: &ObjectAttr) -> syn::Result<ObjectTypeDecl> {
     let name = struct_name(item);
 
     // Generic-param list, in declaration order.
@@ -176,9 +170,9 @@ pub(crate) fn build_decl(
     let mut fields = Vec::<FieldDecl>::new();
     let field_iter: Box<dyn Iterator<Item = (&syn::Field, usize)>> = match &item.fields {
         Fields::Named(named) => Box::new(named.named.iter().enumerate().map(|(i, f)| (f, i))),
-        Fields::Unnamed(unnamed) => Box::new(
-            unnamed.unnamed.iter().enumerate().map(|(i, f)| (f, i)),
-        ),
+        Fields::Unnamed(unnamed) => {
+            Box::new(unnamed.unnamed.iter().enumerate().map(|(i, f)| (f, i)))
+        }
         Fields::Unit => Box::new(std::iter::empty()),
     };
     for (field, i) in field_iter {

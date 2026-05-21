@@ -38,9 +38,9 @@ use tracing::{debug, error, info, warn};
 use crate::{
     block_store::BlockStore,
     consensus_driver::{BLOCK_EMISSION, ConsensusDriver, XdsaVerifier},
-    petal_executor::ChainPetalExecutor,
     genesis::Genesis,
     mempool_persist::MempoolPersist,
+    petal_executor::ChainPetalExecutor,
     rpc::RpcServer,
     state_blob::StateBlobStore,
     state_index::StateIndex,
@@ -94,9 +94,8 @@ impl Node {
         std::fs::create_dir_all(&chain_dir)?;
 
         // ── 1. Open storage ──────────────────────────────────────────────────
-        let block_store = Arc::new(
-            BlockStore::open(&chain_dir.join("blocks")).context("open block_store")?,
-        );
+        let block_store =
+            Arc::new(BlockStore::open(&chain_dir.join("blocks")).context("open block_store")?);
         let blob_store = Arc::new(
             StateBlobStore::open(&chain_dir.join("state_blobs")).context("open state_blobs")?,
         );
@@ -105,8 +104,7 @@ impl Node {
                 .context("open state_index.sqlite")?,
         );
         let mempool_persist = Arc::new(
-            MempoolPersist::open(&chain_dir.join("mempool.sled"))
-                .context("open mempool.sled")?,
+            MempoolPersist::open(&chain_dir.join("mempool.sled")).context("open mempool.sled")?,
         );
         let receipt_store = Arc::new(
             crate::receipt_store::ReceiptStore::open(&chain_dir.join("receipts"))
@@ -146,7 +144,12 @@ impl Node {
                                 &block,
                                 BLOCK_EMISSION,
                             );
-                        debug!(height = h, txs = block.txs.len(), fuel_used, "node.startup.replayed_block");
+                        debug!(
+                            height = h,
+                            txs = block.txs.len(),
+                            fuel_used,
+                            "node.startup.replayed_block"
+                        );
                     }
                 }
             }
@@ -172,8 +175,8 @@ impl Node {
         let bb_state = Arc::clone(&shared_state);
         let bb_block_store = Arc::clone(&block_store);
         let fuel_limit_cfg = cfg.fuel_limit;
-        let block_builder: bloom_chain_consensus::engine::BlockBuilder<XdsaVerifier> =
-            Box::new(move |height: u64, mempool: &mut Mempool<XdsaVerifier>, fuel_limit: u64| {
+        let block_builder: bloom_chain_consensus::engine::BlockBuilder<XdsaVerifier> = Box::new(
+            move |height: u64, mempool: &mut Mempool<XdsaVerifier>, fuel_limit: u64| {
                 // parent_hash: previous block's header.block_hash(), or zero at height 1.
                 let parent_hash = if height <= 1 {
                     Hash32([0u8; 32])
@@ -230,15 +233,15 @@ impl Node {
                         votes: vec![],
                     },
                 }
-            });
+            },
+        );
 
         // Build the xDSA signer from the validator secret key. Without this,
         // every outbound Vote/Proposal would carry an empty `sig` and peers
         // running the post-2026-05-19 ingress check would drop them all.
-        let signer: Arc<dyn bloom_chain_consensus::signer::Signer> =
-            Arc::new(crate::consensus_driver::XdsaSigner::new(Arc::clone(
-                &cfg.validator_secret_key,
-            )));
+        let signer: Arc<dyn bloom_chain_consensus::signer::Signer> = Arc::new(
+            crate::consensus_driver::XdsaSigner::new(Arc::clone(&cfg.validator_secret_key)),
+        );
         let engine: ConsensusEngine<XdsaVerifier> = ConsensusEngine::new(
             starting_height,
             local_address,
@@ -255,11 +258,10 @@ impl Node {
         // mempool rejections surface to the caller as a JSON-RPC error instead
         // of being silently warn-logged on the validator. Without this the
         // sender has no way to tell whether the tx was actually admitted.
-        let (tx_submit_tx, mut tx_submit_rx) =
-            mpsc::channel::<(
-                bloom_chain_types::tx::Tx,
-                tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
-            )>(256);
+        let (tx_submit_tx, mut tx_submit_rx) = mpsc::channel::<(
+            bloom_chain_types::tx::Tx,
+            tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+        )>(256);
 
         // ── 5. TCP transport ──────────────────────────────────────────────────
         let listener = TcpListener::bind(&cfg.listen_addr)
@@ -304,8 +306,7 @@ impl Node {
         // arbitrarily. Caught by the 4-validator docker DEX acceptance test
         // at h=29 (val2 reached r=8+ in milliseconds while other validators
         // were still at r=0–1).
-        let (timeout_tx, mut timeout_rx) =
-            mpsc::channel::<(TimeoutKind, u64, u32)>(64);
+        let (timeout_tx, mut timeout_rx) = mpsc::channel::<(TimeoutKind, u64, u32)>(64);
         let timeout_tx = Arc::new(timeout_tx);
 
         // ── 7. RPC server ─────────────────────────────────────────────────────
@@ -387,8 +388,7 @@ impl Node {
                         // Snapshot the validator set out of the engine guard
                         // before verifying — xDSA verify is the slow path and
                         // must not block engine progress on every inbound msg.
-                        let validator_set =
-                            { driver_ev.engine.lock().validator_set.clone() };
+                        let validator_set = { driver_ev.engine.lock().validator_set.clone() };
                         if !bloom_chain_consensus::auth::verify_proposal_sig(
                             &p,
                             &validator_set,
@@ -406,7 +406,8 @@ impl Node {
                         let my_height = { driver_ev.engine.lock().height() };
                         if p.height > my_height {
                             // We're behind. Ask this peer for the gap.
-                            request_missing_blocks(&peer_pool_ev, &peer_addr, my_height, p.height).await;
+                            request_missing_blocks(&peer_pool_ev, &peer_addr, my_height, p.height)
+                                .await;
                             continue;
                         }
                         // Same-height proposal whose block we don't have? The
@@ -415,7 +416,11 @@ impl Node {
                         // that first frame. Pull it explicitly so we can vote.
                         if p.height == my_height {
                             let have = {
-                                driver_ev.engine.lock().get_registered_block(&p.block_hash).is_some()
+                                driver_ev
+                                    .engine
+                                    .lock()
+                                    .get_registered_block(&p.block_hash)
+                                    .is_some()
                             };
                             if !have {
                                 let _ = peer_pool_ev
@@ -443,8 +448,7 @@ impl Node {
                         // Snapshot the validator set out of the engine guard
                         // before verifying — xDSA verify is the slow path and
                         // must not block engine progress on every inbound msg.
-                        let validator_set =
-                            { driver_ev.engine.lock().validator_set.clone() };
+                        let validator_set = { driver_ev.engine.lock().validator_set.clone() };
                         if !bloom_chain_consensus::auth::verify_vote_sig(
                             &v,
                             &validator_set,
@@ -463,7 +467,8 @@ impl Node {
                         let my_height = { driver_ev.engine.lock().height() };
                         if v.height > my_height {
                             // We're behind. Ask this peer for the gap.
-                            request_missing_blocks(&peer_pool_ev, &peer_addr, my_height, v.height).await;
+                            request_missing_blocks(&peer_pool_ev, &peer_addr, my_height, v.height)
+                                .await;
                             continue;
                         }
                         let actions = { driver_ev.engine.lock().step(Event::ReceiveVote(v)) };
@@ -539,14 +544,15 @@ impl Node {
                         // before us seeing precommits).
                         let block_height = block.header.height;
                         let block_hash = block.header.block_hash();
-                        { driver_ev.engine.lock().register_block(block.clone()); }
+                        {
+                            driver_ev.engine.lock().register_block(block.clone());
+                        }
                         // If we stashed a proposal earlier because its block
                         // was unknown (review 2026-05-19 #3 gate), now that
                         // the block is registered the state machine can
                         // resume — emit prevote + arm Prevote timeout.
-                        let resume_actions = {
-                            driver_ev.engine.lock().try_resume_pending_proposal()
-                        };
+                        let resume_actions =
+                            { driver_ev.engine.lock().try_resume_pending_proposal() };
                         if !resume_actions.is_empty() {
                             process_actions(
                                 Arc::clone(&driver_ev),
@@ -565,9 +571,8 @@ impl Node {
                         // a single TCP reorder strands the validator until a
                         // round timeout, and chain-sync only kicks in once
                         // it has fallen multiple blocks behind.
-                        let commit_actions = {
-                            driver_ev.engine.lock().try_commit_with_block(block_hash)
-                        };
+                        let commit_actions =
+                            { driver_ev.engine.lock().try_commit_with_block(block_hash) };
                         if !commit_actions.is_empty() {
                             process_actions(
                                 Arc::clone(&driver_ev),
@@ -591,10 +596,7 @@ impl Node {
                             let my_height = { driver_ev.engine.lock().height() };
                             if block_height > my_height {
                                 let _ = peer_pool_ev
-                                    .send_to(
-                                        &peer_addr,
-                                        &Frame::BlockRequest { height: my_height },
-                                    )
+                                    .send_to(&peer_addr, &Frame::BlockRequest { height: my_height })
                                     .await;
                             }
                         }
@@ -630,10 +632,11 @@ impl Node {
                                 break;
                             }
                             info!(height = block_height, peer = %peer_addr, "sync.block_applied");
-                            { driver_ev.engine.lock().mempool.remove_included(&block.txs); }
-                            let next_actions = {
-                                driver_ev.engine.lock().enter_next_height(block_height + 1)
-                            };
+                            {
+                                driver_ev.engine.lock().mempool.remove_included(&block.txs);
+                            }
+                            let next_actions =
+                                { driver_ev.engine.lock().enter_next_height(block_height + 1) };
                             process_actions(
                                 Arc::clone(&driver_ev),
                                 Arc::clone(&peer_pool_ev),
@@ -647,7 +650,9 @@ impl Node {
                             let _ = peer_pool_ev
                                 .send_to(
                                     &peer_addr,
-                                    &Frame::BlockRequest { height: block_height + 1 },
+                                    &Frame::BlockRequest {
+                                        height: block_height + 1,
+                                    },
                                 )
                                 .await;
                             break;
@@ -766,13 +771,8 @@ impl Node {
                 .await;
                 let maybe_action = { driver_kick.engine.lock().maybe_propose() };
                 if let Some(action) = maybe_action {
-                    process_actions(
-                        driver_kick,
-                        peer_pool_kick,
-                        timeout_tx_kick,
-                        vec![action],
-                    )
-                    .await;
+                    process_actions(driver_kick, peer_pool_kick, timeout_tx_kick, vec![action])
+                        .await;
                 }
             });
         }
@@ -814,20 +814,18 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                             // register it before they receive the Proposal
                             // (otherwise their commit step can't resolve the
                             // block hash).
-                            let block_opt = {
-                                driver.engine.lock().get_registered_block(&p.block_hash)
-                            };
+                            let block_opt =
+                                { driver.engine.lock().get_registered_block(&p.block_hash) };
                             if let Some(block) = block_opt
                                 && let Err(e) =
                                     peer_pool.broadcast(&Frame::BlockResponse(block)).await
-                                {
-                                    warn!(err = %e, "block broadcast failed");
-                                }
+                            {
+                                warn!(err = %e, "block broadcast failed");
+                            }
 
                             // Now broadcast the proposal itself + deliver to self.
-                            let self_actions = {
-                                driver.engine.lock().step(Event::ReceiveProposal(p.clone()))
-                            };
+                            let self_actions =
+                                { driver.engine.lock().step(Event::ReceiveProposal(p.clone())) };
                             let f = Frame::Proposal(p);
                             if let Err(e) = peer_pool.broadcast(&f).await {
                                 warn!(err = %e, "broadcast failed");
@@ -842,9 +840,8 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                         }
                         bloom_chain_consensus::state_machine::ProposalOrVote::Vote(v) => {
                             // Deliver vote to self too.
-                            let self_actions = {
-                                driver.engine.lock().step(Event::ReceiveVote(v.clone()))
-                            };
+                            let self_actions =
+                                { driver.engine.lock().step(Event::ReceiveVote(v.clone())) };
                             let f = Frame::Vote(v);
                             if let Err(e) = peer_pool.broadcast(&f).await {
                                 warn!(err = %e, "broadcast failed");
@@ -879,7 +876,11 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                     // Drop the just-committed txs from the in-memory mempool
                     // so they aren't re-selected on the next block.
                     {
-                        driver.engine.lock().mempool.remove_included(&block_with_commit.txs);
+                        driver
+                            .engine
+                            .lock()
+                            .mempool
+                            .remove_included(&block_with_commit.txs);
                     }
                     // Enter the next height IMMEDIATELY. The state machine
                     // returns a `StartTimeout(Propose, 500ms)` we deliberately
@@ -899,9 +900,8 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                     // the trailing validator never recovers. Caught by the
                     // 4-validator docker DEX acceptance test (val2 stuck at
                     // height 13).
-                    let _drop_propose_timeout = {
-                        driver.engine.lock().enter_next_height(height + 1)
-                    };
+                    let _drop_propose_timeout =
+                        { driver.engine.lock().enter_next_height(height + 1) };
                     // After TIMEOUT_COMMIT: arm the propose timer and let the
                     // local validator (if it's the proposer for h+1 r=0) build
                     // a block. The 1s gap enforces the block cadence; inbound
@@ -925,13 +925,8 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                         .await;
                         let maybe_action = { driver_c.engine.lock().maybe_propose() };
                         if let Some(action) = maybe_action {
-                            process_actions(
-                                driver_c,
-                                peer_pool_c,
-                                timeout_tx_c,
-                                vec![action],
-                            )
-                            .await;
+                            process_actions(driver_c, peer_pool_c, timeout_tx_c, vec![action])
+                                .await;
                         }
                     });
                 }
@@ -980,7 +975,9 @@ async fn request_missing_blocks(
     const MAX_BURST: u64 = 64;
     let end = to_height.min(from_height.saturating_add(MAX_BURST));
     for h in from_height..end {
-        let _ = peer_pool.send_to(peer, &Frame::BlockRequest { height: h }).await;
+        let _ = peer_pool
+            .send_to(peer, &Frame::BlockRequest { height: h })
+            .await;
     }
 }
 

@@ -623,7 +623,9 @@ impl Item {
             // know which one came second from the attribute list order alone
             // (syn preserves source order), so attach to nonreentrant by
             // convention — the spec describes that case explicitly.
-            let span = nonreentrant_span.or(internal_span).unwrap_or(Span::call_site());
+            let span = nonreentrant_span
+                .or(internal_span)
+                .unwrap_or(Span::call_site());
             return Err(syn::Error::new(
                 span,
                 "combining #[internal] and #[nonreentrant] on the same fn is not allowed",
@@ -882,12 +884,13 @@ fn emit_contract(c: ContractInput) -> Result<TokenStream2> {
     // Validate Bytes positioning: only ever the LAST argument; never a return.
     for m in &c.methods {
         if let Some(ret) = &m.ret
-            && matches!(ret, AbiType::Bytes) {
-                return Err(syn::Error::new(
-                    m.name.span(),
-                    "`bytes` is not a valid return type (raw return payloads bypass the ABI)",
-                ));
-            }
+            && matches!(ret, AbiType::Bytes)
+        {
+            return Err(syn::Error::new(
+                m.name.span(),
+                "`bytes` is not a valid return type (raw return payloads bypass the ABI)",
+            ));
+        }
         for (i, a) in m.args.iter().enumerate() {
             if matches!(a.ty, AbiType::Bytes) && i + 1 != m.args.len() {
                 return Err(syn::Error::new(
@@ -1214,115 +1217,130 @@ fn emit_contract(c: ContractInput) -> Result<TokenStream2> {
     };
 
     // ---- Event emitters ----
-    let event_topic_consts = c.events.iter().map(|e| {
-        let topic_ident = format_ident!("{}_TOPIC", to_snake_case(&e.name.to_string()).to_uppercase());
-        let sig = event_sig(&e.name.to_string(), &e.fields);
-        let sel = selector_bytes(&sig);
-        let s0 = sel[0];
-        let s1 = sel[1];
-        let s2 = sel[2];
-        let s3 = sel[3];
-        let sig_ident = format_ident!("{}_SIG", to_snake_case(&e.name.to_string()).to_uppercase());
-        let sig_lit = sig.clone();
-        quote! {
-            #[allow(non_upper_case_globals)]
-            pub const #topic_ident: [u8; 4] = [#s0, #s1, #s2, #s3];
-            #[allow(non_upper_case_globals)]
-            pub const #sig_ident: &str = #sig_lit;
-        }
-    }).collect::<Vec<_>>();
+    let event_topic_consts = c
+        .events
+        .iter()
+        .map(|e| {
+            let topic_ident = format_ident!(
+                "{}_TOPIC",
+                to_snake_case(&e.name.to_string()).to_uppercase()
+            );
+            let sig = event_sig(&e.name.to_string(), &e.fields);
+            let sel = selector_bytes(&sig);
+            let s0 = sel[0];
+            let s1 = sel[1];
+            let s2 = sel[2];
+            let s3 = sel[3];
+            let sig_ident =
+                format_ident!("{}_SIG", to_snake_case(&e.name.to_string()).to_uppercase());
+            let sig_lit = sig.clone();
+            quote! {
+                #[allow(non_upper_case_globals)]
+                pub const #topic_ident: [u8; 4] = [#s0, #s1, #s2, #s3];
+                #[allow(non_upper_case_globals)]
+                pub const #sig_ident: &str = #sig_lit;
+            }
+        })
+        .collect::<Vec<_>>();
 
-    let event_emit_fns = c.events.iter().map(|e| {
-        let topic_ident = format_ident!("{}_TOPIC", to_snake_case(&e.name.to_string()).to_uppercase());
-        let fn_ident = format_ident!("emit_{}", to_snake_case(&e.name.to_string()));
-        let mut params = Vec::new();
-        let mut indexed_push = Vec::new();
-        let mut data_push = Vec::new();
-        for f in &e.fields {
-            let n = f.name.clone();
-            let pty = f.ty.ref_param_ty();
-            params.push(quote! { #n: #pty });
-            let enc_ident = format_ident!("enc");
-            if f.indexed {
-                // Indexed fields are encoded into a 32-byte topic each. Per
-                // the v0 chain log host import (4-byte topics only), we
-                // pre-pend them to the data blob. The first topic remains
-                // the 4-byte event-signature prefix; downstream consumers
-                // read the 32-byte indexed fields by position.
-                match f.ty {
-                    AbiType::Address | AbiType::Bytes32 => {
-                        indexed_push.push(quote! {
-                            #enc_ident.push_address(#n);
-                        });
-                    }
-                    AbiType::U256 => {
-                        indexed_push.push(quote! {
-                            #enc_ident.push_u256(*#n);
-                        });
-                    }
-                    AbiType::U128 => {
-                        indexed_push.push(quote! {
+    let event_emit_fns = c
+        .events
+        .iter()
+        .map(|e| {
+            let topic_ident = format_ident!(
+                "{}_TOPIC",
+                to_snake_case(&e.name.to_string()).to_uppercase()
+            );
+            let fn_ident = format_ident!("emit_{}", to_snake_case(&e.name.to_string()));
+            let mut params = Vec::new();
+            let mut indexed_push = Vec::new();
+            let mut data_push = Vec::new();
+            for f in &e.fields {
+                let n = f.name.clone();
+                let pty = f.ty.ref_param_ty();
+                params.push(quote! { #n: #pty });
+                let enc_ident = format_ident!("enc");
+                if f.indexed {
+                    // Indexed fields are encoded into a 32-byte topic each. Per
+                    // the v0 chain log host import (4-byte topics only), we
+                    // pre-pend them to the data blob. The first topic remains
+                    // the 4-byte event-signature prefix; downstream consumers
+                    // read the 32-byte indexed fields by position.
+                    match f.ty {
+                        AbiType::Address | AbiType::Bytes32 => {
+                            indexed_push.push(quote! {
+                                #enc_ident.push_address(#n);
+                            });
+                        }
+                        AbiType::U256 => {
+                            indexed_push.push(quote! {
+                                #enc_ident.push_u256(*#n);
+                            });
+                        }
+                        AbiType::U128 => {
+                            indexed_push.push(quote! {
                             {
                                 let __k: [u8; 32] = ::bloom_chain_abi::storage::encode_key_u128(#n);
                                 #enc_ident.push_bytes(&__k);
                             }
                         });
-                    }
-                    AbiType::U64 => {
-                        indexed_push.push(quote! {
+                        }
+                        AbiType::U64 => {
+                            indexed_push.push(quote! {
                             {
                                 let __k: [u8; 32] = ::bloom_chain_abi::storage::encode_key_u64(#n);
                                 #enc_ident.push_bytes(&__k);
                             }
                         });
-                    }
-                    AbiType::Bool => {
-                        indexed_push.push(quote! {
+                        }
+                        AbiType::Bool => {
+                            indexed_push.push(quote! {
                             {
                                 let __k: [u8; 32] = ::bloom_chain_abi::storage::encode_key_bool(#n);
                                 #enc_ident.push_bytes(&__k);
                             }
                         });
+                        }
+                        AbiType::AddressVec | AbiType::Bytes => unreachable!(),
                     }
-                    AbiType::AddressVec | AbiType::Bytes => unreachable!(),
-                }
-            } else {
-                match f.ty {
-                    AbiType::Address | AbiType::Bytes32 => {
-                        data_push.push(quote! { #enc_ident.push_address(#n); });
+                } else {
+                    match f.ty {
+                        AbiType::Address | AbiType::Bytes32 => {
+                            data_push.push(quote! { #enc_ident.push_address(#n); });
+                        }
+                        AbiType::U256 => {
+                            data_push.push(quote! { #enc_ident.push_u256(*#n); });
+                        }
+                        AbiType::U128 => {
+                            data_push.push(quote! { #enc_ident.push_u128(#n); });
+                        }
+                        AbiType::U64 => {
+                            data_push.push(quote! { #enc_ident.push_u64(#n); });
+                        }
+                        AbiType::Bool => {
+                            data_push.push(quote! { #enc_ident.push_bool(#n); });
+                        }
+                        AbiType::AddressVec => {
+                            data_push.push(quote! {
+                                #enc_ident.push_address_vec(#n)
+                                    .expect("address vec length must fit in u16");
+                            });
+                        }
+                        AbiType::Bytes => unreachable!(),
                     }
-                    AbiType::U256 => {
-                        data_push.push(quote! { #enc_ident.push_u256(*#n); });
-                    }
-                    AbiType::U128 => {
-                        data_push.push(quote! { #enc_ident.push_u128(#n); });
-                    }
-                    AbiType::U64 => {
-                        data_push.push(quote! { #enc_ident.push_u64(#n); });
-                    }
-                    AbiType::Bool => {
-                        data_push.push(quote! { #enc_ident.push_bool(#n); });
-                    }
-                    AbiType::AddressVec => {
-                        data_push.push(quote! {
-                            #enc_ident.push_address_vec(#n)
-                                .expect("address vec length must fit in u16");
-                        });
-                    }
-                    AbiType::Bytes => unreachable!(),
                 }
             }
-        }
-        quote! {
-            pub fn #fn_ident(#(#params),*) {
-                let mut enc = ::bloom_chain_abi::Encoder::new();
-                #(#indexed_push)*
-                #(#data_push)*
-                let data = enc.finish();
-                ::bloom_petal_sdk::log::emit(&[#topic_ident], &data);
+            quote! {
+                pub fn #fn_ident(#(#params),*) {
+                    let mut enc = ::bloom_chain_abi::Encoder::new();
+                    #(#indexed_push)*
+                    #(#data_push)*
+                    let data = enc.finish();
+                    ::bloom_petal_sdk::log::emit(&[#topic_ident], &data);
+                }
             }
-        }
-    }).collect::<Vec<_>>();
+        })
+        .collect::<Vec<_>>();
 
     // ---- Storage accessors ----
     let storage_fns = c.storage.iter().map(|f| {

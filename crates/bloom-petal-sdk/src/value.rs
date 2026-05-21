@@ -25,9 +25,7 @@ pub enum LoomValueError {
 impl core::fmt::Display for LoomValueError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            LoomValueError::Overflow => {
-                f.write_str("LoomValue overflow: value exceeds u128::MAX")
-            }
+            LoomValueError::Overflow => f.write_str("LoomValue overflow: value exceeds u128::MAX"),
         }
     }
 }
@@ -176,8 +174,7 @@ mod tests {
         assert_eq!(v.to_u128(), one_loom);
 
         let bytes = v.to_be_u256_bytes();
-        let round_tripped =
-            LoomValue::try_from_be_u256_bytes(&bytes).expect("1 LOOM fits in u128");
+        let round_tripped = LoomValue::try_from_be_u256_bytes(&bytes).expect("1 LOOM fits in u128");
         assert_eq!(round_tripped, v);
     }
 

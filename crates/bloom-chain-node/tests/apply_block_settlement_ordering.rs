@@ -16,14 +16,14 @@
 //! of the post-write_set balances, so transfer-to-self, recipient-is-
 //! proposer, and sender-is-proposer all reconcile to the spec numbers.
 
-use bloom_chain_node::consensus_driver::{apply_block_state_transitions, NoopExecutor};
+use bloom_chain_node::consensus_driver::{NoopExecutor, apply_block_state_transitions};
 use bloom_chain_state::{Account, State};
 use bloom_chain_types::{
     block::Block,
     tx::{Tx, TxKind},
     types::{Address, Hash32, PubKeyBytes, SigBytes},
 };
-use bloom_test_util::{make_addr, BlockBuilder};
+use bloom_test_util::{BlockBuilder, make_addr};
 
 // Block emission is intentionally zero in these tests so the proposer
 // balance after the block is purely the result of fee/refund settlement
@@ -46,17 +46,17 @@ fn make_transfer_tx(
         nonce,
         max_fuel,
         fee_per_unit,
-        kind: TxKind::Transfer { to, amount_loom: amount },
+        kind: TxKind::Transfer {
+            to,
+            amount_loom: amount,
+        },
         pubkey: PubKeyBytes(sender_pubkey_bytes),
         sig: SigBytes(vec![0u8; 64]),
     }
 }
 
 fn make_block(height: u64, proposer: Address, txs: Vec<Tx>) -> Block {
-    BlockBuilder::at(height)
-        .proposer(proposer)
-        .txs(txs)
-        .build()
+    BlockBuilder::at(height).proposer(proposer).txs(txs).build()
 }
 
 fn fund(state: &mut State, addr: Address, loom: u128) {

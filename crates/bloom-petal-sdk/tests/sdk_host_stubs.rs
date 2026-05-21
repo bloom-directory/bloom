@@ -38,11 +38,8 @@ fn public_api_shapes() {
     let _blake3_fn: fn(&[u8]) -> [u8; 32] = bloom_petal_sdk::crypto::blake3;
 
     // host module
-    let _deploy_fn: fn(
-        &[u8; 32],
-        &[u8; 32],
-        &[u8],
-    ) -> Result<[u8; 32], i32> = bloom_petal_sdk::host::deploy;
+    let _deploy_fn: fn(&[u8; 32], &[u8; 32], &[u8]) -> Result<[u8; 32], i32> =
+        bloom_petal_sdk::host::deploy;
 
     // petal module
     let _call_fn: fn(

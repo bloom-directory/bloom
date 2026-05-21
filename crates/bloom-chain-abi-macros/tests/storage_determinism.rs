@@ -6,11 +6,11 @@
 //! field shape in two contracts with explicit-tag overrides that match, and
 //! verifies the runtime slot helpers reproduce the same bytes.
 
+use bloom_chain_abi::U256;
 use bloom_chain_abi::storage::{
     encode_key_address, encode_key_address_address, encode_key_address_u256, encode_key_bool,
-    encode_key_u128, encode_key_u256, encode_key_u64, slot_mapping, slot_scalar,
+    encode_key_u64, encode_key_u128, encode_key_u256, slot_mapping, slot_scalar,
 };
-use bloom_chain_abi::U256;
 use proptest::prelude::*;
 
 #[test]

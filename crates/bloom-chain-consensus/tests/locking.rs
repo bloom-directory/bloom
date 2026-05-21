@@ -28,7 +28,7 @@ use bloom_chain_types::{
     types::{Hash32, SigBytes},
     vote::{Proposal, Vote, VoteKind},
 };
-use bloom_test_util::{make_addr, make_validator_set_fake, BlockBuilder};
+use bloom_test_util::{BlockBuilder, make_addr, make_validator_set_fake};
 
 fn make_block_with_root(height: u64, proposer: u8, root_seed: u8) -> Block {
     BlockBuilder::at(height)

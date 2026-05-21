@@ -29,9 +29,7 @@
 use std::collections::HashMap;
 
 use bloom_chain_node::consensus_driver::apply_block_state_transitions;
-use bloom_chain_node::petal_executor::{
-    ChainPetalExecutor, ChainPetalExecutorWithManifests,
-};
+use bloom_chain_node::petal_executor::{ChainPetalExecutor, ChainPetalExecutorWithManifests};
 use bloom_chain_state::{Account, State};
 use bloom_chain_types::block::Block;
 use bloom_chain_types::tx::{Tx, TxKind};
@@ -83,13 +81,7 @@ fn submit_ptb_tx_with_caps(
     max_fuel: u64,
     fee_per_unit: u64,
 ) -> (Address, Tx) {
-    submit_ptb_tx_with_caps_and_pubkey(
-        vec![0u8; 32],
-        ptb_bytes,
-        nonce,
-        max_fuel,
-        fee_per_unit,
-    )
+    submit_ptb_tx_with_caps_and_pubkey(vec![0u8; 32], ptb_bytes, nonce, max_fuel, fee_per_unit)
 }
 
 fn make_loom_coin(id: ObjectId, owner: [u8; 32], value: u128) -> Object {
@@ -242,8 +234,7 @@ fn outer_max_fuel_lower_than_inner_budget_rejected_at_envelope() {
 
     let block = make_block(1, proposer, vec![tx]);
     let exec = ChainPetalExecutorWithManifests::new(manifests);
-    let (_fuel, receipts) =
-        apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
+    let (_fuel, receipts) = apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
 
     assert_eq!(receipts.len(), 1);
     assert!(!receipts[0].success, "outer/inner cap mismatch must reject");
@@ -295,11 +286,13 @@ fn outer_fee_per_unit_lower_than_inner_price_rejected_at_envelope() {
 
     let block = make_block(1, proposer, vec![tx]);
     let exec = ChainPetalExecutorWithManifests::new(manifests);
-    let (_fuel, receipts) =
-        apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
+    let (_fuel, receipts) = apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
 
     assert_eq!(receipts.len(), 1);
-    assert!(!receipts[0].success, "outer/inner price mismatch must reject");
+    assert!(
+        !receipts[0].success,
+        "outer/inner price mismatch must reject"
+    );
     assert_eq!(receipts[0].fuel_used, 0, "no fuel consumed");
 
     // Coin and sender balance must be untouched. Nonce bumped.
@@ -358,8 +351,7 @@ fn successful_ptb_refunds_unused_gas_and_credits_proposer() {
 
     let block = make_block(1, proposer, vec![tx]);
     let exec = ChainPetalExecutorWithManifests::new(manifests);
-    let (_fuel, receipts) =
-        apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
+    let (_fuel, receipts) = apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
 
     assert_eq!(receipts.len(), 1, "exactly one receipt");
     assert!(
@@ -391,8 +383,7 @@ fn successful_ptb_refunds_unused_gas_and_credits_proposer() {
     // time on the refund write.
     let expected_bumps = if fuel_used < gas_budget { 2 } else { 1 };
     assert!(
-        coin_version(&state, &gas_payer_id).unwrap()
-            >= coin_version_before + expected_bumps,
+        coin_version(&state, &gas_payer_id).unwrap() >= coin_version_before + expected_bumps,
         "coin version must increment on every mutation \
          (before={coin_version_before}, after={}, expected ≥ +{expected_bumps})",
         coin_version(&state, &gas_payer_id).unwrap(),
@@ -465,8 +456,7 @@ fn reverted_ptb_burns_full_reservation_and_credits_proposer() {
 
     let block = make_block(1, proposer, vec![tx]);
     let exec = ChainPetalExecutorWithManifests::new(manifests);
-    let (_fuel, receipts) =
-        apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
+    let (_fuel, receipts) = apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
 
     assert_eq!(receipts.len(), 1);
     assert!(!receipts[0].success, "out-of-fuel must revert");
@@ -524,12 +514,8 @@ fn free_vm_work_attempt_is_rejected_before_execution() {
         100,
     );
     let bytes = encode_ptb(&ptb).expect("encode PTB");
-    let (sender, tx) = submit_ptb_tx_with_caps(
-        bytes,
-        1,
-        /* max_fuel    */ 1,
-        /* fee_per_unit*/ 1,
-    );
+    let (sender, tx) =
+        submit_ptb_tx_with_caps(bytes, 1, /* max_fuel    */ 1, /* fee_per_unit*/ 1);
     fund(&mut state, sender, 100);
 
     let coin_before = coin_value(&state, &gas_payer_id).unwrap();
@@ -538,8 +524,7 @@ fn free_vm_work_attempt_is_rejected_before_execution() {
 
     let block = make_block(1, proposer, vec![tx]);
     let exec = ChainPetalExecutorWithManifests::new(manifests);
-    let (fuel, receipts) =
-        apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
+    let (fuel, receipts) = apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
 
     assert_eq!(fuel, 0, "no fuel may be consumed on outer reject");
     assert_eq!(receipts.len(), 1);
@@ -588,20 +573,19 @@ fn sender_account_loom_never_moves_across_submit_ptb() {
     );
     let bytes = encode_ptb(&ptb).expect("encode PTB");
     let (sender, tx) = submit_ptb_tx_with_caps(
-        bytes,
-        1,
-        /* max_fuel    */ 200_000,
-        /* fee_per_unit*/ 3,
+        bytes, 1, /* max_fuel    */ 200_000, /* fee_per_unit*/ 3,
     );
     fund(&mut state, sender, sender_seed);
 
     let block = make_block(1, proposer, vec![tx]);
     let exec = ChainPetalExecutorWithManifests::new(manifests);
-    let (_fuel, receipts) =
-        apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
+    let (_fuel, receipts) = apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
 
-    assert!(receipts[0].success, "PTB must succeed: {}",
-        String::from_utf8_lossy(&receipts[0].return_data));
+    assert!(
+        receipts[0].success,
+        "PTB must succeed: {}",
+        String::from_utf8_lossy(&receipts[0].return_data)
+    );
     assert_eq!(
         balance(&state, &sender),
         sender_seed,
@@ -630,8 +614,7 @@ fn undecodable_ptb_rejected_at_envelope_with_nonce_bump() {
 
     let block = make_block(1, proposer, vec![tx]);
     let exec = ChainPetalExecutor;
-    let (_fuel, receipts) =
-        apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
+    let (_fuel, receipts) = apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
 
     assert_eq!(receipts.len(), 1);
     assert!(!receipts[0].success);
@@ -642,7 +625,11 @@ fn undecodable_ptb_rejected_at_envelope_with_nonce_bump() {
         "sender Account.loom must be untouched on outer-envelope decode reject"
     );
     assert_eq!(state.get_account(&sender).unwrap().nonce, 1);
-    assert_eq!(balance(&state, &proposer), 0, "proposer must not be credited");
+    assert_eq!(
+        balance(&state, &proposer),
+        0,
+        "proposer must not be credited"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -684,18 +671,12 @@ fn full_budget_consumed_zero_refund_full_burn() {
         100,
     );
     let bytes = encode_ptb(&ptb).expect("encode PTB");
-    let (sender, tx) = submit_ptb_tx_with_caps(
-        bytes,
-        1,
-        gas_budget,
-        gas_price as u64,
-    );
+    let (sender, tx) = submit_ptb_tx_with_caps(bytes, 1, gas_budget, gas_price as u64);
     fund(&mut state, sender, 1);
 
     let block = make_block(1, proposer, vec![tx]);
     let exec = ChainPetalExecutorWithManifests::new(manifests);
-    let (_fuel, receipts) =
-        apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
+    let (_fuel, receipts) = apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
 
     assert!(!receipts[0].success);
     let burn = (gas_budget as u128) * gas_price;

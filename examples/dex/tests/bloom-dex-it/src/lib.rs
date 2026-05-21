@@ -58,8 +58,8 @@ pub fn bloom_dex_bin() -> PathBuf {
 /// `bloom-dex-it`'s manifest dir, i.e. `<workspace>/target/wasm32-unknown-unknown/release`).
 pub fn locate_wasm_dir() -> Result<PathBuf> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let candidate = PathBuf::from(manifest_dir)
-        .join("../../../../target/wasm32-unknown-unknown/release");
+    let candidate =
+        PathBuf::from(manifest_dir).join("../../../../target/wasm32-unknown-unknown/release");
     let canon = candidate.canonicalize().with_context(|| {
         format!(
             "wasm dir {} not found — build DEX petals first",
@@ -82,8 +82,7 @@ pub fn locate_wasm_dir() -> Result<PathBuf> {
 /// `<home>/chain/keystore/validator.xdsa`.
 pub fn wallet_addr_for_home(home: &Path) -> Result<[u8; 32]> {
     let key_path = home.join("chain/keystore/validator.xdsa");
-    let bytes = std::fs::read(&key_path)
-        .with_context(|| format!("read {}", key_path.display()))?;
+    let bytes = std::fs::read(&key_path).with_context(|| format!("read {}", key_path.display()))?;
     let sk = bloom_keystore::xdsa::XdsaSecretKey::from_bytes(&bytes)
         .map_err(|e| anyhow!("decode xdsa key: {e}"))?;
     let pk = sk.public_key();
@@ -248,14 +247,9 @@ pub async fn query_account_loom(client: &RpcClient, addr: &[u8; 32]) -> Result<u
     s.parse::<u128>().context("parse loom u128")
 }
 
-pub async fn query_pair_reserves(
-    client: &RpcClient,
-    pair: &[u8; 32],
-) -> Result<(u128, u128)> {
-    let r0 =
-        query_storage_u128(client, pair, blake3::hash(b"pair.reserve0").as_bytes()).await?;
-    let r1 =
-        query_storage_u128(client, pair, blake3::hash(b"pair.reserve1").as_bytes()).await?;
+pub async fn query_pair_reserves(client: &RpcClient, pair: &[u8; 32]) -> Result<(u128, u128)> {
+    let r0 = query_storage_u128(client, pair, blake3::hash(b"pair.reserve0").as_bytes()).await?;
+    let r1 = query_storage_u128(client, pair, blake3::hash(b"pair.reserve1").as_bytes()).await?;
     Ok((r0, r1))
 }
 

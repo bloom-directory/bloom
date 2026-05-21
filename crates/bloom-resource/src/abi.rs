@@ -352,20 +352,12 @@ mod tests {
 
     #[test]
     fn u8_round_trip() {
-        rt_round(
-            |w, v| w.write_u8(*v),
-            |r| r.read_u8().unwrap(),
-            0xABu8,
-        );
+        rt_round(|w, v| w.write_u8(*v), |r| r.read_u8().unwrap(), 0xABu8);
     }
 
     #[test]
     fn u16_round_trip() {
-        rt_round(
-            |w, v| w.write_u16(*v),
-            |r| r.read_u16().unwrap(),
-            0xBEEFu16,
-        );
+        rt_round(|w, v| w.write_u16(*v), |r| r.read_u16().unwrap(), 0xBEEFu16);
     }
 
     #[test]
@@ -432,11 +424,7 @@ mod tests {
     #[test]
     fn handle_round_trip() {
         let h = RuntimeHandle::from_raw(7);
-        rt_round(
-            |w, v| w.write_handle(*v),
-            |r| r.read_handle().unwrap(),
-            h,
-        );
+        rt_round(|w, v| w.write_handle(*v), |r| r.read_handle().unwrap(), h);
     }
 
     #[test]
@@ -458,21 +446,13 @@ mod tests {
     #[test]
     fn bytes_round_trip() {
         let v = b"hello bloom".to_vec();
-        rt_round(
-            |w, v| w.write_bytes(v),
-            |r| r.read_bytes().unwrap(),
-            v,
-        );
+        rt_round(|w, v| w.write_bytes(v), |r| r.read_bytes().unwrap(), v);
     }
 
     #[test]
     fn bytes_empty_round_trip() {
         let v: Vec<u8> = Vec::new();
-        rt_round(
-            |w, v| w.write_bytes(v),
-            |r| r.read_bytes().unwrap(),
-            v,
-        );
+        rt_round(|w, v| w.write_bytes(v), |r| r.read_bytes().unwrap(), v);
     }
 
     #[test]
@@ -501,16 +481,8 @@ mod tests {
 
     #[test]
     fn bool_round_trip() {
-        rt_round(
-            |w, v| w.write_bool(*v),
-            |r| r.read_bool().unwrap(),
-            true,
-        );
-        rt_round(
-            |w, v| w.write_bool(*v),
-            |r| r.read_bool().unwrap(),
-            false,
-        );
+        rt_round(|w, v| w.write_bool(*v), |r| r.read_bool().unwrap(), true);
+        rt_round(|w, v| w.write_bool(*v), |r| r.read_bool().unwrap(), false);
     }
 
     #[test]
@@ -537,7 +509,10 @@ mod tests {
     fn expect_eof_detects_trailing() {
         let buf = [1u8, 2, 3];
         let r = ArgReader::new(&buf);
-        assert_eq!(r.expect_eof(), Err(AbiError::TrailingBytes { remaining: 3 }));
+        assert_eq!(
+            r.expect_eof(),
+            Err(AbiError::TrailingBytes { remaining: 3 })
+        );
     }
 
     #[test]

@@ -103,7 +103,11 @@ pub struct InitConfig {
 
 /// Sort two 32-byte addresses lexicographically; returns `(smaller, larger)`.
 pub fn sort_tokens(a: &Address, b: &Address) -> (Address, Address) {
-    if a.as_bytes() <= b.as_bytes() { (*a, *b) } else { (*b, *a) }
+    if a.as_bytes() <= b.as_bytes() {
+        (*a, *b)
+    } else {
+        (*b, *a)
+    }
 }
 
 /// `salt = blake3("dex.pair.salt:" || t0 || t1)`. `t0` and `t1` must be sorted.
@@ -221,7 +225,9 @@ pub mod factory {
         let state = State::load(ctx)?;
         let count = state.all_pairs_len.load(ctx);
         if index >= count {
-            return Err(ContractError::from_str("factory: allPairs: index out of bounds"));
+            return Err(ContractError::from_str(
+                "factory: allPairs: index out of bounds",
+            ));
         }
         state.all_pairs_at.get(ctx, &index)
     }
@@ -245,11 +251,7 @@ pub mod factory {
     // Mutating methods
     // -----------------------------------------------------------------------
 
-    pub fn create_pair(
-        ctx: &mut Context,
-        token_a: Address,
-        token_b: Address,
-    ) -> Result<Address> {
+    pub fn create_pair(ctx: &mut Context, token_a: Address, token_b: Address) -> Result<Address> {
         if token_a == token_b {
             return Err(ContractError::from_str("factory: identical addresses"));
         }
@@ -310,7 +312,9 @@ pub mod factory {
         let state = State::load(ctx)?;
         let setter = state.fee_to_setter.load(ctx);
         if ctx.sender() != setter {
-            return Err(ContractError::from_str("factory: setFeeTo: not feeToSetter"));
+            return Err(ContractError::from_str(
+                "factory: setFeeTo: not feeToSetter",
+            ));
         }
         state.fee_to.store(ctx, &addr);
         Ok(())
@@ -456,14 +460,35 @@ mod tests {
 
     #[test]
     fn factory_selectors_match_dex_v0_canonical_strings() {
-        assert_eq!(Factory::SEL_CREATE_PAIR,       blake3_selector("factory.create_pair(address,address)"));
-        assert_eq!(Factory::SEL_GET_PAIR,          blake3_selector("factory.get_pair(address,address)"));
-        assert_eq!(Factory::SEL_ALL_PAIRS,         blake3_selector("factory.all_pairs(u64)"));
-        assert_eq!(Factory::SEL_ALL_PAIRS_LENGTH,  blake3_selector("factory.all_pairs_length()"));
-        assert_eq!(Factory::SEL_FEE_TO,            blake3_selector("factory.fee_to()"));
-        assert_eq!(Factory::SEL_FEE_TO_SETTER,     blake3_selector("factory.fee_to_setter()"));
-        assert_eq!(Factory::SEL_SET_FEE_TO,        blake3_selector("factory.set_fee_to(address)"));
-        assert_eq!(Factory::SEL_SET_FEE_TO_SETTER, blake3_selector("factory.set_fee_to_setter(address)"));
+        assert_eq!(
+            Factory::SEL_CREATE_PAIR,
+            blake3_selector("factory.create_pair(address,address)")
+        );
+        assert_eq!(
+            Factory::SEL_GET_PAIR,
+            blake3_selector("factory.get_pair(address,address)")
+        );
+        assert_eq!(
+            Factory::SEL_ALL_PAIRS,
+            blake3_selector("factory.all_pairs(u64)")
+        );
+        assert_eq!(
+            Factory::SEL_ALL_PAIRS_LENGTH,
+            blake3_selector("factory.all_pairs_length()")
+        );
+        assert_eq!(Factory::SEL_FEE_TO, blake3_selector("factory.fee_to()"));
+        assert_eq!(
+            Factory::SEL_FEE_TO_SETTER,
+            blake3_selector("factory.fee_to_setter()")
+        );
+        assert_eq!(
+            Factory::SEL_SET_FEE_TO,
+            blake3_selector("factory.set_fee_to(address)")
+        );
+        assert_eq!(
+            Factory::SEL_SET_FEE_TO_SETTER,
+            blake3_selector("factory.set_fee_to_setter(address)")
+        );
     }
 
     #[test]
@@ -492,7 +517,8 @@ mod tests {
         // as `factory::PairCreated(<types>)` and hashes the full 32-byte
         // blake3. This is a deliberate change from the legacy 4-byte-prefix
         // topic-0 format (see crate-level docs).
-        let expected = *blake3::hash(b"factory::PairCreated(address,address,address,u64)").as_bytes();
+        let expected =
+            *blake3::hash(b"factory::PairCreated(address,address,address,u64)").as_bytes();
         assert_eq!(factory::PairCreated::TOPIC0, expected);
     }
 
@@ -545,13 +571,13 @@ mod tests {
 
     #[test]
     fn init_payload_is_exactly_96_bytes() {
-        let pair_hash    = [0x01u8; 32];
-        let fee_setter   = [0x03u8; 32];
+        let pair_hash = [0x01u8; 32];
+        let fee_setter = [0x03u8; 32];
         let factory_self = [0x04u8; 32];
 
         let payload = encode_init_payload(pair_hash, fee_setter, factory_self).unwrap();
         assert_eq!(payload.len(), 96, "factory init must be 96 bytes");
-        assert_eq!(&payload[0..32],  &pair_hash);
+        assert_eq!(&payload[0..32], &pair_hash);
         assert_eq!(&payload[32..64], &fee_setter);
         assert_eq!(&payload[64..96], &factory_self);
 
@@ -592,9 +618,9 @@ mod tests {
         cd.extend_from_slice(&t1);
         cd.extend_from_slice(&pair_self);
         assert_eq!(cd.len(), 96, "pair init must be 96 bytes");
-        assert_eq!(&cd[0..32],   &t0);
-        assert_eq!(&cd[32..64],  &t1);
-        assert_eq!(&cd[64..96],  &pair_self);
+        assert_eq!(&cd[0..32], &t0);
+        assert_eq!(&cd[32..64], &t1);
+        assert_eq!(&cd[64..96], &pair_self);
     }
 
     #[test]

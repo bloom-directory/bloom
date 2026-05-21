@@ -274,7 +274,12 @@ pub mod pair {
         let state = State::load(ctx)?;
         let sender = ctx.sender();
         erc20_do_transfer(ctx, &state, &sender, &to, amount)?;
-        Transfer { from: sender, to, value: amount }.emit(ctx)?;
+        Transfer {
+            from: sender,
+            to,
+            value: amount,
+        }
+        .emit(ctx)?;
         Ok(true)
     }
 
@@ -298,7 +303,12 @@ pub mod pair {
         }
 
         erc20_do_transfer(ctx, &state, &from, &to, amount)?;
-        Transfer { from, to, value: amount }.emit(ctx)?;
+        Transfer {
+            from,
+            to,
+            value: amount,
+        }
+        .emit(ctx)?;
         Ok(true)
     }
 
@@ -306,7 +316,12 @@ pub mod pair {
         let state = State::load(ctx)?;
         let owner = ctx.sender();
         state.allowances.set(ctx, &(owner, spender), &value)?;
-        Approval { owner, spender, value }.emit(ctx)?;
+        Approval {
+            owner,
+            spender,
+            value,
+        }
+        .emit(ctx)?;
         Ok(true)
     }
 
@@ -398,7 +413,9 @@ pub mod pair {
         };
 
         if liquidity.is_zero() {
-            return Err(ContractError::from_str("pair: insufficient liquidity minted"));
+            return Err(ContractError::from_str(
+                "pair: insufficient liquidity minted",
+            ));
         }
 
         erc20_mint_internal(&state, ctx, &to, liquidity)?;
@@ -410,10 +427,19 @@ pub mod pair {
             .to_u128_checked()
             .ok_or_else(|| ContractError::from_str("pair: reserve1 overflow u128"))?;
         update_reserves(ctx, &state, new_r0, new_r1);
-        Sync { reserve0: new_r0, reserve1: new_r1 }.emit(ctx)?;
+        Sync {
+            reserve0: new_r0,
+            reserve1: new_r1,
+        }
+        .emit(ctx)?;
 
         let sender = ctx.sender();
-        Mint { sender, amount0, amount1 }.emit(ctx)?;
+        Mint {
+            sender,
+            amount0,
+            amount1,
+        }
+        .emit(ctx)?;
 
         Ok(liquidity)
     }
@@ -464,10 +490,20 @@ pub mod pair {
             .to_u128_checked()
             .ok_or_else(|| ContractError::from_str("pair: post-burn reserve1 overflow"))?;
         update_reserves(ctx, &state, new_r0, new_r1);
-        Sync { reserve0: new_r0, reserve1: new_r1 }.emit(ctx)?;
+        Sync {
+            reserve0: new_r0,
+            reserve1: new_r1,
+        }
+        .emit(ctx)?;
 
         let sender = ctx.sender();
-        Burn { sender, amount0, amount1, to }.emit(ctx)?;
+        Burn {
+            sender,
+            amount0,
+            amount1,
+            to,
+        }
+        .emit(ctx)?;
 
         Ok((amount0, amount1))
     }
@@ -565,7 +601,11 @@ pub mod pair {
             .to_u128_checked()
             .ok_or_else(|| ContractError::from_str("pair: swap reserve1 overflow u128"))?;
         update_reserves(ctx, &state, new_r0, new_r1);
-        Sync { reserve0: new_r0, reserve1: new_r1 }.emit(ctx)?;
+        Sync {
+            reserve0: new_r0,
+            reserve1: new_r1,
+        }
+        .emit(ctx)?;
 
         let sender = ctx.sender();
         Swap {
@@ -623,7 +663,11 @@ pub mod pair {
             .to_u128_checked()
             .ok_or_else(|| ContractError::from_str("pair: sync reserve1 overflow"))?;
         update_reserves(ctx, &state, new_r0, new_r1);
-        Sync { reserve0: new_r0, reserve1: new_r1 }.emit(ctx)?;
+        Sync {
+            reserve0: new_r0,
+            reserve1: new_r1,
+        }
+        .emit(ctx)?;
         Ok(())
     }
 
@@ -672,7 +716,12 @@ pub mod pair {
             .ok_or_else(|| ContractError::from_str("pair: mint balance overflow"))?;
         state.balances.set(ctx, to, &new_bal)?;
 
-        Transfer { from: Address::ZERO, to: *to, value: amount }.emit(ctx)?;
+        Transfer {
+            from: Address::ZERO,
+            to: *to,
+            value: amount,
+        }
+        .emit(ctx)?;
         Ok(())
     }
 
@@ -694,7 +743,12 @@ pub mod pair {
             .ok_or_else(|| ContractError::from_str("pair: burn exceeds balance"))?;
         state.balances.set(ctx, from, &new_bal)?;
 
-        Transfer { from: *from, to: Address::ZERO, value: amount }.emit(ctx)?;
+        Transfer {
+            from: *from,
+            to: Address::ZERO,
+            value: amount,
+        }
+        .emit(ctx)?;
         Ok(())
     }
 
@@ -819,14 +873,20 @@ mod tests {
 
     #[test]
     fn pair_selectors_match_dex_v0_canonical_strings() {
-        assert_eq!(Pair::SEL_TOKEN0,       blake3_selector("pair.token0()"));
-        assert_eq!(Pair::SEL_TOKEN1,       blake3_selector("pair.token1()"));
-        assert_eq!(Pair::SEL_GET_RESERVES, blake3_selector("pair.get_reserves()"));
-        assert_eq!(Pair::SEL_MINT,         blake3_selector("pair.mint(address)"));
-        assert_eq!(Pair::SEL_BURN,         blake3_selector("pair.burn(address)"));
-        assert_eq!(Pair::SEL_SWAP,         blake3_selector("pair.swap(u256,u256,address)"));
-        assert_eq!(Pair::SEL_SKIM,         blake3_selector("pair.skim(address)"));
-        assert_eq!(Pair::SEL_SYNC,         blake3_selector("pair.sync()"));
+        assert_eq!(Pair::SEL_TOKEN0, blake3_selector("pair.token0()"));
+        assert_eq!(Pair::SEL_TOKEN1, blake3_selector("pair.token1()"));
+        assert_eq!(
+            Pair::SEL_GET_RESERVES,
+            blake3_selector("pair.get_reserves()")
+        );
+        assert_eq!(Pair::SEL_MINT, blake3_selector("pair.mint(address)"));
+        assert_eq!(Pair::SEL_BURN, blake3_selector("pair.burn(address)"));
+        assert_eq!(
+            Pair::SEL_SWAP,
+            blake3_selector("pair.swap(u256,u256,address)")
+        );
+        assert_eq!(Pair::SEL_SKIM, blake3_selector("pair.skim(address)"));
+        assert_eq!(Pair::SEL_SYNC, blake3_selector("pair.sync()"));
     }
 
     #[test]
@@ -836,9 +896,18 @@ mod tests {
         // does. The dedicated bloom-dex-erc20 tests pin the full byte-for-byte
         // parity; here we just sanity-check the entry points the pair handlers
         // are matched against.
-        assert_eq!(Erc20::SEL_TRANSFER,      blake3_selector("erc20.transfer(address,u256)"));
-        assert_eq!(Erc20::SEL_TRANSFER_FROM, blake3_selector("erc20.transfer_from(address,address,u256)"));
-        assert_eq!(Erc20::SEL_BALANCE_OF,    blake3_selector("erc20.balance_of(address)"));
+        assert_eq!(
+            Erc20::SEL_TRANSFER,
+            blake3_selector("erc20.transfer(address,u256)")
+        );
+        assert_eq!(
+            Erc20::SEL_TRANSFER_FROM,
+            blake3_selector("erc20.transfer_from(address,address,u256)")
+        );
+        assert_eq!(
+            Erc20::SEL_BALANCE_OF,
+            blake3_selector("erc20.balance_of(address)")
+        );
     }
 
     #[test]
@@ -907,11 +976,7 @@ mod tests {
     fn storage_slot_parity_allowance_mapping() {
         let owner = Address::from([0x11u8; 32]);
         let spender = Address::from([0x22u8; 32]);
-        let expected = blake3_slot(&[
-            b"erc20.allowance:",
-            owner.as_bytes(),
-            spender.as_bytes(),
-        ]);
+        let expected = blake3_slot(&[b"erc20.allowance:", owner.as_bytes(), spender.as_bytes()]);
         let m: Map<(Address, Address), U256> = Map::new(b"erc20.allowance:");
         assert_eq!(m.slot(&(owner, spender)).expect("slot ok"), expected);
     }
@@ -925,7 +990,7 @@ mod tests {
         let sa = [0x04u8; 32];
         let payload = encode_init_payload(t0, t1, sa).unwrap();
         assert_eq!(payload.len(), 96, "pair init must be 96 bytes");
-        assert_eq!(&payload[0..32],  &t0);
+        assert_eq!(&payload[0..32], &t0);
         assert_eq!(&payload[32..64], &t1);
         assert_eq!(&payload[64..96], &sa);
 
@@ -991,17 +1056,19 @@ mod tests {
     // ---- AMM math (Uniswap v2 formula) ----
 
     fn swap_out(a_in: u128, r_in: u128, r_out: u128) -> u128 {
-        let a_in_u   = U256::from_u128(a_in);
-        let r_in_u   = U256::from_u128(r_in);
-        let r_out_u  = U256::from_u128(r_out);
-        let k997     = U256::from_u64(997);
-        let k1000    = U256::from_u64(1000);
+        let a_in_u = U256::from_u128(a_in);
+        let r_in_u = U256::from_u128(r_in);
+        let r_out_u = U256::from_u128(r_out);
+        let k997 = U256::from_u64(997);
+        let k1000 = U256::from_u64(1000);
 
         let a_in_fee = a_in_u.checked_mul(k997).unwrap();
         let numerator = a_in_fee.checked_mul(r_out_u).unwrap();
         let denominator = r_in_u
-            .checked_mul(k1000).unwrap()
-            .checked_add(a_in_fee).unwrap();
+            .checked_mul(k1000)
+            .unwrap()
+            .checked_add(a_in_fee)
+            .unwrap();
         let result = numerator.checked_div(denominator).unwrap();
         result.to_u128_checked().unwrap()
     }
@@ -1020,12 +1087,18 @@ mod tests {
         let r_out_u = U256::from_u128(r_out);
 
         let adj_in = bal_in_u
-            .checked_mul(k1000).unwrap()
-            .checked_sub(a_in_u.checked_mul(k3).unwrap()).unwrap();
+            .checked_mul(k1000)
+            .unwrap()
+            .checked_sub(a_in_u.checked_mul(k3).unwrap())
+            .unwrap();
         let adj_out = bal_out_u.checked_mul(k1000).unwrap();
 
         let lhs = adj_in.checked_mul(adj_out).unwrap();
-        let rhs = r_in_u.checked_mul(r_out_u).unwrap().checked_mul(k1m).unwrap();
+        let rhs = r_in_u
+            .checked_mul(r_out_u)
+            .unwrap()
+            .checked_mul(k1m)
+            .unwrap();
         lhs >= rhs
     }
 
@@ -1062,7 +1135,7 @@ mod tests {
     #[test]
     fn swap_formula_reference_vector_3() {
         let a_in = 1_000_000_000_000_000_000u128;
-        let r_in  = 1_000_000_000_000_000_000_000u128;
+        let r_in = 1_000_000_000_000_000_000_000u128;
         let r_out = 1_000_000_000_000_000_000_000u128;
 
         let got = swap_out(a_in, r_in, r_out);
@@ -1086,7 +1159,12 @@ mod tests {
 
         let a_out_too_much = a_out + 1;
         if r_out > a_out_too_much {
-            assert!(!invariant_holds_after_swap(r_in, r_out, a_in, a_out_too_much));
+            assert!(!invariant_holds_after_swap(
+                r_in,
+                r_out,
+                a_in,
+                a_out_too_much
+            ));
         }
     }
 
@@ -1128,7 +1206,9 @@ mod tests {
     #[test]
     fn sqrt_large_number() {
         let r: u128 = 1_000_000_000_000_000_000_000;
-        let sq = U256::from_u128(r).checked_mul(U256::from_u128(r)).expect("no overflow");
+        let sq = U256::from_u128(r)
+            .checked_mul(U256::from_u128(r))
+            .expect("no overflow");
         let root = sq.sqrt();
         assert_eq!(root, U256::from_u128(r), "sqrt(1e21^2) should be 1e21");
     }

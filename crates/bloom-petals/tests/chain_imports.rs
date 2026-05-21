@@ -12,9 +12,7 @@ use bloom_chain_types::{
     Address, Hash32,
     digest::{blake3_tagged, tags},
 };
-use bloom_petals::{
-    BlockCtx, ChainCallInput, ChainCallOutput, ChainEntry, PetalError, PetalVm,
-};
+use bloom_petals::{BlockCtx, ChainCallInput, ChainCallOutput, ChainEntry, PetalError, PetalVm};
 
 mod common;
 use common::{block_at, make_address, wat};
@@ -88,9 +86,17 @@ const STATE_WRITE_READ: &str = include_str!("fixtures/state_write_read.wat");
 fn state_write_read_roundtrip() {
     let input = make_input(wat(STATE_WRITE_READ), ChainEntry::Call);
     let out = run(input).unwrap();
-    assert_eq!(out.return_data, Some(vec![0xFF; 32]), "read-back value should match written value");
+    assert_eq!(
+        out.return_data,
+        Some(vec![0xFF; 32]),
+        "read-back value should match written value"
+    );
     // Fuel used should include: first write (5000) + second write (1500) + read (100) + overhead.
-    assert!(out.fuel_used >= 5000 + 1500 + 100, "fuel should include slot surcharges; got {}", out.fuel_used);
+    assert!(
+        out.fuel_used >= 5000 + 1500 + 100,
+        "fuel should include slot surcharges; got {}",
+        out.fuel_used
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -123,7 +129,11 @@ const STATE_DELETE_THEN_READ: &str = r#"
 fn state_delete_then_read_returns_zero() {
     let input = make_input(wat(STATE_DELETE_THEN_READ), ChainEntry::Call);
     let out = run(input).unwrap();
-    assert_eq!(out.return_data, Some(vec![0u8; 32]), "deleted slot should read back as zeros");
+    assert_eq!(
+        out.return_data,
+        Some(vec![0u8; 32]),
+        "deleted slot should read back as zeros"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -151,9 +161,18 @@ fn petal_revert_reason_byte_exact_match() {
     // traps / out-of-fuel / engine errors. The executor decides whether to
     // commit the snapshot (it doesn't, for reverts).
     let out = run(input).expect("revert must surface as Ok with revert_reason set");
-    let reason = out.revert_reason.expect("revert must populate revert_reason");
-    assert_eq!(reason, b"oops!".to_vec(), "revert reason should match exactly");
-    assert!(out.return_data.is_none(), "revert path should not also set return_data");
+    let reason = out
+        .revert_reason
+        .expect("revert must populate revert_reason");
+    assert_eq!(
+        reason,
+        b"oops!".to_vec(),
+        "revert reason should match exactly"
+    );
+    assert!(
+        out.return_data.is_none(),
+        "revert path should not also set return_data"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -479,7 +498,10 @@ fn petal_call_missing_target_returns_negative_error() {
     let out = run(input).unwrap();
     let data = out.return_data.unwrap();
     let code = i32::from_le_bytes(data.try_into().unwrap());
-    assert!(code < 0, "missing target should return negative error code, got {code}");
+    assert!(
+        code < 0,
+        "missing target should return negative error code, got {code}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -578,11 +600,17 @@ fn host_deploy_address_matches_spec_formula() {
     let mut addr_arr = [0u8; 32];
     addr_arr.copy_from_slice(&deployed_addr_bytes);
     let deployed_addr = Address(addr_arr);
-    assert_eq!(deployed_addr, expected_addr, "deployed address should match §7.7 formula");
+    assert_eq!(
+        deployed_addr, expected_addr,
+        "deployed address should match §7.7 formula"
+    );
 
     // Verify the deployed account has the right code_hash in the output snapshot.
     let account = out.snapshot.get_account(&deployed_addr);
-    assert!(account.is_some(), "deployed contract should have an account");
+    assert!(
+        account.is_some(),
+        "deployed contract should have an account"
+    );
     assert_eq!(account.unwrap().code_hash, Some(child_hash));
 }
 
@@ -667,7 +695,10 @@ fn host_deploy_collision_returns_error() {
     let out = run(input).unwrap();
     let data = out.return_data.unwrap();
     let rc = i64::from_le_bytes(data.try_into().unwrap());
-    assert!(rc < 0, "collision deploy should return negative error code, got {rc}");
+    assert!(
+        rc < 0,
+        "collision deploy should return negative error code, got {rc}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -676,9 +707,9 @@ fn host_deploy_collision_returns_error() {
 
 #[test]
 fn chain_mode_rejects_any_capability() {
-    use bloom_petals::meta::{Capability, PetalMode};
-    use bloom_petals::meta::validate_mode_caps;
     use bloom_petals::PetalError;
+    use bloom_petals::meta::validate_mode_caps;
+    use bloom_petals::meta::{Capability, PetalMode};
 
     let mut caps = BTreeSet::new();
     caps.insert(Capability::VfsRead);
@@ -789,7 +820,10 @@ fn init_can_self_call_staged_code() {
     // Stage the code in the snapshot (mirrors `snap.insert_code` in
     // ChainPetalExecutor::execute_tx for TxKind::Deploy).
     let staged_hash = snap.insert_code(wasm.clone());
-    assert_eq!(staged_hash, petal_hash, "hash formula must match VM expectation");
+    assert_eq!(
+        staged_hash, petal_hash,
+        "hash formula must match VM expectation"
+    );
 
     // Stage the account so the sub-call can resolve `code_hash` from the
     // snapshot (mirrors `snap.set_account(addr, acct {code_hash:..})`).
@@ -881,8 +915,15 @@ fn code_manifest_hash_returns_some_when_anchor_set() {
     let out = run(input).unwrap();
     let data = out.return_data.expect("must return the 33-byte response");
     assert_eq!(data.len(), 33);
-    assert_eq!(data[0], 1, "discriminant must be 1 when manifest_hash is Some");
-    assert_eq!(&data[1..33], &anchor.0, "trailing bytes must equal the recorded hash");
+    assert_eq!(
+        data[0], 1,
+        "discriminant must be 1 when manifest_hash is Some"
+    );
+    assert_eq!(
+        &data[1..33],
+        &anchor.0,
+        "trailing bytes must equal the recorded hash"
+    );
 }
 
 #[test]
@@ -906,8 +947,15 @@ fn code_manifest_hash_returns_none_when_anchor_absent() {
     let out = run(input).unwrap();
     let data = out.return_data.expect("must return the 33-byte response");
     assert_eq!(data.len(), 33);
-    assert_eq!(data[0], 0, "discriminant must be 0 when manifest_hash is None");
-    assert_eq!(&data[1..33], &[0u8; 32], "trailing bytes must be zeroed when absent");
+    assert_eq!(
+        data[0], 0,
+        "discriminant must be 0 when manifest_hash is None"
+    );
+    assert_eq!(
+        &data[1..33],
+        &[0u8; 32],
+        "trailing bytes must be zeroed when absent"
+    );
 }
 
 #[test]
@@ -960,7 +1008,11 @@ fn validate_chain_wasm_accepts_new_modules() {
         ("object", "borrow", "(param i32 i32) (result i32)"),
         ("cap", "check", "(param i32 i32 i32) (result i32)"),
         ("signer", "index", "(result i32)"),
-        ("ptb", "command_output", "(param i32 i32 i32 i32) (result i32)"),
+        (
+            "ptb",
+            "command_output",
+            "(param i32 i32 i32 i32) (result i32)",
+        ),
         ("log", "emit", "(param i32 i32 i32 i32) (result i32)"),
     ];
     for (module, name, sig) in cases {

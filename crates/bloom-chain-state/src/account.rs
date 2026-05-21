@@ -146,9 +146,9 @@ impl Decode for Account {
                 Some(Hash32(arr))
             }
             _ => {
-                return Err(DecodeError::BytesInvalid(
-                    format!("invalid code_hash discriminant: {discriminant}"),
-                ));
+                return Err(DecodeError::BytesInvalid(format!(
+                    "invalid code_hash discriminant: {discriminant}"
+                )));
             }
         };
 
@@ -165,9 +165,9 @@ impl Decode for Account {
                 Some(Hash32(arr))
             }
             _ => {
-                return Err(DecodeError::BytesInvalid(
-                    format!("invalid manifest_hash discriminant: {manifest_discriminant}"),
-                ));
+                return Err(DecodeError::BytesInvalid(format!(
+                    "invalid manifest_hash discriminant: {manifest_discriminant}"
+                )));
             }
         };
 

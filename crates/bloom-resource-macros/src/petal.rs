@@ -38,12 +38,12 @@ use crate::codegen::{
 };
 use crate::error::err_spanned;
 use crate::invariant::InvariantAttr;
+use crate::object::ObjectAttr;
+use crate::type_tag::TypeTagCtx;
 use bloom_petal_manifest::types::{
     ArgDecl, ArgKind, FunctionDecl, PetalManifestV0, SCHEMA_VERSION, SemVer, TypeParamDecl,
     TypeParamKind,
 };
-use crate::object::ObjectAttr;
-use crate::type_tag::TypeTagCtx;
 
 /// Parsed `#[bloom::petal(...)]` attribute.
 #[derive(Debug, Default, Clone)]
@@ -129,10 +129,7 @@ fn parse_semver(raw: &str, span: &impl syn::spanned::Spanned) -> syn::Result<Sem
 
 /// Walk a parsed module + accumulate every kind of declaration. Used
 /// in tests and from [`expand`].
-pub(crate) fn build_manifest(
-    attr: &PetalAttr,
-    module: &ItemMod,
-) -> syn::Result<PetalManifestV0> {
+pub(crate) fn build_manifest(attr: &PetalAttr, module: &ItemMod) -> syn::Result<PetalManifestV0> {
     let (m, _) = build_manifest_with_asts(attr, module)?;
     Ok(m)
 }
@@ -260,7 +257,10 @@ fn handle_fn(f: &ItemFn, m: &mut PetalManifestV0) -> syn::Result<Option<PetalShi
 
     for (i, arg) in f.sig.inputs.iter().enumerate() {
         let FnArg::Typed(pat_ty) = arg else {
-            return Err(err_spanned(arg, "`self` arguments are not allowed in petal `pub fn`s"));
+            return Err(err_spanned(
+                arg,
+                "`self` arguments are not allowed in petal `pub fn`s",
+            ));
         };
         let arg_name = pat_to_name(&pat_ty.pat).unwrap_or_else(|| format!("_{}", i));
 
@@ -515,9 +515,8 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenS
         for item in items.iter_mut() {
             match item {
                 Item::Struct(s) => {
-                    s.attrs.retain(|a| {
-                        !attr_is_named(a, "object") && !attr_is_named(a, "capability")
-                    });
+                    s.attrs
+                        .retain(|a| !attr_is_named(a, "object") && !attr_is_named(a, "capability"));
                 }
                 Item::Fn(f) => {
                     f.attrs.retain(|a| !attr_is_named(a, "invariant"));
@@ -692,10 +691,7 @@ mod tests {
         let manifest = build_manifest(&attr, &m).unwrap();
         let f = &manifest.functions[0];
         assert_eq!(f.required_capabilities.len(), 1);
-        assert!(matches!(
-            &f.args[0].kind,
-            ArgKind::Object { .. }
-        ));
+        assert!(matches!(&f.args[0].kind, ArgKind::Object { .. }));
     }
 
     #[test]

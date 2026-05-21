@@ -6,9 +6,7 @@
 //! avoid needing to construct a `Cap<T>` from outside the petal (its
 //! fields are intentionally private to the petal body).
 
-use bloom_petal_cap::{
-    INNER_KIND_EXPIRE_AT, INNER_KIND_LOCKED, INNER_KIND_OPEN, is_active_logic,
-};
+use bloom_petal_cap::{INNER_KIND_EXPIRE_AT, INNER_KIND_LOCKED, INNER_KIND_OPEN, is_active_logic};
 
 #[test]
 fn is_active_open() {
@@ -33,7 +31,12 @@ fn is_active_expire_at_before_expiry() {
 #[test]
 fn is_active_expire_at_after_expiry() {
     assert!(!is_active_logic(INNER_KIND_EXPIRE_AT, 100, false, 100));
-    assert!(!is_active_logic(INNER_KIND_EXPIRE_AT, 100, false, 1_000_000));
+    assert!(!is_active_logic(
+        INNER_KIND_EXPIRE_AT,
+        100,
+        false,
+        1_000_000
+    ));
 }
 
 #[test]

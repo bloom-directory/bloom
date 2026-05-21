@@ -46,10 +46,8 @@ fn storage_module_emits_expected_accessors() {
     // Mapping getters/setters.
     let _: fn(&[u8; 32]) -> bloom_chain_abi::U256 = foo::abi::storage::balances::get;
     let _: fn(&[u8; 32], &bloom_chain_abi::U256) = foo::abi::storage::balances::set;
-    let _: fn((&[u8; 32], &[u8; 32])) -> bloom_chain_abi::U256 =
-        foo::abi::storage::allowances::get;
-    let _: fn((&[u8; 32], &[u8; 32]), &bloom_chain_abi::U256) =
-        foo::abi::storage::allowances::set;
+    let _: fn((&[u8; 32], &[u8; 32])) -> bloom_chain_abi::U256 = foo::abi::storage::allowances::get;
+    let _: fn((&[u8; 32], &[u8; 32]), &bloom_chain_abi::U256) = foo::abi::storage::allowances::set;
 }
 
 #[allow(dead_code)]

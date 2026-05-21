@@ -237,7 +237,9 @@ fn now_ms() -> u64 {
 
 /// A valid BLAKE3 hex hash: exactly 64 lowercase hex chars.
 pub fn is_valid_hex_hash(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[cfg(test)]
@@ -272,10 +274,14 @@ mod tests {
         let (_d, store) = store();
         let mut caps_a = BTreeSet::new();
         caps_a.insert(Capability::VfsRead);
-        let (r1, _) = store.install(b"x", Some("a"), &caps_a, PetalMode::Local).unwrap();
+        let (r1, _) = store
+            .install(b"x", Some("a"), &caps_a, PetalMode::Local)
+            .unwrap();
         let mut caps_b = BTreeSet::new();
         caps_b.insert(Capability::VfsWrite);
-        let (r2, m) = store.install(b"x", Some("b"), &caps_b, PetalMode::Local).unwrap();
+        let (r2, m) = store
+            .install(b"x", Some("b"), &caps_b, PetalMode::Local)
+            .unwrap();
         assert_eq!(r1.hash, r2.hash);
         assert!(r2.already_present);
         // Name overwritten on second install.
@@ -295,7 +301,9 @@ mod tests {
     #[test]
     fn list_hashes_filters_non_hash_entries() {
         let (d, store) = store();
-        let (r, _) = store.install(b"abc", None, &BTreeSet::new(), PetalMode::Local).unwrap();
+        let (r, _) = store
+            .install(b"abc", None, &BTreeSet::new(), PetalMode::Local)
+            .unwrap();
         // Drop a stray file that does NOT look like a hash.
         std::fs::write(d.path().join(OBJECTS).join("README"), b"junk").unwrap();
         let hashes = store.list_hashes().unwrap();
@@ -353,12 +361,17 @@ mod tests {
     #[test]
     fn uninstall_removes_object_and_meta() {
         let (_d, store) = store();
-        let (r, _) = store.install(b"toremove", None, &BTreeSet::new(), PetalMode::Local).unwrap();
+        let (r, _) = store
+            .install(b"toremove", None, &BTreeSet::new(), PetalMode::Local)
+            .unwrap();
         assert!(store.contains(&r.hash));
         let removed = store.uninstall(&r.hash).unwrap();
         assert!(removed);
         assert!(!store.contains(&r.hash));
-        assert!(matches!(store.load_meta(&r.hash), Err(PetalError::NotFound(_))));
+        assert!(matches!(
+            store.load_meta(&r.hash),
+            Err(PetalError::NotFound(_))
+        ));
     }
 
     #[test]
@@ -371,10 +384,14 @@ mod tests {
     #[test]
     fn list_hashes_by_mode_filters_correctly() {
         let (_d, store) = store();
-        let (rl, _) = store.install(b"local-bytes", None, &BTreeSet::new(), PetalMode::Local).unwrap();
+        let (rl, _) = store
+            .install(b"local-bytes", None, &BTreeSet::new(), PetalMode::Local)
+            .unwrap();
         let mut chain = BTreeSet::new();
         chain.insert(Capability::ChainRead);
-        let (rc, _) = store.install(b"onchain-bytes", None, &chain, PetalMode::Onchain).unwrap();
+        let (rc, _) = store
+            .install(b"onchain-bytes", None, &chain, PetalMode::Onchain)
+            .unwrap();
         let locals = store.list_hashes_by_mode(PetalMode::Local).unwrap();
         let onchain = store.list_hashes_by_mode(PetalMode::Onchain).unwrap();
         assert_eq!(locals, vec![rl.hash]);

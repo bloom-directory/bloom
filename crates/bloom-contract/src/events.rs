@@ -34,13 +34,19 @@ pub trait IndexedTopic {
 }
 
 impl IndexedTopic for U256 {
-    fn indexed_topic(&self) -> Topic { self.0 }
+    fn indexed_topic(&self) -> Topic {
+        self.0
+    }
 }
 impl IndexedTopic for Address {
-    fn indexed_topic(&self) -> Topic { self.0 }
+    fn indexed_topic(&self) -> Topic {
+        self.0
+    }
 }
 impl IndexedTopic for Hash32 {
-    fn indexed_topic(&self) -> Topic { self.0 }
+    fn indexed_topic(&self) -> Topic {
+        self.0
+    }
 }
 
 macro_rules! indexed_int {

@@ -218,10 +218,7 @@ async fn run_command(
         Err(trap) => {
             // WASI's `proc_exit(N)` surfaces as a trap that carries N
             // in the `I32Exit` downcast. Anything else is a real trap.
-            if let Some(exit) = trap
-                .root_cause()
-                .downcast_ref::<wasmtime_wasi::I32Exit>()
-            {
+            if let Some(exit) = trap.root_cause().downcast_ref::<wasmtime_wasi::I32Exit>() {
                 exit.0
             } else {
                 tracing::info!(target: "bloom_petals::vm", error = %trap, "petal trapped");
@@ -232,7 +229,10 @@ async fn run_command(
     }
 }
 
-fn link_wasi_for_mode(linker: &mut Linker<StoreData>, _mode: crate::meta::PetalMode) -> anyhow::Result<()> {
+fn link_wasi_for_mode(
+    linker: &mut Linker<StoreData>,
+    _mode: crate::meta::PetalMode,
+) -> anyhow::Result<()> {
     // v1 wires the full preview-1 linker for both modes. The mode
     // split is enforced by the bloom.* host-import set (no vfs_* in
     // onchain mode; no chain_read_at in local mode). A follow-up will
@@ -242,7 +242,10 @@ fn link_wasi_for_mode(linker: &mut Linker<StoreData>, _mode: crate::meta::PetalM
     Ok(())
 }
 
-fn link_imports_for_mode(linker: &mut Linker<StoreData>, mode: crate::meta::PetalMode) -> anyhow::Result<()> {
+fn link_imports_for_mode(
+    linker: &mut Linker<StoreData>,
+    mode: crate::meta::PetalMode,
+) -> anyhow::Result<()> {
     use crate::meta::PetalMode;
     match mode {
         PetalMode::Local => link_local_imports(linker),
@@ -366,10 +369,16 @@ fn link_onchain_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
                     Ok(b) => b,
                     Err(c) => return c,
                 };
-                let (chain_bytes, path_bytes) = match raw.split(|b| *b == 0).collect::<Vec<_>>().as_slice() {
-                    [c, p] => (c.to_vec(), p.to_vec()),
-                    _ => return HostError::Invalid("chain_read_at: expected <chain>\\0<path> buffer".into()).as_wasm_code(),
-                };
+                let (chain_bytes, path_bytes) =
+                    match raw.split(|b| *b == 0).collect::<Vec<_>>().as_slice() {
+                        [c, p] => (c.to_vec(), p.to_vec()),
+                        _ => {
+                            return HostError::Invalid(
+                                "chain_read_at: expected <chain>\\0<path> buffer".into(),
+                            )
+                            .as_wasm_code();
+                        }
+                    };
                 let chain = match String::from_utf8(chain_bytes) {
                     Ok(s) => s,
                     Err(_) => return HostError::Invalid("chain not utf-8".into()).as_wasm_code(),
@@ -411,9 +420,7 @@ fn log_denied(d: &StoreData, op: &str) {
 }
 
 fn get_memory(caller: &mut Caller<'_, StoreData>) -> Option<Memory> {
-    caller
-        .get_export("memory")
-        .and_then(|e| e.into_memory())
+    caller.get_export("memory").and_then(|e| e.into_memory())
 }
 
 fn read_string(
@@ -646,15 +653,28 @@ mod tests {
     #[async_trait]
     impl PetalHost for MockHost {
         async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
-            self.store.lock().get(path).cloned().ok_or_else(|| HostError::NotFound(path.into()))
+            self.store
+                .lock()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| HostError::NotFound(path.into()))
         }
         async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
             self.store.lock().insert(path.into(), bytes.to_vec());
             Ok(())
         }
-        async fn chain_read_at(&self, chain: &str, path: &str, block: u64) -> Result<Vec<u8>, HostError> {
+        async fn chain_read_at(
+            &self,
+            chain: &str,
+            path: &str,
+            block: u64,
+        ) -> Result<Vec<u8>, HostError> {
             let key = format!("@{block}:{chain}/{path}");
-            self.store.lock().get(&key).cloned().ok_or_else(|| HostError::NotFound(key))
+            self.store
+                .lock()
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| HostError::NotFound(key))
         }
     }
 
@@ -676,7 +696,10 @@ mod tests {
             .await
             .unwrap();
         // -2 as a single byte = 254.
-        assert_eq!(out.stdout, vec![(HostError::Denied("".into()).as_wasm_code() as i8) as u8]);
+        assert_eq!(
+            out.stdout,
+            vec![(HostError::Denied("".into()).as_wasm_code() as i8) as u8]
+        );
     }
 
     #[tokio::test]

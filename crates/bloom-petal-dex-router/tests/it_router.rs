@@ -42,7 +42,10 @@ fn hand_quote(reserve_in: u128, reserve_out: u128, amount_in: u128, fee_bps: u16
 
 #[test]
 fn router_error_display_slippage() {
-    let e = RouterError::SlippageExceeded { expected: 100, got: 90 };
+    let e = RouterError::SlippageExceeded {
+        expected: 100,
+        got: 90,
+    };
     let s = e.to_string();
     assert!(s.contains("slippage"), "display: {s}");
     assert!(s.contains("100"), "display: {s}");
@@ -84,8 +87,14 @@ fn router_error_from_math_error() {
 
 #[test]
 fn router_error_eq_slippage() {
-    let a = RouterError::SlippageExceeded { expected: 50, got: 40 };
-    let b = RouterError::SlippageExceeded { expected: 50, got: 40 };
+    let a = RouterError::SlippageExceeded {
+        expected: 50,
+        got: 40,
+    };
+    let b = RouterError::SlippageExceeded {
+        expected: 50,
+        got: 40,
+    };
     assert_eq!(a, b);
 }
 
@@ -105,7 +114,10 @@ fn quote_1hop_matches_cpmm_formula() {
 
     assert_eq!(got, expected, "1-hop quote mismatch");
     // Sanity: with equal reserves and small input, out < in (fee taken).
-    assert!(got < amount_in * 2, "reserve_b is 2x reserve_a; out should be ≈ 2x in minus fee");
+    assert!(
+        got < amount_in * 2,
+        "reserve_b is 2x reserve_a; out should be ≈ 2x in minus fee"
+    );
 }
 
 /// Verify 2-hop quote chains two CPMM quotes correctly.
@@ -161,8 +173,14 @@ fn quote_3hop_chains_correctly() {
     assert_eq!(out, exp_out);
     // 3 hops at 30 bps each: out ≈ amount_in * (9970/10000)^3 ≈ 0.991 * amount_in
     // Integer arithmetic makes it slightly less; verify it's in reasonable range.
-    assert!(out > amount_in * 98 / 100, "out={out} too low for 3x 30bps hops");
-    assert!(out <= amount_in, "out={out} must not exceed in (fees always taken)");
+    assert!(
+        out > amount_in * 98 / 100,
+        "out={out} too low for 3x 30bps hops"
+    );
+    assert!(
+        out <= amount_in,
+        "out={out} must not exceed in (fees always taken)"
+    );
 }
 
 /// Cross-check: 3-hop with zero fees collapses toward the CPMM no-fee formula.
@@ -198,12 +216,18 @@ fn quote_2hop_amplified_first_pool() {
     let out = ConstantProduct::quote(ra2, rb2, mid, &p2).unwrap();
 
     // First hop amplifies: mid >> amount_in (B is cheap, so you get lots of B).
-    assert!(mid > amount_in * 50, "mid={mid} should be >> amount_in={amount_in}");
+    assert!(
+        mid > amount_in * 50,
+        "mid={mid} should be >> amount_in={amount_in}"
+    );
     // Second hop with equal reserves: mid is large relative to reserve_b,
     // so there is substantial price impact; out should still be positive.
     assert!(out > 0, "out={out} must be positive");
     // out < mid because fees are taken and mid is significant relative to the pool.
-    assert!(out < mid, "out={out} must be less than mid={mid} (price impact + fee)");
+    assert!(
+        out < mid,
+        "out={out} must be less than mid={mid} (price impact + fee)"
+    );
 }
 
 // ─── 3. Coin payload codec ────────────────────────────────────────────────────
@@ -267,11 +291,11 @@ fn pool_payload_decode_compatible_with_pool_crate() {
     let params_bytes = cpmm_params(50).encode();
 
     // Encode using bloom-petal-dex-pool's canonical encoder.
-    let encoded = payload::pool_payload(&id, reserve_a, reserve_b, lp_supply, k_last, &params_bytes);
+    let encoded =
+        payload::pool_payload(&id, reserve_a, reserve_b, lp_supply, k_last, &params_bytes);
 
     // Decode using the same helpers (same dep imported into the router).
-    let (ra, rb, lps, kl, pb) =
-        payload::decode_pool(&encoded).expect("decode_pool must succeed");
+    let (ra, rb, lps, kl, pb) = payload::decode_pool(&encoded).expect("decode_pool must succeed");
 
     assert_eq!(ra, reserve_a);
     assert_eq!(rb, reserve_b);
@@ -287,7 +311,10 @@ fn pool_payload_decode_compatible_with_pool_crate() {
 #[test]
 fn pool_payload_decode_rejects_short_buffer() {
     let short = vec![0u8; 31];
-    assert!(payload::decode_pool(&short).is_none(), "short buffer must fail");
+    assert!(
+        payload::decode_pool(&short).is_none(),
+        "short buffer must fail"
+    );
 }
 
 // ─── 5. Slippage check semantics ─────────────────────────────────────────────
@@ -300,10 +327,16 @@ fn slippage_exceeded_is_correct_variant() {
     let min_out = 100u128;
 
     if amount_out < min_out {
-        let e = RouterError::SlippageExceeded { expected: min_out, got: amount_out };
+        let e = RouterError::SlippageExceeded {
+            expected: min_out,
+            got: amount_out,
+        };
         assert_eq!(
             e,
-            RouterError::SlippageExceeded { expected: 100, got: 90 }
+            RouterError::SlippageExceeded {
+                expected: 100,
+                got: 90
+            }
         );
     } else {
         panic!("test setup error");
@@ -316,7 +349,10 @@ fn slippage_at_boundary_is_not_exceeded() {
     let amount_out = 100u128;
     let min_out = 100u128;
     // amount_out >= min_out → no slippage error.
-    assert!(amount_out >= min_out, "equal amount should not trigger slippage");
+    assert!(
+        amount_out >= min_out,
+        "equal amount should not trigger slippage"
+    );
 }
 
 // ─── 6. ParamCodec integration (re-used dep) ─────────────────────────────────

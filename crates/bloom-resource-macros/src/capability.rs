@@ -33,7 +33,10 @@ impl CapabilityAttr {
         let attrs: Vec<Attribute> =
             syn::parse::Parser::parse_str(Attribute::parse_outer, &attr_text)?;
         let outer = attrs.into_iter().next().ok_or_else(|| {
-            syn::Error::new(proc_macro2::Span::call_site(), "expected `#[capability(...)]`")
+            syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "expected `#[capability(...)]`",
+            )
         })?;
         let mut out = Self::default();
         if let Meta::List(list) = &outer.meta {
@@ -60,10 +63,7 @@ impl CapabilityAttr {
 }
 
 /// Build the manifest [`CapabilityDecl`] from the user struct.
-pub(crate) fn build_decl(
-    item: &ItemStruct,
-    attr: &CapabilityAttr,
-) -> syn::Result<CapabilityDecl> {
+pub(crate) fn build_decl(item: &ItemStruct, attr: &CapabilityAttr) -> syn::Result<CapabilityDecl> {
     let name = struct_name(item);
     let mut type_params = Vec::new();
     let mut generic_names = Vec::new();
@@ -162,10 +162,7 @@ mod tests {
         let d = build_decl(&s, &a).unwrap();
         assert_eq!(d.name, "AdminCap");
         assert_eq!(d.type_params.len(), 1);
-        assert!(matches!(
-            d.type_params[0].kind,
-            TypeParamKind::Phantom
-        ));
+        assert!(matches!(d.type_params[0].kind, TypeParamKind::Phantom));
     }
 
     #[test]

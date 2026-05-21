@@ -226,9 +226,7 @@ async fn dex_v0_acceptance_end_to_end() -> Result<()> {
     }
     let expected = (4u128 * GENESIS_ALLOCATION) + (height as u128) * BLOCK_EMISSION;
     if sum_loom != expected {
-        bail!(
-            "LOOM accounting mismatch at height {height}: sum={sum_loom} expected={expected}"
-        );
+        bail!("LOOM accounting mismatch at height {height}: sum={sum_loom} expected={expected}");
     }
 
     Ok(())

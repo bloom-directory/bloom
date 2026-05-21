@@ -152,9 +152,19 @@ mod tests {
         assert_eq!(m2.hash, "abc");
         assert_eq!(m2.size, 42);
         assert_eq!(m2.name.as_deref(), Some("hello"));
-        assert!(m2.has_cap(Capability::VfsRead), "VfsRead cap should survive roundtrip");
-        assert!(!m2.has_cap(Capability::VfsWrite), "VfsWrite should not be present");
-        assert_eq!(m2.mode, PetalMode::Local, "default mode should roundtrip as Local");
+        assert!(
+            m2.has_cap(Capability::VfsRead),
+            "VfsRead cap should survive roundtrip"
+        );
+        assert!(
+            !m2.has_cap(Capability::VfsWrite),
+            "VfsWrite should not be present"
+        );
+        assert_eq!(
+            m2.mode,
+            PetalMode::Local,
+            "default mode should roundtrip as Local"
+        );
     }
 
     #[test]
@@ -168,7 +178,11 @@ mod tests {
             mode: PetalMode::Onchain,
         };
         let m2: PetalMeta = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
-        assert_eq!(m2.mode, PetalMode::Onchain, "Onchain mode should survive roundtrip");
+        assert_eq!(
+            m2.mode,
+            PetalMode::Onchain,
+            "Onchain mode should survive roundtrip"
+        );
     }
 
     #[test]
@@ -181,9 +195,18 @@ mod tests {
 
     #[test]
     fn petal_mode_serde_roundtrips_as_lowercase() {
-        assert_eq!(serde_json::to_string(&PetalMode::Local).unwrap(), "\"local\"");
-        assert_eq!(serde_json::to_string(&PetalMode::Onchain).unwrap(), "\"onchain\"");
-        assert_eq!(serde_json::to_string(&PetalMode::Chain).unwrap(), "\"chain\"");
+        assert_eq!(
+            serde_json::to_string(&PetalMode::Local).unwrap(),
+            "\"local\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PetalMode::Onchain).unwrap(),
+            "\"onchain\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PetalMode::Chain).unwrap(),
+            "\"chain\""
+        );
         let m: PetalMode = serde_json::from_str("\"local\"").unwrap();
         assert_eq!(m, PetalMode::Local);
         let m: PetalMode = serde_json::from_str("\"onchain\"").unwrap();
@@ -203,7 +226,11 @@ mod tests {
             mode: PetalMode::Chain,
         };
         let m2: PetalMeta = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
-        assert_eq!(m2.mode, PetalMode::Chain, "Chain mode should survive roundtrip");
+        assert_eq!(
+            m2.mode,
+            PetalMode::Chain,
+            "Chain mode should survive roundtrip"
+        );
     }
 
     #[test]
@@ -241,29 +268,45 @@ mod tests {
         use crate::error::PetalError;
 
         let empty = BTreeSet::new();
-        assert!(validate_mode_caps(PetalMode::Local, &empty).is_ok(), "Local + {{}} should be ok");
-        assert!(validate_mode_caps(PetalMode::Onchain, &empty).is_ok(), "Onchain + {{}} should be ok");
+        assert!(
+            validate_mode_caps(PetalMode::Local, &empty).is_ok(),
+            "Local + {{}} should be ok"
+        );
+        assert!(
+            validate_mode_caps(PetalMode::Onchain, &empty).is_ok(),
+            "Onchain + {{}} should be ok"
+        );
 
         let mut vfs_read = BTreeSet::new();
         vfs_read.insert(Capability::VfsRead);
-        assert!(validate_mode_caps(PetalMode::Local, &vfs_read).is_ok(), "Local + {{vfs.read}} should be ok");
+        assert!(
+            validate_mode_caps(PetalMode::Local, &vfs_read).is_ok(),
+            "Local + {{vfs.read}} should be ok"
+        );
         match validate_mode_caps(PetalMode::Onchain, &vfs_read) {
             Err(PetalError::ModeCapMismatch { mode, cap }) => {
                 assert_eq!(mode, PetalMode::Onchain);
                 assert_eq!(cap, "vfs.read");
             }
-            other => panic!("Onchain + {{vfs.read}} should error with ModeCapMismatch, got {other:?}"),
+            other => {
+                panic!("Onchain + {{vfs.read}} should error with ModeCapMismatch, got {other:?}")
+            }
         }
 
         let mut chain_read = BTreeSet::new();
         chain_read.insert(Capability::ChainRead);
-        assert!(validate_mode_caps(PetalMode::Onchain, &chain_read).is_ok(), "Onchain + {{chain.read}} should be ok");
+        assert!(
+            validate_mode_caps(PetalMode::Onchain, &chain_read).is_ok(),
+            "Onchain + {{chain.read}} should be ok"
+        );
         match validate_mode_caps(PetalMode::Local, &chain_read) {
             Err(PetalError::ModeCapMismatch { mode, cap }) => {
                 assert_eq!(mode, PetalMode::Local);
                 assert_eq!(cap, "chain.read");
             }
-            other => panic!("Local + {{chain.read}} should error with ModeCapMismatch, got {other:?}"),
+            other => {
+                panic!("Local + {{chain.read}} should error with ModeCapMismatch, got {other:?}")
+            }
         }
 
         // Mixed caps: BTreeSet iterates in Capability sort order
@@ -275,7 +318,10 @@ mod tests {
         match validate_mode_caps(PetalMode::Local, &mixed) {
             Err(PetalError::ModeCapMismatch { mode, cap }) => {
                 assert_eq!(mode, PetalMode::Local);
-                assert_eq!(cap, "chain.read", "Local should reject the chain.read entry");
+                assert_eq!(
+                    cap, "chain.read",
+                    "Local should reject the chain.read entry"
+                );
             }
             other => panic!("Local + mixed should error with ModeCapMismatch, got {other:?}"),
         }

@@ -59,7 +59,11 @@ pub struct ContractRef<I: ContractInterface> {
 impl<I: ContractInterface> ContractRef<I> {
     #[inline]
     pub const fn new(address: Address) -> Self {
-        Self { address, value: LoomValue::ZERO, _marker: PhantomData }
+        Self {
+            address,
+            value: LoomValue::ZERO,
+            _marker: PhantomData,
+        }
     }
 
     #[inline]
@@ -71,7 +75,11 @@ impl<I: ContractInterface> ContractRef<I> {
     /// Used to reach `#[payable]` interface methods.
     #[inline]
     pub const fn with_value(self, value: LoomValue) -> Self {
-        Self { address: self.address, value, _marker: PhantomData }
+        Self {
+            address: self.address,
+            value,
+            _marker: PhantomData,
+        }
     }
 }
 
@@ -235,15 +243,22 @@ mod tests {
     }
 
     fn method(name: &'static str, sig: &'static str) -> InterfaceMethod {
-        InterfaceMethod { name, signature: sig, selector: [0; 4] }
+        InterfaceMethod {
+            name,
+            signature: sig,
+            selector: [0; 4],
+        }
     }
 
     #[test]
     fn conformance_passes_when_args_match_under_different_domains() {
         // Interface declares `wloom.deposit()`; contract surfaces it
         // under `erc20.deposit()`. Same arg list (`()`) → conforms.
-        const IFACE: &[InterfaceMethod] =
-            &[InterfaceMethod { name: "deposit", signature: "wloom.deposit()", selector: [0; 4] }];
+        const IFACE: &[InterfaceMethod] = &[InterfaceMethod {
+            name: "deposit",
+            signature: "wloom.deposit()",
+            selector: [0; 4],
+        }];
         let locals = [local("deposit", "erc20.deposit()")];
         let r = check_conformance(IFACE, Box::leak(Box::new(locals)));
         assert_eq!(r, ConformanceResult::Ok);
@@ -263,11 +278,18 @@ mod tests {
 
     #[test]
     fn conformance_flags_missing_method() {
-        const IFACE: &[InterfaceMethod] =
-            &[InterfaceMethod { name: "transfer", signature: "erc20.transfer(address,u256)", selector: [0; 4] }];
+        const IFACE: &[InterfaceMethod] = &[InterfaceMethod {
+            name: "transfer",
+            signature: "erc20.transfer(address,u256)",
+            selector: [0; 4],
+        }];
         let locals = [local("balance_of", "erc20.balance_of(address)")];
         let r = check_conformance(IFACE, Box::leak(Box::new(locals)));
-        assert!(matches!(r, ConformanceResult::MissingMethod { method: "transfer" }), "got {:?}", r);
+        assert!(
+            matches!(r, ConformanceResult::MissingMethod { method: "transfer" }),
+            "got {:?}",
+            r
+        );
     }
 
     #[test]
@@ -275,12 +297,21 @@ mod tests {
         // Interface says transfer(address, u256); local says
         // transfer(u256, address). Names match, types disagree.
         let _ = method("ignored", "");
-        const IFACE: &[InterfaceMethod] =
-            &[InterfaceMethod { name: "transfer", signature: "erc20.transfer(address,u256)", selector: [0; 4] }];
+        const IFACE: &[InterfaceMethod] = &[InterfaceMethod {
+            name: "transfer",
+            signature: "erc20.transfer(address,u256)",
+            selector: [0; 4],
+        }];
         let locals = [local("transfer", "erc20.transfer(u256,address)")];
         let r = check_conformance(IFACE, Box::leak(Box::new(locals)));
         assert!(
-            matches!(r, ConformanceResult::ArgsMismatch { method: "transfer", .. }),
+            matches!(
+                r,
+                ConformanceResult::ArgsMismatch {
+                    method: "transfer",
+                    ..
+                }
+            ),
             "got {:?}",
             r,
         );
@@ -292,8 +323,11 @@ mod tests {
         // a `const _: () = assert_conforms(...)` block. Exercise the
         // const path here so we catch any future regression that
         // demotes the function out of `const`.
-        const IFACE: &[InterfaceMethod] =
-            &[InterfaceMethod { name: "deposit", signature: "wloom.deposit()", selector: [0; 4] }];
+        const IFACE: &[InterfaceMethod] = &[InterfaceMethod {
+            name: "deposit",
+            signature: "wloom.deposit()",
+            selector: [0; 4],
+        }];
         const LOCALS: &[SelectorEntry] = &[SelectorEntry {
             name: "deposit",
             signature: "erc20.deposit()",

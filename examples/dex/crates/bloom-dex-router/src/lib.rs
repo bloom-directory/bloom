@@ -194,10 +194,14 @@ pub fn quote(amount_a: U256, reserve_a: U256, reserve_b: U256) -> Result<U256> {
 /// / (reserveIn * 1000 + amountIn * 997)`.
 pub fn get_amount_out(amount_in: U256, reserve_in: U256, reserve_out: U256) -> Result<U256> {
     if amount_in.is_zero() {
-        return Err(ContractError::from_str("router: getAmountOut: zero amountIn"));
+        return Err(ContractError::from_str(
+            "router: getAmountOut: zero amountIn",
+        ));
     }
     if reserve_in.is_zero() || reserve_out.is_zero() {
-        return Err(ContractError::from_str("router: getAmountOut: zero reserves"));
+        return Err(ContractError::from_str(
+            "router: getAmountOut: zero reserves",
+        ));
     }
     let n997 = U256::from_u64(997);
     let n1000 = U256::from_u64(1000);
@@ -222,10 +226,14 @@ pub fn get_amount_out(amount_in: U256, reserve_in: U256, reserve_out: U256) -> R
 ///   (reserveIn * amountOut * 1000) / ((reserveOut - amountOut) * 997) + 1`.
 pub fn get_amount_in(amount_out: U256, reserve_in: U256, reserve_out: U256) -> Result<U256> {
     if amount_out.is_zero() {
-        return Err(ContractError::from_str("router: getAmountIn: zero amountOut"));
+        return Err(ContractError::from_str(
+            "router: getAmountIn: zero amountOut",
+        ));
     }
     if reserve_in.is_zero() || reserve_out.is_zero() {
-        return Err(ContractError::from_str("router: getAmountIn: zero reserves"));
+        return Err(ContractError::from_str(
+            "router: getAmountIn: zero reserves",
+        ));
     }
     if amount_out >= reserve_out {
         return Err(ContractError::from_str(
@@ -329,12 +337,7 @@ pub mod router {
     // -----------------------------------------------------------------------
 
     #[view]
-    pub fn quote(
-        _ctx: &Context,
-        amount_a: U256,
-        reserve_a: U256,
-        reserve_b: U256,
-    ) -> Result<U256> {
+    pub fn quote(_ctx: &Context, amount_a: U256, reserve_a: U256, reserve_b: U256) -> Result<U256> {
         super::quote(amount_a, reserve_a, reserve_b)
     }
 
@@ -840,9 +843,7 @@ pub mod router {
 
         internal_swap(ctx, &factory, &amounts, &path, &to)?;
 
-        let refund = msg_value
-            .checked_sub(loom_needed)
-            .unwrap_or(U256::ZERO);
+        let refund = msg_value.checked_sub(loom_needed).unwrap_or(U256::ZERO);
         if !refund.is_zero() {
             let sender = ctx.sender();
             send_loom(ctx, &sender, refund)?;
@@ -899,10 +900,7 @@ pub mod router {
         }
     }
 
-    pub(crate) fn pair_get_reserves(
-        ctx: &mut Context,
-        pair: &Address,
-    ) -> Result<(u128, u128)> {
+    pub(crate) fn pair_get_reserves(ctx: &mut Context, pair: &Address) -> Result<(u128, u128)> {
         let (r0, r1, _ts) = ctx
             .call::<Pair>(*pair)
             .get_reserves(ctx)
@@ -929,11 +927,7 @@ pub mod router {
         Ok(())
     }
 
-    pub(crate) fn pair_mint(
-        ctx: &mut Context,
-        pair: &Address,
-        to: &Address,
-    ) -> Result<U256> {
+    pub(crate) fn pair_mint(ctx: &mut Context, pair: &Address, to: &Address) -> Result<U256> {
         ctx.call::<Pair>(*pair)
             .mint(ctx, *to)
             .map_err(|_| ContractError::from_str("router: pair.mint failed"))
@@ -985,11 +979,7 @@ pub mod router {
             .map_err(|_| ContractError::from_str("router: wloom.deposit failed"))
     }
 
-    pub(crate) fn wloom_withdraw(
-        ctx: &mut Context,
-        wloom: &Address,
-        amount: U256,
-    ) -> Result<()> {
+    pub(crate) fn wloom_withdraw(ctx: &mut Context, wloom: &Address, amount: U256) -> Result<()> {
         ctx.call::<Wloom>(*wloom)
             .withdraw(ctx, amount)
             .map_err(|_| ContractError::from_str("router: wloom.withdraw failed"))
@@ -1372,15 +1362,17 @@ mod tests {
 
     #[test]
     fn compute_liquidity_amounts_insufficient_b_errs() {
-        assert!(compute_liquidity_amounts(
-            u256(100),
-            u256(300),
-            u256(0),
-            u256(250),
-            u256(1000),
-            u256(2000),
-        )
-        .is_err());
+        assert!(
+            compute_liquidity_amounts(
+                u256(100),
+                u256(300),
+                u256(0),
+                u256(250),
+                u256(1000),
+                u256(2000),
+            )
+            .is_err()
+        );
     }
 
     // --- Selector parity — pins macro-emitted selectors to canonical strings.
@@ -1394,10 +1386,7 @@ mod tests {
 
     #[test]
     fn router_selectors_match_canonical_strings() {
-        assert_eq!(
-            Router::SEL_QUOTE,
-            blake3_4("router.quote(u256,u256,u256)")
-        );
+        assert_eq!(Router::SEL_QUOTE, blake3_4("router.quote(u256,u256,u256)"));
         assert_eq!(
             Router::SEL_GET_AMOUNT_OUT,
             blake3_4("router.get_amount_out(u256,u256,u256)")

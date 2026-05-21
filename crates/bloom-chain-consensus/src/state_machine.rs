@@ -112,7 +112,12 @@ impl VoteTally {
     /// Record a vote.  Returns the cumulative voting power for the voted hash
     /// after adding this vote.  Duplicate votes (same validator) are ignored —
     /// the first vote counts; equivocations are not punished in v0.
-    pub fn record(&mut self, validator: bloom_chain_types::types::Address, power: u64, hash: Option<Hash32>) -> u64 {
+    pub fn record(
+        &mut self,
+        validator: bloom_chain_types::types::Address,
+        power: u64,
+        hash: Option<Hash32>,
+    ) -> u64 {
         if self.voted.contains(&validator) {
             // Already voted — ignore equivocation silently in v0.
             return self.per_hash.get(&hash).copied().unwrap_or(0);
@@ -272,10 +277,7 @@ impl ConsensusState {
     /// block. Without this, a validator that received a proposal frame
     /// before the matching block frame would silently drop the proposal
     /// and stall its consensus round.
-    pub fn try_resume_pending_proposal(
-        &mut self,
-        blocks: &BTreeMap<Hash32, Block>,
-    ) -> Vec<Action> {
+    pub fn try_resume_pending_proposal(&mut self, blocks: &BTreeMap<Hash32, Block>) -> Vec<Action> {
         let Some(p) = self.pending_proposal.as_ref() else {
             return vec![];
         };
@@ -453,9 +455,7 @@ impl ConsensusState {
                 if pol_round_u > locked_round {
                     let quorum = self.validator_set.quorum();
                     let tally = self.prevotes.get(&pol_round_u);
-                    let polka_power = tally
-                        .map(|t| t.power_for(Some(proposed)))
-                        .unwrap_or(0);
+                    let polka_power = tally.map(|t| t.power_for(Some(proposed))).unwrap_or(0);
                     if polka_power >= quorum {
                         // Unlocked — prevote the new proposal.
                         return Some(proposed);
@@ -518,7 +518,10 @@ impl ConsensusState {
                 // For past rounds: if 2f+1 prevotes arrive late and we haven't advanced yet,
                 // update valid_block for the proposer's benefit in the next round.
                 if v.round < self.round
-                    && let Some(Some(hash)) = self.prevotes.get(&v.round).and_then(|t| t.quorum_hash(quorum))
+                    && let Some(Some(hash)) = self
+                        .prevotes
+                        .get(&v.round)
+                        .and_then(|t| t.quorum_hash(quorum))
                     && self.valid_block.map(|(r, _)| r).unwrap_or(0) < v.round
                 {
                     self.valid_block = Some((v.round, hash));
@@ -694,9 +697,9 @@ mod tests {
         let mut sm = ConsensusState::new(1, make_addr(1), vs);
         let blocks = BTreeMap::new();
         let actions = sm.handle(Event::Tick(TimeoutKind::Propose), &blocks);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::Broadcast(ProposalOrVote::Vote(v)) if v.block_hash.is_none())));
+        assert!(actions.iter().any(
+            |a| matches!(a, Action::Broadcast(ProposalOrVote::Vote(v)) if v.block_hash.is_none())
+        ));
     }
 
     #[test]

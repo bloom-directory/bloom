@@ -308,6 +308,9 @@ mod tests {
         let data = [0u8; 9];
         let mut buf = Buf::new(&data);
         let _ = buf.read_u64().unwrap();
-        assert_eq!(buf.expect_eof(), Err(AbiError::TrailingBytes { remaining: 1 }));
+        assert_eq!(
+            buf.expect_eof(),
+            Err(AbiError::TrailingBytes { remaining: 1 })
+        );
     }
 }

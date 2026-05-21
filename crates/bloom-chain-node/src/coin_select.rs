@@ -15,7 +15,7 @@
 
 use bloom_chain_state::StateSnapshot;
 use bloom_chain_types::types::Address;
-use bloom_objects::{ObjectId, OwnershipIndexKey, OWNER_KIND_ADDRESS};
+use bloom_objects::{OWNER_KIND_ADDRESS, ObjectId, OwnershipIndexKey};
 use bloom_petal_fungible::ops::{decode_coin_value, type_tag_coin_loom};
 use thiserror::Error;
 
@@ -60,13 +60,19 @@ pub fn select_coin_loom(
     amount: u128,
 ) -> Result<CoinSelection, SelectCoinError> {
     if amount == 0 {
-        return Ok(CoinSelection { consumed: vec![], split_remainder: None });
+        return Ok(CoinSelection {
+            consumed: vec![],
+            split_remainder: None,
+        });
     }
 
     let loom_tag = type_tag_coin_loom();
 
     // 1. Collect all Coin<LOOM> objects owned by sender.
-    let okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: sender.0 };
+    let okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: sender.0,
+    };
     let owned_ids = snap.get_ownership(&okey).unwrap_or_default();
 
     let mut coins: Vec<(ObjectId, u128)> = owned_ids
@@ -92,7 +98,10 @@ pub fn select_coin_loom(
     // 3. Greedily pick coins until running total >= amount.
     let total_available: u128 = coins.iter().map(|(_, v)| v).sum();
     if total_available < amount {
-        return Err(SelectCoinError::Insufficient { have: total_available, need: amount });
+        return Err(SelectCoinError::Insufficient {
+            have: total_available,
+            need: amount,
+        });
     }
 
     let mut running = 0u128;
@@ -117,7 +126,10 @@ pub fn select_coin_loom(
         }
     }
 
-    Ok(CoinSelection { consumed, split_remainder })
+    Ok(CoinSelection {
+        consumed,
+        split_remainder,
+    })
 }
 
 #[cfg(test)]
@@ -144,7 +156,10 @@ mod tests {
 
     /// Seed `state` with coins for `owner`, returns the state (with ownership index wired).
     fn seed_coins(state: &mut State, owner: Address, coins: &[(u8, u128)]) {
-        let okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: owner.0 };
+        let okey = OwnershipIndexKey {
+            owner_kind: OWNER_KIND_ADDRESS,
+            owner_id: owner.0,
+        };
         let mut owned = state.get_ownership(&okey).unwrap_or_default();
         for &(id_byte, value) in coins {
             let obj = make_coin_object(id_byte, owner, value);
@@ -222,7 +237,13 @@ mod tests {
         let snap = state.snapshot();
 
         let err = select_coin_loom(&snap, alice, 500).unwrap_err();
-        assert!(matches!(err, SelectCoinError::Insufficient { have: 150, need: 500 }));
+        assert!(matches!(
+            err,
+            SelectCoinError::Insufficient {
+                have: 150,
+                need: 500
+            }
+        ));
     }
 
     #[test]
@@ -232,7 +253,10 @@ mod tests {
         let snap = state.snapshot();
 
         let err = select_coin_loom(&snap, alice, 1).unwrap_err();
-        assert!(matches!(err, SelectCoinError::Insufficient { have: 0, need: 1 }));
+        assert!(matches!(
+            err,
+            SelectCoinError::Insufficient { have: 0, need: 1 }
+        ));
     }
 
     #[test]
@@ -269,12 +293,18 @@ mod tests {
             payload: coin_payload(9999),
         };
         state.set_object(wrong_obj);
-        let okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: alice.0 };
+        let okey = OwnershipIndexKey {
+            owner_kind: OWNER_KIND_ADDRESS,
+            owner_id: alice.0,
+        };
         state.set_ownership(okey, vec![ObjectId([0xBB; 32])]);
 
         let snap = state.snapshot();
         let err = select_coin_loom(&snap, alice, 1).unwrap_err();
-        assert!(matches!(err, SelectCoinError::Insufficient { have: 0, need: 1 }));
+        assert!(matches!(
+            err,
+            SelectCoinError::Insufficient { have: 0, need: 1 }
+        ));
     }
 
     /// StateSnapshot must be used (not base State), so test against a snapshot
@@ -289,7 +319,10 @@ mod tests {
         let obj = make_coin_object(0xC0, alice, 200);
         let id = obj.id;
         snap.insert_object(obj);
-        let okey = OwnershipIndexKey { owner_kind: OWNER_KIND_ADDRESS, owner_id: alice.0 };
+        let okey = OwnershipIndexKey {
+            owner_kind: OWNER_KIND_ADDRESS,
+            owner_id: alice.0,
+        };
         snap.set_ownership(okey, vec![id]);
 
         let sel = select_coin_loom(&snap, alice, 200).unwrap();

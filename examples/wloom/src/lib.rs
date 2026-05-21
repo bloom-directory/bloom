@@ -179,7 +179,12 @@ pub mod wloom {
         let state = State::load(ctx)?;
         let sender = ctx.sender();
         do_transfer(ctx, &state, &sender, &to, amount)?;
-        Transfer { from: sender, to, value: amount }.emit(ctx)?;
+        Transfer {
+            from: sender,
+            to,
+            value: amount,
+        }
+        .emit(ctx)?;
         Ok(true)
     }
 
@@ -201,7 +206,12 @@ pub mod wloom {
         }
 
         do_transfer(ctx, &state, &from, &to, amount)?;
-        Transfer { from, to, value: amount }.emit(ctx)?;
+        Transfer {
+            from,
+            to,
+            value: amount,
+        }
+        .emit(ctx)?;
         Ok(true)
     }
 
@@ -209,7 +219,12 @@ pub mod wloom {
         let state = State::load(ctx)?;
         let owner = ctx.sender();
         state.allowances.set(ctx, &(owner, spender), &value)?;
-        Approval { owner, spender, value }.emit(ctx)?;
+        Approval {
+            owner,
+            spender,
+            value,
+        }
+        .emit(ctx)?;
         Ok(true)
     }
 
@@ -247,8 +262,17 @@ pub mod wloom {
                 .ok_or_else(|| ContractError::from_str("wloom: balance overflow"))?;
             state.balances.set(ctx, &sender, &new_bal)?;
 
-            Deposit { dst: sender, value: amount }.emit(ctx)?;
-            Transfer { from: Address::ZERO, to: sender, value: amount }.emit(ctx)?;
+            Deposit {
+                dst: sender,
+                value: amount,
+            }
+            .emit(ctx)?;
+            Transfer {
+                from: Address::ZERO,
+                to: sender,
+                value: amount,
+            }
+            .emit(ctx)?;
         }
         Ok(())
     }
@@ -279,8 +303,17 @@ pub mod wloom {
             .ok_or_else(|| ContractError::from_str("wloom: total supply underflow"))?;
         state.total_supply.store(ctx, &new_ts);
 
-        Withdrawal { src: sender, value: amount }.emit(ctx)?;
-        Transfer { from: sender, to: Address::ZERO, value: amount }.emit(ctx)?;
+        Withdrawal {
+            src: sender,
+            value: amount,
+        }
+        .emit(ctx)?;
+        Transfer {
+            from: sender,
+            to: Address::ZERO,
+            value: amount,
+        }
+        .emit(ctx)?;
 
         // wLOOM mints are gated through deposits, so any in-supply balance
         // fits in u128 (the native LOOM type). The explicit conversion guards
