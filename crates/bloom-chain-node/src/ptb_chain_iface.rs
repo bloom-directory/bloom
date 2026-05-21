@@ -7,21 +7,18 @@
 //!
 //! ## Phase 1 limitations
 //!
-//! The underlying [`bloom_chain_state::State`] does not yet maintain an
-//! Object trie or an OwnershipIndex trie (Phase 2 / Task #31 follow-up
-//! adds them via extensions to [`bloom_chain_state::WriteSet`]). Until
-//! then:
-//!
-//! - [`load_object`] always returns `None`.
+//! - [`load_object`] reads from the in-memory `objects` map maintained
+//!   on [`bloom_chain_state::State`] (spec §16.3 Phase 1; no merkleisation yet).
 //! - [`load_manifest`] always returns `None` unless an in-memory
 //!   manifest registry is supplied (see [`PtbChainAdapter::with_manifests`]).
-//! - [`resolve_path`] always returns `None` (VFS path index is not yet
-//!   exposed by `bloom-chain-state`).
+//! - [`resolve_path`] always returns `None`; the on-chain VFS path index
+//!   is not yet exposed by `bloom-chain-state`. The validator treats an
+//!   unbound path as permissive, so pure-hash PetalRefs still validate.
 //!
 //! PTBs whose validation step requires any of these will fail with the
 //! appropriate `PtbError` (`ObjectNotFound`, `PetalNotFound`,
 //! `PetalNotPinned`) — which is exactly the conservative, fail-closed
-//! behaviour we want until the underlying state is wired up.
+//! behaviour we want.
 //!
 //! [`load_object`]: ChainStateIface::load_object
 //! [`load_manifest`]: ChainStateIface::load_manifest
@@ -65,10 +62,8 @@ impl<'a> PtbChainAdapter<'a> {
 }
 
 impl ChainStateIface for PtbChainAdapter<'_> {
-    fn load_object(&self, _id: &ObjectId) -> Option<Object> {
-        // Object trie not yet maintained in `State`. Task #31 follow-up
-        // extends `WriteSet`/`State` for object writes.
-        None
+    fn load_object(&self, id: &ObjectId) -> Option<Object> {
+        self.state.get_object(id)
     }
 
     fn load_petal(&self, hash: &Hash32) -> Option<Vec<u8>> {
@@ -102,10 +97,40 @@ mod tests {
     }
 
     #[test]
-    fn load_object_returns_none_in_phase1() {
+    fn load_object_returns_none_when_absent() {
         let state = State::new();
         let adapter = PtbChainAdapter::new(&state, 0);
         assert!(adapter.load_object(&ObjectId([0u8; 32])).is_none());
+    }
+
+    #[test]
+    fn load_object_reads_from_state_objects_map() {
+        use bloom_objects::{Owner, TypeTag};
+        let mut state = State::new();
+        let id = ObjectId([0x42; 32]);
+        let obj = Object {
+            id,
+            type_tag: TypeTag::Concrete {
+                petal_hash: [0; 32],
+                type_name: "Coin".to_string(),
+                type_args: vec![],
+            },
+            owner: Owner::Address([0xAA; 32]),
+            version: 7,
+            payload: vec![9, 9, 9],
+        };
+        state.set_object(obj.clone());
+
+        let adapter = PtbChainAdapter::new(&state, 0);
+        assert_eq!(adapter.load_object(&id), Some(obj));
+        assert!(adapter.load_object(&ObjectId([0u8; 32])).is_none());
+    }
+
+    #[test]
+    fn resolve_path_returns_none_until_vfs_lands() {
+        let state = State::new();
+        let adapter = PtbChainAdapter::new(&state, 0);
+        assert!(adapter.resolve_path("/anything").is_none());
     }
 
     #[test]
