@@ -2,9 +2,7 @@
 //!
 //! # State root (spec §6.1, widened by §16.3)
 //!
-//! Phase 1 widens the state_root payload to 128 bytes so that the
-//! commitment is forward-compatible with the Bloom-native contracts
-//! framework before any PTBs run:
+//! The state_root payload is 128 bytes:
 //!
 //! ```text
 //! state_root = blake3_tagged(
@@ -13,10 +11,13 @@
 //! )
 //! ```
 //!
-//! In Phase 1 the Object and OwnershipIndex tries are empty
-//! (`object_root == ownership_index_root == 0`), so the new commitment
-//! differs from the legacy 64-byte one for the same content. This is
-//! the one intentional break called out by spec §16.3.
+//! `object_root` and `ownership_index_root` commit to the in-memory
+//! Object / OwnershipIndex maps using the same BLAKE3-tagged-sorted-leaf
+//! scheme as the other tries (see [`crate::trie`]). Both roots are zero
+//! when their underlying map is empty (the workspace's empty-trie
+//! convention). They are computed on demand from
+//! [`State::objects`] / [`State::ownership`] — there is no cached
+//! field, so the roots are always live.
 //!
 //! Receipts are NOT included in the state root — they are in the block header's
 //! separate `receipts_root` field (spec §6.1 note).
@@ -44,7 +45,10 @@ use bloom_chain_types::{
     Address, Hash32,
     digest::{blake3_tagged, tags},
 };
-use bloom_objects::{Object, ObjectId, OwnershipIndexKey};
+use bloom_objects::{
+    Object, ObjectId, OwnershipIndexKey,
+    store::{encode_object_trie_value, encode_ownership_value, object_trie_key},
+};
 
 use crate::{
     account::Account,
@@ -52,6 +56,7 @@ use crate::{
     code_store::CodeStore,
     error::StateError,
     storage::StorageTrie,
+    trie::{Trie, TrieKind},
 };
 
 // ---------------------------------------------------------------------------
@@ -97,15 +102,15 @@ pub enum OwnershipDelta {
 ///
 /// Apply to a `State` via [`State::apply`].
 ///
-/// PTB-specific fields (spec §16.3, Phase 1):
+/// PTB-specific fields (spec §16.3):
 /// - `object_writes` / `object_deletes` — `Object` trie diffs.
 /// - `ownership_changes` — `OwnershipIndex` trie diffs.
 /// - `loom_deltas` — signed `loom` adjustments folded into the
 ///   accounts trie at apply time.
 ///
-/// The trie *roots* (`object_root` / `ownership_index_root`) stay zero
-/// in Phase 1 — the data lives in-memory in `State`. Phase 2 will
-/// merkleise the same fields without touching this struct.
+/// The Object and OwnershipIndex roots are computed on demand from
+/// the underlying `State` maps by [`State::object_root`] /
+/// [`State::ownership_index_root`]; this struct just carries the diffs.
 #[derive(Clone, Debug, Default)]
 pub struct WriteSet {
     /// Generation of the state this write set was produced from.
@@ -194,26 +199,16 @@ pub struct State {
     pub(crate) code: CodeStore,
     /// In-memory Object table backing the `Object` trie (spec §16.3).
     ///
-    /// Populated by `WriteSet::object_writes` / `object_deletes`. Phase 1
-    /// keeps this as a plain map; Phase 2 will merkleise it.
+    /// Populated by `WriteSet::object_writes` / `object_deletes`. The
+    /// commitment root is computed on demand by [`State::object_root`]
+    /// using the standard `TrieKind::Object` commitment scheme.
     pub(crate) objects: BTreeMap<ObjectId, Object>,
     /// In-memory OwnershipIndex backing the `OwnershipIndex` trie.
     ///
     /// Populated by `WriteSet::ownership_changes`. Empty lists evict the
-    /// row to keep the table sparse.
+    /// row to keep the table sparse. Root is computed on demand by
+    /// [`State::ownership_index_root`].
     pub(crate) ownership: BTreeMap<OwnershipIndexKey, Vec<ObjectId>>,
-    /// Object trie root (spec §16.3, Phase 1).
-    ///
-    /// Always `Hash32([0u8; 32])` in Phase 1 because the merkleisation
-    /// algorithm is Phase 2 work. The field exists so the state-root
-    /// commitment is stable across the Phase 1 → Phase 2 cutover.
-    /// Phase 2 will populate this from a live
-    /// `bloom_objects::store::ObjectTrie` keyed on `objects` above.
-    pub(crate) object_root: Hash32,
-    /// OwnershipIndex trie root (spec §16.3, Phase 1).
-    ///
-    /// Always `Hash32([0u8; 32])` in Phase 1; see `object_root` above.
-    pub(crate) ownership_index_root: Hash32,
 }
 
 impl State {
@@ -226,8 +221,6 @@ impl State {
             code: CodeStore::new(),
             objects: BTreeMap::new(),
             ownership: BTreeMap::new(),
-            object_root: Hash32([0u8; 32]),
-            ownership_index_root: Hash32([0u8; 32]),
         }
     }
 
@@ -367,16 +360,63 @@ impl State {
 
     /// The Object trie root (spec §16.3).
     ///
-    /// Always zero in Phase 1; populated by the executor in Phase 2.
+    /// Computed on demand from [`State::objects`] using the standard
+    /// `TrieKind::Object` BLAKE3-tagged-sorted-leaf commitment. Returns
+    /// `Hash32([0u8; 32])` when the underlying map is empty (the
+    /// workspace's empty-trie convention).
     pub fn object_root(&self) -> Hash32 {
-        self.object_root
+        if self.objects.is_empty() {
+            return Hash32([0u8; 32]);
+        }
+        let mut trie = Trie::new(TrieKind::Object);
+        for (id, obj) in &self.objects {
+            let value = encode_object_trie_value(obj)
+                .expect("Object canonical encoding is infallible for in-state records");
+            trie.insert(object_trie_key(id), value);
+        }
+        trie.root()
     }
 
     /// The OwnershipIndex trie root (spec §16.3).
     ///
-    /// Always zero in Phase 1; populated by the executor in Phase 2.
+    /// Computed on demand from [`State::ownership`] using the standard
+    /// `TrieKind::OwnershipIndex` commitment. Returns
+    /// `Hash32([0u8; 32])` when the underlying map is empty.
+    ///
+    /// Each row's `Vec<ObjectId>` is sorted before being passed to
+    /// `encode_ownership_value` (which enforces canonical ascending
+    /// order). Callers that store ownership rows via
+    /// [`State::set_ownership`] / [`State::apply`] are not required to
+    /// pre-sort the list — sorting happens here, at root-computation
+    /// time, so the commitment is canonical regardless of caller order.
+    ///
+    /// The logical key is `(owner_kind, owner_id)` (33 bytes); the trie
+    /// requires 32-byte keys, so we derive the trie key by hashing the
+    /// canonical 33-byte encoding with BLAKE3. The hash is uniformly
+    /// distributed and collision-resistant, and `TrieKind::OwnershipIndex`
+    /// supplies outer domain separation via its root/value tags.
     pub fn ownership_index_root(&self) -> Hash32 {
-        self.ownership_index_root
+        if self.ownership.is_empty() {
+            return Hash32([0u8; 32]);
+        }
+        let mut trie = Trie::new(TrieKind::OwnershipIndex);
+        for (key, ids) in &self.ownership {
+            // Sort + dedup defensively so the canonical encoder (which
+            // requires strict ascending order) never sees a malformed
+            // row. Duplicates would be a bug in upstream code; we
+            // tolerate them here to keep the root computation total.
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            let value = encode_ownership_value(&sorted)
+                .expect("ownership_value encoding is infallible for sorted+deduped input");
+            // Derive a 32-byte trie key from the 33-byte canonical
+            // ownership key by hashing with BLAKE3. The trie kind's
+            // domain tags already separate this from other tries.
+            let trie_key: [u8; 32] = blake3::hash(&key.encode()).into();
+            trie.insert(trie_key, value);
+        }
+        trie.root()
     }
 
     /// Compute the `state_root` per spec §6.1, widened by §16.3:
@@ -388,15 +428,14 @@ impl State {
     /// )
     /// ```
     ///
-    /// In Phase 1 the last two roots are zero, but they are still
-    /// included in the preimage so the commitment is stable across
-    /// the Phase 1 → Phase 2 activation.
+    /// All four roots are live: changing any underlying trie data
+    /// changes the corresponding root, which changes `state_root`.
     pub fn state_root(&self) -> Hash32 {
         let mut payload = [0u8; 128];
         payload[0..32].copy_from_slice(&self.accounts_root().0);
         payload[32..64].copy_from_slice(&self.code_root().0);
-        payload[64..96].copy_from_slice(&self.object_root.0);
-        payload[96..128].copy_from_slice(&self.ownership_index_root.0);
+        payload[64..96].copy_from_slice(&self.object_root().0);
+        payload[96..128].copy_from_slice(&self.ownership_index_root().0);
         blake3_tagged(tags::STATE_ROOT, &payload)
     }
 
@@ -719,6 +758,7 @@ impl StateSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bloom_objects::{Object, ObjectId, Owner, OwnershipIndexKey, TypeTag};
 
     fn addr(b: u8) -> Address {
         Address([b; 32])
@@ -731,6 +771,20 @@ mod tests {
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,
+        }
+    }
+
+    fn sample_object(id_byte: u8, owner: Owner, version: u64) -> Object {
+        Object {
+            id: ObjectId([id_byte; 32]),
+            type_tag: TypeTag::Concrete {
+                petal_hash: [0u8; 32],
+                type_name: "Coin".to_string(),
+                type_args: vec![],
+            },
+            owner,
+            version,
+            payload: vec![1, 2, 3],
         }
     }
 
@@ -778,8 +832,10 @@ mod tests {
     }
 
     #[test]
-    fn phase1_object_and_ownership_roots_are_zero() {
-        // Spec §16.3: Phase 1 keeps both new tries empty.
+    fn empty_state_object_and_ownership_roots_are_zero() {
+        // Spec §16.3 + workspace empty-trie convention: a fresh state
+        // has no objects and no ownership rows, so both roots return
+        // the all-zeros sentinel.
         let s = State::new();
         assert_eq!(s.object_root(), Hash32([0u8; 32]));
         assert_eq!(s.ownership_index_root(), Hash32([0u8; 32]));
@@ -800,19 +856,17 @@ mod tests {
     }
 
     #[test]
-    fn state_root_changes_when_new_roots_change() {
+    fn state_root_changes_when_object_data_changes() {
         // Two states identical in accounts+code+storage but with
-        // different `object_root` values must produce different
-        // state_roots (the new roots are actually in the preimage).
+        // different object content must produce different state_roots
+        // (the object_root is now live and part of the preimage).
         let mut s = State::new();
         s.set_account(addr(1), acct(100));
         let baseline = s.state_root();
 
         let mut s2 = State::new();
         s2.set_account(addr(1), acct(100));
-        // Forcibly set a non-zero object_root via the crate-internal
-        // field. (Phase 1 never does this in real execution.)
-        s2.object_root = Hash32([0x11u8; 32]);
+        s2.set_object(sample_object(0xC0, Owner::Shared, 1));
         assert_ne!(baseline, s2.state_root());
     }
 
@@ -836,29 +890,11 @@ mod tests {
 
     // ------------------------------------------------------------------
     // PTB extensions (spec §16.3): object writes, object deletes,
-    // ownership re-keys, Loom deltas.
-    //
-    // Phase 1 keeps the *trie roots* (`object_root` and
-    // `ownership_index_root`) at zero — the data lives in the in-memory
-    // state maps but is not yet merkleised. Phase 2 will compute roots
-    // over the same fields.
+    // ownership re-keys, Loom deltas. The Object and OwnershipIndex
+    // roots are live: changing the underlying maps changes the roots
+    // (and therefore the state_root). The dedicated root tests below
+    // exercise that behaviour directly.
     // ------------------------------------------------------------------
-
-    use bloom_objects::{Object, ObjectId, Owner, OwnershipIndexKey, TypeTag};
-
-    fn sample_object(id_byte: u8, owner: Owner, version: u64) -> Object {
-        Object {
-            id: ObjectId([id_byte; 32]),
-            type_tag: TypeTag::Concrete {
-                petal_hash: [0u8; 32],
-                type_name: "Coin".to_string(),
-                type_args: vec![],
-            },
-            owner,
-            version,
-            payload: vec![1, 2, 3],
-        }
-    }
 
     #[test]
     fn snapshot_insert_object_round_trips_via_state() {
@@ -944,22 +980,152 @@ mod tests {
     }
 
     #[test]
-    fn phase1_object_root_stays_zero_after_object_writes() {
-        // Spec §16.3 Phase 1: object_root/ownership_index_root remain
-        // at zero even after object writes land — the data is held in
-        // memory; merkleisation is Phase 2 work.
+    fn object_root_changes_when_object_inserted() {
+        // Spec §16.3: object_root commits to the Object map. Inserting
+        // an object must change the root from the empty-trie sentinel.
         let mut state = State::new();
+        assert_eq!(state.object_root(), Hash32([0u8; 32]));
         let mut snap = state.snapshot();
         snap.insert_object(sample_object(0xA1, Owner::Shared, 1));
-        snap.set_ownership(
+        state.apply(snap.commit()).unwrap();
+        assert_ne!(state.object_root(), Hash32([0u8; 32]));
+    }
+
+    #[test]
+    fn object_root_is_insertion_order_independent() {
+        // Build two states with the same set of objects inserted in
+        // different orders and assert their object_roots match.
+        let obj_a = sample_object(0x01, Owner::Shared, 1);
+        let obj_b = sample_object(0x02, Owner::Address([0x22u8; 32]), 1);
+        let obj_c = sample_object(0x03, Owner::Immutable, 1);
+
+        let mut s1 = State::new();
+        let mut snap1 = s1.snapshot();
+        snap1.insert_object(obj_a.clone());
+        snap1.insert_object(obj_b.clone());
+        snap1.insert_object(obj_c.clone());
+        s1.apply(snap1.commit()).unwrap();
+
+        let mut s2 = State::new();
+        let mut snap2 = s2.snapshot();
+        // Reverse insertion order.
+        snap2.insert_object(obj_c);
+        snap2.insert_object(obj_b);
+        snap2.insert_object(obj_a);
+        s2.apply(snap2.commit()).unwrap();
+
+        assert_eq!(s1.object_root(), s2.object_root());
+        // And, by transitivity, state_root (other tries empty).
+        assert_eq!(s1.state_root(), s2.state_root());
+    }
+
+    #[test]
+    fn object_root_differs_when_payloads_differ() {
+        // Two objects identical except for payload must produce
+        // different object_roots.
+        let mut obj1 = sample_object(0xA1, Owner::Shared, 1);
+        let mut obj2 = obj1.clone();
+        obj1.payload = vec![1u8, 2, 3];
+        obj2.payload = vec![9u8, 9, 9];
+
+        let mut s1 = State::new();
+        s1.set_object(obj1);
+        let mut s2 = State::new();
+        s2.set_object(obj2);
+
+        assert_ne!(s1.object_root(), s2.object_root());
+    }
+
+    #[test]
+    fn object_root_returns_to_zero_after_removal() {
+        // Insert then remove; the root must collapse back to the
+        // empty-trie sentinel.
+        let mut state = State::new();
+        let obj = sample_object(0xA1, Owner::Shared, 1);
+        let id = obj.id;
+        state.set_object(obj);
+        assert_ne!(state.object_root(), Hash32([0u8; 32]));
+        state.remove_object(&id);
+        assert_eq!(state.object_root(), Hash32([0u8; 32]));
+    }
+
+    #[test]
+    fn ownership_index_root_changes_when_row_inserted() {
+        // Setting an ownership row must change the root from zero.
+        let mut state = State::new();
+        assert_eq!(state.ownership_index_root(), Hash32([0u8; 32]));
+        let key = OwnershipIndexKey {
+            owner_kind: bloom_objects::OWNER_KIND_ADDRESS,
+            owner_id: [0x55u8; 32],
+        };
+        state.set_ownership(key, vec![ObjectId([1u8; 32])]);
+        assert_ne!(state.ownership_index_root(), Hash32([0u8; 32]));
+    }
+
+    #[test]
+    fn ownership_index_root_is_insertion_order_independent() {
+        let key_a = OwnershipIndexKey {
+            owner_kind: bloom_objects::OWNER_KIND_ADDRESS,
+            owner_id: [0x01u8; 32],
+        };
+        let key_b = OwnershipIndexKey {
+            owner_kind: bloom_objects::OWNER_KIND_ADDRESS,
+            owner_id: [0x02u8; 32],
+        };
+        let ids_a = vec![ObjectId([0xA1u8; 32]), ObjectId([0xA2u8; 32])];
+        let ids_b = vec![ObjectId([0xB1u8; 32])];
+
+        let mut s1 = State::new();
+        s1.set_ownership(key_a, ids_a.clone());
+        s1.set_ownership(key_b, ids_b.clone());
+
+        let mut s2 = State::new();
+        // Reverse insertion order across rows. The per-row list is
+        // also reversed; root() sorts defensively, so the canonical
+        // commitment must still match.
+        let mut ids_a_rev = ids_a.clone();
+        ids_a_rev.reverse();
+        s2.set_ownership(key_b, ids_b);
+        s2.set_ownership(key_a, ids_a_rev);
+
+        assert_eq!(s1.ownership_index_root(), s2.ownership_index_root());
+    }
+
+    #[test]
+    fn ownership_index_root_differs_for_distinct_keys() {
+        // Two states with rows under different owner_ids must produce
+        // distinct roots — keys are part of the commitment preimage.
+        let ids = vec![ObjectId([0xA1u8; 32])];
+        let mut s1 = State::new();
+        s1.set_ownership(
             OwnershipIndexKey {
                 owner_kind: bloom_objects::OWNER_KIND_ADDRESS,
-                owner_id: [0u8; 32],
+                owner_id: [0x01u8; 32],
             },
-            vec![ObjectId([1u8; 32])],
+            ids.clone(),
         );
-        state.apply(snap.commit()).unwrap();
-        assert_eq!(state.object_root(), Hash32([0u8; 32]));
+        let mut s2 = State::new();
+        s2.set_ownership(
+            OwnershipIndexKey {
+                owner_kind: bloom_objects::OWNER_KIND_ADDRESS,
+                owner_id: [0x02u8; 32],
+            },
+            ids,
+        );
+        assert_ne!(s1.ownership_index_root(), s2.ownership_index_root());
+    }
+
+    #[test]
+    fn ownership_index_root_returns_to_zero_after_removal() {
+        let mut state = State::new();
+        let key = OwnershipIndexKey {
+            owner_kind: bloom_objects::OWNER_KIND_ADDRESS,
+            owner_id: [0x77u8; 32],
+        };
+        state.set_ownership(key, vec![ObjectId([1u8; 32])]);
+        assert_ne!(state.ownership_index_root(), Hash32([0u8; 32]));
+        // Passing an empty vec to set_ownership evicts the row.
+        state.set_ownership(key, vec![]);
         assert_eq!(state.ownership_index_root(), Hash32([0u8; 32]));
     }
 
