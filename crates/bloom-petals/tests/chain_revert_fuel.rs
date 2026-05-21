@@ -46,6 +46,7 @@ fn run_burner(calldata: Vec<u8>) -> bloom_petals::ChainCallOutput {
         block: default_block(),
         fuel: 10_000_000,
         snapshot: state.snapshot(),
+        ptb_ctx: None,
     };
     PetalVm::run_chain_call(input).expect("top-level revert is Ok with revert_reason set")
 }
@@ -188,6 +189,7 @@ fn run_parent(child_mode_byte: u8) -> bloom_petals::ChainCallOutput {
         block: default_block(),
         fuel: 50_000_000,
         snapshot: state.snapshot(),
+        ptb_ctx: None,
     };
 
     PetalVm::run_chain_call(input).expect("parent must return normally")

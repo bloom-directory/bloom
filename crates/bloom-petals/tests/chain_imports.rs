@@ -39,6 +39,7 @@ fn make_input(wasm: Vec<u8>, entry: ChainEntry) -> ChainCallInput {
         block: default_block(),
         fuel: 10_000_000,
         snapshot: state.snapshot(),
+        ptb_ctx: None,
     }
 }
 
@@ -568,6 +569,7 @@ fn host_deploy_address_matches_spec_formula() {
         block: default_block(),
         fuel: 50_000_000,
         snapshot: state.snapshot(),
+        ptb_ctx: None,
     };
 
     let out = run(input).unwrap();
@@ -659,6 +661,7 @@ fn host_deploy_collision_returns_error() {
         block: default_block(),
         fuel: 50_000_000,
         snapshot: state.snapshot(),
+        ptb_ctx: None,
     };
 
     let out = run(input).unwrap();
@@ -818,6 +821,7 @@ fn init_can_self_call_staged_code() {
         block: default_block(),
         fuel: 50_000_000,
         snapshot: snap,
+        ptb_ctx: None,
     };
 
     let out = run(input).unwrap_or_else(|e| panic!("init self-call must succeed; got {e:?}"));
@@ -923,14 +927,17 @@ fn code_manifest_hash_returns_none_for_unknown_account() {
 }
 
 // ---------------------------------------------------------------------------
-// Bloom-native contracts (spec §16.2): new host imports — Phase 1 stubs.
+// Bloom-native contracts (spec §16.2): new host imports.
 //
 // These tests confirm that:
-// 1. validate_chain_wasm now accepts imports from the new modules
+// 1. validate_chain_wasm accepts imports from the new modules
 //    (object/cap/signer/ptb/log).
-// 2. Calls to the stubs return `NOT_YET_ACTIVATED_CODE` (-100) and burn
-//    a small amount of fuel — i.e. the imports are gated off but the
-//    surface is callable, exactly as spec §17 requires for Phase 1.
+// 2. When invoked from the **legacy** `TxKind::Transfer` / `TxKind::Call`
+//    paths (which don't install a `ptb_ctx`), the new imports surface
+//    `HostError::Backend` (-4) so the calling petal can revert cleanly.
+//    Real PTB-mode coverage of the imports lives in
+//    `crates/bloom-chain-node/tests/ptb_submit_e2e.rs` where a
+//    `PtbHostCtx` is actually wired in.
 // ---------------------------------------------------------------------------
 
 const OBJECT_BORROW_CALL: &str = r#"
@@ -973,20 +980,22 @@ fn validate_chain_wasm_accepts_new_modules() {
 }
 
 #[test]
-fn object_borrow_stub_returns_not_yet_activated() {
-    // object.borrow is a 2-arg stub. The petal calls it, then returns
-    // the raw i32 result. We expect the well-known -100 code.
+fn object_borrow_on_legacy_path_returns_backend_error() {
+    // Legacy `TxKind::Call` constructs `ChainStoreData { ptb_ctx: None }`.
+    // The §16.2 imports must therefore surface `HostError::Backend`
+    // (-4) so the caller petal can revert cleanly.
     let input = make_input(wat(OBJECT_BORROW_CALL), ChainEntry::Call);
     let out = run(input).unwrap();
     let data = out.return_data.expect("return_data");
     assert_eq!(data.len(), 4);
     let code = i32::from_le_bytes(data.try_into().unwrap());
     assert_eq!(
-        code, -100,
-        "Phase 1 object.borrow must return NOT_YET_ACTIVATED_CODE"
+        code, -4,
+        "legacy-path object.borrow must surface HostError::Backend"
     );
-    // The stub burns 1 unit per call — fuel_used should be non-zero.
-    assert!(out.fuel_used >= 1, "stub must charge at least 1 fuel");
+    // The import still charged spec §16.4's 200 fuel before bailing
+    // — confirm a non-zero charge so an attacker cannot busy-loop.
+    assert!(out.fuel_used >= 200, "legacy stub must still charge fuel");
 }
 
 const SIGNER_INDEX_CALL: &str = r#"
@@ -1002,15 +1011,15 @@ const SIGNER_INDEX_CALL: &str = r#"
 "#;
 
 #[test]
-fn signer_index_stub_returns_not_yet_activated() {
-    // signer.index is the nullary (0-arg) shape. Confirm the 0-arity
-    // branch of `link_new_host_imports` is wired correctly.
+fn signer_index_on_legacy_path_returns_backend_error() {
+    // signer.index is the nullary (0-arg) shape. Confirm the 0-arg
+    // branch surfaces `HostError::Backend` (-4) on the legacy path.
     let input = make_input(wat(SIGNER_INDEX_CALL), ChainEntry::Call);
     let out = run(input).unwrap();
     let data = out.return_data.expect("return_data");
     assert_eq!(data.len(), 4);
     let code = i32::from_le_bytes(data.try_into().unwrap());
-    assert_eq!(code, -100);
+    assert_eq!(code, -4);
 }
 
 const PTB_COMMAND_OUTPUT_CALL: &str = r#"
@@ -1028,11 +1037,11 @@ const PTB_COMMAND_OUTPUT_CALL: &str = r#"
 "#;
 
 #[test]
-fn ptb_command_output_stub_returns_not_yet_activated() {
+fn ptb_command_output_on_legacy_path_returns_backend_error() {
     // 4-arg arity branch.
     let input = make_input(wat(PTB_COMMAND_OUTPUT_CALL), ChainEntry::Call);
     let out = run(input).unwrap();
     let data = out.return_data.expect("return_data");
     let code = i32::from_le_bytes(data.try_into().unwrap());
-    assert_eq!(code, -100);
+    assert_eq!(code, -4);
 }

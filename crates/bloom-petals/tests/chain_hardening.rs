@@ -164,6 +164,7 @@ fn revert_child_writes_dont_leak() {
         block: default_block(),
         fuel: 50_000_000,
         snapshot: state.snapshot(),
+        ptb_ctx: None,
     };
 
     let out = PetalVm::run_chain_call(input).expect("parent run must succeed (it ignores the negative rc)");
@@ -234,6 +235,7 @@ fn wasm_memory_grow_caught_at_runtime() {
         block: default_block(),
         fuel: 50_000_000,
         snapshot: state.snapshot(),
+        ptb_ctx: None,
     };
 
     // The petal will either (a) succeed and grow memory if the limiter
@@ -284,6 +286,7 @@ fn single_revert_path_smoke() {
         block: default_block(),
         fuel: 1_000_000,
         snapshot: state.snapshot(),
+        ptb_ctx: None,
     };
 
     let out = PetalVm::run_chain_call(input)

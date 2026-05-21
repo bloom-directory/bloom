@@ -2498,6 +2498,7 @@ dependencies = [
  "bloom-chain-types",
  "bloom-objects",
  "bloom-proto",
+ "bloom-script",
  "bloom-vfs",
  "futures",
  "hex",

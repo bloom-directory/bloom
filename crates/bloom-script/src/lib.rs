@@ -47,6 +47,7 @@ pub mod encode;
 pub mod error;
 pub mod executor;
 pub mod hash;
+pub mod host_ctx;
 pub mod types;
 pub mod validator;
 
@@ -62,6 +63,7 @@ pub use executor::{
     PetalRunner, PtbExecutor,
 };
 pub use hash::{PTB_HASH_TAG, ptb_hash};
+pub use host_ctx::{HandleEntry, PtbHostCtx};
 pub use types::{
     Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PqPubkey, PqSignature, PtbTx, PublishCmd,
     UpgradeCmd, UseRef, loom_coin_type_tag, loom_marker_type_tag,

@@ -138,6 +138,7 @@ impl PetalExecutor for ChainPetalExecutor {
                     block: block_ctx,
                     fuel: tx.max_fuel,
                     snapshot: snap,
+                    ptb_ctx: None,
                 };
 
                 match PetalVm::run_chain_call(input) {
@@ -234,6 +235,7 @@ impl PetalExecutor for ChainPetalExecutor {
                     block: block_ctx,
                     fuel: tx.max_fuel,
                     snapshot: snap,
+                    ptb_ctx: None,
                 };
 
                 match PetalVm::run_chain_call(input) {
