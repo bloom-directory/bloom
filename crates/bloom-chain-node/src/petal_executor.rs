@@ -33,7 +33,7 @@ use bloom_petals::{BlockCtx as PetalBlockCtx, ChainCallInput, ChainEntry, PetalV
 use bloom_script::{
     executor::{LogEntry as PtbLogEntry, PtbExecutor},
     host_ctx::PtbHostCtx,
-    AlwaysOkVerifier, PetalManifestStub, ValidationContext, loom_coin_type_tag,
+    AlwaysOkVerifier, PetalManifestStub, SignatureVerifier, ValidationContext, loom_coin_type_tag,
     validate_ptb,
 };
 use tracing::warn;
@@ -42,6 +42,7 @@ use crate::chain_petal_runner::ChainPetalRunner;
 use crate::coin_select::select_coin_loom;
 use crate::consensus_driver::{ExecOutput, PetalExecutor, empty_account};
 use crate::ptb_chain_iface::PtbChainAdapter;
+use crate::sig_verifier::Ed25519PtbVerifier;
 
 /// Production chain-mode executor.
 ///
@@ -271,6 +272,9 @@ impl PetalExecutor for ChainPetalExecutor {
     ) -> ExecOutput {
         // Production path: manifests resolve from each petal's wasm
         // custom section. `None` overrides ⇒ wasm-only resolution.
+        // PTB signer signatures are checked with the production
+        // Ed25519 verifier (P0-3 fix, spec §7.2 step 1).
+        let verifier = Ed25519PtbVerifier::new();
         execute_tx_impl(
             tx,
             state,
@@ -279,6 +283,7 @@ impl PetalExecutor for ChainPetalExecutor {
             proposer,
             parent_hash,
             None,
+            &verifier,
         )
     }
 }
@@ -293,6 +298,17 @@ impl PetalExecutor for ChainPetalExecutorWithManifests {
         proposer: Address,
         parent_hash: Hash32,
     ) -> ExecOutput {
+        // `ChainPetalExecutorWithManifests` is a **test-only** wrapper
+        // (see struct docs). Its existing fixtures across the workspace
+        // construct PTBs with stub signer / signature placeholders and
+        // exercise downstream pipeline steps (host imports, ownership
+        // index, gas refund, …), not signature cryptography. Keeping
+        // the always-ok verifier here preserves that contract while the
+        // production `ChainPetalExecutor` path uses
+        // [`Ed25519PtbVerifier`]. Tests that *do* want to exercise real
+        // signature verification go through `ChainPetalExecutor`
+        // directly (see `tests/ptb_signature_rejection.rs`).
+        let verifier = AlwaysOkVerifier;
         execute_tx_impl(
             tx,
             state,
@@ -301,6 +317,7 @@ impl PetalExecutor for ChainPetalExecutorWithManifests {
             proposer,
             parent_hash,
             Some(&self.manifests),
+            &verifier,
         )
     }
 }
@@ -309,6 +326,12 @@ impl PetalExecutor for ChainPetalExecutorWithManifests {
 /// parameter is an optional per-petal manifest **override** map the
 /// PTB validator consults *before* the wasm custom-section path
 /// during `Command::Move` typechecks. Production passes `None`.
+///
+/// `verifier` plugs the signature-check policy: production uses
+/// [`Ed25519PtbVerifier`]; the test-only `ChainPetalExecutorWithManifests`
+/// uses `AlwaysOkVerifier` for backwards compatibility with existing
+/// stub-signature fixtures.
+#[allow(clippy::too_many_arguments)]
 fn execute_tx_impl(
     tx: &Tx,
     state: &mut State,
@@ -317,6 +340,7 @@ fn execute_tx_impl(
     _proposer: Address,
     parent_hash: Hash32,
     manifests: Option<&HashMap<Hash32, PetalManifestStub>>,
+    verifier: &dyn SignatureVerifier,
 ) -> ExecOutput {
         // `parent_hash` is the committing block's parent block hash —
         // surfaced to chain-mode petals as `chain::block.prevhash`
@@ -609,12 +633,14 @@ fn execute_tx_impl(
                         }
                     }
                     Ok(ptb) => {
-                        // Phase 1 wiring: validate against current
-                        // chain state. The verifier is `AlwaysOk` until
-                        // the PQ-key registry lands (the 32-byte
-                        // `PqPubkey` is a key *identifier*, not the
-                        // full key; the real verifier resolves it
-                        // through an on-chain map).
+                        // Validator runs against current chain state.
+                        // The signature verifier is now supplied by the
+                        // caller (P0-3 fix, spec §7.2 step 1): the
+                        // production `ChainPetalExecutor` hands in
+                        // `Ed25519PtbVerifier`; the test-only
+                        // `ChainPetalExecutorWithManifests` keeps
+                        // `AlwaysOkVerifier` for legacy fixtures (see
+                        // each impl's call to `execute_tx_impl`).
                         //
                         // TODO(task#32): replace the all-zero
                         // `loom_coin_type` and `fungible_petal_hash`
@@ -638,11 +664,10 @@ fn execute_tx_impl(
                                 ),
                                 None => PtbChainAdapter::new(state, block_number),
                             };
-                            let verifier = AlwaysOkVerifier;
                             let ctx = ValidationContext {
                                 current_block: block_number,
                                 chain: &adapter,
-                                verifier: &verifier,
+                                verifier,
                                 loom_coin_type: loom_coin_type.clone(),
                             };
                             match validate_ptb(&ptb, &ctx) {

@@ -36,6 +36,7 @@ pub mod petal_executor;
 pub mod ptb_chain_iface;
 pub mod receipt_store;
 pub mod rpc;
+pub mod sig_verifier;
 pub mod state_blob;
 pub mod state_index;
 pub mod transport;

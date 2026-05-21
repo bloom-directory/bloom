@@ -29,6 +29,7 @@ parking_lot = "0.12"
 clap    = { version = "4", features = ["derive", "env"] }
 hex     = "0.4"
 zbase32 = "0.1"
+ed25519-dalek.workspace = true
 
 [dev-dependencies]
 bloom-test-util = { path = "../bloom-test-util" }
@@ -36,6 +37,8 @@ tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 # Used by adversarial test fixtures (e.g. `prevhash_threading.rs`).
 wat = "1"
+# Real-key signing helpers in `ptb_signature_rejection.rs`.
+rand = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"
