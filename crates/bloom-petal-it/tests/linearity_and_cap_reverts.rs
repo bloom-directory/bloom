@@ -203,7 +203,6 @@ fn fabricated_gas_payer_wrong_owner_reverts() {
     let mut state = build_state(&[(alice, 1000)]);
 
     // Seed a coin owned by carol, use it as alice's gas_payer.
-    // Use PTB-path 16-byte payload so the validator can decode the coin value.
     let carol_coin_id = ObjectId([0xCC; 32]);
     let carol_coin = Object {
         id: carol_coin_id,

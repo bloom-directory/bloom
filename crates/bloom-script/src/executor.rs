@@ -435,7 +435,7 @@ impl<'c> PtbExecutor<'c> {
         let src_row = borrow_table
             .get_mut(&src_id)
             .ok_or(PtbError::ObjectNotFound { id: src_id })?;
-        // Decode value.
+        // Decode value from canonical 48-byte [id(32)||value(16)] payload.
         let mut value = decode_coin_value(&src_row.payload_bytes).map_err(|_| {
             PtbError::BuiltinFailed {
                 cmd_idx,
@@ -444,6 +444,8 @@ impl<'c> PtbExecutor<'c> {
         })?;
         let coin_type = src_row.type_tag.clone();
         let owner = src_row.owner.clone();
+        // Preserve the 32-byte id prefix from the source coin payload.
+        let src_id_prefix: [u8; 32] = src_row.payload_bytes[..32].try_into().unwrap();
 
         let total_out: u128 = amounts.iter().try_fold(0u128, |acc, a| {
             acc.checked_add(*a)
@@ -462,16 +464,19 @@ impl<'c> PtbExecutor<'c> {
         }
         value -= total_out;
 
-        // Write the source's new value back; mark dirty so diff_check
-        // bumps the version.
-        let new_payload = value.to_be_bytes().to_vec();
+        // Write the source's new value back using canonical 48-byte format,
+        // preserving its id prefix; mark dirty so diff_check bumps the version.
+        let mut new_payload = src_id_prefix.to_vec();
+        new_payload.extend_from_slice(&value.to_be_bytes());
         borrow_table.mark_dirty(&src_id, new_payload)?;
 
-        // Emit one transient Coin per requested amount.
+        // Emit one transient Coin per requested amount, each with a canonical
+        // 48-byte payload: [transient id (32 bytes)] || [amount BE (16 bytes)].
         let mut outs: Vec<Vec<u8>> = Vec::with_capacity(amounts.len());
         for amt in amounts {
             let id = self.mint_transient_id(b"split-coin");
-            let payload = amt.to_be_bytes().to_vec();
+            let mut payload = id.0.to_vec();
+            payload.extend_from_slice(&amt.to_be_bytes());
             borrow_table.insert_transient(BorrowRow {
                 object_id: id,
                 type_tag: coin_type.clone(),
@@ -552,7 +557,10 @@ impl<'c> PtbExecutor<'c> {
             }
         }
         let id = first_id.unwrap();
-        borrow_table.mark_dirty(&id, accum.to_be_bytes().to_vec())?;
+        // Write merged total in canonical 48-byte format: [id (32)] || [total BE (16)].
+        let mut merged_payload = id.0.to_vec();
+        merged_payload.extend_from_slice(&accum.to_be_bytes());
+        borrow_table.mark_dirty(&id, merged_payload)?;
         Ok(vec![id.0.to_vec()])
     }
 
@@ -1029,12 +1037,15 @@ mod tests {
     }
 
     fn make_coin(id_byte: u8, owner: [u8; 32], value: u128, version: u64) -> Object {
+        // 48-byte canonical payload: [ObjectId placeholder (32 bytes)] || [value BE (16 bytes)]
+        let mut payload = vec![0u8; 32];
+        payload.extend_from_slice(&value.to_be_bytes());
         Object {
             id: ObjectId([id_byte; 32]),
             type_tag: loom_tt(),
             owner: Owner::Address(owner),
             version,
-            payload: value.to_be_bytes().to_vec(),
+            payload,
         }
     }
 

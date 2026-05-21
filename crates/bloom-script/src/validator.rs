@@ -415,19 +415,20 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Extract a `Coin<T>::value` from a `Coin` payload. The fungible
-/// petal's canonical payload layout in v0 is `u128 BE value`; later
-/// fields (e.g. metadata) append after. The chain only needs the
-/// first 16 bytes for the gas check.
+/// Extract a `Coin<T>::value` from a `Coin` payload.
+///
+/// The canonical on-chain layout (spec §coin-encoding) is:
+/// `[ObjectId (32 bytes, zeroed at create-time)] || [u128 value BE (16 bytes)]`
+/// — total 48 bytes. The value lives at `payload[32..48]`.
 pub fn decode_coin_value(payload: &[u8]) -> Result<u128, PtbError> {
-    if payload.len() < 16 {
+    if payload.len() < 48 {
         return Err(PtbError::InvalidGasPayer {
             id: ObjectId([0; 32]),
-            reason: format!("coin payload too short ({} bytes)", payload.len()),
+            reason: format!("coin payload too short ({} bytes, need 48)", payload.len()),
         });
     }
     let mut a = [0u8; 16];
-    a.copy_from_slice(&payload[..16]);
+    a.copy_from_slice(&payload[32..48]);
     Ok(u128::from_be_bytes(a))
 }
 
@@ -496,12 +497,15 @@ mod tests {
     }
 
     fn coin_obj(id_byte: u8, owner: [u8; 32], value: u128, version: u64) -> Object {
+        // 48-byte canonical payload: [ObjectId placeholder (32 bytes)] || [value BE (16 bytes)]
+        let mut payload = vec![0u8; 32];
+        payload.extend_from_slice(&value.to_be_bytes());
         Object {
             id: ObjectId([id_byte; 32]),
             type_tag: loom_coin_tt(),
             owner: Owner::Address(owner),
             version,
-            payload: value.to_be_bytes().to_vec(),
+            payload,
         }
     }
 
@@ -840,12 +844,14 @@ mod tests {
     fn rejects_wrong_gas_payer_type() {
         let (chain, signer, gas_id) = setup();
         // Type mismatch.
+        let mut wrong_type_payload = vec![0u8; 32];
+        wrong_type_payload.extend_from_slice(&1_000_000u128.to_be_bytes());
         chain.put_object(Object {
             id: gas_id,
             type_tag: TypeTag::Generic { idx: 0 },
             owner: Owner::Address(signer),
             version: 0,
-            payload: 1_000_000u128.to_be_bytes().to_vec(),
+            payload: wrong_type_payload,
         });
         let tx = sample_ptb(signer, gas_id, 100);
         let verifier = AlwaysOkVerifier;
@@ -891,17 +897,19 @@ mod tests {
 
     #[test]
     fn decode_coin_value_too_short() {
+        // 47 bytes is one byte short of the required 48.
         assert!(matches!(
-            decode_coin_value(&[0u8; 4]),
+            decode_coin_value(&[0u8; 47]),
             Err(PtbError::InvalidGasPayer { .. })
         ));
     }
 
     #[test]
-    fn decode_coin_value_extracts_first_16_bytes() {
+    fn decode_coin_value_reads_value_after_id() {
         let v: u128 = 0xDEAD_BEEF_CAFE_F00Du128;
-        let mut payload = v.to_be_bytes().to_vec();
-        payload.extend_from_slice(b"metadata");
+        // Canonical 48-byte layout: [id placeholder (32)] || [value BE (16)]
+        let mut payload = vec![0u8; 32];
+        payload.extend_from_slice(&v.to_be_bytes());
         assert_eq!(decode_coin_value(&payload).unwrap(), v);
     }
 }

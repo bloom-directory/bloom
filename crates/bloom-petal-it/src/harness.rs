@@ -22,36 +22,26 @@ use bloom_chain_state::{Account, State};
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
 use bloom_objects::{Object, ObjectId, Owner, OwnershipIndexKey, OWNER_KIND_ADDRESS};
-use bloom_petal_fungible::ops::type_tag_coin_loom;
+use bloom_petal_fungible::ops::{coin_payload, decode_coin_value as fungible_decode_coin_value, type_tag_coin_loom};
 use bloom_script::{FunctionDeclStub, PetalManifestStub, encode_ptb, types::PtbTx};
 
 // ---------------------------------------------------------------------------
-// Coin payload format (PTB path)
+// Coin payload format
 // ---------------------------------------------------------------------------
 
-/// Canonical coin payload for the **PTB executor path**: just the 16-byte
-/// big-endian u128 value.
+/// Canonical coin payload: 48-byte `[ObjectId placeholder (32 bytes)] ||
+/// [value BE (16 bytes)]`. Delegates to `bloom_petal_fungible::ops::coin_payload`.
 ///
-/// The PTB validator's `decode_coin_value` (in `bloom-script`) reads
-/// `payload[0..16]` as the value. This differs from the 48-byte format
-/// produced by `bloom_petal_fungible::ops::coin_payload` (32-byte ObjectId
-/// placeholder + 16-byte value), which is used by the legacy-transfer shim
-/// and the fungible petal's on-chain encoding.
-///
-/// This crate uses the 16-byte format for all coins seeded for PTB-path
-/// tests so that both gas-payer validation and `SplitCoins` work correctly.
+/// Both the PTB executor and the on-chain fungible petal now use the same
+/// 48-byte layout, so this is the only helper needed.
 pub fn ptb_coin_payload(value: u128) -> Vec<u8> {
-    value.to_be_bytes().to_vec()
+    coin_payload(value)
 }
 
-/// Decode the value from a 16-byte PTB-path coin payload.
+/// Decode the value from a canonical 48-byte coin payload.
+/// Returns 0 on malformed input (test-harness convenience).
 pub fn ptb_decode_coin_value(payload: &[u8]) -> u128 {
-    if payload.len() < 16 {
-        return 0;
-    }
-    let mut a = [0u8; 16];
-    a.copy_from_slice(&payload[..16]);
-    u128::from_be_bytes(a)
+    fungible_decode_coin_value(payload).unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -90,9 +80,8 @@ pub fn build_state(allocations: &[(Address, u128)]) -> State {
             type_tag: coin_type.clone(),
             owner: Owner::Address(addr.0),
             version: 0,
-            // Use the 16-byte PTB-path payload: the PTB validator's
-            // decode_coin_value reads payload[0..16] as the u128 value.
-            payload: ptb_coin_payload(*balance),
+            // Canonical 48-byte payload: [ObjectId placeholder (32)] || [value BE (16)].
+            payload: coin_payload(*balance),
         };
         state.set_object(obj.clone());
 
@@ -119,14 +108,14 @@ pub fn genesis_coin_id(addr: Address, idx: usize) -> ObjectId {
 }
 
 /// Insert a `Coin<LOOM>` object directly into `state` with a custom id.
-/// Uses the 16-byte PTB-path payload format (value at bytes[0..16]).
+/// Uses the canonical 48-byte payload format: [id placeholder (32)] || [value BE (16)].
 pub fn seed_coin(state: &mut State, id: ObjectId, owner: Address, value: u128) {
     let obj = Object {
         id,
         type_tag: type_tag_coin_loom(),
         owner: Owner::Address(owner.0),
         version: 0,
-        payload: ptb_coin_payload(value),
+        payload: coin_payload(value),
     };
     state.set_object(obj.clone());
 

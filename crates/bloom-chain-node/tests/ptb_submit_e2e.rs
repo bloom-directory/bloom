@@ -176,11 +176,11 @@ fn wat(src: &str) -> Vec<u8> {
 
 /// Build the canonical `Coin<LOOM>` payload for a balance.
 ///
-/// The validator only inspects the leading 16 bytes (the BE-encoded
-/// `u128` value). We keep the rest empty so the object encoding stays
-/// stable across spec revisions.
+/// Canonical on-chain format: [ObjectId placeholder (32 bytes)] || [value BE (16 bytes)].
 fn coin_payload(value: u128) -> Vec<u8> {
-    value.to_be_bytes().to_vec()
+    let mut p = vec![0u8; 32];
+    p.extend_from_slice(&value.to_be_bytes());
+    p
 }
 
 /// Mint a `Coin<LOOM>` object at `id` owned by `owner`, holding
