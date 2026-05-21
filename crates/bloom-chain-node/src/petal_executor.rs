@@ -635,6 +635,17 @@ fn execute_tx_impl(
                         // borrow of `state`; create it inside this
                         // scope so we drop it before reclaiming
                         // ownership of the snapshot.
+                        //
+                        // CRITICAL (P0-2): the executor MUST share the
+                        // same `Arc<Mutex<PtbHostCtx>>` as the wasm
+                        // host imports. Without this, `object.borrow`
+                        // can't see pre-loaded objects, and
+                        // `object.create` rows land in a ctx the
+                        // executor never reads. We thread `host_ctx`
+                        // via `with_ctx_arc(...)` so the executor's
+                        // pre-load + diff-check + linearity-check
+                        // operate on the *same* borrow table the host
+                        // imports mutate.
                         let report = {
                             let adapter =
                                 PtbChainAdapter::with_manifests(
@@ -642,22 +653,24 @@ fn execute_tx_impl(
                                     block_number,
                                     manifests,
                                 );
-                            let mut exec = PtbExecutor::new(
+                            let mut exec = PtbExecutor::with_ctx_arc(
                                 &adapter,
                                 &runner,
                                 loom_coin_type,
                                 fungible_petal_hash,
+                                Arc::clone(&host_ctx),
                             );
                             exec.execute(validated)
                         };
 
-                        // Drain shared host-context state before we
-                        // consume the runner (which holds an Arc).
-                        let drained = {
-                            let mut c =
-                                host_ctx.lock().expect("PtbHostCtx mutex poisoned");
-                            std::mem::take(&mut *c)
-                        };
+                        // The executor drains the ctx itself at the
+                        // end of `execute(...)` (success path) and
+                        // folds host-attributed entries (created
+                        // objects, host deletes, host ownership
+                        // changes, loom deltas, logs) into the
+                        // `ExecutionReport`. We don't need a separate
+                        // drain step here — the host_ctx behind the
+                        // Arc has already been std::mem::take'n.
 
                         // Reclaim the snapshot the runner threaded
                         // through the calls.
@@ -684,50 +697,36 @@ fn execute_tx_impl(
                             };
                         }
 
-                        // Success: fold ExecutionReport diffs + any
-                        // host-import-emitted state into the snapshot.
+                        // Success: fold the unified ExecutionReport
+                        // (which already includes both executor- and
+                        // host-import-attributed state) into the
+                        // snapshot.
                         for obj in &report.object_writes {
                             snapshot.insert_object(obj.clone());
                         }
                         for id in &report.object_deletes {
                             snapshot.delete_object(*id);
                         }
-                        for id in &drained.object_deletes {
-                            snapshot.delete_object(*id);
-                        }
                         // Ownership-index rewrites: rebuild the row
-                        // for each owner referenced by either the
-                        // executor or the host imports.
+                        // for each owner referenced by the report.
                         // Phase 1: a single ownership-row replace per
-                        // unique owner. The host_ctx.ownership_changes
-                        // and report.ownership_changes are both
-                        // "(id, new_owner)" lists; we collect the
-                        // affected (owner_kind, owner_id) keys and
-                        // rebuild each from the post-write object
-                        // table (Phase 2 will do this incrementally).
-                        let mut combined_ownership: Vec<
-                            (bloom_objects::ObjectId, bloom_objects::Owner),
-                        > = Vec::new();
-                        combined_ownership
-                            .extend(report.ownership_changes.iter().cloned());
-                        combined_ownership
-                            .extend(drained.ownership_changes.iter().cloned());
-                        rebuild_ownership_rows(&mut snapshot, &combined_ownership);
+                        // unique owner. The list is "(id, new_owner)"
+                        // and now includes host-import-attributed
+                        // changes (drained into report by the
+                        // executor's commit step).
+                        rebuild_ownership_rows(&mut snapshot, &report.ownership_changes);
 
-                        // Loom deltas: both executor- and host-import-
-                        // attributed.
+                        // Loom deltas: executor- and host-import-
+                        // attributed (both flow through report).
                         for d in &report.loom_deltas {
-                            snapshot
-                                .apply_loom_delta(Address(d.address), d.delta);
-                        }
-                        for d in &drained.loom_deltas {
                             snapshot
                                 .apply_loom_delta(Address(d.address), d.delta);
                         }
 
                         let ws = snapshot.commit();
-                        let logs: Vec<Log> = drained
+                        let logs: Vec<Log> = report
                             .logs
+                            .clone()
                             .into_iter()
                             .map(ptb_log_to_receipt_log)
                             .collect();

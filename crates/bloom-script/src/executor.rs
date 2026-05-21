@@ -15,15 +15,30 @@
 //! [`ExecutionReport`]'s state diffs in that case — `success ==
 //! false`).
 //!
-//! Phase 1 caveat: the executor is library-only. Chain-side wiring
-//! into `TxKind::SubmitPtb` lands in Phase 2.
+//! # Shared host context
+//!
+//! Per spec §16.2 + §16.3, the chain VM's `object.*` / `ptb.*` host
+//! imports operate on the same per-PTB borrow table and
+//! command-output matrix as the executor. To enforce this single
+//! source of truth, [`PtbExecutor`] is constructed with an
+//! `Arc<Mutex<PtbHostCtx>>` (see [`PtbExecutor::with_ctx_arc`]); the
+//! chain-node layer threads the same handle into the wasm linker so
+//! every `object.borrow`, `object.create`, `object.mutate`,
+//! `object.transfer`, etc. mutates the executor's view directly.
+//!
+//! Tests that don't need the chain-VM linkage can use
+//! [`PtbExecutor::new`], which internally allocates a fresh
+//! `Arc<Mutex<PtbHostCtx>>`.
+
+use std::sync::{Arc, Mutex};
 
 use bloom_chain_types::Hash32;
 use bloom_objects::{AbilitySet, AccessMode, Object, ObjectId, Owner, TypeTag};
 
-use crate::borrow_table::{BorrowRow, BorrowTable};
+use crate::borrow_table::BorrowRow;
 use crate::chain_iface::{ChainStateIface, InvariantDeclStub};
 use crate::error::PtbError;
+use crate::host_ctx::PtbHostCtx;
 use crate::types::{Arg, Command, MoveCmd, PublishCmd, UpgradeCmd, UseRef};
 use crate::validator::{ValidatedPtb, decode_coin_value};
 
@@ -162,6 +177,13 @@ pub struct PtbExecutor<'c> {
     /// objects during built-in commands (gas refund, SplitCoins).
     #[allow(dead_code)]
     fungible_petal_hash: Hash32,
+    /// Per-PTB host context shared with the chain VM's §16.2 host
+    /// imports. The executor mutates `ctx.borrow_table` and
+    /// `ctx.command_outputs` directly; the host imports do the same
+    /// under the same lock. Holding this lock across `petal_runner.call`
+    /// would deadlock (the host imports re-acquire it), so dispatch
+    /// methods take short critical sections via [`Self::with_ctx`].
+    ctx: Arc<Mutex<PtbHostCtx>>,
     /// Internal counter that drives unique transient `ObjectId`s.
     transient_counter: u64,
     /// PTB hash used as seed for transient id derivation; keeps ids
@@ -170,21 +192,61 @@ pub struct PtbExecutor<'c> {
 }
 
 impl<'c> PtbExecutor<'c> {
-    /// Construct a new executor.
+    /// Construct a new executor with a private host context.
+    ///
+    /// Suitable for tests / library callers that don't need to share
+    /// the borrow table with chain-VM host imports. The chain-node
+    /// layer uses [`Self::with_ctx_arc`] to thread the same
+    /// `Arc<Mutex<PtbHostCtx>>` into the wasm linker.
     pub fn new(
         chain: &'c dyn ChainStateIface,
         petal_runner: &'c dyn PetalRunner,
         loom_coin_type: TypeTag,
         fungible_petal_hash: Hash32,
     ) -> Self {
+        Self::with_ctx_arc(
+            chain,
+            petal_runner,
+            loom_coin_type,
+            fungible_petal_hash,
+            Arc::new(Mutex::new(PtbHostCtx::new())),
+        )
+    }
+
+    /// Construct an executor that shares `ctx` with the chain VM's
+    /// §16.2 host imports.
+    pub fn with_ctx_arc(
+        chain: &'c dyn ChainStateIface,
+        petal_runner: &'c dyn PetalRunner,
+        loom_coin_type: TypeTag,
+        fungible_petal_hash: Hash32,
+        ctx: Arc<Mutex<PtbHostCtx>>,
+    ) -> Self {
         Self {
             chain,
             petal_runner,
             loom_coin_type,
             fungible_petal_hash,
+            ctx,
             transient_counter: 0,
             seed: [0u8; 32],
         }
+    }
+
+    /// Run a closure with mutable access to the per-PTB host context.
+    ///
+    /// CRITICAL: callers MUST NOT call into `self.petal_runner` while
+    /// holding the lock — the runner's `call(...)` triggers wasm host
+    /// imports that re-acquire the same `Arc<Mutex<PtbHostCtx>>`,
+    /// which would deadlock. Each `with_ctx` call should perform one
+    /// short critical section: read what you need, drop the guard,
+    /// then call out.
+    fn with_ctx<R>(&self, f: impl FnOnce(&mut PtbHostCtx) -> R) -> R {
+        let mut g = self
+            .ctx
+            .lock()
+            .expect("PtbHostCtx mutex poisoned during executor dispatch");
+        f(&mut g)
     }
 
     /// Execute a validated PTB. Returns a complete
@@ -193,12 +255,13 @@ impl<'c> PtbExecutor<'c> {
     pub fn execute(&mut self, vtx: ValidatedPtb) -> ExecutionReport {
         let mut report = ExecutionReport::default();
         self.seed = vtx.tx.signing_digest();
-        let mut borrow_table = BorrowTable::new();
-        let mut command_outputs: Vec<Vec<Vec<u8>>> = Vec::with_capacity(vtx.tx.commands.len());
 
         // Track ownership changes for Loom-bearing objects. The
         // executor consults the per-object type tag to know whether to
-        // record a Loom delta.
+        // record a Loom delta. These accumulators are local because
+        // they're only touched by the executor's built-ins;
+        // host-import-attributed entries flow through
+        // `ctx.ownership_changes` and are folded in at the end.
         let mut planned_writes: Vec<Object> = Vec::new();
         let mut planned_deletes: Vec<ObjectId> = Vec::new();
         let mut ownership_changes: Vec<(ObjectId, Owner)> = Vec::new();
@@ -208,14 +271,17 @@ impl<'c> PtbExecutor<'c> {
         let mut fuel_remaining = vtx.tx.gas_budget;
 
         for (cmd_idx, cmd) in vtx.tx.commands.iter().enumerate() {
+            // Tell the host imports which command they're inside; the
+            // `current_command_idx` is read by `object.create` and any
+            // other §16.2 import that attributes work to a command.
+            self.with_ctx(|ctx| {
+                ctx.current_command_idx = cmd_idx as u16;
+            });
+
             let cmd_outputs = match self.dispatch_command(
                 cmd,
                 cmd_idx as u16,
                 &vtx,
-                &mut borrow_table,
-                &mut command_outputs,
-                &mut planned_writes,
-                &mut planned_deletes,
                 &mut ownership_changes,
                 &mut fuel_remaining,
                 &mut report,
@@ -223,15 +289,21 @@ impl<'c> PtbExecutor<'c> {
                 Ok(o) => o,
                 Err(e) => return revert(report, e),
             };
-            command_outputs.push(cmd_outputs);
 
-            if let Err(e) = borrow_table.diff_check(cmd_idx as u16) {
+            // Push this command's outputs into the shared ctx so later
+            // commands (and the chain VM's `ptb.command_output` host
+            // import inside subsequent Move calls) can read them.
+            self.with_ctx(|ctx| {
+                ctx.command_outputs.push(cmd_outputs);
+            });
+
+            if let Err(e) = self.with_ctx(|ctx| ctx.borrow_table.diff_check(cmd_idx as u16)) {
                 return revert(report, e);
             }
         }
 
         // Tx-end linearity check.
-        let orphans = borrow_table.linearity_check();
+        let orphans = self.with_ctx(|ctx| ctx.borrow_table.linearity_check());
         if !orphans.is_empty() {
             return revert(
                 report,
@@ -242,11 +314,18 @@ impl<'c> PtbExecutor<'c> {
             );
         }
 
-        // Commit: persistent rows whose payload changed go onto the
-        // write list. Transient rows that survived the linearity
-        // check (because they were transferred / shared / frozen via
-        // a built-in command) likewise get written.
-        for (_id, row) in borrow_table.iter() {
+        // Commit: drain the shared host context.
+        //
+        // - `borrow_table.iter()` produces persistent (touched) + transient
+        //   (surviving) rows. Host-created objects entered the borrow
+        //   table via `object.create` and are picked up here.
+        // - `ctx.object_deletes` carries host-`object.delete` ids.
+        // - `ctx.ownership_changes` carries host-`object.transfer/share/freeze` rekeys.
+        // - `ctx.loom_deltas` and `ctx.logs` flow through verbatim.
+        let drained = self.with_ctx(std::mem::take);
+        let command_outputs = drained.command_outputs;
+
+        for (_id, row) in drained.borrow_table.iter() {
             // Skip persistent rows that weren't touched.
             if row.origin_command_idx.is_none() {
                 // Persistent: only write if the version changed (i.e.
@@ -266,11 +345,17 @@ impl<'c> PtbExecutor<'c> {
             }
         }
 
+        // Fold host-import-attributed deltas in.
+        planned_deletes.extend(drained.object_deletes);
+        ownership_changes.extend(drained.ownership_changes);
+
         report.success = true;
         report.command_outputs = command_outputs;
         report.object_writes = planned_writes;
         report.object_deletes = planned_deletes;
         report.ownership_changes = ownership_changes;
+        report.loom_deltas = drained.loom_deltas;
+        report.logs = drained.logs;
         report
     }
 
@@ -278,59 +363,62 @@ impl<'c> PtbExecutor<'c> {
     // Per-command dispatch
     // -----------------------------------------------------------------
 
-    #[allow(clippy::too_many_arguments, clippy::ptr_arg)]
     fn dispatch_command(
         &mut self,
         cmd: &Command,
         cmd_idx: u16,
         vtx: &ValidatedPtb,
-        borrow_table: &mut BorrowTable,
-        command_outputs: &mut Vec<Vec<Vec<u8>>>,
-        planned_writes: &mut Vec<Object>,
-        planned_deletes: &mut Vec<ObjectId>,
         ownership_changes: &mut Vec<(ObjectId, Owner)>,
         fuel_remaining: &mut u64,
         report: &mut ExecutionReport,
     ) -> Result<Vec<Vec<u8>>, PtbError> {
-        self.dispatch_command_inner(
-            cmd,
-            cmd_idx,
-            vtx,
-            borrow_table,
-            command_outputs,
-            planned_writes,
-            planned_deletes,
-            ownership_changes,
-            fuel_remaining,
-            report,
-        )
+        // `object_writes` and `object_deletes` aren't accumulated here;
+        // executor- and host-attributed rows all land in
+        // `ctx.borrow_table` / `ctx.object_deletes` and are drained at
+        // the end of `execute(...)`. Only `ownership_changes` is still
+        // pushed here (by `exec_transfer`), since the TransferObjects
+        // builtin operates outside the host context.
+        match cmd {
+            Command::Move(m) => self.exec_move(m, cmd_idx, vtx, fuel_remaining, report),
+            Command::TransferObjects { uses, owner } => {
+                self.exec_transfer(uses, owner.clone(), cmd_idx, ownership_changes)
+            }
+            Command::SplitCoins { src, amounts } => {
+                self.exec_split_coins(src, amounts, cmd_idx)
+            }
+            Command::MergeCoins(uses) => self.exec_merge_coins(uses, cmd_idx),
+            Command::MakeMoveVec { ty, uses } => self.exec_make_vec_inner(ty, uses, cmd_idx),
+            Command::Publish(p) => self.exec_publish(p, cmd_idx, report),
+            Command::UpgradePetal(u) => self.exec_upgrade(u, cmd_idx, report),
+        }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn exec_move(
         &mut self,
         m: &MoveCmd,
         cmd_idx: u16,
         vtx: &ValidatedPtb,
-        borrow_table: &mut BorrowTable,
-        command_outputs: &[Vec<Vec<u8>>],
         fuel_remaining: &mut u64,
         _report: &mut ExecutionReport,
     ) -> Result<Vec<Vec<u8>>, PtbError> {
         // Load every Arg::Object into the borrow table (already type-
-        // checked by the validator).
+        // checked by the validator). This is the executor's contract
+        // with the host imports: by the time we call into wasm, every
+        // PTB-declared Object arg must be visible in `ctx.borrow_table`
+        // so `object.borrow` can mint a handle without doing chain I/O.
         for arg in &m.args {
             if let Arg::Object {
                 id, access_mode, ..
             } = arg
             {
-                if borrow_table.get(id).is_none() {
+                let already = self.with_ctx(|ctx| ctx.borrow_table.get(id).is_some());
+                if !already {
                     let obj = vtx
                         .objects
                         .get(&id.0)
                         .cloned()
                         .ok_or(PtbError::ObjectNotFound { id: *id })?;
-                    borrow_table.load_persistent(&obj, *access_mode);
+                    self.with_ctx(|ctx| ctx.borrow_table.load_persistent(&obj, *access_mode));
                 }
             }
         }
@@ -338,7 +426,11 @@ impl<'c> PtbExecutor<'c> {
         // Marshal args: a length-prefixed concatenation of per-arg
         // canonical bytes. The bloom-resource runtime on the guest
         // side decodes this prefix-length-blob format.
-        let args_buf = marshal_args(&m.args, command_outputs)?;
+        //
+        // We marshal *outside* the ctx lock — `marshal_args` needs to
+        // read prior command outputs, which we snapshot first.
+        let outputs_snapshot = self.with_ctx(|ctx| ctx.command_outputs.clone());
+        let args_buf = marshal_args(&m.args, &outputs_snapshot)?;
 
         let hash = m
             .petal
@@ -347,6 +439,9 @@ impl<'c> PtbExecutor<'c> {
                 path: m.petal.path.clone(),
             })?;
 
+        // Petal call: DO NOT hold the ctx lock here. The wasm host
+        // imports (chain_vm.rs) reach back into `ctx` via the same
+        // Arc<Mutex>; deadlock if we held it.
         let result = self
             .petal_runner
             .call(&hash, &m.function, &m.type_args, &args_buf, *fuel_remaining)?;
@@ -384,14 +479,13 @@ impl<'c> PtbExecutor<'c> {
         uses: &[UseRef],
         owner: Owner,
         cmd_idx: u16,
-        command_outputs: &[Vec<Vec<u8>>],
-        borrow_table: &mut BorrowTable,
         ownership_changes: &mut Vec<(ObjectId, Owner)>,
     ) -> Result<Vec<Vec<u8>>, PtbError> {
         // Each Use must resolve to a transient object id; we decode
         // the upstream output bytes as `ObjectId` (32 bytes).
+        let outputs_snapshot = self.with_ctx(|ctx| ctx.command_outputs.clone());
         for u in uses {
-            let bytes = lookup_use(command_outputs, *u, cmd_idx)?;
+            let bytes = lookup_use(&outputs_snapshot, *u, cmd_idx)?;
             if bytes.len() != 32 {
                 return Err(PtbError::BuiltinFailed {
                     cmd_idx,
@@ -404,12 +498,16 @@ impl<'c> PtbExecutor<'c> {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&bytes);
             let id = ObjectId(arr);
-            let row = borrow_table
-                .get_mut(&id)
-                .ok_or(PtbError::ObjectNotFound { id })?;
-            row.owner = owner.clone();
+            self.with_ctx(|ctx| -> Result<(), PtbError> {
+                let row = ctx
+                    .borrow_table
+                    .get_mut(&id)
+                    .ok_or(PtbError::ObjectNotFound { id })?;
+                row.owner = owner.clone();
+                ctx.borrow_table.mark_consumed(&id);
+                Ok(())
+            })?;
             ownership_changes.push((id, owner.clone()));
-            borrow_table.mark_consumed(&id);
         }
         Ok(vec![])
     }
@@ -419,10 +517,9 @@ impl<'c> PtbExecutor<'c> {
         src: &UseRef,
         amounts: &[u128],
         cmd_idx: u16,
-        command_outputs: &[Vec<Vec<u8>>],
-        borrow_table: &mut BorrowTable,
     ) -> Result<Vec<Vec<u8>>, PtbError> {
-        let bytes = lookup_use(command_outputs, *src, cmd_idx)?;
+        let outputs_snapshot = self.with_ctx(|ctx| ctx.command_outputs.clone());
+        let bytes = lookup_use(&outputs_snapshot, *src, cmd_idx)?;
         if bytes.len() != 32 {
             return Err(PtbError::BuiltinFailed {
                 cmd_idx,
@@ -432,20 +529,23 @@ impl<'c> PtbExecutor<'c> {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
         let src_id = ObjectId(arr);
-        let src_row = borrow_table
-            .get_mut(&src_id)
-            .ok_or(PtbError::ObjectNotFound { id: src_id })?;
-        // Decode value from canonical 48-byte [id(32)||value(16)] payload.
-        let mut value = decode_coin_value(&src_row.payload_bytes).map_err(|_| {
-            PtbError::BuiltinFailed {
-                cmd_idx,
-                reason: "SplitCoins src has invalid Coin payload".to_string(),
-            }
+
+        // Pull what we need from the source row in one short critical
+        // section.
+        let (mut value, coin_type, owner, src_id_prefix) = self.with_ctx(|ctx| {
+            let src_row = ctx
+                .borrow_table
+                .get(&src_id)
+                .ok_or(PtbError::ObjectNotFound { id: src_id })?;
+            let v = decode_coin_value(&src_row.payload_bytes).map_err(|_| {
+                PtbError::BuiltinFailed {
+                    cmd_idx,
+                    reason: "SplitCoins src has invalid Coin payload".to_string(),
+                }
+            })?;
+            let prefix: [u8; 32] = src_row.payload_bytes[..32].try_into().unwrap();
+            Ok::<_, PtbError>((v, src_row.type_tag.clone(), src_row.owner.clone(), prefix))
         })?;
-        let coin_type = src_row.type_tag.clone();
-        let owner = src_row.owner.clone();
-        // Preserve the 32-byte id prefix from the source coin payload.
-        let src_id_prefix: [u8; 32] = src_row.payload_bytes[..32].try_into().unwrap();
 
         let total_out: u128 = amounts.iter().try_fold(0u128, |acc, a| {
             acc.checked_add(*a)
@@ -464,20 +564,22 @@ impl<'c> PtbExecutor<'c> {
         }
         value -= total_out;
 
-        // Write the source's new value back using canonical 48-byte format,
-        // preserving its id prefix; mark dirty so diff_check bumps the version.
+        // Write the source's new value back using canonical 48-byte
+        // format, preserving its id prefix; mark dirty so diff_check
+        // bumps the version.
         let mut new_payload = src_id_prefix.to_vec();
         new_payload.extend_from_slice(&value.to_be_bytes());
-        borrow_table.mark_dirty(&src_id, new_payload)?;
+        self.with_ctx(|ctx| ctx.borrow_table.mark_dirty(&src_id, new_payload))?;
 
-        // Emit one transient Coin per requested amount, each with a canonical
-        // 48-byte payload: [transient id (32 bytes)] || [amount BE (16 bytes)].
+        // Emit one transient Coin per requested amount, each with a
+        // canonical 48-byte payload: [transient id (32 bytes)] ||
+        // [amount BE (16 bytes)].
         let mut outs: Vec<Vec<u8>> = Vec::with_capacity(amounts.len());
         for amt in amounts {
             let id = self.mint_transient_id(b"split-coin");
             let mut payload = id.0.to_vec();
             payload.extend_from_slice(&amt.to_be_bytes());
-            borrow_table.insert_transient(BorrowRow {
+            let row = BorrowRow {
                 object_id: id,
                 type_tag: coin_type.clone(),
                 owner: owner.clone(),
@@ -487,7 +589,8 @@ impl<'c> PtbExecutor<'c> {
                 origin_command_idx: Some(cmd_idx),
                 dirty: false,
                 baseline_payload: payload,
-            });
+            };
+            self.with_ctx(|ctx| ctx.borrow_table.insert_transient(row));
             outs.push(id.0.to_vec());
         }
 
@@ -498,8 +601,6 @@ impl<'c> PtbExecutor<'c> {
         &mut self,
         uses: &[UseRef],
         cmd_idx: u16,
-        command_outputs: &[Vec<Vec<u8>>],
-        borrow_table: &mut BorrowTable,
     ) -> Result<Vec<Vec<u8>>, PtbError> {
         if uses.is_empty() {
             return Err(PtbError::BuiltinFailed {
@@ -507,12 +608,13 @@ impl<'c> PtbExecutor<'c> {
                 reason: "MergeCoins requires at least one Use".to_string(),
             });
         }
+        let outputs_snapshot = self.with_ctx(|ctx| ctx.command_outputs.clone());
         let mut accum: u128 = 0;
         let mut first_id: Option<ObjectId> = None;
         let mut first_type: Option<TypeTag> = None;
         let mut first_owner: Option<Owner> = None;
         for u in uses {
-            let bytes = lookup_use(command_outputs, *u, cmd_idx)?;
+            let bytes = lookup_use(&outputs_snapshot, *u, cmd_idx)?;
             if bytes.len() != 32 {
                 return Err(PtbError::BuiltinFailed {
                     cmd_idx,
@@ -522,45 +624,58 @@ impl<'c> PtbExecutor<'c> {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&bytes);
             let id = ObjectId(arr);
-            let row = borrow_table
-                .get(&id)
-                .ok_or(PtbError::ObjectNotFound { id })?;
-            let v = decode_coin_value(&row.payload_bytes).map_err(|_| PtbError::BuiltinFailed {
-                cmd_idx,
-                reason: "MergeCoins: invalid Coin payload".to_string(),
-            })?;
+            // Read row data + perform the drop (for non-first ids) in
+            // one critical section.
+            let (v, ty, ow, is_first) =
+                self.with_ctx(|ctx| -> Result<(u128, TypeTag, Owner, bool), PtbError> {
+                    let row = ctx
+                        .borrow_table
+                        .get(&id)
+                        .ok_or(PtbError::ObjectNotFound { id })?;
+                    let v = decode_coin_value(&row.payload_bytes).map_err(|_| {
+                        PtbError::BuiltinFailed {
+                            cmd_idx,
+                            reason: "MergeCoins: invalid Coin payload".to_string(),
+                        }
+                    })?;
+                    let ty = row.type_tag.clone();
+                    let ow = row.owner.clone();
+                    let is_first = first_id.is_none();
+                    if !is_first {
+                        ctx.borrow_table.drop_row(&id);
+                    }
+                    Ok((v, ty, ow, is_first))
+                })?;
             accum = accum
                 .checked_add(v)
                 .ok_or_else(|| PtbError::BuiltinFailed {
                     cmd_idx,
                     reason: "MergeCoins: total overflow".to_string(),
                 })?;
-            if first_id.is_none() {
+            if is_first {
                 first_id = Some(id);
-                first_type = Some(row.type_tag.clone());
-                first_owner = Some(row.owner.clone());
+                first_type = Some(ty);
+                first_owner = Some(ow);
             } else {
-                // Type + owner must agree.
-                if row.type_tag != *first_type.as_ref().unwrap() {
+                if ty != *first_type.as_ref().unwrap() {
                     return Err(PtbError::BuiltinFailed {
                         cmd_idx,
                         reason: "MergeCoins: heterogeneous coin types".to_string(),
                     });
                 }
-                if row.owner != *first_owner.as_ref().unwrap() {
+                if ow != *first_owner.as_ref().unwrap() {
                     return Err(PtbError::BuiltinFailed {
                         cmd_idx,
                         reason: "MergeCoins: heterogeneous owners".to_string(),
                     });
                 }
-                borrow_table.drop_row(&id);
             }
         }
         let id = first_id.unwrap();
         // Write merged total in canonical 48-byte format: [id (32)] || [total BE (16)].
         let mut merged_payload = id.0.to_vec();
         merged_payload.extend_from_slice(&accum.to_be_bytes());
-        borrow_table.mark_dirty(&id, merged_payload)?;
+        self.with_ctx(|ctx| ctx.borrow_table.mark_dirty(&id, merged_payload))?;
         Ok(vec![id.0.to_vec()])
     }
 
@@ -607,6 +722,27 @@ impl<'c> PtbExecutor<'c> {
         Ok(vec![wasm_hash.0.to_vec()])
     }
 
+    fn exec_make_vec_inner(
+        &mut self,
+        _ty: &TypeTag,
+        uses: &[UseRef],
+        cmd_idx: u16,
+    ) -> Result<Vec<Vec<u8>>, PtbError> {
+        let outputs_snapshot = self.with_ctx(|ctx| ctx.command_outputs.clone());
+        let mut out = Vec::with_capacity(uses.len() * 32);
+        for u in uses {
+            let bytes = lookup_use(&outputs_snapshot, *u, cmd_idx)?;
+            if bytes.len() != 32 {
+                return Err(PtbError::BuiltinFailed {
+                    cmd_idx,
+                    reason: format!("MakeMoveVec entry must be 32-byte id, got {}", bytes.len()),
+                });
+            }
+            out.extend_from_slice(&bytes);
+        }
+        Ok(vec![out])
+    }
+
     /// Derive a fresh transient `ObjectId` deterministic per-tx.
     fn mint_transient_id(&mut self, tag: &[u8]) -> ObjectId {
         self.transient_counter = self.transient_counter.saturating_add(1);
@@ -623,80 +759,6 @@ impl<'c> PtbExecutor<'c> {
 // doesn't flag it.
 #[allow(dead_code)]
 fn _abilities_compile_assert(_: AbilitySet) {}
-
-// Re-implementation: `dispatch_command` above used `unreachable!()` as
-// a placeholder; rewrite the function below as a clean single-match
-// returning the per-command outputs and replace the call site.
-impl<'c> PtbExecutor<'c> {
-    #[allow(clippy::too_many_arguments, clippy::ptr_arg)]
-    fn dispatch_command_inner(
-        &mut self,
-        cmd: &Command,
-        cmd_idx: u16,
-        vtx: &ValidatedPtb,
-        borrow_table: &mut BorrowTable,
-        command_outputs: &mut Vec<Vec<Vec<u8>>>,
-        _planned_writes: &mut Vec<Object>,
-        _planned_deletes: &mut Vec<ObjectId>,
-        ownership_changes: &mut Vec<(ObjectId, Owner)>,
-        fuel_remaining: &mut u64,
-        report: &mut ExecutionReport,
-    ) -> Result<Vec<Vec<u8>>, PtbError> {
-        match cmd {
-            Command::Move(m) => self.exec_move(
-                m,
-                cmd_idx,
-                vtx,
-                borrow_table,
-                command_outputs,
-                fuel_remaining,
-                report,
-            ),
-            Command::TransferObjects { uses, owner } => self.exec_transfer(
-                uses,
-                owner.clone(),
-                cmd_idx,
-                command_outputs,
-                borrow_table,
-                ownership_changes,
-            ),
-            Command::SplitCoins { src, amounts } => self.exec_split_coins(
-                src,
-                amounts,
-                cmd_idx,
-                command_outputs,
-                borrow_table,
-            ),
-            Command::MergeCoins(uses) => {
-                self.exec_merge_coins(uses, cmd_idx, command_outputs, borrow_table)
-            }
-            Command::MakeMoveVec { ty, uses } => self.exec_make_vec_inner(ty, uses, cmd_idx, command_outputs),
-            Command::Publish(p) => self.exec_publish(p, cmd_idx, report),
-            Command::UpgradePetal(u) => self.exec_upgrade(u, cmd_idx, report),
-        }
-    }
-
-    fn exec_make_vec_inner(
-        &mut self,
-        _ty: &TypeTag,
-        uses: &[UseRef],
-        cmd_idx: u16,
-        command_outputs: &[Vec<Vec<u8>>],
-    ) -> Result<Vec<Vec<u8>>, PtbError> {
-        let mut out = Vec::with_capacity(uses.len() * 32);
-        for u in uses {
-            let bytes = lookup_use(command_outputs, *u, cmd_idx)?;
-            if bytes.len() != 32 {
-                return Err(PtbError::BuiltinFailed {
-                    cmd_idx,
-                    reason: format!("MakeMoveVec entry must be 32-byte id, got {}", bytes.len()),
-                });
-            }
-            out.extend_from_slice(&bytes);
-        }
-        Ok(vec![out])
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -911,6 +973,7 @@ fn encode_arg_for_scope(arg: &Arg) -> Result<Vec<u8>, PtbError> {
 mod tests {
     use super::*;
     use crate::chain_iface::{ArgDeclStub, FunctionDeclStub, PetalManifestStub};
+    use crate::host_ctx::HandleEntry;
     use crate::types::{
         Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PqSignature, PtbTx, PublishCmd, UseRef,
         loom_coin_type_tag,
@@ -1600,5 +1663,359 @@ mod tests {
         assert!(report.success);
         assert_eq!(report.publish_events.len(), 1);
         assert!(!report.publish_events[0].minted_owner_cap);
+    }
+
+    // ------------------------------------------------------------------
+    // P0-2 / P1-1 conformance tests (shared borrow table)
+    // ------------------------------------------------------------------
+
+    /// Petal runner that asserts the shared ctx holds the preloaded
+    /// object row when its `call(...)` body runs, then optionally
+    /// inserts a host-created object into the borrow table to simulate
+    /// the `object.create` host import.
+    struct AssertingRunner<'a> {
+        ctx: Arc<Mutex<PtbHostCtx>>,
+        expect_preloaded: Vec<ObjectId>,
+        /// (function, return buffer, fuel).
+        canned: HashMap<String, (Vec<u8>, u64)>,
+        /// On a call to this function name, simulate `object.create`
+        /// by inserting these objects into both `borrow_table` and
+        /// `created_objects`. We thread the cell so the runner can
+        /// pop a Vec per call without taking &mut self.
+        host_creates: std::cell::RefCell<HashMap<String, Vec<Object>>>,
+        /// Verifies that calling the runner does NOT find a held lock
+        /// in the ctx mutex (i.e. the executor released it).
+        try_lock_must_succeed: std::cell::Cell<bool>,
+        _life: std::marker::PhantomData<&'a ()>,
+    }
+
+    impl<'a> AssertingRunner<'a> {
+        fn new(ctx: Arc<Mutex<PtbHostCtx>>) -> Self {
+            Self {
+                ctx,
+                expect_preloaded: Vec::new(),
+                canned: HashMap::new(),
+                host_creates: std::cell::RefCell::new(HashMap::new()),
+                try_lock_must_succeed: std::cell::Cell::new(false),
+                _life: std::marker::PhantomData,
+            }
+        }
+        fn set(&mut self, func: &str, ret_buf: Vec<u8>, fuel: u64) {
+            self.canned.insert(func.to_string(), (ret_buf, fuel));
+        }
+    }
+
+    impl<'a> PetalRunner for AssertingRunner<'a> {
+        fn call(
+            &self,
+            _petal_hash: &Hash32,
+            function: &str,
+            _type_args: &[TypeTag],
+            _args_buf: &[u8],
+            _fuel_budget: u64,
+        ) -> Result<PetalCallResult, PtbError> {
+            // Test #3: the executor must have released the lock before
+            // calling us. If `try_lock_must_succeed` is set we assert
+            // the lock acquires cleanly here (would deadlock if the
+            // executor held it across the call).
+            if self.try_lock_must_succeed.get() {
+                let g = self.ctx.try_lock();
+                assert!(g.is_ok(), "executor held ctx lock across petal call");
+                drop(g);
+            }
+            // Test #1: preloaded objects must be visible in the borrow
+            // table.
+            {
+                let g = self.ctx.lock().unwrap();
+                for id in &self.expect_preloaded {
+                    assert!(
+                        g.borrow_table.get(id).is_some(),
+                        "preloaded object {id:?} not visible to host import"
+                    );
+                }
+            }
+            // Test #2: simulate `object.create` host import.
+            if let Some(creates) = self.host_creates.borrow_mut().remove(function) {
+                let mut g = self.ctx.lock().unwrap();
+                for obj in creates {
+                    let row = BorrowRow {
+                        object_id: obj.id,
+                        type_tag: obj.type_tag.clone(),
+                        owner: obj.owner.clone(),
+                        version: 0,
+                        payload_bytes: obj.payload.clone(),
+                        access_mode: AccessMode::Mutable,
+                        origin_command_idx: Some(g.current_command_idx),
+                        dirty: false,
+                        baseline_payload: obj.payload.clone(),
+                    };
+                    g.borrow_table.insert_transient(row);
+                    let _ = g.alloc_handle(HandleEntry {
+                        object_id: obj.id,
+                        created: true,
+                    });
+                    g.created_objects.push(obj);
+                }
+            }
+            let (buf, fuel) = self
+                .canned
+                .get(function)
+                .cloned()
+                .ok_or(PtbError::PetalAbort {
+                    cmd_idx: 0,
+                    code: -1,
+                })?;
+            Ok(PetalCallResult {
+                ret_buf: buf,
+                fuel_used: fuel,
+            })
+        }
+
+        fn call_invariant(
+            &self,
+            _petal_hash: &Hash32,
+            _export_name: &str,
+            _scope_buf: &[u8],
+            _fuel_budget: u64,
+        ) -> Result<InvariantResult, PtbError> {
+            Ok(InvariantResult {
+                ok: true,
+                fuel_used: 0,
+            })
+        }
+    }
+
+    /// P0-2 conformance: a PTB with `Arg::Object{id, Mutable}` must
+    /// preload the row into the *shared* `ctx.borrow_table` before
+    /// dispatching the wasm call, so `object.borrow` host import sees
+    /// it. We assert from inside the runner's `call(...)`.
+    #[test]
+    fn preloaded_object_visible_to_host_import() {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        let coin_id = ObjectId([0xCD; 32]);
+        chain.put_object(make_coin(0xCD, signer, 100, 0));
+        chain.put_petal(
+            petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/p".to_string(),
+                functions: vec![FunctionDeclStub {
+                    name: "f".to_string(),
+                    type_params: vec![],
+                    args: vec![ArgDeclStub::Object {
+                        ty: loom_tt(),
+                        mode: AccessMode::Mutable,
+                    }],
+                    returns: vec![],
+                    attached_invariants: vec![],
+                }],
+                object_types: vec![],
+                external_type_refs: vec![],
+            },
+        );
+
+        let ctx = Arc::new(Mutex::new(PtbHostCtx::new()));
+        let mut runner = AssertingRunner::new(Arc::clone(&ctx));
+        runner.expect_preloaded.push(coin_id);
+        runner.try_lock_must_succeed.set(true);
+        runner.set("f", build_outputs(&[]), 5);
+
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/p".to_string(),
+                    hash: Some(petal),
+                },
+                function: "f".to_string(),
+                type_args: vec![],
+                args: vec![Arg::Object {
+                    id: coin_id,
+                    expected_version: ExpectedVersion(0),
+                    access_mode: AccessMode::Mutable,
+                }],
+            })],
+        );
+
+        let verifier = AlwaysOkVerifier;
+        let vctx = ValidationContext {
+            current_block: chain.block,
+            chain: &chain,
+            verifier: &verifier,
+            loom_coin_type: loom_tt(),
+        };
+        let validated = validate_ptb(&tx, &vctx).unwrap();
+        let mut exec = PtbExecutor::with_ctx_arc(
+            &chain,
+            &runner,
+            loom_tt(),
+            Hash32([0; 32]),
+            Arc::clone(&ctx),
+        );
+        let report = exec.execute(validated);
+        assert!(report.success, "report: {report:?}");
+    }
+
+    /// P1-1 conformance: an object created by a host import inside a
+    /// Move call must end up in `report.object_writes`. We simulate
+    /// `object.create` by directly inserting into the shared ctx from
+    /// our mock runner.
+    #[test]
+    fn host_created_object_survives_to_report() {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        chain.put_petal(
+            petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/p".to_string(),
+                functions: vec![FunctionDeclStub {
+                    name: "mint".to_string(),
+                    type_params: vec![],
+                    args: vec![],
+                    returns: vec![],
+                    attached_invariants: vec![],
+                }],
+                object_types: vec![],
+                external_type_refs: vec![],
+            },
+        );
+
+        let new_id = ObjectId([0x77; 32]);
+        // 48-byte payload: [id (32)] || [value BE (16)].
+        let mut payload = new_id.0.to_vec();
+        payload.extend_from_slice(&123u128.to_be_bytes());
+        let host_obj = Object {
+            id: new_id,
+            type_tag: loom_tt(),
+            // Defaults the host import gives newly-created objects:
+            // the petal's contract address. We use the same signer
+            // for simplicity — the test only cares the object ends up
+            // in writes; transfer is exercised in the e2e test.
+            owner: Owner::Address(signer),
+            version: 0,
+            payload,
+        };
+
+        let ctx = Arc::new(Mutex::new(PtbHostCtx::new()));
+        let mut runner = AssertingRunner::new(Arc::clone(&ctx));
+        runner.set("mint", build_outputs(&[&new_id.0]), 10);
+        runner
+            .host_creates
+            .borrow_mut()
+            .insert("mint".to_string(), vec![host_obj]);
+
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/p".to_string(),
+                        hash: Some(petal),
+                    },
+                    function: "mint".to_string(),
+                    type_args: vec![],
+                    args: vec![],
+                }),
+                // Transfer the new object to the signer to satisfy
+                // tx-end linearity. The Use(0,0) is the 32-byte id
+                // the mock runner emitted.
+                Command::TransferObjects {
+                    uses: vec![UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    }],
+                    owner: Owner::Address(signer),
+                },
+            ],
+        );
+
+        let verifier = AlwaysOkVerifier;
+        let vctx = ValidationContext {
+            current_block: chain.block,
+            chain: &chain,
+            verifier: &verifier,
+            loom_coin_type: loom_tt(),
+        };
+        let validated = validate_ptb(&tx, &vctx).unwrap();
+        let mut exec = PtbExecutor::with_ctx_arc(
+            &chain,
+            &runner,
+            loom_tt(),
+            Hash32([0; 32]),
+            Arc::clone(&ctx),
+        );
+        let report = exec.execute(validated);
+        assert!(report.success, "report: {report:?}");
+        assert!(
+            report.object_writes.iter().any(|o| o.id == new_id),
+            "host-created object missing from report.object_writes: {:?}",
+            report.object_writes.iter().map(|o| o.id).collect::<Vec<_>>()
+        );
+    }
+
+    /// P0-2 / no-deadlock: prove the executor does not hold the ctx
+    /// lock across the `petal_runner.call(...)` boundary. The runner
+    /// invokes `try_lock()` on the ctx; a `Poisoned` or `WouldBlock`
+    /// would fail the test.
+    #[test]
+    fn executor_releases_lock_across_petal_call() {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        chain.put_petal(
+            petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/p".to_string(),
+                functions: vec![FunctionDeclStub {
+                    name: "f".to_string(),
+                    type_params: vec![],
+                    args: vec![],
+                    returns: vec![],
+                    attached_invariants: vec![],
+                }],
+                object_types: vec![],
+                external_type_refs: vec![],
+            },
+        );
+        let ctx = Arc::new(Mutex::new(PtbHostCtx::new()));
+        let mut runner = AssertingRunner::new(Arc::clone(&ctx));
+        runner.try_lock_must_succeed.set(true);
+        runner.set("f", build_outputs(&[]), 5);
+
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/p".to_string(),
+                    hash: Some(petal),
+                },
+                function: "f".to_string(),
+                type_args: vec![],
+                args: vec![],
+            })],
+        );
+
+        let verifier = AlwaysOkVerifier;
+        let vctx = ValidationContext {
+            current_block: chain.block,
+            chain: &chain,
+            verifier: &verifier,
+            loom_coin_type: loom_tt(),
+        };
+        let validated = validate_ptb(&tx, &vctx).unwrap();
+        let mut exec = PtbExecutor::with_ctx_arc(
+            &chain,
+            &runner,
+            loom_tt(),
+            Hash32([0; 32]),
+            Arc::clone(&ctx),
+        );
+        let report = exec.execute(validated);
+        assert!(report.success);
     }
 }

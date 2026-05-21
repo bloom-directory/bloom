@@ -32,11 +32,13 @@ use bloom_chain_node::petal_executor::{
 use bloom_chain_state::State;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
-use bloom_objects::{Object, ObjectId, Owner};
+use bloom_objects::{
+    OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey, TypeTag,
+};
 use bloom_script::{
-    chain_iface::{FunctionDeclStub, PetalManifestStub},
+    chain_iface::{ArgDeclStub, FunctionDeclStub, PetalManifestStub},
     encode_ptb, loom_coin_type_tag,
-    types::{Command, MoveCmd, PetalRef, PqSignature, PtbTx},
+    types::{Arg, Command, MoveCmd, PetalRef, PqSignature, PtbTx},
 };
 
 /// Build the smallest possible `TxKind::SubmitPtb` transaction with
@@ -491,4 +493,257 @@ fn out_of_fuel_reverts_atomically() {
         r.contains("fuel") || r.contains("out of") || r.contains("oof"),
         "expected out-of-fuel-flavoured revert reason, got: {reason}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Test 6 — `object.create` + `object.transfer` round-trip through the
+// unified PtbHostCtx (P0-2 + P1-1 conformance fix).
+//
+// This test is the end-to-end guard for the borrow-table unification:
+// the wasm petal mints a brand-new object via `object.create` and then
+// hands it off to a fresh owner via `object.transfer`. Both host
+// imports operate on the PtbHostCtx's borrow table; before the fix
+// they wrote into a ctx the PTB executor never read, so the new
+// object would have vanished at commit time.
+//
+// After the fix, the executor's end-of-execute drain folds the
+// host-attributed borrow rows + ownership changes into
+// `ExecutionReport.object_writes` and `.ownership_changes`. Those land
+// in the `ExecOutput.write_set`, which we then `State::apply` to drive
+// the visible-state assertions:
+//
+//   1. `out.success == true` (no revert),
+//   2. After applying the write set, the new object lives at the
+//      derived `ObjectId` with `Owner::Address(recipient)`,
+//   3. The OwnershipIndex contains the new object under the recipient,
+//   4. The OwnershipIndex does NOT keep the new object under the petal
+//      contract address (the default-owner the host assigns at create
+//      time — the transfer overrides it before the command ends).
+// ---------------------------------------------------------------------------
+
+/// WAT petal that:
+///   1. Reads a 90-byte `Const` blob from calldata starting at byte 9
+///      (the marshalled layout is `[u32 count=1][u8 tag=1][u32 len=90]
+///      [90 bytes]`).
+///   2. The 90-byte blob holds: `[u16 BE type_tag_len=38][38 type_tag
+///      bytes][u16 BE payload_len=16][16 payload bytes][32 recipient
+///      bytes]`. We pass the type tag dynamically because it embeds
+///      the petal's content hash, which is only known after the petal
+///      is published.
+///   3. Calls `object.create(type_tag_ptr=2, type_tag_len=38,
+///      payload_ptr=42, payload_len=16)` → handle.
+///   4. Calls `object.transfer(handle, OWNER_KIND_ADDRESS=0,
+///      recipient_ptr=58, 32)`.
+const CREATE_AND_TRANSFER_PETAL: &str = r#"
+(module
+  (import "chain"  "msg.calldata.read"
+    (func $cdread (param i32 i32 i32) (result i32)))
+  (import "object" "create"
+    (func $ocreate (param i32 i32 i32 i32) (result i32)))
+  (import "object" "transfer"
+    (func $otransfer (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+
+  (func (export "__petal_create_and_transfer") (param i32 i32) (result i32)
+    ;; Pull the 90-byte Const payload out of calldata into memory[0..90].
+    ;; Const payload starts at calldata offset 9
+    ;; (4-byte count u32 BE | 1-byte tag=1 | 4-byte len u32 BE).
+    (drop (call $cdread
+            (i32.const 0)   ;; dst_ptr
+            (i32.const 9)   ;; offset
+            (i32.const 90))) ;; len
+
+    ;; object.create(type_tag_ptr=2, type_tag_len=38,
+    ;;               payload_ptr=42, payload_len=16) -> handle
+    ;; (mem layout: [u16 BE tag_len][38 tag][u16 BE pay_len][16 pay][32 recip])
+    ;;                 0..2          2..40    40..42         42..58   58..90
+    (drop (call $otransfer
+            (call $ocreate
+                  (i32.const 2)
+                  (i32.const 38)
+                  (i32.const 42)
+                  (i32.const 16))
+            (i32.const 0)   ;; OWNER_KIND_ADDRESS
+            (i32.const 58)  ;; recipient_ptr
+            (i32.const 32))) ;; recipient_len
+
+    i32.const 0)
+)
+"#;
+
+/// Compute the deterministic ObjectId the host's `derive_create_id`
+/// will produce for `(petal_hash, type_tag_bytes, payload_bytes,
+/// created_objects_so_far=0)`. Mirrors `bloom-petals` exactly.
+fn derive_create_id_test(petal_hash: [u8; 32], tag_bytes: &[u8], payload: &[u8]) -> ObjectId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.object.create.v1\0");
+    hasher.update(&petal_hash);
+    hasher.update(&0u64.to_be_bytes()); // first object created in this PTB
+    hasher.update(tag_bytes);
+    hasher.update(payload);
+    let h = hasher.finalize();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(h.as_bytes());
+    ObjectId(arr)
+}
+
+#[test]
+fn object_create_then_transfer_round_trips_through_unified_ctx() {
+    // Test inputs ------------------------------------------------------
+    let signer = [0x91u8; 32];
+    let gas_payer_id = ObjectId([0xBB; 32]);
+    let recipient: [u8; 32] = [0xAB; 32];
+    let new_obj_payload: [u8; 16] = [0x42; 16]; // 16 arbitrary bytes
+    let new_obj_type_name = "T";
+
+    // Build state + register the petal --------------------------------
+    let mut state = State::new();
+    let wasm = wat(CREATE_AND_TRANSFER_PETAL);
+    let petal_hash = state.insert_code(&wasm);
+    state.set_object(make_loom_coin(gas_payer_id, signer, 1_000_000_000));
+
+    // Encode the TypeTag for the new object. The defining-petal hash
+    // is the petal we just registered (object.create enforces this).
+    let new_obj_type = TypeTag::Concrete {
+        petal_hash: petal_hash.0,
+        type_name: new_obj_type_name.to_string(),
+        type_args: vec![],
+    };
+    let tag_bytes = new_obj_type
+        .encode_canonical()
+        .expect("encode type tag");
+    assert_eq!(
+        tag_bytes.len(),
+        38,
+        "type tag size assumption for 1-char name + 0 type args",
+    );
+
+    // Assemble the 90-byte calldata blob -------------------------------
+    //   [u16 BE tag_len=38][38 tag][u16 BE pay_len=16][16 pay][32 recip]
+    let mut blob = Vec::with_capacity(90);
+    blob.extend_from_slice(&(tag_bytes.len() as u16).to_be_bytes());
+    blob.extend_from_slice(&tag_bytes);
+    blob.extend_from_slice(&(new_obj_payload.len() as u16).to_be_bytes());
+    blob.extend_from_slice(&new_obj_payload);
+    blob.extend_from_slice(&recipient);
+    assert_eq!(blob.len(), 90);
+
+    // Build a manifest declaring one `Const` arg of arbitrary type --
+    // the validator only checks variant-shape, not the inner TypeTag.
+    let mut manifests = HashMap::new();
+    manifests.insert(
+        petal_hash,
+        PetalManifestStub {
+            module_path: "/test/e2e".to_string(),
+            functions: vec![FunctionDeclStub {
+                name: "create_and_transfer".to_string(),
+                type_params: vec![],
+                args: vec![ArgDeclStub::Const(new_obj_type.clone())],
+                returns: vec![],
+                attached_invariants: vec![],
+            }],
+            ..Default::default()
+        },
+    );
+
+    // Build the PTB ---------------------------------------------------
+    let ptb = PtbTx {
+        signers: vec![signer],
+        commands: vec![Command::Move(MoveCmd {
+            petal: PetalRef {
+                path: String::new(),
+                hash: Some(petal_hash),
+            },
+            function: "create_and_transfer".to_string(),
+            type_args: vec![],
+            args: vec![Arg::Const(blob)],
+        })],
+        gas_payer: gas_payer_id,
+        gas_budget: 500_000,
+        gas_price: 1,
+        expiry_block: 100,
+        signatures: vec![PqSignature(vec![0u8; 64])],
+    };
+    let bytes = encode_ptb(&ptb).expect("encode PTB");
+    let tx = submit_ptb_tx(test_sender(), bytes);
+
+    // Run -------------------------------------------------------------
+    let exec = ChainPetalExecutorWithManifests::new(manifests);
+    let out = exec.execute_tx(
+        &tx,
+        &mut state,
+        /* block_number */ 100,
+        /* timestamp_ms */ 1_700_000_000_000,
+        /* proposer    */ Address([0xAA; 32]),
+        /* parent_hash */ Hash32([0u8; 32]),
+    );
+
+    // Assert 1 — no revert.
+    assert!(
+        out.success,
+        "expected PTB success, got revert: {}",
+        String::from_utf8_lossy(&out.return_data)
+    );
+    let ws = out.write_set.expect("successful PTB must emit a write set");
+
+    // Apply the WriteSet so we can query the resulting State.
+    state.apply(ws).expect("apply write set");
+
+    // Compute the deterministic ObjectId the host produced.
+    let new_id = derive_create_id_test(petal_hash.0, &tag_bytes, &new_obj_payload);
+
+    // Assert 2 — the new object lives at the derived id with the right
+    // owner. Before the P0-2 fix this lookup returned `None` because
+    // the host-import borrow row never made it into the executor's
+    // drain step.
+    let stored = state
+        .get_object(&new_id)
+        .unwrap_or_else(|| {
+            panic!(
+                "host-created object missing from State; \
+                 ids present: {:?}",
+                state.iter_objects().map(|(id, _)| *id).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        stored.owner,
+        Owner::Address(recipient),
+        "host transfer must rewrite owner before commit",
+    );
+    assert_eq!(stored.payload, new_obj_payload, "payload must round-trip");
+    assert_eq!(
+        stored.type_tag, new_obj_type,
+        "type tag must round-trip via canonical encoding",
+    );
+
+    // Assert 3 — OwnershipIndex contains the new object under the
+    // recipient. Before the P0-2 fix the host's ownership_changes
+    // entry was dropped on the floor.
+    let recipient_key = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: recipient,
+    };
+    let row = state
+        .get_ownership(&recipient_key)
+        .expect("ownership row for recipient must exist");
+    assert!(
+        row.contains(&new_id),
+        "recipient row missing new object id; row = {row:?}",
+    );
+
+    // Assert 4 — OwnershipIndex must NOT keep the new object under
+    // the petal contract address (the default owner at create time).
+    // `rebuild_ownership_rows` only writes the new-owner row in Phase
+    // 1, so we just check that the petal-address row, if present,
+    // doesn't list the new id.
+    let petal_address_key = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: petal_hash.0,
+    };
+    if let Some(row) = state.get_ownership(&petal_address_key) {
+        assert!(
+            !row.contains(&new_id),
+            "petal-address row must not retain the transferred object",
+        );
+    }
 }
