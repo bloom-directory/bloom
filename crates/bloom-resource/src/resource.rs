@@ -18,6 +18,7 @@ use core::marker::PhantomData;
 
 use crate::abi::AbiError;
 use crate::error::PetalError;
+use crate::handle::RuntimeHandle;
 
 /// Synthetic petal hash used by primitive `BloomType` impls. Concrete
 /// petal types use the type-defining petal's content hash; primitives
@@ -48,9 +49,19 @@ pub trait BloomType: Sized {
 }
 
 /// Runtime-typed wrapper for a value of generic type `T`.
+///
+/// Two construction shapes coexist:
+/// 1. Value-bearing: `Resource::new(type_tag, bytes)` / `Resource::from_value(&t)`
+///    carry the canonical-encoded payload for a `T: BloomType`.
+/// 2. Handle-bearing: `Resource::from_handle(h)` wraps a borrow-table
+///    handle for an unrecognised object-like arg in a generic petal fn
+///    (spec §11.2). In this mode `bytes` is empty and `type_tag` is a
+///    placeholder; the petal is expected to drive host imports through
+///    the carried [`RuntimeHandle`].
 pub struct Resource<T> {
     type_tag: TypeTag,
     bytes: Vec<u8>,
+    handle: RuntimeHandle,
     _marker: PhantomData<T>,
 }
 
@@ -59,6 +70,7 @@ impl<T> Clone for Resource<T> {
         Self {
             type_tag: self.type_tag.clone(),
             bytes: self.bytes.clone(),
+            handle: self.handle,
             _marker: PhantomData,
         }
     }
@@ -69,24 +81,45 @@ impl<T> core::fmt::Debug for Resource<T> {
         f.debug_struct("Resource")
             .field("type_tag", &self.type_tag)
             .field("bytes_len", &self.bytes.len())
+            .field("handle", &self.handle)
             .finish()
     }
 }
 
 impl<T> PartialEq for Resource<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.type_tag == other.type_tag && self.bytes == other.bytes
+        self.type_tag == other.type_tag
+            && self.bytes == other.bytes
+            && self.handle == other.handle
     }
 }
 
 impl<T> Eq for Resource<T> {}
 
 impl<T> Resource<T> {
-    /// Construct from raw `TypeTag` + canonical-encoded bytes.
+    /// Construct from raw `TypeTag` + canonical-encoded bytes. The
+    /// runtime handle defaults to [`RuntimeHandle::INVALID`].
     pub fn new(type_tag: TypeTag, bytes: Vec<u8>) -> Self {
         Self {
             type_tag,
             bytes,
+            handle: RuntimeHandle::INVALID,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Wrap a borrow-table handle as a generic object resource.
+    ///
+    /// The macro-emitted `__petal_<fn>` shim calls this for any object
+    /// arg whose Rust type is not specially recognised (i.e. not
+    /// `Coin`, `Capability`, or `Signer`). The carried handle is the
+    /// only piece of state with meaning in this mode; `type_tag` is a
+    /// placeholder (`Generic { idx: 0 }`) and `bytes` is empty.
+    pub fn from_handle(h: RuntimeHandle) -> Self {
+        Self {
+            type_tag: TypeTag::Generic { idx: 0 },
+            bytes: Vec::new(),
+            handle: h,
             _marker: PhantomData,
         }
     }
@@ -104,6 +137,13 @@ impl<T> Resource<T> {
     /// Consume and return the canonical-encoded payload.
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
+    }
+
+    /// Borrow-table handle carried by this resource (valid only for the
+    /// handle-bearing construction shape; otherwise
+    /// [`RuntimeHandle::INVALID`]).
+    pub fn handle(&self) -> RuntimeHandle {
+        self.handle
     }
 }
 
@@ -420,5 +460,19 @@ mod tests {
         assert_eq!(r.bytes(), &[0, 0, 0, 42]);
         let owned = r.clone().into_bytes();
         assert_eq!(owned, vec![0, 0, 0, 42]);
+    }
+
+    #[test]
+    fn resource_from_handle_carries_handle() {
+        let h = RuntimeHandle::from_raw(17);
+        let r: Resource<u128> = Resource::from_handle(h);
+        assert_eq!(r.handle(), h);
+        assert!(r.bytes().is_empty());
+    }
+
+    #[test]
+    fn resource_value_construction_handle_is_invalid() {
+        let r = Resource::<u32>::from_value(&7u32);
+        assert_eq!(r.handle(), RuntimeHandle::INVALID);
     }
 }

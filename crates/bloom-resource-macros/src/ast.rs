@@ -31,9 +31,18 @@ where
     (kept, removed)
 }
 
-/// Test if `attr` is `#[name]` or `#[name(...)]`.
+/// Test if `attr` is `#[name]` or `#[name(...)]`, accepting either a
+/// single-segment path (`#[object]`) or any qualified path whose final
+/// segment matches (`#[bloom::object]`, `#[some::prefix::object]`).
 pub(crate) fn attr_is_named(attr: &Attribute, name: &str) -> bool {
-    attr.path().is_ident(name)
+    let path = attr.path();
+    if path.is_ident(name) {
+        return true;
+    }
+    path.segments
+        .last()
+        .map(|seg| seg.ident == name)
+        .unwrap_or(false)
 }
 
 /// Parse a `key = "value"` form on an attribute's `Meta`.

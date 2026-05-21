@@ -19,6 +19,7 @@ bloom-objects = { workspace = true }
 
 [dev-dependencies]
 bloom-resource = { workspace = true }
+bloom-objects = { workspace = true }
 
 # The macro-emitted petal shim is gated on `feature = "no-entrypoint"`
 # so downstream library consumers can suppress the wasm exports. The

@@ -27,12 +27,15 @@
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::{
-    Attribute, FnArg, GenericParam, Item, ItemFn, ItemMod, ItemStruct, Meta, ReturnType,
+    Attribute, FnArg, GenericParam, Item, ItemFn, ItemMod, ItemStruct, Meta, ReturnType, Type,
 };
 
 use crate::ast::{attr_is_named, fn_name, ident, parse_str_value, signer_arg};
 use crate::capability::CapabilityAttr;
-use crate::codegen::{emit_invariant_shim, emit_manifest_accessor, emit_manifest_section, emit_petal_shim};
+use crate::codegen::{
+    PetalShimAst, ShimArgAst, emit_dispatch_helper, emit_invariant_shim, emit_manifest_accessor,
+    emit_manifest_section, emit_petal_shim,
+};
 use crate::error::err_spanned;
 use crate::invariant::InvariantAttr;
 use crate::manifest::{
@@ -130,12 +133,24 @@ pub(crate) fn build_manifest(
     attr: &PetalAttr,
     module: &ItemMod,
 ) -> syn::Result<PetalManifestV0> {
+    let (m, _) = build_manifest_with_asts(attr, module)?;
+    Ok(m)
+}
+
+/// Same as [`build_manifest`] but also returns the per-function
+/// [`PetalShimAst`] payload used by [`emit_petal_shim`] to lower the
+/// `__petal_<fn>` wasm export body.
+pub(crate) fn build_manifest_with_asts(
+    attr: &PetalAttr,
+    module: &ItemMod,
+) -> syn::Result<(PetalManifestV0, Vec<PetalShimAst>)> {
     let mut m = PetalManifestV0 {
         schema_version: SCHEMA_VERSION,
         module_path: attr.resolved_path(module),
         framework_version: attr.resolved_version(),
         ..Default::default()
     };
+    let mut shims: Vec<PetalShimAst> = Vec::new();
 
     let items = match &module.content {
         Some((_, items)) => items.as_slice(),
@@ -153,7 +168,9 @@ pub(crate) fn build_manifest(
                 handle_struct(s, &mut m)?;
             }
             Item::Fn(f) => {
-                handle_fn(f, &mut m)?;
+                if let Some(shim) = handle_fn(f, &mut m)? {
+                    shims.push(shim);
+                }
             }
             _ => {
                 // Other items are passed through unchanged.
@@ -161,7 +178,7 @@ pub(crate) fn build_manifest(
         }
     }
 
-    Ok(m)
+    Ok((m, shims))
 }
 
 /// Recognise a `#[capability]` or `#[object]` struct and push its decl
@@ -196,10 +213,13 @@ fn handle_struct(s: &ItemStruct, m: &mut PetalManifestV0) -> syn::Result<()> {
 
 /// Recognise `pub fn` items and push their decls into the manifest.
 /// Also processes `#[invariant]` attributes on functions.
-fn handle_fn(f: &ItemFn, m: &mut PetalManifestV0) -> syn::Result<()> {
+///
+/// Returns the [`PetalShimAst`] payload for the function, or `None` if
+/// the function was skipped (non-`pub`).
+fn handle_fn(f: &ItemFn, m: &mut PetalManifestV0) -> syn::Result<Option<PetalShimAst>> {
     // Only `pub` fns are part of the petal surface.
     if !matches!(f.vis, syn::Visibility::Public(_)) {
-        return Ok(());
+        return Ok(None);
     }
 
     // Process #[invariant] first so the function decl can record the
@@ -234,6 +254,7 @@ fn handle_fn(f: &ItemFn, m: &mut PetalManifestV0) -> syn::Result<()> {
     let ctx = TypeTagCtx::from_generic_names(generic_names.iter().cloned());
 
     let mut args = Vec::<ArgDecl>::new();
+    let mut shim_args = Vec::<ShimArgAst>::new();
     let mut required_signers: u8 = 0;
     let mut required_capabilities = Vec::new();
 
@@ -243,11 +264,26 @@ fn handle_fn(f: &ItemFn, m: &mut PetalManifestV0) -> syn::Result<()> {
         };
         let arg_name = pat_to_name(&pat_ty.pat).unwrap_or_else(|| format!("_{}", i));
 
+        // Strip a single `&` / `&mut` layer for ergonomic recognition;
+        // the shim emits the dispatch wrapper as `&local` / `&mut local`
+        // as appropriate.
+        let (is_ref, is_mut, inner_ty) = match pat_ty.ty.as_ref() {
+            Type::Reference(r) => (true, r.mutability.is_some(), (*r.elem).clone()),
+            other => (false, false, other.clone()),
+        };
+
         // Signer detection.
         if signer_arg(arg).is_some() {
             required_signers = required_signers.saturating_add(1);
             args.push(ArgDecl {
+                name: arg_name.clone(),
+                kind: ArgKind::Signer,
+            });
+            shim_args.push(ShimArgAst {
                 name: arg_name,
+                is_ref,
+                is_mut,
+                inner_ty,
                 kind: ArgKind::Signer,
             });
             continue;
@@ -259,35 +295,53 @@ fn handle_fn(f: &ItemFn, m: &mut PetalManifestV0) -> syn::Result<()> {
         // Determine kind based on type shape + reference mode.
         let kind = arg_kind_for(&pat_ty.ty, &ctx, &mut required_capabilities)?;
         args.push(ArgDecl {
+            name: arg_name.clone(),
+            kind: kind.clone(),
+        });
+        shim_args.push(ShimArgAst {
             name: arg_name,
+            is_ref,
+            is_mut,
+            inner_ty,
             kind,
         });
     }
 
-    // Return tags.
-    let returns: Vec<bloom_objects::TypeTag> = match &f.sig.output {
-        ReturnType::Default => Vec::new(),
+    // Return tags + return-type AST (for codegen).
+    let (returns, return_ast) = match &f.sig.output {
+        ReturnType::Default => (Vec::new(), None),
         ReturnType::Type(_, ty) => match ty.as_ref() {
-            syn::Type::Tuple(t) => t
-                .elems
-                .iter()
-                .map(|t| ctx.lower(t))
-                .collect::<Result<Vec<_>, _>>()?,
-            other => vec![ctx.lower(other)?],
+            syn::Type::Tuple(t) => (
+                t.elems
+                    .iter()
+                    .map(|t| ctx.lower(t))
+                    .collect::<Result<Vec<_>, _>>()?,
+                Some((**ty).clone()),
+            ),
+            other => (vec![ctx.lower(other)?], Some((**ty).clone())),
         },
     };
 
+    let fn_name_s = fn_name(f);
+    let is_generic = !type_params.is_empty();
+
     m.functions.push(FunctionDecl {
-        name: fn_name(f),
+        name: fn_name_s.clone(),
         type_params,
         args,
-        returns,
+        returns: returns.clone(),
         required_signers,
         required_capabilities,
         attached_invariants: attached,
     });
 
-    Ok(())
+    Ok(Some(PetalShimAst {
+        fn_name: fn_name_s,
+        args: shim_args,
+        return_ast,
+        return_tags: returns,
+        is_generic,
+    }))
 }
 
 /// Map a `syn::Pat` to a `String` argument name (best effort).
@@ -423,7 +477,7 @@ fn meta_tokens(attr: &Attribute) -> syn::Result<TokenStream> {
 pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenStream> {
     let parsed: ItemMod = syn::parse2(item)?;
     let petal_attr = PetalAttr::parse(attr)?;
-    let manifest = build_manifest(&petal_attr, &parsed)?;
+    let (manifest, shim_asts) = build_manifest_with_asts(&petal_attr, &parsed)?;
 
     // Manifest blob + accessor.
     let section_ident = ident("__BLOOM_PETAL_MANIFEST_BYTES", Span::call_site());
@@ -431,11 +485,16 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenS
     let accessor = emit_manifest_accessor(&section_ident);
 
     // Per-fn shims.
-    let petal_shims: Vec<_> = manifest
-        .functions
-        .iter()
-        .map(emit_petal_shim)
-        .collect();
+    let petal_shims: Vec<_> = shim_asts.iter().map(emit_petal_shim).collect();
+
+    // Per-module dispatch helper (emitted exactly once; every shim in
+    // the module routes through it for the panic-catching / ret-buffer
+    // copy plumbing).
+    let dispatch_helper = if petal_shims.is_empty() {
+        TokenStream::new()
+    } else {
+        emit_dispatch_helper()
+    };
 
     // Per-invariant shims.
     let inv_shims: Vec<_> = manifest
@@ -476,6 +535,7 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenS
     let extras = quote! {
         #section
         #accessor
+        #dispatch_helper
         #(#petal_shims)*
         #(#inv_shims)*
     };
