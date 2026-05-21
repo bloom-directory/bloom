@@ -95,15 +95,19 @@ pub struct PtbHostCtx {
     /// rewrites).
     pub loom_deltas: Vec<LoomDelta>,
 
-    /// Objects deleted via the `object.delete` host import. The
-    /// executor reconciles these with its own `planned_deletes` at
-    /// commit time.
-    pub object_deletes: Vec<ObjectId>,
+    /// Objects deleted via the `object.delete` host import, paired
+    /// with the row's *prior* owner so the chain-node layer can
+    /// rebuild the prior owner's ownership-index row at commit time
+    /// (spec §16.3). The executor reconciles these with its own
+    /// `planned_deletes` at commit time.
+    pub object_deletes: Vec<(ObjectId, Owner)>,
 
     /// Ownership re-keys emitted by `object.transfer` / `object.share` /
-    /// `object.freeze`. The executor merges these into its own
-    /// `ownership_changes` at commit time.
-    pub ownership_changes: Vec<(ObjectId, Owner)>,
+    /// `object.freeze`. Each entry is `(id, old_owner, new_owner)` —
+    /// the chain-node's `rebuild_ownership_rows` needs both keys to
+    /// keep the OwnershipIndex symmetric (the old owner's row must
+    /// drop the id, the new owner's row must gain it; spec §16.3).
+    pub ownership_changes: Vec<(ObjectId, Owner, Owner)>,
 
     /// Newly-created objects from `object.create` that haven't been
     /// folded into the executor's borrow table yet. The runner pushes

@@ -150,64 +150,89 @@ fn ptb_log_to_receipt_log(l: PtbLogEntry) -> Log {
     }
 }
 
-/// For each unique owner referenced in `(id, new_owner)` updates,
-/// rebuild the corresponding `OwnershipIndex` trie row from the
-/// snapshot's current object table.
+/// For each unique owner referenced — *both* old and new sides of
+/// every transfer, plus the prior owner of every delete — rebuild
+/// the corresponding `OwnershipIndex` trie row from the snapshot's
+/// current object table (spec §16.3).
+///
+/// **Symmetry contract (P1-2):** when an object is transferred from
+/// `A` to `B`, the index must drop the id from `A`'s row and add it
+/// to `B`'s. When an object is deleted, the id must drop from its
+/// owner's row. Earlier revisions only rebuilt the *new* owner's
+/// row, leaving stale ids behind in the old owner's row (and
+/// rebuilding nothing for deletes). This implementation collects
+/// every affected owner key from both sides.
 ///
 /// Phase 1 walks the in-memory object map per affected owner; Phase 2
 /// will keep an incremental index inside the trie itself. The Phase 1
-/// implementation is O(unique_owners * total_objects) — acceptable
+/// implementation is O(unique_owners * candidate_ids) — acceptable
 /// for the tens-to-low-hundreds of objects per PTB the v0 chain
 /// expects.
 ///
-/// The owner of an object is determined by reading its current record
-/// from the snapshot (which already reflects the executor's
-/// `object_writes`), so we don't need to inspect the `(id, owner)`
-/// tuples beyond their owner keys.
+/// The membership of each rebuilt row is determined by reading each
+/// candidate object's current record from the snapshot (which
+/// already reflects the executor's `object_writes` / `object_deletes`),
+/// so deleted ids and re-homed ids naturally fall out of the old
+/// owner's row.
 fn rebuild_ownership_rows(
     snapshot: &mut bloom_chain_state::StateSnapshot,
-    changes: &[(bloom_objects::ObjectId, bloom_objects::Owner)],
+    transfers: &[(bloom_objects::ObjectId, bloom_objects::Owner, bloom_objects::Owner)],
+    deletes: &[(bloom_objects::ObjectId, bloom_objects::Owner)],
 ) {
-    use bloom_objects::{Owner, OWNER_KIND_ADDRESS, OWNER_KIND_OBJECT};
+    use bloom_objects::OWNER_KIND_OBJECT;
 
-    // Collect unique (kind, id) owner keys we need to rebuild. Only
-    // Address / Object owners are indexed; Shared / Immutable never
-    // appear in the ownership trie.
-    let mut keys: std::collections::BTreeSet<(u8, [u8; 32])> =
-        std::collections::BTreeSet::new();
-    for (_, owner) in changes {
+    // Helper: extract the (kind, owner_id) pair if this owner has an
+    // ownership-index row. `Shared` / `Immutable` owners are not
+    // indexed.
+    fn owner_key(owner: &Owner) -> Option<(u8, [u8; 32])> {
         match owner {
-            Owner::Address(a) => {
-                keys.insert((OWNER_KIND_ADDRESS, *a));
-            }
-            Owner::Object(id) => {
-                keys.insert((OWNER_KIND_OBJECT, id.0));
-            }
-            Owner::Shared | Owner::Immutable => {}
+            Owner::Address(a) => Some((OWNER_KIND_ADDRESS, *a)),
+            Owner::Object(id) => Some((OWNER_KIND_OBJECT, id.0)),
+            Owner::Shared | Owner::Immutable => None,
         }
     }
 
-    // For each affected owner key, scan the snapshot's current
-    // (post-write) object table and gather the sorted id list.
-    // We pull every object via `get_object` — the snapshot returns
-    // pending writes first, so freshly inserted / deleted objects
-    // are visible.
-    for (kind, owner_id) in keys {
-        let mut owned: Vec<bloom_objects::ObjectId> = Vec::new();
-        // We don't have a snapshot.iter_objects(); fall back to
-        // collecting ids the executor told us about + any preexisting
-        // owner row, then filter by current owner.
-        let mut candidate_ids: std::collections::BTreeSet<bloom_objects::ObjectId> =
-            std::collections::BTreeSet::new();
-        for (id, _) in changes {
-            candidate_ids.insert(*id);
+    // Collect unique (kind, owner_id) keys we need to rebuild.
+    // Symmetric: both old and new owners for transfers, prior owner
+    // for deletes.
+    let mut keys: std::collections::BTreeSet<(u8, [u8; 32])> =
+        std::collections::BTreeSet::new();
+    for (_, old_owner, new_owner) in transfers {
+        if let Some(k) = owner_key(old_owner) {
+            keys.insert(k);
         }
+        if let Some(k) = owner_key(new_owner) {
+            keys.insert(k);
+        }
+    }
+    for (_, old_owner) in deletes {
+        if let Some(k) = owner_key(old_owner) {
+            keys.insert(k);
+        }
+    }
+
+    // Candidate id pool spans every transfer / delete (the executor's
+    // touch-list). For each affected owner key we also fold in the
+    // owner's existing index row so previously-resident ids whose
+    // owner didn't change get carried through.
+    let all_touched_ids: std::collections::BTreeSet<bloom_objects::ObjectId> = transfers
+        .iter()
+        .map(|(id, _, _)| *id)
+        .chain(deletes.iter().map(|(id, _)| *id))
+        .collect();
+
+    for (kind, owner_id) in keys {
+        let mut candidate_ids: std::collections::BTreeSet<bloom_objects::ObjectId> =
+            all_touched_ids.clone();
         if let Some(existing) =
             snapshot.get_ownership(&OwnershipIndexKey { owner_kind: kind, owner_id })
         {
             candidate_ids.extend(existing);
         }
+        let mut owned: Vec<bloom_objects::ObjectId> = Vec::new();
         for cid in candidate_ids {
+            // Deleted objects vanish from `get_object`, so they fall
+            // out of every owner's row naturally.
             if let Some(obj) = snapshot.get_object(&cid) {
                 let matches = match (&obj.owner, kind) {
                     (Owner::Address(a), OWNER_KIND_ADDRESS) => *a == owner_id,
@@ -220,6 +245,8 @@ fn rebuild_ownership_rows(
             }
         }
         owned.sort();
+        // Empty `owned` is set via `set_ownership` which evicts the
+        // row to keep the trie sparse.
         snapshot.set_ownership(
             OwnershipIndexKey { owner_kind: kind, owner_id },
             owned,
@@ -704,17 +731,22 @@ fn execute_tx_impl(
                         for obj in &report.object_writes {
                             snapshot.insert_object(obj.clone());
                         }
-                        for id in &report.object_deletes {
+                        for (id, _old_owner) in &report.object_deletes {
                             snapshot.delete_object(*id);
                         }
                         // Ownership-index rewrites: rebuild the row
-                        // for each owner referenced by the report.
-                        // Phase 1: a single ownership-row replace per
-                        // unique owner. The list is "(id, new_owner)"
-                        // and now includes host-import-attributed
-                        // changes (drained into report by the
-                        // executor's commit step).
-                        rebuild_ownership_rows(&mut snapshot, &report.ownership_changes);
+                        // for every affected owner — both sides of
+                        // each transfer plus the prior owner of each
+                        // delete (P1-2: spec §16.3 owner-symmetric
+                        // rebuild). The lists now include
+                        // host-import-attributed changes (drained
+                        // into the report by the executor's commit
+                        // step).
+                        rebuild_ownership_rows(
+                            &mut snapshot,
+                            &report.ownership_changes,
+                            &report.object_deletes,
+                        );
 
                         // Loom deltas: executor- and host-import-
                         // attributed (both flow through report).

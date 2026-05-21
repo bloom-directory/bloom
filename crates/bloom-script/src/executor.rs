@@ -148,11 +148,17 @@ pub struct ExecutionReport {
     pub command_outputs: Vec<Vec<Vec<u8>>>,
     /// Object trie writes (insert or update) to apply on commit.
     pub object_writes: Vec<Object>,
-    /// Objects to delete from the trie.
-    pub object_deletes: Vec<ObjectId>,
-    /// Ownership re-keys: `(id, new_owner)`. Phase-2 chain code re-
-    /// keys the `OwnershipIndex` trie from this list.
-    pub ownership_changes: Vec<(ObjectId, Owner)>,
+    /// Objects to delete from the trie. Each entry is `(id, old_owner)`:
+    /// the chain-node layer reads the old owner so it can rebuild the
+    /// prior owner's ownership-index row (spec §16.3 — symmetric
+    /// owner-rebuild on delete).
+    pub object_deletes: Vec<(ObjectId, Owner)>,
+    /// Ownership re-keys: `(id, old_owner, new_owner)`. The chain-node
+    /// layer rebuilds the OwnershipIndex row for *both* sides per
+    /// spec §16.3 (the old owner must drop the id; the new owner must
+    /// gain it). Single-owner tuples would leak stale ids in the old
+    /// owner's row.
+    pub ownership_changes: Vec<(ObjectId, Owner, Owner)>,
     /// Account-level Loom deltas to reconcile post-commit (spec §9.2).
     pub loom_deltas: Vec<LoomDelta>,
     /// Publish / upgrade events for explorer indexers.
@@ -263,8 +269,8 @@ impl<'c> PtbExecutor<'c> {
         // host-import-attributed entries flow through
         // `ctx.ownership_changes` and are folded in at the end.
         let mut planned_writes: Vec<Object> = Vec::new();
-        let mut planned_deletes: Vec<ObjectId> = Vec::new();
-        let mut ownership_changes: Vec<(ObjectId, Owner)> = Vec::new();
+        let mut planned_deletes: Vec<(ObjectId, Owner)> = Vec::new();
+        let mut ownership_changes: Vec<(ObjectId, Owner, Owner)> = Vec::new();
 
         // Tx-scope fuel: Phase 1 charges only inside petal calls.
         // We treat `gas_budget` as the upper bound for the *whole* PTB.
@@ -368,7 +374,7 @@ impl<'c> PtbExecutor<'c> {
         cmd: &Command,
         cmd_idx: u16,
         vtx: &ValidatedPtb,
-        ownership_changes: &mut Vec<(ObjectId, Owner)>,
+        ownership_changes: &mut Vec<(ObjectId, Owner, Owner)>,
         fuel_remaining: &mut u64,
         report: &mut ExecutionReport,
     ) -> Result<Vec<Vec<u8>>, PtbError> {
@@ -479,7 +485,7 @@ impl<'c> PtbExecutor<'c> {
         uses: &[UseRef],
         owner: Owner,
         cmd_idx: u16,
-        ownership_changes: &mut Vec<(ObjectId, Owner)>,
+        ownership_changes: &mut Vec<(ObjectId, Owner, Owner)>,
     ) -> Result<Vec<Vec<u8>>, PtbError> {
         // Each Use must resolve to a transient object id; we decode
         // the upstream output bytes as `ObjectId` (32 bytes).
@@ -498,16 +504,23 @@ impl<'c> PtbExecutor<'c> {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&bytes);
             let id = ObjectId(arr);
-            self.with_ctx(|ctx| -> Result<(), PtbError> {
+            // Capture the row's *prior* owner before we overwrite it.
+            // The chain-node layer needs both keys to rebuild a
+            // symmetric `OwnershipIndex` (spec §16.3): the old
+            // owner's row must drop `id`; the new owner's row must
+            // gain it. Without the old key, the prior row retains a
+            // stale entry.
+            let old_owner = self.with_ctx(|ctx| -> Result<Owner, PtbError> {
                 let row = ctx
                     .borrow_table
                     .get_mut(&id)
                     .ok_or(PtbError::ObjectNotFound { id })?;
+                let old = row.owner.clone();
                 row.owner = owner.clone();
                 ctx.borrow_table.mark_consumed(&id);
-                Ok(())
+                Ok(old)
             })?;
-            ownership_changes.push((id, owner.clone()));
+            ownership_changes.push((id, old_owner, owner.clone()));
         }
         Ok(vec![])
     }
@@ -1368,7 +1381,9 @@ mod tests {
             report
                 .ownership_changes
                 .iter()
-                .any(|(id, o)| *id == coin_id && *o == Owner::Address(other)),
+                .any(|(id, old, new)| *id == coin_id
+                    && *old == Owner::Address(signer)
+                    && *new == Owner::Address(other)),
             "ownership_changes: {:?}",
             report.ownership_changes
         );

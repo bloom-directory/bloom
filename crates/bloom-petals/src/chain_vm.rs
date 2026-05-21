@@ -1570,8 +1570,13 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
             with_ptb_ctx(&caller, |ctx| {
                 match ctx.borrow_table.get_mut(&id) {
                     Some(row) => {
+                        // Capture prior owner before overwrite: the
+                        // chain-node's `rebuild_ownership_rows` needs
+                        // both keys to keep the OwnershipIndex
+                        // symmetric (spec §16.3).
+                        let old_owner = row.owner.clone();
                         row.owner = new_owner.clone();
-                        ctx.ownership_changes.push((id, new_owner));
+                        ctx.ownership_changes.push((id, old_owner, new_owner));
                         ctx.borrow_table.mark_consumed(&id);
                         0
                     }
@@ -1597,8 +1602,9 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
             };
             with_ptb_ctx(&caller, |ctx| match ctx.borrow_table.get_mut(&id) {
                 Some(row) => {
+                    let old_owner = row.owner.clone();
                     row.owner = Owner::Shared;
-                    ctx.ownership_changes.push((id, Owner::Shared));
+                    ctx.ownership_changes.push((id, old_owner, Owner::Shared));
                     ctx.borrow_table.mark_consumed(&id);
                     0
                 }
@@ -1623,8 +1629,9 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
             };
             with_ptb_ctx(&caller, |ctx| match ctx.borrow_table.get_mut(&id) {
                 Some(row) => {
+                    let old_owner = row.owner.clone();
                     row.owner = Owner::Immutable;
-                    ctx.ownership_changes.push((id, Owner::Immutable));
+                    ctx.ownership_changes.push((id, old_owner, Owner::Immutable));
                     ctx.borrow_table.mark_consumed(&id);
                     0
                 }
@@ -1651,16 +1658,24 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
             };
             let caller_petal = caller.data().petal_hash;
             with_ptb_ctx(&caller, |ctx| {
-                let defining_hash = match ctx.borrow_table.get(&id) {
-                    Some(row) => match &row.type_tag {
-                        TypeTag::Concrete { petal_hash, .. } => *petal_hash,
-                        _ => {
-                            return HostError::Invalid(
-                                "delete requires Concrete type_tag".into(),
-                            )
-                            .as_wasm_code();
-                        }
-                    },
+                // Capture both the defining-petal hash (for the
+                // §16.2 access-control check) and the row's prior
+                // owner (so the chain-node's
+                // `rebuild_ownership_rows` can drop `id` from the
+                // old owner's row — spec §16.3 symmetric rebuild).
+                let (defining_hash, old_owner) = match ctx.borrow_table.get(&id) {
+                    Some(row) => {
+                        let defining = match &row.type_tag {
+                            TypeTag::Concrete { petal_hash, .. } => *petal_hash,
+                            _ => {
+                                return HostError::Invalid(
+                                    "delete requires Concrete type_tag".into(),
+                                )
+                                .as_wasm_code();
+                            }
+                        };
+                        (defining, row.owner.clone())
+                    }
                     None => {
                         return HostError::NotFound("row vanished".into()).as_wasm_code();
                     }
@@ -1671,7 +1686,7 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                     )
                     .as_wasm_code();
                 }
-                ctx.object_deletes.push(id);
+                ctx.object_deletes.push((id, old_owner));
                 ctx.borrow_table.drop_row(&id);
                 0
             })
@@ -2590,9 +2605,10 @@ mod ptb_host_import_tests {
         assert_eq!(code, 0);
         let guard = arc.lock().unwrap();
         assert_eq!(guard.ownership_changes.len(), 1);
-        let (id, owner) = &guard.ownership_changes[0];
+        let (id, old, new) = &guard.ownership_changes[0];
         assert_eq!(*id, ObjectId([0x07; 32]));
-        assert_eq!(*owner, Owner::Address([0xbb; 32]));
+        assert_eq!(*old, Owner::Address([0xaa; 32]));
+        assert_eq!(*new, Owner::Address([0xbb; 32]));
     }
 
     // -----------------------------------------------------------------------
@@ -2625,7 +2641,14 @@ mod ptb_host_import_tests {
         let arc = Arc::new(Mutex::new(ctx));
         let _ = run_with(parse(OBJECT_SHARE), arc.clone(), petal);
         let guard = arc.lock().unwrap();
-        assert_eq!(guard.ownership_changes.last().map(|c| c.1.clone()), Some(Owner::Shared));
+        assert_eq!(
+            guard.ownership_changes.last().map(|c| c.2.clone()),
+            Some(Owner::Shared)
+        );
+        assert_eq!(
+            guard.ownership_changes.last().map(|c| c.1.clone()),
+            Some(Owner::Address([0xaa; 32]))
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2658,7 +2681,14 @@ mod ptb_host_import_tests {
         let arc = Arc::new(Mutex::new(ctx));
         let _ = run_with(parse(OBJECT_FREEZE), arc.clone(), petal);
         let guard = arc.lock().unwrap();
-        assert_eq!(guard.ownership_changes.last().map(|c| c.1.clone()), Some(Owner::Immutable));
+        assert_eq!(
+            guard.ownership_changes.last().map(|c| c.2.clone()),
+            Some(Owner::Immutable)
+        );
+        assert_eq!(
+            guard.ownership_changes.last().map(|c| c.1.clone()),
+            Some(Owner::Address([0xaa; 32]))
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2701,7 +2731,10 @@ mod ptb_host_import_tests {
         assert_eq!(code, 0);
         let guard = arc.lock().unwrap();
         assert!(guard.borrow_table.get(&ObjectId([0x07; 32])).is_none());
-        assert_eq!(guard.object_deletes, vec![ObjectId([0x07; 32])]);
+        assert_eq!(
+            guard.object_deletes,
+            vec![(ObjectId([0x07; 32]), Owner::Address([0xaa; 32]))]
+        );
     }
 
     #[test]
