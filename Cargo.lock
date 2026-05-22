@@ -1972,8 +1972,11 @@ dependencies = [
  "bloom-daemon",
  "bloom-keystore",
  "bloom-mount",
+ "bloom-objects",
  "bloom-petals",
  "bloom-proto",
+ "bloom-ptb-builder",
+ "bloom-script",
  "bloom-test-util",
  "bloom-tools",
  "bloom-tx",
@@ -2492,6 +2495,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-petal-dex-faucet"
+version = "0.1.0"
+dependencies = [
+ "bloom-objects",
+ "bloom-resource",
+ "bloom-resource-macros",
+]
+
+[[package]]
 name = "bloom-petal-dex-it"
 version = "0.1.0"
 dependencies = [
@@ -2503,12 +2515,20 @@ dependencies = [
  "bloom-dex-math",
  "bloom-objects",
  "bloom-petal-dex-cpmm",
+ "bloom-petal-dex-faucet",
  "bloom-petal-dex-pool",
  "bloom-petal-dex-router",
+ "bloom-petal-dex-wallet",
  "bloom-petal-fungible",
  "bloom-petal-manifest",
+ "bloom-ptb-builder",
  "bloom-resource",
  "bloom-script",
+ "bloom-vfs",
+ "ed25519-dalek",
+ "hex",
+ "serde_json",
+ "tokio",
  "tracing-subscriber",
  "wat",
 ]
@@ -2535,12 +2555,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-petal-dex-wallet"
+version = "0.1.0"
+dependencies = [
+ "bloom-objects",
+ "bloom-resource",
+ "bloom-resource-macros",
+]
+
+[[package]]
 name = "bloom-petal-fungible"
 version = "0.1.0"
 dependencies = [
  "bloom-objects",
  "bloom-resource",
  "bloom-resource-macros",
+]
+
+[[package]]
+name = "bloom-petal-identity"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bloom-chain-node",
+ "bloom-chain-state",
+ "bloom-chain-types",
+ "bloom-objects",
+ "bloom-petal-fungible",
+ "bloom-petal-manifest",
+ "bloom-resource",
+ "bloom-resource-macros",
+ "bloom-script",
+ "wasmparser 0.218.1",
 ]
 
 [[package]]
@@ -2642,6 +2688,17 @@ dependencies = [
  "thiserror 2.0.18",
  "toml 0.8.23",
  "tracing",
+]
+
+[[package]]
+name = "bloom-ptb-builder"
+version = "0.1.0"
+dependencies = [
+ "bloom-chain-types",
+ "bloom-objects",
+ "bloom-petal-manifest",
+ "bloom-script",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2784,15 +2841,19 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bloom-chain",
+ "bloom-chain-types",
  "bloom-defi",
  "bloom-ens",
  "bloom-etherscan",
  "bloom-keystore",
  "bloom-mempool",
+ "bloom-objects",
  "bloom-prices",
  "bloom-proto",
+ "bloom-ptb-builder",
  "bloom-revert",
  "bloom-rpc",
+ "bloom-script",
  "bloom-tools",
  "bloom-tx",
  "bloom-watch",

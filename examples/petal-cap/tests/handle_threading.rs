@@ -16,7 +16,7 @@
 
 use bloom_petal_cap::cap;
 use bloom_resource::{
-    RuntimeHandle,
+    Resource, RuntimeHandle,
     host::{HostCall, HostResponse, test_hooks},
 };
 
@@ -26,6 +26,17 @@ use bloom_resource::{
 
 /// Marker type — stands in for any `T` the test doesn't care about.
 struct Marker;
+
+/// A canonical 10-byte `Cap<T>` payload (`inner_kind || expires_at_block
+/// || revoked`) for pre-programming `object_read` responses. In the
+/// handle/tag model every mutation reads the live payload first.
+fn cap_payload_bytes(inner_kind: u8, expires_at_block: u64, revoked: bool) -> Vec<u8> {
+    let mut v = Vec::with_capacity(10);
+    v.push(inner_kind);
+    v.extend_from_slice(&expires_at_block.to_be_bytes());
+    v.push(revoked as u8);
+    v
+}
 
 /// Sequence responder: drains a vec of responses in order; panics when
 /// the vec is exhausted unexpectedly.
@@ -52,7 +63,8 @@ fn new_calls_object_create_for_cap_and_revoke_cap() {
     ]));
 
     let signer = bloom_resource::Signer::from_index(0);
-    let (_cap, _rev): (cap::Cap<Marker>, cap::RevokeCap<Marker>) = cap::new(&signer);
+    let (_cap, _rev): (Resource<cap::Cap<Marker>>, Resource<cap::RevokeCap<Marker>>) =
+        cap::new(&signer);
 
     let calls = test_hooks::recorded_calls();
     let create_calls: Vec<_> = calls
@@ -83,7 +95,8 @@ fn transfer_uses_real_cap_handle() {
     ]));
 
     let signer = bloom_resource::Signer::from_index(0);
-    let (cap_val, _rev): (cap::Cap<Marker>, cap::RevokeCap<Marker>) = cap::new(&signer);
+    let (cap_val, _rev): (Resource<cap::Cap<Marker>>, Resource<cap::RevokeCap<Marker>>) =
+        cap::new(&signer);
 
     // Reset call log so we only inspect the transfer call.
     test_hooks::clear();
@@ -122,7 +135,8 @@ fn destroy_uses_real_cap_handle() {
     ]));
 
     let signer = bloom_resource::Signer::from_index(0);
-    let (cap_val, _rev): (cap::Cap<Marker>, cap::RevokeCap<Marker>) = cap::new(&signer);
+    let (cap_val, _rev): (Resource<cap::Cap<Marker>>, Resource<cap::RevokeCap<Marker>>) =
+        cap::new(&signer);
 
     // Now test destroy.
     test_hooks::clear();
@@ -148,11 +162,11 @@ fn destroy_uses_real_cap_handle() {
 }
 
 // ---------------------------------------------------------------------------
-// push_cap_payload (exercised through lock/unlock/set_expiry) uses real handle
+// write_cap_fields (exercised through lock/unlock/set_expiry) uses real handle
 // ---------------------------------------------------------------------------
 
 #[test]
-fn lock_push_cap_payload_uses_real_handle() {
+fn lock_write_cap_fields_uses_real_handle() {
     test_hooks::clear();
     test_hooks::set_responder(seq_responder(vec![
         HostResponse::Handle(RuntimeHandle::from_raw(55)), // create Cap<T>
@@ -160,24 +174,40 @@ fn lock_push_cap_payload_uses_real_handle() {
     ]));
 
     let signer = bloom_resource::Signer::from_index(0);
-    let (mut cap_val, _rev): (cap::Cap<Marker>, cap::RevokeCap<Marker>) = cap::new(&signer);
+    let (mut cap_val, _rev): (Resource<cap::Cap<Marker>>, Resource<cap::RevokeCap<Marker>>) =
+        cap::new(&signer);
 
+    // In the handle/tag model `lock` first reads the live payload (to
+    // preserve the `revoked` flag) then writes back the locked payload —
+    // two host calls, both on the cap's real handle (55).
     test_hooks::clear();
     test_hooks::set_responder(seq_responder(vec![
-        HostResponse::Status(0), // object_mutate from lock → push_cap_payload
+        HostResponse::Bytes(cap_payload_bytes(0, 0, false)), // object_read
+        HostResponse::Status(0),                             // object_mutate
     ]));
 
     cap::lock(&mut cap_val);
 
     let calls = test_hooks::recorded_calls();
-    assert_eq!(calls.len(), 1, "lock should issue exactly 1 host call");
+    assert_eq!(
+        calls.len(),
+        2,
+        "lock should issue exactly 2 host calls (read + mutate), got {calls:?}"
+    );
     match &calls[0] {
+        HostCall::ObjectRead { handle } => assert_eq!(
+            *handle,
+            RuntimeHandle::from_raw(55),
+            "object_read must receive the cap's real handle (55), got {handle:?}"
+        ),
+        other => panic!("expected ObjectRead first, got {other:?}"),
+    }
+    match &calls[1] {
         HostCall::ObjectMutate { handle, .. } => {
             assert_eq!(
                 *handle,
                 RuntimeHandle::from_raw(55),
-                "object_mutate in push_cap_payload must receive handle 55, got {:?}",
-                handle
+                "object_mutate in write_cap_fields must receive handle 55, got {handle:?}"
             );
         }
         other => panic!("expected ObjectMutate, got {other:?}"),
@@ -198,7 +228,8 @@ fn transfer_never_uses_invalid_handle() {
     ]));
 
     let signer = bloom_resource::Signer::from_index(0);
-    let (cap_val, _rev): (cap::Cap<Marker>, cap::RevokeCap<Marker>) = cap::new(&signer);
+    let (cap_val, _rev): (Resource<cap::Cap<Marker>>, Resource<cap::RevokeCap<Marker>>) =
+        cap::new(&signer);
 
     // object_transfer with INVALID would return Err(InvalidHandle) before
     // even reaching the mock. If this panics, the handle was INVALID.
@@ -233,7 +264,8 @@ fn destroy_never_uses_invalid_handle() {
     ]));
 
     let signer = bloom_resource::Signer::from_index(0);
-    let (cap_val, _rev): (cap::Cap<Marker>, cap::RevokeCap<Marker>) = cap::new(&signer);
+    let (cap_val, _rev): (Resource<cap::Cap<Marker>>, Resource<cap::RevokeCap<Marker>>) =
+        cap::new(&signer);
 
     test_hooks::clear();
     test_hooks::set_responder(seq_responder(vec![HostResponse::Status(0)]));

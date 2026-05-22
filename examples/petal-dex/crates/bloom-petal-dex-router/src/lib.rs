@@ -253,23 +253,28 @@ pub mod ops {
 /// ## Swap model
 ///
 /// All `swap_Nhop` functions:
-/// - Take `&mut Pool<...>` — the macro arranges a Mutable borrow.
-/// - Take a linear `Coin<A>` input that is fully consumed.
-/// - Return a `Coin<D>` that is freshly minted.
+/// - Take `&mut Resource<Pool>` object handles — the macro arranges a Mutable
+///   borrow and materializes the handle from each arg's `ObjectId`.
+/// - Take a linear `Coin<Erased>` input that is fully consumed (the token's
+///   on-chain identity rides on the coin object's own type tag, not a Rust
+///   generic — spec §11.2 handle/tag model).
+/// - Return a freshly minted `Coin<Erased>`, encoded by the macro as an
+///   `ObjectId` for cross-command threading.
 /// - The `min_out` guard applies to the **final** output only; intermediate
 ///   hops use `0` (the outer slippage check makes this safe).
 ///
 /// ## Inline math
 ///
 /// There is no `petal.call` in v0. The router re-implements the per-hop
-/// swap kernel by reading/writing pool payloads via `ops::hop<S>`, which
-/// uses `bloom-petal-dex-pool::payload` helpers (shared `rlib` dep) and
-/// `bloom-dex-math::SwapStrategy::apply_swap`.
+/// swap kernel by reading/writing pool payloads via `ops::hop::<ConstantProduct>`,
+/// which uses `bloom-petal-dex-pool::payload` helpers (shared `rlib` dep) and
+/// `bloom-dex-math::SwapStrategy::apply_swap`. `ConstantProduct` is the only
+/// strategy; its fee params live serialized in each pool's `params_bytes`.
 #[bloom::petal(path = "/bloom/dex/router", version = "0.1.0")]
 pub mod router {
-    use bloom_dex_math::SwapStrategy;
-    use bloom_petal_dex_pool::{ParamCodec, pool::Pool};
-    use bloom_resource::{Coin, RuntimeHandle};
+    use bloom_dex_math::ConstantProduct;
+    use bloom_petal_dex_pool::pool::Pool;
+    use bloom_resource::{Coin, Erased, Resource};
 
     use crate::ops;
 
@@ -278,36 +283,24 @@ pub mod router {
     /// Predict the output of a single-hop swap A→B without changing state.
     ///
     /// Returns `amount_out` for the given `amount_in`. Reads the pool reserves
-    /// and strategy params, calls `S::quote`, and returns the result.
-    pub fn quote_1hop<A, B, S: SwapStrategy>(_pool: &Pool<A, B, S>, amount_in: u128) -> u128
-    where
-        S::Params: ParamCodec,
-    {
-        let pool_handle = RuntimeHandle::from_raw(0);
-        ops::quote_one::<S>(pool_handle, amount_in).expect("quote_1hop: host failure")
+    /// and strategy params, calls `ConstantProduct::quote`, and returns the
+    /// result.
+    pub fn quote_1hop(pool: &Resource<Pool>, amount_in: u128) -> u128 {
+        ops::quote_one::<ConstantProduct>(pool.handle(), amount_in)
+            .expect("quote_1hop: host failure")
     }
 
     // ── quote_2hop ───────────────────────────────────────────────────────────
 
     /// Predict the output of a two-hop swap A→B→C without changing state.
     ///
-    /// Chains `S1::quote` on `pool1` then `S2::quote` on `pool2`, threading
-    /// the intermediate amount through.
-    pub fn quote_2hop<A, B, C, S1: SwapStrategy, S2: SwapStrategy>(
-        _pool1: &Pool<A, B, S1>,
-        _pool2: &Pool<B, C, S2>,
-        amount_in: u128,
-    ) -> u128
-    where
-        S1::Params: ParamCodec,
-        S2::Params: ParamCodec,
-    {
-        let pool1_handle = RuntimeHandle::from_raw(0);
-        let pool2_handle = RuntimeHandle::from_raw(1);
-
-        let mid =
-            ops::quote_one::<S1>(pool1_handle, amount_in).expect("quote_2hop: pool1 quote failure");
-        ops::quote_one::<S2>(pool2_handle, mid).expect("quote_2hop: pool2 quote failure")
+    /// Chains a quote on `pool1` then `pool2`, threading the intermediate
+    /// amount through.
+    pub fn quote_2hop(pool1: &Resource<Pool>, pool2: &Resource<Pool>, amount_in: u128) -> u128 {
+        let mid = ops::quote_one::<ConstantProduct>(pool1.handle(), amount_in)
+            .expect("quote_2hop: pool1 quote failure");
+        ops::quote_one::<ConstantProduct>(pool2.handle(), mid)
+            .expect("quote_2hop: pool2 quote failure")
     }
 
     // ── quote_3hop ───────────────────────────────────────────────────────────
@@ -315,46 +308,34 @@ pub mod router {
     /// Predict the output of a three-hop swap A→B→C→D without changing state.
     ///
     /// Chains three sequential quotes through pools 1, 2, 3.
-    #[allow(clippy::too_many_arguments)]
-    pub fn quote_3hop<A, B, C, D, S1: SwapStrategy, S2: SwapStrategy, S3: SwapStrategy>(
-        _pool1: &Pool<A, B, S1>,
-        _pool2: &Pool<B, C, S2>,
-        _pool3: &Pool<C, D, S3>,
+    pub fn quote_3hop(
+        pool1: &Resource<Pool>,
+        pool2: &Resource<Pool>,
+        pool3: &Resource<Pool>,
         amount_in: u128,
-    ) -> u128
-    where
-        S1::Params: ParamCodec,
-        S2::Params: ParamCodec,
-        S3::Params: ParamCodec,
-    {
-        let pool1_handle = RuntimeHandle::from_raw(0);
-        let pool2_handle = RuntimeHandle::from_raw(1);
-        let pool3_handle = RuntimeHandle::from_raw(2);
-
-        let mid1 =
-            ops::quote_one::<S1>(pool1_handle, amount_in).expect("quote_3hop: pool1 quote failure");
-        let mid2 =
-            ops::quote_one::<S2>(pool2_handle, mid1).expect("quote_3hop: pool2 quote failure");
-        ops::quote_one::<S3>(pool3_handle, mid2).expect("quote_3hop: pool3 quote failure")
+    ) -> u128 {
+        let mid1 = ops::quote_one::<ConstantProduct>(pool1.handle(), amount_in)
+            .expect("quote_3hop: pool1 quote failure");
+        let mid2 = ops::quote_one::<ConstantProduct>(pool2.handle(), mid1)
+            .expect("quote_3hop: pool2 quote failure");
+        ops::quote_one::<ConstantProduct>(pool3.handle(), mid2)
+            .expect("quote_3hop: pool3 quote failure")
     }
 
     // ── swap_1hop ────────────────────────────────────────────────────────────
 
     /// Execute a single-hop swap A→B.
     ///
-    /// Consumes `coin_in` (Coin<A>). Returns a freshly minted `Coin<B>`.
+    /// Consumes `coin_in`. Returns a freshly minted output coin.
     /// Panics if `amount_out < min_out` (slippage guard).
-    pub fn swap_1hop<A, B, S: SwapStrategy>(
-        _pool: &mut Pool<A, B, S>,
-        coin_in: Coin<A>,
+    pub fn swap_1hop(
+        pool: &mut Resource<Pool>,
+        coin_in: Coin<Erased>,
         min_out: u128,
-    ) -> Coin<B>
-    where
-        S::Params: ParamCodec,
-    {
-        let pool_handle = RuntimeHandle::from_raw(0);
+    ) -> Coin<Erased> {
         let (_amount_out, coin_out_handle) =
-            ops::hop::<S>(pool_handle, coin_in.handle(), min_out).expect("swap_1hop: host failure");
+            ops::hop::<ConstantProduct>(pool.handle(), coin_in.handle(), min_out)
+                .expect("swap_1hop: host failure");
         Coin::from_handle(coin_out_handle)
     }
 
@@ -362,30 +343,24 @@ pub mod router {
 
     /// Execute a two-hop swap A→B→C.
     ///
-    /// Consumes `coin_in` (Coin<A>). The intermediate Coin<B> is created and
-    /// immediately consumed inside this function — it never escapes. Returns a
-    /// freshly minted `Coin<C>`. The `min_out` guard applies to the final
-    /// output only; the intermediate hop uses `min_out = 0`.
-    pub fn swap_2hop<A, B, C, S1: SwapStrategy, S2: SwapStrategy>(
-        _pool1: &mut Pool<A, B, S1>,
-        _pool2: &mut Pool<B, C, S2>,
-        coin_in: Coin<A>,
+    /// Consumes `coin_in`. The intermediate coin is created and immediately
+    /// consumed inside this function — it never escapes. Returns a freshly
+    /// minted output coin. The `min_out` guard applies to the final output
+    /// only; the intermediate hop uses `min_out = 0`.
+    pub fn swap_2hop(
+        pool1: &mut Resource<Pool>,
+        pool2: &mut Resource<Pool>,
+        coin_in: Coin<Erased>,
         min_out: u128,
-    ) -> Coin<C>
-    where
-        S1::Params: ParamCodec,
-        S2::Params: ParamCodec,
-    {
-        let pool1_handle = RuntimeHandle::from_raw(0);
-        let pool2_handle = RuntimeHandle::from_raw(1);
-
+    ) -> Coin<Erased> {
         // Hop 1: A→B (min_out=0; slippage checked at final output).
         let (_mid_amount, coin_mid_handle) =
-            ops::hop::<S1>(pool1_handle, coin_in.handle(), 0).expect("swap_2hop: hop 1 failure");
+            ops::hop::<ConstantProduct>(pool1.handle(), coin_in.handle(), 0)
+                .expect("swap_2hop: hop 1 failure");
 
         // Hop 2: B→C (min_out = user's slippage bound).
         let (_final_amount, coin_out_handle) =
-            ops::hop::<S2>(pool2_handle, coin_mid_handle, min_out)
+            ops::hop::<ConstantProduct>(pool2.handle(), coin_mid_handle, min_out)
                 .expect("swap_2hop: hop 2 failure");
 
         Coin::from_handle(coin_out_handle)
@@ -395,37 +370,29 @@ pub mod router {
 
     /// Execute a three-hop swap A→B→C→D.
     ///
-    /// Consumes `coin_in` (Coin<A>). Intermediate Coin<B> and Coin<C> are
-    /// created and consumed atomically inside this function. Returns a freshly
-    /// minted `Coin<D>`. The `min_out` guard applies to the final output only.
-    #[allow(clippy::too_many_arguments)]
-    pub fn swap_3hop<A, B, C, D, S1: SwapStrategy, S2: SwapStrategy, S3: SwapStrategy>(
-        _pool1: &mut Pool<A, B, S1>,
-        _pool2: &mut Pool<B, C, S2>,
-        _pool3: &mut Pool<C, D, S3>,
-        coin_in: Coin<A>,
+    /// Consumes `coin_in`. Both intermediate coins are created and consumed
+    /// atomically inside this function. Returns a freshly minted output coin.
+    /// The `min_out` guard applies to the final output only.
+    pub fn swap_3hop(
+        pool1: &mut Resource<Pool>,
+        pool2: &mut Resource<Pool>,
+        pool3: &mut Resource<Pool>,
+        coin_in: Coin<Erased>,
         min_out: u128,
-    ) -> Coin<D>
-    where
-        S1::Params: ParamCodec,
-        S2::Params: ParamCodec,
-        S3::Params: ParamCodec,
-    {
-        let pool1_handle = RuntimeHandle::from_raw(0);
-        let pool2_handle = RuntimeHandle::from_raw(1);
-        let pool3_handle = RuntimeHandle::from_raw(2);
-
+    ) -> Coin<Erased> {
         // Hop 1: A→B.
         let (_mid1_amount, coin_mid1_handle) =
-            ops::hop::<S1>(pool1_handle, coin_in.handle(), 0).expect("swap_3hop: hop 1 failure");
+            ops::hop::<ConstantProduct>(pool1.handle(), coin_in.handle(), 0)
+                .expect("swap_3hop: hop 1 failure");
 
         // Hop 2: B→C.
         let (_mid2_amount, coin_mid2_handle) =
-            ops::hop::<S2>(pool2_handle, coin_mid1_handle, 0).expect("swap_3hop: hop 2 failure");
+            ops::hop::<ConstantProduct>(pool2.handle(), coin_mid1_handle, 0)
+                .expect("swap_3hop: hop 2 failure");
 
         // Hop 3: C→D (min_out = user's slippage bound).
         let (_final_amount, coin_out_handle) =
-            ops::hop::<S3>(pool3_handle, coin_mid2_handle, min_out)
+            ops::hop::<ConstantProduct>(pool3.handle(), coin_mid2_handle, min_out)
                 .expect("swap_3hop: hop 3 failure");
 
         Coin::from_handle(coin_out_handle)

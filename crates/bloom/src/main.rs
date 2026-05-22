@@ -11,6 +11,7 @@
 mod commands {
     pub mod chain;
     pub mod contract;
+    pub mod pipe;
 }
 
 use std::path::PathBuf;
@@ -87,6 +88,24 @@ enum Cmd {
     /// Build & verify Bloom Rust smart contracts.
     #[command(subcommand)]
     Contract(ContractCmd),
+    /// Lower a pipe expression into a PTB and stream its receipt (spec §3.5).
+    ///
+    /// `EXPR` is a pipe expression — linear `A | B | C` (each command's
+    /// primary output feeds the next) plus named `--a <(<sub-expr>)>`
+    /// DAG inputs. It lowers + validates against the chain via the same
+    /// `PtbSession` the NFS `tx`-session front door uses, so a plan piped
+    /// here commits identically to one staged over the mount.
+    Pipe {
+        /// The pipe expression to lower, e.g.
+        /// `'/bloom/dex/pool/swap amount=100 --in <(/bloom/wallet/coin)>'`.
+        expr: String,
+        /// Signer pubkey (32-byte hex). Repeat for a multi-signer tx.
+        #[arg(long = "signer", value_name = "HEX")]
+        signers: Vec<String>,
+        /// Gas-payer object id (32-byte hex `Coin<LOOM>`).
+        #[arg(long, value_name = "HEX")]
+        gas_payer: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -489,6 +508,21 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Petals(cmd) => run_petals(home, cmd).await,
         Cmd::Chain(cmd) => commands::chain::run_chain(&home, cmd).await,
         Cmd::Contract(cmd) => commands::contract::run(cmd),
+        Cmd::Pipe {
+            expr,
+            signers,
+            gas_payer,
+        } => {
+            // The lowering/build/receipt core (`commands::pipe::lower_and_build`
+            // / `receipt_ndjson`) is the same code path the NFS `tx`-session
+            // front door drives and is fully unit-tested. The dispatcher
+            // resolves the `ChainStateIface` the resolver needs; the v1
+            // in-process CLI cannot colocate a sovereign-chain `State`, so it
+            // returns a documented error (see `commands::pipe::run`). Wiring a
+            // node-colocated chain interface into this arm is the remaining
+            // deployment step.
+            commands::pipe::run(&expr, &signers, &gas_payer)
+        }
         Cmd::Ipc(IpcCmd::Call { method, params }) => {
             let socket = default_socket_path(home.root());
             if !socket.exists() {

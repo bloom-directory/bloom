@@ -17,7 +17,8 @@
 //! 10. `mint_genesis` creates a `Coin<LOOM>` and transfers it to recipient.
 //! 11. `value` reads back the u128 from the payload without consuming.
 //! 12. Payload helpers `coin_payload` / `rewrite_value` round-trip a u128.
-//! 14. `Supply::handle()` borrows the supply by its id (spec §14.1 — Gap 1).
+//! 14. `ops::borrow_supply_mut` borrows the supply by its id in Mutable mode
+//!     (spec §14.1 — Gap 1).
 //! 15. `mint_genesis` verifies the EpochZero cap via `cap::check` (Gap 2).
 //! 16. `create_burn_cap` does not exist — BurnCap only comes from
 //!     `create_currency` (Gap 3 — verified by absence of the symbol).
@@ -25,8 +26,7 @@
 use bloom_objects::{AccessMode, ObjectId, Owner};
 use bloom_petal_fungible::ops;
 use bloom_resource::host::{HostCall, HostResponse, test_hooks};
-use bloom_resource::{Capability, PetalError, RuntimeHandle, UID};
-use core::marker::PhantomData;
+use bloom_resource::{Capability, PetalError, Resource, RuntimeHandle};
 
 /// Reset the mock host before every test.
 fn fresh() {
@@ -448,7 +448,7 @@ fn type_tag_t_generic_idx_zero() {
 struct TestCoin;
 
 #[test]
-fn supply_handle_borrows_by_supply_id() {
+fn borrow_supply_mut_borrows_by_supply_id() {
     fresh();
     // Supply id: all-0xAA bytes.
     let supply_id = ObjectId([0xAAu8; 32]);
@@ -464,27 +464,24 @@ fn supply_handle_borrows_by_supply_id() {
         other => panic!("unexpected call {other:?}"),
     });
 
-    // Construct a Supply<TestCoin> whose id points to supply_id.
-    let supply: bloom_petal_fungible::fungible::Supply<TestCoin> =
-        bloom_petal_fungible::fungible::Supply {
-            id: UID::from_bytes([0xAAu8; 32]),
-            total: 0u128,
-            _phantom: PhantomData,
-        };
-
-    // Calling handle() must borrow by id and return supply_handle.
-    let got = supply.handle();
+    // In the handle/tag model the macro-emitted shim materializes a
+    // `Supply<T>` arg via `object.borrow(id, Mutable)` before the entry
+    // point runs (the old `Supply::handle()` borrow method was retired in
+    // the reshape). `ops::borrow_supply_mut` is that same borrow, exposed
+    // for PTBs that thread a `Supply<T>` produced in an earlier command: it
+    // must borrow by the supply's id in `Mutable` mode and return the handle.
+    let got = bloom_petal_fungible::ops::borrow_supply_mut(supply_id).expect("borrow_supply_mut");
     assert_eq!(
         got, supply_handle,
-        "handle() must return the borrow-table handle for the supply's id"
+        "borrow_supply_mut must return the borrow-table handle for the supply's id"
     );
 }
 
 #[test]
 fn mint_entry_point_uses_supply_handle_not_zero() {
     fresh();
-    // Supply handle assigned by the host when supply id [0xBB; 32] is borrowed.
-    let supply_id_bytes = [0xBBu8; 32];
+    // Supply handle the macro shim materialized via object.borrow before the
+    // entry point runs; carried by the `Resource<Supply<T>>` arg.
     let supply_handle = RuntimeHandle::from_raw(77);
 
     let supply_bytes = {
@@ -495,10 +492,6 @@ fn mint_entry_point_uses_supply_handle_not_zero() {
     let supply_bytes_clone = supply_bytes.clone();
 
     test_hooks::set_responder(move |call| match call {
-        // borrow(supply_id) → supply_handle
-        HostCall::ObjectBorrow { id, .. } if id.0 == supply_id_bytes => {
-            HostResponse::Handle(supply_handle)
-        }
         // read(supply_handle) → bytes with total=0
         HostCall::ObjectRead { handle } if *handle == supply_handle => {
             HostResponse::Bytes(supply_bytes_clone.clone())
@@ -518,23 +511,20 @@ fn mint_entry_point_uses_supply_handle_not_zero() {
 
     let _cap: Capability<bloom_petal_fungible::fungible::MintCap<TestCoin>> =
         Capability::from_handle(RuntimeHandle::from_raw(1));
-    let mut supply: bloom_petal_fungible::fungible::Supply<TestCoin> =
-        bloom_petal_fungible::fungible::Supply {
-            id: UID::from_bytes(supply_id_bytes),
-            total: 0u128,
-            _phantom: PhantomData,
-        };
+    // The macro materializes `Resource<Supply<T>>` carrying the borrow-table
+    // handle (77) it obtained from `object.borrow`.
+    let mut supply: Resource<bloom_petal_fungible::fungible::Supply<TestCoin>> =
+        Resource::from_handle(supply_handle);
 
     // If the petal entry point hardcodes RuntimeHandle::from_raw(0), the
-    // ObjectRead will be for handle 0, not supply_handle (77), causing the
-    // responder to panic with "unexpected call ObjectRead { handle: 0 }".
+    // ObjectRead/ObjectMutate will be for handle 0, not supply_handle (77),
+    // causing the responder to panic with "unexpected call ... handle: 0".
     let _coin = bloom_petal_fungible::fungible::mint::<TestCoin>(&_cap, &mut supply, 100);
 }
 
 #[test]
 fn burn_entry_point_uses_supply_handle_not_zero() {
     fresh();
-    let supply_id_bytes = [0xCCu8; 32];
     let supply_handle = RuntimeHandle::from_raw(55);
     let coin_handle = RuntimeHandle::from_raw(66);
 
@@ -552,9 +542,6 @@ fn burn_entry_point_uses_supply_handle_not_zero() {
     let coin_bytes_clone = coin_bytes.clone();
 
     test_hooks::set_responder(move |call| match call {
-        HostCall::ObjectBorrow { id, .. } if id.0 == supply_id_bytes => {
-            HostResponse::Handle(supply_handle)
-        }
         HostCall::ObjectRead { handle } if *handle == coin_handle => {
             HostResponse::Bytes(coin_bytes_clone.clone())
         }
@@ -571,12 +558,10 @@ fn burn_entry_point_uses_supply_handle_not_zero() {
 
     let _cap: Capability<bloom_petal_fungible::fungible::BurnCap<TestCoin>> =
         Capability::from_handle(RuntimeHandle::from_raw(2));
-    let mut supply: bloom_petal_fungible::fungible::Supply<TestCoin> =
-        bloom_petal_fungible::fungible::Supply {
-            id: UID::from_bytes(supply_id_bytes),
-            total: 200u128,
-            _phantom: PhantomData,
-        };
+    // The macro materializes `Resource<Supply<T>>` carrying the borrow-table
+    // handle (55) it obtained from `object.borrow`.
+    let mut supply: Resource<bloom_petal_fungible::fungible::Supply<TestCoin>> =
+        Resource::from_handle(supply_handle);
     let coin = bloom_resource::Coin::<TestCoin>::from_handle(coin_handle);
 
     // If the petal entry point hardcodes RuntimeHandle::from_raw(0), the

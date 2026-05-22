@@ -33,7 +33,7 @@ pub fn calldata() -> Vec<u8> {
     if len <= 0 {
         return Vec::new();
     }
-    let mut buf = vec![0; len as usize];
+    let mut buf = alloc::vec![0; len as usize];
     let copied = unsafe { imports::msg_calldata_read(buf.as_mut_ptr() as i32, 0, len) };
     buf.truncate(copied.max(0) as usize);
     buf

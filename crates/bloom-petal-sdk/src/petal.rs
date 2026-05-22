@@ -30,7 +30,7 @@ pub fn call(callee: &[u8; 32], calldata: &[u8], value_loom: LoomValue) -> Result
     let lo = i64::from_ne_bytes((v as u64).to_ne_bytes());
     let hi = i64::from_ne_bytes(((v >> 64) as u64).to_ne_bytes());
 
-    let mut retbuf = vec![0; MAX_RETDATA];
+    let mut retbuf = alloc::vec![0; MAX_RETDATA];
 
     let result = unsafe {
         imports::petal_call(

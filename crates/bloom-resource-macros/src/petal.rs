@@ -255,6 +255,36 @@ fn handle_fn(f: &ItemFn, m: &mut PetalManifestV0) -> syn::Result<Option<PetalShi
     let mut required_signers: u8 = 0;
     let mut required_capabilities = Vec::new();
 
+    // Generic dispatch (spec §5): a fn like `identity<T>(c: Coin<T>)`
+    // compiles to one *non-generic* `__petal_identity` wasm export. The
+    // concrete type-args arrive at runtime as the leading slots of the
+    // calldata (one canonical-encoded `TypeTag` per generic param, in
+    // declaration order, ahead of the positional args). We emit a
+    // shim-only `ArgKind::TypeArg(idx)` decode slot per generic param so
+    // the shim reads those tags off the front of the buffer and binds
+    // them into the per-call `bloom_resource::TypeArgs` context.
+    //
+    // These slots are deliberately *not* pushed into `args` (the
+    // manifest `FunctionDecl.args`): the PTB validator checks
+    // `cmd.args.len() == f.args.len()` and `cmd.type_args.len() ==
+    // f.type_params.len()` separately — type-args live in the dedicated
+    // `MoveCmd.type_args` vector, not in the positional arg list. The
+    // synthetic slots only steer the shim's wire decode.
+    for (idx, _name) in generic_names.iter().enumerate() {
+        let idx_u16 = u16::try_from(idx)
+            .map_err(|_| err_spanned(f, "too many generic type parameters (max 65535)"))?;
+        shim_args.push(ShimArgAst {
+            name: format!("__type_arg_{idx}"),
+            is_ref: false,
+            is_mut: false,
+            // Unused for TypeArg decode (the shim reads a raw TypeTag via
+            // `ArgReader::read_type_tag`), but `ShimArgAst` requires a
+            // `syn::Type`; a `TypeTag` placeholder keeps it well-formed.
+            inner_ty: syn::parse_quote!(::bloom_objects::TypeTag),
+            kind: ArgKind::TypeArg(idx_u16),
+        });
+    }
+
     for (i, arg) in f.sig.inputs.iter().enumerate() {
         let FnArg::Typed(pat_ty) = arg else {
             return Err(err_spanned(
@@ -311,14 +341,20 @@ fn handle_fn(f: &ItemFn, m: &mut PetalManifestV0) -> syn::Result<Option<PetalShi
     let (returns, return_ast) = match &f.sig.output {
         ReturnType::Default => (Vec::new(), None),
         ReturnType::Type(_, ty) => match ty.as_ref() {
+            // Returns unwrap `Resource<T>` to `T` for the same reason args
+            // do (spec §11.2): a returned `Resource<T>` is an on-chain `T`
+            // object id threaded to downstream commands.
             syn::Type::Tuple(t) => (
                 t.elems
                     .iter()
-                    .map(|t| ctx.lower(t))
+                    .map(|t| ctx.lower(crate::type_tag::strip_resource_wrapper(t)))
                     .collect::<Result<Vec<_>, _>>()?,
                 Some((**ty).clone()),
             ),
-            other => (vec![ctx.lower(other)?], Some((**ty).clone())),
+            other => (
+                vec![ctx.lower(crate::type_tag::strip_resource_wrapper(other))?],
+                Some((**ty).clone()),
+            ),
         },
     };
 
@@ -341,6 +377,7 @@ fn handle_fn(f: &ItemFn, m: &mut PetalManifestV0) -> syn::Result<Option<PetalShi
         return_ast,
         return_tags: returns,
         is_generic,
+        generic_names,
     }))
 }
 
@@ -379,6 +416,11 @@ fn arg_kind_for(
         }
         other => (None, other),
     };
+
+    // `Resource<T>` is a transparent handle wrapper; the on-chain object
+    // arg is a `T`, so the manifest declares `T`'s tag (spec §11.2). The
+    // access mode (computed from the outer `&`/`&mut`) is preserved.
+    let inner = crate::type_tag::strip_resource_wrapper(inner);
 
     let tag = ctx.lower(inner)?;
 
@@ -438,6 +480,7 @@ fn is_object_like(ty: &syn::Type) -> bool {
             | "i128"
             | "bool"
             | "String"
+            | "Vec"
             | "Address"
             | "ObjectId"
             | "TypeTag"

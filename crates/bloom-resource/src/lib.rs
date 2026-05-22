@@ -25,6 +25,9 @@
 //!   `#[object]` struct (spec §4.1).
 //! - [`resource`] — `Resource<T>` + `BloomType` trait for non-phantom
 //!   generic state (spec §11.2).
+//! - [`type_args`] — per-call type-argument context that lets generic
+//!   petal fns resolve a phantom `T`'s concrete `TypeTag` at runtime
+//!   (spec §5 generic dispatch).
 //! - [`error`] — `PetalError` typed error code returned by host
 //!   wrappers and (via `as_i32()`) by `__petal_<fn>` wasm exports.
 //! - [`linearity`] — client-side `PetalScope` guardrail for
@@ -57,6 +60,7 @@ pub mod host;
 pub mod linearity;
 pub mod resource;
 pub mod signer;
+pub mod type_args;
 pub mod uid;
 
 pub use abi::{AbiError, ArgReader, RetWriter};
@@ -67,4 +71,5 @@ pub use handle::RuntimeHandle;
 pub use linearity::{PetalScope, ScopeGuard};
 pub use resource::{BloomType, PRIMITIVE_PETAL_HASH, Resource};
 pub use signer::Signer;
+pub use type_args::{Erased, TypeArgs, TypeArgsGuard, current_type_arg, current_type_arg_count};
 pub use uid::UID;

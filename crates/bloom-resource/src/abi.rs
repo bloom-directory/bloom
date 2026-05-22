@@ -57,6 +57,19 @@ pub enum AbiError {
     /// Underlying `TypeTag` codec rejected the bytes.
     #[error("type tag codec error: {0}")]
     TypeTagError(#[from] CodecError),
+    /// A framed arg's tag byte did not match the variant the declared
+    /// parameter expected (e.g. a `Signer` slot fed an `Object` arg).
+    #[error("arg tag mismatch: expected {expected}, got {got}")]
+    ArgTagMismatch {
+        /// Tag byte the parameter shape expected.
+        expected: u8,
+        /// Tag byte actually present on the wire.
+        got: u8,
+    },
+    /// A framed `Object` / `Use` arg carried a byte length other than the
+    /// 32 bytes a raw `ObjectId` requires.
+    #[error("object arg id must be 32 bytes, got {0}")]
+    BadObjectIdLen(usize),
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +340,195 @@ impl RetWriter {
     /// `true` iff nothing has been written yet.
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CallArgsWriter / CallArgsReader — the *framed* PTB calldata envelope
+// ---------------------------------------------------------------------------
+//
+// The chain's PTB executor marshals a `Command::Move`'s args into a
+// count-prefixed, per-arg-tagged buffer (`executor.rs::marshal_args`):
+//
+//     count(u32 BE) | repeat count times: tag(u8) + payload
+//
+// where the tags mirror the `Arg` enum the CLI / PtbSession lowered from:
+//
+//     tag 0  Signer   → u16 BE signer index
+//     tag 1  Const    → u32 BE len + raw bytes
+//     tag 2  Object   → 32 raw `ObjectId` bytes
+//     tag 3  Use      → u32 BE len + raw bytes (an upstream return slot;
+//                       for Coin/Capability threading this is a 32-byte id)
+//     tag 4  TypeArg  → u32 BE len + canonical `TypeTag` bytes
+//
+// The macro-emitted `__petal_<fn>` shim consumes exactly this framing via
+// `CallArgsReader`, and the host-side test harness produces it via
+// `CallArgsWriter`. Keeping one writer/reader pair here means the wire
+// format has a single source of truth shared by the executor, the shim,
+// and the tests.
+
+/// Per-arg tag byte for a `Signer` slot.
+pub const ARG_TAG_SIGNER: u8 = 0;
+/// Per-arg tag byte for a `Const` (raw bytes) slot.
+pub const ARG_TAG_CONST: u8 = 1;
+/// Per-arg tag byte for an `Object` (32-byte id) slot.
+pub const ARG_TAG_OBJECT: u8 = 2;
+/// Per-arg tag byte for a `Use` (upstream return) slot.
+pub const ARG_TAG_USE: u8 = 3;
+/// Per-arg tag byte for a `TypeArg` (canonical `TypeTag`) slot.
+pub const ARG_TAG_TYPE: u8 = 4;
+
+/// Builder for the count-prefixed, per-arg-tagged calldata envelope that
+/// the chain PTB executor hands a `__petal_<fn>` export.
+#[derive(Debug, Default)]
+pub struct CallArgsWriter {
+    count: u32,
+    body: Vec<u8>,
+}
+
+impl CallArgsWriter {
+    /// Empty envelope (no args pushed yet).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn push_tag(&mut self, tag: u8) {
+        self.count += 1;
+        self.body.push(tag);
+    }
+
+    /// Append a `Signer` arg (its `signers[]` index).
+    pub fn push_signer(&mut self, idx: u16) {
+        self.push_tag(ARG_TAG_SIGNER);
+        self.body.extend_from_slice(&idx.to_be_bytes());
+    }
+
+    /// Append a `Const` arg (raw, length-prefixed bytes).
+    pub fn push_const(&mut self, bytes: &[u8]) {
+        self.push_tag(ARG_TAG_CONST);
+        let len = u32::try_from(bytes.len()).expect("const length fits in u32");
+        self.body.extend_from_slice(&len.to_be_bytes());
+        self.body.extend_from_slice(bytes);
+    }
+
+    /// Append an `Object` arg (32 raw `ObjectId` bytes).
+    pub fn push_object(&mut self, id: &ObjectId) {
+        self.push_tag(ARG_TAG_OBJECT);
+        self.body.extend_from_slice(&id.0);
+    }
+
+    /// Append a `Use` arg — an upstream command's return slot, length
+    /// prefixed. For Coin/Capability threading this is a 32-byte id.
+    pub fn push_use(&mut self, bytes: &[u8]) {
+        self.push_tag(ARG_TAG_USE);
+        let len = u32::try_from(bytes.len()).expect("use length fits in u32");
+        self.body.extend_from_slice(&len.to_be_bytes());
+        self.body.extend_from_slice(bytes);
+    }
+
+    /// Append a `TypeArg` slot, encoding `tag` via its canonical codec.
+    pub fn push_type_arg(&mut self, tag: &TypeTag) -> Result<(), AbiError> {
+        let enc = tag.encode_canonical()?;
+        self.push_tag(ARG_TAG_TYPE);
+        let len = u32::try_from(enc.len()).expect("type tag length fits in u32");
+        self.body.extend_from_slice(&len.to_be_bytes());
+        self.body.extend_from_slice(&enc);
+        Ok(())
+    }
+
+    /// Finalize: prepend the `u32` BE arg count to the accumulated body.
+    pub fn finish(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + self.body.len());
+        out.extend_from_slice(&self.count.to_be_bytes());
+        out.extend_from_slice(&self.body);
+        out
+    }
+}
+
+/// Cursor over the framed calldata envelope. The macro-emitted shim
+/// drives this in declaration order, calling the `next_*` accessor that
+/// matches each parameter's shape.
+#[derive(Debug)]
+pub struct CallArgsReader<'a> {
+    inner: ArgReader<'a>,
+    count: u32,
+}
+
+impl<'a> CallArgsReader<'a> {
+    /// Wrap a buffer and read the leading `u32` BE arg count.
+    pub fn new(buf: &'a [u8]) -> Result<Self, AbiError> {
+        let mut inner = ArgReader::new(buf);
+        let count = inner.read_u32()?;
+        Ok(Self { inner, count })
+    }
+
+    /// The arg count declared by the leading length prefix.
+    pub fn declared_count(&self) -> u32 {
+        self.count
+    }
+
+    /// Bytes not yet consumed from the body.
+    pub fn remaining(&self) -> usize {
+        self.inner.remaining()
+    }
+
+    fn expect_tag(&mut self, expected: u8) -> Result<(), AbiError> {
+        let got = self.inner.read_u8()?;
+        if got == expected {
+            Ok(())
+        } else {
+            Err(AbiError::ArgTagMismatch { expected, got })
+        }
+    }
+
+    /// Decode a `Signer` slot to its signer index.
+    pub fn next_signer(&mut self) -> Result<u16, AbiError> {
+        self.expect_tag(ARG_TAG_SIGNER)?;
+        self.inner.read_u16()
+    }
+
+    /// Decode a `Const` (or `Use`) slot to its raw length-prefixed bytes.
+    /// Accepts either tag because a value-typed parameter can be supplied
+    /// as a literal `Const` or threaded from an upstream `Use` return.
+    pub fn next_const_bytes(&mut self) -> Result<Vec<u8>, AbiError> {
+        let tag = self.inner.read_u8()?;
+        match tag {
+            ARG_TAG_CONST | ARG_TAG_USE => self.inner.read_bytes(),
+            other => Err(AbiError::ArgTagMismatch {
+                expected: ARG_TAG_CONST,
+                got: other,
+            }),
+        }
+    }
+
+    /// Decode an `Object` slot (tag 2, 32 raw bytes) or a `Use` slot
+    /// (tag 3, length-prefixed) that threads a Coin/Capability id, into a
+    /// 32-byte `ObjectId`.
+    pub fn next_object_id(&mut self) -> Result<ObjectId, AbiError> {
+        let tag = self.inner.read_u8()?;
+        match tag {
+            ARG_TAG_OBJECT => self.inner.read_object_id(),
+            ARG_TAG_USE => {
+                let b = self.inner.read_bytes()?;
+                if b.len() != 32 {
+                    return Err(AbiError::BadObjectIdLen(b.len()));
+                }
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b);
+                Ok(ObjectId(a))
+            }
+            other => Err(AbiError::ArgTagMismatch {
+                expected: ARG_TAG_OBJECT,
+                got: other,
+            }),
+        }
+    }
+
+    /// Decode a `TypeArg` slot (tag 4) into a `TypeTag`.
+    pub fn next_type_arg(&mut self) -> Result<TypeTag, AbiError> {
+        self.expect_tag(ARG_TAG_TYPE)?;
+        let b = self.inner.read_bytes()?;
+        TypeTag::decode_canonical(&b).map_err(AbiError::from)
     }
 }
 
@@ -611,6 +813,133 @@ mod tests {
         r.read_u32().unwrap();
         assert_eq!(r.remaining(), 4);
         r.read_u32().unwrap();
+        assert_eq!(r.remaining(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // CallArgsWriter / CallArgsReader — framed PTB calldata envelope
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn call_args_empty_envelope() {
+        let buf = CallArgsWriter::new().finish();
+        assert_eq!(buf, vec![0, 0, 0, 0]); // count = 0
+        let r = CallArgsReader::new(&buf).unwrap();
+        assert_eq!(r.declared_count(), 0);
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn call_args_count_is_leading_be_u32() {
+        let mut w = CallArgsWriter::new();
+        w.push_signer(0);
+        w.push_signer(1);
+        let buf = w.finish();
+        assert_eq!(&buf[..4], &[0, 0, 0, 2]); // count = 2
+    }
+
+    #[test]
+    fn call_args_signer_round_trip() {
+        let mut w = CallArgsWriter::new();
+        w.push_signer(0x1234);
+        let buf = w.finish();
+        let mut r = CallArgsReader::new(&buf).unwrap();
+        assert_eq!(r.declared_count(), 1);
+        assert_eq!(r.next_signer().unwrap(), 0x1234);
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn call_args_const_round_trip() {
+        let payload = 0xDEAD_BEEF_u32.to_be_bytes();
+        let mut w = CallArgsWriter::new();
+        w.push_const(&payload);
+        let buf = w.finish();
+        let mut r = CallArgsReader::new(&buf).unwrap();
+        assert_eq!(r.next_const_bytes().unwrap(), payload.to_vec());
+    }
+
+    #[test]
+    fn call_args_object_round_trip() {
+        let id = ObjectId([0x42; 32]);
+        let mut w = CallArgsWriter::new();
+        w.push_object(&id);
+        let buf = w.finish();
+        let mut r = CallArgsReader::new(&buf).unwrap();
+        assert_eq!(r.next_object_id().unwrap(), id);
+    }
+
+    #[test]
+    fn call_args_use_threads_object_id() {
+        // A `Use` slot carrying a 32-byte upstream id decodes as Object.
+        let id = ObjectId([0x7; 32]);
+        let mut w = CallArgsWriter::new();
+        w.push_use(&id.0);
+        let buf = w.finish();
+        let mut r = CallArgsReader::new(&buf).unwrap();
+        assert_eq!(r.next_object_id().unwrap(), id);
+    }
+
+    #[test]
+    fn call_args_use_wrong_len_is_rejected_as_object() {
+        let mut w = CallArgsWriter::new();
+        w.push_use(&[1, 2, 3]); // not 32 bytes
+        let buf = w.finish();
+        let mut r = CallArgsReader::new(&buf).unwrap();
+        assert_eq!(r.next_object_id(), Err(AbiError::BadObjectIdLen(3)));
+    }
+
+    #[test]
+    fn call_args_type_arg_round_trip() {
+        let tag = TypeTag::Concrete {
+            petal_hash: [0x11; 32],
+            type_name: "USDC".to_string(),
+            type_args: vec![],
+        };
+        let mut w = CallArgsWriter::new();
+        w.push_type_arg(&tag).unwrap();
+        let buf = w.finish();
+        let mut r = CallArgsReader::new(&buf).unwrap();
+        assert_eq!(r.next_type_arg().unwrap(), tag);
+    }
+
+    #[test]
+    fn call_args_tag_mismatch_is_reported() {
+        // Push a Signer, try to read it as an Object.
+        let mut w = CallArgsWriter::new();
+        w.push_signer(3);
+        let buf = w.finish();
+        let mut r = CallArgsReader::new(&buf).unwrap();
+        assert_eq!(
+            r.next_object_id(),
+            Err(AbiError::ArgTagMismatch {
+                expected: ARG_TAG_OBJECT,
+                got: ARG_TAG_SIGNER,
+            })
+        );
+    }
+
+    #[test]
+    fn call_args_mixed_envelope_round_trip() {
+        // Mirrors a generic swap call:
+        //   type:Coin<USDC> | signer:0 | obj:pool | const:amount
+        let type_tag = TypeTag::Generic { idx: 0 };
+        let pool = ObjectId([0x9; 32]);
+        let amount = 1_000_000u128.to_be_bytes();
+
+        let mut w = CallArgsWriter::new();
+        w.push_type_arg(&type_tag).unwrap();
+        w.push_signer(0);
+        w.push_object(&pool);
+        w.push_const(&amount);
+        let buf = w.finish();
+
+        let mut r = CallArgsReader::new(&buf).unwrap();
+        assert_eq!(r.declared_count(), 4);
+        assert_eq!(r.next_type_arg().unwrap(), type_tag);
+        assert_eq!(r.next_signer().unwrap(), 0);
+        assert_eq!(r.next_object_id().unwrap(), pool);
+        assert_eq!(r.next_const_bytes().unwrap(), amount.to_vec());
         assert_eq!(r.remaining(), 0);
     }
 }

@@ -18,6 +18,8 @@
 //!   tx hasn't been executed yet (or was never seen), or an object with
 //!   `success`/`fuel_used`/`return_data`/`return_text`/`logs`.
 //! - `chain_query_state` — look up a storage slot for a contract.
+//! - `chain_query_object` — look up an on-chain object by 32-byte id.
+//! - `chain_ls_objects` — scan objects filtered by owner address or type name.
 //! - `chain_ls_validators` — list the current validator set.
 
 use std::path::Path;
@@ -211,6 +213,8 @@ impl RpcServer {
             "chain_query_block" => self.handle_query_block(params),
             "chain_query_tx" => self.handle_query_tx(params),
             "chain_query_state" => self.handle_query_state(params),
+            "chain_query_object" => self.handle_query_object(params),
+            "chain_ls_objects" => self.handle_ls_objects(params),
             "chain_ls_validators" => self.handle_ls_validators(),
             "chain_tip" => self.handle_tip(),
             _ => Err(anyhow!("method not found: {method}")),
@@ -379,6 +383,78 @@ impl RpcServer {
         Ok(json!({ "value": hex::encode(value) }))
     }
 
+    fn handle_query_object(&self, params: &Value) -> Result<Value> {
+        // Params: { "id": "<64-hex object id>" }
+        // Returns null if no object with that id exists.
+        let id_str = params
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing 'id' param"))?;
+        let id_bytes = hex::decode(id_str).context("decode object id hex")?;
+        if id_bytes.len() != 32 {
+            return Err(anyhow!(
+                "object id must be 32 bytes (got {})",
+                id_bytes.len()
+            ));
+        }
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&id_bytes);
+        let object_id = bloom_objects::ObjectId(id);
+
+        let state = self.state.lock();
+        match state.get_object(&object_id) {
+            None => Ok(Value::Null),
+            Some(obj) => Ok(object_to_json(&obj)),
+        }
+    }
+
+    fn handle_ls_objects(&self, params: &Value) -> Result<Value> {
+        // Params: { "owner_addr": "<hex>" } OR { "type_name": "<str>" }.
+        // Scans every object and returns a JSON array of the same per-object
+        // shape as `chain_query_object`, filtered by the supplied predicate.
+        // Exactly one of the two filters must be present.
+        let owner_filter = params
+            .get("owner_addr")
+            .and_then(Value::as_str)
+            .map(|s| {
+                let b = hex::decode(s).context("decode owner_addr hex")?;
+                if b.len() != 32 {
+                    return Err(anyhow!("owner_addr must be 32 bytes (got {})", b.len()));
+                }
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&b);
+                Ok::<_, anyhow::Error>(a)
+            })
+            .transpose()?;
+        let type_filter = params.get("type_name").and_then(Value::as_str);
+        if owner_filter.is_none() == type_filter.is_none() {
+            return Err(anyhow!(
+                "chain_ls_objects: provide exactly one of 'owner_addr' or 'type_name'"
+            ));
+        }
+
+        let state = self.state.lock();
+        let mut out = Vec::new();
+        for (_id, obj) in state.iter_objects() {
+            let keep = match (&owner_filter, type_filter) {
+                (Some(addr), _) => matches!(
+                    &obj.owner,
+                    bloom_objects::Owner::Address(a) | bloom_objects::Owner::Object(bloom_objects::ObjectId(a))
+                        if a == addr
+                ),
+                (None, Some(name)) => matches!(
+                    &obj.type_tag,
+                    bloom_objects::TypeTag::Concrete { type_name, .. } if type_name == name
+                ),
+                (None, None) => unreachable!("filter presence checked above"),
+            };
+            if keep {
+                out.push(object_to_json(obj));
+            }
+        }
+        Ok(Value::Array(out))
+    }
+
     fn handle_ls_validators(&self) -> Result<Value> {
         let vs = &self.validator_set;
         let list: Vec<Value> = vs
@@ -494,6 +570,42 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Object → JSON
+// ---------------------------------------------------------------------------
+
+/// Shape an [`Object`] into the canonical JSON returned by
+/// `chain_query_object` / `chain_ls_objects`. `type_name`/`petal_hash` are
+/// only populated for `TypeTag::Concrete`; `owner_addr` carries the 32 bytes
+/// for `Address`/`Object` owners and is null for `Shared`/`Immutable`.
+fn object_to_json(obj: &bloom_objects::Object) -> Value {
+    use bloom_objects::{Owner, TypeTag};
+
+    let (type_name, petal_hash) = match &obj.type_tag {
+        TypeTag::Concrete {
+            petal_hash,
+            type_name,
+            ..
+        } => (Some(type_name.clone()), Some(hex::encode(petal_hash))),
+        _ => (None, None),
+    };
+    let (owner_kind, owner_addr) = match &obj.owner {
+        Owner::Address(a) => ("address", Some(hex::encode(a))),
+        Owner::Object(id) => ("object", Some(hex::encode(id.0))),
+        Owner::Shared => ("shared", None),
+        Owner::Immutable => ("immutable", None),
+    };
+    json!({
+        "id": hex::encode(obj.id.0),
+        "type_name": type_name,
+        "petal_hash": petal_hash,
+        "owner_kind": owner_kind,
+        "owner_addr": owner_addr,
+        "version": obj.version,
+        "payload": hex::encode(&obj.payload),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Address parser
 // ---------------------------------------------------------------------------
 
@@ -509,4 +621,149 @@ fn parse_address(s: &str) -> Result<Address> {
     }
     // Delegate to genesis parser for b1 format.
     crate::genesis::parse_b1_address(s)
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bloom_objects::{Object, ObjectId, Owner, TypeTag};
+    use bloom_test_util::{make_validator_set_signed, make_validator_with_keypair};
+
+    /// Build an `RpcServer` over an in-memory `State` (with tempdir-backed
+    /// stores) so the object handlers can be exercised in isolation. Returns
+    /// the server plus the tempdir guard, which the caller must keep alive.
+    fn make_server() -> (RpcServer, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let block_store = Arc::new(BlockStore::open(&tmp.path().join("blocks")).unwrap());
+        let receipt_store = Arc::new(
+            crate::receipt_store::ReceiptStore::open(&tmp.path().join("receipts")).unwrap(),
+        );
+        let mempool_persist =
+            Arc::new(MempoolPersist::open(&tmp.path().join("mempool.sled")).unwrap());
+        let state = Arc::new(Mutex::new(State::new()));
+        let v = make_validator_with_keypair();
+        let validator_set = Arc::new(make_validator_set_signed(&[&v], 100));
+        let (tx_submit, _rx) = tokio::sync::mpsc::channel(8);
+        let server = RpcServer {
+            state,
+            block_store,
+            mempool_persist,
+            receipt_store,
+            validator_set,
+            tx_submit,
+        };
+        (server, tmp)
+    }
+
+    /// A `Concrete`-typed object owned by `owner`.
+    fn concrete_object(id: u8, type_name: &str, owner: Owner) -> Object {
+        Object {
+            id: ObjectId([id; 32]),
+            type_tag: TypeTag::Concrete {
+                petal_hash: [0xAB; 32],
+                type_name: type_name.to_string(),
+                type_args: vec![],
+            },
+            owner,
+            version: 7,
+            payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        }
+    }
+
+    #[test]
+    fn query_object_returns_full_shape() {
+        let (server, _tmp) = make_server();
+        let owner = [0x11u8; 32];
+        let obj = concrete_object(0x42, "Coin", Owner::Address(owner));
+        server.state.lock().set_object(obj);
+
+        let res = server
+            .handle_query_object(&json!({ "id": hex::encode([0x42u8; 32]) }))
+            .unwrap();
+        assert_eq!(res["id"], hex::encode([0x42u8; 32]));
+        assert_eq!(res["type_name"], "Coin");
+        assert_eq!(res["petal_hash"], hex::encode([0xABu8; 32]));
+        assert_eq!(res["owner_kind"], "address");
+        assert_eq!(res["owner_addr"], hex::encode(owner));
+        assert_eq!(res["version"], 7);
+        assert_eq!(res["payload"], "deadbeef");
+    }
+
+    #[test]
+    fn query_object_missing_is_null() {
+        let (server, _tmp) = make_server();
+        let res = server
+            .handle_query_object(&json!({ "id": hex::encode([0x99u8; 32]) }))
+            .unwrap();
+        assert!(res.is_null());
+    }
+
+    #[test]
+    fn query_object_rejects_bad_length() {
+        let (server, _tmp) = make_server();
+        let err = server
+            .handle_query_object(&json!({ "id": "deadbeef" }))
+            .unwrap_err();
+        assert!(err.to_string().contains("32 bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn query_object_shared_owner_has_null_addr() {
+        let (server, _tmp) = make_server();
+        let obj = concrete_object(0x01, "Pool", Owner::Shared);
+        server.state.lock().set_object(obj);
+        let res = server
+            .handle_query_object(&json!({ "id": hex::encode([0x01u8; 32]) }))
+            .unwrap();
+        assert_eq!(res["owner_kind"], "shared");
+        assert!(res["owner_addr"].is_null());
+    }
+
+    #[test]
+    fn ls_objects_filters_by_owner_then_type() {
+        let (server, _tmp) = make_server();
+        let alice = [0x11u8; 32];
+        let bob = [0x22u8; 32];
+        {
+            let mut st = server.state.lock();
+            st.set_object(concrete_object(0x01, "Coin", Owner::Address(alice)));
+            st.set_object(concrete_object(0x02, "Pool", Owner::Address(alice)));
+            st.set_object(concrete_object(0x03, "Coin", Owner::Address(bob)));
+        }
+
+        // Filter by owner: two of Alice's objects.
+        let by_owner = server
+            .handle_ls_objects(&json!({ "owner_addr": hex::encode(alice) }))
+            .unwrap();
+        let arr = by_owner.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert!(arr.iter().all(|o| o["owner_addr"] == hex::encode(alice)));
+
+        // Filter by type: two "Coin" objects across owners.
+        let by_type = server
+            .handle_ls_objects(&json!({ "type_name": "Coin" }))
+            .unwrap();
+        let arr = by_type.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert!(arr.iter().all(|o| o["type_name"] == "Coin"));
+    }
+
+    #[test]
+    fn ls_objects_requires_exactly_one_filter() {
+        let (server, _tmp) = make_server();
+        // Neither filter.
+        assert!(server.handle_ls_objects(&json!({})).is_err());
+        // Both filters.
+        assert!(
+            server
+                .handle_ls_objects(
+                    &json!({ "owner_addr": hex::encode([0u8; 32]), "type_name": "Coin" })
+                )
+                .is_err()
+        );
+    }
 }

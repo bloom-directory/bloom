@@ -300,6 +300,32 @@ pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
     Ok(())
 }
 
+/// Whether `bytes` exports a *function* named `name`.
+///
+/// Used by the `TxKind::Deploy` apply path to decide whether to invoke the
+/// deploy-time `init` entry point. PTB-mode petals emitted by
+/// `bloom-resource-macros` (spec §16.2) have no `init`/`call` exports — only
+/// `__petal_*` shims — and create all of their state lazily through PTB
+/// `Move` commands, so deploying one is a pure code+VFS staging step with no
+/// initializer to run. Without this check the deploy path would
+/// unconditionally `get_typed_func("init")` and trap with
+/// `failed to find function export 'init'`.
+pub fn wasm_exports_function(bytes: &[u8], name: &str) -> bool {
+    use wasmparser::{ExternalKind, Parser, Payload};
+
+    for payload in Parser::new(0).parse_all(bytes) {
+        let Ok(Payload::ExportSection(reader)) = payload else {
+            continue;
+        };
+        for export in reader.into_iter().flatten() {
+            if export.kind == ExternalKind::Func && export.name == name {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Memory helpers (for ChainStoreData)
 // ---------------------------------------------------------------------------
@@ -1320,18 +1346,39 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
             // proper error code even if no row is preloaded. The actual
             // diff/access enforcement happens in BorrowTable::diff_check
             // at command-end and in `object.mutate` per-call.
-            let _requested_mode = match AccessMode::from_byte(mode as u8) {
+            let requested_mode = match AccessMode::from_byte(mode as u8) {
                 Ok(m) => m,
                 Err(_) => return HostError::Invalid("bad access mode".into()).as_wasm_code(),
             };
 
             with_ptb_ctx(&caller, |ctx| {
-                // Coalesce repeat borrows of the same object.
+                // Linear-move promotion: a `Consume` borrow of a
+                // *transient* row (an object created earlier in this same
+                // PTB and threaded here via `Arg::Use`) is an explicit
+                // hand-off. The PTB author wired a freshly-minted value
+                // into a by-value (Consume) arg slot — so the borrowing
+                // petal may delete it even though it does not define the
+                // type, exactly as a `Coin<Erased>` faucet-mint feeds a
+                // pool's `create_pool` / `swap_exact_in`. Transient rows
+                // are born `Mutable` (see `object.create`); promote so
+                // `object.delete`'s `defines || Consume` gate admits them.
+                //
+                // We deliberately do NOT promote *persistent* rows: those
+                // carry the PTB-declared access mode the validator already
+                // authorized against on-chain ownership, and silently
+                // escalating a `Mutable` loan to `Consume` would let a
+                // petal delete an object it was only lent.
+                if requested_mode == AccessMode::Consume
+                    && let Some(row) = ctx.borrow_table.get_mut(&id)
+                    && row.origin_command_idx.is_some()
+                {
+                    row.access_mode = AccessMode::Consume;
+                }
+
+                // Coalesce repeat borrows of the same object. (The
+                // linear-move promotion above already ran against the
+                // row, so reusing a prior command's handle is safe.)
                 if let Some(existing) = ctx.handle_for(&id) {
-                    // The row must already exist; just hand the
-                    // existing handle back. Updating access mode on
-                    // re-borrow is intentionally not done — diff_check
-                    // enforces ReadOnly→Mutable promotion is illegal.
                     return existing;
                 }
                 // If the row exists but no handle was minted yet (e.g.
@@ -1492,25 +1539,47 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                 Err(_) => return HostError::Invalid("bad type_tag".into()).as_wasm_code(),
             };
 
-            // Enforce the type-defining-petal rule.
-            let defining_hash = match &type_tag {
-                TypeTag::Concrete { petal_hash, .. } => *petal_hash,
+            // Enforce the type-defining-petal rule (spec §16.2).
+            //
+            // A petal cannot name its own code hash at compile time, so
+            // the `#[bloom::object]` macro emits the `petal_hash =
+            // [0u8; 32]` sentinel for every type the petal defines. We
+            // treat that sentinel as "self": it is stamped with the
+            // caller's real petal hash on creation, giving the on-chain
+            // object a concrete defining-petal identity (the validator's
+            // `type_tags_match` already treats a `[0u8; 32]` *declared*
+            // hash as a wildcard, so downstream type checks line up). A
+            // *non-zero* hash that does not match the caller is a forgery
+            // attempt — a petal trying to mint another petal's type — and
+            // is denied.
+            let caller_petal = caller.data().petal_hash.0;
+            let stamped_tag = match type_tag {
+                TypeTag::Concrete {
+                    petal_hash,
+                    type_name,
+                    type_args,
+                } => {
+                    if petal_hash != [0u8; 32] && petal_hash != caller_petal {
+                        return HostError::Denied("object.create from non-defining petal".into())
+                            .as_wasm_code();
+                    }
+                    TypeTag::Concrete {
+                        petal_hash: caller_petal,
+                        type_name,
+                        type_args,
+                    }
+                }
                 _ => {
                     return HostError::Invalid("create requires Concrete type_tag".into())
                         .as_wasm_code();
                 }
             };
-            let caller_petal = caller.data().petal_hash;
-            if defining_hash != caller_petal.0 {
-                return HostError::Denied("object.create from non-defining petal".into())
-                    .as_wasm_code();
-            }
 
             // Derive a deterministic transient ObjectId.
             let id = derive_create_id(&caller, &tag_bytes, &payload);
             let object = Object {
                 id,
-                type_tag,
+                type_tag: stamped_tag,
                 // Default owner: the petal contract address. The petal
                 // is expected to call `object.transfer` (or share /
                 // freeze) before the command ends. The borrow row is
@@ -1699,7 +1768,7 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                 // owner (so the chain-node's
                 // `rebuild_ownership_rows` can drop `id` from the
                 // old owner's row — spec §16.3 symmetric rebuild).
-                let (defining_hash, old_owner) = match ctx.borrow_table.get(&id) {
+                let (defining_hash, old_owner, row_mode) = match ctx.borrow_table.get(&id) {
                     Some(row) => {
                         let defining = match &row.type_tag {
                             TypeTag::Concrete { petal_hash, .. } => *petal_hash,
@@ -1710,13 +1779,26 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                                 .as_wasm_code();
                             }
                         };
-                        (defining, row.owner.clone())
+                        (defining, row.owner.clone(), row.access_mode)
                     }
                     None => {
                         return HostError::NotFound("row vanished".into()).as_wasm_code();
                     }
                 };
-                if defining_hash != caller_petal.0 {
+                // Authorization to delete (spec §16.2, refined for linear
+                // moves): the type-defining petal may always delete its
+                // own objects. In addition, an object handed to this petal
+                // as a `Consume`-mode argument carries an explicit linear
+                // "move" authorization from the PTB — the validator
+                // (`check_access_mode`) already proved the first signer
+                // owns it (or it is `Shared`), so the PTB author chose to
+                // surrender it. This is what lets the erased-coin DEX
+                // consume `Coin<Erased>` deposits minted by the fungible
+                // petal. A petal still cannot delete an object it merely
+                // borrowed `Mutable`/`ReadOnly` unless it defines the type.
+                let defines = defining_hash == caller_petal.0;
+                let consumed = row_mode == AccessMode::Consume;
+                if !defines && !consumed {
                     return HostError::Denied("object.delete from non-defining petal".into())
                         .as_wasm_code();
                 }
@@ -1724,6 +1806,39 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                 ctx.borrow_table.drop_row(&id);
                 0
             })
+        },
+    )?;
+
+    // -----------------------------------------------------------------------
+    // object.id(handle i32, out_ptr i32) -> i32
+    //
+    // Resolve a borrow handle back to the stable 32-byte `ObjectId` it
+    // points at, writing the id into guest memory at `out_ptr`. Returns
+    // `0` on success (the petal knows the width is always 32) or a
+    // negative `HostError` code. The return path uses this so a
+    // Coin/Capability output crosses a command boundary as its on-chain
+    // id (which `exec_transfer` / `exec_split_coins` decode from a
+    // `Use(...)` slot) rather than the ephemeral borrow handle.
+    // -----------------------------------------------------------------------
+    linker.func_wrap(
+        "object",
+        "id",
+        |mut caller: Caller<'_, ChainStoreData>, handle: i32, out_ptr: i32| -> i32 {
+            if consume_fuel(&mut caller, 100).is_err() {
+                return HostError::Backend("out of fuel".into()).as_wasm_code();
+            }
+            let id = match with_ptb_ctx_lookup_id(&caller, handle) {
+                Ok(id) => id,
+                Err(code) => return code,
+            };
+            let mem = match get_chain_memory(&mut caller) {
+                Some(m) => m,
+                None => return HostError::Invalid("no memory".into()).as_wasm_code(),
+            };
+            if let Err(c) = write_chain_bytes(&mem, &mut caller, out_ptr, &id.0) {
+                return c;
+            }
+            0
         },
     )?;
 
@@ -2951,43 +3066,45 @@ mod ptb_host_import_tests {
     }
 
     #[test]
-    fn object_create_by_defining_petal_mints_handle() {
-        // Build a WAT whose petal_hash, derived by blake3_tagged in
-        // dispatch_chain_call_sync, equals the type tag's petal_hash.
-        // We need to construct the WAT, compute the hash, then build a
-        // type_tag whose petal_hash matches — but the WAT's content
-        // changes with the embedded type tag. To avoid the chicken-and-
-        // -egg, we just construct an arbitrary type tag, then check
-        // we get the right behaviour by reading back the resulting
-        // petal_hash and comparing.
-        //
-        // We pre-build the WAT *without* knowing the hash, then re-check
-        // after.
-        let dummy_hash = [0u8; 32]; // placeholder
-        let dummy_tag = TypeTag::Concrete {
-            petal_hash: dummy_hash,
+    fn object_create_with_sentinel_hash_stamps_self_and_mints_handle() {
+        // The `[0u8; 32]` petal_hash is the compile-time "self" sentinel:
+        // a petal cannot name its own code hash, so the `#[bloom::object]`
+        // macro emits the zero hash for every type the petal defines.
+        // `object.create` must accept the sentinel and stamp the caller's
+        // real (computed) petal hash onto the created object — minting a
+        // valid handle. (A *non-zero* mismatching hash is still denied;
+        // see `object_create_by_non_defining_petal_is_denied`.)
+        let sentinel_tag = TypeTag::Concrete {
+            petal_hash: [0u8; 32],
             type_name: "X".into(),
             type_args: vec![],
         };
-        let want = dummy_tag.encode_canonical().unwrap();
+        let want = sentinel_tag.encode_canonical().unwrap();
         let wasm = parse(&object_create_wat(&want));
         let computed_petal = blake3_tagged(tags::PETAL, &wasm);
 
-        // Rebuild the tag with the correct petal_hash and a wasm that
-        // embeds it. This requires recomputing the wasm too because
-        // the embedded bytes shift the hash. We solve this by simply
-        // pre-loading the row with the correct hash and asserting the
-        // call gets `Denied` for the dummy-hash case (the *real*
-        // assertion is that the chicken-and-egg cannot be solved
-        // statically — we use Subtask D's e2e test against a known
-        // PTB type for a positive-path check).
-        let _ = computed_petal;
-        let ctx = PtbHostCtx::new();
-        let arc = Arc::new(Mutex::new(ctx));
-        let out = run_with(wasm, arc.clone(), Hash32(dummy_hash));
+        let arc = Arc::new(Mutex::new(PtbHostCtx::new()));
+        let out = run_with(wasm, arc.clone(), Hash32([0u8; 32]));
         let code = i32::from_le_bytes(out.return_data.unwrap().try_into().unwrap());
-        // Denied because petal_hash mismatch (computed != dummy).
-        assert_eq!(code, -2);
+        // Sentinel hash is accepted (self) → a non-negative handle.
+        assert!(
+            code >= 0,
+            "sentinel-hash create must mint a handle, got {code}"
+        );
+
+        // The created object's type_tag must be stamped with the caller's
+        // real computed petal hash, not the [0;32] sentinel.
+        let guard = arc.lock().unwrap();
+        assert_eq!(guard.created_objects.len(), 1, "one object created");
+        match &guard.created_objects[0].type_tag {
+            TypeTag::Concrete { petal_hash, .. } => {
+                assert_eq!(
+                    *petal_hash, computed_petal.0,
+                    "the self sentinel must be stamped with the caller's hash"
+                );
+            }
+            other => panic!("expected concrete tag, got {other:?}"),
+        }
     }
 
     #[test]

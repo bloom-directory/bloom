@@ -438,6 +438,43 @@ fn execute_tx_impl(
             acct.manifest_hash = *manifest_hash;
             snap.set_account(addr, acct);
 
+            // Decode the petal's manifest custom section (if
+            // present) so we can bind `module_path → petal_hash` in
+            // the VFS index. New-framework petals always carry one;
+            // legacy framework petals don't, in which case we leave
+            // the VFS index untouched (the petal is reachable only
+            // by pure-hash refs).
+            let vfs_binding: Option<(String, Hash32)> =
+                bloom_petal_manifest::extract_petal_manifest_v0(wasm)
+                    .filter(|m| !m.module_path.is_empty())
+                    .map(|m| (m.module_path, petal_hash));
+
+            // PTB-mode petals (spec §16.2, `bloom-resource-macros`) export
+            // only `__petal_*` shims — no deploy-time `init`. They create all
+            // of their state lazily through PTB `Move` commands, so deploying
+            // one is a pure code+account+VFS staging step. `validate_for_chain`
+            // already admits such petals; we must NOT then unconditionally
+            // invoke `init`, or the deploy traps with
+            // `failed to find function export 'init'`. Commit the staged
+            // snapshot directly and bind the VFS path.
+            if !bloom_petals::chain_vm::wasm_exports_function(wasm, "init") {
+                let ws = snap.commit();
+                if let Some((path, hash)) = vfs_binding {
+                    state.set_vfs_binding(path, hash);
+                }
+                tracing::info!(
+                    addr = %hex::encode(addr.0),
+                    "deploy committed (no init export — PTB-mode petal)"
+                );
+                return ExecOutput {
+                    success: true,
+                    fuel_used: 0,
+                    return_data: addr.0.to_vec(),
+                    logs: vec![],
+                    write_set: Some(ws),
+                };
+            }
+
             let input = ChainCallInput {
                 wasm: wasm.clone(),
                 entry: ChainEntry::Init,
@@ -450,17 +487,6 @@ fn execute_tx_impl(
                 snapshot: snap,
                 ptb_ctx: None,
             };
-
-            // Decode the petal's manifest custom section (if
-            // present) so we can bind `module_path → petal_hash` in
-            // the VFS index. New-framework petals always carry one;
-            // legacy framework petals don't, in which case we leave
-            // the VFS index untouched (the petal is reachable only
-            // by pure-hash refs).
-            let vfs_binding: Option<(String, Hash32)> =
-                bloom_petal_manifest::extract_petal_manifest_v0(wasm)
-                    .filter(|m| !m.module_path.is_empty())
-                    .map(|m| (m.module_path, petal_hash));
 
             match PetalVm::run_chain_call(input) {
                 Ok(out) => {

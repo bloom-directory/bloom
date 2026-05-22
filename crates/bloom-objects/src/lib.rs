@@ -10,6 +10,7 @@
 //! Scope:
 //! - [`id`] — `ObjectId` derivation.
 //! - [`object`] — `Owner` + `Object` records and canonical codec.
+//! - [`packet`] — `Packet` pipe-edge envelope (`TypeTag` + in-plan/object ref).
 //! - [`type_tag`] — recursive `TypeTag` (concrete / generic / external).
 //! - [`abilities`] — `AbilitySet` bitfield + `AccessMode` enum.
 //! - [`codec`] — variable-length codec extensions over `bloom-chain-abi`.
@@ -29,6 +30,7 @@ pub mod codec;
 pub mod host_imports;
 pub mod id;
 pub mod object;
+pub mod packet;
 pub mod primitive;
 pub mod store;
 pub mod type_tag;
@@ -40,6 +42,7 @@ pub use id::{OBJECT_ID_TAG, ObjectId};
 pub use object::{
     OWNER_KIND_ADDRESS, OWNER_KIND_IMMUTABLE, OWNER_KIND_OBJECT, OWNER_KIND_SHARED, Object, Owner,
 };
+pub use packet::{PACKET_REF_OBJECT, PACKET_REF_USE, Packet, PacketRef};
 pub use primitive::{ValidationOutcome, validate_canonical_bytes};
 pub use store::{
     OBJECT_LEAF_TAG, OBJECT_ROOT_TAG, OWNERSHIP_LEAF_TAG, OWNERSHIP_ROOT_TAG, ObjectTrieKey,

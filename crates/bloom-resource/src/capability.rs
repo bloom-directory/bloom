@@ -47,6 +47,18 @@ impl<T> Capability<T> {
     pub fn check(&self, expected: &TypeTag) -> bool {
         host::cap_check(self.handle, expected)
     }
+
+    /// Resolve the **runtime** `TypeTag` of the inner capability type
+    /// `T` for the currently executing generic petal call (spec §5).
+    ///
+    /// Like [`crate::Coin::type_tag`], `T` is a compile-time phantom; the
+    /// petal body supplies `idx` (the position of `T` among the fn's
+    /// generic parameters) and the tag is read from the per-call
+    /// [`crate::type_args`] context. Returns `None` outside a generic
+    /// dispatch or for an out-of-range `idx`.
+    pub fn type_tag(idx: u16) -> Option<TypeTag> {
+        crate::type_args::current_type_arg(idx)
+    }
 }
 
 impl<T> Copy for Capability<T> {}

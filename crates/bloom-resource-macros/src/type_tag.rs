@@ -163,6 +163,39 @@ pub(crate) fn reject_plain_generic_in_payload(
     Ok(())
 }
 
+/// If `ty` (after stripping one `&`/`&mut` layer) is `Resource<Inner>`,
+/// return `Inner`; otherwise return `ty` unchanged.
+///
+/// `Resource<T>` is the petal-side *handle wrapper* around an on-chain `T`
+/// object — it never appears in the on-chain type system. So the declared
+/// type recorded in the manifest for a `Resource<T>` arg / return must be
+/// `T`'s tag, not `Resource<T>` (spec §11.2). The codegen shim still
+/// materializes the full `Resource<T>` for the user fn; only the manifest
+/// type is unwrapped.
+pub(crate) fn strip_resource_wrapper(ty: &Type) -> &Type {
+    let inner = match ty {
+        Type::Reference(r) => r.elem.as_ref(),
+        other => other,
+    };
+    let Type::Path(TypePath { path, qself: None }) = inner else {
+        return ty;
+    };
+    let Some(seg) = path.segments.last() else {
+        return ty;
+    };
+    if seg.ident != "Resource" {
+        return ty;
+    }
+    if let PathArguments::AngleBracketed(args) = &seg.arguments {
+        for a in &args.args {
+            if let GenericArgument::Type(t) = a {
+                return t;
+            }
+        }
+    }
+    ty
+}
+
 /// True iff `ty` is `Resource<...>` (single-segment).
 pub(crate) fn is_resource_wrapper(ty: &Type) -> bool {
     let inner = match ty {

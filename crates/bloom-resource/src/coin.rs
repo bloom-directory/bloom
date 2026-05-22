@@ -8,7 +8,10 @@
 
 use core::marker::PhantomData;
 
+use bloom_objects::TypeTag;
+
 use crate::handle::RuntimeHandle;
+use crate::type_args;
 
 /// Typed handle to a borrowed `Coin<T>` row.
 pub struct Coin<T> {
@@ -44,6 +47,24 @@ impl<T> Coin<T> {
     /// when threading a `Coin` into a downstream host call).
     pub fn into_handle(self) -> RuntimeHandle {
         self.handle
+    }
+
+    /// Resolve the **runtime** `TypeTag` of the inner coin type `T` for
+    /// the currently executing generic petal call (spec §5 generic
+    /// dispatch).
+    ///
+    /// `T` is a compile-time phantom and carries no runtime identity, so
+    /// the petal body supplies `idx` — the position of `T` among the
+    /// fn's generic parameters (`identity<T>` → `idx = 0`;
+    /// `swap<A, B>(coin_in: Coin<A>) -> Coin<B>` → `Coin<A>` resolves
+    /// `idx = 0`, the output `Coin<B>` resolves `idx = 1`). The tag is
+    /// read from the per-call [`type_args`] context the shim bound from
+    /// the calldata's `Arg::TypeArg` slots.
+    ///
+    /// Returns `None` outside a generic dispatch or when `idx` is out of
+    /// range (fewer type-args were supplied than the fn declares).
+    pub fn type_tag(idx: u16) -> Option<TypeTag> {
+        type_args::current_type_arg(idx)
     }
 }
 
@@ -183,5 +204,30 @@ mod tests {
         let big: Balance<USDC> = Balance::from_u128(u128::MAX);
         let one: Balance<USDC> = Balance::from_u128(1);
         assert_eq!(big.saturating_add(one).as_u128(), u128::MAX);
+    }
+
+    #[test]
+    fn type_tag_resolves_from_bound_context() {
+        use crate::type_args::TypeArgs;
+        let usdc = TypeTag::Concrete {
+            petal_hash: [0u8; 32],
+            type_name: "USDC".to_string(),
+            type_args: Vec::new(),
+        };
+        let loom = TypeTag::Concrete {
+            petal_hash: [0u8; 32],
+            type_name: "LOOM".to_string(),
+            type_args: Vec::new(),
+        };
+        let _g = TypeArgs::bind(vec![usdc.clone(), loom.clone()]);
+        // `Coin<A>` at generic index 0, `Coin<B>` at index 1.
+        assert_eq!(Coin::<USDC>::type_tag(0), Some(usdc));
+        assert_eq!(Coin::<USDC>::type_tag(1), Some(loom));
+        assert_eq!(Coin::<USDC>::type_tag(2), None);
+    }
+
+    #[test]
+    fn type_tag_is_none_without_binding() {
+        assert_eq!(Coin::<USDC>::type_tag(0), None);
     }
 }

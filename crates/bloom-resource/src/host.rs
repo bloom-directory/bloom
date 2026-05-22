@@ -72,6 +72,25 @@ mod raw {
         pub fn object_freeze(handle: i32) -> i32;
         #[link_name = "delete"]
         pub fn object_delete(handle: i32) -> i32;
+        #[link_name = "id"]
+        pub fn object_id(handle: i32, out_ptr: *mut u8) -> i32;
+    }
+
+    // -------- chain.* (calldata + return/revert ABI bridge) --------
+    //
+    // These mirror the proven 2-arg `__petal_<fn>(i32, i32) -> i32` VM
+    // ABI (chain_vm.rs): the export reads its framed calldata via
+    // `msg.calldata.read`, then delivers its framed return envelope by
+    // calling `petal.return` (success) or `petal.revert` (abort). Both
+    // delivery imports trap to unwind the guest, so they are `-> ()`.
+    #[link(wasm_import_module = "chain")]
+    unsafe extern "C" {
+        #[link_name = "msg.calldata.read"]
+        pub fn msg_calldata_read(dst_ptr: *mut u8, offset: i32, len: i32) -> i32;
+        #[link_name = "petal.return"]
+        pub fn petal_return(ptr: *const u8, len: i32);
+        #[link_name = "petal.revert"]
+        pub fn petal_revert(ptr: *const u8, len: i32);
     }
 
     #[link(wasm_import_module = "cap")]
@@ -172,6 +191,14 @@ pub enum HostCall {
     },
     /// `object.delete(handle)`
     ObjectDelete {
+        /// Borrow-table handle.
+        handle: RuntimeHandle,
+    },
+    /// `object.id(handle)` — resolve a borrow handle back to the
+    /// 32-byte `ObjectId` it points at (used when a Coin/Capability
+    /// return must cross a command boundary as an `Object`/`Use` id
+    /// rather than the ephemeral borrow handle).
+    ObjectId {
         /// Borrow-table handle.
         handle: RuntimeHandle,
     },
@@ -299,7 +326,9 @@ mod mock {
             HostCall::ObjectRead { .. } | HostCall::PtbCommandOutput { .. } => {
                 HostResponse::Bytes(Vec::new())
             }
-            HostCall::SignerAddress { .. } => HostResponse::Address([0u8; 32]),
+            HostCall::SignerAddress { .. } | HostCall::ObjectId { .. } => {
+                HostResponse::Address([0u8; 32])
+            }
             HostCall::SignerIndex | HostCall::CapCheck { .. } => HostResponse::IntReturn(0),
             _ => HostResponse::Status(PetalError::Ok.as_i32()),
         }
@@ -657,6 +686,41 @@ pub fn object_delete(handle: RuntimeHandle) -> Result<(), PetalError> {
     }
 }
 
+/// Resolve a borrow handle back to the 32-byte [`ObjectId`] it points at.
+///
+/// The return path uses this to encode a Coin/Capability output as the
+/// stable on-chain id (32 bytes) rather than the ephemeral 4-byte borrow
+/// handle, so the chain executor can thread it into a later command's
+/// `Use(...)` → `Object` slot (`exec_transfer` / `exec_split_coins`
+/// decode such a slot as a raw `ObjectId`).
+pub fn object_id(handle: RuntimeHandle) -> Result<ObjectId, PetalError> {
+    if !handle.is_valid() {
+        return Err(PetalError::InvalidHandle);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        match mock::dispatch(HostCall::ObjectId { handle }) {
+            HostResponse::Address(a) => Ok(ObjectId(a)),
+            HostResponse::Err(e) => Err(e),
+            other => panic!("object_id expected Address response, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut out = [0u8; 32];
+        // SAFETY: `out` is a stack-allocated 32-byte buffer we hand to
+        // the host; host writes exactly 32 bytes on success.
+        let code = unsafe { host_extern::object_id(handle.as_raw(), out.as_mut_ptr()) };
+        if code < 0 {
+            Err(PetalError::HostImportFailed)
+        } else {
+            Ok(ObjectId(out))
+        }
+    }
+}
+
 /// Check whether a borrowed object matches the expected capability
 /// type tag. Returns `true` on match.
 pub fn cap_check(handle: RuntimeHandle, expected_type_tag: &TypeTag) -> bool {
@@ -828,6 +892,58 @@ pub fn log_emit(topic: &[u8], data: &[u8]) {
 }
 
 // ===========================================================================
+// Calldata / return / revert ABI bridge (wasm32 only)
+// ===========================================================================
+//
+// These three wrappers exist only on the chain VM target. The
+// macro-emitted `__petal_<fn>(i32, i32) -> i32` export uses them to read
+// its framed calldata and to deliver its framed return / abort envelope.
+// On non-wasm targets the macro emits a `fn shim(args, ret_buf) -> i32`
+// host shim that consumes/produces those buffers directly, so there is
+// no mock equivalent here.
+
+/// Read `len` bytes of the current command's calldata, starting at byte
+/// `offset`, into a freshly-allocated `Vec<u8>` (wasm32 only).
+///
+/// Mirrors the VM's `chain.msg.calldata.read(dst, offset, len)` import.
+#[cfg(target_arch = "wasm32")]
+pub fn calldata_read(offset: i32, len: usize) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::with_capacity(len);
+    // SAFETY: we just allocated `len` capacity; the host writes at most
+    // `len` bytes and returns the count actually written.
+    let written = unsafe { host_extern::msg_calldata_read(buf.as_mut_ptr(), offset, len as i32) };
+    if written < 0 {
+        return Vec::new();
+    }
+    // SAFETY: host wrote `written` valid bytes into our buffer.
+    unsafe { buf.set_len(written as usize) };
+    buf
+}
+
+/// Deliver a successful framed return envelope to the host and unwind
+/// the guest (wasm32 only). The host import traps to terminate the call,
+/// so this never returns.
+#[cfg(target_arch = "wasm32")]
+pub fn petal_return(bytes: &[u8]) -> ! {
+    // SAFETY: `bytes` is borrowed for the duration of the call; the host
+    // copies it out before trapping. The import does not return.
+    unsafe { host_extern::petal_return(bytes.as_ptr(), bytes.len() as i32) };
+    // The host import traps; this is unreachable, but the `!` return type
+    // demands we never fall through.
+    core::unreachable!("chain.petal.return must trap")
+}
+
+/// Deliver an abort (revert) envelope to the host and unwind the guest
+/// (wasm32 only). The host import traps to terminate the call, so this
+/// never returns.
+#[cfg(target_arch = "wasm32")]
+pub fn petal_revert(bytes: &[u8]) -> ! {
+    // SAFETY: same contract as `petal_return`.
+    unsafe { host_extern::petal_revert(bytes.as_ptr(), bytes.len() as i32) };
+    core::unreachable!("chain.petal.revert must trap")
+}
+
+// ===========================================================================
 // Tests (mock-driven)
 // ===========================================================================
 
@@ -934,6 +1050,27 @@ mod tests {
             }
             other => panic!("expected ObjectCreate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn object_id_resolves_handle_to_object_id() {
+        fresh();
+        test_hooks::set_responder(|_| HostResponse::Address([0x5A; 32]));
+        let h = RuntimeHandle::from_raw(4);
+        let id = object_id(h).unwrap();
+        assert_eq!(id, ObjectId([0x5A; 32]));
+        match test_hooks::last_call().unwrap() {
+            HostCall::ObjectId { handle } => assert_eq!(handle, h),
+            other => panic!("expected ObjectId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_id_rejects_invalid_handle_before_dispatch() {
+        fresh();
+        let err = object_id(RuntimeHandle::INVALID).unwrap_err();
+        assert_eq!(err, PetalError::InvalidHandle);
+        assert!(test_hooks::recorded_calls().is_empty());
     }
 
     #[test]

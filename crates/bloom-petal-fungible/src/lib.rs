@@ -276,7 +276,7 @@ pub mod ops {
 #[bloom::petal(path = "/bloom/core/fungible", version = "0.1.0")]
 pub mod fungible {
     use crate::ops;
-    use bloom_resource::{Capability, Coin, Signer, UID};
+    use bloom_resource::{Capability, Coin, Resource, Signer, UID};
     use core::marker::PhantomData;
 
     /// 32-byte post-quantum chain address; the recipient of a transfer
@@ -345,32 +345,6 @@ pub mod fungible {
     }
 
     // -----------------------------------------------------------------
-    // Supply<T> helpers — spec §14.1 / §11.2
-    // -----------------------------------------------------------------
-
-    impl<T> Supply<T> {
-        /// Borrow the supply object from the executor's borrow table in
-        /// `Mutable` mode, using the `id` stored in this struct. Returns
-        /// the runtime handle for use in `ops::mint` / `ops::burn`.
-        ///
-        /// Spec §14.1: every `mint` and `burn` must read and rewrite the
-        /// `Supply<T>` tracker. The handle obtained here is the one the
-        /// runtime has associated with the supply object for this command.
-        ///
-        /// Note: on the wasm execution path the macro-emitted shim calls
-        /// `object.borrow` before the user fn body runs, so `handle()`
-        /// borrows a second time. The runtime de-duplicates same-object
-        /// borrows within a command, so the double-borrow is idempotent.
-        pub fn handle(&self) -> bloom_resource::RuntimeHandle {
-            bloom_resource::host::object_borrow(
-                self.id.as_object_id(),
-                bloom_objects::AccessMode::Mutable,
-            )
-            .expect("Supply::handle: object_borrow failed — supply object not in borrow table")
-        }
-    }
-
-    // -----------------------------------------------------------------
     // Public petal entry points
     // -----------------------------------------------------------------
     //
@@ -402,13 +376,18 @@ pub mod fungible {
     /// Mint `amount` units of `Coin<T>` against the `MintCap<T>` proof
     /// of authority. Updates the `Supply<T>` total in lockstep.
     ///
-    /// The `supply` argument must reference the `Supply<T>` object that
-    /// tracks total issuance for this currency. `supply.handle()` issues
-    /// `object.borrow(supply.id, Mutable)` to obtain the real borrow-table
-    /// handle, fixing the earlier hard-coded `RuntimeHandle::from_raw(0)`
-    /// (spec §14.1 compliance — every mint must update the supply tracker
-    /// via the real runtime handle, not a fabricated one).
-    pub fn mint<T>(_cap: &Capability<MintCap<T>>, supply: &mut Supply<T>, amount: u128) -> Coin<T> {
+    /// The `supply` argument is the `Supply<T>` object that tracks total
+    /// issuance for this currency, taken as an object handle in the
+    /// handle/tag model (spec §11.2). The macro materializes it from the
+    /// arg's `ObjectId` via `object.borrow(id, Mutable)`; `supply.handle()`
+    /// returns that borrow-table handle for `ops::mint` (spec §14.1
+    /// compliance — every mint updates the supply tracker via the real
+    /// runtime handle).
+    pub fn mint<T>(
+        _cap: &Capability<MintCap<T>>,
+        supply: &mut Resource<Supply<T>>,
+        amount: u128,
+    ) -> Coin<T> {
         let supply_handle = supply.handle();
         let coin_handle = ops::mint(supply_handle, amount).expect("mint host failure");
         Coin::from_handle(coin_handle)
@@ -417,10 +396,10 @@ pub mod fungible {
     /// Burn `coin` (consuming it) against the `BurnCap<T>` authority,
     /// decrementing the `Supply<T>` total by the coin's value.
     ///
-    /// Uses `supply.handle()` to obtain the real borrow-table handle
-    /// rather than fabricating `RuntimeHandle::from_raw(0)` (spec §14.1
-    /// compliance).
-    pub fn burn<T>(_cap: &Capability<BurnCap<T>>, supply: &mut Supply<T>, coin: Coin<T>) {
+    /// `supply` is taken as an object handle (spec §11.2); `supply.handle()`
+    /// returns the borrow-table handle the macro materialized for it
+    /// (spec §14.1 compliance).
+    pub fn burn<T>(_cap: &Capability<BurnCap<T>>, supply: &mut Resource<Supply<T>>, coin: Coin<T>) {
         let supply_handle = supply.handle();
         ops::burn(supply_handle, coin.handle()).expect("burn host failure");
     }

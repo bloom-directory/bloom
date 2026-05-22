@@ -185,23 +185,25 @@ mod tags {
         }
     }
 
-    pub fn generic(idx: u16) -> TypeTag {
-        TypeTag::Generic { idx }
-    }
-
-    /// `TypeTag` for `Pool<A, B, S>` using generic indices 0, 1, 2.
+    /// `TypeTag` for the (non-generic) `Pool` object — the on-chain shape
+    /// the `#[bloom::object] struct Pool` declares in the handle/tag model
+    /// (spec §11.2). Token identities `A`/`B` ride on the coin objects'
+    /// own tags, not the pool's, so the pool carries no type args.
     pub fn pool_tag() -> TypeTag {
-        concrete("Pool", vec![generic(0), generic(1), generic(2)])
+        concrete("Pool", vec![])
     }
 
-    /// `TypeTag` for `LpPosition<A, B, S>` using generic indices 0, 1, 2.
+    /// `TypeTag` for the (non-generic) `LpPosition` object.
     pub fn lp_position_tag() -> TypeTag {
-        concrete("LpPosition", vec![generic(0), generic(1), generic(2)])
+        concrete("LpPosition", vec![])
     }
 
-    /// `TypeTag` for `Coin<Generic{idx}>`.
-    pub fn coin_tag(idx: u16) -> TypeTag {
-        concrete("Coin", vec![generic(idx)])
+    /// `TypeTag` for `Coin<Erased>` — the type-erased coin shape the pool's
+    /// exports declare for both their coin args and their returned output
+    /// coins (matches `bloom_resource::Erased`'s tag). The `idx` argument
+    /// is ignored (kept for call-site compatibility).
+    pub fn coin_tag(_idx: u16) -> TypeTag {
+        concrete("Coin", vec![concrete("Erased", vec![])])
     }
 }
 
@@ -751,10 +753,10 @@ pub mod ops {
 /// public entry points for pool lifecycle operations.
 #[bloom::petal(path = "/bloom/dex/pool", version = "0.1.0")]
 pub mod pool {
-    use bloom_dex_math::SwapStrategy;
     use bloom_objects::ObjectId;
-    use bloom_resource::{Coin, UID};
-    use core::marker::PhantomData;
+    use bloom_resource::{Coin, Erased, Resource, UID};
+
+    use bloom_dex_math::{ConstantProduct, ConstantProductParams};
 
     use crate::{ParamCodec, ops};
 
@@ -768,15 +770,17 @@ pub mod pool {
     ///  k_last (16) | params_bytes (4-len + raw)`
     ///
     /// `reserve_a` and `reserve_b` are the raw u128 balances of the two
-    /// token reserves stored as integers (not as `Coin<A>` / `Coin<B>`
-    /// objects) because consuming a coin means deleting it from the
-    /// borrow table; the pool accumulates raw values instead.
+    /// token reserves stored as integers (not as `Coin` objects) because
+    /// consuming a coin means deleting it from the borrow table; the pool
+    /// accumulates raw values instead.
     ///
-    /// `params_bytes` stores the strategy params serialized via [`ParamCodec`].
-    /// See the crate-level doc for why this workaround is used instead of
-    /// the direct `S::Params` associated-type projection.
-    #[bloom::object(abilities = "key, store", phantom = "A, B, S")]
-    pub struct Pool<A, B, S> {
+    /// In the handle/tag model (spec §11.2) the pool is operated on as an
+    /// opaque on-chain object — there is no `Pool<A, B, S>` Rust generic.
+    /// The two token identities `A`/`B` are carried by the coin objects'
+    /// own type tags; the swap strategy is `ConstantProduct`, whose fee
+    /// params live serialized in `params_bytes` (decoded via [`ParamCodec`]).
+    #[bloom::object(abilities = "key, store")]
+    pub struct Pool {
         /// On-chain object identifier.
         pub id: UID,
         /// Raw balance of token A in this pool.
@@ -789,193 +793,129 @@ pub mod pool {
         pub k_last: u128,
         /// Strategy-specific params, serialized via `ParamCodec`.
         pub params_bytes: Vec<u8>,
-        /// Phantom marker for A.
-        pub _phantom_a: PhantomData<A>,
-        /// Phantom marker for B.
-        pub _phantom_b: PhantomData<B>,
-        /// Phantom marker for S.
-        pub _phantom_s: PhantomData<S>,
     }
 
-    /// An LP position in a `Pool<A, B, S>`.
+    /// An LP position in a `Pool`.
     ///
     /// ## Field layout
     ///
     /// `id (32) | pool_id (32) | shares (16)`
-    #[bloom::object(abilities = "key, store", phantom = "A, B, S")]
-    pub struct LpPosition<A, B, S> {
+    #[bloom::object(abilities = "key, store")]
+    pub struct LpPosition {
         /// On-chain object identifier.
         pub id: UID,
         /// The pool this position belongs to.
         pub pool_id: ObjectId,
         /// LP share count.
         pub shares: u128,
-        /// Phantom marker for A.
-        pub _phantom_a: PhantomData<A>,
-        /// Phantom marker for B.
-        pub _phantom_b: PhantomData<B>,
-        /// Phantom marker for S.
-        pub _phantom_s: PhantomData<S>,
     }
 
     // ── Entry points ─────────────────────────────────────────────────────────
 
-    /// Create a fresh `Pool<A, B, S>` and issue an initial `LpPosition<A, B, S>`.
+    /// Create a fresh `Pool` and issue an initial `LpPosition`.
     ///
     /// Computes the initial LP shares as `floor(sqrt(value_a * value_b))` via
-    /// `S::add_liquidity(0, 0, value_a, value_b, 0)` (the sqrt path).
-    /// `coin_a` and `coin_b` are consumed; the LP position is returned to the
-    /// caller alongside the pool object.
+    /// the `ConstantProduct` sqrt path. `coin_a` and `coin_b` are consumed;
+    /// the LP position is returned to the caller alongside the pool object.
     ///
-    /// `params_bytes` is the strategy-specific configuration serialized with
-    /// [`ParamCodec::encode`]. Callers encode their `S::Params` value before
-    /// passing it here (e.g. `ConstantProductParams { fee_bps: 30 }.encode()`).
-    /// This avoids an associated-type projection in the function signature,
-    /// which the petal macro cannot lower to a manifest `TypeTag`.
-    pub fn create_pool<A, B, S: SwapStrategy>(
-        coin_a: Coin<A>,
-        coin_b: Coin<B>,
+    /// In the handle/tag model (spec §11.2) the exports take coin *handles*
+    /// (`Coin<Erased>` — the on-chain token identities `A`/`B` ride on the
+    /// coin objects' own type tags) and return the created objects as
+    /// `Resource` handles, which the macro encodes as `ObjectId`s for
+    /// cross-command threading.
+    ///
+    /// `params_bytes` is the `ConstantProduct` configuration serialized with
+    /// [`ParamCodec::encode`] (e.g. `ConstantProductParams { fee_bps: 30 }`).
+    /// Decoding it here rather than projecting an associated type keeps the
+    /// signature free of types the petal macro cannot lower to a `TypeTag`.
+    pub fn create_pool(
+        coin_a: Coin<Erased>,
+        coin_b: Coin<Erased>,
         params_bytes: Vec<u8>,
-    ) -> (Pool<A, B, S>, LpPosition<A, B, S>)
-    where
-        S::Params: ParamCodec,
-    {
-        // Decode the params to pass to the math strategy.
-        let params = S::Params::decode(&params_bytes)
-            .expect("create_pool: invalid params_bytes — could not decode S::Params");
+    ) -> (Resource<Pool>, Resource<LpPosition>) {
+        let params = ConstantProductParams::decode(&params_bytes)
+            .expect("create_pool: invalid params_bytes — could not decode ConstantProductParams");
 
-        let (pool_h, lp_h) = ops::create_pool::<S>(coin_a.handle(), coin_b.handle(), &params)
-            .expect("create_pool host failure");
-        let _ = pool_h;
-        let _ = lp_h;
-        // The macro shim returns the on-chain objects via the ret buffer;
-        // the Rust struct values here are placeholders for the type system.
-        let pool = Pool {
-            id: UID::default(),
-            reserve_a: 0,
-            reserve_b: 0,
-            lp_supply: 0,
-            k_last: 0,
-            params_bytes,
-            _phantom_a: PhantomData,
-            _phantom_b: PhantomData,
-            _phantom_s: PhantomData,
-        };
-        let lp = LpPosition {
-            id: UID::default(),
-            pool_id: ObjectId([0u8; 32]),
-            shares: 0,
-            _phantom_a: PhantomData,
-            _phantom_b: PhantomData,
-            _phantom_s: PhantomData,
-        };
-        (pool, lp)
+        let (pool_h, lp_h) =
+            ops::create_pool::<ConstantProduct>(coin_a.handle(), coin_b.handle(), &params)
+                .expect("create_pool host failure");
+        (Resource::from_handle(pool_h), Resource::from_handle(lp_h))
     }
 
     /// Add liquidity to `pool`. Returns the new `LpPosition` and any
     /// un-consumed coin remainders.
     #[allow(clippy::type_complexity)]
-    pub fn add_liquidity<A, B, S: SwapStrategy>(
-        _pool: &mut Pool<A, B, S>,
-        coin_a: Coin<A>,
-        coin_b: Coin<B>,
-    ) -> (LpPosition<A, B, S>, Option<Coin<A>>, Option<Coin<B>>)
-    where
-        S::Params: ParamCodec,
-    {
-        // The pool handle is passed by the PTB executor as arg 0 in Mutable
-        // mode. On the wasm execution path the macro shim decodes the real
-        // handle before calling this function. The `RuntimeHandle::from_raw(0)`
-        // is a placeholder that works on the wasm path where handle 0 is the
-        // pool arg; host-side tests should call `ops::add_liquidity` directly.
-        let pool_handle = bloom_resource::RuntimeHandle::from_raw(0);
-        let (lp_h, la, lb) = ops::add_liquidity::<S>(pool_handle, coin_a.handle(), coin_b.handle())
-            .expect("add_liquidity host failure");
-        let _ = lp_h;
-        let lp = LpPosition {
-            id: UID::default(),
-            pool_id: ObjectId([0u8; 32]),
-            shares: 0,
-            _phantom_a: PhantomData,
-            _phantom_b: PhantomData,
-            _phantom_s: PhantomData,
-        };
-        let leftover_a = la.map(Coin::from_handle);
-        let leftover_b = lb.map(Coin::from_handle);
-        (lp, leftover_a, leftover_b)
+    pub fn add_liquidity(
+        pool: &mut Resource<Pool>,
+        coin_a: Coin<Erased>,
+        coin_b: Coin<Erased>,
+    ) -> (
+        Resource<LpPosition>,
+        Option<Coin<Erased>>,
+        Option<Coin<Erased>>,
+    ) {
+        let (lp_h, la, lb) =
+            ops::add_liquidity::<ConstantProduct>(pool.handle(), coin_a.handle(), coin_b.handle())
+                .expect("add_liquidity host failure");
+        (
+            Resource::from_handle(lp_h),
+            la.map(Coin::from_handle),
+            lb.map(Coin::from_handle),
+        )
     }
 
-    /// Remove liquidity by consuming `position`. Returns `(Coin<A>, Coin<B>)`
-    /// with proportional amounts.
-    pub fn remove_liquidity<A, B, S: SwapStrategy>(
-        _pool: &mut Pool<A, B, S>,
-        _position: LpPosition<A, B, S>,
-    ) -> (Coin<A>, Coin<B>)
-    where
-        S::Params: ParamCodec,
-    {
-        let pool_handle = bloom_resource::RuntimeHandle::from_raw(0);
-        let lp_handle = bloom_resource::RuntimeHandle::from_raw(1);
-        let (ca, cb) = ops::remove_liquidity::<S>(pool_handle, lp_handle)
+    /// Remove liquidity by consuming `position`. Returns `(Coin, Coin)`
+    /// with proportional amounts of each reserve token.
+    pub fn remove_liquidity(
+        pool: &mut Resource<Pool>,
+        position: Resource<LpPosition>,
+    ) -> (Coin<Erased>, Coin<Erased>) {
+        let (ca, cb) = ops::remove_liquidity::<ConstantProduct>(pool.handle(), position.handle())
             .expect("remove_liquidity host failure");
         (Coin::from_handle(ca), Coin::from_handle(cb))
     }
 
-    /// Swap exact `coin_in` of `Coin<A>` for at-least `min_out` of `Coin<B>`.
-    pub fn swap_exact_in<A, B, S: SwapStrategy>(
-        _pool: &mut Pool<A, B, S>,
-        coin_in: Coin<A>,
+    /// Swap exact `coin_in` (token A) for at-least `min_out` of token B.
+    pub fn swap_exact_in(
+        coin_in: Coin<Erased>,
+        pool: &mut Resource<Pool>,
         min_out: u128,
-    ) -> Coin<B>
-    where
-        S::Params: ParamCodec,
-    {
-        let pool_handle = bloom_resource::RuntimeHandle::from_raw(0);
-        let out_h = ops::swap_exact_in::<S>(pool_handle, coin_in.handle(), min_out)
+    ) -> Coin<Erased> {
+        let out_h = ops::swap_exact_in::<ConstantProduct>(pool.handle(), coin_in.handle(), min_out)
             .expect("swap_exact_in host failure");
         Coin::from_handle(out_h)
     }
 
-    /// Swap exact `coin_in` of `Coin<B>` for at-least `min_out` of `Coin<A>`.
-    pub fn swap_exact_in_reverse<A, B, S: SwapStrategy>(
-        _pool: &mut Pool<A, B, S>,
-        coin_in: Coin<B>,
+    /// Swap exact `coin_in` (token B) for at-least `min_out` of token A.
+    pub fn swap_exact_in_reverse(
+        coin_in: Coin<Erased>,
+        pool: &mut Resource<Pool>,
         min_out: u128,
-    ) -> Coin<A>
-    where
-        S::Params: ParamCodec,
-    {
-        let pool_handle = bloom_resource::RuntimeHandle::from_raw(0);
-        let out_h = ops::swap_exact_in_reverse::<S>(pool_handle, coin_in.handle(), min_out)
-            .expect("swap_exact_in_reverse host failure");
+    ) -> Coin<Erased> {
+        let out_h =
+            ops::swap_exact_in_reverse::<ConstantProduct>(pool.handle(), coin_in.handle(), min_out)
+                .expect("swap_exact_in_reverse host failure");
         Coin::from_handle(out_h)
     }
 
-    /// Swap at-most `max_in` of `Coin<A>` for exactly `amount_out` of `Coin<B>`.
+    /// Swap at-most `max_in` (token A) for exactly `amount_out` of token B.
     ///
-    /// Returns `(Coin<B>, Option<Coin<A>>)` where the option is the unconsumed
+    /// Returns `(Coin, Option<Coin>)` where the option is the unconsumed
     /// remainder of `max_in` (if any).
-    pub fn swap_exact_out<A, B, S: SwapStrategy>(
-        _pool: &mut Pool<A, B, S>,
-        max_in: Coin<A>,
+    pub fn swap_exact_out(
+        pool: &mut Resource<Pool>,
+        max_in: Coin<Erased>,
         amount_out: u128,
-    ) -> (Coin<B>, Option<Coin<A>>)
-    where
-        S::Params: ParamCodec,
-    {
-        let pool_handle = bloom_resource::RuntimeHandle::from_raw(0);
-        let (cb_h, la) = ops::swap_exact_out::<S>(pool_handle, max_in.handle(), amount_out)
-            .expect("swap_exact_out host failure");
+    ) -> (Coin<Erased>, Option<Coin<Erased>>) {
+        let (cb_h, la) =
+            ops::swap_exact_out::<ConstantProduct>(pool.handle(), max_in.handle(), amount_out)
+                .expect("swap_exact_out host failure");
         (Coin::from_handle(cb_h), la.map(Coin::from_handle))
     }
 
     /// Read `(reserve_a, reserve_b)` from a pool (read-only; for off-chain
     /// quoting).
-    pub fn reserves<A, B, S: SwapStrategy>(_pool: &Pool<A, B, S>) -> (u128, u128)
-    where
-        S::Params: ParamCodec,
-    {
-        let pool_handle = bloom_resource::RuntimeHandle::from_raw(0);
-        ops::reserves(pool_handle).expect("reserves host failure")
+    pub fn reserves(pool: &Resource<Pool>) -> (u128, u128) {
+        ops::reserves(pool.handle()).expect("reserves host failure")
     }
 }

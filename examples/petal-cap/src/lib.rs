@@ -85,7 +85,9 @@ pub fn is_active_logic(
 pub mod cap {
     use super::*;
     use bloom_objects::{Owner, TypeTag};
-    use bloom_resource::{ArgReader, Capability, RetWriter, RuntimeHandle, Signer, UID, host};
+    use bloom_resource::{
+        ArgReader, Capability, Resource, RetWriter, RuntimeHandle, Signer, UID, host,
+    };
     // Re-export the attribute-style proc-macros under unqualified names
     // so the petal macro's `attr.path().is_ident("object")` matcher
     // recognizes them. (It currently only matches single-segment paths;
@@ -101,13 +103,21 @@ pub mod cap {
     /// identical across `T` instantiations; the runtime
     /// `TypeTag::Concrete { type_args: [T_tag], ... }` keeps them
     /// distinct in the object store.
+    //
+    // In the handle/tag model (spec §11.2) the cap is operated on as an
+    // opaque on-chain object: petal entry points take `Resource<Cap<T>>`
+    // handles and read/rewrite the payload via `host::object_read` /
+    // `host::object_mutate` (see `read_cap_fields` / `write_cap_fields`).
+    // The struct below exists only to declare the object's identity,
+    // abilities, and payload field layout in the petal manifest — its
+    // fields are never constructed or read directly in Rust.
     #[object(abilities = "key, store", phantom = "T")]
+    #[allow(dead_code)]
     pub struct Cap<T> {
         /// Globally unique object id. Surfaced into the manifest field
         /// list so the chain-side decoder can identify the row; the
         /// petal body itself doesn't read it (the host owns ID
         /// assignment).
-        #[allow(dead_code)]
         id: UID,
         /// Inner-kind discriminant — see the `INNER_KIND_*` constants.
         inner_kind: u8,
@@ -116,11 +126,6 @@ pub mod cap {
         expires_at_block: u64,
         /// Set by [`revoke`] — once true the cap is permanently inactive.
         revoked: bool,
-        /// Runtime borrow-table handle assigned by `host::object_create`.
-        /// Populated in [`new`] and threaded through to every subsequent
-        /// host call so we never need the `INVALID` sentinel fallback.
-        #[allow(dead_code)]
-        handle: RuntimeHandle,
         _marker: PhantomData<T>,
     }
 
@@ -130,15 +135,11 @@ pub mod cap {
     /// `RevokeCap<T>` matches its target cap by phantom type, so a
     /// `RevokeCap<Mint>` cannot be used to revoke a `Cap<Burn>`.
     #[capability(phantom = "T")]
+    #[allow(dead_code)]
     pub struct RevokeCap<T> {
         /// Globally unique object id. As with `Cap::id`, surfaced into
         /// the manifest but unused inside the petal body.
-        #[allow(dead_code)]
         id: UID,
-        /// Runtime borrow-table handle for this RevokeCap, assigned by
-        /// `host::object_create` in [`new`].
-        #[allow(dead_code)]
-        handle: RuntimeHandle,
         _marker: PhantomData<T>,
     }
 
@@ -152,32 +153,21 @@ pub mod cap {
     /// model (the new objects are created on behalf of the signer);
     /// nothing inside the petal needs to inspect it.
     ///
-    /// Returns `(cap, revoke_cap)`. The caller decides what to do with
-    /// each — typically `transfer` the cap to a delegate and keep the
-    /// revoke cap private.
-    pub fn new<T>(_signer: &Signer) -> (Cap<T>, RevokeCap<T>) {
-        // Encode an "Open" Cap<T> payload + RevokeCap<T> payload.
+    /// Returns `(cap, revoke_cap)` as object handles. The macro encodes
+    /// each as an `ObjectId` in the return envelope for cross-command
+    /// threading (spec §11.2). The caller decides what to do with each —
+    /// typically `transfer` the cap to a delegate and keep the revoke cap
+    /// private.
+    pub fn new<T>(_signer: &Signer) -> (Resource<Cap<T>>, Resource<RevokeCap<T>>) {
+        // Create the "Open" Cap<T> object + its RevokeCap<T> in the
+        // borrow table; the returned handles carry the real object ids.
         let cap_handle =
             create_cap::<T>(INNER_KIND_OPEN, 0, false).expect("host: failed to create Cap<T>");
         let rev_handle = create_revoke_cap::<T>().expect("host: failed to create RevokeCap<T>");
 
         (
-            Cap {
-                id: UID::from_bytes([0u8; 32]),
-                inner_kind: INNER_KIND_OPEN,
-                expires_at_block: 0,
-                revoked: false,
-                // Thread the runtime-allocated handle into the struct so
-                // transfer/destroy/push_cap_payload can use it directly
-                // without falling back to INVALID.
-                handle: cap_handle,
-                _marker: PhantomData,
-            },
-            RevokeCap {
-                id: UID::from_bytes([0u8; 32]),
-                handle: rev_handle,
-                _marker: PhantomData,
-            },
+            Resource::from_handle(cap_handle),
+            Resource::from_handle(rev_handle),
         )
     }
 
@@ -186,37 +176,35 @@ pub mod cap {
     // -----------------------------------------------------------------
 
     /// Lock the cap. A locked cap reports `is_active = false` until
-    /// it is unlocked.
-    pub fn lock<T>(cap: &mut Cap<T>) {
-        cap.inner_kind = INNER_KIND_LOCKED;
-        cap.expires_at_block = 0;
-        push_cap_payload::<T>(cap);
+    /// it is unlocked. Preserves the `revoked` flag.
+    pub fn lock<T>(cap: &mut Resource<Cap<T>>) {
+        let (_kind, _exp, revoked) = read_cap_fields(cap.handle());
+        write_cap_fields(cap.handle(), INNER_KIND_LOCKED, 0, revoked);
     }
 
     /// Reset a locked cap back to the `Open` kind. No-op for caps that
     /// are already `Open`. Has no effect on the `revoked` flag — a
     /// revoked cap cannot be resurrected.
-    pub fn unlock<T>(cap: &mut Cap<T>) {
-        cap.inner_kind = INNER_KIND_OPEN;
-        cap.expires_at_block = 0;
-        push_cap_payload::<T>(cap);
+    pub fn unlock<T>(cap: &mut Resource<Cap<T>>) {
+        let (_kind, _exp, revoked) = read_cap_fields(cap.handle());
+        write_cap_fields(cap.handle(), INNER_KIND_OPEN, 0, revoked);
     }
 
     /// Convert the cap into an `ExpireAt` cap that stops honouring at
     /// block height `block`. Calling this on a `Locked` cap unlocks it
-    /// (the new kind is `ExpireAt`).
-    pub fn set_expiry<T>(cap: &mut Cap<T>, block: u64) {
-        cap.inner_kind = INNER_KIND_EXPIRE_AT;
-        cap.expires_at_block = block;
-        push_cap_payload::<T>(cap);
+    /// (the new kind is `ExpireAt`). Preserves the `revoked` flag.
+    pub fn set_expiry<T>(cap: &mut Resource<Cap<T>>, block: u64) {
+        let (_kind, _exp, revoked) = read_cap_fields(cap.handle());
+        write_cap_fields(cap.handle(), INNER_KIND_EXPIRE_AT, block, revoked);
     }
 
     /// Permanently mark the cap as revoked. The `RevokeCap<T>` proof
     /// authorizes this operation; the runtime cap-check ensures the
-    /// caller actually holds a matching revoke cap.
-    pub fn revoke<T>(_rc: &Capability<RevokeCap<T>>, cap: &mut Cap<T>) {
-        cap.revoked = true;
-        push_cap_payload::<T>(cap);
+    /// caller actually holds a matching revoke cap. Preserves the
+    /// current inner-kind and expiry.
+    pub fn revoke<T>(_rc: &Capability<RevokeCap<T>>, cap: &mut Resource<Cap<T>>) {
+        let (kind, exp, _revoked) = read_cap_fields(cap.handle());
+        write_cap_fields(cap.handle(), kind, exp, true);
     }
 
     // -----------------------------------------------------------------
@@ -224,34 +212,27 @@ pub mod cap {
     // -----------------------------------------------------------------
 
     /// `true` iff the cap currently honours auth requests at
-    /// `current_block`.
-    pub fn is_active<T>(cap: &Cap<T>, current_block: u64) -> bool {
-        super::is_active_logic(
-            cap.inner_kind,
-            cap.expires_at_block,
-            cap.revoked,
-            current_block,
-        )
+    /// `current_block`. Reads the cap's stored payload.
+    pub fn is_active<T>(cap: &Resource<Cap<T>>, current_block: u64) -> bool {
+        let (kind, exp, revoked) = read_cap_fields(cap.handle());
+        super::is_active_logic(kind, exp, revoked, current_block)
     }
 
     // -----------------------------------------------------------------
     // Linear-typed destructors
     // -----------------------------------------------------------------
 
-    /// Transfer ownership of the cap to `to`. The cap is consumed by
-    /// the petal-side wrapper; the chain rewrites the owner row in the
-    /// object store.
-    pub fn transfer<T>(cap: Cap<T>, to: Address) {
-        // Use the runtime handle stored in the cap struct — populated by
-        // `new` from the `host::object_create` return value.
-        let _ = host::object_transfer(cap.handle, &Owner::Address(to));
+    /// Transfer ownership of the cap to `to`. The cap handle is consumed;
+    /// the chain rewrites the owner row in the object store.
+    pub fn transfer<T>(cap: Resource<Cap<T>>, to: Address) {
+        let _ = host::object_transfer(cap.handle(), &Owner::Address(to));
     }
 
     /// Permanently delete the cap. The `RevokeCap<T>` is *not* deleted
     /// — issuers who want to fully wipe out a delegation should also
     /// `destroy` the revoke cap.
-    pub fn destroy<T>(cap: Cap<T>) {
-        let _ = host::object_delete(cap.handle);
+    pub fn destroy<T>(cap: Resource<Cap<T>>) {
+        let _ = host::object_delete(cap.handle());
     }
 
     // -----------------------------------------------------------------
@@ -291,9 +272,6 @@ pub mod cap {
 
     /// Decode a canonical `Cap<T>` payload. Returns `(inner_kind,
     /// expires_at_block, revoked)`.
-    #[allow(dead_code)] // exercised on the chain-side; not called from
-    // this petal's hot path yet (the user's `&mut
-    // Cap<T>` already holds the decoded fields).
     fn decode_cap_payload(buf: &[u8]) -> Option<(u8, u64, bool)> {
         let mut r = ArgReader::new(buf);
         let kind = r.read_u8().ok()?;
@@ -323,12 +301,26 @@ pub mod cap {
         host::object_create(&revoke_cap_type_tag(), &[])
     }
 
-    /// Push the cap's current Rust-side fields into the borrow-table
-    /// payload via `object.mutate`. The user-visible wrapper for every
-    /// `&mut Cap<T>` mutation routes through here.
-    fn push_cap_payload<T>(cap: &Cap<T>) {
-        let payload = encode_cap_payload(cap.inner_kind, cap.expires_at_block, cap.revoked);
-        let _ = host::object_mutate(cap.handle, &payload);
+    /// Read and decode the `Cap<T>` payload at `handle` into
+    /// `(inner_kind, expires_at_block, revoked)`. In the handle/tag model
+    /// every mutation reads the live payload first so concurrent fields
+    /// (e.g. `revoked`) are preserved rather than clobbered.
+    fn read_cap_fields(handle: RuntimeHandle) -> (u8, u64, bool) {
+        let buf = host::object_read(handle).expect("cap: object_read failed");
+        decode_cap_payload(&buf).expect("cap: malformed Cap<T> payload")
+    }
+
+    /// Re-encode the cap fields and write them back to the borrow-table
+    /// payload via `object.mutate`. Every `&mut Resource<Cap<T>>`
+    /// mutation routes through here.
+    fn write_cap_fields(
+        handle: RuntimeHandle,
+        inner_kind: u8,
+        expires_at_block: u64,
+        revoked: bool,
+    ) {
+        let payload = encode_cap_payload(inner_kind, expires_at_block, revoked);
+        let _ = host::object_mutate(handle, &payload);
     }
 }
 

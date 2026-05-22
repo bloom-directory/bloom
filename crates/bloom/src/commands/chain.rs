@@ -44,6 +44,24 @@ pub enum ChainCmd {
         /// Path to SSZ-encoded `Tx` file, or `-` for stdin.
         tx_file_or_dash: String,
     },
+    /// Wrap an already-signed inner PTB in a signed outer tx and submit it.
+    ///
+    /// The `--ptb-file` bytes are the output of `bloom_script::encode_ptb`
+    /// for an inner `PtbTx` that is ALREADY Ed25519-signed against its
+    /// `signers`. The CLI treats those bytes as opaque — it does not sign
+    /// the inner PTB — and only builds + signs the OUTER xDSA tx envelope
+    /// (which is what block-apply verifies) exactly like `deploy`/`call`.
+    SubmitPtb {
+        /// Path to a file holding the `encode_ptb` bytes of a signed `PtbTx`.
+        #[arg(long, value_name = "PATH")]
+        ptb_file: PathBuf,
+        /// Poll for the tx receipt after submitting and print it.
+        #[arg(long)]
+        wait: bool,
+        /// Receipt-poll timeout in seconds (only with `--wait`; default 30).
+        #[arg(long, value_name = "N", default_value_t = 30u64)]
+        wait_timeout_secs: u64,
+    },
     /// Build, sign, and submit a Deploy tx.
     Deploy {
         /// Path to a `.wasm` or `.wat` file.
@@ -261,6 +279,54 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
                 .call("chain_submit_tx", json!({ "tx_hex": hex::encode(&bytes) }))
                 .await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+
+        // ── submit-ptb ──────────────────────────────────────────────────────────
+        ChainCmd::SubmitPtb {
+            ptb_file,
+            wait,
+            wait_timeout_secs,
+        } => {
+            use bloom_chain_types::ssz::Encode;
+
+            // The inner PTB is opaque to the CLI: read the `encode_ptb` bytes
+            // verbatim and wrap them in `TxKind::SubmitPtb`. Only the outer
+            // envelope is signed here (deploy/call pattern).
+            let ptb_bytes = std::fs::read(&ptb_file)
+                .with_context(|| format!("read ptb file: {}", ptb_file.display()))?;
+
+            let (sk, pk, sender) = load_wallet_key(&chain_dir)?;
+            let chain_id = load_chain_id(&chain_dir)?;
+            let client = make_client();
+            let nonce = fetch_nonce(&client, &sender).await? + 1;
+            let tx = build_and_sign_tx(
+                &sk,
+                &pk,
+                sender,
+                &chain_id,
+                nonce,
+                build_submit_ptb_kind(ptb_bytes),
+                10_000_000,
+                1,
+            )?;
+            let tx_hash = tx.tx_hash();
+            client
+                .call(
+                    "chain_submit_tx",
+                    json!({ "tx_hex": hex::encode(tx.as_ssz_bytes()) }),
+                )
+                .await?;
+
+            if wait {
+                // Poll until a receipt is indexed (or timeout) and print it.
+                let timeout = std::time::Duration::from_secs(wait_timeout_secs);
+                let receipt = poll_tx_receipt(&client, &tx_hash, timeout).await?;
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+            }
+            // Always emit the tx_hash as the LAST line so a driver can capture
+            // it regardless of whether `--wait` was set.
+            println!("{}", json!({ "tx_hash": hex::encode(tx_hash.0) }));
             Ok(())
         }
 
@@ -837,6 +903,47 @@ async fn wait_for_tx_receipt(
     }
 }
 
+/// Build the `TxKind::SubmitPtb` envelope kind from the opaque `encode_ptb`
+/// bytes of an already-signed inner PTB. The CLI never inspects or signs the
+/// inner PTB — the node decodes + Ed25519-verifies it against `ptb.signers`
+/// during execution — so this is a thin, pure wrapper kept separate for unit
+/// testing.
+fn build_submit_ptb_kind(ptb_bytes: Vec<u8>) -> bloom_chain_types::tx::TxKind {
+    bloom_chain_types::tx::TxKind::SubmitPtb { ptb_bytes }
+}
+
+/// Poll `chain_query_tx` until a receipt for `tx_hash` is indexed, returning
+/// the full receipt JSON (success or revert alike). Unlike
+/// [`wait_for_tx_receipt`], this does not bail on a reverted tx — `submit-ptb`
+/// callers want to see whatever receipt landed, so the decision is left to
+/// them. Bails only if the timeout elapses with no receipt.
+async fn poll_tx_receipt(
+    client: &RpcClient,
+    tx_hash: &bloom_chain_types::types::Hash32,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let res = client
+            .call(
+                "chain_query_tx",
+                json!({ "tx_hash": hex::encode(tx_hash.0) }),
+            )
+            .await
+            .context("rpc chain_query_tx")?;
+        if !res.is_null() {
+            return Ok(res);
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for receipt of tx {}",
+                hex::encode(tx_hash.0)
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+}
+
 /// Parse an address from CLI (hex or b1-prefixed).
 fn parse_address_cli(s: &str) -> Result<bloom_chain_types::types::Address> {
     bloom_chain_node::genesis::parse_b1_address(s).with_context(|| format!("parse address: {s:?}"))
@@ -1108,6 +1215,19 @@ allocations = []
 "#
         );
         std::fs::write(path, g).unwrap();
+    }
+
+    /// `build_submit_ptb_kind` wraps opaque PTB bytes verbatim into a
+    /// `TxKind::SubmitPtb` without touching them — the CLI does not sign or
+    /// decode the inner PTB.
+    #[test]
+    fn build_submit_ptb_kind_wraps_bytes_verbatim() {
+        use bloom_chain_types::tx::TxKind;
+        let bytes = vec![0x01u8, 0x02, 0x03, 0xFF];
+        match build_submit_ptb_kind(bytes.clone()) {
+            TxKind::SubmitPtb { ptb_bytes } => assert_eq!(ptb_bytes, bytes),
+            other => panic!("expected SubmitPtb, got {other:?}"),
+        }
     }
 
     /// review 2026-05-19 #9 — `write_secret_key_file` refuses to overwrite
