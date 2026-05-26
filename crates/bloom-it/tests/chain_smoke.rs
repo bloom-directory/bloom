@@ -30,8 +30,7 @@ async fn four_validator_state_root_convergence() -> Result<()> {
     let parent: PathBuf = dir.path().to_path_buf();
 
     // 1. Provision 4 validators (genesis + per-node config + keystores).
-    let cfgs = chain_harness::provision_network(&parent, 4)
-        .context("provision_network(4)")?;
+    let cfgs = chain_harness::provision_network(&parent, 4).context("provision_network(4)")?;
     assert_eq!(cfgs.len(), 4);
 
     // 2. Spawn each validator.  Hold the guards for the whole test so the
@@ -46,9 +45,12 @@ async fn four_validator_state_root_convergence() -> Result<()> {
 
     // 3. Poll each node's RPC until all four report a committed block at
     //    `TARGET_HEIGHT`.  Collect the state_roots and assert agreement.
-    let roots = timeout(CONVERGE_TIMEOUT, wait_for_convergence(&guards, TARGET_HEIGHT))
-        .await
-        .map_err(|_| anyhow!("timeout waiting for height {TARGET_HEIGHT} on all nodes"))??;
+    let roots = timeout(
+        CONVERGE_TIMEOUT,
+        wait_for_convergence(&guards, TARGET_HEIGHT),
+    )
+    .await
+    .map_err(|_| anyhow!("timeout waiting for height {TARGET_HEIGHT} on all nodes"))??;
 
     let first = &roots[0];
     for (i, r) in roots.iter().enumerate().skip(1) {
@@ -72,7 +74,10 @@ async fn wait_for_convergence(
 
         for (i, g) in guards.iter().enumerate() {
             let client = RpcClient::new(g.rpc_sock());
-            match client.call("chain_query_block", json!({ "height": target_height })).await {
+            match client
+                .call("chain_query_block", json!({ "height": target_height }))
+                .await
+            {
                 Ok(v) => {
                     if v.is_null() {
                         all_at_height = false;

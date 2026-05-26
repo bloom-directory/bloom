@@ -1,0 +1,21 @@
+[package]
+name = "bloom-resource"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wasm-side runtime library for Bloom-native petals: safe host-import wrappers, args/ret buffer codec, typed handle wrappers (Coin<T>, Capability<T>, Signer, UID), Resource<T>, and client-side linearity tracking"
+
+[dependencies]
+bloom-objects.workspace = true
+bloom-chain-types.workspace = true
+thiserror.workspace = true
+
+[features]
+default = []
+# Opt-in flag for petals that link against the chain VM. The current
+# implementation gates the extern block on `target_arch = "wasm32"`;
+# the `wasm` feature is reserved for future targets (e.g. wasi-p2) that
+# may need to force the extern path on non-wasm32 cdylib builds.
+wasm = []

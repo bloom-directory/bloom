@@ -19,12 +19,11 @@
 // through concrete types, not trait objects).
 
 use ed25519_dalek::{
-    Signature as Ed25519Sig, SigningKey as Ed25519SigningKey,
-    VerifyingKey as Ed25519VerifyingKey,
+    Signature as Ed25519Sig, SigningKey as Ed25519SigningKey, VerifyingKey as Ed25519VerifyingKey,
 };
 use ml_dsa::{
-    Keypair, MlDsa65, Signature as MlDsaSig, SigningKey as MlDsaSK,
-    Signer as MlDsaSigner, VerifyingKey as MlDsaVK,
+    Keypair, MlDsa65, Signature as MlDsaSig, Signer as MlDsaSigner, SigningKey as MlDsaSK,
+    VerifyingKey as MlDsaVK,
 };
 use rand::RngCore;
 use zeroize::Zeroize;
@@ -115,11 +114,17 @@ impl XdsaSecretKey {
         // Composite public key.
         let pk = Self::make_public_key(&mldsa_sk, &ed25519_sk);
 
-        let sk = XdsaSecretKey { mldsa_sk, ed25519_sk };
+        let sk = XdsaSecretKey {
+            mldsa_sk,
+            ed25519_sk,
+        };
         (sk, pk)
     }
 
-    fn make_public_key(mldsa_sk: &MlDsaSK<MlDsa65>, ed25519_sk: &Ed25519SigningKey) -> XdsaPublicKey {
+    fn make_public_key(
+        mldsa_sk: &MlDsaSK<MlDsa65>,
+        ed25519_sk: &Ed25519SigningKey,
+    ) -> XdsaPublicKey {
         let mldsa_vk = mldsa_sk.verifying_key();
         let mldsa_pk_arr = mldsa_vk.encode();
         let ed25519_pk = ed25519_sk.verifying_key();
@@ -157,6 +162,24 @@ impl XdsaSecretKey {
         Self::make_public_key(&self.mldsa_sk, &self.ed25519_sk)
     }
 
+    /// Return the Ed25519 component public key.
+    ///
+    /// PTB phase-1 signatures use the Ed25519 half of the xDSA key as the
+    /// signer/address identity, while outer bloom-chain transactions use the
+    /// full composite xDSA signature.
+    pub fn ed25519_public_key_bytes(&self) -> [u8; ED25519_PK_LEN] {
+        self.ed25519_sk.verifying_key().to_bytes()
+    }
+
+    /// Sign `msg` with only the Ed25519 component.
+    ///
+    /// This is intentionally separate from [`Self::sign`], which produces the
+    /// full xDSA composite signature used by bloom-chain envelopes.
+    pub fn sign_ed25519(&self, msg: &[u8]) -> [u8; ED25519_SIG_LEN] {
+        use ed25519_dalek::Signer;
+        self.ed25519_sk.sign(msg).to_bytes()
+    }
+
     /// Serialise the secret key to bytes.
     ///
     /// Format: `mldsa_seed (32 B) || ed25519_seed (32 B)` = 64 bytes total.
@@ -183,7 +206,10 @@ impl XdsaSecretKey {
         let mldsa_sk = MlDsaSK::<MlDsa65>::from_seed(&mldsa_seed);
         let ed_seed: [u8; 32] = bytes[32..].try_into().expect("slice length checked above");
         let ed25519_sk = Ed25519SigningKey::from_bytes(&ed_seed);
-        Ok(Self { mldsa_sk, ed25519_sk })
+        Ok(Self {
+            mldsa_sk,
+            ed25519_sk,
+        })
     }
 }
 
@@ -244,9 +270,11 @@ impl XdsaPublicKey {
             let vk = MlDsaVK::<MlDsa65>::decode(&mldsa_pk_arr);
             let sig_arr = ml_dsa::EncodedSignature::<MlDsa65>::try_from(mldsa_sig_bytes)
                 .map_err(|_| VerifyError::MlDsaFailed)?;
-            let mldsa_sig = MlDsaSig::<MlDsa65>::decode(&sig_arr).ok_or(VerifyError::MlDsaFailed)?;
+            let mldsa_sig =
+                MlDsaSig::<MlDsa65>::decode(&sig_arr).ok_or(VerifyError::MlDsaFailed)?;
             use ml_dsa::Verifier;
-            vk.verify(msg, &mldsa_sig).map_err(|_| VerifyError::MlDsaFailed)?;
+            vk.verify(msg, &mldsa_sig)
+                .map_err(|_| VerifyError::MlDsaFailed)?;
         }
 
         // Verify Ed25519.
@@ -261,7 +289,9 @@ impl XdsaPublicKey {
                 .map_err(|_| VerifyError::Ed25519Failed)?;
             let ed_sig = Ed25519Sig::from_bytes(&ed_sig_arr);
             use ed25519_dalek::Verifier;
-            ed_pk.verify(msg, &ed_sig).map_err(|_| VerifyError::Ed25519Failed)?;
+            ed_pk
+                .verify(msg, &ed_sig)
+                .map_err(|_| VerifyError::Ed25519Failed)?;
         }
 
         Ok(())
@@ -336,7 +366,11 @@ mod tests {
         let (sk, pk) = XdsaSecretKey::generate();
         let sig = sk.sign(b"size-check");
         assert_eq!(pk.0.len(), XDSA_PK_LEN, "pk must be {XDSA_PK_LEN} bytes");
-        assert_eq!(sig.0.len(), XDSA_SIG_LEN, "sig must be {XDSA_SIG_LEN} bytes");
+        assert_eq!(
+            sig.0.len(),
+            XDSA_SIG_LEN,
+            "sig must be {XDSA_SIG_LEN} bytes"
+        );
         assert_eq!(XDSA_PK_LEN, 1984);
         assert_eq!(XDSA_SIG_LEN, 3373);
     }
@@ -453,8 +487,7 @@ mod tests {
     fn keystore_address_matches_chain_canonical_derivation() {
         let (_, pk) = XdsaSecretKey::generate();
         let keystore_addr = derive_address(&pk);
-        let chain_addr =
-            bloom_chain_types::types::Address::from_pubkey_bytes(&pk.0).0;
+        let chain_addr = bloom_chain_types::types::Address::from_pubkey_bytes(&pk.0).0;
         assert_eq!(
             keystore_addr, chain_addr,
             "wallet derive_address() and Address::from_pubkey_bytes() must \

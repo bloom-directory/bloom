@@ -7,45 +7,54 @@ use serde::{Deserialize, Serialize};
 use ssz::{Decode, DecodeError, Encode, SszDecoderBuilder, SszEncoder};
 
 use crate::digest::{blake3_tagged, tags};
-use crate::types::{
-    decode_string, encode_string, Address, Hash32, PubKeyBytes, SigBytes,
-};
+use crate::types::{Address, Hash32, PubKeyBytes, SigBytes, decode_string, encode_string};
 
 // ---------------------------------------------------------------------------
 // TxKind
 // ---------------------------------------------------------------------------
 
-/// The variant of a bloom-chain transaction (spec §7.1).
+/// The variant of a bloom-chain transaction.
+///
+/// Variant selectors are part of the wire format and must remain stable:
+///
+/// | selector | variant       |
+/// |----------|---------------|
+/// | 0        | `Transfer`    |
+/// | 1        | `SubmitPtb`   |
+/// | 2        | `DeployPetal` |
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum TxKind {
     /// Transfer native LOOM from sender to `to`.
     Transfer { to: Address, amount_loom: u128 },
-    /// Deploy a new wasm petal (contract).
+    /// Submit a Programmable Transaction Block.
     ///
-    /// `manifest_hash` is an optional v1 anchor (bloom-rust-contracts
-    /// Phase 8) — the blake3 of an off-chain manifest the deployer
-    /// commits to. The chain stores it in `Account.manifest_hash` and
-    /// makes it readable via the `chain.code.manifest_hash` host
-    /// import; it never interprets the bytes.
-    Deploy {
-        wasm: Vec<u8>,
-        salt: [u8; 32],
-        init_args: Vec<u8>,
-        manifest_hash: Option<Hash32>,
-    },
-    /// Call an existing petal.
-    Call {
-        to: Address,
-        calldata: Vec<u8>,
-        value_loom: u128,
-    },
+    /// # Why an opaque byte vector
+    ///
+    /// The structured PTB type (`bloom_script::types::PtbTx`) lives in
+    /// the `bloom-script` crate, which already depends on
+    /// `bloom-chain-types` for [`Hash32`]. Embedding `PtbTx` here
+    /// directly would form a dependency cycle.
+    ///
+    /// The wire format is unaffected: `ptb_bytes` is the canonical
+    /// PTB encoding (as produced by `bloom_script::encode_ptb`),
+    /// length-prefixed by the SSZ container framing here. Higher
+    /// layers (mempool, executor) decode via `bloom_script::decode_ptb`.
+    ///
+    /// The executor decodes and validates the inner PTB before running it atomically.
+    SubmitPtb { ptb_bytes: Vec<u8> },
+    /// Deploy a Bloom-native petal wasm module.
+    ///
+    /// The wasm must carry a `bloom_petal_manifest_v0` custom section. The
+    /// executor stores the code by content hash and binds the manifest's
+    /// `module_path` in the chain VFS registry.
+    DeployPetal { wasm_bytes: Vec<u8> },
 }
 
 /// Selector byte written as the first byte of a `TxKind` SSZ encoding.
-/// Matches SSZ union convention: 0 = Transfer, 1 = Deploy, 2 = Call.
+/// Matches SSZ union convention: 0 = Transfer, 1 = SubmitPtb, 2 = DeployPetal.
 const TX_KIND_TRANSFER: u8 = 0;
-const TX_KIND_DEPLOY: u8 = 1;
-const TX_KIND_CALL: u8 = 2;
+const TX_KIND_SUBMIT_PTB: u8 = 1;
+const TX_KIND_DEPLOY_PETAL: u8 = 2;
 
 impl Encode for TxKind {
     fn is_ssz_fixed_len() -> bool {
@@ -58,26 +67,13 @@ impl Encode for TxKind {
                 // to (32) + amount_loom (16)
                 <Address as Encode>::ssz_fixed_len() + 16
             }
-            TxKind::Deploy {
-                wasm,
-                salt: _,
-                init_args,
-                manifest_hash: _,
-            } => {
-                // Variable: salt(32) and manifest_present(1) + manifest_hash(32)
-                // are fixed; wasm and init_args are variable.
-                // Body = 2 offsets (4 each) + 32 (salt) + 33 (manifest) +
-                //        wasm.len() + init_args.len()
-                4 + 4 + 32 + 33 + wasm.len() + init_args.len()
+            TxKind::SubmitPtb { ptb_bytes } => {
+                // Single variable field: just the canonical PTB byte vector,
+                // encoded as a top-level Vec<u8> in SSZ (length-prefixed by
+                // the outer container framing in `from_ssz_bytes`).
+                ptb_bytes.len()
             }
-            TxKind::Call {
-                calldata,
-                value_loom: _,
-                ..
-            } => {
-                // to (32, fixed) + offset for calldata (4) + value_loom (16) + calldata.len()
-                32 + 4 + 16 + calldata.len()
-            }
+            TxKind::DeployPetal { wasm_bytes } => wasm_bytes.len(),
         }
     }
 
@@ -88,51 +84,20 @@ impl Encode for TxKind {
                 to.ssz_append(buf);
                 amount_loom.ssz_append(buf);
             }
-            TxKind::Deploy {
-                wasm,
-                salt,
-                init_args,
-                manifest_hash,
-            } => {
-                buf.push(TX_KIND_DEPLOY);
-                // Container with:
-                //   wasm           (variable)
-                //   salt           (fixed 32)
-                //   init_args      (variable)
-                //   manifest_hash  (fixed 33: 1-byte tag + 32-byte hash)
-                // Fixed portion: 2 variable offsets (4) + salt (32) + manifest (33) = 73.
-                let fixed_len = 4 + 4 + 32 + 33usize;
-                let mut enc = SszEncoder::container(buf, fixed_len);
-                enc.append(wasm);
-                enc.append_parameterized(true, |b| b.extend_from_slice(salt));
-                enc.append(init_args);
-                enc.append_parameterized(true, |b| {
-                    match manifest_hash {
-                        None => {
-                            b.push(0u8);
-                            b.extend_from_slice(&[0u8; 32]);
-                        }
-                        Some(h) => {
-                            b.push(1u8);
-                            b.extend_from_slice(&h.0);
-                        }
-                    }
-                });
-                enc.finalize();
+            TxKind::SubmitPtb { ptb_bytes } => {
+                buf.push(TX_KIND_SUBMIT_PTB);
+                // Single variable field after the selector: the canonical
+                // PTB bytes encoded as a bare SSZ Vec<u8>. The framing of
+                // the outer `Tx` container already covers length-prefix
+                // via the variable-field offset machinery, so here we
+                // just append the raw bytes directly. Decode mirrors this
+                // by reading the post-selector remainder as the full
+                // ptb_bytes payload.
+                buf.extend_from_slice(ptb_bytes);
             }
-            TxKind::Call {
-                to,
-                calldata,
-                value_loom,
-            } => {
-                buf.push(TX_KIND_CALL);
-                // Container with to (fixed 32), calldata (variable), value_loom (fixed 16).
-                let fixed_len = 32 + 4 + 16usize;
-                let mut enc = SszEncoder::container(buf, fixed_len);
-                enc.append(to);
-                enc.append(calldata);
-                enc.append(value_loom);
-                enc.finalize();
+            TxKind::DeployPetal { wasm_bytes } => {
+                buf.push(TX_KIND_DEPLOY_PETAL);
+                buf.extend_from_slice(wasm_bytes);
             }
         }
     }
@@ -165,75 +130,34 @@ impl Decode for TxKind {
                 let amount_loom = u128::from_ssz_bytes(&rest[32..48])?;
                 Ok(TxKind::Transfer { to, amount_loom })
             }
-            TX_KIND_DEPLOY => {
-                // Container: wasm (var), salt (fixed 32), init_args (var),
-                // manifest_hash (fixed 33: 1-byte tag + 32-byte hash).
-                let mut builder = SszDecoderBuilder::new(rest);
-                builder.register_type::<Vec<u8>>()?;
-                builder.register_type_parameterized(true, 32)?;
-                builder.register_type::<Vec<u8>>()?;
-                builder.register_type_parameterized(true, 33)?;
-                let mut decoder = builder.build()?;
-                let wasm: Vec<u8> = decoder.decode_next()?;
-                let salt_bytes: Vec<u8> =
-                    decoder.decode_next_with(|b| Ok(b.to_vec()))?;
-                if salt_bytes.len() != 32 {
-                    return Err(DecodeError::InvalidByteLength {
-                        len: salt_bytes.len(),
-                        expected: 32,
-                    });
-                }
-                let mut salt = [0u8; 32];
-                salt.copy_from_slice(&salt_bytes);
-                let init_args: Vec<u8> = decoder.decode_next()?;
-                let manifest_bytes: Vec<u8> =
-                    decoder.decode_next_with(|b| Ok(b.to_vec()))?;
-                if manifest_bytes.len() != 33 {
-                    return Err(DecodeError::InvalidByteLength {
-                        len: manifest_bytes.len(),
-                        expected: 33,
-                    });
-                }
-                let manifest_hash = match manifest_bytes[0] {
-                    0 => None,
-                    1 => {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&manifest_bytes[1..33]);
-                        Some(Hash32(arr))
-                    }
-                    other => {
-                        return Err(DecodeError::BytesInvalid(format!(
-                            "invalid manifest_hash discriminant: {other}"
-                        )));
-                    }
-                };
-                Ok(TxKind::Deploy {
-                    wasm,
-                    salt,
-                    init_args,
-                    manifest_hash,
+            TX_KIND_SUBMIT_PTB => {
+                // The rest of the bytes are the canonical PTB byte vector.
+                // No further framing — the outer SSZ container has already
+                // length-delimited the kind's payload.
+                Ok(TxKind::SubmitPtb {
+                    ptb_bytes: rest.to_vec(),
                 })
             }
-            TX_KIND_CALL => {
-                // Container: to (fixed 32), calldata (var), value_loom (fixed 16)
-                let mut builder = SszDecoderBuilder::new(rest);
-                builder.register_type::<Address>()?;
-                builder.register_type::<Vec<u8>>()?;
-                builder.register_type::<u128>()?;
-                let mut decoder = builder.build()?;
-                let to: Address = decoder.decode_next()?;
-                let calldata: Vec<u8> = decoder.decode_next()?;
-                let value_loom: u128 = decoder.decode_next()?;
-                Ok(TxKind::Call {
-                    to,
-                    calldata,
-                    value_loom,
-                })
-            }
+            TX_KIND_DEPLOY_PETAL => Ok(TxKind::DeployPetal {
+                wasm_bytes: rest.to_vec(),
+            }),
             _ => Err(DecodeError::BytesInvalid(format!(
                 "unknown TxKind selector: {selector}"
             ))),
         }
+    }
+}
+
+impl TxKind {
+    /// Returns `true` iff this transaction is a `SubmitPtb` (spec §16.1).
+    ///
+    /// Convenience for executor / mempool routing.
+    pub fn is_submit_ptb(&self) -> bool {
+        matches!(self, TxKind::SubmitPtb { .. })
+    }
+
+    pub fn is_deploy_petal(&self) -> bool {
+        matches!(self, TxKind::DeployPetal { .. })
     }
 }
 
@@ -437,77 +361,6 @@ mod tests {
     }
 
     #[test]
-    fn tx_deploy_ssz_roundtrip() {
-        let tx = Tx {
-            chain_id: "bloomchain.v0".to_string(),
-            sender: Address([1u8; 32]),
-            nonce: 2,
-            max_fuel: 5_000_000,
-            fee_per_unit: 2,
-            kind: TxKind::Deploy {
-                wasm: vec![0x00, 0x61, 0x73, 0x6d],
-                salt: [0xAA; 32],
-                init_args: vec![1, 2, 3],
-                manifest_hash: None,
-            },
-            pubkey: PubKeyBytes(vec![5u8; 16]),
-            sig: SigBytes(vec![6u8; 16]),
-        };
-        let bytes = tx.as_ssz_bytes();
-        let decoded = Tx::from_ssz_bytes(&bytes).expect("decode should succeed");
-        assert_eq!(tx, decoded);
-    }
-
-    #[test]
-    fn tx_deploy_with_manifest_hash_ssz_roundtrip() {
-        let tx = Tx {
-            chain_id: "bloomchain.v0".to_string(),
-            sender: Address([1u8; 32]),
-            nonce: 2,
-            max_fuel: 5_000_000,
-            fee_per_unit: 2,
-            kind: TxKind::Deploy {
-                wasm: vec![0x00, 0x61, 0x73, 0x6d],
-                salt: [0xAA; 32],
-                init_args: vec![1, 2, 3],
-                manifest_hash: Some(Hash32([0xEF; 32])),
-            },
-            pubkey: PubKeyBytes(vec![5u8; 16]),
-            sig: SigBytes(vec![6u8; 16]),
-        };
-        let bytes = tx.as_ssz_bytes();
-        let decoded = Tx::from_ssz_bytes(&bytes).expect("decode should succeed");
-        assert_eq!(tx, decoded);
-        match decoded.kind {
-            TxKind::Deploy { manifest_hash, .. } => {
-                assert_eq!(manifest_hash, Some(Hash32([0xEF; 32])));
-            }
-            _ => panic!("expected Deploy"),
-        }
-    }
-
-    #[test]
-    fn tx_call_ssz_roundtrip() {
-        let tx = Tx {
-            chain_id: "bloomchain.v0".to_string(),
-            sender: Address([1u8; 32]),
-            nonce: 3,
-            max_fuel: 2_000_000,
-            fee_per_unit: 3,
-            kind: TxKind::Call {
-                to: Address([7u8; 32]),
-                calldata: vec![0xDE, 0xAD, 0xBE, 0xEF],
-                value_loom: 0,
-            },
-            pubkey: PubKeyBytes(vec![8u8; 16]),
-            sig: SigBytes(vec![9u8; 16]),
-        };
-        let bytes = tx.as_ssz_bytes();
-        let decoded = Tx::from_ssz_bytes(&bytes).expect("decode should succeed");
-        assert_eq!(tx, decoded);
-    }
-
-    #[test]
     fn tx_signing_digest_is_stable() {
         let tx = sample_tx();
         let d1 = tx.signing_digest();
@@ -531,5 +384,127 @@ mod tests {
             tx.tx_hash(),
             "signing digest and tx hash must use distinct domain tags"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // SubmitPtb (spec §16.1, Phase 1 stub)
+    // -----------------------------------------------------------------------
+
+    fn sample_submit_ptb_tx() -> Tx {
+        Tx {
+            chain_id: "bloomchain.v0".to_string(),
+            sender: Address([0x42u8; 32]),
+            nonce: 7,
+            max_fuel: 100_000,
+            fee_per_unit: 1,
+            kind: TxKind::SubmitPtb {
+                // Opaque canonical PTB bytes. The decoder treats this as
+                // a black box; only `bloom-script::decode_ptb` interprets.
+                ptb_bytes: vec![0x01, 0x02, 0x03, 0x04, 0x05],
+            },
+            pubkey: PubKeyBytes(vec![0xAAu8; 16]),
+            sig: SigBytes(vec![0xBBu8; 16]),
+        }
+    }
+
+    #[test]
+    fn tx_submit_ptb_ssz_roundtrip() {
+        let tx = sample_submit_ptb_tx();
+        let bytes = tx.as_ssz_bytes();
+        let decoded = Tx::from_ssz_bytes(&bytes).expect("decode should succeed");
+        assert_eq!(tx, decoded);
+        match &decoded.kind {
+            TxKind::SubmitPtb { ptb_bytes } => {
+                assert_eq!(ptb_bytes, &[0x01, 0x02, 0x03, 0x04, 0x05]);
+            }
+            other => panic!("expected SubmitPtb, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tx_submit_ptb_kind_alone_ssz_roundtrip() {
+        // The TxKind enum encodes selector + payload independently of
+        // the outer Tx envelope; verify the union directly.
+        let kind = TxKind::SubmitPtb {
+            ptb_bytes: b"hello-ptb".to_vec(),
+        };
+        let bytes = kind.as_ssz_bytes();
+        // First byte must be the selector (1).
+        assert_eq!(bytes[0], TX_KIND_SUBMIT_PTB);
+        let decoded = TxKind::from_ssz_bytes(&bytes).expect("decode");
+        assert_eq!(kind, decoded);
+    }
+
+    #[test]
+    fn tx_submit_ptb_empty_payload_roundtrip() {
+        // Zero-length canonical PTB bytes still round-trip cleanly.
+        let kind = TxKind::SubmitPtb { ptb_bytes: vec![] };
+        let bytes = kind.as_ssz_bytes();
+        let decoded = TxKind::from_ssz_bytes(&bytes).expect("decode");
+        assert_eq!(kind, decoded);
+    }
+
+    #[test]
+    fn tx_deploy_petal_kind_alone_ssz_roundtrip() {
+        let kind = TxKind::DeployPetal {
+            wasm_bytes: b"\0asm fake".to_vec(),
+        };
+        let bytes = kind.as_ssz_bytes();
+        assert_eq!(bytes[0], TX_KIND_DEPLOY_PETAL);
+        let decoded = TxKind::from_ssz_bytes(&bytes).expect("decode");
+        assert_eq!(kind, decoded);
+        assert!(decoded.is_deploy_petal());
+    }
+
+    #[test]
+    fn tx_submit_ptb_selector_is_three() {
+        // Wire-format anchor: Transfer, SubmitPtb, DeployPetal.
+        assert_eq!(TX_KIND_SUBMIT_PTB, 1);
+        assert_eq!(TX_KIND_DEPLOY_PETAL, 2);
+    }
+
+    #[test]
+    fn tx_selectors_are_contiguous() {
+        let selectors = [TX_KIND_TRANSFER, TX_KIND_SUBMIT_PTB, TX_KIND_DEPLOY_PETAL];
+        let mut sorted = selectors;
+        sorted.sort_unstable();
+        assert_eq!(sorted, [0, 1, 2]);
+    }
+
+    #[test]
+    fn tx_submit_ptb_hash_is_stable() {
+        let tx = sample_submit_ptb_tx();
+        let h1 = tx.tx_hash();
+        let h2 = tx.tx_hash();
+        assert_eq!(h1, h2, "tx_hash must be deterministic for SubmitPtb");
+        // And the signing digest is independently stable + distinct.
+        assert_ne!(
+            tx.signing_digest(),
+            tx.tx_hash(),
+            "TX vs TX_HASH domain tags must keep digests apart"
+        );
+    }
+
+    #[test]
+    fn is_submit_ptb_helper() {
+        let transfer = TxKind::Transfer {
+            to: Address([0u8; 32]),
+            amount_loom: 0,
+        };
+        let ptb = TxKind::SubmitPtb {
+            ptb_bytes: vec![1, 2, 3],
+        };
+        assert!(!transfer.is_submit_ptb());
+        assert!(ptb.is_submit_ptb());
+    }
+
+    #[test]
+    fn unknown_selector_still_rejected() {
+        // Defence: an unknown selector byte must error, not silently
+        // round-trip as a new variant.
+        let bad = [99u8, 0u8, 0u8, 0u8];
+        let err = TxKind::from_ssz_bytes(&bad).expect_err("must reject unknown selector");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("unknown TxKind selector"), "got: {msg}");
     }
 }

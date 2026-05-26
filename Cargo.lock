@@ -1967,13 +1967,14 @@ dependencies = [
  "bloom-chain",
  "bloom-chain-node",
  "bloom-chain-types",
- "bloom-contract-build",
- "bloom-contract-metadata",
  "bloom-daemon",
  "bloom-keystore",
  "bloom-mount",
+ "bloom-objects",
  "bloom-petals",
  "bloom-proto",
+ "bloom-ptb-builder",
+ "bloom-script",
  "bloom-test-util",
  "bloom-tools",
  "bloom-tx",
@@ -2018,21 +2019,6 @@ name = "bloom-chain-abi"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "bloom-chain-abi-macros",
-]
-
-[[package]]
-name = "bloom-chain-abi-macros"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "bloom-chain-abi",
- "bloom-petal-sdk",
- "proc-macro2",
- "proptest",
- "quote",
- "syn 2.0.117",
- "trybuild",
 ]
 
 [[package]]
@@ -2055,16 +2041,23 @@ name = "bloom-chain-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "blake3",
  "bloom-chain-consensus",
  "bloom-chain-state",
  "bloom-chain-types",
  "bloom-keystore",
+ "bloom-objects",
+ "bloom-petal-fungible",
+ "bloom-petal-manifest",
  "bloom-petals",
+ "bloom-script",
  "bloom-test-util",
  "clap",
+ "ed25519-dalek",
  "hex",
  "parking_lot 0.12.5",
+ "rand 0.8.6",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2074,6 +2067,7 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
+ "wasmparser 0.218.1",
  "wat",
  "zbase32",
 ]
@@ -2084,6 +2078,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "bloom-chain-types",
+ "bloom-objects",
  "ethereum_ssz",
  "hex",
  "proptest",
@@ -2108,61 +2103,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bloom-client-codegen"
-version = "0.1.0"
-dependencies = [
- "bloom-contract-build",
- "bloom-contract-metadata",
- "thiserror 2.0.18",
- "wat",
-]
-
-[[package]]
-name = "bloom-contract"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "bloom-chain-abi",
- "bloom-contract-macros",
- "bloom-petal-sdk",
-]
-
-[[package]]
-name = "bloom-contract-build"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "bloom-contract-metadata",
- "hex",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "wasmparser 0.218.1",
- "wat",
-]
-
-[[package]]
-name = "bloom-contract-macros"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "proc-macro2",
- "quote",
- "serde_json",
- "syn 2.0.117",
-]
-
-[[package]]
-name = "bloom-contract-metadata"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "bloom-daemon"
 version = "0.1.0"
 dependencies = [
@@ -2171,22 +2111,28 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bloom-chain",
+ "bloom-chain-node",
+ "bloom-chain-types",
  "bloom-defi",
  "bloom-ens",
  "bloom-etherscan",
  "bloom-keystore",
  "bloom-mempool",
  "bloom-mount",
+ "bloom-objects",
  "bloom-petals",
  "bloom-prices",
  "bloom-proto",
+ "bloom-ptb-builder",
  "bloom-revert",
+ "bloom-script",
  "bloom-test-util",
  "bloom-tools",
  "bloom-tx",
  "bloom-vfs",
  "bloom-watch",
  "futures",
+ "hex",
  "parking_lot 0.12.5",
  "serde",
  "serde_json",
@@ -2217,99 +2163,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "bloom-dex-cli"
+name = "bloom-dex-math"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "blake3",
- "bloom-chain-abi",
- "bloom-chain-node",
- "bloom-chain-types",
- "bloom-dex-erc20",
- "bloom-dex-factory",
- "bloom-dex-router",
- "bloom-keystore",
- "bloom-proto",
- "clap",
- "hex",
- "serde",
- "serde_json",
- "tokio",
- "toml 0.8.23",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "bloom-dex-erc20"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "bloom-chain-abi",
- "bloom-contract",
- "bloom-petal-sdk",
-]
-
-[[package]]
-name = "bloom-dex-factory"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "bloom-chain-abi",
- "bloom-contract",
- "bloom-petal-sdk",
-]
-
-[[package]]
-name = "bloom-dex-it"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "blake3",
- "bloom-chain-node",
- "bloom-it",
- "bloom-keystore",
- "hex",
- "primitive-types",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "bloom-dex-pair"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "bloom-chain-abi",
- "bloom-contract",
- "bloom-dex-erc20",
- "bloom-petal-sdk",
-]
-
-[[package]]
-name = "bloom-dex-router"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "bloom-chain-abi",
- "bloom-contract",
- "bloom-dex-erc20",
- "bloom-dex-factory",
- "bloom-dex-pair",
- "bloom-dex-wloom",
- "bloom-petal-sdk",
-]
-
-[[package]]
-name = "bloom-dex-wloom"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "bloom-chain-abi",
- "bloom-contract",
- "bloom-dex-erc20",
- "bloom-petal-sdk",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2448,11 +2305,159 @@ dependencies = [
 ]
 
 [[package]]
-name = "bloom-petal-sdk"
+name = "bloom-objects"
 version = "0.1.0"
 dependencies = [
- "bloom-chain-abi",
- "dlmalloc",
+ "blake3",
+ "bloom-chain-types",
+ "hex",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bloom-petal-cap"
+version = "0.1.0"
+dependencies = [
+ "bloom-objects",
+ "bloom-resource",
+ "bloom-resource-macros",
+]
+
+[[package]]
+name = "bloom-petal-dex-cpmm"
+version = "0.1.0"
+dependencies = [
+ "bloom-dex-math",
+ "bloom-objects",
+ "bloom-resource",
+ "bloom-resource-macros",
+]
+
+[[package]]
+name = "bloom-petal-dex-faucet"
+version = "0.1.0"
+dependencies = [
+ "bloom-objects",
+ "bloom-resource",
+ "bloom-resource-macros",
+]
+
+[[package]]
+name = "bloom-petal-dex-it"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "bloom-chain-consensus",
+ "bloom-chain-node",
+ "bloom-chain-state",
+ "bloom-chain-types",
+ "bloom-dex-math",
+ "bloom-keystore",
+ "bloom-objects",
+ "bloom-petal-dex-cpmm",
+ "bloom-petal-dex-faucet",
+ "bloom-petal-dex-pool",
+ "bloom-petal-dex-router",
+ "bloom-petal-dex-wallet",
+ "bloom-petal-fungible",
+ "bloom-petal-manifest",
+ "bloom-ptb-builder",
+ "bloom-resource",
+ "bloom-script",
+ "bloom-vfs",
+ "ed25519-dalek",
+ "hex",
+ "serde_json",
+ "tokio",
+ "tracing-subscriber",
+ "wat",
+]
+
+[[package]]
+name = "bloom-petal-dex-pool"
+version = "0.1.0"
+dependencies = [
+ "bloom-dex-math",
+ "bloom-objects",
+ "bloom-resource",
+ "bloom-resource-macros",
+]
+
+[[package]]
+name = "bloom-petal-dex-router"
+version = "0.1.0"
+dependencies = [
+ "bloom-dex-math",
+ "bloom-objects",
+ "bloom-petal-dex-pool",
+ "bloom-resource",
+ "bloom-resource-macros",
+]
+
+[[package]]
+name = "bloom-petal-dex-wallet"
+version = "0.1.0"
+dependencies = [
+ "bloom-objects",
+ "bloom-resource",
+ "bloom-resource-macros",
+]
+
+[[package]]
+name = "bloom-petal-fungible"
+version = "0.1.0"
+dependencies = [
+ "bloom-objects",
+ "bloom-resource",
+ "bloom-resource-macros",
+]
+
+[[package]]
+name = "bloom-petal-identity"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bloom-chain-node",
+ "bloom-chain-state",
+ "bloom-chain-types",
+ "bloom-objects",
+ "bloom-petal-fungible",
+ "bloom-petal-manifest",
+ "bloom-petals",
+ "bloom-resource",
+ "bloom-resource-macros",
+ "bloom-script",
+ "wasmparser 0.218.1",
+]
+
+[[package]]
+name = "bloom-petal-it"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "bloom-chain-node",
+ "bloom-chain-state",
+ "bloom-chain-types",
+ "bloom-objects",
+ "bloom-petal-fungible",
+ "bloom-petal-manifest",
+ "bloom-petals",
+ "bloom-resource",
+ "bloom-script",
+ "tracing-subscriber",
+ "wat",
+]
+
+[[package]]
+name = "bloom-petal-manifest"
+version = "0.1.0"
+dependencies = [
+ "bloom-chain-types",
+ "bloom-objects",
+ "bloom-script",
+ "wasmparser 0.218.1",
 ]
 
 [[package]]
@@ -2464,7 +2469,9 @@ dependencies = [
  "blake3",
  "bloom-chain-state",
  "bloom-chain-types",
+ "bloom-objects",
  "bloom-proto",
+ "bloom-script",
  "bloom-vfs",
  "futures",
  "hex",
@@ -2518,6 +2525,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-ptb-builder"
+version = "0.1.0"
+dependencies = [
+ "bloom-chain-types",
+ "bloom-objects",
+ "bloom-petal-manifest",
+ "bloom-script",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bloom-resource"
+version = "0.1.0"
+dependencies = [
+ "bloom-chain-types",
+ "bloom-objects",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "bloom-resource-macros"
+version = "0.1.0"
+dependencies = [
+ "bloom-objects",
+ "bloom-petal-manifest",
+ "bloom-resource",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "bloom-revert"
 version = "0.1.0"
 dependencies = [
@@ -2556,6 +2595,16 @@ dependencies = [
  "tower",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "bloom-script"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "bloom-chain-types",
+ "bloom-objects",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2626,15 +2675,19 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bloom-chain",
+ "bloom-chain-types",
  "bloom-defi",
  "bloom-ens",
  "bloom-etherscan",
  "bloom-keystore",
  "bloom-mempool",
+ "bloom-objects",
  "bloom-prices",
  "bloom-proto",
+ "bloom-ptb-builder",
  "bloom-revert",
  "bloom-rpc",
+ "bloom-script",
  "bloom-tools",
  "bloom-tx",
  "bloom-watch",
@@ -3803,17 +3856,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "dlmalloc"
-version = "0.2.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad5208a115eaba24916f7456929832e310a81518c641f93fee4f89aa93aa3675"
-dependencies = [
- "cfg-if",
- "libc",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7041,15 +7083,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_spanned"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
-dependencies = [
- "serde_core",
-]
-
-[[package]]
 name = "serde_urlencoded"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7503,12 +7536,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
 
 [[package]]
-name = "target-triple"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "591ef38edfb78ca4771ee32cf494cb8771944bee237a9b91fc9c1424ac4b777b"
-
-[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7773,7 +7800,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd79e69d3b627db300ff956027cc6c3798cef26d22526befdfcd12feeb6d2257"
 dependencies = [
  "serde",
- "serde_spanned 0.6.9",
+ "serde_spanned",
  "toml_datetime 0.6.11",
  "toml_edit 0.19.15",
 ]
@@ -7785,24 +7812,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
 dependencies = [
  "serde",
- "serde_spanned 0.6.9",
+ "serde_spanned",
  "toml_datetime 0.6.11",
  "toml_edit 0.22.27",
-]
-
-[[package]]
-name = "toml"
-version = "1.1.2+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81f3d15e84cbcd896376e6730314d59fb5a87f31e4b038454184435cd57defee"
-dependencies = [
- "indexmap 2.14.0",
- "serde_core",
- "serde_spanned 1.1.1",
- "toml_datetime 1.1.1+spec-1.1.0",
- "toml_parser",
- "toml_writer",
- "winnow 1.0.2",
 ]
 
 [[package]]
@@ -7831,7 +7843,7 @@ checksum = "1b5bb770da30e5cbfde35a2d7b9b8a2c4b8ef89548a7a6aeab5c9a576e3e7421"
 dependencies = [
  "indexmap 2.14.0",
  "serde",
- "serde_spanned 0.6.9",
+ "serde_spanned",
  "toml_datetime 0.6.11",
  "winnow 0.5.40",
 ]
@@ -7844,7 +7856,7 @@ checksum = "41fe8c660ae4257887cf66394862d21dbca4a6ddd26f04a3560410406a2f819a"
 dependencies = [
  "indexmap 2.14.0",
  "serde",
- "serde_spanned 0.6.9",
+ "serde_spanned",
  "toml_datetime 0.6.11",
  "toml_write",
  "winnow 0.7.15",
@@ -7876,12 +7888,6 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
-
-[[package]]
-name = "toml_writer"
-version = "1.1.1+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
 
 [[package]]
 name = "tower"
@@ -8007,21 +8013,6 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
-
-[[package]]
-name = "trybuild"
-version = "1.0.116"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47c635f0191bd3a2941013e5062667100969f8c4e9cd787c14f977265d73616e"
-dependencies = [
- "glob",
- "serde",
- "serde_derive",
- "serde_json",
- "target-triple",
- "termcolor",
- "toml 1.1.2+spec-1.1.0",
-]
 
 [[package]]
 name = "tungstenite"

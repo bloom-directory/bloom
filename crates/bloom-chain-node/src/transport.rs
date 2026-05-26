@@ -19,21 +19,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use bloom_chain_types::ssz::{Decode, Encode};
 use bloom_chain_types::{
     block::Block,
-    frame::{MAX_PAYLOAD_LEN, MsgType, decode_wire_frame, encode_wire_frame},
+    frame::{MAX_PAYLOAD_LEN, MsgType, encode_wire_frame},
     tx::Tx,
     types::Hash32,
     vote::{Proposal, Vote},
 };
 use parking_lot::Mutex;
-use bloom_chain_types::ssz::{Decode, Encode};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, error, info, warn};
 
 const FRAME_DIGEST_DOMAIN: &[u8] = b"bloom-chain.v0.frame:";
+const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const TRANSPORT_MAX_INBOUND_CONNECTIONS: usize = 128;
 
 /// Inbound message decoded from the wire.
 #[derive(Debug, Clone)]
@@ -41,10 +43,23 @@ pub enum Frame {
     Proposal(Proposal),
     Vote(Vote),
     Tx(Tx),
-    BlockRequest { height: u64 },
+    BlockRequest {
+        height: u64,
+    },
     BlockResponse(Block),
-    StateBlobRequest { hash: Hash32 },
+    StateBlobRequest {
+        hash: Hash32,
+    },
     StateBlobResponse(Vec<u8>),
+    StateSnapshotRequest {
+        min_height: u64,
+    },
+    StateSnapshotResponse {
+        block: Block,
+        state_root: Hash32,
+        blob_hash: Hash32,
+        blob: Vec<u8>,
+    },
     Ping,
     Pong,
 }
@@ -54,23 +69,36 @@ pub enum Frame {
 /// Returns `Ok(None)` on clean EOF.  Returns `Err` on malformed frames.
 /// Verifies the BLAKE3 digest before SSZ-decoding.
 pub async fn read_frame(stream: &mut TcpStream) -> Result<Option<Frame>> {
-    // Read 4-byte length header.
+    let Some((msg_type, payload)) = read_wire_frame(stream, FRAME_READ_TIMEOUT).await? else {
+        return Ok(None);
+    };
+    let frame = decode_payload(msg_type, &payload)?;
+    Ok(Some(frame))
+}
+
+async fn read_wire_frame<R>(
+    reader: &mut R,
+    read_timeout: Duration,
+) -> Result<Option<(MsgType, Vec<u8>)>>
+where
+    R: AsyncRead + Unpin,
+{
     let mut len_buf = [0u8; 4];
-    match stream.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
+    match tokio::time::timeout(read_timeout, reader.read_exact(&mut len_buf)).await {
+        Err(_) => return Err(anyhow!("frame length read timeout")),
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Ok(Err(e)) => return Err(e.into()),
     }
     let body_len = u32::from_be_bytes(len_buf) as usize;
     if body_len > MAX_PAYLOAD_LEN + 1 + 32 {
         return Err(anyhow!("frame body too large: {body_len}"));
     }
 
-    // Read body: msg_type(1) + digest(32) + payload(body_len-33)
     let mut body = vec![0u8; body_len];
-    stream
-        .read_exact(&mut body)
+    tokio::time::timeout(read_timeout, reader.read_exact(&mut body))
         .await
+        .map_err(|_| anyhow!("frame body read timeout"))?
         .context("read frame body")?;
 
     if body.len() < 33 {
@@ -96,8 +124,7 @@ pub async fn read_frame(stream: &mut TcpStream) -> Result<Option<Frame>> {
     let msg_type = MsgType::from_byte(msg_type_byte)
         .ok_or_else(|| anyhow!("unknown msg_type byte: {msg_type_byte}"))?;
 
-    let frame = decode_payload(msg_type, payload)?;
-    Ok(Some(frame))
+    Ok(Some((msg_type, payload.to_vec())))
 }
 
 /// Write one `Frame` to a `TcpStream`.
@@ -117,12 +144,34 @@ fn encode_frame_payload(frame: &Frame) -> Result<(MsgType, Vec<u8>)> {
         Frame::Proposal(p) => Ok((MsgType::Proposal, p.as_ssz_bytes())),
         Frame::Vote(v) => Ok((MsgType::Vote, v.as_ssz_bytes())),
         Frame::Tx(t) => Ok((MsgType::Tx, t.as_ssz_bytes())),
-        Frame::BlockRequest { height } => Ok((MsgType::BlockRequest, height.to_be_bytes().to_vec())),
-        Frame::BlockResponse(b) => Ok((MsgType::BlockResponse, b.as_ssz_bytes())),
-        Frame::StateBlobRequest { hash } => {
-            Ok((MsgType::StateBlobRequest, hash.0.to_vec()))
+        Frame::BlockRequest { height } => {
+            Ok((MsgType::BlockRequest, height.to_be_bytes().to_vec()))
         }
+        Frame::BlockResponse(b) => Ok((MsgType::BlockResponse, b.as_ssz_bytes())),
+        Frame::StateBlobRequest { hash } => Ok((MsgType::StateBlobRequest, hash.0.to_vec())),
         Frame::StateBlobResponse(data) => Ok((MsgType::StateBlobResponse, data.clone())),
+        Frame::StateSnapshotRequest { min_height } => Ok((
+            MsgType::StateSnapshotRequest,
+            min_height.to_be_bytes().to_vec(),
+        )),
+        Frame::StateSnapshotResponse {
+            block,
+            state_root,
+            blob_hash,
+            blob,
+        } => {
+            let block_bytes = block.as_ssz_bytes();
+            if block_bytes.len() > u32::MAX as usize {
+                return Err(anyhow!("snapshot block too large"));
+            }
+            let mut payload = Vec::with_capacity(4 + block_bytes.len() + 32 + 32 + blob.len());
+            payload.extend_from_slice(&(block_bytes.len() as u32).to_be_bytes());
+            payload.extend_from_slice(&block_bytes);
+            payload.extend_from_slice(&state_root.0);
+            payload.extend_from_slice(&blob_hash.0);
+            payload.extend_from_slice(blob);
+            Ok((MsgType::StateSnapshotResponse, payload))
+        }
         Frame::Ping => Ok((MsgType::Ping, vec![])),
         Frame::Pong => Ok((MsgType::Pong, vec![])),
     }
@@ -136,13 +185,12 @@ fn decode_payload(msg_type: MsgType, payload: &[u8]) -> Result<Frame> {
             Ok(Frame::Proposal(p))
         }
         MsgType::Vote => {
-            let v = Vote::from_ssz_bytes(payload)
-                .map_err(|e| anyhow!("Vote SSZ decode: {:?}", e))?;
+            let v =
+                Vote::from_ssz_bytes(payload).map_err(|e| anyhow!("Vote SSZ decode: {:?}", e))?;
             Ok(Frame::Vote(v))
         }
         MsgType::Tx => {
-            let t = Tx::from_ssz_bytes(payload)
-                .map_err(|e| anyhow!("Tx SSZ decode: {:?}", e))?;
+            let t = Tx::from_ssz_bytes(payload).map_err(|e| anyhow!("Tx SSZ decode: {:?}", e))?;
             Ok(Frame::Tx(t))
         }
         MsgType::BlockRequest => {
@@ -153,8 +201,8 @@ fn decode_payload(msg_type: MsgType, payload: &[u8]) -> Result<Frame> {
             Ok(Frame::BlockRequest { height })
         }
         MsgType::BlockResponse => {
-            let b = Block::from_ssz_bytes(payload)
-                .map_err(|e| anyhow!("Block SSZ decode: {:?}", e))?;
+            let b =
+                Block::from_ssz_bytes(payload).map_err(|e| anyhow!("Block SSZ decode: {:?}", e))?;
             Ok(Frame::BlockResponse(b))
         }
         MsgType::StateBlobRequest => {
@@ -166,6 +214,39 @@ fn decode_payload(msg_type: MsgType, payload: &[u8]) -> Result<Frame> {
             Ok(Frame::StateBlobRequest { hash: Hash32(arr) })
         }
         MsgType::StateBlobResponse => Ok(Frame::StateBlobResponse(payload.to_vec())),
+        MsgType::StateSnapshotRequest => {
+            if payload.len() != 8 {
+                return Err(anyhow!("StateSnapshotRequest payload must be 8 bytes"));
+            }
+            Ok(Frame::StateSnapshotRequest {
+                min_height: u64::from_be_bytes(payload.try_into().unwrap()),
+            })
+        }
+        MsgType::StateSnapshotResponse => {
+            if payload.len() < 4 + 32 + 32 {
+                return Err(anyhow!("StateSnapshotResponse payload too short"));
+            }
+            let block_len = u32::from_be_bytes(payload[..4].try_into().unwrap()) as usize;
+            let need = 4usize
+                .checked_add(block_len)
+                .and_then(|n| n.checked_add(64))
+                .ok_or_else(|| anyhow!("StateSnapshotResponse length overflow"))?;
+            if payload.len() < need {
+                return Err(anyhow!("StateSnapshotResponse truncated"));
+            }
+            let block = Block::from_ssz_bytes(&payload[4..4 + block_len])
+                .map_err(|e| anyhow!("StateSnapshotResponse block SSZ decode: {:?}", e))?;
+            let mut state_root = [0u8; 32];
+            state_root.copy_from_slice(&payload[4 + block_len..4 + block_len + 32]);
+            let mut blob_hash = [0u8; 32];
+            blob_hash.copy_from_slice(&payload[4 + block_len + 32..need]);
+            Ok(Frame::StateSnapshotResponse {
+                block,
+                state_root: Hash32(state_root),
+                blob_hash: Hash32(blob_hash),
+                blob: payload[need..].to_vec(),
+            })
+        }
         MsgType::Ping => Ok(Frame::Ping),
         MsgType::Pong => Ok(Frame::Pong),
     }
@@ -177,6 +258,7 @@ fn decode_payload(msg_type: MsgType, payload: &[u8]) -> Result<Frame> {
 
 /// A single entry in the peer pool.
 struct PeerState {
+    #[allow(dead_code)]
     addr: String,
     /// Channel for sending encoded wire frames to the background writer task.
     tx: mpsc::Sender<Vec<u8>>,
@@ -198,10 +280,7 @@ impl PeerPool {
     ///
     /// `peer_addrs`: list of `host:port` strings to maintain connections to.
     /// `inbound_tx`: channel where decoded inbound frames are forwarded.
-    pub fn new(
-        peer_addrs: Vec<String>,
-        inbound_tx: mpsc::Sender<(String, Frame)>,
-    ) -> Arc<Self> {
+    pub fn new(peer_addrs: Vec<String>, inbound_tx: mpsc::Sender<(String, Frame)>) -> Arc<Self> {
         let pool = Arc::new(PeerPool {
             peers: Arc::new(Mutex::new(BTreeMap::new())),
             inbound_tx,
@@ -227,7 +306,7 @@ impl PeerPool {
         loop {
             debug!(peer = %addr, "peer_pool.connecting");
             match TcpStream::connect(&addr).await {
-                Ok(mut stream) => {
+                Ok(stream) => {
                     info!(peer = %addr, "peer_pool.connected");
                     backoff = initial_backoff; // reset on success
 
@@ -237,7 +316,10 @@ impl PeerPool {
                         let mut peers = self.peers.lock();
                         peers.insert(
                             addr.clone(),
-                            PeerState { addr: addr.clone(), tx: send_tx },
+                            PeerState {
+                                addr: addr.clone(),
+                                tx: send_tx,
+                            },
                         );
                     }
 
@@ -246,8 +328,7 @@ impl PeerPool {
                     let addr_clone = addr.clone();
 
                     // Writer half
-                    let (mut read_half, mut write_half) =
-                        stream.into_split();
+                    let (mut read_half, mut write_half) = stream.into_split();
 
                     let write_task = tokio::spawn(async move {
                         while let Some(data) = send_rx.recv().await {
@@ -257,54 +338,20 @@ impl PeerPool {
                         }
                     });
 
-                    // Reader half: reconstruct TcpStream from owned halves is
-                    // not directly possible; use a small bridge.
-                    // We use tokio::io::join for reading.
-                    let mut read_buf = vec![0u8; MAX_PAYLOAD_LEN + 37];
-                    let _ = read_buf; // suppress unused warning
-
-                    // Simplified reader: read raw bytes in a loop.
-                    // For a production implementation, this would use a codec.
-                    // Here we use a helper that works on raw AsyncRead.
                     loop {
-                        let mut len_buf = [0u8; 4];
-                        if read_half.read_exact(&mut len_buf).await.is_err() {
+                        let Some((mt, payload)) =
+                            (match read_wire_frame(&mut read_half, FRAME_READ_TIMEOUT).await {
+                                Ok(frame) => frame,
+                                Err(e) => {
+                                    warn!(peer = %addr_clone, err = %e, "frame read failed");
+                                    break;
+                                }
+                            })
+                        else {
+                            debug!(peer = %addr_clone, "connection closed");
                             break;
-                        }
-                        let body_len = u32::from_be_bytes(len_buf) as usize;
-                        if body_len > MAX_PAYLOAD_LEN + 33 {
-                            warn!(peer = %addr_clone, "frame too large, dropping connection");
-                            break;
-                        }
-                        let mut body = vec![0u8; body_len];
-                        if read_half.read_exact(&mut body).await.is_err() {
-                            break;
-                        }
-                        if body.len() < 33 {
-                            warn!(peer = %addr_clone, "frame body too short");
-                            break;
-                        }
-                        let msg_type_byte = body[0];
-                        let digest_bytes = &body[1..33];
-                        let payload = &body[33..];
-
-                        // Verify digest
-                        let expected = {
-                            let mut hasher = blake3::Hasher::new();
-                            hasher.update(FRAME_DIGEST_DOMAIN);
-                            hasher.update(&[msg_type_byte]);
-                            hasher.update(payload);
-                            *hasher.finalize().as_bytes()
                         };
-                        if digest_bytes != expected {
-                            warn!(peer = %addr_clone, "digest mismatch, dropping frame");
-                            continue;
-                        }
-                        let Some(mt) = MsgType::from_byte(msg_type_byte) else {
-                            warn!(peer = %addr_clone, msg_type = msg_type_byte, "unknown msg_type");
-                            continue;
-                        };
-                        match decode_payload(mt, payload) {
+                        match decode_payload(mt, &payload) {
                             Ok(frame) => {
                                 let _ = inbound_tx.send((addr_clone.clone(), frame)).await;
                             }
@@ -366,31 +413,92 @@ impl PeerPool {
     }
 }
 
-/// Accept inbound TCP connections from peers and forward frames to `inbound_tx`.
-pub async fn accept_loop(
+/// Accept inbound TCP connections from peers and forward frames to the pool's
+/// inbound queue.
+///
+/// Accepted sockets are also registered in [`PeerPool`] under their remote
+/// socket address. Without this, request/response frames arriving over inbound
+/// connections were read-only: the node saw `BlockRequest { height }`, then
+/// `send_to(peer_addr, BlockResponse)` silently found no writer for that
+/// ephemeral address. Catch-up and restart recovery depend on this path.
+pub async fn accept_loop(listener: TcpListener, peer_pool: Arc<PeerPool>) {
+    accept_loop_with_limits(
+        listener,
+        peer_pool,
+        TRANSPORT_MAX_INBOUND_CONNECTIONS,
+        FRAME_READ_TIMEOUT,
+    )
+    .await
+}
+
+async fn accept_loop_with_limits(
     listener: TcpListener,
-    inbound_tx: mpsc::Sender<(String, Frame)>,
+    peer_pool: Arc<PeerPool>,
+    max_inbound_connections: usize,
+    read_timeout: Duration,
 ) {
+    let permits = Arc::new(Semaphore::new(max_inbound_connections.max(1)));
     loop {
         match listener.accept().await {
-            Ok((mut stream, peer_addr)) => {
+            Ok((stream, peer_addr)) => {
+                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    warn!(peer = %peer_addr, "transport.inbound_rejected: limit reached");
+                    drop(stream);
+                    continue;
+                };
                 let addr_str = peer_addr.to_string();
-                let tx = inbound_tx.clone();
+                let inbound_tx = peer_pool.inbound_tx.clone();
+                let peers = Arc::clone(&peer_pool.peers);
                 tokio::spawn(async move {
-                    loop {
-                        match read_frame(&mut stream).await {
-                            Ok(Some(frame)) => {
-                                let _ = tx.send((addr_str.clone(), frame)).await;
-                            }
-                            Ok(None) => {
-                                debug!(peer = %addr_str, "connection closed");
-                                break;
-                            }
-                            Err(e) => {
-                                warn!(peer = %addr_str, err = %e, "read_frame error");
+                    let _permit = permit;
+                    let (mut read_half, mut write_half) = stream.into_split();
+                    let (send_tx, mut send_rx) = mpsc::channel::<Vec<u8>>(256);
+                    {
+                        let mut peers_guard = peers.lock();
+                        peers_guard.insert(
+                            addr_str.clone(),
+                            PeerState {
+                                addr: addr_str.clone(),
+                                tx: send_tx,
+                            },
+                        );
+                    }
+
+                    let write_task = tokio::spawn(async move {
+                        while let Some(data) = send_rx.recv().await {
+                            if write_half.write_all(&data).await.is_err() {
                                 break;
                             }
                         }
+                    });
+
+                    loop {
+                        let Some((mt, payload)) =
+                            (match read_wire_frame(&mut read_half, read_timeout).await {
+                                Ok(frame) => frame,
+                                Err(e) => {
+                                    warn!(peer = %addr_str, err = %e, "frame read failed");
+                                    break;
+                                }
+                            })
+                        else {
+                            debug!(peer = %addr_str, "connection closed");
+                            break;
+                        };
+                        match decode_payload(mt, &payload) {
+                            Ok(frame) => {
+                                let _ = inbound_tx.send((addr_str.clone(), frame)).await;
+                            }
+                            Err(e) => {
+                                warn!(peer = %addr_str, err = %e, "SSZ decode failed");
+                            }
+                        }
+                    }
+
+                    write_task.abort();
+                    {
+                        let mut peers_guard = peers.lock();
+                        peers_guard.remove(&addr_str);
                     }
                 });
             }
@@ -398,5 +506,65 @@ pub async fn accept_loop(
                 error!(err = %e, "accept_loop error");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn test_pool() -> Arc<PeerPool> {
+        let (inbound_tx, _inbound_rx) = mpsc::channel(8);
+        PeerPool::new(Vec::new(), inbound_tx)
+    }
+
+    #[tokio::test]
+    async fn inbound_slowloris_connection_is_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pool = test_pool().await;
+        let task = tokio::spawn(accept_loop_with_limits(
+            listener,
+            pool,
+            4,
+            Duration::from_millis(50),
+        ));
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(&33u32.to_be_bytes()).await.unwrap();
+
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf))
+            .await
+            .expect("server should close slow body reads")
+            .unwrap();
+        assert_eq!(n, 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn excess_inbound_connections_are_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pool = test_pool().await;
+        let task = tokio::spawn(accept_loop_with_limits(
+            listener,
+            pool,
+            1,
+            Duration::from_secs(5),
+        ));
+
+        let _held = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut rejected = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(1), rejected.read(&mut buf))
+            .await
+            .expect("excess inbound connection should be closed")
+            .unwrap();
+        assert_eq!(n, 0);
+        task.abort();
     }
 }

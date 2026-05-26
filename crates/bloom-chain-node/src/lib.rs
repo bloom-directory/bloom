@@ -25,14 +25,18 @@
 #![forbid(unsafe_code)]
 
 pub mod block_store;
+pub mod chain_petal_runner;
+pub mod coin_select;
 pub mod consensus_driver;
 pub mod error;
 pub mod genesis;
 pub mod mempool_persist;
 pub mod node;
 pub mod petal_executor;
+pub mod ptb_chain_iface;
 pub mod receipt_store;
 pub mod rpc;
+pub mod sig_verifier;
 pub mod state_blob;
 pub mod state_index;
 pub mod transport;

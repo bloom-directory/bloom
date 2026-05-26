@@ -46,9 +46,9 @@ impl Decode for Log {
 
     fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut builder = SszDecoderBuilder::new(bytes);
-        builder.register_type::<Address>()?;      // address
-        builder.register_type::<Vec<Hash32>>()?;  // topics
-        builder.register_type::<Vec<u8>>()?;      // data
+        builder.register_type::<Address>()?; // address
+        builder.register_type::<Vec<Hash32>>()?; // topics
+        builder.register_type::<Vec<u8>>()?; // data
 
         let mut decoder = builder.build()?;
         Ok(Log {
@@ -105,10 +105,10 @@ impl Decode for Receipt {
 
     fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut builder = SszDecoderBuilder::new(bytes);
-        builder.register_type::<Hash32>()?;   // tx_hash
-        builder.register_type::<bool>()?;     // success
-        builder.register_type::<u64>()?;      // fuel_used
-        builder.register_type::<Vec<u8>>()?;  // return_data
+        builder.register_type::<Hash32>()?; // tx_hash
+        builder.register_type::<bool>()?; // success
+        builder.register_type::<u64>()?; // fuel_used
+        builder.register_type::<Vec<u8>>()?; // return_data
         builder.register_type::<Vec<Log>>()?; // logs
 
         let mut decoder = builder.build()?;

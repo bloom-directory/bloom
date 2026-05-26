@@ -59,8 +59,8 @@ impl FromStr for Address {
         let rest = s
             .strip_prefix("b1")
             .ok_or(AddressParseError::MissingPrefix)?;
-        let bytes = zbase32::decode_full_bytes_str(rest)
-            .map_err(|_| AddressParseError::InvalidEncoding)?;
+        let bytes =
+            zbase32::decode_full_bytes_str(rest).map_err(|_| AddressParseError::InvalidEncoding)?;
         if bytes.len() != 32 {
             return Err(AddressParseError::WrongLength(bytes.len()));
         }

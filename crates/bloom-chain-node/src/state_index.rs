@@ -49,9 +49,8 @@ impl StateIndex {
     /// Look up state root and blob hash by height.
     pub fn get(&self, height: u64) -> Result<Option<(Hash32, Hash32)>> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare_cached(
-            "SELECT state_root, blob_hash FROM state_index WHERE height = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare_cached("SELECT state_root, blob_hash FROM state_index WHERE height = ?1")?;
         let mut rows = stmt.query(params![height as i64])?;
         if let Some(row) = rows.next()? {
             let sr_bytes: Vec<u8> = row.get(0)?;
@@ -72,9 +71,7 @@ impl StateIndex {
     /// Return the highest indexed height, or `None` if empty.
     pub fn latest_height(&self) -> Result<Option<u64>> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare_cached(
-            "SELECT MAX(height) FROM state_index",
-        )?;
+        let mut stmt = conn.prepare_cached("SELECT MAX(height) FROM state_index")?;
         let h: Option<i64> = stmt.query_row([], |row| row.get(0))?;
         Ok(h.map(|v| v as u64))
     }

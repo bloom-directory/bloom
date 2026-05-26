@@ -18,6 +18,8 @@ pub enum StateError {
     #[error("blob not found: {0}")]
     BlobNotFound(String),
 
-    #[error("generation conflict: snapshot is stale (state has been mutated since snapshot was taken)")]
+    #[error(
+        "generation conflict: snapshot is stale (state has been mutated since snapshot was taken)"
+    )]
     StaleSnapshot,
 }

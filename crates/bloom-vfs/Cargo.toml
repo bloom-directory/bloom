@@ -8,6 +8,10 @@ description = "Path router and handlers for bloom virtual filesystem"
 [dependencies]
 bloom-mempool.workspace = true
 bloom-proto.workspace = true
+bloom-ptb-builder.workspace = true
+bloom-script.workspace = true
+bloom-objects.workspace = true
+bloom-chain-types.workspace = true
 bloom-keystore.workspace = true
 bloom-chain.workspace = true
 bloom-rpc.workspace = true

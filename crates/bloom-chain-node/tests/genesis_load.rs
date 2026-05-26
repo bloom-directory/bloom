@@ -11,15 +11,13 @@ use tempfile::NamedTempFile;
 
 #[test]
 fn genesis_load_one_validator() {
-    // We use a raw hex address for dev-convenience (parse_b1_address accepts it).
-    let addr_hex = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
-
     // Construct a minimal 1984-byte composite pubkey in base64.
     // (All zeros — not a valid real key, but sufficient for parse testing.)
     let pk_bytes = vec![0u8; 1984];
+    let addr_hex = hex::encode(bloom_chain_types::Address::from_pubkey_bytes(&pk_bytes).0);
     let pk_b64 = {
         // Minimal base64 encoding (standard alphabet).
-        use std::fmt::Write as FmtWrite;
+
         let mut out = String::new();
         let enc_table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut i = 0;
@@ -27,7 +25,7 @@ fn genesis_load_one_validator() {
             let b0 = pk_bytes[i] as usize;
             let b1 = pk_bytes[i + 1] as usize;
             let b2 = pk_bytes[i + 2] as usize;
-            out.push(enc_table[(b0 >> 2)] as char);
+            out.push(enc_table[b0 >> 2] as char);
             out.push(enc_table[((b0 & 3) << 4) | (b1 >> 4)] as char);
             out.push(enc_table[((b1 & 0xf) << 2) | (b2 >> 6)] as char);
             out.push(enc_table[b2 & 0x3f] as char);
@@ -70,7 +68,9 @@ amount  = "1000000000000000000000"
     );
 
     let mut tmpfile = NamedTempFile::new().expect("tmpfile");
-    tmpfile.write_all(toml_content.as_bytes()).expect("write genesis");
+    tmpfile
+        .write_all(toml_content.as_bytes())
+        .expect("write genesis");
     tmpfile.flush().expect("flush");
 
     let genesis = Genesis::from_file(tmpfile.path()).expect("parse genesis");

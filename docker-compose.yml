@@ -38,15 +38,19 @@ services:
     environment:
       RUST_LOG: ${RUST_LOG:-warn}
       RUST_BACKTRACE: "1"
+      BLOOM_BLOCK_PRUNE_WINDOW: ${BLOOM_BLOCK_PRUNE_WINDOW:-8}
+      BLOOM_STATE_BLOB_RETENTION: ${BLOOM_STATE_BLOB_RETENTION:-4}
+      BLOOM_RPC_UDS: "0"
     volumes:
       - ${BLOOM_DOCKER_TMPDIR}/home0:/home/bloom
     ports:
+      - "127.0.0.1:18656:26656"
       - "127.0.0.1:18545:8545"
     expose:
       - "26656"
       - "8545"
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 8545 || exit 1"]
+      test: ["CMD-SHELL", "BLOOM_RPC_TCP=127.0.0.1:8545 /usr/local/bin/bloom --home /home/bloom chain health >/dev/null"]
       interval: 2s
       timeout: 2s
       retries: 60
@@ -69,15 +73,19 @@ services:
     environment:
       RUST_LOG: ${RUST_LOG:-warn}
       RUST_BACKTRACE: "1"
+      BLOOM_BLOCK_PRUNE_WINDOW: ${BLOOM_BLOCK_PRUNE_WINDOW:-8}
+      BLOOM_STATE_BLOB_RETENTION: ${BLOOM_STATE_BLOB_RETENTION:-4}
+      BLOOM_RPC_UDS: "0"
     volumes:
       - ${BLOOM_DOCKER_TMPDIR}/home1:/home/bloom
     ports:
+      - "127.0.0.1:18657:26656"
       - "127.0.0.1:18546:8545"
     expose:
       - "26656"
       - "8545"
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 8545 || exit 1"]
+      test: ["CMD-SHELL", "BLOOM_RPC_TCP=127.0.0.1:8545 /usr/local/bin/bloom --home /home/bloom chain health >/dev/null"]
       interval: 2s
       timeout: 2s
       retries: 60
@@ -103,15 +111,19 @@ services:
       # validators stay at the default level to keep noise down.
       RUST_LOG: "info,bloom_chain_node=debug,bloom_chain_consensus=debug,bloom_petals=debug"
       RUST_BACKTRACE: "1"
+      BLOOM_BLOCK_PRUNE_WINDOW: ${BLOOM_BLOCK_PRUNE_WINDOW:-8}
+      BLOOM_STATE_BLOB_RETENTION: ${BLOOM_STATE_BLOB_RETENTION:-4}
+      BLOOM_RPC_UDS: "0"
     volumes:
       - ${BLOOM_DOCKER_TMPDIR}/home2:/home/bloom
     ports:
+      - "127.0.0.1:18658:26656"
       - "127.0.0.1:18547:8545"
     expose:
       - "26656"
       - "8545"
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 8545 || exit 1"]
+      test: ["CMD-SHELL", "BLOOM_RPC_TCP=127.0.0.1:8545 /usr/local/bin/bloom --home /home/bloom chain health >/dev/null"]
       interval: 2s
       timeout: 2s
       retries: 60
@@ -134,15 +146,19 @@ services:
     environment:
       RUST_LOG: ${RUST_LOG:-warn}
       RUST_BACKTRACE: "1"
+      BLOOM_BLOCK_PRUNE_WINDOW: ${BLOOM_BLOCK_PRUNE_WINDOW:-8}
+      BLOOM_STATE_BLOB_RETENTION: ${BLOOM_STATE_BLOB_RETENTION:-4}
+      BLOOM_RPC_UDS: "0"
     volumes:
       - ${BLOOM_DOCKER_TMPDIR}/home3:/home/bloom
     ports:
+      - "127.0.0.1:18659:26656"
       - "127.0.0.1:18548:8545"
     expose:
       - "26656"
       - "8545"
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 8545 || exit 1"]
+      test: ["CMD-SHELL", "BLOOM_RPC_TCP=127.0.0.1:8545 /usr/local/bin/bloom --home /home/bloom chain health >/dev/null"]
       interval: 2s
       timeout: 2s
       retries: 60

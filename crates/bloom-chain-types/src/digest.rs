@@ -38,6 +38,26 @@ pub mod tags {
     pub const VOTE: &str = "bloom-chain.v0.vote:";
     pub const PROPOSAL: &str = "bloom-chain.v0.proposal:";
     pub const FRAME: &str = "bloom-chain.v0.frame:";
+
+    // ----- Bloom-native contracts (spec §16.2, §16.3) -----
+    //
+    // Phase 1: tags are reserved. The Object and OwnershipIndex tries
+    // are empty in Phase 1 (no PTBs are executed yet), so their roots
+    // are zero, but the tag constants live here so commitments stay
+    // domain-separated when Phase 2 activates real PTB execution.
+
+    /// Root tag of the per-account Object trie. Mirrors
+    /// `bloom_objects::store::OBJECT_ROOT_TAG`.
+    pub const OBJECT_ROOT: &str = "bloom-chain.v0.object_root:";
+    /// Value tag for leaves of the Object trie. Mirrors
+    /// `bloom_objects::store::OBJECT_LEAF_TAG`.
+    pub const OBJECT_LEAF: &str = "bloom-chain.v0.object_leaf:";
+    /// Root tag of the per-account OwnershipIndex trie. Mirrors
+    /// `bloom_objects::store::OWNERSHIP_ROOT_TAG`.
+    pub const OWNERSHIP_ROOT: &str = "bloom-chain.v0.ownership_root:";
+    /// Value tag for leaves of the OwnershipIndex trie. Mirrors
+    /// `bloom_objects::store::OWNERSHIP_LEAF_TAG`.
+    pub const OWNERSHIP_LEAF: &str = "bloom-chain.v0.ownership_leaf:";
 }
 
 #[cfg(test)]

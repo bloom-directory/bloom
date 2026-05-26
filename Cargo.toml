@@ -23,23 +23,26 @@ members = [
   "crates/bloom-chain-state",
   "crates/bloom-chain-consensus",
   "crates/bloom-chain-node",
-  "crates/bloom-petal-sdk",
   "crates/bloom-chain-abi",
-  "crates/bloom-chain-abi-macros",
-  "crates/bloom-contract",
-  "crates/bloom-contract-macros",
-  "crates/bloom-contract-metadata",
-  "crates/bloom-contract-build",
-  "crates/bloom-client-codegen",
+  "crates/bloom-objects",
+  "crates/bloom-resource",
+  "crates/bloom-resource-macros",
+  "crates/bloom-petal-manifest",
+  "crates/bloom-script",
+  "crates/bloom-ptb-builder",
+  "crates/bloom-petal-fungible",
   "crates/bloom-test-util",
+  "crates/bloom-petal-it",
   # ---- example apps (not part of the protocol) ----
-  "examples/wloom",
-  "examples/dex/crates/bloom-dex-erc20",
-  "examples/dex/crates/bloom-dex-factory",
-  "examples/dex/crates/bloom-dex-pair",
-  "examples/dex/crates/bloom-dex-router",
-  "examples/dex/crates/bloom-dex-cli",
-  "examples/dex/tests/bloom-dex-it",
+  "examples/petal-dex/crates/bloom-dex-math",
+  "examples/petal-dex/crates/bloom-petal-dex-cpmm",
+  "examples/petal-dex/crates/bloom-petal-dex-faucet",
+  "examples/petal-dex/crates/bloom-petal-dex-pool",
+  "examples/petal-dex/crates/bloom-petal-dex-router",
+  "examples/petal-dex/crates/bloom-petal-dex-wallet",
+  "examples/petal-dex/tests/bloom-petal-dex-it",
+  "examples/petal-identity",
+  "examples/petal-cap",
 ]
 resolver = "2"
 
@@ -116,17 +119,24 @@ bloom-daemon   = { path = "crates/bloom-daemon" }
 bloom-chain-types = { path = "crates/bloom-chain-types" }
 bloom-chain-state = { path = "crates/bloom-chain-state" }
 bloom-chain-node = { path = "crates/bloom-chain-node" }
-bloom-petal-sdk   = { path = "crates/bloom-petal-sdk" }
 bloom-chain-abi   = { path = "crates/bloom-chain-abi", default-features = false }
-bloom-chain-abi-macros = { path = "crates/bloom-chain-abi-macros" }
-bloom-contract    = { path = "crates/bloom-contract", default-features = false }
-bloom-contract-macros = { path = "crates/bloom-contract-macros" }
-bloom-contract-metadata = { path = "crates/bloom-contract-metadata" }
-bloom-contract-build = { path = "crates/bloom-contract-build" }
-bloom-client-codegen = { path = "crates/bloom-client-codegen" }
-# ---- example DEX crates (not part of the protocol) ----
-bloom-dex-factory = { path = "examples/dex/crates/bloom-dex-factory" }
-bloom-dex-pair    = { path = "examples/dex/crates/bloom-dex-pair" }
+bloom-objects     = { path = "crates/bloom-objects" }
+bloom-resource    = { path = "crates/bloom-resource" }
+bloom-resource-macros = { path = "crates/bloom-resource-macros" }
+bloom-petal-manifest = { path = "crates/bloom-petal-manifest" }
+bloom-script      = { path = "crates/bloom-script" }
+bloom-ptb-builder = { path = "crates/bloom-ptb-builder" }
+bloom-petal-fungible = { path = "crates/bloom-petal-fungible", version = "0.1.0" }
+# ---- example petal DEX crates (not part of the protocol) ----
+bloom-dex-math    = { path = "examples/petal-dex/crates/bloom-dex-math" }
+bloom-petal-dex-cpmm = { path = "examples/petal-dex/crates/bloom-petal-dex-cpmm", version = "0.1.0" }
+bloom-petal-dex-faucet = { path = "examples/petal-dex/crates/bloom-petal-dex-faucet" }
+bloom-petal-dex-pool = { path = "examples/petal-dex/crates/bloom-petal-dex-pool" }
+bloom-petal-dex-router = { path = "examples/petal-dex/crates/bloom-petal-dex-router" }
+bloom-petal-dex-wallet = { path = "examples/petal-dex/crates/bloom-petal-dex-wallet" }
+bloom-petal-identity = { path = "examples/petal-identity" }
+# ---- example core petal: generic capability primitives (/bloom/core/cap) ----
+bloom-petal-cap   = { path = "examples/petal-cap", version = "0.1.0" }
 
 [profile.release]
 lto = "thin"

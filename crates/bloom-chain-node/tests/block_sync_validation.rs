@@ -16,14 +16,16 @@
 use std::sync::Arc;
 
 use bloom_chain_consensus::{signer::Signer, validator_set::ValidatorSet};
-use bloom_chain_node::consensus_driver::{validate_block_for_apply, XdsaSigner, XdsaVerifier};
+use bloom_chain_node::consensus_driver::{
+    XdsaSigner, XdsaVerifier, validate_block_for_apply, validate_block_for_proposal,
+};
 use bloom_chain_types::{
     block::Block,
     tx::{Tx, TxKind},
     types::{Address, Hash32, PubKeyBytes, SigBytes},
 };
 use bloom_test_util::{
-    make_validator_set_signed, make_validator_with_keypair, BlockBuilder, TestValidator,
+    BlockBuilder, TestValidator, make_validator_set_signed, make_validator_with_keypair,
 };
 
 /// Build a block with computed txs_root and validator_set_hash plus a
@@ -35,14 +37,14 @@ fn make_block(
     chain_id: &str,
     height: u64,
     parent_hash: Hash32,
-    proposer: Address,
+    _proposer: Address,
     vset: &ValidatorSet,
     signers: &[&TestValidator],
 ) -> Block {
     BlockBuilder::at(height)
         .chain_id(chain_id)
         .parent_hash(parent_hash)
-        .proposer(proposer)
+        .proposer(vset.proposer_for(height, 0).address)
         .with_computed_roots(vset)
         .signed_by(signers)
         .build()
@@ -73,6 +75,41 @@ fn well_formed_block_with_quorum_accepted() {
         &XdsaVerifier,
     );
     assert!(result.is_ok(), "well-formed block rejected: {result:?}");
+}
+
+#[test]
+fn block_with_wrong_header_proposer_is_rejected() {
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
+    let expected = vset.proposer_for(5, 0).address;
+    let wrong = [v1.addr, v2.addr, v3.addr, v4.addr]
+        .into_iter()
+        .find(|addr| *addr != expected)
+        .unwrap();
+    let block = BlockBuilder::at(5)
+        .chain_id("bloom-chain.v0")
+        .parent_hash(Hash32([0x42; 32]))
+        .proposer(wrong)
+        .with_computed_roots(&vset)
+        .signed_by(&[&v1, &v2, &v3])
+        .build();
+
+    let result = validate_block_for_apply(
+        &block,
+        5,
+        "bloom-chain.v0",
+        Hash32([0x42; 32]),
+        &vset,
+        &XdsaVerifier,
+    );
+    assert!(
+        result.is_err(),
+        "wrong header proposer must be rejected; got {result:?}"
+    );
+    assert!(result.unwrap_err().contains("header.proposer"));
 }
 
 #[test]
@@ -367,7 +404,7 @@ fn block_with_commit_for_different_block_hash_falls_below_quorum() {
         result.is_err(),
         "votes for a different block_hash must not count toward quorum; got {result:?}"
     );
-    assert!(result.unwrap_err().contains("commit quorum not met"));
+    assert!(result.unwrap_err().contains("does not match block hash"));
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +449,7 @@ fn make_block_with_tx(
     chain_id: &str,
     height: u64,
     parent_hash: Hash32,
-    proposer: Address,
+    _proposer: Address,
     vset: &ValidatorSet,
     signers: &[&TestValidator],
     tx: Tx,
@@ -420,7 +457,7 @@ fn make_block_with_tx(
     BlockBuilder::at(height)
         .chain_id(chain_id)
         .parent_hash(parent_hash)
-        .proposer(proposer)
+        .proposer(vset.proposer_for(height, 0).address)
         .txs(vec![tx])
         .with_computed_roots(vset)
         .signed_by(signers)
@@ -518,6 +555,118 @@ fn block_with_cross_chain_tx_is_rejected() {
     assert!(
         err.contains("tx.chain_id"),
         "expected tx.chain_id error, got: {err}"
+    );
+}
+
+#[test]
+fn block_with_sender_pubkey_mismatch_is_rejected_before_execution() {
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
+    let (sk_sender, _pk_sender) = bloom_keystore::xdsa::XdsaSecretKey::generate();
+
+    let mut tx = make_signed_tx(&sk_sender, "bloom-chain.v0");
+    tx.sender = Address([0xEF; 32]);
+    let digest = tx.signing_digest();
+    tx.sig = SigBytes(sk_sender.sign(&digest.0).to_bytes());
+
+    let block = make_block_with_tx(
+        "bloom-chain.v0",
+        5,
+        Hash32([0x42; 32]),
+        v1.addr,
+        &vset,
+        &[&v1, &v2, &v3],
+        tx,
+    );
+
+    let result = validate_block_for_apply(
+        &block,
+        5,
+        "bloom-chain.v0",
+        Hash32([0x42; 32]),
+        &vset,
+        &XdsaVerifier,
+    );
+    let err = result.expect_err("sender/pubkey mismatch must reject committed block");
+    assert!(
+        err.contains("sender/pubkey mismatch"),
+        "expected sender/pubkey mismatch, got: {err}"
+    );
+}
+
+#[test]
+fn proposal_with_sender_pubkey_mismatch_is_rejected_before_prevote() {
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
+    let (sk_sender, _pk_sender) = bloom_keystore::xdsa::XdsaSecretKey::generate();
+
+    let mut tx = make_signed_tx(&sk_sender, "bloom-chain.v0");
+    tx.sender = Address([0xEE; 32]);
+    let digest = tx.signing_digest();
+    tx.sig = SigBytes(sk_sender.sign(&digest.0).to_bytes());
+
+    let block = BlockBuilder::at(5)
+        .chain_id("bloom-chain.v0")
+        .parent_hash(Hash32([0x42; 32]))
+        .proposer(vset.proposer_for(5, 0).address)
+        .txs(vec![tx])
+        .with_computed_roots(&vset)
+        .build();
+
+    let result = validate_block_for_proposal(
+        &block,
+        5,
+        0,
+        0,
+        "bloom-chain.v0",
+        Hash32([0x42; 32]),
+        &vset,
+        &XdsaVerifier,
+    );
+    let err = result.expect_err("sender/pubkey mismatch must reject proposal block");
+    assert!(
+        err.contains("sender/pubkey mismatch"),
+        "expected sender/pubkey mismatch, got: {err}"
+    );
+}
+
+#[test]
+fn proposal_validation_accepts_valid_block_from_polka_round() {
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
+    let height = 5;
+    let polka_round = 0;
+    let proposal_round = 1;
+    let block = BlockBuilder::at(height)
+        .chain_id("bloom-chain.v0")
+        .parent_hash(Hash32([0x42; 32]))
+        .proposer(vset.proposer_for(height, polka_round).address)
+        .with_computed_roots(&vset)
+        .build();
+
+    let result = validate_block_for_proposal(
+        &block,
+        height,
+        proposal_round,
+        polka_round,
+        "bloom-chain.v0",
+        Hash32([0x42; 32]),
+        &vset,
+        &XdsaVerifier,
+    );
+
+    assert!(
+        result.is_ok(),
+        "valid-block reproposal from polka round must pass proposal validation: {result:?}"
     );
 }
 

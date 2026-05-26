@@ -24,18 +24,14 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use bloom_chain_consensus::{
-    Action, ConsensusEngine,
-    auth::verify_vote_sig,
-    signer::Signer,
-    state_machine::TimeoutKind,
-    validator_set::ValidatorSet,
+    ConsensusEngine, auth::verify_vote_sig, signer::Signer, validator_set::ValidatorSet,
     verifier::SigVerifier,
 };
 use bloom_chain_state::{Account, State, WriteSet};
 use bloom_chain_types::{
     block::Block,
     digest::blake3_tagged,
-    receipt::{Log, Receipt},
+    receipt::{Log, Receipt, receipts_root},
     tx::{Tx, TxKind},
     types::{Address, Hash32, PubKeyBytes, SigBytes},
     vote::VoteKind,
@@ -44,12 +40,8 @@ use parking_lot::Mutex;
 use tracing::{info, warn};
 
 use crate::{
-    block_store::BlockStore,
-    mempool_persist::MempoolPersist,
-    receipt_store::ReceiptStore,
-    state_blob::StateBlobStore,
-    state_index::StateIndex,
-    transport::PeerPool,
+    block_store::BlockStore, mempool_persist::MempoolPersist, receipt_store::ReceiptStore,
+    state_blob::StateBlobStore, state_index::StateIndex, transport::PeerPool,
 };
 
 // ---------------------------------------------------------------------------
@@ -89,9 +81,8 @@ pub struct ExecOutput {
 pub trait PetalExecutor: Send + Sync + 'static {
     /// Execute a single transaction.
     ///
-    /// `parent_hash` is the committing block's parent block hash; it is
-    /// surfaced inside the chain VM as `chain::block.prevhash`. At height 1
-    /// it is the all-zero hash (genesis parent). See review 2026-05-19 #13.
+    /// `parent_hash` is the committing block's parent block hash. At height 1
+    /// it is the all-zero hash (genesis parent).
     fn execute_tx(
         &self,
         tx: &Tx,
@@ -287,6 +278,16 @@ pub fn validate_block_for_apply(
 
     let block_hash = h.block_hash();
     let commit = &block.commit;
+    let expected_proposer = validator_set.proposer_for(h.height, commit.round).address;
+    if h.proposer != expected_proposer {
+        return Err(format!(
+            "header.proposer={} != expected proposer={} for height={} round={}",
+            hex::encode(h.proposer.0),
+            hex::encode(expected_proposer.0),
+            h.height,
+            commit.round
+        ));
+    }
     if commit.height != h.height {
         return Err(format!(
             "commit.height={} != header.height={}",
@@ -319,6 +320,15 @@ pub fn validate_block_for_apply(
                 tx.chain_id,
                 expected_chain_id,
                 hex::encode(tx.tx_hash().0)
+            ));
+        }
+        let expected_sender = Address::from_pubkey_bytes(&tx.pubkey.0);
+        if expected_sender != tx.sender {
+            return Err(format!(
+                "tx sender/pubkey mismatch (tx_hash={}, sender={}, derived={})",
+                hex::encode(tx.tx_hash().0),
+                hex::encode(tx.sender.0),
+                hex::encode(expected_sender.0)
             ));
         }
         let digest = tx.signing_digest();
@@ -363,13 +373,16 @@ pub fn validate_block_for_apply(
             ));
         }
         if v.block_hash != Some(block_hash) {
-            // A vote that did not commit to this block can't count.
-            continue;
+            return Err(format!(
+                "commit.vote.block_hash from validator {} does not match block hash",
+                hex::encode(v.validator.0)
+            ));
         }
         if !tallied.insert(v.validator) {
-            // Duplicate validator entry — ignore the duplicate but don't
-            // double-count. Don't error; some chains repeat votes for liveness.
-            continue;
+            return Err(format!(
+                "duplicate commit.vote from validator {}",
+                hex::encode(v.validator.0)
+            ));
         }
         let Some(val) = validator_set.get_by_address(&v.validator) else {
             return Err(format!(
@@ -391,6 +404,103 @@ pub fn validate_block_for_apply(
             "commit quorum not met at height {}: power={} quorum={}",
             h.height, power, quorum
         ));
+    }
+    Ok(())
+}
+
+/// Validate a proposal block before the consensus state machine is allowed to
+/// prevote for it. Proposal dissemination carries an empty commit, so this is
+/// the same structural boundary as committed-block validation minus commit
+/// quorum checks and plus the expected proposer from the proposal frame.
+pub fn validate_block_for_proposal(
+    block: &Block,
+    expected_height: u64,
+    expected_round: u32,
+    expected_header_proposer_round: u32,
+    expected_chain_id: &str,
+    expected_parent_hash: Hash32,
+    validator_set: &ValidatorSet,
+    verifier: &XdsaVerifier,
+) -> std::result::Result<(), String> {
+    let h = &block.header;
+
+    if h.chain_id != expected_chain_id {
+        return Err(format!(
+            "chain_id mismatch: header={:?} expected={:?}",
+            h.chain_id, expected_chain_id
+        ));
+    }
+    if h.height != expected_height {
+        return Err(format!(
+            "height mismatch: header={} expected={}",
+            h.height, expected_height
+        ));
+    }
+    if h.parent_hash != expected_parent_hash {
+        return Err(format!(
+            "parent_hash mismatch at height {}: header={} expected={}",
+            h.height,
+            hex::encode(h.parent_hash.0),
+            hex::encode(expected_parent_hash.0)
+        ));
+    }
+    let expected_proposer = validator_set
+        .proposer_for(expected_height, expected_header_proposer_round)
+        .address;
+    if h.proposer != expected_proposer {
+        return Err(format!(
+            "header.proposer={} != expected proposer={} for height={} proposal_round={} header_round={}",
+            hex::encode(h.proposer.0),
+            hex::encode(expected_proposer.0),
+            expected_height,
+            expected_round,
+            expected_header_proposer_round
+        ));
+    }
+    let computed_txs_root = compute_txs_root(&block.txs);
+    if h.txs_root != computed_txs_root {
+        return Err(format!(
+            "txs_root mismatch at height {}: header={} computed={}",
+            h.height,
+            hex::encode(h.txs_root.0),
+            hex::encode(computed_txs_root.0)
+        ));
+    }
+    let vs_hash = validator_set.validator_set_hash();
+    if h.validator_set_hash != vs_hash {
+        return Err(format!(
+            "validator_set_hash mismatch at height {}: header={} expected={}",
+            h.height,
+            hex::encode(h.validator_set_hash.0),
+            hex::encode(vs_hash.0)
+        ));
+    }
+    for tx in &block.txs {
+        if tx.chain_id != expected_chain_id {
+            return Err(format!(
+                "tx.chain_id={:?} != expected_chain_id={:?} (tx_hash={})",
+                tx.chain_id,
+                expected_chain_id,
+                hex::encode(tx.tx_hash().0)
+            ));
+        }
+        let expected_sender = Address::from_pubkey_bytes(&tx.pubkey.0);
+        if expected_sender != tx.sender {
+            return Err(format!(
+                "tx sender/pubkey mismatch (tx_hash={}, sender={}, derived={})",
+                hex::encode(tx.tx_hash().0),
+                hex::encode(tx.sender.0),
+                hex::encode(expected_sender.0)
+            ));
+        }
+        let digest = tx.signing_digest();
+        if !verifier.verify(&tx.pubkey, &digest.0, &tx.sig) {
+            return Err(format!(
+                "tx signature invalid (tx_hash={}, sender={})",
+                hex::encode(tx.tx_hash().0),
+                hex::encode(tx.sender.0)
+            ));
+        }
     }
     Ok(())
 }
@@ -418,8 +528,7 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
     let proposer = block.header.proposer;
     let height = block.header.height;
     let timestamp_ms = block.header.timestamp_ms;
-    // Parent block hash — surfaced to chain-mode petals as
-    // `chain::block.prevhash` (review 2026-05-19 #13).
+    // Parent block hash for execution metadata.
     let parent_hash = block.header.parent_hash;
 
     let mut total_fuel_used: u64 = 0;
@@ -460,12 +569,110 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
             continue;
         }
 
-        // 3. Max-fee reservation.
+        // 3. SubmitPtb outer/inner gas reconciliation (P0-5, spec §7.2 +
+        //    §9.4). PTBs run on the gas-payer `Coin<LOOM>` object — not
+        //    on the sender's `Account.loom`. We still gate execution on
+        //    the outer envelope's `tx.max_fuel` / `tx.fee_per_unit`
+        //    caps so a malicious sender can't squeeze unlimited VM work
+        //    out of a tiny outer fuel budget. Specifically:
+        //
+        //      tx.max_fuel      >= ptb.gas_budget   (cap covers inner budget)
+        //      tx.fee_per_unit  >= ptb.gas_price    (price covers inner price)
+        //
+        //    Together these guarantee
+        //      outer_max_fee = tx.max_fuel * tx.fee_per_unit
+        //                    >= ptb.gas_budget * ptb.gas_price.
+        //    If the inner budget exceeds either outer cap we reject at
+        //    consensus — Receipt(success=false, fuel_used=0), no debit,
+        //    no execution. Otherwise sender's `Account.loom` is left
+        //    untouched (Option A): the petal executor settles gas
+        //    against the gas-payer `Coin<LOOM>` and credits the
+        //    proposer via a `apply_loom_delta` in its WriteSet.
+        if let TxKind::SubmitPtb { ptb_bytes } = &tx.kind {
+            match bloom_script::decode_ptb(ptb_bytes) {
+                Err(e) => {
+                    // Bump nonce so a re-submission can advance, mirroring
+                    // the policy below for the executor-side decode revert
+                    // (sender already passed sender-derivation + nonce).
+                    let mut acct = sender_acct.unwrap_or_else(empty_account);
+                    acct.nonce += 1;
+                    state.set_account(tx.sender, acct);
+                    receipts.push(Receipt {
+                        tx_hash: tx.tx_hash(),
+                        success: false,
+                        fuel_used: 0,
+                        return_data: format!("ptb decode error: {e}").into_bytes(),
+                        logs: vec![],
+                    });
+                    continue;
+                }
+                Ok(ptb) => {
+                    let outer_max_fuel_ok = tx.max_fuel >= ptb.gas_budget;
+                    let outer_price_ok = (tx.fee_per_unit as u128) >= ptb.gas_price;
+                    if !outer_max_fuel_ok || !outer_price_ok {
+                        let mut acct = sender_acct.unwrap_or_else(empty_account);
+                        acct.nonce += 1;
+                        state.set_account(tx.sender, acct);
+                        let reason = format!(
+                            "outer/inner gas cap mismatch: \
+                             tx.max_fuel={} ptb.gas_budget={} \
+                             tx.fee_per_unit={} ptb.gas_price={}",
+                            tx.max_fuel, ptb.gas_budget, tx.fee_per_unit, ptb.gas_price,
+                        );
+                        receipts.push(Receipt {
+                            tx_hash: tx.tx_hash(),
+                            success: false,
+                            fuel_used: 0,
+                            return_data: reason.into_bytes(),
+                            logs: vec![],
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            // Bump nonce; sender's loom stays put.
+            {
+                let mut acct = sender_acct.unwrap_or_else(empty_account);
+                acct.nonce += 1;
+                state.set_account(tx.sender, acct);
+            }
+
+            // 4. Execute via PetalExecutor. All gas settlement
+            //    (gas-payer Coin<LOOM> debit + refund + proposer
+            //    credit) lives in the executor's WriteSet.
+            let output =
+                executor.execute_tx(tx, state, height, timestamp_ms, proposer, parent_hash);
+
+            // Apply whatever the executor produced. On revert the
+            // executor still emits a write_set that carries the
+            // burnt-gas accounting (gas-payer debit + proposer
+            // credit), so we apply it unconditionally rather than
+            // gating on `output.success`.
+            if let Some(ws) = output.write_set
+                && let Err(e) = state.apply(ws)
+            {
+                warn!(err = %e, "apply write_set failed (SubmitPtb)");
+            }
+
+            total_fuel_used += output.fuel_used;
+            receipts.push(Receipt {
+                tx_hash: tx.tx_hash(),
+                success: output.success,
+                fuel_used: output.fuel_used,
+                logs: output.logs,
+                return_data: output.return_data,
+            });
+            continue;
+        }
+
+        // 3. Max-fee reservation (non-PTB txs).
         let max_fee = tx.max_fuel as u128 * tx.fee_per_unit as u128;
         let value = match &tx.kind {
-            TxKind::Call { value_loom, .. } => *value_loom,
             TxKind::Transfer { amount_loom, .. } => *amount_loom,
-            TxKind::Deploy { .. } => 0,
+            TxKind::DeployPetal { .. } => 0,
+            // Handled in the SubmitPtb early-continue branch above.
+            TxKind::SubmitPtb { .. } => unreachable!(),
         };
         let required = max_fee + value;
         let balance = sender_acct.as_ref().map(|a| a.loom).unwrap_or(0);
@@ -507,10 +714,10 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
             // already reflects the pre-execution max-fee debit, so
             // settling on top of the post-write_set balance produces the
             // same numbers minus the clobber hazard. Review 2026-05-19 #5.
-            if let Some(ws) = output.write_set {
-                if let Err(e) = state.apply(ws) {
-                    warn!(err = %e, "apply write_set failed");
-                }
+            if let Some(ws) = output.write_set
+                && let Err(e) = state.apply(ws)
+            {
+                warn!(err = %e, "apply write_set failed");
             }
 
             // Refund unused fuel.
@@ -553,6 +760,80 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
     }
 
     (total_fuel_used, receipts)
+}
+
+/// Result of deterministic block execution on a scratch state.
+#[derive(Debug)]
+pub struct ExecutionValidation {
+    pub state: State,
+    pub fuel_used: u64,
+    pub receipts: Vec<Receipt>,
+    pub state_root: Hash32,
+    pub receipts_root: Hash32,
+}
+
+/// Execute a block on a cloned pre-state and verify the header commits to the
+/// resulting consensus artifacts. Callers can then install `state` atomically.
+pub fn validate_block_execution<E: PetalExecutor>(
+    pre_state: &State,
+    executor: &E,
+    block: &Block,
+    block_emission: u128,
+) -> std::result::Result<ExecutionValidation, String> {
+    let max_fuel: u64 = block
+        .txs
+        .iter()
+        .try_fold(0u64, |acc, tx| acc.checked_add(tx.max_fuel))
+        .ok_or_else(|| "block tx max_fuel sum overflow".to_string())?;
+    if max_fuel > block.header.fuel_limit {
+        return Err(format!(
+            "block tx max_fuel sum {} exceeds header.fuel_limit {}",
+            max_fuel, block.header.fuel_limit
+        ));
+    }
+
+    let mut scratch = pre_state.clone();
+    let (fuel_used, receipts) =
+        apply_block_state_transitions(&mut scratch, executor, block, block_emission);
+    if fuel_used > block.header.fuel_limit {
+        return Err(format!(
+            "executed fuel_used {} exceeds header.fuel_limit {}",
+            fuel_used, block.header.fuel_limit
+        ));
+    }
+
+    let state_root = scratch.state_root();
+    if state_root != block.header.state_root {
+        return Err(format!(
+            "state_root mismatch at height {}: header={} computed={}",
+            block.header.height,
+            hex::encode(block.header.state_root.0),
+            hex::encode(state_root.0)
+        ));
+    }
+    let computed_receipts_root = receipts_root(&receipts);
+    if computed_receipts_root != block.header.receipts_root {
+        return Err(format!(
+            "receipts_root mismatch at height {}: header={} computed={}",
+            block.header.height,
+            hex::encode(block.header.receipts_root.0),
+            hex::encode(computed_receipts_root.0)
+        ));
+    }
+    if fuel_used != block.header.fuel_used {
+        return Err(format!(
+            "fuel_used mismatch at height {}: header={} computed={}",
+            block.header.height, block.header.fuel_used, fuel_used
+        ));
+    }
+
+    Ok(ExecutionValidation {
+        state: scratch,
+        fuel_used,
+        receipts,
+        state_root,
+        receipts_root: computed_receipts_root,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -614,8 +895,9 @@ impl<E: PetalExecutor> ConsensusDriver<E> {
         block: &Block,
         expected_height: u64,
     ) -> std::result::Result<(), String> {
-        let parent =
-            self.expected_parent_hash(expected_height).map_err(|e| e.to_string())?;
+        let parent = self
+            .expected_parent_hash(expected_height)
+            .map_err(|e| e.to_string())?;
         let validator_set = { self.engine.lock().validator_set.clone() };
         validate_block_for_apply(
             block,
@@ -625,6 +907,46 @@ impl<E: PetalExecutor> ConsensusDriver<E> {
             &validator_set,
             &XdsaVerifier,
         )
+    }
+
+    /// Validate an uncommitted proposal body before voting for it.
+    pub fn validate_proposal_block(
+        &self,
+        block: &Block,
+        expected_height: u64,
+        expected_round: u32,
+        expected_header_proposer_round: u32,
+    ) -> std::result::Result<(), String> {
+        let parent = self
+            .expected_parent_hash(expected_height)
+            .map_err(|e| e.to_string())?;
+        let validator_set = { self.engine.lock().validator_set.clone() };
+        validate_block_for_proposal(
+            block,
+            expected_height,
+            expected_round,
+            expected_header_proposer_round,
+            &self.chain_id,
+            parent,
+            &validator_set,
+            &XdsaVerifier,
+        )?;
+        let state = self.state.lock();
+        validate_block_execution(&state, self.executor.as_ref(), block, self.block_emission)
+            .map(|_| ())
+    }
+
+    /// Validate a committed block, including commit proof and deterministic
+    /// execution outputs, without mutating state or durable stores.
+    pub fn validate_committed_block(
+        &self,
+        block: &Block,
+        expected_height: u64,
+    ) -> std::result::Result<(), String> {
+        self.validate_block(block, expected_height)?;
+        let state = self.state.lock();
+        validate_block_execution(&state, self.executor.as_ref(), block, self.block_emission)
+            .map(|_| ())
     }
 
     /// Apply a committed block to state (spec §6.4, §11).
@@ -643,27 +965,43 @@ impl<E: PetalExecutor> ConsensusDriver<E> {
                 reason
             ));
         }
-        // Hold the state lock continuously through state-transition + root
-        // computation so concurrent readers (block builder, RPC) cannot
-        // observe a partially-applied block. The persistence I/O after the
-        // guard drops is keyed by `state_root`, which is now stable.
-        let (total_fuel_used, receipts, state_root) = {
-            let mut state = self.state.lock();
-            let (fuel, recs) = apply_block_state_transitions(
-                &mut state,
-                self.executor.as_ref(),
-                block,
-                self.block_emission,
-            );
-            let root = state.state_root();
-            (fuel, recs, root)
+        // Validate execution on a scratch clone. Durable writes below publish
+        // the block/blob first and the state index last; only after that commit
+        // marker succeeds do we install the already-validated state in memory.
+        let execution = {
+            let state = self.state.lock();
+            validate_block_execution(&state, self.executor.as_ref(), block, self.block_emission)
+                .map_err(|reason| {
+                    anyhow::anyhow!(
+                        "block execution validation failed at height {}: {}",
+                        height,
+                        reason
+                    )
+                })?
         };
+        let total_fuel_used = execution.fuel_used;
+        let receipts = execution.receipts;
+        let state_root = execution.state_root;
+        let (blob_data, expected_blob_hash) =
+            execution.state.to_blob(height, block.header.parent_hash);
 
-        // Persist block and update indices.
-        let blob_data = serde_json::to_vec(&hex::encode(&state_root.0)).unwrap_or_default();
+        // Persist block/blob durably, then publish the state index last as the
+        // restart commit marker. A crash before this point leaves no newer
+        // checkpoint for restart to select.
         let blob_hash = self.blob_store.put(&blob_data)?;
-        self.state_index.put(height, &state_root, &blob_hash)?;
+        if blob_hash != expected_blob_hash {
+            return Err(anyhow::anyhow!(
+                "state blob hash mismatch at height {}: state={} store={}",
+                height,
+                hex::encode(expected_blob_hash.0),
+                hex::encode(blob_hash.0)
+            ));
+        }
         self.block_store.put(height, block)?;
+        self.state_index.put(height, &state_root, &blob_hash)?;
+        {
+            *self.state.lock() = execution.state.clone();
+        }
         self.block_store.prune(height)?;
         self.blob_store.gc(&[blob_hash])?;
 
@@ -690,7 +1028,8 @@ impl<E: PetalExecutor> ConsensusDriver<E> {
             height,
             txs = block.txs.len(),
             fuel_used = total_fuel_used,
-            state_root = %hex::encode(&state_root.0),
+            state_root = %hex::encode(state_root.0),
+            receipts_root = %hex::encode(execution.receipts_root.0),
             "block.committed"
         );
         Ok(())

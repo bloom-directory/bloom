@@ -10,7 +10,7 @@
 
 mod commands {
     pub mod chain;
-    pub mod contract;
+    pub mod pipe;
 }
 
 use std::path::PathBuf;
@@ -26,7 +26,6 @@ use tracing::{debug, info, trace};
 use tracing_subscriber::EnvFilter;
 
 use commands::chain::ChainCmd;
-use commands::contract::ContractCmd;
 
 #[cfg(target_os = "linux")]
 const DEFAULT_MOUNT_PATH: &str = "/bloom";
@@ -81,12 +80,27 @@ enum Cmd {
     Petals(PetalsCmd),
     /// Initialise ~/.bloom with default config + dirs.
     Init,
-    /// Sovereign bloom-chain: init, run-validator, submit, deploy, call, query.
+    /// Sovereign bloom-chain: init, run-validator, submit, query.
     #[command(subcommand)]
     Chain(ChainCmd),
-    /// Build & verify Bloom Rust smart contracts.
-    #[command(subcommand)]
-    Contract(ContractCmd),
+    /// Lower a pipe expression into a PTB and stream its receipt (spec §3.5).
+    ///
+    /// `EXPR` is a pipe expression — linear `A | B | C` (each command's
+    /// primary output feeds the next) plus named `--a <(<sub-expr>)>`
+    /// DAG inputs. It lowers + validates against the chain via the same
+    /// `PtbSession` the NFS `tx`-session front door uses, so a plan piped
+    /// here commits identically to one staged over the mount.
+    Pipe {
+        /// The pipe expression to lower, e.g.
+        /// `'/bloom/dex/pool/swap amount=100 --in <(/bloom/wallet/coin)>'`.
+        expr: String,
+        /// Signer pubkey (32-byte hex). Repeat for a multi-signer tx.
+        #[arg(long = "signer", value_name = "HEX")]
+        signers: Vec<String>,
+        /// Gas-payer object id (32-byte hex `Coin<LOOM>`).
+        #[arg(long, value_name = "HEX")]
+        gas_payer: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -145,14 +159,14 @@ enum PetalsCmd {
         /// flag, the petal runs with all of its declared caps.
         #[arg(long = "cap", value_name = "CAP")]
         cap_mask: Vec<String>,
+        /// Write an onchain run attestation JSON to this path.
+        #[arg(long)]
+        attest: Option<String>,
     },
     /// List installed petals.
     Ls,
     /// Bind `<name>` to `<hash>`. Omit `<hash>` to remove the binding.
-    Name {
-        name: String,
-        hash: Option<String>,
-    },
+    Name { name: String, hash: Option<String> },
     /// Remove an installed petal (and any petname pointing at it).
     Uninstall {
         /// 64-char hex content hash of the petal to remove.
@@ -491,7 +505,15 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Petals(cmd) => run_petals(home, cmd).await,
         Cmd::Chain(cmd) => commands::chain::run_chain(&home, cmd).await,
-        Cmd::Contract(cmd) => commands::contract::run(cmd),
+        Cmd::Pipe {
+            expr,
+            signers,
+            gas_payer,
+        } => {
+            let rpc_sock = home.root().join("chain").join("rpc.sock");
+            let chain_dir = home.root().join("chain");
+            commands::pipe::run(&rpc_sock, &chain_dir, &expr, &signers, &gas_payer).await
+        }
         Cmd::Ipc(IpcCmd::Call { method, params }) => {
             let socket = default_socket_path(home.root());
             if !socket.exists() {
@@ -523,10 +545,17 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
     let vfs_arc = std::sync::Arc::new(d.vfs.clone());
 
     match cmd {
-        PetalsCmd::Install { path, name, caps, mode } => {
+        PetalsCmd::Install {
+            path,
+            name,
+            caps,
+            mode,
+        } => {
             let bytes = if path == "-" {
                 let mut buf = Vec::new();
-                std::io::stdin().read_to_end(&mut buf).context("read stdin")?;
+                std::io::stdin()
+                    .read_to_end(&mut buf)
+                    .context("read stdin")?;
                 buf
             } else {
                 std::fs::read(&path).with_context(|| format!("read {path}"))?
@@ -565,11 +594,14 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
             name_or_hash,
             input,
             cap_mask,
+            attest,
         } => {
             let stdin = match input.as_deref() {
                 Some("-") => {
                     let mut buf = Vec::new();
-                    std::io::stdin().read_to_end(&mut buf).context("read stdin")?;
+                    std::io::stdin()
+                        .read_to_end(&mut buf)
+                        .context("read stdin")?;
                     buf
                 }
                 Some(p) => std::fs::read(p).with_context(|| format!("read {p}"))?,
@@ -587,11 +619,27 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                 Some(s)
             };
             let host = std::sync::Arc::new(VfsHost::new(vfs_arc.clone()));
-            let out = d
-                .petals
-                .run(&name_or_hash, stdin, host, cap_mask, RunOptions::default())
-                .await
-                .context("run petal")?;
+            let (out, attestation) = if attest.is_some() {
+                d.petals
+                    .run_attested(&name_or_hash, stdin, host, cap_mask, RunOptions::default())
+                    .await
+                    .context("run petal")?
+            } else {
+                (
+                    d.petals
+                        .run(&name_or_hash, stdin, host, cap_mask, RunOptions::default())
+                        .await
+                        .context("run petal")?,
+                    None,
+                )
+            };
+            if let Some(path) = attest {
+                let attestation = attestation.ok_or_else(|| {
+                    anyhow::anyhow!("--attest is only supported for onchain petals")
+                })?;
+                let body = serde_json::to_vec_pretty(&attestation).context("encode attestation")?;
+                std::fs::write(&path, body).with_context(|| format!("write attestation {path}"))?;
+            }
             use std::io::Write;
             // Stream stdout/stderr to the user verbatim so they can pipe
             // a petal's output. Exit code goes to the parent process.
@@ -660,10 +708,16 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
             }
             Ok(())
         }
-        PetalsCmd::Replay { name_or_hash, input, expect } => {
+        PetalsCmd::Replay {
+            name_or_hash,
+            input,
+            expect,
+        } => {
             let stdin = if input == "-" {
                 let mut buf = Vec::new();
-                std::io::stdin().read_to_end(&mut buf).context("read stdin")?;
+                std::io::stdin()
+                    .read_to_end(&mut buf)
+                    .context("read stdin")?;
                 buf
             } else {
                 std::fs::read(&input).with_context(|| format!("read {input}"))?

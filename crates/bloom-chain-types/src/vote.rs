@@ -143,8 +143,8 @@ impl Decode for Vote {
 
     fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut builder = SszDecoderBuilder::new(bytes);
-        builder.register_type::<u64>()?;   // height
-        builder.register_type::<u32>()?;   // round
+        builder.register_type::<u64>()?; // height
+        builder.register_type::<u32>()?; // round
         builder.register_type::<VoteKind>()?; // kind
         builder.register_type::<Option<Hash32>>()?; // block_hash
         builder.register_type::<Address>()?; // validator
@@ -238,8 +238,8 @@ impl Decode for Proposal {
 
     fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut builder = SszDecoderBuilder::new(bytes);
-        builder.register_type::<u64>()?;    // height
-        builder.register_type::<u32>()?;    // round
+        builder.register_type::<u64>()?; // height
+        builder.register_type::<u32>()?; // round
         builder.register_type::<Hash32>()?; // block_hash
         builder.register_type_parameterized(true, 4)?; // pol_round (i32)
         builder.register_type::<Address>()?; // proposer
@@ -317,9 +317,9 @@ impl Decode for Commit {
 
     fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut builder = SszDecoderBuilder::new(bytes);
-        builder.register_type::<u64>()?;     // height
-        builder.register_type::<u32>()?;     // round
-        builder.register_type::<Hash32>()?;  // block_hash
+        builder.register_type::<u64>()?; // height
+        builder.register_type::<u32>()?; // round
+        builder.register_type::<Hash32>()?; // block_hash
         builder.register_type::<Vec<Vote>>()?; // votes
 
         let mut decoder = builder.build()?;

@@ -7,8 +7,8 @@
 //! Many contracts can share one code entry (same wasm, different instances).
 
 use bloom_chain_types::{
-    digest::{blake3_tagged, tags},
     Hash32,
+    digest::{blake3_tagged, tags},
 };
 
 use crate::trie::{Trie, TrieKind};

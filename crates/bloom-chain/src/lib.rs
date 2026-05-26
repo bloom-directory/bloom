@@ -257,6 +257,33 @@ impl ChainClient {
         ))
     }
 
+    /// Open a pinned read session at an explicit historical block number.
+    ///
+    /// This is the backend for onchain petal `chain_read_at`: every session
+    /// read asks for the resolved block hash first, and falls back to the same
+    /// block number only if an upstream cannot serve the hash.
+    pub async fn open_session_at(&self, block_number: u64) -> Result<Session<'_>, ChainError> {
+        let block = self
+            .primary
+            .get_block_by_number(BlockNumberOrTag::Number(block_number))
+            .await?
+            .ok_or_else(|| ChainError::NotFound(format!("block {block_number}")))?;
+        let pinned_number = block.header.number;
+        let pinned_hash = block.header.hash;
+        debug!(
+            chain = %self.spec.name,
+            pinned_number,
+            pinned_hash = %pinned_hash,
+            "rpc.session.opened_at"
+        );
+        Ok(Session::from_pinned(
+            self.primary.as_ref(),
+            self.spec.name.clone(),
+            pinned_number,
+            pinned_hash,
+        ))
+    }
+
     pub async fn chain_id(&self) -> Result<u64, ChainError> {
         if let Some(id) = *self.cached_chain_id.read() {
             return Ok(id);

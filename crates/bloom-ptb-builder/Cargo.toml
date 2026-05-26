@@ -1,0 +1,18 @@
+[package]
+name = "bloom-ptb-builder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PtbSession: lowers UNIX-style endpoint composition (CLI pipes + tx-session VFS) into a validated PtbTx. One source of truth for both front doors (spec §3.2)."
+
+[dependencies]
+bloom-objects.workspace = true
+bloom-script.workspace = true
+bloom-petal-manifest.workspace = true
+bloom-chain-types.workspace = true
+thiserror.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

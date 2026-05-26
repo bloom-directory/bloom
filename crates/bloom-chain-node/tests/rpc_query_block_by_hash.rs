@@ -59,15 +59,12 @@ fn make_block(height: u64) -> Block {
 #[tokio::test]
 async fn chain_query_block_by_hash_matches_by_height() {
     let tmp = tempfile::tempdir().unwrap();
-    let block_store = Arc::new(
-        BlockStore::open(&tmp.path().join("blocks")).expect("open BlockStore"),
-    );
-    let receipt_store = Arc::new(
-        ReceiptStore::open(&tmp.path().join("receipts")).expect("open ReceiptStore"),
-    );
+    let block_store =
+        Arc::new(BlockStore::open(&tmp.path().join("blocks")).expect("open BlockStore"));
+    let receipt_store =
+        Arc::new(ReceiptStore::open(&tmp.path().join("receipts")).expect("open ReceiptStore"));
     let mempool_persist = Arc::new(
-        MempoolPersist::open(&tmp.path().join("mempool.sled"))
-            .expect("open MempoolPersist"),
+        MempoolPersist::open(&tmp.path().join("mempool.sled")).expect("open MempoolPersist"),
     );
     let state = Arc::new(Mutex::new(State::new()));
 
@@ -91,6 +88,10 @@ async fn chain_query_block_by_hash_matches_by_height() {
         mempool_persist,
         receipt_store,
         validator_set,
+        chain_id: "bloomchain.test".into(),
+        genesis_hash: bloom_chain_types::types::Hash32([0x42; 32]),
+        local_address: v.addr,
+        startup_height: 0,
         tx_submit,
     };
 
@@ -146,13 +147,13 @@ async fn chain_query_block_by_hash_matches_by_height() {
 
     // Sanity: a 32-byte zero hash points at no block and returns null.
     let missing = client
-        .call(
-            "chain_query_block",
-            json!({ "hash": "0".repeat(64) }),
-        )
+        .call("chain_query_block", json!({ "hash": "0".repeat(64) }))
         .await
         .expect("missing-hash query");
-    assert!(missing.is_null(), "unknown hash must yield null, got {missing}");
+    assert!(
+        missing.is_null(),
+        "unknown hash must yield null, got {missing}"
+    );
 
     // Bad-length hash → error.
     let bad = client

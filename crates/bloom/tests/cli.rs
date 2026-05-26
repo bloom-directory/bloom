@@ -440,10 +440,15 @@ fn install_onchain_with_chain_read_cap_lists_mode() {
     std::fs::write(&wat_path, include_str!("fixtures/onchain_echo.wat")).unwrap();
     bloom_cmd(home.path())
         .args([
-            "petals", "install", wat_path.to_str().unwrap(),
-            "--name", "echo",
-            "--cap", "chain.read",
-            "--mode", "onchain",
+            "petals",
+            "install",
+            wat_path.to_str().unwrap(),
+            "--name",
+            "echo",
+            "--cap",
+            "chain.read",
+            "--mode",
+            "onchain",
         ])
         .assert()
         .success();
@@ -462,14 +467,51 @@ fn install_onchain_with_vfs_cap_fails_with_mode_cap_mismatch() {
     std::fs::write(&wat_path, include_str!("fixtures/onchain_echo.wat")).unwrap();
     bloom_cmd(home.path())
         .args([
-            "petals", "install", wat_path.to_str().unwrap(),
-            "--name", "x",
-            "--cap", "vfs.read",
-            "--mode", "onchain",
+            "petals",
+            "install",
+            wat_path.to_str().unwrap(),
+            "--name",
+            "x",
+            "--cap",
+            "vfs.read",
+            "--mode",
+            "onchain",
         ])
         .assert()
         .failure()
         .stderr(predicate::str::contains("mode/cap"));
+}
+
+#[test]
+fn install_same_hash_same_mode_different_caps_returns_cap_mismatch() {
+    let home = fresh_home();
+    let wat_path = home.path().join("echo.wat");
+    std::fs::write(&wat_path, include_str!("fixtures/onchain_echo.wat")).unwrap();
+    bloom_cmd(home.path())
+        .args([
+            "petals",
+            "install",
+            wat_path.to_str().unwrap(),
+            "--cap",
+            "vfs.read",
+            "--mode",
+            "local",
+        ])
+        .assert()
+        .success();
+    bloom_cmd(home.path())
+        .args([
+            "petals",
+            "install",
+            wat_path.to_str().unwrap(),
+            "--cap",
+            "vfs.write",
+            "--mode",
+            "local",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cap mismatch"));
 }
 
 #[test]
@@ -480,21 +522,83 @@ fn install_same_hash_two_modes_returns_mode_conflict() {
     // First install: local.
     bloom_cmd(home.path())
         .args([
-            "petals", "install", wat_path.to_str().unwrap(),
-            "--mode", "local",
+            "petals",
+            "install",
+            wat_path.to_str().unwrap(),
+            "--mode",
+            "local",
         ])
         .assert()
         .success();
     // Same bytes, onchain mode → ModeConflict.
     bloom_cmd(home.path())
         .args([
-            "petals", "install", wat_path.to_str().unwrap(),
-            "--cap", "chain.read",
-            "--mode", "onchain",
+            "petals",
+            "install",
+            wat_path.to_str().unwrap(),
+            "--cap",
+            "chain.read",
+            "--mode",
+            "onchain",
         ])
         .assert()
         .failure()
         .stderr(predicate::str::contains("mode conflict"));
+}
+
+#[test]
+fn petals_run_onchain_writes_attestation() {
+    let home = fresh_home();
+    let wat_path = home.path().join("echo.wat");
+    std::fs::write(&wat_path, include_str!("fixtures/onchain_echo.wat")).unwrap();
+    let install = bloom_cmd(home.path())
+        .args([
+            "petals",
+            "install",
+            wat_path.to_str().unwrap(),
+            "--name",
+            "echo",
+            "--cap",
+            "chain.read",
+            "--mode",
+            "onchain",
+        ])
+        .assert()
+        .success();
+    let install_out = String::from_utf8(install.get_output().stdout.clone()).unwrap();
+    let hash = install_out
+        .lines()
+        .find(|l| l.starts_with("hash: "))
+        .unwrap()
+        .trim_start_matches("hash: ")
+        .trim()
+        .to_string();
+    let input: &[u8] = b"hello world!!!!!";
+    let input_path = home.path().join("in.bin");
+    let attest_path = home.path().join("attestation.json");
+    std::fs::write(&input_path, input).unwrap();
+
+    bloom_cmd(home.path())
+        .args([
+            "petals",
+            "run",
+            "echo",
+            "--input",
+            input_path.to_str().unwrap(),
+            "--attest",
+            attest_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::eq("hello world!!!!!"));
+
+    let att: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&attest_path).unwrap()).unwrap();
+    let expected = hex::encode(blake3::hash(input).as_bytes());
+    assert_eq!(att["petal_hash"], hash);
+    assert_eq!(att["input_hash"], expected);
+    assert_eq!(att["output_hash"], expected);
+    assert!(att["block_pin"].is_null());
 }
 
 #[test]
@@ -504,10 +608,15 @@ fn replay_matches_then_mismatches_on_tampered_expect() {
     std::fs::write(&wat_path, include_str!("fixtures/onchain_echo.wat")).unwrap();
     bloom_cmd(home.path())
         .args([
-            "petals", "install", wat_path.to_str().unwrap(),
-            "--name", "echo",
-            "--cap", "chain.read",
-            "--mode", "onchain",
+            "petals",
+            "install",
+            wat_path.to_str().unwrap(),
+            "--name",
+            "echo",
+            "--cap",
+            "chain.read",
+            "--mode",
+            "onchain",
         ])
         .assert()
         .success();
@@ -523,9 +632,13 @@ fn replay_matches_then_mismatches_on_tampered_expect() {
     // Matching replay → success.
     bloom_cmd(home.path())
         .args([
-            "petals", "replay", "echo",
-            "--input", input_path.to_str().unwrap(),
-            "--expect", &expected,
+            "petals",
+            "replay",
+            "echo",
+            "--input",
+            input_path.to_str().unwrap(),
+            "--expect",
+            &expected,
         ])
         .assert()
         .success()
@@ -533,13 +646,61 @@ fn replay_matches_then_mismatches_on_tampered_expect() {
     // Tampered expect → mismatch failure with structured stderr.
     bloom_cmd(home.path())
         .args([
-            "petals", "replay", "echo",
-            "--input", input_path.to_str().unwrap(),
-            "--expect", &"0".repeat(64),
+            "petals",
+            "replay",
+            "echo",
+            "--input",
+            input_path.to_str().unwrap(),
+            "--expect",
+            &"0".repeat(64),
         ])
         .assert()
         .failure()
         .stderr(predicate::str::contains("mismatch"));
+}
+
+#[test]
+fn replay_nonzero_exit_fails_as_execution_error() {
+    let home = fresh_home();
+    let wat_path = home.path().join("exit7.wat");
+    let wat = r#"
+        (module
+          (import "wasi_snapshot_preview1" "proc_exit"
+            (func $exit (param i32)))
+          (memory (export "memory") 1)
+          (func (export "_start")
+            (call $exit (i32.const 7)))
+        )
+    "#;
+    std::fs::write(&wat_path, wat).unwrap();
+    bloom_cmd(home.path())
+        .args([
+            "petals",
+            "install",
+            wat_path.to_str().unwrap(),
+            "--name",
+            "exit7",
+            "--mode",
+            "onchain",
+        ])
+        .assert()
+        .success();
+    let input_path = home.path().join("empty.bin");
+    std::fs::write(&input_path, b"").unwrap();
+    bloom_cmd(home.path())
+        .args([
+            "petals",
+            "replay",
+            "exit7",
+            "--input",
+            input_path.to_str().unwrap(),
+            "--expect",
+            &"0".repeat(64),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("replay execution failed"))
+        .stderr(predicate::str::contains("exited with code 7"));
 }
 
 // ---------------------------------------------------------------------------
@@ -556,7 +717,11 @@ fn chain_init_refuses_to_overwrite_validator_key_without_force() {
         .args(["chain", "init"])
         .assert()
         .success();
-    let key_path = home.path().join("chain").join("keystore").join("validator.xdsa");
+    let key_path = home
+        .path()
+        .join("chain")
+        .join("keystore")
+        .join("validator.xdsa");
     let first = std::fs::read(&key_path).expect("first init wrote a key");
 
     bloom_cmd(home.path())
@@ -596,7 +761,11 @@ fn chain_init_writes_validator_key_with_mode_0600() {
         .args(["chain", "init"])
         .assert()
         .success();
-    let key_path = home.path().join("chain").join("keystore").join("validator.xdsa");
+    let key_path = home
+        .path()
+        .join("chain")
+        .join("keystore")
+        .join("validator.xdsa");
     let mode = std::fs::metadata(&key_path)
         .expect("stat validator.xdsa")
         .permissions()
@@ -653,7 +822,8 @@ fn chain_testnet_writes_validator_keys_with_mode_0600() {
             .mode()
             & 0o777;
         assert_eq!(
-            mode, 0o600,
+            mode,
+            0o600,
             "{} must be mode 0o600, got 0o{mode:o}",
             key.display()
         );

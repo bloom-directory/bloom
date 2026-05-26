@@ -14,8 +14,7 @@
 //!
 //! Total: 122 bytes (fixed — no variable-length fields). The
 //! `manifest_hash` slot is the v1 on-chain anchor for off-chain manifest
-//! verification (spec Q4 — bloom-rust-contracts Phase 8). The chain
-//! does not interpret its bytes; explorers and `bloom contract verify`
+//! verification. The chain does not interpret its bytes; off-chain tooling can
 //! compare it against the blake3 of a published manifest.
 
 use bloom_chain_types::Hash32;
@@ -32,10 +31,10 @@ pub struct Account {
     pub code_hash: Option<Hash32>,
     /// Root of this account's storage trie (zero if empty).
     pub storage_root: Hash32,
-    /// `None` for EOAs and pre-Phase-8 contracts; `Some(hash)` when the
-    /// deployer anchored a manifest at `TxKind::Deploy` time. The chain
-    /// does not interpret the bytes — off-chain tools verify a published
-    /// manifest matches by recomputing its blake3.
+    /// `None` for EOAs and contracts without an anchored manifest;
+    /// `Some(hash)` when the publisher anchored a manifest. The chain does
+    /// not interpret the bytes — off-chain tools verify a published manifest
+    /// matches by recomputing its blake3.
     pub manifest_hash: Option<Hash32>,
 }
 
@@ -146,9 +145,9 @@ impl Decode for Account {
                 Some(Hash32(arr))
             }
             _ => {
-                return Err(DecodeError::BytesInvalid(
-                    format!("invalid code_hash discriminant: {discriminant}"),
-                ));
+                return Err(DecodeError::BytesInvalid(format!(
+                    "invalid code_hash discriminant: {discriminant}"
+                )));
             }
         };
 
@@ -165,9 +164,9 @@ impl Decode for Account {
                 Some(Hash32(arr))
             }
             _ => {
-                return Err(DecodeError::BytesInvalid(
-                    format!("invalid manifest_hash discriminant: {manifest_discriminant}"),
-                ));
+                return Err(DecodeError::BytesInvalid(format!(
+                    "invalid manifest_hash discriminant: {manifest_discriminant}"
+                )));
             }
         };
 

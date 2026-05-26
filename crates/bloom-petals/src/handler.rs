@@ -136,14 +136,12 @@ impl Handler for PetalsHandler {
                 }
                 match child.as_str() {
                     "wasm" => self.store.read_wasm(hash).map_err(map_err),
-                    "meta.json" => {
-                        serde_json::to_vec_pretty(&meta)
-                            .map(|mut v| {
-                                v.push(b'\n');
-                                v
-                            })
-                            .map_err(|e| HandlerError::Backend(e.to_string()))
-                    }
+                    "meta.json" => serde_json::to_vec_pretty(&meta)
+                        .map(|mut v| {
+                            v.push(b'\n');
+                            v
+                        })
+                        .map_err(|e| HandlerError::Backend(e.to_string())),
                     _ => Err(HandlerError::NotFound(path.to_string_path())),
                 }
             }
@@ -244,20 +242,26 @@ fn map_err(e: PetalError) -> HandlerError {
         PetalError::InvalidHash(s) => HandlerError::invalid(format!("hash: {s}")),
         PetalError::InvalidName(s) => HandlerError::invalid(format!("name: {s}")),
         PetalError::InvalidWasm(s) => HandlerError::invalid(format!("wasm: {s}")),
-        PetalError::CapabilityDenied { petal, cap } => HandlerError::Backend(format!(
-            "capability denied: petal={petal} cap={cap}"
-        )),
+        PetalError::CapabilityDenied { petal, cap } => {
+            HandlerError::Backend(format!("capability denied: petal={petal} cap={cap}"))
+        }
         PetalError::Vm(s) => HandlerError::Backend(format!("vm: {s}")),
         PetalError::Io(e) => HandlerError::Io(e),
         PetalError::Serde(s) => HandlerError::Backend(format!("serde: {s}")),
-        PetalError::ModeCapMismatch { mode, cap } => {
-            HandlerError::invalid(format!("mode/cap mismatch: mode={mode:?} disallows cap={cap}"))
-        }
+        PetalError::ModeCapMismatch { mode, cap } => HandlerError::invalid(format!(
+            "mode/cap mismatch: mode={mode:?} disallows cap={cap}"
+        )),
+        PetalError::CapMismatch => HandlerError::invalid(
+            "cap mismatch: petal already installed with different capabilities".to_string(),
+        ),
         PetalError::ModeConflict { existing } => {
             HandlerError::invalid(format!("mode conflict: existing={existing}"))
         }
         PetalError::ModeUnsupported(s) => HandlerError::invalid(format!("mode unsupported: {s}")),
         PetalError::ChainCall(s) => HandlerError::Backend(format!("chain call: {s}")),
+        PetalError::ChainCallTrap { detail, fuel_used } => HandlerError::Backend(format!(
+            "chain call trapped after {fuel_used} fuel: {detail}"
+        )),
     }
 }
 
@@ -274,10 +278,24 @@ mod tests {
         let reg = Arc::new(NameRegistry::open(dir.path().join("reg")).unwrap());
         let mut local_caps = BTreeSet::new();
         local_caps.insert(Capability::VfsRead);
-        let (rl, _) = store.install(b"\x00asm\x01\x00\x00\x00local", Some("greet"), &local_caps, PetalMode::Local).unwrap();
+        let (rl, _) = store
+            .install(
+                b"\x00asm\x01\x00\x00\x00local",
+                Some("greet"),
+                &local_caps,
+                PetalMode::Local,
+            )
+            .unwrap();
         let mut chain_caps = BTreeSet::new();
         chain_caps.insert(Capability::ChainRead);
-        let (rc, _) = store.install(b"\x00asm\x01\x00\x00\x00onchain", Some("snap"), &chain_caps, PetalMode::Onchain).unwrap();
+        let (rc, _) = store
+            .install(
+                b"\x00asm\x01\x00\x00\x00onchain",
+                Some("snap"),
+                &chain_caps,
+                PetalMode::Onchain,
+            )
+            .unwrap();
         reg.set("greet", &rl.hash).unwrap();
         reg.set("snap", &rc.hash).unwrap();
         let h = PetalsHandler::new(store, reg);
@@ -299,8 +317,14 @@ mod tests {
         let (_d, h, local_hash, _onchain_hash) = setup_with_modes();
         let entries = h.list(&VfsPath::parse("/local").unwrap()).await.unwrap();
         let hashes: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(hashes.contains(&local_hash.as_str()), "missing local: {hashes:?}");
-        assert!(hashes.iter().all(|n| n != &"snap" || *n == "greet"), "leaked onchain hash into local: {hashes:?}");
+        assert!(
+            hashes.contains(&local_hash.as_str()),
+            "missing local: {hashes:?}"
+        );
+        assert!(
+            hashes.iter().all(|n| n != &"snap" || *n == "greet"),
+            "leaked onchain hash into local: {hashes:?}"
+        );
     }
 
     #[tokio::test]

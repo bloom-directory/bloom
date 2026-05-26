@@ -21,10 +21,15 @@ pub mod validators;
 
 // Re-exports for convenience: a test file can `use bloom_test_util::{...}`
 // instead of reaching into module paths for the common helpers.
-pub use blocks::{txs_root, BlockBuilder};
+pub use blocks::{BlockBuilder, txs_root};
 pub use mocks::TestSigner;
 pub use multi_sm::MultiValidatorMailbox;
-pub use provision::{bloom_bin, pick_free_port, provision_network, spawn_validator, ChainNodeConfig, ChainNodeGuard};
+pub use provision::{
+    ChainNodeConfig, ChainNodeGuard, bloom_bin, pick_free_port, provision_network, spawn_validator,
+};
 pub use rpc::wait_for_socket;
 pub use txs::{make_mempool_tx, make_signed_transfer_tx};
-pub use validators::{make_addr, make_addr_derived, make_validator_set_fake, make_validator_set_signed, make_validator_with_keypair, TestValidator};
+pub use validators::{
+    TestValidator, make_addr, make_addr_derived, make_validator_set_fake,
+    make_validator_set_signed, make_validator_with_keypair,
+};

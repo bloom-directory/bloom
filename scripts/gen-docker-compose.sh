@@ -47,15 +47,19 @@ for i in $(seq 0 $((N - 1))); do
     environment:
       RUST_LOG: \${RUST_LOG:-warn}
       RUST_BACKTRACE: "1"
+      BLOOM_BLOCK_PRUNE_WINDOW: \${BLOOM_BLOCK_PRUNE_WINDOW:-8}
+      BLOOM_STATE_BLOB_RETENTION: \${BLOOM_STATE_BLOB_RETENTION:-4}
+      BLOOM_RPC_UDS: "0"
     volumes:
       - \${BLOOM_DOCKER_TMPDIR}/home${i}:/home/bloom
     ports:
+      - "127.0.0.1:$((18656 + i)):26656"
       - "127.0.0.1:${host_port}:8545"
     expose:
       - "26656"
       - "8545"
     healthcheck:
-      test: ["CMD-SHELL", "nc -z 127.0.0.1 8545 || exit 1"]
+      test: ["CMD-SHELL", "BLOOM_RPC_TCP=127.0.0.1:8545 /usr/local/bin/bloom --home /home/bloom chain health >/dev/null"]
       interval: 2s
       timeout: 2s
       retries: 60

@@ -21,13 +21,20 @@ pub enum PetalError {
     #[error("serde: {0}")]
     Serde(String),
     #[error("mode/cap mismatch: mode={mode} disallows cap={cap}")]
-    ModeCapMismatch { mode: crate::meta::PetalMode, cap: String },
+    ModeCapMismatch {
+        mode: crate::meta::PetalMode,
+        cap: String,
+    },
+    #[error("cap mismatch: petal already installed with different capabilities")]
+    CapMismatch,
     #[error("mode conflict: petal already installed as {existing}; uninstall first")]
     ModeConflict { existing: crate::meta::PetalMode },
     #[error("operation not supported in this petal mode: {0}")]
     ModeUnsupported(String),
     #[error("chain call error: {0}")]
     ChainCall(String),
+    #[error("chain call trapped after {fuel_used} fuel: {detail}")]
+    ChainCallTrap { detail: String, fuel_used: u64 },
 }
 
 impl PetalError {

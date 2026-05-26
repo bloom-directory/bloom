@@ -48,7 +48,11 @@ fn set_get_remove_cycle() {
     assert_eq!(trie.get(&addr(1)), None);
 
     trie.remove(&addr(2));
-    assert_eq!(trie.root(), r0, "root should return to initial after all removes");
+    assert_eq!(
+        trie.root(),
+        r0,
+        "root should return to initial after all removes"
+    );
 }
 
 // ---------------------------------------------------------------------------

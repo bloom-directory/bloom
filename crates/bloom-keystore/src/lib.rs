@@ -162,7 +162,11 @@ const XDSA_ARGON2_P_COST: u32 = 4;
 
 const XDSA_KEYSTORE_AAD: &[u8] = b"bloom-keystore-xdsa-v2";
 
-fn derive_key_v2(passphrase: &str, salt: &[u8], enc: &EncryptedFileV2) -> Result<[u8; 32], KeystoreError> {
+fn derive_key_v2(
+    passphrase: &str,
+    salt: &[u8],
+    enc: &EncryptedFileV2,
+) -> Result<[u8; 32], KeystoreError> {
     let argon = Argon2::new(
         argon2::Algorithm::Argon2id,
         argon2::Version::V0x13,
@@ -176,7 +180,10 @@ fn derive_key_v2(passphrase: &str, salt: &[u8], enc: &EncryptedFileV2) -> Result
     Ok(key)
 }
 
-fn encrypt_xdsa_key(secret_bytes: &[u8], passphrase: &str) -> Result<EncryptedFileV2, KeystoreError> {
+fn encrypt_xdsa_key(
+    secret_bytes: &[u8],
+    passphrase: &str,
+) -> Result<EncryptedFileV2, KeystoreError> {
     let mut salt = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut salt);
     let mut nonce_bytes = [0u8; 12];
@@ -288,8 +295,8 @@ pub fn create_xdsa_wallet(
     let (sk, pk) = xdsa::XdsaSecretKey::generate();
     let secret_bytes = sk.to_bytes();
     let encrypted = encrypt_xdsa_key(secret_bytes.as_slice(), passphrase)?;
-    let blob = serde_json::to_vec(&encrypted)
-        .map_err(|e| KeystoreError::Malformed(e.to_string()))?;
+    let blob =
+        serde_json::to_vec(&encrypted).map_err(|e| KeystoreError::Malformed(e.to_string()))?;
     write_atomic(&dir.join("encrypted.key"), &blob)?;
 
     let addr_bytes = xdsa::derive_address(&pk);
@@ -327,8 +334,8 @@ pub fn load_xdsa_wallet(
         path: dir.join("encrypted.key"),
         source,
     })?;
-    let enc: EncryptedFileV2 = serde_json::from_slice(&blob)
-        .map_err(|e| KeystoreError::Malformed(e.to_string()))?;
+    let enc: EncryptedFileV2 =
+        serde_json::from_slice(&blob).map_err(|e| KeystoreError::Malformed(e.to_string()))?;
 
     let secret_bytes = decrypt_xdsa_key(&enc, passphrase)?;
     let sk = xdsa::XdsaSecretKey::from_bytes(&secret_bytes)?;

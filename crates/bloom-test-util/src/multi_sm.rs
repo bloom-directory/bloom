@@ -87,7 +87,9 @@ impl MultiValidatorMailbox {
         actions
             .into_iter()
             .filter_map(|a| match a {
-                Action::Broadcast(ProposalOrVote::Vote(v)) if v.kind == VoteKind::Prevote => Some(v),
+                Action::Broadcast(ProposalOrVote::Vote(v)) if v.kind == VoteKind::Prevote => {
+                    Some(v)
+                }
                 _ => None,
             })
             .collect()
@@ -99,7 +101,9 @@ impl MultiValidatorMailbox {
         actions
             .into_iter()
             .filter_map(|a| match a {
-                Action::Broadcast(ProposalOrVote::Vote(v)) if v.kind == VoteKind::Precommit => Some(v),
+                Action::Broadcast(ProposalOrVote::Vote(v)) if v.kind == VoteKind::Precommit => {
+                    Some(v)
+                }
                 _ => None,
             })
             .collect()

@@ -405,6 +405,16 @@ fn parse_addr(s: &str) -> Result<alloy::primitives::Address, HandlerError> {
         .map_err(|e| HandlerError::invalid(format!("address: {}", e)))
 }
 
+fn parse_u256_slot(s: &str) -> Result<alloy::primitives::U256, HandlerError> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        alloy::primitives::U256::from_str_radix(hex, 16)
+            .map_err(|e| HandlerError::invalid(format!("storage slot: {e}")))
+    } else {
+        alloy::primitives::U256::from_str_radix(s, 10)
+            .map_err(|e| HandlerError::invalid(format!("storage slot: {e}")))
+    }
+}
+
 fn err_be(e: impl std::fmt::Display) -> HandlerError {
     HandlerError::backend(e.to_string())
 }
@@ -464,6 +474,19 @@ impl Handler for ChainsHandler {
                 path = %path.to_string_path(),
                 error = %e,
                 "chains.read_err"
+            );
+        }
+        r
+    }
+
+    async fn read_at_block(&self, path: &VfsPath, block: u64) -> Result<Vec<u8>, HandlerError> {
+        let r = self.read_at_block_inner(path, block).await;
+        if let Err(e) = &r {
+            tracing::debug!(
+                path = %path.to_string_path(),
+                block,
+                error = %e,
+                "chains.read_at_block_err"
             );
         }
         r
@@ -934,6 +957,91 @@ impl ChainsHandler {
                 None => Err(HandlerError::not_found(path.to_string_path())),
             },
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
+        }
+    }
+
+    async fn read_at_block_inner(
+        &self,
+        path: &VfsPath,
+        block_number: u64,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let segs = path.segments();
+        if segs.is_empty() {
+            return Err(HandlerError::NotAFile(path.to_string_path()));
+        }
+        let chain = &segs[0];
+        let client = self.client(chain)?;
+        match segs.get(1).map(|s| s.as_str()).unwrap_or("") {
+            "chain_id" => {
+                let id = client.chain_id().await.map_err(err_be)?;
+                Ok(format!("{}\n", id).into_bytes())
+            }
+            "head" => {
+                let block = client
+                    .block_by_number(block_number)
+                    .await
+                    .map_err(err_be)?
+                    .ok_or_else(|| HandlerError::not_found(format!("block {}", block_number)))?;
+                match segs.get(2).map(|s| s.as_str()).unwrap_or("") {
+                    "number" => Ok(format!("{}\n", block.header.number).into_bytes()),
+                    "hash" => Ok(format!("{:#x}\n", block.header.hash).into_bytes()),
+                    "timestamp" => Ok(format!("{}\n", block.header.timestamp).into_bytes()),
+                    "full.json" => Ok(serde_json::to_vec_pretty(&block).map_err(err_be)?),
+                    _ => Err(HandlerError::Unsupported(path.to_string_path())),
+                }
+            }
+            "blocks" if segs.len() == 4 && segs[3] == "full.json" => {
+                let n: u64 = segs[2]
+                    .parse()
+                    .map_err(|_| HandlerError::invalid("block number"))?;
+                let block = client
+                    .block_by_number(n)
+                    .await
+                    .map_err(err_be)?
+                    .ok_or_else(|| HandlerError::not_found(format!("block {}", n)))?;
+                Ok(serde_json::to_vec_pretty(&block).map_err(err_be)?)
+            }
+            "addresses" if segs.len() == 4 => {
+                let addr = parse_addr(&segs[2])?;
+                let spec = client.spec().clone();
+                let session = client.open_session_at(block_number).await.map_err(err_be)?;
+                match segs[3].as_str() {
+                    "balance" | "balance.raw" => {
+                        let bal = session.balance(addr).await.map_err(err_be)?;
+                        Ok(format!("{}\n", bal).into_bytes())
+                    }
+                    "balance.eth" => {
+                        let bal = session.balance(addr).await.map_err(err_be)?;
+                        Ok(format!(
+                            "{} {}\n",
+                            format_units(bal, spec.native_decimals),
+                            spec.native_symbol
+                        )
+                        .into_bytes())
+                    }
+                    "nonce" => {
+                        let n = session.nonce(addr).await.map_err(err_be)?;
+                        Ok(format!("{}\n", n).into_bytes())
+                    }
+                    "code" => {
+                        let code = session.code(addr).await.map_err(err_be)?;
+                        Ok(format!("0x{}\n", hex::encode(&code)).into_bytes())
+                    }
+                    "is_contract" => {
+                        let code = session.code(addr).await.map_err(err_be)?;
+                        Ok(format!("{}\n", !code.is_empty()).into_bytes())
+                    }
+                    _ => Err(HandlerError::Unsupported(path.to_string_path())),
+                }
+            }
+            "contracts" if segs.len() == 5 && segs[3] == "storage" => {
+                let addr = parse_addr(&segs[2])?;
+                let slot = parse_u256_slot(&segs[4])?;
+                let session = client.open_session_at(block_number).await.map_err(err_be)?;
+                let value = session.get_storage_at(addr, slot).await.map_err(err_be)?;
+                Ok(format!("{:#x}\n", value).into_bytes())
+            }
+            _ => Err(HandlerError::Unsupported(path.to_string_path())),
         }
     }
 

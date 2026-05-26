@@ -7,13 +7,13 @@
 # dummy lib.rs" cache layer would be brittle (one new member silently
 # busts the cache or breaks the build). cargo-chef does the recipe
 # generation automatically and keeps the dep-build layer reusable across
-# both the host-target binaries (bloom, bloom-dex) and the wasm petals.
+# both the host-target binary (bloom) and the wasm petals.
 #
 # Stages:
 #   chef          — installs cargo-chef and the wasm target on rust:1-bookworm
 #   planner       — generates recipe.json from the full source tree
 #   builder-deps  — cooks deps for host target AND wasm32 target
-#   builder       — copies real sources and builds the binaries + wasm
+#   builder       — copies real sources and builds the binary + wasm
 #   runtime       — debian:bookworm-slim with the produced artefacts
 
 # ----------------------------------------------------------------------------
@@ -67,35 +67,25 @@ COPY . .
 # resolved toolchain. (Idempotent and fast when already installed.)
 RUN rustup target add wasm32-unknown-unknown
 
-# Host binaries.
-RUN cargo build --release -p bloom -p bloom-dex-cli
+# Host binary.
+RUN cargo build --release -p bloom
 
-# DEX petal wasm artefacts. We build each contract in its own `cargo build`
-# invocation rather than a single multi-package build. Why: each contract
-# crate uses `crate-type = ["cdylib", "rlib"]` (cdylib for the on-chain
-# petal, rlib for sibling petals to import the typed `ContractRef` gateway)
-# and the framework's `#[bloom::contract]` macro emits `init` / `call` wasm
-# exports gated on `not(feature = "no-entrypoint")`. Sibling crates depend
-# with `features = ["no-entrypoint"]` so the dep's exports don't leak into
-# the dependent's cdylib. A single multi-package `cargo build` UNIFIES
-# features across packages — so e.g. erc20 (a root target here AND a dep
-# of pair/router/wloom) would be built with `no-entrypoint = ON`, producing
-# an erc20.wasm with no entry points and no functional contract. Separate
-# invocations resolve features per-package, so each contract's own wasm
-# keeps its entry points while sibling deps stay quiet.
-RUN cargo build --release --target wasm32-unknown-unknown -p bloom-dex-erc20
-RUN cargo build --release --target wasm32-unknown-unknown -p bloom-dex-factory
-RUN cargo build --release --target wasm32-unknown-unknown -p bloom-dex-pair
-RUN cargo build --release --target wasm32-unknown-unknown -p bloom-dex-wloom
-RUN cargo build --release --target wasm32-unknown-unknown -p bloom-dex-router
+# DEX petal wasm artefacts. Build each petal in its own `cargo build`
+# invocation because sibling petals use `features = ["no-entrypoint"]` when
+# imported as rlib dependencies; a single multi-package build would unify those
+# features and can suppress a root petal's exported entrypoints.
+RUN cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-pool
+RUN cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-wallet
+RUN cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-faucet
+RUN cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-cpmm
+RUN cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-router
 
 # Stage outputs into /out so the runtime COPY is dead-simple.
 RUN set -eux; \
     mkdir -p /out/bin /out/wasm; \
     cp target/release/bloom        /out/bin/bloom; \
-    cp target/release/bloom-dex    /out/bin/bloom-dex; \
-    for w in bloom_dex_erc20 bloom_dex_factory bloom_dex_pair \
-             bloom_dex_wloom bloom_dex_router; do \
+    for w in bloom_petal_dex_pool bloom_petal_dex_wallet bloom_petal_dex_faucet \
+             bloom_petal_dex_cpmm bloom_petal_dex_router; do \
         cp "target/wasm32-unknown-unknown/release/${w}.wasm" "/out/wasm/${w}.wasm"; \
     done; \
     ls -la /out/bin /out/wasm
@@ -110,7 +100,6 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /out/bin/bloom      /usr/local/bin/bloom
-COPY --from=builder /out/bin/bloom-dex  /usr/local/bin/bloom-dex
 COPY --from=builder /out/wasm/          /wasm/
 
 ENTRYPOINT ["/usr/local/bin/bloom"]

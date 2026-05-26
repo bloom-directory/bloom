@@ -1,5 +1,0 @@
-error: storage tag prefix `__macro.` is reserved for macro-managed slots
- --> tests/ui/reserved_macro_prefix.rs:9:26
-  |
-9 |             field: u64 @ "__macro.foo";
-  |                          ^^^^^^^^^^^^^

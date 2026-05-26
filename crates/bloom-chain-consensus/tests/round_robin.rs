@@ -17,8 +17,7 @@ fn proposer_formula_matches_spec() {
             let expected_addr = make_addr(expected_idx as u8);
             let proposer = vs.proposer_for(height, round);
             assert_eq!(
-                proposer.address,
-                expected_addr,
+                proposer.address, expected_addr,
                 "proposer_for({height}, {round}) = idx {expected_idx}"
             );
         }
@@ -30,7 +29,9 @@ fn round_robin_cycles_through_all_validators() {
     let vs = make_validator_set_fake(4, 100);
     let height = 5u64;
     // As round advances 0,1,2,3 we cycle through all validators.
-    let seen: Vec<Address> = (0u32..4).map(|r| vs.proposer_for(height, r).address).collect();
+    let seen: Vec<Address> = (0u32..4)
+        .map(|r| vs.proposer_for(height, r).address)
+        .collect();
     // (5+0)%4=1, (5+1)%4=2, (5+2)%4=3, (5+3)%4=0
     assert_eq!(seen[0], make_addr(1));
     assert_eq!(seen[1], make_addr(2));

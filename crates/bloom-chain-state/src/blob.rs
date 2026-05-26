@@ -6,6 +6,7 @@
 //!
 //! ```text
 //! blob = header || accounts_section || storage_section || code_section
+//!      || objects_section || ownership_section || vfs_section
 //!
 //! header:
 //!   magic:       [u8; 8]  = b"BLMSTATE"
@@ -35,11 +36,30 @@
 //!     hash:      [u8; 32]
 //!     wasm_len:  u32 LE
 //!     wasm:      [u8; wasm_len]
+//!
+//! objects_section:
+//!   count: u32 LE
+//!   for each:
+//!     id:      [u8; 32]
+//!     obj_len: u32 LE
+//!     object:  canonical Object bytes
+//!
+//! ownership_section:
+//!   count: u32 LE
+//!   for each:
+//!     key:       [u8; 33]   (owner_kind || owner_id)
+//!     id_count:  u32 LE
+//!     ids:       id_count * [u8; 32]
+//!
+//! vfs_section:
+//!   count: u32 LE
+//!   for each:
+//!     path_len: u32 LE
+//!     path:     UTF-8 bytes
+//!     hash:     [u8; 32]
 //! ```
 //!
-//! The blob hash is `blake3_tagged(tags::PETAL, &blob_bytes)` — we reuse the
-//! PETAL domain for content-addressed opaque bytes (the blob itself is not wasm,
-//! but the hash is content-addressed by the same scheme).
+//! The blob hash is `blake3_tagged(STATE_BLOB_HASH_TAG, &blob_bytes)`.
 //!
 //! # `BlobStore`
 //!
@@ -49,23 +69,31 @@
 
 use std::collections::VecDeque;
 
-use bloom_chain_types::{
-    Address, Hash32,
-    digest::{blake3_tagged, tags},
-};
+use bloom_chain_types::{Address, Hash32, digest::blake3_tagged};
+use bloom_objects::{Object, ObjectId, OwnershipIndexKey};
 use ssz::Encode;
 
-use crate::{
-    account::Account,
-    error::StateError,
-    state::State,
-};
+use crate::{account::Account, error::StateError, state::State};
 
 const MAGIC: &[u8; 8] = b"BLMSTATE";
-const VERSION: u8 = 0;
+const VERSION: u8 = 1;
+pub const STATE_BLOB_HASH_TAG: &str = "bloom-chain.v0.state_blob:";
 
 /// Maximum number of blobs retained in the store (spec §6.3).
 pub const MAX_RETAINED_BLOBS: usize = 256;
+/// Maximum accepted state blob size. Matches the transport frame payload cap.
+pub const MAX_STATE_BLOB_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ACCOUNTS: usize = 1_000_000;
+const MAX_STORAGE_ADDRS: usize = 1_000_000;
+const MAX_STORAGE_SLOTS_PER_ADDR: usize = 1_000_000;
+const MAX_CODE_ENTRIES: usize = 100_000;
+const MAX_CODE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_OBJECTS: usize = 1_000_000;
+const MAX_OBJECT_BYTES: usize = 1 * 1024 * 1024;
+const MAX_OWNERSHIP_ROWS: usize = 1_000_000;
+const MAX_OWNERSHIP_IDS_PER_ROW: usize = 1_000_000;
+const MAX_VFS_ENTRIES: usize = 100_000;
+const MAX_VFS_PATH_BYTES: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // Encode helpers
@@ -99,7 +127,9 @@ fn read_u64_le(buf: &[u8], off: &mut usize) -> Result<u64, StateError> {
 
 fn read_bytes32(buf: &[u8], off: &mut usize) -> Result<[u8; 32], StateError> {
     if buf.len() < *off + 32 {
-        return Err(StateError::BlobDecode("unexpected EOF reading [u8;32]".into()));
+        return Err(StateError::BlobDecode(
+            "unexpected EOF reading [u8;32]".into(),
+        ));
     }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&buf[*off..*off + 32]);
@@ -107,11 +137,103 @@ fn read_bytes32(buf: &[u8], off: &mut usize) -> Result<[u8; 32], StateError> {
     Ok(arr)
 }
 
+fn read_exact<'a>(buf: &'a [u8], off: &mut usize, len: usize) -> Result<&'a [u8], StateError> {
+    if buf.len() < *off + len {
+        return Err(StateError::BlobDecode(format!(
+            "unexpected EOF reading {len} bytes"
+        )));
+    }
+    let out = &buf[*off..*off + len];
+    *off += len;
+    Ok(out)
+}
+
+fn remaining(buf: &[u8], off: usize) -> usize {
+    buf.len().saturating_sub(off)
+}
+
+fn read_count_le(
+    buf: &[u8],
+    off: &mut usize,
+    section: &str,
+    max_count: usize,
+    min_bytes_per_item: usize,
+) -> Result<usize, StateError> {
+    let count = read_u32_le(buf, off)? as usize;
+    if count > max_count {
+        return Err(StateError::BlobDecode(format!(
+            "{section} count {count} exceeds cap {max_count}"
+        )));
+    }
+    if min_bytes_per_item > 0 {
+        let max_possible = remaining(buf, *off) / min_bytes_per_item;
+        if count > max_possible {
+            return Err(StateError::BlobDecode(format!(
+                "{section} count {count} exceeds remaining bytes"
+            )));
+        }
+    }
+    Ok(count)
+}
+
+fn read_len_le(
+    buf: &[u8],
+    off: &mut usize,
+    section: &str,
+    max_len: usize,
+) -> Result<usize, StateError> {
+    let len = read_u32_le(buf, off)? as usize;
+    if len > max_len {
+        return Err(StateError::BlobDecode(format!(
+            "{section} length {len} exceeds cap {max_len}"
+        )));
+    }
+    if len > remaining(buf, *off) {
+        return Err(StateError::BlobDecode(format!(
+            "{section} length {len} exceeds remaining bytes"
+        )));
+    }
+    Ok(len)
+}
+
 // ---------------------------------------------------------------------------
 // State serialization
 // ---------------------------------------------------------------------------
 
 impl State {
+    /// Compute the content-addressed hash of canonical state-blob bytes.
+    pub fn blob_hash(bytes: &[u8]) -> Hash32 {
+        blake3_tagged(STATE_BLOB_HASH_TAG, bytes)
+    }
+
+    /// Read the canonical state-blob header without materializing the full state.
+    ///
+    /// Returns `(height, state_root, parent_block_hash)`.
+    pub fn blob_header(bytes: &[u8]) -> Result<(u64, Hash32, Hash32), StateError> {
+        if bytes.len() < 8 {
+            return Err(StateError::BlobDecode("blob too short for magic".into()));
+        }
+        if &bytes[0..8] != MAGIC {
+            return Err(StateError::BlobDecode("invalid magic bytes".into()));
+        }
+        let mut off = 8;
+        if bytes.len() <= off {
+            return Err(StateError::BlobDecode("blob too short for version".into()));
+        }
+        let version = bytes[off];
+        off += 1;
+        if version != VERSION {
+            return Err(StateError::BlobDecode(format!(
+                "unsupported version: {version}"
+            )));
+        }
+
+        let height = read_u64_le(bytes, &mut off)?;
+        let state_root = Hash32(read_bytes32(bytes, &mut off)?);
+        let parent_block_hash = Hash32(read_bytes32(bytes, &mut off)?);
+        Ok((height, state_root, parent_block_hash))
+    }
+
     /// Serialize the full state to a content-addressed blob.
     ///
     /// Returns `(blob_bytes, blob_hash)`.
@@ -165,35 +287,59 @@ impl State {
             buf.extend_from_slice(wasm);
         }
 
-        let hash = blake3_tagged(tags::PETAL, &buf);
+        // --- Objects section ---
+        let object_entries: Vec<_> = self.objects.iter().collect();
+        push_u32_le(&mut buf, object_entries.len() as u32);
+        for (id, obj) in &object_entries {
+            buf.extend_from_slice(&id.0);
+            let encoded = obj
+                .encode_canonical()
+                .expect("Object canonical encoding is infallible for in-state records");
+            push_u32_le(&mut buf, encoded.len() as u32);
+            buf.extend_from_slice(&encoded);
+        }
+
+        // --- Ownership section ---
+        let ownership_entries: Vec<_> = self.ownership.iter().collect();
+        push_u32_le(&mut buf, ownership_entries.len() as u32);
+        for (key, ids) in &ownership_entries {
+            buf.extend_from_slice(&key.encode());
+            let mut sorted = (*ids).clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            push_u32_le(&mut buf, sorted.len() as u32);
+            for id in sorted {
+                buf.extend_from_slice(&id.0);
+            }
+        }
+
+        // --- VFS section ---
+        let vfs_entries: Vec<_> = self.vfs.iter().collect();
+        push_u32_le(&mut buf, vfs_entries.len() as u32);
+        for (path, hash) in &vfs_entries {
+            let path_bytes = path.as_bytes();
+            push_u32_le(&mut buf, path_bytes.len() as u32);
+            buf.extend_from_slice(path_bytes);
+            buf.extend_from_slice(&hash.0);
+        }
+
+        let hash = Self::blob_hash(&buf);
         (buf, hash)
     }
 
     /// Deserialize a state blob and verify its state root.
     pub fn from_blob(bytes: &[u8], expected_state_root: Hash32) -> Result<State, StateError> {
+        if bytes.len() > MAX_STATE_BLOB_BYTES {
+            return Err(StateError::BlobDecode(format!(
+                "state blob is {} bytes, exceeds cap {}",
+                bytes.len(),
+                MAX_STATE_BLOB_BYTES
+            )));
+        }
         // --- Header ---
-        if bytes.len() < 8 {
-            return Err(StateError::BlobDecode("blob too short for magic".into()));
-        }
-        if &bytes[0..8] != MAGIC {
-            return Err(StateError::BlobDecode("invalid magic bytes".into()));
-        }
-        let mut off = 8;
+        let (_, stored_root, _) = Self::blob_header(bytes)?;
+        let mut off = 8 + 1 + 8 + 32 + 32;
 
-        if bytes.len() <= off {
-            return Err(StateError::BlobDecode("blob too short for version".into()));
-        }
-        let version = bytes[off];
-        off += 1;
-        if version != VERSION {
-            return Err(StateError::BlobDecode(format!("unsupported version: {version}")));
-        }
-
-        let _height = read_u64_le(bytes, &mut off)?;
-        let state_root_bytes = read_bytes32(bytes, &mut off)?;
-        let _parent_hash = read_bytes32(bytes, &mut off)?;
-
-        let stored_root = Hash32(state_root_bytes);
         if stored_root != expected_state_root {
             return Err(StateError::RootMismatch {
                 expected: format!("{expected_state_root}"),
@@ -204,11 +350,19 @@ impl State {
         let mut state = State::new();
 
         // --- Accounts section ---
-        let account_count = read_u32_le(bytes, &mut off)? as usize;
+        let account_count = read_count_le(
+            bytes,
+            &mut off,
+            "accounts",
+            MAX_ACCOUNTS,
+            32 + Account::SSZ_LEN,
+        )?;
         for _ in 0..account_count {
             let addr_bytes = read_bytes32(bytes, &mut off)?;
             if bytes.len() < off + Account::SSZ_LEN {
-                return Err(StateError::BlobDecode("unexpected EOF reading account".into()));
+                return Err(StateError::BlobDecode(
+                    "unexpected EOF reading account".into(),
+                ));
             }
             let account = Account::from_ssz_bytes_impl(&bytes[off..off + Account::SSZ_LEN])
                 .map_err(|e| StateError::Ssz(format!("{e:?}")))?;
@@ -217,11 +371,18 @@ impl State {
         }
 
         // --- Storage section ---
-        let addr_count = read_u32_le(bytes, &mut off)? as usize;
+        let addr_count =
+            read_count_le(bytes, &mut off, "storage addresses", MAX_STORAGE_ADDRS, 36)?;
         for _ in 0..addr_count {
             let addr_bytes = read_bytes32(bytes, &mut off)?;
             let addr = Address(addr_bytes);
-            let slot_count = read_u32_le(bytes, &mut off)? as usize;
+            let slot_count = read_count_le(
+                bytes,
+                &mut off,
+                "storage slots",
+                MAX_STORAGE_SLOTS_PER_ADDR,
+                64,
+            )?;
             for _ in 0..slot_count {
                 let key = read_bytes32(bytes, &mut off)?;
                 let val = read_bytes32(bytes, &mut off)?;
@@ -230,15 +391,71 @@ impl State {
         }
 
         // --- Code section ---
-        let code_count = read_u32_le(bytes, &mut off)? as usize;
+        let code_count = read_count_le(bytes, &mut off, "code", MAX_CODE_ENTRIES, 36)?;
         for _ in 0..code_count {
-            let _hash = read_bytes32(bytes, &mut off)?;
-            let wasm_len = read_u32_le(bytes, &mut off)? as usize;
-            if bytes.len() < off + wasm_len {
-                return Err(StateError::BlobDecode("unexpected EOF reading wasm".into()));
+            let hash = Hash32(read_bytes32(bytes, &mut off)?);
+            let wasm_len = read_len_le(bytes, &mut off, "code bytes", MAX_CODE_BYTES)?;
+            let wasm = read_exact(bytes, &mut off, wasm_len)?;
+            let inserted_hash = state.insert_code(wasm);
+            if inserted_hash != hash {
+                return Err(StateError::BlobDecode(format!(
+                    "code hash mismatch: stored={} actual={}",
+                    hash, inserted_hash
+                )));
             }
-            state.insert_code(&bytes[off..off + wasm_len]);
-            off += wasm_len;
+        }
+
+        // --- Objects section ---
+        let object_count = read_count_le(bytes, &mut off, "objects", MAX_OBJECTS, 36)?;
+        for _ in 0..object_count {
+            let id = ObjectId(read_bytes32(bytes, &mut off)?);
+            let obj_len = read_len_le(bytes, &mut off, "object bytes", MAX_OBJECT_BYTES)?;
+            let obj_bytes = read_exact(bytes, &mut off, obj_len)?;
+            let obj = Object::decode_canonical(obj_bytes)
+                .map_err(|e| StateError::BlobDecode(format!("object decode: {e}")))?;
+            if obj.id != id {
+                return Err(StateError::BlobDecode("object id/key mismatch".into()));
+            }
+            state.set_object(obj);
+        }
+
+        // --- Ownership section ---
+        let ownership_count = read_count_le(bytes, &mut off, "ownership", MAX_OWNERSHIP_ROWS, 37)?;
+        for _ in 0..ownership_count {
+            let key_bytes = read_exact(bytes, &mut off, 33)?;
+            let key = OwnershipIndexKey::decode(key_bytes)
+                .map_err(|e| StateError::BlobDecode(format!("ownership key decode: {e}")))?;
+            let id_count = read_count_le(
+                bytes,
+                &mut off,
+                "ownership ids",
+                MAX_OWNERSHIP_IDS_PER_ROW,
+                32,
+            )?;
+            let mut ids = Vec::new();
+            for _ in 0..id_count {
+                ids.push(ObjectId(read_bytes32(bytes, &mut off)?));
+            }
+            state.set_ownership(key, ids);
+        }
+
+        // --- VFS section ---
+        let vfs_count = read_count_le(bytes, &mut off, "vfs", MAX_VFS_ENTRIES, 36)?;
+        for _ in 0..vfs_count {
+            let path_len = read_len_le(bytes, &mut off, "vfs path", MAX_VFS_PATH_BYTES)?;
+            let path_bytes = read_exact(bytes, &mut off, path_len)?;
+            let path = std::str::from_utf8(path_bytes)
+                .map_err(|e| StateError::BlobDecode(format!("vfs path utf8: {e}")))?
+                .to_owned();
+            let hash = Hash32(read_bytes32(bytes, &mut off)?);
+            state.set_vfs_binding(path, hash);
+        }
+
+        if off != bytes.len() {
+            return Err(StateError::BlobDecode(format!(
+                "trailing bytes after state blob: {}",
+                bytes.len() - off
+            )));
         }
 
         // Verify that reconstructed root matches
@@ -295,8 +512,7 @@ impl BlobStore {
 
     /// Open a sled-backed blob store at the given path.
     pub fn open(path: &std::path::Path) -> Result<Self, StateError> {
-        let db = sled::open(path)
-            .map_err(|e| StateError::BlobStore(format!("sled open: {e}")))?;
+        let db = sled::open(path).map_err(|e| StateError::BlobStore(format!("sled open: {e}")))?;
 
         // Rebuild insertion order from sled (alphabetic key order ≠ insertion order,
         // so we cannot fully recover order after restart — we start fresh).

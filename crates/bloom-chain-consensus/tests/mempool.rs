@@ -13,7 +13,8 @@ use bloom_test_util::{make_addr_derived, make_mempool_tx};
 #[test]
 fn admit_valid_tx() {
     let mut mp = Mempool::new(NoopVerifier);
-    mp.admit(make_mempool_tx(1, 1, 10, 1000, 0), 0, 1_000_000).unwrap();
+    mp.admit(make_mempool_tx(1, 1, 10, 1000, 0), 0, 1_000_000)
+        .unwrap();
     assert_eq!(mp.len(), 1);
 }
 
@@ -23,22 +24,32 @@ fn accept_future_nonce() {
     // a transient state lag on the receiving validator. The proposer-side
     // `select_for_block_for` enforces strict per-sender sequential nonces.
     let mut mp = Mempool::new(NoopVerifier);
-    mp.admit(make_mempool_tx(1, 3, 10, 1000, 0), 0, 1_000_000).unwrap();
+    mp.admit(make_mempool_tx(1, 3, 10, 1000, 0), 0, 1_000_000)
+        .unwrap();
     assert_eq!(mp.len(), 1);
 }
 
 #[test]
 fn reject_wrong_nonce_too_low() {
     let mut mp = Mempool::new(NoopVerifier);
-    let err = mp.admit(make_mempool_tx(1, 0, 10, 1000, 0), 0, 1_000_000).unwrap_err();
-    assert!(matches!(err, ConsensusError::NonceMismatch { expected: 1, got: 0 }));
+    let err = mp
+        .admit(make_mempool_tx(1, 0, 10, 1000, 0), 0, 1_000_000)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ConsensusError::NonceMismatch {
+            expected: 1,
+            got: 0
+        }
+    ));
 }
 
 #[test]
 fn admit_nonce_1_for_new_account() {
     // New account has current_nonce=0, so first tx must have nonce=1.
     let mut mp = Mempool::new(NoopVerifier);
-    mp.admit(make_mempool_tx(1, 1, 10, 100, 0), 0, 100_000).unwrap();
+    mp.admit(make_mempool_tx(1, 1, 10, 100, 0), 0, 100_000)
+        .unwrap();
 }
 
 #[test]
@@ -48,7 +59,13 @@ fn reject_insufficient_balance_fee_only() {
     let err = mp
         .admit(make_mempool_tx(1, 1, 10, 1000, 0), 0, 9_999)
         .unwrap_err();
-    assert!(matches!(err, ConsensusError::InsufficientBalance { need: 10000, have: 9999 }));
+    assert!(matches!(
+        err,
+        ConsensusError::InsufficientBalance {
+            need: 10000,
+            have: 9999
+        }
+    ));
 }
 
 #[test]
@@ -58,7 +75,13 @@ fn reject_insufficient_balance_with_value() {
     let err = mp
         .admit(make_mempool_tx(1, 1, 1, 100, 500), 0, 599)
         .unwrap_err();
-    assert!(matches!(err, ConsensusError::InsufficientBalance { need: 600, have: 599 }));
+    assert!(matches!(
+        err,
+        ConsensusError::InsufficientBalance {
+            need: 600,
+            have: 599
+        }
+    ));
 }
 
 #[test]
@@ -77,8 +100,10 @@ fn reject_invalid_signature() {
 #[test]
 fn replace_by_fee_accepts_strictly_higher() {
     let mut mp = Mempool::new(NoopVerifier);
-    mp.admit(make_mempool_tx(1, 1, 10, 100, 0), 0, 1_000_000).unwrap();
-    mp.admit(make_mempool_tx(1, 1, 11, 100, 0), 0, 1_000_000).unwrap();
+    mp.admit(make_mempool_tx(1, 1, 10, 100, 0), 0, 1_000_000)
+        .unwrap();
+    mp.admit(make_mempool_tx(1, 1, 11, 100, 0), 0, 1_000_000)
+        .unwrap();
     assert_eq!(mp.len(), 1);
     // The replacement (fee=11) is stored.
     let selected = mp.select_for_block(u64::MAX);
@@ -88,7 +113,8 @@ fn replace_by_fee_accepts_strictly_higher() {
 #[test]
 fn replace_by_fee_rejects_equal_fee() {
     let mut mp = Mempool::new(NoopVerifier);
-    mp.admit(make_mempool_tx(1, 1, 10, 100, 0), 0, 1_000_000).unwrap();
+    mp.admit(make_mempool_tx(1, 1, 10, 100, 0), 0, 1_000_000)
+        .unwrap();
     let err = mp
         .admit(make_mempool_tx(1, 1, 10, 100, 0), 0, 1_000_000)
         .unwrap_err();
@@ -98,7 +124,8 @@ fn replace_by_fee_rejects_equal_fee() {
 #[test]
 fn replace_by_fee_rejects_lower_fee() {
     let mut mp = Mempool::new(NoopVerifier);
-    mp.admit(make_mempool_tx(1, 1, 10, 100, 0), 0, 1_000_000).unwrap();
+    mp.admit(make_mempool_tx(1, 1, 10, 100, 0), 0, 1_000_000)
+        .unwrap();
     let err = mp
         .admit(make_mempool_tx(1, 1, 9, 100, 0), 0, 1_000_000)
         .unwrap_err();
@@ -112,9 +139,12 @@ fn replace_by_fee_rejects_lower_fee() {
 #[test]
 fn select_ordering_fee_desc() {
     let mut mp = Mempool::new(NoopVerifier);
-    mp.admit(make_mempool_tx(1, 1, 5, 100, 0), 0, 1_000_000).unwrap();
-    mp.admit(make_mempool_tx(2, 1, 20, 100, 0), 0, 1_000_000).unwrap();
-    mp.admit(make_mempool_tx(3, 1, 10, 100, 0), 0, 1_000_000).unwrap();
+    mp.admit(make_mempool_tx(1, 1, 5, 100, 0), 0, 1_000_000)
+        .unwrap();
+    mp.admit(make_mempool_tx(2, 1, 20, 100, 0), 0, 1_000_000)
+        .unwrap();
+    mp.admit(make_mempool_tx(3, 1, 10, 100, 0), 0, 1_000_000)
+        .unwrap();
 
     let selected = mp.select_for_block(u64::MAX);
     assert_eq!(selected.len(), 3);
@@ -129,9 +159,11 @@ fn select_ordering_nonce_asc_within_same_sender_via_fuel_fill() {
     // property by checking two txs from same-fee different-sender come out deterministically.
     let mut mp = Mempool::new(NoopVerifier);
     // sender 0, nonce 1, fee 10
-    mp.admit(make_mempool_tx(0, 1, 10, 100, 0), 0, 1_000_000).unwrap();
+    mp.admit(make_mempool_tx(0, 1, 10, 100, 0), 0, 1_000_000)
+        .unwrap();
     // sender 1, nonce 1, fee 10 (same fee, nonce ordering among senders is deterministic)
-    mp.admit(make_mempool_tx(1, 1, 10, 100, 0), 0, 1_000_000).unwrap();
+    mp.admit(make_mempool_tx(1, 1, 10, 100, 0), 0, 1_000_000)
+        .unwrap();
 
     let selected = mp.select_for_block(u64::MAX);
     assert_eq!(selected.len(), 2);
@@ -145,8 +177,10 @@ fn select_ordering_nonce_asc_within_same_sender_via_fuel_fill() {
 #[test]
 fn select_respects_fuel_limit() {
     let mut mp = Mempool::new(NoopVerifier);
-    mp.admit(make_mempool_tx(1, 1, 20, 700, 0), 0, 1_000_000).unwrap();
-    mp.admit(make_mempool_tx(2, 1, 10, 700, 0), 0, 1_000_000).unwrap();
+    mp.admit(make_mempool_tx(1, 1, 20, 700, 0), 0, 1_000_000)
+        .unwrap();
+    mp.admit(make_mempool_tx(2, 1, 10, 700, 0), 0, 1_000_000)
+        .unwrap();
 
     // Fuel limit = 1000. First tx (fee=20) takes 700. Second (fee=10) would take 1400 total → skip.
     let selected = mp.select_for_block(1000);
@@ -183,23 +217,24 @@ fn remove_included_only_removes_matching_txs() {
 // ---------------------------------------------------------------------------
 // Adversarial: forged-sender admission
 // ---------------------------------------------------------------------------
+//
+// Review item #11 (2026-05-19 consensus hardening): a tx that carries a
+// validly-signed body but whose `sender` field does NOT derive from the
+// signing pubkey must be rejected at the mempool boundary.
+//
+// Pre-fix, `Mempool::admit` accepted such a tx (signature verifies fine,
+// nonce/balance checks both reference `tx.sender` rather than the derived
+// address), letting an attacker propagate a tx that claims a sender it has
+// no key for. The chain-apply path already rejected it with `sender mismatch`
+// in `consensus_driver::apply_block`, but only after gossip had already paid
+// the network cost.
+//
+// This test passes the signature check (NoopVerifier) and constructs a tx
+// whose `pubkey` would derive to address X via
+// `Address::from_pubkey_bytes`, but mutates `sender` to a different,
+// attacker-chosen address before calling `admit`. The mempool must reject
+// with `AddressMismatch`.
 
-/// Review item #11 (2026-05-19 consensus hardening): a tx that carries a
-/// validly-signed body but whose `sender` field does NOT derive from the
-/// signing pubkey must be rejected at the mempool boundary.
-///
-/// Pre-fix, `Mempool::admit` accepted such a tx (signature verifies fine,
-/// nonce/balance checks both reference `tx.sender` rather than the derived
-/// address), letting an attacker propagate a tx that claims a sender it has
-/// no key for. The chain-apply path already rejected it with `sender mismatch`
-/// in `consensus_driver::apply_block`, but only after gossip had already paid
-/// the network cost.
-///
-/// This test passes the signature check (NoopVerifier) and constructs a tx
-/// whose `pubkey` would derive to address X via
-/// `Address::from_pubkey_bytes`, but mutates `sender` to a different,
-/// attacker-chosen address before calling `admit`. The mempool must reject
-/// with `AddressMismatch`.
 // ---------------------------------------------------------------------------
 // Adversarial: per-sender nonce contiguity under fuel pressure
 // ---------------------------------------------------------------------------
@@ -223,10 +258,13 @@ fn select_for_block_keeps_per_sender_nonce_contiguity() {
     let mut mp = Mempool::new(NoopVerifier);
 
     // S: nonce 1 (low fee), nonce 2 (very high fee). Same sender.
-    mp.admit(make_mempool_tx(1, 1, 1, 1000, 0), 0, 10_000_000).unwrap();
-    mp.admit(make_mempool_tx(1, 2, 100, 1000, 0), 0, 10_000_000).unwrap();
+    mp.admit(make_mempool_tx(1, 1, 1, 1000, 0), 0, 10_000_000)
+        .unwrap();
+    mp.admit(make_mempool_tx(1, 2, 100, 1000, 0), 0, 10_000_000)
+        .unwrap();
     // T: nonce 1, medium-high fee.
-    mp.admit(make_mempool_tx(2, 1, 50, 1000, 0), 0, 10_000_000).unwrap();
+    mp.admit(make_mempool_tx(2, 1, 50, 1000, 0), 0, 10_000_000)
+        .unwrap();
 
     let s = make_addr_derived(1);
     let t = make_addr_derived(2);
@@ -251,7 +289,10 @@ fn select_for_block_keeps_per_sender_nonce_contiguity() {
     // must include (S, 1) — without it neither (S, 2) nor any other S tx
     // could ride. Either (T, 1) or (S, 2) is the second slot; both are valid.
     assert_eq!(selected.len(), 2, "expected two txs to fit the fuel budget");
-    assert!(s1.is_some(), "(S, 1) must be included as a contiguity anchor");
+    assert!(
+        s1.is_some(),
+        "(S, 1) must be included as a contiguity anchor"
+    );
     let has_t1 = selected.iter().any(|tx| tx.sender == t && tx.nonce == 1);
     assert!(
         has_t1 || s2.is_some(),
@@ -268,9 +309,12 @@ fn select_for_block_keeps_per_sender_nonce_contiguity() {
 fn select_for_block_under_tight_fuel_never_skips_predecessor() {
     let mut mp = Mempool::new(NoopVerifier);
 
-    mp.admit(make_mempool_tx(1, 1, 1, 1000, 0), 0, 10_000_000).unwrap();
-    mp.admit(make_mempool_tx(1, 2, 100, 1000, 0), 0, 10_000_000).unwrap();
-    mp.admit(make_mempool_tx(2, 1, 50, 1000, 0), 0, 10_000_000).unwrap();
+    mp.admit(make_mempool_tx(1, 1, 1, 1000, 0), 0, 10_000_000)
+        .unwrap();
+    mp.admit(make_mempool_tx(1, 2, 100, 1000, 0), 0, 10_000_000)
+        .unwrap();
+    mp.admit(make_mempool_tx(2, 1, 50, 1000, 0), 0, 10_000_000)
+        .unwrap();
 
     let s = make_addr_derived(1);
     let t = make_addr_derived(2);
@@ -288,7 +332,7 @@ fn select_for_block_under_tight_fuel_never_skips_predecessor() {
     // The valid picks here are (S, 1) [fee 1] or (T, 1) [fee 50]. Either is
     // legal per-block; given fee priority among eligible heads, expect (T, 1).
     assert!(
-        (tx.sender == t && tx.nonce == 1) || (tx.sender == s && tx.nonce == 1),
+        (tx.sender == t || tx.sender == s) && tx.nonce == 1,
         "expected an eligible nonce-1 head, got sender={:?} nonce={}",
         tx.sender,
         tx.nonce

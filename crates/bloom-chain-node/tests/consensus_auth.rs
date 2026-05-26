@@ -45,7 +45,7 @@ fn signed_vote_verifies_against_validator_set() {
     vote.sig = signer.sign(&digest.0);
 
     assert!(
-        verify_vote_sig(&vote, &vset, &XdsaVerifier::default()),
+        verify_vote_sig(&vote, &vset, &XdsaVerifier),
         "a vote signed with the validator's xDSA key must verify"
     );
 }
@@ -68,7 +68,7 @@ fn signed_proposal_verifies_against_validator_set() {
     proposal.sig = signer.sign(&digest.0);
 
     assert!(
-        verify_proposal_sig(&proposal, &vset, &XdsaVerifier::default()),
+        verify_proposal_sig(&proposal, &vset, &XdsaVerifier),
         "a proposal signed with the proposer's xDSA key must verify"
     );
 }
@@ -93,7 +93,7 @@ fn forged_vote_signature_rejected() {
     // Flip a byte in the signature — must invalidate it.
     vote.sig.0[5] ^= 0xFF;
     assert!(
-        !verify_vote_sig(&vote, &vset, &XdsaVerifier::default()),
+        !verify_vote_sig(&vote, &vset, &XdsaVerifier),
         "a vote with a tampered signature must NOT verify"
     );
 }
@@ -117,7 +117,7 @@ fn forged_proposal_signature_rejected() {
     proposal.sig.0[100] ^= 0xFF;
 
     assert!(
-        !verify_proposal_sig(&proposal, &vset, &XdsaVerifier::default()),
+        !verify_proposal_sig(&proposal, &vset, &XdsaVerifier),
         "a proposal with a tampered signature must NOT verify"
     );
 }
@@ -137,7 +137,7 @@ fn empty_vote_signature_rejected() {
         sig: SigBytes(vec![]),
     };
     assert!(
-        !verify_vote_sig(&vote, &vset, &XdsaVerifier::default()),
+        !verify_vote_sig(&vote, &vset, &XdsaVerifier),
         "the pre-2026-05-19 empty-sig vote must be rejected by the ingress \
          check"
     );
@@ -164,7 +164,7 @@ fn vote_signed_by_a_different_validators_key_is_rejected() {
     forged.sig = bob_signer.sign(&digest.0); // ...but signed by Bob.
 
     assert!(
-        !verify_vote_sig(&forged, &vset, &XdsaVerifier::default()),
+        !verify_vote_sig(&forged, &vset, &XdsaVerifier),
         "a vote claiming to be from validator A but signed with B's key must \
          be rejected"
     );
@@ -191,7 +191,7 @@ fn vote_from_unknown_validator_is_rejected() {
     vote.sig = signer.sign(&digest.0);
 
     assert!(
-        !verify_vote_sig(&vote, &vset, &XdsaVerifier::default()),
+        !verify_vote_sig(&vote, &vset, &XdsaVerifier),
         "a vote from an address not in the validator set must be rejected, \
          even with a self-consistent signature"
     );
@@ -203,8 +203,8 @@ fn engine_emits_signed_votes_when_signer_is_set() {
     // and assert that prevote carries a real signature (not the empty bytes
     // emitted on master).
     use bloom_chain_consensus::{
-        state_machine::{Action, Event, ProposalOrVote, TimeoutKind},
         ConsensusEngine,
+        state_machine::{Action, Event, ProposalOrVote, TimeoutKind},
     };
 
     let v = make_validator_with_keypair();
@@ -215,7 +215,7 @@ fn engine_emits_signed_votes_when_signer_is_set() {
         1,
         v.addr,
         vset.clone(),
-        XdsaVerifier::default(),
+        XdsaVerifier,
         None,
         30_000_000,
         Some(signer),
@@ -235,7 +235,7 @@ fn engine_emits_signed_votes_when_signer_is_set() {
         "engine with a Signer must NOT emit empty-sig votes (master regression)"
     );
     assert!(
-        verify_vote_sig(&prevote, &vset, &XdsaVerifier::default()),
+        verify_vote_sig(&prevote, &vset, &XdsaVerifier),
         "engine-emitted votes must verify under the same validator set"
     );
 }

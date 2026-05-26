@@ -15,14 +15,20 @@
 //! restarted node's state is byte-identical to a node that never
 //! restarted.
 
-use bloom_chain_node::consensus_driver::{apply_block_state_transitions, NoopExecutor};
+use bloom_chain_consensus::{ValidatorSet, validator_set::Validator};
+use bloom_chain_node::consensus_driver::{NoopExecutor, apply_block_state_transitions};
+use bloom_chain_node::{
+    block_store::BlockStore, genesis::Genesis, node::restore_state_from_storage,
+    state_blob::StateBlobStore, state_index::StateIndex,
+};
+use bloom_chain_state::Account;
 use bloom_chain_state::State;
 use bloom_chain_types::{
     block::Block,
     tx::{Tx, TxKind},
     types::{Address, Hash32, PubKeyBytes, SigBytes},
 };
-use bloom_test_util::{make_addr, BlockBuilder};
+use bloom_test_util::{BlockBuilder, make_addr};
 
 const BLOCK_EMISSION: u128 = 10_000_000_000_000_000_000u128;
 
@@ -51,10 +57,37 @@ fn make_transfer_tx(
 fn make_block(height: u64, proposer: Address, txs: Vec<Tx>) -> Block {
     // Replay doesn't validate block roots; use the BlockBuilder default
     // sentinel roots (0xAA/0xBB/0xCC/0xDD).
-    BlockBuilder::at(height)
-        .proposer(proposer)
-        .txs(txs)
-        .build()
+    BlockBuilder::at(height).proposer(proposer).txs(txs).build()
+}
+
+fn make_genesis() -> Genesis {
+    let validator = Validator {
+        address: make_addr(0xAA),
+        pubkey: PubKeyBytes(vec![0u8; 1984]),
+        voting_power: 1,
+    };
+    Genesis {
+        chain_id: "bloom-chain.v0".to_string(),
+        genesis_time_ms: 0,
+        validator_set: ValidatorSet::new(vec![validator]).unwrap(),
+        peer_addrs: vec![],
+        allocations: vec![],
+        petals: vec![],
+        genesis_hash: Hash32([0x42; 32]),
+    }
+}
+
+fn persist_checkpoint(
+    state: &State,
+    height: u64,
+    blob_store: &StateBlobStore,
+    state_index: &StateIndex,
+) {
+    let root = state.state_root();
+    let (blob, expected_hash) = state.to_blob(height, Hash32([height as u8; 32]));
+    let stored_hash = blob_store.put(&blob).unwrap();
+    assert_eq!(stored_hash, expected_hash);
+    state_index.put(height, &root, &stored_hash).unwrap();
 }
 
 #[test]
@@ -91,7 +124,13 @@ fn replay_reproduces_full_transfer_chain() {
     let block1 = make_block(
         1,
         proposer,
-        vec![make_transfer_tx(sender, pk_bytes.clone(), recipient, 100, 1)],
+        vec![make_transfer_tx(
+            sender,
+            pk_bytes.clone(),
+            recipient,
+            100,
+            1,
+        )],
     );
     // Block 2: sender → recipient transfer of 50.
     let block2 = make_block(
@@ -144,7 +183,10 @@ fn replay_reproduces_full_transfer_chain() {
         "sender loom must match after replay (master bug: transfers dropped)"
     );
     assert_eq!(
-        replayed.get_account(&recipient).map(|a| a.loom).unwrap_or(0),
+        replayed
+            .get_account(&recipient)
+            .map(|a| a.loom)
+            .unwrap_or(0),
         live_recipient_loom,
         "recipient loom must match after replay (master bug: transfers dropped)"
     );
@@ -213,15 +255,16 @@ fn master_style_replay_diverges() {
             },
         );
     }
-    let mut prop_acct = master_replayed
-        .get_account(&proposer)
-        .unwrap_or(bloom_chain_state::Account {
-            nonce: 0,
-            loom: 0,
-            code_hash: None,
-            storage_root: Hash32([0u8; 32]),
-            manifest_hash: None,
-        });
+    let mut prop_acct =
+        master_replayed
+            .get_account(&proposer)
+            .unwrap_or(bloom_chain_state::Account {
+                nonce: 0,
+                loom: 0,
+                code_hash: None,
+                storage_root: Hash32([0u8; 32]),
+                manifest_hash: None,
+            });
     prop_acct.loom += BLOCK_EMISSION;
     master_replayed.set_account(proposer, prop_acct);
 
@@ -231,4 +274,141 @@ fn master_style_replay_diverges() {
         "master-style replay (emission-only) MUST diverge from live state — \
          the recipient never sees the transfer and the sender's nonce stays at 0"
     );
+}
+
+#[test]
+fn restore_uses_latest_checkpoint_and_replays_suffix_after_pruning() {
+    let temp = tempfile::tempdir().unwrap();
+    let blocks = BlockStore::open(&temp.path().join("blocks")).unwrap();
+    let blobs = StateBlobStore::open(&temp.path().join("state_blobs")).unwrap();
+    let index = StateIndex::open(&temp.path().join("state_index.sqlite")).unwrap();
+
+    let proposer = make_addr(0x77);
+    let executor = NoopExecutor;
+    let mut live = State::new();
+    live.set_account(
+        make_addr(0x10),
+        Account {
+            nonce: 1,
+            loom: 123,
+            code_hash: None,
+            storage_root: Hash32([0u8; 32]),
+            manifest_hash: None,
+        },
+    );
+
+    let checkpoint_height = 260;
+    let latest_height = 520;
+    for h in 1..=latest_height {
+        let mut block = make_block(h, proposer, vec![]);
+        apply_block_state_transitions(&mut live, &executor, &block, BLOCK_EMISSION);
+        block.header.state_root = live.state_root();
+        blocks.put(h, &block).unwrap();
+        if h == checkpoint_height {
+            persist_checkpoint(&live, h, &blobs, &index);
+        }
+    }
+    blocks.prune(latest_height).unwrap();
+    assert!(
+        blocks.get(1).unwrap().is_none(),
+        "old pre-checkpoint blocks should be pruned"
+    );
+
+    let (restored, restored_height) = restore_state_from_storage(
+        &make_genesis(),
+        &blocks,
+        &blobs,
+        &index,
+        &executor,
+        BLOCK_EMISSION,
+    )
+    .unwrap();
+
+    assert_eq!(restored_height, latest_height);
+    assert_eq!(restored.state_root(), live.state_root());
+    assert_eq!(
+        restored.get_account(&proposer).map(|a| a.loom),
+        live.get_account(&proposer).map(|a| a.loom)
+    );
+}
+
+#[test]
+fn restore_fails_when_required_suffix_block_is_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let blocks = BlockStore::open(&temp.path().join("blocks")).unwrap();
+    let blobs = StateBlobStore::open(&temp.path().join("state_blobs")).unwrap();
+    let index = StateIndex::open(&temp.path().join("state_index.sqlite")).unwrap();
+
+    let proposer = make_addr(0x77);
+    let executor = NoopExecutor;
+    let mut checkpoint_state = State::new();
+    let mut block1 = make_block(1, proposer, vec![]);
+    apply_block_state_transitions(&mut checkpoint_state, &executor, &block1, BLOCK_EMISSION);
+    block1.header.state_root = checkpoint_state.state_root();
+    blocks.put(1, &block1).unwrap();
+    persist_checkpoint(&checkpoint_state, 1, &blobs, &index);
+
+    // Height 3 exists, so latest_height is 3, but height 2 is required and
+    // missing. Restore must fail instead of silently skipping it.
+    blocks.put(3, &make_block(3, proposer, vec![])).unwrap();
+
+    let err = restore_state_from_storage(
+        &make_genesis(),
+        &blocks,
+        &blobs,
+        &index,
+        &executor,
+        BLOCK_EMISSION,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("required replay block missing"),
+        "unexpected error: {err:#}"
+    );
+}
+
+#[test]
+fn restore_falls_back_when_latest_checkpoint_block_is_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let blocks = BlockStore::open(&temp.path().join("blocks")).unwrap();
+    let blobs = StateBlobStore::open(&temp.path().join("state_blobs")).unwrap();
+    let index = StateIndex::open(&temp.path().join("state_index.sqlite")).unwrap();
+
+    let proposer = make_addr(0x77);
+    let executor = NoopExecutor;
+    let mut live = State::new();
+
+    let mut block1 = make_block(1, proposer, vec![]);
+    apply_block_state_transitions(&mut live, &executor, &block1, BLOCK_EMISSION);
+    block1.header.state_root = live.state_root();
+    blocks.put(1, &block1).unwrap();
+    persist_checkpoint(&live, 1, &blobs, &index);
+
+    let mut block2 = make_block(2, proposer, vec![]);
+    apply_block_state_transitions(&mut live, &executor, &block2, BLOCK_EMISSION);
+    block2.header.state_root = live.state_root();
+    blocks.put(2, &block2).unwrap();
+
+    let mut indexed_but_missing_block_state = live.clone();
+    let block3 = make_block(3, proposer, vec![]);
+    apply_block_state_transitions(
+        &mut indexed_but_missing_block_state,
+        &executor,
+        &block3,
+        BLOCK_EMISSION,
+    );
+    persist_checkpoint(&indexed_but_missing_block_state, 3, &blobs, &index);
+
+    let (restored, restored_height) = restore_state_from_storage(
+        &make_genesis(),
+        &blocks,
+        &blobs,
+        &index,
+        &executor,
+        BLOCK_EMISSION,
+    )
+    .unwrap();
+
+    assert_eq!(restored_height, 2);
+    assert_eq!(restored.state_root(), live.state_root());
 }

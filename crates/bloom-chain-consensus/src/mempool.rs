@@ -285,8 +285,7 @@ impl<V: SigVerifier> Mempool<V> {
 fn tx_value(tx: &Tx) -> u128 {
     match &tx.kind {
         TxKind::Transfer { amount_loom, .. } => *amount_loom,
-        TxKind::Call { value_loom, .. } => *value_loom,
-        TxKind::Deploy { .. } => 0,
+        TxKind::SubmitPtb { .. } | TxKind::DeployPetal { .. } => 0,
     }
 }
 
@@ -340,7 +339,13 @@ mod tests {
         let mut mp = Mempool::new(NoopVerifier);
         // current_nonce=2 means tx with nonce 1 (or 2) is stale — already on-chain.
         let err = mp.admit(make_tx(1, 2, 10, 1000), 2, 1_000_000).unwrap_err();
-        assert!(matches!(err, ConsensusError::NonceMismatch { expected: 3, got: 2 }));
+        assert!(matches!(
+            err,
+            ConsensusError::NonceMismatch {
+                expected: 3,
+                got: 2
+            }
+        ));
     }
 
     #[test]

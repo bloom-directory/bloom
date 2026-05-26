@@ -1,4 +1,4 @@
-//! Chain-owned canonical ABI.
+//! Chain-owned canonical byte codec.
 //!
 //! This crate is the single source of truth for how data crosses the
 //! bloom-chain calldata / return / event boundary. Petals (guest contracts)
@@ -14,21 +14,22 @@
 //! - `bool` — 1 byte (0 or 1)
 //! - `Vec<Address>` — 2-byte big-endian length prefix + length * 32 bytes
 //!
-//! Method selectors are the first 4 bytes of `blake3(method_string)`. Event
-//! topic prefixes use the same rule on the event signature.
+//! Selector and topic helpers remain as low-level hashing utilities for code
+//! that needs deterministic labels, but selector-based contract dispatch is
+//! not a canonical Bloom contract surface.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
-pub mod u256;
-pub mod encode;
 pub mod decode;
-pub mod dyn_codec;
 pub mod dispatch;
-pub mod selector;
+pub mod dyn_codec;
+pub mod encode;
 pub mod event;
+pub mod selector;
 pub mod storage;
+pub mod u256;
 
 pub use decode::{AbiError, Buf};
 pub use dispatch::DispatchError;
@@ -37,10 +38,6 @@ pub use encode::{AbiEncodeError, Encoder};
 pub use event::{event_signature_topic, event_topic};
 pub use selector::selector;
 pub use u256::U256;
-
-// Re-export the proc-macro under the chain-abi namespace so consumers write
-// `bloom_chain_abi::contract! { ... }`.
-pub use bloom_chain_abi_macros::contract;
 
 #[doc(hidden)]
 pub mod __private {

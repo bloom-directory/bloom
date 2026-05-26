@@ -399,8 +399,8 @@ impl IpcServer {
             "mode": meta.mode_str(),
         });
         if let Some(a) = att {
-            body["attestation"] = serde_json::to_value(&a)
-                .map_err(|e| PetalError::Serde(e.to_string()))?;
+            body["attestation"] =
+                serde_json::to_value(&a).map_err(|e| PetalError::Serde(e.to_string()))?;
         }
         Ok(body)
     }
@@ -480,7 +480,8 @@ impl IpcServer {
             .and_then(|v| v.as_str())
             .ok_or_else(|| PetalError::vm("missing 'name_or_hash'"))?;
         let stdin = if let Some(s) = params.get("stdin_b64").and_then(|v| v.as_str()) {
-            B64.decode(s).map_err(|e| PetalError::vm(format!("stdin_b64: {e}")))?
+            B64.decode(s)
+                .map_err(|e| PetalError::vm(format!("stdin_b64: {e}")))?
         } else if let Some(s) = params.get("input").and_then(|v| v.as_str()) {
             s.as_bytes().to_vec()
         } else {
@@ -568,12 +569,20 @@ fn map_petal_err(id: Value, e: PetalError) -> Response {
             -32602,
             format!("mode/cap mismatch: mode={mode} disallows cap={cap}"),
         ),
+        PetalError::CapMismatch => (
+            -32602,
+            "cap mismatch: petal already installed with different capabilities".to_string(),
+        ),
         PetalError::ModeConflict { existing } => (
             -32008,
             format!("mode conflict: petal already installed as {existing}; uninstall first"),
         ),
         PetalError::ModeUnsupported(s) => (-32009, format!("mode unsupported: {s}")),
         PetalError::ChainCall(s) => (-32010, format!("chain call: {s}")),
+        PetalError::ChainCallTrap { detail, fuel_used } => (
+            -32010,
+            format!("chain call trapped after {fuel_used} fuel: {detail}"),
+        ),
     };
     debug!(code, message = %msg, "ipc.petal_err");
     Response::err(id, code, msg)
@@ -647,7 +656,10 @@ mod tests {
 
     fn vfs() -> Vfs {
         Vfs::builder()
-            .mount("stub", Arc::new(SingleFileHandler::new("greet", b"hi\n".to_vec())))
+            .mount(
+                "stub",
+                Arc::new(SingleFileHandler::new("greet", b"hi\n".to_vec())),
+            )
             .build()
     }
 

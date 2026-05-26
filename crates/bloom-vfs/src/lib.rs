@@ -20,10 +20,14 @@
 pub mod cache;
 pub mod handler;
 pub mod handlers;
+pub mod paginate;
 pub mod path;
 pub mod router;
+pub mod tx_handler;
 
 pub use cache::PathCache;
 pub use handler::{Entry, EntryKind, Handler, HandlerError};
+pub use paginate::{PAGE_SIZE, Projection, page_indices, page_name, page_slice, parse_page_name};
 pub use path::{PercentDecodeError, VfsPath, percent_decode_segment};
 pub use router::Vfs;
+pub use tx_handler::TxHandler;

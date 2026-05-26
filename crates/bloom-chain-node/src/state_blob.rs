@@ -1,19 +1,29 @@
 //! Content-addressed state-blob store.
 //!
 //! Blobs live at `<bloom_home>/chain/state_blobs/<hex_hash>`.
-//! Each blob is the SSZ serialisation of the full state trie at a given height.
-//! Blobs are named by their BLAKE3 hash (content-addressed).
+//! Each blob is the canonical `bloom_chain_state::State::to_blob` encoding of
+//! the full state at a given height. Blobs are named by their domain-separated
+//! state-blob hash (content-addressed).
 //!
 //! The node pins the last 256 state blobs; older ones are GC'd (spec §6.3).
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use bloom_chain_state::State;
 use bloom_chain_types::types::Hash32;
 use tracing::debug;
 
 /// Number of state blobs to retain (spec §6.3).
 const BLOB_RETENTION: usize = 256;
+
+fn blob_retention() -> usize {
+    std::env::var("BLOOM_STATE_BLOB_RETENTION")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(BLOB_RETENTION)
+}
 
 /// Content-addressed blob store.
 pub struct StateBlobStore {
@@ -25,24 +35,26 @@ impl StateBlobStore {
     pub fn open(root: &Path) -> Result<Self> {
         std::fs::create_dir_all(root)
             .with_context(|| format!("create state_blobs dir: {}", root.display()))?;
-        Ok(StateBlobStore { root: root.to_path_buf() })
+        Ok(StateBlobStore {
+            root: root.to_path_buf(),
+        })
     }
 
     fn path_for(&self, hash: &Hash32) -> PathBuf {
-        self.root.join(hex::encode(&hash.0))
+        self.root.join(hex::encode(hash.0))
     }
 
     /// Store a blob, keyed by its BLAKE3 hash.
     ///
     /// Returns the hash of the stored data.
     pub fn put(&self, data: &[u8]) -> Result<Hash32> {
-        let hash_bytes = *blake3::hash(data).as_bytes();
-        let hash = Hash32(hash_bytes);
+        let hash = State::blob_hash(data);
         let path = self.path_for(&hash);
         if !path.exists() {
-            std::fs::write(&path, data)
-                .with_context(|| format!("write state blob {}", hex::encode(hash_bytes)))?;
-            debug!(hash = %hex::encode(hash_bytes), bytes = data.len(), "state_blob.put");
+            let tmp_path = self.root.join(format!(".{}.tmp", hex::encode(hash.0)));
+            write_atomic(&tmp_path, &path, data)
+                .with_context(|| format!("write state blob {}", hex::encode(hash.0)))?;
+            debug!(hash = %hex::encode(hash.0), bytes = data.len(), "state_blob.put");
         }
         Ok(hash)
     }
@@ -53,7 +65,7 @@ impl StateBlobStore {
         match std::fs::read(&path) {
             Ok(data) => Ok(Some(data)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("read blob {}", hex::encode(&hash.0))),
+            Err(e) => Err(e).with_context(|| format!("read blob {}", hex::encode(hash.0))),
         }
     }
 
@@ -68,7 +80,7 @@ impl StateBlobStore {
     /// keeps the `BLOB_RETENTION` most recently modified files.
     pub fn gc(&self, pinned: &[Hash32]) -> Result<()> {
         let pinned_set: std::collections::HashSet<String> =
-            pinned.iter().map(|h| hex::encode(&h.0)).collect();
+            pinned.iter().map(|h| hex::encode(h.0)).collect();
 
         // Collect all blob files with their modification time.
         let mut entries: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
@@ -81,15 +93,16 @@ impl StateBlobStore {
             }
         }
 
-        if entries.len() <= BLOB_RETENTION {
+        let retention = blob_retention();
+        if entries.len() <= retention {
             return Ok(());
         }
 
         // Sort newest first.
-        entries.sort_by(|a, b| b.0.cmp(&a.0));
+        entries.sort_by_key(|b| std::cmp::Reverse(b.0));
 
         // Remove files beyond retention, unless pinned.
-        for (_, path) in entries.into_iter().skip(BLOB_RETENTION) {
+        for (_, path) in entries.into_iter().skip(retention) {
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -103,4 +116,29 @@ impl StateBlobStore {
         }
         Ok(())
     }
+}
+
+fn write_atomic(tmp_path: &Path, final_path: &Path, bytes: &[u8]) -> Result<()> {
+    {
+        let mut file = std::fs::File::create(tmp_path)
+            .with_context(|| format!("create temp file {}", tmp_path.display()))?;
+        use std::io::Write;
+        file.write_all(bytes)
+            .with_context(|| format!("write temp file {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync temp file {}", tmp_path.display()))?;
+    }
+    std::fs::rename(tmp_path, final_path).with_context(|| {
+        format!(
+            "rename temp file {} -> {}",
+            tmp_path.display(),
+            final_path.display()
+        )
+    })?;
+    if let Some(parent) = final_path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }

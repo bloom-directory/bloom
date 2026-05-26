@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
 
@@ -78,7 +78,10 @@ impl Drop for ChainNodeGuard {
 /// `config.toml`.
 ///
 /// Returns once the UDS RPC socket exists, or after `boot_timeout`.
-pub async fn spawn_validator(cfg: ChainNodeConfig, boot_timeout: Duration) -> Result<ChainNodeGuard> {
+pub async fn spawn_validator(
+    cfg: ChainNodeConfig,
+    boot_timeout: Duration,
+) -> Result<ChainNodeGuard> {
     let bin = bloom_bin();
     let rpc_sock = cfg.home.join("chain/rpc.sock");
 
@@ -90,16 +93,19 @@ pub async fn spawn_validator(cfg: ChainNodeConfig, boot_timeout: Duration) -> Re
         .with_context(|| format!("create {}", stderr_log.display()))?;
 
     let mut cmd = Command::new(&bin);
-    cmd.env("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()))
-        .arg("--home")
-        .arg(&cfg.home)
-        .arg("chain")
-        .arg("run-validator")
-        .arg("--config")
-        .arg(&cfg.config)
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .kill_on_drop(true);
+    cmd.env(
+        "RUST_LOG",
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()),
+    )
+    .arg("--home")
+    .arg(&cfg.home)
+    .arg("chain")
+    .arg("run-validator")
+    .arg("--config")
+    .arg(&cfg.config)
+    .stdout(Stdio::from(stdout_file))
+    .stderr(Stdio::from(stderr_file))
+    .kill_on_drop(true);
 
     let child = cmd
         .spawn()
@@ -113,9 +119,12 @@ pub async fn spawn_validator(cfg: ChainNodeConfig, boot_timeout: Duration) -> Re
             sleep(Duration::from_millis(100)).await;
         }
     };
-    timeout(boot_timeout, wait)
-        .await
-        .map_err(|_| anyhow!("validator at {} did not produce rpc.sock within timeout", cfg.home.display()))??;
+    timeout(boot_timeout, wait).await.map_err(|_| {
+        anyhow!(
+            "validator at {} did not produce rpc.sock within timeout",
+            cfg.home.display()
+        )
+    })??;
 
     Ok(ChainNodeGuard {
         child: Some(child),

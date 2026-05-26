@@ -7,13 +7,8 @@
 //! prevote → precommit → commit and assert they all reach the same block hash.
 
 use bloom_chain_consensus::state_machine::Action;
-use bloom_chain_types::{
-    types::SigBytes,
-    vote::Proposal,
-};
-use bloom_test_util::{
-    make_addr, make_validator_set_fake, BlockBuilder, MultiValidatorMailbox,
-};
+use bloom_chain_types::{types::SigBytes, vote::Proposal};
+use bloom_test_util::{BlockBuilder, MultiValidatorMailbox, make_addr, make_validator_set_fake};
 
 #[test]
 fn four_validators_reach_same_commit() {
@@ -50,7 +45,9 @@ fn four_validators_reach_same_commit() {
     // All 4 should have prevoted the block hash.
     assert_eq!(all_prevotes.len(), 4, "all 4 should have prevoted");
     assert!(
-        all_prevotes.iter().all(|v| v.block_hash == Some(block_hash)),
+        all_prevotes
+            .iter()
+            .all(|v| v.block_hash == Some(block_hash)),
         "all prevotes should be for the proposed block"
     );
 

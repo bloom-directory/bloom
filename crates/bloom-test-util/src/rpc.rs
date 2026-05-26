@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use tokio::time::{sleep, timeout};
 
 /// Block until the file at `path` exists (typically a UDS socket created
@@ -24,9 +24,13 @@ pub async fn wait_for_socket(path: &Path, deadline: Duration) -> Result<()> {
             sleep(Duration::from_millis(50)).await;
         }
     };
-    timeout(deadline, fut)
-        .await
-        .map_err(|_| anyhow!("socket {} did not appear within {:?}", path.display(), deadline))??;
+    timeout(deadline, fut).await.map_err(|_| {
+        anyhow!(
+            "socket {} did not appear within {:?}",
+            path.display(),
+            deadline
+        )
+    })??;
     Ok(())
 }
 
@@ -45,7 +49,9 @@ mod tests {
             sleep(Duration::from_millis(80)).await;
             fs::write(&p2, b"").await.unwrap();
         });
-        wait_for_socket(&path, Duration::from_secs(2)).await.unwrap();
+        wait_for_socket(&path, Duration::from_secs(2))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

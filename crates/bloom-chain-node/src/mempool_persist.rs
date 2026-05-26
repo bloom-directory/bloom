@@ -9,8 +9,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use bloom_chain_types::{tx::Tx, types::Address};
 use bloom_chain_types::ssz::{Decode, Encode};
+use bloom_chain_types::{tx::Tx, types::Address};
 use tracing::debug;
 
 /// Sled-backed store for pending txs.
@@ -21,8 +21,8 @@ pub struct MempoolPersist {
 impl MempoolPersist {
     /// Open (or create) the sled database at `path`.
     pub fn open(path: &Path) -> Result<Self> {
-        let db = sled::open(path)
-            .with_context(|| format!("open mempool.sled: {}", path.display()))?;
+        let db =
+            sled::open(path).with_context(|| format!("open mempool.sled: {}", path.display()))?;
         Ok(MempoolPersist { db })
     }
 
@@ -37,10 +37,8 @@ impl MempoolPersist {
     pub fn put(&self, tx: &Tx) -> Result<()> {
         let key = Self::key(&tx.sender, tx.nonce);
         let val = tx.as_ssz_bytes();
-        self.db
-            .insert(&key, val)
-            .context("mempool_persist.put")?;
-        debug!(sender = %hex::encode(&tx.sender.0), nonce = tx.nonce, "mempool_persist.put");
+        self.db.insert(&key, val).context("mempool_persist.put")?;
+        debug!(sender = %hex::encode(tx.sender.0), nonce = tx.nonce, "mempool_persist.put");
         Ok(())
     }
 

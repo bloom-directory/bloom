@@ -139,6 +139,7 @@ fn mul_be(a: &[u8; 32], b: &[u8; 32]) -> Option<[u8; 32]> {
     Some(result)
 }
 
+#[allow(clippy::needless_range_loop)]
 fn divmod_be(a: &[u8; 32], b: &[u8; 32]) -> Option<([u8; 32], [u8; 32])> {
     if b == &[0u8; 32] {
         return None;
@@ -218,6 +219,7 @@ impl U256 {
 
     /// Integer square root via Babylonian iteration. Always succeeds (returns
     /// 0 for 0). Result satisfies `sqrt^2 <= self < (sqrt+1)^2`.
+    #[allow(clippy::needless_range_loop)]
     pub fn sqrt(self) -> Self {
         if self.is_zero() {
             return U256::ZERO;
@@ -433,7 +435,10 @@ mod tests {
         let zero = U256::ZERO;
         let one = U256::from_u64(1);
         assert_eq!(zero.saturating_sub(one), U256::ZERO);
-        assert_eq!(U256::from_u64(5).saturating_sub(U256::from_u64(2)), U256::from_u64(3));
+        assert_eq!(
+            U256::from_u64(5).saturating_sub(U256::from_u64(2)),
+            U256::from_u64(3)
+        );
     }
 
     #[test]
