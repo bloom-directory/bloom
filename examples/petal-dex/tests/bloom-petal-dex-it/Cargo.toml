@@ -28,7 +28,7 @@ bloom-vfs            = { path = "../../../../crates/bloom-vfs" }
 blake3               = "1"
 anyhow               = "1"
 wat                  = "1"
-ed25519-dalek        = { workspace = true }
+base64               = { workspace = true }
 hex                  = { workspace = true }
 
 [dev-dependencies]

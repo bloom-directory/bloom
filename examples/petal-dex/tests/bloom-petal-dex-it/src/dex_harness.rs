@@ -381,31 +381,32 @@ pub fn build_router_wasm() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Live-chain inner-PTB Ed25519 signer (used by `docker_petal_dex.rs`).
+// Live-chain inner-PTB xDSA signer (used by `docker_petal_dex.rs`).
 //
 // On a live 4-validator network the inner PTB is verified with the production
-// `Ed25519PtbVerifier`, so the docker driver must Ed25519-sign each PTB over
-// `ptb.signing_digest()`. The signer must be DETERMINISTIC so the
-// genesis-allocation edit (a shell step that needs the pubkey hex up front)
-// and this Rust driver (which signs with the secret) agree on the same key.
-//
-// IMPORTANT: `ptb_signer_pubkey_hex()` is hardcoded as `PTB_SIGNER_PK_HEX` in
-// `scripts/test-docker-petal-dex.sh`. If you change `PTB_SIGNER_SEED`, run the
-// `prints_ptb_signer_pubkey_hex` test (below) and update the script constant.
+// xDSA verifier, so the docker driver must xDSA-sign each PTB over
+// `ptb.signing_digest()`. The signer is deterministic so the genesis
+// allocation and key-registry entry agree with this Rust driver.
 // ---------------------------------------------------------------------------
 
-/// Fixed 32-byte seed for the inner-PTB Ed25519 signer. Deterministic so the
-/// genesis edit and the driver agree on the gas-payer address.
-pub const PTB_SIGNER_SEED: [u8; 32] = *b"bloom-petal-dex-it.ptb-signer.v0";
+/// Fixed 64-byte xDSA secret-key bytes (`mldsa_seed || ed25519_seed`) for the
+/// inner-PTB signer. Test-only; never use this key outside the docker harness.
+pub const PTB_SIGNER_SECRET_BYTES: [u8; 64] = [0x42; 64];
 
-/// The deterministic Ed25519 signing key for inner PTBs.
-pub fn ptb_signer_keypair() -> ed25519_dalek::SigningKey {
-    ed25519_dalek::SigningKey::from_bytes(&PTB_SIGNER_SEED)
+/// The deterministic xDSA signing key for inner PTBs.
+pub fn ptb_signer_keypair() -> bloom_keystore::xdsa::XdsaSecretKey {
+    bloom_keystore::xdsa::XdsaSecretKey::from_bytes(&PTB_SIGNER_SECRET_BYTES)
+        .expect("fixed PTB signer secret bytes are valid")
 }
 
-/// The 32-byte Ed25519 public key for the inner-PTB signer.
+/// The full composite xDSA public key for the inner-PTB signer.
+pub fn ptb_signer_xdsa_pubkey() -> bloom_keystore::xdsa::XdsaPublicKey {
+    ptb_signer_keypair().public_key()
+}
+
+/// The 32-byte address for the inner-PTB signer.
 pub fn ptb_signer_pubkey() -> [u8; 32] {
-    ed25519_dalek::VerifyingKey::from(&ptb_signer_keypair()).to_bytes()
+    bloom_chain_types::types::Address::from_pubkey_bytes(&ptb_signer_xdsa_pubkey().0).0
 }
 
 /// Lower-hex of [`ptb_signer_pubkey`] — the genesis allocation `address` and
@@ -414,18 +415,16 @@ pub fn ptb_signer_pubkey_hex() -> String {
     hex::encode(ptb_signer_pubkey())
 }
 
-/// Ed25519-sign `ptb` over its `signing_digest()`, installing the 64-byte
-/// signature into `ptb.signatures[0]` and the signer pubkey into
+/// xDSA-sign `ptb` over its `signing_digest()`, installing the composite
+/// signature into `ptb.signatures[0]` and the signer address into
 /// `ptb.signers[0]`. Returns the `encode_ptb` bytes ready to be written to a
 /// file for `bloom chain submit-ptb --ptb-file`.
 pub fn sign_and_encode_ptb(mut ptb: PtbTx) -> Vec<u8> {
-    use ed25519_dalek::Signer as _;
     let sk = ptb_signer_keypair();
-    let pk = ptb_signer_pubkey();
-    ptb.signers = vec![pk];
+    ptb.signers = vec![ptb_signer_pubkey()];
     let digest = ptb.signing_digest();
     let sig = sk.sign(&digest);
-    ptb.signatures = vec![PqSignature(sig.to_bytes().to_vec())];
+    ptb.signatures = vec![PqSignature(sig.to_bytes())];
     encode_ptb(&ptb).expect("encode signed PTB")
 }
 
@@ -611,15 +610,22 @@ pub fn create_shared_pool(
 mod ptb_signer_tests {
     use super::*;
 
-    /// Prints the deterministic inner-PTB signer pubkey hex. Run with
-    /// `cargo test -p bloom-petal-dex-it ptb_signer_pubkey -- --nocapture` and
-    /// copy the value into `PTB_SIGNER_PK_HEX` in
-    /// `scripts/test-docker-petal-dex.sh`.
+    /// Prints the deterministic inner-PTB signer address hex.
     #[test]
     fn prints_ptb_signer_pubkey_hex() {
         println!("PTB_SIGNER_PK_HEX={}", ptb_signer_pubkey_hex());
         // Sanity: deterministic + 64 hex chars.
         assert_eq!(ptb_signer_pubkey_hex().len(), 64);
         assert_eq!(ptb_signer_pubkey_hex(), ptb_signer_pubkey_hex());
+    }
+
+    #[test]
+    fn prints_ptb_signer_registry_entry() {
+        use base64::Engine as _;
+        println!("PTB_SIGNER_PK_HEX={}", ptb_signer_pubkey_hex());
+        println!(
+            "PTB_SIGNER_PUBKEY_B64={}",
+            base64::engine::general_purpose::STANDARD.encode(ptb_signer_xdsa_pubkey().0)
+        );
     }
 }

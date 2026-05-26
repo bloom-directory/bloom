@@ -15,14 +15,14 @@
 //! engine), so they exercise the same code path live blocks run.
 //!
 //! Test plan:
-//! 1. `accepts_valid_ed25519_signature` — build an empty-commands PTB
-//!    with a valid Ed25519 signature over the canonical PTB digest,
+//! 1. `accepts_valid_xdsa_signature` — build an empty-commands PTB
+//!    with a valid xDSA signature over the canonical PTB digest,
 //!    seed a `Coin<LOOM>` gas-payer, submit, assert `success: true`.
 //! 2. `rejects_flipped_signature_byte` — same PTB, flip one byte in
 //!    `signatures[0]`, submit, assert revert with a
 //!    `BadSignature`-flavoured reason and no write set.
 //! 3. `rejects_wrong_pubkey` — same PTB, replace `signers[0]` with a
-//!    different (but valid) Ed25519 public key while keeping the
+//!    different registered xDSA address while keeping the
 //!    original signature, submit, assert revert with a
 //!    `BadSignature`-flavoured reason and no write set.
 
@@ -30,13 +30,12 @@ use bloom_chain_node::{consensus_driver::PetalExecutor, petal_executor::ChainPet
 use bloom_chain_state::State;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
+use bloom_keystore::xdsa::XdsaSecretKey;
 use bloom_objects::{Object, ObjectId, Owner};
 use bloom_script::{
     encode_ptb, loom_coin_type_tag,
     types::{PqSignature, PtbTx},
 };
-use ed25519_dalek::{Signer, SigningKey};
-use rand::rngs::OsRng;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -64,12 +63,12 @@ fn make_loom_coin(id: ObjectId, owner: [u8; 32], value: u128) -> Object {
     }
 }
 
-/// Build a freshly-generated Ed25519 signing key and its raw 32-byte
-/// verifying-key bytes (the same shape the PTB `signers` field carries).
-fn fresh_ed25519_keypair() -> (SigningKey, [u8; 32]) {
-    let sk = SigningKey::generate(&mut OsRng);
-    let pk = sk.verifying_key().to_bytes();
-    (sk, pk)
+/// Build a freshly-generated xDSA signing key and its 32-byte address
+/// (the same shape the PTB `signers` field carries).
+fn fresh_xdsa_keypair() -> (XdsaSecretKey, PubKeyBytes, [u8; 32]) {
+    let (sk, pk) = XdsaSecretKey::generate();
+    let addr = Address::from_pubkey_bytes(&pk.0).0;
+    (sk, PubKeyBytes(pk.to_bytes()), addr)
 }
 
 /// Wrap `ptb_bytes` in the chain's outer `Tx` envelope. The outer
@@ -119,34 +118,35 @@ fn unsigned_empty_ptb(pubkey: [u8; 32], gas_payer: ObjectId, expiry_block: u64) 
 
 /// Sign `ptb` with `sk` over its canonical signing digest, place the
 /// signature in `signatures[0]`, and return the encoded bytes.
-fn sign_and_encode(sk: &SigningKey, mut ptb: PtbTx) -> Vec<u8> {
+fn sign_and_encode(sk: &XdsaSecretKey, mut ptb: PtbTx) -> Vec<u8> {
     // Compute the digest with the signatures slot still as a
     // placeholder. `ptb_hash` deliberately excludes `signatures`
     // (see `bloom_script::types::PtbTx` wire-layout docs).
     let digest = ptb.signing_digest();
     let sig = sk.sign(&digest);
-    ptb.signatures = vec![PqSignature(sig.to_bytes().to_vec())];
+    ptb.signatures = vec![PqSignature(sig.to_bytes())];
     encode_ptb(&ptb).expect("encode PTB")
 }
 
 // ---------------------------------------------------------------------------
-// Test 1 — happy path: a valid Ed25519 signature is accepted.
+// Test 1 — happy path: a valid xDSA signature is accepted.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn accepts_valid_ed25519_signature() {
-    let (sk, pk) = fresh_ed25519_keypair();
+fn accepts_valid_xdsa_signature() {
+    let (sk, pk, signer_addr) = fresh_xdsa_keypair();
     let gas_payer_id = ObjectId([0xCC; 32]);
 
     let mut state = State::new();
+    state.register_pubkey(Address(signer_addr), pk);
     // Seed a Coin<LOOM> owned by the PTB signer so step 6 (gas-payer
     // prep) succeeds. Without this the validator would reject the
     // PTB *after* the signature check, which is still OK for proving
     // the signature passed but masks the fact that a valid sig
     // reaches step 6 at all. Seeding makes the happy path complete.
-    state.set_object(make_loom_coin(gas_payer_id, pk, 1_000_000_000));
+    state.set_object(make_loom_coin(gas_payer_id, signer_addr, 1_000_000_000));
 
-    let ptb = unsigned_empty_ptb(pk, gas_payer_id, /*expiry*/ 100);
+    let ptb = unsigned_empty_ptb(signer_addr, gas_payer_id, /*expiry*/ 100);
     let ptb_bytes = sign_and_encode(&sk, ptb);
     let tx = submit_ptb_tx(outer_sender(), ptb_bytes);
 
@@ -162,7 +162,7 @@ fn accepts_valid_ed25519_signature() {
 
     assert!(
         out.success,
-        "valid Ed25519 PTB signature must be accepted by production: \
+        "valid xDSA PTB signature must be accepted by production: \
          revert reason = {}",
         String::from_utf8_lossy(&out.return_data)
     );
@@ -178,15 +178,16 @@ fn accepts_valid_ed25519_signature() {
 
 #[test]
 fn rejects_flipped_signature_byte() {
-    let (sk, pk) = fresh_ed25519_keypair();
+    let (sk, pk, signer_addr) = fresh_xdsa_keypair();
     let gas_payer_id = ObjectId([0xCC; 32]);
 
     let mut state = State::new();
-    state.set_object(make_loom_coin(gas_payer_id, pk, 1_000_000_000));
+    state.register_pubkey(Address(signer_addr), pk);
+    state.set_object(make_loom_coin(gas_payer_id, signer_addr, 1_000_000_000));
 
-    let mut ptb = unsigned_empty_ptb(pk, gas_payer_id, /*expiry*/ 100);
+    let mut ptb = unsigned_empty_ptb(signer_addr, gas_payer_id, /*expiry*/ 100);
     let digest = ptb.signing_digest();
-    let mut sig_bytes = sk.sign(&digest).to_bytes().to_vec();
+    let mut sig_bytes = sk.sign(&digest).to_bytes();
     // Flip a single bit in the first signature byte.
     sig_bytes[0] ^= 0x01;
     ptb.signatures = vec![PqSignature(sig_bytes)];
@@ -227,15 +228,15 @@ fn rejects_flipped_signature_byte() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3 — replacing the signer pubkey with a different valid Ed25519
-// key (while keeping the original signature) must also revert.
+// Test 3 — replacing the signer address with a different registered xDSA key
+// (while keeping the original signature) must also revert.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn rejects_wrong_pubkey() {
-    let (sk, pk) = fresh_ed25519_keypair();
-    let (_, attacker_pk) = fresh_ed25519_keypair();
-    assert_ne!(pk, attacker_pk, "test keys must differ");
+    let (sk, _pk, signer_addr) = fresh_xdsa_keypair();
+    let (_attacker_sk, attacker_pk, attacker_addr) = fresh_xdsa_keypair();
+    assert_ne!(signer_addr, attacker_addr, "test keys must differ");
     let gas_payer_id = ObjectId([0xCC; 32]);
 
     let mut state = State::new();
@@ -243,25 +244,23 @@ fn rejects_wrong_pubkey() {
     // for step 6 to pass. Seeding under the attacker's pubkey makes
     // sure that — if the signature check were broken — the rest of
     // validation would still succeed and the test would notice.
-    state.set_object(make_loom_coin(gas_payer_id, attacker_pk, 1_000_000_000));
+    state.register_pubkey(Address(attacker_addr), attacker_pk);
+    state.set_object(make_loom_coin(gas_payer_id, attacker_addr, 1_000_000_000));
 
-    // Sign the ptb-as-if-the-real-key-signed-it, but then *swap in*
-    // the attacker's pubkey as signers[0]. The signature is still
-    // valid Ed25519 over `digest`, but is bound to `pk`, not
-    // `attacker_pk`. Real verification must reject this.
-    let mut ptb = unsigned_empty_ptb(pk, gas_payer_id, /*expiry*/ 100);
+    // Build the exact PTB the verifier will see: signer slot names the
+    // attacker's registered address, and the gas payer is owned by that
+    // address, so everything after signature verification would pass. Then
+    // sign that same digest with the wrong xDSA key. This isolates registry
+    // lookup/public-key mismatch from digest mutation.
+    let mut ptb = unsigned_empty_ptb(attacker_addr, gas_payer_id, /*expiry*/ 100);
     let digest = ptb.signing_digest();
     let sig = sk.sign(&digest);
-    ptb.signatures = vec![PqSignature(sig.to_bytes().to_vec())];
-    // Recompute the digest after the swap would defeat the test: a
-    // verifier-of-ptb-with-attacker-pk verifies a signature made by
-    // `sk` against `attacker_pk`, which is exactly the attack we're
-    // detecting. So we do **not** re-sign here.
-    ptb.signers = vec![attacker_pk];
-    // Note: PTB.signing_digest covers the signers field but NOT the
-    // signatures field, so swapping signers changes the digest the
-    // verifier will recompute, ensuring the original signature
-    // doesn't accidentally validate.
+    ptb.signatures = vec![PqSignature(sig.to_bytes())];
+    assert_eq!(
+        digest,
+        ptb.signing_digest(),
+        "test must not rely on signer/digest mutation"
+    );
     let ptb_bytes = encode_ptb(&ptb).expect("encode PTB");
     let tx = submit_ptb_tx(outer_sender(), ptb_bytes);
 

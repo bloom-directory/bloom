@@ -104,7 +104,7 @@ Each arg lowers to an existing `Arg` variant:
 
 Appending resolves the endpoint path → `(petal_hash, fn)`, builds a `Command::Move`, and runs **incremental validation** against the manifest fn signature (arity/types, plus `Use`-ref typing against prior return slots, mirroring `validator.rs:367-406`). A bad command fails the write with the validator message; the session is unchanged.
 
-`cat commit` assembles `PtbTx{ signers, commands, gas_payer, gas_budget, gas_price, expiry_block }`, auto-selects the signer's `Coin<LOOM>` gas payer (reuse `coin_select`), signs the digest via keystore (Ed25519 phase-1 verifier), submits through the existing node submit path, blocks for the receipt, and returns it as canonical NDJSON. Failure → existing snapshot-drop atomicity; nothing commits.
+`cat commit` assembles `PtbTx{ signers, commands, gas_payer, gas_budget, gas_price, expiry_block }`, auto-selects the signer's `Coin<LOOM>` gas payer (reuse `coin_select`), signs the digest via keystore using composite xDSA, submits through the existing node submit path, blocks for the receipt, and returns it as canonical NDJSON. Failure → existing snapshot-drop atomicity; nothing commits.
 
 ### 3.5 CLI lowering (`bloom pipe '<expr>'`)
 
@@ -185,7 +185,7 @@ Ordered so each phase is independently verifiable and the riskiest unit is de-ri
 
 - Bloombook (social petals, feeds, voting) — separate downstream spec; this spec only adds the bounded-projection/pagination *primitive* it will reuse.
 - FUSE/9P exec mounts and kernel-level executable paths — the tx-session VFS substrate sidesteps the NFS no-exec limitation.
-- Composite xDSA signing — stays on the existing Ed25519 phase-1 verifier (`sig_verifier.rs`).
+- Composite xDSA signing — verified by the production PTB verifier through the chain key registry (`sig_verifier.rs`).
 - litmus 5.4 (swap+LP+stake) — no stake petal.
 - Replacing or collapsing `PetalMode::{Local,Onchain,Chain}` — the front door targets chain execution; local/offchain unification is not required here.
 

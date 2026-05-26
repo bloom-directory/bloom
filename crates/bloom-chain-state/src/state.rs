@@ -2,20 +2,21 @@
 //!
 //! # State root (spec §6.1, widened by §16.3)
 //!
-//! The state_root payload is 160 bytes:
+//! The state_root payload is 192 bytes:
 //!
 //! ```text
 //! state_root = blake3_tagged(
 //!     "state_root:",
-//!     accounts_root || code_root || object_root || ownership_index_root || vfs_root
+//!     accounts_root || code_root || object_root || ownership_index_root ||
+//!     vfs_root || key_registry_root
 //! )
 //! ```
 //!
-//! `object_root`, `ownership_index_root`, and `vfs_root` commit to the
-//! in-memory Object / OwnershipIndex / VFS maps using deterministic
+//! `object_root`, `ownership_index_root`, `vfs_root`, and `key_registry_root`
+//! commit to the in-memory Object / OwnershipIndex / VFS / key-registry maps using deterministic
 //! sorted-entry encodings. Roots are zero when their underlying map is empty
 //! (the workspace's empty-trie convention). They are computed on demand from
-//! [`State::objects`] / [`State::ownership`] / [`State::vfs`] — there is no
+//! [`State::objects`] / [`State::ownership`] / [`State::vfs`] / [`State::key_registry`] — there is no
 //! cached field, so the roots are always live.
 //!
 //! Receipts are NOT included in the state root — they are in the block header's
@@ -41,8 +42,9 @@
 use std::collections::BTreeMap;
 
 use bloom_chain_types::{
-    Address, Hash32,
+    Hash32,
     digest::{blake3_tagged, tags},
+    types::{Address, PubKeyBytes},
 };
 use bloom_objects::{
     Object, ObjectId, OwnershipIndexKey,
@@ -60,6 +62,8 @@ use crate::{
 
 const VFS_ROOT_TAG: &str = "bloom-chain.v0.vfs_root:";
 const VFS_LEAF_TAG: &str = "bloom-chain.v0.vfs_leaf:";
+const KEY_REGISTRY_ROOT_TAG: &str = "bloom-chain.v0.key_registry_root:";
+const KEY_REGISTRY_LEAF_TAG: &str = "bloom-chain.v0.key_registry_leaf:";
 
 // ---------------------------------------------------------------------------
 // Write-set types
@@ -224,6 +228,13 @@ pub struct State {
     /// while checking path/hash petal references, so they are committed by
     /// [`State::vfs_root`] and included in [`State::state_root`].
     pub(crate) vfs: BTreeMap<String, Hash32>,
+    /// Address → full xDSA composite public key registry.
+    ///
+    /// PTB signer slots carry 32-byte addresses; the production PTB verifier
+    /// resolves those addresses through this registry to verify full xDSA
+    /// composite signatures. Entries are registered from authenticated outer
+    /// transaction envelopes and from genesis validator keys.
+    pub(crate) key_registry: BTreeMap<Address, PubKeyBytes>,
 }
 
 impl State {
@@ -237,6 +248,7 @@ impl State {
             objects: BTreeMap::new(),
             ownership: BTreeMap::new(),
             vfs: BTreeMap::new(),
+            key_registry: BTreeMap::new(),
         }
     }
 
@@ -409,6 +421,25 @@ impl State {
     }
 
     // -----------------------------------------------------------------------
+    // xDSA key registry
+    // -----------------------------------------------------------------------
+
+    /// Register or replace the full xDSA public key for `addr`.
+    pub fn register_pubkey(&mut self, addr: Address, pubkey: PubKeyBytes) {
+        self.key_registry.insert(addr, pubkey);
+    }
+
+    /// Resolve the full xDSA public key for `addr`.
+    pub fn get_pubkey(&self, addr: &Address) -> Option<PubKeyBytes> {
+        self.key_registry.get(addr).cloned()
+    }
+
+    /// Iterate key-registry entries in address order.
+    pub fn iter_key_registry(&self) -> impl Iterator<Item = (&Address, &PubKeyBytes)> {
+        self.key_registry.iter()
+    }
+
+    // -----------------------------------------------------------------------
     // Roots
     // -----------------------------------------------------------------------
 
@@ -504,24 +535,47 @@ impl State {
         blake3_tagged(VFS_ROOT_TAG, &payload)
     }
 
-    /// Compute the `state_root` per spec §6.1, widened by §16.3:
+    /// The xDSA key-registry root.
+    ///
+    /// Commits to address → full composite public-key bindings in address order.
+    /// Empty registry returns the all-zero sentinel.
+    pub fn key_registry_root(&self) -> Hash32 {
+        if self.key_registry.is_empty() {
+            return Hash32([0u8; 32]);
+        }
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(self.key_registry.len() as u64).to_le_bytes());
+        for (addr, pubkey) in &self.key_registry {
+            let key = blake3_tagged(KEY_REGISTRY_LEAF_TAG, &addr.0);
+            payload.extend_from_slice(&key.0);
+            payload.extend_from_slice(&(pubkey.0.len() as u32).to_be_bytes());
+            payload.extend_from_slice(&pubkey.0);
+        }
+        blake3_tagged(KEY_REGISTRY_ROOT_TAG, &payload)
+    }
+
+    /// Compute the `state_root` per spec §6.1, widened by §16.3 and the xDSA
+    /// key registry:
     ///
     /// ```text
     /// state_root = blake3_tagged(
     ///     "state_root:",
-    ///     accounts_root || code_root || object_root || ownership_index_root || vfs_root
+    ///     accounts_root || code_root || object_root || ownership_index_root ||
+    ///     vfs_root || key_registry_root
     /// )
     /// ```
     ///
-    /// All five roots are live: changing any underlying trie data
+    /// All six roots are live: changing any underlying trie data
     /// changes the corresponding root, which changes `state_root`.
     pub fn state_root(&self) -> Hash32 {
-        let mut payload = [0u8; 160];
+        let mut payload = [0u8; 192];
         payload[0..32].copy_from_slice(&self.accounts_root().0);
         payload[32..64].copy_from_slice(&self.code_root().0);
         payload[64..96].copy_from_slice(&self.object_root().0);
         payload[96..128].copy_from_slice(&self.ownership_index_root().0);
         payload[128..160].copy_from_slice(&self.vfs_root().0);
+        payload[160..192].copy_from_slice(&self.key_registry_root().0);
         blake3_tagged(tags::STATE_ROOT, &payload)
     }
 
@@ -934,16 +988,17 @@ mod tests {
     }
 
     #[test]
-    fn state_root_payload_is_160_bytes() {
-        // Recompute the expected commitment over the canonical 160-byte
+    fn state_root_payload_is_192_bytes() {
+        // Recompute the expected commitment over the canonical 192-byte
         // payload and verify it matches `State::state_root` exactly.
         let s = State::new();
-        let mut payload = [0u8; 160];
+        let mut payload = [0u8; 192];
         payload[0..32].copy_from_slice(&s.accounts_root().0);
         payload[32..64].copy_from_slice(&s.code_root().0);
         payload[64..96].copy_from_slice(&s.object_root().0);
         payload[96..128].copy_from_slice(&s.ownership_index_root().0);
         payload[128..160].copy_from_slice(&s.vfs_root().0);
+        payload[160..192].copy_from_slice(&s.key_registry_root().0);
         let expected = blake3_tagged(tags::STATE_ROOT, &payload);
         assert_eq!(s.state_root(), expected);
     }
@@ -972,6 +1027,17 @@ mod tests {
         s.set_vfs_binding("/bloom/test".to_string(), Hash32([0xAB; 32]));
         assert_ne!(baseline, s.state_root());
         assert_ne!(s.vfs_root(), Hash32([0u8; 32]));
+    }
+
+    #[test]
+    fn state_root_changes_when_key_registry_changes() {
+        let mut s = State::new();
+        let baseline = s.state_root();
+
+        s.register_pubkey(addr(7), PubKeyBytes(vec![0xAB; 1984]));
+        assert_ne!(baseline, s.state_root());
+        assert_ne!(s.key_registry_root(), Hash32([0u8; 32]));
+        assert_eq!(s.get_pubkey(&addr(7)), Some(PubKeyBytes(vec![0xAB; 1984])));
     }
 
     #[test]

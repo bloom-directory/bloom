@@ -23,6 +23,10 @@
 //! [[petals]]
 //! path = "/bloom/dex/pool"
 //! wasm_hex = "<hex-encoded wasm bytes>"
+//!
+//! [[key_registry]]
+//! address = "b1abcd...wxyz"
+//! pubkey  = "<base64 composite pubkey>"
 //! ```
 
 use std::path::Path;
@@ -76,6 +80,15 @@ pub struct GenesisPetal {
     pub wasm_hex: String,
 }
 
+/// Raw TOML representation of an xDSA key-registry entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenesisKeyRegistryEntry {
+    /// b1-prefixed address derived from `pubkey`.
+    pub address: String,
+    /// Base64-encoded composite public key (1984 bytes).
+    pub pubkey: String,
+}
+
 /// Parsed genesis file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenesisFile {
@@ -87,6 +100,8 @@ pub struct GenesisFile {
     pub allocations: Vec<GenesisAllocation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub petals: Vec<GenesisPetal>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_registry: Vec<GenesisKeyRegistryEntry>,
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +120,7 @@ pub struct Genesis {
     pub peer_addrs: Vec<String>,
     pub allocations: Vec<(Address, u128)>,
     pub petals: Vec<(String, Vec<u8>)>,
+    pub key_registry: Vec<(Address, PubKeyBytes)>,
     /// Genesis hash: `blake3("bloom-chain.v0.genesis:" || ssz(chain_id_bytes || genesis_time_ms))`.
     pub genesis_hash: Hash32,
 }
@@ -157,6 +173,12 @@ impl Genesis {
         let validator_set = ValidatorSet::new(validators)
             .map_err(|e| NodeError::Genesis(format!("validator set: {e}")))?;
 
+        let mut key_registry: Vec<(Address, PubKeyBytes)> = validator_set
+            .validators()
+            .iter()
+            .map(|v| (v.address, v.pubkey.clone()))
+            .collect();
+
         // Parse allocations.
         let mut allocations: Vec<(Address, u128)> = Vec::new();
         for alloc in &raw.allocations {
@@ -188,6 +210,22 @@ impl Genesis {
             petals.push((petal.path.clone(), wasm));
         }
 
+        for entry in &raw.key_registry {
+            let addr = parse_b1_address(&entry.address)
+                .map_err(|e| NodeError::Genesis(format!("key_registry address: {e}")))?;
+            let pk_bytes = base64_decode(&entry.pubkey)
+                .map_err(|e| NodeError::Genesis(format!("key_registry pubkey: {e}")))?;
+            let derived = Address::from_pubkey_bytes(&pk_bytes);
+            if addr != derived {
+                return Err(NodeError::Genesis(format!(
+                    "key_registry address/pubkey mismatch: address {} derives {} from pubkey",
+                    hex::encode(addr.0),
+                    hex::encode(derived.0)
+                )));
+            }
+            key_registry.push((addr, PubKeyBytes(pk_bytes)));
+        }
+
         // Genesis hash.
         let genesis_hash = compute_genesis_hash(&raw.chain_id, raw.genesis_time_ms);
 
@@ -198,6 +236,7 @@ impl Genesis {
             peer_addrs,
             allocations,
             petals,
+            key_registry,
             genesis_hash,
         })
     }
@@ -217,6 +256,10 @@ impl Genesis {
     /// // EpochZero is implicit at genesis: the linear cap is consumed by
     /// // this genesis pipeline, not by an on-chain wasm call.
     pub fn apply_to_state(&self, state: &mut State) {
+        for (addr, pubkey) in &self.key_registry {
+            state.register_pubkey(*addr, pubkey.clone());
+        }
+
         for (path, wasm) in &self.petals {
             let hash = state.insert_code(wasm);
             state.set_vfs_binding(path.clone(), hash);
@@ -410,7 +453,7 @@ mod tests {
         let addr = Address([0xAAu8; 32]);
         let validator = Validator {
             address: addr,
-            pubkey: pk,
+            pubkey: pk.clone(),
             voting_power: 1,
         };
         let validator_set = ValidatorSet::new(vec![validator]).unwrap();
@@ -428,6 +471,7 @@ mod tests {
             peer_addrs: vec![],
             allocations: allocs,
             petals: vec![],
+            key_registry: vec![(addr, pk)],
             genesis_hash,
         }
     }
@@ -581,6 +625,7 @@ mod tests {
             }],
             allocations: vec![],
             petals: vec![],
+            key_registry: vec![],
         };
 
         let err = Genesis::from_raw(raw).expect_err("mismatch must be rejected");
@@ -605,6 +650,7 @@ mod tests {
             }],
             allocations: vec![],
             petals: vec![],
+            key_registry: vec![],
         }
     }
 

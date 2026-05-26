@@ -61,9 +61,10 @@ fn make_block(height: u64, proposer: Address, txs: Vec<Tx>) -> Block {
 }
 
 fn make_genesis() -> Genesis {
+    let pk = PubKeyBytes(vec![0u8; 1984]);
     let validator = Validator {
         address: make_addr(0xAA),
-        pubkey: PubKeyBytes(vec![0u8; 1984]),
+        pubkey: pk.clone(),
         voting_power: 1,
     };
     Genesis {
@@ -73,6 +74,7 @@ fn make_genesis() -> Genesis {
         peer_addrs: vec![],
         allocations: vec![],
         petals: vec![],
+        key_registry: vec![(make_addr(0xAA), pk)],
         genesis_hash: Hash32([0x42; 32]),
     }
 }

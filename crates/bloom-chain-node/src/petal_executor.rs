@@ -39,7 +39,7 @@ use crate::chain_petal_runner::ChainPetalRunner;
 use crate::coin_select::select_coin_loom;
 use crate::consensus_driver::{ExecOutput, PetalExecutor, empty_account};
 use crate::ptb_chain_iface::PtbChainAdapter;
-use crate::sig_verifier::Ed25519PtbVerifier;
+use crate::sig_verifier::XdsaPtbVerifier;
 
 /// Production chain-mode executor.
 ///
@@ -432,11 +432,9 @@ impl PetalExecutor for ChainPetalExecutor {
         proposer: Address,
         parent_hash: Hash32,
     ) -> ExecOutput {
-        // Production path: manifests resolve from each petal's wasm
-        // custom section. `None` overrides ⇒ wasm-only resolution.
-        // PTB signer signatures are checked with the production
-        // Ed25519 verifier (P0-3 fix, spec §7.2 step 1).
-        let verifier = Ed25519PtbVerifier::new();
+        // Production path: manifests resolve from each petal's wasm custom
+        // section. PTB signatures are verified as full xDSA signatures by
+        // resolving 32-byte signer addresses through chain state's key registry.
         execute_tx_impl(
             tx,
             state,
@@ -445,7 +443,7 @@ impl PetalExecutor for ChainPetalExecutor {
             proposer,
             parent_hash,
             None,
-            &verifier,
+            PtbSignaturePolicy::ProductionXdsa,
         )
     }
 }
@@ -466,11 +464,10 @@ impl PetalExecutor for ChainPetalExecutorWithManifests {
         // exercise downstream pipeline steps (host imports, ownership
         // index, gas refund, …), not signature cryptography. Keeping
         // the always-ok verifier here preserves that contract while the
-        // production `ChainPetalExecutor` path uses
-        // [`Ed25519PtbVerifier`]. Tests that *do* want to exercise real
-        // signature verification go through `ChainPetalExecutor`
-        // directly (see `tests/ptb_signature_rejection.rs`).
-        let verifier = AlwaysOkVerifier;
+        // production `ChainPetalExecutor` path uses full xDSA via the
+        // state key registry. Tests that *do* want to exercise real signature
+        // verification go through `ChainPetalExecutor` directly (see
+        // `tests/ptb_signature_rejection.rs`).
         execute_tx_impl(
             tx,
             state,
@@ -479,9 +476,15 @@ impl PetalExecutor for ChainPetalExecutorWithManifests {
             proposer,
             parent_hash,
             Some(&self.manifests),
-            &verifier,
+            PtbSignaturePolicy::AlwaysOk,
         )
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PtbSignaturePolicy {
+    ProductionXdsa,
+    AlwaysOk,
 }
 
 /// Shared `PetalExecutor::execute_tx` body. The trailing `manifests`
@@ -489,10 +492,10 @@ impl PetalExecutor for ChainPetalExecutorWithManifests {
 /// PTB validator consults *before* the wasm custom-section path
 /// during `Command::Move` typechecks. Production passes `None`.
 ///
-/// `verifier` plugs the signature-check policy: production uses
-/// [`Ed25519PtbVerifier`]; the test-only `ChainPetalExecutorWithManifests`
-/// uses `AlwaysOkVerifier` for backwards compatibility with existing
-/// stub-signature fixtures.
+/// `signature_policy` plugs the signature-check policy: production uses full
+/// xDSA via the state key registry; the test-only
+/// `ChainPetalExecutorWithManifests` uses `AlwaysOkVerifier` for backwards
+/// compatibility with existing stub-signature fixtures.
 #[allow(clippy::too_many_arguments)]
 fn execute_tx_impl(
     tx: &Tx,
@@ -502,7 +505,7 @@ fn execute_tx_impl(
     proposer: Address,
     parent_hash: Hash32,
     manifests: Option<&HashMap<Hash32, PetalManifestStub>>,
-    verifier: &dyn SignatureVerifier,
+    signature_policy: PtbSignaturePolicy,
 ) -> ExecOutput {
     // `parent_hash` is the committing block's parent block hash, threaded in
     // by `apply_block_state_transitions` from `block.header.parent_hash`.
@@ -624,14 +627,11 @@ fn execute_tx_impl(
                     }
                 }
                 Ok(ptb) => {
-                    // Validator runs against current chain state.
-                    // The signature verifier is now supplied by the
-                    // caller (P0-3 fix, spec §7.2 step 1): the
-                    // production `ChainPetalExecutor` hands in
-                    // `Ed25519PtbVerifier`; the test-only
-                    // `ChainPetalExecutorWithManifests` keeps
-                    // `AlwaysOkVerifier` for legacy fixtures (see
-                    // each impl's call to `execute_tx_impl`).
+                    // Validator runs against current chain state. Production
+                    // resolves each PTB signer address through the state key
+                    // registry and verifies a full xDSA signature. The
+                    // manifest-override harness intentionally keeps the
+                    // always-ok verifier for legacy in-process fixtures.
                     //
                     // TODO(task#32): replace the all-zero
                     // `loom_coin_type` and `fungible_petal_hash`
@@ -649,6 +649,18 @@ fn execute_tx_impl(
                         let adapter = match manifests {
                             Some(m) => PtbChainAdapter::with_overrides(state, block_number, m),
                             None => PtbChainAdapter::new(state, block_number),
+                        };
+                        let production_verifier;
+                        let always_ok_verifier;
+                        let verifier: &dyn SignatureVerifier = match signature_policy {
+                            PtbSignaturePolicy::ProductionXdsa => {
+                                production_verifier = XdsaPtbVerifier::new(state);
+                                &production_verifier
+                            }
+                            PtbSignaturePolicy::AlwaysOk => {
+                                always_ok_verifier = AlwaysOkVerifier;
+                                &always_ok_verifier
+                            }
                         };
                         let ctx = ValidationContext {
                             current_block: block_number,

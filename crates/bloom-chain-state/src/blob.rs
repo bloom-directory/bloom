@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! blob = header || accounts_section || storage_section || code_section
-//!      || objects_section || ownership_section || vfs_section
+//!      || objects_section || ownership_section || vfs_section || key_registry_section
 //!
 //! header:
 //!   magic:       [u8; 8]  = b"BLMSTATE"
@@ -57,6 +57,13 @@
 //!     path_len: u32 LE
 //!     path:     UTF-8 bytes
 //!     hash:     [u8; 32]
+//!
+//! key_registry_section:
+//!   count: u32 LE
+//!   for each:
+//!     address:    [u8; 32]
+//!     pubkey_len: u32 LE
+//!     pubkey:     pubkey_len bytes
 //! ```
 //!
 //! The blob hash is `blake3_tagged(STATE_BLOB_HASH_TAG, &blob_bytes)`.
@@ -69,7 +76,7 @@
 
 use std::collections::VecDeque;
 
-use bloom_chain_types::{Address, Hash32, digest::blake3_tagged};
+use bloom_chain_types::{Address, Hash32, digest::blake3_tagged, types::PubKeyBytes};
 use bloom_objects::{Object, ObjectId, OwnershipIndexKey};
 use ssz::Encode;
 
@@ -94,6 +101,8 @@ const MAX_OWNERSHIP_ROWS: usize = 1_000_000;
 const MAX_OWNERSHIP_IDS_PER_ROW: usize = 1_000_000;
 const MAX_VFS_ENTRIES: usize = 100_000;
 const MAX_VFS_PATH_BYTES: usize = 4096;
+const MAX_KEY_REGISTRY_ENTRIES: usize = 1_000_000;
+const MAX_PUBKEY_BYTES: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // Encode helpers
@@ -323,6 +332,15 @@ impl State {
             buf.extend_from_slice(&hash.0);
         }
 
+        // --- Key registry section ---
+        let key_entries: Vec<_> = self.key_registry.iter().collect();
+        push_u32_le(&mut buf, key_entries.len() as u32);
+        for (addr, pubkey) in &key_entries {
+            buf.extend_from_slice(&addr.0);
+            push_u32_le(&mut buf, pubkey.0.len() as u32);
+            buf.extend_from_slice(&pubkey.0);
+        }
+
         let hash = Self::blob_hash(&buf);
         (buf, hash)
     }
@@ -449,6 +467,21 @@ impl State {
                 .to_owned();
             let hash = Hash32(read_bytes32(bytes, &mut off)?);
             state.set_vfs_binding(path, hash);
+        }
+
+        // --- Key registry section ---
+        let key_count = read_count_le(
+            bytes,
+            &mut off,
+            "key registry",
+            MAX_KEY_REGISTRY_ENTRIES,
+            36,
+        )?;
+        for _ in 0..key_count {
+            let addr = Address(read_bytes32(bytes, &mut off)?);
+            let pubkey_len = read_len_le(bytes, &mut off, "key registry pubkey", MAX_PUBKEY_BYTES)?;
+            let pubkey = read_exact(bytes, &mut off, pubkey_len)?.to_vec();
+            state.register_pubkey(addr, PubKeyBytes(pubkey));
         }
 
         if off != bytes.len() {

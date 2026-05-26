@@ -1034,14 +1034,13 @@ impl PtbSubmitter for RpcPtbSubmitter {
         _status: bloom_ptb_builder::SessionStatus,
     ) -> Result<Vec<serde_json::Value>, HandlerError> {
         let (sk, pk, sender) = self.load_validator_key()?;
-        let ed_pk = sk.ed25519_public_key_bytes();
-        if tx.signers != vec![ed_pk] {
+        if tx.signers != vec![sender.0] {
             return Err(HandlerError::invalid(
-                "tx commit can sign exactly one signer: the validator key's Ed25519 component",
+                "tx commit can sign exactly one signer: the validator key's xDSA address",
             ));
         }
         let ptb_digest = tx.signing_digest();
-        tx.signatures = vec![PqSignature(sk.sign_ed25519(&ptb_digest).to_vec())];
+        tx.signatures = vec![PqSignature(sk.sign(&ptb_digest).to_bytes())];
         let ptb_bytes = bloom_script::encode_ptb(&tx)
             .map_err(|e| HandlerError::backend(format!("encode signed PTB: {e}")))?;
 

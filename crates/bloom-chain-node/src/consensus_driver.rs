@@ -547,6 +547,7 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
             });
             continue;
         }
+        state.register_pubkey(tx.sender, tx.pubkey.clone());
 
         // 2. Nonce check — tx.nonce must equal sender.nonce + 1 (strict
         //    next-nonce ordering).  Without this, a tx accidentally

@@ -12,15 +12,15 @@
 //! Driving model (mirrors `bloom-dex-it`'s `docker_dex_multi_user.rs`):
 //!   - `scripts/test-docker-petal-dex.sh` builds the docker image, provisions
 //!     a 4-validator testnet under `$BLOOM_DOCKER_TMPDIR/home{0..3}`, APPENDS
-//!     an Ed25519 gas allocation (keyed to the inner-PTB signer pubkey) to
+//!     an xDSA gas allocation (keyed to the inner-PTB signer pubkey) to
 //!     all four byte-identical genesis.toml files, `docker compose up -d`s
 //!     the stack, and runs this test.
 //!   - This driver attaches to the running stack over TCP (host ports
 //!     18545..18548), deploys the three petal wasms via `bloom chain deploy`,
-//!     then submits two Ed25519-signed inner PTBs via `bloom chain submit-ptb`.
+//!     then submits two xDSA-signed inner PTBs via `bloom chain submit-ptb`.
 //!
 //! Two address spaces (see brief):
-//!   - INNER PTB auth: a deterministic Ed25519 key (`ptb_signer_*` in
+//!   - INNER PTB auth: a deterministic xDSA key (`ptb_signer_*` in
 //!     `dex_harness`). Its genesis-allocated `Coin<LOOM>` is the inner
 //!     gas-payer; every Address-owned input must be owned by it.
 //!   - OUTER Tx envelope: `bloom chain submit-ptb` signs it with the home0
@@ -128,7 +128,7 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
         HOST_RPC_PORTS[0], HOST_RPC_PORTS[1], HOST_RPC_PORTS[2], HOST_RPC_PORTS[3]
     );
     eprintln!(
-        "[ed25519] inner-PTB signer pubkey = {}  (genesis gas-payer)",
+        "[xDSA] inner-PTB signer pubkey = {}  (genesis gas-payer)",
         ptb_signer_pubkey_hex()
     );
 
@@ -193,11 +193,11 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     let mut latest = current_height(client0).await?;
     wait_all_reach_height(&clients, latest + 2).await?;
 
-    // ── 3. Discover the ed25519-owned gas Coin<LOOM> ──────────────────────
+    // ── 3. Discover the xDSA-owned gas Coin<LOOM> ──────────────────────
     let signer_hex = ptb_signer_pubkey_hex();
     let signer_genesis_coins = timeout(TX_TIMEOUT, wait_for_owned_coins(client0, &signer_hex, 4))
         .await
-        .map_err(|_| anyhow!("timed out discovering ed25519 genesis Coin<LOOM> set"))??;
+        .map_err(|_| anyhow!("timed out discovering xDSA genesis Coin<LOOM> set"))??;
     let gas_coin = signer_genesis_coins[0].clone();
     let gas_payer = obj_id_from_hex(&gas_coin)?;
     let merge_a = signer_genesis_coins[1].clone();
@@ -208,7 +208,7 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     let split_src_id = obj_id_from_hex(&split_src)?;
     eprintln!();
     eprintln!(
-        "[gas]   ed25519 gas Coin<LOOM> = {}  (genesis allocation)",
+        "[gas]   xDSA gas Coin<LOOM> = {}  (genesis allocation)",
         json_str(&gas_coin, "id")?
     );
     eprintln!(
@@ -2319,7 +2319,7 @@ fn deploy_petal(home: &std::path::Path, port: u16, wasm: &std::path::Path) -> Re
     Ok(())
 }
 
-/// Ed25519-sign + encode `ptb`, write the bytes to a temp file, and run
+/// xDSA-sign + encode `ptb`, write the bytes to a temp file, and run
 /// `bloom chain submit-ptb --ptb-file <f> --wait` from `home`. Returns the
 /// parsed receipt JSON (the pretty block printed before the final `tx_hash`
 /// line).

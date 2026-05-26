@@ -47,7 +47,7 @@ pub enum ChainCmd {
     /// Wrap an already-signed inner PTB in a signed outer tx and submit it.
     ///
     /// The `--ptb-file` bytes are the output of `bloom_script::encode_ptb`
-    /// for an inner `PtbTx` that is ALREADY Ed25519-signed against its
+    /// for an inner `PtbTx` that is ALREADY xDSA-signed against its
     /// `signers`. The CLI treats those bytes as opaque — it does not sign
     /// the inner PTB — and only builds + signs the OUTER xDSA tx envelope
     /// (which is what block-apply verifies).
@@ -883,9 +883,9 @@ async fn wait_for_tx_receipt(
 
 /// Build the `TxKind::SubmitPtb` envelope kind from the opaque `encode_ptb`
 /// bytes of an already-signed inner PTB. The CLI never inspects or signs the
-/// inner PTB — the node decodes + Ed25519-verifies it against `ptb.signers`
-/// during execution — so this is a thin, pure wrapper kept separate for unit
-/// testing.
+/// inner PTB — the node decodes it and xDSA-verifies it against registered
+/// signer addresses during execution — so this is a thin, pure wrapper kept
+/// separate for unit testing.
 fn build_submit_ptb_kind(ptb_bytes: Vec<u8>) -> bloom_chain_types::tx::TxKind {
     bloom_chain_types::tx::TxKind::SubmitPtb { ptb_bytes }
 }
@@ -1095,6 +1095,7 @@ fn provision_testnet(
             })
             .collect(),
         petals: vec![],
+        key_registry: vec![],
     };
     let genesis_toml = toml::to_string_pretty(&genesis).context("serialize shared genesis.toml")?;
 

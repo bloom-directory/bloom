@@ -229,14 +229,11 @@ async fn run_pipe_and_submit(
     let mut plan = lower_and_build(chain, expr, signers, gas_payer)?;
 
     let (sk, pk, sender) = load_validator_key(chain_dir)?;
-    let ed_pk = sk.ed25519_public_key_bytes();
-    if plan.tx.signers != vec![ed_pk] {
-        anyhow::bail!(
-            "bloom pipe can sign exactly one signer: the validator key's Ed25519 component"
-        );
+    if plan.tx.signers != vec![sender.0] {
+        anyhow::bail!("bloom pipe can sign exactly one signer: the validator key's xDSA address");
     }
     let ptb_digest = plan.tx.signing_digest();
-    plan.tx.signatures = vec![PqSignature(sk.sign_ed25519(&ptb_digest).to_vec())];
+    plan.tx.signatures = vec![PqSignature(sk.sign(&ptb_digest).to_bytes())];
     let ptb_bytes = bloom_script::encode_ptb(&plan.tx).context("encode signed PTB")?;
 
     let client = match std::env::var("BLOOM_RPC_TCP") {

@@ -17,9 +17,9 @@
 #   3. Build the host-side `bloom` binary (release).
 #   4. Provision per-validator homes via `bloom chain testnet`, wiring peers to
 #      the docker DNS names val0..val3.
-#   5. APPEND a genesis allocation for the inner-PTB Ed25519 signer (the inner
-#      gas-payer) to ALL FOUR home*/chain/genesis.toml files — byte-identical,
-#      or the genesis hash diverges and consensus breaks.
+#   5. APPEND a genesis allocation and key-registry entry for the inner-PTB
+#      xDSA signer (the inner gas-payer) to ALL FOUR home*/chain/genesis.toml
+#      files — byte-identical, or the genesis hash diverges and consensus breaks.
 #   6. `docker compose up -d` + wait for all four healthy.
 #   7. Run the petal-dex docker driver test.
 #   8. Always tear the stack down on exit (trap EXIT), capturing per-validator
@@ -44,11 +44,10 @@ detect_docker_compose
 BLOOM_VALIDATOR_COUNT=4
 COMPOSE_FILE="$REPO_ROOT/docker-compose.yml"
 
-# Inner-PTB Ed25519 signer pubkey hex. MUST equal
-# `bloom_petal_dex_it::dex_harness::ptb_signer_pubkey_hex()` — derived from the
-# fixed `PTB_SIGNER_SEED` constant in that harness. Regenerate with:
-#   cargo test -p bloom-petal-dex-it ptb_signer_pubkey -- --nocapture
-PTB_SIGNER_PK_HEX="f10eaa1bc9f9470c53cab56dfc5c1cad0b106964a9e92b37ba068d17950fc346"
+# Inner-PTB xDSA signer registry values are derived from the fixed test-only
+# secret in `bloom_petal_dex_it::dex_harness`.
+PTB_SIGNER_PK_HEX=""
+PTB_SIGNER_PUBKEY_B64=""
 
 # Inner gas-payer LOOM allocation (gas_price=0 means it's never debited, but the
 # coin must EXIST and be owned by the signer). 1M LOOM in bloomweis.
@@ -126,15 +125,19 @@ if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
         --unsafe-rpc-public-bind \
         --allocation 1000000000000000000000000
 
-    # Append the inner-PTB Ed25519 gas allocation to ALL FOUR genesis.toml
-    # files. They MUST stay byte-identical (same genesis hash) or consensus
-    # breaks, so we append the exact same lines to each.
-    #
-    # `parse_b1_address` accepts a raw 64-hex string as a 32-byte Address, so
-    # the genesis `address` is the signer pubkey hex; genesis then emits a
-    # Coin<LOOM> owned by Owner::Address(ed25519_pk).
-    log "appending ed25519 gas/custody allocations ($PTB_SIGNER_PK_HEX) to all 4 genesis.toml"
+    signer_vars=$(cargo test -q -p bloom-petal-dex-it prints_ptb_signer_registry_entry -- --nocapture)
+    PTB_SIGNER_PK_HEX=$(printf '%s\n' "$signer_vars" | sed -n 's/^PTB_SIGNER_PK_HEX=//p' | tail -n1)
+    PTB_SIGNER_PUBKEY_B64=$(printf '%s\n' "$signer_vars" | sed -n 's/^PTB_SIGNER_PUBKEY_B64=//p' | tail -n1)
+    [ -n "$PTB_SIGNER_PK_HEX" ] || fail "failed to derive PTB signer address"
+    [ -n "$PTB_SIGNER_PUBKEY_B64" ] || fail "failed to derive PTB signer pubkey"
+
+    # Append the inner-PTB xDSA gas allocation and key-registry entry to ALL
+    # FOUR genesis.toml files. They MUST stay byte-identical (same genesis hash)
+    # or consensus breaks, so we append the exact same lines to each.
+    log "appending xDSA gas/custody allocations ($PTB_SIGNER_PK_HEX) to all 4 genesis.toml"
     alloc_block=""
+    alloc_block+=$(printf '\n[[key_registry]]\naddress = "%s"\npubkey = "%s"\n' \
+        "$PTB_SIGNER_PK_HEX" "$PTB_SIGNER_PUBKEY_B64")
     for _ in gas merge-a merge-b split-src; do
         alloc_block+=$(printf '\n[[allocations]]\naddress = "%s"\namount = "%s"\n' \
             "$PTB_SIGNER_PK_HEX" "$PTB_SIGNER_ALLOCATION")

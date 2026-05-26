@@ -162,24 +162,6 @@ impl XdsaSecretKey {
         Self::make_public_key(&self.mldsa_sk, &self.ed25519_sk)
     }
 
-    /// Return the Ed25519 component public key.
-    ///
-    /// PTB phase-1 signatures use the Ed25519 half of the xDSA key as the
-    /// signer/address identity, while outer bloom-chain transactions use the
-    /// full composite xDSA signature.
-    pub fn ed25519_public_key_bytes(&self) -> [u8; ED25519_PK_LEN] {
-        self.ed25519_sk.verifying_key().to_bytes()
-    }
-
-    /// Sign `msg` with only the Ed25519 component.
-    ///
-    /// This is intentionally separate from [`Self::sign`], which produces the
-    /// full xDSA composite signature used by bloom-chain envelopes.
-    pub fn sign_ed25519(&self, msg: &[u8]) -> [u8; ED25519_SIG_LEN] {
-        use ed25519_dalek::Signer;
-        self.ed25519_sk.sign(msg).to_bytes()
-    }
-
     /// Serialise the secret key to bytes.
     ///
     /// Format: `mldsa_seed (32 B) || ed25519_seed (32 B)` = 64 bytes total.

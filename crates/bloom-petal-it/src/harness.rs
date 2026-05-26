@@ -152,10 +152,9 @@ pub fn seed_coin(state: &mut State, id: ObjectId, owner: Address, value: u128) {
 /// appends the real macro-emitted canonical manifest bytes.
 ///
 /// Note: this still uses the test-only `AlwaysOkVerifier` for PTB
-/// signatures (the production verifier requires real Ed25519
-/// signatures; constructing valid post-quantum sigs in a test fixture
-/// is out of scope for these integration tests, and signature
-/// verification has its own coverage in
+/// signatures (the production verifier requires registered xDSA keys and
+/// composite signatures; constructing those in every fixture is out of scope
+/// for these integration tests, and signature verification has its own coverage in
 /// `crates/bloom-chain-node/tests/ptb_signature_rejection.rs`).
 ///
 /// `state` is mutated in-place when the tx succeeds. On revert the

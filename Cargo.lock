@@ -2054,7 +2054,6 @@ dependencies = [
  "bloom-script",
  "bloom-test-util",
  "clap",
- "ed25519-dalek",
  "hex",
  "parking_lot 0.12.5",
  "rand 0.8.6",
@@ -2347,6 +2346,7 @@ name = "bloom-petal-dex-it"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "blake3",
  "bloom-chain-consensus",
  "bloom-chain-node",
@@ -2366,7 +2366,6 @@ dependencies = [
  "bloom-resource",
  "bloom-script",
  "bloom-vfs",
- "ed25519-dalek",
  "hex",
  "serde_json",
  "tokio",
