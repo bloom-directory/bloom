@@ -1,19 +1,29 @@
 //! Content-addressed state-blob store.
 //!
 //! Blobs live at `<bloom_home>/chain/state_blobs/<hex_hash>`.
-//! Each blob is the SSZ serialisation of the full state trie at a given height.
-//! Blobs are named by their BLAKE3 hash (content-addressed).
+//! Each blob is the canonical `bloom_chain_state::State::to_blob` encoding of
+//! the full state at a given height. Blobs are named by their domain-separated
+//! state-blob hash (content-addressed).
 //!
 //! The node pins the last 256 state blobs; older ones are GC'd (spec §6.3).
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use bloom_chain_state::State;
 use bloom_chain_types::types::Hash32;
 use tracing::debug;
 
 /// Number of state blobs to retain (spec §6.3).
 const BLOB_RETENTION: usize = 256;
+
+fn blob_retention() -> usize {
+    std::env::var("BLOOM_STATE_BLOB_RETENTION")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(BLOB_RETENTION)
+}
 
 /// Content-addressed blob store.
 pub struct StateBlobStore {
@@ -38,13 +48,12 @@ impl StateBlobStore {
     ///
     /// Returns the hash of the stored data.
     pub fn put(&self, data: &[u8]) -> Result<Hash32> {
-        let hash_bytes = *blake3::hash(data).as_bytes();
-        let hash = Hash32(hash_bytes);
+        let hash = State::blob_hash(data);
         let path = self.path_for(&hash);
         if !path.exists() {
             std::fs::write(&path, data)
-                .with_context(|| format!("write state blob {}", hex::encode(hash_bytes)))?;
-            debug!(hash = %hex::encode(hash_bytes), bytes = data.len(), "state_blob.put");
+                .with_context(|| format!("write state blob {}", hex::encode(hash.0)))?;
+            debug!(hash = %hex::encode(hash.0), bytes = data.len(), "state_blob.put");
         }
         Ok(hash)
     }
@@ -83,7 +92,8 @@ impl StateBlobStore {
             }
         }
 
-        if entries.len() <= BLOB_RETENTION {
+        let retention = blob_retention();
+        if entries.len() <= retention {
             return Ok(());
         }
 
@@ -91,7 +101,7 @@ impl StateBlobStore {
         entries.sort_by_key(|b| std::cmp::Reverse(b.0));
 
         // Remove files beyond retention, unless pinned.
-        for (_, path) in entries.into_iter().skip(BLOB_RETENTION) {
+        for (_, path) in entries.into_iter().skip(retention) {
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())

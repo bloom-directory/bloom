@@ -49,6 +49,8 @@ pub enum MsgType {
     StateBlobResponse = 6,
     Ping = 7,
     Pong = 8,
+    StateSnapshotRequest = 9,
+    StateSnapshotResponse = 10,
 }
 
 impl MsgType {
@@ -64,6 +66,8 @@ impl MsgType {
             6 => Some(MsgType::StateBlobResponse),
             7 => Some(MsgType::Ping),
             8 => Some(MsgType::Pong),
+            9 => Some(MsgType::StateSnapshotRequest),
+            10 => Some(MsgType::StateSnapshotResponse),
             _ => None,
         }
     }

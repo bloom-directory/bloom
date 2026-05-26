@@ -88,6 +88,8 @@ pub enum ChainCmd {
     Query(QueryCmd),
     /// List the current validator set (JSON).
     LsValidators,
+    /// Probe validator readiness via `chain_health`.
+    Health,
     /// Provision a local multi-validator testnet under `--output-dir`.
     ///
     /// Generates `N` xDSA keypairs, writes per-node `home<i>/chain/`
@@ -121,6 +123,10 @@ pub enum ChainCmd {
         /// written for every node (intended for matching docker port mappings).
         #[arg(long, value_name = "ADDR")]
         rpc_tcp_addr: Option<String>,
+        /// Permit a non-loopback/wildcard RPC TCP bind in generated configs.
+        /// Required with `--rpc-tcp-addr 0.0.0.0:...` for docker-only testnets.
+        #[arg(long)]
+        unsafe_rpc_public_bind: bool,
         /// Comma-separated hostnames (one per validator). When set, the i-th
         /// `[[validators]]` entry in genesis.toml gets its `host` rewritten
         /// to `peer_hosts[i]:<listen_port>` so peers reach each other by
@@ -366,6 +372,16 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             Ok(())
         }
 
+        ChainCmd::Health => {
+            let client = make_client();
+            let result = client.call("chain_health", json!({})).await?;
+            if result.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                anyhow::bail!("chain_health returned not ok: {result}");
+            }
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+
         // ── transfer ──────────────────────────────────────────────────────────
         ChainCmd::Transfer { to, amount } => {
             use bloom_chain_types::ssz::Encode;
@@ -457,6 +473,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             allocation,
             listen_addr,
             rpc_tcp_addr,
+            unsafe_rpc_public_bind,
             peer_hosts,
         } => provision_testnet(
             validators,
@@ -466,6 +483,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             &allocation,
             listen_addr.as_deref(),
             rpc_tcp_addr.as_deref(),
+            unsafe_rpc_public_bind,
             peer_hosts.as_deref(),
         ),
     }
@@ -628,6 +646,26 @@ pub(crate) fn load_validator_run_config(
         .map(PathBuf::from)
         .unwrap_or_else(|| chain_dir.join("genesis.toml"));
     let genesis = bloom_chain_node::Genesis::from_file(&genesis_path)?;
+    let local_validator = genesis
+        .validator_set
+        .get_by_address(&derived)
+        .with_context(|| {
+            format!(
+                "local validator {} is not present in genesis validator set",
+                hex::encode(derived.0)
+            )
+        })?;
+    if local_validator.pubkey.0 != pk.0 {
+        anyhow::bail!(
+            "local validator pubkey mismatch: genesis entry for {} does not match keystore at {}",
+            hex::encode(derived.0),
+            key_path.display()
+        );
+    }
+    validate_rpc_tcp_bind_policy(
+        node_cfg.rpc_tcp_addr.as_deref(),
+        node_cfg.unsafe_rpc_public_bind,
+    )?;
 
     let run_config = bloom_chain_node::NodeRunConfig {
         chain_id: genesis.chain_id.clone(),
@@ -636,10 +674,54 @@ pub(crate) fn load_validator_run_config(
         genesis,
         listen_addr: node_cfg.listen_addr.clone(),
         rpc_tcp_addr: node_cfg.rpc_tcp_addr.clone(),
+        unsafe_rpc_public_bind: node_cfg.unsafe_rpc_public_bind,
         bloom_home: bloom_home.to_path_buf(),
         fuel_limit: node_cfg.fuel_limit.unwrap_or(30_000_000),
     };
     Ok((node_cfg, run_config))
+}
+
+fn validate_rpc_tcp_bind_policy(addr: Option<&str>, unsafe_public_bind: bool) -> Result<()> {
+    let Some(addr) = addr else {
+        return Ok(());
+    };
+    if is_loopback_rpc_bind(addr)? {
+        return Ok(());
+    }
+    if unsafe_public_bind {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "rpc_tcp_addr {addr:?} is not loopback-only; set unsafe_rpc_public_bind = true only for controlled docker/private networks"
+    );
+}
+
+fn is_loopback_rpc_bind(addr: &str) -> Result<bool> {
+    use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+
+    if let Ok(socket) = addr.parse::<SocketAddr>() {
+        return Ok(match socket.ip() {
+            IpAddr::V4(ip) => ip.is_loopback(),
+            IpAddr::V6(ip) => ip.is_loopback(),
+        });
+    }
+
+    let host = addr
+        .rsplit_once(':')
+        .map(|(host, _)| host.trim_matches(['[', ']']))
+        .ok_or_else(|| anyhow::anyhow!("rpc_tcp_addr must be host:port, got {addr:?}"))?;
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(true);
+    }
+    // Avoid DNS lookups for public-bind policy except localhost: a hostname may
+    // resolve differently inside containers or operator environments.
+    if host.parse::<IpAddr>().is_err() {
+        return Ok(false);
+    }
+    let mut addrs = addr
+        .to_socket_addrs()
+        .with_context(|| format!("resolve rpc_tcp_addr {addr:?}"))?;
+    Ok(addrs.all(|a| a.ip().is_loopback()))
 }
 
 /// Load the local validator xDSA key from `<chain_dir>/keystore/validator.xdsa`.
@@ -873,6 +955,7 @@ fn provision_testnet(
     allocation: &str,
     listen_addr_override: Option<&str>,
     rpc_tcp_addr_override: Option<&str>,
+    unsafe_rpc_public_bind: bool,
     peer_hosts_csv: Option<&str>,
 ) -> Result<()> {
     use base64::Engine as _;
@@ -1026,6 +1109,7 @@ fn provision_testnet(
             validator_address: n.address_hex.clone(),
             listen_addr: n.listen_addr.clone(),
             rpc_tcp_addr: rpc_tcp_addr_override.map(|s| s.to_string()),
+            unsafe_rpc_public_bind,
             genesis_path: None,
             log_level: Some("info".into()),
             fuel_limit: Some(30_000_000),
@@ -1043,6 +1127,7 @@ fn provision_testnet(
             "peer_host": n.peer_host,
             "rpc_sock": chain_dir.join("rpc.sock"),
             "rpc_tcp_addr": rpc_tcp_addr_override,
+            "unsafe_rpc_public_bind": unsafe_rpc_public_bind,
         }));
     }
 
@@ -1206,6 +1291,7 @@ allocations = []
             validator_address: hex::encode(bogus.0),
             listen_addr: "127.0.0.1:0".into(),
             rpc_tcp_addr: None,
+            unsafe_rpc_public_bind: false,
             genesis_path: None,
             log_level: Some("warn".into()),
             fuel_limit: Some(30_000_000),
@@ -1258,6 +1344,7 @@ allocations = []
             validator_address: hex::encode(derived.0),
             listen_addr: "127.0.0.1:0".into(),
             rpc_tcp_addr: None,
+            unsafe_rpc_public_bind: false,
             genesis_path: None,
             log_level: Some("warn".into()),
             fuel_limit: Some(30_000_000),
@@ -1288,5 +1375,17 @@ host = "127.0.0.1:26656"
             .expect("matching config should load");
         assert_eq!(loaded_cfg.validator_address, hex::encode(derived.0));
         assert_eq!(run_cfg.validator_address, derived);
+    }
+
+    #[test]
+    fn rpc_tcp_bind_policy_rejects_public_without_flag() {
+        let err = validate_rpc_tcp_bind_policy(Some("0.0.0.0:8545"), false)
+            .expect_err("wildcard RPC bind must require explicit unsafe flag");
+        assert!(
+            err.to_string().contains("unsafe_rpc_public_bind"),
+            "unexpected error: {err}"
+        );
+        validate_rpc_tcp_bind_policy(Some("127.0.0.1:8545"), false).unwrap();
+        validate_rpc_tcp_bind_policy(Some("0.0.0.0:8545"), true).unwrap();
     }
 }

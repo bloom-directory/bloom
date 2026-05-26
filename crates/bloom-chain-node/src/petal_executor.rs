@@ -24,7 +24,7 @@ use bloom_petal_fungible::ops::{
     coin_payload, decode_coin_value, rewrite_value, type_tag_coin_loom,
 };
 use bloom_petal_manifest::extract_petal_manifest_v0;
-use bloom_petals::BlockCtx as PetalBlockCtx;
+use bloom_petals::{BlockCtx as PetalBlockCtx, PetalVm};
 use bloom_script::{
     AlwaysOkVerifier, PetalManifestStub, SignatureVerifier, ValidationContext,
     executor::{LogEntry as PtbLogEntry, PtbExecutor},
@@ -64,6 +64,9 @@ pub const DEPLOY_PETAL_BASE_FUEL: u64 = 1_000;
 /// makes large wasm uploads more expensive without pretending to price
 /// persistent state growth precisely.
 pub const DEPLOY_PETAL_BYTES_PER_FUEL: u64 = 64;
+
+/// Maximum chain-admitted wasm blob size for deploy/publish/upgrade.
+pub const MAX_CHAIN_WASM_BYTES: usize = 2 << 20;
 
 /// **Test-only** wrapper around [`ChainPetalExecutor`] that injects a
 /// per-petal manifest override map into the SubmitPtb dispatch path.
@@ -141,6 +144,30 @@ fn ptb_log_to_receipt_log(l: PtbLogEntry) -> Log {
         topics,
         data: l.data,
     }
+}
+
+fn deploy_fuel_for_bytes(len: usize) -> u64 {
+    DEPLOY_PETAL_BASE_FUEL + (len as u64 / DEPLOY_PETAL_BYTES_PER_FUEL)
+}
+
+fn validate_chain_petal_admission(wasm_bytes: &[u8], module_path: &str) -> Result<(), String> {
+    if wasm_bytes.len() > MAX_CHAIN_WASM_BYTES {
+        return Err(format!(
+            "wasm size {} exceeds limit {}",
+            wasm_bytes.len(),
+            MAX_CHAIN_WASM_BYTES
+        ));
+    }
+    let manifest = extract_petal_manifest_v0(wasm_bytes)
+        .ok_or_else(|| "missing bloom_petal_manifest_v0".to_string())?;
+    if manifest.module_path != module_path {
+        return Err(format!(
+            "manifest module_path '{}' does not match command path '{}'",
+            manifest.module_path, module_path
+        ));
+    }
+    PetalVm::validate_for_chain(wasm_bytes).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// For each unique owner referenced — *both* old and new sides of
@@ -375,12 +402,24 @@ fn execute_tx_impl(
         }
 
         TxKind::DeployPetal { wasm_bytes } => {
+            let required_fuel = deploy_fuel_for_bytes(wasm_bytes.len());
+            let fuel_used = required_fuel.min(tx.max_fuel);
+            if required_fuel > tx.max_fuel {
+                return ExecOutput {
+                    success: false,
+                    fuel_used,
+                    return_data: b"deploy petal failed: insufficient max_fuel for wasm storage"
+                        .to_vec(),
+                    logs: vec![],
+                    write_set: None,
+                };
+            }
             let manifest = match extract_petal_manifest_v0(wasm_bytes) {
                 Some(m) => m,
                 None => {
                     return ExecOutput {
                         success: false,
-                        fuel_used: 100,
+                        fuel_used,
                         return_data: b"deploy petal failed: missing bloom_petal_manifest_v0"
                             .to_vec(),
                         logs: vec![],
@@ -388,13 +427,34 @@ fn execute_tx_impl(
                     };
                 }
             };
+            if let Err(e) = validate_chain_petal_admission(wasm_bytes, &manifest.module_path) {
+                return ExecOutput {
+                    success: false,
+                    fuel_used,
+                    return_data: format!("deploy petal failed: {e}").into_bytes(),
+                    logs: vec![],
+                    write_set: None,
+                };
+            }
+            if state.vfs_lookup(&manifest.module_path).is_some() {
+                return ExecOutput {
+                    success: false,
+                    fuel_used,
+                    return_data: format!(
+                        "deploy petal failed: path '{}' already bound",
+                        manifest.module_path
+                    )
+                    .into_bytes(),
+                    logs: vec![],
+                    write_set: None,
+                };
+            }
             let mut snap = state.snapshot();
             let hash = snap.insert_code(wasm_bytes.clone());
             snap.set_vfs_binding(manifest.module_path.clone(), hash);
             ExecOutput {
                 success: true,
-                fuel_used: DEPLOY_PETAL_BASE_FUEL
-                    + (wasm_bytes.len() as u64 / DEPLOY_PETAL_BYTES_PER_FUEL),
+                fuel_used,
                 return_data: hash.0.to_vec(),
                 logs: vec![],
                 write_set: Some(snap.commit()),
@@ -677,6 +737,102 @@ fn execute_tx_impl(
                     }
 
                     for event in &report.publish_events {
+                        let existing_binding = state.vfs_lookup(&event.module_path);
+                        if event.minted_owner_cap && existing_binding.is_some() {
+                            drop(snapshot);
+                            let ws_out = if reservation > 0 {
+                                let mut gas_snap = state.snapshot();
+                                let mut debited = pre_exec_gas_payer.clone();
+                                let pre_value = decode_coin_value(&debited.payload)
+                                    .expect("decode pre-exec coin value");
+                                let new_value = pre_value.saturating_sub(reservation);
+                                debited.payload = rewrite_value(&debited.payload, new_value)
+                                    .expect("rewrite coin payload");
+                                debited.version = debited.version.saturating_add(1);
+                                gas_snap.insert_object(debited);
+                                gas_snap.apply_loom_delta(
+                                    proposer,
+                                    reservation.min(i128::MAX as u128) as i128,
+                                );
+                                Some(gas_snap.commit())
+                            } else {
+                                None
+                            };
+                            return ExecOutput {
+                                success: false,
+                                fuel_used: charged_fuel,
+                                return_data: format!(
+                                    "ptb publish admission error: path '{}' already bound",
+                                    event.module_path
+                                )
+                                .into_bytes(),
+                                logs: vec![],
+                                write_set: ws_out,
+                            };
+                        }
+                        if !event.minted_owner_cap && existing_binding.is_none() {
+                            drop(snapshot);
+                            let ws_out = if reservation > 0 {
+                                let mut gas_snap = state.snapshot();
+                                let mut debited = pre_exec_gas_payer.clone();
+                                let pre_value = decode_coin_value(&debited.payload)
+                                    .expect("decode pre-exec coin value");
+                                let new_value = pre_value.saturating_sub(reservation);
+                                debited.payload = rewrite_value(&debited.payload, new_value)
+                                    .expect("rewrite coin payload");
+                                debited.version = debited.version.saturating_add(1);
+                                gas_snap.insert_object(debited);
+                                gas_snap.apply_loom_delta(
+                                    proposer,
+                                    reservation.min(i128::MAX as u128) as i128,
+                                );
+                                Some(gas_snap.commit())
+                            } else {
+                                None
+                            };
+                            return ExecOutput {
+                                success: false,
+                                fuel_used: charged_fuel,
+                                return_data: format!(
+                                    "ptb upgrade admission error: path '{}' is not bound",
+                                    event.module_path
+                                )
+                                .into_bytes(),
+                                logs: vec![],
+                                write_set: ws_out,
+                            };
+                        }
+                        let admission =
+                            validate_chain_petal_admission(&event.wasm_bytes, &event.module_path);
+                        if let Err(e) = admission {
+                            drop(snapshot);
+                            let ws_out = if reservation > 0 {
+                                let mut gas_snap = state.snapshot();
+                                let mut debited = pre_exec_gas_payer.clone();
+                                let pre_value = decode_coin_value(&debited.payload)
+                                    .expect("decode pre-exec coin value");
+                                let new_value = pre_value.saturating_sub(reservation);
+                                debited.payload = rewrite_value(&debited.payload, new_value)
+                                    .expect("rewrite coin payload");
+                                debited.version = debited.version.saturating_add(1);
+                                gas_snap.insert_object(debited);
+                                gas_snap.apply_loom_delta(
+                                    proposer,
+                                    reservation.min(i128::MAX as u128) as i128,
+                                );
+                                Some(gas_snap.commit())
+                            } else {
+                                None
+                            };
+                            return ExecOutput {
+                                success: false,
+                                fuel_used: charged_fuel,
+                                return_data: format!("ptb publish admission error: {e}")
+                                    .into_bytes(),
+                                logs: vec![],
+                                write_set: ws_out,
+                            };
+                        }
                         let hash = snapshot.insert_code(event.wasm_bytes.clone());
                         snapshot.set_vfs_binding(event.module_path.clone(), hash);
                     }

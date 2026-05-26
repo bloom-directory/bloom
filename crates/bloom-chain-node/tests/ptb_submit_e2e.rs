@@ -202,13 +202,17 @@ fn make_loom_coin(id: ObjectId, owner: [u8; 32], value: u128) -> Object {
 /// `__petal_<fn>` function — the surface the validator's typecheck
 /// (step 4) needs.
 fn manifest_with_nullary_fn(fn_name: &str) -> PetalManifestStub {
+    manifest_with_nullary_fn_returns(fn_name, vec![])
+}
+
+fn manifest_with_nullary_fn_returns(fn_name: &str, returns: Vec<TypeTag>) -> PetalManifestStub {
     PetalManifestStub {
         module_path: "/test/e2e".to_string(),
         functions: vec![FunctionDeclStub {
             name: fn_name.to_string(),
             type_params: vec![],
             args: vec![],
-            returns: vec![],
+            returns,
             attached_invariants: vec![],
         }],
         ..Default::default()
@@ -298,7 +302,10 @@ fn signer_address_zero_resolves_to_first_signer() {
     state.set_object(make_loom_coin(gas_payer_id, signer, 1_000_000_000));
 
     let mut manifests = HashMap::new();
-    manifests.insert(petal_hash, manifest_with_nullary_fn("get_signer"));
+    manifests.insert(
+        petal_hash,
+        manifest_with_nullary_fn_returns("get_signer", vec![TypeTag::External { ref_idx: 0 }]),
+    );
 
     let ptb = nullary_move_ptb(signer, petal_hash, "get_signer", gas_payer_id, 100);
     let bytes = encode_ptb(&ptb).expect("encode PTB");

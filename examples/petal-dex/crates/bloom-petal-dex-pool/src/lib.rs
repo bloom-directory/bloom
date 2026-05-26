@@ -55,10 +55,13 @@ impl ParamCodec for bloom_dex_math::ConstantProductParams {
         self.fee_bps.to_be_bytes().to_vec()
     }
     fn decode(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 2 {
+        if bytes.len() != 2 {
             return None;
         }
         let fee_bps = u16::from_be_bytes([bytes[0], bytes[1]]);
+        if fee_bps >= bloom_dex_math::MAX_FEE_BPS {
+            return None;
+        }
         Some(Self { fee_bps })
     }
 }
@@ -291,15 +294,21 @@ pub mod ops {
             k_last,
             &params_bytes,
         );
-        let lp_payload = payload::lp_payload(
-            &ObjectId([0u8; 32]),
-            &ObjectId([0u8; 32]), // pool_id filled by host on creation
-            lp_minted,
-        );
 
         let pool_handle = host::object_create(&tags::pool_tag(), &pool_payload)
             .map_err(|_| PoolError::InsufficientLiquidity)?;
+        let pool_id = host::object_id(pool_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
+        let pool_payload =
+            payload::pool_payload(&pool_id, taken_a, taken_b, lp_minted, k_last, &params_bytes);
+        host::object_mutate(pool_handle, &pool_payload)
+            .map_err(|_| PoolError::InsufficientLiquidity)?;
+
+        let lp_payload = payload::lp_payload(&ObjectId([0u8; 32]), &pool_id, lp_minted);
         let lp_handle = host::object_create(&tags::lp_position_tag(), &lp_payload)
+            .map_err(|_| PoolError::InsufficientLiquidity)?;
+        let lp_id = host::object_id(lp_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
+        let lp_payload = payload::lp_payload(&lp_id, &pool_id, lp_minted);
+        host::object_mutate(lp_handle, &lp_payload)
             .map_err(|_| PoolError::InsufficientLiquidity)?;
 
         // Consume the input coins (fully taken on initial deposit).
@@ -413,7 +422,11 @@ pub mod ops {
             payload::decode_pool(&pool_raw).ok_or(PoolError::InsufficientLiquidity)?;
 
         let lp_bytes = host::object_read(lp_handle).map_err(|_| PoolError::WrongPool)?;
-        let (_pool_id, shares) = payload::decode_lp(&lp_bytes).ok_or(PoolError::WrongPool)?;
+        let (lp_pool_id, shares) = payload::decode_lp(&lp_bytes).ok_or(PoolError::WrongPool)?;
+        let pool_id = pool_id_from_payload(&pool_raw).ok_or(PoolError::WrongPool)?;
+        if lp_pool_id != pool_id {
+            return Err(PoolError::WrongPool);
+        }
 
         let (amount_a, amount_b) = S::remove_liquidity(reserve_a, reserve_b, lp_supply, shares)
             .map_err(PoolError::MathFailed)?;
@@ -706,6 +719,15 @@ pub mod ops {
         w.write_object_id(id);
         w.write_u128(value);
         w.finish()
+    }
+
+    fn pool_id_from_payload(bytes: &[u8]) -> Option<ObjectId> {
+        if bytes.len() < 32 {
+            return None;
+        }
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&bytes[..32]);
+        Some(ObjectId(id))
     }
 
     /// Compute the exact input amount required to receive `amount_out` of

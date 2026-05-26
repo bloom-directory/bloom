@@ -35,14 +35,14 @@ fn make_block(
     chain_id: &str,
     height: u64,
     parent_hash: Hash32,
-    proposer: Address,
+    _proposer: Address,
     vset: &ValidatorSet,
     signers: &[&TestValidator],
 ) -> Block {
     BlockBuilder::at(height)
         .chain_id(chain_id)
         .parent_hash(parent_hash)
-        .proposer(proposer)
+        .proposer(vset.proposer_for(height, 0).address)
         .with_computed_roots(vset)
         .signed_by(signers)
         .build()
@@ -73,6 +73,41 @@ fn well_formed_block_with_quorum_accepted() {
         &XdsaVerifier,
     );
     assert!(result.is_ok(), "well-formed block rejected: {result:?}");
+}
+
+#[test]
+fn block_with_wrong_header_proposer_is_rejected() {
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
+    let expected = vset.proposer_for(5, 0).address;
+    let wrong = [v1.addr, v2.addr, v3.addr, v4.addr]
+        .into_iter()
+        .find(|addr| *addr != expected)
+        .unwrap();
+    let block = BlockBuilder::at(5)
+        .chain_id("bloom-chain.v0")
+        .parent_hash(Hash32([0x42; 32]))
+        .proposer(wrong)
+        .with_computed_roots(&vset)
+        .signed_by(&[&v1, &v2, &v3])
+        .build();
+
+    let result = validate_block_for_apply(
+        &block,
+        5,
+        "bloom-chain.v0",
+        Hash32([0x42; 32]),
+        &vset,
+        &XdsaVerifier,
+    );
+    assert!(
+        result.is_err(),
+        "wrong header proposer must be rejected; got {result:?}"
+    );
+    assert!(result.unwrap_err().contains("header.proposer"));
 }
 
 #[test]
@@ -367,7 +402,7 @@ fn block_with_commit_for_different_block_hash_falls_below_quorum() {
         result.is_err(),
         "votes for a different block_hash must not count toward quorum; got {result:?}"
     );
-    assert!(result.unwrap_err().contains("commit quorum not met"));
+    assert!(result.unwrap_err().contains("does not match block hash"));
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +447,7 @@ fn make_block_with_tx(
     chain_id: &str,
     height: u64,
     parent_hash: Hash32,
-    proposer: Address,
+    _proposer: Address,
     vset: &ValidatorSet,
     signers: &[&TestValidator],
     tx: Tx,
@@ -420,7 +455,7 @@ fn make_block_with_tx(
     BlockBuilder::at(height)
         .chain_id(chain_id)
         .parent_hash(parent_hash)
-        .proposer(proposer)
+        .proposer(vset.proposer_for(height, 0).address)
         .txs(vec![tx])
         .with_computed_roots(vset)
         .signed_by(signers)

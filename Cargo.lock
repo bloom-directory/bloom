@@ -2041,6 +2041,7 @@ name = "bloom-chain-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "blake3",
  "bloom-chain-consensus",
  "bloom-chain-state",
@@ -2346,10 +2347,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "bloom-chain-consensus",
  "bloom-chain-node",
  "bloom-chain-state",
  "bloom-chain-types",
  "bloom-dex-math",
+ "bloom-keystore",
  "bloom-objects",
  "bloom-petal-dex-cpmm",
  "bloom-petal-dex-faucet",

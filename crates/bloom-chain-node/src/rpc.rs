@@ -24,10 +24,13 @@
 //! - `chain_ls_objects` — scan objects filtered by owner address or type name.
 //! - `chain_ls_validators` — list the current validator set.
 
+use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use base64::Engine as _;
 use bloom_chain_consensus::ValidatorSet;
 use bloom_chain_state::State;
 use bloom_chain_types::ssz::Decode;
@@ -43,10 +46,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 use tracing::{debug, error, warn};
 
 use crate::block_store::BlockStore;
 use crate::mempool_persist::MempoolPersist;
+
+pub const RPC_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+pub const RPC_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+pub const RPC_MAX_TX_BYTES: usize = 1024 * 1024;
+const RPC_MAX_TCP_CONNECTIONS: usize = 128;
+const RPC_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // JSON-RPC framing
@@ -104,6 +115,9 @@ pub struct RpcServer {
     pub mempool_persist: Arc<MempoolPersist>,
     pub receipt_store: Arc<crate::receipt_store::ReceiptStore>,
     pub validator_set: Arc<ValidatorSet>,
+    pub chain_id: String,
+    pub genesis_hash: Hash32,
+    pub local_address: Address,
     /// Sender for admitting txs to the in-memory mempool. The worker that
     /// receives on the other end performs mempool admission synchronously and
     /// replies via the oneshot — see `node.rs` § "Tx admission from RPC →
@@ -119,18 +133,26 @@ pub struct RpcServer {
 impl RpcServer {
     /// Bind the UDS listener and accept connections.
     pub async fn serve(self, socket_path: &Path) -> Result<()> {
-        // Remove stale socket.
-        if socket_path.exists() {
-            std::fs::remove_file(socket_path)
-                .with_context(|| format!("remove stale socket: {}", socket_path.display()))?;
-        }
         // Ensure parent dir exists.
         if let Some(parent) = socket_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let listener = UnixListener::bind(socket_path)
-            .with_context(|| format!("bind UDS: {}", socket_path.display()))?;
+        remove_stale_socket(socket_path)?;
+        let listener = match UnixListener::bind(socket_path) {
+            Ok(listener) => listener,
+            Err(first) => {
+                remove_stale_socket(socket_path)?;
+                UnixListener::bind(socket_path).with_context(|| {
+                    format!(
+                        "bind UDS after stale socket cleanup: {} (first error kind={:?}, err={})",
+                        socket_path.display(),
+                        first.kind(),
+                        first
+                    )
+                })?
+            }
+        };
         debug!(socket = %socket_path.display(), "rpc.listening");
 
         loop {
@@ -158,12 +180,18 @@ impl RpcServer {
             .await
             .with_context(|| format!("bind RPC TCP: {addr}"))?;
         debug!(addr = %addr, "rpc.tcp.listening");
+        let permits = Arc::new(Semaphore::new(RPC_MAX_TCP_CONNECTIONS));
 
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
+                    let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                        warn!(addr = %addr, "rpc.tcp.connection_rejected: limit reached");
+                        continue;
+                    };
                     let srv = self.clone();
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = srv.handle_connection(stream).await {
                             warn!(err = %e, "rpc.tcp.connection_error");
                         }
@@ -181,16 +209,46 @@ impl RpcServer {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (read_half, mut write_half) = tokio::io::split(stream);
-        let mut lines = BufReader::new(read_half).lines();
+        let mut reader = BufReader::new(read_half);
+        let mut buf = Vec::new();
 
-        while let Some(line) = lines.next_line().await? {
-            let line = line.trim().to_string();
+        loop {
+            buf.clear();
+            let n =
+                tokio::time::timeout(RPC_READ_TIMEOUT, read_bounded_line(&mut reader, &mut buf))
+                    .await
+                    .map_err(|_| anyhow!("RPC read timeout"))??;
+            if n == 0 {
+                break;
+            }
+            if buf.len() > RPC_MAX_REQUEST_BYTES {
+                return Err(anyhow!(
+                    "RPC request frame too large: {} > {}",
+                    buf.len(),
+                    RPC_MAX_REQUEST_BYTES
+                ));
+            }
+            let line = std::str::from_utf8(&buf)
+                .context("RPC request is not UTF-8")?
+                .trim();
             if line.is_empty() {
                 continue;
             }
-            let response = self.dispatch_line(&line).await;
+            let response = self.dispatch_line(line).await;
             let serialized = serde_json::to_string(&response)? + "\n";
-            write_half.write_all(serialized.as_bytes()).await?;
+            if serialized.len() > RPC_MAX_RESPONSE_BYTES {
+                return Err(anyhow!(
+                    "RPC response frame too large: {} > {}",
+                    serialized.len(),
+                    RPC_MAX_RESPONSE_BYTES
+                ));
+            }
+            tokio::time::timeout(
+                RPC_WRITE_TIMEOUT,
+                write_half.write_all(serialized.as_bytes()),
+            )
+            .await
+            .map_err(|_| anyhow!("RPC write timeout"))??;
         }
         Ok(())
     }
@@ -224,6 +282,7 @@ impl RpcServer {
             "chain_ls_objects" => self.handle_ls_objects(params),
             "chain_ls_validators" => self.handle_ls_validators(),
             "chain_tip" => self.handle_tip(),
+            "chain_health" => self.handle_health(),
             _ => Err(anyhow!("method not found: {method}")),
         }
     }
@@ -233,17 +292,14 @@ impl RpcServer {
     // -----------------------------------------------------------------------
 
     async fn handle_submit_tx(&self, params: &Value) -> Result<Value> {
-        // Params: { "tx_hex": "<hex-encoded SSZ tx>" }
-        // or: { "tx_b64": "<base64-encoded SSZ tx>" }
-        let tx_bytes = if let Some(h) = params.get("tx_hex").and_then(Value::as_str) {
-            hex::decode(h).context("decode tx_hex")?
-        } else if let Some(b) = params.get("tx_bytes").and_then(Value::as_array) {
-            b.iter()
-                .filter_map(|v| v.as_u64().map(|n| n as u8))
-                .collect()
-        } else {
-            return Err(anyhow!("chain_submit_tx: missing 'tx_hex' param"));
-        };
+        let tx_bytes = parse_submit_tx_bytes(params)?;
+        if tx_bytes.len() > RPC_MAX_TX_BYTES {
+            return Err(anyhow!(
+                "chain_submit_tx: tx bytes too large: {} > {}",
+                tx_bytes.len(),
+                RPC_MAX_TX_BYTES
+            ));
+        }
 
         let tx = Tx::from_ssz_bytes(&tx_bytes).map_err(|e| anyhow!("SSZ decode tx: {:?}", e))?;
 
@@ -318,6 +374,7 @@ impl RpcServer {
                 "proposer": hex::encode(block.header.proposer.0),
                 "txs_root": hex::encode(block.header.txs_root.0),
                 "state_root": hex::encode(block.header.state_root.0),
+                "receipts_root": hex::encode(block.header.receipts_root.0),
                 "fuel_used": block.header.fuel_used,
                 "fuel_limit": block.header.fuel_limit,
                 "tx_count": block.txs.len(),
@@ -511,6 +568,110 @@ impl RpcServer {
         let h = self.block_store.latest_height()?.unwrap_or(0);
         Ok(json!({ "height": h }))
     }
+
+    fn handle_health(&self) -> Result<Value> {
+        let height = self.block_store.latest_height()?.unwrap_or(0);
+        let state = self.state.lock();
+        let state_root = state.state_root();
+        let object_root = state.object_root();
+        let ownership_root = state.ownership_index_root();
+        let vfs_root = state.vfs_root();
+        Ok(json!({
+            "ok": true,
+            "chain_id": self.chain_id,
+            "genesis_hash": hex::encode(self.genesis_hash.0),
+            "validator_address": hex::encode(self.local_address.0),
+            "height": height,
+            "state_root": hex::encode(state_root.0),
+            "object_root": hex::encode(object_root.0),
+            "ownership_root": hex::encode(ownership_root.0),
+            "vfs_root": hex::encode(vfs_root.0),
+            "validator_set_hash": hex::encode(self.validator_set.validator_set_hash().0),
+        }))
+    }
+}
+
+fn remove_stale_socket(socket_path: &Path) -> Result<()> {
+    match std::fs::remove_file(socket_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("remove stale socket: {}", socket_path.display())),
+    }
+}
+
+async fn read_bounded_line<R>(reader: &mut BufReader<R>, out: &mut Vec<u8>) -> Result<usize>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(out.len());
+        }
+        let take = available
+            .iter()
+            .position(|b| *b == b'\n')
+            .map(|pos| pos + 1)
+            .unwrap_or(available.len());
+        if out.len().saturating_add(take) > RPC_MAX_REQUEST_BYTES {
+            return Err(anyhow!(
+                "RPC request frame too large: > {}",
+                RPC_MAX_REQUEST_BYTES
+            ));
+        }
+        out.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if out.ends_with(b"\n") {
+            return Ok(out.len());
+        }
+    }
+}
+
+fn parse_submit_tx_bytes(params: &Value) -> Result<Vec<u8>> {
+    let obj = params
+        .as_object()
+        .ok_or_else(|| anyhow!("chain_submit_tx: params must be an object"))?;
+    let present = ["tx_hex", "tx_b64", "tx_bytes"]
+        .iter()
+        .filter(|key| obj.contains_key(**key))
+        .count();
+    if present != 1 {
+        return Err(anyhow!(
+            "chain_submit_tx: provide exactly one of 'tx_hex', 'tx_b64', or 'tx_bytes'"
+        ));
+    }
+
+    if let Some(h) = obj.get("tx_hex") {
+        let h = h
+            .as_str()
+            .ok_or_else(|| anyhow!("chain_submit_tx: tx_hex must be a string"))?;
+        return hex::decode(h).context("decode tx_hex");
+    }
+    if let Some(b64) = obj.get("tx_b64") {
+        let b64 = b64
+            .as_str()
+            .ok_or_else(|| anyhow!("chain_submit_tx: tx_b64 must be a string"))?;
+        return base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .context("decode tx_b64");
+    }
+    let arr = obj
+        .get("tx_bytes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("chain_submit_tx: tx_bytes must be an array"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, v) in arr.iter().enumerate() {
+        let n = v
+            .as_u64()
+            .ok_or_else(|| anyhow!("chain_submit_tx: tx_bytes[{idx}] must be an integer"))?;
+        if n > u8::MAX as u64 {
+            return Err(anyhow!(
+                "chain_submit_tx: tx_bytes[{idx}] out of range: {n}"
+            ));
+        }
+        out.push(n as u8);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -789,6 +950,9 @@ mod tests {
             mempool_persist,
             receipt_store,
             validator_set,
+            chain_id: "bloomchain.test".into(),
+            genesis_hash: Hash32([0x42; 32]),
+            local_address: v.addr,
             tx_submit,
         };
         (server, tmp)
@@ -846,6 +1010,43 @@ mod tests {
             .handle_query_object(&json!({ "id": "deadbeef" }))
             .unwrap_err();
         assert!(err.to_string().contains("32 bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn submit_tx_params_reject_silent_array_truncation() {
+        let err = parse_submit_tx_bytes(&json!({ "tx_bytes": [1, 256, "3"] })).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("out of range") || msg.contains("must be an integer"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn submit_tx_params_require_exactly_one_encoding() {
+        let err = parse_submit_tx_bytes(&json!({
+            "tx_hex": "00",
+            "tx_b64": "AA=="
+        }))
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("exactly one"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn health_reports_identity_and_tip() {
+        let (server, _tmp) = make_server();
+        let res = server.handle_health().unwrap();
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["chain_id"], "bloomchain.test");
+        assert_eq!(res["genesis_hash"], hex::encode([0x42u8; 32]));
+        assert_eq!(
+            res["validator_address"],
+            hex::encode(server.local_address.0)
+        );
+        assert_eq!(res["height"], 0);
     }
 
     #[test]

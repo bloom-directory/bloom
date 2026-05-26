@@ -255,3 +255,17 @@ fn pool_error_from_math_error() {
         PoolError::MathFailed(bloom_dex_math::MathError::ZeroReserves)
     ));
 }
+
+#[test]
+fn constant_product_params_decode_bounds_fee_bps() {
+    use bloom_dex_math::ConstantProductParams;
+
+    assert_eq!(
+        ConstantProductParams::decode(&9999u16.to_be_bytes()),
+        Some(ConstantProductParams { fee_bps: 9999 })
+    );
+    assert_eq!(ConstantProductParams::decode(&10000u16.to_be_bytes()), None);
+    assert_eq!(ConstantProductParams::decode(&10001u16.to_be_bytes()), None);
+    assert_eq!(ConstantProductParams::decode(&[0x00]), None);
+    assert_eq!(ConstantProductParams::decode(&[0x00, 0x1e, 0x00]), None);
+}

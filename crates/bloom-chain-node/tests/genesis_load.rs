@@ -11,12 +11,10 @@ use tempfile::NamedTempFile;
 
 #[test]
 fn genesis_load_one_validator() {
-    // We use a raw hex address for dev-convenience (parse_b1_address accepts it).
-    let addr_hex = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
-
     // Construct a minimal 1984-byte composite pubkey in base64.
     // (All zeros — not a valid real key, but sufficient for parse testing.)
     let pk_bytes = vec![0u8; 1984];
+    let addr_hex = hex::encode(bloom_chain_types::Address::from_pubkey_bytes(&pk_bytes).0);
     let pk_b64 = {
         // Minimal base64 encoding (standard alphabet).
 

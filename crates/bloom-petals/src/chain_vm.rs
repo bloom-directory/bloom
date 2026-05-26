@@ -451,6 +451,19 @@ where
     }
 }
 
+fn row_defining_petal(row: &BorrowRow) -> Result<[u8; 32], i32> {
+    match &row.type_tag {
+        TypeTag::Concrete { petal_hash, .. } => Ok(*petal_hash),
+        _ => Err(HostError::Invalid("object op requires Concrete type_tag".into()).as_wasm_code()),
+    }
+}
+
+fn can_move_or_reown(row: &BorrowRow, caller_petal: Hash32) -> Result<bool, i32> {
+    let defines = row_defining_petal(row)? == caller_petal.0;
+    let consumed = row.access_mode == AccessMode::Consume;
+    Ok(defines || consumed)
+}
+
 /// Install the spec §16.2 host imports onto `linker`.
 ///
 /// Every import:
@@ -621,16 +634,24 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                 Err(code) => return code,
             };
 
+            let caller_petal = caller.data().petal_hash;
             with_ptb_ctx(&caller, |ctx| {
-                // Access-mode check: ReadOnly rows cannot be mutated.
-                let access = match ctx.borrow_table.get(&id) {
-                    Some(row) => row.access_mode,
+                let row = match ctx.borrow_table.get(&id) {
+                    Some(row) => row,
                     None => {
                         return HostError::NotFound("row vanished".into()).as_wasm_code();
                     }
                 };
-                if matches!(access, AccessMode::ReadOnly) {
+                if matches!(row.access_mode, AccessMode::ReadOnly) {
                     return HostError::Denied("mutate on ReadOnly".into()).as_wasm_code();
+                }
+                let defining = match row_defining_petal(row) {
+                    Ok(p) => p,
+                    Err(code) => return code,
+                };
+                if defining != caller_petal.0 {
+                    return HostError::Denied("object.mutate from non-defining petal".into())
+                        .as_wasm_code();
                 }
                 match ctx.borrow_table.mark_dirty(&id, bytes) {
                     Ok(()) => 0,
@@ -812,10 +833,21 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                 Ok(id) => id,
                 Err(code) => return code,
             };
+            let caller_petal = caller.data().petal_hash;
 
             with_ptb_ctx(&caller, |ctx| {
                 match ctx.borrow_table.get_mut(&id) {
                     Some(row) => {
+                        match can_move_or_reown(row, caller_petal) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                return HostError::Denied(
+                                    "object.transfer without defining or consume authority".into(),
+                                )
+                                .as_wasm_code();
+                            }
+                            Err(code) => return code,
+                        }
                         // Capture prior owner before overwrite: the
                         // chain-node's `rebuild_ownership_rows` needs
                         // both keys to keep the OwnershipIndex
@@ -846,8 +878,19 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                 Ok(id) => id,
                 Err(code) => return code,
             };
+            let caller_petal = caller.data().petal_hash;
             with_ptb_ctx(&caller, |ctx| match ctx.borrow_table.get_mut(&id) {
                 Some(row) => {
+                    match can_move_or_reown(row, caller_petal) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return HostError::Denied(
+                                "object.share without defining or consume authority".into(),
+                            )
+                            .as_wasm_code();
+                        }
+                        Err(code) => return code,
+                    }
                     let old_owner = row.owner.clone();
                     row.owner = Owner::Shared;
                     ctx.ownership_changes.push((id, old_owner, Owner::Shared));
@@ -873,8 +916,19 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                 Ok(id) => id,
                 Err(code) => return code,
             };
+            let caller_petal = caller.data().petal_hash;
             with_ptb_ctx(&caller, |ctx| match ctx.borrow_table.get_mut(&id) {
                 Some(row) => {
+                    match can_move_or_reown(row, caller_petal) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return HostError::Denied(
+                                "object.freeze without defining or consume authority".into(),
+                            )
+                            .as_wasm_code();
+                        }
+                        Err(code) => return code,
+                    }
                     let old_owner = row.owner.clone();
                     row.owner = Owner::Immutable;
                     ctx.ownership_changes
@@ -1837,12 +1891,13 @@ mod ptb_host_import_tests {
 
     #[test]
     fn object_mutate_replaces_payload() {
-        let petal = Hash32([0x11; 32]);
+        let wasm = parse(OBJECT_BORROW_MUTATE);
+        let petal = blake3_tagged(tags::PETAL, &wasm);
         let mut ctx = PtbHostCtx::new();
         let obj = make_object(0x07, vec![0; 3], Owner::Address([0; 32]), petal.0);
         ctx.borrow_table.load_persistent(&obj, AccessMode::Mutable);
         let arc = Arc::new(Mutex::new(ctx));
-        let out = run_with(parse(OBJECT_BORROW_MUTATE), arc.clone(), petal);
+        let out = run_with(wasm, arc.clone(), petal);
         let code = i32::from_le_bytes(out.return_data.unwrap().try_into().unwrap());
         assert_eq!(code, 0, "object.mutate must succeed");
         let guard = arc.lock().unwrap();
@@ -1894,12 +1949,13 @@ mod ptb_host_import_tests {
 
     #[test]
     fn object_transfer_records_ownership_change() {
-        let petal = Hash32([0x33; 32]);
+        let wasm = parse(OBJECT_TRANSFER);
+        let petal = blake3_tagged(tags::PETAL, &wasm);
         let mut ctx = PtbHostCtx::new();
         let obj = make_object(0x07, vec![1], Owner::Address([0xaa; 32]), petal.0);
         ctx.borrow_table.load_persistent(&obj, AccessMode::Mutable);
         let arc = Arc::new(Mutex::new(ctx));
-        let out = run_with(parse(OBJECT_TRANSFER), arc.clone(), petal);
+        let out = run_with(wasm, arc.clone(), petal);
         let code = i32::from_le_bytes(out.return_data.unwrap().try_into().unwrap());
         assert_eq!(code, 0);
         let guard = arc.lock().unwrap();
@@ -1933,12 +1989,13 @@ mod ptb_host_import_tests {
 
     #[test]
     fn object_share_sets_shared_owner() {
-        let petal = Hash32([0x44; 32]);
+        let wasm = parse(OBJECT_SHARE);
+        let petal = blake3_tagged(tags::PETAL, &wasm);
         let mut ctx = PtbHostCtx::new();
         let obj = make_object(0x07, vec![1], Owner::Address([0xaa; 32]), petal.0);
         ctx.borrow_table.load_persistent(&obj, AccessMode::Mutable);
         let arc = Arc::new(Mutex::new(ctx));
-        let _ = run_with(parse(OBJECT_SHARE), arc.clone(), petal);
+        let _ = run_with(wasm, arc.clone(), petal);
         let guard = arc.lock().unwrap();
         assert_eq!(
             guard.ownership_changes.last().map(|c| c.2.clone()),
@@ -1973,12 +2030,13 @@ mod ptb_host_import_tests {
 
     #[test]
     fn object_freeze_sets_immutable_owner() {
-        let petal = Hash32([0x55; 32]);
+        let wasm = parse(OBJECT_FREEZE);
+        let petal = blake3_tagged(tags::PETAL, &wasm);
         let mut ctx = PtbHostCtx::new();
         let obj = make_object(0x07, vec![1], Owner::Address([0xaa; 32]), petal.0);
         ctx.borrow_table.load_persistent(&obj, AccessMode::Mutable);
         let arc = Arc::new(Mutex::new(ctx));
-        let _ = run_with(parse(OBJECT_FREEZE), arc.clone(), petal);
+        let _ = run_with(wasm, arc.clone(), petal);
         let guard = arc.lock().unwrap();
         assert_eq!(
             guard.ownership_changes.last().map(|c| c.2.clone()),

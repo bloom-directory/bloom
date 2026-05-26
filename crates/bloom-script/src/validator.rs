@@ -5,7 +5,7 @@
 //! pre-loaded chain artefacts (objects, petals, manifests) the
 //! executor would otherwise refetch.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bloom_objects::{
     AccessMode, Object, ObjectId, Owner, TypeTag, ValidationOutcome, validate_canonical_bytes,
@@ -138,6 +138,20 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
                 let manifest = manifests
                     .get(&hash.0)
                     .ok_or(PtbError::PetalNotFound { hash })?;
+                let object_scope_modes: HashMap<ObjectId, AccessMode> = m
+                    .args
+                    .iter()
+                    .filter_map(|arg| {
+                        if let Arg::Object {
+                            id, access_mode, ..
+                        } = arg
+                        {
+                            Some((*id, *access_mode))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 // Pre-load every Object arg for both shape-check and
                 // type-against-manifest matching.
                 for arg in &m.args {
@@ -154,6 +168,7 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
                             *access_mode,
                             &first_signer_addr,
                             &mut objects,
+                            &object_scope_modes,
                         )?;
                     }
                 }
@@ -181,8 +196,22 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
                 cmd_return_types.push(vec![None; amounts.len()]);
             }
             Command::MakeMoveVec { .. } => cmd_return_types.push(vec![None]),
-            Command::Publish(_) => cmd_return_types.push(vec![None, None]),
-            Command::UpgradePetal(_) => cmd_return_types.push(vec![None]),
+            Command::Publish(p) => {
+                if p.publisher_cap.is_some() {
+                    return Err(PtbError::BuiltinFailed {
+                        cmd_idx: cmd_idx as u16,
+                        reason: "publish with OwnerCap is disabled until owner-cap authority is enforced".to_string(),
+                    });
+                }
+                cmd_return_types.push(vec![None, None]);
+            }
+            Command::UpgradePetal(_) => {
+                return Err(PtbError::BuiltinFailed {
+                    cmd_idx: cmd_idx as u16,
+                    reason: "UpgradePetal is disabled until owner-cap authority is enforced"
+                        .to_string(),
+                });
+            }
         }
     }
 
@@ -562,6 +591,7 @@ fn check_object_arg(
     mode: AccessMode,
     first_signer_addr: &[u8; 32],
     objects: &mut HashMap<[u8; 32], Object>,
+    object_scope_modes: &HashMap<ObjectId, AccessMode>,
 ) -> Result<(), PtbError> {
     let obj = match objects.get(&id.0) {
         Some(o) => o.clone(),
@@ -580,15 +610,29 @@ fn check_object_arg(
             found: obj.version,
         });
     }
-    check_access_mode(&obj.owner, mode, first_signer_addr, id)?;
+    let mut seen = HashSet::new();
+    check_access_mode(
+        chain,
+        &obj.owner,
+        mode,
+        first_signer_addr,
+        id,
+        objects,
+        object_scope_modes,
+        &mut seen,
+    )?;
     Ok(())
 }
 
 fn check_access_mode(
+    chain: &dyn ChainStateIface,
     owner: &Owner,
     mode: AccessMode,
     first_signer_addr: &[u8; 32],
     id: &ObjectId,
+    objects: &mut HashMap<[u8; 32], Object>,
+    object_scope_modes: &HashMap<ObjectId, AccessMode>,
+    seen: &mut HashSet<ObjectId>,
 ) -> Result<(), PtbError> {
     match (owner, mode) {
         (Owner::Immutable, AccessMode::ReadOnly) => Ok(()),
@@ -597,7 +641,12 @@ fn check_access_mode(
             mode,
             reason: "immutable objects support ReadOnly only".to_string(),
         }),
-        (Owner::Shared, _) => Ok(()),
+        (Owner::Shared, AccessMode::ReadOnly | AccessMode::Mutable) => Ok(()),
+        (Owner::Shared, AccessMode::Consume) => Err(PtbError::AccessDenied {
+            id: *id,
+            mode,
+            reason: "shared objects cannot be consumed".to_string(),
+        }),
         (Owner::Address(addr), AccessMode::Mutable | AccessMode::Consume) => {
             if addr == first_signer_addr {
                 Ok(())
@@ -610,12 +659,62 @@ fn check_access_mode(
             }
         }
         (Owner::Address(_), AccessMode::ReadOnly) => Ok(()),
-        (Owner::Object(_), _) => {
-            // v0 stub: object-owned access requires walking the borrow
-            // chain (spec §4.3). The detailed walk is implemented by
-            // the executor once it loads the parent. At validate-time
-            // we accept all modes; the executor enforces the chain.
-            Ok(())
+        (Owner::Object(parent_id), _) => {
+            if !seen.insert(*id) {
+                return Err(PtbError::AccessDenied {
+                    id: *id,
+                    mode,
+                    reason: "object-owner cycle detected".to_string(),
+                });
+            }
+            let parent_mode = object_scope_modes.get(parent_id).copied().ok_or_else(|| {
+                PtbError::AccessDenied {
+                    id: *id,
+                    mode,
+                    reason: format!(
+                        "object-owned child requires owning parent {} in command scope",
+                        hex_encode(&parent_id.0)
+                    ),
+                }
+            })?;
+            if !parent_mode_authorizes_child(parent_mode, mode) {
+                return Err(PtbError::AccessDenied {
+                    id: *id,
+                    mode,
+                    reason: format!(
+                        "object-owned child mode {mode:?} requires stronger parent authority than {parent_mode:?}"
+                    ),
+                });
+            }
+            let parent = match objects.get(&parent_id.0) {
+                Some(o) => o.clone(),
+                None => {
+                    let loaded = chain
+                        .load_object(parent_id)
+                        .ok_or(PtbError::ObjectNotFound { id: *parent_id })?;
+                    objects.insert(parent_id.0, loaded.clone());
+                    loaded
+                }
+            };
+            check_access_mode(
+                chain,
+                &parent.owner,
+                parent_mode,
+                first_signer_addr,
+                parent_id,
+                objects,
+                object_scope_modes,
+                seen,
+            )
+        }
+    }
+}
+
+fn parent_mode_authorizes_child(parent_mode: AccessMode, child_mode: AccessMode) -> bool {
+    match child_mode {
+        AccessMode::ReadOnly => true,
+        AccessMode::Mutable | AccessMode::Consume => {
+            matches!(parent_mode, AccessMode::Mutable | AccessMode::Consume)
         }
     }
 }
@@ -989,6 +1088,171 @@ mod tests {
             validate_ptb(&tx, &ctx(&chain, &verifier)),
             Err(PtbError::ObjectVersionMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_object_owned_child_without_parent_in_scope() {
+        let (chain, signer, gas_id) = setup();
+        let parent_id = ObjectId([0x44; 32]);
+        let child_id = ObjectId([0x45; 32]);
+        let mut parent = coin_obj(0x44, signer, 10, 0);
+        parent.id = parent_id;
+        parent.owner = Owner::Shared;
+        let mut child = coin_obj(0x45, signer, 10, 0);
+        child.id = child_id;
+        child.owner = Owner::Object(parent_id);
+        chain.put_object(parent);
+        chain.put_object(child);
+
+        let mut manifest = sample_manifest();
+        manifest.functions.push(FunctionDeclStub {
+            name: "touch_child".to_string(),
+            type_params: vec![],
+            args: vec![ArgDeclStub::Object {
+                ty: loom_coin_tt(),
+                mode: AccessMode::Mutable,
+            }],
+            returns: vec![],
+            attached_invariants: vec![],
+        });
+        chain.put_petal(Hash32([0xAB; 32]), vec![], manifest);
+        let mut tx = sample_ptb(signer, gas_id, 100);
+        tx.commands = vec![Command::Move(MoveCmd {
+            petal: PetalRef {
+                path: "/bloom/dex/pool".to_string(),
+                hash: Some(Hash32([0xAB; 32])),
+            },
+            function: "touch_child".to_string(),
+            type_args: vec![],
+            args: vec![Arg::Object {
+                id: child_id,
+                expected_version: ExpectedVersion(0),
+                access_mode: AccessMode::Mutable,
+            }],
+        })];
+        let verifier = AlwaysOkVerifier;
+        assert!(matches!(
+            validate_ptb(&tx, &ctx(&chain, &verifier)),
+            Err(PtbError::AccessDenied { .. })
+        ));
+    }
+
+    #[test]
+    fn accepts_object_owned_child_when_parent_authority_in_scope() {
+        let (chain, signer, gas_id) = setup();
+        let parent_id = ObjectId([0x54; 32]);
+        let child_id = ObjectId([0x55; 32]);
+        let mut parent = coin_obj(0x54, signer, 10, 0);
+        parent.id = parent_id;
+        parent.owner = Owner::Shared;
+        let mut child = coin_obj(0x55, signer, 10, 0);
+        child.id = child_id;
+        child.owner = Owner::Object(parent_id);
+        chain.put_object(parent);
+        chain.put_object(child);
+
+        let mut manifest = sample_manifest();
+        manifest.functions.push(FunctionDeclStub {
+            name: "touch_pair".to_string(),
+            type_params: vec![],
+            args: vec![
+                ArgDeclStub::Object {
+                    ty: loom_coin_tt(),
+                    mode: AccessMode::Mutable,
+                },
+                ArgDeclStub::Object {
+                    ty: loom_coin_tt(),
+                    mode: AccessMode::Mutable,
+                },
+            ],
+            returns: vec![],
+            attached_invariants: vec![],
+        });
+        chain.put_petal(Hash32([0xAB; 32]), vec![], manifest);
+        let mut tx = sample_ptb(signer, gas_id, 100);
+        tx.commands = vec![Command::Move(MoveCmd {
+            petal: PetalRef {
+                path: "/bloom/dex/pool".to_string(),
+                hash: Some(Hash32([0xAB; 32])),
+            },
+            function: "touch_pair".to_string(),
+            type_args: vec![],
+            args: vec![
+                Arg::Object {
+                    id: parent_id,
+                    expected_version: ExpectedVersion(0),
+                    access_mode: AccessMode::Mutable,
+                },
+                Arg::Object {
+                    id: child_id,
+                    expected_version: ExpectedVersion(0),
+                    access_mode: AccessMode::Mutable,
+                },
+            ],
+        })];
+        let verifier = AlwaysOkVerifier;
+        let validated = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap();
+        assert!(validated.objects.contains_key(&parent_id.0));
+        assert!(validated.objects.contains_key(&child_id.0));
+    }
+
+    #[test]
+    fn rejects_mutable_object_owned_child_when_parent_is_readonly() {
+        let (chain, signer, gas_id) = setup();
+        let parent_id = ObjectId([0x64; 32]);
+        let child_id = ObjectId([0x65; 32]);
+        let mut parent = coin_obj(0x64, signer, 10, 0);
+        parent.id = parent_id;
+        parent.owner = Owner::Address(signer);
+        let mut child = coin_obj(0x65, signer, 10, 0);
+        child.id = child_id;
+        child.owner = Owner::Object(parent_id);
+        chain.put_object(parent);
+        chain.put_object(child);
+
+        let mut manifest = sample_manifest();
+        manifest.functions.push(FunctionDeclStub {
+            name: "read_parent_mutate_child".to_string(),
+            type_params: vec![],
+            args: vec![
+                ArgDeclStub::Object {
+                    ty: loom_coin_tt(),
+                    mode: AccessMode::ReadOnly,
+                },
+                ArgDeclStub::Object {
+                    ty: loom_coin_tt(),
+                    mode: AccessMode::Mutable,
+                },
+            ],
+            returns: vec![],
+            attached_invariants: vec![],
+        });
+        chain.put_petal(Hash32([0xAB; 32]), vec![], manifest);
+        let mut tx = sample_ptb(signer, gas_id, 100);
+        tx.commands = vec![Command::Move(MoveCmd {
+            petal: PetalRef {
+                path: "/bloom/dex/pool".to_string(),
+                hash: Some(Hash32([0xAB; 32])),
+            },
+            function: "read_parent_mutate_child".to_string(),
+            type_args: vec![],
+            args: vec![
+                Arg::Object {
+                    id: parent_id,
+                    expected_version: ExpectedVersion(0),
+                    access_mode: AccessMode::ReadOnly,
+                },
+                Arg::Object {
+                    id: child_id,
+                    expected_version: ExpectedVersion(0),
+                    access_mode: AccessMode::Mutable,
+                },
+            ],
+        })];
+        let verifier = AlwaysOkVerifier;
+        let err = validate_ptb(&tx, &ctx(&chain, &verifier))
+            .expect_err("ReadOnly parent must not authorize Mutable child");
+        assert!(matches!(err, PtbError::AccessDenied { .. }));
     }
 
     #[test]

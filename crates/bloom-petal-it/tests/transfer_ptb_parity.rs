@@ -144,7 +144,7 @@ fn apply_ptb_split_transfer(state: &mut State, alice: Address, bob: Address, amo
                     ty: type_tag_coin_loom(),
                     mode: AccessMode::Mutable,
                 }],
-                returns: vec![],
+                returns: vec![type_tag_coin_loom()],
                 attached_invariants: vec![],
             }],
             ..Default::default()

@@ -104,25 +104,30 @@ pub struct VoteTally {
     /// block_hash → accumulated voting_power of validators that voted for it.
     /// `None` key means nil-vote.
     per_hash: BTreeMap<Option<Hash32>, u64>,
-    /// Set of validator addresses that have already voted in this slot.
-    voted: std::collections::HashSet<bloom_chain_types::types::Address>,
+    /// First vote recorded for each validator in this slot.
+    votes: std::collections::HashMap<bloom_chain_types::types::Address, Option<Hash32>>,
+    /// Validators that emitted conflicting votes in this slot.
+    equivocators: std::collections::HashSet<bloom_chain_types::types::Address>,
 }
 
 impl VoteTally {
     /// Record a vote.  Returns the cumulative voting power for the voted hash
-    /// after adding this vote.  Duplicate votes (same validator) are ignored —
-    /// the first vote counts; equivocations are not punished in v0.
+    /// after adding this vote. Duplicate identical votes are ignored. A
+    /// conflicting duplicate is tracked as equivocation evidence while first
+    /// vote wins for voting-power accounting.
     pub fn record(
         &mut self,
         validator: bloom_chain_types::types::Address,
         power: u64,
         hash: Option<Hash32>,
     ) -> u64 {
-        if self.voted.contains(&validator) {
-            // Already voted — ignore equivocation silently in v0.
+        if let Some(first_hash) = self.votes.get(&validator).copied() {
+            if first_hash != hash {
+                self.equivocators.insert(validator);
+            }
             return self.per_hash.get(&hash).copied().unwrap_or(0);
         }
-        self.voted.insert(validator);
+        self.votes.insert(validator, hash);
         let entry = self.per_hash.entry(hash).or_insert(0);
         *entry += power;
         *entry
@@ -152,6 +157,11 @@ impl VoteTally {
     /// Total power recorded so far across all hashes.
     pub fn total_power(&self) -> u64 {
         self.per_hash.values().sum()
+    }
+
+    /// Validators that emitted conflicting votes for this height/round/kind.
+    pub fn equivocators(&self) -> impl Iterator<Item = bloom_chain_types::types::Address> + '_ {
+        self.equivocators.iter().copied()
     }
 }
 
@@ -528,11 +538,18 @@ impl ConsensusState {
                 }
             }
             VoteKind::Precommit => {
-                // Store for later Commit construction.
-                self.all_precommit_votes
-                    .entry(v.round)
-                    .or_default()
-                    .push(v.clone());
+                // Store the first precommit observed from each validator for
+                // later Commit construction. VoteTally ignores duplicate
+                // validators for power accounting; the Commit bytes must carry
+                // the same de-duplicated validator set or strict apply-time
+                // validation will reject blocks built from gossiped duplicates.
+                let round_votes = self.all_precommit_votes.entry(v.round).or_default();
+                if round_votes
+                    .iter()
+                    .all(|existing| existing.validator != v.validator)
+                {
+                    round_votes.push(v.clone());
+                }
 
                 let tally = self.precommits.entry(v.round).or_default();
                 tally.record(v.validator, power, v.block_hash);
@@ -737,5 +754,53 @@ mod tests {
         tally.record(make_addr(2), 100, hash);
         // 300 >= 267
         assert!(tally.has_quorum(267));
+    }
+
+    #[test]
+    fn vote_tally_tracks_equivocation_without_double_counting() {
+        let mut tally = VoteTally::default();
+        let h1 = Some(Hash32([0xAA; 32]));
+        let h2 = Some(Hash32([0xBB; 32]));
+        tally.record(make_addr(0), 100, h1);
+        tally.record(make_addr(0), 100, h2);
+
+        assert_eq!(tally.power_for(h1), 100);
+        assert_eq!(tally.power_for(h2), 0);
+        assert_eq!(tally.total_power(), 100);
+        assert_eq!(tally.equivocators().collect::<Vec<_>>(), vec![make_addr(0)]);
+    }
+
+    #[test]
+    fn commit_votes_are_deduplicated_by_validator() {
+        let mut sm = ConsensusState::new(1, make_addr(0), make_validator_set());
+        let (hash, block) = make_block(0xCC);
+        let mut blocks = BTreeMap::new();
+        blocks.insert(hash, block);
+
+        let vote = |seed| Vote {
+            height: 1,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: Some(hash),
+            validator: make_addr(seed),
+            sig: SigBytes(vec![seed]),
+        };
+
+        assert!(sm.handle(Event::ReceiveVote(vote(0)), &blocks).is_empty());
+        assert!(sm.handle(Event::ReceiveVote(vote(0)), &blocks).is_empty());
+        assert!(sm.handle(Event::ReceiveVote(vote(1)), &blocks).is_empty());
+        let actions = sm.handle(Event::ReceiveVote(vote(2)), &blocks);
+
+        let commit = actions
+            .iter()
+            .find_map(|action| match action {
+                Action::Commit(_, commit) => Some(commit),
+                _ => None,
+            })
+            .expect("third unique precommit reaches quorum");
+        assert_eq!(commit.votes.len(), 3);
+        assert_eq!(commit.votes[0].validator, make_addr(0));
+        assert_eq!(commit.votes[1].validator, make_addr(1));
+        assert_eq!(commit.votes[2].validator, make_addr(2));
     }
 }

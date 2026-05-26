@@ -314,14 +314,15 @@ pub fn addr(b: u8) -> Address {
 
 /// Build a workspace crate for `wasm32-unknown-unknown` (default features —
 /// i.e. *with* the `__petal_*` entrypoints) and return the path to the
-/// emitted `<artifact>.wasm`. Shells out to `cargo build --target
-/// wasm32-unknown-unknown -p <crate>`; panics if the build or artifact is
-/// missing.
+/// emitted release `<artifact>.wasm`. Live-chain tests deploy these blobs
+/// through the same chain admission path as operators; debug WASM artifacts are
+/// several MiB and intentionally exceed the protocol's max code-size cap.
 fn build_petal_wasm(crate_name: &str, artifact_stem: &str) -> PathBuf {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let status = OsCommand::new(env!("CARGO"))
         .args([
             "build",
+            "--release",
             "-p",
             crate_name,
             "--target",
@@ -342,7 +343,7 @@ fn build_petal_wasm(crate_name: &str, artifact_stem: &str) -> PathBuf {
     let artifact = workspace_root
         .join("target")
         .join("wasm32-unknown-unknown")
-        .join("debug")
+        .join("release")
         .join(format!("{artifact_stem}.wasm"));
     assert!(
         artifact.exists(),
@@ -371,6 +372,12 @@ pub fn build_wallet_wasm() -> PathBuf {
 /// only emits `Coin<LOOM>` (the live-docker provisioning linchpin).
 pub fn build_faucet_wasm() -> PathBuf {
     build_petal_wasm("bloom-petal-dex-faucet", "bloom_petal_dex_faucet")
+}
+
+/// Build `bloom-petal-dex-router` for `wasm32-unknown-unknown`; returns the
+/// artifact path.
+pub fn build_router_wasm() -> PathBuf {
+    build_petal_wasm("bloom-petal-dex-router", "bloom_petal_dex_router")
 }
 
 // ---------------------------------------------------------------------------

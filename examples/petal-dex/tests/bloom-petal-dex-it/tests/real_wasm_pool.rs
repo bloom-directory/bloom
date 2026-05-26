@@ -18,7 +18,7 @@
 //! cargo test -p bloom-petal-dex-it --test real_wasm_pool -- --ignored --nocapture
 //! ```
 
-use bloom_objects::{AccessMode, Owner, TypeTag};
+use bloom_objects::{AccessMode, OWNER_KIND_ADDRESS, Owner, OwnershipIndexKey, TypeTag};
 use bloom_script::{Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PqSignature, PtbTx, UseRef};
 
 use bloom_petal_dex_it::dex_harness::{
@@ -445,4 +445,462 @@ fn real_pool_swap_then_wallet_receive_threads_coin() {
         bloom_petal_dex_pool::payload::decode_pool(&pool.payload).expect("decode pool");
     assert_eq!(ra, 1100, "reserve_a after swap");
     assert_eq!(rb, 910, "reserve_b after swap");
+}
+
+#[test]
+#[ignore = "compiles pool to wasm32; run with `-- --ignored`"]
+fn real_pool_cross_pool_lp_remove_reverts_without_state_change() {
+    let alice = addr(0xA1);
+    let mut state = build_state(&[(alice, 1_000_000)]);
+
+    let wasm = std::fs::read(build_pool_wasm()).expect("read pool wasm");
+    let pool_petal_hash = state.insert_code(&wasm);
+    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_petal_hash);
+
+    let pool_a = create_shared_pool(&mut state, alice, pool_petal_hash, b"a", 30);
+    let lp_a = lp_positions_owned_by(&state, alice)
+        .into_iter()
+        .next()
+        .expect("alice owns initial LP for pool A");
+    let pool_b = create_shared_pool(&mut state, alice, pool_petal_hash, b"b", 31);
+
+    let pool_a_before = state.get_object(&pool_a).expect("pool A").clone();
+    let pool_b_before = state.get_object(&pool_b).expect("pool B").clone();
+    let lp_before = state.get_object(&lp_a).expect("LP A").clone();
+    let alice_owned_before = owned_ids(&state, alice);
+
+    let gas_payer = genesis_coin_id(alice, 0);
+    let ptb = PtbTx {
+        signers: vec![alice.0],
+        commands: vec![
+            Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/bloom/dex/pool".to_string(),
+                    hash: Some(pool_petal_hash),
+                },
+                function: "remove_liquidity".to_string(),
+                type_args: vec![],
+                args: vec![
+                    Arg::Object {
+                        id: pool_b,
+                        expected_version: ExpectedVersion(pool_b_before.version),
+                        access_mode: AccessMode::Mutable,
+                    },
+                    Arg::Object {
+                        id: lp_a,
+                        expected_version: ExpectedVersion(lp_before.version),
+                        access_mode: AccessMode::Consume,
+                    },
+                ],
+            }),
+            Command::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                }],
+                owner: Owner::Address(alice.0),
+            },
+            Command::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 1,
+                }],
+                owner: Owner::Address(alice.0),
+            },
+        ],
+        gas_payer,
+        gas_budget: 2_000_000,
+        gas_price: 0,
+        expiry_block: 100,
+        signatures: vec![PqSignature(vec![0u8; 64])],
+    };
+
+    let out = submit_ptb_chain_auth(&mut state, alice, ptb);
+    assert!(
+        !out.success,
+        "cross-pool LP withdrawal must revert, got success"
+    );
+    assert_eq!(state.get_object(&pool_a), Some(pool_a_before));
+    assert_eq!(state.get_object(&pool_b), Some(pool_b_before));
+    assert_eq!(state.get_object(&lp_a), Some(lp_before));
+    assert_eq!(
+        owned_ids(&state, alice),
+        alice_owned_before,
+        "ownership index must not change on reverted cross-pool withdrawal"
+    );
+}
+
+#[test]
+#[ignore = "compiles pool to wasm32; run with `-- --ignored`"]
+fn real_pool_stale_shared_pool_version_and_sandwich_slippage_revert() {
+    let alice = addr(0xA1);
+    let bob = addr(0xB0);
+    let attacker = addr(0xE0);
+    let mut state = build_state(&[(alice, 1_000_000), (bob, 1_000_000), (attacker, 1_000_000)]);
+
+    let wasm = std::fs::read(build_pool_wasm()).expect("read pool wasm");
+    let pool_petal_hash = state.insert_code(&wasm);
+    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_petal_hash);
+
+    let pool_id = create_shared_pool(&mut state, alice, pool_petal_hash, b"main", 30);
+    let stale_version = state.get_object(&pool_id).expect("pool").version;
+
+    let bob_coin_stale = erased_coin_id(b"bob-stale");
+    seed_erased_coin(&mut state, bob_coin_stale, Owner::Address(bob.0), 100);
+    let stale_swap = swap_exact_in_ptb(
+        bob,
+        genesis_coin_id(bob, 1),
+        pool_petal_hash,
+        pool_id,
+        stale_version,
+        bob_coin_stale,
+        90,
+    );
+
+    let attacker_coin = erased_coin_id(b"attacker-front-run");
+    seed_erased_coin(&mut state, attacker_coin, Owner::Address(attacker.0), 500);
+    let attacker_swap = swap_exact_in_ptb(
+        attacker,
+        genesis_coin_id(attacker, 2),
+        pool_petal_hash,
+        pool_id,
+        stale_version,
+        attacker_coin,
+        300,
+    );
+    let out = submit_ptb_chain_auth(&mut state, attacker, attacker_swap);
+    assert!(
+        out.success,
+        "attacker/front-run swap must succeed; revert: {}",
+        String::from_utf8_lossy(&out.return_data)
+    );
+
+    let after_attacker = state
+        .get_object(&pool_id)
+        .expect("pool after attack")
+        .clone();
+    assert!(
+        after_attacker.version > stale_version,
+        "successful mutable shared-pool swap must bump version"
+    );
+
+    let out = submit_ptb_chain_auth(&mut state, bob, stale_swap);
+    assert!(
+        !out.success,
+        "stale shared-pool expected_version must reject after contention"
+    );
+    assert_eq!(
+        state.get_object(&pool_id),
+        Some(after_attacker.clone()),
+        "stale-version revert must not mutate pool"
+    );
+    assert!(
+        state.get_object(&bob_coin_stale).is_some(),
+        "stale-version revert must leave bob input coin"
+    );
+
+    let bob_coin_sandwich = erased_coin_id(b"bob-sandwich");
+    seed_erased_coin(&mut state, bob_coin_sandwich, Owner::Address(bob.0), 100);
+    let sandwich_swap = swap_exact_in_ptb(
+        bob,
+        genesis_coin_id(bob, 1),
+        pool_petal_hash,
+        pool_id,
+        after_attacker.version,
+        bob_coin_sandwich,
+        90,
+    );
+    let out = submit_ptb_chain_auth(&mut state, bob, sandwich_swap);
+    assert!(
+        !out.success,
+        "victim swap with pre-attack min_out must revert on slippage"
+    );
+    assert_eq!(
+        state.get_object(&pool_id),
+        Some(after_attacker),
+        "slippage revert must preserve post-attacker pool state"
+    );
+    assert!(
+        state.get_object(&bob_coin_sandwich).is_some(),
+        "slippage revert must leave bob input coin"
+    );
+}
+
+#[test]
+#[ignore = "compiles pool to wasm32; run with `-- --ignored`"]
+fn real_pool_add_remove_and_exact_out_execute() {
+    let alice = addr(0xA1);
+    let bob = addr(0xB0);
+    let mut state = build_state(&[(alice, 1_000_000), (bob, 1_000_000)]);
+
+    let wasm = std::fs::read(build_pool_wasm()).expect("read pool wasm");
+    let pool_petal_hash = state.insert_code(&wasm);
+    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_petal_hash);
+
+    let pool_id = create_shared_pool(&mut state, alice, pool_petal_hash, b"main", 30);
+    let lps_before_add = lp_positions_owned_by(&state, alice);
+    let add_a = erased_coin_id(b"add-a");
+    let add_b = erased_coin_id(b"add-b");
+    seed_erased_coin(&mut state, add_a, Owner::Address(alice.0), 500);
+    seed_erased_coin(&mut state, add_b, Owner::Address(alice.0), 600);
+    let add_ptb = PtbTx {
+        signers: vec![alice.0],
+        commands: vec![
+            Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/bloom/dex/pool".to_string(),
+                    hash: Some(pool_petal_hash),
+                },
+                function: "add_liquidity".to_string(),
+                type_args: vec![],
+                args: vec![
+                    Arg::Object {
+                        id: pool_id,
+                        expected_version: ExpectedVersion(
+                            state.get_object(&pool_id).expect("pool").version,
+                        ),
+                        access_mode: AccessMode::Mutable,
+                    },
+                    Arg::Object {
+                        id: add_a,
+                        expected_version: ExpectedVersion(0),
+                        access_mode: AccessMode::Consume,
+                    },
+                    Arg::Object {
+                        id: add_b,
+                        expected_version: ExpectedVersion(0),
+                        access_mode: AccessMode::Consume,
+                    },
+                ],
+            }),
+            Command::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                }],
+                owner: Owner::Address(alice.0),
+            },
+            Command::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 2,
+                }],
+                owner: Owner::Address(alice.0),
+            },
+        ],
+        gas_payer: genesis_coin_id(alice, 0),
+        gas_budget: 2_000_000,
+        gas_price: 0,
+        expiry_block: 100,
+        signatures: vec![PqSignature(vec![0u8; 64])],
+    };
+    let out = submit_ptb_chain_auth(&mut state, alice, add_ptb);
+    assert!(
+        out.success,
+        "add_liquidity must succeed; revert: {}",
+        String::from_utf8_lossy(&out.return_data)
+    );
+    let pool = state.get_object(&pool_id).expect("pool after add");
+    let (ra, rb, lp_supply, ..) =
+        bloom_petal_dex_pool::payload::decode_pool(&pool.payload).expect("decode pool");
+    assert_eq!((ra, rb, lp_supply), (1500, 1500, 1500));
+    assert!(owner_has_coin_worth(&state, alice, 100), "leftover B coin");
+
+    let added_lp = lp_positions_owned_by(&state, alice)
+        .into_iter()
+        .find(|id| !lps_before_add.contains(id))
+        .expect("add_liquidity minted a new LP position");
+    let added_lp_version = state.get_object(&added_lp).expect("added LP").version;
+    let remove_ptb = PtbTx {
+        signers: vec![alice.0],
+        commands: vec![
+            Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/bloom/dex/pool".to_string(),
+                    hash: Some(pool_petal_hash),
+                },
+                function: "remove_liquidity".to_string(),
+                type_args: vec![],
+                args: vec![
+                    Arg::Object {
+                        id: pool_id,
+                        expected_version: ExpectedVersion(
+                            state.get_object(&pool_id).expect("pool").version,
+                        ),
+                        access_mode: AccessMode::Mutable,
+                    },
+                    Arg::Object {
+                        id: added_lp,
+                        expected_version: ExpectedVersion(added_lp_version),
+                        access_mode: AccessMode::Consume,
+                    },
+                ],
+            }),
+            Command::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                }],
+                owner: Owner::Address(alice.0),
+            },
+            Command::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 1,
+                }],
+                owner: Owner::Address(alice.0),
+            },
+        ],
+        gas_payer: genesis_coin_id(alice, 0),
+        gas_budget: 2_000_000,
+        gas_price: 0,
+        expiry_block: 100,
+        signatures: vec![PqSignature(vec![0u8; 64])],
+    };
+    let out = submit_ptb_chain_auth(&mut state, alice, remove_ptb);
+    assert!(
+        out.success,
+        "remove_liquidity must succeed; revert: {}",
+        String::from_utf8_lossy(&out.return_data)
+    );
+    assert!(
+        state.get_object(&added_lp).is_none(),
+        "burned LP must be consumed"
+    );
+    let pool = state.get_object(&pool_id).expect("pool after remove");
+    let (ra, rb, lp_supply, ..) =
+        bloom_petal_dex_pool::payload::decode_pool(&pool.payload).expect("decode pool");
+    assert_eq!((ra, rb, lp_supply), (1000, 1000, 1000));
+
+    let bob_coin = erased_coin_id(b"bob-exact-out");
+    seed_erased_coin(&mut state, bob_coin, Owner::Address(bob.0), 120);
+    let exact_out_ptb = PtbTx {
+        signers: vec![bob.0],
+        commands: vec![
+            Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/bloom/dex/pool".to_string(),
+                    hash: Some(pool_petal_hash),
+                },
+                function: "swap_exact_out".to_string(),
+                type_args: vec![],
+                args: vec![
+                    Arg::Object {
+                        id: pool_id,
+                        expected_version: ExpectedVersion(
+                            state.get_object(&pool_id).expect("pool").version,
+                        ),
+                        access_mode: AccessMode::Mutable,
+                    },
+                    Arg::Object {
+                        id: bob_coin,
+                        expected_version: ExpectedVersion(0),
+                        access_mode: AccessMode::Consume,
+                    },
+                    Arg::Const(90u128.to_be_bytes().to_vec()),
+                ],
+            }),
+            Command::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                }],
+                owner: Owner::Address(bob.0),
+            },
+            Command::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 1,
+                }],
+                owner: Owner::Address(bob.0),
+            },
+        ],
+        gas_payer: genesis_coin_id(bob, 1),
+        gas_budget: 2_000_000,
+        gas_price: 0,
+        expiry_block: 100,
+        signatures: vec![PqSignature(vec![0u8; 64])],
+    };
+    let out = submit_ptb_chain_auth(&mut state, bob, exact_out_ptb);
+    assert!(
+        out.success,
+        "swap_exact_out must succeed; revert: {}",
+        String::from_utf8_lossy(&out.return_data)
+    );
+    assert!(owner_has_coin_worth(&state, bob, 90), "exact output coin");
+}
+
+fn lp_positions_owned_by(
+    state: &bloom_chain_state::State,
+    who: bloom_chain_types::types::Address,
+) -> Vec<bloom_objects::ObjectId> {
+    state
+        .iter_objects()
+        .filter(|(_, o)| {
+            o.owner == Owner::Address(who.0)
+                && matches!(&o.type_tag, TypeTag::Concrete { type_name, .. } if type_name == "LpPosition")
+        })
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+fn owned_ids(
+    state: &bloom_chain_state::State,
+    who: bloom_chain_types::types::Address,
+) -> Vec<bloom_objects::ObjectId> {
+    state
+        .get_ownership(&OwnershipIndexKey {
+            owner_kind: OWNER_KIND_ADDRESS,
+            owner_id: who.0,
+        })
+        .unwrap_or_default()
+}
+
+fn swap_exact_in_ptb(
+    signer: bloom_chain_types::types::Address,
+    gas_payer: bloom_objects::ObjectId,
+    pool_petal_hash: bloom_chain_types::types::Hash32,
+    pool_id: bloom_objects::ObjectId,
+    pool_version: u64,
+    coin_in: bloom_objects::ObjectId,
+    min_out: u128,
+) -> PtbTx {
+    PtbTx {
+        signers: vec![signer.0],
+        commands: vec![
+            Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/bloom/dex/pool".to_string(),
+                    hash: Some(pool_petal_hash),
+                },
+                function: "swap_exact_in".to_string(),
+                type_args: vec![],
+                args: vec![
+                    Arg::Object {
+                        id: coin_in,
+                        expected_version: ExpectedVersion(0),
+                        access_mode: AccessMode::Consume,
+                    },
+                    Arg::Object {
+                        id: pool_id,
+                        expected_version: ExpectedVersion(pool_version),
+                        access_mode: AccessMode::Mutable,
+                    },
+                    Arg::Const(min_out.to_be_bytes().to_vec()),
+                ],
+            }),
+            Command::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                }],
+                owner: Owner::Address(signer.0),
+            },
+        ],
+        gas_payer,
+        gas_budget: 2_000_000,
+        gas_price: 0,
+        expiry_block: 100,
+        signatures: vec![PqSignature(vec![0u8; 64])],
+    }
 }

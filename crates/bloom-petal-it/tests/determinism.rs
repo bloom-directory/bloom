@@ -102,7 +102,7 @@ fn apply_ptb_split_transfer(
                     ty: bloom_petal_fungible::ops::type_tag_coin_loom(),
                     mode: AccessMode::Mutable,
                 }],
-                returns: vec![],
+                returns: vec![bloom_petal_fungible::ops::type_tag_coin_loom()],
                 attached_invariants: vec![],
             }],
             ..Default::default()

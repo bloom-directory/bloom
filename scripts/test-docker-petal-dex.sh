@@ -123,6 +123,7 @@ if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
         --peer-hosts "$peer_hosts" \
         --listen-addr 0.0.0.0:26656 \
         --rpc-tcp-addr 0.0.0.0:8545 \
+        --unsafe-rpc-public-bind \
         --allocation 1000000000000000000000000
 
     # Append the inner-PTB Ed25519 gas allocation to ALL FOUR genesis.toml

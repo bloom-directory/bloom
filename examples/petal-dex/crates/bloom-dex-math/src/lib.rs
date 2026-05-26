@@ -8,6 +8,12 @@ mod sqrt;
 
 pub use sqrt::integer_sqrt;
 
+/// One hundred percent expressed in basis points.
+///
+/// Fees must be strictly less than this value. A 10,000 bps fee would make
+/// every swap output zero, and larger values underflow the fee factor.
+pub const MAX_FEE_BPS: u16 = 10_000;
+
 // ─── Error type ──────────────────────────────────────────────────────────────
 
 /// Errors that can arise from DEX math operations.
@@ -104,9 +110,12 @@ impl SwapStrategy for ConstantProduct {
         if amount_in == 0 {
             return Err(MathError::ZeroAmountIn);
         }
+        if params.fee_bps >= MAX_FEE_BPS {
+            return Err(MathError::MaxOutExceeded);
+        }
 
         // amount_in_with_fee = amount_in * (10_000 - fee_bps) / 10_000
-        let fee_factor = 10_000u128 - u128::from(params.fee_bps);
+        let fee_factor = u128::from(MAX_FEE_BPS - params.fee_bps);
         let amount_in_with_fee = amount_in
             .checked_mul(fee_factor)
             .ok_or(MathError::Overflow)?
@@ -276,6 +285,18 @@ mod tests {
         let s = integer_sqrt(n);
         assert!(s * s <= n);
         assert!((s + 1) * (s + 1) > n);
+    }
+
+    #[test]
+    fn quote_rejects_fee_at_or_above_100_percent() {
+        assert_eq!(
+            ConstantProduct::quote(1000, 1000, 100, &params(MAX_FEE_BPS)),
+            Err(MathError::MaxOutExceeded)
+        );
+        assert_eq!(
+            ConstantProduct::quote(1000, 1000, 100, &params(MAX_FEE_BPS + 1)),
+            Err(MathError::MaxOutExceeded)
+        );
     }
 
     #[test]

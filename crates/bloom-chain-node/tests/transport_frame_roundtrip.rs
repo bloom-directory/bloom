@@ -7,9 +7,10 @@
 
 use bloom_chain_node::transport::{Frame, read_frame, write_frame};
 use bloom_chain_types::{
+    block::{Block, BlockHeader},
     tx::{Tx, TxKind},
     types::{Address, Hash32, PubKeyBytes, SigBytes},
-    vote::{Proposal, Vote, VoteKind},
+    vote::{Commit, Proposal, Vote, VoteKind},
 };
 use tokio::net::{TcpListener, TcpStream};
 
@@ -44,6 +45,19 @@ async fn roundtrip(frame: Frame) {
             Frame::BlockRequest { height } => (3, height.to_be_bytes().to_vec()),
             Frame::Ping => (7, vec![]),
             Frame::Pong => (8, vec![]),
+            Frame::StateSnapshotRequest { min_height } => (9, min_height.to_be_bytes().to_vec()),
+            Frame::StateSnapshotResponse {
+                block,
+                state_root,
+                blob_hash,
+                blob,
+            } => {
+                let mut bytes = block.as_ssz_bytes();
+                bytes.extend_from_slice(&state_root.0);
+                bytes.extend_from_slice(&blob_hash.0);
+                bytes.extend_from_slice(blob);
+                (10, bytes)
+            }
             _ => (255, vec![]),
         }
     }
@@ -98,4 +112,43 @@ async fn vote_roundtrip() {
 async fn ping_pong_roundtrip() {
     roundtrip(Frame::Ping).await;
     roundtrip(Frame::Pong).await;
+}
+
+#[tokio::test]
+async fn state_snapshot_request_roundtrip() {
+    roundtrip(Frame::StateSnapshotRequest { min_height: 64 }).await;
+}
+
+#[tokio::test]
+async fn state_snapshot_response_roundtrip() {
+    let block = Block {
+        header: BlockHeader {
+            chain_id: "bloomchain.test".to_string(),
+            height: 64,
+            parent_hash: Hash32([0x01; 32]),
+            timestamp_ms: 1_747_526_400_000,
+            proposer: Address([0x02; 32]),
+            txs_root: Hash32([0x03; 32]),
+            state_root: Hash32([0x04; 32]),
+            receipts_root: Hash32([0x05; 32]),
+            validator_set_hash: Hash32([0x06; 32]),
+            fuel_used: 7,
+            fuel_limit: 30_000_000,
+        },
+        txs: vec![],
+        commit: Commit {
+            height: 64,
+            round: 0,
+            block_hash: Hash32([0x08; 32]),
+            votes: vec![],
+        },
+    };
+
+    roundtrip(Frame::StateSnapshotResponse {
+        block,
+        state_root: Hash32([0x04; 32]),
+        blob_hash: Hash32([0x09; 32]),
+        blob: vec![0x0A, 0x0B, 0x0C],
+    })
+    .await;
 }

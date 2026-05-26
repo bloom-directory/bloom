@@ -25,7 +25,7 @@ use bloom_chain_consensus::{
 use bloom_chain_state::State;
 use bloom_chain_types::{
     block::{Block, BlockHeader},
-    digest::blake3_tagged,
+    receipt::receipts_root,
     types::{Address, Hash32},
     vote::Commit,
 };
@@ -37,7 +37,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     block_store::BlockStore,
-    consensus_driver::{BLOCK_EMISSION, ConsensusDriver, XdsaVerifier},
+    consensus_driver::{
+        BLOCK_EMISSION, ConsensusDriver, PetalExecutor, XdsaVerifier,
+        apply_block_state_transitions, compute_txs_root, validate_block_for_apply,
+    },
     genesis::Genesis,
     mempool_persist::MempoolPersist,
     petal_executor::ChainPetalExecutor,
@@ -46,6 +49,113 @@ use crate::{
     state_index::StateIndex,
     transport::{Frame, PeerPool, accept_loop},
 };
+
+/// Restore node state from durable storage.
+///
+/// The restore path starts from the latest complete state checkpoint whose
+/// indexed blob exists and whose content-addressed hash/root verify, then
+/// replays every block after that checkpoint up to the latest stored block.
+/// Missing suffix blocks are fatal because skipping them would produce a
+/// locally plausible but consensus-divergent state.
+pub fn restore_state_from_storage<E: PetalExecutor>(
+    genesis: &Genesis,
+    block_store: &BlockStore,
+    blob_store: &StateBlobStore,
+    state_index: &StateIndex,
+    executor: &E,
+    block_emission: u128,
+) -> Result<(State, u64)> {
+    let latest_block_height = block_store
+        .latest_height()
+        .context("query latest block height")?;
+    let latest_index_height = state_index
+        .latest_height()
+        .context("query latest state checkpoint height")?;
+
+    let mut checkpoint: Option<(u64, State)> = None;
+    if let Some(index_top) = latest_index_height {
+        for h in (0..=index_top).rev() {
+            let Some((state_root, blob_hash)) = state_index
+                .get(h)
+                .with_context(|| format!("read state checkpoint index at height {h}"))?
+            else {
+                continue;
+            };
+            let Some(blob) = blob_store
+                .get(&blob_hash)
+                .with_context(|| format!("read state checkpoint blob at height {h}"))?
+            else {
+                continue;
+            };
+            let actual_blob_hash = State::blob_hash(&blob);
+            if actual_blob_hash != blob_hash {
+                return Err(anyhow::anyhow!(
+                    "state checkpoint blob hash mismatch at height {h}: indexed={} actual={}",
+                    hex::encode(blob_hash.0),
+                    hex::encode(actual_blob_hash.0)
+                ));
+            }
+            let state = State::from_blob(&blob, state_root)
+                .with_context(|| format!("restore state checkpoint at height {h}"))?;
+            checkpoint = Some((h, state));
+            break;
+        }
+    }
+
+    let (checkpoint_height, mut state) = match checkpoint {
+        Some((height, state)) => {
+            info!(height, "node.startup: restored state checkpoint");
+            (height, state)
+        }
+        None => {
+            info!("node.startup: no complete state checkpoint, applying genesis");
+            let mut state = State::new();
+            genesis.apply_to_state(&mut state);
+            (0, state)
+        }
+    };
+
+    let top = latest_block_height.unwrap_or(checkpoint_height);
+    if top < checkpoint_height {
+        return Err(anyhow::anyhow!(
+            "latest block height {top} is behind state checkpoint height {checkpoint_height}"
+        ));
+    }
+
+    for h in checkpoint_height + 1..=top {
+        let block = block_store
+            .get(h)
+            .with_context(|| format!("read replay block {h}"))?
+            .ok_or_else(|| anyhow::anyhow!("required replay block missing at height {h}"))?;
+        let (fuel_used, _receipts) = crate::consensus_driver::apply_block_state_transitions(
+            &mut state,
+            executor,
+            &block,
+            block_emission,
+        );
+        if let Some((indexed_root, _)) = state_index
+            .get(h)
+            .with_context(|| format!("read replay state index at height {h}"))?
+        {
+            let actual_root = state.state_root();
+            if actual_root != indexed_root {
+                return Err(anyhow::anyhow!(
+                    "replayed state root mismatch at height {h}: indexed={} actual={}",
+                    hex::encode(indexed_root.0),
+                    hex::encode(actual_root.0)
+                ));
+            }
+        }
+        debug!(
+            height = h,
+            txs = block.txs.len(),
+            fuel_used,
+            "node.startup.replayed_block"
+        );
+    }
+
+    Ok((state, top))
+}
 
 // ---------------------------------------------------------------------------
 // NodeConfig re-export (the full config a caller passes to Node::new)
@@ -66,6 +176,7 @@ pub struct NodeRunConfig {
     /// binds a TCP listener in addition to the UDS socket. Used by the
     /// docker-compose harness where UDS sockets are awkward across hosts.
     pub rpc_tcp_addr: Option<String>,
+    pub unsafe_rpc_public_bind: bool,
     pub bloom_home: PathBuf,
     pub fuel_limit: u64,
 }
@@ -90,6 +201,7 @@ impl Node {
     /// Run the node.  Blocks until graceful shutdown (Ctrl-C or SIGTERM).
     pub async fn run(self) -> Result<()> {
         let cfg = &self.config;
+        validate_rpc_tcp_bind_policy(cfg.rpc_tcp_addr.as_deref(), cfg.unsafe_rpc_public_bind)?;
         let chain_dir = cfg.bloom_home.join("chain");
         std::fs::create_dir_all(&chain_dir)?;
 
@@ -112,50 +224,17 @@ impl Node {
         );
 
         // ── 2. Load or build genesis state ───────────────────────────────────
-        let mut state = State::new();
-        let latest_height = block_store.latest_height().context("query latest height")?;
+        let replay_executor = crate::petal_executor::ChainPetalExecutor;
+        let (state, latest_height) = restore_state_from_storage(
+            &cfg.genesis,
+            &block_store,
+            &blob_store,
+            &state_index,
+            &replay_executor,
+            BLOCK_EMISSION,
+        )?;
 
-        if latest_height.is_none() {
-            info!("node.genesis: applying initial allocations");
-            cfg.genesis.apply_to_state(&mut state);
-        } else {
-            // TODO(v1): reload full state from last state blob.
-            // For v0 we rebuild from genesis and re-execute every committed
-            // block. Master replayed only the proposer LOOM emission and
-            // dropped every tx effect (deploys, transfers, storage writes,
-            // fees, refunds, receipt-derivable state) — a validator that
-            // restarted at height N silently lost all of state H ∈ [1, N]
-            // except the cumulative block-emission balance, then diverged
-            // from peers on the next state_root (review 2026-05-19 #4).
-            //
-            // Replay reuses the exact same state-transition path as live
-            // apply (`apply_block_state_transitions`), so the rebuilt state
-            // is byte-identical to a node that never restarted.
-            info!(height = ?latest_height, "node.startup: rebuilding state from genesis+blocks");
-            cfg.genesis.apply_to_state(&mut state);
-            if let Some(top) = latest_height {
-                let replay_executor = crate::petal_executor::ChainPetalExecutor;
-                for h in 1..=top {
-                    if let Some(block) = block_store.get(h).context("replay block")? {
-                        let (fuel_used, _receipts) =
-                            crate::consensus_driver::apply_block_state_transitions(
-                                &mut state,
-                                &replay_executor,
-                                &block,
-                                BLOCK_EMISSION,
-                            );
-                        debug!(
-                            height = h,
-                            txs = block.txs.len(),
-                            fuel_used,
-                            "node.startup.replayed_block"
-                        );
-                    }
-                }
-            }
-        }
-
-        let starting_height = latest_height.map(|h| h + 1).unwrap_or(1);
+        let starting_height = latest_height + 1;
         info!(starting_height, "node.consensus.starting");
 
         // ── 3. Build consensus engine ─────────────────────────────────────────
@@ -206,7 +285,6 @@ impl Node {
                     })
                 };
                 let txs_root = compute_txs_root(&txs);
-                let state_root = { bb_state.lock().state_root() };
                 let validator_set_hash = bb_validator_set.validator_set_hash();
 
                 let header = BlockHeader {
@@ -216,14 +294,14 @@ impl Node {
                     timestamp_ms,
                     proposer: bb_local_address,
                     txs_root,
-                    state_root,
+                    state_root: Hash32([0u8; 32]),
                     receipts_root: Hash32([0u8; 32]),
                     validator_set_hash,
                     fuel_used: 0,
                     fuel_limit,
                 };
 
-                Block {
+                let mut block = Block {
                     header,
                     txs,
                     commit: Commit {
@@ -232,7 +310,24 @@ impl Node {
                         block_hash: Hash32([0u8; 32]),
                         votes: vec![],
                     },
-                }
+                };
+
+                let (fuel_used, receipts, state_root) = {
+                    let state = bb_state.lock();
+                    let mut scratch = state.clone();
+                    let (fuel, receipts) = apply_block_state_transitions(
+                        &mut scratch,
+                        &ChainPetalExecutor,
+                        &block,
+                        BLOCK_EMISSION,
+                    );
+                    (fuel, receipts, scratch.state_root())
+                };
+                block.header.state_root = state_root;
+                block.header.receipts_root = receipts_root(&receipts);
+                block.header.fuel_used = fuel_used;
+
+                block
             },
         );
 
@@ -242,7 +337,7 @@ impl Node {
         let signer: Arc<dyn bloom_chain_consensus::signer::Signer> = Arc::new(
             crate::consensus_driver::XdsaSigner::new(Arc::clone(&cfg.validator_secret_key)),
         );
-        let engine: ConsensusEngine<XdsaVerifier> = ConsensusEngine::new(
+        let mut engine: ConsensusEngine<XdsaVerifier> = ConsensusEngine::new(
             starting_height,
             local_address,
             validator_set.clone(),
@@ -251,6 +346,8 @@ impl Node {
             fuel_limit_cfg,
             Some(signer),
         );
+        reload_persisted_mempool(&mut engine, &shared_state, &mempool_persist)
+            .context("reload persisted mempool")?;
 
         // ── 4. Channels ───────────────────────────────────────────────────────
         let (inbound_tx, mut inbound_rx) = mpsc::channel::<(String, Frame)>(1024);
@@ -270,9 +367,9 @@ impl Node {
         info!(addr = %cfg.listen_addr, "node.transport.listening");
 
         let peer_pool = PeerPool::new(cfg.genesis.peer_addrs.clone(), inbound_tx.clone());
-        let inbound_tx_accept = inbound_tx.clone();
+        let peer_pool_accept = Arc::clone(&peer_pool);
         tokio::spawn(async move {
-            accept_loop(listener, inbound_tx_accept).await;
+            accept_loop(listener, peer_pool_accept).await;
         });
 
         // ── 6. Build driver ──────────────────────────────────────────────────
@@ -316,16 +413,21 @@ impl Node {
             mempool_persist: Arc::clone(&mempool_persist),
             receipt_store: Arc::clone(&receipt_store),
             validator_set: Arc::new(validator_set.clone()),
+            chain_id: chain_id.clone(),
+            genesis_hash: cfg.genesis.genesis_hash,
+            local_address,
             tx_submit: tx_submit_tx.clone(),
         };
         let rpc_socket = chain_dir.join("rpc.sock");
-        {
+        if rpc_uds_enabled() {
             let rpc_uds = rpc_server.clone();
             tokio::spawn(async move {
                 if let Err(e) = rpc_uds.serve(&rpc_socket).await {
                     error!(err = %e, "rpc.serve failed");
                 }
             });
+        } else {
+            info!("rpc.uds.disabled");
         }
         if let Some(tcp_addr) = cfg.rpc_tcp_addr.clone() {
             info!(addr = %tcp_addr, "rpc.tcp.enabled");
@@ -415,14 +517,22 @@ impl Node {
                         // Proposal frame, but TCP/ordering hiccups can drop
                         // that first frame. Pull it explicitly so we can vote.
                         if p.height == my_height {
-                            let have = {
-                                driver_ev
-                                    .engine
-                                    .lock()
-                                    .get_registered_block(&p.block_hash)
-                                    .is_some()
-                            };
-                            if !have {
+                            let block_opt =
+                                { driver_ev.engine.lock().get_registered_block(&p.block_hash) };
+                            if let Some(block) = block_opt {
+                                if let Err(e) =
+                                    driver_ev.validate_proposal_block(&block, p.height, p.round)
+                                {
+                                    warn!(
+                                        peer = %peer_addr,
+                                        height = p.height,
+                                        round = p.round,
+                                        err = %e,
+                                        "frame.proposal rejected: invalid block body"
+                                    );
+                                    continue;
+                                }
+                            } else {
                                 let _ = peer_pool_ev
                                     .send_to(&peer_addr, &Frame::BlockRequest { height: p.height })
                                     .await;
@@ -536,6 +646,10 @@ impl Node {
                             let _ = peer_pool_ev
                                 .send_to(&peer_addr, &Frame::BlockResponse(block))
                                 .await;
+                        } else if let Ok(Some(snapshot)) =
+                            build_state_snapshot_response(driver_ev.as_ref(), height)
+                        {
+                            let _ = peer_pool_ev.send_to(&peer_addr, &snapshot).await;
                         }
                     }
                     Frame::BlockResponse(block) => {
@@ -544,6 +658,24 @@ impl Node {
                         // before us seeing precommits).
                         let block_height = block.header.height;
                         let block_hash = block.header.block_hash();
+                        let my_height = { driver_ev.engine.lock().height() };
+                        let has_commit = !block.commit.votes.is_empty()
+                            && block.commit.height == block.header.height;
+                        if !has_commit && block_height == my_height {
+                            let round = { driver_ev.engine.lock().round() };
+                            if let Err(e) =
+                                driver_ev.validate_proposal_block(&block, block_height, round)
+                            {
+                                warn!(
+                                    peer = %peer_addr,
+                                    height = block_height,
+                                    round,
+                                    err = %e,
+                                    "block_response rejected: invalid proposal body"
+                                );
+                                continue;
+                            }
+                        }
                         {
                             driver_ev.engine.lock().register_block(block.clone());
                         }
@@ -616,8 +748,6 @@ impl Node {
                         // drives state forward. Skipping silently keeps the
                         // log clean and avoids noisy "sync.apply_block failed"
                         // entries on the happy path.
-                        let has_commit = !block.commit.votes.is_empty()
-                            && block.commit.height == block.header.height;
                         #[allow(clippy::never_loop)]
                         loop {
                             if !has_commit {
@@ -666,6 +796,41 @@ impl Node {
                             let _ = peer_pool_ev
                                 .send_to(&peer_addr, &Frame::StateBlobResponse(data))
                                 .await;
+                        }
+                    }
+                    Frame::StateBlobResponse(_) => {}
+                    Frame::StateSnapshotRequest { min_height } => {
+                        if let Ok(Some(snapshot)) =
+                            build_state_snapshot_response(driver_ev.as_ref(), min_height)
+                        {
+                            let _ = peer_pool_ev.send_to(&peer_addr, &snapshot).await;
+                        }
+                    }
+                    Frame::StateSnapshotResponse {
+                        block,
+                        state_root,
+                        blob_hash,
+                        blob,
+                    } => {
+                        match apply_state_snapshot(
+                            Arc::clone(&driver_ev),
+                            Arc::clone(&peer_pool_ev),
+                            Arc::clone(&timeout_tx_ev),
+                            &peer_addr,
+                            block,
+                            state_root,
+                            blob_hash,
+                            blob,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                info!(peer = %peer_addr, "sync.snapshot_applied");
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                warn!(peer = %peer_addr, err = %e, "sync.snapshot_rejected");
+                            }
                         }
                     }
                     _ => {}
@@ -870,8 +1035,18 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                     let mut block_with_commit = (*block).clone();
                     block_with_commit.commit = commit;
                     if let Err(e) = driver.apply_block(&block_with_commit) {
-                        error!(err = %e, height, "apply_block failed");
-                        continue;
+                        error!(
+                            err = %e,
+                            height,
+                            "fatal: post-quorum apply_block failed; aborting validator"
+                        );
+                        std::process::abort();
+                    }
+                    if let Err(e) = peer_pool
+                        .broadcast(&Frame::BlockResponse(block_with_commit.clone()))
+                        .await
+                    {
+                        warn!(err = %e, height, "committed block broadcast failed");
                     }
                     // Drop the just-committed txs from the in-memory mempool
                     // so they aren't re-selected on the next block.
@@ -951,6 +1126,178 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
     })
 }
 
+fn reload_persisted_mempool(
+    engine: &mut ConsensusEngine<XdsaVerifier>,
+    state: &Arc<Mutex<State>>,
+    mempool_persist: &MempoolPersist,
+) -> Result<()> {
+    let txs = mempool_persist.load_all()?;
+    if txs.is_empty() {
+        return Ok(());
+    }
+    let mut admitted = 0usize;
+    let mut purged = 0usize;
+    for tx in txs {
+        let (nonce, balance) = {
+            let st = state.lock();
+            let acct = st.get_account(&tx.sender);
+            (
+                acct.as_ref().map(|a| a.nonce).unwrap_or(0),
+                acct.as_ref().map(|a| a.loom).unwrap_or(0),
+            )
+        };
+        match engine.submit_tx(tx.clone(), nonce, balance) {
+            Ok(()) => admitted += 1,
+            Err(e) => {
+                purged += 1;
+                let _ = mempool_persist.remove(&tx.sender, tx.nonce);
+                warn!(
+                    sender = %hex::encode(tx.sender.0),
+                    nonce = tx.nonce,
+                    err = %e,
+                    "mempool.reload purged stale/invalid tx"
+                );
+            }
+        }
+    }
+    let _ = mempool_persist.flush();
+    info!(admitted, purged, "mempool.reload complete");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot sync helper
+// ---------------------------------------------------------------------------
+
+fn build_state_snapshot_response<E: PetalExecutor>(
+    driver: &ConsensusDriver<E>,
+    min_height: u64,
+) -> Result<Option<Frame>> {
+    let Some(height) = driver.state_index.latest_height()? else {
+        return Ok(None);
+    };
+    if height < min_height {
+        return Ok(None);
+    }
+    let Some((state_root, blob_hash)) = driver.state_index.get(height)? else {
+        return Ok(None);
+    };
+    let Some(blob) = driver.blob_store.get(&blob_hash)? else {
+        return Ok(None);
+    };
+    let Some(block) = driver.block_store.get(height)? else {
+        return Ok(None);
+    };
+    Ok(Some(Frame::StateSnapshotResponse {
+        block,
+        state_root,
+        blob_hash,
+        blob,
+    }))
+}
+
+async fn apply_state_snapshot<E: PetalExecutor>(
+    driver: Arc<ConsensusDriver<E>>,
+    peer_pool: Arc<PeerPool>,
+    timeout_tx: Arc<mpsc::Sender<(TimeoutKind, u64, u32)>>,
+    peer: &str,
+    block: Block,
+    state_root: Hash32,
+    blob_hash: Hash32,
+    blob: Vec<u8>,
+) -> Result<bool> {
+    let height = block.header.height;
+    let current_height = { driver.engine.lock().height() };
+    if height + 1 <= current_height {
+        return Ok(false);
+    }
+    if block.commit.votes.is_empty() {
+        return Err(anyhow::anyhow!("snapshot block has no commit"));
+    }
+    if block.header.state_root != state_root {
+        return Err(anyhow::anyhow!(
+            "snapshot state_root {} != block header {}",
+            hex::encode(state_root.0),
+            hex::encode(block.header.state_root.0)
+        ));
+    }
+    let actual_blob_hash = State::blob_hash(&blob);
+    if actual_blob_hash != blob_hash {
+        return Err(anyhow::anyhow!(
+            "snapshot blob hash mismatch: advertised={} actual={}",
+            hex::encode(blob_hash.0),
+            hex::encode(actual_blob_hash.0)
+        ));
+    }
+    let (blob_height, blob_state_root, blob_parent_hash) =
+        State::blob_header(&blob).context("decode snapshot blob header")?;
+    if blob_height != height {
+        return Err(anyhow::anyhow!(
+            "snapshot blob height {blob_height} != block height {height}"
+        ));
+    }
+    if blob_state_root != state_root {
+        return Err(anyhow::anyhow!(
+            "snapshot blob state_root {} != advertised {}",
+            hex::encode(blob_state_root.0),
+            hex::encode(state_root.0)
+        ));
+    }
+    if blob_parent_hash != block.header.parent_hash {
+        return Err(anyhow::anyhow!(
+            "snapshot blob parent hash {} != block parent hash {}",
+            hex::encode(blob_parent_hash.0),
+            hex::encode(block.header.parent_hash.0)
+        ));
+    }
+    let state = State::from_blob(&blob, state_root)
+        .with_context(|| format!("restore snapshot state at height {height}"))?;
+
+    let validator_set = { driver.engine.lock().validator_set.clone() };
+    validate_block_for_apply(
+        &block,
+        height,
+        &driver.chain_id,
+        block.header.parent_hash,
+        &validator_set,
+        &XdsaVerifier,
+    )
+    .map_err(|reason| anyhow::anyhow!("snapshot commit validation failed: {reason}"))?;
+
+    let stored_blob_hash = driver.blob_store.put(&blob)?;
+    if stored_blob_hash != blob_hash {
+        return Err(anyhow::anyhow!(
+            "stored snapshot blob hash mismatch: advertised={} stored={}",
+            hex::encode(blob_hash.0),
+            hex::encode(stored_blob_hash.0)
+        ));
+    }
+    driver.state_index.put(height, &state_root, &blob_hash)?;
+    driver.block_store.put(height, &block)?;
+    driver.block_store.prune(height)?;
+    driver.blob_store.gc(&[blob_hash])?;
+    {
+        *driver.state.lock() = state;
+    }
+    {
+        let mut engine = driver.engine.lock();
+        engine.register_block(block.clone());
+        engine.mempool.remove_included(&block.txs);
+    }
+    let actions = { driver.engine.lock().enter_next_height(height + 1) };
+    process_actions(
+        Arc::clone(&driver),
+        Arc::clone(&peer_pool),
+        Arc::clone(&timeout_tx),
+        actions,
+    )
+    .await;
+    let _ = peer_pool
+        .send_to(peer, &Frame::BlockRequest { height: height + 1 })
+        .await;
+    Ok(true)
+}
+
 // ---------------------------------------------------------------------------
 // Chain-sync helper
 // ---------------------------------------------------------------------------
@@ -981,20 +1328,44 @@ async fn request_missing_blocks(
     }
 }
 
-// ---------------------------------------------------------------------------
-// txs_root helper
-// ---------------------------------------------------------------------------
-
-/// Compute a deterministic 32-byte hash committing to the ordered tx list.
-///
-/// The bloom-chain spec doesn't pin a specific txs_root construction at v0;
-/// we use a domain-tagged BLAKE3 of each tx's `tx_hash()` concatenated in order.
-fn compute_txs_root(txs: &[bloom_chain_types::tx::Tx]) -> Hash32 {
-    let mut buf = Vec::with_capacity(txs.len() * 32);
-    for tx in txs {
-        buf.extend_from_slice(&tx.tx_hash().0);
+fn validate_rpc_tcp_bind_policy(addr: Option<&str>, unsafe_public_bind: bool) -> Result<()> {
+    let Some(addr) = addr else {
+        return Ok(());
+    };
+    if is_loopback_rpc_bind(addr)? || unsafe_public_bind {
+        return Ok(());
     }
-    blake3_tagged("bloom-chain.v0.txs_root:", &buf)
+    Err(anyhow::anyhow!(
+        "rpc_tcp_addr {addr:?} is not loopback-only; set unsafe_rpc_public_bind = true only for controlled docker/private networks"
+    ))
+}
+
+fn is_loopback_rpc_bind(addr: &str) -> Result<bool> {
+    use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+
+    if let Ok(socket) = addr.parse::<SocketAddr>() {
+        return Ok(socket.ip().is_loopback());
+    }
+    let host = addr
+        .rsplit_once(':')
+        .map(|(host, _)| host.trim_matches(['[', ']']))
+        .ok_or_else(|| anyhow::anyhow!("rpc_tcp_addr must be host:port, got {addr:?}"))?;
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(true);
+    }
+    if host.parse::<IpAddr>().is_err() {
+        return Ok(false);
+    }
+    let mut addrs = addr
+        .to_socket_addrs()
+        .with_context(|| format!("resolve rpc_tcp_addr {addr:?}"))?;
+    Ok(addrs.all(|a| a.ip().is_loopback()))
+}
+
+fn rpc_uds_enabled() -> bool {
+    std::env::var("BLOOM_RPC_UDS")
+        .map(|v| !matches!(v.as_str(), "0" | "false" | "FALSE" | "off" | "OFF"))
+        .unwrap_or(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,5 +1388,77 @@ async fn wait_for_shutdown() {
     #[cfg(not(unix))]
     {
         let _ = signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bloom_chain_consensus::ConsensusEngine;
+    use bloom_chain_state::Account;
+    use bloom_chain_types::{
+        tx::{Tx, TxKind},
+        types::{PubKeyBytes, SigBytes},
+    };
+    use bloom_test_util::{make_validator_set_signed, make_validator_with_keypair};
+
+    fn signed_transfer_tx(
+        sk: &bloom_keystore::xdsa::XdsaSecretKey,
+        pk: &bloom_keystore::xdsa::XdsaPublicKey,
+    ) -> Tx {
+        let sender = Address::from_pubkey_bytes(&pk.0);
+        let mut tx = Tx {
+            chain_id: "bloomchain.test".into(),
+            sender,
+            nonce: 1,
+            max_fuel: 1_000,
+            fee_per_unit: 1,
+            kind: TxKind::Transfer {
+                to: Address([0x44; 32]),
+                amount_loom: 10,
+            },
+            pubkey: PubKeyBytes(pk.0.clone()),
+            sig: SigBytes(vec![]),
+        };
+        let digest = tx.signing_digest();
+        tx.sig = SigBytes(sk.sign(&digest.0).to_bytes());
+        tx
+    }
+
+    #[test]
+    fn reload_persisted_mempool_re_admits_valid_tx() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mempool_persist = MempoolPersist::open(&tmp.path().join("mempool.sled")).unwrap();
+        let (sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
+        let tx = signed_transfer_tx(&sk, &pk);
+        mempool_persist.put(&tx).unwrap();
+
+        let mut state = State::new();
+        state.set_account(
+            tx.sender,
+            Account {
+                nonce: 0,
+                loom: 1_000_000,
+                code_hash: None,
+                storage_root: Hash32([0; 32]),
+                manifest_hash: None,
+            },
+        );
+        let shared_state = Arc::new(Mutex::new(state));
+
+        let v = make_validator_with_keypair();
+        let validator_set = make_validator_set_signed(&[&v], 100);
+        let mut engine = ConsensusEngine::new(
+            1,
+            v.addr,
+            validator_set,
+            XdsaVerifier,
+            None,
+            30_000_000,
+            None,
+        );
+
+        reload_persisted_mempool(&mut engine, &shared_state, &mempool_persist).unwrap();
+        assert_eq!(engine.mempool.len(), 1);
     }
 }

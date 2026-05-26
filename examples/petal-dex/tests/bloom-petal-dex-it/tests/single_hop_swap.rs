@@ -98,7 +98,7 @@ fn ptb_single_hop_swap_shape() {
                     ty: type_tag_coin_loom(),
                     mode: AccessMode::Mutable,
                 }],
-                returns: vec![],
+                returns: vec![type_tag_coin_loom()],
                 attached_invariants: vec![],
             }],
             ..Default::default()
@@ -235,16 +235,18 @@ fn cpmm_version_call_uses_real_manifest_via_wasm_section() {
     let mut state = build_state(&[(alice, 1_000_000)]);
     let gas_payer = genesis_coin_id(alice, 0);
 
-    // WAT body exporting `__petal_version` as a noop returning 0.
-    // The real manifest declares `version()` with no args and `u32`
-    // return — the validator only inspects the manifest, so the WAT
-    // body content is irrelevant for the typecheck. The bytes appended
-    // by `wrap_with_real_manifest` are the canonical-encoded
-    // `PetalManifestV0` the macro emits for `/bloom/dex/strategy/cpmm`.
+    // WAT body exporting `__petal_version` and returning one ABI slot.
+    // The real manifest declares `version()` with no args and one `u32`
+    // return, so the synthetic body must satisfy the executor's manifest
+    // return-arity check.
     let wat = r#"
 (module
+  (import "chain" "petal.return" (func $ret (param i32 i32)))
   (memory (export "memory") 1)
+  ;; output buffer: count=1, len=4, payload=1 (all big-endian)
+  (data (i32.const 0) "\00\00\00\01\00\00\00\04\00\00\00\01")
   (func (export "__petal_version") (param i32 i32) (result i32)
+    (call $ret (i32.const 0) (i32.const 12))
     i32.const 0)
 )
 "#;

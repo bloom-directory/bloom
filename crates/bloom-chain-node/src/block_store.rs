@@ -13,6 +13,14 @@ use tracing::debug;
 /// Rolling window: blocks older than this many blocks are eligible for pruning.
 const PRUNE_WINDOW: u64 = 512;
 
+fn prune_window() -> u64 {
+    std::env::var("BLOOM_BLOCK_PRUNE_WINDOW")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(PRUNE_WINDOW)
+}
+
 /// Block store backed by plain files under `<root>/`.
 pub struct BlockStore {
     root: PathBuf,
@@ -105,10 +113,11 @@ impl BlockStore {
 
     /// Prune blocks older than `current_height - PRUNE_WINDOW`.
     pub fn prune(&self, current_height: u64) -> Result<()> {
-        if current_height < PRUNE_WINDOW {
+        let window = prune_window();
+        if current_height < window {
             return Ok(());
         }
-        let prune_before = current_height - PRUNE_WINDOW;
+        let prune_before = current_height - window;
         for entry in std::fs::read_dir(&self.root)? {
             let entry = entry?;
             if let Ok(name) = entry.file_name().into_string()

@@ -18,7 +18,7 @@ use bloom_chain_types::Hash32;
 use bloom_objects::{
     AccessMode, ObjectId, Owner, TypeTag,
     codec::{
-        self, CodecError, read_bytes, read_bytes32, read_string, read_u8, read_u16_be, read_u32_be,
+        self, CodecError, read_bytes32, read_string, read_u8, read_u16_be, read_u32_be,
         read_u64_be, write_bytes, write_bytes32, write_string, write_u8, write_u16_be,
         write_u32_be, write_u64_be,
     },
@@ -30,6 +30,25 @@ use crate::types::{
     TAG_CMD_MERGE, TAG_CMD_MOVE, TAG_CMD_PUBLISH, TAG_CMD_SPLIT, TAG_CMD_TRANSFER, TAG_CMD_UPGRADE,
     UpgradeCmd, UseRef,
 };
+
+/// Maximum canonical PTB byte length accepted by the decoder.
+pub const MAX_PTB_BYTES: usize = 1 << 20;
+/// Maximum signer public keys/signatures per PTB.
+pub const MAX_PTB_SIGNERS: usize = 16;
+/// Maximum commands per PTB.
+pub const MAX_PTB_COMMANDS: usize = 256;
+/// Maximum args per Move command.
+pub const MAX_PTB_ARGS: usize = 256;
+/// Maximum `UseRef`s in a single built-in command.
+pub const MAX_PTB_USES: usize = 256;
+/// Maximum function type args.
+pub const MAX_PTB_TYPE_ARGS: usize = 32;
+/// Maximum split amounts in a single command.
+pub const MAX_PTB_SPLIT_AMOUNTS: usize = 256;
+/// Maximum byte-buffer field length inside a PTB.
+pub const MAX_PTB_BYTE_BUF: usize = 2 << 20;
+/// Maximum publish/upgrade wasm payload length.
+pub const MAX_PTB_WASM_BYTES: usize = 2 << 20;
 
 // ---------------------------------------------------------------------------
 // Low-level helpers not in bloom-objects::codec
@@ -97,6 +116,23 @@ fn read_vec_count(rdr: &mut &[u8]) -> Result<usize, CodecError> {
     Ok(read_u32_be(rdr)? as usize)
 }
 
+fn read_vec_count_capped(rdr: &mut &[u8], cap: usize) -> Result<usize, CodecError> {
+    let count = read_vec_count(rdr)?;
+    if count > cap {
+        return Err(CodecError::InvalidLength(count as u64));
+    }
+    Ok(count)
+}
+
+fn read_bytes_capped(rdr: &mut &[u8], cap: usize) -> Result<Vec<u8>, CodecError> {
+    let len = read_u32_be(rdr)? as usize;
+    if len > cap {
+        return Err(CodecError::InvalidLength(len as u64));
+    }
+    let slice = codec::read_slice(rdr, len)?;
+    Ok(slice.to_vec())
+}
+
 // ---------------------------------------------------------------------------
 // PetalRef
 // ---------------------------------------------------------------------------
@@ -148,7 +184,7 @@ pub fn encode_type_tag_vec(buf: &mut Vec<u8>, tags: &[TypeTag]) -> Result<(), Co
 
 /// Decode `Vec<TypeTag>` with a `u32 BE` count prefix.
 pub fn decode_type_tag_vec(rdr: &mut &[u8]) -> Result<Vec<TypeTag>, CodecError> {
-    let count = read_vec_count(rdr)?;
+    let count = read_vec_count_capped(rdr, MAX_PTB_TYPE_ARGS)?;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         out.push(TypeTag::decode_from(rdr, 0)?);
@@ -199,7 +235,7 @@ pub fn decode_arg(rdr: &mut &[u8]) -> Result<Arg, CodecError> {
     let tag = read_u8(rdr)?;
     match tag {
         TAG_ARG_SIGNER => Ok(Arg::Signer(read_u16_be(rdr)?)),
-        TAG_ARG_CONST => Ok(Arg::Const(read_bytes(rdr)?)),
+        TAG_ARG_CONST => Ok(Arg::Const(read_bytes_capped(rdr, MAX_PTB_BYTE_BUF)?)),
         TAG_ARG_OBJECT => {
             let id = ObjectId(read_bytes32(rdr)?);
             let expected_version = ExpectedVersion(read_u64_be(rdr)?);
@@ -231,7 +267,7 @@ pub fn encode_arg_vec(buf: &mut Vec<u8>, args: &[Arg]) -> Result<(), CodecError>
 
 /// Decode `Vec<Arg>` with a `u32 BE` count prefix.
 pub fn decode_arg_vec(rdr: &mut &[u8]) -> Result<Vec<Arg>, CodecError> {
-    let count = read_vec_count(rdr)?;
+    let count = read_vec_count_capped(rdr, MAX_PTB_ARGS)?;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         out.push(decode_arg(rdr)?);
@@ -250,7 +286,7 @@ pub fn encode_use_ref_vec(buf: &mut Vec<u8>, uses: &[UseRef]) -> Result<(), Code
 
 /// Decode `Vec<UseRef>` with a `u32 BE` count prefix.
 pub fn decode_use_ref_vec(rdr: &mut &[u8]) -> Result<Vec<UseRef>, CodecError> {
-    let count = read_vec_count(rdr)?;
+    let count = read_vec_count_capped(rdr, MAX_PTB_USES)?;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         out.push(decode_use_ref(rdr)?);
@@ -269,7 +305,7 @@ pub fn encode_u128_vec(buf: &mut Vec<u8>, amounts: &[u128]) -> Result<(), CodecE
 
 /// Decode `Vec<u128>` amount list with a `u32 BE` count prefix.
 pub fn decode_u128_vec(rdr: &mut &[u8]) -> Result<Vec<u128>, CodecError> {
-    let count = read_vec_count(rdr)?;
+    let count = read_vec_count_capped(rdr, MAX_PTB_SPLIT_AMOUNTS)?;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         out.push(read_u128_be(rdr)?);
@@ -334,7 +370,7 @@ pub fn encode_publish_cmd(buf: &mut Vec<u8>, p: &PublishCmd) -> Result<(), Codec
 
 /// Decode a [`PublishCmd`].
 pub fn decode_publish_cmd(rdr: &mut &[u8]) -> Result<PublishCmd, CodecError> {
-    let wasm_bytes = read_bytes(rdr)?;
+    let wasm_bytes = read_bytes_capped(rdr, MAX_PTB_WASM_BYTES)?;
     let module_path = read_string(rdr)?;
     let publisher_cap = match read_u8(rdr)? {
         0 => None,
@@ -358,7 +394,7 @@ pub fn encode_upgrade_cmd(buf: &mut Vec<u8>, u: &UpgradeCmd) -> Result<(), Codec
 
 /// Decode an [`UpgradeCmd`].
 pub fn decode_upgrade_cmd(rdr: &mut &[u8]) -> Result<UpgradeCmd, CodecError> {
-    let wasm_bytes = read_bytes(rdr)?;
+    let wasm_bytes = read_bytes_capped(rdr, MAX_PTB_WASM_BYTES)?;
     let module_path = read_string(rdr)?;
     let publisher_cap = decode_use_ref(rdr)?;
     Ok(UpgradeCmd {
@@ -448,7 +484,7 @@ pub fn encode_command_vec(buf: &mut Vec<u8>, cmds: &[Command]) -> Result<(), Cod
 
 /// Decode `Vec<Command>` with a `u32 BE` count prefix.
 pub fn decode_command_vec(rdr: &mut &[u8]) -> Result<Vec<Command>, CodecError> {
-    let count = read_vec_count(rdr)?;
+    let count = read_vec_count_capped(rdr, MAX_PTB_COMMANDS)?;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         out.push(decode_command(rdr)?);
@@ -471,7 +507,7 @@ pub fn encode_signers(buf: &mut Vec<u8>, signers: &[[u8; 32]]) -> Result<(), Cod
 
 /// Decode `Vec<PqPubkey>` with a `u32 BE` count prefix.
 pub fn decode_signers(rdr: &mut &[u8]) -> Result<Vec<[u8; 32]>, CodecError> {
-    let count = read_vec_count(rdr)?;
+    let count = read_vec_count_capped(rdr, MAX_PTB_SIGNERS)?;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         out.push(read_bytes32(rdr)?);
@@ -491,10 +527,10 @@ pub fn encode_signatures(buf: &mut Vec<u8>, sigs: &[PqSignature]) -> Result<(), 
 
 /// Decode a `Vec<PqSignature>` with a `u32 BE` count prefix.
 pub fn decode_signatures(rdr: &mut &[u8]) -> Result<Vec<PqSignature>, CodecError> {
-    let count = read_vec_count(rdr)?;
+    let count = read_vec_count_capped(rdr, MAX_PTB_SIGNERS)?;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
-        out.push(PqSignature(read_bytes(rdr)?));
+        out.push(PqSignature(read_bytes_capped(rdr, MAX_PTB_BYTE_BUF)?));
     }
     Ok(out)
 }
@@ -525,6 +561,9 @@ pub fn encode_ptb(tx: &PtbTx) -> Result<Vec<u8>, CodecError> {
 
 /// Canonical-decode a [`PtbTx`], rejecting trailing bytes.
 pub fn decode_ptb(bytes: &[u8]) -> Result<PtbTx, CodecError> {
+    if bytes.len() > MAX_PTB_BYTES {
+        return Err(CodecError::InvalidLength(bytes.len() as u64));
+    }
     let mut rdr = bytes;
     let signers = decode_signers(&mut rdr)?;
     let commands = decode_command_vec(&mut rdr)?;
@@ -921,6 +960,22 @@ mod tests {
             decode_ptb(&bytes),
             Err(CodecError::TrailingBytes { .. })
         ));
+    }
+
+    #[test]
+    fn decode_rejects_huge_command_count_before_allocation() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // signers
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes()); // commands
+        let err = decode_ptb(&bytes).unwrap_err();
+        assert_eq!(err, CodecError::InvalidLength(u32::MAX as u64));
+    }
+
+    #[test]
+    fn decode_rejects_oversized_ptb_bytes() {
+        let bytes = vec![0u8; MAX_PTB_BYTES + 1];
+        let err = decode_ptb(&bytes).unwrap_err();
+        assert_eq!(err, CodecError::InvalidLength((MAX_PTB_BYTES + 1) as u64));
     }
 
     // --- determinism / hex snapshot ---

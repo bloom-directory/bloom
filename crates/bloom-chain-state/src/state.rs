@@ -2,22 +2,21 @@
 //!
 //! # State root (spec §6.1, widened by §16.3)
 //!
-//! The state_root payload is 128 bytes:
+//! The state_root payload is 160 bytes:
 //!
 //! ```text
 //! state_root = blake3_tagged(
 //!     "state_root:",
-//!     accounts_root || code_root || object_root || ownership_index_root
+//!     accounts_root || code_root || object_root || ownership_index_root || vfs_root
 //! )
 //! ```
 //!
-//! `object_root` and `ownership_index_root` commit to the in-memory
-//! Object / OwnershipIndex maps using the same BLAKE3-tagged-sorted-leaf
-//! scheme as the other tries (see [`crate::trie`]). Both roots are zero
-//! when their underlying map is empty (the workspace's empty-trie
-//! convention). They are computed on demand from
-//! [`State::objects`] / [`State::ownership`] — there is no cached
-//! field, so the roots are always live.
+//! `object_root`, `ownership_index_root`, and `vfs_root` commit to the
+//! in-memory Object / OwnershipIndex / VFS maps using deterministic
+//! sorted-entry encodings. Roots are zero when their underlying map is empty
+//! (the workspace's empty-trie convention). They are computed on demand from
+//! [`State::objects`] / [`State::ownership`] / [`State::vfs`] — there is no
+//! cached field, so the roots are always live.
 //!
 //! Receipts are NOT included in the state root — they are in the block header's
 //! separate `receipts_root` field (spec §6.1 note).
@@ -58,6 +57,9 @@ use crate::{
     storage::StorageTrie,
     trie::{Trie, TrieKind},
 };
+
+const VFS_ROOT_TAG: &str = "bloom-chain.v0.vfs_root:";
+const VFS_LEAF_TAG: &str = "bloom-chain.v0.vfs_leaf:";
 
 // ---------------------------------------------------------------------------
 // Write-set types
@@ -218,13 +220,9 @@ pub struct State {
     /// `bloom_petal_manifest_v0` custom section to read the declared
     /// `module_path`.
     ///
-    /// **Phase 1 caveat:** this is a derived in-memory index, **not**
-    /// committed into `state_root`. Two honest replays from the same
-    /// transaction history produce identical VFS bindings, so consensus
-    /// remains deterministic, but a light client that only sees the
-    /// state root cannot prove a path binding. A state-root-committed
-    /// VFS is a Phase 2 followup (would extend the state-root preimage,
-    /// which is a consensus break we're not paying for in this fix).
+    /// VFS bindings are consensus-relevant because validators use them
+    /// while checking path/hash petal references, so they are committed by
+    /// [`State::vfs_root`] and included in [`State::state_root`].
     pub(crate) vfs: BTreeMap<String, Hash32>,
 }
 
@@ -405,6 +403,11 @@ impl State {
         self.vfs.iter()
     }
 
+    /// Iterate every ownership-index row in key-sorted order.
+    pub fn iter_ownership(&self) -> impl Iterator<Item = (&OwnershipIndexKey, &Vec<ObjectId>)> {
+        self.ownership.iter()
+    }
+
     // -----------------------------------------------------------------------
     // Roots
     // -----------------------------------------------------------------------
@@ -480,23 +483,45 @@ impl State {
         trie.root()
     }
 
+    /// The VFS root.
+    ///
+    /// Commits to path → petal-hash bindings in path-sorted order. The path
+    /// bytes are hashed into 32-byte trie keys; the value is the bound petal
+    /// hash. Empty VFS returns the all-zero sentinel.
+    pub fn vfs_root(&self) -> Hash32 {
+        if self.vfs.is_empty() {
+            return Hash32([0u8; 32]);
+        }
+
+        let count = self.vfs.len() as u64;
+        let mut payload = Vec::with_capacity(8 + self.vfs.len() * 64);
+        payload.extend_from_slice(&count.to_le_bytes());
+        for (path, hash) in &self.vfs {
+            let key = blake3_tagged(VFS_LEAF_TAG, path.as_bytes());
+            payload.extend_from_slice(&key.0);
+            payload.extend_from_slice(&hash.0);
+        }
+        blake3_tagged(VFS_ROOT_TAG, &payload)
+    }
+
     /// Compute the `state_root` per spec §6.1, widened by §16.3:
     ///
     /// ```text
     /// state_root = blake3_tagged(
     ///     "state_root:",
-    ///     accounts_root || code_root || object_root || ownership_index_root
+    ///     accounts_root || code_root || object_root || ownership_index_root || vfs_root
     /// )
     /// ```
     ///
-    /// All four roots are live: changing any underlying trie data
+    /// All five roots are live: changing any underlying trie data
     /// changes the corresponding root, which changes `state_root`.
     pub fn state_root(&self) -> Hash32 {
-        let mut payload = [0u8; 128];
+        let mut payload = [0u8; 160];
         payload[0..32].copy_from_slice(&self.accounts_root().0);
         payload[32..64].copy_from_slice(&self.code_root().0);
         payload[64..96].copy_from_slice(&self.object_root().0);
         payload[96..128].copy_from_slice(&self.ownership_index_root().0);
+        payload[128..160].copy_from_slice(&self.vfs_root().0);
         blake3_tagged(tags::STATE_ROOT, &payload)
     }
 
@@ -909,15 +934,16 @@ mod tests {
     }
 
     #[test]
-    fn state_root_payload_is_128_bytes() {
-        // Recompute the expected commitment over the canonical 128-byte
+    fn state_root_payload_is_160_bytes() {
+        // Recompute the expected commitment over the canonical 160-byte
         // payload and verify it matches `State::state_root` exactly.
         let s = State::new();
-        let mut payload = [0u8; 128];
+        let mut payload = [0u8; 160];
         payload[0..32].copy_from_slice(&s.accounts_root().0);
         payload[32..64].copy_from_slice(&s.code_root().0);
         payload[64..96].copy_from_slice(&s.object_root().0);
         payload[96..128].copy_from_slice(&s.ownership_index_root().0);
+        payload[128..160].copy_from_slice(&s.vfs_root().0);
         let expected = blake3_tagged(tags::STATE_ROOT, &payload);
         assert_eq!(s.state_root(), expected);
     }
@@ -935,6 +961,17 @@ mod tests {
         s2.set_account(addr(1), acct(100));
         s2.set_object(sample_object(0xC0, Owner::Shared, 1));
         assert_ne!(baseline, s2.state_root());
+    }
+
+    #[test]
+    fn state_root_changes_when_vfs_binding_changes() {
+        let mut s = State::new();
+        s.set_account(addr(1), acct(100));
+        let baseline = s.state_root();
+
+        s.set_vfs_binding("/bloom/test".to_string(), Hash32([0xAB; 32]));
+        assert_ne!(baseline, s.state_root());
+        assert_ne!(s.vfs_root(), Hash32([0u8; 32]));
     }
 
     #[test]

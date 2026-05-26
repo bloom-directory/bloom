@@ -8,8 +8,10 @@ publish = false
 
 [dependencies]
 bloom-chain-node     = { path = "../../../../crates/bloom-chain-node" }
+bloom-chain-consensus = { path = "../../../../crates/bloom-chain-consensus" }
 bloom-chain-state    = { path = "../../../../crates/bloom-chain-state" }
 bloom-chain-types    = { path = "../../../../crates/bloom-chain-types" }
+bloom-keystore       = { path = "../../../../crates/bloom-keystore" }
 bloom-objects        = { path = "../../../../crates/bloom-objects" }
 bloom-script         = { path = "../../../../crates/bloom-script" }
 bloom-resource       = { path = "../../../../crates/bloom-resource" }

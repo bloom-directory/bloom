@@ -128,6 +128,14 @@ impl Genesis {
                 .map_err(|e| NodeError::Genesis(format!("validator address: {e}")))?;
             let pk_bytes = base64_decode(&v.pubkey)
                 .map_err(|e| NodeError::Genesis(format!("validator pubkey: {e}")))?;
+            let derived = Address::from_pubkey_bytes(&pk_bytes);
+            if addr != derived {
+                return Err(NodeError::Genesis(format!(
+                    "validator address/pubkey mismatch: address {} derives {} from pubkey",
+                    hex::encode(addr.0),
+                    hex::encode(derived.0)
+                )));
+            }
             validators.push(Validator {
                 address: addr,
                 pubkey: PubKeyBytes(pk_bytes),
@@ -362,6 +370,10 @@ fn compute_genesis_hash(chain_id: &str, genesis_time_ms: u64) -> Hash32 {
     Hash32(out)
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 // ---------------------------------------------------------------------------
 // Skeleton config.toml schema (for `chain init`)
 // ---------------------------------------------------------------------------
@@ -378,6 +390,11 @@ pub struct NodeConfig {
     /// framing as the UDS socket; both run in parallel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rpc_tcp_addr: Option<String>,
+    /// Allow `rpc_tcp_addr` to bind a non-loopback or wildcard interface.
+    /// This is intentionally off by default; public RPC exposure is unauthenticated
+    /// in v0 and should only be used inside controlled docker/private networks.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unsafe_rpc_public_bind: bool,
     /// Path to genesis file (default: `chain/genesis.toml`).
     pub genesis_path: Option<String>,
     /// Log level.
@@ -394,6 +411,7 @@ impl Default for NodeConfig {
             validator_address: String::new(),
             listen_addr: "0.0.0.0:26656".into(),
             rpc_tcp_addr: None,
+            unsafe_rpc_public_bind: false,
             genesis_path: None,
             log_level: Some("info".into()),
             fuel_limit: Some(30_000_000),
@@ -409,6 +427,7 @@ impl Default for NodeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use bloom_chain_consensus::ValidatorSet;
     use bloom_chain_consensus::validator_set::Validator;
     use bloom_chain_types::types::PubKeyBytes;
@@ -573,5 +592,32 @@ mod tests {
         let obj = state.get_object(&coin_id).unwrap();
         let value = decode_coin_value(&obj.payload).unwrap();
         assert_eq!(value, amount, "loom cache and coin payload must agree");
+    }
+
+    #[test]
+    fn genesis_rejects_validator_address_pubkey_mismatch() {
+        let (_sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
+        let derived = Address::from_pubkey_bytes(&pk.0);
+        let mut wrong = derived;
+        wrong.0[0] ^= 0xFF;
+        let raw = GenesisFile {
+            chain_id: "bloomchain.test".into(),
+            genesis_time_ms: 0,
+            validators: vec![ValidatorConfig {
+                address: hex::encode(wrong.0),
+                pubkey: base64::engine::general_purpose::STANDARD.encode(&pk.0),
+                voting_power: 100,
+                host: Some("127.0.0.1:26656".into()),
+            }],
+            allocations: vec![],
+            petals: vec![],
+        };
+
+        let err = Genesis::from_raw(raw).expect_err("mismatch must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("address/pubkey mismatch"),
+            "unexpected error: {msg}"
+        );
     }
 }

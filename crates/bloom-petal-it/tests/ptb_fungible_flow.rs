@@ -131,7 +131,7 @@ fn move_split_transfer_happy_path() {
                     ty: type_tag_coin_loom(),
                     mode: AccessMode::Mutable,
                 }],
-                returns: vec![],
+                returns: vec![type_tag_coin_loom()],
                 attached_invariants: vec![],
             }],
             ..Default::default()
@@ -307,14 +307,16 @@ fn fungible_value_call_typechecks_against_real_manifest() {
     let mut state = build_state(&[(alice, 1000)]);
     let alice_coin_id = genesis_coin_id(alice, 0);
 
-    // WAT body: export `__petal_value` as a noop (returns 0). The
-    // validator only sees the manifest, so the WAT body content
-    // doesn't matter for this typecheck — we just need an exported
-    // function the executor can dispatch into.
+    // WAT body: export `__petal_value` with a one-slot u128 return envelope
+    // matching the real manifest's return arity.
     let wat = r#"
 (module
+  (import "chain" "petal.return" (func $ret (param i32 i32)))
   (memory (export "memory") 1)
+  ;; count=1 | len=16 | u128 value payload
+  (data (i32.const 0) "\00\00\00\01\00\00\00\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\03\E8")
   (func (export "__petal_value") (param i32 i32) (result i32)
+    (call $ret (i32.const 0) (i32.const 24))
     i32.const 0)
 )
 "#;

@@ -135,7 +135,7 @@ fn linearity_violation_reverts_atomically() {
                         ty: type_tag_coin_loom(),
                         mode: AccessMode::Mutable,
                     }],
-                    returns: vec![],
+                    returns: vec![type_tag_coin_loom()],
                     attached_invariants: vec![],
                 }],
                 ..Default::default()
@@ -431,7 +431,7 @@ fn revert_atomicity_state_is_unchanged() {
                         ty: type_tag_coin_loom(),
                         mode: AccessMode::Mutable,
                     }],
-                    returns: vec![],
+                    returns: vec![type_tag_coin_loom()],
                     attached_invariants: vec![],
                 }],
                 ..Default::default()

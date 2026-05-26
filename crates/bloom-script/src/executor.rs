@@ -45,6 +45,11 @@ use crate::host_ctx::PtbHostCtx;
 use crate::types::{Arg, Command, MoveCmd, PublishCmd, UpgradeCmd, UseRef};
 use crate::validator::{ValidatedPtb, decode_coin_value};
 
+const MAX_PETAL_RETURN_SLOTS: usize = 32;
+const MAX_PETAL_RETURN_BYTES: usize = 2 << 20;
+const PUBLISH_BASE_FUEL: u64 = 1_000;
+const PUBLISH_BYTES_PER_FUEL: u64 = 64;
+
 // ---------------------------------------------------------------------------
 // Petal runner trait
 // ---------------------------------------------------------------------------
@@ -397,8 +402,8 @@ impl<'c> PtbExecutor<'c> {
             Command::SplitCoins { src, amounts } => self.exec_split_coins(src, amounts, cmd_idx),
             Command::MergeCoins(uses) => self.exec_merge_coins(uses, cmd_idx),
             Command::MakeMoveVec { ty, uses } => self.exec_make_vec_inner(ty, uses, cmd_idx),
-            Command::Publish(p) => self.exec_publish(p, cmd_idx, report),
-            Command::UpgradePetal(u) => self.exec_upgrade(u, cmd_idx, report),
+            Command::Publish(p) => self.exec_publish(p, cmd_idx, fuel_remaining, report),
+            Command::UpgradePetal(u) => self.exec_upgrade(u, cmd_idx, fuel_remaining, report),
         }
     }
 
@@ -408,7 +413,7 @@ impl<'c> PtbExecutor<'c> {
         cmd_idx: u16,
         vtx: &ValidatedPtb,
         fuel_remaining: &mut u64,
-        _report: &mut ExecutionReport,
+        report: &mut ExecutionReport,
     ) -> Result<Vec<Vec<u8>>, PtbError> {
         // Load every Arg::Object into the borrow table (already type-
         // checked by the validator). This is the executor's contract
@@ -444,6 +449,17 @@ impl<'c> PtbExecutor<'c> {
         let hash = m.petal.hash.ok_or_else(|| PtbError::PetalNotPinned {
             path: m.petal.path.clone(),
         })?;
+        let manifest = vtx
+            .manifests
+            .get(&hash.0)
+            .ok_or(PtbError::PetalNotFound { hash })?;
+        let expected_returns = manifest
+            .function(&m.function)
+            .map(|f| f.returns.len())
+            .ok_or_else(|| PtbError::UnknownFunction {
+                function: m.function.clone(),
+                petal_hash: hash,
+            })?;
 
         // Petal call: DO NOT hold the ctx lock here. The wasm host
         // imports (chain_vm.rs) reach back into `ctx` via the same
@@ -451,20 +467,25 @@ impl<'c> PtbExecutor<'c> {
         let result =
             self.petal_runner
                 .call(&hash, &m.function, &m.type_args, &args_buf, *fuel_remaining)?;
+        if result.fuel_used > *fuel_remaining {
+            report.fuel_used = report.fuel_used.saturating_add(*fuel_remaining);
+            return Err(PtbError::OutOfFuel {
+                cmd_idx,
+                limit: *fuel_remaining,
+                used: result.fuel_used,
+            });
+        }
+        report.fuel_used = report.fuel_used.saturating_add(result.fuel_used);
         *fuel_remaining = fuel_remaining.saturating_sub(result.fuel_used);
 
         // Decode the return buffer: same length-prefixed-blobs format
-        // as the args.
-        let outputs = unmarshal_outputs(&result.ret_buf)?;
+        // as the args, and exactly matching the manifest return arity.
+        let outputs = unmarshal_outputs(&result.ret_buf, expected_returns, cmd_idx)?;
 
         // Run attached invariants.
-        let manifest = vtx
-            .manifests
-            .get(&hash.0)
-            .ok_or(PtbError::PetalNotFound { hash })?;
         if let Some(f) = manifest.function(&m.function) {
             for inv in &f.attached_invariants {
-                run_invariant(
+                let used = run_invariant(
                     self.petal_runner,
                     &hash,
                     inv,
@@ -474,6 +495,7 @@ impl<'c> PtbExecutor<'c> {
                     *fuel_remaining,
                     fuel_remaining,
                 )?;
+                report.fuel_used = report.fuel_used.saturating_add(used);
             }
         }
 
@@ -691,11 +713,20 @@ impl<'c> PtbExecutor<'c> {
     fn exec_publish(
         &mut self,
         p: &PublishCmd,
-        _cmd_idx: u16,
+        cmd_idx: u16,
+        fuel_remaining: &mut u64,
         report: &mut ExecutionReport,
     ) -> Result<Vec<Vec<u8>>, PtbError> {
+        charge_builtin_fuel(p.wasm_bytes.len(), cmd_idx, fuel_remaining, report)?;
+        if p.publisher_cap.is_some() {
+            return Err(PtbError::BuiltinFailed {
+                cmd_idx,
+                reason: "publish with OwnerCap is disabled until owner-cap authority is enforced"
+                    .to_string(),
+            });
+        }
         let wasm_hash = blake3_tagged(tags::PETAL, &p.wasm_bytes);
-        let minted_owner_cap = p.publisher_cap.is_none();
+        let minted_owner_cap = true;
         report.publish_events.push(PetalPublishEvent {
             module_path: p.module_path.clone(),
             wasm_hash,
@@ -720,17 +751,16 @@ impl<'c> PtbExecutor<'c> {
     fn exec_upgrade(
         &mut self,
         u: &UpgradeCmd,
-        _cmd_idx: u16,
+        cmd_idx: u16,
+        fuel_remaining: &mut u64,
         report: &mut ExecutionReport,
     ) -> Result<Vec<Vec<u8>>, PtbError> {
-        let wasm_hash = blake3_tagged(tags::PETAL, &u.wasm_bytes);
-        report.publish_events.push(PetalPublishEvent {
-            module_path: u.module_path.clone(),
-            wasm_hash,
-            wasm_bytes: u.wasm_bytes.clone(),
-            minted_owner_cap: false,
-        });
-        Ok(vec![wasm_hash.0.to_vec()])
+        charge_builtin_fuel(u.wasm_bytes.len(), cmd_idx, fuel_remaining, report)?;
+        let _ = &u.publisher_cap;
+        Err(PtbError::BuiltinFailed {
+            cmd_idx,
+            reason: "UpgradePetal is disabled until owner-cap authority is enforced".to_string(),
+        })
     }
 
     fn exec_make_vec_inner(
@@ -850,19 +880,47 @@ fn marshal_args(args: &[Arg], command_outputs: &[Vec<Vec<u8>>]) -> Result<Vec<u8
     Ok(buf)
 }
 
-fn unmarshal_outputs(buf: &[u8]) -> Result<Vec<Vec<u8>>, PtbError> {
+fn unmarshal_outputs(
+    buf: &[u8],
+    expected_count: usize,
+    cmd_idx: u16,
+) -> Result<Vec<Vec<u8>>, PtbError> {
     // Format: count (u32 BE) then for each return: length-prefixed bytes.
     if buf.len() < 4 {
-        return Ok(vec![]);
+        if expected_count == 0 {
+            return Ok(vec![]);
+        }
+        return Err(PtbError::BuiltinFailed {
+            cmd_idx,
+            reason: format!("petal returned 0 slots, manifest declares {expected_count}"),
+        });
     }
     let mut rdr = buf;
     let count = read_u32(&mut rdr)? as usize;
+    if count > MAX_PETAL_RETURN_SLOTS {
+        return Err(PtbError::BuiltinFailed {
+            cmd_idx,
+            reason: format!("petal returned too many slots: {count} > {MAX_PETAL_RETURN_SLOTS}"),
+        });
+    }
+    if count != expected_count {
+        return Err(PtbError::BuiltinFailed {
+            cmd_idx,
+            reason: format!("petal returned {count} slots, manifest declares {expected_count}"),
+        });
+    }
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         let len = read_u32(&mut rdr)? as usize;
+        if len > MAX_PETAL_RETURN_BYTES {
+            return Err(PtbError::BuiltinFailed {
+                cmd_idx,
+                reason: format!("petal return slot too large: {len} > {MAX_PETAL_RETURN_BYTES}"),
+            });
+        }
         if rdr.len() < len {
             return Err(PtbError::BuiltinFailed {
-                cmd_idx: 0,
+                cmd_idx,
                 reason: format!(
                     "petal return buffer truncated: need {len}, have {}",
                     rdr.len()
@@ -871,6 +929,12 @@ fn unmarshal_outputs(buf: &[u8]) -> Result<Vec<Vec<u8>>, PtbError> {
         }
         out.push(rdr[..len].to_vec());
         rdr = &rdr[len..];
+    }
+    if !rdr.is_empty() {
+        return Err(PtbError::BuiltinFailed {
+            cmd_idx,
+            reason: format!("petal return buffer has {} trailing bytes", rdr.len()),
+        });
     }
     Ok(out)
 }
@@ -908,6 +972,28 @@ fn lookup_use(
         })
 }
 
+fn charge_builtin_fuel(
+    byte_len: usize,
+    cmd_idx: u16,
+    fuel_remaining: &mut u64,
+    report: &mut ExecutionReport,
+) -> Result<(), PtbError> {
+    let byte_fuel = (byte_len as u64).saturating_div(PUBLISH_BYTES_PER_FUEL);
+    let cost = PUBLISH_BASE_FUEL.saturating_add(byte_fuel);
+    if cost > *fuel_remaining {
+        report.fuel_used = report.fuel_used.saturating_add(*fuel_remaining);
+        *fuel_remaining = 0;
+        return Err(PtbError::OutOfFuel {
+            cmd_idx,
+            limit: cost,
+            used: cost,
+        });
+    }
+    *fuel_remaining -= cost;
+    report.fuel_used = report.fuel_used.saturating_add(cost);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_invariant(
     runner: &dyn PetalRunner,
@@ -918,7 +1004,7 @@ fn run_invariant(
     cmd_idx: u16,
     fuel_budget: u64,
     fuel_remaining: &mut u64,
-) -> Result<(), PtbError> {
+) -> Result<u64, PtbError> {
     // Build the scope buffer from argspec indices: indices < args.len()
     // select args, indices >= args.len() select outputs[idx - args.len()].
     let mut scope = Vec::new();
@@ -954,6 +1040,15 @@ fn run_invariant(
         }
     }
     let res = runner.call_invariant(petal, &inv.wasm_export, &scope, fuel_budget)?;
+    if res.fuel_used > *fuel_remaining {
+        let limit = *fuel_remaining;
+        *fuel_remaining = 0;
+        return Err(PtbError::OutOfFuel {
+            cmd_idx,
+            limit,
+            used: res.fuel_used,
+        });
+    }
     *fuel_remaining = fuel_remaining.saturating_sub(res.fuel_used);
     if !res.ok {
         return Err(PtbError::InvariantFailed {
@@ -961,7 +1056,7 @@ fn run_invariant(
             name: inv.name.clone(),
         });
     }
-    Ok(())
+    Ok(res.fuel_used)
 }
 
 fn encode_arg_for_scope(arg: &Arg) -> Result<Vec<u8>, PtbError> {
@@ -1193,7 +1288,7 @@ mod tests {
                     name: "f".to_string(),
                     type_params: vec![],
                     args: vec![],
-                    returns: vec![],
+                    returns: vec![loom_tt()],
                     attached_invariants: vec![],
                 }],
                 object_types: vec![],
@@ -1219,6 +1314,143 @@ mod tests {
         assert!(report.success, "report: {report:?}");
         assert_eq!(report.command_outputs.len(), 1);
         assert_eq!(report.command_outputs[0], vec![b"hello".to_vec()]);
+    }
+
+    #[test]
+    fn move_return_count_must_match_manifest() {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        chain.put_petal(
+            petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/p".to_string(),
+                functions: vec![FunctionDeclStub {
+                    name: "f".to_string(),
+                    type_params: vec![],
+                    args: vec![],
+                    returns: vec![],
+                    attached_invariants: vec![],
+                }],
+                object_types: vec![],
+                external_type_refs: vec![],
+            },
+        );
+        let mut runner = MockPetalRunner::new();
+        runner.set(petal, "f", build_outputs(&[b"unexpected"]), 7);
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/p".to_string(),
+                    hash: Some(petal),
+                },
+                function: "f".to_string(),
+                type_args: vec![],
+                args: vec![],
+            })],
+        );
+        let report = run(&chain, &runner, tx);
+        assert!(!report.success);
+        assert!(matches!(
+            report.reverted_with,
+            Some(PtbError::BuiltinFailed { ref reason, .. }) if reason.contains("manifest declares 0")
+        ));
+    }
+
+    #[test]
+    fn huge_return_count_reverts_without_allocation() {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        chain.put_petal(
+            petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/p".to_string(),
+                functions: vec![FunctionDeclStub {
+                    name: "f".to_string(),
+                    type_params: vec![],
+                    args: vec![],
+                    returns: vec![],
+                    attached_invariants: vec![],
+                }],
+                object_types: vec![],
+                external_type_refs: vec![],
+            },
+        );
+        let mut runner = MockPetalRunner::new();
+        runner.set(petal, "f", u32::MAX.to_be_bytes().to_vec(), 7);
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/p".to_string(),
+                    hash: Some(petal),
+                },
+                function: "f".to_string(),
+                type_args: vec![],
+                args: vec![],
+            })],
+        );
+        let report = run(&chain, &runner, tx);
+        assert!(!report.success);
+        assert!(matches!(
+            report.reverted_with,
+            Some(PtbError::BuiltinFailed { ref reason, .. }) if reason.contains("too many slots")
+        ));
+    }
+
+    #[test]
+    fn successful_move_fuel_accumulates_across_commands() {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        chain.put_petal(
+            petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/p".to_string(),
+                functions: vec![FunctionDeclStub {
+                    name: "f".to_string(),
+                    type_params: vec![],
+                    args: vec![],
+                    returns: vec![],
+                    attached_invariants: vec![],
+                }],
+                object_types: vec![],
+                external_type_refs: vec![],
+            },
+        );
+        let mut runner = MockPetalRunner::new();
+        runner.set(petal, "f", build_outputs(&[]), 11);
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/p".to_string(),
+                        hash: Some(petal),
+                    },
+                    function: "f".to_string(),
+                    type_args: vec![],
+                    args: vec![],
+                }),
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/p".to_string(),
+                        hash: Some(petal),
+                    },
+                    function: "f".to_string(),
+                    type_args: vec![],
+                    args: vec![],
+                }),
+            ],
+        );
+        let report = run(&chain, &runner, tx);
+        assert!(report.success, "report: {report:?}");
+        assert_eq!(report.fuel_used, 22);
     }
 
     #[test]
@@ -1321,7 +1553,7 @@ mod tests {
                     ty: loom_tt(),
                     mode: AccessMode::Mutable,
                 }],
-                returns: vec![],
+                returns: vec![loom_tt()],
                 attached_invariants: vec![],
             }],
             object_types: vec![],
@@ -1401,7 +1633,7 @@ mod tests {
                         ty: loom_tt(),
                         mode: AccessMode::Mutable,
                     }],
-                    returns: vec![],
+                    returns: vec![loom_tt()],
                     attached_invariants: vec![],
                 }],
                 object_types: vec![],
@@ -1471,7 +1703,7 @@ mod tests {
                         ty: loom_tt(),
                         mode: AccessMode::Mutable,
                     }],
-                    returns: vec![],
+                    returns: vec![loom_tt()],
                     attached_invariants: vec![],
                 }],
                 object_types: vec![],
@@ -1620,7 +1852,7 @@ mod tests {
                             mode: AccessMode::Mutable,
                         },
                     ],
-                    returns: vec![],
+                    returns: vec![loom_tt(), loom_tt()],
                     attached_invariants: vec![],
                 }],
                 object_types: vec![],
@@ -1726,10 +1958,9 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_emits_event_no_owner_cap() {
+    fn upgrade_is_disabled_until_owner_cap_authority_exists() {
         let chain = MockChain::new();
         let (_petal, signer, gas_id) = build_pkg(&chain);
-        let runner = MockPetalRunner::new();
         let tx = sample_signed_ptb(
             signer,
             gas_id,
@@ -1742,10 +1973,19 @@ mod tests {
                 },
             })],
         );
-        let report = run(&chain, &runner, tx);
-        assert!(report.success);
-        assert_eq!(report.publish_events.len(), 1);
-        assert!(!report.publish_events[0].minted_owner_cap);
+        let verifier = AlwaysOkVerifier;
+        let ctx = ValidationContext {
+            current_block: chain.block,
+            chain: &chain,
+            verifier: &verifier,
+            loom_coin_type: loom_tt(),
+        };
+        let err = validate_ptb(&tx, &ctx).expect_err("upgrade must be rejected before execution");
+        assert!(matches!(
+            err,
+            PtbError::BuiltinFailed { ref reason, .. }
+                if reason.contains("UpgradePetal is disabled")
+        ));
     }
 
     // ------------------------------------------------------------------
@@ -1958,7 +2198,7 @@ mod tests {
                     name: "mint".to_string(),
                     type_params: vec![],
                     args: vec![],
-                    returns: vec![],
+                    returns: vec![loom_tt()],
                     attached_invariants: vec![],
                 }],
                 object_types: vec![],
