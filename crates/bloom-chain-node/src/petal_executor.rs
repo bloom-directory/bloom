@@ -23,6 +23,7 @@ use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexK
 use bloom_petal_fungible::ops::{
     coin_payload, decode_coin_value, rewrite_value, type_tag_coin_loom,
 };
+use bloom_petal_manifest::extract_petal_manifest_v0;
 use bloom_petals::BlockCtx as PetalBlockCtx;
 use bloom_script::{
     AlwaysOkVerifier, PetalManifestStub, SignatureVerifier, ValidationContext,
@@ -50,6 +51,19 @@ use crate::sig_verifier::Ed25519PtbVerifier;
 /// §8.1, §11.1) on demand via [`PtbChainAdapter::new`]. No external
 /// manifest registry is required.
 pub struct ChainPetalExecutor;
+
+/// Provisional fuel charged for a petal deployment before byte-size cost.
+///
+/// Covers fixed validation and state-transition work: manifest extraction,
+/// content-hash calculation, code-store insertion, and VFS path binding.
+pub const DEPLOY_PETAL_BASE_FUEL: u64 = 1_000;
+
+/// Provisional byte-size fuel charged for petal deployment.
+///
+/// This is intentionally simple while the protocol lacks storage rent. It
+/// makes large wasm uploads more expensive without pretending to price
+/// persistent state growth precisely.
+pub const DEPLOY_PETAL_BYTES_PER_FUEL: u64 = 64;
 
 /// **Test-only** wrapper around [`ChainPetalExecutor`] that injects a
 /// per-petal manifest override map into the SubmitPtb dispatch path.
@@ -360,6 +374,33 @@ fn execute_tx_impl(
             }
         }
 
+        TxKind::DeployPetal { wasm_bytes } => {
+            let manifest = match extract_petal_manifest_v0(wasm_bytes) {
+                Some(m) => m,
+                None => {
+                    return ExecOutput {
+                        success: false,
+                        fuel_used: 100,
+                        return_data: b"deploy petal failed: missing bloom_petal_manifest_v0"
+                            .to_vec(),
+                        logs: vec![],
+                        write_set: None,
+                    };
+                }
+            };
+            let mut snap = state.snapshot();
+            let hash = snap.insert_code(wasm_bytes.clone());
+            snap.set_vfs_binding(manifest.module_path.clone(), hash);
+            ExecOutput {
+                success: true,
+                fuel_used: DEPLOY_PETAL_BASE_FUEL
+                    + (wasm_bytes.len() as u64 / DEPLOY_PETAL_BYTES_PER_FUEL),
+                return_data: hash.0.to_vec(),
+                logs: vec![],
+                write_set: Some(snap.commit()),
+            }
+        }
+
         // PTB dispatch (spec §16.2). The PTB wire bytes are decoded
         // here; structural decode failures revert atomically with
         // no fuel consumed beyond the spec-mandated minimum (zero —
@@ -633,6 +674,11 @@ fn execute_tx_impl(
                     // attributed (both flow through report).
                     for d in &report.loom_deltas {
                         snapshot.apply_loom_delta(Address(d.address), d.delta);
+                    }
+
+                    for event in &report.publish_events {
+                        let hash = snapshot.insert_code(event.wasm_bytes.clone());
+                        snapshot.set_vfs_binding(event.module_path.clone(), hash);
                     }
 
                     // P0-5: settle inner gas. The reservation was

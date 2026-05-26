@@ -32,7 +32,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use bloom_chain_types::Hash32;
+use bloom_chain_types::{
+    Hash32,
+    digest::{blake3_tagged, tags},
+};
 use bloom_objects::{AbilitySet, AccessMode, Object, ObjectId, Owner, TypeTag};
 
 use crate::borrow_table::BorrowRow;
@@ -131,6 +134,8 @@ pub struct PetalPublishEvent {
     pub module_path: String,
     /// Content hash (`blake3` of the wasm).
     pub wasm_hash: Hash32,
+    /// Wasm bytes to install if the enclosing PTB commits.
+    pub wasm_bytes: Vec<u8>,
     /// `true` if a fresh `OwnerCap<Path>` was minted.
     pub minted_owner_cap: bool,
 }
@@ -689,11 +694,12 @@ impl<'c> PtbExecutor<'c> {
         _cmd_idx: u16,
         report: &mut ExecutionReport,
     ) -> Result<Vec<Vec<u8>>, PtbError> {
-        let wasm_hash = Hash32(*blake3::hash(&p.wasm_bytes).as_bytes());
+        let wasm_hash = blake3_tagged(tags::PETAL, &p.wasm_bytes);
         let minted_owner_cap = p.publisher_cap.is_none();
         report.publish_events.push(PetalPublishEvent {
             module_path: p.module_path.clone(),
             wasm_hash,
+            wasm_bytes: p.wasm_bytes.clone(),
             minted_owner_cap,
         });
         // Output slot 0: 32-byte content hash; slot 1: 32-byte
@@ -717,10 +723,11 @@ impl<'c> PtbExecutor<'c> {
         _cmd_idx: u16,
         report: &mut ExecutionReport,
     ) -> Result<Vec<Vec<u8>>, PtbError> {
-        let wasm_hash = Hash32(*blake3::hash(&u.wasm_bytes).as_bytes());
+        let wasm_hash = blake3_tagged(tags::PETAL, &u.wasm_bytes);
         report.publish_events.push(PetalPublishEvent {
             module_path: u.module_path.clone(),
             wasm_hash,
+            wasm_bytes: u.wasm_bytes.clone(),
             minted_owner_cap: false,
         });
         Ok(vec![wasm_hash.0.to_vec()])

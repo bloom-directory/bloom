@@ -12,12 +12,12 @@
 //! Driving model (mirrors `bloom-dex-it`'s `docker_dex_multi_user.rs`):
 //!   - `scripts/test-docker-petal-dex.sh` builds the docker image, provisions
 //!     a 4-validator testnet under `$BLOOM_DOCKER_TMPDIR/home{0..3}`, APPENDS
-//!     the petal DEX code/bindings plus an Ed25519 gas allocation (keyed to
-//!     the inner-PTB signer pubkey) to all four byte-identical genesis.toml
-//!     files, `docker compose up -d`s the stack, and runs this test.
+//!     an Ed25519 gas allocation (keyed to the inner-PTB signer pubkey) to
+//!     all four byte-identical genesis.toml files, `docker compose up -d`s
+//!     the stack, and runs this test.
 //!   - This driver attaches to the running stack over TCP (host ports
-//!     18545..18548), checks the genesis-bound petal hashes, then submits two
-//!     Ed25519-signed inner PTBs via `bloom chain submit-ptb`.
+//!     18545..18548), deploys the three petal wasms via `bloom chain deploy`,
+//!     then submits two Ed25519-signed inner PTBs via `bloom chain submit-ptb`.
 //!
 //! Two address spaces (see brief):
 //!   - INNER PTB auth: a deterministic Ed25519 key (`ptb_signer_*` in
@@ -109,7 +109,7 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
         ptb_signer_pubkey_hex()
     );
 
-    // ── 2. Build the three petal wasms and verify genesis bindings ────────
+    // ── 2. Build the three petal wasms + deploy each via the bloom CLI ────
     eprintln!();
     eprintln!("[build] compiling pool/wallet/faucet to wasm32-unknown-unknown");
     let pool_wasm_path = build_pool_wasm();
@@ -120,29 +120,37 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
     let wallet_wasm = std::fs::read(&wallet_wasm_path).context("read wallet wasm")?;
     let faucet_wasm = std::fs::read(&faucet_wasm_path).context("read faucet wasm")?;
 
-    // Host-side petal hashes (= blake3_tagged(PETAL, wasm)) — what genesis
-    // provisioning inserted, and what each PetalRef pins.
+    // Host-side petal hashes (= blake3_tagged(PETAL, wasm)) — what deploy
+    // inserts, and what each PetalRef pins.
     let pool_hash = petal_hash_of(&pool_wasm);
     let wallet_hash = petal_hash_of(&wallet_wasm);
     let faucet_hash = petal_hash_of(&faucet_wasm);
 
     eprintln!();
-    eprintln!("[genesis] verifying petal DEX bindings:");
+    eprintln!("[deploy] deploying petals from home0 (outer xDSA envelope):");
+    deploy_petal(&home0, HOST_RPC_PORTS[0], &pool_wasm_path)?;
     assert_resolves(client0, "/bloom/dex/pool", pool_hash).await?;
     eprintln!(
         "         /bloom/dex/pool   hash={}",
         hex::encode(pool_hash.0)
     );
+    deploy_petal(&home0, HOST_RPC_PORTS[0], &wallet_wasm_path)?;
     assert_resolves(client0, "/bloom/dex/wallet", wallet_hash).await?;
     eprintln!(
         "         /bloom/dex/wallet hash={}",
         hex::encode(wallet_hash.0)
     );
+    deploy_petal(&home0, HOST_RPC_PORTS[0], &faucet_wasm_path)?;
     assert_resolves(client0, "/bloom/dex/faucet", faucet_hash).await?;
     eprintln!(
         "         /bloom/dex/faucet hash={}",
         hex::encode(faucet_hash.0)
     );
+
+    // Deploy receipts are waited on by the CLI. Let every validator catch up
+    // before submitting PTBs that may be admitted by any validator after gossip.
+    let mut latest = current_height(client0).await?;
+    wait_all_reach_height(&clients, latest + 2).await?;
 
     // ── 3. Discover the ed25519-owned gas Coin<LOOM> ──────────────────────
     let signer_hex = ptb_signer_pubkey_hex();
@@ -218,7 +226,7 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
     );
 
     // Make every validator catch up so discovery is not racing the apply.
-    let mut latest = current_height(client0).await?;
+    latest = current_height(client0).await?;
     wait_all_reach_height(&clients, latest + 1).await?;
 
     // ── 5. Discover the shared Pool + assert reserves (1000, 1000) ────────
@@ -393,6 +401,33 @@ fn bloom_bin() -> PathBuf {
     }
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     PathBuf::from(manifest_dir).join("../../../../target/release/bloom")
+}
+
+/// `bloom chain deploy <wasm> --wait` from `home`, dialing the validator at
+/// `127.0.0.1:<port>` via `BLOOM_RPC_TCP`.
+fn deploy_petal(home: &std::path::Path, port: u16, wasm: &std::path::Path) -> Result<()> {
+    let rpc = format!("127.0.0.1:{}", port);
+    let out = Command::new(bloom_bin())
+        .env("BLOOM_RPC_TCP", &rpc)
+        .arg("--home")
+        .arg(home)
+        .arg("chain")
+        .arg("deploy")
+        .arg(wasm)
+        .arg("--wait")
+        .arg("--wait-timeout-secs")
+        .arg("60")
+        .output()
+        .context("invoke bloom chain deploy")?;
+    if !out.status.success() {
+        bail!(
+            "bloom chain deploy {} failed:\n  stdout={}\n  stderr={}",
+            wasm.display(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
 }
 
 /// Ed25519-sign + encode `ptb`, write the bytes to a temp file, and run

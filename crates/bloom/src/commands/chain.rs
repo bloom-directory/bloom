@@ -71,6 +71,18 @@ pub enum ChainCmd {
         #[arg(long, value_name = "BLOOMWEIS")]
         amount: u128,
     },
+    /// Deploy a Bloom-native petal wasm module.
+    Deploy {
+        /// Path to a `.wasm` file carrying a bloom_petal_manifest_v0 section.
+        #[arg(value_name = "WASM")]
+        wasm: PathBuf,
+        /// Poll for the tx receipt after submitting and print it.
+        #[arg(long)]
+        wait: bool,
+        /// Receipt-poll timeout in seconds (only with `--wait`; default 30).
+        #[arg(long, value_name = "N", default_value_t = 30u64)]
+        wait_timeout_secs: u64,
+    },
     /// Query chain state.
     #[command(subcommand)]
     Query(QueryCmd),
@@ -387,6 +399,52 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             println!("{}", serde_json::to_string_pretty(&result)?);
             wait_for_nonce(&client, &sender, nonce, std::time::Duration::from_secs(30)).await?;
             wait_for_tx_receipt(&client, &tx_hash, std::time::Duration::from_secs(30)).await?;
+            Ok(())
+        }
+
+        // ── deploy petal ─────────────────────────────────────────────────────
+        ChainCmd::Deploy {
+            wasm,
+            wait,
+            wait_timeout_secs,
+        } => {
+            use bloom_chain_types::ssz::Encode;
+            use bloom_chain_types::tx::TxKind;
+
+            let wasm_bytes =
+                std::fs::read(&wasm).with_context(|| format!("read wasm: {}", wasm.display()))?;
+            let (sk, pk, sender) = load_wallet_key(&chain_dir)?;
+            let chain_id = load_chain_id(&chain_dir)?;
+            let client = make_client();
+            let nonce = fetch_nonce(&client, &sender).await? + 1;
+            let tx = build_and_sign_tx(
+                &sk,
+                &pk,
+                sender,
+                &chain_id,
+                nonce,
+                TxKind::DeployPetal { wasm_bytes },
+                10_000_000,
+                1,
+            )?;
+            let tx_hash = tx.tx_hash();
+            let result = client
+                .call(
+                    "chain_submit_tx",
+                    json!({ "tx_hex": hex::encode(tx.as_ssz_bytes()) }),
+                )
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            if wait {
+                let receipt = poll_tx_receipt(
+                    &client,
+                    &tx_hash,
+                    std::time::Duration::from_secs(wait_timeout_secs),
+                )
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+            }
+            println!("{}", json!({ "tx_hash": hex::encode(tx_hash.0) }));
             Ok(())
         }
 

@@ -21,6 +21,7 @@ use crate::types::{Address, Hash32, PubKeyBytes, SigBytes, decode_string, encode
 /// |----------|---------------|
 /// | 0        | `Transfer`    |
 /// | 1        | `SubmitPtb`   |
+/// | 2        | `DeployPetal` |
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum TxKind {
     /// Transfer native LOOM from sender to `to`.
@@ -41,12 +42,19 @@ pub enum TxKind {
     ///
     /// The executor decodes and validates the inner PTB before running it atomically.
     SubmitPtb { ptb_bytes: Vec<u8> },
+    /// Deploy a Bloom-native petal wasm module.
+    ///
+    /// The wasm must carry a `bloom_petal_manifest_v0` custom section. The
+    /// executor stores the code by content hash and binds the manifest's
+    /// `module_path` in the chain VFS registry.
+    DeployPetal { wasm_bytes: Vec<u8> },
 }
 
 /// Selector byte written as the first byte of a `TxKind` SSZ encoding.
-/// Matches SSZ union convention: 0 = Transfer, 1 = SubmitPtb.
+/// Matches SSZ union convention: 0 = Transfer, 1 = SubmitPtb, 2 = DeployPetal.
 const TX_KIND_TRANSFER: u8 = 0;
 const TX_KIND_SUBMIT_PTB: u8 = 1;
+const TX_KIND_DEPLOY_PETAL: u8 = 2;
 
 impl Encode for TxKind {
     fn is_ssz_fixed_len() -> bool {
@@ -65,6 +73,7 @@ impl Encode for TxKind {
                 // the outer container framing in `from_ssz_bytes`).
                 ptb_bytes.len()
             }
+            TxKind::DeployPetal { wasm_bytes } => wasm_bytes.len(),
         }
     }
 
@@ -85,6 +94,10 @@ impl Encode for TxKind {
                 // by reading the post-selector remainder as the full
                 // ptb_bytes payload.
                 buf.extend_from_slice(ptb_bytes);
+            }
+            TxKind::DeployPetal { wasm_bytes } => {
+                buf.push(TX_KIND_DEPLOY_PETAL);
+                buf.extend_from_slice(wasm_bytes);
             }
         }
     }
@@ -125,6 +138,9 @@ impl Decode for TxKind {
                     ptb_bytes: rest.to_vec(),
                 })
             }
+            TX_KIND_DEPLOY_PETAL => Ok(TxKind::DeployPetal {
+                wasm_bytes: rest.to_vec(),
+            }),
             _ => Err(DecodeError::BytesInvalid(format!(
                 "unknown TxKind selector: {selector}"
             ))),
@@ -138,6 +154,10 @@ impl TxKind {
     /// Convenience for executor / mempool routing.
     pub fn is_submit_ptb(&self) -> bool {
         matches!(self, TxKind::SubmitPtb { .. })
+    }
+
+    pub fn is_deploy_petal(&self) -> bool {
+        matches!(self, TxKind::DeployPetal { .. })
     }
 }
 
@@ -425,17 +445,30 @@ mod tests {
     }
 
     #[test]
+    fn tx_deploy_petal_kind_alone_ssz_roundtrip() {
+        let kind = TxKind::DeployPetal {
+            wasm_bytes: b"\0asm fake".to_vec(),
+        };
+        let bytes = kind.as_ssz_bytes();
+        assert_eq!(bytes[0], TX_KIND_DEPLOY_PETAL);
+        let decoded = TxKind::from_ssz_bytes(&bytes).expect("decode");
+        assert_eq!(kind, decoded);
+        assert!(decoded.is_deploy_petal());
+    }
+
+    #[test]
     fn tx_submit_ptb_selector_is_three() {
-        // Wire-format anchor: only Transfer and SubmitPtb remain.
+        // Wire-format anchor: Transfer, SubmitPtb, DeployPetal.
         assert_eq!(TX_KIND_SUBMIT_PTB, 1);
+        assert_eq!(TX_KIND_DEPLOY_PETAL, 2);
     }
 
     #[test]
     fn tx_selectors_are_contiguous() {
-        let selectors = [TX_KIND_TRANSFER, TX_KIND_SUBMIT_PTB];
+        let selectors = [TX_KIND_TRANSFER, TX_KIND_SUBMIT_PTB, TX_KIND_DEPLOY_PETAL];
         let mut sorted = selectors;
         sorted.sort_unstable();
-        assert_eq!(sorted, [0, 1]);
+        assert_eq!(sorted, [0, 1, 2]);
     }
 
     #[test]

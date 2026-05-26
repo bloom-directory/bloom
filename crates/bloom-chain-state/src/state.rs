@@ -127,6 +127,8 @@ pub struct WriteSet {
     /// patterns like "deploy then call" or an `init` that self-calls — the
     /// staged code must be visible within the snapshot that staged it.
     pub(crate) code: BTreeMap<Hash32, Vec<u8>>,
+    /// VFS path bindings staged by deploy/publish flows.
+    pub(crate) vfs: BTreeMap<String, Hash32>,
     /// Object trie diffs keyed by `ObjectId` (spec §16.3).
     pub(crate) objects: BTreeMap<ObjectId, ObjectDelta>,
     /// OwnershipIndex trie diffs keyed by `OwnershipIndexKey`.
@@ -548,6 +550,10 @@ impl State {
             self.code.insert(&wasm);
         }
 
+        for (path, hash) in ws.vfs {
+            self.set_vfs_binding(path, hash);
+        }
+
         // PTB extensions (spec §16.3) — Phase 1 in-memory storage.
         for (id, delta) in ws.objects {
             match delta {
@@ -703,6 +709,14 @@ impl StateSnapshot {
         let hash = bloom_chain_types::digest::blake3_tagged(tags::PETAL, &wasm);
         self.write_set.code.insert(hash, wasm);
         hash
+    }
+
+    /// Stage a VFS path binding to a petal hash.
+    pub fn set_vfs_binding(&mut self, path: String, hash: Hash32) {
+        if path.is_empty() {
+            return;
+        }
+        self.write_set.vfs.insert(path, hash);
     }
 
     /// Read code, consulting staged inserts before the committed base state.

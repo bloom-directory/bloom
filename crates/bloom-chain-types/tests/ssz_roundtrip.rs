@@ -44,6 +44,7 @@ fn arb_tx_kind() -> impl Strategy<Value = TxKind> {
         (arb_address(), any::<u128>())
             .prop_map(|(to, amount_loom)| TxKind::Transfer { to, amount_loom }),
         arb_vec_u8(256).prop_map(|ptb_bytes| TxKind::SubmitPtb { ptb_bytes }),
+        arb_vec_u8(256).prop_map(|wasm_bytes| TxKind::DeployPetal { wasm_bytes }),
     ]
 }
 

@@ -551,6 +551,7 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
         let max_fee = tx.max_fuel as u128 * tx.fee_per_unit as u128;
         let value = match &tx.kind {
             TxKind::Transfer { amount_loom, .. } => *amount_loom,
+            TxKind::DeployPetal { .. } => 0,
             // Handled in the SubmitPtb early-continue branch above.
             TxKind::SubmitPtb { .. } => unreachable!(),
         };

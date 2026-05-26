@@ -285,7 +285,7 @@ impl<V: SigVerifier> Mempool<V> {
 fn tx_value(tx: &Tx) -> u128 {
     match &tx.kind {
         TxKind::Transfer { amount_loom, .. } => *amount_loom,
-        TxKind::SubmitPtb { .. } => 0,
+        TxKind::SubmitPtb { .. } | TxKind::DeployPetal { .. } => 0,
     }
 }
 
