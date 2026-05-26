@@ -13,36 +13,9 @@
 //!
 //! ## Why it is `#[ignore]`-gated
 //!
-//! Two reasons:
-//!
-//! 1. It shells out to `cargo build --target wasm32-unknown-unknown`,
-//!    which requires the wasm target to be installed and is too slow /
-//!    environment-dependent for the default `cargo test` run.
-//! 2. A *full* call-through (instantiate the wasm, feed it a PTB carrying
-//!    `Arg::TypeArg` + `Arg::Object(Coin)`, assert the output object's
-//!    runtime type-tag) additionally depends on the calldata wire-format
-//!    reconciliation between the chain VM (`bloom-petals::chain_vm`, which
-//!    invokes `__petal_*` as `(i32, i32) -> i32` and feeds calldata via
-//!    the `msg.calldata.read` import) and the macro-emitted 4-arg
-//!    `(args_ptr, args_len, ret_ptr, ret_cap)` ABI. That reconciliation
-//!    is Phase E/F, not Phase A. The host-shim unit tests in
-//!    `crates/bloom-resource-macros/tests/compile_pass.rs`
-//!    (`generic_dispatch_test`) already drive the dispatch path directly
-//!    in the canonical `ArgReader` wire format and assert the runtime
-//!    type-erased dispatch, runtime-tag resolution, output-object tag
-//!    stamping, and linearity.
-//!
-//! ## Intended end-to-end flow (Phase E/F)
-//!
-//! Once the calldata path is reconciled, this test should additionally:
-//!
-//! 1. Publish the compiled wasm at `/bloom/test/identity`.
-//! 2. Build a PTB with a single `Command::Move` for `identity` whose
-//!    `type_args = [Concrete{ "USDC" }]` and `args = [Arg::Object(coin)]`.
-//! 3. Execute it through `ChainPetalRunner` / `PetalVm` and assert the
-//!    returned coin object carries the runtime tag `USDC` (taken from the
-//!    `Arg::TypeArg`, not a compile-time const) and that the input coin
-//!    was consumed exactly once (linearity).
+//! It shells out to `cargo build --target wasm32-unknown-unknown`, which
+//! requires the wasm target to be installed and is too slow /
+//! environment-dependent for the default `cargo test` run.
 //!
 //! ## How to run
 //!
@@ -52,6 +25,16 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+
+use bloom_chain_node::chain_petal_runner::ChainPetalRunner;
+use bloom_chain_state::State;
+use bloom_chain_types::{Hash32, types::Address};
+use bloom_objects::TypeTag;
+use bloom_petals::BlockCtx;
+use bloom_resource::abi::ArgReader;
+use bloom_script::{executor::PetalRunner, host_ctx::PtbHostCtx};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 /// Build this petal for `wasm32-unknown-unknown` and return the path to
 /// the emitted `.wasm` artifact.
@@ -121,4 +104,44 @@ fn generic_fns_emit_real_wasm_exports() {
         exports.iter().any(|n| n == "__petal_echo_tag"),
         "generic `echo_tag<T>` must emit a real `__petal_echo_tag` export; got {exports:?}"
     );
+}
+
+#[test]
+#[ignore = "compiles to wasm32; run with `cargo test -p bloom-petal-identity -- --ignored`"]
+fn real_wasm_echo_tag_receives_runner_type_args() {
+    let artifact = build_wasm();
+    let bytes = std::fs::read(&artifact).expect("read wasm artifact");
+    let hash = Hash32(blake3::hash(&bytes).into());
+    let usdc = TypeTag::Concrete {
+        petal_hash: [0x11; 32],
+        type_name: "USDC".to_string(),
+        type_args: vec![],
+    };
+    let expected_len = usdc.encode_canonical().unwrap().len() as u128;
+
+    let mut petals = BTreeMap::new();
+    petals.insert(hash, bytes);
+    let runner = ChainPetalRunner::new(
+        petals,
+        Arc::new(Mutex::new(PtbHostCtx::new())),
+        State::new().snapshot(),
+        BlockCtx {
+            number: 1,
+            timestamp_ms: 1_700_000_000_000,
+            prevhash: Hash32([0; 32]),
+        },
+        Address([0; 32]),
+    );
+
+    let result = runner
+        .call(&hash, "echo_tag", &[usdc], &0u32.to_be_bytes(), 1_000_000)
+        .expect("real wasm generic echo_tag should run");
+
+    let mut r = ArgReader::new(&result.ret_buf);
+    assert_eq!(r.read_u32().unwrap(), 1);
+    let bytes = r.read_bytes().unwrap();
+    let mut raw = [0u8; 16];
+    raw.copy_from_slice(&bytes);
+    assert_eq!(u128::from_be_bytes(raw), expected_len);
+    r.expect_eof().unwrap();
 }

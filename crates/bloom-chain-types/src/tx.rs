@@ -60,9 +60,8 @@ pub enum TxKind {
     /// length-prefixed by the SSZ container framing here. Higher
     /// layers (mempool, executor) decode via `bloom_script::decode_ptb`.
     ///
-    /// Through Phase 1 the dispatcher returns a `NotYetActivated`
-    /// revert receipt for this variant; Phase 2 activates real
-    /// execution.
+    /// The executor decodes and validates the inner PTB before running it
+    /// atomically.
     SubmitPtb { ptb_bytes: Vec<u8> },
 }
 
@@ -288,9 +287,7 @@ impl Decode for TxKind {
 impl TxKind {
     /// Returns `true` iff this transaction is a `SubmitPtb` (spec §16.1).
     ///
-    /// Convenience for executor / mempool gating during Phase 1, where
-    /// the variant exists on the wire but execution returns a
-    /// `NotYetActivated` revert.
+    /// Convenience for executor / mempool routing.
     pub fn is_submit_ptb(&self) -> bool {
         matches!(self, TxKind::SubmitPtb { .. })
     }

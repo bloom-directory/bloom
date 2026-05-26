@@ -452,6 +452,7 @@ impl CallArgsWriter {
 pub struct CallArgsReader<'a> {
     inner: ArgReader<'a>,
     count: u32,
+    consumed: u32,
 }
 
 impl<'a> CallArgsReader<'a> {
@@ -459,7 +460,11 @@ impl<'a> CallArgsReader<'a> {
     pub fn new(buf: &'a [u8]) -> Result<Self, AbiError> {
         let mut inner = ArgReader::new(buf);
         let count = inner.read_u32()?;
-        Ok(Self { inner, count })
+        Ok(Self {
+            inner,
+            count,
+            consumed: 0,
+        })
     }
 
     /// The arg count declared by the leading length prefix.
@@ -473,12 +478,35 @@ impl<'a> CallArgsReader<'a> {
     }
 
     fn expect_tag(&mut self, expected: u8) -> Result<(), AbiError> {
+        if self.consumed >= self.count {
+            return Err(AbiError::UnexpectedEof {
+                needed: 1,
+                available: 0,
+            });
+        }
         let got = self.inner.read_u8()?;
         if got == expected {
+            self.consumed += 1;
             Ok(())
         } else {
             Err(AbiError::ArgTagMismatch { expected, got })
         }
+    }
+
+    /// Assert the declared arg count and byte body are fully consumed.
+    pub fn expect_finished(&self) -> Result<(), AbiError> {
+        if self.consumed != self.count {
+            return Err(AbiError::UnexpectedEof {
+                needed: (self.count - self.consumed) as usize,
+                available: 0,
+            });
+        }
+        if self.inner.remaining() != 0 {
+            return Err(AbiError::TrailingBytes {
+                remaining: self.inner.remaining(),
+            });
+        }
+        Ok(())
     }
 
     /// Decode a `Signer` slot to its signer index.
@@ -491,9 +519,19 @@ impl<'a> CallArgsReader<'a> {
     /// Accepts either tag because a value-typed parameter can be supplied
     /// as a literal `Const` or threaded from an upstream `Use` return.
     pub fn next_const_bytes(&mut self) -> Result<Vec<u8>, AbiError> {
+        if self.consumed >= self.count {
+            return Err(AbiError::UnexpectedEof {
+                needed: 1,
+                available: 0,
+            });
+        }
         let tag = self.inner.read_u8()?;
         match tag {
-            ARG_TAG_CONST | ARG_TAG_USE => self.inner.read_bytes(),
+            ARG_TAG_CONST | ARG_TAG_USE => {
+                let bytes = self.inner.read_bytes()?;
+                self.consumed += 1;
+                Ok(bytes)
+            }
             other => Err(AbiError::ArgTagMismatch {
                 expected: ARG_TAG_CONST,
                 got: other,
@@ -505,8 +543,14 @@ impl<'a> CallArgsReader<'a> {
     /// (tag 3, length-prefixed) that threads a Coin/Capability id, into a
     /// 32-byte `ObjectId`.
     pub fn next_object_id(&mut self) -> Result<ObjectId, AbiError> {
+        if self.consumed >= self.count {
+            return Err(AbiError::UnexpectedEof {
+                needed: 1,
+                available: 0,
+            });
+        }
         let tag = self.inner.read_u8()?;
-        match tag {
+        let out = match tag {
             ARG_TAG_OBJECT => self.inner.read_object_id(),
             ARG_TAG_USE => {
                 let b = self.inner.read_bytes()?;
@@ -521,7 +565,9 @@ impl<'a> CallArgsReader<'a> {
                 expected: ARG_TAG_OBJECT,
                 got: other,
             }),
-        }
+        }?;
+        self.consumed += 1;
+        Ok(out)
     }
 
     /// Decode a `TypeArg` slot (tag 4) into a `TypeTag`.
@@ -901,6 +947,34 @@ mod tests {
         let buf = w.finish();
         let mut r = CallArgsReader::new(&buf).unwrap();
         assert_eq!(r.next_type_arg().unwrap(), tag);
+    }
+
+    #[test]
+    fn call_args_rejects_trailing_slots() {
+        let mut w = CallArgsWriter::new();
+        w.push_signer(7);
+        w.push_signer(8);
+        let buf = w.finish();
+        let mut r = CallArgsReader::new(&buf).unwrap();
+        assert_eq!(r.next_signer().unwrap(), 7);
+        assert_eq!(
+            r.expect_finished(),
+            Err(AbiError::UnexpectedEof {
+                needed: 1,
+                available: 0
+            })
+        );
+    }
+
+    #[test]
+    fn call_args_rejects_trailing_bytes_after_counted_slots() {
+        let mut buf = CallArgsWriter::new().finish();
+        buf.push(ARG_TAG_SIGNER);
+        let r = CallArgsReader::new(&buf).unwrap();
+        assert_eq!(
+            r.expect_finished(),
+            Err(AbiError::TrailingBytes { remaining: 1 })
+        );
     }
 
     #[test]

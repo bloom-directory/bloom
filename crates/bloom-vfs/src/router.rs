@@ -138,6 +138,21 @@ impl Vfs {
     fn audit_side_effecting_read(&self, path: &VfsPath) {
         self.audit_record(AUDIT_KIND_READ, path, serde_json::json!({}));
     }
+
+    /// Read `path` pinned to a historical block. This bypasses the router-level
+    /// latest-state cache and only succeeds for handlers that explicitly
+    /// implement historical reads.
+    pub async fn read_at_block(&self, path: &VfsPath, block: u64) -> Result<Vec<u8>, HandlerError> {
+        let head = path
+            .first()
+            .ok_or_else(|| HandlerError::NotAFile(path.to_string_path()))?;
+        let h = self
+            .handlers
+            .get(head)
+            .ok_or_else(|| HandlerError::NotFound(path.to_string_path()))?;
+        let rest = path.shift();
+        h.read_at_block(&rest, block).await
+    }
 }
 
 fn root_agent_guidance_entry(path: &VfsPath) -> Option<&'static str> {

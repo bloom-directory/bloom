@@ -358,6 +358,17 @@ mod dispatch_test {
     }
 
     #[test]
+    fn trailing_calldata_returns_invalid_args_error_code() {
+        test_hooks::clear();
+        let mut w = CallArgsWriter::new();
+        w.push_const(&1u128.to_be_bytes());
+        w.push_const(&2u128.to_be_bytes());
+        let args = w.finish();
+        let (rc, _ret) = drive_safe_shim(dispatch::__bloom_petal_id, &args);
+        assert_eq!(rc, PetalError::InvalidArgs.as_i32());
+    }
+
+    #[test]
     fn return_envelope_is_count_prefixed() {
         test_hooks::clear();
         // A successful call to `id` (returns u128) produces a

@@ -970,7 +970,7 @@ fn encode_arg_for_scope(arg: &Arg) -> Result<Vec<u8>, PtbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain_iface::{ArgDeclStub, FunctionDeclStub, PetalManifestStub};
+    use crate::chain_iface::{ArgDeclStub, FunctionDeclStub, PetalManifestStub, TypeParamDeclStub};
     use crate::host_ctx::HandleEntry;
     use crate::types::{
         Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PqSignature, PtbTx, PublishCmd, UseRef,
@@ -1037,6 +1037,15 @@ mod tests {
         canned: HashMap<(Hash32, String), (Vec<u8>, u64)>,
         // (petal, export) -> (ok, fuel)
         inv: HashMap<(Hash32, String), (bool, u64)>,
+        calls: RefCell<Vec<MockCall>>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct MockCall {
+        petal_hash: Hash32,
+        function: String,
+        type_args: Vec<TypeTag>,
+        args_buf: Vec<u8>,
     }
 
     impl MockPetalRunner {
@@ -1044,6 +1053,7 @@ mod tests {
             Self {
                 canned: HashMap::new(),
                 inv: HashMap::new(),
+                calls: RefCell::new(Vec::new()),
             }
         }
         fn set(&mut self, petal: Hash32, func: &str, ret_buf: Vec<u8>, fuel: u64) {
@@ -1057,10 +1067,16 @@ mod tests {
             &self,
             petal_hash: &Hash32,
             function: &str,
-            _type_args: &[TypeTag],
-            _args_buf: &[u8],
+            type_args: &[TypeTag],
+            args_buf: &[u8],
             _fuel_budget: u64,
         ) -> Result<PetalCallResult, PtbError> {
+            self.calls.borrow_mut().push(MockCall {
+                petal_hash: *petal_hash,
+                function: function.to_string(),
+                type_args: type_args.to_vec(),
+                args_buf: args_buf.to_vec(),
+            });
             match self.canned.get(&(*petal_hash, function.to_string())) {
                 Some((buf, fuel)) => Ok(PetalCallResult {
                     ret_buf: buf.clone(),
@@ -1196,6 +1212,64 @@ mod tests {
         assert!(report.success, "report: {report:?}");
         assert_eq!(report.command_outputs.len(), 1);
         assert_eq!(report.command_outputs[0], vec![b"hello".to_vec()]);
+    }
+
+    #[test]
+    fn move_command_forwards_generic_type_args_to_runner() {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        let usdc = TypeTag::Concrete {
+            petal_hash: [0x22; 32],
+            type_name: "USDC".to_string(),
+            type_args: vec![],
+        };
+        chain.put_petal(
+            petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/p".to_string(),
+                functions: vec![FunctionDeclStub {
+                    name: "generic".to_string(),
+                    type_params: vec![TypeParamDeclStub {
+                        name: "T".to_string(),
+                        phantom: true,
+                    }],
+                    args: vec![ArgDeclStub::Const(TypeTag::Generic { idx: 0 })],
+                    returns: vec![],
+                    attached_invariants: vec![],
+                }],
+                object_types: vec![],
+                external_type_refs: vec![],
+            },
+        );
+        let mut runner = MockPetalRunner::new();
+        runner.set(petal, "generic", build_outputs(&[]), 100);
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/p".to_string(),
+                    hash: Some(petal),
+                },
+                function: "generic".to_string(),
+                type_args: vec![usdc.clone()],
+                args: vec![Arg::Const(42u128.to_be_bytes().to_vec())],
+            })],
+        );
+
+        let report = run(&chain, &runner, tx);
+        assert!(report.success, "report: {report:?}");
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].petal_hash, petal);
+        assert_eq!(calls[0].function, "generic");
+        assert_eq!(calls[0].type_args, vec![usdc]);
+        assert_eq!(
+            u32::from_be_bytes(calls[0].args_buf[..4].try_into().unwrap()),
+            1
+        );
+        assert_eq!(calls[0].args_buf[4], 1);
     }
 
     #[test]

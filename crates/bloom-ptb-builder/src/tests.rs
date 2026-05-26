@@ -680,6 +680,37 @@ fn lower_named_dag_inputs() {
 }
 
 #[test]
+fn lower_named_dag_inputs_are_name_ordered() {
+    let lines = lower_pipe_expr(
+        "/bloom/dex/pool/add-liquidity --b <(/bloom/dex/pool/spend-usdc)> --a <(/bloom/dex/pool/spend-eth)> --min-lp 10",
+    )
+    .unwrap();
+    assert_eq!(
+        lines,
+        vec![
+            "/bloom/dex/pool/spend-usdc".to_string(),
+            "/bloom/dex/pool/spend-eth".to_string(),
+            "/bloom/dex/pool/add-liquidity min-lp=10 a=@1.0 b=@0.0".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn lower_pipe_accepts_scalar_flags_next_to_named_inputs() {
+    let lines = lower_pipe_expr(
+        "/bloom/dex/pool/add-liquidity --min-lp 10 --a <(/bloom/dex/pool/spend-eth)>",
+    )
+    .unwrap();
+    assert_eq!(
+        lines,
+        vec![
+            "/bloom/dex/pool/spend-eth".to_string(),
+            "/bloom/dex/pool/add-liquidity min-lp=10 a=@0.0".to_string(),
+        ]
+    );
+}
+
+#[test]
 fn lower_pipe_rejects_unbalanced_subexpr() {
     let err = lower_pipe_expr("/bloom/x --a <(/bloom/y").unwrap_err();
     assert!(matches!(err, BuildError::Parse(_)));
@@ -788,7 +819,7 @@ fn pipe_to_session_dag_add_liquidity() {
     let signer = [0x22; 32];
     let mut s = ready_session(&chain, signer);
     let lines = lower_pipe_expr(
-        "/bloom/dex/pool/add_liquidity min-lp=10 --a <(/bloom/dex/pool/spend_eth)> --b <(/bloom/dex/pool/spend_usdc)>",
+        "/bloom/dex/pool/add_liquidity --b <(/bloom/dex/pool/spend_usdc)> --a <(/bloom/dex/pool/spend_eth)> --min-lp 10",
     )
     .unwrap();
     // Sub-pipes first, then add_liquidity.
@@ -805,11 +836,11 @@ fn pipe_to_session_dag_add_liquidity() {
                 vec![
                     Arg::Const(10u64.to_be_bytes().to_vec()),
                     Arg::Use {
-                        cmd_idx: 0,
+                        cmd_idx: 1,
                         ret_idx: 0
                     },
                     Arg::Use {
-                        cmd_idx: 1,
+                        cmd_idx: 0,
                         ret_idx: 0
                     },
                 ]

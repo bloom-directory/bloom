@@ -49,13 +49,21 @@ impl PetalHost for VfsHost {
 
     async fn chain_read_at(
         &self,
-        _chain: &str,
-        _path: &str,
+        chain: &str,
+        path: &str,
         _block: u64,
     ) -> Result<Vec<u8>, HostError> {
-        Err(HostError::Denied(
-            "VfsHost: chain reads belong on the VFS for local petals".into(),
-        ))
+        let normalized = path.trim_start_matches('/');
+        let expected_prefix = format!("chains/{chain}/");
+        if !normalized.starts_with(&expected_prefix) {
+            return Err(HostError::ChainPathUnknown(path.to_string()));
+        }
+        let vfs_path =
+            VfsPath::parse(normalized).map_err(|e| HostError::Invalid(format!("path: {e}")))?;
+        self.vfs
+            .read_at_block(&vfs_path, _block)
+            .await
+            .map_err(host_from_chain_read)
     }
 }
 
@@ -68,6 +76,13 @@ fn host_from_handler(e: HandlerError) -> HostError {
         HandlerError::Unsupported(s) => HostError::Backend(format!("unsupported: {s}")),
         HandlerError::Backend(s) => HostError::Backend(s),
         HandlerError::Io(e) => HostError::Backend(format!("io: {e}")),
+    }
+}
+
+fn host_from_chain_read(e: HandlerError) -> HostError {
+    match e {
+        HandlerError::Unsupported(s) | HandlerError::NotFound(s) => HostError::ChainPathUnknown(s),
+        other => host_from_handler(other),
     }
 }
 
@@ -276,7 +291,8 @@ impl PetalRunner {
     /// Re-run an onchain petal against the same stdin and check whether
     /// the output hash matches `expected_output_hash`. Returns the
     /// resulting [`ReplayOutcome`] regardless of match status; only
-    /// non-onchain petals or run failures surface as errors.
+    /// non-onchain petals, VM failures, or nonzero petal exits surface
+    /// as errors.
     pub async fn replay(
         &self,
         name_or_hash: &str,
@@ -295,6 +311,12 @@ impl PetalRunner {
         let (run, att) = self
             .run_attested(name_or_hash, stdin, host, None, opts)
             .await?;
+        if run.exit_code != 0 {
+            return Err(PetalError::Vm(format!(
+                "replay execution failed: petal exited with code {}",
+                run.exit_code
+            )));
+        }
         let att = att.expect("onchain run must produce attestation");
         let matched = att.output_hash == expected_output_hash;
         Ok(ReplayOutcome {
@@ -317,6 +339,8 @@ pub struct ReplayOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use bloom_vfs::handler::{Entry, Handler};
     use tempfile::TempDir;
 
     fn runner() -> (TempDir, PetalRunner) {
@@ -342,6 +366,40 @@ mod tests {
             (call $exit (i32.const 0)))
         )
     "#;
+
+    struct HistoricalOnlyHandler;
+
+    #[async_trait]
+    impl Handler for HistoricalOnlyHandler {
+        async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+            Ok(Entry::file(&path.to_string_path()))
+        }
+
+        async fn read(&self, _path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            Ok(b"latest".to_vec())
+        }
+
+        async fn read_at_block(
+            &self,
+            _path: &VfsPath,
+            block: u64,
+        ) -> Result<Vec<u8>, HandlerError> {
+            Ok(format!("historical:{block}").into_bytes())
+        }
+    }
+
+    #[tokio::test]
+    async fn vfs_host_chain_read_at_uses_historical_vfs_entrypoint() {
+        let vfs = Vfs::builder()
+            .mount("chains", Arc::new(HistoricalOnlyHandler))
+            .build();
+        let host = VfsHost::new(Arc::new(vfs));
+        let bytes = host
+            .chain_read_at("eth", "chains/eth/addresses/0x0/balance", 123)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"historical:123");
+    }
 
     #[tokio::test]
     async fn install_from_wat_then_run_by_name() {
@@ -396,6 +454,17 @@ mod tests {
           (memory (export "memory") 1)
           (func (export "_start")
             i32.const 0
+            call $exit)
+        )
+    "#;
+
+    const ONCHAIN_EXIT_7: &str = r#"
+        (module
+          (import "wasi_snapshot_preview1" "proc_exit"
+            (func $exit (param i32)))
+          (memory (export "memory") 1)
+          (func (export "_start")
+            i32.const 7
             call $exit)
         )
     "#;
@@ -532,6 +601,33 @@ mod tests {
             .await
             .unwrap();
         assert!(!outcome.matched);
+    }
+
+    #[tokio::test]
+    async fn replay_nonzero_exit_returns_execution_error() {
+        let (_d, r) = runner();
+        let (_res, _) = r
+            .install(
+                ONCHAIN_EXIT_7.as_bytes(),
+                Some("exit7"),
+                &BTreeSet::new(),
+                crate::meta::PetalMode::Onchain,
+            )
+            .unwrap();
+        let err = r
+            .replay(
+                "exit7",
+                Vec::new(),
+                &"0".repeat(64),
+                Arc::new(crate::host::DenyHost),
+                RunOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, PetalError::Vm(ref s) if s.contains("exited with code 7")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

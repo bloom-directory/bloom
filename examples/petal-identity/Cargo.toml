@@ -23,6 +23,7 @@ wasmparser = { workspace = true }
 bloom-chain-node = { path = "../../crates/bloom-chain-node" }
 bloom-chain-state = { path = "../../crates/bloom-chain-state" }
 bloom-chain-types = { path = "../../crates/bloom-chain-types" }
+bloom-petals = { path = "../../crates/bloom-petals" }
 bloom-script = { path = "../../crates/bloom-script" }
 bloom-petal-manifest = { workspace = true }
 bloom-petal-fungible = { workspace = true }

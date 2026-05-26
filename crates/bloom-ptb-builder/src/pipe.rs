@@ -60,6 +60,7 @@ fn lower_into(expr: &str, out: &mut Vec<String>) -> Result<u16, BuildError> {
             let sub_final = lower_into(sub_expr, out)?;
             named_refs.push((name.clone(), sub_final));
         }
+        named_refs.sort_by(|(a, _), (b, _)| a.cmp(b));
 
         // Build this stage's command line.
         let mut line = head.trim().to_string();
@@ -149,60 +150,82 @@ fn split_pipe_stages(expr: &str) -> Result<Vec<String>, BuildError> {
 /// `endpoint --a <(…)> min-lp=10`); both are folded into the head so the
 /// stage's positional args are preserved.
 fn split_named_inputs(stage: &str) -> Result<(String, Vec<(String, String)>), BuildError> {
-    // Find the first `--`; everything before it is head-prefix.
-    let Some(first) = stage.find("--") else {
-        return Ok((stage.to_string(), Vec::new()));
-    };
-    let mut head = stage[..first].trim().to_string();
-    let mut rest = &stage[first..];
+    let tokens = split_stage_tokens(stage)?;
+    let mut head_tokens = Vec::new();
     let mut named = Vec::new();
-
-    loop {
-        // `rest` begins at a `--`; parse the name.
-        debug_assert!(rest.starts_with("--"));
-        rest = &rest[2..];
-        let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        let name = rest[..name_end].trim().to_string();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let tok = &tokens[i];
+        let Some(name) = tok.strip_prefix("--") else {
+            head_tokens.push(tok.clone());
+            i += 1;
+            continue;
+        };
         if name.is_empty() {
             return Err(BuildError::Parse(
                 "named input `--` with no name".to_string(),
             ));
         }
-        rest = rest[name_end..].trim_start();
 
-        // Expect a `<( … )>` sub-expression.
-        if !rest.starts_with("<(") {
-            return Err(BuildError::Parse(format!(
-                "named input --{name} must be followed by `<( … )>`"
-            )));
-        }
-        let (sub, after) = extract_subexpr(rest)?;
-        named.push((name, sub));
-        rest = after.trim_start();
+        let Some(next) = tokens.get(i + 1) else {
+            head_tokens.push(format!("{name}=true"));
+            i += 1;
+            continue;
+        };
 
-        // Any plain tokens between this sub-expr and the next `--`
-        // (or end) belong to the head.
-        match rest.find("--") {
-            Some(next) => {
-                let between = rest[..next].trim();
-                if !between.is_empty() {
-                    head.push(' ');
-                    head.push_str(between);
-                }
-                rest = &rest[next..];
+        if next.starts_with("<(") {
+            let (sub, after) = extract_subexpr(next)?;
+            if !after.trim().is_empty() {
+                return Err(BuildError::Parse(format!(
+                    "named input --{name} has trailing text after `<( … )>`"
+                )));
             }
-            None => {
-                let tail = rest.trim();
-                if !tail.is_empty() {
-                    head.push(' ');
-                    head.push_str(tail);
-                }
-                break;
-            }
+            named.push((name.to_string(), sub));
+            i += 2;
+        } else if next.starts_with("--") {
+            head_tokens.push(format!("{name}=true"));
+            i += 1;
+        } else {
+            head_tokens.push(format!("{name}={next}"));
+            i += 2;
         }
     }
 
-    Ok((head.trim().to_string(), named))
+    Ok((head_tokens.join(" "), named))
+}
+
+fn split_stage_tokens(stage: &str) -> Result<Vec<String>, BuildError> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    let mut chars = stage.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '<' if chars.peek() == Some(&'(') => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' if depth > 0 => {
+                depth -= 1;
+                cur.push(c);
+            }
+            c if c.is_whitespace() && depth == 0 => {
+                if !cur.is_empty() {
+                    tokens.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if depth != 0 {
+        return Err(BuildError::Parse(
+            "unbalanced `<( … )>` in pipe expression".to_string(),
+        ));
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    Ok(tokens)
 }
 
 /// Extract a `<( … )>` sub-expression from the front of `s`, returning

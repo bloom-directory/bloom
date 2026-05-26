@@ -569,6 +569,10 @@ fn map_petal_err(id: Value, e: PetalError) -> Response {
             -32602,
             format!("mode/cap mismatch: mode={mode} disallows cap={cap}"),
         ),
+        PetalError::CapMismatch => (
+            -32602,
+            "cap mismatch: petal already installed with different capabilities".to_string(),
+        ),
         PetalError::ModeConflict { existing } => (
             -32008,
             format!("mode conflict: petal already installed as {existing}; uninstall first"),

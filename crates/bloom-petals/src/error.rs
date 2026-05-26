@@ -25,6 +25,8 @@ pub enum PetalError {
         mode: crate::meta::PetalMode,
         cap: String,
     },
+    #[error("cap mismatch: petal already installed with different capabilities")]
+    CapMismatch,
     #[error("mode conflict: petal already installed as {existing}; uninstall first")]
     ModeConflict { existing: crate::meta::PetalMode },
     #[error("operation not supported in this petal mode: {0}")]

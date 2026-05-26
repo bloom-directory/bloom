@@ -233,18 +233,67 @@ impl ChainPetalRunner {
     }
 }
 
+fn calldata_with_type_args(type_args: &[TypeTag], args_buf: &[u8]) -> Result<Vec<u8>, PtbError> {
+    if type_args.is_empty() {
+        return Ok(args_buf.to_vec());
+    }
+    if args_buf.len() < 4 {
+        return Err(PtbError::BuiltinFailed {
+            cmd_idx: 0,
+            reason: "malformed PTB calldata: missing arg count".to_string(),
+        });
+    }
+
+    let positional_count =
+        u32::from_be_bytes(args_buf[..4].try_into().expect("slice length checked"));
+    let type_count: u32 = type_args
+        .len()
+        .try_into()
+        .map_err(|_| PtbError::BuiltinFailed {
+            cmd_idx: 0,
+            reason: "too many type args".to_string(),
+        })?;
+    let total =
+        positional_count
+            .checked_add(type_count)
+            .ok_or_else(|| PtbError::BuiltinFailed {
+                cmd_idx: 0,
+                reason: "too many PTB args".to_string(),
+            })?;
+
+    let mut out = Vec::with_capacity(4 + type_args.len() * 8 + args_buf.len().saturating_sub(4));
+    out.extend_from_slice(&total.to_be_bytes());
+    for tag in type_args {
+        out.push(4);
+        let enc = tag.encode_canonical().map_err(PtbError::Codec)?;
+        let len: u32 = enc.len().try_into().map_err(|_| PtbError::BuiltinFailed {
+            cmd_idx: 0,
+            reason: "TypeArg encoding too large".to_string(),
+        })?;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&enc);
+    }
+    out.extend_from_slice(&args_buf[4..]);
+    Ok(out)
+}
+
 impl PetalRunner for ChainPetalRunner {
     fn call(
         &self,
         petal_hash: &Hash32,
         function: &str,
-        _type_args: &[TypeTag],
+        type_args: &[TypeTag],
         args_buf: &[u8],
         fuel_budget: u64,
     ) -> Result<PetalCallResult, PtbError> {
         // PTB-mode petals export `__petal_<fn_name>` per `bloom-resource-macros`.
         let export = format!("__petal_{function}");
-        self.dispatch(petal_hash, export, args_buf.to_vec(), fuel_budget)
+        self.dispatch(
+            petal_hash,
+            export,
+            calldata_with_type_args(type_args, args_buf)?,
+            fuel_budget,
+        )
     }
 
     fn call_invariant(
@@ -338,5 +387,40 @@ mod tests {
             out.get(&Hash32([0x22; 32])).map(|v| v.as_slice()),
             Some([4, 5, 6].as_slice())
         );
+    }
+
+    #[test]
+    fn runner_calldata_prepends_type_args_before_positional_args() {
+        let usdc = TypeTag::Concrete {
+            petal_hash: [0x11; 32],
+            type_name: "USDC".to_string(),
+            type_args: vec![],
+        };
+        let mut positional = Vec::new();
+        positional.extend_from_slice(&1u32.to_be_bytes());
+        positional.push(1);
+        positional.extend_from_slice(&16u32.to_be_bytes());
+        positional.extend_from_slice(&42u128.to_be_bytes());
+
+        let calldata = calldata_with_type_args(&[usdc.clone()], &positional).unwrap();
+        assert_eq!(u32::from_be_bytes(calldata[..4].try_into().unwrap()), 2);
+
+        let mut cursor = &calldata[4..];
+        assert_eq!(cursor[0], 4);
+        cursor = &cursor[1..];
+        let type_len = u32::from_be_bytes(cursor[..4].try_into().unwrap()) as usize;
+        cursor = &cursor[4..];
+        assert_eq!(
+            TypeTag::decode_canonical(&cursor[..type_len]).unwrap(),
+            usdc
+        );
+        cursor = &cursor[type_len..];
+        assert_eq!(cursor[0], 1);
+        cursor = &cursor[1..];
+        let const_len = u32::from_be_bytes(cursor[..4].try_into().unwrap()) as usize;
+        cursor = &cursor[4..];
+        assert_eq!(const_len, 16);
+        assert_eq!(&cursor[..const_len], &42u128.to_be_bytes());
+        assert!(cursor[const_len..].is_empty());
     }
 }

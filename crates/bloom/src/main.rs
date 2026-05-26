@@ -164,6 +164,9 @@ enum PetalsCmd {
         /// flag, the petal runs with all of its declared caps.
         #[arg(long = "cap", value_name = "CAP")]
         cap_mask: Vec<String>,
+        /// Write an onchain run attestation JSON to this path.
+        #[arg(long)]
+        attest: Option<String>,
     },
     /// List installed petals.
     Ls,
@@ -513,15 +516,9 @@ async fn run(cli: Cli) -> Result<()> {
             signers,
             gas_payer,
         } => {
-            // The lowering/build/receipt core (`commands::pipe::lower_and_build`
-            // / `receipt_ndjson`) is the same code path the NFS `tx`-session
-            // front door drives and is fully unit-tested. The dispatcher
-            // resolves the `ChainStateIface` the resolver needs; the v1
-            // in-process CLI cannot colocate a sovereign-chain `State`, so it
-            // returns a documented error (see `commands::pipe::run`). Wiring a
-            // node-colocated chain interface into this arm is the remaining
-            // deployment step.
-            commands::pipe::run(&expr, &signers, &gas_payer)
+            let rpc_sock = home.root().join("chain").join("rpc.sock");
+            let chain_dir = home.root().join("chain");
+            commands::pipe::run(&rpc_sock, &chain_dir, &expr, &signers, &gas_payer).await
         }
         Cmd::Ipc(IpcCmd::Call { method, params }) => {
             let socket = default_socket_path(home.root());
@@ -603,6 +600,7 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
             name_or_hash,
             input,
             cap_mask,
+            attest,
         } => {
             let stdin = match input.as_deref() {
                 Some("-") => {
@@ -627,11 +625,27 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                 Some(s)
             };
             let host = std::sync::Arc::new(VfsHost::new(vfs_arc.clone()));
-            let out = d
-                .petals
-                .run(&name_or_hash, stdin, host, cap_mask, RunOptions::default())
-                .await
-                .context("run petal")?;
+            let (out, attestation) = if attest.is_some() {
+                d.petals
+                    .run_attested(&name_or_hash, stdin, host, cap_mask, RunOptions::default())
+                    .await
+                    .context("run petal")?
+            } else {
+                (
+                    d.petals
+                        .run(&name_or_hash, stdin, host, cap_mask, RunOptions::default())
+                        .await
+                        .context("run petal")?,
+                    None,
+                )
+            };
+            if let Some(path) = attest {
+                let attestation = attestation.ok_or_else(|| {
+                    anyhow::anyhow!("--attest is only supported for onchain petals")
+                })?;
+                let body = serde_json::to_vec_pretty(&attestation).context("encode attestation")?;
+                std::fs::write(&path, body).with_context(|| format!("write attestation {path}"))?;
+            }
             use std::io::Write;
             // Stream stdout/stderr to the user verbatim so they can pipe
             // a petal's output. Exit code goes to the parent process.

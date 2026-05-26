@@ -251,6 +251,9 @@ fn map_err(e: PetalError) -> HandlerError {
         PetalError::ModeCapMismatch { mode, cap } => HandlerError::invalid(format!(
             "mode/cap mismatch: mode={mode:?} disallows cap={cap}"
         )),
+        PetalError::CapMismatch => HandlerError::invalid(
+            "cap mismatch: petal already installed with different capabilities".to_string(),
+        ),
         PetalError::ModeConflict { existing } => {
             HandlerError::invalid(format!("mode conflict: existing={existing}"))
         }

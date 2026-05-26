@@ -249,6 +249,12 @@ pub fn real_pool_manifest_bytes() -> &'static [u8] {
 }
 
 /// Canonical `PetalManifestV0` bytes embedded in the real
+/// `/bloom/dex/wallet` petal.
+pub fn real_wallet_manifest_bytes() -> &'static [u8] {
+    bloom_petal_dex_wallet::wallet::__bloom_manifest_bytes()
+}
+
+/// Canonical `PetalManifestV0` bytes embedded in the real
 /// `/bloom/dex/strategy/cpmm` petal.
 pub fn real_cpmm_manifest_bytes() -> &'static [u8] {
     bloom_petal_dex_cpmm::cpmm::__bloom_manifest_bytes()

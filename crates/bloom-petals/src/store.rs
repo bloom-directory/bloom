@@ -61,10 +61,10 @@ impl PetalStore {
         self.base.join(META).join(format!("{hash}.json"))
     }
 
-    /// Install raw wasm bytes. The store assigns the content hash;
-    /// `name` and `caps` are merged into the on-disk metadata. If a
-    /// petal with the same hash is already present, its metadata is
-    /// updated (name overwritten if `Some`, caps unioned).
+    /// Install raw wasm bytes. The store assigns the content hash.
+    /// If a petal with the same hash is already present, its metadata
+    /// is updated only when the requested mode and caps match the
+    /// existing install.
     pub fn install(
         &self,
         wasm: &[u8],
@@ -85,6 +85,9 @@ impl PetalStore {
                         existing: existing.mode,
                     });
                 }
+                if existing.caps != *caps {
+                    return Err(PetalError::CapMismatch);
+                }
                 existing
             }
             Err(PetalError::NotFound(_)) => PetalMeta {
@@ -104,7 +107,7 @@ impl PetalStore {
         if let Some(n) = name {
             meta.name = Some(n.to_string());
         }
-        meta.caps.extend(caps.iter().copied());
+        meta.caps = caps.clone();
         meta.size = wasm.len() as u64;
         self.write_meta(&meta)?;
 
@@ -270,25 +273,43 @@ mod tests {
     }
 
     #[test]
-    fn install_is_idempotent_on_hash_and_unions_caps() {
+    fn install_is_idempotent_on_hash_when_caps_match() {
         let (_d, store) = store();
         let mut caps_a = BTreeSet::new();
         caps_a.insert(Capability::VfsRead);
         let (r1, _) = store
             .install(b"x", Some("a"), &caps_a, PetalMode::Local)
             .unwrap();
-        let mut caps_b = BTreeSet::new();
-        caps_b.insert(Capability::VfsWrite);
         let (r2, m) = store
-            .install(b"x", Some("b"), &caps_b, PetalMode::Local)
+            .install(b"x", Some("b"), &caps_a, PetalMode::Local)
             .unwrap();
         assert_eq!(r1.hash, r2.hash);
         assert!(r2.already_present);
         // Name overwritten on second install.
         assert_eq!(m.name.as_deref(), Some("b"));
-        // Caps unioned.
         assert!(m.has_cap(Capability::VfsRead));
-        assert!(m.has_cap(Capability::VfsWrite));
+        assert!(!m.has_cap(Capability::VfsWrite));
+    }
+
+    #[test]
+    fn reinstall_same_hash_same_mode_with_different_caps_is_cap_mismatch() {
+        let (_d, store) = store();
+        let mut caps_a = BTreeSet::new();
+        caps_a.insert(Capability::VfsRead);
+        let (r1, m1) = store
+            .install(b"x", Some("a"), &caps_a, PetalMode::Local)
+            .unwrap();
+
+        let mut caps_b = BTreeSet::new();
+        caps_b.insert(Capability::VfsWrite);
+        let err = store
+            .install(b"x", Some("b"), &caps_b, PetalMode::Local)
+            .unwrap_err();
+
+        assert!(matches!(err, PetalError::CapMismatch));
+        let m2 = store.load_meta(&r1.hash).unwrap();
+        assert_eq!(m2.name, m1.name);
+        assert_eq!(m2.caps, caps_a);
     }
 
     #[test]

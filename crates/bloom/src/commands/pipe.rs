@@ -18,19 +18,24 @@
 //!   chain interface → validated [`PtbTx`]. This is the same code path
 //!   the tx-session handler runs, and it is fully unit-tested below
 //!   against an in-memory chain mock (no node required).
-//! - [`receipt_ndjson`] — the canonical NDJSON receipt projection,
-//!   byte-identical to the tx handler's `commit` output.
+//! - [`receipt_ndjson`] — the structural NDJSON receipt projection
+//!   shared with the tx handler's `commit` output.
 //! - [`run_pipe`] — the dispatcher: lowers + builds against the live
-//!   chain, then (in a deployment that can reach a node) signs the
-//!   digest and submits. Submission is gated on a reachable node; the
-//!   structural plan is what this function renders.
+//!   chain, signs, submits, waits for the node receipt, and streams the
+//!   canonical NDJSON.
+
+use std::path::Path;
 
 use anyhow::{Context, Result};
+use bloom_chain_node::rpc::{RpcChainAdapter, RpcClient};
+use bloom_chain_types::ssz::Encode;
+use bloom_chain_types::tx::{Tx, TxKind};
+use bloom_chain_types::types::{Address as ChainAddress, PubKeyBytes, SigBytes};
 use serde_json::Value;
 
 use bloom_objects::{ObjectId, TypeTag};
 use bloom_ptb_builder::{PtbSession, SessionStatus, lower_pipe_expr};
-use bloom_script::{ChainStateIface, PtbTx};
+use bloom_script::{ChainStateIface, PqSignature, PtbTx};
 
 /// The validated plan a pipe expression lowers to: the unsigned
 /// [`PtbTx`] (the commit/sign seam) plus the [`SessionStatus`] snapshot
@@ -161,30 +166,24 @@ fn type_tag_label(t: &TypeTag) -> String {
 /// gas-payer fails fast, before any chain access), then resolves the
 /// [`ChainStateIface`] the lowering core needs. The v1 in-process CLI has
 /// no colocated chain `State` to hand it (see [`run_pipe`] for the full
-/// boundary rationale), so this returns a documented error rather than a
-/// partial receipt. A node-colocated deployment supplies its
-/// `PtbChainAdapter` here and delegates to [`run_pipe`].
-pub fn run(expr: &str, signers: &[String], gas_payer: &str) -> Result<()> {
+/// boundary rationale), so this uses the chain RPC read model as its
+/// adapter and then signs/submits through the same node RPC socket.
+pub async fn run(
+    chain_rpc_sock: &Path,
+    chain_dir: &Path,
+    expr: &str,
+    signers: &[String],
+    gas_payer: &str,
+) -> Result<()> {
     // Parse the CLI surface up front so bad input fails closed regardless
     // of chain availability.
     let _signers = parse_signers(signers)?;
     let _gas_payer = parse_object_id(gas_payer).context("parse --gas-payer")?;
 
-    // Resolve the chain interface. The per-invocation CLI daemon does not
-    // colocate a sovereign-chain `State` (that lives in the validator
-    // process; the node RPC surface exposes only narrow account/block/key
-    // reads, not the object + manifest graph the resolver walks). When a
-    // deployment can supply one, it constructs a `PtbChainAdapter` and
-    // hands it to `run_pipe`.
-    let chain: Option<&dyn ChainStateIface> = None;
-    match chain {
-        Some(chain) => run_pipe(chain, expr, signers, gas_payer),
-        None => anyhow::bail!(
-            "bloom pipe: no chain interface in this process — pipe lowering runs \
-             against a colocated node `State` (the validator process) or the NFS \
-             `tx`-session front door, not the per-invocation CLI daemon"
-        ),
-    }
+    // The validator owns the authoritative State, so the CLI uses the chain
+    // RPC read model as its `ChainStateIface` implementation.
+    let chain = RpcChainAdapter::from_env_or_socket(chain_rpc_sock);
+    run_pipe_and_submit(chain_rpc_sock, chain_dir, &chain, expr, signers, gas_payer).await
 }
 
 /// `bloom pipe '<expr>' [--signer <hex>]... --gas-payer <hex>` — lower a
@@ -193,22 +192,13 @@ pub fn run(expr: &str, signers: &[String], gas_payer: &str) -> Result<()> {
 ///
 /// ## Node boundary
 ///
-/// Lowering + validation runs against a [`ChainStateIface`]. The v1 CLI
-/// rebuilds an in-process daemon per invocation and does **not**
-/// colocate a chain `State` (that lives in the `bloom chain
-/// run-validator` process; the node RPC surface exposes only narrow
-/// account/block/key reads, not the object + manifest graph the resolver
-/// needs). Submitting therefore requires a chain interface the caller
-/// supplies — in a node-colocated deployment this is the validator's
-/// `PtbChainAdapter`, signed with the operator key and posted via
-/// `TxKind::SubmitPtb`. This dispatcher renders the structural plan that
-/// gets signed and submitted there; the lowering/build/receipt path it
-/// shares with the NFS `tx`-session front door is the fully-tested core
-/// ([`lower_and_build`] / [`receipt_ndjson`], exercised below without a
-/// node).
+/// Lowering + validation runs against a [`ChainStateIface`]. Tests call
+/// this structural helper directly; the public [`run`] entry point wraps it
+/// with the chain RPC adapter and submits the signed `TxKind::SubmitPtb`.
 ///
 /// `signers` are 32-byte hex pubkeys (signature order); `gas_payer` is a
 /// 32-byte hex object id.
+#[allow(dead_code)]
 pub fn run_pipe(
     chain: &dyn ChainStateIface,
     expr: &str,
@@ -224,6 +214,155 @@ pub fn run_pipe(
         .write_all(receipt.as_bytes())
         .context("write receipt")?;
     Ok(())
+}
+
+async fn run_pipe_and_submit(
+    chain_rpc_sock: &Path,
+    chain_dir: &Path,
+    chain: &dyn ChainStateIface,
+    expr: &str,
+    signers: &[String],
+    gas_payer: &str,
+) -> Result<()> {
+    let signers = parse_signers(signers)?;
+    let gas_payer = parse_object_id(gas_payer).context("parse --gas-payer")?;
+    let mut plan = lower_and_build(chain, expr, signers, gas_payer)?;
+
+    let (sk, pk, sender) = load_validator_key(chain_dir)?;
+    let ed_pk = sk.ed25519_public_key_bytes();
+    if plan.tx.signers != vec![ed_pk] {
+        anyhow::bail!(
+            "bloom pipe can sign exactly one signer: the validator key's Ed25519 component"
+        );
+    }
+    let ptb_digest = plan.tx.signing_digest();
+    plan.tx.signatures = vec![PqSignature(sk.sign_ed25519(&ptb_digest).to_vec())];
+    let ptb_bytes = bloom_script::encode_ptb(&plan.tx).context("encode signed PTB")?;
+
+    let client = match std::env::var("BLOOM_RPC_TCP") {
+        Ok(addr) if !addr.is_empty() => RpcClient::tcp(addr),
+        _ => RpcClient::new(chain_rpc_sock),
+    };
+    let chain_id = load_chain_id(chain_dir)?;
+    let nonce = fetch_nonce(&client, sender).await? + 1;
+    let outer = build_outer_tx(&sk, &pk, sender, chain_id, nonce, ptb_bytes);
+    let outer_hash = outer.tx_hash();
+    client
+        .call(
+            "chain_submit_tx",
+            serde_json::json!({ "tx_hex": hex::encode(outer.as_ssz_bytes()) }),
+        )
+        .await
+        .context("rpc chain_submit_tx")?;
+    let receipt = poll_receipt(&client, outer_hash).await?;
+
+    let mut out = receipt_ndjson(&plan);
+    out.push_str(
+        &serde_json::json!({
+            "kind": "submit",
+            "tx_hash": format!("0x{}", hex::encode(outer_hash.0)),
+        })
+        .to_string(),
+    );
+    out.push('\n');
+    out.push_str(
+        &serde_json::json!({
+            "kind": "receipt",
+            "tx_hash": format!("0x{}", hex::encode(outer_hash.0)),
+            "receipt": receipt,
+        })
+        .to_string(),
+    );
+    out.push('\n');
+    use std::io::Write as _;
+    std::io::stdout()
+        .write_all(out.as_bytes())
+        .context("write receipt")?;
+    Ok(())
+}
+
+fn load_validator_key(
+    chain_dir: &Path,
+) -> Result<(
+    bloom_keystore::xdsa::XdsaSecretKey,
+    bloom_keystore::xdsa::XdsaPublicKey,
+    ChainAddress,
+)> {
+    let key_path = chain_dir.join("keystore").join("validator.xdsa");
+    let key_bytes =
+        std::fs::read(&key_path).with_context(|| format!("read key: {}", key_path.display()))?;
+    let sk = bloom_keystore::xdsa::XdsaSecretKey::from_bytes(&key_bytes)
+        .map_err(|e| anyhow::anyhow!("decode validator key: {e}"))?;
+    let pk = sk.public_key();
+    let addr = ChainAddress::from_pubkey_bytes(&pk.0);
+    Ok((sk, pk, addr))
+}
+
+fn load_chain_id(chain_dir: &Path) -> Result<String> {
+    let path = chain_dir.join("genesis.toml");
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("read genesis: {}", path.display()))?;
+    let parsed: bloom_chain_node::genesis::GenesisFile =
+        toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    Ok(parsed.chain_id)
+}
+
+async fn fetch_nonce(client: &RpcClient, sender: ChainAddress) -> Result<u64> {
+    let res = client
+        .call(
+            "chain_query_account",
+            serde_json::json!({ "address": hex::encode(sender.0) }),
+        )
+        .await
+        .context("rpc chain_query_account")?;
+    Ok(res.get("nonce").and_then(|v| v.as_u64()).unwrap_or(0))
+}
+
+async fn poll_receipt(
+    client: &RpcClient,
+    tx_hash: bloom_chain_types::types::Hash32,
+) -> Result<serde_json::Value> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let res = client
+            .call(
+                "chain_query_tx",
+                serde_json::json!({ "tx_hash": hex::encode(tx_hash.0) }),
+            )
+            .await
+            .context("rpc chain_query_tx")?;
+        if !res.is_null() {
+            return Ok(res);
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for tx {}", hex::encode(tx_hash.0));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+}
+
+fn build_outer_tx(
+    sk: &bloom_keystore::xdsa::XdsaSecretKey,
+    pk: &bloom_keystore::xdsa::XdsaPublicKey,
+    sender: ChainAddress,
+    chain_id: String,
+    nonce: u64,
+    ptb_bytes: Vec<u8>,
+) -> Tx {
+    let mut tx = Tx {
+        chain_id,
+        sender,
+        nonce,
+        max_fuel: 10_000_000,
+        fee_per_unit: 1,
+        kind: TxKind::SubmitPtb { ptb_bytes },
+        pubkey: PubKeyBytes(pk.to_bytes()),
+        sig: SigBytes(vec![]),
+    };
+    let digest = tx.signing_digest();
+    let sig = sk.sign(&digest.0);
+    tx.sig = SigBytes(sig.to_bytes());
+    tx
 }
 
 /// Parse the repeated `--signer <hex>` pubkeys into the signer vector.

@@ -37,7 +37,8 @@ use bloom_vfs::{Handler, TxHandler, VfsPath};
 use bloom_dex_math::{ConstantProduct, ConstantProductParams, SwapStrategy};
 use bloom_petal_dex_it::dex_harness::{
     addr, build_pool_wasm, build_state, build_wallet_wasm, create_shared_pool, erased_coin_id,
-    genesis_coin_id, owner_has_coin_worth, seed_erased_coin, submit_ptb_chain_auth,
+    genesis_coin_id, owner_has_coin_worth, real_pool_manifest_bytes, real_wallet_manifest_bytes,
+    seed_erased_coin, submit_ptb_chain_auth, wrap_with_real_manifest,
 };
 
 // ---------------------------------------------------------------------------
@@ -98,6 +99,84 @@ fn deploy(allocations: &[(bloom_chain_types::Address, u128)]) -> (State, Hash32,
     (state, pool_hash, wallet_hash)
 }
 
+const FAST_POOL_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "__petal_create_pool") (param i32 i32) (result i32) i32.const 0)
+  (func (export "__petal_swap_exact_in") (param i32 i32) (result i32) i32.const 0)
+  (func (export "__petal_reserves") (param i32 i32) (result i32) i32.const 0)
+)
+"#;
+
+const FAST_WALLET_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "__petal_receive") (param i32 i32) (result i32) i32.const 0)
+)
+"#;
+
+fn pool_object_tag(petal_hash: [u8; 32]) -> TypeTag {
+    TypeTag::Concrete {
+        petal_hash,
+        type_name: "Pool".to_string(),
+        type_args: vec![],
+    }
+}
+
+fn install_fast_manifest_fixture() -> (State, ObjectId) {
+    let alice = addr(0xA1);
+    let bob = addr(0xB0);
+    let mut state = build_state(&[(alice, 1_000_000), (bob, 1_000_000)]);
+
+    let pool_wasm = wrap_with_real_manifest(FAST_POOL_WAT, real_pool_manifest_bytes());
+    let pool_hash = state.insert_code(&pool_wasm);
+    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_hash);
+
+    let wallet_wasm = wrap_with_real_manifest(FAST_WALLET_WAT, real_wallet_manifest_bytes());
+    let wallet_hash = state.insert_code(&wallet_wasm);
+    state.set_vfs_binding("/bloom/dex/wallet".to_string(), wallet_hash);
+
+    let pool_id = erased_coin_id(b"fast-manifest-pool-id");
+    state.set_object(Object {
+        id: pool_id,
+        type_tag: pool_object_tag(pool_hash.0),
+        owner: Owner::Shared,
+        version: 0,
+        payload: bloom_petal_dex_pool::payload::pool_payload(
+            &pool_id,
+            1000,
+            1000,
+            1000,
+            1_000_000,
+            &FEE_BPS.to_be_bytes(),
+        ),
+    });
+
+    let bob_coin = erased_coin_id(b"fast-manifest-bob-coin");
+    seed_erased_coin(&mut state, bob_coin, Owner::Address(bob.0), 100);
+
+    (state, pool_id)
+}
+
+fn derive_object_create_id_for_test(
+    petal_hash: Hash32,
+    create_idx: u64,
+    type_tag: &TypeTag,
+    payload: &[u8],
+) -> ObjectId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.object.create.v1\0");
+    hasher.update(&petal_hash.0);
+    hasher.update(&create_idx.to_be_bytes());
+    hasher.update(
+        &type_tag
+            .encode_canonical()
+            .expect("test type tag must encode"),
+    );
+    hasher.update(payload);
+    ObjectId(*hasher.finalize().as_bytes())
+}
+
 /// Hex (no `0x`) of a 32-byte id, for splicing into pipe-expr `obj:` tokens.
 fn hex32(b: &[u8; 32]) -> String {
     let mut s = String::with_capacity(64);
@@ -105,6 +184,29 @@ fn hex32(b: &[u8; 32]) -> String {
         s.push_str(&format!("{byte:02x}"));
     }
     s
+}
+
+fn reject_duplicate_linear_uses(lines: &[String]) -> Result<(), String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for line in lines {
+        for token in line.split_whitespace() {
+            let Some(rest) = token.strip_prefix('@') else {
+                continue;
+            };
+            let Some((cmd, ret)) = rest.split_once('.') else {
+                continue;
+            };
+            if cmd.parse::<u16>().is_ok() && ret.parse::<u16>().is_ok() {
+                let key = format!("@{cmd}.{ret}");
+                if !seen.insert(key.clone()) {
+                    return Err(format!(
+                        "duplicate linear Use {key}: a PTB return object may be consumed once"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +234,7 @@ fn build_via_cli_lines(
     signer: [u8; 32],
     gas_payer: ObjectId,
 ) -> Result<PtbTx, String> {
+    reject_duplicate_linear_uses(lines)?;
     let adapter = PtbChainAdapter::new(state, BLOCK);
     let mut s = PtbSession::new(&adapter);
     for line in lines {
@@ -169,6 +272,7 @@ async fn build_via_vfs_lines(
     signer: [u8; 32],
     gas_payer: ObjectId,
 ) -> Result<PtbTx, String> {
+    reject_duplicate_linear_uses(lines)?;
     let chain = Arc::new(OwnedAdapter {
         state: Arc::new(state.clone()),
         block: BLOCK,
@@ -279,6 +383,96 @@ fn expr_5_1(
         pool = hex32(&pool_id.0),
         carol = hex32(carol),
     )
+}
+
+#[test]
+fn fast_pipe_front_doors_match_for_single_hop_plan() {
+    let bob = addr(0xB0);
+    let carol = addr(0xC0);
+    let (state, pool_id) = install_fast_manifest_fixture();
+
+    let bob_coin = erased_coin_id(b"fast-manifest-bob-coin");
+    let gas_payer = genesis_coin_id(bob, 1);
+    let expr = expr_5_1(&bob_coin, &pool_id, 0, 90, &carol.0);
+
+    let tx_cli = build_via_cli(&state, &expr, bob.0, gas_payer).expect("CLI build");
+    let tx_vfs = build_via_vfs_blocking(&state, &expr, bob.0, gas_payer).expect("VFS build");
+
+    assert_eq!(
+        tx_cli.signing_digest(),
+        tx_vfs.signing_digest(),
+        "fast manifest fixture: CLI and VFS must commit the same single-hop plan"
+    );
+}
+
+#[test]
+fn fast_double_spend_lines_rejected_before_execution() {
+    let bob = addr(0xB0);
+    let carol = addr(0xC0);
+    let dave = addr(0xD0);
+    let (state, pool_id) = install_fast_manifest_fixture();
+
+    let bob_coin = erased_coin_id(b"fast-manifest-bob-coin");
+    let gas_payer = genesis_coin_id(bob, 1);
+    let lines = vec![
+        format!(
+            "/bloom/dex/pool/swap_exact_in obj:{bob}@0 obj:{pool}@0 1",
+            bob = hex32(&bob_coin.0),
+            pool = hex32(&pool_id.0),
+        ),
+        format!("/bloom/dex/wallet/receive @0.0 0x{}", hex32(&carol.0)),
+        format!("/bloom/dex/wallet/receive @0.0 0x{}", hex32(&dave.0)),
+    ];
+
+    let cli_err = build_via_cli_lines(&state, &lines, bob.0, gas_payer)
+        .expect_err("CLI must reject duplicate consumption of @0.0");
+    let vfs_err = build_via_vfs_lines_blocking(&state, &lines, bob.0, gas_payer)
+        .expect_err("VFS must reject duplicate consumption of @0.0");
+
+    assert!(
+        cli_err.contains("duplicate linear Use @0.0"),
+        "CLI error should name the duplicate linear Use, got: {cli_err}"
+    );
+    assert_eq!(
+        cli_err, vfs_err,
+        "both front doors should report the same duplicate-use rejection"
+    );
+}
+
+#[test]
+fn pool_create_id_collision_is_documented_by_payload_discriminator() {
+    let pool_hash = Hash32([0x42; 32]);
+    let pool_tag = pool_object_tag([0u8; 32]);
+    let payload_fee_30 = bloom_petal_dex_pool::payload::pool_payload(
+        &ObjectId([0u8; 32]),
+        1000,
+        1000,
+        1000,
+        1_000_000,
+        &30u16.to_be_bytes(),
+    );
+    let payload_fee_25 = bloom_petal_dex_pool::payload::pool_payload(
+        &ObjectId([0u8; 32]),
+        1000,
+        1000,
+        1000,
+        1_000_000,
+        &25u16.to_be_bytes(),
+    );
+
+    let id_a = derive_object_create_id_for_test(pool_hash, 0, &pool_tag, &payload_fee_30);
+    let id_b = derive_object_create_id_for_test(pool_hash, 0, &pool_tag, &payload_fee_30);
+    let id_discriminated =
+        derive_object_create_id_for_test(pool_hash, 0, &pool_tag, &payload_fee_25);
+
+    assert_eq!(
+        id_a, id_b,
+        "two separate single-create PTBs with identical pool payloads collide today"
+    );
+    assert_ne!(
+        id_a, id_discriminated,
+        "the current two-hop fixture uses distinct fee params as a payload discriminator"
+    );
 }
 
 #[test]
@@ -456,15 +650,19 @@ fn litmus_5_1_output_not_double_spendable() {
     ];
 
     // Both doors must treat the double-use identically: either both reject it at
-    // build time, or both build the byte-identical plan and the chain VM yields
-    // the same outcome. We then assert the invariant on the resulting state.
+    // build time, or both build the byte-identical plan and the chain VM must
+    // reject/revert it deterministically. A permissive "last receive wins"
+    // execution is not acceptable for this litmus.
     eprintln!("double-spend plan lines: {lines:#?}");
-    let mut executed = false;
     match build_via_cli_lines(&state, &lines, bob.0, gas_payer) {
         Err(build_err) => {
             // Rejected at build time. The VFS door must reject identically.
             let vfs_err = build_via_vfs_lines_blocking(&state, &lines, bob.0, gas_payer)
                 .expect_err("VFS door must also reject the double-use plan");
+            assert_eq!(
+                build_err, vfs_err,
+                "CLI and VFS should report the same double-use rejection"
+            );
             eprintln!("double-use rejected at build: CLI={build_err} VFS={vfs_err}");
         }
         Ok(tx_cli) => {
@@ -476,24 +674,43 @@ fn litmus_5_1_output_not_double_spendable() {
                 tx_vfs.signing_digest(),
                 "both doors must commit the identical double-use plan"
             );
-            submit(&mut state, bob, tx_cli);
-            executed = true;
+            assert!(
+                !submit(&mut state, bob, tx_cli),
+                "a double-use plan that builds must revert; last-writer execution is forbidden"
+            );
+
+            let surviving = state
+                .get_object(&bob_coin)
+                .expect("bob's input coin must survive a reverted double-spend");
+            assert_eq!(
+                bloom_petal_fungible::ops::decode_coin_value(&surviving.payload).ok(),
+                Some(100),
+                "bob's input coin value must be unchanged after double-spend revert"
+            );
+            let (ra, rb, ..) = bloom_petal_dex_pool::payload::decode_pool(
+                &state.get_object(&pool_id).unwrap().payload,
+            )
+            .unwrap();
+            assert_eq!(
+                ra, 1000,
+                "pool reserve_a unchanged after double-spend revert"
+            );
+            assert_eq!(
+                rb, 1000,
+                "pool reserve_b unchanged after double-spend revert"
+            );
         }
     }
 
-    // THE INVARIANT (value conservation — "not double-spendable"): the single
-    // swap output is one object, so carol and dave can NEVER both hold a copy
-    // of it. If the plan executed, at most one of them holds the `out`-coin; if
-    // it was rejected (at build or by revert), neither does.
+    // THE INVARIANT (deterministic rejection/revert): neither recipient may get
+    // the output coin from a rejected double-spend attempt.
     let carol_has = owner_has_coin_worth(&state, carol, out);
     let dave_has = owner_has_coin_worth(&state, dave, out);
     assert!(
-        !(carol_has && dave_has),
-        "double-spend: the single swap output must not be credited to BOTH \
-         carol and dave (carol_has={carol_has}, dave_has={dave_has})"
+        !carol_has && !dave_has,
+        "double-spend must reject/revert, not credit either recipient \
+         (carol_has={carol_has}, dave_has={dave_has})"
     );
-    // And no matter the outcome, total value is conserved: there is at most one
-    // `out`-worth output coin in existence (never two clones of `@0.0`).
     let out_coins = state
         .iter_objects()
         .filter(|(_, o)| {
@@ -501,12 +718,12 @@ fn litmus_5_1_output_not_double_spendable() {
                 && bloom_petal_fungible::ops::decode_coin_value(&o.payload).ok() == Some(out)
         })
         .count();
-    assert!(
-        out_coins <= 1,
-        "double-spend: at most one output coin (worth {out}) may exist, found {out_coins}"
+    assert_eq!(
+        out_coins, 0,
+        "double-spend reject/revert must not commit an output coin worth {out}"
     );
     eprintln!(
-        "double-spend invariant held: executed={executed} carol_has={carol_has} \
+        "double-spend reject/revert invariant held: carol_has={carol_has} \
          dave_has={dave_has} out_coins={out_coins}"
     );
 }

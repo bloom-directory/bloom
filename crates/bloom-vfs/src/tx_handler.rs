@@ -39,13 +39,10 @@
 //!
 //! ## Commit and the node boundary
 //!
-//! This crate has no node or keystore. `commit` assembles and fully
-//! validates the unsigned `PtbTx` via `PtbSession::build_unsigned` (the
-//! commit/sign seam) and renders the canonical receipt as NDJSON: the
-//! PTB hash (what a signer covers), the resolved command endpoints, and
-//! the gas reservation. A live deployment threads the keystore + node
-//! submit through this same seam; the structural plan rendered here is
-//! exactly what gets signed and submitted.
+//! This crate has no node or keystore, so live submission is injected via
+//! [`PtbSubmitter`]. `commit` always assembles and validates the `PtbTx`;
+//! with a submitter it then signs/submits and appends the on-chain receipt
+//! NDJSON, while tests can still run the structural path without a node.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -56,7 +53,7 @@ use parking_lot::Mutex;
 use bloom_objects::{ObjectId, TypeTag};
 use bloom_ptb_builder::session::SessionId;
 use bloom_ptb_builder::{BuildError, PtbSession, SessionStatus};
-use bloom_script::ChainStateIface;
+use bloom_script::{ChainStateIface, PtbTx};
 
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::paginate;
@@ -81,7 +78,29 @@ struct SessionState {
 #[derive(Clone)]
 pub struct TxHandler {
     chain: Arc<dyn ChainStateIface + Send + Sync>,
+    submitter: Option<Arc<dyn PtbSubmitter>>,
     sessions: Arc<Mutex<HashMap<SessionId, SessionState>>>,
+}
+
+/// Optional live submission backend for `tx/<id>/commit`.
+///
+/// `bloom-vfs` owns the staging semantics, but the daemon owns keys and node
+/// RPC. This trait keeps the VFS handler generic while allowing production
+/// mounts to sign, submit, wait for the on-chain receipt, and append it to the
+/// same NDJSON stream.
+#[async_trait]
+pub trait PtbSubmitter: Send + Sync {
+    /// Select a gas-payer object when the session did not explicitly set one.
+    async fn select_gas_payer(&self, signers: &[[u8; 32]]) -> Result<ObjectId, HandlerError>;
+
+    /// Sign and submit a fully validated PTB, returning extra NDJSON records
+    /// to append after the structural PTB/command receipt lines.
+    async fn submit_ptb(
+        &self,
+        session_id: SessionId,
+        tx: PtbTx,
+        status: SessionStatus,
+    ) -> Result<Vec<serde_json::Value>, HandlerError>;
 }
 
 impl TxHandler {
@@ -90,8 +109,16 @@ impl TxHandler {
     pub fn new(chain: Arc<dyn ChainStateIface + Send + Sync>) -> Self {
         Self {
             chain,
+            submitter: None,
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Attach a live signer/submitter backend. Without one, `commit` preserves
+    /// the historical structural behavior used by unit tests.
+    pub fn with_submitter(mut self, submitter: Arc<dyn PtbSubmitter>) -> Self {
+        self.submitter = Some(submitter);
+        self
     }
 
     /// Allocate a new session and return its id. Backs `cat new`.
@@ -140,6 +167,17 @@ impl TxHandler {
             s.set_gas_payer(gp);
         }
         s
+    }
+
+    async fn state_for_commit(&self, id: SessionId) -> Result<SessionState, HandlerError> {
+        let mut state = self.state(id)?;
+        if state.gas_payer.is_none()
+            && let Some(submitter) = &self.submitter
+        {
+            let gas_payer = submitter.select_gas_payer(&state.signers).await?;
+            state.gas_payer = Some(gas_payer);
+        }
+        Ok(state)
     }
 
     /// Append `line` to session `id`'s stored state, validating it
@@ -245,12 +283,16 @@ impl TxHandler {
 
     /// Finalise session `id` and render the canonical receipt as NDJSON.
     /// Backs `cat <id>/commit`. A build error (missing signer / gas
-    /// payer, or a validation failure) leaves the session intact.
-    fn commit_ndjson(&self, id: SessionId) -> Result<Vec<u8>, HandlerError> {
-        let state = self.state(id)?;
-        let session = self.rebuild(&state);
-        let tx = session.build_unsigned().map_err(build_err_to_handler)?;
-        let status = session.status();
+    /// payer, or a validation failure) leaves the session intact. Once
+    /// the commit receipt renders successfully, the session is consumed.
+    async fn commit_ndjson(&self, id: SessionId) -> Result<Vec<u8>, HandlerError> {
+        let state = self.state_for_commit(id).await?;
+        let (tx, status) = {
+            let session = self.rebuild(&state);
+            let tx = session.build_unsigned().map_err(build_err_to_handler)?;
+            let status = session.status();
+            (tx, status)
+        };
 
         // The receipt is canonical NDJSON: one object per line. The PTB
         // hash is what a signer covers (and what the node indexes); a
@@ -281,6 +323,13 @@ impl TxHandler {
             out.extend(serde_json::to_vec(&line).map_err(json_err)?);
             out.push(b'\n');
         }
+        if let Some(submitter) = &self.submitter {
+            for line in submitter.submit_ptb(id, tx, status).await? {
+                out.extend(serde_json::to_vec(&line).map_err(json_err)?);
+                out.push(b'\n');
+            }
+        }
+        self.sessions.lock().remove(&id);
         Ok(out)
     }
 }
@@ -401,7 +450,7 @@ impl Handler for TxHandler {
                         Ok(body.into_bytes())
                     }
                     "status" => self.status_json(id),
-                    "commit" => self.commit_ndjson(id),
+                    "commit" => self.commit_ndjson(id).await,
                     "abort" => {
                         // `cat abort` also discards (spec allows write/cat).
                         self.abort(id)?;
@@ -523,6 +572,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap as Map;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bloom_chain_types::Hash32;
     use bloom_objects::{Object, Owner};
@@ -578,6 +628,7 @@ mod tests {
 
     const POOL_HASH: Hash32 = Hash32([0xAB; 32]);
     const POOL_PATH: &str = "/bloom/dex/pool";
+    const AUTO_GAS_ID: ObjectId = ObjectId([0xA5; 32]);
 
     fn concrete(name: &str) -> TypeTag {
         TypeTag::Concrete {
@@ -621,6 +672,63 @@ mod tests {
             payload,
         });
         (TxHandler::new(Arc::new(chain)), gas_id)
+    }
+
+    #[derive(Default)]
+    struct MockSubmitter {
+        selects: AtomicUsize,
+        submits: AtomicUsize,
+        fail_submit: bool,
+    }
+
+    #[async_trait]
+    impl PtbSubmitter for MockSubmitter {
+        async fn select_gas_payer(&self, _signers: &[[u8; 32]]) -> Result<ObjectId, HandlerError> {
+            self.selects.fetch_add(1, Ordering::SeqCst);
+            Ok(AUTO_GAS_ID)
+        }
+
+        async fn submit_ptb(
+            &self,
+            _session_id: SessionId,
+            _tx: PtbTx,
+            _status: SessionStatus,
+        ) -> Result<Vec<serde_json::Value>, HandlerError> {
+            self.submits.fetch_add(1, Ordering::SeqCst);
+            if self.fail_submit {
+                return Err(HandlerError::backend("submit failed"));
+            }
+            Ok(vec![serde_json::json!({
+                "kind": "receipt",
+                "success": true,
+            })])
+        }
+    }
+
+    fn handler_with_submitter(
+        funcs: Vec<FunctionDeclStub>,
+        signer: [u8; 32],
+        submitter: Arc<MockSubmitter>,
+    ) -> TxHandler {
+        let chain = MockChain::new();
+        let manifest = PetalManifestStub {
+            module_path: POOL_PATH.to_string(),
+            functions: funcs,
+            object_types: vec![],
+            external_type_refs: vec![],
+        };
+        chain.put_petal(POOL_HASH, manifest);
+        chain.put_path(POOL_PATH, POOL_HASH);
+        let mut payload = vec![0u8; 32];
+        payload.extend_from_slice(&1_000_000u128.to_be_bytes());
+        chain.put_object(Object {
+            id: AUTO_GAS_ID,
+            type_tag: loom_coin_type_tag(Hash32([0u8; 32])),
+            owner: Owner::Address(signer),
+            version: 0,
+            payload,
+        });
+        TxHandler::new(Arc::new(chain)).with_submitter(submitter)
     }
 
     fn vpath(p: &str) -> VfsPath {
@@ -717,10 +825,69 @@ mod tests {
         assert_eq!(header["kind"], "ptb");
         assert_eq!(header["commands"], 2);
         assert!(header["ptb_hash"].as_str().unwrap().starts_with("0x"));
-        // The session survives a successful commit (errors-leave-intact
-        // also implies success doesn't silently discard).
-        let again = String::from_utf8(h.read(&vpath(&format!("{id}/cmd"))).await.unwrap()).unwrap();
-        assert!(again.contains("producer"));
+        // A successful commit consumes the session; failed commits are
+        // covered separately and leave their session intact.
+        let err = h.read(&vpath(&format!("{id}/cmd"))).await.unwrap_err();
+        assert!(matches!(err, HandlerError::NotFound(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn submitter_commit_auto_selects_gas_and_appends_receipt() {
+        let signer = [0x44; 32];
+        let submitter = Arc::new(MockSubmitter::default());
+        let h = handler_with_submitter(
+            vec![func("producer", vec![], vec![concrete("u64")])],
+            signer,
+            submitter.clone(),
+        );
+        let id = new_session(&h).await;
+        h.write(&vpath(&format!("{id}/cmd")), b"/bloom/dex/pool/producer")
+            .await
+            .unwrap();
+        h.write(
+            &vpath(&format!("{id}/signer")),
+            format!("0x{}", hex::encode(signer)).as_bytes(),
+        )
+        .await
+        .unwrap();
+
+        let receipt = h.read(&vpath(&format!("{id}/commit"))).await.unwrap();
+        let text = String::from_utf8(receipt).unwrap();
+        assert!(text.contains(r#""kind":"receipt""#), "{text}");
+        assert_eq!(submitter.selects.load(Ordering::SeqCst), 1);
+        assert_eq!(submitter.submits.load(Ordering::SeqCst), 1);
+        let err = h.read(&vpath(&format!("{id}/cmd"))).await.unwrap_err();
+        assert!(matches!(err, HandlerError::NotFound(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn submitter_failure_leaves_session_intact() {
+        let signer = [0x45; 32];
+        let submitter = Arc::new(MockSubmitter {
+            fail_submit: true,
+            ..Default::default()
+        });
+        let h = handler_with_submitter(
+            vec![func("producer", vec![], vec![concrete("u64")])],
+            signer,
+            submitter,
+        );
+        let id = new_session(&h).await;
+        h.write(&vpath(&format!("{id}/cmd")), b"/bloom/dex/pool/producer")
+            .await
+            .unwrap();
+        h.write(
+            &vpath(&format!("{id}/signer")),
+            format!("0x{}", hex::encode(signer)).as_bytes(),
+        )
+        .await
+        .unwrap();
+
+        let err = h.read(&vpath(&format!("{id}/commit"))).await.unwrap_err();
+        assert!(matches!(err, HandlerError::Backend(_)), "got {err:?}");
+        let listing =
+            String::from_utf8(h.read(&vpath(&format!("{id}/cmd"))).await.unwrap()).unwrap();
+        assert!(listing.contains("/bloom/dex/pool/producer"));
     }
 
     #[tokio::test]

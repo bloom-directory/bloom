@@ -19,6 +19,8 @@
 //!   `success`/`fuel_used`/`return_data`/`return_text`/`logs`.
 //! - `chain_query_state` — look up a storage slot for a contract.
 //! - `chain_query_object` — look up an on-chain object by 32-byte id.
+//! - `chain_query_code` — look up code bytes by 32-byte content hash.
+//! - `chain_resolve_path` — resolve a signed manifest module path to a petal hash.
 //! - `chain_ls_objects` — scan objects filtered by owner address or type name.
 //! - `chain_ls_validators` — list the current validator set.
 
@@ -33,6 +35,9 @@ use bloom_chain_types::{
     tx::Tx,
     types::{Address, Hash32},
 };
+use bloom_objects::Object;
+use bloom_petal_manifest::{extract_petal_manifest_v0, to_petal_manifest_stub};
+use bloom_script::{ChainStateIface, PetalManifestStub};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -214,6 +219,8 @@ impl RpcServer {
             "chain_query_tx" => self.handle_query_tx(params),
             "chain_query_state" => self.handle_query_state(params),
             "chain_query_object" => self.handle_query_object(params),
+            "chain_query_code" => self.handle_query_code(params),
+            "chain_resolve_path" => self.handle_resolve_path(params),
             "chain_ls_objects" => self.handle_ls_objects(params),
             "chain_ls_validators" => self.handle_ls_validators(),
             "chain_tip" => self.handle_tip(),
@@ -408,6 +415,31 @@ impl RpcServer {
         }
     }
 
+    fn handle_query_code(&self, params: &Value) -> Result<Value> {
+        // Params: { "hash": "<64-hex content hash>" }
+        // Returns null if no code with that hash exists.
+        let hash = parse_hash_param(params, "hash")?;
+        let state = self.state.lock();
+        match state.get_code(&hash) {
+            None => Ok(Value::Null),
+            Some(bytes) => Ok(json!({ "hash": hex::encode(hash.0), "bytes": hex::encode(bytes) })),
+        }
+    }
+
+    fn handle_resolve_path(&self, params: &Value) -> Result<Value> {
+        // Params: { "path": "/bloom/module/path" }
+        // Returns null if no deployed petal manifest owns the path.
+        let path = params
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing 'path' param"))?;
+        let state = self.state.lock();
+        match state.vfs_lookup(path) {
+            None => Ok(Value::Null),
+            Some(hash) => Ok(json!({ "hash": hex::encode(hash.0) })),
+        }
+    }
+
     fn handle_ls_objects(&self, params: &Value) -> Result<Value> {
         // Params: { "owner_addr": "<hex>" } OR { "type_name": "<str>" }.
         // Scans every object and returns a JSON array of the same per-object
@@ -495,6 +527,7 @@ enum Transport {
 
 /// Thin client that sends one JSON-RPC request and returns the result.
 /// Used by CLI subcommands like `bloom chain query account`.
+#[derive(Debug, Clone)]
 pub struct RpcClient {
     transport: Transport,
 }
@@ -545,6 +578,93 @@ impl RpcClient {
                 read_one_response(read_half).await
             }
         }
+    }
+}
+
+/// Synchronous [`ChainStateIface`] adapter over the node JSON-RPC API.
+///
+/// The PTB builder/validator is deliberately sync. This adapter bridges to the
+/// async RPC client by running each call on a short-lived helper thread, so it
+/// is safe to use from both CLI and daemon async runtimes.
+#[derive(Debug, Clone)]
+pub struct RpcChainAdapter {
+    client: RpcClient,
+}
+
+impl RpcChainAdapter {
+    /// Build an adapter over an existing RPC client.
+    pub fn new(client: RpcClient) -> Self {
+        Self { client }
+    }
+
+    /// Build an adapter from the standard chain socket path.
+    pub fn uds(socket_path: &Path) -> Self {
+        Self::new(RpcClient::new(socket_path))
+    }
+
+    /// Build an adapter from `BLOOM_RPC_TCP` when set, otherwise UDS.
+    pub fn from_env_or_socket(socket_path: &Path) -> Self {
+        match std::env::var("BLOOM_RPC_TCP") {
+            Ok(addr) if !addr.is_empty() => Self::new(RpcClient::tcp(addr)),
+            _ => Self::uds(socket_path),
+        }
+    }
+
+    fn call_blocking(&self, method: &'static str, params: Value) -> Result<Value> {
+        let client = self.client.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().context("create RPC helper runtime")?;
+            rt.block_on(client.call(method, params))
+        })
+        .join()
+        .map_err(|_| anyhow!("RPC helper thread panicked"))?
+    }
+}
+
+impl ChainStateIface for RpcChainAdapter {
+    fn load_object(&self, id: &bloom_objects::ObjectId) -> Option<Object> {
+        let value = self
+            .call_blocking("chain_query_object", json!({ "id": hex::encode(id.0) }))
+            .ok()?;
+        if value.is_null() {
+            return None;
+        }
+        let bytes = hex::decode(value.get("bytes")?.as_str()?).ok()?;
+        Object::decode_canonical(&bytes).ok()
+    }
+
+    fn load_petal(&self, hash: &Hash32) -> Option<Vec<u8>> {
+        let value = self
+            .call_blocking("chain_query_code", json!({ "hash": hex::encode(hash.0) }))
+            .ok()?;
+        if value.is_null() {
+            return None;
+        }
+        hex::decode(value.get("bytes")?.as_str()?).ok()
+    }
+
+    fn load_manifest(&self, hash: &Hash32) -> Option<PetalManifestStub> {
+        let wasm = self.load_petal(hash)?;
+        let manifest = extract_petal_manifest_v0(&wasm)?;
+        Some(to_petal_manifest_stub(&manifest))
+    }
+
+    fn resolve_path(&self, path: &str) -> Option<Hash32> {
+        let value = self
+            .call_blocking("chain_resolve_path", json!({ "path": path }))
+            .ok()?;
+        if value.is_null() {
+            return None;
+        }
+        let bytes = hex::decode(value.get("hash")?.as_str()?).ok()?;
+        bytes.try_into().ok().map(Hash32)
+    }
+
+    fn current_block(&self) -> u64 {
+        self.call_blocking("chain_tip", json!({}))
+            .ok()
+            .and_then(|v| v.get("height").and_then(Value::as_u64))
+            .unwrap_or(0)
     }
 }
 
@@ -602,7 +722,22 @@ fn object_to_json(obj: &bloom_objects::Object) -> Value {
         "owner_addr": owner_addr,
         "version": obj.version,
         "payload": hex::encode(&obj.payload),
+        "bytes": hex::encode(obj.encode_canonical().expect("object canonical encode")),
     })
+}
+
+fn parse_hash_param(params: &Value, key: &str) -> Result<Hash32> {
+    let s = params
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing '{key}' param"))?;
+    let bytes = hex::decode(s).with_context(|| format!("decode {key} hex"))?;
+    if bytes.len() != 32 {
+        return Err(anyhow!("{key} must be 32 bytes (got {})", bytes.len()));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(Hash32(out))
 }
 
 // ---------------------------------------------------------------------------
@@ -679,6 +814,7 @@ mod tests {
         let (server, _tmp) = make_server();
         let owner = [0x11u8; 32];
         let obj = concrete_object(0x42, "Coin", Owner::Address(owner));
+        let expected_bytes = hex::encode(obj.encode_canonical().unwrap());
         server.state.lock().set_object(obj);
 
         let res = server
@@ -691,6 +827,7 @@ mod tests {
         assert_eq!(res["owner_addr"], hex::encode(owner));
         assert_eq!(res["version"], 7);
         assert_eq!(res["payload"], "deadbeef");
+        assert_eq!(res["bytes"], expected_bytes);
     }
 
     #[test]
@@ -765,5 +902,51 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn query_code_returns_code_bytes() {
+        let (server, _tmp) = make_server();
+        let wasm = b"\0asm-test".to_vec();
+        let hash = server.state.lock().insert_code(&wasm);
+
+        let res = server
+            .handle_query_code(&json!({ "hash": hex::encode(hash.0) }))
+            .unwrap();
+        assert_eq!(res["hash"], hex::encode(hash.0));
+        assert_eq!(res["bytes"], hex::encode(wasm));
+    }
+
+    #[test]
+    fn query_code_missing_is_null() {
+        let (server, _tmp) = make_server();
+        let res = server
+            .handle_query_code(&json!({ "hash": hex::encode([0x55u8; 32]) }))
+            .unwrap();
+        assert!(res.is_null());
+    }
+
+    #[test]
+    fn resolve_path_returns_bound_petal_hash() {
+        let (server, _tmp) = make_server();
+        let hash = Hash32([0xAA; 32]);
+        server
+            .state
+            .lock()
+            .set_vfs_binding("/bloom/dex/pool".to_string(), hash);
+
+        let res = server
+            .handle_resolve_path(&json!({ "path": "/bloom/dex/pool" }))
+            .unwrap();
+        assert_eq!(res["hash"], hex::encode(hash.0));
+    }
+
+    #[test]
+    fn resolve_path_missing_is_null() {
+        let (server, _tmp) = make_server();
+        let res = server
+            .handle_resolve_path(&json!({ "path": "/bloom/missing" }))
+            .unwrap();
+        assert!(res.is_null());
     }
 }

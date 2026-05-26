@@ -219,6 +219,9 @@ pub(crate) fn emit_petal_shim(ast: &PetalShimAst) -> TokenStream {
                     };
                     #type_args_setup
                     #(#decode_stmts)*
+                    if __reader.expect_finished().is_err() {
+                        return Err(::bloom_resource::PetalError::InvalidArgs);
+                    }
                     #type_args_bind
                     let __ret = #user_call;
                     #encode_returns
@@ -248,6 +251,9 @@ pub(crate) fn emit_petal_shim(ast: &PetalShimAst) -> TokenStream {
                     };
                     #type_args_setup
                     #(#decode_stmts)*
+                    if __reader.expect_finished().is_err() {
+                        return Err(::bloom_resource::PetalError::InvalidArgs);
+                    }
                     #type_args_bind
                     let __ret = #user_call;
                     #encode_returns
