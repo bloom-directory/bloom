@@ -50,7 +50,7 @@ pub enum ChainCmd {
     /// for an inner `PtbTx` that is ALREADY Ed25519-signed against its
     /// `signers`. The CLI treats those bytes as opaque — it does not sign
     /// the inner PTB — and only builds + signs the OUTER xDSA tx envelope
-    /// (which is what block-apply verifies) exactly like `deploy`/`call`.
+    /// (which is what block-apply verifies).
     SubmitPtb {
         /// Path to a file holding the `encode_ptb` bytes of a signed `PtbTx`.
         #[arg(long, value_name = "PATH")]
@@ -61,36 +61,6 @@ pub enum ChainCmd {
         /// Receipt-poll timeout in seconds (only with `--wait`; default 30).
         #[arg(long, value_name = "N", default_value_t = 30u64)]
         wait_timeout_secs: u64,
-    },
-    /// Build, sign, and submit a Deploy tx.
-    Deploy {
-        /// Path to a `.wasm` or `.wat` file.
-        wasm_or_wat: String,
-        /// Hex-encoded init calldata.
-        #[arg(long, value_name = "HEX")]
-        init_args: Option<String>,
-        /// 32-byte hex salt (default: all zeros).
-        #[arg(long, value_name = "HEX")]
-        salt: Option<String>,
-        /// Optional 32-byte hex blake3 anchor for an off-chain manifest
-        /// (bloom-rust-contracts Phase 8). Stored in `Account.manifest_hash`
-        /// and readable via the `chain.code.manifest_hash` host import; the
-        /// chain does not interpret the bytes.
-        #[arg(long, value_name = "HEX")]
-        manifest_hash: Option<String>,
-    },
-    /// Build, sign, and submit a Call tx.
-    Call {
-        /// Target contract address (hex or b1-prefixed).
-        addr: String,
-        /// Calldata as hex.
-        calldata_hex: String,
-        /// Native LOOM to attach (in bloomweis; default 0).
-        #[arg(long, value_name = "LOOM")]
-        value: Option<u128>,
-        /// Maximum fuel for this call.
-        #[arg(long, value_name = "N")]
-        max_fuel: Option<u64>,
     },
     /// Build, sign, and submit a plain LOOM Transfer tx.
     Transfer {
@@ -292,7 +262,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
 
             // The inner PTB is opaque to the CLI: read the `encode_ptb` bytes
             // verbatim and wrap them in `TxKind::SubmitPtb`. Only the outer
-            // envelope is signed here (deploy/call pattern).
+            // envelope is signed here.
             let ptb_bytes = std::fs::read(&ptb_file)
                 .with_context(|| format!("read ptb file: {}", ptb_file.display()))?;
 
@@ -327,126 +297,6 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             // Always emit the tx_hash as the LAST line so a driver can capture
             // it regardless of whether `--wait` was set.
             println!("{}", json!({ "tx_hash": hex::encode(tx_hash.0) }));
-            Ok(())
-        }
-
-        // ── deploy ────────────────────────────────────────────────────────────
-        ChainCmd::Deploy {
-            wasm_or_wat,
-            init_args,
-            salt,
-            manifest_hash,
-        } => {
-            use bloom_chain_types::ssz::Encode;
-            use bloom_chain_types::{tx::TxKind, types::Hash32};
-
-            let wasm_bytes = load_wasm(&wasm_or_wat)?;
-            let init_args_bytes = init_args
-                .as_deref()
-                .map(|h| hex::decode(h).context("decode init-args hex"))
-                .transpose()?
-                .unwrap_or_default();
-            let salt_bytes: [u8; 32] = salt
-                .as_deref()
-                .map(|h| {
-                    let b = hex::decode(h).context("decode salt hex")?;
-                    if b.len() != 32 {
-                        anyhow::bail!("salt must be 32 bytes");
-                    }
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&b);
-                    Ok(arr)
-                })
-                .transpose()?
-                .unwrap_or([0u8; 32]);
-            let manifest_hash_opt: Option<Hash32> = manifest_hash
-                .as_deref()
-                .map(|h| {
-                    let b = hex::decode(h).context("decode manifest-hash hex")?;
-                    if b.len() != 32 {
-                        anyhow::bail!("manifest-hash must be 32 bytes");
-                    }
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&b);
-                    Ok::<_, anyhow::Error>(Hash32(arr))
-                })
-                .transpose()?;
-
-            let (sk, pk, sender) = load_wallet_key(&chain_dir)?;
-            let chain_id = load_chain_id(&chain_dir)?;
-            let client = make_client();
-            let nonce = fetch_nonce(&client, &sender).await? + 1;
-            let tx = build_and_sign_tx(
-                &sk,
-                &pk,
-                sender,
-                &chain_id,
-                nonce,
-                TxKind::Deploy {
-                    wasm: wasm_bytes,
-                    salt: salt_bytes,
-                    init_args: init_args_bytes,
-                    manifest_hash: manifest_hash_opt,
-                },
-                10_000_000,
-                1,
-            )?;
-            let tx_hash = tx.tx_hash();
-            let result = client
-                .call(
-                    "chain_submit_tx",
-                    json!({ "tx_hex": hex::encode(tx.as_ssz_bytes()) }),
-                )
-                .await?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
-            wait_for_nonce(&client, &sender, nonce, std::time::Duration::from_secs(30)).await?;
-            wait_for_tx_receipt(&client, &tx_hash, std::time::Duration::from_secs(30)).await?;
-            Ok(())
-        }
-
-        // ── call ──────────────────────────────────────────────────────────────
-        ChainCmd::Call {
-            addr,
-            calldata_hex,
-            value,
-            max_fuel,
-        } => {
-            use bloom_chain_types::ssz::Encode;
-            use bloom_chain_types::tx::TxKind;
-
-            let to = parse_address_cli(&addr)?;
-            let calldata = hex::decode(&calldata_hex).context("decode calldata hex")?;
-            let value_loom = value.unwrap_or(0);
-            let fuel = max_fuel.unwrap_or(1_000_000);
-
-            let (sk, pk, sender) = load_wallet_key(&chain_dir)?;
-            let chain_id = load_chain_id(&chain_dir)?;
-            let client = make_client();
-            let nonce = fetch_nonce(&client, &sender).await? + 1;
-            let tx = build_and_sign_tx(
-                &sk,
-                &pk,
-                sender,
-                &chain_id,
-                nonce,
-                TxKind::Call {
-                    to,
-                    calldata,
-                    value_loom,
-                },
-                fuel,
-                1,
-            )?;
-            let tx_hash = tx.tx_hash();
-            let result = client
-                .call(
-                    "chain_submit_tx",
-                    json!({ "tx_hex": hex::encode(tx.as_ssz_bytes()) }),
-                )
-                .await?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
-            wait_for_nonce(&client, &sender, nonce, std::time::Duration::from_secs(30)).await?;
-            wait_for_tx_receipt(&client, &tx_hash, std::time::Duration::from_secs(30)).await?;
             Ok(())
         }
 
@@ -732,18 +582,6 @@ pub(crate) fn load_validator_run_config(
         fuel_limit: node_cfg.fuel_limit.unwrap_or(30_000_000),
     };
     Ok((node_cfg, run_config))
-}
-
-/// Load a `.wasm` or `.wat` file, converting WAT if necessary.
-fn load_wasm(path: &str) -> Result<Vec<u8>> {
-    let raw = std::fs::read(path).with_context(|| format!("read {path}"))?;
-    if path.ends_with(".wat") {
-        wat::parse_bytes(&raw)
-            .map(|b| b.to_vec())
-            .context("parse WAT")
-    } else {
-        Ok(raw)
-    }
 }
 
 /// Load the local validator xDSA key from `<chain_dir>/keystore/validator.xdsa`.
@@ -1115,6 +953,7 @@ fn provision_testnet(
                 amount: alloc_amount.to_string(),
             })
             .collect(),
+        petals: vec![],
     };
     let genesis_toml = toml::to_string_pretty(&genesis).context("serialize shared genesis.toml")?;
 

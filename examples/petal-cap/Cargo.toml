@@ -18,7 +18,6 @@ bloom-objects = { workspace = true }
 default = []
 # Suppress the wasm `__petal_<fn>` entrypoints when this crate is compiled
 # as a transitive `rlib` dependency of *another* petal. Mirrors the
-# `bloom-contract`/DEX example pattern: dependent contracts must enable
-# `no-entrypoint` so cargo's feature-unification doesn't ship a single
-# wasm with both petals' exports.
+# Dependent petals must enable `no-entrypoint` so cargo's feature-unification
+# doesn't ship a single wasm with both petals' exports.
 no-entrypoint = []

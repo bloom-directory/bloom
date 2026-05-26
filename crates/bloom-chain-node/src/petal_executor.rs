@@ -1,14 +1,7 @@
 //! Real chain-mode petal executor.
 //!
-//! Bridges `consensus_driver::PetalExecutor` to `bloom_petals::PetalVm::run_chain_call`.
-//!
-//! Handles the three tx kinds:
-//! - `Transfer`: pure LOOM move (no VM invocation).
-//! - `Deploy`: validate wasm → check address collision → stage code + account →
-//!   invoke `init` via the chain VM → on success, commit snapshot writes and
-//!   return the deploy address; on revert, drop writes.
-//! - `Call`: load wasm by `code_hash` → forward value → invoke `call` via the
-//!   chain VM → on success commit writes, on revert drop them.
+//! Bridges `consensus_driver::PetalExecutor` to Bloom-native PTB/object
+//! execution through the deterministic chain VM.
 //!
 //! Snapshot semantics:
 //! - `consensus_driver::apply_block` debits `max_fuel * fee_per_unit + value`
@@ -22,7 +15,6 @@ use std::sync::{Arc, Mutex};
 
 use bloom_chain_state::{Account, State};
 use bloom_chain_types::{
-    digest::{blake3_tagged, tags},
     receipt::Log,
     tx::{Tx, TxKind},
     types::{Address, Hash32},
@@ -31,7 +23,7 @@ use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexK
 use bloom_petal_fungible::ops::{
     coin_payload, decode_coin_value, rewrite_value, type_tag_coin_loom,
 };
-use bloom_petals::{BlockCtx as PetalBlockCtx, ChainCallInput, ChainEntry, PetalVm};
+use bloom_petals::BlockCtx as PetalBlockCtx;
 use bloom_script::{
     AlwaysOkVerifier, PetalManifestStub, SignatureVerifier, ValidationContext,
     executor::{LogEntry as PtbLogEntry, PtbExecutor},
@@ -82,31 +74,6 @@ impl ChainPetalExecutorWithManifests {
     /// Construct with an explicit manifest registry.
     pub fn new(manifests: HashMap<Hash32, PetalManifestStub>) -> Self {
         Self { manifests }
-    }
-}
-
-/// Domain-separated derivation of a contract instance address (spec §7.7).
-///
-///   instance_address = blake3(
-///       "bloom-chain.v0.addr:" ||
-///       "deploy:" || deployer || ":" || salt || ":" || petal_hash)
-fn deploy_address(deployer: &Address, salt: &[u8; 32], petal_hash: &Hash32) -> Address {
-    let mut h = blake3::Hasher::new();
-    h.update(tags::ADDR.as_bytes());
-    h.update(b"deploy:");
-    h.update(&deployer.0);
-    h.update(b":");
-    h.update(salt);
-    h.update(b":");
-    h.update(&petal_hash.0);
-    Address(*h.finalize().as_bytes())
-}
-
-fn petal_log_to_receipt_log(l: bloom_petals::LogEntry) -> Log {
-    Log {
-        address: l.address,
-        topics: l.topics,
-        data: l.data,
     }
 }
 
@@ -355,10 +322,8 @@ fn execute_tx_impl(
     manifests: Option<&HashMap<Hash32, PetalManifestStub>>,
     verifier: &dyn SignatureVerifier,
 ) -> ExecOutput {
-    // `parent_hash` is the committing block's parent block hash —
-    // surfaced to chain-mode petals as `chain::block.prevhash`
-    // (review 2026-05-19 #13). Threaded in by
-    // `apply_block_state_transitions` from `block.header.parent_hash`.
+    // `parent_hash` is the committing block's parent block hash, threaded in
+    // by `apply_block_state_transitions` from `block.header.parent_hash`.
     let block_ctx = PetalBlockCtx {
         number: block_number,
         timestamp_ms,
@@ -392,262 +357,6 @@ fn execute_tx_impl(
                 return_data: vec![],
                 logs: vec![],
                 write_set: Some(ws),
-            }
-        }
-
-        TxKind::Deploy {
-            wasm,
-            salt,
-            init_args,
-            manifest_hash,
-        } => {
-            if let Err(e) = PetalVm::validate_for_chain(wasm) {
-                return ExecOutput {
-                    success: false,
-                    fuel_used: 0,
-                    return_data: format!("invalid wasm: {e}").into_bytes(),
-                    logs: vec![],
-                    write_set: None,
-                };
-            }
-
-            let petal_hash = blake3_tagged(tags::PETAL, wasm);
-            let addr = deploy_address(&tx.sender, salt, &petal_hash);
-
-            // Collision: address already deployed (§7.7).
-            if let Some(a) = state.get_account(&addr)
-                && a.code_hash.is_some()
-            {
-                return ExecOutput {
-                    success: false,
-                    fuel_used: 0,
-                    return_data: b"deploy address already in use".to_vec(),
-                    logs: vec![],
-                    write_set: None,
-                };
-            }
-
-            // Stage account + code in the snapshot; invoke init. The
-            // deployer's manifest anchor (if present) lands in the
-            // account here, before `init` runs, so a contract can read
-            // its own anchor inside `init` via the chain.code import.
-            let mut snap = state.snapshot();
-            snap.insert_code(wasm.clone());
-            let mut acct = snap.get_account(&addr).unwrap_or_else(empty_account);
-            acct.code_hash = Some(petal_hash);
-            acct.manifest_hash = *manifest_hash;
-            snap.set_account(addr, acct);
-
-            // Decode the petal's manifest custom section (if
-            // present) so we can bind `module_path → petal_hash` in
-            // the VFS index. New-framework petals always carry one;
-            // legacy framework petals don't, in which case we leave
-            // the VFS index untouched (the petal is reachable only
-            // by pure-hash refs).
-            let vfs_binding: Option<(String, Hash32)> =
-                bloom_petal_manifest::extract_petal_manifest_v0(wasm)
-                    .filter(|m| !m.module_path.is_empty())
-                    .map(|m| (m.module_path, petal_hash));
-
-            // PTB-mode petals (spec §16.2, `bloom-resource-macros`) export
-            // only `__petal_*` shims — no deploy-time `init`. They create all
-            // of their state lazily through PTB `Move` commands, so deploying
-            // one is a pure code+account+VFS staging step. `validate_for_chain`
-            // already admits such petals; we must NOT then unconditionally
-            // invoke `init`, or the deploy traps with
-            // `failed to find function export 'init'`. Commit the staged
-            // snapshot directly and bind the VFS path.
-            if !bloom_petals::chain_vm::wasm_exports_function(wasm, "init") {
-                let ws = snap.commit();
-                if let Some((path, hash)) = vfs_binding {
-                    state.set_vfs_binding(path, hash);
-                }
-                tracing::info!(
-                    addr = %hex::encode(addr.0),
-                    "deploy committed (no init export — PTB-mode petal)"
-                );
-                return ExecOutput {
-                    success: true,
-                    fuel_used: 0,
-                    return_data: addr.0.to_vec(),
-                    logs: vec![],
-                    write_set: Some(ws),
-                };
-            }
-
-            let input = ChainCallInput {
-                wasm: wasm.clone(),
-                entry: ChainEntry::Init,
-                contract_address: addr,
-                msg_sender: tx.sender,
-                msg_value: 0,
-                calldata: init_args.clone(),
-                block: block_ctx,
-                fuel: tx.max_fuel,
-                snapshot: snap,
-                ptb_ctx: None,
-            };
-
-            match PetalVm::run_chain_call(input) {
-                Ok(out) => {
-                    if let Some(reason) = out.revert_reason {
-                        // Snapshot writes discarded.
-                        ExecOutput {
-                            success: false,
-                            fuel_used: out.fuel_used,
-                            return_data: reason,
-                            logs: out.logs.into_iter().map(petal_log_to_receipt_log).collect(),
-                            write_set: None,
-                        }
-                    } else {
-                        let ws = out.snapshot.commit();
-                        // VFS binding survives the deploy only if
-                        // init succeeded. We apply it directly to
-                        // `state` after the write-set commits (the
-                        // VFS is a derived index, not part of the
-                        // committed state root).
-                        if let Some((path, hash)) = vfs_binding {
-                            state.set_vfs_binding(path, hash);
-                        }
-                        tracing::info!(
-                            addr = %hex::encode(addr.0),
-                            fuel_used = out.fuel_used,
-                            "deploy committed"
-                        );
-                        ExecOutput {
-                            success: true,
-                            fuel_used: out.fuel_used,
-                            return_data: addr.0.to_vec(),
-                            logs: out.logs.into_iter().map(petal_log_to_receipt_log).collect(),
-                            write_set: Some(ws),
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(err = %e, "deploy trapped");
-                    ExecOutput {
-                        success: false,
-                        fuel_used: tx.max_fuel,
-                        return_data: e.to_string().into_bytes(),
-                        logs: vec![],
-                        write_set: None,
-                    }
-                }
-            }
-        }
-
-        TxKind::Call {
-            to,
-            calldata,
-            value_loom,
-        } => {
-            // Resolve callee: contract → load wasm; non-contract → value-transfer only.
-            let callee = state.get_account(to);
-            let code_hash = callee.as_ref().and_then(|a| a.code_hash);
-
-            let wasm: Vec<u8> = match code_hash {
-                Some(ref h) => match state.get_code(h) {
-                    Some(b) => b.to_vec(),
-                    None => {
-                        return ExecOutput {
-                            success: false,
-                            fuel_used: 0,
-                            return_data: b"code missing for code_hash".to_vec(),
-                            logs: vec![],
-                            write_set: None,
-                        };
-                    }
-                },
-                None => {
-                    // Pure value transfer (callee is an EOA).
-                    let mut snap = state.snapshot();
-                    if *value_loom > 0 {
-                        let mut to_acct = snap.get_account(to).unwrap_or_else(empty_account);
-                        to_acct.loom += value_loom;
-                        snap.set_account(*to, to_acct);
-
-                        // PTB compat shim: keep Coin<LOOM> objects in sync.
-                        apply_coin_loom_transfer(
-                            &mut snap,
-                            tx.sender,
-                            *to,
-                            *value_loom,
-                            &tx.tx_hash(),
-                        );
-                    }
-                    return ExecOutput {
-                        success: true,
-                        fuel_used: 100,
-                        return_data: vec![],
-                        logs: vec![],
-                        write_set: Some(snap.commit()),
-                    };
-                }
-            };
-
-            // Pre-credit value to callee inside the snapshot.
-            let mut snap = state.snapshot();
-            if *value_loom > 0 {
-                let mut to_acct = snap.get_account(to).unwrap_or_else(empty_account);
-                to_acct.loom += value_loom;
-                snap.set_account(*to, to_acct);
-
-                // PTB compat shim: keep Coin<LOOM> objects in sync.
-                // This runs BEFORE the VM call so the Coin<LOOM> credit
-                // and Account.loom credit land together in the writeset.
-                apply_coin_loom_transfer(&mut snap, tx.sender, *to, *value_loom, &tx.tx_hash());
-            }
-
-            let input = ChainCallInput {
-                wasm,
-                entry: ChainEntry::Call,
-                contract_address: *to,
-                msg_sender: tx.sender,
-                msg_value: *value_loom,
-                calldata: calldata.clone(),
-                block: block_ctx,
-                fuel: tx.max_fuel,
-                snapshot: snap,
-                ptb_ctx: None,
-            };
-
-            match PetalVm::run_chain_call(input) {
-                Ok(out) => {
-                    if let Some(reason) = out.revert_reason {
-                        warn!(
-                            to = %hex::encode(to.0),
-                            fuel_used = out.fuel_used,
-                            reason = %String::from_utf8_lossy(&reason),
-                            "call reverted"
-                        );
-                        ExecOutput {
-                            success: false,
-                            fuel_used: out.fuel_used,
-                            return_data: reason,
-                            logs: out.logs.into_iter().map(petal_log_to_receipt_log).collect(),
-                            write_set: None,
-                        }
-                    } else {
-                        let ws = out.snapshot.commit();
-                        ExecOutput {
-                            success: true,
-                            fuel_used: out.fuel_used,
-                            return_data: out.return_data.unwrap_or_default(),
-                            logs: out.logs.into_iter().map(petal_log_to_receipt_log).collect(),
-                            write_set: Some(ws),
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(to = %hex::encode(to.0), err = %e, "call trapped");
-                    ExecOutput {
-                        success: false,
-                        fuel_used: tx.max_fuel,
-                        return_data: e.to_string().into_bytes(),
-                        logs: vec![],
-                        write_set: None,
-                    }
-                }
             }
         }
 

@@ -73,12 +73,9 @@ pub struct ChainPetalRunner {
     /// Threaded chain snapshot. Each successful `call()` swaps the
     /// returned snapshot back into here so the next call sees it.
     snapshot: Mutex<Option<StateSnapshot>>,
-    /// Block-level context (number, timestamp_ms, prevhash) presented
-    /// to the wasm as the `block.*` import namespace.
+    /// Block-level context retained for receipt/execution metadata.
     block: BlockCtx,
-    /// The PTB's first-signer address — surfaced to the petal as
-    /// `msg.sender` (legacy semantics) so existing chain-mode imports
-    /// like `chain.code.deployer` keep working inside PTB-mode wasm.
+    /// The PTB's first-signer address, retained as dispatch metadata.
     msg_sender: Address,
 }
 
@@ -92,8 +89,7 @@ impl ChainPetalRunner {
     /// - `snapshot` — the initial chain snapshot. Threaded through
     ///   successive Move calls inside this PTB.
     /// - `block` — block-level context (number / timestamp / prevhash).
-    /// - `msg_sender` — first signer address used as the wasm-side
-    ///   `msg.sender`.
+    /// - `msg_sender` — first signer address for dispatch metadata.
     pub fn new(
         petals: BTreeMap<Hash32, Vec<u8>>,
         ctx: Arc<Mutex<PtbHostCtx>>,
@@ -162,11 +158,9 @@ impl ChainPetalRunner {
         let input = ChainCallInput {
             wasm,
             entry: ChainEntry::Function(export_name),
-            // contract_address is the petal's own address: in PTB
-            // mode there's no first-class "callee account" the way
-            // `TxKind::Call` has one. We synthesise it from the
-            // petal hash so chain-state writes attributed via
-            // `chain.state.*` legacy imports land in a stable slot.
+            // contract_address is the petal's own address. PTB mode has no
+            // first-class callee account, so we derive a stable metadata
+            // address from the petal hash.
             contract_address: Address(petal_hash.0),
             msg_sender: self.msg_sender,
             msg_value: 0,

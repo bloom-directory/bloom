@@ -12,20 +12,19 @@
 //! Driving model (mirrors `bloom-dex-it`'s `docker_dex_multi_user.rs`):
 //!   - `scripts/test-docker-petal-dex.sh` builds the docker image, provisions
 //!     a 4-validator testnet under `$BLOOM_DOCKER_TMPDIR/home{0..3}`, APPENDS
-//!     an Ed25519 gas allocation (keyed to the inner-PTB signer pubkey) to all
-//!     four byte-identical genesis.toml files, `docker compose up -d`s the
-//!     stack, and runs this test.
+//!     the petal DEX code/bindings plus an Ed25519 gas allocation (keyed to
+//!     the inner-PTB signer pubkey) to all four byte-identical genesis.toml
+//!     files, `docker compose up -d`s the stack, and runs this test.
 //!   - This driver attaches to the running stack over TCP (host ports
-//!     18545..18548), deploys the three petal wasms via the host `bloom`
-//!     binary (outer xDSA envelope signed from home0), then submits two
+//!     18545..18548), checks the genesis-bound petal hashes, then submits two
 //!     Ed25519-signed inner PTBs via `bloom chain submit-ptb`.
 //!
 //! Two address spaces (see brief):
 //!   - INNER PTB auth: a deterministic Ed25519 key (`ptb_signer_*` in
 //!     `dex_harness`). Its genesis-allocated `Coin<LOOM>` is the inner
 //!     gas-payer; every Address-owned input must be owned by it.
-//!   - OUTER Tx envelope: signed by the home0 xDSA keystore wallet (via the
-//!     CLI — never hand-rolled).
+//!   - OUTER Tx envelope: `bloom chain submit-ptb` signs it with the home0
+//!     xDSA keystore wallet.
 //!
 //! `#[ignore]`-gated. Run via `scripts/test-docker-petal-dex.sh`.
 
@@ -110,7 +109,7 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
         ptb_signer_pubkey_hex()
     );
 
-    // ── 2. Build the three petal wasms + deploy each via the bloom CLI ────
+    // ── 2. Build the three petal wasms and verify genesis bindings ────────
     eprintln!();
     eprintln!("[build] compiling pool/wallet/faucet to wasm32-unknown-unknown");
     let pool_wasm_path = build_pool_wasm();
@@ -121,36 +120,29 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
     let wallet_wasm = std::fs::read(&wallet_wasm_path).context("read wallet wasm")?;
     let faucet_wasm = std::fs::read(&faucet_wasm_path).context("read faucet wasm")?;
 
-    // Host-side petal hashes (= blake3_tagged(PETAL, wasm)) — what the chain's
-    // Deploy apply path also derives, and what each PetalRef pins.
+    // Host-side petal hashes (= blake3_tagged(PETAL, wasm)) — what genesis
+    // provisioning inserted, and what each PetalRef pins.
     let pool_hash = petal_hash_of(&pool_wasm);
     let wallet_hash = petal_hash_of(&wallet_wasm);
     let faucet_hash = petal_hash_of(&faucet_wasm);
 
     eprintln!();
-    eprintln!("[deploy] deploying petals from home0 (outer xDSA envelope):");
-    deploy_petal(&home0, HOST_RPC_PORTS[0], &pool_wasm_path)?;
+    eprintln!("[genesis] verifying petal DEX bindings:");
+    assert_resolves(client0, "/bloom/dex/pool", pool_hash).await?;
     eprintln!(
         "         /bloom/dex/pool   hash={}",
         hex::encode(pool_hash.0)
     );
-    deploy_petal(&home0, HOST_RPC_PORTS[0], &wallet_wasm_path)?;
+    assert_resolves(client0, "/bloom/dex/wallet", wallet_hash).await?;
     eprintln!(
         "         /bloom/dex/wallet hash={}",
         hex::encode(wallet_hash.0)
     );
-    deploy_petal(&home0, HOST_RPC_PORTS[0], &faucet_wasm_path)?;
+    assert_resolves(client0, "/bloom/dex/faucet", faucet_hash).await?;
     eprintln!(
         "         /bloom/dex/faucet hash={}",
         hex::encode(faucet_hash.0)
     );
-
-    // Deploys auto-bind each petal's VFS path on the validator that applies
-    // the block. Wait for the binding to gossip to every validator before we
-    // submit PTBs that reference those paths (the submit-ptb outer envelope
-    // may be admitted by any validator after gossip).
-    let mut latest = current_height(client0).await?;
-    wait_all_reach_height(&clients, latest + 2).await?;
 
     // ── 3. Discover the ed25519-owned gas Coin<LOOM> ──────────────────────
     let signer_hex = ptb_signer_pubkey_hex();
@@ -226,7 +218,7 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
     );
 
     // Make every validator catch up so discovery is not racing the apply.
-    latest = current_height(client0).await?;
+    let mut latest = current_height(client0).await?;
     wait_all_reach_height(&clients, latest + 1).await?;
 
     // ── 5. Discover the shared Pool + assert reserves (1000, 1000) ────────
@@ -403,32 +395,6 @@ fn bloom_bin() -> PathBuf {
     PathBuf::from(manifest_dir).join("../../../../target/release/bloom")
 }
 
-/// `bloom chain deploy <wasm>` from `home`, dialing the validator at
-/// `127.0.0.1:<port>` via `BLOOM_RPC_TCP`. Deploy waits for its own receipt
-/// (the CLI blocks on nonce + receipt), so on return the petal code + VFS
-/// binding are committed on the dialed validator.
-fn deploy_petal(home: &std::path::Path, port: u16, wasm: &std::path::Path) -> Result<()> {
-    let rpc = format!("127.0.0.1:{}", port);
-    let out = Command::new(bloom_bin())
-        .env("BLOOM_RPC_TCP", &rpc)
-        .arg("--home")
-        .arg(home)
-        .arg("chain")
-        .arg("deploy")
-        .arg(wasm)
-        .output()
-        .context("invoke bloom chain deploy")?;
-    if !out.status.success() {
-        bail!(
-            "bloom chain deploy {} failed:\n  stdout={}\n  stderr={}",
-            wasm.display(),
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    Ok(())
-}
-
 /// Ed25519-sign + encode `ptb`, write the bytes to a temp file, and run
 /// `bloom chain submit-ptb --ptb-file <f> --wait` from `home`. Returns the
 /// parsed receipt JSON (the pretty block printed before the final `tx_hash`
@@ -516,6 +482,26 @@ fn parse_receipt_from_submit_ptb(stdout: &str) -> Result<Value> {
 async fn current_height(client: &RpcClient) -> Result<u64> {
     let v = client.call("chain_tip", serde_json::json!({})).await?;
     Ok(v.get("height").and_then(Value::as_u64).unwrap_or(0))
+}
+
+async fn assert_resolves(
+    client: &RpcClient,
+    path: &str,
+    expected: bloom_chain_types::types::Hash32,
+) -> Result<()> {
+    let resolved = client
+        .call("chain_resolve_path", serde_json::json!({ "path": path }))
+        .await
+        .with_context(|| format!("resolve petal path {path}"))?;
+    let got = resolved
+        .get("hash")
+        .and_then(Value::as_str)
+        .with_context(|| format!("petal path {path} is not bound"))?;
+    let expected_hex = hex::encode(expected.0);
+    if got != expected_hex {
+        bail!("petal path {path} resolved to {got}, expected {expected_hex}");
+    }
+    Ok(())
 }
 
 /// Block until `chain_query_block(target)` returns a non-null block.

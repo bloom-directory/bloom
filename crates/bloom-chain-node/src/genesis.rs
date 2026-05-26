@@ -19,6 +19,10 @@
 //! [[allocations]]
 //! address = "b1dev1...0001"
 //! amount  = "1000000000000000000000"
+//!
+//! [[petals]]
+//! path = "/bloom/dex/pool"
+//! wasm_hex = "<hex-encoded wasm bytes>"
 //! ```
 
 use std::path::Path;
@@ -61,6 +65,15 @@ pub struct GenesisAllocation {
     pub amount: String,
 }
 
+/// Raw TOML representation of a petal installed at genesis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenesisPetal {
+    /// VFS module path exposed by the petal's manifest.
+    pub path: String,
+    /// Hex-encoded wasm bytes.
+    pub wasm_hex: String,
+}
+
 /// Parsed genesis file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenesisFile {
@@ -70,6 +83,8 @@ pub struct GenesisFile {
     pub validators: Vec<ValidatorConfig>,
     #[serde(default)]
     pub allocations: Vec<GenesisAllocation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub petals: Vec<GenesisPetal>,
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +102,7 @@ pub struct Genesis {
     /// Peers addresses `host:port` indexed by validator address bytes.
     pub peer_addrs: Vec<String>,
     pub allocations: Vec<(Address, u128)>,
+    pub petals: Vec<(String, Vec<u8>)>,
     /// Genesis hash: `blake3("bloom-chain.v0.genesis:" || ssz(chain_id_bytes || genesis_time_ms))`.
     pub genesis_hash: Hash32,
 }
@@ -142,6 +158,26 @@ impl Genesis {
             allocations.push((addr, amount));
         }
 
+        // Parse genesis-installed petals.
+        let mut petals: Vec<(String, Vec<u8>)> = Vec::new();
+        for petal in &raw.petals {
+            if !petal.path.starts_with('/') {
+                return Err(NodeError::Genesis(format!(
+                    "petal path must be absolute: {:?}",
+                    petal.path
+                )));
+            }
+            let wasm = hex::decode(&petal.wasm_hex)
+                .map_err(|e| NodeError::Genesis(format!("petal wasm_hex: {e}")))?;
+            if wasm.is_empty() {
+                return Err(NodeError::Genesis(format!(
+                    "petal {} has empty wasm_hex",
+                    petal.path
+                )));
+            }
+            petals.push((petal.path.clone(), wasm));
+        }
+
         // Genesis hash.
         let genesis_hash = compute_genesis_hash(&raw.chain_id, raw.genesis_time_ms);
 
@@ -151,6 +187,7 @@ impl Genesis {
             validator_set,
             peer_addrs,
             allocations,
+            petals,
             genesis_hash,
         })
     }
@@ -170,6 +207,11 @@ impl Genesis {
     /// // EpochZero is implicit at genesis: the linear cap is consumed by
     /// // this genesis pipeline, not by an on-chain wasm call.
     pub fn apply_to_state(&self, state: &mut State) {
+        for (path, wasm) in &self.petals {
+            let hash = state.insert_code(wasm);
+            state.set_vfs_binding(path.clone(), hash);
+        }
+
         let coin_type = type_tag_coin_loom();
 
         for (idx, (addr, amount)) in self.allocations.iter().enumerate() {
@@ -396,6 +438,7 @@ mod tests {
             validator_set,
             peer_addrs: vec![],
             allocations: allocs,
+            petals: vec![],
             genesis_hash,
         }
     }

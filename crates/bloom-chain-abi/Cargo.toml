@@ -10,7 +10,6 @@ name = "bloom_chain_abi"
 
 [dependencies]
 blake3 = { version = "1", default-features = false }
-bloom-chain-abi-macros = { workspace = true }
 
 [features]
 default = ["std"]

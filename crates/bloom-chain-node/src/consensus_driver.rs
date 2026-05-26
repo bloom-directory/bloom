@@ -81,9 +81,8 @@ pub struct ExecOutput {
 pub trait PetalExecutor: Send + Sync + 'static {
     /// Execute a single transaction.
     ///
-    /// `parent_hash` is the committing block's parent block hash; it is
-    /// surfaced inside the chain VM as `chain::block.prevhash`. At height 1
-    /// it is the all-zero hash (genesis parent). See review 2026-05-19 #13.
+    /// `parent_hash` is the committing block's parent block hash. At height 1
+    /// it is the all-zero hash (genesis parent).
     fn execute_tx(
         &self,
         tx: &Tx,
@@ -410,8 +409,7 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
     let proposer = block.header.proposer;
     let height = block.header.height;
     let timestamp_ms = block.header.timestamp_ms;
-    // Parent block hash — surfaced to chain-mode petals as
-    // `chain::block.prevhash` (review 2026-05-19 #13).
+    // Parent block hash for execution metadata.
     let parent_hash = block.header.parent_hash;
 
     let mut total_fuel_used: u64 = 0;
@@ -552,9 +550,7 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
         // 3. Max-fee reservation (non-PTB txs).
         let max_fee = tx.max_fuel as u128 * tx.fee_per_unit as u128;
         let value = match &tx.kind {
-            TxKind::Call { value_loom, .. } => *value_loom,
             TxKind::Transfer { amount_loom, .. } => *amount_loom,
-            TxKind::Deploy { .. } => 0,
             // Handled in the SubmitPtb early-continue branch above.
             TxKind::SubmitPtb { .. } => unreachable!(),
         };

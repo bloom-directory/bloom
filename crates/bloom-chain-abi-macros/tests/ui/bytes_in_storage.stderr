@@ -1,5 +1,0 @@
-error: `bytes` storage fields are deferred to v1
- --> tests/ui/bytes_in_storage.rs:8:13
-  |
-8 |             blob: bytes;
-  |             ^^^^

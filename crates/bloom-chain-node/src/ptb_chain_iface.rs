@@ -30,7 +30,7 @@
 //! [`load_object`] reads from the in-memory `objects` map maintained on
 //! [`bloom_chain_state::State`] (spec §16.3 Phase 1; no merkleisation
 //! yet). [`resolve_path`] consults `State::vfs_lookup`, populated by
-//! `TxKind::Deploy` after a successful manifest decode.
+//! a successful PTB publish path.
 //!
 //! [`load_object`]: ChainStateIface::load_object
 //! [`load_manifest`]: ChainStateIface::load_manifest

@@ -212,10 +212,9 @@ pub struct State {
     /// VFS path → petal content hash bindings (spec §7.2 path/hash
     /// pinning, §11.1 module_path).
     ///
-    /// Populated by `TxKind::Deploy` (which decodes the wasm's
+    /// Populated by genesis and petal-publishing flows that decode the wasm's
     /// `bloom_petal_manifest_v0` custom section to read the declared
-    /// `module_path`) and by genesis (for built-in petals seeded at
-    /// chain-init time).
+    /// `module_path`.
     ///
     /// **Phase 1 caveat:** this is a derived in-memory index, **not**
     /// committed into `state_root`. Two honest replays from the same
@@ -377,10 +376,9 @@ impl State {
 
     /// Bind `path` to `hash`. Replaces any prior binding for the path.
     ///
-    /// Called by `TxKind::Deploy` (after decoding the wasm's manifest
-    /// custom section) and by genesis (for the well-known LOOM
-    /// fungible petal). Not state-root-committed — see the `vfs` field
-    /// docs.
+    /// Called by genesis and petal-publishing flows after decoding the wasm's
+    /// manifest custom section. Not state-root-committed — see the `vfs`
+    /// field docs.
     pub fn set_vfs_binding(&mut self, path: String, hash: Hash32) {
         if path.is_empty() {
             return;
@@ -616,11 +614,10 @@ impl Default for State {
 /// Writes accumulate in the embedded `WriteSet`.  Call `commit()` to extract
 /// them for `State::apply`, or `revert()` to discard.
 ///
-/// `Clone` is provided so callers (e.g. the chain VM's nested `petal.call`
-/// path) can checkpoint a snapshot before handing it to a sub-call and roll
-/// back to the unmodified copy if the sub-call reverts or traps. The base
-/// `State` and `WriteSet` are both deeply cloned; this is acceptable for v0
-/// because per-call WriteSets are small.
+/// `Clone` is provided so callers can checkpoint a snapshot before speculative
+/// execution and roll back to the unmodified copy if the work reverts or traps.
+/// The base `State` and `WriteSet` are both deeply cloned; this is acceptable
+/// for v0 because per-call WriteSets are small.
 #[derive(Clone)]
 pub struct StateSnapshot {
     generation: u64,

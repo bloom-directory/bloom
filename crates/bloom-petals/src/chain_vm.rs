@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use wasmtime::{Caller, Config, Engine, Linker, Module, OptLevel, Store};
 
-use bloom_chain_state::{Account, StateSnapshot};
+use bloom_chain_state::StateSnapshot;
 use bloom_chain_types::{
     Address, Hash32,
     digest::{blake3_tagged, tags},
@@ -102,9 +102,8 @@ pub struct ChainStoreData {
     /// loom deltas, …) shared between the wasm host imports installed by
     /// `link_new_host_imports` and the surrounding `PtbExecutor`.
     ///
-    /// `None` for the legacy `TxKind::Transfer` / `TxKind::Call` paths
-    /// — those code paths never call any of the §16.2 imports, so the
-    /// imports will see `None` and respond with `HostError::Backend`.
+    /// `None` is only used by low-level tests that exercise the linker without a
+    /// surrounding PTB executor.
     pub ptb_ctx: Option<Arc<Mutex<PtbHostCtx>>>,
 }
 
@@ -114,17 +113,7 @@ pub struct ChainStoreData {
 
 /// Which exported function the chain VM should invoke.
 pub enum ChainEntry {
-    /// Legacy v0 deploy-time `init` export.
-    Init,
-    /// Legacy v0 `call` export (used by the legacy
-    /// `TxKind::Call` / `TxKind::Deploy` paths).
-    Call,
-    /// PTB-mode Move command: invoke the export with the given name.
-    ///
-    /// Bloom-native petals (spec §16.2) export one function per
-    /// `#[bloom::petal]` function decl, named `__petal_<fn_name>`.
-    /// PTB-mode dispatch routes `MoveCmd::function = "name"` into this
-    /// variant after prefixing the export name.
+    /// Invoke the Bloom-native PTB export with the given name.
     Function(String),
 }
 
@@ -140,11 +129,8 @@ pub struct ChainCallInput {
     pub snapshot: StateSnapshot,
     /// Optional per-PTB host context (spec §16.2).
     ///
-    /// `Some` for PTB-mode dispatch (driven by `ChainPetalRunner` in
-    /// `bloom-chain-node`). `None` for the legacy `TxKind::Transfer` /
-    /// `TxKind::Call` paths — those construct `ChainStoreData` with
-    /// `ptb_ctx: None` and the §16.2 imports return `HostError::Backend`
-    /// when called.
+    /// Production dispatch always supplies `Some(...)`. Tests may pass `None` to
+    /// verify host-import error handling.
     pub ptb_ctx: Option<Arc<Mutex<PtbHostCtx>>>,
 }
 
@@ -206,19 +192,15 @@ fn chain_engine() -> Result<&'static Engine, PetalError> {
 
 /// Allow-list of import modules a chain-mode petal may declare.
 ///
-/// `"chain"` is the legacy v0 surface. The five new modules
-/// (`object`, `cap`, `signer`, `ptb`, `log`) are the spec §16.2
-/// Bloom-native surface — they are accepted at validate-time so that
-/// Phase 2 petals load, but every imported symbol in those modules is
-/// installed as a `NotYetActivated` trap stub in Phase 1.
+/// `"chain"` is retained only for the PTB calldata/return/revert shim used by
+/// the resource runtime. The other modules are the Bloom-native PTB surface.
 const CHAIN_ALLOWED_IMPORT_MODULES: &[&str] = &["chain", "object", "cap", "signer", "ptb", "log"];
 
-/// Validate a wasm binary for deploy-time admission as a chain-mode petal.
+/// Validate a wasm binary for chain-mode admission.
 ///
 /// Rejects:
 /// - Any import whose module is not in `CHAIN_ALLOWED_IMPORT_MODULES`.
-/// - Any function export whose name is not in `{"init", "call"}` and
-///   does not match the PTB petal export naming convention
+/// - Any function export whose name does not match the PTB petal export naming convention
 ///   (`__petal_*`, `__inv_*`, `__alloc`, `__dealloc`,
 ///   `__bloom_manifest_*`).
 /// - A `memory` export with min pages > 256 or max pages > 256 (16 MiB cap).
@@ -230,9 +212,7 @@ const CHAIN_ALLOWED_IMPORT_MODULES: &[&str] = &["chain", "object", "cap", "signe
 ///
 /// PTB-mode petals (spec §16.2) emit one `__petal_<fn>` export per
 /// public function and `__inv_<n>` exports for attached invariants;
-/// both naming patterns are permitted to keep the legacy
-/// `TxKind::Deploy` admission path forward-compatible with bloom-native
-/// petals.
+/// both naming patterns are permitted.
 /// Whether `name` matches one of the PTB-mode petal export naming
 /// conventions emitted by `bloom-resource-macros` (spec §16.2).
 fn is_ptb_petal_export(name: &str) -> bool {
@@ -264,7 +244,6 @@ pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
                 for export in reader {
                     let export = export.map_err(|e| PetalError::InvalidWasm(e.to_string()))?;
                     match (export.kind, export.name) {
-                        (ExternalKind::Func, "init") | (ExternalKind::Func, "call") => {}
                         (ExternalKind::Func, other) if !is_ptb_petal_export(other) => {
                             return Err(PetalError::InvalidWasm(format!(
                                 "chain petal exports disallowed function '{other}'"
@@ -298,32 +277,6 @@ pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
         }
     }
     Ok(())
-}
-
-/// Whether `bytes` exports a *function* named `name`.
-///
-/// Used by the `TxKind::Deploy` apply path to decide whether to invoke the
-/// deploy-time `init` entry point. PTB-mode petals emitted by
-/// `bloom-resource-macros` (spec §16.2) have no `init`/`call` exports — only
-/// `__petal_*` shims — and create all of their state lazily through PTB
-/// `Move` commands, so deploying one is a pure code+VFS staging step with no
-/// initializer to run. Without this check the deploy path would
-/// unconditionally `get_typed_func("init")` and trap with
-/// `failed to find function export 'init'`.
-pub fn wasm_exports_function(bytes: &[u8], name: &str) -> bool {
-    use wasmparser::{ExternalKind, Parser, Payload};
-
-    for payload in Parser::new(0).parse_all(bytes) {
-        let Ok(Payload::ExportSection(reader)) = payload else {
-            continue;
-        };
-        for export in reader.into_iter().flatten() {
-            if export.kind == ExternalKind::Func && export.name == name {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 // ---------------------------------------------------------------------------
@@ -399,145 +352,6 @@ fn consume_fuel(caller: &mut Caller<'_, ChainStoreData>, amount: u64) -> Result<
 // ---------------------------------------------------------------------------
 
 pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<()> {
-    // -----------------------------------------------------------------------
-    // chain.state.read(key_ptr, key_len, out_ptr) -> i64
-    // -----------------------------------------------------------------------
-    linker.func_wrap(
-        "chain",
-        "state.read",
-        |mut caller: Caller<'_, ChainStoreData>, key_ptr: i32, key_len: i32, out_ptr: i32| -> i64 {
-            if consume_fuel(&mut caller, 100).is_err() {
-                return HostError::Backend("out of fuel".into()).as_wasm_code() as i64;
-            }
-            let mem = match get_chain_memory(&mut caller) {
-                Some(m) => m,
-                None => return HostError::Invalid("no memory".into()).as_wasm_code() as i64,
-            };
-            let key_bytes = match read_chain_bytes(&mem, &mut caller, key_ptr, key_len) {
-                Ok(b) => b,
-                Err(c) => return c as i64,
-            };
-            if key_bytes.len() != 32 {
-                return HostError::Invalid("key must be 32 bytes".into()).as_wasm_code() as i64;
-            }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&key_bytes);
-
-            let addr = caller.data().chain_ctx.contract_address;
-            let value = caller.data().chain_ctx.snapshot.storage_read(&addr, &key);
-
-            // Write 32 bytes to out_ptr (zeros if slot is missing).
-            if let Err(c) = write_chain_bytes(&mem, &mut caller, out_ptr, &value) {
-                return c as i64;
-            }
-            32
-        },
-    )?;
-
-    // -----------------------------------------------------------------------
-    // chain.state.write(key_ptr, key_len, val_ptr, val_len) -> i32
-    // -----------------------------------------------------------------------
-    linker.func_wrap(
-        "chain",
-        "state.write",
-        |mut caller: Caller<'_, ChainStoreData>,
-         key_ptr: i32,
-         key_len: i32,
-         val_ptr: i32,
-         val_len: i32|
-         -> i32 {
-            let mem = match get_chain_memory(&mut caller) {
-                Some(m) => m,
-                None => return HostError::Invalid("no memory".into()).as_wasm_code(),
-            };
-            let key_bytes = match read_chain_bytes(&mem, &mut caller, key_ptr, key_len) {
-                Ok(b) => b,
-                Err(c) => return c,
-            };
-            if key_bytes.len() != 32 {
-                return HostError::Invalid("key must be 32 bytes".into()).as_wasm_code();
-            }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&key_bytes);
-
-            if !(0..=32).contains(&val_len) {
-                return HostError::Invalid("val_len must be 0..=32".into()).as_wasm_code();
-            }
-            let val_bytes = match read_chain_bytes(&mem, &mut caller, val_ptr, val_len) {
-                Ok(b) => b,
-                Err(c) => return c,
-            };
-
-            // Left-pad with zeros to 32 bytes.
-            let mut value = [0u8; 32];
-            let offset = 32 - val_bytes.len();
-            value[offset..].copy_from_slice(&val_bytes);
-
-            // Determine new vs. existing slot for fuel pricing.
-            let addr = caller.data().chain_ctx.contract_address;
-            let existing = caller.data().chain_ctx.snapshot.storage_read(&addr, &key);
-            let is_new = existing == [0u8; 32];
-            let fuel = if is_new { 5000 } else { 1500 };
-
-            if consume_fuel(&mut caller, fuel).is_err() {
-                return HostError::Backend("out of fuel".into()).as_wasm_code();
-            }
-
-            caller
-                .data_mut()
-                .chain_ctx
-                .snapshot
-                .storage_write(addr, key, value);
-            0
-        },
-    )?;
-
-    // -----------------------------------------------------------------------
-    // chain.state.delete(key_ptr, key_len) -> i32
-    // -----------------------------------------------------------------------
-    linker.func_wrap(
-        "chain",
-        "state.delete",
-        |mut caller: Caller<'_, ChainStoreData>, key_ptr: i32, key_len: i32| -> i32 {
-            if consume_fuel(&mut caller, 500).is_err() {
-                return HostError::Backend("out of fuel".into()).as_wasm_code();
-            }
-            let mem = match get_chain_memory(&mut caller) {
-                Some(m) => m,
-                None => return HostError::Invalid("no memory".into()).as_wasm_code(),
-            };
-            let key_bytes = match read_chain_bytes(&mem, &mut caller, key_ptr, key_len) {
-                Ok(b) => b,
-                Err(c) => return c,
-            };
-            if key_bytes.len() != 32 {
-                return HostError::Invalid("key must be 32 bytes".into()).as_wasm_code();
-            }
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&key_bytes);
-
-            let addr = caller.data().chain_ctx.contract_address;
-            caller
-                .data_mut()
-                .chain_ctx
-                .snapshot
-                .storage_delete(addr, key);
-            0
-        },
-    )?;
-
-    // -----------------------------------------------------------------------
-    // chain.petal.return(data_ptr, data_len)
-    //
-    // Stores return data then raises a wasmtime trap. The dispatch loop
-    // detects `return_data.is_some()` in the `ChainStoreData` and treats
-    // the trap as a clean successful exit, discarding the trap error.
-    //
-    // We raise the trap by returning `Err(...)` from the `func_wrap` closure
-    // (wasmtime propagates this as a wasm trap). This is reliable in both
-    // sync and async modes — unlike `set_fuel(0)` which only fires at
-    // safepoints.
-    // -----------------------------------------------------------------------
     linker.func_wrap(
         "chain",
         "petal.return",
@@ -558,9 +372,6 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
         },
     )?;
 
-    // -----------------------------------------------------------------------
-    // chain.petal.revert(reason_ptr, reason_len)
-    // -----------------------------------------------------------------------
     linker.func_wrap(
         "chain",
         "petal.revert",
@@ -582,328 +393,6 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
         },
     )?;
 
-    // -----------------------------------------------------------------------
-    // chain.petal.call(target_ptr, target_len, cd_ptr, cd_len,
-    //                  value_lo, value_hi, retdata_ptr, retdata_max) -> i64
-    // -----------------------------------------------------------------------
-    linker.func_wrap(
-        "chain",
-        "petal.call",
-        |mut caller: Caller<'_, ChainStoreData>,
-         target_ptr: i32,
-         target_len: i32,
-         cd_ptr: i32,
-         cd_len: i32,
-         value_lo: i64,
-         value_hi: i64,
-         retdata_ptr: i32,
-         retdata_max: i32|
-         -> i64 {
-            // Depth check (spec §7.6: max 16 nested calls).
-            if caller.data().chain_ctx.call_depth >= 16 {
-                return HostError::Backend("call depth exceeded".into()).as_wasm_code() as i64;
-            }
-
-            let mem = match get_chain_memory(&mut caller) {
-                Some(m) => m,
-                None => return HostError::Invalid("no memory".into()).as_wasm_code() as i64,
-            };
-
-            let target_bytes = match read_chain_bytes(&mem, &mut caller, target_ptr, target_len) {
-                Ok(b) => b,
-                Err(c) => return c as i64,
-            };
-            if target_bytes.len() != 32 {
-                return HostError::Invalid("target must be 32 bytes".into()).as_wasm_code() as i64;
-            }
-            let mut target_arr = [0u8; 32];
-            target_arr.copy_from_slice(&target_bytes);
-            let target = Address(target_arr);
-
-            let calldata = match read_chain_bytes(&mem, &mut caller, cd_ptr, cd_len) {
-                Ok(b) => b,
-                Err(c) => return c as i64,
-            };
-
-            let value_loom =
-                ((value_hi as u128) << 64) | (value_lo as u128 & 0xFFFF_FFFF_FFFF_FFFF);
-
-            // Fuel pre-charge (5000 per call; callee fuel added after).
-            if consume_fuel(&mut caller, 5000).is_err() {
-                return HostError::Backend("out of fuel".into()).as_wasm_code() as i64;
-            }
-
-            // Get code for target contract.
-            let code_hash = {
-                match caller.data().chain_ctx.snapshot.get_account(&target) {
-                    Some(acct) => match acct.code_hash {
-                        Some(h) => h,
-                        None => {
-                            return HostError::NotFound("target has no code".into()).as_wasm_code()
-                                as i64;
-                        }
-                    },
-                    None => {
-                        return HostError::NotFound("target account not found".into()).as_wasm_code()
-                            as i64;
-                    }
-                }
-            };
-
-            // We need the wasm bytes — but snapshot.get_code only has a reference tied
-            // to the snapshot borrow. We clone to avoid the borrow-check issue.
-            let wasm_bytes: Vec<u8> = match caller.data().chain_ctx.snapshot.get_code(&code_hash) {
-                Some(bytes) => bytes.to_vec(),
-                None => return HostError::NotFound("code not found".into()).as_wasm_code() as i64,
-            };
-
-            // Checkpoint-then-restore for nested-call revert isolation
-            // (review 2026-05-19 #6).
-            //
-            // We clone the parent's snapshot BEFORE the value transfer
-            // so that on revert/trap we can restore exactly the parent's
-            // pre-call view — including rolling back the value transfer.
-            // The clone is taken here (and not after the value transfer)
-            // because a reverted child must not retain the LOOM credit;
-            // the parent must end up with its pre-call balance.
-            //
-            // StateSnapshot is `Clone`; the per-call WriteSet is small.
-            let parent_snapshot_checkpoint = caller.data().chain_ctx.snapshot.clone();
-
-            // LOOM transfer (caller → target) before executing.
-            if value_loom > 0 {
-                let caller_addr = caller.data().chain_ctx.contract_address;
-                let caller_acct = caller.data().chain_ctx.snapshot.get_account(&caller_addr);
-                let caller_loom = caller_acct.map(|a| a.loom).unwrap_or(0);
-                if caller_loom < value_loom {
-                    return HostError::Backend("insufficient balance".into()).as_wasm_code() as i64;
-                }
-                // Debit caller.
-                let mut ca = caller
-                    .data()
-                    .chain_ctx
-                    .snapshot
-                    .get_account(&caller_addr)
-                    .unwrap_or_else(Account::empty);
-                ca.loom -= value_loom;
-                caller
-                    .data_mut()
-                    .chain_ctx
-                    .snapshot
-                    .set_account(caller_addr, ca);
-                // Credit target.
-                let mut ta = caller
-                    .data()
-                    .chain_ctx
-                    .snapshot
-                    .get_account(&target)
-                    .unwrap_or_else(Account::empty);
-                ta.loom += value_loom;
-                caller.data_mut().chain_ctx.snapshot.set_account(target, ta);
-            }
-
-            // Build sub-input. We must take a nested snapshot from the same state.
-            // The caller's snapshot accumulates the writes; we pass it by moving it
-            // into the callee via a sub-snapshot derived from its current state.
-            //
-            // Implementation: extract the snapshot from caller, pass it to a sync
-            // recursive call, then restore it afterwards.
-            let depth = caller.data().chain_ctx.call_depth;
-            let block = caller.data().chain_ctx.block.clone();
-            let msg_sender = caller.data().chain_ctx.contract_address;
-            let fuel_remaining = caller.get_fuel().unwrap_or(0);
-
-            // Take ownership of the snapshot to pass to the callee.
-            // We swap it out with a dummy, run the callee, then swap back
-            // with the (mutated) snapshot from the callee output on
-            // success, or with the checkpoint on error.
-            let snap = {
-                let dummy = bloom_chain_state::State::new().snapshot();
-                std::mem::replace(&mut caller.data_mut().chain_ctx.snapshot, dummy)
-            };
-
-            let sub_input = ChainCallInput {
-                wasm: wasm_bytes,
-                entry: ChainEntry::Call,
-                contract_address: target,
-                msg_sender,
-                msg_value: value_loom,
-                calldata,
-                block,
-                fuel: fuel_remaining,
-                snapshot: snap,
-                ptb_ctx: None,
-            };
-
-            let engine = match chain_engine() {
-                Ok(e) => e,
-                Err(_) => {
-                    // Restore parent's pre-call view (value transfer reverts too).
-                    caller.data_mut().chain_ctx.snapshot = parent_snapshot_checkpoint;
-                    return HostError::Backend("engine error".into()).as_wasm_code() as i64;
-                }
-            };
-
-            let sub_result = dispatch_chain_call_sync(engine, sub_input, depth + 1);
-
-            match sub_result {
-                Ok(out) => {
-                    // Success: keep the callee's mutated snapshot — the
-                    // callee's writes (and the pre-call value transfer)
-                    // are now part of the parent's view.
-                    caller.data_mut().chain_ctx.snapshot = out.snapshot;
-                    // Append callee logs.
-                    caller.data_mut().chain_ctx.logs.extend(out.logs);
-
-                    // Charge callee's fuel usage.
-                    let _ = consume_fuel(&mut caller, out.fuel_used);
-
-                    // Write return data.
-                    if let Some(retdata) = out.return_data {
-                        let need = retdata.len();
-                        if retdata_max < 0 || need > retdata_max as usize {
-                            // Overflow: return data too large.
-                            return -((need as i64).saturating_add(PetalVm::OVERFLOW_BIAS as i64));
-                        }
-                        if write_chain_bytes(
-                            &get_chain_memory(&mut caller).unwrap(),
-                            &mut caller,
-                            retdata_ptr,
-                            &retdata,
-                        )
-                        .is_err()
-                        {
-                            return HostError::Invalid("retdata write failed".into()).as_wasm_code()
-                                as i64;
-                        }
-                        need as i64
-                    } else {
-                        0
-                    }
-                }
-                Err(e) => {
-                    // Sub-call failed — discard the callee's (mutated)
-                    // snapshot and restore the parent's pre-call
-                    // checkpoint. This rolls back ALL child writes,
-                    // including the value transfer and any storage
-                    // mutations the child performed before reverting.
-                    // Critically, this holds even if the parent ignores
-                    // the negative return code and continues executing.
-                    caller.data_mut().chain_ctx.snapshot = parent_snapshot_checkpoint;
-                    match e {
-                        SubCallError::Reverted {
-                            reason, fuel_used, ..
-                        } => {
-                            // DoS-hardening 2026-05-19: even though the
-                            // child reverted (and its writes are rolled
-                            // back), the parent's fuel meter MUST be
-                            // debited by what the child actually burned.
-                            // Otherwise burn-then-revert is free.
-                            let _ = consume_fuel(&mut caller, fuel_used);
-                            // Surface the sub-call's revert reason so
-                            // callers can inspect it.
-                            caller.data_mut().chain_ctx.return_data = reason;
-                            HostError::Backend("callee reverted".into()).as_wasm_code() as i64
-                        }
-                        SubCallError::Trapped { fuel_used, .. } => {
-                            // Same hardening for traps: a trapped child
-                            // burned real work and the parent pays for it.
-                            let _ = consume_fuel(&mut caller, fuel_used);
-                            HostError::Backend("callee trapped".into()).as_wasm_code() as i64
-                        }
-                    }
-                }
-            }
-        },
-    )?;
-
-    // -----------------------------------------------------------------------
-    // chain.block.number() -> i64
-    // -----------------------------------------------------------------------
-    linker.func_wrap(
-        "chain",
-        "block.number",
-        |caller: Caller<'_, ChainStoreData>| -> i64 { caller.data().chain_ctx.block.number as i64 },
-    )?;
-
-    // -----------------------------------------------------------------------
-    // chain.block.timestamp() -> i64
-    // -----------------------------------------------------------------------
-    linker.func_wrap(
-        "chain",
-        "block.timestamp",
-        |caller: Caller<'_, ChainStoreData>| -> i64 {
-            caller.data().chain_ctx.block.timestamp_ms as i64
-        },
-    )?;
-
-    // -----------------------------------------------------------------------
-    // chain.block.prevhash(out_ptr: i32)
-    // -----------------------------------------------------------------------
-    linker.func_wrap(
-        "chain",
-        "block.prevhash",
-        |mut caller: Caller<'_, ChainStoreData>, out_ptr: i32| {
-            let prevhash = caller.data().chain_ctx.block.prevhash.0;
-            let mem = match get_chain_memory(&mut caller) {
-                Some(m) => m,
-                None => return,
-            };
-            let _ = write_chain_bytes(&mem, &mut caller, out_ptr, &prevhash);
-        },
-    )?;
-
-    // -----------------------------------------------------------------------
-    // chain.msg.sender(out_ptr: i32)
-    // -----------------------------------------------------------------------
-    linker.func_wrap(
-        "chain",
-        "msg.sender",
-        |mut caller: Caller<'_, ChainStoreData>, out_ptr: i32| {
-            let sender = caller.data().chain_ctx.msg_sender.0;
-            let mem = match get_chain_memory(&mut caller) {
-                Some(m) => m,
-                None => return,
-            };
-            let _ = write_chain_bytes(&mem, &mut caller, out_ptr, &sender);
-        },
-    )?;
-
-    // -----------------------------------------------------------------------
-    // chain.msg.value(out_ptr: i32) — writes the 16-byte little-endian u128 value.
-    //
-    // Multi-value wasm returns aren't part of the default C ABI on
-    // wasm32-unknown-unknown, so we follow the same write-to-pointer convention
-    // used by msg.sender / block.prevhash to stay compatible across compilers.
-    // -----------------------------------------------------------------------
-    linker.func_wrap(
-        "chain",
-        "msg.value",
-        |mut caller: Caller<'_, ChainStoreData>, out_ptr: i32| {
-            let v = caller.data().chain_ctx.msg_value;
-            let bytes = v.to_le_bytes();
-            let mem = match get_chain_memory(&mut caller) {
-                Some(m) => m,
-                None => return,
-            };
-            let _ = write_chain_bytes(&mem, &mut caller, out_ptr, &bytes);
-        },
-    )?;
-
-    // -----------------------------------------------------------------------
-    // chain.msg.calldata.len() -> i32
-    // -----------------------------------------------------------------------
-    linker.func_wrap(
-        "chain",
-        "msg.calldata.len",
-        |caller: Caller<'_, ChainStoreData>| -> i32 {
-            caller.data().chain_ctx.calldata.len() as i32
-        },
-    )?;
-
-    // -----------------------------------------------------------------------
-    // chain.msg.calldata.read(dst_ptr, offset, len) -> i32
-    // -----------------------------------------------------------------------
     linker.func_wrap(
         "chain",
         "msg.calldata.read",
@@ -929,351 +418,6 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
         },
     )?;
 
-    // -----------------------------------------------------------------------
-    // chain.log.emit(topic_ptr, topic_count, data_ptr, data_len) -> i32
-    // Fuel: 100 + 8*data_len + 100*topic_count
-    // -----------------------------------------------------------------------
-    linker.func_wrap(
-        "chain",
-        "log.emit",
-        |mut caller: Caller<'_, ChainStoreData>,
-         topic_ptr: i32,
-         topic_count: i32,
-         data_ptr: i32,
-         data_len: i32|
-         -> i32 {
-            if topic_count < 0 || data_len < 0 {
-                return HostError::Invalid("negative topic_count or data_len".into())
-                    .as_wasm_code();
-            }
-            let fuel = 100u64 + 8u64 * data_len as u64 + 100u64 * topic_count as u64;
-            if consume_fuel(&mut caller, fuel).is_err() {
-                return HostError::Backend("out of fuel".into()).as_wasm_code();
-            }
-
-            let mem = match get_chain_memory(&mut caller) {
-                Some(m) => m,
-                None => return HostError::Invalid("no memory".into()).as_wasm_code(),
-            };
-
-            // Read topics: topic_count * 32 bytes.
-            let topics_len = (topic_count as usize) * 32;
-            let topics_raw = match read_chain_bytes(&mem, &mut caller, topic_ptr, topics_len as i32)
-            {
-                Ok(b) => b,
-                Err(c) => return c,
-            };
-            let topics: Vec<Hash32> = topics_raw
-                .chunks_exact(32)
-                .map(|chunk| {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(chunk);
-                    Hash32(arr)
-                })
-                .collect();
-
-            let data = match read_chain_bytes(&mem, &mut caller, data_ptr, data_len) {
-                Ok(b) => b,
-                Err(c) => return c,
-            };
-
-            let address = caller.data().chain_ctx.contract_address;
-            caller.data_mut().chain_ctx.logs.push(LogEntry {
-                address,
-                topics,
-                data,
-            });
-            0
-        },
-    )?;
-
-    // -----------------------------------------------------------------------
-    // chain.crypto.blake3(in_ptr, in_len, out_ptr) -> i32
-    // Fuel: 50 + 4*in_len
-    // -----------------------------------------------------------------------
-    linker.func_wrap(
-        "chain",
-        "crypto.blake3",
-        |mut caller: Caller<'_, ChainStoreData>, in_ptr: i32, in_len: i32, out_ptr: i32| -> i32 {
-            if in_len < 0 {
-                return HostError::Invalid("negative in_len".into()).as_wasm_code();
-            }
-            let fuel = 50u64 + 4u64 * in_len as u64;
-            if consume_fuel(&mut caller, fuel).is_err() {
-                return HostError::Backend("out of fuel".into()).as_wasm_code();
-            }
-
-            let mem = match get_chain_memory(&mut caller) {
-                Some(m) => m,
-                None => return HostError::Invalid("no memory".into()).as_wasm_code(),
-            };
-            let input = match read_chain_bytes(&mem, &mut caller, in_ptr, in_len) {
-                Ok(b) => b,
-                Err(c) => return c,
-            };
-
-            // Raw (untagged) BLAKE3 for the crypto import — it is a general
-            // hash utility. The spec §7.6 says "deterministic; no state" and
-            // does not mandate a domain tag for this primitive.
-            let hash = *blake3::hash(&input).as_bytes();
-            match write_chain_bytes(&mem, &mut caller, out_ptr, &hash) {
-                Ok(()) => 32,
-                Err(c) => c,
-            }
-        },
-    )?;
-
-    // -----------------------------------------------------------------------
-    // chain.code.manifest_hash(addr_ptr, out_ptr) -> i32
-    //
-    // Writes a 33-byte answer at `out_ptr`:
-    //   byte 0: 0 = no anchor, 1 = anchor present
-    //   bytes 1..33: the 32-byte manifest hash (zeroed when byte 0 is 0)
-    //
-    // Returns 0 on success or a HostError code on failure. The query is
-    // safe for non-existent addresses — those return present=0 with a
-    // zero hash, matching the `Account::manifest_hash == None` view.
-    // (bloom-rust-contracts Phase 8 — on-chain manifest anchor read.)
-    // Fuel: 200
-    // -----------------------------------------------------------------------
-    linker.func_wrap(
-        "chain",
-        "code.manifest_hash",
-        |mut caller: Caller<'_, ChainStoreData>, addr_ptr: i32, out_ptr: i32| -> i32 {
-            if consume_fuel(&mut caller, 200).is_err() {
-                return HostError::Backend("out of fuel".into()).as_wasm_code();
-            }
-
-            let mem = match get_chain_memory(&mut caller) {
-                Some(m) => m,
-                None => return HostError::Invalid("no memory".into()).as_wasm_code(),
-            };
-
-            let addr_bytes = match read_chain_bytes(&mem, &mut caller, addr_ptr, 32) {
-                Ok(b) => b,
-                Err(c) => return c,
-            };
-            let mut addr_arr = [0u8; 32];
-            addr_arr.copy_from_slice(&addr_bytes);
-            let target = Address(addr_arr);
-
-            let mut out = [0u8; 33];
-            if let Some(acct) = caller.data().chain_ctx.snapshot.get_account(&target)
-                && let Some(h) = acct.manifest_hash
-            {
-                out[0] = 1;
-                out[1..33].copy_from_slice(&h.0);
-            }
-
-            match write_chain_bytes(&mem, &mut caller, out_ptr, &out) {
-                Ok(()) => 0,
-                Err(c) => c,
-            }
-        },
-    )?;
-
-    // -----------------------------------------------------------------------
-    // chain.host.deploy(hash_ptr, hash_len, salt_ptr, salt_len,
-    //                   init_ptr, init_len, out_addr_ptr) -> i64
-    // Fuel: 10000 + init's used fuel
-    // -----------------------------------------------------------------------
-    linker.func_wrap(
-        "chain",
-        "host.deploy",
-        |mut caller: Caller<'_, ChainStoreData>,
-         hash_ptr: i32,
-         hash_len: i32,
-         salt_ptr: i32,
-         salt_len: i32,
-         init_ptr: i32,
-         init_len: i32,
-         out_addr_ptr: i32|
-         -> i64 {
-            if consume_fuel(&mut caller, 10000).is_err() {
-                return HostError::Backend("out of fuel".into()).as_wasm_code() as i64;
-            }
-
-            let mem = match get_chain_memory(&mut caller) {
-                Some(m) => m,
-                None => return HostError::Invalid("no memory".into()).as_wasm_code() as i64,
-            };
-
-            let hash_bytes = match read_chain_bytes(&mem, &mut caller, hash_ptr, hash_len) {
-                Ok(b) => b,
-                Err(c) => return c as i64,
-            };
-            if hash_bytes.len() != 32 {
-                return HostError::Invalid("petal_hash must be 32 bytes".into()).as_wasm_code()
-                    as i64;
-            }
-            let mut petal_hash_arr = [0u8; 32];
-            petal_hash_arr.copy_from_slice(&hash_bytes);
-            let petal_hash = Hash32(petal_hash_arr);
-
-            let salt_bytes = match read_chain_bytes(&mem, &mut caller, salt_ptr, salt_len) {
-                Ok(b) => b,
-                Err(c) => return c as i64,
-            };
-            if salt_bytes.len() != 32 {
-                return HostError::Invalid("salt must be 32 bytes".into()).as_wasm_code() as i64;
-            }
-
-            let init_calldata = match read_chain_bytes(&mem, &mut caller, init_ptr, init_len) {
-                Ok(b) => b,
-                Err(c) => return c as i64,
-            };
-
-            // Verify petal_hash exists in code store.
-            if caller
-                .data()
-                .chain_ctx
-                .snapshot
-                .get_code(&petal_hash)
-                .is_none()
-            {
-                return HostError::NotFound("petal_hash not in code store".into()).as_wasm_code()
-                    as i64;
-            }
-
-            // Compute deployed address per spec §7.7:
-            // instance_address = blake3("bloom-chain.v0.addr:" || "deploy:" || deployer || ":" || salt || ":" || petal_hash)
-            let deployer = caller.data().chain_ctx.contract_address;
-            let deployed_address = {
-                let mut payload = b"deploy:".to_vec();
-                payload.extend_from_slice(&deployer.0);
-                payload.push(b':');
-                payload.extend_from_slice(&salt_bytes);
-                payload.push(b':');
-                payload.extend_from_slice(&petal_hash.0);
-                let h = blake3_tagged(tags::ADDR, &payload);
-                Address(h.0)
-            };
-
-            // Check for address collision.
-            if caller
-                .data()
-                .chain_ctx
-                .snapshot
-                .get_account(&deployed_address)
-                .is_some_and(|a| a.code_hash.is_some())
-            {
-                return HostError::Backend("address collision: already deployed".into())
-                    .as_wasm_code() as i64;
-            }
-
-            // Checkpoint BEFORE the spawn so a failed init rolls back the
-            // staged account too (review 2026-05-19 #6).
-            let parent_snapshot_checkpoint = caller.data().chain_ctx.snapshot.clone();
-
-            // Spawn the new account with code_hash set. Cross-contract
-            // deploys via `chain.code.deploy` do not carry a manifest
-            // anchor — only top-level `TxKind::Deploy` does.
-            let new_account = Account {
-                nonce: 0,
-                loom: 0,
-                code_hash: Some(petal_hash),
-                storage_root: Hash32([0u8; 32]),
-                manifest_hash: None,
-            };
-            caller
-                .data_mut()
-                .chain_ctx
-                .snapshot
-                .set_account(deployed_address, new_account);
-
-            // Get the wasm bytes for the init call.
-            let wasm_bytes: Vec<u8> = match caller.data().chain_ctx.snapshot.get_code(&petal_hash) {
-                Some(b) => b.to_vec(),
-                None => {
-                    caller.data_mut().chain_ctx.snapshot = parent_snapshot_checkpoint;
-                    return HostError::NotFound("code not found".into()).as_wasm_code() as i64;
-                }
-            };
-
-            let depth = caller.data().chain_ctx.call_depth;
-            let block = caller.data().chain_ctx.block.clone();
-            let fuel_remaining = caller.get_fuel().unwrap_or(0);
-
-            // Move snapshot into the init call.
-            let snap = {
-                let dummy = bloom_chain_state::State::new().snapshot();
-                std::mem::replace(&mut caller.data_mut().chain_ctx.snapshot, dummy)
-            };
-
-            let sub_input = ChainCallInput {
-                wasm: wasm_bytes,
-                entry: ChainEntry::Init,
-                contract_address: deployed_address,
-                msg_sender: deployer,
-                msg_value: 0,
-                calldata: init_calldata,
-                block,
-                fuel: fuel_remaining,
-                snapshot: snap,
-                ptb_ctx: None,
-            };
-
-            let engine = match chain_engine() {
-                Ok(e) => e,
-                Err(_) => {
-                    caller.data_mut().chain_ctx.snapshot = parent_snapshot_checkpoint;
-                    return HostError::Backend("engine error".into()).as_wasm_code() as i64;
-                }
-            };
-
-            match dispatch_chain_call_sync(engine, sub_input, depth + 1) {
-                Ok(out) => {
-                    // Charge init fuel.
-                    let _ = consume_fuel(&mut caller, out.fuel_used);
-                    // Keep the post-init mutated snapshot (account spawn + init writes).
-                    caller.data_mut().chain_ctx.snapshot = out.snapshot;
-                    caller.data_mut().chain_ctx.logs.extend(out.logs);
-
-                    // Write deployed address to out_addr_ptr.
-                    let mem2 = match get_chain_memory(&mut caller) {
-                        Some(m) => m,
-                        None => {
-                            return HostError::Invalid("no memory".into()).as_wasm_code() as i64;
-                        }
-                    };
-                    if let Err(c) =
-                        write_chain_bytes(&mem2, &mut caller, out_addr_ptr, &deployed_address.0)
-                    {
-                        return c as i64;
-                    }
-                    0
-                }
-                Err(e) => {
-                    // Failed init: restore parent's pre-deploy checkpoint —
-                    // this rolls back BOTH the staged account and any init
-                    // writes the child may have done before reverting.
-                    caller.data_mut().chain_ctx.snapshot = parent_snapshot_checkpoint;
-                    // DoS-hardening 2026-05-19: charge the parent for the
-                    // fuel the failed init actually burned. Otherwise a
-                    // deploy whose `init` runs a fuel-bomb and reverts is
-                    // free to the caller.
-                    let fuel_used = match &e {
-                        SubCallError::Reverted { fuel_used, .. } => *fuel_used,
-                        SubCallError::Trapped { fuel_used, .. } => *fuel_used,
-                    };
-                    let _ = consume_fuel(&mut caller, fuel_used);
-                    HostError::Backend("init failed".into()).as_wasm_code() as i64
-                }
-            }
-        },
-    )?;
-
-    // -----------------------------------------------------------------------
-    // Bloom-native contracts (spec §16.2) — real bodies.
-    //
-    // Every import in `bloom_objects::host_imports::NEW_HOST_IMPORTS`
-    // is installed with a real body that charges per-spec §16.4 fuel
-    // and mutates the per-PTB `PtbHostCtx` stored on `ChainStoreData`.
-    // Legacy `TxKind::Transfer` / `TxKind::Call` paths still link them
-    // — but they construct `ChainStoreData { ptb_ctx: None, .. }` so a
-    // legacy petal that mistakenly imports one of these symbols sees
-    // `HostError::Backend` and aborts cleanly.
-    // -----------------------------------------------------------------------
     link_new_host_imports(linker)?;
 
     Ok(())
@@ -1289,10 +433,8 @@ pub fn link_chain_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result
 pub const NOT_YET_ACTIVATED_CODE: i32 = -100;
 
 /// Run a closure with mutable access to the per-PTB host context. If the
-/// store has no PTB context attached (legacy `TxKind::Call` reached a
-/// §16.2 import, which should not happen for validated petals), the
-/// closure is *not* invoked and we return [`HostError::Backend`]'s wasm
-/// code so the petal aborts cleanly.
+/// store has no PTB context attached, the closure is *not* invoked and we
+/// return [`HostError::Backend`]'s wasm code so the petal aborts cleanly.
 ///
 /// Returned `i32` is the host import's wasm-side return value — never
 /// poisoned-panic, never silent success.
@@ -1305,7 +447,7 @@ where
             Ok(mut ctx) => f(&mut ctx),
             Err(_) => HostError::Backend("ptb ctx poisoned".into()).as_wasm_code(),
         },
-        None => HostError::Backend("no ptb ctx (legacy path?)".into()).as_wasm_code(),
+        None => HostError::Backend("no ptb ctx".into()).as_wasm_code(),
     }
 }
 
@@ -2163,10 +1305,9 @@ const CHAIN_MAX_MEMORY_PAGES: usize = 256;
 /// inject entries), but bounding growth keeps memory use predictable.
 const CHAIN_MAX_TABLE_ELEMENTS: usize = 10_000;
 
-/// Per-instance cap on instance/memory/table counts. The chain-mode
-/// dispatcher creates exactly one instance per `dispatch_chain_call_sync`
-/// call and one memory per instance, but nested `petal.call` may create
-/// new stores; the limiter is scoped to a single store, so these are tight.
+/// Per-instance cap on instance/memory/table counts. The chain-mode dispatcher
+/// creates exactly one instance and one memory per `dispatch_chain_call_sync`
+/// call, so these limits are tight.
 const CHAIN_MAX_INSTANCES: usize = 1;
 const CHAIN_MAX_TABLES: usize = 16;
 const CHAIN_MAX_MEMORIES: usize = 1;
@@ -2241,10 +1382,6 @@ fn dispatch_chain_call_sync(
     let store_data = ChainStoreData {
         chain_ctx,
         petal_hash,
-        // PTB-mode dispatch (`ChainPetalRunner`) supplies an
-        // `Arc<Mutex<PtbHostCtx>>` here; legacy `TxKind::Transfer` /
-        // `TxKind::Call` paths pass `None` and the §16.2 host imports
-        // return `HostError::Backend` when called.
         ptb_ctx: input.ptb_ctx,
     };
 
@@ -2292,12 +1429,8 @@ fn dispatch_chain_call_sync(
         }
     };
 
-    let entry_name = match &input.entry {
-        ChainEntry::Init => "init".to_string(),
-        ChainEntry::Call => "call".to_string(),
-        ChainEntry::Function(name) => name.clone(),
-    };
-    let entry_name: &str = &entry_name;
+    let ChainEntry::Function(entry_name) = &input.entry;
+    let entry_name: &str = entry_name;
 
     let func = match instance.get_typed_func::<(i32, i32), i32>(&mut store, entry_name) {
         Ok(f) => f,
@@ -2471,7 +1604,7 @@ mod ptb_host_import_tests {
         let state = State::new();
         let input = ChainCallInput {
             wasm,
-            entry: ChainEntry::Call,
+            entry: ChainEntry::Function("call".into()),
             contract_address: Address([0x01; 32]),
             msg_sender: Address([0x02; 32]),
             msg_value: 0,

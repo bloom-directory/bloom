@@ -17,9 +17,10 @@
 #   3. Build the host-side `bloom` binary (release).
 #   4. Provision per-validator homes via `bloom chain testnet`, wiring peers to
 #      the docker DNS names val0..val3.
-#   5. APPEND a genesis allocation for the inner-PTB Ed25519 signer (the inner
-#      gas-payer) to ALL FOUR home*/chain/genesis.toml files — byte-identical,
-#      or the genesis hash diverges and consensus breaks.
+#   5. Build the DEX petal wasms and append their genesis bindings, plus a
+#      genesis allocation for the inner-PTB Ed25519 signer (the inner
+#      gas-payer), to ALL FOUR home*/chain/genesis.toml files — byte-identical,
+#      or the genesis state diverges and consensus breaks.
 #   6. `docker compose up -d` + wait for all four healthy.
 #   7. Run the petal-dex docker driver test.
 #   8. Always tear the stack down on exit (trap EXIT), capturing per-validator
@@ -60,6 +61,10 @@ export BLOOM_DOCKER_TMPDIR
 log "tmpdir: $BLOOM_DOCKER_TMPDIR"
 
 BLOOM_BIN="$REPO_ROOT/target/release/bloom"
+
+wasm_hex() {
+    od -An -tx1 -v "$1" | tr -d ' \n'
+}
 
 # Teardown runs unconditionally on exit so we don't leak containers or tmpdirs
 # even if the test panics. Capture and re-raise the original exit code.
@@ -114,6 +119,12 @@ if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
     (cd "$REPO_ROOT" && cargo build --release -p bloom)
     [ -x "$BLOOM_BIN" ] || fail "bloom binary missing: $BLOOM_BIN"
 
+    log "building host-side petal DEX wasms for genesis"
+    (cd "$REPO_ROOT" && cargo build --target wasm32-unknown-unknown \
+        -p bloom-petal-dex-pool \
+        -p bloom-petal-dex-wallet \
+        -p bloom-petal-dex-faucet)
+
     peer_hosts="val0,val1,val2,val3"
 
     log "provisioning $BLOOM_VALIDATOR_COUNT-validator testnet under $BLOOM_DOCKER_TMPDIR"
@@ -147,6 +158,29 @@ if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
         [ "$h0" = "$hi" ] || fail "genesis.toml mismatch home0 vs home$i ($h0 != $hi)"
     done
     log "genesis.toml byte-identical across all 4 homes (sha256=$h0)"
+
+    pool_wasm="$REPO_ROOT/target/wasm32-unknown-unknown/debug/bloom_petal_dex_pool.wasm"
+    wallet_wasm="$REPO_ROOT/target/wasm32-unknown-unknown/debug/bloom_petal_dex_wallet.wasm"
+    faucet_wasm="$REPO_ROOT/target/wasm32-unknown-unknown/debug/bloom_petal_dex_faucet.wasm"
+    [ -f "$pool_wasm" ] || fail "missing pool wasm: $pool_wasm"
+    [ -f "$wallet_wasm" ] || fail "missing wallet wasm: $wallet_wasm"
+    [ -f "$faucet_wasm" ] || fail "missing faucet wasm: $faucet_wasm"
+
+    log "appending petal DEX genesis code/bindings to all 4 genesis.toml files"
+    petal_block=$(printf '\n[[petals]]\npath = "/bloom/dex/pool"\nwasm_hex = "%s"\n\n[[petals]]\npath = "/bloom/dex/wallet"\nwasm_hex = "%s"\n\n[[petals]]\npath = "/bloom/dex/faucet"\nwasm_hex = "%s"\n' \
+        "$(wasm_hex "$pool_wasm")" \
+        "$(wasm_hex "$wallet_wasm")" \
+        "$(wasm_hex "$faucet_wasm")")
+    for i in $(seq 0 $((BLOOM_VALIDATOR_COUNT - 1))); do
+        g="$BLOOM_DOCKER_TMPDIR/home$i/chain/genesis.toml"
+        printf '%s' "$petal_block" >>"$g"
+    done
+    h0=$(sha256sum "$BLOOM_DOCKER_TMPDIR/home0/chain/genesis.toml" | awk '{print $1}')
+    for i in 1 2 3; do
+        hi=$(sha256sum "$BLOOM_DOCKER_TMPDIR/home$i/chain/genesis.toml" | awk '{print $1}')
+        [ "$h0" = "$hi" ] || fail "genesis.toml mismatch home0 vs home$i after petals ($h0 != $hi)"
+    done
+    log "genesis.toml remains byte-identical after petal bindings (sha256=$h0)"
 
     log "starting compose stack"
     (cd "$REPO_ROOT" && "${DC[@]}" -f "$COMPOSE_FILE" up -d)

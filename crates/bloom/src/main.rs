@@ -10,7 +10,6 @@
 
 mod commands {
     pub mod chain;
-    pub mod contract;
     pub mod pipe;
 }
 
@@ -27,7 +26,6 @@ use tracing::{debug, info, trace};
 use tracing_subscriber::EnvFilter;
 
 use commands::chain::ChainCmd;
-use commands::contract::ContractCmd;
 
 #[cfg(target_os = "linux")]
 const DEFAULT_MOUNT_PATH: &str = "/bloom";
@@ -82,12 +80,9 @@ enum Cmd {
     Petals(PetalsCmd),
     /// Initialise ~/.bloom with default config + dirs.
     Init,
-    /// Sovereign bloom-chain: init, run-validator, submit, deploy, call, query.
+    /// Sovereign bloom-chain: init, run-validator, submit, query.
     #[command(subcommand)]
     Chain(ChainCmd),
-    /// Build & verify Bloom Rust smart contracts.
-    #[command(subcommand)]
-    Contract(ContractCmd),
     /// Lower a pipe expression into a PTB and stream its receipt (spec §3.5).
     ///
     /// `EXPR` is a pipe expression — linear `A | B | C` (each command's
@@ -510,7 +505,6 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Petals(cmd) => run_petals(home, cmd).await,
         Cmd::Chain(cmd) => commands::chain::run_chain(&home, cmd).await,
-        Cmd::Contract(cmd) => commands::contract::run(cmd),
         Cmd::Pipe {
             expr,
             signers,

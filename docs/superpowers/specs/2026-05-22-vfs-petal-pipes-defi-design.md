@@ -15,7 +15,7 @@ Advance Bloom toward the handoff vision — UNIX-style paths, stdin/stdout, and 
 The deep layers are already implemented and tested on a real chain:
 
 - **PTB = the transaction plan.** `bloom-script`'s `PtbTx{ commands, signers, gas_* }` with `Arg::Use{cmd_idx,ret_idx}` is exactly the handoff's "transaction plan", and `Use` is already a DAG edge, not just linear. Atomicity, snapshot rollback, gas reservation/refund, signature checks, and linearity (no double-spend) are implemented and pass end-to-end (`crates/bloom-chain-node/tests/ptb_submit_e2e.rs`, `ptb_atomicity.rs`, `examples/petal-dex/.../single_hop_swap.rs`).
-- **The petal ABI is already byte-in/byte-out.** `#[bloom::petal]` emits one `__petal_<fn>` export per public fn with a `(args_ptr,args_len,ret_ptr,ret_cap)` buffer ABI. Dispatch is by name, not a 4-byte selector (the selector macro `bloom-contract-macros` is deprecated).
+- **The petal ABI is already byte-in/byte-out.** `#[bloom::petal]` emits one `__petal_<fn>` export per public fn with a `(args_ptr,args_len,ret_ptr,ret_cap)` buffer ABI. Dispatch is by name, not a 4-byte selector.
 - **The VFS path is already in the manifest.** Each petal's signed `bloom_petal_manifest_v0` carries `module_path` (e.g. `/bloom/dex/pool`) plus its `functions`. `ChainStateIface::resolve_path(path) -> Option<Hash32>` already resolves path → petal.
 - **Packets ≈ typed Objects.** `TypeTag::Concrete{type_name,type_args}` already expresses `Token<USDC>`; `Object{id,type_tag,owner,version}` + content-addressed `ObjectId` + the canonical no-float codec + handle-based linearity give the typed/linear packet core.
 
@@ -55,7 +55,7 @@ PtbSession (bloom-ptb-builder)
 | `tx` VFS handler (in `bloom-vfs`) | `/bloom/tx/new`, `/bloom/tx/<id>/{cmd,status,commit,abort}` backed by a `PtbSession`. Pure NFS read/write. | `Handler` trait (`crates/bloom-vfs/src/handler.rs`), `bloom-ptb-builder` |
 | Packet envelope (module in `bloom-objects`) | Canonical typed value crossing the pipe boundary as a **reference within the plan** — not bearer bytes. | `TypeTag`, object canonical codec |
 | Bounded projection / pagination primitive (in `bloom-vfs`) | `ls` returns bounded affordances; collections project as `page/000000`. Added now, lightly exercised by DeFi; Bloombook leans on it later. | `Handler::list` |
-| Generic-dispatch codegen (`bloom-resource-macros` + `bloom-contract-build`) | Generic petal fns emit a **real** `__petal_<fn>` export doing runtime type-erased dispatch (kills the `NotImplemented` shim). | existing `#[bloom::petal]` shim, `TypeTag::Generic`, PTB `TypeArg` |
+| Generic-dispatch codegen (`bloom-resource-macros`) | Generic petal fns emit a **real** `__petal_<fn>` export doing runtime type-erased dispatch (kills the `NotImplemented` shim). | existing `#[bloom::petal]` shim, `TypeTag::Generic`, PTB `TypeArg` |
 
 **`bloom` CLI:** add `bloom pipe '<expr>'` — parses linear `|` and named `--a <(…)>` inputs into use-edges, drives a `PtbSession`, commits, streams stdout.
 
@@ -143,7 +143,7 @@ PacketRef = Use{ cmd_idx, ret_idx }    // intermediate: resolves only inside THI
 
 - The macro drops the `NotImplemented` branch; instead it decodes the type-args vec from calldata, binds it into a per-call `TypeArgs` context (thread-local, set by the shim), then calls the user body with handle-typed params.
 - Enabling change in `bloom-resource`: phantom-typed wrappers (`Coin<T>`, `Capability<T>`) resolve `type_tag()` from that per-call context instead of a compile-time const. `object_create`/`object_transfer` already take a `TypeTag` argument, so stamping the runtime tag is straightforward.
-- `bloom-contract-build` ensures the generic export lands in the wasm and is listed in the manifest `functions` table (so the endpoint resolver sees it).
+- `bloom-resource-macros` ensures the generic export lands in the wasm and is listed in the manifest `functions` table (so the endpoint resolver sees it).
 
 **Rejected alternatives:** author-site concrete monomorphization (one export per token pair) cannot work — DEX pools are created for arbitrary pairs at runtime and can't be enumerated at compile time. AMM math as a protocol host import is rejected — it would enshrine DeFi math in the protocol, violating §2.
 

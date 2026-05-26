@@ -1,5 +1,0 @@
-error: `#[indexed]` cannot be applied to `bytes` (indexed fields must have a fixed 32-byte encoding)
- --> tests/ui/indexed_bytes.rs:8:31
-  |
-8 |         event Blob(#[indexed] payload: bytes);
-  |                               ^^^^^^^

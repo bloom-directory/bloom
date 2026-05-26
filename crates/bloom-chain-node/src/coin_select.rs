@@ -1,7 +1,7 @@
 //! `select_coin_loom` — snapshot-level helper for picking and splitting
 //! `Coin<LOOM>` objects owned by a sender.
 //!
-//! Used by the legacy `TxKind::Transfer` / `TxKind::Call` compat shim in
+//! Used by the `TxKind::Transfer` compatibility path in
 //! `petal_executor` to keep the Coin<LOOM> object world consistent with the
 //! `Account.loom` cache after a legacy-format tx runs.
 //!

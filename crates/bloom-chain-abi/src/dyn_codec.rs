@@ -1,11 +1,9 @@
 //! Dynamic codec helpers — length-prefixed strings, byte arrays, and
 //! variable-length vectors.
 //!
-//! Phase 2 of the bloom-rust-contracts work. These helpers extend the
-//! existing fixed-width [`Encoder`](crate::Encoder)/[`Buf`](crate::Buf) with
-//! `u16-BE` length prefixes for unbounded ABI types. The fixed-width helpers
-//! are left untouched so legacy `contract!`-emitted code keeps working
-//! unchanged.
+//! These helpers extend the fixed-width [`Encoder`](crate::Encoder) /
+//! [`Buf`](crate::Buf) codec with `u16-BE` length prefixes for unbounded ABI
+//! types.
 //!
 //! Layout:
 //!

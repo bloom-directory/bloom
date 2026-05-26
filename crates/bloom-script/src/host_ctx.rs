@@ -20,8 +20,7 @@
 //! see the same row state.
 //!
 //! The chain VM accesses this through `Arc<Mutex<PtbHostCtx>>` stored
-//! on `ChainStoreData::ptb_ctx` (None for legacy `TxKind::Transfer` /
-//! `TxKind::Call`; `Some(...)` for `TxKind::SubmitPtb` calls).
+//! on `ChainStoreData::ptb_ctx` for `TxKind::SubmitPtb` calls.
 
 use bloom_chain_types::Hash32;
 use bloom_objects::{Object, ObjectId, Owner};

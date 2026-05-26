@@ -43,21 +43,7 @@ fn arb_tx_kind() -> impl Strategy<Value = TxKind> {
     prop_oneof![
         (arb_address(), any::<u128>())
             .prop_map(|(to, amount_loom)| TxKind::Transfer { to, amount_loom }),
-        (arb_vec_u8(64), arb_bytes32(), arb_vec_u8(32)).prop_map(|(wasm, salt, init_args)| {
-            TxKind::Deploy {
-                wasm,
-                salt,
-                init_args,
-                manifest_hash: None,
-            }
-        }),
-        (arb_address(), arb_vec_u8(32), any::<u128>()).prop_map(|(to, calldata, value_loom)| {
-            TxKind::Call {
-                to,
-                calldata,
-                value_loom,
-            }
-        }),
+        arb_vec_u8(256).prop_map(|ptb_bytes| TxKind::SubmitPtb { ptb_bytes }),
     ]
 }
 
