@@ -28,10 +28,12 @@
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
+use base64::Engine as _;
 use bloom_chain_consensus::ValidatorSet;
 use bloom_chain_consensus::validator_set::Validator;
 use bloom_chain_state::{Account, State};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes};
+use bloom_keystore::xdsa::XDSA_PK_LEN;
 use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
 use bloom_petal_fungible::ops::{coin_payload, type_tag_coin_loom};
 use serde::{Deserialize, Serialize};
@@ -317,47 +319,16 @@ pub fn parse_b1_address(s: &str) -> Result<Address> {
 }
 
 fn base64_decode(s: &str) -> Result<Vec<u8>> {
-    // Use the standard base64 alphabet.
-    // We avoid pulling in the `base64` crate; use std's built-in decoder via
-    // a simple wrapper.  Since the keystore already uses base64 via alloy, we
-    // replicate a minimal impl here.
-    //
-    // Actually: just use the `base64` alphabet via the standard approach.
-    // The workspace does have base64 = "0.22" in the bloom crate dev-deps;
-    // however bloom-chain-node doesn't declare it.  Use a manual decode.
-    //
-    // For v0 simplicity, decode standard base64 by hand.
-    fn val(c: u8) -> Result<u8> {
-        match c {
-            b'A'..=b'Z' => Ok(c - b'A'),
-            b'a'..=b'z' => Ok(c - b'a' + 26),
-            b'0'..=b'9' => Ok(c - b'0' + 52),
-            b'+' => Ok(62),
-            b'/' => Ok(63),
-            b'=' => Ok(0), // padding
-            _ => Err(anyhow!("invalid base64 char: {c}")),
-        }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(s.trim())
+        .map_err(|e| anyhow!("strict base64 decode: {e}"))?;
+    if bytes.len() != XDSA_PK_LEN {
+        return Err(anyhow!(
+            "xDSA pubkey must be {XDSA_PK_LEN} bytes, got {}",
+            bytes.len()
+        ));
     }
-
-    let s = s.trim();
-    let mut out = Vec::with_capacity((s.len() * 3) / 4);
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i + 3 < bytes.len() {
-        let b0 = val(bytes[i])?;
-        let b1 = val(bytes[i + 1])?;
-        let b2 = val(bytes[i + 2])?;
-        let b3 = val(bytes[i + 3])?;
-        out.push((b0 << 2) | (b1 >> 4));
-        if bytes[i + 2] != b'=' {
-            out.push((b1 << 4) | (b2 >> 2));
-        }
-        if bytes[i + 3] != b'=' {
-            out.push((b2 << 6) | b3);
-        }
-        i += 4;
-    }
-    Ok(out)
+    Ok(bytes)
 }
 
 fn compute_genesis_hash(chain_id: &str, genesis_time_ms: u64) -> Hash32 {
@@ -427,7 +398,6 @@ impl Default for NodeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
     use bloom_chain_consensus::ValidatorSet;
     use bloom_chain_consensus::validator_set::Validator;
     use bloom_chain_types::types::PubKeyBytes;
@@ -619,5 +589,47 @@ mod tests {
             msg.contains("address/pubkey mismatch"),
             "unexpected error: {msg}"
         );
+    }
+
+    fn raw_genesis_with_pubkey(pubkey: String) -> GenesisFile {
+        let (_sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
+        let address = Address::from_pubkey_bytes(&pk.0);
+        GenesisFile {
+            chain_id: "bloomchain.test".into(),
+            genesis_time_ms: 0,
+            validators: vec![ValidatorConfig {
+                address: hex::encode(address.0),
+                pubkey,
+                voting_power: 100,
+                host: Some("127.0.0.1:26656".into()),
+            }],
+            allocations: vec![],
+            petals: vec![],
+        }
+    }
+
+    #[test]
+    fn genesis_rejects_malformed_validator_pubkey_base64() {
+        let err = Genesis::from_raw(raw_genesis_with_pubkey("AAAAA".into()))
+            .expect_err("non-canonical base64 length must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("base64"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn genesis_rejects_invalid_validator_pubkey_padding() {
+        let err = Genesis::from_raw(raw_genesis_with_pubkey("AA=A".into()))
+            .expect_err("misplaced base64 padding must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("base64"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn genesis_rejects_wrong_validator_pubkey_length() {
+        let short_pubkey = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        let err = Genesis::from_raw(raw_genesis_with_pubkey(short_pubkey))
+            .expect_err("wrong xDSA pubkey length must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("1984 bytes"), "unexpected error: {msg}");
     }
 }

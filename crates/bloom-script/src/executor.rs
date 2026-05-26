@@ -464,9 +464,39 @@ impl<'c> PtbExecutor<'c> {
         // Petal call: DO NOT hold the ctx lock here. The wasm host
         // imports (chain_vm.rs) reach back into `ctx` via the same
         // Arc<Mutex>; deadlock if we held it.
-        let result =
-            self.petal_runner
-                .call(&hash, &m.function, &m.type_args, &args_buf, *fuel_remaining)?;
+        let result = match self.petal_runner.call(
+            &hash,
+            &m.function,
+            &m.type_args,
+            &args_buf,
+            *fuel_remaining,
+        ) {
+            Ok(result) => result,
+            Err(PtbError::OutOfFuel { used, .. }) => {
+                let limit = *fuel_remaining;
+                let charged = used.min(*fuel_remaining);
+                report.fuel_used = report.fuel_used.saturating_add(charged);
+                *fuel_remaining = fuel_remaining.saturating_sub(charged);
+                return Err(PtbError::OutOfFuel {
+                    cmd_idx,
+                    limit,
+                    used,
+                });
+            }
+            Err(PtbError::PetalAbort {
+                code, fuel_used, ..
+            }) => {
+                let charged = fuel_used.min(*fuel_remaining);
+                report.fuel_used = report.fuel_used.saturating_add(charged);
+                *fuel_remaining = fuel_remaining.saturating_sub(charged);
+                return Err(PtbError::PetalAbort {
+                    cmd_idx,
+                    code,
+                    fuel_used,
+                });
+            }
+            Err(e) => return Err(e),
+        };
         if result.fuel_used > *fuel_remaining {
             report.fuel_used = report.fuel_used.saturating_add(*fuel_remaining);
             return Err(PtbError::OutOfFuel {
@@ -572,6 +602,12 @@ impl<'c> PtbExecutor<'c> {
                 .borrow_table
                 .get(&src_id)
                 .ok_or(PtbError::ObjectNotFound { id: src_id })?;
+            if !self.is_fungible_coin_type(&src_row.type_tag) {
+                return Err(PtbError::BuiltinFailed {
+                    cmd_idx,
+                    reason: "SplitCoins source is not a Coin<T>".to_string(),
+                });
+            }
             let v =
                 decode_coin_value(&src_row.payload_bytes).map_err(|_| PtbError::BuiltinFailed {
                     cmd_idx,
@@ -657,12 +693,18 @@ impl<'c> PtbExecutor<'c> {
             let id = ObjectId(arr);
             // Read row data + perform the drop (for non-first ids) in
             // one critical section.
-            let (v, ty, ow, is_first) =
-                self.with_ctx(|ctx| -> Result<(u128, TypeTag, Owner, bool), PtbError> {
+            let (v, ty, ow, is_first, was_persistent) = self.with_ctx(
+                |ctx| -> Result<(u128, TypeTag, Owner, bool, bool), PtbError> {
                     let row = ctx
                         .borrow_table
                         .get(&id)
                         .ok_or(PtbError::ObjectNotFound { id })?;
+                    if !self.is_fungible_coin_type(&row.type_tag) {
+                        return Err(PtbError::BuiltinFailed {
+                            cmd_idx,
+                            reason: "MergeCoins input is not a Coin<T>".to_string(),
+                        });
+                    }
                     let v = decode_coin_value(&row.payload_bytes).map_err(|_| {
                         PtbError::BuiltinFailed {
                             cmd_idx,
@@ -671,12 +713,14 @@ impl<'c> PtbExecutor<'c> {
                     })?;
                     let ty = row.type_tag.clone();
                     let ow = row.owner.clone();
+                    let was_persistent = row.origin_command_idx.is_none();
                     let is_first = first_id.is_none();
                     if !is_first {
                         ctx.borrow_table.drop_row(&id);
                     }
-                    Ok((v, ty, ow, is_first))
-                })?;
+                    Ok((v, ty, ow, is_first, was_persistent))
+                },
+            )?;
             accum = accum
                 .checked_add(v)
                 .ok_or_else(|| PtbError::BuiltinFailed {
@@ -700,6 +744,9 @@ impl<'c> PtbExecutor<'c> {
                         reason: "MergeCoins: heterogeneous owners".to_string(),
                     });
                 }
+                if was_persistent {
+                    self.with_ctx(|ctx| ctx.object_deletes.push((id, ow.clone())));
+                }
             }
         }
         let id = first_id.unwrap();
@@ -708,6 +755,21 @@ impl<'c> PtbExecutor<'c> {
         merged_payload.extend_from_slice(&accum.to_be_bytes());
         self.with_ctx(|ctx| ctx.borrow_table.mark_dirty(&id, merged_payload))?;
         Ok(vec![id.0.to_vec()])
+    }
+
+    fn is_fungible_coin_type(&self, ty: &TypeTag) -> bool {
+        match ty {
+            TypeTag::Concrete {
+                petal_hash,
+                type_name,
+                type_args,
+            } => {
+                *petal_hash == self.fungible_petal_hash.0
+                    && type_name == "Coin"
+                    && type_args.len() == 1
+            }
+            _ => false,
+        }
     }
 
     fn exec_publish(
@@ -1187,6 +1249,7 @@ mod tests {
                 None => Err(PtbError::PetalAbort {
                     cmd_idx: 0,
                     code: -1,
+                    fuel_used: 0,
                 }),
             }
         }
@@ -1223,6 +1286,26 @@ mod tests {
         Object {
             id: ObjectId([id_byte; 32]),
             type_tag: loom_tt(),
+            owner: Owner::Address(owner),
+            version,
+            payload,
+        }
+    }
+
+    fn non_coin_tt() -> TypeTag {
+        TypeTag::Concrete {
+            petal_hash: [0x99; 32],
+            type_name: "Vault".to_string(),
+            type_args: vec![],
+        }
+    }
+
+    fn make_non_coin_resource(id_byte: u8, owner: [u8; 32], value: u128, version: u64) -> Object {
+        let mut payload = vec![0u8; 32];
+        payload.extend_from_slice(&value.to_be_bytes());
+        Object {
+            id: ObjectId([id_byte; 32]),
+            type_tag: non_coin_tt(),
             owner: Owner::Address(owner),
             version,
             payload,
@@ -1616,6 +1699,68 @@ mod tests {
     }
 
     #[test]
+    fn split_coins_rejects_non_coin_shape() {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        let src_id = ObjectId([0xD1; 32]);
+        chain.put_object(make_non_coin_resource(0xD1, signer, 1_000, 0));
+        chain.put_petal(
+            petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/p".to_string(),
+                functions: vec![FunctionDeclStub {
+                    name: "load".to_string(),
+                    type_params: vec![],
+                    args: vec![ArgDeclStub::Object {
+                        ty: non_coin_tt(),
+                        mode: AccessMode::Mutable,
+                    }],
+                    returns: vec![non_coin_tt()],
+                    attached_invariants: vec![],
+                }],
+                object_types: vec![],
+                external_type_refs: vec![],
+            },
+        );
+        let mut runner = MockPetalRunner::new();
+        runner.set(petal, "load", build_outputs(&[&src_id.0]), 10);
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/p".to_string(),
+                        hash: Some(petal),
+                    },
+                    function: "load".to_string(),
+                    type_args: vec![],
+                    args: vec![Arg::Object {
+                        id: src_id,
+                        expected_version: ExpectedVersion(0),
+                        access_mode: AccessMode::Mutable,
+                    }],
+                }),
+                Command::SplitCoins {
+                    src: UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    },
+                    amounts: vec![100],
+                },
+            ],
+        );
+
+        let report = run(&chain, &runner, tx);
+        assert!(!report.success);
+        assert!(matches!(
+            report.reverted_with,
+            Some(PtbError::BuiltinFailed { reason, .. }) if reason.contains("not a Coin")
+        ));
+    }
+
+    #[test]
     fn transfer_objects_records_ownership_change() {
         let chain = MockChain::new();
         let (petal, signer, gas_id) = build_pkg(&chain);
@@ -1905,8 +2050,93 @@ mod tests {
             .find(|o| o.id == a)
             .expect("merged coin a");
         assert_eq!(decode_coin_value(&merged.payload).unwrap(), 120);
-        // b should be deleted from the borrow table (not written).
+        // b should be deleted from the borrow table and from persistent state.
         assert!(!report.object_writes.iter().any(|o| o.id == b));
+        assert_eq!(
+            report.object_deletes,
+            vec![(b, Owner::Address(signer))],
+            "persistent non-first merge input must be deleted"
+        );
+    }
+
+    #[test]
+    fn merge_coins_rejects_non_coin_shape() {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        let a = ObjectId([0x31; 32]);
+        let b = ObjectId([0x32; 32]);
+        chain.put_object(make_non_coin_resource(0x31, signer, 50, 0));
+        chain.put_object(make_non_coin_resource(0x32, signer, 70, 0));
+        chain.put_petal(
+            petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/p".to_string(),
+                functions: vec![FunctionDeclStub {
+                    name: "load_two".to_string(),
+                    type_params: vec![],
+                    args: vec![
+                        ArgDeclStub::Object {
+                            ty: non_coin_tt(),
+                            mode: AccessMode::Mutable,
+                        },
+                        ArgDeclStub::Object {
+                            ty: non_coin_tt(),
+                            mode: AccessMode::Mutable,
+                        },
+                    ],
+                    returns: vec![non_coin_tt(), non_coin_tt()],
+                    attached_invariants: vec![],
+                }],
+                object_types: vec![],
+                external_type_refs: vec![],
+            },
+        );
+        let mut runner = MockPetalRunner::new();
+        runner.set(petal, "load_two", build_outputs(&[&a.0, &b.0]), 10);
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/p".to_string(),
+                        hash: Some(petal),
+                    },
+                    function: "load_two".to_string(),
+                    type_args: vec![],
+                    args: vec![
+                        Arg::Object {
+                            id: a,
+                            expected_version: ExpectedVersion(0),
+                            access_mode: AccessMode::Mutable,
+                        },
+                        Arg::Object {
+                            id: b,
+                            expected_version: ExpectedVersion(0),
+                            access_mode: AccessMode::Mutable,
+                        },
+                    ],
+                }),
+                Command::MergeCoins(vec![
+                    UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    },
+                    UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 1,
+                    },
+                ]),
+            ],
+        );
+
+        let report = run(&chain, &runner, tx);
+        assert!(!report.success);
+        assert!(matches!(
+            report.reverted_with,
+            Some(PtbError::BuiltinFailed { reason, .. }) if reason.contains("not a Coin")
+        ));
     }
 
     #[test]
@@ -2087,6 +2317,7 @@ mod tests {
                 .ok_or(PtbError::PetalAbort {
                     cmd_idx: 0,
                     code: -1,
+                    fuel_used: 0,
                 })?;
             Ok(PetalCallResult {
                 ret_buf: buf,

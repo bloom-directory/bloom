@@ -43,8 +43,9 @@ impl BlockStore {
     /// Store a block at `height`.
     pub fn put(&self, height: u64, block: &Block) -> Result<()> {
         let path = self.path_for(height);
+        let tmp_path = self.root.join(format!(".{height}.tmp"));
         let bytes = block.as_ssz_bytes();
-        std::fs::write(&path, &bytes)
+        write_atomic(&tmp_path, &path, &bytes)
             .with_context(|| format!("write block {height}: {}", path.display()))?;
         debug!(height, bytes = bytes.len(), "block_store.put");
         Ok(())
@@ -131,4 +132,29 @@ impl BlockStore {
         }
         Ok(())
     }
+}
+
+fn write_atomic(tmp_path: &Path, final_path: &Path, bytes: &[u8]) -> Result<()> {
+    {
+        let mut file = std::fs::File::create(tmp_path)
+            .with_context(|| format!("create temp file {}", tmp_path.display()))?;
+        use std::io::Write;
+        file.write_all(bytes)
+            .with_context(|| format!("write temp file {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync temp file {}", tmp_path.display()))?;
+    }
+    std::fs::rename(tmp_path, final_path).with_context(|| {
+        format!(
+            "rename temp file {} -> {}",
+            tmp_path.display(),
+            final_path.display()
+        )
+    })?;
+    if let Some(parent) = final_path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }

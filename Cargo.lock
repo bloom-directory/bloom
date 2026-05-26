@@ -2067,6 +2067,7 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "tracing",
+ "wasmparser 0.218.1",
  "wat",
  "zbase32",
 ]

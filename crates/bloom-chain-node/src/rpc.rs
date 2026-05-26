@@ -27,7 +27,7 @@
 use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
@@ -58,6 +58,7 @@ pub const RPC_MAX_TX_BYTES: usize = 1024 * 1024;
 const RPC_MAX_TCP_CONNECTIONS: usize = 128;
 const RPC_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const RPC_READINESS_MAX_TIP_AGE: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // JSON-RPC framing
@@ -118,6 +119,9 @@ pub struct RpcServer {
     pub chain_id: String,
     pub genesis_hash: Hash32,
     pub local_address: Address,
+    /// Latest block height observed during node startup. Readiness requires
+    /// the persisted tip to advance beyond this height.
+    pub startup_height: u64,
     /// Sender for admitting txs to the in-memory mempool. The worker that
     /// receives on the other end performs mempool admission synchronously and
     /// replies via the oneshot — see `node.rs` § "Tx admission from RPC →
@@ -571,24 +575,55 @@ impl RpcServer {
 
     fn handle_health(&self) -> Result<Value> {
         let height = self.block_store.latest_height()?.unwrap_or(0);
-        let state = self.state.lock();
-        let state_root = state.state_root();
-        let object_root = state.object_root();
-        let ownership_root = state.ownership_index_root();
-        let vfs_root = state.vfs_root();
+        let latest_block = if height == 0 {
+            None
+        } else {
+            self.block_store.get(height)?
+        };
+        let state_root = latest_block.as_ref().map(|block| block.header.state_root);
+        let now_ms = unix_time_ms();
+        let max_tip_age_ms = RPC_READINESS_MAX_TIP_AGE.as_millis() as u64;
+        let tip_age_ms = latest_block
+            .as_ref()
+            .map(|block| now_ms.saturating_sub(block.header.timestamp_ms));
+        let tip_recent = tip_age_ms.is_some_and(|age| age <= max_tip_age_ms);
+        let height_advanced = height > self.startup_height;
+        let ready = height_advanced && tip_recent;
+        let not_ready_reason = if ready {
+            Value::Null
+        } else if !height_advanced {
+            json!("waiting_for_height_progress")
+        } else if latest_block.is_none() {
+            json!("latest_tip_unavailable")
+        } else if !tip_recent {
+            json!("latest_tip_stale")
+        } else {
+            json!("not_ready")
+        };
         Ok(json!({
-            "ok": true,
+            "ok": ready,
+            "live": true,
+            "ready": ready,
+            "not_ready_reason": not_ready_reason,
             "chain_id": self.chain_id,
             "genesis_hash": hex::encode(self.genesis_hash.0),
             "validator_address": hex::encode(self.local_address.0),
             "height": height,
-            "state_root": hex::encode(state_root.0),
-            "object_root": hex::encode(object_root.0),
-            "ownership_root": hex::encode(ownership_root.0),
-            "vfs_root": hex::encode(vfs_root.0),
+            "startup_height": self.startup_height,
+            "tip_age_ms": tip_age_ms,
+            "max_tip_age_ms": max_tip_age_ms,
+            "state_root": state_root.map(|root| hex::encode(root.0)),
+            "latest_block_hash": latest_block.as_ref().map(|block| hex::encode(block.header.block_hash().0)),
             "validator_set_hash": hex::encode(self.validator_set.validator_set_hash().0),
         }))
     }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn remove_stale_socket(socket_path: &Path) -> Result<()> {
@@ -926,6 +961,8 @@ fn parse_address(s: &str) -> Result<Address> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bloom_chain_types::block::{Block, BlockHeader};
+    use bloom_chain_types::vote::Commit;
     use bloom_objects::{Object, ObjectId, Owner, TypeTag};
     use bloom_test_util::{make_validator_set_signed, make_validator_with_keypair};
 
@@ -953,9 +990,40 @@ mod tests {
             chain_id: "bloomchain.test".into(),
             genesis_hash: Hash32([0x42; 32]),
             local_address: v.addr,
+            startup_height: 0,
             tx_submit,
         };
         (server, tmp)
+    }
+
+    fn test_block(height: u64) -> Block {
+        test_block_with_timestamp(height, unix_time_ms())
+    }
+
+    fn test_block_with_timestamp(height: u64, timestamp_ms: u64) -> Block {
+        let block_hash = Hash32([height as u8; 32]);
+        Block {
+            header: BlockHeader {
+                chain_id: "bloomchain.test".into(),
+                height,
+                parent_hash: Hash32([0xAA; 32]),
+                timestamp_ms,
+                proposer: Address([0x11; 32]),
+                txs_root: Hash32([0x22; 32]),
+                state_root: Hash32([0x33; 32]),
+                receipts_root: Hash32([0x44; 32]),
+                validator_set_hash: Hash32([0x55; 32]),
+                fuel_used: 0,
+                fuel_limit: 30_000_000,
+            },
+            txs: vec![],
+            commit: Commit {
+                height,
+                round: 0,
+                block_hash,
+                votes: vec![],
+            },
+        }
     }
 
     /// A `Concrete`-typed object owned by `owner`.
@@ -1039,7 +1107,10 @@ mod tests {
     fn health_reports_identity_and_tip() {
         let (server, _tmp) = make_server();
         let res = server.handle_health().unwrap();
-        assert_eq!(res["ok"], true);
+        assert_eq!(res["ok"], false);
+        assert_eq!(res["live"], true);
+        assert_eq!(res["ready"], false);
+        assert_eq!(res["not_ready_reason"], "waiting_for_height_progress");
         assert_eq!(res["chain_id"], "bloomchain.test");
         assert_eq!(res["genesis_hash"], hex::encode([0x42u8; 32]));
         assert_eq!(
@@ -1047,6 +1118,34 @@ mod tests {
             hex::encode(server.local_address.0)
         );
         assert_eq!(res["height"], 0);
+        assert_eq!(res["startup_height"], 0);
+    }
+
+    #[test]
+    fn health_reports_ready_after_height_progress() {
+        let (server, _tmp) = make_server();
+        server.block_store.put(1, &test_block(1)).unwrap();
+        let res = server.handle_health().unwrap();
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["ready"], true);
+        assert_eq!(res["not_ready_reason"], Value::Null);
+        assert_eq!(res["height"], 1);
+        assert_eq!(res["state_root"], hex::encode([0x33u8; 32]));
+        assert!(res["latest_block_hash"].as_str().is_some());
+    }
+
+    #[test]
+    fn health_rejects_stale_tip_after_height_progress() {
+        let (server, _tmp) = make_server();
+        server
+            .block_store
+            .put(1, &test_block_with_timestamp(1, 1))
+            .unwrap();
+        let res = server.handle_health().unwrap();
+        assert_eq!(res["ok"], false);
+        assert_eq!(res["ready"], false);
+        assert_eq!(res["not_ready_reason"], "latest_tip_stale");
+        assert_eq!(res["height"], 1);
     }
 
     #[test]

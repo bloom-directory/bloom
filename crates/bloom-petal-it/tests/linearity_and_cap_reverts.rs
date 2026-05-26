@@ -40,8 +40,8 @@ use bloom_script::{
 };
 
 use bloom_petal_it::harness::{
-    addr, build_state, genesis_coin_id, ptb_coin_payload, ptb_decode_coin_value, single_manifest,
-    wat_to_wasm,
+    addr, build_state, genesis_coin_id, ptb_coin_payload, ptb_decode_coin_value, seed_coin,
+    single_manifest, wat_to_wasm,
 };
 
 // ---------------------------------------------------------------------------
@@ -114,6 +114,8 @@ fn linearity_violation_reverts_atomically() {
     let alice = addr(0xA1);
     let mut state = build_state(&[(alice, 1000)]);
     let alice_coin_id = genesis_coin_id(alice, 0);
+    let gas_coin_id = genesis_coin_id(alice, 1);
+    seed_coin(&mut state, gas_coin_id, alice, 1);
 
     // Record the state root before the PTB.
     let _root_before = state.state_root();
@@ -171,7 +173,7 @@ fn linearity_violation_reverts_atomically() {
             },
             // Intentionally NO TransferObjects → linearity violation at tx end.
         ],
-        gas_payer: alice_coin_id,
+        gas_payer: gas_coin_id,
         gas_budget: 200_000,
         gas_price: 0,
         expiry_block: 100,

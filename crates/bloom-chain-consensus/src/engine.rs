@@ -11,13 +11,14 @@ use bloom_chain_types::{
     block::Block,
     tx::Tx,
     types::{Address, Hash32},
+    vote::Proposal,
 };
 
 use crate::{
     error::ConsensusError,
     mempool::Mempool,
     signer::Signer,
-    state_machine::{Action, ConsensusState, Event, ProposalOrVote},
+    state_machine::{Action, ConsensusState, Event, ProposalOrVote, Step},
     validator_set::ValidatorSet,
     verifier::SigVerifier,
 };
@@ -51,6 +52,9 @@ pub struct ConsensusEngine<V: SigVerifier> {
     /// emitted messages keep the empty `sig` produced by the state machine
     /// (test-only path; the production node always supplies one).
     signer: Option<Arc<dyn Signer>>,
+    /// Proposal already emitted for a height/round. A proposer must not sign
+    /// multiple block hashes for the same consensus slot.
+    proposed: BTreeMap<(u64, u32), Proposal>,
 }
 
 impl<V: SigVerifier> ConsensusEngine<V> {
@@ -82,6 +86,7 @@ impl<V: SigVerifier> ConsensusEngine<V> {
             block_builder,
             fuel_limit,
             signer,
+            proposed: BTreeMap::new(),
         }
     }
 
@@ -135,22 +140,33 @@ impl<V: SigVerifier> ConsensusEngine<V> {
     /// build and return a proposal action.  Returns `None` otherwise or if
     /// no block builder is configured.
     pub fn maybe_propose(&mut self) -> Option<Action> {
-        if !self.state.is_proposer() {
+        if self.state.step != Step::Propose || !self.state.is_proposer() {
             return None;
         }
-        let builder = self.block_builder.as_ref()?;
         let height = self.state.height;
-        let fuel_limit = self.fuel_limit;
-        let block = builder(height, &mut self.mempool, fuel_limit);
-        let hash = block.header.block_hash();
-        self.blocks.insert(hash, block.clone());
+        let round = self.state.round;
+        if let Some(proposal) = self.proposed.get(&(height, round)).cloned() {
+            return Some(Action::Broadcast(ProposalOrVote::Proposal(proposal)));
+        }
 
-        use bloom_chain_types::vote::Proposal;
+        let (hash, pol_round) = if let Some((valid_round, valid_hash)) = self.state.valid_block
+            && self.blocks.contains_key(&valid_hash)
+        {
+            (valid_hash, valid_round as i32)
+        } else {
+            let builder = self.block_builder.as_ref()?;
+            let fuel_limit = self.fuel_limit;
+            let block = builder(height, &mut self.mempool, fuel_limit);
+            let hash = block.header.block_hash();
+            self.blocks.insert(hash, block.clone());
+            (hash, -1)
+        };
+
         let mut proposal = Proposal {
             height,
-            round: self.state.round,
+            round,
             block_hash: hash,
-            pol_round: -1,
+            pol_round,
             proposer: self.local_address,
             sig: bloom_chain_types::types::SigBytes(vec![]),
         };
@@ -158,6 +174,7 @@ impl<V: SigVerifier> ConsensusEngine<V> {
             let digest = proposal.signing_digest();
             proposal.sig = signer.sign(&digest.0);
         }
+        self.proposed.insert((height, round), proposal.clone());
         Some(Action::Broadcast(ProposalOrVote::Proposal(proposal)))
     }
 
@@ -210,6 +227,7 @@ impl<V: SigVerifier> ConsensusEngine<V> {
     /// recovered.
     pub fn enter_next_height(&mut self, new_height: u64) -> Vec<Action> {
         self.blocks.retain(|_, b| b.header.height >= new_height);
+        self.proposed.retain(|(height, _), _| *height >= new_height);
         let mut actions = self.state.enter_next_height(new_height);
         self.sign_actions(&mut actions);
         actions
@@ -233,5 +251,186 @@ impl<V: SigVerifier> ConsensusEngine<V> {
     /// Current round.
     pub fn round(&self) -> u32 {
         self.state.round
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use bloom_chain_types::{
+        block::{Block, BlockHeader},
+        types::Hash32,
+        vote::Commit,
+    };
+
+    use super::*;
+    use crate::{validator_set::Validator, verifier::NoopVerifier};
+
+    fn addr(seed: u8) -> Address {
+        Address([seed; 32])
+    }
+
+    fn validator_set() -> ValidatorSet {
+        ValidatorSet::new(vec![
+            Validator {
+                address: addr(0),
+                pubkey: bloom_chain_types::types::PubKeyBytes(vec![0; 4]),
+                voting_power: 100,
+            },
+            Validator {
+                address: addr(1),
+                pubkey: bloom_chain_types::types::PubKeyBytes(vec![1; 4]),
+                voting_power: 100,
+            },
+            Validator {
+                address: addr(2),
+                pubkey: bloom_chain_types::types::PubKeyBytes(vec![2; 4]),
+                voting_power: 100,
+            },
+            Validator {
+                address: addr(3),
+                pubkey: bloom_chain_types::types::PubKeyBytes(vec![3; 4]),
+                voting_power: 100,
+            },
+        ])
+        .unwrap()
+    }
+
+    fn block(height: u64, proposer: Address, tag: u8) -> Block {
+        Block {
+            header: BlockHeader {
+                chain_id: "test".to_string(),
+                height,
+                parent_hash: Hash32([0; 32]),
+                timestamp_ms: tag as u64,
+                proposer,
+                txs_root: Hash32([tag; 32]),
+                state_root: Hash32([tag.wrapping_add(1); 32]),
+                receipts_root: Hash32([tag.wrapping_add(2); 32]),
+                validator_set_hash: Hash32([0; 32]),
+                fuel_used: 0,
+                fuel_limit: 1_000,
+            },
+            txs: vec![],
+            commit: Commit {
+                height: 0,
+                round: 0,
+                block_hash: Hash32([0; 32]),
+                votes: vec![],
+            },
+        }
+    }
+
+    fn proposal_hash(action: Option<Action>) -> Hash32 {
+        match action.expect("proposal action") {
+            Action::Broadcast(ProposalOrVote::Proposal(p)) => p.block_hash,
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    fn proposal(action: Option<Action>) -> Proposal {
+        match action.expect("proposal action") {
+            Action::Broadcast(ProposalOrVote::Proposal(p)) => p,
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maybe_propose_is_idempotent_per_height_round() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_builder = Arc::clone(&calls);
+        let local = addr(1); // proposer for height=1 round=0.
+        let builder: BlockBuilder<NoopVerifier> = Box::new(move |height, _mempool, _fuel| {
+            let tag = calls_for_builder.fetch_add(1, Ordering::SeqCst) as u8 + 1;
+            block(height, local, tag)
+        });
+        let mut engine = ConsensusEngine::new(
+            1,
+            local,
+            validator_set(),
+            NoopVerifier,
+            Some(builder),
+            1_000,
+            None,
+        );
+
+        let first = proposal_hash(engine.maybe_propose());
+        let second = proposal_hash(engine.maybe_propose());
+
+        assert_eq!(first, second);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn maybe_propose_only_runs_in_propose_step() {
+        let local = addr(1);
+        let builder: BlockBuilder<NoopVerifier> =
+            Box::new(move |height, _mempool, _fuel| block(height, local, 1));
+        let mut engine = ConsensusEngine::new(
+            1,
+            local,
+            validator_set(),
+            NoopVerifier,
+            Some(builder),
+            1_000,
+            None,
+        );
+        engine.state.step = Step::Prevote;
+
+        assert!(engine.maybe_propose().is_none());
+    }
+
+    #[test]
+    fn proposer_reuses_valid_block_with_polka_round() {
+        let local = addr(2); // proposer for height=1 round=1.
+        let valid = block(1, addr(1), 9);
+        let valid_hash = valid.header.block_hash();
+        let builder_calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_builder = Arc::clone(&builder_calls);
+        let builder: BlockBuilder<NoopVerifier> = Box::new(move |height, _mempool, _fuel| {
+            calls_for_builder.fetch_add(1, Ordering::SeqCst);
+            block(height, local, 1)
+        });
+        let mut engine = ConsensusEngine::new(
+            1,
+            local,
+            validator_set(),
+            NoopVerifier,
+            Some(builder),
+            1_000,
+            None,
+        );
+        engine.state.round = 1;
+        engine.state.valid_block = Some((0, valid_hash));
+        engine.register_block(valid);
+
+        let p = proposal(engine.maybe_propose());
+
+        assert_eq!(p.block_hash, valid_hash);
+        assert_eq!(p.pol_round, 0);
+        assert_eq!(builder_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn repeated_valid_block_reproposal_is_idempotent() {
+        let local = addr(2);
+        let valid = block(1, addr(1), 9);
+        let valid_hash = valid.header.block_hash();
+        let mut engine =
+            ConsensusEngine::new(1, local, validator_set(), NoopVerifier, None, 1_000, None);
+        engine.state.round = 1;
+        engine.state.valid_block = Some((0, valid_hash));
+        engine.register_block(valid);
+
+        let first = proposal(engine.maybe_propose());
+        let second = proposal(engine.maybe_propose());
+
+        assert_eq!(first.block_hash, second.block_hash);
+        assert_eq!(first.pol_round, 0);
+        assert_eq!(second.pol_round, 0);
     }
 }

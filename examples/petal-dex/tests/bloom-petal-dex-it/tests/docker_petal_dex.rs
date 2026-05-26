@@ -38,7 +38,7 @@ use bloom_chain_consensus::validator_set::ValidatorSet;
 use bloom_chain_types::block::{Block, BlockHeader};
 use bloom_chain_types::digest::blake3_tagged;
 use bloom_chain_types::frame::{MsgType, encode_wire_frame};
-use bloom_chain_types::ssz::{Decode, Encode};
+use bloom_chain_types::ssz::Encode;
 use bloom_chain_types::types::{Address, Hash32, SigBytes};
 use bloom_chain_types::vote::{Commit, Proposal, Vote, VoteKind};
 use serde_json::Value;
@@ -49,7 +49,10 @@ use bloom_objects::{AbilitySet, AccessMode, Owner, TypeTag};
 use bloom_petal_manifest::types::{
     ArgDecl, ArgKind, FunctionDecl, PetalManifestV0, SCHEMA_VERSION,
 };
-use bloom_script::{Arg, Command as PtbCommand, ExpectedVersion, MoveCmd, PetalRef, PtbTx, UseRef};
+use bloom_script::{
+    Arg, Command as PtbCommand, ExpectedVersion, MoveCmd, PetalRef, PtbTx, UseRef,
+    loom_coin_type_tag,
+};
 
 use bloom_petal_dex_it::dex_harness::{
     append_manifest_section, build_faucet_wasm, build_pool_wasm, build_wallet_wasm, petal_hash_of,
@@ -78,6 +81,7 @@ const PTB_EXPIRY_BLOCK: u64 = 1_000_000_000;
 const PTB_GAS_BUDGET: u64 = 2_000_000;
 
 const ADVERSARY_PATH: &str = "/bloom/dex/adversary";
+const LOOM_PROBE_PATH: &str = "/bloom/dex/loom-probe";
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(90);
 const TX_TIMEOUT: Duration = Duration::from_secs(60);
@@ -89,6 +93,10 @@ const TX_TIMEOUT: Duration = Duration::from_secs(60);
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker-compose stack; run via scripts/test-docker-petal-dex.sh"]
 async fn docker_petal_dex_acceptance() -> Result<()> {
+    Box::pin(docker_petal_dex_acceptance_inner()).await
+}
+
+async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     let tmpdir = compose_tmpdir()?;
     let home0 = tmpdir.join("home0");
     let genesis_path = home0.join("chain").join("genesis.toml");
@@ -124,7 +132,7 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
         ptb_signer_pubkey_hex()
     );
 
-    exercise_live_malformed_transport(client0, &tmpdir).await?;
+    Box::pin(exercise_live_malformed_transport(client0, &tmpdir)).await?;
 
     // ── 2. Build the petal wasms + deploy each via the bloom CLI ──────────
     eprintln!();
@@ -187,15 +195,54 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
 
     // ── 3. Discover the ed25519-owned gas Coin<LOOM> ──────────────────────
     let signer_hex = ptb_signer_pubkey_hex();
-    let gas_coin = timeout(TX_TIMEOUT, wait_for_owned_coin(client0, &signer_hex))
+    let signer_genesis_coins = timeout(TX_TIMEOUT, wait_for_owned_coins(client0, &signer_hex, 4))
         .await
-        .map_err(|_| anyhow!("timed out discovering ed25519 gas Coin<LOOM>"))??;
+        .map_err(|_| anyhow!("timed out discovering ed25519 genesis Coin<LOOM> set"))??;
+    let gas_coin = signer_genesis_coins[0].clone();
     let gas_payer = obj_id_from_hex(&gas_coin)?;
+    let merge_a = signer_genesis_coins[1].clone();
+    let merge_b = signer_genesis_coins[2].clone();
+    let split_src = signer_genesis_coins[3].clone();
+    let merge_a_id = obj_id_from_hex(&merge_a)?;
+    let merge_b_id = obj_id_from_hex(&merge_b)?;
+    let split_src_id = obj_id_from_hex(&split_src)?;
     eprintln!();
     eprintln!(
         "[gas]   ed25519 gas Coin<LOOM> = {}  (genesis allocation)",
         json_str(&gas_coin, "id")?
     );
+    eprintln!(
+        "[gas]   custody probes use merge=({}, {}) split={}",
+        json_str(&merge_a, "id")?,
+        json_str(&merge_b, "id")?,
+        json_str(&split_src, "id")?
+    );
+
+    let loom_probe_wasm = loom_probe_wasm(merge_a_id, merge_b_id, split_src_id);
+    let loom_probe_hash = petal_hash_of(&loom_probe_wasm);
+    let loom_probe_path = std::env::temp_dir().join(format!(
+        "bloom-loom-probe-{}.wasm",
+        hex::encode(loom_probe_hash.0)
+    ));
+    std::fs::write(&loom_probe_path, &loom_probe_wasm).context("write loom probe wasm")?;
+    deploy_petal(&home0, HOST_RPC_PORTS[0], &loom_probe_path)?;
+    let _ = std::fs::remove_file(&loom_probe_path);
+    assert_resolves(client0, LOOM_PROBE_PATH, loom_probe_hash).await?;
+    latest = current_height(client0).await?;
+    wait_all_reach_height(&clients, latest).await?;
+
+    Box::pin(exercise_live_gas_alias_split_merge_and_trap(
+        client0,
+        &clients,
+        &home0,
+        &tmpdir,
+        loom_probe_hash,
+        &gas_coin,
+        &merge_a,
+        &merge_b,
+        &split_src,
+    ))
+    .await?;
 
     let bad_sig_ptb = PtbTx {
         signers: vec![ptb_signer_pubkey()],
@@ -273,7 +320,7 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
 
     // Make every validator catch up so discovery is not racing the apply.
     latest = current_height(client0).await?;
-    wait_all_reach_height(&clients, latest + 1).await?;
+    wait_all_reach_height(&clients, latest).await?;
 
     // ── 5. Discover the shared Pool + assert reserves (1000, 1000) ────────
     let pool_obj = timeout(TX_TIMEOUT, wait_for_pool(client0))
@@ -362,14 +409,14 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
         bail!("second pool create reverted: {pool_b_receipt}");
     }
     latest = current_height(client0).await?;
-    wait_all_reach_height(&clients, latest + 1).await?;
+    wait_all_reach_height(&clients, latest).await?;
     let pools = ls_objects_by_type(client0, "Pool").await?;
     let pool_b = pools
         .into_iter()
         .find(|p| json_str(p, "id").ok() != Some(pool_id_hex))
         .ok_or_else(|| anyhow!("second shared pool not found"))?;
     let pool_b_id = obj_id_from_hex(&pool_b)?;
-    let pool_b_version = pool_b
+    let mut pool_b_version = pool_b
         .get("version")
         .and_then(Value::as_u64)
         .ok_or_else(|| anyhow!("missing pool B version"))?;
@@ -512,7 +559,7 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
         bail!("add_liquidity reverted: {add_lp_receipt}");
     }
     latest = current_height(client0).await?;
-    wait_all_reach_height(&clients, latest + 1).await?;
+    wait_all_reach_height(&clients, latest).await?;
     let pool_after_add = query_object(client0, pool_id_hex)
         .await?
         .ok_or_else(|| anyhow!("pool object disappeared after add_liquidity"))?;
@@ -533,6 +580,14 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
         })
         .ok_or_else(|| anyhow!("add_liquidity did not mint a new primary-pool LP"))?;
     let added_lp_id = obj_id_from_hex(&added_lp)?;
+    let added_lp_payload_id = decode_lp_self_id(&added_lp)?;
+    if added_lp_payload_id != added_lp_id {
+        bail!(
+            "add_liquidity LP payload self-id mismatch: payload={} object={}",
+            hex::encode(added_lp_payload_id.0),
+            hex::encode(added_lp_id.0)
+        );
+    }
     let added_lp_version = added_lp
         .get("version")
         .and_then(Value::as_u64)
@@ -588,7 +643,7 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
         bail!("remove_liquidity reverted: {remove_lp_receipt}");
     }
     latest = current_height(client0).await?;
-    wait_all_reach_height(&clients, latest + 1).await?;
+    wait_all_reach_height(&clients, latest).await?;
     let pool_after_remove = query_object(client0, pool_id_hex)
         .await?
         .ok_or_else(|| anyhow!("pool object disappeared after remove_liquidity"))?;
@@ -610,10 +665,26 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
     }
     eprintln!("            add_liquidity/remove_liquidity round-trip preserved primary pool");
 
+    pool_version = exercise_live_dex_partial_consume(
+        client0,
+        &clients,
+        &home0,
+        faucet_hash,
+        pool_hash,
+        pool_obj_id,
+        pool_id_hex,
+        pool_version,
+        pool_b_id,
+        json_str(&pool_b, "id")?,
+        &mut pool_b_version,
+        gas_payer,
+    )
+    .await?;
+
     let exact_out_ptb = PtbTx {
         signers: vec![ptb_signer_pubkey()],
         commands: vec![
-            mint_cmd(faucet_hash, 105),
+            mint_cmd(faucet_hash, 250),
             PtbCommand::Move(MoveCmd {
                 petal: pool_ref(pool_hash),
                 function: "swap_exact_out".to_string(),
@@ -635,6 +706,13 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
                 }],
                 owner: Owner::Address(ptb_signer_pubkey()),
             },
+            PtbCommand::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 1,
+                    ret_idx: 1,
+                }],
+                owner: Owner::Address(ptb_signer_pubkey()),
+            },
         ],
         gas_payer,
         gas_budget: PTB_GAS_BUDGET,
@@ -651,7 +729,7 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
         bail!("swap_exact_out reverted: {exact_out_receipt}");
     }
     latest = current_height(client0).await?;
-    wait_all_reach_height(&clients, latest + 1).await?;
+    wait_all_reach_height(&clients, latest).await?;
     let pool_b_after_exact_out = query_object(client0, json_str(&pool_b, "id")?)
         .await?
         .ok_or_else(|| anyhow!("pool B disappeared after swap_exact_out"))?;
@@ -728,7 +806,7 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
     }
 
     latest = current_height(client0).await?;
-    wait_all_reach_height(&clients, latest + 1).await?;
+    wait_all_reach_height(&clients, latest).await?;
 
     // ── 7. Assert carol received a Coin worth 90 ──────────────────────────
     let carol_hex = hex::encode(CAROL);
@@ -917,7 +995,7 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
     let _ = std::fs::remove_file(&adversary_path);
     assert_resolves(client0, ADVERSARY_PATH, adversary_hash).await?;
     latest = current_height(client0).await?;
-    wait_all_reach_height(&clients, latest + 1).await?;
+    wait_all_reach_height(&clients, latest).await?;
 
     eprintln!();
     eprintln!(
@@ -968,7 +1046,7 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
     assert_reverted(&steal_receipt, "Consume access to shared Pool")?;
 
     latest = current_height(client0).await?;
-    wait_all_reach_height(&clients, latest + 1).await?;
+    wait_all_reach_height(&clients, latest).await?;
     let pool_after_attack = query_object(client0, pool_id_hex)
         .await?
         .ok_or_else(|| anyhow!("pool object disappeared after adversarial attempts"))?;
@@ -1031,6 +1109,13 @@ fn adversary_ref(adversary_hash: bloom_chain_types::types::Hash32) -> PetalRef {
     }
 }
 
+fn loom_probe_ref(probe_hash: bloom_chain_types::types::Hash32) -> PetalRef {
+    PetalRef {
+        path: LOOM_PROBE_PATH.to_string(),
+        hash: Some(probe_hash),
+    }
+}
+
 fn use_ret(cmd_idx: u16, ret_idx: u16) -> Arg {
     Arg::Use { cmd_idx, ret_idx }
 }
@@ -1048,6 +1133,614 @@ fn assert_reverted(receipt: &Value, label: &str) -> Result<()> {
         receipt.get("return_text")
     );
     Ok(())
+}
+
+async fn exercise_live_gas_alias_split_merge_and_trap(
+    client: &RpcClient,
+    clients: &[RpcClient],
+    home0: &std::path::Path,
+    tmpdir: &std::path::Path,
+    probe_hash: bloom_chain_types::types::Hash32,
+    gas_coin: &Value,
+    merge_a: &Value,
+    merge_b: &Value,
+    split_src: &Value,
+) -> Result<()> {
+    let gas_payer = obj_id_from_hex(gas_coin)?;
+    let gas_version = object_version(gas_coin)?;
+    let gas_before_alias = query_object(client, json_str(gas_coin, "id")?)
+        .await?
+        .ok_or_else(|| anyhow!("gas coin missing before alias attempt"))?;
+    let gas_alias_ptb = PtbTx {
+        signers: vec![ptb_signer_pubkey()],
+        commands: vec![PtbCommand::Move(MoveCmd {
+            petal: loom_probe_ref(probe_hash),
+            function: "load_split".to_string(),
+            type_args: vec![],
+            args: vec![Arg::Object {
+                id: gas_payer,
+                expected_version: ExpectedVersion(gas_version),
+                access_mode: AccessMode::Mutable,
+            }],
+        })],
+        gas_payer,
+        gas_budget: PTB_GAS_BUDGET,
+        gas_price: 0,
+        expiry_block: PTB_EXPIRY_BLOCK,
+        signatures: vec![],
+    };
+    let gas_alias_receipt = submit_ptb(home0, HOST_RPC_PORTS[0], gas_alias_ptb)?;
+    assert_reverted(&gas_alias_receipt, "gas-payer alias as PTB object input")?;
+    let gas_after_alias = query_object(client, json_str(gas_coin, "id")?)
+        .await?
+        .ok_or_else(|| anyhow!("gas coin missing after alias attempt"))?;
+    assert_same_object_fields(&gas_after_alias, &gas_before_alias, "gas alias reject")?;
+
+    let merge_a_id = obj_id_from_hex(merge_a)?;
+    let merge_b_id = obj_id_from_hex(merge_b)?;
+    let merge_a_before = decode_coin_value(merge_a)?;
+    let merge_b_before = decode_coin_value(merge_b)?;
+    let merge_ptb = PtbTx {
+        signers: vec![ptb_signer_pubkey()],
+        commands: vec![
+            PtbCommand::Move(MoveCmd {
+                petal: loom_probe_ref(probe_hash),
+                function: "load_merge".to_string(),
+                type_args: vec![],
+                args: vec![
+                    Arg::Object {
+                        id: merge_a_id,
+                        expected_version: ExpectedVersion(object_version(merge_a)?),
+                        access_mode: AccessMode::Mutable,
+                    },
+                    Arg::Object {
+                        id: merge_b_id,
+                        expected_version: ExpectedVersion(object_version(merge_b)?),
+                        access_mode: AccessMode::Mutable,
+                    },
+                ],
+            }),
+            PtbCommand::MergeCoins(vec![
+                UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                },
+                UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 1,
+                },
+            ]),
+        ],
+        gas_payer,
+        gas_budget: PTB_GAS_BUDGET,
+        gas_price: 0,
+        expiry_block: PTB_EXPIRY_BLOCK,
+        signatures: vec![],
+    };
+    let merge_receipt = submit_ptb(home0, HOST_RPC_PORTS[0], merge_ptb)?;
+    if !merge_receipt
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("persistent MergeCoins reverted: {merge_receipt}");
+    }
+    let latest = current_height(client).await?;
+    wait_all_reach_height(clients, latest).await?;
+    let merged = query_object(client, json_str(merge_a, "id")?)
+        .await?
+        .ok_or_else(|| anyhow!("merged persistent coin missing"))?;
+    if decode_coin_value(&merged)? != merge_a_before + merge_b_before {
+        bail!(
+            "persistent MergeCoins value mismatch: got {} expected {}",
+            decode_coin_value(&merged)?,
+            merge_a_before + merge_b_before
+        );
+    }
+    if query_object(client, json_str(merge_b, "id")?)
+        .await?
+        .is_some()
+    {
+        bail!("persistent MergeCoins left the consumed second coin live");
+    }
+
+    let split_src_id = obj_id_from_hex(split_src)?;
+    let split_before = decode_coin_value(split_src)?;
+    let owner_before_split = ls_objects_by_owner(client, &ptb_signer_pubkey_hex()).await?;
+    let before_ids: std::collections::HashSet<String> = owner_before_split
+        .iter()
+        .filter_map(|o| json_str(o, "id").ok().map(str::to_string))
+        .collect();
+    let split_ptb = PtbTx {
+        signers: vec![ptb_signer_pubkey()],
+        commands: vec![
+            PtbCommand::Move(MoveCmd {
+                petal: loom_probe_ref(probe_hash),
+                function: "load_split".to_string(),
+                type_args: vec![],
+                args: vec![Arg::Object {
+                    id: split_src_id,
+                    expected_version: ExpectedVersion(object_version(split_src)?),
+                    access_mode: AccessMode::Mutable,
+                }],
+            }),
+            PtbCommand::SplitCoins {
+                src: UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                },
+                amounts: vec![111, 222],
+            },
+            PtbCommand::TransferObjects {
+                uses: vec![
+                    UseRef {
+                        cmd_idx: 1,
+                        ret_idx: 0,
+                    },
+                    UseRef {
+                        cmd_idx: 1,
+                        ret_idx: 1,
+                    },
+                ],
+                owner: Owner::Address(ptb_signer_pubkey()),
+            },
+        ],
+        gas_payer,
+        gas_budget: PTB_GAS_BUDGET,
+        gas_price: 0,
+        expiry_block: PTB_EXPIRY_BLOCK,
+        signatures: vec![],
+    };
+    let split_receipt = submit_ptb(home0, HOST_RPC_PORTS[0], split_ptb)?;
+    if !split_receipt
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("persistent SplitCoins reverted: {split_receipt}");
+    }
+    let latest = current_height(client).await?;
+    wait_all_reach_height(clients, latest).await?;
+    let split_after = query_object(client, json_str(split_src, "id")?)
+        .await?
+        .ok_or_else(|| anyhow!("split source coin missing"))?;
+    if decode_coin_value(&split_after)? != split_before - 333 {
+        bail!(
+            "persistent SplitCoins source value mismatch: got {} expected {}",
+            decode_coin_value(&split_after)?,
+            split_before - 333
+        );
+    }
+    let mut new_split_values = ls_objects_by_owner(client, &ptb_signer_pubkey_hex())
+        .await?
+        .into_iter()
+        .filter(|o| o.get("type_name").and_then(Value::as_str) == Some("Coin"))
+        .filter(|o| {
+            json_str(o, "id")
+                .map(|id| !before_ids.contains(id))
+                .unwrap_or(false)
+        })
+        .map(|o| decode_coin_value(&o))
+        .collect::<Result<Vec<_>>>()?;
+    new_split_values.sort_unstable();
+    if new_split_values != vec![111, 222] {
+        bail!("persistent SplitCoins minted values {new_split_values:?}, expected [111, 222]");
+    }
+
+    let gas_before_trap = query_object(client, json_str(gas_coin, "id")?)
+        .await?
+        .ok_or_else(|| anyhow!("gas coin missing before trap"))?;
+    let validator_balances_before = validator_loom_balances(client, tmpdir).await?;
+    let height_before = current_height(client).await?;
+    let trap_ptb = PtbTx {
+        signers: vec![ptb_signer_pubkey()],
+        commands: vec![PtbCommand::Move(MoveCmd {
+            petal: loom_probe_ref(probe_hash),
+            function: "trap_after_work".to_string(),
+            type_args: vec![],
+            args: vec![],
+        })],
+        gas_payer,
+        gas_budget: PTB_GAS_BUDGET,
+        gas_price: 1,
+        expiry_block: PTB_EXPIRY_BLOCK,
+        signatures: vec![],
+    };
+    let trap_receipt = submit_ptb(home0, HOST_RPC_PORTS[0], trap_ptb)?;
+    assert_reverted(&trap_receipt, "non-OOF wasm trap after fuel burn")?;
+    let trap_fuel = trap_receipt
+        .get("fuel_used")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if trap_fuel == 0 {
+        bail!("non-OOF wasm trap reported zero fuel_used");
+    }
+    let trap_tx_hash = json_str(&trap_receipt, "tx_hash")?;
+    let latest = current_height(client).await?;
+    wait_all_reach_height(clients, latest).await?;
+    let trap_block = find_block_containing_tx(client, height_before, latest + 1, trap_tx_hash)
+        .await?
+        .ok_or_else(|| anyhow!("could not find trap tx {trap_tx_hash} in recent blocks"))?;
+    if trap_block
+        .get("fuel_used")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        < trap_fuel
+    {
+        bail!("trap block fuel_used is lower than trap receipt fuel_used");
+    }
+    let gas_after_trap = query_object(client, json_str(gas_coin, "id")?)
+        .await?
+        .ok_or_else(|| anyhow!("gas coin missing after trap"))?;
+    let gas_before_value = decode_coin_value(&gas_before_trap)?;
+    let gas_after_value = decode_coin_value(&gas_after_trap)?;
+    if gas_after_value != gas_before_value - PTB_GAS_BUDGET as u128 {
+        bail!(
+            "non-OOF trap gas burn mismatch: gas coin got {gas_after_value}, expected {}",
+            gas_before_value - PTB_GAS_BUDGET as u128
+        );
+    }
+    let proposer = json_str(&trap_block, "proposer")?;
+    let proposer_after = query_account_loom(client, proposer).await?;
+    let proposer_before = validator_balances_before
+        .get(proposer)
+        .copied()
+        .unwrap_or_default();
+    if proposer_after < proposer_before + PTB_GAS_BUDGET as u128 {
+        bail!(
+            "non-OOF trap proposer credit too small: before={proposer_before} after={proposer_after}"
+        );
+    }
+
+    eprintln!(
+        "[ptb]   live gas alias rejected; persistent split/merge conserved custody; non-OOF trap fuel={} charged",
+        trap_fuel
+    );
+    Ok(())
+}
+
+async fn exercise_live_dex_partial_consume(
+    client: &RpcClient,
+    clients: &[RpcClient],
+    home0: &std::path::Path,
+    faucet_hash: bloom_chain_types::types::Hash32,
+    pool_hash: bloom_chain_types::types::Hash32,
+    pool_id: bloom_objects::ObjectId,
+    pool_id_hex: &str,
+    mut pool_version: u64,
+    pool_b_id: bloom_objects::ObjectId,
+    pool_b_id_hex: &str,
+    pool_b_version: &mut u64,
+    gas_payer: bloom_objects::ObjectId,
+) -> Result<u64> {
+    let signer_hex = ptb_signer_pubkey_hex();
+
+    let before_mint = owned_coin_ids(client, &signer_hex).await?;
+    let seed_add_ptb = PtbTx {
+        signers: vec![ptb_signer_pubkey()],
+        commands: vec![
+            mint_cmd(faucet_hash, 500),
+            mint_cmd(faucet_hash, 600),
+            PtbCommand::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                }],
+                owner: Owner::Address(ptb_signer_pubkey()),
+            },
+            PtbCommand::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 1,
+                    ret_idx: 0,
+                }],
+                owner: Owner::Address(ptb_signer_pubkey()),
+            },
+        ],
+        gas_payer,
+        gas_budget: PTB_GAS_BUDGET,
+        gas_price: 1,
+        expiry_block: PTB_EXPIRY_BLOCK,
+        signatures: vec![],
+    };
+    let seed_add_receipt = submit_ptb(home0, HOST_RPC_PORTS[0], seed_add_ptb)?;
+    if !seed_add_receipt
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("partial add_liquidity seed mint reverted: {seed_add_receipt}");
+    }
+    let latest = current_height(client).await?;
+    wait_all_reach_height(clients, latest).await?;
+    let add_inputs =
+        wait_for_new_owned_coins_with_values(client, &signer_hex, &before_mint, &[500, 600])
+            .await?;
+    let add_a = add_inputs
+        .iter()
+        .find(|o| decode_coin_value(o).ok() == Some(500))
+        .ok_or_else(|| anyhow!("missing persistent add_liquidity 500 coin"))?;
+    let add_b = add_inputs
+        .iter()
+        .find(|o| decode_coin_value(o).ok() == Some(600))
+        .ok_or_else(|| anyhow!("missing persistent add_liquidity 600 coin"))?;
+    let add_a_id = obj_id_from_hex(add_a)?;
+    let add_b_id = obj_id_from_hex(add_b)?;
+
+    let before_add_consume = owned_coin_ids(client, &signer_hex).await?;
+    let lps_before = ls_objects_by_type(client, "LpPosition")
+        .await?
+        .into_iter()
+        .filter_map(|lp| json_str(&lp, "id").ok().map(str::to_string))
+        .collect::<std::collections::HashSet<_>>();
+    let partial_add_ptb = PtbTx {
+        signers: vec![ptb_signer_pubkey()],
+        commands: vec![
+            PtbCommand::Move(MoveCmd {
+                petal: pool_ref(pool_hash),
+                function: "add_liquidity".to_string(),
+                type_args: vec![],
+                args: vec![
+                    Arg::Object {
+                        id: pool_id,
+                        expected_version: ExpectedVersion(pool_version),
+                        access_mode: AccessMode::Mutable,
+                    },
+                    Arg::Object {
+                        id: add_a_id,
+                        expected_version: ExpectedVersion(object_version(add_a)?),
+                        access_mode: AccessMode::Consume,
+                    },
+                    Arg::Object {
+                        id: add_b_id,
+                        expected_version: ExpectedVersion(object_version(add_b)?),
+                        access_mode: AccessMode::Consume,
+                    },
+                ],
+            }),
+            PtbCommand::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                }],
+                owner: Owner::Address(ptb_signer_pubkey()),
+            },
+            PtbCommand::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 2,
+                }],
+                owner: Owner::Address(ptb_signer_pubkey()),
+            },
+        ],
+        gas_payer,
+        gas_budget: PTB_GAS_BUDGET,
+        gas_price: 1,
+        expiry_block: PTB_EXPIRY_BLOCK,
+        signatures: vec![],
+    };
+    let partial_add_receipt = submit_ptb(home0, HOST_RPC_PORTS[0], partial_add_ptb)?;
+    if !partial_add_receipt
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("persistent partial add_liquidity reverted: {partial_add_receipt}");
+    }
+    let latest = current_height(client).await?;
+    wait_all_reach_height(clients, latest).await?;
+    if query_object(client, json_str(add_a, "id")?)
+        .await?
+        .is_some()
+        || query_object(client, json_str(add_b, "id")?)
+            .await?
+            .is_some()
+    {
+        bail!("partial add_liquidity left a consumed persistent input live");
+    }
+    let pool_after_partial_add = query_object(client, pool_id_hex)
+        .await?
+        .ok_or_else(|| anyhow!("pool missing after partial add_liquidity"))?;
+    let (ra_add, rb_add) = decode_pool_reserves(&pool_after_partial_add)?;
+    if (ra_add, rb_add) != (1500, 1500) {
+        bail!("partial add_liquidity reserves got ({ra_add}, {rb_add}), expected (1500, 1500)");
+    }
+    pool_version = object_version(&pool_after_partial_add)?;
+    let partial_leftovers =
+        wait_for_new_owned_coins_with_values(client, &signer_hex, &before_add_consume, &[100])
+            .await?;
+    if partial_leftovers.len() != 1 || decode_coin_value(&partial_leftovers[0])? != 100 {
+        bail!("partial add_liquidity did not return exactly one 100-value leftover coin");
+    }
+    let added_lp = ls_objects_by_type(client, "LpPosition")
+        .await?
+        .into_iter()
+        .find(|lp| {
+            json_str(lp, "id")
+                .map(|id| !lps_before.contains(id))
+                .unwrap_or(false)
+                && decode_lp_pool_id(lp).ok().as_ref() == Some(&pool_id)
+        })
+        .ok_or_else(|| anyhow!("partial add_liquidity did not mint a primary-pool LP"))?;
+    let added_lp_id = obj_id_from_hex(&added_lp)?;
+    if decode_lp_self_id(&added_lp)? != added_lp_id {
+        bail!("partial add_liquidity LP payload self-id mismatch");
+    }
+
+    let remove_partial_lp = PtbTx {
+        signers: vec![ptb_signer_pubkey()],
+        commands: vec![
+            PtbCommand::Move(MoveCmd {
+                petal: pool_ref(pool_hash),
+                function: "remove_liquidity".to_string(),
+                type_args: vec![],
+                args: vec![
+                    Arg::Object {
+                        id: pool_id,
+                        expected_version: ExpectedVersion(pool_version),
+                        access_mode: AccessMode::Mutable,
+                    },
+                    Arg::Object {
+                        id: added_lp_id,
+                        expected_version: ExpectedVersion(object_version(&added_lp)?),
+                        access_mode: AccessMode::Consume,
+                    },
+                ],
+            }),
+            PtbCommand::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                }],
+                owner: Owner::Address(ptb_signer_pubkey()),
+            },
+            PtbCommand::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 1,
+                }],
+                owner: Owner::Address(ptb_signer_pubkey()),
+            },
+        ],
+        gas_payer,
+        gas_budget: PTB_GAS_BUDGET,
+        gas_price: 1,
+        expiry_block: PTB_EXPIRY_BLOCK,
+        signatures: vec![],
+    };
+    let remove_partial_receipt = submit_ptb(home0, HOST_RPC_PORTS[0], remove_partial_lp)?;
+    if !remove_partial_receipt
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("remove partial add_liquidity LP reverted: {remove_partial_receipt}");
+    }
+    let latest = current_height(client).await?;
+    wait_all_reach_height(clients, latest).await?;
+    let pool_after_remove = query_object(client, pool_id_hex)
+        .await?
+        .ok_or_else(|| anyhow!("pool missing after partial LP removal"))?;
+    let (ra_remove, rb_remove) = decode_pool_reserves(&pool_after_remove)?;
+    if (ra_remove, rb_remove) != (1000, 1000) {
+        bail!(
+            "partial add_liquidity cleanup reserves got ({ra_remove}, {rb_remove}), expected (1000, 1000)"
+        );
+    }
+    pool_version = object_version(&pool_after_remove)?;
+
+    let before_exact_seed = owned_coin_ids(client, &signer_hex).await?;
+    let seed_exact_ptb = PtbTx {
+        signers: vec![ptb_signer_pubkey()],
+        commands: vec![
+            mint_cmd(faucet_hash, 120),
+            PtbCommand::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                }],
+                owner: Owner::Address(ptb_signer_pubkey()),
+            },
+        ],
+        gas_payer,
+        gas_budget: PTB_GAS_BUDGET,
+        gas_price: 1,
+        expiry_block: PTB_EXPIRY_BLOCK,
+        signatures: vec![],
+    };
+    let seed_exact_receipt = submit_ptb(home0, HOST_RPC_PORTS[0], seed_exact_ptb)?;
+    if !seed_exact_receipt
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("partial exact_out seed mint reverted: {seed_exact_receipt}");
+    }
+    let latest = current_height(client).await?;
+    wait_all_reach_height(clients, latest).await?;
+    let max_in_coin =
+        wait_for_new_owned_coins_with_values(client, &signer_hex, &before_exact_seed, &[120])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("missing persistent exact-out max_in coin"))?;
+    let before_exact = owned_coin_ids(client, &signer_hex).await?;
+    let partial_exact_ptb = PtbTx {
+        signers: vec![ptb_signer_pubkey()],
+        commands: vec![
+            PtbCommand::Move(MoveCmd {
+                petal: pool_ref(pool_hash),
+                function: "swap_exact_out".to_string(),
+                type_args: vec![],
+                args: vec![
+                    Arg::Object {
+                        id: pool_b_id,
+                        expected_version: ExpectedVersion(*pool_b_version),
+                        access_mode: AccessMode::Mutable,
+                    },
+                    Arg::Object {
+                        id: obj_id_from_hex(&max_in_coin)?,
+                        expected_version: ExpectedVersion(object_version(&max_in_coin)?),
+                        access_mode: AccessMode::Consume,
+                    },
+                    Arg::Const(90u128.to_be_bytes().to_vec()),
+                ],
+            }),
+            PtbCommand::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                }],
+                owner: Owner::Address(ptb_signer_pubkey()),
+            },
+            PtbCommand::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 1,
+                }],
+                owner: Owner::Address(ptb_signer_pubkey()),
+            },
+        ],
+        gas_payer,
+        gas_budget: PTB_GAS_BUDGET,
+        gas_price: 1,
+        expiry_block: PTB_EXPIRY_BLOCK,
+        signatures: vec![],
+    };
+    let partial_exact_receipt = submit_ptb(home0, HOST_RPC_PORTS[0], partial_exact_ptb)?;
+    if !partial_exact_receipt
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("persistent partial swap_exact_out reverted: {partial_exact_receipt}");
+    }
+    let latest = current_height(client).await?;
+    wait_all_reach_height(clients, latest).await?;
+    if query_object(client, json_str(&max_in_coin, "id")?)
+        .await?
+        .is_some()
+    {
+        bail!("partial swap_exact_out left max_in persistent input live");
+    }
+    let exact_outputs =
+        wait_for_new_owned_coins_with_values(client, &signer_hex, &before_exact, &[15, 90]).await?;
+    let mut exact_values = exact_outputs
+        .iter()
+        .map(decode_coin_value)
+        .collect::<Result<Vec<_>>>()?;
+    exact_values.sort_unstable();
+    if exact_values != vec![15, 90] {
+        bail!("partial swap_exact_out returned values {exact_values:?}, expected [15, 90]");
+    }
+    let pool_b_after = query_object(client, pool_b_id_hex)
+        .await?
+        .ok_or_else(|| anyhow!("pool B missing after partial exact_out"))?;
+    *pool_b_version = object_version(&pool_b_after)?;
+
+    eprintln!(
+        "            persistent DeX partial-consume add_liquidity and swap_exact_out conserved custody"
+    );
+    Ok(pool_version)
 }
 
 async fn exercise_live_malformed_transport(
@@ -1075,8 +1768,17 @@ async fn exercise_live_malformed_transport(
     let _ = send_oversized_rpc_line(HOST_RPC_PORTS[0]);
 
     let bad_height = current_height(client).await?.saturating_add(1);
-    let (bad_proposal_block, bad_proposal) = signed_tampered_empty_block(tmpdir, bad_height, false)
-        .context("build signed tampered proposal block")?;
+    let parent_hash = query_block(client, bad_height.saturating_sub(1))
+        .await?
+        .and_then(|b| {
+            json_str(&b, "hash")
+                .ok()
+                .and_then(|h| hash32_from_hex(h).ok())
+        })
+        .ok_or_else(|| anyhow!("missing parent block hash for height {}", bad_height - 1))?;
+    let (bad_proposal_block, bad_proposal) =
+        signed_tampered_empty_block(tmpdir, bad_height, parent_hash, false)
+            .context("build signed tampered proposal block")?;
     send_frame(
         HOST_P2P_PORTS[0],
         MsgType::BlockResponse,
@@ -1090,7 +1792,7 @@ async fn exercise_live_malformed_transport(
     )
     .context("send signed tampered proposal")?;
 
-    let (bad_sync_block, _) = signed_tampered_empty_block(tmpdir, bad_height, true)
+    let (bad_sync_block, _) = signed_tampered_empty_block(tmpdir, bad_height, parent_hash, true)
         .context("build signed tampered sync block")?;
     let bad_sync_hash = bad_sync_block.header.block_hash();
     send_frame(
@@ -1099,6 +1801,33 @@ async fn exercise_live_malformed_transport(
         &bad_sync_block.as_ssz_bytes(),
     )
     .context("send signed tampered sync block")?;
+
+    let snapshot_height = current_height(client).await?.saturating_add(20);
+    let snapshot_parent_hash = query_block(client, snapshot_height.saturating_sub(20))
+        .await?
+        .and_then(|b| {
+            json_str(&b, "hash")
+                .ok()
+                .and_then(|h| hash32_from_hex(h).ok())
+        })
+        .unwrap_or(parent_hash);
+    let (snapshot_block, _) =
+        signed_tampered_empty_block(tmpdir, snapshot_height, snapshot_parent_hash, true)
+            .context("build signed snapshot block")?;
+    let malformed_blob = malformed_snapshot_blob(
+        snapshot_block.header.height,
+        snapshot_block.header.state_root,
+        snapshot_block.header.parent_hash,
+    );
+    let malformed_blob_hash = bloom_chain_state::State::blob_hash(&malformed_blob);
+    send_snapshot_response_frame(
+        HOST_P2P_PORTS[0],
+        &snapshot_block,
+        snapshot_block.header.state_root,
+        malformed_blob_hash,
+        &malformed_blob,
+    )
+    .context("send malformed state snapshot response")?;
 
     let target = before.saturating_add(2);
     timeout(Duration::from_secs(30), wait_for_height(client, target))
@@ -1111,29 +1840,46 @@ async fn exercise_live_malformed_transport(
         bail!("validator accepted tampered execution-commitment block at height {bad_height}");
     }
     eprintln!(
-        "[net]   malformed and signed-tampered proposal/sync blocks, oversized p2p, and bounded RPC inputs rejected; chain still advances"
+        "[net]   malformed and signed-tampered proposal/sync/snapshot blocks, oversized p2p, and bounded RPC inputs rejected; chain still advances"
     );
     Ok(())
+}
+
+fn malformed_snapshot_blob(height: u64, state_root: Hash32, parent_hash: Hash32) -> Vec<u8> {
+    let mut blob = Vec::new();
+    blob.extend_from_slice(b"BLMSTATE");
+    blob.push(1);
+    blob.extend_from_slice(&height.to_le_bytes());
+    blob.extend_from_slice(&state_root.0);
+    blob.extend_from_slice(&parent_hash.0);
+    blob.extend_from_slice(&0u32.to_le_bytes()); // accounts
+    blob.extend_from_slice(&0u32.to_le_bytes()); // storage
+    blob.extend_from_slice(&0u32.to_le_bytes()); // code
+    blob.extend_from_slice(&0u32.to_le_bytes()); // objects
+    blob.extend_from_slice(&1u32.to_le_bytes()); // ownership rows
+    blob.push(0); // address owner kind
+    blob.extend_from_slice(&[0u8; 32]);
+    blob.extend_from_slice(&1_000_001u32.to_le_bytes()); // exceeds ownership id cap
+    blob
 }
 
 fn signed_tampered_empty_block(
     tmpdir: &std::path::Path,
     height: u64,
+    parent_hash: Hash32,
     with_commit: bool,
 ) -> Result<(Block, Proposal)> {
     let genesis = bloom_chain_node::genesis::Genesis::from_file(
         &tmpdir.join("home0").join("chain").join("genesis.toml"),
     )
     .map_err(|e| anyhow!("load docker genesis: {e}"))?;
-    let latest = read_block_from_home(tmpdir, 0, height.saturating_sub(1))?
-        .ok_or_else(|| anyhow!("missing parent block {}", height.saturating_sub(1)))?;
     let keys = load_validator_keys(tmpdir)?;
     let proposer = genesis.validator_set.proposer_for(height, 0).address;
     let header = BlockHeader {
         chain_id: genesis.chain_id.clone(),
         height,
-        parent_hash: latest.header.block_hash(),
-        timestamp_ms: latest.header.timestamp_ms.saturating_add(1_000),
+        parent_hash,
+        timestamp_ms: genesis.genesis_time_ms.saturating_add(height * 1_000),
         proposer,
         txs_root: empty_txs_root(),
         state_root: Hash32([0xA5; 32]),
@@ -1228,25 +1974,6 @@ fn load_validator_keys(
     Ok(out)
 }
 
-fn read_block_from_home(
-    tmpdir: &std::path::Path,
-    home_idx: usize,
-    height: u64,
-) -> Result<Option<Block>> {
-    let path = tmpdir
-        .join(format!("home{home_idx}"))
-        .join("chain")
-        .join("blocks")
-        .join(height.to_string());
-    match std::fs::read(&path) {
-        Ok(bytes) => Block::from_ssz_bytes(&bytes)
-            .map(Some)
-            .map_err(|e| anyhow!("decode block {}: {:?}", path.display(), e)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("read block {}", path.display())),
-    }
-}
-
 fn empty_txs_root() -> Hash32 {
     blake3_tagged("bloom-chain.v0.txs_root:", &[])
 }
@@ -1254,6 +1981,23 @@ fn empty_txs_root() -> Hash32 {
 fn send_frame(port: u16, msg_type: MsgType, payload: &[u8]) -> Result<()> {
     let frame = encode_wire_frame(msg_type, payload).context("encode p2p frame")?;
     send_raw_p2p_frame(port, &frame)
+}
+
+fn send_snapshot_response_frame(
+    port: u16,
+    block: &Block,
+    state_root: Hash32,
+    blob_hash: Hash32,
+    blob: &[u8],
+) -> Result<()> {
+    let block_bytes = block.as_ssz_bytes();
+    let mut payload = Vec::with_capacity(4 + block_bytes.len() + 64 + blob.len());
+    payload.extend_from_slice(&(block_bytes.len() as u32).to_be_bytes());
+    payload.extend_from_slice(&block_bytes);
+    payload.extend_from_slice(&state_root.0);
+    payload.extend_from_slice(&blob_hash.0);
+    payload.extend_from_slice(blob);
+    send_frame(port, MsgType::StateSnapshotResponse, &payload)
 }
 
 fn send_raw_p2p_frame(port: u16, bytes: &[u8]) -> Result<()> {
@@ -1380,6 +2124,92 @@ fn adversary_wasm(
     append_manifest_section(wat_to_wasm(&wat), &adversary_manifest(pool_hash))
 }
 
+fn loom_probe_manifest() -> Vec<u8> {
+    let coin_ty = loom_coin_type_tag(Hash32([0u8; 32]));
+    let manifest = PetalManifestV0 {
+        schema_version: SCHEMA_VERSION,
+        module_path: LOOM_PROBE_PATH.to_string(),
+        functions: vec![
+            FunctionDecl {
+                name: "load_merge".to_string(),
+                args: vec![
+                    ArgDecl {
+                        name: "a".to_string(),
+                        kind: ArgKind::Object {
+                            ty: coin_ty.clone(),
+                            mode: AccessMode::Mutable,
+                        },
+                    },
+                    ArgDecl {
+                        name: "b".to_string(),
+                        kind: ArgKind::Object {
+                            ty: coin_ty.clone(),
+                            mode: AccessMode::Mutable,
+                        },
+                    },
+                ],
+                returns: vec![coin_ty.clone(), coin_ty.clone()],
+                ..Default::default()
+            },
+            FunctionDecl {
+                name: "load_split".to_string(),
+                args: vec![ArgDecl {
+                    name: "coin".to_string(),
+                    kind: ArgKind::Object {
+                        ty: coin_ty,
+                        mode: AccessMode::Mutable,
+                    },
+                }],
+                returns: vec![loom_coin_type_tag(Hash32([0u8; 32]))],
+                ..Default::default()
+            },
+            FunctionDecl {
+                name: "trap_after_work".to_string(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    bloom_petal_manifest::encode(&manifest).expect("loom probe manifest encodes")
+}
+
+fn loom_probe_wasm(
+    merge_a: bloom_objects::ObjectId,
+    merge_b: bloom_objects::ObjectId,
+    split_src: bloom_objects::ObjectId,
+) -> Vec<u8> {
+    let merge_a_wat = wat_bytes(&merge_a.0);
+    let merge_b_wat = wat_bytes(&merge_b.0);
+    let split_wat = wat_bytes(&split_src.0);
+    let wat = format!(
+        r#"
+(module
+  (import "chain" "petal.return" (func $ret (param i32 i32)))
+  (memory (export "memory") 1)
+  ;; count=2 | len=32 | merge_a | len=32 | merge_b
+  (data (i32.const 0) "\00\00\00\02\00\00\00\20{merge_a_wat}\00\00\00\20{merge_b_wat}")
+  ;; count=1 | len=32 | split_src
+  (data (i32.const 128) "\00\00\00\01\00\00\00\20{split_wat}")
+  (func (export "__petal_load_merge") (param i32 i32) (result i32)
+    (call $ret (i32.const 0) (i32.const 76))
+    i32.const 0)
+  (func (export "__petal_load_split") (param i32 i32) (result i32)
+    (call $ret (i32.const 128) (i32.const 40))
+    i32.const 0)
+  (func (export "__petal_trap_after_work") (param i32 i32) (result i32)
+    (local $i i32)
+    (loop $again
+      (if (i32.lt_u (local.get $i) (i32.const 1000))
+        (then
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $again))))
+    unreachable)
+)
+"#
+    );
+    append_manifest_section(wat_to_wasm(&wat), &loom_probe_manifest())
+}
+
 fn router_probe_wasm() -> Vec<u8> {
     let wat = r#"
 (module
@@ -1394,7 +2224,7 @@ fn router_probe_wasm() -> Vec<u8> {
   (data (i32.const 64) "router probe failed")
   (func $fail
     (call $revert (i32.const 64) (i32.const 19)))
-  (func (export "__petal_quote_2hop") (param i32 i32) (result i32)
+  (func $probe (param i32 i32) (result i32)
     (local $n i32)
     (local $h1 i32)
     (local $h2 i32)
@@ -1412,6 +2242,12 @@ fn router_probe_wasm() -> Vec<u8> {
     (if (i32.le_s (local.get $n) (i32.const 0)) (then (call $fail)))
     (call $ret (i32.const 0) (i32.const 24))
     i32.const 0)
+  (export "__petal_quote_1hop" (func $probe))
+  (export "__petal_quote_2hop" (func $probe))
+  (export "__petal_quote_3hop" (func $probe))
+  (export "__petal_swap_1hop" (func $probe))
+  (export "__petal_swap_2hop" (func $probe))
+  (export "__petal_swap_3hop" (func $probe))
 )
 "#;
     append_manifest_section(wat_to_wasm(wat), real_router_manifest_bytes())
@@ -1544,8 +2380,24 @@ fn submit_ptb_bytes(home: &std::path::Path, port: u16, bytes: &[u8]) -> Result<V
 /// final `{"tx_hash":"..."}` line. Parse the first `{...}` block that carries a
 /// `success` field as the receipt.
 fn parse_receipt_from_submit_ptb(stdout: &str) -> Result<Value> {
-    parse_success_receipt(stdout)
-        .with_context(|| format!("could not parse receipt JSON from submit-ptb stdout:\n{stdout}"))
+    let mut receipt = parse_success_receipt(stdout).with_context(|| {
+        format!("could not parse receipt JSON from submit-ptb stdout:\n{stdout}")
+    })?;
+    if receipt.get("tx_hash").is_none()
+        && let Some(tx_hash) = parse_tx_hash(stdout)
+        && let Some(obj) = receipt.as_object_mut()
+    {
+        obj.insert("tx_hash".to_string(), Value::String(tx_hash));
+    }
+    Ok(receipt)
+}
+
+fn parse_tx_hash(stdout: &str) -> Option<String> {
+    stdout.lines().rev().find_map(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .and_then(|v| v.get("tx_hash").and_then(Value::as_str).map(str::to_string))
+    })
 }
 
 fn parse_success_receipt(stdout: &str) -> Result<Value> {
@@ -1750,6 +2602,60 @@ async fn query_object(client: &RpcClient, id_hex: &str) -> Result<Option<Value>>
     Ok(if v.is_null() { None } else { Some(v) })
 }
 
+async fn query_account_loom(client: &RpcClient, addr_hex: &str) -> Result<u128> {
+    let v = client
+        .call(
+            "chain_query_account",
+            serde_json::json!({ "address": addr_hex }),
+        )
+        .await?;
+    if v.is_null() {
+        return Ok(0);
+    }
+    v.get("loom")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("account response missing loom: {v}"))?
+        .parse::<u128>()
+        .with_context(|| format!("parse account loom for {addr_hex}"))
+}
+
+async fn validator_loom_balances(
+    client: &RpcClient,
+    tmpdir: &std::path::Path,
+) -> Result<std::collections::HashMap<String, u128>> {
+    let mut out = std::collections::HashMap::new();
+    for (addr, _) in load_validator_keys(tmpdir)? {
+        let addr_hex = hex::encode(addr.0);
+        out.insert(
+            addr_hex.clone(),
+            query_account_loom(client, &addr_hex).await?,
+        );
+    }
+    Ok(out)
+}
+
+async fn find_block_containing_tx(
+    client: &RpcClient,
+    from_height: u64,
+    to_height: u64,
+    tx_hash: &str,
+) -> Result<Option<Value>> {
+    for height in from_height..=to_height {
+        let Some(block) = query_block(client, height).await? else {
+            continue;
+        };
+        let contains = block
+            .get("tx_hashes")
+            .and_then(Value::as_array)
+            .map(|hashes| hashes.iter().any(|h| h.as_str() == Some(tx_hash)))
+            .unwrap_or(false);
+        if contains {
+            return Ok(Some(block));
+        }
+    }
+    Ok(None)
+}
+
 async fn assert_object_converged(clients: &[RpcClient], id_hex: &str) -> Result<()> {
     let expected = query_object(&clients[0], id_hex)
         .await?
@@ -1864,6 +2770,71 @@ async fn ls_objects_by_type(client: &RpcClient, type_name: &str) -> Result<Vec<V
     Ok(v.as_array().cloned().unwrap_or_default())
 }
 
+async fn owned_coin_ids(
+    client: &RpcClient,
+    owner_hex: &str,
+) -> Result<std::collections::HashSet<String>> {
+    Ok(ls_objects_by_owner(client, owner_hex)
+        .await?
+        .into_iter()
+        .filter(|o| o.get("type_name").and_then(Value::as_str) == Some("Coin"))
+        .filter_map(|o| json_str(&o, "id").ok().map(str::to_string))
+        .collect())
+}
+
+async fn wait_for_new_owned_coins_with_values(
+    client: &RpcClient,
+    owner_hex: &str,
+    before_ids: &std::collections::HashSet<String>,
+    expected_values: &[u128],
+) -> Result<Vec<Value>> {
+    let mut expected = expected_values.to_vec();
+    expected.sort_unstable();
+    let deadline = Instant::now() + TX_TIMEOUT;
+    loop {
+        let mut candidates = ls_objects_by_owner(client, owner_hex)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|o| o.get("type_name").and_then(Value::as_str) == Some("Coin"))
+            .filter(|o| {
+                json_str(o, "id")
+                    .map(|id| !before_ids.contains(id))
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|a, b| {
+            json_str(a, "id")
+                .unwrap_or_default()
+                .cmp(json_str(b, "id").unwrap_or_default())
+        });
+
+        let mut selected = Vec::new();
+        let mut remaining = expected.clone();
+        for candidate in &candidates {
+            let value = decode_coin_value(candidate)?;
+            if let Some(pos) = remaining.iter().position(|v| *v == value) {
+                remaining.remove(pos);
+                selected.push(candidate.clone());
+            }
+            if remaining.is_empty() {
+                return Ok(selected);
+            }
+        }
+        if Instant::now() >= deadline {
+            let mut seen = candidates
+                .iter()
+                .map(decode_coin_value)
+                .collect::<Result<Vec<_>>>()?;
+            seen.sort_unstable();
+            bail!(
+                "timed out waiting for new owned coin values {expected:?}; saw new values {seen:?}"
+            );
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// Poll until `owner_hex` owns at least one object whose `type_name == "Coin"`,
 /// returning that object's JSON.
 async fn wait_for_owned_coin(client: &RpcClient, owner_hex: &str) -> Result<Value> {
@@ -1876,6 +2847,31 @@ async fn wait_for_owned_coin(client: &RpcClient, owner_hex: &str) -> Result<Valu
             .find(|o| o.get("type_name").and_then(Value::as_str) == Some("Coin"))
         {
             return Ok(coin);
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_owned_coins(
+    client: &RpcClient,
+    owner_hex: &str,
+    count: usize,
+) -> Result<Vec<Value>> {
+    loop {
+        let mut coins = ls_objects_by_owner(client, owner_hex)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|o| o.get("type_name").and_then(Value::as_str) == Some("Coin"))
+            .collect::<Vec<_>>();
+        coins.sort_by(|a, b| {
+            json_str(a, "id")
+                .unwrap_or_default()
+                .cmp(json_str(b, "id").unwrap_or_default())
+        });
+        if coins.len() >= count {
+            coins.truncate(count);
+            return Ok(coins);
         }
         sleep(Duration::from_millis(250)).await;
     }
@@ -1916,6 +2912,22 @@ fn obj_id_from_hex(obj: &Value) -> Result<bloom_objects::ObjectId> {
     Ok(bloom_objects::ObjectId(a))
 }
 
+fn hash32_from_hex(hexs: &str) -> Result<Hash32> {
+    let b = hex::decode(hexs).context("decode hash hex")?;
+    if b.len() != 32 {
+        bail!("hash not 32 bytes: {hexs}");
+    }
+    let mut a = [0u8; 32];
+    a.copy_from_slice(&b);
+    Ok(Hash32(a))
+}
+
+fn object_version(obj: &Value) -> Result<u64> {
+    obj.get("version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("object missing version: {obj}"))
+}
+
 fn payload_bytes(obj: &Value) -> Result<Vec<u8>> {
     let hexs = json_str(obj, "payload")?;
     hex::decode(hexs).context("decode object payload hex")
@@ -1937,4 +2949,17 @@ fn decode_lp_pool_id(obj: &Value) -> Result<bloom_objects::ObjectId> {
     let (pool_id, _shares) = bloom_petal_dex_pool::payload::decode_lp(&payload)
         .ok_or_else(|| anyhow!("decode_lp failed for payload {} bytes", payload.len()))?;
     Ok(pool_id)
+}
+
+fn decode_lp_self_id(obj: &Value) -> Result<bloom_objects::ObjectId> {
+    let payload = payload_bytes(obj)?;
+    if payload.len() < 32 {
+        bail!(
+            "decode_lp self id failed for payload {} bytes",
+            payload.len()
+        );
+    }
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&payload[..32]);
+    Ok(bloom_objects::ObjectId(id))
 }

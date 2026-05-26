@@ -322,6 +322,15 @@ pub fn validate_block_for_apply(
                 hex::encode(tx.tx_hash().0)
             ));
         }
+        let expected_sender = Address::from_pubkey_bytes(&tx.pubkey.0);
+        if expected_sender != tx.sender {
+            return Err(format!(
+                "tx sender/pubkey mismatch (tx_hash={}, sender={}, derived={})",
+                hex::encode(tx.tx_hash().0),
+                hex::encode(tx.sender.0),
+                hex::encode(expected_sender.0)
+            ));
+        }
         let digest = tx.signing_digest();
         if !verifier.verify(&tx.pubkey, &digest.0, &tx.sig) {
             return Err(format!(
@@ -407,6 +416,7 @@ pub fn validate_block_for_proposal(
     block: &Block,
     expected_height: u64,
     expected_round: u32,
+    expected_header_proposer_round: u32,
     expected_chain_id: &str,
     expected_parent_hash: Hash32,
     validator_set: &ValidatorSet,
@@ -435,15 +445,16 @@ pub fn validate_block_for_proposal(
         ));
     }
     let expected_proposer = validator_set
-        .proposer_for(expected_height, expected_round)
+        .proposer_for(expected_height, expected_header_proposer_round)
         .address;
     if h.proposer != expected_proposer {
         return Err(format!(
-            "header.proposer={} != expected proposer={} for height={} round={}",
+            "header.proposer={} != expected proposer={} for height={} proposal_round={} header_round={}",
             hex::encode(h.proposer.0),
             hex::encode(expected_proposer.0),
             expected_height,
-            expected_round
+            expected_round,
+            expected_header_proposer_round
         ));
     }
     let computed_txs_root = compute_txs_root(&block.txs);
@@ -471,6 +482,15 @@ pub fn validate_block_for_proposal(
                 tx.chain_id,
                 expected_chain_id,
                 hex::encode(tx.tx_hash().0)
+            ));
+        }
+        let expected_sender = Address::from_pubkey_bytes(&tx.pubkey.0);
+        if expected_sender != tx.sender {
+            return Err(format!(
+                "tx sender/pubkey mismatch (tx_hash={}, sender={}, derived={})",
+                hex::encode(tx.tx_hash().0),
+                hex::encode(tx.sender.0),
+                hex::encode(expected_sender.0)
             ));
         }
         let digest = tx.signing_digest();
@@ -895,6 +915,7 @@ impl<E: PetalExecutor> ConsensusDriver<E> {
         block: &Block,
         expected_height: u64,
         expected_round: u32,
+        expected_header_proposer_round: u32,
     ) -> std::result::Result<(), String> {
         let parent = self
             .expected_parent_hash(expected_height)
@@ -904,11 +925,25 @@ impl<E: PetalExecutor> ConsensusDriver<E> {
             block,
             expected_height,
             expected_round,
+            expected_header_proposer_round,
             &self.chain_id,
             parent,
             &validator_set,
             &XdsaVerifier,
         )?;
+        let state = self.state.lock();
+        validate_block_execution(&state, self.executor.as_ref(), block, self.block_emission)
+            .map(|_| ())
+    }
+
+    /// Validate a committed block, including commit proof and deterministic
+    /// execution outputs, without mutating state or durable stores.
+    pub fn validate_committed_block(
+        &self,
+        block: &Block,
+        expected_height: u64,
+    ) -> std::result::Result<(), String> {
+        self.validate_block(block, expected_height)?;
         let state = self.state.lock();
         validate_block_execution(&state, self.executor.as_ref(), block, self.block_emission)
             .map(|_| ())
@@ -930,26 +965,19 @@ impl<E: PetalExecutor> ConsensusDriver<E> {
                 reason
             ));
         }
-        // Validate execution on a scratch clone, then atomically install that
-        // already-validated state. Malformed committed blocks never partially
-        // mutate consensus state, and the header must commit to execution.
+        // Validate execution on a scratch clone. Durable writes below publish
+        // the block/blob first and the state index last; only after that commit
+        // marker succeeds do we install the already-validated state in memory.
         let execution = {
-            let mut state = self.state.lock();
-            let execution = validate_block_execution(
-                &state,
-                self.executor.as_ref(),
-                block,
-                self.block_emission,
-            )
-            .map_err(|reason| {
-                anyhow::anyhow!(
-                    "block execution validation failed at height {}: {}",
-                    height,
-                    reason
-                )
-            })?;
-            *state = execution.state.clone();
-            execution
+            let state = self.state.lock();
+            validate_block_execution(&state, self.executor.as_ref(), block, self.block_emission)
+                .map_err(|reason| {
+                    anyhow::anyhow!(
+                        "block execution validation failed at height {}: {}",
+                        height,
+                        reason
+                    )
+                })?
         };
         let total_fuel_used = execution.fuel_used;
         let receipts = execution.receipts;
@@ -957,7 +985,9 @@ impl<E: PetalExecutor> ConsensusDriver<E> {
         let (blob_data, expected_blob_hash) =
             execution.state.to_blob(height, block.header.parent_hash);
 
-        // Persist block and update indices.
+        // Persist block/blob durably, then publish the state index last as the
+        // restart commit marker. A crash before this point leaves no newer
+        // checkpoint for restart to select.
         let blob_hash = self.blob_store.put(&blob_data)?;
         if blob_hash != expected_blob_hash {
             return Err(anyhow::anyhow!(
@@ -967,8 +997,11 @@ impl<E: PetalExecutor> ConsensusDriver<E> {
                 hex::encode(blob_hash.0)
             ));
         }
-        self.state_index.put(height, &state_root, &blob_hash)?;
         self.block_store.put(height, block)?;
+        self.state_index.put(height, &state_root, &blob_hash)?;
+        {
+            *self.state.lock() = execution.state.clone();
+        }
         self.block_store.prune(height)?;
         self.blob_store.gc(&[blob_hash])?;
 

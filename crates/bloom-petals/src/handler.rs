@@ -259,6 +259,9 @@ fn map_err(e: PetalError) -> HandlerError {
         }
         PetalError::ModeUnsupported(s) => HandlerError::invalid(format!("mode unsupported: {s}")),
         PetalError::ChainCall(s) => HandlerError::Backend(format!("chain call: {s}")),
+        PetalError::ChainCallTrap { detail, fuel_used } => HandlerError::Backend(format!(
+            "chain call trapped after {fuel_used} fuel: {detail}"
+        )),
     }
 }
 

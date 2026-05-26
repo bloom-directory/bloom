@@ -51,7 +51,8 @@ impl StateBlobStore {
         let hash = State::blob_hash(data);
         let path = self.path_for(&hash);
         if !path.exists() {
-            std::fs::write(&path, data)
+            let tmp_path = self.root.join(format!(".{}.tmp", hex::encode(hash.0)));
+            write_atomic(&tmp_path, &path, data)
                 .with_context(|| format!("write state blob {}", hex::encode(hash.0)))?;
             debug!(hash = %hex::encode(hash.0), bytes = data.len(), "state_blob.put");
         }
@@ -115,4 +116,29 @@ impl StateBlobStore {
         }
         Ok(())
     }
+}
+
+fn write_atomic(tmp_path: &Path, final_path: &Path, bytes: &[u8]) -> Result<()> {
+    {
+        let mut file = std::fs::File::create(tmp_path)
+            .with_context(|| format!("create temp file {}", tmp_path.display()))?;
+        use std::io::Write;
+        file.write_all(bytes)
+            .with_context(|| format!("write temp file {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync temp file {}", tmp_path.display()))?;
+    }
+    std::fs::rename(tmp_path, final_path).with_context(|| {
+        format!(
+            "rename temp file {} -> {}",
+            tmp_path.display(),
+            final_path.display()
+        )
+    })?;
+    if let Some(parent) = final_path.parent()
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }

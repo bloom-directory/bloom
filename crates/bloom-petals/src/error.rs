@@ -33,6 +33,8 @@ pub enum PetalError {
     ModeUnsupported(String),
     #[error("chain call error: {0}")]
     ChainCall(String),
+    #[error("chain call trapped after {fuel_used} fuel: {detail}")]
+    ChainCallTrap { detail: String, fuel_used: u64 },
 }
 
 impl PetalError {

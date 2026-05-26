@@ -231,6 +231,8 @@ pub enum PtbError {
         cmd_idx: u16,
         /// Petal-defined abort code.
         code: i32,
+        /// Fuel consumed before the abort.
+        fuel_used: u64,
     },
     /// Built-in command failed (split/merge type mismatch, transfer to
     /// invalid owner, ...).

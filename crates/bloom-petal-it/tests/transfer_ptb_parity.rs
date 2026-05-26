@@ -42,7 +42,7 @@ use bloom_script::{
     PetalRef, PqSignature, PtbTx, UseRef, encode_ptb,
 };
 
-use bloom_petal_it::harness::{addr, build_state, genesis_coin_id, wat_to_wasm};
+use bloom_petal_it::harness::{addr, build_state, genesis_coin_id, seed_coin, wat_to_wasm};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -128,6 +128,7 @@ fn coin_loader_wat(coin_id: bloom_objects::ObjectId) -> String {
 ///   cmd 2 TransferObjects([Use(1,0)], bob) → delivers amount-coin to bob
 fn apply_ptb_split_transfer(state: &mut State, alice: Address, bob: Address, amount: u128) {
     let alice_coin_id = genesis_coin_id(alice, 0);
+    let gas_coin_id = genesis_coin_id(alice, 1);
 
     let wasm = wat_to_wasm(&coin_loader_wat(alice_coin_id));
     let petal_hash = state.insert_code(&wasm);
@@ -185,7 +186,7 @@ fn apply_ptb_split_transfer(state: &mut State, alice: Address, bob: Address, amo
                 owner: bloom_objects::Owner::Address(bob.0),
             },
         ],
-        gas_payer: alice_coin_id,
+        gas_payer: gas_coin_id,
         gas_budget: 200_000,
         gas_price: 0,
         expiry_block: 100,
@@ -244,9 +245,11 @@ fn transfer_and_ptb_structural_equivalence() {
     // State A: apply TxKind::Transfer
     let mut state_a = build_state(&[(alice, 1_000)]);
     apply_transfer(&mut state_a, alice, bob, 300);
+    seed_coin(&mut state_a, genesis_coin_id(alice, 1), alice, 1);
 
     // State B: apply PTB SplitCoins + TransferObjects
     let mut state_b = build_state(&[(alice, 1_000)]);
+    seed_coin(&mut state_b, genesis_coin_id(alice, 1), alice, 1);
     apply_ptb_split_transfer(&mut state_b, alice, bob, 300);
 
     // ── Account.loom ─────────────────────────────────────────────────────────
@@ -303,6 +306,9 @@ fn transfer_and_ptb_structural_equivalence() {
     );
 
     // ── Spot-check expected values ────────────────────────────────────────────
-    assert_eq!(alice_coins_a, 700, "alice must have 700 total Coin<LOOM>");
+    assert_eq!(
+        alice_coins_a, 701,
+        "alice must have 700 transfer Coin<LOOM> plus the separate gas coin"
+    );
     assert_eq!(bob_coins_a, 300, "bob must have 300 total Coin<LOOM>");
 }

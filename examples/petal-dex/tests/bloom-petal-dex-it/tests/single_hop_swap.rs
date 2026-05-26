@@ -20,8 +20,8 @@ use bloom_script::{
 };
 
 use bloom_petal_dex_it::dex_harness::{
-    addr, build_state, genesis_coin_id, ptb_decode_coin_value, single_manifest, submit_ptb,
-    wat_to_wasm,
+    addr, build_state, genesis_coin_id, ptb_decode_coin_value, seed_coin, single_manifest,
+    submit_ptb, wat_to_wasm,
 };
 
 fn params(fee_bps: u16) -> ConstantProductParams {
@@ -65,6 +65,8 @@ fn ptb_single_hop_swap_shape() {
 
     let mut state = build_state(&[(alice, 1000)]);
     let alice_coin_id = genesis_coin_id(alice, 0);
+    let gas_coin_id = genesis_coin_id(alice, 1);
+    seed_coin(&mut state, gas_coin_id, alice, 1);
 
     // WAT petal: takes alice's coin as Arg::Object, returns its id (40-byte envelope)
     // simulating a "router load coin" operation.
@@ -141,7 +143,7 @@ fn ptb_single_hop_swap_shape() {
                 owner: Owner::Address(bob.0),
             },
         ],
-        gas_payer: alice_coin_id,
+        gas_payer: gas_coin_id,
         gas_budget: 200_000,
         gas_price: 0,
         expiry_block: 100,

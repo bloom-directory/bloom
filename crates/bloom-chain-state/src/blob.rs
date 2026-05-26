@@ -81,6 +81,19 @@ pub const STATE_BLOB_HASH_TAG: &str = "bloom-chain.v0.state_blob:";
 
 /// Maximum number of blobs retained in the store (spec §6.3).
 pub const MAX_RETAINED_BLOBS: usize = 256;
+/// Maximum accepted state blob size. Matches the transport frame payload cap.
+pub const MAX_STATE_BLOB_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ACCOUNTS: usize = 1_000_000;
+const MAX_STORAGE_ADDRS: usize = 1_000_000;
+const MAX_STORAGE_SLOTS_PER_ADDR: usize = 1_000_000;
+const MAX_CODE_ENTRIES: usize = 100_000;
+const MAX_CODE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_OBJECTS: usize = 1_000_000;
+const MAX_OBJECT_BYTES: usize = 1 * 1024 * 1024;
+const MAX_OWNERSHIP_ROWS: usize = 1_000_000;
+const MAX_OWNERSHIP_IDS_PER_ROW: usize = 1_000_000;
+const MAX_VFS_ENTRIES: usize = 100_000;
+const MAX_VFS_PATH_BYTES: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // Encode helpers
@@ -133,6 +146,54 @@ fn read_exact<'a>(buf: &'a [u8], off: &mut usize, len: usize) -> Result<&'a [u8]
     let out = &buf[*off..*off + len];
     *off += len;
     Ok(out)
+}
+
+fn remaining(buf: &[u8], off: usize) -> usize {
+    buf.len().saturating_sub(off)
+}
+
+fn read_count_le(
+    buf: &[u8],
+    off: &mut usize,
+    section: &str,
+    max_count: usize,
+    min_bytes_per_item: usize,
+) -> Result<usize, StateError> {
+    let count = read_u32_le(buf, off)? as usize;
+    if count > max_count {
+        return Err(StateError::BlobDecode(format!(
+            "{section} count {count} exceeds cap {max_count}"
+        )));
+    }
+    if min_bytes_per_item > 0 {
+        let max_possible = remaining(buf, *off) / min_bytes_per_item;
+        if count > max_possible {
+            return Err(StateError::BlobDecode(format!(
+                "{section} count {count} exceeds remaining bytes"
+            )));
+        }
+    }
+    Ok(count)
+}
+
+fn read_len_le(
+    buf: &[u8],
+    off: &mut usize,
+    section: &str,
+    max_len: usize,
+) -> Result<usize, StateError> {
+    let len = read_u32_le(buf, off)? as usize;
+    if len > max_len {
+        return Err(StateError::BlobDecode(format!(
+            "{section} length {len} exceeds cap {max_len}"
+        )));
+    }
+    if len > remaining(buf, *off) {
+        return Err(StateError::BlobDecode(format!(
+            "{section} length {len} exceeds remaining bytes"
+        )));
+    }
+    Ok(len)
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +329,13 @@ impl State {
 
     /// Deserialize a state blob and verify its state root.
     pub fn from_blob(bytes: &[u8], expected_state_root: Hash32) -> Result<State, StateError> {
+        if bytes.len() > MAX_STATE_BLOB_BYTES {
+            return Err(StateError::BlobDecode(format!(
+                "state blob is {} bytes, exceeds cap {}",
+                bytes.len(),
+                MAX_STATE_BLOB_BYTES
+            )));
+        }
         // --- Header ---
         let (_, stored_root, _) = Self::blob_header(bytes)?;
         let mut off = 8 + 1 + 8 + 32 + 32;
@@ -282,7 +350,13 @@ impl State {
         let mut state = State::new();
 
         // --- Accounts section ---
-        let account_count = read_u32_le(bytes, &mut off)? as usize;
+        let account_count = read_count_le(
+            bytes,
+            &mut off,
+            "accounts",
+            MAX_ACCOUNTS,
+            32 + Account::SSZ_LEN,
+        )?;
         for _ in 0..account_count {
             let addr_bytes = read_bytes32(bytes, &mut off)?;
             if bytes.len() < off + Account::SSZ_LEN {
@@ -297,11 +371,18 @@ impl State {
         }
 
         // --- Storage section ---
-        let addr_count = read_u32_le(bytes, &mut off)? as usize;
+        let addr_count =
+            read_count_le(bytes, &mut off, "storage addresses", MAX_STORAGE_ADDRS, 36)?;
         for _ in 0..addr_count {
             let addr_bytes = read_bytes32(bytes, &mut off)?;
             let addr = Address(addr_bytes);
-            let slot_count = read_u32_le(bytes, &mut off)? as usize;
+            let slot_count = read_count_le(
+                bytes,
+                &mut off,
+                "storage slots",
+                MAX_STORAGE_SLOTS_PER_ADDR,
+                64,
+            )?;
             for _ in 0..slot_count {
                 let key = read_bytes32(bytes, &mut off)?;
                 let val = read_bytes32(bytes, &mut off)?;
@@ -310,10 +391,10 @@ impl State {
         }
 
         // --- Code section ---
-        let code_count = read_u32_le(bytes, &mut off)? as usize;
+        let code_count = read_count_le(bytes, &mut off, "code", MAX_CODE_ENTRIES, 36)?;
         for _ in 0..code_count {
             let hash = Hash32(read_bytes32(bytes, &mut off)?);
-            let wasm_len = read_u32_le(bytes, &mut off)? as usize;
+            let wasm_len = read_len_le(bytes, &mut off, "code bytes", MAX_CODE_BYTES)?;
             let wasm = read_exact(bytes, &mut off, wasm_len)?;
             let inserted_hash = state.insert_code(wasm);
             if inserted_hash != hash {
@@ -325,10 +406,10 @@ impl State {
         }
 
         // --- Objects section ---
-        let object_count = read_u32_le(bytes, &mut off)? as usize;
+        let object_count = read_count_le(bytes, &mut off, "objects", MAX_OBJECTS, 36)?;
         for _ in 0..object_count {
             let id = ObjectId(read_bytes32(bytes, &mut off)?);
-            let obj_len = read_u32_le(bytes, &mut off)? as usize;
+            let obj_len = read_len_le(bytes, &mut off, "object bytes", MAX_OBJECT_BYTES)?;
             let obj_bytes = read_exact(bytes, &mut off, obj_len)?;
             let obj = Object::decode_canonical(obj_bytes)
                 .map_err(|e| StateError::BlobDecode(format!("object decode: {e}")))?;
@@ -339,13 +420,19 @@ impl State {
         }
 
         // --- Ownership section ---
-        let ownership_count = read_u32_le(bytes, &mut off)? as usize;
+        let ownership_count = read_count_le(bytes, &mut off, "ownership", MAX_OWNERSHIP_ROWS, 37)?;
         for _ in 0..ownership_count {
             let key_bytes = read_exact(bytes, &mut off, 33)?;
             let key = OwnershipIndexKey::decode(key_bytes)
                 .map_err(|e| StateError::BlobDecode(format!("ownership key decode: {e}")))?;
-            let id_count = read_u32_le(bytes, &mut off)? as usize;
-            let mut ids = Vec::with_capacity(id_count);
+            let id_count = read_count_le(
+                bytes,
+                &mut off,
+                "ownership ids",
+                MAX_OWNERSHIP_IDS_PER_ROW,
+                32,
+            )?;
+            let mut ids = Vec::new();
             for _ in 0..id_count {
                 ids.push(ObjectId(read_bytes32(bytes, &mut off)?));
             }
@@ -353,9 +440,9 @@ impl State {
         }
 
         // --- VFS section ---
-        let vfs_count = read_u32_le(bytes, &mut off)? as usize;
+        let vfs_count = read_count_le(bytes, &mut off, "vfs", MAX_VFS_ENTRIES, 36)?;
         for _ in 0..vfs_count {
-            let path_len = read_u32_le(bytes, &mut off)? as usize;
+            let path_len = read_len_le(bytes, &mut off, "vfs path", MAX_VFS_PATH_BYTES)?;
             let path_bytes = read_exact(bytes, &mut off, path_len)?;
             let path = std::str::from_utf8(path_bytes)
                 .map_err(|e| StateError::BlobDecode(format!("vfs path utf8: {e}")))?

@@ -49,6 +49,28 @@ const SIG_EMPTY: &[WasmValType] = &[];
 /// `handle` is an opaque `i32` index into the runtime's borrow table
 /// (never the raw `ObjectId`).
 pub const NEW_HOST_IMPORTS: &[HostImport] = &[
+    // -------- chain.* --------
+    HostImport {
+        module: "chain",
+        name: "msg.calldata.read",
+        // (dst_ptr i32, offset i32, len i32) -> len i32
+        params: SIG_I32_I32_I32,
+        results: SIG_I32,
+    },
+    HostImport {
+        module: "chain",
+        name: "petal.return",
+        // (data_ptr i32, data_len i32) -> trap/()
+        params: SIG_I32_I32,
+        results: SIG_EMPTY,
+    },
+    HostImport {
+        module: "chain",
+        name: "petal.revert",
+        // (reason_ptr i32, reason_len i32) -> trap/()
+        params: SIG_I32_I32,
+        results: SIG_EMPTY,
+    },
     // -------- object.* --------
     HostImport {
         module: "object",
@@ -106,6 +128,13 @@ pub const NEW_HOST_IMPORTS: &[HostImport] = &[
         params: SIG_I32,
         results: SIG_I32,
     },
+    HostImport {
+        module: "object",
+        name: "id",
+        // (handle i32, out_ptr i32) -> i32
+        params: SIG_I32_I32,
+        results: SIG_I32,
+    },
     // -------- cap.* --------
     HostImport {
         module: "cap",
@@ -161,6 +190,9 @@ mod tests {
     /// The complete spec §16.2 list as `(module, name, n_params, n_results)`.
     /// Updating this fixture deliberately requires re-reading the spec.
     const EXPECTED: &[(&str, &str, usize, usize)] = &[
+        ("chain", "msg.calldata.read", 3, 1),
+        ("chain", "petal.return", 2, 0),
+        ("chain", "petal.revert", 2, 0),
         ("object", "borrow", 2, 1),
         ("object", "read", 3, 1),
         ("object", "mutate", 3, 1),
@@ -169,6 +201,7 @@ mod tests {
         ("object", "share", 1, 1),
         ("object", "freeze", 1, 1),
         ("object", "delete", 1, 1),
+        ("object", "id", 2, 1),
         ("cap", "check", 3, 1),
         ("signer", "index", 0, 1),
         ("signer", "address", 2, 1),

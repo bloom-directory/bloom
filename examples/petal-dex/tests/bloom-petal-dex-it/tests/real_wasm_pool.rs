@@ -704,12 +704,30 @@ fn real_pool_add_remove_and_exact_out_execute() {
     let (ra, rb, lp_supply, ..) =
         bloom_petal_dex_pool::payload::decode_pool(&pool.payload).expect("decode pool");
     assert_eq!((ra, rb, lp_supply), (1500, 1500, 1500));
+    assert!(
+        state.get_object(&add_a).is_none(),
+        "spent add_liquidity coin A must be consumed"
+    );
+    assert!(
+        state.get_object(&add_b).is_none(),
+        "spent add_liquidity coin B must be consumed even when a leftover is returned"
+    );
+    assert!(
+        !owner_has_coin_worth(&state, alice, 500),
+        "add_liquidity must not leave the spent side as a live user coin"
+    );
     assert!(owner_has_coin_worth(&state, alice, 100), "leftover B coin");
 
     let added_lp = lp_positions_owned_by(&state, alice)
         .into_iter()
         .find(|id| !lps_before_add.contains(id))
         .expect("add_liquidity minted a new LP position");
+    let added_lp_obj = state.get_object(&added_lp).expect("added LP");
+    assert_eq!(
+        lp_payload_self_id(&added_lp_obj.payload),
+        added_lp,
+        "add_liquidity LP payload self-id must match its object id"
+    );
     let added_lp_version = state.get_object(&added_lp).expect("added LP").version;
     let remove_ptb = PtbTx {
         signers: vec![alice.0],
@@ -827,7 +845,95 @@ fn real_pool_add_remove_and_exact_out_execute() {
         "swap_exact_out must succeed; revert: {}",
         String::from_utf8_lossy(&out.return_data)
     );
+    assert!(
+        state.get_object(&bob_coin).is_none(),
+        "swap_exact_out must consume max_in coin when returning a leftover"
+    );
     assert!(owner_has_coin_worth(&state, bob, 90), "exact output coin");
+    assert!(
+        owner_has_coin_worth(&state, bob, 20),
+        "exact-out leftover coin"
+    );
+    assert!(
+        !owner_has_coin_worth(&state, bob, 120),
+        "swap_exact_out must not leave max_in as a live user coin"
+    );
+}
+
+#[test]
+#[ignore = "compiles pool to wasm32; run with `-- --ignored`"]
+fn real_pool_high_fee_exact_out_executes() {
+    let alice = addr(0xA1);
+    let bob = addr(0xB0);
+    let mut state = build_state(&[(alice, 1_000_000), (bob, 1_000_000)]);
+
+    let wasm = std::fs::read(build_pool_wasm()).expect("read pool wasm");
+    let pool_petal_hash = state.insert_code(&wasm);
+    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_petal_hash);
+
+    let pool_id = create_shared_pool(&mut state, alice, pool_petal_hash, b"high-fee", 9999);
+    let max_in = erased_coin_id(b"bob-high-fee-exact-out");
+    seed_erased_coin(&mut state, max_in, Owner::Address(bob.0), 20_000);
+
+    let ptb = PtbTx {
+        signers: vec![bob.0],
+        commands: vec![
+            Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/bloom/dex/pool".to_string(),
+                    hash: Some(pool_petal_hash),
+                },
+                function: "swap_exact_out".to_string(),
+                type_args: vec![],
+                args: vec![
+                    Arg::Object {
+                        id: pool_id,
+                        expected_version: ExpectedVersion(
+                            state.get_object(&pool_id).expect("pool").version,
+                        ),
+                        access_mode: AccessMode::Mutable,
+                    },
+                    Arg::Object {
+                        id: max_in,
+                        expected_version: ExpectedVersion(0),
+                        access_mode: AccessMode::Consume,
+                    },
+                    Arg::Const(1u128.to_be_bytes().to_vec()),
+                ],
+            }),
+            Command::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                }],
+                owner: Owner::Address(bob.0),
+            },
+        ],
+        gas_payer: genesis_coin_id(bob, 1),
+        gas_budget: 2_000_000,
+        gas_price: 0,
+        expiry_block: 100,
+        signatures: vec![PqSignature(vec![0u8; 64])],
+    };
+
+    let out = submit_ptb_chain_auth(&mut state, bob, ptb);
+    assert!(
+        out.success,
+        "9999 bps swap_exact_out must find valid max input; revert: {}",
+        String::from_utf8_lossy(&out.return_data)
+    );
+    assert!(
+        state.get_object(&max_in).is_none(),
+        "high-fee exact-out must consume max input coin"
+    );
+    assert!(owner_has_coin_worth(&state, bob, 1), "exact output coin");
+
+    let pool = state
+        .get_object(&pool_id)
+        .expect("pool after high-fee exact out");
+    let (ra, rb, ..) =
+        bloom_petal_dex_pool::payload::decode_pool(&pool.payload).expect("decode pool");
+    assert_eq!((ra, rb), (21_000, 999));
 }
 
 fn lp_positions_owned_by(
@@ -854,6 +960,12 @@ fn owned_ids(
             owner_id: who.0,
         })
         .unwrap_or_default()
+}
+
+fn lp_payload_self_id(payload: &[u8]) -> bloom_objects::ObjectId {
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&payload[..32]);
+    bloom_objects::ObjectId(id)
 }
 
 fn swap_exact_in_ptb(

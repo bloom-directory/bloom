@@ -86,6 +86,17 @@ fn build_nontrivial_state() -> State {
     s
 }
 
+fn empty_blob_prefix() -> Vec<u8> {
+    let state_root = State::new().state_root();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"BLMSTATE");
+    bytes.push(1);
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&state_root.0);
+    bytes.extend_from_slice(&Hash32([0u8; 32]).0);
+    bytes
+}
+
 // ---------------------------------------------------------------------------
 // Round-trip: build → blob → restore → verify state_root
 // ---------------------------------------------------------------------------
@@ -216,6 +227,70 @@ fn blob_rejects_tampered_bytes() {
     // or the reconstructed state won't match — either way, an error.
     let result = State::from_blob(&blob_bytes, expected_root);
     assert!(result.is_err(), "should reject tampered blob");
+}
+
+#[test]
+fn blob_rejects_huge_ownership_id_count_without_allocating() {
+    let expected_root = State::new().state_root();
+    let mut blob = empty_blob_prefix();
+    // accounts, storage addresses, code, objects
+    for _ in 0..4 {
+        blob.extend_from_slice(&0u32.to_le_bytes());
+    }
+    // ownership rows = 1
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    // ownership key
+    blob.push(OWNER_KIND_ADDRESS);
+    blob.extend_from_slice(&[0x11u8; 32]);
+    // malicious id_count with no backing bytes
+    blob.extend_from_slice(&u32::MAX.to_le_bytes());
+
+    let err = State::from_blob(&blob, expected_root).unwrap_err();
+    assert!(
+        format!("{err}").contains("ownership ids"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn blob_rejects_oversized_object_length() {
+    let expected_root = State::new().state_root();
+    let mut blob = empty_blob_prefix();
+    // accounts, storage addresses, code
+    for _ in 0..3 {
+        blob.extend_from_slice(&0u32.to_le_bytes());
+    }
+    // objects = 1, id, object length above cap
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&[0x44u8; 32]);
+    blob.extend_from_slice(&(2 * 1024 * 1024u32).to_le_bytes());
+
+    let err = State::from_blob(&blob, expected_root).unwrap_err();
+    assert!(
+        format!("{err}").contains("object bytes"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn blob_rejects_oversized_vfs_path_length() {
+    let expected_root = State::new().state_root();
+    let mut blob = empty_blob_prefix();
+    // accounts, storage addresses, code, objects, ownership
+    for _ in 0..5 {
+        blob.extend_from_slice(&0u32.to_le_bytes());
+    }
+    // vfs entries = 1, path length above cap
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&5000u32.to_le_bytes());
+    blob.extend(std::iter::repeat_n(0u8, 5000));
+    blob.extend_from_slice(&Hash32([0xAA; 32]).0);
+
+    let err = State::from_blob(&blob, expected_root).unwrap_err();
+    assert!(
+        format!("{err}").contains("vfs path"),
+        "unexpected error: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------

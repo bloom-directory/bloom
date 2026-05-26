@@ -31,6 +31,7 @@ clap    = { version = "4", features = ["derive", "env"] }
 hex     = "0.4"
 zbase32 = "0.1"
 ed25519-dalek.workspace = true
+wasmparser.workspace = true
 
 [dev-dependencies]
 bloom-test-util = { path = "../bloom-test-util" }

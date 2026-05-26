@@ -95,6 +95,39 @@ pub fn restore_state_from_storage<E: PetalExecutor>(
                     hex::encode(actual_blob_hash.0)
                 ));
             }
+            let (blob_height, blob_state_root, _) = State::blob_header(&blob)
+                .with_context(|| format!("read state checkpoint blob header at height {h}"))?;
+            if blob_height != h || blob_state_root != state_root {
+                warn!(
+                    height = h,
+                    blob_height,
+                    indexed_root = %hex::encode(state_root.0),
+                    blob_root = %hex::encode(blob_state_root.0),
+                    "node.startup: skipping incomplete state checkpoint with mismatched blob header"
+                );
+                continue;
+            }
+            if h > 0 {
+                let Some(block) = block_store
+                    .get(h)
+                    .with_context(|| format!("read checkpoint block {h}"))?
+                else {
+                    warn!(
+                        height = h,
+                        "node.startup: skipping state checkpoint because block is missing"
+                    );
+                    continue;
+                };
+                if block.header.state_root != state_root {
+                    warn!(
+                        height = h,
+                        indexed_root = %hex::encode(state_root.0),
+                        block_root = %hex::encode(block.header.state_root.0),
+                        "node.startup: skipping state checkpoint because block root mismatches"
+                    );
+                    continue;
+                }
+            }
             let state = State::from_blob(&blob, state_root)
                 .with_context(|| format!("restore state checkpoint at height {h}"))?;
             checkpoint = Some((h, state));
@@ -416,6 +449,7 @@ impl Node {
             chain_id: chain_id.clone(),
             genesis_hash: cfg.genesis.genesis_hash,
             local_address,
+            startup_height: latest_height,
             tx_submit: tx_submit_tx.clone(),
         };
         let rpc_socket = chain_dir.join("rpc.sock");
@@ -520,9 +554,16 @@ impl Node {
                             let block_opt =
                                 { driver_ev.engine.lock().get_registered_block(&p.block_hash) };
                             if let Some(block) = block_opt {
-                                if let Err(e) =
-                                    driver_ev.validate_proposal_block(&block, p.height, p.round)
-                                {
+                                let header_round = {
+                                    let eng = driver_ev.engine.lock();
+                                    proposal_header_round(&eng, p.block_hash, p.round, p.pol_round)
+                                };
+                                if let Err(e) = driver_ev.validate_proposal_block(
+                                    &block,
+                                    p.height,
+                                    p.round,
+                                    header_round,
+                                ) {
                                     warn!(
                                         peer = %peer_addr,
                                         height = p.height,
@@ -661,11 +702,33 @@ impl Node {
                         let my_height = { driver_ev.engine.lock().height() };
                         let has_commit = !block.commit.votes.is_empty()
                             && block.commit.height == block.header.height;
-                        if !has_commit && block_height == my_height {
-                            let round = { driver_ev.engine.lock().round() };
-                            if let Err(e) =
-                                driver_ev.validate_proposal_block(&block, block_height, round)
-                            {
+                        if block_height == my_height {
+                            let (round, header_round) = {
+                                let eng = driver_ev.engine.lock();
+                                (
+                                    eng.round(),
+                                    block_response_header_round(&eng, block_hash, eng.round()),
+                                )
+                            };
+                            if has_commit {
+                                if let Err(e) =
+                                    driver_ev.validate_committed_block(&block, block_height)
+                                {
+                                    warn!(
+                                        peer = %peer_addr,
+                                        height = block_height,
+                                        round,
+                                        err = %e,
+                                        "block_response rejected: invalid committed block"
+                                    );
+                                    continue;
+                                }
+                            } else if let Err(e) = driver_ev.validate_proposal_block(
+                                &block,
+                                block_height,
+                                round,
+                                header_round,
+                            ) {
                                 warn!(
                                     peer = %peer_addr,
                                     height = block_height,
@@ -1165,6 +1228,39 @@ fn reload_persisted_mempool(
     Ok(())
 }
 
+fn proposal_header_round(
+    engine: &ConsensusEngine<XdsaVerifier>,
+    block_hash: Hash32,
+    proposal_round: u32,
+    pol_round: i32,
+) -> u32 {
+    if pol_round >= 0 {
+        let pol_round = pol_round as u32;
+        if engine.state.valid_block == Some((pol_round, block_hash)) {
+            return pol_round;
+        }
+    }
+    proposal_round
+}
+
+fn block_response_header_round(
+    engine: &ConsensusEngine<XdsaVerifier>,
+    block_hash: Hash32,
+    current_round: u32,
+) -> u32 {
+    if let Some(pending) = engine.state.pending_proposal.as_ref()
+        && pending.block_hash == block_hash
+    {
+        return proposal_header_round(engine, block_hash, pending.round, pending.pol_round);
+    }
+    if let Some((valid_round, valid_hash)) = engine.state.valid_block
+        && valid_hash == block_hash
+    {
+        return valid_round;
+    }
+    current_round
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot sync helper
 // ---------------------------------------------------------------------------
@@ -1272,8 +1368,8 @@ async fn apply_state_snapshot<E: PetalExecutor>(
             hex::encode(stored_blob_hash.0)
         ));
     }
-    driver.state_index.put(height, &state_root, &blob_hash)?;
     driver.block_store.put(height, &block)?;
+    driver.state_index.put(height, &state_root, &blob_hash)?;
     driver.block_store.prune(height)?;
     driver.blob_store.gc(&[blob_hash])?;
     {

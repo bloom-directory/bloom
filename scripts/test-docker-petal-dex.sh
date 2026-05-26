@@ -133,9 +133,12 @@ if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
     # `parse_b1_address` accepts a raw 64-hex string as a 32-byte Address, so
     # the genesis `address` is the signer pubkey hex; genesis then emits a
     # Coin<LOOM> owned by Owner::Address(ed25519_pk).
-    log "appending ed25519 gas allocation ($PTB_SIGNER_PK_HEX) to all 4 genesis.toml"
-    alloc_block=$(printf '\n[[allocations]]\naddress = "%s"\namount = "%s"\n' \
-        "$PTB_SIGNER_PK_HEX" "$PTB_SIGNER_ALLOCATION")
+    log "appending ed25519 gas/custody allocations ($PTB_SIGNER_PK_HEX) to all 4 genesis.toml"
+    alloc_block=""
+    for _ in gas merge-a merge-b split-src; do
+        alloc_block+=$(printf '\n[[allocations]]\naddress = "%s"\namount = "%s"\n' \
+            "$PTB_SIGNER_PK_HEX" "$PTB_SIGNER_ALLOCATION")
+    done
     for i in $(seq 0 $((BLOOM_VALIDATOR_COUNT - 1))); do
         g="$BLOOM_DOCKER_TMPDIR/home$i/chain/genesis.toml"
         [ -f "$g" ] || fail "missing genesis.toml: $g"
@@ -180,5 +183,6 @@ log "running bloom-petal-dex-it::docker_petal_dex"
 BLOOM_DOCKER_TMPDIR="$BLOOM_DOCKER_TMPDIR" \
 BLOOM_BIN="$BLOOM_BIN" \
 RUST_LOG="${RUST_LOG:-warn}" \
+RUST_MIN_STACK="${RUST_MIN_STACK:-16777216}" \
     cargo test -p bloom-petal-dex-it --test docker_petal_dex \
     -- --ignored --nocapture

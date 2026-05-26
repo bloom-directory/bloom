@@ -28,12 +28,14 @@ use bloom_chain_types::{
     vote::{Proposal, Vote},
 };
 use parking_lot::Mutex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, error, info, warn};
 
 const FRAME_DIGEST_DOMAIN: &[u8] = b"bloom-chain.v0.frame:";
+const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const TRANSPORT_MAX_INBOUND_CONNECTIONS: usize = 128;
 
 /// Inbound message decoded from the wire.
 #[derive(Debug, Clone)]
@@ -67,23 +69,36 @@ pub enum Frame {
 /// Returns `Ok(None)` on clean EOF.  Returns `Err` on malformed frames.
 /// Verifies the BLAKE3 digest before SSZ-decoding.
 pub async fn read_frame(stream: &mut TcpStream) -> Result<Option<Frame>> {
-    // Read 4-byte length header.
+    let Some((msg_type, payload)) = read_wire_frame(stream, FRAME_READ_TIMEOUT).await? else {
+        return Ok(None);
+    };
+    let frame = decode_payload(msg_type, &payload)?;
+    Ok(Some(frame))
+}
+
+async fn read_wire_frame<R>(
+    reader: &mut R,
+    read_timeout: Duration,
+) -> Result<Option<(MsgType, Vec<u8>)>>
+where
+    R: AsyncRead + Unpin,
+{
     let mut len_buf = [0u8; 4];
-    match stream.read_exact(&mut len_buf).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
+    match tokio::time::timeout(read_timeout, reader.read_exact(&mut len_buf)).await {
+        Err(_) => return Err(anyhow!("frame length read timeout")),
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Ok(Err(e)) => return Err(e.into()),
     }
     let body_len = u32::from_be_bytes(len_buf) as usize;
     if body_len > MAX_PAYLOAD_LEN + 1 + 32 {
         return Err(anyhow!("frame body too large: {body_len}"));
     }
 
-    // Read body: msg_type(1) + digest(32) + payload(body_len-33)
     let mut body = vec![0u8; body_len];
-    stream
-        .read_exact(&mut body)
+    tokio::time::timeout(read_timeout, reader.read_exact(&mut body))
         .await
+        .map_err(|_| anyhow!("frame body read timeout"))?
         .context("read frame body")?;
 
     if body.len() < 33 {
@@ -109,8 +124,7 @@ pub async fn read_frame(stream: &mut TcpStream) -> Result<Option<Frame>> {
     let msg_type = MsgType::from_byte(msg_type_byte)
         .ok_or_else(|| anyhow!("unknown msg_type byte: {msg_type_byte}"))?;
 
-    let frame = decode_payload(msg_type, payload)?;
-    Ok(Some(frame))
+    Ok(Some((msg_type, payload.to_vec())))
 }
 
 /// Write one `Frame` to a `TcpStream`.
@@ -324,54 +338,20 @@ impl PeerPool {
                         }
                     });
 
-                    // Reader half: reconstruct TcpStream from owned halves is
-                    // not directly possible; use a small bridge.
-                    // We use tokio::io::join for reading.
-                    let read_buf = vec![0u8; MAX_PAYLOAD_LEN + 37];
-                    let _ = read_buf; // suppress unused warning
-
-                    // Simplified reader: read raw bytes in a loop.
-                    // For a production implementation, this would use a codec.
-                    // Here we use a helper that works on raw AsyncRead.
                     loop {
-                        let mut len_buf = [0u8; 4];
-                        if read_half.read_exact(&mut len_buf).await.is_err() {
+                        let Some((mt, payload)) =
+                            (match read_wire_frame(&mut read_half, FRAME_READ_TIMEOUT).await {
+                                Ok(frame) => frame,
+                                Err(e) => {
+                                    warn!(peer = %addr_clone, err = %e, "frame read failed");
+                                    break;
+                                }
+                            })
+                        else {
+                            debug!(peer = %addr_clone, "connection closed");
                             break;
-                        }
-                        let body_len = u32::from_be_bytes(len_buf) as usize;
-                        if body_len > MAX_PAYLOAD_LEN + 33 {
-                            warn!(peer = %addr_clone, "frame too large, dropping connection");
-                            break;
-                        }
-                        let mut body = vec![0u8; body_len];
-                        if read_half.read_exact(&mut body).await.is_err() {
-                            break;
-                        }
-                        if body.len() < 33 {
-                            warn!(peer = %addr_clone, "frame body too short");
-                            break;
-                        }
-                        let msg_type_byte = body[0];
-                        let digest_bytes = &body[1..33];
-                        let payload = &body[33..];
-
-                        // Verify digest
-                        let expected = {
-                            let mut hasher = blake3::Hasher::new();
-                            hasher.update(FRAME_DIGEST_DOMAIN);
-                            hasher.update(&[msg_type_byte]);
-                            hasher.update(payload);
-                            *hasher.finalize().as_bytes()
                         };
-                        if digest_bytes != expected {
-                            warn!(peer = %addr_clone, "digest mismatch, dropping frame");
-                            continue;
-                        }
-                        let Some(mt) = MsgType::from_byte(msg_type_byte) else {
-                            warn!(peer = %addr_clone, msg_type = msg_type_byte, "unknown msg_type");
-                            continue;
-                        };
-                        match decode_payload(mt, payload) {
+                        match decode_payload(mt, &payload) {
                             Ok(frame) => {
                                 let _ = inbound_tx.send((addr_clone.clone(), frame)).await;
                             }
@@ -442,13 +422,35 @@ impl PeerPool {
 /// `send_to(peer_addr, BlockResponse)` silently found no writer for that
 /// ephemeral address. Catch-up and restart recovery depend on this path.
 pub async fn accept_loop(listener: TcpListener, peer_pool: Arc<PeerPool>) {
+    accept_loop_with_limits(
+        listener,
+        peer_pool,
+        TRANSPORT_MAX_INBOUND_CONNECTIONS,
+        FRAME_READ_TIMEOUT,
+    )
+    .await
+}
+
+async fn accept_loop_with_limits(
+    listener: TcpListener,
+    peer_pool: Arc<PeerPool>,
+    max_inbound_connections: usize,
+    read_timeout: Duration,
+) {
+    let permits = Arc::new(Semaphore::new(max_inbound_connections.max(1)));
     loop {
         match listener.accept().await {
             Ok((stream, peer_addr)) => {
+                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    warn!(peer = %peer_addr, "transport.inbound_rejected: limit reached");
+                    drop(stream);
+                    continue;
+                };
                 let addr_str = peer_addr.to_string();
                 let inbound_tx = peer_pool.inbound_tx.clone();
                 let peers = Arc::clone(&peer_pool.peers);
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let (mut read_half, mut write_half) = stream.into_split();
                     let (send_tx, mut send_rx) = mpsc::channel::<Vec<u8>>(256);
                     {
@@ -471,45 +473,19 @@ pub async fn accept_loop(listener: TcpListener, peer_pool: Arc<PeerPool>) {
                     });
 
                     loop {
-                        let mut len_buf = [0u8; 4];
-                        if read_half.read_exact(&mut len_buf).await.is_err() {
+                        let Some((mt, payload)) =
+                            (match read_wire_frame(&mut read_half, read_timeout).await {
+                                Ok(frame) => frame,
+                                Err(e) => {
+                                    warn!(peer = %addr_str, err = %e, "frame read failed");
+                                    break;
+                                }
+                            })
+                        else {
                             debug!(peer = %addr_str, "connection closed");
                             break;
-                        }
-                        let body_len = u32::from_be_bytes(len_buf) as usize;
-                        if body_len > MAX_PAYLOAD_LEN + 33 {
-                            warn!(peer = %addr_str, "frame too large, dropping connection");
-                            break;
-                        }
-                        let mut body = vec![0u8; body_len];
-                        if read_half.read_exact(&mut body).await.is_err() {
-                            debug!(peer = %addr_str, "connection closed");
-                            break;
-                        }
-                        if body.len() < 33 {
-                            warn!(peer = %addr_str, "frame body too short");
-                            break;
-                        }
-                        let msg_type_byte = body[0];
-                        let digest_bytes = &body[1..33];
-                        let payload = &body[33..];
-
-                        let expected = {
-                            let mut hasher = blake3::Hasher::new();
-                            hasher.update(FRAME_DIGEST_DOMAIN);
-                            hasher.update(&[msg_type_byte]);
-                            hasher.update(payload);
-                            *hasher.finalize().as_bytes()
                         };
-                        if digest_bytes != expected {
-                            warn!(peer = %addr_str, "digest mismatch, dropping frame");
-                            continue;
-                        }
-                        let Some(mt) = MsgType::from_byte(msg_type_byte) else {
-                            warn!(peer = %addr_str, msg_type = msg_type_byte, "unknown msg_type");
-                            continue;
-                        };
-                        match decode_payload(mt, payload) {
+                        match decode_payload(mt, &payload) {
                             Ok(frame) => {
                                 let _ = inbound_tx.send((addr_str.clone(), frame)).await;
                             }
@@ -530,5 +506,65 @@ pub async fn accept_loop(listener: TcpListener, peer_pool: Arc<PeerPool>) {
                 error!(err = %e, "accept_loop error");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn test_pool() -> Arc<PeerPool> {
+        let (inbound_tx, _inbound_rx) = mpsc::channel(8);
+        PeerPool::new(Vec::new(), inbound_tx)
+    }
+
+    #[tokio::test]
+    async fn inbound_slowloris_connection_is_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pool = test_pool().await;
+        let task = tokio::spawn(accept_loop_with_limits(
+            listener,
+            pool,
+            4,
+            Duration::from_millis(50),
+        ));
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(&33u32.to_be_bytes()).await.unwrap();
+
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf))
+            .await
+            .expect("server should close slow body reads")
+            .unwrap();
+        assert_eq!(n, 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn excess_inbound_connections_are_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pool = test_pool().await;
+        let task = tokio::spawn(accept_loop_with_limits(
+            listener,
+            pool,
+            1,
+            Duration::from_secs(5),
+        ));
+
+        let _held = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut rejected = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(1), rejected.read(&mut buf))
+            .await
+            .expect("excess inbound connection should be closed")
+            .unwrap();
+        assert_eq!(n, 0);
+        task.abort();
     }
 }

@@ -579,6 +579,10 @@ fn map_petal_err(id: Value, e: PetalError) -> Response {
         ),
         PetalError::ModeUnsupported(s) => (-32009, format!("mode unsupported: {s}")),
         PetalError::ChainCall(s) => (-32010, format!("chain call: {s}")),
+        PetalError::ChainCallTrap { detail, fuel_used } => (
+            -32010,
+            format!("chain call trapped after {fuel_used} fuel: {detail}"),
+        ),
     };
     debug!(code, message = %msg, "ipc.petal_err");
     Response::err(id, code, msg)

@@ -19,7 +19,9 @@ use bloom_chain_types::{
     tx::{Tx, TxKind},
     types::{Address, Hash32},
 };
-use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
+use bloom_objects::{
+    NEW_HOST_IMPORTS, OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey, WasmValType,
+};
 use bloom_petal_fungible::ops::{
     coin_payload, decode_coin_value, rewrite_value, type_tag_coin_loom,
 };
@@ -166,7 +168,146 @@ fn validate_chain_petal_admission(wasm_bytes: &[u8], module_path: &str) -> Resul
             manifest.module_path, module_path
         ));
     }
+    validate_manifest_wasm_abi(wasm_bytes, &manifest)?;
     PetalVm::validate_for_chain(wasm_bytes).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn validate_manifest_wasm_abi(
+    wasm_bytes: &[u8],
+    manifest: &bloom_petal_manifest::types::PetalManifestV0,
+) -> Result<(), String> {
+    use std::collections::HashMap;
+    use wasmparser::{ExternalKind, Parser, Payload, TypeRef, ValType};
+
+    let mut types = Vec::new();
+    let mut imported_func_types = Vec::new();
+    let mut defined_func_types = Vec::new();
+    let mut exports: HashMap<String, u32> = HashMap::new();
+
+    for payload in Parser::new(0).parse_all(wasm_bytes) {
+        let payload = payload.map_err(|e| format!("wasm parse: {e}"))?;
+        match payload {
+            Payload::TypeSection(reader) => {
+                for ty in reader.into_iter_err_on_gc_types() {
+                    let ty = ty.map_err(|e| format!("wasm type section: {e}"))?;
+                    types.push((ty.params().to_vec(), ty.results().to_vec()));
+                }
+            }
+            Payload::ImportSection(reader) => {
+                for import in reader {
+                    let import = import.map_err(|e| format!("wasm import section: {e}"))?;
+                    let TypeRef::Func(type_idx) = import.ty else {
+                        return Err(format!(
+                            "chain petal import '{}.{}' must be a function import",
+                            import.module, import.name
+                        ));
+                    };
+                    let (params, results) = types.get(type_idx as usize).ok_or_else(|| {
+                        format!(
+                            "import {}.{} references missing type {type_idx}",
+                            import.module, import.name
+                        )
+                    })?;
+                    let Some(expected) = NEW_HOST_IMPORTS
+                        .iter()
+                        .find(|decl| decl.module == import.module && decl.name == import.name)
+                    else {
+                        return Err(format!(
+                            "chain petal imports unknown host function '{}.{}'",
+                            import.module, import.name
+                        ));
+                    };
+                    if !wasm_sig_matches(params, expected.params)
+                        || !wasm_sig_matches(results, expected.results)
+                    {
+                        return Err(format!(
+                            "chain petal import '{}.{}' has wrong signature",
+                            import.module, import.name
+                        ));
+                    }
+                    imported_func_types.push(type_idx);
+                }
+            }
+            Payload::FunctionSection(reader) => {
+                for type_idx in reader {
+                    defined_func_types
+                        .push(type_idx.map_err(|e| format!("wasm function section: {e}"))?);
+                }
+            }
+            Payload::ExportSection(reader) => {
+                for export in reader {
+                    let export = export.map_err(|e| format!("wasm export section: {e}"))?;
+                    if export.kind == ExternalKind::Func {
+                        exports.insert(export.name.to_string(), export.index);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for f in &manifest.functions {
+        validate_export_abi(
+            &format!("__petal_{}", f.name),
+            &exports,
+            &imported_func_types,
+            &defined_func_types,
+            &types,
+        )?;
+    }
+    for inv in &manifest.invariants {
+        validate_export_abi(
+            &inv.wasm_export,
+            &exports,
+            &imported_func_types,
+            &defined_func_types,
+            &types,
+        )?;
+    }
+
+    fn wasm_sig_matches(actual: &[ValType], expected: &[WasmValType]) -> bool {
+        actual.len() == expected.len()
+            && actual.iter().zip(expected).all(|(actual, expected)| {
+                matches!(
+                    (actual, expected),
+                    (ValType::I32, WasmValType::I32) | (ValType::I64, WasmValType::I64)
+                )
+            })
+    }
+
+    fn validate_export_abi(
+        export_name: &str,
+        exports: &HashMap<String, u32>,
+        imported_func_types: &[u32],
+        defined_func_types: &[u32],
+        types: &[(Vec<ValType>, Vec<ValType>)],
+    ) -> Result<(), String> {
+        let func_idx = *exports
+            .get(export_name)
+            .ok_or_else(|| format!("manifest export '{export_name}' missing from wasm"))?;
+        let type_idx = if (func_idx as usize) < imported_func_types.len() {
+            imported_func_types[func_idx as usize]
+        } else {
+            let defined_idx = func_idx as usize - imported_func_types.len();
+            *defined_func_types
+                .get(defined_idx)
+                .ok_or_else(|| format!("export '{export_name}' references missing function"))?
+        };
+        let (params, results) = types
+            .get(type_idx as usize)
+            .ok_or_else(|| format!("export '{export_name}' references missing type"))?;
+        if !matches!(
+            (params.as_slice(), results.as_slice()),
+            ([ValType::I32, ValType::I32], [ValType::I32])
+        ) {
+            return Err(format!(
+                "manifest export '{export_name}' has wrong signature; expected (i32, i32) -> i32"
+            ));
+        }
+        Ok(())
+    }
+
     Ok(())
 }
 

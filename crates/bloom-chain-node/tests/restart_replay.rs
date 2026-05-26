@@ -300,8 +300,9 @@ fn restore_uses_latest_checkpoint_and_replays_suffix_after_pruning() {
     let checkpoint_height = 260;
     let latest_height = 520;
     for h in 1..=latest_height {
-        let block = make_block(h, proposer, vec![]);
+        let mut block = make_block(h, proposer, vec![]);
         apply_block_state_transitions(&mut live, &executor, &block, BLOCK_EMISSION);
+        block.header.state_root = live.state_root();
         blocks.put(h, &block).unwrap();
         if h == checkpoint_height {
             persist_checkpoint(&live, h, &blobs, &index);
@@ -341,8 +342,9 @@ fn restore_fails_when_required_suffix_block_is_missing() {
     let proposer = make_addr(0x77);
     let executor = NoopExecutor;
     let mut checkpoint_state = State::new();
-    let block1 = make_block(1, proposer, vec![]);
+    let mut block1 = make_block(1, proposer, vec![]);
     apply_block_state_transitions(&mut checkpoint_state, &executor, &block1, BLOCK_EMISSION);
+    block1.header.state_root = checkpoint_state.state_root();
     blocks.put(1, &block1).unwrap();
     persist_checkpoint(&checkpoint_state, 1, &blobs, &index);
 
@@ -363,4 +365,50 @@ fn restore_fails_when_required_suffix_block_is_missing() {
         err.to_string().contains("required replay block missing"),
         "unexpected error: {err:#}"
     );
+}
+
+#[test]
+fn restore_falls_back_when_latest_checkpoint_block_is_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let blocks = BlockStore::open(&temp.path().join("blocks")).unwrap();
+    let blobs = StateBlobStore::open(&temp.path().join("state_blobs")).unwrap();
+    let index = StateIndex::open(&temp.path().join("state_index.sqlite")).unwrap();
+
+    let proposer = make_addr(0x77);
+    let executor = NoopExecutor;
+    let mut live = State::new();
+
+    let mut block1 = make_block(1, proposer, vec![]);
+    apply_block_state_transitions(&mut live, &executor, &block1, BLOCK_EMISSION);
+    block1.header.state_root = live.state_root();
+    blocks.put(1, &block1).unwrap();
+    persist_checkpoint(&live, 1, &blobs, &index);
+
+    let mut block2 = make_block(2, proposer, vec![]);
+    apply_block_state_transitions(&mut live, &executor, &block2, BLOCK_EMISSION);
+    block2.header.state_root = live.state_root();
+    blocks.put(2, &block2).unwrap();
+
+    let mut indexed_but_missing_block_state = live.clone();
+    let block3 = make_block(3, proposer, vec![]);
+    apply_block_state_transitions(
+        &mut indexed_but_missing_block_state,
+        &executor,
+        &block3,
+        BLOCK_EMISSION,
+    );
+    persist_checkpoint(&indexed_but_missing_block_state, 3, &blobs, &index);
+
+    let (restored, restored_height) = restore_state_from_storage(
+        &make_genesis(),
+        &blocks,
+        &blobs,
+        &index,
+        &executor,
+        BLOCK_EMISSION,
+    )
+    .unwrap();
+
+    assert_eq!(restored_height, 2);
+    assert_eq!(restored.state_root(), live.state_root());
 }

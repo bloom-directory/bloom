@@ -91,6 +91,7 @@ async fn chain_query_block_by_hash_matches_by_height() {
         chain_id: "bloomchain.test".into(),
         genesis_hash: bloom_chain_types::types::Hash32([0x42; 32]),
         local_address: v.addr,
+        startup_height: 0,
         tx_submit,
     };
 

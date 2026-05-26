@@ -55,7 +55,7 @@ use std::sync::{Arc, Mutex};
 use bloom_chain_state::StateSnapshot;
 use bloom_chain_types::{Hash32, types::Address};
 use bloom_objects::TypeTag;
-use bloom_petals::{BlockCtx, ChainCallInput, ChainEntry, PetalVm};
+use bloom_petals::{BlockCtx, ChainCallInput, ChainEntry, PetalError, PetalVm};
 use bloom_script::{
     PtbError,
     executor::{InvariantResult, PetalCallResult, PetalRunner},
@@ -181,6 +181,7 @@ impl ChainPetalRunner {
                     Err(PtbError::PetalAbort {
                         cmd_idx: 0,
                         code: -1,
+                        fuel_used: out.fuel_used,
                     })
                 } else {
                     // Success: install the post-call snapshot so the
@@ -205,6 +206,10 @@ impl ChainPetalRunner {
                 // exhaustion into `PtbError::OutOfFuel` regardless of
                 // which spelling the engine surfaces.
                 *snap_slot = Some(checkpoint);
+                let trap_fuel_used = match &e {
+                    PetalError::ChainCallTrap { fuel_used, .. } => *fuel_used,
+                    _ => fuel_budget,
+                };
                 let msg = e.to_string().to_lowercase();
                 if msg.contains("out of fuel")
                     || msg.contains("outoffuel")
@@ -214,12 +219,13 @@ impl ChainPetalRunner {
                     Err(PtbError::OutOfFuel {
                         cmd_idx: 0,
                         limit: fuel_budget,
-                        used: fuel_budget,
+                        used: trap_fuel_used,
                     })
                 } else {
                     Err(PtbError::PetalAbort {
                         cmd_idx: 0,
                         code: -2,
+                        fuel_used: trap_fuel_used,
                     })
                 }
             }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Dockerized adversarial private-testnet readiness gate.
 #
-# This is the acceptance suite for docs/reviews/2026-05-26-private-testnet-readiness.md.
+# This is the acceptance suite for docs/reviews/2026-05-26-branch-vs-master-private-testnet-review.md.
 # It combines fast adversarial cargo tests for malformed consensus/execution/RPC
 # inputs with the live 4-validator docker DeX stack. The docker leg provisions a
 # clean network, exercises DeX adversarial PTBs over RPC, restarts a validator,
@@ -45,6 +45,8 @@ cargo test -p bloom-petal-dex-it --test real_wasm_pool \
   real_pool_stale_shared_pool_version_and_sandwich_slippage_revert -- --ignored --nocapture
 cargo test -p bloom-petal-dex-it --test real_wasm_pool \
   real_pool_add_remove_and_exact_out_execute -- --ignored --nocapture
+cargo test -p bloom-petal-dex-it --test real_wasm_pool \
+  real_pool_high_fee_exact_out_executes -- --ignored --nocapture
 
 log "live docker network: clean 4-validator DeX adversarial acceptance + restart/catch-up"
 BLOOM_DOCKER_COMPOSE_UP=1 "$REPO_ROOT/scripts/test-docker-petal-dex.sh"

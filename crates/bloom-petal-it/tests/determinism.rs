@@ -27,7 +27,7 @@ use bloom_script::{
     PetalRef, PqSignature, PtbTx, UseRef, encode_ptb,
 };
 
-use bloom_petal_it::harness::{addr, build_state, genesis_coin_id, wat_to_wasm};
+use bloom_petal_it::harness::{addr, build_state, genesis_coin_id, seed_coin, wat_to_wasm};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -89,6 +89,10 @@ fn apply_ptb_split_transfer(
         .get_object(&alice_coin_id)
         .map(|o| o.version)
         .unwrap_or(0);
+    let gas_coin_id = genesis_coin_id(alice, 1);
+    if state.get_object(&gas_coin_id).is_none() {
+        seed_coin(state, gas_coin_id, alice, 1);
+    }
 
     let mut manifests: HashMap<Hash32, PetalManifestStub> = HashMap::new();
     manifests.insert(
@@ -143,7 +147,7 @@ fn apply_ptb_split_transfer(
                 owner: bloom_objects::Owner::Address(bob.0),
             },
         ],
-        gas_payer: alice_coin_id,
+        gas_payer: gas_coin_id,
         gas_budget: 200_000,
         gas_price: 0,
         expiry_block: 100,

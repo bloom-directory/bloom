@@ -1621,11 +1621,14 @@ impl PetalVm {
                     snapshot: *snapshot,
                 })
             }
-            Err(SubCallError::Trapped { error, .. }) => Err(PetalError::ChainCall(
-                error
+            Err(SubCallError::Trapped {
+                error, fuel_used, ..
+            }) => Err(PetalError::ChainCallTrap {
+                detail: error
                     .map(|s| format!("trapped: {s}"))
                     .unwrap_or_else(|| "trapped".into()),
-            )),
+                fuel_used,
+            }),
         }
     }
 }

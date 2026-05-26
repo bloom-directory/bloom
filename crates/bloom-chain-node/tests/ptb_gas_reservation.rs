@@ -194,6 +194,20 @@ const FUEL_BURNER_PETAL: &str = r#"
 )
 "#;
 
+const NON_OOF_TRAP_PETAL: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "__petal_trap_after_work") (param i32 i32) (result i32)
+    (local $i i32)
+    (loop $again
+      (if (i32.lt_u (local.get $i) (i32.const 1000))
+        (then
+          (local.set $i (i32.add (local.get $i) (i32.const 1)))
+          (br $again))))
+    unreachable)
+)
+"#;
+
 // ---------------------------------------------------------------------------
 // Outer/inner cap reconciliation
 // ---------------------------------------------------------------------------
@@ -476,6 +490,65 @@ fn reverted_ptb_burns_full_reservation_and_credits_proposer() {
         balance(&state, &sender),
         sender_before,
         "sender Account.loom must be untouched even on PTB revert"
+    );
+}
+
+#[test]
+fn non_oof_wasm_trap_charges_consumed_fuel_and_full_revert_burn() {
+    let signer = [0x4Au8; 32];
+    let gas_payer_id = ObjectId([0x4B; 32]);
+    let proposer = Address([0x4C; 32]);
+    let initial_coin: u128 = 1_000_000_000;
+
+    let mut state = State::new();
+    let wasm = wat(NON_OOF_TRAP_PETAL);
+    let petal_hash = state.insert_code(&wasm);
+    state.set_object(make_loom_coin(gas_payer_id, signer, initial_coin));
+
+    let mut manifests = HashMap::new();
+    manifests.insert(petal_hash, manifest_with_nullary_fn("trap_after_work"));
+
+    let gas_budget: u64 = 100_000;
+    let gas_price: u128 = 11;
+    let ptb = nullary_move_ptb_full(
+        signer,
+        petal_hash,
+        "trap_after_work",
+        gas_payer_id,
+        gas_budget,
+        gas_price,
+        100,
+    );
+    let bytes = encode_ptb(&ptb).expect("encode PTB");
+    let (sender, tx) = submit_ptb_tx_with_caps(bytes, 1, gas_budget, gas_price as u64);
+    fund(&mut state, sender, 123_456);
+
+    let block = make_block(1, proposer, vec![tx]);
+    let exec = ChainPetalExecutorWithManifests::new(manifests);
+    let (block_fuel, receipts) =
+        apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
+
+    assert_eq!(receipts.len(), 1);
+    assert!(!receipts[0].success, "non-OOF trap must revert");
+    assert!(
+        receipts[0].fuel_used > 0,
+        "non-OOF trap must preserve consumed wasm fuel in the receipt"
+    );
+    assert_eq!(
+        block_fuel, receipts[0].fuel_used,
+        "block fuel must include the non-OOF trap's consumed fuel"
+    );
+
+    let reservation = (gas_budget as u128) * gas_price;
+    assert_eq!(
+        coin_value(&state, &gas_payer_id).unwrap(),
+        initial_coin - reservation,
+        "gas-payer coin must lose the full reservation on trap revert"
+    );
+    assert_eq!(
+        balance(&state, &proposer),
+        reservation,
+        "proposer must receive the full burn on trap revert"
     );
 }
 

@@ -378,27 +378,35 @@ pub mod ops {
         let lp_payload = payload::lp_payload(&ObjectId([0u8; 32]), &pool_id_bytes, lp_minted);
         let lp_handle = host::object_create(&tags::lp_position_tag(), &lp_payload)
             .map_err(|_| PoolError::InsufficientLiquidity)?;
+        let lp_id = host::object_id(lp_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
+        let lp_payload = payload::lp_payload(&lp_id, &pool_id_bytes, lp_minted);
+        host::object_mutate(lp_handle, &lp_payload)
+            .map_err(|_| PoolError::InsufficientLiquidity)?;
 
         // Handle unused coin remainders.
         let leftover_a = if taken_a < value_a {
             let leftover_amount = value_a - taken_a;
-            let new_a_bytes = rewrite_coin_value(&a_bytes, taken_a);
-            let _ = host::object_mutate(coin_a_handle, &new_a_bytes);
+            host::object_delete(coin_a_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
             let leftover_payload = coin_payload(&ObjectId([0u8; 32]), leftover_amount);
-            host::object_create(&tags::coin_tag(0), &leftover_payload).ok()
+            Some(
+                host::object_create(&tags::coin_tag(0), &leftover_payload)
+                    .map_err(|_| PoolError::InsufficientLiquidity)?,
+            )
         } else {
-            let _ = host::object_delete(coin_a_handle);
+            host::object_delete(coin_a_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
             None
         };
 
         let leftover_b = if taken_b < value_b {
             let leftover_amount = value_b - taken_b;
-            let new_b_bytes = rewrite_coin_value(&b_bytes, taken_b);
-            let _ = host::object_mutate(coin_b_handle, &new_b_bytes);
+            host::object_delete(coin_b_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
             let leftover_payload = coin_payload(&ObjectId([0u8; 32]), leftover_amount);
-            host::object_create(&tags::coin_tag(1), &leftover_payload).ok()
+            Some(
+                host::object_create(&tags::coin_tag(1), &leftover_payload)
+                    .map_err(|_| PoolError::InsufficientLiquidity)?,
+            )
         } else {
-            let _ = host::object_delete(coin_b_handle);
+            host::object_delete(coin_b_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
             None
         };
 
@@ -628,12 +636,13 @@ pub mod ops {
             return Err(PoolError::InsufficientLiquidity);
         }
 
-        // Compute exact amount_in required for `amount_out`.
-        let exact_in = compute_exact_in_for_out::<S>(reserve_a, reserve_b, amount_out, &params)?;
-
         let max_in_bytes =
             host::object_read(max_in_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
         let max_in_value = decode_coin_value(&max_in_bytes)?;
+
+        // Compute exact amount_in required for `amount_out`.
+        let exact_in =
+            compute_exact_in_for_out::<S>(reserve_a, reserve_b, amount_out, max_in_value, &params)?;
 
         if max_in_value < exact_in {
             return Err(PoolError::SlippageExceeded);
@@ -668,12 +677,14 @@ pub mod ops {
         // Handle leftover of max_in.
         let leftover = if exact_in < max_in_value {
             let leftover_amount = max_in_value - exact_in;
-            let new_max_bytes = rewrite_coin_value(&max_in_bytes, exact_in);
-            let _ = host::object_mutate(max_in_handle, &new_max_bytes);
+            host::object_delete(max_in_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
             let leftover_payload = coin_payload(&ObjectId([0u8; 32]), leftover_amount);
-            host::object_create(&tags::coin_tag(0), &leftover_payload).ok()
+            Some(
+                host::object_create(&tags::coin_tag(0), &leftover_payload)
+                    .map_err(|_| PoolError::InsufficientLiquidity)?,
+            )
         } else {
-            let _ = host::object_delete(max_in_handle);
+            host::object_delete(max_in_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
             None
         };
 
@@ -701,18 +712,6 @@ pub mod ops {
         Ok(u128::from_be_bytes(buf))
     }
 
-    /// Re-encode a `Coin<T>` payload with a new value, preserving the 32-byte id.
-    fn rewrite_coin_value(existing: &[u8], new_value: u128) -> Vec<u8> {
-        let mut out = Vec::with_capacity(48);
-        let id_len = 32.min(existing.len());
-        out.extend_from_slice(&existing[..id_len]);
-        if id_len < 32 {
-            out.resize(32, 0);
-        }
-        out.extend_from_slice(&new_value.to_be_bytes());
-        out
-    }
-
     /// Coin payload: 32-byte id placeholder + 16-byte u128 value.
     fn coin_payload(id: &ObjectId, value: u128) -> Vec<u8> {
         let mut w = RetWriter::with_capacity(48);
@@ -733,39 +732,69 @@ pub mod ops {
     /// Compute the exact input amount required to receive `amount_out` of
     /// `Coin<B>` using strategy `S`.
     ///
-    /// Uses an iterative approach starting from the no-fee lower bound and
-    /// bumping up until `S::quote(...) >= amount_out`.
+    /// Uses a bounded binary search up to the caller-provided maximum input.
     fn compute_exact_in_for_out<S: SwapStrategy>(
         reserve_in: u128,
         reserve_out: u128,
         amount_out: u128,
+        max_in: u128,
         params: &S::Params,
     ) -> Result<u128, PoolError> {
         if reserve_out <= amount_out {
             return Err(PoolError::InsufficientLiquidity);
+        }
+        if max_in == 0 {
+            return Err(PoolError::SlippageExceeded);
         }
         let denom = reserve_out - amount_out;
         // Ceiling division for no-fee lower bound.
         let numerator = reserve_in
             .checked_mul(amount_out)
             .ok_or(PoolError::MathFailed(bloom_dex_math::MathError::Overflow))?;
-        let mut guess = numerator / denom + 1; // +1 for fee headroom
+        let lower = (numerator / denom).saturating_add(1).min(max_in);
+        let max_out = match S::quote(reserve_in, reserve_out, max_in, params) {
+            Ok(out) => out,
+            Err(bloom_dex_math::MathError::InsufficientLiquidity)
+            | Err(bloom_dex_math::MathError::ZeroAmountIn) => {
+                return Err(PoolError::SlippageExceeded);
+            }
+            Err(e) => return Err(PoolError::MathFailed(e)),
+        };
+        if max_out < amount_out {
+            return Err(PoolError::SlippageExceeded);
+        }
 
-        // Bump until the quoted output meets `amount_out`.
-        for _ in 0..64u8 {
-            match S::quote(reserve_in, reserve_out, guess, params) {
-                Ok(out) if out >= amount_out => return Ok(guess),
-                Ok(_) => {
-                    guess = guess
-                        .checked_add(1)
-                        .ok_or(PoolError::MathFailed(bloom_dex_math::MathError::Overflow))?;
-                }
+        let mut lo = lower;
+        let mut hi = max_in;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match S::quote(reserve_in, reserve_out, mid, params) {
+                Ok(out) if out >= amount_out => hi = mid,
+                Ok(_) | Err(bloom_dex_math::MathError::InsufficientLiquidity) => lo = mid + 1,
                 Err(e) => return Err(PoolError::MathFailed(e)),
             }
         }
-        Err(PoolError::MathFailed(
-            bloom_dex_math::MathError::InsufficientLiquidity,
-        ))
+        Ok(lo)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use bloom_dex_math::{ConstantProduct, ConstantProductParams};
+
+        #[test]
+        fn exact_out_solver_handles_high_fee_bounds() {
+            let params = ConstantProductParams { fee_bps: 9999 };
+
+            assert_eq!(
+                compute_exact_in_for_out::<ConstantProduct>(1000, 1000, 1, 20_000, &params),
+                Ok(20_000)
+            );
+            assert_eq!(
+                compute_exact_in_for_out::<ConstantProduct>(1000, 1000, 1, 19_999, &params),
+                Err(PoolError::SlippageExceeded)
+            );
+        }
     }
 }
 
