@@ -26,8 +26,8 @@ jobs:
       - name: Run --ignored acceptance tests
         run: cargo test --workspace -- --ignored
 
-  docker-dex:
-    name: docker DEX acceptance
+  docker-petal-dex:
+    name: docker petal DEX acceptance
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -47,6 +47,6 @@ jobs:
       - name: Cache cargo
         if: steps.docker.outputs.available == 'true'
         uses: Swatinem/rust-cache@v2
-      - name: Run docker DEX acceptance
+      - name: Run docker petal DEX acceptance
         if: steps.docker.outputs.available == 'true'
-        run: scripts/test-docker-dex.sh
+        run: scripts/test-docker-petal-dex.sh
