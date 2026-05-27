@@ -149,14 +149,22 @@ pub mod ops {
     }
 
     /// Create a new coin with the given value in the borrow table.
-    fn create_coin(type_idx: u16, value: u128) -> Result<RuntimeHandle, RouterError> {
+    pub fn coin_erased_tag() -> bloom_objects::TypeTag {
         use bloom_objects::TypeTag;
-        let tag = TypeTag::Concrete {
+        TypeTag::Concrete {
             petal_hash: [0u8; 32],
             type_name: "Coin".to_string(),
-            type_args: vec![TypeTag::Generic { idx: type_idx }],
-        };
-        host::object_create(&tag, &coin_payload(value))
+            type_args: vec![TypeTag::Concrete {
+                petal_hash: [0u8; 32],
+                type_name: "Erased".to_string(),
+                type_args: vec![],
+            }],
+        }
+    }
+
+    /// Create a new type-erased coin with the given value in the borrow table.
+    fn create_coin(value: u128) -> Result<RuntimeHandle, RouterError> {
+        host::object_create(&coin_erased_tag(), &coin_payload(value))
             .map_err(|_| RouterError::MathFailed(bloom_dex_math::MathError::InsufficientLiquidity))
     }
 
@@ -222,11 +230,9 @@ pub mod ops {
         // Consume coin_in.
         let _ = host::object_delete(coin_in_handle);
 
-        // Mint coin_out. Use type index 1 (= B in A→B; the petal's generic
-        // position for the output token). In a multi-hop chain the intermediate
-        // coin is immediately consumed by the next hop, so the exact tag is only
-        // meaningful to the host's borrow table briefly.
-        let coin_out = create_coin(1, amount_out)?;
+        // Mint coin_out as the same concrete `Coin<Erased>` shape declared by
+        // the router manifest and consumed by pool/wallet entries.
+        let coin_out = create_coin(amount_out)?;
 
         Ok((amount_out, coin_out))
     }

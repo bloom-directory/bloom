@@ -14,6 +14,16 @@ pub use sqrt::integer_sqrt;
 /// every swap output zero, and larger values underflow the fee factor.
 pub const MAX_FEE_BPS: u16 = 10_000;
 
+fn checked_ceil_div(numerator: u128, denominator: u128) -> Result<u128, MathError> {
+    if denominator == 0 {
+        return Err(MathError::ZeroReserves);
+    }
+    let adjusted = numerator
+        .checked_add(denominator - 1)
+        .ok_or(MathError::Overflow)?;
+    Ok(adjusted / denominator)
+}
+
 // ─── Error type ──────────────────────────────────────────────────────────────
 
 /// Errors that can arise from DEX math operations.
@@ -190,16 +200,20 @@ impl SwapStrategy for ConstantProduct {
                 return Err(MathError::InsufficientLiquidity);
             }
 
-            // Pull proportional amounts; the caller deposits at most the
-            // amounts corresponding to the limiting side.
-            let taken_a = lp_minted
+            // Pull the minimum proportional amounts required for the minted
+            // LP, rounded up. Rounding down here can mint nonzero LP while
+            // collecting zero of a skewed reserve leg.
+            let required_a = lp_minted
                 .checked_mul(reserve_a)
-                .ok_or(MathError::Overflow)?
-                / lp_supply;
-            let taken_b = lp_minted
+                .ok_or(MathError::Overflow)?;
+            let required_b = lp_minted
                 .checked_mul(reserve_b)
-                .ok_or(MathError::Overflow)?
-                / lp_supply;
+                .ok_or(MathError::Overflow)?;
+            let taken_a = checked_ceil_div(required_a, lp_supply)?;
+            let taken_b = checked_ceil_div(required_b, lp_supply)?;
+            if taken_a == 0 || taken_b == 0 || taken_a > amount_a || taken_b > amount_b {
+                return Err(MathError::InsufficientLiquidity);
+            }
 
             Ok((taken_a, taken_b, lp_minted))
         }
@@ -475,6 +489,16 @@ mod tests {
         assert_eq!(lp_minted, 50);
         assert_eq!(taken_a, 100); // 50 * 1000 / 500
         assert_eq!(taken_b, 100); // 50 * 1000 / 500
+    }
+
+    #[test]
+    fn add_liquidity_subsequent_ceil_takes_both_legs() {
+        // Regression: floor-proportional collection minted 1 LP while taking
+        // (1, 0), allowing repeated B-free LP dilution.
+        let (taken_a, taken_b, lp_minted) = ConstantProduct::add_liquidity(5, 2, 2, 1, 3).unwrap();
+        assert_eq!(lp_minted, 1);
+        assert_eq!(taken_a, 2);
+        assert_eq!(taken_b, 1);
     }
 
     #[test]

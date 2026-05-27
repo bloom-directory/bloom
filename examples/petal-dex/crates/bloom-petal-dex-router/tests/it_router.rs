@@ -20,7 +20,7 @@
 //! `bloom-petal-dex-it` (Task #44).
 
 use bloom_dex_math::{ConstantProduct, ConstantProductParams, MathError, SwapStrategy};
-use bloom_objects::ObjectId;
+use bloom_objects::{ObjectId, TypeTag};
 use bloom_petal_dex_pool::{ParamCodec, payload};
 use bloom_petal_dex_router::{RouterError, ops};
 
@@ -257,6 +257,22 @@ fn coin_payload_max_value() {
     let payload = ops::coin_payload(u128::MAX);
     let decoded = ops::decode_coin_value(&payload).unwrap();
     assert_eq!(decoded, u128::MAX);
+}
+
+#[test]
+fn router_coin_create_tag_is_coin_erased() {
+    assert_eq!(
+        ops::coin_erased_tag(),
+        TypeTag::Concrete {
+            petal_hash: [0u8; 32],
+            type_name: "Coin".to_string(),
+            type_args: vec![TypeTag::Concrete {
+                petal_hash: [0u8; 32],
+                type_name: "Erased".to_string(),
+                type_args: vec![],
+            }],
+        }
+    );
 }
 
 #[test]
