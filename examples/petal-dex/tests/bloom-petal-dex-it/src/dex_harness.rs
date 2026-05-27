@@ -317,18 +317,26 @@ pub fn addr(b: u8) -> Address {
 /// emitted release `<artifact>.wasm`. Live-chain tests deploy these blobs
 /// through the same chain admission path as operators; debug WASM artifacts are
 /// several MiB and intentionally exceed the protocol's max code-size cap.
-fn build_petal_wasm(crate_name: &str, artifact_stem: &str) -> PathBuf {
+fn build_petal_wasm_with_env(
+    crate_name: &str,
+    artifact_stem: &str,
+    envs: &[(&str, String)],
+) -> PathBuf {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let status = OsCommand::new(env!("CARGO"))
-        .args([
-            "build",
-            "--release",
-            "-p",
-            crate_name,
-            "--target",
-            "wasm32-unknown-unknown",
-        ])
-        .current_dir(manifest_dir)
+    let mut cmd = OsCommand::new(env!("CARGO"));
+    cmd.args([
+        "build",
+        "--release",
+        "-p",
+        crate_name,
+        "--target",
+        "wasm32-unknown-unknown",
+    ])
+    .current_dir(manifest_dir);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let status = cmd
         .status()
         .unwrap_or_else(|e| panic!("failed to spawn cargo build for {crate_name}: {e}"));
     assert!(status.success(), "wasm32 build of {crate_name} failed");
@@ -353,6 +361,10 @@ fn build_petal_wasm(crate_name: &str, artifact_stem: &str) -> PathBuf {
     artifact
 }
 
+fn build_petal_wasm(crate_name: &str, artifact_stem: &str) -> PathBuf {
+    build_petal_wasm_with_env(crate_name, artifact_stem, &[])
+}
+
 /// Build `bloom-petal-dex-pool` for `wasm32-unknown-unknown`; returns the
 /// artifact path.
 pub fn build_pool_wasm() -> PathBuf {
@@ -371,7 +383,15 @@ pub fn build_wallet_wasm() -> PathBuf {
 /// pool's `create_pool` / `swap_exact_in` consume, on a chain where genesis
 /// only emits `Coin<LOOM>` (the live-docker provisioning linchpin).
 pub fn build_faucet_wasm() -> PathBuf {
-    build_petal_wasm("bloom-petal-dex-faucet", "bloom_petal_dex_faucet")
+    build_faucet_wasm_for_admin(ptb_signer_pubkey_hex())
+}
+
+pub fn build_faucet_wasm_for_admin(admin_hex: String) -> PathBuf {
+    build_petal_wasm_with_env(
+        "bloom-petal-dex-faucet",
+        "bloom_petal_dex_faucet",
+        &[("BLOOM_DEX_FAUCET_ADMIN_HEX", admin_hex)],
+    )
 }
 
 /// Build `bloom-petal-dex-router` for `wasm32-unknown-unknown`; returns the
@@ -444,12 +464,65 @@ pub fn coin_erased_tag() -> TypeTag {
     TypeTag::Concrete {
         petal_hash: [0u8; 32],
         type_name: "Coin".to_string(),
+        type_args: vec![erased_type_tag()],
+    }
+}
+
+/// `TypeTag` for the `Erased` marker used as the concrete type arg in
+/// generic DEX entrypoints.
+pub fn erased_type_tag() -> TypeTag {
+    TypeTag::Concrete {
+        petal_hash: [0u8; 32],
+        type_name: "Erased".to_string(),
+        type_args: vec![],
+    }
+}
+
+/// Type args for two-token pool calls over the demo erased coin type.
+pub fn erased_pair_type_args() -> Vec<TypeTag> {
+    vec![erased_type_tag(), erased_type_tag()]
+}
+
+/// `TypeTag` for `Capability<FaucetAdmin>` with zero-petal sentinels.
+pub fn faucet_admin_cap_tag() -> TypeTag {
+    TypeTag::Concrete {
+        petal_hash: [0u8; 32],
+        type_name: "Capability".to_string(),
         type_args: vec![TypeTag::Concrete {
             petal_hash: [0u8; 32],
-            type_name: "Erased".to_string(),
+            type_name: "FaucetAdmin".to_string(),
             type_args: vec![],
         }],
     }
+}
+
+/// Seed a `Capability<FaucetAdmin>` object owned by `owner` at `id`.
+pub fn seed_faucet_admin_cap(state: &mut State, id: ObjectId, owner: Address) {
+    let obj = Object {
+        id,
+        type_tag: faucet_admin_cap_tag(),
+        owner: Owner::Address(owner.0),
+        version: 0,
+        payload: bloom_petal_dex_faucet::ops::cap_payload(),
+    };
+    state.set_object(obj);
+
+    let okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: owner.0,
+    };
+    let mut owned = state.get_ownership(&okey).unwrap_or_default();
+    let pos = owned.partition_point(|x| x.0 < id.0);
+    owned.insert(pos, id);
+    state.set_ownership(okey, owned);
+}
+
+/// Deterministic id for a test-seeded faucet admin cap.
+pub fn faucet_admin_cap_id(seed: &[u8]) -> ObjectId {
+    let mut h = blake3::Hasher::new();
+    h.update(b"dex-it.faucet-admin-cap");
+    h.update(seed);
+    ObjectId(*h.finalize().as_bytes())
 }
 
 /// Seed a `Coin<Erased>(value)` object owned by `owner` at `id`.
@@ -494,7 +567,7 @@ pub fn owner_has_coin_worth(state: &State, who: Address, want: u128) -> bool {
     })
 }
 
-/// Stand up a shared 1000/1000 `Pool` (at `fee_bps`) via the real pool wasm,
+/// Stand up a shared 10000/10000 `Pool` (at `fee_bps`) via the real pool wasm,
 /// signed by `alice`, and return its `ObjectId`.
 ///
 /// `disc` namespaces the two seeded deposit coins so callers can build
@@ -524,11 +597,11 @@ pub fn create_shared_pool(
     b_seed.extend_from_slice(disc);
     let coin_a = erased_coin_id(&a_seed);
     let coin_b = erased_coin_id(&b_seed);
-    seed_erased_coin(state, coin_a, Owner::Address(alice.0), 1000);
-    seed_erased_coin(state, coin_b, Owner::Address(alice.0), 1000);
+    seed_erased_coin(state, coin_a, Owner::Address(alice.0), 10_000);
+    seed_erased_coin(state, coin_b, Owner::Address(alice.0), 10_000);
 
     // Snapshot existing Pool ids so we can identify the *new* one after the
-    // create (multiple pools in one state all start at 1000/1000, so we
+    // create (multiple pools in one state all start at 10000/10000, so we
     // cannot disambiguate by reserves alone — litmus 5.2 builds two).
     let before: std::collections::HashSet<ObjectId> = state
         .iter_objects()
@@ -549,7 +622,7 @@ pub fn create_shared_pool(
                     hash: Some(pool_petal_hash),
                 },
                 function: "create_pool".to_string(),
-                type_args: vec![],
+                type_args: vec![erased_type_tag(), erased_type_tag()],
                 args: vec![
                     Arg::Object {
                         id: coin_a,

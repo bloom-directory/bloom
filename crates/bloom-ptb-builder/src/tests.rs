@@ -300,6 +300,30 @@ fn append_type_arg_for_generic_endpoint() {
 }
 
 #[test]
+fn append_call_type_arg_for_generic_endpoint_without_type_arg_value() {
+    let chain = chain_with_pool(vec![FunctionDeclStub {
+        name: "identity".to_string(),
+        type_params: vec![TypeParamDeclStub {
+            name: "T".to_string(),
+            phantom: false,
+        }],
+        args: vec![],
+        returns: vec![],
+        attached_invariants: vec![],
+    }]);
+    let mut s = PtbSession::new(&chain);
+    s.append_command("/bloom/dex/pool/identity type:USDC")
+        .unwrap();
+    match &s.commands()[0] {
+        Command::Move(m) => {
+            assert_eq!(m.type_args, vec![concrete("USDC")]);
+            assert_eq!(m.args, vec![]);
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
 fn append_with_label_records_label() {
     let chain = chain_with_pool(vec![func("swap", vec![ArgDeclStub::Signer], vec![])]);
     let mut s = PtbSession::new(&chain);

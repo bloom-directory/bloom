@@ -13,14 +13,16 @@
 //! | `signer:<i>`            | `Arg::Signer(i)`                           |
 //! | `obj:<id>[@<ver>]`      | `Arg::Object{ id, version, access_mode }`  |
 //! | `@<cmd>.<ret>` / `@lbl` | `Arg::Use{ cmd_idx, ret_idx }`             |
-//! | `type:<type-tag>`       | `Arg::TypeArg(TypeTag)`                     |
+//! | `type:<type-tag>`       | generic call type arg or `Arg::TypeArg`     |
 //! | `key=value` / literal   | `Arg::Const(canonical bytes)`              |
 //!
 //! Lowering is **positional against the resolved function signature**:
 //! the i-th token lowers against the i-th declared `ArgDeclStub` (so a
 //! bare literal learns its canonical type, and an `obj:` learns its
-//! declared access mode). `type:` tokens are an exception — they map,
-//! in order, onto the function's declared `TypeArg` slots.
+//! declared access mode). `type:` tokens are an exception: for current
+//! manifests they populate the call's `type_args` vector without consuming a
+//! positional arg; legacy manifests that still declare `TypeArg` positional
+//! slots continue to accept them there.
 
 use bloom_objects::{AccessMode, ObjectId, TypeTag};
 use bloom_script::{Arg, ArgDeclStub, ExpectedVersion, FunctionDeclStub};
@@ -62,6 +64,8 @@ pub enum UseToken {
 pub enum LoweredArg {
     /// A concrete `Arg` (Signer / Const / Object / TypeArg).
     Concrete(Arg),
+    /// A type argument for the generic Move call, not a value argument.
+    CallTypeArg(TypeTag),
     /// A use-reference still to be resolved against the label table.
     Use(UseToken),
 }
@@ -115,26 +119,24 @@ pub fn lower_args(
     for tok in arg_tokens {
         let decl = signature.args.get(value_pos);
         if let Some(rest) = tok.strip_prefix("type:") {
-            // The declared position must be a TypeArg slot.
-            match decl {
-                Some(ArgDeclStub::TypeArg(_)) => {}
-                Some(other) => {
-                    return Err(BuildError::Parse(format!(
-                        "`type:` token at position {value_pos} but signature expects {}",
-                        decl_label(other)
-                    )));
-                }
-                None => {
-                    return Err(BuildError::Parse(format!(
-                        "too many arguments: `type:` token has no declared slot (function takes {})",
-                        signature.args.len()
-                    )));
-                }
-            }
             let tt = parse_type_tag(rest)?;
             type_args.push(tt.clone());
-            out.push(LoweredArg::Concrete(Arg::TypeArg(tt)));
-            value_pos += 1;
+            if matches!(decl, Some(ArgDeclStub::TypeArg(_))) {
+                out.push(LoweredArg::Concrete(Arg::TypeArg(tt)));
+                value_pos += 1;
+            } else if type_args.len() <= signature.type_params.len() {
+                out.push(LoweredArg::CallTypeArg(tt));
+            } else if let Some(other) = decl {
+                return Err(BuildError::Parse(format!(
+                    "`type:` token at position {value_pos} but signature expects {}",
+                    decl_label(other)
+                )));
+            } else {
+                return Err(BuildError::Parse(format!(
+                    "too many arguments: `type:` token has no declared slot (function takes {})",
+                    signature.args.len()
+                )));
+            }
             continue;
         }
 

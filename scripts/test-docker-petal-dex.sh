@@ -182,9 +182,16 @@ else
     [ -x "$BLOOM_BIN" ] || fail "bloom binary missing: $BLOOM_BIN (build it first or unset BLOOM_DOCKER_COMPOSE_UP)"
 fi
 
+if [ -z "$PTB_SIGNER_PK_HEX" ]; then
+    signer_vars=$(cargo test -q -p bloom-petal-dex-it prints_ptb_signer_registry_entry -- --nocapture)
+    PTB_SIGNER_PK_HEX=$(printf '%s\n' "$signer_vars" | sed -n 's/^PTB_SIGNER_PK_HEX=//p' | tail -n1)
+    [ -n "$PTB_SIGNER_PK_HEX" ] || fail "failed to derive PTB signer address"
+fi
+
 log "running bloom-petal-dex-it::docker_petal_dex"
 BLOOM_DOCKER_TMPDIR="$BLOOM_DOCKER_TMPDIR" \
 BLOOM_BIN="$BLOOM_BIN" \
+BLOOM_DEX_FAUCET_ADMIN_HEX="$PTB_SIGNER_PK_HEX" \
 RUST_LOG="${RUST_LOG:-warn}" \
 RUST_MIN_STACK="${RUST_MIN_STACK:-16777216}" \
     cargo test -p bloom-petal-dex-it --test docker_petal_dex \

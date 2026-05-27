@@ -394,47 +394,43 @@ pub fn validate_block_for_apply(
 /// quorum checks and plus the expected proposer from the proposal frame.
 pub fn validate_block_for_proposal(
     block: &Block,
-    expected_height: u64,
-    expected_round: u32,
-    expected_header_proposer_round: u32,
-    expected_chain_id: &str,
-    expected_parent_hash: Hash32,
+    expected: ProposalValidation<'_>,
     validator_set: &ValidatorSet,
     verifier: &XdsaVerifier,
 ) -> std::result::Result<(), String> {
     let h = &block.header;
 
-    if h.chain_id != expected_chain_id {
+    if h.chain_id != expected.chain_id {
         return Err(format!(
             "chain_id mismatch: header={:?} expected={:?}",
-            h.chain_id, expected_chain_id
+            h.chain_id, expected.chain_id
         ));
     }
-    if h.height != expected_height {
+    if h.height != expected.height {
         return Err(format!(
             "height mismatch: header={} expected={}",
-            h.height, expected_height
+            h.height, expected.height
         ));
     }
-    if h.parent_hash != expected_parent_hash {
+    if h.parent_hash != expected.parent_hash {
         return Err(format!(
             "parent_hash mismatch at height {}: header={} expected={}",
             h.height,
             hex::encode(h.parent_hash.0),
-            hex::encode(expected_parent_hash.0)
+            hex::encode(expected.parent_hash.0)
         ));
     }
     let expected_proposer = validator_set
-        .proposer_for(expected_height, expected_header_proposer_round)
+        .proposer_for(expected.height, expected.header_proposer_round)
         .address;
     if h.proposer != expected_proposer {
         return Err(format!(
             "header.proposer={} != expected proposer={} for height={} proposal_round={} header_round={}",
             hex::encode(h.proposer.0),
             hex::encode(expected_proposer.0),
-            expected_height,
-            expected_round,
-            expected_header_proposer_round
+            expected.height,
+            expected.round,
+            expected.header_proposer_round
         ));
     }
     let computed_txs_root = compute_txs_root(&block.txs);
@@ -456,11 +452,11 @@ pub fn validate_block_for_proposal(
         ));
     }
     for tx in &block.txs {
-        if tx.chain_id != expected_chain_id {
+        if tx.chain_id != expected.chain_id {
             return Err(format!(
                 "tx.chain_id={:?} != expected_chain_id={:?} (tx_hash={})",
                 tx.chain_id,
-                expected_chain_id,
+                expected.chain_id,
                 hex::encode(tx.tx_hash().0)
             ));
         }
@@ -483,6 +479,14 @@ pub fn validate_block_for_proposal(
         }
     }
     Ok(())
+}
+
+pub struct ProposalValidation<'a> {
+    pub height: u64,
+    pub round: u32,
+    pub header_proposer_round: u32,
+    pub chain_id: &'a str,
+    pub parent_hash: Hash32,
 }
 
 // ---------------------------------------------------------------------------
@@ -904,11 +908,13 @@ impl<E: PetalExecutor> ConsensusDriver<E> {
         let validator_set = { self.engine.lock().validator_set.clone() };
         validate_block_for_proposal(
             block,
-            expected_height,
-            expected_round,
-            expected_header_proposer_round,
-            &self.chain_id,
-            parent,
+            ProposalValidation {
+                height: expected_height,
+                round: expected_round,
+                header_proposer_round: expected_header_proposer_round,
+                chain_id: &self.chain_id,
+                parent_hash: parent,
+            },
             &validator_set,
             &XdsaVerifier,
         )?;

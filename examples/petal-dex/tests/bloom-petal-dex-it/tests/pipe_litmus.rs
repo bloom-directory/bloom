@@ -36,9 +36,9 @@ use bloom_vfs::{Handler, TxHandler, VfsPath};
 
 use bloom_dex_math::{ConstantProduct, ConstantProductParams, SwapStrategy};
 use bloom_petal_dex_it::dex_harness::{
-    addr, build_pool_wasm, build_state, build_wallet_wasm, create_shared_pool, erased_coin_id,
-    genesis_coin_id, owner_has_coin_worth, real_pool_manifest_bytes, real_wallet_manifest_bytes,
-    seed_erased_coin, submit_ptb_chain_auth, wrap_with_real_manifest,
+    addr, build_pool_wasm, build_state, build_wallet_wasm, coin_erased_tag, create_shared_pool,
+    erased_coin_id, genesis_coin_id, owner_has_coin_worth, real_pool_manifest_bytes,
+    real_wallet_manifest_bytes, seed_erased_coin, submit_ptb_chain_auth, wrap_with_real_manifest,
 };
 
 // ---------------------------------------------------------------------------
@@ -84,6 +84,8 @@ const FEE_BPS: u16 = 30;
 /// give distinct payloads → distinct ids; each hop's math uses its own fee.
 const HOP1_FEE_BPS: u16 = 30;
 const HOP2_FEE_BPS: u16 = 25;
+const SHARED_POOL_INITIAL_RESERVE: u128 = 10_000;
+const BOB_SWAP_IN: u128 = 100;
 
 /// Standard fixture: a fresh state with the real pool + wallet wasm
 /// deployed/bound. Returns `(state, pool_petal_hash, wallet_petal_hash)`.
@@ -149,6 +151,8 @@ fn install_fast_manifest_fixture() -> (State, ObjectId) {
             1000,
             1_000_000,
             &FEE_BPS.to_be_bytes(),
+            &coin_erased_tag(),
+            &coin_erased_tag(),
         ),
     });
 
@@ -378,7 +382,7 @@ fn expr_5_1(
     carol: &[u8; 32],
 ) -> String {
     format!(
-        "/bloom/dex/pool/swap_exact_in obj:{bob}@0 obj:{pool}@{pool_ver} {min_out} | /bloom/dex/wallet/receive 0x{carol}",
+        "/bloom/dex/pool/swap_exact_in type:Erased type:Erased obj:{bob}@0 obj:{pool}@{pool_ver} {min_out} | /bloom/dex/wallet/receive 0x{carol}",
         bob = hex32(&bob_coin.0),
         pool = hex32(&pool_id.0),
         carol = hex32(carol),
@@ -416,7 +420,7 @@ fn fast_double_spend_lines_rejected_before_execution() {
     let gas_payer = genesis_coin_id(bob, 1);
     let lines = vec![
         format!(
-            "/bloom/dex/pool/swap_exact_in obj:{bob}@0 obj:{pool}@0 1",
+            "/bloom/dex/pool/swap_exact_in type:Erased type:Erased obj:{bob}@0 obj:{pool}@0 1",
             bob = hex32(&bob_coin.0),
             pool = hex32(&pool_id.0),
         ),
@@ -450,6 +454,8 @@ fn pool_create_id_collision_is_documented_by_payload_discriminator() {
         1000,
         1_000_000,
         &30u16.to_be_bytes(),
+        &coin_erased_tag(),
+        &coin_erased_tag(),
     );
     let payload_fee_25 = bloom_petal_dex_pool::payload::pool_payload(
         &ObjectId([0u8; 32]),
@@ -458,6 +464,8 @@ fn pool_create_id_collision_is_documented_by_payload_discriminator() {
         1000,
         1_000_000,
         &25u16.to_be_bytes(),
+        &coin_erased_tag(),
+        &coin_erased_tag(),
     );
 
     let id_a = derive_object_create_id_for_test(pool_hash, 0, &pool_tag, &payload_fee_30);
@@ -486,19 +494,26 @@ fn litmus_5_1_one_hop_both_front_doors() {
     // against its own chain; the digests must match before either runs).
     let (mut state_cli, pool_hash, _wallet_hash) = deploy(&[(alice, 1_000_000), (bob, 1_000_000)]);
 
-    // Alice stands up a shared 1000/1000 pool in BOTH states identically.
+    // Alice stands up a shared pool in BOTH states identically.
     let pool_id = create_shared_pool(&mut state_cli, alice, pool_hash, b"p1", FEE_BPS);
     let pool_ver = state_cli.get_object(&pool_id).unwrap().version;
     // Bob seeds his Coin<Erased>(100) input.
     let bob_coin = erased_coin_id(b"bob-5.1");
-    seed_erased_coin(&mut state_cli, bob_coin, Owner::Address(bob.0), 100);
+    seed_erased_coin(&mut state_cli, bob_coin, Owner::Address(bob.0), BOB_SWAP_IN);
 
     // Clone the prepared state so the VFS run starts from byte-identical
     // chain state (pool created, bob coin seeded).
     let mut state_vfs = state_cli.clone();
 
     let gas_payer = genesis_coin_id(bob, 1);
-    let min_out: u128 = 90;
+    let (_expected_ra, _expected_rb, expected_out) = ConstantProduct::apply_swap(
+        SHARED_POOL_INITIAL_RESERVE,
+        SHARED_POOL_INITIAL_RESERVE,
+        BOB_SWAP_IN,
+        &ConstantProductParams { fee_bps: FEE_BPS },
+    )
+    .expect("swap quote");
+    let min_out = expected_out - 1;
     let expr = expr_5_1(&bob_coin, &pool_id, pool_ver, min_out, &carol.0);
 
     let tx_cli = build_via_cli(&state_cli, &expr, bob.0, gas_payer).expect("CLI build");
@@ -527,22 +542,22 @@ fn litmus_5_1_one_hop_both_front_doors() {
             state.get_object(&bob_coin).is_none(),
             "[{label}] bob's input coin must be consumed by swap_exact_in"
         );
-        // CAROL — not bob — owns the swapped output coin (worth 90).
+        // CAROL — not bob — owns the swapped output coin.
         assert!(
-            owner_has_coin_worth(state, carol, 90),
-            "[{label}] carol must receive the swapped output coin (worth 90)"
+            owner_has_coin_worth(state, carol, expected_out),
+            "[{label}] carol must receive the swapped output coin (worth {expected_out})"
         );
         assert!(
-            !owner_has_coin_worth(state, bob, 90),
+            !owner_has_coin_worth(state, bob, expected_out),
             "[{label}] the output coin must settle to carol, not bob"
         );
-        // Pool reserves moved to (1100, 910).
+        // Pool reserves moved by the quoted swap.
         let (ra, rb, ..) = bloom_petal_dex_pool::payload::decode_pool(
             &state.get_object(&pool_id).unwrap().payload,
         )
         .unwrap();
-        assert_eq!(ra, 1100, "[{label}] reserve_a after swap");
-        assert_eq!(rb, 910, "[{label}] reserve_b after swap");
+        assert_eq!(ra, _expected_ra, "[{label}] reserve_a after swap");
+        assert_eq!(rb, _expected_rb, "[{label}] reserve_b after swap");
     }
 }
 
@@ -557,10 +572,17 @@ fn litmus_5_1_slippage_reverts_whole_plan() {
     let pool_id = create_shared_pool(&mut state, alice, pool_hash, b"p1", FEE_BPS);
     let pool_ver = state.get_object(&pool_id).unwrap().version;
     let bob_coin = erased_coin_id(b"bob-5.1-slip");
-    seed_erased_coin(&mut state, bob_coin, Owner::Address(bob.0), 100);
+    seed_erased_coin(&mut state, bob_coin, Owner::Address(bob.0), BOB_SWAP_IN);
 
     let gas_payer = genesis_coin_id(bob, 1);
-    // min_out = 200 ≫ real output (90) → SlippageExceeded → whole-plan revert.
+    let (_, _, expected_out) = ConstantProduct::apply_swap(
+        SHARED_POOL_INITIAL_RESERVE,
+        SHARED_POOL_INITIAL_RESERVE,
+        BOB_SWAP_IN,
+        &ConstantProductParams { fee_bps: FEE_BPS },
+    )
+    .expect("swap quote");
+    // min_out above the real output → SlippageExceeded → whole-plan revert.
     let min_out: u128 = 200;
     let expr = expr_5_1(&bob_coin, &pool_id, pool_ver, min_out, &carol.0);
 
@@ -576,24 +598,30 @@ fn litmus_5_1_slippage_reverts_whole_plan() {
         "swap with min_out=200 must revert on slippage"
     );
 
-    // Whole plan reverted: bob's input survives untouched (value 100)...
+    // Whole plan reverted: bob's input survives untouched...
     let surviving = state
         .get_object(&bob_coin)
         .expect("bob's input coin must survive a reverted swap");
     assert_eq!(
         bloom_petal_fungible::ops::decode_coin_value(&surviving.payload).ok(),
-        Some(100),
+        Some(BOB_SWAP_IN),
         "bob's input coin value must be unchanged after revert"
     );
-    // ...pool reserves stay at (1000, 1000)...
+    // ...pool reserves stay at their initial values...
     let (ra, rb, ..) =
         bloom_petal_dex_pool::payload::decode_pool(&state.get_object(&pool_id).unwrap().payload)
             .unwrap();
-    assert_eq!(ra, 1000, "reserve_a unchanged after revert");
-    assert_eq!(rb, 1000, "reserve_b unchanged after revert");
+    assert_eq!(
+        ra, SHARED_POOL_INITIAL_RESERVE,
+        "reserve_a unchanged after revert"
+    );
+    assert_eq!(
+        rb, SHARED_POOL_INITIAL_RESERVE,
+        "reserve_b unchanged after revert"
+    );
     // ...and carol was credited nothing.
     assert!(
-        !owner_has_coin_worth(&state, carol, 90),
+        !owner_has_coin_worth(&state, carol, expected_out),
         "carol must be credited nothing on a reverted swap"
     );
 }
@@ -611,15 +639,19 @@ fn litmus_5_1_output_not_double_spendable() {
     let pool_id = create_shared_pool(&mut state, alice, pool_hash, b"p1", FEE_BPS);
     let pool_ver = state.get_object(&pool_id).unwrap().version;
     let bob_coin = erased_coin_id(b"bob-5.1-double");
-    seed_erased_coin(&mut state, bob_coin, Owner::Address(bob.0), 100);
+    seed_erased_coin(&mut state, bob_coin, Owner::Address(bob.0), BOB_SWAP_IN);
 
     let gas_payer = genesis_coin_id(bob, 1);
 
     // The swap's expected output (derived, no magic number): the single coin
     // packet `@0.0` is worth this much.
-    let (_ra, _rb, out) =
-        ConstantProduct::apply_swap(1000, 1000, 100, &ConstantProductParams { fee_bps: FEE_BPS })
-            .expect("swap quote");
+    let (_ra, _rb, out) = ConstantProduct::apply_swap(
+        SHARED_POOL_INITIAL_RESERVE,
+        SHARED_POOL_INITIAL_RESERVE,
+        BOB_SWAP_IN,
+        &ConstantProductParams { fee_bps: FEE_BPS },
+    )
+    .expect("swap quote");
 
     // A plan that swaps ONCE (producing the single linear coin packet `@0.0`)
     // then references that SAME `@0.0` output as the input to TWO downstream
@@ -638,7 +670,7 @@ fn litmus_5_1_output_not_double_spendable() {
     let lines = vec![
         // 0: bob's 100-coin → pool → output coin @0.0.
         format!(
-            "/bloom/dex/pool/swap_exact_in obj:{bob}@0 obj:{pool}@{ver} 1",
+            "/bloom/dex/pool/swap_exact_in type:Erased type:Erased obj:{bob}@0 obj:{pool}@{ver} 1",
             bob = hex32(&bob_coin.0),
             pool = hex32(&pool_id.0),
             ver = pool_ver,
@@ -684,7 +716,7 @@ fn litmus_5_1_output_not_double_spendable() {
                 .expect("bob's input coin must survive a reverted double-spend");
             assert_eq!(
                 bloom_petal_fungible::ops::decode_coin_value(&surviving.payload).ok(),
-                Some(100),
+                Some(BOB_SWAP_IN),
                 "bob's input coin value must be unchanged after double-spend revert"
             );
             let (ra, rb, ..) = bloom_petal_dex_pool::payload::decode_pool(
@@ -692,11 +724,11 @@ fn litmus_5_1_output_not_double_spendable() {
             )
             .unwrap();
             assert_eq!(
-                ra, 1000,
+                ra, SHARED_POOL_INITIAL_RESERVE,
                 "pool reserve_a unchanged after double-spend revert"
             );
             assert_eq!(
-                rb, 1000,
+                rb, SHARED_POOL_INITIAL_RESERVE,
                 "pool reserve_b unchanged after double-spend revert"
             );
         }
@@ -732,22 +764,34 @@ fn litmus_5_1_output_not_double_spendable() {
 // Litmus 5.2 — two-hop atomic swap (swap → swap → receive), both doors.
 // ===========================================================================
 
-/// Expected per-hop outputs for a 100-in two-hop through two 1000/1000 pools
+/// Expected per-hop outputs for a fixed-input two-hop through two fresh shared pools
 /// charging `HOP1_FEE_BPS` / `HOP2_FEE_BPS` respectively, derived from
 /// `bloom_dex_math` (no magic numbers). The two fees differ only so the pools
 /// get distinct content-addressed ids (see `HOP*_FEE_BPS`); the swap semantics
 /// are otherwise identical to the spec's "two identical pools" framing.
 fn two_hop_expected() -> (u128, u128) {
-    // Hop 1: 100 in against (1000, 1000) at HOP1's fee → out1.
+    // Hop 1: input against a fresh pool at HOP1's fee → out1.
     let p1 = ConstantProductParams {
         fee_bps: HOP1_FEE_BPS,
     };
-    let (_ra1, _rb1, out1) = ConstantProduct::apply_swap(1000, 1000, 100, &p1).expect("hop1");
-    // Hop 2: out1 in against fresh (1000, 1000) at HOP2's fee → out2.
+    let (_ra1, _rb1, out1) = ConstantProduct::apply_swap(
+        SHARED_POOL_INITIAL_RESERVE,
+        SHARED_POOL_INITIAL_RESERVE,
+        BOB_SWAP_IN,
+        &p1,
+    )
+    .expect("hop1");
+    // Hop 2: out1 in against a fresh pool at HOP2's fee → out2.
     let p2 = ConstantProductParams {
         fee_bps: HOP2_FEE_BPS,
     };
-    let (_ra2, _rb2, out2) = ConstantProduct::apply_swap(1000, 1000, out1, &p2).expect("hop2");
+    let (_ra2, _rb2, out2) = ConstantProduct::apply_swap(
+        SHARED_POOL_INITIAL_RESERVE,
+        SHARED_POOL_INITIAL_RESERVE,
+        out1,
+        &p2,
+    )
+    .expect("hop2");
     (out1, out2)
 }
 
@@ -761,8 +805,8 @@ struct Hop {
 
 fn expr_5_2(bob_coin: &ObjectId, hop1: &Hop, hop2: &Hop, carol: &[u8; 32]) -> String {
     format!(
-        "/bloom/dex/pool/swap_exact_in obj:{bob}@0 obj:{p1}@{v1} {min1} \
-         | /bloom/dex/pool/swap_exact_in obj:{p2}@{v2} {min2} \
+        "/bloom/dex/pool/swap_exact_in type:Erased type:Erased obj:{bob}@0 obj:{p1}@{v1} {min1} \
+         | /bloom/dex/pool/swap_exact_in type:Erased type:Erased obj:{p2}@{v2} {min2} \
          | /bloom/dex/wallet/receive 0x{carol}",
         bob = hex32(&bob_coin.0),
         p1 = hex32(&hop1.pool.0),
@@ -784,7 +828,7 @@ fn litmus_5_2_two_hop_atomic() {
 
     let (mut state_cli, pool_hash, _wallet_hash) = deploy(&[(alice, 1_000_000), (bob, 1_000_000)]);
 
-    // Two distinct shared 1000/1000 pools.
+    // Two distinct shared pools.
     let pool1 = create_shared_pool(&mut state_cli, alice, pool_hash, b"hop1", HOP1_FEE_BPS);
     let pool2 = create_shared_pool(&mut state_cli, alice, pool_hash, b"hop2", HOP2_FEE_BPS);
     assert_ne!(pool1, pool2, "the two hops must be distinct pools");
@@ -792,7 +836,7 @@ fn litmus_5_2_two_hop_atomic() {
     let v2 = state_cli.get_object(&pool2).unwrap().version;
 
     let bob_coin = erased_coin_id(b"bob-5.2");
-    seed_erased_coin(&mut state_cli, bob_coin, Owner::Address(bob.0), 100);
+    seed_erased_coin(&mut state_cli, bob_coin, Owner::Address(bob.0), BOB_SWAP_IN);
 
     let mut state_vfs = state_cli.clone();
 
@@ -850,13 +894,29 @@ fn litmus_5_2_two_hop_atomic() {
         let (ra1, rb1, ..) =
             bloom_petal_dex_pool::payload::decode_pool(&state.get_object(&pool1).unwrap().payload)
                 .unwrap();
-        assert_eq!(ra1, 1000 + 100, "[{label}] pool1 reserve_a after hop1");
-        assert_eq!(rb1, 1000 - out1, "[{label}] pool1 reserve_b after hop1");
+        assert_eq!(
+            ra1,
+            SHARED_POOL_INITIAL_RESERVE + BOB_SWAP_IN,
+            "[{label}] pool1 reserve_a after hop1"
+        );
+        assert_eq!(
+            rb1,
+            SHARED_POOL_INITIAL_RESERVE - out1,
+            "[{label}] pool1 reserve_b after hop1"
+        );
         let (ra2, rb2, ..) =
             bloom_petal_dex_pool::payload::decode_pool(&state.get_object(&pool2).unwrap().payload)
                 .unwrap();
-        assert_eq!(ra2, 1000 + out1, "[{label}] pool2 reserve_a after hop2");
-        assert_eq!(rb2, 1000 - out2, "[{label}] pool2 reserve_b after hop2");
+        assert_eq!(
+            ra2,
+            SHARED_POOL_INITIAL_RESERVE + out1,
+            "[{label}] pool2 reserve_a after hop2"
+        );
+        assert_eq!(
+            rb2,
+            SHARED_POOL_INITIAL_RESERVE - out2,
+            "[{label}] pool2 reserve_b after hop2"
+        );
 
         // The intermediate coin (hop0's output, consumed by hop1) must NOT
         // be a committed standalone object owned by anyone (no orphan
@@ -906,7 +966,7 @@ fn litmus_5_2_failure_reverts_whole_plan() {
     let v1 = state.get_object(&pool1).unwrap().version;
     let v2 = state.get_object(&pool2).unwrap().version;
     let bob_coin = erased_coin_id(b"bob-5.2-fail");
-    seed_erased_coin(&mut state, bob_coin, Owner::Address(bob.0), 100);
+    seed_erased_coin(&mut state, bob_coin, Owner::Address(bob.0), BOB_SWAP_IN);
 
     let (out1, out2) = two_hop_expected();
     let hop1 = Hop {
@@ -931,22 +991,28 @@ fn litmus_5_2_failure_reverts_whole_plan() {
         "two-hop with min2 above the second-hop output must revert"
     );
 
-    // Whole plan reverted: bob's input intact (100)...
+    // Whole plan reverted: bob's input intact...
     let surviving = state
         .get_object(&bob_coin)
         .expect("bob's input coin must survive the reverted two-hop");
     assert_eq!(
         bloom_petal_fungible::ops::decode_coin_value(&surviving.payload).ok(),
-        Some(100),
+        Some(BOB_SWAP_IN),
         "bob's input value unchanged after revert"
     );
-    // ...BOTH pools unchanged at (1000, 1000)...
+    // ...BOTH pools unchanged at their initial values...
     for (label, pool) in [("pool1", &pool1), ("pool2", &pool2)] {
         let (ra, rb, ..) =
             bloom_petal_dex_pool::payload::decode_pool(&state.get_object(pool).unwrap().payload)
                 .unwrap();
-        assert_eq!(ra, 1000, "{label} reserve_a unchanged after revert");
-        assert_eq!(rb, 1000, "{label} reserve_b unchanged after revert");
+        assert_eq!(
+            ra, SHARED_POOL_INITIAL_RESERVE,
+            "{label} reserve_a unchanged after revert"
+        );
+        assert_eq!(
+            rb, SHARED_POOL_INITIAL_RESERVE,
+            "{label} reserve_b unchanged after revert"
+        );
     }
     // ...and carol credited nothing.
     assert!(

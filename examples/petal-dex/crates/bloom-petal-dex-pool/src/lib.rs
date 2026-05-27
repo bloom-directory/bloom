@@ -70,7 +70,7 @@ impl ParamCodec for bloom_dex_math::ConstantProductParams {
 
 /// Payload codec helpers used by both `ops` and the unit tests.
 pub mod payload {
-    use bloom_objects::ObjectId;
+    use bloom_objects::{ObjectId, TypeTag};
     use bloom_resource::abi::{ArgReader, RetWriter};
 
     // Layout of `Pool<A, B, S>` payload written to the chain:
@@ -80,9 +80,16 @@ pub mod payload {
     //   [ lp_supply   : 16 bytes BE ]
     //   [ k_last      : 16 bytes BE ]
     //   [ params_bytes: 4 BE len + raw ]
-    //   total: 84 + len(params) bytes
+    //   [ coin_a_tag  : canonical TypeTag ]
+    //   [ coin_b_tag  : canonical TypeTag ]
+    //   total: 84 + len(params) + len(tags) bytes
+
+    /// Decoded pool payload fields:
+    /// `(reserve_a, reserve_b, lp_supply, k_last, params_bytes, coin_a_tag, coin_b_tag)`.
+    pub type DecodedPool = (u128, u128, u128, u128, Vec<u8>, TypeTag, TypeTag);
 
     /// Encode a `Pool` payload.
+    #[allow(clippy::too_many_arguments)]
     pub fn pool_payload(
         id: &ObjectId,
         reserve_a: u128,
@@ -90,22 +97,28 @@ pub mod payload {
         lp_supply: u128,
         k_last: u128,
         params_bytes: &[u8],
+        coin_a_tag: &TypeTag,
+        coin_b_tag: &TypeTag,
     ) -> Vec<u8> {
-        let mut w = RetWriter::with_capacity(84 + params_bytes.len());
+        let mut w = RetWriter::with_capacity(84 + params_bytes.len() + 64);
         w.write_object_id(id);
         w.write_u128(reserve_a);
         w.write_u128(reserve_b);
         w.write_u128(lp_supply);
         w.write_u128(k_last);
         w.write_bytes(params_bytes);
+        w.write_type_tag(coin_a_tag)
+            .expect("coin_a TypeTag must encode");
+        w.write_type_tag(coin_b_tag)
+            .expect("coin_b TypeTag must encode");
         w.finish()
     }
 
     /// Decode fields from a `Pool` payload slice.
     ///
-    /// Returns `(reserve_a, reserve_b, lp_supply, k_last, params_bytes)` or
+    /// Returns `(reserve_a, reserve_b, lp_supply, k_last, params_bytes, coin_a_tag, coin_b_tag)` or
     /// `None` if the buffer is too short / malformed.
-    pub fn decode_pool(bytes: &[u8]) -> Option<(u128, u128, u128, u128, Vec<u8>)> {
+    pub fn decode_pool(bytes: &[u8]) -> Option<DecodedPool> {
         let mut r = ArgReader::new(bytes);
         r.read_object_id().ok()?; // skip id
         let reserve_a = r.read_u128().ok()?;
@@ -113,7 +126,11 @@ pub mod payload {
         let lp_supply = r.read_u128().ok()?;
         let k_last = r.read_u128().ok()?;
         let params = r.read_bytes().ok()?;
-        Some((reserve_a, reserve_b, lp_supply, k_last, params))
+        let coin_a_tag = r.read_type_tag().ok()?;
+        let coin_b_tag = r.read_type_tag().ok()?;
+        Some((
+            reserve_a, reserve_b, lp_supply, k_last, params, coin_a_tag, coin_b_tag,
+        ))
     }
 
     // Layout of `LpPosition<A, B, S>` payload:
@@ -156,6 +173,8 @@ pub enum PoolError {
     MathFailed(bloom_dex_math::MathError),
     /// A position's `pool_id` does not match the pool being operated on.
     WrongPool,
+    /// A coin type tag does not match the pool's stored pair binding.
+    TokenTypeMismatch,
 }
 
 impl core::fmt::Display for PoolError {
@@ -165,6 +184,7 @@ impl core::fmt::Display for PoolError {
             PoolError::InsufficientLiquidity => write!(f, "insufficient liquidity"),
             PoolError::MathFailed(e) => write!(f, "math failed: {e}"),
             PoolError::WrongPool => write!(f, "wrong pool"),
+            PoolError::TokenTypeMismatch => write!(f, "token type mismatch"),
         }
     }
 }
@@ -201,12 +221,8 @@ mod tags {
         concrete("LpPosition", vec![])
     }
 
-    /// `TypeTag` for `Coin<Erased>` — the type-erased coin shape the pool's
-    /// exports declare for both their coin args and their returned output
-    /// coins (matches `bloom_resource::Erased`'s tag). The `idx` argument
-    /// is ignored (kept for call-site compatibility).
-    pub fn coin_tag(_idx: u16) -> TypeTag {
-        concrete("Coin", vec![concrete("Erased", vec![])])
+    pub fn coin_tag(inner: TypeTag) -> TypeTag {
+        concrete("Coin", vec![inner])
     }
 }
 
@@ -219,7 +235,7 @@ mod tags {
 /// over these, exactly mirroring the `bloom-petal-fungible` split.
 pub mod ops {
     use bloom_dex_math::SwapStrategy;
-    use bloom_objects::ObjectId;
+    use bloom_objects::{ObjectId, TypeTag};
     use bloom_resource::host;
     use bloom_resource::{PetalError, RuntimeHandle, abi::RetWriter};
 
@@ -228,9 +244,7 @@ pub mod ops {
     // ── Pool payload r/w helpers ─────────────────────────────────────────────
 
     /// Decode a pool handle's payload from the borrow table.
-    pub fn read_pool(
-        pool_handle: RuntimeHandle,
-    ) -> Result<(u128, u128, u128, u128, Vec<u8>), PetalError> {
+    pub fn read_pool(pool_handle: RuntimeHandle) -> Result<payload::DecodedPool, PetalError> {
         let bytes = host::object_read(pool_handle)?;
         payload::decode_pool(&bytes).ok_or(PetalError::InvalidArgs)
     }
@@ -239,11 +253,7 @@ pub mod ops {
     pub fn write_pool(
         pool_handle: RuntimeHandle,
         existing_bytes: &[u8],
-        reserve_a: u128,
-        reserve_b: u128,
-        lp_supply: u128,
-        k_last: u128,
-        params_bytes: &[u8],
+        fields: &payload::DecodedPool,
     ) -> Result<(), PetalError> {
         // Preserve the 32-byte id prefix from the existing payload.
         if existing_bytes.len() < 32 {
@@ -252,8 +262,18 @@ pub mod ops {
         let mut id_bytes = [0u8; 32];
         id_bytes.copy_from_slice(&existing_bytes[..32]);
         let id = ObjectId(id_bytes);
-        let new_payload =
-            payload::pool_payload(&id, reserve_a, reserve_b, lp_supply, k_last, params_bytes);
+        let (reserve_a, reserve_b, lp_supply, k_last, params_bytes, coin_a_tag, coin_b_tag) =
+            fields;
+        let new_payload = payload::pool_payload(
+            &id,
+            *reserve_a,
+            *reserve_b,
+            *lp_supply,
+            *k_last,
+            params_bytes,
+            coin_a_tag,
+            coin_b_tag,
+        );
         host::object_mutate(pool_handle, &new_payload)
     }
 
@@ -266,6 +286,8 @@ pub mod ops {
         coin_a_handle: RuntimeHandle,
         coin_b_handle: RuntimeHandle,
         params: &S::Params,
+        coin_a_tag: &TypeTag,
+        coin_b_tag: &TypeTag,
     ) -> Result<(RuntimeHandle, RuntimeHandle), PoolError>
     where
         S: SwapStrategy,
@@ -282,24 +304,35 @@ pub mod ops {
         // Initial LP mint (sqrt path; lp_supply = 0).
         let (taken_a, taken_b, lp_minted) =
             S::add_liquidity(0, 0, value_a, value_b, 0).map_err(PoolError::MathFailed)?;
+        let lp_supply = initial_lp_supply(lp_minted)?;
 
-        let k_last = taken_a.saturating_mul(taken_b);
+        let k_last = checked_k_last(taken_a, taken_b)?;
         let params_bytes = params.encode();
 
         let pool_payload = payload::pool_payload(
             &ObjectId([0u8; 32]),
             taken_a,
             taken_b,
-            lp_minted,
+            lp_supply,
             k_last,
             &params_bytes,
+            coin_a_tag,
+            coin_b_tag,
         );
 
         let pool_handle = host::object_create(&tags::pool_tag(), &pool_payload)
             .map_err(|_| PoolError::InsufficientLiquidity)?;
         let pool_id = host::object_id(pool_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
-        let pool_payload =
-            payload::pool_payload(&pool_id, taken_a, taken_b, lp_minted, k_last, &params_bytes);
+        let pool_payload = payload::pool_payload(
+            &pool_id,
+            taken_a,
+            taken_b,
+            lp_supply,
+            k_last,
+            &params_bytes,
+            coin_a_tag,
+            coin_b_tag,
+        );
         host::object_mutate(pool_handle, &pool_payload)
             .map_err(|_| PoolError::InsufficientLiquidity)?;
 
@@ -312,8 +345,8 @@ pub mod ops {
             .map_err(|_| PoolError::InsufficientLiquidity)?;
 
         // Consume the input coins (fully taken on initial deposit).
-        let _ = host::object_delete(coin_a_handle);
-        let _ = host::object_delete(coin_b_handle);
+        host::object_delete(coin_a_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
+        host::object_delete(coin_b_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
 
         Ok((pool_handle, lp_handle))
     }
@@ -326,6 +359,8 @@ pub mod ops {
         pool_handle: RuntimeHandle,
         coin_a_handle: RuntimeHandle,
         coin_b_handle: RuntimeHandle,
+        coin_a_tag: &TypeTag,
+        coin_b_tag: &TypeTag,
     ) -> Result<(RuntimeHandle, Option<RuntimeHandle>, Option<RuntimeHandle>), PoolError>
     where
         S: SwapStrategy,
@@ -333,8 +368,9 @@ pub mod ops {
     {
         let pool_raw =
             host::object_read(pool_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
-        let (reserve_a, reserve_b, lp_supply, _k_last, params_bytes) =
+        let (reserve_a, reserve_b, lp_supply, _k_last, params_bytes, stored_a_tag, stored_b_tag) =
             payload::decode_pool(&pool_raw).ok_or(PoolError::InsufficientLiquidity)?;
+        ensure_pool_pair(&stored_a_tag, &stored_b_tag, coin_a_tag, coin_b_tag)?;
 
         let a_bytes =
             host::object_read(coin_a_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
@@ -356,16 +392,20 @@ pub mod ops {
         let new_lp_supply = lp_supply
             .checked_add(lp_minted)
             .ok_or(PoolError::MathFailed(bloom_dex_math::MathError::Overflow))?;
-        let new_k_last = new_reserve_a.saturating_mul(new_reserve_b);
+        let new_k_last = checked_k_last(new_reserve_a, new_reserve_b)?;
 
         write_pool(
             pool_handle,
             &pool_raw,
-            new_reserve_a,
-            new_reserve_b,
-            new_lp_supply,
-            new_k_last,
-            &params_bytes,
+            &(
+                new_reserve_a,
+                new_reserve_b,
+                new_lp_supply,
+                new_k_last,
+                params_bytes.clone(),
+                stored_a_tag.clone(),
+                stored_b_tag.clone(),
+            ),
         )
         .map_err(|_| PoolError::MathFailed(bloom_dex_math::MathError::Overflow))?;
 
@@ -389,7 +429,7 @@ pub mod ops {
             host::object_delete(coin_a_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
             let leftover_payload = coin_payload(&ObjectId([0u8; 32]), leftover_amount);
             Some(
-                host::object_create(&tags::coin_tag(0), &leftover_payload)
+                host::object_create(&tags::coin_tag(stored_a_tag.clone()), &leftover_payload)
                     .map_err(|_| PoolError::InsufficientLiquidity)?,
             )
         } else {
@@ -402,7 +442,7 @@ pub mod ops {
             host::object_delete(coin_b_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
             let leftover_payload = coin_payload(&ObjectId([0u8; 32]), leftover_amount);
             Some(
-                host::object_create(&tags::coin_tag(1), &leftover_payload)
+                host::object_create(&tags::coin_tag(stored_b_tag.clone()), &leftover_payload)
                     .map_err(|_| PoolError::InsufficientLiquidity)?,
             )
         } else {
@@ -419,6 +459,8 @@ pub mod ops {
     pub fn remove_liquidity<S>(
         pool_handle: RuntimeHandle,
         lp_handle: RuntimeHandle,
+        coin_a_tag: &TypeTag,
+        coin_b_tag: &TypeTag,
     ) -> Result<(RuntimeHandle, RuntimeHandle), PoolError>
     where
         S: SwapStrategy,
@@ -426,8 +468,9 @@ pub mod ops {
     {
         let pool_raw =
             host::object_read(pool_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
-        let (reserve_a, reserve_b, lp_supply, _k_last, params_bytes) =
+        let (reserve_a, reserve_b, lp_supply, _k_last, params_bytes, stored_a_tag, stored_b_tag) =
             payload::decode_pool(&pool_raw).ok_or(PoolError::InsufficientLiquidity)?;
+        ensure_pool_pair(&stored_a_tag, &stored_b_tag, coin_a_tag, coin_b_tag)?;
 
         let lp_bytes = host::object_read(lp_handle).map_err(|_| PoolError::WrongPool)?;
         let (lp_pool_id, shares) = payload::decode_lp(&lp_bytes).ok_or(PoolError::WrongPool)?;
@@ -448,30 +491,34 @@ pub mod ops {
         let new_lp_supply = lp_supply
             .checked_sub(shares)
             .ok_or(PoolError::InsufficientLiquidity)?;
-        let new_k_last = new_reserve_a.saturating_mul(new_reserve_b);
+        let new_k_last = checked_k_last(new_reserve_a, new_reserve_b)?;
 
         write_pool(
             pool_handle,
             &pool_raw,
-            new_reserve_a,
-            new_reserve_b,
-            new_lp_supply,
-            new_k_last,
-            &params_bytes,
+            &(
+                new_reserve_a,
+                new_reserve_b,
+                new_lp_supply,
+                new_k_last,
+                params_bytes.clone(),
+                stored_a_tag.clone(),
+                stored_b_tag.clone(),
+            ),
         )
         .map_err(|_| PoolError::InsufficientLiquidity)?;
 
         // Consume the LP position.
-        let _ = host::object_delete(lp_handle);
+        host::object_delete(lp_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
 
         // Mint the two output coins.
         let coin_a_handle = host::object_create(
-            &tags::coin_tag(0),
+            &tags::coin_tag(stored_a_tag.clone()),
             &coin_payload(&ObjectId([0u8; 32]), amount_a),
         )
         .map_err(|_| PoolError::InsufficientLiquidity)?;
         let coin_b_handle = host::object_create(
-            &tags::coin_tag(1),
+            &tags::coin_tag(stored_b_tag.clone()),
             &coin_payload(&ObjectId([0u8; 32]), amount_b),
         )
         .map_err(|_| PoolError::InsufficientLiquidity)?;
@@ -486,6 +533,8 @@ pub mod ops {
         pool_handle: RuntimeHandle,
         coin_in_handle: RuntimeHandle,
         min_out: u128,
+        coin_a_tag: &TypeTag,
+        coin_b_tag: &TypeTag,
     ) -> Result<RuntimeHandle, PoolError>
     where
         S: SwapStrategy,
@@ -493,8 +542,9 @@ pub mod ops {
     {
         let pool_raw =
             host::object_read(pool_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
-        let (reserve_a, reserve_b, lp_supply, _k_last, params_bytes) =
+        let (reserve_a, reserve_b, lp_supply, _k_last, params_bytes, stored_a_tag, stored_b_tag) =
             payload::decode_pool(&pool_raw).ok_or(PoolError::InsufficientLiquidity)?;
+        ensure_pool_pair(&stored_a_tag, &stored_b_tag, coin_a_tag, coin_b_tag)?;
 
         let params = S::Params::decode(&params_bytes).ok_or(PoolError::MathFailed(
             bloom_dex_math::MathError::ZeroReserves,
@@ -504,7 +554,7 @@ pub mod ops {
             host::object_read(coin_in_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
         let amount_in = decode_coin_value(&in_bytes)?;
 
-        let (_new_ri, _new_ro, amount_out) =
+        let (new_reserve_a, new_reserve_b, amount_out) =
             S::apply_swap(reserve_a, reserve_b, amount_in, &params)
                 .map_err(PoolError::MathFailed)?;
 
@@ -512,31 +562,29 @@ pub mod ops {
             return Err(PoolError::SlippageExceeded);
         }
 
-        let new_reserve_a = reserve_a
-            .checked_add(amount_in)
-            .ok_or(PoolError::MathFailed(bloom_dex_math::MathError::Overflow))?;
-        let new_reserve_b = reserve_b
-            .checked_sub(amount_out)
-            .ok_or(PoolError::InsufficientLiquidity)?;
-        let new_k_last = new_reserve_a.saturating_mul(new_reserve_b);
+        let new_k_last = checked_k_last(new_reserve_a, new_reserve_b)?;
 
         write_pool(
             pool_handle,
             &pool_raw,
-            new_reserve_a,
-            new_reserve_b,
-            lp_supply,
-            new_k_last,
-            &params_bytes,
+            &(
+                new_reserve_a,
+                new_reserve_b,
+                lp_supply,
+                new_k_last,
+                params_bytes.clone(),
+                stored_a_tag.clone(),
+                stored_b_tag.clone(),
+            ),
         )
         .map_err(|_| PoolError::MathFailed(bloom_dex_math::MathError::Overflow))?;
 
         // Consume coin_in.
-        let _ = host::object_delete(coin_in_handle);
+        host::object_delete(coin_in_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
 
         // Mint coin_out.
         let coin_b_handle = host::object_create(
-            &tags::coin_tag(1),
+            &tags::coin_tag(stored_b_tag.clone()),
             &coin_payload(&ObjectId([0u8; 32]), amount_out),
         )
         .map_err(|_| PoolError::InsufficientLiquidity)?;
@@ -551,6 +599,8 @@ pub mod ops {
         pool_handle: RuntimeHandle,
         coin_in_handle: RuntimeHandle,
         min_out: u128,
+        coin_a_tag: &TypeTag,
+        coin_b_tag: &TypeTag,
     ) -> Result<RuntimeHandle, PoolError>
     where
         S: SwapStrategy,
@@ -558,8 +608,9 @@ pub mod ops {
     {
         let pool_raw =
             host::object_read(pool_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
-        let (reserve_a, reserve_b, lp_supply, _k_last, params_bytes) =
+        let (reserve_a, reserve_b, lp_supply, _k_last, params_bytes, stored_a_tag, stored_b_tag) =
             payload::decode_pool(&pool_raw).ok_or(PoolError::InsufficientLiquidity)?;
+        ensure_pool_pair(&stored_a_tag, &stored_b_tag, coin_a_tag, coin_b_tag)?;
 
         let params = S::Params::decode(&params_bytes).ok_or(PoolError::MathFailed(
             bloom_dex_math::MathError::ZeroReserves,
@@ -570,7 +621,7 @@ pub mod ops {
         let amount_in = decode_coin_value(&in_bytes)?;
 
         // B→A swap: reserve_in=reserve_b, reserve_out=reserve_a.
-        let (_new_ri, _new_ro, amount_out) =
+        let (new_reserve_b, new_reserve_a, amount_out) =
             S::apply_swap(reserve_b, reserve_a, amount_in, &params)
                 .map_err(PoolError::MathFailed)?;
 
@@ -578,31 +629,29 @@ pub mod ops {
             return Err(PoolError::SlippageExceeded);
         }
 
-        let new_reserve_b = reserve_b
-            .checked_add(amount_in)
-            .ok_or(PoolError::MathFailed(bloom_dex_math::MathError::Overflow))?;
-        let new_reserve_a = reserve_a
-            .checked_sub(amount_out)
-            .ok_or(PoolError::InsufficientLiquidity)?;
-        let new_k_last = new_reserve_a.saturating_mul(new_reserve_b);
+        let new_k_last = checked_k_last(new_reserve_a, new_reserve_b)?;
 
         write_pool(
             pool_handle,
             &pool_raw,
-            new_reserve_a,
-            new_reserve_b,
-            lp_supply,
-            new_k_last,
-            &params_bytes,
+            &(
+                new_reserve_a,
+                new_reserve_b,
+                lp_supply,
+                new_k_last,
+                params_bytes.clone(),
+                stored_a_tag.clone(),
+                stored_b_tag.clone(),
+            ),
         )
         .map_err(|_| PoolError::MathFailed(bloom_dex_math::MathError::Overflow))?;
 
         // Consume coin_in.
-        let _ = host::object_delete(coin_in_handle);
+        host::object_delete(coin_in_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
 
         // Mint coin_a_out.
         let coin_a_handle = host::object_create(
-            &tags::coin_tag(0),
+            &tags::coin_tag(stored_a_tag.clone()),
             &coin_payload(&ObjectId([0u8; 32]), amount_out),
         )
         .map_err(|_| PoolError::InsufficientLiquidity)?;
@@ -618,6 +667,8 @@ pub mod ops {
         pool_handle: RuntimeHandle,
         max_in_handle: RuntimeHandle,
         amount_out: u128,
+        coin_a_tag: &TypeTag,
+        coin_b_tag: &TypeTag,
     ) -> Result<(RuntimeHandle, Option<RuntimeHandle>), PoolError>
     where
         S: SwapStrategy,
@@ -625,8 +676,9 @@ pub mod ops {
     {
         let pool_raw =
             host::object_read(pool_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
-        let (reserve_a, reserve_b, lp_supply, _k_last, params_bytes) =
+        let (reserve_a, reserve_b, lp_supply, _k_last, params_bytes, stored_a_tag, stored_b_tag) =
             payload::decode_pool(&pool_raw).ok_or(PoolError::InsufficientLiquidity)?;
+        ensure_pool_pair(&stored_a_tag, &stored_b_tag, coin_a_tag, coin_b_tag)?;
 
         let params = S::Params::decode(&params_bytes).ok_or(PoolError::MathFailed(
             bloom_dex_math::MathError::ZeroReserves,
@@ -654,22 +706,26 @@ pub mod ops {
         let new_reserve_b = reserve_b
             .checked_sub(amount_out)
             .ok_or(PoolError::InsufficientLiquidity)?;
-        let new_k_last = new_reserve_a.saturating_mul(new_reserve_b);
+        let new_k_last = checked_k_last(new_reserve_a, new_reserve_b)?;
 
         write_pool(
             pool_handle,
             &pool_raw,
-            new_reserve_a,
-            new_reserve_b,
-            lp_supply,
-            new_k_last,
-            &params_bytes,
+            &(
+                new_reserve_a,
+                new_reserve_b,
+                lp_supply,
+                new_k_last,
+                params_bytes.clone(),
+                stored_a_tag.clone(),
+                stored_b_tag.clone(),
+            ),
         )
         .map_err(|_| PoolError::MathFailed(bloom_dex_math::MathError::Overflow))?;
 
         // Mint output coin.
         let coin_b_handle = host::object_create(
-            &tags::coin_tag(1),
+            &tags::coin_tag(stored_b_tag.clone()),
             &coin_payload(&ObjectId([0u8; 32]), amount_out),
         )
         .map_err(|_| PoolError::InsufficientLiquidity)?;
@@ -680,7 +736,7 @@ pub mod ops {
             host::object_delete(max_in_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
             let leftover_payload = coin_payload(&ObjectId([0u8; 32]), leftover_amount);
             Some(
-                host::object_create(&tags::coin_tag(0), &leftover_payload)
+                host::object_create(&tags::coin_tag(stored_a_tag.clone()), &leftover_payload)
                     .map_err(|_| PoolError::InsufficientLiquidity)?,
             )
         } else {
@@ -727,6 +783,30 @@ pub mod ops {
         let mut id = [0u8; 32];
         id.copy_from_slice(&bytes[..32]);
         Some(ObjectId(id))
+    }
+
+    fn checked_k_last(reserve_a: u128, reserve_b: u128) -> Result<u128, PoolError> {
+        reserve_a
+            .checked_mul(reserve_b)
+            .ok_or(PoolError::MathFailed(bloom_dex_math::MathError::Overflow))
+    }
+
+    fn initial_lp_supply(lp_minted: u128) -> Result<u128, PoolError> {
+        lp_minted
+            .checked_add(bloom_dex_math::MINIMUM_LIQUIDITY)
+            .ok_or(PoolError::MathFailed(bloom_dex_math::MathError::Overflow))
+    }
+
+    fn ensure_pool_pair(
+        stored_a_tag: &TypeTag,
+        stored_b_tag: &TypeTag,
+        coin_a_tag: &TypeTag,
+        coin_b_tag: &TypeTag,
+    ) -> Result<(), PoolError> {
+        if stored_a_tag != coin_a_tag || stored_b_tag != coin_b_tag {
+            return Err(PoolError::TokenTypeMismatch);
+        }
+        Ok(())
     }
 
     /// Compute the exact input amount required to receive `amount_out` of
@@ -788,11 +868,28 @@ pub mod ops {
 
             assert_eq!(
                 compute_exact_in_for_out::<ConstantProduct>(1000, 1000, 1, 20_000, &params),
-                Ok(20_000)
+                Ok(10_011)
             );
             assert_eq!(
-                compute_exact_in_for_out::<ConstantProduct>(1000, 1000, 1, 19_999, &params),
+                compute_exact_in_for_out::<ConstantProduct>(1000, 1000, 1, 10_010, &params),
                 Err(PoolError::SlippageExceeded)
+            );
+        }
+
+        #[test]
+        fn checked_k_last_overflow_is_math_error() {
+            assert_eq!(
+                checked_k_last(u128::MAX, 2),
+                Err(PoolError::MathFailed(bloom_dex_math::MathError::Overflow))
+            );
+            assert_eq!(checked_k_last(11, 13), Ok(143));
+        }
+
+        #[test]
+        fn initial_lp_supply_includes_locked_minimum() {
+            assert_eq!(
+                initial_lp_supply(5_000),
+                Ok(5_000 + bloom_dex_math::MINIMUM_LIQUIDITY)
             );
         }
     }
@@ -804,8 +901,8 @@ pub mod ops {
 /// public entry points for pool lifecycle operations.
 #[bloom::petal(path = "/bloom/dex/pool", version = "0.1.0")]
 pub mod pool {
-    use bloom_objects::ObjectId;
-    use bloom_resource::{Coin, Erased, Resource, UID};
+    use bloom_objects::{ObjectId, TypeTag};
+    use bloom_resource::{Coin, Resource, UID};
 
     use bloom_dex_math::{ConstantProduct, ConstantProductParams};
 
@@ -818,7 +915,7 @@ pub mod pool {
     /// ## Field layout in the canonical payload
     ///
     /// `id (32) | reserve_a (16) | reserve_b (16) | lp_supply (16) |
-    ///  k_last (16) | params_bytes (4-len + raw)`
+    ///  k_last (16) | params_bytes (4-len + raw) | coin_a_tag | coin_b_tag`
     ///
     /// `reserve_a` and `reserve_b` are the raw u128 balances of the two
     /// token reserves stored as integers (not as `Coin` objects) because
@@ -827,9 +924,11 @@ pub mod pool {
     ///
     /// In the handle/tag model (spec §11.2) the pool is operated on as an
     /// opaque on-chain object — there is no `Pool<A, B, S>` Rust generic.
-    /// The two token identities `A`/`B` are carried by the coin objects'
-    /// own type tags; the swap strategy is `ConstantProduct`, whose fee
-    /// params live serialized in `params_bytes` (decoded via [`ParamCodec`]).
+    /// The two token identities `A`/`B` are persisted as canonical
+    /// [`TypeTag`] values, and generic entrypoints compare their runtime coin
+    /// tags against this stored pair before mutating reserves. The swap
+    /// strategy is `ConstantProduct`, whose fee params live serialized in
+    /// `params_bytes` (decoded via [`ParamCodec`]).
     #[bloom::object(abilities = "key, store")]
     pub struct Pool {
         /// On-chain object identifier.
@@ -844,6 +943,10 @@ pub mod pool {
         pub k_last: u128,
         /// Strategy-specific params, serialized via `ParamCodec`.
         pub params_bytes: Vec<u8>,
+        /// Runtime type tag bound to the pool's token A side.
+        pub coin_a_tag: TypeTag,
+        /// Runtime type tag bound to the pool's token B side.
+        pub coin_b_tag: TypeTag,
     }
 
     /// An LP position in a `Pool`.
@@ -865,13 +968,14 @@ pub mod pool {
 
     /// Create a fresh `Pool` and issue an initial `LpPosition`.
     ///
-    /// Computes the initial LP shares as `floor(sqrt(value_a * value_b))` via
-    /// the `ConstantProduct` sqrt path. `coin_a` and `coin_b` are consumed;
-    /// the LP position is returned to the caller alongside the pool object.
+    /// Computes the initial LP shares via the `ConstantProduct` sqrt path.
+    /// `MINIMUM_LIQUIDITY` is permanently locked in the pool's total LP supply;
+    /// only the remaining minted shares are issued to the caller. `coin_a` and
+    /// `coin_b` are consumed, and the LP position is returned alongside the pool.
     ///
     /// In the handle/tag model (spec §11.2) the exports take coin *handles*
-    /// (`Coin<Erased>` — the on-chain token identities `A`/`B` ride on the
-    /// coin objects' own type tags) and return the created objects as
+    /// (`Coin<A>`/`Coin<B>` — the concrete on-chain token identities are
+    /// supplied as runtime type args) and return the created objects as
     /// `Resource` handles, which the macro encodes as `ObjectId`s for
     /// cross-command threading.
     ///
@@ -879,35 +983,45 @@ pub mod pool {
     /// [`ParamCodec::encode`] (e.g. `ConstantProductParams { fee_bps: 30 }`).
     /// Decoding it here rather than projecting an associated type keeps the
     /// signature free of types the petal macro cannot lower to a `TypeTag`.
-    pub fn create_pool(
-        coin_a: Coin<Erased>,
-        coin_b: Coin<Erased>,
+    pub fn create_pool<A, B>(
+        coin_a: Coin<A>,
+        coin_b: Coin<B>,
         params_bytes: Vec<u8>,
     ) -> (Resource<Pool>, Resource<LpPosition>) {
         let params = ConstantProductParams::decode(&params_bytes)
             .expect("create_pool: invalid params_bytes — could not decode ConstantProductParams");
+        let coin_a_tag = Coin::<A>::type_tag(0).expect("create_pool: A tag must be bound");
+        let coin_b_tag = Coin::<B>::type_tag(1).expect("create_pool: B tag must be bound");
 
-        let (pool_h, lp_h) =
-            ops::create_pool::<ConstantProduct>(coin_a.handle(), coin_b.handle(), &params)
-                .expect("create_pool host failure");
+        let (pool_h, lp_h) = ops::create_pool::<ConstantProduct>(
+            coin_a.handle(),
+            coin_b.handle(),
+            &params,
+            &coin_a_tag,
+            &coin_b_tag,
+        )
+        .expect("create_pool host failure");
         (Resource::from_handle(pool_h), Resource::from_handle(lp_h))
     }
 
     /// Add liquidity to `pool`. Returns the new `LpPosition` and any
     /// un-consumed coin remainders.
     #[allow(clippy::type_complexity)]
-    pub fn add_liquidity(
+    pub fn add_liquidity<A, B>(
         pool: &mut Resource<Pool>,
-        coin_a: Coin<Erased>,
-        coin_b: Coin<Erased>,
-    ) -> (
-        Resource<LpPosition>,
-        Option<Coin<Erased>>,
-        Option<Coin<Erased>>,
-    ) {
-        let (lp_h, la, lb) =
-            ops::add_liquidity::<ConstantProduct>(pool.handle(), coin_a.handle(), coin_b.handle())
-                .expect("add_liquidity host failure");
+        coin_a: Coin<A>,
+        coin_b: Coin<B>,
+    ) -> (Resource<LpPosition>, Option<Coin<A>>, Option<Coin<B>>) {
+        let coin_a_tag = Coin::<A>::type_tag(0).expect("add_liquidity: A tag must be bound");
+        let coin_b_tag = Coin::<B>::type_tag(1).expect("add_liquidity: B tag must be bound");
+        let (lp_h, la, lb) = ops::add_liquidity::<ConstantProduct>(
+            pool.handle(),
+            coin_a.handle(),
+            coin_b.handle(),
+            &coin_a_tag,
+            &coin_b_tag,
+        )
+        .expect("add_liquidity host failure");
         (
             Resource::from_handle(lp_h),
             la.map(Coin::from_handle),
@@ -917,35 +1031,59 @@ pub mod pool {
 
     /// Remove liquidity by consuming `position`. Returns `(Coin, Coin)`
     /// with proportional amounts of each reserve token.
-    pub fn remove_liquidity(
+    pub fn remove_liquidity<A, B>(
         pool: &mut Resource<Pool>,
         position: Resource<LpPosition>,
-    ) -> (Coin<Erased>, Coin<Erased>) {
-        let (ca, cb) = ops::remove_liquidity::<ConstantProduct>(pool.handle(), position.handle())
-            .expect("remove_liquidity host failure");
+    ) -> (Coin<A>, Coin<B>) {
+        let coin_a_tag = Coin::<A>::type_tag(0).expect("remove_liquidity: A tag must be bound");
+        let coin_b_tag = Coin::<B>::type_tag(1).expect("remove_liquidity: B tag must be bound");
+        let (ca, cb) = ops::remove_liquidity::<ConstantProduct>(
+            pool.handle(),
+            position.handle(),
+            &coin_a_tag,
+            &coin_b_tag,
+        )
+        .expect("remove_liquidity host failure");
         (Coin::from_handle(ca), Coin::from_handle(cb))
     }
 
     /// Swap exact `coin_in` (token A) for at-least `min_out` of token B.
-    pub fn swap_exact_in(
-        coin_in: Coin<Erased>,
+    pub fn swap_exact_in<A, B>(
+        coin_in: Coin<A>,
         pool: &mut Resource<Pool>,
         min_out: u128,
-    ) -> Coin<Erased> {
-        let out_h = ops::swap_exact_in::<ConstantProduct>(pool.handle(), coin_in.handle(), min_out)
-            .expect("swap_exact_in host failure");
+    ) -> Coin<B> {
+        let coin_a_tag = Coin::<A>::type_tag(0).expect("swap_exact_in: A tag must be bound");
+        let coin_b_tag = Coin::<B>::type_tag(1).expect("swap_exact_in: B tag must be bound");
+        let out_h = ops::swap_exact_in::<ConstantProduct>(
+            pool.handle(),
+            coin_in.handle(),
+            min_out,
+            &coin_a_tag,
+            &coin_b_tag,
+        )
+        .expect("swap_exact_in host failure");
         Coin::from_handle(out_h)
     }
 
     /// Swap exact `coin_in` (token B) for at-least `min_out` of token A.
-    pub fn swap_exact_in_reverse(
-        coin_in: Coin<Erased>,
+    pub fn swap_exact_in_reverse<A, B>(
+        coin_in: Coin<B>,
         pool: &mut Resource<Pool>,
         min_out: u128,
-    ) -> Coin<Erased> {
-        let out_h =
-            ops::swap_exact_in_reverse::<ConstantProduct>(pool.handle(), coin_in.handle(), min_out)
-                .expect("swap_exact_in_reverse host failure");
+    ) -> Coin<A> {
+        let coin_a_tag =
+            Coin::<A>::type_tag(0).expect("swap_exact_in_reverse: A tag must be bound");
+        let coin_b_tag =
+            Coin::<B>::type_tag(1).expect("swap_exact_in_reverse: B tag must be bound");
+        let out_h = ops::swap_exact_in_reverse::<ConstantProduct>(
+            pool.handle(),
+            coin_in.handle(),
+            min_out,
+            &coin_a_tag,
+            &coin_b_tag,
+        )
+        .expect("swap_exact_in_reverse host failure");
         Coin::from_handle(out_h)
     }
 
@@ -953,14 +1091,21 @@ pub mod pool {
     ///
     /// Returns `(Coin, Option<Coin>)` where the option is the unconsumed
     /// remainder of `max_in` (if any).
-    pub fn swap_exact_out(
+    pub fn swap_exact_out<A, B>(
         pool: &mut Resource<Pool>,
-        max_in: Coin<Erased>,
+        max_in: Coin<A>,
         amount_out: u128,
-    ) -> (Coin<Erased>, Option<Coin<Erased>>) {
-        let (cb_h, la) =
-            ops::swap_exact_out::<ConstantProduct>(pool.handle(), max_in.handle(), amount_out)
-                .expect("swap_exact_out host failure");
+    ) -> (Coin<B>, Option<Coin<A>>) {
+        let coin_a_tag = Coin::<A>::type_tag(0).expect("swap_exact_out: A tag must be bound");
+        let coin_b_tag = Coin::<B>::type_tag(1).expect("swap_exact_out: B tag must be bound");
+        let (cb_h, la) = ops::swap_exact_out::<ConstantProduct>(
+            pool.handle(),
+            max_in.handle(),
+            amount_out,
+            &coin_a_tag,
+            &coin_b_tag,
+        )
+        .expect("swap_exact_out host failure");
         (Coin::from_handle(cb_h), la.map(Coin::from_handle))
     }
 

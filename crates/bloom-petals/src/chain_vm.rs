@@ -51,7 +51,7 @@ use bloom_objects::{
     Object, ObjectId, Owner, TypeTag,
 };
 use bloom_script::{
-    BorrowRow,
+    BorrowRow, CORE_FUNGIBLE_PATH,
     executor::LogEntry as PtbLogEntry,
     host_ctx::{HandleEntry, PtbHostCtx},
 };
@@ -464,6 +464,24 @@ fn can_move_or_reown(row: &BorrowRow, caller_petal: Hash32) -> Result<bool, i32>
     Ok(defines || consumed)
 }
 
+const COIN_MINTER_PATHS: &[&str] = &[
+    CORE_FUNGIBLE_PATH,
+    "/bloom/dex/faucet",
+    "/bloom/dex/pool",
+    "/bloom/dex/router",
+];
+
+fn is_authorized_coin_minter(caller: &Caller<'_, ChainStoreData>, caller_petal: [u8; 32]) -> bool {
+    COIN_MINTER_PATHS.iter().any(|path| {
+        caller
+            .data()
+            .chain_ctx
+            .snapshot
+            .vfs_lookup(path)
+            .is_some_and(|hash| hash.0 == caller_petal)
+    })
+}
+
 /// Install the spec §16.2 host imports onto `linker`.
 ///
 /// Every import:
@@ -725,6 +743,12 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                     if petal_hash != [0u8; 32] && petal_hash != caller_petal {
                         return HostError::Denied("object.create from non-defining petal".into())
                             .as_wasm_code();
+                    }
+                    if type_name == "Coin" && !is_authorized_coin_minter(&caller, caller_petal) {
+                        return HostError::Denied(
+                            "object.create Coin from unauthorized petal".into(),
+                        )
+                        .as_wasm_code();
                     }
                     TypeTag::Concrete {
                         petal_hash: caller_petal,
@@ -1658,7 +1682,15 @@ mod ptb_host_import_tests {
     }
 
     fn run_with(wasm: Vec<u8>, ctx: Arc<Mutex<PtbHostCtx>>, petal_hash: Hash32) -> ChainCallOutput {
-        let state = State::new();
+        run_with_state(wasm, ctx, petal_hash, State::new())
+    }
+
+    fn run_with_state(
+        wasm: Vec<u8>,
+        ctx: Arc<Mutex<PtbHostCtx>>,
+        petal_hash: Hash32,
+        state: State,
+    ) -> ChainCallOutput {
         let input = ChainCallInput {
             wasm,
             entry: ChainEntry::Function("call".into()),
@@ -2315,5 +2347,52 @@ mod ptb_host_import_tests {
         let out = run_with(wasm, arc.clone(), Hash32([0; 32]));
         let code = i32::from_le_bytes(out.return_data.unwrap().try_into().unwrap());
         assert_eq!(code, -2);
+    }
+
+    #[test]
+    fn object_create_coin_from_unbound_petal_is_denied() {
+        let coin_tag = TypeTag::Concrete {
+            petal_hash: [0u8; 32],
+            type_name: "Coin".into(),
+            type_args: vec![TypeTag::Concrete {
+                petal_hash: [0u8; 32],
+                type_name: "Erased".into(),
+                type_args: vec![],
+            }],
+        };
+        let bytes = coin_tag.encode_canonical().unwrap();
+        let wasm = parse(&object_create_wat(&bytes));
+        let arc = Arc::new(Mutex::new(PtbHostCtx::new()));
+        let out = run_with(wasm, arc.clone(), Hash32([0; 32]));
+        let code = i32::from_le_bytes(out.return_data.unwrap().try_into().unwrap());
+        assert_eq!(code, -2);
+        assert!(
+            arc.lock().unwrap().created_objects.is_empty(),
+            "unauthorized Coin create must not stage an object"
+        );
+    }
+
+    #[test]
+    fn object_create_coin_from_vfs_bound_faucet_is_allowed() {
+        let coin_tag = TypeTag::Concrete {
+            petal_hash: [0u8; 32],
+            type_name: "Coin".into(),
+            type_args: vec![TypeTag::Concrete {
+                petal_hash: [0u8; 32],
+                type_name: "Erased".into(),
+                type_args: vec![],
+            }],
+        };
+        let bytes = coin_tag.encode_canonical().unwrap();
+        let wasm = parse(&object_create_wat(&bytes));
+        let computed_petal = blake3_tagged(tags::PETAL, &wasm);
+        let mut state = State::new();
+        state.set_vfs_binding("/bloom/dex/faucet".to_string(), computed_petal);
+
+        let arc = Arc::new(Mutex::new(PtbHostCtx::new()));
+        let out = run_with_state(wasm, arc.clone(), Hash32([0; 32]), state);
+        let code = i32::from_le_bytes(out.return_data.unwrap().try_into().unwrap());
+        assert!(code >= 0, "authorized faucet Coin create got {code}");
+        assert_eq!(arc.lock().unwrap().created_objects.len(), 1);
     }
 }

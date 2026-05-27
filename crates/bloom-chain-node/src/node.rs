@@ -876,14 +876,18 @@ impl Node {
                         blob,
                     } => {
                         match apply_state_snapshot(
-                            Arc::clone(&driver_ev),
-                            Arc::clone(&peer_pool_ev),
-                            Arc::clone(&timeout_tx_ev),
-                            &peer_addr,
-                            block,
-                            state_root,
-                            blob_hash,
-                            blob,
+                            SnapshotApplyContext {
+                                driver: Arc::clone(&driver_ev),
+                                peer_pool: Arc::clone(&peer_pool_ev),
+                                timeout_tx: Arc::clone(&timeout_tx_ev),
+                                peer: &peer_addr,
+                            },
+                            StateSnapshot {
+                                block,
+                                state_root,
+                                blob_hash,
+                                blob,
+                            },
                         )
                         .await
                         {
@@ -1292,19 +1296,39 @@ fn build_state_snapshot_response<E: PetalExecutor>(
     }))
 }
 
-async fn apply_state_snapshot<E: PetalExecutor>(
+struct SnapshotApplyContext<'a, E: PetalExecutor> {
     driver: Arc<ConsensusDriver<E>>,
     peer_pool: Arc<PeerPool>,
     timeout_tx: Arc<mpsc::Sender<(TimeoutKind, u64, u32)>>,
-    peer: &str,
+    peer: &'a str,
+}
+
+struct StateSnapshot {
     block: Block,
     state_root: Hash32,
     blob_hash: Hash32,
     blob: Vec<u8>,
+}
+
+async fn apply_state_snapshot<E: PetalExecutor>(
+    ctx: SnapshotApplyContext<'_, E>,
+    snapshot: StateSnapshot,
 ) -> Result<bool> {
+    let SnapshotApplyContext {
+        driver,
+        peer_pool,
+        timeout_tx,
+        peer,
+    } = ctx;
+    let StateSnapshot {
+        block,
+        state_root,
+        blob_hash,
+        blob,
+    } = snapshot;
     let height = block.header.height;
     let current_height = { driver.engine.lock().height() };
-    if height + 1 <= current_height {
+    if height < current_height {
         return Ok(false);
     }
     if block.commit.votes.is_empty() {

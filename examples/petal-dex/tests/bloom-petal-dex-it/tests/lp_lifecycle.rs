@@ -8,7 +8,7 @@
 //! - add_liquidity proportional: `lp = min(a*lp_supply/reserve_a, b*lp_supply/reserve_b)`
 //! - remove_liquidity: `a_out = reserve_a * lp_burned / lp_supply`
 
-use bloom_dex_math::{ConstantProduct, SwapStrategy, integer_sqrt};
+use bloom_dex_math::{ConstantProduct, MINIMUM_LIQUIDITY, SwapStrategy, integer_sqrt};
 
 // ---------------------------------------------------------------------------
 // Test 1: create_pool initial mint uses sqrt.
@@ -19,15 +19,16 @@ use bloom_dex_math::{ConstantProduct, SwapStrategy, integer_sqrt};
 
 #[test]
 fn create_pool_initial_mint_uses_sqrt() {
-    let (taken_a, taken_b, lp_minted) = ConstantProduct::add_liquidity(0, 0, 400, 900, 0).unwrap();
+    let (taken_a, taken_b, lp_minted) =
+        ConstantProduct::add_liquidity(0, 0, 40_000, 90_000, 0).unwrap();
 
-    assert_eq!(taken_a, 400, "all amount_a deposited on initial mint");
-    assert_eq!(taken_b, 900, "all amount_b deposited on initial mint");
-    assert_eq!(lp_minted, 600, "lp_minted = sqrt(400 * 900) = 600");
+    assert_eq!(taken_a, 40_000, "all amount_a deposited on initial mint");
+    assert_eq!(taken_b, 90_000, "all amount_b deposited on initial mint");
+    assert_eq!(lp_minted, 59_000, "lp_minted = sqrt(k) - minimum");
 
     // Verify via integer_sqrt directly
-    let product = 400u128 * 900u128;
-    assert_eq!(integer_sqrt(product), 600);
+    let product = 40_000u128 * 90_000u128;
+    assert_eq!(integer_sqrt(product), lp_minted + MINIMUM_LIQUIDITY);
 }
 
 // ---------------------------------------------------------------------------
@@ -126,14 +127,16 @@ fn remove_liquidity_burn_exceeds_supply_rejected() {
 #[test]
 fn add_liquidity_create_then_subsequent() {
     // Step 1: create
-    let (_a1, _b1, lp1) = ConstantProduct::add_liquidity(0, 0, 100, 100, 0).unwrap();
-    assert_eq!(lp1, 100, "initial lp = sqrt(100*100) = 100");
+    let (_a1, _b1, lp1) = ConstantProduct::add_liquidity(0, 0, 10_000, 10_000, 0).unwrap();
+    assert_eq!(lp1, 9000, "initial lp = sqrt(k) - minimum");
 
     // Step 2: subsequent deposit (pool now has reserve_a=100, reserve_b=100, lp=100)
-    let (taken_a, taken_b, lp2) = ConstantProduct::add_liquidity(100, 100, 50, 50, lp1).unwrap();
-    assert_eq!(lp2, 50, "subsequent lp proportional = 50");
-    assert_eq!(taken_a, 50);
-    assert_eq!(taken_b, 50);
+    let lp_supply = lp1 + MINIMUM_LIQUIDITY;
+    let (taken_a, taken_b, lp2) =
+        ConstantProduct::add_liquidity(10_000, 10_000, 5000, 5000, lp_supply).unwrap();
+    assert_eq!(lp2, 5000, "subsequent lp proportional = 5000");
+    assert_eq!(taken_a, 5000);
+    assert_eq!(taken_b, 5000);
 }
 
 // ---------------------------------------------------------------------------

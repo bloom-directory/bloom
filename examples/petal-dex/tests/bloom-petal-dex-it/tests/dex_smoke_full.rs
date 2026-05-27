@@ -8,7 +8,7 @@
 //! Math-only verification (no wasm required). The full PTB-level wasm flow
 //! is marked `#[ignore]` pending real wasm artifact integration.
 
-use bloom_dex_math::{ConstantProduct, ConstantProductParams, SwapStrategy};
+use bloom_dex_math::{ConstantProduct, ConstantProductParams, MINIMUM_LIQUIDITY, SwapStrategy};
 
 fn params(fee_bps: u16) -> ConstantProductParams {
     ConstantProductParams { fee_bps }
@@ -41,56 +41,56 @@ fn params(fee_bps: u16) -> ConstantProductParams {
 fn full_dex_flow_math() {
     // Step 1: alice creates pool
     let (taken_a_alice, taken_b_alice, alice_lp) =
-        ConstantProduct::add_liquidity(0, 0, 1000, 1000, 0).unwrap();
-    assert_eq!(alice_lp, 1000, "alice initial lp = sqrt(1M) = 1000");
-    assert_eq!(taken_a_alice, 1000);
-    assert_eq!(taken_b_alice, 1000);
+        ConstantProduct::add_liquidity(0, 0, 10_000, 10_000, 0).unwrap();
+    assert_eq!(
+        alice_lp, 9000,
+        "alice initial lp = sqrt(100M) - MINIMUM_LIQUIDITY"
+    );
+    assert_eq!(taken_a_alice, 10_000);
+    assert_eq!(taken_b_alice, 10_000);
 
-    let mut reserve_a = 1000u128;
-    let mut reserve_b = 1000u128;
-    let mut lp_supply = alice_lp;
+    let mut reserve_a = 10_000u128;
+    let mut reserve_b = 10_000u128;
+    let mut lp_supply = alice_lp + MINIMUM_LIQUIDITY;
 
     // Step 2: bob adds liquidity (deposit 500/500 into 1000/1000 pool)
     let (taken_a_bob, taken_b_bob, bob_lp) =
-        ConstantProduct::add_liquidity(reserve_a, reserve_b, 500, 500, lp_supply).unwrap();
-    assert_eq!(bob_lp, 500, "bob lp proportional = 500");
-    assert_eq!(taken_a_bob, 500);
-    assert_eq!(taken_b_bob, 500);
+        ConstantProduct::add_liquidity(reserve_a, reserve_b, 5000, 5000, lp_supply).unwrap();
+    assert_eq!(bob_lp, 5000, "bob lp proportional = 5000");
+    assert_eq!(taken_a_bob, 5000);
+    assert_eq!(taken_b_bob, 5000);
 
     reserve_a += taken_a_bob;
     reserve_b += taken_b_bob;
     lp_supply += bob_lp;
-    assert_eq!(reserve_a, 1500);
-    assert_eq!(reserve_b, 1500);
-    assert_eq!(lp_supply, 1500);
+    assert_eq!(reserve_a, 15_000);
+    assert_eq!(reserve_b, 15_000);
+    assert_eq!(lp_supply, 15_000);
 
     // Step 3: charlie swaps 100 A→B (fee=30bps)
     let (new_ra, new_rb, amount_out_charlie) =
-        ConstantProduct::apply_swap(reserve_a, reserve_b, 100, &params(30)).unwrap();
+        ConstantProduct::apply_swap(reserve_a, reserve_b, 1000, &params(30)).unwrap();
 
-    // Hand calc: amount_in_with_fee = 100 * 9970 / 10000 = 99
-    // amount_out = 1500 * 99 / (1500 + 99) = 148500 / 1599 = 92
-    assert_eq!(amount_out_charlie, 92, "charlie gets 92 B tokens");
-    assert_eq!(new_ra, 1600, "pool reserve_a = 1600");
-    assert_eq!(new_rb, 1408, "pool reserve_b = 1500 - 92 = 1408");
+    assert_eq!(amount_out_charlie, 934, "charlie gets 934 B tokens");
+    assert_eq!(new_ra, 16_000, "pool reserve_a = 16000");
+    assert_eq!(new_rb, 14_066, "pool reserve_b = 15000 - 934 = 14066");
 
     reserve_a = new_ra;
     reserve_b = new_rb;
 
     // Verify k invariant (with fee, k should be >= original)
     assert!(
-        reserve_a * reserve_b >= 1500 * 1500,
+        reserve_a * reserve_b >= 15_000 * 15_000,
         "k must not decrease after swap"
     );
 
     // Step 4: bob removes half his LP
-    let bob_lp_to_burn = bob_lp / 2; // 250
+    let bob_lp_to_burn = bob_lp / 2; // 2500
     let (a_out_bob, b_out_bob) =
         ConstantProduct::remove_liquidity(reserve_a, reserve_b, lp_supply, bob_lp_to_burn).unwrap();
 
-    // Hand calc: a_out = 1600 * 250 / 1500 = 266, b_out = 1408 * 250 / 1500 = 234
-    assert_eq!(a_out_bob, 266, "bob gets 266 A tokens back");
-    assert_eq!(b_out_bob, 234, "bob gets 234 B tokens back");
+    assert_eq!(a_out_bob, 2666, "bob gets 2666 A tokens back");
+    assert_eq!(b_out_bob, 2344, "bob gets 2344 B tokens back");
 
     // Bob gets back more value than he put in on A-side (due to charlie's swap adding A)
     let bob_a_in = taken_a_bob / 2; // he's only burning half

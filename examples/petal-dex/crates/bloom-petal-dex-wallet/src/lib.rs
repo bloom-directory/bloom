@@ -41,7 +41,7 @@ pub mod wallet {
     /// `bloom-objects` (spec §3.2), matching the fungible petal's `Address`.
     pub type Address = [u8; 32];
 
-    /// Settle `coin` to `recipient`, consuming the coin row.
+    /// Settle `coin` to `recipient`.
     ///
     /// Uses `object.transfer` (no defining-petal restriction), so the coin
     /// may have been minted upstream by a different petal (the pool's swap

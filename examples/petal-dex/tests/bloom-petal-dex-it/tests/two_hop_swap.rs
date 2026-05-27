@@ -22,12 +22,10 @@ fn params(fee_bps: u16) -> ConstantProductParams {
 // amount_in (A) = 100
 //
 // Hop 1:
-//   amount_in_with_fee = 100 * 9970 / 10000 = 99
-//   out_1 = 1000 * 99 / (1000 + 99) = 99000 / 1099 = 90
+//   out_1 = 100 * 9970 * 1000 / (1000 * 10000 + 100 * 9970) = 90
 //
 // Hop 2:
-//   amount_in_with_fee = 90 * 9970 / 10000 = 89 (integer div: 89730/10000=89)
-//   out_2 = 1000 * 89 / (1000 + 89) = 89000 / 1089 = 81
+//   out_2 = 90 * 9970 * 1000 / (1000 * 10000 + 90 * 9970) = 82
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -41,7 +39,7 @@ fn two_hop_quote_matches_hand_calc() {
 
     // Hop 2: B→C (out_1 becomes amount_in for hop 2)
     let out_2 = ConstantProduct::quote(1000, 1000, out_1, &p).unwrap();
-    assert_eq!(out_2, 81, "hop 2 output must be 81");
+    assert_eq!(out_2, 82, "hop 2 output must be 82");
 }
 
 // ---------------------------------------------------------------------------
@@ -49,7 +47,7 @@ fn two_hop_quote_matches_hand_calc() {
 //
 // Same pools/amounts as above.
 // After hop 1: reserve_a=1100, reserve_b=910, amount_out_1=90
-// After hop 2: reserve_b=1090, reserve_c=919, amount_out_2=81
+// After hop 2: reserve_b=1090, reserve_c=918, amount_out_2=82
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -66,9 +64,9 @@ fn two_hop_apply_swap_reserve_updates() {
     // Hop 2: B→C (uses out_1 as amount_in)
     // The second pool starts at its own reserves (1000/1000), independent of pool 1.
     let (new_rb2, new_rc, out_2) = ConstantProduct::apply_swap(1000, 1000, out_1, &p).unwrap();
-    assert_eq!(out_2, 81, "final output must be 81");
+    assert_eq!(out_2, 82, "final output must be 82");
     assert_eq!(new_rb2, 1090, "pool 2 reserve_in = 1000 + 90 = 1090");
-    assert_eq!(new_rc, 919, "pool 2 reserve_out = 1000 - 81 = 919");
+    assert_eq!(new_rc, 918, "pool 2 reserve_out = 1000 - 82 = 918");
 
     // Verify k invariant holds for both hops
     assert!(

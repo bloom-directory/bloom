@@ -4,15 +4,29 @@
 //! compile time by `bloom-petal-dex-cpmm` and `bloom-petal-dex-router` so
 //! that multi-hop math stays self-contained without cross-petal calls.
 
+#![allow(clippy::assign_op_pattern, clippy::manual_div_ceil)]
+
 mod sqrt;
 
 pub use sqrt::integer_sqrt;
+use uint::construct_uint;
+
+construct_uint! {
+    struct U512(8);
+}
 
 /// One hundred percent expressed in basis points.
 ///
 /// Fees must be strictly less than this value. A 10,000 bps fee would make
 /// every swap output zero, and larger values underflow the fee factor.
 pub const MAX_FEE_BPS: u16 = 10_000;
+
+/// LP tokens permanently withheld from the first liquidity provider.
+///
+/// This follows the Uniswap-v2 convention. Initial LP minting returns only the
+/// user-owned LP amount, with this amount reserved for a permanently locked
+/// balance in the pool's total supply.
+pub const MINIMUM_LIQUIDITY: u128 = 1_000;
 
 fn checked_ceil_div(numerator: u128, denominator: u128) -> Result<u128, MathError> {
     if denominator == 0 {
@@ -124,22 +138,22 @@ impl SwapStrategy for ConstantProduct {
             return Err(MathError::MaxOutExceeded);
         }
 
-        // amount_in_with_fee = amount_in * (10_000 - fee_bps) / 10_000
+        // Uniswap-v2 fee formula:
+        // amount_out = amount_in * fee_factor * reserve_out
+        //            / (reserve_in * 10_000 + amount_in * fee_factor)
+        //
+        // Keep the fee-scaled input undivided until the final quotient. Early
+        // truncation can zero out small trades or materially overcharge them.
         let fee_factor = u128::from(MAX_FEE_BPS - params.fee_bps);
-        let amount_in_with_fee = amount_in
-            .checked_mul(fee_factor)
-            .ok_or(MathError::Overflow)?
-            / 10_000;
+        let amount_in_with_fee = U512::from(amount_in) * U512::from(fee_factor);
+        let numerator = U512::from(reserve_out) * amount_in_with_fee;
+        let denominator = U512::from(reserve_in) * U512::from(MAX_FEE_BPS) + amount_in_with_fee;
 
-        // amount_out = reserve_out * amount_in_with_fee / (reserve_in + amount_in_with_fee)
-        let numerator = reserve_out
-            .checked_mul(amount_in_with_fee)
-            .ok_or(MathError::Overflow)?;
-        let denominator = reserve_in
-            .checked_add(amount_in_with_fee)
-            .ok_or(MathError::Overflow)?;
-
-        let amount_out = numerator / denominator;
+        let amount_out_u512 = numerator / denominator;
+        if amount_out_u512 > U512::from(u128::MAX) {
+            return Err(MathError::Overflow);
+        }
+        let amount_out = amount_out_u512.as_u128();
 
         if amount_out == 0 {
             return Err(MathError::InsufficientLiquidity);
@@ -177,9 +191,14 @@ impl SwapStrategy for ConstantProduct {
         lp_supply: u128,
     ) -> Result<(u128, u128, u128), MathError> {
         if lp_supply == 0 {
-            // Initial deposit: mint = sqrt(amount_a * amount_b)
+            // Initial deposit: mint = sqrt(amount_a * amount_b) - MINIMUM_LIQUIDITY.
+            // The withheld minimum is intended to remain permanently locked in
+            // the pool's total LP supply.
             let product = amount_a.checked_mul(amount_b).ok_or(MathError::Overflow)?;
-            let lp_minted = integer_sqrt(product);
+            let root_liquidity = integer_sqrt(product);
+            let lp_minted = root_liquidity
+                .checked_sub(MINIMUM_LIQUIDITY)
+                .ok_or(MathError::InsufficientLiquidity)?;
             if lp_minted == 0 {
                 return Err(MathError::InsufficientLiquidity);
             }
@@ -338,10 +357,21 @@ mod tests {
     fn quote_uniswap_v2_30bps() {
         // Classic Uniswap V2 example: reserve_in=1000, reserve_out=1000,
         // amount_in=100, fee=30bps (0.3%)
-        // amount_in_with_fee = 100 * 9970 / 10000 = 99 (integer div)
-        // amount_out = 1000 * 99 / (1000 + 99) = 99000 / 1099 ≈ 90
+        // amount_out = 100 * 9970 * 1000 / (1000 * 10000 + 100 * 9970) ≈ 90
         let out = ConstantProduct::quote(1000, 1000, 100, &params(30)).unwrap();
         assert_eq!(out, 90);
+    }
+
+    #[test]
+    fn quote_does_not_false_revert_when_fee_scaled_input_is_less_than_denominator() {
+        let out = ConstantProduct::quote(1, 1_000_000_000_000_000_000, 1, &params(30)).unwrap();
+        assert_eq!(out, 499_248_873_309_964_947);
+    }
+
+    #[test]
+    fn quote_keeps_fee_precision_until_final_division() {
+        let out = ConstantProduct::quote(1000, 1000, 3, &params(30)).unwrap();
+        assert_eq!(out, 2);
     }
 
     #[test]
@@ -359,9 +389,9 @@ mod tests {
         let out =
             ConstantProduct::quote(reserve_eth, reserve_usdc, amount_in, &params(30)).unwrap();
 
-        // amount_in_with_fee = 1e18 * 9970 / 10000 = 997_000_000_000_000_000
-        // numerator = 1_600_000_000_000 * 997_000_000_000_000_000 ≈ 1.595e30
-        // denominator = 1_000_000_000_000_000_000_000 + 9.97e17 ≈ 1.0009970e21
+        // amount_in_with_fee = 1e18 * 9970
+        // numerator = 1_600_000_000_000 * amount_in_with_fee
+        // denominator = 1_000_000_000_000_000_000_000 * 10000 + amount_in_with_fee
         // out ≈ 1_594 USDC (in units of 1e6), i.e. ~1594_000_000 raw
         // Approximately 1 ETH at market = 1597 USDC with 0.3% fee taken.
         assert!(out > 1_590 * one_usdc, "out={out}");
@@ -389,12 +419,11 @@ mod tests {
     }
 
     #[test]
-    fn quote_overflow_error() {
-        // amount_in near u128::MAX causes overflow in amount_in * fee_factor
-        assert_eq!(
-            ConstantProduct::quote(u128::MAX / 2, u128::MAX / 2, u128::MAX, &params(0)),
-            Err(MathError::Overflow)
-        );
+    fn quote_uses_wide_intermediates() {
+        let out =
+            ConstantProduct::quote(u128::MAX / 2, u128::MAX / 2, u128::MAX, &params(0)).unwrap();
+        assert!(out > 0);
+        assert!(out < u128::MAX / 2);
     }
 
     // ── CPMM apply_swap ───────────────────────────────────────────────────────
@@ -450,20 +479,34 @@ mod tests {
 
     #[test]
     fn add_liquidity_initial_mint_uses_sqrt() {
-        // lp_supply == 0 → mint = sqrt(amount_a * amount_b)
+        // lp_supply == 0 → mint = sqrt(amount_a * amount_b) - MINIMUM_LIQUIDITY
         let (taken_a, taken_b, lp_minted) =
-            ConstantProduct::add_liquidity(0, 0, 400, 900, 0).unwrap();
-        assert_eq!(taken_a, 400);
-        assert_eq!(taken_b, 900);
-        // sqrt(400 * 900) = sqrt(360_000) = 600
-        assert_eq!(lp_minted, 600);
+            ConstantProduct::add_liquidity(0, 0, 40_000, 90_000, 0).unwrap();
+        assert_eq!(taken_a, 40_000);
+        assert_eq!(taken_b, 90_000);
+        // sqrt(40_000 * 90_000) = sqrt(3_600_000_000) = 60_000
+        assert_eq!(lp_minted, 60_000 - MINIMUM_LIQUIDITY);
     }
 
     #[test]
     fn add_liquidity_initial_non_square() {
-        let (_, _, lp_minted) = ConstantProduct::add_liquidity(0, 0, 100, 200, 0).unwrap();
-        // sqrt(100 * 200) = sqrt(20_000) = 141 (floor)
-        assert_eq!(lp_minted, 141);
+        let (_, _, lp_minted) = ConstantProduct::add_liquidity(0, 0, 10_000, 20_000, 0).unwrap();
+        // sqrt(10_000 * 20_000) = sqrt(200_000_000) = 14_142 (floor)
+        assert_eq!(lp_minted, 14_142 - MINIMUM_LIQUIDITY);
+    }
+
+    #[test]
+    fn add_liquidity_initial_locks_minimum_liquidity() {
+        let (_, _, lp_minted) = ConstantProduct::add_liquidity(0, 0, 1_001, 1_001, 0).unwrap();
+        assert_eq!(lp_minted, 1);
+    }
+
+    #[test]
+    fn add_liquidity_initial_requires_more_than_minimum_liquidity() {
+        assert_eq!(
+            ConstantProduct::add_liquidity(0, 0, 1_000, 1_000, 0),
+            Err(MathError::InsufficientLiquidity)
+        );
     }
 
     #[test]

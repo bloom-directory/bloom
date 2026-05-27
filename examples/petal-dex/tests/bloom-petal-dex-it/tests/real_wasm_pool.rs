@@ -23,7 +23,8 @@ use bloom_script::{Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PqSignature
 
 use bloom_petal_dex_it::dex_harness::{
     addr, build_pool_wasm, build_state, build_wallet_wasm, create_shared_pool, erased_coin_id,
-    genesis_coin_id, owner_has_coin_worth, seed_erased_coin, submit_ptb_chain_auth,
+    erased_pair_type_args, genesis_coin_id, owner_has_coin_worth, seed_erased_coin,
+    submit_ptb_chain_auth,
 };
 
 // ---------------------------------------------------------------------------
@@ -44,8 +45,8 @@ fn real_pool_create_pool_executes() {
     // Seed two Coin<Erased> deposits owned by alice.
     let coin_a = erased_coin_id(b"a");
     let coin_b = erased_coin_id(b"b");
-    seed_erased_coin(&mut state, coin_a, Owner::Address(alice.0), 1000);
-    seed_erased_coin(&mut state, coin_b, Owner::Address(alice.0), 1000);
+    seed_erased_coin(&mut state, coin_a, Owner::Address(alice.0), 10_000);
+    seed_erased_coin(&mut state, coin_b, Owner::Address(alice.0), 10_000);
 
     // params_bytes = ConstantProductParams { fee_bps: 30 } -> 2-byte BE.
     let params_bytes = 30u16.to_be_bytes().to_vec();
@@ -61,7 +62,7 @@ fn real_pool_create_pool_executes() {
                     hash: Some(pool_petal_hash),
                 },
                 function: "create_pool".to_string(),
-                type_args: vec![],
+                type_args: erased_pair_type_args(),
                 args: vec![
                     Arg::Object {
                         id: coin_a,
@@ -117,15 +118,15 @@ fn real_pool_create_pool_executes() {
         "coin_b must be consumed by create_pool"
     );
 
-    // A Pool object must have been created with reserves (1000, 1000).
+    // A Pool object must have been created with reserves (10000, 10000).
     let (_, pool) = state
         .iter_objects()
         .find(|(_, o)| matches!(&o.type_tag, TypeTag::Concrete { type_name, .. } if type_name == "Pool"))
         .expect("a Pool object must exist after create_pool");
-    let (ra, rb, _lp, _k, _p) =
+    let (ra, rb, _lp, _k, _p, _coin_a_tag, _coin_b_tag) =
         bloom_petal_dex_pool::payload::decode_pool(&pool.payload).expect("decode pool");
-    assert_eq!(ra, 1000, "reserve_a");
-    assert_eq!(rb, 1000, "reserve_b");
+    assert_eq!(ra, 10_000, "reserve_a");
+    assert_eq!(rb, 10_000, "reserve_b");
 
     // An LpPosition must also exist.
     assert!(
@@ -153,7 +154,7 @@ fn real_pool_swap_exact_in_executes() {
     let pool_petal_hash = state.insert_code(&wasm);
     state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_petal_hash);
 
-    // Alice stands up a shared 1000/1000 pool.
+    // Alice stands up a shared 10000/10000 pool.
     let pool_id = create_shared_pool(&mut state, alice, pool_petal_hash, b"main", 30);
     let pool_version = state
         .get_object(&pool_id)
@@ -164,7 +165,7 @@ fn real_pool_swap_exact_in_executes() {
     let bob_coin = erased_coin_id(b"bob-in");
     seed_erased_coin(&mut state, bob_coin, Owner::Address(bob.0), 100);
 
-    // min_out = 90 (== expected output for 100-in on a 1000/1000 pool at 30 bps).
+    // min_out = 90 (== expected output for 100-in on a 10000/10000 pool at 30 bps).
     let min_out: u128 = 90;
     let gas_payer = genesis_coin_id(bob, 1);
     let ptb = PtbTx {
@@ -177,7 +178,7 @@ fn real_pool_swap_exact_in_executes() {
                     hash: Some(pool_petal_hash),
                 },
                 function: "swap_exact_in".to_string(),
-                type_args: vec![],
+                type_args: erased_pair_type_args(),
                 args: vec![
                     Arg::Object {
                         id: bob_coin,
@@ -221,18 +222,18 @@ fn real_pool_swap_exact_in_executes() {
         "bob's input coin must be consumed by swap_exact_in"
     );
 
-    // Bob must own an output coin worth exactly 90.
+    // Bob must own an output coin worth exactly 98.
     assert!(
-        owner_has_coin_worth(&state, bob, 90),
-        "bob must receive an output coin worth 90"
+        owner_has_coin_worth(&state, bob, 98),
+        "bob must receive an output coin worth 98"
     );
 
-    // Pool reserves must move to (1100, 910).
+    // Pool reserves must move to (10100, 9902).
     let pool = state.get_object(&pool_id).expect("pool still exists");
-    let (ra, rb, _lp, _k, _p) =
+    let (ra, rb, _lp, _k, _p, _coin_a_tag, _coin_b_tag) =
         bloom_petal_dex_pool::payload::decode_pool(&pool.payload).expect("decode pool");
-    assert_eq!(ra, 1100, "reserve_a after swap");
-    assert_eq!(rb, 910, "reserve_b after swap");
+    assert_eq!(ra, 10_100, "reserve_a after swap");
+    assert_eq!(rb, 9_902, "reserve_b after swap");
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +273,7 @@ fn real_pool_swap_slippage_reverts() {
                     hash: Some(pool_petal_hash),
                 },
                 function: "swap_exact_in".to_string(),
-                type_args: vec![],
+                type_args: erased_pair_type_args(),
                 args: vec![
                     Arg::Object {
                         id: bob_coin,
@@ -318,16 +319,16 @@ fn real_pool_swap_slippage_reverts() {
         "bob's input coin value must be unchanged after revert"
     );
 
-    // ...and the pool reserves stay at the created (1000, 1000).
+    // ...and the pool reserves stay at the created (10000, 10000).
     let pool = state.get_object(&pool_id).expect("pool still exists");
-    let (ra, rb, _lp, _k, _p) =
+    let (ra, rb, _lp, _k, _p, _coin_a_tag, _coin_b_tag) =
         bloom_petal_dex_pool::payload::decode_pool(&pool.payload).expect("decode pool");
-    assert_eq!(ra, 1000, "reserve_a must be unchanged after revert");
-    assert_eq!(rb, 1000, "reserve_b must be unchanged after revert");
+    assert_eq!(ra, 10_000, "reserve_a must be unchanged after revert");
+    assert_eq!(rb, 10_000, "reserve_b must be unchanged after revert");
 
     // And bob did not receive any output coin.
     assert!(
-        !owner_has_coin_worth(&state, bob, 90),
+        !owner_has_coin_worth(&state, bob, 98),
         "no output coin may be credited on a reverted swap"
     );
 }
@@ -355,7 +356,7 @@ fn real_pool_swap_then_wallet_receive_threads_coin() {
     let wallet_petal_hash = state.insert_code(&wallet_wasm);
     state.set_vfs_binding("/bloom/dex/wallet".to_string(), wallet_petal_hash);
 
-    // Alice stands up a shared 1000/1000 pool.
+    // Alice stands up a shared 10000/10000 pool.
     let pool_id = create_shared_pool(&mut state, alice, pool_petal_hash, b"main", 30);
     let pool_version = state
         .get_object(&pool_id)
@@ -378,7 +379,7 @@ fn real_pool_swap_then_wallet_receive_threads_coin() {
                     hash: Some(pool_petal_hash),
                 },
                 function: "swap_exact_in".to_string(),
-                type_args: vec![],
+                type_args: erased_pair_type_args(),
                 args: vec![
                     Arg::Object {
                         id: bob_coin,
@@ -393,24 +394,13 @@ fn real_pool_swap_then_wallet_receive_threads_coin() {
                     Arg::Const(min_out.to_be_bytes().to_vec()),
                 ],
             }),
-            // cmd 1: /bloom/dex/wallet `receive`(<swap output coin>, carol).
-            // The coin arg is the Use-ref of cmd 0's return slot 0 — a coin
-            // minted by the POOL petal, now consumed by a DIFFERENT petal.
-            Command::Move(MoveCmd {
-                petal: PetalRef {
-                    path: "/bloom/dex/wallet".to_string(),
-                    hash: Some(wallet_petal_hash),
-                },
-                function: "receive".to_string(),
-                type_args: vec![],
-                args: vec![
-                    Arg::Use {
-                        cmd_idx: 0,
-                        ret_idx: 0,
-                    },
-                    Arg::Const(carol.0.to_vec()),
-                ],
-            }),
+            Command::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                }],
+                owner: Owner::Address(carol.0),
+            },
         ],
         gas_payer,
         gas_budget: 2_000_000,
@@ -435,16 +425,16 @@ fn real_pool_swap_then_wallet_receive_threads_coin() {
     // CAROL — not bob — owns the 90-output coin, settled by the downstream
     // wallet petal: this is the petal→petal coin-threading proof.
     assert!(
-        owner_has_coin_worth(&state, carol, 90),
-        "carol must receive the swapped output coin (worth 90) via wallet.receive"
+        owner_has_coin_worth(&state, carol, 98),
+        "carol must receive the swapped output coin (worth 98) via wallet.receive"
     );
 
-    // Pool reserves moved to (1100, 910).
+    // Pool reserves moved to (10100, 9902).
     let pool = state.get_object(&pool_id).expect("pool still exists");
-    let (ra, rb, _lp, _k, _p) =
+    let (ra, rb, _lp, _k, _p, _coin_a_tag, _coin_b_tag) =
         bloom_petal_dex_pool::payload::decode_pool(&pool.payload).expect("decode pool");
-    assert_eq!(ra, 1100, "reserve_a after swap");
-    assert_eq!(rb, 910, "reserve_b after swap");
+    assert_eq!(ra, 10_100, "reserve_a after swap");
+    assert_eq!(rb, 9_902, "reserve_b after swap");
 }
 
 #[test]
@@ -479,7 +469,7 @@ fn real_pool_cross_pool_lp_remove_reverts_without_state_change() {
                     hash: Some(pool_petal_hash),
                 },
                 function: "remove_liquidity".to_string(),
-                type_args: vec![],
+                type_args: erased_pair_type_args(),
                 args: vec![
                     Arg::Object {
                         id: pool_b,
@@ -652,7 +642,7 @@ fn real_pool_add_remove_and_exact_out_execute() {
                     hash: Some(pool_petal_hash),
                 },
                 function: "add_liquidity".to_string(),
-                type_args: vec![],
+                type_args: erased_pair_type_args(),
                 args: vec![
                     Arg::Object {
                         id: pool_id,
@@ -703,7 +693,7 @@ fn real_pool_add_remove_and_exact_out_execute() {
     let pool = state.get_object(&pool_id).expect("pool after add");
     let (ra, rb, lp_supply, ..) =
         bloom_petal_dex_pool::payload::decode_pool(&pool.payload).expect("decode pool");
-    assert_eq!((ra, rb, lp_supply), (1500, 1500, 1500));
+    assert_eq!((ra, rb, lp_supply), (10_500, 10_500, 10_500));
     assert!(
         state.get_object(&add_a).is_none(),
         "spent add_liquidity coin A must be consumed"
@@ -738,7 +728,7 @@ fn real_pool_add_remove_and_exact_out_execute() {
                     hash: Some(pool_petal_hash),
                 },
                 function: "remove_liquidity".to_string(),
-                type_args: vec![],
+                type_args: erased_pair_type_args(),
                 args: vec![
                     Arg::Object {
                         id: pool_id,
@@ -788,7 +778,7 @@ fn real_pool_add_remove_and_exact_out_execute() {
     let pool = state.get_object(&pool_id).expect("pool after remove");
     let (ra, rb, lp_supply, ..) =
         bloom_petal_dex_pool::payload::decode_pool(&pool.payload).expect("decode pool");
-    assert_eq!((ra, rb, lp_supply), (1000, 1000, 1000));
+    assert_eq!((ra, rb, lp_supply), (10_000, 10_000, 10_000));
 
     let bob_coin = erased_coin_id(b"bob-exact-out");
     seed_erased_coin(&mut state, bob_coin, Owner::Address(bob.0), 120);
@@ -801,7 +791,7 @@ fn real_pool_add_remove_and_exact_out_execute() {
                     hash: Some(pool_petal_hash),
                 },
                 function: "swap_exact_out".to_string(),
-                type_args: vec![],
+                type_args: erased_pair_type_args(),
                 args: vec![
                     Arg::Object {
                         id: pool_id,
@@ -851,7 +841,7 @@ fn real_pool_add_remove_and_exact_out_execute() {
     );
     assert!(owner_has_coin_worth(&state, bob, 90), "exact output coin");
     assert!(
-        owner_has_coin_worth(&state, bob, 20),
+        owner_has_coin_worth(&state, bob, 28),
         "exact-out leftover coin"
     );
     assert!(
@@ -884,7 +874,7 @@ fn real_pool_high_fee_exact_out_executes() {
                     hash: Some(pool_petal_hash),
                 },
                 function: "swap_exact_out".to_string(),
-                type_args: vec![],
+                type_args: erased_pair_type_args(),
                 args: vec![
                     Arg::Object {
                         id: pool_id,
@@ -905,6 +895,13 @@ fn real_pool_high_fee_exact_out_executes() {
                 uses: vec![UseRef {
                     cmd_idx: 0,
                     ret_idx: 0,
+                }],
+                owner: Owner::Address(bob.0),
+            },
+            Command::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 1,
                 }],
                 owner: Owner::Address(bob.0),
             },
@@ -933,7 +930,7 @@ fn real_pool_high_fee_exact_out_executes() {
         .expect("pool after high-fee exact out");
     let (ra, rb, ..) =
         bloom_petal_dex_pool::payload::decode_pool(&pool.payload).expect("decode pool");
-    assert_eq!((ra, rb), (21_000, 999));
+    assert_eq!((ra, rb), (20_002, 9_999));
 }
 
 fn lp_positions_owned_by(
@@ -986,7 +983,7 @@ fn swap_exact_in_ptb(
                     hash: Some(pool_petal_hash),
                 },
                 function: "swap_exact_in".to_string(),
-                type_args: vec![],
+                type_args: erased_pair_type_args(),
                 args: vec![
                     Arg::Object {
                         id: coin_in,

@@ -17,7 +17,8 @@ use std::sync::Arc;
 
 use bloom_chain_consensus::{signer::Signer, validator_set::ValidatorSet};
 use bloom_chain_node::consensus_driver::{
-    XdsaSigner, XdsaVerifier, validate_block_for_apply, validate_block_for_proposal,
+    ProposalValidation, XdsaSigner, XdsaVerifier, validate_block_for_apply,
+    validate_block_for_proposal,
 };
 use bloom_chain_types::{
     block::Block,
@@ -621,11 +622,13 @@ fn proposal_with_sender_pubkey_mismatch_is_rejected_before_prevote() {
 
     let result = validate_block_for_proposal(
         &block,
-        5,
-        0,
-        0,
-        "bloom-chain.v0",
-        Hash32([0x42; 32]),
+        ProposalValidation {
+            height: 5,
+            round: 0,
+            header_proposer_round: 0,
+            chain_id: "bloom-chain.v0",
+            parent_hash: Hash32([0x42; 32]),
+        },
         &vset,
         &XdsaVerifier,
     );
@@ -655,11 +658,13 @@ fn proposal_validation_accepts_valid_block_from_polka_round() {
 
     let result = validate_block_for_proposal(
         &block,
-        height,
-        proposal_round,
-        polka_round,
-        "bloom-chain.v0",
-        Hash32([0x42; 32]),
+        ProposalValidation {
+            height,
+            round: proposal_round,
+            header_proposer_round: polka_round,
+            chain_id: "bloom-chain.v0",
+            parent_hash: Hash32([0x42; 32]),
+        },
         &vset,
         &XdsaVerifier,
     );

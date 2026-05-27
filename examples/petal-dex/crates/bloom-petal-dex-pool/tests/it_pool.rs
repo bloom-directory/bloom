@@ -18,9 +18,17 @@
 //! the mock) will live in `bloom-petal-dex-it` (Task #44).
 
 use bloom_dex_math::{ConstantProduct, ConstantProductParams, SwapStrategy, integer_sqrt};
-use bloom_objects::ObjectId;
+use bloom_objects::{ObjectId, TypeTag};
 use bloom_petal_dex_pool::ParamCodec;
 use bloom_petal_dex_pool::payload;
+
+fn test_tag(name: &str) -> TypeTag {
+    TypeTag::Concrete {
+        petal_hash: [0u8; 32],
+        type_name: name.to_string(),
+        type_args: vec![],
+    }
+}
 
 // ─── 1. Pool payload round-trips ─────────────────────────────────────────────
 
@@ -32,26 +40,49 @@ fn pool_payload_round_trip_basic() {
     let lp_supply = 1_414u128;
     let k_last = reserve_a * reserve_b;
     let params_bytes = ConstantProductParams { fee_bps: 30 }.encode();
+    let coin_a_tag = test_tag("A");
+    let coin_b_tag = test_tag("B");
 
-    let encoded =
-        payload::pool_payload(&id, reserve_a, reserve_b, lp_supply, k_last, &params_bytes);
+    let encoded = payload::pool_payload(
+        &id,
+        reserve_a,
+        reserve_b,
+        lp_supply,
+        k_last,
+        &params_bytes,
+        &coin_a_tag,
+        &coin_b_tag,
+    );
 
-    let (ra, rb, lps, kl, pb) = payload::decode_pool(&encoded).expect("decode_pool should succeed");
+    let (ra, rb, lps, kl, pb, got_a_tag, got_b_tag) =
+        payload::decode_pool(&encoded).expect("decode_pool should succeed");
 
     assert_eq!(ra, reserve_a);
     assert_eq!(rb, reserve_b);
     assert_eq!(lps, lp_supply);
     assert_eq!(kl, k_last);
     assert_eq!(pb, params_bytes);
+    assert_eq!(got_a_tag, coin_a_tag);
+    assert_eq!(got_b_tag, coin_b_tag);
 }
 
 #[test]
 fn pool_payload_round_trip_zero_reserves() {
     let id = ObjectId([0u8; 32]);
     let params_bytes = ConstantProductParams { fee_bps: 0 }.encode();
-    let encoded = payload::pool_payload(&id, 0, 0, 0, 0, &params_bytes);
+    let encoded = payload::pool_payload(
+        &id,
+        0,
+        0,
+        0,
+        0,
+        &params_bytes,
+        &test_tag("A"),
+        &test_tag("B"),
+    );
 
-    let (ra, rb, lps, kl, _pb) = payload::decode_pool(&encoded).expect("decode_pool with zeros");
+    let (ra, rb, lps, kl, _pb, _coin_a, _coin_b) =
+        payload::decode_pool(&encoded).expect("decode_pool with zeros");
 
     assert_eq!(ra, 0);
     assert_eq!(rb, 0);
@@ -67,17 +98,30 @@ fn pool_payload_round_trip_large_values() {
     let lp_supply = u128::MAX / 4;
     let k_last = 999_999_999_999_999u128;
     let params_bytes = ConstantProductParams { fee_bps: 9999 }.encode();
+    let coin_a_tag = test_tag("LargeA");
+    let coin_b_tag = test_tag("LargeB");
 
-    let encoded =
-        payload::pool_payload(&id, reserve_a, reserve_b, lp_supply, k_last, &params_bytes);
+    let encoded = payload::pool_payload(
+        &id,
+        reserve_a,
+        reserve_b,
+        lp_supply,
+        k_last,
+        &params_bytes,
+        &coin_a_tag,
+        &coin_b_tag,
+    );
 
-    let (ra, rb, lps, kl, pb) = payload::decode_pool(&encoded).expect("decode_pool large values");
+    let (ra, rb, lps, kl, pb, got_a_tag, got_b_tag) =
+        payload::decode_pool(&encoded).expect("decode_pool large values");
 
     assert_eq!(ra, reserve_a);
     assert_eq!(rb, reserve_b);
     assert_eq!(lps, lp_supply);
     assert_eq!(kl, k_last);
     assert_eq!(pb, params_bytes);
+    assert_eq!(got_a_tag, coin_a_tag);
+    assert_eq!(got_b_tag, coin_b_tag);
 }
 
 #[test]
@@ -185,17 +229,16 @@ fn constant_product_params_decode_rejects_empty() {
 
 // ─── 4. Create-pool math matches SwapStrategy directly ───────────────────────
 
-/// The petal's `create_pool` delegates the initial LP amount to
+/// The petal's `create_pool` delegates the initial user LP amount to
 /// `S::add_liquidity(0, 0, value_a, value_b, 0)`. Verify that the result
-/// matches `floor(sqrt(value_a * value_b))` as documented by the CPMM impl.
+/// matches `floor(sqrt(value_a * value_b)) - MINIMUM_LIQUIDITY`.
 #[test]
 fn create_pool_initial_lp_matches_sqrt() {
     let cases: &[(u128, u128)] = &[
-        (400, 900),             // sqrt(360_000) = 600
-        (100, 200),             // sqrt(20_000) = 141
-        (1, 1),                 // sqrt(1) = 1
+        (4_000_000, 9_000_000), // sqrt(36e12) = 6_000_000
+        (10_000, 20_000),       // sqrt(200_000_000) = 14_142
         (1_000_000, 1_000_000), // sqrt(1e12) = 1_000_000
-        (1234, 5678),           // arbitrary
+        (12_340, 56_780),       // arbitrary
     ];
 
     for &(a, b) in cases {
@@ -209,7 +252,8 @@ fn create_pool_initial_lp_matches_sqrt() {
             taken_b, b,
             "all of coin_b should be taken on initial deposit"
         );
-        let expected_lp = integer_sqrt(a.checked_mul(b).expect("no overflow in test"));
+        let expected_lp = integer_sqrt(a.checked_mul(b).expect("no overflow in test"))
+            - bloom_dex_math::MINIMUM_LIQUIDITY;
         assert_eq!(
             lp_minted, expected_lp,
             "initial LP minted {lp_minted} != sqrt({a}*{b})={expected_lp}"

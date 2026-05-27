@@ -798,6 +798,16 @@ impl StateSnapshot {
         self.write_set.vfs.insert(path, hash);
     }
 
+    /// Look up a VFS binding, respecting staged snapshot updates before the
+    /// committed base state.
+    pub fn vfs_lookup(&self, path: &str) -> Option<Hash32> {
+        self.write_set
+            .vfs
+            .get(path)
+            .copied()
+            .or_else(|| self.base.vfs_lookup(path))
+    }
+
     /// Read code, consulting staged inserts before the committed base state.
     ///
     /// The snapshot invariant is preserved: staged code is only visible to

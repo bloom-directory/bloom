@@ -23,6 +23,7 @@ use bloom_dex_math::{ConstantProduct, ConstantProductParams, MathError, SwapStra
 use bloom_objects::{ObjectId, TypeTag};
 use bloom_petal_dex_pool::{ParamCodec, payload};
 use bloom_petal_dex_router::{RouterError, ops};
+use bloom_resource::RuntimeHandle;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -30,12 +31,21 @@ fn cpmm_params(fee_bps: u16) -> ConstantProductParams {
     ConstantProductParams { fee_bps }
 }
 
-/// Hand-calculate the CPMM quote: out = reserve_out * amt_in_fee / (reserve_in + amt_in_fee)
-/// where amt_in_fee = amount_in * (10_000 - fee_bps) / 10_000 (integer division).
+fn test_tag(name: &str) -> TypeTag {
+    TypeTag::Concrete {
+        petal_hash: [0u8; 32],
+        type_name: name.to_string(),
+        type_args: vec![],
+    }
+}
+
+/// Hand-calculate the CPMM quote with the fee division kept at the end.
 fn hand_quote(reserve_in: u128, reserve_out: u128, amount_in: u128, fee_bps: u16) -> u128 {
     let fee_factor = 10_000u128 - u128::from(fee_bps);
-    let amount_in_fee = amount_in * fee_factor / 10_000;
-    reserve_out * amount_in_fee / (reserve_in + amount_in_fee)
+    let amount_in_fee = amount_in * fee_factor;
+    let numerator = reserve_out * amount_in_fee;
+    let denominator = reserve_in * 10_000 + amount_in_fee;
+    numerator / denominator
 }
 
 // ─── 1. RouterError ───────────────────────────────────────────────────────────
@@ -76,6 +86,27 @@ fn router_error_display_pool_payload_decode() {
 fn router_error_display_param_decode() {
     let s = RouterError::ParamDecode.to_string();
     assert!(s.contains("param"), "display: {s}");
+}
+
+#[test]
+fn router_error_display_same_pool_route() {
+    assert_eq!(RouterError::SamePoolRoute.to_string(), "same pool route");
+}
+
+#[test]
+fn router_error_display_object_delete_failed() {
+    assert_eq!(
+        RouterError::ObjectDeleteFailed.to_string(),
+        "object delete failed"
+    );
+}
+
+#[test]
+fn router_error_display_token_type_mismatch() {
+    assert_eq!(
+        RouterError::TokenTypeMismatch.to_string(),
+        "token type mismatch"
+    );
 }
 
 #[test]
@@ -230,6 +261,65 @@ fn quote_2hop_amplified_first_pool() {
     );
 }
 
+#[test]
+fn ensure_distinct_pools_rejects_same_handle() {
+    let h = RuntimeHandle::from_raw(7);
+    assert_eq!(
+        ops::ensure_distinct_pools(h, h),
+        Err(RouterError::SamePoolRoute)
+    );
+}
+
+#[test]
+fn ensure_distinct_pools_accepts_different_handles() {
+    assert_eq!(
+        ops::ensure_distinct_pools(RuntimeHandle::from_raw(7), RuntimeHandle::from_raw(8)),
+        Ok(())
+    );
+}
+
+#[test]
+fn ensure_all_distinct_pools_rejects_any_repeat() {
+    assert_eq!(
+        ops::ensure_all_distinct_pools(
+            RuntimeHandle::from_raw(7),
+            RuntimeHandle::from_raw(8),
+            RuntimeHandle::from_raw(7),
+        ),
+        Err(RouterError::SamePoolRoute)
+    );
+}
+
+#[test]
+fn ensure_all_distinct_pools_accepts_unique_handles() {
+    assert_eq!(
+        ops::ensure_all_distinct_pools(
+            RuntimeHandle::from_raw(7),
+            RuntimeHandle::from_raw(8),
+            RuntimeHandle::from_raw(9),
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn ensure_pool_pair_rejects_mismatched_tags() {
+    let a = test_tag("A");
+    let b = test_tag("B");
+    let c = test_tag("C");
+    assert_eq!(
+        ops::ensure_pool_pair(&a, &b, &a, &c),
+        Err(RouterError::TokenTypeMismatch)
+    );
+}
+
+#[test]
+fn ensure_pool_pair_accepts_matching_tags() {
+    let a = test_tag("A");
+    let b = test_tag("B");
+    assert_eq!(ops::ensure_pool_pair(&a, &b, &a, &b), Ok(()));
+}
+
 // ─── 3. Coin payload codec ────────────────────────────────────────────────────
 
 #[test]
@@ -305,19 +395,32 @@ fn pool_payload_decode_compatible_with_pool_crate() {
     let lp_supply = 612u128;
     let k_last = reserve_a * reserve_b;
     let params_bytes = cpmm_params(50).encode();
+    let coin_a_tag = test_tag("A");
+    let coin_b_tag = test_tag("B");
 
     // Encode using bloom-petal-dex-pool's canonical encoder.
-    let encoded =
-        payload::pool_payload(&id, reserve_a, reserve_b, lp_supply, k_last, &params_bytes);
+    let encoded = payload::pool_payload(
+        &id,
+        reserve_a,
+        reserve_b,
+        lp_supply,
+        k_last,
+        &params_bytes,
+        &coin_a_tag,
+        &coin_b_tag,
+    );
 
     // Decode using the same helpers (same dep imported into the router).
-    let (ra, rb, lps, kl, pb) = payload::decode_pool(&encoded).expect("decode_pool must succeed");
+    let (ra, rb, lps, kl, pb, got_a_tag, got_b_tag) =
+        payload::decode_pool(&encoded).expect("decode_pool must succeed");
 
     assert_eq!(ra, reserve_a);
     assert_eq!(rb, reserve_b);
     assert_eq!(lps, lp_supply);
     assert_eq!(kl, k_last);
     assert_eq!(pb, params_bytes);
+    assert_eq!(got_a_tag, coin_a_tag);
+    assert_eq!(got_b_tag, coin_b_tag);
 
     // Verify params round-trip.
     let decoded_params = ConstantProductParams::decode(&pb).expect("param decode");

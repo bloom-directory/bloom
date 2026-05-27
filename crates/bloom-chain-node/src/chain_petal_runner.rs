@@ -402,7 +402,7 @@ mod tests {
         positional.extend_from_slice(&16u32.to_be_bytes());
         positional.extend_from_slice(&42u128.to_be_bytes());
 
-        let calldata = calldata_with_type_args(&[usdc.clone()], &positional).unwrap();
+        let calldata = calldata_with_type_args(std::slice::from_ref(&usdc), &positional).unwrap();
         assert_eq!(u32::from_be_bytes(calldata[..4].try_into().unwrap()), 2);
 
         let mut cursor = &calldata[4..];

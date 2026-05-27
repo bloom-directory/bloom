@@ -8,3 +8,4 @@ publish = false
 
 [dependencies]
 thiserror = { workspace = true }
+uint = "0.9"

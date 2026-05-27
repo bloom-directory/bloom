@@ -181,7 +181,12 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
                 cmd_return_types.push(
                     f.returns
                         .iter()
-                        .map(|t| Some(substitute_type_args(t, &m.type_args)))
+                        .map(|t| {
+                            Some(resolve_self_type_refs(
+                                &substitute_type_args(t, &m.type_args),
+                                hash.0,
+                            ))
+                        })
                         .collect(),
                 );
             }
@@ -321,6 +326,11 @@ fn typecheck_move_cmd(
                 function: cmd.function.clone(),
                 petal_hash: hash,
             })?;
+    let local_object_types: HashSet<&str> = manifest
+        .object_types
+        .iter()
+        .map(|object_type| object_type.name.as_str())
+        .collect();
 
     if cmd.type_args.len() != f.type_params.len() {
         return Err(PtbError::TypeArgCountMismatch {
@@ -386,7 +396,7 @@ fn typecheck_move_cmd(
                     return Err(PtbError::ObjectNotFound { id: *id });
                 };
                 let expected = substitute_type_args(declared_ty, &cmd.type_args);
-                if !type_tags_match(&obj.type_tag, &expected) {
+                if !type_tags_match(&obj.type_tag, &expected, hash.0, &local_object_types) {
                     return Err(PtbError::TypeMismatch {
                         function: cmd.function.clone(),
                         arg_idx: i,
@@ -425,7 +435,7 @@ fn typecheck_move_cmd(
                 )?;
                 if let Some(actual) = upstream {
                     let expected = substitute_type_args(declared_ty, &cmd.type_args);
-                    if !type_tags_match(&actual, &expected) {
+                    if !type_tags_match(&actual, &expected, hash.0, &local_object_types) {
                         return Err(PtbError::TypeMismatch {
                             function: cmd.function.clone(),
                             arg_idx: i,
@@ -515,11 +525,25 @@ fn substitute_type_args(t: &TypeTag, type_args: &[TypeTag]) -> TypeTag {
 /// Structural compare between two `TypeTag`s.
 ///
 /// Equality is exact except that a self-referential `petal_hash` of
-/// `[0u8; 32]` on the declared side matches any concrete petal hash on
-/// the on-chain side. This mirrors the macro emission convention (the
-/// macros cannot know their own wasm hash at expansion time, so they
-/// stamp `[0u8; 32]` and the chain treats it as "self").
-fn type_tags_match(actual: &TypeTag, declared: &TypeTag) -> bool {
+/// `[0u8; 32]` on the declared side resolves to the currently executing
+/// petal's hash. The `Coin<T>` wrapper is intentionally provenance-neutral:
+/// several petals can mint and consume coins carrying the same inner `T`.
+fn type_tags_match(
+    actual: &TypeTag,
+    declared: &TypeTag,
+    self_hash: [u8; 32],
+    local_object_types: &HashSet<&str>,
+) -> bool {
+    type_tags_match_inner(actual, declared, self_hash, local_object_types, true)
+}
+
+fn type_tags_match_inner(
+    actual: &TypeTag,
+    declared: &TypeTag,
+    self_hash: [u8; 32],
+    local_object_types: &HashSet<&str>,
+    allow_top_level_import: bool,
+) -> bool {
     match (actual, declared) {
         (
             TypeTag::Concrete {
@@ -536,14 +560,50 @@ fn type_tags_match(actual: &TypeTag, declared: &TypeTag) -> bool {
             if an != dn || aa.len() != da.len() {
                 return false;
             }
-            if dh != &[0u8; 32] && ah != dh {
+            if dh == &[0u8; 32] {
+                let imported_object_arg = allow_top_level_import
+                    && da.is_empty()
+                    && dn != "Capability"
+                    && !local_object_types.contains(dn.as_str());
+                if dn != "Coin" && !imported_object_arg && ah != &[0u8; 32] && ah != &self_hash {
+                    return false;
+                }
+            } else if ah != dh {
                 return false;
             }
-            aa.iter().zip(da.iter()).all(|(a, d)| type_tags_match(a, d))
+            aa.iter()
+                .zip(da.iter())
+                .all(|(a, d)| type_tags_match_inner(a, d, self_hash, local_object_types, false))
         }
         (TypeTag::Generic { idx: a }, TypeTag::Generic { idx: b }) => a == b,
         (TypeTag::External { ref_idx: a }, TypeTag::External { ref_idx: b }) => a == b,
         _ => false,
+    }
+}
+
+fn resolve_self_type_refs(t: &TypeTag, self_hash: [u8; 32]) -> TypeTag {
+    match t {
+        TypeTag::Concrete {
+            petal_hash,
+            type_name,
+            type_args,
+        } => TypeTag::Concrete {
+            petal_hash: if petal_hash == &[0u8; 32] && type_name != "Coin" {
+                self_hash
+            } else {
+                *petal_hash
+            },
+            type_name: type_name.clone(),
+            type_args: if type_name == "Coin" {
+                type_args.clone()
+            } else {
+                type_args
+                    .iter()
+                    .map(|x| resolve_self_type_refs(x, self_hash))
+                    .collect()
+            },
+        },
+        TypeTag::Generic { .. } | TypeTag::External { .. } => t.clone(),
     }
 }
 
@@ -617,28 +677,30 @@ fn check_object_arg(
         });
     }
     let mut seen = HashSet::new();
-    check_access_mode(
+    let mut ctx = AccessCheckContext {
         chain,
-        &obj.owner,
-        mode,
         first_signer_addr,
-        id,
         objects,
         object_scope_modes,
-        &mut seen,
-    )?;
+        seen: &mut seen,
+    };
+    check_access_mode(&mut ctx, &obj.owner, mode, id)?;
     Ok(())
 }
 
+struct AccessCheckContext<'a> {
+    chain: &'a dyn ChainStateIface,
+    first_signer_addr: &'a [u8; 32],
+    objects: &'a mut HashMap<[u8; 32], Object>,
+    object_scope_modes: &'a HashMap<ObjectId, AccessMode>,
+    seen: &'a mut HashSet<ObjectId>,
+}
+
 fn check_access_mode(
-    chain: &dyn ChainStateIface,
+    ctx: &mut AccessCheckContext<'_>,
     owner: &Owner,
     mode: AccessMode,
-    first_signer_addr: &[u8; 32],
     id: &ObjectId,
-    objects: &mut HashMap<[u8; 32], Object>,
-    object_scope_modes: &HashMap<ObjectId, AccessMode>,
-    seen: &mut HashSet<ObjectId>,
 ) -> Result<(), PtbError> {
     match (owner, mode) {
         (Owner::Immutable, AccessMode::ReadOnly) => Ok(()),
@@ -654,7 +716,7 @@ fn check_access_mode(
             reason: "shared objects cannot be consumed".to_string(),
         }),
         (Owner::Address(addr), AccessMode::Mutable | AccessMode::Consume) => {
-            if addr == first_signer_addr {
+            if addr == ctx.first_signer_addr {
                 Ok(())
             } else {
                 Err(PtbError::AccessDenied {
@@ -666,23 +728,25 @@ fn check_access_mode(
         }
         (Owner::Address(_), AccessMode::ReadOnly) => Ok(()),
         (Owner::Object(parent_id), _) => {
-            if !seen.insert(*id) {
+            if !ctx.seen.insert(*id) {
                 return Err(PtbError::AccessDenied {
                     id: *id,
                     mode,
                     reason: "object-owner cycle detected".to_string(),
                 });
             }
-            let parent_mode = object_scope_modes.get(parent_id).copied().ok_or_else(|| {
-                PtbError::AccessDenied {
+            let parent_mode = ctx
+                .object_scope_modes
+                .get(parent_id)
+                .copied()
+                .ok_or_else(|| PtbError::AccessDenied {
                     id: *id,
                     mode,
                     reason: format!(
                         "object-owned child requires owning parent {} in command scope",
                         hex_encode(&parent_id.0)
                     ),
-                }
-            })?;
+                })?;
             if !parent_mode_authorizes_child(parent_mode, mode) {
                 return Err(PtbError::AccessDenied {
                     id: *id,
@@ -692,26 +756,18 @@ fn check_access_mode(
                     ),
                 });
             }
-            let parent = match objects.get(&parent_id.0) {
+            let parent = match ctx.objects.get(&parent_id.0) {
                 Some(o) => o.clone(),
                 None => {
-                    let loaded = chain
+                    let loaded = ctx
+                        .chain
                         .load_object(parent_id)
                         .ok_or(PtbError::ObjectNotFound { id: *parent_id })?;
-                    objects.insert(parent_id.0, loaded.clone());
+                    ctx.objects.insert(parent_id.0, loaded.clone());
                     loaded
                 }
             };
-            check_access_mode(
-                chain,
-                &parent.owner,
-                parent_mode,
-                first_signer_addr,
-                parent_id,
-                objects,
-                object_scope_modes,
-                seen,
-            )
+            check_access_mode(ctx, &parent.owner, parent_mode, parent_id)
         }
     }
 }
@@ -756,7 +812,7 @@ pub fn decode_coin_value(payload: &[u8]) -> Result<u128, PtbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain_iface::{ArgDeclStub, FunctionDeclStub};
+    use crate::chain_iface::{ArgDeclStub, FunctionDeclStub, ObjectTypeDeclStub};
     use crate::types::{Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PqSignature, PtbTx};
     use bloom_chain_types::Hash32;
     use bloom_objects::{Owner, TypeTag};
@@ -840,7 +896,12 @@ mod tests {
                 returns: vec![],
                 attached_invariants: vec![],
             }],
-            object_types: vec![],
+            object_types: vec![ObjectTypeDeclStub {
+                name: "Pool".to_string(),
+                abilities: bloom_objects::AbilitySet::from_bits(
+                    bloom_objects::AbilitySet::KEY | bloom_objects::AbilitySet::STORE,
+                ),
+            }],
             external_type_refs: vec![],
         }
     }
@@ -1725,9 +1786,9 @@ mod tests {
 
     /// An Object arg whose on-chain type matches the manifest's declared
     /// type is accepted. Self-petal-hash (`[0u8; 32]`) in the manifest
-    /// matches any concrete hash on the object's type.
+    /// resolves to the executing petal's concrete hash.
     #[test]
-    fn strict_typecheck_object_self_petal_hash_matches_any() {
+    fn strict_typecheck_object_self_petal_hash_matches_current_petal() {
         let (chain, signer, gas_id) = setup();
         let target_id = ObjectId([0xAA; 32]);
         chain.put_object(Object {
@@ -1766,6 +1827,167 @@ mod tests {
         }
         let verifier = AlwaysOkVerifier;
         assert!(validate_ptb(&tx, &ctx(&chain, &verifier)).is_ok());
+    }
+
+    #[test]
+    fn strict_typecheck_object_self_petal_hash_rejects_other_petal() {
+        let (chain, signer, gas_id) = setup();
+        let target_id = ObjectId([0xAA; 32]);
+        chain.put_object(Object {
+            id: target_id,
+            type_tag: TypeTag::Concrete {
+                petal_hash: [0xCD; 32],
+                type_name: "Pool".to_string(),
+                type_args: vec![],
+            },
+            owner: Owner::Shared,
+            version: 0,
+            payload: vec![],
+        });
+        let mut m = sample_manifest();
+        m.functions.push(FunctionDeclStub {
+            name: "touch".to_string(),
+            type_params: vec![],
+            args: vec![ArgDeclStub::Object {
+                ty: concrete("Pool"),
+                mode: AccessMode::Mutable,
+            }],
+            returns: vec![],
+            attached_invariants: vec![],
+        });
+        chain.put_petal(Hash32([0xAB; 32]), vec![], m);
+        let mut tx = sample_ptb(signer, gas_id, 100);
+        if let Command::Move(mc) = &mut tx.commands[0] {
+            mc.function = "touch".to_string();
+            mc.args = vec![Arg::Object {
+                id: target_id,
+                expected_version: ExpectedVersion(0),
+                access_mode: AccessMode::Mutable,
+            }];
+        }
+        let verifier = AlwaysOkVerifier;
+        assert!(matches!(
+            validate_ptb(&tx, &ctx(&chain, &verifier)),
+            Err(PtbError::TypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn strict_typecheck_imported_top_level_object_accepts_other_petal() {
+        let (chain, signer, gas_id) = setup();
+        let target_id = ObjectId([0xAA; 32]);
+        chain.put_object(Object {
+            id: target_id,
+            type_tag: TypeTag::Concrete {
+                petal_hash: [0xCD; 32],
+                type_name: "Pool".to_string(),
+                type_args: vec![],
+            },
+            owner: Owner::Shared,
+            version: 0,
+            payload: vec![],
+        });
+        let mut m = sample_manifest();
+        m.object_types.clear();
+        m.functions.push(FunctionDeclStub {
+            name: "quote".to_string(),
+            type_params: vec![],
+            args: vec![ArgDeclStub::Object {
+                ty: concrete("Pool"),
+                mode: AccessMode::ReadOnly,
+            }],
+            returns: vec![],
+            attached_invariants: vec![],
+        });
+        chain.put_petal(Hash32([0xAB; 32]), vec![], m);
+        let mut tx = sample_ptb(signer, gas_id, 100);
+        if let Command::Move(mc) = &mut tx.commands[0] {
+            mc.function = "quote".to_string();
+            mc.args = vec![Arg::Object {
+                id: target_id,
+                expected_version: ExpectedVersion(0),
+                access_mode: AccessMode::ReadOnly,
+            }];
+        }
+        let verifier = AlwaysOkVerifier;
+        assert!(validate_ptb(&tx, &ctx(&chain, &verifier)).is_ok());
+    }
+
+    #[test]
+    fn strict_typecheck_use_self_petal_return_rejects_other_petal() {
+        let (chain, signer, gas_id) = setup();
+
+        let mut producer = PetalManifestStub {
+            module_path: "/evil".to_string(),
+            functions: vec![FunctionDeclStub {
+                name: "forge".to_string(),
+                type_params: vec![],
+                args: vec![],
+                returns: vec![concrete("Capability")],
+                attached_invariants: vec![],
+            }],
+            object_types: vec![],
+            external_type_refs: vec![],
+        };
+        if let TypeTag::Concrete { type_args, .. } = &mut producer.functions[0].returns[0] {
+            type_args.push(concrete("FaucetAdmin"));
+        }
+        chain.put_petal(Hash32([0xCD; 32]), vec![], producer);
+        chain.put_path("/evil", Hash32([0xCD; 32]));
+
+        let mut consumer = sample_manifest();
+        let mut cap = concrete("Capability");
+        if let TypeTag::Concrete { type_args, .. } = &mut cap {
+            type_args.push(concrete("FaucetAdmin"));
+        }
+        consumer.functions.push(FunctionDeclStub {
+            name: "mint".to_string(),
+            type_params: vec![],
+            args: vec![ArgDeclStub::Object {
+                ty: cap,
+                mode: AccessMode::ReadOnly,
+            }],
+            returns: vec![],
+            attached_invariants: vec![],
+        });
+        chain.put_petal(Hash32([0xAB; 32]), vec![], consumer);
+
+        let tx = PtbTx {
+            signers: vec![signer],
+            commands: vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/evil".to_string(),
+                        hash: Some(Hash32([0xCD; 32])),
+                    },
+                    function: "forge".to_string(),
+                    type_args: vec![],
+                    args: vec![],
+                }),
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/bloom/dex/pool".to_string(),
+                        hash: Some(Hash32([0xAB; 32])),
+                    },
+                    function: "mint".to_string(),
+                    type_args: vec![],
+                    args: vec![Arg::Use {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    }],
+                }),
+            ],
+            gas_payer: gas_id,
+            gas_budget: 100,
+            gas_price: 1,
+            expiry_block: 100,
+            signatures: vec![PqSignature(vec![0xCC; 8])],
+        };
+        let verifier = AlwaysOkVerifier;
+        assert!(matches!(
+            validate_ptb(&tx, &ctx(&chain, &verifier)),
+            Err(PtbError::TypeMismatch { .. })
+        ));
     }
 
     /// Generic substitution works: a `Const T` decl with `T = u64` and

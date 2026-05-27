@@ -45,14 +45,16 @@ pub(crate) fn emit_manifest_section(
     let byte_lits: Vec<TokenStream> = bytes.iter().map(|b| quote! { #b }).collect();
 
     // The `link_section` attribute embeds the constant into the wasm
-    // output as a custom section. On non-wasm targets we still emit the
-    // static so host-side unit tests can inspect it; we omit the
-    // `link_section` so non-wasm linkers don't try to interpret it.
+    // output as a custom section. Transitive petal dependencies compile
+    // with `no-entrypoint`; suppress their wasm-side manifest too, or
+    // the linker concatenates multiple manifest blobs into one custom
+    // section. On non-wasm targets we still emit the static so host-side
+    // unit tests can inspect it.
     Ok(quote! {
         /// Canonical-encoded `PetalManifestV0` blob. Embedded into the
         /// wasm output as the `bloom_petal_manifest_v0` custom section
         /// (spec §8.1). Auto-generated; do not edit.
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(feature = "no-entrypoint")))]
         #[unsafe(link_section = "bloom_petal_manifest_v0")]
         #[used]
         pub static #section_unique_ident: [u8; #len] = [#(#byte_lits),*];
@@ -816,6 +818,7 @@ pub(crate) fn emit_manifest_accessor(section_ident: &Ident) -> TokenStream {
     quote! {
         /// Returns the canonical-encoded `PetalManifestV0` bytes
         /// embedded into this petal at compile time.
+        #[cfg(any(not(target_arch = "wasm32"), not(feature = "no-entrypoint")))]
         pub fn __bloom_manifest_bytes() -> &'static [u8] {
             &#section_ident[..]
         }

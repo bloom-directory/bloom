@@ -212,6 +212,9 @@ impl<'a> PtbSession<'a> {
         let next_cmd_idx = self.commands.len() as u16;
         for la in lowered {
             match la {
+                LoweredArg::CallTypeArg(tt) => {
+                    type_args.push(tt);
+                }
                 LoweredArg::Concrete(Arg::TypeArg(tt)) => {
                     type_args.push(tt.clone());
                     args.push(Arg::TypeArg(tt));

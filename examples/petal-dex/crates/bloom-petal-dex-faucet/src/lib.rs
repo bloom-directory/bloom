@@ -20,7 +20,8 @@
 //! threads into `Coin<Erased>` args identically (the Phase F linchpin, spec
 //! §6 litmus 5.1 / 5.2).
 //!
-//! NOTE: this is a *test/demo* faucet — anyone may mint unbacked value. It is
+//! NOTE: this is a *test/demo* faucet. Minting is gated by a
+//! `Capability<FaucetAdmin>` object held by the acceptance-test admin; it is
 //! deployed only in example / acceptance contexts, never as protocol stdlib.
 
 #![deny(missing_docs)]
@@ -53,6 +54,18 @@ pub mod ops {
         concrete("Coin", vec![concrete("Erased", vec![])])
     }
 
+    /// `TypeTag` for `Capability<FaucetAdmin>`, the runtime mint gate.
+    pub fn faucet_admin_cap_tag() -> TypeTag {
+        concrete("Capability", vec![concrete("FaucetAdmin", vec![])])
+    }
+
+    /// `Capability<FaucetAdmin>` payload: the 32-byte id placeholder.
+    pub fn cap_payload() -> Vec<u8> {
+        let mut w = RetWriter::with_capacity(32);
+        w.write_object_id(&ObjectId([0u8; 32]));
+        w.finish()
+    }
+
     /// `Coin<T>` payload: 32-byte id placeholder (host fills on create) + a
     /// 16-byte big-endian `u128` value. Matches the pool's `coin_payload`.
     fn coin_payload(value: u128) -> Vec<u8> {
@@ -66,21 +79,83 @@ pub mod ops {
     pub fn mint(value: u128) -> Result<RuntimeHandle, PetalError> {
         host::object_create(&coin_erased_tag(), &coin_payload(value))
     }
+
+    /// Mint a fresh faucet-admin capability.
+    pub fn create_admin() -> Result<RuntimeHandle, PetalError> {
+        host::object_create(&faucet_admin_cap_tag(), &cap_payload())
+    }
 }
 
 /// Petal entry points for `/bloom/dex/faucet`.
 #[bloom::petal(path = "/bloom/dex/faucet", version = "0.1.0")]
 pub mod faucet {
     use crate::ops;
-    use bloom_resource::{Coin, Erased};
+    use bloom_resource::{Capability, Coin, Erased, Signer, UID};
+
+    /// Runtime mint authority for the DEX demo faucet.
+    #[bloom::capability]
+    pub struct FaucetAdmin {
+        /// On-chain object identifier.
+        pub id: UID,
+    }
+
+    /// Claim the demo faucet admin capability for the configured acceptance
+    /// admin address.
+    ///
+    /// This is disabled unless the wasm is built with
+    /// `BLOOM_DEX_FAUCET_ADMIN_HEX=<64 lowercase/uppercase hex chars>`.
+    pub fn claim_admin(signer: &Signer) -> Capability<FaucetAdmin> {
+        let signer_addr = signer
+            .address()
+            .expect("claim_admin: signer address host failure");
+        let configured =
+            configured_admin_address().expect("claim_admin: faucet admin address not configured");
+        assert!(
+            signer_addr == configured,
+            "claim_admin: signer is not the configured faucet admin"
+        );
+        let h = ops::create_admin().expect("claim_admin: host failure");
+        Capability::from_handle(h)
+    }
 
     /// Mint a fresh `Coin<Erased>` worth `value`.
     ///
     /// Returns the coin as a borrow-table row (PTB Use-ref) so it can be
     /// threaded atomically into a downstream `create_pool` / swap command in
     /// the same transaction — the on-chain analog of `seed_erased_coin`.
-    pub fn mint(value: u128) -> Coin<Erased> {
+    pub fn mint(signer: &Signer, _admin: &Capability<FaucetAdmin>, value: u128) -> Coin<Erased> {
+        let signer_addr = signer.address().expect("mint: signer address host failure");
+        let configured =
+            configured_admin_address().expect("mint: faucet admin address not configured");
+        assert!(
+            signer_addr == configured,
+            "mint: signer is not the configured faucet admin"
+        );
         let h = ops::mint(value).expect("faucet mint host failure");
         Coin::from_handle(h)
+    }
+
+    fn configured_admin_address() -> Option<[u8; 32]> {
+        let s = option_env!("BLOOM_DEX_FAUCET_ADMIN_HEX")?;
+        if s.len() != 64 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < 32 {
+            out[i] = (hex_nibble(bytes[i * 2])? << 4) | hex_nibble(bytes[i * 2 + 1])?;
+            i += 1;
+        }
+        Some(out)
+    }
+
+    fn hex_nibble(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
     }
 }
