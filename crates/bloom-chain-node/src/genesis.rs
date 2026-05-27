@@ -39,7 +39,8 @@ use bloom_chain_state::{Account, State};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes};
 use bloom_keystore::xdsa::XDSA_PK_LEN;
 use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
-use bloom_petal_fungible::ops::{coin_payload, type_tag_coin_loom};
+use bloom_petal_fungible::ops::coin_payload;
+use bloom_script::{CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, loom_coin_type_tag};
 use serde::{Deserialize, Serialize};
 
 use crate::error::NodeError;
@@ -265,7 +266,10 @@ impl Genesis {
             state.set_vfs_binding(path.clone(), hash);
         }
 
-        let coin_type = type_tag_coin_loom();
+        let fungible_petal_hash = state
+            .vfs_lookup(CORE_FUNGIBLE_PATH)
+            .unwrap_or(DEFAULT_FUNGIBLE_PETAL_HASH);
+        let coin_type = loom_coin_type_tag(fungible_petal_hash);
 
         for (idx, (addr, amount)) in self.allocations.iter().enumerate() {
             // ── 1. Account.loom cache (spec §9.2) ─────────────────────────
@@ -445,7 +449,7 @@ mod tests {
     use bloom_chain_consensus::validator_set::Validator;
     use bloom_chain_types::types::PubKeyBytes;
     use bloom_objects::{OWNER_KIND_ADDRESS, OwnershipIndexKey};
-    use bloom_petal_fungible::ops::{decode_coin_value, type_tag_coin_loom};
+    use bloom_petal_fungible::ops::decode_coin_value;
 
     /// Build a minimal `Genesis` (no file I/O needed) with `n` allocations.
     fn make_genesis(allocations: Vec<([u8; 32], u128)>) -> Genesis {
@@ -476,6 +480,14 @@ mod tests {
         }
     }
 
+    fn genesis_coin_id(genesis: &Genesis, idx: usize) -> ObjectId {
+        let mut h = blake3::Hasher::new();
+        h.update(b"bloom.genesis.loom");
+        h.update(&genesis.genesis_hash.0);
+        h.update(&(idx as u32).to_le_bytes());
+        ObjectId(*h.finalize().as_bytes())
+    }
+
     #[test]
     fn genesis_emits_coin_loom_objects_for_each_allocation() {
         let addr_a = [0x01u8; 32];
@@ -496,7 +508,7 @@ mod tests {
         // TDD: run apply_to_state and assert expected state.
         genesis.apply_to_state(&mut state);
 
-        let coin_type = type_tag_coin_loom();
+        let coin_type = loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH);
 
         for (idx, (raw_addr, expected_amount)) in
             [(addr_a, amount_a), (addr_b, amount_b), (addr_c, amount_c)]
@@ -513,13 +525,7 @@ mod tests {
             );
 
             // 2. A Coin<LOOM> object must exist with deterministic id.
-            let coin_id = {
-                let mut h = blake3::Hasher::new();
-                h.update(b"bloom.genesis.loom");
-                h.update(&genesis.genesis_hash.0);
-                h.update(&(idx as u32).to_le_bytes());
-                ObjectId(*h.finalize().as_bytes())
-            };
+            let coin_id = genesis_coin_id(&genesis, idx);
 
             let obj = state
                 .get_object(&coin_id)
@@ -556,6 +562,26 @@ mod tests {
                 "OwnershipIndex missing coin_id for idx {idx}"
             );
         }
+    }
+
+    #[test]
+    fn genesis_coin_type_uses_pinned_fungible_petal_hash_when_present() {
+        let addr = [0x01u8; 32];
+        let mut genesis = make_genesis(vec![(addr, 1_000_000)]);
+        genesis.petals = vec![(CORE_FUNGIBLE_PATH.to_string(), vec![0x01, 0x02, 0x03])];
+
+        let mut state = State::new();
+        genesis.apply_to_state(&mut state);
+
+        let fungible_hash = state
+            .vfs_lookup(CORE_FUNGIBLE_PATH)
+            .expect("fungible petal bound at genesis");
+        assert_ne!(fungible_hash, DEFAULT_FUNGIBLE_PETAL_HASH);
+
+        let obj = state
+            .get_object(&genesis_coin_id(&genesis, 0))
+            .expect("genesis Coin<LOOM>");
+        assert_eq!(obj.type_tag, loom_coin_type_tag(fungible_hash));
     }
 
     #[test]

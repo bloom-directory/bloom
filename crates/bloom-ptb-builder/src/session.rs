@@ -112,9 +112,10 @@ pub struct PtbSession<'a> {
     gas_budget: u64,
     gas_price: u128,
     expiry_block: u64,
-    /// Fungible-petal hash used to build the well-known `Coin<LOOM>`
-    /// type tag for gas-payer recognition. Settable for Phase D.
-    fungible_petal_hash: bloom_chain_types::Hash32,
+    /// Explicit fungible-petal hash override used to build the well-known
+    /// `Coin<LOOM>` type tag for gas-payer recognition. When unset, the
+    /// session derives it from chain VFS and falls back to the genesis sentinel.
+    fungible_petal_hash: Option<bloom_chain_types::Hash32>,
 }
 
 impl<'a> PtbSession<'a> {
@@ -136,7 +137,7 @@ impl<'a> PtbSession<'a> {
             gas_budget: 1_000_000,
             gas_price: 1,
             expiry_block: u64::MAX,
-            fungible_petal_hash: bloom_chain_types::Hash32([0u8; 32]),
+            fungible_petal_hash: None,
         }
     }
 
@@ -171,10 +172,10 @@ impl<'a> PtbSession<'a> {
     }
 
     /// Set the fungible petal hash used to recognise the `Coin<LOOM>`
-    /// gas payer (matches the genesis fungible petal). Defaults to the
-    /// self-hash `[0u8;32]`.
+    /// gas payer. By default this is resolved from chain VFS path
+    /// `/bloom/core/fungible`, falling back to the genesis sentinel.
     pub fn set_fungible_petal_hash(&mut self, hash: bloom_chain_types::Hash32) {
-        self.fungible_petal_hash = hash;
+        self.fungible_petal_hash = Some(hash);
     }
 
     // --- Core API --------------------------------------------------------
@@ -532,13 +533,17 @@ impl<'a> PtbSession<'a> {
         let mut for_validation = tx.clone();
         for_validation.signatures = vec![PqSignature(vec![0u8; 1]); self.signers.len()];
         let verifier = AlwaysOkVerifier;
+        let fungible_petal_hash = self
+            .fungible_petal_hash
+            .unwrap_or_else(|| bloom_script::resolve_fungible_petal_hash(self.chain));
+
         validate_ptb(
             &for_validation,
             &ValidationContext {
                 current_block: self.chain.current_block(),
                 chain: self.chain,
                 verifier: &verifier as &dyn SignatureVerifier,
-                loom_coin_type: loom_coin_type_tag(self.fungible_petal_hash),
+                loom_coin_type: loom_coin_type_tag(fungible_petal_hash),
             },
         )?;
 

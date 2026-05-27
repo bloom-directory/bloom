@@ -1,9 +1,9 @@
-//! # Sparse Merkle trie — v0 commitment scheme
+//! # BTreeMap-backed v0 state commitment
 //!
 //! ## Design choice (v0 vs v1)
 //!
-//! The spec calls for a 256-ary sparse Merkle tree over BLAKE3 (§5.1, §6.2).
-//! A full SMT requires ~32 rounds of hashing per path and substantial
+//! The spec calls for a 256-ary sparse Merkle tree over BLAKE3 (section 5.1,
+//! section 6.2). A full SMT requires about 32 rounds of hashing per path and substantial
 //! bookkeeping for partial branches. For v0 we need only:
 //!
 //! - A **deterministic commitment** to the set of populated (key, value) pairs.
@@ -23,8 +23,8 @@
 //! all-zeros hash.
 //!
 //! **v1 swap-in path:** replace the `root()` implementation with a true 256-ary
-//! SMT (e.g. a Patricia-Merkle trie over BLAKE3). The `insert`, `get`, `remove`,
-//! `iter`, `len`, `is_empty` public API is identical — only the root computation
+//! SMT, for example a Patricia-Merkle trie over BLAKE3. The `insert`, `get`, `remove`,
+//! `iter`, `len`, `is_empty` public API is identical; only the root computation
 //! changes, which is behind a single method boundary.
 
 use std::collections::BTreeMap;
@@ -81,7 +81,7 @@ impl TrieKind {
     }
 }
 
-/// A sparse Merkle trie backed by a `BTreeMap`.
+/// A deterministic key-value commitment backed by a `BTreeMap`.
 ///
 /// Keys are 32-byte arrays; values are arbitrary byte vectors.  Only non-empty
 /// entries are stored.  See module-level docs for the v0 commitment scheme.

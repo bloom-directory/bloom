@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use bloom_chain_types::Hash32;
 use bloom_objects::{AccessMode, Object, ObjectId, Owner, TypeTag};
 use bloom_script::{
-    Arg, ArgDeclStub, ChainStateIface, Command, ExpectedVersion, FunctionDeclStub,
-    PetalManifestStub, TypeParamDeclStub,
+    Arg, ArgDeclStub, CORE_FUNGIBLE_PATH, ChainStateIface, Command, ExpectedVersion,
+    FunctionDeclStub, PetalManifestStub, TypeParamDeclStub,
 };
 
 use crate::error::{BuildError, ResolveError};
@@ -626,6 +626,34 @@ fn build_unsigned_assembles_and_validates() {
     assert!(tx.signatures.is_empty(), "unsigned: Phase D fills sigs");
     // The digest is computable (what Phase D signs).
     let _digest = tx.signing_digest();
+}
+
+#[test]
+fn build_unsigned_derives_fungible_hash_from_chain_vfs() {
+    let chain = chain_with_pool(vec![func("swap", vec![ArgDeclStub::Signer], vec![])]);
+    let signer = [0x11; 32];
+    let fungible_hash = Hash32([0x44; 32]);
+    chain.put_path(CORE_FUNGIBLE_PATH, fungible_hash);
+
+    let gas_id = ObjectId([0xFE; 32]);
+    let mut payload = vec![0u8; 32];
+    payload.extend_from_slice(&1_000_000u128.to_be_bytes());
+    chain.put_object(Object {
+        id: gas_id,
+        type_tag: bloom_script::loom_coin_type_tag(fungible_hash),
+        owner: Owner::Address(signer),
+        version: 0,
+        payload,
+    });
+
+    let mut s = PtbSession::new(&chain);
+    s.set_signers(vec![signer]);
+    s.set_gas_payer(gas_id);
+    s.set_expiry_block(100);
+    s.append_command("/bloom/dex/pool/swap signer:0").unwrap();
+
+    let tx = s.build_unsigned().unwrap();
+    assert_eq!(tx.gas_payer, gas_id);
 }
 
 // ===========================================================================

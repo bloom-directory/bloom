@@ -6,19 +6,13 @@
 //! - Bridges inbound frames from peers to the driver.
 //! - Implements `SigVerifier` using xDSA composite verification.
 //!
-//! # PetalVm assumption
+//! # Execution boundary
 //!
-//! The chain-mode petals API is assumed to follow `bloom_petals` spec §7.6:
-//! ```ignore
-//! PetalVm::new_chain(engine_cfg: ChainEngineCfg) -> PetalVm
-//! vm.run_chain_call(ctx: ChainCallCtx, calldata: &[u8]) -> Result<ChainCallOutput>
-//! ```
-//! where `ChainCallOutput` contains `{ return_data, fuel_used, state_writes, logs, success }`.
-//!
-//! Because the `bloom-petals` chain-mode API is still in-flight, this module
-//! references it through a `PetalExecutor` trait defined locally so that the
-//! implementation can be swapped in once the final API shape is known.
-//! TODO(adapter): reconcile PetalExecutor with actual bloom_petals chain-mode API.
+//! The consensus driver is intentionally generic over a local `PetalExecutor`
+//! trait. Production wires this to `crate::petal_executor::ChainPetalExecutor`,
+//! which performs Bloom-native chain-mode execution through `bloom_petals` and
+//! the PTB/object pipeline. Tests can inject narrower executors while reusing
+//! the same block validation, gas settlement, and commit logic.
 
 use std::sync::Arc;
 
@@ -46,7 +40,6 @@ use crate::{
 
 // ---------------------------------------------------------------------------
 // PetalExecutor trait
-// TODO(adapter): replace with actual bloom_petals chain-mode API.
 // ---------------------------------------------------------------------------
 
 /// Output from executing a single transaction via the chain-mode petal VM.
@@ -59,25 +52,12 @@ pub struct ExecOutput {
     pub write_set: Option<WriteSet>,
 }
 
-/// Abstraction over the chain-mode petal VM.
+/// Abstraction over deterministic transaction execution.
 ///
-/// TODO(adapter): the actual implementation will delegate to
-/// `bloom_petals::PetalVm::run_chain_call(ctx, calldata)`.  The trait is
-/// defined here so that the consensus driver compiles independently.
-///
-/// Assumed API shape:
-/// ```ignore
-/// // Create a chain-mode VM engine:
-/// let vm = bloom_petals::PetalVm::new_chain(engine_cfg);
-///
-/// // Execute one tx:
-/// let ctx = bloom_petals::ChainCallCtx {
-///     block_number, timestamp_ms, proposer, sender, value_loom,
-///     state_snapshot: &mut snap,
-/// };
-/// let out: ChainCallOutput = vm.run_chain_call(ctx, calldata)?;
-/// // out.return_data, out.fuel_used, out.success, out.logs
-/// ```
+/// The production implementation is [`crate::petal_executor::ChainPetalExecutor`].
+/// Keeping the trait local to the driver isolates consensus/block-application
+/// tests from the full VM while preserving the exact commit interface used by
+/// the node.
 pub trait PetalExecutor: Send + Sync + 'static {
     /// Execute a single transaction.
     ///

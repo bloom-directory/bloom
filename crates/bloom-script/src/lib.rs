@@ -65,8 +65,9 @@ pub use executor::{
 pub use hash::{PTB_HASH_TAG, ptb_hash};
 pub use host_ctx::{HandleEntry, PtbHostCtx};
 pub use types::{
-    Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PqPubkey, PqSignature, PtbTx, PublishCmd,
-    UpgradeCmd, UseRef, loom_coin_type_tag, loom_marker_type_tag,
+    Arg, CORE_FUNGIBLE_PATH, Command, DEFAULT_FUNGIBLE_PETAL_HASH, ExpectedVersion, MoveCmd,
+    PetalRef, PqPubkey, PqSignature, PtbTx, PublishCmd, UpgradeCmd, UseRef, loom_coin_type_tag,
+    loom_marker_type_tag, resolve_fungible_petal_hash,
 };
 pub use validator::{
     AlwaysOkVerifier, SignatureVerifier, ValidatedPtb, ValidationContext, validate_ptb,

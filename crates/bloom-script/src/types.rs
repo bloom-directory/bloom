@@ -9,6 +9,8 @@
 use bloom_chain_types::Hash32;
 use bloom_objects::{AccessMode, ObjectId, Owner, TypeTag};
 
+use crate::chain_iface::ChainStateIface;
+
 // ---------------------------------------------------------------------------
 // Cryptographic placeholders
 // ---------------------------------------------------------------------------
@@ -270,6 +272,22 @@ pub const COIN_TYPE_NAME: &str = "Coin";
 
 /// Type-name string for the inner `LOOM` marker witness type.
 pub const LOOM_TYPE_NAME: &str = "LOOM";
+
+/// Canonical VFS path for the core fungible petal.
+pub const CORE_FUNGIBLE_PATH: &str = "/bloom/core/fungible";
+
+/// Sentinel fungible-petal hash used before a chain pins
+/// [`CORE_FUNGIBLE_PATH`] in VFS.
+pub const DEFAULT_FUNGIBLE_PETAL_HASH: Hash32 = Hash32([0u8; 32]);
+
+/// Resolve the fungible petal hash from chain VFS, falling back to the
+/// genesis/default sentinel used by chains that have not pinned the core
+/// fungible petal yet.
+pub fn resolve_fungible_petal_hash(chain: &dyn ChainStateIface) -> Hash32 {
+    chain
+        .resolve_path(CORE_FUNGIBLE_PATH)
+        .unwrap_or(DEFAULT_FUNGIBLE_PETAL_HASH)
+}
 
 /// Build the canonical `Coin<LOOM>` type tag from the fungible
 /// petal's content hash.

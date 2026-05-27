@@ -29,7 +29,10 @@ use bloom_revert::{
     AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
     OpenchainDecoder, boxed,
 };
-use bloom_script::{ChainStateIface, PqSignature, PtbTx};
+use bloom_script::{
+    CORE_FUNGIBLE_PATH, ChainStateIface, DEFAULT_FUNGIBLE_PETAL_HASH, PqSignature, PtbTx,
+    loom_coin_type_tag,
+};
 use bloom_tx::outbox::Outbox;
 use bloom_tx::tx_engine::TxEngine;
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
@@ -1000,7 +1003,8 @@ impl PtbSubmitter for RpcPtbSubmitter {
         let arr = objects
             .as_array()
             .ok_or_else(|| HandlerError::backend("chain_ls_objects returned non-array"))?;
-        let coin_type = bloom_script::loom_coin_type_tag(bloom_chain_types::types::Hash32([0; 32]));
+        let fungible_petal_hash = self.resolve_fungible_petal_hash().await?;
+        let coin_type = loom_coin_type_tag(fungible_petal_hash);
         let mut best: Option<(u128, bloom_objects::ObjectId)> = None;
         for value in arr {
             let Some(bytes_hex) = value.get("bytes").and_then(|v| v.as_str()) else {
@@ -1067,6 +1071,35 @@ impl PtbSubmitter for RpcPtbSubmitter {
                 "receipt": receipt,
             }),
         ])
+    }
+}
+
+impl RpcPtbSubmitter {
+    async fn resolve_fungible_petal_hash(
+        &self,
+    ) -> Result<bloom_chain_types::types::Hash32, HandlerError> {
+        let value = self
+            .client
+            .call(
+                "chain_resolve_path",
+                serde_json::json!({ "path": CORE_FUNGIBLE_PATH }),
+            )
+            .await
+            .map_err(err_he)?;
+        let Some(hex_hash) = value.get("hash").and_then(|v| v.as_str()) else {
+            return Ok(DEFAULT_FUNGIBLE_PETAL_HASH);
+        };
+        let bytes = hex::decode(hex_hash)
+            .map_err(|e| HandlerError::backend(format!("decode fungible petal hash: {e}")))?;
+        if bytes.len() != 32 {
+            return Err(HandlerError::backend(format!(
+                "fungible petal hash has length {}, expected 32",
+                bytes.len()
+            )));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(bloom_chain_types::types::Hash32(arr))
     }
 }
 

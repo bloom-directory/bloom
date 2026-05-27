@@ -1,18 +1,29 @@
 //! # bloom-chain-state
 //!
-//! Accounts trie, per-contract storage tries, code store, and state-blob
-//! store for bloom-chain v0.
+//! Accounts, per-contract storage, code store, object ownership, VFS,
+//! xDSA key registry, and state-blob store for bloom-chain v0.
 //!
 //! ## Architecture
 //!
 //! ```text
 //! State
-//! ├── AccountsTrie  (BTreeMap-backed sparse Merkle, domain: accounts_root)
-//! ├── BTreeMap<Address, StorageTrie>  (per-contract, domain: storage_key)
-//! └── CodeStore  (content-addressed wasm, domain: code_root)
+//! |-- AccountsTrie  (BTreeMap-backed commitment, domain: accounts_root)
+//! |-- BTreeMap<Address, StorageTrie>  (per-contract, domain: storage_key)
+//! |-- CodeStore  (content-addressed wasm, domain: code_root)
+//! |-- Object map and OwnershipIndex  (PTB/object commitments)
+//! |-- VFS bindings  (path -> petal hash commitments)
+//! `-- xDSA key registry  (address -> composite public key commitments)
 //! ```
 //!
-//! `State::state_root()` = `blake3_tagged("state_root:", accounts_root || code_root)`
+//! `State::state_root()` commits to:
+//!
+//! ```text
+//! blake3_tagged(
+//!     "state_root:",
+//!     accounts_root || code_root || object_root || ownership_index_root ||
+//!     vfs_root || key_registry_root
+//! )
+//! ```
 //!
 //! See [`state`] for the snapshot/commit API and [`blob`] for serialisation.
 

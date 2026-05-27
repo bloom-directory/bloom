@@ -15,8 +15,8 @@
 
 use bloom_chain_state::StateSnapshot;
 use bloom_chain_types::types::Address;
-use bloom_objects::{OWNER_KIND_ADDRESS, ObjectId, OwnershipIndexKey};
-use bloom_petal_fungible::ops::{decode_coin_value, type_tag_coin_loom};
+use bloom_objects::{OWNER_KIND_ADDRESS, ObjectId, OwnershipIndexKey, TypeTag};
+use bloom_petal_fungible::ops::decode_coin_value;
 use thiserror::Error;
 
 /// The result of a `Coin<LOOM>` selection.
@@ -58,6 +58,7 @@ pub fn select_coin_loom(
     snap: &StateSnapshot,
     sender: Address,
     amount: u128,
+    loom_tag: &TypeTag,
 ) -> Result<CoinSelection, SelectCoinError> {
     if amount == 0 {
         return Ok(CoinSelection {
@@ -65,8 +66,6 @@ pub fn select_coin_loom(
             split_remainder: None,
         });
     }
-
-    let loom_tag = type_tag_coin_loom();
 
     // 1. Collect all Coin<LOOM> objects owned by sender.
     let okey = OwnershipIndexKey {
@@ -79,7 +78,7 @@ pub fn select_coin_loom(
         .into_iter()
         .filter_map(|id| {
             let obj = snap.get_object(&id)?;
-            if obj.type_tag != loom_tag {
+            if obj.type_tag != *loom_tag {
                 return None;
             }
             // Only Address-owned coins (not shared/immutable/object-owned).
@@ -139,6 +138,7 @@ mod tests {
     use bloom_chain_types::types::Hash32;
     use bloom_objects::{Object, Owner};
     use bloom_petal_fungible::ops::coin_payload;
+    use bloom_script::{DEFAULT_FUNGIBLE_PETAL_HASH, loom_coin_type_tag};
 
     fn addr(b: u8) -> Address {
         Address([b; 32])
@@ -147,7 +147,7 @@ mod tests {
     fn make_coin_object(id_byte: u8, owner: Address, value: u128) -> Object {
         Object {
             id: ObjectId([id_byte; 32]),
-            type_tag: type_tag_coin_loom(),
+            type_tag: loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
             owner: Owner::Address(owner.0),
             version: 0,
             payload: coin_payload(value),
@@ -180,7 +180,8 @@ mod tests {
         seed_coins(&mut state, alice, &[(0xA0, 500)]);
         let snap = state.snapshot();
 
-        let sel = select_coin_loom(&snap, alice, 500).unwrap();
+        let loom_tag = loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH);
+        let sel = select_coin_loom(&snap, alice, 500, &loom_tag).unwrap();
         assert_eq!(sel.consumed, vec![ObjectId([0xA0; 32])]);
         assert_eq!(sel.split_remainder, None);
     }
@@ -192,7 +193,8 @@ mod tests {
         seed_coins(&mut state, alice, &[(0xA0, 300), (0xA1, 200)]);
         let snap = state.snapshot();
 
-        let sel = select_coin_loom(&snap, alice, 500).unwrap();
+        let loom_tag = loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH);
+        let sel = select_coin_loom(&snap, alice, 500, &loom_tag).unwrap();
         // Both coins consumed (sorted ascending: 200 first, then 300).
         assert_eq!(sel.consumed.len(), 2);
         assert!(sel.consumed.contains(&ObjectId([0xA0; 32])));
@@ -207,7 +209,8 @@ mod tests {
         seed_coins(&mut state, alice, &[(0xA0, 1000)]);
         let snap = state.snapshot();
 
-        let sel = select_coin_loom(&snap, alice, 300).unwrap();
+        let loom_tag = loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH);
+        let sel = select_coin_loom(&snap, alice, 300, &loom_tag).unwrap();
         // No fully-consumed coins — the one coin is split.
         assert_eq!(sel.consumed, vec![]);
         assert_eq!(sel.split_remainder, Some((ObjectId([0xA0; 32]), 700)));
@@ -222,7 +225,8 @@ mod tests {
         let snap = state.snapshot();
 
         // Need 350: 100 + 200 = 300, then split 50 from 500 → remainder 450.
-        let sel = select_coin_loom(&snap, alice, 350).unwrap();
+        let loom_tag = loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH);
+        let sel = select_coin_loom(&snap, alice, 350, &loom_tag).unwrap();
         assert!(sel.consumed.contains(&ObjectId([0xA0; 32])));
         assert!(sel.consumed.contains(&ObjectId([0xA1; 32])));
         assert!(!sel.consumed.contains(&ObjectId([0xA2; 32])));
@@ -236,7 +240,8 @@ mod tests {
         seed_coins(&mut state, alice, &[(0xA0, 100), (0xA1, 50)]);
         let snap = state.snapshot();
 
-        let err = select_coin_loom(&snap, alice, 500).unwrap_err();
+        let loom_tag = loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH);
+        let err = select_coin_loom(&snap, alice, 500, &loom_tag).unwrap_err();
         assert!(matches!(
             err,
             SelectCoinError::Insufficient {
@@ -252,7 +257,8 @@ mod tests {
         let alice = addr(0x01);
         let snap = state.snapshot();
 
-        let err = select_coin_loom(&snap, alice, 1).unwrap_err();
+        let loom_tag = loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH);
+        let err = select_coin_loom(&snap, alice, 1, &loom_tag).unwrap_err();
         assert!(matches!(
             err,
             SelectCoinError::Insufficient { have: 0, need: 1 }
@@ -264,7 +270,8 @@ mod tests {
         let state = State::new();
         let alice = addr(0x01);
         let snap = state.snapshot();
-        let sel = select_coin_loom(&snap, alice, 0).unwrap();
+        let loom_tag = loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH);
+        let sel = select_coin_loom(&snap, alice, 0, &loom_tag).unwrap();
         assert_eq!(sel.consumed, vec![]);
         assert_eq!(sel.split_remainder, None);
     }
@@ -300,7 +307,8 @@ mod tests {
         state.set_ownership(okey, vec![ObjectId([0xBB; 32])]);
 
         let snap = state.snapshot();
-        let err = select_coin_loom(&snap, alice, 1).unwrap_err();
+        let loom_tag = loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH);
+        let err = select_coin_loom(&snap, alice, 1, &loom_tag).unwrap_err();
         assert!(matches!(
             err,
             SelectCoinError::Insufficient { have: 0, need: 1 }
@@ -325,13 +333,14 @@ mod tests {
         };
         snap.set_ownership(okey, vec![id]);
 
-        let sel = select_coin_loom(&snap, alice, 200).unwrap();
+        let loom_tag = loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH);
+        let sel = select_coin_loom(&snap, alice, 200, &loom_tag).unwrap();
         assert_eq!(sel.consumed, vec![ObjectId([0xC0; 32])]);
         assert_eq!(sel.split_remainder, None);
 
         // Also verify the base state sees nothing (confirms snapshot isolation).
         let base_snap = state.snapshot();
-        let err = select_coin_loom(&base_snap, alice, 1).unwrap_err();
+        let err = select_coin_loom(&base_snap, alice, 1, &loom_tag).unwrap_err();
         assert!(matches!(err, SelectCoinError::Insufficient { .. }));
 
         // Suppress unused variable warning

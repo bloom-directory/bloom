@@ -20,15 +20,15 @@ use bloom_chain_types::{
     types::{Address, Hash32},
 };
 use bloom_objects::{
-    NEW_HOST_IMPORTS, OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey, WasmValType,
+    NEW_HOST_IMPORTS, OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey, TypeTag,
+    WasmValType,
 };
-use bloom_petal_fungible::ops::{
-    coin_payload, decode_coin_value, rewrite_value, type_tag_coin_loom,
-};
+use bloom_petal_fungible::ops::{coin_payload, decode_coin_value, rewrite_value};
 use bloom_petal_manifest::extract_petal_manifest_v0;
 use bloom_petals::{BlockCtx as PetalBlockCtx, PetalVm};
 use bloom_script::{
-    AlwaysOkVerifier, PetalManifestStub, SignatureVerifier, ValidationContext,
+    AlwaysOkVerifier, CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, PetalManifestStub,
+    SignatureVerifier, ValidationContext,
     executor::{LogEntry as PtbLogEntry, PtbExecutor},
     host_ctx::PtbHostCtx,
     loom_coin_type_tag, validate_ptb,
@@ -487,6 +487,12 @@ enum PtbSignaturePolicy {
     AlwaysOk,
 }
 
+fn resolve_fungible_petal_hash_from_state(state: &State) -> Hash32 {
+    state
+        .vfs_lookup(CORE_FUNGIBLE_PATH)
+        .unwrap_or(DEFAULT_FUNGIBLE_PETAL_HASH)
+}
+
 /// Shared `PetalExecutor::execute_tx` body. The trailing `manifests`
 /// parameter is an optional per-petal manifest **override** map the
 /// PTB validator consults *before* the wasm custom-section path
@@ -518,6 +524,7 @@ fn execute_tx_impl(
     match &tx.kind {
         TxKind::Transfer { to, amount_loom } => {
             // Pure LOOM move — no VM invocation required.
+            let coin_type = loom_coin_type_tag(resolve_fungible_petal_hash_from_state(state));
             let mut snap = state.snapshot();
             let mut to_acct = snap.get_account(to).unwrap_or_else(empty_account);
             to_acct.loom += amount_loom;
@@ -532,7 +539,14 @@ fn execute_tx_impl(
             // TODO(phase4): make Coin<LOOM> insufficient a hard revert once
             // the legacy Account.loom path is removed.
             if *amount_loom > 0 {
-                apply_coin_loom_transfer(&mut snap, tx.sender, *to, *amount_loom, &tx.tx_hash());
+                apply_coin_loom_transfer(
+                    &mut snap,
+                    tx.sender,
+                    *to,
+                    *amount_loom,
+                    &tx.tx_hash(),
+                    coin_type,
+                );
             }
 
             let ws = snap.commit();
@@ -633,12 +647,8 @@ fn execute_tx_impl(
                     // manifest-override harness intentionally keeps the
                     // always-ok verifier for legacy in-process fixtures.
                     //
-                    // TODO(task#32): replace the all-zero
-                    // `loom_coin_type` and `fungible_petal_hash`
-                    // below with the values pinned at genesis once
-                    // the fungible petal lands.
-                    let loom_coin_type = loom_coin_type_tag(Hash32([0u8; 32]));
-                    let fungible_petal_hash = Hash32([0u8; 32]);
+                    let fungible_petal_hash = resolve_fungible_petal_hash_from_state(state);
+                    let loom_coin_type = loom_coin_type_tag(fungible_petal_hash);
 
                     // Capture per-PTB scratch we need across the
                     // immutable borrow of `state` (validate) and
@@ -1086,13 +1096,12 @@ fn apply_coin_loom_transfer(
     to: Address,
     amount: u128,
     tx_hash: &Hash32,
+    coin_type: TypeTag,
 ) {
     use crate::coin_select::CoinSelection;
 
-    let coin_type = type_tag_coin_loom();
-
     // 1. Select sender coins.
-    let selection: CoinSelection = match select_coin_loom(snap, sender, amount) {
+    let selection: CoinSelection = match select_coin_loom(snap, sender, amount, &coin_type) {
         Ok(s) => s,
         Err(e) => {
             warn!(
