@@ -1109,23 +1109,23 @@ fn execute_tx_impl(
                         }
                     }
                     // Proposer credit (always — burnt or full burn).
-                    if burnt > 0 {
-                        if let Err(e) = mint_coin_loom_to(
+                    if burnt > 0
+                        && let Err(e) = mint_coin_loom_to(
                             &mut snapshot,
                             proposer,
                             burnt,
                             b"bloom.ptb.gas.success",
                             &tx.tx_hash(),
                             loom_coin_type.clone(),
-                        ) {
-                            return ExecOutput {
-                                success: false,
-                                fuel_used: charged_fuel,
+                        )
+                    {
+                        return ExecOutput {
+                            success: false,
+                            fuel_used: charged_fuel,
                                 return_data: format!("ptb gas settlement error: {e}").into_bytes(),
                                 logs: vec![],
-                                write_set: None,
-                            };
-                        }
+                            write_set: None,
+                        };
                     }
 
                     let ws = snapshot.commit();

@@ -111,6 +111,7 @@ pub enum OwnershipDelta {
 /// PTB-specific fields (spec §16.3):
 /// - `object_writes` / `object_deletes` — `Object` trie diffs.
 /// - `ownership_changes` — `OwnershipIndex` trie diffs.
+///
 /// The Object and OwnershipIndex roots are computed on demand from
 /// the underlying `State` maps by [`State::object_root`] /
 /// [`State::ownership_index_root`]; this struct just carries the diffs.
