@@ -694,12 +694,7 @@ fn apply_validation_accepts_commit_after_valid_block_reproposal() {
         .build();
 
     block.commit.round = commit_round;
-    for (vote, signer) in block
-        .commit
-        .votes
-        .iter_mut()
-        .zip([&v1, &v2, &v3].into_iter())
-    {
+    for (vote, signer) in block.commit.votes.iter_mut().zip([&v1, &v2, &v3]) {
         vote.round = commit_round;
         let digest = vote.signing_digest();
         vote.sig = XdsaSigner::new(Arc::clone(&signer.sk)).sign(&digest.0);
