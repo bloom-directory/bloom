@@ -121,13 +121,18 @@ impl<V: SigVerifier> Mempool<V> {
         } else {
             false
         };
-        let fee_reservation = (tx.max_fuel as u128).saturating_mul(tx.fee_per_unit as u128);
         let value = tx_value(&tx);
         let current_balance = if bypass_outer_balance {
             u128::MAX
         } else {
             current_balance
         };
+        let fee_reservation = (tx.max_fuel as u128)
+            .checked_mul(tx.fee_per_unit as u128)
+            .ok_or(ConsensusError::InsufficientBalance {
+                need: u128::MAX,
+                have: current_balance,
+            })?;
         let need =
             fee_reservation
                 .checked_add(value)
@@ -185,8 +190,10 @@ impl<V: SigVerifier> Mempool<V> {
         let mut selected = Vec::new();
         let mut fuel_used: u64 = 0;
         for tx in candidates {
-            if fuel_used.saturating_add(tx.max_fuel) <= fuel_limit {
-                fuel_used += tx.max_fuel;
+            if let Some(next_fuel_used) = fuel_used.checked_add(tx.max_fuel)
+                && next_fuel_used <= fuel_limit
+            {
+                fuel_used = next_fuel_used;
                 selected.push(tx.clone());
             }
         }
@@ -259,7 +266,10 @@ impl<V: SigVerifier> Mempool<V> {
             let mut best: Option<usize> = None;
             for (i, run) in heads.iter().enumerate() {
                 let Some(head) = run.first() else { continue };
-                if fuel_used.saturating_add(head.max_fuel) > fuel_limit {
+                let Some(next_fuel_used) = fuel_used.checked_add(head.max_fuel) else {
+                    continue;
+                };
+                if next_fuel_used > fuel_limit {
                     continue;
                 }
                 let pick = match best {
@@ -279,7 +289,9 @@ impl<V: SigVerifier> Mempool<V> {
             }
             let Some(i) = best else { break };
             let head = heads[i][0];
-            fuel_used += head.max_fuel;
+            fuel_used = fuel_used
+                .checked_add(head.max_fuel)
+                .expect("selected head was checked against fuel budget");
             selected.push(head.clone());
             heads[i] = &heads[i][1..];
         }
@@ -536,6 +548,34 @@ mod tests {
         let selected = mp.select_for_block(1000);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].fee_per_unit, 10); // higher fee selected first
+    }
+
+    #[test]
+    fn select_for_block_rejects_fuel_sum_overflow() {
+        let mut mp = Mempool::new(NoopVerifier);
+        mp.admit(make_tx(1, 1, 10, u64::MAX), 0, u128::MAX).unwrap();
+        mp.admit(make_tx(2, 1, 9, TRANSFER_INTRINSIC_FUEL), 0, u128::MAX)
+            .unwrap();
+
+        let selected = mp.select_for_block(u64::MAX);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].sender, addr_from_seed(1));
+        assert_eq!(selected[0].max_fuel, u64::MAX);
+    }
+
+    #[test]
+    fn select_for_block_for_rejects_fuel_sum_overflow() {
+        let mut mp = Mempool::new(NoopVerifier);
+        mp.admit(make_tx(1, 1, 10, u64::MAX), 0, u128::MAX).unwrap();
+        mp.admit(make_tx(2, 1, 9, TRANSFER_INTRINSIC_FUEL), 0, u128::MAX)
+            .unwrap();
+
+        let selected = mp.select_for_block_for(u64::MAX, |_| 0);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].sender, addr_from_seed(1));
+        assert_eq!(selected[0].max_fuel, u64::MAX);
     }
 
     #[test]

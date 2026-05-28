@@ -682,6 +682,12 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
                         .to_string(),
                 );
             }
+            if output.fuel_used > tx.max_fuel {
+                return Err(format!(
+                    "invalid SubmitPtb execution output: fuel_used {} exceeds max_fuel {}",
+                    output.fuel_used, tx.max_fuel
+                ));
+            }
 
             // Apply whatever the executor produced. On revert the
             // executor still emits a write_set that carries the
@@ -695,7 +701,9 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
             }
             *state = tx_state;
 
-            total_fuel_used += output.fuel_used;
+            total_fuel_used = total_fuel_used
+                .checked_add(output.fuel_used)
+                .ok_or_else(|| "block execution fuel_used overflow".to_string())?;
             receipts.push(Receipt {
                 tx_hash: tx.tx_hash(),
                 success: output.success,
@@ -707,13 +715,20 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
         }
 
         // 3. Max-fee reservation (non-PTB txs).
-        let max_fee = tx.max_fuel as u128 * tx.fee_per_unit as u128;
         if tx.max_fuel == 0 || tx.fee_per_unit == 0 {
             return Err(
                 "invalid non-PTB tx envelope: max_fuel and fee_per_unit must be non-zero"
                     .to_string(),
             );
         }
+        let max_fee = (tx.max_fuel as u128)
+            .checked_mul(tx.fee_per_unit as u128)
+            .ok_or_else(|| {
+                format!(
+                    "invalid non-PTB tx envelope: max fee overflow for max_fuel {} and fee_per_unit {}",
+                    tx.max_fuel, tx.fee_per_unit
+                )
+            })?;
         let value = match &tx.kind {
             TxKind::Transfer { amount_loom, .. } => *amount_loom,
             TxKind::DeployPetal { .. } => 0,
@@ -784,6 +799,12 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
                     .to_string(),
             );
         }
+        if output.fuel_used > tx.max_fuel {
+            return Err(format!(
+                "invalid non-PTB execution output: fuel_used {} exceeds max_fuel {}",
+                output.fuel_used, tx.max_fuel
+            ));
+        }
 
         if output.success {
             if let Some(ws) = output.write_set.clone() {
@@ -798,7 +819,14 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
 
         // 5. Settle fuel and fees as Coin<LOOM> object transfers.
         let fee_charged = if output.success {
-            output.fuel_used as u128 * tx.fee_per_unit as u128
+            (output.fuel_used as u128)
+                .checked_mul(tx.fee_per_unit as u128)
+                .ok_or_else(|| {
+                    format!(
+                        "invalid non-PTB execution output: fee settlement overflow for fuel_used {} and fee_per_unit {}",
+                        output.fuel_used, tx.fee_per_unit
+                    )
+                })?
         } else {
             max_fee
         };
@@ -822,7 +850,9 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
 
         *state = tx_state;
 
-        total_fuel_used += output.fuel_used;
+        total_fuel_used = total_fuel_used
+            .checked_add(output.fuel_used)
+            .ok_or_else(|| "block execution fuel_used overflow".to_string())?;
 
         receipts.push(Receipt {
             tx_hash: tx.tx_hash(),

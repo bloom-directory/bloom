@@ -69,6 +69,50 @@ impl PetalExecutor for FuelOnlyFailedPtbExecutor {
     }
 }
 
+struct OverFuelPtbExecutor;
+
+impl PetalExecutor for OverFuelPtbExecutor {
+    fn execute_tx(
+        &self,
+        _tx: &Tx,
+        state: &mut State,
+        _block_number: u64,
+        _timestamp_ms: u64,
+        _proposer: Address,
+        _parent_hash: Hash32,
+    ) -> ExecOutput {
+        ExecOutput {
+            success: true,
+            fuel_used: 8,
+            return_data: vec![],
+            logs: vec![],
+            write_set: Some(state.snapshot().commit()),
+        }
+    }
+}
+
+struct OverFuelNonPtbExecutor;
+
+impl PetalExecutor for OverFuelNonPtbExecutor {
+    fn execute_tx(
+        &self,
+        _tx: &Tx,
+        state: &mut State,
+        _block_number: u64,
+        _timestamp_ms: u64,
+        _proposer: Address,
+        _parent_hash: Hash32,
+    ) -> ExecOutput {
+        ExecOutput {
+            success: true,
+            fuel_used: 1_001,
+            return_data: vec![],
+            logs: vec![],
+            write_set: Some(state.snapshot().commit()),
+        }
+    }
+}
+
 fn fund(state: &mut State, addr: bloom_chain_types::Address, loom: u128) {
     state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
     state.set_account(
@@ -463,6 +507,45 @@ fn successful_submit_ptb_cannot_advance_nonce_with_zero_fuel() {
 }
 
 #[test]
+fn submit_ptb_cannot_charge_more_than_outer_max_fuel() {
+    let pubkey = PubKeyBytes(vec![0xF3; 32]);
+    let sender = bloom_chain_types::types::Address::from_pubkey_bytes(&pubkey.0);
+    let ptb_bytes = encode_ptb(&PtbTx {
+        gas_budget: 7,
+        gas_price: 3,
+        expiry_block: 99,
+        ..PtbTx::default()
+    })
+    .expect("PTB encodes");
+    let tx = Tx {
+        chain_id: "bloom-chain.v0".to_string(),
+        sender,
+        nonce: 1,
+        max_fuel: 7,
+        fee_per_unit: 3,
+        kind: TxKind::SubmitPtb { ptb_bytes },
+        pubkey,
+        sig: SigBytes(vec![0u8; 64]),
+    };
+    let state = State::new();
+    let block = BlockBuilder::at(1)
+        .chain_id("bloom-chain.v0")
+        .proposer(make_addr(0x11))
+        .txs(vec![tx])
+        .fuel_limit(8)
+        .build();
+
+    let err = validate_block_execution(&state, &OverFuelPtbExecutor, &block, 0)
+        .expect_err("over-fuel SubmitPtb must invalidate block execution");
+
+    assert!(err.contains("exceeds max_fuel"), "got: {err}");
+    assert!(
+        state.get_account(&sender).is_none(),
+        "validation must not bump sender nonce for over-fuel SubmitPtb"
+    );
+}
+
+#[test]
 fn non_ptb_zero_fee_envelope_is_rejected_before_nonce_bump() {
     let (sk, _pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
     let tx = make_signed_transfer_tx(&sk, "bloom-chain.v0", make_addr(0x77), 1, 1, 1_000, 0);
@@ -526,5 +609,43 @@ fn successful_non_ptb_cannot_advance_nonce_with_zero_fuel() {
             .map(|acct| acct.nonce == 0)
             .unwrap_or(true),
         "validation must not bump sender nonce for successful zero-fuel non-PTB tx"
+    );
+}
+
+#[test]
+fn successful_non_ptb_cannot_charge_more_than_max_fuel() {
+    let pubkey = PubKeyBytes(vec![0xF4; 32]);
+    let sender = bloom_chain_types::types::Address::from_pubkey_bytes(&pubkey.0);
+    let tx = Tx {
+        chain_id: "bloom-chain.v0".to_string(),
+        sender,
+        nonce: 1,
+        max_fuel: 1_000,
+        fee_per_unit: 1,
+        kind: TxKind::DeployPetal {
+            wasm_bytes: vec![0x00, 0x61, 0x73, 0x6d],
+        },
+        pubkey,
+        sig: SigBytes(vec![0u8; 64]),
+    };
+    let mut state = State::new();
+    fund(&mut state, sender, 1_000_000);
+    let block = BlockBuilder::at(1)
+        .chain_id("bloom-chain.v0")
+        .proposer(make_addr(0x11))
+        .txs(vec![tx])
+        .fuel_limit(1_001)
+        .build();
+
+    let err = validate_block_execution(&state, &OverFuelNonPtbExecutor, &block, 0)
+        .expect_err("over-fuel non-PTB tx must invalidate block execution");
+
+    assert!(err.contains("exceeds max_fuel"), "got: {err}");
+    assert!(
+        state
+            .get_account(&sender)
+            .map(|acct| acct.nonce == 0)
+            .unwrap_or(true),
+        "validation must not bump sender nonce for over-fuel non-PTB tx"
     );
 }
