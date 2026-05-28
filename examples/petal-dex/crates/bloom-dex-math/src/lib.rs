@@ -28,14 +28,48 @@ pub const MAX_FEE_BPS: u16 = 10_000;
 /// balance in the pool's total supply.
 pub const MINIMUM_LIQUIDITY: u128 = 1_000;
 
-fn checked_ceil_div(numerator: u128, denominator: u128) -> Result<u128, MathError> {
+fn u512_to_u128(value: U512) -> Result<u128, MathError> {
+    if value > U512::from(u128::MAX) {
+        return Err(MathError::Overflow);
+    }
+    Ok(value.as_u128())
+}
+
+fn mul_div_floor(a: u128, b: u128, denominator: u128) -> Result<u128, MathError> {
     if denominator == 0 {
         return Err(MathError::ZeroReserves);
     }
-    let adjusted = numerator
-        .checked_add(denominator - 1)
-        .ok_or(MathError::Overflow)?;
-    Ok(adjusted / denominator)
+    u512_to_u128((U512::from(a) * U512::from(b)) / U512::from(denominator))
+}
+
+fn mul_div_ceil(a: u128, b: u128, denominator: u128) -> Result<u128, MathError> {
+    if denominator == 0 {
+        return Err(MathError::ZeroReserves);
+    }
+    let product = U512::from(a) * U512::from(b);
+    let denominator = U512::from(denominator);
+    u512_to_u128((product + denominator - U512::from(1u8)) / denominator)
+}
+
+fn sqrt_product(a: u128, b: u128) -> u128 {
+    let product = U512::from(a) * U512::from(b);
+    let mut lo = 0u128;
+    let mut hi = u128::MAX;
+    let mut ans = 0u128;
+    while lo <= hi {
+        let mid = lo + ((hi - lo) / 2);
+        let square = U512::from(mid) * U512::from(mid);
+        if square <= product {
+            ans = mid;
+            if mid == u128::MAX {
+                break;
+            }
+            lo = mid + 1;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    ans
 }
 
 // ─── Error type ──────────────────────────────────────────────────────────────
@@ -194,8 +228,7 @@ impl SwapStrategy for ConstantProduct {
             // Initial deposit: mint = sqrt(amount_a * amount_b) - MINIMUM_LIQUIDITY.
             // The withheld minimum is intended to remain permanently locked in
             // the pool's total LP supply.
-            let product = amount_a.checked_mul(amount_b).ok_or(MathError::Overflow)?;
-            let root_liquidity = integer_sqrt(product);
+            let root_liquidity = sqrt_product(amount_a, amount_b);
             let lp_minted = root_liquidity
                 .checked_sub(MINIMUM_LIQUIDITY)
                 .ok_or(MathError::InsufficientLiquidity)?;
@@ -211,8 +244,8 @@ impl SwapStrategy for ConstantProduct {
                 return Err(MathError::ZeroReserves);
             }
 
-            let mint_a = amount_a.checked_mul(lp_supply).ok_or(MathError::Overflow)? / reserve_a;
-            let mint_b = amount_b.checked_mul(lp_supply).ok_or(MathError::Overflow)? / reserve_b;
+            let mint_a = mul_div_floor(amount_a, lp_supply, reserve_a)?;
+            let mint_b = mul_div_floor(amount_b, lp_supply, reserve_b)?;
 
             let lp_minted = mint_a.min(mint_b);
             if lp_minted == 0 {
@@ -222,14 +255,8 @@ impl SwapStrategy for ConstantProduct {
             // Pull the minimum proportional amounts required for the minted
             // LP, rounded up. Rounding down here can mint nonzero LP while
             // collecting zero of a skewed reserve leg.
-            let required_a = lp_minted
-                .checked_mul(reserve_a)
-                .ok_or(MathError::Overflow)?;
-            let required_b = lp_minted
-                .checked_mul(reserve_b)
-                .ok_or(MathError::Overflow)?;
-            let taken_a = checked_ceil_div(required_a, lp_supply)?;
-            let taken_b = checked_ceil_div(required_b, lp_supply)?;
+            let taken_a = mul_div_ceil(lp_minted, reserve_a, lp_supply)?;
+            let taken_b = mul_div_ceil(lp_minted, reserve_b, lp_supply)?;
             if taken_a == 0 || taken_b == 0 || taken_a > amount_a || taken_b > amount_b {
                 return Err(MathError::InsufficientLiquidity);
             }
@@ -255,14 +282,8 @@ impl SwapStrategy for ConstantProduct {
         }
 
         // amount_a = reserve_a * lp_burned / lp_supply
-        let amount_a = reserve_a
-            .checked_mul(lp_burned)
-            .ok_or(MathError::Overflow)?
-            / lp_supply;
-        let amount_b = reserve_b
-            .checked_mul(lp_burned)
-            .ok_or(MathError::Overflow)?
-            / lp_supply;
+        let amount_a = mul_div_floor(reserve_a, lp_burned, lp_supply)?;
+        let amount_b = mul_div_floor(reserve_b, lp_burned, lp_supply)?;
 
         Ok((amount_a, amount_b))
     }
@@ -596,28 +617,36 @@ mod tests {
         );
     }
 
-    // ── Overflow path ─────────────────────────────────────────────────────────
+    // ── Wide intermediate arithmetic ─────────────────────────────────────────
 
     #[test]
-    fn add_liquidity_initial_overflow() {
-        // amount_a * amount_b overflows u128
-        let huge = u128::MAX / 2 + 1;
-        assert_eq!(
-            ConstantProduct::add_liquidity(0, 0, huge, huge, 0),
-            Err(MathError::Overflow)
-        );
+    fn add_liquidity_initial_uses_wide_sqrt_product() {
+        let (taken_a, taken_b, lp_minted) =
+            ConstantProduct::add_liquidity(0, 0, u128::MAX, u128::MAX, 0).unwrap();
+        assert_eq!(taken_a, u128::MAX);
+        assert_eq!(taken_b, u128::MAX);
+        assert_eq!(lp_minted, u128::MAX - MINIMUM_LIQUIDITY);
     }
 
     #[test]
-    fn remove_liquidity_overflow() {
-        // reserve_a=u128::MAX, lp_supply=2, lp_burned=2
-        // reserve_a * lp_burned = u128::MAX * 2 overflows
-        let result = ConstantProduct::remove_liquidity(u128::MAX, 1, 2, 2);
-        assert_eq!(result, Err(MathError::Overflow));
+    fn add_liquidity_subsequent_uses_wide_intermediates() {
+        let (taken_a, taken_b, lp_minted) =
+            ConstantProduct::add_liquidity(u128::MAX, u128::MAX, u128::MAX, u128::MAX, u128::MAX)
+                .unwrap();
+        assert_eq!(taken_a, u128::MAX);
+        assert_eq!(taken_b, u128::MAX);
+        assert_eq!(lp_minted, u128::MAX);
+    }
 
-        // Another case: reserve slightly above half of u128::MAX, lp_burned=2
-        let result2 = ConstantProduct::remove_liquidity(u128::MAX / 2 + 1, 1, 2, 2);
-        // (u128::MAX/2+1) * 2 overflows
-        assert_eq!(result2, Err(MathError::Overflow));
+    #[test]
+    fn remove_liquidity_uses_wide_intermediates() {
+        let (amount_a, amount_b) =
+            ConstantProduct::remove_liquidity(u128::MAX, u128::MAX, u128::MAX, u128::MAX).unwrap();
+        assert_eq!(amount_a, u128::MAX);
+        assert_eq!(amount_b, u128::MAX);
+
+        let (amount_a, amount_b) = ConstantProduct::remove_liquidity(u128::MAX, 1, 2, 2).unwrap();
+        assert_eq!(amount_a, u128::MAX);
+        assert_eq!(amount_b, 1);
     }
 }

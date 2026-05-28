@@ -25,11 +25,17 @@ pub enum ConsensusError {
     #[error("insufficient balance: need {need}, have {have}")]
     InsufficientBalance { need: u128, have: u128 },
 
+    #[error("insufficient fuel: required {required}, got {got}")]
+    InsufficientFuel { required: u64, got: u64 },
+
     #[error("duplicate (sender, nonce) — fee too low to replace")]
     ReplaceFeeNotHigher,
 
     #[error("address mismatch: pubkey does not hash to sender")]
     AddressMismatch,
+
+    #[error("wrong chain id: expected {expected:?}, got {got:?}")]
+    WrongChainId { expected: String, got: String },
 
     #[error("invalid SubmitPtb: {0}")]
     InvalidSubmitPtb(String),

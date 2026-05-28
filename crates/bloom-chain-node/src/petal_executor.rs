@@ -860,16 +860,22 @@ fn execute_tx_impl(
                     // `gas_budget * gas_price`, so charging more
                     // would underflow the refund.
                     let charged_fuel = report.fuel_used.min(gas_budget);
+                    let revert_charged_fuel = if reservation > 0 {
+                        gas_budget
+                    } else {
+                        charged_fuel
+                    };
 
                     if !report.success {
                         // Revert: drop every PTB-side mutation —
                         // EXCEPT the gas accounting, which must
                         // still settle. The pre-execution snapshot
                         // already debited the gas-payer Coin<LOOM>
-                        // by the full reservation; on revert we
-                        // burn the entire `gas_budget * gas_price`
-                        // to the proposer (no refund, even if
-                        // `report.fuel_used < gas_budget`). Build a
+                        // by the full reservation; on revert we burn
+                        // the entire `gas_budget * gas_price` to the
+                        // proposer and report `fuel_used = gas_budget`
+                        // so receipts/block accounting match the gas
+                        // delta. Build a
                         // fresh snapshot off `state` so the
                         // intermediate writes the PTB made are
                         // discarded but the gas debit + proposer
@@ -916,7 +922,7 @@ fn execute_tx_impl(
                         };
                         return ExecOutput {
                             success: false,
-                            fuel_used: charged_fuel,
+                            fuel_used: revert_charged_fuel,
                             return_data: reason.into_bytes(),
                             logs: vec![],
                             write_set: ws_out,
@@ -977,7 +983,7 @@ fn execute_tx_impl(
                             };
                             return ExecOutput {
                                 success: false,
-                                fuel_used: charged_fuel,
+                                fuel_used: revert_charged_fuel,
                                 return_data: format!(
                                     "ptb publish admission error: path '{}' already bound",
                                     event.module_path
@@ -1015,7 +1021,7 @@ fn execute_tx_impl(
                             };
                             return ExecOutput {
                                 success: false,
-                                fuel_used: charged_fuel,
+                                fuel_used: revert_charged_fuel,
                                 return_data: format!(
                                     "ptb upgrade admission error: path '{}' is not bound",
                                     event.module_path
@@ -1055,7 +1061,7 @@ fn execute_tx_impl(
                             };
                             return ExecOutput {
                                 success: false,
-                                fuel_used: charged_fuel,
+                                fuel_used: revert_charged_fuel,
                                 return_data: format!("ptb publish admission error: {e}")
                                     .into_bytes(),
                                 logs: vec![],

@@ -37,7 +37,10 @@ use bloom_chain_types::{
     Hash32,
     digest::{blake3_tagged, tags},
 };
-use bloom_objects::{AbilitySet, AccessMode, Object, ObjectId, Owner, TypeTag};
+use bloom_objects::{
+    AbilitySet, AccessMode, Object, ObjectId, Owner, TypeTag, ValidationOutcome,
+    validate_canonical_bytes,
+};
 
 use crate::borrow_table::BorrowRow;
 use crate::chain_iface::{ArgDeclStub, ChainStateIface, InvariantDeclStub, PetalManifestStub};
@@ -259,6 +262,7 @@ impl<'c> PtbExecutor<'c> {
         self.seed = vtx.tx.signing_digest();
         self.with_ctx(|ctx| {
             ctx.ptb_digest = self.seed;
+            ctx.signers = vtx.tx.signers.clone();
         });
 
         // Track ownership changes for Loom-bearing objects. The
@@ -290,7 +294,7 @@ impl<'c> PtbExecutor<'c> {
                 &vtx.manifests,
                 &mut consumed_use_refs,
             ) {
-                return revert(report, e);
+                return self.revert_report(report, e);
             }
 
             let cmd_outputs = match self.dispatch_command(
@@ -302,7 +306,7 @@ impl<'c> PtbExecutor<'c> {
                 &mut report,
             ) {
                 Ok(o) => o,
-                Err(e) => return revert(report, e),
+                Err(e) => return self.revert_report(report, e),
             };
 
             // Push this command's outputs into the shared ctx so later
@@ -313,14 +317,14 @@ impl<'c> PtbExecutor<'c> {
             });
 
             if let Err(e) = self.with_ctx(|ctx| ctx.borrow_table.diff_check(cmd_idx as u16)) {
-                return revert(report, e);
+                return self.revert_report(report, e);
             }
         }
 
         // Tx-end linearity check.
         let orphans = self.with_ctx(|ctx| ctx.borrow_table.linearity_check());
         if !orphans.is_empty() {
-            return revert(
+            return self.revert_report(
                 report,
                 PtbError::LinearityViolation {
                     orphans: orphans.len(),
@@ -371,6 +375,13 @@ impl<'c> PtbExecutor<'c> {
         report.ownership_changes = ownership_changes;
         report.logs = drained.logs;
         report
+    }
+
+    fn revert_report(&self, report: ExecutionReport, err: PtbError) -> ExecutionReport {
+        self.with_ctx(|ctx| {
+            *ctx = PtbHostCtx::new();
+        });
+        revert(report, err)
     }
 
     // -----------------------------------------------------------------
@@ -458,13 +469,13 @@ impl<'c> PtbExecutor<'c> {
             .manifests
             .get(&hash.0)
             .ok_or(PtbError::PetalNotFound { hash })?;
-        let expected_returns = manifest
+        let f = manifest
             .function(&m.function)
-            .map(|f| f.returns.len())
             .ok_or_else(|| PtbError::UnknownFunction {
                 function: m.function.clone(),
                 petal_hash: hash,
             })?;
+        let expected_returns = f.returns.len();
 
         // Petal call: DO NOT hold the ctx lock here. The wasm host
         // imports (chain_vm.rs) reach back into `ctx` via the same
@@ -516,6 +527,21 @@ impl<'c> PtbExecutor<'c> {
         // Decode the return buffer: same length-prefixed-blobs format
         // as the args, and exactly matching the manifest return arity.
         let outputs = unmarshal_outputs(&result.ret_buf, expected_returns, cmd_idx)?;
+        for (ret_idx, (output, declared)) in outputs.iter().zip(f.returns.iter()).enumerate() {
+            let expected = substitute_type_args(declared, &m.type_args);
+            match validate_canonical_bytes(&expected, output) {
+                ValidationOutcome::Ok | ValidationOutcome::Unknown => {}
+                ValidationOutcome::Invalid(reason) => {
+                    return Err(PtbError::BuiltinFailed {
+                        cmd_idx,
+                        reason: format!(
+                            "Move return slot {ret_idx} does not match declared type {}: {reason}",
+                            type_tag_label(&expected),
+                        ),
+                    });
+                }
+            }
+        }
 
         // Run attached invariants.
         if let Some(f) = manifest.function(&m.function) {
@@ -713,10 +739,8 @@ impl<'c> PtbExecutor<'c> {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&bytes);
             let id = ObjectId(arr);
-            // Read row data + perform the drop (for non-first ids) in
-            // one critical section.
-            let (v, ty, ow, is_first, was_persistent) = self.with_ctx(
-                |ctx| -> Result<(u128, TypeTag, Owner, bool, bool), PtbError> {
+            let (v, ty, ow, is_first, was_persistent, access_mode) = self.with_ctx(
+                |ctx| -> Result<(u128, TypeTag, Owner, bool, bool, AccessMode), PtbError> {
                     let row = ctx
                         .borrow_table
                         .get(&id)
@@ -736,11 +760,9 @@ impl<'c> PtbExecutor<'c> {
                     let ty = row.type_tag.clone();
                     let ow = row.owner.clone();
                     let was_persistent = row.origin_command_idx.is_none();
+                    let access_mode = row.access_mode;
                     let is_first = first_id.is_none();
-                    if !is_first {
-                        ctx.borrow_table.drop_row(&id);
-                    }
-                    Ok((v, ty, ow, is_first, was_persistent))
+                    Ok((v, ty, ow, is_first, was_persistent, access_mode))
                 },
             )?;
             accum = accum
@@ -766,6 +788,16 @@ impl<'c> PtbExecutor<'c> {
                         reason: "MergeCoins: heterogeneous owners".to_string(),
                     });
                 }
+                if was_persistent && access_mode != AccessMode::Consume {
+                    return Err(PtbError::AccessDenied {
+                        id,
+                        mode: access_mode,
+                        reason:
+                            "MergeCoins requires consume access for persistent non-target coins"
+                                .to_string(),
+                    });
+                }
+                self.with_ctx(|ctx| ctx.borrow_table.drop_row(&id));
                 if was_persistent {
                     self.with_ctx(|ctx| ctx.object_deletes.push((id, ow.clone())));
                 }
@@ -895,7 +927,55 @@ fn revert(mut report: ExecutionReport, err: PtbError) -> ExecutionReport {
     report.object_writes.clear();
     report.object_deletes.clear();
     report.ownership_changes.clear();
+    report.publish_events.clear();
+    report.logs.clear();
+    report.command_outputs.clear();
     report
+}
+
+fn substitute_type_args(t: &TypeTag, type_args: &[TypeTag]) -> TypeTag {
+    match t {
+        TypeTag::Generic { idx } => type_args
+            .get(*idx as usize)
+            .cloned()
+            .unwrap_or_else(|| t.clone()),
+        TypeTag::Concrete {
+            petal_hash,
+            type_name,
+            type_args: inner,
+        } => TypeTag::Concrete {
+            petal_hash: *petal_hash,
+            type_name: type_name.clone(),
+            type_args: inner
+                .iter()
+                .map(|x| substitute_type_args(x, type_args))
+                .collect(),
+        },
+        TypeTag::External { .. } => t.clone(),
+    }
+}
+
+fn type_tag_label(t: &TypeTag) -> String {
+    match t {
+        TypeTag::Concrete {
+            type_name,
+            type_args,
+            ..
+        } => {
+            if type_args.is_empty() {
+                type_name.clone()
+            } else {
+                let inner = type_args
+                    .iter()
+                    .map(type_tag_label)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{type_name}<{inner}>")
+            }
+        }
+        TypeTag::Generic { idx } => format!("T{idx}"),
+        TypeTag::External { ref_idx } => format!("$external_{ref_idx}"),
+    }
 }
 
 fn marshal_args(args: &[Arg], command_outputs: &[Vec<Vec<u8>>]) -> Result<Vec<u8>, PtbError> {
@@ -1608,6 +1688,54 @@ mod tests {
     }
 
     #[test]
+    fn move_return_bytes_must_match_declared_primitive_type() {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        chain.put_petal(
+            petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/p".to_string(),
+                functions: vec![FunctionDeclStub {
+                    name: "f".to_string(),
+                    type_params: vec![],
+                    args: vec![],
+                    returns: vec![TypeTag::Concrete {
+                        petal_hash: [0u8; 32],
+                        type_name: "u64".to_string(),
+                        type_args: vec![],
+                    }],
+                    attached_invariants: vec![],
+                }],
+                object_types: vec![],
+                external_type_refs: vec![],
+            },
+        );
+        let mut runner = MockPetalRunner::new();
+        runner.set(petal, "f", build_outputs(&[[0u8; 32].as_slice()]), 7);
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/p".to_string(),
+                    hash: Some(petal),
+                },
+                function: "f".to_string(),
+                type_args: vec![],
+                args: vec![],
+            })],
+        );
+        let report = run(&chain, &runner, tx);
+        assert!(!report.success);
+        assert!(matches!(
+            report.reverted_with,
+            Some(PtbError::BuiltinFailed { ref reason, .. })
+                if reason.contains("declared type u64")
+        ));
+    }
+
+    #[test]
     fn huge_return_count_reverts_without_allocation() {
         let chain = MockChain::new();
         let (petal, signer, gas_id) = build_pkg(&chain);
@@ -2226,7 +2354,7 @@ mod tests {
                         },
                         ArgDeclStub::Object {
                             ty: loom_tt(),
-                            mode: AccessMode::Mutable,
+                            mode: AccessMode::Consume,
                         },
                     ],
                     returns: vec![loom_tt(), loom_tt()],
@@ -2258,7 +2386,7 @@ mod tests {
                         Arg::Object {
                             id: b,
                             expected_version: ExpectedVersion(0),
-                            access_mode: AccessMode::Mutable,
+                            access_mode: AccessMode::Consume,
                         },
                     ],
                 }),
@@ -2288,6 +2416,90 @@ mod tests {
             report.object_deletes,
             vec![(b, Owner::Address(signer))],
             "persistent non-first merge input must be deleted"
+        );
+    }
+
+    #[test]
+    fn merge_coins_rejects_read_only_persistent_non_target() {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        let a = ObjectId([0x25; 32]);
+        let b = ObjectId([0x26; 32]);
+        chain.put_object(make_coin(0x25, signer, 50, 0));
+        chain.put_object(make_coin(0x26, signer, 70, 0));
+        chain.put_petal(
+            petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/p".to_string(),
+                functions: vec![FunctionDeclStub {
+                    name: "load_two".to_string(),
+                    type_params: vec![],
+                    args: vec![
+                        ArgDeclStub::Object {
+                            ty: loom_tt(),
+                            mode: AccessMode::Mutable,
+                        },
+                        ArgDeclStub::Object {
+                            ty: loom_tt(),
+                            mode: AccessMode::ReadOnly,
+                        },
+                    ],
+                    returns: vec![loom_tt(), loom_tt()],
+                    attached_invariants: vec![],
+                }],
+                object_types: vec![],
+                external_type_refs: vec![],
+            },
+        );
+        let mut runner = MockPetalRunner::new();
+        runner.set(petal, "load_two", build_outputs(&[&a.0, &b.0]), 10);
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/p".to_string(),
+                        hash: Some(petal),
+                    },
+                    function: "load_two".to_string(),
+                    type_args: vec![],
+                    args: vec![
+                        Arg::Object {
+                            id: a,
+                            expected_version: ExpectedVersion(0),
+                            access_mode: AccessMode::Mutable,
+                        },
+                        Arg::Object {
+                            id: b,
+                            expected_version: ExpectedVersion(0),
+                            access_mode: AccessMode::ReadOnly,
+                        },
+                    ],
+                }),
+                Command::MergeCoins(vec![
+                    UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    },
+                    UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 1,
+                    },
+                ]),
+            ],
+        );
+        let report = run(&chain, &runner, tx);
+        assert!(!report.success, "report: {report:?}");
+        assert!(matches!(
+            report.reverted_with,
+            Some(PtbError::AccessDenied { ref reason, .. })
+                if reason.contains("MergeCoins requires consume")
+        ));
+        assert!(
+            !report.object_deletes.iter().any(|(id, _)| *id == b),
+            "read-only coin must not be deleted on failed merge"
         );
     }
 

@@ -1296,7 +1296,7 @@ async fn exercise_live_gas_alias_split_merge_and_trap(
                     Arg::Object {
                         id: merge_b_id,
                         expected_version: ExpectedVersion(object_version(merge_b)?),
-                        access_mode: AccessMode::Mutable,
+                        access_mode: AccessMode::Consume,
                     },
                 ],
             }),
@@ -2270,7 +2270,7 @@ fn loom_probe_manifest() -> Vec<u8> {
                         name: "b".to_string(),
                         kind: ArgKind::Object {
                             ty: coin_ty.clone(),
-                            mode: AccessMode::Mutable,
+                            mode: AccessMode::Consume,
                         },
                     },
                 ],

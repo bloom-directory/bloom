@@ -106,6 +106,12 @@ teardown() {
 trap teardown EXIT INT TERM
 
 if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
+    log "running petal DEX package preflight tests"
+    (cd "$REPO_ROOT" && cargo test \
+        -p bloom-dex-math \
+        -p bloom-petal-dex-pool \
+        -p bloom-petal-dex-router)
+
     log "building docker image (bloom-eth:test) — must match current tree"
     (cd "$REPO_ROOT" && "${DC[@]}" -f "$COMPOSE_FILE" build)
 

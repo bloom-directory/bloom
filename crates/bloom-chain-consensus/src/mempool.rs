@@ -12,6 +12,8 @@ use bloom_chain_types::types::Address;
 use crate::error::ConsensusError;
 use crate::verifier::SigVerifier;
 
+const TRANSFER_INTRINSIC_FUEL: u64 = 100;
+
 // ---------------------------------------------------------------------------
 // Key types
 // ---------------------------------------------------------------------------
@@ -137,6 +139,12 @@ impl<V: SigVerifier> Mempool<V> {
             return Err(ConsensusError::InsufficientBalance {
                 need,
                 have: current_balance,
+            });
+        }
+        if matches!(tx.kind, TxKind::Transfer { .. }) && tx.max_fuel < TRANSFER_INTRINSIC_FUEL {
+            return Err(ConsensusError::InsufficientFuel {
+                required: TRANSFER_INTRINSIC_FUEL,
+                got: tx.max_fuel,
             });
         }
 
@@ -438,6 +446,20 @@ mod tests {
         // max_fuel=1000, fee_per_unit=10 → need 10_000
         let err = mp.admit(make_tx(1, 1, 10, 1000), 0, 9_999).unwrap_err();
         assert!(matches!(err, ConsensusError::InsufficientBalance { .. }));
+    }
+
+    #[test]
+    fn reject_transfer_below_intrinsic_fuel() {
+        let mut mp = Mempool::new(NoopVerifier);
+        let err = mp.admit(make_tx(1, 1, 0, 0), 0, 1_000_000).unwrap_err();
+        assert!(matches!(
+            err,
+            ConsensusError::InsufficientFuel {
+                required: TRANSFER_INTRINSIC_FUEL,
+                got: 0
+            }
+        ));
+        assert_eq!(mp.len(), 0);
     }
 
     #[test]

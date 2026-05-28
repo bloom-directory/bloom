@@ -420,6 +420,9 @@ impl ConsensusState {
         if p.proposer != expected_proposer.address {
             return vec![];
         }
+        if p.pol_round >= 0 && p.pol_round as u32 >= p.round {
+            return vec![];
+        }
         // Refuse to prevote a block we have not yet seen. Stash the proposal
         // so the node can replay it once `BlockResponse` (or any other
         // source) registers the missing body — see
@@ -745,6 +748,32 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, Action::Broadcast(ProposalOrVote::Vote(v)) if v.block_hash == Some(hash))));
+    }
+
+    #[test]
+    fn receive_proposal_rejects_current_or_future_pol_round() {
+        let mut sm = ConsensusState::new(1, make_addr(3), make_validator_set());
+        sm.round = 1;
+        let (hash, block) = make_block(0xAB);
+        let mut blocks = BTreeMap::new();
+        blocks.insert(hash, block);
+
+        let proposal = Proposal {
+            height: 1,
+            round: 1,
+            block_hash: hash,
+            pol_round: 1,
+            proposer: make_addr(2), // proposer for (height=1, round=1)
+            sig: SigBytes(vec![]),
+        };
+
+        let actions = sm.handle(Event::ReceiveProposal(proposal), &blocks);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Broadcast(ProposalOrVote::Vote(_)))),
+            "invalid pol_round proposal must not be prevoted"
+        );
     }
 
     #[test]

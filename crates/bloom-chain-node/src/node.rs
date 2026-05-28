@@ -380,7 +380,7 @@ impl Node {
             fuel_limit_cfg,
             Some(signer),
         );
-        reload_persisted_mempool(&mut engine, &shared_state, &mempool_persist)
+        reload_persisted_mempool(&mut engine, &shared_state, &mempool_persist, &chain_id)
             .context("reload persisted mempool")?;
 
         // ── 4. Channels ───────────────────────────────────────────────────────
@@ -486,7 +486,13 @@ impl Node {
                         .map(|coin_type| coin_loom_balance(&state, tx.sender, &coin_type))
                         .unwrap_or(0);
                     drop(state);
-                    let result = eng.submit_tx(tx.clone(), nonce, balance);
+                    let result = submit_tx_for_chain(
+                        &mut eng,
+                        tx.clone(),
+                        nonce,
+                        balance,
+                        &driver_tx.chain_id,
+                    );
                     drop(eng);
                     result
                 };
@@ -557,7 +563,18 @@ impl Node {
                             let block_opt =
                                 { driver_ev.engine.lock().get_registered_block(&p.block_hash) };
                             if let Some(block) = block_opt {
-                                let header_round = proposal_header_round(p.round, p.pol_round);
+                                let Some(header_round) =
+                                    proposal_header_round(p.round, p.pol_round)
+                                else {
+                                    warn!(
+                                        peer = %peer_addr,
+                                        height = p.height,
+                                        round = p.round,
+                                        pol_round = p.pol_round,
+                                        "frame.proposal rejected: invalid pol_round"
+                                    );
+                                    continue;
+                                };
                                 if let Err(e) = driver_ev.validate_proposal_block(
                                     &block,
                                     p.height,
@@ -647,7 +664,13 @@ impl Node {
                                     })
                                     .unwrap_or(0)
                             };
-                            eng.submit_tx(tx.clone(), nonce, balance)
+                            submit_tx_for_chain(
+                                &mut eng,
+                                tx.clone(),
+                                nonce,
+                                balance,
+                                &driver_ev.chain_id,
+                            )
                         };
                         if let Err(e) = admitted {
                             // The gossiping peer admitted this tx, so they
@@ -1213,6 +1236,7 @@ fn reload_persisted_mempool(
     engine: &mut ConsensusEngine<XdsaVerifier>,
     state: &Arc<Mutex<State>>,
     mempool_persist: &MempoolPersist,
+    chain_id: &str,
 ) -> Result<()> {
     let txs = mempool_persist.load_all()?;
     if txs.is_empty() {
@@ -1229,7 +1253,7 @@ fn reload_persisted_mempool(
                 .unwrap_or(0);
             (nonce, balance)
         };
-        match engine.submit_tx(tx.clone(), nonce, balance) {
+        match submit_tx_for_chain(engine, tx.clone(), nonce, balance, chain_id) {
             Ok(()) => admitted += 1,
             Err(e) => {
                 purged += 1;
@@ -1246,6 +1270,22 @@ fn reload_persisted_mempool(
     let _ = mempool_persist.flush();
     info!(admitted, purged, "mempool.reload complete");
     Ok(())
+}
+
+fn submit_tx_for_chain(
+    engine: &mut ConsensusEngine<XdsaVerifier>,
+    tx: bloom_chain_types::tx::Tx,
+    current_nonce: u64,
+    current_balance: u128,
+    chain_id: &str,
+) -> Result<(), bloom_chain_consensus::error::ConsensusError> {
+    if tx.chain_id != chain_id {
+        return Err(bloom_chain_consensus::error::ConsensusError::WrongChainId {
+            expected: chain_id.to_string(),
+            got: tx.chain_id,
+        });
+    }
+    engine.submit_tx(tx, current_nonce, current_balance)
 }
 
 fn prune_committed_mempool_persist(
@@ -1267,11 +1307,15 @@ fn prune_committed_mempool_persist(
     }
 }
 
-fn proposal_header_round(proposal_round: u32, pol_round: i32) -> u32 {
+fn proposal_header_round(proposal_round: u32, pol_round: i32) -> Option<u32> {
     if pol_round >= 0 {
-        return pol_round as u32;
+        let pol_round = pol_round as u32;
+        if pol_round >= proposal_round {
+            return None;
+        }
+        return Some(pol_round);
     }
-    proposal_round
+    Some(proposal_round)
 }
 
 fn block_response_header_round(
@@ -1283,7 +1327,7 @@ fn block_response_header_round(
     if let Some(pending) = engine.state.pending_proposal.as_ref()
         && pending.block_hash == block_hash
     {
-        return Some(proposal_header_round(pending.round, pending.pol_round));
+        return proposal_header_round(pending.round, pending.pol_round);
     }
     if let Some((valid_round, valid_hash)) = engine.state.valid_block
         && valid_hash == block_hash
@@ -1601,6 +1645,35 @@ mod tests {
     }
 
     #[test]
+    fn submit_tx_for_chain_rejects_wrong_chain_id_before_mempool() {
+        let (sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
+        let mut tx = signed_transfer_tx(&sk, &pk);
+        tx.chain_id = "other-chain".into();
+        let digest = tx.signing_digest();
+        tx.sig = SigBytes(sk.sign(&digest.0).to_bytes());
+
+        let v = make_validator_with_keypair();
+        let validator_set = make_validator_set_signed(&[&v], 100);
+        let mut engine = ConsensusEngine::new(
+            1,
+            v.addr,
+            validator_set,
+            XdsaVerifier,
+            None,
+            30_000_000,
+            None,
+        );
+
+        let err = submit_tx_for_chain(&mut engine, tx, 0, 1_000_000, "bloomchain.test")
+            .expect_err("wrong-chain tx must be rejected");
+        assert!(matches!(
+            err,
+            bloom_chain_consensus::error::ConsensusError::WrongChainId { .. }
+        ));
+        assert_eq!(engine.mempool.len(), 0);
+    }
+
+    #[test]
     fn reload_persisted_mempool_re_admits_valid_tx() {
         let tmp = tempfile::tempdir().unwrap();
         let mempool_persist = MempoolPersist::open(&tmp.path().join("mempool.sled")).unwrap();
@@ -1648,7 +1721,13 @@ mod tests {
             None,
         );
 
-        reload_persisted_mempool(&mut engine, &shared_state, &mempool_persist).unwrap();
+        reload_persisted_mempool(
+            &mut engine,
+            &shared_state,
+            &mempool_persist,
+            "bloomchain.test",
+        )
+        .unwrap();
         assert_eq!(engine.mempool.len(), 1);
     }
 
@@ -1719,7 +1798,14 @@ mod tests {
 
         let header_round = proposal_header_round(2, 0);
 
-        assert_eq!(header_round, 0);
+        assert_eq!(header_round, Some(0));
+    }
+
+    #[test]
+    fn proposal_header_round_rejects_future_or_current_pol_round() {
+        assert_eq!(proposal_header_round(1, 1), None);
+        assert_eq!(proposal_header_round(1, 999), None);
+        assert_eq!(proposal_header_round(1, 0), Some(0));
     }
 
     fn test_block(height: u64, parent_hash: Hash32) -> Block {
