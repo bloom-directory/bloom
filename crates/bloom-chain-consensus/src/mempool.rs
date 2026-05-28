@@ -105,7 +105,13 @@ impl<V: SigVerifier> Mempool<V> {
         // 3. Balance check: sender must cover max_fuel * fee_per_unit + optional value.
         let fee_reservation = (tx.max_fuel as u128).saturating_mul(tx.fee_per_unit as u128);
         let value = tx_value(&tx);
-        let need = fee_reservation.saturating_add(value);
+        let need =
+            fee_reservation
+                .checked_add(value)
+                .ok_or(ConsensusError::InsufficientBalance {
+                    need: u128::MAX,
+                    have: current_balance,
+                })?;
         if current_balance < need {
             return Err(ConsensusError::InsufficientBalance {
                 need,

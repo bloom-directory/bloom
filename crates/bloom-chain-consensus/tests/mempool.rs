@@ -85,6 +85,21 @@ fn reject_insufficient_balance_with_value() {
 }
 
 #[test]
+fn reject_transfer_reservation_overflow() {
+    let mut mp = Mempool::new(NoopVerifier);
+    let err = mp
+        .admit(make_mempool_tx(1, 1, 1, 1, u128::MAX), 0, u128::MAX)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        ConsensusError::InsufficientBalance {
+            need: u128::MAX,
+            have: u128::MAX
+        }
+    ));
+}
+
+#[test]
 fn reject_invalid_signature() {
     let mut mp = Mempool::new(RejectAllVerifier);
     let err = mp

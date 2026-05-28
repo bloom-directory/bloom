@@ -532,7 +532,7 @@ impl ConsensusState {
                         .prevotes
                         .get(&v.round)
                         .and_then(|t| t.quorum_hash(quorum))
-                    && self.valid_block.map(|(r, _)| r).unwrap_or(0) < v.round
+                    && self.valid_block.map(|(r, _)| r < v.round).unwrap_or(true)
                 {
                     self.valid_block = Some((v.round, hash));
                 }
@@ -802,5 +802,29 @@ mod tests {
         assert_eq!(commit.votes[0].validator, make_addr(0));
         assert_eq!(commit.votes[1].validator, make_addr(1));
         assert_eq!(commit.votes[2].validator, make_addr(2));
+    }
+
+    #[test]
+    fn late_round_zero_polka_records_valid_block() {
+        let mut sm = ConsensusState::new(1, make_addr(0), make_validator_set());
+        sm.round = 1;
+        sm.step = Step::Propose;
+        let (hash, block) = make_block(0xDD);
+        let mut blocks = BTreeMap::new();
+        blocks.insert(hash, block);
+        let vote = |seed| Vote {
+            height: 1,
+            round: 0,
+            kind: VoteKind::Prevote,
+            block_hash: Some(hash),
+            validator: make_addr(seed),
+            sig: SigBytes(vec![seed]),
+        };
+
+        assert!(sm.handle(Event::ReceiveVote(vote(0)), &blocks).is_empty());
+        assert!(sm.handle(Event::ReceiveVote(vote(1)), &blocks).is_empty());
+        assert!(sm.handle(Event::ReceiveVote(vote(2)), &blocks).is_empty());
+
+        assert_eq!(sm.valid_block, Some((0, hash)));
     }
 }

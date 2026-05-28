@@ -409,8 +409,15 @@ impl<'c> PtbExecutor<'c> {
                 id, access_mode, ..
             } = arg
             {
-                let already = self.with_ctx(|ctx| ctx.borrow_table.get(id).is_some());
-                if !already {
+                let loaded = self.with_ctx(|ctx| {
+                    if let Some(row) = ctx.borrow_table.get_mut(id) {
+                        row.access_mode = *access_mode;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if !loaded {
                     let obj = vtx
                         .objects
                         .get(&id.0)
@@ -551,6 +558,14 @@ impl<'c> PtbExecutor<'c> {
                     .borrow_table
                     .get_mut(&id)
                     .ok_or(PtbError::ObjectNotFound { id })?;
+                if row.origin_command_idx.is_none() && row.access_mode != AccessMode::Consume {
+                    return Err(PtbError::AccessDenied {
+                        id,
+                        mode: AccessMode::Consume,
+                        reason: "TransferObjects requires consume access for persistent objects"
+                            .to_string(),
+                    });
+                }
                 let old = row.owner.clone();
                 row.owner = owner.clone();
                 ctx.borrow_table.mark_consumed(&id);
@@ -1697,7 +1712,7 @@ mod tests {
                     type_params: vec![],
                     args: vec![ArgDeclStub::Object {
                         ty: non_coin_tt(),
-                        mode: AccessMode::Mutable,
+                        mode: AccessMode::Consume,
                     }],
                     returns: vec![non_coin_tt()],
                     attached_invariants: vec![],
@@ -1722,7 +1737,7 @@ mod tests {
                     args: vec![Arg::Object {
                         id: src_id,
                         expected_version: ExpectedVersion(0),
-                        access_mode: AccessMode::Mutable,
+                        access_mode: AccessMode::Consume,
                     }],
                 }),
                 Command::SplitCoins {
@@ -1759,7 +1774,7 @@ mod tests {
                     type_params: vec![],
                     args: vec![ArgDeclStub::Object {
                         ty: loom_tt(),
-                        mode: AccessMode::Mutable,
+                        mode: AccessMode::Consume,
                     }],
                     returns: vec![loom_tt()],
                     attached_invariants: vec![],
@@ -1786,7 +1801,7 @@ mod tests {
                     args: vec![Arg::Object {
                         id: coin_id,
                         expected_version: ExpectedVersion(0),
-                        access_mode: AccessMode::Mutable,
+                        access_mode: AccessMode::Consume,
                     }],
                 }),
                 Command::TransferObjects {
@@ -1810,6 +1825,70 @@ mod tests {
             "ownership_changes: {:?}",
             report.ownership_changes
         );
+    }
+
+    #[test]
+    fn transfer_objects_rejects_persistent_read_only_row() {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        let coin_id = ObjectId([0xD1; 32]);
+        chain.put_object(make_coin(0xD1, signer, 100, 0));
+        chain.put_petal(
+            petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/p".to_string(),
+                functions: vec![FunctionDeclStub {
+                    name: "load".to_string(),
+                    type_params: vec![],
+                    args: vec![ArgDeclStub::Object {
+                        ty: loom_tt(),
+                        mode: AccessMode::ReadOnly,
+                    }],
+                    returns: vec![loom_tt()],
+                    attached_invariants: vec![],
+                }],
+                object_types: vec![],
+                external_type_refs: vec![],
+            },
+        );
+        let mut runner = MockPetalRunner::new();
+        runner.set(petal, "load", build_outputs(&[&coin_id.0]), 10);
+
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/p".to_string(),
+                        hash: Some(petal),
+                    },
+                    function: "load".to_string(),
+                    type_args: vec![],
+                    args: vec![Arg::Object {
+                        id: coin_id,
+                        expected_version: ExpectedVersion(0),
+                        access_mode: AccessMode::ReadOnly,
+                    }],
+                }),
+                Command::TransferObjects {
+                    uses: vec![UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    }],
+                    owner: Owner::Address([0x22; 32]),
+                },
+            ],
+        );
+
+        let report = run(&chain, &runner, tx);
+        assert!(!report.success, "report: {report:?}");
+        assert!(matches!(
+            report.reverted_with,
+            Some(PtbError::AccessDenied { ref reason, .. })
+                if reason.contains("TransferObjects requires consume")
+        ));
     }
 
     #[test]
@@ -2209,6 +2288,8 @@ mod tests {
     /// object row when its `call(...)` body runs, then optionally
     /// inserts a host-created object into the borrow table to simulate
     /// the `object.create` host import.
+    type HostMutations = HashMap<String, Vec<(ObjectId, Vec<u8>)>>;
+
     struct AssertingRunner<'a> {
         ctx: Arc<Mutex<PtbHostCtx>>,
         expect_preloaded: Vec<ObjectId>,
@@ -2219,6 +2300,9 @@ mod tests {
         /// `created_objects`. We thread the cell so the runner can
         /// pop a Vec per call without taking &mut self.
         host_creates: std::cell::RefCell<HashMap<String, Vec<Object>>>,
+        /// On a call to this function name, simulate `object.mutate` on
+        /// preloaded rows.
+        host_mutates: std::cell::RefCell<HostMutations>,
         /// Verifies that calling the runner does NOT find a held lock
         /// in the ctx mutex (i.e. the executor released it).
         try_lock_must_succeed: std::cell::Cell<bool>,
@@ -2232,6 +2316,7 @@ mod tests {
                 expect_preloaded: Vec::new(),
                 canned: HashMap::new(),
                 host_creates: std::cell::RefCell::new(HashMap::new()),
+                host_mutates: std::cell::RefCell::new(HashMap::new()),
                 try_lock_must_succeed: std::cell::Cell::new(false),
                 _life: std::marker::PhantomData,
             }
@@ -2268,6 +2353,13 @@ mod tests {
                         g.borrow_table.get(id).is_some(),
                         "preloaded object {id:?} not visible to host import"
                     );
+                }
+            }
+            // Simulate `object.mutate` host import.
+            if let Some(mutations) = self.host_mutates.borrow_mut().remove(function) {
+                let mut g = self.ctx.lock().unwrap();
+                for (id, payload) in mutations {
+                    g.borrow_table.mark_dirty(&id, payload)?;
                 }
             }
             // Test #2: simulate `object.create` host import.
@@ -2393,6 +2485,100 @@ mod tests {
         );
         let report = exec.execute(validated);
         assert!(report.success, "report: {report:?}");
+    }
+
+    #[test]
+    fn repeated_move_object_arg_uses_current_command_access_mode() {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        let obj_id = ObjectId([0xA7; 32]);
+        chain.put_object(make_non_coin_resource(0xA7, signer, 1, 0));
+        chain.put_petal(
+            petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/p".to_string(),
+                functions: vec![
+                    FunctionDeclStub {
+                        name: "mut".to_string(),
+                        type_params: vec![],
+                        args: vec![ArgDeclStub::Object {
+                            ty: non_coin_tt(),
+                            mode: AccessMode::Mutable,
+                        }],
+                        returns: vec![],
+                        attached_invariants: vec![],
+                    },
+                    FunctionDeclStub {
+                        name: "ro".to_string(),
+                        type_params: vec![],
+                        args: vec![ArgDeclStub::Object {
+                            ty: non_coin_tt(),
+                            mode: AccessMode::ReadOnly,
+                        }],
+                        returns: vec![],
+                        attached_invariants: vec![],
+                    },
+                ],
+                object_types: vec![],
+                external_type_refs: vec![],
+            },
+        );
+
+        let ctx = Arc::new(Mutex::new(PtbHostCtx::new()));
+        let mut runner = AssertingRunner::new(Arc::clone(&ctx));
+        runner.set("mut", build_outputs(&[]), 5);
+        runner.set("ro", build_outputs(&[]), 5);
+        runner
+            .host_mutates
+            .borrow_mut()
+            .insert("ro".to_string(), vec![(obj_id, vec![0xFF; 48])]);
+
+        let obj_arg = |access_mode| Arg::Object {
+            id: obj_id,
+            expected_version: ExpectedVersion(0),
+            access_mode,
+        };
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/p".to_string(),
+                        hash: Some(petal),
+                    },
+                    function: "mut".to_string(),
+                    type_args: vec![],
+                    args: vec![obj_arg(AccessMode::Mutable)],
+                }),
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/p".to_string(),
+                        hash: Some(petal),
+                    },
+                    function: "ro".to_string(),
+                    type_args: vec![],
+                    args: vec![obj_arg(AccessMode::ReadOnly)],
+                }),
+            ],
+        );
+
+        let verifier = AlwaysOkVerifier;
+        let vctx = ValidationContext {
+            current_block: chain.block,
+            chain: &chain,
+            verifier: &verifier,
+            loom_coin_type: loom_tt(),
+        };
+        let validated = validate_ptb(&tx, &vctx).unwrap();
+        let mut exec = PtbExecutor::with_ctx_arc(&chain, &runner, loom_tt(), Hash32([0; 32]), ctx);
+        let report = exec.execute(validated);
+        assert!(!report.success, "report: {report:?}");
+        assert!(matches!(
+            report.reverted_with,
+            Some(PtbError::IllegalMutation { id, .. }) if id == obj_id
+        ));
     }
 
     /// P1-1 conformance: an object created by a host import inside a

@@ -676,6 +676,51 @@ fn proposal_validation_accepts_valid_block_from_polka_round() {
 }
 
 #[test]
+fn apply_validation_accepts_commit_after_valid_block_reproposal() {
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
+    let height = 5;
+    let original_round = 0;
+    let commit_round = 1;
+    let mut block = BlockBuilder::at(height)
+        .chain_id("bloom-chain.v0")
+        .parent_hash(Hash32([0x42; 32]))
+        .proposer(vset.proposer_for(height, original_round).address)
+        .with_computed_roots(&vset)
+        .signed_by(&[&v1, &v2, &v3])
+        .build();
+
+    block.commit.round = commit_round;
+    for (vote, signer) in block
+        .commit
+        .votes
+        .iter_mut()
+        .zip([&v1, &v2, &v3].into_iter())
+    {
+        vote.round = commit_round;
+        let digest = vote.signing_digest();
+        vote.sig = XdsaSigner::new(Arc::clone(&signer.sk)).sign(&digest.0);
+    }
+
+    let result = validate_block_for_apply(
+        &block,
+        height,
+        "bloom-chain.v0",
+        Hash32([0x42; 32]),
+        &vset,
+        &XdsaVerifier,
+    );
+
+    assert!(
+        result.is_ok(),
+        "later-round commit for a round-0 valid block must pass apply validation: {result:?}"
+    );
+}
+
+#[test]
 fn commit_with_votes_from_different_rounds_is_rejected() {
     // Tendermint safety: 2f+1 must come from a single (height, round)
     // tuple. On master, the validation boundary only checked

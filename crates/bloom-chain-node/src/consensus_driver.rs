@@ -325,12 +325,12 @@ pub fn validate_block_for_apply(
 
     let block_hash = h.block_hash();
     let commit = &block.commit;
-    let expected_proposer = validator_set.proposer_for(h.height, commit.round).address;
-    if h.proposer != expected_proposer {
+    let proposer_matches_proposal_round = (0..=commit.round)
+        .any(|round| validator_set.proposer_for(h.height, round).address == h.proposer);
+    if !proposer_matches_proposal_round {
         return Err(format!(
-            "header.proposer={} != expected proposer={} for height={} round={}",
+            "header.proposer={} is not a proposer for height={} in rounds 0..={}",
             hex::encode(h.proposer.0),
-            hex::encode(expected_proposer.0),
             h.height,
             commit.round
         ));
