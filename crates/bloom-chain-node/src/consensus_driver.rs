@@ -576,6 +576,19 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
     block: &Block,
     block_emission: u128,
 ) -> (u64, Vec<Receipt>) {
+    try_apply_block_state_transitions(state, executor, block, block_emission)
+        .expect("block state transition failed")
+}
+
+/// Fallible form of [`apply_block_state_transitions`]. This is the consensus
+/// validation path: apply failures reject the block/transition instead of
+/// being logged and ignored.
+pub fn try_apply_block_state_transitions<E: PetalExecutor>(
+    state: &mut State,
+    executor: &E,
+    block: &Block,
+    block_emission: u128,
+) -> std::result::Result<(u64, Vec<Receipt>), String> {
     let proposer = block.header.proposer;
     let height = block.header.height;
     let timestamp_ms = block.header.timestamp_ms;
@@ -598,8 +611,6 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
             });
             continue;
         }
-        state.register_pubkey(tx.sender, tx.pubkey.clone());
-
         // 2. Nonce check — tx.nonce must equal sender.nonce + 1 (strict
         //    next-nonce ordering).  Without this, a tx accidentally
         //    re-included in a later block would silently re-apply.
@@ -644,9 +655,12 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
                     // Bump nonce so a re-submission can advance, mirroring
                     // the policy below for the executor-side decode revert
                     // (sender already passed sender-derivation + nonce).
-                    let mut acct = sender_acct.unwrap_or_else(empty_account);
+                    let mut tx_state = state.clone();
+                    tx_state.register_pubkey(tx.sender, tx.pubkey.clone());
+                    let mut acct = sender_acct.clone().unwrap_or_else(empty_account);
                     acct.nonce += 1;
-                    state.set_account(tx.sender, acct);
+                    tx_state.set_account(tx.sender, acct);
+                    *state = tx_state;
                     receipts.push(Receipt {
                         tx_hash: tx.tx_hash(),
                         success: false,
@@ -660,9 +674,12 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
                     let outer_max_fuel_ok = tx.max_fuel >= ptb.gas_budget;
                     let outer_price_ok = (tx.fee_per_unit as u128) >= ptb.gas_price;
                     if !outer_max_fuel_ok || !outer_price_ok {
-                        let mut acct = sender_acct.unwrap_or_else(empty_account);
+                        let mut tx_state = state.clone();
+                        tx_state.register_pubkey(tx.sender, tx.pubkey.clone());
+                        let mut acct = sender_acct.clone().unwrap_or_else(empty_account);
                         acct.nonce += 1;
-                        state.set_account(tx.sender, acct);
+                        tx_state.set_account(tx.sender, acct);
+                        *state = tx_state;
                         let reason = format!(
                             "outer/inner gas cap mismatch: \
                              tx.max_fuel={} ptb.gas_budget={} \
@@ -681,29 +698,39 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
                 }
             }
 
+            let mut tx_state = state.clone();
+            tx_state.register_pubkey(tx.sender, tx.pubkey.clone());
+
             // Bump nonce; sender's loom stays put.
             {
-                let mut acct = sender_acct.unwrap_or_else(empty_account);
+                let mut acct = sender_acct.clone().unwrap_or_else(empty_account);
                 acct.nonce += 1;
-                state.set_account(tx.sender, acct);
+                tx_state.set_account(tx.sender, acct);
             }
 
             // 4. Execute via PetalExecutor. All gas settlement
             //    (gas-payer Coin<LOOM> debit + refund + proposer
             //    credit) lives in the executor's WriteSet.
-            let output =
-                executor.execute_tx(tx, state, height, timestamp_ms, proposer, parent_hash);
+            let output = executor.execute_tx(
+                tx,
+                &mut tx_state,
+                height,
+                timestamp_ms,
+                proposer,
+                parent_hash,
+            );
 
             // Apply whatever the executor produced. On revert the
             // executor still emits a write_set that carries the
             // burnt-gas accounting (gas-payer debit + proposer
             // credit), so we apply it unconditionally rather than
             // gating on `output.success`.
-            if let Some(ws) = output.write_set
-                && let Err(e) = state.apply(ws)
-            {
-                warn!(err = %e, "apply write_set failed (SubmitPtb)");
+            if let Some(ws) = output.write_set {
+                tx_state
+                    .apply(ws)
+                    .map_err(|e| format!("apply write_set failed (SubmitPtb): {e}"))?;
             }
+            *state = tx_state;
 
             total_fuel_used += output.fuel_used;
             receipts.push(Receipt {
@@ -759,22 +786,34 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
             continue;
         }
 
+        let mut tx_state = state.clone();
+        tx_state.register_pubkey(tx.sender, tx.pubkey.clone());
+
         // Bump nonce after Coin<LOOM> admission. Value and gas are settled by
-        // object writes, not by account balance fields.
+        // object writes, not by account balance fields. Stage this on a
+        // candidate state so fee settlement can fail without publishing
+        // non-PTB effects.
         {
             let mut acct = sender_acct.unwrap_or_else(empty_account);
             acct.nonce += 1;
-            state.set_account(tx.sender, acct);
+            tx_state.set_account(tx.sender, acct);
         }
 
         // 4. Execute via PetalExecutor.
-        let output = executor.execute_tx(tx, state, height, timestamp_ms, proposer, parent_hash);
+        let output = executor.execute_tx(
+            tx,
+            &mut tx_state,
+            height,
+            timestamp_ms,
+            proposer,
+            parent_hash,
+        );
 
         if output.success {
-            if let Some(ws) = output.write_set
-                && let Err(e) = state.apply(ws)
-            {
-                warn!(err = %e, "apply write_set failed");
+            if let Some(ws) = output.write_set.clone() {
+                tx_state
+                    .apply(ws)
+                    .map_err(|e| format!("apply write_set failed: {e}"))?;
             }
         } else {
             // Failed non-PTB txs forfeit the full max fee. Value was never
@@ -788,7 +827,7 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
             max_fee
         };
         if fee_charged > 0 {
-            let mut fee_snap = state.snapshot();
+            let mut fee_snap = tx_state.snapshot();
             if let Err(e) = apply_coin_loom_transfer_with_domain(
                 &mut fee_snap,
                 tx.sender,
@@ -798,20 +837,14 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
                 coin_type,
                 b"bloom.non_ptb.fee",
             ) {
-                warn!(err = %e, "non-PTB fee settlement failed");
-                receipts.push(Receipt {
-                    tx_hash: tx.tx_hash(),
-                    success: false,
-                    fuel_used: 0,
-                    return_data: format!("fee settlement failed: {e}").into_bytes(),
-                    logs: vec![],
-                });
-                continue;
+                return Err(format!("non-PTB fee settlement failed: {e}"));
             }
-            if let Err(e) = state.apply(fee_snap.commit()) {
-                warn!(err = %e, "apply fee write_set failed");
-            }
+            tx_state
+                .apply(fee_snap.commit())
+                .map_err(|e| format!("apply fee write_set failed: {e}"))?;
         }
+
+        *state = tx_state;
 
         total_fuel_used += output.fuel_used;
 
@@ -845,13 +878,15 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
             &emission_seed,
             coin_type,
         ) {
-            warn!(err = %e, "block emission mint failed");
-        } else if let Err(e) = state.apply(snap.commit()) {
-            warn!(err = %e, "apply block emission write_set failed");
+            return Err(format!("block emission mint failed: {e}"));
+        } else {
+            state
+                .apply(snap.commit())
+                .map_err(|e| format!("apply block emission write_set failed: {e}"))?;
         }
     }
 
-    (total_fuel_used, receipts)
+    Ok((total_fuel_used, receipts))
 }
 
 /// Result of deterministic block execution on a scratch state.
@@ -886,7 +921,7 @@ pub fn validate_block_execution<E: PetalExecutor>(
 
     let mut scratch = pre_state.clone();
     let (fuel_used, receipts) =
-        apply_block_state_transitions(&mut scratch, executor, block, block_emission);
+        try_apply_block_state_transitions(&mut scratch, executor, block, block_emission)?;
     if fuel_used > block.header.fuel_limit {
         return Err(format!(
             "executed fuel_used {} exceeds header.fuel_limit {}",

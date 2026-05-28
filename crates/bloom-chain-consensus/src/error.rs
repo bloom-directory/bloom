@@ -31,6 +31,9 @@ pub enum ConsensusError {
     #[error("address mismatch: pubkey does not hash to sender")]
     AddressMismatch,
 
+    #[error("invalid SubmitPtb: {0}")]
+    InvalidSubmitPtb(String),
+
     // --- State machine errors ---
     #[error("vote is for wrong height (expected {expected}, got {got})")]
     WrongHeight { expected: u64, got: u64 },

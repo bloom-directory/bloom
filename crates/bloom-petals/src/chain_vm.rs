@@ -551,6 +551,9 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                 // Coalesce repeat borrows of the same object. (The
                 // linear-move promotion above already ran against the
                 // row, so reusing a prior command's handle is safe.)
+                if ctx.is_handle_retired(&id) {
+                    return HostError::Invalid("handle retired".into()).as_wasm_code();
+                }
                 if let Some(existing) = ctx.handle_for(&id) {
                     return existing;
                 }
@@ -880,6 +883,7 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                         row.owner = new_owner.clone();
                         ctx.ownership_changes.push((id, old_owner, new_owner));
                         ctx.borrow_table.mark_consumed(&id);
+                        ctx.retire_handles_for(&id);
                         0
                     }
                     None => HostError::NotFound("row vanished".into()).as_wasm_code(),
@@ -919,6 +923,7 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                     row.owner = Owner::Shared;
                     ctx.ownership_changes.push((id, old_owner, Owner::Shared));
                     ctx.borrow_table.mark_consumed(&id);
+                    ctx.retire_handles_for(&id);
                     0
                 }
                 None => HostError::NotFound("row vanished".into()).as_wasm_code(),
@@ -958,6 +963,7 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                     ctx.ownership_changes
                         .push((id, old_owner, Owner::Immutable));
                     ctx.borrow_table.mark_consumed(&id);
+                    ctx.retire_handles_for(&id);
                     0
                 }
                 None => HostError::NotFound("row vanished".into()).as_wasm_code(),
@@ -1024,6 +1030,7 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                 }
                 ctx.object_deletes.push((id, old_owner));
                 ctx.borrow_table.drop_row(&id);
+                ctx.retire_handles_for(&id);
                 0
             })
         },
@@ -1314,10 +1321,10 @@ fn with_ptb_ctx_payload(
 }
 
 /// Derive a deterministic transient `ObjectId` for an `object.create`
-/// call. The recipe (BLAKE3 of caller petal hash + ptb-scope counter +
-/// type-tag bytes + payload bytes) makes the id reproducible across
-/// validator replays of the same PTB without depending on the engine's
-/// internal bookkeeping.
+/// call. The recipe (BLAKE3 of PTB digest + caller petal hash +
+/// ptb-scope counter + type-tag bytes + payload bytes) makes the id
+/// reproducible across validator replays of the same PTB while avoiding
+/// collisions between different PTBs that create identical objects.
 fn derive_create_id(
     caller: &Caller<'_, ChainStoreData>,
     type_tag_bytes: &[u8],
@@ -1325,15 +1332,20 @@ fn derive_create_id(
 ) -> ObjectId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bloom.object.create.v1\0");
-    hasher.update(&caller.data().petal_hash.0);
-    // Mix in the PTB ctx's "created so far" length for per-call
-    // uniqueness within a single PTB.
-    let n = caller
+    let (ptb_digest, n) = caller
         .data()
         .ptb_ctx
         .as_ref()
-        .and_then(|arc| arc.lock().ok().map(|c| c.created_objects.len()))
-        .unwrap_or(0) as u64;
+        .and_then(|arc| {
+            arc.lock()
+                .ok()
+                .map(|c| (c.ptb_digest, c.created_objects.len() as u64))
+        })
+        .unwrap_or(([0u8; 32], 0));
+    hasher.update(&ptb_digest);
+    hasher.update(&caller.data().petal_hash.0);
+    // Mix in the PTB ctx's "created so far" length for per-call
+    // uniqueness within a single PTB.
     hasher.update(&n.to_be_bytes());
     hasher.update(type_tag_bytes);
     hasher.update(payload);
@@ -2001,6 +2013,44 @@ mod ptb_host_import_tests {
         assert_eq!(*new, Owner::Address([0xbb; 32]));
     }
 
+    fn run_reuse_after_terminal_op(wat: &str, access_mode: AccessMode) -> i32 {
+        let wasm = parse(wat);
+        let petal = blake3_tagged(tags::PETAL, &wasm);
+        let mut ctx = PtbHostCtx::new();
+        let obj = make_object(0x07, vec![1], Owner::Address([0xaa; 32]), petal.0);
+        ctx.borrow_table.load_persistent(&obj, access_mode);
+        let out = run_with(wasm, Arc::new(Mutex::new(ctx)), petal);
+        i32::from_le_bytes(out.return_data.unwrap().try_into().unwrap())
+    }
+
+    const OBJECT_TRANSFER_THEN_ID: &str = r#"
+(module
+  (import "object" "borrow"   (func $bo (param i32 i32) (result i32)))
+  (import "object" "transfer" (func $tr (param i32 i32 i32 i32) (result i32)))
+  (import "object" "id"       (func $id (param i32 i32) (result i32)))
+  (import "chain" "petal.return" (func $ret (param i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07")
+  (data (i32.const 32) "\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb\bb")
+  (func (export "call") (param i32 i32) (result i32)
+    (local $h i32) (local $r i32)
+    (local.set $h (call $bo (i32.const 0) (i32.const 1)))
+    (drop (call $tr (local.get $h) (i32.const 0) (i32.const 32) (i32.const 32)))
+    (local.set $r (call $id (local.get $h) (i32.const 96)))
+    (i32.store (i32.const 160) (local.get $r))
+    (call $ret (i32.const 160) (i32.const 4))
+    i32.const 0)
+)
+"#;
+
+    #[test]
+    fn transferred_handle_cannot_be_reused() {
+        assert_eq!(
+            run_reuse_after_terminal_op(OBJECT_TRANSFER_THEN_ID, AccessMode::Mutable),
+            -3
+        );
+    }
+
     // -----------------------------------------------------------------------
     // object.share switches owner to Owner::Shared.
     // -----------------------------------------------------------------------
@@ -2042,6 +2092,33 @@ mod ptb_host_import_tests {
         );
     }
 
+    const OBJECT_SHARE_THEN_ID: &str = r#"
+(module
+  (import "object" "borrow" (func $bo (param i32 i32) (result i32)))
+  (import "object" "share"  (func $sh (param i32) (result i32)))
+  (import "object" "id"     (func $id (param i32 i32) (result i32)))
+  (import "chain" "petal.return" (func $ret (param i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07")
+  (func (export "call") (param i32 i32) (result i32)
+    (local $h i32) (local $r i32)
+    (local.set $h (call $bo (i32.const 0) (i32.const 1)))
+    (drop (call $sh (local.get $h)))
+    (local.set $r (call $id (local.get $h) (i32.const 64)))
+    (i32.store (i32.const 128) (local.get $r))
+    (call $ret (i32.const 128) (i32.const 4))
+    i32.const 0)
+)
+"#;
+
+    #[test]
+    fn shared_handle_cannot_be_reused() {
+        assert_eq!(
+            run_reuse_after_terminal_op(OBJECT_SHARE_THEN_ID, AccessMode::Mutable),
+            -3
+        );
+    }
+
     // -----------------------------------------------------------------------
     // object.freeze switches owner to Owner::Immutable.
     // -----------------------------------------------------------------------
@@ -2080,6 +2157,33 @@ mod ptb_host_import_tests {
         assert_eq!(
             guard.ownership_changes.last().map(|c| c.1.clone()),
             Some(Owner::Address([0xaa; 32]))
+        );
+    }
+
+    const OBJECT_FREEZE_THEN_ID: &str = r#"
+(module
+  (import "object" "borrow" (func $bo (param i32 i32) (result i32)))
+  (import "object" "freeze" (func $fz (param i32) (result i32)))
+  (import "object" "id"     (func $id (param i32 i32) (result i32)))
+  (import "chain" "petal.return" (func $ret (param i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07")
+  (func (export "call") (param i32 i32) (result i32)
+    (local $h i32) (local $r i32)
+    (local.set $h (call $bo (i32.const 0) (i32.const 1)))
+    (drop (call $fz (local.get $h)))
+    (local.set $r (call $id (local.get $h) (i32.const 64)))
+    (i32.store (i32.const 128) (local.get $r))
+    (call $ret (i32.const 128) (i32.const 4))
+    i32.const 0)
+)
+"#;
+
+    #[test]
+    fn frozen_handle_cannot_be_reused() {
+        assert_eq!(
+            run_reuse_after_terminal_op(OBJECT_FREEZE_THEN_ID, AccessMode::Mutable),
+            -3
         );
     }
 
@@ -2141,6 +2245,33 @@ mod ptb_host_import_tests {
         let out = run_with(wasm, arc.clone(), Hash32([0; 32]));
         let code = i32::from_le_bytes(out.return_data.unwrap().try_into().unwrap());
         assert_eq!(code, -2);
+    }
+
+    const OBJECT_DELETE_THEN_ID: &str = r#"
+(module
+  (import "object" "borrow" (func $bo (param i32 i32) (result i32)))
+  (import "object" "delete" (func $dl (param i32) (result i32)))
+  (import "object" "id"     (func $id (param i32 i32) (result i32)))
+  (import "chain" "petal.return" (func $ret (param i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07\07")
+  (func (export "call") (param i32 i32) (result i32)
+    (local $h i32) (local $r i32)
+    (local.set $h (call $bo (i32.const 0) (i32.const 1)))
+    (drop (call $dl (local.get $h)))
+    (local.set $r (call $id (local.get $h) (i32.const 64)))
+    (i32.store (i32.const 128) (local.get $r))
+    (call $ret (i32.const 128) (i32.const 4))
+    i32.const 0)
+)
+"#;
+
+    #[test]
+    fn deleted_handle_cannot_be_reused() {
+        assert_eq!(
+            run_reuse_after_terminal_op(OBJECT_DELETE_THEN_ID, AccessMode::Mutable),
+            -3
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2291,6 +2422,34 @@ mod ptb_host_import_tests {
         )
     }
 
+    fn object_create_return_id_wat(type_tag_bytes: &[u8]) -> String {
+        let mut tag_lit = String::new();
+        for b in type_tag_bytes {
+            tag_lit.push_str(&format!("\\{:02x}", b));
+        }
+        format!(
+            r#"
+(module
+  (import "object" "create" (func $cr (param i32 i32 i32 i32) (result i32)))
+  (import "object" "id" (func $id (param i32 i32) (result i32)))
+  (import "chain" "petal.return" (func $ret (param i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{tag_lit}")
+  (data (i32.const 256) "\de\ad\be\ef")
+  (func (export "call") (param i32 i32) (result i32)
+    (local $h i32)
+    (local.set $h
+      (call $cr (i32.const 0) (i32.const {tag_len}) (i32.const 256) (i32.const 4)))
+    (drop (call $id (local.get $h) (i32.const 512)))
+    (call $ret (i32.const 512) (i32.const 32))
+    i32.const 0)
+)
+"#,
+            tag_lit = tag_lit,
+            tag_len = type_tag_bytes.len(),
+        )
+    }
+
     #[test]
     fn object_create_with_sentinel_hash_stamps_self_and_mints_handle() {
         // The `[0u8; 32]` petal_hash is the compile-time "self" sentinel:
@@ -2331,6 +2490,27 @@ mod ptb_host_import_tests {
             }
             other => panic!("expected concrete tag, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn object_create_id_differs_across_ptb_digests() {
+        let sentinel_tag = TypeTag::Concrete {
+            petal_hash: [0u8; 32],
+            type_name: "X".into(),
+            type_args: vec![],
+        };
+        let want = sentinel_tag.encode_canonical().unwrap();
+        let wasm = parse(&object_create_return_id_wat(&want));
+
+        let mut ctx_a = PtbHostCtx::new();
+        ctx_a.ptb_digest = [0xA1; 32];
+        let out_a = run_with(wasm.clone(), Arc::new(Mutex::new(ctx_a)), Hash32([0u8; 32]));
+
+        let mut ctx_b = PtbHostCtx::new();
+        ctx_b.ptb_digest = [0xB2; 32];
+        let out_b = run_with(wasm, Arc::new(Mutex::new(ctx_b)), Hash32([0u8; 32]));
+
+        assert_ne!(out_a.return_data.unwrap(), out_b.return_data.unwrap());
     }
 
     #[test]

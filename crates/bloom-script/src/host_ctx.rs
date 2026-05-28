@@ -22,6 +22,8 @@
 //! The chain VM accesses this through `Arc<Mutex<PtbHostCtx>>` stored
 //! on `ChainStoreData::ptb_ctx` for `TxKind::SubmitPtb` calls.
 
+use std::collections::BTreeSet;
+
 use bloom_chain_types::Hash32;
 use bloom_objects::{Object, ObjectId, Owner};
 
@@ -77,6 +79,11 @@ pub struct PtbHostCtx {
     /// the first command and bumped after each command.
     pub current_command_idx: u16,
 
+    /// Signing digest of the PTB currently executing. Host-side object
+    /// creation mixes this into transient ids so identical creates in
+    /// different PTBs cannot collide.
+    pub ptb_digest: [u8; 32],
+
     /// Content hash of the petal whose function is currently being
     /// executed. Read by `object.create` to enforce the
     /// type-defining-petal rule and by `log.emit` to attribute log
@@ -110,6 +117,11 @@ pub struct PtbHostCtx {
     /// Wasm-handle table. Index = handle - 1 (handles are 1-based);
     /// 0 is reserved for "not allocated".
     pub handles: Vec<HandleEntry>,
+
+    /// Object ids whose handles have been linearly consumed or
+    /// re-homed. Existing and future handles to these ids are rejected
+    /// for the remainder of the PTB.
+    retired_handle_ids: BTreeSet<[u8; 32]>,
 }
 
 impl PtbHostCtx {
@@ -132,23 +144,47 @@ impl PtbHostCtx {
     /// 0, negative handles, or out-of-range positives.
     pub fn id_for_handle(&self, handle: i32) -> Option<ObjectId> {
         let idx: usize = (handle.checked_sub(1)?).try_into().ok()?;
-        self.handles.get(idx).map(|h| h.object_id)
+        let id = self.handles.get(idx).map(|h| h.object_id)?;
+        if self.is_handle_retired(&id) {
+            None
+        } else {
+            Some(id)
+        }
     }
 
     /// Look up the full [`HandleEntry`] for a handle.
     pub fn entry_for_handle(&self, handle: i32) -> Option<&HandleEntry> {
         let idx: usize = (handle.checked_sub(1)?).try_into().ok()?;
-        self.handles.get(idx)
+        let entry = self.handles.get(idx)?;
+        if self.is_handle_retired(&entry.object_id) {
+            None
+        } else {
+            Some(entry)
+        }
     }
 
     /// Find the first existing handle pointing at `id`, if any. Used
     /// by `object.borrow` to coalesce repeat borrows of the same
     /// object during a single PTB.
     pub fn handle_for(&self, id: &ObjectId) -> Option<i32> {
+        if self.is_handle_retired(id) {
+            return None;
+        }
         self.handles
             .iter()
             .position(|h| h.object_id == *id)
             .map(|i| (i + 1) as i32)
+    }
+
+    /// Retire every handle to `id` after a linear terminal operation
+    /// such as transfer, share, freeze, delete, or built-in consume.
+    pub fn retire_handles_for(&mut self, id: &ObjectId) {
+        self.retired_handle_ids.insert(id.0);
+    }
+
+    /// Returns true when handles to `id` are no longer usable.
+    pub fn is_handle_retired(&self, id: &ObjectId) -> bool {
+        self.retired_handle_ids.contains(&id.0)
     }
 }
 
@@ -195,5 +231,21 @@ mod tests {
         });
         assert_eq!(ctx.handle_for(&id), Some(h));
         assert!(ctx.handle_for(&ObjectId([9; 32])).is_none());
+    }
+
+    #[test]
+    fn consumed_handles_are_not_resolved_or_coalesced() {
+        let mut ctx = PtbHostCtx::new();
+        let id = ObjectId([4; 32]);
+        let h = ctx.alloc_handle(HandleEntry {
+            object_id: id,
+            created: false,
+        });
+
+        ctx.retire_handles_for(&id);
+
+        assert_eq!(ctx.id_for_handle(h), None);
+        assert_eq!(ctx.entry_for_handle(h), None);
+        assert_eq!(ctx.handle_for(&id), None);
     }
 }

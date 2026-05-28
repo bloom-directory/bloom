@@ -30,6 +30,7 @@
 //! [`PtbExecutor::new`], which internally allocates a fresh
 //! `Arc<Mutex<PtbHostCtx>>`.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use bloom_chain_types::{
@@ -39,7 +40,7 @@ use bloom_chain_types::{
 use bloom_objects::{AbilitySet, AccessMode, Object, ObjectId, Owner, TypeTag};
 
 use crate::borrow_table::BorrowRow;
-use crate::chain_iface::{ChainStateIface, InvariantDeclStub};
+use crate::chain_iface::{ArgDeclStub, ChainStateIface, InvariantDeclStub, PetalManifestStub};
 use crate::error::PtbError;
 use crate::host_ctx::PtbHostCtx;
 use crate::types::{Arg, Command, MoveCmd, PublishCmd, UpgradeCmd, UseRef};
@@ -256,6 +257,9 @@ impl<'c> PtbExecutor<'c> {
     pub fn execute(&mut self, vtx: ValidatedPtb) -> ExecutionReport {
         let mut report = ExecutionReport::default();
         self.seed = vtx.tx.signing_digest();
+        self.with_ctx(|ctx| {
+            ctx.ptb_digest = self.seed;
+        });
 
         // Track ownership changes for Loom-bearing objects. The
         // executor consults the per-object type tag to know whether to
@@ -266,6 +270,7 @@ impl<'c> PtbExecutor<'c> {
         let mut planned_writes: Vec<Object> = Vec::new();
         let mut planned_deletes: Vec<(ObjectId, Owner)> = Vec::new();
         let mut ownership_changes: Vec<(ObjectId, Owner, Owner)> = Vec::new();
+        let mut consumed_use_refs: HashSet<UseRef> = HashSet::new();
 
         // Tx-scope fuel: Phase 1 charges only inside petal calls.
         // We treat `gas_budget` as the upper bound for the *whole* PTB.
@@ -278,6 +283,15 @@ impl<'c> PtbExecutor<'c> {
             self.with_ctx(|ctx| {
                 ctx.current_command_idx = cmd_idx as u16;
             });
+
+            if let Err(e) = reject_duplicate_linear_use_refs(
+                cmd,
+                cmd_idx as u16,
+                &vtx.manifests,
+                &mut consumed_use_refs,
+            ) {
+                return revert(report, e);
+            }
 
             let cmd_outputs = match self.dispatch_command(
                 cmd,
@@ -577,6 +591,7 @@ impl<'c> PtbExecutor<'c> {
                 let old = row.owner.clone();
                 row.owner = owner.clone();
                 ctx.borrow_table.mark_consumed(&id);
+                ctx.retire_handles_for(&id);
                 Ok(old)
             })?;
             ownership_changes.push((id, old_owner, owner.clone()));
@@ -1040,6 +1055,77 @@ fn lookup_use(
         })
 }
 
+fn reject_duplicate_linear_use_refs(
+    cmd: &Command,
+    cmd_idx: u16,
+    manifests: &std::collections::HashMap<[u8; 32], PetalManifestStub>,
+    consumed: &mut HashSet<UseRef>,
+) -> Result<(), PtbError> {
+    match cmd {
+        Command::Move(m) => {
+            let hash = m.petal.hash.ok_or_else(|| PtbError::PetalNotPinned {
+                path: m.petal.path.clone(),
+            })?;
+            let manifest = manifests
+                .get(&hash.0)
+                .ok_or(PtbError::PetalNotFound { hash })?;
+            let f = manifest
+                .function(&m.function)
+                .ok_or_else(|| PtbError::UnknownFunction {
+                    function: m.function.clone(),
+                    petal_hash: hash,
+                })?;
+            for (arg, decl) in m.args.iter().zip(f.args.iter()) {
+                if matches!(decl, ArgDeclStub::Object { .. })
+                    && let Arg::Use {
+                        cmd_idx: use_cmd_idx,
+                        ret_idx,
+                    } = arg
+                {
+                    consume_linear_use_ref(
+                        consumed,
+                        UseRef {
+                            cmd_idx: *use_cmd_idx,
+                            ret_idx: *ret_idx,
+                        },
+                        cmd_idx,
+                    )?;
+                }
+            }
+        }
+        Command::TransferObjects { uses, .. }
+        | Command::MergeCoins(uses)
+        | Command::MakeMoveVec { uses, .. } => {
+            for u in uses {
+                consume_linear_use_ref(consumed, *u, cmd_idx)?;
+            }
+        }
+        Command::SplitCoins { src, .. } => {
+            consume_linear_use_ref(consumed, *src, cmd_idx)?;
+        }
+        Command::Publish(_) | Command::UpgradePetal(_) => {}
+    }
+    Ok(())
+}
+
+fn consume_linear_use_ref(
+    consumed: &mut HashSet<UseRef>,
+    u: UseRef,
+    referring_cmd: u16,
+) -> Result<(), PtbError> {
+    if consumed.insert(u) {
+        Ok(())
+    } else {
+        Err(PtbError::BuiltinFailed {
+            cmd_idx: referring_cmd,
+            reason: format!(
+                "duplicate linear Use({}, {}) consumption",
+                u.cmd_idx, u.ret_idx
+            ),
+        })
+    }
+}
+
 fn charge_builtin_fuel(
     byte_len: usize,
     cmd_idx: u16,
@@ -1403,6 +1489,79 @@ mod tests {
         assert!(report.success, "report: {report:?}");
         assert_eq!(report.command_outputs.len(), 1);
         assert_eq!(report.command_outputs[0], vec![b"hello".to_vec()]);
+    }
+
+    #[test]
+    fn executor_rejects_duplicate_linear_use_ref_consumption() {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        let manifest = PetalManifestStub {
+            module_path: "/p".to_string(),
+            functions: vec![FunctionDeclStub {
+                name: "mint".to_string(),
+                type_params: vec![],
+                args: vec![],
+                returns: vec![loom_tt()],
+                attached_invariants: vec![],
+            }],
+            object_types: vec![],
+            external_type_refs: vec![],
+        };
+        chain.put_petal(petal, vec![1, 2, 3], manifest.clone());
+        let minted_id = ObjectId([0x44; 32]);
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/p".to_string(),
+                        hash: Some(petal),
+                    },
+                    function: "mint".to_string(),
+                    type_args: vec![],
+                    args: vec![],
+                }),
+                Command::TransferObjects {
+                    uses: vec![
+                        UseRef {
+                            cmd_idx: 0,
+                            ret_idx: 0,
+                        },
+                        UseRef {
+                            cmd_idx: 0,
+                            ret_idx: 0,
+                        },
+                    ],
+                    owner: Owner::Address([0x22; 32]),
+                },
+            ],
+        );
+        let mut runner = MockPetalRunner::new();
+        runner.set(petal, "mint", build_outputs(&[&minted_id.0]), 1);
+        let mut manifests = HashMap::new();
+        manifests.insert(petal.0, manifest);
+        let mut petals = HashMap::new();
+        petals.insert(petal.0, vec![1, 2, 3]);
+        let mut objects = HashMap::new();
+        objects.insert(gas_id.0, chain.load_object(&gas_id).unwrap());
+        let validated = ValidatedPtb {
+            tx,
+            objects,
+            petals,
+            manifests,
+            first_signer_addr: signer,
+        };
+
+        let mut exec = PtbExecutor::new(&chain, &runner, loom_tt(), Hash32([0; 32]));
+        let report = exec.execute(validated);
+
+        assert!(!report.success);
+        assert!(matches!(
+            report.reverted_with,
+            Some(PtbError::BuiltinFailed { ref reason, .. })
+                if reason.contains("duplicate linear Use(0, 0)")
+        ));
     }
 
     #[test]

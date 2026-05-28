@@ -37,8 +37,9 @@ use bloom_vfs::{Handler, TxHandler, VfsPath};
 use bloom_dex_math::{ConstantProduct, ConstantProductParams, SwapStrategy};
 use bloom_petal_dex_it::dex_harness::{
     addr, build_pool_wasm, build_state, build_wallet_wasm, coin_erased_tag, create_shared_pool,
-    erased_coin_id, genesis_coin_id, owner_has_coin_worth, real_pool_manifest_bytes,
-    real_wallet_manifest_bytes, seed_erased_coin, submit_ptb_chain_auth, wrap_with_real_manifest,
+    erased_coin_id, erased_type_tag, genesis_coin_id, owner_has_coin_worth,
+    real_pool_manifest_bytes, real_wallet_manifest_bytes, seed_erased_coin, submit_ptb_chain_auth,
+    wrap_with_real_manifest,
 };
 
 // ---------------------------------------------------------------------------
@@ -123,6 +124,18 @@ fn pool_object_tag(petal_hash: [u8; 32]) -> TypeTag {
         type_name: "Pool".to_string(),
         type_args: vec![],
     }
+}
+
+fn is_coin_erased(tag: &TypeTag) -> bool {
+    let erased = erased_type_tag();
+    matches!(
+        tag,
+        TypeTag::Concrete {
+            type_name,
+            type_args,
+            ..
+        } if type_name == "Coin" && type_args.len() == 1 && type_args[0] == erased
+    )
 }
 
 fn install_fast_manifest_fixture() -> (State, ObjectId) {
@@ -867,11 +880,13 @@ fn litmus_5_2_two_hop_atomic() {
         ("cli", &mut state_cli, tx_cli),
         ("vfs", &mut state_vfs, tx_vfs),
     ] {
-        // Snapshot the set of standalone Coin ids before exec so we can
-        // assert no orphan intermediate ("B") coin is committed.
+        // Snapshot the set of DEX Coin<Erased> ids before exec so we can
+        // assert no orphan intermediate ("B") coin is committed. Successful
+        // PTB gas settlement may also mint Coin<LOOM> for the proposer; that
+        // accounting coin is not part of this DEX-output invariant.
         let coins_before: std::collections::HashSet<ObjectId> = state
             .iter_objects()
-            .filter(|(_, o)| matches!(&o.type_tag, TypeTag::Concrete { type_name, .. } if type_name == "Coin"))
+            .filter(|(_, o)| is_coin_erased(&o.type_tag))
             .map(|(id, _)| *id)
             .collect();
 
@@ -923,10 +938,7 @@ fn litmus_5_2_two_hop_atomic() {
         // "B-coin"). The only NEW committed Coin is carol's final output.
         let new_coins: Vec<(ObjectId, u128, Owner)> = state
             .iter_objects()
-            .filter(|(id, o)| {
-                matches!(&o.type_tag, TypeTag::Concrete { type_name, .. } if type_name == "Coin")
-                    && !coins_before.contains(id)
-            })
+            .filter(|(id, o)| is_coin_erased(&o.type_tag) && !coins_before.contains(id))
             .map(|(id, o)| {
                 (
                     *id,

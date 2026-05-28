@@ -506,6 +506,9 @@ impl ConsensusState {
                 // Check for 2f+1 prevotes for a non-nil hash in the current round.
                 if v.round == self.round && self.step == Step::Prevote {
                     if let Some(Some(hash)) = tally.quorum_hash(quorum) {
+                        if !blocks.contains_key(&hash) {
+                            return actions;
+                        }
                         // 2f+1 prevotes for a concrete block — update valid_block.
                         self.valid_block = Some((self.round, hash));
                         // Precommit for it.
@@ -532,6 +535,7 @@ impl ConsensusState {
                         .prevotes
                         .get(&v.round)
                         .and_then(|t| t.quorum_hash(quorum))
+                    && blocks.contains_key(&hash)
                     && self.valid_block.map(|(r, _)| r < v.round).unwrap_or(true)
                 {
                     self.valid_block = Some((v.round, hash));
@@ -826,5 +830,62 @@ mod tests {
         assert!(sm.handle(Event::ReceiveVote(vote(2)), &blocks).is_empty());
 
         assert_eq!(sm.valid_block, Some((0, hash)));
+    }
+
+    #[test]
+    fn prevote_quorum_for_unknown_hash_does_not_precommit() {
+        let mut sm = ConsensusState::new(1, make_addr(0), make_validator_set());
+        sm.step = Step::Prevote;
+        let hash = Hash32([0xEE; 32]);
+        let blocks = BTreeMap::new();
+        let vote = |seed| Vote {
+            height: 1,
+            round: 0,
+            kind: VoteKind::Prevote,
+            block_hash: Some(hash),
+            validator: make_addr(seed),
+            sig: SigBytes(vec![seed]),
+        };
+
+        assert!(sm.handle(Event::ReceiveVote(vote(0)), &blocks).is_empty());
+        assert!(sm.handle(Event::ReceiveVote(vote(1)), &blocks).is_empty());
+        let actions = sm.handle(Event::ReceiveVote(vote(2)), &blocks);
+
+        assert!(
+            actions.iter().all(|action| {
+                !matches!(
+                    action,
+                    Action::Broadcast(ProposalOrVote::Vote(v))
+                        if v.kind == VoteKind::Precommit && v.block_hash == Some(hash)
+                )
+            }),
+            "must not precommit a block hash whose body has not been registered"
+        );
+        assert_eq!(sm.step, Step::Prevote);
+        assert_eq!(sm.locked_block, None);
+        assert_eq!(sm.valid_block, None);
+    }
+
+    #[test]
+    fn late_polka_for_unknown_hash_does_not_become_valid_block() {
+        let mut sm = ConsensusState::new(1, make_addr(0), make_validator_set());
+        sm.round = 1;
+        sm.step = Step::Propose;
+        let hash = Hash32([0xEF; 32]);
+        let blocks = BTreeMap::new();
+        let vote = |seed| Vote {
+            height: 1,
+            round: 0,
+            kind: VoteKind::Prevote,
+            block_hash: Some(hash),
+            validator: make_addr(seed),
+            sig: SigBytes(vec![seed]),
+        };
+
+        assert!(sm.handle(Event::ReceiveVote(vote(0)), &blocks).is_empty());
+        assert!(sm.handle(Event::ReceiveVote(vote(1)), &blocks).is_empty());
+        assert!(sm.handle(Event::ReceiveVote(vote(2)), &blocks).is_empty());
+
+        assert_eq!(sm.valid_block, None);
     }
 }

@@ -93,6 +93,10 @@ const TX_TIMEOUT: Duration = Duration::from_secs(60);
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker-compose stack; run via scripts/test-docker-petal-dex.sh"]
 async fn docker_petal_dex_acceptance() -> Result<()> {
+    if std::env::var_os("BLOOM_DOCKER_TMPDIR").is_none() {
+        eprintln!("skipping docker_petal_dex_acceptance: run via scripts/test-docker-petal-dex.sh");
+        return Ok(());
+    }
     Box::pin(docker_petal_dex_acceptance_inner()).await
 }
 

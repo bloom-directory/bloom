@@ -6,6 +6,9 @@ license.workspace = true
 description = "Integration tests for the bloom DEX petal suite (pool + cpmm + router)"
 publish = false
 
+[lib]
+doctest = false
+
 [dependencies]
 bloom-chain-node     = { path = "../../../../crates/bloom-chain-node" }
 bloom-chain-consensus = { path = "../../../../crates/bloom-chain-consensus" }

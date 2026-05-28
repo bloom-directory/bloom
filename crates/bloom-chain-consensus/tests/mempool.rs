@@ -5,11 +5,22 @@
 use bloom_chain_consensus::{ConsensusError, Mempool, NoopVerifier, RejectAllVerifier};
 use bloom_chain_types::tx::TxKind;
 use bloom_chain_types::types::Address;
+use bloom_script::{PtbTx, encode_ptb};
 use bloom_test_util::{make_addr_derived, make_mempool_tx};
 
 // ---------------------------------------------------------------------------
 // Admission tests
 // ---------------------------------------------------------------------------
+
+fn valid_ptb_bytes(gas_budget: u64, gas_price: u128) -> Vec<u8> {
+    encode_ptb(&PtbTx {
+        gas_budget,
+        gas_price,
+        expiry_block: 100,
+        ..PtbTx::default()
+    })
+    .expect("test PTB encodes")
+}
 
 #[test]
 fn admit_valid_tx() {
@@ -105,12 +116,51 @@ fn submit_ptb_admission_does_not_charge_outer_sender_balance() {
     let mut mp = Mempool::new(NoopVerifier);
     let mut tx = make_mempool_tx(1, 1, 10, 100, 0);
     tx.kind = TxKind::SubmitPtb {
-        ptb_bytes: vec![0xCA, 0xFE],
+        ptb_bytes: valid_ptb_bytes(100, 10),
     };
 
     mp.admit(tx, 0, 0)
         .expect("sponsored PTB admission must not require relayer LOOM");
     assert_eq!(mp.len(), 1);
+}
+
+#[test]
+fn submit_ptb_admission_rejects_malformed_bytes() {
+    let mut mp = Mempool::new(NoopVerifier);
+    let mut tx = make_mempool_tx(1, 1, 10, 100, 0);
+    tx.kind = TxKind::SubmitPtb {
+        ptb_bytes: vec![0xCA, 0xFE],
+    };
+
+    let err = mp.admit(tx, 0, 0).unwrap_err();
+    assert!(matches!(err, ConsensusError::InvalidSubmitPtb(_)));
+    assert_eq!(mp.len(), 0);
+}
+
+#[test]
+fn submit_ptb_admission_rejects_inner_cap_above_outer_cap() {
+    let mut mp = Mempool::new(NoopVerifier);
+    let mut tx = make_mempool_tx(1, 1, 10, 99, 0);
+    tx.kind = TxKind::SubmitPtb {
+        ptb_bytes: valid_ptb_bytes(100, 10),
+    };
+
+    let err = mp.admit(tx, 0, 0).unwrap_err();
+    assert!(matches!(err, ConsensusError::InvalidSubmitPtb(_)));
+    assert_eq!(mp.len(), 0);
+}
+
+#[test]
+fn submit_ptb_admission_rejects_free_inner_gas() {
+    let mut mp = Mempool::new(NoopVerifier);
+    let mut tx = make_mempool_tx(1, 1, 10, 100, 0);
+    tx.kind = TxKind::SubmitPtb {
+        ptb_bytes: valid_ptb_bytes(100, 0),
+    };
+
+    let err = mp.admit(tx, 0, 0).unwrap_err();
+    assert!(matches!(err, ConsensusError::InvalidSubmitPtb(_)));
+    assert_eq!(mp.len(), 0);
 }
 
 #[test]

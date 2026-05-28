@@ -90,6 +90,8 @@ pub enum TxEngineError {
     PrivateBroadcast(String),
     #[error("private RPC provider {provider} does not support chain {chain_id}")]
     PrivateProviderChainMismatch { provider: String, chain_id: u64 },
+    #[error("tx '{id}' is in status {status}, expected pending or unmined sent")]
+    InvalidTxStatus { id: String, status: String },
 }
 
 /// In-memory cache for ERC-20 metadata keyed by `(chain_id, address)`.
@@ -1158,11 +1160,41 @@ impl TxEngine {
         Ok(hash)
     }
 
+    fn read_replaceable_entry(
+        &self,
+        wallet: &str,
+        chain_name: &str,
+        original_id: &str,
+    ) -> Result<crate::outbox::OutboxEntry, TxEngineError> {
+        match self
+            .outbox
+            .read_in_state(wallet, chain_name, original_id, OutboxState::Pending)
+        {
+            Ok(entry) => Ok(entry),
+            Err(OutboxError::StateMismatch { actual: "sent", .. }) => {
+                let entry = self.outbox.read_in_state(
+                    wallet,
+                    chain_name,
+                    original_id,
+                    OutboxState::Sent,
+                )?;
+                if matches!(entry.staged.status, TxStatus::Sent) {
+                    Ok(entry)
+                } else {
+                    Err(TxEngineError::InvalidTxStatus {
+                        id: original_id.to_string(),
+                        status: format!("{:?}", entry.staged.status),
+                    })
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Issue a same-nonce replacement tx with bumped fees. The original
-    /// must already be persisted in the outbox **and still in pending**;
-    /// already-broadcast txs cannot be replaced through this path
-    /// (fix #2 / #10). Floors `bump_pct` at 10 to satisfy the mempool's
-    /// >= 10% rule.
+    /// must already be persisted in the outbox and be either still staged
+    /// in `pending/` or broadcast-but-unmined in `sent/`. Floors `bump_pct`
+    /// at 10 to satisfy the mempool's >= 10% rule.
     #[allow(clippy::too_many_arguments)]
     pub async fn replace(
         &self,
@@ -1209,9 +1241,7 @@ impl TxEngine {
         policy: &Policy,
     ) -> Result<StagedTx, TxEngineError> {
         let bump = bump_pct.max(10);
-        let entry =
-            self.outbox
-                .read_in_state(wallet, chain_name, original_id, OutboxState::Pending)?;
+        let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
         let original = &entry.staged;
 
         let mut bumped = original.clone();
@@ -1262,8 +1292,9 @@ impl TxEngine {
         Ok(bumped)
     }
 
-    /// Issue a same-nonce self-send to cancel the original. Refuses if the
-    /// original is no longer pending (fix #2 / #10).
+    /// Issue a same-nonce self-send to cancel the original. The original
+    /// must be either still staged in `pending/` or broadcast-but-unmined in
+    /// `sent/`.
     #[allow(clippy::too_many_arguments)]
     pub async fn cancel(
         &self,
@@ -1276,9 +1307,7 @@ impl TxEngine {
         policy: &Policy,
     ) -> Result<StagedTx, TxEngineError> {
         let bump = bump_pct.max(10);
-        let entry =
-            self.outbox
-                .read_in_state(wallet, chain_name, original_id, OutboxState::Pending)?;
+        let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
         let original = &entry.staged;
 
         let mut cancel_tx = original.clone();

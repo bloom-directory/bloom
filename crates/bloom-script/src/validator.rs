@@ -129,6 +129,7 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
     let mut objects: HashMap<[u8; 32], Object> = HashMap::new();
     let first_signer_addr = tx.signers[0];
     let mut cmd_return_types: Vec<Vec<Option<TypeTag>>> = Vec::with_capacity(tx.commands.len());
+    let mut consumed_use_refs: HashSet<UseRef> = HashSet::new();
     for (cmd_idx, cmd) in tx.commands.iter().enumerate() {
         match cmd {
             Command::Move(m) => {
@@ -173,6 +174,12 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
                     }
                 }
                 typecheck_move_cmd(m, manifest, cmd_idx, &cmd_return_types, &objects)?;
+                reject_duplicate_move_linear_use_refs(
+                    m,
+                    manifest,
+                    cmd_idx as u16,
+                    &mut consumed_use_refs,
+                )?;
                 // Record the declared return types of this command so
                 // later `Use` references can typecheck against them.
                 let f = manifest
@@ -190,8 +197,16 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
                         .collect(),
                 );
             }
-            Command::TransferObjects { .. } => cmd_return_types.push(vec![]),
+            Command::TransferObjects { uses, .. } => {
+                for u in uses {
+                    consume_linear_use_ref(&mut consumed_use_refs, *u, cmd_idx as u16)?;
+                }
+                cmd_return_types.push(vec![]);
+            }
             Command::MergeCoins(uses) => {
+                for u in uses {
+                    consume_linear_use_ref(&mut consumed_use_refs, *u, cmd_idx as u16)?;
+                }
                 let Some((first, rest)) = uses.split_first() else {
                     return Err(PtbError::BuiltinFailed {
                         cmd_idx: cmd_idx as u16,
@@ -230,6 +245,7 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
                 let Command::SplitCoins { src, .. } = cmd else {
                     unreachable!("matched SplitCoins")
                 };
+                consume_linear_use_ref(&mut consumed_use_refs, *src, cmd_idx as u16)?;
                 let coin_type =
                     resolve_required_use_type(&cmd_return_types, *src, cmd_idx, "SplitCoins src")?;
                 if !is_coin_type_tag(&coin_type) {
@@ -240,7 +256,12 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
                 }
                 cmd_return_types.push(vec![Some(coin_type); amounts.len()]);
             }
-            Command::MakeMoveVec { .. } => cmd_return_types.push(vec![None]),
+            Command::MakeMoveVec { uses, .. } => {
+                for u in uses {
+                    consume_linear_use_ref(&mut consumed_use_refs, *u, cmd_idx as u16)?;
+                }
+                cmd_return_types.push(vec![None]);
+            }
             Command::Publish(p) => {
                 if p.publisher_cap.is_some() {
                     return Err(PtbError::BuiltinFailed {
@@ -533,6 +554,59 @@ fn resolve_use_type(
         ret_idx: u.ret_idx,
     })?;
     Ok(slot.clone())
+}
+
+fn reject_duplicate_move_linear_use_refs(
+    cmd: &MoveCmd,
+    manifest: &PetalManifestStub,
+    cmd_idx: u16,
+    consumed: &mut HashSet<UseRef>,
+) -> Result<(), PtbError> {
+    let hash = cmd.petal.hash.ok_or_else(|| PtbError::PetalNotPinned {
+        path: cmd.petal.path.clone(),
+    })?;
+    let f = manifest
+        .function(&cmd.function)
+        .ok_or_else(|| PtbError::UnknownFunction {
+            function: cmd.function.clone(),
+            petal_hash: hash,
+        })?;
+    for (arg, decl) in cmd.args.iter().zip(f.args.iter()) {
+        if matches!(decl, ArgDeclStub::Object { .. })
+            && let Arg::Use {
+                cmd_idx: use_cmd_idx,
+                ret_idx,
+            } = arg
+        {
+            consume_linear_use_ref(
+                consumed,
+                UseRef {
+                    cmd_idx: *use_cmd_idx,
+                    ret_idx: *ret_idx,
+                },
+                cmd_idx,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn consume_linear_use_ref(
+    consumed: &mut HashSet<UseRef>,
+    u: UseRef,
+    referring_cmd: u16,
+) -> Result<(), PtbError> {
+    if consumed.insert(u) {
+        Ok(())
+    } else {
+        Err(PtbError::BuiltinFailed {
+            cmd_idx: referring_cmd,
+            reason: format!(
+                "duplicate linear Use({}, {}) consumption",
+                u.cmd_idx, u.ret_idx
+            ),
+        })
+    }
 }
 
 fn resolve_required_use_type(
@@ -878,7 +952,9 @@ pub fn decode_coin_value(payload: &[u8]) -> Result<u128, PtbError> {
 mod tests {
     use super::*;
     use crate::chain_iface::{ArgDeclStub, FunctionDeclStub, ObjectTypeDeclStub};
-    use crate::types::{Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PqSignature, PtbTx};
+    use crate::types::{
+        Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PqSignature, PtbTx, UseRef,
+    };
     use bloom_chain_types::Hash32;
     use bloom_objects::{Owner, TypeTag};
     use std::cell::RefCell;
@@ -1022,6 +1098,59 @@ mod tests {
         let validated = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap();
         assert_eq!(validated.tx, tx);
         assert!(validated.objects.contains_key(&gas_id.0));
+    }
+
+    #[test]
+    fn rejects_duplicate_linear_use_ref_consumption() {
+        let (chain, signer, gas_id) = setup();
+        let mut m = sample_manifest();
+        m.functions.push(FunctionDeclStub {
+            name: "mint".to_string(),
+            type_params: vec![],
+            args: vec![],
+            returns: vec![loom_coin_tt()],
+            attached_invariants: vec![],
+        });
+        chain.put_petal(Hash32([0xAB; 32]), vec![1, 2, 3], m);
+        let tx = PtbTx {
+            signers: vec![signer],
+            commands: vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/bloom/dex/pool".to_string(),
+                        hash: Some(Hash32([0xAB; 32])),
+                    },
+                    function: "mint".to_string(),
+                    type_args: vec![],
+                    args: vec![],
+                }),
+                Command::TransferObjects {
+                    uses: vec![
+                        UseRef {
+                            cmd_idx: 0,
+                            ret_idx: 0,
+                        },
+                        UseRef {
+                            cmd_idx: 0,
+                            ret_idx: 0,
+                        },
+                    ],
+                    owner: Owner::Address([0x22; 32]),
+                },
+            ],
+            gas_payer: gas_id,
+            gas_budget: 100,
+            gas_price: 1,
+            expiry_block: 100,
+            signatures: vec![PqSignature(vec![0xCC; 8])],
+        };
+        let verifier = AlwaysOkVerifier;
+        let err = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap_err();
+        assert!(matches!(
+            err,
+            PtbError::BuiltinFailed { reason, .. }
+                if reason.contains("duplicate linear Use(0, 0)")
+        ));
     }
 
     #[test]

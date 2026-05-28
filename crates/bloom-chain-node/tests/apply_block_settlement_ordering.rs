@@ -17,7 +17,8 @@
 //! proposer, and sender-is-proposer all reconcile to the spec numbers.
 
 use bloom_chain_node::consensus_driver::{
-    NoopExecutor, apply_block_state_transitions, coin_loom_balance, resolve_loom_coin_type,
+    ExecOutput, NoopExecutor, PetalExecutor, apply_block_state_transitions, coin_loom_balance,
+    resolve_loom_coin_type, try_apply_block_state_transitions,
 };
 use bloom_chain_state::{Account, State};
 use bloom_chain_types::{
@@ -108,6 +109,62 @@ fn balance_of(state: &State, addr: &Address) -> u128 {
 /// fee accounting is `100 * fee_per_unit`. With `max_fuel` larger than
 /// 100, the refund is `(max_fuel - 100) * fee_per_unit`.
 const NOOP_FUEL_USED: u64 = 100;
+
+struct StaleWriteSetExecutor;
+
+impl PetalExecutor for StaleWriteSetExecutor {
+    fn execute_tx(
+        &self,
+        _tx: &Tx,
+        state: &mut State,
+        _block_number: u64,
+        _timestamp_ms: u64,
+        _proposer: Address,
+        _parent_hash: Hash32,
+    ) -> ExecOutput {
+        let stale = state.snapshot().commit();
+        let bump = state.snapshot().commit();
+        state.apply(bump).expect("generation bump must apply");
+        ExecOutput {
+            success: true,
+            fuel_used: NOOP_FUEL_USED,
+            return_data: vec![],
+            logs: vec![],
+            write_set: Some(stale),
+        }
+    }
+}
+
+struct DrainsSenderExecutor;
+
+impl PetalExecutor for DrainsSenderExecutor {
+    fn execute_tx(
+        &self,
+        tx: &Tx,
+        state: &mut State,
+        _block_number: u64,
+        _timestamp_ms: u64,
+        _proposer: Address,
+        _parent_hash: Hash32,
+    ) -> ExecOutput {
+        let mut snap = state.snapshot();
+        let key = OwnershipIndexKey {
+            owner_kind: OWNER_KIND_ADDRESS,
+            owner_id: tx.sender.0,
+        };
+        for id in snap.get_ownership(&key).unwrap_or_default() {
+            snap.delete_object(id);
+        }
+        snap.set_ownership(key, vec![]);
+        ExecOutput {
+            success: true,
+            fuel_used: NOOP_FUEL_USED,
+            return_data: vec![],
+            logs: vec![],
+            write_set: Some(snap.commit()),
+        }
+    }
+}
 
 #[test]
 fn transfer_to_self_preserves_fee_debit() {
@@ -254,4 +311,63 @@ fn sender_is_proposer_pays_amount_only() {
         amount,
         "recipient gets the full amount",
     );
+}
+
+#[test]
+fn state_apply_failure_rejects_transition() {
+    let (_sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
+    let sender = Address::from_pubkey_bytes(&pk.0);
+    let proposer = make_addr(0x44);
+    let initial = 1_000_000u128;
+
+    let mut state = State::new();
+    fund(&mut state, sender, initial);
+    let before_root = state.state_root();
+
+    let tx = make_transfer_tx(sender, pk.0.clone(), proposer, 1, 1, 1_000, 1);
+    let block = make_block(1, proposer, vec![tx]);
+    let err = try_apply_block_state_transitions(
+        &mut state,
+        &StaleWriteSetExecutor,
+        &block,
+        ZERO_EMISSION,
+    )
+    .expect_err("stale executor write_set must reject the transition");
+
+    assert!(err.contains("apply write_set failed"), "got: {err}");
+    assert_eq!(
+        state.state_root(),
+        before_root,
+        "state must remain unchanged"
+    );
+    assert_eq!(balance_of(&state, &sender), initial);
+}
+
+#[test]
+fn non_ptb_effects_are_not_published_when_fee_settlement_fails() {
+    let (_sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
+    let sender = Address::from_pubkey_bytes(&pk.0);
+    let proposer = make_addr(0x45);
+    let max_fuel = 1_000;
+    let fee_per_unit = 1;
+    let initial = max_fuel as u128 * fee_per_unit as u128 + 1;
+
+    let mut state = State::new();
+    fund(&mut state, sender, initial);
+    let before_root = state.state_root();
+
+    let tx = make_transfer_tx(sender, pk.0.clone(), proposer, 1, 1, max_fuel, fee_per_unit);
+    let block = make_block(1, proposer, vec![tx]);
+    let err =
+        try_apply_block_state_transitions(&mut state, &DrainsSenderExecutor, &block, ZERO_EMISSION)
+            .expect_err("fee settlement must reject after executor spends the fee payer coins");
+
+    assert!(err.contains("non-PTB fee settlement failed"), "got: {err}");
+    assert_eq!(
+        state.state_root(),
+        before_root,
+        "executor effects must not publish"
+    );
+    assert_eq!(balance_of(&state, &sender), initial);
+    assert_eq!(balance_of(&state, &proposer), 0);
 }

@@ -7,6 +7,7 @@ description = "Tendermint-style BFT consensus engine for bloom-chain v0"
 
 [dependencies]
 bloom-chain-types = { path = "../bloom-chain-types" }
+bloom-script.workspace = true
 blake3.workspace = true
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true

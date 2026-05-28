@@ -1321,6 +1321,22 @@ struct StateSnapshot {
     blob: Vec<u8>,
 }
 
+fn expected_snapshot_parent_hash(block_store: &BlockStore, height: u64) -> Result<Hash32> {
+    if height <= 1 {
+        return Ok(Hash32([0u8; 32]));
+    }
+    let parent_height = height - 1;
+    let parent = block_store
+        .get(parent_height)
+        .with_context(|| format!("read snapshot parent block at height {parent_height}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "snapshot parent block missing at height {parent_height}; refusing unsafe jump"
+            )
+        })?;
+    Ok(parent.header.block_hash())
+}
+
 async fn apply_state_snapshot<E: PetalExecutor>(
     ctx: SnapshotApplyContext<'_, E>,
     snapshot: StateSnapshot,
@@ -1381,19 +1397,20 @@ async fn apply_state_snapshot<E: PetalExecutor>(
             hex::encode(block.header.parent_hash.0)
         ));
     }
-    let state = State::from_blob(&blob, state_root)
-        .with_context(|| format!("restore snapshot state at height {height}"))?;
-
     let validator_set = { driver.engine.lock().validator_set.clone() };
+    let expected_parent_hash = expected_snapshot_parent_hash(&driver.block_store, height)?;
     validate_block_for_apply(
         &block,
         height,
         &driver.chain_id,
-        block.header.parent_hash,
+        expected_parent_hash,
         &validator_set,
         &XdsaVerifier,
     )
     .map_err(|reason| anyhow::anyhow!("snapshot commit validation failed: {reason}"))?;
+
+    let state = State::from_blob(&blob, state_root)
+        .with_context(|| format!("restore snapshot state at height {height}"))?;
 
     let stored_blob_hash = driver.blob_store.put(&blob)?;
     if stored_blob_hash != blob_hash {
@@ -1658,5 +1675,57 @@ mod tests {
         let header_round = proposal_header_round(2, 0);
 
         assert_eq!(header_round, 0);
+    }
+
+    fn test_block(height: u64, parent_hash: Hash32) -> Block {
+        Block {
+            header: BlockHeader {
+                chain_id: "bloomchain.test".into(),
+                height,
+                parent_hash,
+                timestamp_ms: height,
+                proposer: Address([0x11; 32]),
+                txs_root: Hash32([0; 32]),
+                state_root: Hash32([height as u8; 32]),
+                receipts_root: Hash32([0; 32]),
+                validator_set_hash: Hash32([0x22; 32]),
+                fuel_used: 0,
+                fuel_limit: 30_000_000,
+            },
+            txs: vec![],
+            commit: Commit {
+                height,
+                round: 0,
+                block_hash: Hash32([0; 32]),
+                votes: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn snapshot_parent_hash_comes_from_local_parent_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let block_store = BlockStore::open(&tmp.path().join("blocks")).unwrap();
+        let parent = test_block(4, Hash32([0x44; 32]));
+        let parent_hash = parent.header.block_hash();
+        block_store.put(4, &parent).unwrap();
+
+        let expected = expected_snapshot_parent_hash(&block_store, 5).unwrap();
+
+        assert_eq!(expected, parent_hash);
+        assert_ne!(expected, Hash32([0x44; 32]));
+    }
+
+    #[test]
+    fn snapshot_parent_hash_rejects_unsafe_jump_without_local_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let block_store = BlockStore::open(&tmp.path().join("blocks")).unwrap();
+
+        let err = expected_snapshot_parent_hash(&block_store, 5).unwrap_err();
+
+        assert!(
+            err.to_string().contains("refusing unsafe jump"),
+            "unexpected error: {err}"
+        );
     }
 }

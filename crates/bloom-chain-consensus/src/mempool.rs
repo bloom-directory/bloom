@@ -108,9 +108,20 @@ impl<V: SigVerifier> Mempool<V> {
         // gas-object funded instead: block execution charges the decoded
         // `ptb.gas_payer`, not `tx.sender`, so this generic mempool layer
         // must not reject sponsored PTBs based on the relayer's LOOM balance.
+        //
+        // Before bypassing the relayer balance gate, reject PTBs that would
+        // fail before executor-side gas settlement. Otherwise an unfunded key
+        // could gossip malformed or under-capped SubmitPtb envelopes that burn
+        // no fuel at block execution.
+        let bypass_outer_balance = if let TxKind::SubmitPtb { ptb_bytes } = &tx.kind {
+            precheck_submit_ptb(&tx, ptb_bytes)?;
+            true
+        } else {
+            false
+        };
         let fee_reservation = (tx.max_fuel as u128).saturating_mul(tx.fee_per_unit as u128);
         let value = tx_value(&tx);
-        let current_balance = if matches!(tx.kind, TxKind::SubmitPtb { .. }) {
+        let current_balance = if bypass_outer_balance {
             u128::MAX
         } else {
             current_balance
@@ -303,6 +314,39 @@ fn tx_value(tx: &Tx) -> u128 {
         TxKind::Transfer { amount_loom, .. } => *amount_loom,
         TxKind::SubmitPtb { .. } | TxKind::DeployPetal { .. } => 0,
     }
+}
+
+fn precheck_submit_ptb(tx: &Tx, ptb_bytes: &[u8]) -> Result<(), ConsensusError> {
+    let ptb = bloom_script::decode_ptb(ptb_bytes)
+        .map_err(|e| ConsensusError::InvalidSubmitPtb(format!("decode failed: {e}")))?;
+    if tx.max_fuel == 0 {
+        return Err(ConsensusError::InvalidSubmitPtb(
+            "outer max_fuel must be non-zero".to_string(),
+        ));
+    }
+    if ptb.gas_budget == 0 {
+        return Err(ConsensusError::InvalidSubmitPtb(
+            "inner gas_budget must be non-zero".to_string(),
+        ));
+    }
+    if ptb.gas_price == 0 {
+        return Err(ConsensusError::InvalidSubmitPtb(
+            "inner gas_price must be non-zero".to_string(),
+        ));
+    }
+    if tx.max_fuel < ptb.gas_budget {
+        return Err(ConsensusError::InvalidSubmitPtb(format!(
+            "outer max_fuel {} below inner gas_budget {}",
+            tx.max_fuel, ptb.gas_budget
+        )));
+    }
+    if (tx.fee_per_unit as u128) < ptb.gas_price {
+        return Err(ConsensusError::InvalidSubmitPtb(format!(
+            "outer fee_per_unit {} below inner gas_price {}",
+            tx.fee_per_unit, ptb.gas_price
+        )));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

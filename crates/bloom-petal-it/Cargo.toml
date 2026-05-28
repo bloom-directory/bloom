@@ -6,6 +6,9 @@ license = "MIT"
 publish = false
 description = "Integration tests for the bloom-native contracts framework (PTB fungible flow + linearity/cap reverts)"
 
+[lib]
+doctest = false
+
 [dependencies]
 bloom-chain-node     = { path = "../bloom-chain-node" }
 bloom-chain-state    = { path = "../bloom-chain-state" }

@@ -122,7 +122,7 @@ pub struct Genesis {
     pub allocations: Vec<(Address, u128)>,
     pub petals: Vec<(String, Vec<u8>)>,
     pub key_registry: Vec<(Address, PubKeyBytes)>,
-    /// Genesis hash: `blake3("bloom-chain.v0.genesis:" || ssz(chain_id_bytes || genesis_time_ms))`.
+    /// Genesis hash committing to the validated genesis contents.
     pub genesis_hash: Hash32,
 }
 
@@ -228,7 +228,14 @@ impl Genesis {
         }
 
         // Genesis hash.
-        let genesis_hash = compute_genesis_hash(&raw.chain_id, raw.genesis_time_ms);
+        let genesis_hash = compute_genesis_hash(
+            &raw.chain_id,
+            raw.genesis_time_ms,
+            &validator_set,
+            &allocations,
+            &petals,
+            &key_registry,
+        );
 
         Ok(Genesis {
             chain_id: raw.chain_id,
@@ -370,12 +377,53 @@ fn base64_decode(s: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn compute_genesis_hash(chain_id: &str, genesis_time_ms: u64) -> Hash32 {
+fn compute_genesis_hash(
+    chain_id: &str,
+    genesis_time_ms: u64,
+    validator_set: &ValidatorSet,
+    allocations: &[(Address, u128)],
+    petals: &[(String, Vec<u8>)],
+    key_registry: &[(Address, PubKeyBytes)],
+) -> Hash32 {
+    fn put_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
+        let len = u32::try_from(bytes.len()).expect("genesis field exceeds u32 length");
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(bytes);
+    }
+
+    let mut payload = Vec::new();
+    put_len_prefixed(&mut payload, chain_id.as_bytes());
+    payload.extend_from_slice(&genesis_time_ms.to_le_bytes());
+
+    let validators = validator_set.validators();
+    payload.extend_from_slice(&(validators.len() as u32).to_le_bytes());
+    for validator in validators {
+        payload.extend_from_slice(&validator.address.0);
+        put_len_prefixed(&mut payload, &validator.pubkey.0);
+        payload.extend_from_slice(&validator.voting_power.to_le_bytes());
+    }
+
+    payload.extend_from_slice(&(allocations.len() as u32).to_le_bytes());
+    for (address, amount) in allocations {
+        payload.extend_from_slice(&address.0);
+        payload.extend_from_slice(&amount.to_le_bytes());
+    }
+
+    payload.extend_from_slice(&(petals.len() as u32).to_le_bytes());
+    for (path, wasm) in petals {
+        put_len_prefixed(&mut payload, path.as_bytes());
+        put_len_prefixed(&mut payload, wasm);
+    }
+
+    payload.extend_from_slice(&(key_registry.len() as u32).to_le_bytes());
+    for (address, pubkey) in key_registry {
+        payload.extend_from_slice(&address.0);
+        put_len_prefixed(&mut payload, &pubkey.0);
+    }
+
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bloom-chain.v0.genesis:");
-    hasher.update(chain_id.as_bytes());
-    hasher.update(b":");
-    hasher.update(&genesis_time_ms.to_be_bytes());
+    hasher.update(&payload);
     let out = *hasher.finalize().as_bytes();
     Hash32(out)
 }
@@ -683,5 +731,75 @@ mod tests {
             .expect_err("wrong xDSA pubkey length must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("1984 bytes"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn genesis_hash_changes_with_allocations() {
+        let (_sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
+        let validator_addr = Address::from_pubkey_bytes(&pk.0);
+        let validator = ValidatorConfig {
+            address: hex::encode(validator_addr.0),
+            pubkey: base64::engine::general_purpose::STANDARD.encode(&pk.0),
+            voting_power: 100,
+            host: None,
+        };
+        let raw_a = GenesisFile {
+            chain_id: "bloomchain.test".into(),
+            genesis_time_ms: 1,
+            validators: vec![validator.clone()],
+            allocations: vec![GenesisAllocation {
+                address: hex::encode([0x11u8; 32]),
+                amount: "100".into(),
+            }],
+            petals: vec![],
+            key_registry: vec![],
+        };
+        let mut raw_b = raw_a.clone();
+        raw_b.allocations[0].amount = "101".into();
+
+        let hash_a = Genesis::from_raw(raw_a.clone()).unwrap().genesis_hash;
+        let hash_a_again = Genesis::from_raw(raw_a).unwrap().genesis_hash;
+        let hash_b = Genesis::from_raw(raw_b).unwrap().genesis_hash;
+
+        assert_eq!(hash_a, hash_a_again);
+        assert_ne!(hash_a, hash_b);
+    }
+
+    #[test]
+    fn genesis_hash_changes_with_petals_and_key_registry() {
+        let (_validator_sk, validator_pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
+        let validator_addr = Address::from_pubkey_bytes(&validator_pk.0);
+        let (_registry_sk, registry_pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
+        let registry_addr = Address::from_pubkey_bytes(&registry_pk.0);
+        let raw_a = GenesisFile {
+            chain_id: "bloomchain.test".into(),
+            genesis_time_ms: 1,
+            validators: vec![ValidatorConfig {
+                address: hex::encode(validator_addr.0),
+                pubkey: base64::engine::general_purpose::STANDARD.encode(&validator_pk.0),
+                voting_power: 100,
+                host: None,
+            }],
+            allocations: vec![],
+            petals: vec![GenesisPetal {
+                path: "/bloom/example".into(),
+                wasm_hex: "010203".into(),
+            }],
+            key_registry: vec![GenesisKeyRegistryEntry {
+                address: hex::encode(registry_addr.0),
+                pubkey: base64::engine::general_purpose::STANDARD.encode(&registry_pk.0),
+            }],
+        };
+        let mut raw_b = raw_a.clone();
+        raw_b.petals[0].wasm_hex = "010204".into();
+        let mut raw_c = raw_a.clone();
+        raw_c.key_registry.clear();
+
+        let hash_a = Genesis::from_raw(raw_a).unwrap().genesis_hash;
+        let hash_b = Genesis::from_raw(raw_b).unwrap().genesis_hash;
+        let hash_c = Genesis::from_raw(raw_c).unwrap().genesis_hash;
+
+        assert_ne!(hash_a, hash_b);
+        assert_ne!(hash_a, hash_c);
     }
 }

@@ -597,11 +597,18 @@ const CREATE_AND_TRANSFER_PETAL: &str = r#"
 "#;
 
 /// Compute the deterministic ObjectId the host's `derive_create_id`
-/// will produce for `(petal_hash, type_tag_bytes, payload_bytes,
-/// created_objects_so_far=0)`. Mirrors `bloom-petals` exactly.
-fn derive_create_id_test(petal_hash: [u8; 32], tag_bytes: &[u8], payload: &[u8]) -> ObjectId {
+/// will produce for `(ptb_digest, petal_hash, type_tag_bytes,
+/// payload_bytes, created_objects_so_far=0)`. Mirrors `bloom-petals`
+/// exactly.
+fn derive_create_id_test(
+    ptb_digest: [u8; 32],
+    petal_hash: [u8; 32],
+    tag_bytes: &[u8],
+    payload: &[u8],
+) -> ObjectId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bloom.object.create.v1\0");
+    hasher.update(&ptb_digest);
     hasher.update(&petal_hash);
     hasher.update(&0u64.to_be_bytes()); // first object created in this PTB
     hasher.update(tag_bytes);
@@ -714,7 +721,12 @@ fn object_create_then_transfer_round_trips_through_unified_ctx() {
     state.apply(ws).expect("apply write set");
 
     // Compute the deterministic ObjectId the host produced.
-    let new_id = derive_create_id_test(petal_hash.0, &tag_bytes, &new_obj_payload);
+    let new_id = derive_create_id_test(
+        ptb.signing_digest(),
+        petal_hash.0,
+        &tag_bytes,
+        &new_obj_payload,
+    );
 
     // Assert 2 — the new object lives at the derived id with the right
     // owner. Before the P0-2 fix this lookup returned `None` because
