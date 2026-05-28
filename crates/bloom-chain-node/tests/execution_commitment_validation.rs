@@ -5,20 +5,69 @@
 //! peer must not be able to finalize one body while advertising another result.
 
 use bloom_chain_node::consensus_driver::{
-    BLOCK_EMISSION, NoopExecutor, apply_block_state_transitions, validate_block_execution,
+    BLOCK_EMISSION, ExecOutput, NoopExecutor, PetalExecutor, apply_block_state_transitions,
+    validate_block_execution,
 };
+use bloom_chain_node::petal_executor::ChainPetalExecutor;
 use bloom_chain_state::{Account, State};
 use bloom_chain_types::{
+    Address,
     receipt::receipts_root,
     tx::{Tx, TxKind},
     types::{Hash32, PubKeyBytes, SigBytes},
 };
+use bloom_keystore::xdsa::XdsaSecretKey;
 use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
 use bloom_petal_fungible::ops::coin_payload;
 use bloom_script::{
     CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, PtbTx, encode_ptb, loom_coin_type_tag,
+    types::PqSignature,
 };
 use bloom_test_util::{BlockBuilder, make_addr, make_signed_transfer_tx};
+
+struct FreeFailedPtbExecutor;
+
+impl PetalExecutor for FreeFailedPtbExecutor {
+    fn execute_tx(
+        &self,
+        _tx: &Tx,
+        _state: &mut State,
+        _block_number: u64,
+        _timestamp_ms: u64,
+        _proposer: Address,
+        _parent_hash: Hash32,
+    ) -> ExecOutput {
+        ExecOutput {
+            success: false,
+            fuel_used: 0,
+            return_data: b"ptb validation error: synthetic".to_vec(),
+            logs: vec![],
+            write_set: None,
+        }
+    }
+}
+
+struct FuelOnlyFailedPtbExecutor;
+
+impl PetalExecutor for FuelOnlyFailedPtbExecutor {
+    fn execute_tx(
+        &self,
+        _tx: &Tx,
+        _state: &mut State,
+        _block_number: u64,
+        _timestamp_ms: u64,
+        _proposer: Address,
+        _parent_hash: Hash32,
+    ) -> ExecOutput {
+        ExecOutput {
+            success: false,
+            fuel_used: 1,
+            return_data: b"ptb settlement missing: synthetic".to_vec(),
+            logs: vec![],
+            write_set: None,
+        }
+    }
+}
 
 fn fund(state: &mut State, addr: bloom_chain_types::Address, loom: u128) {
     state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
@@ -199,5 +248,283 @@ fn zero_gas_submit_ptb_is_rejected_before_nonce_bump() {
     assert!(
         state.get_account(&sender).is_none(),
         "validation must not bump sender nonce on zero-gas PTB"
+    );
+}
+
+#[test]
+fn bad_inner_signature_submit_ptb_is_rejected_without_nonce_bump() {
+    let (signer_sk, signer_pk) = XdsaSecretKey::generate();
+    let signer = bloom_chain_types::types::Address::from_pubkey_bytes(&signer_pk.0);
+    let outer_pubkey = PubKeyBytes(vec![0xD0; 32]);
+    let outer_sender = bloom_chain_types::types::Address::from_pubkey_bytes(&outer_pubkey.0);
+    let gas_payer = ObjectId([0x91; 32]);
+
+    let mut ptb = PtbTx {
+        signers: vec![signer.0],
+        commands: vec![],
+        gas_payer,
+        gas_budget: 7,
+        gas_price: 3,
+        expiry_block: 99,
+        signatures: vec![PqSignature(vec![0u8; 64])],
+    };
+    let digest = ptb.signing_digest();
+    let mut sig = signer_sk.sign(&digest).to_bytes();
+    sig[0] ^= 0x01;
+    ptb.signatures = vec![PqSignature(sig)];
+    let ptb_bytes = encode_ptb(&ptb).expect("PTB encodes");
+    let tx = Tx {
+        chain_id: "bloom-chain.v0".to_string(),
+        sender: outer_sender,
+        nonce: 1,
+        max_fuel: 7,
+        fee_per_unit: 3,
+        kind: TxKind::SubmitPtb { ptb_bytes },
+        pubkey: outer_pubkey,
+        sig: SigBytes(vec![0u8; 64]),
+    };
+
+    let mut state = State::new();
+    state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
+    state.register_pubkey(signer, PubKeyBytes(signer_pk.to_bytes()));
+    state.set_object(Object {
+        id: gas_payer,
+        type_tag: loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
+        owner: Owner::Address(signer.0),
+        version: 1,
+        payload: coin_payload(1_000_000),
+    });
+    let block = BlockBuilder::at(1)
+        .chain_id("bloom-chain.v0")
+        .proposer(make_addr(0x11))
+        .txs(vec![tx])
+        .fuel_limit(7)
+        .build();
+
+    let err = validate_block_execution(&state, &ChainPetalExecutor, &block, 0)
+        .expect_err("bad inner signature SubmitPtb must invalidate block execution");
+
+    assert!(
+        err.contains("prechecked PTB must charge positive fuel"),
+        "got: {err}"
+    );
+    assert!(
+        state.get_account(&outer_sender).is_none(),
+        "validation must not bump outer sender nonce for bad inner signature"
+    );
+}
+
+#[test]
+fn failed_submit_ptb_cannot_advance_nonce_without_fuel_or_settlement() {
+    let pubkey = PubKeyBytes(vec![0xEF; 32]);
+    let sender = bloom_chain_types::types::Address::from_pubkey_bytes(&pubkey.0);
+    let ptb_bytes = encode_ptb(&PtbTx {
+        gas_budget: 7,
+        gas_price: 3,
+        expiry_block: 99,
+        ..PtbTx::default()
+    })
+    .expect("PTB encodes");
+    let tx = Tx {
+        chain_id: "bloom-chain.v0".to_string(),
+        sender,
+        nonce: 1,
+        max_fuel: 7,
+        fee_per_unit: 3,
+        kind: TxKind::SubmitPtb { ptb_bytes },
+        pubkey,
+        sig: SigBytes(vec![0u8; 64]),
+    };
+    let state = State::new();
+    let block = BlockBuilder::at(1)
+        .chain_id("bloom-chain.v0")
+        .proposer(make_addr(0x11))
+        .txs(vec![tx])
+        .fuel_limit(7)
+        .build();
+
+    let err = validate_block_execution(&state, &FreeFailedPtbExecutor, &block, 0)
+        .expect_err("free failed SubmitPtb must invalidate block execution");
+
+    assert!(
+        err.contains("prechecked PTB must charge positive fuel"),
+        "got: {err}"
+    );
+    assert!(
+        state.get_account(&sender).is_none(),
+        "validation must not bump sender nonce for a free failed PTB"
+    );
+}
+
+#[test]
+fn failed_submit_ptb_cannot_report_fuel_without_gas_settlement() {
+    let pubkey = PubKeyBytes(vec![0xF0; 32]);
+    let sender = bloom_chain_types::types::Address::from_pubkey_bytes(&pubkey.0);
+    let ptb_bytes = encode_ptb(&PtbTx {
+        gas_budget: 7,
+        gas_price: 3,
+        expiry_block: 99,
+        ..PtbTx::default()
+    })
+    .expect("PTB encodes");
+    let tx = Tx {
+        chain_id: "bloom-chain.v0".to_string(),
+        sender,
+        nonce: 1,
+        max_fuel: 7,
+        fee_per_unit: 3,
+        kind: TxKind::SubmitPtb { ptb_bytes },
+        pubkey,
+        sig: SigBytes(vec![0u8; 64]),
+    };
+    let state = State::new();
+    let block = BlockBuilder::at(1)
+        .chain_id("bloom-chain.v0")
+        .proposer(make_addr(0x11))
+        .txs(vec![tx])
+        .fuel_limit(7)
+        .build();
+
+    let err = validate_block_execution(&state, &FuelOnlyFailedPtbExecutor, &block, 0)
+        .expect_err("failed SubmitPtb with no gas settlement must invalidate block execution");
+
+    assert!(
+        err.contains("prechecked PTB must charge positive fuel"),
+        "got: {err}"
+    );
+    assert!(
+        state.get_account(&sender).is_none(),
+        "validation must not bump sender nonce without gas settlement"
+    );
+}
+
+#[test]
+fn successful_submit_ptb_cannot_advance_nonce_with_zero_fuel() {
+    struct ZeroFuelSuccessPtbExecutor;
+
+    impl PetalExecutor for ZeroFuelSuccessPtbExecutor {
+        fn execute_tx(
+            &self,
+            _tx: &Tx,
+            state: &mut State,
+            _block_number: u64,
+            _timestamp_ms: u64,
+            _proposer: Address,
+            _parent_hash: Hash32,
+        ) -> ExecOutput {
+            ExecOutput {
+                success: true,
+                fuel_used: 0,
+                return_data: vec![],
+                logs: vec![],
+                write_set: Some(state.snapshot().commit()),
+            }
+        }
+    }
+
+    let pubkey = PubKeyBytes(vec![0xF1; 32]);
+    let sender = bloom_chain_types::types::Address::from_pubkey_bytes(&pubkey.0);
+    let ptb_bytes = encode_ptb(&PtbTx {
+        gas_budget: 7,
+        gas_price: 3,
+        expiry_block: 99,
+        ..PtbTx::default()
+    })
+    .expect("PTB encodes");
+    let tx = Tx {
+        chain_id: "bloom-chain.v0".to_string(),
+        sender,
+        nonce: 1,
+        max_fuel: 7,
+        fee_per_unit: 3,
+        kind: TxKind::SubmitPtb { ptb_bytes },
+        pubkey,
+        sig: SigBytes(vec![0u8; 64]),
+    };
+    let state = State::new();
+    let block = BlockBuilder::at(1)
+        .chain_id("bloom-chain.v0")
+        .proposer(make_addr(0x11))
+        .txs(vec![tx])
+        .fuel_limit(7)
+        .build();
+
+    let err = validate_block_execution(&state, &ZeroFuelSuccessPtbExecutor, &block, 0)
+        .expect_err("successful zero-fuel SubmitPtb must invalidate block execution");
+
+    assert!(
+        err.contains("prechecked PTB must charge positive fuel"),
+        "got: {err}"
+    );
+    assert!(
+        state.get_account(&sender).is_none(),
+        "validation must not bump sender nonce for successful zero-fuel PTB"
+    );
+}
+
+#[test]
+fn non_ptb_zero_fee_envelope_is_rejected_before_nonce_bump() {
+    let (sk, _pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
+    let tx = make_signed_transfer_tx(&sk, "bloom-chain.v0", make_addr(0x77), 1, 1, 1_000, 0);
+    let mut state = State::new();
+    fund(&mut state, tx.sender, 1_000_000);
+    let block = BlockBuilder::at(1)
+        .chain_id("bloom-chain.v0")
+        .proposer(make_addr(0x11))
+        .txs(vec![tx.clone()])
+        .fuel_limit(1_000)
+        .build();
+
+    let err = validate_block_execution(&state, &NoopExecutor, &block, 0)
+        .expect_err("zero-fee non-PTB tx must invalidate block execution");
+
+    assert!(err.contains("non-PTB tx envelope"), "got: {err}");
+    assert!(
+        state
+            .get_account(&tx.sender)
+            .map(|acct| acct.nonce == 0)
+            .unwrap_or(true),
+        "validation must not bump sender nonce for zero-fee non-PTB tx"
+    );
+}
+
+#[test]
+fn successful_non_ptb_cannot_advance_nonce_with_zero_fuel() {
+    let pubkey = PubKeyBytes(vec![0xF2; 32]);
+    let sender = bloom_chain_types::types::Address::from_pubkey_bytes(&pubkey.0);
+    let tx = Tx {
+        chain_id: "bloom-chain.v0".to_string(),
+        sender,
+        nonce: 1,
+        max_fuel: 1_000,
+        fee_per_unit: 1,
+        kind: TxKind::DeployPetal {
+            wasm_bytes: vec![0x00, 0x61, 0x73, 0x6d],
+        },
+        pubkey,
+        sig: SigBytes(vec![0u8; 64]),
+    };
+    let mut state = State::new();
+    fund(&mut state, sender, 1_000_000);
+    let block = BlockBuilder::at(1)
+        .chain_id("bloom-chain.v0")
+        .proposer(make_addr(0x11))
+        .txs(vec![tx])
+        .fuel_limit(1_000)
+        .build();
+
+    let err = validate_block_execution(&state, &NoopExecutor, &block, 0)
+        .expect_err("successful zero-fuel non-PTB tx must invalidate block execution");
+
+    assert!(
+        err.contains("successful tx must charge positive fuel"),
+        "got: {err}"
+    );
+    assert!(
+        state
+            .get_account(&sender)
+            .map(|acct| acct.nonce == 0)
+            .unwrap_or(true),
+        "validation must not bump sender nonce for successful zero-fuel non-PTB tx"
     );
 }

@@ -675,6 +675,14 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
                 parent_hash,
             );
 
+            if output.fuel_used == 0 || output.write_set.is_none() {
+                return Err(
+                    "invalid SubmitPtb execution output: prechecked PTB must charge positive fuel \
+                     and emit gas settlement"
+                        .to_string(),
+                );
+            }
+
             // Apply whatever the executor produced. On revert the
             // executor still emits a write_set that carries the
             // burnt-gas accounting (gas-payer debit + proposer
@@ -700,6 +708,12 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
 
         // 3. Max-fee reservation (non-PTB txs).
         let max_fee = tx.max_fuel as u128 * tx.fee_per_unit as u128;
+        if tx.max_fuel == 0 || tx.fee_per_unit == 0 {
+            return Err(
+                "invalid non-PTB tx envelope: max_fuel and fee_per_unit must be non-zero"
+                    .to_string(),
+            );
+        }
         let value = match &tx.kind {
             TxKind::Transfer { amount_loom, .. } => *amount_loom,
             TxKind::DeployPetal { .. } => 0,
@@ -763,6 +777,13 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
             proposer,
             parent_hash,
         );
+
+        if output.success && output.fuel_used == 0 {
+            return Err(
+                "invalid non-PTB execution output: successful tx must charge positive fuel"
+                    .to_string(),
+            );
+        }
 
         if output.success {
             if let Some(ws) = output.write_set.clone() {
