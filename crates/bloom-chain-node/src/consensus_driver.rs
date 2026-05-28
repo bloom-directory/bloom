@@ -325,16 +325,6 @@ pub fn validate_block_for_apply(
 
     let block_hash = h.block_hash();
     let commit = &block.commit;
-    let proposer_matches_proposal_round = (0..=commit.round)
-        .any(|round| validator_set.proposer_for(h.height, round).address == h.proposer);
-    if !proposer_matches_proposal_round {
-        return Err(format!(
-            "header.proposer={} is not a proposer for height={} in rounds 0..={}",
-            hex::encode(h.proposer.0),
-            h.height,
-            commit.round
-        ));
-    }
     if commit.height != h.height {
         return Err(format!(
             "commit.height={} != header.height={}",
@@ -346,6 +336,19 @@ pub fn validate_block_for_apply(
             "commit.block_hash={} != header.block_hash={}",
             hex::encode(commit.block_hash.0),
             hex::encode(block_hash.0)
+        ));
+    }
+    let proposer_round_window = validator_set
+        .len()
+        .min((commit.round as usize).saturating_add(1));
+    let proposer_matches_proposal_round = (0..proposer_round_window)
+        .any(|round| validator_set.proposer_for(h.height, round as u32).address == h.proposer);
+    if !proposer_matches_proposal_round {
+        return Err(format!(
+            "header.proposer={} is not a proposer for height={} in bounded rounds 0..{}",
+            hex::encode(h.proposer.0),
+            h.height,
+            proposer_round_window
         ));
     }
 

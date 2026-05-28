@@ -114,6 +114,35 @@ fn block_with_wrong_header_proposer_is_rejected() {
 }
 
 #[test]
+fn huge_commit_round_with_unscheduled_proposer_is_rejected_without_unbounded_scan() {
+    let v1 = make_validator_with_keypair();
+    let v2 = make_validator_with_keypair();
+    let v3 = make_validator_with_keypair();
+    let v4 = make_validator_with_keypair();
+    let vset = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
+    let mut block = BlockBuilder::at(5)
+        .chain_id("bloom-chain.v0")
+        .parent_hash(Hash32([0x42; 32]))
+        .proposer(Address([0xFE; 32]))
+        .with_computed_roots(&vset)
+        .signed_by(&[&v1])
+        .build();
+    block.commit.round = u32::MAX;
+
+    let result = validate_block_for_apply(
+        &block,
+        5,
+        "bloom-chain.v0",
+        Hash32([0x42; 32]),
+        &vset,
+        &XdsaVerifier,
+    );
+
+    let err = result.expect_err("unscheduled proposer must be rejected");
+    assert!(err.contains("header.proposer"), "got: {err}");
+}
+
+#[test]
 fn block_with_tampered_txs_root_is_rejected() {
     let v1 = make_validator_with_keypair();
     let v2 = make_validator_with_keypair();
