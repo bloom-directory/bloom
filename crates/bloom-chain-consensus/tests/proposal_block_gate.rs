@@ -17,11 +17,11 @@
 
 use std::collections::BTreeMap;
 
-use bloom_chain_consensus::state_machine::{Action, ConsensusState, Event, ProposalOrVote};
+use bloom_chain_consensus::state_machine::{Action, ConsensusState, Event, ProposalOrVote, Step};
 use bloom_chain_types::{
     block::Block,
     types::{Hash32, SigBytes},
-    vote::{Proposal, VoteKind},
+    vote::{Proposal, Vote, VoteKind},
 };
 use bloom_test_util::{BlockBuilder, make_addr, make_validator_set_fake};
 
@@ -164,6 +164,80 @@ fn pending_proposal_replays_when_block_arrives() {
         sm.pending_proposal.is_none(),
         "pending_proposal must clear after successful resume"
     );
+}
+
+#[test]
+fn pending_proposal_resume_rechecks_buffered_prevote_quorum() {
+    // Reordered TCP can deliver Proposal first, then prevotes for that
+    // proposal, and only later the BlockResponse. While the proposal is
+    // stashed the machine is still in Propose, so receiving those prevotes
+    // records the tally but does not run the current-round quorum branch.
+    // Resuming the proposal must therefore re-check that buffered tally and
+    // precommit immediately instead of waiting for the prevote timeout.
+    let height = 1u64;
+    let proposer_idx = 1u8;
+
+    let block = make_block(height, proposer_idx);
+    let block_hash = block.header.block_hash();
+    let mut blocks: BTreeMap<Hash32, Block> = BTreeMap::new();
+    let mut sm = ConsensusState::new(height, make_addr(0), make_validator_set_fake(4, 100));
+    let proposal = Proposal {
+        height,
+        round: 0,
+        block_hash,
+        pol_round: -1,
+        proposer: make_addr(proposer_idx),
+        sig: SigBytes(vec![]),
+    };
+
+    let initial = sm.handle(Event::ReceiveProposal(proposal), &blocks);
+    assert!(
+        initial.is_empty(),
+        "unknown block proposal should be stashed"
+    );
+    assert_eq!(sm.step, Step::Propose);
+
+    for validator in [1u8, 2, 3] {
+        let vote = Vote {
+            height,
+            round: 0,
+            kind: VoteKind::Prevote,
+            block_hash: Some(block_hash),
+            validator: make_addr(validator),
+            sig: SigBytes(vec![]),
+        };
+        let actions = sm.handle(Event::ReceiveVote(vote), &blocks);
+        assert!(
+            actions.is_empty(),
+            "prevotes received before proposal resume should only be tallied"
+        );
+    }
+    assert_eq!(sm.step, Step::Propose);
+
+    blocks.insert(block_hash, block);
+    let resumed = sm.try_resume_pending_proposal(&blocks);
+    let prevote = resumed.iter().find_map(|a| match a {
+        Action::Broadcast(ProposalOrVote::Vote(v)) if v.kind == VoteKind::Prevote => Some(v),
+        _ => None,
+    });
+    let precommit = resumed.iter().find_map(|a| match a {
+        Action::Broadcast(ProposalOrVote::Vote(v)) if v.kind == VoteKind::Precommit => Some(v),
+        _ => None,
+    });
+
+    assert_eq!(
+        prevote.and_then(|v| v.block_hash),
+        Some(block_hash),
+        "resume must still broadcast this validator's prevote"
+    );
+    assert_eq!(
+        precommit.and_then(|v| v.block_hash),
+        Some(block_hash),
+        "resume must immediately precommit the buffered prevote quorum"
+    );
+    assert_eq!(sm.step, Step::Precommit);
+    assert_eq!(sm.locked_block, Some((0, block_hash)));
+    assert_eq!(sm.valid_block, Some((0, block_hash)));
 }
 
 #[test]

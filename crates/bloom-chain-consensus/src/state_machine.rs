@@ -280,8 +280,10 @@ impl ConsensusState {
     /// If a proposal was previously stashed because its block was unknown,
     /// and the block is now in `blocks`, re-run `on_proposal` against it.
     /// Returns any actions emitted by the resumed handler — typically a
-    /// prevote broadcast and a Prevote timeout. Returns an empty vec if
-    /// there is no pending proposal or the block is still missing.
+    /// prevote broadcast and a Prevote timeout. If current-round prevotes
+    /// reached quorum while the proposal was stashed, this also emits the
+    /// immediate precommit transition that `on_vote` could not run while
+    /// the state machine was still in `Propose`.
     ///
     /// Called by the node after a `Frame::BlockResponse` registers a new
     /// block. Without this, a validator that received a proposal frame
@@ -300,7 +302,9 @@ impl ConsensusState {
             return vec![];
         }
         let p = self.pending_proposal.take().unwrap();
-        self.on_proposal(p, blocks)
+        let mut actions = self.on_proposal(p, blocks);
+        actions.extend(self.try_precommit_current_round_from_prevotes(blocks));
+        actions
     }
 
     /// Re-check precommit tallies for a freshly-registered block hash. If any
@@ -503,32 +507,14 @@ impl ConsensusState {
 
         match v.kind {
             VoteKind::Prevote => {
-                let tally = self.prevotes.entry(v.round).or_default();
-                tally.record(v.validator, power, v.block_hash);
+                self.prevotes
+                    .entry(v.round)
+                    .or_default()
+                    .record(v.validator, power, v.block_hash);
 
                 // Check for 2f+1 prevotes for a non-nil hash in the current round.
                 if v.round == self.round && self.step == Step::Prevote {
-                    if let Some(Some(hash)) = tally.quorum_hash(quorum) {
-                        if !blocks.contains_key(&hash) {
-                            return actions;
-                        }
-                        // 2f+1 prevotes for a concrete block — update valid_block.
-                        self.valid_block = Some((self.round, hash));
-                        // Precommit for it.
-                        self.step = Step::Precommit;
-                        let precommit = self.make_precommit(Some(hash));
-                        // Lock on this block.
-                        self.locked_block = Some((self.round, hash));
-                        actions.push(Action::Broadcast(ProposalOrVote::Vote(precommit)));
-                        actions.push(Action::StartTimeout(TimeoutKind::Precommit, TIMEOUT));
-                    } else if let Some(None) = tally.quorum_hash(quorum) {
-                        // 2f+1 nil-prevotes — unlock and nil-precommit.
-                        self.locked_block = None;
-                        self.step = Step::Precommit;
-                        let precommit = self.make_precommit(None);
-                        actions.push(Action::Broadcast(ProposalOrVote::Vote(precommit)));
-                        actions.push(Action::StartTimeout(TimeoutKind::Precommit, TIMEOUT));
-                    }
+                    actions.extend(self.try_precommit_current_round_from_prevotes(blocks));
                 }
 
                 // For past rounds: if 2f+1 prevotes arrive late and we haven't advanced yet,
@@ -588,6 +574,50 @@ impl ConsensusState {
         }
 
         actions
+    }
+
+    fn try_precommit_current_round_from_prevotes(
+        &mut self,
+        blocks: &BTreeMap<Hash32, Block>,
+    ) -> Vec<Action> {
+        if self.step != Step::Prevote {
+            return vec![];
+        }
+        let quorum = self.validator_set.quorum();
+        let quorum_hash = self
+            .prevotes
+            .get(&self.round)
+            .and_then(|tally| tally.quorum_hash(quorum));
+
+        match quorum_hash {
+            Some(Some(hash)) => {
+                if !blocks.contains_key(&hash) {
+                    return vec![];
+                }
+                // 2f+1 prevotes for a concrete block — update valid_block
+                // and precommit for it.
+                self.valid_block = Some((self.round, hash));
+                self.step = Step::Precommit;
+                let precommit = self.make_precommit(Some(hash));
+                // Lock on this block.
+                self.locked_block = Some((self.round, hash));
+                vec![
+                    Action::Broadcast(ProposalOrVote::Vote(precommit)),
+                    Action::StartTimeout(TimeoutKind::Precommit, TIMEOUT),
+                ]
+            }
+            Some(None) => {
+                // 2f+1 nil-prevotes — unlock and nil-precommit.
+                self.locked_block = None;
+                self.step = Step::Precommit;
+                let precommit = self.make_precommit(None);
+                vec![
+                    Action::Broadcast(ProposalOrVote::Vote(precommit)),
+                    Action::StartTimeout(TimeoutKind::Precommit, TIMEOUT),
+                ]
+            }
+            None => vec![],
+        }
     }
 
     // ---------------------------------------------------------------------------
