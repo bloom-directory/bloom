@@ -26,6 +26,7 @@ use bloom_chain_state::State;
 use bloom_chain_types::{
     block::{Block, BlockHeader},
     receipt::receipts_root,
+    tx::Tx,
     types::{Address, Hash32},
     vote::Commit,
 };
@@ -38,8 +39,8 @@ use tracing::{debug, error, info, warn};
 use crate::{
     block_store::BlockStore,
     consensus_driver::{
-        BLOCK_EMISSION, ConsensusDriver, PetalExecutor, XdsaVerifier,
-        apply_block_state_transitions, coin_loom_balance, compute_txs_root, resolve_loom_coin_type,
+        BLOCK_EMISSION, ConsensusDriver, PetalExecutor, XdsaVerifier, coin_loom_balance,
+        compute_txs_root, resolve_loom_coin_type, try_apply_block_state_transitions,
         validate_block_for_apply,
     },
     genesis::Genesis,
@@ -318,50 +319,23 @@ impl Node {
                         st.get_account(addr).map(|a| a.nonce).unwrap_or(0)
                     })
                 };
-                let txs_root = compute_txs_root(&txs);
-                let validator_set_hash = bb_validator_set.validator_set_hash();
-
-                let header = BlockHeader {
+                let template = ProposalBlockTemplate {
                     chain_id: bb_chain_id.clone(),
                     height,
                     parent_hash,
                     timestamp_ms,
                     proposer: bb_local_address,
-                    txs_root,
-                    state_root: Hash32([0u8; 32]),
-                    receipts_root: Hash32([0u8; 32]),
-                    validator_set_hash,
-                    fuel_used: 0,
+                    validator_set_hash: bb_validator_set.validator_set_hash(),
                     fuel_limit,
                 };
-
-                let mut block = Block {
-                    header,
+                let state = bb_state.lock();
+                build_proposal_block_from_candidates(
+                    &template,
+                    &state,
+                    &ChainPetalExecutor,
+                    BLOCK_EMISSION,
                     txs,
-                    commit: Commit {
-                        height: 0,
-                        round: 0,
-                        block_hash: Hash32([0u8; 32]),
-                        votes: vec![],
-                    },
-                };
-
-                let (fuel_used, receipts, state_root) = {
-                    let state = bb_state.lock();
-                    let mut scratch = state.clone();
-                    let (fuel, receipts) = apply_block_state_transitions(
-                        &mut scratch,
-                        &ChainPetalExecutor,
-                        &block,
-                        BLOCK_EMISSION,
-                    );
-                    (fuel, receipts, scratch.state_root())
-                };
-                block.header.state_root = state_root;
-                block.header.receipts_root = receipts_root(&receipts);
-                block.header.fuel_used = fuel_used;
-
-                block
+                )
             },
         );
 
@@ -1356,6 +1330,133 @@ fn prune_committed_mempool_persist(
     }
 }
 
+#[derive(Clone)]
+struct ProposalBlockTemplate {
+    chain_id: String,
+    height: u64,
+    parent_hash: Hash32,
+    timestamp_ms: u64,
+    proposer: Address,
+    validator_set_hash: Hash32,
+    fuel_limit: u64,
+}
+
+fn build_proposal_block_from_candidates<E: PetalExecutor>(
+    template: &ProposalBlockTemplate,
+    base_state: &State,
+    executor: &E,
+    block_emission: u128,
+    candidates: Vec<Tx>,
+) -> Block {
+    let mut accepted = Vec::with_capacity(candidates.len());
+
+    for candidate in candidates {
+        let mut trial_txs = accepted.clone();
+        trial_txs.push(candidate.clone());
+        let trial_block = template.block_with_txs(trial_txs);
+        let mut scratch = base_state.clone();
+
+        match try_apply_block_state_transitions(
+            &mut scratch,
+            executor,
+            &trial_block,
+            block_emission,
+        ) {
+            Ok((_fuel, receipts))
+                if receipts.len() == trial_block.txs.len()
+                    && receipts.last().is_some_and(|receipt| {
+                        receipt.tx_hash == candidate.tx_hash() && receipt.fuel_used > 0
+                    }) =>
+            {
+                accepted.push(candidate)
+            }
+            Ok((_fuel, receipts)) => {
+                warn!(
+                    sender = %hex::encode(candidate.sender.0),
+                    nonce = candidate.nonce,
+                    receipts = receipts.len(),
+                    txs = trial_block.txs.len(),
+                    "proposal.builder dropped selected tx that did not execute"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    sender = %hex::encode(candidate.sender.0),
+                    nonce = candidate.nonce,
+                    err = %e,
+                    "proposal.builder dropped invalid selected tx"
+                );
+            }
+        }
+    }
+
+    match finalize_proposal_block(template, base_state, executor, block_emission, accepted) {
+        Ok(block) => block,
+        Err(e) => {
+            warn!(
+                err = %e,
+                "proposal.builder fell back to empty block after filtered tx set failed"
+            );
+            finalize_proposal_block(template, base_state, executor, block_emission, Vec::new())
+                .expect("empty proposal block must execute")
+        }
+    }
+}
+
+fn finalize_proposal_block<E: PetalExecutor>(
+    template: &ProposalBlockTemplate,
+    base_state: &State,
+    executor: &E,
+    block_emission: u128,
+    txs: Vec<Tx>,
+) -> std::result::Result<Block, String> {
+    let mut block = template.block_with_txs(txs);
+    let mut scratch = base_state.clone();
+    let (fuel_used, receipts) =
+        try_apply_block_state_transitions(&mut scratch, executor, &block, block_emission)?;
+    if receipts.len() != block.txs.len() {
+        return Err(format!(
+            "proposal execution emitted {} receipts for {} txs",
+            receipts.len(),
+            block.txs.len()
+        ));
+    }
+    if receipts.iter().any(|receipt| receipt.fuel_used == 0) {
+        return Err("proposal execution emitted zero-fuel transaction receipt".to_string());
+    }
+    block.header.state_root = scratch.state_root();
+    block.header.receipts_root = receipts_root(&receipts);
+    block.header.fuel_used = fuel_used;
+    Ok(block)
+}
+
+impl ProposalBlockTemplate {
+    fn block_with_txs(&self, txs: Vec<Tx>) -> Block {
+        Block {
+            header: BlockHeader {
+                chain_id: self.chain_id.clone(),
+                height: self.height,
+                parent_hash: self.parent_hash,
+                timestamp_ms: self.timestamp_ms,
+                proposer: self.proposer,
+                txs_root: compute_txs_root(&txs),
+                state_root: Hash32([0u8; 32]),
+                receipts_root: Hash32([0u8; 32]),
+                validator_set_hash: self.validator_set_hash,
+                fuel_used: 0,
+                fuel_limit: self.fuel_limit,
+            },
+            txs,
+            commit: Commit {
+                height: 0,
+                round: 0,
+                block_hash: Hash32([0u8; 32]),
+                votes: vec![],
+            },
+        }
+    }
+}
+
 fn proposal_header_round(proposal_round: u32, pol_round: i32) -> Option<u32> {
     if pol_round >= 0 {
         let pol_round = pol_round as u32;
@@ -1688,6 +1789,7 @@ async fn wait_for_shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consensus_driver::ExecOutput;
     use bloom_chain_consensus::ConsensusEngine;
     use bloom_chain_state::Account;
     use bloom_chain_types::{
@@ -1697,7 +1799,10 @@ mod tests {
     };
     use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
     use bloom_petal_fungible::ops::coin_payload;
-    use bloom_script::{CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, loom_coin_type_tag};
+    use bloom_script::{
+        CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, encode_ptb, loom_coin_type_tag,
+        types::PtbTx,
+    };
     use bloom_test_util::{make_validator_set_signed, make_validator_with_keypair};
 
     fn signed_transfer_tx(
@@ -1829,6 +1934,101 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].sender, tx2.sender);
         assert_eq!(remaining[0].nonce, tx2.nonce);
+    }
+
+    struct NonceTwoFreeFailedPtbExecutor;
+
+    impl PetalExecutor for NonceTwoFreeFailedPtbExecutor {
+        fn execute_tx(
+            &self,
+            tx: &Tx,
+            state: &mut State,
+            _block_number: u64,
+            _timestamp_ms: u64,
+            _proposer: Address,
+            _parent_hash: Hash32,
+        ) -> ExecOutput {
+            if tx.nonce == 2 {
+                return ExecOutput {
+                    success: false,
+                    fuel_used: 0,
+                    return_data: b"missing gas payer".to_vec(),
+                    logs: vec![],
+                    write_set: None,
+                };
+            }
+
+            ExecOutput {
+                success: true,
+                fuel_used: 1,
+                return_data: vec![],
+                logs: vec![],
+                write_set: Some(state.snapshot().commit()),
+            }
+        }
+    }
+
+    fn unsigned_submit_ptb_tx(sender_byte: u8, nonce: u64) -> Tx {
+        let pubkey = PubKeyBytes(vec![sender_byte; 32]);
+        let ptb_bytes = encode_ptb(&PtbTx {
+            gas_budget: 7,
+            gas_price: 3,
+            expiry_block: 99,
+            gas_payer: ObjectId([0xC0; 32]),
+            ..PtbTx::default()
+        })
+        .expect("PTB encodes");
+        Tx {
+            chain_id: "bloomchain.test".into(),
+            sender: Address::from_pubkey_bytes(&pubkey.0),
+            nonce,
+            max_fuel: 7,
+            fee_per_unit: 3,
+            kind: TxKind::SubmitPtb { ptb_bytes },
+            pubkey,
+            sig: SigBytes(vec![0u8; 64]),
+        }
+    }
+
+    #[test]
+    fn proposal_block_builder_drops_selected_ptb_that_breaks_execution() {
+        let base_state = State::new();
+        let proposer = Address([0x44; 32]);
+        let template = ProposalBlockTemplate {
+            chain_id: "bloomchain.test".into(),
+            height: 1,
+            parent_hash: Hash32([0u8; 32]),
+            timestamp_ms: 123,
+            proposer,
+            validator_set_hash: Hash32([0x55; 32]),
+            fuel_limit: 14,
+        };
+        let tx1 = unsigned_submit_ptb_tx(0xA1, 1);
+        let tx2 = unsigned_submit_ptb_tx(0xA1, 2);
+        let tx3 = unsigned_submit_ptb_tx(0xA1, 3);
+
+        let block = build_proposal_block_from_candidates(
+            &template,
+            &base_state,
+            &NonceTwoFreeFailedPtbExecutor,
+            0,
+            vec![tx1.clone(), tx2, tx3],
+        );
+
+        assert_eq!(block.txs, vec![tx1]);
+        assert_eq!(block.header.fuel_used, 1);
+        assert_eq!(block.header.txs_root, compute_txs_root(&block.txs));
+        assert_eq!(block.header.state_root, {
+            let mut scratch = base_state.clone();
+            try_apply_block_state_transitions(
+                &mut scratch,
+                &NonceTwoFreeFailedPtbExecutor,
+                &block,
+                0,
+            )
+            .expect("filtered proposal executes");
+            scratch.state_root()
+        });
     }
 
     #[test]
