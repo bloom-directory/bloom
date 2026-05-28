@@ -533,6 +533,22 @@ impl Node {
                         // Snapshot the validator set out of the engine guard
                         // before verifying — xDSA verify is the slow path and
                         // must not block engine progress on every inbound msg.
+                        let my_height = { driver_ev.engine.lock().height() };
+                        if p.height > my_height {
+                            // We're behind. Ask this peer for the gap.
+                            request_missing_blocks(&peer_pool_ev, &peer_addr, my_height, p.height)
+                                .await;
+                            continue;
+                        }
+                        if p.height < my_height {
+                            debug!(
+                                peer = %peer_addr,
+                                height = p.height,
+                                my_height,
+                                "frame.proposal ignored: stale height"
+                            );
+                            continue;
+                        }
                         let validator_set = { driver_ev.engine.lock().validator_set.clone() };
                         if !bloom_chain_consensus::auth::verify_proposal_sig(
                             &p,
@@ -546,13 +562,6 @@ impl Node {
                                 proposer = ?p.proposer,
                                 "frame.proposal rejected: invalid signature"
                             );
-                            continue;
-                        }
-                        let my_height = { driver_ev.engine.lock().height() };
-                        if p.height > my_height {
-                            // We're behind. Ask this peer for the gap.
-                            request_missing_blocks(&peer_pool_ev, &peer_addr, my_height, p.height)
-                                .await;
                             continue;
                         }
                         // Same-height proposal whose block we don't have? The
@@ -616,6 +625,22 @@ impl Node {
                         // Snapshot the validator set out of the engine guard
                         // before verifying — xDSA verify is the slow path and
                         // must not block engine progress on every inbound msg.
+                        let my_height = { driver_ev.engine.lock().height() };
+                        if v.height > my_height {
+                            // We're behind. Ask this peer for the gap.
+                            request_missing_blocks(&peer_pool_ev, &peer_addr, my_height, v.height)
+                                .await;
+                            continue;
+                        }
+                        if v.height < my_height {
+                            debug!(
+                                peer = %peer_addr,
+                                height = v.height,
+                                my_height,
+                                "frame.vote ignored: stale height"
+                            );
+                            continue;
+                        }
                         let validator_set = { driver_ev.engine.lock().validator_set.clone() };
                         if !bloom_chain_consensus::auth::verify_vote_sig(
                             &v,
@@ -630,13 +655,6 @@ impl Node {
                                 validator = ?v.validator,
                                 "frame.vote rejected: invalid signature"
                             );
-                            continue;
-                        }
-                        let my_height = { driver_ev.engine.lock().height() };
-                        if v.height > my_height {
-                            // We're behind. Ask this peer for the gap.
-                            request_missing_blocks(&peer_pool_ev, &peer_addr, my_height, v.height)
-                                .await;
                             continue;
                         }
                         let actions = { driver_ev.engine.lock().step(Event::ReceiveVote(v)) };
@@ -727,19 +745,32 @@ impl Node {
                         let block_height = block.header.height;
                         let block_hash = block.header.block_hash();
                         let my_height = { driver_ev.engine.lock().height() };
-                        let has_commit = !block.commit.votes.is_empty()
-                            && block.commit.height == block.header.height;
+                        if block_height < my_height {
+                            debug!(
+                                peer = %peer_addr,
+                                height = block_height,
+                                my_height,
+                                "block_response ignored: stale height"
+                            );
+                            continue;
+                        }
+                        if block_height > my_height {
+                            request_missing_blocks(
+                                &peer_pool_ev,
+                                &peer_addr,
+                                my_height,
+                                block_height.saturating_add(1),
+                            )
+                            .await;
+                            continue;
+                        }
+                        let has_commit = !block.commit.votes.is_empty();
                         if block_height == my_height {
-                            let (round, header_round) = {
+                            let (round, body_kind) = {
                                 let eng = driver_ev.engine.lock();
                                 (
                                     eng.round(),
-                                    block_response_header_round(
-                                        &eng,
-                                        block_hash,
-                                        eng.round(),
-                                        block.header.proposer,
-                                    ),
+                                    current_height_block_response_body_kind(&eng, &block),
                                 )
                             };
                             if has_commit {
@@ -755,22 +786,40 @@ impl Node {
                                     );
                                     continue;
                                 }
-                            } else if let Some(header_round) = header_round
-                                && let Err(e) = driver_ev.validate_proposal_block(
+                            } else {
+                                let header_round = match body_kind {
+                                    Ok(CurrentHeightBlockBodyKind::Proposal { header_round }) => {
+                                        header_round
+                                    }
+                                    Ok(CurrentHeightBlockBodyKind::Committed) => unreachable!(
+                                        "has_commit and block-response body kind disagree"
+                                    ),
+                                    Err(e) => {
+                                        warn!(
+                                            peer = %peer_addr,
+                                            height = block_height,
+                                            round,
+                                            err = %e,
+                                            "block_response rejected: invalid proposal body context"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                if let Err(e) = driver_ev.validate_proposal_block(
                                     &block,
                                     block_height,
                                     round,
                                     header_round,
-                                )
-                            {
-                                warn!(
-                                    peer = %peer_addr,
-                                    height = block_height,
-                                    round,
-                                    err = %e,
-                                    "block_response rejected: invalid proposal body"
-                                );
-                                continue;
+                                ) {
+                                    warn!(
+                                        peer = %peer_addr,
+                                        height = block_height,
+                                        round,
+                                        err = %e,
+                                        "block_response rejected: invalid proposal body"
+                                    );
+                                    continue;
+                                }
                             }
                         }
                         {
@@ -1318,6 +1367,34 @@ fn proposal_header_round(proposal_round: u32, pol_round: i32) -> Option<u32> {
     Some(proposal_round)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurrentHeightBlockBodyKind {
+    Committed,
+    Proposal { header_round: u32 },
+}
+
+fn current_height_block_response_body_kind(
+    engine: &ConsensusEngine<XdsaVerifier>,
+    block: &Block,
+) -> std::result::Result<CurrentHeightBlockBodyKind, String> {
+    if !block.commit.votes.is_empty() {
+        return Ok(CurrentHeightBlockBodyKind::Committed);
+    }
+
+    let block_hash = block.header.block_hash();
+    let Some(header_round) =
+        block_response_header_round(engine, block_hash, engine.round(), block.header.proposer)
+    else {
+        return Err(format!(
+            "no valid proposal context for block hash {} at height {} proposer {}",
+            hex::encode(block_hash.0),
+            block.header.height,
+            hex::encode(block.header.proposer.0)
+        ));
+    };
+    Ok(CurrentHeightBlockBodyKind::Proposal { header_round })
+}
+
 fn block_response_header_round(
     engine: &ConsensusEngine<XdsaVerifier>,
     block_hash: Hash32,
@@ -1436,6 +1513,18 @@ async fn apply_state_snapshot<E: PetalExecutor>(
             hex::encode(block.header.state_root.0)
         ));
     }
+    let validator_set = { driver.engine.lock().validator_set.clone() };
+    let expected_parent_hash = expected_snapshot_parent_hash(&driver.block_store, height)?;
+    validate_block_for_apply(
+        &block,
+        height,
+        &driver.chain_id,
+        expected_parent_hash,
+        &validator_set,
+        &XdsaVerifier,
+    )
+    .map_err(|reason| anyhow::anyhow!("snapshot commit validation failed: {reason}"))?;
+
     let actual_blob_hash = State::blob_hash(&blob);
     if actual_blob_hash != blob_hash {
         return Err(anyhow::anyhow!(
@@ -1465,17 +1554,6 @@ async fn apply_state_snapshot<E: PetalExecutor>(
             hex::encode(block.header.parent_hash.0)
         ));
     }
-    let validator_set = { driver.engine.lock().validator_set.clone() };
-    let expected_parent_hash = expected_snapshot_parent_hash(&driver.block_store, height)?;
-    validate_block_for_apply(
-        &block,
-        height,
-        &driver.chain_id,
-        expected_parent_hash,
-        &validator_set,
-        &XdsaVerifier,
-    )
-    .map_err(|reason| anyhow::anyhow!("snapshot commit validation failed: {reason}"))?;
 
     let state = State::from_blob(&blob, state_root)
         .with_context(|| format!("restore snapshot state at height {height}"))?;
@@ -1615,6 +1693,7 @@ mod tests {
     use bloom_chain_types::{
         tx::{Tx, TxKind},
         types::{PubKeyBytes, SigBytes},
+        vote::{Vote, VoteKind},
     };
     use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
     use bloom_petal_fungible::ops::coin_payload;
@@ -1775,6 +1854,64 @@ mod tests {
             block_response_header_round(&engine, Hash32([0x42; 32]), 0, header_proposer);
 
         assert_eq!(header_round, Some(0));
+    }
+
+    #[test]
+    fn current_height_block_response_rejects_uncommitted_body_without_proposal_context() {
+        let v1 = make_validator_with_keypair();
+        let v2 = make_validator_with_keypair();
+        let v3 = make_validator_with_keypair();
+        let v4 = make_validator_with_keypair();
+        let validator_set = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
+        let engine = ConsensusEngine::new(
+            1,
+            v1.addr,
+            validator_set,
+            XdsaVerifier,
+            None,
+            30_000_000,
+            None,
+        );
+        let mut block = test_block(1, Hash32([0; 32]));
+        block.header.proposer = Address([0xFE; 32]);
+
+        let err = current_height_block_response_body_kind(&engine, &block)
+            .expect_err("uncommitted body with unscheduled proposer must be rejected");
+
+        assert!(err.contains("no valid proposal context"), "got: {err}");
+    }
+
+    #[test]
+    fn current_height_block_response_treats_any_nonempty_commit_as_committed() {
+        let v1 = make_validator_with_keypair();
+        let v2 = make_validator_with_keypair();
+        let v3 = make_validator_with_keypair();
+        let v4 = make_validator_with_keypair();
+        let validator_set = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
+        let engine = ConsensusEngine::new(
+            1,
+            v1.addr,
+            validator_set,
+            XdsaVerifier,
+            None,
+            30_000_000,
+            None,
+        );
+        let mut block = test_block(1, Hash32([0; 32]));
+        block.commit.height = 999;
+        block.commit.votes.push(Vote {
+            height: 999,
+            round: 0,
+            kind: VoteKind::Precommit,
+            block_hash: Some(block.header.block_hash()),
+            validator: v1.addr,
+            sig: SigBytes(vec![0u8; 64]),
+        });
+
+        let kind = current_height_block_response_body_kind(&engine, &block)
+            .expect("nonempty commits must be sent to committed-block validation");
+
+        assert_eq!(kind, CurrentHeightBlockBodyKind::Committed);
     }
 
     #[test]
