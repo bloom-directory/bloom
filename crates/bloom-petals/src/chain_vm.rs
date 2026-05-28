@@ -3,7 +3,7 @@
 //! # Wasmtime configuration (spec §7.5)
 //!
 //! The chain engine uses a **separate** `wasmtime::Engine` from the
-//! local/onchain engine so the config cannot bleed across modes.
+//! local engine so the config cannot bleed across modes.
 //!
 //! | Setting | Value | Reason |
 //! |---------|-------|--------|
@@ -170,7 +170,7 @@ fn chain_engine() -> Result<&'static Engine, PetalError> {
         config.async_support(false);
         // Fuel metering required for gas pricing (spec §7.9).
         config.consume_fuel(true);
-        // Determinism: NaN canonicalization (same as local/onchain engine).
+        // Determinism: NaN canonicalization (same as local engine).
         config.cranelift_nan_canonicalization(true);
         // Relaxed SIMD is non-deterministic across microarchitectures; disabled.
         config.wasm_relaxed_simd(false);

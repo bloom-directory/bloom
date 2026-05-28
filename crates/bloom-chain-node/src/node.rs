@@ -839,6 +839,7 @@ impl Node {
                             {
                                 driver_ev.engine.lock().mempool.remove_included(&block.txs);
                             }
+                            prune_committed_mempool_persist(&driver_ev.mempool_persist, &block.txs);
                             let next_actions =
                                 { driver_ev.engine.lock().enter_next_height(block_height + 1) };
                             process_actions(
@@ -1135,6 +1136,10 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                             .mempool
                             .remove_included(&block_with_commit.txs);
                     }
+                    prune_committed_mempool_persist(
+                        &driver.mempool_persist,
+                        &block_with_commit.txs,
+                    );
                     // Enter the next height IMMEDIATELY. The state machine
                     // returns a `StartTimeout(Propose, 500ms)` we deliberately
                     // discard — we'll arm the propose timer after a full
@@ -1241,6 +1246,25 @@ fn reload_persisted_mempool(
     let _ = mempool_persist.flush();
     info!(admitted, purged, "mempool.reload complete");
     Ok(())
+}
+
+fn prune_committed_mempool_persist(
+    mempool_persist: &MempoolPersist,
+    txs: &[bloom_chain_types::tx::Tx],
+) {
+    for tx in txs {
+        if let Err(e) = mempool_persist.remove(&tx.sender, tx.nonce) {
+            warn!(
+                sender = %hex::encode(tx.sender.0),
+                nonce = tx.nonce,
+                err = %e,
+                "mempool_persist.remove committed tx failed"
+            );
+        }
+    }
+    if let Err(e) = mempool_persist.flush() {
+        warn!(err = %e, "mempool_persist.flush after committed prune failed");
+    }
 }
 
 fn proposal_header_round(proposal_round: u32, pol_round: i32) -> u32 {
@@ -1626,6 +1650,27 @@ mod tests {
 
         reload_persisted_mempool(&mut engine, &shared_state, &mempool_persist).unwrap();
         assert_eq!(engine.mempool.len(), 1);
+    }
+
+    #[test]
+    fn committed_txs_are_pruned_from_persistent_mempool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mempool_persist = MempoolPersist::open(&tmp.path().join("mempool.sled")).unwrap();
+        let (sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
+        let tx1 = signed_transfer_tx(&sk, &pk);
+        let mut tx2 = tx1.clone();
+        tx2.nonce = 2;
+        let digest = tx2.signing_digest();
+        tx2.sig = SigBytes(sk.sign(&digest.0).to_bytes());
+        mempool_persist.put(&tx1).unwrap();
+        mempool_persist.put(&tx2).unwrap();
+
+        prune_committed_mempool_persist(&mempool_persist, std::slice::from_ref(&tx1));
+
+        let remaining = mempool_persist.load_all().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].sender, tx2.sender);
+        assert_eq!(remaining[0].nonce, tx2.nonce);
     }
 
     #[test]

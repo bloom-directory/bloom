@@ -18,12 +18,6 @@ pub enum HostError {
     Invalid(String),
     #[error("backend: {0}")]
     Backend(String),
-    #[error("block not pinnable (block=0)")]
-    BlockNotPinnable,
-    #[error("chain unavailable: {0}")]
-    ChainUnavailable(String),
-    #[error("chain path unknown: {0}")]
-    ChainPathUnknown(String),
 }
 
 impl HostError {
@@ -34,9 +28,6 @@ impl HostError {
             HostError::Denied(_) => -2,
             HostError::Invalid(_) => -3,
             HostError::Backend(_) => -4,
-            HostError::BlockNotPinnable => -5,
-            HostError::ChainUnavailable(_) => -6,
-            HostError::ChainPathUnknown(_) => -7,
         }
     }
 }
@@ -49,19 +40,6 @@ pub trait PetalHost: Send + Sync {
     /// Write `bytes` to the writable file at `path` in the surrounding
     /// VFS.
     async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError>;
-
-    /// Read a pinned-block view of a chain VFS path. `chain` is the
-    /// canonical chain id (e.g. `"ethereum"`); `path` is the
-    /// chains-VFS-relative path; `block` is the block number.
-    ///
-    /// Onchain petals call this via `bloom.chain_read_at`. Local petals
-    /// reach the live chain state via `vfs_read` instead.
-    async fn chain_read_at(
-        &self,
-        chain: &str,
-        path: &str,
-        block: u64,
-    ) -> Result<Vec<u8>, HostError>;
 }
 
 /// An always-denying host. Useful as a default and in tests where the
@@ -74,14 +52,6 @@ impl PetalHost for DenyHost {
         Err(HostError::Denied("DenyHost".into()))
     }
     async fn vfs_write(&self, _path: &str, _bytes: &[u8]) -> Result<(), HostError> {
-        Err(HostError::Denied("DenyHost".into()))
-    }
-    async fn chain_read_at(
-        &self,
-        _chain: &str,
-        _path: &str,
-        _block: u64,
-    ) -> Result<Vec<u8>, HostError> {
         Err(HostError::Denied("DenyHost".into()))
     }
 }
@@ -97,9 +67,6 @@ mod tests {
             HostError::Denied("x".into()).as_wasm_code(),
             HostError::Invalid("x".into()).as_wasm_code(),
             HostError::Backend("x".into()).as_wasm_code(),
-            HostError::BlockNotPinnable.as_wasm_code(),
-            HostError::ChainUnavailable("eth".into()).as_wasm_code(),
-            HostError::ChainPathUnknown("p".into()).as_wasm_code(),
         ];
         let mut sorted = codes.clone();
         sorted.sort();
@@ -110,28 +77,14 @@ mod tests {
         }
     }
 
-    /// The wasm-facing error codes are part of the host ABI: changing them
-    /// would silently break already-installed onchain petals. Pin the exact
-    /// numeric assignments so a careless swap gets caught at test time.
+    /// The wasm-facing error codes are part of the local host ABI. Pin the
+    /// exact numeric assignments so a careless swap gets caught at test time.
     #[test]
     fn error_codes_are_pinned() {
         assert_eq!(HostError::NotFound("x".into()).as_wasm_code(), -1);
         assert_eq!(HostError::Denied("x".into()).as_wasm_code(), -2);
         assert_eq!(HostError::Invalid("x".into()).as_wasm_code(), -3);
         assert_eq!(HostError::Backend("x".into()).as_wasm_code(), -4);
-        assert_eq!(HostError::BlockNotPinnable.as_wasm_code(), -5);
-        assert_eq!(HostError::ChainUnavailable("eth".into()).as_wasm_code(), -6);
-        assert_eq!(HostError::ChainPathUnknown("p".into()).as_wasm_code(), -7);
-    }
-
-    #[tokio::test]
-    async fn deny_host_denies_chain_read() {
-        let h = DenyHost;
-        assert!(matches!(
-            h.chain_read_at("eth", "chains/eth/state/0x0/balance", 1)
-                .await,
-            Err(HostError::Denied(_))
-        ));
     }
 
     #[tokio::test]

@@ -4,15 +4,12 @@
 //! the `public/` prefix):
 //!
 //! ```text
-//! .                          → directory listing: { local/, onchain/, names/ }
+//! .                          → directory listing: { local/, names/ }
 //! local/                     → directory of installed local petals
 //! local/<hash>/              → directory
 //! local/<hash>/wasm          → file, read-only, raw wasm bytes
 //! local/<hash>/meta.json     → file, read-only, PetalMeta as JSON
 //! local/<name>               → symlink → <hash> (only if meta.mode == Local)
-//! onchain/                   → directory of installed onchain petals
-//! onchain/<hash>/...         → same layout as local/<hash>/...
-//! onchain/<name>             → symlink → <hash> (only if meta.mode == Onchain)
 //! names/                     → directory
 //! names/<name>               → file, *writable*; body is the target hash
 //! ```
@@ -34,7 +31,6 @@ use crate::store::{PetalStore, is_valid_hex_hash};
 /// Reserved child of `public/` that exposes the name → hash registry.
 const NAMES_DIR: &str = "names";
 const LOCAL_DIR: &str = "local";
-const ONCHAIN_DIR: &str = "onchain";
 
 use crate::meta::PetalMode;
 
@@ -64,7 +60,6 @@ impl Handler for PetalsHandler {
             [] => Ok(Entry::dir("")),
             [seg] if seg == NAMES_DIR => Ok(Entry::dir(NAMES_DIR)),
             [seg] if seg == LOCAL_DIR => Ok(Entry::dir(LOCAL_DIR)),
-            [seg] if seg == ONCHAIN_DIR => Ok(Entry::dir(ONCHAIN_DIR)),
             [first, name] if first == NAMES_DIR => {
                 validate_name(name).map_err(map_err)?;
                 let entry = match self.registry.lookup(name) {
@@ -176,11 +171,7 @@ impl Handler for PetalsHandler {
 
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         match path.segments() {
-            [] => Ok(vec![
-                Entry::dir(LOCAL_DIR),
-                Entry::dir(ONCHAIN_DIR),
-                Entry::dir(NAMES_DIR),
-            ]),
+            [] => Ok(vec![Entry::dir(LOCAL_DIR), Entry::dir(NAMES_DIR)]),
             [seg] if seg == NAMES_DIR => {
                 let mut out = Vec::new();
                 for (name, _hash) in self.registry.snapshot() {
@@ -225,15 +216,11 @@ impl Handler for PetalsHandler {
 }
 
 fn is_mode_dir(s: &str) -> bool {
-    s == LOCAL_DIR || s == ONCHAIN_DIR
+    s == LOCAL_DIR
 }
 
-fn mode_for_seg(s: &str) -> PetalMode {
-    if s == ONCHAIN_DIR {
-        PetalMode::Onchain
-    } else {
-        PetalMode::Local
-    }
+fn mode_for_seg(_s: &str) -> PetalMode {
+    PetalMode::Local
 }
 
 fn map_err(e: PetalError) -> HandlerError {
@@ -272,7 +259,7 @@ mod tests {
     use std::collections::BTreeSet;
     use tempfile::TempDir;
 
-    fn setup_with_modes() -> (TempDir, PetalsHandler, String, String) {
+    fn setup_with_local() -> (TempDir, PetalsHandler, String) {
         let dir = TempDir::new().unwrap();
         let store = PetalStore::open(dir.path().join("store")).unwrap();
         let reg = Arc::new(NameRegistry::open(dir.path().join("reg")).unwrap());
@@ -286,58 +273,34 @@ mod tests {
                 PetalMode::Local,
             )
             .unwrap();
-        let mut chain_caps = BTreeSet::new();
-        chain_caps.insert(Capability::ChainRead);
-        let (rc, _) = store
-            .install(
-                b"\x00asm\x01\x00\x00\x00onchain",
-                Some("snap"),
-                &chain_caps,
-                PetalMode::Onchain,
-            )
-            .unwrap();
         reg.set("greet", &rl.hash).unwrap();
-        reg.set("snap", &rc.hash).unwrap();
         let h = PetalsHandler::new(store, reg);
-        (dir, h, rl.hash, rc.hash)
+        (dir, h, rl.hash)
     }
 
     #[tokio::test]
-    async fn root_lists_local_onchain_names() {
-        let (_d, h, _, _) = setup_with_modes();
+    async fn root_lists_local_and_names() {
+        let (_d, h, _) = setup_with_local();
         let entries = h.list(&VfsPath::parse("/").unwrap()).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"local"));
-        assert!(names.contains(&"onchain"));
         assert!(names.contains(&"names"));
     }
 
     #[tokio::test]
     async fn local_subtree_lists_only_local_petals() {
-        let (_d, h, local_hash, _onchain_hash) = setup_with_modes();
+        let (_d, h, local_hash) = setup_with_local();
         let entries = h.list(&VfsPath::parse("/local").unwrap()).await.unwrap();
         let hashes: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(
             hashes.contains(&local_hash.as_str()),
             "missing local: {hashes:?}"
         );
-        assert!(
-            hashes.iter().all(|n| n != &"snap" || *n == "greet"),
-            "leaked onchain hash into local: {hashes:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn onchain_hash_in_local_path_is_not_found() {
-        let (_d, h, _local_hash, onchain_hash) = setup_with_modes();
-        let p = VfsPath::parse(&format!("/local/{onchain_hash}")).unwrap();
-        let err = h.lookup(&p).await.unwrap_err();
-        assert!(matches!(err, HandlerError::NotFound(_)), "{err:?}");
     }
 
     #[tokio::test]
     async fn read_wasm_under_correct_mode_subtree() {
-        let (_d, h, local_hash, _) = setup_with_modes();
+        let (_d, h, local_hash) = setup_with_local();
         let p = VfsPath::parse(&format!("/local/{local_hash}/wasm")).unwrap();
         let body = h.read(&p).await.unwrap();
         assert_eq!(body, b"\x00asm\x01\x00\x00\x00local");
@@ -345,7 +308,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_to_names_sets_registry() {
-        let (_d, h, local_hash, _) = setup_with_modes();
+        let (_d, h, local_hash) = setup_with_local();
         let p = VfsPath::parse("/names/anothername").unwrap();
         h.write(&p, local_hash.as_bytes()).await.unwrap();
         assert_eq!(h.registry().lookup("anothername"), Some(local_hash));

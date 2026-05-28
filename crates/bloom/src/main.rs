@@ -140,11 +140,6 @@ enum PetalsCmd {
         /// `--cap vfs.read --cap vfs.write`.
         #[arg(long = "cap", value_name = "CAP")]
         caps: Vec<String>,
-        /// Petal mode. `local` (default) lets the petal touch the VFS;
-        /// `onchain` restricts it to deterministic chain reads and is
-        /// eligible for replay verification.
-        #[arg(long, default_value = "local", value_parser = ["local", "onchain"])]
-        mode: String,
     },
     /// Run a petal by petname or hash.
     Run {
@@ -159,9 +154,6 @@ enum PetalsCmd {
         /// flag, the petal runs with all of its declared caps.
         #[arg(long = "cap", value_name = "CAP")]
         cap_mask: Vec<String>,
-        /// Write an onchain run attestation JSON to this path.
-        #[arg(long)]
-        attest: Option<String>,
     },
     /// List installed petals.
     Ls,
@@ -171,18 +163,6 @@ enum PetalsCmd {
     Uninstall {
         /// 64-char hex content hash of the petal to remove.
         hash: String,
-    },
-    /// Re-run an onchain petal and verify its output hash matches
-    /// `--expect`. Exits non-zero on mismatch.
-    Replay {
-        /// Petname or 64-char hex hash.
-        name_or_hash: String,
-        /// Path to a file containing the stdin bytes, or `-` for stdin.
-        #[arg(long)]
-        input: String,
-        /// Expected output hash (64-char hex BLAKE3).
-        #[arg(long)]
-        expect: String,
     },
 }
 
@@ -545,12 +525,7 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
     let vfs_arc = std::sync::Arc::new(d.vfs.clone());
 
     match cmd {
-        PetalsCmd::Install {
-            path,
-            name,
-            caps,
-            mode,
-        } => {
+        PetalsCmd::Install { path, name, caps } => {
             let bytes = if path == "-" {
                 let mut buf = Vec::new();
                 std::io::stdin()
@@ -566,14 +541,14 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("unknown capability: {c:?}"))?;
                 cap_set.insert(cap);
             }
-            let mode = match mode.as_str() {
-                "local" => bloom_petals::PetalMode::Local,
-                "onchain" => bloom_petals::PetalMode::Onchain,
-                other => anyhow::bail!("unknown mode {other:?}; expected 'local' or 'onchain'"),
-            };
             let (result, meta) = d
                 .petals
-                .install(&bytes, name.as_deref(), &cap_set, mode)
+                .install(
+                    &bytes,
+                    name.as_deref(),
+                    &cap_set,
+                    bloom_petals::PetalMode::Local,
+                )
                 .context("install petal")?;
             println!("hash: {}", result.hash);
             println!("mode: {}", meta.mode.as_str());
@@ -594,7 +569,6 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
             name_or_hash,
             input,
             cap_mask,
-            attest,
         } => {
             let stdin = match input.as_deref() {
                 Some("-") => {
@@ -619,27 +593,11 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                 Some(s)
             };
             let host = std::sync::Arc::new(VfsHost::new(vfs_arc.clone()));
-            let (out, attestation) = if attest.is_some() {
-                d.petals
-                    .run_attested(&name_or_hash, stdin, host, cap_mask, RunOptions::default())
-                    .await
-                    .context("run petal")?
-            } else {
-                (
-                    d.petals
-                        .run(&name_or_hash, stdin, host, cap_mask, RunOptions::default())
-                        .await
-                        .context("run petal")?,
-                    None,
-                )
-            };
-            if let Some(path) = attest {
-                let attestation = attestation.ok_or_else(|| {
-                    anyhow::anyhow!("--attest is only supported for onchain petals")
-                })?;
-                let body = serde_json::to_vec_pretty(&attestation).context("encode attestation")?;
-                std::fs::write(&path, body).with_context(|| format!("write attestation {path}"))?;
-            }
+            let out = d
+                .petals
+                .run(&name_or_hash, stdin, host, cap_mask, RunOptions::default())
+                .await
+                .context("run petal")?;
             use std::io::Write;
             // Stream stdout/stderr to the user verbatim so they can pipe
             // a petal's output. Exit code goes to the parent process.
@@ -707,37 +665,6 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                 println!("not installed: {hash}");
             }
             Ok(())
-        }
-        PetalsCmd::Replay {
-            name_or_hash,
-            input,
-            expect,
-        } => {
-            let stdin = if input == "-" {
-                let mut buf = Vec::new();
-                std::io::stdin()
-                    .read_to_end(&mut buf)
-                    .context("read stdin")?;
-                buf
-            } else {
-                std::fs::read(&input).with_context(|| format!("read {input}"))?
-            };
-            let host = std::sync::Arc::new(VfsHost::new(vfs_arc.clone()));
-            let outcome = d
-                .petals
-                .replay(&name_or_hash, stdin, &expect, host, RunOptions::default())
-                .await
-                .context("replay petal")?;
-            if outcome.matched {
-                println!("match: {}", outcome.actual_output_hash);
-                Ok(())
-            } else {
-                eprintln!(
-                    "mismatch:\n  expected: {expect}\n  actual:   {}",
-                    outcome.actual_output_hash
-                );
-                std::process::exit(1);
-            }
         }
     }
 }

@@ -53,10 +53,6 @@ pub struct StoreData {
     host: Arc<dyn PetalHost>,
     caps: BTreeSet<Capability>,
     petal_hash: String,
-    onchain_stdin: Vec<u8>,
-    onchain_stdin_pos: usize,
-    onchain_stdout: Vec<u8>,
-    onchain_stderr: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -156,10 +152,6 @@ impl PetalVm {
                 host,
                 caps,
                 petal_hash: petal_hash.to_string(),
-                onchain_stdin: stdin,
-                onchain_stdin_pos: 0,
-                onchain_stdout: Vec::new(),
-                onchain_stderr: Vec::new(),
             },
         );
         store
@@ -177,17 +169,10 @@ impl PetalVm {
 
         let exit_code = run_command(&mut store, &linker, &module).await;
         let fuel_consumed = opts.fuel.saturating_sub(store.get_fuel().unwrap_or(0));
-        let (stdout_bytes, stderr_bytes) = match mode {
-            crate::meta::PetalMode::Onchain => (
-                store.data().onchain_stdout.clone(),
-                store.data().onchain_stderr.clone(),
-            ),
-            _ => (stdout.contents().to_vec(), stderr.contents().to_vec()),
-        };
 
         Ok(RunOutput {
-            stdout: stdout_bytes,
-            stderr: stderr_bytes,
+            stdout: stdout.contents().to_vec(),
+            stderr: stderr.contents().to_vec(),
             exit_code,
             fuel_consumed,
         })
@@ -237,90 +222,8 @@ fn link_wasi_for_mode(
         crate::meta::PetalMode::Local => {
             preview1::add_to_linker_async(linker, |s: &mut StoreData| &mut s.wasi)?;
         }
-        crate::meta::PetalMode::Onchain => link_minimal_onchain_wasi(linker)?,
         crate::meta::PetalMode::Chain => {}
     }
-    Ok(())
-}
-
-fn link_minimal_onchain_wasi(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
-    linker.func_wrap(
-        "wasi_snapshot_preview1",
-        "proc_exit",
-        |code: i32| -> anyhow::Result<()> { Err(anyhow::Error::new(wasmtime_wasi::I32Exit(code))) },
-    )?;
-    linker.func_wrap(
-        "wasi_snapshot_preview1",
-        "fd_write",
-        |mut caller: Caller<'_, StoreData>,
-         fd: i32,
-         iovs_ptr: i32,
-         iovs_len: i32,
-         nwritten_ptr: i32|
-         -> i32 {
-            let mem = match get_memory(&mut caller) {
-                Some(m) => m,
-                None => return wasi_errno_inval(),
-            };
-            let bytes = match read_iovs(&mem, &mut caller, iovs_ptr, iovs_len) {
-                Ok(b) => b,
-                Err(c) => return c,
-            };
-            let target = match fd {
-                1 => &mut caller.data_mut().onchain_stdout,
-                2 => &mut caller.data_mut().onchain_stderr,
-                _ => return wasi_errno_badf(),
-            };
-            if target.len().saturating_add(bytes.len()) > STDOUT_CAP {
-                return wasi_errno_inval();
-            }
-            target.extend_from_slice(&bytes);
-            write_u32(&mem, &mut caller, nwritten_ptr, bytes.len() as u32)
-        },
-    )?;
-    linker.func_wrap(
-        "wasi_snapshot_preview1",
-        "fd_read",
-        |mut caller: Caller<'_, StoreData>,
-         fd: i32,
-         iovs_ptr: i32,
-         iovs_len: i32,
-         nread_ptr: i32|
-         -> i32 {
-            if fd != 0 {
-                return wasi_errno_badf();
-            }
-            let mem = match get_memory(&mut caller) {
-                Some(m) => m,
-                None => return wasi_errno_inval(),
-            };
-            let iovs = match read_iov_headers(&mem, &mut caller, iovs_ptr, iovs_len) {
-                Ok(v) => v,
-                Err(c) => return c,
-            };
-            let mut total = 0usize;
-            for (dst, len) in iovs {
-                let (chunk, new_pos) = {
-                    let d = caller.data();
-                    let available = d.onchain_stdin.len().saturating_sub(d.onchain_stdin_pos);
-                    let take = available.min(len as usize);
-                    (
-                        d.onchain_stdin[d.onchain_stdin_pos..d.onchain_stdin_pos + take].to_vec(),
-                        d.onchain_stdin_pos + take,
-                    )
-                };
-                if chunk.is_empty() {
-                    break;
-                }
-                if let Err(c) = write_bytes(&mem, &mut caller, dst, &chunk) {
-                    return c;
-                }
-                caller.data_mut().onchain_stdin_pos = new_pos;
-                total += chunk.len();
-            }
-            write_u32(&mem, &mut caller, nread_ptr, total as u32)
-        },
-    )?;
     Ok(())
 }
 
@@ -331,7 +234,6 @@ fn link_imports_for_mode(
     use crate::meta::PetalMode;
     match mode {
         PetalMode::Local => link_local_imports(linker),
-        PetalMode::Onchain => link_onchain_imports(linker),
         PetalMode::Chain => {
             // Chain mode uses its own engine/store type (ChainStoreData) and
             // is driven via PetalVm::run_chain_call, not via PetalVm::run.
@@ -423,79 +325,6 @@ fn link_local_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn link_onchain_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
-    linker.func_wrap_async(
-        "bloom",
-        "chain_read_at",
-        |mut caller: Caller<'_, StoreData>,
-         params: (i32, i32, i64, i32, i32)|
-         -> Box<dyn std::future::Future<Output = i32> + Send + '_> {
-            let (chain_ptr, chain_len, block, dst_ptr, dst_max) = params;
-            Box::new(async move {
-                let cap_ok = caller.data().caps.contains(&Capability::ChainRead);
-                if !cap_ok {
-                    log_denied(caller.data(), "chain_read_at");
-                    return HostError::Denied("chain.read".into()).as_wasm_code();
-                }
-                if block == 0 {
-                    return HostError::BlockNotPinnable.as_wasm_code();
-                }
-                let mem = match get_memory(&mut caller) {
-                    Some(m) => m,
-                    None => return HostError::Invalid("no exported memory".into()).as_wasm_code(),
-                };
-                // Spec ABI: one utf-8 path buffer in the existing
-                // `chains/<chain>/...` namespace. For compatibility with
-                // early fixtures we also accept `<chain>\0<path>`.
-                let raw = match read_bytes(&mem, &mut caller, chain_ptr, chain_len) {
-                    Ok(b) => b,
-                    Err(c) => return c,
-                };
-                let raw = match String::from_utf8(raw) {
-                    Ok(s) => s,
-                    Err(_) => return HostError::Invalid("path not utf-8".into()).as_wasm_code(),
-                };
-                let (chain, path) = match raw.split_once('\0') {
-                    Some((chain, path)) if !chain.is_empty() && !path.is_empty() => {
-                        (chain.to_string(), path.to_string())
-                    }
-                    Some(_) => {
-                        return HostError::Invalid("chain_read_at: empty chain/path".into())
-                            .as_wasm_code();
-                    }
-                    None => match parse_chain_path(&raw) {
-                        Some((chain, path)) => (chain, path),
-                        None => {
-                            return HostError::Invalid(
-                                "chain_read_at: expected chains/<chain>/... path".into(),
-                            )
-                            .as_wasm_code();
-                        }
-                    },
-                };
-                let host = caller.data().host.clone();
-                match host.chain_read_at(&chain, &path, block as u64).await {
-                    Ok(bytes) => {
-                        if dst_max < 0 {
-                            return HostError::Invalid("dst_max < 0".into()).as_wasm_code();
-                        }
-                        let need = bytes.len();
-                        if need > dst_max as usize {
-                            return -((need as i32).saturating_add(PetalVm::OVERFLOW_BIAS));
-                        }
-                        if let Err(c) = write_bytes(&mem, &mut caller, dst_ptr, &bytes) {
-                            return c;
-                        }
-                        need as i32
-                    }
-                    Err(e) => e.as_wasm_code(),
-                }
-            })
-        },
-    )?;
-    Ok(())
-}
-
 fn log_denied(d: &StoreData, op: &str) {
     tracing::info!(
         target: "bloom_petals::vm",
@@ -503,16 +332,6 @@ fn log_denied(d: &StoreData, op: &str) {
         op,
         "host capability denied"
     );
-}
-
-fn parse_chain_path(path: &str) -> Option<(String, String)> {
-    let normalized = path.trim_start_matches('/');
-    let rest = normalized.strip_prefix("chains/")?;
-    let (chain, tail) = rest.split_once('/')?;
-    if chain.is_empty() || tail.is_empty() {
-        return None;
-    }
-    Some((chain.to_string(), normalized.to_string()))
 }
 
 fn get_memory(caller: &mut Caller<'_, StoreData>) -> Option<Memory> {
@@ -568,63 +387,6 @@ fn write_bytes(
         .ok_or(HostError::Invalid("oob write".into()).as_wasm_code())?;
     slot.copy_from_slice(bytes);
     Ok(())
-}
-
-fn read_iov_headers(
-    mem: &Memory,
-    caller: &mut Caller<'_, StoreData>,
-    iovs_ptr: i32,
-    iovs_len: i32,
-) -> Result<Vec<(i32, i32)>, i32> {
-    if iovs_ptr < 0 || iovs_len < 0 {
-        return Err(wasi_errno_inval());
-    }
-    let mut iovs = Vec::with_capacity(iovs_len as usize);
-    let data = mem.data(caller);
-    let base = iovs_ptr as usize;
-    for idx in 0..iovs_len as usize {
-        let off = base
-            .checked_add(idx.saturating_mul(8))
-            .ok_or_else(wasi_errno_inval)?;
-        let end = off.checked_add(8).ok_or_else(wasi_errno_inval)?;
-        let raw = data.get(off..end).ok_or_else(wasi_errno_inval)?;
-        let ptr = i32::from_le_bytes(raw[0..4].try_into().expect("slice length"));
-        let len = i32::from_le_bytes(raw[4..8].try_into().expect("slice length"));
-        if ptr < 0 || len < 0 {
-            return Err(wasi_errno_inval());
-        }
-        iovs.push((ptr, len));
-    }
-    Ok(iovs)
-}
-
-fn read_iovs(
-    mem: &Memory,
-    caller: &mut Caller<'_, StoreData>,
-    iovs_ptr: i32,
-    iovs_len: i32,
-) -> Result<Vec<u8>, i32> {
-    let iovs = read_iov_headers(mem, caller, iovs_ptr, iovs_len)?;
-    let mut out = Vec::new();
-    for (ptr, len) in iovs {
-        out.extend(read_bytes(mem, caller, ptr, len)?);
-    }
-    Ok(out)
-}
-
-fn write_u32(mem: &Memory, caller: &mut Caller<'_, StoreData>, ptr: i32, value: u32) -> i32 {
-    match write_bytes(mem, caller, ptr, &value.to_le_bytes()) {
-        Ok(()) => 0,
-        Err(_) => wasi_errno_inval(),
-    }
-}
-
-fn wasi_errno_badf() -> i32 {
-    8
-}
-
-fn wasi_errno_inval() -> i32 {
-    28
 }
 
 /// Memory growth limiter. We only care about the page cap; everything
@@ -759,25 +521,6 @@ mod tests {
         assert_eq!(out.stdout, b"hi\n");
     }
 
-    #[tokio::test]
-    async fn onchain_mode_allows_stdio_but_not_full_wasi() {
-        let vm = PetalVm::new().unwrap();
-        let out = vm
-            .run(
-                &wat(HELLO_WASI),
-                Vec::new(),
-                BTreeSet::new(),
-                Arc::new(DenyHost),
-                "h",
-                PetalMode::Onchain,
-                RunOptions::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(out.exit_code, 0);
-        assert_eq!(out.stdout, b"hi\n");
-    }
-
     /// Petal that calls `bloom.vfs_read("k")` and writes the resulting
     /// length (as a single byte) to stdout. Tests the host bridge +
     /// capability gating.
@@ -835,19 +578,6 @@ mod tests {
             self.store.lock().insert(path.into(), bytes.to_vec());
             Ok(())
         }
-        async fn chain_read_at(
-            &self,
-            chain: &str,
-            path: &str,
-            block: u64,
-        ) -> Result<Vec<u8>, HostError> {
-            let key = format!("@{block}:{chain}/{path}");
-            self.store
-                .lock()
-                .get(&key)
-                .cloned()
-                .ok_or_else(|| HostError::NotFound(key))
-        }
     }
 
     #[tokio::test]
@@ -896,72 +626,6 @@ mod tests {
         assert_eq!(out.stdout, vec![5u8]); // "VALUE".len()
     }
 
-    const ONCHAIN_TRIES_VFS_READ: &str = r#"
-        (module
-          (import "bloom" "vfs_read"
-            (func $vfs_read (param i32 i32 i32 i32) (result i32)))
-          (memory (export "memory") 1)
-          (func (export "_start") nop)
-        )
-    "#;
-
-    #[tokio::test]
-    async fn onchain_vm_refuses_to_link_vfs_imports() {
-        let vm = PetalVm::new().unwrap();
-        let out = vm
-            .run(
-                &wat(ONCHAIN_TRIES_VFS_READ),
-                Vec::new(),
-                BTreeSet::new(),
-                Arc::new(DenyHost),
-                "h",
-                PetalMode::Onchain,
-                RunOptions::default(),
-            )
-            .await
-            .unwrap();
-        // Instantiation should fail (linker has no bloom.vfs_read in onchain mode).
-        assert_eq!(out.exit_code, 127);
-    }
-
-    const ONCHAIN_TRIES_RANDOM: &str = r#"
-        (module
-          (import "wasi_snapshot_preview1" "random_get"
-            (func $random_get (param i32 i32) (result i32)))
-          (memory (export "memory") 1)
-          (func (export "_start")
-            (drop (call $random_get (i32.const 0) (i32.const 8)))))
-    "#;
-
-    const ONCHAIN_TRIES_CLOCK: &str = r#"
-        (module
-          (import "wasi_snapshot_preview1" "clock_time_get"
-            (func $clock_time_get (param i32 i64 i32) (result i32)))
-          (memory (export "memory") 1)
-          (func (export "_start")
-            (drop (call $clock_time_get (i32.const 0) (i64.const 1) (i32.const 0)))))
-    "#;
-
-    #[tokio::test]
-    async fn onchain_vm_refuses_to_link_random_and_clock() {
-        let vm = PetalVm::new().unwrap();
-        for wat_src in [ONCHAIN_TRIES_RANDOM, ONCHAIN_TRIES_CLOCK] {
-            let out = vm
-                .run(
-                    &wat(wat_src),
-                    Vec::new(),
-                    BTreeSet::new(),
-                    Arc::new(DenyHost),
-                    "h",
-                    PetalMode::Onchain,
-                    RunOptions::default(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(out.exit_code, 127);
-        }
-    }
-
     #[tokio::test]
     async fn local_run_takes_mode_parameter_and_keeps_working() {
         let vm = PetalVm::new().unwrap();
@@ -978,34 +642,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.exit_code, 0);
-    }
-
-    const LOCAL_TRIES_CHAIN_READ: &str = r#"
-        (module
-          (import "bloom" "chain_read_at"
-            (func $chain_read_at (param i32 i32 i64 i32 i32) (result i32)))
-          (memory (export "memory") 1)
-          (func (export "_start") nop)
-        )
-    "#;
-
-    #[tokio::test]
-    async fn local_vm_refuses_to_link_chain_imports() {
-        let vm = PetalVm::new().unwrap();
-        let out = vm
-            .run(
-                &wat(LOCAL_TRIES_CHAIN_READ),
-                Vec::new(),
-                BTreeSet::new(),
-                Arc::new(DenyHost),
-                "h",
-                PetalMode::Local,
-                RunOptions::default(),
-            )
-            .await
-            .unwrap();
-        // Instantiation should fail (linker has no bloom.chain_read_at in local mode).
-        assert_eq!(out.exit_code, 127);
     }
 
     #[test]

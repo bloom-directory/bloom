@@ -230,7 +230,7 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
         ],
         gas_payer,
         gas_budget: PTB_GAS_BUDGET,
-        gas_price: 0,
+        gas_price: 1,
         expiry_block: PTB_EXPIRY_BLOCK,
         signatures: vec![],
     };
@@ -290,7 +290,7 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
         commands: vec![],
         gas_payer,
         gas_budget: PTB_GAS_BUDGET,
-        gas_price: 0,
+        gas_price: 1,
         expiry_block: PTB_EXPIRY_BLOCK,
         signatures: vec![],
     };
@@ -335,7 +335,7 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
         ],
         gas_payer,
         gas_budget: PTB_GAS_BUDGET,
-        gas_price: 0,
+        gas_price: 1,
         expiry_block: PTB_EXPIRY_BLOCK,
         signatures: vec![],
     };
@@ -1063,7 +1063,7 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
         })],
         gas_payer,
         gas_budget: PTB_GAS_BUDGET,
-        gas_price: 0,
+        gas_price: 1,
         expiry_block: PTB_EXPIRY_BLOCK,
         signatures: vec![],
     };
@@ -1084,7 +1084,7 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
         })],
         gas_payer,
         gas_budget: PTB_GAS_BUDGET,
-        gas_price: 0,
+        gas_price: 1,
         expiry_block: PTB_EXPIRY_BLOCK,
         signatures: vec![],
     };
@@ -1265,7 +1265,7 @@ async fn exercise_live_gas_alias_split_merge_and_trap(
         })],
         gas_payer,
         gas_budget: PTB_GAS_BUDGET,
-        gas_price: 0,
+        gas_price: 1,
         expiry_block: PTB_EXPIRY_BLOCK,
         signatures: vec![],
     };
@@ -1313,7 +1313,7 @@ async fn exercise_live_gas_alias_split_merge_and_trap(
         ],
         gas_payer,
         gas_budget: PTB_GAS_BUDGET,
-        gas_price: 0,
+        gas_price: 1,
         expiry_block: PTB_EXPIRY_BLOCK,
         signatures: vec![],
     };
@@ -1387,7 +1387,7 @@ async fn exercise_live_gas_alias_split_merge_and_trap(
         ],
         gas_payer,
         gas_budget: PTB_GAS_BUDGET,
-        gas_price: 0,
+        gas_price: 1,
         expiry_block: PTB_EXPIRY_BLOCK,
         signatures: vec![],
     };

@@ -259,9 +259,8 @@ impl ChainClient {
 
     /// Open a pinned read session at an explicit historical block number.
     ///
-    /// This is the backend for onchain petal `chain_read_at`: every session
-    /// read asks for the resolved block hash first, and falls back to the same
-    /// block number only if an upstream cannot serve the hash.
+    /// Every session read asks for the resolved block hash first, and falls
+    /// back to the same block number only if an upstream cannot serve the hash.
     pub async fn open_session_at(&self, block_number: u64) -> Result<Session<'_>, ChainError> {
         let block = self
             .primary

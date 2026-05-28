@@ -49,8 +49,8 @@ COMPOSE_FILE="$REPO_ROOT/docker-compose.yml"
 PTB_SIGNER_PK_HEX=""
 PTB_SIGNER_PUBKEY_B64=""
 
-# Inner gas-payer LOOM allocation (gas_price=0 means it's never debited, but the
-# coin must EXIST and be owned by the signer). 1M LOOM in bloomweis.
+# Inner gas-payer LOOM allocation. Live PTBs use non-zero gas_price, and the
+# coin must exist and be owned by the signer. 1M LOOM in bloomweis.
 PTB_SIGNER_ALLOCATION="1000000000000000000000000"
 
 # Resolve tmpdir (host-side homes for validators).

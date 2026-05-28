@@ -140,6 +140,34 @@ fn validator_rejected_ptb_reverts_atomically() {
     );
 }
 
+#[test]
+fn missing_fungible_binding_rejects_submit_ptb_before_zero_hash_fallback() {
+    let mut state = State::new();
+    let sender = test_sender();
+
+    let ptb = PtbTx::default();
+    let bytes = encode_ptb(&ptb).expect("encode empty PTB");
+    let tx = submit_ptb_tx(sender, bytes);
+
+    let exec = ChainPetalExecutor;
+    let out = exec.execute_tx(
+        &tx,
+        &mut state,
+        /* block_number */ 100,
+        /* timestamp_ms */ 1_700_000_000_000,
+        /* proposer    */ Address([0xAAu8; 32]),
+        /* parent_hash */ Hash32([0u8; 32]),
+    );
+
+    assert!(!out.success, "missing fungible binding must fail closed");
+    assert!(out.write_set.is_none(), "failure must not mutate state");
+    let reason = String::from_utf8_lossy(&out.return_data);
+    assert!(
+        reason.contains("missing required VFS binding"),
+        "expected missing binding error, got: {reason}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Subtask D — §16.2 host-import end-to-end fixtures (Task #38)
 //
