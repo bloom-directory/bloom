@@ -77,6 +77,20 @@ fn seed_single_coin(state: &mut State, owner: Address, value: u128) -> ObjectId 
     coin_id
 }
 
+fn total_coin_loom(state: &State, owner: Address) -> u128 {
+    let okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: owner.0,
+    };
+    state
+        .get_ownership(&okey)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|id| state.get_object(&id))
+        .map(|obj| decode_coin_value(&obj.payload).expect("coin payload decodes"))
+        .sum()
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 /// Core shim test: alice owns 1 Coin<LOOM>(1000), transfers 300 to bob.
@@ -318,4 +332,49 @@ fn transfer_without_fungible_vfs_binding_fails_closed() {
     );
     assert!(out.write_set.is_none());
     assert!(state.get_account(&bob).is_none());
+}
+
+#[test]
+fn transfer_recipient_coin_aggregate_overflow_fails_closed() {
+    let alice = addr(0xA1);
+    let bob = addr(0xB2);
+
+    let mut state = State::new();
+    bind_bootstrap_fungible(&mut state);
+    seed_single_coin(&mut state, alice, 10);
+    seed_single_coin(&mut state, bob, u128::MAX);
+
+    let tx = transfer_tx(alice, bob, 1);
+    let exec = ChainPetalExecutor;
+    let out = exec.execute_tx(&tx, &mut state, 1, 0, addr(0xFF), Hash32([0u8; 32]));
+
+    assert!(!out.success, "transfer must fail on recipient overflow");
+    assert!(
+        String::from_utf8_lossy(&out.return_data).contains("balance overflow"),
+        "unexpected return_data: {}",
+        String::from_utf8_lossy(&out.return_data)
+    );
+    assert!(out.write_set.is_none());
+    assert_eq!(total_coin_loom(&state, alice), 10);
+    assert_eq!(total_coin_loom(&state, bob), u128::MAX);
+}
+
+#[test]
+fn transfer_to_self_at_max_balance_does_not_false_overflow() {
+    let alice = addr(0xA1);
+
+    let mut state = State::new();
+    bind_bootstrap_fungible(&mut state);
+    seed_single_coin(&mut state, alice, u128::MAX);
+
+    let tx = transfer_tx(alice, alice, 1);
+    let exec = ChainPetalExecutor;
+    let out = exec.execute_tx(&tx, &mut state, 1, 0, addr(0xFF), Hash32([0u8; 32]));
+
+    assert!(
+        out.success,
+        "self-transfer should preserve aggregate balance"
+    );
+    state.apply(out.write_set.expect("write set")).unwrap();
+    assert_eq!(total_coin_loom(&state, alice), u128::MAX);
 }

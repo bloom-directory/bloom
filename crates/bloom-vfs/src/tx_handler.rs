@@ -576,7 +576,10 @@ mod tests {
 
     use bloom_chain_types::Hash32;
     use bloom_objects::{Object, Owner};
-    use bloom_script::{ArgDeclStub, FunctionDeclStub, PetalManifestStub, loom_coin_type_tag};
+    use bloom_script::{
+        ArgDeclStub, CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, FunctionDeclStub,
+        PetalManifestStub, loom_coin_type_tag,
+    };
 
     // -- In-process chain mock (mirrors bloom-ptb-builder's tests.rs, but
     // uses `Mutex` so it is `Send + Sync` for the handler registry; the
@@ -660,13 +663,14 @@ mod tests {
         };
         chain.put_petal(POOL_HASH, manifest);
         chain.put_path(POOL_PATH, POOL_HASH);
+        chain.put_path(CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH);
 
         let gas_id = ObjectId([0xFE; 32]);
         let mut payload = vec![0u8; 32];
         payload.extend_from_slice(&1_000_000u128.to_be_bytes());
         chain.put_object(Object {
             id: gas_id,
-            type_tag: loom_coin_type_tag(Hash32([0u8; 32])),
+            type_tag: loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
             owner: Owner::Address(signer),
             version: 0,
             payload,
@@ -719,11 +723,12 @@ mod tests {
         };
         chain.put_petal(POOL_HASH, manifest);
         chain.put_path(POOL_PATH, POOL_HASH);
+        chain.put_path(CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH);
         let mut payload = vec![0u8; 32];
         payload.extend_from_slice(&1_000_000u128.to_be_bytes());
         chain.put_object(Object {
             id: AUTO_GAS_ID,
-            type_tag: loom_coin_type_tag(Hash32([0u8; 32])),
+            type_tag: loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
             owner: Owner::Address(signer),
             version: 0,
             payload,

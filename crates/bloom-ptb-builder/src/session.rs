@@ -114,7 +114,7 @@ pub struct PtbSession<'a> {
     expiry_block: u64,
     /// Explicit fungible-petal hash override used to build the well-known
     /// `Coin<LOOM>` type tag for gas-payer recognition. When unset, the
-    /// session derives it from chain VFS and falls back to the genesis sentinel.
+    /// session derives it from chain VFS.
     fungible_petal_hash: Option<bloom_chain_types::Hash32>,
 }
 
@@ -173,7 +173,7 @@ impl<'a> PtbSession<'a> {
 
     /// Set the fungible petal hash used to recognise the `Coin<LOOM>`
     /// gas payer. By default this is resolved from chain VFS path
-    /// `/bloom/core/fungible`, falling back to the genesis sentinel.
+    /// `/bloom/core/fungible`.
     pub fn set_fungible_petal_hash(&mut self, hash: bloom_chain_types::Hash32) {
         self.fungible_petal_hash = Some(hash);
     }
@@ -539,7 +539,12 @@ impl<'a> PtbSession<'a> {
         let fungible_petal_hash = self
             .fungible_petal_hash
             .or_else(|| bloom_script::resolve_fungible_petal_hash(self.chain))
-            .unwrap_or(bloom_script::DEFAULT_FUNGIBLE_PETAL_HASH);
+            .ok_or_else(|| {
+                BuildError::NotReady(format!(
+                    "missing required VFS binding for {}",
+                    bloom_script::CORE_FUNGIBLE_PATH
+                ))
+            })?;
 
         validate_ptb(
             &for_validation,

@@ -1222,7 +1222,44 @@ pub(crate) fn apply_coin_loom_transfer_with_domain(
 
     snap.set_ownership(sender_okey, sender_owned);
 
+    ensure_coin_loom_credit_fits(snap, to, amount, &coin_type)?;
+
     mint_coin_loom_to(snap, to, amount, mint_domain, tx_hash, coin_type)
+}
+
+fn ensure_coin_loom_credit_fits(
+    snap: &bloom_chain_state::StateSnapshot,
+    to: Address,
+    amount: u128,
+    coin_type: &TypeTag,
+) -> Result<(), String> {
+    let to_okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: to.0,
+    };
+    let current = snap
+        .get_ownership(&to_okey)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|id| {
+            let obj = snap.get_object(&id)?;
+            if obj.type_tag != *coin_type {
+                return None;
+            }
+            match obj.owner {
+                Owner::Address(addr) if addr == to.0 => Some(decode_coin_value(&obj.payload)),
+                _ => None,
+            }
+        })
+        .try_fold(0u128, |acc, value| {
+            let value = value.map_err(|e| format!("Coin<LOOM> decode failed: {e}"))?;
+            acc.checked_add(value)
+                .ok_or_else(|| "recipient Coin<LOOM> balance overflow".to_string())
+        })?;
+    current
+        .checked_add(amount)
+        .map(|_| ())
+        .ok_or_else(|| "recipient Coin<LOOM> balance overflow".to_string())
 }
 
 pub(crate) fn mint_coin_loom_to(

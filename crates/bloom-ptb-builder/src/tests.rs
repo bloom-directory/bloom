@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use bloom_chain_types::Hash32;
 use bloom_objects::{AccessMode, Object, ObjectId, Owner, TypeTag};
 use bloom_script::{
-    Arg, ArgDeclStub, CORE_FUNGIBLE_PATH, ChainStateIface, Command, ExpectedVersion,
-    FunctionDeclStub, PetalManifestStub, TypeParamDeclStub,
+    Arg, ArgDeclStub, CORE_FUNGIBLE_PATH, ChainStateIface, Command, DEFAULT_FUNGIBLE_PETAL_HASH,
+    ExpectedVersion, FunctionDeclStub, PetalManifestStub, TypeParamDeclStub,
 };
 
 use crate::error::{BuildError, ResolveError};
@@ -112,12 +112,13 @@ fn chain_with_pool(funcs: Vec<FunctionDeclStub>) -> MockChain {
 /// `build_unsigned` can run the full validator.
 fn ready_session(chain: &MockChain, signer: [u8; 32]) -> PtbSession<'_> {
     let gas_id = ObjectId([0xFE; 32]);
+    chain.put_path(CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH);
     // 48-byte coin payload: [id placeholder (32)] || [value BE (16)]
     let mut payload = vec![0u8; 32];
     payload.extend_from_slice(&1_000_000u128.to_be_bytes());
     chain.put_object(Object {
         id: gas_id,
-        type_tag: bloom_script::loom_coin_type_tag(Hash32([0u8; 32])),
+        type_tag: bloom_script::loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
         owner: Owner::Address(signer),
         version: 0,
         payload,
@@ -678,6 +679,34 @@ fn build_unsigned_derives_fungible_hash_from_chain_vfs() {
 
     let tx = s.build_unsigned().unwrap();
     assert_eq!(tx.gas_payer, gas_id);
+}
+
+#[test]
+fn build_unsigned_requires_fungible_vfs_binding_without_override() {
+    let chain = chain_with_pool(vec![func("swap", vec![ArgDeclStub::Signer], vec![])]);
+    let signer = [0x11; 32];
+    let gas_id = ObjectId([0xFE; 32]);
+    let mut payload = vec![0u8; 32];
+    payload.extend_from_slice(&1_000_000u128.to_be_bytes());
+    chain.put_object(Object {
+        id: gas_id,
+        type_tag: bloom_script::loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
+        owner: Owner::Address(signer),
+        version: 0,
+        payload,
+    });
+
+    let mut s = PtbSession::new(&chain);
+    s.set_signers(vec![signer]);
+    s.set_gas_payer(gas_id);
+    s.set_expiry_block(100);
+    s.append_command("/bloom/dex/pool/swap signer:0").unwrap();
+
+    let err = s.build_unsigned().unwrap_err();
+    assert!(
+        matches!(err, BuildError::NotReady(ref msg) if msg.contains(CORE_FUNGIBLE_PATH)),
+        "unexpected error: {err}"
+    );
 }
 
 // ===========================================================================
