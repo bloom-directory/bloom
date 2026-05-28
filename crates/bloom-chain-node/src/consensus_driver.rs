@@ -35,9 +35,13 @@ use bloom_chain_types::{
     types::{Address, Hash32, PubKeyBytes, SigBytes},
     vote::VoteKind,
 };
+use bloom_keystore::xdsa::{XdsaPublicKey, XdsaSignature};
 use bloom_objects::{OWNER_KIND_ADDRESS, Owner, OwnershipIndexKey, TypeTag};
 use bloom_petal_fungible::ops::decode_coin_value;
-use bloom_script::{CORE_FUNGIBLE_PATH, loom_coin_type_tag};
+use bloom_script::{
+    CORE_FUNGIBLE_PATH, PtbError, SignatureVerifier, ValidationContext, loom_coin_type_tag,
+    validate_ptb,
+};
 use parking_lot::Mutex;
 use tracing::{info, warn};
 
@@ -45,6 +49,7 @@ use crate::{
     block_store::BlockStore,
     mempool_persist::MempoolPersist,
     petal_executor::{apply_coin_loom_transfer_with_domain, mint_coin_loom_to},
+    ptb_chain_iface::PtbChainAdapter,
     receipt_store::ReceiptStore,
     state_blob::StateBlobStore,
     state_index::StateIndex,
@@ -89,6 +94,34 @@ pub trait PetalExecutor: Send + Sync + 'static {
 
 pub struct StateAdmissionView<'a> {
     pub state: &'a State,
+    pub current_block: u64,
+}
+
+struct AdmissionPtbVerifier<'a> {
+    state: &'a State,
+    outer_sender: Address,
+    outer_pubkey: &'a PubKeyBytes,
+}
+
+impl SignatureVerifier for AdmissionPtbVerifier<'_> {
+    fn verify(&self, digest: &[u8; 32], signer: &[u8; 32], signature: &[u8]) -> bool {
+        let signer_addr = Address(*signer);
+        let pubkey = if signer_addr == self.outer_sender {
+            self.outer_pubkey.clone()
+        } else {
+            let Some(pubkey) = self.state.get_pubkey(&signer_addr) else {
+                return false;
+            };
+            pubkey
+        };
+        let Ok(pk) = XdsaPublicKey::from_bytes(&pubkey.0) else {
+            return false;
+        };
+        let Ok(sig) = XdsaSignature::from_bytes(signature) else {
+            return false;
+        };
+        pk.verify(digest, &sig).is_ok()
+    }
 }
 
 impl BalanceView for StateAdmissionView<'_> {
@@ -100,6 +133,39 @@ impl BalanceView for StateAdmissionView<'_> {
         resolve_loom_coin_type(self.state)
             .map(|coin_type| coin_loom_balance(self.state, *addr, &coin_type))
             .unwrap_or(0)
+    }
+
+    fn validate_submit_ptb(
+        &self,
+        outer: &Tx,
+        ptb: &bloom_script::PtbTx,
+    ) -> Result<(), AdmitReject> {
+        let Some(coin_type) = resolve_loom_coin_type(self.state) else {
+            return Err(AdmitReject::EnvelopeInvalid(
+                "missing required VFS binding for /bloom/core/fungible".to_string(),
+            ));
+        };
+        let adapter = PtbChainAdapter::new(self.state, self.current_block);
+        let verifier = AdmissionPtbVerifier {
+            state: self.state,
+            outer_sender: outer.sender,
+            outer_pubkey: &outer.pubkey,
+        };
+        let ctx = ValidationContext {
+            current_block: self.current_block,
+            chain: &adapter,
+            verifier: &verifier,
+            loom_coin_type: coin_type,
+        };
+        validate_ptb(ptb, &ctx).map(|_| ()).map_err(|e| match e {
+            PtbError::InsufficientGas { needed, available } => AdmitReject::InsufficientBalance {
+                need: needed,
+                have: available,
+            },
+            other => AdmitReject::EnvelopeInvalid(format!(
+                "PTB validation failed before admission: {other}"
+            )),
+        })
     }
 
     fn ptb_gas_payer_balance(&self, ptb: &bloom_script::PtbTx) -> Result<u128, AdmitReject> {
@@ -616,7 +682,10 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
     let mut receipts: Vec<Receipt> = Vec::new();
 
     for tx in &block.txs {
-        let admission_view = StateAdmissionView { state };
+        let admission_view = StateAdmissionView {
+            state,
+            current_block: height,
+        };
         if let AdmitOutcome::Reject(reject) = check_admissible(tx, &admission_view, true) {
             receipts.push(Receipt {
                 tx_hash: tx.tx_hash(),

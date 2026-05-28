@@ -15,6 +15,13 @@ use crate::tx_admission::{
 };
 use crate::verifier::SigVerifier;
 
+/// Hard cap on pending transactions retained by one node.
+pub const MAX_MEMPOOL_PENDING_TXS: usize = 50_000;
+
+/// Per-sender cap and future-nonce window. This bounds unchargeable storage
+/// and repeated proposer work even when gossip admits future nonces.
+pub const MAX_MEMPOOL_PENDING_PER_SENDER: usize = 128;
+
 // ---------------------------------------------------------------------------
 // Key types
 // ---------------------------------------------------------------------------
@@ -94,12 +101,40 @@ impl<V: SigVerifier> Mempool<V> {
             return Err(admit_reject_to_consensus_error(reject));
         }
 
-        // 4. Replace-by-fee: if a pending tx for (sender, nonce) exists, new fee must be
-        //    strictly higher.
         let slot = TxSlot {
             sender: tx.sender,
             nonce: tx.nonce,
         };
+
+        let current_nonce = view.nonce(&tx.sender);
+        let nonce_distance = tx.nonce.saturating_sub(current_nonce);
+        if nonce_distance > MAX_MEMPOOL_PENDING_PER_SENDER as u64 {
+            return Err(ConsensusError::MempoolSenderLimit {
+                limit: MAX_MEMPOOL_PENDING_PER_SENDER,
+            });
+        }
+
+        let is_replacement = self.pending.contains_key(&slot);
+        if !is_replacement {
+            if self.pending.len() >= MAX_MEMPOOL_PENDING_TXS {
+                return Err(ConsensusError::MempoolFull {
+                    limit: MAX_MEMPOOL_PENDING_TXS,
+                });
+            }
+            let sender_pending = self
+                .pending
+                .keys()
+                .filter(|pending_slot| pending_slot.sender == tx.sender)
+                .count();
+            if sender_pending >= MAX_MEMPOOL_PENDING_PER_SENDER {
+                return Err(ConsensusError::MempoolSenderLimit {
+                    limit: MAX_MEMPOOL_PENDING_PER_SENDER,
+                });
+            }
+        }
+
+        // 4. Replace-by-fee: if a pending tx for (sender, nonce) exists, new fee must be
+        //    strictly higher.
         if let Some(existing) = self.pending.get(&slot)
             && tx.fee_per_unit <= existing.fee_per_unit
         {
@@ -294,6 +329,7 @@ mod tests {
     use bloom_chain_types::tx::TxKind;
     use bloom_chain_types::types::{PubKeyBytes, SigBytes};
 
+    use crate::tx_admission::DEPLOY_PETAL_BASE_FUEL;
     use crate::verifier::NoopVerifier;
 
     /// Derive a fake address from a seed in the same way `admit`'s
@@ -350,12 +386,55 @@ mod tests {
     }
 
     #[test]
+    fn reject_future_nonce_outside_sender_window() {
+        let mut mp = Mempool::new(NoopVerifier);
+        let too_far = MAX_MEMPOOL_PENDING_PER_SENDER as u64 + 1;
+
+        let err = mp
+            .admit(make_tx(1, too_far, 10, 1000), 0, 1_000_000)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ConsensusError::MempoolSenderLimit {
+                limit: MAX_MEMPOOL_PENDING_PER_SENDER
+            }
+        ));
+        assert_eq!(mp.len(), 0);
+    }
+
+    #[test]
+    fn reject_too_many_pending_from_one_sender() {
+        let mut mp = Mempool::new(NoopVerifier);
+        for nonce in 1..=MAX_MEMPOOL_PENDING_PER_SENDER as u64 {
+            mp.admit(make_tx(1, nonce, 10, 1000), 0, 10_000_000)
+                .unwrap();
+        }
+
+        let err = mp
+            .admit(
+                make_tx(1, MAX_MEMPOOL_PENDING_PER_SENDER as u64 + 1, 10, 1000),
+                0,
+                10_000_000,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ConsensusError::MempoolSenderLimit {
+                limit: MAX_MEMPOOL_PENDING_PER_SENDER
+            }
+        ));
+        assert_eq!(mp.len(), MAX_MEMPOOL_PENDING_PER_SENDER);
+    }
+
+    #[test]
     fn select_for_block_for_holds_gaps() {
         let mut mp = Mempool::new(NoopVerifier);
         // Admit nonces 1, 2, then 5 (a gap at 3, 4). State applied = 0.
-        mp.admit(make_tx(1, 1, 10, 100), 0, 1_000_000).unwrap();
-        mp.admit(make_tx(1, 2, 10, 100), 0, 1_000_000).unwrap();
-        mp.admit(make_tx(1, 5, 10, 100), 0, 1_000_000).unwrap();
+        mp.admit(make_tx(1, 1, 10, 1000), 0, 1_000_000).unwrap();
+        mp.admit(make_tx(1, 2, 10, 1000), 0, 1_000_000).unwrap();
+        mp.admit(make_tx(1, 5, 10, 1000), 0, 1_000_000).unwrap();
         let selected = mp.select_for_block_for(10_000, |_| 0);
         // Only the contiguous run [1, 2] should be selected.
         assert_eq!(selected.len(), 2);
@@ -377,8 +456,10 @@ mod tests {
         let err = mp.admit(make_tx(1, 1, 0, 0), 0, 1_000_000).unwrap_err();
         assert!(matches!(
             err,
-            ConsensusError::InvalidSubmitPtb(reason)
-                if reason.contains("max_fuel and fee_per_unit must be non-zero")
+            ConsensusError::InsufficientFuel {
+                required: DEPLOY_PETAL_BASE_FUEL,
+                got: 0
+            }
         ));
         assert_eq!(mp.len(), 0);
     }
@@ -412,11 +493,11 @@ mod tests {
     fn select_for_block_fee_ordering() {
         let mut mp = Mempool::new(NoopVerifier);
         // sender 1, nonce 1, fee=5
-        mp.admit(make_tx(1, 1, 5, 100), 0, 1_000_000).unwrap();
+        mp.admit(make_tx(1, 1, 5, 1000), 0, 1_000_000).unwrap();
         // sender 2, nonce 1, fee=20
-        mp.admit(make_tx(2, 1, 20, 100), 0, 1_000_000).unwrap();
+        mp.admit(make_tx(2, 1, 20, 1000), 0, 1_000_000).unwrap();
         // sender 3, nonce 1, fee=10
-        mp.admit(make_tx(3, 1, 10, 100), 0, 1_000_000).unwrap();
+        mp.admit(make_tx(3, 1, 10, 1000), 0, 1_000_000).unwrap();
 
         let selected = mp.select_for_block(10_000);
         assert_eq!(selected.len(), 3);
@@ -432,11 +513,11 @@ mod tests {
         // Two txs from same sender; they can't both be admitted without incrementing nonce,
         // so test single-sender ordering with separate admits using incremented state.
         // Sender 1, nonce 1 (first tx)
-        mp.admit(make_tx(1, 1, 10, 100), 0, 1_000_000).unwrap();
+        mp.admit(make_tx(1, 1, 10, 1000), 0, 1_000_000).unwrap();
         // For nonce 2 we'd need current_nonce=1, but mempool doesn't track committed state.
         // Test that within same fee, lower nonce comes first for distinct senders.
         // sender 2, nonce 1, fee=10
-        mp.admit(make_tx(2, 1, 10, 100), 0, 1_000_000).unwrap();
+        mp.admit(make_tx(2, 1, 10, 1000), 0, 1_000_000).unwrap();
 
         let selected = mp.select_for_block(10_000);
         assert_eq!(selected.len(), 2);
@@ -450,11 +531,11 @@ mod tests {
     #[test]
     fn select_respects_fuel_limit() {
         let mut mp = Mempool::new(NoopVerifier);
-        mp.admit(make_tx(1, 1, 10, 600), 0, 1_000_000).unwrap();
-        mp.admit(make_tx(2, 1, 9, 600), 0, 1_000_000).unwrap();
+        mp.admit(make_tx(1, 1, 10, 1000), 0, 1_000_000).unwrap();
+        mp.admit(make_tx(2, 1, 9, 1000), 0, 1_000_000).unwrap();
 
-        // Only room for one tx (600 < 1000, but 600+600=1200 > 1000).
-        let selected = mp.select_for_block(1000);
+        // Only room for one tx (1000 < 1500, but 1000+1000=2000 > 1500).
+        let selected = mp.select_for_block(1500);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].fee_per_unit, 10); // higher fee selected first
     }
@@ -463,7 +544,7 @@ mod tests {
     fn select_for_block_rejects_fuel_sum_overflow() {
         let mut mp = Mempool::new(NoopVerifier);
         mp.admit(make_tx(1, 1, 10, u64::MAX), 0, u128::MAX).unwrap();
-        mp.admit(make_tx(2, 1, 9, 1), 0, u128::MAX).unwrap();
+        mp.admit(make_tx(2, 1, 9, 1000), 0, u128::MAX).unwrap();
 
         let selected = mp.select_for_block(u64::MAX);
 
@@ -476,7 +557,7 @@ mod tests {
     fn select_for_block_for_rejects_fuel_sum_overflow() {
         let mut mp = Mempool::new(NoopVerifier);
         mp.admit(make_tx(1, 1, 10, u64::MAX), 0, u128::MAX).unwrap();
-        mp.admit(make_tx(2, 1, 9, 1), 0, u128::MAX).unwrap();
+        mp.admit(make_tx(2, 1, 9, 1000), 0, u128::MAX).unwrap();
 
         let selected = mp.select_for_block_for(u64::MAX, |_| 0);
 
@@ -488,7 +569,7 @@ mod tests {
     #[test]
     fn remove_included() {
         let mut mp = Mempool::new(NoopVerifier);
-        let tx = make_tx(1, 1, 10, 100);
+        let tx = make_tx(1, 1, 10, 1000);
         mp.admit(tx.clone(), 0, 1_000_000).unwrap();
         assert_eq!(mp.len(), 1);
         mp.remove_included(&[tx]);

@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use bloom_chain_consensus::tx_admission::{MAX_CHAIN_WASM_BYTES, deploy_petal_fuel_for_bytes};
 use bloom_chain_state::State;
 use bloom_chain_types::{
     receipt::Log,
@@ -51,22 +52,6 @@ use crate::sig_verifier::XdsaPtbVerifier;
 /// §8.1, §11.1) on demand via [`PtbChainAdapter::new`]. No external
 /// manifest registry is required.
 pub struct ChainPetalExecutor;
-
-/// Provisional fuel charged for a petal deployment before byte-size cost.
-///
-/// Covers fixed validation and state-transition work: manifest extraction,
-/// content-hash calculation, code-store insertion, and VFS path binding.
-pub const DEPLOY_PETAL_BASE_FUEL: u64 = 1_000;
-
-/// Provisional byte-size fuel charged for petal deployment.
-///
-/// This is intentionally simple while the protocol lacks storage rent. It
-/// makes large wasm uploads more expensive without pretending to price
-/// persistent state growth precisely.
-pub const DEPLOY_PETAL_BYTES_PER_FUEL: u64 = 64;
-
-/// Maximum chain-admitted wasm blob size for deploy/publish/upgrade.
-pub const MAX_CHAIN_WASM_BYTES: usize = 2 << 20;
 
 /// **Test-only** wrapper around [`ChainPetalExecutor`] that injects a
 /// per-petal manifest override map into the SubmitPtb dispatch path.
@@ -144,11 +129,6 @@ fn ptb_log_to_receipt_log(l: PtbLogEntry) -> Log {
         topics,
         data: l.data,
     }
-}
-
-fn deploy_fuel_for_bytes(len: usize) -> u64 {
-    let per_byte = (len as u64) / DEPLOY_PETAL_BYTES_PER_FUEL;
-    DEPLOY_PETAL_BASE_FUEL.saturating_add(per_byte)
 }
 
 fn next_object_version(version: u64) -> u64 {
@@ -531,7 +511,7 @@ fn execute_tx_impl(
 
     match &tx.kind {
         TxKind::DeployPetal { wasm_bytes } => {
-            let required_fuel = deploy_fuel_for_bytes(wasm_bytes.len());
+            let required_fuel = deploy_petal_fuel_for_bytes(wasm_bytes.len());
             let fuel_used = required_fuel.min(tx.max_fuel);
             if required_fuel > tx.max_fuel {
                 return ExecOutput {
@@ -1264,12 +1244,15 @@ pub(crate) fn mint_coin_loom_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bloom_chain_consensus::tx_admission::{
+        DEPLOY_PETAL_BASE_FUEL, DEPLOY_PETAL_BYTES_PER_FUEL,
+    };
 
     #[test]
     fn deploy_fuel_for_bytes_uses_saturating_add() {
         let per_byte = (usize::MAX as u64) / DEPLOY_PETAL_BYTES_PER_FUEL;
         let expected = DEPLOY_PETAL_BASE_FUEL.saturating_add(per_byte);
 
-        assert_eq!(deploy_fuel_for_bytes(usize::MAX), expected);
+        assert_eq!(deploy_petal_fuel_for_bytes(usize::MAX), expected);
     }
 }

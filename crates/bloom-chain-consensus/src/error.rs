@@ -31,6 +31,12 @@ pub enum ConsensusError {
     #[error("duplicate (sender, nonce) — fee too low to replace")]
     ReplaceFeeNotHigher,
 
+    #[error("mempool is full: limit {limit}")]
+    MempoolFull { limit: usize },
+
+    #[error("sender has too many pending transactions: limit {limit}")]
+    MempoolSenderLimit { limit: usize },
+
     #[error("address mismatch: pubkey does not hash to sender")]
     AddressMismatch,
 

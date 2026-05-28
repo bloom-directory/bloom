@@ -1,5 +1,6 @@
 use bloom_chain_consensus::tx_admission::{
-    AdmitOutcome, AdmitReject, SimpleBalanceView, check_admissible,
+    AdmitOutcome, AdmitReject, MAX_CHAIN_WASM_BYTES, SimpleBalanceView, check_admissible,
+    deploy_petal_fuel_for_bytes,
 };
 use bloom_chain_types::tx::TxKind;
 use bloom_script::{PtbTx, encode_ptb};
@@ -73,4 +74,34 @@ fn submit_ptb_checks_gas_payer_balance_not_outer_sender() {
 
     view.ptb_gas_payer_balance = 1000;
     assert_eq!(check_admissible(&tx, &view, true), AdmitOutcome::Ok);
+}
+
+#[test]
+fn deploy_petal_requires_intrinsic_fuel_at_admission() {
+    let mut tx = make_mempool_tx(1, 1, 10, 1, 0);
+    tx.kind = TxKind::DeployPetal {
+        wasm_bytes: b"module".to_vec(),
+    };
+    let view = view_for(&tx, 0, 1_000_000);
+    let required = deploy_petal_fuel_for_bytes(6);
+
+    assert_eq!(
+        check_admissible(&tx, &view, true),
+        AdmitOutcome::Reject(AdmitReject::IntrinsicFuel { required, got: 1 })
+    );
+}
+
+#[test]
+fn deploy_petal_rejects_oversized_wasm_at_admission() {
+    let mut tx = make_mempool_tx(1, 1, 10, u64::MAX, 0);
+    tx.kind = TxKind::DeployPetal {
+        wasm_bytes: vec![0u8; MAX_CHAIN_WASM_BYTES + 1],
+    };
+    let view = view_for(&tx, 0, u128::MAX);
+
+    assert!(matches!(
+        check_admissible(&tx, &view, true),
+        AdmitOutcome::Reject(AdmitReject::EnvelopeInvalid(reason))
+            if reason.contains("wasm size")
+    ));
 }

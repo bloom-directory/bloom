@@ -36,6 +36,7 @@ use tracing::{debug, error, info, warn};
 const FRAME_DIGEST_DOMAIN: &[u8] = b"bloom-chain.v0.frame:";
 const FRAME_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const TRANSPORT_MAX_INBOUND_CONNECTIONS: usize = 128;
+pub const TRANSPORT_MAX_TX_BYTES: usize = 1024 * 1024;
 
 /// Inbound message decoded from the wire.
 #[derive(Debug, Clone)]
@@ -143,7 +144,17 @@ fn encode_frame_payload(frame: &Frame) -> Result<(MsgType, Vec<u8>)> {
     match frame {
         Frame::Proposal(p) => Ok((MsgType::Proposal, p.as_ssz_bytes())),
         Frame::Vote(v) => Ok((MsgType::Vote, v.as_ssz_bytes())),
-        Frame::Tx(t) => Ok((MsgType::Tx, t.as_ssz_bytes())),
+        Frame::Tx(t) => {
+            let payload = t.as_ssz_bytes();
+            if payload.len() > TRANSPORT_MAX_TX_BYTES {
+                return Err(anyhow!(
+                    "Tx payload too large: {} > {}",
+                    payload.len(),
+                    TRANSPORT_MAX_TX_BYTES
+                ));
+            }
+            Ok((MsgType::Tx, payload))
+        }
         Frame::BlockRequest { height } => {
             Ok((MsgType::BlockRequest, height.to_be_bytes().to_vec()))
         }
@@ -190,6 +201,13 @@ fn decode_payload(msg_type: MsgType, payload: &[u8]) -> Result<Frame> {
             Ok(Frame::Vote(v))
         }
         MsgType::Tx => {
+            if payload.len() > TRANSPORT_MAX_TX_BYTES {
+                return Err(anyhow!(
+                    "Tx payload too large: {} > {}",
+                    payload.len(),
+                    TRANSPORT_MAX_TX_BYTES
+                ));
+            }
             let t = Tx::from_ssz_bytes(payload).map_err(|e| anyhow!("Tx SSZ decode: {:?}", e))?;
             Ok(Frame::Tx(t))
         }
@@ -512,6 +530,10 @@ async fn accept_loop_with_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bloom_chain_types::{
+        tx::TxKind,
+        types::{Address, PubKeyBytes, SigBytes},
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn test_pool() -> Arc<PeerPool> {
@@ -566,5 +588,34 @@ mod tests {
             .unwrap();
         assert_eq!(n, 0);
         task.abort();
+    }
+
+    #[test]
+    fn tx_frames_are_capped_before_ssz_decode() {
+        let payload = vec![0u8; TRANSPORT_MAX_TX_BYTES + 1];
+
+        let err = decode_payload(MsgType::Tx, &payload).unwrap_err();
+
+        assert!(err.to_string().contains("Tx payload too large"));
+    }
+
+    #[test]
+    fn outgoing_tx_frames_are_capped() {
+        let tx = Tx {
+            chain_id: "bloomchain.test".to_string(),
+            sender: Address([1; 32]),
+            nonce: 1,
+            max_fuel: 1,
+            fee_per_unit: 1,
+            kind: TxKind::DeployPetal {
+                wasm_bytes: vec![0u8; TRANSPORT_MAX_TX_BYTES + 1],
+            },
+            pubkey: PubKeyBytes(vec![1; 32]),
+            sig: SigBytes(vec![1; 64]),
+        };
+
+        let err = encode_frame_payload(&Frame::Tx(tx)).unwrap_err();
+
+        assert!(err.to_string().contains("Tx payload too large"));
     }
 }

@@ -13,6 +13,8 @@ use bloom_chain_types::ssz::{Decode, Encode};
 use bloom_chain_types::{tx::Tx, types::Address};
 use tracing::debug;
 
+pub const MEMPOOL_PERSIST_MAX_TX_BYTES: usize = 1024 * 1024;
+
 /// Sled-backed store for pending txs.
 pub struct MempoolPersist {
     db: sled::Db,
@@ -37,6 +39,13 @@ impl MempoolPersist {
     pub fn put(&self, tx: &Tx) -> Result<()> {
         let key = Self::key(&tx.sender, tx.nonce);
         let val = tx.as_ssz_bytes();
+        if val.len() > MEMPOOL_PERSIST_MAX_TX_BYTES {
+            anyhow::bail!(
+                "mempool_persist.put: tx bytes too large: {} > {}",
+                val.len(),
+                MEMPOOL_PERSIST_MAX_TX_BYTES
+            );
+        }
         self.db.insert(&key, val).context("mempool_persist.put")?;
         debug!(sender = %hex::encode(tx.sender.0), nonce = tx.nonce, "mempool_persist.put");
         Ok(())
@@ -54,6 +63,14 @@ impl MempoolPersist {
         let mut txs = Vec::new();
         for item in self.db.iter() {
             let (_k, v) = item.context("mempool_persist.load_all iter")?;
+            if v.len() > MEMPOOL_PERSIST_MAX_TX_BYTES {
+                tracing::warn!(
+                    len = v.len(),
+                    max = MEMPOOL_PERSIST_MAX_TX_BYTES,
+                    "mempool_persist: oversized tx entry skipped"
+                );
+                continue;
+            }
             match Tx::from_ssz_bytes(&v) {
                 Ok(tx) => txs.push(tx),
                 Err(e) => {
@@ -68,5 +85,54 @@ impl MempoolPersist {
     pub fn flush(&self) -> Result<()> {
         self.db.flush().context("mempool_persist.flush")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bloom_chain_types::{
+        tx::TxKind,
+        types::{PubKeyBytes, SigBytes},
+    };
+
+    fn tx_with_wasm(wasm_len: usize) -> Tx {
+        Tx {
+            chain_id: "bloomchain.test".to_string(),
+            sender: Address([1; 32]),
+            nonce: 1,
+            max_fuel: 1,
+            fee_per_unit: 1,
+            kind: TxKind::DeployPetal {
+                wasm_bytes: vec![0u8; wasm_len],
+            },
+            pubkey: PubKeyBytes(vec![1; 32]),
+            sig: SigBytes(vec![1; 64]),
+        }
+    }
+
+    #[test]
+    fn put_rejects_oversized_tx() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = MempoolPersist::open(&tmp.path().join("mempool.sled")).unwrap();
+        let tx = tx_with_wasm(MEMPOOL_PERSIST_MAX_TX_BYTES + 1);
+
+        let err = persist.put(&tx).unwrap_err();
+
+        assert!(err.to_string().contains("tx bytes too large"));
+    }
+
+    #[test]
+    fn load_all_skips_oversized_entries_before_decode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let persist = MempoolPersist::open(&tmp.path().join("mempool.sled")).unwrap();
+        persist
+            .db
+            .insert(vec![0u8; 40], vec![0u8; MEMPOOL_PERSIST_MAX_TX_BYTES + 1])
+            .unwrap();
+
+        let txs = persist.load_all().unwrap();
+
+        assert!(txs.is_empty());
     }
 }

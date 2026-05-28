@@ -36,8 +36,13 @@ use bloom_chain_state::State;
 use bloom_chain_types::block::Block;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
+use bloom_keystore::xdsa::XdsaSecretKey;
 use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
 use bloom_petal_fungible::ops::decode_coin_value;
+use bloom_petal_manifest::{
+    codec,
+    types::{FunctionDecl, PetalManifestV0, SCHEMA_VERSION, SemVer},
+};
 use bloom_script::{
     CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH,
     chain_iface::{FunctionDeclStub, PetalManifestStub},
@@ -103,6 +108,16 @@ fn make_loom_coin(id: ObjectId, owner: [u8; 32], value: u128) -> Object {
         version: 1,
         payload,
     }
+}
+
+fn make_ptb_signer() -> (XdsaSecretKey, PubKeyBytes, [u8; 32]) {
+    let (sk, pk) = XdsaSecretKey::generate();
+    let signer = Address::from_pubkey_bytes(&pk.0);
+    (sk, PubKeyBytes(pk.to_bytes()), signer.0)
+}
+
+fn register_ptb_signer(state: &mut State, pubkey: PubKeyBytes, signer: [u8; 32]) {
+    state.register_pubkey(Address(signer), pubkey);
 }
 
 fn coin_value(state: &State, id: &ObjectId) -> Option<u128> {
@@ -185,6 +200,12 @@ fn nullary_move_ptb_full(
     }
 }
 
+fn sign_ptb(mut ptb: PtbTx, signer_sk: &XdsaSecretKey) -> PtbTx {
+    let digest = ptb.signing_digest();
+    ptb.signatures = vec![PqSignature(signer_sk.sign(&digest).to_bytes())];
+    ptb
+}
+
 /// Wrap one Tx into a block at the given height with the given proposer.
 fn make_block(height: u64, proposer: Address, txs: Vec<Tx>) -> Block {
     BlockBuilder::at(height).proposer(proposer).txs(txs).build()
@@ -192,6 +213,50 @@ fn make_block(height: u64, proposer: Address, txs: Vec<Tx>) -> Block {
 
 fn wat(src: &str) -> Vec<u8> {
     wat::parse_str(src).expect("valid WAT")
+}
+
+fn leb128(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(b);
+            return;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+fn section(out: &mut Vec<u8>, id: u8, body: &[u8]) {
+    out.push(id);
+    leb128(out, body.len() as u64);
+    out.extend_from_slice(body);
+}
+
+fn custom_section(name: &str, payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    leb128(&mut body, name.len() as u64);
+    body.extend_from_slice(name.as_bytes());
+    body.extend_from_slice(payload);
+    body
+}
+
+fn wat_with_manifest(src: &str, function: &str) -> Vec<u8> {
+    let mut wasm = wat(src);
+    let manifest = codec::encode(&PetalManifestV0 {
+        schema_version: SCHEMA_VERSION,
+        module_path: "/test/p0-5".to_string(),
+        framework_version: SemVer::new(0, 1, 0),
+        functions: vec![FunctionDecl {
+            name: function.to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    })
+    .expect("manifest encodes");
+    let custom = custom_section("bloom_petal_manifest_v0", &manifest);
+    section(&mut wasm, 0, &custom);
+    wasm
 }
 
 /// Trivial petal that does nothing — exits immediately. Burns minimal
@@ -241,7 +306,7 @@ fn outer_max_fuel_lower_than_inner_budget_rejected_at_envelope() {
     let proposer = Address([0xBB; 32]);
 
     let mut state = state_with_bootstrap_fungible();
-    let wasm = wat(NOOP_PETAL);
+    let wasm = wat_with_manifest(NOOP_PETAL, "noop");
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, 1_000_000_000));
 
@@ -298,7 +363,7 @@ fn outer_fee_per_unit_lower_than_inner_price_rejected_at_envelope() {
     let proposer = Address([0xDD; 32]);
 
     let mut state = state_with_bootstrap_fungible();
-    let wasm = wat(NOOP_PETAL);
+    let wasm = wat_with_manifest(NOOP_PETAL, "noop");
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, 1_000_000_000));
 
@@ -357,13 +422,14 @@ fn outer_fee_per_unit_lower_than_inner_price_rejected_at_envelope() {
 ///   - coin version is incremented on every mutation (pre-debit, refund).
 #[test]
 fn successful_ptb_refunds_unused_gas_and_credits_proposer() {
-    let signer = [0x33u8; 32];
+    let (signer_sk, signer_pk, signer) = make_ptb_signer();
     let gas_payer_id = ObjectId([0xEE; 32]);
     let proposer = Address([0xFF; 32]);
     let initial_coin: u128 = 1_000_000_000;
 
     let mut state = state_with_bootstrap_fungible();
-    let wasm = wat(NOOP_PETAL);
+    register_ptb_signer(&mut state, signer_pk, signer);
+    let wasm = wat_with_manifest(NOOP_PETAL, "noop");
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, initial_coin));
 
@@ -373,14 +439,17 @@ fn successful_ptb_refunds_unused_gas_and_credits_proposer() {
     let gas_budget: u64 = 200_000;
     let gas_price: u128 = 5;
 
-    let ptb = nullary_move_ptb_full(
-        signer,
-        petal_hash,
-        "noop",
-        gas_payer_id,
-        gas_budget,
-        gas_price,
-        100,
+    let ptb = sign_ptb(
+        nullary_move_ptb_full(
+            signer,
+            petal_hash,
+            "noop",
+            gas_payer_id,
+            gas_budget,
+            gas_price,
+            100,
+        ),
+        &signer_sk,
     );
     let bytes = encode_ptb(&ptb).expect("encode PTB");
     let (sender, tx) = submit_ptb_tx_with_caps(
@@ -463,13 +532,14 @@ fn successful_ptb_refunds_unused_gas_and_credits_proposer() {
 ///   - sender Coin<LOOM> balance is unchanged.
 #[test]
 fn reverted_ptb_burns_full_reservation_and_credits_proposer() {
-    let signer = [0x44u8; 32];
+    let (signer_sk, signer_pk, signer) = make_ptb_signer();
     let gas_payer_id = ObjectId([0xAB; 32]);
     let proposer = Address([0xBA; 32]);
     let initial_coin: u128 = 1_000_000_000;
 
     let mut state = state_with_bootstrap_fungible();
-    let wasm = wat(FUEL_BURNER_PETAL);
+    register_ptb_signer(&mut state, signer_pk, signer);
+    let wasm = wat_with_manifest(FUEL_BURNER_PETAL, "burn_fuel");
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, initial_coin));
 
@@ -478,14 +548,17 @@ fn reverted_ptb_burns_full_reservation_and_credits_proposer() {
 
     let gas_budget: u64 = 100_000;
     let gas_price: u128 = 7;
-    let ptb = nullary_move_ptb_full(
-        signer,
-        petal_hash,
-        "burn_fuel",
-        gas_payer_id,
-        gas_budget,
-        gas_price,
-        100,
+    let ptb = sign_ptb(
+        nullary_move_ptb_full(
+            signer,
+            petal_hash,
+            "burn_fuel",
+            gas_payer_id,
+            gas_budget,
+            gas_price,
+            100,
+        ),
+        &signer_sk,
     );
     let bytes = encode_ptb(&ptb).expect("encode PTB");
     let (sender, tx) = submit_ptb_tx_with_caps(
@@ -525,13 +598,14 @@ fn reverted_ptb_burns_full_reservation_and_credits_proposer() {
 
 #[test]
 fn non_oof_wasm_trap_charges_consumed_fuel_and_full_revert_burn() {
-    let signer = [0x4Au8; 32];
+    let (signer_sk, signer_pk, signer) = make_ptb_signer();
     let gas_payer_id = ObjectId([0x4B; 32]);
     let proposer = Address([0x4C; 32]);
     let initial_coin: u128 = 1_000_000_000;
 
     let mut state = state_with_bootstrap_fungible();
-    let wasm = wat(NON_OOF_TRAP_PETAL);
+    register_ptb_signer(&mut state, signer_pk, signer);
+    let wasm = wat_with_manifest(NON_OOF_TRAP_PETAL, "trap_after_work");
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, initial_coin));
 
@@ -540,14 +614,17 @@ fn non_oof_wasm_trap_charges_consumed_fuel_and_full_revert_burn() {
 
     let gas_budget: u64 = 100_000;
     let gas_price: u128 = 11;
-    let ptb = nullary_move_ptb_full(
-        signer,
-        petal_hash,
-        "trap_after_work",
-        gas_payer_id,
-        gas_budget,
-        gas_price,
-        100,
+    let ptb = sign_ptb(
+        nullary_move_ptb_full(
+            signer,
+            petal_hash,
+            "trap_after_work",
+            gas_payer_id,
+            gas_budget,
+            gas_price,
+            100,
+        ),
+        &signer_sk,
     );
     let bytes = encode_ptb(&ptb).expect("encode PTB");
     let (sender, tx) = submit_ptb_tx_with_caps(bytes, 1, gas_budget, gas_price as u64);
@@ -596,7 +673,7 @@ fn free_vm_work_attempt_is_rejected_before_execution() {
     let proposer = Address([0xDC; 32]);
 
     let mut state = state_with_bootstrap_fungible();
-    let wasm = wat(FUEL_BURNER_PETAL);
+    let wasm = wat_with_manifest(FUEL_BURNER_PETAL, "burn_fuel");
     let petal_hash = state.insert_code(&wasm);
     // Give the coin enough to cover the inner budget so the validator
     // doesn't reject on InsufficientGas — we want to specifically
@@ -660,27 +737,31 @@ fn free_vm_work_attempt_is_rejected_before_execution() {
 
 #[test]
 fn sender_coin_loom_never_moves_across_submit_ptb() {
-    let signer = [0x66u8; 32];
+    let (signer_sk, signer_pk, signer) = make_ptb_signer();
     let gas_payer_id = ObjectId([0xEF; 32]);
     let proposer = Address([0xFE; 32]);
     let sender_seed: u128 = 12_345_678_901_234;
 
     let mut state = state_with_bootstrap_fungible();
-    let wasm = wat(NOOP_PETAL);
+    register_ptb_signer(&mut state, signer_pk, signer);
+    let wasm = wat_with_manifest(NOOP_PETAL, "noop");
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, 1_000_000_000));
 
     let mut manifests = HashMap::new();
     manifests.insert(petal_hash, manifest_with_nullary_fn("noop"));
 
-    let ptb = nullary_move_ptb_full(
-        signer,
-        petal_hash,
-        "noop",
-        gas_payer_id,
-        /* gas_budget */ 200_000,
-        /* gas_price  */ 3,
-        100,
+    let ptb = sign_ptb(
+        nullary_move_ptb_full(
+            signer,
+            petal_hash,
+            "noop",
+            gas_payer_id,
+            /* gas_budget */ 200_000,
+            /* gas_price  */ 3,
+            100,
+        ),
+        &signer_sk,
     );
     let bytes = encode_ptb(&ptb).expect("encode PTB");
     let (sender, tx) = submit_ptb_tx_with_caps(
@@ -756,7 +837,7 @@ fn ptb_with_overflowing_reservation_is_rejected_not_capped() {
     let proposer = Address([0x77; 32]);
 
     let mut state = state_with_bootstrap_fungible();
-    let wasm = wat(NOOP_PETAL);
+    let wasm = wat_with_manifest(NOOP_PETAL, "noop");
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, u128::MAX));
 
@@ -805,13 +886,14 @@ fn full_budget_consumed_zero_refund_full_burn() {
     // reverted-PTB test. The semantic guarantee we want here is that
     // `(gas_budget - gas_budget) * gas_price == 0` refund is a no-op
     // (no underflow, no spurious coin mutation beyond the pre-debit).
-    let signer = [0x99u8; 32];
+    let (signer_sk, signer_pk, signer) = make_ptb_signer();
     let gas_payer_id = ObjectId([0x10; 32]);
     let proposer = Address([0x20; 32]);
     let initial_coin: u128 = 1_000_000;
 
     let mut state = state_with_bootstrap_fungible();
-    let wasm = wat(FUEL_BURNER_PETAL);
+    register_ptb_signer(&mut state, signer_pk, signer);
+    let wasm = wat_with_manifest(FUEL_BURNER_PETAL, "burn_fuel");
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, initial_coin));
 
@@ -820,14 +902,17 @@ fn full_budget_consumed_zero_refund_full_burn() {
 
     let gas_budget: u64 = 50_000;
     let gas_price: u128 = 2;
-    let ptb = nullary_move_ptb_full(
-        signer,
-        petal_hash,
-        "burn_fuel",
-        gas_payer_id,
-        gas_budget,
-        gas_price,
-        100,
+    let ptb = sign_ptb(
+        nullary_move_ptb_full(
+            signer,
+            petal_hash,
+            "burn_fuel",
+            gas_payer_id,
+            gas_budget,
+            gas_price,
+            100,
+        ),
+        &signer_sk,
     );
     let bytes = encode_ptb(&ptb).expect("encode PTB");
     let (sender, tx) = submit_ptb_tx_with_caps(bytes, 1, gas_budget, gas_price as u64);

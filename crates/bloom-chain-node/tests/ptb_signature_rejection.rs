@@ -26,7 +26,11 @@
 //!    original signature, submit, assert revert with a
 //!    `BadSignature`-flavoured reason and no write set.
 
-use bloom_chain_node::{consensus_driver::PetalExecutor, petal_executor::ChainPetalExecutor};
+use bloom_chain_consensus::{Mempool, NoopVerifier, error::ConsensusError};
+use bloom_chain_node::{
+    consensus_driver::{PetalExecutor, StateAdmissionView},
+    petal_executor::ChainPetalExecutor,
+};
 use bloom_chain_state::State;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
@@ -299,4 +303,100 @@ fn rejects_wrong_pubkey() {
             || reason.contains("signer"),
         "expected a signature-failure revert reason, got: {reason}",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Test 4 — mempool admission must reject unauthenticated gas-sponsored PTBs.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn admission_rejects_bad_inner_signature_before_gas_payer_sponsorship() {
+    let (victim_sk, victim_pk, victim_addr) = fresh_xdsa_keypair();
+    let (attacker_sk, attacker_pk) = XdsaSecretKey::generate();
+    let attacker = Address::from_pubkey_bytes(&attacker_pk.0);
+    let gas_payer_id = ObjectId([0xDD; 32]);
+
+    let mut state = State::new();
+    bind_bootstrap_fungible(&mut state);
+    state.register_pubkey(Address(victim_addr), victim_pk);
+    state.set_object(make_loom_coin(gas_payer_id, victim_addr, 1_000_000_000));
+
+    let mut ptb = unsigned_empty_ptb(victim_addr, gas_payer_id, /*expiry*/ 100);
+    ptb.gas_budget = 10;
+    ptb.gas_price = 1;
+    let digest = ptb.signing_digest();
+    let mut bad_sig = victim_sk.sign(&digest).to_bytes();
+    bad_sig[0] ^= 0x01;
+    ptb.signatures = vec![PqSignature(bad_sig)];
+    let ptb_bytes = encode_ptb(&ptb).expect("encode PTB");
+
+    let mut tx = Tx {
+        chain_id: "bloom-chain.v0".to_string(),
+        sender: attacker,
+        nonce: 1,
+        max_fuel: 10,
+        fee_per_unit: 1,
+        kind: TxKind::SubmitPtb { ptb_bytes },
+        pubkey: PubKeyBytes(attacker_pk.0.clone()),
+        sig: SigBytes(vec![]),
+    };
+    let outer_digest = tx.signing_digest();
+    tx.sig = SigBytes(attacker_sk.sign(&outer_digest.0).to_bytes());
+
+    let view = StateAdmissionView {
+        state: &state,
+        current_block: 50,
+    };
+    let mut mempool = Mempool::new(NoopVerifier);
+    let err = mempool
+        .admit_with_view(tx, &view)
+        .expect_err("bad inner PTB signature must not be admitted");
+
+    assert!(
+        matches!(err, ConsensusError::InvalidSubmitPtb(ref reason) if reason.contains("signature") || reason.contains("BadSignature")),
+        "expected invalid SubmitPtb signature rejection, got {err:?}"
+    );
+    assert_eq!(mempool.len(), 0, "rejected PTB must not persist in mempool");
+}
+
+#[test]
+fn admission_accepts_outer_sender_as_first_ptb_signer_without_prior_key_registry_entry() {
+    let (sk, pk) = XdsaSecretKey::generate();
+    let signer = Address::from_pubkey_bytes(&pk.0);
+    let gas_payer_id = ObjectId([0xDE; 32]);
+
+    let mut state = State::new();
+    bind_bootstrap_fungible(&mut state);
+    state.set_object(make_loom_coin(gas_payer_id, signer.0, 1_000_000_000));
+
+    let mut ptb = unsigned_empty_ptb(signer.0, gas_payer_id, /*expiry*/ 100);
+    ptb.gas_budget = 10;
+    ptb.gas_price = 1;
+    let digest = ptb.signing_digest();
+    ptb.signatures = vec![PqSignature(sk.sign(&digest).to_bytes())];
+    let ptb_bytes = encode_ptb(&ptb).expect("encode PTB");
+
+    let mut tx = Tx {
+        chain_id: "bloom-chain.v0".to_string(),
+        sender: signer,
+        nonce: 1,
+        max_fuel: 10,
+        fee_per_unit: 1,
+        kind: TxKind::SubmitPtb { ptb_bytes },
+        pubkey: PubKeyBytes(pk.0.clone()),
+        sig: SigBytes(vec![]),
+    };
+    let outer_digest = tx.signing_digest();
+    tx.sig = SigBytes(sk.sign(&outer_digest.0).to_bytes());
+
+    let view = StateAdmissionView {
+        state: &state,
+        current_block: 50,
+    };
+    let mut mempool = Mempool::new(NoopVerifier);
+    mempool
+        .admit_with_view(tx, &view)
+        .expect("outer sender's pubkey should authenticate its matching PTB signer slot");
+
+    assert_eq!(mempool.len(), 1);
 }

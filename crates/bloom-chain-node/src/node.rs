@@ -455,7 +455,10 @@ impl Node {
                 let admitted = {
                     let mut eng = driver_tx.engine.lock();
                     let state = driver_tx.state.lock();
-                    let view = StateAdmissionView { state: &state };
+                    let view = StateAdmissionView {
+                        state: &state,
+                        current_block: eng.height(),
+                    };
                     submit_tx_for_chain(&mut eng, tx.clone(), &view, &driver_tx.chain_id)
                 };
                 match admitted {
@@ -633,41 +636,13 @@ impl Node {
                         let admitted = {
                             let mut eng = driver_ev.engine.lock();
                             let state = driver_ev.state.lock();
-                            let view = StateAdmissionView { state: &state };
+                            let view = StateAdmissionView {
+                                state: &state,
+                                current_block: eng.height(),
+                            };
                             submit_tx_for_chain(&mut eng, tx.clone(), &view, &driver_ev.chain_id)
                         };
                         if let Err(e) = admitted {
-                            // The gossiping peer admitted this tx, so they
-                            // are at least as advanced as our view of the
-                            // sender's nonce. If our admit failed, we're
-                            // behind on something — most often a missing
-                            // block. Without this probe, lagging validators
-                            // can stall when they aren't the current
-                            // proposer: gossiped proposals/votes are how
-                            // chain-sync normally fires, and a validator
-                            // that's only seeing forwarded mempool txs has
-                            // no other catch-up signal.
-                            let my_height = {
-                                driver_ev
-                                    .block_store
-                                    .latest_height()
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or(0)
-                            };
-                            // We don't know how far we're behind. Burst a
-                            // wide window from the peer; the BlockResponse
-                            // chain advances us one-at-a-time, and the
-                            // engine's per-frame de-dup makes redundant
-                            // requests cheap.
-                            let target = my_height + 64;
-                            request_missing_blocks(
-                                &peer_pool_ev,
-                                &peer_addr,
-                                my_height + 1,
-                                target,
-                            )
-                            .await;
                             warn!(peer = %peer_addr, err = %e, "mempool.admit from peer failed");
                         } else {
                             let _ = driver_ev.mempool_persist.put(&tx);
@@ -1242,7 +1217,10 @@ fn reload_persisted_mempool(
     for tx in txs {
         let result = {
             let st = state.lock();
-            let view = StateAdmissionView { state: &st };
+            let view = StateAdmissionView {
+                state: &st,
+                current_block: engine.height(),
+            };
             submit_tx_for_chain(engine, tx.clone(), &view, chain_id)
         };
         match result {
@@ -1322,6 +1300,7 @@ fn build_proposal_block_from_candidates<E: PetalExecutor>(
     for candidate in candidates {
         let view = StateAdmissionView {
             state: &accepted_state,
+            current_block: template.height,
         };
         if let bloom_chain_consensus::tx_admission::AdmitOutcome::Reject(reject) =
             bloom_chain_consensus::tx_admission::check_admissible(&candidate, &view, true)
@@ -1851,7 +1830,10 @@ mod tests {
         );
 
         let state = State::new();
-        let view = StateAdmissionView { state: &state };
+        let view = StateAdmissionView {
+            state: &state,
+            current_block: engine.height(),
+        };
         let err = submit_tx_for_chain(&mut engine, tx, &view, "bloomchain.test")
             .expect_err("wrong-chain tx must be rejected");
         assert!(matches!(
@@ -1997,7 +1979,7 @@ mod tests {
     }
 
     #[test]
-    fn proposal_block_builder_drops_selected_ptb_that_breaks_execution() {
+    fn proposal_block_builder_drops_unauthenticated_ptb_before_execution() {
         let mut base_state = State::new();
         base_state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
         base_state.set_object(Object {
@@ -2029,8 +2011,8 @@ mod tests {
             vec![tx1.clone(), tx2, tx3],
         );
 
-        assert_eq!(block.txs, vec![tx1]);
-        assert_eq!(block.header.fuel_used, 1);
+        assert!(block.txs.is_empty());
+        assert_eq!(block.header.fuel_used, 0);
         assert_eq!(block.header.txs_root, compute_txs_root(&block.txs));
         assert_eq!(block.header.state_root, {
             let mut scratch = base_state.clone();

@@ -70,7 +70,7 @@ fn reject_wrong_nonce_too_low() {
 fn admit_nonce_1_for_new_account() {
     // New account has current_nonce=0, so first tx must have nonce=1.
     let mut mp = Mempool::new(NoopVerifier);
-    mp.admit(make_mempool_tx(1, 1, 10, 100, 0), 0, 100_000)
+    mp.admit(make_mempool_tx(1, 1, 10, 1000, 0), 0, 100_000)
         .unwrap();
 }
 
@@ -93,7 +93,7 @@ fn reject_insufficient_balance_fee_only() {
 #[test]
 fn submit_ptb_admission_does_not_charge_outer_sender_balance() {
     let mut mp = Mempool::new(NoopVerifier);
-    let mut tx = make_mempool_tx(1, 1, 10, 100, 0);
+    let mut tx = make_mempool_tx(1, 1, 10, 1000, 0);
     tx.kind = TxKind::SubmitPtb {
         ptb_bytes: valid_ptb_bytes(100, 10),
     };
@@ -107,7 +107,7 @@ fn submit_ptb_admission_does_not_charge_outer_sender_balance() {
 #[test]
 fn legacy_admit_rejects_submit_ptb_without_balance_view() {
     let mut mp = Mempool::new(NoopVerifier);
-    let mut tx = make_mempool_tx(1, 1, 10, 100, 0);
+    let mut tx = make_mempool_tx(1, 1, 10, 1000, 0);
     tx.kind = TxKind::SubmitPtb {
         ptb_bytes: valid_ptb_bytes(100, 10),
     };
@@ -120,7 +120,7 @@ fn legacy_admit_rejects_submit_ptb_without_balance_view() {
 #[test]
 fn submit_ptb_admission_checks_gas_payer_balance() {
     let mut mp = Mempool::new(NoopVerifier);
-    let mut tx = make_mempool_tx(1, 1, 10, 100, 0);
+    let mut tx = make_mempool_tx(1, 1, 10, 1000, 0);
     tx.kind = TxKind::SubmitPtb {
         ptb_bytes: valid_ptb_bytes(100, 10),
     };
@@ -146,7 +146,7 @@ fn submit_ptb_admission_checks_gas_payer_balance() {
 #[test]
 fn submit_ptb_admission_rejects_malformed_bytes() {
     let mut mp = Mempool::new(NoopVerifier);
-    let mut tx = make_mempool_tx(1, 1, 10, 100, 0);
+    let mut tx = make_mempool_tx(1, 1, 10, 1000, 0);
     tx.kind = TxKind::SubmitPtb {
         ptb_bytes: vec![0xCA, 0xFE],
     };
@@ -174,7 +174,7 @@ fn submit_ptb_admission_rejects_inner_cap_above_outer_cap() {
 #[test]
 fn submit_ptb_admission_rejects_free_inner_gas() {
     let mut mp = Mempool::new(NoopVerifier);
-    let mut tx = make_mempool_tx(1, 1, 10, 100, 0);
+    let mut tx = make_mempool_tx(1, 1, 10, 1000, 0);
     tx.kind = TxKind::SubmitPtb {
         ptb_bytes: valid_ptb_bytes(100, 0),
     };
@@ -189,7 +189,7 @@ fn submit_ptb_admission_rejects_free_inner_gas() {
 fn reject_invalid_signature() {
     let mut mp = Mempool::new(RejectAllVerifier);
     let err = mp
-        .admit(make_mempool_tx(1, 1, 10, 100, 0), 0, 1_000_000)
+        .admit(make_mempool_tx(1, 1, 10, 1000, 0), 0, 1_000_000)
         .unwrap_err();
     assert!(matches!(err, ConsensusError::InvalidSignature));
 }
@@ -201,9 +201,9 @@ fn reject_invalid_signature() {
 #[test]
 fn replace_by_fee_accepts_strictly_higher() {
     let mut mp = Mempool::new(NoopVerifier);
-    mp.admit(make_mempool_tx(1, 1, 10, 100, 0), 0, 1_000_000)
+    mp.admit(make_mempool_tx(1, 1, 10, 1000, 0), 0, 1_000_000)
         .unwrap();
-    mp.admit(make_mempool_tx(1, 1, 11, 100, 0), 0, 1_000_000)
+    mp.admit(make_mempool_tx(1, 1, 11, 1000, 0), 0, 1_000_000)
         .unwrap();
     assert_eq!(mp.len(), 1);
     // The replacement (fee=11) is stored.
@@ -214,10 +214,10 @@ fn replace_by_fee_accepts_strictly_higher() {
 #[test]
 fn replace_by_fee_rejects_equal_fee() {
     let mut mp = Mempool::new(NoopVerifier);
-    mp.admit(make_mempool_tx(1, 1, 10, 100, 0), 0, 1_000_000)
+    mp.admit(make_mempool_tx(1, 1, 10, 1000, 0), 0, 1_000_000)
         .unwrap();
     let err = mp
-        .admit(make_mempool_tx(1, 1, 10, 100, 0), 0, 1_000_000)
+        .admit(make_mempool_tx(1, 1, 10, 1000, 0), 0, 1_000_000)
         .unwrap_err();
     assert!(matches!(err, ConsensusError::ReplaceFeeNotHigher));
 }
@@ -225,10 +225,10 @@ fn replace_by_fee_rejects_equal_fee() {
 #[test]
 fn replace_by_fee_rejects_lower_fee() {
     let mut mp = Mempool::new(NoopVerifier);
-    mp.admit(make_mempool_tx(1, 1, 10, 100, 0), 0, 1_000_000)
+    mp.admit(make_mempool_tx(1, 1, 10, 1000, 0), 0, 1_000_000)
         .unwrap();
     let err = mp
-        .admit(make_mempool_tx(1, 1, 9, 100, 0), 0, 1_000_000)
+        .admit(make_mempool_tx(1, 1, 9, 1000, 0), 0, 1_000_000)
         .unwrap_err();
     assert!(matches!(err, ConsensusError::ReplaceFeeNotHigher));
 }
@@ -240,11 +240,11 @@ fn replace_by_fee_rejects_lower_fee() {
 #[test]
 fn select_ordering_fee_desc() {
     let mut mp = Mempool::new(NoopVerifier);
-    mp.admit(make_mempool_tx(1, 1, 5, 100, 0), 0, 1_000_000)
+    mp.admit(make_mempool_tx(1, 1, 5, 1000, 0), 0, 1_000_000)
         .unwrap();
-    mp.admit(make_mempool_tx(2, 1, 20, 100, 0), 0, 1_000_000)
+    mp.admit(make_mempool_tx(2, 1, 20, 1000, 0), 0, 1_000_000)
         .unwrap();
-    mp.admit(make_mempool_tx(3, 1, 10, 100, 0), 0, 1_000_000)
+    mp.admit(make_mempool_tx(3, 1, 10, 1000, 0), 0, 1_000_000)
         .unwrap();
 
     let selected = mp.select_for_block(u64::MAX);
@@ -260,10 +260,10 @@ fn select_ordering_nonce_asc_within_same_sender_via_fuel_fill() {
     // property by checking two txs from same-fee different-sender come out deterministically.
     let mut mp = Mempool::new(NoopVerifier);
     // sender 0, nonce 1, fee 10
-    mp.admit(make_mempool_tx(0, 1, 10, 100, 0), 0, 1_000_000)
+    mp.admit(make_mempool_tx(0, 1, 10, 1000, 0), 0, 1_000_000)
         .unwrap();
     // sender 1, nonce 1, fee 10 (same fee, nonce ordering among senders is deterministic)
-    mp.admit(make_mempool_tx(1, 1, 10, 100, 0), 0, 1_000_000)
+    mp.admit(make_mempool_tx(1, 1, 10, 1000, 0), 0, 1_000_000)
         .unwrap();
 
     let selected = mp.select_for_block(u64::MAX);
@@ -278,12 +278,12 @@ fn select_ordering_nonce_asc_within_same_sender_via_fuel_fill() {
 #[test]
 fn select_respects_fuel_limit() {
     let mut mp = Mempool::new(NoopVerifier);
-    mp.admit(make_mempool_tx(1, 1, 20, 700, 0), 0, 1_000_000)
+    mp.admit(make_mempool_tx(1, 1, 20, 1000, 0), 0, 1_000_000)
         .unwrap();
-    mp.admit(make_mempool_tx(2, 1, 10, 700, 0), 0, 1_000_000)
+    mp.admit(make_mempool_tx(2, 1, 10, 1000, 0), 0, 1_000_000)
         .unwrap();
 
-    // Fuel limit = 1000. First tx (fee=20) takes 700. Second (fee=10) would take 1400 total → skip.
+    // Fuel limit = 1000. First tx (fee=20) takes 1000. Second would exceed.
     let selected = mp.select_for_block(1000);
     assert_eq!(selected.len(), 1);
     assert_eq!(selected[0].fee_per_unit, 20);
@@ -296,7 +296,7 @@ fn select_respects_fuel_limit() {
 #[test]
 fn remove_included_clears_txs() {
     let mut mp = Mempool::new(NoopVerifier);
-    let tx = make_mempool_tx(1, 1, 10, 100, 0);
+    let tx = make_mempool_tx(1, 1, 10, 1000, 0);
     mp.admit(tx.clone(), 0, 1_000_000).unwrap();
     assert_eq!(mp.len(), 1);
     mp.remove_included(&[tx]);
@@ -306,8 +306,8 @@ fn remove_included_clears_txs() {
 #[test]
 fn remove_included_only_removes_matching_txs() {
     let mut mp = Mempool::new(NoopVerifier);
-    let tx1 = make_mempool_tx(1, 1, 10, 100, 0);
-    let tx2 = make_mempool_tx(2, 1, 10, 100, 0);
+    let tx1 = make_mempool_tx(1, 1, 10, 1000, 0);
+    let tx2 = make_mempool_tx(2, 1, 10, 1000, 0);
     mp.admit(tx1.clone(), 0, 1_000_000).unwrap();
     mp.admit(tx2.clone(), 0, 1_000_000).unwrap();
     mp.remove_included(&[tx1]);

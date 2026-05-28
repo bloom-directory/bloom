@@ -168,21 +168,25 @@ fn fund(state: &mut State, addr: bloom_chain_types::Address, loom: u128) {
 }
 
 fn admissible_submit_ptb(pubkey: PubKeyBytes, nonce: u64) -> (State, Tx) {
+    let (signer_sk, signer_pk) = XdsaSecretKey::generate();
     let sender = bloom_chain_types::types::Address::from_pubkey_bytes(&pubkey.0);
-    let signer = make_addr(0x5A);
+    let signer = bloom_chain_types::types::Address::from_pubkey_bytes(&signer_pk.0);
     let gas_payer = ObjectId([0xA5; 32]);
-    let ptb_bytes = encode_ptb(&PtbTx {
+    let mut ptb = PtbTx {
         signers: vec![signer.0],
         commands: vec![],
         gas_payer,
         gas_budget: 7,
         gas_price: 3,
         expiry_block: 99,
-        signatures: vec![PqSignature(vec![0u8; 64])],
-    })
-    .expect("PTB encodes");
+        signatures: vec![PqSignature(vec![])],
+    };
+    let digest = ptb.signing_digest();
+    ptb.signatures = vec![PqSignature(signer_sk.sign(&digest).to_bytes())];
+    let ptb_bytes = encode_ptb(&ptb).expect("PTB encodes");
     let mut state = State::new();
     state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
+    state.register_pubkey(signer, PubKeyBytes(signer_pk.to_bytes()));
     state.set_object(Object {
         id: gas_payer,
         type_tag: loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
@@ -407,10 +411,7 @@ fn bad_inner_signature_submit_ptb_is_rejected_without_nonce_bump() {
     let err = validate_block_execution(&state, &ChainPetalExecutor, &block, 0)
         .expect_err("bad inner signature SubmitPtb must invalidate block execution");
 
-    assert!(
-        err.contains("prechecked PTB must charge positive fuel"),
-        "got: {err}"
-    );
+    assert!(err.contains("state_root mismatch"), "got: {err}");
     assert!(
         state.get_account(&outer_sender).is_none(),
         "validation must not bump outer sender nonce for bad inner signature"

@@ -4,9 +4,24 @@ use bloom_chain_types::{
 };
 use bloom_script::{PtbTx, decode_ptb};
 
+/// Maximum chain-admitted wasm blob size for deploy/publish/upgrade.
+pub const MAX_CHAIN_WASM_BYTES: usize = 2 << 20;
+
+/// Provisional fuel charged for a petal deployment before byte-size cost.
+pub const DEPLOY_PETAL_BASE_FUEL: u64 = 1_000;
+
+/// Provisional byte-size fuel charged for petal deployment.
+pub const DEPLOY_PETAL_BYTES_PER_FUEL: u64 = 64;
+
+pub fn deploy_petal_fuel_for_bytes(len: usize) -> u64 {
+    let per_byte = (len as u64) / DEPLOY_PETAL_BYTES_PER_FUEL;
+    DEPLOY_PETAL_BASE_FUEL.saturating_add(per_byte)
+}
+
 pub trait BalanceView {
     fn nonce(&self, addr: &Address) -> u64;
     fn loom_balance(&self, addr: &Address) -> u128;
+    fn validate_submit_ptb(&self, outer: &Tx, ptb: &PtbTx) -> Result<(), AdmitReject>;
     fn ptb_gas_payer_balance(&self, ptb: &PtbTx) -> Result<u128, AdmitReject>;
 }
 
@@ -52,8 +67,26 @@ pub fn check_admissible(tx: &Tx, view: &dyn BalanceView, strict_nonce: bool) -> 
 
     match &tx.kind {
         TxKind::SubmitPtb { ptb_bytes } => check_submit_ptb(tx, ptb_bytes, view),
-        TxKind::DeployPetal { .. } => check_sender_funded(tx, 0, view),
+        TxKind::DeployPetal { wasm_bytes } => check_deploy_petal(tx, wasm_bytes, view),
     }
+}
+
+fn check_deploy_petal(tx: &Tx, wasm_bytes: &[u8], view: &dyn BalanceView) -> AdmitOutcome {
+    if wasm_bytes.len() > MAX_CHAIN_WASM_BYTES {
+        return AdmitOutcome::Reject(AdmitReject::EnvelopeInvalid(format!(
+            "deploy petal wasm size {} exceeds limit {}",
+            wasm_bytes.len(),
+            MAX_CHAIN_WASM_BYTES
+        )));
+    }
+    let required_fuel = deploy_petal_fuel_for_bytes(wasm_bytes.len());
+    if tx.max_fuel < required_fuel {
+        return AdmitOutcome::Reject(AdmitReject::IntrinsicFuel {
+            required: required_fuel,
+            got: tx.max_fuel,
+        });
+    }
+    check_sender_funded(tx, 0, view)
 }
 
 fn check_sender_funded(tx: &Tx, value: u128, view: &dyn BalanceView) -> AdmitOutcome {
@@ -122,6 +155,9 @@ fn check_submit_ptb(tx: &Tx, ptb_bytes: &[u8], view: &dyn BalanceView) -> AdmitO
             tx.fee_per_unit, ptb.gas_price
         )));
     }
+    if let Err(reject) = view.validate_submit_ptb(tx, &ptb) {
+        return AdmitOutcome::Reject(reject);
+    }
     let have = match view.ptb_gas_payer_balance(&ptb) {
         Ok(have) => have,
         Err(reject) => return AdmitOutcome::Reject(reject),
@@ -154,6 +190,10 @@ impl BalanceView for SimpleBalanceView {
         } else {
             0
         }
+    }
+
+    fn validate_submit_ptb(&self, _outer: &Tx, _ptb: &PtbTx) -> Result<(), AdmitReject> {
+        Ok(())
     }
 
     fn ptb_gas_payer_balance(&self, _ptb: &PtbTx) -> Result<u128, AdmitReject> {
