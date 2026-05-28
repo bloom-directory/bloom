@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use bloom_chain_node::consensus_driver::PetalExecutor;
-use bloom_chain_node::petal_executor::{ChainPetalExecutor, ChainPetalExecutorWithManifests};
+use bloom_chain_node::petal_executor::ChainPetalExecutorWithManifests;
 use bloom_chain_state::State;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
@@ -28,32 +28,6 @@ use bloom_script::{
 };
 
 use bloom_petal_it::harness::{addr, build_state, genesis_coin_id, seed_coin, wat_to_wasm};
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Apply a `TxKind::Transfer` and assert success.
-fn apply_transfer(state: &mut State, sender: Address, to: Address, amount: u128) {
-    let tx = Tx {
-        chain_id: "bloom-chain.v0".to_string(),
-        sender,
-        nonce: 0,
-        max_fuel: 1_000,
-        fee_per_unit: 0,
-        kind: TxKind::Transfer {
-            to,
-            amount_loom: amount,
-        },
-        pubkey: PubKeyBytes(vec![0u8; 32]),
-        sig: SigBytes(vec![0u8; 64]),
-    };
-    let out = ChainPetalExecutor.execute_tx(&tx, state, 1, 0, addr(0xFF), Hash32([0u8; 32]));
-    assert!(out.success, "Transfer must succeed");
-    state
-        .apply(out.write_set.unwrap())
-        .expect("apply must not fail");
-}
 
 /// WAT petal: takes a coin as Arg::Object (Mutable), returns its id.
 fn coin_loader_wat(coin_id: bloom_objects::ObjectId) -> String {
@@ -89,7 +63,7 @@ fn apply_ptb_split_transfer(
         .get_object(&alice_coin_id)
         .map(|o| o.version)
         .unwrap_or(0);
-    let gas_coin_id = genesis_coin_id(alice, 1);
+    let gas_coin_id = genesis_coin_id(alice, 99);
     if state.get_object(&gas_coin_id).is_none() {
         seed_coin(state, gas_coin_id, alice, 1);
     }
@@ -189,9 +163,9 @@ fn apply_ptb_split_transfer(
 // Test 1: Identical tx sequence on two independent states yields equal roots.
 //
 // Sequence:
-//   tx 1: Transfer alice→bob 300 (TxKind::Transfer)
+//   tx 1: PTB SplitCoins+TransferObjects alice→bob 300
 //   tx 2: PTB SplitCoins+TransferObjects alice→bob 200
-//   tx 3: Transfer alice→bob 100 (TxKind::Transfer)
+//   tx 3: PTB SplitCoins+TransferObjects alice→bob 100
 //
 // Genesis: alice=1000, bob=0.
 //
@@ -213,16 +187,15 @@ fn determinism_same_tx_sequence_same_state_root() {
     let root_1 = {
         let mut state = build_state(&[(alice, 1_000)]);
 
-        // Tx 1: Transfer(300)
-        apply_transfer(&mut state, alice, bob, 300);
+        let petal_hash = state.insert_code(&loader_wasm);
+        // Tx 1: PTB SplitCoins+TransferObjects(300)
+        apply_ptb_split_transfer(&mut state, alice, bob, 300, alice_coin_id, petal_hash);
 
         // Tx 2: PTB SplitCoins+TransferObjects(200)
-        // alice now has 700; insert petal
-        let petal_hash = state.insert_code(&loader_wasm);
         apply_ptb_split_transfer(&mut state, alice, bob, 200, alice_coin_id, petal_hash);
 
-        // Tx 3: Transfer(100)
-        apply_transfer(&mut state, alice, bob, 100);
+        // Tx 3: PTB SplitCoins+TransferObjects(100)
+        apply_ptb_split_transfer(&mut state, alice, bob, 100, alice_coin_id, petal_hash);
 
         state.state_root()
     };
@@ -231,12 +204,10 @@ fn determinism_same_tx_sequence_same_state_root() {
     let root_2 = {
         let mut state = build_state(&[(alice, 1_000)]);
 
-        apply_transfer(&mut state, alice, bob, 300);
-
         let petal_hash = state.insert_code(&loader_wasm);
+        apply_ptb_split_transfer(&mut state, alice, bob, 300, alice_coin_id, petal_hash);
         apply_ptb_split_transfer(&mut state, alice, bob, 200, alice_coin_id, petal_hash);
-
-        apply_transfer(&mut state, alice, bob, 100);
+        apply_ptb_split_transfer(&mut state, alice, bob, 100, alice_coin_id, petal_hash);
 
         state.state_root()
     };
@@ -250,14 +221,14 @@ fn determinism_same_tx_sequence_same_state_root() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: Determinism across 5 Transfers.
+// Test 2: Determinism across 5 PTB coin transfers.
 //
-// Applies 5 transfers of varying amounts from alice to bob and verifies
+// Applies 5 PTB transfers of varying amounts from alice to bob and verifies
 // both runs produce the same state root.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn determinism_5_transfers_same_state_root() {
+fn determinism_5_ptb_transfers_same_state_root() {
     let alice = addr(0xA1);
     let bob = addr(0xB2);
 
@@ -265,8 +236,11 @@ fn determinism_5_transfers_same_state_root() {
 
     let apply_sequence = || {
         let mut state = build_state(&[(alice, 1_000)]);
+        let alice_coin_id = genesis_coin_id(alice, 0);
+        let loader_wasm = wat_to_wasm(&coin_loader_wat(alice_coin_id));
+        let petal_hash = state.insert_code(&loader_wasm);
         for &amt in &amounts {
-            apply_transfer(&mut state, alice, bob, amt);
+            apply_ptb_split_transfer(&mut state, alice, bob, amt, alice_coin_id, petal_hash);
         }
         state.state_root()
     };
@@ -276,7 +250,7 @@ fn determinism_5_transfers_same_state_root() {
 
     assert_eq!(
         root_1, root_2,
-        "state roots must be equal across two independent 5-transfer runs"
+        "state roots must be equal across two independent 5-PTB-transfer runs"
     );
 }
 
@@ -295,10 +269,24 @@ fn determinism_3_address_exchange_same_state_root() {
 
     let apply_sequence = || {
         let mut state = build_state(&[(alice, 5_000), (bob, 3_000), (charlie, 2_000)]);
-        apply_transfer(&mut state, alice, bob, 500);
-        apply_transfer(&mut state, bob, charlie, 200);
-        apply_transfer(&mut state, charlie, alice, 100);
-        apply_transfer(&mut state, alice, charlie, 300);
+        let alice_coin_id = genesis_coin_id(alice, 0);
+        let bob_coin_id = genesis_coin_id(bob, 1);
+        let charlie_coin_id = genesis_coin_id(charlie, 2);
+        let alice_loader = state.insert_code(&wat_to_wasm(&coin_loader_wat(alice_coin_id)));
+        let bob_loader = state.insert_code(&wat_to_wasm(&coin_loader_wat(bob_coin_id)));
+        let charlie_loader = state.insert_code(&wat_to_wasm(&coin_loader_wat(charlie_coin_id)));
+
+        apply_ptb_split_transfer(&mut state, alice, bob, 500, alice_coin_id, alice_loader);
+        apply_ptb_split_transfer(&mut state, bob, charlie, 200, bob_coin_id, bob_loader);
+        apply_ptb_split_transfer(
+            &mut state,
+            charlie,
+            alice,
+            100,
+            charlie_coin_id,
+            charlie_loader,
+        );
+        apply_ptb_split_transfer(&mut state, alice, charlie, 300, alice_coin_id, alice_loader);
         state.state_root()
     };
 

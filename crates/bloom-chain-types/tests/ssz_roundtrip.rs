@@ -41,8 +41,6 @@ fn arb_sig() -> impl Strategy<Value = SigBytes> {
 
 fn arb_tx_kind() -> impl Strategy<Value = TxKind> {
     prop_oneof![
-        (arb_address(), any::<u128>())
-            .prop_map(|(to, amount_loom)| TxKind::Transfer { to, amount_loom }),
         arb_vec_u8(256).prop_map(|ptb_bytes| TxKind::SubmitPtb { ptb_bytes }),
         arb_vec_u8(256).prop_map(|wasm_bytes| TxKind::DeployPetal { wasm_bytes }),
     ]
@@ -234,9 +232,8 @@ fn golden_tx_hash() {
         nonce: 1,
         max_fuel: 1_000_000,
         fee_per_unit: 1,
-        kind: TxKind::Transfer {
-            to: Address([0xFF; 32]),
-            amount_loom: 1_000_000_000_000_000_000u128,
+        kind: TxKind::SubmitPtb {
+            ptb_bytes: b"golden-ptb".to_vec(),
         },
         pubkey: PubKeyBytes(vec![0xAB; 4]),
         sig: SigBytes(vec![0xCD; 4]),
@@ -250,7 +247,7 @@ fn golden_tx_hash() {
     // Golden value — generated from a reference run and locked here.
     // If you change the SSZ layout or domain tags, update this constant and
     // leave a comment explaining the reason.
-    const GOLDEN_TX_HASH: &str = "d5f746e6ba76f13687a8e5a7996656f2bef98489c0c350e7e531ffcdc4876d50";
+    const GOLDEN_TX_HASH: &str = "714d072a4aba715910e0cbfed51066617ab9588ecacee7476099a412d8725a10";
 
     assert_eq!(
         hash_hex, GOLDEN_TX_HASH,

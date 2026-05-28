@@ -17,15 +17,13 @@ use crate::types::{Address, Hash32, PubKeyBytes, SigBytes, decode_string, encode
 ///
 /// Variant selectors are part of the wire format and must remain stable:
 ///
-/// | selector | variant       |
-/// |----------|---------------|
-/// | 0        | `Transfer`    |
-/// | 1        | `SubmitPtb`   |
-/// | 2        | `DeployPetal` |
+/// | selector | variant              |
+/// |----------|----------------------|
+/// | 0        | retired `Transfer`   |
+/// | 1        | `SubmitPtb`          |
+/// | 2        | `DeployPetal`        |
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum TxKind {
-    /// Transfer native LOOM from sender to `to`.
-    Transfer { to: Address, amount_loom: u128 },
     /// Submit a Programmable Transaction Block.
     ///
     /// # Why an opaque byte vector
@@ -50,9 +48,10 @@ pub enum TxKind {
     DeployPetal { wasm_bytes: Vec<u8> },
 }
 
+/// Retired selector byte for the removed native-LOOM `Transfer` transaction.
+const TX_KIND_TRANSFER_RETIRED: u8 = 0;
 /// Selector byte written as the first byte of a `TxKind` SSZ encoding.
-/// Matches SSZ union convention: 0 = Transfer, 1 = SubmitPtb, 2 = DeployPetal.
-const TX_KIND_TRANSFER: u8 = 0;
+/// Matches SSZ union convention: 1 = SubmitPtb, 2 = DeployPetal.
 const TX_KIND_SUBMIT_PTB: u8 = 1;
 const TX_KIND_DEPLOY_PETAL: u8 = 2;
 
@@ -63,10 +62,6 @@ impl Encode for TxKind {
 
     fn ssz_bytes_len(&self) -> usize {
         1 + match self {
-            TxKind::Transfer { .. } => {
-                // to (32) + amount_loom (16)
-                <Address as Encode>::ssz_fixed_len() + 16
-            }
             TxKind::SubmitPtb { ptb_bytes } => {
                 // Single variable field: just the canonical PTB byte vector,
                 // encoded as a top-level Vec<u8> in SSZ (length-prefixed by
@@ -79,11 +74,6 @@ impl Encode for TxKind {
 
     fn ssz_append(&self, buf: &mut Vec<u8>) {
         match self {
-            TxKind::Transfer { to, amount_loom } => {
-                buf.push(TX_KIND_TRANSFER);
-                to.ssz_append(buf);
-                amount_loom.ssz_append(buf);
-            }
             TxKind::SubmitPtb { ptb_bytes } => {
                 buf.push(TX_KIND_SUBMIT_PTB);
                 // Single variable field after the selector: the canonical
@@ -118,18 +108,9 @@ impl Decode for TxKind {
         let selector = bytes[0];
         let rest = &bytes[1..];
         match selector {
-            TX_KIND_TRANSFER => {
-                // rest = to (32) || amount_loom (16)
-                if rest.len() != 32 + 16 {
-                    return Err(DecodeError::InvalidByteLength {
-                        len: rest.len(),
-                        expected: 48,
-                    });
-                }
-                let to = Address::from_ssz_bytes(&rest[..32])?;
-                let amount_loom = u128::from_ssz_bytes(&rest[32..48])?;
-                Ok(TxKind::Transfer { to, amount_loom })
-            }
+            TX_KIND_TRANSFER_RETIRED => Err(DecodeError::BytesInvalid(
+                "retired TxKind::Transfer selector".to_string(),
+            )),
             TX_KIND_SUBMIT_PTB => {
                 // The rest of the bytes are the canonical PTB byte vector.
                 // No further framing — the outer SSZ container has already
@@ -343,9 +324,8 @@ mod tests {
             nonce: 1,
             max_fuel: 1_000_000,
             fee_per_unit: 1,
-            kind: TxKind::Transfer {
-                to: Address([2u8; 32]),
-                amount_loom: 1_000_000_000_000_000_000u128,
+            kind: TxKind::SubmitPtb {
+                ptb_bytes: b"sample-ptb".to_vec(),
             },
             pubkey: PubKeyBytes(vec![3u8; 16]),
             sig: SigBytes(vec![4u8; 16]),
@@ -353,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    fn tx_transfer_ssz_roundtrip() {
+    fn tx_ssz_roundtrip() {
         let tx = sample_tx();
         let bytes = tx.as_ssz_bytes();
         let decoded = Tx::from_ssz_bytes(&bytes).expect("decode should succeed");
@@ -458,17 +438,22 @@ mod tests {
 
     #[test]
     fn tx_submit_ptb_selector_is_three() {
-        // Wire-format anchor: Transfer, SubmitPtb, DeployPetal.
+        // Wire-format anchor: retired Transfer, SubmitPtb, DeployPetal.
+        assert_eq!(TX_KIND_TRANSFER_RETIRED, 0);
         assert_eq!(TX_KIND_SUBMIT_PTB, 1);
         assert_eq!(TX_KIND_DEPLOY_PETAL, 2);
     }
 
     #[test]
-    fn tx_selectors_are_contiguous() {
-        let selectors = [TX_KIND_TRANSFER, TX_KIND_SUBMIT_PTB, TX_KIND_DEPLOY_PETAL];
-        let mut sorted = selectors;
-        sorted.sort_unstable();
-        assert_eq!(sorted, [0, 1, 2]);
+    fn retired_transfer_selector_is_rejected() {
+        let mut retired = vec![TX_KIND_TRANSFER_RETIRED];
+        retired.extend_from_slice(&[0u8; 48]);
+        let err = TxKind::from_ssz_bytes(&retired).expect_err("must reject retired transfer");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("retired TxKind::Transfer selector"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -487,14 +472,9 @@ mod tests {
 
     #[test]
     fn is_submit_ptb_helper() {
-        let transfer = TxKind::Transfer {
-            to: Address([0u8; 32]),
-            amount_loom: 0,
-        };
         let ptb = TxKind::SubmitPtb {
             ptb_bytes: vec![1, 2, 3],
         };
-        assert!(!transfer.is_submit_ptb());
         assert!(ptb.is_submit_ptb());
     }
 

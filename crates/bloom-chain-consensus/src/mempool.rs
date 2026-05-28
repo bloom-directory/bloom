@@ -291,15 +291,10 @@ pub fn admit_reject_to_consensus_error(reject: AdmitReject) -> ConsensusError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tx_admission::TRANSFER_INTRINSIC_FUEL;
     use bloom_chain_types::tx::TxKind;
     use bloom_chain_types::types::{PubKeyBytes, SigBytes};
 
     use crate::verifier::NoopVerifier;
-
-    fn addr(seed: u8) -> Address {
-        Address([seed; 32])
-    }
 
     /// Derive a fake address from a seed in the same way `admit`'s
     /// sender-derivation check does, so a tx built with the matching pubkey
@@ -315,9 +310,8 @@ mod tests {
             nonce,
             max_fuel,
             fee_per_unit: fee,
-            kind: TxKind::Transfer {
-                to: addr(99),
-                amount_loom: 0,
+            kind: TxKind::DeployPetal {
+                wasm_bytes: b"test-wasm".to_vec(),
             },
             pubkey: PubKeyBytes(vec![sender; 4]),
             sig: SigBytes(vec![0u8; 4]),
@@ -378,15 +372,13 @@ mod tests {
     }
 
     #[test]
-    fn reject_transfer_below_intrinsic_fuel() {
+    fn reject_zero_fee_or_fuel() {
         let mut mp = Mempool::new(NoopVerifier);
         let err = mp.admit(make_tx(1, 1, 0, 0), 0, 1_000_000).unwrap_err();
         assert!(matches!(
             err,
-            ConsensusError::InsufficientFuel {
-                required: TRANSFER_INTRINSIC_FUEL,
-                got: 0
-            }
+            ConsensusError::InvalidSubmitPtb(reason)
+                if reason.contains("max_fuel and fee_per_unit must be non-zero")
         ));
         assert_eq!(mp.len(), 0);
     }
@@ -471,8 +463,7 @@ mod tests {
     fn select_for_block_rejects_fuel_sum_overflow() {
         let mut mp = Mempool::new(NoopVerifier);
         mp.admit(make_tx(1, 1, 10, u64::MAX), 0, u128::MAX).unwrap();
-        mp.admit(make_tx(2, 1, 9, TRANSFER_INTRINSIC_FUEL), 0, u128::MAX)
-            .unwrap();
+        mp.admit(make_tx(2, 1, 9, 1), 0, u128::MAX).unwrap();
 
         let selected = mp.select_for_block(u64::MAX);
 
@@ -485,8 +476,7 @@ mod tests {
     fn select_for_block_for_rejects_fuel_sum_overflow() {
         let mut mp = Mempool::new(NoopVerifier);
         mp.admit(make_tx(1, 1, 10, u64::MAX), 0, u128::MAX).unwrap();
-        mp.admit(make_tx(2, 1, 9, TRANSFER_INTRINSIC_FUEL), 0, u128::MAX)
-            .unwrap();
+        mp.admit(make_tx(2, 1, 9, 1), 0, u128::MAX).unwrap();
 
         let selected = mp.select_for_block_for(u64::MAX, |_| 0);
 

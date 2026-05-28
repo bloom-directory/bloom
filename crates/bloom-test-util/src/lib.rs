@@ -28,7 +28,7 @@ pub use provision::{
     ChainNodeConfig, ChainNodeGuard, bloom_bin, pick_free_port, provision_network, spawn_validator,
 };
 pub use rpc::wait_for_socket;
-pub use txs::{make_mempool_tx, make_signed_transfer_tx};
+pub use txs::{make_mempool_tx, make_signed_deploy_tx};
 pub use validators::{
     TestValidator, make_addr, make_addr_derived, make_validator_set_fake,
     make_validator_set_signed, make_validator_with_keypair,

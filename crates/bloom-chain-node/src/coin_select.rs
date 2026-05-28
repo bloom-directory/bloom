@@ -1,9 +1,8 @@
 //! `select_coin_loom` — snapshot-level helper for picking and splitting
 //! `Coin<LOOM>` objects owned by a sender.
 //!
-//! Used by the `TxKind::Transfer` compatibility path in
-//! `petal_executor` to keep the Coin<LOOM> object world consistent with the
-//! `Coin<LOOM>` object set after a legacy-format tx runs.
+//! Used by fee settlement and PTB helper paths that need deterministic
+//! Coin<LOOM> debits.
 //!
 //! # Selection strategy
 //!

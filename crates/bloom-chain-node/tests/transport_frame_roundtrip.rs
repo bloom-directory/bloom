@@ -85,9 +85,8 @@ async fn tx_roundtrip() {
         nonce: 1,
         max_fuel: 100_000,
         fee_per_unit: 1,
-        kind: TxKind::Transfer {
-            to: Address([0x02; 32]),
-            amount_loom: 1_000_000_000_000_000_000u128,
+        kind: TxKind::SubmitPtb {
+            ptb_bytes: b"frame-roundtrip-ptb".to_vec(),
         },
         pubkey: PubKeyBytes(vec![0x03; 16]),
         sig: SigBytes(vec![0x04; 16]),

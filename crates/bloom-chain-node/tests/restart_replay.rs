@@ -17,7 +17,8 @@
 
 use bloom_chain_consensus::{ValidatorSet, validator_set::Validator};
 use bloom_chain_node::consensus_driver::{
-    NoopExecutor, apply_block_state_transitions, coin_loom_balance, resolve_loom_coin_type,
+    ExecOutput, NoopExecutor, PetalExecutor, apply_block_state_transitions, coin_loom_balance,
+    resolve_loom_coin_type,
 };
 use bloom_chain_node::{
     block_store::BlockStore, genesis::Genesis, node::restore_state_from_storage,
@@ -37,22 +38,37 @@ use bloom_test_util::{BlockBuilder, make_addr};
 
 const BLOCK_EMISSION: u128 = 10_000_000_000_000_000_000u128;
 
-fn make_transfer_tx(
-    sender: Address,
-    sender_pubkey_bytes: Vec<u8>,
-    to: Address,
-    amount: u128,
-    nonce: u64,
-) -> Tx {
+struct FuelOnlyNonPtbExecutor;
+
+impl PetalExecutor for FuelOnlyNonPtbExecutor {
+    fn execute_tx(
+        &self,
+        _tx: &Tx,
+        state: &mut State,
+        _block_number: u64,
+        _timestamp_ms: u64,
+        _proposer: Address,
+        _parent_hash: Hash32,
+    ) -> ExecOutput {
+        ExecOutput {
+            success: true,
+            fuel_used: 100,
+            return_data: vec![],
+            logs: vec![],
+            write_set: Some(state.snapshot().commit()),
+        }
+    }
+}
+
+fn make_deploy_tx(sender: Address, sender_pubkey_bytes: Vec<u8>, nonce: u64) -> Tx {
     Tx {
         chain_id: "bloom-chain.v0".to_string(),
         sender,
         nonce,
         max_fuel: 1_000,
         fee_per_unit: 1,
-        kind: TxKind::Transfer {
-            to,
-            amount_loom: amount,
+        kind: TxKind::DeployPetal {
+            wasm_bytes: b"test-wasm".to_vec(),
         },
         pubkey: PubKeyBytes(sender_pubkey_bytes),
         sig: SigBytes(vec![0u8; 64]),
@@ -130,7 +146,7 @@ fn persist_checkpoint(
 }
 
 #[test]
-fn replay_reproduces_full_transfer_chain() {
+fn replay_reproduces_full_non_ptb_chain() {
     // Build a fresh sender keypair so the tx survives the sender-derivation
     // check inside apply_block_state_transitions.
     let (_sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
@@ -138,8 +154,6 @@ fn replay_reproduces_full_transfer_chain() {
     let pk_bytes = pk.0.clone();
 
     let proposer = make_addr(0x77);
-    let recipient = make_addr(0x33);
-
     // Genesis-equivalent allocation.
     let initial_balance: u128 = 1_000_000_000_000_000_000_000u128;
 
@@ -159,24 +173,18 @@ fn replay_reproduces_full_transfer_chain() {
             },
         );
     }
-    let executor = NoopExecutor;
-    // Block 1: sender → recipient transfer of 100.
+    let executor = FuelOnlyNonPtbExecutor;
+    // Block 1: first non-PTB tx.
     let block1 = make_block(
         1,
         proposer,
-        vec![make_transfer_tx(
-            sender,
-            pk_bytes.clone(),
-            recipient,
-            100,
-            1,
-        )],
+        vec![make_deploy_tx(sender, pk_bytes.clone(), 1)],
     );
-    // Block 2: sender → recipient transfer of 50.
+    // Block 2: second non-PTB tx.
     let block2 = make_block(
         2,
         proposer,
-        vec![make_transfer_tx(sender, pk_bytes.clone(), recipient, 50, 2)],
+        vec![make_deploy_tx(sender, pk_bytes.clone(), 2)],
     );
 
     apply_block_state_transitions(&mut live, &executor, &block1, BLOCK_EMISSION);
@@ -185,7 +193,6 @@ fn replay_reproduces_full_transfer_chain() {
     let live_root = live.state_root();
     let live_sender_loom = coin_balance(&live, sender);
     let live_sender_nonce = live.get_account(&sender).map(|a| a.nonce).unwrap();
-    let live_recipient_loom = coin_balance(&live, recipient);
     let live_proposer_loom = coin_balance(&live, proposer);
 
     // --- "Restart" replay: same path, fresh state, same blocks. ---
@@ -224,17 +231,10 @@ fn replay_reproduces_full_transfer_chain() {
         "sender loom must match after replay (master bug: transfers dropped)"
     );
     assert_eq!(
-        coin_balance(&replayed, recipient),
-        live_recipient_loom,
-        "recipient loom must match after replay (master bug: transfers dropped)"
-    );
-    assert_eq!(
         coin_balance(&replayed, proposer),
         live_proposer_loom,
         "proposer loom must match after replay (block emission + fees)"
     );
-    // Sanity: the recipient actually received the transferred amount.
-    assert_eq!(live_recipient_loom, 150, "two transfers (100 + 50)");
     // Sanity: the proposer accumulated two block emissions plus fees.
     assert!(
         live_proposer_loom >= 2 * BLOCK_EMISSION,
@@ -253,7 +253,6 @@ fn master_style_replay_diverges() {
     let sender = Address::from_pubkey_bytes(&pk.0);
 
     let proposer = make_addr(0x77);
-    let recipient = make_addr(0x33);
     let initial_balance: u128 = 1_000_000_000_000_000_000_000u128;
 
     let mut live = State::new();
@@ -271,12 +270,8 @@ fn master_style_replay_diverges() {
             },
         );
     }
-    let executor = NoopExecutor;
-    let block1 = make_block(
-        1,
-        proposer,
-        vec![make_transfer_tx(sender, pk.0.clone(), recipient, 100, 1)],
-    );
+    let executor = FuelOnlyNonPtbExecutor;
+    let block1 = make_block(1, proposer, vec![make_deploy_tx(sender, pk.0.clone(), 1)]);
     apply_block_state_transitions(&mut live, &executor, &block1, BLOCK_EMISSION);
 
     // Master-style replay: skip txs entirely, only credit BLOCK_EMISSION.
@@ -299,7 +294,7 @@ fn master_style_replay_diverges() {
         master_replayed.state_root(),
         live.state_root(),
         "master-style replay (emission-only) MUST diverge from live state — \
-         the recipient never sees the transfer and the sender's nonce stays at 0"
+         the sender's nonce stays at 0"
     );
 }
 

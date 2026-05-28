@@ -492,8 +492,6 @@ enum PtbSignaturePolicy {
     AlwaysOk,
 }
 
-const TRANSFER_INTRINSIC_FUEL: u64 = 100;
-
 fn resolve_fungible_petal_hash_from_state(state: &State) -> Result<Hash32, String> {
     state.vfs_lookup(CORE_FUNGIBLE_PATH).ok_or_else(|| {
         format!(
@@ -532,76 +530,6 @@ fn execute_tx_impl(
     };
 
     match &tx.kind {
-        TxKind::Transfer { to, amount_loom } => {
-            // Pure LOOM move — no VM invocation required.
-            if tx.max_fuel < TRANSFER_INTRINSIC_FUEL {
-                return ExecOutput {
-                    success: false,
-                    fuel_used: 0,
-                    return_data: format!(
-                        "legacy Transfer failed: max_fuel {} below intrinsic fuel {}",
-                        tx.max_fuel, TRANSFER_INTRINSIC_FUEL
-                    )
-                    .into_bytes(),
-                    logs: vec![],
-                    write_set: None,
-                };
-            }
-            let coin_type = match resolve_fungible_petal_hash_from_state(state) {
-                Ok(hash) => loom_coin_type_tag(hash),
-                Err(e) => {
-                    warn!(
-                        sender = %hex::encode(tx.sender.0),
-                        to = %hex::encode(to.0),
-                        amount = amount_loom,
-                        err = %e,
-                        "legacy Transfer rejected"
-                    );
-                    return ExecOutput {
-                        success: false,
-                        fuel_used: 0,
-                        return_data: format!("legacy Transfer failed: {e}").into_bytes(),
-                        logs: vec![],
-                        write_set: None,
-                    };
-                }
-            };
-            let mut snap = state.snapshot();
-            if *amount_loom > 0
-                && let Err(e) = apply_coin_loom_transfer(
-                    &mut snap,
-                    tx.sender,
-                    *to,
-                    *amount_loom,
-                    &tx.tx_hash(),
-                    coin_type,
-                )
-            {
-                warn!(
-                    sender = %hex::encode(tx.sender.0),
-                    to = %hex::encode(to.0),
-                    amount = amount_loom,
-                    err = %e,
-                    "legacy Transfer rejected"
-                );
-                return ExecOutput {
-                    success: false,
-                    fuel_used: 0,
-                    return_data: format!("legacy Transfer failed: {e}").into_bytes(),
-                    logs: vec![],
-                    write_set: None,
-                };
-            }
-            let ws = snap.commit();
-            ExecOutput {
-                success: true,
-                fuel_used: TRANSFER_INTRINSIC_FUEL,
-                return_data: vec![],
-                logs: vec![],
-                write_set: Some(ws),
-            }
-        }
-
         TxKind::DeployPetal { wasm_bytes } => {
             let required_fuel = deploy_fuel_for_bytes(wasm_bytes.len());
             let fuel_used = required_fuel.min(tx.max_fuel);
@@ -1203,36 +1131,11 @@ fn execute_tx_impl(
     }
 }
 
-/// Adjust Coin<LOOM> objects for a legacy `TxKind::Transfer`.
+/// Move Coin<LOOM> value between address owners.
 ///
-/// Steps:
-/// 1. Call `select_coin_loom` to pick sender coins.
-/// 2. Delete consumed coins from the snapshot; shrink the split remainder.
-/// 3. Mint a new `Coin<LOOM>` owned by `to` with value `amount`.
-/// 4. Update ownership indices for both `sender` and `to`.
-///
-/// If `sender` lacks sufficient `Coin<LOOM>` (e.g. the coins are already
-/// diverged from object state), this returns an error so the caller can
-/// reject the legacy transfer before applying any write set.
-pub(crate) fn apply_coin_loom_transfer(
-    snap: &mut bloom_chain_state::StateSnapshot,
-    sender: Address,
-    to: Address,
-    amount: u128,
-    tx_hash: &Hash32,
-    coin_type: TypeTag,
-) -> Result<(), String> {
-    apply_coin_loom_transfer_with_domain(
-        snap,
-        sender,
-        to,
-        amount,
-        tx_hash,
-        coin_type,
-        b"bloom.legacy.transfer",
-    )
-}
-
+/// Fee settlement and PTB helper paths use this to debit selected sender
+/// coins, mint a recipient coin with a deterministic id, and refresh ownership
+/// indices for both sides.
 pub(crate) fn apply_coin_loom_transfer_with_domain(
     snap: &mut bloom_chain_state::StateSnapshot,
     sender: Address,

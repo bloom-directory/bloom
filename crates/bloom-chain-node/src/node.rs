@@ -1808,7 +1808,7 @@ mod tests {
     };
     use bloom_test_util::{make_validator_set_signed, make_validator_with_keypair};
 
-    fn signed_transfer_tx(
+    fn signed_deploy_tx(
         sk: &bloom_keystore::xdsa::XdsaSecretKey,
         pk: &bloom_keystore::xdsa::XdsaPublicKey,
     ) -> Tx {
@@ -1819,9 +1819,8 @@ mod tests {
             nonce: 1,
             max_fuel: 1_000,
             fee_per_unit: 1,
-            kind: TxKind::Transfer {
-                to: Address([0x44; 32]),
-                amount_loom: 10,
+            kind: TxKind::DeployPetal {
+                wasm_bytes: b"test-wasm".to_vec(),
             },
             pubkey: PubKeyBytes(pk.0.clone()),
             sig: SigBytes(vec![]),
@@ -1834,7 +1833,7 @@ mod tests {
     #[test]
     fn submit_tx_for_chain_rejects_wrong_chain_id_before_mempool() {
         let (sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
-        let mut tx = signed_transfer_tx(&sk, &pk);
+        let mut tx = signed_deploy_tx(&sk, &pk);
         tx.chain_id = "other-chain".into();
         let digest = tx.signing_digest();
         tx.sig = SigBytes(sk.sign(&digest.0).to_bytes());
@@ -1867,7 +1866,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mempool_persist = MempoolPersist::open(&tmp.path().join("mempool.sled")).unwrap();
         let (sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
-        let tx = signed_transfer_tx(&sk, &pk);
+        let tx = signed_deploy_tx(&sk, &pk);
         mempool_persist.put(&tx).unwrap();
 
         let mut state = State::new();
@@ -1925,7 +1924,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mempool_persist = MempoolPersist::open(&tmp.path().join("mempool.sled")).unwrap();
         let (sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
-        let tx1 = signed_transfer_tx(&sk, &pk);
+        let tx1 = signed_deploy_tx(&sk, &pk);
         let mut tx2 = tx1.clone();
         tx2.nonce = 2;
         let digest = tx2.signing_digest();

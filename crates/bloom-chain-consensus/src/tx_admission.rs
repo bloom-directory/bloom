@@ -4,8 +4,6 @@ use bloom_chain_types::{
 };
 use bloom_script::{PtbTx, decode_ptb};
 
-pub const TRANSFER_INTRINSIC_FUEL: u64 = 100;
-
 pub trait BalanceView {
     fn nonce(&self, addr: &Address) -> u64;
     fn loom_balance(&self, addr: &Address) -> u128;
@@ -54,15 +52,6 @@ pub fn check_admissible(tx: &Tx, view: &dyn BalanceView, strict_nonce: bool) -> 
 
     match &tx.kind {
         TxKind::SubmitPtb { ptb_bytes } => check_submit_ptb(tx, ptb_bytes, view),
-        TxKind::Transfer { amount_loom, .. } => {
-            if tx.max_fuel < TRANSFER_INTRINSIC_FUEL {
-                return AdmitOutcome::Reject(AdmitReject::IntrinsicFuel {
-                    required: TRANSFER_INTRINSIC_FUEL,
-                    got: tx.max_fuel,
-                });
-            }
-            check_sender_funded(tx, *amount_loom, view)
-        }
         TxKind::DeployPetal { .. } => check_sender_funded(tx, 0, view),
     }
 }

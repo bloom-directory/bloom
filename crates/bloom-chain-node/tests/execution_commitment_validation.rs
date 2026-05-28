@@ -23,7 +23,7 @@ use bloom_script::{
     CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, PtbTx, encode_ptb, loom_coin_type_tag,
     types::PqSignature,
 };
-use bloom_test_util::{BlockBuilder, make_addr, make_signed_transfer_tx};
+use bloom_test_util::{BlockBuilder, make_addr, make_signed_deploy_tx};
 
 struct FreeFailedPtbExecutor;
 
@@ -113,6 +113,28 @@ impl PetalExecutor for OverFuelNonPtbExecutor {
     }
 }
 
+struct FuelOnlyNonPtbExecutor;
+
+impl PetalExecutor for FuelOnlyNonPtbExecutor {
+    fn execute_tx(
+        &self,
+        _tx: &Tx,
+        state: &mut State,
+        _block_number: u64,
+        _timestamp_ms: u64,
+        _proposer: Address,
+        _parent_hash: Hash32,
+    ) -> ExecOutput {
+        ExecOutput {
+            success: true,
+            fuel_used: 100,
+            return_data: vec![],
+            logs: vec![],
+            write_set: Some(state.snapshot().commit()),
+        }
+    }
+}
+
 fn fund(state: &mut State, addr: bloom_chain_types::Address, loom: u128) {
     state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
     state.set_account(
@@ -181,9 +203,9 @@ fn admissible_submit_ptb(pubkey: PubKeyBytes, nonce: u64) -> (State, Tx) {
     (state, tx)
 }
 
-fn executable_transfer_block() -> (State, bloom_chain_types::block::Block) {
+fn executable_non_ptb_block() -> (State, bloom_chain_types::block::Block) {
     let (sk, _pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
-    let tx = make_signed_transfer_tx(&sk, "bloom-chain.v0", make_addr(0x77), 12_345, 1, 1_000, 3);
+    let tx = make_signed_deploy_tx(&sk, "bloom-chain.v0", b"test-wasm".to_vec(), 1, 1_000, 3);
 
     let mut state = State::new();
     fund(&mut state, tx.sender, 1_000_000_000_000_000_000_000);
@@ -196,8 +218,12 @@ fn executable_transfer_block() -> (State, bloom_chain_types::block::Block) {
         .build();
 
     let mut scratch = state.clone();
-    let (fuel_used, receipts) =
-        apply_block_state_transitions(&mut scratch, &NoopExecutor, &block, BLOCK_EMISSION);
+    let (fuel_used, receipts) = apply_block_state_transitions(
+        &mut scratch,
+        &FuelOnlyNonPtbExecutor,
+        &block,
+        BLOCK_EMISSION,
+    );
     block.header.state_root = scratch.state_root();
     block.header.receipts_root = receipts_root(&receipts);
     block.header.fuel_used = fuel_used;
@@ -207,10 +233,10 @@ fn executable_transfer_block() -> (State, bloom_chain_types::block::Block) {
 
 #[test]
 fn valid_execution_commitment_is_accepted() {
-    let (state, block) = executable_transfer_block();
+    let (state, block) = executable_non_ptb_block();
 
     let validated =
-        validate_block_execution(&state, &NoopExecutor, &block, BLOCK_EMISSION).unwrap();
+        validate_block_execution(&state, &FuelOnlyNonPtbExecutor, &block, BLOCK_EMISSION).unwrap();
 
     assert_eq!(validated.state_root, block.header.state_root);
     assert_eq!(validated.receipts_root, block.header.receipts_root);
@@ -219,10 +245,10 @@ fn valid_execution_commitment_is_accepted() {
 
 #[test]
 fn tampered_state_root_is_rejected() {
-    let (state, mut block) = executable_transfer_block();
+    let (state, mut block) = executable_non_ptb_block();
     block.header.state_root = Hash32([0xAA; 32]);
 
-    let err = validate_block_execution(&state, &NoopExecutor, &block, BLOCK_EMISSION)
+    let err = validate_block_execution(&state, &FuelOnlyNonPtbExecutor, &block, BLOCK_EMISSION)
         .expect_err("tampered state_root must reject");
 
     assert!(err.contains("state_root mismatch"), "got: {err}");
@@ -230,10 +256,10 @@ fn tampered_state_root_is_rejected() {
 
 #[test]
 fn tampered_receipts_root_is_rejected() {
-    let (state, mut block) = executable_transfer_block();
+    let (state, mut block) = executable_non_ptb_block();
     block.header.receipts_root = Hash32([0xBB; 32]);
 
-    let err = validate_block_execution(&state, &NoopExecutor, &block, BLOCK_EMISSION)
+    let err = validate_block_execution(&state, &FuelOnlyNonPtbExecutor, &block, BLOCK_EMISSION)
         .expect_err("tampered receipts_root must reject");
 
     assert!(err.contains("receipts_root mismatch"), "got: {err}");
@@ -241,10 +267,10 @@ fn tampered_receipts_root_is_rejected() {
 
 #[test]
 fn tampered_fuel_used_is_rejected() {
-    let (state, mut block) = executable_transfer_block();
+    let (state, mut block) = executable_non_ptb_block();
     block.header.fuel_used = block.header.fuel_used.saturating_add(1);
 
-    let err = validate_block_execution(&state, &NoopExecutor, &block, BLOCK_EMISSION)
+    let err = validate_block_execution(&state, &FuelOnlyNonPtbExecutor, &block, BLOCK_EMISSION)
         .expect_err("tampered fuel_used must reject");
 
     assert!(err.contains("fuel_used mismatch"), "got: {err}");
@@ -252,10 +278,10 @@ fn tampered_fuel_used_is_rejected() {
 
 #[test]
 fn tx_max_fuel_sum_above_block_limit_is_rejected_before_execution() {
-    let (state, mut block) = executable_transfer_block();
+    let (state, mut block) = executable_non_ptb_block();
     block.header.fuel_limit = block.txs[0].max_fuel - 1;
 
-    let err = validate_block_execution(&state, &NoopExecutor, &block, BLOCK_EMISSION)
+    let err = validate_block_execution(&state, &FuelOnlyNonPtbExecutor, &block, BLOCK_EMISSION)
         .expect_err("block over fuel limit must reject");
 
     assert!(err.contains("exceeds header.fuel_limit"), "got: {err}");
@@ -513,7 +539,7 @@ fn submit_ptb_cannot_charge_more_than_outer_max_fuel() {
 #[test]
 fn non_ptb_zero_fee_envelope_is_rejected_before_nonce_bump() {
     let (sk, _pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
-    let tx = make_signed_transfer_tx(&sk, "bloom-chain.v0", make_addr(0x77), 1, 1, 1_000, 0);
+    let tx = make_signed_deploy_tx(&sk, "bloom-chain.v0", b"test-wasm".to_vec(), 1, 1_000, 0);
     let mut state = State::new();
     fund(&mut state, tx.sender, 1_000_000);
     let block = BlockBuilder::at(1)

@@ -1,5 +1,5 @@
 use bloom_chain_consensus::tx_admission::{
-    AdmitOutcome, AdmitReject, SimpleBalanceView, TRANSFER_INTRINSIC_FUEL, check_admissible,
+    AdmitOutcome, AdmitReject, SimpleBalanceView, check_admissible,
 };
 use bloom_chain_types::tx::TxKind;
 use bloom_script::{PtbTx, encode_ptb};
@@ -26,20 +26,6 @@ fn future_nonce_is_allowed_only_when_not_strict() {
             expected: 1,
             got: 3
         })
-    ));
-}
-
-#[test]
-fn transfer_intrinsic_fuel_is_enforced() {
-    let tx = make_mempool_tx(1, 1, 10, TRANSFER_INTRINSIC_FUEL - 1, 0);
-    let view = view_for(&tx, 0, 1_000_000);
-
-    assert!(matches!(
-        check_admissible(&tx, &view, true),
-        AdmitOutcome::Reject(AdmitReject::IntrinsicFuel {
-            required: TRANSFER_INTRINSIC_FUEL,
-            got
-        }) if got == TRANSFER_INTRINSIC_FUEL - 1
     ));
 }
 

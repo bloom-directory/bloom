@@ -237,9 +237,8 @@ mod tests {
             nonce: 1,
             max_fuel: 1_000_000,
             fee_per_unit: 1,
-            kind: TxKind::Transfer {
-                to: Address([2u8; 32]),
-                amount_loom: 1_000_000_000_000_000_000u128,
+            kind: TxKind::SubmitPtb {
+                ptb_bytes: b"sample-ptb".to_vec(),
             },
             pubkey: PubKeyBytes(vec![3u8; 8]),
             sig: SigBytes(vec![4u8; 8]),

@@ -62,15 +62,6 @@ pub enum ChainCmd {
         #[arg(long, value_name = "N", default_value_t = 30u64)]
         wait_timeout_secs: u64,
     },
-    /// Build, sign, and submit a plain LOOM Transfer tx.
-    Transfer {
-        /// Recipient address (hex or b1-prefixed).
-        #[arg(long, value_name = "ADDR")]
-        to: String,
-        /// Amount in bloomweis (raw u128 decimal).
-        #[arg(long, value_name = "BLOOMWEIS")]
-        amount: u128,
-    },
     /// Deploy a Bloom-native petal wasm module.
     Deploy {
         /// Path to a `.wasm` file carrying a bloom_petal_manifest_v0 section.
@@ -379,42 +370,6 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
                 anyhow::bail!("chain_health returned not ok: {result}");
             }
             println!("{}", serde_json::to_string_pretty(&result)?);
-            Ok(())
-        }
-
-        // ── transfer ──────────────────────────────────────────────────────────
-        ChainCmd::Transfer { to, amount } => {
-            use bloom_chain_types::ssz::Encode;
-            use bloom_chain_types::tx::TxKind;
-
-            let to_addr = parse_address_cli(&to)?;
-            let (sk, pk, sender) = load_wallet_key(&chain_dir)?;
-            let chain_id = load_chain_id(&chain_dir)?;
-            let client = make_client();
-            let nonce = fetch_nonce(&client, &sender).await? + 1;
-            let tx = build_and_sign_tx(
-                &sk,
-                &pk,
-                sender,
-                &chain_id,
-                nonce,
-                TxKind::Transfer {
-                    to: to_addr,
-                    amount_loom: amount,
-                },
-                100_000,
-                1,
-            )?;
-            let tx_hash = tx.tx_hash();
-            let result = client
-                .call(
-                    "chain_submit_tx",
-                    json!({ "tx_hex": hex::encode(tx.as_ssz_bytes()) }),
-                )
-                .await?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
-            wait_for_nonce(&client, &sender, nonce, std::time::Duration::from_secs(30)).await?;
-            wait_for_tx_receipt(&client, &tx_hash, std::time::Duration::from_secs(30)).await?;
             Ok(())
         }
 
@@ -804,83 +759,6 @@ async fn fetch_nonce(
     Ok(res.get("nonce").and_then(|v| v.as_u64()).unwrap_or(0))
 }
 
-/// Poll `chain_query_account` until the on-chain nonce of `sender` reaches
-/// `expected`. Used by tx-submitting commands to ensure the tx has actually
-/// committed before the CLI returns.
-async fn wait_for_nonce(
-    client: &RpcClient,
-    sender: &bloom_chain_types::types::Address,
-    expected: u64,
-    timeout: std::time::Duration,
-) -> Result<()> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let cur = fetch_nonce(client, sender).await?;
-        if cur >= expected {
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "timed out waiting for nonce {expected} on {} (still at {cur})",
-                hex::encode(sender.0)
-            );
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-}
-
-/// Poll `chain_query_tx` until a receipt for `tx_hash` is indexed. The
-/// consensus driver bumps the sender's nonce *before* executing the petal,
-/// so nonce-only waits cannot tell a successful tx apart from a silent
-/// revert. Bails with the petal-side revert reason on failure.
-async fn wait_for_tx_receipt(
-    client: &RpcClient,
-    tx_hash: &bloom_chain_types::types::Hash32,
-    timeout: std::time::Duration,
-) -> Result<()> {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let res = client
-            .call(
-                "chain_query_tx",
-                json!({ "tx_hash": hex::encode(tx_hash.0) }),
-            )
-            .await
-            .context("rpc chain_query_tx")?;
-        if !res.is_null() {
-            let success = res
-                .get("success")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if success {
-                return Ok(());
-            }
-            let reason = res
-                .get("return_text")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| {
-                    res.get("return_data")
-                        .and_then(|v| v.as_str())
-                        .map(|s| format!("return_data=0x{s}"))
-                        .unwrap_or_else(|| "(no revert reason)".to_string())
-                });
-            anyhow::bail!(
-                "tx {} reverted on-chain: {}",
-                hex::encode(tx_hash.0),
-                reason
-            );
-        }
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "timed out waiting for receipt of tx {}",
-                hex::encode(tx_hash.0)
-            );
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    }
-}
-
 /// Build the `TxKind::SubmitPtb` envelope kind from the opaque `encode_ptb`
 /// bytes of an already-signed inner PTB. The CLI never inspects or signs the
 /// inner PTB — the node decodes it and xDSA-verifies it against registered
@@ -891,10 +769,9 @@ fn build_submit_ptb_kind(ptb_bytes: Vec<u8>) -> bloom_chain_types::tx::TxKind {
 }
 
 /// Poll `chain_query_tx` until a receipt for `tx_hash` is indexed, returning
-/// the full receipt JSON (success or revert alike). Unlike
-/// [`wait_for_tx_receipt`], this does not bail on a reverted tx — `submit-ptb`
-/// callers want to see whatever receipt landed, so the decision is left to
-/// them. Bails only if the timeout elapses with no receipt.
+/// the full receipt JSON (success or revert alike). `submit-ptb` callers want
+/// to see whatever receipt landed, so the decision is left to them. Bails only
+/// if the timeout elapses with no receipt.
 async fn poll_tx_receipt(
     client: &RpcClient,
     tx_hash: &bloom_chain_types::types::Hash32,
@@ -920,11 +797,6 @@ async fn poll_tx_receipt(
         }
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
-}
-
-/// Parse an address from CLI (hex or b1-prefixed).
-fn parse_address_cli(s: &str) -> Result<bloom_chain_types::types::Address> {
-    bloom_chain_node::genesis::parse_b1_address(s).with_context(|| format!("parse address: {s:?}"))
 }
 
 // ---------------------------------------------------------------------------

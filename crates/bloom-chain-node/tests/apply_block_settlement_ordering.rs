@@ -17,7 +17,7 @@
 //! proposer, and sender-is-proposer all reconcile to the spec numbers.
 
 use bloom_chain_node::consensus_driver::{
-    ExecOutput, NoopExecutor, PetalExecutor, apply_block_state_transitions, coin_loom_balance,
+    ExecOutput, PetalExecutor, apply_block_state_transitions, coin_loom_balance,
     resolve_loom_coin_type, try_apply_block_state_transitions,
 };
 use bloom_chain_state::{Account, State};
@@ -37,11 +37,9 @@ use bloom_test_util::{BlockBuilder, make_addr};
 // elsewhere.
 const ZERO_EMISSION: u128 = 0;
 
-fn make_transfer_tx(
+fn make_deploy_tx(
     sender: Address,
     sender_pubkey_bytes: Vec<u8>,
-    to: Address,
-    amount: u128,
     nonce: u64,
     max_fuel: u64,
     fee_per_unit: u64,
@@ -52,9 +50,8 @@ fn make_transfer_tx(
         nonce,
         max_fuel,
         fee_per_unit,
-        kind: TxKind::Transfer {
-            to,
-            amount_loom: amount,
+        kind: TxKind::DeployPetal {
+            wasm_bytes: b"test-wasm".to_vec(),
         },
         pubkey: PubKeyBytes(sender_pubkey_bytes),
         sig: SigBytes(vec![0u8; 64]),
@@ -109,6 +106,76 @@ fn balance_of(state: &State, addr: &Address) -> u128 {
 /// fee accounting is `100 * fee_per_unit`. With `max_fuel` larger than
 /// 100, the refund is `(max_fuel - 100) * fee_per_unit`.
 const NOOP_FUEL_USED: u64 = 100;
+
+struct CoinTransferExecutor {
+    to: Address,
+    amount: u128,
+}
+
+fn deterministic_coin_id(owner: Address, salt: &[u8]) -> ObjectId {
+    let mut h = blake3::Hasher::new();
+    h.update(b"apply_block_settlement_ordering.executor_coin");
+    h.update(&owner.0);
+    h.update(salt);
+    ObjectId(*h.finalize().as_bytes())
+}
+
+fn set_single_coin_balance(
+    snap: &mut bloom_chain_state::StateSnapshot,
+    owner: Address,
+    amount: u128,
+) {
+    let key = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: owner.0,
+    };
+    for id in snap.get_ownership(&key).unwrap_or_default() {
+        snap.delete_object(id);
+    }
+    if amount == 0 {
+        snap.set_ownership(key, vec![]);
+        return;
+    }
+
+    let coin_id = deterministic_coin_id(owner, &amount.to_be_bytes());
+    snap.insert_object(Object {
+        id: coin_id,
+        type_tag: loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
+        owner: Owner::Address(owner.0),
+        version: 0,
+        payload: coin_payload(amount),
+    });
+    snap.set_ownership(key, vec![coin_id]);
+}
+
+impl PetalExecutor for CoinTransferExecutor {
+    fn execute_tx(
+        &self,
+        tx: &Tx,
+        state: &mut State,
+        _block_number: u64,
+        _timestamp_ms: u64,
+        _proposer: Address,
+        _parent_hash: Hash32,
+    ) -> ExecOutput {
+        let sender_before = balance_of(state, &tx.sender);
+        let recipient_before = balance_of(state, &self.to);
+        let mut snap = state.snapshot();
+        if tx.sender == self.to {
+            set_single_coin_balance(&mut snap, tx.sender, sender_before);
+        } else {
+            set_single_coin_balance(&mut snap, tx.sender, sender_before - self.amount);
+            set_single_coin_balance(&mut snap, self.to, recipient_before + self.amount);
+        }
+        ExecOutput {
+            success: true,
+            fuel_used: NOOP_FUEL_USED,
+            return_data: vec![],
+            logs: vec![],
+            write_set: Some(snap.commit()),
+        }
+    }
+}
 
 struct StaleWriteSetExecutor;
 
@@ -187,18 +254,11 @@ fn transfer_to_self_preserves_fee_debit() {
     let mut state = State::new();
     fund(&mut state, sender, initial);
 
-    let tx = make_transfer_tx(
-        sender,
-        pk.0.clone(),
-        sender, // self
-        amount,
-        1,
-        max_fuel,
-        fee_per_unit,
-    );
+    let tx = make_deploy_tx(sender, pk.0.clone(), 1, max_fuel, fee_per_unit);
     let block = make_block(1, proposer, vec![tx]);
+    let executor = CoinTransferExecutor { to: sender, amount };
     let (_fuel, receipts) =
-        apply_block_state_transitions(&mut state, &NoopExecutor, &block, ZERO_EMISSION);
+        apply_block_state_transitions(&mut state, &executor, &block, ZERO_EMISSION);
     assert_eq!(receipts.len(), 1, "one receipt expected");
     assert!(receipts[0].success, "transfer-to-self must succeed");
 
@@ -238,18 +298,14 @@ fn recipient_is_proposer_fee_credit_survives_write_set() {
     fund(&mut state, sender, initial_sender);
     fund(&mut state, proposer, initial_proposer);
 
-    let tx = make_transfer_tx(
-        sender,
-        pk.0.clone(),
-        proposer,
-        amount,
-        1,
-        max_fuel,
-        fee_per_unit,
-    );
+    let tx = make_deploy_tx(sender, pk.0.clone(), 1, max_fuel, fee_per_unit);
     let block = make_block(1, proposer, vec![tx]);
+    let executor = CoinTransferExecutor {
+        to: proposer,
+        amount,
+    };
     let (_fuel, receipts) =
-        apply_block_state_transitions(&mut state, &NoopExecutor, &block, ZERO_EMISSION);
+        apply_block_state_transitions(&mut state, &executor, &block, ZERO_EMISSION);
     assert!(receipts[0].success, "tx must succeed");
 
     assert_eq!(
@@ -287,18 +343,14 @@ fn sender_is_proposer_pays_amount_only() {
     let mut state = State::new();
     fund(&mut state, sender_and_proposer, initial);
 
-    let tx = make_transfer_tx(
-        sender_and_proposer,
-        pk.0.clone(),
-        recipient,
-        amount,
-        1,
-        max_fuel,
-        fee_per_unit,
-    );
+    let tx = make_deploy_tx(sender_and_proposer, pk.0.clone(), 1, max_fuel, fee_per_unit);
     let block = make_block(1, sender_and_proposer, vec![tx]);
+    let executor = CoinTransferExecutor {
+        to: recipient,
+        amount,
+    };
     let (_fuel, receipts) =
-        apply_block_state_transitions(&mut state, &NoopExecutor, &block, ZERO_EMISSION);
+        apply_block_state_transitions(&mut state, &executor, &block, ZERO_EMISSION);
     assert!(receipts[0].success, "tx must succeed");
 
     assert_eq!(
@@ -324,7 +376,7 @@ fn state_apply_failure_rejects_transition() {
     fund(&mut state, sender, initial);
     let before_root = state.state_root();
 
-    let tx = make_transfer_tx(sender, pk.0.clone(), proposer, 1, 1, 1_000, 1);
+    let tx = make_deploy_tx(sender, pk.0.clone(), 1, 1_000, 1);
     let block = make_block(1, proposer, vec![tx]);
     let err = try_apply_block_state_transitions(
         &mut state,
@@ -356,7 +408,7 @@ fn non_ptb_effects_are_not_published_when_fee_settlement_fails() {
     fund(&mut state, sender, initial);
     let before_root = state.state_root();
 
-    let tx = make_transfer_tx(sender, pk.0.clone(), proposer, 1, 1, max_fuel, fee_per_unit);
+    let tx = make_deploy_tx(sender, pk.0.clone(), 1, max_fuel, fee_per_unit);
     let block = make_block(1, proposer, vec![tx]);
     let err =
         try_apply_block_state_transitions(&mut state, &DrainsSenderExecutor, &block, ZERO_EMISSION)

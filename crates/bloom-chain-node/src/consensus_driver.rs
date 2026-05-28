@@ -44,9 +44,7 @@ use tracing::{info, warn};
 use crate::{
     block_store::BlockStore,
     mempool_persist::MempoolPersist,
-    petal_executor::{
-        apply_coin_loom_transfer, apply_coin_loom_transfer_with_domain, mint_coin_loom_to,
-    },
+    petal_executor::{apply_coin_loom_transfer_with_domain, mint_coin_loom_to},
     receipt_store::ReceiptStore,
     state_blob::StateBlobStore,
     state_index::StateIndex,
@@ -137,7 +135,6 @@ impl BalanceView for StateAdmissionView<'_> {
 }
 
 /// A no-op executor that marks every tx as succeeded with zero fuel (for scaffolding / testing).
-/// For Transfer txs it moves LOOM correctly without a petal VM.
 pub struct NoopExecutor;
 
 impl PetalExecutor for NoopExecutor {
@@ -150,59 +147,14 @@ impl PetalExecutor for NoopExecutor {
         _proposer: Address,
         _parent_hash: Hash32,
     ) -> ExecOutput {
-        match &tx.kind {
-            TxKind::Transfer { to, amount_loom } => {
-                if tx.max_fuel < 100 {
-                    return ExecOutput {
-                        success: false,
-                        fuel_used: 0,
-                        return_data: b"transfer failed: max_fuel below intrinsic fuel".to_vec(),
-                        logs: vec![],
-                        write_set: None,
-                    };
-                }
-                let mut snap = state.snapshot();
-                let Some(coin_type) = resolve_loom_coin_type(state) else {
-                    return ExecOutput {
-                        success: false,
-                        fuel_used: 0,
-                        return_data: b"transfer failed: missing fungible VFS binding".to_vec(),
-                        logs: vec![],
-                        write_set: None,
-                    };
-                };
-                if let Err(e) = apply_coin_loom_transfer(
-                    &mut snap,
-                    tx.sender,
-                    *to,
-                    *amount_loom,
-                    &tx.tx_hash(),
-                    coin_type,
-                ) {
-                    return ExecOutput {
-                        success: false,
-                        fuel_used: 0,
-                        return_data: format!("transfer failed: {e}").into_bytes(),
-                        logs: vec![],
-                        write_set: None,
-                    };
-                }
-                let ws = snap.commit();
-                ExecOutput {
-                    success: true,
-                    fuel_used: 100,
-                    return_data: vec![],
-                    logs: vec![],
-                    write_set: Some(ws),
-                }
-            }
-            _ => ExecOutput {
-                success: true,
-                fuel_used: 0,
-                return_data: vec![],
-                logs: vec![],
-                write_set: None,
-            },
+        let _ = tx;
+        let _ = state;
+        ExecOutput {
+            success: true,
+            fuel_used: 0,
+            return_data: vec![],
+            logs: vec![],
+            write_set: None,
         }
     }
 }

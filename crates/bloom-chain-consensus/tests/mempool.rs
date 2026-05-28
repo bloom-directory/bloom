@@ -91,37 +91,6 @@ fn reject_insufficient_balance_fee_only() {
 }
 
 #[test]
-fn reject_insufficient_balance_with_value() {
-    let mut mp = Mempool::new(NoopVerifier);
-    // max_fuel=100, fee=1 → fee_reservation=100; value=500; need=600; have=599.
-    let err = mp
-        .admit(make_mempool_tx(1, 1, 1, 100, 500), 0, 599)
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        ConsensusError::InsufficientBalance {
-            need: 600,
-            have: 599
-        }
-    ));
-}
-
-#[test]
-fn reject_transfer_reservation_overflow() {
-    let mut mp = Mempool::new(NoopVerifier);
-    let err = mp
-        .admit(make_mempool_tx(1, 1, 1, 100, u128::MAX), 0, u128::MAX)
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        ConsensusError::InsufficientBalance {
-            need: u128::MAX,
-            have: u128::MAX
-        }
-    ));
-}
-
-#[test]
 fn submit_ptb_admission_does_not_charge_outer_sender_balance() {
     let mut mp = Mempool::new(NoopVerifier);
     let mut tx = make_mempool_tx(1, 1, 10, 100, 0);

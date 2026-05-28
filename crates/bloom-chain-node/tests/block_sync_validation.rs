@@ -459,9 +459,8 @@ fn make_signed_tx(sk: &bloom_keystore::xdsa::XdsaSecretKey, chain_id: &str) -> T
         nonce: 1,
         max_fuel: 100_000,
         fee_per_unit: 1,
-        kind: TxKind::Transfer {
-            to: Address([0x77; 32]),
-            amount_loom: 1,
+        kind: TxKind::DeployPetal {
+            wasm_bytes: b"test-wasm".to_vec(),
         },
         pubkey: PubKeyBytes(pk.0.clone()),
         sig: SigBytes(vec![]),

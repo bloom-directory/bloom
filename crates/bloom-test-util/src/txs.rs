@@ -4,7 +4,7 @@
 //! - [`make_mempool_tx`]: lightweight, fake-pubkey tx whose sender derives
 //!   from a 4-byte seed. Used by mempool admission tests that don't run
 //!   the real signature verifier.
-//! - [`make_signed_transfer_tx`]: full chain — derive sender from a real
+//! - [`make_signed_deploy_tx`]: full chain — derive sender from a real
 //!   xDSA pubkey, sign the signing-digest with the secret key. Used by
 //!   block-sync validation, settlement ordering, replay tests.
 
@@ -17,7 +17,7 @@ use bloom_keystore::xdsa::XdsaSecretKey;
 use crate::blocks::DEFAULT_CHAIN_ID;
 use crate::validators::make_addr_derived;
 
-/// Build a Transfer tx using seeded fake pubkey/sender. The sender field
+/// Build a DeployPetal tx using seeded fake pubkey/sender. The sender field
 /// is derived via `Address::from_pubkey_bytes(&[seed; 4])` so mempool
 /// admission's sender-from-pubkey check still passes.
 pub fn make_mempool_tx(
@@ -25,7 +25,7 @@ pub fn make_mempool_tx(
     nonce: u64,
     fee_per_unit: u64,
     max_fuel: u64,
-    value_loom: u128,
+    _value_loom: u128,
 ) -> Tx {
     Tx {
         chain_id: "bloomchain.v0".to_string(),
@@ -33,22 +33,20 @@ pub fn make_mempool_tx(
         nonce,
         max_fuel,
         fee_per_unit,
-        kind: TxKind::Transfer {
-            to: Address([99u8; 32]),
-            amount_loom: value_loom,
+        kind: TxKind::DeployPetal {
+            wasm_bytes: b"test-wasm".to_vec(),
         },
         pubkey: PubKeyBytes(vec![sender_seed; 4]),
         sig: SigBytes(vec![0u8; 4]),
     }
 }
 
-/// Build a fully-signed Transfer tx whose sender derives from `sk`'s
+/// Build a fully-signed DeployPetal tx whose sender derives from `sk`'s
 /// public key and whose signature is valid for the supplied `chain_id`.
-pub fn make_signed_transfer_tx(
+pub fn make_signed_deploy_tx(
     sk: &XdsaSecretKey,
     chain_id: &str,
-    to: Address,
-    amount_loom: u128,
+    wasm_bytes: Vec<u8>,
     nonce: u64,
     max_fuel: u64,
     fee_per_unit: u64,
@@ -61,7 +59,7 @@ pub fn make_signed_transfer_tx(
         nonce,
         max_fuel,
         fee_per_unit,
-        kind: TxKind::Transfer { to, amount_loom },
+        kind: TxKind::DeployPetal { wasm_bytes },
         pubkey: PubKeyBytes(pk.0.clone()),
         sig: SigBytes(vec![]),
     };
@@ -70,15 +68,17 @@ pub fn make_signed_transfer_tx(
     tx
 }
 
-/// Convenience: signed transfer tx with the default chain id and
+/// Convenience: signed DeployPetal tx with the default chain id and
 /// max_fuel = 100_000, fee_per_unit = 1.
-pub fn make_signed_transfer_tx_default(
-    sk: &XdsaSecretKey,
-    to: Address,
-    amount_loom: u128,
-    nonce: u64,
-) -> Tx {
-    make_signed_transfer_tx(sk, DEFAULT_CHAIN_ID, to, amount_loom, nonce, 100_000, 1)
+pub fn make_signed_deploy_tx_default(sk: &XdsaSecretKey, nonce: u64) -> Tx {
+    make_signed_deploy_tx(
+        sk,
+        DEFAULT_CHAIN_ID,
+        b"test-wasm".to_vec(),
+        nonce,
+        100_000,
+        1,
+    )
 }
 
 #[cfg(test)]
@@ -96,10 +96,9 @@ mod tests {
     }
 
     #[test]
-    fn signed_transfer_tx_has_valid_signature_and_sender() {
+    fn signed_deploy_tx_has_valid_signature_and_sender() {
         let (sk, pk) = XdsaSecretKey::generate();
-        let to = Address([0xCC; 32]);
-        let tx = make_signed_transfer_tx_default(&sk, to, 12_345, 1);
+        let tx = make_signed_deploy_tx_default(&sk, 1);
         // Sender field derives from pk.
         assert_eq!(tx.sender, Address::from_pubkey_bytes(&pk.0));
         // Signature is non-empty.

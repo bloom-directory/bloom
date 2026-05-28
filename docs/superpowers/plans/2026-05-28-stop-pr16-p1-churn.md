@@ -166,8 +166,8 @@ pub fn check_admissible(
 Key correctness requirements this predicate centralizes (from the divergence table in the investigation):
 1. Sender derivation (`Address::from_pubkey_bytes` == `tx.sender`).
 2. Nonce: `strict_nonce` ⇒ `tx.nonce == current + 1`; else `tx.nonce >= current + 1`.
-3. Balance: `Transfer`/`DeployPetal` ⇒ check **sender**; `SubmitPtb` ⇒ check **`ptb.gas_payer`** (not outer sender) for `gas_budget * gas_price` (checked_mul).
-4. `Transfer` intrinsic fuel ≥ `TRANSFER_INTRINSIC_FUEL`.
+3. Balance: `DeployPetal` ⇒ check **sender**; `SubmitPtb` ⇒ check **`ptb.gas_payer`** (not outer sender) for `gas_budget * gas_price` (checked_mul).
+4. Removed native transfer txs are rejected by the retired selector before admission.
 5. Envelope caps: `tx.max_fuel >= ptb.gas_budget`, `tx.fee_per_unit >= ptb.gas_price`.
 6. All arithmetic checked (no `saturating_add` admitting an overflowing reservation).
 

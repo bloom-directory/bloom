@@ -22,9 +22,8 @@ fn sample_tx(seed: u8) -> Tx {
         nonce: seed as u64,
         max_fuel: 1_000,
         fee_per_unit: 1,
-        kind: TxKind::Transfer {
-            to: Address([!seed; 32]),
-            amount_loom: seed as u128,
+        kind: TxKind::DeployPetal {
+            wasm_bytes: vec![seed; 4],
         },
         pubkey: PubKeyBytes(vec![seed; 4]),
         sig: SigBytes(vec![0u8; 16]),
