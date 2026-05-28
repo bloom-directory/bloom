@@ -26,7 +26,7 @@ use bloom_chain_types::Hash32;
 use bloom_objects::{Object, ObjectId, Owner};
 
 use crate::borrow_table::BorrowTable;
-use crate::executor::{LogEntry, LoomDelta};
+use crate::executor::LogEntry;
 
 /// Handle table entry connecting a wasm-side `handle: i32` to a
 /// borrow-table row by `ObjectId`. Handles are minted on
@@ -86,13 +86,6 @@ pub struct PtbHostCtx {
     /// Logs emitted by `log.emit` during the PTB. Drained by the
     /// chain-node layer into the receipt's `Vec<Log>`.
     pub logs: Vec<LogEntry>,
-
-    /// Per-account signed Loom deltas accumulated by the host imports
-    /// (today only `object.transfer` of `Coin<LOOM>` would touch this,
-    /// but the field exists for the executor's commit path to write
-    /// back fungible-Coin deltas separately from full object
-    /// rewrites).
-    pub loom_deltas: Vec<LoomDelta>,
 
     /// Objects deleted via the `object.delete` host import, paired
     /// with the row's *prior* owner so the chain-node layer can

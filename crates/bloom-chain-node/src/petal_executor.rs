@@ -1122,8 +1122,8 @@ fn execute_tx_impl(
                         return ExecOutput {
                             success: false,
                             fuel_used: charged_fuel,
-                                return_data: format!("ptb gas settlement error: {e}").into_bytes(),
-                                logs: vec![],
+                            return_data: format!("ptb gas settlement error: {e}").into_bytes(),
+                            logs: vec![],
                             write_set: None,
                         };
                     }

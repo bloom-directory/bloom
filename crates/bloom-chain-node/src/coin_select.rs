@@ -3,7 +3,7 @@
 //!
 //! Used by the `TxKind::Transfer` compatibility path in
 //! `petal_executor` to keep the Coin<LOOM> object world consistent with the
-//! `Account.loom` cache after a legacy-format tx runs.
+//! `Coin<LOOM>` object set after a legacy-format tx runs.
 //!
 //! # Selection strategy
 //!

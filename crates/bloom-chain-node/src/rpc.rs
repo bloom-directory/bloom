@@ -331,19 +331,23 @@ impl RpcServer {
             .ok_or_else(|| anyhow!("missing 'address' param"))?;
         let addr = parse_address(addr_str)?;
         let state = self.state.lock();
+        let loom = resolve_loom_coin_type(&state)
+            .map(|coin_type| coin_loom_balance(&state, addr, &coin_type))
+            .unwrap_or(0);
         match state.get_account(&addr) {
-            None => Ok(json!(null)),
-            Some(acct) => {
-                let loom = resolve_loom_coin_type(&state)
-                    .map(|coin_type| coin_loom_balance(&state, addr, &coin_type))
-                    .unwrap_or(0);
-                Ok(json!({
-                    "nonce": acct.nonce,
-                    "loom": loom.to_string(),
-                    "code_hash": acct.code_hash.map(|h| hex::encode(h.0)),
-                    "storage_root": hex::encode(acct.storage_root.0),
-                }))
-            }
+            None if loom == 0 => Ok(json!(null)),
+            None => Ok(json!({
+                "nonce": 0,
+                "loom": loom.to_string(),
+                "code_hash": null,
+                "storage_root": hex::encode(Hash32([0u8; 32]).0),
+            })),
+            Some(acct) => Ok(json!({
+                "nonce": acct.nonce,
+                "loom": loom.to_string(),
+                "code_hash": acct.code_hash.map(|h| hex::encode(h.0)),
+                "storage_root": hex::encode(acct.storage_root.0),
+            })),
         }
     }
 

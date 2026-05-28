@@ -13,8 +13,7 @@
 //!   - After execution (success):
 //!     - Refund `(gas_budget - fuel_used) * gas_price` to the
 //!       (possibly mutated) gas-payer Coin<LOOM>.
-//!     - Credit the proposer `fuel_used * gas_price` via
-//!       `apply_loom_delta`.
+//!     - Credit the proposer `fuel_used * gas_price` as `Coin<LOOM>`.
 //!   - After execution (revert):
 //!     - Burn the full `gas_budget * gas_price` from the gas-payer
 //!       Coin<LOOM>.
@@ -23,8 +22,8 @@
 //! Outer envelope reconciliation (in `apply_block_state_transitions`):
 //!   - For `TxKind::SubmitPtb`, the outer `max_fuel`/`fee_per_unit`
 //!     caps must dominate the inner `gas_budget`/`gas_price`.
-//!   - Sender's `Account.loom` is NEVER touched by a SubmitPtb (the
-//!     gas comes out of the gas-payer Coin<LOOM> object only).
+//!   - The outer sender's coins are not used for PTB gas; gas comes out
+//!     of the gas-payer Coin<LOOM> object only.
 
 use std::collections::HashMap;
 
@@ -261,7 +260,7 @@ fn outer_max_fuel_lower_than_inner_budget_rejected_at_envelope() {
     );
     let bytes = encode_ptb(&ptb).expect("encode PTB");
     let (sender, tx) = submit_ptb_tx_with_caps(bytes, 1, 500_000, 1);
-    fund(&mut state, sender, 5_000_000); // sender Account.loom seed
+    fund(&mut state, sender, 5_000_000);
 
     let coin_before = coin_value(&state, &gas_payer_id).unwrap();
     let sender_before = balance(&state, &sender);
@@ -341,8 +340,8 @@ fn outer_fee_per_unit_lower_than_inner_price_rejected_at_envelope() {
 
 /// A successful PTB that burns N < gas_budget fuel:
 ///   - gas-payer Coin<LOOM> ends up at `initial - N * gas_price`.
-///   - proposer Account.loom gains `N * gas_price`.
-///   - sender Account.loom is unchanged.
+///   - proposer Coin<LOOM> balance gains `N * gas_price`.
+///   - sender Coin<LOOM> balance is unchanged.
 ///   - coin version is incremented on every mutation (pre-debit, refund).
 #[test]
 fn successful_ptb_refunds_unused_gas_and_credits_proposer() {
@@ -423,19 +422,18 @@ fn successful_ptb_refunds_unused_gas_and_credits_proposer() {
         coin_version(&state, &gas_payer_id).unwrap(),
     );
 
-    // Proposer Account.loom: gained exactly the burnt portion.
+    // Proposer Coin<LOOM>: gained exactly the burnt portion.
     assert_eq!(
         balance(&state, &proposer),
         burnt,
         "proposer must be credited the burnt gas"
     );
 
-    // Sender Account.loom: untouched (Option A: PTB gas does NOT flow
-    // through the sender's account).
+    // Sender Coin<LOOM>: untouched by PTB gas.
     assert_eq!(
         balance(&state, &sender),
         sender_before,
-        "sender Account.loom must be untouched by a SubmitPtb"
+        "sender Coin<LOOM> balance must be untouched by a SubmitPtb"
     );
 }
 
@@ -449,8 +447,8 @@ fn successful_ptb_refunds_unused_gas_and_credits_proposer() {
 ///
 /// Assertions:
 ///   - gas-payer Coin<LOOM> loses exactly `gas_budget * gas_price`,
-///   - proposer Account.loom gains exactly the same,
-///   - sender Account.loom is unchanged.
+///   - proposer Coin<LOOM> balance gains exactly the same,
+///   - sender Coin<LOOM> balance is unchanged.
 #[test]
 fn reverted_ptb_burns_full_reservation_and_credits_proposer() {
     let signer = [0x44u8; 32];
@@ -509,7 +507,7 @@ fn reverted_ptb_burns_full_reservation_and_credits_proposer() {
     assert_eq!(
         balance(&state, &sender),
         sender_before,
-        "sender Account.loom must be untouched even on PTB revert"
+        "sender Coin<LOOM> balance must be untouched even on PTB revert"
     );
 }
 
@@ -631,13 +629,12 @@ fn free_vm_work_attempt_is_rejected_before_execution() {
 }
 
 // ---------------------------------------------------------------------------
-// Sender Account.loom strict invariant.
+// Sender Coin<LOOM> strict invariant.
 //
 // This is the explicit "no double-billing" guard: even on the success
 // path with a non-zero outer fee_per_unit and non-zero max_fuel, the
-// sender's Account.loom moves by zero. Gas comes from the gas-payer
-// Coin<LOOM> object and lands in the proposer's account — never the
-// sender's account.
+// sender's Coin<LOOM> balance moves by zero. Gas comes from the gas-payer
+// Coin<LOOM> object and lands in the proposer's Coin<LOOM> balance.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -682,7 +679,7 @@ fn sender_account_loom_never_moves_across_submit_ptb() {
     assert_eq!(
         balance(&state, &sender),
         sender_seed,
-        "sender Account.loom must be byte-equal across the SubmitPtb"
+        "sender Coin<LOOM> balance must be byte-equal across the SubmitPtb"
     );
     // Nonce did advance.
     assert_eq!(state.get_account(&sender).unwrap().nonce, 1);
@@ -715,7 +712,7 @@ fn undecodable_ptb_rejected_at_envelope_with_nonce_bump() {
     assert_eq!(
         balance(&state, &sender),
         sender_seed,
-        "sender Account.loom must be untouched on outer-envelope decode reject"
+        "sender Coin<LOOM> balance must be untouched on outer-envelope decode reject"
     );
     assert_eq!(state.get_account(&sender).unwrap().nonce, 1);
     assert_eq!(

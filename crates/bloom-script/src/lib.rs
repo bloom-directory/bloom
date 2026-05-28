@@ -59,8 +59,8 @@ pub use chain_iface::{
 pub use encode::{decode_ptb, encode_ptb};
 pub use error::PtbError;
 pub use executor::{
-    ExecutionReport, InvariantResult, LogEntry, LoomDelta, PetalCallResult, PetalPublishEvent,
-    PetalRunner, PtbExecutor,
+    ExecutionReport, InvariantResult, LogEntry, PetalCallResult, PetalPublishEvent, PetalRunner,
+    PtbExecutor,
 };
 pub use hash::{PTB_HASH_TAG, ptb_hash};
 pub use host_ctx::{HandleEntry, PtbHostCtx};

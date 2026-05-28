@@ -21,7 +21,6 @@
 //! Therefore: a pure state_root comparison (which commits to ObjectIds)
 //! cannot succeed. We instead assert *structural equivalence*:
 //!
-//! - Both paths produce the same `Account.loom` for alice and bob.
 //! - Both paths produce the same total `Coin<LOOM>` value for alice and bob.
 //! - Both paths produce the same number of entries in alice's and bob's
 //!   ownership indices.
@@ -229,7 +228,7 @@ fn apply_ptb_split_transfer(state: &mut State, alice: Address, bob: Address, amo
 //
 // Scenario: alice=1000, bob=0. Apply Transfer(300) to state A and the
 // equivalent PTB (SplitCoins+TransferObjects) to state B. Assert structural
-// equivalence: same Account.loom, same Coin<LOOM> totals, same coin counts.
+// equivalence: same Coin<LOOM> totals and same coin counts.
 //
 // NOTE: state_root comparison is infeasible because the ObjectId of the
 // new Coin<LOOM> created by the legacy Transfer compat shim and by the PTB
@@ -251,29 +250,6 @@ fn transfer_and_ptb_structural_equivalence() {
     let mut state_b = build_state(&[(alice, 1_000)]);
     seed_coin(&mut state_b, genesis_coin_id(alice, 1), alice, 1);
     apply_ptb_split_transfer(&mut state_b, alice, bob, 300);
-
-    // ── Account.loom ─────────────────────────────────────────────────────────
-    // NOTE: Account.loom diverges between the two paths in the test harness:
-    //
-    // - The legacy Transfer path (execute_tx for TxKind::Transfer) explicitly
-    //   credits the *receiver's* account.loom inside execute_tx (line ~299 of
-    //   petal_executor.rs: `to_acct.loom += amount_loom`).
-    //
-    // - The PTB path (SplitCoins + TransferObjects built-ins) does NOT update
-    //   Account.loom; that reconciliation is spec §7.2 step 9, which runs at
-    //   end-of-block in the full block driver, not inside execute_tx.
-    //
-    // In a full apply_block_state_transitions run both paths would go through
-    // step 9 reconciliation and produce equal Account.loom. In the isolated
-    // test harness (direct execute_tx calls) only the Transfer path touches
-    // Account.loom. We therefore assert only the sender side (which the block
-    // driver debits before calling execute_tx) and skip the receiver comparison.
-    //
-    // Sender (alice): both states have the same Coin<LOOM> total (700), so the
-    // end-of-block reconciliation would yield the same account.loom for both.
-    // We verify the coin totals as the canonical equivalence proof.
-
-    // ── Total Coin<LOOM> value (canonical equivalence) ────────────────────────
 
     // ── Total Coin<LOOM> value ────────────────────────────────────────────────
     let alice_coins_a = sum_coin_loom(&state_a, alice);

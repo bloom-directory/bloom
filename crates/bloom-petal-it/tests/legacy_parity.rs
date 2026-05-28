@@ -4,7 +4,7 @@
 //!
 //! These tests verify that the legacy `TxKind::Transfer` compat shim
 //! (introduced in commit fd57f2d, spec §9.2) produces consistent
-//! `Coin<LOOM>` + `Account.loom` state.
+//! `Coin<LOOM>` state.
 //!
 //! Coins are seeded with the 48-byte fungible-petal payload format
 //! (32-byte ObjectId placeholder + 16-byte u128 value) because
@@ -14,7 +14,6 @@
 //! Assertions follow spec §9.2:
 //!   - `Coin<LOOM>` split remainder = sender balance - amount.
 //!   - Bob receives a new `Coin<LOOM>` of the transferred value.
-//!   - `Account.loom` caches are updated correctly.
 //!   - Total conserved (no LOOM created or destroyed).
 
 use bloom_chain_node::consensus_driver::PetalExecutor;
@@ -61,11 +60,11 @@ fn legacy_coin_id(seed: u8) -> ObjectId {
     ObjectId([seed; 32])
 }
 
-fn transfer_tx(sender: Address, to: Address, amount: u128) -> Tx {
+fn transfer_tx_with_nonce(sender: Address, to: Address, amount: u128, nonce: u64) -> Tx {
     Tx {
         chain_id: "bloom-chain.v0".to_string(),
         sender,
-        nonce: 1,
+        nonce,
         max_fuel: 1_000,
         fee_per_unit: 0,
         kind: TxKind::Transfer {
@@ -77,9 +76,17 @@ fn transfer_tx(sender: Address, to: Address, amount: u128) -> Tx {
     }
 }
 
+fn transfer_tx(sender: Address, to: Address, amount: u128) -> Tx {
+    transfer_tx_with_nonce(sender, to, amount, 1)
+}
+
 fn exec_transfer(state: &mut State, sender: Address, to: Address, amount: u128) {
     let tx = transfer_tx(sender, to, amount);
-    let out = ChainPetalExecutor.execute_tx(&tx, state, 1, 0, addr(0xFF), Hash32([0u8; 32]));
+    exec_transfer_tx(state, &tx);
+}
+
+fn exec_transfer_tx(state: &mut State, tx: &Tx) {
+    let out = ChainPetalExecutor.execute_tx(tx, state, 1, 0, addr(0xFF), Hash32([0u8; 32]));
     assert!(out.success, "Transfer must succeed");
     state
         .apply(out.write_set.unwrap())
@@ -230,8 +237,9 @@ fn five_sequential_transfers_maintain_totals() {
     );
     seed_fungible_coin(&mut state, legacy_coin_id(0xAA), alice, total);
 
-    for _ in 0..5 {
-        exec_transfer(&mut state, alice, bob, 1000);
+    for nonce in 1..=5 {
+        let tx = transfer_tx_with_nonce(alice, bob, 1000, nonce);
+        exec_transfer_tx(&mut state, &tx);
     }
 
     let alice_total = total_coin_loom(&state, alice);
@@ -263,7 +271,7 @@ fn legacy_transfer_diverged_no_coin_loom_fails_closed() {
     let alice = addr(0xA1);
     let bob = addr(0xB2);
 
-    // Alice has Account.loom but no Coin<LOOM> object (diverged state).
+    // Alice has no Coin<LOOM> object.
     let mut state = State::new();
     bind_bootstrap_fungible(&mut state);
     state.set_account(

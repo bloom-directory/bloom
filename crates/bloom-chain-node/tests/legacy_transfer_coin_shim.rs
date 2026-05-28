@@ -4,7 +4,6 @@
 //! (Task #33).
 //!
 //! Verifies that after a legacy `Transfer` tx:
-//! - `Account.loom` for both sender and receiver is updated correctly.
 //! - The sender's `Coin<LOOM>` object is updated (split remainder) or
 //!   deleted (fully consumed).
 //! - The receiver gains a new `Coin<LOOM>` object with the transferred value.
@@ -83,7 +82,6 @@ fn seed_single_coin(state: &mut State, owner: Address, value: u128) -> ObjectId 
 /// Core shim test: alice owns 1 Coin<LOOM>(1000), transfers 300 to bob.
 ///
 /// Expected post-state:
-/// - `Account.loom`: alice = 700, bob = 300.
 /// - alice's coin value = 700 (split remainder).
 /// - bob has a new coin of value 300.
 /// - OwnershipIndex for alice still contains alice's coin.
@@ -96,24 +94,6 @@ fn transfer_splits_sender_coin_and_mints_receiver_coin() {
     let mut state = State::new();
     bind_bootstrap_fungible(&mut state);
 
-    // Seed Account.loom (simulating what apply_block would have done after
-    // genesis — the consensus driver debits sender before calling execute_tx,
-    // so we set it to what it looks like after the 1000→700 debit, i.e. 700.
-    // But execute_tx itself doesn't debit sender (apply_block does that).
-    // So we set alice's account.loom to 700 to reflect the post-debit state
-    // that execute_tx sees when it builds its snapshot.
-    //
-    // Actually: the snapshot the executor takes is of `state` AFTER
-    // apply_block has already debited max_fee + amount from sender's account.
-    // Here, max_fuel=1000, fee_per_unit=0 → max_fee=0; value=300.
-    // So alice's account.loom should be 1000 - 300 = 700 when execute_tx runs.
-    //
-    // We set alice to 1000 (genesis) and the test directly calls execute_tx
-    // without going through apply_block, so the Transfer branch will add 300
-    // to bob's account. Alice's account is untouched by execute_tx (apply_block
-    // already debited it). To match the shim's snapshot view we start with
-    // alice's account.loom at 1000 (pre-debit) since we're calling execute_tx
-    // directly, and the Transfer arm only credits to.
     let alice_acct = bloom_chain_state::Account {
         nonce: 0,
         code_hash: None,
@@ -261,7 +241,7 @@ fn transfer_exact_match_deletes_sender_coin() {
 }
 
 /// Divergence case: if sender has no Coin<LOOM>, the Transfer fails closed
-/// before either `Account.loom` or the object world can change.
+/// without changing the object world.
 #[test]
 fn transfer_without_coin_loom_fails_closed() {
     let alice = addr(0xA1);
@@ -269,7 +249,7 @@ fn transfer_without_coin_loom_fails_closed() {
 
     let mut state = State::new();
     bind_bootstrap_fungible(&mut state);
-    // Alice has Account.loom but NO Coin<LOOM> object (diverged state).
+    // Alice has NO Coin<LOOM> object.
     state.set_account(
         alice,
         bloom_chain_state::Account {
@@ -284,15 +264,14 @@ fn transfer_without_coin_loom_fails_closed() {
     let exec = ChainPetalExecutor;
     let out = exec.execute_tx(&tx, &mut state, 1, 0, addr(0xFF), Hash32([0u8; 32]));
 
-    // Missing Coin<LOOM> must now fail closed so Account.loom cannot diverge
-    // from the object world.
+    // Missing Coin<LOOM> must fail closed.
     assert!(!out.success, "Transfer must fail with missing Coin<LOOM>");
     assert!(
         out.write_set.is_none(),
         "failed transfer must not produce writes"
     );
 
-    // Bob gets no Account.loom credit.
+    // Bob gets no account materialization.
     assert!(state.get_account(&bob).is_none());
 
     // Bob has no Coin<LOOM> either.

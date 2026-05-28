@@ -4,7 +4,7 @@
 //! full committed state, not just the proposer LOOM emission.
 //!
 //! On master, `Node::run` rebuilt state at startup by walking
-//! `block_store` and applying only `proposer.loom += BLOCK_EMISSION` per
+//! `block_store` and applying only proposer block emission per
 //! block — every transfer, deploy, storage write, fee, and refund was
 //! silently dropped. A validator that restarted at height N effectively
 //! lost all of state H ∈ [1, N] except the proposer's accumulated
@@ -244,8 +244,8 @@ fn replay_reproduces_full_transfer_chain() {
 
 #[test]
 fn master_style_replay_diverges() {
-    // Pin the regression: the *master* approach (only `proposer.loom +=
-    // BLOCK_EMISSION` per block) produces a state_root that differs from
+    // Pin the regression: the *master* approach (only proposer block
+    // emission per block) produces a state_root that differs from
     // the live state. Without this assertion, a future change that
     // accidentally re-introduces the master shortcut might pass all
     // other tests.

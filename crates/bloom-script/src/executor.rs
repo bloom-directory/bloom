@@ -119,19 +119,6 @@ pub struct LogEntry {
     pub data: Vec<u8>,
 }
 
-/// Loom delta to apply to an account after the executor has run.
-///
-/// Phase 1: we accumulate these as a list of `(address, delta_loom)`
-/// pairs. The chain-side commit step (Phase 2) walks the list and
-/// updates `accounts[address].loom`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LoomDelta {
-    /// 32-byte address whose Loom balance changes.
-    pub address: [u8; 32],
-    /// Signed bloomwei delta. Positive = credit; negative = debit.
-    pub delta: i128,
-}
-
 /// Petal publish/upgrade event (Phase 1 stub).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct PetalPublishEvent {
@@ -169,8 +156,6 @@ pub struct ExecutionReport {
     /// gain it). Single-owner tuples would leak stale ids in the old
     /// owner's row.
     pub ownership_changes: Vec<(ObjectId, Owner, Owner)>,
-    /// Account-level Loom deltas to reconcile post-commit (spec §9.2).
-    pub loom_deltas: Vec<LoomDelta>,
     /// Publish / upgrade events for explorer indexers.
     pub publish_events: Vec<PetalPublishEvent>,
     /// Log records emitted by petals.
@@ -337,7 +322,7 @@ impl<'c> PtbExecutor<'c> {
         //   table via `object.create` and are picked up here.
         // - `ctx.object_deletes` carries host-`object.delete` ids.
         // - `ctx.ownership_changes` carries host-`object.transfer/share/freeze` rekeys.
-        // - `ctx.loom_deltas` and `ctx.logs` flow through verbatim.
+        // - `ctx.logs` flow through verbatim.
         let drained = self.with_ctx(std::mem::take);
         let command_outputs = drained.command_outputs;
 
@@ -370,7 +355,6 @@ impl<'c> PtbExecutor<'c> {
         report.object_writes = planned_writes;
         report.object_deletes = planned_deletes;
         report.ownership_changes = ownership_changes;
-        report.loom_deltas = drained.loom_deltas;
         report.logs = drained.logs;
         report
     }
@@ -873,7 +857,6 @@ fn revert(mut report: ExecutionReport, err: PtbError) -> ExecutionReport {
     report.object_writes.clear();
     report.object_deletes.clear();
     report.ownership_changes.clear();
-    report.loom_deltas.clear();
     report
 }
 

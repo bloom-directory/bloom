@@ -622,8 +622,7 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
         }
 
         // 3. SubmitPtb outer/inner gas reconciliation (P0-5, spec §7.2 +
-        //    §9.4). PTBs run on the gas-payer `Coin<LOOM>` object — not
-        //    on the sender's `Account.loom`. We still gate execution on
+        //    §9.4). PTBs run on the gas-payer `Coin<LOOM>` object. We still gate execution on
         //    the outer envelope's `tx.max_fuel` / `tx.fee_per_unit`
         //    caps so a malicious sender can't squeeze unlimited VM work
         //    out of a tiny outer fuel budget. Specifically:
@@ -636,10 +635,9 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
         //                    >= ptb.gas_budget * ptb.gas_price.
         //    If the inner budget exceeds either outer cap we reject at
         //    consensus — Receipt(success=false, fuel_used=0), no debit,
-        //    no execution. Otherwise sender's `Account.loom` is left
-        //    untouched (Option A): the petal executor settles gas
-        //    against the gas-payer `Coin<LOOM>` and credits the
-        //    proposer via a `apply_loom_delta` in its WriteSet.
+        //    no execution. Otherwise the petal executor settles gas
+        //    against the gas-payer `Coin<LOOM>` and credits the proposer
+        //    by minting a `Coin<LOOM>`.
         if let TxKind::SubmitPtb { ptb_bytes } = &tx.kind {
             match bloom_script::decode_ptb(ptb_bytes) {
                 Err(e) => {
@@ -830,13 +828,21 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
     if block_emission > 0
         && let Some(coin_type) = resolve_loom_coin_type(state)
     {
+        let emission_seed = {
+            let mut h = blake3::Hasher::new();
+            h.update(b"bloom.block.emission.seed");
+            h.update(&block.header.height.to_be_bytes());
+            h.update(&block.header.parent_hash.0);
+            h.update(&proposer.0);
+            Hash32(*h.finalize().as_bytes())
+        };
         let mut snap = state.snapshot();
         if let Err(e) = mint_coin_loom_to(
             &mut snap,
             proposer,
             block_emission,
             b"bloom.block.emission",
-            &block.header.block_hash(),
+            &emission_seed,
             coin_type,
         ) {
             warn!(err = %e, "block emission mint failed");
