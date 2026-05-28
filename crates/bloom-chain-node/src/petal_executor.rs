@@ -147,7 +147,14 @@ fn ptb_log_to_receipt_log(l: PtbLogEntry) -> Log {
 }
 
 fn deploy_fuel_for_bytes(len: usize) -> u64 {
-    DEPLOY_PETAL_BASE_FUEL + (len as u64 / DEPLOY_PETAL_BYTES_PER_FUEL)
+    let per_byte = (len as u64) / DEPLOY_PETAL_BYTES_PER_FUEL;
+    DEPLOY_PETAL_BASE_FUEL.saturating_add(per_byte)
+}
+
+fn next_object_version(version: u64) -> u64 {
+    version
+        .checked_add(1)
+        .expect("object version must not overflow u64")
 }
 
 fn validate_chain_petal_admission(wasm_bytes: &[u8], module_path: &str) -> Result<(), String> {
@@ -780,7 +787,19 @@ fn execute_tx_impl(
                     let gas_payer_id = ptb.gas_payer;
                     let gas_budget = ptb.gas_budget;
                     let gas_price = ptb.gas_price;
-                    let reservation = (gas_budget as u128).saturating_mul(gas_price);
+                    let reservation = match ptb.checked_gas_reservation() {
+                        Some(reservation) => reservation,
+                        None => {
+                            return ExecOutput {
+                                success: false,
+                                fuel_used: 0,
+                                return_data: b"ptb validation error: gas reservation overflow"
+                                    .to_vec(),
+                                logs: vec![],
+                                write_set: None,
+                            };
+                        }
+                    };
                     let pre_exec_gas_payer = validated
                         .objects
                         .get(&gas_payer_id.0)
@@ -791,11 +810,13 @@ fn execute_tx_impl(
                         // every mutation (spec §4.4).
                         let pre_value = decode_coin_value(&pre_exec_gas_payer.payload)
                             .expect("validator decoded coin value");
-                        let debited = pre_value.saturating_sub(reservation);
+                        let debited = pre_value
+                            .checked_sub(reservation)
+                            .expect("reservation bounds debit");
                         let new_payload = rewrite_value(&pre_exec_gas_payer.payload, debited)
                             .expect("rewrite Coin<LOOM> payload");
                         let mut debited_obj = pre_exec_gas_payer.clone();
-                        debited_obj.version = debited_obj.version.saturating_add(1);
+                        debited_obj.version = next_object_version(debited_obj.version);
                         debited_obj.payload = new_payload;
                         snapshot.insert_object(debited_obj);
                     }
@@ -901,10 +922,12 @@ fn execute_tx_impl(
                             let mut debited = pre_exec_gas_payer.clone();
                             let pre_value = decode_coin_value(&debited.payload)
                                 .expect("decode pre-exec coin value");
-                            let new_value = pre_value.saturating_sub(reservation);
+                            let new_value = pre_value
+                                .checked_sub(reservation)
+                                .expect("reservation bounds debit");
                             debited.payload = rewrite_value(&debited.payload, new_value)
                                 .expect("rewrite coin payload");
-                            debited.version = debited.version.saturating_add(1);
+                            debited.version = next_object_version(debited.version);
                             gas_snap.insert_object(debited);
                             if let Err(e) = mint_coin_loom_to(
                                 &mut gas_snap,
@@ -962,10 +985,12 @@ fn execute_tx_impl(
                                 let mut debited = pre_exec_gas_payer.clone();
                                 let pre_value = decode_coin_value(&debited.payload)
                                     .expect("decode pre-exec coin value");
-                                let new_value = pre_value.saturating_sub(reservation);
+                                let new_value = pre_value
+                                    .checked_sub(reservation)
+                                    .expect("reservation bounds debit");
                                 debited.payload = rewrite_value(&debited.payload, new_value)
                                     .expect("rewrite coin payload");
-                                debited.version = debited.version.saturating_add(1);
+                                debited.version = next_object_version(debited.version);
                                 gas_snap.insert_object(debited);
                                 if let Err(e) = mint_coin_loom_to(
                                     &mut gas_snap,
@@ -1000,10 +1025,12 @@ fn execute_tx_impl(
                                 let mut debited = pre_exec_gas_payer.clone();
                                 let pre_value = decode_coin_value(&debited.payload)
                                     .expect("decode pre-exec coin value");
-                                let new_value = pre_value.saturating_sub(reservation);
+                                let new_value = pre_value
+                                    .checked_sub(reservation)
+                                    .expect("reservation bounds debit");
                                 debited.payload = rewrite_value(&debited.payload, new_value)
                                     .expect("rewrite coin payload");
-                                debited.version = debited.version.saturating_add(1);
+                                debited.version = next_object_version(debited.version);
                                 gas_snap.insert_object(debited);
                                 if let Err(e) = mint_coin_loom_to(
                                     &mut gas_snap,
@@ -1040,10 +1067,12 @@ fn execute_tx_impl(
                                 let mut debited = pre_exec_gas_payer.clone();
                                 let pre_value = decode_coin_value(&debited.payload)
                                     .expect("decode pre-exec coin value");
-                                let new_value = pre_value.saturating_sub(reservation);
+                                let new_value = pre_value
+                                    .checked_sub(reservation)
+                                    .expect("reservation bounds debit");
                                 debited.payload = rewrite_value(&debited.payload, new_value)
                                     .expect("rewrite coin payload");
-                                debited.version = debited.version.saturating_add(1);
+                                debited.version = next_object_version(debited.version);
                                 gas_snap.insert_object(debited);
                                 if let Err(e) = mint_coin_loom_to(
                                     &mut gas_snap,
@@ -1081,17 +1110,31 @@ fn execute_tx_impl(
                     // object we keep the full burn (no refund) but
                     // still credit the proposer the burnt amount,
                     // matching the spec's settlement boundary.
-                    let burnt = (charged_fuel as u128).saturating_mul(gas_price);
-                    let refund = reservation.saturating_sub(burnt);
+                    let burnt = (charged_fuel as u128)
+                        .checked_mul(gas_price)
+                        .expect("charged fuel is bounded by checked reservation");
+                    let refund = reservation
+                        .checked_sub(burnt)
+                        .expect("charged fuel is bounded by gas budget");
                     if refund > 0 {
                         if let Some(mut current) = snapshot.get_object(&gas_payer_id) {
                             match decode_coin_value(&current.payload) {
                                 Ok(cur_value) => {
-                                    let new_value = cur_value.saturating_add(refund);
+                                    let Some(new_value) = cur_value.checked_add(refund) else {
+                                        return ExecOutput {
+                                            success: false,
+                                            fuel_used: charged_fuel,
+                                            return_data:
+                                                b"ptb gas settlement error: refund overflow"
+                                                    .to_vec(),
+                                            logs: vec![],
+                                            write_set: None,
+                                        };
+                                    };
                                     match rewrite_value(&current.payload, new_value) {
                                         Ok(new_payload) => {
                                             current.payload = new_payload;
-                                            current.version = current.version.saturating_add(1);
+                                            current.version = next_object_version(current.version);
                                             snapshot.insert_object(current);
                                         }
                                         Err(e) => warn!(
@@ -1221,7 +1264,7 @@ pub(crate) fn apply_coin_loom_transfer_with_domain(
         && let Some(mut obj) = snap.get_object(&id)
     {
         obj.payload = coin_payload(new_value);
-        obj.version += 1;
+        obj.version = next_object_version(obj.version);
         snap.insert_object(obj);
         // The split coin stays in sender_owned — we keep it.
     }
@@ -1313,4 +1356,17 @@ pub(crate) fn mint_coin_loom_to(
     to_owned.insert(pos, new_coin_id);
     snap.set_ownership(to_okey, to_owned);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deploy_fuel_for_bytes_uses_saturating_add() {
+        let per_byte = (usize::MAX as u64) / DEPLOY_PETAL_BYTES_PER_FUEL;
+        let expected = DEPLOY_PETAL_BASE_FUEL.saturating_add(per_byte);
+
+        assert_eq!(deploy_fuel_for_bytes(usize::MAX), expected);
+    }
 }

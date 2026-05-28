@@ -334,7 +334,12 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
         });
     }
     let coin_value = decode_coin_value(&gas_obj.payload)?;
-    let needed = tx.required_gas_reservation();
+    let needed = tx
+        .checked_gas_reservation()
+        .ok_or(PtbError::GasReservationOverflow {
+            gas_budget: tx.gas_budget,
+            gas_price: tx.gas_price,
+        })?;
     if coin_value < needed {
         return Err(PtbError::InsufficientGas {
             needed,

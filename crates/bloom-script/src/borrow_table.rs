@@ -245,7 +245,10 @@ impl BorrowTable {
                         row.dirty = true; // auto-promote
                     }
                     if row.dirty {
-                        row.version = row.version.saturating_add(1);
+                        row.version = row
+                            .version
+                            .checked_add(1)
+                            .expect("object version must not overflow u64");
                         row.baseline_payload.clone_from(&row.payload_bytes);
                         row.dirty = false;
                     }

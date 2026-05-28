@@ -166,6 +166,14 @@ pub enum PtbError {
         /// Available balance in the payer coin.
         available: u128,
     },
+    /// `gas_budget * gas_price` cannot be represented exactly.
+    #[error("gas reservation overflow: gas_budget {gas_budget} * gas_price {gas_price}")]
+    GasReservationOverflow {
+        /// Inner PTB gas budget.
+        gas_budget: u64,
+        /// Inner PTB gas price.
+        gas_price: u128,
+    },
     /// The `gas_payer` object exists but is not a `Coin<LOOM>` (wrong
     /// `type_tag`) or is owned by someone other than the first signer.
     #[error("invalid gas-payer object {id}: {reason}")]

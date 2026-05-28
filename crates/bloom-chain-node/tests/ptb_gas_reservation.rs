@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 
 use bloom_chain_node::consensus_driver::{
-    apply_block_state_transitions, coin_loom_balance, resolve_loom_coin_type,
+    PetalExecutor, apply_block_state_transitions, coin_loom_balance, resolve_loom_coin_type,
     try_apply_block_state_transitions,
 };
 use bloom_chain_node::petal_executor::{ChainPetalExecutor, ChainPetalExecutorWithManifests};
@@ -232,9 +232,8 @@ const NON_OOF_TRAP_PETAL: &str = r#"
 // Outer/inner cap reconciliation
 // ---------------------------------------------------------------------------
 
-/// `tx.max_fuel < ptb.gas_budget` must make the block invalid at the
-/// outer consensus envelope. No execution, no sender debit, no coin
-/// mutation, and no nonce bump.
+/// `tx.max_fuel < ptb.gas_budget` must be rejected at the shared admission
+/// gate. No execution, no sender debit, no coin mutation, and no nonce bump.
 #[test]
 fn outer_max_fuel_lower_than_inner_budget_rejected_at_envelope() {
     let signer = [0x11u8; 32];
@@ -269,12 +268,18 @@ fn outer_max_fuel_lower_than_inner_budget_rejected_at_envelope() {
     let state_before = state.clone();
     let block = make_block(1, proposer, vec![tx]);
     let exec = ChainPetalExecutorWithManifests::new(manifests);
-    let err = try_apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION)
-        .expect_err("outer/inner max-fuel mismatch must invalidate the block");
+    let (fuel, receipts) =
+        try_apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION)
+            .expect("outer/inner max-fuel mismatch is a no-op rejected receipt");
 
+    assert_eq!(fuel, 0);
+    assert_eq!(receipts.len(), 1);
+    assert!(!receipts[0].success);
+    assert_eq!(receipts[0].fuel_used, 0);
+    let reason = String::from_utf8_lossy(&receipts[0].return_data);
     assert!(
-        err.to_lowercase().contains("outer") || err.contains("max_fuel"),
-        "expected reconciliation error, got: {err}"
+        reason.to_lowercase().contains("outer") || reason.contains("max_fuel"),
+        "expected reconciliation error, got: {reason}"
     );
 
     // Coin, sender balance, and nonce must be untouched.
@@ -284,8 +289,8 @@ fn outer_max_fuel_lower_than_inner_budget_rejected_at_envelope() {
     assert!(state.get_account(&sender).is_none());
 }
 
-/// `tx.fee_per_unit < ptb.gas_price` must make the block invalid at the
-/// outer envelope (same shape as the max-fuel check).
+/// `tx.fee_per_unit < ptb.gas_price` must be rejected at admission
+/// (same no-op shape as the max-fuel check).
 #[test]
 fn outer_fee_per_unit_lower_than_inner_price_rejected_at_envelope() {
     let signer = [0x22u8; 32];
@@ -320,12 +325,18 @@ fn outer_fee_per_unit_lower_than_inner_price_rejected_at_envelope() {
     let state_before = state.clone();
     let block = make_block(1, proposer, vec![tx]);
     let exec = ChainPetalExecutorWithManifests::new(manifests);
-    let err = try_apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION)
-        .expect_err("outer/inner price mismatch must invalidate the block");
+    let (fuel, receipts) =
+        try_apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION)
+            .expect("outer/inner price mismatch is a no-op rejected receipt");
 
+    assert_eq!(fuel, 0);
+    assert_eq!(receipts.len(), 1);
+    assert!(!receipts[0].success);
+    assert_eq!(receipts[0].fuel_used, 0);
+    let reason = String::from_utf8_lossy(&receipts[0].return_data);
     assert!(
-        err.contains("fee_per_unit") || err.contains("gas_price"),
-        "expected price reconciliation error, got: {err}"
+        reason.contains("fee_per_unit") || reason.contains("gas_price"),
+        "expected price reconciliation error, got: {reason}"
     );
 
     // Coin, sender balance, and nonce must be untouched.
@@ -617,12 +628,18 @@ fn free_vm_work_attempt_is_rejected_before_execution() {
     let state_before = state.clone();
     let block = make_block(1, proposer, vec![tx]);
     let exec = ChainPetalExecutorWithManifests::new(manifests);
-    let err = try_apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION)
-        .expect_err("free VM work attempt must invalidate the block");
+    let (fuel, receipts) =
+        try_apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION)
+            .expect("free VM work attempt is rejected before execution");
 
+    assert_eq!(fuel, 0);
+    assert_eq!(receipts.len(), 1);
+    assert!(!receipts[0].success);
+    assert_eq!(receipts[0].fuel_used, 0);
+    let reason = String::from_utf8_lossy(&receipts[0].return_data);
     assert!(
-        err.contains("max_fuel") || err.contains("gas_budget"),
-        "expected outer/inner cap error, got: {err}"
+        reason.contains("max_fuel") || reason.contains("gas_budget"),
+        "expected outer/inner cap error, got: {reason}"
     );
 
     // Nothing moved — sender, coin, proposer all unchanged.
@@ -690,9 +707,8 @@ fn sender_coin_loom_never_moves_across_submit_ptb() {
 }
 
 // ---------------------------------------------------------------------------
-// Decode-error path: undecodable PTB bytes make the block invalid at the
-// outer envelope. Verifies the consensus_driver decode-error branch
-// (not the executor's branch).
+// Decode-error path: undecodable PTB bytes are rejected at the shared
+// admission gate without a nonce bump.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -709,10 +725,16 @@ fn undecodable_ptb_rejected_at_envelope_without_nonce_bump() {
     let state_before = state.clone();
     let block = make_block(1, proposer, vec![tx]);
     let exec = ChainPetalExecutor;
-    let err = try_apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION)
-        .expect_err("undecodable PTB must invalidate the block");
+    let (fuel, receipts) =
+        try_apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION)
+            .expect("undecodable PTB is a no-op rejected receipt");
 
-    assert!(err.contains("decode failed"), "got: {err}");
+    assert_eq!(fuel, 0);
+    assert_eq!(receipts.len(), 1);
+    assert!(!receipts[0].success);
+    assert_eq!(receipts[0].fuel_used, 0);
+    let reason = String::from_utf8_lossy(&receipts[0].return_data);
+    assert!(reason.contains("decode failed"), "got: {reason}");
     assert_eq!(state.state_root(), state_before.state_root());
     assert_eq!(
         balance(&state, &sender),
@@ -725,6 +747,48 @@ fn undecodable_ptb_rejected_at_envelope_without_nonce_bump() {
         0,
         "proposer must not be credited"
     );
+}
+
+#[test]
+fn ptb_with_overflowing_reservation_is_rejected_not_capped() {
+    let signer = [0x89u8; 32];
+    let gas_payer_id = ObjectId([0x98; 32]);
+    let proposer = Address([0x77; 32]);
+
+    let mut state = state_with_bootstrap_fungible();
+    let wasm = wat(NOOP_PETAL);
+    let petal_hash = state.insert_code(&wasm);
+    state.set_object(make_loom_coin(gas_payer_id, signer, u128::MAX));
+
+    let mut manifests = HashMap::new();
+    manifests.insert(petal_hash, manifest_with_nullary_fn("noop"));
+
+    let ptb = nullary_move_ptb_full(
+        signer,
+        petal_hash,
+        "noop",
+        gas_payer_id,
+        u64::MAX,
+        u128::MAX,
+        100,
+    );
+    let bytes = encode_ptb(&ptb).expect("encode PTB");
+    let (_sender, tx) = submit_ptb_tx_with_caps(bytes, 1, u64::MAX, u64::MAX);
+    let before_root = state.state_root();
+
+    let exec = ChainPetalExecutorWithManifests::new(manifests);
+    let out = exec.execute_tx(&tx, &mut state, 1, 0, proposer, Hash32([0; 32]));
+
+    assert!(!out.success);
+    assert_eq!(out.fuel_used, 0);
+    assert!(out.write_set.is_none());
+    assert!(
+        String::from_utf8_lossy(&out.return_data).contains("gas reservation overflow"),
+        "return data: {}",
+        String::from_utf8_lossy(&out.return_data)
+    );
+    assert_eq!(state.state_root(), before_root);
+    assert_eq!(coin_value(&state, &gas_payer_id), Some(u128::MAX));
 }
 
 // ---------------------------------------------------------------------------

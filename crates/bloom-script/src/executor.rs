@@ -194,6 +194,12 @@ pub struct PtbExecutor<'c> {
     /// PTB hash used as seed for transient id derivation; keeps ids
     /// reproducible across replays of the same tx.
     seed: [u8; 32],
+    /// Persistent object ids that were explicitly loaded with consume access.
+    ///
+    /// TransferObjects uses this as the authority record instead of the
+    /// borrow row's mutable `access_mode`, which is scoped to the latest Move
+    /// command that mentioned the row.
+    consume_authority: HashSet<ObjectId>,
 }
 
 impl<'c> PtbExecutor<'c> {
@@ -235,6 +241,7 @@ impl<'c> PtbExecutor<'c> {
             ctx,
             transient_counter: 0,
             seed: [0u8; 32],
+            consume_authority: HashSet::new(),
         }
     }
 
@@ -260,6 +267,7 @@ impl<'c> PtbExecutor<'c> {
     pub fn execute(&mut self, vtx: ValidatedPtb) -> ExecutionReport {
         let mut report = ExecutionReport::default();
         self.seed = vtx.tx.signing_digest();
+        self.consume_authority.clear();
         self.with_ctx(|ctx| {
             ctx.ptb_digest = self.seed;
             ctx.signers = vtx.tx.signers.clone();
@@ -434,6 +442,9 @@ impl<'c> PtbExecutor<'c> {
                 id, access_mode, ..
             } = arg
             {
+                if *access_mode == AccessMode::Consume {
+                    self.consume_authority.insert(*id);
+                }
                 let loaded = self.with_ctx(|ctx| {
                     if let Some(row) = ctx.borrow_table.get_mut(id) {
                         row.access_mode = *access_mode;
@@ -606,7 +617,7 @@ impl<'c> PtbExecutor<'c> {
                     .borrow_table
                     .get_mut(&id)
                     .ok_or(PtbError::ObjectNotFound { id })?;
-                if row.origin_command_idx.is_none() && row.access_mode != AccessMode::Consume {
+                if row.origin_command_idx.is_none() && !self.consume_authority.contains(&id) {
                     return Err(PtbError::AccessDenied {
                         id,
                         mode: AccessMode::Consume,

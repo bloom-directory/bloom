@@ -24,7 +24,7 @@ use bloom_chain_types::{
     vote::{Commit, Proposal, Vote, VoteKind},
 };
 
-use crate::validator_set::ValidatorSet;
+use crate::{round_validation::judge_proposer_round, validator_set::ValidatorSet};
 
 // ---------------------------------------------------------------------------
 // Step
@@ -419,12 +419,17 @@ impl ConsensusState {
         if self.step != Step::Propose {
             return vec![];
         }
-        // Verify the proposer is the expected one.
-        let expected_proposer = self.validator_set.proposer_for(self.height, self.round);
-        if p.proposer != expected_proposer.address {
+        let Ok(judgment) = judge_proposer_round(
+            self.height,
+            p.proposer,
+            self.round,
+            p.pol_round,
+            &self.validator_set,
+            false,
+        ) else {
             return vec![];
-        }
-        if p.pol_round >= 0 && p.pol_round as u32 >= p.round {
+        };
+        if !judgment.proposer_ok {
             return vec![];
         }
         // Refuse to prevote a block we have not yet seen. Stash the proposal

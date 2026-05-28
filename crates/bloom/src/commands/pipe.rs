@@ -108,7 +108,9 @@ fn header_json(tx: &PtbTx) -> Value {
         "gas_payer": format!("0x{}", hex::encode(tx.gas_payer.0)),
         "gas_budget": tx.gas_budget,
         "gas_price": tx.gas_price.to_string(),
-        "gas_reservation": tx.required_gas_reservation().to_string(),
+        "gas_reservation": tx.checked_gas_reservation()
+            .map(|reservation| reservation.to_string())
+            .unwrap_or_else(|| "overflow".to_string()),
         "commands": tx.commands.len(),
     })
 }

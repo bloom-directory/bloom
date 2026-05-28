@@ -10,9 +10,10 @@ use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::Address;
 
 use crate::error::ConsensusError;
+use crate::tx_admission::{
+    AdmitOutcome, AdmitReject, BalanceView, SimpleBalanceView, check_admissible,
+};
 use crate::verifier::SigVerifier;
-
-const TRANSFER_INTRINSIC_FUEL: u64 = 100;
 
 // ---------------------------------------------------------------------------
 // Key types
@@ -51,15 +52,37 @@ impl<V: SigVerifier> Mempool<V> {
         }
     }
 
-    /// Attempt to admit a transaction into the mempool.
+    /// Attempt to admit a non-PTB transaction into the mempool.
     ///
     /// `current_nonce` is the account's current committed nonce (0 for new accounts).
     /// `current_balance` is the account's confirmed LOOM balance in bloomweis.
+    ///
+    /// `SubmitPtb` admission needs a chain-state view so the gas-payer coin can
+    /// be checked. Use [`Self::admit_with_view`] for PTBs.
     pub fn admit(
         &mut self,
         tx: Tx,
         current_nonce: u64,
         current_balance: u128,
+    ) -> Result<(), ConsensusError> {
+        if matches!(tx.kind, TxKind::SubmitPtb { .. }) {
+            return Err(ConsensusError::InvalidSubmitPtb(
+                "SubmitPtb admission requires BalanceView".to_string(),
+            ));
+        }
+        let view = SimpleBalanceView {
+            sender: tx.sender,
+            nonce: current_nonce,
+            balance: current_balance,
+            ptb_gas_payer_balance: 0,
+        };
+        self.admit_with_view(tx, &view)
+    }
+
+    pub fn admit_with_view(
+        &mut self,
+        tx: Tx,
+        view: &dyn BalanceView,
     ) -> Result<(), ConsensusError> {
         // 1. Verify signature.
         let digest = tx.signing_digest();
@@ -67,90 +90,8 @@ impl<V: SigVerifier> Mempool<V> {
             return Err(ConsensusError::InvalidSignature);
         }
 
-        // 1b. Sender must derive from the signing pubkey (spec §4.3).
-        //
-        // Without this check, a tx could carry a valid signature over its
-        // body while claiming an arbitrary `sender` address — letting an
-        // attacker forge sender identity at admission time (review item #11,
-        // 2026-05-19 consensus hardening). The chain-apply path in
-        // `consensus_driver::apply_block` already enforces this; mirroring
-        // it here drops forged-sender txs at the mempool boundary so they
-        // never propagate via gossip.
-        let derived = Address::from_pubkey_bytes(&tx.pubkey.0);
-        if derived != tx.sender {
-            return Err(ConsensusError::AddressMismatch);
-        }
-
-        // 2. Nonce must be >= current_nonce + 1.
-        //
-        // We accept *future* nonces (not just the strict next-nonce) because
-        // gossip propagation is racy: when a peer relays a tx with nonce N+k,
-        // our state may only show nonce N because we haven't yet applied the
-        // intermediate blocks. Rejecting future nonces causes the gossip
-        // channel to silently drop those txs — they only ever reach us via
-        // block-sync of the original submitter's proposed blocks, which is
-        // dramatically slower than direct gossip.
-        //
-        // Stale nonces (<= current_nonce) are still rejected — those slots
-        // are already on-chain and replays would be no-ops at apply time.
-        // `select_for_block_for` enforces strict sequential nonces when the
-        // proposer builds a block, so a held future-nonce tx only ships once
-        // its predecessors are present.
-        let expected_nonce = current_nonce + 1;
-        if tx.nonce < expected_nonce {
-            return Err(ConsensusError::NonceMismatch {
-                expected: expected_nonce,
-                got: tx.nonce,
-            });
-        }
-
-        // 3. Balance check.
-        //
-        // Transfer/DeployPetal reserve against the outer sender. SubmitPtb is
-        // gas-object funded instead: block execution charges the decoded
-        // `ptb.gas_payer`, not `tx.sender`, so this generic mempool layer
-        // must not reject sponsored PTBs based on the relayer's LOOM balance.
-        //
-        // Before bypassing the relayer balance gate, reject PTBs that would
-        // fail before executor-side gas settlement. Otherwise an unfunded key
-        // could gossip malformed or under-capped SubmitPtb envelopes that burn
-        // no fuel at block execution.
-        let bypass_outer_balance = if let TxKind::SubmitPtb { ptb_bytes } = &tx.kind {
-            precheck_submit_ptb(&tx, ptb_bytes)?;
-            true
-        } else {
-            false
-        };
-        let value = tx_value(&tx);
-        let current_balance = if bypass_outer_balance {
-            u128::MAX
-        } else {
-            current_balance
-        };
-        let fee_reservation = (tx.max_fuel as u128)
-            .checked_mul(tx.fee_per_unit as u128)
-            .ok_or(ConsensusError::InsufficientBalance {
-                need: u128::MAX,
-                have: current_balance,
-            })?;
-        let need =
-            fee_reservation
-                .checked_add(value)
-                .ok_or(ConsensusError::InsufficientBalance {
-                    need: u128::MAX,
-                    have: current_balance,
-                })?;
-        if current_balance < need {
-            return Err(ConsensusError::InsufficientBalance {
-                need,
-                have: current_balance,
-            });
-        }
-        if matches!(tx.kind, TxKind::Transfer { .. }) && tx.max_fuel < TRANSFER_INTRINSIC_FUEL {
-            return Err(ConsensusError::InsufficientFuel {
-                required: TRANSFER_INTRINSIC_FUEL,
-                got: tx.max_fuel,
-            });
+        if let AdmitOutcome::Reject(reject) = check_admissible(&tx, view, false) {
+            return Err(admit_reject_to_consensus_error(reject));
         }
 
         // 4. Replace-by-fee: if a pending tx for (sender, nonce) exists, new fee must be
@@ -328,45 +269,19 @@ impl<V: SigVerifier> Mempool<V> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Extract the LOOM value embedded in a tx (for balance-check purposes).
-fn tx_value(tx: &Tx) -> u128 {
-    match &tx.kind {
-        TxKind::Transfer { amount_loom, .. } => *amount_loom,
-        TxKind::SubmitPtb { .. } | TxKind::DeployPetal { .. } => 0,
+pub fn admit_reject_to_consensus_error(reject: AdmitReject) -> ConsensusError {
+    match reject {
+        AdmitReject::SenderMismatch => ConsensusError::AddressMismatch,
+        AdmitReject::Nonce { expected, got } => ConsensusError::NonceMismatch { expected, got },
+        AdmitReject::InsufficientBalance { need, have } => {
+            ConsensusError::InsufficientBalance { need, have }
+        }
+        AdmitReject::EnvelopeInvalid(reason) => ConsensusError::InvalidSubmitPtb(reason),
+        AdmitReject::IntrinsicFuel { required, got } => {
+            ConsensusError::InsufficientFuel { required, got }
+        }
+        AdmitReject::Overflow(reason) => ConsensusError::InvalidSubmitPtb(reason),
     }
-}
-
-fn precheck_submit_ptb(tx: &Tx, ptb_bytes: &[u8]) -> Result<(), ConsensusError> {
-    let ptb = bloom_script::decode_ptb(ptb_bytes)
-        .map_err(|e| ConsensusError::InvalidSubmitPtb(format!("decode failed: {e}")))?;
-    if tx.max_fuel == 0 {
-        return Err(ConsensusError::InvalidSubmitPtb(
-            "outer max_fuel must be non-zero".to_string(),
-        ));
-    }
-    if ptb.gas_budget == 0 {
-        return Err(ConsensusError::InvalidSubmitPtb(
-            "inner gas_budget must be non-zero".to_string(),
-        ));
-    }
-    if ptb.gas_price == 0 {
-        return Err(ConsensusError::InvalidSubmitPtb(
-            "inner gas_price must be non-zero".to_string(),
-        ));
-    }
-    if tx.max_fuel < ptb.gas_budget {
-        return Err(ConsensusError::InvalidSubmitPtb(format!(
-            "outer max_fuel {} below inner gas_budget {}",
-            tx.max_fuel, ptb.gas_budget
-        )));
-    }
-    if (tx.fee_per_unit as u128) < ptb.gas_price {
-        return Err(ConsensusError::InvalidSubmitPtb(format!(
-            "outer fee_per_unit {} below inner gas_price {}",
-            tx.fee_per_unit, ptb.gas_price
-        )));
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +291,8 @@ fn precheck_submit_ptb(tx: &Tx, ptb_bytes: &[u8]) -> Result<(), ConsensusError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tx_admission::TRANSFER_INTRINSIC_FUEL;
+    use bloom_chain_types::tx::TxKind;
     use bloom_chain_types::types::{PubKeyBytes, SigBytes};
 
     use crate::verifier::NoopVerifier;

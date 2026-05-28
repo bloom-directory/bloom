@@ -2,6 +2,7 @@
 //!
 //! Mempool unit tests.
 
+use bloom_chain_consensus::tx_admission::SimpleBalanceView;
 use bloom_chain_consensus::{ConsensusError, Mempool, NoopVerifier, RejectAllVerifier};
 use bloom_chain_types::tx::TxKind;
 use bloom_chain_types::types::Address;
@@ -20,6 +21,15 @@ fn valid_ptb_bytes(gas_budget: u64, gas_price: u128) -> Vec<u8> {
         ..PtbTx::default()
     })
     .expect("test PTB encodes")
+}
+
+fn funded_ptb_view(sender: Address, gas_payer_balance: u128) -> SimpleBalanceView {
+    SimpleBalanceView {
+        sender,
+        nonce: 0,
+        balance: 0,
+        ptb_gas_payer_balance: gas_payer_balance,
+    }
 }
 
 #[test]
@@ -100,7 +110,7 @@ fn reject_insufficient_balance_with_value() {
 fn reject_transfer_reservation_overflow() {
     let mut mp = Mempool::new(NoopVerifier);
     let err = mp
-        .admit(make_mempool_tx(1, 1, 1, 1, u128::MAX), 0, u128::MAX)
+        .admit(make_mempool_tx(1, 1, 1, 100, u128::MAX), 0, u128::MAX)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -118,10 +128,50 @@ fn submit_ptb_admission_does_not_charge_outer_sender_balance() {
     tx.kind = TxKind::SubmitPtb {
         ptb_bytes: valid_ptb_bytes(100, 10),
     };
+    let view = funded_ptb_view(tx.sender, 1_000);
 
-    mp.admit(tx, 0, 0)
+    mp.admit_with_view(tx, &view)
         .expect("sponsored PTB admission must not require relayer LOOM");
     assert_eq!(mp.len(), 1);
+}
+
+#[test]
+fn legacy_admit_rejects_submit_ptb_without_balance_view() {
+    let mut mp = Mempool::new(NoopVerifier);
+    let mut tx = make_mempool_tx(1, 1, 10, 100, 0);
+    tx.kind = TxKind::SubmitPtb {
+        ptb_bytes: valid_ptb_bytes(100, 10),
+    };
+
+    let err = mp.admit(tx, 0, 0).unwrap_err();
+    assert!(matches!(err, ConsensusError::InvalidSubmitPtb(_)));
+    assert_eq!(mp.len(), 0);
+}
+
+#[test]
+fn submit_ptb_admission_checks_gas_payer_balance() {
+    let mut mp = Mempool::new(NoopVerifier);
+    let mut tx = make_mempool_tx(1, 1, 10, 100, 0);
+    tx.kind = TxKind::SubmitPtb {
+        ptb_bytes: valid_ptb_bytes(100, 10),
+    };
+    let view = SimpleBalanceView {
+        sender: tx.sender,
+        nonce: 0,
+        balance: 0,
+        ptb_gas_payer_balance: 999,
+    };
+
+    let err = mp.admit_with_view(tx, &view).unwrap_err();
+
+    assert!(matches!(
+        err,
+        ConsensusError::InsufficientBalance {
+            need: 1000,
+            have: 999
+        }
+    ));
+    assert_eq!(mp.len(), 0);
 }
 
 #[test]
@@ -131,8 +181,9 @@ fn submit_ptb_admission_rejects_malformed_bytes() {
     tx.kind = TxKind::SubmitPtb {
         ptb_bytes: vec![0xCA, 0xFE],
     };
+    let view = funded_ptb_view(tx.sender, 1_000);
 
-    let err = mp.admit(tx, 0, 0).unwrap_err();
+    let err = mp.admit_with_view(tx, &view).unwrap_err();
     assert!(matches!(err, ConsensusError::InvalidSubmitPtb(_)));
     assert_eq!(mp.len(), 0);
 }
@@ -144,8 +195,9 @@ fn submit_ptb_admission_rejects_inner_cap_above_outer_cap() {
     tx.kind = TxKind::SubmitPtb {
         ptb_bytes: valid_ptb_bytes(100, 10),
     };
+    let view = funded_ptb_view(tx.sender, 1_000);
 
-    let err = mp.admit(tx, 0, 0).unwrap_err();
+    let err = mp.admit_with_view(tx, &view).unwrap_err();
     assert!(matches!(err, ConsensusError::InvalidSubmitPtb(_)));
     assert_eq!(mp.len(), 0);
 }
@@ -157,8 +209,9 @@ fn submit_ptb_admission_rejects_free_inner_gas() {
     tx.kind = TxKind::SubmitPtb {
         ptb_bytes: valid_ptb_bytes(100, 0),
     };
+    let view = funded_ptb_view(tx.sender, 1_000);
 
-    let err = mp.admit(tx, 0, 0).unwrap_err();
+    let err = mp.admit_with_view(tx, &view).unwrap_err();
     assert!(matches!(err, ConsensusError::InvalidSubmitPtb(_)));
     assert_eq!(mp.len(), 0);
 }

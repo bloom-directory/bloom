@@ -19,6 +19,7 @@ use crate::{
     mempool::Mempool,
     signer::Signer,
     state_machine::{Action, ConsensusState, Event, ProposalOrVote, Step},
+    tx_admission::BalanceView,
     validator_set::ValidatorSet,
     verifier::SigVerifier,
 };
@@ -233,7 +234,10 @@ impl<V: SigVerifier> ConsensusEngine<V> {
         actions
     }
 
-    /// Admit a transaction into the mempool.
+    /// Admit a non-PTB transaction into the mempool.
+    ///
+    /// Use [`Self::submit_tx_with_view`] for `SubmitPtb`; PTB admission needs a
+    /// chain-state view to validate the gas-payer coin and balance.
     pub fn submit_tx(
         &mut self,
         tx: Tx,
@@ -241,6 +245,14 @@ impl<V: SigVerifier> ConsensusEngine<V> {
         current_balance: u128,
     ) -> Result<(), ConsensusError> {
         self.mempool.admit(tx, current_nonce, current_balance)
+    }
+
+    pub fn submit_tx_with_view(
+        &mut self,
+        tx: Tx,
+        view: &dyn BalanceView,
+    ) -> Result<(), ConsensusError> {
+        self.mempool.admit_with_view(tx, view)
     }
 
     /// Current height.

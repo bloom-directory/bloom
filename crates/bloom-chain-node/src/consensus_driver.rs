@@ -18,7 +18,12 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use bloom_chain_consensus::{
-    ConsensusEngine, auth::verify_vote_sig, signer::Signer, validator_set::ValidatorSet,
+    ConsensusEngine,
+    auth::verify_vote_sig,
+    round_validation::{bounded_round_window, judge_proposer_round},
+    signer::Signer,
+    tx_admission::{AdmitOutcome, AdmitReject, BalanceView, check_admissible},
+    validator_set::ValidatorSet,
     verifier::SigVerifier,
 };
 use bloom_chain_state::{Account, State, WriteSet};
@@ -82,6 +87,53 @@ pub trait PetalExecutor: Send + Sync + 'static {
         proposer: Address,
         parent_hash: Hash32,
     ) -> ExecOutput;
+}
+
+pub struct StateAdmissionView<'a> {
+    pub state: &'a State,
+}
+
+impl BalanceView for StateAdmissionView<'_> {
+    fn nonce(&self, addr: &Address) -> u64 {
+        self.state.get_account(addr).map(|a| a.nonce).unwrap_or(0)
+    }
+
+    fn loom_balance(&self, addr: &Address) -> u128 {
+        resolve_loom_coin_type(self.state)
+            .map(|coin_type| coin_loom_balance(self.state, *addr, &coin_type))
+            .unwrap_or(0)
+    }
+
+    fn ptb_gas_payer_balance(&self, ptb: &bloom_script::PtbTx) -> Result<u128, AdmitReject> {
+        let Some(first_signer) = ptb.signers.first() else {
+            return Err(AdmitReject::EnvelopeInvalid(
+                "PTB has no signers".to_string(),
+            ));
+        };
+        let Some(coin_type) = resolve_loom_coin_type(self.state) else {
+            return Err(AdmitReject::EnvelopeInvalid(
+                "missing required VFS binding for /bloom/core/fungible".to_string(),
+            ));
+        };
+        let Some(obj) = self.state.get_object(&ptb.gas_payer) else {
+            return Err(AdmitReject::EnvelopeInvalid(
+                "gas-payer object not found".to_string(),
+            ));
+        };
+        if obj.owner != Owner::Address(*first_signer) {
+            return Err(AdmitReject::EnvelopeInvalid(
+                "gas-payer object is not owned by first signer".to_string(),
+            ));
+        }
+        if obj.type_tag != coin_type {
+            return Err(AdmitReject::EnvelopeInvalid(
+                "gas-payer object is not a Coin<LOOM>".to_string(),
+            ));
+        }
+        decode_coin_value(&obj.payload).map_err(|e| {
+            AdmitReject::EnvelopeInvalid(format!("gas-payer Coin<LOOM> decode failed: {e}"))
+        })
+    }
 }
 
 /// A no-op executor that marks every tx as succeeded with zero fuel (for scaffolding / testing).
@@ -338,12 +390,11 @@ pub fn validate_block_for_apply(
             hex::encode(block_hash.0)
         ));
     }
-    let proposer_round_window = validator_set
-        .len()
-        .min((commit.round as usize).saturating_add(1));
-    let proposer_matches_proposal_round = (0..proposer_round_window)
-        .any(|round| validator_set.proposer_for(h.height, round as u32).address == h.proposer);
-    if !proposer_matches_proposal_round {
+    let proposer_judgment =
+        judge_proposer_round(h.height, h.proposer, commit.round, -1, validator_set, true)
+            .map_err(|e| e.to_string())?;
+    if !proposer_judgment.proposer_ok {
+        let proposer_round_window = bounded_round_window(validator_set.len(), commit.round);
         return Err(format!(
             "header.proposer={} is not a proposer for height={} in bounded rounds 0..{}",
             hex::encode(h.proposer.0),
@@ -446,7 +497,9 @@ pub fn validate_block_for_apply(
                 hex::encode(v.validator.0)
             ));
         }
-        power = power.saturating_add(val.voting_power);
+        power = power
+            .checked_add(val.voting_power)
+            .ok_or_else(|| "commit voting power overflow".to_string())?;
     }
     let quorum = validator_set.quorum();
     if power < quorum {
@@ -490,10 +543,19 @@ pub fn validate_block_for_proposal(
             hex::encode(expected.parent_hash.0)
         ));
     }
-    let expected_proposer = validator_set
-        .proposer_for(expected.height, expected.header_proposer_round)
-        .address;
-    if h.proposer != expected_proposer {
+    let proposer_judgment = judge_proposer_round(
+        expected.height,
+        h.proposer,
+        expected.header_proposer_round,
+        -1,
+        validator_set,
+        false,
+    )
+    .map_err(|e| e.to_string())?;
+    if !proposer_judgment.proposer_ok {
+        let expected_proposer = validator_set
+            .proposer_for(expected.height, expected.header_proposer_round)
+            .address;
         return Err(format!(
             "header.proposer={} != expected proposer={} for height={} proposal_round={} header_round={}",
             hex::encode(h.proposer.0),
@@ -602,34 +664,13 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
     let mut receipts: Vec<Receipt> = Vec::new();
 
     for tx in &block.txs {
-        // 1. Verify sender derivation (cheap check before expensive xDSA).
-        let expected_sender = Address::from_pubkey_bytes(&tx.pubkey.0);
-        if expected_sender != tx.sender {
+        let admission_view = StateAdmissionView { state };
+        if let AdmitOutcome::Reject(reject) = check_admissible(tx, &admission_view, true) {
             receipts.push(Receipt {
                 tx_hash: tx.tx_hash(),
                 success: false,
                 fuel_used: 0,
-                return_data: b"sender mismatch".to_vec(),
-                logs: vec![],
-            });
-            continue;
-        }
-        // 2. Nonce check — tx.nonce must equal sender.nonce + 1 (strict
-        //    next-nonce ordering).  Without this, a tx accidentally
-        //    re-included in a later block would silently re-apply.
-        let sender_acct = state.get_account(&tx.sender);
-        let current_nonce = sender_acct.as_ref().map(|a| a.nonce).unwrap_or(0);
-        if tx.nonce != current_nonce + 1 {
-            receipts.push(Receipt {
-                tx_hash: tx.tx_hash(),
-                success: false,
-                fuel_used: 0,
-                return_data: format!(
-                    "nonce mismatch: tx.nonce={} expected={}",
-                    tx.nonce,
-                    current_nonce + 1
-                )
-                .into_bytes(),
+                return_data: format!("tx admission rejected: {reject:?}").into_bytes(),
                 logs: vec![],
             });
             continue;
@@ -653,16 +694,17 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
         //    catch-up sync cannot trust mempool filtering: accepting those
         //    envelopes as zero-fuel nonce bumps lets a Byzantine proposer
         //    change state without consuming block fuel.
-        if let TxKind::SubmitPtb { ptb_bytes } = &tx.kind {
-            precheck_submit_ptb_envelope(tx, ptb_bytes)?;
-
+        if let TxKind::SubmitPtb { .. } = &tx.kind {
             let mut tx_state = state.clone();
             tx_state.register_pubkey(tx.sender, tx.pubkey.clone());
 
             // Bump nonce; sender's loom stays put.
             {
-                let mut acct = sender_acct.clone().unwrap_or_else(empty_account);
-                acct.nonce += 1;
+                let mut acct = state.get_account(&tx.sender).unwrap_or_else(empty_account);
+                acct.nonce = acct
+                    .nonce
+                    .checked_add(1)
+                    .expect("admission checked sender nonce can advance");
                 tx_state.set_account(tx.sender, acct);
             }
 
@@ -717,40 +759,11 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
             continue;
         }
 
-        // 3. Max-fee reservation (non-PTB txs).
-        if tx.max_fuel == 0 || tx.fee_per_unit == 0 {
-            return Err(
-                "invalid non-PTB tx envelope: max_fuel and fee_per_unit must be non-zero"
-                    .to_string(),
-            );
-        }
+        // 3. Max-fee reservation (non-PTB txs). The admission predicate above
+        // already proved this arithmetic and the sender balance are valid.
         let max_fee = (tx.max_fuel as u128)
             .checked_mul(tx.fee_per_unit as u128)
-            .ok_or_else(|| {
-                format!(
-                    "invalid non-PTB tx envelope: max fee overflow for max_fuel {} and fee_per_unit {}",
-                    tx.max_fuel, tx.fee_per_unit
-                )
-            })?;
-        let value = match &tx.kind {
-            TxKind::Transfer { amount_loom, .. } => *amount_loom,
-            TxKind::DeployPetal { .. } => 0,
-            // Handled in the SubmitPtb early-continue branch above.
-            TxKind::SubmitPtb { .. } => unreachable!(),
-        };
-        let required = match max_fee.checked_add(value) {
-            Some(required) => required,
-            None => {
-                receipts.push(Receipt {
-                    tx_hash: tx.tx_hash(),
-                    success: false,
-                    fuel_used: 0,
-                    return_data: b"required Coin<LOOM> overflow".to_vec(),
-                    logs: vec![],
-                });
-                continue;
-            }
-        };
+            .expect("admission checked non-PTB max fee");
         let Some(coin_type) = resolve_loom_coin_type(state) else {
             receipts.push(Receipt {
                 tx_hash: tx.tx_hash(),
@@ -761,17 +774,6 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
             });
             continue;
         };
-        let balance = coin_loom_balance(state, tx.sender, &coin_type);
-        if balance < required {
-            receipts.push(Receipt {
-                tx_hash: tx.tx_hash(),
-                success: false,
-                fuel_used: 0,
-                return_data: b"insufficient Coin<LOOM>".to_vec(),
-                logs: vec![],
-            });
-            continue;
-        }
 
         let mut tx_state = state.clone();
         tx_state.register_pubkey(tx.sender, tx.pubkey.clone());
@@ -781,8 +783,11 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
         // candidate state so fee settlement can fail without publishing
         // non-PTB effects.
         {
-            let mut acct = sender_acct.unwrap_or_else(empty_account);
-            acct.nonce += 1;
+            let mut acct = state.get_account(&tx.sender).unwrap_or_else(empty_account);
+            acct.nonce = acct
+                .nonce
+                .checked_add(1)
+                .expect("admission checked sender nonce can advance");
             tx_state.set_account(tx.sender, acct);
         }
 
@@ -896,33 +901,6 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
     }
 
     Ok((total_fuel_used, receipts))
-}
-
-fn precheck_submit_ptb_envelope(tx: &Tx, ptb_bytes: &[u8]) -> std::result::Result<(), String> {
-    let ptb = bloom_script::decode_ptb(ptb_bytes)
-        .map_err(|e| format!("invalid SubmitPtb envelope: decode failed: {e}"))?;
-    if tx.max_fuel == 0 {
-        return Err("invalid SubmitPtb envelope: outer max_fuel must be non-zero".to_string());
-    }
-    if ptb.gas_budget == 0 {
-        return Err("invalid SubmitPtb envelope: inner gas_budget must be non-zero".to_string());
-    }
-    if ptb.gas_price == 0 {
-        return Err("invalid SubmitPtb envelope: inner gas_price must be non-zero".to_string());
-    }
-    if tx.max_fuel < ptb.gas_budget {
-        return Err(format!(
-            "invalid SubmitPtb envelope: outer max_fuel {} below inner gas_budget {}",
-            tx.max_fuel, ptb.gas_budget
-        ));
-    }
-    if (tx.fee_per_unit as u128) < ptb.gas_price {
-        return Err(format!(
-            "invalid SubmitPtb envelope: outer fee_per_unit {} below inner gas_price {}",
-            tx.fee_per_unit, ptb.gas_price
-        ));
-    }
-    Ok(())
 }
 
 /// Result of deterministic block execution on a scratch state.

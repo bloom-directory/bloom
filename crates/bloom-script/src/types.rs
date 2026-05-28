@@ -253,11 +253,12 @@ impl PtbTx {
         crate::hash::ptb_hash(self)
     }
 
-    /// Required gas reservation: `gas_budget * gas_price`. Saturates
-    /// at `u128::MAX` to avoid an in-validator panic; the validator
-    /// then compares against the gas payer's value.
-    pub fn required_gas_reservation(&self) -> u128 {
-        (self.gas_budget as u128).saturating_mul(self.gas_price)
+    /// Required gas reservation: `gas_budget * gas_price`.
+    ///
+    /// Returns `None` when the reservation cannot be represented exactly.
+    /// Callers must reject such PTBs instead of silently capping the debit.
+    pub fn checked_gas_reservation(&self) -> Option<u128> {
+        (self.gas_budget as u128).checked_mul(self.gas_price)
     }
 }
 
@@ -326,23 +327,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn required_gas_reservation_saturates() {
+    fn checked_gas_reservation_rejects_overflow() {
         let tx = PtbTx {
             gas_budget: u64::MAX,
             gas_price: u128::MAX,
             ..PtbTx::default()
         };
-        assert_eq!(tx.required_gas_reservation(), u128::MAX);
+        assert_eq!(tx.checked_gas_reservation(), None);
     }
 
     #[test]
-    fn required_gas_reservation_normal() {
+    fn checked_gas_reservation_normal() {
         let tx = PtbTx {
             gas_budget: 100_000,
             gas_price: 7,
             ..PtbTx::default()
         };
-        assert_eq!(tx.required_gas_reservation(), 700_000u128);
+        assert_eq!(tx.checked_gas_reservation(), Some(700_000u128));
     }
 
     #[test]

@@ -22,8 +22,10 @@ pub mod auth;
 pub mod engine;
 pub mod error;
 pub mod mempool;
+pub mod round_validation;
 pub mod signer;
 pub mod state_machine;
+pub mod tx_admission;
 pub mod validator_set;
 pub mod verifier;
 

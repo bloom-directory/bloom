@@ -44,9 +44,10 @@ ENV CARGO_TARGET_DIR=/tmp/cargo-target \
 
 # Build the mempool mock WS server — a stand-alone Cargo package that
 # lives outside the main workspace so it builds independently.
+COPY tests/docker/mempool_mock_ws /tmp/mempool_mock_ws
 RUN cargo build --release \
-        --manifest-path tests/docker/mempool_mock_ws/Cargo.toml \
-    && cp tests/docker/mempool_mock_ws/target/release/mempool-mock-ws \
+        --manifest-path /tmp/mempool_mock_ws/Cargo.toml \
+    && cp /tmp/cargo-target/release/mempool-mock-ws \
            /usr/local/bin/mempool-mock-ws
 
 # The host driver bind-mounts the repo at /workspace and runs

@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use bloom_chain_consensus::{
     Action, ConsensusEngine, Mempool,
+    round_validation::judge_proposer_round,
     state_machine::{Event, TimeoutKind},
 };
 use bloom_chain_state::State;
@@ -39,9 +40,8 @@ use tracing::{debug, error, info, warn};
 use crate::{
     block_store::BlockStore,
     consensus_driver::{
-        BLOCK_EMISSION, ConsensusDriver, PetalExecutor, XdsaVerifier, coin_loom_balance,
-        compute_txs_root, resolve_loom_coin_type, try_apply_block_state_transitions,
-        validate_block_for_apply,
+        BLOCK_EMISSION, ConsensusDriver, PetalExecutor, StateAdmissionView, XdsaVerifier,
+        compute_txs_root, try_apply_block_state_transitions, validate_block_for_apply,
     },
     genesis::Genesis,
     mempool_persist::MempoolPersist,
@@ -455,20 +455,8 @@ impl Node {
                 let admitted = {
                     let mut eng = driver_tx.engine.lock();
                     let state = driver_tx.state.lock();
-                    let nonce = state.get_account(&tx.sender).map(|a| a.nonce).unwrap_or(0);
-                    let balance = resolve_loom_coin_type(&state)
-                        .map(|coin_type| coin_loom_balance(&state, tx.sender, &coin_type))
-                        .unwrap_or(0);
-                    drop(state);
-                    let result = submit_tx_for_chain(
-                        &mut eng,
-                        tx.clone(),
-                        nonce,
-                        balance,
-                        &driver_tx.chain_id,
-                    );
-                    drop(eng);
-                    result
+                    let view = StateAdmissionView { state: &state };
+                    submit_tx_for_chain(&mut eng, tx.clone(), &view, &driver_tx.chain_id)
                 };
                 match admitted {
                     Err(e) => {
@@ -644,25 +632,9 @@ impl Node {
                         // All locking happens inside this block; no locks held at await.
                         let admitted = {
                             let mut eng = driver_ev.engine.lock();
-                            let nonce = {
-                                let state = driver_ev.state.lock();
-                                state.get_account(&tx.sender).map(|a| a.nonce).unwrap_or(0)
-                            };
-                            let balance = {
-                                let state = driver_ev.state.lock();
-                                resolve_loom_coin_type(&state)
-                                    .map(|coin_type| {
-                                        coin_loom_balance(&state, tx.sender, &coin_type)
-                                    })
-                                    .unwrap_or(0)
-                            };
-                            submit_tx_for_chain(
-                                &mut eng,
-                                tx.clone(),
-                                nonce,
-                                balance,
-                                &driver_ev.chain_id,
-                            )
+                            let state = driver_ev.state.lock();
+                            let view = StateAdmissionView { state: &state };
+                            submit_tx_for_chain(&mut eng, tx.clone(), &view, &driver_ev.chain_id)
                         };
                         if let Err(e) = admitted {
                             // The gossiping peer admitted this tx, so they
@@ -1268,15 +1240,12 @@ fn reload_persisted_mempool(
     let mut admitted = 0usize;
     let mut purged = 0usize;
     for tx in txs {
-        let (nonce, balance) = {
+        let result = {
             let st = state.lock();
-            let nonce = st.get_account(&tx.sender).map(|a| a.nonce).unwrap_or(0);
-            let balance = resolve_loom_coin_type(&st)
-                .map(|coin_type| coin_loom_balance(&st, tx.sender, &coin_type))
-                .unwrap_or(0);
-            (nonce, balance)
+            let view = StateAdmissionView { state: &st };
+            submit_tx_for_chain(engine, tx.clone(), &view, chain_id)
         };
-        match submit_tx_for_chain(engine, tx.clone(), nonce, balance, chain_id) {
+        match result {
             Ok(()) => admitted += 1,
             Err(e) => {
                 purged += 1;
@@ -1298,8 +1267,7 @@ fn reload_persisted_mempool(
 fn submit_tx_for_chain(
     engine: &mut ConsensusEngine<XdsaVerifier>,
     tx: bloom_chain_types::tx::Tx,
-    current_nonce: u64,
-    current_balance: u128,
+    view: &dyn bloom_chain_consensus::tx_admission::BalanceView,
     chain_id: &str,
 ) -> Result<(), bloom_chain_consensus::error::ConsensusError> {
     if tx.chain_id != chain_id {
@@ -1308,7 +1276,7 @@ fn submit_tx_for_chain(
             got: tx.chain_id,
         });
     }
-    engine.submit_tx(tx, current_nonce, current_balance)
+    engine.submit_tx_with_view(tx, view)
 }
 
 fn prune_committed_mempool_persist(
@@ -1349,25 +1317,37 @@ fn build_proposal_block_from_candidates<E: PetalExecutor>(
     candidates: Vec<Tx>,
 ) -> Block {
     let mut accepted = Vec::with_capacity(candidates.len());
+    let mut accepted_state = base_state.clone();
 
     for candidate in candidates {
+        let view = StateAdmissionView {
+            state: &accepted_state,
+        };
+        if let bloom_chain_consensus::tx_admission::AdmitOutcome::Reject(reject) =
+            bloom_chain_consensus::tx_admission::check_admissible(&candidate, &view, true)
+        {
+            warn!(
+                sender = %hex::encode(candidate.sender.0),
+                nonce = candidate.nonce,
+                reject = ?reject,
+                "proposal.builder dropped inadmissible selected tx"
+            );
+            continue;
+        }
+
         let mut trial_txs = accepted.clone();
         trial_txs.push(candidate.clone());
         let trial_block = template.block_with_txs(trial_txs);
         let mut scratch = base_state.clone();
 
-        match try_apply_block_state_transitions(
-            &mut scratch,
-            executor,
-            &trial_block,
-            block_emission,
-        ) {
+        match try_apply_block_state_transitions(&mut scratch, executor, &trial_block, 0) {
             Ok((_fuel, receipts))
                 if receipts.len() == trial_block.txs.len()
                     && receipts.last().is_some_and(|receipt| {
                         receipt.tx_hash == candidate.tx_hash() && receipt.fuel_used > 0
                     }) =>
             {
+                accepted_state = scratch;
                 accepted.push(candidate)
             }
             Ok((_fuel, receipts)) => {
@@ -1458,14 +1438,23 @@ impl ProposalBlockTemplate {
 }
 
 fn proposal_header_round(proposal_round: u32, pol_round: i32) -> Option<u32> {
-    if pol_round >= 0 {
-        let pol_round = pol_round as u32;
-        if pol_round >= proposal_round {
-            return None;
-        }
-        return Some(pol_round);
-    }
-    Some(proposal_round)
+    let empty_validator_set =
+        bloom_chain_consensus::ValidatorSet::new(vec![bloom_chain_consensus::Validator {
+            address: Address([0u8; 32]),
+            pubkey: bloom_chain_types::types::PubKeyBytes(vec![]),
+            voting_power: 1,
+        }])
+        .expect("single validator set is valid");
+    judge_proposer_round(
+        0,
+        Address([0u8; 32]),
+        proposal_round,
+        pol_round,
+        &empty_validator_set,
+        false,
+    )
+    .ok()
+    .map(|judgment| judgment.header_round)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1505,7 +1494,17 @@ fn block_response_header_round(
     if let Some(pending) = engine.state.pending_proposal.as_ref()
         && pending.block_hash == block_hash
     {
-        return proposal_header_round(pending.round, pending.pol_round);
+        return judge_proposer_round(
+            engine.state.height,
+            pending.proposer,
+            pending.round,
+            pending.pol_round,
+            engine.state.validator_set(),
+            false,
+        )
+        .ok()
+        .filter(|judgment| judgment.proposer_ok)
+        .map(|judgment| judgment.header_round);
     }
     if let Some((valid_round, valid_hash)) = engine.state.valid_block
         && valid_hash == block_hash
@@ -1513,12 +1512,16 @@ fn block_response_header_round(
         return Some(valid_round);
     }
     (0..engine.state.validator_set().len() as u32).find(|&round| {
-        engine
-            .state
-            .validator_set()
-            .proposer_for(engine.state.height, round)
-            .address
-            == header_proposer
+        judge_proposer_round(
+            engine.state.height,
+            header_proposer,
+            round,
+            -1,
+            engine.state.validator_set(),
+            false,
+        )
+        .map(|judgment| judgment.proposer_ok)
+        .unwrap_or(false)
     })
 }
 
@@ -1801,7 +1804,7 @@ mod tests {
     use bloom_petal_fungible::ops::coin_payload;
     use bloom_script::{
         CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, encode_ptb, loom_coin_type_tag,
-        types::PtbTx,
+        types::{PqSignature, PtbTx},
     };
     use bloom_test_util::{make_validator_set_signed, make_validator_with_keypair};
 
@@ -1848,7 +1851,9 @@ mod tests {
             None,
         );
 
-        let err = submit_tx_for_chain(&mut engine, tx, 0, 1_000_000, "bloomchain.test")
+        let state = State::new();
+        let view = StateAdmissionView { state: &state };
+        let err = submit_tx_for_chain(&mut engine, tx, &view, "bloomchain.test")
             .expect_err("wrong-chain tx must be rejected");
         assert!(matches!(
             err,
@@ -1971,10 +1976,12 @@ mod tests {
     fn unsigned_submit_ptb_tx(sender_byte: u8, nonce: u64) -> Tx {
         let pubkey = PubKeyBytes(vec![sender_byte; 32]);
         let ptb_bytes = encode_ptb(&PtbTx {
+            signers: vec![[0xC1; 32]],
             gas_budget: 7,
             gas_price: 3,
             expiry_block: 99,
             gas_payer: ObjectId([0xC0; 32]),
+            signatures: vec![PqSignature(vec![0u8; 64])],
             ..PtbTx::default()
         })
         .expect("PTB encodes");
@@ -1992,7 +1999,15 @@ mod tests {
 
     #[test]
     fn proposal_block_builder_drops_selected_ptb_that_breaks_execution() {
-        let base_state = State::new();
+        let mut base_state = State::new();
+        base_state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
+        base_state.set_object(Object {
+            id: ObjectId([0xC0; 32]),
+            type_tag: loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
+            owner: Owner::Address([0xC1; 32]),
+            version: 1,
+            payload: coin_payload(1_000_000),
+        });
         let proposer = Address([0x44; 32]);
         let template = ProposalBlockTemplate {
             chain_id: "bloomchain.test".into(),
