@@ -628,7 +628,6 @@ mod tests {
             Address([1u8; 32]),
             Account {
                 nonce: 1,
-                loom: 1000,
                 code_hash: None,
                 storage_root: Hash32([0u8; 32]),
                 manifest_hash: None,

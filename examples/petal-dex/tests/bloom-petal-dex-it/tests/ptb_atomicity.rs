@@ -131,7 +131,6 @@ fn coin_loader_wat(coin_id: bloom_objects::ObjectId) -> String {
 //   - success == false
 //   - write_set == None
 //   - alice's coin unchanged (still 1000)
-//   - alice's account.loom unchanged
 //   - alice's ownership index unchanged
 // ---------------------------------------------------------------------------
 
@@ -143,7 +142,6 @@ fn ptb_second_command_abort_rolls_back_first() {
 
     // Record pre-tx state.
     let root_before = state.state_root();
-    let alice_loom_before = state.get_account(&alice).map(|a| a.loom).unwrap_or(0);
 
     // Insert petals.
     let loader_wasm = wat_to_wasm(&coin_loader_wat(alice_coin_id));
@@ -240,13 +238,6 @@ fn ptb_second_command_abort_rolls_back_first() {
     assert_eq!(
         alice_val, 1_000,
         "alice's coin value must be 1000 after revert"
-    );
-
-    // alice's account.loom must be unchanged.
-    let alice_loom_after = state.get_account(&alice).map(|a| a.loom).unwrap_or(0);
-    assert_eq!(
-        alice_loom_before, alice_loom_after,
-        "alice.account.loom must be unchanged after PTB revert"
     );
 
     // alice's total Coin<LOOM> sum must be unchanged.

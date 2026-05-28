@@ -50,6 +50,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error, warn};
 
 use crate::block_store::BlockStore;
+use crate::consensus_driver::{coin_loom_balance, resolve_loom_coin_type};
 use crate::mempool_persist::MempoolPersist;
 
 pub const RPC_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
@@ -332,12 +333,17 @@ impl RpcServer {
         let state = self.state.lock();
         match state.get_account(&addr) {
             None => Ok(json!(null)),
-            Some(acct) => Ok(json!({
-                "nonce": acct.nonce,
-                "loom": acct.loom.to_string(),
-                "code_hash": acct.code_hash.map(|h| hex::encode(h.0)),
-                "storage_root": hex::encode(acct.storage_root.0),
-            })),
+            Some(acct) => {
+                let loom = resolve_loom_coin_type(&state)
+                    .map(|coin_type| coin_loom_balance(&state, addr, &coin_type))
+                    .unwrap_or(0);
+                Ok(json!({
+                    "nonce": acct.nonce,
+                    "loom": loom.to_string(),
+                    "code_hash": acct.code_hash.map(|h| hex::encode(h.0)),
+                    "storage_root": hex::encode(acct.storage_root.0),
+                }))
+            }
         }
     }
 

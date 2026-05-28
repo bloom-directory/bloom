@@ -280,13 +280,14 @@ pub const CORE_FUNGIBLE_PATH: &str = "/bloom/core/fungible";
 /// [`CORE_FUNGIBLE_PATH`] in VFS.
 pub const DEFAULT_FUNGIBLE_PETAL_HASH: Hash32 = Hash32([0u8; 32]);
 
-/// Resolve the fungible petal hash from chain VFS, falling back to the
-/// genesis/default sentinel used by chains that have not pinned the core
-/// fungible petal yet.
-pub fn resolve_fungible_petal_hash(chain: &dyn ChainStateIface) -> Hash32 {
-    chain
-        .resolve_path(CORE_FUNGIBLE_PATH)
-        .unwrap_or(DEFAULT_FUNGIBLE_PETAL_HASH)
+/// Resolve the fungible petal hash from chain VFS.
+///
+/// Callers that intentionally run in a bootstrap/test state with the
+/// sentinel hash must bind [`CORE_FUNGIBLE_PATH`] to
+/// [`DEFAULT_FUNGIBLE_PETAL_HASH`] explicitly. A missing binding is
+/// therefore distinguishable from a deliberate sentinel binding.
+pub fn resolve_fungible_petal_hash(chain: &dyn ChainStateIface) -> Option<Hash32> {
+    chain.resolve_path(CORE_FUNGIBLE_PATH)
 }
 
 /// Build the canonical `Coin<LOOM>` type tag from the fungible

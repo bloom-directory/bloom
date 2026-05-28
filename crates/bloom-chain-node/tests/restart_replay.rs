@@ -16,7 +16,9 @@
 //! restarted.
 
 use bloom_chain_consensus::{ValidatorSet, validator_set::Validator};
-use bloom_chain_node::consensus_driver::{NoopExecutor, apply_block_state_transitions};
+use bloom_chain_node::consensus_driver::{
+    NoopExecutor, apply_block_state_transitions, coin_loom_balance, resolve_loom_coin_type,
+};
 use bloom_chain_node::{
     block_store::BlockStore, genesis::Genesis, node::restore_state_from_storage,
     state_blob::StateBlobStore, state_index::StateIndex,
@@ -28,6 +30,9 @@ use bloom_chain_types::{
     tx::{Tx, TxKind},
     types::{Address, Hash32, PubKeyBytes, SigBytes},
 };
+use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
+use bloom_petal_fungible::ops::coin_payload;
+use bloom_script::{CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, loom_coin_type_tag};
 use bloom_test_util::{BlockBuilder, make_addr};
 
 const BLOCK_EMISSION: u128 = 10_000_000_000_000_000_000u128;
@@ -79,6 +84,38 @@ fn make_genesis() -> Genesis {
     }
 }
 
+fn bind_bootstrap_fungible(state: &mut State) {
+    state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
+}
+
+fn coin_balance(state: &State, addr: Address) -> u128 {
+    resolve_loom_coin_type(state)
+        .map(|coin_type| coin_loom_balance(state, addr, &coin_type))
+        .unwrap_or(0)
+}
+
+fn seed_coin(state: &mut State, owner: Address, value: u128) {
+    let mut h = blake3::Hasher::new();
+    h.update(b"restart_replay.seed");
+    h.update(&owner.0);
+    h.update(&value.to_be_bytes());
+    let id = ObjectId(*h.finalize().as_bytes());
+    state.set_object(Object {
+        id,
+        type_tag: loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
+        owner: Owner::Address(owner.0),
+        version: 0,
+        payload: coin_payload(value),
+    });
+    state.set_ownership(
+        OwnershipIndexKey {
+            owner_kind: OWNER_KIND_ADDRESS,
+            owner_id: owner.0,
+        },
+        vec![id],
+    );
+}
+
 fn persist_checkpoint(
     state: &State,
     height: u64,
@@ -108,13 +145,14 @@ fn replay_reproduces_full_transfer_chain() {
 
     // --- "Live" run: build state by applying blocks once. ---
     let mut live = State::new();
+    bind_bootstrap_fungible(&mut live);
+    seed_coin(&mut live, sender, initial_balance);
     {
         use bloom_chain_state::Account;
         live.set_account(
             sender,
             Account {
                 nonce: 0,
-                loom: initial_balance,
                 code_hash: None,
                 storage_root: Hash32([0u8; 32]),
                 manifest_hash: None,
@@ -145,20 +183,21 @@ fn replay_reproduces_full_transfer_chain() {
     apply_block_state_transitions(&mut live, &executor, &block2, BLOCK_EMISSION);
 
     let live_root = live.state_root();
-    let live_sender_loom = live.get_account(&sender).map(|a| a.loom).unwrap();
+    let live_sender_loom = coin_balance(&live, sender);
     let live_sender_nonce = live.get_account(&sender).map(|a| a.nonce).unwrap();
-    let live_recipient_loom = live.get_account(&recipient).map(|a| a.loom).unwrap_or(0);
-    let live_proposer_loom = live.get_account(&proposer).map(|a| a.loom).unwrap_or(0);
+    let live_recipient_loom = coin_balance(&live, recipient);
+    let live_proposer_loom = coin_balance(&live, proposer);
 
     // --- "Restart" replay: same path, fresh state, same blocks. ---
     let mut replayed = State::new();
+    bind_bootstrap_fungible(&mut replayed);
+    seed_coin(&mut replayed, sender, initial_balance);
     {
         use bloom_chain_state::Account;
         replayed.set_account(
             sender,
             Account {
                 nonce: 0,
-                loom: initial_balance,
                 code_hash: None,
                 storage_root: Hash32([0u8; 32]),
                 manifest_hash: None,
@@ -180,20 +219,17 @@ fn replay_reproduces_full_transfer_chain() {
         "sender nonce must match after replay (master bug: nonce reset)"
     );
     assert_eq!(
-        replayed.get_account(&sender).map(|a| a.loom).unwrap(),
+        coin_balance(&replayed, sender),
         live_sender_loom,
         "sender loom must match after replay (master bug: transfers dropped)"
     );
     assert_eq!(
-        replayed
-            .get_account(&recipient)
-            .map(|a| a.loom)
-            .unwrap_or(0),
+        coin_balance(&replayed, recipient),
         live_recipient_loom,
         "recipient loom must match after replay (master bug: transfers dropped)"
     );
     assert_eq!(
-        replayed.get_account(&proposer).map(|a| a.loom).unwrap_or(0),
+        coin_balance(&replayed, proposer),
         live_proposer_loom,
         "proposer loom must match after replay (block emission + fees)"
     );
@@ -221,13 +257,14 @@ fn master_style_replay_diverges() {
     let initial_balance: u128 = 1_000_000_000_000_000_000_000u128;
 
     let mut live = State::new();
+    bind_bootstrap_fungible(&mut live);
+    seed_coin(&mut live, sender, initial_balance);
     {
         use bloom_chain_state::Account;
         live.set_account(
             sender,
             Account {
                 nonce: 0,
-                loom: initial_balance,
                 code_hash: None,
                 storage_root: Hash32([0u8; 32]),
                 manifest_hash: None,
@@ -244,32 +281,20 @@ fn master_style_replay_diverges() {
 
     // Master-style replay: skip txs entirely, only credit BLOCK_EMISSION.
     let mut master_replayed = State::new();
+    bind_bootstrap_fungible(&mut master_replayed);
+    seed_coin(&mut master_replayed, sender, initial_balance);
     {
         use bloom_chain_state::Account;
         master_replayed.set_account(
             sender,
             Account {
                 nonce: 0,
-                loom: initial_balance,
                 code_hash: None,
                 storage_root: Hash32([0u8; 32]),
                 manifest_hash: None,
             },
         );
     }
-    let mut prop_acct =
-        master_replayed
-            .get_account(&proposer)
-            .unwrap_or(bloom_chain_state::Account {
-                nonce: 0,
-                loom: 0,
-                code_hash: None,
-                storage_root: Hash32([0u8; 32]),
-                manifest_hash: None,
-            });
-    prop_acct.loom += BLOCK_EMISSION;
-    master_replayed.set_account(proposer, prop_acct);
-
     assert_ne!(
         master_replayed.state_root(),
         live.state_root(),
@@ -288,11 +313,11 @@ fn restore_uses_latest_checkpoint_and_replays_suffix_after_pruning() {
     let proposer = make_addr(0x77);
     let executor = NoopExecutor;
     let mut live = State::new();
+    bind_bootstrap_fungible(&mut live);
     live.set_account(
         make_addr(0x10),
         Account {
             nonce: 1,
-            loom: 123,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,
@@ -329,8 +354,8 @@ fn restore_uses_latest_checkpoint_and_replays_suffix_after_pruning() {
     assert_eq!(restored_height, latest_height);
     assert_eq!(restored.state_root(), live.state_root());
     assert_eq!(
-        restored.get_account(&proposer).map(|a| a.loom),
-        live.get_account(&proposer).map(|a| a.loom)
+        coin_balance(&restored, proposer),
+        coin_balance(&live, proposer)
     );
 }
 
@@ -344,6 +369,7 @@ fn restore_fails_when_required_suffix_block_is_missing() {
     let proposer = make_addr(0x77);
     let executor = NoopExecutor;
     let mut checkpoint_state = State::new();
+    bind_bootstrap_fungible(&mut checkpoint_state);
     let mut block1 = make_block(1, proposer, vec![]);
     apply_block_state_transitions(&mut checkpoint_state, &executor, &block1, BLOCK_EMISSION);
     block1.header.state_root = checkpoint_state.state_root();
@@ -379,6 +405,7 @@ fn restore_falls_back_when_latest_checkpoint_block_is_missing() {
     let proposer = make_addr(0x77);
     let executor = NoopExecutor;
     let mut live = State::new();
+    bind_bootstrap_fungible(&mut live);
 
     let mut block1 = make_block(1, proposer, vec![]);
     apply_block_state_transitions(&mut live, &executor, &block1, BLOCK_EMISSION);

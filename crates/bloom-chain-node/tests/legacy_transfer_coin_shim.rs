@@ -17,6 +17,7 @@ use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
 use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
 use bloom_petal_fungible::ops::{coin_payload, decode_coin_value, type_tag_coin_loom};
+use bloom_script::{CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH};
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -39,6 +40,10 @@ fn transfer_tx(sender: Address, to: Address, amount: u128) -> Tx {
         pubkey: PubKeyBytes(vec![0u8; 32]),
         sig: SigBytes(vec![0u8; 64]),
     }
+}
+
+fn bind_bootstrap_fungible(state: &mut State) {
+    state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
 }
 
 /// Seed `state` with a single `Coin<LOOM>` for `owner` with the given value.
@@ -89,6 +94,7 @@ fn transfer_splits_sender_coin_and_mints_receiver_coin() {
     let bob = addr(0xB2);
 
     let mut state = State::new();
+    bind_bootstrap_fungible(&mut state);
 
     // Seed Account.loom (simulating what apply_block would have done after
     // genesis — the consensus driver debits sender before calling execute_tx,
@@ -110,7 +116,6 @@ fn transfer_splits_sender_coin_and_mints_receiver_coin() {
     // directly, and the Transfer arm only credits to.
     let alice_acct = bloom_chain_state::Account {
         nonce: 0,
-        loom: 1000,
         code_hash: None,
         storage_root: Hash32([0u8; 32]),
         manifest_hash: None,
@@ -135,15 +140,6 @@ fn transfer_splits_sender_coin_and_mints_receiver_coin() {
     assert!(out.success, "Transfer must succeed");
     let ws = out.write_set.expect("Transfer must produce a write set");
     state.apply(ws).expect("apply write_set must not fail");
-
-    // ── Account.loom checks ──────────────────────────────────────────────────
-    // execute_tx credits bob; alice stays at whatever apply_block left her at
-    // (we seeded 1000, alice is untouched by the executor — her debit happens
-    // in apply_block, which we bypassed).
-    let bob_acct = state
-        .get_account(&bob)
-        .expect("bob must have an account now");
-    assert_eq!(bob_acct.loom, 300, "bob.loom should be 300 after Transfer");
 
     // ── Coin<LOOM> checks ───────────────────────────────────────────────────
     // Alice's original coin should now have value 700 (1000 - 300).
@@ -215,11 +211,11 @@ fn transfer_exact_match_deletes_sender_coin() {
     let bob = addr(0xB2);
 
     let mut state = State::new();
+    bind_bootstrap_fungible(&mut state);
     state.set_account(
         alice,
         bloom_chain_state::Account {
             nonce: 0,
-            loom: 300,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,
@@ -264,21 +260,20 @@ fn transfer_exact_match_deletes_sender_coin() {
     assert_eq!(bob_coin_val, 300);
 }
 
-/// Divergence case: if sender has no Coin<LOOM>, the Transfer still succeeds
-/// (legacy Account.loom path), but logs a warning and leaves the Coin<LOOM>
-/// world unchanged (bob gets no coin).
+/// Divergence case: if sender has no Coin<LOOM>, the Transfer fails closed
+/// before either `Account.loom` or the object world can change.
 #[test]
-fn transfer_without_coin_loom_still_succeeds() {
+fn transfer_without_coin_loom_fails_closed() {
     let alice = addr(0xA1);
     let bob = addr(0xB2);
 
     let mut state = State::new();
+    bind_bootstrap_fungible(&mut state);
     // Alice has Account.loom but NO Coin<LOOM> object (diverged state).
     state.set_account(
         alice,
         bloom_chain_state::Account {
             nonce: 0,
-            loom: 1000,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,
@@ -289,18 +284,18 @@ fn transfer_without_coin_loom_still_succeeds() {
     let exec = ChainPetalExecutor;
     let out = exec.execute_tx(&tx, &mut state, 1, 0, addr(0xFF), Hash32([0u8; 32]));
 
-    // The legacy Transfer must still succeed even though Coin<LOOM> is missing.
+    // Missing Coin<LOOM> must now fail closed so Account.loom cannot diverge
+    // from the object world.
+    assert!(!out.success, "Transfer must fail with missing Coin<LOOM>");
     assert!(
-        out.success,
-        "Transfer must succeed even with missing Coin<LOOM>"
+        out.write_set.is_none(),
+        "failed transfer must not produce writes"
     );
-    state.apply(out.write_set.unwrap()).unwrap();
 
-    // Bob gets Account.loom credit.
-    let bob_acct = state.get_account(&bob).expect("bob must have an account");
-    assert_eq!(bob_acct.loom, 300);
+    // Bob gets no Account.loom credit.
+    assert!(state.get_account(&bob).is_none());
 
-    // But bob has NO Coin<LOOM> (shim diverged, no coins to debit from alice).
+    // Bob has no Coin<LOOM> either.
     let bob_okey = OwnershipIndexKey {
         owner_kind: OWNER_KIND_ADDRESS,
         owner_id: bob.0,
@@ -310,4 +305,38 @@ fn transfer_without_coin_loom_still_succeeds() {
         bob_owned.is_empty(),
         "bob must have no Coin<LOOM> objects when shim diverged"
     );
+}
+
+#[test]
+fn transfer_without_fungible_vfs_binding_fails_closed() {
+    let alice = addr(0xA1);
+    let bob = addr(0xB2);
+
+    let mut state = State::new();
+    state.set_account(
+        alice,
+        bloom_chain_state::Account {
+            nonce: 0,
+            code_hash: None,
+            storage_root: Hash32([0u8; 32]),
+            manifest_hash: None,
+        },
+    );
+    seed_single_coin(&mut state, alice, 1000);
+
+    let tx = transfer_tx(alice, bob, 300);
+    let exec = ChainPetalExecutor;
+    let out = exec.execute_tx(&tx, &mut state, 1, 0, addr(0xFF), Hash32([0u8; 32]));
+
+    assert!(
+        !out.success,
+        "Transfer must fail when /bloom/core/fungible is unbound"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.return_data).contains("missing required VFS binding"),
+        "unexpected return_data: {}",
+        String::from_utf8_lossy(&out.return_data)
+    );
+    assert!(out.write_set.is_none());
+    assert!(state.get_account(&bob).is_none());
 }

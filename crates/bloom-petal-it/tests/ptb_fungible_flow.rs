@@ -327,7 +327,6 @@ fn fungible_value_call_typechecks_against_real_manifest() {
 "#;
     let wasm = wrap_with_real_manifest(wat, real_fungible_manifest_bytes());
     let petal_hash = state.insert_code(&wasm);
-    state.set_vfs_binding("/bloom/core/fungible".to_string(), petal_hash);
 
     // `value<T>(coin: &Coin<T>)` → manifest declares one Object arg with
     // type `Coin<Generic{0}>`, mode ReadOnly. We call with type_args=[LOOM]

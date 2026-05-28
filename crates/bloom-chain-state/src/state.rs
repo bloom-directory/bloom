@@ -111,9 +111,6 @@ pub enum OwnershipDelta {
 /// PTB-specific fields (spec §16.3):
 /// - `object_writes` / `object_deletes` — `Object` trie diffs.
 /// - `ownership_changes` — `OwnershipIndex` trie diffs.
-/// - `loom_deltas` — signed `loom` adjustments folded into the
-///   accounts trie at apply time.
-///
 /// The Object and OwnershipIndex roots are computed on demand from
 /// the underlying `State` maps by [`State::object_root`] /
 /// [`State::ownership_index_root`]; this struct just carries the diffs.
@@ -139,9 +136,6 @@ pub struct WriteSet {
     pub(crate) objects: BTreeMap<ObjectId, ObjectDelta>,
     /// OwnershipIndex trie diffs keyed by `OwnershipIndexKey`.
     pub(crate) ownership: BTreeMap<OwnershipIndexKey, OwnershipDelta>,
-    /// Per-account signed `loom` deltas (spec §9.2). Multiple deltas
-    /// for the same address inside one snapshot are accumulated.
-    pub(crate) loom_deltas: BTreeMap<Address, i128>,
 }
 
 impl WriteSet {
@@ -181,11 +175,6 @@ impl WriteSet {
                 OwnershipDelta::Remove => (*k, Vec::new()),
             })
             .collect()
-    }
-
-    /// Snapshot of accumulated signed Loom deltas.
-    pub fn loom_deltas(&self) -> &BTreeMap<Address, i128> {
-        &self.loom_deltas
     }
 }
 
@@ -658,22 +647,6 @@ impl State {
                 }
             }
         }
-        // Apply signed Loom deltas after account-level Set/Remove ops,
-        // so a snapshot that did `set_account(...)` followed by
-        // `apply_loom_delta(...)` reflects the delta on top of the new
-        // balance (which is the order `StateSnapshot::apply_loom_delta`
-        // already enforces via its in-snapshot read-modify-write).
-        for (addr, delta) in ws.loom_deltas {
-            let mut acct = self.accounts.get(&addr).unwrap_or_else(Account::empty);
-            if delta >= 0 {
-                acct.loom = acct.loom.saturating_add(delta as u128);
-            } else {
-                let mag = (-delta) as u128;
-                acct.loom = acct.loom.saturating_sub(mag);
-            }
-            self.accounts.set(addr, acct);
-        }
-
         self.generation += 1;
         Ok(())
     }
@@ -714,27 +687,13 @@ pub struct StateSnapshot {
 impl StateSnapshot {
     /// Read an account, respecting any pending writes in this snapshot.
     ///
-    /// The order is: account Set/Remove delta wins (if present), else
-    /// base; *then* any pending `loom_deltas` adjustment is folded on
-    /// top so callers in the same snapshot see the up-to-date balance.
+    /// The order is: account Set/Remove delta wins (if present), else base.
     pub fn get_account(&self, addr: &Address) -> Option<Account> {
-        let base_acct = match self.write_set.accounts.get(addr) {
+        match self.write_set.accounts.get(addr) {
             Some(AccountDelta::Set(a)) => Some(a.clone()),
             Some(AccountDelta::Remove) => None,
             None => self.base.accounts.get(addr),
-        };
-        let loom_delta = self.write_set.loom_deltas.get(addr).copied().unwrap_or(0);
-        if loom_delta == 0 {
-            return base_acct;
         }
-        let mut acct = base_acct.unwrap_or_else(Account::empty);
-        if loom_delta >= 0 {
-            acct.loom = acct.loom.saturating_add(loom_delta as u128);
-        } else {
-            let mag = (-loom_delta) as u128;
-            acct.loom = acct.loom.saturating_sub(mag);
-        }
-        if acct.is_empty() { None } else { Some(acct) }
     }
 
     /// Stage an account write.
@@ -870,26 +829,6 @@ impl StateSnapshot {
         }
     }
 
-    // ----------------------------------------------------------------
-    // Loom deltas (spec §9.2 — signed adjustments)
-    // ----------------------------------------------------------------
-
-    /// Stage a signed Loom adjustment for `addr`.
-    ///
-    /// Snapshot reads via `get_account` reflect the cumulative delta
-    /// (overlaid on the base balance via [`get_account`]). `State::apply`
-    /// folds the total into the live account in a single pass after the
-    /// account-level Set/Remove deltas, so a snapshot that does
-    /// `set_account(...)` followed by `apply_loom_delta(...)` ends up
-    /// with the delta applied on top of the explicit set value.
-    /// Multiple deltas accumulate additively.
-    ///
-    /// [`get_account`]: Self::get_account
-    pub fn apply_loom_delta(&mut self, addr: Address, delta: i128) {
-        let entry = self.write_set.loom_deltas.entry(addr).or_insert(0);
-        *entry = entry.saturating_add(delta);
-    }
-
     /// Extract the accumulated write set for application to the parent state.
     ///
     /// Consumes the snapshot.
@@ -920,10 +859,9 @@ mod tests {
         Address([b; 32])
     }
 
-    fn acct(loom: u128) -> Account {
+    fn acct(nonce: u64) -> Account {
         Account {
-            nonce: 1,
-            loom,
+            nonce,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,
@@ -1057,15 +995,15 @@ mod tests {
 
         let mut snap = state.snapshot();
         // Should read base account
-        assert_eq!(snap.get_account(&addr(1)).unwrap().loom, 100);
+        assert_eq!(snap.get_account(&addr(1)).unwrap().nonce, 100);
 
         snap.set_account(addr(1), acct(200));
         // Should see staged value
-        assert_eq!(snap.get_account(&addr(1)).unwrap().loom, 200);
+        assert_eq!(snap.get_account(&addr(1)).unwrap().nonce, 200);
 
         state.apply(snap.commit()).unwrap();
         // Live state should reflect the committed write
-        assert_eq!(state.get_account(&addr(1)).unwrap().loom, 200);
+        assert_eq!(state.get_account(&addr(1)).unwrap().nonce, 200);
     }
 
     // ------------------------------------------------------------------
@@ -1130,33 +1068,6 @@ mod tests {
         snap2.set_ownership(key, vec![]);
         state.apply(snap2.commit()).unwrap();
         assert!(state.get_ownership(&key).is_none());
-    }
-
-    #[test]
-    fn snapshot_apply_loom_delta_modifies_balance() {
-        let mut state = State::new();
-        state.set_account(addr(1), acct(100));
-        let mut snap = state.snapshot();
-        snap.apply_loom_delta(addr(1), 50);
-        // Snapshot read reflects the credit.
-        assert_eq!(snap.get_account(&addr(1)).unwrap().loom, 150);
-        state.apply(snap.commit()).unwrap();
-        assert_eq!(state.get_account(&addr(1)).unwrap().loom, 150);
-
-        // Debit.
-        let mut snap2 = state.snapshot();
-        snap2.apply_loom_delta(addr(1), -30);
-        state.apply(snap2.commit()).unwrap();
-        assert_eq!(state.get_account(&addr(1)).unwrap().loom, 120);
-    }
-
-    #[test]
-    fn snapshot_apply_loom_delta_creates_account_when_absent() {
-        let mut state = State::new();
-        let mut snap = state.snapshot();
-        snap.apply_loom_delta(addr(7), 42);
-        state.apply(snap.commit()).unwrap();
-        assert_eq!(state.get_account(&addr(7)).unwrap().loom, 42);
     }
 
     #[test]

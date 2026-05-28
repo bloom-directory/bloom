@@ -538,7 +538,8 @@ impl<'a> PtbSession<'a> {
         let verifier = AlwaysOkVerifier;
         let fungible_petal_hash = self
             .fungible_petal_hash
-            .unwrap_or_else(|| bloom_script::resolve_fungible_petal_hash(self.chain));
+            .or_else(|| bloom_script::resolve_fungible_petal_hash(self.chain))
+            .unwrap_or(bloom_script::DEFAULT_FUNGIBLE_PETAL_HASH);
 
         validate_ptb(
             &for_validation,

@@ -20,7 +20,7 @@ use bloom_chain_node::{
     consensus_driver::{ExecOutput, PetalExecutor},
     petal_executor::ChainPetalExecutorWithManifests,
 };
-use bloom_chain_state::{Account, State};
+use bloom_chain_state::State;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
 use bloom_objects::{
@@ -30,8 +30,9 @@ use bloom_petal_fungible::ops::{
     coin_payload, decode_coin_value as fungible_decode_coin_value, type_tag_coin_loom,
 };
 use bloom_script::{
-    Arg, Command, ExpectedVersion, FunctionDeclStub, MoveCmd, PetalManifestStub, PetalRef,
-    PqSignature, UseRef, encode_ptb, types::PtbTx,
+    Arg, CORE_FUNGIBLE_PATH, Command, DEFAULT_FUNGIBLE_PETAL_HASH, ExpectedVersion,
+    FunctionDeclStub, MoveCmd, PetalManifestStub, PetalRef, PqSignature, UseRef, encode_ptb,
+    types::PtbTx,
 };
 
 // ---------------------------------------------------------------------------
@@ -55,25 +56,14 @@ pub fn ptb_decode_coin_value(payload: &[u8]) -> u128 {
 // ---------------------------------------------------------------------------
 
 /// Build a fresh `State` with each `(address, balance)` allocation:
-/// 1. `Account.loom = balance` (derived cache, spec §9.2).
-/// 2. A `Coin<LOOM>` object with a deterministic id owned by the address.
-/// 3. The `OwnershipIndex` updated to list the coin.
+/// 1. A `Coin<LOOM>` object with a deterministic id owned by the address.
+/// 2. The `OwnershipIndex` updated to list the coin.
 pub fn build_state(allocations: &[(Address, u128)]) -> State {
     let mut state = State::new();
+    state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
     let coin_type = type_tag_coin_loom();
 
     for (idx, (addr, balance)) in allocations.iter().enumerate() {
-        state.set_account(
-            *addr,
-            Account {
-                nonce: 0,
-                loom: *balance,
-                code_hash: None,
-                storage_root: Hash32([0u8; 32]),
-                manifest_hash: None,
-            },
-        );
-
         let coin_id = genesis_coin_id(*addr, idx);
 
         let obj = Object {

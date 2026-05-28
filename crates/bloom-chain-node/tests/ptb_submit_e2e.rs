@@ -32,6 +32,7 @@ use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
 use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey, TypeTag};
 use bloom_script::{
+    CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH,
     chain_iface::{ArgDeclStub, FunctionDeclStub, PetalManifestStub},
     encode_ptb, loom_coin_type_tag,
     types::{Arg, Command, MoveCmd, PetalRef, PqSignature, PtbTx},
@@ -66,6 +67,7 @@ fn test_sender() -> Address {
 #[test]
 fn undecodable_ptb_bytes_revert_atomically() {
     let mut state = State::new();
+    bind_bootstrap_fungible(&mut state);
     let sender = test_sender();
 
     // Empty bytes are not a valid canonical PTB encoding.
@@ -102,6 +104,7 @@ fn undecodable_ptb_bytes_revert_atomically() {
 #[test]
 fn validator_rejected_ptb_reverts_atomically() {
     let mut state = State::new();
+    bind_bootstrap_fungible(&mut state);
     let sender = test_sender();
 
     // Empty PtbTx decodes fine but fails validation immediately at the
@@ -185,17 +188,20 @@ fn coin_payload(value: u128) -> Vec<u8> {
 }
 
 /// Mint a `Coin<LOOM>` object at `id` owned by `owner`, holding
-/// `value` bloomwei. Uses the zero-petal-hash convention for the LOOM
-/// type tag — matches the executor's `loom_coin_type_tag(Hash32([0;32]))`
-/// fallback while the fungible petal isn't pinned at genesis yet.
+/// `value` bloomwei. Tests bind the bootstrap fungible VFS path to the
+/// sentinel hash explicitly, matching pre-pin genesis behavior.
 fn make_loom_coin(id: ObjectId, owner: [u8; 32], value: u128) -> Object {
     Object {
         id,
-        type_tag: loom_coin_type_tag(Hash32([0u8; 32])),
+        type_tag: loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
         owner: Owner::Address(owner),
         version: 1,
         payload: coin_payload(value),
     }
+}
+
+fn bind_bootstrap_fungible(state: &mut State) {
+    state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
 }
 
 /// Build a manifest stub declaring a single zero-arg, zero-return
@@ -297,6 +303,7 @@ fn signer_address_zero_resolves_to_first_signer() {
     let gas_payer_id = ObjectId([0xCC; 32]);
 
     let mut state = State::new();
+    bind_bootstrap_fungible(&mut state);
     let wasm = wat(SIGNER_FETCH_PETAL);
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, 1_000_000_000));
@@ -375,6 +382,7 @@ fn log_emit_round_trips_topics_and_data() {
     let gas_payer_id = ObjectId([0xDD; 32]);
 
     let mut state = State::new();
+    bind_bootstrap_fungible(&mut state);
     let wasm = wat(LOG_EMIT_PETAL);
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, 1_000_000_000));
@@ -470,6 +478,7 @@ fn out_of_fuel_reverts_atomically() {
     let gas_payer_id = ObjectId([0xEE; 32]);
 
     let mut state = State::new();
+    bind_bootstrap_fungible(&mut state);
     let wasm = wat(FUEL_BURNER_PETAL);
     let petal_hash = state.insert_code(&wasm);
     // Generous coin so the validator's gas-reservation check succeeds
@@ -614,6 +623,7 @@ fn object_create_then_transfer_round_trips_through_unified_ctx() {
 
     // Build state + register the petal --------------------------------
     let mut state = State::new();
+    bind_bootstrap_fungible(&mut state);
     let wasm = wat(CREATE_AND_TRANSFER_PETAL);
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, 1_000_000_000));

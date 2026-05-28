@@ -39,7 +39,8 @@ use crate::{
     block_store::BlockStore,
     consensus_driver::{
         BLOCK_EMISSION, ConsensusDriver, PetalExecutor, XdsaVerifier,
-        apply_block_state_transitions, compute_txs_root, validate_block_for_apply,
+        apply_block_state_transitions, coin_loom_balance, compute_txs_root, resolve_loom_coin_type,
+        validate_block_for_apply,
     },
     genesis::Genesis,
     mempool_persist::MempoolPersist,
@@ -481,7 +482,9 @@ impl Node {
                     let mut eng = driver_tx.engine.lock();
                     let state = driver_tx.state.lock();
                     let nonce = state.get_account(&tx.sender).map(|a| a.nonce).unwrap_or(0);
-                    let balance = state.get_account(&tx.sender).map(|a| a.loom).unwrap_or(0);
+                    let balance = resolve_loom_coin_type(&state)
+                        .map(|coin_type| coin_loom_balance(&state, tx.sender, &coin_type))
+                        .unwrap_or(0);
                     drop(state);
                     let result = eng.submit_tx(tx.clone(), nonce, balance);
                     drop(eng);
@@ -641,7 +644,11 @@ impl Node {
                             };
                             let balance = {
                                 let state = driver_ev.state.lock();
-                                state.get_account(&tx.sender).map(|a| a.loom).unwrap_or(0)
+                                resolve_loom_coin_type(&state)
+                                    .map(|coin_type| {
+                                        coin_loom_balance(&state, tx.sender, &coin_type)
+                                    })
+                                    .unwrap_or(0)
                             };
                             eng.submit_tx(tx.clone(), nonce, balance)
                         };
@@ -1207,11 +1214,11 @@ fn reload_persisted_mempool(
     for tx in txs {
         let (nonce, balance) = {
             let st = state.lock();
-            let acct = st.get_account(&tx.sender);
-            (
-                acct.as_ref().map(|a| a.nonce).unwrap_or(0),
-                acct.as_ref().map(|a| a.loom).unwrap_or(0),
-            )
+            let nonce = st.get_account(&tx.sender).map(|a| a.nonce).unwrap_or(0);
+            let balance = resolve_loom_coin_type(&st)
+                .map(|coin_type| coin_loom_balance(&st, tx.sender, &coin_type))
+                .unwrap_or(0);
+            (nonce, balance)
         };
         match engine.submit_tx(tx.clone(), nonce, balance) {
             Ok(()) => admitted += 1,
@@ -1520,6 +1527,9 @@ mod tests {
         tx::{Tx, TxKind},
         types::{PubKeyBytes, SigBytes},
     };
+    use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
+    use bloom_petal_fungible::ops::coin_payload;
+    use bloom_script::{CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, loom_coin_type_tag};
     use bloom_test_util::{make_validator_set_signed, make_validator_with_keypair};
 
     fn signed_transfer_tx(
@@ -1554,15 +1564,30 @@ mod tests {
         mempool_persist.put(&tx).unwrap();
 
         let mut state = State::new();
+        state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
         state.set_account(
             tx.sender,
             Account {
                 nonce: 0,
-                loom: 1_000_000,
                 code_hash: None,
                 storage_root: Hash32([0; 32]),
                 manifest_hash: None,
             },
+        );
+        let coin_id = ObjectId([0xAC; 32]);
+        state.set_object(Object {
+            id: coin_id,
+            type_tag: loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
+            owner: Owner::Address(tx.sender.0),
+            version: 0,
+            payload: coin_payload(1_000_000),
+        });
+        state.set_ownership(
+            OwnershipIndexKey {
+                owner_kind: OWNER_KIND_ADDRESS,
+                owner_id: tx.sender.0,
+            },
+            vec![coin_id],
         );
         let shared_state = Arc::new(Mutex::new(state));
 

@@ -9,10 +9,9 @@ fn addr(b: u8) -> Address {
     Address([b; 32])
 }
 
-fn acct(loom: u128) -> Account {
+fn acct(nonce: u64) -> Account {
     Account {
-        nonce: 1,
-        loom,
+        nonce,
         code_hash: None,
         storage_root: Hash32([0u8; 32]),
         manifest_hash: None,
@@ -33,7 +32,7 @@ fn commit_applies_writes() {
 
     state.apply(snap.commit()).expect("apply should succeed");
 
-    assert_eq!(state.get_account(&addr(1)).unwrap().loom, 100);
+    assert_eq!(state.get_account(&addr(1)).unwrap().nonce, 100);
     assert_eq!(state.storage_read(&addr(2), &[5u8; 32]), [7u8; 32]);
     assert_eq!(state.generation(), 1);
 }
@@ -52,7 +51,7 @@ fn revert_discards_writes() {
     snap.revert();
 
     // Live state is unchanged
-    assert_eq!(state.get_account(&addr(1)).unwrap().loom, 50);
+    assert_eq!(state.get_account(&addr(1)).unwrap().nonce, 50);
     assert_eq!(state.generation(), 0);
 }
 
@@ -73,7 +72,7 @@ fn parallel_snapshots_do_not_interfere() {
 
     // Apply snap_a first — generation 0 → 1
     state.apply(snap_a.commit()).expect("snap_a should apply");
-    assert_eq!(state.get_account(&addr(1)).unwrap().loom, 100);
+    assert_eq!(state.get_account(&addr(1)).unwrap().nonce, 100);
 
     // snap_b was taken at generation 0; now state is at 1 — should fail
     let result = state.apply(snap_b.commit());
@@ -83,7 +82,7 @@ fn parallel_snapshots_do_not_interfere() {
     );
 
     // State is unchanged after rejection
-    assert_eq!(state.get_account(&addr(1)).unwrap().loom, 100);
+    assert_eq!(state.get_account(&addr(1)).unwrap().nonce, 100);
     assert_eq!(state.generation(), 1);
 }
 
@@ -97,7 +96,7 @@ fn snapshot_reads_through_base() {
     state.set_account(addr(1), acct(77));
 
     let snap = state.snapshot();
-    assert_eq!(snap.get_account(&addr(1)).unwrap().loom, 77);
+    assert_eq!(snap.get_account(&addr(1)).unwrap().nonce, 77);
 }
 
 // ---------------------------------------------------------------------------
@@ -113,9 +112,9 @@ fn snapshot_staged_read_shadows_base() {
     snap.set_account(addr(1), acct(99));
 
     // Snap should return staged value, not base
-    assert_eq!(snap.get_account(&addr(1)).unwrap().loom, 99);
+    assert_eq!(snap.get_account(&addr(1)).unwrap().nonce, 99);
     // Base state is unchanged
-    assert_eq!(state.get_account(&addr(1)).unwrap().loom, 10);
+    assert_eq!(state.get_account(&addr(1)).unwrap().nonce, 10);
 }
 
 // ---------------------------------------------------------------------------

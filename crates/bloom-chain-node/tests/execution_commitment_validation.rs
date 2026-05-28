@@ -9,18 +9,40 @@ use bloom_chain_node::consensus_driver::{
 };
 use bloom_chain_state::{Account, State};
 use bloom_chain_types::{receipt::receipts_root, types::Hash32};
+use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
+use bloom_petal_fungible::ops::coin_payload;
+use bloom_script::{CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, loom_coin_type_tag};
 use bloom_test_util::{BlockBuilder, make_addr, make_signed_transfer_tx};
 
 fn fund(state: &mut State, addr: bloom_chain_types::Address, loom: u128) {
+    state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
     state.set_account(
         addr,
         Account {
             nonce: 0,
-            loom,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,
         },
+    );
+    let mut h = blake3::Hasher::new();
+    h.update(b"execution_commitment_validation.fund");
+    h.update(&addr.0);
+    h.update(&loom.to_be_bytes());
+    let coin_id = ObjectId(*h.finalize().as_bytes());
+    state.set_object(Object {
+        id: coin_id,
+        type_tag: loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
+        owner: Owner::Address(addr.0),
+        version: 0,
+        payload: coin_payload(loom),
+    });
+    state.set_ownership(
+        OwnershipIndexKey {
+            owner_kind: OWNER_KIND_ADDRESS,
+            owner_id: addr.0,
+        },
+        vec![coin_id],
     );
 }
 

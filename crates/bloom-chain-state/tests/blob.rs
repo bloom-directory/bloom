@@ -19,7 +19,6 @@ fn build_nontrivial_state() -> State {
         addr(1),
         Account {
             nonce: 5,
-            loom: 1_000_000,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,
@@ -29,7 +28,6 @@ fn build_nontrivial_state() -> State {
         addr(2),
         Account {
             nonce: 1,
-            loom: 500,
             code_hash: Some(Hash32([0xDE; 32])),
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,
@@ -176,7 +174,7 @@ fn blob_accounts_preserved() {
     let (blob_bytes, _) = state.to_blob(1, Hash32([0u8; 32]));
     let recovered = State::from_blob(&blob_bytes, expected_root).unwrap();
 
-    assert_eq!(recovered.get_account(&addr(1)).unwrap().loom, 1_000_000);
+    assert_eq!(recovered.get_account(&addr(1)).unwrap().nonce, 5);
     assert_eq!(recovered.get_account(&addr(2)).unwrap().nonce, 1);
     assert_eq!(recovered.get_account(&addr(3)), None);
 }

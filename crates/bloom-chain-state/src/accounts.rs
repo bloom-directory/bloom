@@ -92,7 +92,6 @@ mod tests {
         let mut trie = AccountsTrie::new();
         let account = Account {
             nonce: 1,
-            loom: 500,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,
@@ -115,7 +114,6 @@ mod tests {
         let mut trie = AccountsTrie::new();
         let account = Account {
             nonce: 5,
-            loom: 100,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,
@@ -134,7 +132,6 @@ mod tests {
             addr(1),
             Account {
                 nonce: 1,
-                loom: 100,
                 code_hash: None,
                 storage_root: Hash32([0u8; 32]),
                 manifest_hash: None,
@@ -146,8 +143,7 @@ mod tests {
         trie.set(
             addr(2),
             Account {
-                nonce: 1,
-                loom: 200,
+                nonce: 2,
                 code_hash: None,
                 storage_root: Hash32([0u8; 32]),
                 manifest_hash: None,

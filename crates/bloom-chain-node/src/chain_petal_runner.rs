@@ -360,7 +360,6 @@ mod tests {
         let mut state = State::new();
         let mut acct = bloom_chain_state::Account::empty();
         acct.nonce = 7;
-        acct.loom = 999;
         state.set_account(Address([0x42; 32]), acct);
         let snap = state.snapshot();
         let ctx = Arc::new(Mutex::new(PtbHostCtx::new()));
@@ -370,7 +369,6 @@ mod tests {
         // The snapshot must round-trip the account state we loaded.
         let acct = final_snap.get_account(&Address([0x42; 32])).unwrap();
         assert_eq!(acct.nonce, 7);
-        assert_eq!(acct.loom, 999);
     }
 
     #[test]

@@ -38,6 +38,7 @@ use bloom_objects::{
     AccessMode, OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey, TypeTag,
 };
 use bloom_script::{
+    CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH,
     chain_iface::{ArgDeclStub, FunctionDeclStub, PetalManifestStub},
     encode_ptb, loom_coin_type_tag,
     types::{Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PqSignature, PtbTx},
@@ -225,6 +226,7 @@ fn single_move_with_object(
 fn ownership_index_rebuilds_for_old_and_new_owners_on_transfer_then_delete() {
     // ---- Seed ----------------------------------------------------------
     let mut state = State::new();
+    state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
     let wasm = wat(TRANSFER_AND_DELETE_PETAL);
     let petal_hash = state.insert_code(&wasm);
 

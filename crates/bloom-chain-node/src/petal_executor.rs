@@ -4,16 +4,15 @@
 //! execution through the deterministic chain VM.
 //!
 //! Snapshot semantics:
-//! - `consensus_driver::apply_block` debits `max_fuel * fee_per_unit + value`
-//!   from the sender at the `State` level *before* calling `execute_tx`. The
-//!   snapshot we take here therefore already reflects that debit.
+//! - LOOM value lives in `Coin<LOOM>` objects. The executor mutates those
+//!   objects directly and never mirrors value into `Account`.
 //! - The VM returns the (mutated) snapshot; we `.commit()` it into a `WriteSet`
 //!   on success, or drop it on revert.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use bloom_chain_state::{Account, State};
+use bloom_chain_state::State;
 use bloom_chain_types::{
     receipt::Log,
     tx::{Tx, TxKind},
@@ -27,8 +26,7 @@ use bloom_petal_fungible::ops::{coin_payload, decode_coin_value, rewrite_value};
 use bloom_petal_manifest::extract_petal_manifest_v0;
 use bloom_petals::{BlockCtx as PetalBlockCtx, PetalVm};
 use bloom_script::{
-    AlwaysOkVerifier, CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, PetalManifestStub,
-    SignatureVerifier, ValidationContext,
+    AlwaysOkVerifier, CORE_FUNGIBLE_PATH, PetalManifestStub, SignatureVerifier, ValidationContext,
     executor::{LogEntry as PtbLogEntry, PtbExecutor},
     host_ctx::PtbHostCtx,
     loom_coin_type_tag, validate_ptb,
@@ -37,7 +35,7 @@ use tracing::warn;
 
 use crate::chain_petal_runner::ChainPetalRunner;
 use crate::coin_select::select_coin_loom;
-use crate::consensus_driver::{ExecOutput, PetalExecutor, empty_account};
+use crate::consensus_driver::{ExecOutput, PetalExecutor};
 use crate::ptb_chain_iface::PtbChainAdapter;
 use crate::sig_verifier::XdsaPtbVerifier;
 
@@ -487,10 +485,15 @@ enum PtbSignaturePolicy {
     AlwaysOk,
 }
 
-fn resolve_fungible_petal_hash_from_state(state: &State) -> Hash32 {
-    state
-        .vfs_lookup(CORE_FUNGIBLE_PATH)
-        .unwrap_or(DEFAULT_FUNGIBLE_PETAL_HASH)
+const TRANSFER_INTRINSIC_FUEL: u64 = 100;
+
+fn resolve_fungible_petal_hash_from_state(state: &State) -> Result<Hash32, String> {
+    state.vfs_lookup(CORE_FUNGIBLE_PATH).ok_or_else(|| {
+        format!(
+            "missing required VFS binding for {CORE_FUNGIBLE_PATH}; \
+             bootstrap states must bind the sentinel explicitly"
+        )
+    })
 }
 
 /// Shared `PetalExecutor::execute_tx` body. The trailing `manifests`
@@ -524,35 +527,68 @@ fn execute_tx_impl(
     match &tx.kind {
         TxKind::Transfer { to, amount_loom } => {
             // Pure LOOM move — no VM invocation required.
-            let coin_type = loom_coin_type_tag(resolve_fungible_petal_hash_from_state(state));
+            if tx.max_fuel < TRANSFER_INTRINSIC_FUEL {
+                return ExecOutput {
+                    success: false,
+                    fuel_used: 0,
+                    return_data: format!(
+                        "legacy Transfer failed: max_fuel {} below intrinsic fuel {}",
+                        tx.max_fuel, TRANSFER_INTRINSIC_FUEL
+                    )
+                    .into_bytes(),
+                    logs: vec![],
+                    write_set: None,
+                };
+            }
+            let coin_type = match resolve_fungible_petal_hash_from_state(state) {
+                Ok(hash) => loom_coin_type_tag(hash),
+                Err(e) => {
+                    warn!(
+                        sender = %hex::encode(tx.sender.0),
+                        to = %hex::encode(to.0),
+                        amount = amount_loom,
+                        err = %e,
+                        "legacy Transfer rejected"
+                    );
+                    return ExecOutput {
+                        success: false,
+                        fuel_used: 0,
+                        return_data: format!("legacy Transfer failed: {e}").into_bytes(),
+                        logs: vec![],
+                        write_set: None,
+                    };
+                }
+            };
             let mut snap = state.snapshot();
-            let mut to_acct = snap.get_account(to).unwrap_or_else(empty_account);
-            to_acct.loom += amount_loom;
-            snap.set_account(*to, to_acct);
-
-            // ── PTB compat shim ─────────────────────────────────────────
-            // Keep Coin<LOOM> objects in sync with the Account.loom update.
-            // If select_coin_loom returns Insufficient we warn and continue
-            // (legacy Account.loom is the authoritative source of truth in
-            // Phase 2/3; Phase 4 removal will tighten this).
-            //
-            // TODO(phase4): make Coin<LOOM> insufficient a hard revert once
-            // the legacy Account.loom path is removed.
-            if *amount_loom > 0 {
-                apply_coin_loom_transfer(
+            if *amount_loom > 0
+                && let Err(e) = apply_coin_loom_transfer(
                     &mut snap,
                     tx.sender,
                     *to,
                     *amount_loom,
                     &tx.tx_hash(),
                     coin_type,
+                )
+            {
+                warn!(
+                    sender = %hex::encode(tx.sender.0),
+                    to = %hex::encode(to.0),
+                    amount = amount_loom,
+                    err = %e,
+                    "legacy Transfer rejected"
                 );
+                return ExecOutput {
+                    success: false,
+                    fuel_used: 0,
+                    return_data: format!("legacy Transfer failed: {e}").into_bytes(),
+                    logs: vec![],
+                    write_set: None,
+                };
             }
-
             let ws = snap.commit();
             ExecOutput {
                 success: true,
-                fuel_used: 100,
+                fuel_used: TRANSFER_INTRINSIC_FUEL,
                 return_data: vec![],
                 logs: vec![],
                 write_set: Some(ws),
@@ -647,7 +683,23 @@ fn execute_tx_impl(
                     // manifest-override harness intentionally keeps the
                     // always-ok verifier for legacy in-process fixtures.
                     //
-                    let fungible_petal_hash = resolve_fungible_petal_hash_from_state(state);
+                    let fungible_petal_hash = match resolve_fungible_petal_hash_from_state(state) {
+                        Ok(hash) => hash,
+                        Err(e) => {
+                            warn!(
+                                sender = %hex::encode(tx.sender.0),
+                                err = %e,
+                                "SubmitPtb validation failed"
+                            );
+                            return ExecOutput {
+                                success: false,
+                                fuel_used: 0,
+                                return_data: format!("ptb validation error: {e}").into_bytes(),
+                                logs: vec![],
+                                write_set: None,
+                            };
+                        }
+                    };
                     let loom_coin_type = loom_coin_type_tag(fungible_petal_hash);
 
                     // Capture per-PTB scratch we need across the
@@ -781,7 +833,7 @@ fn execute_tx_impl(
                         let mut exec = PtbExecutor::with_ctx_arc(
                             &adapter,
                             &runner,
-                            loom_coin_type,
+                            loom_coin_type.clone(),
                             fungible_petal_hash,
                             Arc::clone(&host_ctx),
                         );
@@ -848,14 +900,16 @@ fn execute_tx_impl(
                                 .expect("rewrite coin payload");
                             debited.version = debited.version.saturating_add(1);
                             gas_snap.insert_object(debited);
-                            // Credit proposer the full burn.
-                            // Saturating-cast to i128 for safety
-                            // (reservation is bounded by the
-                            // validator's coin-value check).
-                            gas_snap.apply_loom_delta(
+                            if let Err(e) = mint_coin_loom_to(
+                                &mut gas_snap,
                                 proposer,
-                                reservation.min(i128::MAX as u128) as i128,
-                            );
+                                reservation,
+                                b"bloom.ptb.gas.revert",
+                                &tx.tx_hash(),
+                                loom_coin_type.clone(),
+                            ) {
+                                warn!(err = %e, "PTB gas proposer credit failed");
+                            }
                             Some(gas_snap.commit())
                         } else {
                             None
@@ -893,12 +947,6 @@ fn execute_tx_impl(
                         &report.object_deletes,
                     );
 
-                    // Loom deltas: executor- and host-import-
-                    // attributed (both flow through report).
-                    for d in &report.loom_deltas {
-                        snapshot.apply_loom_delta(Address(d.address), d.delta);
-                    }
-
                     for event in &report.publish_events {
                         let existing_binding = state.vfs_lookup(&event.module_path);
                         if event.minted_owner_cap && existing_binding.is_some() {
@@ -913,10 +961,16 @@ fn execute_tx_impl(
                                     .expect("rewrite coin payload");
                                 debited.version = debited.version.saturating_add(1);
                                 gas_snap.insert_object(debited);
-                                gas_snap.apply_loom_delta(
+                                if let Err(e) = mint_coin_loom_to(
+                                    &mut gas_snap,
                                     proposer,
-                                    reservation.min(i128::MAX as u128) as i128,
-                                );
+                                    reservation,
+                                    b"bloom.ptb.gas.publish.path",
+                                    &tx.tx_hash(),
+                                    loom_coin_type.clone(),
+                                ) {
+                                    warn!(err = %e, "PTB gas proposer credit failed");
+                                }
                                 Some(gas_snap.commit())
                             } else {
                                 None
@@ -945,10 +999,16 @@ fn execute_tx_impl(
                                     .expect("rewrite coin payload");
                                 debited.version = debited.version.saturating_add(1);
                                 gas_snap.insert_object(debited);
-                                gas_snap.apply_loom_delta(
+                                if let Err(e) = mint_coin_loom_to(
+                                    &mut gas_snap,
                                     proposer,
-                                    reservation.min(i128::MAX as u128) as i128,
-                                );
+                                    reservation,
+                                    b"bloom.ptb.gas.upgrade.path",
+                                    &tx.tx_hash(),
+                                    loom_coin_type.clone(),
+                                ) {
+                                    warn!(err = %e, "PTB gas proposer credit failed");
+                                }
                                 Some(gas_snap.commit())
                             } else {
                                 None
@@ -979,10 +1039,16 @@ fn execute_tx_impl(
                                     .expect("rewrite coin payload");
                                 debited.version = debited.version.saturating_add(1);
                                 gas_snap.insert_object(debited);
-                                gas_snap.apply_loom_delta(
+                                if let Err(e) = mint_coin_loom_to(
+                                    &mut gas_snap,
                                     proposer,
-                                    reservation.min(i128::MAX as u128) as i128,
-                                );
+                                    reservation,
+                                    b"bloom.ptb.gas.admission",
+                                    &tx.tx_hash(),
+                                    loom_coin_type.clone(),
+                                ) {
+                                    warn!(err = %e, "PTB gas proposer credit failed");
+                                }
                                 Some(gas_snap.commit())
                             } else {
                                 None
@@ -1042,10 +1108,24 @@ fn execute_tx_impl(
                             );
                         }
                     }
-                    // Proposer credit (always — burnt or full
-                    // burn). saturating_cast i128 for safety.
+                    // Proposer credit (always — burnt or full burn).
                     if burnt > 0 {
-                        snapshot.apply_loom_delta(proposer, burnt.min(i128::MAX as u128) as i128);
+                        if let Err(e) = mint_coin_loom_to(
+                            &mut snapshot,
+                            proposer,
+                            burnt,
+                            b"bloom.ptb.gas.success",
+                            &tx.tx_hash(),
+                            loom_coin_type.clone(),
+                        ) {
+                            return ExecOutput {
+                                success: false,
+                                fuel_used: charged_fuel,
+                                return_data: format!("ptb gas settlement error: {e}").into_bytes(),
+                                logs: vec![],
+                                write_set: None,
+                            };
+                        }
                     }
 
                     let ws = snapshot.commit();
@@ -1074,8 +1154,7 @@ fn execute_tx_impl(
     }
 }
 
-/// PTB compat shim: adjust Coin<LOOM> objects to match a legacy
-/// `Account.loom` debit/credit pair.
+/// Adjust Coin<LOOM> objects for a legacy `TxKind::Transfer`.
 ///
 /// Steps:
 /// 1. Call `select_coin_loom` to pick sender coins.
@@ -1084,38 +1163,41 @@ fn execute_tx_impl(
 /// 4. Update ownership indices for both `sender` and `to`.
 ///
 /// If `sender` lacks sufficient `Coin<LOOM>` (e.g. the coins are already
-/// diverged from `Account.loom`), this logs a warning and returns
-/// without modifying the object world. The `Account.loom` update in the
-/// caller is the source of truth and proceeds regardless.
-///
-/// TODO(phase4): tighten to a hard revert once the legacy Account.loom
-/// path is removed.
-fn apply_coin_loom_transfer(
+/// diverged from object state), this returns an error so the caller can
+/// reject the legacy transfer before applying any write set.
+pub(crate) fn apply_coin_loom_transfer(
     snap: &mut bloom_chain_state::StateSnapshot,
     sender: Address,
     to: Address,
     amount: u128,
     tx_hash: &Hash32,
     coin_type: TypeTag,
-) {
+) -> Result<(), String> {
+    apply_coin_loom_transfer_with_domain(
+        snap,
+        sender,
+        to,
+        amount,
+        tx_hash,
+        coin_type,
+        b"bloom.legacy.transfer",
+    )
+}
+
+pub(crate) fn apply_coin_loom_transfer_with_domain(
+    snap: &mut bloom_chain_state::StateSnapshot,
+    sender: Address,
+    to: Address,
+    amount: u128,
+    tx_hash: &Hash32,
+    coin_type: TypeTag,
+    mint_domain: &[u8],
+) -> Result<(), String> {
     use crate::coin_select::CoinSelection;
 
     // 1. Select sender coins.
-    let selection: CoinSelection = match select_coin_loom(snap, sender, amount, &coin_type) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(
-                sender = %hex::encode(sender.0),
-                to = %hex::encode(to.0),
-                amount = amount,
-                err = %e,
-                "legacy Transfer/Call Coin<LOOM> state diverged — \
-                 Account.loom updated but Coin<LOOM> objects unchanged; \
-                 TODO(phase4): remove legacy Account.loom path"
-            );
-            return;
-        }
-    };
+    let selection: CoinSelection = select_coin_loom(snap, sender, amount, &coin_type)
+        .map_err(|e| format!("Coin<LOOM> selection failed: {e}"))?;
 
     // 2a. Delete fully-consumed coins and remove from sender's ownership index.
     let sender_okey = OwnershipIndexKey {
@@ -1140,17 +1222,35 @@ fn apply_coin_loom_transfer(
 
     snap.set_ownership(sender_okey, sender_owned);
 
-    // 3. Mint a new Coin<LOOM> owned by `to`.
-    //
-    // Deterministic ObjectId: blake3("bloom.legacy.transfer" || tx_hash)
-    // Each Transfer tx is 1-to-1 with exactly one mint, so the tx hash
-    // as the sole input is collision-free across distinct txs.
+    mint_coin_loom_to(snap, to, amount, mint_domain, tx_hash, coin_type)
+}
+
+pub(crate) fn mint_coin_loom_to(
+    snap: &mut bloom_chain_state::StateSnapshot,
+    to: Address,
+    amount: u128,
+    domain: &[u8],
+    seed_hash: &Hash32,
+    coin_type: TypeTag,
+) -> Result<(), String> {
+    if amount == 0 {
+        return Ok(());
+    }
     let new_coin_id = {
         let mut h = blake3::Hasher::new();
-        h.update(b"bloom.legacy.transfer");
-        h.update(&tx_hash.0);
+        h.update(domain);
+        h.update(&seed_hash.0);
+        h.update(&to.0);
+        h.update(&amount.to_be_bytes());
         ObjectId(*h.finalize().as_bytes())
     };
+
+    if snap.get_object(&new_coin_id).is_some() {
+        return Err(format!(
+            "Coin<LOOM> mint id collision: {}",
+            hex::encode(new_coin_id.0)
+        ));
+    }
 
     let new_coin = Object {
         id: new_coin_id,
@@ -1161,7 +1261,6 @@ fn apply_coin_loom_transfer(
     };
     snap.insert_object(new_coin);
 
-    // 4. Update ownership index for `to`.
     let to_okey = OwnershipIndexKey {
         owner_kind: OWNER_KIND_ADDRESS,
         owner_id: to.0,
@@ -1170,10 +1269,5 @@ fn apply_coin_loom_transfer(
     let pos = to_owned.partition_point(|id| id.0 < new_coin_id.0);
     to_owned.insert(pos, new_coin_id);
     snap.set_ownership(to_okey, to_owned);
-}
-
-// suppress unused-import lints when Account isn't needed in some configs
-#[allow(dead_code)]
-fn _typecheck() -> Option<Account> {
-    None
+    Ok(())
 }

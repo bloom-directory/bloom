@@ -28,15 +28,18 @@
 
 use std::collections::HashMap;
 
-use bloom_chain_node::consensus_driver::apply_block_state_transitions;
+use bloom_chain_node::consensus_driver::{
+    apply_block_state_transitions, coin_loom_balance, resolve_loom_coin_type,
+};
 use bloom_chain_node::petal_executor::{ChainPetalExecutor, ChainPetalExecutorWithManifests};
-use bloom_chain_state::{Account, State};
+use bloom_chain_state::State;
 use bloom_chain_types::block::Block;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
-use bloom_objects::{Object, ObjectId, Owner};
+use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
 use bloom_petal_fungible::ops::decode_coin_value;
 use bloom_script::{
+    CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH,
     chain_iface::{FunctionDeclStub, PetalManifestStub},
     encode_ptb, loom_coin_type_tag,
     types::{Command, MoveCmd, PetalRef, PqSignature, PtbTx},
@@ -48,6 +51,12 @@ use bloom_test_util::BlockBuilder;
 // ---------------------------------------------------------------------------
 
 const ZERO_EMISSION: u128 = 0;
+
+fn state_with_bootstrap_fungible() -> State {
+    let mut state = State::new();
+    state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
+    state
+}
 
 /// Build a SubmitPtb Tx with explicit outer caps. The tx `sender` is
 /// derived from the supplied envelope-level pubkey so
@@ -106,20 +115,31 @@ fn coin_version(state: &State, id: &ObjectId) -> Option<u64> {
 }
 
 fn balance(state: &State, addr: &Address) -> u128 {
-    state.get_account(addr).map(|a| a.loom).unwrap_or(0)
+    resolve_loom_coin_type(state)
+        .map(|coin_type| coin_loom_balance(state, *addr, &coin_type))
+        .unwrap_or(0)
 }
 
 fn fund(state: &mut State, addr: Address, loom: u128) {
-    state.set_account(
-        addr,
-        Account {
-            nonce: 0,
-            loom,
-            code_hash: None,
-            storage_root: Hash32([0u8; 32]),
-            manifest_hash: None,
-        },
-    );
+    if loom == 0 {
+        return;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"ptb_gas_reservation.fund");
+    h.update(&addr.0);
+    h.update(&loom.to_be_bytes());
+    let coin_id = ObjectId(*h.finalize().as_bytes());
+    state.set_object(make_loom_coin(coin_id, addr.0, loom));
+    let key = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: addr.0,
+    };
+    let mut owned = state.get_ownership(&key).unwrap_or_default();
+    if !owned.contains(&coin_id) {
+        owned.push(coin_id);
+        owned.sort();
+    }
+    state.set_ownership(key, owned);
 }
 
 fn manifest_with_nullary_fn(fn_name: &str) -> PetalManifestStub {
@@ -221,7 +241,7 @@ fn outer_max_fuel_lower_than_inner_budget_rejected_at_envelope() {
     let gas_payer_id = ObjectId([0xAA; 32]);
     let proposer = Address([0xBB; 32]);
 
-    let mut state = State::new();
+    let mut state = state_with_bootstrap_fungible();
     let wasm = wat(NOOP_PETAL);
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, 1_000_000_000));
@@ -273,7 +293,7 @@ fn outer_fee_per_unit_lower_than_inner_price_rejected_at_envelope() {
     let gas_payer_id = ObjectId([0xCC; 32]);
     let proposer = Address([0xDD; 32]);
 
-    let mut state = State::new();
+    let mut state = state_with_bootstrap_fungible();
     let wasm = wat(NOOP_PETAL);
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, 1_000_000_000));
@@ -331,7 +351,7 @@ fn successful_ptb_refunds_unused_gas_and_credits_proposer() {
     let proposer = Address([0xFF; 32]);
     let initial_coin: u128 = 1_000_000_000;
 
-    let mut state = State::new();
+    let mut state = state_with_bootstrap_fungible();
     let wasm = wat(NOOP_PETAL);
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, initial_coin));
@@ -438,7 +458,7 @@ fn reverted_ptb_burns_full_reservation_and_credits_proposer() {
     let proposer = Address([0xBA; 32]);
     let initial_coin: u128 = 1_000_000_000;
 
-    let mut state = State::new();
+    let mut state = state_with_bootstrap_fungible();
     let wasm = wat(FUEL_BURNER_PETAL);
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, initial_coin));
@@ -500,7 +520,7 @@ fn non_oof_wasm_trap_charges_consumed_fuel_and_full_revert_burn() {
     let proposer = Address([0x4C; 32]);
     let initial_coin: u128 = 1_000_000_000;
 
-    let mut state = State::new();
+    let mut state = state_with_bootstrap_fungible();
     let wasm = wat(NON_OOF_TRAP_PETAL);
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, initial_coin));
@@ -565,7 +585,7 @@ fn free_vm_work_attempt_is_rejected_before_execution() {
     let gas_payer_id = ObjectId([0xCD; 32]);
     let proposer = Address([0xDC; 32]);
 
-    let mut state = State::new();
+    let mut state = state_with_bootstrap_fungible();
     let wasm = wat(FUEL_BURNER_PETAL);
     let petal_hash = state.insert_code(&wasm);
     // Give the coin enough to cover the inner budget so the validator
@@ -627,7 +647,7 @@ fn sender_account_loom_never_moves_across_submit_ptb() {
     let proposer = Address([0xFE; 32]);
     let sender_seed: u128 = 12_345_678_901_234;
 
-    let mut state = State::new();
+    let mut state = state_with_bootstrap_fungible();
     let wasm = wat(NOOP_PETAL);
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, 1_000_000_000));
@@ -679,7 +699,7 @@ fn undecodable_ptb_rejected_at_envelope_with_nonce_bump() {
     let proposer = Address([0x88u8; 32]);
     let sender_seed: u128 = 42;
 
-    let mut state = State::new();
+    let mut state = state_with_bootstrap_fungible();
 
     // Empty bytes do not decode.
     let (sender, tx) = submit_ptb_tx_with_caps(vec![], 1, 10_000_000, 1);
@@ -724,7 +744,7 @@ fn full_budget_consumed_zero_refund_full_burn() {
     let proposer = Address([0x20; 32]);
     let initial_coin: u128 = 1_000_000;
 
-    let mut state = State::new();
+    let mut state = state_with_bootstrap_fungible();
     let wasm = wat(FUEL_BURNER_PETAL);
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, initial_coin));

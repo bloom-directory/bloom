@@ -16,13 +16,18 @@
 //! of the post-write_set balances, so transfer-to-self, recipient-is-
 //! proposer, and sender-is-proposer all reconcile to the spec numbers.
 
-use bloom_chain_node::consensus_driver::{NoopExecutor, apply_block_state_transitions};
+use bloom_chain_node::consensus_driver::{
+    NoopExecutor, apply_block_state_transitions, coin_loom_balance, resolve_loom_coin_type,
+};
 use bloom_chain_state::{Account, State};
 use bloom_chain_types::{
     block::Block,
     tx::{Tx, TxKind},
     types::{Address, Hash32, PubKeyBytes, SigBytes},
 };
+use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
+use bloom_petal_fungible::ops::coin_payload;
+use bloom_script::{CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, loom_coin_type_tag};
 use bloom_test_util::{BlockBuilder, make_addr};
 
 // Block emission is intentionally zero in these tests so the proposer
@@ -60,20 +65,43 @@ fn make_block(height: u64, proposer: Address, txs: Vec<Tx>) -> Block {
 }
 
 fn fund(state: &mut State, addr: Address, loom: u128) {
+    state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
     state.set_account(
         addr,
         Account {
             nonce: 0,
-            loom,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,
         },
     );
+    if loom > 0 {
+        let mut h = blake3::Hasher::new();
+        h.update(b"apply_block_settlement_ordering.fund");
+        h.update(&addr.0);
+        h.update(&loom.to_be_bytes());
+        let coin_id = ObjectId(*h.finalize().as_bytes());
+        state.set_object(Object {
+            id: coin_id,
+            type_tag: loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
+            owner: Owner::Address(addr.0),
+            version: 0,
+            payload: coin_payload(loom),
+        });
+        state.set_ownership(
+            OwnershipIndexKey {
+                owner_kind: OWNER_KIND_ADDRESS,
+                owner_id: addr.0,
+            },
+            vec![coin_id],
+        );
+    }
 }
 
 fn balance_of(state: &State, addr: &Address) -> u128 {
-    state.get_account(addr).map(|a| a.loom).unwrap_or(0)
+    resolve_loom_coin_type(state)
+        .map(|coin_type| coin_loom_balance(state, *addr, &coin_type))
+        .unwrap_or(0)
 }
 
 /// `NoopExecutor` always reports `fuel_used = 100` for a `Transfer`, so

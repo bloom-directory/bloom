@@ -1,8 +1,8 @@
-//! Spec §19 #4 — Account.loom reconciliation invariant.
+//! Spec §19 #4 — Coin<LOOM> conservation invariant.
 //!
 //! After applying a sequence of transactions, walk `state.objects` collecting
 //! every `Coin<LOOM>` owned by `Owner::Address(addr)`, sum the values, and
-//! assert the sum matches `state.get_account(&addr).loom`.
+//! assert object totals remain conserved.
 //!
 //! DOD item: spec §19 #4.
 
@@ -40,44 +40,19 @@ fn sum_coin_loom(state: &State, owner: Address) -> u128 {
         .sum()
 }
 
-/// Assert the reconciliation invariant for `addr`:
-///   account.loom == sum(Coin<LOOM> owned by addr)
-fn assert_reconciled(state: &State, owner: Address, label: &str) {
-    let account_loom = state.get_account(&owner).map(|a| a.loom).unwrap_or(0);
+fn assert_coin_total(state: &State, owner: Address, expected: u128, label: &str) {
     let coin_total = sum_coin_loom(state, owner);
     assert_eq!(
-        account_loom,
+        expected,
         coin_total,
-        "{label}: account.loom ({account_loom}) != sum(Coin<LOOM>) ({coin_total}) \
-         for addr {addr:?}",
+        "{label}: expected Coin<LOOM> total {expected}, got {coin_total} for addr {addr:?}",
         addr = owner.0
     );
 }
 
 /// Execute a `TxKind::Transfer` and apply the write set.
 ///
-/// Mirrors `apply_block_state_transitions` steps 3+4: debit `amount_loom`
-/// from the sender's `account.loom` before calling `execute_tx` (which only
-/// credits the receiver). This is necessary for the reconciliation invariant
-/// to hold for both parties; without the debit, the sender's `account.loom`
-/// would remain inflated relative to their `Coin<LOOM>` sum.
 fn exec_transfer(state: &mut State, sender: Address, to: Address, amount: u128) {
-    // Step 3 (block driver): debit sender's account.loom.
-    {
-        let mut sender_acct = state
-            .get_account(&sender)
-            .expect("sender must have an account");
-        assert!(
-            sender_acct.loom >= amount,
-            "sender account.loom {loom} < transfer amount {amount}",
-            loom = sender_acct.loom
-        );
-        sender_acct.loom -= amount;
-        state.set_account(sender, sender_acct);
-    }
-
-    // Step 4 (block driver): execute_tx (credits receiver's account.loom,
-    // updates Coin<LOOM> objects via the PTB compat shim).
     let tx = Tx {
         chain_id: "bloom-chain.v0".to_string(),
         sender,
@@ -113,9 +88,9 @@ fn reconciliation_genesis_3_allocations() {
 
     let state = build_state(&[(alice, 1_000), (bob, 2_000), (charlie, 3_000)]);
 
-    assert_reconciled(&state, alice, "genesis alice");
-    assert_reconciled(&state, bob, "genesis bob");
-    assert_reconciled(&state, charlie, "genesis charlie");
+    assert_coin_total(&state, alice, 1_000, "genesis alice");
+    assert_coin_total(&state, bob, 2_000, "genesis bob");
+    assert_coin_total(&state, charlie, 3_000, "genesis charlie");
 }
 
 // ---------------------------------------------------------------------------
@@ -134,8 +109,8 @@ fn reconciliation_after_single_transfer() {
 
     exec_transfer(&mut state, alice, bob, 300);
 
-    assert_reconciled(&state, alice, "after transfer: alice");
-    assert_reconciled(&state, bob, "after transfer: bob");
+    assert_coin_total(&state, alice, 700, "after transfer: alice");
+    assert_coin_total(&state, bob, 300, "after transfer: bob");
 
     // Spot-check values.
     assert_eq!(
@@ -177,10 +152,6 @@ fn reconciliation_5_sequential_transfers_3_addresses() {
     exec_transfer(&mut state, bob, charlie, 400);
     exec_transfer(&mut state, alice, charlie, 300);
     exec_transfer(&mut state, alice, bob, 200);
-
-    assert_reconciled(&state, alice, "after 5 transfers: alice");
-    assert_reconciled(&state, bob, "after 5 transfers: bob");
-    assert_reconciled(&state, charlie, "after 5 transfers: charlie");
 
     // Conservation: total must equal 10_000.
     let total =

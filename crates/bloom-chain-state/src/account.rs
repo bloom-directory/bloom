@@ -1,18 +1,17 @@
 //! `Account` struct per bloom-chain spec §5.1.
 //!
-//! # SSZ layout (fixed-size, 122 bytes)
+//! # SSZ layout (fixed-size, 106 bytes)
 //!
 //! | Field              | Bytes | Notes                                  |
 //! |--------------------|-------|----------------------------------------|
 //! | `nonce`            | 8     | u64 LE                                 |
-//! | `loom`             | 16    | u128 LE (bloomweis)                    |
 //! | code_present       | 1     | 0 = None, 1 = Some                     |
 //! | `code_hash`        | 32    | only meaningful when code_present == 1 |
 //! | `storage_root`     | 32    | zero hash when no storage              |
 //! | manifest_present   | 1     | 0 = None, 1 = Some                     |
 //! | `manifest_hash`    | 32    | meaningful when manifest_present == 1  |
 //!
-//! Total: 122 bytes (fixed — no variable-length fields). The
+//! Total: 106 bytes (fixed — no variable-length fields). The
 //! `manifest_hash` slot is the v1 on-chain anchor for off-chain manifest
 //! verification. The chain does not interpret its bytes; off-chain tooling can
 //! compare it against the blake3 of a published manifest.
@@ -25,8 +24,6 @@ use ssz::{Decode, DecodeError, Encode};
 pub struct Account {
     /// Next expected tx nonce for this account (monotonic).
     pub nonce: u64,
-    /// Native LOOM balance in bloomweis.
-    pub loom: u128,
     /// `None` for EOAs; `Some(hash)` for petal contracts.
     pub code_hash: Option<Hash32>,
     /// Root of this account's storage trie (zero if empty).
@@ -40,13 +37,12 @@ pub struct Account {
 
 impl Account {
     /// The canonical SSZ byte length for an `Account`.
-    pub const SSZ_LEN: usize = 8 + 16 + 1 + 32 + 32 + 1 + 32;
+    pub const SSZ_LEN: usize = 8 + 1 + 32 + 32 + 1 + 32;
 
     /// Construct the empty/zero account (spec §5.1 definition).
     pub fn empty() -> Self {
         Self {
             nonce: 0,
-            loom: 0,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,
@@ -54,13 +50,11 @@ impl Account {
     }
 
     /// True iff this account matches the empty-account definition:
-    /// `nonce=0, loom=0, code_hash=None, storage_root=zero,
-    /// manifest_hash=None`.
+    /// `nonce=0, code_hash=None, storage_root=zero, manifest_hash=None`.
     ///
     /// Empty accounts are not materialised in the trie (spec §5.1).
     pub fn is_empty(&self) -> bool {
         self.nonce == 0
-            && self.loom == 0
             && self.code_hash.is_none()
             && self.storage_root == Hash32([0u8; 32])
             && self.manifest_hash.is_none()
@@ -87,8 +81,6 @@ impl Encode for Account {
     fn ssz_append(&self, buf: &mut Vec<u8>) {
         // nonce (8 bytes LE)
         buf.extend_from_slice(&self.nonce.to_le_bytes());
-        // loom (16 bytes LE)
-        buf.extend_from_slice(&self.loom.to_le_bytes());
         // code_hash discriminant + bytes
         match &self.code_hash {
             None => {
@@ -134,14 +126,12 @@ impl Decode for Account {
         }
 
         let nonce = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        let loom = u128::from_le_bytes(bytes[8..24].try_into().unwrap());
-
-        let discriminant = bytes[24];
+        let discriminant = bytes[8];
         let code_hash = match discriminant {
             0 => None,
             1 => {
                 let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes[25..57]);
+                arr.copy_from_slice(&bytes[9..41]);
                 Some(Hash32(arr))
             }
             _ => {
@@ -152,15 +142,15 @@ impl Decode for Account {
         };
 
         let mut storage_arr = [0u8; 32];
-        storage_arr.copy_from_slice(&bytes[57..89]);
+        storage_arr.copy_from_slice(&bytes[41..73]);
         let storage_root = Hash32(storage_arr);
 
-        let manifest_discriminant = bytes[89];
+        let manifest_discriminant = bytes[73];
         let manifest_hash = match manifest_discriminant {
             0 => None,
             1 => {
                 let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes[90..122]);
+                arr.copy_from_slice(&bytes[74..106]);
                 Some(Hash32(arr))
             }
             _ => {
@@ -172,7 +162,6 @@ impl Decode for Account {
 
         Ok(Account {
             nonce,
-            loom,
             code_hash,
             storage_root,
             manifest_hash,
@@ -194,15 +183,15 @@ mod tests {
     #[test]
     fn non_empty_account_not_is_empty() {
         let mut a = Account::empty();
-        a.loom = 100;
+        a.nonce = 1;
         assert!(!a.is_empty());
 
         let mut b = Account::empty();
-        b.nonce = 1;
+        b.code_hash = Some(Hash32([1u8; 32]));
         assert!(!b.is_empty());
 
         let mut c = Account::empty();
-        c.code_hash = Some(Hash32([1u8; 32]));
+        c.manifest_hash = Some(Hash32([2u8; 32]));
         assert!(!c.is_empty());
     }
 
@@ -210,7 +199,6 @@ mod tests {
     fn ssz_roundtrip_eoa() {
         let a = Account {
             nonce: 42,
-            loom: 1_000_000,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,
@@ -225,7 +213,6 @@ mod tests {
     fn ssz_roundtrip_contract() {
         let a = Account {
             nonce: 1,
-            loom: 0,
             code_hash: Some(Hash32([0xAB; 32])),
             storage_root: Hash32([0xCD; 32]),
             manifest_hash: None,
@@ -240,7 +227,6 @@ mod tests {
     fn ssz_roundtrip_contract_with_manifest_hash() {
         let a = Account {
             nonce: 1,
-            loom: 0,
             code_hash: Some(Hash32([0xAB; 32])),
             storage_root: Hash32([0xCD; 32]),
             manifest_hash: Some(Hash32([0xEF; 32])),
@@ -255,14 +241,14 @@ mod tests {
     #[test]
     fn ssz_rejects_bad_discriminant() {
         let mut bytes = Account::empty().as_ssz_bytes();
-        bytes[24] = 2; // invalid code_hash discriminant
+        bytes[8] = 2; // invalid code_hash discriminant
         assert!(Account::from_ssz_bytes(&bytes).is_err());
     }
 
     #[test]
     fn ssz_rejects_bad_manifest_discriminant() {
         let mut bytes = Account::empty().as_ssz_bytes();
-        bytes[89] = 2; // invalid manifest_hash discriminant
+        bytes[73] = 2; // invalid manifest_hash discriminant
         assert!(Account::from_ssz_bytes(&bytes).is_err());
     }
 }

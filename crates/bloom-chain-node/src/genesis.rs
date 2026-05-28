@@ -1,7 +1,7 @@
 //! Genesis file parsing (spec §5.4, §14).
 //!
 //! Parses `<bloom_home>/chain/genesis.toml` into a `Genesis` struct, builds
-//! the initial `ValidatorSet`, applies genesis allocations to the accounts trie,
+//! the initial `ValidatorSet`, applies genesis allocations to Coin<LOOM> objects,
 //! and computes the genesis hash.
 //!
 //! # Genesis TOML format
@@ -35,7 +35,7 @@ use anyhow::{Result, anyhow};
 use base64::Engine as _;
 use bloom_chain_consensus::ValidatorSet;
 use bloom_chain_consensus::validator_set::Validator;
-use bloom_chain_state::{Account, State};
+use bloom_chain_state::State;
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes};
 use bloom_keystore::xdsa::XDSA_PK_LEN;
 use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
@@ -245,8 +245,7 @@ impl Genesis {
     /// Apply allocations to an empty `State`, producing the genesis state.
     ///
     /// For each allocation this method:
-    /// 1. Writes `Account.loom = amount` (the derived cache, spec §9.2).
-    /// 2. Emits a `Coin<LOOM>` object with a deterministic `ObjectId`
+    /// 1. Emits a `Coin<LOOM>` object with a deterministic `ObjectId`
     ///    and transfers it to the recipient (equivalent to what running
     ///    `bloom_petal_fungible::ops::mint_genesis` on-chain would produce,
     ///    but written directly to avoid running wasm at genesis).
@@ -265,6 +264,9 @@ impl Genesis {
             let hash = state.insert_code(wasm);
             state.set_vfs_binding(path.clone(), hash);
         }
+        if state.vfs_lookup(CORE_FUNGIBLE_PATH).is_none() {
+            state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
+        }
 
         let fungible_petal_hash = state
             .vfs_lookup(CORE_FUNGIBLE_PATH)
@@ -272,17 +274,7 @@ impl Genesis {
         let coin_type = loom_coin_type_tag(fungible_petal_hash);
 
         for (idx, (addr, amount)) in self.allocations.iter().enumerate() {
-            // ── 1. Account.loom cache (spec §9.2) ─────────────────────────
-            let acct = Account {
-                nonce: 0,
-                loom: *amount,
-                code_hash: None,
-                storage_root: Hash32([0u8; 32]),
-                manifest_hash: None,
-            };
-            state.set_account(*addr, acct);
-
-            // ── 2. Coin<LOOM> object ───────────────────────────────────────
+            // ── Coin<LOOM> object ──────────────────────────────────────────
             //
             // Derive a deterministic ObjectId:
             // blake3("bloom.genesis.loom" || genesis_hash_bytes || idx_le32)
@@ -515,16 +507,7 @@ mod tests {
                 .iter()
                 .enumerate()
         {
-            let addr = Address(*raw_addr);
-
-            // 1. Account.loom cache must still match the allocation amount.
-            let acct = state.get_account(&addr).expect("account must exist");
-            assert_eq!(
-                acct.loom, *expected_amount,
-                "Account.loom cache mismatch for idx {idx}"
-            );
-
-            // 2. A Coin<LOOM> object must exist with deterministic id.
+            // A Coin<LOOM> object must exist with deterministic id.
             let coin_id = genesis_coin_id(&genesis, idx);
 
             let obj = state
@@ -612,15 +595,12 @@ mod tests {
     }
 
     #[test]
-    fn genesis_loom_cache_matches_coin_value() {
+    fn genesis_loom_allocation_mints_coin_value() {
         let addr = [0xCCu8; 32];
         let amount: u128 = 999_999_999_999_999_999;
         let genesis = make_genesis(vec![(addr, amount)]);
         let mut state = State::new();
         genesis.apply_to_state(&mut state);
-
-        let acct = state.get_account(&Address(addr)).unwrap();
-        assert_eq!(acct.loom, amount);
 
         let coin_id = {
             let mut h = blake3::Hasher::new();
@@ -631,7 +611,7 @@ mod tests {
         };
         let obj = state.get_object(&coin_id).unwrap();
         let value = decode_coin_value(&obj.payload).unwrap();
-        assert_eq!(value, amount, "loom cache and coin payload must agree");
+        assert_eq!(value, amount, "genesis coin payload must match allocation");
     }
 
     #[test]

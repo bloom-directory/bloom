@@ -105,10 +105,9 @@ fn mint_genesis_wrong_typed_cap_reverts_with_typemismatch() {
     // Install the real fungible manifest on a synthetic WAT body.
     let wasm = wrap_with_real_manifest(noop_mint_genesis_wat(), real_fungible_manifest_bytes());
     let petal_hash = state.insert_code(&wasm);
-    // The macro emits `module_path = "/bloom/core/fungible"`; bind that
-    // path so the production adapter resolves it (and so any path-bound
-    // PTB encoder would, although here we pin by hash).
-    state.set_vfs_binding("/bloom/core/fungible".to_string(), petal_hash);
+    // The PTB pins by hash, so the manifest is loaded from the inserted
+    // wasm. The harness keeps `/bloom/core/fungible` bound to the
+    // bootstrap sentinel so the seeded gas coin remains Coin<LOOM>.
 
     // Build `mint_genesis(epoch=alice_coin /* WRONG TYPE */,
     //                    amount=u128 BE 1000,
@@ -193,7 +192,6 @@ fn mint_genesis_with_real_epoch_zero_cap_typechecks_ok() {
 
     let wasm = wrap_with_real_manifest(noop_mint_genesis_wat(), real_fungible_manifest_bytes());
     let petal_hash = state.insert_code(&wasm);
-    state.set_vfs_binding("/bloom/core/fungible".to_string(), petal_hash);
 
     // Seed a real Capability<EpochZero> object owned by alice.
     let epoch_id = ObjectId([0xE0; 32]);

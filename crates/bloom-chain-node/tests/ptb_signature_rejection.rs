@@ -33,7 +33,7 @@ use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
 use bloom_keystore::xdsa::XdsaSecretKey;
 use bloom_objects::{Object, ObjectId, Owner};
 use bloom_script::{
-    encode_ptb, loom_coin_type_tag,
+    CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, encode_ptb, loom_coin_type_tag,
     types::{PqSignature, PtbTx},
 };
 
@@ -56,11 +56,15 @@ fn coin_payload(value: u128) -> Vec<u8> {
 fn make_loom_coin(id: ObjectId, owner: [u8; 32], value: u128) -> Object {
     Object {
         id,
-        type_tag: loom_coin_type_tag(Hash32([0u8; 32])),
+        type_tag: loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
         owner: Owner::Address(owner),
         version: 1,
         payload: coin_payload(value),
     }
+}
+
+fn bind_bootstrap_fungible(state: &mut State) {
+    state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
 }
 
 /// Build a freshly-generated xDSA signing key and its 32-byte address
@@ -138,6 +142,7 @@ fn accepts_valid_xdsa_signature() {
     let gas_payer_id = ObjectId([0xCC; 32]);
 
     let mut state = State::new();
+    bind_bootstrap_fungible(&mut state);
     state.register_pubkey(Address(signer_addr), pk);
     // Seed a Coin<LOOM> owned by the PTB signer so step 6 (gas-payer
     // prep) succeeds. Without this the validator would reject the
@@ -182,6 +187,7 @@ fn rejects_flipped_signature_byte() {
     let gas_payer_id = ObjectId([0xCC; 32]);
 
     let mut state = State::new();
+    bind_bootstrap_fungible(&mut state);
     state.register_pubkey(Address(signer_addr), pk);
     state.set_object(make_loom_coin(gas_payer_id, signer_addr, 1_000_000_000));
 
@@ -240,6 +246,7 @@ fn rejects_wrong_pubkey() {
     let gas_payer_id = ObjectId([0xCC; 32]);
 
     let mut state = State::new();
+    bind_bootstrap_fungible(&mut state);
     // The attacker's address is what would need to own the gas-payer
     // for step 6 to pass. Seeding under the attacker's pubkey makes
     // sure that — if the signature check were broken — the rest of

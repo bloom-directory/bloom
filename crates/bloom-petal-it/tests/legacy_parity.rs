@@ -24,6 +24,7 @@ use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
 use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
 use bloom_petal_fungible::ops::{coin_payload, decode_coin_value, type_tag_coin_loom};
+use bloom_script::{CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH};
 
 use bloom_petal_it::harness::addr;
 
@@ -35,6 +36,7 @@ use bloom_petal_it::harness::addr;
 /// (32-byte ObjectId placeholder + 16-byte u128 value).
 /// This matches what `select_coin_loom` + `decode_coin_value` expect.
 fn seed_fungible_coin(state: &mut State, id: ObjectId, owner: Address, value: u128) {
+    state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
     let obj = Object {
         id,
         type_tag: type_tag_coin_loom(),
@@ -84,6 +86,10 @@ fn exec_transfer(state: &mut State, sender: Address, to: Address, amount: u128) 
         .expect("apply must not fail");
 }
 
+fn bind_bootstrap_fungible(state: &mut State) {
+    state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
+}
+
 /// Sum all `Coin<LOOM>` values owned by `owner` (uses 48-byte fungible decode).
 fn total_coin_loom(state: &State, owner: Address) -> u128 {
     let okey = OwnershipIndexKey {
@@ -114,7 +120,6 @@ fn legacy_transfer_produces_correct_coin_values() {
         alice,
         bloom_chain_state::Account {
             nonce: 0,
-            loom: 1000,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,
@@ -158,10 +163,6 @@ fn legacy_transfer_produces_correct_coin_values() {
         Owner::Address(bob.0),
         "bob must own the coin"
     );
-
-    // Account.loom for bob = 300.
-    let bob_acct = state.get_account(&bob).expect("bob must have an account");
-    assert_eq!(bob_acct.loom, 300, "bob.account.loom must be 300");
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +179,6 @@ fn legacy_transfer_exact_deletes_sender_coin() {
         alice,
         bloom_chain_state::Account {
             nonce: 0,
-            loom: 300,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,
@@ -209,7 +209,7 @@ fn legacy_transfer_exact_deletes_sender_coin() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3: five sequential Transfers maintain Account.loom + Coin<LOOM> total.
+// Test 3: five sequential Transfers maintain Coin<LOOM> totals.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -223,7 +223,6 @@ fn five_sequential_transfers_maintain_totals() {
         alice,
         bloom_chain_state::Account {
             nonce: 0,
-            loom: total,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,
@@ -253,44 +252,40 @@ fn five_sequential_transfers_maintain_totals() {
         total,
         "total Coin<LOOM> must be conserved: {alice_total} + {bob_total} != {total}"
     );
-
-    // Account.loom for bob = 5 * 1000 = 5000.
-    let bob_acct = state.get_account(&bob).expect("bob must have an account");
-    assert_eq!(
-        bob_acct.loom, 5_000,
-        "bob.account.loom must be 5000 after 5 transfers"
-    );
 }
 
 // ---------------------------------------------------------------------------
-// Test 4: diverged state (no Coin<LOOM>) — legacy Transfer still succeeds.
+// Test 4: diverged state (no Coin<LOOM>) — legacy Transfer fails closed.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn legacy_transfer_diverged_no_coin_loom_still_credits_account() {
+fn legacy_transfer_diverged_no_coin_loom_fails_closed() {
     let alice = addr(0xA1);
     let bob = addr(0xB2);
 
     // Alice has Account.loom but no Coin<LOOM> object (diverged state).
     let mut state = State::new();
+    bind_bootstrap_fungible(&mut state);
     state.set_account(
         alice,
         bloom_chain_state::Account {
             nonce: 0,
-            loom: 1000,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,
         },
     );
 
-    exec_transfer(&mut state, alice, bob, 300);
+    let tx = transfer_tx(alice, bob, 300);
+    let out = ChainPetalExecutor.execute_tx(&tx, &mut state, 1, 0, addr(0xFF), Hash32([0u8; 32]));
+    assert!(!out.success, "diverged transfer must fail closed");
+    assert!(out.write_set.is_none(), "failed transfer must not write");
+    assert!(
+        state.get_account(&bob).is_none(),
+        "bob must not be credited"
+    );
 
-    // Bob got Account.loom credit even though alice had no Coin<LOOM>.
-    let bob_acct = state.get_account(&bob).expect("bob must have an account");
-    assert_eq!(bob_acct.loom, 300, "bob.account.loom must be credited");
-
-    // Bob has NO Coin<LOOM> (shim diverged — no coin to debit from alice).
+    // Bob has no Coin<LOOM> either.
     let bob_coin_total = total_coin_loom(&state, bob);
     assert_eq!(
         bob_coin_total, 0,
@@ -312,7 +307,6 @@ fn value_conservation_across_two_paths() {
         alice,
         bloom_chain_state::Account {
             nonce: 0,
-            loom: 1000,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,
@@ -326,7 +320,6 @@ fn value_conservation_across_two_paths() {
         alice,
         bloom_chain_state::Account {
             nonce: 0,
-            loom: 1000,
             code_hash: None,
             storage_root: Hash32([0u8; 32]),
             manifest_hash: None,

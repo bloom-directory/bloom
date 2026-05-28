@@ -9,10 +9,9 @@ fn addr(b: u8) -> Address {
     Address([b; 32])
 }
 
-fn eoa(loom: u128) -> Account {
+fn eoa(nonce: u64) -> Account {
     Account {
-        nonce: 1,
-        loom,
+        nonce,
         code_hash: None,
         storage_root: Hash32([0u8; 32]),
         manifest_hash: None,

@@ -29,10 +29,7 @@ use bloom_revert::{
     AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
     OpenchainDecoder, boxed,
 };
-use bloom_script::{
-    CORE_FUNGIBLE_PATH, ChainStateIface, DEFAULT_FUNGIBLE_PETAL_HASH, PqSignature, PtbTx,
-    loom_coin_type_tag,
-};
+use bloom_script::{CORE_FUNGIBLE_PATH, ChainStateIface, PqSignature, PtbTx, loom_coin_type_tag};
 use bloom_tx::outbox::Outbox;
 use bloom_tx::tx_engine::TxEngine;
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
@@ -1087,7 +1084,9 @@ impl RpcPtbSubmitter {
             .await
             .map_err(err_he)?;
         let Some(hex_hash) = value.get("hash").and_then(|v| v.as_str()) else {
-            return Ok(DEFAULT_FUNGIBLE_PETAL_HASH);
+            return Err(HandlerError::backend(format!(
+                "missing required VFS binding for {CORE_FUNGIBLE_PATH}"
+            )));
         };
         let bytes = hex::decode(hex_hash)
             .map_err(|e| HandlerError::backend(format!("decode fungible petal hash: {e}")))?;

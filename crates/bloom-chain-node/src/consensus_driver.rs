@@ -30,12 +30,22 @@ use bloom_chain_types::{
     types::{Address, Hash32, PubKeyBytes, SigBytes},
     vote::VoteKind,
 };
+use bloom_objects::{OWNER_KIND_ADDRESS, Owner, OwnershipIndexKey, TypeTag};
+use bloom_petal_fungible::ops::decode_coin_value;
+use bloom_script::{CORE_FUNGIBLE_PATH, loom_coin_type_tag};
 use parking_lot::Mutex;
 use tracing::{info, warn};
 
 use crate::{
-    block_store::BlockStore, mempool_persist::MempoolPersist, receipt_store::ReceiptStore,
-    state_blob::StateBlobStore, state_index::StateIndex, transport::PeerPool,
+    block_store::BlockStore,
+    mempool_persist::MempoolPersist,
+    petal_executor::{
+        apply_coin_loom_transfer, apply_coin_loom_transfer_with_domain, mint_coin_loom_to,
+    },
+    receipt_store::ReceiptStore,
+    state_blob::StateBlobStore,
+    state_index::StateIndex,
+    transport::PeerPool,
 };
 
 // ---------------------------------------------------------------------------
@@ -90,11 +100,41 @@ impl PetalExecutor for NoopExecutor {
     ) -> ExecOutput {
         match &tx.kind {
             TxKind::Transfer { to, amount_loom } => {
-                // Move LOOM from sender to recipient.
+                if tx.max_fuel < 100 {
+                    return ExecOutput {
+                        success: false,
+                        fuel_used: 0,
+                        return_data: b"transfer failed: max_fuel below intrinsic fuel".to_vec(),
+                        logs: vec![],
+                        write_set: None,
+                    };
+                }
                 let mut snap = state.snapshot();
-                let mut to_acct = snap.get_account(to).unwrap_or_else(empty_account);
-                to_acct.loom += amount_loom;
-                snap.set_account(*to, to_acct);
+                let Some(coin_type) = resolve_loom_coin_type(state) else {
+                    return ExecOutput {
+                        success: false,
+                        fuel_used: 0,
+                        return_data: b"transfer failed: missing fungible VFS binding".to_vec(),
+                        logs: vec![],
+                        write_set: None,
+                    };
+                };
+                if let Err(e) = apply_coin_loom_transfer(
+                    &mut snap,
+                    tx.sender,
+                    *to,
+                    *amount_loom,
+                    &tx.tx_hash(),
+                    coin_type,
+                ) {
+                    return ExecOutput {
+                        success: false,
+                        fuel_used: 0,
+                        return_data: format!("transfer failed: {e}").into_bytes(),
+                        logs: vec![],
+                        write_set: None,
+                    };
+                }
                 let ws = snap.commit();
                 ExecOutput {
                     success: true,
@@ -113,6 +153,33 @@ impl PetalExecutor for NoopExecutor {
             },
         }
     }
+}
+
+pub fn resolve_loom_coin_type(state: &State) -> Option<TypeTag> {
+    state.vfs_lookup(CORE_FUNGIBLE_PATH).map(loom_coin_type_tag)
+}
+
+pub fn coin_loom_balance(state: &State, owner: Address, coin_type: &TypeTag) -> u128 {
+    let okey = OwnershipIndexKey {
+        owner_kind: OWNER_KIND_ADDRESS,
+        owner_id: owner.0,
+    };
+    state
+        .get_ownership(&okey)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|id| {
+            let obj = state.get_object(&id)?;
+            if obj.type_tag != *coin_type {
+                return None;
+            }
+            match obj.owner {
+                Owner::Address(addr) if addr == owner.0 => decode_coin_value(&obj.payload).ok(),
+                _ => None,
+            }
+        })
+        .try_fold(0u128, |acc, value| acc.checked_add(value))
+        .unwrap_or(u128::MAX)
 }
 
 // ---------------------------------------------------------------------------
@@ -659,23 +726,45 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
             // Handled in the SubmitPtb early-continue branch above.
             TxKind::SubmitPtb { .. } => unreachable!(),
         };
-        let required = max_fee + value;
-        let balance = sender_acct.as_ref().map(|a| a.loom).unwrap_or(0);
+        let required = match max_fee.checked_add(value) {
+            Some(required) => required,
+            None => {
+                receipts.push(Receipt {
+                    tx_hash: tx.tx_hash(),
+                    success: false,
+                    fuel_used: 0,
+                    return_data: b"required Coin<LOOM> overflow".to_vec(),
+                    logs: vec![],
+                });
+                continue;
+            }
+        };
+        let Some(coin_type) = resolve_loom_coin_type(state) else {
+            receipts.push(Receipt {
+                tx_hash: tx.tx_hash(),
+                success: false,
+                fuel_used: 0,
+                return_data: b"missing required VFS binding for /bloom/core/fungible".to_vec(),
+                logs: vec![],
+            });
+            continue;
+        };
+        let balance = coin_loom_balance(state, tx.sender, &coin_type);
         if balance < required {
             receipts.push(Receipt {
                 tx_hash: tx.tx_hash(),
                 success: false,
                 fuel_used: 0,
-                return_data: b"insufficient balance".to_vec(),
+                return_data: b"insufficient Coin<LOOM>".to_vec(),
                 logs: vec![],
             });
             continue;
         }
 
-        // Debit max-fee reservation.
+        // Bump nonce after Coin<LOOM> admission. Value and gas are settled by
+        // object writes, not by account balance fields.
         {
             let mut acct = sender_acct.unwrap_or_else(empty_account);
-            acct.loom -= required;
             acct.nonce += 1;
             state.set_account(tx.sender, acct);
         }
@@ -683,47 +772,47 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
         // 4. Execute via PetalExecutor.
         let output = executor.execute_tx(tx, state, height, timestamp_ms, proposer, parent_hash);
 
-        // 5. Settle fuel and fees.
-        let fuel_refund = tx.max_fuel.saturating_sub(output.fuel_used);
-        let fee_refund = fuel_refund as u128 * tx.fee_per_unit as u128;
-        let fee_earned = output.fuel_used as u128 * tx.fee_per_unit as u128;
-
         if output.success {
-            // Apply write_set FIRST. `WriteSet` carries absolute
-            // post-execution account values (see
-            // `bloom_chain_state::state::AccountDelta::Set`), so applying
-            // it AFTER fee/refund settlement would clobber the proposer
-            // credit or sender refund whenever the executor's snapshot
-            // touched those accounts (e.g. transfer-to-self,
-            // recipient-is-proposer, sender-is-proposer). The snapshot
-            // already reflects the pre-execution max-fee debit, so
-            // settling on top of the post-write_set balance produces the
-            // same numbers minus the clobber hazard. Review 2026-05-19 #5.
             if let Some(ws) = output.write_set
                 && let Err(e) = state.apply(ws)
             {
                 warn!(err = %e, "apply write_set failed");
             }
-
-            // Refund unused fuel.
-            let mut sender = state.get_account(&tx.sender).unwrap_or_else(empty_account);
-            sender.loom += fee_refund;
-            state.set_account(tx.sender, sender);
-
-            // Credit fee to proposer. Re-read after the refund so a
-            // sender-is-proposer tx sees the refund in its base.
-            let mut prop = state.get_account(&proposer).unwrap_or_else(empty_account);
-            prop.loom += fee_earned;
-            state.set_account(proposer, prop);
         } else {
-            // Full max-fee forfeited to proposer (spec §6.4 step 5).
-            let mut prop = state.get_account(&proposer).unwrap_or_else(empty_account);
-            prop.loom += max_fee;
-            state.set_account(proposer, prop);
-            // Value refunded to sender.
-            let mut sender = state.get_account(&tx.sender).unwrap_or_else(empty_account);
-            sender.loom += value;
-            state.set_account(tx.sender, sender);
+            // Failed non-PTB txs forfeit the full max fee. Value was never
+            // debited, so no value refund is needed.
+        }
+
+        // 5. Settle fuel and fees as Coin<LOOM> object transfers.
+        let fee_charged = if output.success {
+            output.fuel_used as u128 * tx.fee_per_unit as u128
+        } else {
+            max_fee
+        };
+        if fee_charged > 0 {
+            let mut fee_snap = state.snapshot();
+            if let Err(e) = apply_coin_loom_transfer_with_domain(
+                &mut fee_snap,
+                tx.sender,
+                proposer,
+                fee_charged,
+                &tx.tx_hash(),
+                coin_type,
+                b"bloom.non_ptb.fee",
+            ) {
+                warn!(err = %e, "non-PTB fee settlement failed");
+                receipts.push(Receipt {
+                    tx_hash: tx.tx_hash(),
+                    success: false,
+                    fuel_used: 0,
+                    return_data: format!("fee settlement failed: {e}").into_bytes(),
+                    logs: vec![],
+                });
+                continue;
+            }
+            if let Err(e) = state.apply(fee_snap.commit()) {
+                warn!(err = %e, "apply fee write_set failed");
+            }
         }
 
         total_fuel_used += output.fuel_used;
@@ -737,11 +826,23 @@ pub fn apply_block_state_transitions<E: PetalExecutor>(
         });
     }
 
-    // 6. LOOM block emission (spec §11.1).
+    // 6. LOOM block emission (spec §11.1), minted as Coin<LOOM>.
+    if block_emission > 0
+        && let Some(coin_type) = resolve_loom_coin_type(state)
     {
-        let mut prop = state.get_account(&proposer).unwrap_or_else(empty_account);
-        prop.loom += block_emission;
-        state.set_account(proposer, prop);
+        let mut snap = state.snapshot();
+        if let Err(e) = mint_coin_loom_to(
+            &mut snap,
+            proposer,
+            block_emission,
+            b"bloom.block.emission",
+            &block.header.block_hash(),
+            coin_type,
+        ) {
+            warn!(err = %e, "block emission mint failed");
+        } else if let Err(e) = state.apply(snap.commit()) {
+            warn!(err = %e, "apply block emission write_set failed");
+        }
     }
 
     (total_fuel_used, receipts)
