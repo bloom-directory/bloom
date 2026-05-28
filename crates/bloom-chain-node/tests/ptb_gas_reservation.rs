@@ -29,6 +29,7 @@ use std::collections::HashMap;
 
 use bloom_chain_node::consensus_driver::{
     apply_block_state_transitions, coin_loom_balance, resolve_loom_coin_type,
+    try_apply_block_state_transitions,
 };
 use bloom_chain_node::petal_executor::{ChainPetalExecutor, ChainPetalExecutorWithManifests};
 use bloom_chain_state::State;
@@ -231,9 +232,9 @@ const NON_OOF_TRAP_PETAL: &str = r#"
 // Outer/inner cap reconciliation
 // ---------------------------------------------------------------------------
 
-/// `tx.max_fuel < ptb.gas_budget` must be rejected at the outer
-/// consensus envelope. No execution, no sender debit, no coin
-/// mutation; only nonce advances (so a re-submission can progress).
+/// `tx.max_fuel < ptb.gas_budget` must make the block invalid at the
+/// outer consensus envelope. No execution, no sender debit, no coin
+/// mutation, and no nonce bump.
 #[test]
 fn outer_max_fuel_lower_than_inner_budget_rejected_at_envelope() {
     let signer = [0x11u8; 32];
@@ -265,27 +266,26 @@ fn outer_max_fuel_lower_than_inner_budget_rejected_at_envelope() {
     let coin_before = coin_value(&state, &gas_payer_id).unwrap();
     let sender_before = balance(&state, &sender);
 
+    let state_before = state.clone();
     let block = make_block(1, proposer, vec![tx]);
     let exec = ChainPetalExecutorWithManifests::new(manifests);
-    let (_fuel, receipts) = apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
+    let err = try_apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION)
+        .expect_err("outer/inner max-fuel mismatch must invalidate the block");
 
-    assert_eq!(receipts.len(), 1);
-    assert!(!receipts[0].success, "outer/inner cap mismatch must reject");
-    assert_eq!(receipts[0].fuel_used, 0, "no fuel consumed");
-    let reason = String::from_utf8_lossy(&receipts[0].return_data);
     assert!(
-        reason.to_lowercase().contains("outer") || reason.contains("max_fuel"),
-        "expected reconciliation revert reason, got: {reason}"
+        err.to_lowercase().contains("outer") || err.contains("max_fuel"),
+        "expected reconciliation error, got: {err}"
     );
 
-    // Coin and sender balance must be untouched. Nonce bumped.
+    // Coin, sender balance, and nonce must be untouched.
+    assert_eq!(state.state_root(), state_before.state_root());
     assert_eq!(coin_value(&state, &gas_payer_id).unwrap(), coin_before);
     assert_eq!(balance(&state, &sender), sender_before);
-    assert_eq!(state.get_account(&sender).unwrap().nonce, 1);
+    assert!(state.get_account(&sender).is_none());
 }
 
-/// `tx.fee_per_unit < ptb.gas_price` must be rejected at the outer
-/// envelope (same shape as the max-fuel check).
+/// `tx.fee_per_unit < ptb.gas_price` must make the block invalid at the
+/// outer envelope (same shape as the max-fuel check).
 #[test]
 fn outer_fee_per_unit_lower_than_inner_price_rejected_at_envelope() {
     let signer = [0x22u8; 32];
@@ -317,21 +317,22 @@ fn outer_fee_per_unit_lower_than_inner_price_rejected_at_envelope() {
     let coin_before = coin_value(&state, &gas_payer_id).unwrap();
     let sender_before = balance(&state, &sender);
 
+    let state_before = state.clone();
     let block = make_block(1, proposer, vec![tx]);
     let exec = ChainPetalExecutorWithManifests::new(manifests);
-    let (_fuel, receipts) = apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
+    let err = try_apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION)
+        .expect_err("outer/inner price mismatch must invalidate the block");
 
-    assert_eq!(receipts.len(), 1);
     assert!(
-        !receipts[0].success,
-        "outer/inner price mismatch must reject"
+        err.contains("fee_per_unit") || err.contains("gas_price"),
+        "expected price reconciliation error, got: {err}"
     );
-    assert_eq!(receipts[0].fuel_used, 0, "no fuel consumed");
 
-    // Coin and sender balance must be untouched. Nonce bumped.
+    // Coin, sender balance, and nonce must be untouched.
+    assert_eq!(state.state_root(), state_before.state_root());
     assert_eq!(coin_value(&state, &gas_payer_id).unwrap(), coin_before);
     assert_eq!(balance(&state, &sender), sender_before);
-    assert_eq!(state.get_account(&sender).unwrap().nonce, 1);
+    assert!(state.get_account(&sender).is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -613,16 +614,19 @@ fn free_vm_work_attempt_is_rejected_before_execution() {
     let proposer_before = balance(&state, &proposer);
     let sender_before = balance(&state, &sender);
 
+    let state_before = state.clone();
     let block = make_block(1, proposer, vec![tx]);
     let exec = ChainPetalExecutorWithManifests::new(manifests);
-    let (fuel, receipts) = apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
+    let err = try_apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION)
+        .expect_err("free VM work attempt must invalidate the block");
 
-    assert_eq!(fuel, 0, "no fuel may be consumed on outer reject");
-    assert_eq!(receipts.len(), 1);
-    assert!(!receipts[0].success);
-    assert_eq!(receipts[0].fuel_used, 0);
+    assert!(
+        err.contains("max_fuel") || err.contains("gas_budget"),
+        "expected outer/inner cap error, got: {err}"
+    );
 
     // Nothing moved — sender, coin, proposer all unchanged.
+    assert_eq!(state.state_root(), state_before.state_root());
     assert_eq!(coin_value(&state, &gas_payer_id).unwrap(), coin_before);
     assert_eq!(balance(&state, &proposer), proposer_before);
     assert_eq!(balance(&state, &sender), sender_before);
@@ -686,13 +690,13 @@ fn sender_coin_loom_never_moves_across_submit_ptb() {
 }
 
 // ---------------------------------------------------------------------------
-// Decode-error path: undecodable PTB bytes should fail at the outer
-// envelope with a clean nonce bump and no other state change. Verifies
-// the consensus_driver decode-error branch (not the executor's branch).
+// Decode-error path: undecodable PTB bytes make the block invalid at the
+// outer envelope. Verifies the consensus_driver decode-error branch
+// (not the executor's branch).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn undecodable_ptb_rejected_at_envelope_with_nonce_bump() {
+fn undecodable_ptb_rejected_at_envelope_without_nonce_bump() {
     let proposer = Address([0x88u8; 32]);
     let sender_seed: u128 = 42;
 
@@ -702,19 +706,20 @@ fn undecodable_ptb_rejected_at_envelope_with_nonce_bump() {
     let (sender, tx) = submit_ptb_tx_with_caps(vec![], 1, 10_000_000, 1);
     fund(&mut state, sender, sender_seed);
 
+    let state_before = state.clone();
     let block = make_block(1, proposer, vec![tx]);
     let exec = ChainPetalExecutor;
-    let (_fuel, receipts) = apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
+    let err = try_apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION)
+        .expect_err("undecodable PTB must invalidate the block");
 
-    assert_eq!(receipts.len(), 1);
-    assert!(!receipts[0].success);
-    assert_eq!(receipts[0].fuel_used, 0);
+    assert!(err.contains("decode failed"), "got: {err}");
+    assert_eq!(state.state_root(), state_before.state_root());
     assert_eq!(
         balance(&state, &sender),
         sender_seed,
         "sender Coin<LOOM> balance must be untouched on outer-envelope decode reject"
     );
-    assert_eq!(state.get_account(&sender).unwrap().nonce, 1);
+    assert!(state.get_account(&sender).is_none());
     assert_eq!(
         balance(&state, &proposer),
         0,

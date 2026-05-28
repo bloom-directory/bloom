@@ -644,59 +644,14 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
         //    Together these guarantee
         //      outer_max_fee = tx.max_fuel * tx.fee_per_unit
         //                    >= ptb.gas_budget * ptb.gas_price.
-        //    If the inner budget exceeds either outer cap we reject at
-        //    consensus — Receipt(success=false, fuel_used=0), no debit,
-        //    no execution. Otherwise the petal executor settles gas
-        //    against the gas-payer `Coin<LOOM>` and credits the proposer
-        //    by minting a `Coin<LOOM>`.
+        //    If the PTB cannot decode or the inner budget exceeds either
+        //    outer cap, the block is invalid. Mempool admission performs the
+        //    same envelope precheck, but committed block validation and
+        //    catch-up sync cannot trust mempool filtering: accepting those
+        //    envelopes as zero-fuel nonce bumps lets a Byzantine proposer
+        //    change state without consuming block fuel.
         if let TxKind::SubmitPtb { ptb_bytes } = &tx.kind {
-            match bloom_script::decode_ptb(ptb_bytes) {
-                Err(e) => {
-                    // Bump nonce so a re-submission can advance, mirroring
-                    // the policy below for the executor-side decode revert
-                    // (sender already passed sender-derivation + nonce).
-                    let mut tx_state = state.clone();
-                    tx_state.register_pubkey(tx.sender, tx.pubkey.clone());
-                    let mut acct = sender_acct.clone().unwrap_or_else(empty_account);
-                    acct.nonce += 1;
-                    tx_state.set_account(tx.sender, acct);
-                    *state = tx_state;
-                    receipts.push(Receipt {
-                        tx_hash: tx.tx_hash(),
-                        success: false,
-                        fuel_used: 0,
-                        return_data: format!("ptb decode error: {e}").into_bytes(),
-                        logs: vec![],
-                    });
-                    continue;
-                }
-                Ok(ptb) => {
-                    let outer_max_fuel_ok = tx.max_fuel >= ptb.gas_budget;
-                    let outer_price_ok = (tx.fee_per_unit as u128) >= ptb.gas_price;
-                    if !outer_max_fuel_ok || !outer_price_ok {
-                        let mut tx_state = state.clone();
-                        tx_state.register_pubkey(tx.sender, tx.pubkey.clone());
-                        let mut acct = sender_acct.clone().unwrap_or_else(empty_account);
-                        acct.nonce += 1;
-                        tx_state.set_account(tx.sender, acct);
-                        *state = tx_state;
-                        let reason = format!(
-                            "outer/inner gas cap mismatch: \
-                             tx.max_fuel={} ptb.gas_budget={} \
-                             tx.fee_per_unit={} ptb.gas_price={}",
-                            tx.max_fuel, ptb.gas_budget, tx.fee_per_unit, ptb.gas_price,
-                        );
-                        receipts.push(Receipt {
-                            tx_hash: tx.tx_hash(),
-                            success: false,
-                            fuel_used: 0,
-                            return_data: reason.into_bytes(),
-                            logs: vec![],
-                        });
-                        continue;
-                    }
-                }
-            }
+            precheck_submit_ptb_envelope(tx, ptb_bytes)?;
 
             let mut tx_state = state.clone();
             tx_state.register_pubkey(tx.sender, tx.pubkey.clone());
@@ -887,6 +842,33 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
     }
 
     Ok((total_fuel_used, receipts))
+}
+
+fn precheck_submit_ptb_envelope(tx: &Tx, ptb_bytes: &[u8]) -> std::result::Result<(), String> {
+    let ptb = bloom_script::decode_ptb(ptb_bytes)
+        .map_err(|e| format!("invalid SubmitPtb envelope: decode failed: {e}"))?;
+    if tx.max_fuel == 0 {
+        return Err("invalid SubmitPtb envelope: outer max_fuel must be non-zero".to_string());
+    }
+    if ptb.gas_budget == 0 {
+        return Err("invalid SubmitPtb envelope: inner gas_budget must be non-zero".to_string());
+    }
+    if ptb.gas_price == 0 {
+        return Err("invalid SubmitPtb envelope: inner gas_price must be non-zero".to_string());
+    }
+    if tx.max_fuel < ptb.gas_budget {
+        return Err(format!(
+            "invalid SubmitPtb envelope: outer max_fuel {} below inner gas_budget {}",
+            tx.max_fuel, ptb.gas_budget
+        ));
+    }
+    if (tx.fee_per_unit as u128) < ptb.gas_price {
+        return Err(format!(
+            "invalid SubmitPtb envelope: outer fee_per_unit {} below inner gas_price {}",
+            tx.fee_per_unit, ptb.gas_price
+        ));
+    }
+    Ok(())
 }
 
 /// Result of deterministic block execution on a scratch state.

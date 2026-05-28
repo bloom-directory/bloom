@@ -8,10 +8,16 @@ use bloom_chain_node::consensus_driver::{
     BLOCK_EMISSION, NoopExecutor, apply_block_state_transitions, validate_block_execution,
 };
 use bloom_chain_state::{Account, State};
-use bloom_chain_types::{receipt::receipts_root, types::Hash32};
+use bloom_chain_types::{
+    receipt::receipts_root,
+    tx::{Tx, TxKind},
+    types::{Hash32, PubKeyBytes, SigBytes},
+};
 use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
 use bloom_petal_fungible::ops::coin_payload;
-use bloom_script::{CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, loom_coin_type_tag};
+use bloom_script::{
+    CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, PtbTx, encode_ptb, loom_coin_type_tag,
+};
 use bloom_test_util::{BlockBuilder, make_addr, make_signed_transfer_tx};
 
 fn fund(state: &mut State, addr: bloom_chain_types::Address, loom: u128) {
@@ -124,4 +130,74 @@ fn tx_max_fuel_sum_above_block_limit_is_rejected_before_execution() {
         .expect_err("block over fuel limit must reject");
 
     assert!(err.contains("exceeds header.fuel_limit"), "got: {err}");
+}
+
+#[test]
+fn zero_fuel_malformed_submit_ptb_is_rejected_before_nonce_bump() {
+    let pubkey = PubKeyBytes(vec![0xAB; 32]);
+    let sender = bloom_chain_types::types::Address::from_pubkey_bytes(&pubkey.0);
+    let tx = Tx {
+        chain_id: "bloom-chain.v0".to_string(),
+        sender,
+        nonce: 1,
+        max_fuel: 0,
+        fee_per_unit: 1,
+        kind: TxKind::SubmitPtb {
+            ptb_bytes: vec![0xCA, 0xFE],
+        },
+        pubkey,
+        sig: SigBytes(vec![0u8; 64]),
+    };
+    let state = State::new();
+    let block = BlockBuilder::at(1)
+        .chain_id("bloom-chain.v0")
+        .proposer(make_addr(0x11))
+        .txs(vec![tx])
+        .fuel_limit(0)
+        .build();
+
+    let err = validate_block_execution(&state, &NoopExecutor, &block, 0)
+        .expect_err("malformed zero-fuel SubmitPtb must invalidate block execution");
+
+    assert!(err.contains("decode failed"), "got: {err}");
+    assert!(
+        state.get_account(&sender).is_none(),
+        "validation must not bump sender nonce on malformed zero-fuel PTB"
+    );
+}
+
+#[test]
+fn zero_gas_submit_ptb_is_rejected_before_nonce_bump() {
+    let pubkey = PubKeyBytes(vec![0xCD; 32]);
+    let sender = bloom_chain_types::types::Address::from_pubkey_bytes(&pubkey.0);
+    let ptb_bytes = encode_ptb(&PtbTx::default()).expect("default PTB encodes");
+    let tx = Tx {
+        chain_id: "bloom-chain.v0".to_string(),
+        sender,
+        nonce: 1,
+        max_fuel: 0,
+        fee_per_unit: 1,
+        kind: TxKind::SubmitPtb { ptb_bytes },
+        pubkey,
+        sig: SigBytes(vec![0u8; 64]),
+    };
+    let state = State::new();
+    let block = BlockBuilder::at(1)
+        .chain_id("bloom-chain.v0")
+        .proposer(make_addr(0x11))
+        .txs(vec![tx])
+        .fuel_limit(0)
+        .build();
+
+    let err = validate_block_execution(&state, &NoopExecutor, &block, 0)
+        .expect_err("zero-gas SubmitPtb must invalidate block execution");
+
+    assert!(
+        err.contains("max_fuel") || err.contains("gas_budget"),
+        "got: {err}"
+    );
+    assert!(
+        state.get_account(&sender).is_none(),
+        "validation must not bump sender nonce on zero-gas PTB"
+    );
 }
