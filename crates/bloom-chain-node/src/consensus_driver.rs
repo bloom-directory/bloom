@@ -932,8 +932,8 @@ pub fn validate_block_execution<E: PetalExecutor>(
 // Default-like helper for Account
 // ---------------------------------------------------------------------------
 
-/// Return an empty account (nonce=0, loom=0, no code, zero storage_root,
-/// no manifest anchor).
+/// Return an empty account (nonce=0, no code, zero storage_root, no manifest
+/// anchor).
 pub(crate) fn empty_account() -> Account {
     Account::empty()
 }

@@ -50,7 +50,6 @@ use tokio::sync::Semaphore;
 use tracing::{debug, error, warn};
 
 use crate::block_store::BlockStore;
-use crate::consensus_driver::{coin_loom_balance, resolve_loom_coin_type};
 use crate::mempool_persist::MempoolPersist;
 
 pub const RPC_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
@@ -331,20 +330,10 @@ impl RpcServer {
             .ok_or_else(|| anyhow!("missing 'address' param"))?;
         let addr = parse_address(addr_str)?;
         let state = self.state.lock();
-        let loom = resolve_loom_coin_type(&state)
-            .map(|coin_type| coin_loom_balance(&state, addr, &coin_type))
-            .unwrap_or(0);
         match state.get_account(&addr) {
-            None if loom == 0 => Ok(json!(null)),
-            None => Ok(json!({
-                "nonce": 0,
-                "loom": loom.to_string(),
-                "code_hash": null,
-                "storage_root": hex::encode(Hash32([0u8; 32]).0),
-            })),
+            None => Ok(json!(null)),
             Some(acct) => Ok(json!({
                 "nonce": acct.nonce,
-                "loom": loom.to_string(),
                 "code_hash": acct.code_hash.map(|h| hex::encode(h.0)),
                 "storage_root": hex::encode(acct.storage_root.0),
             })),
@@ -1049,6 +1038,22 @@ mod tests {
             version: 7,
             payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
         }
+    }
+
+    #[test]
+    fn query_account_does_not_project_coin_balance() {
+        let (server, _tmp) = make_server();
+        let addr = Address([0xA1; 32]);
+        server
+            .state
+            .lock()
+            .set_object(concrete_object(9, "Coin", Owner::Address(addr.0)));
+
+        let account = server
+            .handle_query_account(&json!({ "address": hex::encode(addr.0) }))
+            .unwrap();
+
+        assert!(account.is_null());
     }
 
     #[test]

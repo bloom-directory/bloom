@@ -1426,7 +1426,7 @@ async fn exercise_live_gas_alias_split_merge_and_trap(
     let gas_before_trap = query_object(client, json_str(gas_coin, "id")?)
         .await?
         .ok_or_else(|| anyhow!("gas coin missing before trap"))?;
-    let validator_balances_before = validator_loom_balances(client, tmpdir).await?;
+    let validator_balances_before = validator_coin_balances(client, tmpdir).await?;
     let height_before = current_height(client).await?;
     let trap_ptb = PtbTx {
         signers: vec![ptb_signer_pubkey()],
@@ -1477,7 +1477,7 @@ async fn exercise_live_gas_alias_split_merge_and_trap(
         );
     }
     let proposer = json_str(&trap_block, "proposer")?;
-    let proposer_after = query_account_loom(client, proposer).await?;
+    let proposer_after = query_owned_coin_balance(client, proposer).await?;
     let proposer_before = validator_balances_before
         .get(proposer)
         .copied()
@@ -2681,24 +2681,19 @@ async fn query_object(client: &RpcClient, id_hex: &str) -> Result<Option<Value>>
     Ok(if v.is_null() { None } else { Some(v) })
 }
 
-async fn query_account_loom(client: &RpcClient, addr_hex: &str) -> Result<u128> {
-    let v = client
-        .call(
-            "chain_query_account",
-            serde_json::json!({ "address": addr_hex }),
-        )
-        .await?;
-    if v.is_null() {
-        return Ok(0);
-    }
-    v.get("loom")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("account response missing loom: {v}"))?
-        .parse::<u128>()
-        .with_context(|| format!("parse account loom for {addr_hex}"))
+async fn query_owned_coin_balance(client: &RpcClient, owner_hex: &str) -> Result<u128> {
+    ls_objects_by_owner(client, owner_hex)
+        .await?
+        .into_iter()
+        .filter(|o| o.get("type_name").and_then(Value::as_str) == Some("Coin"))
+        .try_fold(0u128, |acc, obj| {
+            let value = decode_coin_value(&obj)?;
+            acc.checked_add(value)
+                .ok_or_else(|| anyhow!("Coin balance overflow for owner {owner_hex}"))
+        })
 }
 
-async fn validator_loom_balances(
+async fn validator_coin_balances(
     client: &RpcClient,
     tmpdir: &std::path::Path,
 ) -> Result<std::collections::HashMap<String, u128>> {
@@ -2707,7 +2702,7 @@ async fn validator_loom_balances(
         let addr_hex = hex::encode(addr.0);
         out.insert(
             addr_hex.clone(),
-            query_account_loom(client, &addr_hex).await?,
+            query_owned_coin_balance(client, &addr_hex).await?,
         );
     }
     Ok(out)

@@ -139,7 +139,7 @@ pub enum ChainCmd {
 /// `bloom chain query ...` subcommands.
 #[derive(Subcommand, Debug)]
 pub enum QueryCmd {
-    /// JSON: nonce, balance, code_hash, storage_root.
+    /// JSON: nonce, code_hash, storage_root.
     Account {
         /// Address (hex or b1-prefixed).
         addr: String,
