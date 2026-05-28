@@ -174,13 +174,12 @@ fn read_count_le(
             "{section} count {count} exceeds cap {max_count}"
         )));
     }
-    if min_bytes_per_item > 0 {
-        let max_possible = remaining(buf, *off) / min_bytes_per_item;
-        if count > max_possible {
-            return Err(StateError::BlobDecode(format!(
-                "{section} count {count} exceeds remaining bytes"
-            )));
-        }
+    if let Some(max_possible) = remaining(buf, *off).checked_div(min_bytes_per_item)
+        && count > max_possible
+    {
+        return Err(StateError::BlobDecode(format!(
+            "{section} count {count} exceeds remaining bytes"
+        )));
     }
     Ok(count)
 }
