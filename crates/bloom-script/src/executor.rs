@@ -506,7 +506,8 @@ impl<'c> PtbExecutor<'c> {
         // Run attached invariants.
         if let Some(f) = manifest.function(&m.function) {
             for inv in &f.attached_invariants {
-                let used = run_invariant(
+                let before_invariant = *fuel_remaining;
+                let used = match run_invariant(
                     self.petal_runner,
                     &hash,
                     inv,
@@ -515,7 +516,14 @@ impl<'c> PtbExecutor<'c> {
                     cmd_idx,
                     *fuel_remaining,
                     fuel_remaining,
-                )?;
+                ) {
+                    Ok(used) => used,
+                    Err(e) => {
+                        let charged = before_invariant.saturating_sub(*fuel_remaining);
+                        report.fuel_used = report.fuel_used.saturating_add(charged);
+                        return Err(e);
+                    }
+                };
                 report.fuel_used = report.fuel_used.saturating_add(used);
             }
         }
@@ -1721,8 +1729,6 @@ mod tests {
                 external_type_refs: vec![],
             },
         );
-        let mut runner = MockPetalRunner::new();
-        runner.set(petal, "load", build_outputs(&[&src_id.0]), 10);
         let tx = sample_signed_ptb(
             signer,
             gas_id,
@@ -1750,11 +1756,17 @@ mod tests {
             ],
         );
 
-        let report = run(&chain, &runner, tx);
-        assert!(!report.success);
+        let verifier = AlwaysOkVerifier;
+        let vctx = ValidationContext {
+            current_block: chain.block,
+            chain: &chain,
+            verifier: &verifier,
+            loom_coin_type: loom_tt(),
+        };
+        let err = validate_ptb(&tx, &vctx).unwrap_err();
         assert!(matches!(
-            report.reverted_with,
-            Some(PtbError::BuiltinFailed { reason, .. }) if reason.contains("not a Coin")
+            err,
+            PtbError::BuiltinFailed { reason, .. } if reason.contains("not a Coin")
         ));
     }
 
@@ -1787,6 +1799,7 @@ mod tests {
         runner.set(petal, "load", build_outputs(&[&coin_id.0]), 10);
 
         let other = [0x22; 32];
+
         let tx = sample_signed_ptb(
             signer,
             gas_id,
@@ -1979,9 +1992,8 @@ mod tests {
 
     #[test]
     fn second_command_revert_discards_first_writes() {
-        // Command 0 mutates a Coin via a wasm call (returns garbage so
-        // the executor's Move handler succeeds); command 1 tries to
-        // SplitCoins from a non-existent transient → revert.
+        // Command 0 returns a typed coin id that is absent from the borrow
+        // table; command 1 typechecks but fails at execution and must revert.
         let chain = MockChain::new();
         let (petal, signer, gas_id) = build_pkg(&chain);
         chain.put_petal(
@@ -1993,7 +2005,7 @@ mod tests {
                     name: "noop".to_string(),
                     type_params: vec![],
                     args: vec![],
-                    returns: vec![],
+                    returns: vec![loom_tt()],
                     attached_invariants: vec![],
                 }],
                 object_types: vec![],
@@ -2001,7 +2013,7 @@ mod tests {
             },
         );
         let mut runner = MockPetalRunner::new();
-        runner.set(petal, "noop", build_outputs(&[]), 1);
+        runner.set(petal, "noop", build_outputs(&[&[0xEE; 32]]), 1);
         let tx = sample_signed_ptb(
             signer,
             gas_id,
@@ -2015,11 +2027,10 @@ mod tests {
                     type_args: vec![],
                     args: vec![],
                 }),
-                // Bad split: refers to ret_idx 99 of cmd 0, which has no returns.
                 Command::SplitCoins {
                     src: UseRef {
                         cmd_idx: 0,
-                        ret_idx: 99,
+                        ret_idx: 0,
                     },
                     amounts: vec![1],
                 },
@@ -2193,11 +2204,17 @@ mod tests {
             ],
         );
 
-        let report = run(&chain, &runner, tx);
-        assert!(!report.success);
+        let verifier = AlwaysOkVerifier;
+        let vctx = ValidationContext {
+            current_block: chain.block,
+            chain: &chain,
+            verifier: &verifier,
+            loom_coin_type: loom_tt(),
+        };
+        let err = validate_ptb(&tx, &vctx).unwrap_err();
         assert!(matches!(
-            report.reverted_with,
-            Some(PtbError::BuiltinFailed { reason, .. }) if reason.contains("not a Coin")
+            err,
+            PtbError::BuiltinFailed { reason, .. } if reason.contains("not a Coin")
         ));
     }
 
@@ -2247,6 +2264,57 @@ mod tests {
             report.reverted_with,
             Some(PtbError::InvariantFailed { .. })
         ));
+    }
+
+    #[test]
+    fn invariant_out_of_fuel_charges_remaining_fuel() {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        chain.put_petal(
+            petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/p".to_string(),
+                functions: vec![FunctionDeclStub {
+                    name: "f".to_string(),
+                    type_params: vec![],
+                    args: vec![],
+                    returns: vec![],
+                    attached_invariants: vec![InvariantDeclStub {
+                        name: "oof".to_string(),
+                        wasm_export: "__inv_oof".to_string(),
+                        argspec: vec![],
+                    }],
+                }],
+                object_types: vec![],
+                external_type_refs: vec![],
+            },
+        );
+        let mut runner = MockPetalRunner::new();
+        runner.set(petal, "f", build_outputs(&[]), 1);
+        runner
+            .inv
+            .insert((petal, "__inv_oof".to_string()), (true, 2_000_000));
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/p".to_string(),
+                    hash: Some(petal),
+                },
+                function: "f".to_string(),
+                type_args: vec![],
+                args: vec![],
+            })],
+        );
+        let report = run(&chain, &runner, tx);
+        assert!(!report.success);
+        assert!(matches!(
+            report.reverted_with,
+            Some(PtbError::OutOfFuel { .. })
+        ));
+        assert_eq!(report.fuel_used, 1_000_000);
     }
 
     #[test]

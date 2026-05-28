@@ -557,10 +557,7 @@ impl Node {
                             let block_opt =
                                 { driver_ev.engine.lock().get_registered_block(&p.block_hash) };
                             if let Some(block) = block_opt {
-                                let header_round = {
-                                    let eng = driver_ev.engine.lock();
-                                    proposal_header_round(&eng, p.block_hash, p.round, p.pol_round)
-                                };
+                                let header_round = proposal_header_round(p.round, p.pol_round);
                                 if let Err(e) = driver_ev.validate_proposal_block(
                                     &block,
                                     p.height,
@@ -714,7 +711,12 @@ impl Node {
                                 let eng = driver_ev.engine.lock();
                                 (
                                     eng.round(),
-                                    block_response_header_round(&eng, block_hash, eng.round()),
+                                    block_response_header_round(
+                                        &eng,
+                                        block_hash,
+                                        eng.round(),
+                                        block.header.proposer,
+                                    ),
                                 )
                             };
                             if has_commit {
@@ -730,12 +732,14 @@ impl Node {
                                     );
                                     continue;
                                 }
-                            } else if let Err(e) = driver_ev.validate_proposal_block(
-                                &block,
-                                block_height,
-                                round,
-                                header_round,
-                            ) {
+                            } else if let Some(header_round) = header_round
+                                && let Err(e) = driver_ev.validate_proposal_block(
+                                    &block,
+                                    block_height,
+                                    round,
+                                    header_round,
+                                )
+                            {
                                 warn!(
                                     peer = %peer_addr,
                                     height = block_height,
@@ -1239,17 +1243,9 @@ fn reload_persisted_mempool(
     Ok(())
 }
 
-fn proposal_header_round(
-    engine: &ConsensusEngine<XdsaVerifier>,
-    block_hash: Hash32,
-    proposal_round: u32,
-    pol_round: i32,
-) -> u32 {
+fn proposal_header_round(proposal_round: u32, pol_round: i32) -> u32 {
     if pol_round >= 0 {
-        let pol_round = pol_round as u32;
-        if engine.state.valid_block == Some((pol_round, block_hash)) {
-            return pol_round;
-        }
+        return pol_round as u32;
     }
     proposal_round
 }
@@ -1257,19 +1253,27 @@ fn proposal_header_round(
 fn block_response_header_round(
     engine: &ConsensusEngine<XdsaVerifier>,
     block_hash: Hash32,
-    current_round: u32,
-) -> u32 {
+    _current_round: u32,
+    header_proposer: Address,
+) -> Option<u32> {
     if let Some(pending) = engine.state.pending_proposal.as_ref()
         && pending.block_hash == block_hash
     {
-        return proposal_header_round(engine, block_hash, pending.round, pending.pol_round);
+        return Some(proposal_header_round(pending.round, pending.pol_round));
     }
     if let Some((valid_round, valid_hash)) = engine.state.valid_block
         && valid_hash == block_hash
     {
-        return valid_round;
+        return Some(valid_round);
     }
-    current_round
+    (0..engine.state.validator_set().len() as u32).find(|&round| {
+        engine
+            .state
+            .validator_set()
+            .proposer_for(engine.state.height, round)
+            .address
+            == header_proposer
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1605,5 +1609,54 @@ mod tests {
 
         reload_persisted_mempool(&mut engine, &shared_state, &mempool_persist).unwrap();
         assert_eq!(engine.mempool.len(), 1);
+    }
+
+    #[test]
+    fn block_response_header_round_recovers_original_proposer_round() {
+        let v1 = make_validator_with_keypair();
+        let v2 = make_validator_with_keypair();
+        let v3 = make_validator_with_keypair();
+        let v4 = make_validator_with_keypair();
+        let validator_set = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
+        let mut engine = ConsensusEngine::new(
+            1,
+            v1.addr,
+            validator_set.clone(),
+            XdsaVerifier,
+            None,
+            30_000_000,
+            None,
+        );
+        engine.state.round = 0;
+        let header_proposer = validator_set.proposer_for(1, 0).address;
+
+        let header_round =
+            block_response_header_round(&engine, Hash32([0x42; 32]), 0, header_proposer);
+
+        assert_eq!(header_round, Some(0));
+    }
+
+    #[test]
+    fn proposal_header_round_uses_pol_round_without_local_valid_block() {
+        let v1 = make_validator_with_keypair();
+        let v2 = make_validator_with_keypair();
+        let v3 = make_validator_with_keypair();
+        let v4 = make_validator_with_keypair();
+        let validator_set = make_validator_set_signed(&[&v1, &v2, &v3, &v4], 100);
+        let mut engine = ConsensusEngine::new(
+            1,
+            v1.addr,
+            validator_set,
+            XdsaVerifier,
+            None,
+            30_000_000,
+            None,
+        );
+        engine.state.round = 2;
+        engine.state.valid_block = None;
+
+        let header_round = proposal_header_round(2, 0);
+
+        assert_eq!(header_round, 0);
     }
 }

@@ -190,15 +190,55 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
                         .collect(),
                 );
             }
-            // Built-ins: the executor materialises outputs for these
-            // (32-byte object ids for the linear builtins, 32-byte
-            // wasm hash for Publish/Upgrade). The validator does not
-            // yet propagate concrete types for these slots — `None`
-            // means "accept any consumer type" at the upstream end.
             Command::TransferObjects { .. } => cmd_return_types.push(vec![]),
-            Command::MergeCoins(_) => cmd_return_types.push(vec![None]),
+            Command::MergeCoins(uses) => {
+                let Some((first, rest)) = uses.split_first() else {
+                    return Err(PtbError::BuiltinFailed {
+                        cmd_idx: cmd_idx as u16,
+                        reason: "MergeCoins requires at least one Use".to_string(),
+                    });
+                };
+                let coin_type = resolve_required_use_type(
+                    &cmd_return_types,
+                    *first,
+                    cmd_idx,
+                    "MergeCoins input",
+                )?;
+                if !is_coin_type_tag(&coin_type) {
+                    return Err(PtbError::BuiltinFailed {
+                        cmd_idx: cmd_idx as u16,
+                        reason: "MergeCoins input is not a Coin<T>".to_string(),
+                    });
+                }
+                for u in rest {
+                    let next = resolve_required_use_type(
+                        &cmd_return_types,
+                        *u,
+                        cmd_idx,
+                        "MergeCoins input",
+                    )?;
+                    if next != coin_type {
+                        return Err(PtbError::BuiltinFailed {
+                            cmd_idx: cmd_idx as u16,
+                            reason: "MergeCoins: heterogeneous coin types".to_string(),
+                        });
+                    }
+                }
+                cmd_return_types.push(vec![Some(coin_type)]);
+            }
             Command::SplitCoins { amounts, .. } => {
-                cmd_return_types.push(vec![None; amounts.len()]);
+                let Command::SplitCoins { src, .. } = cmd else {
+                    unreachable!("matched SplitCoins")
+                };
+                let coin_type =
+                    resolve_required_use_type(&cmd_return_types, *src, cmd_idx, "SplitCoins src")?;
+                if !is_coin_type_tag(&coin_type) {
+                    return Err(PtbError::BuiltinFailed {
+                        cmd_idx: cmd_idx as u16,
+                        reason: "SplitCoins source is not a Coin<T>".to_string(),
+                    });
+                }
+                cmd_return_types.push(vec![Some(coin_type); amounts.len()]);
             }
             Command::MakeMoveVec { .. } => cmd_return_types.push(vec![None]),
             Command::Publish(p) => {
@@ -493,6 +533,31 @@ fn resolve_use_type(
         ret_idx: u.ret_idx,
     })?;
     Ok(slot.clone())
+}
+
+fn resolve_required_use_type(
+    cmd_return_types: &[Vec<Option<TypeTag>>],
+    u: UseRef,
+    referring_cmd_idx: usize,
+    context: &str,
+) -> Result<TypeTag, PtbError> {
+    resolve_use_type(cmd_return_types, u, referring_cmd_idx)?.ok_or_else(|| {
+        PtbError::BuiltinFailed {
+            cmd_idx: referring_cmd_idx as u16,
+            reason: format!("{context} must reference a typed object output"),
+        }
+    })
+}
+
+fn is_coin_type_tag(t: &TypeTag) -> bool {
+    matches!(
+        t,
+        TypeTag::Concrete {
+            type_name,
+            type_args,
+            ..
+        } if type_name == "Coin" && type_args.len() == 1
+    )
 }
 
 /// Apply a function-level type-arg substitution to a `TypeTag`,
@@ -1740,6 +1805,79 @@ mod tests {
         };
         let verifier = AlwaysOkVerifier;
         assert!(validate_ptb(&tx, &ctx(&chain, &verifier)).is_ok());
+    }
+
+    #[test]
+    fn split_coin_output_preserves_type_across_use_edge() {
+        let (chain, signer, gas_id) = setup();
+        let erased_coin = TypeTag::Concrete {
+            petal_hash: [0u8; 32],
+            type_name: "Coin".to_string(),
+            type_args: vec![concrete("Erased")],
+        };
+        let mut m = sample_manifest();
+        m.functions.push(FunctionDeclStub {
+            name: "producer".to_string(),
+            type_params: vec![],
+            args: vec![],
+            returns: vec![loom_coin_tt()],
+            attached_invariants: vec![],
+        });
+        m.functions.push(FunctionDeclStub {
+            name: "consumer".to_string(),
+            type_params: vec![],
+            args: vec![ArgDeclStub::Object {
+                ty: erased_coin,
+                mode: AccessMode::Mutable,
+            }],
+            returns: vec![],
+            attached_invariants: vec![],
+        });
+        chain.put_petal(Hash32([0xAB; 32]), vec![], m);
+        let tx = PtbTx {
+            signers: vec![signer],
+            commands: vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/bloom/dex/pool".to_string(),
+                        hash: Some(Hash32([0xAB; 32])),
+                    },
+                    function: "producer".to_string(),
+                    type_args: vec![],
+                    args: vec![],
+                }),
+                Command::SplitCoins {
+                    src: UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    },
+                    amounts: vec![1],
+                },
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/bloom/dex/pool".to_string(),
+                        hash: Some(Hash32([0xAB; 32])),
+                    },
+                    function: "consumer".to_string(),
+                    type_args: vec![],
+                    args: vec![Arg::Use {
+                        cmd_idx: 1,
+                        ret_idx: 0,
+                    }],
+                }),
+            ],
+            gas_payer: gas_id,
+            gas_budget: 100,
+            gas_price: 1,
+            expiry_block: 100,
+            signatures: vec![PqSignature(vec![0xCC; 8])],
+        };
+        let verifier = AlwaysOkVerifier;
+        let err = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap_err();
+        assert!(
+            matches!(err, PtbError::TypeMismatch { ref reason, .. } if reason.contains("LOOM") && reason.contains("Erased")),
+            "expected split output type mismatch, got {err:?}"
+        );
     }
 
     /// An Object arg whose on-chain `type_tag` does not match the

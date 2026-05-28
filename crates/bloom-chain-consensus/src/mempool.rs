@@ -102,9 +102,19 @@ impl<V: SigVerifier> Mempool<V> {
             });
         }
 
-        // 3. Balance check: sender must cover max_fuel * fee_per_unit + optional value.
+        // 3. Balance check.
+        //
+        // Transfer/DeployPetal reserve against the outer sender. SubmitPtb is
+        // gas-object funded instead: block execution charges the decoded
+        // `ptb.gas_payer`, not `tx.sender`, so this generic mempool layer
+        // must not reject sponsored PTBs based on the relayer's LOOM balance.
         let fee_reservation = (tx.max_fuel as u128).saturating_mul(tx.fee_per_unit as u128);
         let value = tx_value(&tx);
+        let current_balance = if matches!(tx.kind, TxKind::SubmitPtb { .. }) {
+            u128::MAX
+        } else {
+            current_balance
+        };
         let need =
             fee_reservation
                 .checked_add(value)

@@ -3,6 +3,7 @@
 //! Mempool unit tests.
 
 use bloom_chain_consensus::{ConsensusError, Mempool, NoopVerifier, RejectAllVerifier};
+use bloom_chain_types::tx::TxKind;
 use bloom_chain_types::types::Address;
 use bloom_test_util::{make_addr_derived, make_mempool_tx};
 
@@ -97,6 +98,19 @@ fn reject_transfer_reservation_overflow() {
             have: u128::MAX
         }
     ));
+}
+
+#[test]
+fn submit_ptb_admission_does_not_charge_outer_sender_balance() {
+    let mut mp = Mempool::new(NoopVerifier);
+    let mut tx = make_mempool_tx(1, 1, 10, 100, 0);
+    tx.kind = TxKind::SubmitPtb {
+        ptb_bytes: vec![0xCA, 0xFE],
+    };
+
+    mp.admit(tx, 0, 0)
+        .expect("sponsored PTB admission must not require relayer LOOM");
+    assert_eq!(mp.len(), 1);
 }
 
 #[test]
