@@ -99,8 +99,8 @@ pub struct ChainStoreData {
     pub chain_ctx: ChainCtx,
     pub petal_hash: Hash32,
     /// Per-PTB host context (spec §16.2 borrow table, signers, logs,
-    /// loom deltas, …) shared between the wasm host imports installed by
-    /// `link_new_host_imports` and the surrounding `PtbExecutor`.
+    /// host-created object state, ...) shared between the wasm host imports
+    /// installed by `link_new_host_imports` and the surrounding `PtbExecutor`.
     ///
     /// `None` is only used by low-level tests that exercise the linker without a
     /// surrounding PTB executor.

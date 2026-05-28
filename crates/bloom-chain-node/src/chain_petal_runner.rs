@@ -11,8 +11,8 @@
 //!   constant on hash bytes either way).
 //! - An `Arc<Mutex<PtbHostCtx>>` shared with the chain-node executor
 //!   wiring so the §16.2 host imports installed by `chain_vm.rs`
-//!   mutate the same borrow table / logs / loom-delta vectors the
-//!   `PtbExecutor` later drains.
+//!   mutate the same borrow table, logs, and host-created object state
+//!   the `PtbExecutor` later drains.
 //! - A `Mutex<StateSnapshot>` that threads the chain `WriteSet`
 //!   through successive Move calls inside the same PTB. Between two
 //!   adjacent `Command::Move` commands, any host-import mutations

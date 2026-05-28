@@ -638,7 +638,7 @@ fn free_vm_work_attempt_is_rejected_before_execution() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn sender_account_loom_never_moves_across_submit_ptb() {
+fn sender_coin_loom_never_moves_across_submit_ptb() {
     let signer = [0x66u8; 32];
     let gas_payer_id = ObjectId([0xEF; 32]);
     let proposer = Address([0xFE; 32]);

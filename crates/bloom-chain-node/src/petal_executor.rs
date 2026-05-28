@@ -844,7 +844,7 @@ fn execute_tx_impl(
                     // end of `execute(...)` (success path) and
                     // folds host-attributed entries (created
                     // objects, host deletes, host ownership
-                    // changes, loom deltas, logs) into the
+                    // changes, logs) into the
                     // `ExecutionReport`. We don't need a separate
                     // drain step here — the host_ctx behind the
                     // Arc has already been std::mem::take'n.
