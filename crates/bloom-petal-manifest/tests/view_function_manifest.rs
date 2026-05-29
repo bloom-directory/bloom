@@ -110,8 +110,10 @@ fn function_decl_view_flag_round_trips() {
 
 #[test]
 fn schema_version_is_bumped_for_view_function_layout() {
+    let manifest = PetalManifestV0::default();
+
     assert!(
-        SCHEMA_VERSION >= 2,
+        manifest.schema_version >= 2,
         "adding FunctionDecl.view changes the positional manifest layout"
     );
 }

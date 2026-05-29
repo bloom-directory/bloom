@@ -437,7 +437,7 @@ fn one_byte(tag: &TypeTag, bytes: &[u8]) -> Result<u8, JsonAbiError> {
 
 fn fixed<const N: usize>(tag: &TypeTag, bytes: &[u8]) -> Result<[u8; N], JsonAbiError> {
     if bytes.len() != N {
-        return Err(mismatch(tag, &format!("expected {N} bytes")));
+        return Err(mismatch(tag, format!("expected {N} bytes")));
     }
     let mut out = [0u8; N];
     out.copy_from_slice(bytes);
