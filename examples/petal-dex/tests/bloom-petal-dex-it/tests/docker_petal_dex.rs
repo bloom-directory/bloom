@@ -294,9 +294,11 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
         expiry_block: PTB_EXPIRY_BLOCK,
         signatures: vec![],
     };
-    let bad_sig_receipt =
-        submit_ptb_with_bad_inner_signature(&home0, HOST_RPC_PORTS[0], bad_sig_ptb)?;
-    assert_reverted(&bad_sig_receipt, "bad inner PTB signature")?;
+    assert_submit_rejected(
+        submit_ptb_with_bad_inner_signature(&home0, HOST_RPC_PORTS[0], bad_sig_ptb),
+        "bad inner PTB signature",
+        "signature verification failed for signer index 0",
+    )?;
 
     // ── 4. faucet.mint ×2 → create_pool (one atomic PTB) ──────────────────
     eprintln!();
@@ -910,11 +912,10 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
         expiry_block: PTB_EXPIRY_BLOCK,
         signatures: vec![],
     };
-    let bad_sig_real_receipt =
-        submit_ptb_with_bad_inner_signature(&home0, HOST_RPC_PORTS[0], bad_sig_real_swap)?;
-    assert_reverted(
-        &bad_sig_real_receipt,
+    assert_submit_rejected(
+        submit_ptb_with_bad_inner_signature(&home0, HOST_RPC_PORTS[0], bad_sig_real_swap),
         "bad inner PTB signature on stateful swap",
+        "signature verification failed for signer index 0",
     )?;
     let pool_after_bad_sig = query_object(client0, pool_id_hex)
         .await?
@@ -950,8 +951,11 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
         expiry_block: PTB_EXPIRY_BLOCK,
         signatures: vec![],
     };
-    let stale_receipt = submit_ptb(&home0, HOST_RPC_PORTS[0], stale_ptb)?;
-    assert_reverted(&stale_receipt, "stale shared Pool version")?;
+    assert_submit_rejected(
+        submit_ptb(&home0, HOST_RPC_PORTS[0], stale_ptb),
+        "stale shared Pool version",
+        "version mismatch",
+    )?;
     let pool_after_stale = query_object(client0, pool_id_hex)
         .await?
         .ok_or_else(|| anyhow!("pool object disappeared after stale-version attempt"))?;
@@ -1088,8 +1092,11 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
         expiry_block: PTB_EXPIRY_BLOCK,
         signatures: vec![],
     };
-    let steal_receipt = submit_ptb(&home0, HOST_RPC_PORTS[0], steal_ptb)?;
-    assert_reverted(&steal_receipt, "Consume access to shared Pool")?;
+    assert_submit_rejected(
+        submit_ptb(&home0, HOST_RPC_PORTS[0], steal_ptb),
+        "Consume access to shared Pool",
+        "shared objects cannot be consumed",
+    )?;
 
     latest = current_height(client0).await?;
     wait_all_reach_height(&clients, latest).await?;
@@ -1214,6 +1221,20 @@ fn assert_reverted(receipt: &Value, label: &str) -> Result<()> {
     Ok(())
 }
 
+fn assert_submit_rejected(result: Result<Value>, label: &str, expected: &str) -> Result<()> {
+    match result {
+        Ok(receipt) => bail!("{label} unexpectedly submitted: {receipt}"),
+        Err(err) => {
+            let msg = format!("{err:#}");
+            if !msg.contains(expected) {
+                bail!("{label} rejected for the wrong reason: {msg}");
+            }
+            eprintln!("            rejected {label}: {msg}");
+        }
+    }
+    Ok(())
+}
+
 struct LiveGasAliasEnv<'a> {
     client: &'a RpcClient,
     clients: &'a [RpcClient],
@@ -1247,10 +1268,10 @@ async fn exercise_live_gas_alias_split_merge_and_trap(
         split_src,
     } = coins;
     let gas_payer = obj_id_from_hex(gas_coin)?;
-    let gas_version = object_version(gas_coin)?;
     let gas_before_alias = query_object(client, json_str(gas_coin, "id")?)
         .await?
         .ok_or_else(|| anyhow!("gas coin missing before alias attempt"))?;
+    let gas_version = object_version(&gas_before_alias)?;
     let gas_alias_ptb = PtbTx {
         signers: vec![ptb_signer_pubkey()],
         commands: vec![PtbCommand::Move(MoveCmd {
@@ -1269,8 +1290,11 @@ async fn exercise_live_gas_alias_split_merge_and_trap(
         expiry_block: PTB_EXPIRY_BLOCK,
         signatures: vec![],
     };
-    let gas_alias_receipt = submit_ptb(home0, HOST_RPC_PORTS[0], gas_alias_ptb)?;
-    assert_reverted(&gas_alias_receipt, "gas-payer alias as PTB object input")?;
+    assert_submit_rejected(
+        submit_ptb(home0, HOST_RPC_PORTS[0], gas_alias_ptb),
+        "gas-payer alias as PTB object input",
+        "gas payer cannot also be used as a PTB object input",
+    )?;
     let gas_after_alias = query_object(client, json_str(gas_coin, "id")?)
         .await?
         .ok_or_else(|| anyhow!("gas coin missing after alias attempt"))?;
