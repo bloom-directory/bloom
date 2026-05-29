@@ -92,6 +92,10 @@ pub enum TxEngineError {
     PrivateProviderChainMismatch { provider: String, chain_id: u64 },
     #[error("tx '{id}' is in status {status}, expected pending or unmined sent")]
     InvalidTxStatus { id: String, status: String },
+    #[error(
+        "Enso quote is {age}s old (expires ~5 min) — re-run the intent for a fresh route, or write 'override' to broadcast anyway"
+    )]
+    EnsoQuoteStale { age: u64 },
 }
 
 /// In-memory cache for ERC-20 metadata keyed by `(chain_id, address)`.
@@ -156,6 +160,12 @@ struct TokenMeta {
     decimals: u8,
 }
 
+/// Per-(wallet, chain, from) stage-serialisation lock map.
+/// Outer lock: `parking_lot` (held microseconds for HashMap lookup/insert).
+/// Inner lock: `tokio` async mutex (held for the stage critical section).
+type NonceLocks =
+    Arc<parking_lot::Mutex<HashMap<(String, String, Address), Arc<tokio::sync::Mutex<()>>>>>;
+
 /// Stage / confirm the lifecycle.
 #[derive(Clone)]
 pub struct TxEngine {
@@ -177,6 +187,12 @@ pub struct TxEngine {
     /// signed raw txs privately when `policy.private.enabled` is set
     /// (mainnet only — see `MAINNET_CHAIN_ID`).
     private_rpcs: PrivateRpcs,
+    /// Per-(wallet, chain, from) async mutex that serialises the
+    /// read-chain-nonce → check-pending → write-pending critical section
+    /// in `stage()`. The outer `parking_lot::Mutex` is held for
+    /// microseconds only (HashMap lookup/insert); the inner
+    /// `tokio::sync::Mutex` is the actual per-sender stage lock.
+    nonce_locks: NonceLocks,
 }
 
 impl TxEngine {
@@ -190,7 +206,27 @@ impl TxEngine {
             price_oracle: None,
             mempool_indexes: Arc::new(RwLock::new(BTreeMap::new())),
             private_rpcs: Arc::new(RwLock::new(BTreeMap::new())),
+            nonce_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Return (or create) the per-(wallet, chain, from) `tokio::sync::Mutex`
+    /// used to serialise nonce assignment in `stage()`. The outer
+    /// `parking_lot::Mutex` is held only for the HashMap lookup/insert
+    /// (~microseconds); callers then `.lock().await` the returned
+    /// `Arc<tokio::sync::Mutex<()>>` to cover the critical section.
+    fn nonce_lock_for(
+        &self,
+        wallet: &str,
+        chain: &str,
+        from: Address,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let key = (wallet.to_string(), chain.to_string(), from);
+        self.nonce_locks
+            .lock()
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Register the `PendingTxIndex` for `chain`. Calling stage on this
@@ -742,9 +778,26 @@ impl TxEngine {
                 "tx.staging.session_degraded"
             );
         }
+        // Acquire a per-(wallet, chain, from) async mutex so concurrent
+        // stage() calls for the same sender serialise here. The guard
+        // lives until the end of stage(), covering write_pending, so two
+        // callers can't both read nonce=0 and commit pending entries with
+        // the same nonce.
+        let nonce_mutex = self.nonce_lock_for(wallet, &spec.name, from);
+        let _nonce_guard = nonce_mutex.lock().await;
         let nonce = match intent.nonce {
             Some(n) => n,
-            None => session.nonce(from).await?,
+            None => {
+                let chain_nonce = session.nonce(from).await?;
+                let pending_high = self
+                    .outbox
+                    .highest_pending_nonce(wallet, &spec.name, from)?;
+                // If there are staged-but-unconfirmed txs, use the slot
+                // after the highest pending nonce. After broadcast they
+                // move to sent/ and the chain RPC returns the updated
+                // next nonce — no stale-data risk once the queue drains.
+                pending_high.map_or(chain_nonce, |h| chain_nonce.max(h + 1))
+            }
         };
         // Check for an externally-observed pending tx at this (from, nonce).
         // Body is computed up-front but written only after write_pending
@@ -786,8 +839,15 @@ impl TxEngine {
                 buffered.max(21_000)
             }
             Err(e) => {
-                tracing::warn!(error = %e, "estimate_gas failed; using 500k fallback");
-                500_000
+                // Use the hint from the external estimator (e.g. Enso) when
+                // available, applying the same 25% buffer. Fall back to 500k
+                // only if no hint was provided.
+                let fallback = intent
+                    .gas_limit_hint
+                    .map(|h| (h.saturating_mul(125) / 100).min(30_000_000))
+                    .unwrap_or(500_000);
+                tracing::warn!(error = %e, fallback, "estimate_gas failed");
+                fallback
             }
         };
 
@@ -1041,6 +1101,16 @@ impl TxEngine {
                 "tx.policy_denied"
             );
             return Err(TxEngineError::PolicyDenied);
+        }
+
+        // Enso quotes embed a ~5-minute deadline. Warn before wasting gas.
+        const ENSO_QUOTE_MAX_AGE_SECS: u64 = 300;
+        let now_secs = (now_ms() / 1000) as u64;
+        if let Some(age) = enso_quote_age_secs(&staged.data_hex, now_secs)
+            && age > ENSO_QUOTE_MAX_AGE_SECS
+            && !override_text
+        {
+            return Err(TxEngineError::EnsoQuoteStale { age });
         }
 
         // Broadcast gate: never broadcast to mainnet by default.
@@ -1381,6 +1451,37 @@ fn decode_data(s: &str) -> Result<Bytes, TxEngineError> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     let v = hex::decode(s).map_err(|e| TxEngineError::Amount(format!("data: {e}")))?;
     Ok(Bytes::from(v))
+}
+
+/// Parse the Enso quote age in seconds from calldata, if present.
+/// Enso appends a raw JSON blob starting with `{"Source":"Enso` to every
+/// route calldata. Returns `None` for non-Enso calldata or parse failures.
+fn enso_quote_age_secs(data_hex: &str, now_secs: u64) -> Option<u64> {
+    let bytes = hex::decode(data_hex.trim_start_matches("0x")).ok()?;
+    const MARKER: &[u8] = b"{\"Source\":\"Enso";
+    let pos = bytes.windows(MARKER.len()).position(|w| w == MARKER)?;
+    // Marker found — try to extract timestamp.
+    let v: serde_json::Value = match serde_json::Deserializer::from_slice(&bytes[pos..])
+        .into_iter()
+        .next()
+    {
+        Some(Ok(val)) => val,
+        other => {
+            tracing::warn!(?other, "enso.calldata.marker_found_parse_failed");
+            return None;
+        }
+    };
+    let ts = match v["Timestamp"].as_u64() {
+        Some(t) => t,
+        None => {
+            tracing::warn!(enso_json = %v, "enso.calldata.timestamp_missing");
+            return None;
+        }
+    };
+    now_secs.checked_sub(ts).or_else(|| {
+        tracing::warn!(enso_ts = ts, now = now_secs, "enso.quote.future_timestamp");
+        None
+    })
 }
 
 fn now_ms() -> u128 {
@@ -2086,7 +2187,7 @@ mod tests {
     /// an explicit erc721 hint we never dial the RPC. Selector must be
     /// the canonical ERC-721 approve (0x095ea7b3).
     #[tokio::test]
-    async fn resolve_intent_body_nft_approve_emits_erc721_approve_selector() {
+    async fn resolve_intent_body_nft_approve_errors_on_unreachable_rpc() {
         use bloom_proto::intent::RawIntentBody;
         // We have no hint on `NftApprove`, so the chain probe runs; with
         // an unreachable URL it errors. Use the resolver directly to
@@ -2212,6 +2313,103 @@ mod tests {
             Err(TxEngineError::PolicyDenied) => panic!("override token did not bypass warn"),
             Ok(_) => panic!("unexpected broadcast success on unreachable RPC"),
             Err(_) => {}
+        }
+    }
+
+    /// A hard-Deny policy check must block confirm() before broadcast,
+    /// return PolicyDenied, and move the outbox entry to Failed.
+    #[tokio::test]
+    async fn policy_hard_deny_blocks_confirm_and_marks_failed() {
+        use bloom_proto::policy::{PolicyCheck, PolicyOutcome};
+
+        let (engine, spec, _dir) = fake_engine(60_000);
+        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let policy = bloom_proto::Policy::default();
+
+        let mut staged = fake_staged_1559("0001-test");
+        staged.expires_ms = now_ms() + 60_000;
+        staged.policy_checks = vec![PolicyCheck {
+            rule: "caps.max_value_eth".into(),
+            outcome: PolicyOutcome::Deny,
+            message: "value exceeds max".into(),
+        }];
+        engine.outbox.write_pending(&staged, "p").unwrap();
+
+        let r = engine
+            .confirm("alice", "anvil", "0001-test", &chain, &signer, &policy, "y")
+            .await;
+        assert!(
+            matches!(r, Err(TxEngineError::PolicyDenied)),
+            "expected PolicyDenied, got {r:?}"
+        );
+
+        // The outbox entry must have been moved to the `failed` state.
+        let entry = engine.outbox.read("alice", "anvil", "0001-test").unwrap();
+        assert_eq!(
+            entry.state,
+            crate::outbox::OutboxState::Failed,
+            "tx must be Failed after hard deny"
+        );
+    }
+
+    /// A soft-Warn check must block confirm() when no override sentinel is
+    /// given, and must pass the policy gate when the correct sentinel is
+    /// given. The outbox entry must stay Pending after a Warn rejection so
+    /// the user can retry with the override — it must NOT be moved to Failed.
+    #[tokio::test]
+    async fn policy_soft_warn_requires_override_sentinel() {
+        use bloom_proto::policy::{PolicyCheck, PolicyOutcome};
+
+        let (engine, spec, _dir) = fake_engine(60_000);
+        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let policy = bloom_proto::Policy::default(); // override_sentinel() == "override"
+
+        let mut staged = fake_staged_1559("0001-test");
+        staged.expires_ms = now_ms() + 60_000;
+        staged.policy_checks = vec![PolicyCheck {
+            rule: "caps.warn_value_eth".into(),
+            outcome: PolicyOutcome::Warn,
+            message: "soft cap exceeded".into(),
+        }];
+        engine.outbox.write_pending(&staged, "p").unwrap();
+
+        // Wrong text — must be rejected.
+        let r = engine
+            .confirm("alice", "anvil", "0001-test", &chain, &signer, &policy, "y")
+            .await;
+        assert!(
+            matches!(r, Err(TxEngineError::PolicyDenied)),
+            "expected PolicyDenied without override, got {r:?}"
+        );
+
+        // After a Warn rejection the entry must still be Pending (not Failed).
+        let entry = engine.outbox.read("alice", "anvil", "0001-test").unwrap();
+        assert_eq!(
+            entry.state,
+            crate::outbox::OutboxState::Pending,
+            "tx must stay Pending after warn-without-override"
+        );
+
+        // Correct sentinel — gets past the policy gate; broadcast will fail
+        // on the unreachable RPC. Any error other than PolicyDenied means
+        // the policy gate was successfully passed.
+        let r = engine
+            .confirm(
+                "alice",
+                "anvil",
+                "0001-test",
+                &chain,
+                &signer,
+                &policy,
+                "override",
+            )
+            .await;
+        match r {
+            Err(TxEngineError::PolicyDenied) => panic!("override sentinel did not bypass warn"),
+            Ok(_) => panic!("unexpected broadcast success on unreachable RPC"),
+            Err(_) => {} // any other error means the policy gate was passed
         }
     }
 
@@ -2370,5 +2568,42 @@ mod tests {
             }
             other => panic!("expected PrivateNotSupportedOnChain, got {other:?}"),
         }
+    }
+
+    // -------------------------------------------------------------------
+    // enso_quote_age_secs
+    // -------------------------------------------------------------------
+
+    fn enso_hex(json: &str) -> String {
+        format!("0x{}", hex::encode(json.as_bytes()))
+    }
+
+    #[test]
+    fn enso_quote_age_parses_timestamp() {
+        let hex = enso_hex(r#"{"Source":"Enso","Timestamp":1700000000}"#);
+        assert_eq!(enso_quote_age_secs(&hex, 1700000300), Some(300));
+    }
+
+    #[test]
+    fn enso_quote_age_zero_for_current() {
+        let hex = enso_hex(r#"{"Source":"Enso","Timestamp":1700000000}"#);
+        assert_eq!(enso_quote_age_secs(&hex, 1700000000), Some(0));
+    }
+
+    #[test]
+    fn enso_quote_age_none_for_future() {
+        let hex = enso_hex(r#"{"Source":"Enso","Timestamp":1700000100}"#);
+        assert_eq!(enso_quote_age_secs(&hex, 1700000000), None);
+    }
+
+    #[test]
+    fn enso_quote_age_none_for_non_enso_calldata() {
+        assert_eq!(enso_quote_age_secs("0xdeadbeef", 1700000000), None);
+    }
+
+    #[test]
+    fn enso_quote_age_none_for_missing_timestamp() {
+        let hex = enso_hex(r#"{"Source":"Enso","Route":"0x1234"}"#);
+        assert_eq!(enso_quote_age_secs(&hex, 1700000000), None);
     }
 }

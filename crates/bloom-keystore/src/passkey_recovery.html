@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>bloom — Recovery Key</title>
+  <style>
+    body{font-family:monospace;max-width:620px;margin:60px auto;padding:0 20px}
+    h1{font-size:1.1em;margin-bottom:0.2em}
+    .wallet{color:#888;font-size:0.9em;margin:0 0 1.4em}
+    .warning{background:#fff3cd;border:1px solid #ffc107;border-radius:4px;padding:1em 1.2em;margin-bottom:1.4em;line-height:1.6}
+    .warning strong{color:#856404}
+    .key-box{background:#1a1a2e;color:#e0e0e0;padding:1.2em;border-radius:6px;margin-bottom:1em;position:relative;word-break:break-all;font-size:0.82em;line-height:1.8;letter-spacing:0.04em}
+    .key-box .label{color:#888;font-size:0.75em;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:0.6em}
+    .key-box .hex{display:block}
+    .copy-btn{position:absolute;top:0.8em;right:0.8em;font-family:monospace;font-size:0.8em;padding:0.3em 0.8em;background:#333;color:#ccc;border:1px solid #555;border-radius:3px;cursor:pointer}
+    .copy-btn:hover{background:#444}
+    .cmd{background:#f4f4f4;padding:0.7em 1em;border-radius:4px;font-size:0.85em;margin-bottom:1.4em;color:#333;word-break:break-all}
+    .cmd .label{font-size:0.7em;text-transform:uppercase;letter-spacing:0.08em;color:#888;margin-bottom:0.3em}
+    .confirm-row{display:flex;align-items:center;gap:0.6em;margin-bottom:1em}
+    .confirm-row input[type=checkbox]{width:16px;height:16px;cursor:pointer}
+    .confirm-row label{font-size:0.85em;color:#444;cursor:pointer}
+    button{font-family:monospace;font-size:0.95em;padding:0.55em 1.2em;background:#1a1a2e;color:#fff;border:none;border-radius:4px;cursor:pointer}
+    button:disabled{opacity:0.45;cursor:default}
+    #status{margin-top:1em;padding:0.8em 1em;border-radius:4px;line-height:1.5;display:none}
+    .ok{background:#d4edda;color:#155724;display:block!important}
+  </style>
+</head>
+<body>
+  <h1>bloom — Recovery Key</h1>
+  <p class="wallet" id="wallet-name">Loading…</p>
+
+  <div class="warning">
+    <strong>STORE THIS KEY SAFELY.</strong><br>
+    If you lose <strong>both</strong> your passkey device <strong>and</strong> this recovery key,
+    your wallet is <strong>permanently inaccessible</strong>. No one can recover it — not bloom, not anyone.
+    <br><br>
+    This page is shown <strong>once</strong>. Write the key down or save it in a password manager
+    before you continue.
+  </div>
+
+  <div class="key-box">
+    <div class="label">Recovery key</div>
+    <button class="copy-btn" id="copy-btn" onclick="copyKey()">Copy</button>
+    <span class="hex" id="key-text"></span>
+  </div>
+
+  <div class="cmd">
+    <div class="label">Recovery command</div>
+    <div id="cmd-text"></div>
+  </div>
+
+  <div class="confirm-row">
+    <input type="checkbox" id="saved" onchange="updateBtn()">
+    <label for="saved">I have securely stored this recovery key</label>
+  </div>
+
+  <button id="btn" disabled onclick="confirmKey()">Done — I have saved this key</button>
+  <div id="status"></div>
+
+<script>
+var TK=new URLSearchParams(location.search).get('t')||'';
+var recoveryKeyHex = '';
+function updateBtn(){
+  document.getElementById('btn').disabled = !document.getElementById('saved').checked;
+}
+function copyKey(){
+  navigator.clipboard.writeText(recoveryKeyHex).then(function(){
+    var b = document.getElementById('copy-btn');
+    b.textContent = 'Copied!';
+    setTimeout(function(){ b.textContent = 'Copy'; }, 2000);
+  }).catch(function(){
+    prompt('Copy this key:', recoveryKeyHex);
+  });
+}
+async function confirmKey(){
+  var btn = document.getElementById('btn');
+  var st = document.getElementById('status');
+  btn.disabled = true;
+  try{
+    var resp = await fetch('/done', {method:'POST',headers:{'x-bloom-token':TK}});
+    if(resp.ok){
+      st.className = 'ok';
+      st.textContent = '✓ Confirmed. You can close this tab.';
+    }else{
+      btn.disabled = false;
+      st.style.display = 'block';
+      st.className = '';
+      st.style.background = '#f8d7da';
+      st.style.color = '#721c24';
+      st.textContent = 'Something went wrong. Please try again.';
+    }
+  }catch(e){
+    btn.disabled = false;
+    st.style.display = 'block';
+    st.style.background = '#f8d7da';
+    st.style.color = '#721c24';
+    st.textContent = 'Error: ' + e.message;
+  }
+}
+async function init(){
+  try{
+    var resp = await fetch('/data', {headers:{'x-bloom-token':TK}});
+    var data = await resp.json();
+    document.getElementById('wallet-name').textContent = 'wallet: ' + data.wallet;
+    document.getElementById('key-text').textContent = data.recovery_key;
+    document.getElementById('cmd-text').textContent = data.recovery_command;
+    recoveryKeyHex = data.recovery_key;
+  }catch(e){
+    document.getElementById('wallet-name').textContent = 'Error loading key data.';
+  }
+}
+init();
+</script>
+</body>
+</html>

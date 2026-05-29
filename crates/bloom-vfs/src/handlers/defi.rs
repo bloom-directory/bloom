@@ -329,6 +329,7 @@ impl DefiHandler {
                     chain: Some(chain_name.clone()),
                     gas: GasStrategy::Auto,
                     nonce: None,
+                    gas_limit_hint: None,
                 });
             }
         }
@@ -341,6 +342,7 @@ impl DefiHandler {
             chain: Some(chain_name.clone()),
             gas: GasStrategy::Auto,
             nonce: None,
+            gas_limit_hint: route.gas.as_deref().and_then(|g| g.parse().ok()),
         });
 
         let plan = render_plan_md(&body.intent, &chain_name, &req, &route, &intents);
@@ -831,6 +833,7 @@ mod tests {
             chain: Some("ethereum".into()),
             gas: GasStrategy::Auto,
             nonce: None,
+            gas_limit_hint: None,
         }];
         let md = render_plan_md("swap 1 ETH to USDC", "ethereum", &req, &route, &intents);
         assert!(md.contains("swap 1 ETH to USDC"));
@@ -879,6 +882,7 @@ mod tests {
                 chain: Some("ethereum".into()),
                 gas: GasStrategy::Auto,
                 nonce: None,
+                gas_limit_hint: None,
             },
             RawIntent {
                 body: RawIntentBody::Raw {
@@ -889,6 +893,7 @@ mod tests {
                 chain: Some("ethereum".into()),
                 gas: GasStrategy::Auto,
                 nonce: None,
+                gas_limit_hint: None,
             },
         ];
         let md = render_plan_md("swap 1 USDC to ETH", "ethereum", &req, &route, &intents);

@@ -63,6 +63,7 @@ serde_json = "1"
 serde_with = "3"
 toml = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 async-trait = "0.1"
@@ -93,6 +94,14 @@ wasmtime = { version = "26", default-features = false, features = ["async", "cra
 wasmtime-wasi = "26"
 wat = "1"
 wasmparser = "0.218"
+# danger-allow-state-serialisation: webauthn-rs requires this feature to allow
+# the PasskeyRegistration / PasskeyAuthentication state structs to be serialised
+# across await points. Our ceremony server holds state in Arc<Mutex<>> for the
+# duration of a single short-lived HTTP server, so this is safe — we never
+# persist the state to disk or send it across a network boundary.
+webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation"] }
+open = "5"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
 
 # Ethereum stack
 alloy = { version = "2", features = ["full", "signer-local", "rpc-types", "providers", "provider-http", "consensus", "network", "rlp", "json-abi", "k256", "eips", "essentials", "contract", "transport-throttle", "json-rpc"] }

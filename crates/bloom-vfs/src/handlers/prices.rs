@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bloom_prices::{CoinId, PricesClient, PricesError};
+use bloom_prices::{CoinId, PricesClient, PricesError, SYMBOL_MAP};
 
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
@@ -145,8 +145,9 @@ impl PricesHandler {
             return Ok(vec![Entry::dir("spot"), Entry::dir("change_24h")]);
         }
         match path.segments()[0].as_str() {
-            "spot" if path.segments().len() == 1 => Ok(vec![]),
-            "change_24h" if path.segments().len() == 1 => Ok(vec![]),
+            "spot" | "change_24h" if path.segments().len() == 1 => {
+                Ok(SYMBOL_MAP.iter().map(|(s, _)| Entry::file(s)).collect())
+            }
             _ => Err(HandlerError::NotADir(path.to_string_path())),
         }
     }
@@ -200,6 +201,19 @@ mod tests {
         let p = VfsPath::parse("/spot/eth.usd").unwrap();
         let bytes = h.read(&p).await.unwrap();
         assert_eq!(String::from_utf8_lossy(&bytes).trim(), "3500.5");
+    }
+
+    #[tokio::test]
+    async fn spot_dir_lists_well_known_symbols() {
+        let client = PricesClient::with_base_url("http://127.0.0.1:1");
+        let h = PricesHandler::new(client);
+        let p = VfsPath::parse("/spot").unwrap();
+        let entries = h.list(&p).await.unwrap();
+        assert_eq!(entries.len(), SYMBOL_MAP.len());
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        for (sym, _) in SYMBOL_MAP {
+            assert!(names.contains(sym), "spot listing missing {sym}");
+        }
     }
 
     #[tokio::test]

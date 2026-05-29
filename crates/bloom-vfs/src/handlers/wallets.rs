@@ -26,7 +26,11 @@ use async_trait::async_trait;
 use bloom_chain::ChainRegistry;
 use bloom_keystore::Keystore;
 use bloom_proto::{AddressBook, RawIntent, format_units};
-use bloom_tx::{intent_parser, outbox::OutboxState, tx_engine::TxEngine};
+use bloom_tx::{
+    intent_parser,
+    outbox::OutboxState,
+    tx_engine::{TxEngine, TxEngineError},
+};
 
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
@@ -65,15 +69,19 @@ impl WalletsHandler {
         self
     }
 
-    fn wallet_dir_entries() -> Vec<Entry> {
-        vec![
+    fn wallet_dir_entries(kind: bloom_keystore::WalletKind) -> Vec<Entry> {
+        let mut entries = vec![
             Entry::file("address"),
             Entry::file("public_key"),
             Entry::file("kind"),
             Entry::file("policy.toml"),
             Entry::dir("chains"),
             Entry::dir("sign"),
-        ]
+        ];
+        if kind == bloom_keystore::WalletKind::PasskeyGated {
+            entries.push(Entry::writable_file("unlock-passkey"));
+        }
+        entries
     }
 
     fn sign_dir_entries() -> Vec<Entry> {
@@ -193,13 +201,16 @@ impl WalletsHandler {
             return Ok(Entry::writable_file("new"));
         }
         let wallet = &segs[0];
-        let _info = self.keystore.info(wallet).map_err(err_be)?;
+        let info = self.keystore.info(wallet).map_err(err_be)?;
         if segs.len() == 1 {
             return Ok(Entry::dir(wallet));
         }
         match segs[1].as_str() {
             "address" | "public_key" | "kind" => Ok(Entry::file(&segs[1])),
             "policy.toml" => Ok(Entry::writable_file("policy.toml")),
+            "unlock-passkey" if info.kind == bloom_keystore::WalletKind::PasskeyGated => {
+                Ok(Entry::writable_file("unlock-passkey"))
+            }
             "sign" => match segs.len() {
                 2 => Ok(Entry::dir("sign")),
                 3 if matches!(segs[2].as_str(), "message" | "hash" | "typed_data") => {
@@ -241,6 +252,7 @@ impl WalletsHandler {
                 let s = match info.kind {
                     bloom_keystore::WalletKind::Local => "local",
                     bloom_keystore::WalletKind::Watch => "watch",
+                    bloom_keystore::WalletKind::PasskeyGated => "passkey",
                 };
                 Ok(format!("{}\n", s).into_bytes())
             }
@@ -262,12 +274,29 @@ impl WalletsHandler {
             return self.write_new_wallet(data).await;
         }
         let wallet = &segs[0];
-        let _info = self.keystore.info(wallet).map_err(err_be)?;
+        let info = self.keystore.info(wallet).map_err(err_be)?;
         if segs.len() >= 4 && segs[1] == "chains" && segs[3] == "outbox" {
             return self.write_outbox(wallet, &segs[2], &segs[4..], data).await;
         }
         if segs.len() == 3 && segs[1] == "sign" {
             return self.write_sign(wallet, &segs[2], data).await;
+        }
+        if segs.len() == 2 && segs[1] == "policy.toml" {
+            self.keystore.write_policy(wallet, data).map_err(err_be)?;
+            return Ok(());
+        }
+        // PasskeyGated wallet: browser WebAuthn authentication ceremony.
+        if segs.len() == 2 && segs[1] == "unlock-passkey" {
+            if info.kind != bloom_keystore::WalletKind::PasskeyGated {
+                return Err(HandlerError::invalid(
+                    "unlock-passkey only applies to passkey wallets",
+                ));
+            }
+            if self.keystore.signer(wallet).is_ok() {
+                return Ok(()); // already unlocked — ceremony not needed
+            }
+            self.keystore.unlock_passkey(wallet).await.map_err(err_be)?;
+            return Ok(());
         }
         Err(HandlerError::PermissionDenied)
     }
@@ -281,9 +310,9 @@ impl WalletsHandler {
             return Ok(out);
         }
         let wallet = &segs[0];
-        let _info = self.keystore.info(wallet).map_err(err_be)?;
+        let info = self.keystore.info(wallet).map_err(err_be)?;
         match segs.len() {
-            1 => Ok(Self::wallet_dir_entries()),
+            1 => Ok(Self::wallet_dir_entries(info.kind)),
             2 if segs[1] == "chains" => Ok(self
                 .chains
                 .list_names()
@@ -714,7 +743,12 @@ impl WalletsHandler {
                         confirm_text,
                     )
                     .await
-                    .map_err(err_be)?;
+                    .map_err(|e| match e {
+                        TxEngineError::EnsoQuoteStale { .. } => {
+                            HandlerError::invalid(e.to_string())
+                        }
+                        other => err_be(other),
+                    })?;
                 Ok(())
             }
             // outbox/pending/<id>/cancel — fire a self-send replacement.
@@ -851,11 +885,22 @@ impl WalletsHandler {
             .unwrap_or("");
 
         let info = match spec.kind.as_str() {
-            "local" => self
-                .keystore
-                .create_local(&spec.name, pass)
-                .map_err(err_be)?,
+            "local" => {
+                if pass.is_empty() {
+                    return Err(HandlerError::invalid(
+                        "passphrase required (set BLOOM_PASSPHRASE or include 'passphrase' in the TOML spec)",
+                    ));
+                }
+                self.keystore
+                    .create_local(&spec.name, pass)
+                    .map_err(err_be)?
+            }
             "import" => {
+                if pass.is_empty() {
+                    return Err(HandlerError::invalid(
+                        "passphrase required (set BLOOM_PASSPHRASE or include 'passphrase' in the TOML spec)",
+                    ));
+                }
                 let key = spec
                     .private_key
                     .as_deref()
@@ -874,9 +919,26 @@ impl WalletsHandler {
                     .map_err(|e| HandlerError::invalid(format!("address: {e}")))?;
                 self.keystore.add_watch(&spec.name, addr).map_err(err_be)?
             }
+            // PasskeyGated: opens a browser WebAuthn registration ceremony.
+            "passkey" => self
+                .keystore
+                .create_passkey(&spec.name)
+                .await
+                .map_err(err_be)?,
+            // PasskeyGated from an existing hex private key.
+            "passkey-import" => {
+                let key = spec
+                    .private_key
+                    .as_deref()
+                    .ok_or_else(|| HandlerError::invalid("passkey-import requires private_key"))?;
+                self.keystore
+                    .import_passkey(&spec.name, key)
+                    .await
+                    .map_err(err_be)?
+            }
             other => {
                 return Err(HandlerError::invalid(format!(
-                    "unknown wallet kind '{other}'; expected local|import|watch"
+                    "unknown wallet kind '{other}'; expected local|import|watch|passkey|passkey-import"
                 )));
             }
         };
@@ -1139,12 +1201,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_new_wallet_plain_name_creates_local_wallet() {
+    async fn write_new_wallet_toml_creates_local_wallet() {
         let f = make_handler();
         let p = VfsPath::parse("/new").unwrap();
-        f.handler.write(&p, b"bob").await.unwrap();
+        f.handler
+            .write(
+                &p,
+                b"name = \"bob\"\nkind = \"local\"\npassphrase = \"p\"\n",
+            )
+            .await
+            .unwrap();
         let info = f.handler.keystore.info("bob").unwrap();
         assert!(matches!(info.kind, bloom_keystore::WalletKind::Local));
+    }
+
+    /// Writing a plain name string without BLOOM_PASSPHRASE or a TOML
+    /// passphrase must return an Invalid error — empty passphrases are
+    /// no longer accepted for local wallets.
+    #[tokio::test]
+    async fn write_new_wallet_plain_name_rejected_without_passphrase() {
+        let f = make_handler();
+        let p = VfsPath::parse("/new").unwrap();
+        let r = f.handler.write(&p, b"bob").await;
+        assert!(
+            matches!(r, Err(HandlerError::Invalid(_))),
+            "expected Invalid error for plain name without passphrase, got: {r:?}"
+        );
     }
 
     #[tokio::test]
@@ -1439,6 +1521,102 @@ mod tests {
         assert_eq!(v["observed_nonces"], serde_json::json!([3, 5]));
         // checksum address is non-empty hex
         assert!(v["address"].as_str().unwrap().starts_with("0x"));
+    }
+
+    /// Helper: construct a passkey wallet on disk (no browser ceremony needed).
+    /// Returns the wallet's address.
+    fn seed_passkey_wallet(f: &Fixture, name: &str) -> Address {
+        let addr: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+            .parse()
+            .unwrap();
+        let wallet_dir = f._tmp.path().join("keystore").join(name);
+        std::fs::create_dir_all(&wallet_dir).unwrap();
+        std::fs::write(
+            wallet_dir.join("address"),
+            bloom_proto::checksum_address(&addr).as_bytes(),
+        )
+        .unwrap();
+        std::fs::write(wallet_dir.join("pubkey"), b"").unwrap();
+        std::fs::write(wallet_dir.join("kind"), b"passkey").unwrap();
+        let policy = bloom_proto::Policy::default();
+        std::fs::write(
+            wallet_dir.join("policy.toml"),
+            toml::to_string_pretty(&policy).unwrap(),
+        )
+        .unwrap();
+        addr
+    }
+
+    /// Passkey wallet: dir lists `unlock-passkey`, lookup gives writable file,
+    /// and `kind` reads "passkey".
+    #[tokio::test]
+    async fn passkey_wallet_vfs_properties() {
+        let f = make_handler();
+        let _addr = seed_passkey_wallet(&f, "pk");
+
+        // listing includes unlock-passkey
+        let entries = f
+            .handler
+            .list(&VfsPath::parse("/pk").unwrap())
+            .await
+            .unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"unlock-passkey"), "names={names:?}");
+
+        // unlock-passkey is a writable file
+        let entry = f
+            .handler
+            .lookup(&VfsPath::parse("/pk/unlock-passkey").unwrap())
+            .await
+            .unwrap();
+        assert!(matches!(entry.kind, crate::handler::EntryKind::File));
+        assert_eq!(entry.mode, 0o644);
+
+        // kind reads "passkey"
+        let bytes = f
+            .handler
+            .read(&VfsPath::parse("/pk/kind").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&bytes).trim(), "passkey");
+    }
+
+    /// Local wallet: `kind` reads "local", `unlock-passkey` is not exposed
+    /// (lookup → NotFound, write → Invalid, list → absent).
+    #[tokio::test]
+    async fn local_wallet_passkey_properties() {
+        let f = make_handler();
+
+        // kind reads "local"
+        let bytes = f
+            .handler
+            .read(&VfsPath::parse("/alice/kind").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&bytes).trim(), "local");
+
+        // unlock-passkey resolves to NotFound
+        let r = f
+            .handler
+            .lookup(&VfsPath::parse("/alice/unlock-passkey").unwrap())
+            .await;
+        assert!(matches!(r, Err(HandlerError::NotFound(_))), "got {r:?}");
+
+        // writing to unlock-passkey is Invalid
+        let r = f
+            .handler
+            .write(&VfsPath::parse("/alice/unlock-passkey").unwrap(), b"unlock")
+            .await;
+        assert!(matches!(r, Err(HandlerError::Invalid(_))), "got {r:?}");
+
+        // listing does NOT contain unlock-passkey
+        let entries = f
+            .handler
+            .list(&VfsPath::parse("/alice").unwrap())
+            .await
+            .unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(!names.contains(&"unlock-passkey"), "names={names:?}");
     }
 
     #[tokio::test]

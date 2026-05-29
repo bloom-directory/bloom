@@ -125,6 +125,10 @@ pub struct RawIntent {
     /// Optional explicit nonce override (rarely useful).
     #[serde(default)]
     pub nonce: Option<u64>,
+    /// Gas limit hint from an external estimator (e.g. Enso). Used as
+    /// the fallback when `eth_estimateGas` fails at stage time.
+    #[serde(default)]
+    pub gas_limit_hint: Option<u64>,
 }
 
 /// A normalised concrete tx-intent (post-resolution): addresses parsed,

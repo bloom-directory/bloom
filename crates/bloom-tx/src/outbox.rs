@@ -226,6 +226,44 @@ impl Outbox {
         Ok(path)
     }
 
+    /// Return the highest nonce among all `pending/<wallet>/<chain>/<id>/intent.json`
+    /// entries whose `from` address matches `addr`. Returns `None` when the pending
+    /// directory is empty or doesn't exist yet (no staged txs for this sender).
+    ///
+    /// Called by `TxEngine::stage()` under a per-(wallet, chain, from) async mutex
+    /// to compute the correct next nonce when multiple txs are staged before any
+    /// are broadcast.
+    ///
+    /// Scans all pending entries for `addr` on each call — acceptable for
+    /// single-user CLI where the pending queue is small.
+    pub fn highest_pending_nonce(
+        &self,
+        wallet: &str,
+        chain: &str,
+        addr: alloy::primitives::Address,
+    ) -> Result<Option<u64>, OutboxError> {
+        let dir = self.state_dir(wallet, chain, OutboxState::Pending)?;
+        if !dir.exists() {
+            return Ok(None);
+        }
+        let mut max_nonce: Option<u64> = None;
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let intent_path = entry.path().join("intent.json");
+            if !intent_path.exists() {
+                continue;
+            }
+            let staged: StagedTx = serde_json::from_slice(&fs::read(&intent_path)?)?;
+            if staged.from.parse::<alloy::primitives::Address>().ok() == Some(addr) {
+                max_nonce = Some(max_nonce.map_or(staged.nonce, |m| m.max(staged.nonce)));
+            }
+        }
+        Ok(max_nonce)
+    }
+
     /// Search for `id` across pending/sent/failed and return the first hit.
     /// Prefer [`Self::read_in_state`] when the caller knows where the entry
     /// is supposed to be — this method exists for diagnostics and is the

@@ -17,11 +17,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use bloom_daemon::Daemon;
 use bloom_daemon::ipc::{IpcClient, IpcServer, default_socket_path};
 use bloom_proto::HomeDir;
 use bloom_vfs::{VfsPath, handler::Handler};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
 use tracing::{debug, info, trace};
 use tracing_subscriber::EnvFilter;
 
@@ -101,6 +104,8 @@ enum Cmd {
         #[arg(long, value_name = "HEX")]
         gas_payer: String,
     },
+    /// Print a shell completion script.
+    Completions { shell: Shell },
 }
 
 #[derive(Subcommand, Debug)]
@@ -118,7 +123,10 @@ enum VfsCmd {
     /// `cat /bloom/<path>` — read a file via the VFS.
     Cat { path: String },
     /// `ls /bloom/<path>` — list a directory via the VFS.
-    Ls { path: String },
+    Ls {
+        #[arg(default_value = "/")]
+        path: String,
+    },
     /// Write data to a writable VFS path. Reads from stdin if `--data` is omitted.
     Write {
         path: String,
@@ -168,26 +176,33 @@ enum PetalsCmd {
 
 #[derive(Subcommand, Debug)]
 enum WalletCmd {
-    /// Create a new local wallet.
+    /// Create a new wallet. Pass `--passkey` for a browser WebAuthn ceremony;
+    /// defaults to passphrase-encrypted local wallet.
     New {
         name: String,
+        #[arg(long)]
+        passkey: bool,
         #[arg(long, env = "BLOOM_PASSPHRASE")]
-        passphrase: String,
+        passphrase: Option<String>,
     },
     /// Import a wallet from a hex private key.
     Import {
         name: String,
         private_key: String,
+        #[arg(long)]
+        passkey: bool,
         #[arg(long, env = "BLOOM_PASSPHRASE")]
-        passphrase: String,
+        passphrase: Option<String>,
     },
     /// List configured wallets.
     List,
     /// Unlock a wallet for the lifetime of the process.
+    /// For passkey wallets the passphrase is not needed — a browser
+    /// ceremony is opened instead.
     Unlock {
         name: String,
         #[arg(long, env = "BLOOM_PASSPHRASE")]
-        passphrase: String,
+        passphrase: Option<String>,
     },
     /// Stage a tx by writing an intent file. Convenience for the
     /// outbox flow.
@@ -207,12 +222,54 @@ enum WalletCmd {
         chain: String,
         id: String,
         #[arg(long, env = "BLOOM_PASSPHRASE")]
-        passphrase: String,
+        passphrase: Option<String>,
         /// Confirmation text (default "y"; "override" bypasses soft
         /// policy warnings).
         #[arg(long, default_value = "y")]
         text: String,
     },
+    /// Sign the current policy.toml for a passkey-gated wallet.
+    /// The wallet must already be unlocked (run `unlock` first).
+    SignPolicy { name: String },
+    /// Re-bind an existing PRF-based passkey wallet to a new passkey
+    /// credential. Unlocks with the current credential first to prove
+    /// ownership, then runs a fresh WebAuthn registration ceremony and
+    /// re-encrypts the private key under the new PRF output. The wallet
+    /// address does not change.
+    ///
+    /// Use this to rotate authenticators (e.g. new YubiKey or new device)
+    /// without moving funds. A recovery key is printed once after rebind.
+    RebindPasskey { name: String },
+    /// Permanently delete a wallet. All wallet files are removed from disk.
+    /// This cannot be undone — make sure you have the recovery key or the
+    /// private key stored elsewhere before deleting a passkey wallet.
+    Delete { name: String },
+}
+
+/// Print the recovery key to stdout and block until the user types "saved".
+///
+/// All tracing logs go to stderr; this prints to stdout, so it cannot be
+/// buried by ceremony log noise. The loop prevents the terminal from
+/// scrolling past the key unnoticed.
+fn acknowledge_recovery_key(name: &str, key: &str) {
+    use std::io::Write as _;
+    let line = "═".repeat(60);
+    println!("\n{line}");
+    println!("  ⚠  RECOVERY KEY — write this down before continuing.");
+    println!("  bloom will NEVER show this again.\n");
+    println!("  0x{key}\n");
+    println!("  To recover:  bloom wallet import {name} 0x<key>");
+    println!("{line}");
+    loop {
+        print!("\n  Type \"saved\" and press Enter to continue: ");
+        let _ = std::io::stdout().flush();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap_or(0);
+        if input.trim().eq_ignore_ascii_case("saved") {
+            break;
+        }
+    }
+    println!();
 }
 
 #[tokio::main]
@@ -232,6 +289,54 @@ async fn main() -> ExitCode {
             eprintln!("error: {:#}", e);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Returns `None` when no daemon socket is present (daemon not started),
+/// propagating all other errors normally. A stale socket (file exists but
+/// connection refused) is removed and surfaced as an error rather than
+/// silently falling back to in-process — a stale socket almost always
+/// means the daemon crashed and the caller should restart it explicitly.
+async fn try_ipc(
+    client: &IpcClient,
+    method: &str,
+    params: serde_json::Value,
+) -> std::io::Result<Option<serde_json::Value>> {
+    match client.call(method, params).await {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!(error = %e, "ipc.no_daemon_fallback");
+            Ok(None)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            // Only remove if it is actually a socket, not a regular
+            // file or symlink placed by another process.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                let removed = std::fs::symlink_metadata(client.socket())
+                    .is_ok_and(|m| m.file_type().is_socket())
+                    && std::fs::remove_file(client.socket()).is_ok();
+                let detail = if removed {
+                    "stale socket removed"
+                } else {
+                    "socket not responding"
+                };
+                Err(std::io::Error::other(format!(
+                    "daemon socket exists but is not responding ({detail}); \
+                     start the daemon with 'bloom serve'",
+                )))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = std::fs::remove_file(client.socket());
+                return Err(std::io::Error::other(
+                    "daemon socket exists but is not responding (stale socket removed); \
+                     start the daemon with 'bloom serve'",
+                ));
+            }
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -267,19 +372,16 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Vfs(VfsCmd::Cat { path }) => {
             let socket = default_socket_path(home.root());
             let p = VfsPath::parse(&path).context("parse path")?;
-            let bytes = if socket.exists() {
+            let client = IpcClient::new(&socket);
+            let ipc_res = try_ipc(&client, "read", serde_json::json!({ "path": path }))
+                .await
+                .context("ipc read")?;
+            let bytes = if let Some(res) = ipc_res {
                 debug!(socket = %socket.display(), "cli.vfs.cat.via_ipc");
-                let client = IpcClient::new(&socket);
-                let res = client
-                    .call("read", serde_json::json!({ "path": path }))
-                    .await
-                    .context("ipc read")?;
                 let b64 = res
                     .get("bytes_b64")
                     .and_then(|v| v.as_str())
                     .context("ipc read: missing bytes_b64")?;
-                use base64::Engine as _;
-                use base64::engine::general_purpose::STANDARD as B64;
                 B64.decode(b64).context("ipc read: bad base64")?
             } else {
                 debug!("cli.vfs.cat.via_inproc: no daemon socket present");
@@ -292,13 +394,12 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Vfs(VfsCmd::Ls { path }) => {
             let socket = default_socket_path(home.root());
             let p = VfsPath::parse(&path).context("parse path")?;
-            if socket.exists() {
+            let client = IpcClient::new(&socket);
+            let ipc_res = try_ipc(&client, "list", serde_json::json!({ "path": path }))
+                .await
+                .context("ipc list")?;
+            if let Some(res) = ipc_res {
                 debug!(socket = %socket.display(), "cli.vfs.ls.via_ipc");
-                let client = IpcClient::new(&socket);
-                let res = client
-                    .call("list", serde_json::json!({ "path": path }))
-                    .await
-                    .context("ipc list")?;
                 let arr = res.as_array().context("ipc list: expected array")?;
                 for e in arr {
                     let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("?");
@@ -330,18 +431,16 @@ async fn run(cli: Cli) -> Result<()> {
                     buf
                 }
             };
-            if socket.exists() {
+            let client = IpcClient::new(&socket);
+            let ipc_res = try_ipc(
+                &client,
+                "write",
+                serde_json::json!({ "path": path, "bytes_b64": B64.encode(&body) }),
+            )
+            .await
+            .context("ipc write")?;
+            if ipc_res.is_some() {
                 debug!(socket = %socket.display(), "cli.vfs.write.via_ipc");
-                use base64::Engine as _;
-                use base64::engine::general_purpose::STANDARD as B64;
-                let client = IpcClient::new(&socket);
-                client
-                    .call(
-                        "write",
-                        serde_json::json!({ "path": path, "bytes_b64": B64.encode(&body) }),
-                    )
-                    .await
-                    .context("ipc write")?;
             } else {
                 debug!("cli.vfs.write.via_inproc: no daemon socket present");
                 let d = Daemon::from_home(home).context("build daemon")?;
@@ -349,20 +448,47 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Wallet(WalletCmd::New { name, passphrase }) => {
+        Cmd::Wallet(WalletCmd::New {
+            name,
+            passkey,
+            passphrase,
+        }) => {
             let d = Daemon::from_home(home).context("build daemon")?;
-            let info = d.keystore.create_local(&name, &passphrase)?;
+            let info = if passkey {
+                d.keystore.create_passkey(&name).await?
+            } else {
+                let pass = passphrase.as_deref().unwrap_or("");
+                if pass.is_empty() {
+                    anyhow::bail!("passphrase required (use --passphrase or BLOOM_PASSPHRASE)");
+                }
+                d.keystore.create_local(&name, pass)?
+            };
             println!("created wallet '{}': {}", info.name, info.address);
+            if let Some(ref key) = info.recovery_key {
+                acknowledge_recovery_key(&info.name, key);
+            }
             Ok(())
         }
         Cmd::Wallet(WalletCmd::Import {
             name,
             private_key,
+            passkey,
             passphrase,
         }) => {
             let d = Daemon::from_home(home).context("build daemon")?;
-            let info = d.keystore.import_hex(&name, &private_key, &passphrase)?;
+            let info = if passkey {
+                d.keystore.import_passkey(&name, &private_key).await?
+            } else {
+                let pass = passphrase.as_deref().unwrap_or("");
+                if pass.is_empty() {
+                    anyhow::bail!("passphrase required (use --passphrase or BLOOM_PASSPHRASE)");
+                }
+                d.keystore.import_hex(&name, &private_key, pass)?
+            };
             println!("imported wallet '{}': {}", info.name, info.address);
+            if let Some(ref key) = info.recovery_key {
+                acknowledge_recovery_key(&info.name, key);
+            }
             Ok(())
         }
         Cmd::Wallet(WalletCmd::List) => {
@@ -371,6 +497,7 @@ async fn run(cli: Cli) -> Result<()> {
                 let kind = match info.kind {
                     bloom_keystore::WalletKind::Local => "local",
                     bloom_keystore::WalletKind::Watch => "watch",
+                    bloom_keystore::WalletKind::PasskeyGated => "passkey",
                 };
                 println!("{}\t{}\t{}", info.name, info.address, kind);
             }
@@ -378,8 +505,53 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Wallet(WalletCmd::Unlock { name, passphrase }) => {
             let d = Daemon::from_home(home).context("build daemon")?;
-            d.keystore.unlock(&name, &passphrase)?;
+            let info = d.keystore.info(&name)?;
+            match info.kind {
+                bloom_keystore::WalletKind::PasskeyGated => {
+                    d.keystore.unlock_passkey(&name).await?;
+                }
+                _ => {
+                    d.keystore
+                        .unlock(&name, passphrase.as_deref().unwrap_or(""))?;
+                }
+            }
             println!("unlocked '{}' (in-memory; ends with this process)", name);
+            Ok(())
+        }
+        Cmd::Wallet(WalletCmd::SignPolicy { name }) => {
+            let d = Daemon::from_home(home).context("build daemon")?;
+            // Auto-unlock passkey wallets so this command is self-contained.
+            let info = d.keystore.info(&name)?;
+            // Show the policy the user is about to sign, in the terminal,
+            // before the browser ceremony opens.
+            let policy_toml = toml::to_string_pretty(&info.policy)
+                .unwrap_or_else(|_| "(could not serialise policy)".into());
+            println!("Policy for '{name}':\n\n{policy_toml}");
+            if info.kind == bloom_keystore::WalletKind::PasskeyGated
+                && !d.keystore.is_unlocked(&name)
+            {
+                d.keystore.unlock_passkey(&name).await?;
+            }
+            d.keystore.sign_policy(&name)?;
+            println!("policy.toml signed for '{name}'");
+            Ok(())
+        }
+        Cmd::Wallet(WalletCmd::RebindPasskey { name }) => {
+            let d = Daemon::from_home(home).context("build daemon")?;
+            let info = d.keystore.rebind_passkey(&name).await?;
+            println!(
+                "✓ '{}' rebound to new passkey credential ({})",
+                info.name, info.address
+            );
+            if let Some(ref key) = info.recovery_key {
+                acknowledge_recovery_key(&info.name, key);
+            }
+            Ok(())
+        }
+        Cmd::Wallet(WalletCmd::Delete { name }) => {
+            let d = Daemon::from_home(home).context("build daemon")?;
+            d.keystore.delete(&name)?;
+            println!("✓ wallet '{name}' deleted");
             Ok(())
         }
         Cmd::Wallet(WalletCmd::Stage {
@@ -424,7 +596,16 @@ async fn run(cli: Cli) -> Result<()> {
             text,
         }) => {
             let d = Daemon::from_home(home).context("build daemon")?;
-            d.keystore.unlock(&wallet, &passphrase)?;
+            let info = d.keystore.info(&wallet)?;
+            match info.kind {
+                bloom_keystore::WalletKind::PasskeyGated => {
+                    d.keystore.unlock_passkey(&wallet).await?;
+                }
+                _ => {
+                    d.keystore
+                        .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
+                }
+            }
             let signer = d.keystore.signer(&wallet)?;
             let info = d.keystore.info(&wallet)?;
             let client = d
@@ -464,10 +645,23 @@ async fn run(cli: Cli) -> Result<()> {
             let server = IpcServer::new(d.vfs.clone(), env!("CARGO_PKG_VERSION"), chains)
                 .with_petals(d.petals.clone());
             let server2 = server.clone();
-            // Trigger graceful shutdown on Ctrl-C.
+            // Trigger graceful shutdown on Ctrl-C or SIGTERM.
             let shutdown = tokio::spawn(async move {
-                let _ = tokio::signal::ctrl_c().await;
-                info!("cli.serve.ctrl_c_received");
+                #[cfg(unix)]
+                {
+                    use tokio::signal::unix::{SignalKind, signal};
+                    let mut sigterm = signal(SignalKind::terminate())
+                        .expect("SIGTERM handler registration failed");
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => info!("cli.serve.ctrl_c_received"),
+                        _ = sigterm.recv() => info!("cli.serve.sigterm_received"),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = tokio::signal::ctrl_c().await;
+                    info!("cli.serve.ctrl_c_received");
+                }
                 server2.trigger_shutdown();
             });
             let serve_result = server.serve(&socket).await.context("ipc serve");
@@ -493,6 +687,10 @@ async fn run(cli: Cli) -> Result<()> {
             let rpc_sock = home.root().join("chain").join("rpc.sock");
             let chain_dir = home.root().join("chain");
             commands::pipe::run(&rpc_sock, &chain_dir, &expr, &signers, &gas_payer).await
+        }
+        Cmd::Completions { shell } => {
+            generate(shell, &mut Cli::command(), "bloom", &mut std::io::stdout());
+            Ok(())
         }
         Cmd::Ipc(IpcCmd::Call { method, params }) => {
             let socket = default_socket_path(home.root());

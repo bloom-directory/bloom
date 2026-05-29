@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>bloom — Authenticate</title>
+  <style>
+    body{font-family:monospace;max-width:560px;margin:80px auto;padding:0 20px}
+    h1{font-size:1.1em;margin-bottom:0.3em}
+    p{color:#555;margin-top:0;font-size:0.9em}
+    #status{margin-top:1.2em;padding:1em;background:#f4f4f4;border-radius:4px;line-height:1.5}
+    .ok{background:#d4edda;color:#155724}
+    .err{background:#f8d7da;color:#721c24}
+  </style>
+</head>
+<body>
+  <h1>bloom — Authenticate with Passkey</h1>
+  <p>This page completes passkey authentication for your bloom wallet.</p>
+  <div id="status">Starting authentication…</div>
+<script>
+var TK=new URLSearchParams(location.search).get('t')||'';
+function dec(s){
+  s=s.replace(/-/g,'+').replace(/_/g,'/');
+  while(s.length%4)s+='=';
+  return Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+}
+function enc(b){
+  return btoa(String.fromCharCode(...new Uint8Array(b)))
+    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
+}
+async function run(){
+  const st=document.getElementById('status');
+  if(!navigator.credentials||!navigator.credentials.get){
+    st.className='err';
+    st.textContent='WebAuthn is not available in this browser. Try Chrome or Safari on this device.';
+    return;
+  }
+  try{
+    const opts=await(await fetch('/challenge')).json();
+    opts.publicKey.challenge=dec(opts.publicKey.challenge);
+    if(opts.publicKey.allowCredentials)
+      opts.publicKey.allowCredentials=opts.publicKey.allowCredentials.map(c=>({...c,id:dec(c.id)}));
+    // Decode PRF salt if present (injected by server when unlocking a PRF wallet).
+    // Capture as a variable so the fallback path below can reuse it.
+    var prfSaltBytes=null;
+    if(opts.publicKey.extensions&&opts.publicKey.extensions.prf&&opts.publicKey.extensions.prf.eval&&opts.publicKey.extensions.prf.eval.first){
+      prfSaltBytes=dec(opts.publicKey.extensions.prf.eval.first);
+      opts.publicKey.extensions.prf.eval.first=prfSaltBytes;
+    }
+    st.textContent='Waiting for passkey interaction (Touch ID / security key)…';
+    const cred=await navigator.credentials.get(opts);
+
+    // Extract PRF output and send it before submitting the auth credential.
+    const ext=cred.getClientExtensionResults();
+    const prfFirst=ext&&ext.prf&&ext.prf.results&&ext.prf.results.first;
+    if(prfFirst){
+      await fetch('/prf-output',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({prf_output_b64:enc(prfFirst),client_data_json_b64:enc(cred.response.clientDataJSON)})});
+    }else if(prfSaltBytes&&ext&&ext.prf&&ext.prf.enabled){
+      // PRF is supported but output was not returned in the primary get() call.
+      // Run a secondary get() with a fresh challenge to extract the PRF output,
+      // then submit the original credential to /auth as usual.
+      st.textContent='Almost done — please authenticate once more to complete PRF extraction…';
+      const challengeData=await(await fetch('/auth-challenge')).json();
+      const fallbackChallenge=dec(challengeData.challenge);
+      const credId=new Uint8Array(cred.rawId);
+      const fallbackOpts={
+        publicKey:{
+          challenge:fallbackChallenge,
+          timeout:60000,
+          allowCredentials:[{id:credId,type:'public-key'}],
+          extensions:{prf:{eval:{first:prfSaltBytes}}}
+        }
+      };
+      const fallbackCred=await navigator.credentials.get(fallbackOpts);
+      const fallbackExt=fallbackCred.getClientExtensionResults();
+      const fallbackPrfFirst=fallbackExt&&fallbackExt.prf&&fallbackExt.prf.results&&fallbackExt.prf.results.first;
+      if(!fallbackPrfFirst){
+        st.className='err';
+        st.textContent='PRF output not available from your authenticator. Supported: Touch ID (macOS/iOS), YubiKey 5+, Windows Hello (Chrome 147+), security keys with hmac-secret. On Linux: Chromium has no built-in passkey manager — install Google Chrome instead.';
+        return;
+      }
+      await fetch('/prf-output',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({prf_output_b64:enc(fallbackPrfFirst),client_data_json_b64:enc(fallbackCred.response.clientDataJSON)})});
+    }
+
+    await fetch('/auth',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({
+      id:cred.id,rawId:enc(cred.rawId),type:cred.type,
+      response:{
+        authenticatorData:enc(cred.response.authenticatorData),
+        clientDataJSON:enc(cred.response.clientDataJSON),
+        signature:enc(cred.response.signature),
+        userHandle:cred.response.userHandle?enc(cred.response.userHandle):null
+      }
+    })});
+    st.className='ok';
+    st.textContent='✓ Authentication successful. You can close this tab.';
+  }catch(e){
+    st.className='err';
+    var m=e.message||'';
+    if(m.indexOf('connection')!==-1||m.indexOf('Receiving end')!==-1||m.indexOf('extension')!==-1){
+      st.innerHTML='A browser extension is interfering with passkey authentication.<br><br>Fix: in your browser extension settings, disable passkey management for Bitwarden (or whichever extension is intercepting). On Linux, do <b>not</b> use incognito — passkeys are not saved to the OS keychain from incognito mode. Alternatively, install Google Chrome (not Chromium) and disable Bitwarden passkeys there.<br><br>Error: '+m;
+    }else{
+      st.textContent='Error: '+m;
+    }
+  }
+}
+window.addEventListener('unhandledrejection',function(e){
+  const st=document.getElementById('status');
+  st.className='err';
+  st.textContent='Error: '+e.reason.message+' (disable extension passkey management, or install Google Chrome on Linux)';
+  e.preventDefault();
+});
+run().catch(function(e){
+  const st=document.getElementById('status');
+  st.className='err';
+  st.textContent='Error: '+e.message+' (disable extension passkey management, or install Google Chrome on Linux)';
+});
+</script>
+</body>
+</html>

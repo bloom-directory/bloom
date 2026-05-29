@@ -93,24 +93,31 @@ impl CoinId {
     }
 }
 
-/// Resolve a common ticker symbol to a wire id.
-///
-/// v1: hardcoded popular symbols. Caller-provided unknown symbols return
-/// `None`; the client surfaces these as [`PricesError::InvalidCoinId`].
+/// Single source of truth for built-in symbols: (lowercase ticker, wire id).
+pub const SYMBOL_MAP: &[(&str, &str)] = &[
+    ("eth", "coingecko:ethereum"),
+    ("btc", "coingecko:bitcoin"),
+    (
+        "usdc",
+        "ethereum:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+    ),
+    (
+        "usdt",
+        "ethereum:0xdac17f958d2ee523a2206206994597c13d831ec7",
+    ),
+    ("dai", "ethereum:0x6b175474e89094c44da98b954eedeac495271d0f"),
+    (
+        "weth",
+        "ethereum:0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+    ),
+];
+
 fn resolve_symbol(sym: &str) -> Option<String> {
-    let s = sym.trim().to_ascii_uppercase();
-    Some(
-        match s.as_str() {
-            "ETH" => "coingecko:ethereum",
-            "BTC" => "coingecko:bitcoin",
-            "USDC" => "ethereum:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-            "USDT" => "ethereum:0xdac17f958d2ee523a2206206994597c13d831ec7",
-            "DAI" => "ethereum:0x6b175474e89094c44da98b954eedeac495271d0f",
-            "WETH" => "ethereum:0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
-            _ => return None,
-        }
-        .to_string(),
-    )
+    let s = sym.trim().to_ascii_lowercase();
+    SYMBOL_MAP
+        .iter()
+        .find(|(k, _)| *k == s.as_str())
+        .map(|(_, v)| v.to_string())
 }
 
 /// Resolve a native-chain identifier to a wire id (coingecko slug).

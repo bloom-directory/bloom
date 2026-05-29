@@ -49,6 +49,15 @@ pub fn default_socket_path(home_root: &Path) -> PathBuf {
     home_root.join("run").join("bloom.sock")
 }
 
+/// RAII guard that removes the socket file on drop, covering normal exit
+/// and panics during [`IpcServer::serve`].
+struct SocketGuard(PathBuf);
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Request {
     #[serde(default)]
@@ -153,6 +162,7 @@ impl IpcServer {
             let _ = std::fs::remove_file(socket_path);
         }
         let listener = UnixListener::bind(socket_path)?;
+        let _guard = SocketGuard(socket_path.to_owned());
         // Best-effort restrict permissions to user.
         #[cfg(unix)]
         {
@@ -192,7 +202,6 @@ impl IpcServer {
         }
 
         info!(socket = %socket_path.display(), "ipc.shutdown");
-        let _ = std::fs::remove_file(socket_path);
         Ok(())
     }
 
@@ -222,7 +231,12 @@ impl IpcServer {
             };
             let mut out = serde_json::to_vec(&resp).unwrap_or_else(|e| {
                 debug!(error = %e, "ipc.response_serialise_failed");
-                b"{}".to_vec()
+                // We cannot echo the request id here (serialisation of the
+                // proper Response already failed, so we may not have a
+                // well-formed id either). `null` is the safe default per
+                // JSON-RPC 2.0 §5 when the id cannot be determined.
+                br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal error"}}"#
+                    .to_vec()
             });
             out.push(b'\n');
             wr.write_all(&out).await?;
