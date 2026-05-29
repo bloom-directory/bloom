@@ -10,7 +10,7 @@
 //! cargo test -p bloom-it -- --ignored
 //! ```
 //!
-//! They spawn a local `anvil` from `~/.foundry/bin/anvil`.
+//! They spawn a local `anvil` from `$PATH` (or `BLOOM_ANVIL_BIN`).
 
 use std::net::TcpListener;
 use std::process::Stdio;
@@ -24,8 +24,6 @@ use bloom_tx::tx_engine::{TxEngine, TxEngineError};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
-
-const ANVIL_BIN: &str = "/Users/joshua/.foundry/bin/anvil";
 
 /// Anvil prefunded account #0.
 const ANVIL_PK0: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -57,9 +55,13 @@ fn pick_free_port() -> Result<u16> {
     Ok(l.local_addr()?.port())
 }
 
+fn anvil_bin() -> String {
+    std::env::var("BLOOM_ANVIL_BIN").unwrap_or_else(|_| "anvil".to_string())
+}
+
 async fn spawn_anvil(no_mining: bool) -> Result<AnvilGuard> {
     let port = pick_free_port()?;
-    let mut cmd = Command::new(ANVIL_BIN);
+    let mut cmd = Command::new(anvil_bin());
     cmd.arg("--port")
         .arg(port.to_string())
         .arg("--host")

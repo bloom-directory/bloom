@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bloom_chain_consensus::{
-    Action, ConsensusEngine, Mempool,
+    Action, ConsensusEngine, Mempool, ROUND_TIMEOUT,
     round_validation::judge_proposer_round,
     state_machine::{Event, TimeoutKind},
 };
@@ -405,7 +405,7 @@ impl Node {
         // the engine's *current* `(height, round)` and silently drops the
         // tick if they no longer match. Without this guard, stale timers
         // from earlier rounds/heights bleed across transitions: when a
-        // Precommit scheduled at h=N r=R fires 500ms later, the engine may
+        // Precommit scheduled at h=N r=R fires later, the engine may
         // already be at h=N r=R+1 in step Precommit again — `on_tick` would
         // see `step == Precommit` and call `advance_round`, skipping rounds
         // arbitrarily. Caught by the 4-validator docker DEX acceptance test
@@ -998,10 +998,7 @@ impl Node {
             let timeout_tx_kick = Arc::clone(&timeout_tx);
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(1000)).await;
-                let kickoff = vec![Action::StartTimeout(
-                    TimeoutKind::Propose,
-                    Duration::from_millis(500),
-                )];
+                let kickoff = vec![Action::StartTimeout(TimeoutKind::Propose, ROUND_TIMEOUT)];
                 process_actions(
                     Arc::clone(&driver_kick),
                     Arc::clone(&peer_pool_kick),
@@ -1137,7 +1134,7 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                         &block_with_commit.txs,
                     );
                     // Enter the next height IMMEDIATELY. The state machine
-                    // returns a `StartTimeout(Propose, 500ms)` we deliberately
+                    // returns a `StartTimeout(Propose, ROUND_TIMEOUT)` we deliberately
                     // discard — we'll arm the propose timer after a full
                     // TIMEOUT_COMMIT (1s) below.
                     //
@@ -1148,7 +1145,7 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                     // inbound-frame gate at `frame.vote recv` / `frame.proposal
                     // recv` drops frames whose height > my_height, so an
                     // entire round of votes for H+1 vanished. The validator
-                    // then sat in Propose step until its 500ms propose
+                    // then sat in Propose step until its propose
                     // timeout fired nil-prevote, by which point the rest of
                     // the network had moved on — repeated for every height,
                     // the trailing validator never recovers. Caught by the
@@ -1166,10 +1163,8 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                     let timeout_tx_c = Arc::clone(&timeout_tx);
                     tokio::spawn(async move {
                         tokio::time::sleep(TIMEOUT_COMMIT).await;
-                        let kickoff = vec![Action::StartTimeout(
-                            TimeoutKind::Propose,
-                            Duration::from_millis(500),
-                        )];
+                        let kickoff =
+                            vec![Action::StartTimeout(TimeoutKind::Propose, ROUND_TIMEOUT)];
                         process_actions(
                             Arc::clone(&driver_c),
                             Arc::clone(&peer_pool_c),
@@ -1552,20 +1547,23 @@ struct StateSnapshot {
     blob: Vec<u8>,
 }
 
-fn expected_snapshot_parent_hash(block_store: &BlockStore, height: u64) -> Result<Hash32> {
+fn expected_snapshot_parent_hash(block_store: &BlockStore, block: &Block) -> Result<Hash32> {
+    let height = block.header.height;
     if height <= 1 {
         return Ok(Hash32([0u8; 32]));
     }
     let parent_height = height - 1;
-    let parent = block_store
+    if let Some(parent) = block_store
         .get(parent_height)
         .with_context(|| format!("read snapshot parent block at height {parent_height}"))?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "snapshot parent block missing at height {parent_height}; refusing unsafe jump"
-            )
-        })?;
-    Ok(parent.header.block_hash())
+    {
+        return Ok(parent.header.block_hash());
+    }
+
+    // Snapshot catch-up is specifically for peers whose local block window may
+    // no longer contain the parent. The quorum-committed snapshot block still
+    // binds the parent hash that validators signed.
+    Ok(block.header.parent_hash)
 }
 
 async fn apply_state_snapshot<E: PetalExecutor>(
@@ -1600,7 +1598,7 @@ async fn apply_state_snapshot<E: PetalExecutor>(
         ));
     }
     let validator_set = { driver.engine.lock().validator_set.clone() };
-    let expected_parent_hash = expected_snapshot_parent_hash(&driver.block_store, height)?;
+    let expected_parent_hash = expected_snapshot_parent_hash(&driver.block_store, &block)?;
     validate_block_for_apply(
         &block,
         height,
@@ -2177,23 +2175,22 @@ mod tests {
         let parent = test_block(4, Hash32([0x44; 32]));
         let parent_hash = parent.header.block_hash();
         block_store.put(4, &parent).unwrap();
+        let snapshot = test_block(5, Hash32([0xAA; 32]));
 
-        let expected = expected_snapshot_parent_hash(&block_store, 5).unwrap();
+        let expected = expected_snapshot_parent_hash(&block_store, &snapshot).unwrap();
 
         assert_eq!(expected, parent_hash);
         assert_ne!(expected, Hash32([0x44; 32]));
     }
 
     #[test]
-    fn snapshot_parent_hash_rejects_unsafe_jump_without_local_parent() {
+    fn snapshot_parent_hash_falls_back_to_committed_header_when_parent_pruned() {
         let tmp = tempfile::tempdir().unwrap();
         let block_store = BlockStore::open(&tmp.path().join("blocks")).unwrap();
+        let snapshot = test_block(5, Hash32([0xAA; 32]));
 
-        let err = expected_snapshot_parent_hash(&block_store, 5).unwrap_err();
+        let expected = expected_snapshot_parent_hash(&block_store, &snapshot).unwrap();
 
-        assert!(
-            err.to_string().contains("refusing unsafe jump"),
-            "unexpected error: {err}"
-        );
+        assert_eq!(expected, snapshot.header.parent_hash);
     }
 }

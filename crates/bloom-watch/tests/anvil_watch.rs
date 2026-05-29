@@ -9,8 +9,8 @@
 //! cargo test -p bloom-watch -- --ignored
 //! ```
 //!
-//! Requires Foundry's `anvil` and `cast` to be available at
-//! `~/.foundry/bin/{anvil,cast}` (matching the path used by `bloom-it`).
+//! Requires Foundry's `anvil` and `cast` on `$PATH` (or `BLOOM_ANVIL_BIN` /
+//! `BLOOM_CAST_BIN`).
 
 use std::net::TcpListener;
 use std::process::Stdio;
@@ -25,8 +25,6 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
 
-const ANVIL_BIN: &str = "/Users/joshua/.foundry/bin/anvil";
-const CAST_BIN: &str = "/Users/joshua/.foundry/bin/cast";
 const FUNDER_PRIV_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 // Anvil prefunded account #1 — receives the funded watch.
 const ALICE_ADDR: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
@@ -55,9 +53,17 @@ fn pick_free_port() -> Result<u16> {
     Ok(l.local_addr()?.port())
 }
 
+fn anvil_bin() -> String {
+    std::env::var("BLOOM_ANVIL_BIN").unwrap_or_else(|_| "anvil".to_string())
+}
+
+fn cast_bin() -> String {
+    std::env::var("BLOOM_CAST_BIN").unwrap_or_else(|_| "cast".to_string())
+}
+
 async fn spawn_anvil() -> Result<AnvilGuard> {
     let port = pick_free_port()?;
-    let mut cmd = Command::new(ANVIL_BIN);
+    let mut cmd = Command::new(anvil_bin());
     cmd.arg("--port")
         .arg(port.to_string())
         .arg("--host")
@@ -93,7 +99,7 @@ async fn spawn_anvil() -> Result<AnvilGuard> {
 }
 
 async fn fund(rpc_url: &str, to: &str, value_eth: u64) -> Result<()> {
-    let out = Command::new(CAST_BIN)
+    let out = Command::new(cast_bin())
         .arg("send")
         .arg("--private-key")
         .arg(FUNDER_PRIV_KEY)
