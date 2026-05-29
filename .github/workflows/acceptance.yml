@@ -17,8 +17,14 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
-      - name: Install Rust toolchain
-        run: rustup show
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Install Rust toolchain and WASM target
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
       - name: Build workspace (release-ish; debug is fine for acceptance)
@@ -41,9 +47,11 @@ jobs:
             echo "available=false" >> "$GITHUB_OUTPUT"
             echo "::notice::docker not available on runner; skipping docker DEX gate"
           fi
-      - name: Install Rust toolchain
+      - name: Install Rust toolchain and WASM target
         if: steps.docker.outputs.available == 'true'
-        run: rustup show
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
       - name: Cache cargo
         if: steps.docker.outputs.available == 'true'
         uses: Swatinem/rust-cache@v2
