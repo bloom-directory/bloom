@@ -112,8 +112,14 @@ if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
         -p bloom-petal-dex-pool \
         -p bloom-petal-dex-router)
 
-    log "building docker image (bloom-eth:test) — must match current tree"
-    (cd "$REPO_ROOT" && "${DC[@]}" -f "$COMPOSE_FILE" build)
+    if [ "${BLOOM_DOCKER_IMAGE_PREBUILT:-0}" = "1" ]; then
+        log "using prebuilt docker image (bloom-eth:test)"
+        docker image inspect bloom-eth:test >/dev/null \
+            || fail "BLOOM_DOCKER_IMAGE_PREBUILT=1 but bloom-eth:test is missing"
+    else
+        log "building docker image (bloom-eth:test) — must match current tree"
+        (cd "$REPO_ROOT" && "${DC[@]}" -f "$COMPOSE_FILE" build)
+    fi
 
     log "building host-side bloom (release, all features for NFS mount)"
     (cd "$REPO_ROOT" && cargo build --release -p bloom --all-features)

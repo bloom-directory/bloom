@@ -108,7 +108,21 @@ jobs:
           cache-targets: false
       - name: Install NFS client
         run: sudo apt-get update && sudo apt-get install -y nfs-common
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: bloom-eth:test
+          network: host
+          cache-from: type=gha,scope=bloom-eth
+          cache-to: type=gha,scope=bloom-eth,mode=max
       - name: Run docker petal VFS acceptance
+        env:
+          BLOOM_DOCKER_IMAGE_PREBUILT: "1"
         run: scripts/test-docker-petal-vfs.sh
       - name: Show sccache stats
         if: always()
