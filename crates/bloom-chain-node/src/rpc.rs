@@ -823,11 +823,7 @@ impl RpcServer {
         let block_head = self.block_store.latest_height()?.unwrap_or(0);
         let indexed_head = self.state_index.latest_height()?.unwrap_or(0);
         let chain_head = block_head.max(indexed_head);
-        let height = at_block.unwrap_or(if indexed_head > 0 {
-            indexed_head
-        } else {
-            block_head
-        });
+        let height = at_block.unwrap_or(block_head);
         if height > chain_head {
             return Err(anyhow!(
                 "HeightUnavailable {{ requested: {height}, oldest_retained: {}, head: {chain_head} }}",
@@ -856,7 +852,9 @@ impl RpcServer {
             }
         };
 
-        let state = if height == 0 && chain_head == 0 && self.state_index.get(0)?.is_none() {
+        let state = if at_block.is_none() && height == block_head {
+            self.state.lock().clone()
+        } else if height == 0 && chain_head == 0 && self.state_index.get(0)?.is_none() {
             self.state.lock().clone()
         } else {
             self.load_indexed_state(height, chain_head)?
@@ -1916,21 +1914,13 @@ mod tests {
         server.blob_store.put(&blob).unwrap();
         server.state_index.put(1, &old_root, &blob_hash).unwrap();
 
-        let current_root = {
+        {
             let mut current = server.state.lock();
             let new_hash = current.insert_code(&wasm_new);
             current.set_vfs_binding(path.to_string(), new_hash);
-            current.state_root()
-        };
+        }
         let block2 = test_block_with_timestamp(2, 20);
         server.block_store.put(2, &block2).unwrap();
-        let current_state = server.state.lock().clone();
-        let (blob2, blob2_hash) = current_state.to_blob(2, block2.header.parent_hash);
-        server.blob_store.put(&blob2).unwrap();
-        server
-            .state_index
-            .put(2, &current_root, &blob2_hash)
-            .unwrap();
 
         let historical = server
             .handle_view_call(&json!({
@@ -1949,6 +1939,8 @@ mod tests {
         assert_eq!(historical["at_block"], 1);
         assert_eq!(historical["chain_head"], 2);
         assert_eq!(historical["commands"][0]["returns"][0], "42");
+        assert_eq!(tip["at_block"], 2);
+        assert_eq!(tip["chain_head"], 2);
         assert_eq!(tip["commands"][0]["returns"][0], "99");
 
         let genesis = server
