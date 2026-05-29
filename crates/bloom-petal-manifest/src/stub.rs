@@ -52,6 +52,7 @@ pub fn to_petal_manifest_stub(m: &PetalManifestV0) -> PetalManifestStub {
 fn project_function(f: &FunctionDecl) -> FunctionDeclStub {
     FunctionDeclStub {
         name: f.name.clone(),
+        view: f.view,
         type_params: f.type_params.iter().map(project_type_param).collect(),
         args: f
             .args
@@ -143,6 +144,7 @@ mod tests {
             module_path: "/bloom/test".into(),
             functions: vec![FunctionDecl {
                 name: "f".into(),
+                view: true,
                 type_params: vec![TypeParamDecl {
                     name: "T".into(),
                     kind: TypeParamKind::Phantom,
@@ -181,6 +183,7 @@ mod tests {
         assert_eq!(s.functions.len(), 1);
         let f = &s.functions[0];
         assert_eq!(f.name, "f");
+        assert!(f.view);
         assert_eq!(f.type_params.len(), 1);
         assert!(f.type_params[0].phantom);
         assert_eq!(f.args.len(), 4);

@@ -21,7 +21,7 @@ use bloom_objects::{AbilitySet, AccessMode, TypeTag};
 use crate::types::{
     ArgDecl, ArgKind, CapabilityDecl, ExternalTypeRef, FieldDecl, FuelHints, FunctionDecl,
     HostImportDecl, InvariantDecl, InvariantTarget, ObjectTypeDecl, PetalManifestV0, PredicateAst,
-    SemVer, TypeParamDecl, TypeParamKind, WasmFuncSig, WasmValType,
+    SCHEMA_VERSION, SemVer, TypeParamDecl, TypeParamKind, WasmFuncSig, WasmValType,
 };
 
 // ===========================================================================
@@ -37,13 +37,20 @@ pub fn encode(manifest: &PetalManifestV0) -> Result<Vec<u8>, CodecError> {
 
 /// Canonical-encode the manifest into an existing buffer.
 pub fn encode_into(manifest: &PetalManifestV0, buf: &mut Vec<u8>) -> Result<(), CodecError> {
+    if !matches!(manifest.schema_version, 1 | SCHEMA_VERSION) {
+        return Err(CodecError::InvalidLength(manifest.schema_version as u64));
+    }
     write_u32_be(buf, manifest.schema_version);
     write_string(buf, &manifest.module_path)?;
     write_semver(buf, &manifest.framework_version);
     write_option_hash(buf, manifest.parent_version.as_ref());
     write_list(buf, &manifest.object_types, write_object_type_decl)?;
     write_list(buf, &manifest.capability_types, write_capability_decl)?;
-    write_list(buf, &manifest.functions, write_function_decl)?;
+    match manifest.schema_version {
+        1 => write_list(buf, &manifest.functions, write_function_decl_v1)?,
+        SCHEMA_VERSION => write_list(buf, &manifest.functions, write_function_decl_v2)?,
+        other => return Err(CodecError::InvalidLength(other as u64)),
+    }
     write_list(buf, &manifest.invariants, write_invariant_decl)?;
     write_list(buf, &manifest.required_host_imports, write_host_import_decl)?;
     write_list(buf, &manifest.external_type_refs, write_external_type_ref)?;
@@ -62,12 +69,19 @@ pub fn decode(bytes: &[u8]) -> Result<PetalManifestV0, CodecError> {
 /// Decode from a cursor (allows trailing bytes; used when nested).
 pub fn decode_from(rdr: &mut &[u8]) -> Result<PetalManifestV0, CodecError> {
     let schema_version = read_u32_be(rdr)?;
+    if !matches!(schema_version, 1 | SCHEMA_VERSION) {
+        return Err(CodecError::InvalidLength(schema_version as u64));
+    }
     let module_path = read_string(rdr)?;
     let framework_version = read_semver(rdr)?;
     let parent_version = read_option_hash(rdr)?;
     let object_types = read_list(rdr, read_object_type_decl)?;
     let capability_types = read_list(rdr, read_capability_decl)?;
-    let functions = read_list(rdr, read_function_decl)?;
+    let functions = match schema_version {
+        1 => read_list(rdr, read_function_decl_v1)?,
+        SCHEMA_VERSION => read_list(rdr, read_function_decl_v2)?,
+        other => return Err(CodecError::InvalidLength(other as u64)),
+    };
     let invariants = read_list(rdr, read_invariant_decl)?;
     let required_host_imports = read_list(rdr, read_host_import_decl)?;
     let external_type_refs = read_list(rdr, read_external_type_ref)?;
@@ -266,7 +280,7 @@ fn read_arg_decl(rdr: &mut &[u8]) -> Result<ArgDecl, CodecError> {
     Ok(ArgDecl { name, kind })
 }
 
-fn write_function_decl(buf: &mut Vec<u8>, f: &FunctionDecl) -> Result<(), CodecError> {
+fn write_function_decl_v1(buf: &mut Vec<u8>, f: &FunctionDecl) -> Result<(), CodecError> {
     write_string(buf, &f.name)?;
     write_list(buf, &f.type_params, write_type_param)?;
     write_list(buf, &f.args, write_arg_decl)?;
@@ -282,7 +296,13 @@ fn write_function_decl(buf: &mut Vec<u8>, f: &FunctionDecl) -> Result<(), CodecE
     Ok(())
 }
 
-fn read_function_decl(rdr: &mut &[u8]) -> Result<FunctionDecl, CodecError> {
+fn write_function_decl_v2(buf: &mut Vec<u8>, f: &FunctionDecl) -> Result<(), CodecError> {
+    write_function_decl_v1(buf, f)?;
+    write_u8(buf, u8::from(f.view));
+    Ok(())
+}
+
+fn read_function_decl_v1(rdr: &mut &[u8]) -> Result<FunctionDecl, CodecError> {
     let name = read_string(rdr)?;
     let type_params = read_list(rdr, read_type_param)?;
     let args = read_list(rdr, read_arg_decl)?;
@@ -296,6 +316,7 @@ fn read_function_decl(rdr: &mut &[u8]) -> Result<FunctionDecl, CodecError> {
     }
     Ok(FunctionDecl {
         name,
+        view: false,
         type_params,
         args,
         returns,
@@ -303,6 +324,16 @@ fn read_function_decl(rdr: &mut &[u8]) -> Result<FunctionDecl, CodecError> {
         required_capabilities,
         attached_invariants,
     })
+}
+
+fn read_function_decl_v2(rdr: &mut &[u8]) -> Result<FunctionDecl, CodecError> {
+    let mut f = read_function_decl_v1(rdr)?;
+    f.view = match read_u8(rdr)? {
+        0 => false,
+        1 => true,
+        other => return Err(CodecError::InvalidDiscriminant(other)),
+    };
+    Ok(f)
 }
 
 fn write_invariant_decl(buf: &mut Vec<u8>, inv: &InvariantDecl) -> Result<(), CodecError> {
@@ -549,6 +580,7 @@ mod tests {
             }],
             functions: vec![FunctionDecl {
                 name: "swap".to_string(),
+                view: false,
                 type_params: vec![],
                 args: vec![
                     ArgDecl {
@@ -643,16 +675,16 @@ mod tests {
 
     #[test]
     fn snapshot_minimal_first_bytes() {
-        // schema_version (1) || module_path ("/x" = 2 bytes)
+        // schema_version (2) || module_path ("/x" = 2 bytes)
         let m = PetalManifestV0 {
-            schema_version: 1,
+            schema_version: SCHEMA_VERSION,
             module_path: "/x".to_string(),
             framework_version: SemVer::new(0, 1, 0),
             ..Default::default()
         };
         let bytes = encode(&m).unwrap();
-        // [0,0,0,1] schema || [0,2] len || "/x" || semver [0,0,0,1,0,0] || option none [0] || 6 empty lists of u32 zero || fuel_hints len 0 || default none 0
-        assert_eq!(&bytes[..4], &[0, 0, 0, 1]);
+        // [0,0,0,2] schema || [0,2] len || "/x" || semver [0,0,0,1,0,0] || option none [0] || 6 empty lists of u32 zero || fuel_hints len 0 || default none 0
+        assert_eq!(&bytes[..4], &[0, 0, 0, 2]);
         assert_eq!(&bytes[4..6], &[0, 2]);
         assert_eq!(&bytes[6..8], b"/x");
         assert_eq!(&bytes[8..14], &[0, 0, 0, 1, 0, 0]);
@@ -685,6 +717,7 @@ mod tests {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDecl {
                     name: "f".to_string(),
+                    view: false,
                     args: vec![ArgDecl {
                         name: "o".to_string(),
                         kind: ArgKind::Object {
@@ -767,5 +800,41 @@ mod tests {
         };
         let back = decode(&encode(&m).unwrap()).unwrap();
         assert_eq!(back, m);
+    }
+
+    #[test]
+    fn function_view_round_trips_in_schema_v2() {
+        let m = PetalManifestV0 {
+            schema_version: SCHEMA_VERSION,
+            module_path: "/p".to_string(),
+            functions: vec![FunctionDecl {
+                name: "quote".to_string(),
+                view: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let back = decode(&encode(&m).unwrap()).unwrap();
+        assert_eq!(back.functions[0].name, "quote");
+        assert!(back.functions[0].view);
+    }
+
+    #[test]
+    fn schema_v1_function_decodes_with_view_false() {
+        let m = PetalManifestV0 {
+            schema_version: 1,
+            module_path: "/p".to_string(),
+            functions: vec![FunctionDecl {
+                name: "legacy".to_string(),
+                view: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let bytes = encode(&m).unwrap();
+        let back = decode(&bytes).unwrap();
+        assert_eq!(back.schema_version, 1);
+        assert_eq!(back.functions[0].name, "legacy");
+        assert!(!back.functions[0].view);
     }
 }

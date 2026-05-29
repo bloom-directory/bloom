@@ -55,6 +55,8 @@ impl PetalManifestStub {
 pub struct FunctionDeclStub {
     /// Function name (PTB `MoveCmd::function` must equal this).
     pub name: String,
+    /// True if this function is declared read-only and may be called as a view.
+    pub view: bool,
     /// Generic type parameters.
     pub type_params: Vec<TypeParamDeclStub>,
     /// Declared argument kinds (in order).

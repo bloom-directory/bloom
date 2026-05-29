@@ -10,13 +10,13 @@ use bloom_objects::{AbilitySet, AccessMode, TypeTag};
 
 /// Schema version this crate produces. Bumped when the manifest layout
 /// changes incompatibly.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Custom section name embedded into every new-framework petal (spec §8.1).
 pub const MANIFEST_CUSTOM_SECTION: &str = "bloom_petal_manifest_v0";
 
 /// Top-level manifest emitted by `#[bloom::petal]`.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PetalManifestV0 {
     /// `= SCHEMA_VERSION` for this crate's emission.
     pub schema_version: u32,
@@ -40,6 +40,24 @@ pub struct PetalManifestV0 {
     pub external_type_refs: Vec<ExternalTypeRef>,
     /// Declared per-function fuel ceilings (opt-in).
     pub fuel_hints: FuelHints,
+}
+
+impl Default for PetalManifestV0 {
+    fn default() -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            module_path: String::new(),
+            framework_version: SemVer::default(),
+            parent_version: None,
+            object_types: Vec::new(),
+            capability_types: Vec::new(),
+            functions: Vec::new(),
+            invariants: Vec::new(),
+            required_host_imports: Vec::new(),
+            external_type_refs: Vec::new(),
+            fuel_hints: FuelHints::default(),
+        }
+    }
 }
 
 /// Semantic version triple. Carried in the manifest so chain/explorers
@@ -127,6 +145,8 @@ pub struct CapabilityDecl {
 pub struct FunctionDecl {
     /// Function name (`__petal_<name>` wasm export drops the prefix).
     pub name: String,
+    /// True if this function is declared read-only and may be called as a view.
+    pub view: bool,
     /// Generic parameters in declaration order.
     pub type_params: Vec<TypeParamDecl>,
     /// Argument decls in source order.
@@ -291,8 +311,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn schema_version_is_one() {
-        assert_eq!(SCHEMA_VERSION, 1);
+    fn schema_version_is_two() {
+        assert_eq!(SCHEMA_VERSION, 2);
     }
 
     #[test]
@@ -306,7 +326,7 @@ mod tests {
     #[test]
     fn default_manifest_is_empty() {
         let m = PetalManifestV0::default();
-        assert_eq!(m.schema_version, 0);
+        assert_eq!(m.schema_version, SCHEMA_VERSION);
         assert!(m.functions.is_empty());
         assert!(m.object_types.is_empty());
     }

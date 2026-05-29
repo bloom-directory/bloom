@@ -128,6 +128,7 @@ fn move_split_transfer_happy_path() {
         PetalManifestStub {
             module_path: "/test/loader".to_string(),
             functions: vec![FunctionDeclStub {
+                view: false,
                 name: "load_coin".to_string(),
                 type_params: vec![],
                 args: vec![ArgDeclStub::Object {

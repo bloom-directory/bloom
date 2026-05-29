@@ -159,6 +159,7 @@ fn ptb_second_command_abort_rolls_back_first() {
         PetalManifestStub {
             module_path: "/test/loader".to_string(),
             functions: vec![FunctionDeclStub {
+                view: false,
                 name: "load_coin".to_string(),
                 type_params: vec![],
                 args: vec![ArgDeclStub::Object {
@@ -291,6 +292,7 @@ fn ptb_orphaned_split_coin_rolls_back() {
         PetalManifestStub {
             module_path: "/dex/loader".to_string(),
             functions: vec![FunctionDeclStub {
+                view: false,
                 name: "load_coin".to_string(),
                 type_params: vec![],
                 args: vec![ArgDeclStub::Object {

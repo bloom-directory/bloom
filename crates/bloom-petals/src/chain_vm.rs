@@ -13,6 +13,7 @@
 //! | `wasm_simd` | `true` | Standard deterministic SIMD is allowed. |
 //! | `wasm_multi_memory` | `false` | Multiple memories are non-deterministic in ordering; banned per spec. |
 //! | `wasm_bulk_memory` | `true` | Bulk-memory is deterministic and useful; allowed. |
+//! | `wasm_tail_call` | `false` | Tail calls add alternate control-flow opcodes; chain mode rejects them. |
 //! | `wasm_threads` | `false` | Shared-memory threads break determinism; banned. |
 //! | `async_support` | `false` | Chain calls are fully synchronous (§7.6). |
 //! | `cranelift_opt_level` | `Speed` | Same as the existing engine; deterministic across runs. |
@@ -37,7 +38,10 @@
 //! 1. `return_data` / `revert_reason` are only set by their respective imports.
 //! 2. Any other trap leaves both `None`, so the dispatch can distinguish them.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use wasmtime::{Caller, Config, Engine, Linker, Module, OptLevel, Store};
 
@@ -50,6 +54,7 @@ use bloom_objects::{
     AccessMode, OWNER_KIND_ADDRESS, OWNER_KIND_IMMUTABLE, OWNER_KIND_OBJECT, OWNER_KIND_SHARED,
     Object, ObjectId, Owner, TypeTag,
 };
+use bloom_petal_manifest::{extract_petal_manifest_v0, types::PetalManifestV0};
 use bloom_script::{
     BorrowRow, CORE_FUNGIBLE_PATH,
     executor::LogEntry as PtbLogEntry,
@@ -180,6 +185,9 @@ fn chain_engine() -> Result<&'static Engine, PetalError> {
         config.wasm_multi_memory(false);
         // Bulk-memory (memory.copy, memory.fill) is deterministic; allowed.
         config.wasm_bulk_memory(true);
+        // Tail-call opcodes are disabled in chain mode; the deploy-time verifier
+        // still rejects them explicitly when reachable from a view export.
+        config.wasm_tail_call(false);
         config.cranelift_opt_level(OptLevel::Speed);
         Engine::new(&config).map_err(|e| e.to_string())
     });
@@ -195,6 +203,9 @@ fn chain_engine() -> Result<&'static Engine, PetalError> {
 /// `"chain"` is retained only for the PTB calldata/return/revert shim used by
 /// the resource runtime. The other modules are the Bloom-native PTB surface.
 const CHAIN_ALLOWED_IMPORT_MODULES: &[&str] = &["chain", "object", "cap", "signer", "ptb", "log"];
+
+const VIEW_MUTATING_OBJECT_IMPORTS: &[&str] =
+    &["create", "transfer", "share", "freeze", "delete", "mutate"];
 
 /// Validate a wasm binary for chain-mode admission.
 ///
@@ -273,7 +284,177 @@ pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
                     }
                 }
             }
+            Payload::StartSection { func, .. } => {
+                return Err(PetalError::InvalidWasm(format!(
+                    "chain petal declares start function {func}; start sections are not allowed"
+                )));
+            }
             _ => {}
+        }
+    }
+    if let Some(manifest) = extract_petal_manifest_v0(bytes) {
+        validate_view_functions_are_pure(bytes, &manifest)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct StaticCallGraph {
+    exports: HashMap<String, u32>,
+    import_targets: HashMap<u32, (String, String)>,
+    calls: HashMap<u32, Vec<u32>>,
+    functions_with_indirect_calls: HashMap<u32, &'static str>,
+}
+
+fn validate_view_functions_are_pure(
+    bytes: &[u8],
+    manifest: &PetalManifestV0,
+) -> Result<(), PetalError> {
+    let graph = parse_static_call_graph(bytes)?;
+    for f in manifest.functions.iter().filter(|f| f.view) {
+        let export_name = format!("__petal_{}", f.name);
+        let start = graph.exports.get(&export_name).copied().ok_or_else(|| {
+            PetalError::InvalidWasm(format!(
+                "view function '{}' export '{export_name}' missing from wasm",
+                f.name
+            ))
+        })?;
+        reject_view_reachable_mutation(&graph, &f.name, start)?;
+    }
+    Ok(())
+}
+
+fn parse_static_call_graph(bytes: &[u8]) -> Result<StaticCallGraph, PetalError> {
+    use wasmparser::{ExternalKind, Operator, Parser, Payload, TypeRef};
+
+    let mut graph = StaticCallGraph::default();
+    let mut next_func_index = 0u32;
+    let mut defined_func_indices = Vec::<u32>::new();
+    let mut code_index = 0usize;
+
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|e| PetalError::InvalidWasm(e.to_string()))?;
+        match payload {
+            Payload::ImportSection(reader) => {
+                for import in reader {
+                    let import = import.map_err(|e| PetalError::InvalidWasm(e.to_string()))?;
+                    if matches!(import.ty, TypeRef::Func(_)) {
+                        graph.import_targets.insert(
+                            next_func_index,
+                            (import.module.to_string(), import.name.to_string()),
+                        );
+                        next_func_index = next_func_index.checked_add(1).ok_or_else(|| {
+                            PetalError::InvalidWasm("function index overflow".into())
+                        })?;
+                    }
+                }
+            }
+            Payload::FunctionSection(reader) => {
+                for ty in reader {
+                    ty.map_err(|e| PetalError::InvalidWasm(e.to_string()))?;
+                    defined_func_indices.push(next_func_index);
+                    next_func_index = next_func_index
+                        .checked_add(1)
+                        .ok_or_else(|| PetalError::InvalidWasm("function index overflow".into()))?;
+                }
+            }
+            Payload::ExportSection(reader) => {
+                for export in reader {
+                    let export = export.map_err(|e| PetalError::InvalidWasm(e.to_string()))?;
+                    if export.kind == ExternalKind::Func {
+                        graph.exports.insert(export.name.to_string(), export.index);
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(body) => {
+                let func_idx = *defined_func_indices.get(code_index).ok_or_else(|| {
+                    PetalError::InvalidWasm("code section has more bodies than functions".into())
+                })?;
+                code_index += 1;
+
+                let mut calls = Vec::new();
+                let operators = body
+                    .get_operators_reader()
+                    .map_err(|e| PetalError::InvalidWasm(e.to_string()))?;
+                for op in operators {
+                    match op.map_err(|e| PetalError::InvalidWasm(e.to_string()))? {
+                        Operator::Call { function_index } => calls.push(function_index),
+                        Operator::ReturnCall { function_index } => calls.push(function_index),
+                        Operator::CallIndirect { .. } => {
+                            graph
+                                .functions_with_indirect_calls
+                                .entry(func_idx)
+                                .or_insert("call_indirect");
+                        }
+                        Operator::ReturnCallIndirect { .. } => {
+                            graph
+                                .functions_with_indirect_calls
+                                .entry(func_idx)
+                                .or_insert("return_call_indirect");
+                        }
+                        Operator::CallRef { .. } => {
+                            graph
+                                .functions_with_indirect_calls
+                                .entry(func_idx)
+                                .or_insert("call_ref");
+                        }
+                        Operator::ReturnCallRef { .. } => {
+                            graph
+                                .functions_with_indirect_calls
+                                .entry(func_idx)
+                                .or_insert("return_call_ref");
+                        }
+                        _ => {}
+                    }
+                }
+                if !calls.is_empty() {
+                    graph.calls.insert(func_idx, calls);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if code_index != defined_func_indices.len() {
+        return Err(PetalError::InvalidWasm(format!(
+            "code section body count {} does not match function count {}",
+            code_index,
+            defined_func_indices.len()
+        )));
+    }
+
+    Ok(graph)
+}
+
+fn reject_view_reachable_mutation(
+    graph: &StaticCallGraph,
+    view_name: &str,
+    start: u32,
+) -> Result<(), PetalError> {
+    let mut seen = HashSet::new();
+    let mut stack = vec![start];
+    while let Some(func_idx) = stack.pop() {
+        if !seen.insert(func_idx) {
+            continue;
+        }
+
+        if let Some(op) = graph.functions_with_indirect_calls.get(&func_idx) {
+            return Err(PetalError::InvalidWasm(format!(
+                "view function '{view_name}' reaches {op} in function index {func_idx}"
+            )));
+        }
+
+        if let Some((module, name)) = graph.import_targets.get(&func_idx) {
+            if module == "object" && VIEW_MUTATING_OBJECT_IMPORTS.contains(&name.as_str()) {
+                return Err(PetalError::InvalidWasm(format!(
+                    "view function '{view_name}' reaches mutating host import object.{name}"
+                )));
+            }
+            continue;
+        }
+
+        if let Some(calls) = graph.calls.get(&func_idx) {
+            stack.extend(calls.iter().copied());
         }
     }
     Ok(())

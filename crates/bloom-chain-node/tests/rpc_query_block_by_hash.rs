@@ -16,6 +16,8 @@ use std::sync::Arc;
 use bloom_chain_node::block_store::BlockStore;
 use bloom_chain_node::mempool_persist::MempoolPersist;
 use bloom_chain_node::receipt_store::ReceiptStore;
+use bloom_chain_node::state_blob::StateBlobStore;
+use bloom_chain_node::state_index::StateIndex;
 use bloom_chain_node::{RpcClient, RpcServer};
 use bloom_chain_state::State;
 use bloom_chain_types::{
@@ -63,6 +65,11 @@ async fn chain_query_block_by_hash_matches_by_height() {
         Arc::new(BlockStore::open(&tmp.path().join("blocks")).expect("open BlockStore"));
     let receipt_store =
         Arc::new(ReceiptStore::open(&tmp.path().join("receipts")).expect("open ReceiptStore"));
+    let blob_store =
+        Arc::new(StateBlobStore::open(&tmp.path().join("state_blobs")).expect("open blob store"));
+    let state_index = Arc::new(
+        StateIndex::open(&tmp.path().join("state_index.sqlite")).expect("open state index"),
+    );
     let mempool_persist = Arc::new(
         MempoolPersist::open(&tmp.path().join("mempool.sled")).expect("open MempoolPersist"),
     );
@@ -85,6 +92,8 @@ async fn chain_query_block_by_hash_matches_by_height() {
     let server = RpcServer {
         state,
         block_store: Arc::clone(&block_store),
+        blob_store,
+        state_index,
         mempool_persist,
         receipt_store,
         validator_set,
@@ -93,6 +102,7 @@ async fn chain_query_block_by_hash_matches_by_height() {
         local_address: v.addr,
         startup_height: 0,
         tx_submit,
+        max_view_fuel_limit: 1_000_000,
     };
 
     // Bind serve_tcp on an OS-assigned port. We resolve the port by binding

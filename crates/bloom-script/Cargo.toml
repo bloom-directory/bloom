@@ -12,6 +12,8 @@ bloom-objects.workspace = true
 bloom-chain-types.workspace = true
 blake3.workspace = true
 thiserror.workspace = true
+serde_json.workspace = true
+hex.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

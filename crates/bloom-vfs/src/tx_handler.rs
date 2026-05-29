@@ -645,6 +645,7 @@ mod tests {
 
     fn func(name: &str, args: Vec<ArgDeclStub>, returns: Vec<TypeTag>) -> FunctionDeclStub {
         FunctionDeclStub {
+            view: false,
             name: name.to_string(),
             type_params: vec![],
             args,

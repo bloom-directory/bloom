@@ -266,6 +266,7 @@ pub fn manifest_nullary(fn_name: &str) -> PetalManifestStub {
     PetalManifestStub {
         module_path: "/dex/petal-it".to_string(),
         functions: vec![FunctionDeclStub {
+            view: false,
             name: fn_name.to_string(),
             type_params: vec![],
             args: vec![],

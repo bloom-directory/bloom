@@ -41,6 +41,7 @@
 
 #![deny(missing_docs)]
 
+pub mod abi_json;
 pub mod borrow_table;
 pub mod chain_iface;
 pub mod encode;
@@ -51,6 +52,9 @@ pub mod host_ctx;
 pub mod types;
 pub mod validator;
 
+pub use abi_json::{
+    JsonAbiError, decode_json_const, decode_json_type_tag, decode_return_json, encode_type_tag_json,
+};
 pub use borrow_table::{BorrowRow, BorrowTable, RowState};
 pub use chain_iface::{
     ArgDeclStub, ChainStateIface, ExternalTypeRefStub, FunctionDeclStub, InvariantDeclStub,
@@ -70,5 +74,6 @@ pub use types::{
     loom_marker_type_tag, resolve_fungible_petal_hash,
 };
 pub use validator::{
-    AlwaysOkVerifier, SignatureVerifier, ValidatedPtb, ValidationContext, validate_ptb,
+    AlwaysOkVerifier, SignatureVerifier, ValidatedPtb, ValidationContext, ValidationMode,
+    validate_ptb,
 };

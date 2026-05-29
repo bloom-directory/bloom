@@ -1323,7 +1323,7 @@ mod tests {
         Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PqSignature, PtbTx, PublishCmd, UseRef,
         loom_coin_type_tag,
     };
-    use crate::validator::{AlwaysOkVerifier, ValidationContext, validate_ptb};
+    use crate::validator::{AlwaysOkVerifier, ValidationContext, ValidationMode, validate_ptb};
     use bloom_chain_types::Hash32;
     use bloom_objects::{Object, Owner};
     use std::cell::RefCell;
@@ -1517,6 +1517,7 @@ mod tests {
     fn run(chain: &MockChain, runner: &MockPetalRunner, tx: PtbTx) -> ExecutionReport {
         let verifier = AlwaysOkVerifier;
         let ctx = ValidationContext {
+            mode: ValidationMode::Commit,
             current_block: chain.block,
             chain,
             verifier: &verifier,
@@ -1551,6 +1552,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "f".to_string(),
                     type_params: vec![],
                     args: vec![],
@@ -1589,6 +1591,7 @@ mod tests {
         let manifest = PetalManifestStub {
             module_path: "/p".to_string(),
             functions: vec![FunctionDeclStub {
+                view: false,
                 name: "mint".to_string(),
                 type_params: vec![],
                 args: vec![],
@@ -1665,6 +1668,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "f".to_string(),
                     type_params: vec![],
                     args: vec![],
@@ -1708,6 +1712,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "f".to_string(),
                     type_params: vec![],
                     args: vec![],
@@ -1756,6 +1761,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "f".to_string(),
                     type_params: vec![],
                     args: vec![],
@@ -1799,6 +1805,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "f".to_string(),
                     type_params: vec![],
                     args: vec![],
@@ -1855,6 +1862,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "generic".to_string(),
                     type_params: vec![TypeParamDeclStub {
                         name: "T".to_string(),
@@ -1908,6 +1916,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "load".to_string(),
                     type_params: vec![],
                     args: vec![],
@@ -1934,6 +1943,7 @@ mod tests {
         let mut manifest_with_arg = PetalManifestStub {
             module_path: "/p".to_string(),
             functions: vec![FunctionDeclStub {
+                view: false,
                 name: "load".to_string(),
                 type_params: vec![],
                 args: vec![ArgDeclStub::Object {
@@ -2014,6 +2024,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "load".to_string(),
                     type_params: vec![],
                     args: vec![ArgDeclStub::Object {
@@ -2056,6 +2067,7 @@ mod tests {
 
         let verifier = AlwaysOkVerifier;
         let vctx = ValidationContext {
+            mode: ValidationMode::Commit,
             current_block: chain.block,
             chain: &chain,
             verifier: &verifier,
@@ -2080,6 +2092,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "load".to_string(),
                     type_params: vec![],
                     args: vec![ArgDeclStub::Object {
@@ -2150,6 +2163,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "load".to_string(),
                     type_params: vec![],
                     args: vec![ArgDeclStub::Object {
@@ -2215,6 +2229,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "load".to_string(),
                     type_params: vec![],
                     args: vec![ArgDeclStub::Object {
@@ -2300,6 +2315,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "noop".to_string(),
                     type_params: vec![],
                     args: vec![],
@@ -2356,6 +2372,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "load_two".to_string(),
                     type_params: vec![],
                     args: vec![
@@ -2444,6 +2461,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "load_two".to_string(),
                     type_params: vec![],
                     args: vec![
@@ -2528,6 +2546,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "load_two".to_string(),
                     type_params: vec![],
                     args: vec![
@@ -2588,6 +2607,7 @@ mod tests {
 
         let verifier = AlwaysOkVerifier;
         let vctx = ValidationContext {
+            mode: ValidationMode::Commit,
             current_block: chain.block,
             chain: &chain,
             verifier: &verifier,
@@ -2607,6 +2627,7 @@ mod tests {
         let mut manifest = PetalManifestStub {
             module_path: "/p".to_string(),
             functions: vec![FunctionDeclStub {
+                view: false,
                 name: "f".to_string(),
                 type_params: vec![],
                 args: vec![],
@@ -2658,6 +2679,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "f".to_string(),
                     type_params: vec![],
                     args: vec![],
@@ -2717,6 +2739,7 @@ mod tests {
         );
         let verifier = AlwaysOkVerifier;
         let ctx = ValidationContext {
+            mode: ValidationMode::Commit,
             current_block: chain.block,
             chain: &chain,
             verifier: &verifier,
@@ -2880,6 +2903,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "f".to_string(),
                     type_params: vec![],
                     args: vec![ArgDeclStub::Object {
@@ -2920,6 +2944,7 @@ mod tests {
 
         let verifier = AlwaysOkVerifier;
         let vctx = ValidationContext {
+            mode: ValidationMode::Commit,
             current_block: chain.block,
             chain: &chain,
             verifier: &verifier,
@@ -2950,6 +2975,7 @@ mod tests {
                 module_path: "/p".to_string(),
                 functions: vec![
                     FunctionDeclStub {
+                        view: false,
                         name: "mut".to_string(),
                         type_params: vec![],
                         args: vec![ArgDeclStub::Object {
@@ -2960,6 +2986,7 @@ mod tests {
                         attached_invariants: vec![],
                     },
                     FunctionDeclStub {
+                        view: false,
                         name: "ro".to_string(),
                         type_params: vec![],
                         args: vec![ArgDeclStub::Object {
@@ -3016,6 +3043,7 @@ mod tests {
 
         let verifier = AlwaysOkVerifier;
         let vctx = ValidationContext {
+            mode: ValidationMode::Commit,
             current_block: chain.block,
             chain: &chain,
             verifier: &verifier,
@@ -3045,6 +3073,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "mint".to_string(),
                     type_params: vec![],
                     args: vec![],
@@ -3108,6 +3137,7 @@ mod tests {
 
         let verifier = AlwaysOkVerifier;
         let vctx = ValidationContext {
+            mode: ValidationMode::Commit,
             current_block: chain.block,
             chain: &chain,
             verifier: &verifier,
@@ -3148,6 +3178,7 @@ mod tests {
             PetalManifestStub {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "f".to_string(),
                     type_params: vec![],
                     args: vec![],
@@ -3179,6 +3210,7 @@ mod tests {
 
         let verifier = AlwaysOkVerifier;
         let vctx = ValidationContext {
+            mode: ValidationMode::Commit,
             current_block: chain.block,
             chain: &chain,
             verifier: &verifier,

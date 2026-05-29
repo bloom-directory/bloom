@@ -75,4 +75,12 @@ impl StateIndex {
         let h: Option<i64> = stmt.query_row([], |row| row.get(0))?;
         Ok(h.map(|v| v as u64))
     }
+
+    /// Return the lowest indexed height, or `None` if empty.
+    pub fn oldest_height(&self) -> Result<Option<u64>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare_cached("SELECT MIN(height) FROM state_index")?;
+        let h: Option<i64> = stmt.query_row([], |row| row.get(0))?;
+        Ok(h.map(|v| v as u64))
+    }
 }

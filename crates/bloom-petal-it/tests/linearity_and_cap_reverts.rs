@@ -131,6 +131,7 @@ fn linearity_violation_reverts_atomically() {
             PetalManifestStub {
                 module_path: "/test/linearity".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "load_coin".to_string(),
                     type_params: vec![],
                     args: vec![ArgDeclStub::Object {
@@ -427,6 +428,7 @@ fn revert_atomicity_state_is_unchanged() {
             PetalManifestStub {
                 module_path: "/test/lin".to_string(),
                 functions: vec![FunctionDeclStub {
+                    view: false,
                     name: "load_coin".to_string(),
                     type_params: vec![],
                     args: vec![ArgDeclStub::Object {

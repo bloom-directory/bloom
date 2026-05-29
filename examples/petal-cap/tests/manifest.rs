@@ -66,7 +66,7 @@ struct Arg {
 
 fn decode(bytes: &[u8]) -> Manifest {
     let mut r = bytes;
-    let _schema_version = read_u32_be(&mut r).unwrap();
+    let schema_version = read_u32_be(&mut r).unwrap();
     let module_path = read_string(&mut r).unwrap();
     // semver (3 x u16)
     let _ = read_u16_be(&mut r).unwrap();
@@ -80,7 +80,7 @@ fn decode(bytes: &[u8]) -> Manifest {
 
     let object_types = decode_list(&mut r, decode_object_type);
     let capability_types = decode_list(&mut r, decode_capability);
-    let functions = decode_list(&mut r, decode_function);
+    let functions = decode_list(&mut r, |r| decode_function(r, schema_version));
 
     Manifest {
         module_path,
@@ -159,7 +159,7 @@ fn decode_arg(r: &mut &[u8]) -> Arg {
     }
 }
 
-fn decode_function(r: &mut &[u8]) -> Function {
+fn decode_function(r: &mut &[u8], schema_version: u32) -> Function {
     let name = read_string(r).unwrap();
     let _type_params = decode_list(r, decode_type_param);
     let args = decode_list(r, decode_arg);
@@ -172,6 +172,9 @@ fn decode_function(r: &mut &[u8]) -> Function {
     let n = read_u32_be(r).unwrap() as usize;
     for _ in 0..n {
         let _ = read_u16_be(r).unwrap();
+    }
+    if schema_version >= 2 {
+        let _view = read_u8(r).unwrap();
     }
     Function {
         name,

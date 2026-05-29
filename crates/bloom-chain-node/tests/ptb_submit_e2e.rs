@@ -243,6 +243,7 @@ fn manifest_with_nullary_fn_returns(fn_name: &str, returns: Vec<TypeTag>) -> Pet
     PetalManifestStub {
         module_path: "/test/e2e".to_string(),
         functions: vec![FunctionDeclStub {
+            view: false,
             name: fn_name.to_string(),
             type_params: vec![],
             args: vec![],
@@ -695,6 +696,7 @@ fn object_create_then_transfer_round_trips_through_unified_ctx() {
         PetalManifestStub {
             module_path: "/test/e2e".to_string(),
             functions: vec![FunctionDeclStub {
+                view: false,
                 name: "create_and_transfer".to_string(),
                 type_params: vec![],
                 args: vec![ArgDeclStub::Const(new_obj_type.clone())],

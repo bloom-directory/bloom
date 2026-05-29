@@ -94,6 +94,7 @@ fn ptb_single_hop_swap_shape() {
         PetalManifestStub {
             module_path: "/dex/router-proxy".to_string(),
             functions: vec![FunctionDeclStub {
+                view: false,
                 name: "load_coin".to_string(),
                 type_params: vec![],
                 args: vec![ArgDeclStub::Object {

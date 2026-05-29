@@ -43,8 +43,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bloom_objects::{Object, TypeTag, ValidationOutcome, validate_canonical_bytes};
 use bloom_script::{
     AlwaysOkVerifier, Arg, ArgDeclStub, ChainStateIface, Command, MoveCmd, PetalRef, PqPubkey,
-    PqSignature, PtbError, PtbTx, SignatureVerifier, UseRef, ValidationContext, loom_coin_type_tag,
-    validate_ptb,
+    PqSignature, PtbError, PtbTx, SignatureVerifier, UseRef, ValidationContext, ValidationMode,
+    loom_coin_type_tag, validate_ptb,
 };
 
 use crate::error::BuildError;
@@ -549,6 +549,7 @@ impl<'a> PtbSession<'a> {
         validate_ptb(
             &for_validation,
             &ValidationContext {
+                mode: ValidationMode::Commit,
                 current_block: self.chain.current_block(),
                 chain: self.chain,
                 verifier: &verifier as &dyn SignatureVerifier,

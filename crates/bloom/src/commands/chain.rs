@@ -74,6 +74,40 @@ pub enum ChainCmd {
         #[arg(long, value_name = "N", default_value_t = 30u64)]
         wait_timeout_secs: u64,
     },
+    /// Execute one read-only petal call against the latest committed snapshot.
+    View {
+        /// Composed view command array as JSON. When set, --path/--function/--arg are ignored.
+        #[arg(long, value_name = "JSON")]
+        commands: Option<String>,
+        /// Deployed petal path, e.g. `/bloom/apps/bloombook`.
+        #[arg(long)]
+        path: Option<String>,
+        /// Petal function name, e.g. `counts`.
+        #[arg(long)]
+        function: Option<String>,
+        /// Optional pinned petal hash. If omitted, the node resolves `--path`.
+        #[arg(long)]
+        hash: Option<String>,
+        /// JSON argument descriptor. Repeat for each argument.
+        ///
+        /// Examples:
+        /// `--arg '{"kind":"object","id":"<object-id>"}'`
+        /// `--arg '{"kind":"const","hex":"0000000000000000000000000000002a"}'`
+        #[arg(long = "arg", value_name = "JSON")]
+        args: Vec<String>,
+        /// Canonical TypeTag bytes as hex. Repeat for generic functions.
+        #[arg(long = "type-arg", value_name = "HEX")]
+        type_args: Vec<String>,
+        /// Signer address to expose to `&Signer` args. Repeat as needed.
+        #[arg(long = "signer", value_name = "ADDR")]
+        signers: Vec<String>,
+        /// Evaluate against a retained historical block height.
+        #[arg(long, value_name = "HEIGHT")]
+        at_block: Option<u64>,
+        /// Fuel cap for the non-committing execution.
+        #[arg(long, value_name = "N", default_value_t = 1_000_000u64)]
+        fuel_limit: u64,
+    },
     /// Query chain state.
     #[command(subcommand)]
     Query(QueryCmd),
@@ -351,6 +385,60 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
                     json!({ "address": addr, "key": key_hex }),
                 )
                 .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+
+        // ── view petal call ──────────────────────────────────────────────────
+        ChainCmd::View {
+            commands,
+            path,
+            function,
+            hash,
+            args,
+            type_args,
+            signers,
+            at_block,
+            fuel_limit,
+        } => {
+            let parsed_args = args
+                .iter()
+                .map(|arg| {
+                    serde_json::from_str::<serde_json::Value>(arg)
+                        .with_context(|| format!("parse --arg JSON: {arg}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let parsed_commands = commands
+                .as_deref()
+                .map(|commands| {
+                    serde_json::from_str::<serde_json::Value>(commands)
+                        .with_context(|| format!("parse --commands JSON: {commands}"))
+                })
+                .transpose()?;
+            let client = make_client();
+            let params = if let Some(commands) = parsed_commands {
+                json!({
+                    "commands": commands,
+                    "signers": signers,
+                    "at_block": at_block,
+                    "fuel_limit": fuel_limit,
+                })
+            } else {
+                let path = path.context("--path is required unless --commands is set")?;
+                let function =
+                    function.context("--function is required unless --commands is set")?;
+                json!({
+                    "path": path,
+                    "function": function,
+                    "hash": hash,
+                    "args": parsed_args,
+                    "type_args": type_args,
+                    "signers": signers,
+                    "at_block": at_block,
+                    "fuel_limit": fuel_limit,
+                })
+            };
+            let result = client.call("chain_view_call", params).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }

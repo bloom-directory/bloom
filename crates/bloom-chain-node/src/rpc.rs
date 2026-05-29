@@ -22,6 +22,7 @@
 //! - `chain_query_code` — look up code bytes by 32-byte content hash.
 //! - `chain_resolve_path` — resolve a signed manifest module path to a petal hash.
 //! - `chain_ls_objects` — scan objects filtered by owner address or type name.
+//! - `chain_view_call` — execute one read-only petal call against a snapshot.
 //! - `chain_ls_validators` — list the current validator set.
 
 use std::io::ErrorKind;
@@ -38,9 +39,14 @@ use bloom_chain_types::{
     tx::Tx,
     types::{Address, Hash32},
 };
-use bloom_objects::Object;
+use bloom_objects::{AccessMode, Object, ObjectId, TypeTag};
 use bloom_petal_manifest::{extract_petal_manifest_v0, to_petal_manifest_stub};
-use bloom_script::{ChainStateIface, PetalManifestStub};
+use bloom_script::{
+    ArgDeclStub, CORE_FUNGIBLE_PATH, ChainStateIface, PetalManifestStub, decode_json_const,
+    decode_json_type_tag, decode_return_json, loom_coin_type_tag,
+    types::{Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PtbTx},
+    validator::{SignatureVerifier, ValidationMode},
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -51,10 +57,15 @@ use tracing::{debug, error, warn};
 
 use crate::block_store::BlockStore;
 use crate::mempool_persist::MempoolPersist;
+use crate::petal_executor::run_ptb;
+use crate::ptb_chain_iface::PtbChainAdapter;
+use crate::state_blob::StateBlobStore;
+use crate::state_index::StateIndex;
 
 pub const RPC_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 pub const RPC_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 pub const RPC_MAX_TX_BYTES: usize = 1024 * 1024;
+const DEFAULT_VIEW_FUEL_LIMIT: u64 = 1_000_000;
 const RPC_MAX_TCP_CONNECTIONS: usize = 128;
 const RPC_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const RPC_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -104,6 +115,56 @@ impl JsonRpcResponse {
     }
 }
 
+#[derive(Deserialize, Debug)]
+struct ViewCallParams {
+    #[serde(default)]
+    commands: Vec<ViewCommandParams>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    function: Option<String>,
+    #[serde(default)]
+    hash: Option<String>,
+    #[serde(default)]
+    type_args: Vec<Value>,
+    #[serde(default)]
+    args: Vec<Value>,
+    #[serde(default)]
+    signers: Vec<String>,
+    #[serde(default)]
+    at_block: Option<u64>,
+    #[serde(default)]
+    fuel_limit: Option<u64>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct ViewCommandParams {
+    path: String,
+    function: String,
+    #[serde(default)]
+    hash: Option<String>,
+    #[serde(default)]
+    type_args: Vec<Value>,
+    #[serde(default)]
+    args: Vec<Value>,
+}
+
+#[derive(Debug)]
+struct ViewSnapshot {
+    state: State,
+    height: u64,
+    block_ctx: bloom_petals::BlockCtx,
+    chain_head: u64,
+}
+
+struct ViewNoSignatureVerifier;
+
+impl SignatureVerifier for ViewNoSignatureVerifier {
+    fn verify(&self, _digest: &[u8; 32], _pubkey: &[u8; 32], _signature: &[u8]) -> bool {
+        unreachable!("ReadOnly validation must not verify signatures")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RpcServer
 // ---------------------------------------------------------------------------
@@ -113,6 +174,8 @@ impl JsonRpcResponse {
 pub struct RpcServer {
     pub state: Arc<Mutex<State>>,
     pub block_store: Arc<BlockStore>,
+    pub blob_store: Arc<StateBlobStore>,
+    pub state_index: Arc<StateIndex>,
     pub mempool_persist: Arc<MempoolPersist>,
     pub receipt_store: Arc<crate::receipt_store::ReceiptStore>,
     pub validator_set: Arc<ValidatorSet>,
@@ -132,6 +195,8 @@ pub struct RpcServer {
         Tx,
         tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     )>,
+    /// Node-side maximum for standalone view fuel.
+    pub max_view_fuel_limit: u64,
 }
 
 impl RpcServer {
@@ -284,6 +349,7 @@ impl RpcServer {
             "chain_query_code" => self.handle_query_code(params),
             "chain_resolve_path" => self.handle_resolve_path(params),
             "chain_ls_objects" => self.handle_ls_objects(params),
+            "chain_view_call" => self.handle_view_call(params),
             "chain_ls_validators" => self.handle_ls_validators(),
             "chain_tip" => self.handle_tip(),
             "chain_health" => self.handle_health(),
@@ -567,6 +633,265 @@ impl RpcServer {
         }))
     }
 
+    fn handle_view_call(&self, params: &Value) -> Result<Value> {
+        let params: ViewCallParams = serde_json::from_value(params.clone())
+            .context("chain_view_call: invalid params shape")?;
+        let requested_commands = view_commands_from_params(&params)?;
+        let snapshot = self.resolve_view_snapshot(params.at_block)?;
+        let state = snapshot.state;
+        let adapter = PtbChainAdapter::new(&state, snapshot.height);
+
+        let signers = view_signers(&params)?;
+        let mut commands = Vec::with_capacity(requested_commands.len());
+        let mut response_meta = Vec::with_capacity(requested_commands.len());
+        let mut declared_returns = Vec::with_capacity(requested_commands.len());
+
+        for (cmd_idx, cmd) in requested_commands.iter().enumerate() {
+            if cmd.path.is_empty() {
+                return Err(anyhow!(
+                    "chain_view_call: command {cmd_idx}: path must not be empty"
+                ));
+            }
+            if cmd.function.is_empty() {
+                return Err(anyhow!(
+                    "chain_view_call: command {cmd_idx}: function must not be empty"
+                ));
+            }
+            let bound_hash = adapter
+                .resolve_path(&cmd.path)
+                .ok_or_else(|| anyhow!("chain_view_call: path not deployed: {}", cmd.path))?;
+            let petal_hash = match cmd.hash.as_deref() {
+                Some(hash) => {
+                    let pinned = parse_hash_hex(hash).with_context(|| {
+                        format!("chain_view_call: command {cmd_idx}: decode hash")
+                    })?;
+                    if pinned != bound_hash {
+                        return Err(anyhow!(
+                            "chain_view_call: petal hash mismatch for path {}",
+                            cmd.path
+                        ));
+                    }
+                    pinned
+                }
+                None => bound_hash,
+            };
+            if bound_hash != petal_hash {
+                return Err(anyhow!(
+                    "chain_view_call: petal hash mismatch for path {}",
+                    cmd.path
+                ));
+            }
+            let manifest = adapter
+                .load_manifest(&petal_hash)
+                .ok_or_else(|| anyhow!("chain_view_call: manifest not found for {}", cmd.path))?;
+            let function = manifest.function(&cmd.function).ok_or_else(|| {
+                anyhow!(
+                    "chain_view_call: function {} not found in {}",
+                    cmd.function,
+                    cmd.path
+                )
+            })?;
+            if !function.view {
+                return Err(anyhow!("FunctionNotAView: {}::{}", cmd.path, cmd.function));
+            }
+            let type_args = cmd
+                .type_args
+                .iter()
+                .enumerate()
+                .map(|(idx, value)| {
+                    decode_json_type_tag(value).with_context(|| {
+                        format!("chain_view_call: command {cmd_idx}: type_arg {idx}")
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let args = decode_view_args(cmd_idx, &cmd.args, &function.args, &type_args, &state)?;
+            declared_returns.push(
+                function
+                    .returns
+                    .iter()
+                    .map(|t| {
+                        resolve_self_type_refs(&substitute_type_args(t, &type_args), petal_hash.0)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            response_meta.push((cmd.path.clone(), cmd.function.clone(), petal_hash));
+            commands.push(Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: cmd.path.clone(),
+                    hash: Some(petal_hash),
+                },
+                function: cmd.function.clone(),
+                type_args,
+                args,
+            }));
+        }
+
+        let fuel_limit = params
+            .fuel_limit
+            .unwrap_or(DEFAULT_VIEW_FUEL_LIMIT)
+            .min(self.max_view_fuel_limit.max(1));
+        let fungible_petal_hash = state.vfs_lookup(CORE_FUNGIBLE_PATH).ok_or_else(|| {
+            anyhow!("chain_view_call: missing required VFS binding for {CORE_FUNGIBLE_PATH}")
+        })?;
+        let loom_coin_type = loom_coin_type_tag(fungible_petal_hash);
+        let tx = PtbTx {
+            signers,
+            commands,
+            gas_payer: ObjectId([0u8; 32]),
+            gas_budget: fuel_limit,
+            gas_price: 0,
+            expiry_block: snapshot.height,
+            signatures: vec![],
+        };
+
+        let verifier = ViewNoSignatureVerifier;
+        let sender = Address(tx.signers.first().copied().unwrap_or([0u8; 32]));
+        let run = run_ptb(
+            &state,
+            snapshot.height,
+            snapshot.block_ctx,
+            sender,
+            &tx,
+            loom_coin_type,
+            fungible_petal_hash,
+            &verifier,
+            None,
+            ValidationMode::ReadOnly,
+            |_validated, snapshot| Ok(snapshot),
+        )
+        .context("chain_view_call: validation/execution failed")?;
+        let report = run.report;
+
+        if !report.success {
+            let reason = report
+                .reverted_with
+                .as_ref()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "view call reverted".to_string());
+            return Err(anyhow!("chain_view_call: {reason}"));
+        }
+        if !report.object_writes.is_empty()
+            || !report.object_deletes.is_empty()
+            || !report.ownership_changes.is_empty()
+            || !report.publish_events.is_empty()
+        {
+            return Err(anyhow!(
+                "chain_view_call: view attempted state changes (writes={}, deletes={}, ownership_changes={}, publish_events={})",
+                report.object_writes.len(),
+                report.object_deletes.len(),
+                report.ownership_changes.len(),
+                report.publish_events.len(),
+            ));
+        }
+
+        let mut out_commands = Vec::with_capacity(response_meta.len());
+        for (idx, (path, function, petal_hash)) in response_meta.into_iter().enumerate() {
+            let outputs = report.command_outputs.get(idx).cloned().unwrap_or_default();
+            let raw = outputs.iter().map(hex::encode).collect::<Vec<_>>();
+            let mut typed = Vec::with_capacity(outputs.len());
+            for (ret_idx, bytes) in outputs.iter().enumerate() {
+                let Some(tag) = declared_returns.get(idx).and_then(|v| v.get(ret_idx)) else {
+                    typed.push(Value::Null);
+                    continue;
+                };
+                typed.push(decode_return_json(tag, bytes)?.unwrap_or(Value::Null));
+            }
+            out_commands.push(json!({
+                "path": path,
+                "function": function,
+                "petal_hash": hex::encode(petal_hash.0),
+                "returns": typed,
+                "returns_raw": raw,
+                "logs": [],
+            }));
+        }
+
+        Ok(json!({
+            "at_block": snapshot.height,
+            "chain_head": snapshot.chain_head,
+            "fuel_used": report.fuel_used,
+            "commands": out_commands,
+            "logs": report.logs.iter().map(|l| json!({
+                "petal": hex::encode(l.petal.0),
+                "topic": hex::encode(&l.topic),
+                "data": hex::encode(&l.data),
+            })).collect::<Vec<_>>(),
+        }))
+    }
+
+    fn resolve_view_snapshot(&self, at_block: Option<u64>) -> Result<ViewSnapshot> {
+        let block_head = self.block_store.latest_height()?.unwrap_or(0);
+        let indexed_head = self.state_index.latest_height()?.unwrap_or(0);
+        let chain_head = block_head.max(indexed_head);
+        let height = at_block.unwrap_or(if indexed_head > 0 {
+            indexed_head
+        } else {
+            block_head
+        });
+        if height > chain_head {
+            return Err(anyhow!(
+                "HeightUnavailable {{ requested: {height}, oldest_retained: {}, head: {chain_head} }}",
+                self.state_index.oldest_height()?.unwrap_or(chain_head)
+            ));
+        }
+
+        let block_ctx = if height == 0 {
+            bloom_petals::BlockCtx {
+                number: 0,
+                timestamp_ms: 0,
+                prevhash: Hash32([0u8; 32]),
+            }
+        } else {
+            let oldest_retained = self.state_index.oldest_height()?.unwrap_or(chain_head);
+            let block = self.block_store.get(height)?.ok_or_else(|| {
+                anyhow!(
+                    "HeightUnavailable {{ requested: {height}, oldest_retained: {}, head: {chain_head} }}",
+                    oldest_retained
+                )
+            })?;
+            bloom_petals::BlockCtx {
+                number: height,
+                timestamp_ms: block.header.timestamp_ms,
+                prevhash: block.header.parent_hash,
+            }
+        };
+
+        let state = if height == 0 && chain_head == 0 && self.state_index.get(0)?.is_none() {
+            self.state.lock().clone()
+        } else {
+            self.load_indexed_state(height, chain_head)?
+        };
+
+        Ok(ViewSnapshot {
+            state,
+            height,
+            block_ctx,
+            chain_head,
+        })
+    }
+
+    fn load_indexed_state(&self, height: u64, chain_head: u64) -> Result<State> {
+        let oldest_retained = self.state_index.oldest_height()?.unwrap_or(chain_head);
+        let Some((state_root, blob_hash)) = self.state_index.get(height)? else {
+            return Err(anyhow!(
+                "HeightUnavailable {{ requested: {height}, oldest_retained: {oldest_retained}, head: {chain_head} }}"
+            ));
+        };
+        let Some(blob) = self.blob_store.get(&blob_hash)? else {
+            return Err(anyhow!(
+                "HeightUnavailable {{ requested: {height}, oldest_retained: {oldest_retained}, head: {chain_head} }}"
+            ));
+        };
+        let actual_blob_hash = State::blob_hash(&blob);
+        if actual_blob_hash != blob_hash {
+            return Err(anyhow!(
+                "chain_view_call: state blob hash mismatch at height {height}"
+            ));
+        }
+        State::from_blob(&blob, state_root)
+            .with_context(|| format!("chain_view_call: restore state at height {height}"))
+    }
+
     fn handle_tip(&self) -> Result<Value> {
         let h = self.block_store.latest_height()?.unwrap_or(0);
         Ok(json!({ "height": h }))
@@ -615,6 +940,242 @@ impl RpcServer {
             "latest_block_hash": latest_block.as_ref().map(|block| hex::encode(block.header.block_hash().0)),
             "validator_set_hash": hex::encode(self.validator_set.validator_set_hash().0),
         }))
+    }
+}
+
+fn view_commands_from_params(params: &ViewCallParams) -> Result<Vec<ViewCommandParams>> {
+    if !params.commands.is_empty() {
+        return Ok(params.commands.clone());
+    }
+    let path = params
+        .path
+        .clone()
+        .ok_or_else(|| anyhow!("chain_view_call: provide commands or path/function"))?;
+    let function = params
+        .function
+        .clone()
+        .ok_or_else(|| anyhow!("chain_view_call: provide commands or path/function"))?;
+    Ok(vec![ViewCommandParams {
+        path,
+        function,
+        hash: params.hash.clone(),
+        type_args: params.type_args.clone(),
+        args: params.args.clone(),
+    }])
+}
+
+fn view_signers(params: &ViewCallParams) -> Result<Vec<[u8; 32]>> {
+    params
+        .signers
+        .iter()
+        .map(|s| parse_address(s).map(|a| a.0))
+        .collect()
+}
+
+fn decode_view_args(
+    cmd_idx: usize,
+    values: &[Value],
+    decls: &[ArgDeclStub],
+    type_args: &[TypeTag],
+    state: &State,
+) -> Result<Vec<Arg>> {
+    if values.len() != decls.len() {
+        return Err(anyhow!(
+            "chain_view_call: command {cmd_idx}: arg count mismatch: got {}, expected {}",
+            values.len(),
+            decls.len()
+        ));
+    }
+    values
+        .iter()
+        .zip(decls.iter())
+        .enumerate()
+        .map(|(arg_idx, (value, decl))| match decl {
+            ArgDeclStub::Signer => parse_signer_arg(cmd_idx, arg_idx, value),
+            ArgDeclStub::Const(tag) => parse_const_arg(cmd_idx, arg_idx, tag, type_args, value),
+            ArgDeclStub::Object { .. } => parse_object_arg(cmd_idx, arg_idx, value, state),
+            ArgDeclStub::TypeArg(idx) => {
+                let tag = if let Some(tag) = type_args.get(*idx as usize) {
+                    tag.clone()
+                } else {
+                    decode_json_type_tag(value).with_context(|| {
+                        format!("chain_view_call: command {cmd_idx}: arg {arg_idx}: TypeTag")
+                    })?
+                };
+                Ok(Arg::TypeArg(tag))
+            }
+        })
+        .collect()
+}
+
+fn parse_signer_arg(cmd_idx: usize, arg_idx: usize, value: &Value) -> Result<Arg> {
+    let index = if let Some(index) = value.as_u64() {
+        index
+    } else if let Some(index) = value.get("signer").and_then(Value::as_u64) {
+        index
+    } else if value.get("kind").and_then(Value::as_str) == Some("signer") {
+        value.get("index").and_then(Value::as_u64).ok_or_else(|| {
+            anyhow!("chain_view_call: command {cmd_idx}: arg {arg_idx}: signer index missing")
+        })?
+    } else {
+        return Err(anyhow!(
+            "chain_view_call: command {cmd_idx}: arg {arg_idx}: expected signer index"
+        ));
+    };
+    Ok(Arg::Signer(index.try_into().map_err(|_| {
+        anyhow!("chain_view_call: command {cmd_idx}: arg {arg_idx}: signer index out of range")
+    })?))
+}
+
+fn parse_const_arg(
+    cmd_idx: usize,
+    arg_idx: usize,
+    tag: &TypeTag,
+    type_args: &[TypeTag],
+    value: &Value,
+) -> Result<Arg> {
+    if value.get("kind").and_then(Value::as_str) == Some("const")
+        && let Some(hex) = value.get("hex").and_then(Value::as_str)
+    {
+        return Ok(Arg::Const(hex::decode(hex).with_context(|| {
+            format!("chain_view_call: command {cmd_idx}: arg {arg_idx}: const hex")
+        })?));
+    }
+    if let Some(use_ref) = parse_use_arg(value)? {
+        return Ok(Arg::Use {
+            cmd_idx: use_ref.0,
+            ret_idx: use_ref.1,
+        });
+    }
+    let resolved = substitute_type_args(tag, type_args);
+    Ok(Arg::Const(
+        decode_json_const(&resolved, value).with_context(|| {
+            format!("chain_view_call: command {cmd_idx}: arg {arg_idx}: decode typed const")
+        })?,
+    ))
+}
+
+fn parse_object_arg(cmd_idx: usize, arg_idx: usize, value: &Value, state: &State) -> Result<Arg> {
+    if let Some(use_ref) = parse_use_arg(value)? {
+        return Ok(Arg::Use {
+            cmd_idx: use_ref.0,
+            ret_idx: use_ref.1,
+        });
+    }
+    let obj = if value.get("kind").and_then(Value::as_str) == Some("object") {
+        value
+    } else {
+        value.get("object").unwrap_or(value)
+    };
+    let id_str = obj
+        .get("id")
+        .and_then(Value::as_str)
+        .or_else(|| obj.as_str())
+        .ok_or_else(|| {
+            anyhow!("chain_view_call: command {cmd_idx}: arg {arg_idx}: object id missing")
+        })?;
+    let id = parse_object_id_hex(id_str)?;
+    let expected_version = match obj.get("version").and_then(Value::as_u64) {
+        Some(version) => ExpectedVersion(version),
+        None => {
+            let obj = state
+                .get_object(&id)
+                .ok_or_else(|| anyhow!("object {} not found for view arg", hex::encode(id.0)))?;
+            ExpectedVersion(obj.version)
+        }
+    };
+    Ok(Arg::Object {
+        id,
+        expected_version,
+        access_mode: AccessMode::ReadOnly,
+    })
+}
+
+fn parse_use_arg(value: &Value) -> Result<Option<(u16, u16)>> {
+    let Some(use_value) = value.get("use") else {
+        return Ok(None);
+    };
+    let cmd = use_value
+        .get("cmd")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("view use-ref missing cmd"))?;
+    let ret = use_value
+        .get("ret")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("view use-ref missing ret"))?;
+    Ok(Some((
+        cmd.try_into()
+            .map_err(|_| anyhow!("view use-ref cmd out of range"))?,
+        ret.try_into()
+            .map_err(|_| anyhow!("view use-ref ret out of range"))?,
+    )))
+}
+
+fn parse_hash_hex(s: &str) -> Result<Hash32> {
+    let bytes = hex::decode(s).context("decode hash hex")?;
+    if bytes.len() != 32 {
+        return Err(anyhow!("hash must be 32 bytes (got {})", bytes.len()));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(Hash32(out))
+}
+
+fn parse_object_id_hex(s: &str) -> Result<ObjectId> {
+    let bytes = hex::decode(s).context("decode object id hex")?;
+    if bytes.len() != 32 {
+        return Err(anyhow!("object id must be 32 bytes (got {})", bytes.len()));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(ObjectId(out))
+}
+
+fn substitute_type_args(t: &TypeTag, type_args: &[TypeTag]) -> TypeTag {
+    match t {
+        TypeTag::Generic { idx } => type_args
+            .get(*idx as usize)
+            .cloned()
+            .unwrap_or_else(|| t.clone()),
+        TypeTag::Concrete {
+            petal_hash,
+            type_name,
+            type_args: inner,
+        } => TypeTag::Concrete {
+            petal_hash: *petal_hash,
+            type_name: type_name.clone(),
+            type_args: inner
+                .iter()
+                .map(|x| substitute_type_args(x, type_args))
+                .collect(),
+        },
+        TypeTag::External { .. } => t.clone(),
+    }
+}
+
+fn resolve_self_type_refs(t: &TypeTag, self_hash: [u8; 32]) -> TypeTag {
+    match t {
+        TypeTag::Concrete {
+            petal_hash,
+            type_name,
+            type_args,
+        } => TypeTag::Concrete {
+            petal_hash: if petal_hash == &[0u8; 32] && type_name != "Coin" {
+                self_hash
+            } else {
+                *petal_hash
+            },
+            type_name: type_name.clone(),
+            type_args: if type_name == "Coin" {
+                type_args.clone()
+            } else {
+                type_args
+                    .iter()
+                    .map(|x| resolve_self_type_refs(x, self_hash))
+                    .collect()
+            },
+        },
+        TypeTag::Generic { .. } | TypeTag::External { .. } => t.clone(),
     }
 }
 
@@ -963,6 +1524,9 @@ mod tests {
     use bloom_chain_types::block::{Block, BlockHeader};
     use bloom_chain_types::vote::Commit;
     use bloom_objects::{Object, ObjectId, Owner, TypeTag};
+    use bloom_petal_manifest::codec;
+    use bloom_petal_manifest::types::{FunctionDecl, PetalManifestV0, SCHEMA_VERSION, SemVer};
+    use bloom_script::DEFAULT_FUNGIBLE_PETAL_HASH;
     use bloom_test_util::{make_validator_set_signed, make_validator_with_keypair};
 
     /// Build an `RpcServer` over an in-memory `State` (with tempdir-backed
@@ -971,18 +1535,28 @@ mod tests {
     fn make_server() -> (RpcServer, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let block_store = Arc::new(BlockStore::open(&tmp.path().join("blocks")).unwrap());
+        let blob_store = Arc::new(
+            crate::state_blob::StateBlobStore::open(&tmp.path().join("state_blobs")).unwrap(),
+        );
+        let state_index = Arc::new(
+            crate::state_index::StateIndex::open(&tmp.path().join("state_index.sqlite")).unwrap(),
+        );
         let receipt_store = Arc::new(
             crate::receipt_store::ReceiptStore::open(&tmp.path().join("receipts")).unwrap(),
         );
         let mempool_persist =
             Arc::new(MempoolPersist::open(&tmp.path().join("mempool.sled")).unwrap());
-        let state = Arc::new(Mutex::new(State::new()));
+        let mut initial_state = State::new();
+        initial_state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
+        let state = Arc::new(Mutex::new(initial_state));
         let v = make_validator_with_keypair();
         let validator_set = Arc::new(make_validator_set_signed(&[&v], 100));
         let (tx_submit, _rx) = tokio::sync::mpsc::channel(8);
         let server = RpcServer {
             state,
             block_store,
+            blob_store,
+            state_index,
             mempool_persist,
             receipt_store,
             validator_set,
@@ -991,6 +1565,7 @@ mod tests {
             local_address: v.addr,
             startup_height: 0,
             tx_submit,
+            max_view_fuel_limit: DEFAULT_VIEW_FUEL_LIMIT,
         };
         (server, tmp)
     }
@@ -1038,6 +1613,64 @@ mod tests {
             version: 7,
             payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
         }
+    }
+
+    fn leb128(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                return;
+            }
+            out.push(b | 0x80);
+        }
+    }
+
+    fn custom_section(name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        leb128(&mut body, name.len() as u64);
+        body.extend_from_slice(name.as_bytes());
+        body.extend_from_slice(payload);
+        body
+    }
+
+    fn section(out: &mut Vec<u8>, id: u8, body: &[u8]) {
+        out.push(id);
+        leb128(out, body.len() as u64);
+        out.extend_from_slice(body);
+    }
+
+    fn append_manifest(mut wasm: Vec<u8>, manifest: PetalManifestV0) -> Vec<u8> {
+        let bytes = codec::encode(&manifest).expect("manifest encodes");
+        let custom = custom_section("bloom_petal_manifest_v0", &bytes);
+        section(&mut wasm, 0, &custom);
+        wasm
+    }
+
+    fn u128_tag() -> TypeTag {
+        TypeTag::Concrete {
+            petal_hash: [0u8; 32],
+            type_name: "u128".to_string(),
+            type_args: vec![],
+        }
+    }
+
+    fn view_manifest(path: &str, functions: Vec<FunctionDecl>) -> PetalManifestV0 {
+        PetalManifestV0 {
+            schema_version: SCHEMA_VERSION,
+            module_path: path.to_string(),
+            framework_version: SemVer::new(0, 1, 0),
+            functions,
+            ..Default::default()
+        }
+    }
+
+    fn install_view_wasm(server: &RpcServer, path: &str, wasm: &[u8]) -> Hash32 {
+        let mut state = server.state.lock();
+        let hash = state.insert_code(wasm);
+        state.set_vfs_binding(path.to_string(), hash);
+        hash
     }
 
     #[test]
@@ -1093,6 +1726,243 @@ mod tests {
             .handle_query_object(&json!({ "id": "deadbeef" }))
             .unwrap_err();
         assert!(err.to_string().contains("32 bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn view_call_executes_read_only_petal_without_committing_state() {
+        let (server, _tmp) = make_server();
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (import "chain" "petal.return" (func $ret (param i32 i32)))
+              (import "chain" "msg.calldata.read" (func $read (param i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              ;; count=1, len=16, u128=42
+              (data (i32.const 0) "\00\00\00\01\00\00\00\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
+              (func (export "__petal_answer") (param i32 i32) (result i32)
+                (call $ret (i32.const 0) (i32.const 24))
+                i32.const 0)
+            )
+            "#,
+        )
+        .unwrap();
+        let path = "/bloom/test/view";
+        let wasm = append_manifest(
+            wasm,
+            view_manifest(
+                path,
+                vec![FunctionDecl {
+                    name: "answer".to_string(),
+                    view: true,
+                    returns: vec![u128_tag()],
+                    ..Default::default()
+                }],
+            ),
+        );
+        let hash = install_view_wasm(&server, path, &wasm);
+
+        let res = server
+            .handle_view_call(&json!({
+                "path": path,
+                "function": "answer"
+            }))
+            .unwrap();
+
+        assert_eq!(res["at_block"], 0);
+        assert_eq!(res["chain_head"], 0);
+        assert_eq!(res["commands"][0]["path"], path);
+        assert_eq!(res["commands"][0]["function"], "answer");
+        assert_eq!(res["commands"][0]["petal_hash"], hex::encode(hash.0));
+        assert_eq!(res["commands"][0]["returns"][0], "42");
+        assert_eq!(
+            res["commands"][0]["returns_raw"][0],
+            "0000000000000000000000000000002a"
+        );
+        assert!(server.state.lock().iter_objects().next().is_none());
+    }
+
+    #[test]
+    fn view_call_composes_multiple_commands_with_use_refs() {
+        let (server, _tmp) = make_server();
+        let path = "/bloom/test/view-compose";
+        let wasm = wat::parse_str(
+            r#"
+            (module
+              (import "chain" "petal.return" (func $ret (param i32 i32)))
+              (import "chain" "msg.calldata.read" (func $read (param i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              ;; count=1, len=16, u128=42
+              (data (i32.const 0) "\00\00\00\01\00\00\00\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
+              (data (i32.const 64) "\00\00\00\01\00\00\00\10")
+              (func (export "__petal_answer") (param i32 i32) (result i32)
+                (call $ret (i32.const 0) (i32.const 24))
+                i32.const 0)
+              (func (export "__petal_echo") (param $ptr i32) (param $len i32) (result i32)
+                ;; Args buffer: count(4), tag(1), len(4), payload(16). Return count/len + payload.
+                (drop (call $read (i32.const 128) (i32.const 0) (i32.const 25)))
+                (memory.copy (i32.const 72) (i32.const 137) (i32.const 16))
+                (call $ret (i32.const 64) (i32.const 24))
+                i32.const 0)
+            )
+            "#,
+        )
+        .unwrap();
+        let wasm = append_manifest(
+            wasm,
+            view_manifest(
+                path,
+                vec![
+                    FunctionDecl {
+                        name: "answer".to_string(),
+                        view: true,
+                        returns: vec![u128_tag()],
+                        ..Default::default()
+                    },
+                    FunctionDecl {
+                        name: "echo".to_string(),
+                        view: true,
+                        args: vec![bloom_petal_manifest::types::ArgDecl {
+                            name: "value".to_string(),
+                            kind: bloom_petal_manifest::types::ArgKind::Const(u128_tag()),
+                        }],
+                        returns: vec![u128_tag()],
+                        ..Default::default()
+                    },
+                ],
+            ),
+        );
+        install_view_wasm(&server, path, &wasm);
+
+        let res = server
+            .handle_view_call(&json!({
+                "commands": [
+                    { "path": path, "function": "answer" },
+                    { "path": path, "function": "echo", "args": [ { "use": { "cmd": 0, "ret": 0 } } ] }
+                ]
+            }))
+            .unwrap();
+
+        assert_eq!(res["commands"][0]["returns"][0], "42");
+        assert_eq!(res["commands"][1]["returns"][0], "42");
+        assert_eq!(
+            res["commands"][1]["returns_raw"][0],
+            "0000000000000000000000000000002a"
+        );
+    }
+
+    #[test]
+    fn view_call_at_block_uses_retained_snapshot() {
+        let (server, _tmp) = make_server();
+        let path = "/bloom/test/historical-view";
+        let wasm_old = wat::parse_str(
+            r#"
+            (module
+              (import "chain" "petal.return" (func $ret (param i32 i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 0) "\00\00\00\01\00\00\00\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
+              (func (export "__petal_answer") (param i32 i32) (result i32)
+                (call $ret (i32.const 0) (i32.const 24))
+                i32.const 0)
+            )
+            "#,
+        )
+        .unwrap();
+        let wasm_new = wat::parse_str(
+            r#"
+            (module
+              (import "chain" "petal.return" (func $ret (param i32 i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 0) "\00\00\00\01\00\00\00\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\63")
+              (func (export "__petal_answer") (param i32 i32) (result i32)
+                (call $ret (i32.const 0) (i32.const 24))
+                i32.const 0)
+            )
+            "#,
+        )
+        .unwrap();
+        let wasm_old = append_manifest(
+            wasm_old,
+            view_manifest(
+                path,
+                vec![FunctionDecl {
+                    name: "answer".to_string(),
+                    view: true,
+                    returns: vec![u128_tag()],
+                    ..Default::default()
+                }],
+            ),
+        );
+        let wasm_new = append_manifest(
+            wasm_new,
+            view_manifest(
+                path,
+                vec![FunctionDecl {
+                    name: "answer".to_string(),
+                    view: true,
+                    returns: vec![u128_tag()],
+                    ..Default::default()
+                }],
+            ),
+        );
+
+        let mut old_state = State::new();
+        old_state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
+        let old_hash = old_state.insert_code(&wasm_old);
+        old_state.set_vfs_binding(path.to_string(), old_hash);
+        let old_root = old_state.state_root();
+        let block1 = test_block_with_timestamp(1, 10);
+        server.block_store.put(1, &block1).unwrap();
+        let (blob, blob_hash) = old_state.to_blob(1, block1.header.parent_hash);
+        server.blob_store.put(&blob).unwrap();
+        server.state_index.put(1, &old_root, &blob_hash).unwrap();
+
+        let current_root = {
+            let mut current = server.state.lock();
+            let new_hash = current.insert_code(&wasm_new);
+            current.set_vfs_binding(path.to_string(), new_hash);
+            current.state_root()
+        };
+        let block2 = test_block_with_timestamp(2, 20);
+        server.block_store.put(2, &block2).unwrap();
+        let current_state = server.state.lock().clone();
+        let (blob2, blob2_hash) = current_state.to_blob(2, block2.header.parent_hash);
+        server.blob_store.put(&blob2).unwrap();
+        server
+            .state_index
+            .put(2, &current_root, &blob2_hash)
+            .unwrap();
+
+        let historical = server
+            .handle_view_call(&json!({
+                "path": path,
+                "function": "answer",
+                "at_block": 1
+            }))
+            .unwrap();
+        let tip = server
+            .handle_view_call(&json!({
+                "path": path,
+                "function": "answer"
+            }))
+            .unwrap();
+
+        assert_eq!(historical["at_block"], 1);
+        assert_eq!(historical["chain_head"], 2);
+        assert_eq!(historical["commands"][0]["returns"][0], "42");
+        assert_eq!(tip["commands"][0]["returns"][0], "99");
+
+        let genesis = server
+            .handle_view_call(&json!({
+                "path": path,
+                "function": "answer",
+                "at_block": 0
+            }))
+            .unwrap_err();
+        let msg = genesis.to_string();
+        assert!(
+            msg.contains("HeightUnavailable") && msg.contains("requested: 0"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

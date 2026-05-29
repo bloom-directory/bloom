@@ -86,6 +86,7 @@ fn concrete(name: &str) -> TypeTag {
 
 fn func(name: &str, args: Vec<ArgDeclStub>, returns: Vec<TypeTag>) -> FunctionDeclStub {
     FunctionDeclStub {
+        view: false,
         name: name.to_string(),
         type_params: vec![],
         args,
@@ -279,6 +280,7 @@ fn append_object_arg_with_version_and_mode() {
 #[test]
 fn append_type_arg_for_generic_endpoint() {
     let chain = chain_with_pool(vec![FunctionDeclStub {
+        view: false,
         name: "identity".to_string(),
         type_params: vec![TypeParamDeclStub {
             name: "T".to_string(),
@@ -303,6 +305,7 @@ fn append_type_arg_for_generic_endpoint() {
 #[test]
 fn append_call_type_arg_for_generic_endpoint_without_type_arg_value() {
     let chain = chain_with_pool(vec![FunctionDeclStub {
+        view: false,
         name: "identity".to_string(),
         type_params: vec![TypeParamDeclStub {
             name: "T".to_string(),

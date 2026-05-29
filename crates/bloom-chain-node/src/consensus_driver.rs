@@ -39,8 +39,8 @@ use bloom_keystore::xdsa::{XdsaPublicKey, XdsaSignature};
 use bloom_objects::{OWNER_KIND_ADDRESS, Owner, OwnershipIndexKey, TypeTag};
 use bloom_petal_fungible::ops::decode_coin_value;
 use bloom_script::{
-    CORE_FUNGIBLE_PATH, PtbError, SignatureVerifier, ValidationContext, loom_coin_type_tag,
-    validate_ptb,
+    CORE_FUNGIBLE_PATH, PtbError, SignatureVerifier, ValidationContext, ValidationMode,
+    loom_coin_type_tag, validate_ptb,
 };
 use parking_lot::Mutex;
 use tracing::{info, warn};
@@ -152,6 +152,7 @@ impl BalanceView for StateAdmissionView<'_> {
             outer_pubkey: &outer.pubkey,
         };
         let ctx = ValidationContext {
+            mode: ValidationMode::Commit,
             current_block: self.current_block,
             chain: &adapter,
             verifier: &verifier,

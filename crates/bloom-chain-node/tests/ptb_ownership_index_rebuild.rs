@@ -156,6 +156,7 @@ fn manifest_for(obj_type: TypeTag) -> PetalManifestStub {
         module_path: "/test/p1-2".to_string(),
         functions: vec![
             FunctionDeclStub {
+                view: false,
                 name: "xfer".to_string(),
                 type_params: vec![],
                 args: vec![ArgDeclStub::Object {
@@ -166,6 +167,7 @@ fn manifest_for(obj_type: TypeTag) -> PetalManifestStub {
                 attached_invariants: vec![],
             },
             FunctionDeclStub {
+                view: false,
                 name: "del".to_string(),
                 type_params: vec![],
                 args: vec![ArgDeclStub::Object {

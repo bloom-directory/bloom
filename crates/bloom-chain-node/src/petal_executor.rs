@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bloom_chain_consensus::tx_admission::{MAX_CHAIN_WASM_BYTES, deploy_petal_fuel_for_bytes};
-use bloom_chain_state::State;
+use bloom_chain_state::{State, StateSnapshot};
 use bloom_chain_types::{
     receipt::Log,
     tx::{Tx, TxKind},
@@ -27,7 +27,8 @@ use bloom_petal_fungible::ops::{coin_payload, decode_coin_value, rewrite_value};
 use bloom_petal_manifest::extract_petal_manifest_v0;
 use bloom_petals::{BlockCtx as PetalBlockCtx, PetalVm};
 use bloom_script::{
-    AlwaysOkVerifier, CORE_FUNGIBLE_PATH, PetalManifestStub, SignatureVerifier, ValidationContext,
+    AlwaysOkVerifier, CORE_FUNGIBLE_PATH, PetalManifestStub, PtbError, SignatureVerifier,
+    ValidatedPtb, ValidationContext, ValidationMode,
     executor::{LogEntry as PtbLogEntry, PtbExecutor},
     host_ctx::PtbHostCtx,
     loom_coin_type_tag, validate_ptb,
@@ -481,6 +482,84 @@ fn resolve_fungible_petal_hash_from_state(state: &State) -> Result<Hash32, Strin
     })
 }
 
+/// Result of running a PTB through the shared validate + execute core.
+pub(crate) struct RunPtbOutput {
+    /// Complete PTB execution report.
+    pub report: bloom_script::ExecutionReport,
+    /// Snapshot after execution. Callers decide whether and how to commit it.
+    pub snapshot: StateSnapshot,
+}
+
+/// Shared PTB execution core for commit and read-only paths.
+///
+/// Snapshot selection is deliberately outside this helper: callers pass the
+/// exact [`State`] they want evaluated, and the helper has no height selector
+/// or historical-read concept.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_ptb(
+    state: &State,
+    block_number: u64,
+    block_ctx: PetalBlockCtx,
+    sender: Address,
+    ptb: &bloom_script::PtbTx,
+    loom_coin_type: TypeTag,
+    fungible_petal_hash: Hash32,
+    verifier: &dyn SignatureVerifier,
+    manifests: Option<&HashMap<Hash32, PetalManifestStub>>,
+    mode: ValidationMode,
+    prepare_snapshot: impl FnOnce(&ValidatedPtb, StateSnapshot) -> Result<StateSnapshot, PtbError>,
+) -> Result<RunPtbOutput, PtbError> {
+    let validated = {
+        let adapter = match manifests {
+            Some(m) => PtbChainAdapter::with_overrides(state, block_number, m),
+            None => PtbChainAdapter::new(state, block_number),
+        };
+        let ctx = ValidationContext {
+            mode,
+            current_block: block_number,
+            chain: &adapter,
+            verifier,
+            loom_coin_type: loom_coin_type.clone(),
+        };
+        validate_ptb(ptb, &ctx)?
+    };
+
+    let host_ctx = {
+        let mut c = PtbHostCtx::new();
+        c.signers = validated.tx.signers.clone();
+        Arc::new(Mutex::new(c))
+    };
+    let snapshot = prepare_snapshot(&validated, state.snapshot())?;
+    let petals_owned = ChainPetalRunner::petals_from_validated(&validated.petals);
+    let runner = ChainPetalRunner::new(
+        petals_owned,
+        Arc::clone(&host_ctx),
+        snapshot,
+        block_ctx,
+        sender,
+    );
+
+    let report = {
+        let adapter = match manifests {
+            Some(m) => PtbChainAdapter::with_overrides(state, block_number, m),
+            None => PtbChainAdapter::new(state, block_number),
+        };
+        let mut exec = PtbExecutor::with_ctx_arc(
+            &adapter,
+            &runner,
+            loom_coin_type,
+            fungible_petal_hash,
+            Arc::clone(&host_ctx),
+        );
+        exec.execute(validated)
+    };
+
+    Ok(RunPtbOutput {
+        report,
+        snapshot: runner.into_snapshot(),
+    })
+}
+
 /// Shared `PetalExecutor::execute_tx` body. The trailing `manifests`
 /// parameter is an optional per-petal manifest **override** map the
 /// PTB validator consults *before* the wasm custom-section path
@@ -617,62 +696,6 @@ fn execute_tx_impl(
                     };
                     let loom_coin_type = loom_coin_type_tag(fungible_petal_hash);
 
-                    // Capture per-PTB scratch we need across the
-                    // immutable borrow of `state` (validate) and
-                    // the mutable borrow (commit) below.
-                    let signers = ptb.signers.clone();
-
-                    let validated = {
-                        let adapter = match manifests {
-                            Some(m) => PtbChainAdapter::with_overrides(state, block_number, m),
-                            None => PtbChainAdapter::new(state, block_number),
-                        };
-                        let production_verifier;
-                        let always_ok_verifier;
-                        let verifier: &dyn SignatureVerifier = match signature_policy {
-                            PtbSignaturePolicy::ProductionXdsa => {
-                                production_verifier = XdsaPtbVerifier::new(state);
-                                &production_verifier
-                            }
-                            PtbSignaturePolicy::AlwaysOk => {
-                                always_ok_verifier = AlwaysOkVerifier;
-                                &always_ok_verifier
-                            }
-                        };
-                        let ctx = ValidationContext {
-                            current_block: block_number,
-                            chain: &adapter,
-                            verifier,
-                            loom_coin_type: loom_coin_type.clone(),
-                        };
-                        match validate_ptb(&ptb, &ctx) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                warn!(
-                                    sender = %hex::encode(tx.sender.0),
-                                    err = %e,
-                                    "SubmitPtb validation failed"
-                                );
-                                return ExecOutput {
-                                    success: false,
-                                    fuel_used: 0,
-                                    return_data: format!("ptb validation error: {e}").into_bytes(),
-                                    logs: vec![],
-                                    write_set: None,
-                                };
-                            }
-                        }
-                    };
-
-                    // Build the host-context + snapshot the runner
-                    // and §16.2 imports share.
-                    let host_ctx = {
-                        let mut c = PtbHostCtx::new();
-                        c.signers = signers;
-                        Arc::new(Mutex::new(c))
-                    };
-                    let mut snapshot = state.snapshot();
-
                     // P0-5: pre-execution gas reservation (spec §7.2
                     // step 6 + §9.4). The validator already verified
                     // that the gas-payer `Coin<LOOM>` exists, is
@@ -708,79 +731,75 @@ fn execute_tx_impl(
                             };
                         }
                     };
-                    let pre_exec_gas_payer = validated
-                        .objects
-                        .get(&gas_payer_id.0)
-                        .cloned()
-                        .expect("validator inserted gas_payer object");
-                    if reservation > 0 {
-                        // Apply pre-debit. `version` is monotonic on
-                        // every mutation (spec §4.4).
-                        let pre_value = decode_coin_value(&pre_exec_gas_payer.payload)
-                            .expect("validator decoded coin value");
-                        let debited = pre_value
-                            .checked_sub(reservation)
-                            .expect("reservation bounds debit");
-                        let new_payload = rewrite_value(&pre_exec_gas_payer.payload, debited)
-                            .expect("rewrite Coin<LOOM> payload");
-                        let mut debited_obj = pre_exec_gas_payer.clone();
-                        debited_obj.version = next_object_version(debited_obj.version);
-                        debited_obj.payload = new_payload;
-                        snapshot.insert_object(debited_obj);
-                    }
-
-                    let petals_owned = ChainPetalRunner::petals_from_validated(&validated.petals);
-                    let runner = ChainPetalRunner::new(
-                        petals_owned,
-                        Arc::clone(&host_ctx),
-                        snapshot,
+                    let production_verifier;
+                    let always_ok_verifier;
+                    let verifier: &dyn SignatureVerifier = match signature_policy {
+                        PtbSignaturePolicy::ProductionXdsa => {
+                            production_verifier = XdsaPtbVerifier::new(state);
+                            &production_verifier
+                        }
+                        PtbSignaturePolicy::AlwaysOk => {
+                            always_ok_verifier = AlwaysOkVerifier;
+                            &always_ok_verifier
+                        }
+                    };
+                    let mut pre_exec_gas_payer = None;
+                    let run = match run_ptb(
+                        state,
+                        block_number,
                         block_ctx.clone(),
                         tx.sender,
-                    );
-
-                    // The ChainStateIface adapter the executor
-                    // hands to its built-in commands needs a
-                    // borrow of `state`; create it inside this
-                    // scope so we drop it before reclaiming
-                    // ownership of the snapshot.
-                    //
-                    // CRITICAL (P0-2): the executor MUST share the
-                    // same `Arc<Mutex<PtbHostCtx>>` as the wasm
-                    // host imports. Without this, `object.borrow`
-                    // can't see pre-loaded objects, and
-                    // `object.create` rows land in a ctx the
-                    // executor never reads. We thread `host_ctx`
-                    // via `with_ctx_arc(...)` so the executor's
-                    // pre-load + diff-check + linearity-check
-                    // operate on the *same* borrow table the host
-                    // imports mutate.
-                    let report = {
-                        let adapter = match manifests {
-                            Some(m) => PtbChainAdapter::with_overrides(state, block_number, m),
-                            None => PtbChainAdapter::new(state, block_number),
-                        };
-                        let mut exec = PtbExecutor::with_ctx_arc(
-                            &adapter,
-                            &runner,
-                            loom_coin_type.clone(),
-                            fungible_petal_hash,
-                            Arc::clone(&host_ctx),
-                        );
-                        exec.execute(validated)
+                        &ptb,
+                        loom_coin_type.clone(),
+                        fungible_petal_hash,
+                        verifier,
+                        manifests,
+                        ValidationMode::Commit,
+                        |validated, mut snapshot| {
+                            let gas_obj = validated
+                                .objects
+                                .get(&gas_payer_id.0)
+                                .cloned()
+                                .expect("validator inserted gas_payer object");
+                            if reservation > 0 {
+                                // Apply pre-debit. `version` is monotonic on
+                                // every mutation (spec §4.4).
+                                let pre_value = decode_coin_value(&gas_obj.payload)
+                                    .expect("validator decoded coin value");
+                                let debited = pre_value
+                                    .checked_sub(reservation)
+                                    .expect("reservation bounds debit");
+                                let new_payload = rewrite_value(&gas_obj.payload, debited)
+                                    .expect("rewrite Coin<LOOM> payload");
+                                let mut debited_obj = gas_obj.clone();
+                                debited_obj.version = next_object_version(debited_obj.version);
+                                debited_obj.payload = new_payload;
+                                snapshot.insert_object(debited_obj);
+                            }
+                            pre_exec_gas_payer = Some(gas_obj);
+                            Ok(snapshot)
+                        },
+                    ) {
+                        Ok(run) => run,
+                        Err(e) => {
+                            warn!(
+                                sender = %hex::encode(tx.sender.0),
+                                err = %e,
+                                "SubmitPtb validation failed"
+                            );
+                            return ExecOutput {
+                                success: false,
+                                fuel_used: 0,
+                                return_data: format!("ptb validation error: {e}").into_bytes(),
+                                logs: vec![],
+                                write_set: None,
+                            };
+                        }
                     };
-
-                    // The executor drains the ctx itself at the
-                    // end of `execute(...)` (success path) and
-                    // folds host-attributed entries (created
-                    // objects, host deletes, host ownership
-                    // changes, logs) into the
-                    // `ExecutionReport`. We don't need a separate
-                    // drain step here — the host_ctx behind the
-                    // Arc has already been std::mem::take'n.
-
-                    // Reclaim the snapshot the runner threaded
-                    // through the calls.
-                    let mut snapshot = runner.into_snapshot();
+                    let pre_exec_gas_payer =
+                        pre_exec_gas_payer.expect("run_ptb prepared commit gas snapshot");
+                    let report = run.report;
+                    let mut snapshot = run.snapshot;
 
                     // Clamp fuel actually charged to the inner
                     // budget — defence-in-depth in case the

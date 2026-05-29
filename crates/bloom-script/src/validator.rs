@@ -15,6 +15,15 @@ use crate::chain_iface::{ArgDeclStub, ChainStateIface, FunctionDeclStub, PetalMa
 use crate::error::PtbError;
 use crate::types::{Arg, Command, ExpectedVersion, MoveCmd, PtbTx, UseRef};
 
+/// Validation policy for a PTB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValidationMode {
+    /// Validate a PTB that may be committed to chain state.
+    Commit,
+    /// Validate a PTB for read-only execution against an existing snapshot.
+    ReadOnly,
+}
+
 /// Verifies an xDSA signature against (`digest`, `pubkey`).
 ///
 /// The real implementation lives in `bloom-keystore` (composite
@@ -44,6 +53,8 @@ impl SignatureVerifier for AlwaysOkVerifier {
 /// well-known `Coin<LOOM>` type tag the validator uses to recognise
 /// the gas payer.
 pub struct ValidationContext<'a> {
+    /// Whether validation is for commit or read-only execution.
+    pub mode: ValidationMode,
     /// Current block height.
     pub current_block: u64,
     /// Chain reader.
@@ -77,22 +88,29 @@ pub struct ValidatedPtb {
 
 /// Run the full validation pipeline (spec §7.2 steps 1–6).
 pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<ValidatedPtb, PtbError> {
+    let tx = match ctx.mode {
+        ValidationMode::Commit => tx.clone(),
+        ValidationMode::ReadOnly => read_only_ptb(tx),
+    };
+
     // Step 1: signature check.
-    if tx.signers.is_empty() {
-        return Err(PtbError::NoSigners);
-    }
-    if tx.signatures.len() != tx.signers.len() {
-        return Err(PtbError::SignatureCountMismatch {
-            expected: tx.signers.len(),
-            got: tx.signatures.len(),
-        });
-    }
-    let digest = tx.signing_digest();
-    for (i, (pk, sig)) in tx.signers.iter().zip(tx.signatures.iter()).enumerate() {
-        if !ctx.verifier.verify(&digest, pk, &sig.0) {
-            return Err(PtbError::BadSignature {
-                signer_idx: i as u16,
+    if ctx.mode == ValidationMode::Commit {
+        if tx.signers.is_empty() {
+            return Err(PtbError::NoSigners);
+        }
+        if tx.signatures.len() != tx.signers.len() {
+            return Err(PtbError::SignatureCountMismatch {
+                expected: tx.signers.len(),
+                got: tx.signatures.len(),
             });
+        }
+        let digest = tx.signing_digest();
+        for (i, (pk, sig)) in tx.signers.iter().zip(tx.signatures.iter()).enumerate() {
+            if !ctx.verifier.verify(&digest, pk, &sig.0) {
+                return Err(PtbError::BadSignature {
+                    signer_idx: i as u16,
+                });
+            }
         }
     }
 
@@ -128,7 +146,7 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
     // built-in output" and cannot be consumed where a concrete type is
     // required).
     let mut objects: HashMap<[u8; 32], Object> = HashMap::new();
-    let first_signer_addr = tx.signers[0];
+    let first_signer_addr = tx.signers.first().copied().unwrap_or([0; 32]);
     let mut cmd_return_types: Vec<Vec<Option<TypeTag>>> = Vec::with_capacity(tx.commands.len());
     let mut consumed_use_refs: HashSet<UseRef> = HashSet::new();
     for (cmd_idx, cmd) in tx.commands.iter().enumerate() {
@@ -308,48 +326,50 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
     }
 
     // Step 6: gas-payer prep.
-    let gas_obj = ctx
-        .chain
-        .load_object(&tx.gas_payer)
-        .ok_or(PtbError::ObjectNotFound { id: tx.gas_payer })?;
-    if objects.contains_key(&tx.gas_payer.0) {
-        return Err(PtbError::InvalidGasPayer {
-            id: tx.gas_payer,
-            reason: "gas payer cannot also be used as a PTB object input".to_string(),
-        });
+    if ctx.mode == ValidationMode::Commit {
+        let gas_obj = ctx
+            .chain
+            .load_object(&tx.gas_payer)
+            .ok_or(PtbError::ObjectNotFound { id: tx.gas_payer })?;
+        if objects.contains_key(&tx.gas_payer.0) {
+            return Err(PtbError::InvalidGasPayer {
+                id: tx.gas_payer,
+                reason: "gas payer cannot also be used as a PTB object input".to_string(),
+            });
+        }
+        if gas_obj.owner != Owner::Address(first_signer_addr) {
+            return Err(PtbError::InvalidGasPayer {
+                id: tx.gas_payer,
+                reason: format!(
+                    "gas payer is not owned by first signer ({})",
+                    hex_encode(&first_signer_addr)
+                ),
+            });
+        }
+        if gas_obj.type_tag != ctx.loom_coin_type {
+            return Err(PtbError::InvalidGasPayer {
+                id: tx.gas_payer,
+                reason: "gas payer is not a Coin<LOOM>".to_string(),
+            });
+        }
+        let coin_value = decode_coin_value(&gas_obj.payload)?;
+        let needed = tx
+            .checked_gas_reservation()
+            .ok_or(PtbError::GasReservationOverflow {
+                gas_budget: tx.gas_budget,
+                gas_price: tx.gas_price,
+            })?;
+        if coin_value < needed {
+            return Err(PtbError::InsufficientGas {
+                needed,
+                available: coin_value,
+            });
+        }
+        objects.insert(gas_obj.id.0, gas_obj);
     }
-    if gas_obj.owner != Owner::Address(first_signer_addr) {
-        return Err(PtbError::InvalidGasPayer {
-            id: tx.gas_payer,
-            reason: format!(
-                "gas payer is not owned by first signer ({})",
-                hex_encode(&first_signer_addr)
-            ),
-        });
-    }
-    if gas_obj.type_tag != ctx.loom_coin_type {
-        return Err(PtbError::InvalidGasPayer {
-            id: tx.gas_payer,
-            reason: "gas payer is not a Coin<LOOM>".to_string(),
-        });
-    }
-    let coin_value = decode_coin_value(&gas_obj.payload)?;
-    let needed = tx
-        .checked_gas_reservation()
-        .ok_or(PtbError::GasReservationOverflow {
-            gas_budget: tx.gas_budget,
-            gas_price: tx.gas_price,
-        })?;
-    if coin_value < needed {
-        return Err(PtbError::InsufficientGas {
-            needed,
-            available: coin_value,
-        });
-    }
-    objects.insert(gas_obj.id.0, gas_obj);
 
     Ok(ValidatedPtb {
-        tx: tx.clone(),
+        tx,
         objects,
         petals,
         manifests,
@@ -360,6 +380,20 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn read_only_ptb(tx: &PtbTx) -> PtbTx {
+    let mut tx = tx.clone();
+    for cmd in &mut tx.commands {
+        if let Command::Move(m) = cmd {
+            for arg in &mut m.args {
+                if let Arg::Object { access_mode, .. } = arg {
+                    *access_mode = AccessMode::ReadOnly;
+                }
+            }
+        }
+    }
+    tx
+}
 
 fn resolve_petal(
     petal: &crate::types::PetalRef,
@@ -1094,10 +1128,29 @@ mod tests {
         }
     }
 
+    fn pool_tt() -> TypeTag {
+        TypeTag::Concrete {
+            petal_hash: [0xAB; 32],
+            type_name: "Pool".to_string(),
+            type_args: vec![],
+        }
+    }
+
+    fn pool_obj(id_byte: u8, owner: Owner, version: u64) -> Object {
+        Object {
+            id: ObjectId([id_byte; 32]),
+            type_tag: pool_tt(),
+            owner,
+            version,
+            payload: vec![0xCA, 0xFE],
+        }
+    }
+
     fn sample_manifest() -> PetalManifestStub {
         PetalManifestStub {
             module_path: "/bloom/dex/pool".to_string(),
             functions: vec![FunctionDeclStub {
+                view: false,
                 name: "swap".to_string(),
                 type_params: vec![],
                 args: vec![ArgDeclStub::Signer],
@@ -1112,6 +1165,26 @@ mod tests {
             }],
             external_type_refs: vec![],
         }
+    }
+
+    fn object_manifest(mode: AccessMode) -> PetalManifestStub {
+        let mut manifest = sample_manifest();
+        manifest.functions = vec![FunctionDeclStub {
+            view: false,
+            name: "inspect".to_string(),
+            type_params: vec![],
+            args: vec![ArgDeclStub::Object {
+                ty: TypeTag::Concrete {
+                    petal_hash: [0; 32],
+                    type_name: "Pool".to_string(),
+                    type_args: vec![],
+                },
+                mode,
+            }],
+            returns: vec![],
+            attached_invariants: vec![],
+        }];
+        manifest
     }
 
     fn sample_ptb(signer: [u8; 32], gas_payer_id: ObjectId, expiry: u64) -> PtbTx {
@@ -1146,10 +1219,32 @@ mod tests {
 
     fn ctx<'a>(chain: &'a MockChain, verifier: &'a dyn SignatureVerifier) -> ValidationContext<'a> {
         ValidationContext {
+            mode: ValidationMode::Commit,
             current_block: chain.block,
             chain,
             verifier,
             loom_coin_type: loom_coin_tt(),
+        }
+    }
+
+    fn read_only_ctx<'a>(
+        chain: &'a MockChain,
+        verifier: &'a dyn SignatureVerifier,
+    ) -> ValidationContext<'a> {
+        ValidationContext {
+            mode: ValidationMode::ReadOnly,
+            current_block: chain.block,
+            chain,
+            verifier,
+            loom_coin_type: loom_coin_tt(),
+        }
+    }
+
+    struct PanicVerifier;
+
+    impl SignatureVerifier for PanicVerifier {
+        fn verify(&self, _: &[u8; 32], _: &[u8; 32], _: &[u8]) -> bool {
+            panic!("read-only validation must not verify signatures")
         }
     }
 
@@ -1168,10 +1263,104 @@ mod tests {
     }
 
     #[test]
+    fn read_only_accepts_absent_signatures_and_no_gas_payer_coin() {
+        let chain = MockChain::new();
+        let obj = pool_obj(0x44, Owner::Address([0x99; 32]), 7);
+        chain.put_object(obj.clone());
+        chain.put_petal(
+            Hash32([0xAB; 32]),
+            vec![1, 2, 3],
+            object_manifest(AccessMode::ReadOnly),
+        );
+        chain.put_path("/bloom/dex/pool", Hash32([0xAB; 32]));
+        let tx = PtbTx {
+            signers: vec![],
+            commands: vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/bloom/dex/pool".to_string(),
+                    hash: Some(Hash32([0xAB; 32])),
+                },
+                function: "inspect".to_string(),
+                type_args: vec![],
+                args: vec![Arg::Object {
+                    id: obj.id,
+                    expected_version: ExpectedVersion(7),
+                    access_mode: AccessMode::Mutable,
+                }],
+            })],
+            gas_payer: ObjectId([0xFE; 32]),
+            gas_budget: 100,
+            gas_price: 1,
+            expiry_block: 100,
+            signatures: vec![],
+        };
+
+        let validated = validate_ptb(&tx, &read_only_ctx(&chain, &PanicVerifier)).unwrap();
+        assert!(validated.objects.contains_key(&obj.id.0));
+        assert!(!validated.objects.contains_key(&tx.gas_payer.0));
+        let Command::Move(m) = &validated.tx.commands[0] else {
+            panic!("expected Move command");
+        };
+        let Arg::Object { access_mode, .. } = &m.args[0] else {
+            panic!("expected Object arg");
+        };
+        assert_eq!(*access_mode, AccessMode::ReadOnly);
+    }
+
+    #[test]
+    fn read_only_allows_supplied_signer_without_signature_verification() {
+        let (chain, signer, gas_id) = setup();
+        let mut tx = sample_ptb(signer, gas_id, 100);
+        tx.signatures.clear();
+
+        assert!(validate_ptb(&tx, &read_only_ctx(&chain, &PanicVerifier)).is_ok());
+    }
+
+    #[test]
+    fn read_only_coercion_rejects_mutable_object_declarations() {
+        let chain = MockChain::new();
+        let obj = pool_obj(0x44, Owner::Address([0x99; 32]), 7);
+        chain.put_object(obj.clone());
+        chain.put_petal(
+            Hash32([0xAB; 32]),
+            vec![1, 2, 3],
+            object_manifest(AccessMode::Mutable),
+        );
+        chain.put_path("/bloom/dex/pool", Hash32([0xAB; 32]));
+        let tx = PtbTx {
+            signers: vec![],
+            commands: vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/bloom/dex/pool".to_string(),
+                    hash: Some(Hash32([0xAB; 32])),
+                },
+                function: "inspect".to_string(),
+                type_args: vec![],
+                args: vec![Arg::Object {
+                    id: obj.id,
+                    expected_version: ExpectedVersion(7),
+                    access_mode: AccessMode::Mutable,
+                }],
+            })],
+            gas_payer: ObjectId([0xFE; 32]),
+            gas_budget: 100,
+            gas_price: 1,
+            expiry_block: 100,
+            signatures: vec![],
+        };
+
+        let err = validate_ptb(&tx, &read_only_ctx(&chain, &PanicVerifier)).unwrap_err();
+        assert!(
+            matches!(err, PtbError::TypeMismatch { reason, .. } if reason.contains("access mode ReadOnly"))
+        );
+    }
+
+    #[test]
     fn rejects_duplicate_linear_use_ref_consumption() {
         let (chain, signer, gas_id) = setup();
         let mut m = sample_manifest();
         m.functions.push(FunctionDeclStub {
+            view: false,
             name: "mint".to_string(),
             type_params: vec![],
             args: vec![],
@@ -1392,6 +1581,7 @@ mod tests {
         // Add a function with an Object arg to swap into the manifest.
         let mut manifest = sample_manifest();
         manifest.functions.push(FunctionDeclStub {
+            view: false,
             name: "use_obj".to_string(),
             type_params: vec![],
             args: vec![ArgDeclStub::Object {
@@ -1434,6 +1624,7 @@ mod tests {
 
         let mut manifest = sample_manifest();
         manifest.functions.push(FunctionDeclStub {
+            view: false,
             name: "touch_child".to_string(),
             type_params: vec![],
             args: vec![ArgDeclStub::Object {
@@ -1481,6 +1672,7 @@ mod tests {
 
         let mut manifest = sample_manifest();
         manifest.functions.push(FunctionDeclStub {
+            view: false,
             name: "touch_pair".to_string(),
             type_params: vec![],
             args: vec![
@@ -1540,6 +1732,7 @@ mod tests {
 
         let mut manifest = sample_manifest();
         manifest.functions.push(FunctionDeclStub {
+            view: false,
             name: "read_parent_mutate_child".to_string(),
             type_params: vec![],
             args: vec![
@@ -1596,6 +1789,7 @@ mod tests {
         });
         let mut manifest = sample_manifest();
         manifest.functions.push(FunctionDeclStub {
+            view: false,
             name: "mutate".to_string(),
             type_params: vec![],
             args: vec![ArgDeclStub::Object {
@@ -1707,6 +1901,7 @@ mod tests {
         });
         let mut manifest = sample_manifest();
         manifest.functions.push(FunctionDeclStub {
+            view: false,
             name: "touch".to_string(),
             type_params: vec![],
             args: vec![ArgDeclStub::Object {
@@ -1763,6 +1958,7 @@ mod tests {
     fn install_fn(chain: &MockChain, name: &str, args: Vec<ArgDeclStub>, returns: Vec<TypeTag>) {
         let mut m = sample_manifest();
         m.functions.push(FunctionDeclStub {
+            view: false,
             name: name.to_string(),
             type_params: vec![],
             args,
@@ -1894,6 +2090,7 @@ mod tests {
         // Const u128. Hooking them up with a Use should fail.
         let mut m = sample_manifest();
         m.functions.push(FunctionDeclStub {
+            view: false,
             name: "producer".to_string(),
             type_params: vec![],
             args: vec![],
@@ -1901,6 +2098,7 @@ mod tests {
             attached_invariants: vec![],
         });
         m.functions.push(FunctionDeclStub {
+            view: false,
             name: "consumer".to_string(),
             type_params: vec![],
             args: vec![ArgDeclStub::Const(concrete("u128"))],
@@ -1954,6 +2152,7 @@ mod tests {
         let (chain, signer, gas_id) = setup();
         let mut m = sample_manifest();
         m.functions.push(FunctionDeclStub {
+            view: false,
             name: "producer".to_string(),
             type_params: vec![],
             args: vec![],
@@ -1961,6 +2160,7 @@ mod tests {
             attached_invariants: vec![],
         });
         m.functions.push(FunctionDeclStub {
+            view: false,
             name: "consumer".to_string(),
             type_params: vec![],
             args: vec![ArgDeclStub::Const(concrete("u64"))],
@@ -2033,6 +2233,7 @@ mod tests {
         };
         let mut m = sample_manifest();
         m.functions.push(FunctionDeclStub {
+            view: false,
             name: "generic".to_string(),
             type_params: vec![crate::chain_iface::TypeParamDeclStub {
                 name: "T".to_string(),
@@ -2111,6 +2312,7 @@ mod tests {
         };
         let mut m = sample_manifest();
         m.functions.push(FunctionDeclStub {
+            view: false,
             name: "producer".to_string(),
             type_params: vec![],
             args: vec![],
@@ -2118,6 +2320,7 @@ mod tests {
             attached_invariants: vec![],
         });
         m.functions.push(FunctionDeclStub {
+            view: false,
             name: "consumer".to_string(),
             type_params: vec![],
             args: vec![ArgDeclStub::Object {
@@ -2179,6 +2382,7 @@ mod tests {
         let (chain, signer, gas_id) = setup();
         let mut m = sample_manifest();
         m.functions.push(FunctionDeclStub {
+            view: false,
             name: "producer".to_string(),
             type_params: vec![],
             args: vec![],
@@ -2186,6 +2390,7 @@ mod tests {
             attached_invariants: vec![],
         });
         m.functions.push(FunctionDeclStub {
+            view: false,
             name: "consumer".to_string(),
             type_params: vec![],
             args: vec![ArgDeclStub::Object {
@@ -2252,6 +2457,7 @@ mod tests {
         };
         let mut m = sample_manifest();
         m.functions.push(FunctionDeclStub {
+            view: false,
             name: "producer".to_string(),
             type_params: vec![],
             args: vec![],
@@ -2308,6 +2514,7 @@ mod tests {
         });
         let mut m = sample_manifest();
         m.functions.push(FunctionDeclStub {
+            view: false,
             name: "touch".to_string(),
             type_params: vec![],
             args: vec![ArgDeclStub::Object {
@@ -2356,6 +2563,7 @@ mod tests {
         });
         let mut m = sample_manifest();
         m.functions.push(FunctionDeclStub {
+            view: false,
             name: "touch".to_string(),
             type_params: vec![],
             args: vec![ArgDeclStub::Object {
@@ -2397,6 +2605,7 @@ mod tests {
         });
         let mut m = sample_manifest();
         m.functions.push(FunctionDeclStub {
+            view: false,
             name: "touch".to_string(),
             type_params: vec![],
             args: vec![ArgDeclStub::Object {
@@ -2441,6 +2650,7 @@ mod tests {
         let mut m = sample_manifest();
         m.object_types.clear();
         m.functions.push(FunctionDeclStub {
+            view: false,
             name: "quote".to_string(),
             type_params: vec![],
             args: vec![ArgDeclStub::Object {
@@ -2471,6 +2681,7 @@ mod tests {
         let mut producer = PetalManifestStub {
             module_path: "/evil".to_string(),
             functions: vec![FunctionDeclStub {
+                view: false,
                 name: "forge".to_string(),
                 type_params: vec![],
                 args: vec![],
@@ -2492,6 +2703,7 @@ mod tests {
             type_args.push(concrete("FaucetAdmin"));
         }
         consumer.functions.push(FunctionDeclStub {
+            view: false,
             name: "mint".to_string(),
             type_params: vec![],
             args: vec![ArgDeclStub::Object {
@@ -2548,6 +2760,7 @@ mod tests {
         let (chain, signer, gas_id) = setup();
         let mut m = sample_manifest();
         m.functions.push(FunctionDeclStub {
+            view: false,
             name: "gf".to_string(),
             type_params: vec![crate::chain_iface::TypeParamDeclStub {
                 name: "T".to_string(),

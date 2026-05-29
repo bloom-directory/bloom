@@ -418,6 +418,8 @@ impl Node {
         let rpc_server = RpcServer {
             state: Arc::clone(&shared_state),
             block_store: Arc::clone(&block_store),
+            blob_store: Arc::clone(&blob_store),
+            state_index: Arc::clone(&state_index),
             mempool_persist: Arc::clone(&mempool_persist),
             receipt_store: Arc::clone(&receipt_store),
             validator_set: Arc::new(validator_set.clone()),
@@ -426,6 +428,7 @@ impl Node {
             local_address,
             startup_height: latest_height,
             tx_submit: tx_submit_tx.clone(),
+            max_view_fuel_limit: cfg.fuel_limit,
         };
         let rpc_socket = chain_dir.join("rpc.sock");
         if rpc_uds_enabled() {

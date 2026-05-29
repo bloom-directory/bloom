@@ -220,8 +220,10 @@ fn handle_fn(f: &ItemFn, m: &mut PetalManifestV0) -> syn::Result<Option<PetalShi
     }
 
     // Process #[invariant] first so the function decl can record the
-    // invariant index.
+    // invariant index. A bare #[view] marks the exported function as
+    // statically read-only for chain admission.
     let mut attached: Vec<u16> = Vec::new();
+    let mut view = false;
     for a in &f.attrs {
         if attr_is_named(a, "invariant") {
             let inv_attr = InvariantAttr::parse(meta_tokens(a)?)?;
@@ -229,6 +231,11 @@ fn handle_fn(f: &ItemFn, m: &mut PetalManifestV0) -> syn::Result<Option<PetalShi
             let decl = crate::invariant::build_decl(&inv_attr, f, idx);
             m.invariants.push(decl);
             attached.push(idx);
+        } else if attr_is_named(a, "view") {
+            if !meta_tokens(a)?.is_empty() {
+                return Err(err_spanned(a, "`#[view]` does not accept arguments"));
+            }
+            view = true;
         }
     }
 
@@ -363,6 +370,7 @@ fn handle_fn(f: &ItemFn, m: &mut PetalManifestV0) -> syn::Result<Option<PetalShi
 
     m.functions.push(FunctionDecl {
         name: fn_name_s.clone(),
+        view,
         type_params,
         args,
         returns: returns.clone(),
@@ -562,7 +570,8 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenS
                         .retain(|a| !attr_is_named(a, "object") && !attr_is_named(a, "capability"));
                 }
                 Item::Fn(f) => {
-                    f.attrs.retain(|a| !attr_is_named(a, "invariant"));
+                    f.attrs
+                        .retain(|a| !attr_is_named(a, "invariant") && !attr_is_named(a, "view"));
                 }
                 _ => {}
             }
@@ -651,6 +660,33 @@ mod tests {
         assert_eq!(manifest.module_path, "/p");
         assert_eq!(manifest.functions.len(), 1);
         assert_eq!(manifest.functions[0].name, "noop");
+        assert!(!manifest.functions[0].view);
+    }
+
+    #[test]
+    fn build_manifest_records_view_attr() {
+        let m = parse_mod(quote! {
+            pub mod p {
+                #[view]
+                pub fn quote() -> u128 { 7 }
+            }
+        });
+        let attr = PetalAttr::parse(quote! { path = "/p" }).unwrap();
+        let manifest = build_manifest(&attr, &m).unwrap();
+        assert_eq!(manifest.functions[0].name, "quote");
+        assert!(manifest.functions[0].view);
+    }
+
+    #[test]
+    fn build_manifest_rejects_view_attr_args() {
+        let m = parse_mod(quote! {
+            pub mod p {
+                #[view(true)]
+                pub fn quote() {}
+            }
+        });
+        let attr = PetalAttr::parse(quote! { path = "/p" }).unwrap();
+        assert!(build_manifest(&attr, &m).is_err());
     }
 
     #[test]

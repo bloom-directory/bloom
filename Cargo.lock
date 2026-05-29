@@ -2481,6 +2481,7 @@ dependencies = [
  "bloom-chain-state",
  "bloom-chain-types",
  "bloom-objects",
+ "bloom-petal-manifest",
  "bloom-proto",
  "bloom-script",
  "bloom-vfs",
@@ -2615,6 +2616,8 @@ dependencies = [
  "blake3",
  "bloom-chain-types",
  "bloom-objects",
+ "hex",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 
