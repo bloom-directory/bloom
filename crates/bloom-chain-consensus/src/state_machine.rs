@@ -169,7 +169,13 @@ impl VoteTally {
 // ConsensusState
 // ---------------------------------------------------------------------------
 
-const TIMEOUT: Duration = Duration::from_millis(500);
+/// Default per-round timeout for propose, prevote, and precommit steps.
+///
+/// Proposal construction validates and executes the candidate block before the
+/// proposal is broadcast. Real PETAL PTBs can take materially longer than a
+/// sub-second local-network timeout on shared CI runners, so keep enough budget
+/// for block execution before peers nil-prevote the round.
+pub const ROUND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The Tendermint-style BFT state machine for a single local validator.
 ///
@@ -257,7 +263,7 @@ impl ConsensusState {
     }
 
     /// Reset the state machine to begin consensus at `new_height`, round 0,
-    /// step Propose.  Returns a single `StartTimeout(Propose, TIMEOUT)` action
+    /// step Propose.  Returns a single `StartTimeout(Propose, ROUND_TIMEOUT)` action
     /// so the caller can drive the new round.
     ///
     /// All per-height state (locked/valid block, proposal, votes, committed
@@ -274,7 +280,7 @@ impl ConsensusState {
         self.precommits.clear();
         self.all_precommit_votes.clear();
         self.committed_block = None;
-        vec![Action::StartTimeout(TimeoutKind::Propose, TIMEOUT)]
+        vec![Action::StartTimeout(TimeoutKind::Propose, ROUND_TIMEOUT)]
     }
 
     /// If a proposal was previously stashed because its block was unknown,
@@ -382,7 +388,7 @@ impl ConsensusState {
                 self.step = Step::Prevote;
                 let actions = vec![
                     Action::Broadcast(ProposalOrVote::Vote(self.make_prevote(None))),
-                    Action::StartTimeout(TimeoutKind::Prevote, TIMEOUT),
+                    Action::StartTimeout(TimeoutKind::Prevote, ROUND_TIMEOUT),
                 ];
                 actions
             }
@@ -394,7 +400,7 @@ impl ConsensusState {
                 self.step = Step::Precommit;
                 let actions = vec![
                     Action::Broadcast(ProposalOrVote::Vote(self.make_precommit(None))),
-                    Action::StartTimeout(TimeoutKind::Precommit, TIMEOUT),
+                    Action::StartTimeout(TimeoutKind::Precommit, ROUND_TIMEOUT),
                 ];
                 actions
             }
@@ -457,7 +463,7 @@ impl ConsensusState {
 
         vec![
             Action::Broadcast(ProposalOrVote::Vote(prevote)),
-            Action::StartTimeout(TimeoutKind::Prevote, TIMEOUT),
+            Action::StartTimeout(TimeoutKind::Prevote, ROUND_TIMEOUT),
         ]
     }
 
@@ -608,7 +614,7 @@ impl ConsensusState {
                 self.locked_block = Some((self.round, hash));
                 vec![
                     Action::Broadcast(ProposalOrVote::Vote(precommit)),
-                    Action::StartTimeout(TimeoutKind::Precommit, TIMEOUT),
+                    Action::StartTimeout(TimeoutKind::Precommit, ROUND_TIMEOUT),
                 ]
             }
             Some(None) => {
@@ -618,7 +624,7 @@ impl ConsensusState {
                 let precommit = self.make_precommit(None);
                 vec![
                     Action::Broadcast(ProposalOrVote::Vote(precommit)),
-                    Action::StartTimeout(TimeoutKind::Precommit, TIMEOUT),
+                    Action::StartTimeout(TimeoutKind::Precommit, ROUND_TIMEOUT),
                 ]
             }
             None => vec![],
@@ -634,7 +640,7 @@ impl ConsensusState {
         self.step = Step::Propose;
         self.proposal = None;
 
-        let actions = vec![Action::StartTimeout(TimeoutKind::Propose, TIMEOUT)];
+        let actions = vec![Action::StartTimeout(TimeoutKind::Propose, ROUND_TIMEOUT)];
 
         // If this validator is the new proposer, they need to build and broadcast.
         // The engine layer handles building; here we just signal a propose timeout

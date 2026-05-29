@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bloom_chain_consensus::{
-    Action, ConsensusEngine, Mempool,
+    Action, ConsensusEngine, Mempool, ROUND_TIMEOUT,
     round_validation::judge_proposer_round,
     state_machine::{Event, TimeoutKind},
 };
@@ -405,7 +405,7 @@ impl Node {
         // the engine's *current* `(height, round)` and silently drops the
         // tick if they no longer match. Without this guard, stale timers
         // from earlier rounds/heights bleed across transitions: when a
-        // Precommit scheduled at h=N r=R fires 500ms later, the engine may
+        // Precommit scheduled at h=N r=R fires later, the engine may
         // already be at h=N r=R+1 in step Precommit again — `on_tick` would
         // see `step == Precommit` and call `advance_round`, skipping rounds
         // arbitrarily. Caught by the 4-validator docker DEX acceptance test
@@ -995,10 +995,7 @@ impl Node {
             let timeout_tx_kick = Arc::clone(&timeout_tx);
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(1000)).await;
-                let kickoff = vec![Action::StartTimeout(
-                    TimeoutKind::Propose,
-                    Duration::from_millis(500),
-                )];
+                let kickoff = vec![Action::StartTimeout(TimeoutKind::Propose, ROUND_TIMEOUT)];
                 process_actions(
                     Arc::clone(&driver_kick),
                     Arc::clone(&peer_pool_kick),
@@ -1134,7 +1131,7 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                         &block_with_commit.txs,
                     );
                     // Enter the next height IMMEDIATELY. The state machine
-                    // returns a `StartTimeout(Propose, 500ms)` we deliberately
+                    // returns a `StartTimeout(Propose, ROUND_TIMEOUT)` we deliberately
                     // discard — we'll arm the propose timer after a full
                     // TIMEOUT_COMMIT (1s) below.
                     //
@@ -1145,7 +1142,7 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                     // inbound-frame gate at `frame.vote recv` / `frame.proposal
                     // recv` drops frames whose height > my_height, so an
                     // entire round of votes for H+1 vanished. The validator
-                    // then sat in Propose step until its 500ms propose
+                    // then sat in Propose step until its propose
                     // timeout fired nil-prevote, by which point the rest of
                     // the network had moved on — repeated for every height,
                     // the trailing validator never recovers. Caught by the
@@ -1163,10 +1160,8 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                     let timeout_tx_c = Arc::clone(&timeout_tx);
                     tokio::spawn(async move {
                         tokio::time::sleep(TIMEOUT_COMMIT).await;
-                        let kickoff = vec![Action::StartTimeout(
-                            TimeoutKind::Propose,
-                            Duration::from_millis(500),
-                        )];
+                        let kickoff =
+                            vec![Action::StartTimeout(TimeoutKind::Propose, ROUND_TIMEOUT)];
                         process_actions(
                             Arc::clone(&driver_c),
                             Arc::clone(&peer_pool_c),

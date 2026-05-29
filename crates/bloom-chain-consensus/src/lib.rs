@@ -35,6 +35,6 @@ pub use engine::ConsensusEngine;
 pub use error::ConsensusError;
 pub use mempool::Mempool;
 pub use signer::{NoopSigner, Signer};
-pub use state_machine::{Action, ConsensusState, Event, Step, TimeoutKind};
+pub use state_machine::{Action, ConsensusState, Event, ROUND_TIMEOUT, Step, TimeoutKind};
 pub use validator_set::{Validator, ValidatorSet};
 pub use verifier::{NoopVerifier, RejectAllVerifier, SigVerifier};
