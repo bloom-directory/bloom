@@ -78,7 +78,10 @@ impl StateBlobStore {
     ///
     /// `pinned`: set of hashes to keep regardless of age.  The implementation
     /// keeps the `BLOB_RETENTION` most recently modified files.
-    pub fn gc(&self, pinned: &[Hash32]) -> Result<()> {
+    ///
+    /// Returns the valid blob hashes removed during this pass so callers can
+    /// keep secondary indexes in sync.
+    pub fn gc(&self, pinned: &[Hash32]) -> Result<Vec<Hash32>> {
         let pinned_set: std::collections::HashSet<String> =
             pinned.iter().map(|h| hex::encode(h.0)).collect();
 
@@ -95,13 +98,14 @@ impl StateBlobStore {
 
         let retention = blob_retention();
         if entries.len() <= retention {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // Sort newest first.
         entries.sort_by_key(|b| std::cmp::Reverse(b.0));
 
         // Remove files beyond retention, unless pinned.
+        let mut removed = Vec::new();
         for (_, path) in entries.into_iter().skip(retention) {
             let name = path
                 .file_name()
@@ -111,11 +115,29 @@ impl StateBlobStore {
             if pinned_set.contains(&name) {
                 continue;
             }
-            let _ = std::fs::remove_file(&path);
-            debug!(blob = %name, "state_blob.gc");
+            let removed_file = match std::fs::remove_file(&path) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(_) => false,
+            };
+            if removed_file {
+                if let Some(hash) = hash_from_blob_filename(&name) {
+                    removed.push(hash);
+                }
+                debug!(blob = %name, "state_blob.gc");
+            }
         }
-        Ok(())
+        Ok(removed)
     }
+}
+
+fn hash_from_blob_filename(name: &str) -> Option<Hash32> {
+    if name.len() != 64 {
+        return None;
+    }
+    let bytes = hex::decode(name).ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    Some(Hash32(arr))
 }
 
 fn write_atomic(tmp_path: &Path, final_path: &Path, bytes: &[u8]) -> Result<()> {

@@ -117,8 +117,7 @@ fn reachable_return_call_to_mutating_import_is_rejected() {
     );
 
     let err = validate_chain_wasm(&wasm).unwrap_err().to_string();
-    assert!(err.contains("view function 'quote'"));
-    assert!(err.contains("object.mutate"));
+    assert!(err.contains("return_call"));
 }
 
 #[test]
@@ -139,6 +138,22 @@ fn reachable_return_call_indirect_in_view_is_rejected() {
 
     let err = validate_chain_wasm(&wasm).unwrap_err().to_string();
     assert!(err.contains("return_call_indirect"));
+}
+
+#[test]
+fn tail_call_in_non_view_export_is_rejected() {
+    let wasm = wasm_with_manifest(
+        r#"(module
+            (func $helper)
+            (func $__petal_update
+              (return_call $helper))
+            (export "__petal_update" (func $__petal_update))
+        )"#,
+        vec![func("update", false)],
+    );
+
+    let err = validate_chain_wasm(&wasm).unwrap_err().to_string();
+    assert!(err.contains("return_call"));
 }
 
 #[test]

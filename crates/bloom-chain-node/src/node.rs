@@ -1655,7 +1655,8 @@ async fn apply_state_snapshot<E: PetalExecutor>(
     driver.block_store.put(height, &block)?;
     driver.state_index.put(height, &state_root, &blob_hash)?;
     driver.block_store.prune(height)?;
-    driver.blob_store.gc(&[blob_hash])?;
+    let removed_blobs = driver.blob_store.gc(&[blob_hash])?;
+    driver.state_index.delete_blob_hashes(&removed_blobs)?;
     {
         *driver.state.lock() = state;
     }

@@ -83,4 +83,49 @@ impl StateIndex {
         let h: Option<i64> = stmt.query_row([], |row| row.get(0))?;
         Ok(h.map(|v| v as u64))
     }
+
+    /// Delete rows that point at blobs removed from the content-addressed store.
+    pub fn delete_blob_hashes(&self, blob_hashes: &[Hash32]) -> Result<usize> {
+        if blob_hashes.is_empty() {
+            return Ok(0);
+        }
+
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().context("begin state_index prune")?;
+        let mut deleted = 0usize;
+        for blob_hash in blob_hashes {
+            deleted += tx
+                .execute(
+                    "DELETE FROM state_index WHERE blob_hash = ?1",
+                    params![&blob_hash.0[..]],
+                )
+                .context("delete pruned state_index rows")?;
+        }
+        tx.commit().context("commit state_index prune")?;
+        debug!(deleted, "state_index.prune_pruned_blobs");
+        Ok(deleted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_blob_hashes_updates_oldest_height() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = StateIndex::open(&tmp.path().join("state_index.sqlite")).unwrap();
+        let root1 = Hash32([0x11; 32]);
+        let root2 = Hash32([0x22; 32]);
+        let blob1 = Hash32([0xAA; 32]);
+        let blob2 = Hash32([0xBB; 32]);
+
+        index.put(1, &root1, &blob1).unwrap();
+        index.put(2, &root2, &blob2).unwrap();
+        assert_eq!(index.oldest_height().unwrap(), Some(1));
+
+        assert_eq!(index.delete_blob_hashes(&[blob1]).unwrap(), 1);
+        assert_eq!(index.get(1).unwrap(), None);
+        assert_eq!(index.oldest_height().unwrap(), Some(2));
+    }
 }

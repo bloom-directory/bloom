@@ -1168,7 +1168,8 @@ impl<E: PetalExecutor> ConsensusDriver<E> {
             *self.state.lock() = execution.state.clone();
         }
         self.block_store.prune(height)?;
-        self.blob_store.gc(&[blob_hash])?;
+        let removed_blobs = self.blob_store.gc(&[blob_hash])?;
+        self.state_index.delete_blob_hashes(&removed_blobs)?;
 
         // Persist receipts so CLIs can distinguish a successful tx from a
         // silent revert. The consensus driver bumps the nonce *before*

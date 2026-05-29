@@ -186,7 +186,7 @@ fn chain_engine() -> Result<&'static Engine, PetalError> {
         // Bulk-memory (memory.copy, memory.fill) is deterministic; allowed.
         config.wasm_bulk_memory(true);
         // Tail-call opcodes are disabled in chain mode; the deploy-time verifier
-        // still rejects them explicitly when reachable from a view export.
+        // rejects them globally so admission matches this engine config.
         config.wasm_tail_call(false);
         config.cranelift_opt_level(OptLevel::Speed);
         Engine::new(&config).map_err(|e| e.to_string())
@@ -234,7 +234,7 @@ fn is_ptb_petal_export(name: &str) -> bool {
 }
 
 pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
-    use wasmparser::{ExternalKind, Parser, Payload};
+    use wasmparser::{ExternalKind, Operator, Parser, Payload};
 
     let parser = Parser::new(0);
     for payload in parser.parse_all(bytes) {
@@ -288,6 +288,32 @@ pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
                 return Err(PetalError::InvalidWasm(format!(
                     "chain petal declares start function {func}; start sections are not allowed"
                 )));
+            }
+            Payload::CodeSectionEntry(body) => {
+                let operators = body
+                    .get_operators_reader()
+                    .map_err(|e| PetalError::InvalidWasm(e.to_string()))?;
+                for op in operators {
+                    match op.map_err(|e| PetalError::InvalidWasm(e.to_string()))? {
+                        Operator::ReturnCall { .. } => {
+                            return Err(PetalError::InvalidWasm(
+                                "chain petal uses disabled tail-call opcode return_call".into(),
+                            ));
+                        }
+                        Operator::ReturnCallIndirect { .. } => {
+                            return Err(PetalError::InvalidWasm(
+                                "chain petal uses disabled tail-call opcode return_call_indirect"
+                                    .into(),
+                            ));
+                        }
+                        Operator::ReturnCallRef { .. } => {
+                            return Err(PetalError::InvalidWasm(
+                                "chain petal uses disabled tail-call opcode return_call_ref".into(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
             }
             _ => {}
         }
