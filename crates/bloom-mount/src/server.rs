@@ -30,6 +30,8 @@ use crate::{MountConfig, MountError, MountHandle, build_mount_args, build_mount_
 const MOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const UMOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
+type CommandAttempt = (String, Vec<String>);
+
 fn unmount_args(path: &Path) -> Vec<String> {
     #[cfg(target_os = "linux")]
     {
@@ -43,6 +45,34 @@ fn unmount_args(path: &Path) -> Vec<String> {
     {
         vec!["-f".to_string(), path.display().to_string()]
     }
+}
+
+fn unmount_attempts(path: &Path) -> Vec<CommandAttempt> {
+    let args = unmount_args(path);
+    #[cfg(target_os = "linux")]
+    {
+        let mut attempts = vec![("umount".to_string(), args.clone())];
+        attempts.push(("sudo".to_string(), sudo_args("umount", &args)));
+        attempts
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        vec![("umount".to_string(), args)]
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sudo_args(cmd_name: &str, args: &[String]) -> Vec<String> {
+    let mut sudo_args = Vec::with_capacity(args.len() + 2);
+    sudo_args.push("-n".to_string());
+    sudo_args.push(cmd_name.to_string());
+    sudo_args.extend(args.iter().cloned());
+    sudo_args
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sudo_args(_cmd_name: &str, _args: &[String]) -> Vec<String> {
+    Vec::new()
 }
 
 fn run_command_with_timeout(
@@ -69,6 +99,28 @@ fn run_command_with_timeout(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn run_command_attempts(
+    attempts: Vec<CommandAttempt>,
+    timeout: Duration,
+) -> Result<Output, MountError> {
+    let mut errors = Vec::new();
+    for (cmd_name, args) in attempts {
+        match run_command_with_timeout(&cmd_name, &args, timeout) {
+            Ok(output) if output.status.success() => return Ok(output),
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                errors.push(format!(
+                    "{} {:?} exited {}: stdout={} stderr={}",
+                    cmd_name, args, output.status, stdout, stderr
+                ));
+            }
+            Err(e) => errors.push(format!("{} {:?}: {}", cmd_name, args, e)),
+        }
+    }
+    Err(MountError::Mount(errors.join("; ")))
 }
 
 fn linux_mount_fallback_args(cfg: &MountConfig, server: SocketAddr) -> Vec<String> {
@@ -115,9 +167,12 @@ impl Drop for NfsMountHandle {
         let already = *self.unmounted.lock();
         if !already {
             let mp = self.mount_path.clone();
-            let args = unmount_args(&mp);
-            if let Err(e) = std::process::Command::new("umount")
-                .args(&args)
+            let attempts = unmount_attempts(&mp);
+            let Some((cmd_name, args)) = attempts.last() else {
+                return;
+            };
+            if let Err(e) = std::process::Command::new(cmd_name)
+                .args(args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
@@ -146,19 +201,12 @@ impl MountHandle for NfsMountHandle {
             *flag = true;
         }
         let mp = self.mount_path.clone();
-        let status = tokio::task::spawn_blocking(move || {
-            let args = unmount_args(&mp);
-            run_command_with_timeout("umount", &args, UMOUNT_COMMAND_TIMEOUT)
+        let output = tokio::task::spawn_blocking(move || {
+            run_command_attempts(unmount_attempts(&mp), UMOUNT_COMMAND_TIMEOUT)
         })
         .await
         .map_err(|e| MountError::Mount(format!("umount join: {e}")))??;
-        if !status.status.success() {
-            let stderr = String::from_utf8_lossy(&status.stderr);
-            return Err(MountError::Mount(format!(
-                "umount exited {}: {}",
-                status.status, stderr
-            )));
-        }
+        debug!(status = %output.status, "mount.unmount_command_finished");
         if let Some(task) = self.server_task.lock().take() {
             task.abort();
         }
@@ -229,32 +277,18 @@ pub async fn serve_nfs_with(vfs: Vfs, cfg: MountConfig) -> Result<NfsMountHandle
     // the client struct) doesn't pin the runtime worker.
     let args = build_mount_args(&cfg, local);
     let cmd_name = crate::detect_mount_command();
-    let mut attempts = vec![(cmd_name.to_string(), args)];
+    let mut attempts = vec![(cmd_name.to_string(), args.clone())];
     if cfg!(target_os = "linux") {
-        attempts.push(("mount".to_string(), linux_mount_fallback_args(&cfg, local)));
+        let fallback_args = linux_mount_fallback_args(&cfg, local);
+        attempts.push(("mount".to_string(), fallback_args.clone()));
+        attempts.push(("sudo".to_string(), sudo_args(cmd_name, &args)));
+        attempts.push(("sudo".to_string(), sudo_args("mount", &fallback_args)));
     }
     debug!(?attempts, "mount.cmd_attempts");
     let mp_for_log = cfg.mount_path.clone();
     let mount_result = tokio::task::spawn_blocking({
         let attempts = attempts.clone();
-        move || {
-            let mut errors = Vec::new();
-            for (cmd_name, args) in attempts {
-                match run_command_with_timeout(&cmd_name, &args, MOUNT_COMMAND_TIMEOUT) {
-                    Ok(output) if output.status.success() => return Ok(output),
-                    Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        errors.push(format!(
-                            "{} {:?} exited {}: stdout={} stderr={}",
-                            cmd_name, args, output.status, stdout, stderr
-                        ));
-                    }
-                    Err(e) => errors.push(format!("{} {:?}: {}", cmd_name, args, e)),
-                }
-            }
-            Err(MountError::Mount(errors.join("; ")))
-        }
+        move || run_command_attempts(attempts, MOUNT_COMMAND_TIMEOUT)
     })
     .await
     .map_err(|e| MountError::Mount(format!("mount join: {e}")))?;
