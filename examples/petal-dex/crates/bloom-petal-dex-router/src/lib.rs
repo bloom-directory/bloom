@@ -1,4 +1,4 @@
-//! `/bloom/dex/router` petal — multi-hop DEX routing.
+//! `/bloom/petals/dex/router` petal — multi-hop DEX routing.
 //!
 //! Exposes `quote_Nhop` (pure read-only quote) and `swap_Nhop` (executes a
 //! multi-hop swap) for N ∈ {1, 2, 3}.
@@ -22,7 +22,7 @@
 //! ## Petal entry points
 //!
 //! Declared inside `pub mod router` with
-//! `#[bloom::petal(path = "/bloom/dex/router", version = "0.1.0")]`.
+//! `#[bloom::petal(path = "/bloom/petals/dex/router", version = "0.1.0")]`.
 
 #![deny(missing_docs)]
 #![cfg_attr(target_arch = "wasm32", no_main)]
@@ -345,7 +345,7 @@ pub mod ops {
 
 // ─── Petal module — public entry points ──────────────────────────────────────
 
-/// The `/bloom/dex/router` petal. Multi-hop quote and swap operations.
+/// The `/bloom/petals/dex/router` petal. Multi-hop quote and swap operations.
 ///
 /// ## Swap model
 ///
@@ -366,7 +366,7 @@ pub mod ops {
 /// which uses `bloom-petal-dex-pool::payload` helpers (shared `rlib` dep) and
 /// `bloom-dex-math::SwapStrategy::apply_swap`. `ConstantProduct` is the only
 /// strategy; its fee params live serialized in each pool's `params_bytes`.
-#[bloom::petal(path = "/bloom/dex/router", version = "0.1.0")]
+#[bloom::petal(path = "/bloom/petals/dex/router", version = "0.1.0")]
 pub mod router {
     use bloom_dex_math::ConstantProduct;
     use bloom_petal_dex_pool::pool::Pool;

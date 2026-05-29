@@ -1,4 +1,4 @@
-//! `/bloom/dex/wallet` — minimal settlement petal for the DeFi pipe demo.
+//! `/bloom/petals/dex/wallet` — minimal settlement petal for the DeFi pipe demo.
 //!
 //! The pipe front-door emits only Move commands (never builtin
 //! `TransferObjects`), so the final "deliver the swapped coin to a
@@ -30,8 +30,8 @@ pub mod ops {
     }
 }
 
-/// Petal entry points for `/bloom/dex/wallet`.
-#[bloom::petal(path = "/bloom/dex/wallet", version = "0.1.0")]
+/// Petal entry points for `/bloom/petals/dex/wallet`.
+#[bloom::petal(path = "/bloom/petals/dex/wallet", version = "0.1.0")]
 pub mod wallet {
     use crate::ops;
     use bloom_resource::{Coin, Erased};

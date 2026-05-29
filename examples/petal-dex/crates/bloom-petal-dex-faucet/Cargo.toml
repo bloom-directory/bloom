@@ -3,7 +3,7 @@ name = "bloom-petal-dex-faucet"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "DEX test faucet petal (/bloom/dex/faucet) — mint() creates a Coin<Erased> for live-chain pool/swap provisioning"
+description = "DEX test faucet petal (/bloom/petals/dex/faucet) — mint() creates a Coin<Erased> for live-chain pool/swap provisioning"
 publish = false
 
 [lib]

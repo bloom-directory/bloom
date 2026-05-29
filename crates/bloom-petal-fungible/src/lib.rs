@@ -1,4 +1,4 @@
-//! `/bloom/core/fungible` petal — the canonical fungible-token petal
+//! `/bloom/petals/core/fungible` petal — the canonical fungible-token petal
 //! shipped as part of the Bloom standard library.
 //!
 //! Implements:
@@ -269,11 +269,11 @@ pub mod ops {
     }
 }
 
-/// The `/bloom/core/fungible` petal module. Declares the on-chain
+/// The `/bloom/petals/core/fungible` petal module. Declares the on-chain
 /// objects (`LOOM`, `MintCap<T>`, `BurnCap<T>`, `Supply<T>`, `EpochZero`)
 /// and the public entry points (`create_currency`, `mint`, `burn`,
 /// `split`, `merge`, `transfer`, `value`, `mint_genesis`).
-#[bloom::petal(path = "/bloom/core/fungible", version = "0.1.0")]
+#[bloom::petal(path = "/bloom/petals/core/fungible", version = "0.1.0")]
 pub mod fungible {
     use crate::ops;
     use bloom_resource::{Capability, Coin, Resource, Signer, UID};

@@ -70,6 +70,18 @@ impl Entry {
             link_target: None,
         }
     }
+    /// Build an executable read-only file entry (mode 0o555). This is used
+    /// for command shims whose content is readable but whose primary affordance
+    /// is `execve`.
+    pub fn executable_file(name: &str) -> Self {
+        Self {
+            name: name.into(),
+            kind: EntryKind::File,
+            size: 0,
+            mode: 0o555,
+            link_target: None,
+        }
+    }
     pub fn symlink(name: &str, target: &str) -> Self {
         Self {
             name: name.into(),
@@ -212,6 +224,16 @@ mod tests {
         assert_eq!(e.kind, EntryKind::File);
         assert_eq!(e.size, 0);
         assert_eq!(e.mode, 0o644);
+        assert!(e.link_target.is_none());
+    }
+
+    #[test]
+    fn executable_file_defaults() {
+        let e = Entry::executable_file("quote");
+        assert_eq!(e.name, "quote");
+        assert_eq!(e.kind, EntryKind::File);
+        assert_eq!(e.size, 0);
+        assert_eq!(e.mode, 0o555);
         assert!(e.link_target.is_none());
     }
 

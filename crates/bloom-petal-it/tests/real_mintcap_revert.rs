@@ -79,7 +79,7 @@ fn seed_epoch_zero_cap(state: &mut State, id: ObjectId, owner: bloom_chain_types
 /// Tiny WAT petal exporting `__petal_mint_genesis` as a noop. The
 /// `bloom_petal_manifest_v0` custom section appended by
 /// `wrap_with_real_manifest` carries the real macro-emitted manifest
-/// for `/bloom/core/fungible`, so the validator sees the exact
+/// for `/bloom/petals/core/fungible`, so the validator sees the exact
 /// declared arg types for `mint_genesis`.
 fn noop_mint_genesis_wat() -> &'static str {
     r#"
@@ -106,7 +106,7 @@ fn mint_genesis_wrong_typed_cap_reverts_with_typemismatch() {
     let wasm = wrap_with_real_manifest(noop_mint_genesis_wat(), real_fungible_manifest_bytes());
     let petal_hash = state.insert_code(&wasm);
     // The PTB pins by hash, so the manifest is loaded from the inserted
-    // wasm. The harness keeps `/bloom/core/fungible` bound to the
+    // wasm. The harness keeps `/bloom/petals/core/fungible` bound to the
     // bootstrap sentinel so the seeded gas coin remains Coin<LOOM>.
 
     // Build `mint_genesis(epoch=alice_coin /* WRONG TYPE */,

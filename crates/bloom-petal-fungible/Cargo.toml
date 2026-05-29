@@ -5,7 +5,7 @@ edition = "2024"
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "/bloom/core/fungible petal: Coin<T>, MintCap<T>, BurnCap<T>, Supply<T>, LOOM marker, EpochZero (spec §9, §14.1)."
+description = "/bloom/petals/core/fungible petal: Coin<T>, MintCap<T>, BurnCap<T>, Supply<T>, LOOM marker, EpochZero (spec §9, §14.1)."
 
 [lib]
 name = "bloom_petal_fungible"

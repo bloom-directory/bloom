@@ -6,6 +6,7 @@
 //! Subcommands that build/sign txs use the xDSA wallet stored in
 //! `<bloom_home>/chain/keystore/<validator>.xdsa`.
 
+use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -75,7 +76,8 @@ pub enum ChainCmd {
         wait_timeout_secs: u64,
     },
     /// Execute one read-only petal call against the latest committed snapshot.
-    View {
+    #[command(name = "view-call", alias = "view")]
+    ViewCall {
         /// Composed view command array as JSON. When set, --path/--function/--arg are ignored.
         #[arg(long, value_name = "JSON")]
         commands: Option<String>,
@@ -390,7 +392,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
         }
 
         // ── view petal call ──────────────────────────────────────────────────
-        ChainCmd::View {
+        ChainCmd::ViewCall {
             commands,
             path,
             function,
@@ -415,8 +417,9 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
                         .with_context(|| format!("parse --commands JSON: {commands}"))
                 })
                 .transpose()?;
+            let mut stdin_params = read_view_call_stdin_json()?;
             let client = make_client();
-            let params = if let Some(commands) = parsed_commands {
+            let mut params = if let Some(commands) = parsed_commands {
                 json!({
                     "commands": commands,
                     "signers": signers,
@@ -438,6 +441,19 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
                     "fuel_limit": fuel_limit,
                 })
             };
+            if let Some(stdin_params) = stdin_params.as_object_mut()
+                && let Some(params) = params.as_object_mut()
+            {
+                for (key, value) in std::mem::take(stdin_params) {
+                    match key.as_str() {
+                        // The VFS shim bakes these in; argv remains authoritative.
+                        "path" | "function" => {}
+                        _ => {
+                            params.insert(key, value);
+                        }
+                    }
+                }
+            }
             let result = client.call("chain_view_call", params).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
@@ -535,6 +551,23 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn read_view_call_stdin_json() -> Result<serde_json::Value> {
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Ok(serde_json::Value::Null);
+    }
+
+    let mut body = String::new();
+    stdin
+        .read_to_string(&mut body)
+        .context("read view-call stdin")?;
+    let body = body.trim();
+    if body.is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_str(body).context("parse view-call stdin JSON")
+}
 
 fn genesis_skeleton() -> &'static str {
     r#"# bloom-chain v0 genesis (edit before sharing with validators)

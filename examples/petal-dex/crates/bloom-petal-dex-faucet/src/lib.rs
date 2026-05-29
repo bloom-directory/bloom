@@ -1,4 +1,4 @@
-//! `/bloom/dex/faucet` — test faucet petal for the DeFi pipe demo.
+//! `/bloom/petals/dex/faucet` — test faucet petal for the DeFi pipe demo.
 //!
 //! On a live chain, genesis only emits `Coin<LOOM>` (see
 //! `bloom_chain_node::genesis::Genesis::apply_to_state`), and the PTB
@@ -86,8 +86,8 @@ pub mod ops {
     }
 }
 
-/// Petal entry points for `/bloom/dex/faucet`.
-#[bloom::petal(path = "/bloom/dex/faucet", version = "0.1.0")]
+/// Petal entry points for `/bloom/petals/dex/faucet`.
+#[bloom::petal(path = "/bloom/petals/dex/faucet", version = "0.1.0")]
 pub mod faucet {
     use crate::ops;
     use bloom_resource::{Capability, Coin, Erased, Signer, UID};

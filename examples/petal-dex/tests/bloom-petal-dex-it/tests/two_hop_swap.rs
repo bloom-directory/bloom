@@ -109,7 +109,7 @@ fn two_hop_asymmetric_pools_no_fee() {
 // Previously `#[ignore]`d pending a pre-built `bloom_petal_dex_router.wasm`
 // (wasm32-unknown-unknown is not in CI). With `wrap_with_real_manifest`
 // we pair a tiny WAT body with the **real** macro-emitted canonical
-// manifest bytes for `/bloom/dex/strategy/cpmm` (which exposes the
+// manifest bytes for `/bloom/petals/dex/strategy/cpmm` (which exposes the
 // nullary `version()` entry point exercising the multi-petal manifest
 // resolution path). The router petal's `quote_*hop` functions take
 // `&Pool<A, B, S>` arguments that the validator would substitute via
@@ -132,7 +132,7 @@ fn router_manifest_decodes_and_publishes_via_wasm_section() {
     // codec (i.e. they are valid `PetalManifestV0` bytes).
     let bytes = real_router_manifest_bytes();
     let m = decode_manifest(bytes).expect("real router manifest must decode");
-    assert_eq!(m.module_path, "/bloom/dex/router");
+    assert_eq!(m.module_path, "/bloom/petals/dex/router");
     let names: Vec<&str> = m.functions.iter().map(|f| f.name.as_str()).collect();
     assert!(
         names
@@ -165,7 +165,7 @@ fn router_manifest_decodes_and_publishes_via_wasm_section() {
 "#;
     let router_wasm = wrap_with_real_manifest(router_wat, real_router_manifest_bytes());
     let router_hash = state.insert_code(&router_wasm);
-    state.set_vfs_binding("/bloom/dex/router".to_string(), router_hash);
+    state.set_vfs_binding("/bloom/petals/dex/router".to_string(), router_hash);
 
     // Also install the cpmm petal so we can submit a real PTB that
     // exercises the chain-authoritative path end-to-end.
@@ -182,7 +182,7 @@ fn router_manifest_decodes_and_publishes_via_wasm_section() {
 "#;
     let cpmm_wasm = wrap_with_real_manifest(cpmm_wat, real_cpmm_manifest_bytes());
     let cpmm_hash = state.insert_code(&cpmm_wasm);
-    state.set_vfs_binding("/bloom/dex/strategy/cpmm".to_string(), cpmm_hash);
+    state.set_vfs_binding("/bloom/petals/dex/strategy/cpmm".to_string(), cpmm_hash);
 
     let ptb = PtbTx {
         signers: vec![alice.0],

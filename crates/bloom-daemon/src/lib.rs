@@ -491,6 +491,10 @@ impl Daemon {
             };
             let submitter = Arc::new(RpcPtbSubmitter::new(home.clone(), rpc_client));
             vfs_builder = vfs_builder.mount(
+                "petals",
+                Arc::new(bloom_vfs::PetalsEndpointHandler::new(chain_state.clone())) as _,
+            );
+            vfs_builder = vfs_builder.mount(
                 "tx",
                 Arc::new(bloom_vfs::TxHandler::new(chain_state).with_submitter(submitter)) as _,
             );
@@ -1146,6 +1150,7 @@ mod tests {
         assert!(d.vfs.handler("addressbook").is_some());
         assert!(d.vfs.handler("ens").is_some());
         assert!(d.vfs.handler("public").is_some());
+        assert!(d.vfs.handler("petals").is_some());
     }
 
     #[test]

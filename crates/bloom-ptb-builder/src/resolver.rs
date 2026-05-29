@@ -7,7 +7,7 @@
 //! manifest `module_path` plus a trailing `/function` segment:
 //!
 //! ```text
-//! /bloom/dex/pool/swap_exact_in
+//! /bloom/petals/dex/pool/swap_exact_in
 //! └────────────┬───┘ └─────┬────┘
 //!     petal path        function
 //! ```

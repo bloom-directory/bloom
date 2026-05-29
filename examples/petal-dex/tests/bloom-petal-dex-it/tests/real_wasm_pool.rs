@@ -1,4 +1,4 @@
-//! **Real-wasm** end-to-end de-risk for the `/bloom/dex/pool` petal
+//! **Real-wasm** end-to-end de-risk for the `/bloom/petals/dex/pool` petal
 //! (spec §6 litmus linchpin "R1": does the real pool wasm body execute
 //! through the chain VM?).
 //!
@@ -40,7 +40,7 @@ fn real_pool_create_pool_executes() {
     // Deploy the real pool wasm.
     let wasm = std::fs::read(build_pool_wasm()).expect("read pool wasm");
     let pool_petal_hash = state.insert_code(&wasm);
-    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_petal_hash);
+    state.set_vfs_binding("/bloom/petals/dex/pool".to_string(), pool_petal_hash);
 
     // Seed two Coin<Erased> deposits owned by alice.
     let coin_a = erased_coin_id(b"a");
@@ -58,7 +58,7 @@ fn real_pool_create_pool_executes() {
             // cmd 0: create_pool(coin_a, coin_b, params) -> (Pool, LpPosition)
             Command::Move(MoveCmd {
                 petal: PetalRef {
-                    path: "/bloom/dex/pool".to_string(),
+                    path: "/bloom/petals/dex/pool".to_string(),
                     hash: Some(pool_petal_hash),
                 },
                 function: "create_pool".to_string(),
@@ -152,7 +152,7 @@ fn real_pool_swap_exact_in_executes() {
     // Deploy the real pool wasm + bind the VFS path.
     let wasm = std::fs::read(build_pool_wasm()).expect("read pool wasm");
     let pool_petal_hash = state.insert_code(&wasm);
-    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_petal_hash);
+    state.set_vfs_binding("/bloom/petals/dex/pool".to_string(), pool_petal_hash);
 
     // Alice stands up a shared 10000/10000 pool.
     let pool_id = create_shared_pool(&mut state, alice, pool_petal_hash, b"main", 30);
@@ -174,7 +174,7 @@ fn real_pool_swap_exact_in_executes() {
             // cmd 0: swap_exact_in(coin_in, pool, min_out) -> Coin<Erased>
             Command::Move(MoveCmd {
                 petal: PetalRef {
-                    path: "/bloom/dex/pool".to_string(),
+                    path: "/bloom/petals/dex/pool".to_string(),
                     hash: Some(pool_petal_hash),
                 },
                 function: "swap_exact_in".to_string(),
@@ -250,7 +250,7 @@ fn real_pool_swap_slippage_reverts() {
 
     let wasm = std::fs::read(build_pool_wasm()).expect("read pool wasm");
     let pool_petal_hash = state.insert_code(&wasm);
-    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_petal_hash);
+    state.set_vfs_binding("/bloom/petals/dex/pool".to_string(), pool_petal_hash);
 
     let pool_id = create_shared_pool(&mut state, alice, pool_petal_hash, b"main", 30);
     let pool_version = state
@@ -269,7 +269,7 @@ fn real_pool_swap_slippage_reverts() {
         commands: vec![
             Command::Move(MoveCmd {
                 petal: PetalRef {
-                    path: "/bloom/dex/pool".to_string(),
+                    path: "/bloom/petals/dex/pool".to_string(),
                     hash: Some(pool_petal_hash),
                 },
                 function: "swap_exact_in".to_string(),
@@ -335,7 +335,7 @@ fn real_pool_swap_slippage_reverts() {
 
 // ---------------------------------------------------------------------------
 // Test (Phase F linchpin): real pool swap output → PTB Use-ref → a DOWNSTREAM
-// petal Move (/bloom/dex/wallet `receive`) Consume arg → settled to a third
+// petal Move (/bloom/petals/dex/wallet `receive`) Consume arg → settled to a third
 // party. Proves petal→petal coin threading through the chain VM (spec §6).
 // ---------------------------------------------------------------------------
 
@@ -350,11 +350,11 @@ fn real_pool_swap_then_wallet_receive_threads_coin() {
     // Deploy the real pool wasm and the real wallet wasm; bind both VFS paths.
     let pool_wasm = std::fs::read(build_pool_wasm()).expect("read pool wasm");
     let pool_petal_hash = state.insert_code(&pool_wasm);
-    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_petal_hash);
+    state.set_vfs_binding("/bloom/petals/dex/pool".to_string(), pool_petal_hash);
 
     let wallet_wasm = std::fs::read(build_wallet_wasm()).expect("read wallet wasm");
     let wallet_petal_hash = state.insert_code(&wallet_wasm);
-    state.set_vfs_binding("/bloom/dex/wallet".to_string(), wallet_petal_hash);
+    state.set_vfs_binding("/bloom/petals/dex/wallet".to_string(), wallet_petal_hash);
 
     // Alice stands up a shared 10000/10000 pool.
     let pool_id = create_shared_pool(&mut state, alice, pool_petal_hash, b"main", 30);
@@ -375,7 +375,7 @@ fn real_pool_swap_then_wallet_receive_threads_coin() {
             // cmd 0: swap_exact_in(coin_in, pool, min_out) -> Coin<Erased>  [coin-first]
             Command::Move(MoveCmd {
                 petal: PetalRef {
-                    path: "/bloom/dex/pool".to_string(),
+                    path: "/bloom/petals/dex/pool".to_string(),
                     hash: Some(pool_petal_hash),
                 },
                 function: "swap_exact_in".to_string(),
@@ -445,7 +445,7 @@ fn real_pool_cross_pool_lp_remove_reverts_without_state_change() {
 
     let wasm = std::fs::read(build_pool_wasm()).expect("read pool wasm");
     let pool_petal_hash = state.insert_code(&wasm);
-    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_petal_hash);
+    state.set_vfs_binding("/bloom/petals/dex/pool".to_string(), pool_petal_hash);
 
     let pool_a = create_shared_pool(&mut state, alice, pool_petal_hash, b"a", 30);
     let lp_a = lp_positions_owned_by(&state, alice)
@@ -465,7 +465,7 @@ fn real_pool_cross_pool_lp_remove_reverts_without_state_change() {
         commands: vec![
             Command::Move(MoveCmd {
                 petal: PetalRef {
-                    path: "/bloom/dex/pool".to_string(),
+                    path: "/bloom/petals/dex/pool".to_string(),
                     hash: Some(pool_petal_hash),
                 },
                 function: "remove_liquidity".to_string(),
@@ -530,7 +530,7 @@ fn real_pool_stale_shared_pool_version_and_sandwich_slippage_revert() {
 
     let wasm = std::fs::read(build_pool_wasm()).expect("read pool wasm");
     let pool_petal_hash = state.insert_code(&wasm);
-    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_petal_hash);
+    state.set_vfs_binding("/bloom/petals/dex/pool".to_string(), pool_petal_hash);
 
     let pool_id = create_shared_pool(&mut state, alice, pool_petal_hash, b"main", 30);
     let stale_version = state.get_object(&pool_id).expect("pool").version;
@@ -625,7 +625,7 @@ fn real_pool_add_remove_and_exact_out_execute() {
 
     let wasm = std::fs::read(build_pool_wasm()).expect("read pool wasm");
     let pool_petal_hash = state.insert_code(&wasm);
-    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_petal_hash);
+    state.set_vfs_binding("/bloom/petals/dex/pool".to_string(), pool_petal_hash);
 
     let pool_id = create_shared_pool(&mut state, alice, pool_petal_hash, b"main", 30);
     let lps_before_add = lp_positions_owned_by(&state, alice);
@@ -638,7 +638,7 @@ fn real_pool_add_remove_and_exact_out_execute() {
         commands: vec![
             Command::Move(MoveCmd {
                 petal: PetalRef {
-                    path: "/bloom/dex/pool".to_string(),
+                    path: "/bloom/petals/dex/pool".to_string(),
                     hash: Some(pool_petal_hash),
                 },
                 function: "add_liquidity".to_string(),
@@ -724,7 +724,7 @@ fn real_pool_add_remove_and_exact_out_execute() {
         commands: vec![
             Command::Move(MoveCmd {
                 petal: PetalRef {
-                    path: "/bloom/dex/pool".to_string(),
+                    path: "/bloom/petals/dex/pool".to_string(),
                     hash: Some(pool_petal_hash),
                 },
                 function: "remove_liquidity".to_string(),
@@ -787,7 +787,7 @@ fn real_pool_add_remove_and_exact_out_execute() {
         commands: vec![
             Command::Move(MoveCmd {
                 petal: PetalRef {
-                    path: "/bloom/dex/pool".to_string(),
+                    path: "/bloom/petals/dex/pool".to_string(),
                     hash: Some(pool_petal_hash),
                 },
                 function: "swap_exact_out".to_string(),
@@ -859,7 +859,7 @@ fn real_pool_high_fee_exact_out_executes() {
 
     let wasm = std::fs::read(build_pool_wasm()).expect("read pool wasm");
     let pool_petal_hash = state.insert_code(&wasm);
-    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_petal_hash);
+    state.set_vfs_binding("/bloom/petals/dex/pool".to_string(), pool_petal_hash);
 
     let pool_id = create_shared_pool(&mut state, alice, pool_petal_hash, b"high-fee", 9999);
     let max_in = erased_coin_id(b"bob-high-fee-exact-out");
@@ -870,7 +870,7 @@ fn real_pool_high_fee_exact_out_executes() {
         commands: vec![
             Command::Move(MoveCmd {
                 petal: PetalRef {
-                    path: "/bloom/dex/pool".to_string(),
+                    path: "/bloom/petals/dex/pool".to_string(),
                     hash: Some(pool_petal_hash),
                 },
                 function: "swap_exact_out".to_string(),
@@ -979,7 +979,7 @@ fn swap_exact_in_ptb(
         commands: vec![
             Command::Move(MoveCmd {
                 petal: PetalRef {
-                    path: "/bloom/dex/pool".to_string(),
+                    path: "/bloom/petals/dex/pool".to_string(),
                     hash: Some(pool_petal_hash),
                 },
                 function: "swap_exact_in".to_string(),

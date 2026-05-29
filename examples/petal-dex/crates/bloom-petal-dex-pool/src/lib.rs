@@ -1,4 +1,4 @@
-//! `/bloom/dex/pool` petal — strategy-generic DEX pool.
+//! `/bloom/petals/dex/pool` petal — strategy-generic DEX pool.
 //!
 //! Defines:
 //! - `Pool<A, B, S>` — the shared pool object holding two coin reserves
@@ -28,7 +28,7 @@
 //! ## Petal entry points
 //!
 //! Declared inside `pub mod pool` with
-//! `#[bloom::petal(path = "/bloom/dex/pool", version = "0.1.0")]`.
+//! `#[bloom::petal(path = "/bloom/petals/dex/pool", version = "0.1.0")]`.
 
 #![deny(missing_docs)]
 #![cfg_attr(target_arch = "wasm32", no_main)]
@@ -897,9 +897,9 @@ pub mod ops {
 
 // ─── Petal module — public entry points ──────────────────────────────────────
 
-/// The `/bloom/dex/pool` petal. Declares the on-chain objects and the
+/// The `/bloom/petals/dex/pool` petal. Declares the on-chain objects and the
 /// public entry points for pool lifecycle operations.
-#[bloom::petal(path = "/bloom/dex/pool", version = "0.1.0")]
+#[bloom::petal(path = "/bloom/petals/dex/pool", version = "0.1.0")]
 pub mod pool {
     use bloom_objects::{ObjectId, TypeTag};
     use bloom_resource::{Coin, Resource, UID};

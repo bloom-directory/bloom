@@ -21,7 +21,7 @@
 //! amount  = "1000000000000000000000"
 //!
 //! [[petals]]
-//! path = "/bloom/dex/pool"
+//! path = "/bloom/petals/dex/pool"
 //! wasm_hex = "<hex-encoded wasm bytes>"
 //!
 //! [[key_registry]]

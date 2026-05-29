@@ -663,7 +663,7 @@ mod tests {
     #[test]
     fn petal_ref_roundtrip_pinned() {
         let p = PetalRef {
-            path: "/bloom/dex/pool".to_string(),
+            path: "/bloom/petals/dex/pool".to_string(),
             hash: Some(Hash32([0xEF; 32])),
         };
         let mut buf = Vec::new();
@@ -675,7 +675,7 @@ mod tests {
     #[test]
     fn petal_ref_roundtrip_unpinned() {
         let p = PetalRef {
-            path: "/bloom/core/fungible".to_string(),
+            path: "/bloom/petals/core/fungible".to_string(),
             hash: None,
         };
         let mut buf = Vec::new();
@@ -780,7 +780,7 @@ mod tests {
     fn cmd_move_rt() {
         cmd_rt(&Command::Move(MoveCmd {
             petal: PetalRef {
-                path: "/bloom/dex/pool".to_string(),
+                path: "/bloom/petals/dex/pool".to_string(),
                 hash: Some(Hash32([0x01; 32])),
             },
             function: "swap_a_for_b".to_string(),
@@ -805,7 +805,7 @@ mod tests {
     fn cmd_publish_rt() {
         cmd_rt(&Command::Publish(PublishCmd {
             wasm_bytes: vec![0x00, 0x61, 0x73, 0x6d],
-            module_path: "/bloom/dex/strategy/cpmm".to_string(),
+            module_path: "/bloom/petals/dex/strategy/cpmm".to_string(),
             publisher_cap: None,
         }));
         cmd_rt(&Command::Publish(PublishCmd {
@@ -879,7 +879,7 @@ mod tests {
     fn cmd_upgrade_rt() {
         cmd_rt(&Command::UpgradePetal(UpgradeCmd {
             wasm_bytes: vec![1, 2, 3, 4],
-            module_path: "/bloom/dex/strategy/cpmm".to_string(),
+            module_path: "/bloom/petals/dex/strategy/cpmm".to_string(),
             publisher_cap: UseRef {
                 cmd_idx: 0,
                 ret_idx: 0,
@@ -905,7 +905,7 @@ mod tests {
             commands: vec![
                 Command::Move(MoveCmd {
                     petal: PetalRef {
-                        path: "/bloom/dex/pool".to_string(),
+                        path: "/bloom/petals/dex/pool".to_string(),
                         hash: Some(Hash32([0x01; 32])),
                     },
                     function: "swap".to_string(),

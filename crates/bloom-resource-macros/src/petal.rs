@@ -1,7 +1,7 @@
 //! `#[bloom::petal]` module attribute (spec §11.1).
 //!
 //! ```ignore
-//! #[bloom::petal(path = "/bloom/dex/pool", version = "0.1.0")]
+//! #[bloom::petal(path = "/bloom/petals/dex/pool", version = "0.1.0")]
 //! pub mod pool {
 //!     use bloom_resource::{Coin, UID};
 //!
@@ -48,7 +48,7 @@ use bloom_petal_manifest::types::{
 /// Parsed `#[bloom::petal(...)]` attribute.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PetalAttr {
-    /// VFS path of the petal (`"/bloom/dex/pool"`).
+    /// VFS path of the petal (`"/bloom/petals/dex/pool"`).
     pub path: Option<String>,
     /// Framework version, e.g. `"0.1.0"`. Defaults to `(0, 1, 0)`.
     pub version: Option<SemVer>,

@@ -1160,6 +1160,7 @@ mod tests {
             match p.first() {
                 Some("inbox") => Ok(Entry::writable_file("inbox")),
                 Some("readme") => Ok(Entry::file("readme")),
+                Some("run") => Ok(Entry::executable_file("run")),
                 _ => Err(HandlerError::NotFound(p.to_string_path())),
             }
         }
@@ -1167,6 +1168,7 @@ mod tests {
             match p.first() {
                 Some("inbox") => Ok(self.writes.lock().last().cloned().unwrap_or_default()),
                 Some("readme") => Ok(b"static read-only body\n".to_vec()),
+                Some("run") => Ok(b"#!/bin/sh\n".to_vec()),
                 _ => Err(HandlerError::NotAFile(p.to_string_path())),
             }
         }
@@ -1181,7 +1183,11 @@ mod tests {
         }
         async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
             if p.is_root() {
-                Ok(vec![Entry::writable_file("inbox"), Entry::file("readme")])
+                Ok(vec![
+                    Entry::writable_file("inbox"),
+                    Entry::file("readme"),
+                    Entry::executable_file("run"),
+                ])
             } else {
                 Err(HandlerError::NotADir(p.to_string_path()))
             }
@@ -1444,6 +1450,18 @@ mod tests {
         let inbox = fs.lookup(&ctx, &dir, "inbox").await.unwrap();
         let attrs = fs.getattr(&ctx, &inbox).await.unwrap();
         assert_eq!(attrs.mode & 0o777, 0o644);
+    }
+
+    #[tokio::test]
+    async fn getattr_executable_file_is_0555() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let run = fs.lookup(&ctx, &dir, "run").await.unwrap();
+        let attrs = fs.getattr(&ctx, &run).await.unwrap();
+        assert_eq!(attrs.mode & 0o777, 0o555);
     }
 
     /// Bug #5: ACCESS strips MODIFY/EXTEND/DELETE for a read-only path

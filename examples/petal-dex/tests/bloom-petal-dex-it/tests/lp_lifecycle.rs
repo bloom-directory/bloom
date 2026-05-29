@@ -145,7 +145,7 @@ fn add_liquidity_create_then_subsequent() {
 // Previously `#[ignore]`d pending a pre-built `bloom_petal_dex_pool.wasm`
 // (wasm32-unknown-unknown is not in CI). With `wrap_with_real_manifest`
 // we install the **real** macro-emitted canonical manifest bytes for
-// `/bloom/dex/pool` into chain state and confirm:
+// `/bloom/petals/dex/pool` into chain state and confirm:
 //   1. The manifest is canonical-decodable.
 //   2. It declares the LP lifecycle entry points the spec promises
 //      (`create_pool`, `add_liquidity`, `remove_liquidity`).
@@ -168,7 +168,7 @@ use bloom_script::ChainStateIface;
 fn real_pool_manifest_loads_via_chain_adapter() {
     let bytes = real_pool_manifest_bytes();
     let m = decode_manifest(bytes).expect("real pool manifest must decode");
-    assert_eq!(m.module_path, "/bloom/dex/pool");
+    assert_eq!(m.module_path, "/bloom/petals/dex/pool");
 
     let names: Vec<&str> = m.functions.iter().map(|f| f.name.as_str()).collect();
     for expected in ["create_pool", "add_liquidity", "remove_liquidity"] {
@@ -198,7 +198,7 @@ fn real_pool_manifest_loads_via_chain_adapter() {
     let stub = adapter
         .load_manifest(&hash)
         .expect("adapter must load manifest from wasm custom section");
-    assert_eq!(stub.module_path, "/bloom/dex/pool");
+    assert_eq!(stub.module_path, "/bloom/petals/dex/pool");
     let stub_names: Vec<&str> = stub.functions.iter().map(|f| f.name.as_str()).collect();
     assert!(stub_names.contains(&"create_pool"));
     assert!(stub_names.contains(&"add_liquidity"));

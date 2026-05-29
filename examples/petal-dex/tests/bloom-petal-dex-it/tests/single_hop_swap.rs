@@ -215,7 +215,7 @@ fn apply_swap_zero_fee_correctness() {
 // Previously `#[ignore]`d pending a pre-built `bloom_petal_dex_router.wasm`
 // (wasm32-unknown-unknown is not in CI). With `wrap_with_real_manifest`
 // we pair a tiny WAT body with the **real** macro-emitted canonical
-// manifest bytes for `/bloom/dex/strategy/cpmm`, install it in `state`,
+// manifest bytes for `/bloom/petals/dex/strategy/cpmm`, install it in `state`,
 // and invoke the nullary `version()` function. The validator decodes
 // the manifest from the wasm custom section via `PtbChainAdapter`
 // (layer 2, the production path) — identical to what the chain node
@@ -255,7 +255,7 @@ fn cpmm_version_call_uses_real_manifest_via_wasm_section() {
 "#;
     let wasm = wrap_with_real_manifest(wat, real_cpmm_manifest_bytes());
     let petal_hash = state.insert_code(&wasm);
-    state.set_vfs_binding("/bloom/dex/strategy/cpmm".to_string(), petal_hash);
+    state.set_vfs_binding("/bloom/petals/dex/strategy/cpmm".to_string(), petal_hash);
 
     let ptb = PtbTx {
         signers: vec![alice.0],

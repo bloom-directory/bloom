@@ -95,10 +95,10 @@ fn deploy(allocations: &[(bloom_chain_types::Address, u128)]) -> (State, Hash32,
     let mut state = build_state(allocations);
     let pool_wasm = std::fs::read(build_pool_wasm()).expect("read pool wasm");
     let pool_hash = state.insert_code(&pool_wasm);
-    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_hash);
+    state.set_vfs_binding("/bloom/petals/dex/pool".to_string(), pool_hash);
     let wallet_wasm = std::fs::read(build_wallet_wasm()).expect("read wallet wasm");
     let wallet_hash = state.insert_code(&wallet_wasm);
-    state.set_vfs_binding("/bloom/dex/wallet".to_string(), wallet_hash);
+    state.set_vfs_binding("/bloom/petals/dex/wallet".to_string(), wallet_hash);
     (state, pool_hash, wallet_hash)
 }
 
@@ -145,11 +145,11 @@ fn install_fast_manifest_fixture() -> (State, ObjectId) {
 
     let pool_wasm = wrap_with_real_manifest(FAST_POOL_WAT, real_pool_manifest_bytes());
     let pool_hash = state.insert_code(&pool_wasm);
-    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_hash);
+    state.set_vfs_binding("/bloom/petals/dex/pool".to_string(), pool_hash);
 
     let wallet_wasm = wrap_with_real_manifest(FAST_WALLET_WAT, real_wallet_manifest_bytes());
     let wallet_hash = state.insert_code(&wallet_wasm);
-    state.set_vfs_binding("/bloom/dex/wallet".to_string(), wallet_hash);
+    state.set_vfs_binding("/bloom/petals/dex/wallet".to_string(), wallet_hash);
 
     let pool_id = erased_coin_id(b"fast-manifest-pool-id");
     state.set_object(Object {
@@ -395,7 +395,7 @@ fn expr_5_1(
     carol: &[u8; 32],
 ) -> String {
     format!(
-        "/bloom/dex/pool/swap_exact_in type:Erased type:Erased obj:{bob}@0 obj:{pool}@{pool_ver} {min_out} | /bloom/dex/wallet/receive 0x{carol}",
+        "/bloom/petals/dex/pool/swap_exact_in type:Erased type:Erased obj:{bob}@0 obj:{pool}@{pool_ver} {min_out} | /bloom/petals/dex/wallet/receive 0x{carol}",
         bob = hex32(&bob_coin.0),
         pool = hex32(&pool_id.0),
         carol = hex32(carol),
@@ -433,12 +433,15 @@ fn fast_double_spend_lines_rejected_before_execution() {
     let gas_payer = genesis_coin_id(bob, 1);
     let lines = vec![
         format!(
-            "/bloom/dex/pool/swap_exact_in type:Erased type:Erased obj:{bob}@0 obj:{pool}@0 1",
+            "/bloom/petals/dex/pool/swap_exact_in type:Erased type:Erased obj:{bob}@0 obj:{pool}@0 1",
             bob = hex32(&bob_coin.0),
             pool = hex32(&pool_id.0),
         ),
-        format!("/bloom/dex/wallet/receive @0.0 0x{}", hex32(&carol.0)),
-        format!("/bloom/dex/wallet/receive @0.0 0x{}", hex32(&dave.0)),
+        format!(
+            "/bloom/petals/dex/wallet/receive @0.0 0x{}",
+            hex32(&carol.0)
+        ),
+        format!("/bloom/petals/dex/wallet/receive @0.0 0x{}", hex32(&dave.0)),
     ];
 
     let cli_err = build_via_cli_lines(&state, &lines, bob.0, gas_payer)
@@ -683,15 +686,18 @@ fn litmus_5_1_output_not_double_spendable() {
     let lines = vec![
         // 0: bob's 100-coin → pool → output coin @0.0.
         format!(
-            "/bloom/dex/pool/swap_exact_in type:Erased type:Erased obj:{bob}@0 obj:{pool}@{ver} 1",
+            "/bloom/petals/dex/pool/swap_exact_in type:Erased type:Erased obj:{bob}@0 obj:{pool}@{ver} 1",
             bob = hex32(&bob_coin.0),
             pool = hex32(&pool_id.0),
             ver = pool_ver,
         ),
         // 1: settle @0.0 to carol.
-        format!("/bloom/dex/wallet/receive @0.0 0x{}", hex32(&carol.0)),
+        format!(
+            "/bloom/petals/dex/wallet/receive @0.0 0x{}",
+            hex32(&carol.0)
+        ),
         // 2: settle the SAME @0.0 to dave — the double-spend.
-        format!("/bloom/dex/wallet/receive @0.0 0x{}", hex32(&dave.0)),
+        format!("/bloom/petals/dex/wallet/receive @0.0 0x{}", hex32(&dave.0)),
     ];
 
     // Both doors must treat the double-use identically: either both reject it at
@@ -818,9 +824,9 @@ struct Hop {
 
 fn expr_5_2(bob_coin: &ObjectId, hop1: &Hop, hop2: &Hop, carol: &[u8; 32]) -> String {
     format!(
-        "/bloom/dex/pool/swap_exact_in type:Erased type:Erased obj:{bob}@0 obj:{p1}@{v1} {min1} \
-         | /bloom/dex/pool/swap_exact_in type:Erased type:Erased obj:{p2}@{v2} {min2} \
-         | /bloom/dex/wallet/receive 0x{carol}",
+        "/bloom/petals/dex/pool/swap_exact_in type:Erased type:Erased obj:{bob}@0 obj:{p1}@{v1} {min1} \
+         | /bloom/petals/dex/pool/swap_exact_in type:Erased type:Erased obj:{p2}@{v2} {min2} \
+         | /bloom/petals/dex/wallet/receive 0x{carol}",
         bob = hex32(&bob_coin.0),
         p1 = hex32(&hop1.pool.0),
         v1 = hop1.version,

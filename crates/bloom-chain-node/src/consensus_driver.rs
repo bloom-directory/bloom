@@ -142,7 +142,7 @@ impl BalanceView for StateAdmissionView<'_> {
     ) -> Result<(), AdmitReject> {
         let Some(coin_type) = resolve_loom_coin_type(self.state) else {
             return Err(AdmitReject::EnvelopeInvalid(
-                "missing required VFS binding for /bloom/core/fungible".to_string(),
+                "missing required VFS binding for /bloom/petals/core/fungible".to_string(),
             ));
         };
         let adapter = PtbChainAdapter::new(self.state, self.current_block);
@@ -177,7 +177,7 @@ impl BalanceView for StateAdmissionView<'_> {
         };
         let Some(coin_type) = resolve_loom_coin_type(self.state) else {
             return Err(AdmitReject::EnvelopeInvalid(
-                "missing required VFS binding for /bloom/core/fungible".to_string(),
+                "missing required VFS binding for /bloom/petals/core/fungible".to_string(),
             ));
         };
         let Some(obj) = self.state.get_object(&ptb.gas_payer) else {
@@ -791,7 +791,8 @@ pub fn try_apply_block_state_transitions<E: PetalExecutor>(
                 tx_hash: tx.tx_hash(),
                 success: false,
                 fuel_used: 0,
-                return_data: b"missing required VFS binding for /bloom/core/fungible".to_vec(),
+                return_data: b"missing required VFS binding for /bloom/petals/core/fungible"
+                    .to_vec(),
                 logs: vec![],
             });
             continue;

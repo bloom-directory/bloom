@@ -1148,7 +1148,7 @@ mod tests {
 
     fn sample_manifest() -> PetalManifestStub {
         PetalManifestStub {
-            module_path: "/bloom/dex/pool".to_string(),
+            module_path: "/bloom/petals/dex/pool".to_string(),
             functions: vec![FunctionDeclStub {
                 view: false,
                 name: "swap".to_string(),
@@ -1192,7 +1192,7 @@ mod tests {
             signers: vec![signer],
             commands: vec![Command::Move(MoveCmd {
                 petal: PetalRef {
-                    path: "/bloom/dex/pool".to_string(),
+                    path: "/bloom/petals/dex/pool".to_string(),
                     hash: Some(Hash32([0xAB; 32])),
                 },
                 function: "swap".to_string(),
@@ -1213,7 +1213,7 @@ mod tests {
         let gas_id = ObjectId([0xFE; 32]);
         chain.put_object(coin_obj(0xFE, signer, 1_000_000, 0));
         chain.put_petal(Hash32([0xAB; 32]), vec![1, 2, 3], sample_manifest());
-        chain.put_path("/bloom/dex/pool", Hash32([0xAB; 32]));
+        chain.put_path("/bloom/petals/dex/pool", Hash32([0xAB; 32]));
         (chain, signer, gas_id)
     }
 
@@ -1272,12 +1272,12 @@ mod tests {
             vec![1, 2, 3],
             object_manifest(AccessMode::ReadOnly),
         );
-        chain.put_path("/bloom/dex/pool", Hash32([0xAB; 32]));
+        chain.put_path("/bloom/petals/dex/pool", Hash32([0xAB; 32]));
         let tx = PtbTx {
             signers: vec![],
             commands: vec![Command::Move(MoveCmd {
                 petal: PetalRef {
-                    path: "/bloom/dex/pool".to_string(),
+                    path: "/bloom/petals/dex/pool".to_string(),
                     hash: Some(Hash32([0xAB; 32])),
                 },
                 function: "inspect".to_string(),
@@ -1326,12 +1326,12 @@ mod tests {
             vec![1, 2, 3],
             object_manifest(AccessMode::Mutable),
         );
-        chain.put_path("/bloom/dex/pool", Hash32([0xAB; 32]));
+        chain.put_path("/bloom/petals/dex/pool", Hash32([0xAB; 32]));
         let tx = PtbTx {
             signers: vec![],
             commands: vec![Command::Move(MoveCmd {
                 petal: PetalRef {
-                    path: "/bloom/dex/pool".to_string(),
+                    path: "/bloom/petals/dex/pool".to_string(),
                     hash: Some(Hash32([0xAB; 32])),
                 },
                 function: "inspect".to_string(),
@@ -1373,7 +1373,7 @@ mod tests {
             commands: vec![
                 Command::Move(MoveCmd {
                     petal: PetalRef {
-                        path: "/bloom/dex/pool".to_string(),
+                        path: "/bloom/petals/dex/pool".to_string(),
                         hash: Some(Hash32([0xAB; 32])),
                     },
                     function: "mint".to_string(),
@@ -1502,7 +1502,7 @@ mod tests {
     fn rejects_path_hash_mismatch() {
         let (chain, signer, gas_id) = setup();
         // Re-bind the path to a different hash than what's in the PTB.
-        chain.put_path("/bloom/dex/pool", Hash32([0xCD; 32]));
+        chain.put_path("/bloom/petals/dex/pool", Hash32([0xCD; 32]));
         let tx = sample_ptb(signer, gas_id, 100);
         let verifier = AlwaysOkVerifier;
         assert!(matches!(
@@ -1638,7 +1638,7 @@ mod tests {
         let mut tx = sample_ptb(signer, gas_id, 100);
         tx.commands = vec![Command::Move(MoveCmd {
             petal: PetalRef {
-                path: "/bloom/dex/pool".to_string(),
+                path: "/bloom/petals/dex/pool".to_string(),
                 hash: Some(Hash32([0xAB; 32])),
             },
             function: "touch_child".to_string(),
@@ -1692,7 +1692,7 @@ mod tests {
         let mut tx = sample_ptb(signer, gas_id, 100);
         tx.commands = vec![Command::Move(MoveCmd {
             petal: PetalRef {
-                path: "/bloom/dex/pool".to_string(),
+                path: "/bloom/petals/dex/pool".to_string(),
                 hash: Some(Hash32([0xAB; 32])),
             },
             function: "touch_pair".to_string(),
@@ -1752,7 +1752,7 @@ mod tests {
         let mut tx = sample_ptb(signer, gas_id, 100);
         tx.commands = vec![Command::Move(MoveCmd {
             petal: PetalRef {
-                path: "/bloom/dex/pool".to_string(),
+                path: "/bloom/petals/dex/pool".to_string(),
                 hash: Some(Hash32([0xAB; 32])),
             },
             function: "read_parent_mutate_child".to_string(),
@@ -2111,7 +2111,7 @@ mod tests {
             commands: vec![
                 Command::Move(MoveCmd {
                     petal: PetalRef {
-                        path: "/bloom/dex/pool".to_string(),
+                        path: "/bloom/petals/dex/pool".to_string(),
                         hash: Some(Hash32([0xAB; 32])),
                     },
                     function: "producer".to_string(),
@@ -2120,7 +2120,7 @@ mod tests {
                 }),
                 Command::Move(MoveCmd {
                     petal: PetalRef {
-                        path: "/bloom/dex/pool".to_string(),
+                        path: "/bloom/petals/dex/pool".to_string(),
                         hash: Some(Hash32([0xAB; 32])),
                     },
                     function: "consumer".to_string(),
@@ -2173,7 +2173,7 @@ mod tests {
             commands: vec![
                 Command::Move(MoveCmd {
                     petal: PetalRef {
-                        path: "/bloom/dex/pool".to_string(),
+                        path: "/bloom/petals/dex/pool".to_string(),
                         hash: Some(Hash32([0xAB; 32])),
                     },
                     function: "producer".to_string(),
@@ -2182,7 +2182,7 @@ mod tests {
                 }),
                 Command::Move(MoveCmd {
                     petal: PetalRef {
-                        path: "/bloom/dex/pool".to_string(),
+                        path: "/bloom/petals/dex/pool".to_string(),
                         hash: Some(Hash32([0xAB; 32])),
                     },
                     function: "consumer".to_string(),
@@ -2277,7 +2277,7 @@ mod tests {
                 }),
                 Command::Move(MoveCmd {
                     petal: PetalRef {
-                        path: "/bloom/dex/pool".to_string(),
+                        path: "/bloom/petals/dex/pool".to_string(),
                         hash: Some(Hash32([0xAB; 32])),
                     },
                     function: "consumer".to_string(),
@@ -2336,7 +2336,7 @@ mod tests {
             commands: vec![
                 Command::Move(MoveCmd {
                     petal: PetalRef {
-                        path: "/bloom/dex/pool".to_string(),
+                        path: "/bloom/petals/dex/pool".to_string(),
                         hash: Some(Hash32([0xAB; 32])),
                     },
                     function: "producer".to_string(),
@@ -2352,7 +2352,7 @@ mod tests {
                 },
                 Command::Move(MoveCmd {
                     petal: PetalRef {
-                        path: "/bloom/dex/pool".to_string(),
+                        path: "/bloom/petals/dex/pool".to_string(),
                         hash: Some(Hash32([0xAB; 32])),
                     },
                     function: "consumer".to_string(),
@@ -2406,7 +2406,7 @@ mod tests {
             commands: vec![
                 Command::Move(MoveCmd {
                     petal: PetalRef {
-                        path: "/bloom/dex/pool".to_string(),
+                        path: "/bloom/petals/dex/pool".to_string(),
                         hash: Some(Hash32([0xAB; 32])),
                     },
                     function: "producer".to_string(),
@@ -2422,7 +2422,7 @@ mod tests {
                 },
                 Command::Move(MoveCmd {
                     petal: PetalRef {
-                        path: "/bloom/dex/pool".to_string(),
+                        path: "/bloom/petals/dex/pool".to_string(),
                         hash: Some(Hash32([0xAB; 32])),
                     },
                     function: "consumer".to_string(),
@@ -2470,7 +2470,7 @@ mod tests {
             commands: vec![
                 Command::Move(MoveCmd {
                     petal: PetalRef {
-                        path: "/bloom/dex/pool".to_string(),
+                        path: "/bloom/petals/dex/pool".to_string(),
                         hash: Some(Hash32([0xAB; 32])),
                     },
                     function: "producer".to_string(),
@@ -2729,7 +2729,7 @@ mod tests {
                 }),
                 Command::Move(MoveCmd {
                     petal: PetalRef {
-                        path: "/bloom/dex/pool".to_string(),
+                        path: "/bloom/petals/dex/pool".to_string(),
                         hash: Some(Hash32([0xAB; 32])),
                     },
                     function: "mint".to_string(),

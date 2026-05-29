@@ -92,7 +92,7 @@ enum Cmd {
     /// here commits identically to one staged over the mount.
     Pipe {
         /// The pipe expression to lower, e.g.
-        /// `'/bloom/dex/pool/swap amount=100 --in <(/bloom/wallet/coin)>'`.
+        /// `'/bloom/petals/dex/pool/swap amount=100 --in <(/bloom/wallet/coin)>'`.
         expr: String,
         /// Signer pubkey (32-byte hex). Repeat for a multi-signer tx.
         #[arg(long = "signer", value_name = "HEX")]

@@ -443,7 +443,7 @@ mod tests {
     }
 
     const POOL_HASH: Hash32 = Hash32([0xAB; 32]);
-    const POOL_PATH: &str = "/bloom/dex/pool";
+    const POOL_PATH: &str = "/bloom/petals/dex/pool";
 
     fn concrete(name: &str) -> TypeTag {
         TypeTag::Concrete {
@@ -527,7 +527,7 @@ mod tests {
         );
         let plan = lower_and_build(
             &chain,
-            "/bloom/dex/pool/spend | /bloom/dex/pool/swap | /bloom/dex/pool/receive",
+            "/bloom/petals/dex/pool/spend | /bloom/petals/dex/pool/swap | /bloom/petals/dex/pool/receive",
             vec![signer],
             gas,
         )
@@ -595,7 +595,7 @@ mod tests {
         );
         let plan = lower_and_build(
             &chain,
-            "/bloom/dex/pool/add_liquidity min-lp=10 --a <(/bloom/dex/pool/spend_eth)> --b <(/bloom/dex/pool/spend_usdc)>",
+            "/bloom/petals/dex/pool/add_liquidity min-lp=10 --a <(/bloom/petals/dex/pool/spend_eth)> --b <(/bloom/petals/dex/pool/spend_usdc)>",
             vec![signer],
             gas,
         )
@@ -637,8 +637,13 @@ mod tests {
             )],
             signer,
         );
-        let err = lower_and_build(&chain, "/bloom/dex/pool/consumer @9.0", vec![signer], gas)
-            .unwrap_err();
+        let err = lower_and_build(
+            &chain,
+            "/bloom/petals/dex/pool/consumer @9.0",
+            vec![signer],
+            gas,
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("dangling") || msg.contains("@9.0"), "{msg}");
     }
@@ -663,7 +668,7 @@ mod tests {
             ],
             signer,
         );
-        let expr = "/bloom/dex/pool/spend | /bloom/dex/pool/receive";
+        let expr = "/bloom/petals/dex/pool/spend | /bloom/petals/dex/pool/receive";
 
         // CLI path.
         let cli = lower_and_build(&chain, expr, vec![signer], gas).unwrap();

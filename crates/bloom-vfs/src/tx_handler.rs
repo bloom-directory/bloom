@@ -632,7 +632,7 @@ mod tests {
     }
 
     const POOL_HASH: Hash32 = Hash32([0xAB; 32]);
-    const POOL_PATH: &str = "/bloom/dex/pool";
+    const POOL_PATH: &str = "/bloom/petals/dex/pool";
     const AUTO_GAS_ID: ObjectId = ObjectId([0xA5; 32]);
 
     fn concrete(name: &str) -> TypeTag {
@@ -789,25 +789,31 @@ mod tests {
         // Append two good commands + bind a label.
         h.write(
             &vpath(&format!("{id}/cmd")),
-            b"/bloom/dex/pool/producer as p",
+            b"/bloom/petals/dex/pool/producer as p",
         )
         .await
         .unwrap();
-        h.write(&vpath(&format!("{id}/cmd")), b"/bloom/dex/pool/consumer @p")
-            .await
-            .unwrap();
+        h.write(
+            &vpath(&format!("{id}/cmd")),
+            b"/bloom/petals/dex/pool/consumer @p",
+        )
+        .await
+        .unwrap();
 
         // `cat cmd` lists the appended lines.
         let listing =
             String::from_utf8(h.read(&vpath(&format!("{id}/cmd"))).await.unwrap()).unwrap();
-        assert!(listing.contains("/bloom/dex/pool/producer as p"));
-        assert!(listing.contains("/bloom/dex/pool/consumer @p"));
+        assert!(listing.contains("/bloom/petals/dex/pool/producer as p"));
+        assert!(listing.contains("/bloom/petals/dex/pool/consumer @p"));
 
         // `cat status` is JSON with both commands resolved.
         let status = h.read(&vpath(&format!("{id}/status"))).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&status).unwrap();
         assert_eq!(v["commands"].as_array().unwrap().len(), 2);
-        assert_eq!(v["commands"][0]["endpoint"], "/bloom/dex/pool/producer");
+        assert_eq!(
+            v["commands"][0]["endpoint"],
+            "/bloom/petals/dex/pool/producer"
+        );
         assert_eq!(v["commands"][0]["returns"][0], "u64");
 
         // Set signer + gas payer (the §3.4 header injection seam), then commit.
@@ -849,9 +855,12 @@ mod tests {
             submitter.clone(),
         );
         let id = new_session(&h).await;
-        h.write(&vpath(&format!("{id}/cmd")), b"/bloom/dex/pool/producer")
-            .await
-            .unwrap();
+        h.write(
+            &vpath(&format!("{id}/cmd")),
+            b"/bloom/petals/dex/pool/producer",
+        )
+        .await
+        .unwrap();
         h.write(
             &vpath(&format!("{id}/signer")),
             format!("0x{}", hex::encode(signer)).as_bytes(),
@@ -881,9 +890,12 @@ mod tests {
             submitter,
         );
         let id = new_session(&h).await;
-        h.write(&vpath(&format!("{id}/cmd")), b"/bloom/dex/pool/producer")
-            .await
-            .unwrap();
+        h.write(
+            &vpath(&format!("{id}/cmd")),
+            b"/bloom/petals/dex/pool/producer",
+        )
+        .await
+        .unwrap();
         h.write(
             &vpath(&format!("{id}/signer")),
             format!("0x{}", hex::encode(signer)).as_bytes(),
@@ -895,7 +907,7 @@ mod tests {
         assert!(matches!(err, HandlerError::Backend(_)), "got {err:?}");
         let listing =
             String::from_utf8(h.read(&vpath(&format!("{id}/cmd"))).await.unwrap()).unwrap();
-        assert!(listing.contains("/bloom/dex/pool/producer"));
+        assert!(listing.contains("/bloom/petals/dex/pool/producer"));
     }
 
     #[tokio::test]
@@ -913,14 +925,17 @@ mod tests {
         );
         let id = new_session(&h).await;
         // One good command.
-        h.write(&vpath(&format!("{id}/cmd")), b"/bloom/dex/pool/producer")
-            .await
-            .unwrap();
+        h.write(
+            &vpath(&format!("{id}/cmd")),
+            b"/bloom/petals/dex/pool/producer",
+        )
+        .await
+        .unwrap();
         // A bad one: dangling forward use-ref. Must be rejected.
         let err = h
             .write(
                 &vpath(&format!("{id}/cmd")),
-                b"/bloom/dex/pool/consumer @9.0",
+                b"/bloom/petals/dex/pool/consumer @9.0",
             )
             .await
             .unwrap_err();
@@ -934,7 +949,7 @@ mod tests {
         // The prior good command survives both bad writes.
         let listing =
             String::from_utf8(h.read(&vpath(&format!("{id}/cmd"))).await.unwrap()).unwrap();
-        assert_eq!(listing.trim(), "/bloom/dex/pool/producer");
+        assert_eq!(listing.trim(), "/bloom/petals/dex/pool/producer");
         // status reflects exactly one command.
         let v: serde_json::Value =
             serde_json::from_slice(&h.read(&vpath(&format!("{id}/status"))).await.unwrap())
@@ -951,7 +966,7 @@ mod tests {
         let id = new_session(&h).await;
         h.write(
             &vpath(&format!("{id}/cmd")),
-            b"/bloom/dex/pool/swap signer:0",
+            b"/bloom/petals/dex/pool/swap signer:0",
         )
         .await
         .unwrap();
@@ -973,7 +988,7 @@ mod tests {
         let id = new_session(&h).await;
         h.write(
             &vpath(&format!("{id}/cmd")),
-            b"/bloom/dex/pool/swap signer:0",
+            b"/bloom/petals/dex/pool/swap signer:0",
         )
         .await
         .unwrap();

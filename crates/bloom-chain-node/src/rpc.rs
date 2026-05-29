@@ -21,6 +21,7 @@
 //! - `chain_query_object` — look up an on-chain object by 32-byte id.
 //! - `chain_query_code` — look up code bytes by 32-byte content hash.
 //! - `chain_resolve_path` — resolve a signed manifest module path to a petal hash.
+//! - `chain_list_vfs` — list VFS petal path bindings.
 //! - `chain_ls_objects` — scan objects filtered by owner address or type name.
 //! - `chain_view_call` — execute one read-only petal call against a snapshot.
 //! - `chain_ls_validators` — list the current validator set.
@@ -348,6 +349,7 @@ impl RpcServer {
             "chain_query_object" => self.handle_query_object(params),
             "chain_query_code" => self.handle_query_code(params),
             "chain_resolve_path" => self.handle_resolve_path(params),
+            "chain_list_vfs" => self.handle_list_vfs(),
             "chain_ls_objects" => self.handle_ls_objects(params),
             "chain_view_call" => self.handle_view_call(params),
             "chain_ls_validators" => self.handle_ls_validators(),
@@ -564,6 +566,19 @@ impl RpcServer {
             None => Ok(Value::Null),
             Some(hash) => Ok(json!({ "hash": hex::encode(hash.0) })),
         }
+    }
+
+    fn handle_list_vfs(&self) -> Result<Value> {
+        let state = self.state.lock();
+        Ok(json!({
+            "bindings": state
+                .iter_vfs()
+                .map(|(path, hash)| json!({
+                    "path": path,
+                    "hash": hex::encode(hash.0),
+                }))
+                .collect::<Vec<_>>()
+        }))
     }
 
     fn handle_ls_objects(&self, params: &Value) -> Result<Value> {
@@ -1416,6 +1431,24 @@ impl ChainStateIface for RpcChainAdapter {
         bytes.try_into().ok().map(Hash32)
     }
 
+    fn iter_vfs(&self) -> Vec<(String, Hash32)> {
+        let Ok(value) = self.call_blocking("chain_list_vfs", json!({})) else {
+            return Vec::new();
+        };
+        let Some(bindings) = value.get("bindings").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        bindings
+            .iter()
+            .filter_map(|binding| {
+                let path = binding.get("path")?.as_str()?.to_string();
+                let hash_hex = binding.get("hash")?.as_str()?;
+                let bytes: [u8; 32] = hex::decode(hash_hex).ok()?.try_into().ok()?;
+                Some((path, Hash32(bytes)))
+            })
+            .collect()
+    }
+
     fn current_block(&self) -> u64 {
         self.call_blocking("chain_tip", json!({}))
             .ok()
@@ -2118,10 +2151,10 @@ mod tests {
         server
             .state
             .lock()
-            .set_vfs_binding("/bloom/dex/pool".to_string(), hash);
+            .set_vfs_binding("/bloom/petals/dex/pool".to_string(), hash);
 
         let res = server
-            .handle_resolve_path(&json!({ "path": "/bloom/dex/pool" }))
+            .handle_resolve_path(&json!({ "path": "/bloom/petals/dex/pool" }))
             .unwrap();
         assert_eq!(res["hash"], hex::encode(hash.0));
     }

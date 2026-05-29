@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/test-docker-petal-dex.sh — drive the dockerized 4-validator
 # bloom-chain LIVE acceptance test for the petal-based DEX
-# (/bloom/dex/{pool,wallet,faucet}).
+# (/bloom/petals/dex/{pool,wallet,faucet}).
 #
 # Proves, on a real 4-validator network over RPC, the two PTB flows that
 # `examples/petal-dex/tests/.../faucet_provision.rs` proves in-process:
@@ -115,8 +115,8 @@ if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
     log "building docker image (bloom-eth:test) — must match current tree"
     (cd "$REPO_ROOT" && "${DC[@]}" -f "$COMPOSE_FILE" build)
 
-    log "building host-side bloom (release)"
-    (cd "$REPO_ROOT" && cargo build --release -p bloom)
+    log "building host-side bloom (release, all features for NFS mount)"
+    (cd "$REPO_ROOT" && cargo build --release -p bloom --all-features)
     [ -x "$BLOOM_BIN" ] || fail "bloom binary missing: $BLOOM_BIN"
 
     peer_hosts="val0,val1,val2,val3"

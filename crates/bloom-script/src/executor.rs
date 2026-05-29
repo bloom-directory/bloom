@@ -2730,7 +2730,7 @@ mod tests {
             gas_id,
             vec![Command::UpgradePetal(UpgradeCmd {
                 wasm_bytes: vec![0xCAu8; 16],
-                module_path: "/bloom/dex/strategy/cpmm".to_string(),
+                module_path: "/bloom/petals/dex/strategy/cpmm".to_string(),
                 publisher_cap: UseRef {
                     cmd_idx: 0,
                     ret_idx: 0,

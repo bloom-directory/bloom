@@ -2,7 +2,7 @@
 //! executor's borrow table (spec §5, §14).
 //!
 //! This crate does **not** implement Coin semantics (split, merge,
-//! value, etc.); that lives in the `/bloom/core/fungible` petal. This
+//! value, etc.); that lives in the `/bloom/petals/core/fungible` petal. This
 //! type is a wrapper so the macros and petals have a stable type to
 //! refer to in function signatures.
 

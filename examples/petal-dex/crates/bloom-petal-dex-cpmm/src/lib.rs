@@ -1,4 +1,4 @@
-//! `/bloom/dex/strategy/cpmm` — ConstantProduct swap strategy petal.
+//! `/bloom/petals/dex/strategy/cpmm` — ConstantProduct swap strategy petal.
 //!
 //! This petal's primary purpose is to define `ConstantProduct` as an
 //! on-chain *type* with a stable `petal_hash`, so other petals can
@@ -20,12 +20,12 @@ use bloom_resource_macros as bloom;
 
 pub use bloom_dex_math::{ConstantProduct, ConstantProductParams, MathError, SwapStrategy};
 
-/// Petal body for `/bloom/dex/strategy/cpmm`.
+/// Petal body for `/bloom/petals/dex/strategy/cpmm`.
 ///
 /// Every `pub fn` inside this module becomes a `__petal_<name>` wasm
 /// export. The `#[bloom::petal]` macro embeds a `PetalManifestV0`
 /// custom section (spec §8) listing the types and entry points below.
-#[bloom::petal(path = "/bloom/dex/strategy/cpmm", version = "0.1.0")]
+#[bloom::petal(path = "/bloom/petals/dex/strategy/cpmm", version = "0.1.0")]
 pub mod cpmm {
     use bloom_dex_math::SwapStrategy as _;
     #[allow(unused_imports)]

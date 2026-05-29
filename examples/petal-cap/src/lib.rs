@@ -1,4 +1,4 @@
-//! `/bloom/core/cap` — generic capability primitives (spec §5 + §18).
+//! `/bloom/petals/core/cap` — generic capability primitives (spec §5 + §18).
 //!
 //! This petal provides `Cap<T>`, a reusable, transferable, optionally
 //! revocable capability object that *any* downstream petal can mint
@@ -81,7 +81,7 @@ pub fn is_active_logic(
 /// export. The petal-level macro embeds a canonical-encoded
 /// `PetalManifestV0` (spec §8) as the `bloom_petal_manifest_v0`
 /// custom section.
-#[bloom::petal(path = "/bloom/core/cap", version = "0.1.0")]
+#[bloom::petal(path = "/bloom/petals/core/cap", version = "0.1.0")]
 pub mod cap {
     use super::*;
     use bloom_objects::{Owner, TypeTag};

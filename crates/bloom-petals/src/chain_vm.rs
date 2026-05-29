@@ -673,9 +673,9 @@ fn can_move_or_reown(row: &BorrowRow, caller_petal: Hash32) -> Result<bool, i32>
 
 const COIN_MINTER_PATHS: &[&str] = &[
     CORE_FUNGIBLE_PATH,
-    "/bloom/dex/faucet",
-    "/bloom/dex/pool",
-    "/bloom/dex/router",
+    "/bloom/petals/dex/faucet",
+    "/bloom/petals/dex/pool",
+    "/bloom/petals/dex/router",
 ];
 
 fn is_authorized_coin_minter(caller: &Caller<'_, ChainStoreData>, caller_petal: [u8; 32]) -> bool {
@@ -2774,7 +2774,7 @@ mod ptb_host_import_tests {
         let wasm = parse(&object_create_wat(&bytes));
         let computed_petal = blake3_tagged(tags::PETAL, &wasm);
         let mut state = State::new();
-        state.set_vfs_binding("/bloom/dex/faucet".to_string(), computed_petal);
+        state.set_vfs_binding("/bloom/petals/dex/faucet".to_string(), computed_petal);
 
         let arc = Arc::new(Mutex::new(PtbHostCtx::new()));
         let out = run_with_state(wasm, arc.clone(), Hash32([0; 32]), state);

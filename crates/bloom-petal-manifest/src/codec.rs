@@ -554,7 +554,7 @@ mod tests {
     fn sample() -> PetalManifestV0 {
         PetalManifestV0 {
             schema_version: SCHEMA_VERSION,
-            module_path: "/bloom/dex/pool".to_string(),
+            module_path: "/bloom/petals/dex/pool".to_string(),
             framework_version: SemVer::new(0, 1, 0),
             parent_version: None,
             object_types: vec![ObjectTypeDecl {
@@ -633,7 +633,7 @@ mod tests {
             }],
             external_type_refs: vec![ExternalTypeRef {
                 placeholder: "$external_0".to_string(),
-                declared_petal_path: "/bloom/core/fungible".to_string(),
+                declared_petal_path: "/bloom/petals/core/fungible".to_string(),
                 declared_type_name: "LOOM".to_string(),
                 declared_content_hash: Some([0x42u8; 32]),
             }],

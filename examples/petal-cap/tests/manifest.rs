@@ -1,4 +1,4 @@
-//! Manifest-shape tests for the `/bloom/core/cap` petal.
+//! Manifest-shape tests for the `/bloom/petals/core/cap` petal.
 //!
 //! These tests decode the wasm `bloom_petal_manifest_v0` custom-section
 //! blob that `#[bloom::petal]` emits into a `static [u8; N]` and assert
@@ -198,7 +198,7 @@ fn manifest_bytes_present() {
 fn manifest_module_path_is_bloom_core_cap() {
     let bytes = cap::__bloom_manifest_bytes();
     let m = decode(bytes);
-    assert_eq!(m.module_path, "/bloom/core/cap");
+    assert_eq!(m.module_path, "/bloom/petals/core/cap");
 }
 
 #[test]

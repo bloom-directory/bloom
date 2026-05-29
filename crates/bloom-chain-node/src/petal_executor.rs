@@ -146,6 +146,11 @@ fn validate_chain_petal_admission(wasm_bytes: &[u8], module_path: &str) -> Resul
             MAX_CHAIN_WASM_BYTES
         ));
     }
+    if !module_path.starts_with("/bloom/petals/") {
+        return Err(format!(
+            "module_path '{module_path}' must start with /bloom/petals/"
+        ));
+    }
     let manifest = extract_petal_manifest_v0(wasm_bytes)
         .ok_or_else(|| "missing bloom_petal_manifest_v0".to_string())?;
     if manifest.module_path != module_path {

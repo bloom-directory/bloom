@@ -1,4 +1,4 @@
-//! **Real-wasm** de-risk for the `/bloom/dex/faucet` petal — the live-chain
+//! **Real-wasm** de-risk for the `/bloom/petals/dex/faucet` petal — the live-chain
 //! `Coin<Erased>` provisioning linchpin (see
 //! `project-live-docker-dex-design`).
 //!
@@ -39,7 +39,7 @@ fn deploy_faucet(
     let wasm =
         std::fs::read(build_faucet_wasm_for_admin(hex::encode(admin.0))).expect("read faucet wasm");
     let hash = state.insert_code(&wasm);
-    state.set_vfs_binding("/bloom/dex/faucet".to_string(), hash);
+    state.set_vfs_binding("/bloom/petals/dex/faucet".to_string(), hash);
     hash
 }
 
@@ -51,7 +51,7 @@ fn mint_cmd(
 ) -> Command {
     Command::Move(MoveCmd {
         petal: PetalRef {
-            path: "/bloom/dex/faucet".to_string(),
+            path: "/bloom/petals/dex/faucet".to_string(),
             hash: Some(faucet_hash),
         },
         function: "mint".to_string(),
@@ -71,7 +71,7 @@ fn mint_cmd(
 fn ungated_mint_cmd(faucet_hash: bloom_chain_types::types::Hash32, value: u128) -> Command {
     Command::Move(MoveCmd {
         petal: PetalRef {
-            path: "/bloom/dex/faucet".to_string(),
+            path: "/bloom/petals/dex/faucet".to_string(),
             hash: Some(faucet_hash),
         },
         function: "mint".to_string(),
@@ -150,7 +150,7 @@ fn faucet_mint_then_create_pool() {
 
     let pool_wasm = std::fs::read(build_pool_wasm()).expect("read pool wasm");
     let pool_petal_hash = state.insert_code(&pool_wasm);
-    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_petal_hash);
+    state.set_vfs_binding("/bloom/petals/dex/pool".to_string(), pool_petal_hash);
 
     let params_bytes = 30u16.to_be_bytes().to_vec();
     let gas_payer = genesis_coin_id(alice, 0);
@@ -166,7 +166,7 @@ fn faucet_mint_then_create_pool() {
             // cmd 2: create_pool(@0.0, @1.0, params) -> (Pool, LpPosition)
             Command::Move(MoveCmd {
                 petal: PetalRef {
-                    path: "/bloom/dex/pool".to_string(),
+                    path: "/bloom/petals/dex/pool".to_string(),
                     hash: Some(pool_petal_hash),
                 },
                 function: "create_pool".to_string(),
@@ -252,11 +252,11 @@ fn faucet_mint_then_swap_then_receive() {
 
     let pool_wasm = std::fs::read(build_pool_wasm()).expect("read pool wasm");
     let pool_petal_hash = state.insert_code(&pool_wasm);
-    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_petal_hash);
+    state.set_vfs_binding("/bloom/petals/dex/pool".to_string(), pool_petal_hash);
 
     let wallet_wasm = std::fs::read(build_wallet_wasm()).expect("read wallet wasm");
     let wallet_petal_hash = state.insert_code(&wallet_wasm);
-    state.set_vfs_binding("/bloom/dex/wallet".to_string(), wallet_petal_hash);
+    state.set_vfs_binding("/bloom/petals/dex/wallet".to_string(), wallet_petal_hash);
 
     // Alice stands up a shared 10000/10000 pool (setup convenience).
     let pool_id = create_shared_pool(&mut state, alice, pool_petal_hash, b"main", 30);
@@ -277,7 +277,7 @@ fn faucet_mint_then_swap_then_receive() {
             // cmd 1: swap_exact_in(@0.0, pool, min_out) -> Coin<Erased>
             Command::Move(MoveCmd {
                 petal: PetalRef {
-                    path: "/bloom/dex/pool".to_string(),
+                    path: "/bloom/petals/dex/pool".to_string(),
                     hash: Some(pool_petal_hash),
                 },
                 function: "swap_exact_in".to_string(),

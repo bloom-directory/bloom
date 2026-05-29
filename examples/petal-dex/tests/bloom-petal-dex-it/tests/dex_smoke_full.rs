@@ -134,8 +134,8 @@ fn multi_token_scale_swap() {
 // Previously `#[ignore]`d pending pre-built DEX petal wasms (the
 // wasm32-unknown-unknown toolchain is not in CI). With
 // `wrap_with_real_manifest` we install **all three** real DEX petal
-// manifests (`/bloom/dex/pool`, `/bloom/dex/strategy/cpmm`,
-// `/bloom/dex/router`) into a single `State`, then drive a PTB that
+// manifests (`/bloom/petals/dex/pool`, `/bloom/petals/dex/strategy/cpmm`,
+// `/bloom/petals/dex/router`) into a single `State`, then drive a PTB that
 // invokes the nullary `cpmm.version()` entry against the chain
 // adapter's wasm custom-section path. Asserting that the executor
 // resolves the right manifest by hash (and not by VFS path collision
@@ -171,7 +171,7 @@ fn three_dex_petal_manifests_coexist_via_chain_adapter() {
 "#;
     let pool_wasm = wrap_with_real_manifest(pool_wat, real_pool_manifest_bytes());
     let pool_hash = state.insert_code(&pool_wasm);
-    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_hash);
+    state.set_vfs_binding("/bloom/petals/dex/pool".to_string(), pool_hash);
 
     let cpmm_wat = r#"
 (module
@@ -185,7 +185,7 @@ fn three_dex_petal_manifests_coexist_via_chain_adapter() {
 "#;
     let cpmm_wasm = wrap_with_real_manifest(cpmm_wat, real_cpmm_manifest_bytes());
     let cpmm_hash = state.insert_code(&cpmm_wasm);
-    state.set_vfs_binding("/bloom/dex/strategy/cpmm".to_string(), cpmm_hash);
+    state.set_vfs_binding("/bloom/petals/dex/strategy/cpmm".to_string(), cpmm_hash);
 
     let router_wat = r#"
 (module
@@ -196,7 +196,7 @@ fn three_dex_petal_manifests_coexist_via_chain_adapter() {
 "#;
     let router_wasm = wrap_with_real_manifest(router_wat, real_router_manifest_bytes());
     let router_hash = state.insert_code(&router_wasm);
-    state.set_vfs_binding("/bloom/dex/router".to_string(), router_hash);
+    state.set_vfs_binding("/bloom/petals/dex/router".to_string(), router_hash);
 
     assert_ne!(
         pool_hash, cpmm_hash,

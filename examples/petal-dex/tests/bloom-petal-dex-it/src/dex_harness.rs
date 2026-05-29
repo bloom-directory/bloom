@@ -227,31 +227,31 @@ fn leb128(out: &mut Vec<u8>, mut v: u64) {
 }
 
 /// The canonical-encoded `PetalManifestV0` bytes embedded in the real
-/// `/bloom/core/fungible` petal.
+/// `/bloom/petals/core/fungible` petal.
 pub fn real_fungible_manifest_bytes() -> &'static [u8] {
     bloom_petal_fungible::fungible::__bloom_manifest_bytes()
 }
 
 /// Canonical `PetalManifestV0` bytes embedded in the real
-/// `/bloom/dex/pool` petal.
+/// `/bloom/petals/dex/pool` petal.
 pub fn real_pool_manifest_bytes() -> &'static [u8] {
     bloom_petal_dex_pool::pool::__bloom_manifest_bytes()
 }
 
 /// Canonical `PetalManifestV0` bytes embedded in the real
-/// `/bloom/dex/wallet` petal.
+/// `/bloom/petals/dex/wallet` petal.
 pub fn real_wallet_manifest_bytes() -> &'static [u8] {
     bloom_petal_dex_wallet::wallet::__bloom_manifest_bytes()
 }
 
 /// Canonical `PetalManifestV0` bytes embedded in the real
-/// `/bloom/dex/strategy/cpmm` petal.
+/// `/bloom/petals/dex/strategy/cpmm` petal.
 pub fn real_cpmm_manifest_bytes() -> &'static [u8] {
     bloom_petal_dex_cpmm::cpmm::__bloom_manifest_bytes()
 }
 
 /// Canonical `PetalManifestV0` bytes embedded in the real
-/// `/bloom/dex/router` petal.
+/// `/bloom/petals/dex/router` petal.
 pub fn real_router_manifest_bytes() -> &'static [u8] {
     bloom_petal_dex_router::router::__bloom_manifest_bytes()
 }
@@ -389,6 +389,12 @@ pub fn build_faucet_wasm_for_admin(admin_hex: String) -> PathBuf {
 /// artifact path.
 pub fn build_router_wasm() -> PathBuf {
     build_petal_wasm("bloom-petal-dex-router", "bloom_petal_dex_router")
+}
+
+/// Build `bloom-petal-dex-cpmm` for `wasm32-unknown-unknown`; returns the
+/// artifact path.
+pub fn build_cpmm_wasm() -> PathBuf {
+    build_petal_wasm("bloom-petal-dex-cpmm", "bloom_petal_dex_cpmm")
 }
 
 // ---------------------------------------------------------------------------
@@ -609,7 +615,7 @@ pub fn create_shared_pool(
         commands: vec![
             Command::Move(MoveCmd {
                 petal: PetalRef {
-                    path: "/bloom/dex/pool".to_string(),
+                    path: "/bloom/petals/dex/pool".to_string(),
                     hash: Some(pool_petal_hash),
                 },
                 function: "create_pool".to_string(),

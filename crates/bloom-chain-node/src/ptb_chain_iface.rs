@@ -148,6 +148,13 @@ impl ChainStateIface for PtbChainAdapter<'_> {
         self.state.vfs_lookup(path)
     }
 
+    fn iter_vfs(&self) -> Vec<(String, Hash32)> {
+        self.state
+            .iter_vfs()
+            .map(|(p, h)| (p.clone(), *h))
+            .collect()
+    }
+
     fn current_block(&self) -> u64 {
         self.current_block
     }

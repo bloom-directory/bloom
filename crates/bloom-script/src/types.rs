@@ -61,7 +61,7 @@ pub struct ExpectedVersion(
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct PetalRef {
     /// Virtual-file-system path the petal is published at, e.g.
-    /// `"/bloom/dex/pool"`.
+    /// `"/bloom/petals/dex/pool"`.
     pub path: String,
     /// Content hash (`blake3` of the wasm bytes). Required in v0.
     pub hash: Option<Hash32>,
@@ -275,7 +275,7 @@ pub const COIN_TYPE_NAME: &str = "Coin";
 pub const LOOM_TYPE_NAME: &str = "LOOM";
 
 /// Canonical VFS path for the core fungible petal.
-pub const CORE_FUNGIBLE_PATH: &str = "/bloom/core/fungible";
+pub const CORE_FUNGIBLE_PATH: &str = "/bloom/petals/core/fungible";
 
 /// Sentinel fungible-petal hash used before a chain pins
 /// [`CORE_FUNGIBLE_PATH`] in VFS.

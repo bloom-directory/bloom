@@ -173,7 +173,7 @@ impl<'a> PtbSession<'a> {
 
     /// Set the fungible petal hash used to recognise the `Coin<LOOM>`
     /// gas payer. By default this is resolved from chain VFS path
-    /// `/bloom/core/fungible`.
+    /// `/bloom/petals/core/fungible`.
     pub fn set_fungible_petal_hash(&mut self, hash: bloom_chain_types::Hash32) {
         self.fungible_petal_hash = Some(hash);
     }

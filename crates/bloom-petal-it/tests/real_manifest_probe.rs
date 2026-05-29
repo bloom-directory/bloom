@@ -11,7 +11,7 @@ fn real_fungible_manifest_decodes() {
     let bytes = real_fungible_manifest_bytes();
     assert!(!bytes.is_empty(), "manifest blob must be non-empty");
     let m = decode(bytes).expect("real fungible manifest must decode");
-    assert_eq!(m.module_path, "/bloom/core/fungible");
+    assert_eq!(m.module_path, "/bloom/petals/core/fungible");
     // Spec §14.1 — every public petal fn in the fungible module must
     // appear in the manifest.
     let names: Vec<&str> = m.functions.iter().map(|f| f.name.as_str()).collect();

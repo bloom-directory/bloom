@@ -2,7 +2,7 @@
 name = "bloom-petal-cap"
 version = "0.1.0"
 edition = "2024"
-description = "Bloom-native petal at `/bloom/core/cap` — generic capability primitives (spec §5 + §18)."
+description = "Bloom-native petal at `/bloom/petals/core/cap` — generic capability primitives (spec §5 + §18)."
 license = "MIT"
 
 [lib]

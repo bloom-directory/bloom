@@ -20,7 +20,7 @@ pub const MANIFEST_CUSTOM_SECTION: &str = "bloom_petal_manifest_v0";
 pub struct PetalManifestV0 {
     /// `= SCHEMA_VERSION` for this crate's emission.
     pub schema_version: u32,
-    /// VFS path the petal lives at, e.g. `"/bloom/dex/pool"`.
+    /// VFS path the petal lives at, e.g. `"/bloom/petals/dex/pool"`.
     pub module_path: String,
     /// `bloom-resource` framework version the petal was compiled against.
     pub framework_version: SemVer,

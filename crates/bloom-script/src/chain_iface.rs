@@ -157,6 +157,11 @@ pub trait ChainStateIface {
     /// by the validator to verify a `(path, hash)` PetalRef agrees
     /// with the on-chain VFS state).
     fn resolve_path(&self, path: &str) -> Option<Hash32>;
+    /// Iterate VFS path bindings as `(path, petal_hash)`. Handlers use this
+    /// for namespace projection; callers should not assume a particular order.
+    fn iter_vfs(&self) -> Vec<(String, Hash32)> {
+        Vec::new()
+    }
     /// Current block height for the expiry check.
     fn current_block(&self) -> u64;
 }
