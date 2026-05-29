@@ -29,6 +29,8 @@ jobs:
         run: rustup show
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -41,6 +43,8 @@ jobs:
         run: rustup show
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
       - name: Run tests
         run: cargo test --workspace
 
@@ -53,12 +57,15 @@ jobs:
         run: rustup show
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
       - name: Build full-feature binary with locked dependencies
         run: cargo build --release -p bloom --all-features --locked
 
   docker-petal-vfs:
     name: docker petal VFS
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust toolchain
@@ -67,6 +74,8 @@ jobs:
           rustup target add wasm32-unknown-unknown
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
       - name: Install NFS client
         run: sudo apt-get update && sudo apt-get install -y nfs-common
       - name: Run docker petal VFS acceptance
