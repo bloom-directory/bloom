@@ -1549,20 +1549,23 @@ struct StateSnapshot {
     blob: Vec<u8>,
 }
 
-fn expected_snapshot_parent_hash(block_store: &BlockStore, height: u64) -> Result<Hash32> {
+fn expected_snapshot_parent_hash(block_store: &BlockStore, block: &Block) -> Result<Hash32> {
+    let height = block.header.height;
     if height <= 1 {
         return Ok(Hash32([0u8; 32]));
     }
     let parent_height = height - 1;
-    let parent = block_store
+    if let Some(parent) = block_store
         .get(parent_height)
         .with_context(|| format!("read snapshot parent block at height {parent_height}"))?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "snapshot parent block missing at height {parent_height}; refusing unsafe jump"
-            )
-        })?;
-    Ok(parent.header.block_hash())
+    {
+        return Ok(parent.header.block_hash());
+    }
+
+    // Snapshot catch-up is specifically for peers whose local block window may
+    // no longer contain the parent. The quorum-committed snapshot block still
+    // binds the parent hash that validators signed.
+    Ok(block.header.parent_hash)
 }
 
 async fn apply_state_snapshot<E: PetalExecutor>(
@@ -1597,7 +1600,7 @@ async fn apply_state_snapshot<E: PetalExecutor>(
         ));
     }
     let validator_set = { driver.engine.lock().validator_set.clone() };
-    let expected_parent_hash = expected_snapshot_parent_hash(&driver.block_store, height)?;
+    let expected_parent_hash = expected_snapshot_parent_hash(&driver.block_store, &block)?;
     validate_block_for_apply(
         &block,
         height,
@@ -2173,23 +2176,22 @@ mod tests {
         let parent = test_block(4, Hash32([0x44; 32]));
         let parent_hash = parent.header.block_hash();
         block_store.put(4, &parent).unwrap();
+        let snapshot = test_block(5, Hash32([0xAA; 32]));
 
-        let expected = expected_snapshot_parent_hash(&block_store, 5).unwrap();
+        let expected = expected_snapshot_parent_hash(&block_store, &snapshot).unwrap();
 
         assert_eq!(expected, parent_hash);
         assert_ne!(expected, Hash32([0x44; 32]));
     }
 
     #[test]
-    fn snapshot_parent_hash_rejects_unsafe_jump_without_local_parent() {
+    fn snapshot_parent_hash_falls_back_to_committed_header_when_parent_pruned() {
         let tmp = tempfile::tempdir().unwrap();
         let block_store = BlockStore::open(&tmp.path().join("blocks")).unwrap();
+        let snapshot = test_block(5, Hash32([0xAA; 32]));
 
-        let err = expected_snapshot_parent_hash(&block_store, 5).unwrap_err();
+        let expected = expected_snapshot_parent_hash(&block_store, &snapshot).unwrap();
 
-        assert!(
-            err.to_string().contains("refusing unsafe jump"),
-            "unexpected error: {err}"
-        );
+        assert_eq!(expected, snapshot.header.parent_hash);
     }
 }
