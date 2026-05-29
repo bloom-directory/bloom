@@ -157,9 +157,8 @@ pub fn detect_mount_command() -> &'static str {
 /// the platform mount command, targeting the embedded NFSv4.1 server at
 /// `server`.
 ///
-/// The shared options are `vers=4.1,proto=tcp,nolocks` (the embedded
-/// server doesn't speak NLM), explicit `mountport`/`port` so we can
-/// target the auto-assigned ephemeral port, generous `rsize`/`wsize`
+/// The shared options are `vers=4.1,proto=tcp`, explicit `port` so we
+/// can target the auto-assigned ephemeral port, generous `rsize`/`wsize`
 /// so most JSON/TOML payloads fit in a single op (the adapter buffers
 /// multi-block writes anyway but a single op stays simpler for the
 /// common case), and `timeo=10` for snappy failure on a wedged server.
@@ -167,9 +166,9 @@ pub fn detect_mount_command() -> &'static str {
 /// Caching options diverge per-platform because the kernels expose
 /// different knobs:
 ///
-/// * **Linux** (`mount.nfs4`): `noac,lookupcache=none` disables kernel
-///   attribute and lookup caching that would otherwise mask reactive
-///   VFS updates. `noac` implies `actimeo=0` plus sync writes.
+/// * **Linux** (`mount.nfs4`): `actimeo=0` disables attribute caching
+///   without relying on `lookupcache=none`, which is rejected by some
+///   minimal CI images.
 /// * **macOS** (`mount_nfs`): `actimeo=0` zeros the attribute-cache
 ///   timeouts. The Linux-only `lookupcache=none`, `nocallback`, and
 ///   `nonegnamecache` knobs are *not* recognised by macOS and would
@@ -196,9 +195,7 @@ pub fn build_mount_args(cfg: &MountConfig, server: SocketAddr) -> Vec<String> {
 
 #[cfg(target_os = "linux")]
 fn build_mount_opts(port: u16) -> String {
-    format!(
-        "noac,lookupcache=none,vers=4.1,proto=tcp,nolocks,mountport={port},port={port},rsize=65536,wsize=65536,timeo=10"
-    )
+    format!("actimeo=0,vers=4.1,proto=tcp,port={port},rsize=65536,wsize=65536,timeo=10")
 }
 
 #[cfg(target_os = "macos")]
@@ -246,8 +243,8 @@ mod tests {
         );
         if cfg!(target_os = "linux") {
             assert!(
-                joined.contains("mountport=54321"),
-                "missing mountport=54321 in {joined}"
+                !joined.contains("mountport="),
+                "linux nfs4 mount must not include mountport=: {joined}"
             );
         } else if cfg!(target_os = "macos") {
             assert!(
@@ -260,7 +257,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn build_mount_args_linux_uses_noac_and_lookupcache_none() {
+    fn build_mount_args_linux_uses_portable_cache_options() {
         let cfg = MountConfig {
             mount_path: PathBuf::from("/tmp/bloom"),
             nfs_listen: "127.0.0.1:0".parse().unwrap(),
@@ -270,16 +267,20 @@ mod tests {
         let args = build_mount_args(&cfg, server);
         let joined = args.join(" ");
         assert!(
-            joined.contains("noac"),
-            "linux opts must include noac: {joined}"
+            joined.contains("actimeo=0"),
+            "linux opts must include actimeo=0: {joined}"
         );
         assert!(
-            joined.contains("lookupcache=none"),
-            "linux opts must include lookupcache=none: {joined}"
+            !joined.contains("lookupcache="),
+            "linux opts must avoid lookupcache= because some mount.nfs4 builds reject it: {joined}"
         );
         assert!(
-            !joined.contains("actimeo="),
-            "linux opts should rely on noac, not actimeo: {joined}"
+            !joined.contains("nolocks"),
+            "linux opts must avoid nolocks on nfs4: {joined}"
+        );
+        assert!(
+            !joined.contains("mountport="),
+            "linux opts must avoid nfs2/nfs3 mountport= on nfs4: {joined}"
         );
     }
 

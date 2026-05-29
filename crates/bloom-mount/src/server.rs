@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 use bloom_vfs::Vfs;
 
 use crate::adapter::BloomFs;
-use crate::{MountConfig, MountError, MountHandle, build_mount_args};
+use crate::{MountConfig, MountError, MountHandle, build_mount_args, build_mount_opts};
 
 const MOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const UMOUNT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -73,9 +73,7 @@ fn run_command_with_timeout(
 
 fn linux_mount_fallback_args(cfg: &MountConfig, server: SocketAddr) -> Vec<String> {
     let port = server.port();
-    let mut opts = format!(
-        "vers=4.1,proto=tcp,port={port},noac,lookupcache=none,rsize=65536,wsize=65536,timeo=10"
-    );
+    let mut opts = build_mount_opts(port);
     if cfg.readonly {
         opts.push_str(",ro");
     }

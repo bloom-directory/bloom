@@ -867,9 +867,9 @@ impl RpcServer {
             }
         };
 
-        let state = if at_block.is_none() && height == block_head {
-            self.state.lock().clone()
-        } else if height == 0 && chain_head == 0 && self.state_index.get(0)?.is_none() {
+        let use_live_state = (at_block.is_none() && height == block_head)
+            || (height == 0 && chain_head == 0 && self.state_index.get(0)?.is_none());
+        let state = if use_live_state {
             self.state.lock().clone()
         } else {
             self.load_indexed_state(height, chain_head)?
