@@ -2958,7 +2958,7 @@ async fn exercise_live_petal_vfs_mount(
             String::from_utf8_lossy(&pipe_success.stderr)
         );
     }
-    assert_pipe_ndjson_commands("mounted pipe success", &pipe_success.stdout, 2)?;
+    assert_pipe_ndjson("mounted pipe success", &pipe_success.stdout, 2, true)?;
     let latest = current_height(&clients[0]).await?;
     wait_all_reach_height(clients, latest).await?;
 
@@ -3007,7 +3007,7 @@ async fn exercise_live_petal_vfs_mount(
             String::from_utf8_lossy(&pipe_revert.stderr)
         );
     }
-    assert_pipe_ndjson_commands("mounted pipe revert", &pipe_revert.stdout, 2)?;
+    assert_pipe_ndjson("mounted pipe revert", &pipe_revert.stdout, 2, false)?;
     let pipe_revert_stderr = String::from_utf8_lossy(&pipe_revert.stderr);
     if !pipe_revert_stderr.contains("petal call reverted")
         || !pipe_revert_stderr.contains("petal abort in command 1")
@@ -3199,22 +3199,34 @@ fn run_mounted_petal_endpoint_raw_stdin(
         .context("wait for mounted petal endpoint")
 }
 
-fn assert_pipe_ndjson_commands(label: &str, stdout: &[u8], expected_commands: u64) -> Result<()> {
+fn assert_pipe_ndjson(
+    label: &str,
+    stdout: &[u8],
+    expected_commands: u64,
+    expected_success: bool,
+) -> Result<()> {
     let text = std::str::from_utf8(stdout).with_context(|| format!("{label} stdout utf8"))?;
-    let mut lines = text.lines();
-    let header_line = lines
-        .next()
-        .ok_or_else(|| anyhow!("{label} missing PTB header line"))?;
-    let header: Value = serde_json::from_str(header_line)
-        .with_context(|| format!("{label} parse PTB header line: {header_line}"))?;
-    if header.get("kind").and_then(Value::as_str) != Some("ptb")
-        || header.get("commands").and_then(Value::as_u64) != Some(expected_commands)
-    {
-        bail!("{label} unexpected PTB header: {header}");
-    }
-    let command_lines = lines
+    let lines = text
+        .lines()
         .map(|line| serde_json::from_str::<Value>(line).map_err(anyhow::Error::from))
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<_>>>()
+        .with_context(|| format!("{label} parse NDJSON stdout: {text}"))?;
+    let expected_lines = expected_commands as usize + 3;
+    if lines.len() != expected_lines {
+        bail!(
+            "{label} expected {expected_lines} NDJSON lines, got {}: {lines:?}",
+            lines.len()
+        );
+    }
+    let header_line = lines
+        .first()
+        .ok_or_else(|| anyhow!("{label} missing PTB header line"))?;
+    if header_line.get("kind").and_then(Value::as_str) != Some("ptb")
+        || header_line.get("commands").and_then(Value::as_u64) != Some(expected_commands)
+    {
+        bail!("{label} unexpected PTB header: {header_line}");
+    }
+    let command_lines = &lines[1..=expected_commands as usize];
     if command_lines.len() != expected_commands as usize
         || command_lines
             .iter()
@@ -3222,7 +3234,47 @@ fn assert_pipe_ndjson_commands(label: &str, stdout: &[u8], expected_commands: u6
     {
         bail!("{label} unexpected command lines: {command_lines:?}");
     }
+    let submit = &lines[expected_commands as usize + 1];
+    if submit.get("kind").and_then(Value::as_str) != Some("submit") {
+        bail!("{label} missing submit line: {submit}");
+    }
+    let submit_tx_hash = submit
+        .get("tx_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("{label} submit line missing tx_hash: {submit}"))?;
+    if !submit_tx_hash.starts_with("0x") {
+        bail!("{label} submit tx_hash must be 0x-prefixed: {submit_tx_hash}");
+    }
+    let receipt_line = &lines[expected_commands as usize + 2];
+    if receipt_line.get("kind").and_then(Value::as_str) != Some("receipt")
+        || receipt_line.get("tx_hash").and_then(Value::as_str) != Some(submit_tx_hash)
+    {
+        bail!("{label} unexpected receipt line: {receipt_line}");
+    }
+    let receipt = receipt_line
+        .get("receipt")
+        .ok_or_else(|| anyhow!("{label} receipt line missing receipt object: {receipt_line}"))?;
+    if receipt.get("success").and_then(Value::as_bool) != Some(expected_success) {
+        bail!("{label} unexpected receipt success: {receipt}");
+    }
     Ok(())
+}
+
+#[test]
+fn pipe_ndjson_assertion_accepts_submitted_receipts() {
+    let out = concat!(
+        r#"{"kind":"ptb","commands":2}"#,
+        "\n",
+        r#"{"kind":"command","cmd_idx":0}"#,
+        "\n",
+        r#"{"kind":"command","cmd_idx":1}"#,
+        "\n",
+        r#"{"kind":"submit","tx_hash":"0xabc"}"#,
+        "\n",
+        r#"{"kind":"receipt","tx_hash":"0xabc","receipt":{"success":true}}"#,
+        "\n",
+    );
+    assert_pipe_ndjson("test pipe", out.as_bytes(), 2, true).unwrap();
 }
 
 fn parse_json_command_output(label: &str, out: std::process::Output) -> Result<Value> {
