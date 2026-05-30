@@ -149,11 +149,7 @@ pub(crate) fn validate_chain_petal_admission(
             MAX_CHAIN_WASM_BYTES
         ));
     }
-    if !module_path.starts_with("/bloom/petals/") {
-        return Err(format!(
-            "module_path '{module_path}' must start with /bloom/petals/"
-        ));
-    }
+    validate_chain_petal_module_path(module_path)?;
     let manifest = extract_petal_manifest_v0(wasm_bytes)
         .ok_or_else(|| "missing bloom_petal_manifest_v0".to_string())?;
     if manifest.module_path != module_path {
@@ -164,6 +160,27 @@ pub(crate) fn validate_chain_petal_admission(
     }
     validate_manifest_wasm_abi(wasm_bytes, &manifest)?;
     PetalVm::validate_for_chain(wasm_bytes).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn validate_chain_petal_module_path(module_path: &str) -> Result<(), String> {
+    let Some(suffix) = module_path.strip_prefix("/bloom/petals/") else {
+        return Err(format!(
+            "module_path '{module_path}' must start with /bloom/petals/"
+        ));
+    };
+    if suffix.is_empty() {
+        return Err(format!(
+            "module_path '{module_path}' must include a petal path after /bloom/petals/"
+        ));
+    }
+    for segment in suffix.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(format!(
+                "module_path '{module_path}' contains non-canonical path segment"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1281,5 +1298,24 @@ mod tests {
         let expected = DEPLOY_PETAL_BASE_FUEL.saturating_add(per_byte);
 
         assert_eq!(deploy_petal_fuel_for_bytes(usize::MAX), expected);
+    }
+
+    #[test]
+    fn chain_petal_module_path_rejects_non_canonical_segments() {
+        validate_chain_petal_module_path("/bloom/petals/dex/pool").unwrap();
+
+        for path in [
+            "/bloom/dex/pool",
+            "/bloom/petals/",
+            "/bloom/petals/dex/pool/",
+            "/bloom/petals/dex//pool",
+            "/bloom/petals/dex/./pool",
+            "/bloom/petals/dex/../pool",
+        ] {
+            assert!(
+                validate_chain_petal_module_path(path).is_err(),
+                "{path} should be rejected"
+            );
+        }
     }
 }

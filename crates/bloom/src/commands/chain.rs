@@ -586,6 +586,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
                 poll_tx_receipt(&client, &tx_hash, std::time::Duration::from_secs(30)).await?;
             let value = chain_call_submission_output(false, &tx_hash, Some(&receipt))?;
             println!("{}", serde_json::to_string_pretty(&value)?);
+            ensure_success_receipt(&value)?;
             Ok(())
         }
 
@@ -1159,7 +1160,6 @@ fn chain_call_submission_output(
         return Ok(tx_hash_json(tx_hash));
     }
     let receipt = receipt.context("missing call receipt after submit")?;
-    ensure_success_receipt(receipt)?;
     Ok(receipt.clone())
 }
 
@@ -2208,17 +2208,25 @@ allocations = []
     }
 
     #[test]
-    fn call_submission_output_wait_requires_successful_receipt() {
+    fn call_submission_output_wait_returns_success_or_revert_receipt() {
         let hash = bloom_chain_types::types::Hash32([0xAB; 32]);
         let ok = serde_json::json!({ "success": true, "height": 9 });
         assert_eq!(
             chain_call_submission_output(false, &hash, Some(&ok)).unwrap(),
             ok
         );
-        let err = chain_call_submission_output(
-            false,
-            &hash,
-            Some(&serde_json::json!({ "success": false, "return_text": "nope" })),
+        let revert = serde_json::json!({ "success": false, "return_text": "nope" });
+        assert_eq!(
+            chain_call_submission_output(false, &hash, Some(&revert)).unwrap(),
+            revert
+        );
+        let err = ensure_success_receipt(
+            &chain_call_submission_output(
+                false,
+                &hash,
+                Some(&serde_json::json!({ "success": false, "return_text": "nope" })),
+            )
+            .unwrap(),
         )
         .unwrap_err();
         assert_eq!(format!("{err}"), "petal call reverted: nope");
