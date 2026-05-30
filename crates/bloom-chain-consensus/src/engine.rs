@@ -209,6 +209,15 @@ impl<V: SigVerifier> ConsensusEngine<V> {
         self.blocks.get(hash).cloned()
     }
 
+    /// Count registered in-flight blocks at a height, including uncommitted
+    /// proposal bodies that are not yet in persistent block storage.
+    pub fn registered_block_count_at_height(&self, height: u64) -> usize {
+        self.blocks
+            .values()
+            .filter(|block| block.header.height == height)
+            .count()
+    }
+
     /// Reset the engine to begin consensus at `new_height`.  Prunes only the
     /// blocks for heights strictly below `new_height` from the known-blocks
     /// map and delegates per-height state reset to `ConsensusState`.

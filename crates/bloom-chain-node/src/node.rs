@@ -491,7 +491,15 @@ impl Node {
             while let Some((peer_addr, frame)) = inbound_rx.recv().await {
                 match frame {
                     Frame::Proposal(p) => {
-                        debug!(peer = %peer_addr, height = p.height, round = p.round, "frame.proposal recv");
+                        debug!(
+                            peer = %peer_addr,
+                            height = p.height,
+                            round = p.round,
+                            block_hash = %p.block_hash,
+                            pol_round = p.pol_round,
+                            proposer = %p.proposer,
+                            "frame.proposal recv"
+                        );
                         // Authentication boundary (review 2026-05-19 #1):
                         // every Proposal must be xDSA-verified against the
                         // proposer's pubkey in the validator set BEFORE it
@@ -568,6 +576,13 @@ impl Node {
                                     continue;
                                 }
                             } else {
+                                warn!(
+                                    peer = %peer_addr,
+                                    height = p.height,
+                                    round = p.round,
+                                    block_hash = %p.block_hash,
+                                    "frame.proposal missing local block body; requesting block"
+                                );
                                 let _ = peer_pool_ev
                                     .send_to(&peer_addr, &Frame::BlockRequest { height: p.height })
                                     .await;
@@ -583,7 +598,15 @@ impl Node {
                         .await;
                     }
                     Frame::Vote(v) => {
-                        debug!(peer = %peer_addr, height = v.height, round = v.round, kind = ?v.kind, "frame.vote recv");
+                        debug!(
+                            peer = %peer_addr,
+                            height = v.height,
+                            round = v.round,
+                            kind = ?v.kind,
+                            block_hash = ?v.block_hash,
+                            validator = %v.validator,
+                            "frame.vote recv"
+                        );
                         // Authentication boundary (review 2026-05-19 #1):
                         // every Vote (prevote and precommit) must be
                         // xDSA-verified against the voter's pubkey in the
@@ -653,13 +676,41 @@ impl Node {
                     }
                     Frame::BlockRequest { height } => {
                         if let Ok(Some(block)) = driver_ev.block_store.get(height) {
+                            debug!(
+                                peer = %peer_addr,
+                                height,
+                                block_hash = %block.header.block_hash(),
+                                "block_request served: committed block"
+                            );
                             let _ = peer_pool_ev
                                 .send_to(&peer_addr, &Frame::BlockResponse(block))
                                 .await;
                         } else if let Ok(Some(snapshot)) =
                             build_state_snapshot_response(driver_ev.as_ref(), height)
                         {
+                            debug!(
+                                peer = %peer_addr,
+                                height,
+                                "block_request served: state snapshot"
+                            );
                             let _ = peer_pool_ev.send_to(&peer_addr, &snapshot).await;
+                        } else {
+                            let (current_height, current_round, registered_at_height) = {
+                                let eng = driver_ev.engine.lock();
+                                (
+                                    eng.height(),
+                                    eng.round(),
+                                    eng.registered_block_count_at_height(height),
+                                )
+                            };
+                            warn!(
+                                peer = %peer_addr,
+                                requested_height = height,
+                                current_height,
+                                current_round,
+                                registered_at_height,
+                                "block_request missed: no committed block or snapshot"
+                            );
                         }
                     }
                     Frame::BlockResponse(block) => {
@@ -668,6 +719,15 @@ impl Node {
                         // before us seeing precommits).
                         let block_height = block.header.height;
                         let block_hash = block.header.block_hash();
+                        let has_commit = !block.commit.votes.is_empty();
+                        debug!(
+                            peer = %peer_addr,
+                            height = block_height,
+                            block_hash = %block_hash,
+                            has_commit,
+                            commit_votes = block.commit.votes.len(),
+                            "block_response recv"
+                        );
                         let my_height = { driver_ev.engine.lock().height() };
                         if block_height < my_height {
                             debug!(
@@ -688,7 +748,6 @@ impl Node {
                             .await;
                             continue;
                         }
-                        let has_commit = !block.commit.votes.is_empty();
                         if block_height == my_height {
                             let (round, body_kind) = {
                                 let eng = driver_ev.engine.lock();
@@ -749,6 +808,13 @@ impl Node {
                         {
                             driver_ev.engine.lock().register_block(block.clone());
                         }
+                        debug!(
+                            peer = %peer_addr,
+                            height = block_height,
+                            block_hash = %block_hash,
+                            has_commit,
+                            "block_response registered"
+                        );
                         // If we stashed a proposal earlier because its block
                         // was unknown (review 2026-05-19 #3 gate), now that
                         // the block is registered the state machine can
@@ -756,6 +822,12 @@ impl Node {
                         let resume_actions =
                             { driver_ev.engine.lock().try_resume_pending_proposal() };
                         if !resume_actions.is_empty() {
+                            debug!(
+                                height = block_height,
+                                block_hash = %block_hash,
+                                actions = resume_actions.len(),
+                                "block_response resumed pending proposal"
+                            );
                             process_actions(
                                 Arc::clone(&driver_ev),
                                 Arc::clone(&peer_pool_ev),
@@ -776,6 +848,12 @@ impl Node {
                         let commit_actions =
                             { driver_ev.engine.lock().try_commit_with_block(block_hash) };
                         if !commit_actions.is_empty() {
+                            debug!(
+                                height = block_height,
+                                block_hash = %block_hash,
+                                actions = commit_actions.len(),
+                                "block_response unblocked commit"
+                            );
                             process_actions(
                                 Arc::clone(&driver_ev),
                                 Arc::clone(&peer_pool_ev),
@@ -1046,7 +1124,13 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                 Action::Broadcast(pov) => {
                     match pov {
                         bloom_chain_consensus::state_machine::ProposalOrVote::Proposal(p) => {
-                            debug!(height = p.height, round = p.round, "proposing");
+                            debug!(
+                                height = p.height,
+                                round = p.round,
+                                block_hash = %p.block_hash,
+                                pol_round = p.pol_round,
+                                "proposing"
+                            );
                             // First, broadcast the FULL BLOCK so peers can
                             // register it before they receive the Proposal
                             // (otherwise their commit step can't resolve the
@@ -1076,6 +1160,14 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                             .await;
                         }
                         bloom_chain_consensus::state_machine::ProposalOrVote::Vote(v) => {
+                            debug!(
+                                height = v.height,
+                                round = v.round,
+                                kind = ?v.kind,
+                                block_hash = ?v.block_hash,
+                                validator = %v.validator,
+                                "consensus.vote broadcast"
+                            );
                             // Deliver vote to self too.
                             let self_actions =
                                 { driver.engine.lock().step(Event::ReceiveVote(v.clone())) };
@@ -1095,6 +1187,13 @@ fn process_actions<E: crate::consensus_driver::PetalExecutor>(
                 }
                 Action::Commit(block, commit) => {
                     let height = block.header.height;
+                    debug!(
+                        height,
+                        round = commit.round,
+                        block_hash = %commit.block_hash,
+                        votes = commit.votes.len(),
+                        "block.committing"
+                    );
                     // Fold the freshly-built Commit (the 2f+1 precommits
                     // that finalised this block) into the block itself
                     // before applying. The state machine builds the

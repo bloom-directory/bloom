@@ -23,6 +23,7 @@ use bloom_chain_types::{
     types::Hash32,
     vote::{Commit, Proposal, Vote, VoteKind},
 };
+use tracing::{debug, warn};
 
 use crate::{round_validation::judge_proposer_round, validator_set::ValidatorSet};
 
@@ -157,6 +158,16 @@ impl VoteTally {
     /// Total power recorded so far across all hashes.
     pub fn total_power(&self) -> u64 {
         self.per_hash.values().sum()
+    }
+
+    /// Accumulated power for nil votes.
+    pub fn nil_power(&self) -> u64 {
+        self.power_for(None)
+    }
+
+    /// Number of distinct concrete block hashes observed in this tally.
+    pub fn distinct_block_hashes(&self) -> usize {
+        self.per_hash.keys().filter(|hash| hash.is_some()).count()
     }
 
     /// Validators that emitted conflicting votes for this height/round/kind.
@@ -385,6 +396,12 @@ impl ConsensusState {
                 if self.step != Step::Propose {
                     return vec![];
                 }
+                warn!(
+                    height = self.height,
+                    round = self.round,
+                    pending_block_hash = ?self.pending_proposal.as_ref().map(|p| p.block_hash),
+                    "consensus.timeout_propose: nil prevote"
+                );
                 self.step = Step::Prevote;
                 let actions = vec![
                     Action::Broadcast(ProposalOrVote::Vote(self.make_prevote(None))),
@@ -397,6 +414,19 @@ impl ConsensusState {
                 if self.step != Step::Prevote {
                     return vec![];
                 }
+                let quorum = self.validator_set.quorum();
+                let tally = self.prevotes.get(&self.round);
+                warn!(
+                    height = self.height,
+                    round = self.round,
+                    total_power = tally.map(VoteTally::total_power).unwrap_or(0),
+                    nil_power = tally.map(VoteTally::nil_power).unwrap_or(0),
+                    distinct_block_hashes =
+                        tally.map(VoteTally::distinct_block_hashes).unwrap_or(0),
+                    quorum = quorum,
+                    quorum_hash = ?tally.and_then(|t| t.quorum_hash(quorum)),
+                    "consensus.timeout_prevote: nil precommit"
+                );
                 self.step = Step::Precommit;
                 let actions = vec![
                     Action::Broadcast(ProposalOrVote::Vote(self.make_precommit(None))),
@@ -409,6 +439,19 @@ impl ConsensusState {
                 if self.step != Step::Precommit {
                     return vec![];
                 }
+                let quorum = self.validator_set.quorum();
+                let tally = self.precommits.get(&self.round);
+                warn!(
+                    height = self.height,
+                    round = self.round,
+                    total_power = tally.map(VoteTally::total_power).unwrap_or(0),
+                    nil_power = tally.map(VoteTally::nil_power).unwrap_or(0),
+                    distinct_block_hashes =
+                        tally.map(VoteTally::distinct_block_hashes).unwrap_or(0),
+                    quorum = quorum,
+                    quorum_hash = ?tally.and_then(|t| t.quorum_hash(quorum)),
+                    "consensus.timeout_precommit: advance round"
+                );
                 self.advance_round(blocks)
             }
         }
@@ -420,9 +463,23 @@ impl ConsensusState {
 
     fn on_proposal(&mut self, p: Proposal, blocks: &BTreeMap<Hash32, Block>) -> Vec<Action> {
         if p.height != self.height || p.round != self.round {
+            debug!(
+                proposal_height = p.height,
+                proposal_round = p.round,
+                height = self.height,
+                round = self.round,
+                "consensus.proposal_ignored: wrong slot"
+            );
             return vec![];
         }
         if self.step != Step::Propose {
+            debug!(
+                height = self.height,
+                round = self.round,
+                step = ?self.step,
+                block_hash = %p.block_hash,
+                "consensus.proposal_ignored: wrong step"
+            );
             return vec![];
         }
         let Ok(judgment) = judge_proposer_round(
@@ -433,9 +490,27 @@ impl ConsensusState {
             &self.validator_set,
             false,
         ) else {
+            warn!(
+                height = self.height,
+                round = self.round,
+                proposer = %p.proposer,
+                pol_round = p.pol_round,
+                block_hash = %p.block_hash,
+                "consensus.proposal_rejected: invalid proposer round"
+            );
             return vec![];
         };
         if !judgment.proposer_ok {
+            let expected = self.validator_set.proposer_for(self.height, self.round);
+            warn!(
+                height = self.height,
+                round = self.round,
+                proposer = %p.proposer,
+                expected = %expected.address,
+                pol_round = p.pol_round,
+                block_hash = %p.block_hash,
+                "consensus.proposal_rejected: unexpected proposer"
+            );
             return vec![];
         }
         // Refuse to prevote a block we have not yet seen. Stash the proposal
@@ -445,6 +520,14 @@ impl ConsensusState {
         // makes us attest to a body we have not validated — exactly the
         // surface the 2026-05-19 review flagged at state_machine.rs:307.
         if !blocks.contains_key(&p.block_hash) {
+            warn!(
+                height = self.height,
+                round = self.round,
+                proposer = %p.proposer,
+                pol_round = p.pol_round,
+                block_hash = %p.block_hash,
+                "consensus.proposal_stashed: missing block body"
+            );
             self.pending_proposal = Some(p);
             return vec![];
         }
@@ -459,6 +542,16 @@ impl ConsensusState {
         // - If locked on the proposed block: prevote it.
         // - If not locked: prevote the proposal (we trust the proposer has a valid block).
         let prevote_hash = self.choose_prevote_hash(p.block_hash, p.pol_round);
+        debug!(
+            height = self.height,
+            round = self.round,
+            proposer = %p.proposer,
+            block_hash = %p.block_hash,
+            prevote_hash = ?prevote_hash,
+            locked_block = ?self.locked_block,
+            valid_block = ?self.valid_block,
+            "consensus.proposal_accepted"
+        );
         let prevote = self.make_prevote(prevote_hash);
 
         vec![
@@ -518,10 +611,25 @@ impl ConsensusState {
 
         match v.kind {
             VoteKind::Prevote => {
-                self.prevotes
-                    .entry(v.round)
-                    .or_default()
-                    .record(v.validator, power, v.block_hash);
+                let voted_power = self.prevotes.entry(v.round).or_default().record(
+                    v.validator,
+                    power,
+                    v.block_hash,
+                );
+                let tally = self.prevotes.get(&v.round).expect("prevote tally exists");
+                debug!(
+                    height = v.height,
+                    round = v.round,
+                    validator = %v.validator,
+                    block_hash = ?v.block_hash,
+                    voted_power,
+                    total_power = tally.total_power(),
+                    nil_power = tally.nil_power(),
+                    distinct_block_hashes = tally.distinct_block_hashes(),
+                    quorum = quorum,
+                    quorum_hash = ?tally.quorum_hash(quorum),
+                    "consensus.prevote_recorded"
+                );
 
                 // Check for 2f+1 prevotes for a non-nil hash in the current round.
                 if v.round == self.round && self.step == Step::Prevote {
@@ -556,30 +664,58 @@ impl ConsensusState {
                 }
 
                 let tally = self.precommits.entry(v.round).or_default();
-                tally.record(v.validator, power, v.block_hash);
+                let voted_power = tally.record(v.validator, power, v.block_hash);
+                debug!(
+                    height = v.height,
+                    round = v.round,
+                    validator = %v.validator,
+                    block_hash = ?v.block_hash,
+                    voted_power,
+                    total_power = tally.total_power(),
+                    nil_power = tally.nil_power(),
+                    distinct_block_hashes = tally.distinct_block_hashes(),
+                    quorum = quorum,
+                    quorum_hash = ?tally.quorum_hash(quorum),
+                    "consensus.precommit_recorded"
+                );
 
                 // Check for 2f+1 precommits for a concrete hash.
                 if let Some(Some(hash)) = tally.quorum_hash(quorum)
                     && self.step != Step::Commit
-                    && let Some(block) = blocks.get(&hash)
                 {
-                    self.step = Step::Commit;
-                    let commit_votes: Vec<Vote> = self
-                        .all_precommit_votes
-                        .get(&v.round)
-                        .cloned()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|vote| vote.block_hash == Some(hash))
-                        .collect();
-                    let commit = Commit {
-                        height: self.height,
-                        round: v.round,
-                        block_hash: hash,
-                        votes: commit_votes,
-                    };
-                    self.committed_block = Some(block.clone());
-                    actions.push(Action::Commit(Box::new(block.clone()), commit));
+                    if let Some(block) = blocks.get(&hash) {
+                        debug!(
+                            height = self.height,
+                            round = v.round,
+                            block_hash = %hash,
+                            "consensus.commit_ready"
+                        );
+                        self.step = Step::Commit;
+                        let commit_votes: Vec<Vote> = self
+                            .all_precommit_votes
+                            .get(&v.round)
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|vote| vote.block_hash == Some(hash))
+                            .collect();
+                        let commit = Commit {
+                            height: self.height,
+                            round: v.round,
+                            block_hash: hash,
+                            votes: commit_votes,
+                        };
+                        self.committed_block = Some(block.clone());
+                        actions.push(Action::Commit(Box::new(block.clone()), commit));
+                    } else {
+                        warn!(
+                            height = self.height,
+                            round = v.round,
+                            block_hash = %hash,
+                            quorum = quorum,
+                            "consensus.commit_blocked: precommit quorum but missing block body"
+                        );
+                    }
                 }
             }
         }
@@ -603,6 +739,13 @@ impl ConsensusState {
         match quorum_hash {
             Some(Some(hash)) => {
                 if !blocks.contains_key(&hash) {
+                    warn!(
+                        height = self.height,
+                        round = self.round,
+                        block_hash = %hash,
+                        quorum = quorum,
+                        "consensus.precommit_blocked: prevote quorum but missing block body"
+                    );
                     return vec![];
                 }
                 // 2f+1 prevotes for a concrete block — update valid_block
@@ -619,6 +762,12 @@ impl ConsensusState {
             }
             Some(None) => {
                 // 2f+1 nil-prevotes — unlock and nil-precommit.
+                debug!(
+                    height = self.height,
+                    round = self.round,
+                    quorum = quorum,
+                    "consensus.nil_precommit: nil prevote quorum"
+                );
                 self.locked_block = None;
                 self.step = Step::Precommit;
                 let precommit = self.make_precommit(None);
