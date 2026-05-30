@@ -178,6 +178,12 @@ fn lower_one(
             .map_err(|e| BuildError::Parse(format!("bad signer index {rest:?}: {e}")))?;
         return Ok(LoweredArg::Concrete(Arg::Signer(idx)));
     }
+    // `const:<hex>`: raw canonical bytes. This is primarily for front doors
+    // that already accepted ABI JSON and must preserve exact const bytes.
+    if let Some(rest) = tok.strip_prefix("const:") {
+        let bytes = crate::literal::parse_hex_bytes(rest)?;
+        return Ok(LoweredArg::Concrete(Arg::Const(bytes)));
+    }
     // `obj:<id>[@<ver>]`.
     if let Some(rest) = tok.strip_prefix("obj:") {
         let (id_str, ver) = match rest.split_once('@') {

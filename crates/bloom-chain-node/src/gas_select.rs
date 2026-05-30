@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use bloom_objects::ObjectId;
+use bloom_objects::{Object, ObjectId, TypeTag};
 use bloom_script::{CORE_FUNGIBLE_PATH, loom_coin_type_tag};
 use serde_json::json;
 
@@ -31,21 +31,32 @@ pub async fn select_loom_gas_payer_rpc(
         )
         .await
         .context("rpc chain_ls_objects for gas payer")?;
+    select_loom_gas_payer_from_object_json(
+        objects
+            .as_array()
+            .context("chain_ls_objects returned non-array")?,
+        &coin_type,
+        min_amount,
+    )
+}
+
+pub fn select_loom_gas_payer_from_object_json(
+    objects: &[serde_json::Value],
+    coin_type: &TypeTag,
+    min_amount: u128,
+) -> Result<ObjectId> {
     let mut best: Option<(u128, ObjectId)> = None;
-    for value in objects
-        .as_array()
-        .context("chain_ls_objects returned non-array")?
-    {
+    for value in objects {
         let Some(bytes_hex) = value.get("bytes").and_then(|v| v.as_str()) else {
             continue;
         };
         let Ok(bytes) = hex::decode(bytes_hex) else {
             continue;
         };
-        let Ok(obj) = bloom_objects::Object::decode_canonical(&bytes) else {
+        let Ok(obj) = Object::decode_canonical(&bytes) else {
             continue;
         };
-        if obj.type_tag != coin_type {
+        if obj.type_tag != *coin_type {
             continue;
         }
         let Some(amount) = decode_coin_value(&obj.payload) else {
@@ -71,4 +82,49 @@ pub fn decode_coin_value(bytes: &[u8]) -> Option<u128> {
     let mut buf = [0u8; 16];
     buf.copy_from_slice(&bytes[32..48]);
     Some(u128::from_be_bytes(buf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bloom_objects::{Object, Owner};
+    use bloom_script::{DEFAULT_FUNGIBLE_PETAL_HASH, loom_coin_type_tag};
+
+    fn coin_object(id_byte: u8, amount: u128) -> Object {
+        let mut payload = vec![0u8; 32];
+        payload.extend_from_slice(&amount.to_be_bytes());
+        Object {
+            id: ObjectId([id_byte; 32]),
+            type_tag: loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
+            owner: Owner::Address([0xAA; 32]),
+            version: 0,
+            payload,
+        }
+    }
+
+    #[test]
+    fn selects_largest_covering_loom_coin() {
+        let coin_type = loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH);
+        let objects = vec![
+            serde_json::json!({ "bytes": hex::encode(coin_object(1, 50).encode_canonical().unwrap()) }),
+            serde_json::json!({ "bytes": hex::encode(coin_object(2, 500).encode_canonical().unwrap()) }),
+            serde_json::json!({ "bytes": hex::encode(coin_object(3, 300).encode_canonical().unwrap()) }),
+        ];
+        let selected = select_loom_gas_payer_from_object_json(&objects, &coin_type, 100).unwrap();
+        assert_eq!(selected, ObjectId([2; 32]));
+    }
+
+    #[test]
+    fn errors_when_no_loom_coin_covers_budget() {
+        let coin_type = loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH);
+        let objects = vec![
+            serde_json::json!({ "bytes": hex::encode(coin_object(1, 50).encode_canonical().unwrap()) }),
+        ];
+        let err = select_loom_gas_payer_from_object_json(&objects, &coin_type, 100).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no signer-owned Coin<LOOM> gas payer covers budget 100"),
+            "unexpected error: {err:#}"
+        );
+    }
 }

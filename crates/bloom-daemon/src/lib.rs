@@ -993,7 +993,7 @@ impl PtbSubmitter for RpcPtbSubmitter {
         let signer = signers
             .first()
             .ok_or_else(|| HandlerError::invalid("no signers set"))?;
-        bloom_chain_node::gas_select::select_loom_gas_payer_rpc(&self.client, *signer, 0)
+        bloom_chain_node::gas_select::select_loom_gas_payer_rpc(&self.client, *signer, 1_000_000)
             .await
             .map_err(|e| HandlerError::invalid(e.to_string()))
     }

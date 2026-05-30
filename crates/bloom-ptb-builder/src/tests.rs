@@ -243,6 +243,24 @@ fn append_const_literal_u64() {
 }
 
 #[test]
+fn append_raw_const_bytes_preserves_abi_hex() {
+    let chain = chain_with_pool(vec![func(
+        "set",
+        vec![ArgDeclStub::Const(concrete("u64"))],
+        vec![],
+    )]);
+    let mut s = PtbSession::new(&chain);
+    s.append_command("/bloom/petals/dex/pool/set const:0x00000000000003d4")
+        .unwrap();
+    match &s.commands()[0] {
+        Command::Move(m) => {
+            assert_eq!(m.args, vec![Arg::Const(980u64.to_be_bytes().to_vec())]);
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
 fn append_object_arg_with_version_and_mode() {
     let pool_obj = ObjectId([0x55; 32]);
     let chain = chain_with_pool(vec![func(

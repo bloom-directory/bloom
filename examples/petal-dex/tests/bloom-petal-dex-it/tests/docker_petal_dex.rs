@@ -2234,6 +2234,10 @@ fn view_probe_manifest() -> Vec<u8> {
                 ..Default::default()
             },
             FunctionDecl {
+                name: "fail_counter".to_string(),
+                ..Default::default()
+            },
+            FunctionDecl {
                 name: "counter_value".to_string(),
                 view: true,
                 args: vec![ArgDecl {
@@ -2267,6 +2271,7 @@ fn view_probe_wasm() -> Vec<u8> {
         r#"
 (module
   (import "chain" "petal.return" (func $ret (param i32 i32)))
+  (import "chain" "petal.revert" (func $revert (param i32 i32)))
   (import "chain" "msg.calldata.read" (func $cdread (param i32 i32 i32) (result i32)))
   (import "object" "borrow" (func $borrow (param i32 i32) (result i32)))
   (import "object" "create" (func $create (param i32 i32 i32 i32) (result i32)))
@@ -2280,6 +2285,7 @@ fn view_probe_wasm() -> Vec<u8> {
   ;; Counter payloads: initial 42, then mutated to 77.
   (data (i32.const 160) "\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
   (data (i32.const 192) "\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\4d")
+  (data (i32.const 224) "forced revert")
   ;; one object-id return slot: count=1, len=32
   (data (i32.const 512) "\00\00\00\01\00\00\00\20")
   ;; one u128 return slot: count=1, len=16
@@ -2300,6 +2306,9 @@ fn view_probe_wasm() -> Vec<u8> {
     (drop (call $cdread (i32.const 256) (i32.const 5) (i32.const 32)))
     (local.set $h (call $borrow (i32.const 256) (i32.const 1)))
     (drop (call $mutate (local.get $h) (i32.const 192) (i32.const 16)))
+    i32.const 0)
+  (func (export "__petal_fail_counter") (param i32 i32) (result i32)
+    (call $revert (i32.const 224) (i32.const 13))
     i32.const 0)
   (func (export "__petal_counter_value") (param i32 i32) (result i32)
     (local $h i32)
@@ -2615,6 +2624,7 @@ async fn exercise_live_petal_vfs_mount(
     let answer_endpoint = mount_dir.join("petals/dex/view-probe/answer");
     let counter_endpoint = mount_dir.join("petals/dex/view-probe/counter_value");
     let set_counter_endpoint = mount_dir.join("petals/dex/view-probe/set_counter");
+    let fail_counter_endpoint = mount_dir.join("petals/dex/view-probe/fail_counter");
     let wait_deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.try_wait().context("poll bloom serve --mount")? {
@@ -2628,7 +2638,11 @@ async fn exercise_live_petal_vfs_mount(
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        if answer_endpoint.exists() && counter_endpoint.exists() && set_counter_endpoint.exists() {
+        if answer_endpoint.exists()
+            && counter_endpoint.exists()
+            && set_counter_endpoint.exists()
+            && fail_counter_endpoint.exists()
+        {
             break;
         }
         if Instant::now() >= wait_deadline {
@@ -2752,7 +2766,7 @@ async fn exercise_live_petal_vfs_mount(
         &short_home,
         &rpc,
         &path_env,
-        &["--arg".to_string(), counter_arg.clone()],
+        &["--arg".to_string(), counter_arg],
         Some(serde_json::json!({
             "gas_budget": PTB_GAS_BUDGET,
             "fuel_limit": 10_000_000u64,
@@ -2768,22 +2782,26 @@ async fn exercise_live_petal_vfs_mount(
     let latest = current_height(&clients[0]).await?;
     wait_all_reach_height(clients, latest).await?;
 
-    let stale = run_mounted_petal_endpoint_raw(
-        &set_counter_endpoint,
+    let reverted = run_mounted_petal_endpoint_raw(
+        &fail_counter_endpoint,
         &short_home,
         &rpc,
         &path_env,
-        &["--arg".to_string(), counter_arg],
+        &[],
         Some(serde_json::json!({
             "gas_budget": PTB_GAS_BUDGET,
         })),
     )?;
-    if stale.status.success() {
+    if reverted.status.success() {
         bail!(
-            "mounted stale counter mutation unexpectedly succeeded: stdout={} stderr={}",
-            String::from_utf8_lossy(&stale.stdout),
-            String::from_utf8_lossy(&stale.stderr)
+            "mounted reverting counter endpoint unexpectedly succeeded: stdout={} stderr={}",
+            String::from_utf8_lossy(&reverted.stdout),
+            String::from_utf8_lossy(&reverted.stderr)
         );
+    }
+    let revert_stderr = String::from_utf8_lossy(&reverted.stderr);
+    if !revert_stderr.contains("forced revert") {
+        bail!("mounted revert stderr did not include reason: {revert_stderr}");
     }
 
     let direct_after = direct_petal_vfs_counter_value(&short_home, &counter_id)?;

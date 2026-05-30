@@ -83,7 +83,7 @@ fn encode_primitive(type_name: &str, value: &str) -> Result<Vec<u8>, BuildError>
 
 /// Parse a possibly-`0x`-prefixed hex string into raw bytes. A bare
 /// (non-hex) value with no `0x` prefix is rejected so typos surface.
-fn parse_hex_bytes(value: &str) -> Result<Vec<u8>, BuildError> {
+pub(crate) fn parse_hex_bytes(value: &str) -> Result<Vec<u8>, BuildError> {
     let s = value.strip_prefix("0x").unwrap_or(value);
     if s.is_empty() {
         return Ok(vec![]);
