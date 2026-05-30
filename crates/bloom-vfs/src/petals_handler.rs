@@ -66,15 +66,15 @@ impl PetalsEndpointHandler {
         &'a self,
         bindings: &'a [Binding],
         rel: &[String],
-    ) -> Option<(&'a Binding, String)> {
+    ) -> Option<(&'a Binding, String, bool)> {
         let (function, petal_rel) = rel.split_last()?;
         let binding = self.binding_at(bindings, petal_rel)?;
         let manifest = self.manifest_for(binding)?;
         manifest
             .functions
             .iter()
-            .any(|f| f.view && f.name == *function)
-            .then(|| (binding, function.clone()))
+            .find(|f| f.name == *function)
+            .map(|f| (binding, function.clone(), f.view))
     }
 
     fn entries_for(&self, rel: &[String]) -> Result<Vec<Entry>, HandlerError> {
@@ -104,7 +104,7 @@ impl PetalsEndpointHandler {
         if let Some(binding) = self.binding_at(&bindings, rel)
             && let Some(manifest) = self.manifest_for(binding)
         {
-            for function in manifest.functions.iter().filter(|f| f.view) {
+            for function in &manifest.functions {
                 by_name
                     .entry(function.name.clone())
                     .or_insert_with(|| Entry::executable_file(&function.name));
@@ -148,7 +148,7 @@ impl PetalsEndpointHandler {
         if let Some(binding) = self.binding_at(&bindings, rel)
             && let Some(manifest) = self.manifest_for(binding)
         {
-            for function in manifest.functions.iter().filter(|f| f.view) {
+            for function in &manifest.functions {
                 by_name
                     .entry(function.name.clone())
                     .or_insert_with(|| Entry::executable_file(&function.name));
@@ -157,9 +157,15 @@ impl PetalsEndpointHandler {
         Ok(by_name.into_values().collect())
     }
 
-    fn shim(path: &str, function: &str) -> Vec<u8> {
+    fn shim(path: &str, function: &str, view: bool) -> Vec<u8> {
+        let command = if view { "view-call" } else { "call" };
+        let comment = if view {
+            "Bloom petal view endpoint."
+        } else {
+            "Bloom petal mutating endpoint."
+        };
         format!(
-            "#!/bin/sh\n# Bloom petal view endpoint.\nexec bloom chain view-call --path {} --function {} \"$@\"\n",
+            "#!/bin/sh\n# {comment}\nexec bloom chain {command} --path {} --function {} \"$@\"\n",
             shell_quote(path),
             shell_quote(function)
         )
@@ -204,7 +210,7 @@ impl Handler for PetalsEndpointHandler {
         if Self::has_descendant(&bindings, segs) {
             return Ok(Entry::dir(segs.last().expect("non-root has leaf")));
         }
-        if let Some((_binding, function)) = self.endpoint_at(&bindings, segs) {
+        if let Some((_binding, function, _view)) = self.endpoint_at(&bindings, segs) {
             return Ok(Entry::executable_file(&function));
         }
         if self.binding_at(&bindings, segs).is_some() {
@@ -221,10 +227,10 @@ impl Handler for PetalsEndpointHandler {
         if Self::has_descendant(&bindings, path.segments()) {
             return Err(HandlerError::NotAFile(path.to_string_path()));
         }
-        let Some((binding, function)) = self.endpoint_at(&bindings, path.segments()) else {
+        let Some((binding, function, view)) = self.endpoint_at(&bindings, path.segments()) else {
             return Err(HandlerError::NotAFile(path.to_string_path()));
         };
-        Ok(Self::shim(&binding.path, &function))
+        Ok(Self::shim(&binding.path, &function, view))
     }
 
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
@@ -318,7 +324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lists_bound_path_segments_and_view_endpoints_only() {
+    async fn lists_bound_path_segments_and_all_endpoints() {
         let chain = Arc::new(MockChain::default());
         chain.bind(
             "/bloom/petals/dex/pool",
@@ -346,9 +352,11 @@ mod tests {
         assert_eq!(dex[0].name, "pool");
 
         let pool = h.list(&vpath("dex/pool")).await.unwrap();
-        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.len(), 2);
         assert_eq!(pool[0].name, "quote");
         assert_eq!(pool[0].mode, 0o555);
+        assert_eq!(pool[1].name, "swap");
+        assert_eq!(pool[1].mode, 0o555);
     }
 
     #[tokio::test]
@@ -369,6 +377,11 @@ mod tests {
         assert!(shim.contains("bloom chain view-call"));
         assert!(shim.contains("--path '/bloom/petals/dex/pool'"));
         assert!(shim.contains("--function 'quote'"));
+
+        let swap = String::from_utf8(h.read(&vpath("dex/pool/swap")).await.unwrap()).unwrap();
+        assert!(swap.contains("bloom chain call"));
+        assert!(swap.contains("--path '/bloom/petals/dex/pool'"));
+        assert!(swap.contains("--function 'swap'"));
     }
 
     #[tokio::test]

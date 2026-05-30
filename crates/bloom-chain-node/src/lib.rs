@@ -29,6 +29,7 @@ pub mod chain_petal_runner;
 pub mod coin_select;
 pub mod consensus_driver;
 pub mod error;
+pub mod gas_select;
 pub mod genesis;
 pub mod mempool_persist;
 pub mod node;

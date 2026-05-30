@@ -66,6 +66,19 @@ pub fn lower_and_build(
     signers: Vec<[u8; 32]>,
     gas_payer: ObjectId,
 ) -> Result<LoweredPlan> {
+    lower_and_build_with_gas(chain, expr, signers, gas_payer, 1_000_000, 1)
+}
+
+/// Lower a pipe expression and build the validated [`LoweredPlan`] with an
+/// explicit gas policy.
+pub fn lower_and_build_with_gas(
+    chain: &dyn ChainStateIface,
+    expr: &str,
+    signers: Vec<[u8; 32]>,
+    gas_payer: ObjectId,
+    gas_budget: u64,
+    gas_price: u128,
+) -> Result<LoweredPlan> {
     let lines = lower_pipe_expr(expr).context("lower pipe expression")?;
     let mut session = PtbSession::new(chain);
     for line in &lines {
@@ -75,6 +88,7 @@ pub fn lower_and_build(
     }
     session.set_signers(signers);
     session.set_gas_payer(gas_payer);
+    session.set_gas(gas_budget, gas_price);
     let tx = session.build_unsigned().context("build unsigned PTB")?;
     let status = session.status();
     Ok(LoweredPlan { tx, status })

@@ -2614,6 +2614,7 @@ async fn exercise_live_petal_vfs_mount(
 
     let answer_endpoint = mount_dir.join("petals/dex/view-probe/answer");
     let counter_endpoint = mount_dir.join("petals/dex/view-probe/counter_value");
+    let set_counter_endpoint = mount_dir.join("petals/dex/view-probe/set_counter");
     let wait_deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.try_wait().context("poll bloom serve --mount")? {
@@ -2627,7 +2628,7 @@ async fn exercise_live_petal_vfs_mount(
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        if answer_endpoint.exists() && counter_endpoint.exists() {
+        if answer_endpoint.exists() && counter_endpoint.exists() && set_counter_endpoint.exists() {
             break;
         }
         if Instant::now() >= wait_deadline {
@@ -2717,7 +2718,6 @@ async fn exercise_live_petal_vfs_mount(
         })
         .ok_or_else(|| anyhow!("VFS counter create did not produce a new Counter object"))?;
     let counter_id = json_str(&counter, "id")?.to_string();
-    let counter_obj_id = obj_id_from_hex(&counter)?;
     let counter_version = object_version(&counter)?;
     if json_str(&counter, "owner_kind")? != "shared" {
         bail!("VFS counter was not shared after create: {counter}");
@@ -2741,37 +2741,50 @@ async fn exercise_live_petal_vfs_mount(
         );
     }
 
-    let set_counter = PtbTx {
-        signers: vec![ptb_signer_pubkey()],
-        commands: vec![PtbCommand::Move(MoveCmd {
-            petal: PetalRef {
-                path: PETAL_VFS_PROBE_PATH.to_string(),
-                hash: Some(probe_hash),
-            },
-            function: "set_counter".to_string(),
-            type_args: vec![],
-            args: vec![Arg::Object {
-                id: counter_obj_id,
-                expected_version: ExpectedVersion(counter_version),
-                access_mode: AccessMode::Mutable,
-            }],
-        })],
-        gas_payer,
-        gas_budget: PTB_GAS_BUDGET,
-        gas_price: 1,
-        expiry_block: PTB_EXPIRY_BLOCK,
-        signatures: vec![],
-    };
-    let set_receipt = submit_ptb(home, HOST_RPC_PORTS[0], set_counter)?;
+    let counter_arg = serde_json::json!({
+        "kind": "object",
+        "id": counter_id,
+        "version": counter_version,
+    })
+    .to_string();
+    let set_receipt = run_mounted_petal_endpoint_with_args(
+        &set_counter_endpoint,
+        &short_home,
+        &rpc,
+        &path_env,
+        &["--arg".to_string(), counter_arg.clone()],
+        Some(serde_json::json!({
+            "gas_budget": PTB_GAS_BUDGET,
+            "fuel_limit": 10_000_000u64,
+        })),
+    )?;
     if !set_receipt
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        bail!("VFS counter mutation PTB reverted: {set_receipt}");
+        bail!("mounted VFS counter mutation endpoint reverted: {set_receipt}");
     }
     let latest = current_height(&clients[0]).await?;
     wait_all_reach_height(clients, latest).await?;
+
+    let stale = run_mounted_petal_endpoint_raw(
+        &set_counter_endpoint,
+        &short_home,
+        &rpc,
+        &path_env,
+        &["--arg".to_string(), counter_arg],
+        Some(serde_json::json!({
+            "gas_budget": PTB_GAS_BUDGET,
+        })),
+    )?;
+    if stale.status.success() {
+        bail!(
+            "mounted stale counter mutation unexpectedly succeeded: stdout={} stderr={}",
+            String::from_utf8_lossy(&stale.stdout),
+            String::from_utf8_lossy(&stale.stderr)
+        );
+    }
 
     let direct_after = direct_petal_vfs_counter_value(&short_home, &counter_id)?;
     let mounted_after = run_mounted_petal_endpoint(
@@ -2792,7 +2805,7 @@ async fn exercise_live_petal_vfs_mount(
     }
 
     eprintln!(
-        "[petals-vfs] mounted counter view observed state mutation: {before_value} -> {after_value}"
+        "[petals-vfs] mounted counter endpoint mutated state and stale replay failed: {before_value} -> {after_value}"
     );
     stop_child(&mut child);
     let _ = std::fs::remove_file(&short_home);
@@ -2873,12 +2886,36 @@ fn run_mounted_petal_endpoint(
     path_env: &std::ffi::OsStr,
     stdin_json: Option<Value>,
 ) -> Result<Value> {
+    run_mounted_petal_endpoint_with_args(endpoint, home, rpc, path_env, &[], stdin_json)
+}
+
+fn run_mounted_petal_endpoint_with_args(
+    endpoint: &Path,
+    home: &Path,
+    rpc: &str,
+    path_env: &std::ffi::OsStr,
+    argv: &[String],
+    stdin_json: Option<Value>,
+) -> Result<Value> {
+    let out = run_mounted_petal_endpoint_raw(endpoint, home, rpc, path_env, argv, stdin_json)?;
+    parse_json_command_output("mounted petal endpoint", out)
+}
+
+fn run_mounted_petal_endpoint_raw(
+    endpoint: &Path,
+    home: &Path,
+    rpc: &str,
+    path_env: &std::ffi::OsStr,
+    argv: &[String],
+    stdin_json: Option<Value>,
+) -> Result<std::process::Output> {
     let mut cmd = Command::new(endpoint);
     cmd.env("BLOOM_HOME", home)
         .env("BLOOM_RPC_TCP", rpc)
         .env("PATH", path_env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    cmd.args(argv);
     if stdin_json.is_some() {
         cmd.stdin(Stdio::piped());
     }
@@ -2895,7 +2932,7 @@ fn run_mounted_petal_endpoint(
     let out = child
         .wait_with_output()
         .context("wait for mounted petal endpoint")?;
-    parse_json_command_output("mounted petal endpoint", out)
+    Ok(out)
 }
 
 fn parse_json_command_output(label: &str, out: std::process::Output) -> Result<Value> {

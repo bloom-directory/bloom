@@ -110,6 +110,40 @@ pub enum ChainCmd {
         #[arg(long, value_name = "N", default_value_t = 1_000_000u64)]
         fuel_limit: u64,
     },
+    /// Execute one mutating petal call by lowering it through the PTB builder.
+    #[command(name = "call")]
+    Call {
+        /// Deployed petal path, e.g. `/bloom/apps/bloombook`.
+        #[arg(long)]
+        path: Option<String>,
+        /// Petal function name, e.g. `swap`.
+        #[arg(long)]
+        function: Option<String>,
+        /// JSON argument descriptor. Repeat for each argument.
+        #[arg(long = "arg", value_name = "JSON")]
+        args: Vec<String>,
+        /// Canonical TypeTag bytes as hex. Repeat for generic functions.
+        #[arg(long = "type-arg", value_name = "HEX")]
+        type_args: Vec<String>,
+        /// Signer address/pubkey for the inner PTB. Defaults to the local validator key.
+        #[arg(long = "signer", value_name = "ADDR")]
+        signers: Vec<String>,
+        /// Explicit gas-payer object id. If omitted, selects signer-owned Coin<LOOM>.
+        #[arg(long = "gas-payer", value_name = "OBJECT_ID")]
+        gas_payer: Option<String>,
+        /// Gas budget for the inner PTB.
+        #[arg(long = "gas-budget", value_name = "N", default_value_t = 1_000_000u64)]
+        gas_budget: u64,
+        /// Outer transaction fuel cap.
+        #[arg(long = "fuel-limit", value_name = "N", default_value_t = 10_000_000u64)]
+        fuel_limit: u64,
+        /// Lower and validate the PTB without submitting it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Submit without waiting for the committed receipt.
+        #[arg(long = "no-wait")]
+        no_wait: bool,
+    },
     /// Query chain state.
     #[command(subcommand)]
     Query(QueryCmd),
@@ -459,6 +493,187 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             Ok(())
         }
 
+        // ── mutating petal call ─────────────────────────────────────────────
+        ChainCmd::Call {
+            path,
+            function,
+            args,
+            type_args,
+            signers,
+            gas_payer,
+            gas_budget,
+            fuel_limit,
+            dry_run,
+            no_wait,
+        } => {
+            use bloom_chain_node::rpc::RpcChainAdapter;
+            use bloom_chain_types::ssz::Encode;
+            use bloom_script::PqSignature;
+
+            let parsed_args = args
+                .iter()
+                .map(|arg| {
+                    serde_json::from_str::<serde_json::Value>(arg)
+                        .with_context(|| format!("parse --arg JSON: {arg}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut stdin_params = read_call_stdin_json("call")?;
+            let mut params = json!({
+                "path": path,
+                "function": function,
+                "args": parsed_args,
+                "type_args": type_args,
+                "signers": signers,
+                "gas_payer": gas_payer,
+                "gas_budget": gas_budget,
+                "fuel_limit": fuel_limit,
+            });
+            merge_stdin_params(&mut params, &mut stdin_params);
+
+            let path = params
+                .get("path")
+                .and_then(|v| v.as_str())
+                .context("--path is required")?
+                .to_string();
+            let function = params
+                .get("function")
+                .and_then(|v| v.as_str())
+                .context("--function is required")?
+                .to_string();
+            let args = params
+                .get("args")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let type_args = params
+                .get("type_args")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|v| {
+                            v.as_str()
+                                .map(str::to_string)
+                                .context("type_args entries must be strings")
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let gas_budget = params
+                .get("gas_budget")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(gas_budget);
+            let fuel_limit = params
+                .get("fuel_limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(fuel_limit);
+
+            let (sk, pk, sender) = load_wallet_key(&chain_dir)?;
+            let signer_strings = params
+                .get("signers")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|v| {
+                            v.as_str()
+                                .map(str::to_string)
+                                .context("signers entries must be strings")
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let signers = if signer_strings.is_empty() {
+                vec![sender.0]
+            } else {
+                signer_strings
+                    .iter()
+                    .map(|s| parse_addr(s).with_context(|| format!("parse --signer {s:?}")))
+                    .map(|r| r.map(|a| a.0))
+                    .collect::<Result<Vec<_>>>()?
+            };
+
+            if signers != vec![sender.0] {
+                anyhow::bail!(
+                    "bloom chain call can sign exactly one signer: the local validator key address {}",
+                    hex::encode(sender.0)
+                );
+            }
+
+            let client = make_client();
+            let gas_payer = match params.get("gas_payer").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => parse_object_id_32(s).context("parse --gas-payer")?,
+                _ => {
+                    bloom_chain_node::gas_select::select_loom_gas_payer_rpc(
+                        &client,
+                        sender.0,
+                        gas_budget as u128,
+                    )
+                    .await?
+                }
+            };
+            let command = single_call_command(&path, &function, &type_args, &args)?;
+            let chain = RpcChainAdapter::from_env_or_socket(&rpc_sock);
+            let mut plan = crate::commands::pipe::lower_and_build_with_gas(
+                &chain, &command, signers, gas_payer, gas_budget, 1,
+            )?;
+
+            if dry_run {
+                let mut value: serde_json::Value = serde_json::from_str(
+                    &crate::commands::pipe::receipt_ndjson(&plan)
+                        .lines()
+                        .next()
+                        .unwrap_or("{}"),
+                )
+                .context("render dry-run plan")?;
+                value["dry_run"] = serde_json::Value::Bool(true);
+                value["endpoint"] = serde_json::Value::String(format!("{path}/{function}"));
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                return Ok(());
+            }
+
+            let ptb_digest = plan.tx.signing_digest();
+            plan.tx.signatures = vec![PqSignature(sk.sign(&ptb_digest).to_bytes())];
+            let ptb_bytes = bloom_script::encode_ptb(&plan.tx).context("encode signed PTB")?;
+            let chain_id = load_chain_id(&chain_dir)?;
+            let nonce = fetch_nonce(&client, &sender).await? + 1;
+            let tx = build_and_sign_tx(
+                &sk,
+                &pk,
+                sender,
+                &chain_id,
+                nonce,
+                build_submit_ptb_kind(ptb_bytes),
+                fuel_limit,
+                1,
+            )?;
+            let tx_hash = tx.tx_hash();
+            client
+                .call(
+                    "chain_submit_tx",
+                    json!({ "tx_hex": hex::encode(tx.as_ssz_bytes()) }),
+                )
+                .await?;
+            if no_wait {
+                println!("{}", json!({ "tx_hash": hex::encode(tx_hash.0) }));
+                return Ok(());
+            }
+            let receipt =
+                poll_tx_receipt(&client, &tx_hash, std::time::Duration::from_secs(30)).await?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+            if receipt.get("success").and_then(|v| v.as_bool()) == Some(true) {
+                Ok(())
+            } else {
+                let reason = receipt
+                    .get("return_text")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| receipt.get("return_data").and_then(|v| v.as_str()))
+                    .unwrap_or("unknown revert");
+                anyhow::bail!("petal call reverted: {reason}")
+            }
+        }
+
         // ── ls-validators ─────────────────────────────────────────────────────
         ChainCmd::LsValidators => {
             let client = make_client();
@@ -567,6 +782,142 @@ fn read_view_call_stdin_json() -> Result<serde_json::Value> {
         return Ok(serde_json::Value::Null);
     }
     serde_json::from_str(body).context("parse view-call stdin JSON")
+}
+
+fn read_call_stdin_json(label: &str) -> Result<serde_json::Value> {
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Ok(serde_json::Value::Null);
+    }
+
+    let mut body = String::new();
+    stdin
+        .read_to_string(&mut body)
+        .with_context(|| format!("read {label} stdin"))?;
+    let body = body.trim();
+    if body.is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_str(body).with_context(|| format!("parse {label} stdin JSON"))
+}
+
+fn merge_stdin_params(params: &mut serde_json::Value, stdin_params: &mut serde_json::Value) {
+    if let Some(stdin_params) = stdin_params.as_object_mut()
+        && let Some(params) = params.as_object_mut()
+    {
+        for (key, value) in std::mem::take(stdin_params) {
+            match key.as_str() {
+                "path" | "function" => {}
+                _ => {
+                    params.insert(key, value);
+                }
+            }
+        }
+    }
+}
+
+fn parse_addr(s: &str) -> Result<bloom_chain_types::types::Address> {
+    bloom_chain_node::genesis::parse_b1_address(s)
+}
+
+fn parse_object_id_32(s: &str) -> Result<bloom_objects::ObjectId> {
+    let bytes = hex::decode(s.trim().trim_start_matches("0x")).context("decode object id hex")?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("object id must be 32 bytes"))?;
+    Ok(bloom_objects::ObjectId(arr))
+}
+
+fn single_call_command(
+    path: &str,
+    function: &str,
+    type_args: &[String],
+    args: &[serde_json::Value],
+) -> Result<String> {
+    let mut tokens = vec![format!("{}/{}", path.trim_end_matches('/'), function)];
+    for ty in type_args {
+        tokens.push(format!("type:{}", call_type_arg_token(ty)?));
+    }
+    for arg in args {
+        tokens.push(call_arg_token(arg)?);
+    }
+    Ok(tokens.join(" "))
+}
+
+fn call_type_arg_token(value: &str) -> Result<String> {
+    let tag = bloom_script::decode_json_type_tag(&serde_json::Value::String(value.to_string()))
+        .with_context(|| format!("decode --type-arg {value:?}"))?;
+    Ok(type_tag_token(&tag))
+}
+
+fn type_tag_token(tag: &bloom_objects::TypeTag) -> String {
+    match tag {
+        bloom_objects::TypeTag::Concrete {
+            petal_hash,
+            type_name,
+            type_args,
+        } => {
+            let mut out = type_name.clone();
+            if *petal_hash != [0u8; 32] {
+                out.push('@');
+                out.push_str(&hex::encode(petal_hash));
+            }
+            if !type_args.is_empty() {
+                out.push('<');
+                out.push_str(
+                    &type_args
+                        .iter()
+                        .map(type_tag_token)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+                out.push('>');
+            }
+            out
+        }
+        bloom_objects::TypeTag::Generic { idx } => format!("T{idx}"),
+        bloom_objects::TypeTag::External { ref_idx } => format!("$external_{ref_idx}"),
+    }
+}
+
+fn call_arg_token(arg: &serde_json::Value) -> Result<String> {
+    let kind = arg
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .context("call arg missing string field 'kind'")?;
+    match kind {
+        "object" => {
+            let id = arg
+                .get("id")
+                .and_then(|v| v.as_str())
+                .context("object arg missing string field 'id'")?;
+            let id = id.trim().trim_start_matches("0x");
+            if let Some(version) = arg.get("version").and_then(|v| v.as_u64()) {
+                Ok(format!("obj:{id}@{version}"))
+            } else {
+                Ok(format!("obj:{id}"))
+            }
+        }
+        "signer" => {
+            let idx = arg.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+            Ok(format!("signer:{idx}"))
+        }
+        "const" => {
+            if let Some(hex) = arg.get("hex").and_then(|v| v.as_str()) {
+                Ok(format!("0x{}", hex.trim().trim_start_matches("0x")))
+            } else if let Some(value) = arg.get("value") {
+                match value {
+                    serde_json::Value::String(s) => Ok(s.clone()),
+                    serde_json::Value::Number(n) => Ok(n.to_string()),
+                    serde_json::Value::Bool(b) => Ok(b.to_string()),
+                    _ => anyhow::bail!("const arg 'value' must be string, number, or bool"),
+                }
+            } else {
+                anyhow::bail!("const arg requires 'hex' or 'value'")
+            }
+        }
+        other => anyhow::bail!("unsupported call arg kind {other:?}"),
+    }
 }
 
 fn genesis_skeleton() -> &'static str {
@@ -1204,6 +1555,46 @@ allocations = []
             TxKind::SubmitPtb { ptb_bytes } => assert_eq!(ptb_bytes, bytes),
             other => panic!("expected SubmitPtb, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn call_command_builds_ptb_builder_line_from_json_args() {
+        let line = single_call_command(
+            "/bloom/petals/dex/probe",
+            "set_counter",
+            &["u64".to_string()],
+            &[
+                serde_json::json!({ "kind": "object", "id": "0x1111111111111111111111111111111111111111111111111111111111111111", "version": 7 }),
+                serde_json::json!({ "kind": "signer", "index": 0 }),
+                serde_json::json!({ "kind": "const", "value": 77 }),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            line,
+            "/bloom/petals/dex/probe/set_counter type:u64 obj:1111111111111111111111111111111111111111111111111111111111111111@7 signer:0 77"
+        );
+    }
+
+    #[test]
+    fn call_stdin_merge_keeps_baked_path_and_function_authoritative() {
+        let mut params = serde_json::json!({
+            "path": "/bloom/petals/dex/probe",
+            "function": "set_counter",
+            "args": [],
+            "gas_budget": 1_000_000u64,
+        });
+        let mut stdin = serde_json::json!({
+            "path": "/evil",
+            "function": "other",
+            "args": [{ "kind": "const", "value": 77 }],
+            "gas_budget": 2_000_000u64,
+        });
+        merge_stdin_params(&mut params, &mut stdin);
+        assert_eq!(params["path"], "/bloom/petals/dex/probe");
+        assert_eq!(params["function"], "set_counter");
+        assert_eq!(params["gas_budget"], 2_000_000u64);
+        assert_eq!(params["args"][0]["value"], 77);
     }
 
     /// review 2026-05-19 #9 — `write_secret_key_file` refuses to overwrite
