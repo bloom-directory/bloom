@@ -67,8 +67,9 @@ COPY . .
 # resolved toolchain. (Idempotent and fast when already installed.)
 RUN rustup target add wasm32-unknown-unknown
 
-# Host binary.
-RUN cargo build --release -p bloom
+# Host/validator binary. Build with all features so the same artifact can be
+# copied out by the docker acceptance script for host-side VFS mount commands.
+RUN cargo build --release -p bloom --all-features
 
 # DEX petal wasm artefacts. Build each petal in its own `cargo build`
 # invocation because sibling petals use `features = ["no-entrypoint"]` when

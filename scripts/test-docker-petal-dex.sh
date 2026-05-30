@@ -14,7 +14,8 @@
 #   2. Build the docker image (`bloom-eth:test` via docker-compose.yml). REQUIRED
 #      so the in-container validator binary matches the current tree (the
 #      driver pins petal hashes computed from the host-built wasm).
-#   3. Build the host-side `bloom` binary (release).
+#   3. Extract the already-built `bloom` binary from the docker image for
+#      host-side provisioning and CLI shellouts.
 #   4. Provision per-validator homes via `bloom chain testnet`, wiring peers to
 #      the docker DNS names val0..val3.
 #   5. APPEND a genesis allocation and key-registry entry for the inner-PTB
@@ -58,7 +59,7 @@ BLOOM_DOCKER_TMPDIR="${BLOOM_DOCKER_TMPDIR:-$(mktemp -d -t bloom-docker-petal-de
 export BLOOM_DOCKER_TMPDIR
 log "tmpdir: $BLOOM_DOCKER_TMPDIR"
 
-BLOOM_BIN="$REPO_ROOT/target/release/bloom"
+BLOOM_BIN="${BLOOM_BIN:-$BLOOM_DOCKER_TMPDIR/host-bin/bloom}"
 
 # Teardown runs unconditionally on exit so we don't leak containers or tmpdirs
 # even if the test panics. Capture and re-raise the original exit code.
@@ -146,6 +147,33 @@ teardown() {
 }
 trap teardown EXIT INT TERM
 
+prepare_bloom_cli() {
+    if [ -x "$BLOOM_BIN" ]; then
+        log "using host-side bloom CLI: $BLOOM_BIN"
+        return 0
+    fi
+
+    if [ "$(uname -s)" = "Linux" ] && docker image inspect bloom-eth:test >/dev/null 2>&1; then
+        log "extracting host-side bloom CLI from bloom-eth:test"
+        mkdir -p "$(dirname "$BLOOM_BIN")"
+        local cid=""
+        cid=$(docker create bloom-eth:test)
+        if ! docker cp "$cid:/usr/local/bin/bloom" "$BLOOM_BIN"; then
+            docker rm "$cid" >/dev/null 2>&1 || true
+            fail "failed to extract /usr/local/bin/bloom from bloom-eth:test"
+        fi
+        docker rm "$cid" >/dev/null
+        chmod +x "$BLOOM_BIN"
+        [ -x "$BLOOM_BIN" ] || fail "extracted bloom binary is not executable: $BLOOM_BIN"
+        return 0
+    fi
+
+    log "building host-side bloom (release) because no compatible docker image binary is available"
+    (cd "$REPO_ROOT" && cargo build --release -p bloom --all-features)
+    BLOOM_BIN="$REPO_ROOT/target/release/bloom"
+    [ -x "$BLOOM_BIN" ] || fail "bloom binary missing: $BLOOM_BIN"
+}
+
 if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
     log "running petal DEX package preflight tests"
     (cd "$REPO_ROOT" && cargo test \
@@ -162,9 +190,7 @@ if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
         (cd "$REPO_ROOT" && "${DC[@]}" -f "$COMPOSE_FILE" build)
     fi
 
-    log "building host-side bloom (release, all features for NFS mount)"
-    (cd "$REPO_ROOT" && cargo build --release -p bloom --all-features)
-    [ -x "$BLOOM_BIN" ] || fail "bloom binary missing: $BLOOM_BIN"
+    prepare_bloom_cli
 
     peer_hosts="val0,val1,val2,val3"
 
@@ -232,7 +258,7 @@ if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
     done
 else
     log "BLOOM_DOCKER_COMPOSE_UP=0 — skipping build/provision/up"
-    [ -x "$BLOOM_BIN" ] || fail "bloom binary missing: $BLOOM_BIN (build it first or unset BLOOM_DOCKER_COMPOSE_UP)"
+    prepare_bloom_cli
 fi
 
 if [ -z "$PTB_SIGNER_PK_HEX" ]; then
