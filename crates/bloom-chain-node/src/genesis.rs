@@ -44,6 +44,7 @@ use bloom_script::{CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, loom_coin_ty
 use serde::{Deserialize, Serialize};
 
 use crate::error::NodeError;
+use crate::petal_executor::validate_chain_petal_admission;
 
 // ---------------------------------------------------------------------------
 // TOML schema
@@ -208,6 +209,8 @@ impl Genesis {
                     petal.path
                 )));
             }
+            validate_chain_petal_admission(&wasm, &petal.path)
+                .map_err(|e| NodeError::Genesis(format!("petal {}: {e}", petal.path)))?;
             petals.push((petal.path.clone(), wasm));
         }
 
@@ -528,6 +531,56 @@ mod tests {
         ObjectId(*h.finalize().as_bytes())
     }
 
+    fn leb128(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                return;
+            }
+            out.push(b | 0x80);
+        }
+    }
+
+    fn section(out: &mut Vec<u8>, id: u8, body: &[u8]) {
+        out.push(id);
+        leb128(out, body.len() as u64);
+        out.extend_from_slice(body);
+    }
+
+    fn custom_section(name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        leb128(&mut body, name.len() as u64);
+        body.extend_from_slice(name.as_bytes());
+        body.extend_from_slice(payload);
+        body
+    }
+
+    fn genesis_petal_wasm(path: &str) -> Vec<u8> {
+        let manifest =
+            bloom_petal_manifest::codec::encode(&bloom_petal_manifest::types::PetalManifestV0 {
+                schema_version: bloom_petal_manifest::types::SCHEMA_VERSION,
+                module_path: path.to_string(),
+                framework_version: bloom_petal_manifest::types::SemVer::new(0, 1, 0),
+                ..Default::default()
+            })
+            .expect("manifest encodes");
+        let mut wasm = Vec::new();
+        wasm.extend_from_slice(b"\0asm");
+        wasm.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        let custom = custom_section("bloom_petal_manifest_v0", &manifest);
+        section(&mut wasm, 0, &custom);
+        wasm
+    }
+
+    fn genesis_petal_wasm_variant(path: &str) -> Vec<u8> {
+        let mut wasm = genesis_petal_wasm(path);
+        let custom = custom_section("variant", b"1");
+        section(&mut wasm, 0, &custom);
+        wasm
+    }
+
     #[test]
     fn genesis_emits_coin_loom_objects_for_each_allocation() {
         let addr_a = [0x01u8; 32];
@@ -766,6 +819,62 @@ mod tests {
     }
 
     #[test]
+    fn genesis_rejects_petal_outside_petals_namespace() {
+        let (_validator_sk, validator_pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
+        let validator_addr = Address::from_pubkey_bytes(&validator_pk.0);
+        let raw = GenesisFile {
+            chain_id: "bloomchain.test".into(),
+            genesis_time_ms: 1,
+            validators: vec![ValidatorConfig {
+                address: hex::encode(validator_addr.0),
+                pubkey: base64::engine::general_purpose::STANDARD.encode(&validator_pk.0),
+                voting_power: 100,
+                host: None,
+            }],
+            allocations: vec![],
+            petals: vec![GenesisPetal {
+                path: "/bloom/example".into(),
+                wasm_hex: hex::encode(genesis_petal_wasm("/bloom/example")),
+            }],
+            key_registry: vec![],
+        };
+
+        let err = Genesis::from_raw(raw).unwrap_err();
+        assert!(
+            err.to_string().contains("must start with /bloom/petals/"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn genesis_rejects_petal_manifest_path_mismatch() {
+        let (_validator_sk, validator_pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
+        let validator_addr = Address::from_pubkey_bytes(&validator_pk.0);
+        let raw = GenesisFile {
+            chain_id: "bloomchain.test".into(),
+            genesis_time_ms: 1,
+            validators: vec![ValidatorConfig {
+                address: hex::encode(validator_addr.0),
+                pubkey: base64::engine::general_purpose::STANDARD.encode(&validator_pk.0),
+                voting_power: 100,
+                host: None,
+            }],
+            allocations: vec![],
+            petals: vec![GenesisPetal {
+                path: "/bloom/petals/example".into(),
+                wasm_hex: hex::encode(genesis_petal_wasm("/bloom/petals/other")),
+            }],
+            key_registry: vec![],
+        };
+
+        let err = Genesis::from_raw(raw).unwrap_err();
+        assert!(
+            err.to_string().contains("manifest module_path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn genesis_hash_changes_with_petals_and_key_registry() {
         let (_validator_sk, validator_pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
         let validator_addr = Address::from_pubkey_bytes(&validator_pk.0);
@@ -782,8 +891,8 @@ mod tests {
             }],
             allocations: vec![],
             petals: vec![GenesisPetal {
-                path: "/bloom/example".into(),
-                wasm_hex: "010203".into(),
+                path: "/bloom/petals/example".into(),
+                wasm_hex: hex::encode(genesis_petal_wasm("/bloom/petals/example")),
             }],
             key_registry: vec![GenesisKeyRegistryEntry {
                 address: hex::encode(registry_addr.0),
@@ -791,7 +900,7 @@ mod tests {
             }],
         };
         let mut raw_b = raw_a.clone();
-        raw_b.petals[0].wasm_hex = "010204".into();
+        raw_b.petals[0].wasm_hex = hex::encode(genesis_petal_wasm_variant("/bloom/petals/example"));
         let mut raw_c = raw_a.clone();
         raw_c.key_registry.clear();
 

@@ -1,4 +1,4 @@
-//! `/bloom/test/identity` — trivial generic identity petal.
+//! `/bloom/petals/test/identity` — trivial generic identity petal.
 //!
 //! De-risk fixture for **Phase A** (generic-dispatch monomorphization,
 //! spec §5): the smallest possible petal that exercises *runtime
@@ -30,12 +30,12 @@
 
 use bloom_resource_macros as bloom;
 
-/// Petal body for `/bloom/test/identity`.
+/// Petal body for `/bloom/petals/test/identity`.
 ///
 /// Every `pub fn` inside this module becomes a `__petal_<name>` wasm
 /// export. The generic fns emit a *real* export doing runtime
 /// type-erased dispatch (spec §5), not a `NotImplemented` stub.
-#[bloom::petal(path = "/bloom/test/identity", version = "0.1.0")]
+#[bloom::petal(path = "/bloom/petals/test/identity", version = "0.1.0")]
 pub mod identity {
     use bloom_resource::Coin;
 

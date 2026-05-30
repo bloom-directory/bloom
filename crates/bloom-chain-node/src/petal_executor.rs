@@ -138,7 +138,10 @@ fn next_object_version(version: u64) -> u64 {
         .expect("object version must not overflow u64")
 }
 
-fn validate_chain_petal_admission(wasm_bytes: &[u8], module_path: &str) -> Result<(), String> {
+pub(crate) fn validate_chain_petal_admission(
+    wasm_bytes: &[u8],
+    module_path: &str,
+) -> Result<(), String> {
     if wasm_bytes.len() > MAX_CHAIN_WASM_BYTES {
         return Err(format!(
             "wasm size {} exceeds limit {}",
