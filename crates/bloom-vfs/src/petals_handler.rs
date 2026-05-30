@@ -12,6 +12,9 @@ use crate::paginate;
 use crate::path::VfsPath;
 
 const PETAL_PREFIX: &str = "/bloom/petals/";
+const PIPE_NODE: &str = ".pipe";
+const PIPE_SHIM: &str =
+    "#!/bin/sh\n# Bloom petal composition endpoint.\nexec bloom chain pipe \"$@\"\n";
 
 #[derive(Clone)]
 pub struct PetalsEndpointHandler {
@@ -113,8 +116,19 @@ impl PetalsEndpointHandler {
 
         let entries = by_name.into_values().collect::<Vec<_>>();
         Ok(match paginate::project(entries) {
-            paginate::Projection::Direct(entries) => entries,
-            paginate::Projection::Paged { .. } => vec![Entry::dir("page")],
+            paginate::Projection::Direct(mut entries) => {
+                if rel.is_empty() {
+                    entries.insert(0, Entry::executable_file(PIPE_NODE));
+                }
+                entries
+            }
+            paginate::Projection::Paged { .. } => {
+                if rel.is_empty() {
+                    vec![Entry::executable_file(PIPE_NODE), Entry::dir("page")]
+                } else {
+                    vec![Entry::dir("page")]
+                }
+            }
         })
     }
 
@@ -194,6 +208,9 @@ impl Handler for PetalsEndpointHandler {
         if segs.is_empty() {
             return Ok(Entry::dir(""));
         }
+        if segs.len() == 1 && segs[0] == PIPE_NODE {
+            return Ok(Entry::executable_file(PIPE_NODE));
+        }
         if let Some((parent, Some(_))) = split_page_path(segs) {
             let _ = self.entries_for_unpaged(parent)?;
             return Ok(Entry::dir(segs.last().expect("page path has leaf")));
@@ -223,11 +240,15 @@ impl Handler for PetalsEndpointHandler {
     }
 
     async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        let segs = path.segments();
+        if segs.len() == 1 && segs[0] == PIPE_NODE {
+            return Ok(PIPE_SHIM.as_bytes().to_vec());
+        }
         let bindings = self.bindings();
-        if Self::has_descendant(&bindings, path.segments()) {
+        if Self::has_descendant(&bindings, segs) {
             return Err(HandlerError::NotAFile(path.to_string_path()));
         }
-        let Some((binding, function, view)) = self.endpoint_at(&bindings, path.segments()) else {
+        let Some((binding, function, view)) = self.endpoint_at(&bindings, segs) else {
             return Err(HandlerError::NotAFile(path.to_string_path()));
         };
         Ok(Self::shim(&binding.path, &function, view))
@@ -346,7 +367,7 @@ mod tests {
         let root = h.list(&vpath("")).await.unwrap();
         assert_eq!(
             root.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
-            vec!["core", "dex"]
+            vec![".pipe", "core", "dex"]
         );
         let dex = h.list(&vpath("dex")).await.unwrap();
         assert_eq!(dex[0].name, "pool");
@@ -357,6 +378,42 @@ mod tests {
         assert_eq!(pool[0].mode, 0o555);
         assert_eq!(pool[1].name, "swap");
         assert_eq!(pool[1].mode, 0o555);
+    }
+
+    #[tokio::test]
+    async fn root_includes_pipe_node_and_reads_composition_shim() {
+        let h = PetalsEndpointHandler::new(Arc::new(MockChain::default()));
+
+        let root = h.list(&vpath("")).await.unwrap();
+        let pipe = root.iter().find(|entry| entry.name == ".pipe").unwrap();
+        assert_eq!(pipe.mode, 0o555);
+
+        let entry = h.lookup(&vpath(".pipe")).await.unwrap();
+        assert_eq!(entry.mode, 0o555);
+
+        let shim = String::from_utf8(h.read(&vpath(".pipe")).await.unwrap()).unwrap();
+        assert!(shim.starts_with("#!/bin/sh\n"));
+        assert!(shim.contains("exec bloom chain pipe \"$@\""));
+    }
+
+    #[tokio::test]
+    async fn root_pipe_node_is_not_paginated_with_projected_petals() {
+        let chain = Arc::new(MockChain::default());
+        for i in 0..=paginate::PAGE_SIZE {
+            let path = format!("/bloom/petals/p{i:03}");
+            chain.bind(&path, Hash32([i as u8; 32]), manifest(&path));
+        }
+        let h = PetalsEndpointHandler::new(chain);
+
+        let root = h.list(&vpath("")).await.unwrap();
+        assert_eq!(
+            root.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec![".pipe", "page"]
+        );
+
+        let page = h.list(&vpath("page/000000")).await.unwrap();
+        assert!(!page.iter().any(|entry| entry.name == ".pipe"));
+        assert!(page.iter().all(|entry| entry.name.starts_with('p')));
     }
 
     #[tokio::test]

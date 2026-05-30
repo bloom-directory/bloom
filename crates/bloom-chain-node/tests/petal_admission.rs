@@ -378,3 +378,27 @@ fn deploy_outside_petals_prefix_fails_without_writes() {
     assert!(state.vfs_lookup(path).is_none());
     assert!(String::from_utf8_lossy(&out.return_data).contains("/bloom/petals/"));
 }
+
+#[test]
+fn deploy_reserved_pipe_path_fails_without_writes() {
+    for path in ["/bloom/petals/.pipe", "/bloom/petals/.pipe/foo"] {
+        let mut state = State::new();
+        let out = ChainPetalExecutor.execute_tx(
+            &deploy_tx(wasm_with_manifest(path)),
+            &mut state,
+            1,
+            1_700_000_000_000,
+            Address([0xAA; 32]),
+            Hash32([0; 32]),
+        );
+
+        assert!(!out.success, "{path} should fail admission");
+        assert!(out.write_set.is_none(), "{path} should not emit writes");
+        assert!(state.vfs_lookup(path).is_none());
+        assert!(
+            String::from_utf8_lossy(&out.return_data).contains(".pipe"),
+            "unexpected error for {path}: {}",
+            String::from_utf8_lossy(&out.return_data)
+        );
+    }
+}

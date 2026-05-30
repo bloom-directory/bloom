@@ -144,6 +144,31 @@ pub enum ChainCmd {
         #[arg(long = "no-wait")]
         no_wait: bool,
     },
+    /// Execute one atomic multi-endpoint petal plan through the PTB builder.
+    #[command(name = "pipe")]
+    Pipe {
+        /// Pipe expression over `/bloom/petals/...` endpoint paths. If omitted, read from stdin.
+        #[arg(value_name = "EXPR")]
+        expr: Option<String>,
+        /// Signer address/pubkey for the inner PTB. Defaults to the local validator key.
+        #[arg(long = "signer", value_name = "ADDR")]
+        signers: Vec<String>,
+        /// Explicit gas-payer object id. If omitted, selects signer-owned Coin<LOOM>.
+        #[arg(long = "gas-payer", value_name = "OBJECT_ID")]
+        gas_payer: Option<String>,
+        /// Gas budget for the inner PTB.
+        #[arg(long = "gas-budget", value_name = "N", default_value_t = 1_000_000u64)]
+        gas_budget: u64,
+        /// Outer transaction fuel cap.
+        #[arg(long = "fuel-limit", value_name = "N", default_value_t = 10_000_000u64)]
+        fuel_limit: u64,
+        /// Lower and validate the PTB without submitting it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Submit without waiting for the committed receipt.
+        #[arg(long = "no-wait")]
+        no_wait: bool,
+    },
     /// Query chain state.
     #[command(subcommand)]
     Query(QueryCmd),
@@ -590,6 +615,79 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             Ok(())
         }
 
+        // ── mutating petal pipe ─────────────────────────────────────────────
+        ChainCmd::Pipe {
+            expr,
+            signers,
+            gas_payer,
+            gas_budget,
+            fuel_limit,
+            dry_run,
+            no_wait,
+        } => {
+            use bloom_chain_node::rpc::RpcChainAdapter;
+            use bloom_chain_types::ssz::Encode;
+            use bloom_script::PqSignature;
+
+            let expr = read_pipe_expr(expr)?;
+            let signer_override = single_signer_override(&signers, "bloom chain pipe")?;
+            let (sk, pk, sender) = load_wallet_key_for_signer(&chain_dir, signer_override)?;
+
+            let client = make_client();
+            let gas_payer = match gas_payer.as_deref() {
+                Some(s) if !s.is_empty() => parse_object_id_32(s).context("parse --gas-payer")?,
+                _ => {
+                    bloom_chain_node::gas_select::select_loom_gas_payer_rpc(
+                        &client,
+                        sender.0,
+                        gas_budget as u128,
+                    )
+                    .await?
+                }
+            };
+            let chain = RpcChainAdapter::from_env_or_socket(&rpc_sock);
+            let mut plan =
+                prepare_chain_pipe_plan(&chain, &expr, &signers, sender, gas_payer, gas_budget)?;
+
+            let plan_receipt = crate::commands::pipe::receipt_ndjson(&plan);
+            if dry_run {
+                print!("{plan_receipt}");
+                return Ok(());
+            }
+
+            let ptb_digest = plan.tx.signing_digest();
+            plan.tx.signatures = vec![PqSignature(sk.sign(&ptb_digest).to_bytes())];
+            let ptb_bytes = bloom_script::encode_ptb(&plan.tx).context("encode signed PTB")?;
+            let chain_id = load_chain_id(&chain_dir)?;
+            let nonce = fetch_nonce(&client, &sender).await? + 1;
+            let tx = build_and_sign_tx(
+                &sk,
+                &pk,
+                sender,
+                &chain_id,
+                nonce,
+                build_submit_ptb_kind(ptb_bytes),
+                fuel_limit,
+                1,
+            )?;
+            let tx_hash = tx.tx_hash();
+            client
+                .call(
+                    "chain_submit_tx",
+                    json!({ "tx_hex": hex::encode(tx.as_ssz_bytes()) }),
+                )
+                .await?;
+            if no_wait {
+                println!("{}", tx_hash_json(&tx_hash));
+                return Ok(());
+            }
+            let receipt =
+                poll_tx_receipt(&client, &tx_hash, std::time::Duration::from_secs(30)).await?;
+            print!("{plan_receipt}");
+            ensure_success_receipt(&receipt)?;
+            Ok(())
+        }
+
         // ── ls-validators ─────────────────────────────────────────────────────
         ChainCmd::LsValidators => {
             let client = make_client();
@@ -717,6 +815,30 @@ fn read_call_stdin_json(label: &str) -> Result<serde_json::Value> {
     serde_json::from_str(body).with_context(|| format!("parse {label} stdin JSON"))
 }
 
+fn read_pipe_expr(expr: Option<String>) -> Result<String> {
+    if let Some(expr) = expr {
+        let expr = expr.trim();
+        if expr.is_empty() {
+            anyhow::bail!("pipe expression cannot be empty");
+        }
+        return Ok(expr.to_string());
+    }
+
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        anyhow::bail!("pipe expression is required as EXPR or stdin");
+    }
+    let mut body = String::new();
+    stdin
+        .read_to_string(&mut body)
+        .context("read chain pipe stdin")?;
+    let body = body.trim();
+    if body.is_empty() {
+        anyhow::bail!("pipe expression cannot be empty");
+    }
+    Ok(body.to_string())
+}
+
 fn merge_stdin_params(params: &mut serde_json::Value, stdin_params: &mut serde_json::Value) {
     if let Some(stdin_params) = stdin_params.as_object_mut()
         && let Some(params) = params.as_object_mut()
@@ -820,25 +942,38 @@ fn chain_call_request_from_params(
 fn chain_call_signer_override(
     request: &ChainCallRequest,
 ) -> Result<Option<bloom_chain_types::types::Address>> {
-    if request.signers.len() > 1 {
-        anyhow::bail!("bloom chain call supports exactly one --signer in Stage 2");
-    }
-    request
-        .signers
-        .first()
-        .map(|s| parse_addr(s).with_context(|| format!("parse --signer {s:?}")))
-        .transpose()
+    single_signer_override(&request.signers, "bloom chain call")
 }
 
 fn chain_call_signers_for_sender(
     request: &ChainCallRequest,
     sender: bloom_chain_types::types::Address,
 ) -> Result<Vec<[u8; 32]>> {
-    let signers = if request.signers.is_empty() {
+    single_signers_for_sender(&request.signers, sender, "bloom chain call")
+}
+
+fn single_signer_override(
+    signers: &[String],
+    command: &str,
+) -> Result<Option<bloom_chain_types::types::Address>> {
+    if signers.len() > 1 {
+        anyhow::bail!("{command} supports exactly one --signer");
+    }
+    signers
+        .first()
+        .map(|s| parse_addr(s).with_context(|| format!("parse --signer {s:?}")))
+        .transpose()
+}
+
+fn single_signers_for_sender(
+    signers_raw: &[String],
+    sender: bloom_chain_types::types::Address,
+    command: &str,
+) -> Result<Vec<[u8; 32]>> {
+    let signers = if signers_raw.is_empty() {
         vec![sender.0]
     } else {
-        request
-            .signers
+        signers_raw
             .iter()
             .map(|s| parse_addr(s).with_context(|| format!("parse --signer {s:?}")))
             .map(|r| r.map(|a| a.0))
@@ -847,7 +982,7 @@ fn chain_call_signers_for_sender(
 
     if signers != vec![sender.0] {
         anyhow::bail!(
-            "bloom chain call can sign exactly one signer: the local validator key address {}",
+            "{command} can sign exactly one signer: the local key address {}",
             hex::encode(sender.0)
         );
     }
@@ -876,6 +1011,18 @@ fn prepare_chain_call_plan(
         request.gas_budget,
         1,
     )
+}
+
+fn prepare_chain_pipe_plan(
+    chain: &dyn bloom_script::ChainStateIface,
+    expr: &str,
+    signers_raw: &[String],
+    sender: bloom_chain_types::types::Address,
+    gas_payer: bloom_objects::ObjectId,
+    gas_budget: u64,
+) -> Result<crate::commands::pipe::LoweredPlan> {
+    let signers = single_signers_for_sender(signers_raw, sender, "bloom chain pipe")?;
+    crate::commands::pipe::lower_and_build_with_gas(chain, expr, signers, gas_payer, gas_budget, 1)
 }
 
 fn single_call_command(
@@ -1844,7 +1991,7 @@ mod tests {
 
     use bloom_chain_types::Hash32;
     use bloom_objects::{AccessMode, Object, ObjectId, Owner, TypeTag};
-    use bloom_script::{ArgDeclStub, FunctionDeclStub, PetalManifestStub};
+    use bloom_script::{Arg, ArgDeclStub, Command, FunctionDeclStub, PetalManifestStub};
 
     #[derive(Default)]
     struct MockChain {
@@ -1925,20 +2072,74 @@ mod tests {
             Hash32([0xAB; 32]),
             PetalManifestStub {
                 module_path: "/bloom/petals/dex/probe".to_string(),
-                functions: vec![FunctionDeclStub {
-                    name: "set_counter".to_string(),
-                    type_params: vec![],
-                    args: vec![
-                        ArgDeclStub::Object {
-                            ty: concrete("Counter"),
-                            mode: AccessMode::Mutable,
-                        },
-                        ArgDeclStub::Signer,
-                        ArgDeclStub::Const(concrete("u64")),
-                    ],
-                    returns: vec![],
-                    ..Default::default()
-                }],
+                functions: vec![
+                    FunctionDeclStub {
+                        name: "set_counter".to_string(),
+                        type_params: vec![],
+                        args: vec![
+                            ArgDeclStub::Object {
+                                ty: concrete("Counter"),
+                                mode: AccessMode::Mutable,
+                            },
+                            ArgDeclStub::Signer,
+                            ArgDeclStub::Const(concrete("u64")),
+                        ],
+                        returns: vec![],
+                        ..Default::default()
+                    },
+                    FunctionDeclStub {
+                        name: "spend".to_string(),
+                        args: vec![],
+                        returns: vec![concrete("Packet")],
+                        ..Default::default()
+                    },
+                    FunctionDeclStub {
+                        name: "swap".to_string(),
+                        args: vec![ArgDeclStub::Object {
+                            ty: concrete("Packet"),
+                            mode: AccessMode::Consume,
+                        }],
+                        returns: vec![concrete("Packet")],
+                        ..Default::default()
+                    },
+                    FunctionDeclStub {
+                        name: "receive".to_string(),
+                        args: vec![ArgDeclStub::Object {
+                            ty: concrete("Packet"),
+                            mode: AccessMode::Consume,
+                        }],
+                        returns: vec![],
+                        ..Default::default()
+                    },
+                    FunctionDeclStub {
+                        name: "spend_eth".to_string(),
+                        args: vec![],
+                        returns: vec![concrete("ETH")],
+                        ..Default::default()
+                    },
+                    FunctionDeclStub {
+                        name: "spend_usdc".to_string(),
+                        args: vec![],
+                        returns: vec![concrete("USDC")],
+                        ..Default::default()
+                    },
+                    FunctionDeclStub {
+                        name: "add_liquidity".to_string(),
+                        args: vec![
+                            ArgDeclStub::Const(concrete("u64")),
+                            ArgDeclStub::Object {
+                                ty: concrete("ETH"),
+                                mode: AccessMode::Consume,
+                            },
+                            ArgDeclStub::Object {
+                                ty: concrete("USDC"),
+                                mode: AccessMode::Consume,
+                            },
+                        ],
+                        returns: vec![concrete("LP")],
+                        ..Default::default()
+                    },
+                ],
                 ..Default::default()
             },
         );
@@ -2094,6 +2295,102 @@ allocations = []
             format!("{err}").contains("can sign exactly one signer"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn chain_pipe_prepare_plan_uses_multi_command_expr_signer_and_gas_override() {
+        let chain = command_test_chain();
+        let sender = bloom_chain_types::types::Address([0x22; 32]);
+        let gas_payer = ObjectId([0xFE; 32]);
+        let signer = hex::encode(sender.0);
+        let expr = "/bloom/petals/dex/probe/spend \
+            | /bloom/petals/dex/probe/swap \
+            | /bloom/petals/dex/probe/receive";
+
+        let plan =
+            prepare_chain_pipe_plan(&chain, expr, &[signer], sender, gas_payer, 2_000_000).unwrap();
+        assert_eq!(plan.tx.commands.len(), 3);
+        assert_eq!(plan.tx.signers, vec![[0x22; 32]]);
+        assert_eq!(plan.tx.gas_payer, gas_payer);
+        assert_eq!(plan.tx.gas_budget, 2_000_000);
+
+        match &plan.tx.commands[1] {
+            Command::Move(m) => assert_eq!(
+                m.args,
+                vec![Arg::Use {
+                    cmd_idx: 0,
+                    ret_idx: 0
+                }]
+            ),
+            other => panic!("expected Move command, got {other:?}"),
+        }
+        match &plan.tx.commands[2] {
+            Command::Move(m) => assert_eq!(
+                m.args,
+                vec![Arg::Use {
+                    cmd_idx: 1,
+                    ret_idx: 0
+                }]
+            ),
+            other => panic!("expected Move command, got {other:?}"),
+        }
+
+        let receipt = crate::commands::pipe::receipt_ndjson(&plan);
+        assert_eq!(receipt.lines().count(), 4);
+    }
+
+    #[test]
+    fn chain_pipe_prepare_plan_rejects_signer_that_does_not_match_local_key() {
+        let chain = command_test_chain();
+        let other = hex::encode([0x33; 32]);
+        let err = prepare_chain_pipe_plan(
+            &chain,
+            "/bloom/petals/dex/probe/spend",
+            &[other],
+            bloom_chain_types::types::Address([0x22; 32]),
+            ObjectId([0xFE; 32]),
+            1_000_000,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("can sign exactly one signer"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn chain_pipe_prepare_plan_supports_named_dag_expr() {
+        let chain = command_test_chain();
+        let sender = bloom_chain_types::types::Address([0x22; 32]);
+        let gas_payer = ObjectId([0xFE; 32]);
+        let signer = hex::encode(sender.0);
+        let expr = "/bloom/petals/dex/probe/add_liquidity --min-lp 10 \
+            --a <(/bloom/petals/dex/probe/spend_eth)> \
+            --b <(/bloom/petals/dex/probe/spend_usdc)>";
+
+        let plan =
+            prepare_chain_pipe_plan(&chain, expr, &[signer], sender, gas_payer, 3_000_000).unwrap();
+        assert_eq!(plan.tx.commands.len(), 3);
+        assert_eq!(plan.tx.signers, vec![[0x22; 32]]);
+        assert_eq!(plan.tx.gas_payer, gas_payer);
+        assert_eq!(plan.tx.gas_budget, 3_000_000);
+
+        match &plan.tx.commands[2] {
+            Command::Move(m) => assert_eq!(
+                &m.args[1..],
+                [
+                    Arg::Use {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    },
+                    Arg::Use {
+                        cmd_idx: 1,
+                        ret_idx: 0,
+                    },
+                ]
+            ),
+            other => panic!("expected Move command, got {other:?}"),
+        }
     }
 
     #[test]

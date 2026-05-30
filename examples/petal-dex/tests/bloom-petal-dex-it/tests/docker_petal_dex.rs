@@ -2234,6 +2234,52 @@ fn view_probe_manifest() -> Vec<u8> {
                 ..Default::default()
             },
             FunctionDecl {
+                name: "set_counter_99_ret".to_string(),
+                args: vec![ArgDecl {
+                    name: "counter".to_string(),
+                    kind: ArgKind::Object {
+                        ty: self_counter.clone(),
+                        mode: AccessMode::Mutable,
+                    },
+                }],
+                returns: vec![self_counter.clone()],
+                ..Default::default()
+            },
+            FunctionDecl {
+                name: "set_counter_123_ret".to_string(),
+                args: vec![ArgDecl {
+                    name: "counter".to_string(),
+                    kind: ArgKind::Object {
+                        ty: self_counter.clone(),
+                        mode: AccessMode::Mutable,
+                    },
+                }],
+                returns: vec![self_counter.clone()],
+                ..Default::default()
+            },
+            FunctionDecl {
+                name: "sink_counter".to_string(),
+                args: vec![ArgDecl {
+                    name: "counter".to_string(),
+                    kind: ArgKind::Object {
+                        ty: self_counter.clone(),
+                        mode: AccessMode::ReadOnly,
+                    },
+                }],
+                ..Default::default()
+            },
+            FunctionDecl {
+                name: "fail_after_counter".to_string(),
+                args: vec![ArgDecl {
+                    name: "counter".to_string(),
+                    kind: ArgKind::Object {
+                        ty: self_counter.clone(),
+                        mode: AccessMode::ReadOnly,
+                    },
+                }],
+                ..Default::default()
+            },
+            FunctionDecl {
                 name: "fail_counter".to_string(),
                 ..Default::default()
             },
@@ -2282,10 +2328,12 @@ fn view_probe_wasm() -> Vec<u8> {
   ;; count=1, len=16, u128=42
   (data (i32.const 0) "\00\00\00\01\00\00\00\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
   (data (i32.const 64) "{counter_tag_wat}")
-  ;; Counter payloads: initial 42, then mutated to 77.
+  ;; Counter payloads: initial 42, then mutated values.
   (data (i32.const 160) "\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
   (data (i32.const 192) "\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\4d")
-  (data (i32.const 224) "forced revert")
+  (data (i32.const 208) "\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\63")
+  (data (i32.const 224) "\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\7b")
+  (data (i32.const 240) "forced revert")
   ;; one object-id return slot: count=1, len=32
   (data (i32.const 512) "\00\00\00\01\00\00\00\20")
   ;; one u128 return slot: count=1, len=16
@@ -2307,8 +2355,39 @@ fn view_probe_wasm() -> Vec<u8> {
     (local.set $h (call $borrow (i32.const 256) (i32.const 1)))
     (drop (call $mutate (local.get $h) (i32.const 192) (i32.const 16)))
     i32.const 0)
+  (func (export "__petal_set_counter_99_ret") (param i32 i32) (result i32)
+    (local $h i32)
+    ;; Arg 0 is an object: count(4), tag(1), id(32).
+    (drop (call $cdread (i32.const 256) (i32.const 5) (i32.const 32)))
+    (local.set $h (call $borrow (i32.const 256) (i32.const 1)))
+    (drop (call $mutate (local.get $h) (i32.const 208) (i32.const 16)))
+    (drop (call $id (local.get $h) (i32.const 520)))
+    (call $ret (i32.const 512) (i32.const 40))
+    i32.const 0)
+  (func (export "__petal_set_counter_123_ret") (param i32 i32) (result i32)
+    (local $h i32)
+    ;; Arg 0 is an object: count(4), tag(1), id(32).
+    (drop (call $cdread (i32.const 256) (i32.const 5) (i32.const 32)))
+    (local.set $h (call $borrow (i32.const 256) (i32.const 1)))
+    (drop (call $mutate (local.get $h) (i32.const 224) (i32.const 16)))
+    (drop (call $id (local.get $h) (i32.const 520)))
+    (call $ret (i32.const 512) (i32.const 40))
+    i32.const 0)
+  (func (export "__petal_sink_counter") (param i32 i32) (result i32)
+    (local $h i32)
+    ;; Arg 0 is an object: count(4), tag(1), id(32).
+    (drop (call $cdread (i32.const 256) (i32.const 5) (i32.const 32)))
+    (local.set $h (call $borrow (i32.const 256) (i32.const 0)))
+    i32.const 0)
+  (func (export "__petal_fail_after_counter") (param i32 i32) (result i32)
+    (local $h i32)
+    ;; Arg 0 is an object: count(4), tag(1), id(32).
+    (drop (call $cdread (i32.const 256) (i32.const 5) (i32.const 32)))
+    (local.set $h (call $borrow (i32.const 256) (i32.const 0)))
+    (call $revert (i32.const 240) (i32.const 13))
+    i32.const 0)
   (func (export "__petal_fail_counter") (param i32 i32) (result i32)
-    (call $revert (i32.const 224) (i32.const 13))
+    (call $revert (i32.const 240) (i32.const 13))
     i32.const 0)
   (func (export "__petal_counter_value") (param i32 i32) (result i32)
     (local $h i32)
@@ -2625,6 +2704,7 @@ async fn exercise_live_petal_vfs_mount(
     let counter_endpoint = mount_dir.join("petals/dex/view-probe/counter_value");
     let set_counter_endpoint = mount_dir.join("petals/dex/view-probe/set_counter");
     let fail_counter_endpoint = mount_dir.join("petals/dex/view-probe/fail_counter");
+    let pipe_endpoint = mount_dir.join("petals/.pipe");
     let wait_deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.try_wait().context("poll bloom serve --mount")? {
@@ -2642,6 +2722,7 @@ async fn exercise_live_petal_vfs_mount(
             && counter_endpoint.exists()
             && set_counter_endpoint.exists()
             && fail_counter_endpoint.exists()
+            && pipe_endpoint.exists()
         {
             break;
         }
@@ -2822,8 +2903,113 @@ async fn exercise_live_petal_vfs_mount(
         );
     }
 
+    let counter_after_set = ls_objects_by_type(&clients[0], "Counter")
+        .await?
+        .into_iter()
+        .find(|obj| json_str(obj, "id").ok() == Some(counter_id.as_str()))
+        .ok_or_else(|| anyhow!("counter disappeared before pipe composition"))?;
+    let counter_version_after_set = object_version(&counter_after_set)?;
+    let pipe_success_expr = format!(
+        "{PETAL_VFS_PROBE_PATH}/set_counter_99_ret obj:{counter_id}@{counter_version_after_set} \
+         | {PETAL_VFS_PROBE_PATH}/sink_counter"
+    );
+    let pipe_success = run_mounted_petal_endpoint_raw_stdin(
+        &pipe_endpoint,
+        &short_home,
+        &rpc,
+        &path_env,
+        &[
+            "--gas-budget".to_string(),
+            PTB_GAS_BUDGET.to_string(),
+            "--fuel-limit".to_string(),
+            "10000000".to_string(),
+        ],
+        Some(&pipe_success_expr),
+    )?;
+    if !pipe_success.status.success() {
+        bail!(
+            "mounted pipe composition unexpectedly failed:\nexpr={pipe_success_expr}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&pipe_success.stdout),
+            String::from_utf8_lossy(&pipe_success.stderr)
+        );
+    }
+    assert_pipe_ndjson_commands("mounted pipe success", &pipe_success.stdout, 2)?;
+    let latest = current_height(&clients[0]).await?;
+    wait_all_reach_height(clients, latest).await?;
+
+    let mounted_after_pipe = run_mounted_petal_endpoint(
+        &counter_endpoint,
+        &short_home,
+        &rpc,
+        &path_env,
+        Some(serde_json::json!({
+            "args": [{ "kind": "object", "id": counter_id }],
+            "fuel_limit": 1_000_000u64,
+        })),
+    )?;
+    let after_pipe_value = first_view_u128_return(&mounted_after_pipe)?;
+    if after_pipe_value != 99 {
+        bail!("mounted pipe composition did not mutate counter to 99: {mounted_after_pipe}");
+    }
+
+    let counter_after_pipe = ls_objects_by_type(&clients[0], "Counter")
+        .await?
+        .into_iter()
+        .find(|obj| json_str(obj, "id").ok() == Some(counter_id.as_str()))
+        .ok_or_else(|| anyhow!("counter disappeared before reverting pipe composition"))?;
+    let counter_version_after_pipe = object_version(&counter_after_pipe)?;
+    let pipe_revert_expr = format!(
+        "{PETAL_VFS_PROBE_PATH}/set_counter_123_ret obj:{counter_id}@{counter_version_after_pipe} \
+         | {PETAL_VFS_PROBE_PATH}/fail_after_counter"
+    );
+    let pipe_revert = run_mounted_petal_endpoint_raw_stdin(
+        &pipe_endpoint,
+        &short_home,
+        &rpc,
+        &path_env,
+        &[
+            "--gas-budget".to_string(),
+            PTB_GAS_BUDGET.to_string(),
+            "--fuel-limit".to_string(),
+            "10000000".to_string(),
+        ],
+        Some(&pipe_revert_expr),
+    )?;
+    if pipe_revert.status.success() {
+        bail!(
+            "mounted reverting pipe composition unexpectedly succeeded:\nexpr={pipe_revert_expr}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&pipe_revert.stdout),
+            String::from_utf8_lossy(&pipe_revert.stderr)
+        );
+    }
+    assert_pipe_ndjson_commands("mounted pipe revert", &pipe_revert.stdout, 2)?;
+    let pipe_revert_stderr = String::from_utf8_lossy(&pipe_revert.stderr);
+    if !pipe_revert_stderr.contains("petal call reverted")
+        || !pipe_revert_stderr.contains("forced revert")
+    {
+        bail!("mounted pipe revert stderr did not include revert reason: {pipe_revert_stderr}");
+    }
+    let latest = current_height(&clients[0]).await?;
+    wait_all_reach_height(clients, latest).await?;
+    let mounted_after_revert_pipe = run_mounted_petal_endpoint(
+        &counter_endpoint,
+        &short_home,
+        &rpc,
+        &path_env,
+        Some(serde_json::json!({
+            "args": [{ "kind": "object", "id": counter_id }],
+            "fuel_limit": 1_000_000u64,
+        })),
+    )?;
+    let after_revert_pipe_value = first_view_u128_return(&mounted_after_revert_pipe)?;
+    if after_revert_pipe_value != 99 {
+        bail!(
+            "mounted reverting pipe composition partially mutated state: {mounted_after_revert_pipe}"
+        );
+    }
+
     eprintln!(
-        "[petals-vfs] mounted counter endpoint mutated state and stale replay failed: {before_value} -> {after_value}"
+        "[petals-vfs] mounted counter endpoint and pipe composition mutated atomically: {before_value} -> {after_value} -> {after_pipe_value}"
     );
     stop_child(&mut child);
     let _ = std::fs::remove_file(&short_home);
@@ -2951,6 +3137,65 @@ fn run_mounted_petal_endpoint_raw(
         .wait_with_output()
         .context("wait for mounted petal endpoint")?;
     Ok(out)
+}
+
+fn run_mounted_petal_endpoint_raw_stdin(
+    endpoint: &Path,
+    home: &Path,
+    rpc: &str,
+    path_env: &std::ffi::OsStr,
+    argv: &[String],
+    stdin_text: Option<&str>,
+) -> Result<std::process::Output> {
+    let mut cmd = Command::new(endpoint);
+    cmd.env("BLOOM_HOME", home)
+        .env("BLOOM_RPC_TCP", rpc)
+        .env("PATH", path_env)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.args(argv);
+    if stdin_text.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
+    let mut child = cmd.spawn().context("spawn mounted petal endpoint")?;
+    if let Some(stdin_text) = stdin_text {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("mounted endpoint stdin was not piped"))?;
+        stdin
+            .write_all(stdin_text.as_bytes())
+            .context("write mounted endpoint stdin text")?;
+    }
+    child
+        .wait_with_output()
+        .context("wait for mounted petal endpoint")
+}
+
+fn assert_pipe_ndjson_commands(label: &str, stdout: &[u8], expected_commands: u64) -> Result<()> {
+    let text = std::str::from_utf8(stdout).with_context(|| format!("{label} stdout utf8"))?;
+    let mut lines = text.lines();
+    let header_line = lines
+        .next()
+        .ok_or_else(|| anyhow!("{label} missing PTB header line"))?;
+    let header: Value = serde_json::from_str(header_line)
+        .with_context(|| format!("{label} parse PTB header line: {header_line}"))?;
+    if header.get("kind").and_then(Value::as_str) != Some("ptb")
+        || header.get("commands").and_then(Value::as_u64) != Some(expected_commands)
+    {
+        bail!("{label} unexpected PTB header: {header}");
+    }
+    let command_lines = lines
+        .map(|line| serde_json::from_str::<Value>(line).map_err(anyhow::Error::from))
+        .collect::<Result<Vec<_>>>()?;
+    if command_lines.len() != expected_commands as usize
+        || command_lines
+            .iter()
+            .any(|line| line.get("kind").and_then(Value::as_str) != Some("command"))
+    {
+        bail!("{label} unexpected command lines: {command_lines:?}");
+    }
+    Ok(())
 }
 
 fn parse_json_command_output(label: &str, out: std::process::Output) -> Result<Value> {

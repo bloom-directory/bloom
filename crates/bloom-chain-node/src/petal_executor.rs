@@ -181,6 +181,11 @@ fn validate_chain_petal_module_path(module_path: &str) -> Result<(), String> {
             ));
         }
     }
+    if suffix.split('/').next() == Some(".pipe") {
+        return Err(format!(
+            "module_path '{module_path}' reserves /bloom/petals/.pipe for composition"
+        ));
+    }
     Ok(())
 }
 
@@ -1307,6 +1312,8 @@ mod tests {
         for path in [
             "/bloom/dex/pool",
             "/bloom/petals/",
+            "/bloom/petals/.pipe",
+            "/bloom/petals/.pipe/child",
             "/bloom/petals/dex/pool/",
             "/bloom/petals/dex//pool",
             "/bloom/petals/dex/./pool",
