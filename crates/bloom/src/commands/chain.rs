@@ -1135,7 +1135,7 @@ fn dry_run_plan_json(
     endpoint: &str,
 ) -> Result<serde_json::Value> {
     let mut value: serde_json::Value = serde_json::from_str(
-        &crate::commands::pipe::receipt_ndjson(plan)
+        crate::commands::pipe::receipt_ndjson(plan)
             .lines()
             .next()
             .unwrap_or("{}"),

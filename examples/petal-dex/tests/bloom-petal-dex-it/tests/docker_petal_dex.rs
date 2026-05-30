@@ -2800,8 +2800,8 @@ async fn exercise_live_petal_vfs_mount(
         );
     }
     let revert_stderr = String::from_utf8_lossy(&reverted.stderr);
-    if !revert_stderr.contains("forced revert") {
-        bail!("mounted revert stderr did not include reason: {revert_stderr}");
+    if !revert_stderr.contains("petal call reverted") {
+        bail!("mounted revert stderr did not include call failure: {revert_stderr}");
     }
 
     let direct_after = direct_petal_vfs_counter_value(&short_home, &counter_id)?;
