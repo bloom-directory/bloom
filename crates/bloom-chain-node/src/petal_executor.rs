@@ -175,15 +175,47 @@ fn validate_chain_petal_module_path(module_path: &str) -> Result<(), String> {
         ));
     }
     for segment in suffix.split('/') {
-        if segment.is_empty() || segment == "." || segment == ".." {
-            return Err(format!(
-                "module_path '{module_path}' contains non-canonical path segment"
-            ));
-        }
+        validate_chain_petal_vfs_segment(module_path, segment)?;
     }
-    if suffix.split('/').next() == Some(".pipe") {
+    let first = suffix.split('/').next();
+    if first == Some(".pipe") {
         return Err(format!(
             "module_path '{module_path}' reserves /bloom/petals/.pipe for composition"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_chain_petal_vfs_segment(module_path: &str, segment: &str) -> Result<(), String> {
+    if segment.is_empty()
+        || segment == "."
+        || segment == ".."
+        || segment.contains('\\')
+        || segment.contains('\0')
+    {
+        return Err(format!(
+            "module_path '{module_path}' contains VFS-invalid path segment"
+        ));
+    }
+    if segment == "page" {
+        return Err(format!(
+            "module_path '{module_path}' reserves 'page' for VFS pagination"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_chain_petal_function_segment(function: &str) -> Result<(), String> {
+    if function.is_empty()
+        || function == "."
+        || function == ".."
+        || function == "page"
+        || function.contains('/')
+        || function.contains('\\')
+        || function.contains('\0')
+    {
+        return Err(format!(
+            "petal function '{function}' is not addressable as a VFS path segment"
         ));
     }
     Ok(())
@@ -264,6 +296,7 @@ fn validate_manifest_wasm_abi(
     }
 
     for f in &manifest.functions {
+        validate_chain_petal_function_segment(&f.name)?;
         validate_export_abi(
             &format!("__petal_{}", f.name),
             &exports,
@@ -1314,6 +1347,10 @@ mod tests {
             "/bloom/petals/",
             "/bloom/petals/.pipe",
             "/bloom/petals/.pipe/child",
+            "/bloom/petals/page",
+            "/bloom/petals/dex/page",
+            "/bloom/petals/dex\\pool",
+            "/bloom/petals/dex/\0pool",
             "/bloom/petals/dex/pool/",
             "/bloom/petals/dex//pool",
             "/bloom/petals/dex/./pool",
@@ -1322,6 +1359,18 @@ mod tests {
             assert!(
                 validate_chain_petal_module_path(path).is_err(),
                 "{path} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn chain_petal_function_names_must_be_vfs_segments() {
+        validate_chain_petal_function_segment("swap_exact_in").unwrap();
+
+        for function in ["", ".", "..", "page", "foo/bar", "foo\\bar", "foo\0bar"] {
+            assert!(
+                validate_chain_petal_function_segment(function).is_err(),
+                "{function:?} should be rejected"
             );
         }
     }

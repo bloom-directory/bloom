@@ -36,6 +36,7 @@ pub async fn select_loom_gas_payer_rpc(
             .as_array()
             .context("chain_ls_objects returned non-array")?,
         &coin_type,
+        signer,
         min_amount,
     )
 }
@@ -43,10 +44,17 @@ pub async fn select_loom_gas_payer_rpc(
 pub fn select_loom_gas_payer_from_object_json(
     objects: &[serde_json::Value],
     coin_type: &TypeTag,
+    signer: [u8; 32],
     min_amount: u128,
 ) -> Result<ObjectId> {
     let mut best: Option<(u128, ObjectId)> = None;
+    let signer_hex = hex::encode(signer);
     for value in objects {
+        if value.get("owner_kind").and_then(|v| v.as_str()) != Some("address")
+            || value.get("owner_addr").and_then(|v| v.as_str()) != Some(signer_hex.as_str())
+        {
+            continue;
+        }
         let Some(bytes_hex) = value.get("bytes").and_then(|v| v.as_str()) else {
             continue;
         };
@@ -57,6 +65,9 @@ pub fn select_loom_gas_payer_from_object_json(
             continue;
         };
         if obj.type_tag != *coin_type {
+            continue;
+        }
+        if obj.owner != bloom_objects::Owner::Address(signer) {
             continue;
         }
         let Some(amount) = decode_coin_value(&obj.payload) else {
@@ -90,37 +101,67 @@ mod tests {
     use bloom_objects::{Object, Owner};
     use bloom_script::{DEFAULT_FUNGIBLE_PETAL_HASH, loom_coin_type_tag};
 
-    fn coin_object(id_byte: u8, amount: u128) -> Object {
+    fn coin_object(id_byte: u8, owner: Owner, amount: u128) -> Object {
         let mut payload = vec![0u8; 32];
         payload.extend_from_slice(&amount.to_be_bytes());
         Object {
             id: ObjectId([id_byte; 32]),
             type_tag: loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
-            owner: Owner::Address([0xAA; 32]),
+            owner,
             version: 0,
             payload,
         }
     }
 
+    fn object_json(obj: Object) -> serde_json::Value {
+        let (owner_kind, owner_addr) = match &obj.owner {
+            Owner::Address(addr) => ("address", Some(hex::encode(addr))),
+            Owner::Object(id) => ("object", Some(hex::encode(id.0))),
+            Owner::Shared => ("shared", None),
+            Owner::Immutable => ("immutable", None),
+        };
+        serde_json::json!({
+            "owner_kind": owner_kind,
+            "owner_addr": owner_addr,
+            "bytes": hex::encode(obj.encode_canonical().unwrap()),
+        })
+    }
+
     #[test]
     fn selects_largest_covering_loom_coin() {
         let coin_type = loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH);
+        let signer = [0xAA; 32];
         let objects = vec![
-            serde_json::json!({ "bytes": hex::encode(coin_object(1, 50).encode_canonical().unwrap()) }),
-            serde_json::json!({ "bytes": hex::encode(coin_object(2, 500).encode_canonical().unwrap()) }),
-            serde_json::json!({ "bytes": hex::encode(coin_object(3, 300).encode_canonical().unwrap()) }),
+            object_json(coin_object(1, Owner::Address(signer), 50)),
+            object_json(coin_object(2, Owner::Address(signer), 500)),
+            object_json(coin_object(3, Owner::Address(signer), 300)),
         ];
-        let selected = select_loom_gas_payer_from_object_json(&objects, &coin_type, 100).unwrap();
+        let selected =
+            select_loom_gas_payer_from_object_json(&objects, &coin_type, signer, 100).unwrap();
+        assert_eq!(selected, ObjectId([2; 32]));
+    }
+
+    #[test]
+    fn ignores_object_owned_coin_even_when_owner_id_matches_signer() {
+        let coin_type = loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH);
+        let signer = [0xAA; 32];
+        let objects = vec![
+            object_json(coin_object(1, Owner::Object(ObjectId(signer)), 1_000)),
+            object_json(coin_object(2, Owner::Address(signer), 200)),
+        ];
+
+        let selected =
+            select_loom_gas_payer_from_object_json(&objects, &coin_type, signer, 100).unwrap();
         assert_eq!(selected, ObjectId([2; 32]));
     }
 
     #[test]
     fn errors_when_no_loom_coin_covers_budget() {
         let coin_type = loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH);
-        let objects = vec![
-            serde_json::json!({ "bytes": hex::encode(coin_object(1, 50).encode_canonical().unwrap()) }),
-        ];
-        let err = select_loom_gas_payer_from_object_json(&objects, &coin_type, 100).unwrap_err();
+        let signer = [0xAA; 32];
+        let objects = vec![object_json(coin_object(1, Owner::Address(signer), 50))];
+        let err =
+            select_loom_gas_payer_from_object_json(&objects, &coin_type, signer, 100).unwrap_err();
         assert!(
             err.to_string()
                 .contains("no signer-owned Coin<LOOM> gas payer covers budget 100"),

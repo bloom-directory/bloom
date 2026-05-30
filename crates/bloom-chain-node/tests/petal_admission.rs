@@ -402,3 +402,79 @@ fn deploy_reserved_pipe_path_fails_without_writes() {
         );
     }
 }
+
+#[test]
+fn deploy_reserved_page_path_fails_without_writes() {
+    for path in ["/bloom/petals/page", "/bloom/petals/dex/page"] {
+        let mut state = State::new();
+        let out = ChainPetalExecutor.execute_tx(
+            &deploy_tx(wasm_with_manifest(path)),
+            &mut state,
+            1,
+            1_700_000_000_000,
+            Address([0xAA; 32]),
+            Hash32([0; 32]),
+        );
+
+        assert!(!out.success, "{path} should fail admission");
+        assert!(out.write_set.is_none(), "{path} should not emit writes");
+        assert!(state.vfs_lookup(path).is_none());
+        assert!(
+            String::from_utf8_lossy(&out.return_data).contains("page"),
+            "unexpected error for {path}: {}",
+            String::from_utf8_lossy(&out.return_data)
+        );
+    }
+}
+
+#[test]
+fn deploy_vfs_invalid_path_segment_fails_without_writes() {
+    for path in ["/bloom/petals/dex\\pool", "/bloom/petals/dex/\0pool"] {
+        let mut state = State::new();
+        let out = ChainPetalExecutor.execute_tx(
+            &deploy_tx(wasm_with_manifest(path)),
+            &mut state,
+            1,
+            1_700_000_000_000,
+            Address([0xAA; 32]),
+            Hash32([0; 32]),
+        );
+
+        assert!(!out.success, "{path:?} should fail admission");
+        assert!(out.write_set.is_none(), "{path:?} should not emit writes");
+        assert!(state.vfs_lookup(path).is_none());
+        assert!(
+            String::from_utf8_lossy(&out.return_data).contains("VFS-invalid"),
+            "unexpected error for {path:?}: {}",
+            String::from_utf8_lossy(&out.return_data)
+        );
+    }
+}
+
+#[test]
+fn deploy_vfs_invalid_function_name_fails_without_writes() {
+    let path = "/bloom/petals/dex/bad-function";
+    for function in ["foo/bar", "foo\\bar", "foo\0bar", "page"] {
+        let mut state = State::new();
+        let out = ChainPetalExecutor.execute_tx(
+            &deploy_tx(wasm_with_function_manifest_missing_export(path, function)),
+            &mut state,
+            1,
+            1_700_000_000_000,
+            Address([0xAA; 32]),
+            Hash32([0; 32]),
+        );
+
+        assert!(!out.success, "{function:?} should fail admission");
+        assert!(
+            out.write_set.is_none(),
+            "{function:?} should not emit writes"
+        );
+        assert!(state.vfs_lookup(path).is_none());
+        assert!(
+            String::from_utf8_lossy(&out.return_data).contains("VFS path segment"),
+            "unexpected error for {function:?}: {}",
+            String::from_utf8_lossy(&out.return_data)
+        );
+    }
+}

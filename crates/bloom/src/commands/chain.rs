@@ -683,7 +683,8 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             }
             let receipt =
                 poll_tx_receipt(&client, &tx_hash, std::time::Duration::from_secs(30)).await?;
-            print!("{plan_receipt}");
+            let out = chain_pipe_submission_ndjson(&plan_receipt, &tx_hash, &receipt);
+            print!("{out}");
             ensure_success_receipt(&receipt)?;
             Ok(())
         }
@@ -1292,6 +1293,33 @@ fn dry_run_plan_json(
     value["dry_run"] = serde_json::Value::Bool(true);
     value["endpoint"] = serde_json::Value::String(endpoint.to_string());
     Ok(value)
+}
+
+fn chain_pipe_submission_ndjson(
+    plan_receipt: &str,
+    tx_hash: &bloom_chain_types::types::Hash32,
+    receipt: &serde_json::Value,
+) -> String {
+    let tx_hash_hex = format!("0x{}", hex::encode(tx_hash.0));
+    let mut out = plan_receipt.to_string();
+    out.push_str(
+        &json!({
+            "kind": "submit",
+            "tx_hash": tx_hash_hex,
+        })
+        .to_string(),
+    );
+    out.push('\n');
+    out.push_str(
+        &json!({
+            "kind": "receipt",
+            "tx_hash": tx_hash_hex,
+            "receipt": receipt,
+        })
+        .to_string(),
+    );
+    out.push('\n');
+    out
 }
 
 fn tx_hash_json(tx_hash: &bloom_chain_types::types::Hash32) -> serde_json::Value {
@@ -2337,6 +2365,24 @@ allocations = []
 
         let receipt = crate::commands::pipe::receipt_ndjson(&plan);
         assert_eq!(receipt.lines().count(), 4);
+    }
+
+    #[test]
+    fn chain_pipe_submission_output_appends_submit_and_receipt_lines() {
+        let plan_receipt = "{\"kind\":\"ptb\"}\n{\"kind\":\"command\"}\n";
+        let tx_hash = bloom_chain_types::types::Hash32([0xAB; 32]);
+        let receipt = serde_json::json!({ "success": false, "return_text": "nope" });
+        let out = chain_pipe_submission_ndjson(plan_receipt, &tx_hash, &receipt);
+        let lines = out
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[2]["kind"], "submit");
+        assert_eq!(lines[2]["tx_hash"], format!("0x{}", hex::encode(tx_hash.0)));
+        assert_eq!(lines[3]["kind"], "receipt");
+        assert_eq!(lines[3]["receipt"], receipt);
     }
 
     #[test]

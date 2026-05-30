@@ -167,19 +167,21 @@ impl Drop for NfsMountHandle {
         let already = *self.unmounted.lock();
         if !already {
             let mp = self.mount_path.clone();
-            let attempts = unmount_attempts(&mp);
-            let Some((cmd_name, args)) = attempts.last() else {
-                return;
-            };
-            if let Err(e) = std::process::Command::new(cmd_name)
-                .args(args)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
+            let mount_path_display = mp.display().to_string();
+            if std::thread::Builder::new()
+                .name("bloom-nfs-drop-umount".to_string())
+                .spawn(move || {
+                    if let Err(e) =
+                        run_command_attempts(unmount_attempts(&mp), UMOUNT_COMMAND_TIMEOUT)
+                    {
+                        warn!(mount_path = %mount_path_display, error = %e, "mount.drop.umount_failed");
+                    }
+                })
+                .is_err()
             {
-                warn!(mount_path = %mp.display(), error = %e, "mount.drop.umount_spawn_failed");
+                warn!(mount_path = %self.mount_path.display(), "mount.drop.umount_thread_spawn_failed");
             } else {
-                debug!(mount_path = %mp.display(), "mount.drop.umount_dispatched");
+                debug!(mount_path = %self.mount_path.display(), "mount.drop.umount_dispatched");
             }
         }
         if let Some(task) = self.server_task.lock().take() {

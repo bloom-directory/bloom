@@ -76,7 +76,7 @@ impl PetalsEndpointHandler {
         manifest
             .functions
             .iter()
-            .find(|f| f.name == *function)
+            .find(|f| f.name == *function && is_endpoint_segment(&f.name))
             .map(|f| (binding, function.clone(), f.view))
     }
 
@@ -107,7 +107,11 @@ impl PetalsEndpointHandler {
         if let Some(binding) = self.binding_at(&bindings, rel)
             && let Some(manifest) = self.manifest_for(binding)
         {
-            for function in &manifest.functions {
+            for function in manifest
+                .functions
+                .iter()
+                .filter(|function| is_endpoint_segment(&function.name))
+            {
                 by_name
                     .entry(function.name.clone())
                     .or_insert_with(|| Entry::executable_file(&function.name));
@@ -162,7 +166,11 @@ impl PetalsEndpointHandler {
         if let Some(binding) = self.binding_at(&bindings, rel)
             && let Some(manifest) = self.manifest_for(binding)
         {
-            for function in &manifest.functions {
+            for function in manifest
+                .functions
+                .iter()
+                .filter(|function| is_endpoint_segment(&function.name))
+            {
                 by_name
                     .entry(function.name.clone())
                     .or_insert_with(|| Entry::executable_file(&function.name));
@@ -201,6 +209,16 @@ fn split_page_path(segs: &[String]) -> Option<(&[String], Option<usize>)> {
     None
 }
 
+fn is_endpoint_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && segment != "page"
+        && !segment.contains('/')
+        && !segment.contains('\\')
+        && !segment.contains('\0')
+}
+
 #[async_trait]
 impl Handler for PetalsEndpointHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
@@ -212,8 +230,10 @@ impl Handler for PetalsEndpointHandler {
             return Ok(Entry::executable_file(PIPE_NODE));
         }
         if let Some((parent, Some(_))) = split_page_path(segs) {
-            let _ = self.entries_for_unpaged(parent)?;
-            return Ok(Entry::dir(segs.last().expect("page path has leaf")));
+            let total = self.entries_for_unpaged(parent)?.len();
+            if paginate::is_paged(total) {
+                return Ok(Entry::dir(segs.last().expect("page path has leaf")));
+            }
         }
         if matches!(segs.last().map(String::as_str), Some("page")) {
             let parent = &segs[..segs.len() - 1];
@@ -259,10 +279,15 @@ impl Handler for PetalsEndpointHandler {
         if matches!(segs.last().map(String::as_str), Some("page")) {
             let parent = &segs[..segs.len() - 1];
             let total = self.entries_for_unpaged(parent)?.len();
-            return Ok(paginate::page_indices(total));
+            if paginate::is_paged(total) {
+                return Ok(paginate::page_indices(total));
+            }
         }
         if let Some((parent, Some(index))) = split_page_path(segs) {
-            return self.page_entries_for(parent, index);
+            let total = self.entries_for_unpaged(parent)?.len();
+            if paginate::is_paged(total) {
+                return self.page_entries_for(parent, index);
+            }
         }
         if split_page_path(segs).is_some() {
             return Err(HandlerError::not_found(path.to_string_path()));
@@ -414,6 +439,59 @@ mod tests {
         let page = h.list(&vpath("page/000000")).await.unwrap();
         assert!(!page.iter().any(|entry| entry.name == ".pipe"));
         assert!(page.iter().all(|entry| entry.name.starts_with('p')));
+    }
+
+    #[tokio::test]
+    async fn page_segment_is_only_pagination_when_parent_is_paged() {
+        let chain = Arc::new(MockChain::default());
+        chain.bind(
+            "/bloom/petals/dex/page",
+            Hash32([1; 32]),
+            manifest("/bloom/petals/dex/page"),
+        );
+        let h = PetalsEndpointHandler::new(chain);
+
+        let dex = h.list(&vpath("dex")).await.unwrap();
+        assert_eq!(
+            dex.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["page"]
+        );
+
+        let page = h.list(&vpath("dex/page")).await.unwrap();
+        assert_eq!(
+            page.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["quote", "swap"]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_function_segments_are_not_exposed() {
+        let chain = Arc::new(MockChain::default());
+        chain.bind(
+            "/bloom/petals/dex/pool",
+            Hash32([1; 32]),
+            PetalManifestStub {
+                module_path: "/bloom/petals/dex/pool".to_string(),
+                functions: vec![
+                    func("quote", true),
+                    func("foo/bar", true),
+                    func("foo\\bar", true),
+                    func("page", true),
+                ],
+                ..Default::default()
+            },
+        );
+        let h = PetalsEndpointHandler::new(chain);
+
+        let pool = h.list(&vpath("dex/pool")).await.unwrap();
+        assert_eq!(
+            pool.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["quote"]
+        );
+        assert!(matches!(
+            h.lookup(&vpath("dex/pool/page")).await,
+            Err(HandlerError::NotFound(_))
+        ));
     }
 
     #[tokio::test]
