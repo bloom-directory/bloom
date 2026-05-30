@@ -69,12 +69,53 @@ teardown() {
     TEARDOWN_RAN=1
     local log_dir="${BLOOM_DOCKER_LOG_DIR:-/tmp/bloom-petal-dex-run}"
     mkdir -p "$log_dir" || true
+    {
+        printf 'exit_code=%s\n' "$rc"
+        printf 'tmpdir=%s\n' "$BLOOM_DOCKER_TMPDIR"
+        printf 'repo=%s\n' "$REPO_ROOT"
+        printf 'compose_file=%s\n' "$COMPOSE_FILE"
+        printf 'petal_vfs_only=%s\n' "${BLOOM_DOCKER_PETAL_VFS_ONLY:-0}"
+    } >"$log_dir/run.env" 2>&1 || true
+    (cd "$REPO_ROOT" && "${DC[@]}" -f "$COMPOSE_FILE" ps --all) \
+        >"$log_dir/docker-compose-ps.txt" 2>&1 || true
     for i in $(seq 0 $((BLOOM_VALIDATOR_COUNT - 1))); do
         name="bloom-val$i"
         docker logs "$name" >"$log_dir/val$i.log" 2>&1 || true
+        docker inspect "$name" >"$log_dir/$name.inspect.json" 2>&1 || true
+        {
+            printf '=== docker health status ===\n'
+            docker inspect --format='{{.State.Health.Status}}' "$name" 2>&1 || true
+            printf '\n=== chain health ===\n'
+            docker exec "$name" /bin/sh -lc \
+                'BLOOM_RPC_TCP=127.0.0.1:8545 /usr/local/bin/bloom --home /home/bloom chain health' \
+                2>&1 || true
+            printf '\n=== chain validators ===\n'
+            docker exec "$name" /bin/sh -lc \
+                'BLOOM_RPC_TCP=127.0.0.1:8545 /usr/local/bin/bloom --home /home/bloom chain ls-validators' \
+                2>&1 || true
+        } >"$log_dir/$name.health.txt" 2>&1 || true
+        chain_dir="$BLOOM_DOCKER_TMPDIR/home$i/chain"
+        if [ -d "$chain_dir" ]; then
+            mkdir -p "$log_dir/home$i" || true
+            cp "$chain_dir/genesis.toml" "$log_dir/home$i/genesis.toml" 2>/dev/null || true
+            cp "$chain_dir/config.toml" "$log_dir/home$i/config.toml" 2>/dev/null || true
+        fi
     done
     log "captured per-validator logs to $log_dir/val{0..$((BLOOM_VALIDATOR_COUNT - 1))}.log"
     if [ "$rc" -ne 0 ]; then
+        {
+            printf '=== docker compose ps ===\n'
+            cat "$log_dir/docker-compose-ps.txt" 2>/dev/null || true
+            for i in $(seq 0 $((BLOOM_VALIDATOR_COUNT - 1))); do
+                printf '\n=== bloom-val%s health ===\n' "$i"
+                cat "$log_dir/bloom-val$i.health.txt" 2>/dev/null || true
+                printf '\n=== bloom-val%s recent consensus warnings/errors ===\n' "$i"
+                grep -E 'ERROR|WARN|fatal|rejected|invalid|block\.committed|sync\.block_applied|consensus\.timeout|frame\.(proposal|vote)' \
+                    "$log_dir/val$i.log" 2>/dev/null | tail -n 160 || true
+            done
+        } >"$log_dir/failure-summary.txt" 2>&1 || true
+        log "test failed (exit $rc) — dumping failure summary"
+        sed 's/^/[docker-debug] /' "$log_dir/failure-summary.txt" || true
         log "test failed (exit $rc) — dumping recent compose logs"
         (cd "$REPO_ROOT" && "${DC[@]}" -f "$COMPOSE_FILE" logs --tail=600) \
             2>&1 | sed 's/^/[compose-logs] /' || true
