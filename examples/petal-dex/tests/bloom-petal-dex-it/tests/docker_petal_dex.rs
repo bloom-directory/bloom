@@ -57,7 +57,7 @@ use bloom_script::{
 use bloom_petal_dex_it::dex_harness::{
     append_manifest_section, build_faucet_wasm, build_pool_wasm, build_router_wasm,
     build_wallet_wasm, erased_type_tag, petal_hash_of, ptb_decode_coin_value, ptb_signer_pubkey,
-    ptb_signer_pubkey_hex, sign_and_encode_ptb, wat_to_wasm,
+    ptb_signer_pubkey_hex, ptb_signer_xdsa_pubkey, sign_and_encode_ptb, wat_to_wasm,
 };
 
 // ---------------------------------------------------------------------------
@@ -101,6 +101,17 @@ async fn docker_petal_dex_acceptance() -> Result<()> {
     Box::pin(docker_petal_dex_acceptance_inner()).await
 }
 
+#[test]
+fn prints_ptb_signer_registry_entry_for_docker_script() {
+    use base64::Engine as _;
+
+    println!("PTB_SIGNER_PK_HEX={}", ptb_signer_pubkey_hex());
+    println!(
+        "PTB_SIGNER_PUBKEY_B64={}",
+        base64::engine::general_purpose::STANDARD.encode(ptb_signer_xdsa_pubkey().0)
+    );
+}
+
 async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     let tmpdir = compose_tmpdir()?;
     let home0 = tmpdir.join("home0");
@@ -141,11 +152,11 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
 
     // ── 2. Build the petal wasms + deploy each via the bloom CLI ──────────
     eprintln!();
-    eprintln!("[build] compiling pool/wallet/faucet/router to wasm32-unknown-unknown");
-    let pool_wasm_path = build_pool_wasm();
-    let wallet_wasm_path = build_wallet_wasm();
-    let faucet_wasm_path = build_faucet_wasm();
-    let router_wasm_path = build_router_wasm();
+    eprintln!("[build] resolving pool/wallet/faucet/router wasm artifacts");
+    let pool_wasm_path = docker_petal_wasm_path("bloom_petal_dex_pool", build_pool_wasm)?;
+    let wallet_wasm_path = docker_petal_wasm_path("bloom_petal_dex_wallet", build_wallet_wasm)?;
+    let faucet_wasm_path = docker_petal_wasm_path("bloom_petal_dex_faucet", build_faucet_wasm)?;
+    let router_wasm_path = docker_petal_wasm_path("bloom_petal_dex_router", build_router_wasm)?;
     let view_probe_wasm_path = tmpdir.join("petal-vfs-view-probe.wasm");
     std::fs::write(&view_probe_wasm_path, view_probe_wasm()).context("write view probe wasm")?;
 
@@ -2618,6 +2629,20 @@ fn bloom_bin() -> PathBuf {
     PathBuf::from(manifest_dir).join("../../../../target/release/bloom")
 }
 
+fn docker_petal_wasm_path(stem: &str, build: fn() -> PathBuf) -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var("BLOOM_DOCKER_PREBUILT_WASM_DIR") {
+        let path = PathBuf::from(dir).join(format!("{stem}.wasm"));
+        if path.exists() {
+            return Ok(path);
+        }
+        bail!(
+            "BLOOM_DOCKER_PREBUILT_WASM_DIR was set, but {} is missing",
+            path.display()
+        );
+    }
+    Ok(build())
+}
+
 /// `bloom chain deploy <wasm> --wait` from `home`, dialing the validator at
 /// `127.0.0.1:<port>` via `BLOOM_RPC_TCP`.
 fn deploy_petal(home: &std::path::Path, port: u16, wasm: &std::path::Path) -> Result<()> {
@@ -2985,9 +3010,11 @@ async fn exercise_live_petal_vfs_mount(
     assert_pipe_ndjson_commands("mounted pipe revert", &pipe_revert.stdout, 2)?;
     let pipe_revert_stderr = String::from_utf8_lossy(&pipe_revert.stderr);
     if !pipe_revert_stderr.contains("petal call reverted")
-        || !pipe_revert_stderr.contains("forced revert")
+        || !pipe_revert_stderr.contains("petal abort in command 1")
     {
-        bail!("mounted pipe revert stderr did not include revert reason: {pipe_revert_stderr}");
+        bail!(
+            "mounted pipe revert stderr did not include command-level revert: {pipe_revert_stderr}"
+        );
     }
     let latest = current_height(&clients[0]).await?;
     wait_all_reach_height(clients, latest).await?;

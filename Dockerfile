@@ -71,25 +71,33 @@ RUN rustup target add wasm32-unknown-unknown
 # copied out by the docker acceptance script for host-side VFS mount commands.
 RUN cargo build --release -p bloom --all-features
 
+# Docker acceptance driver. Build it in the image so CI does not compile the
+# same test graph again on the host after the image build has already run.
+RUN cargo test --release -p bloom-petal-dex-it --test docker_petal_dex --no-run
+
 # DEX petal wasm artefacts. Build each petal in its own `cargo build`
 # invocation because sibling petals use `features = ["no-entrypoint"]` when
 # imported as rlib dependencies; a single multi-package build would unify those
 # features and can suppress a root petal's exported entrypoints.
 RUN cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-pool
 RUN cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-wallet
-RUN cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-faucet
+RUN BLOOM_DEX_FAUCET_ADMIN_HEX=6252e10b0fae9107bdf13f3dfe482e81099df4ef93e7373516f94b7fde3da72f \
+    cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-faucet
 RUN cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-cpmm
 RUN cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-router
 
 # Stage outputs into /out so the runtime COPY is dead-simple.
 RUN set -eux; \
-    mkdir -p /out/bin /out/wasm; \
+    mkdir -p /out/bin /out/tests /out/wasm; \
     cp target/release/bloom        /out/bin/bloom; \
+    test_bin="$(find target/release/deps -maxdepth 1 -type f -executable -name 'docker_petal_dex-*' | head -n1)"; \
+    test -n "$test_bin"; \
+    cp "$test_bin" /out/tests/docker_petal_dex; \
     for w in bloom_petal_dex_pool bloom_petal_dex_wallet bloom_petal_dex_faucet \
              bloom_petal_dex_cpmm bloom_petal_dex_router; do \
         cp "target/wasm32-unknown-unknown/release/${w}.wasm" "/out/wasm/${w}.wasm"; \
     done; \
-    ls -la /out/bin /out/wasm
+    ls -la /out/bin /out/tests /out/wasm
 
 # ----------------------------------------------------------------------------
 FROM debian:${DEBIAN_RELEASE}-slim AS runtime
@@ -101,6 +109,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /out/bin/bloom      /usr/local/bin/bloom
+COPY --from=builder /out/tests/         /tests/
 COPY --from=builder /out/wasm/          /wasm/
 
 ENTRYPOINT ["/usr/local/bin/bloom"]
