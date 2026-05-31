@@ -210,6 +210,7 @@ fn validate_chain_petal_function_segment(function: &str) -> Result<(), String> {
         || function == "."
         || function == ".."
         || function == "page"
+        || function.starts_with('.')
         || function.contains('/')
         || function.contains('\\')
         || function.contains('\0')
@@ -1377,6 +1378,8 @@ mod tests {
             ".",
             "..",
             "page",
+            ".state",
+            ".pipe",
             "foo/bar",
             "foo\\bar",
             "foo\0bar",

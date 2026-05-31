@@ -469,6 +469,8 @@ fn deploy_vfs_invalid_function_name_fails_without_writes() {
         "foo\\bar",
         "foo\0bar",
         "page",
+        ".state",
+        ".pipe",
         "set counter",
         "set\tcounter",
     ] {

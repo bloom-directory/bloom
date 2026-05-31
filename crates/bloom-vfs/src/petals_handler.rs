@@ -437,6 +437,7 @@ fn is_endpoint_segment(segment: &str) -> bool {
         && segment != "."
         && segment != ".."
         && segment != "page"
+        && !segment.starts_with('.')
         && !segment.contains('/')
         && !segment.contains('\\')
         && !segment.contains('\0')
@@ -1428,6 +1429,8 @@ mod tests {
                     func("foo/bar", true),
                     func("foo\\bar", true),
                     func("page", true),
+                    func(".state", true),
+                    func(".pipe", true),
                     func("set counter", true),
                 ],
                 ..Default::default()
