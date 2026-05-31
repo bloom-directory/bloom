@@ -440,6 +440,7 @@ fn is_endpoint_segment(segment: &str) -> bool {
         && !segment.contains('/')
         && !segment.contains('\\')
         && !segment.contains('\0')
+        && !segment.chars().any(char::is_whitespace)
 }
 
 fn parse_object_id(id_hex: &str) -> Result<ObjectId, HandlerError> {
@@ -1427,6 +1428,7 @@ mod tests {
                     func("foo/bar", true),
                     func("foo\\bar", true),
                     func("page", true),
+                    func("set counter", true),
                 ],
                 ..Default::default()
             },

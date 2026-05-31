@@ -186,6 +186,7 @@ fn validate_chain_petal_vfs_segment(module_path: &str, segment: &str) -> Result<
         || segment == ".."
         || segment.contains('\\')
         || segment.contains('\0')
+        || segment.chars().any(char::is_whitespace)
     {
         return Err(format!(
             "module_path '{module_path}' contains VFS-invalid path segment"
@@ -212,6 +213,7 @@ fn validate_chain_petal_function_segment(function: &str) -> Result<(), String> {
         || function.contains('/')
         || function.contains('\\')
         || function.contains('\0')
+        || function.chars().any(char::is_whitespace)
     {
         return Err(format!(
             "petal function '{function}' is not addressable as a VFS path segment"
@@ -1352,6 +1354,8 @@ mod tests {
             "/bloom/petals/dex/page",
             "/bloom/petals/dex\\pool",
             "/bloom/petals/dex/\0pool",
+            "/bloom/petals/my app/pool",
+            "/bloom/petals/dex/\tpool",
             "/bloom/petals/dex/pool/",
             "/bloom/petals/dex//pool",
             "/bloom/petals/dex/./pool",
@@ -1368,7 +1372,17 @@ mod tests {
     fn chain_petal_function_names_must_be_vfs_segments() {
         validate_chain_petal_function_segment("swap_exact_in").unwrap();
 
-        for function in ["", ".", "..", "page", "foo/bar", "foo\\bar", "foo\0bar"] {
+        for function in [
+            "",
+            ".",
+            "..",
+            "page",
+            "foo/bar",
+            "foo\\bar",
+            "foo\0bar",
+            "set counter",
+            "set\tcounter",
+        ] {
             assert!(
                 validate_chain_petal_function_segment(function).is_err(),
                 "{function:?} should be rejected"

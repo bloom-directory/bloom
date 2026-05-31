@@ -434,7 +434,12 @@ fn deploy_reserved_page_path_fails_without_writes() {
 
 #[test]
 fn deploy_vfs_invalid_path_segment_fails_without_writes() {
-    for path in ["/bloom/petals/dex\\pool", "/bloom/petals/dex/\0pool"] {
+    for path in [
+        "/bloom/petals/dex\\pool",
+        "/bloom/petals/dex/\0pool",
+        "/bloom/petals/my app/pool",
+        "/bloom/petals/dex/\tpool",
+    ] {
         let mut state = State::new();
         let out = ChainPetalExecutor.execute_tx(
             &deploy_tx(wasm_with_manifest(path)),
@@ -459,7 +464,14 @@ fn deploy_vfs_invalid_path_segment_fails_without_writes() {
 #[test]
 fn deploy_vfs_invalid_function_name_fails_without_writes() {
     let path = "/bloom/petals/dex/bad-function";
-    for function in ["foo/bar", "foo\\bar", "foo\0bar", "page"] {
+    for function in [
+        "foo/bar",
+        "foo\\bar",
+        "foo\0bar",
+        "page",
+        "set counter",
+        "set\tcounter",
+    ] {
         let mut state = State::new();
         let out = ChainPetalExecutor.execute_tx(
             &deploy_tx(wasm_with_function_manifest_missing_export(path, function)),
