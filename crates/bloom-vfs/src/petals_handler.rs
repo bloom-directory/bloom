@@ -279,6 +279,22 @@ impl PetalsEndpointHandler {
     fn state_lookup(&self, binding: &Binding, state_rel: &[String]) -> Result<Entry, HandlerError> {
         match state_rel {
             [] => Ok(Entry::dir(STATE_NODE)),
+            [page] if page == "page" => {
+                let total = self.state_unpaged_entries(binding, &[])?.len();
+                if paginate::is_paged(total) {
+                    Ok(Entry::dir("page"))
+                } else {
+                    Err(HandlerError::not_found(page.clone()))
+                }
+            }
+            [page, index] if page == "page" => {
+                let total = self.state_unpaged_entries(binding, &[])?.len();
+                if paginate::is_paged(total) && paginate::parse_page_name(index).is_some() {
+                    Ok(Entry::dir(index))
+                } else {
+                    Err(HandlerError::not_found(index.clone()))
+                }
+            }
             [type_name] => {
                 self.full_manifest_for(binding)
                     .and_then(|manifest| object_type_decl(&manifest, type_name).cloned())
@@ -309,6 +325,24 @@ impl PetalsEndpointHandler {
                 self.state_object(binding.hash, type_name, id_hex)?;
                 Ok(Entry::dir(id_hex))
             }
+            [type_name, id_hex, page] if page == "page" => {
+                let parent = vec![type_name.clone(), id_hex.clone()];
+                let total = self.state_unpaged_entries(binding, &parent)?.len();
+                if paginate::is_paged(total) {
+                    Ok(Entry::dir("page"))
+                } else {
+                    Err(HandlerError::not_found(page.clone()))
+                }
+            }
+            [type_name, id_hex, page, index] if page == "page" => {
+                let parent = vec![type_name.clone(), id_hex.clone()];
+                let total = self.state_unpaged_entries(binding, &parent)?.len();
+                if paginate::is_paged(total) && paginate::parse_page_name(index).is_some() {
+                    Ok(Entry::dir(index))
+                } else {
+                    Err(HandlerError::not_found(index.clone()))
+                }
+            }
             [type_name, id_hex, leaf] => {
                 let manifest = self
                     .full_manifest_for(binding)
@@ -333,6 +367,25 @@ impl PetalsEndpointHandler {
         state_rel: &[String],
     ) -> Result<Vec<Entry>, HandlerError> {
         match state_rel {
+            [page] if page == "page" => {
+                let total = self.state_unpaged_entries(binding, &[])?.len();
+                if paginate::is_paged(total) {
+                    Ok(paginate::page_indices(total))
+                } else {
+                    Err(HandlerError::not_found(page.clone()))
+                }
+            }
+            [page, index] if page == "page" => {
+                let Some(index) = paginate::parse_page_name(index) else {
+                    return Err(HandlerError::not_found(index.clone()));
+                };
+                let entries = self.state_unpaged_entries(binding, &[])?;
+                if paginate::is_paged(entries.len()) {
+                    Ok(paginate::page_slice(&entries, index).to_vec())
+                } else {
+                    Err(HandlerError::not_found(page.clone()))
+                }
+            }
             [type_name, page] if page == "page" => {
                 let total = self
                     .state_unpaged_entries(binding, std::slice::from_ref(type_name))?
@@ -349,6 +402,27 @@ impl PetalsEndpointHandler {
                 };
                 let entries =
                     self.state_unpaged_entries(binding, std::slice::from_ref(type_name))?;
+                if paginate::is_paged(entries.len()) {
+                    Ok(paginate::page_slice(&entries, index).to_vec())
+                } else {
+                    Err(HandlerError::not_found(page.clone()))
+                }
+            }
+            [type_name, id_hex, page] if page == "page" => {
+                let parent = vec![type_name.clone(), id_hex.clone()];
+                let total = self.state_unpaged_entries(binding, &parent)?.len();
+                if paginate::is_paged(total) {
+                    Ok(paginate::page_indices(total))
+                } else {
+                    Err(HandlerError::not_found(page.clone()))
+                }
+            }
+            [type_name, id_hex, page, index] if page == "page" => {
+                let Some(index) = paginate::parse_page_name(index) else {
+                    return Err(HandlerError::not_found(index.clone()));
+                };
+                let parent = vec![type_name.clone(), id_hex.clone()];
+                let entries = self.state_unpaged_entries(binding, &parent)?;
                 if paginate::is_paged(entries.len()) {
                     Ok(paginate::page_slice(&entries, index).to_vec())
                 } else {
@@ -1270,6 +1344,71 @@ mod tests {
             .await,
             Err(HandlerError::PermissionDenied)
         ));
+    }
+
+    #[tokio::test]
+    async fn state_type_and_field_directories_page_when_advertised() {
+        let chain = Arc::new(MockChain::default());
+        let hash = Hash32([0x13; 32]);
+        let counter_fields = (0..=paginate::PAGE_SIZE)
+            .map(|i| FieldDecl {
+                name: format!("field_{i:03}"),
+                ty: prim("u8"),
+            })
+            .collect::<Vec<_>>();
+        let counter_type = ObjectTypeDecl {
+            name: "Counter".to_string(),
+            abilities: AbilitySet::key_store(),
+            fields: counter_fields,
+            ..Default::default()
+        };
+        let mut object_types = vec![counter_type];
+        for i in 0..=paginate::PAGE_SIZE {
+            object_types.push(object_type(&format!("Type{i:03}"), vec![]));
+        }
+        chain.bind_full(
+            "/bloom/petals/dex/probe",
+            hash,
+            full_manifest("/bloom/petals/dex/probe", object_types),
+        );
+        let counter = petal_object(0x13, hash, "Counter", vec![7; paginate::PAGE_SIZE + 1]);
+        let counter_id = hex::encode(counter.id.0);
+        chain.put_object(counter);
+        let h = PetalsEndpointHandler::new(chain);
+
+        let types = h.list(&vpath("dex/probe/.state")).await.unwrap();
+        assert_eq!(
+            types.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["page"]
+        );
+        h.lookup(&vpath("dex/probe/.state/page")).await.unwrap();
+        let type_page = h
+            .list(&vpath("dex/probe/.state/page/000000"))
+            .await
+            .unwrap();
+        assert_eq!(type_page.len(), paginate::PAGE_SIZE);
+
+        let leaves = h
+            .list(&vpath(&format!("dex/probe/.state/Counter/{counter_id}")))
+            .await
+            .unwrap();
+        assert_eq!(
+            leaves.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["page"]
+        );
+        h.lookup(&vpath(&format!(
+            "dex/probe/.state/Counter/{counter_id}/page"
+        )))
+        .await
+        .unwrap();
+        let field_page = h
+            .list(&vpath(&format!(
+                "dex/probe/.state/Counter/{counter_id}/page/000000"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(field_page.len(), paginate::PAGE_SIZE);
+        assert!(field_page.iter().any(|entry| entry.name == "_object.json"));
     }
 
     #[test]
