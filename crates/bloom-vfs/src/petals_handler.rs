@@ -265,7 +265,7 @@ impl PetalsEndpointHandler {
                 let mut entries = object_type
                     .fields
                     .iter()
-                    .filter(|field| is_endpoint_segment(&field.name))
+                    .filter(|field| is_state_field_segment(&field.name))
                     .map(|field| Entry::file(&field.name))
                     .collect::<Vec<_>>();
                 entries.push(Entry::file(OBJECT_JSON));
@@ -358,7 +358,7 @@ impl PetalsEndpointHandler {
                     || object_type
                         .fields
                         .iter()
-                        .any(|field| field.name == *leaf && is_endpoint_segment(&field.name))
+                        .any(|field| field.name == *leaf && is_state_field_segment(&field.name))
                 {
                     Ok(Entry::file(leaf))
                 } else {
@@ -461,7 +461,7 @@ impl PetalsEndpointHandler {
         let value = if leaf == OBJECT_JSON {
             state_object_json(&object, fields)
         } else {
-            if !is_endpoint_segment(leaf) {
+            if !is_state_field_segment(leaf) {
                 return Err(HandlerError::not_found(leaf.clone()));
             }
             fields
@@ -527,6 +527,10 @@ fn is_endpoint_segment(segment: &str) -> bool {
         && !segment.contains('\\')
         && !segment.contains('\0')
         && !segment.chars().any(char::is_whitespace)
+}
+
+fn is_state_field_segment(segment: &str) -> bool {
+    is_endpoint_segment(segment) && segment != OBJECT_JSON
 }
 
 fn parse_object_id(id_hex: &str) -> Result<ObjectId, HandlerError> {
@@ -1472,11 +1476,12 @@ mod tests {
                         ("page", prim("u8")),
                         (".state", prim("u8")),
                         ("Foo/Bar", prim("u8")),
+                        (OBJECT_JSON, prim("u8")),
                     ],
                 )],
             ),
         );
-        let counter = petal_object(0x15, hash, "Counter", vec![9, 8, 7, 6]);
+        let counter = petal_object(0x15, hash, "Counter", vec![9, 8, 7, 6, 5]);
         let counter_id = hex::encode(counter.id.0);
         chain.put_object(counter);
         let h = PetalsEndpointHandler::new(chain);
@@ -1503,6 +1508,15 @@ mod tests {
             .await,
             Err(HandlerError::NotFound(_))
         ));
+        let object_json = h
+            .read(&vpath(&format!(
+                "dex/probe/.state/Counter/{counter_id}/{OBJECT_JSON}"
+            )))
+            .await
+            .unwrap();
+        let object_json: Value = serde_json::from_slice(&object_json).unwrap();
+        assert_eq!(object_json["id"], counter_id);
+        assert_eq!(object_json["fields"][OBJECT_JSON], json!(5));
     }
 
     #[test]
