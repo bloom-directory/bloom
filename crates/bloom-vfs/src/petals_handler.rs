@@ -126,9 +126,10 @@ impl PetalsEndpointHandler {
                 .iter()
                 .filter(|function| is_endpoint_segment(&function.name))
             {
-                by_name
-                    .entry(function.name.clone())
-                    .or_insert_with(|| Entry::executable_file(&function.name));
+                by_name.insert(
+                    function.name.clone(),
+                    Entry::executable_file(&function.name),
+                );
             }
         }
 
@@ -188,9 +189,10 @@ impl PetalsEndpointHandler {
                 .iter()
                 .filter(|function| is_endpoint_segment(&function.name))
             {
-                by_name
-                    .entry(function.name.clone())
-                    .or_insert_with(|| Entry::executable_file(&function.name));
+                by_name.insert(
+                    function.name.clone(),
+                    Entry::executable_file(&function.name),
+                );
             }
         }
         Ok(by_name.into_values().collect())
@@ -241,6 +243,7 @@ impl PetalsEndpointHandler {
             [] => Ok(manifest
                 .object_types
                 .iter()
+                .filter(|object_type| is_endpoint_segment(&object_type.name))
                 .map(|object_type| Entry::dir(&object_type.name))
                 .collect()),
             [type_name] => {
@@ -538,6 +541,9 @@ fn object_matches(object: &Object, petal_hash: Hash32, type_name: &str) -> bool 
 }
 
 fn object_type_decl<'a>(manifest: &'a PetalManifestV0, name: &str) -> Option<&'a ObjectTypeDecl> {
+    if !is_endpoint_segment(name) {
+        return None;
+    }
     manifest
         .object_types
         .iter()
@@ -871,11 +877,11 @@ impl Handler for PetalsEndpointHandler {
             }
         }
 
-        if Self::has_descendant(&bindings, segs) {
-            return Ok(Entry::dir(segs.last().expect("non-root has leaf")));
-        }
         if let Some((_binding, function, _view)) = self.endpoint_at(&bindings, segs) {
             return Ok(Entry::executable_file(&function));
+        }
+        if Self::has_descendant(&bindings, segs) {
+            return Ok(Entry::dir(segs.last().expect("non-root has leaf")));
         }
         if self.binding_at(&bindings, segs).is_some() {
             return Ok(Entry::dir(segs.last().expect("non-root has leaf")));
@@ -894,9 +900,6 @@ impl Handler for PetalsEndpointHandler {
         let bindings = self.bindings();
         if let Some((binding, state_rel)) = Self::state_path(&bindings, segs) {
             return self.state_read(binding, state_rel);
-        }
-        if Self::has_descendant(&bindings, segs) {
-            return Err(HandlerError::NotAFile(path.to_string_path()));
         }
         let Some((binding, function, view)) = self.endpoint_at(&bindings, segs) else {
             return Err(HandlerError::NotAFile(path.to_string_path()));
@@ -1411,6 +1414,40 @@ mod tests {
         assert!(field_page.iter().any(|entry| entry.name == "_object.json"));
     }
 
+    #[tokio::test]
+    async fn invalid_state_type_names_are_not_exposed() {
+        let chain = Arc::new(MockChain::default());
+        let hash = Hash32([0x14; 32]);
+        chain.bind_full(
+            "/bloom/petals/dex/probe",
+            hash,
+            full_manifest(
+                "/bloom/petals/dex/probe",
+                vec![
+                    object_type("Counter", vec![("value", prim("u128"))]),
+                    object_type("Foo/Bar", vec![("value", prim("u128"))]),
+                    object_type("page", vec![("value", prim("u128"))]),
+                    object_type(".state", vec![("value", prim("u128"))]),
+                ],
+            ),
+        );
+        let h = PetalsEndpointHandler::new(chain);
+
+        let types = h.list(&vpath("dex/probe/.state")).await.unwrap();
+        assert_eq!(
+            types.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["Counter"]
+        );
+        assert!(matches!(
+            h.lookup(&vpath("dex/probe/.state/page")).await,
+            Err(HandlerError::NotFound(_))
+        ));
+        assert!(matches!(
+            h.lookup(&vpath("dex/probe/.state/.state")).await,
+            Err(HandlerError::NotFound(_))
+        ));
+    }
+
     #[test]
     fn state_field_decoder_substitutes_generics_and_falls_back_to_hex() {
         let hash = Hash32([0x33; 32]);
@@ -1623,7 +1660,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn descendant_directory_wins_over_same_named_view_endpoint() {
+    async fn endpoint_wins_over_same_named_descendant_directory() {
         let chain = Arc::new(MockChain::default());
         chain.bind(
             "/bloom/petals/dex",
@@ -1646,13 +1683,18 @@ mod tests {
             dex.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
             vec![".state", "pool"]
         );
-        assert_eq!(dex[1].mode, 0o755);
+        assert_eq!(dex[1].mode, 0o555);
 
         let pool = h.lookup(&vpath("dex/pool")).await.unwrap();
-        assert_eq!(pool.mode, 0o755);
-        assert!(matches!(
-            h.read(&vpath("dex/pool")).await,
-            Err(HandlerError::NotAFile(_))
-        ));
+        assert_eq!(pool.mode, 0o555);
+        let shim = String::from_utf8(h.read(&vpath("dex/pool")).await.unwrap()).unwrap();
+        assert!(shim.contains("--path '/bloom/petals/dex'"));
+        assert!(shim.contains("--function 'pool'"));
+
+        let child = h.list(&vpath("dex/pool/child")).await.unwrap();
+        assert_eq!(
+            child.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec![".state", "quote", "swap"]
+        );
     }
 }
