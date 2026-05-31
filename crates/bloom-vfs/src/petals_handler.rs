@@ -265,6 +265,7 @@ impl PetalsEndpointHandler {
                 let mut entries = object_type
                     .fields
                     .iter()
+                    .filter(|field| is_endpoint_segment(&field.name))
                     .map(|field| Entry::file(&field.name))
                     .collect::<Vec<_>>();
                 entries.push(Entry::file(OBJECT_JSON));
@@ -353,7 +354,11 @@ impl PetalsEndpointHandler {
                 let object_type = object_type_decl(&manifest, type_name)
                     .ok_or_else(|| HandlerError::not_found(type_name.clone()))?;
                 self.state_object(binding.hash, type_name, id_hex)?;
-                if leaf == OBJECT_JSON || object_type.fields.iter().any(|field| field.name == *leaf)
+                if leaf == OBJECT_JSON
+                    || object_type
+                        .fields
+                        .iter()
+                        .any(|field| field.name == *leaf && is_endpoint_segment(&field.name))
                 {
                     Ok(Entry::file(leaf))
                 } else {
@@ -456,6 +461,9 @@ impl PetalsEndpointHandler {
         let value = if leaf == OBJECT_JSON {
             state_object_json(&object, fields)
         } else {
+            if !is_endpoint_segment(leaf) {
+                return Err(HandlerError::not_found(leaf.clone()));
+            }
             fields
                 .get(leaf)
                 .cloned()
@@ -1444,6 +1452,55 @@ mod tests {
         ));
         assert!(matches!(
             h.lookup(&vpath("dex/probe/.state/.state")).await,
+            Err(HandlerError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_state_field_names_are_not_exposed() {
+        let chain = Arc::new(MockChain::default());
+        let hash = Hash32([0x15; 32]);
+        chain.bind_full(
+            "/bloom/petals/dex/probe",
+            hash,
+            full_manifest(
+                "/bloom/petals/dex/probe",
+                vec![object_type(
+                    "Counter",
+                    vec![
+                        ("value", prim("u8")),
+                        ("page", prim("u8")),
+                        (".state", prim("u8")),
+                        ("Foo/Bar", prim("u8")),
+                    ],
+                )],
+            ),
+        );
+        let counter = petal_object(0x15, hash, "Counter", vec![9, 8, 7, 6]);
+        let counter_id = hex::encode(counter.id.0);
+        chain.put_object(counter);
+        let h = PetalsEndpointHandler::new(chain);
+
+        let leaves = h
+            .list(&vpath(&format!("dex/probe/.state/Counter/{counter_id}")))
+            .await
+            .unwrap();
+        assert_eq!(
+            leaves.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["_object.json", "value"]
+        );
+        assert!(matches!(
+            h.lookup(&vpath(&format!(
+                "dex/probe/.state/Counter/{counter_id}/page"
+            )))
+            .await,
+            Err(HandlerError::NotFound(_))
+        ));
+        assert!(matches!(
+            h.read(&vpath(&format!(
+                "dex/probe/.state/Counter/{counter_id}/page"
+            )))
+            .await,
             Err(HandlerError::NotFound(_))
         ));
     }
