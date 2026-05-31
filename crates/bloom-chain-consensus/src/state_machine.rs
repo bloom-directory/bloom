@@ -188,6 +188,13 @@ impl VoteTally {
 /// for block execution before peers nil-prevote the round.
 pub const ROUND_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum future-round proposal lookahead kept for the current height.
+///
+/// The buffer exists only to bridge normal gossip skew between adjacent rounds;
+/// far-future proposals are cheap for a Byzantine peer to generate and are not
+/// useful until many timeout cycles later.
+const FUTURE_PROPOSAL_ROUND_LOOKAHEAD: u32 = 16;
+
 /// The Tendermint-style BFT state machine for a single local validator.
 ///
 /// One `ConsensusState` per validator per node.  Multiple instances can be
@@ -483,6 +490,18 @@ impl ConsensusState {
             return vec![];
         }
         if p.round > self.round {
+            let max_future_round = self.round.saturating_add(FUTURE_PROPOSAL_ROUND_LOOKAHEAD);
+            if p.round > max_future_round {
+                debug!(
+                    height = self.height,
+                    proposal_round = p.round,
+                    round = self.round,
+                    max_future_round,
+                    block_hash = %p.block_hash,
+                    "consensus.proposal_ignored: future round beyond buffer window"
+                );
+                return vec![];
+            }
             let Ok(judgment) = judge_proposer_round(
                 self.height,
                 p.proposer,
@@ -1241,5 +1260,51 @@ mod tests {
             Action::Broadcast(ProposalOrVote::Vote(v))
                 if v.kind == VoteKind::Prevote && v.round == 1 && v.block_hash == Some(hash)
         )));
+    }
+
+    #[test]
+    fn far_future_round_proposal_is_not_buffered() {
+        let vs = make_validator_set();
+        let far_round = FUTURE_PROPOSAL_ROUND_LOOKAHEAD + 1;
+        let proposer = vs.proposer_for(1, far_round).address;
+        let mut sm = ConsensusState::new(1, make_addr(0), vs);
+        let (hash, _block) = make_block(0xF2);
+        let proposal = Proposal {
+            height: 1,
+            round: far_round,
+            block_hash: hash,
+            pol_round: -1,
+            proposer,
+            sig: SigBytes(vec![]),
+        };
+
+        assert!(
+            sm.handle(Event::ReceiveProposal(proposal), &BTreeMap::new())
+                .is_empty()
+        );
+        assert!(sm.future_proposals.is_empty());
+    }
+
+    #[test]
+    fn future_round_proposal_at_buffer_window_is_kept() {
+        let vs = make_validator_set();
+        let round = FUTURE_PROPOSAL_ROUND_LOOKAHEAD;
+        let proposer = vs.proposer_for(1, round).address;
+        let mut sm = ConsensusState::new(1, make_addr(0), vs);
+        let (hash, _block) = make_block(0xF3);
+        let proposal = Proposal {
+            height: 1,
+            round,
+            block_hash: hash,
+            pol_round: -1,
+            proposer,
+            sig: SigBytes(vec![]),
+        };
+
+        assert!(
+            sm.handle(Event::ReceiveProposal(proposal), &BTreeMap::new())
+                .is_empty()
+        );
+        assert!(sm.future_proposals.contains_key(&round));
     }
 }
