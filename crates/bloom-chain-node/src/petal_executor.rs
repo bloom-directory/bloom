@@ -265,7 +265,7 @@ fn validate_chain_petal_vfs_collisions(
     validate_chain_petal_vfs_collisions_with_pending(&new_rel, manifest, &[])
 }
 
-fn validate_chain_petal_vfs_collisions_with_pending(
+pub(crate) fn validate_chain_petal_vfs_collisions_with_pending(
     new_rel: &[String],
     manifest: &bloom_petal_manifest::types::PetalManifestV0,
     pending: &[(String, bloom_petal_manifest::types::PetalManifestV0)],
@@ -305,7 +305,7 @@ fn validate_chain_petal_vfs_collisions_with_pending(
     Ok(())
 }
 
-fn petal_path_segments(path: &str) -> Result<Vec<String>, String> {
+pub(crate) fn petal_path_segments(path: &str) -> Result<Vec<String>, String> {
     let Some(suffix) = path.strip_prefix("/bloom/petals/") else {
         return Err(format!(
             "module_path '{path}' must start with /bloom/petals/"
