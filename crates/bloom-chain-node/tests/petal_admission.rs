@@ -361,6 +361,86 @@ fn deploy_existing_path_fails_without_rebinding() {
 }
 
 #[test]
+fn deploy_path_function_collision_fails_without_writes() {
+    let mut state = State::new();
+    let parent_path = "/bloom/petals/dex";
+    let child_path = "/bloom/petals/dex/pool";
+
+    let parent = ChainPetalExecutor.execute_tx(
+        &deploy_tx(wasm_with_chain_return_import_and_function(
+            parent_path,
+            "pool",
+        )),
+        &mut state,
+        1,
+        1_700_000_000_000,
+        Address([0xAA; 32]),
+        Hash32([0; 32]),
+    );
+    assert!(
+        parent.success,
+        "parent deploy failed: {}",
+        String::from_utf8_lossy(&parent.return_data)
+    );
+    state
+        .apply(parent.write_set.expect("parent deploy emits writes"))
+        .expect("parent deploy applies");
+
+    let child = ChainPetalExecutor.execute_tx(
+        &deploy_tx(wasm_with_manifest(child_path)),
+        &mut state,
+        2,
+        1_700_000_000_000,
+        Address([0xAA; 32]),
+        Hash32([0; 32]),
+    );
+    assert!(!child.success);
+    assert!(child.write_set.is_none());
+    assert!(state.vfs_lookup(child_path).is_none());
+    assert!(String::from_utf8_lossy(&child.return_data).contains("collides"));
+}
+
+#[test]
+fn deploy_function_descendant_collision_fails_without_writes() {
+    let mut state = State::new();
+    let parent_path = "/bloom/petals/dex";
+    let child_path = "/bloom/petals/dex/pool";
+
+    let child = ChainPetalExecutor.execute_tx(
+        &deploy_tx(wasm_with_manifest(child_path)),
+        &mut state,
+        1,
+        1_700_000_000_000,
+        Address([0xAA; 32]),
+        Hash32([0; 32]),
+    );
+    assert!(
+        child.success,
+        "child deploy failed: {}",
+        String::from_utf8_lossy(&child.return_data)
+    );
+    state
+        .apply(child.write_set.expect("child deploy emits writes"))
+        .expect("child deploy applies");
+
+    let parent = ChainPetalExecutor.execute_tx(
+        &deploy_tx(wasm_with_chain_return_import_and_function(
+            parent_path,
+            "pool",
+        )),
+        &mut state,
+        2,
+        1_700_000_000_000,
+        Address([0xAA; 32]),
+        Hash32([0; 32]),
+    );
+    assert!(!parent.success);
+    assert!(parent.write_set.is_none());
+    assert!(state.vfs_lookup(parent_path).is_none());
+    assert!(String::from_utf8_lossy(&parent.return_data).contains("collides"));
+}
+
+#[test]
 fn deploy_outside_petals_prefix_fails_without_writes() {
     let mut state = State::new();
     let path = "/bloom/dex/pool";
