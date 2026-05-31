@@ -483,6 +483,37 @@ impl ConsensusState {
             return vec![];
         }
         if p.round > self.round {
+            let Ok(judgment) = judge_proposer_round(
+                self.height,
+                p.proposer,
+                p.round,
+                p.pol_round,
+                &self.validator_set,
+                false,
+            ) else {
+                warn!(
+                    height = self.height,
+                    proposal_round = p.round,
+                    proposer = %p.proposer,
+                    pol_round = p.pol_round,
+                    block_hash = %p.block_hash,
+                    "consensus.proposal_rejected: invalid future proposer round"
+                );
+                return vec![];
+            };
+            if !judgment.proposer_ok {
+                let expected = self.validator_set.proposer_for(self.height, p.round);
+                warn!(
+                    height = self.height,
+                    proposal_round = p.round,
+                    proposer = %p.proposer,
+                    expected = %expected.address,
+                    pol_round = p.pol_round,
+                    block_hash = %p.block_hash,
+                    "consensus.proposal_rejected: unexpected future proposer"
+                );
+                return vec![];
+            }
             debug!(
                 height = self.height,
                 proposal_round = p.round,
@@ -1169,6 +1200,42 @@ mod tests {
 
         assert_eq!(sm.round, 1);
         assert_eq!(sm.step, Step::Prevote);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            Action::Broadcast(ProposalOrVote::Vote(v))
+                if v.kind == VoteKind::Prevote && v.round == 1 && v.block_hash == Some(hash)
+        )));
+    }
+
+    #[test]
+    fn invalid_future_round_proposal_does_not_block_valid_one() {
+        let mut sm = ConsensusState::new(1, make_addr(0), make_validator_set());
+        let (hash, block) = make_block(0xF1);
+        let mut blocks = BTreeMap::new();
+        blocks.insert(hash, block);
+        let invalid = Proposal {
+            height: 1,
+            round: 1,
+            block_hash: hash,
+            pol_round: -1,
+            proposer: make_addr(3), // proposer for (height=1, round=1) is addr(2)
+            sig: SigBytes(vec![]),
+        };
+        let valid = Proposal {
+            proposer: make_addr(2),
+            ..invalid.clone()
+        };
+
+        assert!(
+            sm.handle(Event::ReceiveProposal(invalid), &blocks)
+                .is_empty()
+        );
+        assert!(sm.handle(Event::ReceiveProposal(valid), &blocks).is_empty());
+        let _ = sm.handle(Event::Tick(TimeoutKind::Propose), &blocks);
+        let _ = sm.handle(Event::Tick(TimeoutKind::Prevote), &blocks);
+        let actions = sm.handle(Event::Tick(TimeoutKind::Precommit), &blocks);
+
+        assert_eq!(sm.round, 1);
         assert!(actions.iter().any(|action| matches!(
             action,
             Action::Broadcast(ProposalOrVote::Vote(v))
