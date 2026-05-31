@@ -262,6 +262,46 @@ fn validate_chain_petal_vfs_collisions(
             ));
         }
     }
+    validate_chain_petal_vfs_collisions_with_pending(&new_rel, manifest, &[])
+}
+
+fn validate_chain_petal_vfs_collisions_with_pending(
+    new_rel: &[String],
+    manifest: &bloom_petal_manifest::types::PetalManifestV0,
+    pending: &[(String, bloom_petal_manifest::types::PetalManifestV0)],
+) -> Result<(), String> {
+    for (existing_path, existing_manifest) in pending {
+        if existing_path == &manifest.module_path {
+            return Err(format!(
+                "module_path '{}' collides with another publish in the same transaction",
+                manifest.module_path
+            ));
+        }
+        let existing_rel = petal_path_segments(existing_path)?;
+        if existing_rel.len() < new_rel.len()
+            && new_rel.starts_with(&existing_rel)
+            && let Some(child_segment) = new_rel.get(existing_rel.len())
+            && existing_manifest
+                .functions
+                .iter()
+                .any(|f| f.name == *child_segment)
+        {
+            return Err(format!(
+                "module_path '{}' collides with function '{}' on pending ancestor petal '{}'",
+                manifest.module_path, child_segment, existing_path
+            ));
+        }
+        if new_rel.len() < existing_rel.len()
+            && existing_rel.starts_with(new_rel)
+            && let Some(child_segment) = existing_rel.get(new_rel.len())
+            && manifest.functions.iter().any(|f| f.name == *child_segment)
+        {
+            return Err(format!(
+                "function '{}' collides with pending descendant petal path '{}'",
+                child_segment, existing_path
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1028,6 +1068,7 @@ fn execute_tx_impl(
                         &report.object_deletes,
                     );
 
+                    let mut pending_publish_manifests = Vec::new();
                     for event in &report.publish_events {
                         let existing_binding = state.vfs_lookup(&event.module_path);
                         if event.minted_owner_cap && existing_binding.is_some() {
@@ -1227,8 +1268,91 @@ fn execute_tx_impl(
                                 write_set: ws_out,
                             };
                         }
+                        let event_rel = match petal_path_segments(&event_manifest.module_path) {
+                            Ok(rel) => rel,
+                            Err(e) => {
+                                drop(snapshot);
+                                let ws_out = if reservation > 0 {
+                                    let mut gas_snap = state.snapshot();
+                                    let mut debited = pre_exec_gas_payer.clone();
+                                    let pre_value = decode_coin_value(&debited.payload)
+                                        .expect("decode pre-exec coin value");
+                                    let new_value = pre_value
+                                        .checked_sub(reservation)
+                                        .expect("reservation bounds debit");
+                                    debited.payload = rewrite_value(&debited.payload, new_value)
+                                        .expect("rewrite coin payload");
+                                    debited.version = next_object_version(debited.version);
+                                    gas_snap.insert_object(debited);
+                                    if let Err(e) = mint_coin_loom_to(
+                                        &mut gas_snap,
+                                        proposer,
+                                        reservation,
+                                        b"bloom.ptb.gas.admission",
+                                        &tx.tx_hash(),
+                                        loom_coin_type.clone(),
+                                    ) {
+                                        warn!(err = %e, "PTB gas proposer credit failed");
+                                    }
+                                    Some(gas_snap.commit())
+                                } else {
+                                    None
+                                };
+                                return ExecOutput {
+                                    success: false,
+                                    fuel_used: revert_charged_fuel,
+                                    return_data: format!("ptb publish admission error: {e}")
+                                        .into_bytes(),
+                                    logs: vec![],
+                                    write_set: ws_out,
+                                };
+                            }
+                        };
+                        if let Err(e) = validate_chain_petal_vfs_collisions_with_pending(
+                            &event_rel,
+                            &event_manifest,
+                            &pending_publish_manifests,
+                        ) {
+                            drop(snapshot);
+                            let ws_out = if reservation > 0 {
+                                let mut gas_snap = state.snapshot();
+                                let mut debited = pre_exec_gas_payer.clone();
+                                let pre_value = decode_coin_value(&debited.payload)
+                                    .expect("decode pre-exec coin value");
+                                let new_value = pre_value
+                                    .checked_sub(reservation)
+                                    .expect("reservation bounds debit");
+                                debited.payload = rewrite_value(&debited.payload, new_value)
+                                    .expect("rewrite coin payload");
+                                debited.version = next_object_version(debited.version);
+                                gas_snap.insert_object(debited);
+                                if let Err(e) = mint_coin_loom_to(
+                                    &mut gas_snap,
+                                    proposer,
+                                    reservation,
+                                    b"bloom.ptb.gas.admission",
+                                    &tx.tx_hash(),
+                                    loom_coin_type.clone(),
+                                ) {
+                                    warn!(err = %e, "PTB gas proposer credit failed");
+                                }
+                                Some(gas_snap.commit())
+                            } else {
+                                None
+                            };
+                            return ExecOutput {
+                                success: false,
+                                fuel_used: revert_charged_fuel,
+                                return_data: format!("ptb publish admission error: {e}")
+                                    .into_bytes(),
+                                logs: vec![],
+                                write_set: ws_out,
+                            };
+                        }
                         let hash = snapshot.insert_code(event.wasm_bytes.clone());
                         snapshot.set_vfs_binding(event.module_path.clone(), hash);
+                        pending_publish_manifests
+                            .push((event.module_path.clone(), event_manifest.clone()));
                     }
 
                     // P0-5: settle inner gas. The reservation was
@@ -1529,5 +1653,51 @@ mod tests {
                 "{function:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn pending_petal_publishes_reject_path_function_collisions() {
+        let parent = bloom_petal_manifest::types::PetalManifestV0 {
+            module_path: "/bloom/petals/dex".to_string(),
+            functions: vec![bloom_petal_manifest::types::FunctionDecl {
+                name: "pool".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let child = bloom_petal_manifest::types::PetalManifestV0 {
+            module_path: "/bloom/petals/dex/pool".to_string(),
+            ..Default::default()
+        };
+        let child_rel = petal_path_segments(&child.module_path).unwrap();
+        assert!(
+            validate_chain_petal_vfs_collisions_with_pending(
+                &child_rel,
+                &child,
+                &[(parent.module_path.clone(), parent)]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pending_petal_publishes_reject_duplicate_paths() {
+        let first = bloom_petal_manifest::types::PetalManifestV0 {
+            module_path: "/bloom/petals/dex/pool".to_string(),
+            ..Default::default()
+        };
+        let second = bloom_petal_manifest::types::PetalManifestV0 {
+            module_path: "/bloom/petals/dex/pool".to_string(),
+            ..Default::default()
+        };
+        let second_rel = petal_path_segments(&second.module_path).unwrap();
+        assert!(
+            validate_chain_petal_vfs_collisions_with_pending(
+                &second_rel,
+                &second,
+                &[(first.module_path.clone(), first)]
+            )
+            .is_err()
+        );
     }
 }
