@@ -223,6 +223,14 @@ pub struct ConsensusState {
     /// moments later.
     pub pending_proposal: Option<Proposal>,
 
+    /// Same-height proposals received for rounds ahead of the local round.
+    ///
+    /// Network delivery can race round transitions: a peer may enter round N+1
+    /// and gossip its proposal while this validator is still finishing round N.
+    /// Dropping that proposal means we enter N+1 with votes but no proposal to
+    /// prevote, so keep it until `advance_round` reaches the matching slot.
+    future_proposals: BTreeMap<u32, Proposal>,
+
     /// Prevote tallies: round → VoteTally.
     pub prevotes: BTreeMap<u32, VoteTally>,
     /// Precommit tallies: round → VoteTally.
@@ -256,6 +264,7 @@ impl ConsensusState {
             valid_block: None,
             proposal: None,
             pending_proposal: None,
+            future_proposals: BTreeMap::new(),
             prevotes: BTreeMap::new(),
             precommits: BTreeMap::new(),
             all_precommit_votes: BTreeMap::new(),
@@ -287,6 +296,7 @@ impl ConsensusState {
         self.valid_block = None;
         self.proposal = None;
         self.pending_proposal = None;
+        self.future_proposals.clear();
         self.prevotes.clear();
         self.precommits.clear();
         self.all_precommit_votes.clear();
@@ -462,13 +472,34 @@ impl ConsensusState {
     // ---------------------------------------------------------------------------
 
     fn on_proposal(&mut self, p: Proposal, blocks: &BTreeMap<Hash32, Block>) -> Vec<Action> {
-        if p.height != self.height || p.round != self.round {
+        if p.height != self.height {
             debug!(
                 proposal_height = p.height,
                 proposal_round = p.round,
                 height = self.height,
                 round = self.round,
                 "consensus.proposal_ignored: wrong slot"
+            );
+            return vec![];
+        }
+        if p.round > self.round {
+            debug!(
+                height = self.height,
+                proposal_round = p.round,
+                round = self.round,
+                block_hash = %p.block_hash,
+                "consensus.proposal_buffered: future round"
+            );
+            self.future_proposals.entry(p.round).or_insert(p);
+            return vec![];
+        }
+        if p.round < self.round {
+            debug!(
+                height = self.height,
+                proposal_round = p.round,
+                round = self.round,
+                block_hash = %p.block_hash,
+                "consensus.proposal_ignored: stale round"
             );
             return vec![];
         }
@@ -784,12 +815,17 @@ impl ConsensusState {
     // Round advancement
     // ---------------------------------------------------------------------------
 
-    fn advance_round(&mut self, _blocks: &BTreeMap<Hash32, Block>) -> Vec<Action> {
+    fn advance_round(&mut self, blocks: &BTreeMap<Hash32, Block>) -> Vec<Action> {
         self.round += 1;
         self.step = Step::Propose;
         self.proposal = None;
+        self.pending_proposal = None;
 
-        let actions = vec![Action::StartTimeout(TimeoutKind::Propose, ROUND_TIMEOUT)];
+        let mut actions = vec![Action::StartTimeout(TimeoutKind::Propose, ROUND_TIMEOUT)];
+        if let Some(p) = self.future_proposals.remove(&self.round) {
+            actions.extend(self.on_proposal(p, blocks));
+            actions.extend(self.try_precommit_current_round_from_prevotes(blocks));
+        }
 
         // If this validator is the new proposer, they need to build and broadcast.
         // The engine layer handles building; here we just signal a propose timeout
@@ -1106,5 +1142,37 @@ mod tests {
         assert!(sm.handle(Event::ReceiveVote(vote(2)), &blocks).is_empty());
 
         assert_eq!(sm.valid_block, None);
+    }
+
+    #[test]
+    fn future_round_proposal_is_replayed_when_round_catches_up() {
+        let mut sm = ConsensusState::new(1, make_addr(0), make_validator_set());
+        let (hash, block) = make_block(0xF0);
+        let mut blocks = BTreeMap::new();
+        blocks.insert(hash, block);
+        let proposal = Proposal {
+            height: 1,
+            round: 1,
+            block_hash: hash,
+            pol_round: -1,
+            proposer: make_addr(2), // proposer for (height=1, round=1)
+            sig: SigBytes(vec![]),
+        };
+
+        assert!(
+            sm.handle(Event::ReceiveProposal(proposal), &blocks)
+                .is_empty()
+        );
+        let _ = sm.handle(Event::Tick(TimeoutKind::Propose), &blocks);
+        let _ = sm.handle(Event::Tick(TimeoutKind::Prevote), &blocks);
+        let actions = sm.handle(Event::Tick(TimeoutKind::Precommit), &blocks);
+
+        assert_eq!(sm.round, 1);
+        assert_eq!(sm.step, Step::Prevote);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            Action::Broadcast(ProposalOrVote::Vote(v))
+                if v.kind == VoteKind::Prevote && v.round == 1 && v.block_hash == Some(hash)
+        )));
     }
 }

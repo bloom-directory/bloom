@@ -576,6 +576,9 @@ fn decode_field_json(
     if type_name == "vector" && type_args.len() == 1 && remaining.len() >= 4 {
         let elem_ty = resolve_self_type_refs(&type_args[0], petal_hash.0);
         let elem_width = static_field_width(petal_hash, &elem_ty, manifest, depth + 1)?;
+        if elem_width == 0 {
+            return None;
+        }
         let count =
             u32::from_be_bytes([remaining[0], remaining[1], remaining[2], remaining[3]]) as usize;
         let elems_len = count.checked_mul(elem_width)?;
@@ -1362,6 +1365,30 @@ mod tests {
                 { "id": hex::encode([0xB0; 32]), "value": "9" },
             ])
         );
+    }
+
+    #[test]
+    fn state_field_decoder_rejects_zero_width_vector_elements() {
+        let hash = Hash32([0x77; 32]);
+        let empty = object_type("Empty", vec![]);
+        let object_type = object_type(
+            "Bag",
+            vec![(
+                "items",
+                vector(TypeTag::Concrete {
+                    petal_hash: [0; 32],
+                    type_name: "Empty".to_string(),
+                    type_args: vec![],
+                }),
+            )],
+        );
+        let manifest = full_manifest("/bloom/petals/dex/bag", vec![empty, object_type.clone()]);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u32::MAX.to_be_bytes());
+        let object = petal_object(0x77, hash, "Bag", payload);
+
+        let fields = decode_object_fields(hash, &object, &object_type, &manifest);
+        assert_eq!(fields["items"], json!({ "hex": "ffffffff" }));
     }
 
     #[tokio::test]
