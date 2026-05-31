@@ -375,7 +375,7 @@ impl PetalsEndpointHandler {
         let object_type = object_type_decl(&manifest, type_name)
             .ok_or_else(|| HandlerError::not_found(type_name.clone()))?;
         let (_id, object) = self.state_object(binding.hash, type_name, id_hex)?;
-        let fields = decode_object_fields(binding.hash, &object, object_type);
+        let fields = decode_object_fields(binding.hash, &object, object_type, &manifest);
         let value = if leaf == OBJECT_JSON {
             state_object_json(&object, fields)
         } else {
@@ -472,32 +472,159 @@ fn decode_object_fields(
     petal_hash: Hash32,
     object: &Object,
     object_type: &ObjectTypeDecl,
+    manifest: &PetalManifestV0,
 ) -> BTreeMap<String, Value> {
-    let mut out = BTreeMap::new();
-    let mut offset = 0usize;
     let type_args = match &object.type_tag {
         TypeTag::Concrete { type_args, .. } => type_args.as_slice(),
         _ => &[],
     };
+    decode_fields_from_payload(
+        petal_hash,
+        &object.payload,
+        object_type,
+        manifest,
+        type_args,
+        0,
+    )
+    .0
+}
+
+fn decode_fields_from_payload(
+    petal_hash: Hash32,
+    payload: &[u8],
+    object_type: &ObjectTypeDecl,
+    manifest: &PetalManifestV0,
+    type_args: &[TypeTag],
+    depth: usize,
+) -> (BTreeMap<String, Value>, usize) {
+    let mut out = BTreeMap::new();
+    let mut offset = 0usize;
     for (idx, field) in object_type.fields.iter().enumerate() {
-        let remaining = &object.payload[offset..];
+        let remaining = &payload[offset..];
         let field_ty =
             resolve_self_type_refs(&substitute_type_args(&field.ty, type_args), petal_hash.0);
-        let width = field_width(&field_ty, remaining, idx + 1 == object_type.fields.len());
-        let Some(width) = width.filter(|width| offset + *width <= object.payload.len()) else {
+        let decoded = decode_field_json(
+            petal_hash,
+            &field_ty,
+            remaining,
+            idx + 1 == object_type.fields.len(),
+            manifest,
+            depth,
+        );
+        let Some((value, consumed)) = decoded.filter(|(_, consumed)| *consumed <= remaining.len())
+        else {
             out.insert(field.name.clone(), json!({ "hex": hex::encode(remaining) }));
-            offset = object.payload.len();
+            offset = payload.len();
             continue;
         };
-        let bytes = &object.payload[offset..offset + width];
-        let value = match decode_return_json(&field_ty, bytes) {
-            Ok(Some(value)) => value,
-            Ok(None) | Err(_) => json!({ "hex": hex::encode(bytes) }),
-        };
         out.insert(field.name.clone(), value);
-        offset += width;
+        offset += consumed;
     }
-    out
+    (out, offset)
+}
+
+fn decode_field_json(
+    petal_hash: Hash32,
+    tag: &TypeTag,
+    remaining: &[u8],
+    is_last: bool,
+    manifest: &PetalManifestV0,
+    depth: usize,
+) -> Option<(Value, usize)> {
+    if depth > 16 {
+        return None;
+    }
+    let TypeTag::Concrete {
+        petal_hash: tag_hash,
+        type_name,
+        type_args,
+    } = tag
+    else {
+        return None;
+    };
+
+    if let Some(width) = fixed_width(tag) {
+        let bytes = remaining.get(..width)?;
+        return Some((decode_scalar_or_hex(tag, bytes), width));
+    }
+
+    if type_name == "String" && remaining.len() >= 2 {
+        let len = u16::from_be_bytes([remaining[0], remaining[1]]) as usize;
+        let width = 2usize.checked_add(len)?;
+        let bytes = remaining.get(..width)?;
+        return Some((decode_scalar_or_hex(tag, bytes), width));
+    }
+
+    if matches!(type_name.as_str(), "bytes" | "string") && is_last {
+        return Some((decode_scalar_or_hex(tag, remaining), remaining.len()));
+    }
+
+    if type_name == "Coin" && type_args.len() == 1 {
+        let id = remaining.get(..32)?;
+        let value = remaining.get(32..48)?;
+        let mut amount = [0u8; 16];
+        amount.copy_from_slice(value);
+        return Some((
+            json!({
+                "id": hex::encode(id),
+                "value": u128::from_be_bytes(amount).to_string(),
+            }),
+            48,
+        ));
+    }
+
+    if type_name == "vector" && type_args.len() == 1 && remaining.len() >= 4 {
+        let elem_ty = resolve_self_type_refs(&type_args[0], petal_hash.0);
+        let elem_width = static_field_width(petal_hash, &elem_ty, manifest, depth + 1)?;
+        let count =
+            u32::from_be_bytes([remaining[0], remaining[1], remaining[2], remaining[3]]) as usize;
+        let elems_len = count.checked_mul(elem_width)?;
+        let width = 4usize.checked_add(elems_len)?;
+        remaining.get(..width)?;
+
+        let mut values = Vec::with_capacity(count);
+        let mut offset = 4usize;
+        for _ in 0..count {
+            let end = offset + elem_width;
+            let (value, consumed) = decode_field_json(
+                petal_hash,
+                &elem_ty,
+                &remaining[offset..end],
+                true,
+                manifest,
+                depth + 1,
+            )?;
+            if consumed != elem_width {
+                return None;
+            }
+            values.push(value);
+            offset = end;
+        }
+        return Some((Value::Array(values), width));
+    }
+
+    if *tag_hash == petal_hash.0
+        && let Some(nested_type) = object_type_decl(manifest, type_name)
+    {
+        let (fields, consumed) = decode_fields_from_payload(
+            petal_hash,
+            remaining,
+            nested_type,
+            manifest,
+            type_args,
+            depth + 1,
+        );
+        return Some((json!(fields), consumed));
+    }
+
+    None
+}
+
+fn decode_scalar_or_hex(tag: &TypeTag, bytes: &[u8]) -> Value {
+    match decode_return_json(tag, bytes) {
+        Ok(Some(value)) => value,
+        Ok(None) | Err(_) => json!({ "hex": hex::encode(bytes) }),
+    }
 }
 
 fn substitute_type_args(t: &TypeTag, type_args: &[TypeTag]) -> TypeTag {
@@ -548,30 +675,41 @@ fn resolve_self_type_refs(t: &TypeTag, self_hash: [u8; 32]) -> TypeTag {
     }
 }
 
-fn field_width(tag: &TypeTag, remaining: &[u8], is_last: bool) -> Option<usize> {
+fn static_field_width(
+    petal_hash: Hash32,
+    tag: &TypeTag,
+    manifest: &PetalManifestV0,
+    depth: usize,
+) -> Option<usize> {
+    if depth > 16 {
+        return None;
+    }
     let TypeTag::Concrete {
+        petal_hash: tag_hash,
         type_name,
         type_args,
-        ..
     } = tag
     else {
         return None;
     };
-    if type_name == "vector"
-        && type_args.len() == 1
-        && let Some(elem_width) = fixed_width(&type_args[0])
-        && remaining.len() >= 4
+    if type_name == "Coin" && type_args.len() == 1 {
+        return Some(48);
+    }
+    if *tag_hash == petal_hash.0
+        && let Some(nested_type) = object_type_decl(manifest, type_name)
     {
-        let count =
-            u32::from_be_bytes([remaining[0], remaining[1], remaining[2], remaining[3]]) as usize;
-        return 4usize.checked_add(count.checked_mul(elem_width)?);
-    }
-    if matches!(type_name.as_str(), "bytes" | "string") && is_last {
-        return Some(remaining.len());
-    }
-    if type_name == "String" && remaining.len() >= 2 {
-        let len = u16::from_be_bytes([remaining[0], remaining[1]]) as usize;
-        return Some(2 + len);
+        let mut width = 0usize;
+        for field in &nested_type.fields {
+            let field_ty =
+                resolve_self_type_refs(&substitute_type_args(&field.ty, type_args), petal_hash.0);
+            width = width.checked_add(static_field_width(
+                petal_hash,
+                &field_ty,
+                manifest,
+                depth + 1,
+            )?)?;
+        }
+        return Some(width);
     }
     fixed_width(tag)
 }
@@ -1070,6 +1208,65 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn state_object_ids_are_paginated_and_state_files_are_read_only() {
+        let chain = Arc::new(MockChain::default());
+        let hash = Hash32([0x12; 32]);
+        chain.bind_full(
+            "/bloom/petals/dex/probe",
+            hash,
+            full_manifest(
+                "/bloom/petals/dex/probe",
+                vec![object_type("Counter", vec![("value", prim("u128"))])],
+            ),
+        );
+        for i in 0..=paginate::PAGE_SIZE {
+            let mut id = [0u8; 32];
+            id[30..].copy_from_slice(&(i as u16).to_be_bytes());
+            chain.put_object(Object {
+                id: ObjectId(id),
+                type_tag: TypeTag::Concrete {
+                    petal_hash: hash.0,
+                    type_name: "Counter".to_string(),
+                    type_args: vec![],
+                },
+                owner: Owner::Shared,
+                version: 1,
+                payload: (i as u128).to_be_bytes().to_vec(),
+            });
+        }
+        let h = PetalsEndpointHandler::new(chain);
+
+        let counters = h.list(&vpath("dex/probe/.state/Counter")).await.unwrap();
+        assert_eq!(
+            counters.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["page"]
+        );
+        let page = h
+            .list(&vpath("dex/probe/.state/Counter/page/000000"))
+            .await
+            .unwrap();
+        assert_eq!(page.len(), paginate::PAGE_SIZE);
+        assert!(page.iter().all(|entry| entry.mode == 0o755));
+
+        let first_id = &page[0].name;
+        let value = h
+            .lookup(&vpath(&format!(
+                "dex/probe/.state/Counter/{first_id}/value"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(value.mode, 0o444);
+        assert!(matches!(
+            h.write(
+                &vpath(&format!("dex/probe/.state/Counter/{first_id}/value")),
+                b"123"
+            )
+            .await,
+            Err(HandlerError::PermissionDenied)
+        ));
+    }
+
     #[test]
     fn state_field_decoder_substitutes_generics_and_falls_back_to_hex() {
         let hash = Hash32([0x33; 32]);
@@ -1102,9 +1299,69 @@ mod tests {
             payload,
         };
 
-        let fields = decode_object_fields(hash, &object, &object_type);
+        let manifest = full_manifest("/bloom/petals/dex/box", vec![object_type.clone()]);
+        let fields = decode_object_fields(hash, &object, &object_type, &manifest);
         assert_eq!(fields["inner"], "5");
         assert_eq!(fields["opaque"], json!({ "hex": "abcd" }));
+    }
+
+    #[test]
+    fn state_field_decoder_decodes_nested_structs_and_coins() {
+        let hash = Hash32([0x55; 32]);
+        let stats = object_type(
+            "Stats",
+            vec![("count", prim("u32")), ("enabled", prim("bool"))],
+        );
+        let coin = TypeTag::Concrete {
+            petal_hash: [0; 32],
+            type_name: "Coin".to_string(),
+            type_args: vec![prim("LOOM")],
+        };
+        let object_type = object_type(
+            "Vault",
+            vec![
+                (
+                    "stats",
+                    TypeTag::Concrete {
+                        petal_hash: [0; 32],
+                        type_name: "Stats".to_string(),
+                        type_args: vec![],
+                    },
+                ),
+                ("coins", vector(coin)),
+            ],
+        );
+        let manifest = full_manifest("/bloom/petals/dex/vault", vec![stats, object_type.clone()]);
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&42u32.to_be_bytes());
+        payload.push(1);
+        payload.extend_from_slice(&(2u32).to_be_bytes());
+        payload.extend_from_slice(&[0xA0; 32]);
+        payload.extend_from_slice(&7u128.to_be_bytes());
+        payload.extend_from_slice(&[0xB0; 32]);
+        payload.extend_from_slice(&9u128.to_be_bytes());
+        let object = Object {
+            id: ObjectId([0x66; 32]),
+            type_tag: TypeTag::Concrete {
+                petal_hash: hash.0,
+                type_name: "Vault".to_string(),
+                type_args: vec![],
+            },
+            owner: Owner::Immutable,
+            version: 1,
+            payload,
+        };
+
+        let fields = decode_object_fields(hash, &object, &object_type, &manifest);
+        assert_eq!(fields["stats"], json!({ "count": 42, "enabled": true }));
+        assert_eq!(
+            fields["coins"],
+            json!([
+                { "id": hex::encode([0xA0; 32]), "value": "7" },
+                { "id": hex::encode([0xB0; 32]), "value": "9" },
+            ])
+        );
     }
 
     #[tokio::test]
