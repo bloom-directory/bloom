@@ -11,6 +11,7 @@ bloom-proto.workspace = true
 bloom-ptb-builder.workspace = true
 bloom-script.workspace = true
 bloom-objects.workspace = true
+bloom-petal-manifest.workspace = true
 bloom-chain-types.workspace = true
 bloom-keystore.workspace = true
 bloom-chain.workspace = true

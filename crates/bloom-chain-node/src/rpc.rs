@@ -22,7 +22,7 @@
 //! - `chain_query_code` — look up code bytes by 32-byte content hash.
 //! - `chain_resolve_path` — resolve a signed manifest module path to a petal hash.
 //! - `chain_list_vfs` — list VFS petal path bindings.
-//! - `chain_ls_objects` — scan objects filtered by owner address or type name.
+//! - `chain_ls_objects` — scan objects filtered by owner address, type name, or all.
 //! - `chain_view_call` — execute one read-only petal call against a snapshot.
 //! - `chain_ls_validators` — list the current validator set.
 
@@ -582,7 +582,7 @@ impl RpcServer {
     }
 
     fn handle_ls_objects(&self, params: &Value) -> Result<Value> {
-        // Params: { "owner_addr": "<hex>" } OR { "type_name": "<str>" }.
+        // Params: { "owner_addr": "<hex>" } OR { "type_name": "<str>" } OR { "all": true }.
         // Scans every object and returns a JSON array of the same per-object
         // shape as `chain_query_object`, filtered by the supplied predicate.
         // Exactly one of the two filters must be present.
@@ -600,9 +600,12 @@ impl RpcServer {
             })
             .transpose()?;
         let type_filter = params.get("type_name").and_then(Value::as_str);
-        if owner_filter.is_none() == type_filter.is_none() {
+        let all_filter = params.get("all").and_then(Value::as_bool) == Some(true);
+        let filter_count =
+            owner_filter.is_some() as u8 + type_filter.is_some() as u8 + all_filter as u8;
+        if filter_count != 1 {
             return Err(anyhow!(
-                "chain_ls_objects: provide exactly one of 'owner_addr' or 'type_name'"
+                "chain_ls_objects: provide exactly one of 'owner_addr', 'type_name', or 'all'"
             ));
         }
 
@@ -619,6 +622,7 @@ impl RpcServer {
                     &obj.type_tag,
                     bloom_objects::TypeTag::Concrete { type_name, .. } if type_name == name
                 ),
+                (None, None) if all_filter => true,
                 (None, None) => unreachable!("filter presence checked above"),
             };
             if keep {
@@ -1447,6 +1451,23 @@ impl ChainStateIface for RpcChainAdapter {
             .collect()
     }
 
+    fn iter_objects(&self) -> Vec<(bloom_objects::ObjectId, Object)> {
+        let Ok(value) = self.call_blocking("chain_ls_objects", json!({ "all": true })) else {
+            return Vec::new();
+        };
+        let Some(objects) = value.as_array() else {
+            return Vec::new();
+        };
+        objects
+            .iter()
+            .filter_map(|value| {
+                let bytes = hex::decode(value.get("bytes")?.as_str()?).ok()?;
+                let object = Object::decode_canonical(&bytes).ok()?;
+                Some((object.id, object))
+            })
+            .collect()
+    }
+
     fn current_block(&self) -> u64 {
         self.call_blocking("chain_tip", json!({}))
             .ok()
@@ -2097,6 +2118,9 @@ mod tests {
         let arr = by_type.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         assert!(arr.iter().all(|o| o["type_name"] == "Coin"));
+
+        let all = server.handle_ls_objects(&json!({ "all": true })).unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 3);
     }
 
     #[test]
@@ -2110,6 +2134,11 @@ mod tests {
                 .handle_ls_objects(
                     &json!({ "owner_addr": hex::encode([0u8; 32]), "type_name": "Coin" })
                 )
+                .is_err()
+        );
+        assert!(
+            server
+                .handle_ls_objects(&json!({ "type_name": "Coin", "all": true }))
                 .is_err()
         );
     }

@@ -380,8 +380,13 @@ fn deploy_outside_petals_prefix_fails_without_writes() {
 }
 
 #[test]
-fn deploy_reserved_pipe_path_fails_without_writes() {
-    for path in ["/bloom/petals/.pipe", "/bloom/petals/.pipe/foo"] {
+fn deploy_dot_prefixed_path_fails_without_writes() {
+    for path in [
+        "/bloom/petals/.pipe",
+        "/bloom/petals/.pipe/foo",
+        "/bloom/petals/dex/.state",
+        "/bloom/petals/dex/.foo",
+    ] {
         let mut state = State::new();
         let out = ChainPetalExecutor.execute_tx(
             &deploy_tx(wasm_with_manifest(path)),
@@ -396,7 +401,7 @@ fn deploy_reserved_pipe_path_fails_without_writes() {
         assert!(out.write_set.is_none(), "{path} should not emit writes");
         assert!(state.vfs_lookup(path).is_none());
         assert!(
-            String::from_utf8_lossy(&out.return_data).contains(".pipe"),
+            String::from_utf8_lossy(&out.return_data).contains("dot-prefixed"),
             "unexpected error for {path}: {}",
             String::from_utf8_lossy(&out.return_data)
         );

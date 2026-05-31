@@ -17,17 +17,17 @@
 #   runtime       — debian:bookworm-slim with the produced artefacts
 
 # ----------------------------------------------------------------------------
-# Use `rust:1-bookworm` (latest stable in the 1.x series) rather than pinning
-# to 1.85 — the workspace MSRV is 1.85 (lower bound) and several build-time
-# tools (cargo-chef and its deps) now require >=1.86.
-ARG RUST_VERSION=1
+# Use a concrete stable Rust image so rustup does not refresh the floating
+# `stable` channel during every Docker build.
+ARG RUST_VERSION=1.96.0
 ARG DEBIAN_RELEASE=bookworm
 
 FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS chef
 WORKDIR /build
 ENV CARGO_TERM_COLOR=always \
     CARGO_NET_RETRY=10 \
-    RUST_BACKTRACE=1
+    RUST_BACKTRACE=1 \
+    RUSTUP_TOOLCHAIN=${RUST_VERSION}
 # Pre-install all components that the workspace's rust-toolchain.toml lists
 # (channel = "stable", components = ["rustfmt", "clippy"]). Without this,
 # the first cargo invocation in the planner stage triggers a rustup channel
@@ -49,7 +49,9 @@ COPY --from=planner /recipe.json /recipe.json
 # specific packages because `cargo chef cook -p <pkg>` doesn't always pick
 # up workspace examples reliably; cooking the whole tree is more robust and
 # the resulting layer is reused by every host-target build below.
-RUN cargo chef cook --release --recipe-path /recipe.json
+RUN cargo chef cook --release --recipe-path /recipe.json \
+    -p bloom --bin bloom --all-features \
+    -p bloom-petal-dex-it --tests
 # We deliberately skip a wasm32 `cargo chef cook` step: most workspace deps
 # (tokio, rocksdb, alloy providers, …) don't compile for wasm32 and would
 # fail. The DEX petals have a small, self-contained dep tree that builds
@@ -59,21 +61,18 @@ RUN cargo chef cook --release --recipe-path /recipe.json
 FROM builder-deps AS builder
 COPY . .
 
-# The workspace ships a `rust-toolchain.toml` that pins `channel = "stable"`.
-# Once the source tree lands in /build, rustup will auto-install whichever
-# toolchain that resolves to — potentially different from the one used in the
-# `chef` stage where we ran `rustup target add wasm32-unknown-unknown`.
-# Re-add the wasm target here so it's guaranteed to be present for the
-# resolved toolchain. (Idempotent and fast when already installed.)
+# RUSTUP_TOOLCHAIN is set in the base stage so cargo uses the already-installed
+# Docker toolchain instead of syncing the workspace `rust-toolchain.toml`
+# override after every source COPY. Re-add the wasm target here so it is
+# guaranteed to be present for the active toolchain.
 RUN rustup target add wasm32-unknown-unknown
 
-# Host/validator binary. Build with all features so the same artifact can be
-# copied out by the docker acceptance script for host-side VFS mount commands.
-RUN cargo build --release -p bloom --all-features
-
-# Docker acceptance driver. Build it in the image so CI does not compile the
-# same test graph again on the host after the image build has already run.
-RUN cargo test --release -p bloom-petal-dex-it --test docker_petal_dex --no-run
+# Host/validator binary plus Docker acceptance driver. Build them in one Cargo
+# invocation so the shared graph is planned and compiled once in this layer.
+RUN rm -f target/release/deps/docker_petal_dex-* \
+ && cargo build --release \
+    -p bloom --bin bloom --all-features \
+    -p bloom-petal-dex-it --test docker_petal_dex
 
 # DEX petal wasm artefacts. Build each petal in its own `cargo build`
 # invocation because sibling petals use `features = ["no-entrypoint"]` when

@@ -155,6 +155,13 @@ impl ChainStateIface for PtbChainAdapter<'_> {
             .collect()
     }
 
+    fn iter_objects(&self) -> Vec<(bloom_objects::ObjectId, Object)> {
+        self.state
+            .iter_objects()
+            .map(|(id, obj)| (*id, obj.clone()))
+            .collect()
+    }
+
     fn current_block(&self) -> u64 {
         self.current_block
     }

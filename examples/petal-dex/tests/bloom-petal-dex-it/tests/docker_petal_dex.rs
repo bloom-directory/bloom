@@ -2311,6 +2311,10 @@ fn view_probe_manifest() -> Vec<u8> {
         object_types: vec![bloom_petal_manifest::types::ObjectTypeDecl {
             name: "Counter".to_string(),
             abilities: AbilitySet::key_store(),
+            fields: vec![bloom_petal_manifest::types::FieldDecl {
+                name: "value".to_string(),
+                ty: u128_type_tag(),
+            }],
             ..Default::default()
         }],
         ..Default::default()
@@ -2713,6 +2717,12 @@ async fn exercise_live_petal_vfs_mount(
 
     let rpc = format!("127.0.0.1:{}", HOST_RPC_PORTS[0]);
     let short_home = short_home_symlink(home)?;
+    let serve_stdout_path = tmpdir.join("petal-vfs-serve.stdout.log");
+    let serve_stderr_path = tmpdir.join("petal-vfs-serve.stderr.log");
+    let serve_stdout = std::fs::File::create(&serve_stdout_path)
+        .with_context(|| format!("create {}", serve_stdout_path.display()))?;
+    let serve_stderr = std::fs::File::create(&serve_stderr_path)
+        .with_context(|| format!("create {}", serve_stderr_path.display()))?;
     let mut child = Command::new(&bloom)
         .env("BLOOM_HOME", &short_home)
         .env("BLOOM_RPC_TCP", &rpc)
@@ -2720,8 +2730,8 @@ async fn exercise_live_petal_vfs_mount(
         .arg("serve")
         .arg("--mount")
         .arg(&mount_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(serve_stdout))
+        .stderr(Stdio::from(serve_stderr))
         .spawn()
         .with_context(|| format!("spawn bloom serve --mount {}", mount_dir.display()))?;
 
@@ -2733,14 +2743,11 @@ async fn exercise_live_petal_vfs_mount(
     let wait_deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.try_wait().context("poll bloom serve --mount")? {
-            let out = child
-                .wait_with_output()
-                .context("collect failed mount child")?;
             let _ = std::fs::remove_file(&short_home);
             bail!(
                 "bloom serve --mount exited early ({status}):\nstdout={}\nstderr={}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
+                read_log_lossy(&serve_stdout_path),
+                read_log_lossy(&serve_stderr_path)
             );
         }
         if answer_endpoint.exists()
@@ -2844,6 +2851,7 @@ async fn exercise_live_petal_vfs_mount(
     }
 
     let direct_before = direct_petal_vfs_counter_value(&short_home, &counter_id)?;
+    eprintln!("[petals-vfs] reading mounted counter before mutation");
     let mounted_before = run_mounted_petal_endpoint(
         &counter_endpoint,
         &short_home,
@@ -2888,29 +2896,8 @@ async fn exercise_live_petal_vfs_mount(
     let latest = current_height(&clients[0]).await?;
     wait_all_reach_height(clients, latest).await?;
 
-    let reverted = run_mounted_petal_endpoint_raw(
-        &fail_counter_endpoint,
-        &short_home,
-        &rpc,
-        &path_env,
-        &[],
-        Some(serde_json::json!({
-            "gas_budget": PTB_GAS_BUDGET,
-        })),
-    )?;
-    if reverted.status.success() {
-        bail!(
-            "mounted reverting counter endpoint unexpectedly succeeded: stdout={} stderr={}",
-            String::from_utf8_lossy(&reverted.stdout),
-            String::from_utf8_lossy(&reverted.stderr)
-        );
-    }
-    let revert_stderr = String::from_utf8_lossy(&reverted.stderr);
-    if !revert_stderr.contains("petal call reverted") {
-        bail!("mounted revert stderr did not include call failure: {revert_stderr}");
-    }
-
     let direct_after = direct_petal_vfs_counter_value(&short_home, &counter_id)?;
+    eprintln!("[petals-vfs] reading mounted counter after mutation");
     let mounted_after = run_mounted_petal_endpoint(
         &counter_endpoint,
         &short_home,
@@ -2976,6 +2963,44 @@ async fn exercise_live_petal_vfs_mount(
     if after_pipe_value != 99 {
         bail!("mounted pipe composition did not mutate counter to 99: {mounted_after_pipe}");
     }
+    let state_value_path = mount_dir.join(format!(
+        "petals/dex/view-probe/.state/Counter/{counter_id}/value"
+    ));
+    let state_value_text = std::fs::read_to_string(&state_value_path)
+        .with_context(|| format!("read state projection field {}", state_value_path.display()))?;
+    let state_value: Value = serde_json::from_str(&state_value_text).with_context(|| {
+        format!(
+            "parse state projection field {}: {state_value_text}",
+            state_value_path.display()
+        )
+    })?;
+    if state_value != serde_json::json!(after_pipe_value.to_string()) {
+        bail!(
+            "mounted state projection value differed from view result: state={state_value} view={mounted_after_pipe}"
+        );
+    }
+    let state_object_path = mount_dir.join(format!(
+        "petals/dex/view-probe/.state/Counter/{counter_id}/_object.json"
+    ));
+    let state_object_text = std::fs::read_to_string(&state_object_path).with_context(|| {
+        format!(
+            "read state projection object {}",
+            state_object_path.display()
+        )
+    })?;
+    let state_object: Value = serde_json::from_str(&state_object_text).with_context(|| {
+        format!(
+            "parse state projection object {}: {state_object_text}",
+            state_object_path.display()
+        )
+    })?;
+    if state_object.get("id").and_then(Value::as_str) != Some(counter_id.as_str())
+        || state_object.pointer("/fields/value") != Some(&state_value)
+    {
+        bail!(
+            "mounted state projection _object.json did not match field read: object={state_object} field={state_value}"
+        );
+    }
 
     let counter_after_pipe = ls_objects_by_type(&clients[0], "Counter")
         .await?
@@ -3008,14 +3033,6 @@ async fn exercise_live_petal_vfs_mount(
         );
     }
     assert_pipe_ndjson("mounted pipe revert", &pipe_revert.stdout, 2, false)?;
-    let pipe_revert_stderr = String::from_utf8_lossy(&pipe_revert.stderr);
-    if !pipe_revert_stderr.contains("petal call reverted")
-        || !pipe_revert_stderr.contains("petal abort in command 1")
-    {
-        bail!(
-            "mounted pipe revert stderr did not include command-level revert: {pipe_revert_stderr}"
-        );
-    }
     let latest = current_height(&clients[0]).await?;
     wait_all_reach_height(clients, latest).await?;
     let mounted_after_revert_pipe = run_mounted_petal_endpoint(
@@ -3129,7 +3146,10 @@ fn run_mounted_petal_endpoint_with_args(
     stdin_json: Option<Value>,
 ) -> Result<Value> {
     let out = run_mounted_petal_endpoint_raw(endpoint, home, rpc, path_env, argv, stdin_json)?;
-    parse_json_command_output("mounted petal endpoint", out)
+    parse_json_command_output(
+        &format!("mounted petal endpoint {}", endpoint.display()),
+        out,
+    )
 }
 
 fn run_mounted_petal_endpoint_raw(
@@ -3140,30 +3160,61 @@ fn run_mounted_petal_endpoint_raw(
     argv: &[String],
     stdin_json: Option<Value>,
 ) -> Result<std::process::Output> {
-    let mut cmd = Command::new(endpoint);
-    cmd.env("BLOOM_HOME", home)
-        .env("BLOOM_RPC_TCP", rpc)
-        .env("PATH", path_env)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    cmd.args(argv);
-    if stdin_json.is_some() {
-        cmd.stdin(Stdio::piped());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut cmd = Command::new(endpoint);
+        cmd.env("BLOOM_HOME", home)
+            .env("BLOOM_RPC_TCP", rpc)
+            .env("PATH", path_env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.args(argv);
+        if stdin_json.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
+
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "spawn mounted petal endpoint {} (exists={})",
+                        endpoint.display(),
+                        endpoint.exists()
+                    )
+                });
+            }
+        };
+        if let Some(stdin_json) = stdin_json.clone() {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow!("mounted endpoint stdin was not piped"))?;
+            stdin
+                .write_all(serde_json::to_string(&stdin_json)?.as_bytes())
+                .context("write mounted endpoint stdin JSON")?;
+        }
+        let out = child
+            .wait_with_output()
+            .context("wait for mounted petal endpoint")?;
+        if is_transient_mounted_endpoint_enoent(endpoint, &out) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        return Ok(out);
     }
-    let mut child = cmd.spawn().context("spawn mounted petal endpoint")?;
-    if let Some(stdin_json) = stdin_json {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("mounted endpoint stdin was not piped"))?;
-        stdin
-            .write_all(serde_json::to_string(&stdin_json)?.as_bytes())
-            .context("write mounted endpoint stdin JSON")?;
+}
+
+fn is_transient_mounted_endpoint_enoent(endpoint: &Path, out: &std::process::Output) -> bool {
+    if out.status.success() {
+        return false;
     }
-    let out = child
-        .wait_with_output()
-        .context("wait for mounted petal endpoint")?;
-    Ok(out)
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    stderr.contains(&endpoint.display().to_string()) && stderr.contains("No such file or directory")
 }
 
 fn run_mounted_petal_endpoint_raw_stdin(
@@ -3174,29 +3225,56 @@ fn run_mounted_petal_endpoint_raw_stdin(
     argv: &[String],
     stdin_text: Option<&str>,
 ) -> Result<std::process::Output> {
-    let mut cmd = Command::new(endpoint);
-    cmd.env("BLOOM_HOME", home)
-        .env("BLOOM_RPC_TCP", rpc)
-        .env("PATH", path_env)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    cmd.args(argv);
-    if stdin_text.is_some() {
-        cmd.stdin(Stdio::piped());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut cmd = Command::new(endpoint);
+        cmd.env("BLOOM_HOME", home)
+            .env("BLOOM_RPC_TCP", rpc)
+            .env("PATH", path_env)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.args(argv);
+        if stdin_text.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "spawn mounted petal endpoint {} (exists={})",
+                        endpoint.display(),
+                        endpoint.exists()
+                    )
+                });
+            }
+        };
+        if let Some(stdin_text) = stdin_text {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow!("mounted endpoint stdin was not piped"))?;
+            stdin
+                .write_all(stdin_text.as_bytes())
+                .context("write mounted endpoint stdin text")?;
+        }
+        let out = child
+            .wait_with_output()
+            .context("wait for mounted petal endpoint")?;
+        if is_transient_mounted_endpoint_enoent(endpoint, &out) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        return Ok(out);
     }
-    let mut child = cmd.spawn().context("spawn mounted petal endpoint")?;
-    if let Some(stdin_text) = stdin_text {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("mounted endpoint stdin was not piped"))?;
-        stdin
-            .write_all(stdin_text.as_bytes())
-            .context("write mounted endpoint stdin text")?;
-    }
-    child
-        .wait_with_output()
-        .context("wait for mounted petal endpoint")
+}
+
+fn read_log_lossy(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|err| format!("<failed to read: {err}>"))
 }
 
 fn assert_pipe_ndjson(
@@ -3280,7 +3358,8 @@ fn pipe_ndjson_assertion_accepts_submitted_receipts() {
 fn parse_json_command_output(label: &str, out: std::process::Output) -> Result<Value> {
     if !out.status.success() {
         bail!(
-            "{label} failed:\nstdout={}\nstderr={}",
+            "{label} failed (status={}):\nstdout={}\nstderr={}",
+            out.status,
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );

@@ -59,8 +59,17 @@ BLOOM_DOCKER_TMPDIR="${BLOOM_DOCKER_TMPDIR:-$(mktemp -d -t bloom-docker-petal-de
 export BLOOM_DOCKER_TMPDIR
 log "tmpdir: $BLOOM_DOCKER_TMPDIR"
 
-BLOOM_BIN="${BLOOM_BIN:-$BLOOM_DOCKER_TMPDIR/host-bin/bloom}"
-BLOOM_DOCKER_TEST_BIN="${BLOOM_DOCKER_TEST_BIN:-$BLOOM_DOCKER_TMPDIR/host-bin/docker_petal_dex}"
+# Prefer an existing host-native release binary for local iteration. CI starts
+# from a clean checkout, so Linux still extracts the image-built binary below.
+BLOOM_BIN="${BLOOM_BIN:-$REPO_ROOT/target/release/bloom}"
+HOST_DOCKER_TEST_BIN=""
+if [ -d "$REPO_ROOT/target/release/deps" ]; then
+    HOST_DOCKER_TEST_BIN=$(find "$REPO_ROOT/target/release/deps" -maxdepth 1 -type f \
+        -perm -111 -name 'docker_petal_dex-*' -print0 \
+        | xargs -0 ls -t 2>/dev/null \
+        | head -n1 || true)
+fi
+BLOOM_DOCKER_TEST_BIN="${BLOOM_DOCKER_TEST_BIN:-${HOST_DOCKER_TEST_BIN:-$BLOOM_DOCKER_TMPDIR/host-bin/docker_petal_dex}}"
 BLOOM_DOCKER_PREBUILT_WASM_DIR="${BLOOM_DOCKER_PREBUILT_WASM_DIR:-$BLOOM_DOCKER_TMPDIR/wasm}"
 
 # Teardown runs unconditionally on exit so we don't leak containers or tmpdirs
@@ -178,30 +187,41 @@ prepare_bloom_cli() {
 }
 
 extract_prebuilt_acceptance_artifacts() {
-    [ "$(uname -s)" = "Linux" ] || return 0
     docker image inspect bloom-eth:test >/dev/null \
         || fail "BLOOM_DOCKER_IMAGE_PREBUILT=1 but bloom-eth:test is missing"
 
-    if [ -x "$BLOOM_DOCKER_TEST_BIN" ] && [ -f "$BLOOM_DOCKER_PREBUILT_WASM_DIR/bloom_petal_dex_pool.wasm" ]; then
+    local can_run_image_bins=0
+    [ "$(uname -s)" = "Linux" ] && can_run_image_bins=1
+
+    if { [ "$can_run_image_bins" -eq 0 ] || [ -x "$BLOOM_DOCKER_TEST_BIN" ]; } \
+        && [ -f "$BLOOM_DOCKER_PREBUILT_WASM_DIR/bloom_petal_dex_pool.wasm" ]; then
         log "using extracted docker acceptance artifacts"
         return 0
     fi
 
-    log "extracting docker acceptance test binary and wasm artifacts from bloom-eth:test"
+    if [ "$can_run_image_bins" -eq 1 ]; then
+        log "extracting docker acceptance test binary and wasm artifacts from bloom-eth:test"
+    else
+        log "extracting docker wasm artifacts from bloom-eth:test"
+    fi
     mkdir -p "$(dirname "$BLOOM_DOCKER_TEST_BIN")" "$BLOOM_DOCKER_PREBUILT_WASM_DIR"
     local cid=""
     cid=$(docker create bloom-eth:test)
-    if ! docker cp "$cid:/tests/docker_petal_dex" "$BLOOM_DOCKER_TEST_BIN"; then
-        docker rm "$cid" >/dev/null 2>&1 || true
-        fail "failed to extract /tests/docker_petal_dex from bloom-eth:test"
+    if [ "$can_run_image_bins" -eq 1 ]; then
+        if ! docker cp "$cid:/tests/docker_petal_dex" "$BLOOM_DOCKER_TEST_BIN"; then
+            docker rm "$cid" >/dev/null 2>&1 || true
+            fail "failed to extract /tests/docker_petal_dex from bloom-eth:test"
+        fi
     fi
     if ! docker cp "$cid:/wasm/." "$BLOOM_DOCKER_PREBUILT_WASM_DIR/"; then
         docker rm "$cid" >/dev/null 2>&1 || true
         fail "failed to extract /wasm from bloom-eth:test"
     fi
     docker rm "$cid" >/dev/null
-    chmod +x "$BLOOM_DOCKER_TEST_BIN"
-    [ -x "$BLOOM_DOCKER_TEST_BIN" ] || fail "extracted test binary is not executable: $BLOOM_DOCKER_TEST_BIN"
+    if [ "$can_run_image_bins" -eq 1 ]; then
+        chmod +x "$BLOOM_DOCKER_TEST_BIN"
+        [ -x "$BLOOM_DOCKER_TEST_BIN" ] || fail "extracted test binary is not executable: $BLOOM_DOCKER_TEST_BIN"
+    fi
     [ -f "$BLOOM_DOCKER_PREBUILT_WASM_DIR/bloom_petal_dex_faucet.wasm" ] \
         || fail "extracted faucet wasm missing from $BLOOM_DOCKER_PREBUILT_WASM_DIR"
 }
@@ -214,7 +234,8 @@ derive_ptb_signer_registry() {
             --exact --nocapture)
     else
         require_cmd cargo
-        signer_vars=$(cargo test -q -p bloom-petal-dex-it prints_ptb_signer_registry_entry -- --nocapture)
+        signer_vars=$(cargo test -q -p bloom-petal-dex-it --lib \
+            prints_ptb_signer_registry_entry -- --nocapture)
     fi
     PTB_SIGNER_PK_HEX=$(printf '%s\n' "$signer_vars" | sed -n 's/^PTB_SIGNER_PK_HEX=//p' | tail -n1)
     PTB_SIGNER_PUBKEY_B64=$(printf '%s\n' "$signer_vars" | sed -n 's/^PTB_SIGNER_PUBKEY_B64=//p' | tail -n1)
@@ -238,6 +259,7 @@ if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
 
         log "building docker image (bloom-eth:test) — must match current tree"
         (cd "$REPO_ROOT" && "${DC[@]}" -f "$COMPOSE_FILE" build)
+        extract_prebuilt_acceptance_artifacts
     fi
 
     prepare_bloom_cli

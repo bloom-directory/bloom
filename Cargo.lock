@@ -2696,6 +2696,7 @@ dependencies = [
  "bloom-keystore",
  "bloom-mempool",
  "bloom-objects",
+ "bloom-petal-manifest",
  "bloom-prices",
  "bloom-proto",
  "bloom-ptb-builder",

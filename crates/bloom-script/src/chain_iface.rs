@@ -162,6 +162,12 @@ pub trait ChainStateIface {
     fn iter_vfs(&self) -> Vec<(String, Hash32)> {
         Vec::new()
     }
+    /// Iterate every live object as `(id, object)`. Handlers use this for
+    /// latest-snapshot projections; callers should not assume a particular
+    /// order.
+    fn iter_objects(&self) -> Vec<(ObjectId, Object)> {
+        Vec::new()
+    }
     /// Current block height for the expiry check.
     fn current_block(&self) -> u64;
 }

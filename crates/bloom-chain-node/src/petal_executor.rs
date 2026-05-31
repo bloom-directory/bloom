@@ -177,12 +177,6 @@ fn validate_chain_petal_module_path(module_path: &str) -> Result<(), String> {
     for segment in suffix.split('/') {
         validate_chain_petal_vfs_segment(module_path, segment)?;
     }
-    let first = suffix.split('/').next();
-    if first == Some(".pipe") {
-        return Err(format!(
-            "module_path '{module_path}' reserves /bloom/petals/.pipe for composition"
-        ));
-    }
     Ok(())
 }
 
@@ -195,6 +189,11 @@ fn validate_chain_petal_vfs_segment(module_path: &str, segment: &str) -> Result<
     {
         return Err(format!(
             "module_path '{module_path}' contains VFS-invalid path segment"
+        ));
+    }
+    if segment.starts_with('.') {
+        return Err(format!(
+            "module_path '{module_path}' reserves dot-prefixed VFS control segments"
         ));
     }
     if segment == "page" {
@@ -1347,6 +1346,8 @@ mod tests {
             "/bloom/petals/",
             "/bloom/petals/.pipe",
             "/bloom/petals/.pipe/child",
+            "/bloom/petals/dex/.state",
+            "/bloom/petals/dex/.foo",
             "/bloom/petals/page",
             "/bloom/petals/dex/page",
             "/bloom/petals/dex\\pool",
