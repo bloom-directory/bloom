@@ -68,6 +68,8 @@ fn project_function(f: &FunctionDecl) -> FunctionDeclStub {
             })
             .collect(),
         returns: f.returns.clone(),
+        required_signers: f.required_signers,
+        required_capabilities: f.required_capabilities.clone(),
         attached_invariants: f
             .attached_invariants
             .iter()

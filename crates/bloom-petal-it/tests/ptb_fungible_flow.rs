@@ -136,6 +136,8 @@ fn move_split_transfer_happy_path() {
                     mode: AccessMode::Mutable,
                 }],
                 returns: vec![type_tag_coin_loom()],
+                required_signers: 0,
+                required_capabilities: vec![],
                 attached_invariants: vec![],
             }],
             ..Default::default()

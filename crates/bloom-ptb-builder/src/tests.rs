@@ -91,6 +91,8 @@ fn func(name: &str, args: Vec<ArgDeclStub>, returns: Vec<TypeTag>) -> FunctionDe
         type_params: vec![],
         args,
         returns,
+        required_signers: 0,
+        required_capabilities: vec![],
         attached_invariants: vec![],
     }
 }
@@ -308,6 +310,8 @@ fn append_type_arg_for_generic_endpoint() {
         }],
         args: vec![ArgDeclStub::TypeArg(0)],
         returns: vec![],
+        required_signers: 0,
+        required_capabilities: vec![],
         attached_invariants: vec![],
     }]);
     let mut s = PtbSession::new(&chain);
@@ -333,6 +337,8 @@ fn append_call_type_arg_for_generic_endpoint_without_type_arg_value() {
         }],
         args: vec![],
         returns: vec![],
+        required_signers: 0,
+        required_capabilities: vec![],
         attached_invariants: vec![],
     }]);
     let mut s = PtbSession::new(&chain);

@@ -63,6 +63,10 @@ pub struct FunctionDeclStub {
     pub args: Vec<ArgDeclStub>,
     /// Declared return TypeTags (in order).
     pub returns: Vec<TypeTag>,
+    /// Count of distinct signer authorities required by the manifest.
+    pub required_signers: u8,
+    /// Capability authorities required by the manifest.
+    pub required_capabilities: Vec<TypeTag>,
     /// Attached invariants (resolved by the executor after the call).
     pub attached_invariants: Vec<InvariantDeclStub>,
 }

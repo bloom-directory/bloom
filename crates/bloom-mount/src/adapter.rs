@@ -325,8 +325,14 @@ struct MountRenderCache {
 
 #[derive(Clone)]
 struct MountRenderEntry {
-    bytes: Bytes,
+    result: MountRenderResult,
     expires_at: Instant,
+}
+
+#[derive(Clone)]
+enum MountRenderResult {
+    Bytes(Bytes),
+    Error,
 }
 
 impl MountRenderCache {
@@ -337,7 +343,7 @@ impl MountRenderCache {
         }
     }
 
-    fn get(&self, path: &VfsPath) -> Option<Bytes> {
+    fn get(&self, path: &VfsPath) -> Option<MountRenderResult> {
         let mut g = self.inner.lock();
         let expired = g.peek(path).map(|e| e.expires_at <= Instant::now());
         match expired {
@@ -345,14 +351,22 @@ impl MountRenderCache {
                 g.pop(path);
                 None
             }
-            Some(false) => g.get(path).map(|e| e.bytes.clone()),
+            Some(false) => g.get(path).map(|e| e.result.clone()),
             None => None,
         }
     }
 
     fn put(&self, path: &VfsPath, bytes: Bytes, ttl: Duration) {
         let entry = MountRenderEntry {
-            bytes,
+            result: MountRenderResult::Bytes(bytes),
+            expires_at: Instant::now() + ttl,
+        };
+        self.inner.lock().put(path.clone(), entry);
+    }
+
+    fn put_error(&self, path: &VfsPath, ttl: Duration) {
+        let entry = MountRenderEntry {
+            result: MountRenderResult::Error,
             expires_at: Instant::now() + ttl,
         };
         self.inner.lock().put(path.clone(), entry);
@@ -657,13 +671,11 @@ impl FileSystem for BloomFs {
                             // write-only sink that errors on read).
                             // Falling through with `size = 0` keeps
                             // metadata-only inspection (`stat`,
-                            // `ls -l`) working — we must never let a
-                            // backend hiccup turn into a stat failure.
-                            // The kernel will short-circuit `cat` for
-                            // size=0, so a follow-up read won't
-                            // re-surface the error; that's a tradeoff
-                            // we accept (logs carry the detail) in
-                            // exchange for not breaking `ls`.
+                            // `ls -l`) working, but remember the
+                            // negative render so a follow-up READ can
+                            // surface EIO instead of looking like a
+                            // legitimate empty file.
+                            self.render_cache.put_error(path, RENDER_CACHE_TTL);
                             warn!(
                                 path = %path.to_string_path(),
                                 "mount.adapter.getattr.render_failed_falling_back_to_size_0"
@@ -819,10 +831,9 @@ impl FileSystem for BloomFs {
                 // past the immediate listing display; the next read
                 // re-issues GETATTR and gets a real size.
                 let size = if e.kind == EntryKind::File {
-                    if let Some(b) = self.render_cache.get(&child_path) {
-                        b.len() as u64
-                    } else {
-                        e.size
+                    match self.render_cache.get(&child_path) {
+                        Some(MountRenderResult::Bytes(b)) => b.len() as u64,
+                        Some(MountRenderResult::Error) | None => e.size,
                     }
                 } else {
                     e.size
@@ -876,8 +887,11 @@ impl FileSystem for BloomFs {
         // rendered body. Reading from that cache guarantees the size
         // we returned in GETATTR matches what READ delivers, so `eof`
         // is correct and tooling never sees NUL padding past EOF.
-        let data: Bytes = if let Some(b) = self.render_cache.get(&path) {
-            b
+        let data: Bytes = if let Some(cached) = self.render_cache.get(&path) {
+            match cached {
+                MountRenderResult::Bytes(b) => b,
+                MountRenderResult::Error => return Err(FsError::Io),
+            }
         } else {
             // Cache miss — go straight to the VFS. This covers reads
             // without a preceding GETATTR (e.g. some kernel paths
@@ -946,10 +960,9 @@ impl FileSystem for BloomFs {
         //   buffer is contiguous and report back the requested level so
         //   the kernel doesn't need to follow up with a COMMIT.
         // - DATA_SYNC / FILE_SYNC requested but buffer is incomplete
-        //   (mid-stream chunk): we keep buffering and downgrade the
-        //   reply to UNSTABLE — the embednfs server will reject this,
-        //   so this case is intentionally rare. In practice clients
-        //   issuing sync writes pack the whole payload into a single op.
+        //   (mid-stream chunk): reject explicitly. Returning a weaker
+        //   stability than requested violates embednfs' contract and
+        //   surfaces as SERVERFAULT/EREMOTEIO.
         // - UNSTABLE requested: buffer and reply UNSTABLE; the kernel
         //   sends a COMMIT after CLOSE that triggers `flush_path`.
         let (complete_payload, accepted) = {
@@ -974,6 +987,16 @@ impl FileSystem for BloomFs {
             };
             (payload, len)
         };
+
+        if complete_payload.is_none()
+            && matches!(
+                requested,
+                WriteStability::DataSync | WriteStability::FileSync
+            )
+        {
+            self.write_buffers.lock().remove(&path);
+            return Err(FsError::Unsupported);
+        }
 
         let actual_stability = if complete_payload.is_some() {
             // We persisted the buffer through to the VFS, so we can
@@ -1394,6 +1417,30 @@ mod tests {
         assert_eq!(result.stability, WriteStability::DataSync);
     }
 
+    #[tokio::test]
+    async fn incomplete_sync_write_is_rejected_instead_of_downgraded() {
+        let recorder = RecordingHandler::new();
+        let vfs = Vfs::builder().mount("box", recorder.clone()).build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let inbox = fs.lookup(&ctx, &dir, "inbox").await.unwrap();
+
+        let err = fs
+            .write(
+                &ctx,
+                &inbox,
+                8,
+                Bytes::copy_from_slice(b"tail"),
+                WriteStability::FileSync,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, FsError::Unsupported);
+        assert_eq!(recorder.write_count(), 0);
+    }
+
     /// Bug #4 acceptance: a write that would push the per-handle
     /// buffer past `MAX_WRITE_BUFFER_BYTES` must be rejected with
     /// `FileTooLarge` (NFS4ERR_FBIG) before any state mutation.
@@ -1706,6 +1753,22 @@ mod tests {
         let attrs = fs.getattr(&ctx, &confirm).await.unwrap();
         assert_eq!(attrs.size, 0);
         assert_eq!(attrs.mode & 0o777, 0o644);
+    }
+
+    #[tokio::test]
+    async fn getattr_render_failure_makes_followup_read_fail() {
+        let vfs = Vfs::builder()
+            .mount("box", Arc::new(WriteOnlySinkHandler))
+            .build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let dir = fs.lookup(&ctx, &BloomHandle::Root, "box").await.unwrap();
+        let confirm = fs.lookup(&ctx, &dir, "confirm").await.unwrap();
+
+        let attrs = fs.getattr(&ctx, &confirm).await.unwrap();
+        assert_eq!(attrs.size, 0);
+        let err = fs.read(&ctx, &confirm, 0, 1024).await.unwrap_err();
+        assert_eq!(err, FsError::Io);
     }
 
     /// Handler that exposes a read-only file whose `read` actually

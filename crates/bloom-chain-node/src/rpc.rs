@@ -66,6 +66,7 @@ use crate::state_index::StateIndex;
 pub const RPC_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 pub const RPC_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 pub const RPC_MAX_TX_BYTES: usize = 1024 * 1024;
+const RPC_MAX_LS_OBJECTS: usize = 1_024;
 const DEFAULT_VIEW_FUEL_LIMIT: u64 = 1_000_000;
 const RPC_MAX_TCP_CONNECTIONS: usize = 128;
 const RPC_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -583,9 +584,9 @@ impl RpcServer {
 
     fn handle_ls_objects(&self, params: &Value) -> Result<Value> {
         // Params: { "owner_addr": "<hex>" } OR { "type_name": "<str>" } OR { "all": true }.
-        // Scans every object and returns a JSON array of the same per-object
+        // Optional: { "limit": n, "offset": n }. Returns the same per-object
         // shape as `chain_query_object`, filtered by the supplied predicate.
-        // Exactly one of the two filters must be present.
+        // Exactly one filter must be present.
         let owner_filter = params
             .get("owner_addr")
             .and_then(Value::as_str)
@@ -608,9 +609,24 @@ impl RpcServer {
                 "chain_ls_objects: provide exactly one of 'owner_addr', 'type_name', or 'all'"
             ));
         }
+        let limit = params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+            .unwrap_or(RPC_MAX_LS_OBJECTS)
+            .min(RPC_MAX_LS_OBJECTS);
+        if limit == 0 {
+            return Err(anyhow!("chain_ls_objects: limit must be > 0"));
+        }
+        let offset = params
+            .get("offset")
+            .and_then(Value::as_u64)
+            .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+            .unwrap_or(0);
 
         let state = self.state.lock();
         let mut out = Vec::new();
+        let mut skipped = 0usize;
         for (_id, obj) in state.iter_objects() {
             let keep = match (&owner_filter, type_filter) {
                 (Some(addr), _) => matches!(
@@ -626,7 +642,14 @@ impl RpcServer {
                 (None, None) => unreachable!("filter presence checked above"),
             };
             if keep {
+                if skipped < offset {
+                    skipped += 1;
+                    continue;
+                }
                 out.push(object_to_json(obj));
+                if out.len() >= limit {
+                    break;
+                }
             }
         }
         Ok(Value::Array(out))
@@ -842,7 +865,11 @@ impl RpcServer {
         let block_head = self.block_store.latest_height()?.unwrap_or(0);
         let indexed_head = self.state_index.latest_height()?.unwrap_or(0);
         let chain_head = block_head.max(indexed_head);
-        let height = at_block.unwrap_or(block_head);
+        let height = at_block.unwrap_or(if indexed_head > 0 {
+            indexed_head
+        } else {
+            block_head
+        });
         if height > chain_head {
             return Err(anyhow!(
                 "HeightUnavailable {{ requested: {height}, oldest_retained: {}, head: {chain_head} }}",
@@ -871,8 +898,7 @@ impl RpcServer {
             }
         };
 
-        let use_live_state = (at_block.is_none() && height == block_head)
-            || (height == 0 && chain_head == 0 && self.state_index.get(0)?.is_none());
+        let use_live_state = height == 0 && chain_head == 0 && self.state_index.get(0)?.is_none();
         let state = if use_live_state {
             self.state.lock().clone()
         } else {
@@ -904,6 +930,35 @@ impl RpcServer {
             return Err(anyhow!(
                 "chain_view_call: state blob hash mismatch at height {height}"
             ));
+        }
+        let (blob_height, blob_state_root, _) = State::blob_header(&blob).with_context(|| {
+            format!("chain_view_call: read state blob header at height {height}")
+        })?;
+        if blob_height != height {
+            return Err(anyhow!(
+                "chain_view_call: state blob height mismatch: requested={height} blob={blob_height}"
+            ));
+        }
+        if blob_state_root != state_root {
+            return Err(anyhow!(
+                "chain_view_call: state blob root mismatch at height {height}: indexed={} blob={}",
+                hex::encode(state_root.0),
+                hex::encode(blob_state_root.0)
+            ));
+        }
+        if height > 0 {
+            let block = self.block_store.get(height)?.ok_or_else(|| {
+                anyhow!(
+                    "HeightUnavailable {{ requested: {height}, oldest_retained: {oldest_retained}, head: {chain_head} }}"
+                )
+            })?;
+            if block.header.state_root != state_root {
+                return Err(anyhow!(
+                    "chain_view_call: block state root mismatch at height {height}: indexed={} block={}",
+                    hex::encode(state_root.0),
+                    hex::encode(block.header.state_root.0)
+                ));
+            }
         }
         State::from_blob(&blob, state_root)
             .with_context(|| format!("chain_view_call: restore state at height {height}"))
@@ -1962,7 +2017,8 @@ mod tests {
         let old_hash = old_state.insert_code(&wasm_old);
         old_state.set_vfs_binding(path.to_string(), old_hash);
         let old_root = old_state.state_root();
-        let block1 = test_block_with_timestamp(1, 10);
+        let mut block1 = test_block_with_timestamp(1, 10);
+        block1.header.state_root = old_root;
         server.block_store.put(1, &block1).unwrap();
         let (blob, blob_hash) = old_state.to_blob(1, block1.header.parent_hash);
         server.blob_store.put(&blob).unwrap();
@@ -1993,9 +2049,9 @@ mod tests {
         assert_eq!(historical["at_block"], 1);
         assert_eq!(historical["chain_head"], 2);
         assert_eq!(historical["commands"][0]["returns"][0], "42");
-        assert_eq!(tip["at_block"], 2);
+        assert_eq!(tip["at_block"], 1);
         assert_eq!(tip["chain_head"], 2);
-        assert_eq!(tip["commands"][0]["returns"][0], "99");
+        assert_eq!(tip["commands"][0]["returns"][0], "42");
 
         let genesis = server
             .handle_view_call(&json!({
@@ -2008,6 +2064,45 @@ mod tests {
         assert!(
             msg.contains("HeightUnavailable") && msg.contains("requested: 0"),
             "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn indexed_state_rejects_mismatched_blob_header() {
+        let (server, _tmp) = make_server();
+        let mut state = State::new();
+        state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
+        let root = state.state_root();
+        let mut block = test_block(1);
+        block.header.state_root = root;
+        server.block_store.put(1, &block).unwrap();
+        let (blob, blob_hash) = state.to_blob(2, block.header.parent_hash);
+        server.blob_store.put(&blob).unwrap();
+        server.state_index.put(1, &root, &blob_hash).unwrap();
+
+        let err = server.load_indexed_state(1, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("state blob height mismatch"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn indexed_state_rejects_block_root_mismatch() {
+        let (server, _tmp) = make_server();
+        let mut state = State::new();
+        state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
+        let root = state.state_root();
+        let block = test_block(1);
+        server.block_store.put(1, &block).unwrap();
+        let (blob, blob_hash) = state.to_blob(1, block.header.parent_hash);
+        server.blob_store.put(&blob).unwrap();
+        server.state_index.put(1, &root, &blob_hash).unwrap();
+
+        let err = server.load_indexed_state(1, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("block state root mismatch"),
+            "unexpected error: {err:#}"
         );
     }
 
@@ -2121,6 +2216,10 @@ mod tests {
 
         let all = server.handle_ls_objects(&json!({ "all": true })).unwrap();
         assert_eq!(all.as_array().unwrap().len(), 3);
+        let paged = server
+            .handle_ls_objects(&json!({ "all": true, "limit": 2, "offset": 1 }))
+            .unwrap();
+        assert_eq!(paged.as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -2139,6 +2238,11 @@ mod tests {
         assert!(
             server
                 .handle_ls_objects(&json!({ "type_name": "Coin", "all": true }))
+                .is_err()
+        );
+        assert!(
+            server
+                .handle_ls_objects(&json!({ "all": true, "limit": 0 }))
                 .is_err()
         );
     }

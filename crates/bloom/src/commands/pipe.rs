@@ -482,6 +482,8 @@ mod tests {
             type_params: vec![],
             args,
             returns,
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         }
     }

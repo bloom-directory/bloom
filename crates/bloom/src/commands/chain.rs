@@ -478,6 +478,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
                 .transpose()?;
             let mut stdin_params = read_view_call_stdin_json()?;
             let client = make_client();
+            let endpoint_mode = parsed_commands.is_none();
             let mut params = if let Some(commands) = parsed_commands {
                 json!({
                     "commands": commands,
@@ -500,19 +501,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
                     "fuel_limit": fuel_limit,
                 })
             };
-            if let Some(stdin_params) = stdin_params.as_object_mut()
-                && let Some(params) = params.as_object_mut()
-            {
-                for (key, value) in std::mem::take(stdin_params) {
-                    match key.as_str() {
-                        // The VFS shim bakes these in; argv remains authoritative.
-                        "path" | "function" => {}
-                        _ => {
-                            params.insert(key, value);
-                        }
-                    }
-                }
-            }
+            merge_view_stdin_params(&mut params, &mut stdin_params, endpoint_mode)?;
             let result = client.call("chain_view_call", params).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
@@ -853,6 +842,34 @@ fn merge_stdin_params(params: &mut serde_json::Value, stdin_params: &mut serde_j
             }
         }
     }
+}
+
+fn merge_view_stdin_params(
+    params: &mut serde_json::Value,
+    stdin_params: &mut serde_json::Value,
+    endpoint_mode: bool,
+) -> Result<()> {
+    if endpoint_mode
+        && stdin_params
+            .get("commands")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|commands| !commands.is_empty())
+    {
+        anyhow::bail!("view-call endpoint mode does not accept stdin 'commands'");
+    }
+    if let Some(stdin_params) = stdin_params.as_object_mut()
+        && let Some(params) = params.as_object_mut()
+    {
+        for (key, value) in std::mem::take(stdin_params) {
+            match key.as_str() {
+                "path" | "function" => {}
+                _ => {
+                    params.insert(key, value);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_addr(s: &str) -> Result<bloom_chain_types::types::Address> {
@@ -2458,6 +2475,41 @@ allocations = []
         assert_eq!(params["function"], "set_counter");
         assert_eq!(params["gas_budget"], 2_000_000u64);
         assert_eq!(params["args"][0]["value"], 77);
+    }
+
+    #[test]
+    fn view_endpoint_stdin_merge_rejects_commands_override() {
+        let mut params = serde_json::json!({
+            "path": "/bloom/petals/dex/probe",
+            "function": "get_counter",
+            "args": [],
+        });
+        let mut stdin = serde_json::json!({
+            "commands": [{
+                "path": "/bloom/petals/other",
+                "function": "get_other"
+            }]
+        });
+        let err = merge_view_stdin_params(&mut params, &mut stdin, true).unwrap_err();
+        assert!(
+            format!("{err}").contains("does not accept stdin 'commands'"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn view_commands_mode_accepts_stdin_commands() {
+        let mut params = serde_json::json!({
+            "commands": [],
+        });
+        let mut stdin = serde_json::json!({
+            "commands": [{
+                "path": "/bloom/petals/other",
+                "function": "get_other"
+            }]
+        });
+        merge_view_stdin_params(&mut params, &mut stdin, false).unwrap();
+        assert_eq!(params["commands"].as_array().unwrap().len(), 1);
     }
 
     #[test]

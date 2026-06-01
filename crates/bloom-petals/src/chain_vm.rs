@@ -476,6 +476,11 @@ fn reject_view_reachable_mutation(
                     "view function '{view_name}' reaches mutating host import object.{name}"
                 )));
             }
+            if module == "log" && name == "emit" {
+                return Err(PetalError::InvalidWasm(format!(
+                    "view function '{view_name}' reaches observable host import log.emit"
+                )));
+            }
             continue;
         }
 
@@ -671,12 +676,7 @@ fn can_move_or_reown(row: &BorrowRow, caller_petal: Hash32) -> Result<bool, i32>
     Ok(defines || consumed)
 }
 
-const COIN_MINTER_PATHS: &[&str] = &[
-    CORE_FUNGIBLE_PATH,
-    "/bloom/petals/dex/faucet",
-    "/bloom/petals/dex/pool",
-    "/bloom/petals/dex/router",
-];
+const COIN_MINTER_PATHS: &[&str] = &[CORE_FUNGIBLE_PATH];
 
 fn is_authorized_coin_minter(caller: &Caller<'_, ChainStoreData>, caller_petal: [u8; 32]) -> bool {
     COIN_MINTER_PATHS.iter().any(|path| {
@@ -1893,11 +1893,38 @@ mod ptb_host_import_tests {
     use bloom_chain_state::State;
     use bloom_chain_types::Address;
     use bloom_objects::{AccessMode, Object, ObjectId, Owner, TypeTag};
+    use bloom_petal_manifest::codec;
+    use bloom_petal_manifest::types::{FunctionDecl, PetalManifestV0, SCHEMA_VERSION, SemVer};
     use bloom_script::host_ctx::PtbHostCtx;
     use std::sync::{Arc, Mutex};
 
     fn parse(src: &str) -> Vec<u8> {
         wat::parse_str(src).expect("valid WAT")
+    }
+
+    fn leb128(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                return;
+            }
+            out.push(b | 0x80);
+        }
+    }
+
+    fn append_manifest(mut wasm: Vec<u8>, manifest: PetalManifestV0) -> Vec<u8> {
+        let bytes = codec::encode(&manifest).expect("manifest encodes");
+        let mut custom = Vec::new();
+        let name = "bloom_petal_manifest_v0";
+        leb128(&mut custom, name.len() as u64);
+        custom.extend_from_slice(name.as_bytes());
+        custom.extend_from_slice(&bytes);
+        wasm.push(0);
+        leb128(&mut wasm, custom.len() as u64);
+        wasm.extend_from_slice(&custom);
+        wasm
     }
 
     fn run_with(wasm: Vec<u8>, ctx: Arc<Mutex<PtbHostCtx>>, petal_hash: Hash32) -> ChainCallOutput {
@@ -2041,6 +2068,41 @@ mod ptb_host_import_tests {
         assert_eq!(
             logs[0].data,
             vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x01]
+        );
+    }
+
+    #[test]
+    fn view_function_reaching_log_emit_is_rejected() {
+        let wasm = parse(
+            r#"
+            (module
+              (import "log" "emit" (func $emit (param i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "__petal_view") (param i32 i32) (result i32)
+                (drop (call $emit (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+                i32.const 0)
+            )
+            "#,
+        );
+        let wasm = append_manifest(
+            wasm,
+            PetalManifestV0 {
+                schema_version: SCHEMA_VERSION,
+                module_path: "/bloom/petals/test/view-log".to_string(),
+                framework_version: SemVer::new(0, 1, 0),
+                functions: vec![FunctionDecl {
+                    name: "view".to_string(),
+                    view: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let err = validate_chain_wasm(&wasm).unwrap_err();
+        assert!(
+            err.to_string().contains("log.emit"),
+            "unexpected error: {err}"
         );
     }
 
@@ -2760,7 +2822,31 @@ mod ptb_host_import_tests {
     }
 
     #[test]
-    fn object_create_coin_from_vfs_bound_faucet_is_allowed() {
+    fn object_create_coin_from_core_fungible_binding_is_allowed() {
+        let coin_tag = TypeTag::Concrete {
+            petal_hash: [0u8; 32],
+            type_name: "Coin".into(),
+            type_args: vec![TypeTag::Concrete {
+                petal_hash: [0u8; 32],
+                type_name: "Erased".into(),
+                type_args: vec![],
+            }],
+        };
+        let bytes = coin_tag.encode_canonical().unwrap();
+        let wasm = parse(&object_create_wat(&bytes));
+        let computed_petal = blake3_tagged(tags::PETAL, &wasm);
+        let mut state = State::new();
+        state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), computed_petal);
+
+        let arc = Arc::new(Mutex::new(PtbHostCtx::new()));
+        let out = run_with_state(wasm, arc.clone(), Hash32([0; 32]), state);
+        let code = i32::from_le_bytes(out.return_data.unwrap().try_into().unwrap());
+        assert!(code >= 0, "authorized core fungible Coin create got {code}");
+        assert_eq!(arc.lock().unwrap().created_objects.len(), 1);
+    }
+
+    #[test]
+    fn object_create_coin_from_example_dex_path_is_denied() {
         let coin_tag = TypeTag::Concrete {
             petal_hash: [0u8; 32],
             type_name: "Coin".into(),
@@ -2779,7 +2865,7 @@ mod ptb_host_import_tests {
         let arc = Arc::new(Mutex::new(PtbHostCtx::new()));
         let out = run_with_state(wasm, arc.clone(), Hash32([0; 32]), state);
         let code = i32::from_le_bytes(out.return_data.unwrap().try_into().unwrap());
-        assert!(code >= 0, "authorized faucet Coin create got {code}");
-        assert_eq!(arc.lock().unwrap().created_objects.len(), 1);
+        assert_eq!(code, -2);
+        assert!(arc.lock().unwrap().created_objects.is_empty());
     }
 }

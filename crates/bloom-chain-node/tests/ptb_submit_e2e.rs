@@ -248,6 +248,8 @@ fn manifest_with_nullary_fn_returns(fn_name: &str, returns: Vec<TypeTag>) -> Pet
             type_params: vec![],
             args: vec![],
             returns,
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         }],
         ..Default::default()
@@ -701,6 +703,8 @@ fn object_create_then_transfer_round_trips_through_unified_ctx() {
                 type_params: vec![],
                 args: vec![ArgDeclStub::Const(new_obj_type.clone())],
                 returns: vec![],
+                required_signers: 0,
+                required_capabilities: vec![],
                 attached_invariants: vec![],
             }],
             ..Default::default()

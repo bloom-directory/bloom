@@ -475,6 +475,24 @@ fn typecheck_move_cmd(
         });
     }
 
+    if signer_count < usize::from(f.required_signers) {
+        return Err(PtbError::TypeMismatch {
+            function: cmd.function.clone(),
+            arg_idx: 0,
+            reason: format!(
+                "manifest requires {} signer(s), but PTB has {signer_count}",
+                f.required_signers
+            ),
+        });
+    }
+    if !f.required_capabilities.is_empty() {
+        return Err(PtbError::TypeMismatch {
+            function: cmd.function.clone(),
+            arg_idx: 0,
+            reason: "manifest required_capabilities are not supported by PTB validation".into(),
+        });
+    }
+
     for (i, (arg, decl)) in cmd.args.iter().zip(f.args.iter()).enumerate() {
         match (arg, decl) {
             (Arg::Signer(idx), ArgDeclStub::Signer) => {
@@ -1155,6 +1173,8 @@ mod tests {
                 type_params: vec![],
                 args: vec![ArgDeclStub::Signer],
                 returns: vec![],
+                required_signers: 0,
+                required_capabilities: vec![],
                 attached_invariants: vec![],
             }],
             object_types: vec![ObjectTypeDeclStub {
@@ -1182,6 +1202,8 @@ mod tests {
                 mode,
             }],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         }];
         manifest
@@ -1365,6 +1387,8 @@ mod tests {
             type_params: vec![],
             args: vec![],
             returns: vec![loom_coin_tt()],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![1, 2, 3], m);
@@ -1407,6 +1431,36 @@ mod tests {
             PtbError::BuiltinFailed { reason, .. }
                 if reason.contains("duplicate linear Use(0, 0)")
         ));
+    }
+
+    #[test]
+    fn rejects_manifest_required_signers_not_present() {
+        let (chain, signer, gas_id) = setup();
+        let mut manifest = sample_manifest();
+        manifest.functions[0].required_signers = 2;
+        chain.put_petal(Hash32([0xAB; 32]), vec![1, 2, 3], manifest);
+        let tx = sample_ptb(signer, gas_id, 100);
+
+        let err = validate_ptb(&tx, &ctx(&chain, &AlwaysOkVerifier)).unwrap_err();
+        assert!(
+            matches!(err, PtbError::TypeMismatch { ref reason, .. } if reason.contains("requires 2 signer")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_manifest_required_capabilities_until_supported() {
+        let (chain, signer, gas_id) = setup();
+        let mut manifest = sample_manifest();
+        manifest.functions[0].required_capabilities = vec![pool_tt()];
+        chain.put_petal(Hash32([0xAB; 32]), vec![1, 2, 3], manifest);
+        let tx = sample_ptb(signer, gas_id, 100);
+
+        let err = validate_ptb(&tx, &ctx(&chain, &AlwaysOkVerifier)).unwrap_err();
+        assert!(
+            matches!(err, PtbError::TypeMismatch { ref reason, .. } if reason.contains("required_capabilities")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
@@ -1589,6 +1643,8 @@ mod tests {
                 mode: AccessMode::Mutable,
             }],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], manifest);
@@ -1632,6 +1688,8 @@ mod tests {
                 mode: AccessMode::Mutable,
             }],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], manifest);
@@ -1686,6 +1744,8 @@ mod tests {
                 },
             ],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], manifest);
@@ -1746,6 +1806,8 @@ mod tests {
                 },
             ],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], manifest);
@@ -1797,6 +1859,8 @@ mod tests {
                 mode: AccessMode::Mutable,
             }],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], manifest);
@@ -1909,6 +1973,8 @@ mod tests {
                 mode: AccessMode::Mutable,
             }],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], manifest);
@@ -1963,6 +2029,8 @@ mod tests {
             type_params: vec![],
             args,
             returns,
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], m);
@@ -2095,6 +2163,8 @@ mod tests {
             type_params: vec![],
             args: vec![],
             returns: vec![concrete("u64")],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         m.functions.push(FunctionDeclStub {
@@ -2103,6 +2173,8 @@ mod tests {
             type_params: vec![],
             args: vec![ArgDeclStub::Const(concrete("u128"))],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], m);
@@ -2157,6 +2229,8 @@ mod tests {
             type_params: vec![],
             args: vec![],
             returns: vec![concrete("u64")],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         m.functions.push(FunctionDeclStub {
@@ -2165,6 +2239,8 @@ mod tests {
             type_params: vec![],
             args: vec![ArgDeclStub::Const(concrete("u64"))],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], m);
@@ -2241,6 +2317,8 @@ mod tests {
             }],
             args: vec![ArgDeclStub::TypeArg(0)],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], m);
@@ -2317,6 +2395,8 @@ mod tests {
             type_params: vec![],
             args: vec![],
             returns: vec![loom_coin_tt()],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         m.functions.push(FunctionDeclStub {
@@ -2328,6 +2408,8 @@ mod tests {
                 mode: AccessMode::Mutable,
             }],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], m);
@@ -2387,6 +2469,8 @@ mod tests {
             type_params: vec![],
             args: vec![],
             returns: vec![loom_coin_tt()],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         m.functions.push(FunctionDeclStub {
@@ -2398,6 +2482,8 @@ mod tests {
                 mode: AccessMode::Mutable,
             }],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], m);
@@ -2462,6 +2548,8 @@ mod tests {
             type_params: vec![],
             args: vec![],
             returns: vec![loom_coin_tt()],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], m);
@@ -2522,6 +2610,8 @@ mod tests {
                 mode: AccessMode::Mutable,
             }],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], m);
@@ -2572,6 +2662,8 @@ mod tests {
                 mode: AccessMode::Mutable,
             }],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], m);
@@ -2613,6 +2705,8 @@ mod tests {
                 mode: AccessMode::Mutable,
             }],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], m);
@@ -2658,6 +2752,8 @@ mod tests {
                 mode: AccessMode::ReadOnly,
             }],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], m);
@@ -2686,6 +2782,8 @@ mod tests {
                 type_params: vec![],
                 args: vec![],
                 returns: vec![concrete("Capability")],
+                required_signers: 0,
+                required_capabilities: vec![],
                 attached_invariants: vec![],
             }],
             object_types: vec![],
@@ -2711,6 +2809,8 @@ mod tests {
                 mode: AccessMode::ReadOnly,
             }],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], consumer);
@@ -2768,6 +2868,8 @@ mod tests {
             }],
             args: vec![ArgDeclStub::Const(TypeTag::Generic { idx: 0 })],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         });
         chain.put_petal(Hash32([0xAB; 32]), vec![], m);

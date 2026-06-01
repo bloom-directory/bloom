@@ -164,6 +164,8 @@ fn manifest_for(obj_type: TypeTag) -> PetalManifestStub {
                     mode: AccessMode::Mutable,
                 }],
                 returns: vec![],
+                required_signers: 0,
+                required_capabilities: vec![],
                 attached_invariants: vec![],
             },
             FunctionDeclStub {
@@ -175,6 +177,8 @@ fn manifest_for(obj_type: TypeTag) -> PetalManifestStub {
                     mode: AccessMode::Consume,
                 }],
                 returns: vec![],
+                required_signers: 0,
+                required_capabilities: vec![],
                 attached_invariants: vec![],
             },
         ],
