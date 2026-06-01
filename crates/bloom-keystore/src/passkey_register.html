@@ -158,49 +158,26 @@ async function register(){
     var ext=cred.getClientExtensionResults();
     var prfFirst=ext&&ext.prf&&ext.prf.results&&ext.prf.results.first;
 
-    if(prfFirst){
-      // PRF output returned during create — most common path (macOS Touch ID + Chrome).
-      await fetch('/prf-output',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({prf_output_b64:enc(prfFirst),client_data_json_b64:enc(cred.response.clientDataJSON)})});
-    }else if(ext&&ext.prf&&ext.prf.enabled){
-      // PRF is supported but output only available during get(), not create().
-      // Run a secondary authentication to extract PRF output.
-      st.textContent='Almost done — please authenticate once more to complete PRF setup…';
-      var challengeData=await(await fetch('/auth-challenge')).json();
-      var fallbackChallenge=dec(challengeData.challenge);
-      var credId=new Uint8Array(cred.rawId);
-      var authOpts={
-        publicKey:{
-          challenge:fallbackChallenge,
-          timeout:60000,
-          allowCredentials:[{id:credId,type:'public-key'}],
-          extensions:{prf:{eval:{first:prfSaltBytes}}}
-        }
-      };
-      var authCred=await navigator.credentials.get(authOpts);
-      var authExt=authCred.getClientExtensionResults();
-      var authPrfFirst=authExt&&authExt.prf&&authExt.prf.results&&authExt.prf.results.first;
-      if(!authPrfFirst){
-        st.className='err';
-        st.textContent='PRF output not available from your authenticator. Supported: Touch ID (macOS/iOS), YubiKey 5+, Windows Hello (Chrome 147+), security keys with hmac-secret. On Linux: Chromium has no built-in passkey manager — install Google Chrome instead.';
-        btn.disabled=false;
-        return;
-      }
-      await fetch('/prf-output',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({prf_output_b64:enc(authPrfFirst),client_data_json_b64:enc(authCred.response.clientDataJSON)})});
-    }else{
+    if(!prfFirst){
       // PRF not supported at all by this authenticator.
       st.className='err';
-      st.textContent='Your authenticator does not support the PRF extension required by bloom passkey wallets. Supported: Touch ID (macOS/iOS), YubiKey 5+, Windows Hello (Chrome 147+), security keys with hmac-secret. On Linux: Chromium has no built-in passkey manager — install Google Chrome instead.';
+      st.textContent='PRF output was not returned during passkey creation. This build requires primary-ceremony PRF support; try a current Chrome or Safari with a platform authenticator.';
       btn.disabled=false;
       return;
     }
 
-    await fetch('/register',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({
-      id:cred.id,rawId:enc(cred.rawId),type:cred.type,
-      response:{
-        attestationObject:enc(cred.response.attestationObject),
-        clientDataJSON:enc(cred.response.clientDataJSON)
-      }
+    var regResp=await fetch('/register',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({
+      credential:{
+        id:cred.id,rawId:enc(cred.rawId),type:cred.type,
+        response:{
+          attestationObject:enc(cred.response.attestationObject),
+          clientDataJSON:enc(cred.response.clientDataJSON)
+        }
+      },
+      prf_output_b64:enc(prfFirst),
+      client_data_json_b64:enc(cred.response.clientDataJSON)
     })});
+    if(!regResp.ok) throw new Error('registration rejected by local ceremony server ('+regResp.status+')');
     st.className='ok';
     st.textContent='✓ Passkey registered. You can close this tab.';
     btn.style.display='none';

@@ -83,12 +83,12 @@ No `wrap.key`. PRF output is never written to disk.
 
 | Platform | PRF support |
 |---|---|
-| Chrome ≥ 116 | ✅ |
-| Safari ≥ 18 | ✅ |
+| Chrome ≥ 116 | ✅ when PRF output is returned by the primary ceremony |
+| Safari ≥ 18 | ✅ when PRF output is returned by the primary ceremony |
 | Firefox | ⚠️ — no built-in passkey manager on Linux; does not support WebAuthn PRF |
-| macOS Secure Enclave (Touch ID) | ✅ |
-| Windows Hello | ✅ (Chrome 147+) |
-| YubiKey 5 series | ✅ (via `hmac-secret`) |
+| macOS Secure Enclave (Touch ID) | ✅ on current Safari/Chrome primary ceremonies |
+| Windows Hello | ⚠️ requires browser support for primary-ceremony PRF output |
+| YubiKey 5 series | ⚠️ requires browser support for primary-ceremony PRF output |
 | Old FIDO U2F keys | ❌ — bloom rejects with clear error |
 
 ---
@@ -100,12 +100,15 @@ around this by:
 
 1. Patching the WebAuthn challenge JSON to inject the PRF extension before
    serving it to the browser (same technique already used for `residentKey`).
-2. Adding a `/prf-output` HTTP endpoint to the local ceremony server.
-3. The browser JS extracts the PRF output from `getClientExtensionResults()`
-   and POSTs it to `/prf-output` before submitting the credential.
+2. Having the browser JS extract the PRF output from
+   `getClientExtensionResults()`.
+3. Posting the PRF output in the same local-server request as the WebAuthn
+   credential, so the Rust side only consumes PRF output from the verified
+   ceremony.
 
-This is identical to how Bitwarden implements PRF-based vault encryption with
-WebAuthn passkeys.
+Bloom currently requires PRF output during the primary WebAuthn ceremony.
+Authenticators or browser combinations that only return PRF output from a
+follow-up `get()` ceremony are rejected until a verified fallback flow is added.
 
 ---
 

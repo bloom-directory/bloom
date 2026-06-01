@@ -1538,12 +1538,6 @@ mod tests {
         .unwrap();
         std::fs::write(wallet_dir.join("pubkey"), b"").unwrap();
         std::fs::write(wallet_dir.join("kind"), b"passkey").unwrap();
-        let policy = bloom_proto::Policy::default();
-        std::fs::write(
-            wallet_dir.join("policy.toml"),
-            toml::to_string_pretty(&policy).unwrap(),
-        )
-        .unwrap();
         addr
     }
 

@@ -49,47 +49,30 @@ async function run(){
     st.textContent='Waiting for passkey interaction (Touch ID / security key)…';
     const cred=await navigator.credentials.get(opts);
 
-    // Extract PRF output and send it before submitting the auth credential.
+    // Extract PRF output and submit it with the auth credential so the local
+    // server only consumes PRF data from the verified WebAuthn ceremony.
     const ext=cred.getClientExtensionResults();
     const prfFirst=ext&&ext.prf&&ext.prf.results&&ext.prf.results.first;
-    if(prfFirst){
-      await fetch('/prf-output',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({prf_output_b64:enc(prfFirst),client_data_json_b64:enc(cred.response.clientDataJSON)})});
-    }else if(prfSaltBytes&&ext&&ext.prf&&ext.prf.enabled){
-      // PRF is supported but output was not returned in the primary get() call.
-      // Run a secondary get() with a fresh challenge to extract the PRF output,
-      // then submit the original credential to /auth as usual.
-      st.textContent='Almost done — please authenticate once more to complete PRF extraction…';
-      const challengeData=await(await fetch('/auth-challenge')).json();
-      const fallbackChallenge=dec(challengeData.challenge);
-      const credId=new Uint8Array(cred.rawId);
-      const fallbackOpts={
-        publicKey:{
-          challenge:fallbackChallenge,
-          timeout:60000,
-          allowCredentials:[{id:credId,type:'public-key'}],
-          extensions:{prf:{eval:{first:prfSaltBytes}}}
-        }
-      };
-      const fallbackCred=await navigator.credentials.get(fallbackOpts);
-      const fallbackExt=fallbackCred.getClientExtensionResults();
-      const fallbackPrfFirst=fallbackExt&&fallbackExt.prf&&fallbackExt.prf.results&&fallbackExt.prf.results.first;
-      if(!fallbackPrfFirst){
-        st.className='err';
-        st.textContent='PRF output not available from your authenticator. Supported: Touch ID (macOS/iOS), YubiKey 5+, Windows Hello (Chrome 147+), security keys with hmac-secret. On Linux: Chromium has no built-in passkey manager — install Google Chrome instead.';
-        return;
-      }
-      await fetch('/prf-output',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({prf_output_b64:enc(fallbackPrfFirst),client_data_json_b64:enc(fallbackCred.response.clientDataJSON)})});
+    if(prfSaltBytes&&!prfFirst){
+      st.className='err';
+      st.textContent='PRF output was not returned by the primary WebAuthn ceremony. This build requires primary-ceremony PRF support; try a current Chrome or Safari with a platform authenticator.';
+      return;
     }
 
-    await fetch('/auth',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({
-      id:cred.id,rawId:enc(cred.rawId),type:cred.type,
-      response:{
-        authenticatorData:enc(cred.response.authenticatorData),
-        clientDataJSON:enc(cred.response.clientDataJSON),
-        signature:enc(cred.response.signature),
-        userHandle:cred.response.userHandle?enc(cred.response.userHandle):null
-      }
+    const authResp=await fetch('/auth',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({
+      credential:{
+        id:cred.id,rawId:enc(cred.rawId),type:cred.type,
+        response:{
+          authenticatorData:enc(cred.response.authenticatorData),
+          clientDataJSON:enc(cred.response.clientDataJSON),
+          signature:enc(cred.response.signature),
+          userHandle:cred.response.userHandle?enc(cred.response.userHandle):null
+        }
+      },
+      prf_output_b64:prfFirst?enc(prfFirst):'',
+      client_data_json_b64:enc(cred.response.clientDataJSON)
     })});
+    if(!authResp.ok) throw new Error('authentication rejected by local ceremony server ('+authResp.status+')');
     st.className='ok';
     st.textContent='✓ Authentication successful. You can close this tab.';
   }catch(e){

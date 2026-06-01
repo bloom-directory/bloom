@@ -64,8 +64,7 @@ pub(crate) const RP_ID: &str = "localhost";
 /// Referenced from both the Rust ceremony path and (via const) from lib.rs.
 pub(crate) const PRF_NOT_SUPPORTED_MSG: &str = "PRF output not received from authenticator. \
      Bloom requires the WebAuthn PRF extension for passkey wallets. \
-     Supported authenticators: Touch ID (macOS/iOS), YubiKey 5+, \
-     Windows Hello (Chrome 147+), security keys with hmac-secret.";
+     This build requires PRF output to be returned by the primary WebAuthn ceremony.";
 
 // ── browser launcher ──────────────────────────────────────────────────────────
 
@@ -225,15 +224,13 @@ pub(crate) async fn register_ceremony(
         challenge_json = serde_json::to_string(&v).map_err(|e| e.to_string())?;
     }
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<RegisterPublicKeyCredential>();
+    let (tx, rx) = tokio::sync::oneshot::channel::<RegisterCeremonyPost>();
     let challenge_b64 = extract_challenge_b64(&challenge_json);
     let state = RegState {
         challenge_json,
         challenge_b64,
         wallet_name: wallet_name.to_string(),
         token: gen_token(),
-        prf_output: Arc::new(Mutex::new(None)),
-        fallback_challenge: Arc::new(Mutex::new(None)),
         policy_toml: Arc::new(Mutex::new(policy_toml.to_string())),
         tx: Arc::new(Mutex::new(Some(tx))),
         shutdown: Arc::new(tokio::sync::Notify::new()),
@@ -259,9 +256,9 @@ pub(crate) async fn register_ceremony(
         return Err(e);
     }
 
-    let rpkc =
+    let posted =
         match tokio::time::timeout(std::time::Duration::from_secs(REG_TIMEOUT_SECS), rx).await {
-            Ok(Ok(cred)) => cred,
+            Ok(Ok(posted)) => posted,
             Ok(Err(_)) => {
                 state.shutdown.notify_one();
                 let _ = server.await;
@@ -277,18 +274,16 @@ pub(crate) async fn register_ceremony(
     state.shutdown.notify_one();
     let _ = server.await;
 
+    let prf_output = parse_prf_output(
+        &posted.prf_output_b64,
+        &posted.client_data_json_b64,
+        &state.challenge_b64,
+    )
+    .map_err(|_| PRF_NOT_SUPPORTED_MSG.to_string())?;
     let passkey = webauthn
-        .finish_passkey_registration(&rpkc, &reg_state)
+        .finish_passkey_registration(&posted.credential, &reg_state)
         .map_err(|e| format!("finish_passkey_registration: {e}"))?;
     let final_policy = state.policy_toml.lock().clone();
-
-    // PRF output must have arrived before /register was POSTed (JS awaits
-    // /prf-output before calling fetch('/register')).
-    let prf_output = state
-        .prf_output
-        .lock()
-        .take()
-        .ok_or_else(|| PRF_NOT_SUPPORTED_MSG.to_string())?;
 
     Ok((passkey, final_policy, prf_output))
 }
@@ -300,7 +295,8 @@ pub(crate) async fn register_ceremony(
 ///
 /// If `prf_salt` is `Some`, the PRF extension is injected into the auth
 /// challenge so the authenticator produces PRF output. The browser POSTs
-/// it to `/prf-output`; the returned tuple includes `Some(prf_output)`.
+/// it in the same POST as the WebAuthn credential; the returned tuple includes
+/// `Some(prf_output)`.
 ///
 /// If `prf_salt` is `None` (legacy/non-PRF path), no PRF extension is
 /// injected and the second element of the return tuple is `None`.
@@ -327,14 +323,12 @@ pub(crate) async fn auth_ceremony(
         challenge_json = serde_json::to_string(&v).map_err(|e| e.to_string())?;
     }
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<PublicKeyCredential>();
+    let (tx, rx) = tokio::sync::oneshot::channel::<AuthCeremonyPost>();
     let challenge_b64 = extract_challenge_b64(&challenge_json);
     let state = AuthState {
         challenge_json,
         challenge_b64,
         token: gen_token(),
-        prf_output: Arc::new(Mutex::new(None)),
-        fallback_challenge: Arc::new(Mutex::new(None)),
         tx: Arc::new(Mutex::new(Some(tx))),
         shutdown: Arc::new(tokio::sync::Notify::new()),
     };
@@ -359,9 +353,9 @@ pub(crate) async fn auth_ceremony(
         return Err(e);
     }
 
-    let pkc =
+    let posted =
         match tokio::time::timeout(std::time::Duration::from_secs(AUTH_TIMEOUT_SECS), rx).await {
-            Ok(Ok(cred)) => cred,
+            Ok(Ok(posted)) => posted,
             Ok(Err(_)) => {
                 state.shutdown.notify_one();
                 let _ = server.await;
@@ -377,25 +371,39 @@ pub(crate) async fn auth_ceremony(
     state.shutdown.notify_one();
     let _ = server.await;
 
+    let prf_output = if prf_salt.is_some() {
+        Some(
+            parse_prf_output(
+                &posted.prf_output_b64,
+                &posted.client_data_json_b64,
+                &state.challenge_b64,
+            )
+            .map_err(|_| PRF_NOT_SUPPORTED_MSG.to_string())?,
+        )
+    } else {
+        None
+    };
     let auth_result = webauthn
-        .finish_passkey_authentication(&pkc, &auth_state)
+        .finish_passkey_authentication(&posted.credential, &auth_state)
         .map_err(|e| format!("finish_passkey_authentication: {e}"))?;
-
-    let prf_output = state.prf_output.lock().take();
     Ok((auth_result, prf_output))
 }
 
 // ── axum apps ─────────────────────────────────────────────────────────────────
 
-/// Body sent to POST /prf-output. The bundled clientDataJSON lets the server
-/// check the PRF output was produced for the challenge it issued, which stops a
-/// cross-tab *browser* script from racing in a forged output. It does NOT by
-/// itself stop a local non-browser process (which can spoof `Origin` and read
-/// the challenge from GET /challenge) — that is what the per-server capability
-/// token enforced by `require_token` is for.
 #[derive(serde::Deserialize)]
-struct PrfOutputBody {
+struct RegisterCeremonyPost {
+    credential: RegisterPublicKeyCredential,
     prf_output_b64: String,
+    client_data_json_b64: String,
+}
+
+#[derive(serde::Deserialize)]
+struct AuthCeremonyPost {
+    credential: PublicKeyCredential,
+    #[serde(default)]
+    prf_output_b64: String,
+    #[serde(default)]
     client_data_json_b64: String,
 }
 
@@ -413,21 +421,20 @@ fn extract_challenge_b64(challenge_json: &str) -> String {
         .unwrap_or_default()
 }
 
-fn parse_prf_output_body(
-    body: &PrfOutputBody,
+fn parse_prf_output(
+    prf_output_b64: &str,
+    client_data_json_b64: &str,
     main_challenge: &str,
-    fallback: &Mutex<Option<String>>,
 ) -> Result<[u8; 32], axum::http::StatusCode> {
     use base64::Engine as _;
-    let Ok(bytes) =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(body.prf_output_b64.trim())
+    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(prf_output_b64.trim())
     else {
         return Err(axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     };
     if bytes.len() != 32 {
         return Err(axum::http::StatusCode::UNPROCESSABLE_ENTITY);
     }
-    if !prf_challenge_ok(&body.client_data_json_b64, main_challenge, fallback) {
+    if !prf_challenge_ok(client_data_json_b64, main_challenge) {
         return Err(axum::http::StatusCode::FORBIDDEN);
     }
     let mut arr = [0u8; 32];
@@ -435,22 +442,9 @@ fn parse_prf_output_body(
     Ok(arr)
 }
 
-fn issue_fallback_challenge(fallback_challenge: &Mutex<Option<String>>) -> Json<serde_json::Value> {
-    let mut challenge = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut challenge);
-    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge);
-    *fallback_challenge.lock() = Some(b64.clone());
-    Json(serde_json::json!({ "challenge": b64 }))
-}
-
 /// Verify that the `clientDataJSON` supplied by the browser contains a
-/// `challenge` field matching either the main ceremony challenge or the
-/// stored fallback challenge (used on the secondary `credentials.get()` path).
-fn prf_challenge_ok(
-    client_data_json_b64: &str,
-    main_challenge: &str,
-    fallback: &Mutex<Option<String>>,
-) -> bool {
+/// `challenge` field matching the main WebAuthn ceremony challenge.
+fn prf_challenge_ok(client_data_json_b64: &str, main_challenge: &str) -> bool {
     use base64::Engine as _;
     let Ok(bytes) =
         base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(client_data_json_b64.trim())
@@ -463,7 +457,7 @@ fn prf_challenge_ok(
     let Some(got) = cdj.get("challenge").and_then(|v| v.as_str()) else {
         return false;
     };
-    got == main_challenge || fallback.lock().as_deref() == Some(got)
+    got == main_challenge
 }
 
 #[derive(Clone)]
@@ -476,16 +470,10 @@ struct RegState {
     /// Per-server capability token embedded in the launched URL; required on
     /// state-changing requests by `require_token`.
     token: String,
-    /// Filled by POST /prf-output once the browser extracts PRF output from
-    /// the authenticator.
-    prf_output: Arc<Mutex<Option<[u8; 32]>>>,
-    /// Set by GET /auth-challenge when the browser needs a second ceremony
-    /// to extract PRF output (the `prf.enabled=true` fallback path).
-    fallback_challenge: Arc<Mutex<Option<String>>>,
     /// Shared mutable policy TOML — updated when the user edits fields in the
     /// browser before completing the ceremony.
     policy_toml: Arc<Mutex<String>>,
-    tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<RegisterPublicKeyCredential>>>>,
+    tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<RegisterCeremonyPost>>>>,
     shutdown: Arc<tokio::sync::Notify>,
 }
 
@@ -577,8 +565,6 @@ fn build_reg_app(state: RegState) -> Router {
         .route("/name", get(reg_name))
         .route("/policy", get(reg_policy))
         .route("/policy/update", post(reg_policy_update))
-        .route("/prf-output", post(reg_prf_output))
-        .route("/auth-challenge", get(reg_auth_challenge))
         .route("/register", post(reg_post))
         .layer(axum::middleware::from_fn(require_localhost_origin))
         .layer(axum::middleware::from_fn_with_state(token, require_token))
@@ -627,44 +613,15 @@ async fn reg_policy_update(State(state): State<RegState>, body: String) -> axum:
     axum::http::StatusCode::OK
 }
 
-async fn reg_prf_output(
-    State(state): State<RegState>,
-    Json(body): Json<PrfOutputBody>,
-) -> axum::http::StatusCode {
-    match parse_prf_output_body(&body, &state.challenge_b64, &state.fallback_challenge) {
-        Ok(arr) => {
-            // Reject a second PRF output rather than letting a late/racing POST
-            // overwrite the first — the value is consumed only at /register.
-            let mut g = state.prf_output.lock();
-            if g.is_some() {
-                return axum::http::StatusCode::CONFLICT;
-            }
-            *g = Some(arr);
-            axum::http::StatusCode::OK
-        }
-        Err(status) => status,
-    }
-}
-
-/// Issue a random challenge for the fallback PRF extraction flow (registration).
-async fn reg_auth_challenge(State(state): State<RegState>) -> Json<serde_json::Value> {
-    issue_fallback_challenge(&state.fallback_challenge)
-}
-
-/// Issue a random challenge for the fallback PRF extraction flow (authentication).
-async fn auth_auth_challenge(State(state): State<AuthState>) -> Json<serde_json::Value> {
-    issue_fallback_challenge(&state.fallback_challenge)
-}
-
 async fn reg_post(
     State(state): State<RegState>,
-    Json(cred): Json<RegisterPublicKeyCredential>,
+    Json(posted): Json<RegisterCeremonyPost>,
 ) -> axum::http::StatusCode {
     let sent = state
         .tx
         .lock()
         .take()
-        .is_some_and(|tx| tx.send(cred).is_ok());
+        .is_some_and(|tx| tx.send(posted).is_ok());
     state.shutdown.notify_one();
     if sent {
         axum::http::StatusCode::OK
@@ -685,11 +642,7 @@ struct AuthState {
     /// Per-server capability token embedded in the launched URL; required on
     /// state-changing requests by `require_token`.
     token: String,
-    /// Filled by POST /prf-output.
-    prf_output: Arc<Mutex<Option<[u8; 32]>>>,
-    /// Set by GET /auth-challenge on the fallback PRF extraction path.
-    fallback_challenge: Arc<Mutex<Option<String>>>,
-    tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<PublicKeyCredential>>>>,
+    tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<AuthCeremonyPost>>>>,
     shutdown: Arc<tokio::sync::Notify>,
 }
 
@@ -698,8 +651,6 @@ fn build_auth_app(state: AuthState) -> Router {
     Router::new()
         .route("/", get(auth_index))
         .route("/challenge", get(auth_challenge))
-        .route("/auth-challenge", get(auth_auth_challenge))
-        .route("/prf-output", post(auth_prf_output))
         .route("/auth", post(auth_post))
         .layer(axum::middleware::from_fn(require_localhost_origin))
         .layer(axum::middleware::from_fn_with_state(token, require_token))
@@ -718,34 +669,15 @@ async fn auth_challenge(
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-async fn auth_prf_output(
-    State(state): State<AuthState>,
-    Json(body): Json<PrfOutputBody>,
-) -> axum::http::StatusCode {
-    match parse_prf_output_body(&body, &state.challenge_b64, &state.fallback_challenge) {
-        Ok(arr) => {
-            // Reject a second PRF output rather than letting a late/racing POST
-            // overwrite the first — the value is consumed only at /auth.
-            let mut g = state.prf_output.lock();
-            if g.is_some() {
-                return axum::http::StatusCode::CONFLICT;
-            }
-            *g = Some(arr);
-            axum::http::StatusCode::OK
-        }
-        Err(status) => status,
-    }
-}
-
 async fn auth_post(
     State(state): State<AuthState>,
-    Json(cred): Json<PublicKeyCredential>,
+    Json(posted): Json<AuthCeremonyPost>,
 ) -> axum::http::StatusCode {
     let sent = state
         .tx
         .lock()
         .take()
-        .is_some_and(|tx| tx.send(cred).is_ok());
+        .is_some_and(|tx| tx.send(posted).is_ok());
     state.shutdown.notify_one();
     if sent {
         axum::http::StatusCode::OK

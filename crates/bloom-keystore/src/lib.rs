@@ -557,16 +557,17 @@ impl Keystore {
             String::new()
         };
 
-        // Phase 2: verify policy.toml.sig for PasskeyGated wallets.
+        // Passkey policy files are part of the security boundary. A missing
+        // signature must fail closed; otherwise deleting policy.toml.sig would
+        // downgrade verification to a warning and allow policy tampering.
         if kind == WalletKind::PasskeyGated && !policy_content.is_empty() {
             let sig_path = dir.join("policy.toml.sig");
             if sig_path.exists() {
                 passkey::verify_policy_sig(name, &policy_content, &address, &sig_path)?;
             } else {
-                tracing::warn!(
-                    wallet = name,
-                    "passkey wallet has unsigned policy.toml (run sign-policy to sign it)"
-                );
+                return Err(KeystoreError::Policy(
+                    "passkey wallet policy.toml is missing policy.toml.sig".into(),
+                ));
             }
         }
 
@@ -1216,9 +1217,6 @@ mod tests {
         (wallet_dir, addr)
     }
 
-    /// info() correctly reads a manually constructed passkey wallet directory
-    /// and returns PasskeyGated kind without requiring a real ceremony.
-    /// A missing policy.toml.sig should warn (not error).
     /// Passkey wallet info() should error when policy.toml.sig is tampered.
     #[test]
     fn passkey_info_rejects_tampered_policy_sig() {
@@ -1244,16 +1242,25 @@ mod tests {
     }
 
     #[test]
+    fn passkey_info_rejects_missing_policy_sig() {
+        let (dir, ks) = temp_store();
+        let (wallet_dir, _addr) = setup_passkey_dir(dir.path(), "missing-sig");
+        let policy_toml = toml::to_string_pretty(&bloom_proto::Policy::default()).unwrap();
+        write_atomic(&wallet_dir.join("policy.toml"), policy_toml.as_bytes()).unwrap();
+
+        let err = ks.info("missing-sig").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(err, KeystoreError::Policy(_)) && msg.contains("policy.toml.sig"),
+            "expected missing policy.toml.sig error, got: {err}"
+        );
+    }
+
+    #[test]
     fn passkey_kind_round_trip() {
         let (dir, ks) = temp_store();
-        let (wallet_dir, addr) = setup_passkey_dir(dir.path(), "passkey-test");
-        let policy = bloom_proto::Policy::default();
-        write_atomic(
-            &wallet_dir.join("policy.toml"),
-            toml::to_string_pretty(&policy).unwrap().as_bytes(),
-        )
-        .unwrap();
-        // No passkey.json, no prf.salt, no policy.toml.sig — just kind="passkey".
+        let (_wallet_dir, addr) = setup_passkey_dir(dir.path(), "passkey-test");
+        // No policy.toml yet, so there is no policy signature to require.
         let info = ks.info("passkey-test").unwrap();
         assert_eq!(info.kind, WalletKind::PasskeyGated);
         assert_eq!(info.address, addr);
