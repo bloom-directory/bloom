@@ -67,6 +67,7 @@ pub const RPC_MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 pub const RPC_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 pub const RPC_MAX_TX_BYTES: usize = 1024 * 1024;
 const RPC_MAX_LS_OBJECTS: usize = 1_024;
+const RPC_CHAIN_ADAPTER_OBJECT_PAGE_LIMIT: usize = RPC_MAX_LS_OBJECTS;
 const DEFAULT_VIEW_FUEL_LIMIT: u64 = 1_000_000;
 const RPC_MAX_TCP_CONNECTIONS: usize = 128;
 const RPC_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1507,20 +1508,32 @@ impl ChainStateIface for RpcChainAdapter {
     }
 
     fn iter_objects(&self) -> Vec<(bloom_objects::ObjectId, Object)> {
-        let Ok(value) = self.call_blocking("chain_ls_objects", json!({ "all": true })) else {
-            return Vec::new();
-        };
-        let Some(objects) = value.as_array() else {
-            return Vec::new();
-        };
-        objects
-            .iter()
-            .filter_map(|value| {
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let Ok(value) = self.call_blocking(
+                "chain_ls_objects",
+                json!({
+                    "all": true,
+                    "limit": RPC_CHAIN_ADAPTER_OBJECT_PAGE_LIMIT,
+                    "offset": offset,
+                }),
+            ) else {
+                return out;
+            };
+            let Some(objects) = value.as_array() else {
+                return out;
+            };
+            out.extend(objects.iter().filter_map(|value| {
                 let bytes = hex::decode(value.get("bytes")?.as_str()?).ok()?;
                 let object = Object::decode_canonical(&bytes).ok()?;
                 Some((object.id, object))
-            })
-            .collect()
+            }));
+            if objects.len() < RPC_CHAIN_ADAPTER_OBJECT_PAGE_LIMIT {
+                return out;
+            }
+            offset = offset.saturating_add(RPC_CHAIN_ADAPTER_OBJECT_PAGE_LIMIT);
+        }
     }
 
     fn current_block(&self) -> u64 {

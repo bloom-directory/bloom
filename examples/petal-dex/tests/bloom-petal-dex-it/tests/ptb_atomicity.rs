@@ -167,6 +167,8 @@ fn ptb_second_command_abort_rolls_back_first() {
                     mode: AccessMode::Mutable,
                 }],
                 returns: vec![type_tag_coin_loom()],
+                required_signers: 0,
+                required_capabilities: vec![],
                 attached_invariants: vec![],
             }],
             ..Default::default()
@@ -300,6 +302,8 @@ fn ptb_orphaned_split_coin_rolls_back() {
                     mode: AccessMode::Mutable,
                 }],
                 returns: vec![type_tag_coin_loom()],
+                required_signers: 0,
+                required_capabilities: vec![],
                 attached_invariants: vec![],
             }],
             ..Default::default()

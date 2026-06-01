@@ -102,6 +102,8 @@ fn ptb_single_hop_swap_shape() {
                     mode: AccessMode::Mutable,
                 }],
                 returns: vec![type_tag_coin_loom()],
+                required_signers: 0,
+                required_capabilities: vec![],
                 attached_invariants: vec![],
             }],
             ..Default::default()

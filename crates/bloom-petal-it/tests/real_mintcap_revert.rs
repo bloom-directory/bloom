@@ -1,4 +1,4 @@
-//! Real `&Capability<EpochZero>` typecheck cap-revert (spec §5, §9.3).
+//! Real `&Capability<EpochZero>` required-capability fail-closed check.
 //!
 //! Audit finding: previous cap-revert coverage exercised gas-payer /
 //! access-control failures rather than the real `&MintCap<T>` /
@@ -14,15 +14,12 @@
 //!    from each petal's wasm.
 //!
 //! 2. Build a PTB that calls `mint_genesis(epoch, amount, recipient)`
-//!    with the **wrong-typed** object in the `epoch` slot (a
-//!    `Coin<LOOM>` where the manifest declares `Capability<EpochZero>`)
-//!    and assert the executor reverts with `PtbError::TypeMismatch`
-//!    mentioning both `Capability` and `EpochZero`.
+//!    from that manifest and assert validation rejects the unsupported
+//!    manifest-level `required_capabilities` declaration fail-closed.
 //!
-//! 3. Positive control: with a properly-typed
-//!    `Capability<EpochZero>` object seeded into state, the PTB
-//!    typecheck passes (the petal's WAT body is a noop, so the call
-//!    succeeds end-to-end as far as the validator is concerned).
+//! 3. Assert the same fail-closed rejection also wins when a properly
+//!    typed `Capability<EpochZero>` object is present, so callers cannot
+//!    bypass unsupported capability validation by satisfying arg shapes.
 //!
 //! Why `mint_genesis` and not `mint`? `mint` is generic on `T` so its
 //! cap arg is declared as `Capability<MintCap<T>>` with a `Generic{idx:0}`
@@ -92,12 +89,11 @@ fn noop_mint_genesis_wat() -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Negative: passing a Coin<LOOM> where Capability<EpochZero> is
-// declared reverts with TypeMismatch mentioning Capability / EpochZero.
+// Negative: unsupported required_capabilities fail closed before arg typing.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn mint_genesis_wrong_typed_cap_reverts_with_typemismatch() {
+fn mint_genesis_required_capabilities_fail_closed_for_wrong_typed_cap() {
     let alice = addr(0xA1);
     let mut state = build_state(&[(alice, 1_000_000)]);
     let alice_coin_id = genesis_coin_id(alice, 0);
@@ -161,31 +157,19 @@ fn mint_genesis_wrong_typed_cap_reverts_with_typemismatch() {
 
     let reason = String::from_utf8_lossy(&out.return_data);
     let reason_lc = reason.to_lowercase();
-    // The validator emits `TypeMismatch { reason: "object <hex> has
-    // type Coin<LOOM>, declared arg type is Capability<EpochZero>" }`.
-    // Assert both halves are mentioned — proving this is the real
-    // cap-typecheck path and not a fallthrough error.
     assert!(
-        reason_lc.contains("capability") && reason_lc.contains("epochzero"),
-        "revert reason must cite Capability/EpochZero typecheck; got: {reason}"
-    );
-    assert!(
-        reason_lc.contains("typemismatch")
-            || reason_lc.contains("type mismatch")
-            || reason_lc.contains("coin<loom>"),
-        "revert reason must indicate a type mismatch; got: {reason}"
+        reason_lc.contains("required_capabilities") && reason_lc.contains("not supported"),
+        "revert reason must cite unsupported required_capabilities; got: {reason}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Positive control: a properly-typed Capability<EpochZero> object
-// passes the validator typecheck (and our WAT noop body returns 0,
-// so the whole PTB succeeds end-to-end through the chain-authoritative
-// adapter).
+// A properly-typed Capability<EpochZero> object still fails closed while
+// manifest-level required_capabilities are unsupported.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn mint_genesis_with_real_epoch_zero_cap_typechecks_ok() {
+fn mint_genesis_required_capabilities_fail_closed_for_real_epoch_zero_cap() {
     let alice = addr(0xA1);
     let mut state = build_state(&[(alice, 1_000_000)]);
     let alice_coin_id = genesis_coin_id(alice, 0);
@@ -229,9 +213,14 @@ fn mint_genesis_with_real_epoch_zero_cap_typechecks_ok() {
 
     let out = submit_ptb_chain_auth(&mut state, alice, ptb);
 
+    assert!(!out.success, "required_capabilities must fail closed");
+    assert!(out.write_set.is_none(), "revert must drop write set");
+    assert!(out.logs.is_empty(), "revert must drop logs");
+
+    let reason = String::from_utf8_lossy(&out.return_data);
+    let reason_lc = reason.to_lowercase();
     assert!(
-        out.success,
-        "positive control with real Capability<EpochZero> must pass typecheck; revert: {}",
-        String::from_utf8_lossy(&out.return_data)
+        reason_lc.contains("required_capabilities") && reason_lc.contains("not supported"),
+        "revert reason must cite unsupported required_capabilities; got: {reason}"
     );
 }

@@ -5,6 +5,8 @@ use serde_json::json;
 
 use crate::rpc::RpcClient;
 
+const GAS_OBJECT_SCAN_PAGE_LIMIT: usize = 1_024;
+
 pub async fn select_loom_gas_payer_rpc(
     client: &RpcClient,
     signer: [u8; 32],
@@ -24,21 +26,34 @@ pub async fn select_loom_gas_payer_rpc(
         .map_err(|_| anyhow::anyhow!("Coin<LOOM> petal hash must be 32 bytes"))?;
     let coin_type = loom_coin_type_tag(bloom_chain_types::Hash32(hash_arr));
 
-    let objects = client
-        .call(
-            "chain_ls_objects",
-            json!({ "owner_addr": hex::encode(signer) }),
-        )
-        .await
-        .context("rpc chain_ls_objects for gas payer")?;
-    select_loom_gas_payer_from_object_json(
-        objects
+    let signer_hex = hex::encode(signer);
+    let mut offset = 0usize;
+    let mut best: Option<(u128, ObjectId)> = None;
+    loop {
+        let objects = client
+            .call(
+                "chain_ls_objects",
+                json!({
+                    "owner_addr": signer_hex,
+                    "limit": GAS_OBJECT_SCAN_PAGE_LIMIT,
+                    "offset": offset,
+                }),
+            )
+            .await
+            .context("rpc chain_ls_objects for gas payer")?;
+        let page = objects
             .as_array()
-            .context("chain_ls_objects returned non-array")?,
-        &coin_type,
-        signer,
-        min_amount,
-    )
+            .context("chain_ls_objects returned non-array")?;
+        best =
+            select_best_loom_gas_payer_from_object_json(page, &coin_type, signer, min_amount, best);
+        if page.len() < GAS_OBJECT_SCAN_PAGE_LIMIT {
+            break;
+        }
+        offset = offset.saturating_add(GAS_OBJECT_SCAN_PAGE_LIMIT);
+    }
+    best.map(|(_, id)| id).ok_or_else(|| {
+        anyhow::anyhow!("no signer-owned Coin<LOOM> gas payer covers budget {min_amount}")
+    })
 }
 
 pub fn select_loom_gas_payer_from_object_json(
@@ -48,6 +63,20 @@ pub fn select_loom_gas_payer_from_object_json(
     min_amount: u128,
 ) -> Result<ObjectId> {
     let mut best: Option<(u128, ObjectId)> = None;
+    best =
+        select_best_loom_gas_payer_from_object_json(objects, coin_type, signer, min_amount, best);
+    best.map(|(_, id)| id).ok_or_else(|| {
+        anyhow::anyhow!("no signer-owned Coin<LOOM> gas payer covers budget {min_amount}")
+    })
+}
+
+fn select_best_loom_gas_payer_from_object_json(
+    objects: &[serde_json::Value],
+    coin_type: &TypeTag,
+    signer: [u8; 32],
+    min_amount: u128,
+    mut best: Option<(u128, ObjectId)>,
+) -> Option<(u128, ObjectId)> {
     let signer_hex = hex::encode(signer);
     for value in objects {
         if value.get("owner_kind").and_then(|v| v.as_str()) != Some("address")
@@ -81,9 +110,7 @@ pub fn select_loom_gas_payer_from_object_json(
             _ => best = Some((amount, obj.id)),
         }
     }
-    best.map(|(_, id)| id).ok_or_else(|| {
-        anyhow::anyhow!("no signer-owned Coin<LOOM> gas payer covers budget {min_amount}")
-    })
+    best
 }
 
 pub fn decode_coin_value(bytes: &[u8]) -> Option<u128> {

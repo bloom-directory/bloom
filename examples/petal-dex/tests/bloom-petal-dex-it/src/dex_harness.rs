@@ -271,6 +271,8 @@ pub fn manifest_nullary(fn_name: &str) -> PetalManifestStub {
             type_params: vec![],
             args: vec![],
             returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
             attached_invariants: vec![],
         }],
         ..Default::default()
