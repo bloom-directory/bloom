@@ -4,19 +4,17 @@
 //! literal to an [`Arg::Const`] whose bytes are the **canonical
 //! encoding** of the value under the declared
 //! [`ArgDeclStub::Const(TypeTag)`] type. We encode using the same widths
-//! `bloom-objects`' canonical codec / `primitive` validator expects, so
-//! the resulting `Const` round-trips through
-//! `validate_canonical_bytes` cleanly.
+//! `bloom-resource`' canonical [`BloomType`] implementations emit, so
+//! the resulting `Const` bytes match the schema-driven value codec.
 //!
 //! Supported primitive type names: `u8`..`u128`, `i8`..`i128`, `bool`,
 //! `Address`/`ObjectId`/`Hash32` (32-byte hex), `String`. Anything else
-//! (petal-defined structs, generics, externals) is treated as opaque:
-//! the literal is interpreted as `0x`-prefixed hex bytes (raw,
-//! length-checked only by the runtime), matching the validator's
-//! "Unknown ⇒ accept" stance.
+//! (petal-defined structs, generics, externals) must be supplied as
+//! `0x`-prefixed canonical bytes and is validated by the PTB validator
+//! against the resolved manifest schema.
 
 use bloom_objects::TypeTag;
-use bloom_objects::codec::{write_string, write_u64_be};
+use bloom_resource::BloomType;
 
 use crate::error::BuildError;
 
@@ -40,11 +38,7 @@ fn encode_primitive(type_name: &str, value: &str) -> Result<Vec<u8>, BuildError>
         "u8" => parse_uint(value, 8).map(|v| vec![v as u8]),
         "u16" => parse_uint(value, 16).map(|v| (v as u16).to_be_bytes().to_vec()),
         "u32" => parse_uint(value, 32).map(|v| (v as u32).to_be_bytes().to_vec()),
-        "u64" => {
-            let mut buf = Vec::with_capacity(8);
-            write_u64_be(&mut buf, parse_uint(value, 64)? as u64);
-            Ok(buf)
-        }
+        "u64" => parse_uint(value, 64).map(|v| (v as u64).canonical_encode()),
         "u128" => parse_u128(value).map(|v| v.to_be_bytes().to_vec()),
         "i8" => parse_int(value, 8).map(|v| (v as i8).to_be_bytes().to_vec()),
         "i16" => parse_int(value, 16).map(|v| (v as i16).to_be_bytes().to_vec()),
@@ -68,15 +62,9 @@ fn encode_primitive(type_name: &str, value: &str) -> Result<Vec<u8>, BuildError>
             }
             Ok(bytes)
         }
-        "String" => {
-            let mut buf = Vec::new();
-            // Canonical String: 2-byte BE length prefix + UTF-8.
-            write_string(&mut buf, value).map_err(|e| {
-                BuildError::Parse(format!("String literal does not fit canonical codec: {e}"))
-            })?;
-            Ok(buf)
-        }
-        // Unknown primitive name (petal struct etc.): accept opaque hex.
+        "String" => Ok(value.to_string().canonical_encode()),
+        // Petal struct/enum names: accept canonical bytes as hex; the
+        // schema resolver validates them before the command is recorded.
         _ => parse_hex_bytes(value),
     }
 }

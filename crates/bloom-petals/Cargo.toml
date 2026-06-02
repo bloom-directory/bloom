@@ -13,6 +13,7 @@ bloom-chain-state.workspace = true
 bloom-objects.workspace = true
 bloom-petal-manifest.workspace = true
 bloom-script.workspace = true
+bloom-value.workspace = true
 wasmparser = "0.218"
 async-trait.workspace = true
 anyhow.workspace = true

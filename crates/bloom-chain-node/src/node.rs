@@ -145,7 +145,7 @@ pub fn restore_state_from_storage<E: PetalExecutor>(
         None => {
             info!("node.startup: no complete state checkpoint, applying genesis");
             let mut state = State::new();
-            genesis.apply_to_state(&mut state);
+            genesis.apply_to_state(&mut state)?;
             (0, state)
         }
     };

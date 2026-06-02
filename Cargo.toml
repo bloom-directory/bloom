@@ -24,6 +24,7 @@ members = [
   "crates/bloom-chain-consensus",
   "crates/bloom-chain-node",
   "crates/bloom-chain-abi",
+  "crates/bloom-value",
   "crates/bloom-objects",
   "crates/bloom-resource",
   "crates/bloom-resource-macros",
@@ -129,6 +130,7 @@ bloom-chain-types = { path = "crates/bloom-chain-types" }
 bloom-chain-state = { path = "crates/bloom-chain-state" }
 bloom-chain-node = { path = "crates/bloom-chain-node" }
 bloom-chain-abi   = { path = "crates/bloom-chain-abi", default-features = false }
+bloom-value       = { path = "crates/bloom-value" }
 bloom-objects     = { path = "crates/bloom-objects" }
 bloom-resource    = { path = "crates/bloom-resource" }
 bloom-resource-macros = { path = "crates/bloom-resource-macros" }

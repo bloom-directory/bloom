@@ -1,0 +1,17 @@
+[package]
+name = "bloom-value"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Schema-driven canonical value codec and JSON projection for Bloom-native payloads"
+
+[dependencies]
+bloom-objects.workspace = true
+hex.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -14,6 +14,10 @@ bloom-resource = { workspace = true }
 bloom-resource-macros = { workspace = true }
 bloom-objects = { workspace = true }
 
+[dev-dependencies]
+bloom-petal-manifest = { workspace = true }
+bloom-value = { workspace = true }
+
 [features]
 default = []
 # Suppress the wasm `__petal_<fn>` entrypoints when this crate is compiled

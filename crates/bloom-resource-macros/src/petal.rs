@@ -24,10 +24,13 @@
 //! `invariant.rs`) can also be used standalone (e.g. in a test crate)
 //! — they're idempotent with respect to the petal macro.
 
+use std::collections::HashSet;
+
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::{
-    Attribute, FnArg, GenericParam, Item, ItemFn, ItemMod, ItemStruct, Meta, ReturnType, Type,
+    Attribute, FnArg, GenericParam, Item, ItemEnum, ItemFn, ItemMod, ItemStruct, Meta, ReturnType,
+    Type,
 };
 
 use crate::ast::{attr_is_named, fn_name, ident, parse_str_value, signer_arg};
@@ -159,13 +162,19 @@ pub(crate) fn build_manifest_with_asts(
         }
     };
 
+    let bloom_value_types = collect_bloom_value_type_names(items);
+    let object_arg_types = collect_object_arg_type_names(items);
+
     for item in items {
         match item {
             Item::Struct(s) => {
                 handle_struct(s, &mut m)?;
             }
+            Item::Enum(e) => {
+                handle_enum(e, &mut m)?;
+            }
             Item::Fn(f) => {
-                if let Some(shim) = handle_fn(f, &mut m)? {
+                if let Some(shim) = handle_fn(f, &mut m, &bloom_value_types, &object_arg_types)? {
                     shims.push(shim);
                 }
             }
@@ -176,6 +185,39 @@ pub(crate) fn build_manifest_with_asts(
     }
 
     Ok((m, shims))
+}
+
+fn collect_bloom_value_type_names(items: &[Item]) -> HashSet<String> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Struct(s) if crate::bloom_type::has_bloom_type_derive(&s.attrs) => {
+                Some(s.ident.to_string())
+            }
+            Item::Enum(e) if crate::bloom_type::has_bloom_type_derive(&e.attrs) => {
+                Some(e.ident.to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn collect_object_arg_type_names(items: &[Item]) -> HashSet<String> {
+    let mut names = HashSet::from([
+        "Coin".to_string(),
+        "Balance".to_string(),
+        "Resource".to_string(),
+    ]);
+    names.extend(items.iter().filter_map(|item| match item {
+        Item::Struct(s)
+            if find_attr(&s.attrs, "object").is_some()
+                || find_attr(&s.attrs, "capability").is_some() =>
+        {
+            Some(s.ident.to_string())
+        }
+        _ => None,
+    }));
+    names
 }
 
 /// Recognise a `#[capability]` or `#[object]` struct and push its decl
@@ -205,6 +247,19 @@ fn handle_struct(s: &ItemStruct, m: &mut PetalManifestV0) -> syn::Result<()> {
         return Ok(());
     }
 
+    if crate::bloom_type::has_bloom_type_derive(&s.attrs) {
+        m.data_types.push(crate::bloom_type::build_data_decl(s)?);
+        return Ok(());
+    }
+
+    Ok(())
+}
+
+/// Recognise a plain `#[derive(BloomType)]` enum and push its decl.
+fn handle_enum(e: &ItemEnum, m: &mut PetalManifestV0) -> syn::Result<()> {
+    if crate::bloom_type::has_bloom_type_derive(&e.attrs) {
+        m.enum_types.push(crate::bloom_type::build_enum_decl(e)?);
+    }
     Ok(())
 }
 
@@ -213,7 +268,12 @@ fn handle_struct(s: &ItemStruct, m: &mut PetalManifestV0) -> syn::Result<()> {
 ///
 /// Returns the [`PetalShimAst`] payload for the function, or `None` if
 /// the function was skipped (non-`pub`).
-fn handle_fn(f: &ItemFn, m: &mut PetalManifestV0) -> syn::Result<Option<PetalShimAst>> {
+fn handle_fn(
+    f: &ItemFn,
+    m: &mut PetalManifestV0,
+    bloom_value_types: &HashSet<String>,
+    object_arg_types: &HashSet<String>,
+) -> syn::Result<Option<PetalShimAst>> {
     // Only `pub` fns are part of the petal surface.
     if !matches!(f.vis, syn::Visibility::Public(_)) {
         return Ok(None);
@@ -330,7 +390,13 @@ fn handle_fn(f: &ItemFn, m: &mut PetalManifestV0) -> syn::Result<Option<PetalShi
         crate::type_tag::reject_plain_generic_in_payload(&pat_ty.ty, &generic_names)?;
 
         // Determine kind based on type shape + reference mode.
-        let kind = arg_kind_for(&pat_ty.ty, &ctx, &mut required_capabilities)?;
+        let kind = arg_kind_for(
+            &pat_ty.ty,
+            &ctx,
+            &mut required_capabilities,
+            bloom_value_types,
+            object_arg_types,
+        )?;
         args.push(ArgDecl {
             name: arg_name.clone(),
             kind: kind.clone(),
@@ -354,12 +420,12 @@ fn handle_fn(f: &ItemFn, m: &mut PetalManifestV0) -> syn::Result<Option<PetalShi
             syn::Type::Tuple(t) => (
                 t.elems
                     .iter()
-                    .map(|t| ctx.lower(crate::type_tag::strip_resource_wrapper(t)))
+                    .map(|t| lower_manifest_return_tag(&ctx, t))
                     .collect::<Result<Vec<_>, _>>()?,
                 Some((**ty).clone()),
             ),
             other => (
-                vec![ctx.lower(crate::type_tag::strip_resource_wrapper(other))?],
+                vec![lower_manifest_return_tag(&ctx, other)?],
                 Some((**ty).clone()),
             ),
         },
@@ -411,6 +477,8 @@ fn arg_kind_for(
     ty: &syn::Type,
     ctx: &TypeTagCtx,
     required_capabilities: &mut Vec<bloom_objects::TypeTag>,
+    bloom_value_types: &HashSet<String>,
+    object_arg_types: &HashSet<String>,
 ) -> syn::Result<ArgKind> {
     // Strip a single layer of `&` / `&mut`.
     let (access, inner) = match ty {
@@ -424,6 +492,8 @@ fn arg_kind_for(
         }
         other => (None, other),
     };
+
+    let resource_wrapped = crate::type_tag::is_resource_wrapper(inner);
 
     // `Resource<T>` is a transparent handle wrapper; the on-chain object
     // arg is a `T`, so the manifest declares `T`'s tag (spec §11.2). The
@@ -439,22 +509,28 @@ fn arg_kind_for(
         ..
     } = &tag
     {
+        if bloom_value_types.contains(type_name) {
+            return Ok(ArgKind::Const(tag));
+        }
         if type_name == "Capability" {
             // Treat the inner T as the cap type.
             if let Some(inner) = type_args.first() {
                 required_capabilities.push(inner.clone());
+                return Ok(ArgKind::Object {
+                    ty: inner.clone(),
+                    mode: access.unwrap_or(bloom_objects::AccessMode::ReadOnly),
+                });
             }
-            return Ok(ArgKind::Object {
-                ty: tag,
-                mode: access.unwrap_or(bloom_objects::AccessMode::ReadOnly),
-            });
         }
     }
 
-    // Heuristic: types we recognise as "owned objects" — `Coin`,
-    // `Balance`, `Resource`, anything starting with an uppercase that
-    // isn't a primitive integer.
-    if is_object_like(inner) {
+    if resource_wrapped
+        || matches!(
+            &tag,
+            bloom_objects::TypeTag::Concrete { type_name, .. }
+                if object_arg_types.contains(type_name)
+        )
+    {
         let mode = access.unwrap_or(bloom_objects::AccessMode::Consume);
         return Ok(ArgKind::Object { ty: tag, mode });
     }
@@ -462,47 +538,24 @@ fn arg_kind_for(
     Ok(ArgKind::Const(tag))
 }
 
-/// Heuristic: returns `true` for types that should be treated as
-/// "object" args (linear, taken from the borrow table) rather than
-/// canonical-codec consts. Primitive types (`u8`..`u128`, `bool`,
-/// `Address`, etc.) come back as `false`.
-fn is_object_like(ty: &syn::Type) -> bool {
-    let syn::Type::Path(syn::TypePath { path, qself: None }) = ty else {
-        return false;
-    };
-    let Some(seg) = path.segments.last() else {
-        return false;
-    };
-    let n = seg.ident.to_string();
-
-    if matches!(
-        n.as_str(),
-        "u8" | "u16"
-            | "u32"
-            | "u64"
-            | "u128"
-            | "i8"
-            | "i16"
-            | "i32"
-            | "i64"
-            | "i128"
-            | "bool"
-            | "String"
-            | "Vec"
-            | "Address"
-            | "ObjectId"
-            | "TypeTag"
-    ) {
-        return false;
+fn lower_manifest_return_tag(
+    ctx: &TypeTagCtx,
+    ty: &syn::Type,
+) -> syn::Result<bloom_objects::TypeTag> {
+    let tag = ctx.lower(crate::type_tag::strip_resource_wrapper(ty))?;
+    if let bloom_objects::TypeTag::Concrete {
+        type_name,
+        type_args,
+        ..
+    } = &tag
+    {
+        if type_name == "Capability" {
+            if let Some(inner) = type_args.first() {
+                return Ok(inner.clone());
+            }
+        }
     }
-
-    // Single uppercase letter (e.g. `T`) is a generic, not an object.
-    if n.len() == 1 && n.chars().next().unwrap().is_ascii_uppercase() {
-        return false;
-    }
-
-    // Otherwise, assume CamelCase = object-like.
-    n.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+    Ok(tag)
 }
 
 /// Find the (last) attribute on a list matching `name`.
@@ -554,6 +607,7 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenS
         .enumerate()
         .map(|(i, _)| emit_invariant_shim(i as u16))
         .collect();
+    let object_cap_impls = emit_object_capability_impls(&parsed)?;
 
     // Strip the petal-recognised inner attributes from the module
     // body so downstream compilation sees clean Rust. The user-facing
@@ -589,6 +643,7 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenS
         #dispatch_helper
         #(#petal_shims)*
         #(#inv_shims)*
+        #(#object_cap_impls)*
     };
 
     let ItemMod {
@@ -611,6 +666,31 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenS
             #extras
         }
     })
+}
+
+fn emit_object_capability_impls(module: &ItemMod) -> syn::Result<Vec<TokenStream>> {
+    let Some((_, items)) = &module.content else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let Item::Struct(s) = item else {
+            continue;
+        };
+        if find_attr(&s.attrs, "object").is_some() {
+            out.push(crate::bloom_type::emit_struct_impl_for_item(s, true)?);
+        }
+        if find_attr(&s.attrs, "capability").is_some() {
+            let bloom_type_impl = crate::bloom_type::emit_struct_impl_for_item(s, true)?;
+            let name = &s.ident;
+            let (impl_gen, ty_gen, where_clause) = s.generics.split_for_impl();
+            out.push(quote! {
+                #bloom_type_impl
+                impl #impl_gen ::bloom_resource::CapabilityMarker for #name #ty_gen #where_clause {}
+            });
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -719,6 +799,27 @@ mod tests {
     }
 
     #[test]
+    fn build_manifest_collects_derived_data_and_enums() {
+        let m = parse_mod(quote! {
+            pub mod p {
+                #[derive(BloomType)]
+                pub struct Quote { amount: u128, label: String }
+
+                #[derive(Clone, bloom::BloomType)]
+                pub enum Side { Bid, Ask { amount: u64 } }
+            }
+        });
+        let attr = PetalAttr::parse(quote! { path = "/p" }).unwrap();
+        let manifest = build_manifest(&attr, &m).unwrap();
+        assert_eq!(manifest.data_types.len(), 1);
+        assert_eq!(manifest.data_types[0].name, "Quote");
+        assert_eq!(manifest.data_types[0].fields.len(), 2);
+        assert_eq!(manifest.enum_types.len(), 1);
+        assert_eq!(manifest.enum_types[0].name, "Side");
+        assert_eq!(manifest.enum_types[0].variants.len(), 2);
+    }
+
+    #[test]
     fn build_manifest_collects_invariants() {
         let m = parse_mod(quote! {
             pub mod p {
@@ -760,6 +861,94 @@ mod tests {
     }
 
     #[test]
+    fn build_manifest_records_builtin_value_containers_as_const_args() {
+        let m = parse_mod(quote! {
+            pub mod p {
+                pub fn store(
+                    blob: Bytes,
+                    maybe: Option<String>,
+                    result: Result<u64, String>,
+                    labels: BTreeSet<String>,
+                    amounts: BTreeMap<String, u128>,
+                ) {}
+            }
+        });
+        let attr = PetalAttr::parse(quote! {}).unwrap();
+        let manifest = build_manifest(&attr, &m).unwrap();
+        let args = &manifest.functions[0].args;
+        assert_eq!(args.len(), 5);
+        for arg in args {
+            assert!(
+                matches!(arg.kind, ArgKind::Const(_)),
+                "{} should be a const value arg, got {:?}",
+                arg.name,
+                arg.kind
+            );
+        }
+        assert!(matches!(
+            &args[0].kind,
+            ArgKind::Const(bloom_objects::TypeTag::Concrete { type_name, .. })
+                if type_name == "bytes"
+        ));
+        assert!(matches!(
+            &args[1].kind,
+            ArgKind::Const(bloom_objects::TypeTag::Concrete { type_name, .. })
+                if type_name == "Option"
+        ));
+        assert!(matches!(
+            &args[2].kind,
+            ArgKind::Const(bloom_objects::TypeTag::Concrete { type_name, .. })
+                if type_name == "Result"
+        ));
+        assert!(matches!(
+            &args[3].kind,
+            ArgKind::Const(bloom_objects::TypeTag::Concrete { type_name, .. })
+                if type_name == "set"
+        ));
+        assert!(matches!(
+            &args[4].kind,
+            ArgKind::Const(bloom_objects::TypeTag::Concrete { type_name, .. })
+                if type_name == "map"
+        ));
+    }
+
+    #[test]
+    fn build_manifest_does_not_treat_unknown_uppercase_as_object_arg() {
+        let m = parse_mod(quote! {
+            pub mod p {
+                pub fn f(q: Quote) {}
+            }
+        });
+        let attr = PetalAttr::parse(quote! {}).unwrap();
+        let manifest = build_manifest(&attr, &m).unwrap();
+        let args = &manifest.functions[0].args;
+        assert!(matches!(
+            &args[0].kind,
+            ArgKind::Const(bloom_objects::TypeTag::Concrete { type_name, .. })
+                if type_name == "Quote"
+        ));
+    }
+
+    #[test]
+    fn build_manifest_treats_resource_wrapper_as_object_arg() {
+        let m = parse_mod(quote! {
+            pub mod p {
+                pub fn f(pool: &mut Resource<Pool>) {}
+            }
+        });
+        let attr = PetalAttr::parse(quote! {}).unwrap();
+        let manifest = build_manifest(&attr, &m).unwrap();
+        let args = &manifest.functions[0].args;
+        assert!(matches!(
+            &args[0].kind,
+            ArgKind::Object {
+                ty: bloom_objects::TypeTag::Concrete { type_name, .. },
+                mode: bloom_objects::AccessMode::Mutable,
+            } if type_name == "Pool"
+        ));
+    }
+
+    #[test]
     fn build_manifest_records_capability_arg() {
         let m = parse_mod(quote! {
             pub mod p {
@@ -770,7 +959,17 @@ mod tests {
         let manifest = build_manifest(&attr, &m).unwrap();
         let f = &manifest.functions[0];
         assert_eq!(f.required_capabilities.len(), 1);
-        assert!(matches!(&f.args[0].kind, ArgKind::Object { .. }));
+        assert!(matches!(
+            &f.required_capabilities[0],
+            bloom_objects::TypeTag::Concrete { type_name, .. } if type_name == "AdminCap"
+        ));
+        assert!(matches!(
+            &f.args[0].kind,
+            ArgKind::Object {
+                ty: bloom_objects::TypeTag::Concrete { type_name, .. },
+                ..
+            } if type_name == "AdminCap"
+        ));
     }
 
     #[test]
@@ -795,6 +994,21 @@ mod tests {
         let attr = PetalAttr::parse(quote! {}).unwrap();
         let manifest = build_manifest(&attr, &m).unwrap();
         assert_eq!(manifest.functions[0].returns.len(), 2);
+    }
+
+    #[test]
+    fn build_manifest_erases_capability_return_wrapper() {
+        let m = parse_mod(quote! {
+            pub mod p {
+                pub fn claim() -> Capability<AdminCap> { unimplemented!() }
+            }
+        });
+        let attr = PetalAttr::parse(quote! {}).unwrap();
+        let manifest = build_manifest(&attr, &m).unwrap();
+        assert!(matches!(
+            &manifest.functions[0].returns[0],
+            bloom_objects::TypeTag::Concrete { type_name, .. } if type_name == "AdminCap"
+        ));
     }
 
     #[test]

@@ -56,3 +56,4 @@ tempfile.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
 bloom-test-util = { path = "../bloom-test-util" }
+bloom-petal-fungible.workspace = true

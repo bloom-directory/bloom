@@ -10,6 +10,7 @@ description = "Wasm-side runtime library for Bloom-native petals: safe host-impo
 [dependencies]
 bloom-objects.workspace = true
 bloom-chain-types.workspace = true
+bloom-value.workspace = true
 thiserror.workspace = true
 
 [features]

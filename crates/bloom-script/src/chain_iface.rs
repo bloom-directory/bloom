@@ -34,6 +34,12 @@ pub struct PetalManifestStub {
     pub functions: Vec<FunctionDeclStub>,
     /// Object-type decls (currently used only for abilities lookup).
     pub object_types: Vec<ObjectTypeDeclStub>,
+    /// Capability declarations for schema-driven value validation.
+    pub capability_types: Vec<CapabilityTypeDeclStub>,
+    /// Plain data struct declarations for schema-driven value validation.
+    pub data_types: Vec<DataTypeDeclStub>,
+    /// Plain enum declarations for schema-driven value validation.
+    pub enum_types: Vec<EnumTypeDeclStub>,
     /// External type refs from other petals (paths + pinned hashes).
     pub external_type_refs: Vec<ExternalTypeRefStub>,
 }
@@ -108,6 +114,72 @@ pub struct ObjectTypeDeclStub {
     pub name: String,
     /// Declared abilities.
     pub abilities: AbilitySet,
+    /// Generic parameters in declaration order.
+    pub type_params: Vec<TypeParamDeclStub>,
+    /// Payload fields in canonical order.
+    pub fields: Vec<FieldDeclStub>,
+}
+
+/// Capability declaration in the manifest stub.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct CapabilityTypeDeclStub {
+    /// Type name within the petal.
+    pub name: String,
+    /// Generic parameters in declaration order.
+    pub type_params: Vec<TypeParamDeclStub>,
+    /// Payload fields in canonical order.
+    pub fields: Vec<FieldDeclStub>,
+}
+
+/// Plain data-struct declaration in the manifest stub.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct DataTypeDeclStub {
+    /// Type name within the petal.
+    pub name: String,
+    /// Generic parameters in declaration order.
+    pub type_params: Vec<TypeParamDeclStub>,
+    /// Fields in canonical order.
+    pub fields: Vec<FieldDeclStub>,
+}
+
+/// Plain enum declaration in the manifest stub.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct EnumTypeDeclStub {
+    /// Type name within the petal.
+    pub name: String,
+    /// Generic parameters in declaration order.
+    pub type_params: Vec<TypeParamDeclStub>,
+    /// Variants in declaration order.
+    pub variants: Vec<VariantDeclStub>,
+}
+
+/// Struct/object field declaration in the manifest stub.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldDeclStub {
+    /// Field name.
+    pub name: String,
+    /// Field type.
+    pub ty: TypeTag,
+}
+
+/// Enum variant declaration in the manifest stub.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VariantDeclStub {
+    /// Variant name.
+    pub name: String,
+    /// Variant payload layout.
+    pub fields: VariantFieldsDeclStub,
+}
+
+/// Enum variant payload shape in the manifest stub.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VariantFieldsDeclStub {
+    /// Unit variant.
+    Unit,
+    /// Tuple fields.
+    Tuple(Vec<TypeTag>),
+    /// Struct fields.
+    Struct(Vec<FieldDeclStub>),
 }
 
 /// Resolved external-type reference (`/path/to/petal::TypeName ->
@@ -199,6 +271,7 @@ mod tests {
             object_types: vec![ObjectTypeDeclStub {
                 name: "Pool".to_string(),
                 abilities: AbilitySet::key_store(),
+                ..Default::default()
             }],
             ..Default::default()
         };

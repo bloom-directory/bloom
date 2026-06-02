@@ -39,13 +39,13 @@ use bloom_script::{
 // Coin payload helpers
 // ---------------------------------------------------------------------------
 
-/// Canonical 48-byte coin payload: `[ObjectId placeholder (32)] || [value BE (16)]`.
+/// Canonical 16-byte coin payload: `[value BE (16)]`.
 /// Delegates to `bloom_petal_fungible::ops::coin_payload`.
 pub fn ptb_coin_payload(value: u128) -> Vec<u8> {
     coin_payload(value)
 }
 
-/// Decode the value from a canonical 48-byte coin payload.
+/// Decode the value from a canonical 16-byte coin payload.
 /// Returns 0 on malformed input (test-harness convenience).
 pub fn ptb_decode_coin_value(payload: &[u8]) -> u128 {
     fungible_decode_coin_value(payload).unwrap_or(0)
@@ -482,20 +482,16 @@ pub fn erased_pair_type_args() -> Vec<TypeTag> {
     vec![erased_type_tag(), erased_type_tag()]
 }
 
-/// `TypeTag` for `Capability<FaucetAdmin>` with zero-petal sentinels.
+/// `TypeTag` for `FaucetAdmin` with a zero-petal self sentinel.
 pub fn faucet_admin_cap_tag() -> TypeTag {
     TypeTag::Concrete {
         petal_hash: [0u8; 32],
-        type_name: "Capability".to_string(),
-        type_args: vec![TypeTag::Concrete {
-            petal_hash: [0u8; 32],
-            type_name: "FaucetAdmin".to_string(),
-            type_args: vec![],
-        }],
+        type_name: "FaucetAdmin".to_string(),
+        type_args: vec![],
     }
 }
 
-/// Seed a `Capability<FaucetAdmin>` object owned by `owner` at `id`.
+/// Seed a `FaucetAdmin` capability object owned by `owner` at `id`.
 pub fn seed_faucet_admin_cap(state: &mut State, id: ObjectId, owner: Address) {
     let obj = Object {
         id,

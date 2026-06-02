@@ -605,29 +605,41 @@ fn emit_return_encode(ast: &PetalShimAst) -> TokenStream {
 /// return type. The handle/tag model encodes every on-chain object
 /// wrapper (`Coin<_>`, `Capability<_>`, `Resource<_>`) as its stable
 /// 32-byte `ObjectId` so a downstream command's `Use(cmd, ret)` can
-/// re-borrow it; `Option<wrapper>` becomes a present/absent slot; and
-/// plain values route through `BloomType::canonical_encode`.
+/// re-borrow it; `Option<wrapper>` becomes canonical
+/// `Option<ObjectId>` bytes; and plain values route through
+/// `BloomType::canonical_encode`.
 ///
 /// `generic_names` lists the enclosing fn's type-param names so the
 /// `BloomType` fallback can erase any phantom generic to
 /// `bloom_resource::Erased` (the non-generic shim must name a concrete
 /// type — spec §5).
 fn emit_return_write(ty: &Type, value_expr: &TokenStream, generic_names: &[String]) -> TokenStream {
-    // `Option<Inner>` → a present/absent slot. `Some` writes the inner
-    // value's encoding (recursively); `None` writes a zero-length slot the
-    // reader interprets as absent. This lets petals return optional coin
-    // remainders (e.g. `swap_exact_out`) within the fixed count-prefixed
-    // envelope.
     if let Some(inner) = option_inner(ty) {
-        let some_write = emit_return_write(inner, &quote! { __opt_inner }, generic_names);
-        return quote! {
-            {
-                match (#value_expr) {
-                    ::core::option::Option::Some(__opt_inner) => { #some_write }
-                    ::core::option::Option::None => { __writer.write_bytes(&[]); }
+        let inner_name = path_last_ident(inner);
+        if matches!(
+            inner_name.as_deref(),
+            Some("Coin") | Some("Capability") | Some("Resource")
+        ) {
+            return quote! {
+                {
+                    match (#value_expr) {
+                        ::core::option::Option::Some(__opt_inner) => {
+                            let __slot_id = match ::bloom_resource::host::object_id(__opt_inner.handle()) {
+                                Ok(id) => id,
+                                Err(e) => return Err(e),
+                            };
+                            let mut __slot_bytes = ::std::vec::Vec::with_capacity(33);
+                            __slot_bytes.push(1u8);
+                            __slot_bytes.extend_from_slice(&__slot_id.0);
+                            __writer.write_bytes(&__slot_bytes);
+                        }
+                        ::core::option::Option::None => {
+                            __writer.write_bytes(&[0u8]);
+                        }
+                    }
                 }
-            }
-        };
+            };
+        }
     }
 
     let name = path_last_ident(ty);
@@ -980,14 +992,24 @@ mod tests {
 
     #[test]
     fn emit_return_write_option_wrapper_emits_present_absent_slot() {
-        // `Option<Coin<T>>` → a match: Some writes the ObjectId, None
-        // writes a zero-length slot.
+        // `Option<Coin<T>>` → canonical `Option<ObjectId>` bytes.
         let ty: Type = syn::parse_str("Option<Coin<A>>").unwrap();
         let s = emit_return_write(&ty, &quote! { __ret }, &["A".to_string()]).to_string();
         assert!(s.contains("Some"));
         assert!(s.contains("None"));
         assert!(s.contains("object_id"));
+        assert!(s.contains("push (1u8)"));
+        assert!(s.contains("& [0u8]"));
         assert!(s.contains("write_bytes"));
+    }
+
+    #[test]
+    fn emit_return_write_plain_option_uses_bloom_type_codec() {
+        let ty: Type = syn::parse_str("Option<u128>").unwrap();
+        let s = emit_return_write(&ty, &quote! { __ret }, &[]).to_string();
+        assert!(s.contains("canonical_encode"));
+        assert!(!s.contains("object_id"));
+        assert!(!s.contains("& [0u8]"));
     }
 
     #[test]

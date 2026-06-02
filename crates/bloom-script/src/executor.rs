@@ -37,22 +37,26 @@ use bloom_chain_types::{
     Hash32,
     digest::{blake3_tagged, tags},
 };
-use bloom_objects::{
-    AbilitySet, AccessMode, Object, ObjectId, Owner, TypeTag, ValidationOutcome,
-    validate_canonical_bytes,
-};
+use bloom_objects::{AbilitySet, AccessMode, Object, ObjectId, Owner, TypeTag};
+use bloom_resource::BloomType;
+use bloom_resource::abi::{CallArgsWriter, RetReader};
 
 use crate::borrow_table::BorrowRow;
 use crate::chain_iface::{ArgDeclStub, ChainStateIface, InvariantDeclStub, PetalManifestStub};
 use crate::error::PtbError;
 use crate::host_ctx::PtbHostCtx;
 use crate::types::{Arg, Command, MoveCmd, PublishCmd, UpgradeCmd, UseRef};
+use crate::value_validation::validate_return_slot;
 use crate::validator::{ValidatedPtb, decode_coin_value};
 
 const MAX_PETAL_RETURN_SLOTS: usize = 32;
 const MAX_PETAL_RETURN_BYTES: usize = 2 << 20;
 const PUBLISH_BASE_FUEL: u64 = 1_000;
 const PUBLISH_BYTES_PER_FUEL: u64 = 64;
+
+fn coin_payload(value: u128) -> Vec<u8> {
+    value.canonical_encode()
+}
 
 // ---------------------------------------------------------------------------
 // Petal runner trait
@@ -540,17 +544,14 @@ impl<'c> PtbExecutor<'c> {
         let outputs = unmarshal_outputs(&result.ret_buf, expected_returns, cmd_idx)?;
         for (ret_idx, (output, declared)) in outputs.iter().zip(f.returns.iter()).enumerate() {
             let expected = substitute_type_args(declared, &m.type_args);
-            match validate_canonical_bytes(&expected, output) {
-                ValidationOutcome::Ok | ValidationOutcome::Unknown => {}
-                ValidationOutcome::Invalid(reason) => {
-                    return Err(PtbError::BuiltinFailed {
-                        cmd_idx,
-                        reason: format!(
-                            "Move return slot {ret_idx} does not match declared type {}: {reason}",
-                            type_tag_label(&expected),
-                        ),
-                    });
-                }
+            if let Err(reason) = validate_return_slot(manifest, hash.0, &expected, output) {
+                return Err(PtbError::BuiltinFailed {
+                    cmd_idx,
+                    reason: format!(
+                        "Move return slot {ret_idx} does not match declared type {}: {reason}",
+                        type_tag_label(&expected),
+                    ),
+                });
             }
         }
 
@@ -656,7 +657,7 @@ impl<'c> PtbExecutor<'c> {
 
         // Pull what we need from the source row in one short critical
         // section.
-        let (mut value, coin_type, owner, src_id_prefix) = self.with_ctx(|ctx| {
+        let (mut value, coin_type, owner) = self.with_ctx(|ctx| {
             let src_row = ctx
                 .borrow_table
                 .get(&src_id)
@@ -672,8 +673,7 @@ impl<'c> PtbExecutor<'c> {
                     cmd_idx,
                     reason: "SplitCoins src has invalid Coin payload".to_string(),
                 })?;
-            let prefix: [u8; 32] = src_row.payload_bytes[..32].try_into().unwrap();
-            Ok::<_, PtbError>((v, src_row.type_tag.clone(), src_row.owner.clone(), prefix))
+            Ok::<_, PtbError>((v, src_row.type_tag.clone(), src_row.owner.clone()))
         })?;
 
         let total_out: u128 = amounts.iter().try_fold(0u128, |acc, a| {
@@ -690,21 +690,16 @@ impl<'c> PtbExecutor<'c> {
         }
         value -= total_out;
 
-        // Write the source's new value back using canonical 48-byte
-        // format, preserving its id prefix; mark dirty so diff_check
-        // bumps the version.
-        let mut new_payload = src_id_prefix.to_vec();
-        new_payload.extend_from_slice(&value.to_be_bytes());
-        self.with_ctx(|ctx| ctx.borrow_table.mark_dirty(&src_id, new_payload))?;
+        // Write the source's new value back using canonical Coin { value: u128 }
+        // payload bytes; mark dirty so diff_check bumps the version.
+        self.with_ctx(|ctx| ctx.borrow_table.mark_dirty(&src_id, coin_payload(value)))?;
 
-        // Emit one transient Coin per requested amount, each with a
-        // canonical 48-byte payload: [transient id (32 bytes)] ||
-        // [amount BE (16 bytes)].
+        // Emit one transient Coin per requested amount. The PTB output carries
+        // the object id; the Coin payload itself is just the `u128` value.
         let mut outs: Vec<Vec<u8>> = Vec::with_capacity(amounts.len());
         for amt in amounts {
             let id = self.mint_transient_id(b"split-coin");
-            let mut payload = id.0.to_vec();
-            payload.extend_from_slice(&amt.to_be_bytes());
+            let payload = coin_payload(*amt);
             let row = BorrowRow {
                 object_id: id,
                 type_tag: coin_type.clone(),
@@ -815,10 +810,7 @@ impl<'c> PtbExecutor<'c> {
             }
         }
         let id = first_id.unwrap();
-        // Write merged total in canonical 48-byte format: [id (32)] || [total BE (16)].
-        let mut merged_payload = id.0.to_vec();
-        merged_payload.extend_from_slice(&accum.to_be_bytes());
-        self.with_ctx(|ctx| ctx.borrow_table.mark_dirty(&id, merged_payload))?;
+        self.with_ctx(|ctx| ctx.borrow_table.mark_dirty(&id, coin_payload(accum)))?;
         Ok(vec![id.0.to_vec()])
     }
 
@@ -990,34 +982,27 @@ fn type_tag_label(t: &TypeTag) -> String {
 }
 
 fn marshal_args(args: &[Arg], command_outputs: &[Vec<Vec<u8>>]) -> Result<Vec<u8>, PtbError> {
-    // Format: count (u32 BE) then for each arg: tag (u8) + length-prefixed payload.
-    let mut buf = Vec::new();
-    let count: u32 = args.len().try_into().map_err(|_| PtbError::BuiltinFailed {
+    let _count: u32 = args.len().try_into().map_err(|_| PtbError::BuiltinFailed {
         cmd_idx: 0,
         reason: "too many args".to_string(),
     })?;
-    buf.extend_from_slice(&count.to_be_bytes());
+    let mut writer = CallArgsWriter::new();
     for arg in args {
         match arg {
             Arg::Signer(idx) => {
-                buf.push(0);
-                buf.extend_from_slice(&idx.to_be_bytes());
+                writer.push_signer(*idx);
             }
             Arg::Const(bytes) => {
-                buf.push(1);
-                let len: u32 = bytes
-                    .len()
-                    .try_into()
-                    .map_err(|_| PtbError::BuiltinFailed {
+                if u32::try_from(bytes.len()).is_err() {
+                    return Err(PtbError::BuiltinFailed {
                         cmd_idx: 0,
                         reason: "Const too large".to_string(),
-                    })?;
-                buf.extend_from_slice(&len.to_be_bytes());
-                buf.extend_from_slice(bytes);
+                    });
+                }
+                writer.push_const(bytes);
             }
             Arg::Object { id, .. } => {
-                buf.push(2);
-                buf.extend_from_slice(&id.0);
+                writer.push_object(id);
             }
             Arg::Use { cmd_idx, ret_idx } => {
                 let bytes = lookup_use(
@@ -1028,30 +1013,26 @@ fn marshal_args(args: &[Arg], command_outputs: &[Vec<Vec<u8>>]) -> Result<Vec<u8
                     },
                     *cmd_idx,
                 )?;
-                buf.push(3);
-                let len: u32 = bytes
-                    .len()
-                    .try_into()
-                    .map_err(|_| PtbError::BuiltinFailed {
+                if u32::try_from(bytes.len()).is_err() {
+                    return Err(PtbError::BuiltinFailed {
                         cmd_idx: *cmd_idx,
                         reason: "Use payload too large".to_string(),
-                    })?;
-                buf.extend_from_slice(&len.to_be_bytes());
-                buf.extend_from_slice(&bytes);
+                    });
+                }
+                writer.push_use(&bytes);
             }
             Arg::TypeArg(t) => {
-                buf.push(4);
-                let enc = t.encode_canonical().map_err(PtbError::Codec)?;
-                let len: u32 = enc.len().try_into().map_err(|_| PtbError::BuiltinFailed {
-                    cmd_idx: 0,
-                    reason: "TypeArg encoding too large".to_string(),
+                writer.push_type_arg(t).map_err(|e| match e {
+                    bloom_resource::AbiError::TypeTagError(err) => PtbError::Codec(err),
+                    other => PtbError::BuiltinFailed {
+                        cmd_idx: 0,
+                        reason: format!("TypeArg encoding failed: {other}"),
+                    },
                 })?;
-                buf.extend_from_slice(&len.to_be_bytes());
-                buf.extend_from_slice(&enc);
             }
         }
     }
-    Ok(buf)
+    Ok(writer.finish())
 }
 
 fn unmarshal_outputs(
@@ -1059,7 +1040,6 @@ fn unmarshal_outputs(
     expected_count: usize,
     cmd_idx: u16,
 ) -> Result<Vec<Vec<u8>>, PtbError> {
-    // Format: count (u32 BE) then for each return: length-prefixed bytes.
     if buf.len() < 4 {
         if expected_count == 0 {
             return Ok(vec![]);
@@ -1069,8 +1049,11 @@ fn unmarshal_outputs(
             reason: format!("petal returned 0 slots, manifest declares {expected_count}"),
         });
     }
-    let mut rdr = buf;
-    let count = read_u32(&mut rdr)? as usize;
+    let mut rdr = RetReader::new(buf).map_err(|e| PtbError::BuiltinFailed {
+        cmd_idx,
+        reason: format!("petal return buffer invalid: {e}"),
+    })?;
+    let count = rdr.declared_count() as usize;
     if count > MAX_PETAL_RETURN_SLOTS {
         return Err(PtbError::BuiltinFailed {
             cmd_idx,
@@ -1085,45 +1068,19 @@ fn unmarshal_outputs(
     }
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
-        let len = read_u32(&mut rdr)? as usize;
-        if len > MAX_PETAL_RETURN_BYTES {
-            return Err(PtbError::BuiltinFailed {
-                cmd_idx,
-                reason: format!("petal return slot too large: {len} > {MAX_PETAL_RETURN_BYTES}"),
-            });
-        }
-        if rdr.len() < len {
-            return Err(PtbError::BuiltinFailed {
-                cmd_idx,
-                reason: format!(
-                    "petal return buffer truncated: need {len}, have {}",
-                    rdr.len()
-                ),
-            });
-        }
-        out.push(rdr[..len].to_vec());
-        rdr = &rdr[len..];
+        out.push(
+            rdr.next_bytes(MAX_PETAL_RETURN_BYTES)
+                .map_err(|e| PtbError::BuiltinFailed {
+                    cmd_idx,
+                    reason: format!("petal return buffer invalid: {e}"),
+                })?,
+        );
     }
-    if !rdr.is_empty() {
-        return Err(PtbError::BuiltinFailed {
-            cmd_idx,
-            reason: format!("petal return buffer has {} trailing bytes", rdr.len()),
-        });
-    }
+    rdr.expect_finished().map_err(|e| PtbError::BuiltinFailed {
+        cmd_idx,
+        reason: format!("petal return buffer invalid: {e}"),
+    })?;
     Ok(out)
-}
-
-fn read_u32(rdr: &mut &[u8]) -> Result<u32, PtbError> {
-    if rdr.len() < 4 {
-        return Err(PtbError::BuiltinFailed {
-            cmd_idx: 0,
-            reason: "buffer truncated".to_string(),
-        });
-    }
-    let mut a = [0u8; 4];
-    a.copy_from_slice(&rdr[..4]);
-    *rdr = &rdr[4..];
-    Ok(u32::from_be_bytes(a))
 }
 
 fn lookup_use(
@@ -1462,16 +1419,21 @@ mod tests {
         loom_coin_type_tag(Hash32([0; 32]))
     }
 
+    fn builtin_tt(name: &str) -> TypeTag {
+        TypeTag::Concrete {
+            petal_hash: bloom_objects::BUILTIN_TYPE_HASH,
+            type_name: name.to_string(),
+            type_args: vec![],
+        }
+    }
+
     fn make_coin(id_byte: u8, owner: [u8; 32], value: u128, version: u64) -> Object {
-        // 48-byte canonical payload: [ObjectId placeholder (32 bytes)] || [value BE (16 bytes)]
-        let mut payload = vec![0u8; 32];
-        payload.extend_from_slice(&value.to_be_bytes());
         Object {
             id: ObjectId([id_byte; 32]),
             type_tag: loom_tt(),
             owner: Owner::Address(owner),
             version,
-            payload,
+            payload: coin_payload(value),
         }
     }
 
@@ -1556,17 +1518,19 @@ mod tests {
                     name: "f".to_string(),
                     type_params: vec![],
                     args: vec![],
-                    returns: vec![loom_tt()],
+                    returns: vec![builtin_tt("String")],
                     required_signers: 0,
                     required_capabilities: vec![],
                     attached_invariants: vec![],
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
-        runner.set(petal, "f", build_outputs(&[b"hello"]), 100);
+        let hello = "hello".to_string().canonical_encode();
+        runner.set(petal, "f", build_outputs(&[hello.as_slice()]), 100);
         let tx = sample_signed_ptb(
             signer,
             gas_id,
@@ -1583,7 +1547,7 @@ mod tests {
         let report = run(&chain, &runner, tx);
         assert!(report.success, "report: {report:?}");
         assert_eq!(report.command_outputs.len(), 1);
-        assert_eq!(report.command_outputs[0], vec![b"hello".to_vec()]);
+        assert_eq!(report.command_outputs[0], vec![hello]);
     }
 
     #[test]
@@ -1604,6 +1568,7 @@ mod tests {
             }],
             object_types: vec![],
             external_type_refs: vec![],
+        ..Default::default()
         };
         chain.put_petal(petal, vec![1, 2, 3], manifest.clone());
         let minted_id = ObjectId([0x44; 32]);
@@ -1683,6 +1648,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -1733,6 +1699,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -1780,6 +1747,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -1826,6 +1794,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -1880,7 +1849,7 @@ mod tests {
                         name: "T".to_string(),
                         phantom: true,
                     }],
-                    args: vec![ArgDeclStub::Const(TypeTag::Generic { idx: 0 })],
+                    args: vec![],
                     returns: vec![],
                     required_signers: 0,
                     required_capabilities: vec![],
@@ -1888,6 +1857,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -1902,7 +1872,7 @@ mod tests {
                 },
                 function: "generic".to_string(),
                 type_args: vec![usdc.clone()],
-                args: vec![Arg::Const(42u128.to_be_bytes().to_vec())],
+                args: vec![],
             })],
         );
 
@@ -1915,9 +1885,8 @@ mod tests {
         assert_eq!(calls[0].type_args, vec![usdc]);
         assert_eq!(
             u32::from_be_bytes(calls[0].args_buf[..4].try_into().unwrap()),
-            1
+            0
         );
-        assert_eq!(calls[0].args_buf[4], 1);
     }
 
     #[test]
@@ -1941,6 +1910,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
         // Source coin (separate from gas payer).
@@ -1973,6 +1943,7 @@ mod tests {
             }],
             object_types: vec![],
             external_type_refs: vec![],
+        ..Default::default()
         };
         chain.put_petal(petal, vec![], manifest_with_arg.clone());
 
@@ -2056,6 +2027,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
         let tx = sample_signed_ptb(
@@ -2126,6 +2098,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -2199,6 +2172,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -2267,6 +2241,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -2352,6 +2327,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -2420,6 +2396,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -2511,6 +2488,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -2598,6 +2576,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -2676,6 +2655,7 @@ mod tests {
             }],
             object_types: vec![],
             external_type_refs: vec![],
+        ..Default::default()
         };
         chain.put_petal(petal, vec![], manifest.clone());
         let mut runner = MockPetalRunner::new();
@@ -2730,6 +2710,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -2955,6 +2936,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
 
@@ -3043,6 +3025,7 @@ mod tests {
                 ],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
 
@@ -3053,7 +3036,7 @@ mod tests {
         runner
             .host_mutates
             .borrow_mut()
-            .insert("ro".to_string(), vec![(obj_id, vec![0xFF; 48])]);
+            .insert("ro".to_string(), vec![(obj_id, vec![0xFF; 16])]);
 
         let obj_arg = |access_mode| Arg::Object {
             id: obj_id,
@@ -3128,13 +3111,11 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
 
         let new_id = ObjectId([0x77; 32]);
-        // 48-byte payload: [id (32)] || [value BE (16)].
-        let mut payload = new_id.0.to_vec();
-        payload.extend_from_slice(&123u128.to_be_bytes());
         let host_obj = Object {
             id: new_id,
             type_tag: loom_tt(),
@@ -3144,7 +3125,7 @@ mod tests {
             // in writes; transfer is exercised in the e2e test.
             owner: Owner::Address(signer),
             version: 0,
-            payload,
+            payload: 123u128.to_be_bytes().to_vec(),
         };
 
         let ctx = Arc::new(Mutex::new(PtbHostCtx::new()));
@@ -3235,6 +3216,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
+            ..Default::default()
             },
         );
         let ctx = Arc::new(Mutex::new(PtbHostCtx::new()));

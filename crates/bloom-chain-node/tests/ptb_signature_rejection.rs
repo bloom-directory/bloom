@@ -36,6 +36,7 @@ use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
 use bloom_keystore::xdsa::XdsaSecretKey;
 use bloom_objects::{Object, ObjectId, Owner};
+use bloom_petal_fungible::ops::coin_payload;
 use bloom_script::{
     CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, encode_ptb, loom_coin_type_tag,
     types::{PqSignature, PtbTx},
@@ -44,15 +45,6 @@ use bloom_script::{
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
-
-/// Canonical `Coin<LOOM>` payload for `value` bloomwei.
-/// Matches the convention used by the chain-node fungible petal:
-/// 32-byte ObjectId placeholder || value in BE u128 bytes.
-fn coin_payload(value: u128) -> Vec<u8> {
-    let mut p = vec![0u8; 32];
-    p.extend_from_slice(&value.to_be_bytes());
-    p
-}
 
 /// Mint a `Coin<LOOM>` object at `id`, owned by `Owner::Address(owner)`,
 /// holding `value` bloomwei. Mirrors the fixture helper from

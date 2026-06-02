@@ -64,12 +64,14 @@ pub mod type_args;
 pub mod uid;
 
 pub use abi::{AbiError, ArgReader, RetWriter};
+pub use bloom_objects::TypeTag;
+pub use bloom_value::{read_uleb128, write_uleb128};
 pub use capability::{Capability, CapabilityMarker};
 pub use coin::{Balance, Coin};
 pub use error::{CUSTOM_BIT, PetalError};
 pub use handle::RuntimeHandle;
 pub use linearity::{PetalScope, ScopeGuard};
-pub use resource::{BloomType, PRIMITIVE_PETAL_HASH, Resource};
+pub use resource::{BloomType, Bytes, PRIMITIVE_PETAL_HASH, Resource};
 pub use signer::Signer;
 pub use type_args::{Erased, TypeArgs, TypeArgsGuard, current_type_arg, current_type_arg_count};
 pub use uid::UID;

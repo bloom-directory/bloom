@@ -176,6 +176,9 @@ pub(crate) fn build_decl(item: &ItemStruct, attr: &ObjectAttr) -> syn::Result<Ob
         Fields::Unit => Box::new(std::iter::empty()),
     };
     for (field, i) in field_iter {
+        if crate::bloom_type::is_phantom_data_type(&field.ty) {
+            continue;
+        }
         // Reject plain `T` in field position unless wrapped in
         // `Resource<T>` (spec §11.2).
         crate::type_tag::reject_plain_generic_in_payload(&field.ty, &non_phantom)?;
@@ -218,9 +221,11 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenS
         &format!("__BLOOM_OBJECT_{}__ABILITIES", output.ident),
         proc_macro2::Span::call_site(),
     );
+    let bloom_type_impl = crate::bloom_type::emit_struct_impl_for_item(&output, true)?;
 
     Ok(quote! {
         #output
+        #bloom_type_impl
 
         /// Ability bits recorded by `#[object]`. The petal-level macro
         /// reads this when assembling the manifest. Auto-generated.

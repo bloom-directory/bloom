@@ -10,7 +10,7 @@ use bloom_objects::{AbilitySet, AccessMode, TypeTag};
 
 /// Schema version this crate produces. Bumped when the manifest layout
 /// changes incompatibly.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Custom section name embedded into every new-framework petal (spec §8.1).
 pub const MANIFEST_CUSTOM_SECTION: &str = "bloom_petal_manifest_v0";
@@ -30,6 +30,10 @@ pub struct PetalManifestV0 {
     pub object_types: Vec<ObjectTypeDecl>,
     /// All `#[capability]`-annotated structs in declaration order.
     pub capability_types: Vec<CapabilityDecl>,
+    /// Plain `#[derive(BloomType)]` structs in declaration order.
+    pub data_types: Vec<DataTypeDecl>,
+    /// Plain `#[derive(BloomType)]` enums in declaration order.
+    pub enum_types: Vec<EnumTypeDecl>,
     /// All `pub fn`s in declaration order; the petal's public surface.
     pub functions: Vec<FunctionDecl>,
     /// All `#[invariant]`-annotated invariants, indexed by `__inv_<idx>`.
@@ -51,6 +55,8 @@ impl Default for PetalManifestV0 {
             parent_version: None,
             object_types: Vec::new(),
             capability_types: Vec::new(),
+            data_types: Vec::new(),
+            enum_types: Vec::new(),
             functions: Vec::new(),
             invariants: Vec::new(),
             required_host_imports: Vec::new(),
@@ -129,15 +135,58 @@ pub struct FieldDecl {
 /// Declaration of a `#[capability]`-annotated struct (spec §5).
 ///
 /// Capabilities are a sugar over `#[object(abilities = "key, store, copy")]`
-/// plus a `CapabilityMarker` impl; this decl carries the same metadata
-/// as `ObjectTypeDecl` minus the field list (capabilities almost always
-/// carry only `id: UID`).
+/// plus a `CapabilityMarker` impl; this decl carries the same payload fields
+/// as an object so capabilities participate in the same canonical codec.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct CapabilityDecl {
     /// Struct name.
     pub name: String,
     /// Generic parameters in declaration order.
     pub type_params: Vec<TypeParamDecl>,
+    /// Field declarations, in source order.
+    pub fields: Vec<FieldDecl>,
+}
+
+/// Plain data struct declaration emitted by `#[derive(BloomType)]`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct DataTypeDecl {
+    /// Struct name.
+    pub name: String,
+    /// Generic parameters in declaration order.
+    pub type_params: Vec<TypeParamDecl>,
+    /// Field declarations, in source order.
+    pub fields: Vec<FieldDecl>,
+}
+
+/// Plain enum declaration emitted by `#[derive(BloomType)]`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct EnumTypeDecl {
+    /// Enum name.
+    pub name: String,
+    /// Generic parameters in declaration order.
+    pub type_params: Vec<TypeParamDecl>,
+    /// Variants in source order; discriminants are their zero-based index.
+    pub variants: Vec<VariantDecl>,
+}
+
+/// Enum variant declaration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VariantDecl {
+    /// Variant name.
+    pub name: String,
+    /// Payload fields.
+    pub fields: VariantFieldsDecl,
+}
+
+/// Enum variant payload shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VariantFieldsDecl {
+    /// Unit variant.
+    Unit,
+    /// Tuple variant fields.
+    Tuple(Vec<TypeTag>),
+    /// Struct variant fields.
+    Struct(Vec<FieldDecl>),
 }
 
 /// `pub fn` declaration (spec §8.2 / §11.1).
@@ -311,8 +360,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn schema_version_is_two() {
-        assert_eq!(SCHEMA_VERSION, 2);
+    fn schema_version_is_three() {
+        assert_eq!(SCHEMA_VERSION, 3);
     }
 
     #[test]
@@ -329,6 +378,9 @@ mod tests {
         assert_eq!(m.schema_version, SCHEMA_VERSION);
         assert!(m.functions.is_empty());
         assert!(m.object_types.is_empty());
+        assert!(m.capability_types.is_empty());
+        assert!(m.data_types.is_empty());
+        assert!(m.enum_types.is_empty());
     }
 
     #[test]

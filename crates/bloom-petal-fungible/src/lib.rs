@@ -17,11 +17,10 @@
 //! - `value<T>` — read the `u128` value field of a `Coin<T>`.
 //! - `mint_genesis` — single-use LOOM minter gated by `EpochZero`.
 //!
-//! The petal does **not** define a `Coin<T>` struct itself: the runtime
-//! crate `bloom-resource` already owns `Coin<T>` as a typed handle
-//! wrapper (see `crates/bloom-resource/src/coin.rs`). The on-chain
-//! payload encoding for a `Coin<T>` object is fixed by this petal:
-//! 32-byte `ObjectId` followed by 16-byte big-endian `u128` value.
+//! This petal defines the `Coin<T>` object schema. The runtime crate
+//! `bloom-resource` owns the typed handle wrapper used in public
+//! function signatures. The on-chain payload encoding for a `Coin<T>`
+//! object is a single 16-byte big-endian `u128` value.
 //!
 //! Error model: per spec §11.1, the macro-generated wasm shim returns
 //! `i32` where `0` = success and a non-zero value = typed error code.
@@ -44,67 +43,74 @@ use bloom_resource_macros as bloom;
 /// (or `()`) and the host-import error as a [`bloom_resource::PetalError`].
 pub mod ops {
     use bloom_objects::{AccessMode, ObjectId, Owner, TypeTag};
-    use bloom_resource::abi::RetWriter;
     use bloom_resource::host;
-    use bloom_resource::{PetalError, RuntimeHandle};
+    use bloom_resource::{BloomType, Erased, PetalError, RuntimeHandle, UID};
+    use core::marker::PhantomData;
 
     // -----------------------------------------------------------------
     // Payload helpers
     // -----------------------------------------------------------------
 
-    /// Canonical-encoded payload for a freshly minted `Coin<T>`. The
-    /// `id` is zeroed because the host fills it in on `object_create`.
+    /// Canonical-encoded payload for a freshly minted `Coin<T>`.
     pub fn coin_payload(value: u128) -> Vec<u8> {
-        let mut w = RetWriter::with_capacity(48);
-        w.write_object_id(&ObjectId([0u8; 32]));
-        w.write_u128(value);
-        w.finish()
+        crate::fungible::Coin::<Erased> {
+            value,
+            _phantom: PhantomData,
+        }
+        .canonical_encode()
     }
 
-    /// Canonical-encoded payload for a fresh `Supply<T>` (id placeholder
-    /// + total).
+    /// Canonical-encoded payload for a fresh `Supply<T>`.
     pub fn supply_payload(total: u128) -> Vec<u8> {
-        let mut w = RetWriter::with_capacity(48);
-        w.write_object_id(&ObjectId([0u8; 32]));
-        w.write_u128(total);
-        w.finish()
+        crate::fungible::Supply::<Erased> {
+            id: UID::from_bytes([0u8; 32]),
+            total,
+            _phantom: PhantomData,
+        }
+        .canonical_encode()
     }
 
     /// Canonical-encoded payload for a brand-new capability object —
     /// just the `id` placeholder.
     pub fn cap_payload() -> Vec<u8> {
-        let mut w = RetWriter::with_capacity(32);
-        w.write_object_id(&ObjectId([0u8; 32]));
-        w.finish()
+        crate::fungible::MintCap::<Erased> {
+            id: UID::from_bytes([0u8; 32]),
+            _phantom: PhantomData,
+        }
+        .canonical_encode()
     }
 
-    /// Decode the `value` (low 16 bytes after the 32-byte `id`) from a
-    /// `Coin<T>` payload as read back from the borrow table.
+    /// Decode the `value` from a `Coin<T>` payload as read back from the borrow table.
     pub fn decode_coin_value(bytes: &[u8]) -> Result<u128, PetalError> {
-        if bytes.len() < 48 {
-            return Err(PetalError::InvalidArgs);
-        }
-        let mut buf = [0u8; 16];
-        buf.copy_from_slice(&bytes[32..48]);
-        Ok(u128::from_be_bytes(buf))
+        crate::fungible::Coin::<Erased>::canonical_decode(bytes)
+            .map(|coin| coin.value)
+            .map_err(|_| PetalError::InvalidArgs)
     }
 
-    /// Decode the `total` field of a `Supply<T>` payload (same layout
-    /// as a `Coin<T>` value field).
+    /// Decode the `total` field of a `Supply<T>` payload.
     pub fn decode_supply_total(bytes: &[u8]) -> Result<u128, PetalError> {
-        decode_coin_value(bytes)
+        crate::fungible::Supply::<Erased>::canonical_decode(bytes)
+            .map(|supply| supply.total)
+            .map_err(|_| PetalError::InvalidArgs)
     }
 
-    /// Re-encode a `Coin<T>` / `Supply<T>` payload with a new value,
-    /// preserving the 32-byte `id` prefix.
+    /// Re-encode a `Coin<T>` / `Supply<T>` payload with a new value.
     pub fn rewrite_value(existing: &[u8], new_value: u128) -> Result<Vec<u8>, PetalError> {
-        if existing.len() < 48 {
-            return Err(PetalError::InvalidArgs);
+        match existing.len() {
+            16 => {
+                let mut coin = crate::fungible::Coin::<Erased>::canonical_decode(existing)
+                    .map_err(|_| PetalError::InvalidArgs)?;
+                coin.value = new_value;
+                Ok(coin.canonical_encode())
+            }
+            48 => {
+                let mut supply = crate::fungible::Supply::<Erased>::canonical_decode(existing)
+                    .map_err(|_| PetalError::InvalidArgs)?;
+                supply.total = new_value;
+                Ok(supply.canonical_encode())
+            }
+            _ => Err(PetalError::InvalidArgs),
         }
-        let mut out = Vec::with_capacity(48);
-        out.extend_from_slice(&existing[..32]);
-        out.extend_from_slice(&new_value.to_be_bytes());
-        Ok(out)
     }
 
     // -----------------------------------------------------------------
@@ -270,13 +276,13 @@ pub mod ops {
 }
 
 /// The `/bloom/petals/core/fungible` petal module. Declares the on-chain
-/// objects (`LOOM`, `MintCap<T>`, `BurnCap<T>`, `Supply<T>`, `EpochZero`)
-/// and the public entry points (`create_currency`, `mint`, `burn`,
-/// `split`, `merge`, `transfer`, `value`, `mint_genesis`).
+/// objects (`LOOM`, `Coin<T>`, `MintCap<T>`, `BurnCap<T>`, `Supply<T>`,
+/// `EpochZero`) and the public entry points (`create_currency`, `mint`,
+/// `burn`, `split`, `merge`, `transfer`, `value`, `mint_genesis`).
 #[bloom::petal(path = "/bloom/petals/core/fungible", version = "0.1.0")]
 pub mod fungible {
     use crate::ops;
-    use bloom_resource::{Capability, Coin, Resource, Signer, UID};
+    use bloom_resource::{Capability, Resource, Signer, UID};
     use core::marker::PhantomData;
 
     /// 32-byte post-quantum chain address; the recipient of a transfer
@@ -294,6 +300,16 @@ pub mod fungible {
     /// only inside `Coin<LOOM>` / `Balance<LOOM>` positions (spec §9.1).
     #[bloom::object(no_abilities)]
     pub struct LOOM {}
+
+    /// Fungible value object. The object id lives on the chain
+    /// `Object`; the canonical payload is only the numeric value.
+    #[bloom::object(abilities = "key, store", phantom = "T")]
+    pub struct Coin<T> {
+        /// Coin value in the smallest unit for currency `T`.
+        pub value: u128,
+        /// Phantom marker — `T` only flows through the type tag.
+        pub _phantom: PhantomData<T>,
+    }
 
     /// Mint authority for `Coin<T>`. Holding a `&MintCap<T>` in a PTB
     /// arg authorises `mint::<T>` (spec §5).
@@ -387,10 +403,10 @@ pub mod fungible {
         _cap: &Capability<MintCap<T>>,
         supply: &mut Resource<Supply<T>>,
         amount: u128,
-    ) -> Coin<T> {
+    ) -> bloom_resource::Coin<T> {
         let supply_handle = supply.handle();
         let coin_handle = ops::mint(supply_handle, amount).expect("mint host failure");
-        Coin::from_handle(coin_handle)
+        bloom_resource::Coin::from_handle(coin_handle)
     }
 
     /// Burn `coin` (consuming it) against the `BurnCap<T>` authority,
@@ -399,7 +415,11 @@ pub mod fungible {
     /// `supply` is taken as an object handle (spec §11.2); `supply.handle()`
     /// returns the borrow-table handle the macro materialized for it
     /// (spec §14.1 compliance).
-    pub fn burn<T>(_cap: &Capability<BurnCap<T>>, supply: &mut Resource<Supply<T>>, coin: Coin<T>) {
+    pub fn burn<T>(
+        _cap: &Capability<BurnCap<T>>,
+        supply: &mut Resource<Supply<T>>,
+        coin: bloom_resource::Coin<T>,
+    ) {
         let supply_handle = supply.handle();
         ops::burn(supply_handle, coin.handle()).expect("burn host failure");
     }
@@ -408,24 +428,24 @@ pub mod fungible {
     /// shrinking the original. Returns the new coin.
     ///
     /// Reverts with `InsufficientBalance` if `coin.value < amount`.
-    pub fn split<T>(coin: &mut Coin<T>, amount: u128) -> Coin<T> {
+    pub fn split<T>(coin: &mut bloom_resource::Coin<T>, amount: u128) -> bloom_resource::Coin<T> {
         let new_handle = ops::split(coin.handle(), amount).expect("split host failure");
-        Coin::from_handle(new_handle)
+        bloom_resource::Coin::from_handle(new_handle)
     }
 
     /// Merge `other` into `dst`, consuming `other`. The total value is
     /// checked-added; overflow panics with petal-custom code `1`.
-    pub fn merge<T>(dst: &mut Coin<T>, other: Coin<T>) {
+    pub fn merge<T>(dst: &mut bloom_resource::Coin<T>, other: bloom_resource::Coin<T>) {
         ops::merge(dst.handle(), other.handle()).expect("merge host failure");
     }
 
     /// Transfer `coin` to `recipient`. Consumes the coin row.
-    pub fn transfer<T>(coin: Coin<T>, recipient: Address) {
+    pub fn transfer<T>(coin: bloom_resource::Coin<T>, recipient: Address) {
         ops::transfer(coin.handle(), recipient).expect("transfer host failure");
     }
 
     /// Read the `u128` value field of a `Coin<T>` without consuming it.
-    pub fn value<T>(coin: &Coin<T>) -> u128 {
+    pub fn value<T>(coin: &bloom_resource::Coin<T>) -> u128 {
         ops::value(coin.handle()).expect("value host failure")
     }
 

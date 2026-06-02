@@ -38,10 +38,10 @@ use bloom_chain_consensus::validator_set::Validator;
 use bloom_chain_state::State;
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes};
 use bloom_keystore::xdsa::XDSA_PK_LEN;
-use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
+use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey, TypeTag};
 use bloom_petal_fungible::ops::coin_payload;
 use bloom_petal_manifest::extract_petal_manifest_v0;
-use bloom_script::{CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, loom_coin_type_tag};
+use bloom_script::{CORE_FUNGIBLE_PATH, loom_coin_type_tag};
 use serde::{Deserialize, Serialize};
 
 use crate::error::NodeError;
@@ -277,11 +277,11 @@ impl Genesis {
     ///    but written directly to avoid running wasm at genesis).
     ///
     /// `ObjectId` derivation (one deterministic id per allocation):
-    /// `blake3("bloom.genesis.loom" || genesis_hash || idx_le32)`
+    /// `ObjectId::derive_for_type_tag(genesis_hash, allocation_idx, Coin<LOOM>, coin_payload)`.
     ///
     /// // EpochZero is implicit at genesis: the linear cap is consumed by
     /// // this genesis pipeline, not by an on-chain wasm call.
-    pub fn apply_to_state(&self, state: &mut State) {
+    pub fn apply_to_state(&self, state: &mut State) -> Result<()> {
         for (addr, pubkey) in &self.key_registry {
             state.register_pubkey(*addr, pubkey.clone());
         }
@@ -290,27 +290,24 @@ impl Genesis {
             let hash = state.insert_code(wasm);
             state.set_vfs_binding(path.clone(), hash);
         }
-        if state.vfs_lookup(CORE_FUNGIBLE_PATH).is_none() {
-            state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), DEFAULT_FUNGIBLE_PETAL_HASH);
-        }
-
-        let fungible_petal_hash = state
-            .vfs_lookup(CORE_FUNGIBLE_PATH)
-            .unwrap_or(DEFAULT_FUNGIBLE_PETAL_HASH);
-        let coin_type = loom_coin_type_tag(fungible_petal_hash);
+        let coin_type = if self.allocations.is_empty() {
+            None
+        } else {
+            let fungible_petal_hash = state.vfs_lookup(CORE_FUNGIBLE_PATH).ok_or_else(|| {
+                anyhow!("genesis allocations require {CORE_FUNGIBLE_PATH} binding")
+            })?;
+            Some(loom_coin_type_tag(fungible_petal_hash))
+        };
 
         for (idx, (addr, amount)) in self.allocations.iter().enumerate() {
             // ── Coin<LOOM> object ──────────────────────────────────────────
             //
-            // Derive a deterministic ObjectId:
-            // blake3("bloom.genesis.loom" || genesis_hash_bytes || idx_le32)
-            let coin_id = {
-                let mut h = blake3::Hasher::new();
-                h.update(b"bloom.genesis.loom");
-                h.update(&self.genesis_hash.0);
-                h.update(&(idx as u32).to_le_bytes());
-                ObjectId(*h.finalize().as_bytes())
-            };
+            let payload = coin_payload(*amount);
+            let coin_type = coin_type
+                .as_ref()
+                .expect("coin type is present when allocations are non-empty");
+            let coin_id =
+                derive_canonical_object_id(&self.genesis_hash, idx as u64, coin_type, &payload);
 
             let owner = Owner::Address(addr.0);
             let obj = Object {
@@ -318,8 +315,7 @@ impl Genesis {
                 type_tag: coin_type.clone(),
                 owner: owner.clone(),
                 version: 0,
-                // coin_payload encodes ObjectId([0;32]) placeholder + u128 value
-                payload: coin_payload(*amount),
+                payload,
             };
             state.set_object(obj);
 
@@ -334,6 +330,7 @@ impl Genesis {
             owned.insert(pos, coin_id);
             state.set_ownership(okey, owned);
         }
+        Ok(())
     }
 }
 
@@ -451,6 +448,15 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+fn derive_canonical_object_id(
+    creation_seed: &Hash32,
+    creation_nonce: u64,
+    type_tag: &TypeTag,
+    payload: &[u8],
+) -> ObjectId {
+    ObjectId::derive_for_type_tag(creation_seed, creation_nonce, type_tag, payload)
+}
+
 // ---------------------------------------------------------------------------
 // Skeleton config.toml schema (for `chain init`)
 // ---------------------------------------------------------------------------
@@ -527,24 +533,46 @@ mod tests {
             .collect();
 
         let genesis_hash = Hash32([0x42u8; 32]);
+        let petals = if allocs.is_empty() {
+            Vec::new()
+        } else {
+            vec![(
+                CORE_FUNGIBLE_PATH.to_string(),
+                genesis_petal_wasm(CORE_FUNGIBLE_PATH),
+            )]
+        };
+
         Genesis {
             chain_id: "bloomchain.test".into(),
             genesis_time_ms: 0,
             validator_set,
             peer_addrs: vec![],
             allocations: allocs,
-            petals: vec![],
+            petals,
             key_registry: vec![(addr, pk)],
             genesis_hash,
         }
     }
 
-    fn genesis_coin_id(genesis: &Genesis, idx: usize) -> ObjectId {
-        let mut h = blake3::Hasher::new();
-        h.update(b"bloom.genesis.loom");
-        h.update(&genesis.genesis_hash.0);
-        h.update(&(idx as u32).to_le_bytes());
-        ObjectId(*h.finalize().as_bytes())
+    fn bound_loom_coin_type(state: &State) -> TypeTag {
+        let fungible_hash = state
+            .vfs_lookup(CORE_FUNGIBLE_PATH)
+            .expect("core fungible petal bound");
+        loom_coin_type_tag(fungible_hash)
+    }
+
+    fn genesis_coin_id(
+        genesis: &Genesis,
+        idx: usize,
+        coin_type: &TypeTag,
+        amount: u128,
+    ) -> ObjectId {
+        derive_canonical_object_id(
+            &genesis.genesis_hash,
+            idx as u64,
+            coin_type,
+            &coin_payload(amount),
+        )
     }
 
     fn leb128(out: &mut Vec<u8>, mut v: u64) {
@@ -650,9 +678,9 @@ mod tests {
         let mut state = State::new();
 
         // TDD: run apply_to_state and assert expected state.
-        genesis.apply_to_state(&mut state);
+        genesis.apply_to_state(&mut state).unwrap();
 
-        let coin_type = loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH);
+        let coin_type = bound_loom_coin_type(&state);
 
         for (idx, (raw_addr, expected_amount)) in
             [(addr_a, amount_a), (addr_b, amount_b), (addr_c, amount_c)]
@@ -660,7 +688,7 @@ mod tests {
                 .enumerate()
         {
             // A Coin<LOOM> object must exist with deterministic id.
-            let coin_id = genesis_coin_id(&genesis, idx);
+            let coin_id = genesis_coin_id(&genesis, idx, &coin_type, *expected_amount);
 
             let obj = state
                 .get_object(&coin_id)
@@ -706,15 +734,18 @@ mod tests {
         genesis.petals = vec![(CORE_FUNGIBLE_PATH.to_string(), vec![0x01, 0x02, 0x03])];
 
         let mut state = State::new();
-        genesis.apply_to_state(&mut state);
+        genesis.apply_to_state(&mut state).unwrap();
 
         let fungible_hash = state
             .vfs_lookup(CORE_FUNGIBLE_PATH)
             .expect("fungible petal bound at genesis");
-        assert_ne!(fungible_hash, DEFAULT_FUNGIBLE_PETAL_HASH);
-
         let obj = state
-            .get_object(&genesis_coin_id(&genesis, 0))
+            .get_object(&genesis_coin_id(
+                &genesis,
+                0,
+                &loom_coin_type_tag(fungible_hash),
+                1_000_000,
+            ))
             .expect("genesis Coin<LOOM>");
         assert_eq!(obj.type_tag, loom_coin_type_tag(fungible_hash));
     }
@@ -725,22 +756,11 @@ mod tests {
         let addr = [0xBBu8; 32];
         let genesis = make_genesis(vec![(addr, 100), (addr, 200)]);
         let mut state = State::new();
-        genesis.apply_to_state(&mut state);
+        genesis.apply_to_state(&mut state).unwrap();
 
-        let id0 = {
-            let mut h = blake3::Hasher::new();
-            h.update(b"bloom.genesis.loom");
-            h.update(&genesis.genesis_hash.0);
-            h.update(&0u32.to_le_bytes());
-            ObjectId(*h.finalize().as_bytes())
-        };
-        let id1 = {
-            let mut h = blake3::Hasher::new();
-            h.update(b"bloom.genesis.loom");
-            h.update(&genesis.genesis_hash.0);
-            h.update(&1u32.to_le_bytes());
-            ObjectId(*h.finalize().as_bytes())
-        };
+        let coin_type = bound_loom_coin_type(&state);
+        let id0 = genesis_coin_id(&genesis, 0, &coin_type, 100);
+        let id1 = genesis_coin_id(&genesis, 1, &coin_type, 200);
         assert_ne!(id0, id1, "coin ids must differ across allocation indices");
         assert!(state.get_object(&id0).is_some());
         assert!(state.get_object(&id1).is_some());
@@ -752,18 +772,28 @@ mod tests {
         let amount: u128 = 999_999_999_999_999_999;
         let genesis = make_genesis(vec![(addr, amount)]);
         let mut state = State::new();
-        genesis.apply_to_state(&mut state);
+        genesis.apply_to_state(&mut state).unwrap();
 
-        let coin_id = {
-            let mut h = blake3::Hasher::new();
-            h.update(b"bloom.genesis.loom");
-            h.update(&genesis.genesis_hash.0);
-            h.update(&0u32.to_le_bytes());
-            ObjectId(*h.finalize().as_bytes())
-        };
+        let coin_type = bound_loom_coin_type(&state);
+        let coin_id = genesis_coin_id(&genesis, 0, &coin_type, amount);
         let obj = state.get_object(&coin_id).unwrap();
         let value = decode_coin_value(&obj.payload).unwrap();
         assert_eq!(value, amount, "genesis coin payload must match allocation");
+    }
+
+    #[test]
+    fn genesis_allocations_require_core_fungible_binding() {
+        let addr = [0xDDu8; 32];
+        let genesis = Genesis {
+            petals: vec![],
+            ..make_genesis(vec![(addr, 1)])
+        };
+        let mut state = State::new();
+        let err = genesis.apply_to_state(&mut state).unwrap_err();
+        assert!(
+            err.to_string().contains(CORE_FUNGIBLE_PATH),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

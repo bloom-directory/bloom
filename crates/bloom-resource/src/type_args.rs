@@ -34,6 +34,9 @@
 
 use bloom_objects::TypeTag;
 
+use crate::abi::AbiError;
+use crate::resource::BloomType;
+
 #[cfg(not(target_arch = "wasm32"))]
 use std::cell::RefCell;
 
@@ -52,6 +55,28 @@ use core::cell::RefCell;
 /// no data and is never constructed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Erased {}
+
+impl BloomType for Erased {
+    fn canonical_encode(&self) -> Vec<u8> {
+        match *self {}
+    }
+
+    fn canonical_decode(_buf: &[u8]) -> Result<Self, AbiError> {
+        Err(AbiError::ValueCodec(
+            "Erased is a phantom marker and has no value encoding".into(),
+        ))
+    }
+
+    fn canonical_decode_from(_buf: &mut &[u8]) -> Result<Self, AbiError> {
+        Err(AbiError::ValueCodec(
+            "Erased is a phantom marker and has no value encoding".into(),
+        ))
+    }
+
+    fn type_tag() -> TypeTag {
+        TypeTag::Generic { idx: 0 }
+    }
+}
 
 thread_local! {
     /// The type-args bound for the *currently executing* petal call,

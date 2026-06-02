@@ -28,7 +28,8 @@
 //!
 //! ## Layout
 //!
-//! `Cap<T>` payload (10 bytes, canonical):
+//! `Cap<T>` payload (42 bytes, canonical):
+//! - 32 bytes: `id` placeholder
 //! - 1 byte: `inner_kind`
 //! - 8 bytes BE: `expires_at_block`
 //! - 1 byte: `revoked` (`0`/`1`)
@@ -47,7 +48,7 @@ pub const INNER_KIND_LOCKED: u8 = 1;
 pub const INNER_KIND_EXPIRE_AT: u8 = 2;
 
 /// Length in bytes of the `Cap<T>` canonical payload.
-pub const CAP_PAYLOAD_LEN: usize = 10;
+pub const CAP_PAYLOAD_LEN: usize = 42;
 
 /// 32-byte post-quantum address. Re-exported as a path type so that
 /// petal function signatures can use it directly (the macro's type-tag
@@ -86,7 +87,7 @@ pub mod cap {
     use super::*;
     use bloom_objects::{Owner, TypeTag};
     use bloom_resource::{
-        ArgReader, Capability, Resource, RetWriter, RuntimeHandle, Signer, UID, host,
+        BloomType, Capability, Erased, Resource, RuntimeHandle, Signer, UID, host,
     };
     // Re-export the attribute-style proc-macros under unqualified names
     // so the petal macro's `attr.path().is_ident("object")` matcher
@@ -261,24 +262,23 @@ pub mod cap {
         }
     }
 
-    /// Encode the canonical `Cap<T>` payload (10 bytes).
+    /// Encode the canonical `Cap<T>` payload.
     fn encode_cap_payload(inner_kind: u8, expires_at_block: u64, revoked: bool) -> Vec<u8> {
-        let mut w = RetWriter::new();
-        w.write_u8(inner_kind);
-        w.write_u64(expires_at_block);
-        w.write_bool(revoked);
-        w.finish()
+        Cap::<Erased> {
+            id: UID::from_bytes([0u8; 32]),
+            inner_kind,
+            expires_at_block,
+            revoked,
+            _marker: PhantomData,
+        }
+        .canonical_encode()
     }
 
     /// Decode a canonical `Cap<T>` payload. Returns `(inner_kind,
     /// expires_at_block, revoked)`.
     fn decode_cap_payload(buf: &[u8]) -> Option<(u8, u64, bool)> {
-        let mut r = ArgReader::new(buf);
-        let kind = r.read_u8().ok()?;
-        let exp = r.read_u64().ok()?;
-        let revoked = r.read_bool().ok()?;
-        r.expect_eof().ok()?;
-        Some((kind, exp, revoked))
+        let cap = Cap::<Erased>::canonical_decode(buf).ok()?;
+        Some((cap.inner_kind, cap.expires_at_block, cap.revoked))
     }
 
     /// Materialize a fresh `Cap<T>` in the borrow table.
@@ -295,10 +295,12 @@ pub mod cap {
     /// Materialize a fresh `RevokeCap<T>` in the borrow table.
     fn create_revoke_cap<T>() -> Result<bloom_resource::RuntimeHandle, bloom_resource::PetalError> {
         let _ = PhantomData::<T>;
-        // RevokeCap<T> carries no payload beyond its identity; emit an
-        // empty buffer (spec §5.1: caps with no extra state encode as
-        // zero-length payload).
-        host::object_create(&revoke_cap_type_tag(), &[])
+        let payload = RevokeCap::<Erased> {
+            id: UID::from_bytes([0u8; 32]),
+            _marker: PhantomData,
+        }
+        .canonical_encode();
+        host::object_create(&revoke_cap_type_tag(), &payload)
     }
 
     /// Read and decode the `Cap<T>` payload at `handle` into

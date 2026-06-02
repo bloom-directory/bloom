@@ -27,11 +27,12 @@ use bloom_resource::{
 /// Marker type — stands in for any `T` the test doesn't care about.
 struct Marker;
 
-/// A canonical 10-byte `Cap<T>` payload (`inner_kind || expires_at_block
+/// A canonical `Cap<T>` payload (`id || inner_kind || expires_at_block
 /// || revoked`) for pre-programming `object_read` responses. In the
 /// handle/tag model every mutation reads the live payload first.
 fn cap_payload_bytes(inner_kind: u8, expires_at_block: u64, revoked: bool) -> Vec<u8> {
-    let mut v = Vec::with_capacity(10);
+    let mut v = Vec::with_capacity(bloom_petal_cap::CAP_PAYLOAD_LEN);
+    v.extend_from_slice(&[0u8; 32]);
     v.push(inner_kind);
     v.extend_from_slice(&expires_at_block.to_be_bytes());
     v.push(revoked as u8);

@@ -31,6 +31,7 @@ extern crate proc_macro;
 use proc_macro::TokenStream;
 
 mod ast;
+mod bloom_type;
 mod capability;
 mod codegen;
 mod error;
@@ -75,6 +76,15 @@ pub fn capability(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn invariant(attr: TokenStream, item: TokenStream) -> TokenStream {
     invariant::expand(attr.into(), item.into())
+        .unwrap_or_else(|e| e.to_compile_error())
+        .into()
+}
+
+/// Derive canonical `BloomType` encoding/decoding for plain value
+/// structs and enums.
+#[proc_macro_derive(BloomType)]
+pub fn derive_bloom_type(item: TokenStream) -> TokenStream {
+    bloom_type::expand(item.into())
         .unwrap_or_else(|e| e.to_compile_error())
         .into()
 }

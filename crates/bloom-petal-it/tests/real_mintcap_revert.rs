@@ -1,10 +1,9 @@
-//! Real `&Capability<EpochZero>` required-capability fail-closed check.
+//! Real `&Capability<EpochZero>` required-capability check.
 //!
 //! Audit finding: previous cap-revert coverage exercised gas-payer /
 //! access-control failures rather than the real `&MintCap<T>` /
 //! `&Capability<...>` typecheck that the validator enforces against a
-//! chain-authoritative manifest. This file restores that coverage end
-//! to end:
+//! chain-authoritative manifest. This file keeps that coverage end to end:
 //!
 //! 1. Load the **real** macro-emitted manifest bytes from
 //!    `bloom_petal_fungible::fungible::__bloom_manifest_bytes()` and
@@ -14,19 +13,18 @@
 //!    from each petal's wasm.
 //!
 //! 2. Build a PTB that calls `mint_genesis(epoch, amount, recipient)`
-//!    from that manifest and assert validation rejects the unsupported
-//!    manifest-level `required_capabilities` declaration fail-closed.
+//!    from that manifest and assert validation rejects a wrongly typed
+//!    capability object.
 //!
-//! 3. Assert the same fail-closed rejection also wins when a properly
-//!    typed `Capability<EpochZero>` object is present, so callers cannot
-//!    bypass unsupported capability validation by satisfying arg shapes.
+//! 3. Assert a properly typed `EpochZero` capability object satisfies
+//!    the manifest-level required capability.
 //!
 //! Why `mint_genesis` and not `mint`? `mint` is generic on `T` so its
 //! cap arg is declared as `Capability<MintCap<T>>` with a `Generic{idx:0}`
 //! inner type that requires the caller to thread `type_args=[T]`. The
 //! validator's substitution then checks the seeded cap against
-//! `Capability<MintCap<LOOM>>`. `mint_genesis` is non-generic and uses
-//! `Capability<EpochZero>` directly, so the typecheck is independent
+//! `MintCap<LOOM>`. `mint_genesis` is non-generic and uses
+//! `EpochZero` directly, so the typecheck is independent
 //! of `type_args` substitution and the assertion is simpler. The
 //! validator pathway exercised is identical — both go through
 //! `typecheck_move_cmd` → `type_tags_match` on `ArgDeclStub::Object`.
@@ -43,29 +41,25 @@ use bloom_petal_it::harness::{
 };
 
 // ---------------------------------------------------------------------------
-// Helpers: build the canonical TypeTag for `Capability<EpochZero>` and
+// Helpers: build the canonical TypeTag for `EpochZero` and
 // seed such an object into state for the positive-control test.
 // ---------------------------------------------------------------------------
 
-fn type_tag_capability_epoch_zero() -> TypeTag {
+fn type_tag_epoch_zero() -> TypeTag {
     // Macro emits `petal_hash: [0u8; 32]` ("self" sentinel) for any
     // type declared inside the petal — the validator treats this as
     // a wildcard match against on-chain hashes.
     TypeTag::Concrete {
         petal_hash: [0u8; 32],
-        type_name: "Capability".to_string(),
-        type_args: vec![TypeTag::Concrete {
-            petal_hash: [0u8; 32],
-            type_name: "EpochZero".to_string(),
-            type_args: vec![],
-        }],
+        type_name: "EpochZero".to_string(),
+        type_args: vec![],
     }
 }
 
 fn seed_epoch_zero_cap(state: &mut State, id: ObjectId, owner: bloom_chain_types::types::Address) {
     let obj = Object {
         id,
-        type_tag: type_tag_capability_epoch_zero(),
+        type_tag: type_tag_epoch_zero(),
         owner: Owner::Address(owner.0),
         version: 0,
         payload: cap_payload(),
@@ -89,11 +83,11 @@ fn noop_mint_genesis_wat() -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// Negative: unsupported required_capabilities fail closed before arg typing.
+// Negative: missing required capability fails closed.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn mint_genesis_required_capabilities_fail_closed_for_wrong_typed_cap() {
+fn mint_genesis_required_capability_rejects_wrong_typed_cap() {
     let alice = addr(0xA1);
     let mut state = build_state(&[(alice, 1_000_000)]);
     let alice_coin_id = genesis_coin_id(alice, 0);
@@ -108,7 +102,7 @@ fn mint_genesis_required_capabilities_fail_closed_for_wrong_typed_cap() {
     // Build `mint_genesis(epoch=alice_coin /* WRONG TYPE */,
     //                    amount=u128 BE 1000,
     //                    recipient=alice address)`.
-    // `mint_genesis` declares arg[0] as Object{Capability<EpochZero>, ReadOnly};
+    // `mint_genesis` declares arg[0] as Object{EpochZero, ReadOnly};
     // we pass alice's Coin<LOOM> in ReadOnly mode (ReadOnly never trips
     // ownership) so the typecheck error is the type-tag mismatch, not
     // an access-mode/ownership error.
@@ -127,7 +121,7 @@ fn mint_genesis_required_capabilities_fail_closed_for_wrong_typed_cap() {
             function: "mint_genesis".to_string(),
             type_args: vec![],
             args: vec![
-                // arg[0]: WRONG-TYPED OBJECT — Coin<LOOM>, not Capability<EpochZero>.
+                // arg[0]: WRONG-TYPED OBJECT — Coin<LOOM>, not EpochZero.
                 Arg::Object {
                     id: alice_coin_id,
                     expected_version: ExpectedVersion(0),
@@ -150,7 +144,7 @@ fn mint_genesis_required_capabilities_fail_closed_for_wrong_typed_cap() {
 
     assert!(
         !out.success,
-        "passing Coin<LOOM> where Capability<EpochZero> is expected MUST revert"
+        "passing Coin<LOOM> where EpochZero is expected MUST revert"
     );
     assert!(out.write_set.is_none(), "revert must drop write set");
     assert!(out.logs.is_empty(), "revert must drop logs");
@@ -158,18 +152,20 @@ fn mint_genesis_required_capabilities_fail_closed_for_wrong_typed_cap() {
     let reason = String::from_utf8_lossy(&out.return_data);
     let reason_lc = reason.to_lowercase();
     assert!(
-        reason_lc.contains("required_capabilities") && reason_lc.contains("not supported"),
-        "revert reason must cite unsupported required_capabilities; got: {reason}"
+        reason_lc.contains("arg type mismatch")
+            && reason_lc.contains("coin<loom>")
+            && reason_lc.contains("epochzero"),
+        "revert reason must cite the canonical capability arg type mismatch; got: {reason}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// A properly-typed Capability<EpochZero> object still fails closed while
-// manifest-level required_capabilities are unsupported.
+// A properly-typed EpochZero capability object satisfies the manifest
+// required capability.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn mint_genesis_required_capabilities_fail_closed_for_real_epoch_zero_cap() {
+fn mint_genesis_required_capability_accepts_real_epoch_zero_cap() {
     let alice = addr(0xA1);
     let mut state = build_state(&[(alice, 1_000_000)]);
     let alice_coin_id = genesis_coin_id(alice, 0);
@@ -177,7 +173,7 @@ fn mint_genesis_required_capabilities_fail_closed_for_real_epoch_zero_cap() {
     let wasm = wrap_with_real_manifest(noop_mint_genesis_wat(), real_fungible_manifest_bytes());
     let petal_hash = state.insert_code(&wasm);
 
-    // Seed a real Capability<EpochZero> object owned by alice.
+    // Seed a real EpochZero capability object owned by alice.
     let epoch_id = ObjectId([0xE0; 32]);
     seed_epoch_zero_cap(&mut state, epoch_id, alice);
 
@@ -213,14 +209,9 @@ fn mint_genesis_required_capabilities_fail_closed_for_real_epoch_zero_cap() {
 
     let out = submit_ptb_chain_auth(&mut state, alice, ptb);
 
-    assert!(!out.success, "required_capabilities must fail closed");
-    assert!(out.write_set.is_none(), "revert must drop write set");
-    assert!(out.logs.is_empty(), "revert must drop logs");
-
-    let reason = String::from_utf8_lossy(&out.return_data);
-    let reason_lc = reason.to_lowercase();
     assert!(
-        reason_lc.contains("required_capabilities") && reason_lc.contains("not supported"),
-        "revert reason must cite unsupported required_capabilities; got: {reason}"
+        out.success,
+        "properly typed EpochZero object must satisfy required_capabilities; got: {}",
+        String::from_utf8_lossy(&out.return_data)
     );
 }

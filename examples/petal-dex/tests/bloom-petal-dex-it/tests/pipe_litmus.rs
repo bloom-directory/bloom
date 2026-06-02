@@ -176,22 +176,12 @@ fn install_fast_manifest_fixture() -> (State, ObjectId) {
 }
 
 fn derive_object_create_id_for_test(
-    petal_hash: Hash32,
+    creation_seed: Hash32,
     create_idx: u64,
     type_tag: &TypeTag,
     payload: &[u8],
 ) -> ObjectId {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"bloom.object.create.v1\0");
-    hasher.update(&petal_hash.0);
-    hasher.update(&create_idx.to_be_bytes());
-    hasher.update(
-        &type_tag
-            .encode_canonical()
-            .expect("test type tag must encode"),
-    );
-    hasher.update(payload);
-    ObjectId(*hasher.finalize().as_bytes())
+    ObjectId::derive_for_type_tag(&creation_seed, create_idx, type_tag, payload)
 }
 
 /// Hex (no `0x`) of a 32-byte id, for splicing into pipe-expr `obj:` tokens.
@@ -460,9 +450,9 @@ fn fast_double_spend_lines_rejected_before_execution() {
 }
 
 #[test]
-fn pool_create_id_collision_is_documented_by_payload_discriminator() {
+fn pool_create_id_uses_creation_seed_and_payload() {
     let pool_hash = Hash32([0x42; 32]);
-    let pool_tag = pool_object_tag([0u8; 32]);
+    let pool_tag = pool_object_tag(pool_hash.0);
     let payload_fee_30 = bloom_petal_dex_pool::payload::pool_payload(
         &ObjectId([0u8; 32]),
         1000,
@@ -484,18 +474,24 @@ fn pool_create_id_collision_is_documented_by_payload_discriminator() {
         &coin_erased_tag(),
     );
 
-    let id_a = derive_object_create_id_for_test(pool_hash, 0, &pool_tag, &payload_fee_30);
-    let id_b = derive_object_create_id_for_test(pool_hash, 0, &pool_tag, &payload_fee_30);
-    let id_discriminated =
-        derive_object_create_id_for_test(pool_hash, 0, &pool_tag, &payload_fee_25);
+    let seed_a = Hash32([0xA0; 32]);
+    let seed_b = Hash32([0xB0; 32]);
+    let id_a = derive_object_create_id_for_test(seed_a, 0, &pool_tag, &payload_fee_30);
+    let id_b = derive_object_create_id_for_test(seed_a, 0, &pool_tag, &payload_fee_30);
+    let id_other_ptb = derive_object_create_id_for_test(seed_b, 0, &pool_tag, &payload_fee_30);
+    let id_discriminated = derive_object_create_id_for_test(seed_a, 0, &pool_tag, &payload_fee_25);
 
     assert_eq!(
         id_a, id_b,
-        "two separate single-create PTBs with identical pool payloads collide today"
+        "same creation seed, nonce, tag, and payload must be deterministic"
+    );
+    assert_ne!(
+        id_a, id_other_ptb,
+        "different PTB creation seeds must not collide for identical payloads"
     );
     assert_ne!(
         id_a, id_discriminated,
-        "the current two-hop fixture uses distinct fee params as a payload discriminator"
+        "payload remains part of the canonical object id derivation"
     );
 }
 

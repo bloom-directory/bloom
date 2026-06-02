@@ -54,12 +54,13 @@ use bloom_objects::{
     AccessMode, OWNER_KIND_ADDRESS, OWNER_KIND_IMMUTABLE, OWNER_KIND_OBJECT, OWNER_KIND_SHARED,
     Object, ObjectId, Owner, TypeTag,
 };
-use bloom_petal_manifest::{extract_petal_manifest_v0, types::PetalManifestV0};
+use bloom_petal_manifest::{ManifestResolver, extract_petal_manifest_v0, types::PetalManifestV0};
 use bloom_script::{
     BorrowRow, CORE_FUNGIBLE_PATH,
     executor::LogEntry as PtbLogEntry,
     host_ctx::{HandleEntry, PtbHostCtx},
 };
+use bloom_value::{CodecLimits, validate_value_bytes};
 
 use crate::error::PetalError;
 use crate::host::HostError;
@@ -103,6 +104,7 @@ pub struct ChainCtx {
 pub struct ChainStoreData {
     pub chain_ctx: ChainCtx,
     pub petal_hash: Hash32,
+    pub manifest: Option<PetalManifestV0>,
     /// Per-PTB host context (spec §16.2 borrow table, signers, logs,
     /// host-created object state, ...) shared between the wasm host imports
     /// installed by `link_new_host_imports` and the surrounding `PtbExecutor`.
@@ -881,6 +883,9 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                     return HostError::Denied("object.mutate from non-defining petal".into())
                         .as_wasm_code();
                 }
+                if let Err(code) = validate_object_payload(&caller, &row.type_tag, &bytes) {
+                    return code;
+                }
                 match ctx.borrow_table.mark_dirty(&id, bytes) {
                     Ok(()) => 0,
                     Err(_) => HostError::Backend("mark_dirty failed".into()).as_wasm_code(),
@@ -972,8 +977,12 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                 }
             };
 
+            if let Err(code) = validate_object_payload(&caller, &stamped_tag, &payload) {
+                return code;
+            }
+
             // Derive a deterministic transient ObjectId.
-            let id = derive_create_id(&caller, &tag_bytes, &payload);
+            let id = derive_create_id(&caller, &stamped_tag, &payload);
             let object = Object {
                 id,
                 type_tag: stamped_tag,
@@ -1527,6 +1536,24 @@ fn with_ptb_ctx_payload(
     }
 }
 
+fn validate_object_payload(
+    caller: &Caller<'_, ChainStoreData>,
+    tag: &TypeTag,
+    payload: &[u8],
+) -> Result<(), i32> {
+    let Some(manifest) = caller.data().manifest.as_ref() else {
+        return Err(
+            HostError::Invalid("object payload validation requires manifest".into()).as_wasm_code(),
+        );
+    };
+    let mut limits = CodecLimits::default();
+    limits.max_value_bytes = payload.len();
+    let resolver = ManifestResolver::with_self_hash(manifest, caller.data().petal_hash.0);
+    validate_value_bytes(&resolver, tag, payload, &limits).map_err(|e| {
+        HostError::Invalid(format!("object payload decode failed: {e}")).as_wasm_code()
+    })
+}
+
 /// Derive a deterministic transient `ObjectId` for an `object.create`
 /// call. The recipe (BLAKE3 of PTB digest + caller petal hash +
 /// ptb-scope counter + type-tag bytes + payload bytes) makes the id
@@ -1534,11 +1561,9 @@ fn with_ptb_ctx_payload(
 /// collisions between different PTBs that create identical objects.
 fn derive_create_id(
     caller: &Caller<'_, ChainStoreData>,
-    type_tag_bytes: &[u8],
+    type_tag: &TypeTag,
     payload: &[u8],
 ) -> ObjectId {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"bloom.object.create.v1\0");
     let (ptb_digest, n) = caller
         .data()
         .ptb_ctx
@@ -1549,17 +1574,7 @@ fn derive_create_id(
                 .map(|c| (c.ptb_digest, c.created_objects.len() as u64))
         })
         .unwrap_or(([0u8; 32], 0));
-    hasher.update(&ptb_digest);
-    hasher.update(&caller.data().petal_hash.0);
-    // Mix in the PTB ctx's "created so far" length for per-call
-    // uniqueness within a single PTB.
-    hasher.update(&n.to_be_bytes());
-    hasher.update(type_tag_bytes);
-    hasher.update(payload);
-    let h = hasher.finalize();
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(h.as_bytes());
-    ObjectId(arr)
+    ObjectId::derive_for_type_tag(&Hash32(ptb_digest), n, type_tag, payload)
 }
 
 // ---------------------------------------------------------------------------
@@ -1663,6 +1678,8 @@ fn dispatch_chain_call_sync(
 
     let petal_hash = blake3_tagged(tags::PETAL, &input.wasm);
 
+    let manifest = extract_petal_manifest_v0(&input.wasm);
+
     let chain_ctx = ChainCtx {
         snapshot: input.snapshot,
         contract_address: input.contract_address,
@@ -1679,6 +1696,7 @@ fn dispatch_chain_call_sync(
     let store_data = ChainStoreData {
         chain_ctx,
         petal_hash,
+        manifest,
         ptb_ctx: input.ptb_ctx,
     };
 
@@ -1892,9 +1910,14 @@ mod ptb_host_import_tests {
     use super::*;
     use bloom_chain_state::State;
     use bloom_chain_types::Address;
-    use bloom_objects::{AccessMode, Object, ObjectId, Owner, TypeTag};
+    use bloom_objects::{
+        AbilitySet, AccessMode, BUILTIN_TYPE_HASH, Object, ObjectId, Owner, TypeTag,
+    };
     use bloom_petal_manifest::codec;
-    use bloom_petal_manifest::types::{FunctionDecl, PetalManifestV0, SCHEMA_VERSION, SemVer};
+    use bloom_petal_manifest::types::{
+        FieldDecl, FunctionDecl, ObjectTypeDecl, PetalManifestV0, SCHEMA_VERSION, SemVer,
+        TypeParamDecl, TypeParamKind,
+    };
     use bloom_script::host_ctx::PtbHostCtx;
     use std::sync::{Arc, Mutex};
 
@@ -1925,6 +1948,45 @@ mod ptb_host_import_tests {
         leb128(&mut wasm, custom.len() as u64);
         wasm.extend_from_slice(&custom);
         wasm
+    }
+
+    fn builtin(name: &str) -> TypeTag {
+        TypeTag::Concrete {
+            petal_hash: BUILTIN_TYPE_HASH,
+            type_name: name.to_string(),
+            type_args: vec![],
+        }
+    }
+
+    fn object_manifest(type_name: &str, fields: Vec<(&str, TypeTag)>) -> PetalManifestV0 {
+        PetalManifestV0 {
+            schema_version: SCHEMA_VERSION,
+            module_path: "/bloom/petals/test/object".to_string(),
+            framework_version: SemVer::new(0, 1, 0),
+            object_types: vec![ObjectTypeDecl {
+                name: type_name.to_string(),
+                abilities: AbilitySet::key_store(),
+                type_params: vec![],
+                fields: fields
+                    .into_iter()
+                    .map(|(name, ty)| FieldDecl {
+                        name: name.to_string(),
+                        ty,
+                    })
+                    .collect(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn generic_object_manifest(type_name: &str, fields: Vec<(&str, TypeTag)>) -> PetalManifestV0 {
+        let mut manifest = object_manifest(type_name, fields);
+        manifest.object_types[0].type_params.push(TypeParamDecl {
+            name: "T".to_string(),
+            kind: TypeParamKind::Phantom,
+            bounds: vec![],
+        });
+        manifest
     }
 
     fn run_with(wasm: Vec<u8>, ctx: Arc<Mutex<PtbHostCtx>>, petal_hash: Hash32) -> ChainCallOutput {
@@ -2207,7 +2269,17 @@ mod ptb_host_import_tests {
 
     #[test]
     fn object_mutate_replaces_payload() {
-        let wasm = parse(OBJECT_BORROW_MUTATE);
+        let wasm = append_manifest(
+            parse(OBJECT_BORROW_MUTATE),
+            object_manifest(
+                "T",
+                vec![
+                    ("a", builtin("u8")),
+                    ("b", builtin("u8")),
+                    ("c", builtin("u8")),
+                ],
+            ),
+        );
         let petal = blake3_tagged(tags::PETAL, &wasm);
         let mut ctx = PtbHostCtx::new();
         let obj = make_object(0x07, vec![0; 3], Owner::Address([0; 32]), petal.0);
@@ -2665,10 +2737,23 @@ mod ptb_host_import_tests {
     // -----------------------------------------------------------------------
 
     fn object_create_wat(type_tag_bytes: &[u8]) -> String {
+        object_create_wat_with_payload(type_tag_bytes, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+    }
+
+    fn wat_bytes(bytes: &[u8]) -> String {
+        let mut lit = String::new();
+        for b in bytes {
+            lit.push_str(&format!("\\{:02x}", b));
+        }
+        lit
+    }
+
+    fn object_create_wat_with_payload(type_tag_bytes: &[u8], payload: &[u8]) -> String {
         let mut tag_lit = String::new();
         for b in type_tag_bytes {
             tag_lit.push_str(&format!("\\{:02x}", b));
         }
+        let payload_lit = wat_bytes(payload);
         format!(
             r#"
 (module
@@ -2676,11 +2761,11 @@ mod ptb_host_import_tests {
   (import "chain" "petal.return" (func $ret (param i32 i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{tag_lit}")
-  (data (i32.const 256) "\de\ad\be\ef")
+  (data (i32.const 256) "{payload_lit}")
   (func (export "call") (param i32 i32) (result i32)
     (local $h i32)
     (local.set $h
-      (call $cr (i32.const 0) (i32.const {tag_len}) (i32.const 256) (i32.const 4)))
+      (call $cr (i32.const 0) (i32.const {tag_len}) (i32.const 256) (i32.const {payload_len})))
     (i32.store (i32.const 512) (local.get $h))
     (call $ret (i32.const 512) (i32.const 4))
     i32.const 0)
@@ -2688,6 +2773,8 @@ mod ptb_host_import_tests {
 "#,
             tag_lit = tag_lit,
             tag_len = type_tag_bytes.len(),
+            payload_lit = payload_lit,
+            payload_len = payload.len(),
         )
     }
 
@@ -2704,11 +2791,11 @@ mod ptb_host_import_tests {
   (import "chain" "petal.return" (func $ret (param i32 i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "{tag_lit}")
-  (data (i32.const 256) "\de\ad\be\ef")
+  (data (i32.const 256) "\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\01")
   (func (export "call") (param i32 i32) (result i32)
     (local $h i32)
     (local.set $h
-      (call $cr (i32.const 0) (i32.const {tag_len}) (i32.const 256) (i32.const 4)))
+      (call $cr (i32.const 0) (i32.const {tag_len}) (i32.const 256) (i32.const 16)))
     (drop (call $id (local.get $h) (i32.const 512)))
     (call $ret (i32.const 512) (i32.const 32))
     i32.const 0)
@@ -2734,7 +2821,10 @@ mod ptb_host_import_tests {
             type_args: vec![],
         };
         let want = sentinel_tag.encode_canonical().unwrap();
-        let wasm = parse(&object_create_wat(&want));
+        let wasm = append_manifest(
+            parse(&object_create_wat(&want)),
+            object_manifest("X", vec![("value", builtin("u128"))]),
+        );
         let computed_petal = blake3_tagged(tags::PETAL, &wasm);
 
         let arc = Arc::new(Mutex::new(PtbHostCtx::new()));
@@ -2762,6 +2852,31 @@ mod ptb_host_import_tests {
     }
 
     #[test]
+    fn object_create_rejects_malformed_canonical_payload() {
+        let sentinel_tag = TypeTag::Concrete {
+            petal_hash: [0u8; 32],
+            type_name: "X".into(),
+            type_args: vec![],
+        };
+        let want = sentinel_tag.encode_canonical().unwrap();
+        let mut malformed = vec![0u8; 16];
+        malformed.push(0xAA);
+        let wasm = append_manifest(
+            parse(&object_create_wat_with_payload(&want, &malformed)),
+            object_manifest("X", vec![("value", builtin("u128"))]),
+        );
+
+        let arc = Arc::new(Mutex::new(PtbHostCtx::new()));
+        let out = run_with(wasm, arc.clone(), Hash32([0u8; 32]));
+        let code = i32::from_le_bytes(out.return_data.unwrap().try_into().unwrap());
+        assert_eq!(code, -3, "malformed payload must be an Invalid host error");
+        assert!(
+            arc.lock().unwrap().created_objects.is_empty(),
+            "malformed create must not stage an object"
+        );
+    }
+
+    #[test]
     fn object_create_id_differs_across_ptb_digests() {
         let sentinel_tag = TypeTag::Concrete {
             petal_hash: [0u8; 32],
@@ -2769,7 +2884,10 @@ mod ptb_host_import_tests {
             type_args: vec![],
         };
         let want = sentinel_tag.encode_canonical().unwrap();
-        let wasm = parse(&object_create_return_id_wat(&want));
+        let wasm = append_manifest(
+            parse(&object_create_return_id_wat(&want)),
+            object_manifest("X", vec![("value", builtin("u128"))]),
+        );
 
         let mut ctx_a = PtbHostCtx::new();
         ctx_a.ptb_digest = [0xA1; 32];
@@ -2783,6 +2901,26 @@ mod ptb_host_import_tests {
     }
 
     #[test]
+    fn object_mutate_rejects_malformed_canonical_payload() {
+        let wasm = append_manifest(
+            parse(OBJECT_BORROW_MUTATE),
+            object_manifest("T", vec![("value", builtin("u128"))]),
+        );
+        let petal = blake3_tagged(tags::PETAL, &wasm);
+        let mut ctx = PtbHostCtx::new();
+        let obj = make_object(0x07, vec![0; 16], Owner::Address([0; 32]), petal.0);
+        ctx.borrow_table.load_persistent(&obj, AccessMode::Mutable);
+        let arc = Arc::new(Mutex::new(ctx));
+        let out = run_with(wasm, arc.clone(), petal);
+        let code = i32::from_le_bytes(out.return_data.unwrap().try_into().unwrap());
+        assert_eq!(code, -3, "malformed payload must be an Invalid host error");
+        let guard = arc.lock().unwrap();
+        let row = guard.borrow_table.get(&ObjectId([0x07; 32])).unwrap();
+        assert_eq!(row.payload_bytes, vec![0; 16]);
+        assert!(!row.dirty, "malformed mutate must not dirty the row");
+    }
+
+    #[test]
     fn object_create_by_non_defining_petal_is_denied() {
         // Type tag's petal_hash != caller wasm's petal_hash → Denied (-2).
         let bogus_tag = TypeTag::Concrete {
@@ -2791,7 +2929,10 @@ mod ptb_host_import_tests {
             type_args: vec![],
         };
         let bytes = bogus_tag.encode_canonical().unwrap();
-        let wasm = parse(&object_create_wat(&bytes));
+        let wasm = append_manifest(
+            parse(&object_create_wat(&bytes)),
+            object_manifest("Whatever", vec![("value", builtin("u128"))]),
+        );
         let arc = Arc::new(Mutex::new(PtbHostCtx::new()));
         let out = run_with(wasm, arc.clone(), Hash32([0; 32]));
         let code = i32::from_le_bytes(out.return_data.unwrap().try_into().unwrap());
@@ -2833,7 +2974,10 @@ mod ptb_host_import_tests {
             }],
         };
         let bytes = coin_tag.encode_canonical().unwrap();
-        let wasm = parse(&object_create_wat(&bytes));
+        let wasm = append_manifest(
+            parse(&object_create_wat(&bytes)),
+            generic_object_manifest("Coin", vec![("value", builtin("u128"))]),
+        );
         let computed_petal = blake3_tagged(tags::PETAL, &wasm);
         let mut state = State::new();
         state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), computed_petal);

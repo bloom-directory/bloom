@@ -2036,6 +2036,7 @@ mod tests {
 
     use bloom_chain_types::Hash32;
     use bloom_objects::{AccessMode, Object, ObjectId, Owner, TypeTag};
+    use bloom_petal_fungible::ops::coin_payload;
     use bloom_script::{Arg, ArgDeclStub, Command, FunctionDeclStub, PetalManifestStub};
 
     #[derive(Default)]
@@ -2099,14 +2100,12 @@ mod tests {
             version: 7,
             payload: vec![],
         });
-        let mut gas_payload = vec![0u8; 32];
-        gas_payload.extend_from_slice(&3_000_000u128.to_be_bytes());
         chain.put_object(Object {
             id: gas_id,
             type_tag: bloom_script::loom_coin_type_tag(bloom_script::DEFAULT_FUNGIBLE_PETAL_HASH),
             owner: Owner::Address([0x22; 32]),
             version: 0,
-            payload: gas_payload,
+            payload: coin_payload(3_000_000),
         });
         chain.paths.lock().unwrap().insert(
             bloom_script::CORE_FUNGIBLE_PATH.to_string(),

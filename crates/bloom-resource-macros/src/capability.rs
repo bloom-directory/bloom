@@ -9,11 +9,12 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{Attribute, GenericParam, ItemStruct, Meta};
+use syn::{Attribute, Fields, GenericParam, ItemStruct, Meta};
 
 use crate::ast::{attr_is_named, ident, parse_ident_list, parse_str_value, struct_name};
 use crate::error::err_spanned;
-use bloom_petal_manifest::types::{CapabilityDecl, TypeParamDecl, TypeParamKind};
+use crate::type_tag::TypeTagCtx;
+use bloom_petal_manifest::types::{CapabilityDecl, FieldDecl, TypeParamDecl, TypeParamKind};
 use syn::spanned::Spanned;
 
 /// Parsed `#[capability(...)]` attribute.
@@ -94,7 +95,34 @@ pub(crate) fn build_decl(item: &ItemStruct, attr: &CapabilityAttr) -> syn::Resul
             ));
         }
     }
-    Ok(CapabilityDecl { name, type_params })
+    let ctx = TypeTagCtx::from_generic_names(generic_names.iter().cloned());
+    let mut fields = Vec::<FieldDecl>::new();
+    let field_iter: Box<dyn Iterator<Item = (&syn::Field, usize)>> = match &item.fields {
+        Fields::Named(named) => Box::new(named.named.iter().enumerate().map(|(i, f)| (f, i))),
+        Fields::Unnamed(unnamed) => {
+            Box::new(unnamed.unnamed.iter().enumerate().map(|(i, f)| (f, i)))
+        }
+        Fields::Unit => Box::new(std::iter::empty()),
+    };
+    for (field, i) in field_iter {
+        if crate::bloom_type::is_phantom_data_type(&field.ty) {
+            continue;
+        }
+        let field_name = field
+            .ident
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| i.to_string());
+        fields.push(FieldDecl {
+            name: field_name,
+            ty: ctx.lower(&field.ty)?,
+        });
+    }
+    Ok(CapabilityDecl {
+        name,
+        type_params,
+        fields,
+    })
 }
 
 /// Macro entry: re-emit the user struct plus a `CapabilityMarker` impl.
@@ -116,9 +144,11 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenS
 
     // key | store | copy = 0b0111 = 7
     let abilities_byte: u8 = 0b0111;
+    let bloom_type_impl = crate::bloom_type::emit_struct_impl_for_item(&output, true)?;
 
     Ok(quote! {
         #output
+        #bloom_type_impl
 
         impl #impl_gen ::bloom_resource::CapabilityMarker for #name #ty_gen #where_clause {}
 
@@ -162,6 +192,8 @@ mod tests {
         let d = build_decl(&s, &a).unwrap();
         assert_eq!(d.name, "AdminCap");
         assert_eq!(d.type_params.len(), 1);
+        assert_eq!(d.fields.len(), 1);
+        assert_eq!(d.fields[0].name, "id");
         assert!(matches!(d.type_params[0].kind, TypeParamKind::Phantom));
     }
 

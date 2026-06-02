@@ -40,11 +40,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bloom_objects::{Object, TypeTag, ValidationOutcome, validate_canonical_bytes};
+use bloom_objects::{Object, TypeTag};
 use bloom_script::{
     AlwaysOkVerifier, Arg, ArgDeclStub, ChainStateIface, Command, MoveCmd, PetalRef, PqPubkey,
     PqSignature, PtbError, PtbTx, SignatureVerifier, UseRef, ValidationContext, ValidationMode,
     loom_coin_type_tag, validate_ptb,
+    value_validation::validate_const_slot,
 };
 
 use crate::error::BuildError;
@@ -322,19 +323,18 @@ impl<'a> PtbSession<'a> {
                 (Arg::Signer(_), ArgDeclStub::Signer) => {}
                 (Arg::Const(bytes), ArgDeclStub::Const(declared_tag)) => {
                     let expected = substitute_type_args(declared_tag, &cmd.type_args);
-                    match validate_canonical_bytes(&expected, bytes) {
-                        ValidationOutcome::Ok | ValidationOutcome::Unknown => {}
-                        ValidationOutcome::Invalid(reason) => {
-                            return Err(PtbError::TypeMismatch {
-                                function,
-                                arg_idx: i,
-                                reason: format!(
-                                    "Const bytes do not match declared type {}: {reason}",
-                                    type_tag_label(&expected)
-                                ),
-                            }
-                            .into());
+                    if let Err(reason) =
+                        validate_const_slot(&endpoint.manifest, petal_hash.0, &expected, bytes)
+                    {
+                        return Err(PtbError::TypeMismatch {
+                            function,
+                            arg_idx: i,
+                            reason: format!(
+                                "Const bytes do not match declared type {}: {reason}",
+                                type_tag_label(&expected)
+                            ),
                         }
+                        .into());
                     }
                 }
                 (

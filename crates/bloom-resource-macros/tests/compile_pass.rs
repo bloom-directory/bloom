@@ -39,6 +39,111 @@ mod invariant_test {
     }
 }
 
+mod bloom_type_test {
+    include!("fixtures/bloom_type_petal.rs");
+
+    use self::bloom_type_fixture::{Quote, Status};
+    use bloom_objects::{BUILTIN_TYPE_HASH, TypeTag};
+
+    #[test]
+    fn plain_struct_round_trips_variable_width_field() {
+        let quote = Quote {
+            amount: 42,
+            label: "spot".to_string(),
+            tags: vec!["a".to_string(), "bc".to_string()],
+            raw: vec![1, 2, 3],
+            blob: bloom_resource::Bytes::from(vec![4, 5]),
+        };
+        let bytes = quote.canonical_encode();
+        let mut expected = 42u128.to_be_bytes().to_vec();
+        expected.push(4);
+        expected.extend_from_slice(b"spot");
+        expected.extend_from_slice(b"\x02\x01a\x02bc");
+        expected.extend_from_slice(b"\x03\x01\x02\x03");
+        expected.extend_from_slice(b"\x02\x04\x05");
+        assert_eq!(bytes, expected);
+        assert_eq!(Quote::canonical_decode(&bytes).unwrap(), quote);
+    }
+
+    #[test]
+    fn enum_variants_round_trip() {
+        let filled = Status::Filled(7, "done".to_string());
+        assert_eq!(
+            Status::canonical_decode(&filled.canonical_encode()).unwrap(),
+            filled
+        );
+        let named = Status::Named {
+            ok: true,
+            id: bloom_objects::ObjectId([0xAB; 32]),
+        };
+        assert_eq!(
+            Status::canonical_decode(&named.canonical_encode()).unwrap(),
+            named
+        );
+    }
+
+    #[test]
+    fn generated_type_tag_uses_self_sentinel_and_generic_args() {
+        match Quote::type_tag() {
+            TypeTag::Concrete {
+                petal_hash,
+                type_name,
+                type_args,
+            } => {
+                assert_eq!(petal_hash, [0u8; 32]);
+                assert_eq!(type_name, "Quote");
+                assert!(type_args.is_empty());
+            }
+            other => panic!("expected concrete tag, got {other:?}"),
+        }
+        match String::type_tag() {
+            TypeTag::Concrete { petal_hash, .. } => assert_eq!(petal_hash, BUILTIN_TYPE_HASH),
+            other => panic!("expected concrete tag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manifest_records_derived_types() {
+        let manifest =
+            bloom_petal_manifest::codec::decode(self::bloom_type_fixture::__bloom_manifest_bytes())
+                .unwrap();
+        assert_eq!(manifest.data_types.len(), 2);
+        assert_eq!(manifest.data_types[0].name, "Quote");
+        let quote_fields = &manifest.data_types[0].fields;
+        assert_eq!(quote_fields[2].name, "tags");
+        assert!(matches!(
+            &quote_fields[2].ty,
+            TypeTag::Concrete {
+                petal_hash: BUILTIN_TYPE_HASH,
+                type_name,
+                type_args,
+            } if type_name == "vector" && type_args.len() == 1
+        ));
+        assert_eq!(quote_fields[3].name, "raw");
+        assert!(matches!(
+            &quote_fields[3].ty,
+            TypeTag::Concrete {
+                petal_hash: BUILTIN_TYPE_HASH,
+                type_name,
+                type_args,
+            } if type_name == "vector" && type_args == &vec![u8::type_tag()]
+        ));
+        assert_eq!(quote_fields[4].name, "blob");
+        assert!(matches!(
+            &quote_fields[4].ty,
+            TypeTag::Concrete {
+                petal_hash: BUILTIN_TYPE_HASH,
+                type_name,
+                type_args,
+            } if type_name == "bytes" && type_args.is_empty()
+        ));
+        assert_eq!(manifest.data_types[1].name, "LocalData");
+        assert_eq!(manifest.enum_types.len(), 2);
+        assert_eq!(manifest.enum_types[0].name, "Status");
+        assert_eq!(manifest.enum_types[1].name, "LocalEnum");
+    }
+}
+
 mod generic_dispatch_test {
     //! Drives the macro-emitted `__petal_<fn>` host shims for *generic*
     //! petal fns, proving runtime type-erased dispatch (spec §5):
@@ -255,7 +360,7 @@ mod dispatch_test {
     use bloom_objects::{AccessMode, ObjectId};
     use bloom_resource::abi::{ArgReader, CallArgsWriter};
     use bloom_resource::host::{HostCall, HostResponse, test_hooks};
-    use bloom_resource::{PetalError, RuntimeHandle};
+    use bloom_resource::{BloomType, PetalError, RuntimeHandle};
 
     /// Drive a host-side mirror shim with the given args buffer.
     /// Returns the rc and the encoded return bytes the shim appended.
@@ -283,6 +388,29 @@ mod dispatch_test {
         let mut a = [0u8; 16];
         a.copy_from_slice(&bytes);
         assert_eq!(u128::from_be_bytes(a), 7777);
+    }
+
+    #[test]
+    fn bytes_arg_decodes_as_canonical_const_value_not_object() {
+        test_hooks::clear();
+        let blob = bloom_resource::Bytes::from(vec![0xA1, 0xB2, 0xC3]);
+        let mut w = CallArgsWriter::new();
+        w.push_const(&blob.canonical_encode());
+        let args = w.finish();
+
+        let (rc, ret) = drive_safe_shim(dispatch::__bloom_petal_blob_len, &args);
+        assert_eq!(rc, 0, "blob_len() should succeed");
+
+        let mut r = ArgReader::new(&ret);
+        assert_eq!(r.read_u32().unwrap(), 1);
+        let bytes = r.read_bytes().unwrap();
+        let mut a = [0u8; 16];
+        a.copy_from_slice(&bytes);
+        assert_eq!(u128::from_be_bytes(a), 3);
+        assert!(
+            test_hooks::recorded_calls().is_empty(),
+            "Bytes must not be decoded via object.borrow"
+        );
     }
 
     #[test]

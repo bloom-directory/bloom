@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use bloom_chain_types::Hash32;
 use bloom_objects::{AccessMode, Object, ObjectId, Owner, TypeTag};
+use bloom_petal_fungible::ops::coin_payload;
 use bloom_script::{
     Arg, ArgDeclStub, CORE_FUNGIBLE_PATH, ChainStateIface, Command, DEFAULT_FUNGIBLE_PETAL_HASH,
     ExpectedVersion, FunctionDeclStub, PetalManifestStub, TypeParamDeclStub,
@@ -77,8 +78,29 @@ const POOL_HASH: Hash32 = Hash32([0xAB; 32]);
 const POOL_PATH: &str = "/bloom/petals/dex/pool";
 
 fn concrete(name: &str) -> TypeTag {
+    let petal_hash = if matches!(
+        name,
+        "bool"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "Address"
+            | "ObjectId"
+            | "Hash32"
+            | "UID"
+            | "TypeTag"
+            | "bytes"
+            | "String"
+            | "string"
+    ) {
+        bloom_objects::BUILTIN_TYPE_HASH
+    } else {
+        [0u8; 32]
+    };
     TypeTag::Concrete {
-        petal_hash: [0u8; 32],
+        petal_hash,
         type_name: name.to_string(),
         type_args: vec![],
     }
@@ -105,6 +127,7 @@ fn chain_with_pool(funcs: Vec<FunctionDeclStub>) -> MockChain {
         functions: funcs,
         object_types: vec![],
         external_type_refs: vec![],
+        ..Default::default()
     };
     chain.put_petal(POOL_HASH, manifest);
     chain.put_path(POOL_PATH, POOL_HASH);
@@ -116,15 +139,12 @@ fn chain_with_pool(funcs: Vec<FunctionDeclStub>) -> MockChain {
 fn ready_session(chain: &MockChain, signer: [u8; 32]) -> PtbSession<'_> {
     let gas_id = ObjectId([0xFE; 32]);
     chain.put_path(CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH);
-    // 48-byte coin payload: [id placeholder (32)] || [value BE (16)]
-    let mut payload = vec![0u8; 32];
-    payload.extend_from_slice(&1_000_000u128.to_be_bytes());
     chain.put_object(Object {
         id: gas_id,
         type_tag: bloom_script::loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
         owner: Owner::Address(signer),
         version: 0,
-        payload,
+        payload: coin_payload(1_000_000),
     });
     let mut s = PtbSession::new(chain);
     s.set_signers(vec![signer]);
@@ -707,14 +727,12 @@ fn build_unsigned_derives_fungible_hash_from_chain_vfs() {
     chain.put_path(CORE_FUNGIBLE_PATH, fungible_hash);
 
     let gas_id = ObjectId([0xFE; 32]);
-    let mut payload = vec![0u8; 32];
-    payload.extend_from_slice(&1_000_000u128.to_be_bytes());
     chain.put_object(Object {
         id: gas_id,
         type_tag: bloom_script::loom_coin_type_tag(fungible_hash),
         owner: Owner::Address(signer),
         version: 0,
-        payload,
+        payload: coin_payload(1_000_000),
     });
 
     let mut s = PtbSession::new(&chain);
@@ -733,14 +751,12 @@ fn build_unsigned_requires_fungible_vfs_binding_without_override() {
     let chain = chain_with_pool(vec![func("swap", vec![ArgDeclStub::Signer], vec![])]);
     let signer = [0x11; 32];
     let gas_id = ObjectId([0xFE; 32]);
-    let mut payload = vec![0u8; 32];
-    payload.extend_from_slice(&1_000_000u128.to_be_bytes());
     chain.put_object(Object {
         id: gas_id,
         type_tag: bloom_script::loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
         owner: Owner::Address(signer),
         version: 0,
-        payload,
+        payload: coin_payload(1_000_000),
     });
 
     let mut s = PtbSession::new(&chain);

@@ -248,11 +248,11 @@ mod tests {
     #[test]
     fn load_manifest_parses_wasm_custom_section() {
         use bloom_petal_manifest::codec;
-        use bloom_petal_manifest::types::{PetalManifestV0, SemVer};
+        use bloom_petal_manifest::types::{PetalManifestV0, SCHEMA_VERSION, SemVer};
 
         // Build a minimal wasm with a `bloom_petal_manifest_v0` section.
         let manifest = PetalManifestV0 {
-            schema_version: 1,
+            schema_version: SCHEMA_VERSION,
             module_path: "/bloom/test/petal".into(),
             framework_version: SemVer::new(0, 1, 0),
             ..Default::default()
@@ -275,10 +275,10 @@ mod tests {
         // Ensures the adapter only parses each wasm once across multiple
         // load_manifest calls for the same hash.
         use bloom_petal_manifest::codec;
-        use bloom_petal_manifest::types::{PetalManifestV0, SemVer};
+        use bloom_petal_manifest::types::{PetalManifestV0, SCHEMA_VERSION, SemVer};
 
         let manifest = PetalManifestV0 {
-            schema_version: 1,
+            schema_version: SCHEMA_VERSION,
             module_path: "/bloom/test/petal".into(),
             framework_version: SemVer::new(0, 1, 0),
             ..Default::default()
@@ -301,10 +301,10 @@ mod tests {
     #[test]
     fn overrides_win_over_wasm_section() {
         use bloom_petal_manifest::codec;
-        use bloom_petal_manifest::types::{PetalManifestV0, SemVer};
+        use bloom_petal_manifest::types::{PetalManifestV0, SCHEMA_VERSION, SemVer};
 
         let real = PetalManifestV0 {
-            schema_version: 1,
+            schema_version: SCHEMA_VERSION,
             module_path: "/wasm/path".into(),
             framework_version: SemVer::new(0, 1, 0),
             ..Default::default()

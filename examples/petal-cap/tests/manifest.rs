@@ -5,183 +5,13 @@
 //! the petal's user-visible surface (object types, capability types,
 //! function entries, required-capability lists) match spec §5 + §18.
 //!
-//! We can't depend on `bloom-resource-macros` as a normal crate
-//! (it's `proc-macro = true`), so we inline a small decoder that walks
-//! the encoding documented in `bloom-resource-macros/src/manifest_codec.rs`.
-//! The decoder only walks far enough to answer each test's question.
-
-use bloom_objects::codec::{read_bytes32, read_string, read_u8, read_u16_be, read_u32_be};
 use bloom_objects::{AccessMode, TypeTag};
 use bloom_petal_cap::cap;
+use bloom_petal_manifest::PetalManifestV0;
+use bloom_petal_manifest::types::{ArgKind, TypeParamKind};
 
-// ===========================================================================
-// Inline minimal manifest decoder
-// ===========================================================================
-
-#[derive(Debug)]
-struct Manifest {
-    module_path: String,
-    object_types: Vec<ObjectType>,
-    capability_types: Vec<Capability>,
-    functions: Vec<Function>,
-}
-
-#[derive(Debug)]
-struct ObjectType {
-    name: String,
-    abilities: u8,
-    type_params: Vec<TypeParam>,
-}
-
-#[derive(Debug)]
-struct Capability {
-    name: String,
-    type_params: Vec<TypeParam>,
-}
-
-#[derive(Debug)]
-struct TypeParam {
-    name: String,
-    /// 0 = Phantom, 1 = Resource.
-    kind: u8,
-}
-
-#[derive(Debug)]
-struct Function {
-    name: String,
-    args: Vec<Arg>,
-    required_signers: u8,
-    required_capabilities: Vec<TypeTag>,
-}
-
-#[derive(Debug)]
-#[allow(dead_code)]
-struct Arg {
-    name: String,
-    /// 0 = Signer, 1 = Const, 2 = Object, 3 = TypeArg.
-    kind: u8,
-    object_ty: Option<TypeTag>,
-    object_mode: Option<AccessMode>,
-}
-
-fn decode(bytes: &[u8]) -> Manifest {
-    let mut r = bytes;
-    let schema_version = read_u32_be(&mut r).unwrap();
-    let module_path = read_string(&mut r).unwrap();
-    // semver (3 x u16)
-    let _ = read_u16_be(&mut r).unwrap();
-    let _ = read_u16_be(&mut r).unwrap();
-    let _ = read_u16_be(&mut r).unwrap();
-    // parent_version Option<[u8;32]>
-    let pv = read_u8(&mut r).unwrap();
-    if pv == 1 {
-        let _ = read_bytes32(&mut r).unwrap();
-    }
-
-    let object_types = decode_list(&mut r, decode_object_type);
-    let capability_types = decode_list(&mut r, decode_capability);
-    let functions = decode_list(&mut r, |r| decode_function(r, schema_version));
-
-    Manifest {
-        module_path,
-        object_types,
-        capability_types,
-        functions,
-    }
-}
-
-fn decode_list<T>(r: &mut &[u8], mut f: impl FnMut(&mut &[u8]) -> T) -> Vec<T> {
-    let n = read_u32_be(r).unwrap() as usize;
-    (0..n).map(|_| f(r)).collect()
-}
-
-fn decode_type_param(r: &mut &[u8]) -> TypeParam {
-    let name = read_string(r).unwrap();
-    let kind = read_u8(r).unwrap();
-    // bounds: list of TypeTag (each consumes self-delimited bytes)
-    let n = read_u32_be(r).unwrap() as usize;
-    for _ in 0..n {
-        let _ = TypeTag::decode_from(r, 0).unwrap();
-    }
-    TypeParam { name, kind }
-}
-
-fn decode_field(r: &mut &[u8]) {
-    let _name = read_string(r).unwrap();
-    let _ty = TypeTag::decode_from(r, 0).unwrap();
-}
-
-fn decode_object_type(r: &mut &[u8]) -> ObjectType {
-    let name = read_string(r).unwrap();
-    let abilities = read_u8(r).unwrap();
-    let type_params = decode_list(r, decode_type_param);
-    let _fields = decode_list(r, decode_field);
-    ObjectType {
-        name,
-        abilities,
-        type_params,
-    }
-}
-
-fn decode_capability(r: &mut &[u8]) -> Capability {
-    let name = read_string(r).unwrap();
-    let type_params = decode_list(r, decode_type_param);
-    Capability { name, type_params }
-}
-
-fn decode_arg(r: &mut &[u8]) -> Arg {
-    let name = read_string(r).unwrap();
-    let kind = read_u8(r).unwrap();
-    let mut object_ty = None;
-    let mut object_mode = None;
-    match kind {
-        0 => {} // Signer
-        1 => {
-            // Const(ty)
-            let _ = TypeTag::decode_from(r, 0).unwrap();
-        }
-        2 => {
-            // Object { ty, mode }
-            object_ty = Some(TypeTag::decode_from(r, 0).unwrap());
-            object_mode = Some(AccessMode::from_byte(read_u8(r).unwrap()).unwrap());
-        }
-        3 => {
-            // TypeArg(u16)
-            let _ = read_u16_be(r).unwrap();
-        }
-        other => panic!("unknown ArgKind discriminant {other}"),
-    }
-    Arg {
-        name,
-        kind,
-        object_ty,
-        object_mode,
-    }
-}
-
-fn decode_function(r: &mut &[u8], schema_version: u32) -> Function {
-    let name = read_string(r).unwrap();
-    let _type_params = decode_list(r, decode_type_param);
-    let args = decode_list(r, decode_arg);
-    let _returns = decode_list(r, |r| {
-        TypeTag::decode_from(r, 0).unwrap();
-    });
-    let required_signers = read_u8(r).unwrap();
-    let required_capabilities = decode_list(r, |r| TypeTag::decode_from(r, 0).unwrap());
-    // attached_invariants
-    let n = read_u32_be(r).unwrap() as usize;
-    for _ in 0..n {
-        let _ = read_u16_be(r).unwrap();
-    }
-    if schema_version >= 2 {
-        let _view = read_u8(r).unwrap();
-    }
-    Function {
-        name,
-        args,
-        required_signers,
-        required_capabilities,
-    }
+fn decode(bytes: &[u8]) -> PetalManifestV0 {
+    bloom_petal_manifest::codec::decode(bytes).unwrap()
 }
 
 // ===========================================================================
@@ -210,16 +40,18 @@ fn manifest_exposes_cap_object_type() {
         .iter()
         .find(|o| o.name == "Cap")
         .expect("manifest must declare `Cap` as an #[object]");
-    // abilities = key | store -> 0b0011 = 3 (per `AbilitySet::from_str_list`).
-    assert_ne!(cap_obj.abilities & 0b01, 0, "Cap must have `key` ability");
-    assert_ne!(cap_obj.abilities & 0b10, 0, "Cap must have `store` ability");
+    assert!(cap_obj.abilities.has_key(), "Cap must have `key` ability");
+    assert!(
+        cap_obj.abilities.has_store(),
+        "Cap must have `store` ability"
+    );
     // The single generic `T` is declared as phantom.
     let t = cap_obj
         .type_params
         .iter()
         .find(|p| p.name == "T")
         .expect("Cap must have a `T` generic param");
-    assert_eq!(t.kind, 0, "`T` must be phantom (kind = 0)");
+    assert_eq!(t.kind, TypeParamKind::Phantom, "`T` must be phantom");
 }
 
 #[test]
@@ -236,7 +68,7 @@ fn manifest_exposes_revoke_cap_capability() {
         .iter()
         .find(|p| p.name == "T")
         .expect("RevokeCap must have a `T` generic param");
-    assert_eq!(t.kind, 0, "`T` must be phantom (kind = 0)");
+    assert_eq!(t.kind, TypeParamKind::Phantom, "`T` must be phantom");
 }
 
 #[test]
@@ -279,7 +111,7 @@ fn manifest_records_required_signer_on_new() {
         "new<T>(_signer: &Signer, ...) must declare 1 required signer"
     );
     assert!(
-        matches!(new_fn.args.first(), Some(a) if a.kind == 0),
+        matches!(new_fn.args.first(), Some(a) if matches!(a.kind, ArgKind::Signer)),
         "first arg of `new` must be the Signer"
     );
 }
@@ -294,12 +126,14 @@ fn manifest_records_mutable_borrow_on_lock() {
         .find(|f| f.name == "lock")
         .expect("manifest must declare `lock` fn");
     let arg = &f.args[0];
-    assert_eq!(arg.kind, 2, "first arg of `lock` must be an Object arg");
-    assert_eq!(
-        arg.object_mode,
-        Some(AccessMode::Mutable),
-        "first arg of `lock` must be borrowed Mutable"
-    );
+    match &arg.kind {
+        ArgKind::Object { mode, .. } => assert_eq!(
+            *mode,
+            AccessMode::Mutable,
+            "first arg of `lock` must be borrowed Mutable"
+        ),
+        other => panic!("first arg of `lock` must be an Object arg, got {other:?}"),
+    }
 }
 
 #[test]

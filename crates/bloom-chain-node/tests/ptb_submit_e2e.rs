@@ -30,7 +30,18 @@ use bloom_chain_node::petal_executor::{ChainPetalExecutor, ChainPetalExecutorWit
 use bloom_chain_state::State;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
-use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey, TypeTag};
+use bloom_objects::{
+    AbilitySet, BUILTIN_TYPE_HASH, OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey,
+    TypeTag,
+};
+use bloom_petal_fungible::ops::coin_payload;
+use bloom_petal_manifest::{
+    codec,
+    types::{
+        FieldDecl, FunctionDecl, MANIFEST_CUSTOM_SECTION, ObjectTypeDecl, PetalManifestV0,
+        SCHEMA_VERSION, SemVer,
+    },
+};
 use bloom_script::{
     CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH,
     chain_iface::{ArgDeclStub, FunctionDeclStub, PetalManifestStub},
@@ -58,6 +69,39 @@ fn submit_ptb_tx(sender: Address, ptb_bytes: Vec<u8>) -> Tx {
 /// does not look the account up before dispatching to the PTB path.
 fn test_sender() -> Address {
     Address([0x11u8; 32])
+}
+
+fn leb128(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(b);
+            return;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+fn append_manifest(mut wasm: Vec<u8>, manifest: PetalManifestV0) -> Vec<u8> {
+    let bytes = codec::encode(&manifest).expect("manifest encodes");
+    let mut custom = Vec::new();
+    leb128(&mut custom, MANIFEST_CUSTOM_SECTION.len() as u64);
+    custom.extend_from_slice(MANIFEST_CUSTOM_SECTION.as_bytes());
+    custom.extend_from_slice(&bytes);
+
+    wasm.push(0);
+    leb128(&mut wasm, custom.len() as u64);
+    wasm.extend_from_slice(&custom);
+    wasm
+}
+
+fn builtin_type(name: &str) -> TypeTag {
+    TypeTag::Concrete {
+        petal_hash: BUILTIN_TYPE_HASH,
+        type_name: name.to_string(),
+        type_args: vec![],
+    }
 }
 
 /// Test 1: PTB bytes that do not decode (empty payload) MUST revert
@@ -204,15 +248,6 @@ fn missing_fungible_binding_rejects_submit_ptb_before_zero_hash_fallback() {
 /// because every fixture in this file is statically valid.
 fn wat(src: &str) -> Vec<u8> {
     wat::parse_str(src).expect("valid WAT")
-}
-
-/// Build the canonical `Coin<LOOM>` payload for a balance.
-///
-/// Canonical on-chain format: [ObjectId placeholder (32 bytes)] || [value BE (16 bytes)].
-fn coin_payload(value: u128) -> Vec<u8> {
-    let mut p = vec![0u8; 32];
-    p.extend_from_slice(&value.to_be_bytes());
-    p
 }
 
 /// Mint a `Coin<LOOM>` object at `id` owned by `owner`, holding
@@ -628,26 +663,32 @@ const CREATE_AND_TRANSFER_PETAL: &str = r#"
 "#;
 
 /// Compute the deterministic ObjectId the host's `derive_create_id`
-/// will produce for `(ptb_digest, petal_hash, type_tag_bytes,
-/// payload_bytes, created_objects_so_far=0)`. Mirrors `bloom-petals`
-/// exactly.
-fn derive_create_id_test(
-    ptb_digest: [u8; 32],
-    petal_hash: [u8; 32],
-    tag_bytes: &[u8],
-    payload: &[u8],
-) -> ObjectId {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"bloom.object.create.v1\0");
-    hasher.update(&ptb_digest);
-    hasher.update(&petal_hash);
-    hasher.update(&0u64.to_be_bytes()); // first object created in this PTB
-    hasher.update(tag_bytes);
-    hasher.update(payload);
-    let h = hasher.finalize();
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(h.as_bytes());
-    ObjectId(arr)
+/// will produce for `(ptb_digest, type_tag, payload_bytes,
+/// created_objects_so_far=0)`. Mirrors `bloom-petals` exactly.
+fn derive_create_id_test(ptb_digest: [u8; 32], type_tag: &TypeTag, payload: &[u8]) -> ObjectId {
+    ObjectId::derive_for_type_tag(&Hash32(ptb_digest), 0, type_tag, payload)
+}
+
+fn create_and_transfer_manifest() -> PetalManifestV0 {
+    PetalManifestV0 {
+        schema_version: SCHEMA_VERSION,
+        module_path: "/test/e2e".to_string(),
+        framework_version: SemVer::new(0, 1, 0),
+        object_types: vec![ObjectTypeDecl {
+            name: "T".to_string(),
+            abilities: AbilitySet::key_store(),
+            type_params: vec![],
+            fields: vec![FieldDecl {
+                name: "value".to_string(),
+                ty: builtin_type("u128"),
+            }],
+        }],
+        functions: vec![FunctionDecl {
+            name: "create_and_transfer".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -662,7 +703,10 @@ fn object_create_then_transfer_round_trips_through_unified_ctx() {
     // Build state + register the petal --------------------------------
     let mut state = State::new();
     bind_bootstrap_fungible(&mut state);
-    let wasm = wat(CREATE_AND_TRANSFER_PETAL);
+    let wasm = append_manifest(
+        wat(CREATE_AND_TRANSFER_PETAL),
+        create_and_transfer_manifest(),
+    );
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, 1_000_000_000));
 
@@ -755,12 +799,7 @@ fn object_create_then_transfer_round_trips_through_unified_ctx() {
     state.apply(ws).expect("apply write set");
 
     // Compute the deterministic ObjectId the host produced.
-    let new_id = derive_create_id_test(
-        ptb.signing_digest(),
-        petal_hash.0,
-        &tag_bytes,
-        &new_obj_payload,
-    );
+    let new_id = derive_create_id_test(ptb.signing_digest(), &new_obj_type, &new_obj_payload);
 
     // Assert 2 — the new object lives at the derived id with the right
     // owner. Before the P0-2 fix this lookup returned `None` because

@@ -16,6 +16,7 @@ bloom-resource-macros = { workspace = true }
 bloom-objects         = { workspace = true }
 bloom-dex-math        = { workspace = true }
 bloom-petal-dex-pool  = { workspace = true, features = ["no-entrypoint"] }
+bloom-petal-fungible  = { workspace = true, features = ["no-entrypoint"] }
 
 [features]
 default = []

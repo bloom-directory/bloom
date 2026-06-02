@@ -1551,14 +1551,9 @@ pub(crate) fn mint_coin_loom_to(
     if amount == 0 {
         return Ok(());
     }
-    let new_coin_id = {
-        let mut h = blake3::Hasher::new();
-        h.update(domain);
-        h.update(&seed_hash.0);
-        h.update(&to.0);
-        h.update(&amount.to_be_bytes());
-        ObjectId(*h.finalize().as_bytes())
-    };
+    let payload = coin_payload(amount);
+    let creation_seed = loom_mint_creation_seed(domain, seed_hash, to, amount);
+    let new_coin_id = ObjectId::derive_for_type_tag(&creation_seed, 0, &coin_type, &payload);
 
     if snap.get_object(&new_coin_id).is_some() {
         return Err(format!(
@@ -1572,7 +1567,7 @@ pub(crate) fn mint_coin_loom_to(
         type_tag: coin_type,
         owner: Owner::Address(to.0),
         version: 0,
-        payload: coin_payload(amount),
+        payload,
     };
     snap.insert_object(new_coin);
 
@@ -1585,6 +1580,17 @@ pub(crate) fn mint_coin_loom_to(
     to_owned.insert(pos, new_coin_id);
     snap.set_ownership(to_okey, to_owned);
     Ok(())
+}
+
+fn loom_mint_creation_seed(domain: &[u8], seed_hash: &Hash32, to: Address, amount: u128) -> Hash32 {
+    let mut h = blake3::Hasher::new();
+    h.update(b"bloom.loom.mint.seed");
+    h.update(&(domain.len() as u64).to_le_bytes());
+    h.update(domain);
+    h.update(&seed_hash.0);
+    h.update(&to.0);
+    h.update(&amount.to_be_bytes());
+    Hash32(*h.finalize().as_bytes())
 }
 
 #[cfg(test)]

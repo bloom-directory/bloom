@@ -16,6 +16,10 @@ bloom-resource = { workspace = true }
 bloom-resource-macros = { workspace = true }
 bloom-objects = { workspace = true }
 
+[dev-dependencies]
+bloom-value = { workspace = true }
+bloom-petal-manifest = { workspace = true }
+
 [features]
 default = []
 # Solana/Anchor-style flag: when consumers depend on this petal as a

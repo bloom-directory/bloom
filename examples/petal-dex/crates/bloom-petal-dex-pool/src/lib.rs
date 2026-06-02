@@ -19,8 +19,8 @@
 //! parameter of the struct, it can't be wrapped as `Resource<S::Params>`.
 //!
 //! We therefore use **workaround (1)**: the params are serialized to
-//! `Vec<u8>` (length-prefixed, using `bloom_resource::abi::RetWriter`)
-//! and stored in `params_bytes: Vec<u8>`. Strategies must implement
+//! `Vec<u8>` (canonical `vector<u8>` bytes) and stored in
+//! `params_bytes: Vec<u8>`. Strategies must implement
 //! [`ParamCodec`] (two tiny functions) so the pool can encode on `create`
 //! and decode on every operation. `ConstantProductParams` (30 bps,
 //! 2-byte big-endian) is the reference impl.
@@ -71,7 +71,7 @@ impl ParamCodec for bloom_dex_math::ConstantProductParams {
 /// Payload codec helpers used by both `ops` and the unit tests.
 pub mod payload {
     use bloom_objects::{ObjectId, TypeTag};
-    use bloom_resource::abi::{ArgReader, RetWriter};
+    use bloom_resource::{BloomType, UID};
 
     // Layout of `Pool<A, B, S>` payload written to the chain:
     //   [ id          : 32 bytes ]   ← ObjectId placeholder (host fills on create)
@@ -79,7 +79,7 @@ pub mod payload {
     //   [ reserve_b   : 16 bytes BE ]
     //   [ lp_supply   : 16 bytes BE ]
     //   [ k_last      : 16 bytes BE ]
-    //   [ params_bytes: 4 BE len + raw ]
+    //   [ params_bytes: ULEB128 count + raw u8 elements ]
     //   [ coin_a_tag  : canonical TypeTag ]
     //   [ coin_b_tag  : canonical TypeTag ]
     //   total: 84 + len(params) + len(tags) bytes
@@ -100,18 +100,17 @@ pub mod payload {
         coin_a_tag: &TypeTag,
         coin_b_tag: &TypeTag,
     ) -> Vec<u8> {
-        let mut w = RetWriter::with_capacity(84 + params_bytes.len() + 64);
-        w.write_object_id(id);
-        w.write_u128(reserve_a);
-        w.write_u128(reserve_b);
-        w.write_u128(lp_supply);
-        w.write_u128(k_last);
-        w.write_bytes(params_bytes);
-        w.write_type_tag(coin_a_tag)
-            .expect("coin_a TypeTag must encode");
-        w.write_type_tag(coin_b_tag)
-            .expect("coin_b TypeTag must encode");
-        w.finish()
+        crate::pool::Pool {
+            id: UID::from_object_id(*id),
+            reserve_a,
+            reserve_b,
+            lp_supply,
+            k_last,
+            params_bytes: params_bytes.to_vec(),
+            coin_a_tag: coin_a_tag.clone(),
+            coin_b_tag: coin_b_tag.clone(),
+        }
+        .canonical_encode()
     }
 
     /// Decode fields from a `Pool` payload slice.
@@ -119,17 +118,15 @@ pub mod payload {
     /// Returns `(reserve_a, reserve_b, lp_supply, k_last, params_bytes, coin_a_tag, coin_b_tag)` or
     /// `None` if the buffer is too short / malformed.
     pub fn decode_pool(bytes: &[u8]) -> Option<DecodedPool> {
-        let mut r = ArgReader::new(bytes);
-        r.read_object_id().ok()?; // skip id
-        let reserve_a = r.read_u128().ok()?;
-        let reserve_b = r.read_u128().ok()?;
-        let lp_supply = r.read_u128().ok()?;
-        let k_last = r.read_u128().ok()?;
-        let params = r.read_bytes().ok()?;
-        let coin_a_tag = r.read_type_tag().ok()?;
-        let coin_b_tag = r.read_type_tag().ok()?;
+        let pool = crate::pool::Pool::canonical_decode(bytes).ok()?;
         Some((
-            reserve_a, reserve_b, lp_supply, k_last, params, coin_a_tag, coin_b_tag,
+            pool.reserve_a,
+            pool.reserve_b,
+            pool.lp_supply,
+            pool.k_last,
+            pool.params_bytes,
+            pool.coin_a_tag,
+            pool.coin_b_tag,
         ))
     }
 
@@ -141,22 +138,20 @@ pub mod payload {
 
     /// Encode an `LpPosition` payload.
     pub fn lp_payload(id: &ObjectId, pool_id: &ObjectId, shares: u128) -> Vec<u8> {
-        let mut w = RetWriter::with_capacity(80);
-        w.write_object_id(id);
-        w.write_object_id(pool_id);
-        w.write_u128(shares);
-        w.finish()
+        crate::pool::LpPosition {
+            id: UID::from_object_id(*id),
+            pool_id: *pool_id,
+            shares,
+        }
+        .canonical_encode()
     }
 
     /// Decode fields from an `LpPosition` payload slice.
     ///
     /// Returns `(pool_id, shares)` or `None` on malformed input.
     pub fn decode_lp(bytes: &[u8]) -> Option<(ObjectId, u128)> {
-        let mut r = ArgReader::new(bytes);
-        r.read_object_id().ok()?; // skip own id
-        let pool_id = r.read_object_id().ok()?;
-        let shares = r.read_u128().ok()?;
-        Some((pool_id, shares))
+        let lp = crate::pool::LpPosition::canonical_decode(bytes).ok()?;
+        Some((lp.pool_id, lp.shares))
     }
 }
 
@@ -237,7 +232,7 @@ pub mod ops {
     use bloom_dex_math::SwapStrategy;
     use bloom_objects::{ObjectId, TypeTag};
     use bloom_resource::host;
-    use bloom_resource::{PetalError, RuntimeHandle, abi::RetWriter};
+    use bloom_resource::{PetalError, RuntimeHandle};
 
     use crate::{ParamCodec, PoolError, payload, tags};
 
@@ -427,7 +422,7 @@ pub mod ops {
         let leftover_a = if taken_a < value_a {
             let leftover_amount = value_a - taken_a;
             host::object_delete(coin_a_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
-            let leftover_payload = coin_payload(&ObjectId([0u8; 32]), leftover_amount);
+            let leftover_payload = coin_payload(leftover_amount);
             Some(
                 host::object_create(&tags::coin_tag(stored_a_tag.clone()), &leftover_payload)
                     .map_err(|_| PoolError::InsufficientLiquidity)?,
@@ -440,7 +435,7 @@ pub mod ops {
         let leftover_b = if taken_b < value_b {
             let leftover_amount = value_b - taken_b;
             host::object_delete(coin_b_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
-            let leftover_payload = coin_payload(&ObjectId([0u8; 32]), leftover_amount);
+            let leftover_payload = coin_payload(leftover_amount);
             Some(
                 host::object_create(&tags::coin_tag(stored_b_tag.clone()), &leftover_payload)
                     .map_err(|_| PoolError::InsufficientLiquidity)?,
@@ -514,12 +509,12 @@ pub mod ops {
         // Mint the two output coins.
         let coin_a_handle = host::object_create(
             &tags::coin_tag(stored_a_tag.clone()),
-            &coin_payload(&ObjectId([0u8; 32]), amount_a),
+            &coin_payload(amount_a),
         )
         .map_err(|_| PoolError::InsufficientLiquidity)?;
         let coin_b_handle = host::object_create(
             &tags::coin_tag(stored_b_tag.clone()),
-            &coin_payload(&ObjectId([0u8; 32]), amount_b),
+            &coin_payload(amount_b),
         )
         .map_err(|_| PoolError::InsufficientLiquidity)?;
 
@@ -585,7 +580,7 @@ pub mod ops {
         // Mint coin_out.
         let coin_b_handle = host::object_create(
             &tags::coin_tag(stored_b_tag.clone()),
-            &coin_payload(&ObjectId([0u8; 32]), amount_out),
+            &coin_payload(amount_out),
         )
         .map_err(|_| PoolError::InsufficientLiquidity)?;
 
@@ -652,7 +647,7 @@ pub mod ops {
         // Mint coin_a_out.
         let coin_a_handle = host::object_create(
             &tags::coin_tag(stored_a_tag.clone()),
-            &coin_payload(&ObjectId([0u8; 32]), amount_out),
+            &coin_payload(amount_out),
         )
         .map_err(|_| PoolError::InsufficientLiquidity)?;
 
@@ -726,7 +721,7 @@ pub mod ops {
         // Mint output coin.
         let coin_b_handle = host::object_create(
             &tags::coin_tag(stored_b_tag.clone()),
-            &coin_payload(&ObjectId([0u8; 32]), amount_out),
+            &coin_payload(amount_out),
         )
         .map_err(|_| PoolError::InsufficientLiquidity)?;
 
@@ -734,7 +729,7 @@ pub mod ops {
         let leftover = if exact_in < max_in_value {
             let leftover_amount = max_in_value - exact_in;
             host::object_delete(max_in_handle).map_err(|_| PoolError::InsufficientLiquidity)?;
-            let leftover_payload = coin_payload(&ObjectId([0u8; 32]), leftover_amount);
+            let leftover_payload = coin_payload(leftover_amount);
             Some(
                 host::object_create(&tags::coin_tag(stored_a_tag.clone()), &leftover_payload)
                     .map_err(|_| PoolError::InsufficientLiquidity)?,
@@ -758,22 +753,15 @@ pub mod ops {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    /// Decode the `u128` value field (bytes 32..48) of a `Coin<T>` payload.
+    /// Decode the `u128` value field of a `Coin<T>` payload.
     fn decode_coin_value(bytes: &[u8]) -> Result<u128, PoolError> {
-        if bytes.len() < 48 {
-            return Err(PoolError::InsufficientLiquidity);
-        }
-        let mut buf = [0u8; 16];
-        buf.copy_from_slice(&bytes[32..48]);
-        Ok(u128::from_be_bytes(buf))
+        bloom_petal_fungible::ops::decode_coin_value(bytes)
+            .map_err(|_| PoolError::InsufficientLiquidity)
     }
 
-    /// Coin payload: 32-byte id placeholder + 16-byte u128 value.
-    fn coin_payload(id: &ObjectId, value: u128) -> Vec<u8> {
-        let mut w = RetWriter::with_capacity(48);
-        w.write_object_id(id);
-        w.write_u128(value);
-        w.finish()
+    /// Coin payload: 16-byte u128 value.
+    fn coin_payload(value: u128) -> Vec<u8> {
+        bloom_petal_fungible::ops::coin_payload(value)
     }
 
     fn pool_id_from_payload(bytes: &[u8]) -> Option<ObjectId> {
@@ -915,7 +903,8 @@ pub mod pool {
     /// ## Field layout in the canonical payload
     ///
     /// `id (32) | reserve_a (16) | reserve_b (16) | lp_supply (16) |
-    ///  k_last (16) | params_bytes (4-len + raw) | coin_a_tag | coin_b_tag`
+    ///  k_last (16) | params_bytes (ULEB128 count + raw u8 elements) |
+    ///  coin_a_tag | coin_b_tag`
     ///
     /// `reserve_a` and `reserve_b` are the raw u128 balances of the two
     /// token reserves stored as integers (not as `Coin` objects) because

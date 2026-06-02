@@ -21,7 +21,7 @@
 //! §6 litmus 5.1 / 5.2).
 //!
 //! NOTE: this is a *test/demo* faucet. Minting is gated by a
-//! `Capability<FaucetAdmin>` object held by the acceptance-test admin; it is
+//! `FaucetAdmin` capability object held by the acceptance-test admin; it is
 //! deployed only in example / acceptance contexts, never as protocol stdlib.
 
 #![deny(missing_docs)]
@@ -32,10 +32,9 @@ use bloom_resource_macros as bloom;
 /// `Result`-typed host-side variants, exposed for host-side unit tests and
 /// non-wasm callers (mirrors the `ops` pattern in the pool / wallet petals).
 pub mod ops {
-    use bloom_objects::{ObjectId, TypeTag};
-    use bloom_resource::abi::RetWriter;
+    use bloom_objects::TypeTag;
     use bloom_resource::host;
-    use bloom_resource::{PetalError, RuntimeHandle};
+    use bloom_resource::{BloomType, PetalError, RuntimeHandle, UID};
 
     /// Build a `Concrete` `TypeTag` with the self-petal sentinel hash
     /// (`[0u8; 32]`); the chain stamps the real petal hash on `object.create`.
@@ -54,25 +53,22 @@ pub mod ops {
         concrete("Coin", vec![concrete("Erased", vec![])])
     }
 
-    /// `TypeTag` for `Capability<FaucetAdmin>`, the runtime mint gate.
+    /// `TypeTag` for `FaucetAdmin`, the runtime mint gate.
     pub fn faucet_admin_cap_tag() -> TypeTag {
-        concrete("Capability", vec![concrete("FaucetAdmin", vec![])])
+        concrete("FaucetAdmin", vec![])
     }
 
-    /// `Capability<FaucetAdmin>` payload: the 32-byte id placeholder.
+    /// `FaucetAdmin` payload: the 32-byte id placeholder.
     pub fn cap_payload() -> Vec<u8> {
-        let mut w = RetWriter::with_capacity(32);
-        w.write_object_id(&ObjectId([0u8; 32]));
-        w.finish()
+        crate::faucet::FaucetAdmin {
+            id: UID::from_bytes([0u8; 32]),
+        }
+        .canonical_encode()
     }
 
-    /// `Coin<T>` payload: 32-byte id placeholder (host fills on create) + a
-    /// 16-byte big-endian `u128` value. Matches the pool's `coin_payload`.
+    /// `Coin<T>` payload: a 16-byte big-endian `u128` value.
     fn coin_payload(value: u128) -> Vec<u8> {
-        let mut w = RetWriter::with_capacity(48);
-        w.write_object_id(&ObjectId([0u8; 32]));
-        w.write_u128(value);
-        w.finish()
+        bloom_petal_fungible::ops::coin_payload(value)
     }
 
     /// Mint a fresh `Coin<Erased>` worth `value`, returning its handle.

@@ -57,6 +57,9 @@ pub enum AbiError {
     /// Underlying `TypeTag` codec rejected the bytes.
     #[error("type tag codec error: {0}")]
     TypeTagError(#[from] CodecError),
+    /// Shared value codec rejected canonical bytes.
+    #[error("value codec error: {0}")]
+    ValueCodec(String),
     /// A framed arg's tag byte did not match the variant the declared
     /// parameter expected (e.g. a `Signer` slot fed an `Object` arg).
     #[error("arg tag mismatch: expected {expected}, got {got}")]
@@ -340,6 +343,69 @@ impl RetWriter {
     /// `true` iff nothing has been written yet.
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
+    }
+}
+
+/// Cursor over a count-prefixed return-slot envelope produced by
+/// [`RetWriter`].
+#[derive(Debug)]
+pub struct RetReader<'a> {
+    inner: ArgReader<'a>,
+    count: u32,
+    consumed: u32,
+}
+
+impl<'a> RetReader<'a> {
+    /// Wrap a buffer and read the leading `u32` BE return count.
+    pub fn new(buf: &'a [u8]) -> Result<Self, AbiError> {
+        let mut inner = ArgReader::new(buf);
+        let count = inner.read_u32()?;
+        Ok(Self {
+            inner,
+            count,
+            consumed: 0,
+        })
+    }
+
+    /// The return-slot count declared by the leading prefix.
+    pub fn declared_count(&self) -> u32 {
+        self.count
+    }
+
+    /// Decode the next length-prefixed return slot.
+    pub fn next_bytes(&mut self, max_len: usize) -> Result<Vec<u8>, AbiError> {
+        if self.consumed >= self.count {
+            return Err(AbiError::UnexpectedEof {
+                needed: 1,
+                available: 0,
+            });
+        }
+        let bytes = self.inner.read_bytes()?;
+        if bytes.len() > max_len {
+            return Err(AbiError::ValueCodec(format!(
+                "return slot too large: {} > {}",
+                bytes.len(),
+                max_len
+            )));
+        }
+        self.consumed += 1;
+        Ok(bytes)
+    }
+
+    /// Assert that all declared slots and all bytes have been consumed.
+    pub fn expect_finished(&self) -> Result<(), AbiError> {
+        if self.consumed != self.count {
+            return Err(AbiError::UnexpectedEof {
+                needed: (self.count - self.consumed) as usize,
+                available: 0,
+            });
+        }
+        if self.inner.remaining() != 0 {
+            return Err(AbiError::TrailingBytes {
+                remaining: self.inner.remaining(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -708,6 +774,30 @@ mod tests {
         let mut w = RetWriter::new();
         w.write_bytes(b"abc");
         assert_eq!(w.finish(), vec![0, 0, 0, 3, b'a', b'b', b'c']);
+    }
+
+    #[test]
+    fn ret_reader_round_trips_slots() {
+        let mut w = RetWriter::new();
+        w.write_u32(2);
+        w.write_bytes(b"one");
+        w.write_bytes(b"two");
+        let buf = w.finish();
+        let mut r = RetReader::new(&buf).unwrap();
+        assert_eq!(r.declared_count(), 2);
+        assert_eq!(r.next_bytes(16).unwrap(), b"one");
+        assert_eq!(r.next_bytes(16).unwrap(), b"two");
+        r.expect_finished().unwrap();
+    }
+
+    #[test]
+    fn ret_reader_rejects_oversized_slot() {
+        let mut w = RetWriter::new();
+        w.write_u32(1);
+        w.write_bytes(b"toolong");
+        let buf = w.finish();
+        let mut r = RetReader::new(&buf).unwrap();
+        assert!(matches!(r.next_bytes(3), Err(AbiError::ValueCodec(_))));
     }
 
     #[test]
