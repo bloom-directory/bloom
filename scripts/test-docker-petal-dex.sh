@@ -260,15 +260,21 @@ prepare_host_acceptance_driver() {
         cargo test -p bloom-petal-dex-it --test docker_petal_dex --no-run)
 }
 
-append_core_fungible_petal() {
+upsert_core_fungible_petal() {
     local genesis_file="$1"
     local wasm_file="$BLOOM_DOCKER_PREBUILT_WASM_DIR/bloom_petal_fungible.wasm"
     [ -f "$wasm_file" ] || fail "missing core fungible wasm: $wasm_file"
-    {
-        printf '\n[[petals]]\npath = "%s"\nwasm_hex = "' "$CORE_FUNGIBLE_PATH"
-        od -An -tx1 -v "$wasm_file" | tr -d ' \n'
-        printf '"\n'
-    } >>"$genesis_file"
+    local wasm_hex
+    wasm_hex="$(od -An -tx1 -v "$wasm_file" | tr -d ' \n')"
+    CORE_FUNGIBLE_PATH="$CORE_FUNGIBLE_PATH" \
+        CORE_FUNGIBLE_WASM_HEX="$wasm_hex" \
+        perl -0pi -e '
+            my $path = quotemeta($ENV{CORE_FUNGIBLE_PATH});
+            my $block = "\n[[petals]]\npath = \"$ENV{CORE_FUNGIBLE_PATH}\"\nwasm_hex = \"$ENV{CORE_FUNGIBLE_WASM_HEX}\"\n";
+            if (!s/\n\[\[petals\]\]\npath = "$path"\nwasm_hex = "[^"]*"\n/$block/s) {
+                $_ .= $block;
+            }
+        ' "$genesis_file"
 }
 
 if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
@@ -307,10 +313,10 @@ if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
     derive_ptb_signer_registry
     prepare_host_acceptance_driver
 
-    # Append the canonical fungible petal plus the inner-PTB xDSA gas allocation
+    # Upsert the canonical fungible petal plus the inner-PTB xDSA gas allocation
     # and key-registry entry to ALL FOUR genesis.toml files. They MUST stay
     # byte-identical (same genesis hash) or consensus breaks.
-    log "appending core fungible petal and xDSA gas/custody allocations ($PTB_SIGNER_PK_HEX) to all 4 genesis.toml"
+    log "upserting core fungible petal and xDSA gas/custody allocations ($PTB_SIGNER_PK_HEX) to all 4 genesis.toml"
     alloc_block=""
     alloc_block+=$(printf '\n[[key_registry]]\naddress = "%s"\npubkey = "%s"\n' \
         "$PTB_SIGNER_PK_HEX" "$PTB_SIGNER_PUBKEY_B64")
@@ -321,7 +327,7 @@ if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
     for i in $(seq 0 $((BLOOM_VALIDATOR_COUNT - 1))); do
         g="$BLOOM_DOCKER_TMPDIR/home$i/chain/genesis.toml"
         [ -f "$g" ] || fail "missing genesis.toml: $g"
-        append_core_fungible_petal "$g"
+        upsert_core_fungible_petal "$g"
         printf '%s' "$alloc_block" >>"$g"
     done
     # Sanity: all four genesis files identical (same hash) post-edit.
