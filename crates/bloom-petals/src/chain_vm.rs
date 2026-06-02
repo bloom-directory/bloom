@@ -701,6 +701,35 @@ fn authorized_coin_defining_petal(
     authorized.then_some(fungible_hash)
 }
 
+fn stamp_self_type_refs(tag: TypeTag, self_hash: [u8; 32]) -> TypeTag {
+    match tag {
+        TypeTag::Concrete {
+            petal_hash,
+            type_name,
+            type_args,
+        } => TypeTag::Concrete {
+            petal_hash: if petal_hash == [0u8; 32] {
+                self_hash
+            } else {
+                petal_hash
+            },
+            type_name,
+            type_args: type_args
+                .into_iter()
+                .map(|arg| stamp_self_type_refs(arg, self_hash))
+                .collect(),
+        },
+        TypeTag::Generic { .. } | TypeTag::External { .. } => tag,
+    }
+}
+
+fn stamp_self_type_args(type_args: Vec<TypeTag>, self_hash: [u8; 32]) -> Vec<TypeTag> {
+    type_args
+        .into_iter()
+        .map(|arg| stamp_self_type_refs(arg, self_hash))
+        .collect()
+}
+
 /// Install the spec §16.2 host imports onto `linker`.
 ///
 /// Every import:
@@ -993,7 +1022,7 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                     TypeTag::Concrete {
                         petal_hash: stamped_petal_hash,
                         type_name,
-                        type_args,
+                        type_args: stamp_self_type_args(type_args, stamped_petal_hash),
                     }
                 }
                 _ => {
@@ -1584,8 +1613,10 @@ fn validate_object_payload(
             HostError::Invalid("object payload validation requires manifest".into()).as_wasm_code(),
         );
     };
-    let mut limits = CodecLimits::default();
-    limits.max_value_bytes = payload.len();
+    let limits = CodecLimits {
+        max_value_bytes: payload.len(),
+        ..CodecLimits::default()
+    };
     let resolver = ManifestResolver::with_self_hash(manifest, caller.data().petal_hash.0);
     validate_value_bytes(&resolver, tag, payload, &limits).map_err(|e| {
         HostError::Invalid(format!("object payload decode failed: {e}")).as_wasm_code()
@@ -3030,7 +3061,19 @@ mod ptb_host_import_tests {
         let guard = arc.lock().unwrap();
         assert_eq!(guard.created_objects.len(), 1);
         match &guard.created_objects[0].type_tag {
-            TypeTag::Concrete { petal_hash, .. } => assert_eq!(*petal_hash, computed_petal.0),
+            TypeTag::Concrete {
+                petal_hash,
+                type_args,
+                ..
+            } => {
+                assert_eq!(*petal_hash, computed_petal.0);
+                match &type_args[0] {
+                    TypeTag::Concrete { petal_hash, .. } => {
+                        assert_eq!(*petal_hash, computed_petal.0)
+                    }
+                    other => panic!("created Coin had non-concrete type arg: {other:?}"),
+                }
+            }
             other => panic!("created Coin had non-concrete type tag: {other:?}"),
         }
     }
@@ -3064,7 +3107,19 @@ mod ptb_host_import_tests {
         let guard = arc.lock().unwrap();
         assert_eq!(guard.created_objects.len(), 1);
         match &guard.created_objects[0].type_tag {
-            TypeTag::Concrete { petal_hash, .. } => assert_eq!(*petal_hash, fungible_petal.0),
+            TypeTag::Concrete {
+                petal_hash,
+                type_args,
+                ..
+            } => {
+                assert_eq!(*petal_hash, fungible_petal.0);
+                match &type_args[0] {
+                    TypeTag::Concrete { petal_hash, .. } => {
+                        assert_eq!(*petal_hash, fungible_petal.0)
+                    }
+                    other => panic!("created Coin had non-concrete type arg: {other:?}"),
+                }
+            }
             other => panic!("created Coin had non-concrete type tag: {other:?}"),
         }
     }

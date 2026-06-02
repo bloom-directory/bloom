@@ -1113,7 +1113,7 @@ fn type_tag_token(tag: &bloom_objects::TypeTag) -> String {
             type_args,
         } => {
             let mut out = type_name.clone();
-            if *petal_hash != [0u8; 32] {
+            if *petal_hash != [0u8; 32] && *petal_hash != bloom_objects::BUILTIN_TYPE_HASH {
                 out.push('@');
                 out.push_str(&hex::encode(petal_hash));
             }

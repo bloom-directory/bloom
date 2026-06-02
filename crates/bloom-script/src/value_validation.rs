@@ -45,12 +45,16 @@ fn validate_with_tag(
     tag: &TypeTag,
     bytes: &[u8],
 ) -> Result<(), String> {
+    let tag = normalize_declared_tag(tag);
+    if matches!(tag, TypeTag::External { .. }) {
+        return Ok(());
+    }
     let resolver = StubResolver::with_self_hash(manifest, self_hash);
     let limits = CodecLimits {
         max_value_bytes: bytes.len(),
         ..CodecLimits::default()
     };
-    validate_value_bytes(&resolver, tag, bytes, &limits).map_err(|e| e.to_string())
+    validate_value_bytes(&resolver, &tag, bytes, &limits).map_err(|e| e.to_string())
 }
 
 fn return_slot_tag(manifest: &PetalManifestStub, tag: &TypeTag) -> Option<TypeTag> {
@@ -103,6 +107,55 @@ fn builtin_tag(type_name: &str, type_args: Vec<TypeTag>) -> TypeTag {
     }
 }
 
+fn normalize_declared_tag(tag: &TypeTag) -> TypeTag {
+    match tag {
+        TypeTag::Concrete {
+            petal_hash,
+            type_name,
+            type_args,
+        } => {
+            let petal_hash = if *petal_hash == [0u8; 32] && is_builtin_type_name(type_name) {
+                BUILTIN_TYPE_HASH
+            } else {
+                *petal_hash
+            };
+            TypeTag::Concrete {
+                petal_hash,
+                type_name: type_name.clone(),
+                type_args: type_args.iter().map(normalize_declared_tag).collect(),
+            }
+        }
+        TypeTag::Generic { .. } | TypeTag::External { .. } => tag.clone(),
+    }
+}
+
+fn is_builtin_type_name(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "bool"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "Address"
+            | "address"
+            | "ObjectId"
+            | "Hash32"
+            | "UID"
+            | "TypeTag"
+            | "bytes"
+            | "String"
+            | "string"
+            | "vector"
+            | "set"
+            | "map"
+            | "tuple"
+            | "Option"
+            | "Result"
+    )
+}
+
 #[derive(Clone, Debug)]
 struct StubResolver<'a> {
     manifest: &'a PetalManifestStub,
@@ -151,14 +204,21 @@ impl<'a> StubResolver<'a> {
                 petal_hash,
                 type_name,
                 type_args,
-            } => Ok(TypeTag::Concrete {
-                petal_hash: *petal_hash,
-                type_name: type_name.clone(),
-                type_args: type_args
-                    .iter()
-                    .map(|arg| self.subst(arg, args))
-                    .collect::<Result<Vec<_>, _>>()?,
-            }),
+            } => {
+                let petal_hash = if *petal_hash == [0u8; 32] && is_builtin_type_name(type_name) {
+                    BUILTIN_TYPE_HASH
+                } else {
+                    *petal_hash
+                };
+                Ok(TypeTag::Concrete {
+                    petal_hash,
+                    type_name: type_name.clone(),
+                    type_args: type_args
+                        .iter()
+                        .map(|arg| self.subst(arg, args))
+                        .collect::<Result<Vec<_>, _>>()?,
+                })
+            }
         }
     }
 
@@ -306,5 +366,50 @@ impl Resolver for StubResolver<'_> {
         Err(ValueCodecError::UnresolvedType(
             bloom_value::type_tag_label(tag),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn zero_hash_tag(type_name: &str, type_args: Vec<TypeTag>) -> TypeTag {
+        TypeTag::Concrete {
+            petal_hash: [0u8; 32],
+            type_name: type_name.to_string(),
+            type_args,
+        }
+    }
+
+    #[test]
+    fn validates_legacy_zero_hash_builtin_const() {
+        let manifest = PetalManifestStub::default();
+        let tag = zero_hash_tag("u64", Vec::new());
+        assert!(validate_const_slot(&manifest, [0xAA; 32], &tag, &7u64.to_be_bytes()).is_ok());
+    }
+
+    #[test]
+    fn validates_nested_legacy_zero_hash_builtin_field() {
+        let manifest = PetalManifestStub {
+            data_types: vec![DataTypeDeclStub {
+                name: "Wrapper".to_string(),
+                fields: vec![FieldDeclStub {
+                    name: "value".to_string(),
+                    ty: zero_hash_tag("u64", Vec::new()),
+                }],
+                ..DataTypeDeclStub::default()
+            }],
+            ..PetalManifestStub::default()
+        };
+        let tag = zero_hash_tag("Wrapper", Vec::new());
+        assert!(validate_const_slot(&manifest, [0xAA; 32], &tag, &7u64.to_be_bytes()).is_ok());
+    }
+
+    #[test]
+    fn top_level_external_slots_remain_opaque() {
+        let manifest = PetalManifestStub::default();
+        let tag = TypeTag::External { ref_idx: 0 };
+        assert!(validate_const_slot(&manifest, [0xAA; 32], &tag, b"opaque").is_ok());
+        assert!(validate_return_slot(&manifest, [0xAA; 32], &tag, b"opaque").is_ok());
     }
 }

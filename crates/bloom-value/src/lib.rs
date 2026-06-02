@@ -1532,20 +1532,7 @@ fn is_zero_sized(
             .iter()
             .map(|f| is_zero_sized(resolver, &f.ty, limits, depth + 1))
             .try_fold(true, |acc, item| item.map(|x| acc && x)),
-        TypeShape::Enum(variants) => variants
-            .iter()
-            .map(|v| match &v.fields {
-                VariantFields::Unit => Ok(true),
-                VariantFields::Tuple(elems) => elems
-                    .iter()
-                    .map(|t| is_zero_sized(resolver, t, limits, depth + 1))
-                    .try_fold(true, |acc, item| item.map(|x| acc && x)),
-                VariantFields::Struct(fields) => fields
-                    .iter()
-                    .map(|f| is_zero_sized(resolver, &f.ty, limits, depth + 1))
-                    .try_fold(true, |acc, item| item.map(|x| acc && x)),
-            })
-            .try_fold(true, |acc, item| item.map(|x| acc && x)),
+        TypeShape::Enum(_) => Ok(false),
         _ => Ok(false),
     }
 }
@@ -1760,6 +1747,27 @@ mod tests {
         assert_eq!(
             decode_value(&BuiltinResolver, &tag, &[1], &CodecLimits::default()).unwrap_err(),
             ValueCodecError::ZeroSizedCollection
+        );
+    }
+
+    #[test]
+    fn non_empty_unit_enum_collection_is_not_zero_sized() {
+        let tag = vec_t(builtin_type("Option", vec![builtin_type("tuple", vec![])]));
+        let bytes = [2, 0, 0];
+        assert_eq!(
+            decode_value(&BuiltinResolver, &tag, &bytes, &CodecLimits::default()).unwrap(),
+            Value::Seq(vec![
+                Value::Enum {
+                    index: 0,
+                    name: "None".to_string(),
+                    fields: VariantValue::Unit,
+                },
+                Value::Enum {
+                    index: 0,
+                    name: "None".to_string(),
+                    fields: VariantValue::Unit,
+                },
+            ])
         );
     }
 

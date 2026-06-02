@@ -349,31 +349,31 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     // ── 4. canonical fungible mint ×2 → create_pool ───────────────────────
     eprintln!();
     eprintln!("[ptb-1] fungible.mint(10000)×2 -> create_pool(30bps) -> share Pool + LP to signer");
-    let pool_coin_a = mint_owned_coin(
-        client0,
-        &clients,
-        &home0,
+    let pool_coin_a = mint_owned_coin(MintOwnedCoin {
+        client: client0,
+        clients: &clients,
+        home: &home0,
         fungible_hash,
         mint_cap_id,
         mint_cap_version,
         supply_id,
-        &mut supply_version,
+        supply_version: &mut supply_version,
         gas_payer,
-        10_000,
-    )
+        value: 10_000,
+    })
     .await?;
-    let pool_coin_b = mint_owned_coin(
-        client0,
-        &clients,
-        &home0,
+    let pool_coin_b = mint_owned_coin(MintOwnedCoin {
+        client: client0,
+        clients: &clients,
+        home: &home0,
         fungible_hash,
         mint_cap_id,
         mint_cap_version,
         supply_id,
-        &mut supply_version,
+        supply_version: &mut supply_version,
         gas_payer,
-        10_000,
-    )
+        value: 10_000,
+    })
     .await?;
     let create_ptb = PtbTx {
         signers: vec![ptb_signer_pubkey()], // overwritten by sign_and_encode_ptb
@@ -485,31 +485,31 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
 
     // Create a second pool, then try to burn pool-A LP against pool-B. This
     // must revert without mutating either pool or the LP.
-    let pool_b_coin_a = mint_owned_coin(
-        client0,
-        &clients,
-        &home0,
+    let pool_b_coin_a = mint_owned_coin(MintOwnedCoin {
+        client: client0,
+        clients: &clients,
+        home: &home0,
         fungible_hash,
         mint_cap_id,
         mint_cap_version,
         supply_id,
-        &mut supply_version,
+        supply_version: &mut supply_version,
         gas_payer,
-        10_000,
-    )
+        value: 10_000,
+    })
     .await?;
-    let pool_b_coin_b = mint_owned_coin(
-        client0,
-        &clients,
-        &home0,
+    let pool_b_coin_b = mint_owned_coin(MintOwnedCoin {
+        client: client0,
+        clients: &clients,
+        home: &home0,
         fungible_hash,
         mint_cap_id,
         mint_cap_version,
         supply_id,
-        &mut supply_version,
+        supply_version: &mut supply_version,
         gas_payer,
-        10_000,
-    )
+        value: 10_000,
+    })
     .await?;
     let create_pool_b = PtbTx {
         signers: vec![ptb_signer_pubkey()],
@@ -674,31 +674,31 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     assert_same_object_fields(&pool_b_after_cross, &pool_b, "cross-pool pool B")?;
     assert_same_object_fields(&lp_a_after_cross, &lp_a_before_cross, "cross-pool LP A")?;
 
-    let add_lp_coin_a = mint_owned_coin(
-        client0,
-        &clients,
-        &home0,
+    let add_lp_coin_a = mint_owned_coin(MintOwnedCoin {
+        client: client0,
+        clients: &clients,
+        home: &home0,
         fungible_hash,
         mint_cap_id,
         mint_cap_version,
         supply_id,
-        &mut supply_version,
+        supply_version: &mut supply_version,
         gas_payer,
-        500,
-    )
+        value: 500,
+    })
     .await?;
-    let add_lp_coin_b = mint_owned_coin(
-        client0,
-        &clients,
-        &home0,
+    let add_lp_coin_b = mint_owned_coin(MintOwnedCoin {
+        client: client0,
+        clients: &clients,
+        home: &home0,
         fungible_hash,
         mint_cap_id,
         mint_cap_version,
         supply_id,
-        &mut supply_version,
+        supply_version: &mut supply_version,
         gas_payer,
-        500,
-    )
+        value: 500,
+    })
     .await?;
     let add_lp_ptb = PtbTx {
         signers: vec![ptb_signer_pubkey()],
@@ -1782,31 +1782,31 @@ async fn exercise_live_dex_partial_consume(input: LiveDexPartialConsume<'_>) -> 
     let mut pool_version = pool_version;
     let signer_hex = ptb_signer_pubkey_hex();
 
-    let add_a = mint_owned_coin(
+    let add_a = mint_owned_coin(MintOwnedCoin {
         client,
         clients,
-        home0,
+        home: home0,
         fungible_hash,
         mint_cap_id,
         mint_cap_version,
         supply_id,
         supply_version,
         gas_payer,
-        500,
-    )
+        value: 500,
+    })
     .await?;
-    let add_b = mint_owned_coin(
+    let add_b = mint_owned_coin(MintOwnedCoin {
         client,
         clients,
-        home0,
+        home: home0,
         fungible_hash,
         mint_cap_id,
         mint_cap_version,
         supply_id,
         supply_version,
         gas_payer,
-        500,
-    )
+        value: 500,
+    })
     .await?;
     let add_a_id = obj_id_from_hex(&add_a)?;
     let add_b_id = obj_id_from_hex(&add_b)?;
@@ -4026,18 +4026,32 @@ async fn owned_coin_ids(
         .collect())
 }
 
-async fn mint_owned_coin(
-    client: &RpcClient,
-    clients: &[RpcClient],
-    home: &Path,
+struct MintOwnedCoin<'a> {
+    client: &'a RpcClient,
+    clients: &'a [RpcClient],
+    home: &'a Path,
     fungible_hash: Hash32,
     mint_cap_id: bloom_objects::ObjectId,
     mint_cap_version: u64,
     supply_id: bloom_objects::ObjectId,
-    supply_version: &mut u64,
+    supply_version: &'a mut u64,
     gas_payer: bloom_objects::ObjectId,
     value: u128,
-) -> Result<Value> {
+}
+
+async fn mint_owned_coin(input: MintOwnedCoin<'_>) -> Result<Value> {
+    let MintOwnedCoin {
+        client,
+        clients,
+        home,
+        fungible_hash,
+        mint_cap_id,
+        mint_cap_version,
+        supply_id,
+        supply_version,
+        gas_payer,
+        value,
+    } = input;
     let owner_hex = ptb_signer_pubkey_hex();
     let before_ids = owned_coin_ids(client, &owner_hex).await?;
     let ptb = PtbTx {

@@ -48,7 +48,7 @@ pub trait BloomType: Sized {
     /// Canonical-decode one value from the front of `buf`, advancing
     /// the cursor by exactly the bytes consumed.
     fn canonical_decode_from(buf: &mut &[u8]) -> Result<Self, AbiError> {
-        let value = Self::canonical_decode(*buf)?;
+        let value = Self::canonical_decode(buf)?;
         *buf = &[];
         Ok(value)
     }

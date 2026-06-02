@@ -38,13 +38,16 @@ use bloom_petal_fungible::ops::coin_payload;
 use bloom_petal_manifest::{
     codec,
     types::{
-        FieldDecl, FunctionDecl, MANIFEST_CUSTOM_SECTION, ObjectTypeDecl, PetalManifestV0,
-        SCHEMA_VERSION, SemVer,
+        ArgDecl, ArgKind, DataTypeDecl, FieldDecl, FunctionDecl, MANIFEST_CUSTOM_SECTION,
+        ObjectTypeDecl, PetalManifestV0, SCHEMA_VERSION, SemVer,
     },
 };
 use bloom_script::{
     CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH,
-    chain_iface::{ArgDeclStub, FunctionDeclStub, PetalManifestStub},
+    chain_iface::{
+        ArgDeclStub, DataTypeDeclStub, FieldDeclStub, FunctionDeclStub, ObjectTypeDeclStub,
+        PetalManifestStub,
+    },
     encode_ptb, loom_coin_type_tag,
     types::{Arg, Command, MoveCmd, PetalRef, PqSignature, PtbTx},
 };
@@ -613,18 +616,17 @@ fn out_of_fuel_reverts_atomically() {
 // ---------------------------------------------------------------------------
 
 /// WAT petal that:
-///   1. Reads a 90-byte `Const` blob from calldata starting at byte 9
-///      (the marshalled layout is `[u32 count=1][u8 tag=1][u32 len=90]
-///      [90 bytes]`).
-///   2. The 90-byte blob holds: `[u16 BE type_tag_len=38][38 type_tag
-///      bytes][u16 BE payload_len=16][16 payload bytes][32 recipient
-///      bytes]`. We pass the type tag dynamically because it embeds
-///      the petal's content hash, which is only known after the petal
-///      is published.
-///   3. Calls `object.create(type_tag_ptr=2, type_tag_len=38,
-///      payload_ptr=42, payload_len=16)` → handle.
+///   1. Reads an 86-byte canonical `CreateAndTransfer` const from calldata
+///      starting at byte 9 (the marshalled layout is `[u32 count=1][u8 tag=1]
+///      [u32 len=86][86 bytes]`).
+///   2. The canonical struct holds: `[38 type_tag bytes][16 u128 value bytes]
+///      [32 recipient bytes]`. We pass the type tag dynamically because it
+///      embeds the petal's content hash, which is only known after the petal is
+///      published.
+///   3. Calls `object.create(type_tag_ptr=0, type_tag_len=38,
+///      payload_ptr=38, payload_len=16)` → handle.
 ///   4. Calls `object.transfer(handle, OWNER_KIND_ADDRESS=0,
-///      recipient_ptr=58, 32)`.
+///      recipient_ptr=54, 32)`.
 const CREATE_AND_TRANSFER_PETAL: &str = r#"
 (module
   (import "chain"  "msg.calldata.read"
@@ -636,26 +638,26 @@ const CREATE_AND_TRANSFER_PETAL: &str = r#"
   (memory (export "memory") 1)
 
   (func (export "__petal_create_and_transfer") (param i32 i32) (result i32)
-    ;; Pull the 90-byte Const payload out of calldata into memory[0..90].
+    ;; Pull the 86-byte Const payload out of calldata into memory[0..86].
     ;; Const payload starts at calldata offset 9
     ;; (4-byte count u32 BE | 1-byte tag=1 | 4-byte len u32 BE).
     (drop (call $cdread
             (i32.const 0)   ;; dst_ptr
             (i32.const 9)   ;; offset
-            (i32.const 90))) ;; len
+            (i32.const 86))) ;; len
 
-    ;; object.create(type_tag_ptr=2, type_tag_len=38,
-    ;;               payload_ptr=42, payload_len=16) -> handle
-    ;; (mem layout: [u16 BE tag_len][38 tag][u16 BE pay_len][16 pay][32 recip])
-    ;;                 0..2          2..40    40..42         42..58   58..90
+    ;; object.create(type_tag_ptr=0, type_tag_len=38,
+    ;;               payload_ptr=38, payload_len=16) -> handle
+    ;; (mem layout: [38 tag][16 value][32 recipient])
+    ;;                 0..38  38..54    54..86
     (drop (call $otransfer
             (call $ocreate
-                  (i32.const 2)
+                  (i32.const 0)
                   (i32.const 38)
-                  (i32.const 42)
+                  (i32.const 38)
                   (i32.const 16))
             (i32.const 0)   ;; OWNER_KIND_ADDRESS
-            (i32.const 58)  ;; recipient_ptr
+            (i32.const 54)  ;; recipient_ptr
             (i32.const 32))) ;; recipient_len
 
     i32.const 0)
@@ -670,6 +672,11 @@ fn derive_create_id_test(ptb_digest: [u8; 32], type_tag: &TypeTag, payload: &[u8
 }
 
 fn create_and_transfer_manifest() -> PetalManifestV0 {
+    let input_type = TypeTag::Concrete {
+        petal_hash: [0u8; 32],
+        type_name: "CreateAndTransfer".to_string(),
+        type_args: vec![],
+    };
     PetalManifestV0 {
         schema_version: SCHEMA_VERSION,
         module_path: "/test/e2e".to_string(),
@@ -683,8 +690,30 @@ fn create_and_transfer_manifest() -> PetalManifestV0 {
                 ty: builtin_type("u128"),
             }],
         }],
+        data_types: vec![DataTypeDecl {
+            name: "CreateAndTransfer".to_string(),
+            type_params: vec![],
+            fields: vec![
+                FieldDecl {
+                    name: "tag".to_string(),
+                    ty: builtin_type("TypeTag"),
+                },
+                FieldDecl {
+                    name: "value".to_string(),
+                    ty: builtin_type("u128"),
+                },
+                FieldDecl {
+                    name: "recipient".to_string(),
+                    ty: builtin_type("Address"),
+                },
+            ],
+        }],
         functions: vec![FunctionDecl {
             name: "create_and_transfer".to_string(),
+            args: vec![ArgDecl {
+                name: "input".to_string(),
+                kind: ArgKind::Const(input_type),
+            }],
             ..Default::default()
         }],
         ..Default::default()
@@ -717,6 +746,11 @@ fn object_create_then_transfer_round_trips_through_unified_ctx() {
         type_name: new_obj_type_name.to_string(),
         type_args: vec![],
     };
+    let input_type = TypeTag::Concrete {
+        petal_hash: petal_hash.0,
+        type_name: "CreateAndTransfer".to_string(),
+        type_args: vec![],
+    };
     let tag_bytes = new_obj_type.encode_canonical().expect("encode type tag");
     assert_eq!(
         tag_bytes.len(),
@@ -724,28 +758,53 @@ fn object_create_then_transfer_round_trips_through_unified_ctx() {
         "type tag size assumption for 1-char name + 0 type args",
     );
 
-    // Assemble the 90-byte calldata blob -------------------------------
-    //   [u16 BE tag_len=38][38 tag][u16 BE pay_len=16][16 pay][32 recip]
-    let mut blob = Vec::with_capacity(90);
-    blob.extend_from_slice(&(tag_bytes.len() as u16).to_be_bytes());
+    // Assemble the 86-byte canonical CreateAndTransfer payload ---------
+    //   [38 tag][16 u128 value][32 recipient]
+    let mut blob = Vec::with_capacity(86);
     blob.extend_from_slice(&tag_bytes);
-    blob.extend_from_slice(&(new_obj_payload.len() as u16).to_be_bytes());
     blob.extend_from_slice(&new_obj_payload);
     blob.extend_from_slice(&recipient);
-    assert_eq!(blob.len(), 90);
+    assert_eq!(blob.len(), 86);
 
-    // Build a manifest declaring one `Const` arg of arbitrary type --
-    // the validator only checks variant-shape, not the inner TypeTag.
+    // Build a manifest declaring the same canonical input struct that the wasm
+    // manifest exposes.
     let mut manifests = HashMap::new();
     manifests.insert(
         petal_hash,
         PetalManifestStub {
             module_path: "/test/e2e".to_string(),
+            object_types: vec![ObjectTypeDeclStub {
+                name: new_obj_type_name.to_string(),
+                abilities: AbilitySet::key_store(),
+                fields: vec![FieldDeclStub {
+                    name: "value".to_string(),
+                    ty: builtin_type("u128"),
+                }],
+                ..ObjectTypeDeclStub::default()
+            }],
+            data_types: vec![DataTypeDeclStub {
+                name: "CreateAndTransfer".to_string(),
+                fields: vec![
+                    FieldDeclStub {
+                        name: "tag".to_string(),
+                        ty: builtin_type("TypeTag"),
+                    },
+                    FieldDeclStub {
+                        name: "value".to_string(),
+                        ty: builtin_type("u128"),
+                    },
+                    FieldDeclStub {
+                        name: "recipient".to_string(),
+                        ty: builtin_type("Address"),
+                    },
+                ],
+                ..DataTypeDeclStub::default()
+            }],
             functions: vec![FunctionDeclStub {
                 view: false,
                 name: "create_and_transfer".to_string(),
                 type_params: vec![],
-                args: vec![ArgDeclStub::Const(new_obj_type.clone())],
+                args: vec![ArgDeclStub::Const(input_type)],
                 returns: vec![],
                 required_signers: 0,
                 required_capabilities: vec![],
