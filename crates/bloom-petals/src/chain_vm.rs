@@ -1019,10 +1019,13 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                         }
                         caller_petal
                     };
+                    // The Coin exception only changes the defining petal of
+                    // the top-level Coin object. Nested self-defined type args
+                    // still belong to the caller petal.
                     TypeTag::Concrete {
                         petal_hash: stamped_petal_hash,
                         type_name,
-                        type_args: stamp_self_type_args(type_args, stamped_petal_hash),
+                        type_args: stamp_self_type_args(type_args, caller_petal),
                     }
                 }
                 _ => {
@@ -3115,7 +3118,7 @@ mod ptb_host_import_tests {
                 assert_eq!(*petal_hash, fungible_petal.0);
                 match &type_args[0] {
                     TypeTag::Concrete { petal_hash, .. } => {
-                        assert_eq!(*petal_hash, fungible_petal.0)
+                        assert_eq!(*petal_hash, computed_petal.0)
                     }
                     other => panic!("created Coin had non-concrete type arg: {other:?}"),
                 }
