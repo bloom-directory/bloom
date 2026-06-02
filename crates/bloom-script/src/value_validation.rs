@@ -35,7 +35,8 @@ pub fn validate_return_slot(
     tag: &TypeTag,
     bytes: &[u8],
 ) -> Result<(), String> {
-    let effective = return_slot_tag(manifest, tag).unwrap_or_else(|| tag.clone());
+    let tag = normalize_declared_tag(tag);
+    let effective = return_slot_tag(manifest, &tag).unwrap_or(tag);
     validate_with_tag(manifest, self_hash, &effective, bytes)
 }
 
@@ -411,5 +412,15 @@ mod tests {
         let tag = TypeTag::External { ref_idx: 0 };
         assert!(validate_const_slot(&manifest, [0xAA; 32], &tag, b"opaque").is_ok());
         assert!(validate_return_slot(&manifest, [0xAA; 32], &tag, b"opaque").is_ok());
+    }
+
+    #[test]
+    fn return_option_handle_accepts_legacy_zero_hash_option() {
+        let manifest = PetalManifestStub::default();
+        let tag = zero_hash_tag("Option", vec![zero_hash_tag("Coin", Vec::new())]);
+        let mut bytes = vec![1];
+        bytes.extend_from_slice(&[0x22; 32]);
+
+        assert!(validate_return_slot(&manifest, [0xAA; 32], &tag, &bytes).is_ok());
     }
 }

@@ -8,13 +8,13 @@
 //! the resulting `Const` bytes match the schema-driven value codec.
 //!
 //! Supported primitive type names: `u8`..`u128`, `i8`..`i128`, `bool`,
-//! `Address`/`ObjectId`/`Hash32` (32-byte hex), `String`. Anything else
-//! (petal-defined structs, generics, externals) must be supplied as
-//! `0x`-prefixed canonical bytes and is validated by the PTB validator
+//! `Address`/`ObjectId`/`Hash32` (32-byte hex), `bytes`, `String`/`string`.
+//! Anything else (petal-defined structs, generics, externals) must be supplied
+//! as `0x`-prefixed canonical bytes and is validated by the PTB validator
 //! against the resolved manifest schema.
 
 use bloom_objects::TypeTag;
-use bloom_resource::BloomType;
+use bloom_resource::{BloomType, Bytes as BloomBytes};
 
 use crate::error::BuildError;
 
@@ -62,7 +62,8 @@ fn encode_primitive(type_name: &str, value: &str) -> Result<Vec<u8>, BuildError>
             }
             Ok(bytes)
         }
-        "String" => Ok(value.to_string().canonical_encode()),
+        "bytes" => parse_hex_bytes(value).map(|bytes| BloomBytes(bytes).canonical_encode()),
+        "String" | "string" => Ok(value.to_string().canonical_encode()),
         // Petal struct/enum names: accept canonical bytes as hex; the
         // schema resolver validates them before the command is recorded.
         _ => parse_hex_bytes(value),

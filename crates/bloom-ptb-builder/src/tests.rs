@@ -265,6 +265,49 @@ fn append_const_literal_u64() {
 }
 
 #[test]
+fn append_const_literal_bytes_canonicalizes_hex_payload() {
+    let chain = chain_with_pool(vec![func(
+        "store",
+        vec![ArgDeclStub::Const(concrete("bytes"))],
+        vec![],
+    )]);
+    let mut s = PtbSession::new(&chain);
+
+    s.append_command("/bloom/petals/dex/pool/store 0xdeadbeef")
+        .unwrap();
+
+    match &s.commands()[0] {
+        Command::Move(m) => {
+            assert_eq!(m.args, vec![Arg::Const(vec![4, 0xde, 0xad, 0xbe, 0xef])]);
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn append_const_literal_lowercase_string_uses_canonical_string_encoding() {
+    let chain = chain_with_pool(vec![func(
+        "store",
+        vec![ArgDeclStub::Const(concrete("string"))],
+        vec![],
+    )]);
+    let mut s = PtbSession::new(&chain);
+
+    s.append_command("/bloom/petals/dex/pool/store hello")
+        .unwrap();
+
+    match &s.commands()[0] {
+        Command::Move(m) => {
+            assert_eq!(
+                m.args,
+                vec![Arg::Const(vec![5, b'h', b'e', b'l', b'l', b'o'])]
+            );
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
 fn append_raw_const_bytes_preserves_abi_hex() {
     let chain = chain_with_pool(vec![func(
         "set",
