@@ -109,6 +109,13 @@ fn decode_type_param(r: &mut &[u8]) -> TypeParam {
 fn decode_field(r: &mut &[u8]) {
     let _name = read_string(r).unwrap();
     let _ty = TypeTag::decode_from(r, 0).unwrap();
+    // ADR-011: each field carries `offset` then `width`, both
+    // `Option<u32>` encoded as a presence byte + optional u32 BE.
+    for _ in 0..2 {
+        if read_u8(r).unwrap() == 1 {
+            let _ = read_u32_be(r).unwrap();
+        }
+    }
 }
 
 fn decode_object_type(r: &mut &[u8]) -> ObjectType {

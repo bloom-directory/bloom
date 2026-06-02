@@ -1,0 +1,41 @@
+[
+  {
+    "id": "frontier-1",
+    "hypothesis": "The secure division of labor for NL-to-on-chain-invariant collapses to a single principle—'agents propose, the deterministic gate disposes'—where an off-chain LLM emits a candidate predicate AND a concrete, executable violation witness (a counterexample transaction), and the on-chain checker's only job is to deterministically REPLAY that witness; under deterministic consensus this makes LLM contract reasoning trustworthy without ever trusting the LLM, because a refuted invariant is proven on-chain by re-execution, not asserted.",
+    "rationale": "Neuroforger ('Neuroforger: certified violation witnesses for smart contracts verification via LLMs') represents a spec as a Solidity test with existentially-quantified abstract-typed variables; instantiating them to concrete values concretizes an executable PoC counterexample—exactly the artifact a deterministic VM can re-run. 'Agentic Model Checking' formalizes the same split ('agents propose, solvers verify'): agents do semantic judgment, the BMC backend discharges every soundness-relevant decision, and counterexamples pass a validation pipeline including dynamic replay. On a blockchain the 'solver/replay' role is filled for free by deterministic consensus re-execution, so the witness IS the proof. This reframes the on-chain gate as a witness-validator rather than a theorem prover.",
+    "supports_if": "Empirically, LLM-produced violation witnesses that pass off-chain concretization also reproduce deterministically when replayed by an independent VM at high rate (Neuroforger-style PoCs validate in the wild); and witness-replay catches invariant violations that natural-language-only LLM judgments miss, with the on-chain cost dominated by re-execution rather than proving.",
+    "refutes_if": "A large fraction of real invariants of interest are universally-quantified safety properties with NO finite executable witness (e.g., 'k never decreases over ALL reachable states'), so the witness-replay model can refute but cannot establish them; or LLM-generated witnesses are non-reproducible / environment-dependent (gas, block context) such that off-chain concretization and on-chain replay disagree, breaking the determinism assumption.",
+    "motivating_papers": [
+      "Neuroforger: certified violation witnesses for smart contracts verification via LLMs",
+      "Agentic Model Checking",
+      "Accessible Smart Contracts Verification: Synthesizing Formal Models with Tamed LLMs"
+    ]
+  },
+  {
+    "id": "frontier-2",
+    "hypothesis": "Round-trip equivalence—generate predicate from intent, then reconstruct the intent (or a reference artifact) FROM the predicate and check the two for formal/semantic equivalence—is a sufficient faithfulness oracle to certify NL-to-invariant translation, and an agentic generate-verify-repair loop driven by equivalence counterexamples converges to high faithfulness without a human in the inner loop.",
+    "rationale": "SpecLoop ('SpecLoop: An Agentic RTL-to-Specification Framework with Formal Verification Feedback Loop') generates a spec, reconstructs the artifact from it, runs formal equivalence checking, and feeds counterexamples back to iteratively refine until equivalence is proven—materially improving correctness over LLM-only baselines. 'Autoformalize Mathematical Statements by Symbolic Equivalence and Semantic Consistency' does the dual: it informalizes candidates back to NL and selects by symbolic equivalence (via ATPs) plus embedding similarity, sharply improving pass@1. PAT-Agent and KerSpecGen ('PAT-Agent: Autoformalization for Model Checking'; 'KerSpecGen: Co-piloting formal Kernel specification synthesis...') show the same plan/generate/verify-against-checker/repair loop reaching high success on model checking and seL4 specs. The bold claim: the round-trip loop, not human review, becomes the trust anchor for invariants.",
+    "supports_if": "Across an invariant benchmark, predicates accepted by a round-trip equivalence loop show measurably higher human-judged faithfulness and fewer escaped semantic errors than single-pass generation, and the loop converges in few iterations (SpecLoop/PAT-Agent-style) without human intervention.",
+    "refutes_if": "Round-trip equivalence is systematically gameable—an LLM produces a predicate plus a back-translation that agree with each other but both diverge from true human intent (shared blind spot / mode collapse), so equivalence passes while faithfulness fails; or formal equivalence checking of the reconstructed artifact is undecidable/intractable for the predicate fragment needed for real invariants, so the oracle cannot actually close the loop.",
+    "motivating_papers": [
+      "SpecLoop: An Agentic RTL-to-Specification Framework with Formal Verification Feedback Loop",
+      "Autoformalize Mathematical Statements by Symbolic Equivalence and Semantic Consistency",
+      "PAT-Agent: Autoformalization for Model Checking",
+      "KerSpecGen: Co-piloting formal Kernel specification synthesis with refined knowledge graphs and large language models."
+    ]
+  },
+  {
+    "id": "frontier-3",
+    "hypothesis": "The optimal shared referent between human, LLM, and on-chain checker is neither raw NL nor a general-purpose verification language but a controlled-natural-language layer over a restricted, deterministically-compilable predicate DSL carrying per-clause provenance certificates—i.e., a representation engineered so its syntax mirrors NL while compiling unambiguously to on-chain assume/assert primitives, with retrieval of audited reference predicates as the generation backbone.",
+    "rationale": "'Agentic Model Checking' insists specifications live in a RESTRICTED DSL that 'translates deterministically into the backend's assume/assert primitives'—the determinism property an on-chain gate requires. 'Developing controlled natural language for formal specification patterns using AI assistants' shows CNL can be systematically constructed from formal specification patterns so it is both human-readable and pattern-grounded, and NILE ('NILE: Formalizing Natural-Language Descriptions of Formal Languages') deliberately designs a representation language to MIRROR NL syntax so semantic differences are algorithmically explainable. 'Trustworthy Formal Natural Language Specifications' adds proof certificates explaining how each word was interpreted, making the NL->formal step itself auditable. PropertyGPT ('PropertyGPT: LLM-driven Formal Verification of Smart Contracts through Retrieval-Augmented Property Generation') shows retrieval of human-audited reference properties is what makes generated predicates compilable, appropriate, and verifiable enough to find real zero-days. Together they point to CNL-over-deterministic-DSL-with-provenance as the convergence point.",
+    "supports_if": "A CNL/restricted-DSL representation yields both higher LLM translation accuracy AND higher human comprehension than free-form NL or a raw verification language, compiles deterministically to identical on-chain checks across implementations, and its per-clause provenance certificates let humans localize mistranslations (NILE-style explanations); retrieval-augmented generation over audited predicates further raises recall of correct invariants.",
+    "refutes_if": "The CNL/DSL expressive enough to capture real economic invariants becomes as hard to read and write as the underlying formal language (no comprehension gain over Dafny/Solidity-spec), so it fails as a human referent; or deterministic compilation forces a fragment so restricted it cannot express the target invariants, pushing authors back to general NL and reintroducing ambiguity.",
+    "motivating_papers": [
+      "Agentic Model Checking",
+      "Developing controlled natural language for formal specification patterns using AI assistants",
+      "NILE: Formalizing Natural-Language Descriptions of Formal Languages",
+      "Trustworthy Formal Natural Language Specifications",
+      "PropertyGPT: LLM-driven Formal Verification of Smart Contracts through Retrieval-Augmented Property Generation"
+    ]
+  }
+]

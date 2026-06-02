@@ -2435,8 +2435,10 @@ name = "bloom-petal-cap"
 version = "0.1.0"
 dependencies = [
  "bloom-objects",
+ "bloom-petal-manifest",
  "bloom-resource",
  "bloom-resource-macros",
+ "bloom-script",
 ]
 
 [[package]]
@@ -2479,6 +2481,7 @@ dependencies = [
  "bloom-petal-dex-wallet",
  "bloom-petal-fungible",
  "bloom-petal-manifest",
+ "bloom-petals",
  "bloom-ptb-builder",
  "bloom-resource",
  "bloom-script",

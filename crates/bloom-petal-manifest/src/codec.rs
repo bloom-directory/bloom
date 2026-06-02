@@ -19,9 +19,10 @@ use bloom_objects::codec::{
 use bloom_objects::{AbilitySet, AccessMode, TypeTag};
 
 use crate::types::{
-    ArgDecl, ArgKind, CapabilityDecl, ExternalTypeRef, FieldDecl, FuelHints, FunctionDecl,
-    HostImportDecl, InvariantDecl, InvariantTarget, ObjectTypeDecl, PetalManifestV0, PredicateAst,
-    SCHEMA_VERSION, SemVer, TypeParamDecl, TypeParamKind, WasmFuncSig, WasmValType,
+    ArgDecl, ArgKind, ArithExpr, BoundedArithOp, CapabilityDecl, CmpOp, ExternalTypeRef, FieldDecl,
+    FuelHints, FunctionDecl, HostImportDecl, InvariantDecl, InvariantTarget, ObjectTypeDecl,
+    OverflowPolicy, PetalManifestV0, PredicateAst, SCHEMA_VERSION, SemVer, TypeParamDecl,
+    TypeParamKind, WasmFuncSig, WasmValType, Widening,
 };
 
 const MAX_MANIFEST_LIST_ITEMS: usize = 16_384;
@@ -201,16 +202,43 @@ fn read_type_tag(rdr: &mut &[u8]) -> Result<TypeTag, CodecError> {
     TypeTag::decode_from(rdr, 0)
 }
 
+fn write_opt_u32(buf: &mut Vec<u8>, v: Option<u32>) {
+    match v {
+        Some(n) => {
+            write_u8(buf, 1);
+            write_u32_be(buf, n);
+        }
+        None => write_u8(buf, 0),
+    }
+}
+
+fn read_opt_u32(rdr: &mut &[u8]) -> Result<Option<u32>, CodecError> {
+    match read_u8(rdr)? {
+        0 => Ok(None),
+        1 => Ok(Some(read_u32_be(rdr)?)),
+        other => Err(CodecError::InvalidDiscriminant(other)),
+    }
+}
+
 fn write_field_decl(buf: &mut Vec<u8>, f: &FieldDecl) -> Result<(), CodecError> {
     write_string(buf, &f.name)?;
     write_type_tag(buf, &f.ty)?;
+    write_opt_u32(buf, f.offset);
+    write_opt_u32(buf, f.width);
     Ok(())
 }
 
 fn read_field_decl(rdr: &mut &[u8]) -> Result<FieldDecl, CodecError> {
     let name = read_string(rdr)?;
     let ty = read_type_tag(rdr)?;
-    Ok(FieldDecl { name, ty })
+    let offset = read_opt_u32(rdr)?;
+    let width = read_opt_u32(rdr)?;
+    Ok(FieldDecl {
+        name,
+        ty,
+        offset,
+        width,
+    })
 }
 
 fn write_object_type_decl(buf: &mut Vec<u8>, o: &ObjectTypeDecl) -> Result<(), CodecError> {
@@ -355,6 +383,7 @@ fn write_invariant_decl(buf: &mut Vec<u8>, inv: &InvariantDecl) -> Result<(), Co
     }
     write_predicate(buf, &inv.predicate)?;
     write_string(buf, &inv.wasm_export)?;
+    write_string(buf, &inv.human_text)?;
     Ok(())
 }
 
@@ -371,11 +400,13 @@ fn read_invariant_decl(rdr: &mut &[u8]) -> Result<InvariantDecl, CodecError> {
     };
     let predicate = read_predicate(rdr)?;
     let wasm_export = read_string(rdr)?;
+    let human_text = read_string(rdr)?;
     Ok(InvariantDecl {
         name,
         target,
         predicate,
         wasm_export,
+        human_text,
     })
 }
 
@@ -410,11 +441,154 @@ fn write_predicate(buf: &mut Vec<u8>, p: &PredicateAst) -> Result<(), CodecError
         PredicateAst::Opaque => {
             write_u8(buf, 5);
         }
+        PredicateAst::ArithCmp { op, lhs, rhs } => {
+            write_u8(buf, 6);
+            write_u8(buf, cmp_op_tag(*op));
+            write_arith_expr(buf, lhs)?;
+            write_arith_expr(buf, rhs)?;
+        }
+        PredicateAst::And(lhs, rhs) => {
+            write_u8(buf, 7);
+            write_predicate(buf, lhs)?;
+            write_predicate(buf, rhs)?;
+        }
+        PredicateAst::Or(lhs, rhs) => {
+            write_u8(buf, 8);
+            write_predicate(buf, lhs)?;
+            write_predicate(buf, rhs)?;
+        }
+        PredicateAst::Not(inner) => {
+            write_u8(buf, 9);
+            write_predicate(buf, inner)?;
+        }
     }
     Ok(())
 }
 
+fn cmp_op_tag(op: CmpOp) -> u8 {
+    match op {
+        CmpOp::Ge => 0,
+        CmpOp::Le => 1,
+        CmpOp::Eq => 2,
+    }
+}
+
+fn read_cmp_op(rdr: &mut &[u8]) -> Result<CmpOp, CodecError> {
+    Ok(match read_u8(rdr)? {
+        0 => CmpOp::Ge,
+        1 => CmpOp::Le,
+        2 => CmpOp::Eq,
+        other => return Err(CodecError::InvalidDiscriminant(other)),
+    })
+}
+
+fn write_arith_expr(buf: &mut Vec<u8>, e: &ArithExpr) -> Result<(), CodecError> {
+    match e {
+        ArithExpr::Field(name) => {
+            write_u8(buf, 0);
+            write_string(buf, name)?;
+        }
+        ArithExpr::Literal(v) => {
+            write_u8(buf, 1);
+            write_u64_be(buf, (*v >> 64) as u64);
+            write_u64_be(buf, *v as u64);
+        }
+        ArithExpr::Bounded {
+            op,
+            lhs,
+            rhs,
+            widening,
+            on_overflow,
+        } => {
+            write_u8(buf, 2);
+            write_u8(
+                buf,
+                match op {
+                    BoundedArithOp::Add => 0,
+                    BoundedArithOp::Sub => 1,
+                    BoundedArithOp::Mul => 2,
+                },
+            );
+            write_u8(
+                buf,
+                match widening {
+                    Widening::None => 0,
+                    Widening::U256 => 1,
+                    Widening::U512 => 2,
+                },
+            );
+            write_u8(
+                buf,
+                match on_overflow {
+                    OverflowPolicy::Indeterminate => 0,
+                    OverflowPolicy::Saturate => 1,
+                },
+            );
+            write_arith_expr(buf, lhs)?;
+            write_arith_expr(buf, rhs)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_arith_expr_at(rdr: &mut &[u8], depth: u32) -> Result<ArithExpr, CodecError> {
+    if depth > MAX_PREDICATE_DEPTH {
+        return Err(CodecError::RecursionLimit);
+    }
+    Ok(match read_u8(rdr)? {
+        0 => ArithExpr::Field(read_string(rdr)?),
+        1 => {
+            let hi = read_u64_be(rdr)? as u128;
+            let lo = read_u64_be(rdr)? as u128;
+            ArithExpr::Literal((hi << 64) | lo)
+        }
+        2 => {
+            let op = match read_u8(rdr)? {
+                0 => BoundedArithOp::Add,
+                1 => BoundedArithOp::Sub,
+                2 => BoundedArithOp::Mul,
+                other => return Err(CodecError::InvalidDiscriminant(other)),
+            };
+            let widening = match read_u8(rdr)? {
+                0 => Widening::None,
+                1 => Widening::U256,
+                2 => Widening::U512,
+                other => return Err(CodecError::InvalidDiscriminant(other)),
+            };
+            let on_overflow = match read_u8(rdr)? {
+                0 => OverflowPolicy::Indeterminate,
+                1 => OverflowPolicy::Saturate,
+                other => return Err(CodecError::InvalidDiscriminant(other)),
+            };
+            let lhs = Box::new(read_arith_expr_at(rdr, depth + 1)?);
+            let rhs = Box::new(read_arith_expr_at(rdr, depth + 1)?);
+            ArithExpr::Bounded {
+                op,
+                lhs,
+                rhs,
+                widening,
+                on_overflow,
+            }
+        }
+        other => return Err(CodecError::InvalidDiscriminant(other)),
+    })
+}
+
+/// Maximum nesting depth a decoded `PredicateAst` / `ArithExpr` may reach.
+/// A malicious manifest with a deeply-nested predicate would otherwise
+/// stack-overflow the decoder (and thus the validating node) before any
+/// higher-level gate runs. Far above any legitimate predicate; the deploy
+/// fuel-headroom gate rejects merely-large (sub-overflow) predicates.
+const MAX_PREDICATE_DEPTH: u32 = 256;
+
 fn read_predicate(rdr: &mut &[u8]) -> Result<PredicateAst, CodecError> {
+    read_predicate_at(rdr, 0)
+}
+
+fn read_predicate_at(rdr: &mut &[u8], depth: u32) -> Result<PredicateAst, CodecError> {
+    if depth > MAX_PREDICATE_DEPTH {
+        return Err(CodecError::RecursionLimit);
+    }
     Ok(match read_u8(rdr)? {
         0 => PredicateAst::FieldGe {
             lhs: read_string(rdr)?,
@@ -434,6 +608,20 @@ fn read_predicate(rdr: &mut &[u8]) -> Result<PredicateAst, CodecError> {
         },
         4 => PredicateAst::AllPoolsKNonDecreasing,
         5 => PredicateAst::Opaque,
+        6 => PredicateAst::ArithCmp {
+            op: read_cmp_op(rdr)?,
+            lhs: read_arith_expr_at(rdr, depth + 1)?,
+            rhs: read_arith_expr_at(rdr, depth + 1)?,
+        },
+        7 => PredicateAst::And(
+            Box::new(read_predicate_at(rdr, depth + 1)?),
+            Box::new(read_predicate_at(rdr, depth + 1)?),
+        ),
+        8 => PredicateAst::Or(
+            Box::new(read_predicate_at(rdr, depth + 1)?),
+            Box::new(read_predicate_at(rdr, depth + 1)?),
+        ),
+        9 => PredicateAst::Not(Box::new(read_predicate_at(rdr, depth + 1)?)),
         other => return Err(CodecError::InvalidDiscriminant(other)),
     })
 }
@@ -577,6 +765,8 @@ mod tests {
                         type_name: "UID".to_string(),
                         type_args: vec![],
                     },
+                    offset: Some(0),
+                    width: Some(32),
                 }],
             }],
             capability_types: vec![CapabilityDecl {
@@ -627,6 +817,7 @@ mod tests {
                     rhs: "k_last".to_string(),
                 },
                 wasm_export: "__inv_0".to_string(),
+                human_text: String::new(),
             }],
             required_host_imports: vec![HostImportDecl {
                 module: "object".to_string(),
@@ -778,6 +969,49 @@ mod tests {
             },
             PredicateAst::AllPoolsKNonDecreasing,
             PredicateAst::Opaque,
+            PredicateAst::ArithCmp {
+                op: CmpOp::Ge,
+                lhs: ArithExpr::Bounded {
+                    op: BoundedArithOp::Mul,
+                    lhs: Box::new(ArithExpr::Field("after.reserve_a".into())),
+                    rhs: Box::new(ArithExpr::Field("after.reserve_b".into())),
+                    widening: Widening::U256,
+                    on_overflow: OverflowPolicy::Indeterminate,
+                },
+                rhs: ArithExpr::Field("before.k_last".into()),
+            },
+            PredicateAst::ArithCmp {
+                op: CmpOp::Eq,
+                lhs: ArithExpr::Literal(u128::MAX),
+                rhs: ArithExpr::Bounded {
+                    op: BoundedArithOp::Add,
+                    lhs: Box::new(ArithExpr::Field("x".into())),
+                    rhs: Box::new(ArithExpr::Literal(1)),
+                    widening: Widening::None,
+                    on_overflow: OverflowPolicy::Saturate,
+                },
+            },
+            // Boolean composition (nested).
+            PredicateAst::Or(
+                Box::new(PredicateAst::FieldGe {
+                    lhs: "after.reserve_a".into(),
+                    rhs: "before.k_last".into(),
+                }),
+                Box::new(PredicateAst::Not(Box::new(PredicateAst::FieldEq {
+                    lhs: "after.lp_supply".into(),
+                    rhs: "before.lp_supply".into(),
+                }))),
+            ),
+            PredicateAst::And(
+                Box::new(PredicateAst::FieldLe {
+                    lhs: "after.total".into(),
+                    rhs: "after.cap".into(),
+                }),
+                Box::new(PredicateAst::FieldGe {
+                    lhs: "after.total".into(),
+                    rhs: "before.total".into(),
+                }),
+            ),
         ];
         for p in variants {
             let m = PetalManifestV0 {
@@ -789,6 +1023,7 @@ mod tests {
                     },
                     predicate: p.clone(),
                     wasm_export: "__inv_0".to_string(),
+                    human_text: String::new(),
                 }],
                 ..Default::default()
             };
@@ -854,5 +1089,40 @@ mod tests {
         assert_eq!(back.schema_version, 1);
         assert_eq!(back.functions[0].name, "legacy");
         assert!(!back.functions[0].view);
+    }
+
+    #[test]
+    fn deeply_nested_predicate_decode_is_bounded() {
+        // A run of `And` discriminants (0x07) with no terminating leaf
+        // would recurse unbounded; the decoder must error rather than
+        // stack-overflow (deploy-time DoS guard). Drive `read_predicate`
+        // directly with crafted bytes past the depth limit.
+        let bytes = vec![7u8; (MAX_PREDICATE_DEPTH as usize) + 8];
+        let mut rdr = &bytes[..];
+        let err = read_predicate(&mut rdr).unwrap_err();
+        assert!(matches!(err, CodecError::RecursionLimit), "got {err:?}");
+    }
+
+    #[test]
+    fn invariant_human_text_round_trips() {
+        let m = PetalManifestV0 {
+            module_path: "/p".to_string(),
+            invariants: vec![InvariantDecl {
+                name: "x".to_string(),
+                target: InvariantTarget::ObjectType {
+                    name: "T".to_string(),
+                },
+                predicate: PredicateAst::FieldGe {
+                    lhs: "after.a".into(),
+                    rhs: "before.a".into(),
+                },
+                wasm_export: "__inv_0".to_string(),
+                human_text: "a never decreases".to_string(),
+            }],
+            ..Default::default()
+        };
+        let back = decode(&encode(&m).unwrap()).unwrap();
+        assert_eq!(back.invariants[0].human_text, "a never decreases");
+        assert_eq!(back, m);
     }
 }

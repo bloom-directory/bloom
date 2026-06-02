@@ -305,20 +305,35 @@ impl PetalRunner for ChainPetalRunner {
     ) -> Result<InvariantResult, PtbError> {
         // Invariant exports are already in `__inv_<n>` form — pass
         // through unchanged.
-        let result = self.dispatch(
+        match self.dispatch(
             petal_hash,
             export_name.to_string(),
             scope_buf.to_vec(),
             fuel_budget,
-        )?;
-        // The invariant ABI is `() -> i32`; bloom-resource-macros
-        // wraps it so the returned buffer's first byte is 1 (ok) or 0
-        // (failed). An empty buffer is treated as failure (conservative).
-        let ok = result.ret_buf.first().copied() == Some(1);
-        Ok(InvariantResult {
-            ok,
-            fuel_used: result.fuel_used,
-        })
+        ) {
+            Ok(result) => {
+                // The invariant ABI is `() -> i32`; bloom-resource-macros
+                // wraps it so the returned buffer's first byte is 1 (ok)
+                // or 0 (failed). An empty buffer is treated as failure
+                // (conservative).
+                let ok = result.ret_buf.first().copied() == Some(1);
+                Ok(InvariantResult {
+                    ok,
+                    fuel_used: result.fuel_used,
+                    indeterminate: false,
+                })
+            }
+            // Out-of-fuel during invariant evaluation is *indeterminate*,
+            // not a violation (ADR-002): the predicate was too expensive
+            // to decide, so the host must not revert on it. `dispatch`
+            // has already surfaced fuel exhaustion as `OutOfFuel`.
+            Err(PtbError::OutOfFuel { .. }) => Ok(InvariantResult {
+                ok: false,
+                fuel_used: fuel_budget,
+                indeterminate: true,
+            }),
+            Err(e) => Err(e),
+        }
     }
 }
 

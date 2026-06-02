@@ -311,6 +311,13 @@ pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
                                 "chain petal uses disabled tail-call opcode return_call_ref".into(),
                             ));
                         }
+                        // Floating-point is non-deterministic across hosts
+                        // (ADR-004): reject every float opcode.
+                        ref op if is_float_operator(op) => {
+                            return Err(PetalError::InvalidWasm(
+                                "chain petal uses disallowed floating-point opcode".into(),
+                            ));
+                        }
                         _ => {}
                     }
                 }
@@ -320,8 +327,259 @@ pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
     }
     if let Some(manifest) = extract_petal_manifest_v0(bytes) {
         validate_view_functions_are_pure(bytes, &manifest)?;
+        for inv in &manifest.invariants {
+            // (1) Fail-closed on invariants the on-chain evaluator can't
+            // enforce: unsupported predicate shapes lower to a constant in
+            // the guest, so a declared-but-unenforced invariant would
+            // silently always pass (ADR-014).
+            if !bloom_petal_manifest::predicate_is_enforceable(&inv.predicate) {
+                return Err(PetalError::InvalidWasm(format!(
+                    "chain petal invariant '{}' uses an unenforceable predicate shape \
+                     (only field comparisons and bounded-arithmetic comparisons are \
+                     supported on-chain)",
+                    inv.name
+                )));
+            }
+            // (1b) Reject subtraction: on underflow the guest fails closed to
+            // Violated (no tri-state) while the trusted interpreter returns
+            // Indeterminate — a divergence the differential gate does not yet
+            // cover. Fail closed until `Sub` is reconciled + fuzzed (S1).
+            if bloom_petal_manifest::predicate_uses_subtraction(&inv.predicate) {
+                return Err(PetalError::InvalidWasm(format!(
+                    "chain petal invariant '{}' uses subtraction, which is not yet supported \
+                     on-chain: the guest fails closed on underflow while the reference \
+                     interpreter treats it as indeterminate, and this divergence is not yet \
+                     covered by the differential gate. Use addition/multiplication for now",
+                    inv.name
+                )));
+            }
+            // (2) Fuel-headroom gate (RT-006): reject predicates whose
+            // worst-case static cost approaches the runtime evaluation
+            // budget, so a deployed invariant can never be pushed
+            // out-of-fuel (→ indeterminate → no revert) by adversarial
+            // inputs.
+            let max_fuel = bloom_petal_manifest::predicate_max_fuel(&inv.predicate);
+            if max_fuel > bloom_petal_manifest::MAX_INVARIANT_PREDICATE_FUEL {
+                return Err(PetalError::InvalidWasm(format!(
+                    "chain petal invariant '{}' predicate is too expensive to evaluate \
+                     within its fuel budget (worst-case {} > limit {})",
+                    inv.name,
+                    max_fuel,
+                    bloom_petal_manifest::MAX_INVARIANT_PREDICATE_FUEL
+                )));
+            }
+            // (3) Field-name gate: every field a predicate references must
+            // resolve in the target's scope. A reference the host can't
+            // populate lowers to `0` in the guest, and a `Not` over it
+            // flips to a false `Satisfied` (the codegen has no tri-state).
+            validate_invariant_field_refs(inv, &manifest)?;
+            // (4) Vacuity gate (ADR-003 intent-conformance): a statically
+            // always-true / always-false predicate enforces nothing and can
+            // match no real intent — reject it rather than record a hollow
+            // `Satisfied` forever.
+            if let Some(t) = bloom_petal_manifest::predicate_triviality(&inv.predicate) {
+                let desc = match t {
+                    bloom_petal_manifest::Triviality::AlwaysTrue => {
+                        "always satisfied regardless of input"
+                    }
+                    bloom_petal_manifest::Triviality::AlwaysFalse => {
+                        "always violated regardless of input"
+                    }
+                };
+                return Err(PetalError::InvalidWasm(format!(
+                    "chain petal invariant '{}' is vacuous — it {desc}; it enforces nothing. \
+                     Rewrite the predicate so it depends on before/after state",
+                    inv.name
+                )));
+            }
+            // (5) Boundary gate (ADR-003 Tier 1a): semantic vacuity
+            // detection. Catches predicates that are structurally
+            // non-trivial (cleared gate 4) but always-true or
+            // always-false because of field domain constraints — e.g.
+            // `after.x >= 0` on a u128 field.
+            if let bloom_petal_manifest::types::InvariantTarget::ObjectType { ref name } =
+                inv.target
+                && let Some(obj) = manifest.object_types.iter().find(|o| &o.name == name)
+            {
+                let field_widths: std::collections::HashMap<String, u8> = obj
+                    .fields
+                    .iter()
+                    .filter(|f| {
+                        f.offset.is_some() && matches!(f.width, Some(w) if (1..=16).contains(&w))
+                    })
+                    .map(|f| (f.name.clone(), (f.width.unwrap() * 8) as u8))
+                    .collect();
+                if !field_widths.is_empty()
+                    && let Err(e) = bloom_petal_manifest::boundary_check(
+                        &inv.predicate,
+                        &inv.name,
+                        name,
+                        &field_widths,
+                        &bloom_petal_manifest::BoundaryConfig::default(),
+                    )
+                {
+                    return Err(PetalError::InvalidWasm(e.to_string()));
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Reject an invariant whose predicate references a field its target scope
+/// can't supply. For an object-type target, every `before.<f>`/`after.<f>`
+/// must name an addressable numeric field (fixed-prefix, width ≤ 16 —
+/// ADR-011, matching `build_object_scope`). For a function-exit target the
+/// v1 scope is an empty field table, so *any* field reference is rejected.
+fn validate_invariant_field_refs(
+    inv: &bloom_petal_manifest::types::InvariantDecl,
+    manifest: &PetalManifestV0,
+) -> Result<(), PetalError> {
+    use bloom_petal_manifest::types::InvariantTarget;
+    let refs = bloom_petal_manifest::collect_field_refs(&inv.predicate);
+
+    match &inv.target {
+        InvariantTarget::FunctionExit { .. } => {
+            if let Some(field) = refs.first() {
+                return Err(PetalError::InvalidWasm(format!(
+                    "chain petal invariant '{}' is a function-exit invariant but references \
+                     field '{}'; function-exit field predicates are unsupported in v1 \
+                     (the scope is an empty field table)",
+                    inv.name, field
+                )));
+            }
+        }
+        InvariantTarget::ObjectType { name } => {
+            let obj = manifest
+                .object_types
+                .iter()
+                .find(|o| &o.name == name)
+                .ok_or_else(|| {
+                    PetalError::InvalidWasm(format!(
+                        "chain petal invariant '{}' targets unknown object type '{}'",
+                        inv.name, name
+                    ))
+                })?;
+            let addressable: std::collections::HashSet<&str> = obj
+                .fields
+                .iter()
+                .filter(|f| {
+                    f.offset.is_some() && matches!(f.width, Some(w) if (1..=16).contains(&w))
+                })
+                .map(|f| f.name.as_str())
+                .collect();
+            for r in refs {
+                let bare = r
+                    .strip_prefix("before.")
+                    .or_else(|| r.strip_prefix("after."));
+                match bare {
+                    Some(f) if addressable.contains(f) => {}
+                    _ => {
+                        return Err(PetalError::InvalidWasm(format!(
+                            "chain petal invariant '{}' references field '{}' which is not an \
+                             addressable numeric (<=16-byte fixed-prefix) before./after. field \
+                             of object type '{}'",
+                            inv.name, r, name
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `op` is a *scalar* floating-point opcode (f32/f64 const,
+/// memory, comparison, arithmetic, or int↔float conversion). Rejecting
+/// all of these removes the scalar float surface, so scalar float values
+/// can never be produced or consumed (ADR-004).
+///
+/// Standard SIMD (`wasm_simd`) — including its f32x4/f64x2 lanes — is
+/// intentionally *enabled* in chain mode and made deterministic by
+/// `cranelift_nan_canonicalization`; it is not rejected here. Relaxed
+/// SIMD (the non-deterministic variant) is disabled at the engine level
+/// (`wasm_relaxed_simd(false)`), so its opcodes can never appear.
+fn is_float_operator(op: &wasmparser::Operator) -> bool {
+    use wasmparser::Operator::*;
+    matches!(
+        op,
+        F32Const { .. }
+            | F64Const { .. }
+            | F32Load { .. }
+            | F64Load { .. }
+            | F32Store { .. }
+            | F64Store { .. }
+            | F32Eq
+            | F32Ne
+            | F32Lt
+            | F32Gt
+            | F32Le
+            | F32Ge
+            | F64Eq
+            | F64Ne
+            | F64Lt
+            | F64Gt
+            | F64Le
+            | F64Ge
+            | F32Abs
+            | F32Neg
+            | F32Ceil
+            | F32Floor
+            | F32Trunc
+            | F32Nearest
+            | F32Sqrt
+            | F32Add
+            | F32Sub
+            | F32Mul
+            | F32Div
+            | F32Min
+            | F32Max
+            | F32Copysign
+            | F64Abs
+            | F64Neg
+            | F64Ceil
+            | F64Floor
+            | F64Trunc
+            | F64Nearest
+            | F64Sqrt
+            | F64Add
+            | F64Sub
+            | F64Mul
+            | F64Div
+            | F64Min
+            | F64Max
+            | F64Copysign
+            | I32TruncF32S
+            | I32TruncF32U
+            | I32TruncF64S
+            | I32TruncF64U
+            | I64TruncF32S
+            | I64TruncF32U
+            | I64TruncF64S
+            | I64TruncF64U
+            | F32ConvertI32S
+            | F32ConvertI32U
+            | F32ConvertI64S
+            | F32ConvertI64U
+            | F32DemoteF64
+            | F64ConvertI32S
+            | F64ConvertI32U
+            | F64ConvertI64S
+            | F64ConvertI64U
+            | F64PromoteF32
+            | I32ReinterpretF32
+            | I64ReinterpretF64
+            | F32ReinterpretI32
+            | F64ReinterpretI64
+            | I32TruncSatF32S
+            | I32TruncSatF32U
+            | I32TruncSatF64S
+            | I32TruncSatF64U
+            | I64TruncSatF32S
+            | I64TruncSatF32U
+            | I64TruncSatF64S
+            | I64TruncSatF64U
+    )
 }
 
 #[derive(Debug, Default)]

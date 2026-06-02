@@ -9,7 +9,7 @@ use bloom_script::encode::{decode_ptb, encode_ptb};
 use bloom_script::validator::{AlwaysOkVerifier, ValidationContext, ValidationMode, validate_ptb};
 use bloom_script::{
     Command, MoveCmd, PetalRef, PqSignature, PtbTx,
-    types::{Arg, ExpectedVersion},
+    types::{Arg, ExpectedVersion, UseRef},
 };
 
 static ALWAYS_OK: AlwaysOkVerifier = AlwaysOkVerifier;
@@ -95,6 +95,7 @@ fn readonly_manifest(args: Vec<ArgDeclStub>) -> PetalManifestStub {
     PetalManifestStub {
         module_path: "/bloom/test/view".to_string(),
         functions: vec![FunctionDeclStub {
+            view: true,
             name: "read_counter".to_string(),
             args,
             ..Default::default()
@@ -228,6 +229,56 @@ fn readonly_validation_coerces_object_args_to_readonly() {
         panic!("expected object arg");
     };
     assert_eq!(*access_mode, bloom_objects::AccessMode::ReadOnly);
+}
+
+#[test]
+fn readonly_mode_rejects_transfer_objects() {
+    let mut chain = TestChain {
+        block: 1,
+        ..Default::default()
+    };
+    chain
+        .petals
+        .insert(Hash32([0x22; 32]), vec![0, 97, 115, 109]);
+    chain
+        .manifests
+        .insert(Hash32([0x22; 32]), readonly_manifest(vec![]));
+    chain
+        .paths
+        .insert("/bloom/test/view".to_string(), Hash32([0x22; 32]));
+
+    let tx = PtbTx {
+        signers: vec![],
+        commands: vec![
+            Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/bloom/test/view".to_string(),
+                    hash: Some(Hash32([0x22; 32])),
+                },
+                function: "read_counter".to_string(),
+                type_args: vec![],
+                args: vec![],
+            }),
+            Command::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                }],
+                owner: bloom_objects::Owner::Address([0xAA; 32]),
+            },
+        ],
+        gas_payer: ObjectId([0xFE; 32]),
+        gas_budget: 0,
+        gas_price: 0,
+        expiry_block: 10,
+        signatures: vec![],
+    };
+
+    let err = validate_ptb(&tx, &readonly_validation_ctx(&chain)).unwrap_err();
+    assert!(
+        err.to_string().contains("read-only"),
+        "TransferObjects must be rejected in read-only mode, got: {err}"
+    );
 }
 
 #[test]

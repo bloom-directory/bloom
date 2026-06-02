@@ -117,6 +117,44 @@ pub enum TypeParamKind {
     Resource,
 }
 
+/// Fixed canonical byte width of a field type, or `None` for
+/// variable-width types (ADR-011, S7a–S7d).
+///
+/// The widths mirror the canonical payload encoding: fixed-width
+/// integers are their byte size; `bool` is one byte; the 32-byte
+/// identity/hash types (`ObjectId`/`Address`/`Hash32`/`UID`) and the
+/// `Coin<T>`/`Resource<T>` object-handle wrappers are 32 bytes.
+/// Variable-width types (`Vec<u8>`, `String`, a nested `TypeTag`) and
+/// unresolved generics return `None`.
+pub fn canonical_byte_width(ty: &TypeTag) -> Option<u32> {
+    match ty {
+        TypeTag::Concrete {
+            type_name,
+            type_args,
+            ..
+        } => {
+            if !type_args.is_empty() {
+                // The only fixed-width generic carriers are the 32-byte
+                // object-handle wrappers.
+                return match type_name.as_str() {
+                    "Coin" | "Resource" => Some(32),
+                    _ => None,
+                };
+            }
+            match type_name.as_str() {
+                "u8" | "bool" => Some(1),
+                "u16" => Some(2),
+                "u32" => Some(4),
+                "u64" => Some(8),
+                "u128" => Some(16),
+                "ObjectId" | "Address" | "Hash32" | "UID" => Some(32),
+                _ => None,
+            }
+        }
+        TypeTag::Generic { .. } | TypeTag::External { .. } => None,
+    }
+}
+
 /// Field on an `#[object]` struct.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FieldDecl {
@@ -124,6 +162,15 @@ pub struct FieldDecl {
     pub name: String,
     /// Field's recorded `TypeTag` (best-effort, see `crate::type_tag`).
     pub ty: TypeTag,
+    /// Byte offset of this field within the canonical object payload, or
+    /// `None` if not statically known (ADR-011). Under the *fixed-prefix
+    /// rule*, `offset` is `Some` only while every preceding field has a
+    /// known fixed width; the first variable-width field and everything
+    /// after it are `None` and not invariant-addressable in v1.
+    pub offset: Option<u32>,
+    /// Fixed canonical byte width of this field, or `None` for
+    /// variable-width types (`Vec<u8>`, `String`, nested `TypeTag`).
+    pub width: Option<u32>,
 }
 
 /// Declaration of a `#[capability]`-annotated struct (spec §5).
@@ -199,6 +246,11 @@ pub struct InvariantDecl {
     pub predicate: PredicateAst,
     /// Wasm export name (`__inv_<idx>`).
     pub wasm_export: String,
+    /// Optional natural-language claim paired with the predicate (ADR-003,
+    /// spec↔intent). Empty string = none. Not consumed by evaluation; it is
+    /// surfaced for rendering/arbitration and is the human half the
+    /// deploy-time intent-conformance work checks against.
+    pub human_text: String,
 }
 
 /// Where the invariant attaches.
@@ -251,8 +303,93 @@ pub enum PredicateAst {
     },
     /// Router-style "all pools' k non-decreasing" (spec §14.3).
     AllPoolsKNonDecreasing,
+    /// Bounded-arithmetic comparison `lhs <op> rhs` over scope fields
+    /// (plan §7). Operands are `u128`; intermediates widen so the
+    /// comparison never overflows. This is the general form that, e.g.,
+    /// `after.reserve_a * after.reserve_b >= before.k_last` lowers to.
+    ArithCmp {
+        /// Comparison operator.
+        op: CmpOp,
+        /// Left-hand arithmetic expression.
+        lhs: ArithExpr,
+        /// Right-hand arithmetic expression.
+        rhs: ArithExpr,
+    },
+    /// Boolean conjunction (`lhs && rhs`).
+    And(Box<PredicateAst>, Box<PredicateAst>),
+    /// Boolean disjunction (`lhs || rhs`).
+    Or(Box<PredicateAst>, Box<PredicateAst>),
+    /// Boolean negation (`!inner`).
+    Not(Box<PredicateAst>),
     /// Catch-all when the AST shape isn't recognized in v0.
     Opaque,
+}
+
+/// Comparison operator for [`PredicateAst::ArithCmp`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmpOp {
+    /// `>=`
+    Ge,
+    /// `<=`
+    Le,
+    /// `==`
+    Eq,
+}
+
+/// Checked arithmetic operation (plan §7). Operands widen per
+/// [`Widening`]; overflow follows [`OverflowPolicy`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundedArithOp {
+    /// Checked addition.
+    Add,
+    /// Checked subtraction (saturating at zero is *not* implied).
+    Sub,
+    /// Checked multiplication.
+    Mul,
+}
+
+/// Intermediate widening domain for bounded arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Widening {
+    /// Stay in `u128`; overflow follows [`OverflowPolicy`].
+    None,
+    /// Widen intermediates to 256 bits.
+    U256,
+    /// Widen intermediates to 512 bits.
+    U512,
+}
+
+/// What to do when a bounded-arithmetic step overflows its domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverflowPolicy {
+    /// Overflow ⇒ the predicate result is indeterminate (never violated).
+    Indeterminate,
+    /// Overflow ⇒ saturate at the domain max (rarely correct).
+    Saturate,
+}
+
+/// An arithmetic expression over scope fields, evaluated with checked
+/// widening arithmetic. Realizes plan §7's `BoundedArith` as a
+/// composable, SMT-encodable value node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArithExpr {
+    /// Reference to a named scope field (e.g. `"after.reserve_a"`).
+    Field(String),
+    /// A literal `u128` value.
+    Literal(u128),
+    /// `lhs <op> rhs` with the given widening / overflow policy.
+    Bounded {
+        /// Arithmetic operation.
+        op: BoundedArithOp,
+        /// Left operand.
+        lhs: Box<ArithExpr>,
+        /// Right operand.
+        rhs: Box<ArithExpr>,
+        /// Intermediate widening domain.
+        widening: Widening,
+        /// Overflow behaviour.
+        on_overflow: OverflowPolicy,
+    },
 }
 
 /// Wasm-side host-import declaration. Mirrors `bloom_objects::HostImport`.

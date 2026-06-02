@@ -3,7 +3,7 @@
 //! End-to-end SSZ round-trip property tests and golden vectors.
 
 use bloom_chain_types::frame::{FrameError, MAX_PAYLOAD_LEN, decode_frame, encode_frame};
-use bloom_chain_types::receipt::{Log, Receipt, receipts_root};
+use bloom_chain_types::receipt::{InvariantRecord, Log, Receipt, receipts_root};
 use bloom_chain_types::ssz::{Decode, Encode};
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
@@ -111,6 +111,14 @@ fn arb_log() -> impl Strategy<Value = Log> {
         })
 }
 
+fn arb_invariant_record() -> impl Strategy<Value = InvariantRecord> {
+    (any::<u16>(), 0u8..=2, arb_vec_u8(32)).prop_map(|(cmd_idx, verdict, name)| InvariantRecord {
+        cmd_idx,
+        verdict,
+        name,
+    })
+}
+
 fn arb_receipt() -> impl Strategy<Value = Receipt> {
     (
         arb_hash32(),
@@ -118,14 +126,18 @@ fn arb_receipt() -> impl Strategy<Value = Receipt> {
         any::<u64>(),
         arb_vec_u8(64),
         prop::collection::vec(arb_log(), 0..=3),
+        prop::collection::vec(arb_invariant_record(), 0..=3),
     )
-        .prop_map(|(tx_hash, success, fuel_used, return_data, logs)| Receipt {
-            tx_hash,
-            success,
-            fuel_used,
-            return_data,
-            logs,
-        })
+        .prop_map(
+            |(tx_hash, success, fuel_used, return_data, logs, invariant_outcomes)| Receipt {
+                tx_hash,
+                success,
+                fuel_used,
+                return_data,
+                logs,
+                invariant_outcomes,
+            },
+        )
 }
 
 // ---------------------------------------------------------------------------

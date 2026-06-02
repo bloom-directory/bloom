@@ -17,6 +17,7 @@ bloom-chain-types    = { path = "../../../../crates/bloom-chain-types" }
 bloom-keystore       = { path = "../../../../crates/bloom-keystore" }
 bloom-objects        = { path = "../../../../crates/bloom-objects" }
 bloom-script         = { path = "../../../../crates/bloom-script" }
+bloom-petals         = { path = "../../../../crates/bloom-petals" }
 bloom-resource       = { path = "../../../../crates/bloom-resource" }
 bloom-petal-fungible = { path = "../../../../crates/bloom-petal-fungible" }
 bloom-petal-manifest = { path = "../../../../crates/bloom-petal-manifest" }

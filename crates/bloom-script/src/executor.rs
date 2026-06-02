@@ -43,7 +43,9 @@ use bloom_objects::{
 };
 
 use crate::borrow_table::BorrowRow;
-use crate::chain_iface::{ArgDeclStub, ChainStateIface, InvariantDeclStub, PetalManifestStub};
+use crate::chain_iface::{
+    ArgDeclStub, ChainStateIface, FieldLayoutStub, InvariantTargetStub, PetalManifestStub,
+};
 use crate::error::PtbError;
 use crate::host_ctx::PtbHostCtx;
 use crate::types::{Arg, Command, MoveCmd, PublishCmd, UpgradeCmd, UseRef};
@@ -53,6 +55,20 @@ const MAX_PETAL_RETURN_SLOTS: usize = 32;
 const MAX_PETAL_RETURN_BYTES: usize = 2 << 20;
 const PUBLISH_BASE_FUEL: u64 = 1_000;
 const PUBLISH_BYTES_PER_FUEL: u64 = 64;
+
+/// Fixed fuel budget granted to *each* invariant evaluation, independent
+/// of the command's remaining fuel (ADR-002: "a separate invariant-fuel
+/// budget"). Evaluating on leftover command fuel would let a PTB submitter
+/// gas-starve the check into `indeterminate` and commit a violating state
+/// (red-team RT-006). A per-evaluation budget removes both
+/// command→invariant and invariant→invariant starvation, so the number of
+/// invariants that fire is irrelevant. The actual fuel consumed is still
+/// billed into `report.fuel_used`; this is only the ceiling. The deploy-
+/// time headroom gate (`bloom_petal_manifest::predicate_max_fuel` in
+/// `validate_chain_wasm`) keeps every deployed predicate's worst-case cost
+/// well under this ceiling, so a deployed invariant can never be pushed
+/// out-of-fuel by adversarial inputs.
+const INV_FUEL_PER_EVAL: u64 = 10_000_000;
 
 // ---------------------------------------------------------------------------
 // Petal runner trait
@@ -71,10 +87,15 @@ pub struct PetalCallResult {
 /// Output of a single invariant call.
 #[derive(Debug, Clone, Default)]
 pub struct InvariantResult {
-    /// `true` iff the invariant returned `1`.
+    /// `true` iff the invariant returned `1` (predicate satisfied).
+    /// Always `false` when `indeterminate` is `true`.
     pub ok: bool,
     /// Fuel consumed by the invariant.
     pub fuel_used: u64,
+    /// `true` when evaluation trapped / ran out of fuel. The invariant
+    /// was not violated — it was too expensive to decide. The host does
+    /// not revert on an indeterminate result (ADR-002).
+    pub indeterminate: bool,
 }
 
 /// Trait the executor delegates to for wasm dispatch.
@@ -109,6 +130,29 @@ pub trait PetalRunner {
 // ---------------------------------------------------------------------------
 // Report shapes
 // ---------------------------------------------------------------------------
+
+/// The tri-state outcome of evaluating one invariant (ADR-002).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvariantVerdict {
+    /// Predicate returned `1`.
+    Satisfied,
+    /// Predicate returned `0`.
+    Violated,
+    /// Evaluation trapped / ran out of fuel; not decidable.
+    Indeterminate,
+}
+
+/// A recorded invariant evaluation. Emitted into the receipt for *every*
+/// invariant the executor fires, including satisfied ones (ADR-002).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvariantOutcome {
+    /// Invariant name (matches the `#[invariant]` attribute / export).
+    pub name: String,
+    /// Command index that triggered the evaluation.
+    pub cmd_idx: u16,
+    /// Tri-state verdict.
+    pub verdict: InvariantVerdict,
+}
 
 /// A single petal-emitted log record (forwarded by the executor to the
 /// chain receipt). Phase 1 is a minimal struct so the executor's API
@@ -164,6 +208,10 @@ pub struct ExecutionReport {
     pub publish_events: Vec<PetalPublishEvent>,
     /// Log records emitted by petals.
     pub logs: Vec<LogEntry>,
+    /// Per-invariant verdicts, recorded even on success (ADR-002). On a
+    /// revert caused by `InvariantFailed`, the violating entry is the
+    /// last one pushed.
+    pub invariant_outcomes: Vec<InvariantOutcome>,
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +371,17 @@ impl<'c> PtbExecutor<'c> {
             self.with_ctx(|ctx| {
                 ctx.command_outputs.push(cmd_outputs);
             });
+
+            // Fire object-type invariants for every row this command
+            // dirtied (ADR-010), regardless of command kind. This runs
+            // *before* `diff_check` clears the dirty flags and re-snapshots
+            // the baseline, so before/after are still distinguishable. It
+            // lives here (not inside `exec_move`) so built-in commands that
+            // mutate rows — `MergeCoins`/`SplitCoins` — are checked too, not
+            // only Move calls.
+            if let Err(e) = self.fire_object_invariants(&vtx, cmd_idx as u16, &mut report) {
+                return self.revert_report(report, e);
+            }
 
             if let Err(e) = self.with_ctx(|ctx| ctx.borrow_table.diff_check(cmd_idx as u16)) {
                 return self.revert_report(report, e);
@@ -554,32 +613,129 @@ impl<'c> PtbExecutor<'c> {
             }
         }
 
-        // Run attached invariants.
+        // Run function-exit invariants. v1 builds an empty flat
+        // field-table scope (same wire format the guest evaluator reads):
+        // function-arg/return field extraction is a future addition, so a
+        // function-exit predicate referencing fields evaluates fail-closed
+        // rather than mis-parsing a different encoding.
         if let Some(f) = manifest.function(&m.function) {
             for inv in &f.attached_invariants {
-                let before_invariant = *fuel_remaining;
-                let used = match run_invariant(
-                    self.petal_runner,
-                    &hash,
-                    inv,
-                    &m.args,
-                    &outputs,
-                    cmd_idx,
-                    *fuel_remaining,
-                    fuel_remaining,
-                ) {
-                    Ok(used) => used,
-                    Err(e) => {
-                        let charged = before_invariant.saturating_sub(*fuel_remaining);
-                        report.fuel_used = report.fuel_used.saturating_add(charged);
-                        return Err(e);
-                    }
-                };
-                report.fuel_used = report.fuel_used.saturating_add(used);
+                if !matches!(inv.target, InvariantTargetStub::FunctionExit { .. }) {
+                    continue; // object-type invariants fire via the borrow table below
+                }
+                let scope = crate::invariant_scope::build_invariant_scope(
+                    crate::invariant_scope::SCOPE_KIND_FUNCTION_EXIT,
+                    &m.function,
+                    // petal_version: reserved-but-unused placeholder (see
+                    // `build_object_scope`); the v1 field table is empty.
+                    0,
+                    &[],
+                )
+                .map_err(PtbError::Codec)?;
+                self.fire_invariant(&hash, &inv.name, &inv.wasm_export, &scope, cmd_idx, report)?;
             }
         }
 
+        // Object-type invariants fire from the per-command loop in
+        // `execute` (so built-in mutating commands are covered too), not
+        // here — see the call site after `dispatch_command`.
+
         Ok(outputs)
+    }
+
+    /// Evaluate one invariant against a prebuilt scope on its own fixed
+    /// fuel budget (see [`INV_FUEL_PER_EVAL`]), bill the fuel it actually
+    /// consumed into the report, and record the verdict. A violation
+    /// propagates `InvariantFailed`. The invariant's budget is independent
+    /// of the command's remaining fuel, so it cannot be gas-starved.
+    fn fire_invariant(
+        &self,
+        petal: &Hash32,
+        name: &str,
+        wasm_export: &str,
+        scope: &[u8],
+        cmd_idx: u16,
+        report: &mut ExecutionReport,
+    ) -> Result<(), PtbError> {
+        match run_invariant(
+            self.petal_runner,
+            petal,
+            name,
+            wasm_export,
+            scope,
+            cmd_idx,
+            &mut report.invariant_outcomes,
+        ) {
+            Ok(used) => {
+                report.fuel_used = report.fuel_used.saturating_add(used);
+                Ok(())
+            }
+            // A `Violated` verdict still reports the fuel the evaluation
+            // burned before returning the verdict.
+            Err((used, e)) => {
+                report.fuel_used = report.fuel_used.saturating_add(used);
+                Err(e)
+            }
+        }
+    }
+
+    /// Fire object-type invariants for every borrow row dirtied by the
+    /// current command. For each dirty row of type `T` defined by petal
+    /// `P`, evaluate `P`'s `ObjectType(T)` invariants over a flat
+    /// field-table scope built from the row's before/after payloads.
+    fn fire_object_invariants(
+        &mut self,
+        vtx: &ValidatedPtb,
+        cmd_idx: u16,
+        report: &mut ExecutionReport,
+    ) -> Result<(), PtbError> {
+        // Snapshot dirty rows under the lock: (type_tag, before, after).
+        let dirty: Vec<(TypeTag, Vec<u8>, Vec<u8>)> = self.with_ctx(|ctx| {
+            ctx.borrow_table
+                .iter()
+                .filter(|(_, row)| row.dirty)
+                .map(|(_, row)| {
+                    (
+                        row.type_tag.clone(),
+                        row.baseline_payload.clone(),
+                        row.payload_bytes.clone(),
+                    )
+                })
+                .collect()
+        });
+
+        for (type_tag, before, after) in dirty {
+            let TypeTag::Concrete {
+                petal_hash,
+                type_name,
+                ..
+            } = &type_tag
+            else {
+                continue; // generic / external tags carry no object invariants
+            };
+            let Some(def_manifest) = vtx.manifests.get(petal_hash) else {
+                // The type's invariants live in its defining petal's manifest,
+                // which is only in `vtx.manifests` when a Move command in this
+                // PTB referenced that petal. A built-in mutation (e.g.
+                // MergeCoins) on a foreign-defined type whose petal isn't
+                // Move-called here finds no manifest and skips the check.
+                // Distinct from cross-petal *claims*; see
+                // 08-implementation-status §5. v1+.
+                continue;
+            };
+            let Some(obj_decl) = def_manifest.object_type(type_name) else {
+                continue;
+            };
+            if def_manifest.object_invariants(type_name).next().is_none() {
+                continue;
+            }
+            let scope = build_object_scope(type_name, &obj_decl.field_layout, &before, &after)?;
+            let petal = Hash32(*petal_hash);
+            for inv in def_manifest.object_invariants(type_name) {
+                self.fire_invariant(&petal, &inv.name, &inv.wasm_export, &scope, cmd_idx, report)?;
+            }
+        }
+        Ok(())
     }
 
     fn exec_transfer(
@@ -1239,75 +1395,103 @@ fn charge_builtin_fuel(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Evaluate one invariant against a prebuilt scope buffer, record the
+/// tri-state verdict (ADR-002: recorded even on success), and return the
+/// fuel consumed for billing.
+///
+/// The evaluation runs on its own fixed [`INV_FUEL_PER_EVAL`] budget,
+/// **not** the command's remaining fuel — so a PTB submitter cannot
+/// gas-starve the check into `indeterminate` (RT-006). An indeterminate
+/// result (out-of-fuel / trap) is recorded but does **not** revert; only a
+/// clean `0` (violated) returns `InvariantFailed`.
 fn run_invariant(
     runner: &dyn PetalRunner,
     petal: &Hash32,
-    inv: &InvariantDeclStub,
-    args: &[Arg],
-    outputs: &[Vec<u8>],
+    name: &str,
+    wasm_export: &str,
+    scope: &[u8],
     cmd_idx: u16,
-    fuel_budget: u64,
-    fuel_remaining: &mut u64,
-) -> Result<u64, PtbError> {
-    // Build the scope buffer from argspec indices: indices < args.len()
-    // select args, indices >= args.len() select outputs[idx - args.len()].
-    let mut scope = Vec::new();
-    for idx in &inv.argspec {
-        let i = *idx as usize;
-        if i < args.len() {
-            // Re-encode the arg as a length-prefixed blob.
-            let bytes = encode_arg_for_scope(&args[i])?;
-            let len: u32 = bytes
-                .len()
-                .try_into()
-                .map_err(|_| PtbError::BuiltinFailed {
-                    cmd_idx,
-                    reason: "invariant scope arg too large".to_string(),
-                })?;
-            scope.extend_from_slice(&len.to_be_bytes());
-            scope.extend_from_slice(&bytes);
-        } else {
-            let j = i - args.len();
-            let bytes = outputs.get(j).ok_or(PtbError::InvariantFailed {
+    outcomes: &mut Vec<InvariantOutcome>,
+) -> Result<u64, (u64, PtbError)> {
+    // A dispatch error other than out-of-fuel (which the runner already
+    // maps to an indeterminate result) carries no reliable fuel figure;
+    // bill nothing for it.
+    let res = runner
+        .call_invariant(petal, wasm_export, scope, INV_FUEL_PER_EVAL)
+        .map_err(|e| (0, e))?;
+
+    let verdict = if res.indeterminate {
+        InvariantVerdict::Indeterminate
+    } else if res.ok {
+        InvariantVerdict::Satisfied
+    } else {
+        InvariantVerdict::Violated
+    };
+    outcomes.push(InvariantOutcome {
+        name: name.to_string(),
+        cmd_idx,
+        verdict,
+    });
+
+    if matches!(verdict, InvariantVerdict::Violated) {
+        return Err((
+            res.fuel_used,
+            PtbError::InvariantFailed {
                 cmd_idx,
-                name: inv.name.clone(),
-            })?;
-            let len: u32 = bytes
-                .len()
-                .try_into()
-                .map_err(|_| PtbError::BuiltinFailed {
-                    cmd_idx,
-                    reason: "invariant scope output too large".to_string(),
-                })?;
-            scope.extend_from_slice(&len.to_be_bytes());
-            scope.extend_from_slice(bytes);
-        }
-    }
-    let res = runner.call_invariant(petal, &inv.wasm_export, &scope, fuel_budget)?;
-    if res.fuel_used > *fuel_remaining {
-        let limit = *fuel_remaining;
-        *fuel_remaining = 0;
-        return Err(PtbError::OutOfFuel {
-            cmd_idx,
-            limit,
-            used: res.fuel_used,
-        });
-    }
-    *fuel_remaining = fuel_remaining.saturating_sub(res.fuel_used);
-    if !res.ok {
-        return Err(PtbError::InvariantFailed {
-            cmd_idx,
-            name: inv.name.clone(),
-        });
+                name: name.to_string(),
+            },
+        ));
     }
     Ok(res.fuel_used)
 }
 
-fn encode_arg_for_scope(arg: &Arg) -> Result<Vec<u8>, PtbError> {
-    let mut buf = Vec::new();
-    crate::encode::encode_arg(&mut buf, arg).map_err(PtbError::Codec)?;
-    Ok(buf)
+/// Build a flat field-table scope for an object-type invariant. Each
+/// statically-addressable numeric field (width ≤ 16) contributes a
+/// `before.<name>` entry (from the row's baseline payload) and an
+/// `after.<name>` entry (from its current payload). Wider fields (32-byte
+/// ids) are not numeric and are skipped.
+fn build_object_scope(
+    type_name: &str,
+    layout: &[FieldLayoutStub],
+    before: &[u8],
+    after: &[u8],
+) -> Result<Vec<u8>, PtbError> {
+    let mut fields: Vec<(String, u128)> = Vec::with_capacity(layout.len() * 2);
+    for f in layout {
+        let width = f.width as usize;
+        if width == 0 || width > 16 {
+            continue;
+        }
+        let offset = f.offset as usize;
+        if let Some(v) = extract_be_u128(before, offset, width) {
+            fields.push((format!("before.{}", f.name), v));
+        }
+        if let Some(v) = extract_be_u128(after, offset, width) {
+            fields.push((format!("after.{}", f.name), v));
+        }
+    }
+    crate::invariant_scope::build_invariant_scope(
+        crate::invariant_scope::SCOPE_KIND_OBJECT_TYPE,
+        type_name,
+        // petal_version: reserved in the wire format but unused by the v1
+        // guest evaluator (it looks fields up by name). Emitted as 0 until
+        // version-skew checks need it; not live data.
+        0,
+        &fields,
+    )
+    .map_err(PtbError::Codec)
+}
+
+/// Read a big-endian unsigned integer of `width` bytes (≤ 16) at `offset`
+/// into a `u128`. Returns `None` if the slice is out of bounds.
+fn extract_be_u128(payload: &[u8], offset: usize, width: usize) -> Option<u128> {
+    let end = offset.checked_add(width)?;
+    let slice = payload.get(offset..end)?;
+    let mut v = 0u128;
+    for &b in slice {
+        v = (v << 8) | b as u128;
+    }
+    Some(v)
 }
 
 // -----------------------------------------------------------------------------
@@ -1317,7 +1501,9 @@ fn encode_arg_for_scope(arg: &Arg) -> Result<Vec<u8>, PtbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain_iface::{ArgDeclStub, FunctionDeclStub, PetalManifestStub, TypeParamDeclStub};
+    use crate::chain_iface::{
+        ArgDeclStub, FunctionDeclStub, InvariantDeclStub, PetalManifestStub, TypeParamDeclStub,
+    };
     use crate::host_ctx::HandleEntry;
     use crate::types::{
         Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PqSignature, PtbTx, PublishCmd, UseRef,
@@ -1382,8 +1568,8 @@ mod tests {
     struct MockPetalRunner {
         // (petal, function) -> canned return buffer + fuel
         canned: HashMap<(Hash32, String), (Vec<u8>, u64)>,
-        // (petal, export) -> (ok, fuel)
-        inv: HashMap<(Hash32, String), (bool, u64)>,
+        // (petal, export) -> canned invariant result
+        inv: HashMap<(Hash32, String), InvariantResult>,
         calls: RefCell<Vec<MockCall>>,
     }
 
@@ -1406,6 +1592,9 @@ mod tests {
         fn set(&mut self, petal: Hash32, func: &str, ret_buf: Vec<u8>, fuel: u64) {
             self.canned
                 .insert((petal, func.to_string()), (ret_buf, fuel));
+        }
+        fn set_inv(&mut self, petal: Hash32, export: &str, res: InvariantResult) {
+            self.inv.insert((petal, export.to_string()), res);
         }
     }
 
@@ -1444,13 +1633,11 @@ mod tests {
             _fuel_budget: u64,
         ) -> Result<InvariantResult, PtbError> {
             match self.inv.get(&(*petal_hash, export_name.to_string())) {
-                Some((ok, fuel)) => Ok(InvariantResult {
-                    ok: *ok,
-                    fuel_used: *fuel,
-                }),
+                Some(res) => Ok(res.clone()),
                 None => Ok(InvariantResult {
                     ok: true,
                     fuel_used: 0,
+                    indeterminate: false,
                 }),
             }
         }
@@ -2477,6 +2664,138 @@ mod tests {
         );
     }
 
+    /// B1 regression: an object-type invariant must be evaluated after a
+    /// *built-in* mutation (here `MergeCoins`), not only after a `Move`
+    /// command. We register the `Coin`-defining manifest under the coin's
+    /// petal hash (`[0; 32]`, the fungible petal) with an `ObjectType("Coin")`
+    /// invariant, run `Move` (to load that manifest) then `MergeCoins`, and
+    /// assert a verdict was recorded for the command that mutated the coin.
+    /// Before B1 the firing lived inside `exec_move`, so the `MergeCoins`
+    /// command produced no invariant outcome.
+    #[test]
+    fn builtin_mutation_fires_object_invariant() {
+        use crate::chain_iface::{FieldLayoutStub, ObjectTypeDeclStub};
+        let chain = MockChain::new();
+        let (_petal, signer, gas_id) = build_pkg(&chain);
+        // The coin-defining petal *is* the fungible petal (`loom_tt()` pins
+        // petal hash `[0; 32]`); register its manifest there so the borrow
+        // rows for coins resolve to it.
+        let coin_petal = Hash32([0; 32]);
+        chain.put_path("/coin", coin_petal);
+        let a = ObjectId([0x71; 32]);
+        let b = ObjectId([0x72; 32]);
+        chain.put_object(make_coin(0x71, signer, 50, 0));
+        chain.put_object(make_coin(0x72, signer, 70, 0));
+        chain.put_petal(
+            coin_petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/coin".to_string(),
+                functions: vec![FunctionDeclStub {
+                    view: false,
+                    name: "load_two".to_string(),
+                    type_params: vec![],
+                    args: vec![
+                        ArgDeclStub::Object {
+                            ty: loom_tt(),
+                            mode: AccessMode::Mutable,
+                        },
+                        ArgDeclStub::Object {
+                            ty: loom_tt(),
+                            mode: AccessMode::Consume,
+                        },
+                    ],
+                    returns: vec![loom_tt(), loom_tt()],
+                    required_signers: 0,
+                    required_capabilities: vec![],
+                    // The object-type invariant is attached to a function but
+                    // fires on every mutation of its target type.
+                    attached_invariants: vec![InvariantDeclStub {
+                        name: "coin_value_inv".to_string(),
+                        wasm_export: "__inv_coin".to_string(),
+                        argspec: vec![],
+                        target: InvariantTargetStub::ObjectType {
+                            name: "Coin".to_string(),
+                        },
+                    }],
+                }],
+                object_types: vec![ObjectTypeDeclStub {
+                    name: "Coin".to_string(),
+                    abilities: Default::default(),
+                    // value field: 16-byte BE u128 after the 32-byte id.
+                    field_layout: vec![FieldLayoutStub {
+                        name: "value".to_string(),
+                        offset: 32,
+                        width: 16,
+                    }],
+                }],
+                external_type_refs: vec![],
+            },
+        );
+        let mut runner = MockPetalRunner::new();
+        runner.set(coin_petal, "load_two", build_outputs(&[&a.0, &b.0]), 10);
+        // Satisfied verdict — we are asserting the check *runs*, not its sign.
+        runner.set_inv(
+            coin_petal,
+            "__inv_coin",
+            InvariantResult {
+                ok: true,
+                fuel_used: 7,
+                indeterminate: false,
+            },
+        );
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/coin".to_string(),
+                        hash: Some(coin_petal),
+                    },
+                    function: "load_two".to_string(),
+                    type_args: vec![],
+                    args: vec![
+                        Arg::Object {
+                            id: a,
+                            expected_version: ExpectedVersion(0),
+                            access_mode: AccessMode::Mutable,
+                        },
+                        Arg::Object {
+                            id: b,
+                            expected_version: ExpectedVersion(0),
+                            access_mode: AccessMode::Consume,
+                        },
+                    ],
+                }),
+                Command::MergeCoins(vec![
+                    UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    },
+                    UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 1,
+                    },
+                ]),
+            ],
+        );
+        let report = run(&chain, &runner, tx);
+        assert!(report.success, "report: {report:?}");
+        // The MergeCoins command (idx 1) mutated coin `a`; its invariant must
+        // have been evaluated. Before B1 there was no outcome at cmd_idx 1.
+        assert!(
+            report
+                .invariant_outcomes
+                .iter()
+                .any(|o| o.name == "coin_value_inv"
+                    && o.cmd_idx == 1
+                    && o.verdict == InvariantVerdict::Satisfied),
+            "expected a coin_value_inv verdict for the MergeCoins command, got {:?}",
+            report.invariant_outcomes
+        );
+    }
+
     #[test]
     fn merge_coins_rejects_read_only_persistent_non_target() {
         let chain = MockChain::new();
@@ -2672,6 +2991,7 @@ mod tests {
                     name: "always_fail".to_string(),
                     wasm_export: "__inv_0".to_string(),
                     argspec: vec![],
+                    target: Default::default(),
                 }],
             }],
             object_types: vec![],
@@ -2680,9 +3000,15 @@ mod tests {
         chain.put_petal(petal, vec![], manifest.clone());
         let mut runner = MockPetalRunner::new();
         runner.set(petal, "f", build_outputs(&[]), 1);
-        runner
-            .inv
-            .insert((petal, "__inv_0".to_string()), (false, 1));
+        runner.set_inv(
+            petal,
+            "__inv_0",
+            InvariantResult {
+                ok: false,
+                fuel_used: 1,
+                indeterminate: false,
+            },
+        );
         let tx = sample_signed_ptb(
             signer,
             gas_id,
@@ -2703,10 +3029,143 @@ mod tests {
             report.reverted_with,
             Some(PtbError::InvariantFailed { .. })
         ));
+        // Even a violation is recorded (ADR-002).
+        assert_eq!(report.invariant_outcomes.len(), 1);
+        assert_eq!(
+            report.invariant_outcomes[0].verdict,
+            InvariantVerdict::Violated
+        );
+    }
+
+    /// Run function `f` (one attached `__inv_0`) with the given canned
+    /// invariant result; return the execution report.
+    fn run_with_inv_result(res: InvariantResult) -> ExecutionReport {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        let manifest = PetalManifestStub {
+            module_path: "/p".to_string(),
+            functions: vec![FunctionDeclStub {
+                view: false,
+                name: "f".to_string(),
+                type_params: vec![],
+                args: vec![],
+                returns: vec![],
+                required_signers: 0,
+                required_capabilities: vec![],
+                attached_invariants: vec![InvariantDeclStub {
+                    name: "inv".to_string(),
+                    wasm_export: "__inv_0".to_string(),
+                    argspec: vec![],
+                    target: Default::default(),
+                }],
+            }],
+            object_types: vec![],
+            external_type_refs: vec![],
+        };
+        chain.put_petal(petal, vec![], manifest);
+        let mut runner = MockPetalRunner::new();
+        runner.set(petal, "f", build_outputs(&[]), 1);
+        runner.set_inv(petal, "__inv_0", res);
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/p".to_string(),
+                    hash: Some(petal),
+                },
+                function: "f".to_string(),
+                type_args: vec![],
+                args: vec![],
+            })],
+        );
+        run(&chain, &runner, tx)
     }
 
     #[test]
-    fn invariant_out_of_fuel_charges_remaining_fuel() {
+    fn build_object_scope_extracts_before_and_after_numeric_fields() {
+        use crate::chain_iface::FieldLayoutStub;
+        use crate::invariant_scope::{decode_invariant_scope, lookup_field};
+
+        // Pool-like payload prefix: id(32) | reserve_a(16) | k_last(16).
+        let layout = vec![
+            FieldLayoutStub {
+                name: "id".to_string(),
+                offset: 0,
+                width: 32, // 32-byte id: not numeric, must be skipped
+            },
+            FieldLayoutStub {
+                name: "reserve_a".to_string(),
+                offset: 32,
+                width: 16,
+            },
+            FieldLayoutStub {
+                name: "k_last".to_string(),
+                offset: 48,
+                width: 16,
+            },
+        ];
+        let payload = |reserve_a: u128, k_last: u128| {
+            let mut p = vec![0u8; 32];
+            p.extend_from_slice(&reserve_a.to_be_bytes());
+            p.extend_from_slice(&k_last.to_be_bytes());
+            p
+        };
+        let before = payload(1000, 1_000_000);
+        let after = payload(1100, 1_001_000);
+
+        let scope = build_object_scope("Pool", &layout, &before, &after).unwrap();
+        let decoded = decode_invariant_scope(&scope).unwrap();
+        assert_eq!(decoded.target_name, "Pool");
+        // 32-byte id skipped; reserve_a + k_last each yield before/after.
+        assert_eq!(lookup_field(&scope, "before.reserve_a"), Some(1000));
+        assert_eq!(lookup_field(&scope, "after.reserve_a"), Some(1100));
+        assert_eq!(lookup_field(&scope, "before.k_last"), Some(1_000_000));
+        assert_eq!(lookup_field(&scope, "after.k_last"), Some(1_001_000));
+        assert_eq!(lookup_field(&scope, "before.id"), None);
+    }
+
+    #[test]
+    fn invariant_indeterminate_does_not_revert() {
+        // Out-of-fuel evaluation is indeterminate, not a violation: the
+        // PTB must commit and the verdict be recorded (ADR-002).
+        let report = run_with_inv_result(InvariantResult {
+            ok: false,
+            fuel_used: 5,
+            indeterminate: true,
+        });
+        assert!(report.success, "indeterminate must not revert");
+        assert_eq!(report.invariant_outcomes.len(), 1);
+        assert_eq!(
+            report.invariant_outcomes[0].verdict,
+            InvariantVerdict::Indeterminate
+        );
+    }
+
+    #[test]
+    fn invariant_satisfied_is_recorded_on_success() {
+        let report = run_with_inv_result(InvariantResult {
+            ok: true,
+            fuel_used: 3,
+            indeterminate: false,
+        });
+        assert!(report.success);
+        assert_eq!(report.invariant_outcomes.len(), 1);
+        assert_eq!(
+            report.invariant_outcomes[0].verdict,
+            InvariantVerdict::Satisfied
+        );
+        assert_eq!(report.invariant_outcomes[0].name, "inv");
+    }
+
+    /// B1 / RT-006 regression: an invariant evaluates on its own fixed
+    /// budget (`INV_FUEL_PER_EVAL`), not the command's leftover fuel, so a
+    /// PTB submitter cannot gas-starve the check. Here the command's gas is
+    /// tiny but the violating invariant reports a large `fuel_used`; it must
+    /// still be caught (`InvariantFailed`, not `OutOfFuel`/indeterminate),
+    /// and its fuel is billed *on top of* the command budget.
+    #[test]
+    fn gas_starved_ptb_does_not_bypass_violating_invariant() {
         let chain = MockChain::new();
         let (petal, signer, gas_id) = build_pkg(&chain);
         chain.put_petal(
@@ -2723,9 +3182,10 @@ mod tests {
                     required_signers: 0,
                     required_capabilities: vec![],
                     attached_invariants: vec![InvariantDeclStub {
-                        name: "oof".to_string(),
-                        wasm_export: "__inv_oof".to_string(),
+                        name: "guard".to_string(),
+                        wasm_export: "__inv_guard".to_string(),
                         argspec: vec![],
+                        target: Default::default(),
                     }],
                 }],
                 object_types: vec![],
@@ -2734,9 +3194,18 @@ mod tests {
         );
         let mut runner = MockPetalRunner::new();
         runner.set(petal, "f", build_outputs(&[]), 1);
-        runner
-            .inv
-            .insert((petal, "__inv_oof".to_string()), (true, 2_000_000));
+        // The violating invariant burns far more than the whole PTB gas
+        // budget — under the old "leftover command fuel" model this would
+        // have surfaced as OutOfFuel → indeterminate → no revert.
+        runner.set_inv(
+            petal,
+            "__inv_guard",
+            InvariantResult {
+                ok: false,
+                fuel_used: 2_000_000,
+                indeterminate: false,
+            },
+        );
         let tx = sample_signed_ptb(
             signer,
             gas_id,
@@ -2751,12 +3220,21 @@ mod tests {
             })],
         );
         let report = run(&chain, &runner, tx);
-        assert!(!report.success);
-        assert!(matches!(
-            report.reverted_with,
-            Some(PtbError::OutOfFuel { .. })
-        ));
-        assert_eq!(report.fuel_used, 1_000_000);
+        assert!(
+            !report.success,
+            "violation must revert even when gas-starved"
+        );
+        assert!(
+            matches!(report.reverted_with, Some(PtbError::InvariantFailed { .. })),
+            "expected InvariantFailed, got {:?}",
+            report.reverted_with
+        );
+        assert_eq!(
+            report.invariant_outcomes[0].verdict,
+            InvariantVerdict::Violated
+        );
+        // Invariant fuel is billed on its own budget, beyond the command's.
+        assert!(report.fuel_used >= 2_000_000);
     }
 
     #[test]
@@ -2921,6 +3399,7 @@ mod tests {
             Ok(InvariantResult {
                 ok: true,
                 fuel_used: 0,
+                indeterminate: false,
             })
         }
     }

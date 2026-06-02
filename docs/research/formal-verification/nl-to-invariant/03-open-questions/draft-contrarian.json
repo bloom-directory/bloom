@@ -1,0 +1,38 @@
+[
+  {
+    "id": "contrarian-1",
+    "hypothesis": "Pipeline 'security' for NL->predicate is largely illusory because the unsolved core is intent-conformance (does the predicate mean what the human meant?), not generation or formal validity — and nothing the field measures (generation accuracy, formal equivalence, counterexample validation) actually measures intent-conformance, so a pipeline can be fully 'secure' by every available metric and still enforce the wrong property.",
+    "rationale": "'Evaluating LLM-driven User-Intent Formalization for Verification-Aware Languages' states there is no algorithmic way to ensure the correctness of a user-intent formalization — the spec-vs-intent gap is definitionally outside mechanical checking. 'Trustworthy Formal Natural Language Specifications' makes the dual point: a formally proved claim 'may have been mistranslated' from the informal intent, so the proof certifies the wrong thing. Every other corpus technique checks predicate-vs-predicate or predicate-vs-execution, never predicate-vs-meaning.",
+    "supports_if": "Studies that hold formal validity / generation accuracy fixed still find a substantial residual rate of predicates that humans judge as not matching their intent, and no automated metric in the corpus correlates strongly with human-judged intent-conformance.",
+    "refutes_if": "Some automated signal (e.g. round-trip agreement, ensemble consistency, or a learned judge) is shown to correlate strongly with human-judged intent-conformance across a benchmark, demonstrating intent-conformance IS mechanically approximable and thus not an irreducible gap.",
+    "motivating_papers": [
+      "Evaluating LLM-driven User-Intent Formalization for Verification-Aware Languages",
+      "Trustworthy Formal Natural Language Specifications"
+    ]
+  },
+  {
+    "id": "contrarian-2",
+    "hypothesis": "Round-trip / back-translation checking gives FALSE assurance and can be net-negative: because the same model performs the forward and backward translation, their errors are correlated, so a fluent back-translation that 'confirms' the predicate mostly demonstrates self-consistency, not faithfulness — and the fluent confirmation actively inflates author over-trust.",
+    "rationale": "'nl2spec' relies on subformula back-translation as its human-facing check, but the mechanism is the same LLM paraphrasing its own output. Contrast with 'Logic-LM' and 'Neuroforger', whose guarantees come from a DETERMINISTIC symbolic solver / concrete on-chain execution respectively — not from natural-language paraphrase. The contrarian claim: trust should derive only from the deterministic component; NL round-trip is decorative and possibly harmful.",
+    "supports_if": "Forward and backward LLM translation errors are shown to be correlated (back-translation 'passes' precisely on the predicates that are wrong in the same way), and giving authors a fluent back-translation measurably increases their acceptance of incorrect predicates versus showing none.",
+    "refutes_if": "Back-translation disagreement reliably flags unfaithful predicates (high recall of true errors) and independent-model back-translation breaks the error correlation, so round-trip is a genuinely useful faithfulness signal rather than self-consistency theatre.",
+    "motivating_papers": [
+      "nl2spec: Interactively Translating Unstructured Natural Language to Temporal Logics with Large Language Models",
+      "Logic-LM: Empowering Large Language Models with Symbolic Solvers for Faithful Logical Reasoning",
+      "Neuroforger: certified violation witnesses for smart contracts verification via LLMs"
+    ]
+  },
+  {
+    "id": "contrarian-3",
+    "hypothesis": "Adding a generative LLM step strictly WORSENS trust versus having authors write the predicate directly in a sufficiently constrained, auditable representation; the real bottleneck is human review of the predicate, so the optimal pipeline minimizes review burden (a small pattern-based DSL/CNL the author reads and writes directly) and may contain NO generative LLM at all.",
+    "rationale": "'PropertyGPT' works by transferring human-written, audited reference properties (Certora specs) via retrieval — its value comes from the human-authored corpus, not free generation. 'Accessible Smart Contracts Verification: Synthesizing Formal Models with Tamed LLMs' frames the LLM as something that must be 'tamed'/repaired before trust. 'Developing controlled natural language for formal specification patterns using AI assistants' and the decidable finite-trace fragment work suggest a constrained, directly-authorable referent. If the predicate must be human-reviewed regardless, the generation step adds a failure mode without removing the bottleneck.",
+    "supports_if": "On a fixed budget, authors writing/reviewing predicates directly in a constrained DSL/CNL achieve higher deployed-predicate faithfulness than an LLM-generation-plus-review pipeline, and total human effort is dominated by review in both — so generation adds risk without saving the binding cost.",
+    "refutes_if": "LLM generation plus human review yields higher faithfulness per unit human effort than direct authoring (generation meaningfully reduces review burden or improves coverage of intended invariants), showing the generative step is net-positive rather than a pure added failure mode.",
+    "motivating_papers": [
+      "PropertyGPT: LLM-driven Formal Verification of Smart Contracts through Retrieval-Augmented Property Generation",
+      "Accessible Smart Contracts Verification: Synthesizing Formal Models with Tamed LLMs",
+      "Developing controlled natural language for formal specification patterns using AI assistants",
+      "First-Order Temporal Logic on Finite Traces: Semantic Properties, Decidable Fragments, and Applications"
+    ]
+  }
+]

@@ -14,6 +14,12 @@ bloom-resource = { workspace = true }
 bloom-resource-macros = { workspace = true }
 bloom-objects = { workspace = true }
 
+[dev-dependencies]
+# Invariant test: decode the petal manifest + drive the host evaluator
+# against the trusted interpreter over a built scope.
+bloom-petal-manifest = { workspace = true }
+bloom-script = { workspace = true }
+
 [features]
 default = []
 # Suppress the wasm `__petal_<fn>` entrypoints when this crate is compiled

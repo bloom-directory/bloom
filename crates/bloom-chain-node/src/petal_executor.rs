@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use bloom_chain_consensus::tx_admission::{MAX_CHAIN_WASM_BYTES, deploy_petal_fuel_for_bytes};
 use bloom_chain_state::{State, StateSnapshot};
 use bloom_chain_types::{
-    receipt::Log,
+    receipt::{InvariantRecord, Log},
     tx::{Tx, TxKind},
     types::{Address, Hash32},
 };
@@ -129,6 +129,22 @@ fn ptb_log_to_receipt_log(l: PtbLogEntry) -> Log {
         address: Address(l.petal.0),
         topics,
         data: l.data,
+    }
+}
+
+/// Map an executor-side invariant verdict into the receipt-level record
+/// (ADR-002). Verdict encoding: 0 = satisfied, 1 = violated, 2 =
+/// indeterminate.
+fn inv_outcome_to_record(o: &bloom_script::InvariantOutcome) -> InvariantRecord {
+    use bloom_script::InvariantVerdict;
+    InvariantRecord {
+        cmd_idx: o.cmd_idx,
+        verdict: match o.verdict {
+            InvariantVerdict::Satisfied => 0,
+            InvariantVerdict::Violated => 1,
+            InvariantVerdict::Indeterminate => 2,
+        },
+        name: o.name.clone().into_bytes(),
     }
 }
 
@@ -755,6 +771,7 @@ fn execute_tx_impl(
                     return_data: b"deploy petal failed: insufficient max_fuel for wasm storage"
                         .to_vec(),
                     logs: vec![],
+                    invariant_outcomes: Vec::new(),
                     write_set: None,
                 };
             }
@@ -767,6 +784,7 @@ fn execute_tx_impl(
                         return_data: b"deploy petal failed: missing bloom_petal_manifest_v0"
                             .to_vec(),
                         logs: vec![],
+                        invariant_outcomes: Vec::new(),
                         write_set: None,
                     };
                 }
@@ -777,6 +795,7 @@ fn execute_tx_impl(
                     fuel_used,
                     return_data: format!("deploy petal failed: {e}").into_bytes(),
                     logs: vec![],
+                    invariant_outcomes: Vec::new(),
                     write_set: None,
                 };
             }
@@ -790,6 +809,7 @@ fn execute_tx_impl(
                     )
                     .into_bytes(),
                     logs: vec![],
+                    invariant_outcomes: Vec::new(),
                     write_set: None,
                 };
             }
@@ -799,6 +819,7 @@ fn execute_tx_impl(
                     fuel_used,
                     return_data: format!("deploy petal failed: {e}").into_bytes(),
                     logs: vec![],
+                    invariant_outcomes: Vec::new(),
                     write_set: None,
                 };
             }
@@ -810,6 +831,7 @@ fn execute_tx_impl(
                 fuel_used,
                 return_data: hash.0.to_vec(),
                 logs: vec![],
+                invariant_outcomes: Vec::new(),
                 write_set: Some(snap.commit()),
             }
         }
@@ -832,6 +854,7 @@ fn execute_tx_impl(
                         fuel_used: 0,
                         return_data: format!("ptb decode error: {e}").into_bytes(),
                         logs: vec![],
+                        invariant_outcomes: Vec::new(),
                         write_set: None,
                     }
                 }
@@ -855,6 +878,7 @@ fn execute_tx_impl(
                                 fuel_used: 0,
                                 return_data: format!("ptb validation error: {e}").into_bytes(),
                                 logs: vec![],
+                                invariant_outcomes: Vec::new(),
                                 write_set: None,
                             };
                         }
@@ -892,6 +916,7 @@ fn execute_tx_impl(
                                 return_data: b"ptb validation error: gas reservation overflow"
                                     .to_vec(),
                                 logs: vec![],
+                                invariant_outcomes: Vec::new(),
                                 write_set: None,
                             };
                         }
@@ -957,6 +982,7 @@ fn execute_tx_impl(
                                 fuel_used: 0,
                                 return_data: format!("ptb validation error: {e}").into_bytes(),
                                 logs: vec![],
+                                invariant_outcomes: Vec::new(),
                                 write_set: None,
                             };
                         }
@@ -1040,6 +1066,14 @@ fn execute_tx_impl(
                             fuel_used: revert_charged_fuel,
                             return_data: reason.into_bytes(),
                             logs: vec![],
+                            // Surface the recorded verdicts on a reverted
+                            // PTB too — e.g. the violating invariant when
+                            // the revert reason is InvariantFailed (ADR-002).
+                            invariant_outcomes: report
+                                .invariant_outcomes
+                                .iter()
+                                .map(inv_outcome_to_record)
+                                .collect(),
                             write_set: ws_out,
                         };
                     }
@@ -1108,6 +1142,7 @@ fn execute_tx_impl(
                                 )
                                 .into_bytes(),
                                 logs: vec![],
+                                invariant_outcomes: Vec::new(),
                                 write_set: ws_out,
                             };
                         }
@@ -1148,6 +1183,7 @@ fn execute_tx_impl(
                                 )
                                 .into_bytes(),
                                 logs: vec![],
+                                invariant_outcomes: Vec::new(),
                                 write_set: ws_out,
                             };
                         }
@@ -1187,6 +1223,7 @@ fn execute_tx_impl(
                                 return_data: format!("ptb publish admission error: {e}")
                                     .into_bytes(),
                                 logs: vec![],
+                                invariant_outcomes: Vec::new(),
                                 write_set: ws_out,
                             };
                         }
@@ -1226,6 +1263,7 @@ fn execute_tx_impl(
                                     return_data: b"ptb publish admission error: missing bloom_petal_manifest_v0"
                                         .to_vec(),
                                     logs: vec![],
+                                    invariant_outcomes: Vec::new(),
                                     write_set: ws_out,
                                 };
                             }
@@ -1265,6 +1303,7 @@ fn execute_tx_impl(
                                 return_data: format!("ptb publish admission error: {e}")
                                     .into_bytes(),
                                 logs: vec![],
+                                invariant_outcomes: Vec::new(),
                                 write_set: ws_out,
                             };
                         }
@@ -1304,6 +1343,7 @@ fn execute_tx_impl(
                                     return_data: format!("ptb publish admission error: {e}")
                                         .into_bytes(),
                                     logs: vec![],
+                                    invariant_outcomes: Vec::new(),
                                     write_set: ws_out,
                                 };
                             }
@@ -1346,6 +1386,7 @@ fn execute_tx_impl(
                                 return_data: format!("ptb publish admission error: {e}")
                                     .into_bytes(),
                                 logs: vec![],
+                                invariant_outcomes: Vec::new(),
                                 write_set: ws_out,
                             };
                         }
@@ -1382,6 +1423,7 @@ fn execute_tx_impl(
                                                 b"ptb gas settlement error: refund overflow"
                                                     .to_vec(),
                                             logs: vec![],
+                                            invariant_outcomes: Vec::new(),
                                             write_set: None,
                                         };
                                     };
@@ -1427,6 +1469,7 @@ fn execute_tx_impl(
                             fuel_used: charged_fuel,
                             return_data: format!("ptb gas settlement error: {e}").into_bytes(),
                             logs: vec![],
+                            invariant_outcomes: Vec::new(),
                             write_set: None,
                         };
                     }
@@ -1444,11 +1487,18 @@ fn execute_tx_impl(
                     // every command's outputs deterministically.
                     let return_data = encode_command_outputs(&report.command_outputs);
 
+                    let invariant_outcomes = report
+                        .invariant_outcomes
+                        .iter()
+                        .map(inv_outcome_to_record)
+                        .collect();
+
                     ExecOutput {
                         success: true,
                         fuel_used: charged_fuel,
                         return_data,
                         logs,
+                        invariant_outcomes,
                         write_set: Some(ws),
                     }
                 }
@@ -1593,6 +1643,28 @@ mod tests {
     use bloom_chain_consensus::tx_admission::{
         DEPLOY_PETAL_BASE_FUEL, DEPLOY_PETAL_BYTES_PER_FUEL,
     };
+
+    #[test]
+    fn inv_outcome_to_record_maps_verdicts() {
+        use bloom_script::{InvariantOutcome, InvariantVerdict};
+        let mk = |verdict| InvariantOutcome {
+            name: "pool_k".to_string(),
+            cmd_idx: 4,
+            verdict,
+        };
+        assert_eq!(
+            inv_outcome_to_record(&mk(InvariantVerdict::Satisfied)).verdict,
+            0
+        );
+        assert_eq!(
+            inv_outcome_to_record(&mk(InvariantVerdict::Violated)).verdict,
+            1
+        );
+        let rec = inv_outcome_to_record(&mk(InvariantVerdict::Indeterminate));
+        assert_eq!(rec.verdict, 2);
+        assert_eq!(rec.cmd_idx, 4);
+        assert_eq!(rec.name, b"pool_k");
+    }
 
     #[test]
     fn deploy_fuel_for_bytes_uses_saturating_add() {
