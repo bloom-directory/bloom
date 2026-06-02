@@ -264,13 +264,17 @@ upsert_core_fungible_petal() {
     local genesis_file="$1"
     local wasm_file="$BLOOM_DOCKER_PREBUILT_WASM_DIR/bloom_petal_fungible.wasm"
     [ -f "$wasm_file" ] || fail "missing core fungible wasm: $wasm_file"
-    local wasm_hex
-    wasm_hex="$(od -An -tx1 -v "$wasm_file" | tr -d ' \n')"
+    local wasm_hex_file="$BLOOM_DOCKER_TMPDIR/core_fungible_wasm.hex"
+    od -An -tx1 -v "$wasm_file" | tr -d ' \n' >"$wasm_hex_file"
     CORE_FUNGIBLE_PATH="$CORE_FUNGIBLE_PATH" \
-        CORE_FUNGIBLE_WASM_HEX="$wasm_hex" \
+        CORE_FUNGIBLE_WASM_HEX_FILE="$wasm_hex_file" \
         perl -0pi -e '
             my $path = quotemeta($ENV{CORE_FUNGIBLE_PATH});
-            my $block = "\n[[petals]]\npath = \"$ENV{CORE_FUNGIBLE_PATH}\"\nwasm_hex = \"$ENV{CORE_FUNGIBLE_WASM_HEX}\"\n";
+            open my $fh, "<", $ENV{CORE_FUNGIBLE_WASM_HEX_FILE}
+                or die "open wasm hex file: $!";
+            my $wasm_hex = do { local $/; <$fh> };
+            chomp $wasm_hex;
+            my $block = "\n[[petals]]\npath = \"$ENV{CORE_FUNGIBLE_PATH}\"\nwasm_hex = \"$wasm_hex\"\n";
             if (!s/\n\[\[petals\]\]\npath = "$path"\nwasm_hex = "[^"]*"\n/$block/s) {
                 $_ .= $block;
             }
