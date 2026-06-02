@@ -1804,7 +1804,9 @@ fn provision_testnet(
 ) -> Result<()> {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as B64;
-    use bloom_chain_node::genesis::{GenesisAllocation, GenesisFile, NodeConfig, ValidatorConfig};
+    use bloom_chain_node::genesis::{
+        GenesisAllocation, GenesisFile, GenesisPetal, NodeConfig, ValidatorConfig,
+    };
 
     if validators == 0 {
         anyhow::bail!("--validators must be >= 1");
@@ -1919,6 +1921,9 @@ fn provision_testnet(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
+    let core_fungible_wasm =
+        genesis_manifest_wasm(bloom_petal_fungible::fungible::__bloom_manifest_bytes())
+            .context("build core fungible genesis petal wasm")?;
     let genesis = GenesisFile {
         chain_id: chain_id.to_string(),
         genesis_time_ms,
@@ -1938,7 +1943,10 @@ fn provision_testnet(
                 amount: alloc_amount.to_string(),
             })
             .collect(),
-        petals: vec![],
+        petals: vec![GenesisPetal {
+            path: bloom_script::CORE_FUNGIBLE_PATH.to_string(),
+            wasm_hex: hex::encode(core_fungible_wasm),
+        }],
         key_registry: vec![],
     };
     let genesis_toml = toml::to_string_pretty(&genesis).context("serialize shared genesis.toml")?;
@@ -1994,6 +2002,35 @@ fn parse_port_from_host_port(s: &str) -> Result<u16> {
     port_str
         .parse::<u16>()
         .with_context(|| format!("parse port {port_str:?}"))
+}
+
+fn genesis_manifest_wasm(manifest_bytes: &[u8]) -> Result<Vec<u8>> {
+    let wasm = wat::parse_str("(module)").context("compile genesis bootstrap wasm")?;
+    Ok(append_manifest_section(wasm, manifest_bytes))
+}
+
+fn append_manifest_section(mut wasm: Vec<u8>, manifest_bytes: &[u8]) -> Vec<u8> {
+    let name = bloom_petal_manifest::MANIFEST_CUSTOM_SECTION;
+    let mut body = Vec::new();
+    write_uleb128(&mut body, name.len() as u64);
+    body.extend_from_slice(name.as_bytes());
+    body.extend_from_slice(manifest_bytes);
+    wasm.push(0x00);
+    write_uleb128(&mut wasm, body.len() as u64);
+    wasm.extend_from_slice(&body);
+    wasm
+}
+
+fn write_uleb128(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
 }
 
 /// Bind `count` consecutive TCP listeners starting at an OS-assigned port,

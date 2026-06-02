@@ -568,6 +568,14 @@ fn chain_testnet_writes_validator_keys_with_mode_0600() {
         ])
         .assert()
         .success();
+    let genesis = std::fs::read_to_string(outdir.join("home0").join("chain").join("genesis.toml"))
+        .expect("read generated genesis.toml");
+    assert!(
+        genesis.contains("[[petals]]")
+            && genesis.contains(r#"path = "/bloom/petals/core/fungible""#)
+            && genesis.contains("wasm_hex = \"00"),
+        "generated funded genesis must bind the core fungible petal"
+    );
     for i in 0..2u8 {
         let key = outdir
             .join(format!("home{i}"))

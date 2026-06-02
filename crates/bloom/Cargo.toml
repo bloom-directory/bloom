@@ -32,6 +32,8 @@ bloom-vfs.workspace = true
 bloom-tools.workspace = true
 bloom-petals.workspace = true
 bloom-ptb-builder.workspace = true
+bloom-petal-fungible.workspace = true
+bloom-petal-manifest.workspace = true
 bloom-script.workspace = true
 bloom-objects.workspace = true
 anyhow.workspace = true
@@ -56,4 +58,3 @@ tempfile.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
 bloom-test-util = { path = "../bloom-test-util" }
-bloom-petal-fungible.workspace = true

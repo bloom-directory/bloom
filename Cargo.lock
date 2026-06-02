@@ -2080,6 +2080,7 @@ dependencies = [
  "bloom-mount",
  "bloom-objects",
  "bloom-petal-fungible",
+ "bloom-petal-manifest",
  "bloom-petals",
  "bloom-proto",
  "bloom-ptb-builder",
