@@ -678,17 +678,27 @@ fn can_move_or_reown(row: &BorrowRow, caller_petal: Hash32) -> Result<bool, i32>
     Ok(defines || consumed)
 }
 
-const COIN_MINTER_PATHS: &[&str] = &[CORE_FUNGIBLE_PATH];
+const COIN_MINTER_PATHS: &[&str] = &[CORE_FUNGIBLE_PATH, "/bloom/petals/dex/pool"];
 
-fn is_authorized_coin_minter(caller: &Caller<'_, ChainStoreData>, caller_petal: [u8; 32]) -> bool {
-    COIN_MINTER_PATHS.iter().any(|path| {
+fn authorized_coin_defining_petal(
+    caller: &Caller<'_, ChainStoreData>,
+    caller_petal: [u8; 32],
+) -> Option<[u8; 32]> {
+    let fungible_hash = caller
+        .data()
+        .chain_ctx
+        .snapshot
+        .vfs_lookup(CORE_FUNGIBLE_PATH)?
+        .0;
+    let authorized = COIN_MINTER_PATHS.iter().any(|path| {
         caller
             .data()
             .chain_ctx
             .snapshot
             .vfs_lookup(path)
             .is_some_and(|hash| hash.0 == caller_petal)
-    })
+    });
+    authorized.then_some(fungible_hash)
 }
 
 /// Install the spec §16.2 host imports onto `linker`.
@@ -955,18 +965,33 @@ fn link_new_host_imports(linker: &mut Linker<ChainStoreData>) -> anyhow::Result<
                     type_name,
                     type_args,
                 } => {
-                    if petal_hash != [0u8; 32] && petal_hash != caller_petal {
-                        return HostError::Denied("object.create from non-defining petal".into())
+                    let stamped_petal_hash = if type_name == "Coin" {
+                        let Some(fungible_hash) =
+                            authorized_coin_defining_petal(&caller, caller_petal)
+                        else {
+                            return HostError::Denied(
+                                "object.create Coin from unauthorized petal".into(),
+                            )
                             .as_wasm_code();
-                    }
-                    if type_name == "Coin" && !is_authorized_coin_minter(&caller, caller_petal) {
-                        return HostError::Denied(
-                            "object.create Coin from unauthorized petal".into(),
-                        )
-                        .as_wasm_code();
-                    }
+                        };
+                        if petal_hash != [0u8; 32] && petal_hash != fungible_hash {
+                            return HostError::Denied(
+                                "object.create Coin from non-fungible petal".into(),
+                            )
+                            .as_wasm_code();
+                        }
+                        fungible_hash
+                    } else {
+                        if petal_hash != [0u8; 32] && petal_hash != caller_petal {
+                            return HostError::Denied(
+                                "object.create from non-defining petal".into(),
+                            )
+                            .as_wasm_code();
+                        }
+                        caller_petal
+                    };
                     TypeTag::Concrete {
-                        petal_hash: caller_petal,
+                        petal_hash: stamped_petal_hash,
                         type_name,
                         type_args,
                     }
@@ -1541,6 +1566,19 @@ fn validate_object_payload(
     tag: &TypeTag,
     payload: &[u8],
 ) -> Result<(), i32> {
+    if let TypeTag::Concrete { type_name, .. } = tag
+        && type_name == "Coin"
+    {
+        return if payload.len() == 16 {
+            Ok(())
+        } else {
+            Err(HostError::Invalid(format!(
+                "Coin payload must be 16 bytes, got {}",
+                payload.len()
+            ))
+            .as_wasm_code())
+        };
+    }
     let Some(manifest) = caller.data().manifest.as_ref() else {
         return Err(
             HostError::Invalid("object payload validation requires manifest".into()).as_wasm_code(),
@@ -2737,7 +2775,10 @@ mod ptb_host_import_tests {
     // -----------------------------------------------------------------------
 
     fn object_create_wat(type_tag_bytes: &[u8]) -> String {
-        object_create_wat_with_payload(type_tag_bytes, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+        object_create_wat_with_payload(
+            type_tag_bytes,
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        )
     }
 
     fn wat_bytes(bytes: &[u8]) -> String {
@@ -2986,7 +3027,46 @@ mod ptb_host_import_tests {
         let out = run_with_state(wasm, arc.clone(), Hash32([0; 32]), state);
         let code = i32::from_le_bytes(out.return_data.unwrap().try_into().unwrap());
         assert!(code >= 0, "authorized core fungible Coin create got {code}");
-        assert_eq!(arc.lock().unwrap().created_objects.len(), 1);
+        let guard = arc.lock().unwrap();
+        assert_eq!(guard.created_objects.len(), 1);
+        match &guard.created_objects[0].type_tag {
+            TypeTag::Concrete { petal_hash, .. } => assert_eq!(*petal_hash, computed_petal.0),
+            other => panic!("created Coin had non-concrete type tag: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_create_coin_from_dex_pool_binding_is_allowed() {
+        let coin_tag = TypeTag::Concrete {
+            petal_hash: [0u8; 32],
+            type_name: "Coin".into(),
+            type_args: vec![TypeTag::Concrete {
+                petal_hash: [0u8; 32],
+                type_name: "Erased".into(),
+                type_args: vec![],
+            }],
+        };
+        let bytes = coin_tag.encode_canonical().unwrap();
+        let wasm = append_manifest(
+            parse(&object_create_wat(&bytes)),
+            generic_object_manifest("Coin", vec![("value", builtin("u128"))]),
+        );
+        let computed_petal = blake3_tagged(tags::PETAL, &wasm);
+        let fungible_petal = Hash32([0x42; 32]);
+        let mut state = State::new();
+        state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), fungible_petal);
+        state.set_vfs_binding("/bloom/petals/dex/pool".to_string(), computed_petal);
+
+        let arc = Arc::new(Mutex::new(PtbHostCtx::new()));
+        let out = run_with_state(wasm, arc.clone(), Hash32([0; 32]), state);
+        let code = i32::from_le_bytes(out.return_data.unwrap().try_into().unwrap());
+        assert!(code >= 0, "authorized DEX pool Coin create got {code}");
+        let guard = arc.lock().unwrap();
+        assert_eq!(guard.created_objects.len(), 1);
+        match &guard.created_objects[0].type_tag {
+            TypeTag::Concrete { petal_hash, .. } => assert_eq!(*petal_hash, fungible_petal.0),
+            other => panic!("created Coin had non-concrete type tag: {other:?}"),
+        }
     }
 
     #[test]

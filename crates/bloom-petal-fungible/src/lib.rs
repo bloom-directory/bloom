@@ -44,7 +44,7 @@ use bloom_resource_macros as bloom;
 pub mod ops {
     use bloom_objects::{AccessMode, ObjectId, Owner, TypeTag};
     use bloom_resource::host;
-    use bloom_resource::{BloomType, Erased, PetalError, RuntimeHandle, UID};
+    use bloom_resource::{BloomType, Erased, PetalError, RuntimeHandle, UID, current_type_arg};
     use core::marker::PhantomData;
 
     // -----------------------------------------------------------------
@@ -117,7 +117,8 @@ pub mod ops {
     // TypeTag builders (zero petal_hash placeholder, per spec §8.2)
     // -----------------------------------------------------------------
 
-    fn type_tag_with_arg(name: &str, arg: &TypeTag) -> TypeTag {
+    /// Build a zero-hash self-reference type tag with one type argument.
+    pub fn type_tag_with_arg(name: &str, arg: &TypeTag) -> TypeTag {
         TypeTag::Concrete {
             petal_hash: [0u8; 32],
             type_name: name.to_string(),
@@ -125,7 +126,8 @@ pub mod ops {
         }
     }
 
-    fn type_tag_no_args(name: &str) -> TypeTag {
+    /// Build a zero-hash self-reference type tag with no type arguments.
+    pub fn type_tag_no_args(name: &str) -> TypeTag {
         TypeTag::Concrete {
             petal_hash: [0u8; 32],
             type_name: name.to_string(),
@@ -138,6 +140,12 @@ pub mod ops {
     /// says `<T>`.
     pub fn type_tag_t() -> TypeTag {
         TypeTag::Generic { idx: 0 }
+    }
+
+    /// Runtime-resolved first type argument, falling back to the generic
+    /// placeholder for direct host-side tests outside a petal shim.
+    pub fn current_type_tag_t() -> TypeTag {
+        current_type_arg(0).unwrap_or_else(type_tag_t)
     }
 
     /// The canonical `TypeTag` for `Coin<LOOM>` with the zero
@@ -158,7 +166,7 @@ pub mod ops {
     /// Returns the three host borrow-table handles in declaration
     /// order: `(mint_handle, burn_handle, supply_handle)`.
     pub fn create_currency() -> Result<(RuntimeHandle, RuntimeHandle, RuntimeHandle), PetalError> {
-        let t = type_tag_t();
+        let t = current_type_tag_t();
         let mint_tag = type_tag_with_arg("MintCap", &t);
         let burn_tag = type_tag_with_arg("BurnCap", &t);
         let supply_tag = type_tag_with_arg("Supply", &t);
@@ -181,7 +189,7 @@ pub mod ops {
         let next = current.checked_add(amount).ok_or(PetalError::Custom(1))?;
 
         let coin_handle = host::object_create(
-            &type_tag_with_arg("Coin", &type_tag_t()),
+            &type_tag_with_arg("Coin", &current_type_tag_t()),
             &coin_payload(amount),
         )?;
 
@@ -221,7 +229,7 @@ pub mod ops {
             .ok_or(PetalError::InsufficientBalance)?;
 
         let new_handle = host::object_create(
-            &type_tag_with_arg("Coin", &type_tag_t()),
+            &type_tag_with_arg("Coin", &current_type_tag_t()),
             &coin_payload(amount),
         )?;
 
@@ -282,7 +290,7 @@ pub mod ops {
 #[bloom::petal(path = "/bloom/petals/core/fungible", version = "0.1.0")]
 pub mod fungible {
     use crate::ops;
-    use bloom_resource::{Capability, Resource, Signer, UID};
+    use bloom_resource::{Capability, Resource, Signer, UID, current_type_arg};
     use core::marker::PhantomData;
 
     /// 32-byte post-quantum chain address; the recipient of a transfer
@@ -375,18 +383,41 @@ pub mod fungible {
     // Real PTBs assemble the triple by calling all three and threading
     // results with `Use(cmd, ret)` references.
 
-    /// Create the `MintCap<T>` half of a fresh fungible-currency triple
-    /// (`MintCap<T>`, `BurnCap<T>`, `Supply<T>`). Per spec §5.3,
-    /// capabilities are minted at type-creation time by `create_currency`
-    /// and cannot be granted in isolation afterwards.
+    /// Create a fresh `MintCap<T>`.
     ///
-    /// PTBs that need all three capabilities call this once and thread
-    /// the return values via `Use(cmd, ret)` references to downstream
-    /// commands. There is no separate `create_burn_cap` entry point —
-    /// the `BurnCap<T>` is an inseparable part of the triple (spec §14.1).
+    /// PTBs that mint through the canonical fungible petal pair this with a
+    /// `Supply<T>` from [`create_supply`]. There is no direct external-petal
+    /// `Coin<T>` mint path.
     pub fn create_currency<T>(_signer: &Signer) -> Capability<MintCap<T>> {
-        let (mint, _burn, _supply) = ops::create_currency().expect("create_currency host failure");
+        let t = current_type_arg(0).unwrap_or_else(ops::type_tag_t);
+        let mint_tag = ops::type_tag_with_arg("MintCap", &t);
+        let mint = bloom_resource::host::object_create(&mint_tag, &ops::cap_payload())
+            .expect("create_currency host failure");
         Capability::from_handle(mint)
+    }
+
+    /// Create a fresh `BurnCap<T>`.
+    ///
+    /// This mirrors [`create_currency`] for PTBs that need to retain burn
+    /// authority through the canonical fungible petal surface.
+    pub fn create_burn_cap<T>(_signer: &Signer) -> Capability<BurnCap<T>> {
+        let t = current_type_arg(0).unwrap_or_else(ops::type_tag_t);
+        let burn_tag = ops::type_tag_with_arg("BurnCap", &t);
+        let burn = bloom_resource::host::object_create(&burn_tag, &ops::cap_payload())
+            .expect("create_burn_cap host failure");
+        Capability::from_handle(burn)
+    }
+
+    /// Create the `Supply<T>` tracker for a fresh fungible currency.
+    ///
+    /// PTBs pass this object to [`mint`] / [`burn`] so total issuance is updated
+    /// by the canonical core fungible petal rather than by external petals.
+    pub fn create_supply<T>(_signer: &Signer) -> Resource<Supply<T>> {
+        let t = current_type_arg(0).unwrap_or_else(ops::type_tag_t);
+        let supply_tag = ops::type_tag_with_arg("Supply", &t);
+        let supply = bloom_resource::host::object_create(&supply_tag, &ops::supply_payload(0))
+            .expect("create_supply host failure");
+        Resource::from_handle(supply)
     }
 
     /// Mint `amount` units of `Coin<T>` against the `MintCap<T>` proof

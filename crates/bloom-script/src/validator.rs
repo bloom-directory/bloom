@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use bloom_objects::{AccessMode, Object, ObjectId, Owner, TypeTag};
+use bloom_objects::{AccessMode, BUILTIN_TYPE_HASH, Object, ObjectId, Owner, TypeTag};
 use bloom_resource::BloomType;
 
 use crate::chain_iface::{ArgDeclStub, ChainStateIface, FunctionDeclStub, PetalManifestStub};
@@ -854,6 +854,16 @@ fn type_tags_match_inner(
     local_object_types: &HashSet<&str>,
     allow_top_level_import: bool,
 ) -> bool {
+    if is_object_id_tag(declared) && is_object_handle_tag(actual, local_object_types) {
+        return true;
+    }
+    if let (Some(actual_inner), Some(declared_inner)) =
+        (option_type_arg(actual), option_type_arg(declared))
+        && is_object_id_tag(declared_inner)
+        && is_object_handle_tag(actual_inner, local_object_types)
+    {
+        return true;
+    }
     match (actual, declared) {
         (
             TypeTag::Concrete {
@@ -889,6 +899,45 @@ fn type_tags_match_inner(
         (TypeTag::External { ref_idx: a }, TypeTag::External { ref_idx: b }) => a == b,
         _ => false,
     }
+}
+
+fn option_type_arg(t: &TypeTag) -> Option<&TypeTag> {
+    let TypeTag::Concrete {
+        petal_hash,
+        type_name,
+        type_args,
+    } = t
+    else {
+        return None;
+    };
+    if *petal_hash == BUILTIN_TYPE_HASH && type_name == "Option" && type_args.len() == 1 {
+        type_args.first()
+    } else {
+        None
+    }
+}
+
+fn is_object_id_tag(t: &TypeTag) -> bool {
+    matches!(
+        t,
+        TypeTag::Concrete {
+            petal_hash,
+            type_name,
+            type_args,
+        } if *petal_hash == BUILTIN_TYPE_HASH && type_name == "ObjectId" && type_args.is_empty()
+    )
+}
+
+fn is_object_handle_tag(t: &TypeTag, local_object_types: &HashSet<&str>) -> bool {
+    matches!(
+        t,
+        TypeTag::Concrete {
+            type_name,
+            type_args: _,
+            ..
+        } if matches!(type_name.as_str(), "Coin" | "Resource" | "Capability")
+            || local_object_types.contains(type_name.as_str())
+    )
 }
 
 fn resolve_self_type_refs(t: &TypeTag, self_hash: [u8; 32]) -> TypeTag {
@@ -1104,11 +1153,9 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 /// Extract a `Coin<T>::value` from a `Coin` payload.
 pub fn decode_coin_value(payload: &[u8]) -> Result<u128, PtbError> {
-    u128::canonical_decode(payload).map_err(|_| {
-        PtbError::InvalidGasPayer {
-            id: ObjectId([0; 32]),
-            reason: format!("coin payload must be 16 bytes, got {}", payload.len()),
-        }
+    u128::canonical_decode(payload).map_err(|_| PtbError::InvalidGasPayer {
+        id: ObjectId([0; 32]),
+        reason: format!("coin payload must be 16 bytes, got {}", payload.len()),
     })
 }
 
@@ -1227,7 +1274,7 @@ mod tests {
                 ..Default::default()
             }],
             external_type_refs: vec![],
-        ..Default::default()
+            ..Default::default()
         }
     }
 
@@ -2879,7 +2926,7 @@ mod tests {
             }],
             object_types: vec![],
             external_type_refs: vec![],
-        ..Default::default()
+            ..Default::default()
         };
         chain.put_petal(Hash32([0xCD; 32]), vec![], producer);
         chain.put_path("/evil", Hash32([0xCD; 32]));

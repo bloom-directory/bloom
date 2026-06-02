@@ -46,8 +46,8 @@ use crate::chain_iface::{ArgDeclStub, ChainStateIface, InvariantDeclStub, PetalM
 use crate::error::PtbError;
 use crate::host_ctx::PtbHostCtx;
 use crate::types::{Arg, Command, MoveCmd, PublishCmd, UpgradeCmd, UseRef};
-use crate::value_validation::validate_return_slot;
 use crate::validator::{ValidatedPtb, decode_coin_value};
+use crate::value_validation::validate_return_slot;
 
 const MAX_PETAL_RETURN_SLOTS: usize = 32;
 const MAX_PETAL_RETURN_BYTES: usize = 2 << 20;
@@ -1525,7 +1525,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -1568,7 +1568,7 @@ mod tests {
             }],
             object_types: vec![],
             external_type_refs: vec![],
-        ..Default::default()
+            ..Default::default()
         };
         chain.put_petal(petal, vec![1, 2, 3], manifest.clone());
         let minted_id = ObjectId([0x44; 32]);
@@ -1648,7 +1648,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -1699,7 +1699,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -1747,7 +1747,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -1794,7 +1794,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -1857,7 +1857,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -1910,7 +1910,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
         // Source coin (separate from gas payer).
@@ -1943,7 +1943,7 @@ mod tests {
             }],
             object_types: vec![],
             external_type_refs: vec![],
-        ..Default::default()
+            ..Default::default()
         };
         chain.put_petal(petal, vec![], manifest_with_arg.clone());
 
@@ -2027,7 +2027,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
         let tx = sample_signed_ptb(
@@ -2098,7 +2098,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -2172,7 +2172,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -2241,7 +2241,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -2327,7 +2327,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -2396,7 +2396,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -2488,7 +2488,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -2576,7 +2576,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -2655,7 +2655,7 @@ mod tests {
             }],
             object_types: vec![],
             external_type_refs: vec![],
-        ..Default::default()
+            ..Default::default()
         };
         chain.put_petal(petal, vec![], manifest.clone());
         let mut runner = MockPetalRunner::new();
@@ -2710,7 +2710,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
         let mut runner = MockPetalRunner::new();
@@ -2936,7 +2936,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
 
@@ -3025,7 +3025,7 @@ mod tests {
                 ],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
 
@@ -3111,7 +3111,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
 
@@ -3216,7 +3216,7 @@ mod tests {
                 }],
                 object_types: vec![],
                 external_type_refs: vec![],
-            ..Default::default()
+                ..Default::default()
             },
         );
         let ctx = Arc::new(Mutex::new(PtbHostCtx::new()));

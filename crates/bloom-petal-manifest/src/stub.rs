@@ -23,8 +23,7 @@ use bloom_script::{
 
 use crate::types::{
     ArgKind, CapabilityDecl, DataTypeDecl, EnumTypeDecl, FieldDecl, FunctionDecl, InvariantDecl,
-    ObjectTypeDecl, PetalManifestV0, TypeParamDecl, TypeParamKind, VariantDecl,
-    VariantFieldsDecl,
+    ObjectTypeDecl, PetalManifestV0, TypeParamDecl, TypeParamKind, VariantDecl, VariantFieldsDecl,
 };
 
 /// Project a full canonical manifest down to the validator-facing stub.

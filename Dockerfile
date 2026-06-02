@@ -84,6 +84,7 @@ RUN BLOOM_DEX_FAUCET_ADMIN_HEX=6252e10b0fae9107bdf13f3dfe482e81099df4ef93e737351
     cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-faucet
 RUN cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-cpmm
 RUN cargo build --release --target wasm32-unknown-unknown -p bloom-petal-dex-router
+RUN cargo build --release --target wasm32-unknown-unknown -p bloom-petal-fungible
 
 # Stage outputs into /out so the runtime COPY is dead-simple.
 RUN set -eux; \
@@ -93,7 +94,7 @@ RUN set -eux; \
     test -n "$test_bin"; \
     cp "$test_bin" /out/tests/docker_petal_dex; \
     for w in bloom_petal_dex_pool bloom_petal_dex_wallet bloom_petal_dex_faucet \
-             bloom_petal_dex_cpmm bloom_petal_dex_router; do \
+             bloom_petal_dex_cpmm bloom_petal_dex_router bloom_petal_fungible; do \
         cp "target/wasm32-unknown-unknown/release/${w}.wasm" "/out/wasm/${w}.wasm"; \
     done; \
     ls -la /out/bin /out/tests /out/wasm

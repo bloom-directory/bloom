@@ -7,8 +7,8 @@ use bloom_value::{
 };
 
 use crate::chain_iface::{
-    CapabilityTypeDeclStub, DataTypeDeclStub, EnumTypeDeclStub, FieldDeclStub,
-    ObjectTypeDeclStub, PetalManifestStub, VariantFieldsDeclStub,
+    CapabilityTypeDeclStub, DataTypeDeclStub, EnumTypeDeclStub, FieldDeclStub, ObjectTypeDeclStub,
+    PetalManifestStub, VariantFieldsDeclStub,
 };
 
 /// Validate a PTB `Arg::Const` slot against a manifest-declared value type.
@@ -82,8 +82,13 @@ fn is_object_handle_tag(manifest: &PetalManifestStub, tag: &TypeTag) -> bool {
     let TypeTag::Concrete { type_name, .. } = tag else {
         return false;
     };
-    matches!(type_name.as_str(), "Coin" | "Balance" | "Resource" | "Capability")
-        || manifest.object_types.iter().any(|decl| decl.name == *type_name)
+    matches!(
+        type_name.as_str(),
+        "Coin" | "Balance" | "Resource" | "Capability"
+    ) || manifest
+        .object_types
+        .iter()
+        .any(|decl| decl.name == *type_name)
         || manifest
             .capability_types
             .iter()

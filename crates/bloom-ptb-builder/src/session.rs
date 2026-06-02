@@ -44,8 +44,7 @@ use bloom_objects::{Object, TypeTag};
 use bloom_script::{
     AlwaysOkVerifier, Arg, ArgDeclStub, ChainStateIface, Command, MoveCmd, PetalRef, PqPubkey,
     PqSignature, PtbError, PtbTx, SignatureVerifier, UseRef, ValidationContext, ValidationMode,
-    loom_coin_type_tag, validate_ptb,
-    value_validation::validate_const_slot,
+    loom_coin_type_tag, validate_ptb, value_validation::validate_const_slot,
 };
 
 use crate::error::BuildError;

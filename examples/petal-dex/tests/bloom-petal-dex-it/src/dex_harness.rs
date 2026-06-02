@@ -29,6 +29,7 @@ use bloom_objects::{
 use bloom_petal_fungible::ops::{
     coin_payload, decode_coin_value as fungible_decode_coin_value, type_tag_coin_loom,
 };
+use bloom_resource::BloomType;
 use bloom_script::{
     Arg, CORE_FUNGIBLE_PATH, Command, DEFAULT_FUNGIBLE_PETAL_HASH, ExpectedVersion,
     FunctionDeclStub, MoveCmd, PetalManifestStub, PetalRef, PqSignature, UseRef, encode_ptb,
@@ -606,7 +607,7 @@ pub fn create_shared_pool(
         .map(|(id, _)| *id)
         .collect();
 
-    let params_bytes = fee_bps.to_be_bytes().to_vec();
+    let params_bytes = fee_bps.to_be_bytes().to_vec().canonical_encode();
     let gas_payer = genesis_coin_id(alice, 0);
     let ptb = PtbTx {
         signers: vec![alice.0],
