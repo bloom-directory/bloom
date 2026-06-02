@@ -2005,8 +2005,57 @@ fn parse_port_from_host_port(s: &str) -> Result<u16> {
 }
 
 fn genesis_manifest_wasm(manifest_bytes: &[u8]) -> Result<Vec<u8>> {
-    let wasm = wat::parse_str("(module)").context("compile genesis bootstrap wasm")?;
+    let manifest = bloom_petal_manifest::codec::decode(manifest_bytes)
+        .context("decode genesis petal manifest")?;
+    let mut wasm = Vec::new();
+    wasm.extend_from_slice(b"\0asm");
+    wasm.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+
+    // type 0: (i32, i32) -> i32, the PTB petal export ABI.
+    wasm_section(&mut wasm, 1, &[0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f]);
+
+    let mut export_names: Vec<String> = manifest
+        .functions
+        .iter()
+        .map(|function| format!("__petal_{}", function.name))
+        .collect();
+    export_names.extend(
+        manifest
+            .invariants
+            .iter()
+            .map(|invariant| invariant.wasm_export.clone()),
+    );
+
+    let mut functions = Vec::new();
+    write_uleb128(&mut functions, export_names.len() as u64);
+    functions.extend(std::iter::repeat_n(0x00, export_names.len()));
+    wasm_section(&mut wasm, 3, &functions);
+
+    let mut exports = Vec::new();
+    write_uleb128(&mut exports, export_names.len() as u64);
+    for (idx, export_name) in export_names.iter().enumerate() {
+        write_uleb128(&mut exports, export_name.len() as u64);
+        exports.extend_from_slice(export_name.as_bytes());
+        exports.push(0x00);
+        write_uleb128(&mut exports, idx as u64);
+    }
+    wasm_section(&mut wasm, 7, &exports);
+
+    let mut code = Vec::new();
+    write_uleb128(&mut code, export_names.len() as u64);
+    for _ in &export_names {
+        // no locals; i32.const 0; end
+        code.extend_from_slice(&[0x04, 0x00, 0x41, 0x00, 0x0b]);
+    }
+    wasm_section(&mut wasm, 10, &code);
+
     Ok(append_manifest_section(wasm, manifest_bytes))
+}
+
+fn wasm_section(out: &mut Vec<u8>, id: u8, body: &[u8]) {
+    out.push(id);
+    write_uleb128(out, body.len() as u64);
+    out.extend_from_slice(body);
 }
 
 fn append_manifest_section(mut wasm: Vec<u8>, manifest_bytes: &[u8]) -> Vec<u8> {
