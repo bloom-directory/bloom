@@ -1122,7 +1122,6 @@ fn single_call_command_for_function(
 fn call_type_arg_token(value: &serde_json::Value) -> Result<String> {
     let tag = bloom_script::decode_json_type_tag(value)
         .with_context(|| format!("decode --type-arg {value}"))?;
-    let tag = bloom_value::normalize_legacy_builtin_type_tag(&tag);
     Ok(bloom_value::type_tag_label(&tag))
 }
 
@@ -2335,7 +2334,7 @@ allocations = []
     #[test]
     fn call_command_builds_ptb_builder_line_from_json_args() {
         let u64_tag = bloom_objects::TypeTag::Concrete {
-            petal_hash: [0u8; 32],
+            petal_hash: bloom_objects::BUILTIN_TYPE_HASH,
             type_name: "u64".to_string(),
             type_args: vec![],
         };
