@@ -2044,8 +2044,10 @@ fn genesis_manifest_wasm(manifest_bytes: &[u8]) -> Result<Vec<u8>> {
     let mut code = Vec::new();
     write_uleb128(&mut code, export_names.len() as u64);
     for _ in &export_names {
-        // no locals; i32.const 0; end
-        code.extend_from_slice(&[0x04, 0x00, 0x41, 0x00, 0x0b]);
+        // no locals; i32.const -3; end. This manifest-only bootstrap wasm
+        // exists to bind the path and schema at genesis, but it must fail
+        // closed if someone calls it before replacing it with real wasm.
+        code.extend_from_slice(&[0x04, 0x00, 0x41, 0x7d, 0x0b]);
     }
     wasm_section(&mut wasm, 10, &code);
 
@@ -2173,6 +2175,24 @@ mod tests {
             type_name: name.to_string(),
             type_args: vec![],
         }
+    }
+
+    #[test]
+    fn genesis_manifest_wasm_exports_fail_closed() {
+        let wasm = genesis_manifest_wasm(bloom_petal_fungible::fungible::__bloom_manifest_bytes())
+            .expect("genesis manifest wasm builds");
+
+        assert!(
+            wasm.windows(5)
+                .any(|window| window == [0x04, 0x00, 0x41, 0x7d, 0x0b]),
+            "bootstrap petal exports must return the Invalid host code, not success"
+        );
+        assert!(
+            !wasm
+                .windows(5)
+                .any(|window| window == [0x04, 0x00, 0x41, 0x00, 0x0b]),
+            "bootstrap petal exports must not be successful no-ops"
+        );
     }
 
     fn command_test_chain() -> MockChain {

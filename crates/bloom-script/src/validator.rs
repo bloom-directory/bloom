@@ -799,7 +799,7 @@ fn is_coin_type_tag(t: &TypeTag) -> bool {
 
 fn vector_type_tag(elem: TypeTag) -> TypeTag {
     TypeTag::Concrete {
-        petal_hash: [0u8; 32],
+        petal_hash: BUILTIN_TYPE_HASH,
         type_name: "vector".to_string(),
         type_args: vec![elem],
     }
@@ -2669,6 +2669,79 @@ mod tests {
             matches!(err, PtbError::TypeMismatch { ref reason, .. } if reason.contains("vector") && reason.contains("Coin")),
             "expected vector/scalar TypeMismatch, got {err:?}"
         );
+    }
+
+    #[test]
+    fn make_move_vec_output_matches_builtin_vector_declared_arg() {
+        let (chain, signer, gas_id) = setup();
+        let vector_of_loom = TypeTag::Concrete {
+            petal_hash: bloom_objects::BUILTIN_TYPE_HASH,
+            type_name: "vector".to_string(),
+            type_args: vec![loom_coin_tt()],
+        };
+        let mut m = sample_manifest();
+        m.functions.push(FunctionDeclStub {
+            view: false,
+            name: "producer".to_string(),
+            type_params: vec![],
+            args: vec![],
+            returns: vec![loom_coin_tt()],
+            required_signers: 0,
+            required_capabilities: vec![],
+            attached_invariants: vec![],
+        });
+        m.functions.push(FunctionDeclStub {
+            view: false,
+            name: "consumer".to_string(),
+            type_params: vec![],
+            args: vec![ArgDeclStub::Const(vector_of_loom)],
+            returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
+            attached_invariants: vec![],
+        });
+        chain.put_petal(Hash32([0xAB; 32]), vec![], m);
+        let tx = PtbTx {
+            signers: vec![signer],
+            commands: vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/bloom/petals/dex/pool".to_string(),
+                        hash: Some(Hash32([0xAB; 32])),
+                    },
+                    function: "producer".to_string(),
+                    type_args: vec![],
+                    args: vec![],
+                }),
+                Command::MakeMoveVec {
+                    ty: loom_coin_tt(),
+                    uses: vec![UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    }],
+                },
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/bloom/petals/dex/pool".to_string(),
+                        hash: Some(Hash32([0xAB; 32])),
+                    },
+                    function: "consumer".to_string(),
+                    type_args: vec![],
+                    args: vec![Arg::Use {
+                        cmd_idx: 1,
+                        ret_idx: 0,
+                    }],
+                }),
+            ],
+            gas_payer: gas_id,
+            gas_budget: 100,
+            gas_price: 1,
+            expiry_block: 100,
+            signatures: vec![PqSignature(vec![0xCC; 8])],
+        };
+        let verifier = AlwaysOkVerifier;
+
+        assert!(validate_ptb(&tx, &ctx(&chain, &verifier)).is_ok());
     }
 
     #[test]
