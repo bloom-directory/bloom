@@ -25,7 +25,7 @@ const CONVERGE_TIMEOUT: Duration = Duration::from_secs(120);
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "spawns 4 long-running validator processes; run with `--ignored` or in CI"]
 async fn four_validator_state_root_convergence() -> Result<()> {
-    ensure_bloom_built()?;
+    ensure_bloom_bin_available()?;
 
     let dir = tempdir()?;
     let parent: PathBuf = dir.path().to_path_buf();
@@ -141,13 +141,13 @@ fn tail_file(path: &std::path::Path, max_lines: usize) -> String {
     }
 }
 
-fn ensure_bloom_built() -> Result<()> {
-    let status = std::process::Command::new("cargo")
-        .args(["build", "-p", "bloom", "--bin", "bloom"])
-        .status()
-        .context("invoke `cargo build -p bloom`")?;
-    if !status.success() {
-        return Err(anyhow!("`cargo build -p bloom` failed"));
+fn ensure_bloom_bin_available() -> Result<()> {
+    let bin = chain_harness::bloom_bin();
+    if !bin.is_file() {
+        return Err(anyhow!(
+            "bloom binary not found at {}; build it first with `cargo build -p bloom --bin bloom` or set BLOOM_BIN",
+            bin.display()
+        ));
     }
     Ok(())
 }

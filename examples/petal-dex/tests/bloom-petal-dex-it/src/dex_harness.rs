@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command as OsCommand;
+use std::sync::{Mutex, OnceLock};
 
 use bloom_chain_node::{
     consensus_driver::{ExecOutput, PetalExecutor},
@@ -306,16 +307,38 @@ pub fn addr(b: u8) -> Address {
 // builds on the same proven foundation.
 // ---------------------------------------------------------------------------
 
-/// Build a workspace crate for `wasm32-unknown-unknown` (default features —
-/// i.e. *with* the `__petal_*` entrypoints) and return the path to the
-/// emitted release `<artifact>.wasm`. Live-chain tests deploy these blobs
-/// through the same chain admission path as operators; debug WASM artifacts are
-/// several MiB and intentionally exceed the protocol's max code-size cap.
+static WASM_ARTIFACT_CACHE: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+
+/// Build or resolve a workspace crate's `wasm32-unknown-unknown` release
+/// artifact (default features — i.e. *with* the `__petal_*` entrypoints).
+///
+/// Resolution order:
+/// 1. An explicit per-petal env var such as `BLOOM_PETAL_DEX_POOL_WASM`.
+/// 2. `BLOOM_PETAL_DEX_WASM_DIR/<artifact>.wasm`.
+/// 3. `BLOOM_DOCKER_PREBUILT_WASM_DIR/<artifact>.wasm`.
+/// 4. A cached fallback `cargo build --release --target wasm32-unknown-unknown`.
+///
+/// For admin-specific faucet builds, shared directory lookup is only used for
+/// the harness's default PTB signer admin. Custom-admin tests must either set
+/// `BLOOM_PETAL_DEX_FAUCET_WASM` explicitly or fall back to Cargo.
 fn build_petal_wasm_with_env(
     crate_name: &str,
     artifact_stem: &str,
     envs: &[(&str, String)],
 ) -> PathBuf {
+    let cache_key = wasm_cache_key(crate_name, artifact_stem, envs);
+    let cache = WASM_ARTIFACT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().expect("wasm artifact cache poisoned");
+
+    if let Some(cached) = cache.get(&cache_key) {
+        return cached.clone();
+    }
+
+    if let Some(prebuilt) = prebuilt_wasm_path(artifact_stem, envs) {
+        cache.insert(cache_key, prebuilt.clone());
+        return prebuilt;
+    }
+
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let mut cmd = OsCommand::new(env!("CARGO"));
     cmd.args([
@@ -352,7 +375,81 @@ fn build_petal_wasm_with_env(
         "expected wasm artifact at {}",
         artifact.display()
     );
+    cache.insert(cache_key, artifact.clone());
     artifact
+}
+
+fn wasm_cache_key(crate_name: &str, artifact_stem: &str, envs: &[(&str, String)]) -> String {
+    let mut key = format!("{crate_name}:{artifact_stem}");
+    for (name, value) in envs {
+        key.push('|');
+        key.push_str(name);
+        key.push('=');
+        key.push_str(value);
+    }
+    key
+}
+
+fn prebuilt_wasm_path(artifact_stem: &str, envs: &[(&str, String)]) -> Option<PathBuf> {
+    for env_key in prebuilt_wasm_env_keys(artifact_stem) {
+        if let Some(path) = existing_wasm_path_from_env(env_key) {
+            return Some(path);
+        }
+    }
+
+    if !shared_wasm_dir_allowed(artifact_stem, envs) {
+        return None;
+    }
+
+    for env_key in ["BLOOM_PETAL_DEX_WASM_DIR", "BLOOM_DOCKER_PREBUILT_WASM_DIR"] {
+        let Ok(dir) = std::env::var(env_key) else {
+            continue;
+        };
+        let path = PathBuf::from(dir).join(format!("{artifact_stem}.wasm"));
+        assert!(
+            path.is_file(),
+            "{env_key} is set but {} does not exist",
+            path.display()
+        );
+        return Some(path);
+    }
+
+    None
+}
+
+fn prebuilt_wasm_env_keys(artifact_stem: &str) -> &'static [&'static str] {
+    match artifact_stem {
+        "bloom_petal_dex_pool" => &["BLOOM_PETAL_DEX_POOL_WASM"],
+        "bloom_petal_dex_wallet" => &["BLOOM_PETAL_DEX_WALLET_WASM"],
+        "bloom_petal_dex_faucet" => &["BLOOM_PETAL_DEX_FAUCET_WASM"],
+        "bloom_petal_dex_router" => &["BLOOM_PETAL_DEX_ROUTER_WASM"],
+        "bloom_petal_dex_cpmm" => &["BLOOM_PETAL_DEX_CPMM_WASM"],
+        _ => &[],
+    }
+}
+
+fn existing_wasm_path_from_env(env_key: &str) -> Option<PathBuf> {
+    let Ok(raw) = std::env::var(env_key) else {
+        return None;
+    };
+    let path = PathBuf::from(raw);
+    assert!(
+        path.is_file(),
+        "{env_key} is set but {} does not exist",
+        path.display()
+    );
+    Some(path)
+}
+
+fn shared_wasm_dir_allowed(artifact_stem: &str, envs: &[(&str, String)]) -> bool {
+    if artifact_stem != "bloom_petal_dex_faucet" {
+        return envs.is_empty();
+    }
+
+    matches!(
+        envs,
+        [("BLOOM_DEX_FAUCET_ADMIN_HEX", admin_hex)] if admin_hex == &ptb_signer_pubkey_hex()
+    )
 }
 
 fn build_petal_wasm(crate_name: &str, artifact_stem: &str) -> PathBuf {

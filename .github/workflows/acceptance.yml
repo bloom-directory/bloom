@@ -25,12 +25,16 @@ jobs:
         run: |
           rustup show
           rustup target add wasm32-unknown-unknown
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+      - name: Build bloom CLI for subprocess tests
+        run: cargo build -p bloom --bin bloom
       - name: Build workspace (release-ish; debug is fine for acceptance)
         run: cargo build --workspace --tests
       - name: Run --ignored acceptance tests
-        run: cargo test --workspace -- --ignored
+        run: cargo nextest run --workspace --ignored --no-fail-fast
 
   docker-petal-dex:
     name: docker petal DEX acceptance
