@@ -36,6 +36,7 @@ bloom-petal-fungible.workspace = true
 bloom-petal-manifest.workspace = true
 bloom-script.workspace = true
 bloom-objects.workspace = true
+bloom-value.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true

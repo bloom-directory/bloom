@@ -2088,6 +2088,7 @@ dependencies = [
  "bloom-test-util",
  "bloom-tools",
  "bloom-tx",
+ "bloom-value",
  "bloom-vfs",
  "clap",
  "clap_complete",

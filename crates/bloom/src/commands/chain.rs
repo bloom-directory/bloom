@@ -1122,37 +1122,7 @@ fn single_call_command_for_function(
 fn call_type_arg_token(value: &serde_json::Value) -> Result<String> {
     let tag = bloom_script::decode_json_type_tag(value)
         .with_context(|| format!("decode --type-arg {value}"))?;
-    Ok(type_tag_token(&tag))
-}
-
-fn type_tag_token(tag: &bloom_objects::TypeTag) -> String {
-    match tag {
-        bloom_objects::TypeTag::Concrete {
-            petal_hash,
-            type_name,
-            type_args,
-        } => {
-            let mut out = type_name.clone();
-            if *petal_hash != [0u8; 32] && *petal_hash != bloom_objects::BUILTIN_TYPE_HASH {
-                out.push('@');
-                out.push_str(&hex::encode(petal_hash));
-            }
-            if !type_args.is_empty() {
-                out.push('<');
-                out.push_str(
-                    &type_args
-                        .iter()
-                        .map(type_tag_token)
-                        .collect::<Vec<_>>()
-                        .join(","),
-                );
-                out.push('>');
-            }
-            out
-        }
-        bloom_objects::TypeTag::Generic { idx } => format!("T{idx}"),
-        bloom_objects::TypeTag::External { ref_idx } => format!("$external_{ref_idx}"),
-    }
+    Ok(bloom_value::type_tag_label(&tag))
 }
 
 #[cfg(test)]
@@ -1264,7 +1234,12 @@ fn call_const_token(
         value,
         Some(&load_manifest),
     )
-    .with_context(|| format!("decode const arg for {}", type_tag_token(&resolved)))?;
+    .with_context(|| {
+        format!(
+            "decode const arg for {}",
+            bloom_value::type_tag_label(&resolved)
+        )
+    })?;
     Ok(format!("const:0x{}", hex::encode(bytes)))
 }
 
