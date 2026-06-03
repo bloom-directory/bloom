@@ -525,7 +525,7 @@ mod tests {
     #[test]
     fn data_decl_records_fields() {
         let item: ItemStruct = syn::parse2(quote! {
-            struct Pair<T> { a: u64, b: Option<T> }
+            struct Pair<T> { a: u64, b: Resource<T> }
         })
         .unwrap();
         let decl = build_data_decl(&item).unwrap();
