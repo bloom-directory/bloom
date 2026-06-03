@@ -1141,7 +1141,12 @@ fn project_enum_json(
                 let VariantFields::Tuple(types) = &variant.fields else {
                     unreachable!("builtin Option Some is tuple")
                 };
-                project_json(resolver, &types[0], &values[0], limits, depth + 1)
+                let payload = project_json(resolver, &types[0], &values[0], limits, depth + 1)?;
+                if option_payload_needs_explicit_some(&payload) {
+                    Ok(json!({ "Some": payload }))
+                } else {
+                    Ok(payload)
+                }
             }
             _ => Err(ValueCodecError::JsonMismatch {
                 type_tag: "Option".to_string(),
@@ -1182,6 +1187,15 @@ fn project_enum_json(
         }
     };
     Ok(json!({ name: payload }))
+}
+
+fn option_payload_needs_explicit_some(payload: &JsonValue) -> bool {
+    payload.is_null()
+        || payload
+            .as_object()
+            .filter(|obj| obj.len() == 1)
+            .and_then(|obj| obj.keys().next())
+            .is_some_and(|key| key == "Some" || key == "None")
 }
 
 fn value_from_json(
@@ -1308,7 +1322,7 @@ fn enum_from_json(
     depth: usize,
 ) -> Result<Value, ValueCodecError> {
     if variants.len() == 2 && variants[0].name == "None" && variants[1].name == "Some" {
-        if json.is_null() {
+        if json.is_null() || explicit_option_none(json)? {
             return Ok(Value::Enum {
                 index: 0,
                 name: "None".to_string(),
@@ -1318,13 +1332,14 @@ fn enum_from_json(
         let VariantFields::Tuple(types) = &variants[1].fields else {
             unreachable!("builtin Option Some is tuple")
         };
+        let payload = explicit_option_some(json).unwrap_or(json);
         return Ok(Value::Enum {
             index: 1,
             name: "Some".to_string(),
             fields: VariantValue::Tuple(vec![value_from_json(
                 resolver,
                 &types[0],
-                json,
+                payload,
                 limits,
                 depth + 1,
             )?]),
@@ -1416,6 +1431,28 @@ fn enum_from_json(
         name: variant.name.clone(),
         fields,
     })
+}
+
+fn explicit_option_some(json: &JsonValue) -> Option<&JsonValue> {
+    let obj = json.as_object().filter(|obj| obj.len() == 1)?;
+    obj.get("Some")
+}
+
+fn explicit_option_none(json: &JsonValue) -> Result<bool, ValueCodecError> {
+    let Some(obj) = json.as_object().filter(|obj| obj.len() == 1) else {
+        return Ok(false);
+    };
+    let Some(payload) = obj.get("None") else {
+        return Ok(false);
+    };
+    if payload.is_null() || payload.as_object().is_some_and(serde_json::Map::is_empty) {
+        Ok(true)
+    } else {
+        Err(ValueCodecError::JsonMismatch {
+            type_tag: "Option".to_string(),
+            reason: "None payload must be null or empty".to_string(),
+        })
+    }
 }
 
 fn find_variant<'a>(
@@ -1904,6 +1941,48 @@ mod tests {
         assert_eq!(
             decode_json(&BuiltinResolver, &tag, &[0], &CodecLimits::default()).unwrap(),
             JsonValue::Null
+        );
+
+        let nested = builtin_type("Option", vec![tag.clone()]);
+        assert_eq!(
+            decode_json(&BuiltinResolver, &nested, &[0], &CodecLimits::default()).unwrap(),
+            JsonValue::Null
+        );
+        assert_eq!(
+            encode_json(
+                &BuiltinResolver,
+                &nested,
+                &JsonValue::Null,
+                &CodecLimits::default()
+            )
+            .unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            decode_json(&BuiltinResolver, &nested, &[1, 0], &CodecLimits::default()).unwrap(),
+            json!({ "Some": null })
+        );
+        assert_eq!(
+            encode_json(
+                &BuiltinResolver,
+                &nested,
+                &json!({ "Some": null }),
+                &CodecLimits::default()
+            )
+            .unwrap(),
+            vec![1, 0]
+        );
+        let mut nested_some_some = vec![1, 1];
+        nested_some_some.extend_from_slice(&7u64.to_be_bytes());
+        assert_eq!(
+            encode_json(
+                &BuiltinResolver,
+                &nested,
+                &json!({ "Some": { "Some": "7" } }),
+                &CodecLimits::default()
+            )
+            .unwrap(),
+            nested_some_some
         );
     }
 
