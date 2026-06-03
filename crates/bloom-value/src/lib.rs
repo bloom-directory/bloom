@@ -317,6 +317,29 @@ pub fn builtin_type(name: &str, type_args: Vec<TypeTag>) -> TypeTag {
     }
 }
 
+/// Normalize legacy type tags that used the zero hash for built-in types.
+pub fn normalize_legacy_builtin_type_tag(tag: &TypeTag) -> TypeTag {
+    match tag {
+        TypeTag::Concrete {
+            petal_hash,
+            type_name,
+            type_args,
+        } => TypeTag::Concrete {
+            petal_hash: if *petal_hash == [0u8; 32] && is_builtin_type_name(type_name) {
+                BUILTIN_TYPE_HASH
+            } else {
+                *petal_hash
+            },
+            type_name: type_name.clone(),
+            type_args: type_args
+                .iter()
+                .map(normalize_legacy_builtin_type_tag)
+                .collect(),
+        },
+        TypeTag::Generic { .. } | TypeTag::External { .. } => tag.clone(),
+    }
+}
+
 /// Return a stable human label for a type tag.
 pub fn type_tag_label(tag: &TypeTag) -> String {
     match tag {
@@ -1825,6 +1848,21 @@ mod tests {
 
     fn set_t(elem: TypeTag) -> TypeTag {
         builtin_type("set", vec![elem])
+    }
+
+    #[test]
+    fn normalizes_legacy_zero_hash_builtin_labels() {
+        let tag = TypeTag::Concrete {
+            petal_hash: [0u8; 32],
+            type_name: "vector".to_string(),
+            type_args: vec![TypeTag::Concrete {
+                petal_hash: [0u8; 32],
+                type_name: "u64".to_string(),
+                type_args: vec![],
+            }],
+        };
+        let normalized = normalize_legacy_builtin_type_tag(&tag);
+        assert_eq!(type_tag_label(&normalized), "vector<u64>");
     }
 
     fn custom_t(name: &str) -> TypeTag {
