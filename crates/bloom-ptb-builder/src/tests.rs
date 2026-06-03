@@ -12,7 +12,8 @@ use bloom_objects::{AccessMode, Object, ObjectId, Owner, TypeTag};
 use bloom_petal_fungible::ops::coin_payload;
 use bloom_script::{
     Arg, ArgDeclStub, CORE_FUNGIBLE_PATH, ChainStateIface, Command, DEFAULT_FUNGIBLE_PETAL_HASH,
-    ExpectedVersion, FunctionDeclStub, PetalManifestStub, TypeParamDeclStub,
+    DataTypeDeclStub, ExpectedVersion, ExternalTypeRefStub, FieldDeclStub, FunctionDeclStub,
+    PetalManifestStub, TypeParamDeclStub,
 };
 
 use crate::error::{BuildError, ResolveError};
@@ -344,6 +345,54 @@ fn append_raw_const_bytes_preserves_abi_hex() {
     match &s.commands()[0] {
         Command::Move(m) => {
             assert_eq!(m.args, vec![Arg::Const(980u64.to_be_bytes().to_vec())]);
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn append_external_const_uses_manifest_loader() {
+    let chain = MockChain::new();
+    let foreign_hash = Hash32([0xBB; 32]);
+    let foreign_manifest = PetalManifestStub {
+        module_path: "/foreign".to_string(),
+        data_types: vec![DataTypeDeclStub {
+            name: "Foreign".to_string(),
+            fields: vec![FieldDeclStub {
+                name: "value".to_string(),
+                ty: concrete("u64"),
+            }],
+            ..DataTypeDeclStub::default()
+        }],
+        ..PetalManifestStub::default()
+    };
+    let pool_manifest = PetalManifestStub {
+        module_path: POOL_PATH.to_string(),
+        functions: vec![func(
+            "set",
+            vec![ArgDeclStub::Const(TypeTag::External { ref_idx: 0 })],
+            vec![],
+        )],
+        external_type_refs: vec![ExternalTypeRefStub {
+            placeholder: "$external_0".to_string(),
+            declared_petal_path: "/foreign".to_string(),
+            declared_type_name: "Foreign".to_string(),
+            declared_content_hash: Some(foreign_hash),
+        }],
+        ..PetalManifestStub::default()
+    };
+    chain.put_petal(POOL_HASH, pool_manifest);
+    chain.put_path(POOL_PATH, POOL_HASH);
+    chain.put_petal(foreign_hash, foreign_manifest);
+    chain.put_path("/foreign", foreign_hash);
+
+    let mut s = PtbSession::new(&chain);
+    s.append_command("/bloom/petals/dex/pool/set const:0x0000000000000007")
+        .unwrap();
+
+    match &s.commands()[0] {
+        Command::Move(m) => {
+            assert_eq!(m.args, vec![Arg::Const(7u64.to_be_bytes().to_vec())]);
         }
         _ => panic!(),
     }

@@ -55,6 +55,7 @@ use std::sync::{Arc, Mutex};
 use bloom_chain_state::StateSnapshot;
 use bloom_chain_types::{Hash32, types::Address};
 use bloom_objects::TypeTag;
+use bloom_petal_manifest::extract_petal_manifest_v0;
 use bloom_petals::{BlockCtx, ChainCallInput, ChainEntry, PetalError, PetalVm};
 use bloom_script::{
     PtbError,
@@ -157,6 +158,11 @@ impl ChainPetalRunner {
 
         let input = ChainCallInput {
             wasm,
+            external_manifests: self
+                .petals
+                .iter()
+                .filter_map(|(hash, wasm)| extract_petal_manifest_v0(wasm).map(|m| (*hash, m)))
+                .collect(),
             entry: ChainEntry::Function(export_name),
             // contract_address is the petal's own address. PTB mode has no
             // first-class callee account, so we derive a stable metadata

@@ -245,10 +245,13 @@ impl BorrowTable {
                         row.dirty = true; // auto-promote
                     }
                     if row.dirty {
-                        row.version = row
-                            .version
-                            .checked_add(1)
-                            .expect("object version must not overflow u64");
+                        row.version =
+                            row.version
+                                .checked_add(1)
+                                .ok_or(PtbError::ObjectVersionOverflow {
+                                    id: row.object_id,
+                                    version: row.version,
+                                })?;
                         row.baseline_payload.clone_from(&row.payload_bytes);
                         row.dirty = false;
                     }
@@ -387,6 +390,22 @@ mod tests {
         t.diff_check(0).unwrap();
         let row = t.get(&obj.id).unwrap();
         assert_eq!(row.version, 2, "auto-promoted mutation must bump version");
+    }
+
+    #[test]
+    fn diff_check_reports_version_overflow() {
+        let mut t = BorrowTable::new();
+        let obj = sample_obj(1, vec![1, 2, 3], u64::MAX);
+        t.load_persistent(&obj, AccessMode::Mutable);
+        t.mark_dirty(&obj.id, vec![5, 6, 7]).unwrap();
+        let err = t.diff_check(0).unwrap_err();
+        assert_eq!(
+            err,
+            PtbError::ObjectVersionOverflow {
+                id: obj.id,
+                version: u64::MAX,
+            }
+        );
     }
 
     #[test]

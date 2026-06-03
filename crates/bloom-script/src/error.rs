@@ -204,6 +204,14 @@ pub enum PtbError {
         /// Command that mutated it.
         cmd_idx: u16,
     },
+    /// An object version could not be incremented without overflowing.
+    #[error("object {id} version overflow at {version}")]
+    ObjectVersionOverflow {
+        /// Object whose version would overflow.
+        id: ObjectId,
+        /// Version observed before the attempted increment.
+        version: u64,
+    },
     /// One or more transient rows were left in the borrow table at
     /// tx-end without being consumed, transferred, shared, frozen, or
     /// deleted (spec §4.4).

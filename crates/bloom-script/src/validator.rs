@@ -135,6 +135,17 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
             _ => {}
         }
     }
+    let root_manifests = manifests.values().cloned().collect::<Vec<_>>();
+    let mut external_visited = petals.keys().copied().collect::<HashSet<_>>();
+    for manifest in &root_manifests {
+        resolve_external_petals(
+            manifest,
+            ctx,
+            &mut petals,
+            &mut manifests,
+            &mut external_visited,
+        )?;
+    }
 
     // Steps 4 + 5 (unified): strict typecheck + object version/access.
     //
@@ -432,6 +443,35 @@ fn resolve_petal(
             expected: hash,
             found: bound,
         });
+    }
+    Ok(())
+}
+
+fn resolve_external_petals(
+    manifest: &PetalManifestStub,
+    ctx: &ValidationContext<'_>,
+    petals: &mut HashMap<[u8; 32], Vec<u8>>,
+    manifests: &mut HashMap<[u8; 32], PetalManifestStub>,
+    visited: &mut HashSet<[u8; 32]>,
+) -> Result<(), PtbError> {
+    for external in &manifest.external_type_refs {
+        let Some(hash) = external.declared_content_hash else {
+            continue;
+        };
+        if !visited.insert(hash.0) {
+            continue;
+        }
+        let wasm = ctx
+            .chain
+            .load_petal(&hash)
+            .ok_or(PtbError::PetalNotFound { hash })?;
+        petals.entry(hash.0).or_insert(wasm);
+        let external_manifest = ctx
+            .chain
+            .load_manifest(&hash)
+            .ok_or(PtbError::PetalNotFound { hash })?;
+        manifests.entry(hash.0).or_insert(external_manifest.clone());
+        resolve_external_petals(&external_manifest, ctx, petals, manifests, visited)?;
     }
     Ok(())
 }
@@ -1383,6 +1423,47 @@ mod tests {
         let validated = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap();
         assert_eq!(validated.tx, tx);
         assert!(validated.objects.contains_key(&gas_id.0));
+    }
+
+    #[test]
+    fn preloads_transitive_external_petals() {
+        let (chain, signer, gas_id) = setup();
+        let middle_hash = Hash32([0xBC; 32]);
+        let leaf_hash = Hash32([0xCD; 32]);
+        let mut root_manifest = sample_manifest();
+        root_manifest.external_type_refs = vec![crate::ExternalTypeRefStub {
+            placeholder: "$external_0".to_string(),
+            declared_petal_path: "/bloom/petals/middle".to_string(),
+            declared_type_name: "Middle".to_string(),
+            declared_content_hash: Some(middle_hash),
+        }];
+        let middle_manifest = PetalManifestStub {
+            module_path: "/bloom/petals/middle".to_string(),
+            external_type_refs: vec![crate::ExternalTypeRefStub {
+                placeholder: "$external_0".to_string(),
+                declared_petal_path: "/bloom/petals/leaf".to_string(),
+                declared_type_name: "Leaf".to_string(),
+                declared_content_hash: Some(leaf_hash),
+            }],
+            ..PetalManifestStub::default()
+        };
+        let leaf_manifest = PetalManifestStub {
+            module_path: "/bloom/petals/leaf".to_string(),
+            ..PetalManifestStub::default()
+        };
+        chain.put_petal(Hash32([0xAB; 32]), vec![1, 2, 3], root_manifest);
+        chain.put_petal(middle_hash, vec![4, 5, 6], middle_manifest);
+        chain.put_petal(leaf_hash, vec![7, 8, 9], leaf_manifest);
+
+        let tx = sample_ptb(signer, gas_id, 100);
+        let verifier = AlwaysOkVerifier;
+        let validated = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap();
+
+        assert!(validated.petals.contains_key(&[0xAB; 32]));
+        assert!(validated.petals.contains_key(&middle_hash.0));
+        assert!(validated.petals.contains_key(&leaf_hash.0));
+        assert!(validated.manifests.contains_key(&middle_hash.0));
+        assert!(validated.manifests.contains_key(&leaf_hash.0));
     }
 
     #[test]

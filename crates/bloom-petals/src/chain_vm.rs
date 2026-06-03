@@ -105,6 +105,7 @@ pub struct ChainStoreData {
     pub chain_ctx: ChainCtx,
     pub petal_hash: Hash32,
     pub manifest: Option<PetalManifestV0>,
+    pub external_manifests: Vec<(Hash32, PetalManifestV0)>,
     /// Per-PTB host context (spec §16.2 borrow table, signers, logs,
     /// host-created object state, ...) shared between the wasm host imports
     /// installed by `link_new_host_imports` and the surrounding `PtbExecutor`.
@@ -126,6 +127,7 @@ pub enum ChainEntry {
 
 pub struct ChainCallInput {
     pub wasm: Vec<u8>,
+    pub external_manifests: Vec<(Hash32, PetalManifestV0)>,
     pub entry: ChainEntry,
     pub contract_address: Address,
     pub msg_sender: Address,
@@ -1616,14 +1618,37 @@ fn validate_object_payload(
             HostError::Invalid("object payload validation requires manifest".into()).as_wasm_code(),
         );
     };
+    validate_object_payload_bytes(
+        manifest,
+        caller.data().petal_hash.0,
+        &caller.data().external_manifests,
+        tag,
+        payload,
+    )
+    .map_err(|e| HostError::Invalid(format!("object payload decode failed: {e}")).as_wasm_code())
+}
+
+fn validate_object_payload_bytes(
+    manifest: &PetalManifestV0,
+    self_hash: [u8; 32],
+    external_manifests: &[(Hash32, PetalManifestV0)],
+    tag: &TypeTag,
+    payload: &[u8],
+) -> Result<(), bloom_value::ValueCodecError> {
     let limits = CodecLimits {
         max_value_bytes: payload.len(),
         ..CodecLimits::default()
     };
-    let resolver = ManifestResolver::with_self_hash(manifest, caller.data().petal_hash.0);
-    validate_value_bytes(&resolver, tag, payload, &limits).map_err(|e| {
-        HostError::Invalid(format!("object payload decode failed: {e}")).as_wasm_code()
-    })
+    let external_manifest_refs: Vec<([u8; 32], &PetalManifestV0)> = external_manifests
+        .iter()
+        .map(|(hash, manifest)| (hash.0, manifest))
+        .collect();
+    let resolver = ManifestResolver::with_self_hash_and_external_manifests(
+        manifest,
+        self_hash,
+        &external_manifest_refs,
+    );
+    validate_value_bytes(&resolver, tag, payload, &limits)
 }
 
 /// Derive a deterministic transient `ObjectId` for an `object.create`
@@ -1769,6 +1794,7 @@ fn dispatch_chain_call_sync(
         chain_ctx,
         petal_hash,
         manifest,
+        external_manifests: input.external_manifests,
         ptb_ctx: input.ptb_ctx,
     };
 
@@ -1987,8 +2013,8 @@ mod ptb_host_import_tests {
     };
     use bloom_petal_manifest::codec;
     use bloom_petal_manifest::types::{
-        FieldDecl, FunctionDecl, ObjectTypeDecl, PetalManifestV0, SCHEMA_VERSION, SemVer,
-        TypeParamDecl, TypeParamKind,
+        DataTypeDecl, ExternalTypeRef, FieldDecl, FunctionDecl, ObjectTypeDecl, PetalManifestV0,
+        SCHEMA_VERSION, SemVer, TypeParamDecl, TypeParamKind,
     };
     use bloom_script::host_ctx::PtbHostCtx;
     use std::sync::{Arc, Mutex};
@@ -2061,6 +2087,51 @@ mod ptb_host_import_tests {
         manifest
     }
 
+    #[test]
+    fn object_payload_validation_resolves_external_manifest_fields() {
+        let foreign_hash = Hash32([0xBB; 32]);
+        let mut manifest =
+            object_manifest("X", vec![("foreign", TypeTag::External { ref_idx: 0 })]);
+        manifest.external_type_refs.push(ExternalTypeRef {
+            placeholder: "$external_0".to_string(),
+            declared_petal_path: "/foreign".to_string(),
+            declared_type_name: "Foreign".to_string(),
+            declared_content_hash: Some(foreign_hash.0),
+        });
+        let foreign_manifest = PetalManifestV0 {
+            schema_version: SCHEMA_VERSION,
+            module_path: "/foreign".to_string(),
+            framework_version: SemVer::new(0, 1, 0),
+            data_types: vec![DataTypeDecl {
+                name: "Foreign".to_string(),
+                fields: vec![FieldDecl {
+                    name: "value".to_string(),
+                    ty: builtin("u64"),
+                }],
+                ..DataTypeDecl::default()
+            }],
+            ..Default::default()
+        };
+        let tag = TypeTag::Concrete {
+            petal_hash: [0u8; 32],
+            type_name: "X".to_string(),
+            type_args: vec![],
+        };
+        let payload = 7u64.to_be_bytes();
+
+        assert!(validate_object_payload_bytes(&manifest, [0xAA; 32], &[], &tag, &payload).is_err());
+        assert!(
+            validate_object_payload_bytes(
+                &manifest,
+                [0xAA; 32],
+                &[(foreign_hash, foreign_manifest)],
+                &tag,
+                &payload,
+            )
+            .is_ok()
+        );
+    }
+
     fn run_with(wasm: Vec<u8>, ctx: Arc<Mutex<PtbHostCtx>>, petal_hash: Hash32) -> ChainCallOutput {
         run_with_state(wasm, ctx, petal_hash, State::new())
     }
@@ -2073,6 +2144,7 @@ mod ptb_host_import_tests {
     ) -> ChainCallOutput {
         let input = ChainCallInput {
             wasm,
+            external_manifests: Vec::new(),
             entry: ChainEntry::Function("call".into()),
             contract_address: Address([0x01; 32]),
             msg_sender: Address([0x02; 32]),
