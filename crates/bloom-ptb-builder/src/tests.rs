@@ -587,11 +587,9 @@ fn const_type_mismatch_rejected() {
 
 #[test]
 fn const_bytes_invalid_caught_by_validator() {
-    // A `u64` declared arg but a too-short hex literal that the literal
-    // encoder accepts as opaque-ish — exercise the validator path by
-    // declaring an unknown type so the literal encoder defers and the
-    // validator's canonical check is the gate. Here we use a vector<u64>
-    // const fed wrong bytes through hex so the validator rejects length.
+    // Parameterized const values need manifest-aware typed lowering; this
+    // builder literal path must not accept opaque bytes and hope validation
+    // catches malformed payloads later.
     let chain = chain_with_pool(vec![func(
         "set",
         vec![ArgDeclStub::Const(TypeTag::Concrete {
@@ -608,7 +606,7 @@ fn const_bytes_invalid_caught_by_validator() {
         .unwrap_err();
     assert!(matches!(
         err,
-        BuildError::Validation(bloom_script::PtbError::TypeMismatch { .. })
+        BuildError::Parse(ref msg) if msg.contains("manifest-aware typed lowering")
     ));
     assert!(s.is_empty());
 }

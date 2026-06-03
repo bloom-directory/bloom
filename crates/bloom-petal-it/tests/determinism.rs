@@ -37,10 +37,10 @@ fn coin_loader_wat(coin_id: bloom_objects::ObjectId) -> String {
 (module
   (import "chain" "petal.return" (func $ret (param i32 i32)))
   (memory (export "memory") 1)
-  ;; 40-byte return envelope: count=1 (4 BE) | len=32 (4 BE) | coin_id (32 bytes)
-  (data (i32.const 0) "\00\00\00\01\00\00\00\20{id_hex}")
+  ;; 37-byte return envelope: count=1 (4 BE) | len=32 (ULEB) | coin_id (32 bytes)
+  (data (i32.const 0) "\00\00\00\01\20{id_hex}")
   (func (export "__petal_load_coin") (param i32 i32) (result i32)
-    (call $ret (i32.const 0) (i32.const 40))
+    (call $ret (i32.const 0) (i32.const 37))
     i32.const 0)
 )
 "#

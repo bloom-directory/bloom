@@ -652,6 +652,14 @@ impl_tuple_bloom_type!(A: 0);
 impl_tuple_bloom_type!(A: 0, B: 1);
 impl_tuple_bloom_type!(A: 0, B: 1, C: 2);
 impl_tuple_bloom_type!(A: 0, B: 1, C: 2, D: 3);
+impl_tuple_bloom_type!(A: 0, B: 1, C: 2, D: 3, E: 4);
+impl_tuple_bloom_type!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5);
+impl_tuple_bloom_type!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6);
+impl_tuple_bloom_type!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7);
+impl_tuple_bloom_type!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8);
+impl_tuple_bloom_type!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9);
+impl_tuple_bloom_type!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10);
+impl_tuple_bloom_type!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11);
 
 impl BloomType for () {
     fn canonical_encode(&self) -> Vec<u8> {
@@ -968,6 +976,10 @@ mod tests {
         rt((9u8,));
         rt((1u8, "x".to_string()));
         rt((1u8, 2u16, true, "z".to_string()));
+        rt((1u8, 2u16, 3u32, 4u64, 5u128));
+        rt((
+            1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8, 9u8, 10u8, 11u8, 12u8,
+        ));
     }
 
     #[test]

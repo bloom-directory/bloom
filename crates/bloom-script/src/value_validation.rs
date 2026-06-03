@@ -10,6 +10,9 @@ use crate::chain_iface::{
     CapabilityTypeDeclStub, DataTypeDeclStub, EnumTypeDeclStub, FieldDeclStub, ObjectTypeDeclStub,
     PetalManifestStub, VariantFieldsDeclStub,
 };
+use bloom_chain_types::Hash32;
+
+pub(crate) type ManifestLoader<'a> = dyn Fn(&Hash32) -> Option<PetalManifestStub> + 'a;
 
 /// Validate a PTB `Arg::Const` slot against a manifest-declared value type.
 ///
@@ -21,7 +24,19 @@ pub fn validate_const_slot(
     tag: &TypeTag,
     bytes: &[u8],
 ) -> Result<(), String> {
-    validate_with_tag(manifest, self_hash, tag, bytes)
+    validate_with_tag(manifest, self_hash, tag, bytes, None)
+}
+
+/// Validate a PTB `Arg::Const` slot, resolving external custom types through
+/// `load_manifest` when the declared schema references another petal hash.
+pub fn validate_const_slot_with_manifest_loader(
+    manifest: &PetalManifestStub,
+    self_hash: [u8; 32],
+    tag: &TypeTag,
+    bytes: &[u8],
+    load_manifest: &ManifestLoader<'_>,
+) -> Result<(), String> {
+    validate_with_tag(manifest, self_hash, tag, bytes, Some(load_manifest))
 }
 
 /// Validate one Move return slot against a manifest-declared return type.
@@ -35,9 +50,21 @@ pub fn validate_return_slot(
     tag: &TypeTag,
     bytes: &[u8],
 ) -> Result<(), String> {
-    let tag = normalize_declared_tag(tag);
-    let effective = return_slot_tag(manifest, &tag).unwrap_or(tag);
-    validate_with_tag(manifest, self_hash, &effective, bytes)
+    let effective = effective_return_slot_tag(manifest, tag);
+    validate_with_tag(manifest, self_hash, &effective, bytes, None)
+}
+
+/// Validate one Move return slot, resolving external custom types through
+/// `load_manifest` when the declared schema references another petal hash.
+pub fn validate_return_slot_with_manifest_loader(
+    manifest: &PetalManifestStub,
+    self_hash: [u8; 32],
+    tag: &TypeTag,
+    bytes: &[u8],
+    load_manifest: &ManifestLoader<'_>,
+) -> Result<(), String> {
+    let effective = effective_return_slot_tag(manifest, tag);
+    validate_with_tag(manifest, self_hash, &effective, bytes, Some(load_manifest))
 }
 
 fn validate_with_tag(
@@ -45,17 +72,23 @@ fn validate_with_tag(
     self_hash: [u8; 32],
     tag: &TypeTag,
     bytes: &[u8],
+    load_manifest: Option<&ManifestLoader<'_>>,
 ) -> Result<(), String> {
-    let tag = normalize_declared_tag(tag);
-    if matches!(tag, TypeTag::External { .. }) {
-        return Ok(());
-    }
-    let resolver = StubResolver::with_self_hash(manifest, self_hash);
+    let resolver =
+        StubResolver::with_self_hash_and_manifest_loader(manifest, self_hash, load_manifest);
+    let tag = resolver
+        .resolve_declared_tag(tag)
+        .map_err(|e| e.to_string())?;
     let limits = CodecLimits {
         max_value_bytes: bytes.len(),
         ..CodecLimits::default()
     };
     validate_value_bytes(&resolver, &tag, bytes, &limits).map_err(|e| e.to_string())
+}
+
+pub(crate) fn effective_return_slot_tag(manifest: &PetalManifestStub, tag: &TypeTag) -> TypeTag {
+    let tag = normalize_declared_tag(tag);
+    return_slot_tag(manifest, &tag).unwrap_or(tag)
 }
 
 fn return_slot_tag(manifest: &PetalManifestStub, tag: &TypeTag) -> Option<TypeTag> {
@@ -108,7 +141,7 @@ fn builtin_tag(type_name: &str, type_args: Vec<TypeTag>) -> TypeTag {
     }
 }
 
-fn normalize_declared_tag(tag: &TypeTag) -> TypeTag {
+pub(crate) fn normalize_declared_tag(tag: &TypeTag) -> TypeTag {
     match tag {
         TypeTag::Concrete {
             petal_hash,
@@ -157,18 +190,27 @@ fn is_builtin_type_name(type_name: &str) -> bool {
     )
 }
 
-#[derive(Clone, Debug)]
-struct StubResolver<'a> {
+pub(crate) struct StubResolver<'a> {
     manifest: &'a PetalManifestStub,
     self_hash: [u8; 32],
+    load_manifest: Option<&'a ManifestLoader<'a>>,
 }
 
 impl<'a> StubResolver<'a> {
-    fn with_self_hash(manifest: &'a PetalManifestStub, self_hash: [u8; 32]) -> Self {
+    pub(crate) fn with_self_hash_and_manifest_loader(
+        manifest: &'a PetalManifestStub,
+        self_hash: [u8; 32],
+        load_manifest: Option<&'a ManifestLoader<'a>>,
+    ) -> Self {
         Self {
             manifest,
             self_hash,
+            load_manifest,
         }
+    }
+
+    pub(crate) fn resolve_declared_tag(&self, tag: &TypeTag) -> Result<TypeTag, ValueCodecError> {
+        self.subst(&normalize_declared_tag(tag), &[])
     }
 
     fn is_self_hash(&self, hash: &[u8; 32]) -> bool {
@@ -328,6 +370,17 @@ impl Resolver for StubResolver<'_> {
             ));
         };
         if !self.is_self_hash(petal_hash) {
+            if let Some(load_manifest) = self.load_manifest {
+                let hash = Hash32(*petal_hash);
+                if let Some(manifest) = load_manifest(&hash) {
+                    let resolver = StubResolver::with_self_hash_and_manifest_loader(
+                        &manifest,
+                        *petal_hash,
+                        self.load_manifest,
+                    );
+                    return resolver.resolve_shape(tag, _depth);
+                }
+            }
             return Err(ValueCodecError::UnresolvedType(
                 bloom_value::type_tag_label(tag),
             ));
@@ -373,6 +426,7 @@ impl Resolver for StubResolver<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExternalTypeRefStub;
 
     fn zero_hash_tag(type_name: &str, type_args: Vec<TypeTag>) -> TypeTag {
         TypeTag::Concrete {
@@ -407,11 +461,68 @@ mod tests {
     }
 
     #[test]
-    fn top_level_external_slots_remain_opaque() {
-        let manifest = PetalManifestStub::default();
+    fn top_level_external_slots_require_schema() {
+        let manifest = PetalManifestStub {
+            external_type_refs: vec![ExternalTypeRefStub {
+                placeholder: "$external_0".to_string(),
+                declared_petal_path: "/foreign".to_string(),
+                declared_type_name: "Foreign".to_string(),
+                declared_content_hash: Some(bloom_chain_types::Hash32([0xBB; 32])),
+            }],
+            ..PetalManifestStub::default()
+        };
         let tag = TypeTag::External { ref_idx: 0 };
-        assert!(validate_const_slot(&manifest, [0xAA; 32], &tag, b"opaque").is_ok());
-        assert!(validate_return_slot(&manifest, [0xAA; 32], &tag, b"opaque").is_ok());
+
+        assert!(validate_const_slot(&manifest, [0xAA; 32], &tag, b"opaque").is_err());
+        assert!(validate_return_slot(&manifest, [0xAA; 32], &tag, b"opaque").is_err());
+    }
+
+    #[test]
+    fn external_slots_resolve_through_manifest_loader() {
+        let manifest = PetalManifestStub {
+            external_type_refs: vec![ExternalTypeRefStub {
+                placeholder: "$external_0".to_string(),
+                declared_petal_path: "/foreign".to_string(),
+                declared_type_name: "Foreign".to_string(),
+                declared_content_hash: Some(bloom_chain_types::Hash32([0xBB; 32])),
+            }],
+            ..PetalManifestStub::default()
+        };
+        let foreign = PetalManifestStub {
+            data_types: vec![DataTypeDeclStub {
+                name: "Foreign".to_string(),
+                fields: vec![FieldDeclStub {
+                    name: "value".to_string(),
+                    ty: zero_hash_tag("u64", Vec::new()),
+                }],
+                ..DataTypeDeclStub::default()
+            }],
+            ..PetalManifestStub::default()
+        };
+        let loader =
+            |hash: &bloom_chain_types::Hash32| (hash.0 == [0xBB; 32]).then_some(foreign.clone());
+        let tag = TypeTag::External { ref_idx: 0 };
+
+        assert!(
+            validate_const_slot_with_manifest_loader(
+                &manifest,
+                [0xAA; 32],
+                &tag,
+                &7u64.to_be_bytes(),
+                &loader,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_return_slot_with_manifest_loader(
+                &manifest,
+                [0xAA; 32],
+                &tag,
+                &7u64.to_be_bytes(),
+                &loader,
+            )
+            .is_ok()
+        );
     }
 
     #[test]

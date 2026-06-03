@@ -94,7 +94,7 @@ pub enum ChainCmd {
         ///
         /// Examples:
         /// `--arg '{"kind":"object","id":"<object-id>"}'`
-        /// `--arg '{"kind":"const","hex":"0000000000000000000000000000002a"}'`
+        /// `--arg '{"kind":"const","value":"42"}'`
         #[arg(long = "arg", value_name = "JSON")]
         args: Vec<String>,
         /// Canonical TypeTag bytes as hex. Repeat for generic functions.
@@ -1059,18 +1059,36 @@ fn single_call_command(
     let function_decl = manifest
         .function(function)
         .with_context(|| format!("function {function} not found in {path}"))?;
-    single_call_command_for_function(chain, path, function, function_decl, type_args, args)
+    let ctx = SingleCallFunctionCtx {
+        chain,
+        path,
+        function,
+        manifest: &manifest,
+        self_hash: hash.0,
+        function_decl,
+    };
+    single_call_command_for_function(&ctx, type_args, args)
+}
+
+struct SingleCallFunctionCtx<'a> {
+    chain: &'a dyn bloom_script::ChainStateIface,
+    path: &'a str,
+    function: &'a str,
+    manifest: &'a bloom_script::PetalManifestStub,
+    self_hash: [u8; 32],
+    function_decl: &'a bloom_script::FunctionDeclStub,
 }
 
 fn single_call_command_for_function(
-    chain: &dyn bloom_script::ChainStateIface,
-    path: &str,
-    function: &str,
-    function_decl: &bloom_script::FunctionDeclStub,
+    ctx: &SingleCallFunctionCtx<'_>,
     type_args: &[serde_json::Value],
     args: &[serde_json::Value],
 ) -> Result<String> {
-    let mut tokens = vec![format!("{}/{}", path.trim_end_matches('/'), function)];
+    let mut tokens = vec![format!(
+        "{}/{}",
+        ctx.path.trim_end_matches('/'),
+        ctx.function
+    )];
     let decoded_type_args = type_args
         .iter()
         .map(|ty| {
@@ -1081,18 +1099,20 @@ fn single_call_command_for_function(
     for ty in type_args {
         tokens.push(format!("type:{}", call_type_arg_token(ty)?));
     }
-    if args.len() != function_decl.args.len() {
+    if args.len() != ctx.function_decl.args.len() {
         anyhow::bail!(
             "arg count mismatch: function declares {} arg(s), got {}",
-            function_decl.args.len(),
+            ctx.function_decl.args.len(),
             args.len()
         );
     }
-    for (arg, decl) in args.iter().zip(&function_decl.args) {
+    for (arg, decl) in args.iter().zip(&ctx.function_decl.args) {
         tokens.push(call_arg_token_for_decl(
-            chain,
+            ctx.chain,
             arg,
             decl,
+            ctx.manifest,
+            ctx.self_hash,
             &decoded_type_args,
         )?);
     }
@@ -1162,7 +1182,7 @@ fn call_arg_token(arg: &serde_json::Value) -> Result<String> {
         }
         "const" => {
             if let Some(hex) = arg.get("hex").and_then(|v| v.as_str()) {
-                Ok(format!("const:0x{}", hex.trim().trim_start_matches("0x")))
+                anyhow::bail!("raw const hex is not accepted for typed JSON args: {hex}");
             } else if let Some(value) = arg.get("value") {
                 match value {
                     serde_json::Value::String(s) => Ok(s.clone()),
@@ -1182,6 +1202,8 @@ fn call_arg_token_for_decl(
     chain: &dyn bloom_script::ChainStateIface,
     arg: &serde_json::Value,
     decl: &bloom_script::ArgDeclStub,
+    manifest: &bloom_script::PetalManifestStub,
+    self_hash: [u8; 32],
     type_args: &[bloom_objects::TypeTag],
 ) -> Result<String> {
     match decl {
@@ -1190,7 +1212,9 @@ fn call_arg_token_for_decl(
             let idx = call_signer_index(arg)?.context("expected signer arg")?;
             Ok(format!("signer:{idx}"))
         }
-        bloom_script::ArgDeclStub::Const(tag) => call_const_token(arg, tag, type_args),
+        bloom_script::ArgDeclStub::Const(tag) => {
+            call_const_token(chain, arg, tag, manifest, self_hash, type_args)
+        }
         bloom_script::ArgDeclStub::TypeArg(_) => Ok(format!("type:{}", call_type_arg_token(arg)?)),
     }
 }
@@ -1215,21 +1239,32 @@ fn call_object_token(
 }
 
 fn call_const_token(
+    chain: &dyn bloom_script::ChainStateIface,
     arg: &serde_json::Value,
     tag: &bloom_objects::TypeTag,
+    manifest: &bloom_script::PetalManifestStub,
+    self_hash: [u8; 32],
     type_args: &[bloom_objects::TypeTag],
 ) -> Result<String> {
     let value = if arg.get("kind").and_then(|v| v.as_str()) == Some("const") {
         if let Some(hex) = arg.get("hex").and_then(|v| v.as_str()) {
-            return Ok(format!("const:0x{}", hex.trim().trim_start_matches("0x")));
+            anyhow::bail!("raw const hex is not accepted for typed JSON args: {hex}");
         }
         arg.get("value").unwrap_or(arg)
     } else {
         arg
     };
     let resolved = substitute_call_type_args(tag, type_args);
-    let bytes = bloom_script::decode_json_const(&resolved, value)
-        .with_context(|| format!("decode const arg for {}", type_tag_token(&resolved)))?;
+    let load_manifest =
+        |petal_hash: &bloom_chain_types::types::Hash32| chain.load_manifest(petal_hash);
+    let bytes = bloom_script::decode_json_const_with_manifest_loader(
+        manifest,
+        self_hash,
+        &resolved,
+        value,
+        Some(&load_manifest),
+    )
+    .with_context(|| format!("decode const arg for {}", type_tag_token(&resolved)))?;
     Ok(format!("const:0x{}", hex::encode(bytes)))
 }
 
@@ -2631,10 +2666,23 @@ allocations = []
     }
 
     #[test]
-    fn call_const_hex_preserves_raw_abi_bytes() {
-        let token =
-            call_arg_token(&serde_json::json!({ "kind": "const", "hex": "00000000000003d4" }))
-                .unwrap();
+    fn call_const_value_encodes_typed_abi_bytes() {
+        let chain = command_test_chain();
+        let manifest = bloom_script::PetalManifestStub::default();
+        let tag = bloom_objects::TypeTag::Concrete {
+            petal_hash: bloom_objects::BUILTIN_TYPE_HASH,
+            type_name: "u64".to_string(),
+            type_args: vec![],
+        };
+        let token = call_const_token(
+            &chain,
+            &serde_json::json!({ "kind": "const", "value": "980" }),
+            &tag,
+            &manifest,
+            [0xAB; 32],
+            &[],
+        )
+        .unwrap();
         assert_eq!(token, "const:0x00000000000003d4");
     }
 

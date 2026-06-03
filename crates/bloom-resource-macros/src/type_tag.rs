@@ -183,44 +183,95 @@ fn is_qualified_framework_wrapper(path: &syn::Path) -> bool {
         )
 }
 
-/// Reject plain generic types in payload positions (spec §11.2: `T` is
-/// only allowed in TypeTag-bearing positions; payload usage must go
-/// through `Resource<T>`).
+/// Reject generic types in payload positions (spec §11.2: `T` is only
+/// allowed in TypeTag-bearing positions; payload usage must go through
+/// `Resource<T>`).
 ///
-/// Returns `Ok(())` if `ty` is not a plain generic reference, or if it
-/// *is* but does not appear in `non_phantom`. Returns `Err` if `ty` is
-/// a plain non-phantom generic that the caller therefore needs to wrap.
+/// Returns `Ok(())` if `ty` contains no non-phantom generic payload use.
+/// Returns `Err` if the generic appears directly or nested inside another
+/// payload type. Bloom wrappers such as `Resource<T>` and `Capability<T>`
+/// are allowed because they carry the type parameter in the type tag rather
+/// than encoding a generic `T` payload field.
 pub(crate) fn reject_plain_generic_in_payload(
     ty: &Type,
     non_phantom: &[String],
 ) -> syn::Result<()> {
-    // Walk through one reference layer (`&T`).
-    let inner = match ty {
-        Type::Reference(r) => r.elem.as_ref(),
-        other => other,
+    reject_generic_payload_inner(ty, non_phantom)
+}
+
+fn reject_generic_payload_inner(ty: &Type, non_phantom: &[String]) -> syn::Result<()> {
+    match ty {
+        Type::Reference(r) => reject_generic_payload_inner(&r.elem, non_phantom),
+        Type::Tuple(tuple) => tuple
+            .elems
+            .iter()
+            .try_for_each(|elem| reject_generic_payload_inner(elem, non_phantom)),
+        Type::Paren(paren) => reject_generic_payload_inner(&paren.elem, non_phantom),
+        Type::Group(group) => reject_generic_payload_inner(&group.elem, non_phantom),
+        Type::Path(TypePath { path, qself: None }) if is_generic_payload_wrapper_path(path) => {
+            Ok(())
+        }
+        Type::Path(TypePath { path, qself: None }) => {
+            if path.segments.len() == 1 {
+                let seg = path.segments.first().expect("checked len == 1");
+                if matches!(seg.arguments, PathArguments::None) {
+                    let name = seg.ident.to_string();
+                    if non_phantom.iter().any(|n| n == &name) {
+                        return generic_payload_err(ty, &name);
+                    }
+                }
+            }
+            for segment in &path.segments {
+                match &segment.arguments {
+                    PathArguments::None => {}
+                    PathArguments::AngleBracketed(args) => {
+                        for arg in &args.args {
+                            if let GenericArgument::Type(inner) = arg {
+                                reject_generic_payload_inner(inner, non_phantom)?;
+                            }
+                        }
+                    }
+                    PathArguments::Parenthesized(args) => {
+                        for input in &args.inputs {
+                            reject_generic_payload_inner(input, non_phantom)?;
+                        }
+                        if let syn::ReturnType::Type(_, output) = &args.output {
+                            reject_generic_payload_inner(output, non_phantom)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn generic_payload_err(ty: &Type, name: &str) -> syn::Result<()> {
+    Err(err_spanned(
+        ty,
+        format!(
+            "plain generic `{}` is not allowed in field/arg position; \
+             wrap with `Resource<{}>` (spec §11.2)",
+            name, name
+        ),
+    ))
+}
+
+fn is_generic_payload_wrapper_path(path: &syn::Path) -> bool {
+    let Some(seg) = path.segments.last() else {
+        return false;
     };
-    let Type::Path(TypePath { path, qself: None }) = inner else {
-        return Ok(());
-    };
-    if path.segments.len() != 1 {
-        return Ok(());
+    if !matches!(
+        seg.ident.to_string().as_str(),
+        "Resource" | "Capability" | "Coin" | "Balance"
+    ) {
+        return false;
     }
-    let seg = path.segments.first().expect("checked len == 1");
-    if !matches!(seg.arguments, PathArguments::None) {
-        return Ok(());
+    if path.segments.len() > 1 && !is_qualified_framework_wrapper(path) {
+        return false;
     }
-    let name = seg.ident.to_string();
-    if non_phantom.iter().any(|n| n == &name) {
-        return Err(err_spanned(
-            ty,
-            format!(
-                "plain generic `{}` is not allowed in field/arg position; \
-                 wrap with `Resource<{}>` (spec §11.2)",
-                name, name
-            ),
-        ));
-    }
-    Ok(())
+    matches!(seg.arguments, PathArguments::AngleBracketed(_))
 }
 
 /// If `ty` (after stripping one `&`/`&mut` layer) is `Resource<Inner>`,
@@ -497,6 +548,33 @@ mod tests {
     #[test]
     fn reject_plain_generic_in_payload_allows_resource_wrap() {
         let ty: Type = syn::parse2(quote! { Resource<T> }).unwrap();
+        assert!(reject_plain_generic_in_payload(&ty, &["T".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn reject_plain_generic_in_payload_flags_nested_generic_payloads() {
+        for src in [
+            "Option<T>",
+            "Vec<T>",
+            "(u64, T)",
+            "BTreeMap<T, u64>",
+            "Foo<T>",
+        ] {
+            let ty: Type = syn::parse_str(src).unwrap();
+            assert!(
+                reject_plain_generic_in_payload(&ty, &["T".to_string()]).is_err(),
+                "expected nested generic payload to be rejected: {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_plain_generic_in_payload_allows_nested_resource_wrap() {
+        let ty: Type = syn::parse2(quote! { Option<Resource<T>> }).unwrap();
+        assert!(reject_plain_generic_in_payload(&ty, &["T".to_string()]).is_ok());
+        let ty: Type = syn::parse2(quote! { Capability<MintCap<T>> }).unwrap();
+        assert!(reject_plain_generic_in_payload(&ty, &["T".to_string()]).is_ok());
+        let ty: Type = syn::parse2(quote! { bloom_resource::Coin<T> }).unwrap();
         assert!(reject_plain_generic_in_payload(&ty, &["T".to_string()]).is_ok());
     }
 

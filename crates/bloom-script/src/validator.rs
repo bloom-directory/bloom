@@ -13,7 +13,7 @@ use bloom_resource::BloomType;
 use crate::chain_iface::{ArgDeclStub, ChainStateIface, FunctionDeclStub, PetalManifestStub};
 use crate::error::PtbError;
 use crate::types::{Arg, Command, ExpectedVersion, MoveCmd, PtbTx, UseRef};
-use crate::value_validation::validate_const_slot;
+use crate::value_validation::validate_const_slot_with_manifest_loader;
 
 /// Validation policy for a PTB.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,6 +195,7 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
                 typecheck_move_cmd(
                     m,
                     manifest,
+                    ctx.chain,
                     cmd_idx,
                     &cmd_return_types,
                     &objects,
@@ -438,6 +439,7 @@ fn resolve_petal(
 fn typecheck_move_cmd(
     cmd: &MoveCmd,
     manifest: &PetalManifestStub,
+    chain: &dyn ChainStateIface,
     cmd_idx: usize,
     cmd_return_types: &[Vec<Option<TypeTag>>],
     objects: &HashMap<[u8; 32], Object>,
@@ -503,7 +505,15 @@ fn typecheck_move_cmd(
                 // manifest is checked against the concrete `T` the
                 // caller chose for this MoveCmd.
                 let expected = substitute_type_args(declared_tag, &cmd.type_args);
-                if let Err(reason) = validate_const_slot(manifest, hash.0, &expected, bytes) {
+                let load_manifest =
+                    |petal_hash: &bloom_chain_types::Hash32| chain.load_manifest(petal_hash);
+                if let Err(reason) = validate_const_slot_with_manifest_loader(
+                    manifest,
+                    hash.0,
+                    &expected,
+                    bytes,
+                    &load_manifest,
+                ) {
                     return Err(PtbError::TypeMismatch {
                         function: cmd.function.clone(),
                         arg_idx: i,

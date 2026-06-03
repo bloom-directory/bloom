@@ -1205,6 +1205,12 @@ fn value_from_json(
             let obj = json
                 .as_object()
                 .ok_or_else(|| json_mismatch(tag, "expected object"))?;
+            if let Some(unknown) = obj
+                .keys()
+                .find(|key| !fields.iter().any(|field| field.name == **key))
+            {
+                return Err(json_mismatch(tag, &format!("unknown field {unknown}")));
+            }
             let mut values = Vec::with_capacity(fields.len());
             for field in fields {
                 let field_json = obj
@@ -1345,7 +1351,15 @@ fn enum_from_json(
     let (name, payload) = obj.iter().next().expect("len checked");
     let (idx, variant) = find_variant(&variants, name, tag)?;
     let fields = match &variant.fields {
-        VariantFields::Unit => VariantValue::Unit,
+        VariantFields::Unit => {
+            if !(payload.is_null() || payload.as_object().is_some_and(serde_json::Map::is_empty)) {
+                return Err(json_mismatch(
+                    tag,
+                    "unit variant payload must be null or empty",
+                ));
+            }
+            VariantValue::Unit
+        }
         VariantFields::Tuple(types) => {
             if types.len() == 1 {
                 VariantValue::Tuple(vec![value_from_json(
@@ -1375,6 +1389,15 @@ fn enum_from_json(
             let obj = payload
                 .as_object()
                 .ok_or_else(|| json_mismatch(tag, "expected struct variant object"))?;
+            if let Some(unknown) = obj
+                .keys()
+                .find(|key| !fields.iter().any(|field| field.name == **key))
+            {
+                return Err(json_mismatch(
+                    tag,
+                    &format!("unknown variant field {unknown}"),
+                ));
+            }
             VariantValue::Struct(
                 fields
                     .iter()
@@ -1619,6 +1642,52 @@ mod tests {
         builtin_type("set", vec![elem])
     }
 
+    fn custom_t(name: &str) -> TypeTag {
+        TypeTag::Concrete {
+            petal_hash: [0xAA; 32],
+            type_name: name.to_string(),
+            type_args: vec![],
+        }
+    }
+
+    struct TestResolver;
+
+    impl Resolver for TestResolver {
+        fn resolve_shape(
+            &self,
+            tag: &TypeTag,
+            _depth: usize,
+        ) -> Result<TypeShape, ValueCodecError> {
+            if let Some(shape) = builtin_shape(tag)? {
+                return Ok(shape);
+            }
+            match tag {
+                TypeTag::Concrete { type_name, .. } if type_name == "Pair" => {
+                    Ok(TypeShape::Struct(vec![FieldShape {
+                        name: "amount".to_string(),
+                        ty: t("u64"),
+                    }]))
+                }
+                TypeTag::Concrete { type_name, .. } if type_name == "Mode" => {
+                    Ok(TypeShape::Enum(vec![
+                        VariantShape {
+                            name: "Paused".to_string(),
+                            fields: VariantFields::Unit,
+                        },
+                        VariantShape {
+                            name: "Configured".to_string(),
+                            fields: VariantFields::Struct(vec![FieldShape {
+                                name: "level".to_string(),
+                                ty: t("u8"),
+                            }]),
+                        },
+                    ]))
+                }
+                _ => Err(ValueCodecError::UnresolvedType(type_tag_label(tag))),
+            }
+        }
+    }
+
     #[test]
     fn uleb128_minimal_roundtrip_and_rejects_non_minimal() {
         let cases = [0, 1, 127, 128, 16_384, u32::MAX as u64, u64::MAX];
@@ -1688,6 +1757,59 @@ mod tests {
             decode_json(&BuiltinResolver, &tag, &[0], &CodecLimits::default()).unwrap(),
             JsonValue::Null
         );
+    }
+
+    #[test]
+    fn json_struct_rejects_unknown_fields() {
+        let tag = custom_t("Pair");
+        let err = encode_json(
+            &TestResolver,
+            &tag,
+            &json!({ "amount": "7", "admin": true }),
+            &CodecLimits::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field admin"));
+    }
+
+    #[test]
+    fn json_unit_enum_rejects_non_empty_payload() {
+        let tag = custom_t("Mode");
+        encode_json(
+            &TestResolver,
+            &tag,
+            &json!("Paused"),
+            &CodecLimits::default(),
+        )
+        .unwrap();
+        encode_json(
+            &TestResolver,
+            &tag,
+            &json!({ "Paused": null }),
+            &CodecLimits::default(),
+        )
+        .unwrap();
+        let err = encode_json(
+            &TestResolver,
+            &tag,
+            &json!({ "Paused": { "ignored": true } }),
+            &CodecLimits::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unit variant payload"));
+    }
+
+    #[test]
+    fn json_struct_variant_rejects_unknown_fields() {
+        let tag = custom_t("Mode");
+        let err = encode_json(
+            &TestResolver,
+            &tag,
+            &json!({ "Configured": { "level": 1, "extra": 2 } }),
+            &CodecLimits::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown variant field extra"));
     }
 
     #[test]

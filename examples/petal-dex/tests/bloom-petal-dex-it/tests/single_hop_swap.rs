@@ -68,7 +68,7 @@ fn ptb_single_hop_swap_shape() {
     let gas_coin_id = genesis_coin_id(alice, 1);
     seed_coin(&mut state, gas_coin_id, alice, 1);
 
-    // WAT petal: takes alice's coin as Arg::Object, returns its id (40-byte envelope)
+    // WAT petal: takes alice's coin as Arg::Object, returns its id (37-byte envelope)
     // simulating a "router load coin" operation.
     let id_bytes = alice_coin_id.0;
     let id_hex: String = id_bytes.iter().map(|b| format!("\\{b:02x}")).collect();
@@ -77,10 +77,10 @@ fn ptb_single_hop_swap_shape() {
 (module
   (import "chain" "petal.return" (func $ret (param i32 i32)))
   (memory (export "memory") 1)
-  ;; 40-byte return envelope: count=1 (4 bytes BE) | len=32 (4 bytes BE) | id (32 bytes)
-  (data (i32.const 0) "\00\00\00\01\00\00\00\20{id_hex}")
+  ;; 37-byte return envelope: count=1 (4 bytes BE) | len=32 (ULEB128) | id (32 bytes)
+  (data (i32.const 0) "\00\00\00\01\20{id_hex}")
   (func (export "__petal_load_coin") (param i32 i32) (result i32)
-    (call $ret (i32.const 0) (i32.const 40))
+    (call $ret (i32.const 0) (i32.const 37))
     i32.const 0)
 )
 "#
@@ -248,10 +248,10 @@ fn cpmm_version_call_uses_real_manifest_via_wasm_section() {
 (module
   (import "chain" "petal.return" (func $ret (param i32 i32)))
   (memory (export "memory") 1)
-  ;; output buffer: count=1, len=4, payload=1 (all big-endian)
-  (data (i32.const 0) "\00\00\00\01\00\00\00\04\00\00\00\01")
+  ;; output buffer: count=1, len=4, payload=1
+  (data (i32.const 0) "\00\00\00\01\04\00\00\00\01")
   (func (export "__petal_version") (param i32 i32) (result i32)
-    (call $ret (i32.const 0) (i32.const 12))
+    (call $ret (i32.const 0) (i32.const 9))
     i32.const 0)
 )
 "#;

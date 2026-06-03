@@ -11,6 +11,9 @@ use bloom_value::{
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use crate::chain_iface::PetalManifestStub;
+use crate::value_validation::{ManifestLoader, StubResolver, effective_return_slot_tag};
+
 /// Error returned while converting typed JSON to or from canonical ABI bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum JsonAbiError {
@@ -56,6 +59,35 @@ pub fn decode_json_const(tag: &TypeTag, value: &Value) -> Result<Vec<u8>, JsonAb
         .map_err(|e| map_value_error(&tag, e))
 }
 
+/// Convert typed JSON to canonical bytes for a declared TypeTag using a petal
+/// manifest to resolve custom structs/enums and generic self references.
+pub fn decode_json_const_with_manifest(
+    manifest: &PetalManifestStub,
+    self_hash: [u8; 32],
+    tag: &TypeTag,
+    value: &Value,
+) -> Result<Vec<u8>, JsonAbiError> {
+    decode_json_const_with_manifest_loader(manifest, self_hash, tag, value, None)
+}
+
+/// Convert typed JSON to canonical bytes using a petal manifest plus a loader
+/// for external petal manifests referenced by `external_type_refs`.
+pub fn decode_json_const_with_manifest_loader(
+    manifest: &PetalManifestStub,
+    self_hash: [u8; 32],
+    tag: &TypeTag,
+    value: &Value,
+    load_manifest: Option<&ManifestLoader<'_>>,
+) -> Result<Vec<u8>, JsonAbiError> {
+    let resolver =
+        StubResolver::with_self_hash_and_manifest_loader(manifest, self_hash, load_manifest);
+    let tag = resolver
+        .resolve_declared_tag(tag)
+        .map_err(|e| map_value_error(tag, e))?;
+    encode_value_json(&resolver, &tag, value, &CodecLimits::default())
+        .map_err(|e| map_value_error(&tag, e))
+}
+
 /// Decode one return slot. Unknown/custom types degrade to `Ok(None)` so callers
 /// can still surface the raw slot.
 pub fn decode_return_json(tag: &TypeTag, bytes: &[u8]) -> Result<Option<Value>, JsonAbiError> {
@@ -67,6 +99,37 @@ pub fn decode_return_json(tag: &TypeTag, bytes: &[u8]) -> Result<Option<Value>, 
             JsonAbiError::UnsupportedType(_) => Ok(None),
             other => Err(other),
         })
+}
+
+/// Decode one return slot using a petal manifest to resolve custom return
+/// shapes. Object-handle returns are decoded using the same effective type that
+/// return-slot validation applies.
+pub fn decode_return_json_with_manifest(
+    manifest: &PetalManifestStub,
+    self_hash: [u8; 32],
+    tag: &TypeTag,
+    bytes: &[u8],
+) -> Result<Value, JsonAbiError> {
+    decode_return_json_with_manifest_loader(manifest, self_hash, tag, bytes, None)
+}
+
+/// Decode one return slot using a petal manifest plus a loader for external
+/// petal manifests referenced by `external_type_refs`.
+pub fn decode_return_json_with_manifest_loader(
+    manifest: &PetalManifestStub,
+    self_hash: [u8; 32],
+    tag: &TypeTag,
+    bytes: &[u8],
+    load_manifest: Option<&ManifestLoader<'_>>,
+) -> Result<Value, JsonAbiError> {
+    let tag = effective_return_slot_tag(manifest, tag);
+    let resolver =
+        StubResolver::with_self_hash_and_manifest_loader(manifest, self_hash, load_manifest);
+    let tag = resolver
+        .resolve_declared_tag(&tag)
+        .map_err(|e| map_value_error(&tag, e))?;
+    decode_value_json(&resolver, &tag, bytes, &CodecLimits::default())
+        .map_err(|e| map_value_error(&tag, e))
 }
 
 /// Decode a TypeTag from JSON.
@@ -345,8 +408,53 @@ mod tests {
     }
 
     #[test]
-    fn unknown_return_degrades_to_none() {
+    fn builtin_only_unknown_return_degrades_to_none() {
         let tag = prim("Custom");
         assert_eq!(decode_return_json(&tag, &[1, 2, 3]).unwrap(), None);
+    }
+
+    #[test]
+    fn manifest_custom_data_round_trips() {
+        let manifest = PetalManifestStub {
+            data_types: vec![crate::DataTypeDeclStub {
+                name: "Wrapper".to_string(),
+                fields: vec![crate::FieldDeclStub {
+                    name: "value".to_string(),
+                    ty: prim("u64"),
+                }],
+                ..crate::DataTypeDeclStub::default()
+            }],
+            ..PetalManifestStub::default()
+        };
+        let tag = prim("Wrapper");
+
+        let bytes =
+            decode_json_const_with_manifest(&manifest, [0xAA; 32], &tag, &json!({"value": "42"}))
+                .unwrap();
+
+        assert_eq!(bytes, 42u64.to_be_bytes());
+        assert_eq!(
+            decode_return_json_with_manifest(&manifest, [0xAA; 32], &tag, &bytes).unwrap(),
+            json!({"value": "42"})
+        );
+    }
+
+    #[test]
+    fn manifest_object_return_decodes_as_object_id() {
+        let manifest = PetalManifestStub {
+            object_types: vec![crate::ObjectTypeDeclStub {
+                name: "Thing".to_string(),
+                fields: vec![],
+                ..crate::ObjectTypeDeclStub::default()
+            }],
+            ..PetalManifestStub::default()
+        };
+        let tag = prim("Thing");
+        let bytes = [0x22; 32];
+
+        assert_eq!(
+            decode_return_json_with_manifest(&manifest, [0xAA; 32], &tag, &bytes).unwrap(),
+            json!(hex::encode(bytes))
+        );
     }
 }

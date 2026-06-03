@@ -129,10 +129,12 @@ impl BalanceView for StateAdmissionView<'_> {
         self.state.get_account(addr).map(|a| a.nonce).unwrap_or(0)
     }
 
-    fn loom_balance(&self, addr: &Address) -> u128 {
-        resolve_loom_coin_type(self.state)
-            .map(|coin_type| coin_loom_balance(self.state, *addr, &coin_type))
-            .unwrap_or(0)
+    fn loom_balance(&self, addr: &Address) -> Result<u128, AdmitReject> {
+        let Some(coin_type) = resolve_loom_coin_type(self.state) else {
+            return Ok(0);
+        };
+        coin_loom_balance(self.state, *addr, &coin_type)
+            .map_err(|reason| AdmitReject::Overflow(reason.to_string()))
     }
 
     fn validate_submit_ptb(
@@ -230,7 +232,11 @@ pub fn resolve_loom_coin_type(state: &State) -> Option<TypeTag> {
     state.vfs_lookup(CORE_FUNGIBLE_PATH).map(loom_coin_type_tag)
 }
 
-pub fn coin_loom_balance(state: &State, owner: Address, coin_type: &TypeTag) -> u128 {
+pub fn coin_loom_balance(
+    state: &State,
+    owner: Address,
+    coin_type: &TypeTag,
+) -> Result<u128, &'static str> {
     let okey = OwnershipIndexKey {
         owner_kind: OWNER_KIND_ADDRESS,
         owner_id: owner.0,
@@ -250,7 +256,57 @@ pub fn coin_loom_balance(state: &State, owner: Address, coin_type: &TypeTag) -> 
             }
         })
         .try_fold(0u128, |acc, value| acc.checked_add(value))
-        .unwrap_or(u128::MAX)
+        .ok_or("Coin<LOOM> balance overflow")
+}
+
+#[cfg(test)]
+mod balance_tests {
+    use super::*;
+    use bloom_objects::{Object, ObjectId};
+    use bloom_petal_fungible::ops::coin_payload;
+    use bloom_script::{DEFAULT_FUNGIBLE_PETAL_HASH, loom_coin_type_tag};
+
+    fn address(byte: u8) -> Address {
+        Address([byte; 32])
+    }
+
+    fn insert_coin(
+        state: &mut State,
+        id_byte: u8,
+        owner: Address,
+        value: u128,
+        coin_type: TypeTag,
+    ) {
+        let id = ObjectId([id_byte; 32]);
+        state.set_object(Object {
+            id,
+            type_tag: coin_type,
+            owner: Owner::Address(owner.0),
+            version: 0,
+            payload: coin_payload(value),
+        });
+        let key = OwnershipIndexKey {
+            owner_kind: OWNER_KIND_ADDRESS,
+            owner_id: owner.0,
+        };
+        let mut owned = state.get_ownership(&key).unwrap_or_default();
+        owned.push(id);
+        state.set_ownership(key, owned);
+    }
+
+    #[test]
+    fn coin_loom_balance_reports_overflow() {
+        let mut state = State::new();
+        let owner = address(0x11);
+        let coin_type = loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH);
+        insert_coin(&mut state, 0xA0, owner, u128::MAX, coin_type.clone());
+        insert_coin(&mut state, 0xA1, owner, 1, coin_type.clone());
+
+        assert_eq!(
+            coin_loom_balance(&state, owner, &coin_type),
+            Err("Coin<LOOM> balance overflow")
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

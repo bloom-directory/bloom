@@ -9,9 +9,8 @@
 //!
 //! Supported primitive type names: `u8`..`u128`, `i8`..`i128`, `bool`,
 //! `Address`/`ObjectId`/`Hash32` (32-byte hex), `bytes`, `String`/`string`.
-//! Anything else (petal-defined structs, generics, externals) must be supplied
-//! as `0x`-prefixed canonical bytes and is validated by the PTB validator
-//! against the resolved manifest schema.
+//! Anything else (petal-defined structs, generics, externals, and
+//! parameterized values) must be lowered through a manifest-aware front door.
 
 use bloom_objects::TypeTag;
 use bloom_resource::{BloomType, Bytes as BloomBytes};
@@ -27,9 +26,10 @@ pub fn encode_const_literal(declared: &TypeTag, value: &str) -> Result<Vec<u8>, 
             type_args,
             ..
         } if type_args.is_empty() => encode_primitive(type_name, value),
-        // Generic / external / parameterised concrete: we have no static
-        // schema, so accept a raw `0x`-hex literal as opaque bytes.
-        _ => parse_hex_bytes(value),
+        _ => Err(BuildError::Parse(format!(
+            "declared const type {} requires manifest-aware typed lowering",
+            type_tag_label(declared)
+        ))),
     }
 }
 
@@ -64,9 +64,47 @@ fn encode_primitive(type_name: &str, value: &str) -> Result<Vec<u8>, BuildError>
         }
         "bytes" => parse_hex_bytes(value).map(|bytes| BloomBytes(bytes).canonical_encode()),
         "String" | "string" => Ok(value.to_string().canonical_encode()),
-        // Petal struct/enum names: accept canonical bytes as hex; the
-        // schema resolver validates them before the command is recorded.
-        _ => parse_hex_bytes(value),
+        _ => Err(BuildError::Parse(format!(
+            "declared const type {type_name} requires manifest-aware typed lowering"
+        ))),
+    }
+}
+
+fn type_tag_label(tag: &TypeTag) -> String {
+    match tag {
+        TypeTag::Concrete {
+            petal_hash,
+            type_name,
+            type_args,
+        } => {
+            let mut out = type_name.clone();
+            if *petal_hash != [0u8; 32] && *petal_hash != bloom_objects::BUILTIN_TYPE_HASH {
+                out.push('@');
+                push_hex(petal_hash, &mut out);
+            }
+            if !type_args.is_empty() {
+                out.push('<');
+                out.push_str(
+                    &type_args
+                        .iter()
+                        .map(type_tag_label)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+                out.push('>');
+            }
+            out
+        }
+        TypeTag::Generic { idx } => format!("T{idx}"),
+        TypeTag::External { ref_idx } => format!("$external_{ref_idx}"),
+    }
+}
+
+fn push_hex(bytes: &[u8], out: &mut String) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
     }
 }
 

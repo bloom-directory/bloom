@@ -47,7 +47,7 @@ use crate::error::PtbError;
 use crate::host_ctx::PtbHostCtx;
 use crate::types::{Arg, Command, MoveCmd, PublishCmd, UpgradeCmd, UseRef};
 use crate::validator::{ValidatedPtb, decode_coin_value};
-use crate::value_validation::validate_return_slot;
+use crate::value_validation::validate_return_slot_with_manifest_loader;
 
 const MAX_PETAL_RETURN_SLOTS: usize = 32;
 const MAX_PETAL_RETURN_BYTES: usize = 2 << 20;
@@ -544,7 +544,14 @@ impl<'c> PtbExecutor<'c> {
         let outputs = unmarshal_outputs(&result.ret_buf, expected_returns, cmd_idx)?;
         for (ret_idx, (output, declared)) in outputs.iter().zip(f.returns.iter()).enumerate() {
             let expected = substitute_type_args(declared, &m.type_args);
-            if let Err(reason) = validate_return_slot(manifest, hash.0, &expected, output) {
+            let load_manifest = |petal_hash: &Hash32| self.chain.load_manifest(petal_hash);
+            if let Err(reason) = validate_return_slot_with_manifest_loader(
+                manifest,
+                hash.0,
+                &expected,
+                output,
+                &load_manifest,
+            ) {
                 return Err(PtbError::BuiltinFailed {
                     cmd_idx,
                     reason: format!(
@@ -1470,7 +1477,7 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(&(items.len() as u32).to_be_bytes());
         for it in items {
-            buf.extend_from_slice(&(it.len() as u32).to_be_bytes());
+            bloom_value::write_uleb128(it.len() as u64, &mut buf);
             buf.extend_from_slice(it);
         }
         buf

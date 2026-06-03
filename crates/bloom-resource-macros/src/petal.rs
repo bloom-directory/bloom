@@ -184,6 +184,9 @@ pub(crate) fn build_manifest_with_asts(
         }
     }
 
+    bloom_petal_manifest::validate_reserved_type_names(&m)
+        .map_err(|e| err_spanned(module, e.to_string()))?;
+
     Ok((m, shims))
 }
 
@@ -817,6 +820,23 @@ mod tests {
         assert_eq!(manifest.enum_types.len(), 1);
         assert_eq!(manifest.enum_types[0].name, "Side");
         assert_eq!(manifest.enum_types[0].variants.len(), 2);
+    }
+
+    #[test]
+    fn build_manifest_rejects_reserved_builtin_type_names() {
+        let m = parse_mod(quote! {
+            pub mod p {
+                #[derive(BloomType)]
+                pub struct String { value: u64 }
+            }
+        });
+        let attr = PetalAttr::parse(quote! { path = "/p" }).unwrap();
+        let err = build_manifest(&attr, &m).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("reserved built-in type name String"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

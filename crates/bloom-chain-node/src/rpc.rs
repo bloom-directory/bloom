@@ -43,8 +43,9 @@ use bloom_chain_types::{
 use bloom_objects::{AccessMode, Object, ObjectId, TypeTag};
 use bloom_petal_manifest::{extract_petal_manifest_v0, to_petal_manifest_stub};
 use bloom_script::{
-    ArgDeclStub, CORE_FUNGIBLE_PATH, ChainStateIface, PetalManifestStub, decode_json_const,
-    decode_json_type_tag, decode_return_json, loom_coin_type_tag,
+    ArgDeclStub, CORE_FUNGIBLE_PATH, ChainStateIface, PetalManifestStub,
+    decode_json_const_with_manifest_loader, decode_json_type_tag,
+    decode_return_json_with_manifest_loader, loom_coin_type_tag,
     types::{Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PtbTx},
     validator::{SignatureVerifier, ValidationMode},
 };
@@ -747,7 +748,15 @@ impl RpcServer {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let args = decode_view_args(cmd_idx, &cmd.args, &function.args, &type_args, &state)?;
+            let load_manifest = |hash: &Hash32| adapter.load_manifest(hash);
+            let arg_ctx = ViewArgDecodeCtx {
+                type_args: &type_args,
+                manifest: &manifest,
+                self_hash: petal_hash.0,
+                load_manifest: &load_manifest,
+                state: &state,
+            };
+            let args = decode_view_args(cmd_idx, &cmd.args, &function.args, &arg_ctx)?;
             declared_returns.push(
                 function
                     .returns
@@ -757,7 +766,7 @@ impl RpcServer {
                     })
                     .collect::<Vec<_>>(),
             );
-            response_meta.push((cmd.path.clone(), cmd.function.clone(), petal_hash));
+            response_meta.push((cmd.path.clone(), cmd.function.clone(), petal_hash, manifest));
             commands.push(Command::Move(MoveCmd {
                 petal: PetalRef {
                     path: cmd.path.clone(),
@@ -828,7 +837,7 @@ impl RpcServer {
         }
 
         let mut out_commands = Vec::with_capacity(response_meta.len());
-        for (idx, (path, function, petal_hash)) in response_meta.into_iter().enumerate() {
+        for (idx, (path, function, petal_hash, manifest)) in response_meta.into_iter().enumerate() {
             let outputs = report.command_outputs.get(idx).cloned().unwrap_or_default();
             let raw = outputs.iter().map(hex::encode).collect::<Vec<_>>();
             let mut typed = Vec::with_capacity(outputs.len());
@@ -837,7 +846,14 @@ impl RpcServer {
                     typed.push(Value::Null);
                     continue;
                 };
-                typed.push(decode_return_json(tag, bytes)?.unwrap_or(Value::Null));
+                let load_manifest = |hash: &Hash32| adapter.load_manifest(hash);
+                typed.push(decode_return_json_with_manifest_loader(
+                    &manifest,
+                    petal_hash.0,
+                    tag,
+                    bytes,
+                    Some(&load_manifest),
+                )?);
             }
             out_commands.push(json!({
                 "path": path,
@@ -1045,12 +1061,19 @@ fn view_signers(params: &ViewCallParams) -> Result<Vec<[u8; 32]>> {
         .collect()
 }
 
+struct ViewArgDecodeCtx<'a> {
+    type_args: &'a [TypeTag],
+    manifest: &'a PetalManifestStub,
+    self_hash: [u8; 32],
+    load_manifest: &'a dyn Fn(&Hash32) -> Option<PetalManifestStub>,
+    state: &'a State,
+}
+
 fn decode_view_args(
     cmd_idx: usize,
     values: &[Value],
     decls: &[ArgDeclStub],
-    type_args: &[TypeTag],
-    state: &State,
+    ctx: &ViewArgDecodeCtx<'_>,
 ) -> Result<Vec<Arg>> {
     if values.len() != decls.len() {
         return Err(anyhow!(
@@ -1065,10 +1088,10 @@ fn decode_view_args(
         .enumerate()
         .map(|(arg_idx, (value, decl))| match decl {
             ArgDeclStub::Signer => parse_signer_arg(cmd_idx, arg_idx, value),
-            ArgDeclStub::Const(tag) => parse_const_arg(cmd_idx, arg_idx, tag, type_args, value),
-            ArgDeclStub::Object { .. } => parse_object_arg(cmd_idx, arg_idx, value, state),
+            ArgDeclStub::Const(tag) => parse_const_arg(cmd_idx, arg_idx, tag, value, ctx),
+            ArgDeclStub::Object { .. } => parse_object_arg(cmd_idx, arg_idx, value, ctx.state),
             ArgDeclStub::TypeArg(idx) => {
-                let tag = if let Some(tag) = type_args.get(*idx as usize) {
+                let tag = if let Some(tag) = ctx.type_args.get(*idx as usize) {
                     tag.clone()
                 } else {
                     decode_json_type_tag(value).with_context(|| {
@@ -1104,15 +1127,15 @@ fn parse_const_arg(
     cmd_idx: usize,
     arg_idx: usize,
     tag: &TypeTag,
-    type_args: &[TypeTag],
     value: &Value,
+    ctx: &ViewArgDecodeCtx<'_>,
 ) -> Result<Arg> {
     if value.get("kind").and_then(Value::as_str) == Some("const")
         && let Some(hex) = value.get("hex").and_then(Value::as_str)
     {
-        return Ok(Arg::Const(hex::decode(hex).with_context(|| {
-            format!("chain_view_call: command {cmd_idx}: arg {arg_idx}: const hex")
-        })?));
+        return Err(anyhow!(
+            "chain_view_call: command {cmd_idx}: arg {arg_idx}: raw const hex is not accepted for typed JSON args: {hex}"
+        ));
     }
     if let Some(use_ref) = parse_use_arg(value)? {
         return Ok(Arg::Use {
@@ -1120,9 +1143,21 @@ fn parse_const_arg(
             ret_idx: use_ref.1,
         });
     }
-    let resolved = substitute_type_args(tag, type_args);
+    let value = if value.get("kind").and_then(Value::as_str) == Some("const") {
+        value.get("value").unwrap_or(value)
+    } else {
+        value
+    };
+    let resolved = substitute_type_args(tag, ctx.type_args);
     Ok(Arg::Const(
-        decode_json_const(&resolved, value).with_context(|| {
+        decode_json_const_with_manifest_loader(
+            ctx.manifest,
+            ctx.self_hash,
+            &resolved,
+            value,
+            Some(ctx.load_manifest),
+        )
+        .with_context(|| {
             format!("chain_view_call: command {cmd_idx}: arg {arg_idx}: decode typed const")
         })?,
     ))
@@ -1770,7 +1805,7 @@ mod tests {
 
     fn u128_tag() -> TypeTag {
         TypeTag::Concrete {
-            petal_hash: [0u8; 32],
+            petal_hash: bloom_objects::BUILTIN_TYPE_HASH,
             type_name: "u128".to_string(),
             type_args: vec![],
         }
@@ -1857,10 +1892,10 @@ mod tests {
               (import "chain" "petal.return" (func $ret (param i32 i32)))
               (import "chain" "msg.calldata.read" (func $read (param i32 i32 i32) (result i32)))
               (memory (export "memory") 1)
-              ;; count=1, len=16, u128=42
-              (data (i32.const 0) "\00\00\00\01\00\00\00\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
+              ;; count=1, len=16 (ULEB), u128=42
+              (data (i32.const 0) "\00\00\00\01\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
               (func (export "__petal_answer") (param i32 i32) (result i32)
-                (call $ret (i32.const 0) (i32.const 24))
+                (call $ret (i32.const 0) (i32.const 21))
                 i32.const 0)
             )
             "#,
@@ -1911,17 +1946,17 @@ mod tests {
               (import "chain" "petal.return" (func $ret (param i32 i32)))
               (import "chain" "msg.calldata.read" (func $read (param i32 i32 i32) (result i32)))
               (memory (export "memory") 1)
-              ;; count=1, len=16, u128=42
-              (data (i32.const 0) "\00\00\00\01\00\00\00\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
-              (data (i32.const 64) "\00\00\00\01\00\00\00\10")
+              ;; count=1, len=16 (ULEB), u128=42
+              (data (i32.const 0) "\00\00\00\01\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
+              (data (i32.const 64) "\00\00\00\01\10")
               (func (export "__petal_answer") (param i32 i32) (result i32)
-                (call $ret (i32.const 0) (i32.const 24))
+                (call $ret (i32.const 0) (i32.const 21))
                 i32.const 0)
               (func (export "__petal_echo") (param $ptr i32) (param $len i32) (result i32)
-                ;; Args buffer: count(4), tag(1), len(4), payload(16). Return count/len + payload.
-                (drop (call $read (i32.const 128) (i32.const 0) (i32.const 25)))
-                (memory.copy (i32.const 72) (i32.const 137) (i32.const 16))
-                (call $ret (i32.const 64) (i32.const 24))
+                ;; Args buffer: count(4), tag(1), len(ULEB), payload(16). Return count/len + payload.
+                (drop (call $read (i32.const 128) (i32.const 0) (i32.const 22)))
+                (memory.copy (i32.const 69) (i32.const 134) (i32.const 16))
+                (call $ret (i32.const 64) (i32.const 21))
                 i32.const 0)
             )
             "#,
@@ -1979,9 +2014,9 @@ mod tests {
             (module
               (import "chain" "petal.return" (func $ret (param i32 i32)))
               (memory (export "memory") 1)
-              (data (i32.const 0) "\00\00\00\01\00\00\00\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
+              (data (i32.const 0) "\00\00\00\01\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
               (func (export "__petal_answer") (param i32 i32) (result i32)
-                (call $ret (i32.const 0) (i32.const 24))
+                (call $ret (i32.const 0) (i32.const 21))
                 i32.const 0)
             )
             "#,
@@ -1992,9 +2027,9 @@ mod tests {
             (module
               (import "chain" "petal.return" (func $ret (param i32 i32)))
               (memory (export "memory") 1)
-              (data (i32.const 0) "\00\00\00\01\00\00\00\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\63")
+              (data (i32.const 0) "\00\00\00\01\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\63")
               (func (export "__petal_answer") (param i32 i32) (result i32)
-                (call $ret (i32.const 0) (i32.const 24))
+                (call $ret (i32.const 0) (i32.const 21))
                 i32.const 0)
             )
             "#,

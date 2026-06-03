@@ -1446,17 +1446,8 @@ fn build_proposal_block_from_candidates<E: PetalExecutor>(
         }
     }
 
-    match finalize_proposal_block(template, base_state, executor, block_emission, accepted) {
-        Ok(block) => block,
-        Err(e) => {
-            warn!(
-                err = %e,
-                "proposal.builder fell back to empty block after filtered tx set failed"
-            );
-            finalize_proposal_block(template, base_state, executor, block_emission, Vec::new())
-                .expect("empty proposal block must execute")
-        }
-    }
+    finalize_proposal_block(template, base_state, executor, block_emission, accepted)
+        .expect("filtered proposal block must execute after prefix validation")
 }
 
 fn finalize_proposal_block<E: PetalExecutor>(

@@ -376,7 +376,13 @@ if [ -z "$PTB_SIGNER_PK_HEX" ]; then
     derive_ptb_signer_registry
 fi
 
-log "running bloom-petal-dex-it::docker_petal_dex"
+if [ -n "${BLOOM_DOCKER_PETAL_VFS_ONLY:-}" ]; then
+    DOCKER_PETAL_TEST_NAME="docker_petal_vfs_acceptance"
+else
+    DOCKER_PETAL_TEST_NAME="docker_petal_dex_acceptance"
+fi
+
+log "running bloom-petal-dex-it::docker_petal_dex::$DOCKER_PETAL_TEST_NAME"
 if [ -x "$BLOOM_DOCKER_TEST_BIN" ]; then
     BLOOM_DOCKER_TMPDIR="$BLOOM_DOCKER_TMPDIR" \
     BLOOM_BIN="$BLOOM_BIN" \
@@ -384,7 +390,7 @@ if [ -x "$BLOOM_DOCKER_TEST_BIN" ]; then
     BLOOM_DEX_FAUCET_ADMIN_HEX="$PTB_SIGNER_PK_HEX" \
     RUST_LOG="${RUST_LOG:-warn}" \
     RUST_MIN_STACK="${RUST_MIN_STACK:-16777216}" \
-        "$BLOOM_DOCKER_TEST_BIN" docker_petal_dex_acceptance \
+        "$BLOOM_DOCKER_TEST_BIN" "$DOCKER_PETAL_TEST_NAME" \
         --exact --ignored --nocapture
 else
     require_cmd cargo
@@ -395,5 +401,5 @@ else
     RUST_LOG="${RUST_LOG:-warn}" \
     RUST_MIN_STACK="${RUST_MIN_STACK:-16777216}" \
         cargo test -p bloom-petal-dex-it --test docker_petal_dex \
-        -- --ignored --nocapture
+        "$DOCKER_PETAL_TEST_NAME" -- --exact --ignored --nocapture
 fi

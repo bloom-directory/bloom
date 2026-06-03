@@ -129,7 +129,7 @@ fn coin_version(state: &State, id: &ObjectId) -> Option<u64> {
 
 fn balance(state: &State, addr: &Address) -> u128 {
     resolve_loom_coin_type(state)
-        .map(|coin_type| coin_loom_balance(state, *addr, &coin_type))
+        .and_then(|coin_type| coin_loom_balance(state, *addr, &coin_type).ok())
         .unwrap_or(0)
 }
 

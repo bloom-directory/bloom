@@ -342,26 +342,26 @@ fn nullary_move_ptb(
 // ---------------------------------------------------------------------------
 
 // The PTB executor parses `petal.return`'d bytes as a length-prefixed
-// envelope: `count u32 BE | for each: (len u32 BE | bytes)`. To return
-// one 32-byte slot we therefore lay out 40 bytes:
+// envelope: `count u32 BE | for each: (len ULEB128 | bytes)`. To return
+// one 32-byte slot we therefore lay out 37 bytes:
 //
 //   offset 0..4   = 0x00000001  (count = 1 slot)
-//   offset 4..8   = 0x00000020  (len   = 32 bytes)
-//   offset 8..40  = 32 bytes the host writes via `signer.address(0, 8)`
+//   offset 4..5   = 0x20        (len   = 32 bytes)
+//   offset 5..37  = 32 bytes the host writes via `signer.address(0, 5)`
 //
-// Then `petal.return(0, 40)` ships the whole envelope back.
+// Then `petal.return(0, 37)` ships the whole envelope back.
 const SIGNER_FETCH_PETAL: &str = r#"
 (module
   (import "signer" "address"     (func $sa  (param i32 i32) (result i32)))
   (import "chain"  "petal.return" (func $ret (param i32 i32)))
   (memory (export "memory") 1)
-  ;; Pre-seed the length-prefixed envelope header: count=1, len=32 (BE).
-  (data (i32.const 0) "\00\00\00\01\00\00\00\20")
+  ;; Pre-seed the length-prefixed envelope header: count=1, len=32.
+  (data (i32.const 0) "\00\00\00\01\20")
   (func (export "__petal_get_signer") (param i32 i32) (result i32)
-    ;; signer.address(0, 8) — writes 32 signer bytes after the header.
-    (drop (call $sa (i32.const 0) (i32.const 8)))
-    ;; Ship the full 40-byte envelope back to the executor.
-    (call $ret (i32.const 0) (i32.const 40))
+    ;; signer.address(0, 5) — writes 32 signer bytes after the header.
+    (drop (call $sa (i32.const 0) (i32.const 5)))
+    ;; Ship the full 37-byte envelope back to the executor.
+    (call $ret (i32.const 0) (i32.const 37))
     i32.const 0)
 )
 "#;
@@ -380,7 +380,7 @@ fn signer_address_zero_resolves_to_first_signer() {
     let mut manifests = HashMap::new();
     manifests.insert(
         petal_hash,
-        manifest_with_nullary_fn_returns("get_signer", vec![TypeTag::External { ref_idx: 0 }]),
+        manifest_with_nullary_fn_returns("get_signer", vec![builtin_type("Address")]),
     );
 
     let ptb = nullary_move_ptb(signer, petal_hash, "get_signer", gas_payer_id, 100);
@@ -639,11 +639,11 @@ const CREATE_AND_TRANSFER_PETAL: &str = r#"
 
   (func (export "__petal_create_and_transfer") (param i32 i32) (result i32)
     ;; Pull the 86-byte Const payload out of calldata into memory[0..86].
-    ;; Const payload starts at calldata offset 9
-    ;; (4-byte count u32 BE | 1-byte tag=1 | 4-byte len u32 BE).
+    ;; Const payload starts at calldata offset 6
+    ;; (4-byte count u32 BE | 1-byte tag=1 | 1-byte ULEB128 len=86).
     (drop (call $cdread
             (i32.const 0)   ;; dst_ptr
-            (i32.const 9)   ;; offset
+            (i32.const 6)   ;; offset
             (i32.const 86))) ;; len
 
     ;; object.create(type_tag_ptr=0, type_tag_len=38,

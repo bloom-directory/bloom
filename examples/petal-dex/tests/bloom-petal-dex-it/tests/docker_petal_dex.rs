@@ -95,11 +95,15 @@ const TX_TIMEOUT: Duration = Duration::from_secs(60);
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker-compose stack; run via scripts/test-docker-petal-dex.sh"]
 async fn docker_petal_dex_acceptance() -> Result<()> {
-    if std::env::var_os("BLOOM_DOCKER_TMPDIR").is_none() {
-        eprintln!("skipping docker_petal_dex_acceptance: run via scripts/test-docker-petal-dex.sh");
-        return Ok(());
-    }
-    Box::pin(docker_petal_dex_acceptance_inner()).await
+    require_docker_harness("docker_petal_dex_acceptance")?;
+    Box::pin(docker_petal_dex_acceptance_inner(false)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker-compose stack; run via scripts/test-docker-petal-vfs.sh"]
+async fn docker_petal_vfs_acceptance() -> Result<()> {
+    require_docker_harness("docker_petal_vfs_acceptance")?;
+    Box::pin(docker_petal_dex_acceptance_inner(true)).await
 }
 
 #[test]
@@ -113,7 +117,15 @@ fn prints_ptb_signer_registry_entry_for_docker_script() {
     );
 }
 
-async fn docker_petal_dex_acceptance_inner() -> Result<()> {
+fn require_docker_harness(test_name: &str) -> Result<()> {
+    if std::env::var_os("BLOOM_DOCKER_TMPDIR").is_none() {
+        eprintln!("skipping {test_name}: run via scripts/test-docker-petal-dex.sh");
+        return Ok(());
+    }
+    Ok(())
+}
+
+async fn docker_petal_dex_acceptance_inner(vfs_only: bool) -> Result<()> {
     let tmpdir = compose_tmpdir()?;
     let home0 = tmpdir.join("home0");
     let genesis_path = home0.join("chain").join("genesis.toml");
@@ -239,7 +251,7 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     );
 
     exercise_live_petal_vfs_mount(&clients, &tmpdir, &home0, gas_payer, view_probe_hash).await?;
-    if std::env::var_os("BLOOM_DOCKER_PETAL_VFS_ONLY").is_some() {
+    if vfs_only {
         return Ok(());
     }
 
@@ -2507,7 +2519,7 @@ fn view_probe_wasm() -> Vec<u8> {
   (import "object" "read" (func $read (param i32 i32 i32) (result i32)))
   (memory (export "memory") 1)
   ;; count=1, len=16, u128=42
-  (data (i32.const 0) "\00\00\00\01\00\00\00\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
+  (data (i32.const 0) "\00\00\00\01\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
   (data (i32.const 64) "{counter_tag_wat}")
   ;; Counter payloads: initial 42, then mutated values.
   (data (i32.const 160) "\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
@@ -2516,18 +2528,18 @@ fn view_probe_wasm() -> Vec<u8> {
   (data (i32.const 224) "\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\7b")
   (data (i32.const 240) "forced revert")
   ;; one object-id return slot: count=1, len=32
-  (data (i32.const 512) "\00\00\00\01\00\00\00\20")
+  (data (i32.const 512) "\00\00\00\01\20")
   ;; one u128 return slot: count=1, len=16
-  (data (i32.const 640) "\00\00\00\01\00\00\00\10")
+  (data (i32.const 640) "\00\00\00\01\10")
   (func (export "__petal_answer") (param i32 i32) (result i32)
-    (call $ret (i32.const 0) (i32.const 24))
+    (call $ret (i32.const 0) (i32.const 21))
     i32.const 0)
   (func (export "__petal_init_counter") (param i32 i32) (result i32)
     (local $h i32)
     (local.set $h
       (call $create (i32.const 64) (i32.const {counter_tag_len}) (i32.const 160) (i32.const 16)))
     (drop (call $id (local.get $h) (i32.const 520)))
-    (call $ret (i32.const 512) (i32.const 40))
+    (call $ret (i32.const 512) (i32.const 37))
     i32.const 0)
   (func (export "__petal_set_counter") (param i32 i32) (result i32)
     (local $h i32)
@@ -2543,7 +2555,7 @@ fn view_probe_wasm() -> Vec<u8> {
     (local.set $h (call $borrow (i32.const 256) (i32.const 1)))
     (drop (call $mutate (local.get $h) (i32.const 208) (i32.const 16)))
     (drop (call $id (local.get $h) (i32.const 520)))
-    (call $ret (i32.const 512) (i32.const 40))
+    (call $ret (i32.const 512) (i32.const 37))
     i32.const 0)
   (func (export "__petal_set_counter_123_ret") (param i32 i32) (result i32)
     (local $h i32)
@@ -2552,7 +2564,7 @@ fn view_probe_wasm() -> Vec<u8> {
     (local.set $h (call $borrow (i32.const 256) (i32.const 1)))
     (drop (call $mutate (local.get $h) (i32.const 224) (i32.const 16)))
     (drop (call $id (local.get $h) (i32.const 520)))
-    (call $ret (i32.const 512) (i32.const 40))
+    (call $ret (i32.const 512) (i32.const 37))
     i32.const 0)
   (func (export "__petal_sink_counter") (param i32 i32) (result i32)
     (local $h i32)
@@ -2576,7 +2588,7 @@ fn view_probe_wasm() -> Vec<u8> {
     (drop (call $cdread (i32.const 256) (i32.const 5) (i32.const 32)))
     (local.set $h (call $borrow (i32.const 256) (i32.const 0)))
     (drop (call $read (local.get $h) (i32.const 648) (i32.const 16)))
-    (call $ret (i32.const 640) (i32.const 24))
+    (call $ret (i32.const 640) (i32.const 21))
     i32.const 0)
 )
 "#,
@@ -2751,14 +2763,14 @@ fn loom_probe_wasm(
   (import "chain" "petal.return" (func $ret (param i32 i32)))
   (memory (export "memory") 1)
   ;; count=2 | len=32 | merge_a | len=32 | merge_b
-  (data (i32.const 0) "\00\00\00\02\00\00\00\20{merge_a_wat}\00\00\00\20{merge_b_wat}")
+  (data (i32.const 0) "\00\00\00\02\20{merge_a_wat}\20{merge_b_wat}")
   ;; count=1 | len=32 | split_src
-  (data (i32.const 128) "\00\00\00\01\00\00\00\20{split_wat}")
+  (data (i32.const 128) "\00\00\00\01\20{split_wat}")
   (func (export "__petal_load_merge") (param i32 i32) (result i32)
-    (call $ret (i32.const 0) (i32.const 76))
+    (call $ret (i32.const 0) (i32.const 70))
     i32.const 0)
   (func (export "__petal_load_split") (param i32 i32) (result i32)
-    (call $ret (i32.const 128) (i32.const 40))
+    (call $ret (i32.const 128) (i32.const 37))
     i32.const 0)
   (func (export "__petal_trap_after_work") (param i32 i32) (result i32)
     (local $i i32)

@@ -20,7 +20,7 @@ pub fn deploy_petal_fuel_for_bytes(len: usize) -> u64 {
 
 pub trait BalanceView {
     fn nonce(&self, addr: &Address) -> u64;
-    fn loom_balance(&self, addr: &Address) -> u128;
+    fn loom_balance(&self, addr: &Address) -> Result<u128, AdmitReject>;
     fn validate_submit_ptb(&self, outer: &Tx, ptb: &PtbTx) -> Result<(), AdmitReject>;
     fn ptb_gas_payer_balance(&self, ptb: &PtbTx) -> Result<u128, AdmitReject>;
 }
@@ -96,18 +96,29 @@ fn check_sender_funded(tx: &Tx, value: u128, view: &dyn BalanceView) -> AdmitOut
         ));
     }
     let Some(fee_reservation) = (tx.max_fuel as u128).checked_mul(tx.fee_per_unit as u128) else {
+        let have = match view.loom_balance(&tx.sender) {
+            Ok(have) => have,
+            Err(reject) => return AdmitOutcome::Reject(reject),
+        };
         return AdmitOutcome::Reject(AdmitReject::InsufficientBalance {
             need: u128::MAX,
-            have: view.loom_balance(&tx.sender),
+            have,
         });
     };
     let Some(need) = fee_reservation.checked_add(value) else {
+        let have = match view.loom_balance(&tx.sender) {
+            Ok(have) => have,
+            Err(reject) => return AdmitOutcome::Reject(reject),
+        };
         return AdmitOutcome::Reject(AdmitReject::InsufficientBalance {
             need: u128::MAX,
-            have: view.loom_balance(&tx.sender),
+            have,
         });
     };
-    let have = view.loom_balance(&tx.sender);
+    let have = match view.loom_balance(&tx.sender) {
+        Ok(have) => have,
+        Err(reject) => return AdmitOutcome::Reject(reject),
+    };
     if have < need {
         return AdmitOutcome::Reject(AdmitReject::InsufficientBalance { need, have });
     }
@@ -184,12 +195,12 @@ impl BalanceView for SimpleBalanceView {
         if *addr == self.sender { self.nonce } else { 0 }
     }
 
-    fn loom_balance(&self, addr: &Address) -> u128 {
-        if *addr == self.sender {
+    fn loom_balance(&self, addr: &Address) -> Result<u128, AdmitReject> {
+        Ok(if *addr == self.sender {
             self.balance
         } else {
             0
-        }
+        })
     }
 
     fn validate_submit_ptb(&self, _outer: &Tx, _ptb: &PtbTx) -> Result<(), AdmitReject> {

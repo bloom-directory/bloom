@@ -17,6 +17,7 @@ use crate::types::{
 pub struct ManifestResolver<'a> {
     manifest: &'a PetalManifestV0,
     self_hash: Option<[u8; 32]>,
+    external_manifests: &'a [([u8; 32], &'a PetalManifestV0)],
 }
 
 impl<'a> ManifestResolver<'a> {
@@ -27,6 +28,7 @@ impl<'a> ManifestResolver<'a> {
         Self {
             manifest,
             self_hash: None,
+            external_manifests: &[],
         }
     }
 
@@ -35,6 +37,21 @@ impl<'a> ManifestResolver<'a> {
         Self {
             manifest,
             self_hash: Some(self_hash),
+            external_manifests: &[],
+        }
+    }
+
+    /// Create a resolver that can structurally resolve foreign concrete tags
+    /// through the supplied `(content_hash, manifest)` table.
+    pub fn with_self_hash_and_external_manifests(
+        manifest: &'a PetalManifestV0,
+        self_hash: [u8; 32],
+        external_manifests: &'a [([u8; 32], &'a PetalManifestV0)],
+    ) -> Self {
+        Self {
+            manifest,
+            self_hash: Some(self_hash),
+            external_manifests,
         }
     }
 
@@ -185,6 +202,18 @@ impl Resolver for ManifestResolver<'_> {
             ));
         };
         if !self.is_self_hash(petal_hash) {
+            if let Some((_, manifest)) = self
+                .external_manifests
+                .iter()
+                .find(|(hash, _)| hash == petal_hash)
+            {
+                let resolver = ManifestResolver {
+                    manifest,
+                    self_hash: Some(*petal_hash),
+                    external_manifests: self.external_manifests,
+                };
+                return resolver.resolve_shape(tag, _depth);
+            }
             return Err(ValueCodecError::UnresolvedType(
                 bloom_value::type_tag_label(tag),
             ));
@@ -281,8 +310,8 @@ mod tests {
     use bloom_value::{CodecLimits, Value, decode_value};
 
     use crate::types::{
-        DataTypeDecl, EnumTypeDecl, FieldDecl, ObjectTypeDecl, TypeParamDecl, TypeParamKind,
-        VariantDecl,
+        DataTypeDecl, EnumTypeDecl, ExternalTypeRef, FieldDecl, ObjectTypeDecl, TypeParamDecl,
+        TypeParamKind, VariantDecl,
     };
 
     fn builtin(name: &str) -> TypeTag {
@@ -406,6 +435,92 @@ mod tests {
                 name: "Ask".to_string(),
                 fields: bloom_value::VariantValue::Tuple(vec![Value::U8(9)]),
             }
+        );
+    }
+
+    #[test]
+    fn resolves_external_type_refs_through_supplied_manifest() {
+        let foreign_hash = [0xBB; 32];
+        let manifest = PetalManifestV0 {
+            external_type_refs: vec![ExternalTypeRef {
+                placeholder: "$external_0".to_string(),
+                declared_petal_path: "/foreign".to_string(),
+                declared_type_name: "Foreign".to_string(),
+                declared_content_hash: Some(foreign_hash),
+            }],
+            data_types: vec![DataTypeDecl {
+                name: "Local".to_string(),
+                fields: vec![FieldDecl {
+                    name: "foreign".to_string(),
+                    ty: TypeTag::External { ref_idx: 0 },
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let foreign = PetalManifestV0 {
+            data_types: vec![DataTypeDecl {
+                name: "Foreign".to_string(),
+                fields: vec![FieldDecl {
+                    name: "value".to_string(),
+                    ty: builtin("u64"),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let externals = [(foreign_hash, &foreign)];
+        let resolver = ManifestResolver::with_self_hash_and_external_manifests(
+            &manifest, [0xAA; 32], &externals,
+        );
+
+        let value = decode_value(
+            &resolver,
+            &self_ty("Local", vec![]),
+            &7u64.to_be_bytes(),
+            &CodecLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            value,
+            Value::Struct(vec![(
+                "foreign".to_string(),
+                Value::Struct(vec![("value".to_string(), Value::U64(7))])
+            )])
+        );
+    }
+
+    #[test]
+    fn external_type_refs_reject_without_supplied_manifest() {
+        let foreign_hash = [0xBB; 32];
+        let manifest = PetalManifestV0 {
+            external_type_refs: vec![ExternalTypeRef {
+                placeholder: "$external_0".to_string(),
+                declared_petal_path: "/foreign".to_string(),
+                declared_type_name: "Foreign".to_string(),
+                declared_content_hash: Some(foreign_hash),
+            }],
+            data_types: vec![DataTypeDecl {
+                name: "Local".to_string(),
+                fields: vec![FieldDecl {
+                    name: "foreign".to_string(),
+                    ty: TypeTag::External { ref_idx: 0 },
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let resolver = ManifestResolver::with_self_hash(&manifest, [0xAA; 32]);
+
+        assert!(
+            decode_value(
+                &resolver,
+                &self_ty("Local", vec![]),
+                &7u64.to_be_bytes(),
+                &CodecLimits::default(),
+            )
+            .is_err()
         );
     }
 
