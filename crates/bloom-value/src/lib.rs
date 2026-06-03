@@ -1293,12 +1293,9 @@ fn scalar_from_json(
             out.copy_from_slice(&bytes);
             Ok(Value::Bytes32(out))
         }
-        ScalarKind::TypeTag => {
-            let bytes = hex_from_json(tag, json)?;
-            TypeTag::decode_canonical(&bytes)
-                .map(Value::TypeTag)
-                .map_err(|e| json_mismatch(tag, &format!("invalid TypeTag: {e}")))
-        }
+        ScalarKind::TypeTag => type_tag_from_json(tag, json)
+            .map(Value::TypeTag)
+            .map_err(|e| json_mismatch(tag, &format!("invalid TypeTag: {e}"))),
     }
 }
 
@@ -1609,6 +1606,157 @@ fn hex_from_json(tag: &TypeTag, value: &JsonValue) -> Result<Vec<u8>, ValueCodec
         type_tag: type_tag_label(tag),
         reason: format!("invalid hex: {e}"),
     })
+}
+
+fn type_tag_from_json(tag: &TypeTag, value: &JsonValue) -> Result<TypeTag, String> {
+    match value {
+        JsonValue::String(s) => type_tag_from_json_string(s),
+        JsonValue::Object(map) => {
+            if let Some(v) = map.get("concrete") {
+                let obj = v
+                    .as_object()
+                    .ok_or_else(|| "concrete must be an object".to_string())?;
+                let type_name = obj
+                    .get("type_name")
+                    .or_else(|| obj.get("name"))
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| "concrete.type_name missing".to_string())?
+                    .to_string();
+                let petal_hash = match obj.get("petal_hash").or_else(|| obj.get("hash")) {
+                    Some(JsonValue::String(s)) => parse_hex32(s)
+                        .map_err(|reason| format!("invalid concrete.petal_hash: {reason}"))?,
+                    None => default_type_hash(&type_name),
+                    _ => return Err("concrete.petal_hash must be a hex string".to_string()),
+                };
+                let type_args = match obj.get("type_args") {
+                    Some(JsonValue::Array(items)) => items
+                        .iter()
+                        .map(|item| type_tag_from_json(tag, item))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    Some(_) => return Err("concrete.type_args must be an array".to_string()),
+                    None => Vec::new(),
+                };
+                Ok(normalize_builtin_type_tag(&TypeTag::Concrete {
+                    petal_hash,
+                    type_name,
+                    type_args,
+                }))
+            } else if let Some(v) = map.get("generic") {
+                Ok(TypeTag::Generic {
+                    idx: u16_from_json(v, "generic")?,
+                })
+            } else if let Some(v) = map.get("external") {
+                Ok(TypeTag::External {
+                    ref_idx: u16_from_json(v, "external")?,
+                })
+            } else {
+                Err("expected concrete/generic/external".to_string())
+            }
+        }
+        _ => Err("TypeTag must be a string or object".to_string()),
+    }
+    .map_err(|reason| format!("{reason} while parsing {}", type_tag_label(tag)))
+}
+
+fn type_tag_from_json_string(s: &str) -> Result<TypeTag, String> {
+    if let Ok(bytes) = hex::decode(strip_0x(s))
+        && let Ok(tag) = TypeTag::decode_canonical(&bytes)
+    {
+        return Ok(tag);
+    }
+    if let Some(inner) = s.strip_prefix("vector<").and_then(|v| v.strip_suffix('>')) {
+        return Ok(TypeTag::Concrete {
+            petal_hash: BUILTIN_TYPE_HASH,
+            type_name: "vector".to_string(),
+            type_args: vec![type_tag_from_json_string(inner.trim())?],
+        });
+    }
+    if s.is_empty() {
+        return Err("empty type tag".to_string());
+    }
+    Ok(TypeTag::Concrete {
+        petal_hash: default_type_hash(s),
+        type_name: s.to_string(),
+        type_args: Vec::new(),
+    })
+}
+
+fn parse_hex32(s: &str) -> Result<[u8; 32], String> {
+    let bytes = hex::decode(strip_0x(s)).map_err(|e| e.to_string())?;
+    if bytes.len() != 32 {
+        return Err(format!("expected 32 bytes, got {}", bytes.len()));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+fn strip_0x(s: &str) -> &str {
+    s.strip_prefix("0x").unwrap_or(s)
+}
+
+fn u16_from_json(value: &JsonValue, label: &str) -> Result<u16, String> {
+    let n = value
+        .as_u64()
+        .ok_or_else(|| format!("{label} must be a u16"))?;
+    n.try_into().map_err(|_| format!("{label} out of range"))
+}
+
+fn normalize_builtin_type_tag(tag: &TypeTag) -> TypeTag {
+    match tag {
+        TypeTag::Concrete {
+            petal_hash,
+            type_name,
+            type_args,
+        } => TypeTag::Concrete {
+            petal_hash: if is_builtin_type_name(type_name) {
+                BUILTIN_TYPE_HASH
+            } else {
+                *petal_hash
+            },
+            type_name: type_name.clone(),
+            type_args: type_args
+                .iter()
+                .map(normalize_builtin_type_tag)
+                .collect::<Vec<_>>(),
+        },
+        TypeTag::Generic { .. } | TypeTag::External { .. } => tag.clone(),
+    }
+}
+
+fn default_type_hash(type_name: &str) -> [u8; 32] {
+    if is_builtin_type_name(type_name) {
+        BUILTIN_TYPE_HASH
+    } else {
+        [0u8; 32]
+    }
+}
+
+fn is_builtin_type_name(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "bool"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "Address"
+            | "address"
+            | "ObjectId"
+            | "Hash32"
+            | "UID"
+            | "TypeTag"
+            | "bytes"
+            | "String"
+            | "string"
+            | "vector"
+            | "set"
+            | "map"
+            | "tuple"
+            | "Option"
+            | "Result"
+    )
 }
 
 fn _cow_label(tag: &TypeTag) -> Cow<'_, str> {
@@ -1931,7 +2079,43 @@ mod tests {
         );
         assert_eq!(
             decode_json(&BuiltinResolver, &tag, &bytes, &CodecLimits::default()).unwrap(),
-            json!(hex::encode(bytes))
+            json!(hex::encode(&bytes))
+        );
+        assert_eq!(
+            encode_json(
+                &BuiltinResolver,
+                &tag,
+                &json!(hex::encode(&bytes)),
+                &CodecLimits::default()
+            )
+            .unwrap(),
+            bytes
+        );
+        assert_eq!(
+            encode_json(
+                &BuiltinResolver,
+                &tag,
+                &json!("u64"),
+                &CodecLimits::default()
+            )
+            .unwrap(),
+            t("u64").encode_canonical().unwrap()
+        );
+        assert_eq!(
+            encode_json(
+                &BuiltinResolver,
+                &tag,
+                &json!({
+                    "concrete": {
+                        "petal_hash": hex::encode([0xAA; 32]),
+                        "type_name": "Coin",
+                        "type_args": ["u128"]
+                    }
+                }),
+                &CodecLimits::default()
+            )
+            .unwrap(),
+            bytes
         );
     }
 }

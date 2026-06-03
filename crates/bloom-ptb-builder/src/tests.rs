@@ -87,6 +87,7 @@ fn concrete(name: &str) -> TypeTag {
             | "u64"
             | "u128"
             | "Address"
+            | "address"
             | "ObjectId"
             | "Hash32"
             | "UID"
@@ -281,6 +282,29 @@ fn append_const_literal_bytes_canonicalizes_hex_payload() {
             assert_eq!(m.args, vec![Arg::Const(vec![4, 0xde, 0xad, 0xbe, 0xef])]);
         }
         _ => panic!(),
+    }
+}
+
+#[test]
+fn append_const_literal_accepts_address_aliases_and_uid() {
+    let literal = format!("0x{}", "22".repeat(32));
+    for type_name in ["Address", "address", "ObjectId", "Hash32", "UID"] {
+        let chain = chain_with_pool(vec![func(
+            "store",
+            vec![ArgDeclStub::Const(concrete(type_name))],
+            vec![],
+        )]);
+        let mut s = PtbSession::new(&chain);
+
+        s.append_command(&format!("/bloom/petals/dex/pool/store {literal}"))
+            .unwrap();
+
+        match &s.commands()[0] {
+            Command::Move(m) => {
+                assert_eq!(m.args, vec![Arg::Const(vec![0x22; 32])]);
+            }
+            _ => panic!(),
+        }
     }
 }
 

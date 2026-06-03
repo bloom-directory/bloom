@@ -12,6 +12,7 @@ bloom-chain-consensus = { path = "../bloom-chain-consensus" }
 bloom-petals       = { path = "../bloom-petals" }
 bloom-script       = { path = "../bloom-script" }
 bloom-objects      = { path = "../bloom-objects" }
+bloom-value        = { path = "../bloom-value" }
 bloom-petal-manifest = { path = "../bloom-petal-manifest" }
 bloom-petal-fungible = { path = "../bloom-petal-fungible" }
 bloom-keystore     = { path = "../bloom-keystore" }

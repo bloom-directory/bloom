@@ -311,6 +311,7 @@ fn is_builtin_name(type_name: &str) -> bool {
             | "ObjectId"
             | "Hash32"
             | "UID"
+            | "TypeTag"
             | "bytes"
             | "String"
             | "string"

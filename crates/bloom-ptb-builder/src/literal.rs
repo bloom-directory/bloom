@@ -8,7 +8,8 @@
 //! the resulting `Const` bytes match the schema-driven value codec.
 //!
 //! Supported primitive type names: `u8`..`u128`, `i8`..`i128`, `bool`,
-//! `Address`/`ObjectId`/`Hash32` (32-byte hex), `bytes`, `String`/`string`.
+//! `Address`/`address`/`ObjectId`/`Hash32`/`UID` (32-byte hex), `bytes`,
+//! `String`/`string`.
 //! Anything else (petal-defined structs, generics, externals, and
 //! parameterized values) must be lowered through a manifest-aware front door.
 
@@ -52,7 +53,7 @@ fn encode_primitive(type_name: &str, value: &str) -> Result<Vec<u8>, BuildError>
                 "expected bool (true/false/0/1), got {other:?}"
             ))),
         },
-        "Address" | "ObjectId" | "Hash32" => {
+        "Address" | "address" | "ObjectId" | "Hash32" | "UID" => {
             let bytes = parse_hex_bytes(value)?;
             if bytes.len() != 32 {
                 return Err(BuildError::Parse(format!(

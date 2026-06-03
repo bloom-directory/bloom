@@ -2165,6 +2165,7 @@ dependencies = [
  "bloom-petals",
  "bloom-script",
  "bloom-test-util",
+ "bloom-value",
  "clap",
  "hex",
  "parking_lot 0.12.5",

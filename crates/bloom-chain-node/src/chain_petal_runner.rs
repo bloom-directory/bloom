@@ -261,16 +261,16 @@ fn calldata_with_type_args(type_args: &[TypeTag], args_buf: &[u8]) -> Result<Vec
                 reason: "too many PTB args".to_string(),
             })?;
 
-    let mut out = Vec::with_capacity(4 + type_args.len() * 8 + args_buf.len().saturating_sub(4));
+    let mut out = Vec::with_capacity(4 + type_args.len() * 11 + args_buf.len().saturating_sub(4));
     out.extend_from_slice(&total.to_be_bytes());
     for tag in type_args {
         out.push(4);
         let enc = tag.encode_canonical().map_err(PtbError::Codec)?;
-        let len: u32 = enc.len().try_into().map_err(|_| PtbError::BuiltinFailed {
+        let len: u64 = enc.len().try_into().map_err(|_| PtbError::BuiltinFailed {
             cmd_idx: 0,
             reason: "TypeArg encoding too large".to_string(),
         })?;
-        out.extend_from_slice(&len.to_be_bytes());
+        bloom_value::write_uleb128(len, &mut out);
         out.extend_from_slice(&enc);
     }
     out.extend_from_slice(&args_buf[4..]);
@@ -397,7 +397,7 @@ mod tests {
         let mut positional = Vec::new();
         positional.extend_from_slice(&1u32.to_be_bytes());
         positional.push(1);
-        positional.extend_from_slice(&16u32.to_be_bytes());
+        bloom_value::write_uleb128(16, &mut positional);
         positional.extend_from_slice(&42u128.to_be_bytes());
 
         let calldata = calldata_with_type_args(std::slice::from_ref(&usdc), &positional).unwrap();
@@ -406,8 +406,7 @@ mod tests {
         let mut cursor = &calldata[4..];
         assert_eq!(cursor[0], 4);
         cursor = &cursor[1..];
-        let type_len = u32::from_be_bytes(cursor[..4].try_into().unwrap()) as usize;
-        cursor = &cursor[4..];
+        let type_len = bloom_value::read_uleb128(&mut cursor).unwrap() as usize;
         assert_eq!(
             TypeTag::decode_canonical(&cursor[..type_len]).unwrap(),
             usdc
@@ -415,8 +414,7 @@ mod tests {
         cursor = &cursor[type_len..];
         assert_eq!(cursor[0], 1);
         cursor = &cursor[1..];
-        let const_len = u32::from_be_bytes(cursor[..4].try_into().unwrap()) as usize;
-        cursor = &cursor[4..];
+        let const_len = bloom_value::read_uleb128(&mut cursor).unwrap() as usize;
         assert_eq!(const_len, 16);
         assert_eq!(&cursor[..const_len], &42u128.to_be_bytes());
         assert!(cursor[const_len..].is_empty());
