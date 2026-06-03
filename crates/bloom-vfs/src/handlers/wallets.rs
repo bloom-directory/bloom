@@ -1526,25 +1526,12 @@ mod tests {
     /// Helper: construct a passkey wallet on disk (no browser ceremony needed).
     /// Returns the wallet's address.
     fn seed_passkey_wallet(f: &Fixture, name: &str) -> Address {
-        let addr: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
-            .parse()
-            .unwrap();
+        let info = f.handler.keystore.create_local(name, "passphrase").unwrap();
+        f.handler.keystore.unlock(name, "passphrase").unwrap();
         let wallet_dir = f._tmp.path().join("keystore").join(name);
-        std::fs::create_dir_all(&wallet_dir).unwrap();
-        std::fs::write(
-            wallet_dir.join("address"),
-            bloom_proto::checksum_address(&addr).as_bytes(),
-        )
-        .unwrap();
-        std::fs::write(wallet_dir.join("pubkey"), b"").unwrap();
         std::fs::write(wallet_dir.join("kind"), b"passkey").unwrap();
-        let policy = bloom_proto::Policy::default();
-        std::fs::write(
-            wallet_dir.join("policy.toml"),
-            toml::to_string_pretty(&policy).unwrap(),
-        )
-        .unwrap();
-        addr
+        f.handler.keystore.sign_policy(name).unwrap();
+        info.address
     }
 
     /// Passkey wallet: dir lists `unlock-passkey`, lookup gives writable file,
