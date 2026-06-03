@@ -613,7 +613,7 @@ mod tests {
 
     fn concrete(name: &str) -> TypeTag {
         TypeTag::Concrete {
-            petal_hash: [0u8; 32],
+            petal_hash: bloom_objects::BUILTIN_TYPE_HASH,
             type_name: name.to_string(),
             type_args: vec![],
         }
