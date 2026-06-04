@@ -21,6 +21,8 @@ use bloom_dex_math::{ConstantProduct, ConstantProductParams, SwapStrategy, integ
 use bloom_objects::{ObjectId, TypeTag};
 use bloom_petal_dex_pool::ParamCodec;
 use bloom_petal_dex_pool::payload;
+use bloom_petal_dex_pool::pool;
+use bloom_value::{CodecLimits, validate_value_bytes};
 
 fn test_tag(name: &str) -> TypeTag {
     TypeTag::Concrete {
@@ -131,6 +133,53 @@ fn decode_pool_rejects_short_buffer() {
         payload::decode_pool(&short).is_none(),
         "short buffer should fail"
     );
+}
+
+#[test]
+fn payload_helpers_match_declared_manifest_layouts() {
+    let manifest = bloom_petal_manifest::codec::decode(pool::__bloom_manifest_bytes()).unwrap();
+    let resolver = bloom_petal_manifest::ManifestResolver::new(&manifest);
+    let limits = CodecLimits::default();
+    let pool_tag = TypeTag::Concrete {
+        petal_hash: [0u8; 32],
+        type_name: "Pool".to_string(),
+        type_args: vec![],
+    };
+    let lp_tag = TypeTag::Concrete {
+        petal_hash: [0u8; 32],
+        type_name: "LpPosition".to_string(),
+        type_args: vec![],
+    };
+
+    let id = ObjectId([0x11u8; 32]);
+    let pool_id = ObjectId([0x22u8; 32]);
+    let params_bytes = ConstantProductParams { fee_bps: 30 }.encode();
+    let coin_a_tag = test_tag("A");
+    let coin_b_tag = test_tag("B");
+    let encoded = payload::pool_payload(&id, 1, 2, 3, 4, &params_bytes, &coin_a_tag, &coin_b_tag);
+    validate_value_bytes(&resolver, &pool_tag, &encoded, &limits).unwrap();
+
+    let mut old_four_byte_params_len = Vec::new();
+    old_four_byte_params_len.extend_from_slice(&id.0);
+    old_four_byte_params_len.extend_from_slice(&1u128.to_be_bytes());
+    old_four_byte_params_len.extend_from_slice(&2u128.to_be_bytes());
+    old_four_byte_params_len.extend_from_slice(&3u128.to_be_bytes());
+    old_four_byte_params_len.extend_from_slice(&4u128.to_be_bytes());
+    old_four_byte_params_len.extend_from_slice(&(params_bytes.len() as u32).to_be_bytes());
+    old_four_byte_params_len.extend_from_slice(&params_bytes);
+    coin_a_tag
+        .encode_into(&mut old_four_byte_params_len)
+        .unwrap();
+    coin_b_tag
+        .encode_into(&mut old_four_byte_params_len)
+        .unwrap();
+    assert!(
+        validate_value_bytes(&resolver, &pool_tag, &old_four_byte_params_len, &limits).is_err(),
+        "old 4-byte params_bytes length prefix must not validate"
+    );
+
+    let lp_payload = payload::lp_payload(&id, &pool_id, 99);
+    validate_value_bytes(&resolver, &lp_tag, &lp_payload, &limits).unwrap();
 }
 
 // ─── 2. LpPosition payload round-trips ───────────────────────────────────────

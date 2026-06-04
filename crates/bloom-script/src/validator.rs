@@ -7,13 +7,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use bloom_objects::{
-    AccessMode, Object, ObjectId, Owner, TypeTag, ValidationOutcome, validate_canonical_bytes,
-};
+use bloom_objects::{AccessMode, BUILTIN_TYPE_HASH, Object, ObjectId, Owner, TypeTag};
+use bloom_resource::BloomType;
 
 use crate::chain_iface::{ArgDeclStub, ChainStateIface, FunctionDeclStub, PetalManifestStub};
 use crate::error::PtbError;
 use crate::types::{Arg, Command, ExpectedVersion, MoveCmd, PtbTx, UseRef};
+use crate::value_validation::validate_const_slot_with_manifest_loader;
 
 /// Validation policy for a PTB.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,6 +135,17 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
             _ => {}
         }
     }
+    let root_manifests = manifests.values().cloned().collect::<Vec<_>>();
+    let mut external_visited = petals.keys().copied().collect::<HashSet<_>>();
+    for manifest in &root_manifests {
+        resolve_external_petals(
+            manifest,
+            ctx,
+            &mut petals,
+            &mut manifests,
+            &mut external_visited,
+        )?;
+    }
 
     // Steps 4 + 5 (unified): strict typecheck + object version/access.
     //
@@ -210,6 +221,7 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
                 typecheck_move_cmd(
                     m,
                     manifest,
+                    ctx.chain,
                     cmd_idx,
                     &cmd_return_types,
                     &objects,
@@ -457,9 +469,39 @@ fn resolve_petal(
     Ok(())
 }
 
+fn resolve_external_petals(
+    manifest: &PetalManifestStub,
+    ctx: &ValidationContext<'_>,
+    petals: &mut HashMap<[u8; 32], Vec<u8>>,
+    manifests: &mut HashMap<[u8; 32], PetalManifestStub>,
+    visited: &mut HashSet<[u8; 32]>,
+) -> Result<(), PtbError> {
+    for external in &manifest.external_type_refs {
+        let Some(hash) = external.declared_content_hash else {
+            continue;
+        };
+        if !visited.insert(hash.0) {
+            continue;
+        }
+        let wasm = ctx
+            .chain
+            .load_petal(&hash)
+            .ok_or(PtbError::PetalNotFound { hash })?;
+        petals.entry(hash.0).or_insert(wasm);
+        let external_manifest = ctx
+            .chain
+            .load_manifest(&hash)
+            .ok_or(PtbError::PetalNotFound { hash })?;
+        manifests.entry(hash.0).or_insert(external_manifest.clone());
+        resolve_external_petals(&external_manifest, ctx, petals, manifests, visited)?;
+    }
+    Ok(())
+}
+
 fn typecheck_move_cmd(
     cmd: &MoveCmd,
     manifest: &PetalManifestStub,
+    chain: &dyn ChainStateIface,
     cmd_idx: usize,
     cmd_return_types: &[Vec<Option<TypeTag>>],
     objects: &HashMap<[u8; 32], Object>,
@@ -507,14 +549,6 @@ fn typecheck_move_cmd(
             ),
         });
     }
-    if !f.required_capabilities.is_empty() {
-        return Err(PtbError::TypeMismatch {
-            function: cmd.function.clone(),
-            arg_idx: 0,
-            reason: "manifest required_capabilities are not supported by PTB validation".into(),
-        });
-    }
-
     for (i, (arg, decl)) in cmd.args.iter().zip(f.args.iter()).enumerate() {
         match (arg, decl) {
             (Arg::Signer(idx), ArgDeclStub::Signer) => {
@@ -533,18 +567,23 @@ fn typecheck_move_cmd(
                 // manifest is checked against the concrete `T` the
                 // caller chose for this MoveCmd.
                 let expected = substitute_type_args(declared_tag, &cmd.type_args);
-                match validate_canonical_bytes(&expected, bytes) {
-                    ValidationOutcome::Ok | ValidationOutcome::Unknown => {}
-                    ValidationOutcome::Invalid(reason) => {
-                        return Err(PtbError::TypeMismatch {
-                            function: cmd.function.clone(),
-                            arg_idx: i,
-                            reason: format!(
-                                "Const bytes do not match declared type {}: {reason}",
-                                type_tag_label(&expected)
-                            ),
-                        });
-                    }
+                let load_manifest =
+                    |petal_hash: &bloom_chain_types::Hash32| chain.load_manifest(petal_hash);
+                if let Err(reason) = validate_const_slot_with_manifest_loader(
+                    manifest,
+                    hash.0,
+                    &expected,
+                    bytes,
+                    &load_manifest,
+                ) {
+                    return Err(PtbError::TypeMismatch {
+                        function: cmd.function.clone(),
+                        arg_idx: i,
+                        reason: format!(
+                            "Const bytes do not match declared type {}: {reason}",
+                            type_tag_label(&expected)
+                        ),
+                    });
                 }
             }
             (
@@ -654,6 +693,69 @@ fn typecheck_move_cmd(
         }
     }
 
+    check_required_capabilities(
+        cmd,
+        f,
+        cmd_idx,
+        cmd_return_types,
+        objects,
+        hash.0,
+        &local_object_types,
+    )?;
+
+    Ok(())
+}
+
+fn check_required_capabilities(
+    cmd: &MoveCmd,
+    f: &FunctionDeclStub,
+    cmd_idx: usize,
+    cmd_return_types: &[Vec<Option<TypeTag>>],
+    objects: &HashMap<[u8; 32], Object>,
+    self_hash: [u8; 32],
+    local_object_types: &HashSet<&str>,
+) -> Result<(), PtbError> {
+    for required in &f.required_capabilities {
+        let expected = substitute_type_args(required, &cmd.type_args);
+        let mut satisfied = false;
+        for (arg, decl) in cmd.args.iter().zip(f.args.iter()) {
+            if !matches!(decl, ArgDeclStub::Object { .. }) {
+                continue;
+            }
+            let actual = match arg {
+                Arg::Object { id, .. } => objects.get(&id.0).map(|obj| obj.type_tag.clone()),
+                Arg::Use {
+                    cmd_idx: u_cmd,
+                    ret_idx: u_ret,
+                } => Some(resolve_required_use_type(
+                    cmd_return_types,
+                    UseRef {
+                        cmd_idx: *u_cmd,
+                        ret_idx: *u_ret,
+                    },
+                    cmd_idx,
+                    "Capability requirement",
+                )?),
+                _ => None,
+            };
+            if actual.as_ref().is_some_and(|actual| {
+                type_tags_match(actual, &expected, self_hash, local_object_types)
+            }) {
+                satisfied = true;
+                break;
+            }
+        }
+        if !satisfied {
+            return Err(PtbError::TypeMismatch {
+                function: cmd.function.clone(),
+                arg_idx: 0,
+                reason: format!(
+                    "required capability {} was not provided",
+                    type_tag_label(&expected)
+                ),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -769,7 +871,7 @@ fn is_coin_type_tag(t: &TypeTag) -> bool {
 
 fn vector_type_tag(elem: TypeTag) -> TypeTag {
     TypeTag::Concrete {
-        petal_hash: [0u8; 32],
+        petal_hash: BUILTIN_TYPE_HASH,
         type_name: "vector".to_string(),
         type_args: vec![elem],
     }
@@ -824,6 +926,16 @@ fn type_tags_match_inner(
     local_object_types: &HashSet<&str>,
     allow_top_level_import: bool,
 ) -> bool {
+    if is_object_id_tag(declared) && is_object_handle_tag(actual, local_object_types) {
+        return true;
+    }
+    if let (Some(actual_inner), Some(declared_inner)) =
+        (option_type_arg(actual), option_type_arg(declared))
+        && is_object_id_tag(declared_inner)
+        && is_object_handle_tag(actual_inner, local_object_types)
+    {
+        return true;
+    }
     match (actual, declared) {
         (
             TypeTag::Concrete {
@@ -859,6 +971,45 @@ fn type_tags_match_inner(
         (TypeTag::External { ref_idx: a }, TypeTag::External { ref_idx: b }) => a == b,
         _ => false,
     }
+}
+
+fn option_type_arg(t: &TypeTag) -> Option<&TypeTag> {
+    let TypeTag::Concrete {
+        petal_hash,
+        type_name,
+        type_args,
+    } = t
+    else {
+        return None;
+    };
+    if *petal_hash == BUILTIN_TYPE_HASH && type_name == "Option" && type_args.len() == 1 {
+        type_args.first()
+    } else {
+        None
+    }
+}
+
+fn is_object_id_tag(t: &TypeTag) -> bool {
+    matches!(
+        t,
+        TypeTag::Concrete {
+            petal_hash,
+            type_name,
+            type_args,
+        } if *petal_hash == BUILTIN_TYPE_HASH && type_name == "ObjectId" && type_args.is_empty()
+    )
+}
+
+fn is_object_handle_tag(t: &TypeTag, local_object_types: &HashSet<&str>) -> bool {
+    matches!(
+        t,
+        TypeTag::Concrete {
+            type_name,
+            type_args: _,
+            ..
+        } if matches!(type_name.as_str(), "Coin" | "Resource" | "Capability")
+            || local_object_types.contains(type_name.as_str())
+    )
 }
 
 fn resolve_self_type_refs(t: &TypeTag, self_hash: [u8; 32]) -> TypeTag {
@@ -1073,20 +1224,11 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Extract a `Coin<T>::value` from a `Coin` payload.
-///
-/// The canonical on-chain layout (spec §coin-encoding) is:
-/// `[ObjectId (32 bytes, zeroed at create-time)] || [u128 value BE (16 bytes)]`
-/// — total 48 bytes. The value lives at `payload[32..48]`.
 pub fn decode_coin_value(payload: &[u8]) -> Result<u128, PtbError> {
-    if payload.len() < 48 {
-        return Err(PtbError::InvalidGasPayer {
-            id: ObjectId([0; 32]),
-            reason: format!("coin payload too short ({} bytes, need 48)", payload.len()),
-        });
-    }
-    let mut a = [0u8; 16];
-    a.copy_from_slice(&payload[32..48]);
-    Ok(u128::from_be_bytes(a))
+    u128::canonical_decode(payload).map_err(|_| PtbError::InvalidGasPayer {
+        id: ObjectId([0; 32]),
+        reason: format!("coin payload must be 16 bytes, got {}", payload.len()),
+    })
 }
 
 #[cfg(test)]
@@ -1156,15 +1298,12 @@ mod tests {
     }
 
     fn coin_obj(id_byte: u8, owner: [u8; 32], value: u128, version: u64) -> Object {
-        // 48-byte canonical payload: [ObjectId placeholder (32 bytes)] || [value BE (16 bytes)]
-        let mut payload = vec![0u8; 32];
-        payload.extend_from_slice(&value.to_be_bytes());
         Object {
             id: ObjectId([id_byte; 32]),
             type_tag: loom_coin_tt(),
             owner: Owner::Address(owner),
             version,
-            payload,
+            payload: value.canonical_encode(),
         }
     }
 
@@ -1204,9 +1343,10 @@ mod tests {
                 abilities: bloom_objects::AbilitySet::from_bits(
                     bloom_objects::AbilitySet::KEY | bloom_objects::AbilitySet::STORE,
                 ),
-                field_layout: vec![],
+                ..Default::default()
             }],
             external_type_refs: vec![],
+            ..Default::default()
         }
     }
 
@@ -1305,6 +1445,47 @@ mod tests {
         let validated = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap();
         assert_eq!(validated.tx, tx);
         assert!(validated.objects.contains_key(&gas_id.0));
+    }
+
+    #[test]
+    fn preloads_transitive_external_petals() {
+        let (chain, signer, gas_id) = setup();
+        let middle_hash = Hash32([0xBC; 32]);
+        let leaf_hash = Hash32([0xCD; 32]);
+        let mut root_manifest = sample_manifest();
+        root_manifest.external_type_refs = vec![crate::ExternalTypeRefStub {
+            placeholder: "$external_0".to_string(),
+            declared_petal_path: "/bloom/petals/middle".to_string(),
+            declared_type_name: "Middle".to_string(),
+            declared_content_hash: Some(middle_hash),
+        }];
+        let middle_manifest = PetalManifestStub {
+            module_path: "/bloom/petals/middle".to_string(),
+            external_type_refs: vec![crate::ExternalTypeRefStub {
+                placeholder: "$external_0".to_string(),
+                declared_petal_path: "/bloom/petals/leaf".to_string(),
+                declared_type_name: "Leaf".to_string(),
+                declared_content_hash: Some(leaf_hash),
+            }],
+            ..PetalManifestStub::default()
+        };
+        let leaf_manifest = PetalManifestStub {
+            module_path: "/bloom/petals/leaf".to_string(),
+            ..PetalManifestStub::default()
+        };
+        chain.put_petal(Hash32([0xAB; 32]), vec![1, 2, 3], root_manifest);
+        chain.put_petal(middle_hash, vec![4, 5, 6], middle_manifest);
+        chain.put_petal(leaf_hash, vec![7, 8, 9], leaf_manifest);
+
+        let tx = sample_ptb(signer, gas_id, 100);
+        let verifier = AlwaysOkVerifier;
+        let validated = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap();
+
+        assert!(validated.petals.contains_key(&[0xAB; 32]));
+        assert!(validated.petals.contains_key(&middle_hash.0));
+        assert!(validated.petals.contains_key(&leaf_hash.0));
+        assert!(validated.manifests.contains_key(&middle_hash.0));
+        assert!(validated.manifests.contains_key(&leaf_hash.0));
     }
 
     #[test]
@@ -1491,7 +1672,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_manifest_required_capabilities_until_supported() {
+    fn accepts_manifest_required_capability_when_object_arg_provides_it() {
+        let (chain, signer, gas_id) = setup();
+        let target_id = ObjectId([0xAC; 32]);
+        chain.put_object(Object {
+            id: target_id,
+            type_tag: pool_tt(),
+            owner: Owner::Shared,
+            version: 0,
+            payload: vec![],
+        });
+        let mut manifest = object_manifest(AccessMode::ReadOnly);
+        manifest.functions[0].required_capabilities = vec![pool_tt()];
+        chain.put_petal(Hash32([0xAB; 32]), vec![1, 2, 3], manifest);
+        let mut tx = sample_ptb(signer, gas_id, 100);
+        if let Command::Move(mc) = &mut tx.commands[0] {
+            mc.function = "inspect".to_string();
+            mc.args = vec![Arg::Object {
+                id: target_id,
+                expected_version: ExpectedVersion(0),
+                access_mode: AccessMode::ReadOnly,
+            }];
+        }
+
+        assert!(validate_ptb(&tx, &ctx(&chain, &AlwaysOkVerifier)).is_ok());
+    }
+
+    #[test]
+    fn rejects_manifest_required_capability_when_missing() {
         let (chain, signer, gas_id) = setup();
         let mut manifest = sample_manifest();
         manifest.functions[0].required_capabilities = vec![pool_tt()];
@@ -1500,7 +1708,7 @@ mod tests {
 
         let err = validate_ptb(&tx, &ctx(&chain, &AlwaysOkVerifier)).unwrap_err();
         assert!(
-            matches!(err, PtbError::TypeMismatch { ref reason, .. } if reason.contains("required_capabilities")),
+            matches!(err, PtbError::TypeMismatch { ref reason, .. } if reason.contains("required capability")),
             "unexpected error: {err:?}"
         );
     }
@@ -2035,19 +2243,16 @@ mod tests {
 
     #[test]
     fn decode_coin_value_too_short() {
-        // 47 bytes is one byte short of the required 48.
         assert!(matches!(
-            decode_coin_value(&[0u8; 47]),
+            decode_coin_value(&[0u8; 15]),
             Err(PtbError::InvalidGasPayer { .. })
         ));
     }
 
     #[test]
-    fn decode_coin_value_reads_value_after_id() {
+    fn decode_coin_value_reads_canonical_u128() {
         let v: u128 = 0xDEAD_BEEF_CAFE_F00Du128;
-        // Canonical 48-byte layout: [id placeholder (32)] || [value BE (16)]
-        let mut payload = vec![0u8; 32];
-        payload.extend_from_slice(&v.to_be_bytes());
+        let payload = v.to_be_bytes();
         assert_eq!(decode_coin_value(&payload).unwrap(), v);
     }
 
@@ -2056,8 +2261,29 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn concrete(name: &str) -> TypeTag {
+        let petal_hash = if matches!(
+            name,
+            "bool"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "Address"
+                | "ObjectId"
+                | "Hash32"
+                | "UID"
+                | "TypeTag"
+                | "bytes"
+                | "String"
+                | "string"
+        ) {
+            bloom_objects::BUILTIN_TYPE_HASH
+        } else {
+            [0u8; 32]
+        };
         TypeTag::Concrete {
-            petal_hash: [0u8; 32],
+            petal_hash,
             type_name: name.to_string(),
             type_args: vec![],
         }
@@ -2144,10 +2370,8 @@ mod tests {
         );
     }
 
-    /// Unknown (petal-defined) Const types are accepted unconditionally
-    /// — the runtime is the final arbiter.
     #[test]
-    fn strict_typecheck_const_unknown_type_accepts_any_bytes() {
+    fn strict_typecheck_const_unknown_type_rejects_malformed_bytes() {
         let (chain, signer, gas_id) = setup();
         install_fn(
             &chain,
@@ -2161,7 +2385,11 @@ mod tests {
             m.args = vec![Arg::Const(vec![1, 2, 3])];
         }
         let verifier = AlwaysOkVerifier;
-        assert!(validate_ptb(&tx, &ctx(&chain, &verifier)).is_ok());
+        let err = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap_err();
+        assert!(
+            matches!(err, PtbError::TypeMismatch { ref reason, .. } if reason.contains("Pool")),
+            "expected TypeMismatch mentioning Pool, got {err:?}"
+        );
     }
 
     /// A `Use` slot referring to a non-existent command (forward
@@ -2576,6 +2804,79 @@ mod tests {
     }
 
     #[test]
+    fn make_move_vec_output_matches_builtin_vector_declared_arg() {
+        let (chain, signer, gas_id) = setup();
+        let vector_of_loom = TypeTag::Concrete {
+            petal_hash: bloom_objects::BUILTIN_TYPE_HASH,
+            type_name: "vector".to_string(),
+            type_args: vec![loom_coin_tt()],
+        };
+        let mut m = sample_manifest();
+        m.functions.push(FunctionDeclStub {
+            view: false,
+            name: "producer".to_string(),
+            type_params: vec![],
+            args: vec![],
+            returns: vec![loom_coin_tt()],
+            required_signers: 0,
+            required_capabilities: vec![],
+            attached_invariants: vec![],
+        });
+        m.functions.push(FunctionDeclStub {
+            view: false,
+            name: "consumer".to_string(),
+            type_params: vec![],
+            args: vec![ArgDeclStub::Const(vector_of_loom)],
+            returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
+            attached_invariants: vec![],
+        });
+        chain.put_petal(Hash32([0xAB; 32]), vec![], m);
+        let tx = PtbTx {
+            signers: vec![signer],
+            commands: vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/bloom/petals/dex/pool".to_string(),
+                        hash: Some(Hash32([0xAB; 32])),
+                    },
+                    function: "producer".to_string(),
+                    type_args: vec![],
+                    args: vec![],
+                }),
+                Command::MakeMoveVec {
+                    ty: loom_coin_tt(),
+                    uses: vec![UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    }],
+                },
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/bloom/petals/dex/pool".to_string(),
+                        hash: Some(Hash32([0xAB; 32])),
+                    },
+                    function: "consumer".to_string(),
+                    type_args: vec![],
+                    args: vec![Arg::Use {
+                        cmd_idx: 1,
+                        ret_idx: 0,
+                    }],
+                }),
+            ],
+            gas_payer: gas_id,
+            gas_budget: 100,
+            gas_price: 1,
+            expiry_block: 100,
+            signatures: vec![PqSignature(vec![0xCC; 8])],
+        };
+        let verifier = AlwaysOkVerifier;
+
+        assert!(validate_ptb(&tx, &ctx(&chain, &verifier)).is_ok());
+    }
+
+    #[test]
     fn make_move_vec_rejects_elements_that_do_not_match_declared_type() {
         let (chain, signer, gas_id) = setup();
         let erased_coin = TypeTag::Concrete {
@@ -2816,38 +3117,37 @@ mod tests {
     fn strict_typecheck_use_self_petal_return_rejects_other_petal() {
         let (chain, signer, gas_id) = setup();
 
-        let mut producer = PetalManifestStub {
+        let producer = PetalManifestStub {
             module_path: "/evil".to_string(),
             functions: vec![FunctionDeclStub {
                 view: false,
                 name: "forge".to_string(),
                 type_params: vec![],
                 args: vec![],
-                returns: vec![concrete("Capability")],
+                returns: vec![concrete("FaucetAdmin")],
                 required_signers: 0,
                 required_capabilities: vec![],
                 attached_invariants: vec![],
             }],
             object_types: vec![],
             external_type_refs: vec![],
+            ..Default::default()
         };
-        if let TypeTag::Concrete { type_args, .. } = &mut producer.functions[0].returns[0] {
-            type_args.push(concrete("FaucetAdmin"));
-        }
         chain.put_petal(Hash32([0xCD; 32]), vec![], producer);
         chain.put_path("/evil", Hash32([0xCD; 32]));
 
         let mut consumer = sample_manifest();
-        let mut cap = concrete("Capability");
-        if let TypeTag::Concrete { type_args, .. } = &mut cap {
-            type_args.push(concrete("FaucetAdmin"));
-        }
+        consumer.object_types.push(ObjectTypeDeclStub {
+            name: "FaucetAdmin".to_string(),
+            abilities: bloom_objects::AbilitySet::key_store(),
+            ..Default::default()
+        });
         consumer.functions.push(FunctionDeclStub {
             view: false,
             name: "mint".to_string(),
             type_params: vec![],
             args: vec![ArgDeclStub::Object {
-                ty: cap,
+                ty: concrete("FaucetAdmin"),
                 mode: AccessMode::ReadOnly,
             }],
             returns: vec![],

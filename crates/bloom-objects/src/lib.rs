@@ -48,4 +48,4 @@ pub use store::{
     OBJECT_LEAF_TAG, OBJECT_ROOT_TAG, OWNERSHIP_LEAF_TAG, OWNERSHIP_ROOT_TAG, ObjectTrieKey,
     ObjectTrieValue, OwnershipIndexKey, OwnershipIndexValue,
 };
-pub use type_tag::TypeTag;
+pub use type_tag::{BUILTIN_TYPE_HASH, TypeTag};

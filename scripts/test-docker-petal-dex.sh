@@ -18,9 +18,10 @@
 #      host-side provisioning and CLI shellouts.
 #   4. Provision per-validator homes via `bloom chain testnet`, wiring peers to
 #      the docker DNS names val0..val3.
-#   5. APPEND a genesis allocation and key-registry entry for the inner-PTB
-#      xDSA signer (the inner gas-payer) to ALL FOUR home*/chain/genesis.toml
-#      files — byte-identical, or the genesis hash diverges and consensus breaks.
+#   5. APPEND the canonical core fungible petal binding plus a genesis
+#      allocation and key-registry entry for the inner-PTB xDSA signer (the
+#      inner gas-payer) to ALL FOUR home*/chain/genesis.toml files —
+#      byte-identical, or the genesis hash diverges and consensus breaks.
 #   6. `docker compose up -d` + wait for all four healthy.
 #   7. Run the petal-dex docker driver test.
 #   8. Always tear the stack down on exit (trap EXIT), capturing per-validator
@@ -53,6 +54,7 @@ PTB_SIGNER_PUBKEY_B64=""
 # Inner gas-payer LOOM allocation. Live PTBs use non-zero gas_price, and the
 # coin must exist and be owned by the signer. 1M LOOM in bloomweis.
 PTB_SIGNER_ALLOCATION="1000000000000000000000000"
+CORE_FUNGIBLE_PATH="/bloom/petals/core/fungible"
 
 # Resolve tmpdir (host-side homes for validators).
 BLOOM_DOCKER_TMPDIR="${BLOOM_DOCKER_TMPDIR:-$(mktemp -d -t bloom-docker-petal-dex.XXXX)}"
@@ -62,14 +64,7 @@ log "tmpdir: $BLOOM_DOCKER_TMPDIR"
 # Prefer an existing host-native release binary for local iteration. CI starts
 # from a clean checkout, so Linux still extracts the image-built binary below.
 BLOOM_BIN="${BLOOM_BIN:-$REPO_ROOT/target/release/bloom}"
-HOST_DOCKER_TEST_BIN=""
-if [ -d "$REPO_ROOT/target/release/deps" ]; then
-    HOST_DOCKER_TEST_BIN=$(find "$REPO_ROOT/target/release/deps" -maxdepth 1 -type f \
-        -perm -111 -name 'docker_petal_dex-*' -print0 \
-        | xargs -0 ls -t 2>/dev/null \
-        | head -n1 || true)
-fi
-BLOOM_DOCKER_TEST_BIN="${BLOOM_DOCKER_TEST_BIN:-${HOST_DOCKER_TEST_BIN:-$BLOOM_DOCKER_TMPDIR/host-bin/docker_petal_dex}}"
+BLOOM_DOCKER_TEST_BIN="${BLOOM_DOCKER_TEST_BIN:-$BLOOM_DOCKER_TMPDIR/host-bin/docker_petal_dex}"
 BLOOM_DOCKER_PREBUILT_WASM_DIR="${BLOOM_DOCKER_PREBUILT_WASM_DIR:-$BLOOM_DOCKER_TMPDIR/wasm}"
 
 # Teardown runs unconditionally on exit so we don't leak containers or tmpdirs
@@ -159,8 +154,16 @@ teardown() {
 trap teardown EXIT INT TERM
 
 prepare_bloom_cli() {
-    if [ -x "$BLOOM_BIN" ]; then
+    if [ -x "$BLOOM_BIN" ] && ! grep -a -q 'mount support is not enabled' "$BLOOM_BIN"; then
         log "using host-side bloom CLI: $BLOOM_BIN"
+        return 0
+    fi
+    if [ -x "$BLOOM_BIN" ]; then
+        log "rebuilding host-side bloom with all features because existing CLI lacks mount support: $BLOOM_BIN"
+        require_cmd cargo
+        (cd "$REPO_ROOT" && cargo build --release -p bloom --all-features)
+        BLOOM_BIN="$REPO_ROOT/target/release/bloom"
+        [ -x "$BLOOM_BIN" ] || fail "bloom binary missing: $BLOOM_BIN"
         return 0
     fi
 
@@ -194,7 +197,8 @@ extract_prebuilt_acceptance_artifacts() {
     [ "$(uname -s)" = "Linux" ] && can_run_image_bins=1
 
     if { [ "$can_run_image_bins" -eq 0 ] || [ -x "$BLOOM_DOCKER_TEST_BIN" ]; } \
-        && [ -f "$BLOOM_DOCKER_PREBUILT_WASM_DIR/bloom_petal_dex_pool.wasm" ]; then
+        && [ -f "$BLOOM_DOCKER_PREBUILT_WASM_DIR/bloom_petal_dex_pool.wasm" ] \
+        && [ -f "$BLOOM_DOCKER_PREBUILT_WASM_DIR/bloom_petal_fungible.wasm" ]; then
         log "using extracted docker acceptance artifacts"
         return 0
     fi
@@ -224,6 +228,8 @@ extract_prebuilt_acceptance_artifacts() {
     fi
     [ -f "$BLOOM_DOCKER_PREBUILT_WASM_DIR/bloom_petal_dex_faucet.wasm" ] \
         || fail "extracted faucet wasm missing from $BLOOM_DOCKER_PREBUILT_WASM_DIR"
+    [ -f "$BLOOM_DOCKER_PREBUILT_WASM_DIR/bloom_petal_fungible.wasm" ] \
+        || fail "extracted core fungible wasm missing from $BLOOM_DOCKER_PREBUILT_WASM_DIR"
 }
 
 derive_ptb_signer_registry() {
@@ -241,6 +247,38 @@ derive_ptb_signer_registry() {
     PTB_SIGNER_PUBKEY_B64=$(printf '%s\n' "$signer_vars" | sed -n 's/^PTB_SIGNER_PUBKEY_B64=//p' | tail -n1)
     [ -n "$PTB_SIGNER_PK_HEX" ] || fail "failed to derive PTB signer address"
     [ -n "$PTB_SIGNER_PUBKEY_B64" ] || fail "failed to derive PTB signer pubkey"
+}
+
+prepare_host_acceptance_driver() {
+    if [ -x "$BLOOM_DOCKER_TEST_BIN" ]; then
+        return 0
+    fi
+    require_cmd cargo
+    log "precompiling host-side docker acceptance test"
+    (cd "$REPO_ROOT" && \
+        BLOOM_DEX_FAUCET_ADMIN_HEX="$PTB_SIGNER_PK_HEX" \
+        cargo test -p bloom-petal-dex-it --test docker_petal_dex --no-run)
+}
+
+upsert_core_fungible_petal() {
+    local genesis_file="$1"
+    local wasm_file="$BLOOM_DOCKER_PREBUILT_WASM_DIR/bloom_petal_fungible.wasm"
+    [ -f "$wasm_file" ] || fail "missing core fungible wasm: $wasm_file"
+    local wasm_hex_file="$BLOOM_DOCKER_TMPDIR/core_fungible_wasm.hex"
+    od -An -tx1 -v "$wasm_file" | tr -d ' \n' >"$wasm_hex_file"
+    CORE_FUNGIBLE_PATH="$CORE_FUNGIBLE_PATH" \
+        CORE_FUNGIBLE_WASM_HEX_FILE="$wasm_hex_file" \
+        perl -0pi -e '
+            my $path = quotemeta($ENV{CORE_FUNGIBLE_PATH});
+            open my $fh, "<", $ENV{CORE_FUNGIBLE_WASM_HEX_FILE}
+                or die "open wasm hex file: $!";
+            my $wasm_hex = do { local $/; <$fh> };
+            chomp $wasm_hex;
+            my $block = "\n[[petals]]\npath = \"$ENV{CORE_FUNGIBLE_PATH}\"\nwasm_hex = \"$wasm_hex\"\n";
+            if (!s/\n\[\[petals\]\]\npath = "$path"\nwasm_hex = "[^"]*"\n/$block/s) {
+                $_ .= $block;
+            }
+        ' "$genesis_file"
 }
 
 if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
@@ -277,11 +315,12 @@ if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
         --allocation 1000000000000000000000000
 
     derive_ptb_signer_registry
+    prepare_host_acceptance_driver
 
-    # Append the inner-PTB xDSA gas allocation and key-registry entry to ALL
-    # FOUR genesis.toml files. They MUST stay byte-identical (same genesis hash)
-    # or consensus breaks, so we append the exact same lines to each.
-    log "appending xDSA gas/custody allocations ($PTB_SIGNER_PK_HEX) to all 4 genesis.toml"
+    # Upsert the canonical fungible petal plus the inner-PTB xDSA gas allocation
+    # and key-registry entry to ALL FOUR genesis.toml files. They MUST stay
+    # byte-identical (same genesis hash) or consensus breaks.
+    log "upserting core fungible petal and xDSA gas/custody allocations ($PTB_SIGNER_PK_HEX) to all 4 genesis.toml"
     alloc_block=""
     alloc_block+=$(printf '\n[[key_registry]]\naddress = "%s"\npubkey = "%s"\n' \
         "$PTB_SIGNER_PK_HEX" "$PTB_SIGNER_PUBKEY_B64")
@@ -292,6 +331,7 @@ if [ "${BLOOM_DOCKER_COMPOSE_UP:-1}" != "0" ]; then
     for i in $(seq 0 $((BLOOM_VALIDATOR_COUNT - 1))); do
         g="$BLOOM_DOCKER_TMPDIR/home$i/chain/genesis.toml"
         [ -f "$g" ] || fail "missing genesis.toml: $g"
+        upsert_core_fungible_petal "$g"
         printf '%s' "$alloc_block" >>"$g"
     done
     # Sanity: all four genesis files identical (same hash) post-edit.
@@ -336,7 +376,13 @@ if [ -z "$PTB_SIGNER_PK_HEX" ]; then
     derive_ptb_signer_registry
 fi
 
-log "running bloom-petal-dex-it::docker_petal_dex"
+if [ -n "${BLOOM_DOCKER_PETAL_VFS_ONLY:-}" ]; then
+    DOCKER_PETAL_TEST_NAME="docker_petal_vfs_acceptance"
+else
+    DOCKER_PETAL_TEST_NAME="docker_petal_dex_acceptance"
+fi
+
+log "running bloom-petal-dex-it::docker_petal_dex::$DOCKER_PETAL_TEST_NAME"
 if [ -x "$BLOOM_DOCKER_TEST_BIN" ]; then
     BLOOM_DOCKER_TMPDIR="$BLOOM_DOCKER_TMPDIR" \
     BLOOM_BIN="$BLOOM_BIN" \
@@ -344,15 +390,16 @@ if [ -x "$BLOOM_DOCKER_TEST_BIN" ]; then
     BLOOM_DEX_FAUCET_ADMIN_HEX="$PTB_SIGNER_PK_HEX" \
     RUST_LOG="${RUST_LOG:-warn}" \
     RUST_MIN_STACK="${RUST_MIN_STACK:-16777216}" \
-        "$BLOOM_DOCKER_TEST_BIN" docker_petal_dex_acceptance \
+        "$BLOOM_DOCKER_TEST_BIN" "$DOCKER_PETAL_TEST_NAME" \
         --exact --ignored --nocapture
 else
     require_cmd cargo
     BLOOM_DOCKER_TMPDIR="$BLOOM_DOCKER_TMPDIR" \
     BLOOM_BIN="$BLOOM_BIN" \
+    BLOOM_DOCKER_PREBUILT_WASM_DIR="$BLOOM_DOCKER_PREBUILT_WASM_DIR" \
     BLOOM_DEX_FAUCET_ADMIN_HEX="$PTB_SIGNER_PK_HEX" \
     RUST_LOG="${RUST_LOG:-warn}" \
     RUST_MIN_STACK="${RUST_MIN_STACK:-16777216}" \
         cargo test -p bloom-petal-dex-it --test docker_petal_dex \
-        -- --ignored --nocapture
+        "$DOCKER_PETAL_TEST_NAME" -- --exact --ignored --nocapture
 fi

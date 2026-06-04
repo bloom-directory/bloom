@@ -174,9 +174,9 @@ fn router_manifest_decodes_and_publishes_via_wasm_section() {
 (module
   (import "chain" "petal.return" (func $ret (param i32 i32)))
   (memory (export "memory") 1)
-  (data (i32.const 0) "\00\00\00\01\00\00\00\04\00\00\00\01")
+  (data (i32.const 0) "\00\00\00\01\04\00\00\00\01")
   (func (export "__petal_version") (param i32 i32) (result i32)
-    (call $ret (i32.const 0) (i32.const 12))
+    (call $ret (i32.const 0) (i32.const 9))
     i32.const 0)
 )
 "#;

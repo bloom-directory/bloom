@@ -16,13 +16,16 @@
 
 use bloom_chain_types::Hash32;
 use bloom_script::{
-    ArgDeclStub, ExternalTypeRefStub, FieldLayoutStub, FunctionDeclStub, InvariantDeclStub,
-    InvariantTargetStub, ObjectTypeDeclStub, PetalManifestStub, TypeParamDeclStub,
+    ArgDeclStub, CapabilityTypeDeclStub, DataTypeDeclStub, EnumTypeDeclStub, ExternalTypeRefStub,
+    FieldDeclStub, FieldLayoutStub, FunctionDeclStub, InvariantDeclStub, InvariantTargetStub,
+    ObjectTypeDeclStub, PetalManifestStub, TypeParamDeclStub, VariantDeclStub,
+    VariantFieldsDeclStub,
 };
 
 use crate::types::{
-    ArgKind, FunctionDecl, InvariantDecl, InvariantTarget, ObjectTypeDecl, PetalManifestV0,
-    TypeParamDecl, TypeParamKind,
+    ArgKind, CapabilityDecl, DataTypeDecl, EnumTypeDecl, FieldDecl, FunctionDecl, InvariantDecl,
+    InvariantTarget, ObjectTypeDecl, PetalManifestV0, TypeParamDecl, TypeParamKind, VariantDecl,
+    VariantFieldsDecl,
 };
 
 /// Project a full canonical manifest down to the validator-facing stub.
@@ -40,6 +43,13 @@ pub fn to_petal_manifest_stub(m: &PetalManifestV0) -> PetalManifestStub {
             .map(|f| project_function(f, &m.invariants))
             .collect(),
         object_types: m.object_types.iter().map(project_object_type).collect(),
+        capability_types: m
+            .capability_types
+            .iter()
+            .map(project_capability_type)
+            .collect(),
+        data_types: m.data_types.iter().map(project_data_type).collect(),
+        enum_types: m.enum_types.iter().map(project_enum_type).collect(),
         external_type_refs: m
             .external_type_refs
             .iter()
@@ -100,7 +110,53 @@ fn project_object_type(o: &ObjectTypeDecl) -> ObjectTypeDeclStub {
     ObjectTypeDeclStub {
         name: o.name.clone(),
         abilities: o.abilities,
+        type_params: o.type_params.iter().map(project_type_param).collect(),
+        fields: o.fields.iter().map(project_field).collect(),
         field_layout,
+    }
+}
+
+fn project_capability_type(c: &CapabilityDecl) -> CapabilityTypeDeclStub {
+    CapabilityTypeDeclStub {
+        name: c.name.clone(),
+        type_params: c.type_params.iter().map(project_type_param).collect(),
+        fields: c.fields.iter().map(project_field).collect(),
+    }
+}
+
+fn project_data_type(d: &DataTypeDecl) -> DataTypeDeclStub {
+    DataTypeDeclStub {
+        name: d.name.clone(),
+        type_params: d.type_params.iter().map(project_type_param).collect(),
+        fields: d.fields.iter().map(project_field).collect(),
+    }
+}
+
+fn project_enum_type(e: &EnumTypeDecl) -> EnumTypeDeclStub {
+    EnumTypeDeclStub {
+        name: e.name.clone(),
+        type_params: e.type_params.iter().map(project_type_param).collect(),
+        variants: e.variants.iter().map(project_variant).collect(),
+    }
+}
+
+fn project_field(field: &FieldDecl) -> FieldDeclStub {
+    FieldDeclStub {
+        name: field.name.clone(),
+        ty: field.ty.clone(),
+    }
+}
+
+fn project_variant(variant: &VariantDecl) -> VariantDeclStub {
+    VariantDeclStub {
+        name: variant.name.clone(),
+        fields: match &variant.fields {
+            VariantFieldsDecl::Unit => VariantFieldsDeclStub::Unit,
+            VariantFieldsDecl::Tuple(types) => VariantFieldsDeclStub::Tuple(types.clone()),
+            VariantFieldsDecl::Struct(fields) => {
+                VariantFieldsDeclStub::Struct(fields.iter().map(project_field).collect())
+            }
+        },
     }
 }
 

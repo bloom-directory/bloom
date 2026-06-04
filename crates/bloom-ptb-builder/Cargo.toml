@@ -9,10 +9,14 @@ description = "PtbSession: lowers UNIX-style endpoint composition (CLI pipes + t
 
 [dependencies]
 bloom-objects.workspace = true
+bloom-resource.workspace = true
 bloom-script.workspace = true
 bloom-petal-manifest.workspace = true
 bloom-chain-types.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+bloom-petal-fungible.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

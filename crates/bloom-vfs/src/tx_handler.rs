@@ -50,7 +50,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 
-use bloom_objects::{ObjectId, TypeTag};
+use bloom_objects::ObjectId;
 use bloom_ptb_builder::session::SessionId;
 use bloom_ptb_builder::{BuildError, PtbSession, SessionStatus};
 use bloom_script::{ChainStateIface, PtbTx};
@@ -320,7 +320,7 @@ impl TxHandler {
                 "kind": "command",
                 "cmd_idx": cs.cmd_idx,
                 "endpoint": cs.endpoint_path,
-                "returns": cs.return_types.iter().map(type_tag_label).collect::<Vec<_>>(),
+                "returns": cs.return_types.iter().map(bloom_value::type_tag_label).collect::<Vec<_>>(),
             });
             out.extend(serde_json::to_vec(&line).map_err(json_err)?);
             out.push(b'\n');
@@ -359,7 +359,7 @@ fn status_to_json(status: &SessionStatus) -> serde_json::Value {
                 "cmd_idx": c.cmd_idx,
                 "endpoint": c.endpoint_path,
                 "function": c.function,
-                "returns": c.return_types.iter().map(type_tag_label).collect::<Vec<_>>(),
+                "returns": c.return_types.iter().map(bloom_value::type_tag_label).collect::<Vec<_>>(),
                 "label": c.label,
             })
         }).collect::<Vec<_>>(),
@@ -370,31 +370,6 @@ fn status_to_json(status: &SessionStatus) -> serde_json::Value {
         "signer_count": status.signer_count,
         "estimated_gas": status.estimated_gas,
     })
-}
-
-/// Human/debug label for a [`TypeTag`] (non-authoritative projection,
-/// matching the builder's `type_tag_label`).
-fn type_tag_label(t: &TypeTag) -> String {
-    match t {
-        TypeTag::Concrete {
-            type_name,
-            type_args,
-            ..
-        } => {
-            if type_args.is_empty() {
-                type_name.clone()
-            } else {
-                let inner = type_args
-                    .iter()
-                    .map(type_tag_label)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{type_name}<{inner}>")
-            }
-        }
-        TypeTag::Generic { idx } => format!("T{idx}"),
-        TypeTag::External { ref_idx } => format!("$external_{ref_idx}"),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -577,7 +552,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bloom_chain_types::Hash32;
-    use bloom_objects::{Object, Owner};
+    use bloom_objects::{Object, Owner, TypeTag};
+    use bloom_petal_fungible::ops::coin_payload;
     use bloom_script::{
         ArgDeclStub, CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH, FunctionDeclStub,
         PetalManifestStub, loom_coin_type_tag,
@@ -637,7 +613,7 @@ mod tests {
 
     fn concrete(name: &str) -> TypeTag {
         TypeTag::Concrete {
-            petal_hash: [0u8; 32],
+            petal_hash: bloom_objects::BUILTIN_TYPE_HASH,
             type_name: name.to_string(),
             type_args: vec![],
         }
@@ -665,20 +641,19 @@ mod tests {
             functions: funcs,
             object_types: vec![],
             external_type_refs: vec![],
+            ..Default::default()
         };
         chain.put_petal(POOL_HASH, manifest);
         chain.put_path(POOL_PATH, POOL_HASH);
         chain.put_path(CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH);
 
         let gas_id = ObjectId([0xFE; 32]);
-        let mut payload = vec![0u8; 32];
-        payload.extend_from_slice(&1_000_000u128.to_be_bytes());
         chain.put_object(Object {
             id: gas_id,
             type_tag: loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
             owner: Owner::Address(signer),
             version: 0,
-            payload,
+            payload: coin_payload(1_000_000),
         });
         (TxHandler::new(Arc::new(chain)), gas_id)
     }
@@ -725,18 +700,17 @@ mod tests {
             functions: funcs,
             object_types: vec![],
             external_type_refs: vec![],
+            ..Default::default()
         };
         chain.put_petal(POOL_HASH, manifest);
         chain.put_path(POOL_PATH, POOL_HASH);
         chain.put_path(CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH);
-        let mut payload = vec![0u8; 32];
-        payload.extend_from_slice(&1_000_000u128.to_be_bytes());
         chain.put_object(Object {
             id: AUTO_GAS_ID,
             type_tag: loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
             owner: Owner::Address(signer),
             version: 0,
-            payload,
+            payload: coin_payload(1_000_000),
         });
         TxHandler::new(Arc::new(chain)).with_submitter(submitter)
     }

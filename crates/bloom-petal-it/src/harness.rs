@@ -34,16 +34,12 @@ use bloom_script::{
 // Coin payload format
 // ---------------------------------------------------------------------------
 
-/// Canonical coin payload: 48-byte `[ObjectId placeholder (32 bytes)] ||
-/// [value BE (16 bytes)]`. Delegates to `bloom_petal_fungible::ops::coin_payload`.
-///
-/// Both the PTB executor and the on-chain fungible petal now use the same
-/// 48-byte layout, so this is the only helper needed.
+/// Canonical coin payload: a single big-endian `u128` value.
 pub fn ptb_coin_payload(value: u128) -> Vec<u8> {
     coin_payload(value)
 }
 
-/// Decode the value from a canonical 48-byte coin payload.
+/// Decode the value from a canonical coin payload.
 /// Returns 0 on malformed input (test-harness convenience).
 pub fn ptb_decode_coin_value(payload: &[u8]) -> u128 {
     fungible_decode_coin_value(payload).unwrap_or(0)
@@ -73,7 +69,6 @@ pub fn build_state(allocations: &[(Address, u128)]) -> State {
             type_tag: coin_type.clone(),
             owner: Owner::Address(addr.0),
             version: 0,
-            // Canonical 48-byte payload: [ObjectId placeholder (32)] || [value BE (16)].
             payload: coin_payload(*balance),
         };
         state.set_object(obj.clone());
@@ -104,7 +99,6 @@ pub fn genesis_coin_id(addr: Address, idx: usize) -> ObjectId {
 }
 
 /// Insert a `Coin<LOOM>` object directly into `state` with a custom id.
-/// Uses the canonical 48-byte payload format: [id placeholder (32)] || [value BE (16)].
 pub fn seed_coin(state: &mut State, id: ObjectId, owner: Address, value: u128) {
     let obj = Object {
         id,

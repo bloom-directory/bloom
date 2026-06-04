@@ -94,7 +94,7 @@ pub enum ChainCmd {
         ///
         /// Examples:
         /// `--arg '{"kind":"object","id":"<object-id>"}'`
-        /// `--arg '{"kind":"const","hex":"0000000000000000000000000000002a"}'`
+        /// `--arg '{"kind":"const","value":"42"}'`
         #[arg(long = "arg", value_name = "JSON")]
         args: Vec<String>,
         /// Canonical TypeTag bytes as hex. Repeat for generic functions.
@@ -1059,18 +1059,36 @@ fn single_call_command(
     let function_decl = manifest
         .function(function)
         .with_context(|| format!("function {function} not found in {path}"))?;
-    single_call_command_for_function(chain, path, function, function_decl, type_args, args)
+    let ctx = SingleCallFunctionCtx {
+        chain,
+        path,
+        function,
+        manifest: &manifest,
+        self_hash: hash.0,
+        function_decl,
+    };
+    single_call_command_for_function(&ctx, type_args, args)
+}
+
+struct SingleCallFunctionCtx<'a> {
+    chain: &'a dyn bloom_script::ChainStateIface,
+    path: &'a str,
+    function: &'a str,
+    manifest: &'a bloom_script::PetalManifestStub,
+    self_hash: [u8; 32],
+    function_decl: &'a bloom_script::FunctionDeclStub,
 }
 
 fn single_call_command_for_function(
-    chain: &dyn bloom_script::ChainStateIface,
-    path: &str,
-    function: &str,
-    function_decl: &bloom_script::FunctionDeclStub,
+    ctx: &SingleCallFunctionCtx<'_>,
     type_args: &[serde_json::Value],
     args: &[serde_json::Value],
 ) -> Result<String> {
-    let mut tokens = vec![format!("{}/{}", path.trim_end_matches('/'), function)];
+    let mut tokens = vec![format!(
+        "{}/{}",
+        ctx.path.trim_end_matches('/'),
+        ctx.function
+    )];
     let decoded_type_args = type_args
         .iter()
         .map(|ty| {
@@ -1081,18 +1099,20 @@ fn single_call_command_for_function(
     for ty in type_args {
         tokens.push(format!("type:{}", call_type_arg_token(ty)?));
     }
-    if args.len() != function_decl.args.len() {
+    if args.len() != ctx.function_decl.args.len() {
         anyhow::bail!(
             "arg count mismatch: function declares {} arg(s), got {}",
-            function_decl.args.len(),
+            ctx.function_decl.args.len(),
             args.len()
         );
     }
-    for (arg, decl) in args.iter().zip(&function_decl.args) {
+    for (arg, decl) in args.iter().zip(&ctx.function_decl.args) {
         tokens.push(call_arg_token_for_decl(
-            chain,
+            ctx.chain,
             arg,
             decl,
+            ctx.manifest,
+            ctx.self_hash,
             &decoded_type_args,
         )?);
     }
@@ -1102,37 +1122,7 @@ fn single_call_command_for_function(
 fn call_type_arg_token(value: &serde_json::Value) -> Result<String> {
     let tag = bloom_script::decode_json_type_tag(value)
         .with_context(|| format!("decode --type-arg {value}"))?;
-    Ok(type_tag_token(&tag))
-}
-
-fn type_tag_token(tag: &bloom_objects::TypeTag) -> String {
-    match tag {
-        bloom_objects::TypeTag::Concrete {
-            petal_hash,
-            type_name,
-            type_args,
-        } => {
-            let mut out = type_name.clone();
-            if *petal_hash != [0u8; 32] {
-                out.push('@');
-                out.push_str(&hex::encode(petal_hash));
-            }
-            if !type_args.is_empty() {
-                out.push('<');
-                out.push_str(
-                    &type_args
-                        .iter()
-                        .map(type_tag_token)
-                        .collect::<Vec<_>>()
-                        .join(","),
-                );
-                out.push('>');
-            }
-            out
-        }
-        bloom_objects::TypeTag::Generic { idx } => format!("T{idx}"),
-        bloom_objects::TypeTag::External { ref_idx } => format!("$external_{ref_idx}"),
-    }
+    Ok(bloom_value::type_tag_label(&tag))
 }
 
 #[cfg(test)]
@@ -1162,7 +1152,7 @@ fn call_arg_token(arg: &serde_json::Value) -> Result<String> {
         }
         "const" => {
             if let Some(hex) = arg.get("hex").and_then(|v| v.as_str()) {
-                Ok(format!("const:0x{}", hex.trim().trim_start_matches("0x")))
+                anyhow::bail!("raw const hex is not accepted for typed JSON args: {hex}");
             } else if let Some(value) = arg.get("value") {
                 match value {
                     serde_json::Value::String(s) => Ok(s.clone()),
@@ -1182,6 +1172,8 @@ fn call_arg_token_for_decl(
     chain: &dyn bloom_script::ChainStateIface,
     arg: &serde_json::Value,
     decl: &bloom_script::ArgDeclStub,
+    manifest: &bloom_script::PetalManifestStub,
+    self_hash: [u8; 32],
     type_args: &[bloom_objects::TypeTag],
 ) -> Result<String> {
     match decl {
@@ -1190,7 +1182,9 @@ fn call_arg_token_for_decl(
             let idx = call_signer_index(arg)?.context("expected signer arg")?;
             Ok(format!("signer:{idx}"))
         }
-        bloom_script::ArgDeclStub::Const(tag) => call_const_token(arg, tag, type_args),
+        bloom_script::ArgDeclStub::Const(tag) => {
+            call_const_token(chain, arg, tag, manifest, self_hash, type_args)
+        }
         bloom_script::ArgDeclStub::TypeArg(_) => Ok(format!("type:{}", call_type_arg_token(arg)?)),
     }
 }
@@ -1215,21 +1209,37 @@ fn call_object_token(
 }
 
 fn call_const_token(
+    chain: &dyn bloom_script::ChainStateIface,
     arg: &serde_json::Value,
     tag: &bloom_objects::TypeTag,
+    manifest: &bloom_script::PetalManifestStub,
+    self_hash: [u8; 32],
     type_args: &[bloom_objects::TypeTag],
 ) -> Result<String> {
     let value = if arg.get("kind").and_then(|v| v.as_str()) == Some("const") {
         if let Some(hex) = arg.get("hex").and_then(|v| v.as_str()) {
-            return Ok(format!("const:0x{}", hex.trim().trim_start_matches("0x")));
+            anyhow::bail!("raw const hex is not accepted for typed JSON args: {hex}");
         }
         arg.get("value").unwrap_or(arg)
     } else {
         arg
     };
     let resolved = substitute_call_type_args(tag, type_args);
-    let bytes = bloom_script::decode_json_const(&resolved, value)
-        .with_context(|| format!("decode const arg for {}", type_tag_token(&resolved)))?;
+    let load_manifest =
+        |petal_hash: &bloom_chain_types::types::Hash32| chain.load_manifest(petal_hash);
+    let bytes = bloom_script::decode_json_const_with_manifest_loader(
+        manifest,
+        self_hash,
+        &resolved,
+        value,
+        Some(&load_manifest),
+    )
+    .with_context(|| {
+        format!(
+            "decode const arg for {}",
+            bloom_value::type_tag_label(&resolved)
+        )
+    })?;
     Ok(format!("const:0x{}", hex::encode(bytes)))
 }
 
@@ -1804,7 +1814,9 @@ fn provision_testnet(
 ) -> Result<()> {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as B64;
-    use bloom_chain_node::genesis::{GenesisAllocation, GenesisFile, NodeConfig, ValidatorConfig};
+    use bloom_chain_node::genesis::{
+        GenesisAllocation, GenesisFile, GenesisPetal, NodeConfig, ValidatorConfig,
+    };
 
     if validators == 0 {
         anyhow::bail!("--validators must be >= 1");
@@ -1919,6 +1931,9 @@ fn provision_testnet(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
+    let core_fungible_wasm =
+        genesis_manifest_wasm(bloom_petal_fungible::fungible::__bloom_manifest_bytes())
+            .context("build core fungible genesis petal wasm")?;
     let genesis = GenesisFile {
         chain_id: chain_id.to_string(),
         genesis_time_ms,
@@ -1938,7 +1953,10 @@ fn provision_testnet(
                 amount: alloc_amount.to_string(),
             })
             .collect(),
-        petals: vec![],
+        petals: vec![GenesisPetal {
+            path: bloom_script::CORE_FUNGIBLE_PATH.to_string(),
+            wasm_hex: hex::encode(core_fungible_wasm),
+        }],
         key_registry: vec![],
     };
     let genesis_toml = toml::to_string_pretty(&genesis).context("serialize shared genesis.toml")?;
@@ -1996,6 +2014,86 @@ fn parse_port_from_host_port(s: &str) -> Result<u16> {
         .with_context(|| format!("parse port {port_str:?}"))
 }
 
+fn genesis_manifest_wasm(manifest_bytes: &[u8]) -> Result<Vec<u8>> {
+    let manifest = bloom_petal_manifest::codec::decode(manifest_bytes)
+        .context("decode genesis petal manifest")?;
+    let mut wasm = Vec::new();
+    wasm.extend_from_slice(b"\0asm");
+    wasm.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+
+    // type 0: (i32, i32) -> i32, the PTB petal export ABI.
+    wasm_section(&mut wasm, 1, &[0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f]);
+
+    let mut export_names: Vec<String> = manifest
+        .functions
+        .iter()
+        .map(|function| format!("__petal_{}", function.name))
+        .collect();
+    export_names.extend(
+        manifest
+            .invariants
+            .iter()
+            .map(|invariant| invariant.wasm_export.clone()),
+    );
+
+    let mut functions = Vec::new();
+    write_uleb128(&mut functions, export_names.len() as u64);
+    functions.extend(std::iter::repeat_n(0x00, export_names.len()));
+    wasm_section(&mut wasm, 3, &functions);
+
+    let mut exports = Vec::new();
+    write_uleb128(&mut exports, export_names.len() as u64);
+    for (idx, export_name) in export_names.iter().enumerate() {
+        write_uleb128(&mut exports, export_name.len() as u64);
+        exports.extend_from_slice(export_name.as_bytes());
+        exports.push(0x00);
+        write_uleb128(&mut exports, idx as u64);
+    }
+    wasm_section(&mut wasm, 7, &exports);
+
+    let mut code = Vec::new();
+    write_uleb128(&mut code, export_names.len() as u64);
+    for _ in &export_names {
+        // no locals; i32.const -3; end. This manifest-only bootstrap wasm
+        // exists to bind the path and schema at genesis, but it must fail
+        // closed if someone calls it before replacing it with real wasm.
+        code.extend_from_slice(&[0x04, 0x00, 0x41, 0x7d, 0x0b]);
+    }
+    wasm_section(&mut wasm, 10, &code);
+
+    Ok(append_manifest_section(wasm, manifest_bytes))
+}
+
+fn wasm_section(out: &mut Vec<u8>, id: u8, body: &[u8]) {
+    out.push(id);
+    write_uleb128(out, body.len() as u64);
+    out.extend_from_slice(body);
+}
+
+fn append_manifest_section(mut wasm: Vec<u8>, manifest_bytes: &[u8]) -> Vec<u8> {
+    let name = bloom_petal_manifest::MANIFEST_CUSTOM_SECTION;
+    let mut body = Vec::new();
+    write_uleb128(&mut body, name.len() as u64);
+    body.extend_from_slice(name.as_bytes());
+    body.extend_from_slice(manifest_bytes);
+    wasm.push(0x00);
+    write_uleb128(&mut wasm, body.len() as u64);
+    wasm.extend_from_slice(&body);
+    wasm
+}
+
+fn write_uleb128(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
 /// Bind `count` consecutive TCP listeners starting at an OS-assigned port,
 /// then release them — best-effort window for a multi-node testnet.
 ///
@@ -2036,6 +2134,7 @@ mod tests {
 
     use bloom_chain_types::Hash32;
     use bloom_objects::{AccessMode, Object, ObjectId, Owner, TypeTag};
+    use bloom_petal_fungible::ops::coin_payload;
     use bloom_script::{Arg, ArgDeclStub, Command, FunctionDeclStub, PetalManifestStub};
 
     #[derive(Default)]
@@ -2088,6 +2187,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn genesis_manifest_wasm_exports_fail_closed() {
+        let wasm = genesis_manifest_wasm(bloom_petal_fungible::fungible::__bloom_manifest_bytes())
+            .expect("genesis manifest wasm builds");
+
+        assert!(
+            wasm.windows(5)
+                .any(|window| window == [0x04, 0x00, 0x41, 0x7d, 0x0b]),
+            "bootstrap petal exports must return the Invalid host code, not success"
+        );
+        assert!(
+            !wasm
+                .windows(5)
+                .any(|window| window == [0x04, 0x00, 0x41, 0x00, 0x0b]),
+            "bootstrap petal exports must not be successful no-ops"
+        );
+    }
+
     fn command_test_chain() -> MockChain {
         let chain = MockChain::default();
         let object_id = ObjectId([0x11; 32]);
@@ -2099,14 +2216,12 @@ mod tests {
             version: 7,
             payload: vec![],
         });
-        let mut gas_payload = vec![0u8; 32];
-        gas_payload.extend_from_slice(&3_000_000u128.to_be_bytes());
         chain.put_object(Object {
             id: gas_id,
             type_tag: bloom_script::loom_coin_type_tag(bloom_script::DEFAULT_FUNGIBLE_PETAL_HASH),
             owner: Owner::Address([0x22; 32]),
             version: 0,
-            payload: gas_payload,
+            payload: coin_payload(3_000_000),
         });
         chain.paths.lock().unwrap().insert(
             bloom_script::CORE_FUNGIBLE_PATH.to_string(),
@@ -2219,7 +2334,7 @@ allocations = []
     #[test]
     fn call_command_builds_ptb_builder_line_from_json_args() {
         let u64_tag = bloom_objects::TypeTag::Concrete {
-            petal_hash: [0u8; 32],
+            petal_hash: bloom_objects::BUILTIN_TYPE_HASH,
             type_name: "u64".to_string(),
             type_args: vec![],
         };
@@ -2526,10 +2641,23 @@ allocations = []
     }
 
     #[test]
-    fn call_const_hex_preserves_raw_abi_bytes() {
-        let token =
-            call_arg_token(&serde_json::json!({ "kind": "const", "hex": "00000000000003d4" }))
-                .unwrap();
+    fn call_const_value_encodes_typed_abi_bytes() {
+        let chain = command_test_chain();
+        let manifest = bloom_script::PetalManifestStub::default();
+        let tag = bloom_objects::TypeTag::Concrete {
+            petal_hash: bloom_objects::BUILTIN_TYPE_HASH,
+            type_name: "u64".to_string(),
+            type_args: vec![],
+        };
+        let token = call_const_token(
+            &chain,
+            &serde_json::json!({ "kind": "const", "value": "980" }),
+            &tag,
+            &manifest,
+            [0xAB; 32],
+            &[],
+        )
+        .unwrap();
         assert_eq!(token, "const:0x00000000000003d4");
     }
 

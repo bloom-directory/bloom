@@ -9,7 +9,7 @@
 //! - `u128`: 16 bytes BE
 //! - address / `ObjectId`: 32 bytes raw
 //! - handle (`RuntimeHandle`): i32 BE (4 bytes)
-//! - bytes / string: 4-byte BE length + raw bytes (utf-8 for string)
+//! - bytes / string: ULEB128 length + raw bytes (utf-8 for string)
 //! - `TypeTag`: via `bloom_objects::TypeTag` canonical codec (recursive,
 //!   variant-tagged; see `bloom-objects/src/type_tag.rs`)
 //!
@@ -24,6 +24,7 @@
 //! signatures here are part of the contract.
 
 use bloom_objects::{CodecError, ObjectId, TypeTag};
+use bloom_value::{read_uleb128, write_uleb128};
 use thiserror::Error;
 
 use crate::handle::RuntimeHandle;
@@ -57,6 +58,9 @@ pub enum AbiError {
     /// Underlying `TypeTag` codec rejected the bytes.
     #[error("type tag codec error: {0}")]
     TypeTagError(#[from] CodecError),
+    /// Shared value codec rejected canonical bytes.
+    #[error("value codec error: {0}")]
+    ValueCodec(String),
     /// A framed arg's tag byte did not match the variant the declared
     /// parameter expected (e.g. a `Signer` slot fed an `Object` arg).
     #[error("arg tag mismatch: expected {expected}, got {got}")]
@@ -110,6 +114,14 @@ impl<'a> ArgReader<'a> {
         let (head, tail) = self.cursor.split_at(n);
         self.cursor = tail;
         Ok(head)
+    }
+
+    fn read_len(&mut self, kind: &str) -> Result<usize, AbiError> {
+        let len =
+            read_uleb128(&mut self.cursor).map_err(|e| AbiError::ValueCodec(e.to_string()))?;
+        usize::try_from(len).map_err(|_| {
+            AbiError::ValueCodec(format!("{kind} length does not fit in usize: {len}"))
+        })
     }
 
     /// Read a single byte.
@@ -196,14 +208,14 @@ impl<'a> ArgReader<'a> {
 
     /// Read a length-prefixed byte vector.
     pub fn read_bytes(&mut self) -> Result<Vec<u8>, AbiError> {
-        let len = self.read_u32()? as usize;
+        let len = self.read_len("bytes")?;
         let bytes = self.take(len)?;
         Ok(bytes.to_vec())
     }
 
     /// Read a length-prefixed UTF-8 string.
     pub fn read_string(&mut self) -> Result<String, AbiError> {
-        let len = self.read_u32()? as usize;
+        let len = self.read_len("string")?;
         let bytes = self.take(len)?;
         core::str::from_utf8(bytes)
             .map(|s| s.to_owned())
@@ -236,6 +248,11 @@ impl<'a> ArgReader<'a> {
 // ---------------------------------------------------------------------------
 // RetWriter
 // ---------------------------------------------------------------------------
+
+fn write_len(len: usize, out: &mut Vec<u8>) {
+    let len_u64 = u64::try_from(len).expect("length fits in u64");
+    write_uleb128(len_u64, out);
+}
 
 /// Builder for a `__petal_<fn>` return buffer.
 #[derive(Debug, Default)]
@@ -306,8 +323,7 @@ impl RetWriter {
 
     /// Write a length-prefixed byte vector.
     pub fn write_bytes(&mut self, v: &[u8]) {
-        let len = u32::try_from(v.len()).expect("bytes length fits in u32 for canonical encoding");
-        self.buf.extend_from_slice(&len.to_be_bytes());
+        write_len(v.len(), &mut self.buf);
         self.buf.extend_from_slice(v);
     }
 
@@ -343,6 +359,69 @@ impl RetWriter {
     }
 }
 
+/// Cursor over a count-prefixed return-slot envelope produced by
+/// [`RetWriter`].
+#[derive(Debug)]
+pub struct RetReader<'a> {
+    inner: ArgReader<'a>,
+    count: u32,
+    consumed: u32,
+}
+
+impl<'a> RetReader<'a> {
+    /// Wrap a buffer and read the leading `u32` BE return count.
+    pub fn new(buf: &'a [u8]) -> Result<Self, AbiError> {
+        let mut inner = ArgReader::new(buf);
+        let count = inner.read_u32()?;
+        Ok(Self {
+            inner,
+            count,
+            consumed: 0,
+        })
+    }
+
+    /// The return-slot count declared by the leading prefix.
+    pub fn declared_count(&self) -> u32 {
+        self.count
+    }
+
+    /// Decode the next length-prefixed return slot.
+    pub fn next_bytes(&mut self, max_len: usize) -> Result<Vec<u8>, AbiError> {
+        if self.consumed >= self.count {
+            return Err(AbiError::UnexpectedEof {
+                needed: 1,
+                available: 0,
+            });
+        }
+        let bytes = self.inner.read_bytes()?;
+        if bytes.len() > max_len {
+            return Err(AbiError::ValueCodec(format!(
+                "return slot too large: {} > {}",
+                bytes.len(),
+                max_len
+            )));
+        }
+        self.consumed += 1;
+        Ok(bytes)
+    }
+
+    /// Assert that all declared slots and all bytes have been consumed.
+    pub fn expect_finished(&self) -> Result<(), AbiError> {
+        if self.consumed != self.count {
+            return Err(AbiError::UnexpectedEof {
+                needed: (self.count - self.consumed) as usize,
+                available: 0,
+            });
+        }
+        if self.inner.remaining() != 0 {
+            return Err(AbiError::TrailingBytes {
+                remaining: self.inner.remaining(),
+            });
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CallArgsWriter / CallArgsReader — the *framed* PTB calldata envelope
 // ---------------------------------------------------------------------------
@@ -355,11 +434,11 @@ impl RetWriter {
 // where the tags mirror the `Arg` enum the CLI / PtbSession lowered from:
 //
 //     tag 0  Signer   → u16 BE signer index
-//     tag 1  Const    → u32 BE len + raw bytes
+//     tag 1  Const    → ULEB128 len + raw bytes
 //     tag 2  Object   → 32 raw `ObjectId` bytes
-//     tag 3  Use      → u32 BE len + raw bytes (an upstream return slot;
+//     tag 3  Use      → ULEB128 len + raw bytes (an upstream return slot;
 //                       for Coin/Capability threading this is a 32-byte id)
-//     tag 4  TypeArg  → u32 BE len + canonical `TypeTag` bytes
+//     tag 4  TypeArg  → ULEB128 len + canonical `TypeTag` bytes
 //
 // The macro-emitted `__petal_<fn>` shim consumes exactly this framing via
 // `CallArgsReader`, and the host-side test harness produces it via
@@ -406,8 +485,7 @@ impl CallArgsWriter {
     /// Append a `Const` arg (raw, length-prefixed bytes).
     pub fn push_const(&mut self, bytes: &[u8]) {
         self.push_tag(ARG_TAG_CONST);
-        let len = u32::try_from(bytes.len()).expect("const length fits in u32");
-        self.body.extend_from_slice(&len.to_be_bytes());
+        write_len(bytes.len(), &mut self.body);
         self.body.extend_from_slice(bytes);
     }
 
@@ -421,8 +499,7 @@ impl CallArgsWriter {
     /// prefixed. For Coin/Capability threading this is a 32-byte id.
     pub fn push_use(&mut self, bytes: &[u8]) {
         self.push_tag(ARG_TAG_USE);
-        let len = u32::try_from(bytes.len()).expect("use length fits in u32");
-        self.body.extend_from_slice(&len.to_be_bytes());
+        write_len(bytes.len(), &mut self.body);
         self.body.extend_from_slice(bytes);
     }
 
@@ -430,8 +507,7 @@ impl CallArgsWriter {
     pub fn push_type_arg(&mut self, tag: &TypeTag) -> Result<(), AbiError> {
         let enc = tag.encode_canonical()?;
         self.push_tag(ARG_TAG_TYPE);
-        let len = u32::try_from(enc.len()).expect("type tag length fits in u32");
-        self.body.extend_from_slice(&len.to_be_bytes());
+        write_len(enc.len(), &mut self.body);
         self.body.extend_from_slice(&enc);
         Ok(())
     }
@@ -704,10 +780,34 @@ mod tests {
     }
 
     #[test]
-    fn bytes_length_prefix_is_big_endian() {
+    fn bytes_length_prefix_is_uleb128() {
         let mut w = RetWriter::new();
         w.write_bytes(b"abc");
-        assert_eq!(w.finish(), vec![0, 0, 0, 3, b'a', b'b', b'c']);
+        assert_eq!(w.finish(), vec![3, b'a', b'b', b'c']);
+    }
+
+    #[test]
+    fn ret_reader_round_trips_slots() {
+        let mut w = RetWriter::new();
+        w.write_u32(2);
+        w.write_bytes(b"one");
+        w.write_bytes(b"two");
+        let buf = w.finish();
+        let mut r = RetReader::new(&buf).unwrap();
+        assert_eq!(r.declared_count(), 2);
+        assert_eq!(r.next_bytes(16).unwrap(), b"one");
+        assert_eq!(r.next_bytes(16).unwrap(), b"two");
+        r.expect_finished().unwrap();
+    }
+
+    #[test]
+    fn ret_reader_rejects_oversized_slot() {
+        let mut w = RetWriter::new();
+        w.write_u32(1);
+        w.write_bytes(b"toolong");
+        let buf = w.finish();
+        let mut r = RetReader::new(&buf).unwrap();
+        assert!(matches!(r.next_bytes(3), Err(AbiError::ValueCodec(_))));
     }
 
     #[test]
@@ -721,8 +821,8 @@ mod tests {
 
     #[test]
     fn string_rejects_invalid_utf8() {
-        // 4-byte BE length prefix 2, then two non-UTF-8 bytes.
-        let buf = [0u8, 0, 0, 2, 0xFF, 0xFE];
+        // ULEB128 length prefix 2, then two non-UTF-8 bytes.
+        let buf = [2, 0xFF, 0xFE];
         let mut r = ArgReader::new(&buf);
         assert_eq!(r.read_string(), Err(AbiError::InvalidUtf8));
     }

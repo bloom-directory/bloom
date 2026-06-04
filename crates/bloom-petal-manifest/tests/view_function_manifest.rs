@@ -54,15 +54,11 @@ fn legacy_schema_v1_manifest_bytes_with_one_function() -> Vec<u8> {
 }
 
 #[test]
-fn schema_v1_manifest_fixture_decodes_after_view_schema_bump() {
-    let decoded = codec::decode(&legacy_schema_v1_manifest_bytes_with_one_function())
-        .expect("schema-v1 manifests must remain decodable");
-
-    assert_eq!(decoded.schema_version, 1);
-    assert_eq!(decoded.module_path, "/bloom/test/legacy-view");
-    assert_eq!(decoded.functions.len(), 1);
-    assert_eq!(decoded.functions[0].name, "read_counter");
-    assert!(!decoded.functions[0].view);
+fn schema_v1_manifest_fixture_is_rejected_after_clean_break() {
+    assert!(
+        codec::decode(&legacy_schema_v1_manifest_bytes_with_one_function()).is_err(),
+        "schema-v1 manifests are intentionally not supported after the canonical codec clean break"
+    );
 }
 
 #[test]
@@ -113,7 +109,7 @@ fn schema_version_is_bumped_for_view_function_layout() {
     let manifest = PetalManifestV0::default();
 
     assert!(
-        manifest.schema_version >= 2,
-        "adding FunctionDecl.view changes the positional manifest layout"
+        manifest.schema_version >= 3,
+        "canonical codec declarations change the positional manifest layout"
     );
 }

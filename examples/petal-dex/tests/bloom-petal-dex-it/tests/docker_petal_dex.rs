@@ -49,9 +49,10 @@ use bloom_objects::{AbilitySet, AccessMode, Owner, TypeTag};
 use bloom_petal_manifest::types::{
     ArgDecl, ArgKind, FunctionDecl, PetalManifestV0, SCHEMA_VERSION,
 };
+use bloom_resource::BloomType;
 use bloom_script::{
-    Arg, Command as PtbCommand, ExpectedVersion, MoveCmd, PetalRef, PtbTx, UseRef,
-    loom_coin_type_tag,
+    Arg, CORE_FUNGIBLE_PATH, Command as PtbCommand, ExpectedVersion, MoveCmd, PetalRef, PtbTx,
+    UseRef, loom_coin_type_tag,
 };
 
 use bloom_petal_dex_it::dex_harness::{
@@ -94,11 +95,15 @@ const TX_TIMEOUT: Duration = Duration::from_secs(60);
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker-compose stack; run via scripts/test-docker-petal-dex.sh"]
 async fn docker_petal_dex_acceptance() -> Result<()> {
-    if std::env::var_os("BLOOM_DOCKER_TMPDIR").is_none() {
-        eprintln!("skipping docker_petal_dex_acceptance: run via scripts/test-docker-petal-dex.sh");
-        return Ok(());
-    }
-    Box::pin(docker_petal_dex_acceptance_inner()).await
+    require_docker_harness("docker_petal_dex_acceptance")?;
+    Box::pin(docker_petal_dex_acceptance_inner(false)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker-compose stack; run via scripts/test-docker-petal-vfs.sh"]
+async fn docker_petal_vfs_acceptance() -> Result<()> {
+    require_docker_harness("docker_petal_vfs_acceptance")?;
+    Box::pin(docker_petal_dex_acceptance_inner(true)).await
 }
 
 #[test]
@@ -112,7 +117,15 @@ fn prints_ptb_signer_registry_entry_for_docker_script() {
     );
 }
 
-async fn docker_petal_dex_acceptance_inner() -> Result<()> {
+fn require_docker_harness(test_name: &str) -> Result<()> {
+    if std::env::var_os("BLOOM_DOCKER_TMPDIR").is_none() {
+        eprintln!("skipping {test_name}: run via scripts/test-docker-petal-dex.sh");
+        return Ok(());
+    }
+    Ok(())
+}
+
+async fn docker_petal_dex_acceptance_inner(vfs_only: bool) -> Result<()> {
     let tmpdir = compose_tmpdir()?;
     let home0 = tmpdir.join("home0");
     let genesis_path = home0.join("chain").join("genesis.toml");
@@ -238,18 +251,27 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     );
 
     exercise_live_petal_vfs_mount(&clients, &tmpdir, &home0, gas_payer, view_probe_hash).await?;
-    if std::env::var_os("BLOOM_DOCKER_PETAL_VFS_ONLY").is_some() {
+    if vfs_only {
         return Ok(());
     }
 
-    eprintln!("[faucet] claiming FaucetAdmin capability for inner PTB signer");
-    let faucet_admin_claim = PtbTx {
+    let fungible_hash = resolve_petal_hash(client0, CORE_FUNGIBLE_PATH).await?;
+    eprintln!("[fungible] creating canonical MintCap<Erased> and Supply<Erased>");
+    let fungible_setup = PtbTx {
         signers: vec![ptb_signer_pubkey()],
         commands: vec![
-            claim_admin_cmd(faucet_hash),
+            create_currency_cmd(fungible_hash),
             PtbCommand::TransferObjects {
                 uses: vec![UseRef {
                     cmd_idx: 0,
+                    ret_idx: 0,
+                }],
+                owner: Owner::Address(ptb_signer_pubkey()),
+            },
+            create_supply_cmd(fungible_hash),
+            PtbCommand::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 2,
                     ret_idx: 0,
                 }],
                 owner: Owner::Address(ptb_signer_pubkey()),
@@ -261,28 +283,37 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
         expiry_block: PTB_EXPIRY_BLOCK,
         signatures: vec![],
     };
-    let claim_receipt = submit_ptb(&home0, HOST_RPC_PORTS[0], faucet_admin_claim)?;
-    if !claim_receipt
+    let fungible_receipt = submit_ptb(&home0, HOST_RPC_PORTS[0], fungible_setup)?;
+    if !fungible_receipt
         .get("success")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        bail!("faucet admin claim reverted: {claim_receipt}");
+        bail!("fungible setup reverted: {fungible_receipt}");
     }
-    let faucet_admin = timeout(
+    let mint_cap = timeout(
         TX_TIMEOUT,
-        wait_for_faucet_admin_cap(client0, &signer_hex, faucet_hash),
+        wait_for_owned_object_type(client0, &signer_hex, fungible_hash, "MintCap"),
     )
     .await
-    .map_err(|_| anyhow!("timed out discovering FaucetAdmin capability"))??;
-    let faucet_admin_id = obj_id_from_hex(&faucet_admin)?;
-    let faucet_admin_version = object_version(&faucet_admin)?;
+    .map_err(|_| anyhow!("timed out discovering MintCap<Erased>"))??;
+    let supply = timeout(
+        TX_TIMEOUT,
+        wait_for_owned_object_type(client0, &signer_hex, fungible_hash, "Supply"),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out discovering Supply<Erased>"))??;
+    let mint_cap_id = obj_id_from_hex(&mint_cap)?;
+    let mint_cap_version = object_version(&mint_cap)?;
+    let supply_id = obj_id_from_hex(&supply)?;
+    let mut supply_version = object_version(&supply)?;
     eprintln!(
-        "[faucet] FaucetAdmin capability = {}",
-        json_str(&faucet_admin, "id")?
+        "[fungible] MintCap = {}  Supply = {}",
+        json_str(&mint_cap, "id")?,
+        json_str(&supply, "id")?
     );
 
-    let loom_probe_wasm = loom_probe_wasm(merge_a_id, merge_b_id, split_src_id);
+    let loom_probe_wasm = loom_probe_wasm(merge_a_id, merge_b_id, split_src_id, fungible_hash);
     let loom_probe_hash = petal_hash_of(&loom_probe_wasm);
     let loom_probe_path = std::env::temp_dir().join(format!(
         "bloom-loom-probe-{}.wasm",
@@ -327,28 +358,60 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
         "signature verification failed for signer index 0",
     )?;
 
-    // ── 4. faucet.mint ×2 → create_pool (one atomic PTB) ──────────────────
+    // ── 4. canonical fungible mint ×2 → create_pool ───────────────────────
     eprintln!();
-    eprintln!("[ptb-1] faucet.mint(10000)×2 -> create_pool(30bps) -> share Pool + LP to signer");
+    eprintln!("[ptb-1] fungible.mint(10000)×2 -> create_pool(30bps) -> share Pool + LP to signer");
+    let pool_coin_a = mint_owned_coin(MintOwnedCoin {
+        client: client0,
+        clients: &clients,
+        home: &home0,
+        fungible_hash,
+        mint_cap_id,
+        mint_cap_version,
+        supply_id,
+        supply_version: &mut supply_version,
+        gas_payer,
+        value: 10_000,
+    })
+    .await?;
+    let pool_coin_b = mint_owned_coin(MintOwnedCoin {
+        client: client0,
+        clients: &clients,
+        home: &home0,
+        fungible_hash,
+        mint_cap_id,
+        mint_cap_version,
+        supply_id,
+        supply_version: &mut supply_version,
+        gas_payer,
+        value: 10_000,
+    })
+    .await?;
     let create_ptb = PtbTx {
         signers: vec![ptb_signer_pubkey()], // overwritten by sign_and_encode_ptb
         commands: vec![
-            mint_cmd(faucet_hash, faucet_admin_id, faucet_admin_version, 10_000),
-            mint_cmd(faucet_hash, faucet_admin_id, faucet_admin_version, 10_000),
             PtbCommand::Move(MoveCmd {
                 petal: pool_ref(pool_hash),
                 function: "create_pool".to_string(),
                 type_args: erased_pair_type_args(),
                 args: vec![
-                    use_ret(0, 0),
-                    use_ret(1, 0),
-                    Arg::Const(POOL_FEE_BPS.to_be_bytes().to_vec()),
+                    Arg::Object {
+                        id: obj_id_from_hex(&pool_coin_a)?,
+                        expected_version: ExpectedVersion(object_version(&pool_coin_a)?),
+                        access_mode: AccessMode::Consume,
+                    },
+                    Arg::Object {
+                        id: obj_id_from_hex(&pool_coin_b)?,
+                        expected_version: ExpectedVersion(object_version(&pool_coin_b)?),
+                        access_mode: AccessMode::Consume,
+                    },
+                    Arg::Const(vector_u8_const(&POOL_FEE_BPS.to_be_bytes())),
                 ],
             }),
             // Share the Pool (slot 0) so anyone can swap.
             PtbCommand::TransferObjects {
                 uses: vec![UseRef {
-                    cmd_idx: 2,
+                    cmd_idx: 0,
                     ret_idx: 0,
                 }],
                 owner: Owner::Shared,
@@ -356,7 +419,7 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
             // Give the LpPosition (slot 1) to the signer.
             PtbCommand::TransferObjects {
                 uses: vec![UseRef {
-                    cmd_idx: 2,
+                    cmd_idx: 0,
                     ret_idx: 1,
                 }],
                 owner: Owner::Address(ptb_signer_pubkey()),
@@ -434,31 +497,63 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
 
     // Create a second pool, then try to burn pool-A LP against pool-B. This
     // must revert without mutating either pool or the LP.
+    let pool_b_coin_a = mint_owned_coin(MintOwnedCoin {
+        client: client0,
+        clients: &clients,
+        home: &home0,
+        fungible_hash,
+        mint_cap_id,
+        mint_cap_version,
+        supply_id,
+        supply_version: &mut supply_version,
+        gas_payer,
+        value: 10_000,
+    })
+    .await?;
+    let pool_b_coin_b = mint_owned_coin(MintOwnedCoin {
+        client: client0,
+        clients: &clients,
+        home: &home0,
+        fungible_hash,
+        mint_cap_id,
+        mint_cap_version,
+        supply_id,
+        supply_version: &mut supply_version,
+        gas_payer,
+        value: 10_000,
+    })
+    .await?;
     let create_pool_b = PtbTx {
         signers: vec![ptb_signer_pubkey()],
         commands: vec![
-            mint_cmd(faucet_hash, faucet_admin_id, faucet_admin_version, 10_000),
-            mint_cmd(faucet_hash, faucet_admin_id, faucet_admin_version, 10_000),
             PtbCommand::Move(MoveCmd {
                 petal: pool_ref(pool_hash),
                 function: "create_pool".to_string(),
                 type_args: erased_pair_type_args(),
                 args: vec![
-                    use_ret(0, 0),
-                    use_ret(1, 0),
-                    Arg::Const((POOL_FEE_BPS + 1).to_be_bytes().to_vec()),
+                    Arg::Object {
+                        id: obj_id_from_hex(&pool_b_coin_a)?,
+                        expected_version: ExpectedVersion(object_version(&pool_b_coin_a)?),
+                        access_mode: AccessMode::Consume,
+                    },
+                    Arg::Object {
+                        id: obj_id_from_hex(&pool_b_coin_b)?,
+                        expected_version: ExpectedVersion(object_version(&pool_b_coin_b)?),
+                        access_mode: AccessMode::Consume,
+                    },
+                    Arg::Const(vector_u8_const(&(POOL_FEE_BPS + 1).to_be_bytes())),
                 ],
             }),
             PtbCommand::TransferObjects {
                 uses: vec![UseRef {
-                    cmd_idx: 2,
+                    cmd_idx: 0,
                     ret_idx: 0,
                 }],
                 owner: Owner::Shared,
             },
             PtbCommand::TransferObjects {
                 uses: vec![UseRef {
-                    cmd_idx: 2,
+                    cmd_idx: 0,
                     ret_idx: 1,
                 }],
                 owner: Owner::Address(ptb_signer_pubkey()),
@@ -478,6 +573,7 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     {
         bail!("second pool create reverted: {pool_b_receipt}");
     }
+    supply_version = refresh_object_version(client0, supply_id, "Supply<Erased>").await?;
     latest = current_height(client0).await?;
     wait_all_reach_height(&clients, latest).await?;
     let pools = ls_objects_by_type(client0, "Pool").await?;
@@ -590,11 +686,35 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     assert_same_object_fields(&pool_b_after_cross, &pool_b, "cross-pool pool B")?;
     assert_same_object_fields(&lp_a_after_cross, &lp_a_before_cross, "cross-pool LP A")?;
 
+    let add_lp_coin_a = mint_owned_coin(MintOwnedCoin {
+        client: client0,
+        clients: &clients,
+        home: &home0,
+        fungible_hash,
+        mint_cap_id,
+        mint_cap_version,
+        supply_id,
+        supply_version: &mut supply_version,
+        gas_payer,
+        value: 500,
+    })
+    .await?;
+    let add_lp_coin_b = mint_owned_coin(MintOwnedCoin {
+        client: client0,
+        clients: &clients,
+        home: &home0,
+        fungible_hash,
+        mint_cap_id,
+        mint_cap_version,
+        supply_id,
+        supply_version: &mut supply_version,
+        gas_payer,
+        value: 500,
+    })
+    .await?;
     let add_lp_ptb = PtbTx {
         signers: vec![ptb_signer_pubkey()],
         commands: vec![
-            mint_cmd(faucet_hash, faucet_admin_id, faucet_admin_version, 500),
-            mint_cmd(faucet_hash, faucet_admin_id, faucet_admin_version, 500),
             PtbCommand::Move(MoveCmd {
                 petal: pool_ref(pool_hash),
                 function: "add_liquidity".to_string(),
@@ -605,13 +725,21 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
                         expected_version: ExpectedVersion(pool_version),
                         access_mode: AccessMode::Mutable,
                     },
-                    use_ret(0, 0),
-                    use_ret(1, 0),
+                    Arg::Object {
+                        id: obj_id_from_hex(&add_lp_coin_a)?,
+                        expected_version: ExpectedVersion(object_version(&add_lp_coin_a)?),
+                        access_mode: AccessMode::Consume,
+                    },
+                    Arg::Object {
+                        id: obj_id_from_hex(&add_lp_coin_b)?,
+                        expected_version: ExpectedVersion(object_version(&add_lp_coin_b)?),
+                        access_mode: AccessMode::Consume,
+                    },
                 ],
             }),
             PtbCommand::TransferObjects {
                 uses: vec![UseRef {
-                    cmd_idx: 2,
+                    cmd_idx: 0,
                     ret_idx: 0,
                 }],
                 owner: Owner::Address(ptb_signer_pubkey()),
@@ -631,6 +759,7 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     {
         bail!("add_liquidity reverted: {add_lp_receipt}");
     }
+    supply_version = refresh_object_version(client0, supply_id, "Supply<Erased>").await?;
     latest = current_height(client0).await?;
     wait_all_reach_height(&clients, latest).await?;
     let pool_after_add = query_object(client0, pool_id_hex)
@@ -744,16 +873,19 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
         client: client0,
         clients: &clients,
         home0: &home0,
-        faucet_hash,
         pool_hash,
+        wallet_hash,
         pool_id: pool_obj_id,
         pool_id_hex,
         pool_version,
         pool_b_id,
         pool_b_id_hex: json_str(&pool_b, "id")?,
         pool_b_version: &mut pool_b_version,
-        faucet_admin_id,
-        faucet_admin_version,
+        fungible_hash,
+        mint_cap_id,
+        mint_cap_version,
+        supply_id,
+        supply_version: &mut supply_version,
         gas_payer,
     })
     .await?;
@@ -761,7 +893,14 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     let exact_out_ptb = PtbTx {
         signers: vec![ptb_signer_pubkey()],
         commands: vec![
-            mint_cmd(faucet_hash, faucet_admin_id, faucet_admin_version, 250),
+            fungible_mint_cmd(
+                fungible_hash,
+                mint_cap_id,
+                mint_cap_version,
+                supply_id,
+                supply_version,
+                250,
+            ),
             PtbCommand::Move(MoveCmd {
                 petal: pool_ref(pool_hash),
                 function: "swap_exact_out".to_string(),
@@ -783,13 +922,12 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
                 }],
                 owner: Owner::Address(ptb_signer_pubkey()),
             },
-            PtbCommand::TransferObjects {
-                uses: vec![UseRef {
-                    cmd_idx: 1,
-                    ret_idx: 1,
-                }],
-                owner: Owner::Address(ptb_signer_pubkey()),
-            },
+            PtbCommand::Move(MoveCmd {
+                petal: wallet_ref(wallet_hash),
+                function: "receive_optional".to_string(),
+                type_args: vec![],
+                args: vec![use_ret(1, 1), Arg::Const(ptb_signer_pubkey().to_vec())],
+            }),
         ],
         gas_payer,
         gas_budget: PTB_GAS_BUDGET,
@@ -805,6 +943,7 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     {
         bail!("swap_exact_out reverted: {exact_out_receipt}");
     }
+    supply_version = refresh_object_version(client0, supply_id, "Supply<Erased>").await?;
     latest = current_height(client0).await?;
     wait_all_reach_height(&clients, latest).await?;
     let pool_b_after_exact_out = query_object(client0, json_str(&pool_b, "id")?)
@@ -816,14 +955,21 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     }
     eprintln!("            swap_exact_out on second pool executed and converged");
 
-    // ── 6. faucet.mint → swap_exact_in → wallet.receive (one atomic PTB) ──
+    // ── 6. fungible.mint → swap_exact_in → wallet.receive (one atomic PTB) ─
     eprintln!();
-    eprintln!("[ptb-2] faucet.mint(100) -> swap_exact_in(min_out=90) -> wallet.receive(carol)");
+    eprintln!("[ptb-2] fungible.mint(100) -> swap_exact_in(min_out=90) -> wallet.receive(carol)");
     let min_out: u128 = 90;
     let swap_ptb = PtbTx {
         signers: vec![ptb_signer_pubkey()],
         commands: vec![
-            mint_cmd(faucet_hash, faucet_admin_id, faucet_admin_version, 100),
+            fungible_mint_cmd(
+                fungible_hash,
+                mint_cap_id,
+                mint_cap_version,
+                supply_id,
+                supply_version,
+                100,
+            ),
             PtbCommand::Move(MoveCmd {
                 petal: pool_ref(pool_hash),
                 function: "swap_exact_in".to_string(),
@@ -879,6 +1025,7 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     {
         bail!("nonzero-gas swap success reported zero fuel_used");
     }
+    supply_version = refresh_object_version(client0, supply_id, "Supply<Erased>").await?;
 
     latest = current_height(client0).await?;
     wait_all_reach_height(&clients, latest).await?;
@@ -917,7 +1064,14 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     let bad_sig_real_swap = PtbTx {
         signers: vec![ptb_signer_pubkey()],
         commands: vec![
-            mint_cmd(faucet_hash, faucet_admin_id, faucet_admin_version, 1),
+            fungible_mint_cmd(
+                fungible_hash,
+                mint_cap_id,
+                mint_cap_version,
+                supply_id,
+                supply_version,
+                1,
+            ),
             PtbCommand::Move(MoveCmd {
                 petal: pool_ref(pool_hash),
                 function: "swap_exact_in".to_string(),
@@ -956,7 +1110,14 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     let stale_ptb = PtbTx {
         signers: vec![ptb_signer_pubkey()],
         commands: vec![
-            mint_cmd(faucet_hash, faucet_admin_id, faucet_admin_version, 1),
+            fungible_mint_cmd(
+                fungible_hash,
+                mint_cap_id,
+                mint_cap_version,
+                supply_id,
+                supply_version,
+                1,
+            ),
             PtbCommand::Move(MoveCmd {
                 petal: pool_ref(pool_hash),
                 function: "swap_exact_in".to_string(),
@@ -991,7 +1152,14 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     let slippage_ptb = PtbTx {
         signers: vec![ptb_signer_pubkey()],
         commands: vec![
-            mint_cmd(faucet_hash, faucet_admin_id, faucet_admin_version, 100),
+            fungible_mint_cmd(
+                fungible_hash,
+                mint_cap_id,
+                mint_cap_version,
+                supply_id,
+                supply_version,
+                100,
+            ),
             PtbCommand::Move(MoveCmd {
                 petal: pool_ref(pool_hash),
                 function: "swap_exact_in".to_string(),
@@ -1031,7 +1199,14 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
     let low_gas_ptb = PtbTx {
         signers: vec![ptb_signer_pubkey()],
         commands: vec![
-            mint_cmd(faucet_hash, faucet_admin_id, faucet_admin_version, 1),
+            fungible_mint_cmd(
+                fungible_hash,
+                mint_cap_id,
+                mint_cap_version,
+                supply_id,
+                supply_version,
+                1,
+            ),
             PtbCommand::Move(MoveCmd {
                 petal: pool_ref(pool_hash),
                 function: "swap_exact_in".to_string(),
@@ -1162,48 +1337,74 @@ async fn docker_petal_dex_acceptance_inner() -> Result<()> {
 // PTB construction helpers
 // ---------------------------------------------------------------------------
 
-/// A faucet `mint(admin, value)` Move command.
-fn mint_cmd(
-    faucet_hash: bloom_chain_types::types::Hash32,
-    admin_id: bloom_objects::ObjectId,
-    admin_version: u64,
+fn create_currency_cmd(fungible_hash: bloom_chain_types::types::Hash32) -> PtbCommand {
+    PtbCommand::Move(MoveCmd {
+        petal: fungible_ref(fungible_hash),
+        function: "create_currency".to_string(),
+        type_args: vec![erased_type_tag()],
+        args: vec![Arg::Signer(0)],
+    })
+}
+
+fn create_supply_cmd(fungible_hash: bloom_chain_types::types::Hash32) -> PtbCommand {
+    PtbCommand::Move(MoveCmd {
+        petal: fungible_ref(fungible_hash),
+        function: "create_supply".to_string(),
+        type_args: vec![erased_type_tag()],
+        args: vec![Arg::Signer(0)],
+    })
+}
+
+fn fungible_mint_cmd(
+    fungible_hash: bloom_chain_types::types::Hash32,
+    mint_cap_id: bloom_objects::ObjectId,
+    mint_cap_version: u64,
+    supply_id: bloom_objects::ObjectId,
+    supply_version: u64,
     value: u128,
 ) -> PtbCommand {
     PtbCommand::Move(MoveCmd {
-        petal: PetalRef {
-            path: "/bloom/petals/dex/faucet".to_string(),
-            hash: Some(faucet_hash),
-        },
+        petal: fungible_ref(fungible_hash),
         function: "mint".to_string(),
-        type_args: vec![],
+        type_args: vec![erased_type_tag()],
         args: vec![
-            Arg::Signer(0),
             Arg::Object {
-                id: admin_id,
-                expected_version: ExpectedVersion(admin_version),
+                id: mint_cap_id,
+                expected_version: ExpectedVersion(mint_cap_version),
                 access_mode: AccessMode::ReadOnly,
+            },
+            Arg::Object {
+                id: supply_id,
+                expected_version: ExpectedVersion(supply_version),
+                access_mode: AccessMode::Mutable,
             },
             Arg::Const(value.to_be_bytes().to_vec()),
         ],
     })
 }
 
-fn claim_admin_cmd(faucet_hash: bloom_chain_types::types::Hash32) -> PtbCommand {
-    PtbCommand::Move(MoveCmd {
-        petal: PetalRef {
-            path: "/bloom/petals/dex/faucet".to_string(),
-            hash: Some(faucet_hash),
-        },
-        function: "claim_admin".to_string(),
-        type_args: vec![],
-        args: vec![Arg::Signer(0)],
-    })
+fn vector_u8_const(bytes: &[u8]) -> Vec<u8> {
+    bytes.to_vec().canonical_encode()
+}
+
+fn fungible_ref(fungible_hash: bloom_chain_types::types::Hash32) -> PetalRef {
+    PetalRef {
+        path: CORE_FUNGIBLE_PATH.to_string(),
+        hash: Some(fungible_hash),
+    }
 }
 
 fn pool_ref(pool_hash: bloom_chain_types::types::Hash32) -> PetalRef {
     PetalRef {
         path: "/bloom/petals/dex/pool".to_string(),
         hash: Some(pool_hash),
+    }
+}
+
+fn wallet_ref(wallet_hash: bloom_chain_types::types::Hash32) -> PetalRef {
+    PetalRef {
+        path: "/bloom/petals/dex/wallet".to_string(),
+        hash: Some(wallet_hash),
     }
 }
 
@@ -1554,16 +1755,19 @@ struct LiveDexPartialConsume<'a> {
     client: &'a RpcClient,
     clients: &'a [RpcClient],
     home0: &'a std::path::Path,
-    faucet_hash: bloom_chain_types::types::Hash32,
     pool_hash: bloom_chain_types::types::Hash32,
+    wallet_hash: bloom_chain_types::types::Hash32,
     pool_id: bloom_objects::ObjectId,
     pool_id_hex: &'a str,
     pool_version: u64,
     pool_b_id: bloom_objects::ObjectId,
     pool_b_id_hex: &'a str,
     pool_b_version: &'a mut u64,
-    faucet_admin_id: bloom_objects::ObjectId,
-    faucet_admin_version: u64,
+    fungible_hash: bloom_chain_types::types::Hash32,
+    mint_cap_id: bloom_objects::ObjectId,
+    mint_cap_version: u64,
+    supply_id: bloom_objects::ObjectId,
+    supply_version: &'a mut u64,
     gas_payer: bloom_objects::ObjectId,
 }
 
@@ -1572,73 +1776,53 @@ async fn exercise_live_dex_partial_consume(input: LiveDexPartialConsume<'_>) -> 
         client,
         clients,
         home0,
-        faucet_hash,
         pool_hash,
+        wallet_hash,
         pool_id,
         pool_id_hex,
         pool_version,
         pool_b_id,
         pool_b_id_hex,
         pool_b_version,
-        faucet_admin_id,
-        faucet_admin_version,
+        fungible_hash,
+        mint_cap_id,
+        mint_cap_version,
+        supply_id,
+        supply_version,
         gas_payer,
     } = input;
     let mut pool_version = pool_version;
     let signer_hex = ptb_signer_pubkey_hex();
 
-    let before_mint = owned_coin_ids(client, &signer_hex).await?;
-    let seed_add_ptb = PtbTx {
-        signers: vec![ptb_signer_pubkey()],
-        commands: vec![
-            mint_cmd(faucet_hash, faucet_admin_id, faucet_admin_version, 500),
-            mint_cmd(faucet_hash, faucet_admin_id, faucet_admin_version, 600),
-            PtbCommand::TransferObjects {
-                uses: vec![UseRef {
-                    cmd_idx: 0,
-                    ret_idx: 0,
-                }],
-                owner: Owner::Address(ptb_signer_pubkey()),
-            },
-            PtbCommand::TransferObjects {
-                uses: vec![UseRef {
-                    cmd_idx: 1,
-                    ret_idx: 0,
-                }],
-                owner: Owner::Address(ptb_signer_pubkey()),
-            },
-        ],
+    let add_a = mint_owned_coin(MintOwnedCoin {
+        client,
+        clients,
+        home: home0,
+        fungible_hash,
+        mint_cap_id,
+        mint_cap_version,
+        supply_id,
+        supply_version,
         gas_payer,
-        gas_budget: PTB_GAS_BUDGET,
-        gas_price: 1,
-        expiry_block: PTB_EXPIRY_BLOCK,
-        signatures: vec![],
-    };
-    let seed_add_receipt = submit_ptb(home0, HOST_RPC_PORTS[0], seed_add_ptb)?;
-    if !seed_add_receipt
-        .get("success")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        bail!("partial add_liquidity seed mint reverted: {seed_add_receipt}");
-    }
-    let latest = current_height(client).await?;
-    wait_all_reach_height(clients, latest).await?;
-    let add_inputs =
-        wait_for_new_owned_coins_with_values(client, &signer_hex, &before_mint, &[500, 600])
-            .await?;
-    let add_a = add_inputs
-        .iter()
-        .find(|o| decode_coin_value(o).ok() == Some(500))
-        .ok_or_else(|| anyhow!("missing persistent add_liquidity 500 coin"))?;
-    let add_b = add_inputs
-        .iter()
-        .find(|o| decode_coin_value(o).ok() == Some(600))
-        .ok_or_else(|| anyhow!("missing persistent add_liquidity 600 coin"))?;
-    let add_a_id = obj_id_from_hex(add_a)?;
-    let add_b_id = obj_id_from_hex(add_b)?;
+        value: 500,
+    })
+    .await?;
+    let add_b = mint_owned_coin(MintOwnedCoin {
+        client,
+        clients,
+        home: home0,
+        fungible_hash,
+        mint_cap_id,
+        mint_cap_version,
+        supply_id,
+        supply_version,
+        gas_payer,
+        value: 500,
+    })
+    .await?;
+    let add_a_id = obj_id_from_hex(&add_a)?;
+    let add_b_id = obj_id_from_hex(&add_b)?;
 
-    let before_add_consume = owned_coin_ids(client, &signer_hex).await?;
     let lps_before = ls_objects_by_type(client, "LpPosition")
         .await?
         .into_iter()
@@ -1659,12 +1843,12 @@ async fn exercise_live_dex_partial_consume(input: LiveDexPartialConsume<'_>) -> 
                     },
                     Arg::Object {
                         id: add_a_id,
-                        expected_version: ExpectedVersion(object_version(add_a)?),
+                        expected_version: ExpectedVersion(object_version(&add_a)?),
                         access_mode: AccessMode::Consume,
                     },
                     Arg::Object {
                         id: add_b_id,
-                        expected_version: ExpectedVersion(object_version(add_b)?),
+                        expected_version: ExpectedVersion(object_version(&add_b)?),
                         access_mode: AccessMode::Consume,
                     },
                 ],
@@ -1673,13 +1857,6 @@ async fn exercise_live_dex_partial_consume(input: LiveDexPartialConsume<'_>) -> 
                 uses: vec![UseRef {
                     cmd_idx: 0,
                     ret_idx: 0,
-                }],
-                owner: Owner::Address(ptb_signer_pubkey()),
-            },
-            PtbCommand::TransferObjects {
-                uses: vec![UseRef {
-                    cmd_idx: 0,
-                    ret_idx: 2,
                 }],
                 owner: Owner::Address(ptb_signer_pubkey()),
             },
@@ -1700,10 +1877,10 @@ async fn exercise_live_dex_partial_consume(input: LiveDexPartialConsume<'_>) -> 
     }
     let latest = current_height(client).await?;
     wait_all_reach_height(clients, latest).await?;
-    if query_object(client, json_str(add_a, "id")?)
+    if query_object(client, json_str(&add_a, "id")?)
         .await?
         .is_some()
-        || query_object(client, json_str(add_b, "id")?)
+        || query_object(client, json_str(&add_b, "id")?)
             .await?
             .is_some()
     {
@@ -1717,12 +1894,6 @@ async fn exercise_live_dex_partial_consume(input: LiveDexPartialConsume<'_>) -> 
         bail!("partial add_liquidity reserves got ({ra_add}, {rb_add}), expected (10500, 10500)");
     }
     pool_version = object_version(&pool_after_partial_add)?;
-    let partial_leftovers =
-        wait_for_new_owned_coins_with_values(client, &signer_hex, &before_add_consume, &[100])
-            .await?;
-    if partial_leftovers.len() != 1 || decode_coin_value(&partial_leftovers[0])? != 100 {
-        bail!("partial add_liquidity did not return exactly one 100-value leftover coin");
-    }
     let added_lp = ls_objects_by_type(client, "LpPosition")
         .await?
         .into_iter()
@@ -1804,7 +1975,14 @@ async fn exercise_live_dex_partial_consume(input: LiveDexPartialConsume<'_>) -> 
     let seed_exact_ptb = PtbTx {
         signers: vec![ptb_signer_pubkey()],
         commands: vec![
-            mint_cmd(faucet_hash, faucet_admin_id, faucet_admin_version, 120),
+            fungible_mint_cmd(
+                fungible_hash,
+                mint_cap_id,
+                mint_cap_version,
+                supply_id,
+                *supply_version,
+                120,
+            ),
             PtbCommand::TransferObjects {
                 uses: vec![UseRef {
                     cmd_idx: 0,
@@ -1827,6 +2005,7 @@ async fn exercise_live_dex_partial_consume(input: LiveDexPartialConsume<'_>) -> 
     {
         bail!("partial exact_out seed mint reverted: {seed_exact_receipt}");
     }
+    *supply_version = refresh_object_version(client, supply_id, "Supply<Erased>").await?;
     let latest = current_height(client).await?;
     wait_all_reach_height(clients, latest).await?;
     let max_in_coin =
@@ -1864,13 +2043,12 @@ async fn exercise_live_dex_partial_consume(input: LiveDexPartialConsume<'_>) -> 
                 }],
                 owner: Owner::Address(ptb_signer_pubkey()),
             },
-            PtbCommand::TransferObjects {
-                uses: vec![UseRef {
-                    cmd_idx: 0,
-                    ret_idx: 1,
-                }],
-                owner: Owner::Address(ptb_signer_pubkey()),
-            },
+            PtbCommand::Move(MoveCmd {
+                petal: wallet_ref(wallet_hash),
+                function: "receive_optional".to_string(),
+                type_args: vec![],
+                args: vec![use_ret(0, 1), Arg::Const(ptb_signer_pubkey().to_vec())],
+            }),
         ],
         gas_payer,
         gas_budget: PTB_GAS_BUDGET,
@@ -2202,7 +2380,7 @@ fn pool_type_tag(pool_hash: bloom_chain_types::types::Hash32) -> TypeTag {
 
 fn u128_type_tag() -> TypeTag {
     TypeTag::Concrete {
-        petal_hash: [0u8; 32],
+        petal_hash: bloom_objects::BUILTIN_TYPE_HASH,
         type_name: "u128".to_string(),
         type_args: vec![],
     }
@@ -2343,7 +2521,7 @@ fn view_probe_wasm() -> Vec<u8> {
   (import "object" "read" (func $read (param i32 i32 i32) (result i32)))
   (memory (export "memory") 1)
   ;; count=1, len=16, u128=42
-  (data (i32.const 0) "\00\00\00\01\00\00\00\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
+  (data (i32.const 0) "\00\00\00\01\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
   (data (i32.const 64) "{counter_tag_wat}")
   ;; Counter payloads: initial 42, then mutated values.
   (data (i32.const 160) "\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\2a")
@@ -2352,18 +2530,18 @@ fn view_probe_wasm() -> Vec<u8> {
   (data (i32.const 224) "\00\00\00\00\00\00\00\00\00\00\00\00\00\00\00\7b")
   (data (i32.const 240) "forced revert")
   ;; one object-id return slot: count=1, len=32
-  (data (i32.const 512) "\00\00\00\01\00\00\00\20")
+  (data (i32.const 512) "\00\00\00\01\20")
   ;; one u128 return slot: count=1, len=16
-  (data (i32.const 640) "\00\00\00\01\00\00\00\10")
+  (data (i32.const 640) "\00\00\00\01\10")
   (func (export "__petal_answer") (param i32 i32) (result i32)
-    (call $ret (i32.const 0) (i32.const 24))
+    (call $ret (i32.const 0) (i32.const 21))
     i32.const 0)
   (func (export "__petal_init_counter") (param i32 i32) (result i32)
     (local $h i32)
     (local.set $h
       (call $create (i32.const 64) (i32.const {counter_tag_len}) (i32.const 160) (i32.const 16)))
-    (drop (call $id (local.get $h) (i32.const 520)))
-    (call $ret (i32.const 512) (i32.const 40))
+    (drop (call $id (local.get $h) (i32.const 517)))
+    (call $ret (i32.const 512) (i32.const 37))
     i32.const 0)
   (func (export "__petal_set_counter") (param i32 i32) (result i32)
     (local $h i32)
@@ -2378,8 +2556,8 @@ fn view_probe_wasm() -> Vec<u8> {
     (drop (call $cdread (i32.const 256) (i32.const 5) (i32.const 32)))
     (local.set $h (call $borrow (i32.const 256) (i32.const 1)))
     (drop (call $mutate (local.get $h) (i32.const 208) (i32.const 16)))
-    (drop (call $id (local.get $h) (i32.const 520)))
-    (call $ret (i32.const 512) (i32.const 40))
+    (drop (call $id (local.get $h) (i32.const 517)))
+    (call $ret (i32.const 512) (i32.const 37))
     i32.const 0)
   (func (export "__petal_set_counter_123_ret") (param i32 i32) (result i32)
     (local $h i32)
@@ -2387,8 +2565,8 @@ fn view_probe_wasm() -> Vec<u8> {
     (drop (call $cdread (i32.const 256) (i32.const 5) (i32.const 32)))
     (local.set $h (call $borrow (i32.const 256) (i32.const 1)))
     (drop (call $mutate (local.get $h) (i32.const 224) (i32.const 16)))
-    (drop (call $id (local.get $h) (i32.const 520)))
-    (call $ret (i32.const 512) (i32.const 40))
+    (drop (call $id (local.get $h) (i32.const 517)))
+    (call $ret (i32.const 512) (i32.const 37))
     i32.const 0)
   (func (export "__petal_sink_counter") (param i32 i32) (result i32)
     (local $h i32)
@@ -2411,8 +2589,8 @@ fn view_probe_wasm() -> Vec<u8> {
     ;; Arg 0 is an object: count(4), tag(1), id(32).
     (drop (call $cdread (i32.const 256) (i32.const 5) (i32.const 32)))
     (local.set $h (call $borrow (i32.const 256) (i32.const 0)))
-    (drop (call $read (local.get $h) (i32.const 648) (i32.const 16)))
-    (call $ret (i32.const 640) (i32.const 24))
+    (drop (call $read (local.get $h) (i32.const 645) (i32.const 16)))
+    (call $ret (i32.const 640) (i32.const 21))
     i32.const 0)
 )
 "#,
@@ -2523,8 +2701,8 @@ fn adversary_wasm(
     append_manifest_section(wat_to_wasm(&wat), &adversary_manifest(pool_hash))
 }
 
-fn loom_probe_manifest() -> Vec<u8> {
-    let coin_ty = loom_coin_type_tag(Hash32([0u8; 32]));
+fn loom_probe_manifest(fungible_hash: Hash32) -> Vec<u8> {
+    let coin_ty = loom_coin_type_tag(fungible_hash);
     let manifest = PetalManifestV0 {
         schema_version: SCHEMA_VERSION,
         module_path: LOOM_PROBE_PATH.to_string(),
@@ -2555,11 +2733,11 @@ fn loom_probe_manifest() -> Vec<u8> {
                 args: vec![ArgDecl {
                     name: "coin".to_string(),
                     kind: ArgKind::Object {
-                        ty: coin_ty,
+                        ty: coin_ty.clone(),
                         mode: AccessMode::Mutable,
                     },
                 }],
-                returns: vec![loom_coin_type_tag(Hash32([0u8; 32]))],
+                returns: vec![coin_ty],
                 ..Default::default()
             },
             FunctionDecl {
@@ -2576,6 +2754,7 @@ fn loom_probe_wasm(
     merge_a: bloom_objects::ObjectId,
     merge_b: bloom_objects::ObjectId,
     split_src: bloom_objects::ObjectId,
+    fungible_hash: Hash32,
 ) -> Vec<u8> {
     let merge_a_wat = wat_bytes(&merge_a.0);
     let merge_b_wat = wat_bytes(&merge_b.0);
@@ -2586,14 +2765,14 @@ fn loom_probe_wasm(
   (import "chain" "petal.return" (func $ret (param i32 i32)))
   (memory (export "memory") 1)
   ;; count=2 | len=32 | merge_a | len=32 | merge_b
-  (data (i32.const 0) "\00\00\00\02\00\00\00\20{merge_a_wat}\00\00\00\20{merge_b_wat}")
+  (data (i32.const 0) "\00\00\00\02\20{merge_a_wat}\20{merge_b_wat}")
   ;; count=1 | len=32 | split_src
-  (data (i32.const 128) "\00\00\00\01\00\00\00\20{split_wat}")
+  (data (i32.const 128) "\00\00\00\01\20{split_wat}")
   (func (export "__petal_load_merge") (param i32 i32) (result i32)
-    (call $ret (i32.const 0) (i32.const 76))
+    (call $ret (i32.const 0) (i32.const 70))
     i32.const 0)
   (func (export "__petal_load_split") (param i32 i32) (result i32)
-    (call $ret (i32.const 128) (i32.const 40))
+    (call $ret (i32.const 128) (i32.const 37))
     i32.const 0)
   (func (export "__petal_trap_after_work") (param i32 i32) (result i32)
     (local $i i32)
@@ -2606,7 +2785,7 @@ fn loom_probe_wasm(
 )
 "#
     );
-    append_manifest_section(wat_to_wasm(&wat), &loom_probe_manifest())
+    append_manifest_section(wat_to_wasm(&wat), &loom_probe_manifest(fungible_hash))
 }
 
 fn wat_bytes(bytes: &[u8]) -> String {
@@ -3164,7 +3343,8 @@ fn run_mounted_petal_endpoint_raw(
 ) -> Result<std::process::Output> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let mut cmd = Command::new(endpoint);
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg(endpoint);
         cmd.env("BLOOM_HOME", home)
             .env("BLOOM_RPC_TCP", rpc)
             .env("PATH", path_env)
@@ -3229,7 +3409,8 @@ fn run_mounted_petal_endpoint_raw_stdin(
 ) -> Result<std::process::Output> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let mut cmd = Command::new(endpoint);
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg(endpoint);
         cmd.env("BLOOM_HOME", home)
             .env("BLOOM_RPC_TCP", rpc)
             .env("PATH", path_env)
@@ -3530,6 +3711,16 @@ async fn assert_resolves(
     path: &str,
     expected: bloom_chain_types::types::Hash32,
 ) -> Result<()> {
+    let got_hash = resolve_petal_hash(client, path).await?;
+    let got = hex::encode(got_hash.0);
+    let expected_hex = hex::encode(expected.0);
+    if got != expected_hex {
+        bail!("petal path {path} resolved to {got}, expected {expected_hex}");
+    }
+    Ok(())
+}
+
+async fn resolve_petal_hash(client: &RpcClient, path: &str) -> Result<Hash32> {
     let resolved = client
         .call("chain_resolve_path", serde_json::json!({ "path": path }))
         .await
@@ -3538,11 +3729,11 @@ async fn assert_resolves(
         .get("hash")
         .and_then(Value::as_str)
         .with_context(|| format!("petal path {path} is not bound"))?;
-    let expected_hex = hex::encode(expected.0);
-    if got != expected_hex {
-        bail!("petal path {path} resolved to {got}, expected {expected_hex}");
-    }
-    Ok(())
+    let bytes = hex::decode(got).with_context(|| format!("petal path {path} hash is not hex"))?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("petal path {path} hash is not 32 bytes"))?;
+    Ok(Hash32(arr))
 }
 
 /// Block until the node reports a tip at or beyond `target`.
@@ -3849,6 +4040,77 @@ async fn owned_coin_ids(
         .collect())
 }
 
+struct MintOwnedCoin<'a> {
+    client: &'a RpcClient,
+    clients: &'a [RpcClient],
+    home: &'a Path,
+    fungible_hash: Hash32,
+    mint_cap_id: bloom_objects::ObjectId,
+    mint_cap_version: u64,
+    supply_id: bloom_objects::ObjectId,
+    supply_version: &'a mut u64,
+    gas_payer: bloom_objects::ObjectId,
+    value: u128,
+}
+
+async fn mint_owned_coin(input: MintOwnedCoin<'_>) -> Result<Value> {
+    let MintOwnedCoin {
+        client,
+        clients,
+        home,
+        fungible_hash,
+        mint_cap_id,
+        mint_cap_version,
+        supply_id,
+        supply_version,
+        gas_payer,
+        value,
+    } = input;
+    let owner_hex = ptb_signer_pubkey_hex();
+    let before_ids = owned_coin_ids(client, &owner_hex).await?;
+    let ptb = PtbTx {
+        signers: vec![ptb_signer_pubkey()],
+        commands: vec![
+            fungible_mint_cmd(
+                fungible_hash,
+                mint_cap_id,
+                mint_cap_version,
+                supply_id,
+                *supply_version,
+                value,
+            ),
+            PtbCommand::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                }],
+                owner: Owner::Address(ptb_signer_pubkey()),
+            },
+        ],
+        gas_payer,
+        gas_budget: PTB_GAS_BUDGET,
+        gas_price: 1,
+        expiry_block: PTB_EXPIRY_BLOCK,
+        signatures: vec![],
+    };
+    let receipt = submit_ptb(home, HOST_RPC_PORTS[0], ptb)?;
+    if !receipt
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("canonical fungible mint({value}) reverted: {receipt}");
+    }
+    *supply_version = refresh_object_version(client, supply_id, "Supply<Erased>").await?;
+    let latest = current_height(client).await?;
+    wait_all_reach_height(clients, latest).await?;
+    let mut coins =
+        wait_for_new_owned_coins_with_values(client, &owner_hex, &before_ids, &[value]).await?;
+    coins
+        .pop()
+        .ok_or_else(|| anyhow!("canonical fungible mint({value}) produced no owned coin"))
+}
+
 async fn wait_for_new_owned_coins_with_values(
     client: &RpcClient,
     owner_hex: &str,
@@ -3919,24 +4181,37 @@ async fn wait_for_owned_coin(client: &RpcClient, owner_hex: &str) -> Result<Valu
     }
 }
 
-async fn wait_for_faucet_admin_cap(
+async fn wait_for_owned_object_type(
     client: &RpcClient,
     owner_hex: &str,
-    faucet_hash: bloom_chain_types::types::Hash32,
+    petal_hash: bloom_chain_types::types::Hash32,
+    type_name: &str,
 ) -> Result<Value> {
-    let faucet_hash_hex = hex::encode(faucet_hash.0);
+    let petal_hash_hex = hex::encode(petal_hash.0);
     loop {
         let objs = ls_objects_by_owner(client, owner_hex)
             .await
             .unwrap_or_default();
-        if let Some(cap) = objs.into_iter().find(|o| {
-            o.get("type_name").and_then(Value::as_str) == Some("Capability")
-                && o.get("petal_hash").and_then(Value::as_str) == Some(faucet_hash_hex.as_str())
+        if let Some(obj) = objs.into_iter().find(|o| {
+            o.get("type_name").and_then(Value::as_str) == Some(type_name)
+                && o.get("petal_hash").and_then(Value::as_str) == Some(petal_hash_hex.as_str())
         }) {
-            return Ok(cap);
+            return Ok(obj);
         }
         sleep(Duration::from_millis(250)).await;
     }
+}
+
+async fn refresh_object_version(
+    client: &RpcClient,
+    id: bloom_objects::ObjectId,
+    label: &str,
+) -> Result<u64> {
+    let id_hex = hex::encode(id.0);
+    let obj = query_object(client, &id_hex)
+        .await?
+        .ok_or_else(|| anyhow!("{label} missing: {id_hex}"))?;
+    object_version(&obj)
 }
 
 async fn wait_for_owned_coins(

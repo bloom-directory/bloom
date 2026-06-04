@@ -5,6 +5,8 @@
 //! recipient" stage of a swap pipeline must go through a petal Move export.
 //! `receive` is that settlement stage: it takes a `Coin<Erased>` — typically
 //! the Use-ref output of an upstream swap — and transfers it to `recipient`.
+//! `receive_optional` performs the same settlement for optional refund object
+//! ids without relying on old raw-handle encodings.
 //!
 //! `object.transfer` carries no defining-petal restriction (any petal
 //! holding a valid handle may re-owner the row), so this non-defining wallet
@@ -19,7 +21,7 @@ use bloom_resource_macros as bloom;
 /// `Result`-typed host-side variants, exposed for host-side unit tests and
 /// non-wasm callers (mirrors the `ops` pattern in the fungible/pool petals).
 pub mod ops {
-    use bloom_objects::Owner;
+    use bloom_objects::{AccessMode, ObjectId, Owner};
     use bloom_resource::host;
     use bloom_resource::{PetalError, RuntimeHandle};
 
@@ -28,12 +30,19 @@ pub mod ops {
     pub fn receive(coin_handle: RuntimeHandle, recipient: [u8; 32]) -> Result<(), PetalError> {
         host::object_transfer(coin_handle, &Owner::Address(recipient))
     }
+
+    /// Transfer the coin at `coin_id` to `recipient`.
+    pub fn receive_id(coin_id: ObjectId, recipient: [u8; 32]) -> Result<(), PetalError> {
+        let handle = host::object_borrow(&coin_id, AccessMode::Consume)?;
+        receive(handle, recipient)
+    }
 }
 
 /// Petal entry points for `/bloom/petals/dex/wallet`.
 #[bloom::petal(path = "/bloom/petals/dex/wallet", version = "0.1.0")]
 pub mod wallet {
     use crate::ops;
+    use bloom_objects::ObjectId;
     use bloom_resource::{Coin, Erased};
 
     /// 32-byte chain address — the recipient of a settled coin. Kept as a
@@ -48,5 +57,12 @@ pub mod wallet {
     /// output threaded in via a PTB Use-ref).
     pub fn receive(coin: Coin<Erased>, recipient: Address) {
         ops::receive(coin.handle(), recipient).expect("receive host failure");
+    }
+
+    /// Settle an optional coin object id to `recipient`.
+    pub fn receive_optional(coin_id: Option<ObjectId>, recipient: Address) {
+        if let Some(coin_id) = coin_id {
+            ops::receive_id(coin_id, recipient).expect("receive_optional host failure");
+        }
     }
 }

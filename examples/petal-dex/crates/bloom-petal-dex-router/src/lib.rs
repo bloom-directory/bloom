@@ -94,7 +94,7 @@ pub mod ops {
     use bloom_dex_math::SwapStrategy;
     use bloom_objects::{ObjectId, TypeTag};
     use bloom_petal_dex_pool::{ParamCodec, payload};
-    use bloom_resource::{RuntimeHandle, abi::RetWriter, host};
+    use bloom_resource::{RuntimeHandle, host};
 
     use crate::RouterError;
 
@@ -152,24 +152,16 @@ pub mod ops {
 
     // ── Coin helpers ─────────────────────────────────────────────────────────
 
-    /// Decode the `u128` value field (bytes 32..48) of a `Coin<T>` payload.
+    /// Decode the `u128` value field of a `Coin<T>` payload.
     ///
-    /// `Coin<T>` layout: `id (32 bytes BE) | value (16 bytes BE)`.
+    /// `Coin<T>` layout: `value (16 bytes BE)`.
     pub fn decode_coin_value(bytes: &[u8]) -> Result<u128, RouterError> {
-        if bytes.len() < 48 {
-            return Err(RouterError::EmptyInput);
-        }
-        let mut buf = [0u8; 16];
-        buf.copy_from_slice(&bytes[32..48]);
-        Ok(u128::from_be_bytes(buf))
+        bloom_petal_fungible::ops::decode_coin_value(bytes).map_err(|_| RouterError::EmptyInput)
     }
 
-    /// Build a `Coin<T>` payload with a zero id placeholder and the given value.
+    /// Build a `Coin<T>` payload with the given value.
     pub fn coin_payload(value: u128) -> Vec<u8> {
-        let mut w = RetWriter::with_capacity(48);
-        w.write_object_id(&ObjectId([0u8; 32]));
-        w.write_u128(value);
-        w.finish()
+        bloom_petal_fungible::ops::coin_payload(value)
     }
 
     /// Create a new coin with the given value in the borrow table.

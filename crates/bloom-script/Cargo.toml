@@ -9,6 +9,8 @@ description = "Programmable Transaction Block (PTB) wire types, canonical codec,
 
 [dependencies]
 bloom-objects.workspace = true
+bloom-value.workspace = true
+bloom-resource.workspace = true
 bloom-chain-types.workspace = true
 blake3.workspace = true
 thiserror.workspace = true

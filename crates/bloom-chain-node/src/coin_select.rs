@@ -94,7 +94,11 @@ pub fn select_coin_loom(
     coins.sort_by_key(|&(_, v)| v);
 
     // 3. Greedily pick coins until running total >= amount.
-    let total_available: u128 = coins.iter().map(|(_, v)| v).sum();
+    let total_available = coins.iter().map(|(_, v)| *v).fold(0u128, |acc, value| {
+        acc.checked_add(value)
+            .map(|sum| sum.min(amount))
+            .unwrap_or(amount)
+    });
     if total_available < amount {
         return Err(SelectCoinError::Insufficient {
             have: total_available,
@@ -248,6 +252,19 @@ mod tests {
                 need: 500
             }
         ));
+    }
+
+    #[test]
+    fn selection_total_caps_at_need_without_overflowing() {
+        let mut state = State::new();
+        let alice = addr(0x01);
+        seed_coins(&mut state, alice, &[(0xA0, u128::MAX), (0xA1, 1)]);
+        let snap = state.snapshot();
+
+        let loom_tag = loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH);
+        let sel = select_coin_loom(&snap, alice, u128::MAX, &loom_tag).unwrap();
+        assert_eq!(sel.consumed, vec![ObjectId([0xA1; 32])]);
+        assert_eq!(sel.split_remainder, Some((ObjectId([0xA0; 32]), 1)));
     }
 
     #[test]

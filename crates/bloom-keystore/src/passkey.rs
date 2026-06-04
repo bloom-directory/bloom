@@ -1040,6 +1040,39 @@ fn write_policy_sig(
     )
 }
 
+fn copy_wallet_dir_files(
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> Result<(), KeystoreError> {
+    for entry in std::fs::read_dir(from).map_err(|source| KeystoreError::Io {
+        path: from.to_path_buf(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| KeystoreError::Io {
+            path: from.to_path_buf(),
+            source,
+        })?;
+        let file_type = entry.file_type().map_err(|source| KeystoreError::Io {
+            path: entry.path(),
+            source,
+        })?;
+        if file_type.is_file() {
+            let dest = to.join(entry.file_name());
+            std::fs::copy(entry.path(), &dest)
+                .map_err(|source| KeystoreError::Io { path: dest, source })?;
+        }
+    }
+    Ok(())
+}
+
+fn unique_rebind_backup_dir(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    root.join(format!(".bloom-rebind-backup-{name}-{nanos}"))
+}
+
 // ── impl Keystore — passkey operations ───────────────────────────────────────
 
 impl super::Keystore {
@@ -1331,26 +1364,53 @@ impl super::Keystore {
         let enc_blob_new =
             serde_json::to_vec(&enc_new).map_err(|e| KeystoreError::Malformed(e.to_string()))?;
 
-        // Step 6: Atomic writes — order matters for crash safety.
-        //
-        // `encrypted.key` is written LAST so it acts as the commit point.
-        // Any crash before the final write leaves the old encrypted.key on
-        // disk, which still matches the old prf.salt and passkey.json, so
-        // the original authenticator can still unlock the wallet.
-        //
-        // Write order:
-        //   1. policy.toml / policy.toml.sig  — non-critical; crash here is harmless
-        //   2. passkey.json                   — new credential info
-        //   3. prf.salt                       — new PRF salt
-        //   4. encrypted.key                  — FINAL COMMIT: activates new authentication
-        write_atomic(&dir.join("policy.toml"), final_policy_toml.as_bytes())?;
-        write_policy_sig(&dir, name, &final_policy_toml, &signer)?;
-
+        // Step 6: stage a complete replacement wallet directory, then swap
+        // directory names. The live wallet path should never contain a mixed
+        // old/new passkey triple.
         let passkey_json = serde_json::to_string(&credential)
             .map_err(|e| KeystoreError::Malformed(format!("passkey serialise: {e}")))?;
-        write_atomic(&dir.join("passkey.json"), passkey_json.as_bytes())?;
-        write_atomic(&dir.join("prf.salt"), hex::encode(prf_salt).as_bytes())?;
-        write_atomic(&dir.join("encrypted.key"), &enc_blob_new)?;
+        let tmp_dir = self.inner.root.join(format!(".bloom-rebind-tmp-{name}"));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).map_err(|source| KeystoreError::Io {
+            path: tmp_dir.clone(),
+            source,
+        })?;
+        struct TmpGuard(std::path::PathBuf);
+        impl Drop for TmpGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let tmp_guard = TmpGuard(tmp_dir.clone());
+
+        copy_wallet_dir_files(&dir, &tmp_dir)?;
+        write_atomic(&tmp_dir.join("policy.toml"), final_policy_toml.as_bytes())?;
+        write_policy_sig(&tmp_dir, name, &final_policy_toml, &signer)?;
+        write_atomic(&tmp_dir.join("passkey.json"), passkey_json.as_bytes())?;
+        write_atomic(&tmp_dir.join("prf.salt"), hex::encode(prf_salt).as_bytes())?;
+        write_atomic(&tmp_dir.join("encrypted.key"), &enc_blob_new)?;
+
+        let backup_dir = unique_rebind_backup_dir(&self.inner.root, name);
+        std::fs::rename(&dir, &backup_dir).map_err(|source| KeystoreError::Io {
+            path: backup_dir.clone(),
+            source,
+        })?;
+        if let Err(source) = std::fs::rename(&tmp_dir, &dir) {
+            let rollback_result = std::fs::rename(&backup_dir, &dir);
+            if let Err(rollback_source) = rollback_result {
+                tracing::error!(
+                    wallet = name,
+                    backup = %backup_dir.display(),
+                    err = %rollback_source,
+                    "keystore.passkey_rebind rollback failed; old wallet preserved at backup path"
+                );
+            }
+            return Err(KeystoreError::Io {
+                path: dir.clone(),
+                source,
+            });
+        }
+        std::mem::forget(tmp_guard);
 
         // Step 7: Show recovery key in browser; fall back to terminal if needed.
         let recovery_key = recovery_key_field(name, &signer).await;

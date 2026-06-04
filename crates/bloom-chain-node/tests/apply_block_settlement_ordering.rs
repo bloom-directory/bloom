@@ -98,7 +98,7 @@ fn fund(state: &mut State, addr: Address, loom: u128) {
 
 fn balance_of(state: &State, addr: &Address) -> u128 {
     resolve_loom_coin_type(state)
-        .map(|coin_type| coin_loom_balance(state, *addr, &coin_type))
+        .and_then(|coin_type| coin_loom_balance(state, *addr, &coin_type).ok())
         .unwrap_or(0)
 }
 

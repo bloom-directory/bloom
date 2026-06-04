@@ -87,7 +87,7 @@ mod tests {
 
     fn sample_manifest() -> PetalManifestV0 {
         PetalManifestV0 {
-            schema_version: 1,
+            schema_version: crate::types::SCHEMA_VERSION,
             module_path: "/bloom/test/x".into(),
             framework_version: SemVer::new(0, 1, 0),
             ..Default::default()

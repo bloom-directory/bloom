@@ -58,6 +58,7 @@ fn scope(ra: u128, rb: u128, k_before: u128, lp_before: u128, lp_after: u128) ->
 fn run_inv(wasm: &[u8], scope: &[u8]) -> (u8, u64) {
     let input = ChainCallInput {
         wasm: wasm.to_vec(),
+        external_manifests: Vec::new(),
         entry: ChainEntry::Function("__inv_0".to_string()),
         contract_address: Address([0x01; 32]),
         msg_sender: Address([0x02; 32]),

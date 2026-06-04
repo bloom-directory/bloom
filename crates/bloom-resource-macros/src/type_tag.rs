@@ -1,14 +1,13 @@
 //! `syn::Type` → `bloom_objects::TypeTag` lowering used by every macro
 //! to record field / argument / return shapes in the manifest.
 //!
-//! All `Concrete` TypeTags use `[0u8; 32]` as the `petal_hash`: the
-//! macro cannot know its own crate's wasm hash at expansion time. The
-//! chain layer replaces these placeholders with the actual hash on
-//! publish (spec §8.3, §8.2 paragraph about self-references).
+//! Petal-defined `Concrete` TypeTags use `[0u8; 32]` as the `petal_hash`:
+//! the macro cannot know its own crate's wasm hash at expansion time. Built-in
+//! primitives/containers use `BUILTIN_TYPE_HASH`.
 
 use std::collections::HashMap;
 
-use bloom_objects::TypeTag;
+use bloom_objects::{BUILTIN_TYPE_HASH, TypeTag};
 use syn::{GenericArgument, PathArguments, Type, TypePath};
 
 use crate::error::err_spanned;
@@ -46,9 +45,10 @@ impl TypeTagCtx {
     ///
     /// Rules (spec §8.2 / §11.2):
     /// - `T` (a generic name in scope) → `TypeTag::Generic { idx }`.
-    /// - `SomeName<A, B>` (concrete path) → `TypeTag::Concrete { petal_hash:
-    ///   [0; 32] (self), type_name, type_args }`.
-    /// - References, slices, tuples, fn pointers, etc. are rejected.
+    /// - `SomeName<A, B>` (concrete path) → `TypeTag::Concrete`.
+    /// - Built-ins are stamped with `BUILTIN_TYPE_HASH`; petal-defined types use
+    ///   `[0; 32]` until publish-time self-reference stamping.
+    /// - References are stripped; unsupported Rust type forms are rejected.
     pub fn lower(&self, ty: &Type) -> syn::Result<TypeTag> {
         // Strip a single layer of `&` / `&mut` so callers can pass the
         // raw arg type and we apply consistent rules.
@@ -57,29 +57,44 @@ impl TypeTagCtx {
             other => other,
         };
 
+        if let Type::Tuple(tuple) = inner {
+            let type_args = tuple
+                .elems
+                .iter()
+                .map(|elem| self.lower(elem))
+                .collect::<syn::Result<Vec<_>>>()?;
+            return Ok(TypeTag::Concrete {
+                petal_hash: BUILTIN_TYPE_HASH,
+                type_name: "tuple".to_string(),
+                type_args,
+            });
+        }
+
         let path = match inner {
             Type::Path(TypePath { path, qself: None }) => path,
             _ => {
                 return Err(err_spanned(
                     ty,
-                    "only path types are supported in object fields / function args",
+                    "only path and tuple types are supported in object fields / function args",
                 ));
             }
         };
 
         // We always look at the last path segment for the type name.
-        // We *also* reject anything that isn't a single-segment path
-        // (no `::` qualification) because the macro emits the bare type
-        // name into the manifest and the chain resolves it within the
-        // same petal scope.
-        if path.segments.len() != 1 {
+        // Arbitrary qualified petal-local types remain rejected because
+        // the manifest records the bare in-petal name. Qualified
+        // framework wrappers are allowed so signatures can disambiguate
+        // a handle wrapper from an object schema with the same logical
+        // name, e.g. `bloom_resource::Coin<T>` inside the fungible petal
+        // that declares the `Coin<T>` object.
+        if path.segments.len() != 1 && !is_qualified_framework_wrapper(path) {
             return Err(err_spanned(
                 ty,
                 "qualified paths are not supported; use the unqualified type name",
             ));
         }
 
-        let seg = path.segments.first().expect("checked len == 1");
+        let seg = path.segments.last().expect("path has at least one segment");
         let name = seg.ident.to_string();
 
         // Bare generic reference: `T`, where `T` is in scope.
@@ -87,9 +102,12 @@ impl TypeTagCtx {
             if let Some(idx) = self.generic_idx.get(&name) {
                 return Ok(TypeTag::Generic { idx: *idx });
             }
+            let (petal_hash, type_name) = builtin_type_name(&name)
+                .map(|builtin| (BUILTIN_TYPE_HASH, builtin.to_string()))
+                .unwrap_or(([0u8; 32], name));
             return Ok(TypeTag::Concrete {
-                petal_hash: [0u8; 32],
-                type_name: name,
+                petal_hash,
+                type_name,
                 type_args: Vec::new(),
             });
         }
@@ -115,52 +133,145 @@ impl TypeTagCtx {
             }
         }
 
+        let (petal_hash, type_name) = builtin_type_name(&name)
+            .map(|builtin| (BUILTIN_TYPE_HASH, builtin.to_string()))
+            .unwrap_or(([0u8; 32], name));
         Ok(TypeTag::Concrete {
-            petal_hash: [0u8; 32],
-            type_name: name,
+            petal_hash,
+            type_name,
             type_args,
         })
     }
 }
 
-/// Reject plain generic types in payload positions (spec §11.2: `T` is
-/// only allowed in TypeTag-bearing positions; payload usage must go
-/// through `Resource<T>`).
+fn builtin_type_name(name: &str) -> Option<&'static str> {
+    match name {
+        "bool" => Some("bool"),
+        "u8" => Some("u8"),
+        "u16" => Some("u16"),
+        "u32" => Some("u32"),
+        "u64" => Some("u64"),
+        "u128" => Some("u128"),
+        "Address" => Some("Address"),
+        "address" => Some("address"),
+        "ObjectId" => Some("ObjectId"),
+        "Hash32" => Some("Hash32"),
+        "UID" => Some("UID"),
+        "TypeTag" => Some("TypeTag"),
+        "String" => Some("String"),
+        "Bytes" | "bytes" => Some("bytes"),
+        "Option" => Some("Option"),
+        "Result" => Some("Result"),
+        "Vec" | "vector" => Some("vector"),
+        "BTreeMap" | "HashMap" | "map" => Some("map"),
+        "BTreeSet" | "HashSet" | "set" => Some("set"),
+        _ => None,
+    }
+}
+
+fn is_qualified_framework_wrapper(path: &syn::Path) -> bool {
+    let Some(first) = path.segments.first() else {
+        return false;
+    };
+    let Some(last) = path.segments.last() else {
+        return false;
+    };
+    first.ident == "bloom_resource"
+        && matches!(
+            last.ident.to_string().as_str(),
+            "Coin" | "Balance" | "Capability" | "Resource" | "Bytes"
+        )
+}
+
+/// Reject generic types in payload positions (spec §11.2: `T` is only
+/// allowed in TypeTag-bearing positions; payload usage must go through
+/// `Resource<T>`).
 ///
-/// Returns `Ok(())` if `ty` is not a plain generic reference, or if it
-/// *is* but does not appear in `non_phantom`. Returns `Err` if `ty` is
-/// a plain non-phantom generic that the caller therefore needs to wrap.
+/// Returns `Ok(())` if `ty` contains no non-phantom generic payload use.
+/// Returns `Err` if the generic appears directly or nested inside another
+/// payload type. Bloom wrappers such as `Resource<T>` and `Capability<T>`
+/// are allowed because they carry the type parameter in the type tag rather
+/// than encoding a generic `T` payload field.
 pub(crate) fn reject_plain_generic_in_payload(
     ty: &Type,
     non_phantom: &[String],
 ) -> syn::Result<()> {
-    // Walk through one reference layer (`&T`).
-    let inner = match ty {
-        Type::Reference(r) => r.elem.as_ref(),
-        other => other,
+    reject_generic_payload_inner(ty, non_phantom)
+}
+
+fn reject_generic_payload_inner(ty: &Type, non_phantom: &[String]) -> syn::Result<()> {
+    match ty {
+        Type::Reference(r) => reject_generic_payload_inner(&r.elem, non_phantom),
+        Type::Tuple(tuple) => tuple
+            .elems
+            .iter()
+            .try_for_each(|elem| reject_generic_payload_inner(elem, non_phantom)),
+        Type::Paren(paren) => reject_generic_payload_inner(&paren.elem, non_phantom),
+        Type::Group(group) => reject_generic_payload_inner(&group.elem, non_phantom),
+        Type::Path(TypePath { path, qself: None }) if is_generic_payload_wrapper_path(path) => {
+            Ok(())
+        }
+        Type::Path(TypePath { path, qself: None }) => {
+            if path.segments.len() == 1 {
+                let seg = path.segments.first().expect("checked len == 1");
+                if matches!(seg.arguments, PathArguments::None) {
+                    let name = seg.ident.to_string();
+                    if non_phantom.iter().any(|n| n == &name) {
+                        return generic_payload_err(ty, &name);
+                    }
+                }
+            }
+            for segment in &path.segments {
+                match &segment.arguments {
+                    PathArguments::None => {}
+                    PathArguments::AngleBracketed(args) => {
+                        for arg in &args.args {
+                            if let GenericArgument::Type(inner) = arg {
+                                reject_generic_payload_inner(inner, non_phantom)?;
+                            }
+                        }
+                    }
+                    PathArguments::Parenthesized(args) => {
+                        for input in &args.inputs {
+                            reject_generic_payload_inner(input, non_phantom)?;
+                        }
+                        if let syn::ReturnType::Type(_, output) = &args.output {
+                            reject_generic_payload_inner(output, non_phantom)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn generic_payload_err(ty: &Type, name: &str) -> syn::Result<()> {
+    Err(err_spanned(
+        ty,
+        format!(
+            "plain generic `{}` is not allowed in field/arg position; \
+             wrap with `Resource<{}>` (spec §11.2)",
+            name, name
+        ),
+    ))
+}
+
+fn is_generic_payload_wrapper_path(path: &syn::Path) -> bool {
+    let Some(seg) = path.segments.last() else {
+        return false;
     };
-    let Type::Path(TypePath { path, qself: None }) = inner else {
-        return Ok(());
-    };
-    if path.segments.len() != 1 {
-        return Ok(());
+    if !matches!(
+        seg.ident.to_string().as_str(),
+        "Resource" | "Capability" | "Coin" | "Balance"
+    ) {
+        return false;
     }
-    let seg = path.segments.first().expect("checked len == 1");
-    if !matches!(seg.arguments, PathArguments::None) {
-        return Ok(());
+    if path.segments.len() > 1 && !is_qualified_framework_wrapper(path) {
+        return false;
     }
-    let name = seg.ident.to_string();
-    if non_phantom.iter().any(|n| n == &name) {
-        return Err(err_spanned(
-            ty,
-            format!(
-                "plain generic `{}` is not allowed in field/arg position; \
-                 wrap with `Resource<{}>` (spec §11.2)",
-                name, name
-            ),
-        ));
-    }
-    Ok(())
+    matches!(seg.arguments, PathArguments::AngleBracketed(_))
 }
 
 /// If `ty` (after stripping one `&`/`&mut` layer) is `Resource<Inner>`,
@@ -323,10 +434,103 @@ mod tests {
     }
 
     #[test]
-    fn tuple_rejected() {
+    fn qualified_framework_coin_lowers_by_last_segment() {
+        let ty: Type = syn::parse2(quote! { bloom_resource::Coin<T> }).unwrap();
+        let ctx = TypeTagCtx::from_generic_names(["T"]);
+        match ctx.lower(&ty).unwrap() {
+            TypeTag::Concrete {
+                petal_hash,
+                type_name,
+                type_args,
+            } => {
+                assert_eq!(petal_hash, [0u8; 32]);
+                assert_eq!(type_name, "Coin");
+                assert_eq!(type_args, vec![TypeTag::Generic { idx: 0 }]);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tuple_lowers_to_builtin_tuple() {
         let ty: Type = syn::parse2(quote! { (u8, u8) }).unwrap();
         let ctx = TypeTagCtx::default();
-        assert!(ctx.lower(&ty).is_err());
+        match ctx.lower(&ty).unwrap() {
+            TypeTag::Concrete {
+                petal_hash,
+                type_name,
+                type_args,
+            } => {
+                assert_eq!(petal_hash, BUILTIN_TYPE_HASH);
+                assert_eq!(type_name, "tuple");
+                assert_eq!(type_args.len(), 2);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn primitive_lowers_to_builtin_hash() {
+        match lower(quote! { u64 }, &[]) {
+            TypeTag::Concrete {
+                petal_hash,
+                type_name,
+                type_args,
+            } => {
+                assert_eq!(petal_hash, BUILTIN_TYPE_HASH);
+                assert_eq!(type_name, "u64");
+                assert!(type_args.is_empty());
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vec_lowers_to_builtin_vector() {
+        match lower(quote! { Vec<String> }, &[]) {
+            TypeTag::Concrete {
+                petal_hash,
+                type_name,
+                type_args,
+            } => {
+                assert_eq!(petal_hash, BUILTIN_TYPE_HASH);
+                assert_eq!(type_name, "vector");
+                assert_eq!(type_args.len(), 1);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bytes_lowers_to_builtin_bytes() {
+        match lower(quote! { Bytes }, &[]) {
+            TypeTag::Concrete {
+                petal_hash,
+                type_name,
+                type_args,
+            } => {
+                assert_eq!(petal_hash, BUILTIN_TYPE_HASH);
+                assert_eq!(type_name, "bytes");
+                assert!(type_args.is_empty());
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn qualified_bytes_lowers_to_builtin_bytes() {
+        match lower(quote! { bloom_resource::Bytes }, &[]) {
+            TypeTag::Concrete {
+                petal_hash,
+                type_name,
+                type_args,
+            } => {
+                assert_eq!(petal_hash, BUILTIN_TYPE_HASH);
+                assert_eq!(type_name, "bytes");
+                assert!(type_args.is_empty());
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]
@@ -344,6 +548,33 @@ mod tests {
     #[test]
     fn reject_plain_generic_in_payload_allows_resource_wrap() {
         let ty: Type = syn::parse2(quote! { Resource<T> }).unwrap();
+        assert!(reject_plain_generic_in_payload(&ty, &["T".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn reject_plain_generic_in_payload_flags_nested_generic_payloads() {
+        for src in [
+            "Option<T>",
+            "Vec<T>",
+            "(u64, T)",
+            "BTreeMap<T, u64>",
+            "Foo<T>",
+        ] {
+            let ty: Type = syn::parse_str(src).unwrap();
+            assert!(
+                reject_plain_generic_in_payload(&ty, &["T".to_string()]).is_err(),
+                "expected nested generic payload to be rejected: {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_plain_generic_in_payload_allows_nested_resource_wrap() {
+        let ty: Type = syn::parse2(quote! { Option<Resource<T>> }).unwrap();
+        assert!(reject_plain_generic_in_payload(&ty, &["T".to_string()]).is_ok());
+        let ty: Type = syn::parse2(quote! { Capability<MintCap<T>> }).unwrap();
+        assert!(reject_plain_generic_in_payload(&ty, &["T".to_string()]).is_ok());
+        let ty: Type = syn::parse2(quote! { bloom_resource::Coin<T> }).unwrap();
         assert!(reject_plain_generic_in_payload(&ty, &["T".to_string()]).is_ok());
     }
 

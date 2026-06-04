@@ -148,10 +148,21 @@ fn inv_outcome_to_record(o: &bloom_script::InvariantOutcome) -> InvariantRecord 
     }
 }
 
-fn next_object_version(version: u64) -> u64 {
+fn next_object_version(id: ObjectId, version: u64) -> Result<u64, PtbError> {
     version
         .checked_add(1)
-        .expect("object version must not overflow u64")
+        .ok_or(PtbError::ObjectVersionOverflow { id, version })
+}
+
+fn version_overflow_output(error: PtbError, fuel_used: u64) -> ExecOutput {
+    ExecOutput {
+        success: false,
+        fuel_used,
+        return_data: format!("ptb execution error: {error}").into_bytes(),
+        logs: vec![],
+        invariant_outcomes: Vec::new(),
+        write_set: None,
+    }
 }
 
 pub(crate) fn validate_chain_petal_admission(
@@ -962,7 +973,8 @@ fn execute_tx_impl(
                                 let new_payload = rewrite_value(&gas_obj.payload, debited)
                                     .expect("rewrite Coin<LOOM> payload");
                                 let mut debited_obj = gas_obj.clone();
-                                debited_obj.version = next_object_version(debited_obj.version);
+                                debited_obj.version =
+                                    next_object_version(debited_obj.id, debited_obj.version)?;
                                 debited_obj.payload = new_payload;
                                 snapshot.insert_object(debited_obj);
                             }
@@ -1045,7 +1057,13 @@ fn execute_tx_impl(
                                 .expect("reservation bounds debit");
                             debited.payload = rewrite_value(&debited.payload, new_value)
                                 .expect("rewrite coin payload");
-                            debited.version = next_object_version(debited.version);
+                            debited.version = match next_object_version(debited.id, debited.version)
+                            {
+                                Ok(version) => version,
+                                Err(e) => {
+                                    return version_overflow_output(e, revert_charged_fuel);
+                                }
+                            };
                             gas_snap.insert_object(debited);
                             if let Err(e) = mint_coin_loom_to(
                                 &mut gas_snap,
@@ -1117,7 +1135,13 @@ fn execute_tx_impl(
                                     .expect("reservation bounds debit");
                                 debited.payload = rewrite_value(&debited.payload, new_value)
                                     .expect("rewrite coin payload");
-                                debited.version = next_object_version(debited.version);
+                                debited.version =
+                                    match next_object_version(debited.id, debited.version) {
+                                        Ok(version) => version,
+                                        Err(e) => {
+                                            return version_overflow_output(e, revert_charged_fuel);
+                                        }
+                                    };
                                 gas_snap.insert_object(debited);
                                 if let Err(e) = mint_coin_loom_to(
                                     &mut gas_snap,
@@ -1158,7 +1182,13 @@ fn execute_tx_impl(
                                     .expect("reservation bounds debit");
                                 debited.payload = rewrite_value(&debited.payload, new_value)
                                     .expect("rewrite coin payload");
-                                debited.version = next_object_version(debited.version);
+                                debited.version =
+                                    match next_object_version(debited.id, debited.version) {
+                                        Ok(version) => version,
+                                        Err(e) => {
+                                            return version_overflow_output(e, revert_charged_fuel);
+                                        }
+                                    };
                                 gas_snap.insert_object(debited);
                                 if let Err(e) = mint_coin_loom_to(
                                     &mut gas_snap,
@@ -1201,7 +1231,13 @@ fn execute_tx_impl(
                                     .expect("reservation bounds debit");
                                 debited.payload = rewrite_value(&debited.payload, new_value)
                                     .expect("rewrite coin payload");
-                                debited.version = next_object_version(debited.version);
+                                debited.version =
+                                    match next_object_version(debited.id, debited.version) {
+                                        Ok(version) => version,
+                                        Err(e) => {
+                                            return version_overflow_output(e, revert_charged_fuel);
+                                        }
+                                    };
                                 gas_snap.insert_object(debited);
                                 if let Err(e) = mint_coin_loom_to(
                                     &mut gas_snap,
@@ -1241,7 +1277,16 @@ fn execute_tx_impl(
                                         .expect("reservation bounds debit");
                                     debited.payload = rewrite_value(&debited.payload, new_value)
                                         .expect("rewrite coin payload");
-                                    debited.version = next_object_version(debited.version);
+                                    debited.version =
+                                        match next_object_version(debited.id, debited.version) {
+                                            Ok(version) => version,
+                                            Err(e) => {
+                                                return version_overflow_output(
+                                                    e,
+                                                    revert_charged_fuel,
+                                                );
+                                            }
+                                        };
                                     gas_snap.insert_object(debited);
                                     if let Err(e) = mint_coin_loom_to(
                                         &mut gas_snap,
@@ -1281,7 +1326,13 @@ fn execute_tx_impl(
                                     .expect("reservation bounds debit");
                                 debited.payload = rewrite_value(&debited.payload, new_value)
                                     .expect("rewrite coin payload");
-                                debited.version = next_object_version(debited.version);
+                                debited.version =
+                                    match next_object_version(debited.id, debited.version) {
+                                        Ok(version) => version,
+                                        Err(e) => {
+                                            return version_overflow_output(e, revert_charged_fuel);
+                                        }
+                                    };
                                 gas_snap.insert_object(debited);
                                 if let Err(e) = mint_coin_loom_to(
                                     &mut gas_snap,
@@ -1321,7 +1372,16 @@ fn execute_tx_impl(
                                         .expect("reservation bounds debit");
                                     debited.payload = rewrite_value(&debited.payload, new_value)
                                         .expect("rewrite coin payload");
-                                    debited.version = next_object_version(debited.version);
+                                    debited.version =
+                                        match next_object_version(debited.id, debited.version) {
+                                            Ok(version) => version,
+                                            Err(e) => {
+                                                return version_overflow_output(
+                                                    e,
+                                                    revert_charged_fuel,
+                                                );
+                                            }
+                                        };
                                     gas_snap.insert_object(debited);
                                     if let Err(e) = mint_coin_loom_to(
                                         &mut gas_snap,
@@ -1364,7 +1424,13 @@ fn execute_tx_impl(
                                     .expect("reservation bounds debit");
                                 debited.payload = rewrite_value(&debited.payload, new_value)
                                     .expect("rewrite coin payload");
-                                debited.version = next_object_version(debited.version);
+                                debited.version =
+                                    match next_object_version(debited.id, debited.version) {
+                                        Ok(version) => version,
+                                        Err(e) => {
+                                            return version_overflow_output(e, revert_charged_fuel);
+                                        }
+                                    };
                                 gas_snap.insert_object(debited);
                                 if let Err(e) = mint_coin_loom_to(
                                     &mut gas_snap,
@@ -1430,7 +1496,18 @@ fn execute_tx_impl(
                                     match rewrite_value(&current.payload, new_value) {
                                         Ok(new_payload) => {
                                             current.payload = new_payload;
-                                            current.version = next_object_version(current.version);
+                                            current.version = match next_object_version(
+                                                current.id,
+                                                current.version,
+                                            ) {
+                                                Ok(version) => version,
+                                                Err(e) => {
+                                                    return version_overflow_output(
+                                                        e,
+                                                        charged_fuel,
+                                                    );
+                                                }
+                                            };
                                             snapshot.insert_object(current);
                                         }
                                         Err(e) => warn!(
@@ -1543,7 +1620,7 @@ pub(crate) fn apply_coin_loom_transfer_with_domain(
         && let Some(mut obj) = snap.get_object(&id)
     {
         obj.payload = coin_payload(new_value);
-        obj.version = next_object_version(obj.version);
+        obj.version = next_object_version(obj.id, obj.version).map_err(|e| e.to_string())?;
         snap.insert_object(obj);
         // The split coin stays in sender_owned — we keep it.
     }
@@ -1601,14 +1678,9 @@ pub(crate) fn mint_coin_loom_to(
     if amount == 0 {
         return Ok(());
     }
-    let new_coin_id = {
-        let mut h = blake3::Hasher::new();
-        h.update(domain);
-        h.update(&seed_hash.0);
-        h.update(&to.0);
-        h.update(&amount.to_be_bytes());
-        ObjectId(*h.finalize().as_bytes())
-    };
+    let payload = coin_payload(amount);
+    let creation_seed = loom_mint_creation_seed(domain, seed_hash, to, amount);
+    let new_coin_id = ObjectId::derive_for_type_tag(&creation_seed, 0, &coin_type, &payload);
 
     if snap.get_object(&new_coin_id).is_some() {
         return Err(format!(
@@ -1622,7 +1694,7 @@ pub(crate) fn mint_coin_loom_to(
         type_tag: coin_type,
         owner: Owner::Address(to.0),
         version: 0,
-        payload: coin_payload(amount),
+        payload,
     };
     snap.insert_object(new_coin);
 
@@ -1635,6 +1707,17 @@ pub(crate) fn mint_coin_loom_to(
     to_owned.insert(pos, new_coin_id);
     snap.set_ownership(to_okey, to_owned);
     Ok(())
+}
+
+fn loom_mint_creation_seed(domain: &[u8], seed_hash: &Hash32, to: Address, amount: u128) -> Hash32 {
+    let mut h = blake3::Hasher::new();
+    h.update(b"bloom.loom.mint.seed");
+    h.update(&(domain.len() as u64).to_le_bytes());
+    h.update(domain);
+    h.update(&seed_hash.0);
+    h.update(&to.0);
+    h.update(&amount.to_be_bytes());
+    Hash32(*h.finalize().as_bytes())
 }
 
 #[cfg(test)]

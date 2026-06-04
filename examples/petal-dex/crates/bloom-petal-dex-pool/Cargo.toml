@@ -15,6 +15,11 @@ bloom-resource = { workspace = true }
 bloom-resource-macros = { workspace = true }
 bloom-objects = { workspace = true }
 bloom-dex-math = { workspace = true }
+bloom-petal-fungible = { workspace = true, features = ["no-entrypoint"] }
+
+[dev-dependencies]
+bloom-petal-manifest = { workspace = true }
+bloom-value = { workspace = true }
 
 [features]
 default = []

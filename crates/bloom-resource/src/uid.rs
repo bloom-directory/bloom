@@ -7,7 +7,10 @@
 //! if the underlying representation gains derivation helpers later
 //! (e.g. v1 deterministic-id derivation from a fresh nonce).
 
-use bloom_objects::ObjectId;
+use bloom_objects::{ObjectId, TypeTag};
+
+use crate::abi::AbiError;
+use crate::resource::{BloomType, PRIMITIVE_PETAL_HASH};
 
 /// Object-id field wrapper.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default, Ord, PartialOrd)]
@@ -50,6 +53,46 @@ impl From<ObjectId> for UID {
 impl From<UID> for ObjectId {
     fn from(uid: UID) -> Self {
         uid.0
+    }
+}
+
+impl BloomType for UID {
+    fn canonical_encode(&self) -> Vec<u8> {
+        self.0.0.to_vec()
+    }
+
+    fn canonical_decode(buf: &[u8]) -> Result<Self, AbiError> {
+        if buf.len() != 32 {
+            return Err(AbiError::UnexpectedEof {
+                needed: 32,
+                available: buf.len(),
+            });
+        }
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(buf);
+        Ok(Self(ObjectId(bytes)))
+    }
+
+    fn canonical_decode_from(buf: &mut &[u8]) -> Result<Self, AbiError> {
+        if buf.len() < 32 {
+            return Err(AbiError::UnexpectedEof {
+                needed: 32,
+                available: buf.len(),
+            });
+        }
+        let (head, tail) = buf.split_at(32);
+        *buf = tail;
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(head);
+        Ok(Self(ObjectId(bytes)))
+    }
+
+    fn type_tag() -> TypeTag {
+        TypeTag::Concrete {
+            petal_hash: PRIMITIVE_PETAL_HASH,
+            type_name: "UID".to_string(),
+            type_args: Vec::new(),
+        }
     }
 }
 

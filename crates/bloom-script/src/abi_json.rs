@@ -3,9 +3,16 @@
 //! This module intentionally sits beside the PTB wire codec so RPC, CLI and
 //! tests use one TypeTag-driven mapping between human JSON and canonical bytes.
 
-use bloom_objects::{TypeTag, ValidationOutcome, validate_canonical_bytes};
+use bloom_objects::{BUILTIN_TYPE_HASH, TypeTag};
+use bloom_value::{
+    BuiltinResolver, CodecLimits, ValueCodecError, decode_json as decode_value_json,
+    encode_json as encode_value_json, type_tag_label,
+};
 use serde_json::{Value, json};
 use thiserror::Error;
+
+use crate::chain_iface::PetalManifestStub;
+use crate::value_validation::{ManifestLoader, StubResolver, effective_return_slot_tag};
 
 /// Error returned while converting typed JSON to or from canonical ABI bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -47,23 +54,82 @@ pub enum JsonAbiError {
 
 /// Convert typed JSON to canonical bytes for a declared TypeTag.
 pub fn decode_json_const(tag: &TypeTag, value: &Value) -> Result<Vec<u8>, JsonAbiError> {
-    let bytes = encode_value(tag, value)?;
-    match validate_canonical_bytes(tag, &bytes) {
-        ValidationOutcome::Ok | ValidationOutcome::Unknown => Ok(bytes),
-        ValidationOutcome::Invalid(reason) => Err(JsonAbiError::InvalidCanonical {
-            type_tag: type_tag_label(tag),
-            reason: reason.to_string(),
-        }),
-    }
+    let tag = normalize_builtin_tag(tag);
+    encode_value_json(&BuiltinResolver, &tag, value, &CodecLimits::default())
+        .map_err(|e| map_value_error(&tag, e))
+}
+
+/// Convert typed JSON to canonical bytes for a declared TypeTag using a petal
+/// manifest to resolve custom structs/enums and generic self references.
+pub fn decode_json_const_with_manifest(
+    manifest: &PetalManifestStub,
+    self_hash: [u8; 32],
+    tag: &TypeTag,
+    value: &Value,
+) -> Result<Vec<u8>, JsonAbiError> {
+    decode_json_const_with_manifest_loader(manifest, self_hash, tag, value, None)
+}
+
+/// Convert typed JSON to canonical bytes using a petal manifest plus a loader
+/// for external petal manifests referenced by `external_type_refs`.
+pub fn decode_json_const_with_manifest_loader(
+    manifest: &PetalManifestStub,
+    self_hash: [u8; 32],
+    tag: &TypeTag,
+    value: &Value,
+    load_manifest: Option<&ManifestLoader<'_>>,
+) -> Result<Vec<u8>, JsonAbiError> {
+    let resolver =
+        StubResolver::with_self_hash_and_manifest_loader(manifest, self_hash, load_manifest);
+    let tag = resolver
+        .resolve_declared_tag(tag)
+        .map_err(|e| map_value_error(tag, e))?;
+    encode_value_json(&resolver, &tag, value, &CodecLimits::default())
+        .map_err(|e| map_value_error(&tag, e))
 }
 
 /// Decode one return slot. Unknown/custom types degrade to `Ok(None)` so callers
 /// can still surface the raw slot.
 pub fn decode_return_json(tag: &TypeTag, bytes: &[u8]) -> Result<Option<Value>, JsonAbiError> {
-    decode_value(tag, bytes).map(Some).or_else(|err| match err {
-        JsonAbiError::UnsupportedType(_) => Ok(None),
-        other => Err(other),
-    })
+    let tag = normalize_builtin_tag(tag);
+    decode_value_json(&BuiltinResolver, &tag, bytes, &CodecLimits::default())
+        .map(Some)
+        .map_err(|e| map_value_error(&tag, e))
+        .or_else(|err| match err {
+            JsonAbiError::UnsupportedType(_) => Ok(None),
+            other => Err(other),
+        })
+}
+
+/// Decode one return slot using a petal manifest to resolve custom return
+/// shapes. Object-handle returns are decoded using the same effective type that
+/// return-slot validation applies.
+pub fn decode_return_json_with_manifest(
+    manifest: &PetalManifestStub,
+    self_hash: [u8; 32],
+    tag: &TypeTag,
+    bytes: &[u8],
+) -> Result<Value, JsonAbiError> {
+    decode_return_json_with_manifest_loader(manifest, self_hash, tag, bytes, None)
+}
+
+/// Decode one return slot using a petal manifest plus a loader for external
+/// petal manifests referenced by `external_type_refs`.
+pub fn decode_return_json_with_manifest_loader(
+    manifest: &PetalManifestStub,
+    self_hash: [u8; 32],
+    tag: &TypeTag,
+    bytes: &[u8],
+    load_manifest: Option<&ManifestLoader<'_>>,
+) -> Result<Value, JsonAbiError> {
+    let tag = effective_return_slot_tag(manifest, tag);
+    let resolver =
+        StubResolver::with_self_hash_and_manifest_loader(manifest, self_hash, load_manifest);
+    let tag = resolver
+        .resolve_declared_tag(&tag)
+        .map_err(|e| map_value_error(&tag, e))?;
+    decode_value_json(&resolver, &tag, bytes, &CodecLimits::default())
+        .map_err(|e| map_value_error(&tag, e))
 }
 
 /// Decode a TypeTag from JSON.
@@ -93,7 +159,7 @@ pub fn decode_json_type_tag(value: &Value) -> Result<TypeTag, JsonAbiError> {
                     Some(Value::String(s)) => parse_hex32(s).map_err(|reason| {
                         JsonAbiError::InvalidTypeTag(format!("invalid petal_hash: {reason}"))
                     })?,
-                    None => [0u8; 32],
+                    None => default_type_hash(&type_name),
                     _ => {
                         return Err(JsonAbiError::InvalidTypeTag(
                             "concrete.petal_hash must be a hex string".to_string(),
@@ -112,11 +178,11 @@ pub fn decode_json_type_tag(value: &Value) -> Result<TypeTag, JsonAbiError> {
                     }
                     None => Vec::new(),
                 };
-                Ok(TypeTag::Concrete {
+                Ok(normalize_builtin_tag(&TypeTag::Concrete {
                     petal_hash,
                     type_name,
                     type_args,
-                })
+                }))
             } else if let Some(v) = map.get("generic") {
                 Ok(TypeTag::Generic {
                     idx: u16_from_json(v, "generic")?,
@@ -156,177 +222,6 @@ pub fn encode_type_tag_json(tag: &TypeTag) -> Value {
     }
 }
 
-fn encode_value(tag: &TypeTag, value: &Value) -> Result<Vec<u8>, JsonAbiError> {
-    let TypeTag::Concrete {
-        type_name,
-        type_args,
-        ..
-    } = tag
-    else {
-        return Err(JsonAbiError::UnsupportedType(type_tag_label(tag)));
-    };
-    match (type_name.as_str(), type_args.as_slice()) {
-        ("bool", []) => Ok(vec![
-            value
-                .as_bool()
-                .ok_or_else(|| mismatch(tag, "expected bool"))? as u8,
-        ]),
-        ("u8", []) => Ok(vec![u64_value(tag, value, u8::MAX as u64)? as u8]),
-        ("u16", []) => Ok((u64_value(tag, value, u16::MAX as u64)? as u16)
-            .to_be_bytes()
-            .to_vec()),
-        ("u32", []) => Ok((u64_value(tag, value, u32::MAX as u64)? as u32)
-            .to_be_bytes()
-            .to_vec()),
-        ("u64", []) => Ok(u64_value(tag, value, u64::MAX)?.to_be_bytes().to_vec()),
-        ("u128", []) => Ok(u128_value(tag, value)?.to_be_bytes().to_vec()),
-        ("address" | "Address" | "ObjectId" | "Hash32", []) => {
-            Ok(parse_hex32_json(tag, value)?.to_vec())
-        }
-        ("bytes", []) => Ok(parse_hex_json(tag, value)?),
-        ("string", []) => string_value(tag, value).map(|s| s.into_bytes()),
-        ("String", []) => {
-            let s = string_value(tag, value)?;
-            let len: u16 = s.len().try_into().map_err(|_| JsonAbiError::TypeMismatch {
-                type_tag: type_tag_label(tag),
-                reason: "string exceeds u16 length prefix".to_string(),
-            })?;
-            let mut out = Vec::with_capacity(2 + s.len());
-            out.extend_from_slice(&len.to_be_bytes());
-            out.extend_from_slice(s.as_bytes());
-            Ok(out)
-        }
-        ("TypeTag", []) => decode_json_type_tag(value).and_then(|t| {
-            t.encode_canonical()
-                .map_err(|e| JsonAbiError::InvalidTypeTag(e.to_string()))
-        }),
-        ("vector", [elem]) => encode_vector(tag, elem, value),
-        _ => Err(JsonAbiError::UnsupportedType(type_tag_label(tag))),
-    }
-}
-
-fn decode_value(tag: &TypeTag, bytes: &[u8]) -> Result<Value, JsonAbiError> {
-    let TypeTag::Concrete {
-        type_name,
-        type_args,
-        ..
-    } = tag
-    else {
-        return Err(JsonAbiError::UnsupportedType(type_tag_label(tag)));
-    };
-    match (type_name.as_str(), type_args.as_slice()) {
-        ("bool", []) => {
-            let b = one_byte(tag, bytes)?;
-            match b {
-                0 => Ok(Value::Bool(false)),
-                1 => Ok(Value::Bool(true)),
-                _ => Err(mismatch(tag, "bool byte must be 0 or 1")),
-            }
-        }
-        ("u8", []) => Ok(json!(one_byte(tag, bytes)?)),
-        ("u16", []) => Ok(json!(u16::from_be_bytes(fixed(tag, bytes)?))),
-        ("u32", []) => Ok(json!(u32::from_be_bytes(fixed(tag, bytes)?))),
-        ("u64", []) => Ok(json!(u64::from_be_bytes(fixed(tag, bytes)?).to_string())),
-        ("u128", []) => Ok(json!(u128::from_be_bytes(fixed(tag, bytes)?).to_string())),
-        ("address" | "Address" | "ObjectId" | "Hash32", []) => {
-            let a: [u8; 32] = fixed(tag, bytes)?;
-            Ok(json!(hex::encode(a)))
-        }
-        ("bytes", []) => Ok(json!(hex::encode(bytes))),
-        ("string", []) => core::str::from_utf8(bytes)
-            .map(|s| json!(s))
-            .map_err(|_| mismatch(tag, "invalid utf-8")),
-        ("String", []) => {
-            if bytes.len() < 2 {
-                return Err(mismatch(tag, "missing u16 string length"));
-            }
-            let len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
-            if bytes.len() != 2 + len {
-                return Err(mismatch(tag, "string length prefix does not match payload"));
-            }
-            core::str::from_utf8(&bytes[2..])
-                .map(|s| json!(s))
-                .map_err(|_| mismatch(tag, "invalid utf-8"))
-        }
-        ("TypeTag", []) => {
-            let tag = TypeTag::decode_canonical(bytes)
-                .map_err(|e| JsonAbiError::InvalidTypeTag(e.to_string()))?;
-            Ok(encode_type_tag_json(&tag))
-        }
-        ("vector", [elem]) => decode_vector(tag, elem, bytes),
-        _ => Err(JsonAbiError::UnsupportedType(type_tag_label(tag))),
-    }
-}
-
-fn encode_vector(tag: &TypeTag, elem: &TypeTag, value: &Value) -> Result<Vec<u8>, JsonAbiError> {
-    if fixed_width(elem).is_none() {
-        return Err(JsonAbiError::UnsupportedType(type_tag_label(tag)));
-    }
-    let items = value
-        .as_array()
-        .ok_or_else(|| mismatch(tag, "expected array"))?;
-    let count: u32 = items
-        .len()
-        .try_into()
-        .map_err(|_| mismatch(tag, "vector too long"))?;
-    let mut out = Vec::new();
-    out.extend_from_slice(&count.to_be_bytes());
-    for item in items {
-        out.extend_from_slice(&encode_value(elem, item)?);
-    }
-    Ok(out)
-}
-
-fn decode_vector(tag: &TypeTag, elem: &TypeTag, bytes: &[u8]) -> Result<Value, JsonAbiError> {
-    if bytes.len() < 4 {
-        return Err(mismatch(tag, "vector missing u32 count"));
-    }
-    let count = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-    let Some(width) = fixed_width(elem) else {
-        return Err(JsonAbiError::UnsupportedType(type_tag_label(tag)));
-    };
-    let expected = 4usize
-        .checked_add(
-            count
-                .checked_mul(width)
-                .ok_or_else(|| mismatch(tag, "vector length overflow"))?,
-        )
-        .ok_or_else(|| mismatch(tag, "vector length overflow"))?;
-    if bytes.len() != expected {
-        return Err(mismatch(tag, "vector payload length mismatch"));
-    }
-    let mut out = Vec::with_capacity(count);
-    let mut offset = 4;
-    for _ in 0..count {
-        out.push(decode_value(elem, &bytes[offset..offset + width])?);
-        offset += width;
-    }
-    Ok(Value::Array(out))
-}
-
-fn fixed_width(tag: &TypeTag) -> Option<usize> {
-    let TypeTag::Concrete {
-        type_name,
-        type_args,
-        ..
-    } = tag
-    else {
-        return None;
-    };
-    if !type_args.is_empty() {
-        return None;
-    }
-    match type_name.as_str() {
-        "bool" | "u8" => Some(1),
-        "u16" => Some(2),
-        "u32" => Some(4),
-        "u64" => Some(8),
-        "u128" => Some(16),
-        "address" | "Address" | "ObjectId" | "Hash32" => Some(32),
-        _ => None,
-    }
-}
-
 fn decode_type_tag_string(s: &str) -> Result<TypeTag, JsonAbiError> {
     if let Ok(bytes) = hex::decode(strip_0x(s))
         && let Ok(tag) = TypeTag::decode_canonical(&bytes)
@@ -335,7 +230,7 @@ fn decode_type_tag_string(s: &str) -> Result<TypeTag, JsonAbiError> {
     }
     if let Some(inner) = s.strip_prefix("vector<").and_then(|v| v.strip_suffix('>')) {
         return Ok(TypeTag::Concrete {
-            petal_hash: [0u8; 32],
+            petal_hash: BUILTIN_TYPE_HASH,
             type_name: "vector".to_string(),
             type_args: vec![decode_type_tag_string(inner.trim())?],
         });
@@ -344,65 +239,9 @@ fn decode_type_tag_string(s: &str) -> Result<TypeTag, JsonAbiError> {
         return Err(JsonAbiError::InvalidTypeTag("empty type tag".to_string()));
     }
     Ok(TypeTag::Concrete {
-        petal_hash: [0u8; 32],
+        petal_hash: default_type_hash(s),
         type_name: s.to_string(),
         type_args: Vec::new(),
-    })
-}
-
-fn string_value(tag: &TypeTag, value: &Value) -> Result<String, JsonAbiError> {
-    value
-        .as_str()
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| mismatch(tag, "expected string"))
-}
-
-fn u64_value(tag: &TypeTag, value: &Value, max: u64) -> Result<u64, JsonAbiError> {
-    let n = match value {
-        Value::Number(n) => n
-            .as_u64()
-            .ok_or_else(|| mismatch(tag, "expected unsigned integer"))?,
-        Value::String(s) => s
-            .parse::<u64>()
-            .map_err(|_| mismatch(tag, "expected unsigned integer string"))?,
-        _ => return Err(mismatch(tag, "expected unsigned integer")),
-    };
-    if n > max {
-        return Err(JsonAbiError::IntegerRange(type_tag_label(tag)));
-    }
-    Ok(n)
-}
-
-fn u128_value(tag: &TypeTag, value: &Value) -> Result<u128, JsonAbiError> {
-    match value {
-        Value::Number(n) => n
-            .as_u64()
-            .map(u128::from)
-            .ok_or_else(|| mismatch(tag, "expected unsigned integer")),
-        Value::String(s) => s
-            .parse::<u128>()
-            .map_err(|_| mismatch(tag, "expected unsigned integer string")),
-        _ => Err(mismatch(tag, "expected unsigned integer")),
-    }
-}
-
-fn parse_hex32_json(tag: &TypeTag, value: &Value) -> Result<[u8; 32], JsonAbiError> {
-    let s = value
-        .as_str()
-        .ok_or_else(|| mismatch(tag, "expected hex string"))?;
-    parse_hex32(s).map_err(|reason| JsonAbiError::InvalidHex {
-        type_tag: type_tag_label(tag),
-        reason,
-    })
-}
-
-fn parse_hex_json(tag: &TypeTag, value: &Value) -> Result<Vec<u8>, JsonAbiError> {
-    let s = value
-        .as_str()
-        .ok_or_else(|| mismatch(tag, "expected hex string"))?;
-    hex::decode(strip_0x(s)).map_err(|e| JsonAbiError::InvalidHex {
-        type_tag: type_tag_label(tag),
-        reason: e.to_string(),
     })
 }
 
@@ -428,50 +267,79 @@ fn u16_from_json(value: &Value, label: &str) -> Result<u16, JsonAbiError> {
         .map_err(|_| JsonAbiError::InvalidTypeTag(format!("{label} out of range")))
 }
 
-fn one_byte(tag: &TypeTag, bytes: &[u8]) -> Result<u8, JsonAbiError> {
-    if bytes.len() != 1 {
-        return Err(mismatch(tag, "expected 1 byte"));
-    }
-    Ok(bytes[0])
-}
-
-fn fixed<const N: usize>(tag: &TypeTag, bytes: &[u8]) -> Result<[u8; N], JsonAbiError> {
-    if bytes.len() != N {
-        return Err(mismatch(tag, format!("expected {N} bytes")));
-    }
-    let mut out = [0u8; N];
-    out.copy_from_slice(bytes);
-    Ok(out)
-}
-
-fn mismatch(tag: &TypeTag, reason: impl Into<String>) -> JsonAbiError {
-    JsonAbiError::TypeMismatch {
-        type_tag: type_tag_label(tag),
-        reason: reason.into(),
-    }
-}
-
-fn type_tag_label(tag: &TypeTag) -> String {
+fn normalize_builtin_tag(tag: &TypeTag) -> TypeTag {
     match tag {
         TypeTag::Concrete {
+            petal_hash,
             type_name,
             type_args,
-            ..
-        } if type_args.is_empty() => type_name.clone(),
-        TypeTag::Concrete {
-            type_name,
-            type_args,
-            ..
-        } => {
-            let args = type_args
+        } => TypeTag::Concrete {
+            petal_hash: if is_builtin_name(type_name) {
+                BUILTIN_TYPE_HASH
+            } else {
+                *petal_hash
+            },
+            type_name: type_name.clone(),
+            type_args: type_args
                 .iter()
-                .map(type_tag_label)
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("{type_name}<{args}>")
+                .map(normalize_builtin_tag)
+                .collect::<Vec<_>>(),
+        },
+        TypeTag::Generic { .. } | TypeTag::External { .. } => tag.clone(),
+    }
+}
+
+fn default_type_hash(type_name: &str) -> [u8; 32] {
+    if is_builtin_name(type_name) {
+        BUILTIN_TYPE_HASH
+    } else {
+        [0u8; 32]
+    }
+}
+
+fn is_builtin_name(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "bool"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "Address"
+            | "address"
+            | "ObjectId"
+            | "Hash32"
+            | "UID"
+            | "TypeTag"
+            | "bytes"
+            | "String"
+            | "string"
+            | "vector"
+            | "set"
+            | "map"
+            | "tuple"
+            | "Option"
+            | "Result"
+    )
+}
+
+fn map_value_error(tag: &TypeTag, err: ValueCodecError) -> JsonAbiError {
+    match err {
+        ValueCodecError::JsonMismatch { type_tag, reason } => {
+            JsonAbiError::TypeMismatch { type_tag, reason }
         }
-        TypeTag::Generic { idx } => format!("T{idx}"),
-        TypeTag::External { ref_idx } => format!("$external_{ref_idx}"),
+        ValueCodecError::UnresolvedType(_) | ValueCodecError::InvalidArity { .. } => {
+            JsonAbiError::UnsupportedType(type_tag_label(tag))
+        }
+        ValueCodecError::TypeMismatch { expected, got } => JsonAbiError::TypeMismatch {
+            type_tag: type_tag_label(tag),
+            reason: format!("expected {expected}, got {got}"),
+        },
+        other => JsonAbiError::InvalidCanonical {
+            type_tag: type_tag_label(tag),
+            reason: other.to_string(),
+        },
     }
 }
 
@@ -526,21 +394,68 @@ mod tests {
     }
 
     #[test]
-    fn vector_variable_width_elements_are_unsupported() {
+    fn vector_variable_width_elements_round_trip() {
         let tag = TypeTag::Concrete {
             petal_hash: [0u8; 32],
             type_name: "vector".to_string(),
             type_args: vec![prim("string")],
         };
-        assert!(matches!(
-            decode_json_const(&tag, &json!(["a"])),
-            Err(JsonAbiError::UnsupportedType(_))
-        ));
+        let bytes = decode_json_const(&tag, &json!(["a", "bc"])).unwrap();
+        assert_eq!(bytes, vec![2, 1, b'a', 2, b'b', b'c']);
+        assert_eq!(
+            decode_return_json(&tag, &bytes).unwrap(),
+            Some(json!(["a", "bc"]))
+        );
     }
 
     #[test]
-    fn unknown_return_degrades_to_none() {
+    fn builtin_only_unknown_return_degrades_to_none() {
         let tag = prim("Custom");
         assert_eq!(decode_return_json(&tag, &[1, 2, 3]).unwrap(), None);
+    }
+
+    #[test]
+    fn manifest_custom_data_round_trips() {
+        let manifest = PetalManifestStub {
+            data_types: vec![crate::DataTypeDeclStub {
+                name: "Wrapper".to_string(),
+                fields: vec![crate::FieldDeclStub {
+                    name: "value".to_string(),
+                    ty: prim("u64"),
+                }],
+                ..crate::DataTypeDeclStub::default()
+            }],
+            ..PetalManifestStub::default()
+        };
+        let tag = prim("Wrapper");
+
+        let bytes =
+            decode_json_const_with_manifest(&manifest, [0xAA; 32], &tag, &json!({"value": "42"}))
+                .unwrap();
+
+        assert_eq!(bytes, 42u64.to_be_bytes());
+        assert_eq!(
+            decode_return_json_with_manifest(&manifest, [0xAA; 32], &tag, &bytes).unwrap(),
+            json!({"value": "42"})
+        );
+    }
+
+    #[test]
+    fn manifest_object_return_decodes_as_object_id() {
+        let manifest = PetalManifestStub {
+            object_types: vec![crate::ObjectTypeDeclStub {
+                name: "Thing".to_string(),
+                fields: vec![],
+                ..crate::ObjectTypeDeclStub::default()
+            }],
+            ..PetalManifestStub::default()
+        };
+        let tag = prim("Thing");
+        let bytes = [0x22; 32];
+
+        assert_eq!(
+            decode_return_json_with_manifest(&manifest, [0xAA; 32], &tag, &bytes).unwrap(),
+            json!(hex::encode(bytes))
+        );
     }
 }

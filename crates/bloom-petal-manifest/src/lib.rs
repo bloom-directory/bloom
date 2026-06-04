@@ -29,6 +29,7 @@ pub mod boundary;
 pub mod codec;
 pub mod extract;
 pub mod interpret;
+pub mod resolver;
 pub mod stub;
 pub mod types;
 
@@ -40,5 +41,6 @@ pub use interpret::{
     predicate_is_enforceable, predicate_max_fuel, predicate_triviality, predicate_uses_subtraction,
     render_predicate_english,
 };
+pub use resolver::{ManifestResolver, validate_reserved_type_names};
 pub use stub::to_petal_manifest_stub;
 pub use types::{MANIFEST_CUSTOM_SECTION, PetalManifestV0, SCHEMA_VERSION};

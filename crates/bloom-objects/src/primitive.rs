@@ -13,8 +13,10 @@
 //! declared [`TypeTag`]. Callers map the outcome onto their own error
 //! types.
 
-use crate::codec::{CodecError, read_u8, read_u16_be};
+use crate::codec::{CodecError, read_u8};
 use crate::type_tag::TypeTag;
+
+const MAX_COLLECTION_LEN: u64 = 1_000_000;
 
 /// Outcome of validating a byte string against a declared [`TypeTag`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,19 +88,26 @@ fn validate_concrete(name: &str, type_args: &[TypeTag], bytes: &[u8]) -> Validat
         ("u32", 0) | ("i32", 0) => exact_len(bytes, 4, "u32/i32 require exactly 4 bytes"),
         ("u64", 0) | ("i64", 0) => exact_len(bytes, 8, "u64/i64 require exactly 8 bytes"),
         ("u128", 0) | ("i128", 0) => exact_len(bytes, 16, "u128/i128 require exactly 16 bytes"),
-        ("Address", 0) | ("ObjectId", 0) | ("Hash32", 0) => exact_len(
-            bytes,
-            32,
-            "Address/ObjectId/Hash32 require exactly 32 bytes",
-        ),
+        ("Address", 0) | ("address", 0) | ("ObjectId", 0) | ("Hash32", 0) | ("UID", 0) => {
+            exact_len(
+                bytes,
+                32,
+                "Address/ObjectId/Hash32/UID require exactly 32 bytes",
+            )
+        }
         ("String", 0) => {
-            // Canonical String encoding: 2-byte BE length prefix + UTF-8.
+            // Canonical String encoding: minimal ULEB128 length prefix + UTF-8.
             let mut rdr: &[u8] = bytes;
-            let len = match read_u16_be(&mut rdr) {
-                Ok(l) => l as usize,
+            let len = match read_uleb128(&mut rdr) {
+                Ok(l) => l,
                 Err(_) => {
-                    return ValidationOutcome::Invalid("String missing 2-byte length prefix");
+                    return ValidationOutcome::Invalid(
+                        "String missing valid ULEB128 length prefix",
+                    );
                 }
+            };
+            let Ok(len) = usize::try_from(len) else {
+                return ValidationOutcome::Invalid("String length overflows usize");
             };
             if rdr.len() != len {
                 return ValidationOutcome::Invalid(
@@ -117,12 +126,44 @@ fn validate_concrete(name: &str, type_args: &[TypeTag], bytes: &[u8]) -> Validat
                 Err(_) => ValidationOutcome::Invalid("TypeTag canonical decode failed"),
             }
         }
-        // `vector<T>` — 4-byte BE count + N concatenated canonical
-        // encodings of T. We only validate the prefix and length-walk
-        // when the element type is a known primitive.
+        // `vector<T>` — ULEB128 count + N concatenated canonical encodings of
+        // T. We only validate the length-walk when T is fixed-width primitive.
         ("vector", 1) => validate_vector(&type_args[0], bytes),
         _ => ValidationOutcome::Unknown,
     }
+}
+
+fn read_uleb128(input: &mut &[u8]) -> Result<u64, ()> {
+    let start_len = input.len();
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    for i in 0..10 {
+        let Some((&byte, rest)) = input.split_first() else {
+            return Err(());
+        };
+        *input = rest;
+        let low = (byte & 0x7f) as u64;
+        if i == 9 && (byte & 0x80 != 0 || low > 1) {
+            return Err(());
+        }
+        value |= low << shift;
+        if byte & 0x80 == 0 {
+            let consumed = start_len - input.len();
+            if consumed > 1 {
+                let min = if value == 0 {
+                    1
+                } else {
+                    ((value.ilog2() / 7) + 1) as usize
+                };
+                if consumed != min {
+                    return Err(());
+                }
+            }
+            return Ok(value);
+        }
+        shift += 7;
+    }
+    Err(())
 }
 
 fn exact_len(bytes: &[u8], n: usize, msg: &'static str) -> ValidationOutcome {
@@ -134,11 +175,12 @@ fn exact_len(bytes: &[u8], n: usize, msg: &'static str) -> ValidationOutcome {
 }
 
 fn validate_vector(elem: &TypeTag, bytes: &[u8]) -> ValidationOutcome {
-    if bytes.len() < 4 {
-        return ValidationOutcome::Invalid("vector missing 4-byte count prefix");
-    }
-    let count = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-    let mut rdr = &bytes[4..];
+    let mut rdr = bytes;
+    let count = match read_uleb128(&mut rdr) {
+        Ok(count) if count <= MAX_COLLECTION_LEN => count as usize,
+        Ok(_) => return ValidationOutcome::Invalid("vector count exceeds limit"),
+        Err(_) => return ValidationOutcome::Invalid("vector missing valid ULEB128 count prefix"),
+    };
     // If the element type isn't a known primitive, we can't tell where
     // each element ends, so once we've verified the count prefix we
     // signal Unknown and let the runtime decode.
@@ -187,7 +229,7 @@ fn primitive_size_hint(tag: &TypeTag) -> Option<usize> {
         "u32" | "i32" => Some(4),
         "u64" | "i64" => Some(8),
         "u128" | "i128" => Some(16),
-        "Address" | "ObjectId" | "Hash32" => Some(32),
+        "Address" | "address" | "ObjectId" | "Hash32" | "UID" => Some(32),
         _ => None,
     }
 }
@@ -261,8 +303,8 @@ mod tests {
     #[test]
     fn string_length_prefix_match() {
         let mut buf: Vec<u8> = vec![];
-        // 2-byte BE length = 5
-        buf.extend_from_slice(&5u16.to_be_bytes());
+        // ULEB128 length = 5
+        buf.push(5);
         buf.extend_from_slice(b"hello");
         assert!(validate_canonical_bytes(&prim("String"), &buf).is_ok());
     }
@@ -270,7 +312,7 @@ mod tests {
     #[test]
     fn string_length_prefix_mismatch_invalid() {
         let mut buf: Vec<u8> = vec![];
-        buf.extend_from_slice(&10u16.to_be_bytes()); // claims 10 bytes
+        buf.push(10); // claims 10 bytes
         buf.extend_from_slice(b"hi");
         assert!(validate_canonical_bytes(&prim("String"), &buf).is_invalid());
     }
@@ -278,7 +320,7 @@ mod tests {
     #[test]
     fn string_invalid_utf8() {
         let mut buf: Vec<u8> = vec![];
-        buf.extend_from_slice(&2u16.to_be_bytes());
+        buf.push(2);
         buf.extend_from_slice(&[0xFF, 0xFE]);
         assert!(validate_canonical_bytes(&prim("String"), &buf).is_invalid());
     }
@@ -294,7 +336,7 @@ mod tests {
     #[test]
     fn vector_u64_count_matches() {
         let mut buf: Vec<u8> = vec![];
-        buf.extend_from_slice(&2u32.to_be_bytes());
+        buf.push(2);
         buf.extend_from_slice(&[0u8; 8]);
         buf.extend_from_slice(&[0u8; 8]);
         assert!(validate_canonical_bytes(&vector_of("u64"), &buf).is_ok());
@@ -303,7 +345,7 @@ mod tests {
     #[test]
     fn vector_u64_count_mismatch_invalid() {
         let mut buf: Vec<u8> = vec![];
-        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.push(3);
         buf.extend_from_slice(&[0u8; 8]); // only one element follows
         assert!(validate_canonical_bytes(&vector_of("u64"), &buf).is_invalid());
     }

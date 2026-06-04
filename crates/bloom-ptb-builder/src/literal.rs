@@ -4,19 +4,17 @@
 //! literal to an [`Arg::Const`] whose bytes are the **canonical
 //! encoding** of the value under the declared
 //! [`ArgDeclStub::Const(TypeTag)`] type. We encode using the same widths
-//! `bloom-objects`' canonical codec / `primitive` validator expects, so
-//! the resulting `Const` round-trips through
-//! `validate_canonical_bytes` cleanly.
+//! `bloom-resource`' canonical [`BloomType`] implementations emit, so
+//! the resulting `Const` bytes match the schema-driven value codec.
 //!
 //! Supported primitive type names: `u8`..`u128`, `i8`..`i128`, `bool`,
-//! `Address`/`ObjectId`/`Hash32` (32-byte hex), `String`. Anything else
-//! (petal-defined structs, generics, externals) is treated as opaque:
-//! the literal is interpreted as `0x`-prefixed hex bytes (raw,
-//! length-checked only by the runtime), matching the validator's
-//! "Unknown ⇒ accept" stance.
+//! `Address`/`address`/`ObjectId`/`Hash32`/`UID` (32-byte hex), `bytes`,
+//! `String`/`string`.
+//! Anything else (petal-defined structs, generics, externals, and
+//! parameterized values) must be lowered through a manifest-aware front door.
 
 use bloom_objects::TypeTag;
-use bloom_objects::codec::{write_string, write_u64_be};
+use bloom_resource::{BloomType, Bytes as BloomBytes};
 
 use crate::error::BuildError;
 
@@ -29,9 +27,10 @@ pub fn encode_const_literal(declared: &TypeTag, value: &str) -> Result<Vec<u8>, 
             type_args,
             ..
         } if type_args.is_empty() => encode_primitive(type_name, value),
-        // Generic / external / parameterised concrete: we have no static
-        // schema, so accept a raw `0x`-hex literal as opaque bytes.
-        _ => parse_hex_bytes(value),
+        _ => Err(BuildError::Parse(format!(
+            "declared const type {} requires manifest-aware typed lowering",
+            type_tag_label(declared)
+        ))),
     }
 }
 
@@ -40,11 +39,7 @@ fn encode_primitive(type_name: &str, value: &str) -> Result<Vec<u8>, BuildError>
         "u8" => parse_uint(value, 8).map(|v| vec![v as u8]),
         "u16" => parse_uint(value, 16).map(|v| (v as u16).to_be_bytes().to_vec()),
         "u32" => parse_uint(value, 32).map(|v| (v as u32).to_be_bytes().to_vec()),
-        "u64" => {
-            let mut buf = Vec::with_capacity(8);
-            write_u64_be(&mut buf, parse_uint(value, 64)? as u64);
-            Ok(buf)
-        }
+        "u64" => parse_uint(value, 64).map(|v| (v as u64).canonical_encode()),
         "u128" => parse_u128(value).map(|v| v.to_be_bytes().to_vec()),
         "i8" => parse_int(value, 8).map(|v| (v as i8).to_be_bytes().to_vec()),
         "i16" => parse_int(value, 16).map(|v| (v as i16).to_be_bytes().to_vec()),
@@ -58,7 +53,7 @@ fn encode_primitive(type_name: &str, value: &str) -> Result<Vec<u8>, BuildError>
                 "expected bool (true/false/0/1), got {other:?}"
             ))),
         },
-        "Address" | "ObjectId" | "Hash32" => {
+        "Address" | "address" | "ObjectId" | "Hash32" | "UID" => {
             let bytes = parse_hex_bytes(value)?;
             if bytes.len() != 32 {
                 return Err(BuildError::Parse(format!(
@@ -68,16 +63,49 @@ fn encode_primitive(type_name: &str, value: &str) -> Result<Vec<u8>, BuildError>
             }
             Ok(bytes)
         }
-        "String" => {
-            let mut buf = Vec::new();
-            // Canonical String: 2-byte BE length prefix + UTF-8.
-            write_string(&mut buf, value).map_err(|e| {
-                BuildError::Parse(format!("String literal does not fit canonical codec: {e}"))
-            })?;
-            Ok(buf)
+        "bytes" => parse_hex_bytes(value).map(|bytes| BloomBytes(bytes).canonical_encode()),
+        "String" | "string" => Ok(value.to_string().canonical_encode()),
+        _ => Err(BuildError::Parse(format!(
+            "declared const type {type_name} requires manifest-aware typed lowering"
+        ))),
+    }
+}
+
+fn type_tag_label(tag: &TypeTag) -> String {
+    match tag {
+        TypeTag::Concrete {
+            petal_hash,
+            type_name,
+            type_args,
+        } => {
+            let mut out = type_name.clone();
+            if *petal_hash != [0u8; 32] && *petal_hash != bloom_objects::BUILTIN_TYPE_HASH {
+                out.push('@');
+                push_hex(petal_hash, &mut out);
+            }
+            if !type_args.is_empty() {
+                out.push('<');
+                out.push_str(
+                    &type_args
+                        .iter()
+                        .map(type_tag_label)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+                out.push('>');
+            }
+            out
         }
-        // Unknown primitive name (petal struct etc.): accept opaque hex.
-        _ => parse_hex_bytes(value),
+        TypeTag::Generic { idx } => format!("T{idx}"),
+        TypeTag::External { ref_idx } => format!("$external_{ref_idx}"),
+    }
+}
+
+fn push_hex(bytes: &[u8], out: &mut String) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
     }
 }
 

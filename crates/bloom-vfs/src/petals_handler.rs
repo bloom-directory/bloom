@@ -6,9 +6,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bloom_chain_types::Hash32;
 use bloom_objects::{Object, ObjectId, Owner, TypeTag};
+use bloom_petal_manifest::ManifestResolver;
 use bloom_petal_manifest::extract_petal_manifest_v0;
 use bloom_petal_manifest::types::{ObjectTypeDecl, PetalManifestV0};
-use bloom_script::{ChainStateIface, PetalManifestStub, decode_return_json};
+use bloom_script::{ChainStateIface, PetalManifestStub};
+use bloom_value::{CodecLimits, decode_json};
 use serde_json::{Value, json};
 
 use crate::handler::{Entry, Handler, HandlerError};
@@ -64,6 +66,41 @@ impl PetalsEndpointHandler {
     fn full_manifest_for(&self, binding: &Binding) -> Option<PetalManifestV0> {
         let wasm = self.chain.load_petal(&binding.hash)?;
         extract_petal_manifest_v0(&wasm)
+    }
+
+    fn external_full_manifests_for(
+        &self,
+        manifest: &PetalManifestV0,
+    ) -> Vec<(Hash32, PetalManifestV0)> {
+        let mut manifests = Vec::new();
+        let mut visited = BTreeSet::new();
+        self.collect_external_full_manifests(manifest, &mut manifests, &mut visited);
+        manifests
+    }
+
+    fn collect_external_full_manifests(
+        &self,
+        manifest: &PetalManifestV0,
+        out: &mut Vec<(Hash32, PetalManifestV0)>,
+        visited: &mut BTreeSet<[u8; 32]>,
+    ) {
+        for external in &manifest.external_type_refs {
+            let Some(content_hash) = external.declared_content_hash else {
+                continue;
+            };
+            if !visited.insert(content_hash) {
+                continue;
+            }
+            let hash = Hash32(content_hash);
+            let Some(wasm) = self.chain.load_petal(&hash) else {
+                continue;
+            };
+            let Some(external_manifest) = extract_petal_manifest_v0(&wasm) else {
+                continue;
+            };
+            self.collect_external_full_manifests(&external_manifest, out, visited);
+            out.push((hash, external_manifest));
+        }
     }
 
     fn binding_at<'a>(&self, bindings: &'a [Binding], rel: &[String]) -> Option<&'a Binding> {
@@ -457,7 +494,14 @@ impl PetalsEndpointHandler {
         let object_type = object_type_decl(&manifest, type_name)
             .ok_or_else(|| HandlerError::not_found(type_name.clone()))?;
         let (_id, object) = self.state_object(binding.hash, type_name, id_hex)?;
-        let fields = decode_object_fields(binding.hash, &object, object_type, &manifest);
+        let external_manifests = self.external_full_manifests_for(&manifest);
+        let fields = decode_object_fields(
+            binding.hash,
+            &object,
+            object_type,
+            &manifest,
+            &external_manifests,
+        )?;
         let value = if leaf == OBJECT_JSON {
             state_object_json(&object, fields)
         } else {
@@ -565,273 +609,32 @@ fn object_type_decl<'a>(manifest: &'a PetalManifestV0, name: &str) -> Option<&'a
 fn decode_object_fields(
     petal_hash: Hash32,
     object: &Object,
-    object_type: &ObjectTypeDecl,
+    _object_type: &ObjectTypeDecl,
     manifest: &PetalManifestV0,
-) -> BTreeMap<String, Value> {
-    let type_args = match &object.type_tag {
-        TypeTag::Concrete { type_args, .. } => type_args.as_slice(),
-        _ => &[],
-    };
-    decode_fields_from_payload(
-        petal_hash,
-        &object.payload,
-        object_type,
+    external_manifests: &[(Hash32, PetalManifestV0)],
+) -> Result<BTreeMap<String, Value>, HandlerError> {
+    let external_manifest_refs: Vec<([u8; 32], &PetalManifestV0)> = external_manifests
+        .iter()
+        .map(|(hash, manifest)| (hash.0, manifest))
+        .collect();
+    let resolver = ManifestResolver::with_self_hash_and_external_manifests(
         manifest,
-        type_args,
-        0,
+        petal_hash.0,
+        &external_manifest_refs,
+    );
+    let value = decode_json(
+        &resolver,
+        &object.type_tag,
+        &object.payload,
+        &CodecLimits::default(),
     )
-    .0
-}
-
-fn decode_fields_from_payload(
-    petal_hash: Hash32,
-    payload: &[u8],
-    object_type: &ObjectTypeDecl,
-    manifest: &PetalManifestV0,
-    type_args: &[TypeTag],
-    depth: usize,
-) -> (BTreeMap<String, Value>, usize) {
-    let mut out = BTreeMap::new();
-    let mut offset = 0usize;
-    for (idx, field) in object_type.fields.iter().enumerate() {
-        let remaining = &payload[offset..];
-        let field_ty =
-            resolve_self_type_refs(&substitute_type_args(&field.ty, type_args), petal_hash.0);
-        let decoded = decode_field_json(
-            petal_hash,
-            &field_ty,
-            remaining,
-            idx + 1 == object_type.fields.len(),
-            manifest,
-            depth,
-        );
-        let Some((value, consumed)) = decoded.filter(|(_, consumed)| *consumed <= remaining.len())
-        else {
-            out.insert(field.name.clone(), json!({ "hex": hex::encode(remaining) }));
-            offset = payload.len();
-            continue;
-        };
-        out.insert(field.name.clone(), value);
-        offset += consumed;
-    }
-    (out, offset)
-}
-
-fn decode_field_json(
-    petal_hash: Hash32,
-    tag: &TypeTag,
-    remaining: &[u8],
-    is_last: bool,
-    manifest: &PetalManifestV0,
-    depth: usize,
-) -> Option<(Value, usize)> {
-    if depth > 16 {
-        return None;
-    }
-    let TypeTag::Concrete {
-        petal_hash: tag_hash,
-        type_name,
-        type_args,
-    } = tag
-    else {
-        return None;
-    };
-
-    if let Some(width) = fixed_width(tag) {
-        let bytes = remaining.get(..width)?;
-        return Some((decode_scalar_or_hex(tag, bytes), width));
-    }
-
-    if type_name == "String" && remaining.len() >= 2 {
-        let len = u16::from_be_bytes([remaining[0], remaining[1]]) as usize;
-        let width = 2usize.checked_add(len)?;
-        let bytes = remaining.get(..width)?;
-        return Some((decode_scalar_or_hex(tag, bytes), width));
-    }
-
-    if matches!(type_name.as_str(), "bytes" | "string") && is_last {
-        return Some((decode_scalar_or_hex(tag, remaining), remaining.len()));
-    }
-
-    if type_name == "Coin" && type_args.len() == 1 {
-        let id = remaining.get(..32)?;
-        let value = remaining.get(32..48)?;
-        let mut amount = [0u8; 16];
-        amount.copy_from_slice(value);
-        return Some((
-            json!({
-                "id": hex::encode(id),
-                "value": u128::from_be_bytes(amount).to_string(),
-            }),
-            48,
+    .map_err(|e| HandlerError::backend(format!("object payload decode failed: {e}")))?;
+    let Value::Object(fields) = value else {
+        return Err(HandlerError::backend(
+            "object payload decoded to non-object JSON",
         ));
-    }
-
-    if type_name == "vector" && type_args.len() == 1 && remaining.len() >= 4 {
-        let elem_ty = resolve_self_type_refs(&type_args[0], petal_hash.0);
-        let elem_width = static_field_width(petal_hash, &elem_ty, manifest, depth + 1)?;
-        if elem_width == 0 {
-            return None;
-        }
-        let count =
-            u32::from_be_bytes([remaining[0], remaining[1], remaining[2], remaining[3]]) as usize;
-        let elems_len = count.checked_mul(elem_width)?;
-        let width = 4usize.checked_add(elems_len)?;
-        remaining.get(..width)?;
-
-        let mut values = Vec::with_capacity(count);
-        let mut offset = 4usize;
-        for _ in 0..count {
-            let end = offset + elem_width;
-            let (value, consumed) = decode_field_json(
-                petal_hash,
-                &elem_ty,
-                &remaining[offset..end],
-                true,
-                manifest,
-                depth + 1,
-            )?;
-            if consumed != elem_width {
-                return None;
-            }
-            values.push(value);
-            offset = end;
-        }
-        return Some((Value::Array(values), width));
-    }
-
-    if *tag_hash == petal_hash.0
-        && let Some(nested_type) = object_type_decl(manifest, type_name)
-    {
-        let (fields, consumed) = decode_fields_from_payload(
-            petal_hash,
-            remaining,
-            nested_type,
-            manifest,
-            type_args,
-            depth + 1,
-        );
-        return Some((json!(fields), consumed));
-    }
-
-    None
-}
-
-fn decode_scalar_or_hex(tag: &TypeTag, bytes: &[u8]) -> Value {
-    match decode_return_json(tag, bytes) {
-        Ok(Some(value)) => value,
-        Ok(None) | Err(_) => json!({ "hex": hex::encode(bytes) }),
-    }
-}
-
-fn substitute_type_args(t: &TypeTag, type_args: &[TypeTag]) -> TypeTag {
-    match t {
-        TypeTag::Generic { idx } => type_args
-            .get(*idx as usize)
-            .cloned()
-            .unwrap_or_else(|| t.clone()),
-        TypeTag::Concrete {
-            petal_hash,
-            type_name,
-            type_args: inner,
-        } => TypeTag::Concrete {
-            petal_hash: *petal_hash,
-            type_name: type_name.clone(),
-            type_args: inner
-                .iter()
-                .map(|inner| substitute_type_args(inner, type_args))
-                .collect(),
-        },
-        TypeTag::External { .. } => t.clone(),
-    }
-}
-
-fn resolve_self_type_refs(t: &TypeTag, self_hash: [u8; 32]) -> TypeTag {
-    match t {
-        TypeTag::Concrete {
-            petal_hash,
-            type_name,
-            type_args,
-        } => TypeTag::Concrete {
-            petal_hash: if petal_hash == &[0u8; 32] && type_name != "Coin" {
-                self_hash
-            } else {
-                *petal_hash
-            },
-            type_name: type_name.clone(),
-            type_args: if type_name == "Coin" {
-                type_args.clone()
-            } else {
-                type_args
-                    .iter()
-                    .map(|inner| resolve_self_type_refs(inner, self_hash))
-                    .collect()
-            },
-        },
-        TypeTag::Generic { .. } | TypeTag::External { .. } => t.clone(),
-    }
-}
-
-fn static_field_width(
-    petal_hash: Hash32,
-    tag: &TypeTag,
-    manifest: &PetalManifestV0,
-    depth: usize,
-) -> Option<usize> {
-    if depth > 16 {
-        return None;
-    }
-    let TypeTag::Concrete {
-        petal_hash: tag_hash,
-        type_name,
-        type_args,
-    } = tag
-    else {
-        return None;
     };
-    if type_name == "Coin" && type_args.len() == 1 {
-        return Some(48);
-    }
-    if *tag_hash == petal_hash.0
-        && let Some(nested_type) = object_type_decl(manifest, type_name)
-    {
-        let mut width = 0usize;
-        for field in &nested_type.fields {
-            let field_ty =
-                resolve_self_type_refs(&substitute_type_args(&field.ty, type_args), petal_hash.0);
-            width = width.checked_add(static_field_width(
-                petal_hash,
-                &field_ty,
-                manifest,
-                depth + 1,
-            )?)?;
-        }
-        return Some(width);
-    }
-    fixed_width(tag)
-}
-
-fn fixed_width(tag: &TypeTag) -> Option<usize> {
-    let TypeTag::Concrete {
-        type_name,
-        type_args,
-        ..
-    } = tag
-    else {
-        return None;
-    };
-    if !type_args.is_empty() {
-        return None;
-    }
-    match type_name.as_str() {
-        "bool" | "u8" => Some(1),
-        "u16" => Some(2),
-        "u32" => Some(4),
-        "u64" => Some(8),
-        "u128" => Some(16),
-        "address" | "Address" | "ObjectId" | "Hash32" => Some(32),
-        _ => None,
-    }
+    Ok(fields.into_iter().collect())
 }
 
 fn state_object_json(object: &Object, fields: BTreeMap<String, Value>) -> Value {
@@ -951,8 +754,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use bloom_objects::{AbilitySet, Object, ObjectId};
-    use bloom_petal_manifest::types::{FieldDecl, ObjectTypeDecl, PetalManifestV0};
+    use bloom_objects::{AbilitySet, BUILTIN_TYPE_HASH, Object, ObjectId};
+    use bloom_petal_manifest::types::{
+        DataTypeDecl, ExternalTypeRef, FieldDecl, ObjectTypeDecl, PetalManifestV0, TypeParamDecl,
+        TypeParamKind,
+    };
     use bloom_script::FunctionDeclStub;
 
     #[derive(Default)]
@@ -1053,7 +859,7 @@ mod tests {
 
     fn prim(name: &str) -> TypeTag {
         TypeTag::Concrete {
-            petal_hash: [0; 32],
+            petal_hash: BUILTIN_TYPE_HASH,
             type_name: name.to_string(),
             type_args: vec![],
         }
@@ -1061,7 +867,7 @@ mod tests {
 
     fn vector(elem: TypeTag) -> TypeTag {
         TypeTag::Concrete {
-            petal_hash: [0; 32],
+            petal_hash: BUILTIN_TYPE_HASH,
             type_name: "vector".to_string(),
             type_args: vec![elem],
         }
@@ -1228,9 +1034,9 @@ mod tests {
 
         let mut payload = Vec::new();
         payload.extend_from_slice(&99u128.to_be_bytes());
-        payload.extend_from_slice(&(2u16).to_be_bytes());
+        payload.push(2);
         payload.extend_from_slice(b"ok");
-        payload.extend_from_slice(&(2u32).to_be_bytes());
+        payload.push(2);
         payload.extend_from_slice(&(7u16).to_be_bytes());
         payload.extend_from_slice(&(8u16).to_be_bytes());
         let counter = petal_object(0xA1, hash, "Counter", payload);
@@ -1523,26 +1329,154 @@ mod tests {
         assert_eq!(object_json["fields"][OBJECT_JSON], json!(5));
     }
 
-    #[test]
-    fn state_field_decoder_substitutes_generics_and_falls_back_to_hex() {
-        let hash = Hash32([0x33; 32]);
-        let object_type = object_type(
-            "Box",
-            vec![
-                ("inner", TypeTag::Generic { idx: 0 }),
-                (
-                    "opaque",
-                    TypeTag::Concrete {
-                        petal_hash: hash.0,
-                        type_name: "Custom".to_string(),
-                        type_args: vec![],
-                    },
-                ),
-            ],
+    #[tokio::test]
+    async fn state_read_hard_errors_on_malformed_canonical_payload() {
+        let chain = Arc::new(MockChain::default());
+        let hash = Hash32([0x16; 32]);
+        chain.bind_full(
+            "/bloom/petals/dex/probe",
+            hash,
+            full_manifest(
+                "/bloom/petals/dex/probe",
+                vec![object_type("Counter", vec![("value", prim("u128"))])],
+            ),
         );
+        let mut payload = 5u128.to_be_bytes().to_vec();
+        payload.push(0xAA);
+        let counter = petal_object(0x16, hash, "Counter", payload);
+        let counter_id = hex::encode(counter.id.0);
+        chain.put_object(counter);
+        let h = PetalsEndpointHandler::new(chain);
+
+        let err = h
+            .read(&vpath(&format!(
+                "dex/probe/.state/Counter/{counter_id}/{OBJECT_JSON}"
+            )))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HandlerError::Backend(ref msg) if msg.contains("object payload decode failed")),
+            "malformed canonical payload must hard-error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_read_resolves_external_fields() {
+        let chain = Arc::new(MockChain::default());
+        let hash = Hash32([0x17; 32]);
+        let foreign_hash = Hash32([0x18; 32]);
+        let object_type = object_type("Box", vec![("foreign", TypeTag::External { ref_idx: 0 })]);
+        let mut manifest = full_manifest("/bloom/petals/dex/box", vec![object_type]);
+        manifest.external_type_refs.push(ExternalTypeRef {
+            placeholder: "$external_0".to_string(),
+            declared_petal_path: "/bloom/petals/foreign".to_string(),
+            declared_type_name: "Foreign".to_string(),
+            declared_content_hash: Some(foreign_hash.0),
+        });
+        let foreign_manifest = PetalManifestV0 {
+            module_path: "/bloom/petals/foreign".to_string(),
+            data_types: vec![DataTypeDecl {
+                name: "Foreign".to_string(),
+                fields: vec![FieldDecl {
+                    name: "value".to_string(),
+                    ty: prim("u64"),
+                    offset: None,
+                    width: Some(8),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        chain.bind_full("/bloom/petals/dex/box", hash, manifest);
+        chain.bind_full("/bloom/petals/foreign", foreign_hash, foreign_manifest);
+        let object = petal_object(0x17, hash, "Box", 7u64.to_be_bytes().to_vec());
+        let object_id = hex::encode(object.id.0);
+        chain.put_object(object);
+        let h = PetalsEndpointHandler::new(chain);
+
+        let field = h
+            .read(&vpath(&format!("dex/box/.state/Box/{object_id}/foreign")))
+            .await
+            .unwrap();
+        let field: Value = serde_json::from_slice(&field).unwrap();
+        assert_eq!(field, json!({ "value": "7" }));
+    }
+
+    #[tokio::test]
+    async fn state_read_resolves_transitive_external_fields() {
+        let chain = Arc::new(MockChain::default());
+        let root_hash = Hash32([0x19; 32]);
+        let middle_hash = Hash32([0x1A; 32]);
+        let leaf_hash = Hash32([0x1B; 32]);
+        let object_type = object_type("Box", vec![("foreign", TypeTag::External { ref_idx: 0 })]);
+        let mut root_manifest = full_manifest("/bloom/petals/dex/box", vec![object_type]);
+        root_manifest.external_type_refs.push(ExternalTypeRef {
+            placeholder: "$external_0".to_string(),
+            declared_petal_path: "/bloom/petals/middle".to_string(),
+            declared_type_name: "Middle".to_string(),
+            declared_content_hash: Some(middle_hash.0),
+        });
+        let mut middle_manifest = PetalManifestV0 {
+            module_path: "/bloom/petals/middle".to_string(),
+            data_types: vec![DataTypeDecl {
+                name: "Middle".to_string(),
+                fields: vec![FieldDecl {
+                    name: "leaf".to_string(),
+                    ty: TypeTag::External { ref_idx: 0 },
+                    offset: None,
+                    width: None,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        middle_manifest.external_type_refs.push(ExternalTypeRef {
+            placeholder: "$external_0".to_string(),
+            declared_petal_path: "/bloom/petals/leaf".to_string(),
+            declared_type_name: "Leaf".to_string(),
+            declared_content_hash: Some(leaf_hash.0),
+        });
+        let leaf_manifest = PetalManifestV0 {
+            module_path: "/bloom/petals/leaf".to_string(),
+            data_types: vec![DataTypeDecl {
+                name: "Leaf".to_string(),
+                fields: vec![FieldDecl {
+                    name: "value".to_string(),
+                    ty: prim("u64"),
+                    offset: None,
+                    width: Some(8),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        chain.bind_full("/bloom/petals/dex/box", root_hash, root_manifest);
+        chain.bind_full("/bloom/petals/middle", middle_hash, middle_manifest);
+        chain.bind_full("/bloom/petals/leaf", leaf_hash, leaf_manifest);
+        let object = petal_object(0x19, root_hash, "Box", 7u64.to_be_bytes().to_vec());
+        let object_id = hex::encode(object.id.0);
+        chain.put_object(object);
+        let h = PetalsEndpointHandler::new(chain);
+
+        let field = h
+            .read(&vpath(&format!("dex/box/.state/Box/{object_id}/foreign")))
+            .await
+            .unwrap();
+        let field: Value = serde_json::from_slice(&field).unwrap();
+        assert_eq!(field, json!({ "leaf": { "value": "7" } }));
+    }
+
+    #[test]
+    fn state_field_decoder_substitutes_generics() {
+        let hash = Hash32([0x33; 32]);
+        let mut object_type = object_type("Box", vec![("inner", TypeTag::Generic { idx: 0 })]);
+        object_type.type_params.push(TypeParamDecl {
+            name: "T".to_string(),
+            kind: TypeParamKind::Resource,
+            bounds: vec![],
+        });
         let mut payload = Vec::new();
         payload.extend_from_slice(&5u128.to_be_bytes());
-        payload.extend_from_slice(&[0xAB, 0xCD]);
         let object = Object {
             id: ObjectId([0x44; 32]),
             type_tag: TypeTag::Concrete {
@@ -1556,23 +1490,76 @@ mod tests {
         };
 
         let manifest = full_manifest("/bloom/petals/dex/box", vec![object_type.clone()]);
-        let fields = decode_object_fields(hash, &object, &object_type, &manifest);
+        let fields = decode_object_fields(hash, &object, &object_type, &manifest, &[]).unwrap();
         assert_eq!(fields["inner"], "5");
-        assert_eq!(fields["opaque"], json!({ "hex": "abcd" }));
     }
 
     #[test]
-    fn state_field_decoder_decodes_nested_structs_and_coins() {
+    fn state_field_decoder_errors_on_unresolved_fields() {
+        let hash = Hash32([0x34; 32]);
+        let object_type = object_type(
+            "Box",
+            vec![(
+                "opaque",
+                TypeTag::Concrete {
+                    petal_hash: hash.0,
+                    type_name: "Custom".to_string(),
+                    type_args: vec![],
+                },
+            )],
+        );
+        let object = petal_object(0x34, hash, "Box", vec![0xAB, 0xCD]);
+        let manifest = full_manifest("/bloom/petals/dex/box", vec![object_type.clone()]);
+        assert!(decode_object_fields(hash, &object, &object_type, &manifest, &[]).is_err());
+    }
+
+    #[test]
+    fn state_field_decoder_resolves_external_fields() {
+        let hash = Hash32([0x35; 32]);
+        let foreign_hash = Hash32([0x36; 32]);
+        let object_type = object_type("Box", vec![("foreign", TypeTag::External { ref_idx: 0 })]);
+        let mut manifest = full_manifest("/bloom/petals/dex/box", vec![object_type.clone()]);
+        manifest.external_type_refs.push(ExternalTypeRef {
+            placeholder: "$external_0".to_string(),
+            declared_petal_path: "/bloom/petals/foreign".to_string(),
+            declared_type_name: "Foreign".to_string(),
+            declared_content_hash: Some(foreign_hash.0),
+        });
+        let foreign_manifest = PetalManifestV0 {
+            module_path: "/bloom/petals/foreign".to_string(),
+            data_types: vec![DataTypeDecl {
+                name: "Foreign".to_string(),
+                fields: vec![FieldDecl {
+                    name: "value".to_string(),
+                    ty: prim("u64"),
+                    offset: None,
+                    width: Some(8),
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let object = petal_object(0x35, hash, "Box", 7u64.to_be_bytes().to_vec());
+
+        assert!(decode_object_fields(hash, &object, &object_type, &manifest, &[]).is_err());
+        let fields = decode_object_fields(
+            hash,
+            &object,
+            &object_type,
+            &manifest,
+            &[(foreign_hash, foreign_manifest)],
+        )
+        .unwrap();
+        assert_eq!(fields["foreign"], json!({ "value": "7" }));
+    }
+
+    #[test]
+    fn state_field_decoder_decodes_nested_structs_and_vectors() {
         let hash = Hash32([0x55; 32]);
         let stats = object_type(
             "Stats",
             vec![("count", prim("u32")), ("enabled", prim("bool"))],
         );
-        let coin = TypeTag::Concrete {
-            petal_hash: [0; 32],
-            type_name: "Coin".to_string(),
-            type_args: vec![prim("LOOM")],
-        };
         let object_type = object_type(
             "Vault",
             vec![
@@ -1584,7 +1571,7 @@ mod tests {
                         type_args: vec![],
                     },
                 ),
-                ("coins", vector(coin)),
+                ("amounts", vector(prim("u128"))),
             ],
         );
         let manifest = full_manifest("/bloom/petals/dex/vault", vec![stats, object_type.clone()]);
@@ -1592,10 +1579,8 @@ mod tests {
         let mut payload = Vec::new();
         payload.extend_from_slice(&42u32.to_be_bytes());
         payload.push(1);
-        payload.extend_from_slice(&(2u32).to_be_bytes());
-        payload.extend_from_slice(&[0xA0; 32]);
+        payload.push(2);
         payload.extend_from_slice(&7u128.to_be_bytes());
-        payload.extend_from_slice(&[0xB0; 32]);
         payload.extend_from_slice(&9u128.to_be_bytes());
         let object = Object {
             id: ObjectId([0x66; 32]),
@@ -1609,15 +1594,9 @@ mod tests {
             payload,
         };
 
-        let fields = decode_object_fields(hash, &object, &object_type, &manifest);
+        let fields = decode_object_fields(hash, &object, &object_type, &manifest, &[]).unwrap();
         assert_eq!(fields["stats"], json!({ "count": 42, "enabled": true }));
-        assert_eq!(
-            fields["coins"],
-            json!([
-                { "id": hex::encode([0xA0; 32]), "value": "7" },
-                { "id": hex::encode([0xB0; 32]), "value": "9" },
-            ])
-        );
+        assert_eq!(fields["amounts"], json!(["7", "9"]));
     }
 
     #[test]
@@ -1636,12 +1615,10 @@ mod tests {
             )],
         );
         let manifest = full_manifest("/bloom/petals/dex/bag", vec![empty, object_type.clone()]);
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&u32::MAX.to_be_bytes());
+        let payload = vec![1];
         let object = petal_object(0x77, hash, "Bag", payload);
 
-        let fields = decode_object_fields(hash, &object, &object_type, &manifest);
-        assert_eq!(fields["items"], json!({ "hex": "ffffffff" }));
+        assert!(decode_object_fields(hash, &object, &object_type, &manifest, &[]).is_err());
     }
 
     #[tokio::test]

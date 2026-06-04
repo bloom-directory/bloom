@@ -19,10 +19,11 @@ use bloom_objects::codec::{
 use bloom_objects::{AbilitySet, AccessMode, TypeTag};
 
 use crate::types::{
-    ArgDecl, ArgKind, ArithExpr, BoundedArithOp, CapabilityDecl, CmpOp, ExternalTypeRef, FieldDecl,
-    FuelHints, FunctionDecl, HostImportDecl, InvariantDecl, InvariantTarget, ObjectTypeDecl,
-    OverflowPolicy, PetalManifestV0, PredicateAst, SCHEMA_VERSION, SemVer, TypeParamDecl,
-    TypeParamKind, WasmFuncSig, WasmValType, Widening,
+    ArgDecl, ArgKind, ArithExpr, BoundedArithOp, CapabilityDecl, CmpOp, DataTypeDecl, EnumTypeDecl,
+    ExternalTypeRef, FieldDecl, FuelHints, FunctionDecl, HostImportDecl, InvariantDecl,
+    InvariantTarget, ObjectTypeDecl, OverflowPolicy, PetalManifestV0, PredicateAst, SCHEMA_VERSION,
+    SemVer, TypeParamDecl, TypeParamKind, VariantDecl, VariantFieldsDecl, WasmFuncSig, WasmValType,
+    Widening,
 };
 
 const MAX_MANIFEST_LIST_ITEMS: usize = 16_384;
@@ -40,7 +41,7 @@ pub fn encode(manifest: &PetalManifestV0) -> Result<Vec<u8>, CodecError> {
 
 /// Canonical-encode the manifest into an existing buffer.
 pub fn encode_into(manifest: &PetalManifestV0, buf: &mut Vec<u8>) -> Result<(), CodecError> {
-    if !matches!(manifest.schema_version, 1 | SCHEMA_VERSION) {
+    if manifest.schema_version != SCHEMA_VERSION {
         return Err(CodecError::InvalidLength(manifest.schema_version as u64));
     }
     write_u32_be(buf, manifest.schema_version);
@@ -49,11 +50,9 @@ pub fn encode_into(manifest: &PetalManifestV0, buf: &mut Vec<u8>) -> Result<(), 
     write_option_hash(buf, manifest.parent_version.as_ref());
     write_list(buf, &manifest.object_types, write_object_type_decl)?;
     write_list(buf, &manifest.capability_types, write_capability_decl)?;
-    match manifest.schema_version {
-        1 => write_list(buf, &manifest.functions, write_function_decl_v1)?,
-        SCHEMA_VERSION => write_list(buf, &manifest.functions, write_function_decl_v2)?,
-        other => return Err(CodecError::InvalidLength(other as u64)),
-    }
+    write_list(buf, &manifest.data_types, write_data_type_decl)?;
+    write_list(buf, &manifest.enum_types, write_enum_type_decl)?;
+    write_list(buf, &manifest.functions, write_function_decl)?;
     write_list(buf, &manifest.invariants, write_invariant_decl)?;
     write_list(buf, &manifest.required_host_imports, write_host_import_decl)?;
     write_list(buf, &manifest.external_type_refs, write_external_type_ref)?;
@@ -72,7 +71,7 @@ pub fn decode(bytes: &[u8]) -> Result<PetalManifestV0, CodecError> {
 /// Decode from a cursor (allows trailing bytes; used when nested).
 pub fn decode_from(rdr: &mut &[u8]) -> Result<PetalManifestV0, CodecError> {
     let schema_version = read_u32_be(rdr)?;
-    if !matches!(schema_version, 1 | SCHEMA_VERSION) {
+    if schema_version != SCHEMA_VERSION {
         return Err(CodecError::InvalidLength(schema_version as u64));
     }
     let module_path = read_string(rdr)?;
@@ -80,11 +79,9 @@ pub fn decode_from(rdr: &mut &[u8]) -> Result<PetalManifestV0, CodecError> {
     let parent_version = read_option_hash(rdr)?;
     let object_types = read_list(rdr, read_object_type_decl)?;
     let capability_types = read_list(rdr, read_capability_decl)?;
-    let functions = match schema_version {
-        1 => read_list(rdr, read_function_decl_v1)?,
-        SCHEMA_VERSION => read_list(rdr, read_function_decl_v2)?,
-        other => return Err(CodecError::InvalidLength(other as u64)),
-    };
+    let data_types = read_list(rdr, read_data_type_decl)?;
+    let enum_types = read_list(rdr, read_enum_type_decl)?;
+    let functions = read_list(rdr, read_function_decl)?;
     let invariants = read_list(rdr, read_invariant_decl)?;
     let required_host_imports = read_list(rdr, read_host_import_decl)?;
     let external_type_refs = read_list(rdr, read_external_type_ref)?;
@@ -96,6 +93,8 @@ pub fn decode_from(rdr: &mut &[u8]) -> Result<PetalManifestV0, CodecError> {
         parent_version,
         object_types,
         capability_types,
+        data_types,
+        enum_types,
         functions,
         invariants,
         required_host_imports,
@@ -265,13 +264,82 @@ fn read_object_type_decl(rdr: &mut &[u8]) -> Result<ObjectTypeDecl, CodecError> 
 fn write_capability_decl(buf: &mut Vec<u8>, c: &CapabilityDecl) -> Result<(), CodecError> {
     write_string(buf, &c.name)?;
     write_list(buf, &c.type_params, write_type_param)?;
+    write_list(buf, &c.fields, write_field_decl)?;
     Ok(())
 }
 
 fn read_capability_decl(rdr: &mut &[u8]) -> Result<CapabilityDecl, CodecError> {
     let name = read_string(rdr)?;
     let type_params = read_list(rdr, read_type_param)?;
-    Ok(CapabilityDecl { name, type_params })
+    let fields = read_list(rdr, read_field_decl)?;
+    Ok(CapabilityDecl {
+        name,
+        type_params,
+        fields,
+    })
+}
+
+fn write_data_type_decl(buf: &mut Vec<u8>, d: &DataTypeDecl) -> Result<(), CodecError> {
+    write_string(buf, &d.name)?;
+    write_list(buf, &d.type_params, write_type_param)?;
+    write_list(buf, &d.fields, write_field_decl)?;
+    Ok(())
+}
+
+fn read_data_type_decl(rdr: &mut &[u8]) -> Result<DataTypeDecl, CodecError> {
+    let name = read_string(rdr)?;
+    let type_params = read_list(rdr, read_type_param)?;
+    let fields = read_list(rdr, read_field_decl)?;
+    Ok(DataTypeDecl {
+        name,
+        type_params,
+        fields,
+    })
+}
+
+fn write_enum_type_decl(buf: &mut Vec<u8>, e: &EnumTypeDecl) -> Result<(), CodecError> {
+    write_string(buf, &e.name)?;
+    write_list(buf, &e.type_params, write_type_param)?;
+    write_list(buf, &e.variants, write_variant_decl)?;
+    Ok(())
+}
+
+fn read_enum_type_decl(rdr: &mut &[u8]) -> Result<EnumTypeDecl, CodecError> {
+    let name = read_string(rdr)?;
+    let type_params = read_list(rdr, read_type_param)?;
+    let variants = read_list(rdr, read_variant_decl)?;
+    Ok(EnumTypeDecl {
+        name,
+        type_params,
+        variants,
+    })
+}
+
+fn write_variant_decl(buf: &mut Vec<u8>, v: &VariantDecl) -> Result<(), CodecError> {
+    write_string(buf, &v.name)?;
+    match &v.fields {
+        VariantFieldsDecl::Unit => write_u8(buf, 0),
+        VariantFieldsDecl::Tuple(types) => {
+            write_u8(buf, 1);
+            write_list(buf, types, write_type_tag)?;
+        }
+        VariantFieldsDecl::Struct(fields) => {
+            write_u8(buf, 2);
+            write_list(buf, fields, write_field_decl)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_variant_decl(rdr: &mut &[u8]) -> Result<VariantDecl, CodecError> {
+    let name = read_string(rdr)?;
+    let fields = match read_u8(rdr)? {
+        0 => VariantFieldsDecl::Unit,
+        1 => VariantFieldsDecl::Tuple(read_list(rdr, read_type_tag)?),
+        2 => VariantFieldsDecl::Struct(read_list(rdr, read_field_decl)?),
+        other => return Err(CodecError::InvalidDiscriminant(other)),
+    };
+    Ok(VariantDecl { name, fields })
 }
 
 fn write_arg_decl(buf: &mut Vec<u8>, a: &ArgDecl) -> Result<(), CodecError> {
@@ -313,8 +381,9 @@ fn read_arg_decl(rdr: &mut &[u8]) -> Result<ArgDecl, CodecError> {
     Ok(ArgDecl { name, kind })
 }
 
-fn write_function_decl_v1(buf: &mut Vec<u8>, f: &FunctionDecl) -> Result<(), CodecError> {
+fn write_function_decl(buf: &mut Vec<u8>, f: &FunctionDecl) -> Result<(), CodecError> {
     write_string(buf, &f.name)?;
+    write_u8(buf, u8::from(f.view));
     write_list(buf, &f.type_params, write_type_param)?;
     write_list(buf, &f.args, write_arg_decl)?;
     write_list(buf, &f.returns, write_type_tag)?;
@@ -329,14 +398,13 @@ fn write_function_decl_v1(buf: &mut Vec<u8>, f: &FunctionDecl) -> Result<(), Cod
     Ok(())
 }
 
-fn write_function_decl_v2(buf: &mut Vec<u8>, f: &FunctionDecl) -> Result<(), CodecError> {
-    write_function_decl_v1(buf, f)?;
-    write_u8(buf, u8::from(f.view));
-    Ok(())
-}
-
-fn read_function_decl_v1(rdr: &mut &[u8]) -> Result<FunctionDecl, CodecError> {
+fn read_function_decl(rdr: &mut &[u8]) -> Result<FunctionDecl, CodecError> {
     let name = read_string(rdr)?;
+    let view = match read_u8(rdr)? {
+        0 => false,
+        1 => true,
+        other => return Err(CodecError::InvalidDiscriminant(other)),
+    };
     let type_params = read_list(rdr, read_type_param)?;
     let args = read_list(rdr, read_arg_decl)?;
     let returns = read_list(rdr, read_type_tag)?;
@@ -349,7 +417,7 @@ fn read_function_decl_v1(rdr: &mut &[u8]) -> Result<FunctionDecl, CodecError> {
     }
     Ok(FunctionDecl {
         name,
-        view: false,
+        view,
         type_params,
         args,
         returns,
@@ -357,16 +425,6 @@ fn read_function_decl_v1(rdr: &mut &[u8]) -> Result<FunctionDecl, CodecError> {
         required_capabilities,
         attached_invariants,
     })
-}
-
-fn read_function_decl_v2(rdr: &mut &[u8]) -> Result<FunctionDecl, CodecError> {
-    let mut f = read_function_decl_v1(rdr)?;
-    f.view = match read_u8(rdr)? {
-        0 => false,
-        1 => true,
-        other => return Err(CodecError::InvalidDiscriminant(other)),
-    };
-    Ok(f)
 }
 
 fn write_invariant_decl(buf: &mut Vec<u8>, inv: &InvariantDecl) -> Result<(), CodecError> {
@@ -772,6 +830,48 @@ mod tests {
             capability_types: vec![CapabilityDecl {
                 name: "AdminCap".to_string(),
                 type_params: vec![],
+                fields: vec![FieldDecl {
+                    name: "id".to_string(),
+                    ty: TypeTag::Concrete {
+                        petal_hash: [0u8; 32],
+                        type_name: "UID".to_string(),
+                        type_args: vec![],
+                    },
+                    offset: Some(0),
+                    width: Some(32),
+                }],
+            }],
+            data_types: vec![DataTypeDecl {
+                name: "Quote".to_string(),
+                type_params: vec![],
+                fields: vec![FieldDecl {
+                    name: "amount".to_string(),
+                    ty: TypeTag::Concrete {
+                        petal_hash: [0u8; 32],
+                        type_name: "u128".to_string(),
+                        type_args: vec![],
+                    },
+                    offset: None,
+                    width: Some(16),
+                }],
+            }],
+            enum_types: vec![EnumTypeDecl {
+                name: "Side".to_string(),
+                type_params: vec![],
+                variants: vec![
+                    VariantDecl {
+                        name: "Bid".to_string(),
+                        fields: VariantFieldsDecl::Unit,
+                    },
+                    VariantDecl {
+                        name: "Ask".to_string(),
+                        fields: VariantFieldsDecl::Tuple(vec![TypeTag::Concrete {
+                            petal_hash: [0u8; 32],
+                            type_name: "u64".to_string(),
+                            type_args: vec![],
+                        }]),
+                    },
+                ],
             }],
             functions: vec![FunctionDecl {
                 name: "swap".to_string(),
@@ -871,7 +971,7 @@ mod tests {
 
     #[test]
     fn snapshot_minimal_first_bytes() {
-        // schema_version (2) || module_path ("/x" = 2 bytes)
+        // schema_version (3) || module_path ("/x" = 2 bytes)
         let m = PetalManifestV0 {
             schema_version: SCHEMA_VERSION,
             module_path: "/x".to_string(),
@@ -879,8 +979,8 @@ mod tests {
             ..Default::default()
         };
         let bytes = encode(&m).unwrap();
-        // [0,0,0,2] schema || [0,2] len || "/x" || semver [0,0,0,1,0,0] || option none [0] || 6 empty lists of u32 zero || fuel_hints len 0 || default none 0
-        assert_eq!(&bytes[..4], &[0, 0, 0, 2]);
+        // [0,0,0,3] schema || [0,2] len || "/x" || semver [0,0,0,1,0,0] || option none [0] || empty declaration lists
+        assert_eq!(&bytes[..4], &[0, 0, 0, 3]);
         assert_eq!(&bytes[4..6], &[0, 2]);
         assert_eq!(&bytes[6..8], b"/x");
         assert_eq!(&bytes[8..14], &[0, 0, 0, 1, 0, 0]);
@@ -1056,7 +1156,7 @@ mod tests {
     }
 
     #[test]
-    fn function_view_round_trips_in_schema_v2() {
+    fn function_view_round_trips_in_schema_v3() {
         let m = PetalManifestV0 {
             schema_version: SCHEMA_VERSION,
             module_path: "/p".to_string(),
@@ -1073,7 +1173,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_function_decodes_with_view_false() {
+    fn schema_v1_manifest_is_rejected() {
         let m = PetalManifestV0 {
             schema_version: 1,
             module_path: "/p".to_string(),
@@ -1084,11 +1184,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let bytes = encode(&m).unwrap();
-        let back = decode(&bytes).unwrap();
-        assert_eq!(back.schema_version, 1);
-        assert_eq!(back.functions[0].name, "legacy");
-        assert!(!back.functions[0].view);
+        assert!(encode(&m).is_err());
     }
 
     #[test]

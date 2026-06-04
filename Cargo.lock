@@ -2079,6 +2079,8 @@ dependencies = [
  "bloom-keystore",
  "bloom-mount",
  "bloom-objects",
+ "bloom-petal-fungible",
+ "bloom-petal-manifest",
  "bloom-petals",
  "bloom-proto",
  "bloom-ptb-builder",
@@ -2086,6 +2088,7 @@ dependencies = [
  "bloom-test-util",
  "bloom-tools",
  "bloom-tx",
+ "bloom-value",
  "bloom-vfs",
  "clap",
  "clap_complete",
@@ -2163,6 +2166,7 @@ dependencies = [
  "bloom-petals",
  "bloom-script",
  "bloom-test-util",
+ "bloom-value",
  "clap",
  "hex",
  "parking_lot 0.12.5",
@@ -2439,6 +2443,7 @@ dependencies = [
  "bloom-resource",
  "bloom-resource-macros",
  "bloom-script",
+ "bloom-value",
 ]
 
 [[package]]
@@ -2456,6 +2461,7 @@ name = "bloom-petal-dex-faucet"
 version = "0.1.0"
 dependencies = [
  "bloom-objects",
+ "bloom-petal-fungible",
  "bloom-resource",
  "bloom-resource-macros",
 ]
@@ -2499,8 +2505,11 @@ version = "0.1.0"
 dependencies = [
  "bloom-dex-math",
  "bloom-objects",
+ "bloom-petal-fungible",
+ "bloom-petal-manifest",
  "bloom-resource",
  "bloom-resource-macros",
+ "bloom-value",
 ]
 
 [[package]]
@@ -2510,6 +2519,7 @@ dependencies = [
  "bloom-dex-math",
  "bloom-objects",
  "bloom-petal-dex-pool",
+ "bloom-petal-fungible",
  "bloom-resource",
  "bloom-resource-macros",
 ]
@@ -2528,8 +2538,10 @@ name = "bloom-petal-fungible"
 version = "0.1.0"
 dependencies = [
  "bloom-objects",
+ "bloom-petal-manifest",
  "bloom-resource",
  "bloom-resource-macros",
+ "bloom-value",
 ]
 
 [[package]]
@@ -2576,6 +2588,7 @@ dependencies = [
  "bloom-chain-types",
  "bloom-objects",
  "bloom-script",
+ "bloom-value",
  "wasmparser 0.218.1",
 ]
 
@@ -2592,6 +2605,7 @@ dependencies = [
  "bloom-petal-manifest",
  "bloom-proto",
  "bloom-script",
+ "bloom-value",
  "bloom-vfs",
  "futures",
  "hex",
@@ -2650,7 +2664,9 @@ version = "0.1.0"
 dependencies = [
  "bloom-chain-types",
  "bloom-objects",
+ "bloom-petal-fungible",
  "bloom-petal-manifest",
+ "bloom-resource",
  "bloom-script",
  "thiserror 2.0.18",
 ]
@@ -2661,6 +2677,7 @@ version = "0.1.0"
 dependencies = [
  "bloom-chain-types",
  "bloom-objects",
+ "bloom-value",
  "thiserror 2.0.18",
 ]
 
@@ -2724,6 +2741,8 @@ dependencies = [
  "blake3",
  "bloom-chain-types",
  "bloom-objects",
+ "bloom-resource",
+ "bloom-value",
  "hex",
  "serde_json",
  "thiserror 2.0.18",
@@ -2788,6 +2807,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-value"
+version = "0.1.0"
+dependencies = [
+ "bloom-objects",
+ "hex",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bloom-vfs"
 version = "0.1.0"
 dependencies = [
@@ -2804,6 +2833,7 @@ dependencies = [
  "bloom-keystore",
  "bloom-mempool",
  "bloom-objects",
+ "bloom-petal-fungible",
  "bloom-petal-manifest",
  "bloom-prices",
  "bloom-proto",
@@ -2813,6 +2843,7 @@ dependencies = [
  "bloom-script",
  "bloom-tools",
  "bloom-tx",
+ "bloom-value",
  "bloom-watch",
  "hex",
  "lru 0.12.5",

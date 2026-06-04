@@ -30,10 +30,24 @@ use bloom_chain_node::petal_executor::{ChainPetalExecutor, ChainPetalExecutorWit
 use bloom_chain_state::State;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
-use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey, TypeTag};
+use bloom_objects::{
+    AbilitySet, BUILTIN_TYPE_HASH, OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey,
+    TypeTag,
+};
+use bloom_petal_fungible::ops::coin_payload;
+use bloom_petal_manifest::{
+    codec,
+    types::{
+        ArgDecl, ArgKind, DataTypeDecl, FieldDecl, FunctionDecl, MANIFEST_CUSTOM_SECTION,
+        ObjectTypeDecl, PetalManifestV0, SCHEMA_VERSION, SemVer,
+    },
+};
 use bloom_script::{
     CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH,
-    chain_iface::{ArgDeclStub, FunctionDeclStub, PetalManifestStub},
+    chain_iface::{
+        ArgDeclStub, DataTypeDeclStub, FieldDeclStub, FunctionDeclStub, ObjectTypeDeclStub,
+        PetalManifestStub,
+    },
     encode_ptb, loom_coin_type_tag,
     types::{Arg, Command, MoveCmd, PetalRef, PqSignature, PtbTx},
 };
@@ -58,6 +72,39 @@ fn submit_ptb_tx(sender: Address, ptb_bytes: Vec<u8>) -> Tx {
 /// does not look the account up before dispatching to the PTB path.
 fn test_sender() -> Address {
     Address([0x11u8; 32])
+}
+
+fn leb128(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(b);
+            return;
+        }
+        out.push(b | 0x80);
+    }
+}
+
+fn append_manifest(mut wasm: Vec<u8>, manifest: PetalManifestV0) -> Vec<u8> {
+    let bytes = codec::encode(&manifest).expect("manifest encodes");
+    let mut custom = Vec::new();
+    leb128(&mut custom, MANIFEST_CUSTOM_SECTION.len() as u64);
+    custom.extend_from_slice(MANIFEST_CUSTOM_SECTION.as_bytes());
+    custom.extend_from_slice(&bytes);
+
+    wasm.push(0);
+    leb128(&mut wasm, custom.len() as u64);
+    wasm.extend_from_slice(&custom);
+    wasm
+}
+
+fn builtin_type(name: &str) -> TypeTag {
+    TypeTag::Concrete {
+        petal_hash: BUILTIN_TYPE_HASH,
+        type_name: name.to_string(),
+        type_args: vec![],
+    }
 }
 
 /// Test 1: PTB bytes that do not decode (empty payload) MUST revert
@@ -206,15 +253,6 @@ fn wat(src: &str) -> Vec<u8> {
     wat::parse_str(src).expect("valid WAT")
 }
 
-/// Build the canonical `Coin<LOOM>` payload for a balance.
-///
-/// Canonical on-chain format: [ObjectId placeholder (32 bytes)] || [value BE (16 bytes)].
-fn coin_payload(value: u128) -> Vec<u8> {
-    let mut p = vec![0u8; 32];
-    p.extend_from_slice(&value.to_be_bytes());
-    p
-}
-
 /// Mint a `Coin<LOOM>` object at `id` owned by `owner`, holding
 /// `value` bloomwei. Tests bind the bootstrap fungible VFS path to the
 /// sentinel hash explicitly, matching pre-pin genesis behavior.
@@ -304,26 +342,26 @@ fn nullary_move_ptb(
 // ---------------------------------------------------------------------------
 
 // The PTB executor parses `petal.return`'d bytes as a length-prefixed
-// envelope: `count u32 BE | for each: (len u32 BE | bytes)`. To return
-// one 32-byte slot we therefore lay out 40 bytes:
+// envelope: `count u32 BE | for each: (len ULEB128 | bytes)`. To return
+// one 32-byte slot we therefore lay out 37 bytes:
 //
 //   offset 0..4   = 0x00000001  (count = 1 slot)
-//   offset 4..8   = 0x00000020  (len   = 32 bytes)
-//   offset 8..40  = 32 bytes the host writes via `signer.address(0, 8)`
+//   offset 4..5   = 0x20        (len   = 32 bytes)
+//   offset 5..37  = 32 bytes the host writes via `signer.address(0, 5)`
 //
-// Then `petal.return(0, 40)` ships the whole envelope back.
+// Then `petal.return(0, 37)` ships the whole envelope back.
 const SIGNER_FETCH_PETAL: &str = r#"
 (module
   (import "signer" "address"     (func $sa  (param i32 i32) (result i32)))
   (import "chain"  "petal.return" (func $ret (param i32 i32)))
   (memory (export "memory") 1)
-  ;; Pre-seed the length-prefixed envelope header: count=1, len=32 (BE).
-  (data (i32.const 0) "\00\00\00\01\00\00\00\20")
+  ;; Pre-seed the length-prefixed envelope header: count=1, len=32.
+  (data (i32.const 0) "\00\00\00\01\20")
   (func (export "__petal_get_signer") (param i32 i32) (result i32)
-    ;; signer.address(0, 8) — writes 32 signer bytes after the header.
-    (drop (call $sa (i32.const 0) (i32.const 8)))
-    ;; Ship the full 40-byte envelope back to the executor.
-    (call $ret (i32.const 0) (i32.const 40))
+    ;; signer.address(0, 5) — writes 32 signer bytes after the header.
+    (drop (call $sa (i32.const 0) (i32.const 5)))
+    ;; Ship the full 37-byte envelope back to the executor.
+    (call $ret (i32.const 0) (i32.const 37))
     i32.const 0)
 )
 "#;
@@ -342,7 +380,7 @@ fn signer_address_zero_resolves_to_first_signer() {
     let mut manifests = HashMap::new();
     manifests.insert(
         petal_hash,
-        manifest_with_nullary_fn_returns("get_signer", vec![TypeTag::External { ref_idx: 0 }]),
+        manifest_with_nullary_fn_returns("get_signer", vec![builtin_type("Address")]),
     );
 
     let ptb = nullary_move_ptb(signer, petal_hash, "get_signer", gas_payer_id, 100);
@@ -578,18 +616,17 @@ fn out_of_fuel_reverts_atomically() {
 // ---------------------------------------------------------------------------
 
 /// WAT petal that:
-///   1. Reads a 90-byte `Const` blob from calldata starting at byte 9
-///      (the marshalled layout is `[u32 count=1][u8 tag=1][u32 len=90]
-///      [90 bytes]`).
-///   2. The 90-byte blob holds: `[u16 BE type_tag_len=38][38 type_tag
-///      bytes][u16 BE payload_len=16][16 payload bytes][32 recipient
-///      bytes]`. We pass the type tag dynamically because it embeds
-///      the petal's content hash, which is only known after the petal
-///      is published.
-///   3. Calls `object.create(type_tag_ptr=2, type_tag_len=38,
-///      payload_ptr=42, payload_len=16)` → handle.
+///   1. Reads an 86-byte canonical `CreateAndTransfer` const from calldata
+///      starting at byte 9 (the marshalled layout is `[u32 count=1][u8 tag=1]
+///      [u32 len=86][86 bytes]`).
+///   2. The canonical struct holds: `[38 type_tag bytes][16 u128 value bytes]
+///      [32 recipient bytes]`. We pass the type tag dynamically because it
+///      embeds the petal's content hash, which is only known after the petal is
+///      published.
+///   3. Calls `object.create(type_tag_ptr=0, type_tag_len=38,
+///      payload_ptr=38, payload_len=16)` → handle.
 ///   4. Calls `object.transfer(handle, OWNER_KIND_ADDRESS=0,
-///      recipient_ptr=58, 32)`.
+///      recipient_ptr=54, 32)`.
 const CREATE_AND_TRANSFER_PETAL: &str = r#"
 (module
   (import "chain"  "msg.calldata.read"
@@ -601,26 +638,26 @@ const CREATE_AND_TRANSFER_PETAL: &str = r#"
   (memory (export "memory") 1)
 
   (func (export "__petal_create_and_transfer") (param i32 i32) (result i32)
-    ;; Pull the 90-byte Const payload out of calldata into memory[0..90].
-    ;; Const payload starts at calldata offset 9
-    ;; (4-byte count u32 BE | 1-byte tag=1 | 4-byte len u32 BE).
+    ;; Pull the 86-byte Const payload out of calldata into memory[0..86].
+    ;; Const payload starts at calldata offset 6
+    ;; (4-byte count u32 BE | 1-byte tag=1 | 1-byte ULEB128 len=86).
     (drop (call $cdread
             (i32.const 0)   ;; dst_ptr
-            (i32.const 9)   ;; offset
-            (i32.const 90))) ;; len
+            (i32.const 6)   ;; offset
+            (i32.const 86))) ;; len
 
-    ;; object.create(type_tag_ptr=2, type_tag_len=38,
-    ;;               payload_ptr=42, payload_len=16) -> handle
-    ;; (mem layout: [u16 BE tag_len][38 tag][u16 BE pay_len][16 pay][32 recip])
-    ;;                 0..2          2..40    40..42         42..58   58..90
+    ;; object.create(type_tag_ptr=0, type_tag_len=38,
+    ;;               payload_ptr=38, payload_len=16) -> handle
+    ;; (mem layout: [38 tag][16 value][32 recipient])
+    ;;                 0..38  38..54    54..86
     (drop (call $otransfer
             (call $ocreate
-                  (i32.const 2)
+                  (i32.const 0)
                   (i32.const 38)
-                  (i32.const 42)
+                  (i32.const 38)
                   (i32.const 16))
             (i32.const 0)   ;; OWNER_KIND_ADDRESS
-            (i32.const 58)  ;; recipient_ptr
+            (i32.const 54)  ;; recipient_ptr
             (i32.const 32))) ;; recipient_len
 
     i32.const 0)
@@ -628,26 +665,67 @@ const CREATE_AND_TRANSFER_PETAL: &str = r#"
 "#;
 
 /// Compute the deterministic ObjectId the host's `derive_create_id`
-/// will produce for `(ptb_digest, petal_hash, type_tag_bytes,
-/// payload_bytes, created_objects_so_far=0)`. Mirrors `bloom-petals`
-/// exactly.
-fn derive_create_id_test(
-    ptb_digest: [u8; 32],
-    petal_hash: [u8; 32],
-    tag_bytes: &[u8],
-    payload: &[u8],
-) -> ObjectId {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"bloom.object.create.v1\0");
-    hasher.update(&ptb_digest);
-    hasher.update(&petal_hash);
-    hasher.update(&0u64.to_be_bytes()); // first object created in this PTB
-    hasher.update(tag_bytes);
-    hasher.update(payload);
-    let h = hasher.finalize();
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(h.as_bytes());
-    ObjectId(arr)
+/// will produce for `(ptb_digest, type_tag, payload_bytes,
+/// created_objects_so_far=0)`. Mirrors `bloom-petals` exactly.
+fn derive_create_id_test(ptb_digest: [u8; 32], type_tag: &TypeTag, payload: &[u8]) -> ObjectId {
+    ObjectId::derive_for_type_tag(&Hash32(ptb_digest), 0, type_tag, payload)
+}
+
+fn create_and_transfer_manifest() -> PetalManifestV0 {
+    let input_type = TypeTag::Concrete {
+        petal_hash: [0u8; 32],
+        type_name: "CreateAndTransfer".to_string(),
+        type_args: vec![],
+    };
+    PetalManifestV0 {
+        schema_version: SCHEMA_VERSION,
+        module_path: "/test/e2e".to_string(),
+        framework_version: SemVer::new(0, 1, 0),
+        object_types: vec![ObjectTypeDecl {
+            name: "T".to_string(),
+            abilities: AbilitySet::key_store(),
+            type_params: vec![],
+            fields: vec![FieldDecl {
+                name: "value".to_string(),
+                ty: builtin_type("u128"),
+                offset: Some(0),
+                width: Some(16),
+            }],
+        }],
+        data_types: vec![DataTypeDecl {
+            name: "CreateAndTransfer".to_string(),
+            type_params: vec![],
+            fields: vec![
+                FieldDecl {
+                    name: "tag".to_string(),
+                    ty: builtin_type("TypeTag"),
+                    offset: None,
+                    width: None,
+                },
+                FieldDecl {
+                    name: "value".to_string(),
+                    ty: builtin_type("u128"),
+                    offset: None,
+                    width: Some(16),
+                },
+                FieldDecl {
+                    name: "recipient".to_string(),
+                    ty: builtin_type("Address"),
+                    offset: None,
+                    width: Some(32),
+                },
+            ],
+        }],
+        functions: vec![FunctionDecl {
+            name: "create_and_transfer".to_string(),
+            args: vec![ArgDecl {
+                name: "input".to_string(),
+                kind: ArgKind::Const(input_type),
+            }],
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -662,7 +740,10 @@ fn object_create_then_transfer_round_trips_through_unified_ctx() {
     // Build state + register the petal --------------------------------
     let mut state = State::new();
     bind_bootstrap_fungible(&mut state);
-    let wasm = wat(CREATE_AND_TRANSFER_PETAL);
+    let wasm = append_manifest(
+        wat(CREATE_AND_TRANSFER_PETAL),
+        create_and_transfer_manifest(),
+    );
     let petal_hash = state.insert_code(&wasm);
     state.set_object(make_loom_coin(gas_payer_id, signer, 1_000_000_000));
 
@@ -673,6 +754,11 @@ fn object_create_then_transfer_round_trips_through_unified_ctx() {
         type_name: new_obj_type_name.to_string(),
         type_args: vec![],
     };
+    let input_type = TypeTag::Concrete {
+        petal_hash: petal_hash.0,
+        type_name: "CreateAndTransfer".to_string(),
+        type_args: vec![],
+    };
     let tag_bytes = new_obj_type.encode_canonical().expect("encode type tag");
     assert_eq!(
         tag_bytes.len(),
@@ -680,28 +766,53 @@ fn object_create_then_transfer_round_trips_through_unified_ctx() {
         "type tag size assumption for 1-char name + 0 type args",
     );
 
-    // Assemble the 90-byte calldata blob -------------------------------
-    //   [u16 BE tag_len=38][38 tag][u16 BE pay_len=16][16 pay][32 recip]
-    let mut blob = Vec::with_capacity(90);
-    blob.extend_from_slice(&(tag_bytes.len() as u16).to_be_bytes());
+    // Assemble the 86-byte canonical CreateAndTransfer payload ---------
+    //   [38 tag][16 u128 value][32 recipient]
+    let mut blob = Vec::with_capacity(86);
     blob.extend_from_slice(&tag_bytes);
-    blob.extend_from_slice(&(new_obj_payload.len() as u16).to_be_bytes());
     blob.extend_from_slice(&new_obj_payload);
     blob.extend_from_slice(&recipient);
-    assert_eq!(blob.len(), 90);
+    assert_eq!(blob.len(), 86);
 
-    // Build a manifest declaring one `Const` arg of arbitrary type --
-    // the validator only checks variant-shape, not the inner TypeTag.
+    // Build a manifest declaring the same canonical input struct that the wasm
+    // manifest exposes.
     let mut manifests = HashMap::new();
     manifests.insert(
         petal_hash,
         PetalManifestStub {
             module_path: "/test/e2e".to_string(),
+            object_types: vec![ObjectTypeDeclStub {
+                name: new_obj_type_name.to_string(),
+                abilities: AbilitySet::key_store(),
+                fields: vec![FieldDeclStub {
+                    name: "value".to_string(),
+                    ty: builtin_type("u128"),
+                }],
+                ..ObjectTypeDeclStub::default()
+            }],
+            data_types: vec![DataTypeDeclStub {
+                name: "CreateAndTransfer".to_string(),
+                fields: vec![
+                    FieldDeclStub {
+                        name: "tag".to_string(),
+                        ty: builtin_type("TypeTag"),
+                    },
+                    FieldDeclStub {
+                        name: "value".to_string(),
+                        ty: builtin_type("u128"),
+                    },
+                    FieldDeclStub {
+                        name: "recipient".to_string(),
+                        ty: builtin_type("Address"),
+                    },
+                ],
+                ..DataTypeDeclStub::default()
+            }],
             functions: vec![FunctionDeclStub {
                 view: false,
                 name: "create_and_transfer".to_string(),
                 type_params: vec![],
-                args: vec![ArgDeclStub::Const(new_obj_type.clone())],
+                args: vec![ArgDeclStub::Const(input_type)],
                 returns: vec![],
                 required_signers: 0,
                 required_capabilities: vec![],
@@ -755,12 +866,7 @@ fn object_create_then_transfer_round_trips_through_unified_ctx() {
     state.apply(ws).expect("apply write set");
 
     // Compute the deterministic ObjectId the host produced.
-    let new_id = derive_create_id_test(
-        ptb.signing_digest(),
-        petal_hash.0,
-        &tag_bytes,
-        &new_obj_payload,
-    );
+    let new_id = derive_create_id_test(ptb.signing_digest(), &new_obj_type, &new_obj_payload);
 
     // Assert 2 — the new object lives at the derived id with the right
     // owner. Before the P0-2 fix this lookup returned `None` because

@@ -23,14 +23,76 @@
 //! 16. `create_burn_cap` does not exist — BurnCap only comes from
 //!     `create_currency` (Gap 3 — verified by absence of the symbol).
 
-use bloom_objects::{AccessMode, ObjectId, Owner};
+use bloom_objects::{AccessMode, BUILTIN_TYPE_HASH, ObjectId, Owner, TypeTag};
+use bloom_petal_fungible::fungible;
 use bloom_petal_fungible::ops;
 use bloom_resource::host::{HostCall, HostResponse, test_hooks};
 use bloom_resource::{Capability, PetalError, Resource, RuntimeHandle};
+use bloom_value::{CodecLimits, validate_value_bytes};
 
 /// Reset the mock host before every test.
 fn fresh() {
     test_hooks::clear();
+}
+
+fn self_type(name: &str, type_args: Vec<TypeTag>) -> TypeTag {
+    TypeTag::Concrete {
+        petal_hash: [0u8; 32],
+        type_name: name.to_string(),
+        type_args,
+    }
+}
+
+#[test]
+fn manifest_declares_coin_value_only_payload() {
+    let manifest = bloom_petal_manifest::codec::decode(fungible::__bloom_manifest_bytes()).unwrap();
+    let coin = manifest
+        .object_types
+        .iter()
+        .find(|decl| decl.name == "Coin")
+        .expect("Coin object declaration");
+    assert_eq!(coin.type_params.len(), 1);
+    assert_eq!(coin.fields.len(), 1);
+    assert_eq!(coin.fields[0].name, "value");
+    assert_eq!(
+        coin.fields[0].ty,
+        TypeTag::Concrete {
+            petal_hash: BUILTIN_TYPE_HASH,
+            type_name: "u128".to_string(),
+            type_args: vec![],
+        }
+    );
+}
+
+#[test]
+fn payload_helpers_match_declared_manifest_layouts() {
+    let manifest = bloom_petal_manifest::codec::decode(fungible::__bloom_manifest_bytes()).unwrap();
+    let resolver = bloom_petal_manifest::ManifestResolver::new(&manifest);
+    let limits = CodecLimits::default();
+    let loom = self_type("LOOM", vec![]);
+
+    let coin_tag = self_type("Coin", vec![loom.clone()]);
+    validate_value_bytes(&resolver, &coin_tag, &ops::coin_payload(424242), &limits).unwrap();
+    let mut old_coin_payload = vec![0u8; 32];
+    old_coin_payload.extend_from_slice(&424242u128.to_be_bytes());
+    assert!(
+        validate_value_bytes(&resolver, &coin_tag, &old_coin_payload, &limits).is_err(),
+        "old id-prefixed Coin<T> payloads must not validate"
+    );
+
+    let supply_tag = self_type("Supply", vec![loom.clone()]);
+    validate_value_bytes(&resolver, &supply_tag, &ops::supply_payload(123), &limits).unwrap();
+    assert!(
+        validate_value_bytes(&resolver, &supply_tag, &123u128.to_be_bytes(), &limits).is_err(),
+        "value-only Supply<T> payloads must not validate"
+    );
+
+    let mint_cap_tag = self_type("MintCap", vec![loom.clone()]);
+    validate_value_bytes(&resolver, &mint_cap_tag, &ops::cap_payload(), &limits).unwrap();
+    let burn_cap_tag = self_type("BurnCap", vec![loom]);
+    validate_value_bytes(&resolver, &burn_cap_tag, &ops::cap_payload(), &limits).unwrap();
+    let epoch_zero_tag = self_type("EpochZero", vec![]);
+    validate_value_bytes(&resolver, &epoch_zero_tag, &ops::cap_payload(), &limits).unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -70,11 +132,7 @@ fn create_currency_emits_three_object_creates_in_order() {
 fn mint_reads_supply_creates_coin_and_writes_back_total() {
     fresh();
     // Supply starts at 50.
-    let supply_bytes = {
-        let mut b = vec![0u8; 32];
-        b.extend_from_slice(&50u128.to_be_bytes());
-        b
-    };
+    let supply_bytes = ops::supply_payload(50);
 
     test_hooks::set_responder(move |call| match call {
         HostCall::ObjectRead { .. } => HostResponse::Bytes(supply_bytes.clone()),
@@ -94,9 +152,7 @@ fn mint_reads_supply_creates_coin_and_writes_back_total() {
         HostCall::ObjectMutate { handle, payload } => {
             assert_eq!(*handle, supply_handle);
             // Decoded new total should be 75.
-            let mut be = [0u8; 16];
-            be.copy_from_slice(&payload[32..48]);
-            assert_eq!(u128::from_be_bytes(be), 75);
+            assert_eq!(ops::decode_supply_total(payload).unwrap(), 75);
         }
         other => panic!("expected mutate, got {other:?}"),
     }
@@ -109,11 +165,7 @@ fn mint_reads_supply_creates_coin_and_writes_back_total() {
 #[test]
 fn mint_overflow_returns_custom_one() {
     fresh();
-    let supply_bytes = {
-        let mut b = vec![0u8; 32];
-        b.extend_from_slice(&(u128::MAX - 1).to_be_bytes());
-        b
-    };
+    let supply_bytes = ops::supply_payload(u128::MAX - 1);
     test_hooks::set_responder(move |call| match call {
         HostCall::ObjectRead { .. } => HostResponse::Bytes(supply_bytes.clone()),
         other => panic!("unexpected call {other:?}"),
@@ -130,16 +182,8 @@ fn mint_overflow_returns_custom_one() {
 #[test]
 fn burn_decrements_supply_and_deletes_coin() {
     fresh();
-    let supply_bytes = {
-        let mut b = vec![0u8; 32];
-        b.extend_from_slice(&100u128.to_be_bytes());
-        b
-    };
-    let coin_bytes = {
-        let mut b = vec![0u8; 32];
-        b.extend_from_slice(&30u128.to_be_bytes());
-        b
-    };
+    let supply_bytes = ops::supply_payload(100);
+    let coin_bytes = ops::coin_payload(30);
 
     // The wrapper reads coin first (handle=5), then supply (handle=4).
     let supply_handle = RuntimeHandle::from_raw(4);
@@ -167,9 +211,7 @@ fn burn_decrements_supply_and_deletes_coin() {
     match &calls[3] {
         HostCall::ObjectMutate { handle, payload } => {
             assert_eq!(*handle, supply_handle);
-            let mut be = [0u8; 16];
-            be.copy_from_slice(&payload[32..48]);
-            assert_eq!(u128::from_be_bytes(be), 70);
+            assert_eq!(ops::decode_supply_total(payload).unwrap(), 70);
         }
         other => panic!("expected mutate, got {other:?}"),
     }
@@ -182,16 +224,8 @@ fn burn_decrements_supply_and_deletes_coin() {
 #[test]
 fn burn_underflow_returns_insufficient_balance() {
     fresh();
-    let supply_bytes = {
-        let mut b = vec![0u8; 32];
-        b.extend_from_slice(&5u128.to_be_bytes()); // total=5
-        b
-    };
-    let coin_bytes = {
-        let mut b = vec![0u8; 32];
-        b.extend_from_slice(&10u128.to_be_bytes()); // coin=10 > total
-        b
-    };
+    let supply_bytes = ops::supply_payload(5); // total=5
+    let coin_bytes = ops::coin_payload(10); // coin=10 > total
     let supply_handle = RuntimeHandle::from_raw(0);
     let coin_handle = RuntimeHandle::from_raw(1);
     let sup = supply_bytes.clone();
@@ -216,11 +250,7 @@ fn burn_underflow_returns_insufficient_balance() {
 #[test]
 fn split_emits_new_coin_and_rewrites_origin() {
     fresh();
-    let coin_bytes = {
-        let mut b = vec![0u8; 32];
-        b.extend_from_slice(&100u128.to_be_bytes());
-        b
-    };
+    let coin_bytes = ops::coin_payload(100);
     let src = RuntimeHandle::from_raw(9);
     let cb = coin_bytes.clone();
     test_hooks::set_responder(move |call| match call {
@@ -238,9 +268,7 @@ fn split_emits_new_coin_and_rewrites_origin() {
     match &calls[2] {
         HostCall::ObjectMutate { handle, payload } => {
             assert_eq!(*handle, src);
-            let mut be = [0u8; 16];
-            be.copy_from_slice(&payload[32..48]);
-            assert_eq!(u128::from_be_bytes(be), 60); // remaining
+            assert_eq!(ops::decode_coin_value(payload).unwrap(), 60); // remaining
         }
         other => panic!("expected mutate, got {other:?}"),
     }
@@ -253,11 +281,7 @@ fn split_emits_new_coin_and_rewrites_origin() {
 #[test]
 fn split_more_than_balance_returns_insufficient() {
     fresh();
-    let coin_bytes = {
-        let mut b = vec![0u8; 32];
-        b.extend_from_slice(&3u128.to_be_bytes());
-        b
-    };
+    let coin_bytes = ops::coin_payload(3);
     let cb = coin_bytes.clone();
     test_hooks::set_responder(move |call| match call {
         HostCall::ObjectRead { .. } => HostResponse::Bytes(cb.clone()),
@@ -274,16 +298,8 @@ fn split_more_than_balance_returns_insufficient() {
 #[test]
 fn merge_deletes_other_and_sums_into_dst() {
     fresh();
-    let dst_bytes = {
-        let mut b = vec![0u8; 32];
-        b.extend_from_slice(&20u128.to_be_bytes());
-        b
-    };
-    let other_bytes = {
-        let mut b = vec![0u8; 32];
-        b.extend_from_slice(&80u128.to_be_bytes());
-        b
-    };
+    let dst_bytes = ops::coin_payload(20);
+    let other_bytes = ops::coin_payload(80);
     let dst = RuntimeHandle::from_raw(1);
     let other = RuntimeHandle::from_raw(2);
     let dst_c = dst_bytes.clone();
@@ -304,9 +320,7 @@ fn merge_deletes_other_and_sums_into_dst() {
     match &calls[3] {
         HostCall::ObjectMutate { handle, payload } => {
             assert_eq!(*handle, dst);
-            let mut be = [0u8; 16];
-            be.copy_from_slice(&payload[32..48]);
-            assert_eq!(u128::from_be_bytes(be), 100);
+            assert_eq!(ops::decode_coin_value(payload).unwrap(), 100);
         }
         other => panic!("expected mutate, got {other:?}"),
     }
@@ -379,11 +393,7 @@ fn mint_genesis_creates_coin_loom_and_transfers_to_recipient() {
 #[test]
 fn value_reads_payload_without_consuming() {
     fresh();
-    let coin_bytes = {
-        let mut b = vec![0u8; 32];
-        b.extend_from_slice(&12345u128.to_be_bytes());
-        b
-    };
+    let coin_bytes = ops::coin_payload(12345);
     let cb = coin_bytes.clone();
     test_hooks::set_responder(move |call| match call {
         HostCall::ObjectRead { .. } => HostResponse::Bytes(cb.clone()),
@@ -402,21 +412,31 @@ fn value_reads_payload_without_consuming() {
 #[test]
 fn payload_helpers_roundtrip_value() {
     let bytes = ops::coin_payload(424242);
-    assert_eq!(bytes.len(), 48);
+    assert_eq!(bytes.len(), 16);
     let v = ops::decode_coin_value(&bytes).unwrap();
     assert_eq!(v, 424242);
 
     let rewritten = ops::rewrite_value(&bytes, 999_999).unwrap();
-    assert_eq!(rewritten.len(), 48);
-    assert_eq!(&rewritten[..32], &bytes[..32]);
+    assert_eq!(rewritten.len(), 16);
     let v2 = ops::decode_coin_value(&rewritten).unwrap();
     assert_eq!(v2, 999_999);
+
+    let supply_bytes = ops::supply_payload(777);
+    assert_eq!(supply_bytes.len(), 48);
+    assert_eq!(ops::decode_supply_total(&supply_bytes).unwrap(), 777);
+
+    let rewritten_supply = ops::rewrite_value(&supply_bytes, 888).unwrap();
+    assert_eq!(rewritten_supply.len(), 48);
+    assert_eq!(&rewritten_supply[..32], &supply_bytes[..32]);
+    assert_eq!(ops::decode_supply_total(&rewritten_supply).unwrap(), 888);
 }
 
 #[test]
 fn decode_rejects_truncated_payload() {
-    let short = vec![0u8; 32];
+    let short = vec![0u8; 15];
     let err = ops::decode_coin_value(&short).unwrap_err();
+    assert_eq!(err, PetalError::InvalidArgs);
+    let err = ops::decode_supply_total(&short).unwrap_err();
     assert_eq!(err, PetalError::InvalidArgs);
 }
 
@@ -484,11 +504,7 @@ fn mint_entry_point_uses_supply_handle_not_zero() {
     // entry point runs; carried by the `Resource<Supply<T>>` arg.
     let supply_handle = RuntimeHandle::from_raw(77);
 
-    let supply_bytes = {
-        let mut b = vec![0u8; 32];
-        b.extend_from_slice(&0u128.to_be_bytes()); // total = 0
-        b
-    };
+    let supply_bytes = ops::supply_payload(0); // total = 0
     let supply_bytes_clone = supply_bytes.clone();
 
     test_hooks::set_responder(move |call| match call {
@@ -528,16 +544,8 @@ fn burn_entry_point_uses_supply_handle_not_zero() {
     let supply_handle = RuntimeHandle::from_raw(55);
     let coin_handle = RuntimeHandle::from_raw(66);
 
-    let supply_bytes = {
-        let mut b = vec![0u8; 32];
-        b.extend_from_slice(&200u128.to_be_bytes()); // total = 200
-        b
-    };
-    let coin_bytes = {
-        let mut b = vec![0u8; 32];
-        b.extend_from_slice(&100u128.to_be_bytes()); // value = 100
-        b
-    };
+    let supply_bytes = ops::supply_payload(200); // total = 200
+    let coin_bytes = ops::coin_payload(100); // value = 100
     let supply_bytes_clone = supply_bytes.clone();
     let coin_bytes_clone = coin_bytes.clone();
 

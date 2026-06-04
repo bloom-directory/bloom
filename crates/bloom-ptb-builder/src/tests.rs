@@ -9,9 +9,11 @@ use std::collections::HashMap;
 
 use bloom_chain_types::Hash32;
 use bloom_objects::{AccessMode, Object, ObjectId, Owner, TypeTag};
+use bloom_petal_fungible::ops::coin_payload;
 use bloom_script::{
     Arg, ArgDeclStub, CORE_FUNGIBLE_PATH, ChainStateIface, Command, DEFAULT_FUNGIBLE_PETAL_HASH,
-    ExpectedVersion, FunctionDeclStub, PetalManifestStub, TypeParamDeclStub,
+    DataTypeDeclStub, ExpectedVersion, ExternalTypeRefStub, FieldDeclStub, FunctionDeclStub,
+    PetalManifestStub, TypeParamDeclStub,
 };
 
 use crate::error::{BuildError, ResolveError};
@@ -77,8 +79,30 @@ const POOL_HASH: Hash32 = Hash32([0xAB; 32]);
 const POOL_PATH: &str = "/bloom/petals/dex/pool";
 
 fn concrete(name: &str) -> TypeTag {
+    let petal_hash = if matches!(
+        name,
+        "bool"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "Address"
+            | "address"
+            | "ObjectId"
+            | "Hash32"
+            | "UID"
+            | "TypeTag"
+            | "bytes"
+            | "String"
+            | "string"
+    ) {
+        bloom_objects::BUILTIN_TYPE_HASH
+    } else {
+        [0u8; 32]
+    };
     TypeTag::Concrete {
-        petal_hash: [0u8; 32],
+        petal_hash,
         type_name: name.to_string(),
         type_args: vec![],
     }
@@ -105,6 +129,7 @@ fn chain_with_pool(funcs: Vec<FunctionDeclStub>) -> MockChain {
         functions: funcs,
         object_types: vec![],
         external_type_refs: vec![],
+        ..Default::default()
     };
     chain.put_petal(POOL_HASH, manifest);
     chain.put_path(POOL_PATH, POOL_HASH);
@@ -116,15 +141,12 @@ fn chain_with_pool(funcs: Vec<FunctionDeclStub>) -> MockChain {
 fn ready_session(chain: &MockChain, signer: [u8; 32]) -> PtbSession<'_> {
     let gas_id = ObjectId([0xFE; 32]);
     chain.put_path(CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH);
-    // 48-byte coin payload: [id placeholder (32)] || [value BE (16)]
-    let mut payload = vec![0u8; 32];
-    payload.extend_from_slice(&1_000_000u128.to_be_bytes());
     chain.put_object(Object {
         id: gas_id,
         type_tag: bloom_script::loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
         owner: Owner::Address(signer),
         version: 0,
-        payload,
+        payload: coin_payload(1_000_000),
     });
     let mut s = PtbSession::new(chain);
     s.set_signers(vec![signer]);
@@ -245,6 +267,72 @@ fn append_const_literal_u64() {
 }
 
 #[test]
+fn append_const_literal_bytes_canonicalizes_hex_payload() {
+    let chain = chain_with_pool(vec![func(
+        "store",
+        vec![ArgDeclStub::Const(concrete("bytes"))],
+        vec![],
+    )]);
+    let mut s = PtbSession::new(&chain);
+
+    s.append_command("/bloom/petals/dex/pool/store 0xdeadbeef")
+        .unwrap();
+
+    match &s.commands()[0] {
+        Command::Move(m) => {
+            assert_eq!(m.args, vec![Arg::Const(vec![4, 0xde, 0xad, 0xbe, 0xef])]);
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn append_const_literal_accepts_address_aliases_and_uid() {
+    let literal = format!("0x{}", "22".repeat(32));
+    for type_name in ["Address", "address", "ObjectId", "Hash32", "UID"] {
+        let chain = chain_with_pool(vec![func(
+            "store",
+            vec![ArgDeclStub::Const(concrete(type_name))],
+            vec![],
+        )]);
+        let mut s = PtbSession::new(&chain);
+
+        s.append_command(&format!("/bloom/petals/dex/pool/store {literal}"))
+            .unwrap();
+
+        match &s.commands()[0] {
+            Command::Move(m) => {
+                assert_eq!(m.args, vec![Arg::Const(vec![0x22; 32])]);
+            }
+            _ => panic!(),
+        }
+    }
+}
+
+#[test]
+fn append_const_literal_lowercase_string_uses_canonical_string_encoding() {
+    let chain = chain_with_pool(vec![func(
+        "store",
+        vec![ArgDeclStub::Const(concrete("string"))],
+        vec![],
+    )]);
+    let mut s = PtbSession::new(&chain);
+
+    s.append_command("/bloom/petals/dex/pool/store hello")
+        .unwrap();
+
+    match &s.commands()[0] {
+        Command::Move(m) => {
+            assert_eq!(
+                m.args,
+                vec![Arg::Const(vec![5, b'h', b'e', b'l', b'l', b'o'])]
+            );
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
 fn append_raw_const_bytes_preserves_abi_hex() {
     let chain = chain_with_pool(vec![func(
         "set",
@@ -257,6 +345,54 @@ fn append_raw_const_bytes_preserves_abi_hex() {
     match &s.commands()[0] {
         Command::Move(m) => {
             assert_eq!(m.args, vec![Arg::Const(980u64.to_be_bytes().to_vec())]);
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn append_external_const_uses_manifest_loader() {
+    let chain = MockChain::new();
+    let foreign_hash = Hash32([0xBB; 32]);
+    let foreign_manifest = PetalManifestStub {
+        module_path: "/foreign".to_string(),
+        data_types: vec![DataTypeDeclStub {
+            name: "Foreign".to_string(),
+            fields: vec![FieldDeclStub {
+                name: "value".to_string(),
+                ty: concrete("u64"),
+            }],
+            ..DataTypeDeclStub::default()
+        }],
+        ..PetalManifestStub::default()
+    };
+    let pool_manifest = PetalManifestStub {
+        module_path: POOL_PATH.to_string(),
+        functions: vec![func(
+            "set",
+            vec![ArgDeclStub::Const(TypeTag::External { ref_idx: 0 })],
+            vec![],
+        )],
+        external_type_refs: vec![ExternalTypeRefStub {
+            placeholder: "$external_0".to_string(),
+            declared_petal_path: "/foreign".to_string(),
+            declared_type_name: "Foreign".to_string(),
+            declared_content_hash: Some(foreign_hash),
+        }],
+        ..PetalManifestStub::default()
+    };
+    chain.put_petal(POOL_HASH, pool_manifest);
+    chain.put_path(POOL_PATH, POOL_HASH);
+    chain.put_petal(foreign_hash, foreign_manifest);
+    chain.put_path("/foreign", foreign_hash);
+
+    let mut s = PtbSession::new(&chain);
+    s.append_command("/bloom/petals/dex/pool/set const:0x0000000000000007")
+        .unwrap();
+
+    match &s.commands()[0] {
+        Command::Move(m) => {
+            assert_eq!(m.args, vec![Arg::Const(7u64.to_be_bytes().to_vec())]);
         }
         _ => panic!(),
     }
@@ -524,11 +660,9 @@ fn const_type_mismatch_rejected() {
 
 #[test]
 fn const_bytes_invalid_caught_by_validator() {
-    // A `u64` declared arg but a too-short hex literal that the literal
-    // encoder accepts as opaque-ish — exercise the validator path by
-    // declaring an unknown type so the literal encoder defers and the
-    // validator's canonical check is the gate. Here we use a vector<u64>
-    // const fed wrong bytes through hex so the validator rejects length.
+    // Parameterized const values need manifest-aware typed lowering; this
+    // builder literal path must not accept opaque bytes and hope validation
+    // catches malformed payloads later.
     let chain = chain_with_pool(vec![func(
         "set",
         vec![ArgDeclStub::Const(TypeTag::Concrete {
@@ -545,7 +679,7 @@ fn const_bytes_invalid_caught_by_validator() {
         .unwrap_err();
     assert!(matches!(
         err,
-        BuildError::Validation(bloom_script::PtbError::TypeMismatch { .. })
+        BuildError::Parse(ref msg) if msg.contains("manifest-aware typed lowering")
     ));
     assert!(s.is_empty());
 }
@@ -707,14 +841,12 @@ fn build_unsigned_derives_fungible_hash_from_chain_vfs() {
     chain.put_path(CORE_FUNGIBLE_PATH, fungible_hash);
 
     let gas_id = ObjectId([0xFE; 32]);
-    let mut payload = vec![0u8; 32];
-    payload.extend_from_slice(&1_000_000u128.to_be_bytes());
     chain.put_object(Object {
         id: gas_id,
         type_tag: bloom_script::loom_coin_type_tag(fungible_hash),
         owner: Owner::Address(signer),
         version: 0,
-        payload,
+        payload: coin_payload(1_000_000),
     });
 
     let mut s = PtbSession::new(&chain);
@@ -733,14 +865,12 @@ fn build_unsigned_requires_fungible_vfs_binding_without_override() {
     let chain = chain_with_pool(vec![func("swap", vec![ArgDeclStub::Signer], vec![])]);
     let signer = [0x11; 32];
     let gas_id = ObjectId([0xFE; 32]);
-    let mut payload = vec![0u8; 32];
-    payload.extend_from_slice(&1_000_000u128.to_be_bytes());
     chain.put_object(Object {
         id: gas_id,
         type_tag: bloom_script::loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
         owner: Owner::Address(signer),
         version: 0,
-        payload,
+        payload: coin_payload(1_000_000),
     });
 
     let mut s = PtbSession::new(&chain);

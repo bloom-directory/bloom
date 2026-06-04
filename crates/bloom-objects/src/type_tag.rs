@@ -24,6 +24,13 @@ pub const TAG_EXTERNAL: u8 = 2;
 /// `decode_canonical`'s stack use and guards against pathological inputs.
 pub const MAX_TYPE_TAG_DEPTH: usize = 16;
 
+/// Reserved petal hash for intrinsic Bloom types.
+///
+/// The all-zero hash remains only a macro-time self-petal sentinel. Built-in
+/// scalar/container tags stored in manifests or visible to validators use this
+/// reserved non-zero hash.
+pub const BUILTIN_TYPE_HASH: [u8; 32] = *b"bloom.builtin.types.v1.reserved!";
+
 /// Recursive type identity.
 ///
 /// `Concrete` resolves to a specific type defined by a specific petal

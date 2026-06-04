@@ -37,6 +37,7 @@ use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
 use bloom_objects::{
     AccessMode, OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey, TypeTag,
 };
+use bloom_petal_fungible::ops::coin_payload;
 use bloom_script::{
     CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH,
     chain_iface::{ArgDeclStub, FunctionDeclStub, PetalManifestStub},
@@ -70,13 +71,6 @@ fn submit_ptb_tx(sender: Address, ptb_bytes: Vec<u8>) -> Tx {
         pubkey: PubKeyBytes(vec![0u8; 32]),
         sig: SigBytes(vec![0u8; 64]),
     }
-}
-
-/// Build the canonical `Coin<LOOM>` payload for a balance.
-fn coin_payload(value: u128) -> Vec<u8> {
-    let mut p = vec![0u8; 32];
-    p.extend_from_slice(&value.to_be_bytes());
-    p
 }
 
 /// Mint a `Coin<LOOM>` object owned by `owner` for fee coverage.

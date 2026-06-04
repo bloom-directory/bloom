@@ -52,15 +52,20 @@ pub mod host_ctx;
 pub mod invariant_scope;
 pub mod types;
 pub mod validator;
+pub mod value_validation;
 
 pub use abi_json::{
-    JsonAbiError, decode_json_const, decode_json_type_tag, decode_return_json, encode_type_tag_json,
+    JsonAbiError, decode_json_const, decode_json_const_with_manifest,
+    decode_json_const_with_manifest_loader, decode_json_type_tag, decode_return_json,
+    decode_return_json_with_manifest, decode_return_json_with_manifest_loader,
+    encode_type_tag_json,
 };
 pub use borrow_table::{BorrowRow, BorrowTable, RowState};
 pub use chain_iface::{
-    ArgDeclStub, ChainStateIface, ExternalTypeRefStub, FieldLayoutStub, FunctionDeclStub,
-    InvariantDeclStub, InvariantTargetStub, ObjectTypeDeclStub, PetalManifestStub,
-    TypeParamDeclStub,
+    ArgDeclStub, CapabilityTypeDeclStub, ChainStateIface, DataTypeDeclStub, EnumTypeDeclStub,
+    ExternalTypeRefStub, FieldDeclStub, FieldLayoutStub, FunctionDeclStub, InvariantDeclStub,
+    InvariantTargetStub, ObjectTypeDeclStub, PetalManifestStub, TypeParamDeclStub, VariantDeclStub,
+    VariantFieldsDeclStub,
 };
 pub use encode::{decode_ptb, encode_ptb};
 pub use error::PtbError;

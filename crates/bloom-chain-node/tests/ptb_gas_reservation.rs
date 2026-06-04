@@ -38,7 +38,7 @@ use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
 use bloom_keystore::xdsa::XdsaSecretKey;
 use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
-use bloom_petal_fungible::ops::decode_coin_value;
+use bloom_petal_fungible::ops::{coin_payload, decode_coin_value};
 use bloom_petal_manifest::{
     codec,
     types::{FunctionDecl, PetalManifestV0, SCHEMA_VERSION, SemVer},
@@ -99,14 +99,12 @@ fn submit_ptb_tx_with_caps(
 }
 
 fn make_loom_coin(id: ObjectId, owner: [u8; 32], value: u128) -> Object {
-    let mut payload = vec![0u8; 32];
-    payload.extend_from_slice(&value.to_be_bytes());
     Object {
         id,
         type_tag: loom_coin_type_tag(Hash32([0u8; 32])),
         owner: Owner::Address(owner),
         version: 1,
-        payload,
+        payload: coin_payload(value),
     }
 }
 
@@ -131,7 +129,7 @@ fn coin_version(state: &State, id: &ObjectId) -> Option<u64> {
 
 fn balance(state: &State, addr: &Address) -> u128 {
     resolve_loom_coin_type(state)
-        .map(|coin_type| coin_loom_balance(state, *addr, &coin_type))
+        .and_then(|coin_type| coin_loom_balance(state, *addr, &coin_type).ok())
         .unwrap_or(0)
 }
 

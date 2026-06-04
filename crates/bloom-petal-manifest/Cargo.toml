@@ -11,6 +11,7 @@ description = "Canonical PetalManifestV0 schema, codec, wasm custom-section extr
 bloom-objects.workspace = true
 bloom-chain-types.workspace = true
 bloom-script.workspace = true
+bloom-value.workspace = true
 wasmparser.workspace = true
 
 [lints.rust]

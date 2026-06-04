@@ -327,8 +327,8 @@ fn coin_payload_encode_decode_round_trip() {
     let value = 1_234_567_890u128;
     let payload = ops::coin_payload(value);
 
-    // Coin payload: 32-byte id + 16-byte u128 = 48 bytes.
-    assert_eq!(payload.len(), 48, "coin payload must be 48 bytes");
+    // Coin payload: 16-byte u128 value.
+    assert_eq!(payload.len(), 16, "coin payload must be 16 bytes");
 
     let decoded = ops::decode_coin_value(&payload).expect("decode should succeed");
     assert_eq!(decoded, value);
@@ -337,7 +337,7 @@ fn coin_payload_encode_decode_round_trip() {
 #[test]
 fn coin_payload_zero_value() {
     let payload = ops::coin_payload(0u128);
-    assert_eq!(payload.len(), 48);
+    assert_eq!(payload.len(), 16);
     let decoded = ops::decode_coin_value(&payload).unwrap();
     assert_eq!(decoded, 0);
 }
@@ -367,7 +367,7 @@ fn router_coin_create_tag_is_coin_erased() {
 
 #[test]
 fn decode_coin_value_rejects_short_buffer() {
-    let short = vec![0u8; 47];
+    let short = vec![0u8; 15];
     assert!(
         ops::decode_coin_value(&short).is_err(),
         "short buffer must fail"
@@ -375,11 +375,10 @@ fn decode_coin_value_rejects_short_buffer() {
 }
 
 #[test]
-fn decode_coin_value_reads_bytes_32_to_48() {
-    // Build a payload manually: id = 0xFF * 32, value at bytes 32..48.
-    let mut buf = vec![0xFFu8; 48];
+fn decode_coin_value_reads_value_only_payload() {
+    // Build a canonical value-only Coin payload.
     let value: u128 = 42_000;
-    buf[32..48].copy_from_slice(&value.to_be_bytes());
+    let buf = value.to_be_bytes().to_vec();
     let decoded = ops::decode_coin_value(&buf).unwrap();
     assert_eq!(decoded, value);
 }

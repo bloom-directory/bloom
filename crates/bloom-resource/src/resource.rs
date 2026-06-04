@@ -12,8 +12,11 @@
 //! `canonical_decode`). The matching `TypeTag` is also produced by
 //! `BloomType::type_tag`.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use bloom_chain_types::Hash32;
-use bloom_objects::{ObjectId, TypeTag};
+use bloom_objects::{BUILTIN_TYPE_HASH, ObjectId, TypeTag};
+use bloom_value::{DEFAULT_MAX_COLLECTION_LEN, read_uleb128, write_uleb128};
 use core::marker::PhantomData;
 
 use crate::abi::AbiError;
@@ -22,9 +25,8 @@ use crate::handle::RuntimeHandle;
 
 /// Synthetic petal hash used by primitive `BloomType` impls. Concrete
 /// petal types use the type-defining petal's content hash; primitives
-/// are intrinsic and carry an all-zero hash so the resulting `TypeTag`
-/// is deterministic and globally unique among primitives.
-pub const PRIMITIVE_PETAL_HASH: [u8; 32] = [0u8; 32];
+/// are intrinsic and carry the reserved built-in hash.
+pub const PRIMITIVE_PETAL_HASH: [u8; 32] = BUILTIN_TYPE_HASH;
 
 /// Marker trait identifying every type that may be stored as a
 /// `Resource<T>` payload. The macros impl this automatically for
@@ -42,6 +44,14 @@ pub trait BloomType: Sized {
     /// Canonical-decode `buf`. Returns the typed value or an
     /// [`AbiError`] if the bytes do not match the expected shape.
     fn canonical_decode(buf: &[u8]) -> Result<Self, AbiError>;
+
+    /// Canonical-decode one value from the front of `buf`, advancing
+    /// the cursor by exactly the bytes consumed.
+    fn canonical_decode_from(buf: &mut &[u8]) -> Result<Self, AbiError> {
+        let value = Self::canonical_decode(buf)?;
+        *buf = &[];
+        Ok(value)
+    }
 
     /// The `TypeTag` that identifies `Self` in the on-chain object
     /// store and in inter-petal calls.
@@ -178,6 +188,24 @@ fn primitive_tag(name: &str) -> TypeTag {
     }
 }
 
+fn write_collection_len(len: usize, out: &mut Vec<u8>, kind: &str) {
+    assert!(
+        (len as u64) <= DEFAULT_MAX_COLLECTION_LEN,
+        "{kind} length exceeds canonical collection limit"
+    );
+    write_uleb128(len as u64, out);
+}
+
+fn read_collection_len(buf: &mut &[u8], kind: &str) -> Result<usize, AbiError> {
+    let count = read_uleb128(buf).map_err(|e| AbiError::ValueCodec(e.to_string()))?;
+    if count > DEFAULT_MAX_COLLECTION_LEN {
+        return Err(AbiError::ValueCodec(format!(
+            "{kind} length exceeds canonical collection limit"
+        )));
+    }
+    usize::try_from(count).map_err(|_| AbiError::ValueCodec(format!("{kind} length overflow")))
+}
+
 macro_rules! impl_bloom_type_for_unsigned {
     ($t:ty, $name:literal, $bytes:literal) => {
         impl BloomType for $t {
@@ -193,6 +221,19 @@ macro_rules! impl_bloom_type_for_unsigned {
                 }
                 let mut a = [0u8; $bytes];
                 a.copy_from_slice(buf);
+                Ok(<$t>::from_be_bytes(a))
+            }
+            fn canonical_decode_from(buf: &mut &[u8]) -> Result<Self, AbiError> {
+                if buf.len() < $bytes {
+                    return Err(AbiError::UnexpectedEof {
+                        needed: $bytes,
+                        available: buf.len(),
+                    });
+                }
+                let (head, tail) = buf.split_at($bytes);
+                *buf = tail;
+                let mut a = [0u8; $bytes];
+                a.copy_from_slice(head);
                 Ok(<$t>::from_be_bytes(a))
             }
             fn type_tag() -> TypeTag {
@@ -225,6 +266,21 @@ impl BloomType for bool {
             other => Err(AbiError::InvalidBool(other)),
         }
     }
+    fn canonical_decode_from(buf: &mut &[u8]) -> Result<Self, AbiError> {
+        if buf.is_empty() {
+            return Err(AbiError::UnexpectedEof {
+                needed: 1,
+                available: 0,
+            });
+        }
+        let b = buf[0];
+        *buf = &buf[1..];
+        match b {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(AbiError::InvalidBool(other)),
+        }
+    }
     fn type_tag() -> TypeTag {
         primitive_tag("bool")
     }
@@ -245,6 +301,19 @@ impl BloomType for [u8; 32] {
         a.copy_from_slice(buf);
         Ok(a)
     }
+    fn canonical_decode_from(buf: &mut &[u8]) -> Result<Self, AbiError> {
+        if buf.len() < 32 {
+            return Err(AbiError::UnexpectedEof {
+                needed: 32,
+                available: buf.len(),
+            });
+        }
+        let (head, tail) = buf.split_at(32);
+        *buf = tail;
+        let mut a = [0u8; 32];
+        a.copy_from_slice(head);
+        Ok(a)
+    }
     fn type_tag() -> TypeTag {
         primitive_tag("address")
     }
@@ -256,6 +325,9 @@ impl BloomType for ObjectId {
     }
     fn canonical_decode(buf: &[u8]) -> Result<Self, AbiError> {
         <[u8; 32]>::canonical_decode(buf).map(ObjectId)
+    }
+    fn canonical_decode_from(buf: &mut &[u8]) -> Result<Self, AbiError> {
+        <[u8; 32]>::canonical_decode_from(buf).map(ObjectId)
     }
     fn type_tag() -> TypeTag {
         primitive_tag("ObjectId")
@@ -269,6 +341,9 @@ impl BloomType for Hash32 {
     fn canonical_decode(buf: &[u8]) -> Result<Self, AbiError> {
         <[u8; 32]>::canonical_decode(buf).map(Hash32)
     }
+    fn canonical_decode_from(buf: &mut &[u8]) -> Result<Self, AbiError> {
+        <[u8; 32]>::canonical_decode_from(buf).map(Hash32)
+    }
     fn type_tag() -> TypeTag {
         primitive_tag("Hash32")
     }
@@ -276,27 +351,478 @@ impl BloomType for Hash32 {
 
 impl BloomType for String {
     fn canonical_encode(&self) -> Vec<u8> {
-        self.as_bytes().to_vec()
+        let mut out = Vec::new();
+        write_collection_len(self.len(), &mut out, "string");
+        out.extend_from_slice(self.as_bytes());
+        out
     }
     fn canonical_decode(buf: &[u8]) -> Result<Self, AbiError> {
-        core::str::from_utf8(buf)
+        let mut cursor = buf;
+        let len = read_collection_len(&mut cursor, "string")?;
+        if cursor.len() != len {
+            return Err(AbiError::UnexpectedEof {
+                needed: len,
+                available: cursor.len(),
+            });
+        }
+        core::str::from_utf8(cursor)
+            .map(|s| s.to_owned())
+            .map_err(|_| AbiError::InvalidUtf8)
+    }
+    fn canonical_decode_from(buf: &mut &[u8]) -> Result<Self, AbiError> {
+        let len = read_collection_len(buf, "string")?;
+        if buf.len() < len {
+            return Err(AbiError::UnexpectedEof {
+                needed: len,
+                available: buf.len(),
+            });
+        }
+        let (head, tail) = buf.split_at(len);
+        *buf = tail;
+        core::str::from_utf8(head)
             .map(|s| s.to_owned())
             .map_err(|_| AbiError::InvalidUtf8)
     }
     fn type_tag() -> TypeTag {
-        primitive_tag("string")
+        primitive_tag("String")
     }
 }
 
-impl BloomType for Vec<u8> {
+/// Canonical Bloom `bytes` value.
+///
+/// Use `Vec<T>` for the algebraic `vector<T>` collection. This wrapper
+/// exists so Rust code can opt into the distinct built-in `bytes` type.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Bytes(
+    /// Raw byte contents.
+    pub Vec<u8>,
+);
+
+impl From<Vec<u8>> for Bytes {
+    fn from(value: Vec<u8>) -> Self {
+        Self(value)
+    }
+}
+
+impl AsRef<[u8]> for Bytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl BloomType for Bytes {
     fn canonical_encode(&self) -> Vec<u8> {
-        self.clone()
+        let mut out = Vec::new();
+        write_collection_len(self.0.len(), &mut out, "bytes");
+        out.extend_from_slice(&self.0);
+        out
     }
     fn canonical_decode(buf: &[u8]) -> Result<Self, AbiError> {
-        Ok(buf.to_vec())
+        let mut cursor = buf;
+        let len = read_collection_len(&mut cursor, "bytes")?;
+        if cursor.len() != len {
+            return Err(AbiError::UnexpectedEof {
+                needed: len,
+                available: cursor.len(),
+            });
+        }
+        Ok(Self(cursor.to_vec()))
+    }
+    fn canonical_decode_from(buf: &mut &[u8]) -> Result<Self, AbiError> {
+        let len = read_collection_len(buf, "bytes")?;
+        if buf.len() < len {
+            return Err(AbiError::UnexpectedEof {
+                needed: len,
+                available: buf.len(),
+            });
+        }
+        let (head, tail) = buf.split_at(len);
+        *buf = tail;
+        Ok(Self(head.to_vec()))
     }
     fn type_tag() -> TypeTag {
         primitive_tag("bytes")
+    }
+}
+
+impl<T: BloomType> BloomType for Vec<T> {
+    fn canonical_encode(&self) -> Vec<u8> {
+        let encoded = self
+            .iter()
+            .map(BloomType::canonical_encode)
+            .collect::<Vec<_>>();
+        if encoded.first().is_some_and(Vec::is_empty) {
+            panic!("non-empty vector of zero-sized values is not canonical");
+        }
+        let mut out = Vec::new();
+        write_collection_len(encoded.len(), &mut out, "vector");
+        for item in encoded {
+            out.extend_from_slice(&item);
+        }
+        out
+    }
+
+    fn canonical_decode(buf: &[u8]) -> Result<Self, AbiError> {
+        let mut cursor = buf;
+        let value = Self::canonical_decode_from(&mut cursor)?;
+        if cursor.is_empty() {
+            Ok(value)
+        } else {
+            Err(AbiError::TrailingBytes {
+                remaining: cursor.len(),
+            })
+        }
+    }
+
+    fn canonical_decode_from(buf: &mut &[u8]) -> Result<Self, AbiError> {
+        let count = read_collection_len(buf, "vector")?;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let value = T::canonical_decode_from(buf)?;
+            if value.canonical_encode().is_empty() {
+                return Err(AbiError::ValueCodec(
+                    "non-empty vector of zero-sized values".into(),
+                ));
+            }
+            out.push(value);
+        }
+        Ok(out)
+    }
+
+    fn type_tag() -> TypeTag {
+        TypeTag::Concrete {
+            petal_hash: PRIMITIVE_PETAL_HASH,
+            type_name: "vector".to_string(),
+            type_args: vec![T::type_tag()],
+        }
+    }
+}
+
+impl BloomType for TypeTag {
+    fn canonical_encode(&self) -> Vec<u8> {
+        self.encode_canonical()
+            .expect("TypeTag canonical encoding should fit codec limits")
+    }
+
+    fn canonical_decode(buf: &[u8]) -> Result<Self, AbiError> {
+        TypeTag::decode_canonical(buf).map_err(AbiError::from)
+    }
+
+    fn canonical_decode_from(buf: &mut &[u8]) -> Result<Self, AbiError> {
+        TypeTag::decode_from(buf, 0).map_err(AbiError::from)
+    }
+
+    fn type_tag() -> TypeTag {
+        primitive_tag("TypeTag")
+    }
+}
+
+impl<T: BloomType> BloomType for Option<T> {
+    fn canonical_encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self {
+            None => write_uleb128(0, &mut out),
+            Some(value) => {
+                write_uleb128(1, &mut out);
+                out.extend_from_slice(&value.canonical_encode());
+            }
+        }
+        out
+    }
+
+    fn canonical_decode(buf: &[u8]) -> Result<Self, AbiError> {
+        let mut cursor = buf;
+        let value = Self::canonical_decode_from(&mut cursor)?;
+        if cursor.is_empty() {
+            Ok(value)
+        } else {
+            Err(AbiError::TrailingBytes {
+                remaining: cursor.len(),
+            })
+        }
+    }
+
+    fn canonical_decode_from(buf: &mut &[u8]) -> Result<Self, AbiError> {
+        match read_uleb128(buf).map_err(|e| AbiError::ValueCodec(e.to_string()))? {
+            0 => Ok(None),
+            1 => T::canonical_decode_from(buf).map(Some),
+            other => Err(AbiError::ValueCodec(format!(
+                "Option discriminant {other} out of range"
+            ))),
+        }
+    }
+
+    fn type_tag() -> TypeTag {
+        TypeTag::Concrete {
+            petal_hash: PRIMITIVE_PETAL_HASH,
+            type_name: "Option".to_string(),
+            type_args: vec![T::type_tag()],
+        }
+    }
+}
+
+impl<T: BloomType, E: BloomType> BloomType for Result<T, E> {
+    fn canonical_encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self {
+            Ok(value) => {
+                write_uleb128(0, &mut out);
+                out.extend_from_slice(&value.canonical_encode());
+            }
+            Err(value) => {
+                write_uleb128(1, &mut out);
+                out.extend_from_slice(&value.canonical_encode());
+            }
+        }
+        out
+    }
+
+    fn canonical_decode(buf: &[u8]) -> Result<Self, AbiError> {
+        let mut cursor = buf;
+        let value = Self::canonical_decode_from(&mut cursor)?;
+        if cursor.is_empty() {
+            Ok(value)
+        } else {
+            Err(AbiError::TrailingBytes {
+                remaining: cursor.len(),
+            })
+        }
+    }
+
+    fn canonical_decode_from(buf: &mut &[u8]) -> Result<Self, AbiError> {
+        match read_uleb128(buf).map_err(|e| AbiError::ValueCodec(e.to_string()))? {
+            0 => T::canonical_decode_from(buf).map(Ok),
+            1 => E::canonical_decode_from(buf).map(Err),
+            other => Err(AbiError::ValueCodec(format!(
+                "Result discriminant {other} out of range"
+            ))),
+        }
+    }
+
+    fn type_tag() -> TypeTag {
+        TypeTag::Concrete {
+            petal_hash: PRIMITIVE_PETAL_HASH,
+            type_name: "Result".to_string(),
+            type_args: vec![T::type_tag(), E::type_tag()],
+        }
+    }
+}
+
+macro_rules! impl_tuple_bloom_type {
+    ($($name:ident : $idx:tt),+ $(,)?) => {
+        impl<$($name: BloomType),+> BloomType for ($($name,)+) {
+            fn canonical_encode(&self) -> Vec<u8> {
+                let mut out = Vec::new();
+                $(
+                    out.extend_from_slice(&self.$idx.canonical_encode());
+                )+
+                out
+            }
+
+            fn canonical_decode(buf: &[u8]) -> Result<Self, AbiError> {
+                let mut cursor = buf;
+                let value = Self::canonical_decode_from(&mut cursor)?;
+                if cursor.is_empty() {
+                    Ok(value)
+                } else {
+                    Err(AbiError::TrailingBytes {
+                        remaining: cursor.len(),
+                    })
+                }
+            }
+
+            fn canonical_decode_from(buf: &mut &[u8]) -> Result<Self, AbiError> {
+                Ok(($(
+                    $name::canonical_decode_from(buf)?,
+                )+))
+            }
+
+            fn type_tag() -> TypeTag {
+                TypeTag::Concrete {
+                    petal_hash: PRIMITIVE_PETAL_HASH,
+                    type_name: "tuple".to_string(),
+                    type_args: vec![$($name::type_tag()),+],
+                }
+            }
+        }
+    };
+}
+
+impl_tuple_bloom_type!(A: 0);
+impl_tuple_bloom_type!(A: 0, B: 1);
+impl_tuple_bloom_type!(A: 0, B: 1, C: 2);
+impl_tuple_bloom_type!(A: 0, B: 1, C: 2, D: 3);
+impl_tuple_bloom_type!(A: 0, B: 1, C: 2, D: 3, E: 4);
+impl_tuple_bloom_type!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5);
+impl_tuple_bloom_type!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6);
+impl_tuple_bloom_type!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7);
+impl_tuple_bloom_type!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8);
+impl_tuple_bloom_type!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9);
+impl_tuple_bloom_type!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10);
+impl_tuple_bloom_type!(A: 0, B: 1, C: 2, D: 3, E: 4, F: 5, G: 6, H: 7, I: 8, J: 9, K: 10, L: 11);
+
+impl BloomType for () {
+    fn canonical_encode(&self) -> Vec<u8> {
+        Vec::new()
+    }
+
+    fn canonical_decode(buf: &[u8]) -> Result<Self, AbiError> {
+        if buf.is_empty() {
+            Ok(())
+        } else {
+            Err(AbiError::TrailingBytes {
+                remaining: buf.len(),
+            })
+        }
+    }
+
+    fn canonical_decode_from(_buf: &mut &[u8]) -> Result<Self, AbiError> {
+        Ok(())
+    }
+
+    fn type_tag() -> TypeTag {
+        TypeTag::Concrete {
+            petal_hash: PRIMITIVE_PETAL_HASH,
+            type_name: "tuple".to_string(),
+            type_args: Vec::new(),
+        }
+    }
+}
+
+impl<T> BloomType for BTreeSet<T>
+where
+    T: BloomType + Ord,
+{
+    fn canonical_encode(&self) -> Vec<u8> {
+        let mut encoded = self
+            .iter()
+            .map(BloomType::canonical_encode)
+            .collect::<Vec<_>>();
+        encoded.sort();
+        let mut out = Vec::new();
+        write_collection_len(encoded.len(), &mut out, "set");
+        if encoded.first().is_some_and(Vec::is_empty) {
+            panic!("non-empty set of zero-sized values is not canonical");
+        }
+        for item in encoded {
+            out.extend_from_slice(&item);
+        }
+        out
+    }
+
+    fn canonical_decode(buf: &[u8]) -> Result<Self, AbiError> {
+        let mut cursor = buf;
+        let value = Self::canonical_decode_from(&mut cursor)?;
+        if cursor.is_empty() {
+            Ok(value)
+        } else {
+            Err(AbiError::TrailingBytes {
+                remaining: cursor.len(),
+            })
+        }
+    }
+
+    fn canonical_decode_from(buf: &mut &[u8]) -> Result<Self, AbiError> {
+        let count = read_collection_len(buf, "set")?;
+        let mut prev: Option<Vec<u8>> = None;
+        let mut out = BTreeSet::new();
+        for _ in 0..count {
+            let value = T::canonical_decode_from(buf)?;
+            let encoded = value.canonical_encode();
+            if encoded.is_empty() {
+                return Err(AbiError::ValueCodec(
+                    "non-empty set of zero-sized values".into(),
+                ));
+            }
+            if prev.as_ref().is_some_and(|p| p >= &encoded) {
+                return Err(AbiError::ValueCodec(
+                    "set keys are not strictly sorted".into(),
+                ));
+            }
+            prev = Some(encoded);
+            if !out.insert(value) {
+                return Err(AbiError::ValueCodec("duplicate set key".into()));
+            }
+        }
+        Ok(out)
+    }
+
+    fn type_tag() -> TypeTag {
+        TypeTag::Concrete {
+            petal_hash: PRIMITIVE_PETAL_HASH,
+            type_name: "set".to_string(),
+            type_args: vec![T::type_tag()],
+        }
+    }
+}
+
+impl<K, V> BloomType for BTreeMap<K, V>
+where
+    K: BloomType + Ord,
+    V: BloomType,
+{
+    fn canonical_encode(&self) -> Vec<u8> {
+        let mut encoded = self
+            .iter()
+            .map(|(k, v)| (k.canonical_encode(), v.canonical_encode()))
+            .collect::<Vec<_>>();
+        encoded.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut out = Vec::new();
+        write_collection_len(encoded.len(), &mut out, "map");
+        if encoded.first().is_some_and(|(key, _)| key.is_empty()) {
+            panic!("non-empty map with zero-sized keys is not canonical");
+        }
+        for (key, value) in encoded {
+            out.extend_from_slice(&key);
+            out.extend_from_slice(&value);
+        }
+        out
+    }
+
+    fn canonical_decode(buf: &[u8]) -> Result<Self, AbiError> {
+        let mut cursor = buf;
+        let value = Self::canonical_decode_from(&mut cursor)?;
+        if cursor.is_empty() {
+            Ok(value)
+        } else {
+            Err(AbiError::TrailingBytes {
+                remaining: cursor.len(),
+            })
+        }
+    }
+
+    fn canonical_decode_from(buf: &mut &[u8]) -> Result<Self, AbiError> {
+        let count = read_collection_len(buf, "map")?;
+        let mut prev: Option<Vec<u8>> = None;
+        let mut out = BTreeMap::new();
+        for _ in 0..count {
+            let key = K::canonical_decode_from(buf)?;
+            let encoded = key.canonical_encode();
+            if encoded.is_empty() {
+                return Err(AbiError::ValueCodec(
+                    "non-empty map with zero-sized keys".into(),
+                ));
+            }
+            if prev.as_ref().is_some_and(|p| p >= &encoded) {
+                return Err(AbiError::ValueCodec(
+                    "map keys are not strictly sorted".into(),
+                ));
+            }
+            prev = Some(encoded);
+            let value = V::canonical_decode_from(buf)?;
+            if out.insert(key, value).is_some() {
+                return Err(AbiError::ValueCodec("duplicate map key".into()));
+            }
+        }
+        Ok(out)
+    }
+
+    fn type_tag() -> TypeTag {
+        TypeTag::Concrete {
+            petal_hash: PRIMITIVE_PETAL_HASH,
+            type_name: "map".to_string(),
+            type_args: vec![K::type_tag(), V::type_tag()],
+        }
     }
 }
 
@@ -381,14 +907,160 @@ mod tests {
 
     #[test]
     fn string_rejects_invalid_utf8() {
-        let err = String::canonical_decode(&[0xFF, 0xFE]).unwrap_err();
+        let err = String::canonical_decode(&[2, 0xFF, 0xFE]).unwrap_err();
         assert_eq!(err, AbiError::InvalidUtf8);
     }
 
     #[test]
-    fn vec_bytes_round_trip() {
+    fn bytes_round_trip() {
+        rt(Bytes::from(Vec::new()));
+        rt(Bytes::from(vec![1u8, 2, 3, 4, 5]));
+        assert_eq!(
+            Bytes::from(vec![1u8, 2, 3]).canonical_encode(),
+            b"\x03\x01\x02\x03"
+        );
+        match Bytes::type_tag() {
+            TypeTag::Concrete { type_name, .. } => assert_eq!(type_name, "bytes"),
+            other => panic!("expected concrete bytes tag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vec_round_trip_and_uses_vector_type_tag() {
         rt(Vec::<u8>::new());
         rt(vec![1u8, 2, 3, 4, 5]);
+        rt(vec!["a".to_string(), "bc".to_string()]);
+        assert_eq!(vec![1u8, 2, 3].canonical_encode(), b"\x03\x01\x02\x03");
+        match Vec::<u8>::type_tag() {
+            TypeTag::Concrete {
+                type_name,
+                type_args,
+                ..
+            } => {
+                assert_eq!(type_name, "vector");
+                assert_eq!(type_args, vec![u8::type_tag()]);
+            }
+            other => panic!("expected concrete vector tag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn type_tag_round_trip() {
+        rt(TypeTag::Concrete {
+            petal_hash: [0xAA; 32],
+            type_name: "Coin".to_string(),
+            type_args: vec![String::type_tag()],
+        });
+    }
+
+    #[test]
+    fn option_round_trip() {
+        rt(None::<u64>);
+        rt(Some("hi".to_string()));
+        assert_eq!(Some("hi".to_string()).canonical_encode(), b"\x01\x02hi");
+    }
+
+    #[test]
+    fn result_round_trip() {
+        rt(Ok::<u64, String>(7));
+        rt(Err::<u64, String>("bad".to_string()));
+        assert_eq!(
+            Ok::<u64, String>(7).canonical_encode(),
+            vec![0, 0, 0, 0, 0, 0, 0, 0, 7]
+        );
+    }
+
+    #[test]
+    fn tuple_round_trip() {
+        rt(());
+        rt((9u8,));
+        rt((1u8, "x".to_string()));
+        rt((1u8, 2u16, true, "z".to_string()));
+        rt((1u8, 2u16, 3u32, 4u64, 5u128));
+        rt((
+            1u8, 2u8, 3u8, 4u8, 5u8, 6u8, 7u8, 8u8, 9u8, 10u8, 11u8, 12u8,
+        ));
+    }
+
+    #[test]
+    fn btree_set_round_trip_and_canonical_order() {
+        let mut set = BTreeSet::new();
+        set.insert("aa".to_string());
+        set.insert("b".to_string());
+
+        // Canonical order is encoded-byte order, so "b" (len 1)
+        // precedes "aa" (len 2), even though Rust string order differs.
+        assert_eq!(set.canonical_encode(), b"\x02\x01b\x02aa");
+        assert_eq!(
+            BTreeSet::<String>::canonical_decode(b"\x02\x01b\x02aa").unwrap(),
+            set
+        );
+
+        let err = BTreeSet::<String>::canonical_decode(b"\x02\x02aa\x01b").unwrap_err();
+        assert!(matches!(err, AbiError::ValueCodec(_)));
+    }
+
+    #[test]
+    fn btree_map_round_trip_and_canonical_key_order() {
+        let mut map = BTreeMap::new();
+        map.insert("aa".to_string(), 7u8);
+        map.insert("b".to_string(), 9u8);
+
+        assert_eq!(map.canonical_encode(), b"\x02\x01b\x09\x02aa\x07");
+        assert_eq!(
+            BTreeMap::<String, u8>::canonical_decode(b"\x02\x01b\x09\x02aa\x07").unwrap(),
+            map
+        );
+
+        let err = BTreeMap::<String, u8>::canonical_decode(b"\x02\x02aa\x07\x01b\x09").unwrap_err();
+        assert!(matches!(err, AbiError::ValueCodec(_)));
+    }
+
+    #[test]
+    fn non_empty_zero_sized_collections_are_rejected() {
+        let err = Vec::<()>::canonical_decode(&[1]).unwrap_err();
+        assert!(matches!(err, AbiError::ValueCodec(_)));
+
+        let err = BTreeSet::<()>::canonical_decode(&[1]).unwrap_err();
+        assert!(matches!(err, AbiError::ValueCodec(_)));
+
+        let err = BTreeMap::<(), u8>::canonical_decode(&[1, 7]).unwrap_err();
+        assert!(matches!(err, AbiError::ValueCodec(_)));
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty set of zero-sized values")]
+    fn non_empty_zero_sized_set_encoding_panics() {
+        let mut set = BTreeSet::new();
+        set.insert(());
+        let _ = set.canonical_encode();
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty vector of zero-sized values")]
+    fn non_empty_zero_sized_vector_encoding_panics() {
+        let _ = vec![()].canonical_encode();
+    }
+
+    #[test]
+    fn generic_type_tags_use_intrinsic_petal_hash() {
+        let tags = [
+            Option::<u64>::type_tag(),
+            Result::<u64, String>::type_tag(),
+            Vec::<String>::type_tag(),
+            <(u8, String)>::type_tag(),
+            BTreeSet::<String>::type_tag(),
+            BTreeMap::<String, u8>::type_tag(),
+        ];
+
+        for tag in tags {
+            match tag {
+                TypeTag::Concrete { petal_hash, .. } => {
+                    assert_eq!(petal_hash, PRIMITIVE_PETAL_HASH);
+                }
+                other => panic!("expected concrete tag, got {other:?}"),
+            }
+        }
     }
 
     #[test]

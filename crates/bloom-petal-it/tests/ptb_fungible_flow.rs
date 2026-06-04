@@ -83,7 +83,7 @@ fn submit_and_apply(
 //
 // PTB command sequence:
 //   cmd 0 Move(load_coin, Arg::Object(alice_coin, Mutable))
-//          → WAT returns 40-byte envelope: 1 slot of 32 bytes = alice_coin_id
+//          → WAT returns 37-byte envelope: 1 slot of 32 bytes = alice_coin_id
 //   cmd 1 SplitCoins(src=Use(0,0), amounts=[300])
 //          → produces transient Coin<LOOM>(300), alice's coin debited to 700
 //   cmd 2 TransferObjects([Use(1,0)], Owner::Address(bob))
@@ -103,7 +103,7 @@ fn move_split_transfer_happy_path() {
     let gas_coin_id = genesis_coin_id(alice, 1);
     seed_coin(&mut state, gas_coin_id, alice, 1);
 
-    // WAT petal: takes alice's coin as Arg::Object, returns its id (40-byte envelope).
+    // WAT petal: takes alice's coin as Arg::Object, returns its id (37-byte envelope).
     let id_bytes = alice_coin_id.0;
     let id_hex: String = id_bytes.iter().map(|b| format!("\\{b:02x}")).collect();
     let loader_wat = format!(
@@ -111,10 +111,10 @@ fn move_split_transfer_happy_path() {
 (module
   (import "chain" "petal.return" (func $ret (param i32 i32)))
   (memory (export "memory") 1)
-  ;; 40-byte return envelope: count=1 (4 bytes BE) | len=32 (4 bytes BE) | id (32 bytes)
-  (data (i32.const 0) "\00\00\00\01\00\00\00\20{id_hex}")
+  ;; 37-byte return envelope: count=1 (4 bytes BE) | len=32 (ULEB) | id (32 bytes)
+  (data (i32.const 0) "\00\00\00\01\20{id_hex}")
   (func (export "__petal_load_coin") (param i32 i32) (result i32)
-    (call $ret (i32.const 0) (i32.const 40))
+    (call $ret (i32.const 0) (i32.const 37))
     i32.const 0)
 )
 "#
@@ -321,10 +321,10 @@ fn fungible_value_call_typechecks_against_real_manifest() {
 (module
   (import "chain" "petal.return" (func $ret (param i32 i32)))
   (memory (export "memory") 1)
-  ;; count=1 | len=16 | u128 value payload
-  (data (i32.const 0) "\00\00\00\01\00\00\00\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\03\E8")
+  ;; count=1 | len=16 (ULEB) | u128 value payload
+  (data (i32.const 0) "\00\00\00\01\10\00\00\00\00\00\00\00\00\00\00\00\00\00\00\03\E8")
   (func (export "__petal_value") (param i32 i32) (result i32)
-    (call $ret (i32.const 0) (i32.const 24))
+    (call $ret (i32.const 0) (i32.const 21))
     i32.const 0)
 )
 "#;

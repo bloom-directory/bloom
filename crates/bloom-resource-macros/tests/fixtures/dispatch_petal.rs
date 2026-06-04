@@ -3,11 +3,12 @@
 // arg/return shape:
 //
 // - `id(x: u128) -> u128` — pure const arg + const return.
+// - `blob_len(blob: Bytes) -> u128` — built-in bytes value arg.
 // - `requires_signer(s: &Signer) -> u32` — signer arg + primitive return.
 // - `double_coin(c: Coin<u128>) -> u128` — object arg consumed as a
 //   `Coin<T>` wrapper, return derived from the host-mocked handle.
 
-use bloom_resource::{Coin, Signer};
+use bloom_resource::{Bytes, Coin, Signer};
 use bloom_resource_macros as bloom;
 
 #[bloom::petal(path = "/test/dispatch", version = "0.1.0")]
@@ -16,6 +17,10 @@ pub mod dispatch {
 
     pub fn id(x: u128) -> u128 {
         x
+    }
+
+    pub fn blob_len(blob: Bytes) -> u128 {
+        blob.0.len() as u128
     }
 
     pub fn requires_signer(s: &Signer) -> u32 {

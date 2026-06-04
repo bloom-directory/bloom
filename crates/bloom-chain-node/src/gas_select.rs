@@ -114,11 +114,11 @@ fn select_best_loom_gas_payer_from_object_json(
 }
 
 pub fn decode_coin_value(bytes: &[u8]) -> Option<u128> {
-    if bytes.len() < 48 {
+    if bytes.len() != 16 {
         return None;
     }
     let mut buf = [0u8; 16];
-    buf.copy_from_slice(&bytes[32..48]);
+    buf.copy_from_slice(bytes);
     Some(u128::from_be_bytes(buf))
 }
 
@@ -126,17 +126,16 @@ pub fn decode_coin_value(bytes: &[u8]) -> Option<u128> {
 mod tests {
     use super::*;
     use bloom_objects::{Object, Owner};
+    use bloom_petal_fungible::ops::coin_payload;
     use bloom_script::{DEFAULT_FUNGIBLE_PETAL_HASH, loom_coin_type_tag};
 
     fn coin_object(id_byte: u8, owner: Owner, amount: u128) -> Object {
-        let mut payload = vec![0u8; 32];
-        payload.extend_from_slice(&amount.to_be_bytes());
         Object {
             id: ObjectId([id_byte; 32]),
             type_tag: loom_coin_type_tag(DEFAULT_FUNGIBLE_PETAL_HASH),
             owner,
             version: 0,
-            payload,
+            payload: coin_payload(amount),
         }
     }
 
