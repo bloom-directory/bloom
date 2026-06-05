@@ -2492,8 +2492,8 @@ fn view_probe_manifest() -> Vec<u8> {
             fields: vec![bloom_petal_manifest::types::FieldDecl {
                 name: "value".to_string(),
                 ty: u128_type_tag(),
-                offset: None,
-                width: None,
+                offset: Some(0),
+                width: Some(16),
             }],
             ..Default::default()
         }],
