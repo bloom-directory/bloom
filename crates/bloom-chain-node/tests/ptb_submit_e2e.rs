@@ -43,7 +43,7 @@ use bloom_petal_manifest::{
     },
 };
 use bloom_script::{
-    CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH,
+    ArithExprStub, CORE_FUNGIBLE_PATH, CmpOpStub, DEFAULT_FUNGIBLE_PETAL_HASH, PredicateAstStub,
     chain_iface::{
         ArgDeclStub, DataTypeDeclStub, FieldDeclStub, FunctionDeclStub, InvariantDeclStub,
         ObjectTypeDeclStub, PetalManifestStub,
@@ -308,6 +308,11 @@ fn manifest_with_satisfied_function_invariant(fn_name: &str) -> PetalManifestStu
             attached_invariants: vec![InvariantDeclStub {
                 name: "touch_inv".to_string(),
                 wasm_export: "__inv_0".to_string(),
+                predicate: PredicateAstStub::ArithCmp {
+                    op: CmpOpStub::Ge,
+                    lhs: ArithExprStub::Literal(1),
+                    rhs: ArithExprStub::Literal(0),
+                },
                 argspec: vec![],
                 target: Default::default(),
             }],

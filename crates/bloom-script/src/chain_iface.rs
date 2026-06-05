@@ -19,6 +19,8 @@
 use bloom_chain_types::Hash32;
 use bloom_objects::{AbilitySet, AccessMode, Object, ObjectId, TypeTag};
 
+use crate::predicate::PredicateAstStub;
+
 // ---------------------------------------------------------------------------
 // Manifest stubs
 // ---------------------------------------------------------------------------
@@ -259,15 +261,18 @@ impl Default for InvariantTargetStub {
     }
 }
 
-/// Invariant declaration. The executor calls the wasm export after
-/// the function returns; predicate is checked guest-side and the host
-/// reads the 1/0 return code.
+/// Invariant declaration projected for runtime enforcement.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct InvariantDeclStub {
     /// Human-readable name (matches the source attribute).
     pub name: String,
     /// Wasm export name (e.g. `"__inv_0"`).
+    ///
+    /// Kept for ABI compatibility/tooling; runtime enforcement uses
+    /// [`predicate`](Self::predicate), not the arbitrary wasm return byte.
     pub wasm_export: String,
+    /// Machine-readable manifest predicate interpreted by the host.
+    pub predicate: PredicateAstStub,
     /// Indices into the function's args/returns that the invariant
     /// receives (encoded as `Vec<u16>`; the executor builds the scope
     /// buffer from these positions). Empty for object-type invariants,
@@ -348,6 +353,7 @@ mod tests {
         let inv = |name: &str, target| InvariantDeclStub {
             name: name.to_string(),
             wasm_export: name.to_string(),
+            predicate: PredicateAstStub::Opaque,
             argspec: vec![],
             target,
         };

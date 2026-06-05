@@ -16,16 +16,18 @@
 
 use bloom_chain_types::Hash32;
 use bloom_script::{
-    ArgDeclStub, CapabilityTypeDeclStub, DataTypeDeclStub, EnumTypeDeclStub, ExternalTypeRefStub,
-    FieldDeclStub, FieldLayoutStub, FunctionDeclStub, InvariantDeclStub, InvariantTargetStub,
-    ObjectTypeDeclStub, PetalManifestStub, TypeParamDeclStub, VariantDeclStub,
-    VariantFieldsDeclStub,
+    ArgDeclStub, ArithExprStub, BoundedArithOpStub, CapabilityTypeDeclStub, CmpOpStub,
+    DataTypeDeclStub, EnumTypeDeclStub, ExternalTypeRefStub, FieldDeclStub, FieldLayoutStub,
+    FunctionDeclStub, InvariantDeclStub, InvariantTargetStub, ObjectTypeDeclStub,
+    OverflowPolicyStub, PetalManifestStub, PredicateAstStub, TypeParamDeclStub, VariantDeclStub,
+    VariantFieldsDeclStub, WideningStub,
 };
 
 use crate::types::{
-    ArgKind, CapabilityDecl, DataTypeDecl, EnumTypeDecl, FieldDecl, FunctionDecl, InvariantDecl,
-    InvariantTarget, ObjectTypeDecl, PetalManifestV0, TypeParamDecl, TypeParamKind, VariantDecl,
-    VariantFieldsDecl, is_numeric_invariant_field,
+    ArgKind, ArithExpr, BoundedArithOp, CapabilityDecl, CmpOp, DataTypeDecl, EnumTypeDecl,
+    FieldDecl, FunctionDecl, InvariantDecl, InvariantTarget, ObjectTypeDecl, OverflowPolicy,
+    PetalManifestV0, PredicateAst, TypeParamDecl, TypeParamKind, VariantDecl, VariantFieldsDecl,
+    Widening, is_numeric_invariant_field,
 };
 
 /// Project a full canonical manifest down to the validator-facing stub.
@@ -188,11 +190,103 @@ pub fn project_invariant(inv: &InvariantDecl) -> InvariantDeclStub {
     InvariantDeclStub {
         name: inv.name.clone(),
         wasm_export: inv.wasm_export.clone(),
+        predicate: project_predicate(&inv.predicate),
         // human_text is excluded — it is only used by tooling/arbitration
         // (ADR-003 spec↔intent), not by the runtime validator or executor.
         // InvariantDeclStub has no human_text field.
         argspec: vec![],
         target,
+    }
+}
+
+fn project_predicate(p: &PredicateAst) -> PredicateAstStub {
+    match p {
+        PredicateAst::FieldGe { lhs, rhs } => PredicateAstStub::FieldGe {
+            lhs: lhs.clone(),
+            rhs: rhs.clone(),
+        },
+        PredicateAst::FieldLe { lhs, rhs } => PredicateAstStub::FieldLe {
+            lhs: lhs.clone(),
+            rhs: rhs.clone(),
+        },
+        PredicateAst::FieldEq { lhs, rhs } => PredicateAstStub::FieldEq {
+            lhs: lhs.clone(),
+            rhs: rhs.clone(),
+        },
+        PredicateAst::StrategyKNonDecreasing {
+            strategy_param,
+            pool_field,
+        } => PredicateAstStub::StrategyKNonDecreasing {
+            strategy_param: strategy_param.clone(),
+            pool_field: pool_field.clone(),
+        },
+        PredicateAst::AllPoolsKNonDecreasing => PredicateAstStub::AllPoolsKNonDecreasing,
+        PredicateAst::ArithCmp { op, lhs, rhs } => PredicateAstStub::ArithCmp {
+            op: project_cmp_op(*op),
+            lhs: project_arith(lhs),
+            rhs: project_arith(rhs),
+        },
+        PredicateAst::And(a, b) => PredicateAstStub::And(
+            Box::new(project_predicate(a)),
+            Box::new(project_predicate(b)),
+        ),
+        PredicateAst::Or(a, b) => PredicateAstStub::Or(
+            Box::new(project_predicate(a)),
+            Box::new(project_predicate(b)),
+        ),
+        PredicateAst::Not(inner) => PredicateAstStub::Not(Box::new(project_predicate(inner))),
+        PredicateAst::Opaque => PredicateAstStub::Opaque,
+    }
+}
+
+fn project_arith(e: &ArithExpr) -> ArithExprStub {
+    match e {
+        ArithExpr::Field(name) => ArithExprStub::Field(name.clone()),
+        ArithExpr::Literal(v) => ArithExprStub::Literal(*v),
+        ArithExpr::Bounded {
+            op,
+            lhs,
+            rhs,
+            widening,
+            on_overflow,
+        } => ArithExprStub::Bounded {
+            op: project_arith_op(*op),
+            lhs: Box::new(project_arith(lhs)),
+            rhs: Box::new(project_arith(rhs)),
+            widening: project_widening(*widening),
+            on_overflow: project_overflow_policy(*on_overflow),
+        },
+    }
+}
+
+fn project_cmp_op(op: CmpOp) -> CmpOpStub {
+    match op {
+        CmpOp::Ge => CmpOpStub::Ge,
+        CmpOp::Le => CmpOpStub::Le,
+        CmpOp::Eq => CmpOpStub::Eq,
+    }
+}
+
+fn project_arith_op(op: BoundedArithOp) -> BoundedArithOpStub {
+    match op {
+        BoundedArithOp::Add => BoundedArithOpStub::Add,
+        BoundedArithOp::Sub => BoundedArithOpStub::Sub,
+        BoundedArithOp::Mul => BoundedArithOpStub::Mul,
+    }
+}
+
+fn project_widening(w: Widening) -> WideningStub {
+    match w {
+        Widening::None => WideningStub::None,
+        Widening::U256 => WideningStub::U256,
+        Widening::U512 => WideningStub::U512,
+    }
+}
+
+fn project_overflow_policy(p: OverflowPolicy) -> OverflowPolicyStub {
+    match p {
+        OverflowPolicy::Indeterminate => OverflowPolicyStub::Indeterminate,
+        OverflowPolicy::Saturate => OverflowPolicyStub::Saturate,
     }
 }
 
