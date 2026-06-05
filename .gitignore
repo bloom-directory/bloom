@@ -8,3 +8,9 @@ test.env
 .worktrees/
 .claude/worktrees/
 .claude/scheduled_tasks.lock
+
+# Literature-inquiry raw corpus + full-text third-party papers. These are
+# large machine-generated artifacts (and the full text carries third-party
+# copyright), so they live in an external store, not the repo. The
+# synthesized markdown under lit/ stays tracked. See lit/RESEARCH.md.
+docs/research/formal-verification/lit/data/

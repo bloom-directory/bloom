@@ -25,14 +25,22 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::too_many_lines)]
 
+pub mod boundary;
 pub mod codec;
 pub mod extract;
+pub mod interpret;
 pub mod resolver;
 pub mod stub;
 pub mod types;
 
+pub use boundary::{BoundaryConfig, BoundaryReport, boundary_check};
 pub use codec::{decode, decode_from, encode, encode_into};
 pub use extract::{extract_petal_manifest_v0, extract_petal_manifest_v0_bytes};
+pub use interpret::{
+    EvalOutcome, MAX_INVARIANT_PREDICATE_FUEL, Triviality, collect_field_refs, interpret_predicate,
+    predicate_is_enforceable, predicate_max_fuel, predicate_triviality, predicate_uses_subtraction,
+    predicate_uses_unsupported_arithmetic_shape, render_predicate_english,
+};
 pub use resolver::{ManifestResolver, validate_reserved_type_names};
 pub use stub::to_petal_manifest_stub;
 pub use types::{MANIFEST_CUSTOM_SECTION, PetalManifestV0, SCHEMA_VERSION};

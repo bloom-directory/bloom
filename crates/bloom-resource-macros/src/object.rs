@@ -175,6 +175,10 @@ pub(crate) fn build_decl(item: &ItemStruct, attr: &ObjectAttr) -> syn::Result<Ob
         }
         Fields::Unit => Box::new(std::iter::empty()),
     };
+    // Running byte offset for the fixed-width prefix (ADR-011). `None`
+    // once any preceding field is variable-width: every field from that
+    // point on is not statically addressable.
+    let mut running_offset: Option<u32> = Some(0);
     for (field, i) in field_iter {
         if crate::bloom_type::is_phantom_data_type(&field.ty) {
             continue;
@@ -188,9 +192,19 @@ pub(crate) fn build_decl(item: &ItemStruct, attr: &ObjectAttr) -> syn::Result<Ob
             .map(|i| i.to_string())
             .unwrap_or_else(|| i.to_string());
         let ty = ctx.lower(&field.ty)?;
+        let width = bloom_petal_manifest::types::canonical_byte_width(&ty);
+        // A field is addressable only while it *and* every preceding
+        // field have a known fixed width.
+        let offset = running_offset;
+        running_offset = match (running_offset, width) {
+            (Some(off), Some(w)) => Some(off + w),
+            _ => None,
+        };
         fields.push(FieldDecl {
             name: field_name,
             ty,
+            offset: offset.filter(|_| width.is_some()),
+            width,
         });
     }
 

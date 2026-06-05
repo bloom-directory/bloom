@@ -45,11 +45,11 @@ use bloom_petal_manifest::{
 use bloom_script::{
     CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH,
     chain_iface::{
-        ArgDeclStub, DataTypeDeclStub, FieldDeclStub, FunctionDeclStub, ObjectTypeDeclStub,
-        PetalManifestStub,
+        ArgDeclStub, DataTypeDeclStub, FieldDeclStub, FunctionDeclStub, InvariantDeclStub,
+        ObjectTypeDeclStub, PetalManifestStub,
     },
     encode_ptb, loom_coin_type_tag,
-    types::{Arg, Command, MoveCmd, PetalRef, PqSignature, PtbTx},
+    types::{Arg, Command, MoveCmd, PetalRef, PqSignature, PtbTx, PublishCmd},
 };
 
 /// Build the smallest possible `TxKind::SubmitPtb` transaction with
@@ -294,6 +294,28 @@ fn manifest_with_nullary_fn_returns(fn_name: &str, returns: Vec<TypeTag>) -> Pet
     }
 }
 
+fn manifest_with_satisfied_function_invariant(fn_name: &str) -> PetalManifestStub {
+    PetalManifestStub {
+        module_path: "/test/e2e".to_string(),
+        functions: vec![FunctionDeclStub {
+            view: false,
+            name: fn_name.to_string(),
+            type_params: vec![],
+            args: vec![],
+            returns: vec![],
+            required_signers: 0,
+            required_capabilities: vec![],
+            attached_invariants: vec![InvariantDeclStub {
+                name: "touch_inv".to_string(),
+                wasm_export: "__inv_0".to_string(),
+                argspec: vec![],
+                target: Default::default(),
+            }],
+        }],
+        ..Default::default()
+    }
+}
+
 /// Build a `PtbTx` with a single `Command::Move` calling `fn_name`
 /// against the petal at `petal_hash`, signed (sham PQ sig) by
 /// `signer`, and paying gas out of `gas_payer`.
@@ -511,7 +533,105 @@ fn log_emit_round_trips_topics_and_data() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 5 — out-of-fuel during a petal call reverts atomically.
+// Test 5 — post-execution publish admission failure preserves invariant
+// outcomes already recorded by the PTB executor.
+//
+// The PTB first calls a no-op Move function with a satisfied function-exit
+// invariant, then publishes to a path that is already bound. Admission rejects
+// the publish after execution has produced an ExecutionReport; the failed
+// receipt must still surface the invariant verdict.
+// ---------------------------------------------------------------------------
+
+const SATISFIED_INV_PETAL: &str = r#"
+(module
+  (import "chain" "petal.return" (func $ret (param i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "\01")
+  (func (export "__petal_touch") (param i32 i32) (result i32)
+    i32.const 0)
+  (func (export "__inv_0") (param i32 i32) (result i32)
+    (call $ret (i32.const 0) (i32.const 1))
+    i32.const 0)
+)
+"#;
+
+#[test]
+fn publish_admission_revert_preserves_invariant_receipts() {
+    let signer = [0x44u8; 32];
+    let gas_payer_id = ObjectId([0xEF; 32]);
+    let publish_path = "/bloom/petals/test/already";
+
+    let mut state = State::new();
+    bind_bootstrap_fungible(&mut state);
+    state.set_vfs_binding(publish_path.to_string(), Hash32([0x99; 32]));
+
+    let wasm = wat(SATISFIED_INV_PETAL);
+    let petal_hash = state.insert_code(&wasm);
+    state.set_object(make_loom_coin(gas_payer_id, signer, 1_000_000_000));
+
+    let mut manifests = HashMap::new();
+    manifests.insert(
+        petal_hash,
+        manifest_with_satisfied_function_invariant("touch"),
+    );
+
+    let ptb = PtbTx {
+        signers: vec![signer],
+        commands: vec![
+            Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: String::new(),
+                    hash: Some(petal_hash),
+                },
+                function: "touch".to_string(),
+                type_args: vec![],
+                args: vec![],
+            }),
+            Command::Publish(PublishCmd {
+                wasm_bytes: vec![0x00],
+                module_path: publish_path.to_string(),
+                publisher_cap: None,
+            }),
+        ],
+        gas_payer: gas_payer_id,
+        gas_budget: 200_000,
+        gas_price: 1,
+        expiry_block: 100,
+        signatures: vec![PqSignature(vec![0u8; 64])],
+    };
+    let bytes = encode_ptb(&ptb).expect("encode PTB");
+    let tx = submit_ptb_tx(test_sender(), bytes);
+
+    let exec = ChainPetalExecutorWithManifests::new(manifests);
+    let out = exec.execute_tx(
+        &tx,
+        &mut state,
+        /* block_number */ 100,
+        /* timestamp_ms */ 1_700_000_000_000,
+        /* proposer    */ Address([0xAA; 32]),
+        /* parent_hash */ Hash32([0u8; 32]),
+    );
+
+    assert!(!out.success, "publish admission failure must revert");
+    let reason = String::from_utf8_lossy(&out.return_data);
+    assert!(
+        reason.contains("ptb publish admission error")
+            && reason.contains("path '/bloom/petals/test/already' already bound"),
+        "unexpected revert reason: {reason}"
+    );
+    assert_eq!(
+        out.invariant_outcomes.len(),
+        1,
+        "failed receipt must preserve invariant outcomes"
+    );
+    let inv = &out.invariant_outcomes[0];
+    assert_eq!(inv.cmd_idx, 0);
+    assert_eq!(inv.verdict, 0, "satisfied invariant verdict");
+    assert_eq!(inv.name, b"touch_inv");
+}
+
+// ---------------------------------------------------------------------------
+// Test 6 — out-of-fuel during a petal call reverts atomically.
 //
 // The petal enters an infinite `(loop (br 0))` that the wasm engine
 // must trap as "out of fuel" before reaching `petal.return`. The
@@ -688,6 +808,8 @@ fn create_and_transfer_manifest() -> PetalManifestV0 {
             fields: vec![FieldDecl {
                 name: "value".to_string(),
                 ty: builtin_type("u128"),
+                offset: Some(0),
+                width: Some(16),
             }],
         }],
         data_types: vec![DataTypeDecl {
@@ -697,14 +819,20 @@ fn create_and_transfer_manifest() -> PetalManifestV0 {
                 FieldDecl {
                     name: "tag".to_string(),
                     ty: builtin_type("TypeTag"),
+                    offset: None,
+                    width: None,
                 },
                 FieldDecl {
                     name: "value".to_string(),
                     ty: builtin_type("u128"),
+                    offset: None,
+                    width: Some(16),
                 },
                 FieldDecl {
                     name: "recipient".to_string(),
                     ty: builtin_type("Address"),
+                    offset: None,
+                    width: Some(32),
                 },
             ],
         }],

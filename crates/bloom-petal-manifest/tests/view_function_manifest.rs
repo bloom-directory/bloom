@@ -109,7 +109,7 @@ fn schema_version_is_bumped_for_view_function_layout() {
     let manifest = PetalManifestV0::default();
 
     assert!(
-        manifest.schema_version >= 3,
+        manifest.schema_version >= 4,
         "canonical codec declarations change the positional manifest layout"
     );
 }

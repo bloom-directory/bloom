@@ -161,6 +161,21 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
     let mut cmd_return_types: Vec<Vec<Option<TypeTag>>> = Vec::with_capacity(tx.commands.len());
     let mut consumed_use_refs: HashSet<UseRef> = HashSet::new();
     for (cmd_idx, cmd) in tx.commands.iter().enumerate() {
+        // ReadOnly mode: only Move commands are permitted.
+        if ctx.mode == ValidationMode::ReadOnly
+            && matches!(
+                cmd,
+                Command::TransferObjects { .. }
+                    | Command::MergeCoins { .. }
+                    | Command::SplitCoins { .. }
+                    | Command::MakeMoveVec { .. }
+            )
+        {
+            return Err(PtbError::BuiltinFailed {
+                cmd_idx: cmd_idx as u16,
+                reason: "built-in command not allowed in read-only mode".to_string(),
+            });
+        }
         match cmd {
             Command::Move(m) => {
                 let hash = m.petal.hash.ok_or_else(|| PtbError::PetalNotPinned {
@@ -223,6 +238,13 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
                 let f = manifest
                     .function(&m.function)
                     .expect("function presence verified by typecheck_move_cmd");
+                if ctx.mode == ValidationMode::ReadOnly && !f.view {
+                    return Err(PtbError::TypeMismatch {
+                        function: m.function.clone(),
+                        arg_idx: 0,
+                        reason: "read-only PTB may only call view functions".into(),
+                    });
+                }
                 cmd_return_types.push(
                     f.returns
                         .iter()
@@ -1331,7 +1353,7 @@ mod tests {
     fn object_manifest(mode: AccessMode) -> PetalManifestStub {
         let mut manifest = sample_manifest();
         manifest.functions = vec![FunctionDeclStub {
-            view: false,
+            view: true,
             name: "inspect".to_string(),
             type_params: vec![],
             args: vec![ArgDeclStub::Object {
@@ -1513,9 +1535,28 @@ mod tests {
 
     #[test]
     fn read_only_allows_supplied_signer_without_signature_verification() {
-        let (chain, signer, gas_id) = setup();
-        let mut tx = sample_ptb(signer, gas_id, 100);
-        tx.signatures.clear();
+        let chain = MockChain::new();
+        let mut manifest = sample_manifest();
+        manifest.functions[0].view = true;
+        chain.put_petal(Hash32([0xAB; 32]), vec![1, 2, 3], manifest);
+        chain.put_path("/bloom/dex/pool", Hash32([0xAB; 32]));
+        let tx = PtbTx {
+            signers: vec![[0x11; 32]],
+            commands: vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/bloom/dex/pool".to_string(),
+                    hash: Some(Hash32([0xAB; 32])),
+                },
+                function: "swap".to_string(),
+                type_args: vec![],
+                args: vec![Arg::Signer(0)],
+            })],
+            gas_payer: ObjectId([0xFE; 32]),
+            gas_budget: 100,
+            gas_price: 1,
+            expiry_block: 100,
+            signatures: vec![],
+        };
 
         assert!(validate_ptb(&tx, &read_only_ctx(&chain, &PanicVerifier)).is_ok());
     }

@@ -49,6 +49,7 @@ pub mod error;
 pub mod executor;
 pub mod hash;
 pub mod host_ctx;
+pub mod invariant_scope;
 pub mod types;
 pub mod validator;
 pub mod value_validation;
@@ -62,14 +63,15 @@ pub use abi_json::{
 pub use borrow_table::{BorrowRow, BorrowTable, RowState};
 pub use chain_iface::{
     ArgDeclStub, CapabilityTypeDeclStub, ChainStateIface, DataTypeDeclStub, EnumTypeDeclStub,
-    ExternalTypeRefStub, FieldDeclStub, FunctionDeclStub, InvariantDeclStub, ObjectTypeDeclStub,
-    PetalManifestStub, TypeParamDeclStub, VariantDeclStub, VariantFieldsDeclStub,
+    ExternalTypeRefStub, FieldDeclStub, FieldLayoutStub, FunctionDeclStub, InvariantDeclStub,
+    InvariantTargetStub, ObjectTypeDeclStub, PetalManifestStub, TypeParamDeclStub, VariantDeclStub,
+    VariantFieldsDeclStub,
 };
 pub use encode::{decode_ptb, encode_ptb};
 pub use error::PtbError;
 pub use executor::{
-    ExecutionReport, InvariantResult, LogEntry, PetalCallResult, PetalPublishEvent, PetalRunner,
-    PtbExecutor,
+    ExecutionReport, InvariantOutcome, InvariantResult, InvariantVerdict, LogEntry,
+    PetalCallResult, PetalPublishEvent, PetalRunner, PtbExecutor,
 };
 pub use hash::{PTB_HASH_TAG, ptb_hash};
 pub use host_ctx::{HandleEntry, PtbHostCtx};

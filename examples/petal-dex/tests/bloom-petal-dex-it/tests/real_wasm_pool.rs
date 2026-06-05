@@ -234,6 +234,107 @@ fn real_pool_swap_exact_in_executes() {
         bloom_petal_dex_pool::payload::decode_pool(&pool.payload).expect("decode pool");
     assert_eq!(ra, 10_100, "reserve_a after swap");
     assert_eq!(rb, 9_902, "reserve_b after swap");
+
+    // The pool_k_non_decreasing invariant fired and its verdict was
+    // threaded into the execution output (→ consensus Receipt → RPC).
+    let rec = out
+        .invariant_outcomes
+        .iter()
+        .find(|o| o.name == b"pool_k_non_decreasing")
+        .expect("pool_k_non_decreasing verdict recorded on the swap");
+    assert_eq!(rec.verdict, 0, "k held, so the verdict must be Satisfied");
+}
+
+// ---------------------------------------------------------------------------
+// Regression: remove_liquidity lowers k (reserves shrink). Since
+// pool_k_non_decreasing is an ObjectType("Pool") invariant it fires on this
+// mutation too; the corrected predicate's `|| lp_supply changed` disjunct must
+// let it through. Before that fix, this PTB reverted with InvariantFailed.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "compiles pool to wasm32; run with `-- --ignored`"]
+fn real_pool_remove_liquidity_not_blocked_by_invariant() {
+    let alice = addr(0xA1);
+    let mut state = build_state(&[(alice, 1_000_000)]);
+
+    let wasm = std::fs::read(build_pool_wasm()).expect("read pool wasm");
+    let pool_petal_hash = state.insert_code(&wasm);
+    state.set_vfs_binding("/bloom/dex/pool".to_string(), pool_petal_hash);
+
+    // Alice creates the pool and receives the initial LpPosition.
+    let pool_id = create_shared_pool(&mut state, alice, pool_petal_hash, b"lp", 30);
+    let pool_version = state.get_object(&pool_id).expect("pool exists").version;
+    let (lp_id, lp_version) = state
+        .iter_objects()
+        .find(|(_, o)| {
+            matches!(&o.type_tag, TypeTag::Concrete { type_name, .. } if type_name == "LpPosition")
+                && o.owner == Owner::Address(alice.0)
+        })
+        .map(|(id, o)| (*id, o.version))
+        .expect("alice owns the initial LpPosition");
+
+    let gas_payer = genesis_coin_id(alice, 0);
+    let ptb = PtbTx {
+        signers: vec![alice.0],
+        commands: vec![
+            // cmd 0: remove_liquidity(pool, position) -> (Coin<A>, Coin<B>)
+            Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/bloom/dex/pool".to_string(),
+                    hash: Some(pool_petal_hash),
+                },
+                function: "remove_liquidity".to_string(),
+                type_args: erased_pair_type_args(),
+                args: vec![
+                    Arg::Object {
+                        id: pool_id,
+                        expected_version: ExpectedVersion(pool_version),
+                        access_mode: AccessMode::Mutable,
+                    },
+                    Arg::Object {
+                        id: lp_id,
+                        expected_version: ExpectedVersion(lp_version),
+                        access_mode: AccessMode::Consume,
+                    },
+                ],
+            }),
+            // cmd 1: hand both withdrawn coins back to alice (linearity).
+            Command::TransferObjects {
+                uses: vec![
+                    UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    },
+                    UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 1,
+                    },
+                ],
+                owner: Owner::Address(alice.0),
+            },
+        ],
+        gas_payer,
+        gas_budget: 2_000_000,
+        gas_price: 0,
+        expiry_block: 100,
+        signatures: vec![PqSignature(vec![0u8; 64])],
+    };
+
+    let out = submit_ptb_chain_auth(&mut state, alice, ptb);
+    assert!(
+        out.success,
+        "remove_liquidity must not be blocked by pool_k_non_decreasing; revert: {}",
+        String::from_utf8_lossy(&out.return_data)
+    );
+    // The invariant still fired (it's an ObjectType invariant) and was Satisfied
+    // via the liquidity-event disjunct.
+    let rec = out
+        .invariant_outcomes
+        .iter()
+        .find(|o| o.name == b"pool_k_non_decreasing")
+        .expect("invariant fired on the Pool mutation");
+    assert_eq!(rec.verdict, 0, "liquidity event must satisfy the invariant");
 }
 
 // ---------------------------------------------------------------------------

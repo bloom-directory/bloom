@@ -54,6 +54,25 @@ impl PetalManifestStub {
     pub fn object_type(&self, name: &str) -> Option<&ObjectTypeDeclStub> {
         self.object_types.iter().find(|o| o.name == name)
     }
+
+    /// Object-type invariants whose target matches `type_name`. The
+    /// executor fires these against dirty borrow rows of that type after
+    /// any command that mutates such a row (ADR-010) — Move calls and
+    /// built-ins (`MergeCoins`/`SplitCoins`) alike. Every invariant is
+    /// attached to its host function, so scanning `functions` enumerates
+    /// them all; each invariant is attached exactly once, so there are no
+    /// duplicates.
+    pub fn object_invariants<'a>(
+        &'a self,
+        type_name: &'a str,
+    ) -> impl Iterator<Item = &'a InvariantDeclStub> + 'a {
+        self.functions
+            .iter()
+            .flat_map(|f| f.attached_invariants.iter())
+            .filter(move |inv| {
+                matches!(&inv.target, InvariantTargetStub::ObjectType { name } if name == type_name)
+            })
+    }
 }
 
 /// Function declaration in the manifest stub.
@@ -106,6 +125,20 @@ pub enum ArgDeclStub {
     TypeArg(u16),
 }
 
+/// Statically-known canonical-payload location of one object field
+/// (ADR-011). Only fields in the fixed-width prefix appear here; the
+/// scope builder uses these to extract named field values at runtime
+/// without re-parsing the type-defining petal's serialization.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldLayoutStub {
+    /// Field name.
+    pub name: String,
+    /// Byte offset within the canonical object payload.
+    pub offset: u32,
+    /// Fixed byte width of the field.
+    pub width: u32,
+}
+
 /// Object-type declaration; only abilities are consulted by the
 /// validator today (e.g. to ensure a `Consume`d object can be dropped).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -118,6 +151,9 @@ pub struct ObjectTypeDeclStub {
     pub type_params: Vec<TypeParamDeclStub>,
     /// Payload fields in canonical order.
     pub fields: Vec<FieldDeclStub>,
+    /// Layout of the statically-addressable (fixed-prefix) fields,
+    /// used by the invariant scope builder.
+    pub field_layout: Vec<FieldLayoutStub>,
 }
 
 /// Capability declaration in the manifest stub.
@@ -198,6 +234,31 @@ pub struct ExternalTypeRefStub {
     pub declared_content_hash: Option<Hash32>,
 }
 
+/// Where an invariant attaches. Runtime mirror of the manifest's
+/// `InvariantTarget` (the two crates can't share the type without a
+/// dependency cycle, since the manifest projector depends on this crate).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InvariantTargetStub {
+    /// Fires after every mutation of the named object type.
+    ObjectType {
+        /// Base object type name (generics stripped).
+        name: String,
+    },
+    /// Fires on exit from the named function.
+    FunctionExit {
+        /// Function name.
+        name: String,
+    },
+}
+
+impl Default for InvariantTargetStub {
+    fn default() -> Self {
+        InvariantTargetStub::FunctionExit {
+            name: String::new(),
+        }
+    }
+}
+
 /// Invariant declaration. The executor calls the wasm export after
 /// the function returns; predicate is checked guest-side and the host
 /// reads the 1/0 return code.
@@ -209,8 +270,11 @@ pub struct InvariantDeclStub {
     pub wasm_export: String,
     /// Indices into the function's args/returns that the invariant
     /// receives (encoded as `Vec<u16>`; the executor builds the scope
-    /// buffer from these positions).
+    /// buffer from these positions). Empty for object-type invariants,
+    /// which build their scope from the borrow row's payloads.
     pub argspec: Vec<u16>,
+    /// Where the invariant attaches (object-type vs function-exit).
+    pub target: InvariantTargetStub,
 }
 
 // ---------------------------------------------------------------------------
@@ -277,5 +341,60 @@ mod tests {
         };
         assert!(m.object_type("Pool").is_some());
         assert!(m.object_type("Nope").is_none());
+    }
+
+    #[test]
+    fn object_invariants_selects_matching_object_type_targets() {
+        let inv = |name: &str, target| InvariantDeclStub {
+            name: name.to_string(),
+            wasm_export: name.to_string(),
+            argspec: vec![],
+            target,
+        };
+        let m = PetalManifestStub {
+            functions: vec![
+                FunctionDeclStub {
+                    name: "swap".to_string(),
+                    attached_invariants: vec![
+                        inv(
+                            "pool_k",
+                            InvariantTargetStub::ObjectType {
+                                name: "Pool".to_string(),
+                            },
+                        ),
+                        inv(
+                            "fn_exit",
+                            InvariantTargetStub::FunctionExit {
+                                name: "swap".to_string(),
+                            },
+                        ),
+                    ],
+                    ..Default::default()
+                },
+                FunctionDeclStub {
+                    name: "drain".to_string(),
+                    attached_invariants: vec![inv(
+                        "vault_ok",
+                        InvariantTargetStub::ObjectType {
+                            name: "Vault".to_string(),
+                        },
+                    )],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        // Only the Pool-targeted invariant matches, across all functions.
+        let pool: Vec<&str> = m
+            .object_invariants("Pool")
+            .map(|i| i.name.as_str())
+            .collect();
+        assert_eq!(pool, vec!["pool_k"]);
+        let vault: Vec<&str> = m
+            .object_invariants("Vault")
+            .map(|i| i.name.as_str())
+            .collect();
+        assert_eq!(vault, vec!["vault_ok"]);
+        assert_eq!(m.object_invariants("Nope").count(), 0);
     }
 }

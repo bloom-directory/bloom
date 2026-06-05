@@ -203,6 +203,16 @@ pub mod cap {
     /// authorizes this operation; the runtime cap-check ensures the
     /// caller actually holds a matching revoke cap. Preserves the
     /// current inner-kind and expiry.
+    ///
+    /// Invariant (fires on *every* `Cap` mutation, ADR-010): revocation is
+    /// permanent — `revoked` never goes 1→0 — and the inner-kind discriminant
+    /// stays in range. Demonstrates the framework on a non-DEX petal and uses
+    /// boolean composition (`&&` over a `FieldGe` and a bounded comparison).
+    #[invariant(
+        name = "cap_revoked_is_monotone",
+        target = "Cap",
+        pred = |before, after| after.revoked >= before.revoked && after.inner_kind <= 2
+    )]
     pub fn revoke<T>(_rc: &Capability<RevokeCap<T>>, cap: &mut Resource<Cap<T>>) {
         let (kind, exp, _revoked) = read_cap_fields(cap.handle());
         write_cap_fields(cap.handle(), kind, exp, true);
