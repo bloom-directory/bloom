@@ -331,6 +331,7 @@ pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
     }
     if let Some(manifest) = extract_petal_manifest_v0(bytes) {
         validate_view_functions_are_pure(bytes, &manifest)?;
+        validate_invariant_attachments(&manifest)?;
         for inv in &manifest.invariants {
             // (1) Fail-closed on invariants the on-chain evaluator can't
             // enforce: unsupported predicate shapes lower to a constant in
@@ -357,7 +358,13 @@ pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
                     inv.name
                 )));
             }
-            // (1c) Reject arithmetic shapes where the reference interpreter
+            // (1c) Reject hand-authored arithmetic metadata the host
+            // interpreter / generated evaluator do not yet implement as
+            // distinct semantics. Macro output uses U256 +
+            // Indeterminate; any other declaration would be admitted with
+            // semantics that are not actually enforced.
+            validate_invariant_arithmetic_metadata(inv)?;
+            // (1d) Reject arithmetic shapes where the reference interpreter
             // and generated guest are not yet proven equivalent. v1 supports
             // the common shape `u128 op u128 <cmp> u128` (for example
             // `after.reserve_a * after.reserve_b >= before.k_last`), but not
@@ -444,6 +451,103 @@ pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
         }
     }
     Ok(())
+}
+
+/// Ensure every declared invariant is reachable from the runtime manifest
+/// projection exactly once. The runtime stub projects only attached
+/// invariants, so a top-level declaration that is unattached or referenced by
+/// an invalid index would otherwise pass admission and then never fire.
+fn validate_invariant_attachments(manifest: &PetalManifestV0) -> Result<(), PetalError> {
+    let mut counts = vec![0usize; manifest.invariants.len()];
+    for function in &manifest.functions {
+        for idx in &function.attached_invariants {
+            let Some(inv) = manifest.invariants.get(*idx as usize) else {
+                return Err(PetalError::InvalidWasm(format!(
+                    "chain petal function '{}' attaches unknown invariant index {}",
+                    function.name, idx
+                )));
+            };
+            if let bloom_petal_manifest::types::InvariantTarget::FunctionExit { name } = &inv.target
+                && name != &function.name
+            {
+                return Err(PetalError::InvalidWasm(format!(
+                    "chain petal invariant '{}' targets function '{}' but is attached to '{}'",
+                    inv.name, name, function.name
+                )));
+            }
+            counts[*idx as usize] += 1;
+        }
+    }
+
+    for (idx, (inv, count)) in manifest.invariants.iter().zip(counts).enumerate() {
+        match count {
+            1 => {}
+            0 => {
+                return Err(PetalError::InvalidWasm(format!(
+                    "chain petal invariant '{}' at index {} is not attached to any function",
+                    inv.name, idx
+                )));
+            }
+            n => {
+                return Err(PetalError::InvalidWasm(format!(
+                    "chain petal invariant '{}' at index {} is attached {} times; attach each \
+                     invariant exactly once",
+                    inv.name, idx, n
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_invariant_arithmetic_metadata(
+    inv: &bloom_petal_manifest::types::InvariantDecl,
+) -> Result<(), PetalError> {
+    use bloom_petal_manifest::types::{ArithExpr, OverflowPolicy, PredicateAst, Widening};
+
+    fn check_expr(e: &ArithExpr) -> bool {
+        match e {
+            ArithExpr::Field(_) | ArithExpr::Literal(_) => true,
+            ArithExpr::Bounded {
+                lhs,
+                rhs,
+                widening,
+                on_overflow,
+                ..
+            } => {
+                *widening == Widening::U256
+                    && *on_overflow == OverflowPolicy::Indeterminate
+                    && check_expr(lhs)
+                    && check_expr(rhs)
+            }
+        }
+    }
+
+    fn check_predicate(p: &PredicateAst) -> bool {
+        match p {
+            PredicateAst::ArithCmp { lhs, rhs, .. } => check_expr(lhs) && check_expr(rhs),
+            PredicateAst::And(a, b) | PredicateAst::Or(a, b) => {
+                check_predicate(a) && check_predicate(b)
+            }
+            PredicateAst::Not(inner) => check_predicate(inner),
+            PredicateAst::FieldGe { .. }
+            | PredicateAst::FieldLe { .. }
+            | PredicateAst::FieldEq { .. }
+            | PredicateAst::StrategyKNonDecreasing { .. }
+            | PredicateAst::AllPoolsKNonDecreasing
+            | PredicateAst::Opaque => true,
+        }
+    }
+
+    if check_predicate(&inv.predicate) {
+        Ok(())
+    } else {
+        Err(PetalError::InvalidWasm(format!(
+            "chain petal invariant '{}' uses unsupported arithmetic metadata; v1 supports \
+             only U256 widening with Indeterminate overflow",
+            inv.name
+        )))
+    }
 }
 
 /// Reject an invariant whose predicate references a field its target scope
@@ -2440,6 +2544,11 @@ mod ptb_host_import_tests {
             schema_version: SCHEMA_VERSION,
             module_path: "/bloom/petals/test/object".to_string(),
             framework_version: SemVer::new(0, 1, 0),
+            functions: vec![FunctionDecl {
+                name: "touch".to_string(),
+                attached_invariants: vec![0],
+                ..Default::default()
+            }],
             invariants: vec![InvariantDecl {
                 name: "bad_arith".to_string(),
                 target: InvariantTarget::FunctionExit {
@@ -2459,6 +2568,112 @@ mod ptb_host_import_tests {
         let err = validate_chain_wasm(&wasm).unwrap_err();
         assert!(
             err.to_string().contains("unsupported arithmetic shape"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_unattached_and_out_of_range_invariants() {
+        let invariant = InvariantDecl {
+            name: "unreachable".to_string(),
+            target: InvariantTarget::FunctionExit {
+                name: "touch".to_string(),
+            },
+            predicate: PredicateAst::ArithCmp {
+                op: CmpOp::Ge,
+                lhs: ArithExpr::Literal(1),
+                rhs: ArithExpr::Literal(0),
+            },
+            wasm_export: "__inv_0".to_string(),
+            human_text: String::new(),
+        };
+        let unattached = PetalManifestV0 {
+            schema_version: SCHEMA_VERSION,
+            module_path: "/bloom/petals/test/object".to_string(),
+            framework_version: SemVer::new(0, 1, 0),
+            functions: vec![FunctionDecl {
+                name: "touch".to_string(),
+                ..Default::default()
+            }],
+            invariants: vec![invariant],
+            ..Default::default()
+        };
+        let wasm = append_manifest(parse(r#"(module)"#), unattached);
+        let err = validate_chain_wasm(&wasm).unwrap_err();
+        assert!(
+            err.to_string().contains("not attached"),
+            "unexpected error: {err}"
+        );
+
+        let out_of_range = PetalManifestV0 {
+            schema_version: SCHEMA_VERSION,
+            module_path: "/bloom/petals/test/object".to_string(),
+            framework_version: SemVer::new(0, 1, 0),
+            functions: vec![FunctionDecl {
+                name: "touch".to_string(),
+                attached_invariants: vec![0],
+                ..Default::default()
+            }],
+            invariants: vec![],
+            ..Default::default()
+        };
+        let wasm = append_manifest(parse(r#"(module)"#), out_of_range);
+        let err = validate_chain_wasm(&wasm).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown invariant index"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_arithmetic_metadata_not_enforced_by_runtime() {
+        let pred = PredicateAst::ArithCmp {
+            op: CmpOp::Ge,
+            lhs: ArithExpr::Bounded {
+                op: BoundedArithOp::Add,
+                lhs: Box::new(ArithExpr::Field("after.count".to_string())),
+                rhs: Box::new(ArithExpr::Literal(1)),
+                widening: Widening::None,
+                on_overflow: OverflowPolicy::Saturate,
+            },
+            rhs: ArithExpr::Field("before.count".to_string()),
+        };
+        let manifest = PetalManifestV0 {
+            schema_version: SCHEMA_VERSION,
+            module_path: "/bloom/petals/test/object".to_string(),
+            framework_version: SemVer::new(0, 1, 0),
+            functions: vec![FunctionDecl {
+                name: "touch".to_string(),
+                attached_invariants: vec![0],
+                ..Default::default()
+            }],
+            object_types: vec![ObjectTypeDecl {
+                name: "Counter".to_string(),
+                abilities: AbilitySet::key_store(),
+                type_params: vec![],
+                fields: vec![FieldDecl {
+                    name: "count".to_string(),
+                    ty: builtin("u64"),
+                    offset: Some(0),
+                    width: Some(8),
+                }],
+            }],
+            invariants: vec![InvariantDecl {
+                name: "bad_metadata".to_string(),
+                target: InvariantTarget::ObjectType {
+                    name: "Counter".to_string(),
+                },
+                predicate: pred,
+                wasm_export: "__inv_0".to_string(),
+                human_text: String::new(),
+            }],
+            ..Default::default()
+        };
+        let wasm = append_manifest(parse(r#"(module)"#), manifest);
+
+        let err = validate_chain_wasm(&wasm).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported arithmetic metadata"),
             "unexpected error: {err}"
         );
     }

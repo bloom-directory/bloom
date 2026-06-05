@@ -839,6 +839,13 @@ fn build_unsigned_derives_fungible_hash_from_chain_vfs() {
     let signer = [0x11; 32];
     let fungible_hash = Hash32([0x44; 32]);
     chain.put_path(CORE_FUNGIBLE_PATH, fungible_hash);
+    chain.put_petal(
+        fungible_hash,
+        PetalManifestStub {
+            module_path: CORE_FUNGIBLE_PATH.to_string(),
+            ..Default::default()
+        },
+    );
 
     let gas_id = ObjectId([0xFE; 32]);
     chain.put_object(Object {

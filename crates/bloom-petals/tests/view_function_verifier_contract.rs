@@ -232,6 +232,11 @@ fn wasm_with_invariant(predicate: bloom_petal_manifest::types::PredicateAst) -> 
     };
     let manifest = PetalManifestV0 {
         module_path: "/bloom/test/inv".to_string(),
+        functions: vec![FunctionDecl {
+            name: "touch".to_string(),
+            attached_invariants: vec![0],
+            ..Default::default()
+        }],
         object_types: vec![ObjectTypeDecl {
             name: "Pool".to_string(),
             abilities: AbilitySet::default(),
@@ -357,6 +362,11 @@ fn function_exit_invariant_referencing_fields_is_rejected() {
     let mut wasm = wat::parse_str("(module)").expect("wat parses");
     let manifest = PetalManifestV0 {
         module_path: "/bloom/test/inv".to_string(),
+        functions: vec![FunctionDecl {
+            name: "swap".to_string(),
+            attached_invariants: vec![0],
+            ..Default::default()
+        }],
         invariants: vec![InvariantDecl {
             name: "guard".to_string(),
             target: InvariantTarget::FunctionExit {
@@ -518,6 +528,11 @@ fn semantically_always_false_predicate_rejected_at_deploy() {
     let mut wasm = wat::parse_str("(module)").expect("wat parses");
     let manifest = PetalManifestV0 {
         module_path: "/bloom/test/inv".to_string(),
+        functions: vec![FunctionDecl {
+            name: "touch".to_string(),
+            attached_invariants: vec![0],
+            ..Default::default()
+        }],
         object_types: vec![ObjectTypeDecl {
             name: "T".to_string(),
             abilities: AbilitySet::default(),

@@ -37,7 +37,7 @@ use bloom_chain_types::{
     Hash32,
     digest::{blake3_tagged, tags},
 };
-use bloom_objects::{AbilitySet, AccessMode, Object, ObjectId, Owner, TypeTag};
+use bloom_objects::{AbilitySet, AccessMode, BUILTIN_TYPE_HASH, Object, ObjectId, Owner, TypeTag};
 use bloom_resource::BloomType;
 use bloom_resource::abi::{CallArgsWriter, RetReader};
 
@@ -708,14 +708,12 @@ impl<'c> PtbExecutor<'c> {
                 continue; // generic / external tags carry no object invariants
             };
             let Some(def_manifest) = vtx.manifests.get(petal_hash) else {
-                // The type's invariants live in its defining petal's manifest,
-                // which is only in `vtx.manifests` when a Move command in this
-                // PTB referenced that petal. A built-in mutation (e.g.
-                // MergeCoins) on a foreign-defined type whose petal isn't
-                // Move-called here finds no manifest and skips the check.
-                // Distinct from cross-petal *claims*; see
-                // 08-implementation-status §5. v1+.
-                continue;
+                if *petal_hash == [0u8; 32] || *petal_hash == BUILTIN_TYPE_HASH {
+                    continue;
+                }
+                return Err(PtbError::PetalNotFound {
+                    hash: Hash32(*petal_hash),
+                });
             };
             let Some(obj_decl) = def_manifest.object_type(type_name) else {
                 continue;
@@ -1443,7 +1441,8 @@ fn extract_be_u128(payload: &[u8], offset: usize, width: usize) -> Option<u128> 
 mod tests {
     use super::*;
     use crate::chain_iface::{
-        ArgDeclStub, FunctionDeclStub, InvariantDeclStub, PetalManifestStub, TypeParamDeclStub,
+        ArgDeclStub, FunctionDeclStub, InvariantDeclStub, ObjectTypeDeclStub, PetalManifestStub,
+        TypeParamDeclStub,
     };
     use crate::host_ctx::HandleEntry;
     use crate::predicate::{ArithExprStub, CmpOpStub};
@@ -3863,6 +3862,18 @@ mod tests {
         let (petal, signer, gas_id) = build_pkg(&chain);
         let obj_id = ObjectId([0xA7; 32]);
         chain.put_object(make_non_coin_resource(0xA7, signer, 1, 0));
+        chain.put_petal(
+            Hash32([0x99; 32]),
+            vec![],
+            PetalManifestStub {
+                module_path: "/vault".to_string(),
+                object_types: vec![ObjectTypeDeclStub {
+                    name: "Vault".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
         chain.put_petal(
             petal,
             vec![],
