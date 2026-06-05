@@ -10,7 +10,7 @@ use bloom_objects::{AbilitySet, AccessMode, TypeTag};
 
 /// Schema version this crate produces. Bumped when the manifest layout
 /// changes incompatibly.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Custom section name embedded into every new-framework petal (spec §8.1).
 pub const MANIFEST_CUSTOM_SECTION: &str = "bloom_petal_manifest_v0";
@@ -537,8 +537,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn schema_version_is_three() {
-        assert_eq!(SCHEMA_VERSION, 3);
+    fn schema_version_is_four() {
+        assert_eq!(SCHEMA_VERSION, 4);
     }
 
     #[test]

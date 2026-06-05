@@ -687,32 +687,38 @@ impl<'c> PtbExecutor<'c> {
         }
     }
 
-    /// Fire object-type invariants for every borrow row dirtied by the
-    /// current command. For each dirty row of type `T` defined by petal
-    /// `P`, evaluate `P`'s `ObjectType(T)` invariants over a flat
-    /// field-table scope built from the row's before/after payloads.
+    /// Fire object-type invariants for every borrow row dirtied, silently
+    /// payload-mutated, or created by the current command. For each row of type
+    /// `T` defined by petal `P`, evaluate `P`'s `ObjectType(T)` invariants over
+    /// a flat field-table scope built from the row's before/after payloads.
     fn fire_object_invariants(
         &mut self,
         vtx: &ValidatedPtb,
         cmd_idx: u16,
         report: &mut ExecutionReport,
     ) -> Result<(), PtbError> {
-        // Snapshot dirty rows under the lock: (type_tag, before, after).
-        let dirty: Vec<(TypeTag, Vec<u8>, Vec<u8>)> = self.with_ctx(|ctx| {
+        // Snapshot rows under the lock: (type_tag, before, after, created).
+        let changed: Vec<(TypeTag, Vec<u8>, Vec<u8>, bool)> = self.with_ctx(|ctx| {
             ctx.borrow_table
                 .iter()
-                .filter(|(_, row)| row.dirty)
+                .filter(|(_, row)| {
+                    row.dirty
+                        || row.payload_bytes != row.baseline_payload
+                        || row.origin_command_idx == Some(cmd_idx)
+                })
                 .map(|(_, row)| {
+                    let created = row.origin_command_idx == Some(cmd_idx);
                     (
                         row.type_tag.clone(),
                         row.baseline_payload.clone(),
                         row.payload_bytes.clone(),
+                        created,
                     )
                 })
                 .collect()
         });
 
-        for (type_tag, before, after) in dirty {
+        for (type_tag, before, after, created) in changed {
             let TypeTag::Concrete {
                 petal_hash,
                 type_name,
@@ -737,7 +743,8 @@ impl<'c> PtbExecutor<'c> {
             if def_manifest.object_invariants(type_name).next().is_none() {
                 continue;
             }
-            let scope = build_object_scope(type_name, &obj_decl.field_layout, &before, &after)?;
+            let scope =
+                build_object_scope(type_name, &obj_decl.field_layout, &before, &after, created)?;
             let petal = Hash32(*petal_hash);
             for inv in def_manifest.object_invariants(type_name) {
                 self.fire_invariant(&petal, &inv.name, &inv.wasm_export, &scope, cmd_idx, report)?;
@@ -1419,6 +1426,7 @@ fn build_object_scope(
     layout: &[FieldLayoutStub],
     before: &[u8],
     after: &[u8],
+    created: bool,
 ) -> Result<Vec<u8>, PtbError> {
     let mut fields: Vec<(String, u128)> = Vec::with_capacity(layout.len() * 2);
     for f in layout {
@@ -1427,7 +1435,9 @@ fn build_object_scope(
             continue;
         }
         let offset = f.offset as usize;
-        if let Some(v) = extract_be_u128(before, offset, width) {
+        if created {
+            fields.push((format!("before.{}", f.name), 0));
+        } else if let Some(v) = extract_be_u128(before, offset, width) {
             fields.push((format!("before.{}", f.name), v));
         }
         if let Some(v) = extract_be_u128(after, offset, width) {
@@ -1535,6 +1545,7 @@ mod tests {
         // (petal, export) -> canned invariant result
         inv: HashMap<(Hash32, String), InvariantResult>,
         calls: RefCell<Vec<MockCall>>,
+        inv_calls: RefCell<Vec<MockInvariantCall>>,
     }
 
     #[derive(Debug, Clone)]
@@ -1545,12 +1556,20 @@ mod tests {
         args_buf: Vec<u8>,
     }
 
+    #[derive(Debug, Clone)]
+    struct MockInvariantCall {
+        petal_hash: Hash32,
+        export_name: String,
+        scope_buf: Vec<u8>,
+    }
+
     impl MockPetalRunner {
         fn new() -> Self {
             Self {
                 canned: HashMap::new(),
                 inv: HashMap::new(),
                 calls: RefCell::new(Vec::new()),
+                inv_calls: RefCell::new(Vec::new()),
             }
         }
         fn set(&mut self, petal: Hash32, func: &str, ret_buf: Vec<u8>, fuel: u64) {
@@ -1593,9 +1612,14 @@ mod tests {
             &self,
             petal_hash: &Hash32,
             export_name: &str,
-            _scope_buf: &[u8],
+            scope_buf: &[u8],
             _fuel_budget: u64,
         ) -> Result<InvariantResult, PtbError> {
+            self.inv_calls.borrow_mut().push(MockInvariantCall {
+                petal_hash: *petal_hash,
+                export_name: export_name.to_string(),
+                scope_buf: scope_buf.to_vec(),
+            });
             match self.inv.get(&(*petal_hash, export_name.to_string())) {
                 Some(res) => Ok(res.clone()),
                 None => Ok(InvariantResult {
@@ -2783,6 +2807,134 @@ mod tests {
     }
 
     #[test]
+    fn split_coins_fires_object_invariant_for_created_coin() {
+        use crate::chain_iface::{FieldLayoutStub, ObjectTypeDeclStub};
+        use crate::invariant_scope::lookup_field;
+
+        let chain = MockChain::new();
+        let (_petal, signer, gas_id) = build_pkg(&chain);
+        let bob = [0xB0; 32];
+        let coin_petal = Hash32([0; 32]);
+        let src = ObjectId([0x81; 32]);
+
+        chain.put_path("/coin", coin_petal);
+        chain.put_object(make_coin(0x81, signer, 100, 0));
+        chain.put_petal(
+            coin_petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/coin".to_string(),
+                functions: vec![FunctionDeclStub {
+                    view: false,
+                    name: "load_one".to_string(),
+                    type_params: vec![],
+                    args: vec![ArgDeclStub::Object {
+                        ty: loom_tt(),
+                        mode: AccessMode::Mutable,
+                    }],
+                    returns: vec![loom_tt()],
+                    required_signers: 0,
+                    required_capabilities: vec![],
+                    attached_invariants: vec![InvariantDeclStub {
+                        name: "coin_value_inv".to_string(),
+                        wasm_export: "__inv_coin".to_string(),
+                        argspec: vec![],
+                        target: InvariantTargetStub::ObjectType {
+                            name: "Coin".to_string(),
+                        },
+                    }],
+                }],
+                object_types: vec![ObjectTypeDeclStub {
+                    name: "Coin".to_string(),
+                    abilities: Default::default(),
+                    field_layout: vec![FieldLayoutStub {
+                        name: "value".to_string(),
+                        offset: 0,
+                        width: 16,
+                    }],
+                    ..Default::default()
+                }],
+                external_type_refs: vec![],
+                ..Default::default()
+            },
+        );
+
+        let mut runner = MockPetalRunner::new();
+        runner.set(coin_petal, "load_one", build_outputs(&[&src.0]), 10);
+        runner.set_inv(
+            coin_petal,
+            "__inv_coin",
+            InvariantResult {
+                ok: true,
+                fuel_used: 7,
+                indeterminate: false,
+            },
+        );
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/coin".to_string(),
+                        hash: Some(coin_petal),
+                    },
+                    function: "load_one".to_string(),
+                    type_args: vec![],
+                    args: vec![Arg::Object {
+                        id: src,
+                        expected_version: ExpectedVersion(0),
+                        access_mode: AccessMode::Mutable,
+                    }],
+                }),
+                Command::SplitCoins {
+                    src: UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    },
+                    amounts: vec![30],
+                },
+                Command::TransferObjects {
+                    uses: vec![UseRef {
+                        cmd_idx: 1,
+                        ret_idx: 0,
+                    }],
+                    owner: Owner::Address(bob),
+                },
+            ],
+        );
+
+        let report = run(&chain, &runner, tx);
+        assert!(report.success, "report: {report:?}");
+
+        let inv_calls = runner.inv_calls.borrow();
+        let coin_scopes: Vec<&[u8]> = inv_calls
+            .iter()
+            .filter(|c| c.petal_hash == coin_petal && c.export_name == "__inv_coin")
+            .map(|c| c.scope_buf.as_slice())
+            .collect();
+        assert_eq!(
+            coin_scopes.len(),
+            2,
+            "SplitCoins must check source and newly-created coin; calls: {inv_calls:?}"
+        );
+        assert!(
+            coin_scopes.iter().any(|scope| {
+                lookup_field(scope, "before.value") == Some(100)
+                    && lookup_field(scope, "after.value") == Some(70)
+            }),
+            "missing source-coin invariant scope: {inv_calls:?}"
+        );
+        assert!(
+            coin_scopes.iter().any(|scope| {
+                lookup_field(scope, "before.value") == Some(0)
+                    && lookup_field(scope, "after.value") == Some(30)
+            }),
+            "missing created-coin invariant scope: {inv_calls:?}"
+        );
+    }
+
+    #[test]
     fn merge_coins_rejects_read_only_persistent_non_target() {
         let chain = MockChain::new();
         let (petal, signer, gas_id) = build_pkg(&chain);
@@ -3104,7 +3256,7 @@ mod tests {
         let before = payload(1000, 1_000_000);
         let after = payload(1100, 1_001_000);
 
-        let scope = build_object_scope("Pool", &layout, &before, &after).unwrap();
+        let scope = build_object_scope("Pool", &layout, &before, &after, false).unwrap();
         let decoded = decode_invariant_scope(&scope).unwrap();
         assert_eq!(decoded.target_name, "Pool");
         // 32-byte id skipped; reserve_a + k_last each yield before/after.
@@ -3113,6 +3265,24 @@ mod tests {
         assert_eq!(lookup_field(&scope, "before.k_last"), Some(1_000_000));
         assert_eq!(lookup_field(&scope, "after.k_last"), Some(1_001_000));
         assert_eq!(lookup_field(&scope, "before.id"), None);
+    }
+
+    #[test]
+    fn build_object_scope_zeros_before_fields_for_created_rows() {
+        use crate::chain_iface::FieldLayoutStub;
+        use crate::invariant_scope::lookup_field;
+
+        let layout = vec![FieldLayoutStub {
+            name: "value".to_string(),
+            offset: 32,
+            width: 16,
+        }];
+        let mut after = vec![0u8; 32];
+        after.extend_from_slice(&42u128.to_be_bytes());
+
+        let scope = build_object_scope("Coin", &layout, &after, &after, true).unwrap();
+        assert_eq!(lookup_field(&scope, "before.value"), Some(0));
+        assert_eq!(lookup_field(&scope, "after.value"), Some(42));
     }
 
     #[test]
@@ -3283,6 +3453,11 @@ mod tests {
         /// On a call to this function name, simulate `object.mutate` on
         /// preloaded rows.
         host_mutates: std::cell::RefCell<HostMutations>,
+        /// On a call to this function name, mutate payload bytes without
+        /// marking the row dirty, matching the path auto-promoted by
+        /// `BorrowTable::diff_check`.
+        host_silent_mutates: std::cell::RefCell<HostMutations>,
+        inv_calls: std::cell::RefCell<Vec<MockInvariantCall>>,
         /// Verifies that calling the runner does NOT find a held lock
         /// in the ctx mutex (i.e. the executor released it).
         try_lock_must_succeed: std::cell::Cell<bool>,
@@ -3297,6 +3472,8 @@ mod tests {
                 canned: HashMap::new(),
                 host_creates: std::cell::RefCell::new(HashMap::new()),
                 host_mutates: std::cell::RefCell::new(HashMap::new()),
+                host_silent_mutates: std::cell::RefCell::new(HashMap::new()),
+                inv_calls: std::cell::RefCell::new(Vec::new()),
                 try_lock_must_succeed: std::cell::Cell::new(false),
                 _life: std::marker::PhantomData,
             }
@@ -3342,6 +3519,19 @@ mod tests {
                     g.borrow_table.mark_dirty(&id, payload)?;
                 }
             }
+            // Simulate a guest payload write that bypasses `object.mutate`;
+            // `diff_check` auto-promotes it later, but invariants must still
+            // fire before that pass.
+            if let Some(mutations) = self.host_silent_mutates.borrow_mut().remove(function) {
+                let mut g = self.ctx.lock().unwrap();
+                for (id, payload) in mutations {
+                    let row = g
+                        .borrow_table
+                        .get_mut(&id)
+                        .ok_or(PtbError::ObjectNotFound { id })?;
+                    row.payload_bytes = payload;
+                }
+            }
             // Test #2: simulate `object.create` host import.
             if let Some(creates) = self.host_creates.borrow_mut().remove(function) {
                 let mut g = self.ctx.lock().unwrap();
@@ -3382,11 +3572,16 @@ mod tests {
 
         fn call_invariant(
             &self,
-            _petal_hash: &Hash32,
-            _export_name: &str,
-            _scope_buf: &[u8],
+            petal_hash: &Hash32,
+            export_name: &str,
+            scope_buf: &[u8],
             _fuel_budget: u64,
         ) -> Result<InvariantResult, PtbError> {
+            self.inv_calls.borrow_mut().push(MockInvariantCall {
+                petal_hash: *petal_hash,
+                export_name: export_name.to_string(),
+                scope_buf: scope_buf.to_vec(),
+            });
             Ok(InvariantResult {
                 ok: true,
                 fuel_used: 0,
@@ -3471,6 +3666,113 @@ mod tests {
         );
         let report = exec.execute(validated);
         assert!(report.success, "report: {report:?}");
+    }
+
+    #[test]
+    fn silent_payload_delta_fires_object_invariant_before_diff_check() {
+        use crate::chain_iface::{FieldLayoutStub, ObjectTypeDeclStub};
+        use crate::invariant_scope::lookup_field;
+
+        let chain = MockChain::new();
+        let (_petal, signer, gas_id) = build_pkg(&chain);
+        let coin_petal = Hash32([0; 32]);
+        let coin_id = ObjectId([0xCE; 32]);
+
+        chain.put_path("/coin", coin_petal);
+        chain.put_object(make_coin(0xCE, signer, 100, 0));
+        chain.put_petal(
+            coin_petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/coin".to_string(),
+                functions: vec![FunctionDeclStub {
+                    view: false,
+                    name: "silent".to_string(),
+                    type_params: vec![],
+                    args: vec![ArgDeclStub::Object {
+                        ty: loom_tt(),
+                        mode: AccessMode::Mutable,
+                    }],
+                    returns: vec![],
+                    required_signers: 0,
+                    required_capabilities: vec![],
+                    attached_invariants: vec![InvariantDeclStub {
+                        name: "coin_value_inv".to_string(),
+                        wasm_export: "__inv_coin".to_string(),
+                        argspec: vec![],
+                        target: InvariantTargetStub::ObjectType {
+                            name: "Coin".to_string(),
+                        },
+                    }],
+                }],
+                object_types: vec![ObjectTypeDeclStub {
+                    name: "Coin".to_string(),
+                    abilities: Default::default(),
+                    field_layout: vec![FieldLayoutStub {
+                        name: "value".to_string(),
+                        offset: 0,
+                        width: 16,
+                    }],
+                    ..Default::default()
+                }],
+                external_type_refs: vec![],
+                ..Default::default()
+            },
+        );
+
+        let ctx = Arc::new(Mutex::new(PtbHostCtx::new()));
+        let mut runner = AssertingRunner::new(Arc::clone(&ctx));
+        runner.set("silent", build_outputs(&[]), 5);
+        runner
+            .host_silent_mutates
+            .borrow_mut()
+            .insert("silent".to_string(), vec![(coin_id, coin_payload(70))]);
+
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/coin".to_string(),
+                    hash: Some(coin_petal),
+                },
+                function: "silent".to_string(),
+                type_args: vec![],
+                args: vec![Arg::Object {
+                    id: coin_id,
+                    expected_version: ExpectedVersion(0),
+                    access_mode: AccessMode::Mutable,
+                }],
+            })],
+        );
+
+        let verifier = AlwaysOkVerifier;
+        let vctx = ValidationContext {
+            mode: ValidationMode::Commit,
+            current_block: chain.block,
+            chain: &chain,
+            verifier: &verifier,
+            loom_coin_type: loom_tt(),
+        };
+        let validated = validate_ptb(&tx, &vctx).unwrap();
+        let mut exec = PtbExecutor::with_ctx_arc(
+            &chain,
+            &runner,
+            loom_tt(),
+            Hash32([0; 32]),
+            Arc::clone(&ctx),
+        );
+        let report = exec.execute(validated);
+        assert!(report.success, "report: {report:?}");
+
+        let inv_calls = runner.inv_calls.borrow();
+        let scope = inv_calls
+            .iter()
+            .find(|c| c.petal_hash == coin_petal && c.export_name == "__inv_coin")
+            .map(|c| c.scope_buf.as_slice())
+            .expect("silent payload delta must fire object invariant");
+        assert_eq!(lookup_field(scope, "before.value"), Some(100));
+        assert_eq!(lookup_field(scope, "after.value"), Some(70));
     }
 
     #[test]

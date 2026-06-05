@@ -971,7 +971,7 @@ mod tests {
 
     #[test]
     fn snapshot_minimal_first_bytes() {
-        // schema_version (3) || module_path ("/x" = 2 bytes)
+        // schema_version (4) || module_path ("/x" = 2 bytes)
         let m = PetalManifestV0 {
             schema_version: SCHEMA_VERSION,
             module_path: "/x".to_string(),
@@ -979,8 +979,8 @@ mod tests {
             ..Default::default()
         };
         let bytes = encode(&m).unwrap();
-        // [0,0,0,3] schema || [0,2] len || "/x" || semver [0,0,0,1,0,0] || option none [0] || empty declaration lists
-        assert_eq!(&bytes[..4], &[0, 0, 0, 3]);
+        // [0,0,0,4] schema || [0,2] len || "/x" || semver [0,0,0,1,0,0] || option none [0] || empty declaration lists
+        assert_eq!(&bytes[..4], &[0, 0, 0, 4]);
         assert_eq!(&bytes[4..6], &[0, 2]);
         assert_eq!(&bytes[6..8], b"/x");
         assert_eq!(&bytes[8..14], &[0, 0, 0, 1, 0, 0]);
@@ -1156,7 +1156,7 @@ mod tests {
     }
 
     #[test]
-    fn function_view_round_trips_in_schema_v3() {
+    fn function_view_round_trips_in_current_schema() {
         let m = PetalManifestV0 {
             schema_version: SCHEMA_VERSION,
             module_path: "/p".to_string(),
