@@ -34,6 +34,12 @@ pub enum ChainCmd {
         #[arg(long)]
         force: bool,
     },
+    /// Generate a client xDSA wallet, write it to the chain keystore, and print its address.
+    Keygen {
+        /// Overwrite the address-named key file if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
     /// Run a validator node (long-running).
     RunValidator {
         /// Path to `config.toml` (default: `<bloom_home>/chain/config.toml`).
@@ -144,6 +150,33 @@ pub enum ChainCmd {
         #[arg(long = "no-wait")]
         no_wait: bool,
     },
+    /// Transfer LOOM fuel to an address by splitting the signer's Coin<LOOM>.
+    Transfer {
+        /// Recipient address (0x/raw-hex or b1-prefixed).
+        #[arg(long, value_name = "ADDR")]
+        to: String,
+        /// LOOM amount in bloomweis.
+        #[arg(long, value_name = "N")]
+        amount: String,
+        /// Signer address. Defaults to validator.xdsa or the only .xdsa key in the keystore.
+        #[arg(long = "signer", value_name = "ADDR")]
+        signer: Option<String>,
+        /// Explicit Coin<LOOM> object id to split. If omitted, selects signer-owned Coin<LOOM>.
+        #[arg(long = "gas-payer", value_name = "OBJECT_ID")]
+        gas_payer: Option<String>,
+        /// Gas budget for the inner PTB.
+        #[arg(long = "gas-budget", value_name = "N", default_value_t = 1_000_000u64)]
+        gas_budget: u64,
+        /// Outer transaction fuel cap.
+        #[arg(long = "fuel-limit", value_name = "N", default_value_t = 10_000_000u64)]
+        fuel_limit: u64,
+        /// Build and validate the transfer PTB without submitting it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Submit without waiting for the committed receipt.
+        #[arg(long = "no-wait")]
+        no_wait: bool,
+    },
     /// Execute one atomic multi-endpoint petal plan through the PTB builder.
     #[command(name = "pipe")]
     Pipe {
@@ -198,6 +231,9 @@ pub enum ChainCmd {
         /// Per-validator pre-funded LOOM allocation, in bloomweis.
         #[arg(long, default_value = "1000000000000000000000000")]
         allocation: String,
+        /// Treasury LOOM allocation, in bloomweis.
+        #[arg(long, default_value = "1000000000000000000000000000")]
+        treasury_allocation: String,
         /// Override per-validator `listen_addr` in config.toml. Useful for
         /// docker-compose where every container should bind the same internal
         /// `0.0.0.0:port` regardless of host. When set, the port is also used
@@ -301,8 +337,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             }
 
             // Generate a fresh xDSA keypair for this validator.
-            let (sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
-            let sk_bytes = sk.to_bytes();
+            let (sk_bytes, pk) = generate_xdsa_key_material()?;
             let pk_bytes = pk.0.clone();
 
             // Derive address (spec §4.3 — canonical helper).
@@ -315,7 +350,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             // (review 2026-05-19 #9). Mode 0o600 is set on Unix so the secret
             // is never world- or group-readable.
             let key_path = chain_dir.join("keystore").join("validator.xdsa");
-            write_secret_key_file(&key_path, sk_bytes.as_slice(), force)
+            write_secret_key_file(&key_path, &sk_bytes, force)
                 .with_context(|| format!("write validator key: {}", key_path.display()))?;
 
             println!("validator address : {addr_hex}");
@@ -323,6 +358,26 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             println!(
                 "\nEdit {} to add validators and allocations, then share genesis.toml with all validators.",
                 genesis_dest.display()
+            );
+            Ok(())
+        }
+
+        // ── keygen ────────────────────────────────────────────────────────────
+        ChainCmd::Keygen { force } => {
+            let keystore_dir = chain_dir.join("keystore");
+            std::fs::create_dir_all(&keystore_dir).context("create chain keystore dir")?;
+            let (sk_bytes, pk) = generate_xdsa_key_material()?;
+            let addr = bloom_chain_types::types::Address::from_pubkey_bytes(&pk.0);
+            let addr_hex = hex::encode(addr.0);
+            let key_path = keystore_dir.join(format!("{addr_hex}.xdsa"));
+            write_secret_key_file(&key_path, &sk_bytes, force)
+                .with_context(|| format!("write client key: {}", key_path.display()))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "address": format!("0x{addr_hex}"),
+                    "key_path": key_path,
+                }))?
             );
             Ok(())
         }
@@ -604,6 +659,90 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             Ok(())
         }
 
+        // ── transfer ────────────────────────────────────────────────────────
+        ChainCmd::Transfer {
+            to,
+            amount,
+            signer,
+            gas_payer,
+            gas_budget,
+            fuel_limit,
+            dry_run,
+            no_wait,
+        } => {
+            use bloom_chain_node::rpc::RpcChainAdapter;
+            use bloom_chain_types::ssz::Encode;
+            use bloom_script::PqSignature;
+
+            let recipient = parse_addr(&to).with_context(|| format!("parse --to {to:?}"))?;
+            let amount: u128 = amount
+                .parse()
+                .with_context(|| format!("parse --amount as u128: {amount:?}"))?;
+            if amount == 0 {
+                anyhow::bail!("--amount must be > 0");
+            }
+            let signer_override = signer
+                .as_deref()
+                .map(|s| parse_addr(s).with_context(|| format!("parse --signer {s:?}")))
+                .transpose()?;
+            let (sk, pk, sender) = load_wallet_key_for_signer(&chain_dir, signer_override)?;
+            let client = make_client();
+            let needed = amount
+                .checked_add(gas_budget as u128)
+                .context("transfer amount plus gas budget overflows u128")?;
+            let gas_payer = match gas_payer.as_deref() {
+                Some(s) if !s.is_empty() => parse_object_id_32(s).context("parse --gas-payer")?,
+                _ => {
+                    bloom_chain_node::gas_select::select_loom_gas_payer_rpc(
+                        &client, sender.0, needed,
+                    )
+                    .await?
+                }
+            };
+            let chain = RpcChainAdapter::from_env_or_socket(&rpc_sock);
+            let mut plan =
+                prepare_transfer_plan(&chain, sender, recipient, amount, gas_payer, gas_budget)?;
+
+            if dry_run {
+                let value = transfer_dry_run_json(&plan, recipient, amount)?;
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                return Ok(());
+            }
+
+            let ptb_digest = plan.signing_digest();
+            plan.signatures = vec![PqSignature(sk.sign(&ptb_digest).to_bytes())];
+            let ptb_bytes =
+                bloom_script::encode_ptb(&plan).context("encode signed transfer PTB")?;
+            let chain_id = load_chain_id(&chain_dir)?;
+            let nonce = fetch_nonce(&client, &sender).await? + 1;
+            let tx = build_and_sign_tx(
+                &sk,
+                &pk,
+                sender,
+                &chain_id,
+                nonce,
+                build_submit_ptb_kind(ptb_bytes),
+                fuel_limit,
+                1,
+            )?;
+            let tx_hash = tx.tx_hash();
+            client
+                .call(
+                    "chain_submit_tx",
+                    json!({ "tx_hex": hex::encode(tx.as_ssz_bytes()) }),
+                )
+                .await?;
+            if no_wait {
+                println!("{}", tx_hash_json(&tx_hash));
+                return Ok(());
+            }
+            let receipt =
+                poll_tx_receipt(&client, &tx_hash, std::time::Duration::from_secs(30)).await?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+            ensure_success_receipt(&receipt)?;
+            Ok(())
+        }
+
         // ── mutating petal pipe ─────────────────────────────────────────────
         ChainCmd::Pipe {
             expr,
@@ -749,6 +888,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             base_port,
             chain_id,
             allocation,
+            treasury_allocation,
             listen_addr,
             rpc_tcp_addr,
             unsafe_rpc_public_bind,
@@ -759,6 +899,7 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             base_port,
             &chain_id,
             &allocation,
+            &treasury_allocation,
             listen_addr.as_deref(),
             rpc_tcp_addr.as_deref(),
             unsafe_rpc_public_bind,
@@ -1041,6 +1182,111 @@ fn prepare_chain_pipe_plan(
 ) -> Result<crate::commands::pipe::LoweredPlan> {
     let signers = single_signers_for_sender(signers_raw, sender, "bloom chain pipe")?;
     crate::commands::pipe::lower_and_build_with_gas(chain, expr, signers, gas_payer, gas_budget, 1)
+}
+
+fn prepare_transfer_plan(
+    chain: &dyn bloom_script::ChainStateIface,
+    sender: bloom_chain_types::types::Address,
+    recipient: bloom_chain_types::types::Address,
+    amount: u128,
+    gas_payer: bloom_objects::ObjectId,
+    gas_budget: u64,
+) -> Result<bloom_script::PtbTx> {
+    use bloom_objects::{AccessMode, Owner};
+    use bloom_script::{
+        AlwaysOkVerifier, Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PqSignature, UseRef,
+        ValidationContext, ValidationMode, loom_coin_type_tag, loom_marker_type_tag, validate_ptb,
+    };
+
+    let fungible_hash = bloom_script::resolve_fungible_petal_hash(chain).ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing required VFS binding for {}",
+            bloom_script::CORE_FUNGIBLE_PATH
+        )
+    })?;
+    let source = chain
+        .load_object(&gas_payer)
+        .with_context(|| format!("load source Coin<LOOM> {}", hex::encode(gas_payer.0)))?;
+    let loom_coin_type = loom_coin_type_tag(fungible_hash);
+    if source.type_tag != loom_coin_type {
+        anyhow::bail!("selected gas payer is not a Coin<LOOM>");
+    }
+    if source.owner != Owner::Address(sender.0) {
+        anyhow::bail!("selected Coin<LOOM> is not owned by signer");
+    }
+
+    let mut tx = bloom_script::PtbTx {
+        signers: vec![sender.0],
+        commands: vec![
+            Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: bloom_script::CORE_FUNGIBLE_PATH.to_string(),
+                    hash: Some(fungible_hash),
+                },
+                function: "identity".to_string(),
+                type_args: vec![loom_marker_type_tag(fungible_hash)],
+                args: vec![Arg::Object {
+                    id: gas_payer,
+                    expected_version: ExpectedVersion(source.version),
+                    access_mode: AccessMode::Mutable,
+                }],
+            }),
+            Command::SplitCoins {
+                src: UseRef {
+                    cmd_idx: 0,
+                    ret_idx: 0,
+                },
+                amounts: vec![amount],
+            },
+            Command::TransferObjects {
+                uses: vec![UseRef {
+                    cmd_idx: 1,
+                    ret_idx: 0,
+                }],
+                owner: Owner::Address(recipient.0),
+            },
+        ],
+        gas_payer,
+        gas_budget,
+        gas_price: 1,
+        expiry_block: u64::MAX,
+        signatures: vec![],
+    };
+
+    let verifier = AlwaysOkVerifier;
+    tx.signatures = vec![PqSignature(vec![0u8; 1])];
+    validate_ptb(
+        &tx,
+        &ValidationContext {
+            mode: ValidationMode::Commit,
+            current_block: chain.current_block(),
+            chain,
+            verifier: &verifier,
+            loom_coin_type,
+        },
+    )
+    .context("validate transfer PTB")?;
+    tx.signatures.clear();
+    Ok(tx)
+}
+
+fn transfer_dry_run_json(
+    tx: &bloom_script::PtbTx,
+    recipient: bloom_chain_types::types::Address,
+    amount: u128,
+) -> Result<serde_json::Value> {
+    Ok(json!({
+        "dry_run": true,
+        "kind": "transfer",
+        "to": format!("0x{}", hex::encode(recipient.0)),
+        "amount": amount.to_string(),
+        "ptb_hash": format!("0x{}", hex::encode(tx.signing_digest())),
+        "signers": tx.signers.len(),
+        "gas_payer": format!("0x{}", hex::encode(tx.gas_payer.0)),
+        "gas_budget": tx.gas_budget,
+        "gas_price": tx.gas_price.to_string(),
+        "commands": tx.commands.len(),
+    }))
 }
 
 fn single_call_command(
@@ -1409,6 +1655,20 @@ wasmtime_version = "26"
 "#
 }
 
+fn generate_xdsa_key_material() -> Result<(Vec<u8>, bloom_keystore::xdsa::XdsaPublicKey)> {
+    std::thread::Builder::new()
+        .name("bloom-xdsa-keygen".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let (sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
+            let bytes = sk.to_bytes().as_slice().to_vec();
+            (bytes, pk)
+        })
+        .context("spawn xDSA keygen thread")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("xDSA keygen thread panicked"))
+}
+
 /// Write a validator secret-key file with strict permissions and an explicit
 /// no-overwrite rule (review 2026-05-19 #9).
 ///
@@ -1639,7 +1899,10 @@ fn load_wallet_key_for_signer(
 )> {
     let key_path = chain_dir.join("keystore").join("validator.xdsa");
     if signer.is_none() {
-        return load_xdsa_key_at(&key_path);
+        if key_path.exists() {
+            return load_xdsa_key_at(&key_path);
+        }
+        return load_single_xdsa_key(&chain_dir.join("keystore"));
     }
     let signer = signer.expect("checked above");
     let keystore_dir = chain_dir.join("keystore");
@@ -1661,6 +1924,29 @@ fn load_wallet_key_for_signer(
         hex::encode(signer.0),
         keystore_dir.display()
     )
+}
+
+fn load_single_xdsa_key(
+    keystore_dir: &std::path::Path,
+) -> Result<(
+    bloom_keystore::xdsa::XdsaSecretKey,
+    bloom_keystore::xdsa::XdsaPublicKey,
+    bloom_chain_types::types::Address,
+)> {
+    let mut keys = std::fs::read_dir(keystore_dir)
+        .with_context(|| format!("read chain keystore dir: {}", keystore_dir.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("xdsa"))
+        .collect::<Vec<_>>();
+    keys.sort();
+    match keys.as_slice() {
+        [path] => load_xdsa_key_at(path),
+        [] => anyhow::bail!("no xDSA keys found under {}", keystore_dir.display()),
+        _ => anyhow::bail!(
+            "multiple xDSA keys found under {}; pass --signer to select one",
+            keystore_dir.display()
+        ),
+    }
 }
 
 fn load_xdsa_key_at(
@@ -1807,6 +2093,7 @@ fn provision_testnet(
     base_port: Option<u16>,
     chain_id: &str,
     allocation: &str,
+    treasury_allocation: &str,
     listen_addr_override: Option<&str>,
     rpc_tcp_addr_override: Option<&str>,
     unsafe_rpc_public_bind: bool,
@@ -1815,7 +2102,8 @@ fn provision_testnet(
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as B64;
     use bloom_chain_node::genesis::{
-        GenesisAllocation, GenesisFile, GenesisPetal, NodeConfig, ValidatorConfig,
+        GenesisAllocation, GenesisFile, GenesisKeyRegistryEntry, GenesisPetal, NodeConfig,
+        ValidatorConfig,
     };
 
     if validators == 0 {
@@ -1824,6 +2112,9 @@ fn provision_testnet(
     let alloc_amount: u128 = allocation
         .parse()
         .with_context(|| format!("parse --allocation as u128: {allocation:?}"))?;
+    let treasury_amount: u128 = treasury_allocation
+        .parse()
+        .with_context(|| format!("parse --treasury-allocation as u128: {treasury_allocation:?}"))?;
 
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("create output dir {}", output_dir.display()))?;
@@ -1886,8 +2177,7 @@ fn provision_testnet(
         std::fs::create_dir_all(chain_dir.join("state_blobs"))
             .with_context(|| format!("mkdir state_blobs for home{i}"))?;
 
-        let (sk, pk) = bloom_keystore::xdsa::XdsaSecretKey::generate();
-        let sk_bytes = sk.to_bytes();
+        let (sk_bytes, pk) = generate_xdsa_key_material()?;
 
         // Address = blake3("bloom-chain.v0.addr:" || pubkey) — canonical helper.
         let addr_bytes = bloom_chain_types::types::Address::from_pubkey_bytes(&pk.0).0;
@@ -1896,7 +2186,7 @@ fn provision_testnet(
         // Testnet provisioning creates fresh per-validator home dirs, so the
         // path should never already exist — but write with mode 0o600 so the
         // secret never lands on disk with the umask-default 0644.
-        write_secret_key_file(&key_path, sk_bytes.as_slice(), false)
+        write_secret_key_file(&key_path, &sk_bytes, false)
             .with_context(|| format!("write key for home{i}"))?;
 
         // Default per-validator port window: 127.0.0.1:{base+i}.
@@ -1925,6 +2215,19 @@ fn provision_testnet(
         });
     }
 
+    let treasury_home = output_dir.join("treasury");
+    let treasury_chain_dir = treasury_home.join("chain");
+    std::fs::create_dir_all(treasury_chain_dir.join("keystore"))
+        .context("mkdir treasury keystore")?;
+    let (treasury_sk_bytes, treasury_pk) = generate_xdsa_key_material()?;
+    let treasury_addr = bloom_chain_types::types::Address::from_pubkey_bytes(&treasury_pk.0);
+    let treasury_addr_hex = hex::encode(treasury_addr.0);
+    let treasury_key_path = treasury_chain_dir
+        .join("keystore")
+        .join(format!("{treasury_addr_hex}.xdsa"));
+    write_secret_key_file(&treasury_key_path, &treasury_sk_bytes, false)
+        .context("write treasury key")?;
+
     // Build the shared GenesisFile.
     let genesis_time_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1934,6 +2237,17 @@ fn provision_testnet(
     let core_fungible_wasm =
         genesis_manifest_wasm(bloom_petal_fungible::fungible::__bloom_manifest_bytes())
             .context("build core fungible genesis petal wasm")?;
+    let mut allocations = nodes
+        .iter()
+        .map(|n| GenesisAllocation {
+            address: n.address_hex.clone(),
+            amount: alloc_amount.to_string(),
+        })
+        .collect::<Vec<_>>();
+    allocations.push(GenesisAllocation {
+        address: treasury_addr_hex.clone(),
+        amount: treasury_amount.to_string(),
+    });
     let genesis = GenesisFile {
         chain_id: chain_id.to_string(),
         genesis_time_ms,
@@ -1946,18 +2260,15 @@ fn provision_testnet(
                 host: Some(n.peer_host.clone()),
             })
             .collect(),
-        allocations: nodes
-            .iter()
-            .map(|n| GenesisAllocation {
-                address: n.address_hex.clone(),
-                amount: alloc_amount.to_string(),
-            })
-            .collect(),
+        allocations,
         petals: vec![GenesisPetal {
             path: bloom_script::CORE_FUNGIBLE_PATH.to_string(),
             wasm_hex: hex::encode(core_fungible_wasm),
         }],
-        key_registry: vec![],
+        key_registry: vec![GenesisKeyRegistryEntry {
+            address: treasury_addr_hex.clone(),
+            pubkey: B64.encode(&treasury_pk.0),
+        }],
     };
     let genesis_toml = toml::to_string_pretty(&genesis).context("serialize shared genesis.toml")?;
 
@@ -1993,11 +2304,22 @@ fn provision_testnet(
             "unsafe_rpc_public_bind": unsafe_rpc_public_bind,
         }));
     }
+    std::fs::create_dir_all(treasury_chain_dir.join("blocks")).context("mkdir treasury blocks")?;
+    std::fs::create_dir_all(treasury_chain_dir.join("state_blobs"))
+        .context("mkdir treasury state_blobs")?;
+    std::fs::write(treasury_chain_dir.join("genesis.toml"), &genesis_toml)
+        .context("write treasury genesis")?;
 
     let out = json!({
         "chain_id": chain_id,
         "genesis_time_ms": genesis_time_ms,
         "validators": manifest,
+        "treasury": {
+            "home": treasury_home,
+            "address": format!("0x{treasury_addr_hex}"),
+            "key_path": treasury_key_path,
+            "allocation": treasury_amount.to_string(),
+        },
     });
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
@@ -2226,6 +2548,15 @@ mod tests {
         chain.paths.lock().unwrap().insert(
             bloom_script::CORE_FUNGIBLE_PATH.to_string(),
             bloom_script::DEFAULT_FUNGIBLE_PETAL_HASH,
+        );
+        let fungible_manifest = bloom_petal_manifest::codec::decode(
+            bloom_petal_fungible::fungible::__bloom_manifest_bytes(),
+        )
+        .unwrap();
+        chain.put_petal(
+            bloom_script::CORE_FUNGIBLE_PATH,
+            bloom_script::DEFAULT_FUNGIBLE_PETAL_HASH,
+            bloom_petal_manifest::stub::to_petal_manifest_stub(&fungible_manifest),
         );
         chain.put_petal(
             "/bloom/petals/dex/probe",
@@ -2786,6 +3117,59 @@ allocations = []
     }
 
     #[test]
+    fn transfer_plan_splits_selected_loom_coin_and_transfers_output() {
+        let chain = command_test_chain();
+        let sender = bloom_chain_types::types::Address([0x22; 32]);
+        let recipient = bloom_chain_types::types::Address([0x44; 32]);
+        let gas_payer = ObjectId([0xFE; 32]);
+
+        let tx = prepare_transfer_plan(&chain, sender, recipient, 500, gas_payer, 1_000).unwrap();
+        assert_eq!(tx.signers, vec![[0x22; 32]]);
+        assert_eq!(tx.gas_payer, gas_payer);
+        assert_eq!(tx.gas_budget, 1_000);
+        assert!(tx.signatures.is_empty());
+        assert_eq!(tx.commands.len(), 3);
+
+        match &tx.commands[0] {
+            Command::Move(m) => {
+                assert_eq!(m.petal.path, bloom_script::CORE_FUNGIBLE_PATH);
+                assert_eq!(m.function, "identity");
+                assert_eq!(
+                    m.type_args,
+                    vec![bloom_script::loom_marker_type_tag(
+                        bloom_script::DEFAULT_FUNGIBLE_PETAL_HASH
+                    )]
+                );
+                assert_eq!(m.args.len(), 1);
+            }
+            other => panic!("expected core fungible identity move, got {other:?}"),
+        }
+        match &tx.commands[1] {
+            Command::SplitCoins { src, amounts } => {
+                assert_eq!(src.cmd_idx, 0);
+                assert_eq!(src.ret_idx, 0);
+                assert_eq!(amounts, &vec![500]);
+            }
+            other => panic!("expected SplitCoins, got {other:?}"),
+        }
+        match &tx.commands[2] {
+            Command::TransferObjects { uses, owner } => {
+                assert_eq!(uses.len(), 1);
+                assert_eq!(uses[0].cmd_idx, 1);
+                assert_eq!(uses[0].ret_idx, 0);
+                assert_eq!(owner, &bloom_objects::Owner::Address(recipient.0));
+            }
+            other => panic!("expected TransferObjects, got {other:?}"),
+        }
+
+        let dry = transfer_dry_run_json(&tx, recipient, 500).unwrap();
+        assert_eq!(dry["dry_run"], true);
+        assert_eq!(dry["kind"], "transfer");
+        assert_eq!(dry["amount"], "500");
+        assert_eq!(dry["commands"], 3);
+    }
+
+    #[test]
     fn load_wallet_key_for_signer_selects_matching_xdsa_file() {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
@@ -2822,6 +3206,48 @@ allocations = []
     }
 
     #[test]
+    fn load_wallet_key_without_signer_uses_only_client_key_when_no_validator_key() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let tmp = tempfile::tempdir().unwrap();
+                let chain_dir = tmp.path().join("chain");
+                let keystore = chain_dir.join("keystore");
+                std::fs::create_dir_all(&keystore).unwrap();
+
+                let bytes = [7u8; 64];
+                let sk = bloom_keystore::xdsa::XdsaSecretKey::from_bytes(&bytes).unwrap();
+                let expected =
+                    bloom_chain_types::types::Address::from_pubkey_bytes(&sk.public_key().0);
+                std::fs::write(keystore.join("client.xdsa"), sk.to_bytes().as_slice()).unwrap();
+
+                let (_sk, _pk, addr) = load_wallet_key_for_signer(&chain_dir, None).unwrap();
+                assert_eq!(addr, expected);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn load_wallet_key_without_signer_rejects_ambiguous_client_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let chain_dir = tmp.path().join("chain");
+        let keystore = chain_dir.join("keystore");
+        std::fs::create_dir_all(&keystore).unwrap();
+        std::fs::write(keystore.join("a.xdsa"), [1u8; 64]).unwrap();
+        std::fs::write(keystore.join("b.xdsa"), [2u8; 64]).unwrap();
+        let err = match load_wallet_key_for_signer(&chain_dir, None) {
+            Ok(_) => panic!("ambiguous signer key should error"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err:#}").contains("multiple xDSA keys"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
     fn load_wallet_key_for_signer_errors_when_key_missing() {
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
@@ -2848,6 +3274,60 @@ allocations = []
                     format!("{err:#}").contains("no xDSA key for signer"),
                     "unexpected error: {err:#}"
                 );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn testnet_provisioning_allocates_and_registers_treasury_key() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let tmp = tempfile::tempdir().unwrap();
+                provision_testnet(
+                    1,
+                    tmp.path(),
+                    Some(39871),
+                    "bloomchain.test",
+                    "10",
+                    "99",
+                    None,
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap();
+
+                let treasury_keystore = tmp.path().join("treasury/chain/keystore");
+                let mut keys = std::fs::read_dir(&treasury_keystore)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("xdsa"))
+                    .collect::<Vec<_>>();
+                keys.sort();
+                assert_eq!(keys.len(), 1);
+                let treasury = load_xdsa_key_at(&keys[0]).unwrap();
+                let treasury_hex = hex::encode(treasury.2.0);
+
+                let genesis_text =
+                    std::fs::read_to_string(tmp.path().join("home0/chain/genesis.toml")).unwrap();
+                let genesis: bloom_chain_node::genesis::GenesisFile =
+                    toml::from_str(&genesis_text).unwrap();
+                assert!(
+                    genesis
+                        .allocations
+                        .iter()
+                        .any(|alloc| { alloc.address == treasury_hex && alloc.amount == "99" })
+                );
+                assert!(
+                    genesis
+                        .key_registry
+                        .iter()
+                        .any(|entry| { entry.address == treasury_hex && !entry.pubkey.is_empty() })
+                );
+                assert!(tmp.path().join("treasury/chain/genesis.toml").exists());
             })
             .unwrap()
             .join()

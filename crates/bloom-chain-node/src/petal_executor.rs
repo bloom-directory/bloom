@@ -1065,6 +1065,15 @@ fn execute_tx_impl(
                     // (which already includes both executor- and
                     // host-import-attributed state) into the
                     // snapshot.
+                    let gas_payer_written_by_ptb = report
+                        .object_writes
+                        .iter()
+                        .any(|obj| obj.id == gas_payer_id);
+                    let gas_payer_deleted_by_ptb = report
+                        .object_deletes
+                        .iter()
+                        .any(|(id, _)| *id == gas_payer_id);
+
                     for obj in &report.object_writes {
                         snapshot.insert_object(obj.clone());
                     }
@@ -1435,20 +1444,42 @@ fn execute_tx_impl(
                     let refund = reservation
                         .checked_sub(burnt)
                         .expect("charged fuel is bounded by gas budget");
-                    if refund > 0 {
+                    if !gas_payer_deleted_by_ptb
+                        && ((gas_payer_written_by_ptb && burnt > 0) || refund > 0)
+                    {
                         if let Some(mut current) = snapshot.get_object(&gas_payer_id) {
                             match decode_coin_value(&current.payload) {
                                 Ok(cur_value) => {
-                                    let Some(new_value) = cur_value.checked_add(refund) else {
-                                        return ExecOutput {
-                                            success: false,
-                                            fuel_used: charged_fuel,
-                                            return_data:
-                                                b"ptb gas settlement error: refund overflow"
-                                                    .to_vec(),
-                                            logs: vec![],
-                                            write_set: None,
-                                        };
+                                    let new_value = if gas_payer_written_by_ptb {
+                                        match cur_value.checked_sub(burnt) {
+                                            Some(value) => value,
+                                            None => {
+                                                return ExecOutput {
+                                                    success: false,
+                                                    fuel_used: charged_fuel,
+                                                    return_data:
+                                                        b"ptb gas settlement error: gas burn exceeds mutated gas-payer balance"
+                                                            .to_vec(),
+                                                    logs: vec![],
+                                                    write_set: None,
+                                                };
+                                            }
+                                        }
+                                    } else {
+                                        match cur_value.checked_add(refund) {
+                                            Some(value) => value,
+                                            None => {
+                                                return ExecOutput {
+                                                    success: false,
+                                                    fuel_used: charged_fuel,
+                                                    return_data:
+                                                        b"ptb gas settlement error: refund overflow"
+                                                            .to_vec(),
+                                                    logs: vec![],
+                                                    write_set: None,
+                                                };
+                                            }
+                                        }
                                     };
                                     match rewrite_value(&current.payload, new_value) {
                                         Ok(new_payload) => {
@@ -1475,7 +1506,7 @@ fn execute_tx_impl(
                                     }
                                 }
                                 Err(e) => warn!(
-                                    err = ?e,
+                                        err = ?e,
                                     gas_payer = %hex::encode(gas_payer_id.0),
                                     "PTB gas refund: decode_coin_value failed; skipping refund"
                                 ),

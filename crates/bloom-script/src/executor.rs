@@ -492,6 +492,23 @@ impl<'c> PtbExecutor<'c> {
             })?;
         let expected_returns = f.returns.len();
 
+        if m.petal.path == crate::CORE_FUNGIBLE_PATH && m.function == "identity" {
+            charge_builtin_fuel(0, cmd_idx, fuel_remaining, report)?;
+            if expected_returns != 1 {
+                return Err(PtbError::BuiltinFailed {
+                    cmd_idx,
+                    reason: "core fungible identity must declare exactly one return".to_string(),
+                });
+            }
+            let Some(Arg::Object { id, .. }) = m.args.first() else {
+                return Err(PtbError::BuiltinFailed {
+                    cmd_idx,
+                    reason: "core fungible identity requires one object argument".to_string(),
+                });
+            };
+            return Ok(vec![id.0.to_vec()]);
+        }
+
         // Petal call: DO NOT hold the ctx lock here. The wasm host
         // imports (chain_vm.rs) reach back into `ctx` via the same
         // Arc<Mutex>; deadlock if we held it.

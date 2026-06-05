@@ -37,7 +37,7 @@ use bloom_chain_types::block::Block;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
 use bloom_keystore::xdsa::XdsaSecretKey;
-use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
+use bloom_objects::{AccessMode, OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey};
 use bloom_petal_fungible::ops::{coin_payload, decode_coin_value};
 use bloom_petal_manifest::{
     codec,
@@ -46,8 +46,8 @@ use bloom_petal_manifest::{
 use bloom_script::{
     CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH,
     chain_iface::{FunctionDeclStub, PetalManifestStub},
-    encode_ptb, loom_coin_type_tag,
-    types::{Command, MoveCmd, PetalRef, PqSignature, PtbTx},
+    encode_ptb, loom_coin_type_tag, loom_marker_type_tag,
+    types::{Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PqSignature, PtbTx, UseRef},
 };
 use bloom_test_util::BlockBuilder;
 
@@ -99,9 +99,18 @@ fn submit_ptb_tx_with_caps(
 }
 
 fn make_loom_coin(id: ObjectId, owner: [u8; 32], value: u128) -> Object {
+    make_loom_coin_with_hash(id, owner, value, Hash32([0u8; 32]))
+}
+
+fn make_loom_coin_with_hash(
+    id: ObjectId,
+    owner: [u8; 32],
+    value: u128,
+    fungible_hash: Hash32,
+) -> Object {
     Object {
         id,
-        type_tag: loom_coin_type_tag(Hash32([0u8; 32])),
+        type_tag: loom_coin_type_tag(fungible_hash),
         owner: Owner::Address(owner),
         version: 1,
         payload: coin_payload(value),
@@ -256,6 +265,15 @@ fn wat_with_manifest(src: &str, function: &str) -> Vec<u8> {
     })
     .expect("manifest encodes");
     let custom = custom_section("bloom_petal_manifest_v0", &manifest);
+    section(&mut wasm, 0, &custom);
+    wasm
+}
+
+fn minimal_wasm_with_manifest(manifest_bytes: &[u8]) -> Vec<u8> {
+    let mut wasm = Vec::new();
+    wasm.extend_from_slice(b"\0asm");
+    wasm.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+    let custom = custom_section("bloom_petal_manifest_v0", manifest_bytes);
     section(&mut wasm, 0, &custom);
     wasm
 }
@@ -516,6 +534,109 @@ fn successful_ptb_refunds_unused_gas_and_credits_proposer() {
         balance(&state, &sender),
         sender_before,
         "sender Coin<LOOM> balance must be untouched by a SubmitPtb"
+    );
+}
+
+#[test]
+fn successful_ptb_can_split_and_transfer_the_gas_payer_coin_without_over_refund() {
+    let (signer_sk, signer_pk, signer) = make_ptb_signer();
+    let gas_payer_id = ObjectId([0xE1; 32]);
+    let proposer = Address([0xF1; 32]);
+    let recipient = Address([0x44; 32]);
+    let initial_coin: u128 = 1_000_000;
+    let transfer_amount: u128 = 12_345;
+
+    let mut state = State::new();
+    register_ptb_signer(&mut state, signer_pk, signer);
+    let core_manifest_bytes = bloom_petal_fungible::fungible::__bloom_manifest_bytes();
+    let fungible_hash = state.insert_code(&minimal_wasm_with_manifest(core_manifest_bytes));
+    state.set_vfs_binding(CORE_FUNGIBLE_PATH.to_string(), fungible_hash);
+    state.set_object(make_loom_coin_with_hash(
+        gas_payer_id,
+        signer,
+        initial_coin,
+        fungible_hash,
+    ));
+
+    let fungible_manifest =
+        codec::decode(core_manifest_bytes).expect("core fungible manifest decodes");
+    let mut manifests = HashMap::new();
+    manifests.insert(
+        fungible_hash,
+        bloom_petal_manifest::stub::to_petal_manifest_stub(&fungible_manifest),
+    );
+
+    let gas_budget: u64 = 200_000;
+    let gas_price: u128 = 5;
+    let ptb = sign_ptb(
+        PtbTx {
+            signers: vec![signer],
+            commands: vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: CORE_FUNGIBLE_PATH.to_string(),
+                        hash: Some(fungible_hash),
+                    },
+                    function: "identity".to_string(),
+                    type_args: vec![loom_marker_type_tag(fungible_hash)],
+                    args: vec![Arg::Object {
+                        id: gas_payer_id,
+                        expected_version: ExpectedVersion(1),
+                        access_mode: AccessMode::Mutable,
+                    }],
+                }),
+                Command::SplitCoins {
+                    src: UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    },
+                    amounts: vec![transfer_amount],
+                },
+                Command::TransferObjects {
+                    uses: vec![UseRef {
+                        cmd_idx: 1,
+                        ret_idx: 0,
+                    }],
+                    owner: Owner::Address(recipient.0),
+                },
+            ],
+            gas_payer: gas_payer_id,
+            gas_budget,
+            gas_price,
+            expiry_block: 100,
+            signatures: vec![],
+        },
+        &signer_sk,
+    );
+    let bytes = encode_ptb(&ptb).expect("encode PTB");
+    let (sender, tx) = submit_ptb_tx_with_caps(bytes, 1, gas_budget, gas_price as u64);
+    fund(&mut state, sender, 7_777);
+
+    let block = make_block(1, proposer, vec![tx]);
+    let exec = ChainPetalExecutorWithManifests::new(manifests);
+    let (_fuel, receipts) = apply_block_state_transitions(&mut state, &exec, &block, ZERO_EMISSION);
+
+    assert_eq!(receipts.len(), 1);
+    assert!(
+        receipts[0].success,
+        "same-coin transfer PTB should succeed, got: {}",
+        String::from_utf8_lossy(&receipts[0].return_data)
+    );
+    let burnt = (receipts[0].fuel_used as u128) * gas_price;
+    assert_eq!(
+        coin_value(&state, &gas_payer_id).unwrap(),
+        initial_coin - transfer_amount - burnt,
+        "gas-payer/source coin must lose transfer amount plus actual gas burn"
+    );
+    assert_eq!(
+        balance(&state, &recipient),
+        transfer_amount,
+        "recipient must own the split Coin<LOOM>"
+    );
+    assert_eq!(
+        balance(&state, &proposer),
+        burnt,
+        "proposer must receive exactly the burnt gas"
     );
 }
 

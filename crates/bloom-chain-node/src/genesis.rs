@@ -344,8 +344,9 @@ impl Genesis {
 /// (useful in dev / test contexts before the display format is finalised).
 pub fn parse_b1_address(s: &str) -> Result<Address> {
     // Allow raw hex for dev convenience.
-    if s.len() == 64
-        && let Ok(bytes) = hex::decode(s)
+    let maybe_hex = s.trim().strip_prefix("0x").unwrap_or_else(|| s.trim());
+    if maybe_hex.len() == 64
+        && let Ok(bytes) = hex::decode(maybe_hex)
         && bytes.len() == 32
     {
         let mut arr = [0u8; 32];
@@ -658,6 +659,14 @@ mod tests {
         let custom = custom_section("variant", b"1");
         section(&mut wasm, 0, &custom);
         wasm
+    }
+
+    #[test]
+    fn parse_b1_address_accepts_0x_prefixed_hex() {
+        let addr =
+            parse_b1_address("0x1111111111111111111111111111111111111111111111111111111111111111")
+                .unwrap();
+        assert_eq!(addr, Address([0x11; 32]));
     }
 
     #[test]

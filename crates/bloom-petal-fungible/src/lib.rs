@@ -12,6 +12,7 @@
 //! Public entry points (declared inside the `fungible` petal mod):
 //! - `create_currency<T>` — mint a fresh capability triple.
 //! - `mint<T>` / `burn<T>` — cap-gated value creation and destruction.
+//! - `identity<T>` — re-expose an input `Coin<T>` as a typed PTB return.
 //! - `split<T>` / `merge<T>` — value reshuffling between `Coin<T>` objects.
 //! - `transfer<T>` — move a `Coin<T>` to a new address owner.
 //! - `value<T>` — read the `u128` value field of a `Coin<T>`.
@@ -453,6 +454,15 @@ pub mod fungible {
     ) {
         let supply_handle = supply.handle();
         ops::burn(supply_handle, coin.handle()).expect("burn host failure");
+    }
+
+    /// Return the same coin handle as a typed PTB output.
+    ///
+    /// This exists so chain-native built-ins such as `SplitCoins` can consume
+    /// a persistent `Coin<T>` object through a normal typed `Use` edge without
+    /// requiring a separate petal-specific splitter.
+    pub fn identity<T>(coin: &mut bloom_resource::Coin<T>) -> bloom_resource::Coin<T> {
+        *coin
     }
 
     /// Split `amount` units off `coin` into a freshly minted `Coin<T>`,
