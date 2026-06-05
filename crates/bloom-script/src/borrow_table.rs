@@ -53,6 +53,22 @@ pub struct BorrowRow {
     pub baseline_payload: Vec<u8>,
 }
 
+/// Snapshot retained after a row is dropped during the current command.
+///
+/// Dropped rows are no longer candidates for commit writes or linearity, but
+/// object-type invariants still need their pre-delete type and payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DroppedBorrowRow {
+    /// Object identifier.
+    pub object_id: ObjectId,
+    /// Recursive type identity.
+    pub type_tag: TypeTag,
+    /// Command index that produced a transient row, if any.
+    pub origin_command_idx: Option<u16>,
+    /// Payload snapshot from before the command's mutation/delete.
+    pub baseline_payload: Vec<u8>,
+}
+
 impl BorrowRow {
     /// Construct a persistent row from an [`Object`] loaded out of
     /// the chain trie.
@@ -116,6 +132,10 @@ pub struct BorrowTable {
     /// `linearity_check` doesn't flag them as orphans even after the
     /// row is removed from `rows`.
     consumed_transient: BTreeMap<[u8; 32], ()>,
+    /// Rows dropped since the last successful `diff_check`. These tombstones
+    /// are for per-command invariant firing only and are cleared once that
+    /// command's invariant/diff pass completes.
+    dropped_rows: BTreeMap<[u8; 32], DroppedBorrowRow>,
 }
 
 impl BorrowTable {
@@ -187,6 +207,15 @@ impl BorrowTable {
             if row.origin_command_idx.is_some() {
                 self.consumed_transient.insert(id.0, ());
             }
+            self.dropped_rows.insert(
+                id.0,
+                DroppedBorrowRow {
+                    object_id: row.object_id,
+                    type_tag: row.type_tag,
+                    origin_command_idx: row.origin_command_idx,
+                    baseline_payload: row.baseline_payload,
+                },
+            );
         }
     }
 
@@ -258,6 +287,7 @@ impl BorrowTable {
                 }
             }
         }
+        self.dropped_rows.clear();
         Ok(())
     }
 
@@ -273,6 +303,11 @@ impl BorrowTable {
     /// Iterate every row in the table (for the executor's commit phase).
     pub fn iter(&self) -> impl Iterator<Item = (&ObjectId, &BorrowRow)> {
         self.rows.values().map(|row| (&row.object_id, row))
+    }
+
+    /// Iterate rows dropped during the current command.
+    pub fn dropped_rows(&self) -> impl Iterator<Item = (&ObjectId, &DroppedBorrowRow)> {
+        self.dropped_rows.values().map(|row| (&row.object_id, row))
     }
 }
 
@@ -348,6 +383,9 @@ mod tests {
         assert!(t.get(&id).is_none());
         // Transient row dropped = consumed (no orphan).
         assert!(t.linearity_check().is_empty());
+        assert_eq!(t.dropped_rows().count(), 1);
+        t.diff_check(0).unwrap();
+        assert_eq!(t.dropped_rows().count(), 0);
     }
 
     #[test]
