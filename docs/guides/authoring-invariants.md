@@ -59,11 +59,12 @@ pre-mutation value.
   using `+`/`*` (e.g. `a >= b + c` instead of `a - c >= b`).
 - Boolean: `&&`, `||`, `!` compose any of the above (short-circuit at runtime).
 
-**Field rules (important):** only **fixed-prefix, ≤16-byte numeric fields** are
-addressable — i.e. `u8/u16/u32/u64/u128` (and `bool`) that appear *before* the
-first variable-width field in the struct. Once a `Vec<u8>`, `String`, or
-`TypeTag` field appears, it and everything after it are **not** addressable.
-(Reserves and `k_last` sit in the pool's fixed prefix, so they're fine.)
+**Field rules (important):** only **fixed-prefix, ≤16-byte unsigned integer fields** are
+addressable — i.e. `u8/u16/u32/u64/u128` fields that appear *before* the first
+variable-width field in the struct. `bool` is fixed-width but not addressable as
+a numeric invariant field. Once a `Vec<u8>`, `String`, or `TypeTag` field
+appears, it and everything after it are **not** addressable. (Reserves and
+`k_last` sit in the pool's fixed prefix, so they're fine.)
 
 ## The golden rule: it must hold after *every* mutation of the target
 

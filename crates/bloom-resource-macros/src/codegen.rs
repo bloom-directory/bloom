@@ -939,8 +939,8 @@ pub(crate) fn emit_invariant_runtime() -> TokenStream {
 }
 
 /// Lower a [`PredicateAst`] to a Rust expression returning `1` (satisfied)
-/// or `0` (violated/indeterminate — fail-closed). Unsupported shapes keep
-/// the historical permissive default (`1`).
+/// or `0` (violated/indeterminate — fail-closed). Unsupported shapes lower
+/// to `0` and are rejected by chain admission.
 fn emit_predicate_eval(p: &PredicateAst) -> TokenStream {
     match p {
         PredicateAst::ArithCmp { op, lhs, rhs } => {

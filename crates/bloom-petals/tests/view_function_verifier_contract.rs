@@ -230,6 +230,16 @@ fn wasm_with_invariant(predicate: bloom_petal_manifest::types::PredicateAst) -> 
         offset: Some(offset),
         width: Some(16),
     };
+    let id_field = FieldDecl {
+        name: "id".to_string(),
+        ty: TypeTag::Concrete {
+            petal_hash: [0u8; 32],
+            type_name: "UID".to_string(),
+            type_args: vec![],
+        },
+        offset: Some(0),
+        width: Some(32),
+    };
     let manifest = PetalManifestV0 {
         module_path: "/bloom/test/inv".to_string(),
         functions: vec![FunctionDecl {
@@ -242,6 +252,7 @@ fn wasm_with_invariant(predicate: bloom_petal_manifest::types::PredicateAst) -> 
             abilities: AbilitySet::default(),
             type_params: vec![],
             fields: vec![
+                id_field,
                 num_field("reserve_a", 32),
                 num_field("reserve_b", 48),
                 num_field("k_last", 64),

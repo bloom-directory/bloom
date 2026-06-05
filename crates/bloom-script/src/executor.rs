@@ -764,6 +764,7 @@ impl<'c> PtbExecutor<'c> {
                 &change.after,
                 change.created,
                 change.deleted,
+                cmd_idx,
             )?;
             for inv in def_manifest.object_invariants(type_name) {
                 if change.deleted {
@@ -1554,6 +1555,7 @@ fn build_object_scope(
     after: &[u8],
     created: bool,
     deleted: bool,
+    cmd_idx: u16,
 ) -> Result<Vec<u8>, PtbError> {
     let mut fields: Vec<(String, u128)> = Vec::with_capacity(layout.len() * 2);
     for f in layout {
@@ -1564,10 +1566,32 @@ fn build_object_scope(
         let offset = f.offset as usize;
         if created {
             fields.push((format!("before.{}", f.name), 0));
-        } else if let Some(v) = extract_be_u128(before, offset, width) {
+        } else {
+            let v = extract_be_u128(before, offset, width).ok_or_else(|| {
+                invariant_scope_projection_error(
+                    cmd_idx,
+                    type_name,
+                    &f.name,
+                    "before",
+                    offset,
+                    width,
+                    before.len(),
+                )
+            })?;
             fields.push((format!("before.{}", f.name), v));
         }
-        if !deleted && let Some(v) = extract_be_u128(after, offset, width) {
+        if !deleted {
+            let v = extract_be_u128(after, offset, width).ok_or_else(|| {
+                invariant_scope_projection_error(
+                    cmd_idx,
+                    type_name,
+                    &f.name,
+                    "after",
+                    offset,
+                    width,
+                    after.len(),
+                )
+            })?;
             fields.push((format!("after.{}", f.name), v));
         }
     }
@@ -1581,6 +1605,24 @@ fn build_object_scope(
         &fields,
     )
     .map_err(PtbError::Codec)
+}
+
+fn invariant_scope_projection_error(
+    cmd_idx: u16,
+    type_name: &str,
+    field_name: &str,
+    side: &str,
+    offset: usize,
+    width: usize,
+    payload_len: usize,
+) -> PtbError {
+    PtbError::BuiltinFailed {
+        cmd_idx,
+        reason: format!(
+            "object invariant scope for {type_name}.{field_name} could not extract {side} field \
+             at offset {offset} width {width} from payload length {payload_len}"
+        ),
+    }
 }
 
 /// Read a big-endian unsigned integer of `width` bytes (≤ 16) at `offset`
@@ -2869,10 +2911,10 @@ mod tests {
                 object_types: vec![ObjectTypeDeclStub {
                     name: "Coin".to_string(),
                     abilities: Default::default(),
-                    // value field: 16-byte BE u128 after the 32-byte id.
+                    // Fungible coin payload is just the 16-byte BE u128 value.
                     field_layout: vec![FieldLayoutStub {
                         name: "value".to_string(),
-                        offset: 32,
+                        offset: 0,
                         width: 16,
                     }],
                     ..Default::default()
@@ -3634,7 +3676,7 @@ mod tests {
         let before = payload(1000, 1_000_000);
         let after = payload(1100, 1_001_000);
 
-        let scope = build_object_scope("Pool", &layout, &before, &after, false, false).unwrap();
+        let scope = build_object_scope("Pool", &layout, &before, &after, false, false, 0).unwrap();
         let decoded = decode_invariant_scope(&scope).unwrap();
         assert_eq!(decoded.target_name, "Pool");
         // 32-byte id skipped; reserve_a + k_last each yield before/after.
@@ -3658,7 +3700,7 @@ mod tests {
         let mut after = vec![0u8; 32];
         after.extend_from_slice(&42u128.to_be_bytes());
 
-        let scope = build_object_scope("Coin", &layout, &after, &after, true, false).unwrap();
+        let scope = build_object_scope("Coin", &layout, &after, &after, true, false, 0).unwrap();
         assert_eq!(lookup_field(&scope, "before.value"), Some(0));
         assert_eq!(lookup_field(&scope, "after.value"), Some(42));
     }
@@ -3675,9 +3717,29 @@ mod tests {
         }];
         let before = 42u128.to_be_bytes().to_vec();
 
-        let scope = build_object_scope("Coin", &layout, &before, &[], false, true).unwrap();
+        let scope = build_object_scope("Coin", &layout, &before, &[], false, true, 0).unwrap();
         assert_eq!(lookup_field(&scope, "before.value"), Some(42));
         assert_eq!(lookup_field(&scope, "after.value"), None);
+    }
+
+    #[test]
+    fn build_object_scope_rejects_missing_numeric_field_bytes() {
+        use crate::chain_iface::FieldLayoutStub;
+
+        let layout = vec![FieldLayoutStub {
+            name: "value".to_string(),
+            offset: 16,
+            width: 16,
+        }];
+        let payload = 42u128.to_be_bytes().to_vec();
+
+        let err =
+            build_object_scope("Vault", &layout, &payload, &payload, false, false, 7).unwrap_err();
+        assert!(
+            matches!(err, PtbError::BuiltinFailed { ref reason, cmd_idx: 7 }
+                if reason.contains("could not extract before field")),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

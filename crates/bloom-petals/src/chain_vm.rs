@@ -332,6 +332,7 @@ pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
     if let Some(manifest) = extract_petal_manifest_v0(bytes) {
         validate_view_functions_are_pure(bytes, &manifest)?;
         validate_invariant_attachments(&manifest)?;
+        validate_object_field_layouts(&manifest)?;
         for inv in &manifest.invariants {
             // (1) Fail-closed on invariants the on-chain evaluator can't
             // enforce: unsupported predicate shapes lower to a constant in
@@ -448,6 +449,53 @@ pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
                     return Err(PetalError::InvalidWasm(e.to_string()));
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_object_field_layouts(manifest: &PetalManifestV0) -> Result<(), PetalError> {
+    for obj in &manifest.object_types {
+        let mut names = HashSet::new();
+        let mut next_offset = Some(0u32);
+        for field in &obj.fields {
+            if !names.insert(field.name.as_str()) {
+                return Err(PetalError::InvalidWasm(format!(
+                    "chain petal object type '{}' declares duplicate field name '{}'",
+                    obj.name, field.name
+                )));
+            }
+
+            let expected_width = bloom_petal_manifest::types::canonical_byte_width(&field.ty);
+            if field.width != expected_width {
+                return Err(PetalError::InvalidWasm(format!(
+                    "chain petal object type '{}' field '{}' declares width {:?}, expected {:?} \
+                     from its canonical type",
+                    obj.name, field.name, field.width, expected_width
+                )));
+            }
+
+            let expected_offset = match (next_offset, expected_width) {
+                (Some(offset), Some(_)) => Some(offset),
+                _ => None,
+            };
+            if field.offset != expected_offset {
+                return Err(PetalError::InvalidWasm(format!(
+                    "chain petal object type '{}' field '{}' declares offset {:?}, expected {:?} \
+                     from canonical field order",
+                    obj.name, field.name, field.offset, expected_offset
+                )));
+            }
+
+            next_offset = match (next_offset, expected_width) {
+                (Some(offset), Some(width)) => Some(offset.checked_add(width).ok_or_else(|| {
+                    PetalError::InvalidWasm(format!(
+                        "chain petal object type '{}' field '{}' overflows canonical layout offset",
+                        obj.name, field.name
+                    ))
+                })?),
+                _ => None,
+            };
         }
     }
     Ok(())
@@ -2516,6 +2564,130 @@ mod ptb_host_import_tests {
             .unwrap_err();
         assert!(
             err.to_string().contains("addressable numeric"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_tampered_object_invariant_field_offset() {
+        let manifest = PetalManifestV0 {
+            schema_version: SCHEMA_VERSION,
+            module_path: "/bloom/petals/test/object".to_string(),
+            framework_version: SemVer::new(0, 1, 0),
+            functions: vec![FunctionDecl {
+                name: "touch".to_string(),
+                attached_invariants: vec![0],
+                ..Default::default()
+            }],
+            object_types: vec![ObjectTypeDecl {
+                name: "Vault".to_string(),
+                abilities: AbilitySet::key_store(),
+                type_params: vec![],
+                fields: vec![FieldDecl {
+                    name: "amount".to_string(),
+                    ty: builtin("u128"),
+                    offset: Some(16),
+                    width: Some(16),
+                }],
+            }],
+            invariants: vec![InvariantDecl {
+                name: "amount_non_decreasing".to_string(),
+                target: InvariantTarget::ObjectType {
+                    name: "Vault".to_string(),
+                },
+                predicate: PredicateAst::FieldGe {
+                    lhs: "after.amount".to_string(),
+                    rhs: "before.amount".to_string(),
+                },
+                wasm_export: "__inv_0".to_string(),
+                human_text: String::new(),
+            }],
+            ..Default::default()
+        };
+        let wasm = append_manifest(parse(r#"(module)"#), manifest);
+
+        let err = validate_chain_wasm(&wasm).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("declares offset Some(16), expected Some(0)"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_duplicate_object_field_names() {
+        let manifest = PetalManifestV0 {
+            schema_version: SCHEMA_VERSION,
+            module_path: "/bloom/petals/test/object".to_string(),
+            framework_version: SemVer::new(0, 1, 0),
+            functions: vec![FunctionDecl {
+                name: "touch".to_string(),
+                attached_invariants: vec![0],
+                ..Default::default()
+            }],
+            object_types: vec![ObjectTypeDecl {
+                name: "Vault".to_string(),
+                abilities: AbilitySet::key_store(),
+                type_params: vec![],
+                fields: vec![
+                    FieldDecl {
+                        name: "amount".to_string(),
+                        ty: builtin("u128"),
+                        offset: Some(0),
+                        width: Some(16),
+                    },
+                    FieldDecl {
+                        name: "amount".to_string(),
+                        ty: builtin("u128"),
+                        offset: Some(16),
+                        width: Some(16),
+                    },
+                ],
+            }],
+            invariants: vec![InvariantDecl {
+                name: "amount_non_decreasing".to_string(),
+                target: InvariantTarget::ObjectType {
+                    name: "Vault".to_string(),
+                },
+                predicate: PredicateAst::FieldGe {
+                    lhs: "after.amount".to_string(),
+                    rhs: "before.amount".to_string(),
+                },
+                wasm_export: "__inv_0".to_string(),
+                human_text: String::new(),
+            }],
+            ..Default::default()
+        };
+        let wasm = append_manifest(parse(r#"(module)"#), manifest);
+
+        let err = validate_chain_wasm(&wasm).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate field name 'amount'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn object_field_layout_validation_uses_fixed_prefix_rule() {
+        let mut manifest = object_manifest(
+            "Packet",
+            vec![
+                ("head", builtin("u64")),
+                ("bytes", builtin("Vec<u8>")),
+                ("tail", builtin("u64")),
+            ],
+        );
+        manifest.object_types[0].fields[0].offset = Some(0);
+        manifest.object_types[0].fields[1].offset = None;
+        manifest.object_types[0].fields[2].offset = None;
+
+        assert!(validate_object_field_layouts(&manifest).is_ok());
+
+        manifest.object_types[0].fields[2].offset = Some(8);
+        let err = validate_object_field_layouts(&manifest).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("field 'tail' declares offset Some(8), expected None"),
             "unexpected error: {err}"
         );
     }
