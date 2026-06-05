@@ -1,6 +1,6 @@
 //! `cap_revoked_is_monotone` invariant — proves the invariant framework
 //! generalizes to a non-DEX petal (`/bloom/core/cap`) and exercises boolean
-//! composition (`&&` over a `FieldGe` and a literal-bounded `ArithCmp`).
+//! composition (`&&` over field and literal-bounded comparisons).
 //!
 //! Host-only (no wasm32): decode the petal's embedded manifest, assert the
 //! invariant's shape, then check the macro-generated host evaluator
@@ -28,30 +28,38 @@ fn cap_predicate() -> PredicateAst {
     inv.predicate.clone()
 }
 
-#[test]
-fn manifest_carries_boolean_cap_invariant() {
-    // after.revoked >= before.revoked && after.inner_kind <= 2
-    let PredicateAst::And(left, right) = cap_predicate() else {
-        panic!("expected And(...) predicate");
-    };
-    assert_eq!(
-        *left,
-        PredicateAst::FieldGe {
-            lhs: "after.revoked".into(),
-            rhs: "before.revoked".into(),
-        }
-    );
-    match *right {
+fn assert_field_le_literal(pred: PredicateAst, field: &str, literal: u128) {
+    match pred {
         PredicateAst::ArithCmp {
             op: CmpOp::Le,
             lhs,
             rhs,
         } => {
-            assert_eq!(lhs, ArithExpr::Field("after.inner_kind".into()));
-            assert_eq!(rhs, ArithExpr::Literal(2));
+            assert_eq!(lhs, ArithExpr::Field(field.into()));
+            assert_eq!(rhs, ArithExpr::Literal(literal));
         }
-        other => panic!("unexpected right conjunct: {other:?}"),
+        other => panic!("unexpected conjunct: {other:?}"),
     }
+}
+
+#[test]
+fn manifest_carries_cap_invariant() {
+    // after.revoked >= before.revoked && after.revoked <= 1 && after.inner_kind <= 2
+    let PredicateAst::And(left, right) = cap_predicate() else {
+        panic!("expected And(...) predicate");
+    };
+    let PredicateAst::And(monotone, flag_range) = *left else {
+        panic!("expected left And(...) predicate");
+    };
+    assert_eq!(
+        *monotone,
+        PredicateAst::FieldGe {
+            lhs: "after.revoked".into(),
+            rhs: "before.revoked".into(),
+        }
+    );
+    assert_field_le_literal(*flag_range, "after.revoked", 1);
+    assert_field_le_literal(*right, "after.inner_kind", 2);
 }
 
 fn scope(rev_before: u128, rev_after: u128, kind_after: u128) -> Vec<u8> {
@@ -77,6 +85,7 @@ fn generated_evaluator_matches_interpreter() {
         (0, 0, 1, EvalOutcome::Satisfied),     // lock: revoked preserved, kind Locked
         (1, 1, 2, EvalOutcome::Satisfied),     // already revoked, ExpireAt kind
         (1, 0, 0, EvalOutcome::Violated),      // illegal un-revoke (1 -> 0)
+        (1, 2, 0, EvalOutcome::Violated),      // invalid revoked flag
         (0, 0, 3, EvalOutcome::Violated),      // out-of-range inner_kind
     ];
     for (rb, ra, kind, expected) in cases {

@@ -214,9 +214,10 @@ broke (roots are computed at runtime). Any node must adopt it in lockstep.
   `real_pool_remove_liquidity_not_blocked_by_invariant`.
 - **Second invariant on a new petal** (`/bloom/core/cap`):
   `cap_revoked_is_monotone` = `after.revoked >= before.revoked &&
-  after.inner_kind <= 2` — proves the framework off the DEX and exercises
-  `And` + a `FieldGe` over `before/after` + a literal-bounded `ArithCmp`. Tested
-  in `examples/petal-cap/tests/invariant.rs`.
+  after.revoked <= 1 && after.inner_kind <= 2` — proves the framework off the
+  DEX and exercises `And` + a `FieldGe` over `before/after` +
+  literal-bounded `ArithCmp`s. Tested in
+  `examples/petal-cap/tests/invariant.rs`.
 - **Codegen fix surfaced by the literal:** `ArithExpr::Literal` now emits a
   suffixed `Nu128` (was the invalid `N u128`); never hit before because pool_k
   used no literal.

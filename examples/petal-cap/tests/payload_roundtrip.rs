@@ -1,7 +1,7 @@
 //! `Cap<T>` payload-layer round-trip tests.
 //!
 //! `Cap<T>` is encoded on the wire as `id (UID) || inner_kind (u8) ||
-//! expires_at_block (u64 BE) || revoked (bool)`. We re-encode the payload
+//! expires_at_block (u64 BE) || revoked flag (u8)`. We re-encode the payload
 //! from outside the petal and check the bytes are stable, deterministic,
 //! and decode losslessly.
 
@@ -66,7 +66,7 @@ fn payload_revoked_open_round_trip() {
 #[test]
 fn payload_is_exactly_forty_two_bytes() {
     // Sanity: the wire size is fixed (no length prefixes on a u8 or a
-    // u64; one byte on the trailing bool). This is the canonical
+    // u64; one byte on the trailing revoked flag). This is the canonical
     // CAP_PAYLOAD_LEN.
     assert_eq!(bloom_petal_cap::CAP_PAYLOAD_LEN, 42);
     for k in [0u8, 1, 2] {
