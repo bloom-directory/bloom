@@ -47,7 +47,9 @@ use crate::chain_iface::{
 };
 use crate::error::PtbError;
 use crate::host_ctx::PtbHostCtx;
-use crate::predicate::{PredicateAstStub, PredicateEvalOutcome, interpret_predicate};
+use crate::predicate::{
+    ArithExprStub, PredicateAstStub, PredicateEvalOutcome, interpret_predicate,
+};
 use crate::types::{Arg, Command, MoveCmd, PublishCmd, UpgradeCmd, UseRef};
 use crate::validator::{ValidatedPtb, decode_coin_value};
 use crate::value_validation::validate_return_slot_with_manifest_loader;
@@ -56,6 +58,9 @@ const MAX_PETAL_RETURN_SLOTS: usize = 32;
 const MAX_PETAL_RETURN_BYTES: usize = 2 << 20;
 const PUBLISH_BASE_FUEL: u64 = 1_000;
 const PUBLISH_BYTES_PER_FUEL: u64 = 64;
+const INV_BASE_FUEL: u64 = 100;
+const INV_PRED_NODE_FUEL: u64 = 10;
+const INV_SCOPE_BYTES_PER_FUEL: u64 = 64;
 
 fn coin_payload(value: u128) -> Vec<u8> {
     value.canonical_encode()
@@ -378,7 +383,9 @@ impl<'c> PtbExecutor<'c> {
             // lives here (not inside `exec_move`) so built-in commands that
             // mutate rows — `MergeCoins`/`SplitCoins` — are checked too, not
             // only Move calls.
-            if let Err(e) = self.fire_object_invariants(&vtx, cmd_idx as u16, &mut report) {
+            if let Err(e) =
+                self.fire_object_invariants(&vtx, cmd_idx as u16, &mut report, &mut fuel_remaining)
+            {
                 return self.revert_report(report, e);
             }
 
@@ -635,7 +642,14 @@ impl<'c> PtbExecutor<'c> {
                     &[],
                 )
                 .map_err(PtbError::Codec)?;
-                self.fire_invariant(&inv.name, &inv.predicate, &scope, cmd_idx, report)?;
+                self.fire_invariant(
+                    &inv.name,
+                    &inv.predicate,
+                    &scope,
+                    cmd_idx,
+                    report,
+                    fuel_remaining,
+                )?;
             }
         }
 
@@ -656,6 +670,7 @@ impl<'c> PtbExecutor<'c> {
         scope: &[u8],
         cmd_idx: u16,
         report: &mut ExecutionReport,
+        fuel_remaining: &mut u64,
     ) -> Result<(), PtbError> {
         match run_invariant(
             name,
@@ -664,12 +679,9 @@ impl<'c> PtbExecutor<'c> {
             cmd_idx,
             &mut report.invariant_outcomes,
         ) {
-            Ok(used) => {
-                report.fuel_used = report.fuel_used.saturating_add(used);
-                Ok(())
-            }
+            Ok(used) => charge_invariant_fuel(used, cmd_idx, fuel_remaining, report),
             Err((used, e)) => {
-                report.fuel_used = report.fuel_used.saturating_add(used);
+                charge_reverting_invariant_fuel(used, fuel_remaining, report);
                 Err(e)
             }
         }
@@ -687,6 +699,7 @@ impl<'c> PtbExecutor<'c> {
         vtx: &ValidatedPtb,
         cmd_idx: u16,
         report: &mut ExecutionReport,
+        fuel_remaining: &mut u64,
     ) -> Result<(), PtbError> {
         let changed: Vec<ObjectInvariantChange> =
             self.with_ctx(|ctx| {
@@ -760,9 +773,17 @@ impl<'c> PtbExecutor<'c> {
                         &scope,
                         cmd_idx,
                         report,
+                        fuel_remaining,
                     )?;
                 } else {
-                    self.fire_invariant(&inv.name, &inv.predicate, &scope, cmd_idx, report)?;
+                    self.fire_invariant(
+                        &inv.name,
+                        &inv.predicate,
+                        &scope,
+                        cmd_idx,
+                        report,
+                        fuel_remaining,
+                    )?;
                 }
             }
         }
@@ -779,7 +800,9 @@ impl<'c> PtbExecutor<'c> {
         scope: &[u8],
         cmd_idx: u16,
         report: &mut ExecutionReport,
+        fuel_remaining: &mut u64,
     ) -> Result<(), PtbError> {
+        let used = deterministic_invariant_fuel(predicate, scope);
         let verdict = match interpret_predicate(predicate, scope) {
             PredicateEvalOutcome::Satisfied => InvariantVerdict::Satisfied,
             PredicateEvalOutcome::Violated | PredicateEvalOutcome::Indeterminate => {
@@ -792,12 +815,13 @@ impl<'c> PtbExecutor<'c> {
             verdict,
         });
         if matches!(verdict, InvariantVerdict::Violated) {
+            charge_reverting_invariant_fuel(used, fuel_remaining, report);
             return Err(PtbError::InvariantFailed {
                 cmd_idx,
                 name: name.to_string(),
             });
         }
-        Ok(())
+        charge_invariant_fuel(used, cmd_idx, fuel_remaining, report)
     }
 
     fn exec_transfer(
@@ -1413,6 +1437,72 @@ fn charge_builtin_fuel(
     Ok(())
 }
 
+fn charge_invariant_fuel(
+    cost: u64,
+    cmd_idx: u16,
+    fuel_remaining: &mut u64,
+    report: &mut ExecutionReport,
+) -> Result<(), PtbError> {
+    if cost > *fuel_remaining {
+        report.fuel_used = report.fuel_used.saturating_add(*fuel_remaining);
+        let limit = *fuel_remaining;
+        *fuel_remaining = 0;
+        return Err(PtbError::OutOfFuel {
+            cmd_idx,
+            limit,
+            used: cost,
+        });
+    }
+    *fuel_remaining -= cost;
+    report.fuel_used = report.fuel_used.saturating_add(cost);
+    Ok(())
+}
+
+fn charge_reverting_invariant_fuel(
+    cost: u64,
+    fuel_remaining: &mut u64,
+    report: &mut ExecutionReport,
+) {
+    let charged = cost.min(*fuel_remaining);
+    *fuel_remaining = fuel_remaining.saturating_sub(charged);
+    report.fuel_used = report.fuel_used.saturating_add(charged);
+}
+
+fn deterministic_invariant_fuel(predicate: &PredicateAstStub, scope: &[u8]) -> u64 {
+    let scope_units = (scope.len() as u64).saturating_add(INV_SCOPE_BYTES_PER_FUEL - 1)
+        / INV_SCOPE_BYTES_PER_FUEL;
+    INV_BASE_FUEL
+        .saturating_add(predicate_node_count(predicate).saturating_mul(INV_PRED_NODE_FUEL))
+        .saturating_add(scope_units)
+}
+
+fn predicate_node_count(predicate: &PredicateAstStub) -> u64 {
+    match predicate {
+        PredicateAstStub::FieldGe { .. }
+        | PredicateAstStub::FieldLe { .. }
+        | PredicateAstStub::FieldEq { .. }
+        | PredicateAstStub::StrategyKNonDecreasing { .. }
+        | PredicateAstStub::AllPoolsKNonDecreasing
+        | PredicateAstStub::Opaque => 1,
+        PredicateAstStub::ArithCmp { lhs, rhs, .. } => {
+            1 + arith_node_count(lhs) + arith_node_count(rhs)
+        }
+        PredicateAstStub::And(a, b) | PredicateAstStub::Or(a, b) => {
+            1 + predicate_node_count(a) + predicate_node_count(b)
+        }
+        PredicateAstStub::Not(inner) => 1 + predicate_node_count(inner),
+    }
+}
+
+fn arith_node_count(expr: &ArithExprStub) -> u64 {
+    match expr {
+        ArithExprStub::Field(_) | ArithExprStub::Literal(_) => 1,
+        ArithExprStub::Bounded { lhs, rhs, .. } => {
+            1 + arith_node_count(lhs) + arith_node_count(rhs)
+        }
+    }
+}
+
 /// Evaluate one manifest predicate against a prebuilt scope buffer, record the
 /// tri-state verdict (ADR-002: recorded even on success), and return the fuel
 /// consumed for billing.
@@ -1428,6 +1518,7 @@ fn run_invariant(
     cmd_idx: u16,
     outcomes: &mut Vec<InvariantOutcome>,
 ) -> Result<u64, (u64, PtbError)> {
+    let used = deterministic_invariant_fuel(predicate, scope);
     let verdict = match interpret_predicate(predicate, scope) {
         PredicateEvalOutcome::Satisfied => InvariantVerdict::Satisfied,
         PredicateEvalOutcome::Violated => InvariantVerdict::Violated,
@@ -1441,14 +1532,14 @@ fn run_invariant(
 
     if matches!(verdict, InvariantVerdict::Violated) {
         return Err((
-            0,
+            used,
             PtbError::InvariantFailed {
                 cmd_idx,
                 name: name.to_string(),
             },
         ));
     }
-    Ok(0)
+    Ok(used)
 }
 
 /// Build a flat field-table scope for an object-type invariant. Each
@@ -3620,14 +3711,76 @@ mod tests {
             InvariantVerdict::Satisfied
         );
         assert_eq!(report.invariant_outcomes[0].name, "inv");
+        assert!(
+            report.fuel_used > 1,
+            "host-side invariant evaluation must be billed; report: {report:?}"
+        );
     }
 
-    /// B1 / RT-006 regression: an invariant evaluates on its own fixed
-    /// budget (`INV_FUEL_PER_EVAL`), not the command's leftover fuel, so a
-    /// PTB submitter cannot gas-starve the check. Here the command's gas is
-    /// tiny but the violating invariant reports a large `fuel_used`; it must
-    /// still be caught (`InvariantFailed`, not `OutOfFuel`/indeterminate),
-    /// and its fuel is billed *on top of* the command budget.
+    #[test]
+    fn satisfied_invariant_out_of_fuel_after_recording_verdict() {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        chain.put_petal(
+            petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/p".to_string(),
+                functions: vec![FunctionDeclStub {
+                    view: false,
+                    name: "f".to_string(),
+                    type_params: vec![],
+                    args: vec![],
+                    returns: vec![],
+                    required_signers: 0,
+                    required_capabilities: vec![],
+                    attached_invariants: vec![InvariantDeclStub {
+                        name: "guard".to_string(),
+                        wasm_export: "__inv_guard".to_string(),
+                        predicate: always_satisfied_predicate(),
+                        argspec: vec![],
+                        target: Default::default(),
+                    }],
+                }],
+                object_types: vec![],
+                external_type_refs: vec![],
+                ..Default::default()
+            },
+        );
+        let mut runner = MockPetalRunner::new();
+        runner.set(petal, "f", build_outputs(&[]), 1);
+        let mut tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/p".to_string(),
+                    hash: Some(petal),
+                },
+                function: "f".to_string(),
+                type_args: vec![],
+                args: vec![],
+            })],
+        );
+        tx.gas_budget = 1;
+
+        let report = run(&chain, &runner, tx);
+        assert!(!report.success, "report: {report:?}");
+        assert!(matches!(
+            report.reverted_with,
+            Some(PtbError::OutOfFuel { cmd_idx: 0, .. })
+        ));
+        assert_eq!(report.invariant_outcomes.len(), 1);
+        assert_eq!(
+            report.invariant_outcomes[0].verdict,
+            InvariantVerdict::Satisfied
+        );
+    }
+
+    /// B1 / RT-006 regression: a PTB submitter cannot gas-starve a violating
+    /// check into an indeterminate non-revert. Here the guest invariant export
+    /// claims a huge fuel burn, but host-side enforcement ignores the export
+    /// verdict/cost and must still catch the manifest predicate violation.
     #[test]
     fn gas_starved_ptb_does_not_bypass_violating_invariant() {
         let chain = MockChain::new();

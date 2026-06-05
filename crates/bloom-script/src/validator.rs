@@ -169,6 +169,7 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
                     | Command::MergeCoins { .. }
                     | Command::SplitCoins { .. }
                     | Command::MakeMoveVec { .. }
+                    | Command::Publish(_)
             )
         {
             return Err(PtbError::BuiltinFailed {
@@ -1686,6 +1687,30 @@ mod tests {
         };
 
         assert!(validate_ptb(&tx, &read_only_ctx(&chain, &PanicVerifier)).is_ok());
+    }
+
+    #[test]
+    fn read_only_rejects_publish() {
+        let chain = MockChain::new();
+        let tx = PtbTx {
+            signers: vec![],
+            commands: vec![Command::Publish(crate::types::PublishCmd {
+                wasm_bytes: vec![0],
+                module_path: "/new".to_string(),
+                publisher_cap: None,
+            })],
+            gas_payer: ObjectId([0xFE; 32]),
+            gas_budget: 100,
+            gas_price: 1,
+            expiry_block: 100,
+            signatures: vec![],
+        };
+
+        let err = validate_ptb(&tx, &read_only_ctx(&chain, &PanicVerifier)).unwrap_err();
+        assert!(
+            matches!(err, PtbError::BuiltinFailed { ref reason, .. } if reason.contains("read-only mode")),
+            "expected read-only publish rejection, got {err:?}"
+        );
     }
 
     #[test]
