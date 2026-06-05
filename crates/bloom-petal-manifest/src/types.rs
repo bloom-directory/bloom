@@ -161,6 +161,30 @@ pub fn canonical_byte_width(ty: &TypeTag) -> Option<u32> {
     }
 }
 
+/// Numeric field width accepted by the v1 invariant field-table evaluator.
+///
+/// This is intentionally narrower than [`canonical_byte_width`]: booleans are
+/// fixed-width in the canonical codec, but their semantic domain is `{0, 1}`,
+/// not the full `u8` range. Until the invariant schema carries scalar-domain
+/// metadata, only unsigned integer primitives are exposed as numeric fields.
+pub fn invariant_numeric_byte_width(ty: &TypeTag) -> Option<u32> {
+    match ty {
+        TypeTag::Concrete {
+            type_name,
+            type_args,
+            ..
+        } if type_args.is_empty() => match type_name.as_str() {
+            "u8" => Some(1),
+            "u16" => Some(2),
+            "u32" => Some(4),
+            "u64" => Some(8),
+            "u128" => Some(16),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Field on an `#[object]` struct.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FieldDecl {
@@ -177,6 +201,22 @@ pub struct FieldDecl {
     /// Fixed canonical byte width of this field, or `None` for
     /// variable-width types (`Vec<u8>`, `String`, nested `TypeTag`).
     pub width: Option<u32>,
+}
+
+/// `true` iff `ty` is one of the unsigned integer types the invariant
+/// evaluator models as a numeric `u128` domain.
+///
+/// `bool` is deliberately excluded even though its canonical width is one
+/// byte: treating it as a numeric `u8` admits arithmetic/domain claims that
+/// are not boolean semantics.
+pub fn is_numeric_invariant_type(ty: &TypeTag) -> bool {
+    invariant_numeric_byte_width(ty).is_some()
+}
+
+/// `true` iff `field` can be exposed in the v1 invariant numeric scope:
+/// fixed-prefix, at most 16 bytes wide, and an unsigned integer type.
+pub fn is_numeric_invariant_field(field: &FieldDecl) -> bool {
+    field.offset.is_some() && field.width == invariant_numeric_byte_width(&field.ty)
 }
 
 /// Declaration of a `#[capability]`-annotated struct (spec §5).
@@ -536,5 +576,49 @@ mod tests {
             rhs: "b".into(),
         };
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn invariant_numeric_width_excludes_bool_domain() {
+        let tag = |name: &str| TypeTag::Concrete {
+            petal_hash: [0u8; 32],
+            type_name: name.to_string(),
+            type_args: vec![],
+        };
+
+        assert_eq!(canonical_byte_width(&tag("bool")), Some(1));
+        assert_eq!(invariant_numeric_byte_width(&tag("bool")), None);
+        assert!(!is_numeric_invariant_type(&tag("bool")));
+
+        assert_eq!(invariant_numeric_byte_width(&tag("u8")), Some(1));
+        assert!(is_numeric_invariant_type(&tag("u128")));
+    }
+
+    #[test]
+    fn invariant_numeric_field_requires_unsigned_integer_layout() {
+        let tag = |name: &str| TypeTag::Concrete {
+            petal_hash: [0u8; 32],
+            type_name: name.to_string(),
+            type_args: vec![],
+        };
+        let field = |name: &str, ty: TypeTag, width: Option<u32>| FieldDecl {
+            name: name.to_string(),
+            ty,
+            offset: Some(0),
+            width,
+        };
+
+        assert!(is_numeric_invariant_field(&field("x", tag("u64"), Some(8))));
+        assert!(!is_numeric_invariant_field(&field(
+            "enabled",
+            tag("bool"),
+            Some(1)
+        )));
+        assert!(!is_numeric_invariant_field(&field("x", tag("u64"), None)));
+        assert!(!is_numeric_invariant_field(&field(
+            "x",
+            tag("u64"),
+            Some(16)
+        )));
     }
 }

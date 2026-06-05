@@ -19,11 +19,16 @@
 //! or bounded-arithmetic (`*`, `+`, `u128` literals) expressions, composed
 //! with boolean `&&`/`||`/`!` (ADR-015) — lowered to
 //! [`PredicateAst::FieldGe`]/`FieldLe`/`FieldEq`, [`PredicateAst::ArithCmp`],
-//! and [`PredicateAst::And`]/`Or`/`Not`. Only fixed-prefix, ≤16-byte numeric
-//! fields are addressable (ADR-011). Subtraction (`-`) lowers but is **rejected
-//! at deploy** for now: the guest fails closed to Violated on underflow while
-//! the trusted interpreter returns Indeterminate, and the differential gate
-//! does not yet cover that split — use `+`/`*` until it does.
+//! and [`PredicateAst::And`]/`Or`/`Not`. Only fixed-prefix unsigned-integer
+//! fields (`u8`..`u128`) are addressable as numeric invariant fields; `bool`
+//! is intentionally excluded rather than modeled as `u8` (ADR-011).
+//! Subtraction (`-`) lowers but is **rejected at deploy** for now: the guest
+//! fails closed to Violated on underflow while the trusted interpreter returns
+//! Indeterminate, and the differential gate does not yet cover that split.
+//! Nested bounded arithmetic and bounded arithmetic on both sides of a
+//! comparison are also rejected at deploy until the trusted interpreter uses
+//! exact `U256` semantics throughout — use a single `+`/`*` expression on one
+//! side of the comparison for now.
 //!
 //! **Unsupported shapes are rejected at deploy** (fail-closed, ADR-014):
 //! `S::k(p)`-style calls and any closure that doesn't lower to a supported

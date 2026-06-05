@@ -148,6 +148,14 @@ fn inv_outcome_to_record(o: &bloom_script::InvariantOutcome) -> InvariantRecord 
     }
 }
 
+fn invariant_records(report: &bloom_script::ExecutionReport) -> Vec<InvariantRecord> {
+    report
+        .invariant_outcomes
+        .iter()
+        .map(inv_outcome_to_record)
+        .collect()
+}
+
 fn next_object_version(id: ObjectId, version: u64) -> Result<u64, PtbError> {
     version
         .checked_add(1)
@@ -1087,11 +1095,7 @@ fn execute_tx_impl(
                             // Surface the recorded verdicts on a reverted
                             // PTB too — e.g. the violating invariant when
                             // the revert reason is InvariantFailed (ADR-002).
-                            invariant_outcomes: report
-                                .invariant_outcomes
-                                .iter()
-                                .map(inv_outcome_to_record)
-                                .collect(),
+                            invariant_outcomes: invariant_records(&report),
                             write_set: ws_out,
                         };
                     }
@@ -1166,7 +1170,7 @@ fn execute_tx_impl(
                                 )
                                 .into_bytes(),
                                 logs: vec![],
-                                invariant_outcomes: Vec::new(),
+                                invariant_outcomes: invariant_records(&report),
                                 write_set: ws_out,
                             };
                         }
@@ -1213,7 +1217,7 @@ fn execute_tx_impl(
                                 )
                                 .into_bytes(),
                                 logs: vec![],
-                                invariant_outcomes: Vec::new(),
+                                invariant_outcomes: invariant_records(&report),
                                 write_set: ws_out,
                             };
                         }
@@ -1259,7 +1263,7 @@ fn execute_tx_impl(
                                 return_data: format!("ptb publish admission error: {e}")
                                     .into_bytes(),
                                 logs: vec![],
-                                invariant_outcomes: Vec::new(),
+                                invariant_outcomes: invariant_records(&report),
                                 write_set: ws_out,
                             };
                         }
@@ -1308,7 +1312,7 @@ fn execute_tx_impl(
                                     return_data: b"ptb publish admission error: missing bloom_petal_manifest_v0"
                                         .to_vec(),
                                     logs: vec![],
-                                    invariant_outcomes: Vec::new(),
+                                    invariant_outcomes: invariant_records(&report),
                                     write_set: ws_out,
                                 };
                             }
@@ -1354,7 +1358,7 @@ fn execute_tx_impl(
                                 return_data: format!("ptb publish admission error: {e}")
                                     .into_bytes(),
                                 logs: vec![],
-                                invariant_outcomes: Vec::new(),
+                                invariant_outcomes: invariant_records(&report),
                                 write_set: ws_out,
                             };
                         }
@@ -1403,7 +1407,7 @@ fn execute_tx_impl(
                                     return_data: format!("ptb publish admission error: {e}")
                                         .into_bytes(),
                                     logs: vec![],
-                                    invariant_outcomes: Vec::new(),
+                                    invariant_outcomes: invariant_records(&report),
                                     write_set: ws_out,
                                 };
                             }
@@ -1452,7 +1456,7 @@ fn execute_tx_impl(
                                 return_data: format!("ptb publish admission error: {e}")
                                     .into_bytes(),
                                 logs: vec![],
-                                invariant_outcomes: Vec::new(),
+                                invariant_outcomes: invariant_records(&report),
                                 write_set: ws_out,
                             };
                         }
@@ -1489,7 +1493,7 @@ fn execute_tx_impl(
                                                 b"ptb gas settlement error: refund overflow"
                                                     .to_vec(),
                                             logs: vec![],
-                                            invariant_outcomes: Vec::new(),
+                                            invariant_outcomes: invariant_records(&report),
                                             write_set: None,
                                         };
                                     };
@@ -1546,7 +1550,7 @@ fn execute_tx_impl(
                             fuel_used: charged_fuel,
                             return_data: format!("ptb gas settlement error: {e}").into_bytes(),
                             logs: vec![],
-                            invariant_outcomes: Vec::new(),
+                            invariant_outcomes: invariant_records(&report),
                             write_set: None,
                         };
                     }

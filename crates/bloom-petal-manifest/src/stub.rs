@@ -25,7 +25,7 @@ use bloom_script::{
 use crate::types::{
     ArgKind, CapabilityDecl, DataTypeDecl, EnumTypeDecl, FieldDecl, FunctionDecl, InvariantDecl,
     InvariantTarget, ObjectTypeDecl, PetalManifestV0, TypeParamDecl, TypeParamKind, VariantDecl,
-    VariantFieldsDecl,
+    VariantFieldsDecl, is_numeric_invariant_field,
 };
 
 /// Project a full canonical manifest down to the validator-facing stub.
@@ -93,18 +93,16 @@ fn project_function(f: &FunctionDecl, all_invariants: &[InvariantDecl]) -> Funct
 }
 
 fn project_object_type(o: &ObjectTypeDecl) -> ObjectTypeDeclStub {
-    // Project only the statically-addressable (fixed-prefix) fields:
-    // those with both a known offset and width (ADR-011).
+    // Project only statically-addressable unsigned integer fields into the
+    // invariant numeric scope. Bool is fixed-width but not a numeric u8 domain.
     let field_layout = o
         .fields
         .iter()
-        .filter_map(|f| match (f.offset, f.width) {
-            (Some(offset), Some(width)) => Some(FieldLayoutStub {
-                name: f.name.clone(),
-                offset,
-                width,
-            }),
-            _ => None,
+        .filter(|f| is_numeric_invariant_field(f))
+        .map(|f| FieldLayoutStub {
+            name: f.name.clone(),
+            offset: f.offset.expect("numeric invariant field has offset"),
+            width: f.width.expect("numeric invariant field has width"),
         })
         .collect();
     ObjectTypeDeclStub {
@@ -306,5 +304,36 @@ mod tests {
         assert_eq!(s.object_types.len(), 1);
         assert_eq!(s.object_types[0].name, "Pool");
         assert_eq!(s.object_types[0].abilities, AbilitySet::key_store());
+    }
+
+    #[test]
+    fn object_field_layout_excludes_bool_from_numeric_invariant_scope() {
+        let m = PetalManifestV0 {
+            module_path: "/p".into(),
+            object_types: vec![ObjectTypeDecl {
+                name: "Flags".into(),
+                abilities: AbilitySet::key_store(),
+                type_params: vec![],
+                fields: vec![
+                    FieldDecl {
+                        name: "enabled".into(),
+                        ty: concrete("bool"),
+                        offset: Some(0),
+                        width: Some(1),
+                    },
+                    FieldDecl {
+                        name: "count".into(),
+                        ty: concrete("u64"),
+                        offset: Some(1),
+                        width: Some(8),
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+
+        let s = to_petal_manifest_stub(&m);
+        assert_eq!(s.object_types[0].field_layout.len(), 1);
+        assert_eq!(s.object_types[0].field_layout[0].name, "count");
     }
 }

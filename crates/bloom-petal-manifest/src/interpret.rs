@@ -197,6 +197,56 @@ fn arith_uses_sub(e: &ArithExpr) -> bool {
     }
 }
 
+/// Returns true for arithmetic shapes whose guest and reference semantics are
+/// not part of the v1 equivalence contract.
+///
+/// The generated runtime can evaluate one non-nested bounded arithmetic node
+/// over `u128` operands and compare it against a field/literal. That covers the
+/// current pool invariant shape (`after.reserve_a * after.reserve_b >=
+/// before.k_last`). Nested arithmetic and arithmetic on both sides can involve
+/// two exact overflowing `U256` values; the current reference interpreter's
+/// coarse overflow model is not equivalent for those cases, so deployment must
+/// reject them until the interpreter is upgraded to exact `U256`.
+pub fn predicate_uses_unsupported_arithmetic_shape(p: &PredicateAst) -> bool {
+    match p {
+        PredicateAst::ArithCmp { lhs, rhs, .. } => {
+            arith_has_nested_bounded(lhs)
+                || arith_has_nested_bounded(rhs)
+                || (arith_has_bounded(lhs) && arith_has_bounded(rhs))
+        }
+        PredicateAst::And(a, b) | PredicateAst::Or(a, b) => {
+            predicate_uses_unsupported_arithmetic_shape(a)
+                || predicate_uses_unsupported_arithmetic_shape(b)
+        }
+        PredicateAst::Not(inner) => predicate_uses_unsupported_arithmetic_shape(inner),
+        PredicateAst::FieldGe { .. }
+        | PredicateAst::FieldLe { .. }
+        | PredicateAst::FieldEq { .. }
+        | PredicateAst::StrategyKNonDecreasing { .. }
+        | PredicateAst::AllPoolsKNonDecreasing
+        | PredicateAst::Opaque => false,
+    }
+}
+
+fn arith_has_bounded(e: &ArithExpr) -> bool {
+    match e {
+        ArithExpr::Field(_) | ArithExpr::Literal(_) => false,
+        ArithExpr::Bounded { .. } => true,
+    }
+}
+
+fn arith_has_nested_bounded(e: &ArithExpr) -> bool {
+    match e {
+        ArithExpr::Field(_) | ArithExpr::Literal(_) => false,
+        ArithExpr::Bounded { lhs, rhs, .. } => {
+            arith_has_bounded(lhs)
+                || arith_has_bounded(rhs)
+                || arith_has_nested_bounded(lhs)
+                || arith_has_nested_bounded(rhs)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AST → English (ADR-001/003): a canonical, deterministic rendering of a
 // predicate, so the machine predicate and its `human_text` claim can be
@@ -674,6 +724,45 @@ mod tests {
             Box::new(pool_k_predicate()),
             Box::new(PredicateAst::Not(Box::new(sub))),
         )));
+    }
+
+    #[test]
+    fn detects_unsupported_arithmetic_shapes() {
+        let product = ArithExpr::Bounded {
+            op: BoundedArithOp::Mul,
+            lhs: Box::new(ArithExpr::Field("after.a".into())),
+            rhs: Box::new(ArithExpr::Field("after.b".into())),
+            widening: Widening::U256,
+            on_overflow: OverflowPolicy::Indeterminate,
+        };
+        let supported = PredicateAst::ArithCmp {
+            op: CmpOp::Ge,
+            lhs: product.clone(),
+            rhs: ArithExpr::Field("before.k".into()),
+        };
+        assert!(!predicate_uses_unsupported_arithmetic_shape(&supported));
+
+        let product_vs_product = PredicateAst::ArithCmp {
+            op: CmpOp::Le,
+            lhs: product.clone(),
+            rhs: product.clone(),
+        };
+        assert!(predicate_uses_unsupported_arithmetic_shape(
+            &product_vs_product
+        ));
+
+        let nested = PredicateAst::ArithCmp {
+            op: CmpOp::Ge,
+            lhs: ArithExpr::Bounded {
+                op: BoundedArithOp::Mul,
+                lhs: Box::new(product),
+                rhs: Box::new(ArithExpr::Field("after.c".into())),
+                widening: Widening::U256,
+                on_overflow: OverflowPolicy::Indeterminate,
+            },
+            rhs: ArithExpr::Literal(0),
+        };
+        assert!(predicate_uses_unsupported_arithmetic_shape(&nested));
     }
 
     #[test]

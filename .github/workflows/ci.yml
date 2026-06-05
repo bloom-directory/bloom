@@ -184,21 +184,12 @@ jobs:
         if: always()
         run: sccache --show-stats
 
-  # Hermetic real-wasm invariant ABI gate: compiles the example petal to
-  # wasm32 and exercises the `__inv_<idx>` chain-VM host/guest ABI seam
-  # in-process (no anvil/network/docker). `#[ignore]`d (heavy) so it doesn't
-  # run in the host `test` job; gated on PRs here — this is the regression
-  # gate for the latent calldata/`petal.return` ABI class of bug.
-  #
-  # Scoped to `real_inv_wasm` only. The `real_wasm_pool` end-to-end gate is
-  # intentionally NOT run here: it depends on the DEX pool minting coins,
-  # which #26 disallowed (`COIN_MINTER_PATHS` = core fungible only, with a
-  # unit test), while leaving the DEX example still minting — so it fails on
-  # `origin/master` too. That's a pre-existing DEX bug for the maintainer,
-  # unrelated to the invariant subsystem. The full `--ignored` acceptance
-  # suite stays master-push/manual only.
+  # Hermetic real-wasm invariant gates: compile the example petals to
+  # wasm32 and exercise invariant ABI + full PTB object-invariant receipt
+  # propagation in-process (no anvil/network/docker). `#[ignore]`d (heavy)
+  # so these don't run in the host `test` job; gated on PRs here.
   real-wasm-gates:
-    name: real-wasm invariant gate
+    name: real-wasm invariant gates
     runs-on: ubuntu-latest
     env:
       CARGO_BUILD_JOBS: "2"
@@ -218,6 +209,10 @@ jobs:
           cache-targets: false
       - name: Run hermetic real-wasm invariant ABI gate
         run: cargo test -p bloom-petal-dex-it --test real_inv_wasm -- --ignored
+      - name: Run real-wasm PTB object-invariant gate
+        run: cargo test -p bloom-petal-dex-it --test real_wasm_pool real_pool_swap_exact_in_executes -- --ignored
+      - name: Run chain-authoritative capability gate
+        run: cargo test -p bloom-petal-it --test real_mintcap_revert
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats

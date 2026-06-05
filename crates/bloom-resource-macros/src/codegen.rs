@@ -1001,6 +1001,11 @@ fn emit_field_cmp(op: u8, lhs: &str, rhs: &str) -> TokenStream {
 
 /// Lower an [`ArithExpr`] to a Rust expression of type
 /// `Option<__bloom_inv_rt::U256>` (`None` ⇒ indeterminate).
+///
+/// This lowering is intentionally broader than the deployable v1 surface.
+/// Admission rejects nested bounded arithmetic and bounded arithmetic on both
+/// sides until the trusted interpreter uses exact `U256`; see
+/// `predicate_uses_unsupported_arithmetic_shape`.
 fn emit_arith(e: &ArithExpr) -> TokenStream {
     match e {
         ArithExpr::Field(name) => {

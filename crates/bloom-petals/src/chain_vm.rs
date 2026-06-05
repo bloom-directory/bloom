@@ -357,6 +357,19 @@ pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
                     inv.name
                 )));
             }
+            // (1c) Reject arithmetic shapes where the reference interpreter
+            // and generated guest are not yet proven equivalent. v1 supports
+            // the common shape `u128 op u128 <cmp> u128` (for example
+            // `after.reserve_a * after.reserve_b >= before.k_last`), but not
+            // nested arithmetic or arithmetic on both sides of a comparison.
+            if bloom_petal_manifest::predicate_uses_unsupported_arithmetic_shape(&inv.predicate) {
+                return Err(PetalError::InvalidWasm(format!(
+                    "chain petal invariant '{}' uses an unsupported arithmetic shape; \
+                     v1 supports only a single non-nested arithmetic expression on one \
+                     side of a comparison",
+                    inv.name
+                )));
+            }
             // (2) Fuel-headroom gate (RT-006): reject predicates whose
             // worst-case static cost approaches the runtime evaluation
             // budget, so a deployed invariant can never be pushed
@@ -408,10 +421,13 @@ pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
                 let field_widths: std::collections::HashMap<String, u8> = obj
                     .fields
                     .iter()
-                    .filter(|f| {
-                        f.offset.is_some() && matches!(f.width, Some(w) if (1..=16).contains(&w))
+                    .filter_map(|f| {
+                        if bloom_petal_manifest::types::is_numeric_invariant_field(f) {
+                            Some((f.name.clone(), (f.width.unwrap() * 8) as u8))
+                        } else {
+                            None
+                        }
                     })
-                    .map(|f| (f.name.clone(), (f.width.unwrap() * 8) as u8))
                     .collect();
                 if !field_widths.is_empty()
                     && let Err(e) = bloom_petal_manifest::boundary_check(
@@ -467,9 +483,7 @@ fn validate_invariant_field_refs(
             let addressable: std::collections::HashSet<&str> = obj
                 .fields
                 .iter()
-                .filter(|f| {
-                    f.offset.is_some() && matches!(f.width, Some(w) if (1..=16).contains(&w))
-                })
+                .filter(|f| bloom_petal_manifest::types::is_numeric_invariant_field(f))
                 .map(|f| f.name.as_str())
                 .collect();
             for r in refs {
@@ -2271,8 +2285,9 @@ mod ptb_host_import_tests {
     };
     use bloom_petal_manifest::codec;
     use bloom_petal_manifest::types::{
-        DataTypeDecl, ExternalTypeRef, FieldDecl, FunctionDecl, ObjectTypeDecl, PetalManifestV0,
-        SCHEMA_VERSION, SemVer, TypeParamDecl, TypeParamKind,
+        ArithExpr, BoundedArithOp, CmpOp, DataTypeDecl, ExternalTypeRef, FieldDecl, FunctionDecl,
+        InvariantDecl, InvariantTarget, ObjectTypeDecl, OverflowPolicy, PetalManifestV0,
+        PredicateAst, SCHEMA_VERSION, SemVer, TypeParamDecl, TypeParamKind, Widening,
     };
     use bloom_script::host_ctx::PtbHostCtx;
     use std::sync::{Arc, Mutex};
@@ -2348,6 +2363,104 @@ mod ptb_host_import_tests {
             bounds: vec![],
         });
         manifest
+    }
+
+    #[test]
+    fn invariant_field_refs_reject_bool_numeric_domain() {
+        let manifest = PetalManifestV0 {
+            schema_version: SCHEMA_VERSION,
+            module_path: "/bloom/petals/test/object".to_string(),
+            framework_version: SemVer::new(0, 1, 0),
+            object_types: vec![ObjectTypeDecl {
+                name: "Flags".to_string(),
+                abilities: AbilitySet::key_store(),
+                type_params: vec![],
+                fields: vec![
+                    FieldDecl {
+                        name: "enabled".to_string(),
+                        ty: builtin("bool"),
+                        offset: Some(0),
+                        width: Some(1),
+                    },
+                    FieldDecl {
+                        name: "count".to_string(),
+                        ty: builtin("u64"),
+                        offset: Some(1),
+                        width: Some(8),
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        let inv = |lhs: &str, rhs: &str| InvariantDecl {
+            name: "inv".to_string(),
+            target: InvariantTarget::ObjectType {
+                name: "Flags".to_string(),
+            },
+            predicate: PredicateAst::FieldEq {
+                lhs: lhs.to_string(),
+                rhs: rhs.to_string(),
+            },
+            wasm_export: "__inv_0".to_string(),
+            human_text: String::new(),
+        };
+
+        assert!(
+            validate_invariant_field_refs(&inv("after.count", "before.count"), &manifest).is_ok()
+        );
+        let err = validate_invariant_field_refs(&inv("after.enabled", "before.enabled"), &manifest)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("addressable numeric"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn admission_rejects_unsupported_nested_arithmetic_shape() {
+        let add = ArithExpr::Bounded {
+            op: BoundedArithOp::Add,
+            lhs: Box::new(ArithExpr::Field("after.a".to_string())),
+            rhs: Box::new(ArithExpr::Literal(1)),
+            widening: Widening::U256,
+            on_overflow: OverflowPolicy::Indeterminate,
+        };
+        let pred = PredicateAst::ArithCmp {
+            op: CmpOp::Ge,
+            lhs: ArithExpr::Bounded {
+                op: BoundedArithOp::Mul,
+                lhs: Box::new(add),
+                rhs: Box::new(ArithExpr::Field("after.b".to_string())),
+                widening: Widening::U256,
+                on_overflow: OverflowPolicy::Indeterminate,
+            },
+            rhs: ArithExpr::Field("before.k".to_string()),
+        };
+        let manifest = PetalManifestV0 {
+            schema_version: SCHEMA_VERSION,
+            module_path: "/bloom/petals/test/object".to_string(),
+            framework_version: SemVer::new(0, 1, 0),
+            invariants: vec![InvariantDecl {
+                name: "bad_arith".to_string(),
+                target: InvariantTarget::FunctionExit {
+                    name: "touch".to_string(),
+                },
+                predicate: pred,
+                wasm_export: "__inv_0".to_string(),
+                human_text: String::new(),
+            }],
+            ..Default::default()
+        };
+        let wasm = append_manifest(
+            parse(r#"(module (func (export "__inv_0") (param i32 i32) (result i32) i32.const 0))"#),
+            manifest,
+        );
+
+        let err = validate_chain_wasm(&wasm).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported arithmetic shape"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
