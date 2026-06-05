@@ -672,19 +672,15 @@ impl<'c> PtbExecutor<'c> {
         report: &mut ExecutionReport,
         fuel_remaining: &mut u64,
     ) -> Result<(), PtbError> {
-        match run_invariant(
+        let used = deterministic_invariant_fuel(predicate, scope);
+        charge_invariant_fuel(used, cmd_idx, fuel_remaining, report)?;
+        run_invariant(
             name,
             predicate,
             scope,
             cmd_idx,
             &mut report.invariant_outcomes,
-        ) {
-            Ok(used) => charge_invariant_fuel(used, cmd_idx, fuel_remaining, report),
-            Err((used, e)) => {
-                charge_reverting_invariant_fuel(used, fuel_remaining, report);
-                Err(e)
-            }
-        }
+        )
     }
 
     /// Fire object-type invariants for every borrow row dirtied, silently
@@ -804,6 +800,7 @@ impl<'c> PtbExecutor<'c> {
         fuel_remaining: &mut u64,
     ) -> Result<(), PtbError> {
         let used = deterministic_invariant_fuel(predicate, scope);
+        charge_invariant_fuel(used, cmd_idx, fuel_remaining, report)?;
         let verdict = match interpret_predicate(predicate, scope) {
             PredicateEvalOutcome::Satisfied => InvariantVerdict::Satisfied,
             PredicateEvalOutcome::Violated | PredicateEvalOutcome::Indeterminate => {
@@ -816,13 +813,12 @@ impl<'c> PtbExecutor<'c> {
             verdict,
         });
         if matches!(verdict, InvariantVerdict::Violated) {
-            charge_reverting_invariant_fuel(used, fuel_remaining, report);
             return Err(PtbError::InvariantFailed {
                 cmd_idx,
                 name: name.to_string(),
             });
         }
-        charge_invariant_fuel(used, cmd_idx, fuel_remaining, report)
+        Ok(())
     }
 
     fn exec_transfer(
@@ -1459,16 +1455,6 @@ fn charge_invariant_fuel(
     Ok(())
 }
 
-fn charge_reverting_invariant_fuel(
-    cost: u64,
-    fuel_remaining: &mut u64,
-    report: &mut ExecutionReport,
-) {
-    let charged = cost.min(*fuel_remaining);
-    *fuel_remaining = fuel_remaining.saturating_sub(charged);
-    report.fuel_used = report.fuel_used.saturating_add(charged);
-}
-
 fn deterministic_invariant_fuel(predicate: &PredicateAstStub, scope: &[u8]) -> u64 {
     let scope_units = (scope.len() as u64).saturating_add(INV_SCOPE_BYTES_PER_FUEL - 1)
         / INV_SCOPE_BYTES_PER_FUEL;
@@ -1504,9 +1490,10 @@ fn arith_node_count(expr: &ArithExprStub) -> u64 {
     }
 }
 
-/// Evaluate one manifest predicate against a prebuilt scope buffer, record the
-/// tri-state verdict (ADR-002: recorded even on success), and return the fuel
-/// consumed for billing.
+/// Evaluate one manifest predicate against a prebuilt scope buffer and record
+/// the tri-state verdict (ADR-002: recorded even on success). Callers must
+/// charge the deterministic invariant fuel before interpretation so out-of-fuel
+/// preempts predicate work.
 ///
 /// The verdict is derived from the manifest AST, not the petal's `__inv_*`
 /// wasm export. Admission can check the export's signature, but hand-written
@@ -1518,8 +1505,7 @@ fn run_invariant(
     scope: &[u8],
     cmd_idx: u16,
     outcomes: &mut Vec<InvariantOutcome>,
-) -> Result<u64, (u64, PtbError)> {
-    let used = deterministic_invariant_fuel(predicate, scope);
+) -> Result<(), PtbError> {
     let verdict = match interpret_predicate(predicate, scope) {
         PredicateEvalOutcome::Satisfied => InvariantVerdict::Satisfied,
         PredicateEvalOutcome::Violated => InvariantVerdict::Violated,
@@ -1532,15 +1518,12 @@ fn run_invariant(
     });
 
     if matches!(verdict, InvariantVerdict::Violated) {
-        return Err((
-            used,
-            PtbError::InvariantFailed {
-                cmd_idx,
-                name: name.to_string(),
-            },
-        ));
+        return Err(PtbError::InvariantFailed {
+            cmd_idx,
+            name: name.to_string(),
+        });
     }
-    Ok(used)
+    Ok(())
 }
 
 /// Build a flat field-table scope for an object-type invariant. Each
@@ -3780,7 +3763,7 @@ mod tests {
     }
 
     #[test]
-    fn satisfied_invariant_out_of_fuel_after_recording_verdict() {
+    fn invariant_out_of_fuel_preempts_predicate_verdict() {
         let chain = MockChain::new();
         let (petal, signer, gas_id) = build_pkg(&chain);
         chain.put_petal(
@@ -3832,10 +3815,10 @@ mod tests {
             report.reverted_with,
             Some(PtbError::OutOfFuel { cmd_idx: 0, .. })
         ));
-        assert_eq!(report.invariant_outcomes.len(), 1);
-        assert_eq!(
-            report.invariant_outcomes[0].verdict,
-            InvariantVerdict::Satisfied
+        assert!(
+            report.invariant_outcomes.is_empty(),
+            "out-of-fuel must preempt predicate evaluation, got {:?}",
+            report.invariant_outcomes
         );
     }
 
@@ -4413,6 +4396,116 @@ mod tests {
                     && o.verdict == InvariantVerdict::Violated
             }),
             "expected delete-path violation, got {:?}",
+            report.invariant_outcomes
+        );
+    }
+
+    #[test]
+    fn object_delete_invariant_out_of_fuel_preempts_fail_closed_verdict() {
+        use crate::chain_iface::{FieldLayoutStub, ObjectTypeDeclStub};
+        let chain = MockChain::new();
+        let (_petal, signer, gas_id) = build_pkg(&chain);
+        let coin_petal = Hash32([0; 32]);
+        let coin_id = ObjectId([0xD0; 32]);
+
+        chain.put_path("/coin", coin_petal);
+        chain.put_object(make_coin(0xD0, signer, 100, 0));
+        chain.put_petal(
+            coin_petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/coin".to_string(),
+                functions: vec![FunctionDeclStub {
+                    view: false,
+                    name: "delete".to_string(),
+                    type_params: vec![],
+                    args: vec![ArgDeclStub::Object {
+                        ty: loom_tt(),
+                        mode: AccessMode::Consume,
+                    }],
+                    returns: vec![],
+                    required_signers: 0,
+                    required_capabilities: vec![],
+                    attached_invariants: vec![InvariantDeclStub {
+                        name: "coin_value_non_decreasing".to_string(),
+                        wasm_export: "__inv_coin".to_string(),
+                        predicate: PredicateAstStub::FieldGe {
+                            lhs: "after.value".to_string(),
+                            rhs: "before.value".to_string(),
+                        },
+                        argspec: vec![],
+                        target: InvariantTargetStub::ObjectType {
+                            name: "Coin".to_string(),
+                        },
+                    }],
+                }],
+                object_types: vec![ObjectTypeDeclStub {
+                    name: "Coin".to_string(),
+                    abilities: Default::default(),
+                    field_layout: vec![FieldLayoutStub {
+                        name: "value".to_string(),
+                        offset: 0,
+                        width: 16,
+                    }],
+                    ..Default::default()
+                }],
+                external_type_refs: vec![],
+                ..Default::default()
+            },
+        );
+
+        let ctx = Arc::new(Mutex::new(PtbHostCtx::new()));
+        let mut runner = AssertingRunner::new(Arc::clone(&ctx));
+        runner.set("delete", build_outputs(&[]), 5);
+        runner
+            .host_deletes
+            .borrow_mut()
+            .insert("delete".to_string(), vec![coin_id]);
+
+        let mut tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/coin".to_string(),
+                    hash: Some(coin_petal),
+                },
+                function: "delete".to_string(),
+                type_args: vec![],
+                args: vec![Arg::Object {
+                    id: coin_id,
+                    expected_version: ExpectedVersion(0),
+                    access_mode: AccessMode::Consume,
+                }],
+            })],
+        );
+        tx.gas_budget = 5;
+
+        let verifier = AlwaysOkVerifier;
+        let vctx = ValidationContext {
+            mode: ValidationMode::Commit,
+            current_block: chain.block,
+            chain: &chain,
+            verifier: &verifier,
+            loom_coin_type: loom_tt(),
+        };
+        let validated = validate_ptb(&tx, &vctx).unwrap();
+        let mut exec = PtbExecutor::with_ctx_arc(
+            &chain,
+            &runner,
+            loom_tt(),
+            Hash32([0; 32]),
+            Arc::clone(&ctx),
+        );
+        let report = exec.execute(validated);
+        assert!(!report.success, "report: {report:?}");
+        assert!(matches!(
+            report.reverted_with,
+            Some(PtbError::OutOfFuel { cmd_idx: 0, .. })
+        ));
+        assert!(
+            report.invariant_outcomes.is_empty(),
+            "out-of-fuel must preempt deleted-row predicate evaluation, got {:?}",
             report.invariant_outcomes
         );
     }
