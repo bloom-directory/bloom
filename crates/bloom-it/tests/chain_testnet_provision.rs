@@ -9,7 +9,7 @@
 //!      exist for every requested validator.
 //!   2. The shared genesis round-trips through `bloom_chain_node::Genesis::from_file`.
 //!   3. Genesis surfaces N validators in the validator set, each with non-empty
-//!      peer host, and N pre-funded allocations.
+//!      peer host, and N validator allocations plus one treasury allocation.
 //!   4. Per-node `config.toml` parses as `bloom_chain_node::NodeConfig` and
 //!      every node gets a distinct listen_addr.
 //!
@@ -51,7 +51,11 @@ fn provisions_three_validator_network() -> Result<()> {
         let g = bloom_chain_node::Genesis::from_file(&home.join("chain/genesis.toml"))?;
         assert_eq!(g.chain_id, "bloomchain.local");
         assert_eq!(g.validator_set.len(), 3, "validator count in genesis");
-        assert_eq!(g.allocations.len(), 3, "allocation count in genesis");
+        assert_eq!(
+            g.allocations.len(),
+            4,
+            "allocation count in genesis includes treasury"
+        );
 
         // config.toml parses through NodeConfig.
         let cfg_text = std::fs::read_to_string(&cfg.config)?;

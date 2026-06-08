@@ -2129,7 +2129,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_gas_payer_as_object_input() {
+    fn accepts_gas_payer_as_object_input() {
         let (chain, signer, gas_id) = setup();
         let mut manifest = sample_manifest();
         manifest.functions[0].args = vec![ArgDeclStub::Object {
@@ -2148,11 +2148,7 @@ mod tests {
         }
 
         let verifier = AlwaysOkVerifier;
-        let err = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap_err();
-        assert!(matches!(
-            err,
-            PtbError::InvalidGasPayer { reason, .. } if reason.contains("object input")
-        ));
+        validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap();
     }
 
     #[test]
