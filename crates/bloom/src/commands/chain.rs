@@ -425,9 +425,9 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             let ptb_bytes = std::fs::read(&ptb_file)
                 .with_context(|| format!("read ptb file: {}", ptb_file.display()))?;
 
-            let (sk, pk, sender) = load_wallet_key(&chain_dir)?;
-            let chain_id = load_chain_id(&chain_dir)?;
             let client = make_client();
+            let (sk, pk, sender) = load_wallet_key(&chain_dir)?;
+            let chain_id = fetch_chain_id(&client).await?;
             let nonce = fetch_nonce(&client, &sender).await? + 1;
             let tx = build_and_sign_tx(
                 &sk,
@@ -627,8 +627,8 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             let ptb_digest = plan.tx.signing_digest();
             plan.tx.signatures = vec![PqSignature(sk.sign(&ptb_digest).to_bytes())];
             let ptb_bytes = bloom_script::encode_ptb(&plan.tx).context("encode signed PTB")?;
-            let chain_id = load_chain_id(&chain_dir)?;
             let nonce = fetch_nonce(&client, &sender).await? + 1;
+            let chain_id = fetch_chain_id(&client).await?;
             let tx = build_and_sign_tx(
                 &sk,
                 &pk,
@@ -713,8 +713,8 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             plan.signatures = vec![PqSignature(sk.sign(&ptb_digest).to_bytes())];
             let ptb_bytes =
                 bloom_script::encode_ptb(&plan).context("encode signed transfer PTB")?;
-            let chain_id = load_chain_id(&chain_dir)?;
             let nonce = fetch_nonce(&client, &sender).await? + 1;
+            let chain_id = fetch_chain_id(&client).await?;
             let tx = build_and_sign_tx(
                 &sk,
                 &pk,
@@ -786,8 +786,8 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             let ptb_digest = plan.tx.signing_digest();
             plan.tx.signatures = vec![PqSignature(sk.sign(&ptb_digest).to_bytes())];
             let ptb_bytes = bloom_script::encode_ptb(&plan.tx).context("encode signed PTB")?;
-            let chain_id = load_chain_id(&chain_dir)?;
             let nonce = fetch_nonce(&client, &sender).await? + 1;
+            let chain_id = fetch_chain_id(&client).await?;
             let tx = build_and_sign_tx(
                 &sk,
                 &pk,
@@ -847,8 +847,8 @@ pub async fn run_chain(home: &bloom_proto::HomeDir, cmd: ChainCmd) -> Result<()>
             let wasm_bytes =
                 std::fs::read(&wasm).with_context(|| format!("read wasm: {}", wasm.display()))?;
             let (sk, pk, sender) = load_wallet_key(&chain_dir)?;
-            let chain_id = load_chain_id(&chain_dir)?;
             let client = make_client();
+            let chain_id = fetch_chain_id(&client).await?;
             let nonce = fetch_nonce(&client, &sender).await? + 1;
             let tx = build_and_sign_tx(
                 &sk,
@@ -1967,8 +1967,8 @@ fn load_xdsa_key_at(
 
 /// Build and sign a Tx with an explicit `chain_id` and `nonce`. Callers are
 /// responsible for fetching the next-valid nonce from the chain via
-/// [`fetch_nonce`] and reading `chain_id` from the local genesis with
-/// [`load_chain_id`]; baking either of those in would produce txs that get
+/// [`fetch_nonce`] and resolving `chain_id` from the connected node via
+/// [`fetch_chain_id`]; baking either of those in would produce txs that get
 /// silently rejected by the mempool.
 #[allow(clippy::too_many_arguments)]
 fn build_and_sign_tx(
@@ -2000,15 +2000,18 @@ fn build_and_sign_tx(
     Ok(tx)
 }
 
-/// Read `chain_id` from `<chain_dir>/genesis.toml` so signed txs use the same
-/// signing domain as the running validators.
-fn load_chain_id(chain_dir: &std::path::Path) -> Result<String> {
-    let path = chain_dir.join("genesis.toml");
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("read genesis: {}", path.display()))?;
-    let parsed: bloom_chain_node::genesis::GenesisFile =
-        toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-    Ok(parsed.chain_id)
+/// Fetch `chain_id` from the connected validator so public clients only need a
+/// local signer key, not a copied genesis file.
+async fn fetch_chain_id(client: &RpcClient) -> Result<String> {
+    let res = client
+        .call("chain_health", json!({}))
+        .await
+        .context("rpc chain_health")?;
+    res.get("chain_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("chain_health missing chain_id: {res}"))
 }
 
 /// Fetch the on-chain account nonce for `sender`. Returns 0 for an unknown

@@ -231,7 +231,7 @@ async fn run_pipe_and_submit(
         Ok(addr) if !addr.is_empty() => RpcClient::tcp(addr),
         _ => RpcClient::new(chain_rpc_sock),
     };
-    let chain_id = load_chain_id(chain_dir)?;
+    let chain_id = fetch_chain_id(&client).await?;
     let nonce = fetch_nonce(&client, sender).await? + 1;
     let outer = build_outer_tx(&sk, &pk, sender, chain_id, nonce, ptb_bytes);
     let outer_hash = outer.tx_hash();
@@ -286,13 +286,16 @@ fn load_validator_key(
     Ok((sk, pk, addr))
 }
 
-fn load_chain_id(chain_dir: &Path) -> Result<String> {
-    let path = chain_dir.join("genesis.toml");
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("read genesis: {}", path.display()))?;
-    let parsed: bloom_chain_node::genesis::GenesisFile =
-        toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
-    Ok(parsed.chain_id)
+async fn fetch_chain_id(client: &RpcClient) -> Result<String> {
+    let res = client
+        .call("chain_health", serde_json::json!({}))
+        .await
+        .context("rpc chain_health")?;
+    res.get("chain_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("chain_health missing chain_id: {res}"))
 }
 
 async fn fetch_nonce(client: &RpcClient, sender: ChainAddress) -> Result<u64> {
