@@ -80,7 +80,7 @@ pub fn is_active_logic(
 
 /// Petal body — every `pub fn` here becomes a `__petal_<name>` wasm
 /// export. The petal-level macro embeds a canonical-encoded
-/// `PetalManifestV0` (spec §8) as the `bloom_petal_manifest_v0`
+/// `PetalManifest` (spec §8) as the `bloom_petal_manifest`
 /// custom section.
 #[bloom::petal(path = "/bloom/petals/core/cap", version = "0.1.0")]
 pub mod cap {

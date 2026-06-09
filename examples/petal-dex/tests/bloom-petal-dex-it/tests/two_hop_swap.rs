@@ -129,7 +129,7 @@ use bloom_script::{Command, MoveCmd, PetalRef, PqSignature, PtbTx};
 #[test]
 fn router_manifest_decodes_and_publishes_via_wasm_section() {
     // Step 1: verify the macro-emitted bytes round-trip the canonical
-    // codec (i.e. they are valid `PetalManifestV0` bytes).
+    // codec (i.e. they are valid `PetalManifest` bytes).
     let bytes = real_router_manifest_bytes();
     let m = decode_manifest(bytes).expect("real router manifest must decode");
     assert_eq!(m.module_path, "/bloom/petals/dex/router");

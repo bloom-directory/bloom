@@ -42,7 +42,7 @@ pub enum TxKind {
     SubmitPtb { ptb_bytes: Vec<u8> },
     /// Deploy a Bloom-native petal wasm module.
     ///
-    /// The wasm must carry a `bloom_petal_manifest_v0` custom section. The
+    /// The wasm must carry a `bloom_petal_manifest` custom section. The
     /// executor stores the code by content hash and binds the manifest's
     /// `module_path` in the chain VFS registry.
     DeployPetal { wasm_bytes: Vec<u8> },

@@ -211,7 +211,7 @@ pub struct State {
     /// pinning, §11.1 module_path).
     ///
     /// Populated by genesis and petal-publishing flows that decode the wasm's
-    /// `bloom_petal_manifest_v0` custom section to read the declared
+    /// `bloom_petal_manifest` custom section to read the declared
     /// `module_path`.
     ///
     /// VFS bindings are consensus-relevant because validators use them

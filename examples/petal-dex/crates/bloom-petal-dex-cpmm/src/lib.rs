@@ -23,7 +23,7 @@ pub use bloom_dex_math::{ConstantProduct, ConstantProductParams, MathError, Swap
 /// Petal body for `/bloom/petals/dex/strategy/cpmm`.
 ///
 /// Every `pub fn` inside this module becomes a `__petal_<name>` wasm
-/// export. The `#[bloom::petal]` macro embeds a `PetalManifestV0`
+/// export. The `#[bloom::petal]` macro embeds a `PetalManifest`
 /// custom section (spec §8) listing the types and entry points below.
 #[bloom::petal(path = "/bloom/petals/dex/strategy/cpmm", version = "0.1.0")]
 pub mod cpmm {

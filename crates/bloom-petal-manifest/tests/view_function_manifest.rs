@@ -1,5 +1,5 @@
 use bloom_petal_manifest::types::{FunctionDecl, SemVer};
-use bloom_petal_manifest::{PetalManifestV0, SCHEMA_VERSION, codec};
+use bloom_petal_manifest::{PetalManifest, SCHEMA_VERSION, codec};
 
 fn write_u32_be(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_be_bytes());
@@ -63,7 +63,7 @@ fn schema_v1_manifest_fixture_is_rejected_after_clean_break() {
 
 #[test]
 fn manifest_encoder_uses_declared_schema_version_prefix() {
-    let manifest = PetalManifestV0 {
+    let manifest = PetalManifest {
         schema_version: SCHEMA_VERSION,
         module_path: "/bloom/test/schema-prefix".to_string(),
         ..Default::default()
@@ -76,7 +76,7 @@ fn manifest_encoder_uses_declared_schema_version_prefix() {
 
 #[test]
 fn function_decl_view_flag_round_trips() {
-    let manifest = PetalManifestV0 {
+    let manifest = PetalManifest {
         schema_version: SCHEMA_VERSION,
         module_path: "/bloom/test/view-roundtrip".to_string(),
         framework_version: SemVer::new(0, 1, 0),
@@ -106,7 +106,7 @@ fn function_decl_view_flag_round_trips() {
 
 #[test]
 fn schema_version_is_bumped_for_view_function_layout() {
-    let manifest = PetalManifestV0::default();
+    let manifest = PetalManifest::default();
 
     assert!(
         manifest.schema_version >= 4,

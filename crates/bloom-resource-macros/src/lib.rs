@@ -42,7 +42,7 @@ mod type_tag;
 
 /// Attribute applied to a `mod` declaration to mark it as a Bloom
 /// petal entry-point. Emits the `__petal_<fn>` wasm exports and the
-/// `bloom_petal_manifest_v0` custom section (spec §8 / §11.1).
+/// `bloom_petal_manifest` custom section (spec §8 / §11.1).
 #[proc_macro_attribute]
 pub fn petal(attr: TokenStream, item: TokenStream) -> TokenStream {
     petal::expand(attr.into(), item.into())

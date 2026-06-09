@@ -190,14 +190,14 @@ pub fn wat_to_wasm(src: &str) -> Vec<u8> {
     wat::parse_str(src).expect("valid WAT")
 }
 
-/// Append a `bloom_petal_manifest_v0` custom section carrying
+/// Append a `bloom_petal_manifest` custom section carrying
 /// `manifest_bytes` to `wasm`. See [`crate::dex_harness`] / the
 /// `bloom-petal-it` mirror for the rationale: this pairs a real,
 /// chain-authoritative manifest (as the macro emits into the wasm
 /// custom section) with a hand-written WAT body so tests don't need
 /// `wasm32-unknown-unknown` at compile time.
 pub fn append_manifest_section(mut wasm: Vec<u8>, manifest_bytes: &[u8]) -> Vec<u8> {
-    let name = "bloom_petal_manifest_v0";
+    let name = "bloom_petal_manifest";
     let mut body = Vec::new();
     leb128(&mut body, name.len() as u64);
     body.extend_from_slice(name.as_bytes());
@@ -209,7 +209,7 @@ pub fn append_manifest_section(mut wasm: Vec<u8>, manifest_bytes: &[u8]) -> Vec<
 }
 
 /// Convenience: compile `wat_src` and append the
-/// `bloom_petal_manifest_v0` custom section in one call.
+/// `bloom_petal_manifest` custom section in one call.
 pub fn wrap_with_real_manifest(wat_src: &str, manifest_bytes: &[u8]) -> Vec<u8> {
     let base = wat_to_wasm(wat_src);
     append_manifest_section(base, manifest_bytes)
@@ -228,31 +228,31 @@ fn leb128(out: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-/// The canonical-encoded `PetalManifestV0` bytes embedded in the real
+/// The canonical-encoded `PetalManifest` bytes embedded in the real
 /// `/bloom/petals/core/fungible` petal.
 pub fn real_fungible_manifest_bytes() -> &'static [u8] {
     bloom_petal_fungible::fungible::__bloom_manifest_bytes()
 }
 
-/// Canonical `PetalManifestV0` bytes embedded in the real
+/// Canonical `PetalManifest` bytes embedded in the real
 /// `/bloom/petals/dex/pool` petal.
 pub fn real_pool_manifest_bytes() -> &'static [u8] {
     bloom_petal_dex_pool::pool::__bloom_manifest_bytes()
 }
 
-/// Canonical `PetalManifestV0` bytes embedded in the real
+/// Canonical `PetalManifest` bytes embedded in the real
 /// `/bloom/petals/dex/wallet` petal.
 pub fn real_wallet_manifest_bytes() -> &'static [u8] {
     bloom_petal_dex_wallet::wallet::__bloom_manifest_bytes()
 }
 
-/// Canonical `PetalManifestV0` bytes embedded in the real
+/// Canonical `PetalManifest` bytes embedded in the real
 /// `/bloom/petals/dex/strategy/cpmm` petal.
 pub fn real_cpmm_manifest_bytes() -> &'static [u8] {
     bloom_petal_dex_cpmm::cpmm::__bloom_manifest_bytes()
 }
 
-/// Canonical `PetalManifestV0` bytes embedded in the real
+/// Canonical `PetalManifest` bytes embedded in the real
 /// `/bloom/petals/dex/router` petal.
 pub fn real_router_manifest_bytes() -> &'static [u8] {
     bloom_petal_dex_router::router::__bloom_manifest_bytes()

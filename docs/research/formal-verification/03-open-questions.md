@@ -397,8 +397,8 @@ field layout information today.
 - **Question:** Should the scope builder read field layout from the full manifest (available at
   deploy time and carried alongside the compiled Wasm), or should field layout be projected into
   the validator stub (which the executor holds)?
-- **Analysis:** The full `PetalManifestV0` is available at deploy time (stored in the petal
-  Wasm's custom section, extracted by `extract_petal_manifest_v0`). The executor currently uses
+- **Analysis:** The full `PetalManifest` is available at deploy time (stored in the petal
+  Wasm's custom section, extracted by `extract_petal_manifest`). The executor currently uses
   `PetalManifestStub`, which is a projected subset. Either: (a) extend the stub with a minimal
   `FieldLayoutStub` carrying `{name, offset, width}`, or (b) have the scope builder access the
   full manifest (not just the stub) for field layout. (a) is cleaner: it keeps the executor's

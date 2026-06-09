@@ -46,9 +46,7 @@ use tokio::time::{sleep, timeout};
 
 use bloom_chain_node::rpc::RpcClient;
 use bloom_objects::{AbilitySet, AccessMode, Owner, TypeTag};
-use bloom_petal_manifest::types::{
-    ArgDecl, ArgKind, FunctionDecl, PetalManifestV0, SCHEMA_VERSION,
-};
+use bloom_petal_manifest::types::{ArgDecl, ArgKind, FunctionDecl, PetalManifest, SCHEMA_VERSION};
 use bloom_resource::BloomType;
 use bloom_script::{
     Arg, CORE_FUNGIBLE_PATH, Command as PtbCommand, ExpectedVersion, MoveCmd, PetalRef, PtbTx,
@@ -2396,7 +2394,7 @@ fn counter_type_tag(petal_hash: Hash32) -> TypeTag {
 
 fn view_probe_manifest() -> Vec<u8> {
     let self_counter = counter_type_tag(Hash32([0u8; 32]));
-    let manifest = PetalManifestV0 {
+    let manifest = PetalManifest {
         schema_version: SCHEMA_VERSION,
         module_path: PETAL_VFS_PROBE_PATH.to_string(),
         functions: vec![
@@ -2602,7 +2600,7 @@ fn view_probe_wasm() -> Vec<u8> {
 
 fn adversary_manifest(pool_hash: bloom_chain_types::types::Hash32) -> Vec<u8> {
     let pool_ty = pool_type_tag(pool_hash);
-    let manifest = PetalManifestV0 {
+    let manifest = PetalManifest {
         schema_version: SCHEMA_VERSION,
         module_path: ADVERSARY_PATH.to_string(),
         functions: vec![
@@ -2703,7 +2701,7 @@ fn adversary_wasm(
 
 fn loom_probe_manifest(fungible_hash: Hash32) -> Vec<u8> {
     let coin_ty = loom_coin_type_tag(fungible_hash);
-    let manifest = PetalManifestV0 {
+    let manifest = PetalManifest {
         schema_version: SCHEMA_VERSION,
         module_path: LOOM_PROBE_PATH.to_string(),
         functions: vec![

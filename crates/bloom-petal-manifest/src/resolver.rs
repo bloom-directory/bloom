@@ -1,30 +1,30 @@
 //! Reflective type resolver for full petal manifests.
 //!
 //! The value codec is schema-driven and deliberately does not know this
-//! manifest crate. This module bridges a decoded [`PetalManifestV0`] into the
+//! manifest crate. This module bridges a decoded [`PetalManifest`] into the
 //! neutral [`bloom_value::Resolver`] interface.
 
 use bloom_objects::TypeTag;
 use bloom_value::{FieldShape, Resolver, TypeShape, ValueCodecError, VariantFields, VariantShape};
 
 use crate::types::{
-    CapabilityDecl, DataTypeDecl, EnumTypeDecl, FieldDecl, ObjectTypeDecl, PetalManifestV0,
+    CapabilityDecl, DataTypeDecl, EnumTypeDecl, FieldDecl, ObjectTypeDecl, PetalManifest,
     VariantFieldsDecl,
 };
 
 /// Full-manifest resolver for user-defined object/capability/data/enum types.
 #[derive(Clone, Debug)]
 pub struct ManifestResolver<'a> {
-    manifest: &'a PetalManifestV0,
+    manifest: &'a PetalManifest,
     self_hash: Option<[u8; 32]>,
-    external_manifests: &'a [([u8; 32], &'a PetalManifestV0)],
+    external_manifests: &'a [([u8; 32], &'a PetalManifest)],
 }
 
 impl<'a> ManifestResolver<'a> {
     /// Create a resolver for `manifest` without a known publish hash.
     ///
     /// This resolves macro-time self references (`petal_hash == [0; 32]`).
-    pub fn new(manifest: &'a PetalManifestV0) -> Self {
+    pub fn new(manifest: &'a PetalManifest) -> Self {
         Self {
             manifest,
             self_hash: None,
@@ -33,7 +33,7 @@ impl<'a> ManifestResolver<'a> {
     }
 
     /// Create a resolver that also treats `self_hash` as this manifest's hash.
-    pub fn with_self_hash(manifest: &'a PetalManifestV0, self_hash: [u8; 32]) -> Self {
+    pub fn with_self_hash(manifest: &'a PetalManifest, self_hash: [u8; 32]) -> Self {
         Self {
             manifest,
             self_hash: Some(self_hash),
@@ -44,9 +44,9 @@ impl<'a> ManifestResolver<'a> {
     /// Create a resolver that can structurally resolve foreign concrete tags
     /// through the supplied `(content_hash, manifest)` table.
     pub fn with_self_hash_and_external_manifests(
-        manifest: &'a PetalManifestV0,
+        manifest: &'a PetalManifest,
         self_hash: [u8; 32],
-        external_manifests: &'a [([u8; 32], &'a PetalManifestV0)],
+        external_manifests: &'a [([u8; 32], &'a PetalManifest)],
     ) -> Self {
         Self {
             manifest,
@@ -258,7 +258,7 @@ impl Resolver for ManifestResolver<'_> {
 
 /// Validate that manifest-defined declarations do not claim reserved built-in
 /// type names.
-pub fn validate_reserved_type_names(manifest: &PetalManifestV0) -> Result<(), ValueCodecError> {
+pub fn validate_reserved_type_names(manifest: &PetalManifest) -> Result<(), ValueCodecError> {
     for name in manifest
         .object_types
         .iter()
@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn resolves_object_fields_and_decodes_payload() {
-        let manifest = PetalManifestV0 {
+        let manifest = PetalManifest {
             object_types: vec![ObjectTypeDecl {
                 name: "Thing".to_string(),
                 abilities: AbilitySet::key_store(),
@@ -375,7 +375,7 @@ mod tests {
 
     #[test]
     fn substitutes_generic_type_args() {
-        let manifest = PetalManifestV0 {
+        let manifest = PetalManifest {
             data_types: vec![DataTypeDecl {
                 name: "Boxed".to_string(),
                 type_params: vec![TypeParamDecl {
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn resolves_enum_variants() {
-        let manifest = PetalManifestV0 {
+        let manifest = PetalManifest {
             enum_types: vec![EnumTypeDecl {
                 name: "Side".to_string(),
                 type_params: vec![],
@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn resolves_external_type_refs_through_supplied_manifest() {
         let foreign_hash = [0xBB; 32];
-        let manifest = PetalManifestV0 {
+        let manifest = PetalManifest {
             external_type_refs: vec![ExternalTypeRef {
                 placeholder: "$external_0".to_string(),
                 declared_petal_path: "/foreign".to_string(),
@@ -466,7 +466,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let foreign = PetalManifestV0 {
+        let foreign = PetalManifest {
             data_types: vec![DataTypeDecl {
                 name: "Foreign".to_string(),
                 fields: vec![FieldDecl {
@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn external_type_refs_reject_without_supplied_manifest() {
         let foreign_hash = [0xBB; 32];
-        let manifest = PetalManifestV0 {
+        let manifest = PetalManifest {
             external_type_refs: vec![ExternalTypeRef {
                 placeholder: "$external_0".to_string(),
                 declared_petal_path: "/foreign".to_string(),
@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn rejects_reserved_declaration_names() {
-        let manifest = PetalManifestV0 {
+        let manifest = PetalManifest {
             data_types: vec![DataTypeDecl {
                 name: "String".to_string(),
                 ..Default::default()

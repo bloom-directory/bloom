@@ -179,7 +179,7 @@ fn real_pool_manifest_loads_via_chain_adapter() {
     }
 
     // Install a synthetic wasm carrying the real manifest in its
-    // `bloom_petal_manifest_v0` custom section and confirm the
+    // `bloom_petal_manifest` custom section and confirm the
     // production `PtbChainAdapter` finds it via layer 2 (wasm
     // custom-section parse + project). This is the **exact** path
     // the chain node uses for a deployed petal.

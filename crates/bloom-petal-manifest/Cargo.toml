@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Canonical PetalManifestV0 schema, codec, wasm custom-section extractor, and validator-side stub projector for Bloom-native petals (spec §8, §11.1)."
+description = "Canonical PetalManifest schema, codec, wasm custom-section extractor, and validator-side stub projector for Bloom-native petals (spec §8, §11.1)."
 
 [dependencies]
 bloom-objects.workspace = true

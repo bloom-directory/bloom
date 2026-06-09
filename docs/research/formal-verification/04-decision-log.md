@@ -475,7 +475,7 @@ prerequisite for the first real invariant.
    discards `fields`, so the executor's scope builder has no layout. **Decision:** extend
    `ObjectTypeDeclStub` with `field_layout: Vec<FieldLayoutStub { name, offset: Option<u32>, width:
    Option<u32> }>` — a minimal projection that gives the scope builder layout without pulling the
-   full `PetalManifestV0` into the execution hot path.
+   full `PetalManifest` into the execution hot path.
 
 **Consequences:** `FieldDecl` gains `offset: Option<u32>` and `width: Option<u32>`. The manifest
 codec (`bloom-petal-manifest/src/codec.rs`) serializes them. The `#[object]` macro's

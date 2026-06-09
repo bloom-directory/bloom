@@ -1,16 +1,16 @@
 //! Manifest-shape tests for the `/bloom/petals/core/cap` petal.
 //!
-//! These tests decode the wasm `bloom_petal_manifest_v0` custom-section
+//! These tests decode the wasm `bloom_petal_manifest` custom-section
 //! blob that `#[bloom::petal]` emits into a `static [u8; N]` and assert
 //! the petal's user-visible surface (object types, capability types,
 //! function entries, required-capability lists) match spec §5 + §18.
 //!
 use bloom_objects::{AccessMode, TypeTag};
 use bloom_petal_cap::cap;
-use bloom_petal_manifest::PetalManifestV0;
+use bloom_petal_manifest::PetalManifest;
 use bloom_petal_manifest::types::{ArgKind, TypeParamKind};
 
-fn decode(bytes: &[u8]) -> PetalManifestV0 {
+fn decode(bytes: &[u8]) -> PetalManifest {
     bloom_petal_manifest::codec::decode(bytes).unwrap()
 }
 

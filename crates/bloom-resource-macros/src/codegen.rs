@@ -2,9 +2,9 @@
 //!
 //! These helpers produce `proc_macro2::TokenStream` fragments that:
 //!
-//! - Marshal `PetalManifestV0` instances into rust constants whose
+//! - Marshal `PetalManifest` instances into rust constants whose
 //!   canonical-encoded bytes get embedded as the
-//!   `bloom_petal_manifest_v0` wasm custom section (spec §8.1, §11.1).
+//!   `bloom_petal_manifest` wasm custom section (spec §8.1, §11.1).
 //! - Emit `__petal_<fn>` wasm exports with the spec §11.1 signature,
 //!   driving an [`bloom_resource::abi::ArgReader`] across the args
 //!   buffer, dispatching to the user fn, and writing typed return
@@ -19,7 +19,7 @@ use syn::{GenericArgument, Ident, LitByteStr, PathArguments, Type, TypePath};
 
 use bloom_petal_manifest::codec as manifest_codec;
 use bloom_petal_manifest::types::{
-    ArgKind, ArithExpr, BoundedArithOp, CmpOp, PetalManifestV0, PredicateAst,
+    ArgKind, ArithExpr, BoundedArithOp, CmpOp, PetalManifest, PredicateAst,
 };
 
 // ---------------------------------------------------------------------------
@@ -28,12 +28,12 @@ use bloom_petal_manifest::types::{
 
 /// Generate the `#[link_section]` bytes constant that embeds the
 /// canonical-encoded manifest into the wasm output as the
-/// `bloom_petal_manifest_v0` custom section.
+/// `bloom_petal_manifest` custom section.
 ///
 /// The macro emits the bytes as a `static [u8; N]` with a target-gated
 /// `#[link_section]` attribute that only fires on wasm targets.
 pub(crate) fn emit_manifest_section(
-    manifest: &PetalManifestV0,
+    manifest: &PetalManifest,
     section_unique_ident: &Ident,
 ) -> syn::Result<TokenStream> {
     let bytes = manifest_codec::encode(manifest).map_err(|e| {
@@ -53,11 +53,11 @@ pub(crate) fn emit_manifest_section(
     // section. On non-wasm targets we still emit the static so host-side
     // unit tests can inspect it.
     Ok(quote! {
-        /// Canonical-encoded `PetalManifestV0` blob. Embedded into the
-        /// wasm output as the `bloom_petal_manifest_v0` custom section
+        /// Canonical-encoded `PetalManifest` blob. Embedded into the
+        /// wasm output as the `bloom_petal_manifest` custom section
         /// (spec §8.1). Auto-generated; do not edit.
         #[cfg(all(target_arch = "wasm32", not(feature = "no-entrypoint")))]
-        #[unsafe(link_section = "bloom_petal_manifest_v0")]
+        #[unsafe(link_section = "bloom_petal_manifest")]
         #[used]
         pub static #section_unique_ident: [u8; #len] = [#(#byte_lits),*];
 
@@ -1051,7 +1051,7 @@ fn cmp_op_byte(op: CmpOp) -> u8 {
 /// and for tools that pre-flight a wasm before publishing.
 pub(crate) fn emit_manifest_accessor(section_ident: &Ident) -> TokenStream {
     quote! {
-        /// Returns the canonical-encoded `PetalManifestV0` bytes
+        /// Returns the canonical-encoded `PetalManifest` bytes
         /// embedded into this petal at compile time.
         #[cfg(any(not(target_arch = "wasm32"), not(feature = "no-entrypoint")))]
         pub fn __bloom_manifest_bytes() -> &'static [u8] {
@@ -1069,8 +1069,8 @@ mod tests {
     use super::*;
     use bloom_petal_manifest::types::*;
 
-    fn empty_manifest() -> PetalManifestV0 {
-        PetalManifestV0 {
+    fn empty_manifest() -> PetalManifest {
+        PetalManifest {
             schema_version: SCHEMA_VERSION,
             module_path: "/p".to_string(),
             framework_version: SemVer::new(0, 1, 0),
@@ -1096,7 +1096,7 @@ mod tests {
         let toks = emit_manifest_section(&m, &id).unwrap();
         let s = toks.to_string();
         assert!(s.contains("link_section"));
-        assert!(s.contains("bloom_petal_manifest_v0"));
+        assert!(s.contains("bloom_petal_manifest"));
         assert!(s.contains("__BLOOM_M"));
     }
 

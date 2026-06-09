@@ -1,4 +1,4 @@
-//! Canonical encoder / decoder for [`crate::types::PetalManifestV0`].
+//! Canonical encoder / decoder for [`crate::types::PetalManifest`].
 //!
 //! Wire format (deterministic, BE):
 //! - 4-byte BE counts for lists.
@@ -21,7 +21,7 @@ use bloom_objects::{AbilitySet, AccessMode, TypeTag};
 use crate::types::{
     ArgDecl, ArgKind, ArithExpr, BoundedArithOp, CapabilityDecl, CmpOp, DataTypeDecl, EnumTypeDecl,
     ExternalTypeRef, FieldDecl, FuelHints, FunctionDecl, HostImportDecl, InvariantDecl,
-    InvariantTarget, ObjectTypeDecl, OverflowPolicy, PetalManifestV0, PredicateAst, SCHEMA_VERSION,
+    InvariantTarget, ObjectTypeDecl, OverflowPolicy, PetalManifest, PredicateAst, SCHEMA_VERSION,
     SemVer, TypeParamDecl, TypeParamKind, VariantDecl, VariantFieldsDecl, WasmFuncSig, WasmValType,
     Widening,
 };
@@ -33,14 +33,14 @@ const MAX_MANIFEST_LIST_ITEMS: usize = 16_384;
 // ===========================================================================
 
 /// Canonical-encode the manifest into a fresh `Vec<u8>`.
-pub fn encode(manifest: &PetalManifestV0) -> Result<Vec<u8>, CodecError> {
+pub fn encode(manifest: &PetalManifest) -> Result<Vec<u8>, CodecError> {
     let mut out = Vec::new();
     encode_into(manifest, &mut out)?;
     Ok(out)
 }
 
 /// Canonical-encode the manifest into an existing buffer.
-pub fn encode_into(manifest: &PetalManifestV0, buf: &mut Vec<u8>) -> Result<(), CodecError> {
+pub fn encode_into(manifest: &PetalManifest, buf: &mut Vec<u8>) -> Result<(), CodecError> {
     if manifest.schema_version != SCHEMA_VERSION {
         return Err(CodecError::InvalidLength(manifest.schema_version as u64));
     }
@@ -61,7 +61,7 @@ pub fn encode_into(manifest: &PetalManifestV0, buf: &mut Vec<u8>) -> Result<(), 
 }
 
 /// Canonical-decode a manifest from `bytes`, rejecting trailing data.
-pub fn decode(bytes: &[u8]) -> Result<PetalManifestV0, CodecError> {
+pub fn decode(bytes: &[u8]) -> Result<PetalManifest, CodecError> {
     let mut rdr = bytes;
     let m = decode_from(&mut rdr)?;
     codec::expect_eof(rdr)?;
@@ -69,7 +69,7 @@ pub fn decode(bytes: &[u8]) -> Result<PetalManifestV0, CodecError> {
 }
 
 /// Decode from a cursor (allows trailing bytes; used when nested).
-pub fn decode_from(rdr: &mut &[u8]) -> Result<PetalManifestV0, CodecError> {
+pub fn decode_from(rdr: &mut &[u8]) -> Result<PetalManifest, CodecError> {
     let schema_version = read_u32_be(rdr)?;
     if schema_version != SCHEMA_VERSION {
         return Err(CodecError::InvalidLength(schema_version as u64));
@@ -86,7 +86,7 @@ pub fn decode_from(rdr: &mut &[u8]) -> Result<PetalManifestV0, CodecError> {
     let required_host_imports = read_list(rdr, read_host_import_decl)?;
     let external_type_refs = read_list(rdr, read_external_type_ref)?;
     let fuel_hints = read_fuel_hints(rdr)?;
-    Ok(PetalManifestV0 {
+    Ok(PetalManifest {
         schema_version,
         module_path,
         framework_version,
@@ -802,8 +802,8 @@ mod tests {
     use super::*;
     use crate::types::*;
 
-    fn sample() -> PetalManifestV0 {
-        PetalManifestV0 {
+    fn sample() -> PetalManifest {
+        PetalManifest {
             schema_version: SCHEMA_VERSION,
             module_path: "/bloom/petals/dex/pool".to_string(),
             framework_version: SemVer::new(0, 1, 0),
@@ -950,7 +950,7 @@ mod tests {
 
     #[test]
     fn round_trip_empty() {
-        let m = PetalManifestV0 {
+        let m = PetalManifest {
             schema_version: SCHEMA_VERSION,
             module_path: "/p".to_string(),
             framework_version: SemVer::new(0, 0, 1),
@@ -972,7 +972,7 @@ mod tests {
     #[test]
     fn snapshot_minimal_first_bytes() {
         // schema_version (4) || module_path ("/x" = 2 bytes)
-        let m = PetalManifestV0 {
+        let m = PetalManifest {
             schema_version: SCHEMA_VERSION,
             module_path: "/x".to_string(),
             framework_version: SemVer::new(0, 1, 0),
@@ -996,7 +996,7 @@ mod tests {
 
     #[test]
     fn rejects_trailing_bytes() {
-        let m = PetalManifestV0::default();
+        let m = PetalManifest::default();
         let mut bytes = encode(&m).unwrap();
         bytes.push(0xFF);
         assert!(decode(&bytes).is_err());
@@ -1022,7 +1022,7 @@ mod tests {
             AccessMode::Mutable,
             AccessMode::Consume,
         ] {
-            let m = PetalManifestV0 {
+            let m = PetalManifest {
                 module_path: "/p".to_string(),
                 functions: vec![FunctionDecl {
                     name: "f".to_string(),
@@ -1114,7 +1114,7 @@ mod tests {
             ),
         ];
         for p in variants {
-            let m = PetalManifestV0 {
+            let m = PetalManifest {
                 module_path: "/p".to_string(),
                 invariants: vec![InvariantDecl {
                     name: "x".to_string(),
@@ -1143,7 +1143,7 @@ mod tests {
 
     #[test]
     fn fuel_hints_round_trip() {
-        let m = PetalManifestV0 {
+        let m = PetalManifest {
             module_path: "/p".to_string(),
             fuel_hints: FuelHints {
                 per_function: vec![("a".to_string(), 1_000), ("b".to_string(), 2_000)],
@@ -1157,7 +1157,7 @@ mod tests {
 
     #[test]
     fn function_view_round_trips_in_current_schema() {
-        let m = PetalManifestV0 {
+        let m = PetalManifest {
             schema_version: SCHEMA_VERSION,
             module_path: "/p".to_string(),
             functions: vec![FunctionDecl {
@@ -1174,7 +1174,7 @@ mod tests {
 
     #[test]
     fn schema_v1_manifest_is_rejected() {
-        let m = PetalManifestV0 {
+        let m = PetalManifest {
             schema_version: 1,
             module_path: "/p".to_string(),
             functions: vec![FunctionDecl {
@@ -1201,7 +1201,7 @@ mod tests {
 
     #[test]
     fn invariant_human_text_round_trips() {
-        let m = PetalManifestV0 {
+        let m = PetalManifest {
             module_path: "/p".to_string(),
             invariants: vec![InvariantDecl {
                 name: "x".to_string(),

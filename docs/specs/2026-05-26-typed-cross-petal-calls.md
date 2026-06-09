@@ -125,7 +125,7 @@ surface.
 ## Manifest And Dependency Identity
 
 Introduce a new manifest schema version or a versioned extension section. Do
-not append fields silently to the positional `PetalManifestV0` codec.
+not append fields silently to the positional `PetalManifest` codec.
 
 Add declared uses:
 

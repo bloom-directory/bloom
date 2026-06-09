@@ -54,7 +54,7 @@ use bloom_objects::{
     AccessMode, OWNER_KIND_ADDRESS, OWNER_KIND_IMMUTABLE, OWNER_KIND_OBJECT, OWNER_KIND_SHARED,
     Object, ObjectId, Owner, TypeTag,
 };
-use bloom_petal_manifest::{ManifestResolver, extract_petal_manifest_v0, types::PetalManifestV0};
+use bloom_petal_manifest::{ManifestResolver, extract_petal_manifest, types::PetalManifest};
 use bloom_script::{
     BorrowRow, CORE_FUNGIBLE_PATH,
     executor::LogEntry as PtbLogEntry,
@@ -104,8 +104,8 @@ pub struct ChainCtx {
 pub struct ChainStoreData {
     pub chain_ctx: ChainCtx,
     pub petal_hash: Hash32,
-    pub manifest: Option<PetalManifestV0>,
-    pub external_manifests: Vec<(Hash32, PetalManifestV0)>,
+    pub manifest: Option<PetalManifest>,
+    pub external_manifests: Vec<(Hash32, PetalManifest)>,
     /// Per-PTB host context (spec §16.2 borrow table, signers, logs,
     /// host-created object state, ...) shared between the wasm host imports
     /// installed by `link_new_host_imports` and the surrounding `PtbExecutor`.
@@ -127,7 +127,7 @@ pub enum ChainEntry {
 
 pub struct ChainCallInput {
     pub wasm: Vec<u8>,
-    pub external_manifests: Vec<(Hash32, PetalManifestV0)>,
+    pub external_manifests: Vec<(Hash32, PetalManifest)>,
     pub entry: ChainEntry,
     pub contract_address: Address,
     pub msg_sender: Address,
@@ -329,7 +329,7 @@ pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
             _ => {}
         }
     }
-    if let Some(manifest) = extract_petal_manifest_v0(bytes) {
+    if let Some(manifest) = extract_petal_manifest(bytes) {
         validate_view_functions_are_pure(bytes, &manifest)?;
         validate_invariant_attachments(&manifest)?;
         validate_object_field_layouts(&manifest)?;
@@ -454,7 +454,7 @@ pub fn validate_chain_wasm(bytes: &[u8]) -> Result<(), PetalError> {
     Ok(())
 }
 
-fn validate_object_field_layouts(manifest: &PetalManifestV0) -> Result<(), PetalError> {
+fn validate_object_field_layouts(manifest: &PetalManifest) -> Result<(), PetalError> {
     for obj in &manifest.object_types {
         let mut names = HashSet::new();
         let mut next_offset = Some(0u32);
@@ -505,7 +505,7 @@ fn validate_object_field_layouts(manifest: &PetalManifestV0) -> Result<(), Petal
 /// projection exactly once. The runtime stub projects only attached
 /// invariants, so a top-level declaration that is unattached or referenced by
 /// an invalid index would otherwise pass admission and then never fire.
-fn validate_invariant_attachments(manifest: &PetalManifestV0) -> Result<(), PetalError> {
+fn validate_invariant_attachments(manifest: &PetalManifest) -> Result<(), PetalError> {
     let mut counts = vec![0usize; manifest.invariants.len()];
     for function in &manifest.functions {
         for idx in &function.attached_invariants {
@@ -605,7 +605,7 @@ fn validate_invariant_arithmetic_metadata(
 /// v1 scope is an empty field table, so *any* field reference is rejected.
 fn validate_invariant_field_refs(
     inv: &bloom_petal_manifest::types::InvariantDecl,
-    manifest: &PetalManifestV0,
+    manifest: &PetalManifest,
 ) -> Result<(), PetalError> {
     use bloom_petal_manifest::types::InvariantTarget;
     let refs = bloom_petal_manifest::collect_field_refs(&inv.predicate);
@@ -762,7 +762,7 @@ struct StaticCallGraph {
 
 fn validate_view_functions_are_pure(
     bytes: &[u8],
-    manifest: &PetalManifestV0,
+    manifest: &PetalManifest,
 ) -> Result<(), PetalError> {
     let graph = parse_static_call_graph(bytes)?;
     for f in manifest.functions.iter().filter(|f| f.view) {
@@ -2053,9 +2053,9 @@ fn validate_object_payload(
 }
 
 fn validate_object_payload_bytes(
-    manifest: &PetalManifestV0,
+    manifest: &PetalManifest,
     self_hash: [u8; 32],
-    external_manifests: &[(Hash32, PetalManifestV0)],
+    external_manifests: &[(Hash32, PetalManifest)],
     tag: &TypeTag,
     payload: &[u8],
 ) -> Result<(), bloom_value::ValueCodecError> {
@@ -2063,7 +2063,7 @@ fn validate_object_payload_bytes(
         max_value_bytes: payload.len(),
         ..CodecLimits::default()
     };
-    let external_manifest_refs: Vec<([u8; 32], &PetalManifestV0)> = external_manifests
+    let external_manifest_refs: Vec<([u8; 32], &PetalManifest)> = external_manifests
         .iter()
         .map(|(hash, manifest)| (hash.0, manifest))
         .collect();
@@ -2199,7 +2199,7 @@ fn dispatch_chain_call_sync(
 
     let petal_hash = blake3_tagged(tags::PETAL, &input.wasm);
 
-    let manifest = extract_petal_manifest_v0(&input.wasm);
+    let manifest = extract_petal_manifest(&input.wasm);
 
     let chain_ctx = ChainCtx {
         snapshot: input.snapshot,
@@ -2438,7 +2438,7 @@ mod ptb_host_import_tests {
     use bloom_petal_manifest::codec;
     use bloom_petal_manifest::types::{
         ArithExpr, BoundedArithOp, CmpOp, DataTypeDecl, ExternalTypeRef, FieldDecl, FunctionDecl,
-        InvariantDecl, InvariantTarget, ObjectTypeDecl, OverflowPolicy, PetalManifestV0,
+        InvariantDecl, InvariantTarget, ObjectTypeDecl, OverflowPolicy, PetalManifest,
         PredicateAst, SCHEMA_VERSION, SemVer, TypeParamDecl, TypeParamKind, Widening,
     };
     use bloom_script::host_ctx::PtbHostCtx;
@@ -2460,10 +2460,10 @@ mod ptb_host_import_tests {
         }
     }
 
-    fn append_manifest(mut wasm: Vec<u8>, manifest: PetalManifestV0) -> Vec<u8> {
+    fn append_manifest(mut wasm: Vec<u8>, manifest: PetalManifest) -> Vec<u8> {
         let bytes = codec::encode(&manifest).expect("manifest encodes");
         let mut custom = Vec::new();
-        let name = "bloom_petal_manifest_v0";
+        let name = "bloom_petal_manifest";
         leb128(&mut custom, name.len() as u64);
         custom.extend_from_slice(name.as_bytes());
         custom.extend_from_slice(&bytes);
@@ -2481,8 +2481,8 @@ mod ptb_host_import_tests {
         }
     }
 
-    fn object_manifest(type_name: &str, fields: Vec<(&str, TypeTag)>) -> PetalManifestV0 {
-        PetalManifestV0 {
+    fn object_manifest(type_name: &str, fields: Vec<(&str, TypeTag)>) -> PetalManifest {
+        PetalManifest {
             schema_version: SCHEMA_VERSION,
             module_path: "/bloom/petals/test/object".to_string(),
             framework_version: SemVer::new(0, 1, 0),
@@ -2507,7 +2507,7 @@ mod ptb_host_import_tests {
         }
     }
 
-    fn generic_object_manifest(type_name: &str, fields: Vec<(&str, TypeTag)>) -> PetalManifestV0 {
+    fn generic_object_manifest(type_name: &str, fields: Vec<(&str, TypeTag)>) -> PetalManifest {
         let mut manifest = object_manifest(type_name, fields);
         manifest.object_types[0].type_params.push(TypeParamDecl {
             name: "T".to_string(),
@@ -2519,7 +2519,7 @@ mod ptb_host_import_tests {
 
     #[test]
     fn invariant_field_refs_reject_bool_numeric_domain() {
-        let manifest = PetalManifestV0 {
+        let manifest = PetalManifest {
             schema_version: SCHEMA_VERSION,
             module_path: "/bloom/petals/test/object".to_string(),
             framework_version: SemVer::new(0, 1, 0),
@@ -2570,7 +2570,7 @@ mod ptb_host_import_tests {
 
     #[test]
     fn admission_rejects_tampered_object_invariant_field_offset() {
-        let manifest = PetalManifestV0 {
+        let manifest = PetalManifest {
             schema_version: SCHEMA_VERSION,
             module_path: "/bloom/petals/test/object".to_string(),
             framework_version: SemVer::new(0, 1, 0),
@@ -2616,7 +2616,7 @@ mod ptb_host_import_tests {
 
     #[test]
     fn admission_rejects_duplicate_object_field_names() {
-        let manifest = PetalManifestV0 {
+        let manifest = PetalManifest {
             schema_version: SCHEMA_VERSION,
             module_path: "/bloom/petals/test/object".to_string(),
             framework_version: SemVer::new(0, 1, 0),
@@ -2712,7 +2712,7 @@ mod ptb_host_import_tests {
             },
             rhs: ArithExpr::Field("before.k".to_string()),
         };
-        let manifest = PetalManifestV0 {
+        let manifest = PetalManifest {
             schema_version: SCHEMA_VERSION,
             module_path: "/bloom/petals/test/object".to_string(),
             framework_version: SemVer::new(0, 1, 0),
@@ -2759,7 +2759,7 @@ mod ptb_host_import_tests {
             wasm_export: "__inv_0".to_string(),
             human_text: String::new(),
         };
-        let unattached = PetalManifestV0 {
+        let unattached = PetalManifest {
             schema_version: SCHEMA_VERSION,
             module_path: "/bloom/petals/test/object".to_string(),
             framework_version: SemVer::new(0, 1, 0),
@@ -2777,7 +2777,7 @@ mod ptb_host_import_tests {
             "unexpected error: {err}"
         );
 
-        let out_of_range = PetalManifestV0 {
+        let out_of_range = PetalManifest {
             schema_version: SCHEMA_VERSION,
             module_path: "/bloom/petals/test/object".to_string(),
             framework_version: SemVer::new(0, 1, 0),
@@ -2810,7 +2810,7 @@ mod ptb_host_import_tests {
             },
             rhs: ArithExpr::Field("before.count".to_string()),
         };
-        let manifest = PetalManifestV0 {
+        let manifest = PetalManifest {
             schema_version: SCHEMA_VERSION,
             module_path: "/bloom/petals/test/object".to_string(),
             framework_version: SemVer::new(0, 1, 0),
@@ -2861,7 +2861,7 @@ mod ptb_host_import_tests {
             declared_type_name: "Foreign".to_string(),
             declared_content_hash: Some(foreign_hash.0),
         });
-        let foreign_manifest = PetalManifestV0 {
+        let foreign_manifest = PetalManifest {
             schema_version: SCHEMA_VERSION,
             module_path: "/foreign".to_string(),
             framework_version: SemVer::new(0, 1, 0),
@@ -3057,7 +3057,7 @@ mod ptb_host_import_tests {
         );
         let wasm = append_manifest(
             wasm,
-            PetalManifestV0 {
+            PetalManifest {
                 schema_version: SCHEMA_VERSION,
                 module_path: "/bloom/petals/test/view-log".to_string(),
                 framework_version: SemVer::new(0, 1, 0),

@@ -71,7 +71,7 @@ pub enum ChainCmd {
     },
     /// Deploy a Bloom-native petal wasm module.
     Deploy {
-        /// Path to a `.wasm` file carrying a bloom_petal_manifest_v0 section.
+        /// Path to a `.wasm` file carrying a bloom_petal_manifest section.
         #[arg(value_name = "WASM")]
         wasm: PathBuf,
         /// Poll for the tx receipt after submitting and print it.

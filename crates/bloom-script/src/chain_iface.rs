@@ -8,12 +8,12 @@
 //!
 //! ## Manifest stubs
 //!
-//! The full `PetalManifestV0` (spec §8.2) lives in
+//! The full `PetalManifest` (spec §8.2) lives in
 //! `bloom-resource-macros` once that crate lands; the chain reads it
 //! out of the wasm custom section. For Phase 1 we model only the
 //! pieces the validator's type-check needs, in the form of
 //! [`PetalManifestStub`] + friends. The producer-side macros will emit
-//! `From<PetalManifestV0>` for the stub when the macro crate is wired
+//! `From<PetalManifest>` for the stub when the macro crate is wired
 //! in, so chain code does not need a second copy of the full schema.
 
 use bloom_chain_types::Hash32;
@@ -26,7 +26,7 @@ use crate::predicate::PredicateAstStub;
 // ---------------------------------------------------------------------------
 
 /// Minimal manifest projection the PTB validator consults at typecheck
-/// time. Mirrors the relevant subset of `PetalManifestV0` (spec §8.2).
+/// time. Mirrors the relevant subset of `PetalManifest` (spec §8.2).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct PetalManifestStub {
     /// VFS path the petal is published at (mirrors the macro-emitted

@@ -483,7 +483,7 @@ Pruning is only as neutral as the evidence it adjudicates. A challenge or audit 
 ```
 ReplayWitness := {
   petal_hash,                 // exact deployed wasm artifact
-  manifest_hash,              // canonical PetalManifestV0
+  manifest_hash,              // canonical PetalManifest
   petal_version, inv_version, // version pinning (see §2)
   assertion_id,               // which InvariantDecl
   assertion_text_hash,        // ties to human_text (see §2)
@@ -809,7 +809,7 @@ For the implementing agent. All paths relative to `bloom/`.
 | `PredicateAst` enum (FieldGe/Le/Eq, StrategyKNonDecreasing, AllPoolsKNonDecreasing, Opaque) | `crates/bloom-petal-manifest/src/types.rs:203` |
 | `InvariantDecl { name, target, predicate, wasm_export }` | `…/types.rs:173` |
 | `InvariantTarget` {ObjectType, FunctionExit} | `…/types.rs:186` |
-| `PetalManifestV0.invariants`; `FunctionDecl.attached_invariants` | `…/types.rs:36`, `…:141` |
+| `PetalManifest.invariants`; `FunctionDecl.attached_invariants` | `…/types.rs:36`, `…:141` |
 | Closure → AST best-effort lowering (`predicate_ast_of`, `build_decl`, `expand`) | `crates/bloom-resource-macros/src/invariant.rs:104,128,198` |
 | `emit_invariant_shim` — the `__inv_<idx>(scope_ptr,scope_len)->i32` **`return 1` stub** | `crates/bloom-resource-macros/src/codegen.rs:787` |
 | `CHAIN_ALLOWED_IMPORT_MODULES` = [chain, object, cap, signer, ptb, log] | `crates/bloom-petals/src/chain_vm.rs:197` |

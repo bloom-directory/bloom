@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use bloom_chain_types::Hash32;
 use bloom_objects::{Object, ObjectId, Owner, TypeTag};
 use bloom_petal_manifest::ManifestResolver;
-use bloom_petal_manifest::extract_petal_manifest_v0;
-use bloom_petal_manifest::types::{ObjectTypeDecl, PetalManifestV0};
+use bloom_petal_manifest::extract_petal_manifest;
+use bloom_petal_manifest::types::{ObjectTypeDecl, PetalManifest};
 use bloom_script::{ChainStateIface, PetalManifestStub};
 use bloom_value::{CodecLimits, decode_json};
 use serde_json::{Value, json};
@@ -63,15 +63,15 @@ impl PetalsEndpointHandler {
         self.chain.load_manifest(&binding.hash)
     }
 
-    fn full_manifest_for(&self, binding: &Binding) -> Option<PetalManifestV0> {
+    fn full_manifest_for(&self, binding: &Binding) -> Option<PetalManifest> {
         let wasm = self.chain.load_petal(&binding.hash)?;
-        extract_petal_manifest_v0(&wasm)
+        extract_petal_manifest(&wasm)
     }
 
     fn external_full_manifests_for(
         &self,
-        manifest: &PetalManifestV0,
-    ) -> Vec<(Hash32, PetalManifestV0)> {
+        manifest: &PetalManifest,
+    ) -> Vec<(Hash32, PetalManifest)> {
         let mut manifests = Vec::new();
         let mut visited = BTreeSet::new();
         self.collect_external_full_manifests(manifest, &mut manifests, &mut visited);
@@ -80,8 +80,8 @@ impl PetalsEndpointHandler {
 
     fn collect_external_full_manifests(
         &self,
-        manifest: &PetalManifestV0,
-        out: &mut Vec<(Hash32, PetalManifestV0)>,
+        manifest: &PetalManifest,
+        out: &mut Vec<(Hash32, PetalManifest)>,
         visited: &mut BTreeSet<[u8; 32]>,
     ) {
         for external in &manifest.external_type_refs {
@@ -95,7 +95,7 @@ impl PetalsEndpointHandler {
             let Some(wasm) = self.chain.load_petal(&hash) else {
                 continue;
             };
-            let Some(external_manifest) = extract_petal_manifest_v0(&wasm) else {
+            let Some(external_manifest) = extract_petal_manifest(&wasm) else {
                 continue;
             };
             self.collect_external_full_manifests(&external_manifest, out, visited);
@@ -596,7 +596,7 @@ fn object_matches(object: &Object, petal_hash: Hash32, type_name: &str) -> bool 
     )
 }
 
-fn object_type_decl<'a>(manifest: &'a PetalManifestV0, name: &str) -> Option<&'a ObjectTypeDecl> {
+fn object_type_decl<'a>(manifest: &'a PetalManifest, name: &str) -> Option<&'a ObjectTypeDecl> {
     if !is_endpoint_segment(name) {
         return None;
     }
@@ -610,10 +610,10 @@ fn decode_object_fields(
     petal_hash: Hash32,
     object: &Object,
     _object_type: &ObjectTypeDecl,
-    manifest: &PetalManifestV0,
-    external_manifests: &[(Hash32, PetalManifestV0)],
+    manifest: &PetalManifest,
+    external_manifests: &[(Hash32, PetalManifest)],
 ) -> Result<BTreeMap<String, Value>, HandlerError> {
-    let external_manifest_refs: Vec<([u8; 32], &PetalManifestV0)> = external_manifests
+    let external_manifest_refs: Vec<([u8; 32], &PetalManifest)> = external_manifests
         .iter()
         .map(|(hash, manifest)| (hash.0, manifest))
         .collect();
@@ -756,7 +756,7 @@ mod tests {
 
     use bloom_objects::{AbilitySet, BUILTIN_TYPE_HASH, Object, ObjectId};
     use bloom_petal_manifest::types::{
-        DataTypeDecl, ExternalTypeRef, FieldDecl, ObjectTypeDecl, PetalManifestV0, TypeParamDecl,
+        DataTypeDecl, ExternalTypeRef, FieldDecl, ObjectTypeDecl, PetalManifest, TypeParamDecl,
         TypeParamKind,
     };
     use bloom_script::FunctionDeclStub;
@@ -775,7 +775,7 @@ mod tests {
             self.manifests.lock().unwrap().insert(hash, manifest);
         }
 
-        fn bind_full(&self, path: &str, hash: Hash32, manifest: PetalManifestV0) {
+        fn bind_full(&self, path: &str, hash: Hash32, manifest: PetalManifest) {
             self.bindings.lock().unwrap().push((path.to_string(), hash));
             self.manifests.lock().unwrap().insert(
                 hash,
@@ -785,7 +785,7 @@ mod tests {
             self.code
                 .lock()
                 .unwrap()
-                .insert(hash, wasm_with_custom("bloom_petal_manifest_v0", &bytes));
+                .insert(hash, wasm_with_custom("bloom_petal_manifest", &bytes));
         }
 
         fn put_object(&self, object: Object) {
@@ -849,8 +849,8 @@ mod tests {
         }
     }
 
-    fn full_manifest(path: &str, object_types: Vec<ObjectTypeDecl>) -> PetalManifestV0 {
-        PetalManifestV0 {
+    fn full_manifest(path: &str, object_types: Vec<ObjectTypeDecl>) -> PetalManifest {
+        PetalManifest {
             module_path: path.to_string(),
             object_types,
             ..Default::default()
@@ -1373,7 +1373,7 @@ mod tests {
             declared_type_name: "Foreign".to_string(),
             declared_content_hash: Some(foreign_hash.0),
         });
-        let foreign_manifest = PetalManifestV0 {
+        let foreign_manifest = PetalManifest {
             module_path: "/bloom/petals/foreign".to_string(),
             data_types: vec![DataTypeDecl {
                 name: "Foreign".to_string(),
@@ -1416,7 +1416,7 @@ mod tests {
             declared_type_name: "Middle".to_string(),
             declared_content_hash: Some(middle_hash.0),
         });
-        let mut middle_manifest = PetalManifestV0 {
+        let mut middle_manifest = PetalManifest {
             module_path: "/bloom/petals/middle".to_string(),
             data_types: vec![DataTypeDecl {
                 name: "Middle".to_string(),
@@ -1436,7 +1436,7 @@ mod tests {
             declared_type_name: "Leaf".to_string(),
             declared_content_hash: Some(leaf_hash.0),
         });
-        let leaf_manifest = PetalManifestV0 {
+        let leaf_manifest = PetalManifest {
             module_path: "/bloom/petals/leaf".to_string(),
             data_types: vec![DataTypeDecl {
                 name: "Leaf".to_string(),
@@ -1525,7 +1525,7 @@ mod tests {
             declared_type_name: "Foreign".to_string(),
             declared_content_hash: Some(foreign_hash.0),
         });
-        let foreign_manifest = PetalManifestV0 {
+        let foreign_manifest = PetalManifest {
             module_path: "/bloom/petals/foreign".to_string(),
             data_types: vec![DataTypeDecl {
                 name: "Foreign".to_string(),

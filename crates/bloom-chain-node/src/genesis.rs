@@ -40,7 +40,7 @@ use bloom_chain_types::types::{Address, Hash32, PubKeyBytes};
 use bloom_keystore::xdsa::XDSA_PK_LEN;
 use bloom_objects::{OWNER_KIND_ADDRESS, Object, ObjectId, Owner, OwnershipIndexKey, TypeTag};
 use bloom_petal_fungible::ops::coin_payload;
-use bloom_petal_manifest::extract_petal_manifest_v0;
+use bloom_petal_manifest::extract_petal_manifest;
 use bloom_script::{CORE_FUNGIBLE_PATH, loom_coin_type_tag};
 use serde::{Deserialize, Serialize};
 
@@ -216,9 +216,9 @@ impl Genesis {
             }
             validate_chain_petal_admission(&wasm, &petal.path)
                 .map_err(|e| NodeError::Genesis(format!("petal {}: {e}", petal.path)))?;
-            let manifest = extract_petal_manifest_v0(&wasm).ok_or_else(|| {
+            let manifest = extract_petal_manifest(&wasm).ok_or_else(|| {
                 NodeError::Genesis(format!(
-                    "petal {}: missing bloom_petal_manifest_v0",
+                    "petal {}: missing bloom_petal_manifest",
                     petal.path
                 ))
             })?;
@@ -604,7 +604,7 @@ mod tests {
 
     fn genesis_petal_wasm(path: &str) -> Vec<u8> {
         let manifest =
-            bloom_petal_manifest::codec::encode(&bloom_petal_manifest::types::PetalManifestV0 {
+            bloom_petal_manifest::codec::encode(&bloom_petal_manifest::types::PetalManifest {
                 schema_version: bloom_petal_manifest::types::SCHEMA_VERSION,
                 module_path: path.to_string(),
                 framework_version: bloom_petal_manifest::types::SemVer::new(0, 1, 0),
@@ -614,14 +614,14 @@ mod tests {
         let mut wasm = Vec::new();
         wasm.extend_from_slice(b"\0asm");
         wasm.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
-        let custom = custom_section("bloom_petal_manifest_v0", &manifest);
+        let custom = custom_section("bloom_petal_manifest", &manifest);
         section(&mut wasm, 0, &custom);
         wasm
     }
 
     fn genesis_petal_wasm_with_function(path: &str, function: &str) -> Vec<u8> {
         let manifest =
-            bloom_petal_manifest::codec::encode(&bloom_petal_manifest::types::PetalManifestV0 {
+            bloom_petal_manifest::codec::encode(&bloom_petal_manifest::types::PetalManifest {
                 schema_version: bloom_petal_manifest::types::SCHEMA_VERSION,
                 module_path: path.to_string(),
                 framework_version: bloom_petal_manifest::types::SemVer::new(0, 1, 0),
@@ -649,7 +649,7 @@ mod tests {
         section(&mut wasm, 7, &exports);
         // one body: no locals; i32.const 0; end
         section(&mut wasm, 10, &[0x01, 0x04, 0x00, 0x41, 0x00, 0x0b]);
-        let custom = custom_section("bloom_petal_manifest_v0", &manifest);
+        let custom = custom_section("bloom_petal_manifest", &manifest);
         section(&mut wasm, 0, &custom);
         wasm
     }

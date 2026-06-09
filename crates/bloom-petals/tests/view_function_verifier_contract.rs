@@ -1,12 +1,12 @@
 use bloom_petal_manifest::{
     codec,
-    types::{FunctionDecl, MANIFEST_CUSTOM_SECTION, PetalManifestV0},
+    types::{FunctionDecl, MANIFEST_CUSTOM_SECTION, PetalManifest},
 };
 use bloom_petals::chain_vm::validate_chain_wasm;
 
 fn wasm_with_manifest(wat_src: &str, functions: Vec<FunctionDecl>) -> Vec<u8> {
     let mut wasm = wat::parse_str(wat_src).expect("wat parses");
-    let manifest = PetalManifestV0 {
+    let manifest = PetalManifest {
         module_path: "/bloom/test/view".to_string(),
         functions,
         ..Default::default()
@@ -240,7 +240,7 @@ fn wasm_with_invariant(predicate: bloom_petal_manifest::types::PredicateAst) -> 
         offset: Some(0),
         width: Some(32),
     };
-    let manifest = PetalManifestV0 {
+    let manifest = PetalManifest {
         module_path: "/bloom/test/inv".to_string(),
         functions: vec![FunctionDecl {
             name: "touch".to_string(),
@@ -371,7 +371,7 @@ fn function_exit_invariant_referencing_fields_is_rejected() {
     // A function-exit invariant gets an empty field table in v1, so any
     // field reference can't be enforced — reject at deploy (B2).
     let mut wasm = wat::parse_str("(module)").expect("wat parses");
-    let manifest = PetalManifestV0 {
+    let manifest = PetalManifest {
         module_path: "/bloom/test/inv".to_string(),
         functions: vec![FunctionDecl {
             name: "swap".to_string(),
@@ -526,7 +526,7 @@ fn semantically_always_false_predicate_rejected_at_deploy() {
         codec,
         types::{
             ArithExpr, CmpOp, FieldDecl, InvariantDecl, InvariantTarget, MANIFEST_CUSTOM_SECTION,
-            ObjectTypeDecl, PetalManifestV0, PredicateAst,
+            ObjectTypeDecl, PetalManifest, PredicateAst,
         },
     };
     // `after.x >= 256` on a u8 field (width=1, domain 0..255) — always
@@ -537,7 +537,7 @@ fn semantically_always_false_predicate_rejected_at_deploy() {
         rhs: ArithExpr::Literal(256),
     };
     let mut wasm = wat::parse_str("(module)").expect("wat parses");
-    let manifest = PetalManifestV0 {
+    let manifest = PetalManifest {
         module_path: "/bloom/test/inv".to_string(),
         functions: vec![FunctionDecl {
             name: "touch".to_string(),

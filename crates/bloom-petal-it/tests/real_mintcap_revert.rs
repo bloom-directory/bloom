@@ -8,7 +8,7 @@
 //! 1. Load the **real** macro-emitted manifest bytes from
 //!    `bloom_petal_fungible::fungible::__bloom_manifest_bytes()` and
 //!    install them on a synthetic WAT wasm via the
-//!    `bloom_petal_manifest_v0` custom section — i.e. the exact same
+//!    `bloom_petal_manifest` custom section — i.e. the exact same
 //!    manifest the production node decodes via `PtbChainAdapter::new`
 //!    from each petal's wasm.
 //!
@@ -68,7 +68,7 @@ fn seed_epoch_zero_cap(state: &mut State, id: ObjectId, owner: bloom_chain_types
 }
 
 /// Tiny WAT petal exporting `__petal_mint_genesis` as a noop. The
-/// `bloom_petal_manifest_v0` custom section appended by
+/// `bloom_petal_manifest` custom section appended by
 /// `wrap_with_real_manifest` carries the real macro-emitted manifest
 /// for `/bloom/petals/core/fungible`, so the validator sees the exact
 /// declared arg types for `mint_genesis`.

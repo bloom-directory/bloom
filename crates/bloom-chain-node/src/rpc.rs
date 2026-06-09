@@ -41,7 +41,7 @@ use bloom_chain_types::{
     types::{Address, Hash32},
 };
 use bloom_objects::{AccessMode, Object, ObjectId, TypeTag};
-use bloom_petal_manifest::{extract_petal_manifest_v0, to_petal_manifest_stub};
+use bloom_petal_manifest::{extract_petal_manifest, to_petal_manifest_stub};
 use bloom_script::{
     ArgDeclStub, CORE_FUNGIBLE_PATH, ChainStateIface, PetalManifestStub,
     decode_json_const_with_manifest_loader, decode_json_type_tag,
@@ -1522,7 +1522,7 @@ impl ChainStateIface for RpcChainAdapter {
 
     fn load_manifest(&self, hash: &Hash32) -> Option<PetalManifestStub> {
         let wasm = self.load_petal(hash)?;
-        let manifest = extract_petal_manifest_v0(&wasm)?;
+        let manifest = extract_petal_manifest(&wasm)?;
         Some(to_petal_manifest_stub(&manifest))
     }
 
@@ -1693,7 +1693,7 @@ mod tests {
     use bloom_chain_types::vote::Commit;
     use bloom_objects::{Object, ObjectId, Owner, TypeTag};
     use bloom_petal_manifest::codec;
-    use bloom_petal_manifest::types::{FunctionDecl, PetalManifestV0, SCHEMA_VERSION, SemVer};
+    use bloom_petal_manifest::types::{FunctionDecl, PetalManifest, SCHEMA_VERSION, SemVer};
     use bloom_script::DEFAULT_FUNGIBLE_PETAL_HASH;
     use bloom_test_util::{make_validator_set_signed, make_validator_with_keypair};
 
@@ -1809,9 +1809,9 @@ mod tests {
         out.extend_from_slice(body);
     }
 
-    fn append_manifest(mut wasm: Vec<u8>, manifest: PetalManifestV0) -> Vec<u8> {
+    fn append_manifest(mut wasm: Vec<u8>, manifest: PetalManifest) -> Vec<u8> {
         let bytes = codec::encode(&manifest).expect("manifest encodes");
-        let custom = custom_section("bloom_petal_manifest_v0", &bytes);
+        let custom = custom_section("bloom_petal_manifest", &bytes);
         section(&mut wasm, 0, &custom);
         wasm
     }
@@ -1824,8 +1824,8 @@ mod tests {
         }
     }
 
-    fn view_manifest(path: &str, functions: Vec<FunctionDecl>) -> PetalManifestV0 {
-        PetalManifestV0 {
+    fn view_manifest(path: &str, functions: Vec<FunctionDecl>) -> PetalManifest {
+        PetalManifest {
             schema_version: SCHEMA_VERSION,
             module_path: path.to_string(),
             framework_version: SemVer::new(0, 1, 0),

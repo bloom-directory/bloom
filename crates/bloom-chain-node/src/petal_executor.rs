@@ -24,7 +24,7 @@ use bloom_objects::{
     WasmValType,
 };
 use bloom_petal_fungible::ops::{coin_payload, decode_coin_value, rewrite_value};
-use bloom_petal_manifest::extract_petal_manifest_v0;
+use bloom_petal_manifest::extract_petal_manifest;
 use bloom_petals::{BlockCtx as PetalBlockCtx, PetalVm};
 use bloom_script::{
     AlwaysOkVerifier, CORE_FUNGIBLE_PATH, PetalManifestStub, PtbError, SignatureVerifier,
@@ -49,7 +49,7 @@ use crate::sig_verifier::XdsaPtbVerifier;
 ///
 /// PTB-mode `Command::Move` dispatch is **chain-authoritative**: the
 /// validator's typecheck pulls each referenced petal's manifest by
-/// decoding the `bloom_petal_manifest_v0` wasm custom section (spec
+/// decoding the `bloom_petal_manifest` wasm custom section (spec
 /// §8.1, §11.1) on demand via [`PtbChainAdapter::new`]. No external
 /// manifest registry is required.
 pub struct ChainPetalExecutor;
@@ -185,8 +185,8 @@ pub(crate) fn validate_chain_petal_admission(
         ));
     }
     validate_chain_petal_module_path(module_path)?;
-    let manifest = extract_petal_manifest_v0(wasm_bytes)
-        .ok_or_else(|| "missing bloom_petal_manifest_v0".to_string())?;
+    let manifest = extract_petal_manifest(wasm_bytes)
+        .ok_or_else(|| "missing bloom_petal_manifest".to_string())?;
     if manifest.module_path != module_path {
         return Err(format!(
             "manifest module_path '{}' does not match command path '{}'",
@@ -260,7 +260,7 @@ fn validate_chain_petal_function_segment(function: &str) -> Result<(), String> {
 
 fn validate_chain_petal_vfs_collisions(
     state: &State,
-    manifest: &bloom_petal_manifest::types::PetalManifestV0,
+    manifest: &bloom_petal_manifest::types::PetalManifest,
 ) -> Result<(), String> {
     let new_rel = petal_path_segments(&manifest.module_path)?;
     for (existing_path, existing_hash) in state.iter_vfs() {
@@ -275,7 +275,7 @@ fn validate_chain_petal_vfs_collisions(
             && let Some(child_segment) = new_rel.get(existing_rel.len())
             && let Some(existing_manifest) = state
                 .get_code(existing_hash)
-                .and_then(extract_petal_manifest_v0)
+                .and_then(extract_petal_manifest)
             && existing_manifest
                 .functions
                 .iter()
@@ -302,8 +302,8 @@ fn validate_chain_petal_vfs_collisions(
 
 pub(crate) fn validate_chain_petal_vfs_collisions_with_pending(
     new_rel: &[String],
-    manifest: &bloom_petal_manifest::types::PetalManifestV0,
-    pending: &[(String, bloom_petal_manifest::types::PetalManifestV0)],
+    manifest: &bloom_petal_manifest::types::PetalManifest,
+    pending: &[(String, bloom_petal_manifest::types::PetalManifest)],
 ) -> Result<(), String> {
     for (existing_path, existing_manifest) in pending {
         if existing_path == &manifest.module_path {
@@ -351,7 +351,7 @@ pub(crate) fn petal_path_segments(path: &str) -> Result<Vec<String>, String> {
 
 fn validate_manifest_wasm_abi(
     wasm_bytes: &[u8],
-    manifest: &bloom_petal_manifest::types::PetalManifestV0,
+    manifest: &bloom_petal_manifest::types::PetalManifest,
 ) -> Result<(), String> {
     use std::collections::HashMap;
     use wasmparser::{ExternalKind, Parser, Payload, TypeRef, ValType};
@@ -794,14 +794,13 @@ fn execute_tx_impl(
                     write_set: None,
                 };
             }
-            let manifest = match extract_petal_manifest_v0(wasm_bytes) {
+            let manifest = match extract_petal_manifest(wasm_bytes) {
                 Some(m) => m,
                 None => {
                     return ExecOutput {
                         success: false,
                         fuel_used,
-                        return_data: b"deploy petal failed: missing bloom_petal_manifest_v0"
-                            .to_vec(),
+                        return_data: b"deploy petal failed: missing bloom_petal_manifest".to_vec(),
                         logs: vec![],
                         invariant_outcomes: Vec::new(),
                         write_set: None,
@@ -1276,7 +1275,7 @@ fn execute_tx_impl(
                                 write_set: ws_out,
                             };
                         }
-                        let event_manifest = match extract_petal_manifest_v0(&event.wasm_bytes) {
+                        let event_manifest = match extract_petal_manifest(&event.wasm_bytes) {
                             Some(manifest) => manifest,
                             None => {
                                 drop(snapshot);
@@ -1318,8 +1317,9 @@ fn execute_tx_impl(
                                 return ExecOutput {
                                     success: false,
                                     fuel_used: revert_charged_fuel,
-                                    return_data: b"ptb publish admission error: missing bloom_petal_manifest_v0"
-                                        .to_vec(),
+                                    return_data:
+                                        b"ptb publish admission error: missing bloom_petal_manifest"
+                                            .to_vec(),
                                     logs: vec![],
                                     invariant_outcomes: invariant_records(&report),
                                     write_set: ws_out,
@@ -1848,7 +1848,7 @@ mod tests {
 
     #[test]
     fn pending_petal_publishes_reject_path_function_collisions() {
-        let parent = bloom_petal_manifest::types::PetalManifestV0 {
+        let parent = bloom_petal_manifest::types::PetalManifest {
             module_path: "/bloom/petals/dex".to_string(),
             functions: vec![bloom_petal_manifest::types::FunctionDecl {
                 name: "pool".to_string(),
@@ -1856,7 +1856,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let child = bloom_petal_manifest::types::PetalManifestV0 {
+        let child = bloom_petal_manifest::types::PetalManifest {
             module_path: "/bloom/petals/dex/pool".to_string(),
             ..Default::default()
         };
@@ -1873,11 +1873,11 @@ mod tests {
 
     #[test]
     fn pending_petal_publishes_reject_duplicate_paths() {
-        let first = bloom_petal_manifest::types::PetalManifestV0 {
+        let first = bloom_petal_manifest::types::PetalManifest {
             module_path: "/bloom/petals/dex/pool".to_string(),
             ..Default::default()
         };
-        let second = bloom_petal_manifest::types::PetalManifestV0 {
+        let second = bloom_petal_manifest::types::PetalManifest {
             module_path: "/bloom/petals/dex/pool".to_string(),
             ..Default::default()
         };

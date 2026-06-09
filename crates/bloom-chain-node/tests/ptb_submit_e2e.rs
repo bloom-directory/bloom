@@ -39,7 +39,7 @@ use bloom_petal_manifest::{
     codec,
     types::{
         ArgDecl, ArgKind, DataTypeDecl, FieldDecl, FunctionDecl, MANIFEST_CUSTOM_SECTION,
-        ObjectTypeDecl, PetalManifestV0, SCHEMA_VERSION, SemVer,
+        ObjectTypeDecl, PetalManifest, SCHEMA_VERSION, SemVer,
     },
 };
 use bloom_script::{
@@ -86,7 +86,7 @@ fn leb128(out: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-fn append_manifest(mut wasm: Vec<u8>, manifest: PetalManifestV0) -> Vec<u8> {
+fn append_manifest(mut wasm: Vec<u8>, manifest: PetalManifest) -> Vec<u8> {
     let bytes = codec::encode(&manifest).expect("manifest encodes");
     let mut custom = Vec::new();
     leb128(&mut custom, MANIFEST_CUSTOM_SECTION.len() as u64);
@@ -796,13 +796,13 @@ fn derive_create_id_test(ptb_digest: [u8; 32], type_tag: &TypeTag, payload: &[u8
     ObjectId::derive_for_type_tag(&Hash32(ptb_digest), 0, type_tag, payload)
 }
 
-fn create_and_transfer_manifest() -> PetalManifestV0 {
+fn create_and_transfer_manifest() -> PetalManifest {
     let input_type = TypeTag::Concrete {
         petal_hash: [0u8; 32],
         type_name: "CreateAndTransfer".to_string(),
         type_args: vec![],
     };
-    PetalManifestV0 {
+    PetalManifest {
         schema_version: SCHEMA_VERSION,
         module_path: "/test/e2e".to_string(),
         framework_version: SemVer::new(0, 1, 0),

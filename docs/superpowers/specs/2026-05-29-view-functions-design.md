@@ -52,7 +52,7 @@ The consensus core, state, and the PTB *executor* do not change semantically. We
 
 | Unit | Responsibility | Builds on |
 |---|---|---|
-| `view` flag on `FunctionDecl` (`bloom-petal-manifest`) | Per-function purity marker; bumps `SCHEMA_VERSION`, defaults `false`. The discovery/contract mechanism. | `PetalManifestV0.functions`, `codec` |
+| `view` flag on `FunctionDecl` (`bloom-petal-manifest`) | Per-function purity marker; bumps `SCHEMA_VERSION`, defaults `false`. The discovery/contract mechanism. | `PetalManifest.functions`, `codec` |
 | Call-graph view verifier (in `bloom-petals` chain-mode admission, alongside `CHAIN_ALLOWED_IMPORT_MODULES`) | At deploy, reject any `view`-marked function whose static call graph can reach a mutating host import, or that is not statically analyzable (`call_indirect`). | `chain_vm.rs` import/admission pass |
 | `ValidationMode { Commit, ReadOnly }` on `validate_ptb` (`bloom-script`) | `ReadOnly`: no gas-payer-Coin requirement; all object args coerced to `ReadOnly`; absent/zero signatures accepted. Makes read-only a first-class, tested property of the validator. | `validate_ptb`, `ValidationContext` |
 | `run_ptb(...)` shared helper (`bloom-chain-node`) | The extracted `validate → host_ctx → snapshot → ChainPetalRunner → PtbExecutor::with_ctx_arc → execute → drain` sequence, taking a state reference + validation mode, returning `ExecutionReport`. One execution core for both commit and view. | `PtbExecutor`, `ChainPetalRunner`, `PtbHostCtx` |

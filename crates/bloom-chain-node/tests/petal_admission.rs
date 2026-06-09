@@ -4,7 +4,7 @@ use bloom_chain_state::State;
 use bloom_chain_types::tx::{Tx, TxKind};
 use bloom_chain_types::types::{Address, Hash32, PubKeyBytes, SigBytes};
 use bloom_petal_manifest::codec;
-use bloom_petal_manifest::types::{FunctionDecl, PetalManifestV0, SCHEMA_VERSION, SemVer};
+use bloom_petal_manifest::types::{FunctionDecl, PetalManifest, SCHEMA_VERSION, SemVer};
 
 fn deploy_tx(wasm_bytes: Vec<u8>) -> Tx {
     Tx {
@@ -20,7 +20,7 @@ fn deploy_tx(wasm_bytes: Vec<u8>) -> Tx {
 }
 
 fn manifest(path: &str) -> Vec<u8> {
-    codec::encode(&PetalManifestV0 {
+    codec::encode(&PetalManifest {
         schema_version: SCHEMA_VERSION,
         module_path: path.to_string(),
         framework_version: SemVer::new(0, 1, 0),
@@ -30,7 +30,7 @@ fn manifest(path: &str) -> Vec<u8> {
 }
 
 fn manifest_with_function(path: &str, function: &str) -> Vec<u8> {
-    codec::encode(&PetalManifestV0 {
+    codec::encode(&PetalManifest {
         schema_version: SCHEMA_VERSION,
         module_path: path.to_string(),
         framework_version: SemVer::new(0, 1, 0),
@@ -86,7 +86,7 @@ fn wasm_with_disallowed_import_and_manifest(path: &str) -> Vec<u8> {
     imports.push(0x00);
     section(&mut wasm, 2, &imports);
 
-    let custom = custom_section("bloom_petal_manifest_v0", &manifest(path));
+    let custom = custom_section("bloom_petal_manifest", &manifest(path));
     section(&mut wasm, 0, &custom);
     wasm
 }
@@ -109,7 +109,7 @@ fn wasm_with_unknown_allowed_module_import_and_manifest(path: &str) -> Vec<u8> {
     imports.push(0x00);
     section(&mut wasm, 2, &imports);
 
-    let custom = custom_section("bloom_petal_manifest_v0", &manifest(path));
+    let custom = custom_section("bloom_petal_manifest", &manifest(path));
     section(&mut wasm, 0, &custom);
     wasm
 }
@@ -137,7 +137,7 @@ fn wasm_with_non_function_import_and_manifest(path: &str, import_kind: u8) -> Ve
     }
     section(&mut wasm, 2, &imports);
 
-    let custom = custom_section("bloom_petal_manifest_v0", &manifest(path));
+    let custom = custom_section("bloom_petal_manifest", &manifest(path));
     section(&mut wasm, 0, &custom);
     wasm
 }
@@ -146,7 +146,7 @@ fn wasm_with_manifest(path: &str) -> Vec<u8> {
     let mut wasm = Vec::new();
     wasm.extend_from_slice(b"\0asm");
     wasm.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
-    let custom = custom_section("bloom_petal_manifest_v0", &manifest(path));
+    let custom = custom_section("bloom_petal_manifest", &manifest(path));
     section(&mut wasm, 0, &custom);
     wasm
 }
@@ -156,7 +156,7 @@ fn wasm_with_function_manifest_missing_export(path: &str, function: &str) -> Vec
     wasm.extend_from_slice(b"\0asm");
     wasm.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
     let custom = custom_section(
-        "bloom_petal_manifest_v0",
+        "bloom_petal_manifest",
         &manifest_with_function(path, function),
     );
     section(&mut wasm, 0, &custom);
@@ -205,7 +205,7 @@ fn wasm_with_chain_return_import_and_function(path: &str, function: &str) -> Vec
     section(&mut wasm, 10, &[0x01, 0x04, 0x00, 0x41, 0x00, 0x0b]);
 
     let custom = custom_section(
-        "bloom_petal_manifest_v0",
+        "bloom_petal_manifest",
         &manifest_with_function(path, function),
     );
     section(&mut wasm, 0, &custom);

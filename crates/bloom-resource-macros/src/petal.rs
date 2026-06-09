@@ -14,8 +14,8 @@
 //!
 //! The macro orchestrates the inner `#[object]` / `#[capability]` /
 //! `#[invariant]` attributes: it walks the module body, recognises
-//! those attributes, builds a single [`PetalManifestV0`] from them, and
-//! emits one canonical-encoded blob (`bloom_petal_manifest_v0` custom
+//! those attributes, builds a single [`PetalManifest`] from them, and
+//! emits one canonical-encoded blob (`bloom_petal_manifest` custom
 //! section) plus one `__petal_<fn>` shim per `pub fn`.
 //!
 //! Because Rust's attribute-macro expansion order is bottom-up, the
@@ -44,7 +44,7 @@ use crate::invariant::InvariantAttr;
 use crate::object::ObjectAttr;
 use crate::type_tag::TypeTagCtx;
 use bloom_petal_manifest::types::{
-    ArgDecl, ArgKind, FunctionDecl, PetalManifestV0, SCHEMA_VERSION, SemVer, TypeParamDecl,
+    ArgDecl, ArgKind, FunctionDecl, PetalManifest, SCHEMA_VERSION, SemVer, TypeParamDecl,
     TypeParamKind,
 };
 
@@ -132,7 +132,7 @@ fn parse_semver(raw: &str, span: &impl syn::spanned::Spanned) -> syn::Result<Sem
 
 /// Walk a parsed module + accumulate every kind of declaration. Used
 /// in tests and from [`expand`].
-pub(crate) fn build_manifest(attr: &PetalAttr, module: &ItemMod) -> syn::Result<PetalManifestV0> {
+pub(crate) fn build_manifest(attr: &PetalAttr, module: &ItemMod) -> syn::Result<PetalManifest> {
     let (m, _) = build_manifest_with_asts(attr, module)?;
     Ok(m)
 }
@@ -143,8 +143,8 @@ pub(crate) fn build_manifest(attr: &PetalAttr, module: &ItemMod) -> syn::Result<
 pub(crate) fn build_manifest_with_asts(
     attr: &PetalAttr,
     module: &ItemMod,
-) -> syn::Result<(PetalManifestV0, Vec<PetalShimAst>)> {
-    let mut m = PetalManifestV0 {
+) -> syn::Result<(PetalManifest, Vec<PetalShimAst>)> {
+    let mut m = PetalManifest {
         schema_version: SCHEMA_VERSION,
         module_path: attr.resolved_path(module),
         framework_version: attr.resolved_version(),
@@ -225,7 +225,7 @@ fn collect_object_arg_type_names(items: &[Item]) -> HashSet<String> {
 
 /// Recognise a `#[capability]` or `#[object]` struct and push its decl
 /// into the manifest.
-fn handle_struct(s: &ItemStruct, m: &mut PetalManifestV0) -> syn::Result<()> {
+fn handle_struct(s: &ItemStruct, m: &mut PetalManifest) -> syn::Result<()> {
     let object_attr = find_attr(&s.attrs, "object");
     let capability_attr = find_attr(&s.attrs, "capability");
 
@@ -259,7 +259,7 @@ fn handle_struct(s: &ItemStruct, m: &mut PetalManifestV0) -> syn::Result<()> {
 }
 
 /// Recognise a plain `#[derive(BloomType)]` enum and push its decl.
-fn handle_enum(e: &ItemEnum, m: &mut PetalManifestV0) -> syn::Result<()> {
+fn handle_enum(e: &ItemEnum, m: &mut PetalManifest) -> syn::Result<()> {
     if crate::bloom_type::has_bloom_type_derive(&e.attrs) {
         m.enum_types.push(crate::bloom_type::build_enum_decl(e)?);
     }
@@ -273,7 +273,7 @@ fn handle_enum(e: &ItemEnum, m: &mut PetalManifestV0) -> syn::Result<()> {
 /// the function was skipped (non-`pub`).
 fn handle_fn(
     f: &ItemFn,
-    m: &mut PetalManifestV0,
+    m: &mut PetalManifest,
     bloom_value_types: &HashSet<String>,
     object_arg_types: &HashSet<String>,
 ) -> syn::Result<Option<PetalShimAst>> {
@@ -1065,7 +1065,7 @@ mod tests {
         .unwrap();
         let s = toks.to_string();
         assert!(s.contains("__BLOOM_PETAL_MANIFEST_BYTES"));
-        assert!(s.contains("bloom_petal_manifest_v0"));
+        assert!(s.contains("bloom_petal_manifest"));
         assert!(s.contains("__petal_noop"));
     }
 }

@@ -17,7 +17,7 @@
 //!
 //! 2. **On-chain wasm custom section** — the adapter pulls the wasm by
 //!    content hash via `state.get_code(...)`, walks it for the
-//!    `bloom_petal_manifest_v0` custom section (emitted by
+//!    `bloom_petal_manifest` custom section (emitted by
 //!    `#[bloom::petal]`, spec §8.1 / §11.1), decodes the bytes via the
 //!    canonical codec, and projects them down to the validator's
 //!    `PetalManifestStub` via
@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use bloom_chain_state::State;
 use bloom_chain_types::Hash32;
 use bloom_objects::{Object, ObjectId};
-use bloom_petal_manifest::{extract_petal_manifest_v0, to_petal_manifest_stub};
+use bloom_petal_manifest::{extract_petal_manifest, to_petal_manifest_stub};
 use bloom_script::{ChainStateIface, PetalManifestStub};
 
 /// Adapter wrapping a borrowed [`State`] for PTB validation / execution.
@@ -63,7 +63,7 @@ pub struct PtbChainAdapter<'a> {
     overrides: Option<&'a HashMap<Hash32, PetalManifestStub>>,
     /// Per-adapter cache of stubs decoded from wasm custom sections.
     /// Keyed by petal content hash. `None` means "we tried and it
-    /// wasn't a v0 manifest"; absence means "we haven't tried yet".
+    /// wasn't a manifest"; absence means "we haven't tried yet".
     manifest_cache: RefCell<HashMap<Hash32, Option<PetalManifestStub>>>,
 }
 
@@ -137,7 +137,7 @@ impl ChainStateIface for PtbChainAdapter<'_> {
         }
 
         let stub = self.state.get_code(hash).and_then(|wasm| {
-            let m = extract_petal_manifest_v0(wasm)?;
+            let m = extract_petal_manifest(wasm)?;
             Some(to_petal_manifest_stub(&m))
         });
         self.manifest_cache.borrow_mut().insert(*hash, stub.clone());
@@ -248,17 +248,17 @@ mod tests {
     #[test]
     fn load_manifest_parses_wasm_custom_section() {
         use bloom_petal_manifest::codec;
-        use bloom_petal_manifest::types::{PetalManifestV0, SCHEMA_VERSION, SemVer};
+        use bloom_petal_manifest::types::{PetalManifest, SCHEMA_VERSION, SemVer};
 
-        // Build a minimal wasm with a `bloom_petal_manifest_v0` section.
-        let manifest = PetalManifestV0 {
+        // Build a minimal wasm with a `bloom_petal_manifest` section.
+        let manifest = PetalManifest {
             schema_version: SCHEMA_VERSION,
             module_path: "/bloom/test/petal".into(),
             framework_version: SemVer::new(0, 1, 0),
             ..Default::default()
         };
         let manifest_bytes = codec::encode(&manifest).unwrap();
-        let wasm = wasm_with_custom("bloom_petal_manifest_v0", &manifest_bytes);
+        let wasm = wasm_with_custom("bloom_petal_manifest", &manifest_bytes);
 
         let mut state = State::new();
         let hash = state.insert_code(&wasm);
@@ -275,16 +275,16 @@ mod tests {
         // Ensures the adapter only parses each wasm once across multiple
         // load_manifest calls for the same hash.
         use bloom_petal_manifest::codec;
-        use bloom_petal_manifest::types::{PetalManifestV0, SCHEMA_VERSION, SemVer};
+        use bloom_petal_manifest::types::{PetalManifest, SCHEMA_VERSION, SemVer};
 
-        let manifest = PetalManifestV0 {
+        let manifest = PetalManifest {
             schema_version: SCHEMA_VERSION,
             module_path: "/bloom/test/petal".into(),
             framework_version: SemVer::new(0, 1, 0),
             ..Default::default()
         };
         let manifest_bytes = codec::encode(&manifest).unwrap();
-        let wasm = wasm_with_custom("bloom_petal_manifest_v0", &manifest_bytes);
+        let wasm = wasm_with_custom("bloom_petal_manifest", &manifest_bytes);
 
         let mut state = State::new();
         let hash = state.insert_code(&wasm);
@@ -301,15 +301,15 @@ mod tests {
     #[test]
     fn overrides_win_over_wasm_section() {
         use bloom_petal_manifest::codec;
-        use bloom_petal_manifest::types::{PetalManifestV0, SCHEMA_VERSION, SemVer};
+        use bloom_petal_manifest::types::{PetalManifest, SCHEMA_VERSION, SemVer};
 
-        let real = PetalManifestV0 {
+        let real = PetalManifest {
             schema_version: SCHEMA_VERSION,
             module_path: "/wasm/path".into(),
             framework_version: SemVer::new(0, 1, 0),
             ..Default::default()
         };
-        let wasm = wasm_with_custom("bloom_petal_manifest_v0", &codec::encode(&real).unwrap());
+        let wasm = wasm_with_custom("bloom_petal_manifest", &codec::encode(&real).unwrap());
 
         let mut state = State::new();
         let hash = state.insert_code(&wasm);

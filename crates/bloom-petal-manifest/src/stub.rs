@@ -1,4 +1,4 @@
-//! Projector from the canonical [`crate::types::PetalManifestV0`] to the
+//! Projector from the canonical [`crate::types::PetalManifest`] to the
 //! validator-facing [`bloom_script::PetalManifestStub`].
 //!
 //! The full manifest carries everything a tool or social-layer reader
@@ -10,7 +10,7 @@
 //! - `external_type_refs` (so `TypeTag::External` refs can be resolved
 //!   at typecheck time)
 //!
-//! This projection is total — every `PetalManifestV0` produces a valid
+//! This projection is total — every `PetalManifest` produces a valid
 //! `PetalManifestStub`. It is *not* round-trippable; the back-projection
 //! requires the original manifest's invariant + fuel + host-import data.
 
@@ -26,17 +26,17 @@ use bloom_script::{
 use crate::types::{
     ArgKind, ArithExpr, BoundedArithOp, CapabilityDecl, CmpOp, DataTypeDecl, EnumTypeDecl,
     FieldDecl, FunctionDecl, InvariantDecl, InvariantTarget, ObjectTypeDecl, OverflowPolicy,
-    PetalManifestV0, PredicateAst, TypeParamDecl, TypeParamKind, VariantDecl, VariantFieldsDecl,
+    PetalManifest, PredicateAst, TypeParamDecl, TypeParamKind, VariantDecl, VariantFieldsDecl,
     Widening, is_numeric_invariant_field,
 };
 
 /// Project a full canonical manifest down to the validator-facing stub.
 ///
 /// Spec §8.2 + §11.4. The chain calls this immediately after decoding a
-/// `bloom_petal_manifest_v0` custom section so the validator can
+/// `bloom_petal_manifest` custom section so the validator can
 /// typecheck `Command::Move`s without re-parsing the full manifest on
 /// every PTB.
-pub fn to_petal_manifest_stub(m: &PetalManifestV0) -> PetalManifestStub {
+pub fn to_petal_manifest_stub(m: &PetalManifest) -> PetalManifestStub {
     PetalManifestStub {
         module_path: m.module_path.clone(),
         functions: m
@@ -294,7 +294,7 @@ fn project_overflow_policy(p: OverflowPolicy) -> OverflowPolicyStub {
 mod tests {
     use super::*;
     use crate::types::{
-        ArgDecl, FunctionDecl, InvariantDecl, InvariantTarget, ObjectTypeDecl, PetalManifestV0,
+        ArgDecl, FunctionDecl, InvariantDecl, InvariantTarget, ObjectTypeDecl, PetalManifest,
         PredicateAst, TypeParamDecl, TypeParamKind,
     };
     use bloom_objects::{AbilitySet, AccessMode, TypeTag};
@@ -309,7 +309,7 @@ mod tests {
 
     #[test]
     fn projects_module_path_and_functions() {
-        let m = PetalManifestV0 {
+        let m = PetalManifest {
             module_path: "/bloom/test".into(),
             functions: vec![FunctionDecl {
                 name: "f".into(),
@@ -384,7 +384,7 @@ mod tests {
 
     #[test]
     fn projects_object_types() {
-        let m = PetalManifestV0 {
+        let m = PetalManifest {
             module_path: "/p".into(),
             object_types: vec![ObjectTypeDecl {
                 name: "Pool".into(),
@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn object_field_layout_excludes_bool_from_numeric_invariant_scope() {
-        let m = PetalManifestV0 {
+        let m = PetalManifest {
             module_path: "/p".into(),
             object_types: vec![ObjectTypeDecl {
                 name: "Flags".into(),

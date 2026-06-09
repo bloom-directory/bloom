@@ -16,7 +16,7 @@ The deep layers are already implemented and tested on a real chain:
 
 - **PTB = the transaction plan.** `bloom-script`'s `PtbTx{ commands, signers, gas_* }` with `Arg::Use{cmd_idx,ret_idx}` is exactly the handoff's "transaction plan", and `Use` is already a DAG edge, not just linear. Atomicity, snapshot rollback, gas reservation/refund, signature checks, and linearity (no double-spend) are implemented and pass end-to-end (`crates/bloom-chain-node/tests/ptb_submit_e2e.rs`, `ptb_atomicity.rs`, `examples/petal-dex/.../single_hop_swap.rs`).
 - **The petal ABI is already byte-in/byte-out.** `#[bloom::petal]` emits one `__petal_<fn>` export per public fn with a `(args_ptr,args_len,ret_ptr,ret_cap)` buffer ABI. Dispatch is by name, not a 4-byte selector.
-- **The VFS path is already in the manifest.** Each petal's signed `bloom_petal_manifest_v0` carries `module_path` (e.g. `/bloom/dex/pool`) plus its `functions`. `ChainStateIface::resolve_path(path) -> Option<Hash32>` already resolves path → petal.
+- **The VFS path is already in the manifest.** Each petal's signed `bloom_petal_manifest` carries `module_path` (e.g. `/bloom/dex/pool`) plus its `functions`. `ChainStateIface::resolve_path(path) -> Option<Hash32>` already resolves path → petal.
 - **Packets ≈ typed Objects.** `TypeTag::Concrete{type_name,type_args}` already expresses `Token<USDC>`; `Object{id,type_tag,owner,version}` + content-addressed `ObjectId` + the canonical no-float codec + handle-based linearity give the typed/linear packet core.
 
 What is missing is entirely the front door: an executable-endpoint surface, a builder that lowers composition into a `PtbTx`, a serialized packet envelope, bounded/paginated projection, and the agent-facing invocation surface. Plus one petal-side gap: the DEX swap is not yet a real wasm export.
@@ -51,7 +51,7 @@ PtbSession (bloom-ptb-builder)
 | Unit | Responsibility | Builds on |
 |---|---|---|
 | `bloom-ptb-builder` (new crate) | `PtbSession`: turn an ordered list of (endpoint-path, args, use-edges) into a **validated** `PtbTx`. Shared by CLI + tx-session — one source of truth. | `bloom-script` `PtbTx/Command/Arg/UseRef`, `validate_ptb` |
-| Endpoint resolver (extend `bloom-petal-manifest` and the `ChainStateIface` path hook) | `path → (petal_hash, fn, abi)` derived from the signed manifest (`module_path` + `functions`). Not a new source of truth. | `resolve_path` (`crates/bloom-script/src/chain_iface.rs:157`), `PetalManifestV0.functions` |
+| Endpoint resolver (extend `bloom-petal-manifest` and the `ChainStateIface` path hook) | `path → (petal_hash, fn, abi)` derived from the signed manifest (`module_path` + `functions`). Not a new source of truth. | `resolve_path` (`crates/bloom-script/src/chain_iface.rs:157`), `PetalManifest.functions` |
 | `tx` VFS handler (in `bloom-vfs`) | `/bloom/tx/new`, `/bloom/tx/<id>/{cmd,status,commit,abort}` backed by a `PtbSession`. Pure NFS read/write. | `Handler` trait (`crates/bloom-vfs/src/handler.rs`), `bloom-ptb-builder` |
 | Packet envelope (module in `bloom-objects`) | Canonical typed value crossing the pipe boundary as a **reference within the plan** — not bearer bytes. | `TypeTag`, object canonical codec |
 | Bounded projection / pagination primitive (in `bloom-vfs`) | `ls` returns bounded affordances; collections project as `page/000000`. Added now, lightly exercised by DeFi; Bloombook leans on it later. | `Handler::list` |

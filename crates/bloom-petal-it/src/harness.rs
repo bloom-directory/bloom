@@ -129,7 +129,7 @@ pub fn seed_coin(state: &mut State, id: ObjectId, owner: Address, value: u128) {
 /// `ExecOutput`.
 ///
 /// "Chain-authoritative" here means the manifest is decoded entirely
-/// from the `bloom_petal_manifest_v0` custom section of each petal's
+/// from the `bloom_petal_manifest` custom section of each petal's
 /// on-chain wasm bytes (layer 2 of `PtbChainAdapter::load_manifest`),
 /// exactly like the production node — the empty override map
 /// short-circuits layer 1. This pairs well with
@@ -208,7 +208,7 @@ pub fn wat_to_wasm(src: &str) -> Vec<u8> {
     wat::parse_str(src).expect("valid WAT")
 }
 
-/// Append a `bloom_petal_manifest_v0` custom section carrying
+/// Append a `bloom_petal_manifest` custom section carrying
 /// `manifest_bytes` to `wasm`. The caller is expected to pass canonical
 /// manifest bytes — typically the output of one of the real petals'
 /// macro-emitted `__bloom_manifest_bytes()` accessors.
@@ -223,7 +223,7 @@ pub fn wat_to_wasm(src: &str) -> Vec<u8> {
 /// The append is byte-level (matches the `wasm_with_custom` helper used
 /// in `bloom-chain-node`'s adapter tests); we don't re-parse the wasm.
 pub fn append_manifest_section(mut wasm: Vec<u8>, manifest_bytes: &[u8]) -> Vec<u8> {
-    let name = "bloom_petal_manifest_v0";
+    let name = "bloom_petal_manifest";
     // Body = name_len (LEB128) | name | payload.
     let mut body = Vec::new();
     leb128(&mut body, name.len() as u64);
@@ -237,7 +237,7 @@ pub fn append_manifest_section(mut wasm: Vec<u8>, manifest_bytes: &[u8]) -> Vec<
 }
 
 /// Convenience: compile `wat_src` and append the
-/// `bloom_petal_manifest_v0` custom section in one call.
+/// `bloom_petal_manifest` custom section in one call.
 pub fn wrap_with_real_manifest(wat_src: &str, manifest_bytes: &[u8]) -> Vec<u8> {
     let base = wat_to_wasm(wat_src);
     append_manifest_section(base, manifest_bytes)
@@ -256,9 +256,9 @@ fn leb128(out: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-/// The canonical-encoded `PetalManifestV0` bytes embedded in the real
+/// The canonical-encoded `PetalManifest` bytes embedded in the real
 /// `/bloom/petals/core/fungible` petal — i.e. the exact same blob the macro
-/// emits into the wasm `bloom_petal_manifest_v0` custom section. Use
+/// emits into the wasm `bloom_petal_manifest` custom section. Use
 /// with [`wrap_with_real_manifest`] to build a chain-authoritative
 /// fixture for the fungible petal.
 pub fn real_fungible_manifest_bytes() -> &'static [u8] {

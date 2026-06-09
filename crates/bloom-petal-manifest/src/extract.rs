@@ -1,9 +1,9 @@
 //! Wasm custom-section extractor for the canonical petal manifest.
 //!
-//! Walks a wasm binary looking for the `bloom_petal_manifest_v0` custom
+//! Walks a wasm binary looking for the `bloom_petal_manifest` custom
 //! section emitted by `#[bloom::petal]` (spec §8.1, §11.1). On hit,
 //! decodes the bytes via [`crate::codec::decode`] and returns the
-//! [`crate::types::PetalManifestV0`]. Missing section or malformed
+//! [`crate::types::PetalManifest`]. Missing section or malformed
 //! bytes yield `None` — the caller decides whether absence is a hard
 //! error (the chain's `load_manifest` treats it as "no manifest, no
 //! Move dispatch" by surfacing `PetalNotFound`).
@@ -11,9 +11,9 @@
 use wasmparser::{Parser, Payload};
 
 use crate::codec;
-use crate::types::{MANIFEST_CUSTOM_SECTION, PetalManifestV0};
+use crate::types::{MANIFEST_CUSTOM_SECTION, PetalManifest};
 
-/// Extract and canonical-decode the `bloom_petal_manifest_v0` custom
+/// Extract and canonical-decode the `bloom_petal_manifest` custom
 /// section from `wasm`. Returns `None` if either:
 /// - the section is absent (legacy petals, hand-written wasm, …), or
 /// - the wasm parses but the section bytes do not round-trip through
@@ -22,16 +22,16 @@ use crate::types::{MANIFEST_CUSTOM_SECTION, PetalManifestV0};
 /// In both cases the chain falls back to "no manifest" and the validator
 /// rejects any `Command::Move` against this petal with `PetalNotFound`
 /// (which is the conservative, fail-closed behaviour we want).
-pub fn extract_petal_manifest_v0(wasm: &[u8]) -> Option<PetalManifestV0> {
-    let bytes = extract_petal_manifest_v0_bytes(wasm)?;
+pub fn extract_petal_manifest(wasm: &[u8]) -> Option<PetalManifest> {
+    let bytes = extract_petal_manifest_bytes(wasm)?;
     codec::decode(&bytes).ok()
 }
 
-/// Extract the raw bytes of the `bloom_petal_manifest_v0` custom
+/// Extract the raw bytes of the `bloom_petal_manifest` custom
 /// section without decoding. Useful for tooling that wants to compute a
 /// content hash over the section, or for callers that already trust the
 /// bytes and want to skip the round-trip overhead.
-pub fn extract_petal_manifest_v0_bytes(wasm: &[u8]) -> Option<Vec<u8>> {
+pub fn extract_petal_manifest_bytes(wasm: &[u8]) -> Option<Vec<u8>> {
     let parser = Parser::new(0);
     for payload in parser.parse_all(wasm) {
         let payload = payload.ok()?;
@@ -48,7 +48,7 @@ pub fn extract_petal_manifest_v0_bytes(wasm: &[u8]) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::codec;
-    use crate::types::{PetalManifestV0, SemVer};
+    use crate::types::{PetalManifest, SemVer};
 
     /// Build a minimal wasm with one custom section.
     /// We hand-emit the wasm preamble + a single CustomSection payload.
@@ -85,8 +85,8 @@ mod tests {
         }
     }
 
-    fn sample_manifest() -> PetalManifestV0 {
-        PetalManifestV0 {
+    fn sample_manifest() -> PetalManifest {
+        PetalManifest {
             schema_version: crate::types::SCHEMA_VERSION,
             module_path: "/bloom/test/x".into(),
             framework_version: SemVer::new(0, 1, 0),
@@ -99,7 +99,7 @@ mod tests {
         let m = sample_manifest();
         let encoded = codec::encode(&m).unwrap();
         let wasm = wasm_with_custom(MANIFEST_CUSTOM_SECTION, &encoded);
-        let back = extract_petal_manifest_v0(&wasm).expect("section must decode");
+        let back = extract_petal_manifest(&wasm).expect("section must decode");
         assert_eq!(back, m);
     }
 
@@ -107,20 +107,20 @@ mod tests {
     fn returns_none_when_section_missing() {
         // Wasm with a *different* custom section name.
         let wasm = wasm_with_custom("not_the_manifest", &[1, 2, 3]);
-        assert!(extract_petal_manifest_v0(&wasm).is_none());
+        assert!(extract_petal_manifest(&wasm).is_none());
     }
 
     #[test]
     fn returns_none_on_malformed_payload() {
         // Right section name, garbage payload.
         let wasm = wasm_with_custom(MANIFEST_CUSTOM_SECTION, &[0xFF, 0xFF, 0xFF]);
-        assert!(extract_petal_manifest_v0(&wasm).is_none());
+        assert!(extract_petal_manifest(&wasm).is_none());
     }
 
     #[test]
     fn returns_none_on_non_wasm_input() {
         let garbage = vec![0u8; 16];
-        assert!(extract_petal_manifest_v0(&garbage).is_none());
+        assert!(extract_petal_manifest(&garbage).is_none());
     }
 
     #[test]
@@ -128,7 +128,7 @@ mod tests {
         let m = sample_manifest();
         let encoded = codec::encode(&m).unwrap();
         let wasm = wasm_with_custom(MANIFEST_CUSTOM_SECTION, &encoded);
-        let raw = extract_petal_manifest_v0_bytes(&wasm).unwrap();
+        let raw = extract_petal_manifest_bytes(&wasm).unwrap();
         assert_eq!(raw, encoded);
     }
 }

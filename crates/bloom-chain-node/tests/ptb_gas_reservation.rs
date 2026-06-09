@@ -41,7 +41,7 @@ use bloom_objects::{AccessMode, OWNER_KIND_ADDRESS, Object, ObjectId, Owner, Own
 use bloom_petal_fungible::ops::{coin_payload, decode_coin_value};
 use bloom_petal_manifest::{
     codec,
-    types::{FunctionDecl, PetalManifestV0, SCHEMA_VERSION, SemVer},
+    types::{FunctionDecl, PetalManifest, SCHEMA_VERSION, SemVer},
 };
 use bloom_script::{
     CORE_FUNGIBLE_PATH, DEFAULT_FUNGIBLE_PETAL_HASH,
@@ -253,7 +253,7 @@ fn custom_section(name: &str, payload: &[u8]) -> Vec<u8> {
 
 fn wat_with_manifest(src: &str, function: &str) -> Vec<u8> {
     let mut wasm = wat(src);
-    let manifest = codec::encode(&PetalManifestV0 {
+    let manifest = codec::encode(&PetalManifest {
         schema_version: SCHEMA_VERSION,
         module_path: "/test/p0-5".to_string(),
         framework_version: SemVer::new(0, 1, 0),
@@ -264,7 +264,7 @@ fn wat_with_manifest(src: &str, function: &str) -> Vec<u8> {
         ..Default::default()
     })
     .expect("manifest encodes");
-    let custom = custom_section("bloom_petal_manifest_v0", &manifest);
+    let custom = custom_section("bloom_petal_manifest", &manifest);
     section(&mut wasm, 0, &custom);
     wasm
 }
@@ -273,7 +273,7 @@ fn minimal_wasm_with_manifest(manifest_bytes: &[u8]) -> Vec<u8> {
     let mut wasm = Vec::new();
     wasm.extend_from_slice(b"\0asm");
     wasm.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
-    let custom = custom_section("bloom_petal_manifest_v0", manifest_bytes);
+    let custom = custom_section("bloom_petal_manifest", manifest_bytes);
     section(&mut wasm, 0, &custom);
     wasm
 }

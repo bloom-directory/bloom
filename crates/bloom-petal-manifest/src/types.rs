@@ -1,4 +1,4 @@
-//! `PetalManifestV0` — the canonical manifest schema emitted by
+//! `PetalManifest` — the canonical manifest schema emitted by
 //! `#[bloom::petal]` as a wasm custom section (spec §8, §8.2).
 //!
 //! These types are pure data; no `syn`/`quote` dependencies. The
@@ -13,11 +13,11 @@ use bloom_objects::{AbilitySet, AccessMode, TypeTag};
 pub const SCHEMA_VERSION: u32 = 4;
 
 /// Custom section name embedded into every new-framework petal (spec §8.1).
-pub const MANIFEST_CUSTOM_SECTION: &str = "bloom_petal_manifest_v0";
+pub const MANIFEST_CUSTOM_SECTION: &str = "bloom_petal_manifest";
 
 /// Top-level manifest emitted by `#[bloom::petal]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PetalManifestV0 {
+pub struct PetalManifest {
     /// `= SCHEMA_VERSION` for this crate's emission.
     pub schema_version: u32,
     /// VFS path the petal lives at, e.g. `"/bloom/petals/dex/pool"`.
@@ -46,7 +46,7 @@ pub struct PetalManifestV0 {
     pub fuel_hints: FuelHints,
 }
 
-impl Default for PetalManifestV0 {
+impl Default for PetalManifest {
     fn default() -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
@@ -293,7 +293,7 @@ pub struct FunctionDecl {
     pub required_signers: u8,
     /// Capability args, by their declared TypeTag.
     pub required_capabilities: Vec<TypeTag>,
-    /// Indices into `PetalManifestV0::invariants` that fire after this fn.
+    /// Indices into `PetalManifest::invariants` that fire after this fn.
     pub attached_invariants: Vec<u16>,
 }
 
@@ -551,7 +551,7 @@ mod tests {
 
     #[test]
     fn default_manifest_is_empty() {
-        let m = PetalManifestV0::default();
+        let m = PetalManifest::default();
         assert_eq!(m.schema_version, SCHEMA_VERSION);
         assert!(m.functions.is_empty());
         assert!(m.object_types.is_empty());
