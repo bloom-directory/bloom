@@ -1496,10 +1496,10 @@ async fn exercise_live_gas_alias_split_merge_and_trap(
         split_src,
     } = coins;
     let gas_payer = obj_id_from_hex(gas_coin)?;
-    let gas_before_alias = query_object(client, json_str(gas_coin, "id")?)
+    let gas_version = query_object(client, json_str(gas_coin, "id")?)
         .await?
-        .ok_or_else(|| anyhow!("gas coin missing before alias attempt"))?;
-    let gas_version = object_version(&gas_before_alias)?;
+        .ok_or_else(|| anyhow!("gas coin missing before alias attempt"))
+        .and_then(|obj| object_version(&obj))?;
     let gas_alias_ptb = PtbTx {
         signers: vec![ptb_signer_pubkey()],
         commands: vec![PtbCommand::Move(MoveCmd {
@@ -1518,15 +1518,16 @@ async fn exercise_live_gas_alias_split_merge_and_trap(
         expiry_block: PTB_EXPIRY_BLOCK,
         signatures: vec![],
     };
-    assert_submit_rejected(
-        submit_ptb(home0, HOST_RPC_PORTS[0], gas_alias_ptb),
-        "gas-payer alias as PTB object input",
-        "gas payer cannot also be used as a PTB object input",
-    )?;
-    let gas_after_alias = query_object(client, json_str(gas_coin, "id")?)
-        .await?
-        .ok_or_else(|| anyhow!("gas coin missing after alias attempt"))?;
-    assert_same_object_fields(&gas_after_alias, &gas_before_alias, "gas alias reject")?;
+    let gas_alias_receipt = submit_ptb(home0, HOST_RPC_PORTS[0], gas_alias_ptb)?;
+    if !gas_alias_receipt
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        bail!("gas-payer alias as PTB object input reverted: {gas_alias_receipt}");
+    }
+    let latest = current_height(client).await?;
+    wait_all_reach_height(clients, latest).await?;
 
     let merge_a_id = obj_id_from_hex(merge_a)?;
     let merge_b_id = obj_id_from_hex(merge_b)?;

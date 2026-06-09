@@ -985,9 +985,10 @@ fn type_tags_match_inner(
             } else if ah != dh {
                 return false;
             }
-            aa.iter()
-                .zip(da.iter())
-                .all(|(a, d)| type_tags_match_inner(a, d, self_hash, local_object_types, false))
+            let allow_nested_import = an == "Coin" && dn == "Coin";
+            aa.iter().zip(da.iter()).all(|(a, d)| {
+                type_tags_match_inner(a, d, self_hash, local_object_types, allow_nested_import)
+            })
         }
         (TypeTag::Generic { idx: a }, TypeTag::Generic { idx: b }) => a == b,
         (TypeTag::External { ref_idx: a }, TypeTag::External { ref_idx: b }) => a == b,
@@ -1608,6 +1609,38 @@ mod tests {
         assert!(validated.petals.contains_key(&leaf_hash.0));
         assert!(validated.manifests.contains_key(&middle_hash.0));
         assert!(validated.manifests.contains_key(&leaf_hash.0));
+    }
+
+    #[test]
+    fn coin_type_args_allow_imported_object_provenance() {
+        let fungible_hash = [0xCD; 32];
+        let pool_hash = [0xAB; 32];
+        let actual = TypeTag::Concrete {
+            petal_hash: [0; 32],
+            type_name: "Coin".to_string(),
+            type_args: vec![TypeTag::Concrete {
+                petal_hash: fungible_hash,
+                type_name: "Erased".to_string(),
+                type_args: vec![],
+            }],
+        };
+        let declared = TypeTag::Concrete {
+            petal_hash: [0; 32],
+            type_name: "Coin".to_string(),
+            type_args: vec![TypeTag::Concrete {
+                petal_hash: [0; 32],
+                type_name: "Erased".to_string(),
+                type_args: vec![],
+            }],
+        };
+        let local_object_types = HashSet::new();
+
+        assert!(type_tags_match(
+            &actual,
+            &declared,
+            pool_hash,
+            &local_object_types
+        ));
     }
 
     #[test]

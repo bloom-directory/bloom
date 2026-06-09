@@ -1,6 +1,18 @@
 name: acceptance
 
 on:
+  pull_request:
+    paths:
+      - .github/workflows/acceptance.yml
+      - scripts/test-docker-petal-dex.sh
+      - scripts/lib.sh
+      - docker-compose.yml
+      - Dockerfile
+      - crates/bloom*/**
+      - crates/bloom-mount/**
+      - crates/bloom-chain*/**
+      - crates/bloom-petal*/**
+      - examples/petal-dex/**
   push:
     branches:
       - master
@@ -34,7 +46,7 @@ jobs:
       - name: Build workspace (release-ish; debug is fine for acceptance)
         run: cargo build --workspace --tests
       - name: Run --ignored acceptance tests
-        run: cargo nextest run --workspace --ignored --no-fail-fast
+        run: cargo nextest run --workspace --run-ignored ignored-only --no-fail-fast -E 'not package(bloom-petal-dex-it)'
 
   docker-petal-dex:
     name: docker petal DEX acceptance
@@ -56,9 +68,21 @@ jobs:
         run: |
           rustup show
           rustup target add wasm32-unknown-unknown
+      - name: Install NFS client
+        if: steps.docker.outputs.available == 'true'
+        run: sudo apt-get update && sudo apt-get install -y nfs-common
       - name: Cache cargo
         if: steps.docker.outputs.available == 'true'
         uses: Swatinem/rust-cache@v2
       - name: Run docker petal DEX acceptance
         if: steps.docker.outputs.available == 'true'
+        env:
+          BLOOM_DOCKER_LOG_DIR: ${{ runner.temp }}/bloom-docker-petal-dex-logs
         run: scripts/test-docker-petal-dex.sh
+      - name: Upload docker petal DEX diagnostics
+        if: always() && steps.docker.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-petal-dex-diagnostics
+          path: ${{ runner.temp }}/bloom-docker-petal-dex-logs
+          if-no-files-found: warn
