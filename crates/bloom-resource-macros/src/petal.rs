@@ -36,8 +36,8 @@ use syn::{
 use crate::ast::{attr_is_named, fn_name, ident, parse_str_value, signer_arg};
 use crate::capability::CapabilityAttr;
 use crate::codegen::{
-    PetalShimAst, ShimArgAst, emit_dispatch_helper, emit_invariant_shim, emit_manifest_accessor,
-    emit_manifest_section, emit_petal_shim,
+    PetalShimAst, ShimArgAst, emit_dispatch_helper, emit_invariant_runtime, emit_invariant_shim,
+    emit_manifest_accessor, emit_manifest_section, emit_petal_shim,
 };
 use crate::error::err_spanned;
 use crate::invariant::InvariantAttr;
@@ -603,12 +603,18 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenS
         emit_dispatch_helper()
     };
 
-    // Per-invariant shims.
+    // Per-invariant shims, plus the shared evaluator runtime (emitted
+    // once when the petal declares any invariant).
+    let inv_runtime = if manifest.invariants.is_empty() {
+        TokenStream::new()
+    } else {
+        emit_invariant_runtime()
+    };
     let inv_shims: Vec<_> = manifest
         .invariants
         .iter()
         .enumerate()
-        .map(|(i, _)| emit_invariant_shim(i as u16))
+        .map(|(i, inv)| emit_invariant_shim(i as u16, &inv.predicate))
         .collect();
     let object_cap_impls = emit_object_capability_impls(&parsed)?;
 
@@ -644,6 +650,7 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream) -> syn::Result<TokenS
         #section
         #accessor
         #dispatch_helper
+        #inv_runtime
         #(#petal_shims)*
         #(#inv_shims)*
         #(#object_cap_impls)*

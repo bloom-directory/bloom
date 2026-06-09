@@ -2442,6 +2442,7 @@ dependencies = [
  "bloom-petal-manifest",
  "bloom-resource",
  "bloom-resource-macros",
+ "bloom-script",
  "bloom-value",
 ]
 
@@ -2486,6 +2487,7 @@ dependencies = [
  "bloom-petal-dex-wallet",
  "bloom-petal-fungible",
  "bloom-petal-manifest",
+ "bloom-petals",
  "bloom-ptb-builder",
  "bloom-resource",
  "bloom-script",

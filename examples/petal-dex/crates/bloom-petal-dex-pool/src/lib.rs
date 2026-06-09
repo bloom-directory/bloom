@@ -1037,6 +1037,17 @@ pub mod pool {
     }
 
     /// Swap exact `coin_in` (token A) for at-least `min_out` of token B.
+    // `target = "Pool"` makes this fire after *every* Pool mutation, so the
+    // predicate must hold across all of them — not just swaps. The
+    // disjunct `!(after.lp_supply == before.lp_supply)` exempts liquidity
+    // events (add/remove_liquidity), where `k` legitimately moves with the
+    // reserves; on a pure swap `lp_supply` is unchanged, so `k` must not drop.
+    #[invariant(
+        name = "pool_k_non_decreasing",
+        target = "Pool",
+        pred = |before, after| after.reserve_a * after.reserve_b >= before.k_last
+            || !(after.lp_supply == before.lp_supply)
+    )]
     pub fn swap_exact_in<A, B>(
         coin_in: Coin<A>,
         pool: &mut Resource<Pool>,

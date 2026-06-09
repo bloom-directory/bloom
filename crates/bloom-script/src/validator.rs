@@ -161,6 +161,22 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
     let mut cmd_return_types: Vec<Vec<Option<TypeTag>>> = Vec::with_capacity(tx.commands.len());
     let mut consumed_use_refs: HashSet<UseRef> = HashSet::new();
     for (cmd_idx, cmd) in tx.commands.iter().enumerate() {
+        // ReadOnly mode: only Move commands are permitted.
+        if ctx.mode == ValidationMode::ReadOnly
+            && matches!(
+                cmd,
+                Command::TransferObjects { .. }
+                    | Command::MergeCoins { .. }
+                    | Command::SplitCoins { .. }
+                    | Command::MakeMoveVec { .. }
+                    | Command::Publish(_)
+            )
+        {
+            return Err(PtbError::BuiltinFailed {
+                cmd_idx: cmd_idx as u16,
+                reason: "built-in command not allowed in read-only mode".to_string(),
+            });
+        }
         match cmd {
             Command::Move(m) => {
                 let hash = m.petal.hash.ok_or_else(|| PtbError::PetalNotPinned {
@@ -223,6 +239,13 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
                 let f = manifest
                     .function(&m.function)
                     .expect("function presence verified by typecheck_move_cmd");
+                if ctx.mode == ValidationMode::ReadOnly && !f.view {
+                    return Err(PtbError::TypeMismatch {
+                        function: m.function.clone(),
+                        arg_idx: 0,
+                        reason: "read-only PTB may only call view functions".into(),
+                    });
+                }
                 cmd_return_types.push(
                     f.returns
                         .iter()
@@ -374,6 +397,8 @@ pub fn validate_ptb(tx: &PtbTx, ctx: &ValidationContext<'_>) -> Result<Validated
         objects.entry(gas_obj.id.0).or_insert(gas_obj);
     }
 
+    resolve_loaded_object_manifests(ctx, &objects, &mut manifests)?;
+
     Ok(ValidatedPtb {
         tx,
         objects,
@@ -466,6 +491,31 @@ fn resolve_external_petals(
             .ok_or(PtbError::PetalNotFound { hash })?;
         manifests.entry(hash.0).or_insert(external_manifest.clone());
         resolve_external_petals(&external_manifest, ctx, petals, manifests, visited)?;
+    }
+    Ok(())
+}
+
+fn resolve_loaded_object_manifests(
+    ctx: &ValidationContext<'_>,
+    objects: &HashMap<[u8; 32], Object>,
+    manifests: &mut HashMap<[u8; 32], PetalManifestStub>,
+) -> Result<(), PtbError> {
+    for obj in objects.values() {
+        let TypeTag::Concrete { petal_hash, .. } = &obj.type_tag else {
+            continue;
+        };
+        if *petal_hash == [0u8; 32]
+            || *petal_hash == BUILTIN_TYPE_HASH
+            || manifests.contains_key(petal_hash)
+        {
+            continue;
+        }
+        let hash = bloom_chain_types::Hash32(*petal_hash);
+        let manifest = ctx
+            .chain
+            .load_manifest(&hash)
+            .ok_or(PtbError::PetalNotFound { hash })?;
+        manifests.insert(*petal_hash, manifest);
     }
     Ok(())
 }
@@ -1297,6 +1347,26 @@ mod tests {
         }
     }
 
+    fn foreign_obj(
+        id_byte: u8,
+        owner: [u8; 32],
+        version: u64,
+        petal_hash: Hash32,
+        type_name: &str,
+    ) -> Object {
+        Object {
+            id: ObjectId([id_byte; 32]),
+            type_tag: TypeTag::Concrete {
+                petal_hash: petal_hash.0,
+                type_name: type_name.to_string(),
+                type_args: vec![],
+            },
+            owner: Owner::Address(owner),
+            version,
+            payload: vec![],
+        }
+    }
+
     fn sample_manifest() -> PetalManifestStub {
         PetalManifestStub {
             module_path: "/bloom/petals/dex/pool".to_string(),
@@ -1325,7 +1395,7 @@ mod tests {
     fn object_manifest(mode: AccessMode) -> PetalManifestStub {
         let mut manifest = sample_manifest();
         manifest.functions = vec![FunctionDeclStub {
-            view: false,
+            view: true,
             name: "inspect".to_string(),
             type_params: vec![],
             args: vec![ArgDeclStub::Object {
@@ -1420,6 +1490,86 @@ mod tests {
     }
 
     #[test]
+    fn preloads_manifest_for_foreign_object_type_inputs() {
+        let (chain, signer, gas_id) = setup();
+        let foreign_hash = Hash32([0xCD; 32]);
+        let foreign_type = TypeTag::Concrete {
+            petal_hash: foreign_hash.0,
+            type_name: "Foreign".to_string(),
+            type_args: vec![],
+        };
+        chain.put_object(foreign_obj(0x44, signer, 0, foreign_hash, "Foreign"));
+        chain.manifests.borrow_mut().insert(
+            foreign_hash.0,
+            PetalManifestStub {
+                module_path: "/foreign".to_string(),
+                object_types: vec![ObjectTypeDeclStub {
+                    name: "Foreign".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        install_fn(
+            &chain,
+            "touch_foreign",
+            vec![ArgDeclStub::Object {
+                ty: foreign_type,
+                mode: AccessMode::Mutable,
+            }],
+            vec![],
+        );
+        let mut tx = sample_ptb(signer, gas_id, 100);
+        if let Command::Move(m) = &mut tx.commands[0] {
+            m.function = "touch_foreign".to_string();
+            m.args = vec![Arg::Object {
+                id: ObjectId([0x44; 32]),
+                expected_version: ExpectedVersion(0),
+                access_mode: AccessMode::Mutable,
+            }];
+        }
+
+        let verifier = AlwaysOkVerifier;
+        let validated = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap();
+        assert!(validated.manifests.contains_key(&[0xAB; 32]));
+        assert!(validated.manifests.contains_key(&foreign_hash.0));
+    }
+
+    #[test]
+    fn missing_manifest_for_foreign_object_type_input_is_rejected() {
+        let (chain, signer, gas_id) = setup();
+        let foreign_hash = Hash32([0xCD; 32]);
+        let foreign_type = TypeTag::Concrete {
+            petal_hash: foreign_hash.0,
+            type_name: "Foreign".to_string(),
+            type_args: vec![],
+        };
+        chain.put_object(foreign_obj(0x44, signer, 0, foreign_hash, "Foreign"));
+        install_fn(
+            &chain,
+            "touch_foreign",
+            vec![ArgDeclStub::Object {
+                ty: foreign_type,
+                mode: AccessMode::Mutable,
+            }],
+            vec![],
+        );
+        let mut tx = sample_ptb(signer, gas_id, 100);
+        if let Command::Move(m) = &mut tx.commands[0] {
+            m.function = "touch_foreign".to_string();
+            m.args = vec![Arg::Object {
+                id: ObjectId([0x44; 32]),
+                expected_version: ExpectedVersion(0),
+                access_mode: AccessMode::Mutable,
+            }];
+        }
+
+        let verifier = AlwaysOkVerifier;
+        let err = validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap_err();
+        assert!(matches!(err, PtbError::PetalNotFound { hash } if hash == foreign_hash));
+    }
+
+    #[test]
     fn preloads_transitive_external_petals() {
         let (chain, signer, gas_id) = setup();
         let middle_hash = Hash32([0xBC; 32]);
@@ -1507,11 +1657,54 @@ mod tests {
 
     #[test]
     fn read_only_allows_supplied_signer_without_signature_verification() {
-        let (chain, signer, gas_id) = setup();
-        let mut tx = sample_ptb(signer, gas_id, 100);
-        tx.signatures.clear();
+        let chain = MockChain::new();
+        let mut manifest = sample_manifest();
+        manifest.functions[0].view = true;
+        chain.put_petal(Hash32([0xAB; 32]), vec![1, 2, 3], manifest);
+        chain.put_path("/bloom/dex/pool", Hash32([0xAB; 32]));
+        let tx = PtbTx {
+            signers: vec![[0x11; 32]],
+            commands: vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/bloom/dex/pool".to_string(),
+                    hash: Some(Hash32([0xAB; 32])),
+                },
+                function: "swap".to_string(),
+                type_args: vec![],
+                args: vec![Arg::Signer(0)],
+            })],
+            gas_payer: ObjectId([0xFE; 32]),
+            gas_budget: 100,
+            gas_price: 1,
+            expiry_block: 100,
+            signatures: vec![],
+        };
 
         assert!(validate_ptb(&tx, &read_only_ctx(&chain, &PanicVerifier)).is_ok());
+    }
+
+    #[test]
+    fn read_only_rejects_publish() {
+        let chain = MockChain::new();
+        let tx = PtbTx {
+            signers: vec![],
+            commands: vec![Command::Publish(crate::types::PublishCmd {
+                wasm_bytes: vec![0],
+                module_path: "/new".to_string(),
+                publisher_cap: None,
+            })],
+            gas_payer: ObjectId([0xFE; 32]),
+            gas_budget: 100,
+            gas_price: 1,
+            expiry_block: 100,
+            signatures: vec![],
+        };
+
+        let err = validate_ptb(&tx, &read_only_ctx(&chain, &PanicVerifier)).unwrap_err();
+        assert!(
+            matches!(err, PtbError::BuiltinFailed { ref reason, .. } if reason.contains("read-only mode")),
+            "expected read-only publish rejection, got {err:?}"
+        );
     }
 
     #[test]
@@ -2187,7 +2380,7 @@ mod tests {
             }];
         }
         let verifier = AlwaysOkVerifier;
-        assert!(validate_ptb(&tx, &ctx(&chain, &verifier)).is_ok());
+        validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap();
     }
 
     #[test]
@@ -2271,7 +2464,7 @@ mod tests {
             m.args = vec![Arg::Const(vec![0u8; 8])];
         }
         let verifier = AlwaysOkVerifier;
-        assert!(validate_ptb(&tx, &ctx(&chain, &verifier)).is_ok());
+        validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap();
     }
 
     #[test]
@@ -2987,6 +3180,17 @@ mod tests {
             version: 0,
             payload: vec![],
         });
+        chain.manifests.borrow_mut().insert(
+            [0xCD; 32],
+            PetalManifestStub {
+                module_path: "/foreign".to_string(),
+                object_types: vec![ObjectTypeDeclStub {
+                    name: "Pool".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
         let mut m = sample_manifest();
         m.functions.push(FunctionDeclStub {
             view: false,
@@ -3033,6 +3237,17 @@ mod tests {
             version: 0,
             payload: vec![],
         });
+        chain.manifests.borrow_mut().insert(
+            [0xCD; 32],
+            PetalManifestStub {
+                module_path: "/foreign".to_string(),
+                object_types: vec![ObjectTypeDeclStub {
+                    name: "Pool".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
         let mut m = sample_manifest();
         m.object_types.clear();
         m.functions.push(FunctionDeclStub {
@@ -3059,7 +3274,7 @@ mod tests {
             }];
         }
         let verifier = AlwaysOkVerifier;
-        assert!(validate_ptb(&tx, &ctx(&chain, &verifier)).is_ok());
+        validate_ptb(&tx, &ctx(&chain, &verifier)).unwrap();
     }
 
     #[test]

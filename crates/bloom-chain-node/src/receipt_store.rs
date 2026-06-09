@@ -135,6 +135,7 @@ mod tests {
                 topics: vec![Hash32([0xAA; 32])],
                 data: vec![1, 2, 3],
             }],
+            invariant_outcomes: vec![],
         }
     }
 

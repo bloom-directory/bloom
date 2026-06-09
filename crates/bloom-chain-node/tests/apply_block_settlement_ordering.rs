@@ -172,6 +172,7 @@ impl PetalExecutor for CoinTransferExecutor {
             fuel_used: NOOP_FUEL_USED,
             return_data: vec![],
             logs: vec![],
+            invariant_outcomes: Vec::new(),
             write_set: Some(snap.commit()),
         }
     }
@@ -197,6 +198,7 @@ impl PetalExecutor for StaleWriteSetExecutor {
             fuel_used: NOOP_FUEL_USED,
             return_data: vec![],
             logs: vec![],
+            invariant_outcomes: Vec::new(),
             write_set: Some(stale),
         }
     }
@@ -228,6 +230,7 @@ impl PetalExecutor for DrainsSenderExecutor {
             fuel_used: NOOP_FUEL_USED,
             return_data: vec![],
             logs: vec![],
+            invariant_outcomes: Vec::new(),
             write_set: Some(snap.commit()),
         }
     }

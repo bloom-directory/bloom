@@ -492,6 +492,19 @@ impl RpcServer {
                         "topics": l.topics.iter().map(|t| hex::encode(t.0)).collect::<Vec<_>>(),
                         "data": hex::encode(&l.data),
                     })).collect::<Vec<_>>(),
+                    // Per-invariant verdicts (ADR-002) so the social /
+                    // trust-scoring layer can read them straight from the
+                    // receipt.
+                    "invariant_outcomes": r.invariant_outcomes.iter().map(|o| json!({
+                        "name": String::from_utf8_lossy(&o.name),
+                        "cmd_idx": o.cmd_idx,
+                        "verdict": match o.verdict {
+                            0 => "satisfied",
+                            1 => "violated",
+                            2 => "indeterminate",
+                            _ => "unknown",
+                        },
+                    })).collect::<Vec<_>>(),
                 }))
             }
         }

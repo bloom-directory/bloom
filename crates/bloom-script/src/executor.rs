@@ -37,14 +37,19 @@ use bloom_chain_types::{
     Hash32,
     digest::{blake3_tagged, tags},
 };
-use bloom_objects::{AbilitySet, AccessMode, Object, ObjectId, Owner, TypeTag};
+use bloom_objects::{AbilitySet, AccessMode, BUILTIN_TYPE_HASH, Object, ObjectId, Owner, TypeTag};
 use bloom_resource::BloomType;
 use bloom_resource::abi::{CallArgsWriter, RetReader};
 
 use crate::borrow_table::BorrowRow;
-use crate::chain_iface::{ArgDeclStub, ChainStateIface, InvariantDeclStub, PetalManifestStub};
+use crate::chain_iface::{
+    ArgDeclStub, ChainStateIface, FieldLayoutStub, InvariantTargetStub, PetalManifestStub,
+};
 use crate::error::PtbError;
 use crate::host_ctx::PtbHostCtx;
+use crate::predicate::{
+    ArithExprStub, PredicateAstStub, PredicateEvalOutcome, interpret_predicate,
+};
 use crate::types::{Arg, Command, MoveCmd, PublishCmd, UpgradeCmd, UseRef};
 use crate::validator::{ValidatedPtb, decode_coin_value};
 use crate::value_validation::validate_return_slot_with_manifest_loader;
@@ -53,6 +58,9 @@ const MAX_PETAL_RETURN_SLOTS: usize = 32;
 const MAX_PETAL_RETURN_BYTES: usize = 2 << 20;
 const PUBLISH_BASE_FUEL: u64 = 1_000;
 const PUBLISH_BYTES_PER_FUEL: u64 = 64;
+const INV_BASE_FUEL: u64 = 100;
+const INV_PRED_NODE_FUEL: u64 = 10;
+const INV_SCOPE_BYTES_PER_FUEL: u64 = 64;
 
 fn coin_payload(value: u128) -> Vec<u8> {
     value.canonical_encode()
@@ -75,10 +83,15 @@ pub struct PetalCallResult {
 /// Output of a single invariant call.
 #[derive(Debug, Clone, Default)]
 pub struct InvariantResult {
-    /// `true` iff the invariant returned `1`.
+    /// `true` iff the invariant returned `1` (predicate satisfied).
+    /// Always `false` when `indeterminate` is `true`.
     pub ok: bool,
     /// Fuel consumed by the invariant.
     pub fuel_used: u64,
+    /// `true` when evaluation trapped / ran out of fuel. The invariant
+    /// was not violated — it was too expensive to decide. The host does
+    /// not revert on an indeterminate result (ADR-002).
+    pub indeterminate: bool,
 }
 
 /// Trait the executor delegates to for wasm dispatch.
@@ -113,6 +126,37 @@ pub trait PetalRunner {
 // ---------------------------------------------------------------------------
 // Report shapes
 // ---------------------------------------------------------------------------
+
+/// The tri-state outcome of evaluating one invariant (ADR-002).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvariantVerdict {
+    /// Predicate returned `1`.
+    Satisfied,
+    /// Predicate returned `0`.
+    Violated,
+    /// Evaluation trapped / ran out of fuel; not decidable.
+    Indeterminate,
+}
+
+/// A recorded invariant evaluation. Emitted into the receipt for *every*
+/// invariant the executor fires, including satisfied ones (ADR-002).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvariantOutcome {
+    /// Invariant name (matches the `#[invariant]` attribute / export).
+    pub name: String,
+    /// Command index that triggered the evaluation.
+    pub cmd_idx: u16,
+    /// Tri-state verdict.
+    pub verdict: InvariantVerdict,
+}
+
+struct ObjectInvariantChange {
+    type_tag: TypeTag,
+    before: Vec<u8>,
+    after: Vec<u8>,
+    created: bool,
+    deleted: bool,
+}
 
 /// A single petal-emitted log record (forwarded by the executor to the
 /// chain receipt). Phase 1 is a minimal struct so the executor's API
@@ -168,6 +212,10 @@ pub struct ExecutionReport {
     pub publish_events: Vec<PetalPublishEvent>,
     /// Log records emitted by petals.
     pub logs: Vec<LogEntry>,
+    /// Per-invariant verdicts, recorded even on success (ADR-002). On a
+    /// revert caused by `InvariantFailed`, the violating entry is the
+    /// last one pushed.
+    pub invariant_outcomes: Vec<InvariantOutcome>,
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +375,19 @@ impl<'c> PtbExecutor<'c> {
             self.with_ctx(|ctx| {
                 ctx.command_outputs.push(cmd_outputs);
             });
+
+            // Fire object-type invariants for every row this command
+            // dirtied (ADR-010), regardless of command kind. This runs
+            // *before* `diff_check` clears the dirty flags and re-snapshots
+            // the baseline, so before/after are still distinguishable. It
+            // lives here (not inside `exec_move`) so built-in commands that
+            // mutate rows — `MergeCoins`/`SplitCoins` — are checked too, not
+            // only Move calls.
+            if let Err(e) =
+                self.fire_object_invariants(&vtx, cmd_idx as u16, &mut report, &mut fuel_remaining)
+            {
+                return self.revert_report(report, e);
+            }
 
             if let Err(e) = self.with_ctx(|ctx| ctx.borrow_table.diff_check(cmd_idx as u16)) {
                 return self.revert_report(report, e);
@@ -579,32 +640,202 @@ impl<'c> PtbExecutor<'c> {
             }
         }
 
-        // Run attached invariants.
+        // Run function-exit invariants. v1 builds an empty flat
+        // field-table scope (same wire format the guest evaluator reads):
+        // function-arg/return field extraction is a future addition, so a
+        // function-exit predicate referencing fields evaluates fail-closed
+        // rather than mis-parsing a different encoding.
         if let Some(f) = manifest.function(&m.function) {
             for inv in &f.attached_invariants {
-                let before_invariant = *fuel_remaining;
-                let used = match run_invariant(
-                    self.petal_runner,
-                    &hash,
-                    inv,
-                    &m.args,
-                    &outputs,
+                if !matches!(inv.target, InvariantTargetStub::FunctionExit { .. }) {
+                    continue; // object-type invariants fire via the borrow table below
+                }
+                let scope = crate::invariant_scope::build_invariant_scope(
+                    crate::invariant_scope::SCOPE_KIND_FUNCTION_EXIT,
+                    &m.function,
+                    // petal_version: reserved-but-unused placeholder (see
+                    // `build_object_scope`); the v1 field table is empty.
+                    0,
+                    &[],
+                )
+                .map_err(PtbError::Codec)?;
+                self.fire_invariant(
+                    &inv.name,
+                    &inv.predicate,
+                    &scope,
                     cmd_idx,
-                    *fuel_remaining,
+                    report,
                     fuel_remaining,
-                ) {
-                    Ok(used) => used,
-                    Err(e) => {
-                        let charged = before_invariant.saturating_sub(*fuel_remaining);
-                        report.fuel_used = report.fuel_used.saturating_add(charged);
-                        return Err(e);
-                    }
-                };
-                report.fuel_used = report.fuel_used.saturating_add(used);
+                )?;
             }
         }
 
+        // Object-type invariants fire from the per-command loop in
+        // `execute` (so built-in mutating commands are covered too), not
+        // here — see the call site after `dispatch_command`.
+
         Ok(outputs)
+    }
+
+    /// Evaluate one invariant against a prebuilt scope using the trusted
+    /// host-side manifest predicate interpreter and record the verdict.
+    /// A violation propagates `InvariantFailed`.
+    fn fire_invariant(
+        &self,
+        name: &str,
+        predicate: &PredicateAstStub,
+        scope: &[u8],
+        cmd_idx: u16,
+        report: &mut ExecutionReport,
+        fuel_remaining: &mut u64,
+    ) -> Result<(), PtbError> {
+        let used = deterministic_invariant_fuel(predicate, scope);
+        charge_invariant_fuel(used, cmd_idx, fuel_remaining, report)?;
+        run_invariant(
+            name,
+            predicate,
+            scope,
+            cmd_idx,
+            &mut report.invariant_outcomes,
+        )
+    }
+
+    /// Fire object-type invariants for every borrow row dirtied, silently
+    /// payload-mutated, created, or deleted by the current command. For each row
+    /// of type `T` defined by petal `P`, evaluate `P`'s `ObjectType(T)`
+    /// invariants over a flat field-table scope built from the row's
+    /// before/after payloads. Deleted rows have no after payload; any
+    /// indeterminate predicate result is therefore treated as a violation so a
+    /// delete cannot bypass invariants that require post-state fields.
+    fn fire_object_invariants(
+        &mut self,
+        vtx: &ValidatedPtb,
+        cmd_idx: u16,
+        report: &mut ExecutionReport,
+        fuel_remaining: &mut u64,
+    ) -> Result<(), PtbError> {
+        let changed: Vec<ObjectInvariantChange> =
+            self.with_ctx(|ctx| {
+                let mut changed: Vec<_> = ctx
+                    .borrow_table
+                    .iter()
+                    .filter(|(_, row)| {
+                        row.dirty
+                            || row.payload_bytes != row.baseline_payload
+                            || row.origin_command_idx == Some(cmd_idx)
+                    })
+                    .map(|(_, row)| {
+                        let created = row.origin_command_idx == Some(cmd_idx);
+                        ObjectInvariantChange {
+                            type_tag: row.type_tag.clone(),
+                            before: row.baseline_payload.clone(),
+                            after: row.payload_bytes.clone(),
+                            created,
+                            deleted: false,
+                        }
+                    })
+                    .collect();
+                changed.extend(ctx.borrow_table.dropped_rows().map(|(_, row)| {
+                    ObjectInvariantChange {
+                        type_tag: row.type_tag.clone(),
+                        before: row.baseline_payload.clone(),
+                        after: Vec::new(),
+                        created: row.origin_command_idx == Some(cmd_idx),
+                        deleted: true,
+                    }
+                }));
+                changed
+            });
+
+        for change in changed {
+            let TypeTag::Concrete {
+                petal_hash,
+                type_name,
+                ..
+            } = &change.type_tag
+            else {
+                continue; // generic / external tags carry no object invariants
+            };
+            let Some(def_manifest) = vtx.manifests.get(petal_hash) else {
+                if *petal_hash == [0u8; 32] || *petal_hash == BUILTIN_TYPE_HASH {
+                    continue;
+                }
+                return Err(PtbError::PetalNotFound {
+                    hash: Hash32(*petal_hash),
+                });
+            };
+            let Some(obj_decl) = def_manifest.object_type(type_name) else {
+                continue;
+            };
+            if def_manifest.object_invariants(type_name).next().is_none() {
+                continue;
+            }
+            let scope = build_object_scope(
+                type_name,
+                &obj_decl.field_layout,
+                &change.before,
+                &change.after,
+                change.created,
+                change.deleted,
+                cmd_idx,
+            )?;
+            for inv in def_manifest.object_invariants(type_name) {
+                if change.deleted {
+                    self.fire_invariant_fail_closed(
+                        &inv.name,
+                        &inv.predicate,
+                        &scope,
+                        cmd_idx,
+                        report,
+                        fuel_remaining,
+                    )?;
+                } else {
+                    self.fire_invariant(
+                        &inv.name,
+                        &inv.predicate,
+                        &scope,
+                        cmd_idx,
+                        report,
+                        fuel_remaining,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluate an invariant where an indeterminate result must fail closed.
+    /// Used for deleted object rows, where absent after-fields otherwise make
+    /// post-state predicates undecidable and therefore bypassable.
+    fn fire_invariant_fail_closed(
+        &self,
+        name: &str,
+        predicate: &PredicateAstStub,
+        scope: &[u8],
+        cmd_idx: u16,
+        report: &mut ExecutionReport,
+        fuel_remaining: &mut u64,
+    ) -> Result<(), PtbError> {
+        let used = deterministic_invariant_fuel(predicate, scope);
+        charge_invariant_fuel(used, cmd_idx, fuel_remaining, report)?;
+        let verdict = match interpret_predicate(predicate, scope) {
+            PredicateEvalOutcome::Satisfied => InvariantVerdict::Satisfied,
+            PredicateEvalOutcome::Violated | PredicateEvalOutcome::Indeterminate => {
+                InvariantVerdict::Violated
+            }
+        };
+        report.invariant_outcomes.push(InvariantOutcome {
+            name: name.to_string(),
+            cmd_idx,
+            verdict,
+        });
+        if matches!(verdict, InvariantVerdict::Violated) {
+            return Err(PtbError::InvariantFailed {
+                cmd_idx,
+                name: name.to_string(),
+            });
+        }
+        Ok(())
     }
 
     fn exec_transfer(
@@ -1220,75 +1451,190 @@ fn charge_builtin_fuel(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_invariant(
-    runner: &dyn PetalRunner,
-    petal: &Hash32,
-    inv: &InvariantDeclStub,
-    args: &[Arg],
-    outputs: &[Vec<u8>],
+fn charge_invariant_fuel(
+    cost: u64,
     cmd_idx: u16,
-    fuel_budget: u64,
     fuel_remaining: &mut u64,
-) -> Result<u64, PtbError> {
-    // Build the scope buffer from argspec indices: indices < args.len()
-    // select args, indices >= args.len() select outputs[idx - args.len()].
-    let mut scope = Vec::new();
-    for idx in &inv.argspec {
-        let i = *idx as usize;
-        if i < args.len() {
-            // Re-encode the arg as a length-prefixed blob.
-            let bytes = encode_arg_for_scope(&args[i])?;
-            let len: u32 = bytes
-                .len()
-                .try_into()
-                .map_err(|_| PtbError::BuiltinFailed {
-                    cmd_idx,
-                    reason: "invariant scope arg too large".to_string(),
-                })?;
-            scope.extend_from_slice(&len.to_be_bytes());
-            scope.extend_from_slice(&bytes);
-        } else {
-            let j = i - args.len();
-            let bytes = outputs.get(j).ok_or(PtbError::InvariantFailed {
-                cmd_idx,
-                name: inv.name.clone(),
-            })?;
-            let len: u32 = bytes
-                .len()
-                .try_into()
-                .map_err(|_| PtbError::BuiltinFailed {
-                    cmd_idx,
-                    reason: "invariant scope output too large".to_string(),
-                })?;
-            scope.extend_from_slice(&len.to_be_bytes());
-            scope.extend_from_slice(bytes);
-        }
-    }
-    let res = runner.call_invariant(petal, &inv.wasm_export, &scope, fuel_budget)?;
-    if res.fuel_used > *fuel_remaining {
+    report: &mut ExecutionReport,
+) -> Result<(), PtbError> {
+    if cost > *fuel_remaining {
+        report.fuel_used = report.fuel_used.saturating_add(*fuel_remaining);
         let limit = *fuel_remaining;
         *fuel_remaining = 0;
         return Err(PtbError::OutOfFuel {
             cmd_idx,
             limit,
-            used: res.fuel_used,
+            used: cost,
         });
     }
-    *fuel_remaining = fuel_remaining.saturating_sub(res.fuel_used);
-    if !res.ok {
-        return Err(PtbError::InvariantFailed {
-            cmd_idx,
-            name: inv.name.clone(),
-        });
-    }
-    Ok(res.fuel_used)
+    *fuel_remaining -= cost;
+    report.fuel_used = report.fuel_used.saturating_add(cost);
+    Ok(())
 }
 
-fn encode_arg_for_scope(arg: &Arg) -> Result<Vec<u8>, PtbError> {
-    let mut buf = Vec::new();
-    crate::encode::encode_arg(&mut buf, arg).map_err(PtbError::Codec)?;
-    Ok(buf)
+fn deterministic_invariant_fuel(predicate: &PredicateAstStub, scope: &[u8]) -> u64 {
+    let scope_units = (scope.len() as u64).saturating_add(INV_SCOPE_BYTES_PER_FUEL - 1)
+        / INV_SCOPE_BYTES_PER_FUEL;
+    INV_BASE_FUEL
+        .saturating_add(predicate_node_count(predicate).saturating_mul(INV_PRED_NODE_FUEL))
+        .saturating_add(scope_units)
+}
+
+fn predicate_node_count(predicate: &PredicateAstStub) -> u64 {
+    match predicate {
+        PredicateAstStub::FieldGe { .. }
+        | PredicateAstStub::FieldLe { .. }
+        | PredicateAstStub::FieldEq { .. }
+        | PredicateAstStub::StrategyKNonDecreasing { .. }
+        | PredicateAstStub::AllPoolsKNonDecreasing
+        | PredicateAstStub::Opaque => 1,
+        PredicateAstStub::ArithCmp { lhs, rhs, .. } => {
+            1 + arith_node_count(lhs) + arith_node_count(rhs)
+        }
+        PredicateAstStub::And(a, b) | PredicateAstStub::Or(a, b) => {
+            1 + predicate_node_count(a) + predicate_node_count(b)
+        }
+        PredicateAstStub::Not(inner) => 1 + predicate_node_count(inner),
+    }
+}
+
+fn arith_node_count(expr: &ArithExprStub) -> u64 {
+    match expr {
+        ArithExprStub::Field(_) | ArithExprStub::Literal(_) => 1,
+        ArithExprStub::Bounded { lhs, rhs, .. } => {
+            1 + arith_node_count(lhs) + arith_node_count(rhs)
+        }
+    }
+}
+
+/// Evaluate one manifest predicate against a prebuilt scope buffer and record
+/// the tri-state verdict (ADR-002: recorded even on success). Callers must
+/// charge the deterministic invariant fuel before interpretation so out-of-fuel
+/// preempts predicate work.
+///
+/// The verdict is derived from the manifest AST, not the petal's `__inv_*`
+/// wasm export. Admission can check the export's signature, but hand-written
+/// or tampered wasm can return any byte, so runtime enforcement cannot trust
+/// that return value.
+fn run_invariant(
+    name: &str,
+    predicate: &PredicateAstStub,
+    scope: &[u8],
+    cmd_idx: u16,
+    outcomes: &mut Vec<InvariantOutcome>,
+) -> Result<(), PtbError> {
+    let verdict = match interpret_predicate(predicate, scope) {
+        PredicateEvalOutcome::Satisfied => InvariantVerdict::Satisfied,
+        PredicateEvalOutcome::Violated => InvariantVerdict::Violated,
+        PredicateEvalOutcome::Indeterminate => InvariantVerdict::Indeterminate,
+    };
+    outcomes.push(InvariantOutcome {
+        name: name.to_string(),
+        cmd_idx,
+        verdict,
+    });
+
+    if matches!(verdict, InvariantVerdict::Violated) {
+        return Err(PtbError::InvariantFailed {
+            cmd_idx,
+            name: name.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Build a flat field-table scope for an object-type invariant. Each
+/// statically-addressable numeric field (width ≤ 16) contributes a
+/// `before.<name>` entry (from the row's baseline payload) and an
+/// `after.<name>` entry (from its current payload) unless the row was deleted.
+/// Wider fields (32-byte ids) are not numeric and are skipped.
+fn build_object_scope(
+    type_name: &str,
+    layout: &[FieldLayoutStub],
+    before: &[u8],
+    after: &[u8],
+    created: bool,
+    deleted: bool,
+    cmd_idx: u16,
+) -> Result<Vec<u8>, PtbError> {
+    let mut fields: Vec<(String, u128)> = Vec::with_capacity(layout.len() * 2);
+    for f in layout {
+        let width = f.width as usize;
+        if width == 0 || width > 16 {
+            continue;
+        }
+        let offset = f.offset as usize;
+        if created {
+            fields.push((format!("before.{}", f.name), 0));
+        } else {
+            let v = extract_be_u128(before, offset, width).ok_or_else(|| {
+                invariant_scope_projection_error(
+                    cmd_idx,
+                    type_name,
+                    &f.name,
+                    "before",
+                    offset,
+                    width,
+                    before.len(),
+                )
+            })?;
+            fields.push((format!("before.{}", f.name), v));
+        }
+        if !deleted {
+            let v = extract_be_u128(after, offset, width).ok_or_else(|| {
+                invariant_scope_projection_error(
+                    cmd_idx,
+                    type_name,
+                    &f.name,
+                    "after",
+                    offset,
+                    width,
+                    after.len(),
+                )
+            })?;
+            fields.push((format!("after.{}", f.name), v));
+        }
+    }
+    crate::invariant_scope::build_invariant_scope(
+        crate::invariant_scope::SCOPE_KIND_OBJECT_TYPE,
+        type_name,
+        // petal_version: reserved in the wire format but unused by the v1
+        // guest evaluator (it looks fields up by name). Emitted as 0 until
+        // version-skew checks need it; not live data.
+        0,
+        &fields,
+    )
+    .map_err(PtbError::Codec)
+}
+
+fn invariant_scope_projection_error(
+    cmd_idx: u16,
+    type_name: &str,
+    field_name: &str,
+    side: &str,
+    offset: usize,
+    width: usize,
+    payload_len: usize,
+) -> PtbError {
+    PtbError::BuiltinFailed {
+        cmd_idx,
+        reason: format!(
+            "object invariant scope for {type_name}.{field_name} could not extract {side} field \
+             at offset {offset} width {width} from payload length {payload_len}"
+        ),
+    }
+}
+
+/// Read a big-endian unsigned integer of `width` bytes (≤ 16) at `offset`
+/// into a `u128`. Returns `None` if the slice is out of bounds.
+fn extract_be_u128(payload: &[u8], offset: usize, width: usize) -> Option<u128> {
+    let end = offset.checked_add(width)?;
+    let slice = payload.get(offset..end)?;
+    let mut v = 0u128;
+    for &b in slice {
+        v = (v << 8) | b as u128;
+    }
+    Some(v)
 }
 
 // -----------------------------------------------------------------------------
@@ -1298,8 +1644,12 @@ fn encode_arg_for_scope(arg: &Arg) -> Result<Vec<u8>, PtbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain_iface::{ArgDeclStub, FunctionDeclStub, PetalManifestStub, TypeParamDeclStub};
+    use crate::chain_iface::{
+        ArgDeclStub, FunctionDeclStub, InvariantDeclStub, ObjectTypeDeclStub, PetalManifestStub,
+        TypeParamDeclStub,
+    };
     use crate::host_ctx::HandleEntry;
+    use crate::predicate::{ArithExprStub, CmpOpStub};
     use crate::types::{
         Arg, Command, ExpectedVersion, MoveCmd, PetalRef, PqSignature, PtbTx, PublishCmd, UseRef,
         loom_coin_type_tag,
@@ -1363,8 +1713,8 @@ mod tests {
     struct MockPetalRunner {
         // (petal, function) -> canned return buffer + fuel
         canned: HashMap<(Hash32, String), (Vec<u8>, u64)>,
-        // (petal, export) -> (ok, fuel)
-        inv: HashMap<(Hash32, String), (bool, u64)>,
+        // (petal, export) -> canned invariant result
+        inv: HashMap<(Hash32, String), InvariantResult>,
         calls: RefCell<Vec<MockCall>>,
     }
 
@@ -1387,6 +1737,9 @@ mod tests {
         fn set(&mut self, petal: Hash32, func: &str, ret_buf: Vec<u8>, fuel: u64) {
             self.canned
                 .insert((petal, func.to_string()), (ret_buf, fuel));
+        }
+        fn set_inv(&mut self, petal: Hash32, export: &str, res: InvariantResult) {
+            self.inv.insert((petal, export.to_string()), res);
         }
     }
 
@@ -1425,13 +1778,11 @@ mod tests {
             _fuel_budget: u64,
         ) -> Result<InvariantResult, PtbError> {
             match self.inv.get(&(*petal_hash, export_name.to_string())) {
-                Some((ok, fuel)) => Ok(InvariantResult {
-                    ok: *ok,
-                    fuel_used: *fuel,
-                }),
+                Some(res) => Ok(res.clone()),
                 None => Ok(InvariantResult {
                     ok: true,
                     fuel_used: 0,
+                    indeterminate: false,
                 }),
             }
         }
@@ -1498,6 +1849,29 @@ mod tests {
             buf.extend_from_slice(it);
         }
         buf
+    }
+
+    fn always_satisfied_predicate() -> PredicateAstStub {
+        PredicateAstStub::ArithCmp {
+            op: CmpOpStub::Ge,
+            lhs: ArithExprStub::Literal(1),
+            rhs: ArithExprStub::Literal(0),
+        }
+    }
+
+    fn always_violated_predicate() -> PredicateAstStub {
+        PredicateAstStub::ArithCmp {
+            op: CmpOpStub::Ge,
+            lhs: ArithExprStub::Literal(0),
+            rhs: ArithExprStub::Literal(1),
+        }
+    }
+
+    fn value_non_increase_predicate() -> PredicateAstStub {
+        PredicateAstStub::FieldLe {
+            lhs: "after.value".to_string(),
+            rhs: "before.value".to_string(),
+        }
     }
 
     fn run(chain: &MockChain, runner: &MockPetalRunner, tx: PtbTx) -> ExecutionReport {
@@ -2478,6 +2852,500 @@ mod tests {
         );
     }
 
+    /// B1 regression: an object-type invariant must be evaluated after a
+    /// *built-in* mutation (here `MergeCoins`), not only after a `Move`
+    /// command. We register the `Coin`-defining manifest under the coin's
+    /// petal hash (`[0; 32]`, the fungible petal) with an `ObjectType("Coin")`
+    /// invariant, run `Move` (to load that manifest) then `MergeCoins`, and
+    /// assert a verdict was recorded for the command that mutated the coin.
+    /// Before B1 the firing lived inside `exec_move`, so the `MergeCoins`
+    /// command produced no invariant outcome.
+    #[test]
+    fn builtin_mutation_fires_object_invariant() {
+        use crate::chain_iface::{FieldLayoutStub, ObjectTypeDeclStub};
+        let chain = MockChain::new();
+        let (_petal, signer, gas_id) = build_pkg(&chain);
+        // The coin-defining petal *is* the fungible petal (`loom_tt()` pins
+        // petal hash `[0; 32]`); register its manifest there so the borrow
+        // rows for coins resolve to it.
+        let coin_petal = Hash32([0; 32]);
+        chain.put_path("/coin", coin_petal);
+        let a = ObjectId([0x71; 32]);
+        let b = ObjectId([0x72; 32]);
+        chain.put_object(make_coin(0x71, signer, 50, 0));
+        chain.put_object(make_coin(0x72, signer, 70, 0));
+        chain.put_petal(
+            coin_petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/coin".to_string(),
+                functions: vec![FunctionDeclStub {
+                    view: false,
+                    name: "load_two".to_string(),
+                    type_params: vec![],
+                    args: vec![
+                        ArgDeclStub::Object {
+                            ty: loom_tt(),
+                            mode: AccessMode::Mutable,
+                        },
+                        ArgDeclStub::Object {
+                            ty: loom_tt(),
+                            mode: AccessMode::Consume,
+                        },
+                    ],
+                    returns: vec![loom_tt(), loom_tt()],
+                    required_signers: 0,
+                    required_capabilities: vec![],
+                    // The object-type invariant is attached to a function but
+                    // fires on every mutation of its target type.
+                    attached_invariants: vec![InvariantDeclStub {
+                        name: "coin_value_inv".to_string(),
+                        wasm_export: "__inv_coin".to_string(),
+                        predicate: always_satisfied_predicate(),
+                        argspec: vec![],
+                        target: InvariantTargetStub::ObjectType {
+                            name: "Coin".to_string(),
+                        },
+                    }],
+                }],
+                object_types: vec![ObjectTypeDeclStub {
+                    name: "Coin".to_string(),
+                    abilities: Default::default(),
+                    // Fungible coin payload is just the 16-byte BE u128 value.
+                    field_layout: vec![FieldLayoutStub {
+                        name: "value".to_string(),
+                        offset: 0,
+                        width: 16,
+                    }],
+                    ..Default::default()
+                }],
+                external_type_refs: vec![],
+                ..Default::default()
+            },
+        );
+        let mut runner = MockPetalRunner::new();
+        runner.set(coin_petal, "load_two", build_outputs(&[&a.0, &b.0]), 10);
+        // Satisfied verdict — we are asserting the check *runs*, not its sign.
+        runner.set_inv(
+            coin_petal,
+            "__inv_coin",
+            InvariantResult {
+                ok: true,
+                fuel_used: 7,
+                indeterminate: false,
+            },
+        );
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/coin".to_string(),
+                        hash: Some(coin_petal),
+                    },
+                    function: "load_two".to_string(),
+                    type_args: vec![],
+                    args: vec![
+                        Arg::Object {
+                            id: a,
+                            expected_version: ExpectedVersion(0),
+                            access_mode: AccessMode::Mutable,
+                        },
+                        Arg::Object {
+                            id: b,
+                            expected_version: ExpectedVersion(0),
+                            access_mode: AccessMode::Consume,
+                        },
+                    ],
+                }),
+                Command::MergeCoins(vec![
+                    UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    },
+                    UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 1,
+                    },
+                ]),
+            ],
+        );
+        let report = run(&chain, &runner, tx);
+        assert!(report.success, "report: {report:?}");
+        // The MergeCoins command (idx 1) mutates coin `a` and deletes coin
+        // `b`; both object-type invariant checks must be recorded.
+        let outcomes: Vec<_> = report
+            .invariant_outcomes
+            .iter()
+            .filter(|o| o.name == "coin_value_inv" && o.cmd_idx == 1)
+            .collect();
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "expected coin_value_inv verdicts for the mutated and deleted coins, got {:?}",
+            report.invariant_outcomes
+        );
+        assert!(
+            outcomes
+                .iter()
+                .all(|o| o.verdict == InvariantVerdict::Satisfied),
+            "expected satisfied verdicts for always-true predicate, got {outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn merge_coins_deleted_input_fails_closed_for_after_field_invariant() {
+        use crate::chain_iface::{FieldLayoutStub, ObjectTypeDeclStub};
+        let chain = MockChain::new();
+        let (_petal, signer, gas_id) = build_pkg(&chain);
+        let coin_petal = Hash32([0; 32]);
+        let a = ObjectId([0x73; 32]);
+        let b = ObjectId([0x74; 32]);
+
+        chain.put_path("/coin", coin_petal);
+        chain.put_object(make_coin(0x73, signer, 50, 0));
+        chain.put_object(make_coin(0x74, signer, 70, 0));
+        chain.put_petal(
+            coin_petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/coin".to_string(),
+                functions: vec![FunctionDeclStub {
+                    view: false,
+                    name: "load_two".to_string(),
+                    type_params: vec![],
+                    args: vec![
+                        ArgDeclStub::Object {
+                            ty: loom_tt(),
+                            mode: AccessMode::Mutable,
+                        },
+                        ArgDeclStub::Object {
+                            ty: loom_tt(),
+                            mode: AccessMode::Consume,
+                        },
+                    ],
+                    returns: vec![loom_tt(), loom_tt()],
+                    required_signers: 0,
+                    required_capabilities: vec![],
+                    attached_invariants: vec![InvariantDeclStub {
+                        name: "coin_value_non_decreasing".to_string(),
+                        wasm_export: "__inv_coin".to_string(),
+                        predicate: PredicateAstStub::FieldGe {
+                            lhs: "after.value".to_string(),
+                            rhs: "before.value".to_string(),
+                        },
+                        argspec: vec![],
+                        target: InvariantTargetStub::ObjectType {
+                            name: "Coin".to_string(),
+                        },
+                    }],
+                }],
+                object_types: vec![ObjectTypeDeclStub {
+                    name: "Coin".to_string(),
+                    abilities: Default::default(),
+                    field_layout: vec![FieldLayoutStub {
+                        name: "value".to_string(),
+                        offset: 0,
+                        width: 16,
+                    }],
+                    ..Default::default()
+                }],
+                external_type_refs: vec![],
+                ..Default::default()
+            },
+        );
+
+        let mut runner = MockPetalRunner::new();
+        runner.set(coin_petal, "load_two", build_outputs(&[&a.0, &b.0]), 10);
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/coin".to_string(),
+                        hash: Some(coin_petal),
+                    },
+                    function: "load_two".to_string(),
+                    type_args: vec![],
+                    args: vec![
+                        Arg::Object {
+                            id: a,
+                            expected_version: ExpectedVersion(0),
+                            access_mode: AccessMode::Mutable,
+                        },
+                        Arg::Object {
+                            id: b,
+                            expected_version: ExpectedVersion(0),
+                            access_mode: AccessMode::Consume,
+                        },
+                    ],
+                }),
+                Command::MergeCoins(vec![
+                    UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    },
+                    UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 1,
+                    },
+                ]),
+            ],
+        );
+
+        let report = run(&chain, &runner, tx);
+        assert!(!report.success, "report: {report:?}");
+        assert!(matches!(
+            report.reverted_with,
+            Some(PtbError::InvariantFailed { ref name, cmd_idx })
+                if name == "coin_value_non_decreasing" && cmd_idx == 1
+        ));
+        assert!(
+            report.invariant_outcomes.iter().any(|o| {
+                o.name == "coin_value_non_decreasing"
+                    && o.cmd_idx == 1
+                    && o.verdict == InvariantVerdict::Violated
+            }),
+            "expected delete-path violation, got {:?}",
+            report.invariant_outcomes
+        );
+    }
+
+    #[test]
+    fn split_coins_fires_object_invariant_for_created_coin() {
+        use crate::chain_iface::{FieldLayoutStub, ObjectTypeDeclStub};
+        let chain = MockChain::new();
+        let (_petal, signer, gas_id) = build_pkg(&chain);
+        let bob = [0xB0; 32];
+        let coin_petal = Hash32([0; 32]);
+        let src = ObjectId([0x81; 32]);
+
+        chain.put_path("/coin", coin_petal);
+        chain.put_object(make_coin(0x81, signer, 100, 0));
+        chain.put_petal(
+            coin_petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/coin".to_string(),
+                functions: vec![FunctionDeclStub {
+                    view: false,
+                    name: "load_one".to_string(),
+                    type_params: vec![],
+                    args: vec![ArgDeclStub::Object {
+                        ty: loom_tt(),
+                        mode: AccessMode::Mutable,
+                    }],
+                    returns: vec![loom_tt()],
+                    required_signers: 0,
+                    required_capabilities: vec![],
+                    attached_invariants: vec![InvariantDeclStub {
+                        name: "coin_value_inv".to_string(),
+                        wasm_export: "__inv_coin".to_string(),
+                        predicate: always_satisfied_predicate(),
+                        argspec: vec![],
+                        target: InvariantTargetStub::ObjectType {
+                            name: "Coin".to_string(),
+                        },
+                    }],
+                }],
+                object_types: vec![ObjectTypeDeclStub {
+                    name: "Coin".to_string(),
+                    abilities: Default::default(),
+                    field_layout: vec![FieldLayoutStub {
+                        name: "value".to_string(),
+                        offset: 0,
+                        width: 16,
+                    }],
+                    ..Default::default()
+                }],
+                external_type_refs: vec![],
+                ..Default::default()
+            },
+        );
+
+        let mut runner = MockPetalRunner::new();
+        runner.set(coin_petal, "load_one", build_outputs(&[&src.0]), 10);
+        runner.set_inv(
+            coin_petal,
+            "__inv_coin",
+            InvariantResult {
+                ok: true,
+                fuel_used: 7,
+                indeterminate: false,
+            },
+        );
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/coin".to_string(),
+                        hash: Some(coin_petal),
+                    },
+                    function: "load_one".to_string(),
+                    type_args: vec![],
+                    args: vec![Arg::Object {
+                        id: src,
+                        expected_version: ExpectedVersion(0),
+                        access_mode: AccessMode::Mutable,
+                    }],
+                }),
+                Command::SplitCoins {
+                    src: UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    },
+                    amounts: vec![30],
+                },
+                Command::TransferObjects {
+                    uses: vec![UseRef {
+                        cmd_idx: 1,
+                        ret_idx: 0,
+                    }],
+                    owner: Owner::Address(bob),
+                },
+            ],
+        );
+
+        let report = run(&chain, &runner, tx);
+        assert!(report.success, "report: {report:?}");
+
+        let coin_outcomes: Vec<_> = report
+            .invariant_outcomes
+            .iter()
+            .filter(|o| o.name == "coin_value_inv" && o.cmd_idx == 1)
+            .collect();
+        assert_eq!(
+            coin_outcomes.len(),
+            2,
+            "SplitCoins must check source and newly-created coin; outcomes: {:?}",
+            report.invariant_outcomes
+        );
+        assert!(
+            coin_outcomes
+                .iter()
+                .all(|o| o.verdict == InvariantVerdict::Satisfied),
+            "expected both SplitCoins invariant evaluations to satisfy, got {coin_outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn tampered_invariant_export_cannot_override_manifest_predicate() {
+        use crate::chain_iface::{FieldLayoutStub, ObjectTypeDeclStub};
+
+        let chain = MockChain::new();
+        let (_petal, signer, gas_id) = build_pkg(&chain);
+        let coin_petal = Hash32([0; 32]);
+        let src = ObjectId([0x82; 32]);
+
+        chain.put_path("/coin", coin_petal);
+        chain.put_object(make_coin(0x82, signer, 100, 0));
+        chain.put_petal(
+            coin_petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/coin".to_string(),
+                functions: vec![FunctionDeclStub {
+                    view: false,
+                    name: "load_one".to_string(),
+                    type_params: vec![],
+                    args: vec![ArgDeclStub::Object {
+                        ty: loom_tt(),
+                        mode: AccessMode::Mutable,
+                    }],
+                    returns: vec![loom_tt()],
+                    required_signers: 0,
+                    required_capabilities: vec![],
+                    attached_invariants: vec![InvariantDeclStub {
+                        name: "coin_value_non_decreasing".to_string(),
+                        wasm_export: "__inv_coin".to_string(),
+                        predicate: PredicateAstStub::FieldGe {
+                            lhs: "after.value".to_string(),
+                            rhs: "before.value".to_string(),
+                        },
+                        argspec: vec![],
+                        target: InvariantTargetStub::ObjectType {
+                            name: "Coin".to_string(),
+                        },
+                    }],
+                }],
+                object_types: vec![ObjectTypeDeclStub {
+                    name: "Coin".to_string(),
+                    abilities: Default::default(),
+                    field_layout: vec![FieldLayoutStub {
+                        name: "value".to_string(),
+                        offset: 0,
+                        width: 16,
+                    }],
+                    ..Default::default()
+                }],
+                external_type_refs: vec![],
+                ..Default::default()
+            },
+        );
+
+        let mut runner = MockPetalRunner::new();
+        runner.set(coin_petal, "load_one", build_outputs(&[&src.0]), 10);
+        // This models a hand-written/tampered `__inv_coin` export that always
+        // returns "satisfied"; the executor must ignore it for enforcement.
+        runner.set_inv(
+            coin_petal,
+            "__inv_coin",
+            InvariantResult {
+                ok: true,
+                fuel_used: 0,
+                indeterminate: false,
+            },
+        );
+
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![
+                Command::Move(MoveCmd {
+                    petal: PetalRef {
+                        path: "/coin".to_string(),
+                        hash: Some(coin_petal),
+                    },
+                    function: "load_one".to_string(),
+                    type_args: vec![],
+                    args: vec![Arg::Object {
+                        id: src,
+                        expected_version: ExpectedVersion(0),
+                        access_mode: AccessMode::Mutable,
+                    }],
+                }),
+                Command::SplitCoins {
+                    src: UseRef {
+                        cmd_idx: 0,
+                        ret_idx: 0,
+                    },
+                    amounts: vec![30],
+                },
+            ],
+        );
+
+        let report = run(&chain, &runner, tx);
+        assert!(!report.success, "report: {report:?}");
+        assert!(matches!(
+            report.reverted_with,
+            Some(PtbError::InvariantFailed { ref name, .. })
+                if name == "coin_value_non_decreasing"
+        ));
+        assert!(
+            report.invariant_outcomes.iter().any(|o| {
+                o.name == "coin_value_non_decreasing"
+                    && o.cmd_idx == 1
+                    && o.verdict == InvariantVerdict::Violated
+            }),
+            "expected host-interpreted violation, got {:?}",
+            report.invariant_outcomes
+        );
+    }
+
     #[test]
     fn merge_coins_rejects_read_only_persistent_non_target() {
         let chain = MockChain::new();
@@ -2674,7 +3542,9 @@ mod tests {
                 attached_invariants: vec![InvariantDeclStub {
                     name: "always_fail".to_string(),
                     wasm_export: "__inv_0".to_string(),
+                    predicate: always_violated_predicate(),
                     argspec: vec![],
+                    target: Default::default(),
                 }],
             }],
             object_types: vec![],
@@ -2684,9 +3554,15 @@ mod tests {
         chain.put_petal(petal, vec![], manifest.clone());
         let mut runner = MockPetalRunner::new();
         runner.set(petal, "f", build_outputs(&[]), 1);
-        runner
-            .inv
-            .insert((petal, "__inv_0".to_string()), (false, 1));
+        runner.set_inv(
+            petal,
+            "__inv_0",
+            InvariantResult {
+                ok: false,
+                fuel_used: 1,
+                indeterminate: false,
+            },
+        );
         let tx = sample_signed_ptb(
             signer,
             gas_id,
@@ -2707,10 +3583,204 @@ mod tests {
             report.reverted_with,
             Some(PtbError::InvariantFailed { .. })
         ));
+        // Even a violation is recorded (ADR-002).
+        assert_eq!(report.invariant_outcomes.len(), 1);
+        assert_eq!(
+            report.invariant_outcomes[0].verdict,
+            InvariantVerdict::Violated
+        );
+    }
+
+    /// Run function `f` (one attached `__inv_0`) with the given canned
+    /// invariant result; return the execution report.
+    fn run_with_inv_result(res: InvariantResult) -> ExecutionReport {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        let manifest = PetalManifestStub {
+            module_path: "/p".to_string(),
+            functions: vec![FunctionDeclStub {
+                view: false,
+                name: "f".to_string(),
+                type_params: vec![],
+                args: vec![],
+                returns: vec![],
+                required_signers: 0,
+                required_capabilities: vec![],
+                attached_invariants: vec![InvariantDeclStub {
+                    name: "inv".to_string(),
+                    wasm_export: "__inv_0".to_string(),
+                    predicate: if res.indeterminate {
+                        PredicateAstStub::Opaque
+                    } else if res.ok {
+                        always_satisfied_predicate()
+                    } else {
+                        always_violated_predicate()
+                    },
+                    argspec: vec![],
+                    target: Default::default(),
+                }],
+            }],
+            object_types: vec![],
+            external_type_refs: vec![],
+            ..Default::default()
+        };
+        chain.put_petal(petal, vec![], manifest);
+        let mut runner = MockPetalRunner::new();
+        runner.set(petal, "f", build_outputs(&[]), 1);
+        runner.set_inv(petal, "__inv_0", res);
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/p".to_string(),
+                    hash: Some(petal),
+                },
+                function: "f".to_string(),
+                type_args: vec![],
+                args: vec![],
+            })],
+        );
+        run(&chain, &runner, tx)
     }
 
     #[test]
-    fn invariant_out_of_fuel_charges_remaining_fuel() {
+    fn build_object_scope_extracts_before_and_after_numeric_fields() {
+        use crate::chain_iface::FieldLayoutStub;
+        use crate::invariant_scope::{decode_invariant_scope, lookup_field};
+
+        // Pool-like payload prefix: id(32) | reserve_a(16) | k_last(16).
+        let layout = vec![
+            FieldLayoutStub {
+                name: "id".to_string(),
+                offset: 0,
+                width: 32, // 32-byte id: not numeric, must be skipped
+            },
+            FieldLayoutStub {
+                name: "reserve_a".to_string(),
+                offset: 32,
+                width: 16,
+            },
+            FieldLayoutStub {
+                name: "k_last".to_string(),
+                offset: 48,
+                width: 16,
+            },
+        ];
+        let payload = |reserve_a: u128, k_last: u128| {
+            let mut p = vec![0u8; 32];
+            p.extend_from_slice(&reserve_a.to_be_bytes());
+            p.extend_from_slice(&k_last.to_be_bytes());
+            p
+        };
+        let before = payload(1000, 1_000_000);
+        let after = payload(1100, 1_001_000);
+
+        let scope = build_object_scope("Pool", &layout, &before, &after, false, false, 0).unwrap();
+        let decoded = decode_invariant_scope(&scope).unwrap();
+        assert_eq!(decoded.target_name, "Pool");
+        // 32-byte id skipped; reserve_a + k_last each yield before/after.
+        assert_eq!(lookup_field(&scope, "before.reserve_a"), Some(1000));
+        assert_eq!(lookup_field(&scope, "after.reserve_a"), Some(1100));
+        assert_eq!(lookup_field(&scope, "before.k_last"), Some(1_000_000));
+        assert_eq!(lookup_field(&scope, "after.k_last"), Some(1_001_000));
+        assert_eq!(lookup_field(&scope, "before.id"), None);
+    }
+
+    #[test]
+    fn build_object_scope_zeros_before_fields_for_created_rows() {
+        use crate::chain_iface::FieldLayoutStub;
+        use crate::invariant_scope::lookup_field;
+
+        let layout = vec![FieldLayoutStub {
+            name: "value".to_string(),
+            offset: 32,
+            width: 16,
+        }];
+        let mut after = vec![0u8; 32];
+        after.extend_from_slice(&42u128.to_be_bytes());
+
+        let scope = build_object_scope("Coin", &layout, &after, &after, true, false, 0).unwrap();
+        assert_eq!(lookup_field(&scope, "before.value"), Some(0));
+        assert_eq!(lookup_field(&scope, "after.value"), Some(42));
+    }
+
+    #[test]
+    fn build_object_scope_omits_after_fields_for_deleted_rows() {
+        use crate::chain_iface::FieldLayoutStub;
+        use crate::invariant_scope::lookup_field;
+
+        let layout = vec![FieldLayoutStub {
+            name: "value".to_string(),
+            offset: 0,
+            width: 16,
+        }];
+        let before = 42u128.to_be_bytes().to_vec();
+
+        let scope = build_object_scope("Coin", &layout, &before, &[], false, true, 0).unwrap();
+        assert_eq!(lookup_field(&scope, "before.value"), Some(42));
+        assert_eq!(lookup_field(&scope, "after.value"), None);
+    }
+
+    #[test]
+    fn build_object_scope_rejects_missing_numeric_field_bytes() {
+        use crate::chain_iface::FieldLayoutStub;
+
+        let layout = vec![FieldLayoutStub {
+            name: "value".to_string(),
+            offset: 16,
+            width: 16,
+        }];
+        let payload = 42u128.to_be_bytes().to_vec();
+
+        let err =
+            build_object_scope("Vault", &layout, &payload, &payload, false, false, 7).unwrap_err();
+        assert!(
+            matches!(err, PtbError::BuiltinFailed { ref reason, cmd_idx: 7 }
+                if reason.contains("could not extract before field")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn invariant_indeterminate_does_not_revert() {
+        // Out-of-fuel evaluation is indeterminate, not a violation: the
+        // PTB must commit and the verdict be recorded (ADR-002).
+        let report = run_with_inv_result(InvariantResult {
+            ok: false,
+            fuel_used: 5,
+            indeterminate: true,
+        });
+        assert!(report.success, "indeterminate must not revert");
+        assert_eq!(report.invariant_outcomes.len(), 1);
+        assert_eq!(
+            report.invariant_outcomes[0].verdict,
+            InvariantVerdict::Indeterminate
+        );
+    }
+
+    #[test]
+    fn invariant_satisfied_is_recorded_on_success() {
+        let report = run_with_inv_result(InvariantResult {
+            ok: true,
+            fuel_used: 3,
+            indeterminate: false,
+        });
+        assert!(report.success);
+        assert_eq!(report.invariant_outcomes.len(), 1);
+        assert_eq!(
+            report.invariant_outcomes[0].verdict,
+            InvariantVerdict::Satisfied
+        );
+        assert_eq!(report.invariant_outcomes[0].name, "inv");
+        assert!(
+            report.fuel_used > 1,
+            "host-side invariant evaluation must be billed; report: {report:?}"
+        );
+    }
+
+    #[test]
+    fn invariant_out_of_fuel_preempts_predicate_verdict() {
         let chain = MockChain::new();
         let (petal, signer, gas_id) = build_pkg(&chain);
         chain.put_petal(
@@ -2727,9 +3797,11 @@ mod tests {
                     required_signers: 0,
                     required_capabilities: vec![],
                     attached_invariants: vec![InvariantDeclStub {
-                        name: "oof".to_string(),
-                        wasm_export: "__inv_oof".to_string(),
+                        name: "guard".to_string(),
+                        wasm_export: "__inv_guard".to_string(),
+                        predicate: always_satisfied_predicate(),
                         argspec: vec![],
+                        target: Default::default(),
                     }],
                 }],
                 object_types: vec![],
@@ -2739,9 +3811,82 @@ mod tests {
         );
         let mut runner = MockPetalRunner::new();
         runner.set(petal, "f", build_outputs(&[]), 1);
-        runner
-            .inv
-            .insert((petal, "__inv_oof".to_string()), (true, 2_000_000));
+        let mut tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/p".to_string(),
+                    hash: Some(petal),
+                },
+                function: "f".to_string(),
+                type_args: vec![],
+                args: vec![],
+            })],
+        );
+        tx.gas_budget = 1;
+
+        let report = run(&chain, &runner, tx);
+        assert!(!report.success, "report: {report:?}");
+        assert!(matches!(
+            report.reverted_with,
+            Some(PtbError::OutOfFuel { cmd_idx: 0, .. })
+        ));
+        assert!(
+            report.invariant_outcomes.is_empty(),
+            "out-of-fuel must preempt predicate evaluation, got {:?}",
+            report.invariant_outcomes
+        );
+    }
+
+    /// B1 / RT-006 regression: a PTB submitter cannot gas-starve a violating
+    /// check into an indeterminate non-revert. Here the guest invariant export
+    /// claims a huge fuel burn, but host-side enforcement ignores the export
+    /// verdict/cost and must still catch the manifest predicate violation.
+    #[test]
+    fn gas_starved_ptb_does_not_bypass_violating_invariant() {
+        let chain = MockChain::new();
+        let (petal, signer, gas_id) = build_pkg(&chain);
+        chain.put_petal(
+            petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/p".to_string(),
+                functions: vec![FunctionDeclStub {
+                    view: false,
+                    name: "f".to_string(),
+                    type_params: vec![],
+                    args: vec![],
+                    returns: vec![],
+                    required_signers: 0,
+                    required_capabilities: vec![],
+                    attached_invariants: vec![InvariantDeclStub {
+                        name: "guard".to_string(),
+                        wasm_export: "__inv_guard".to_string(),
+                        predicate: always_violated_predicate(),
+                        argspec: vec![],
+                        target: Default::default(),
+                    }],
+                }],
+                object_types: vec![],
+                external_type_refs: vec![],
+                ..Default::default()
+            },
+        );
+        let mut runner = MockPetalRunner::new();
+        runner.set(petal, "f", build_outputs(&[]), 1);
+        // The violating invariant burns far more than the whole PTB gas
+        // budget — under the old "leftover command fuel" model this would
+        // have surfaced as OutOfFuel → indeterminate → no revert.
+        runner.set_inv(
+            petal,
+            "__inv_guard",
+            InvariantResult {
+                ok: false,
+                fuel_used: 2_000_000,
+                indeterminate: false,
+            },
+        );
         let tx = sample_signed_ptb(
             signer,
             gas_id,
@@ -2756,12 +3901,21 @@ mod tests {
             })],
         );
         let report = run(&chain, &runner, tx);
-        assert!(!report.success);
-        assert!(matches!(
-            report.reverted_with,
-            Some(PtbError::OutOfFuel { .. })
-        ));
-        assert_eq!(report.fuel_used, 1_000_000);
+        assert!(
+            !report.success,
+            "violation must revert even when gas-starved"
+        );
+        assert!(
+            matches!(report.reverted_with, Some(PtbError::InvariantFailed { .. })),
+            "expected InvariantFailed, got {:?}",
+            report.reverted_with
+        );
+        assert_eq!(
+            report.invariant_outcomes[0].verdict,
+            InvariantVerdict::Violated
+        );
+        // Host-side evaluation is not starvable by the command's leftover
+        // wasm gas and does not trust or bill a guest `__inv_*` verdict.
     }
 
     #[test]
@@ -2819,6 +3973,13 @@ mod tests {
         /// On a call to this function name, simulate `object.mutate` on
         /// preloaded rows.
         host_mutates: std::cell::RefCell<HostMutations>,
+        /// On a call to this function name, mutate payload bytes without
+        /// marking the row dirty, matching the path auto-promoted by
+        /// `BorrowTable::diff_check`.
+        host_silent_mutates: std::cell::RefCell<HostMutations>,
+        /// On a call to this function name, simulate `object.delete` by
+        /// dropping preloaded rows from the shared borrow table.
+        host_deletes: std::cell::RefCell<HashMap<String, Vec<ObjectId>>>,
         /// Verifies that calling the runner does NOT find a held lock
         /// in the ctx mutex (i.e. the executor released it).
         try_lock_must_succeed: std::cell::Cell<bool>,
@@ -2833,6 +3994,8 @@ mod tests {
                 canned: HashMap::new(),
                 host_creates: std::cell::RefCell::new(HashMap::new()),
                 host_mutates: std::cell::RefCell::new(HashMap::new()),
+                host_silent_mutates: std::cell::RefCell::new(HashMap::new()),
+                host_deletes: std::cell::RefCell::new(HashMap::new()),
                 try_lock_must_succeed: std::cell::Cell::new(false),
                 _life: std::marker::PhantomData,
             }
@@ -2876,6 +4039,33 @@ mod tests {
                 let mut g = self.ctx.lock().unwrap();
                 for (id, payload) in mutations {
                     g.borrow_table.mark_dirty(&id, payload)?;
+                }
+            }
+            // Simulate a guest payload write that bypasses `object.mutate`;
+            // `diff_check` auto-promotes it later, but invariants must still
+            // fire before that pass.
+            if let Some(mutations) = self.host_silent_mutates.borrow_mut().remove(function) {
+                let mut g = self.ctx.lock().unwrap();
+                for (id, payload) in mutations {
+                    let row = g
+                        .borrow_table
+                        .get_mut(&id)
+                        .ok_or(PtbError::ObjectNotFound { id })?;
+                    row.payload_bytes = payload;
+                }
+            }
+            // Simulate `object.delete` host import.
+            if let Some(deletes) = self.host_deletes.borrow_mut().remove(function) {
+                let mut g = self.ctx.lock().unwrap();
+                for id in deletes {
+                    let old_owner = g
+                        .borrow_table
+                        .get(&id)
+                        .ok_or(PtbError::ObjectNotFound { id })?
+                        .owner
+                        .clone();
+                    g.object_deletes.push((id, old_owner));
+                    g.borrow_table.drop_row(&id);
                 }
             }
             // Test #2: simulate `object.create` host import.
@@ -2926,6 +4116,7 @@ mod tests {
             Ok(InvariantResult {
                 ok: true,
                 fuel_used: 0,
+                indeterminate: false,
             })
         }
     }
@@ -3009,11 +4200,351 @@ mod tests {
     }
 
     #[test]
+    fn silent_payload_delta_fires_object_invariant_before_diff_check() {
+        use crate::chain_iface::{FieldLayoutStub, ObjectTypeDeclStub};
+        let chain = MockChain::new();
+        let (_petal, signer, gas_id) = build_pkg(&chain);
+        let coin_petal = Hash32([0; 32]);
+        let coin_id = ObjectId([0xCE; 32]);
+
+        chain.put_path("/coin", coin_petal);
+        chain.put_object(make_coin(0xCE, signer, 100, 0));
+        chain.put_petal(
+            coin_petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/coin".to_string(),
+                functions: vec![FunctionDeclStub {
+                    view: false,
+                    name: "silent".to_string(),
+                    type_params: vec![],
+                    args: vec![ArgDeclStub::Object {
+                        ty: loom_tt(),
+                        mode: AccessMode::Mutable,
+                    }],
+                    returns: vec![],
+                    required_signers: 0,
+                    required_capabilities: vec![],
+                    attached_invariants: vec![InvariantDeclStub {
+                        name: "coin_value_inv".to_string(),
+                        wasm_export: "__inv_coin".to_string(),
+                        predicate: value_non_increase_predicate(),
+                        argspec: vec![],
+                        target: InvariantTargetStub::ObjectType {
+                            name: "Coin".to_string(),
+                        },
+                    }],
+                }],
+                object_types: vec![ObjectTypeDeclStub {
+                    name: "Coin".to_string(),
+                    abilities: Default::default(),
+                    field_layout: vec![FieldLayoutStub {
+                        name: "value".to_string(),
+                        offset: 0,
+                        width: 16,
+                    }],
+                    ..Default::default()
+                }],
+                external_type_refs: vec![],
+                ..Default::default()
+            },
+        );
+
+        let ctx = Arc::new(Mutex::new(PtbHostCtx::new()));
+        let mut runner = AssertingRunner::new(Arc::clone(&ctx));
+        runner.set("silent", build_outputs(&[]), 5);
+        runner
+            .host_silent_mutates
+            .borrow_mut()
+            .insert("silent".to_string(), vec![(coin_id, coin_payload(70))]);
+
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/coin".to_string(),
+                    hash: Some(coin_petal),
+                },
+                function: "silent".to_string(),
+                type_args: vec![],
+                args: vec![Arg::Object {
+                    id: coin_id,
+                    expected_version: ExpectedVersion(0),
+                    access_mode: AccessMode::Mutable,
+                }],
+            })],
+        );
+
+        let verifier = AlwaysOkVerifier;
+        let vctx = ValidationContext {
+            mode: ValidationMode::Commit,
+            current_block: chain.block,
+            chain: &chain,
+            verifier: &verifier,
+            loom_coin_type: loom_tt(),
+        };
+        let validated = validate_ptb(&tx, &vctx).unwrap();
+        let mut exec = PtbExecutor::with_ctx_arc(
+            &chain,
+            &runner,
+            loom_tt(),
+            Hash32([0; 32]),
+            Arc::clone(&ctx),
+        );
+        let report = exec.execute(validated);
+        assert!(report.success, "report: {report:?}");
+
+        let outcome = report
+            .invariant_outcomes
+            .iter()
+            .find(|o| o.name == "coin_value_inv" && o.cmd_idx == 0)
+            .expect("silent payload delta must fire object invariant");
+        assert_eq!(outcome.verdict, InvariantVerdict::Satisfied);
+    }
+
+    #[test]
+    fn object_delete_fails_closed_for_after_field_invariant() {
+        use crate::chain_iface::{FieldLayoutStub, ObjectTypeDeclStub};
+        let chain = MockChain::new();
+        let (_petal, signer, gas_id) = build_pkg(&chain);
+        let coin_petal = Hash32([0; 32]);
+        let coin_id = ObjectId([0xCF; 32]);
+
+        chain.put_path("/coin", coin_petal);
+        chain.put_object(make_coin(0xCF, signer, 100, 0));
+        chain.put_petal(
+            coin_petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/coin".to_string(),
+                functions: vec![FunctionDeclStub {
+                    view: false,
+                    name: "delete".to_string(),
+                    type_params: vec![],
+                    args: vec![ArgDeclStub::Object {
+                        ty: loom_tt(),
+                        mode: AccessMode::Consume,
+                    }],
+                    returns: vec![],
+                    required_signers: 0,
+                    required_capabilities: vec![],
+                    attached_invariants: vec![InvariantDeclStub {
+                        name: "coin_value_non_decreasing".to_string(),
+                        wasm_export: "__inv_coin".to_string(),
+                        predicate: PredicateAstStub::FieldGe {
+                            lhs: "after.value".to_string(),
+                            rhs: "before.value".to_string(),
+                        },
+                        argspec: vec![],
+                        target: InvariantTargetStub::ObjectType {
+                            name: "Coin".to_string(),
+                        },
+                    }],
+                }],
+                object_types: vec![ObjectTypeDeclStub {
+                    name: "Coin".to_string(),
+                    abilities: Default::default(),
+                    field_layout: vec![FieldLayoutStub {
+                        name: "value".to_string(),
+                        offset: 0,
+                        width: 16,
+                    }],
+                    ..Default::default()
+                }],
+                external_type_refs: vec![],
+                ..Default::default()
+            },
+        );
+
+        let ctx = Arc::new(Mutex::new(PtbHostCtx::new()));
+        let mut runner = AssertingRunner::new(Arc::clone(&ctx));
+        runner.set("delete", build_outputs(&[]), 5);
+        runner
+            .host_deletes
+            .borrow_mut()
+            .insert("delete".to_string(), vec![coin_id]);
+
+        let tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/coin".to_string(),
+                    hash: Some(coin_petal),
+                },
+                function: "delete".to_string(),
+                type_args: vec![],
+                args: vec![Arg::Object {
+                    id: coin_id,
+                    expected_version: ExpectedVersion(0),
+                    access_mode: AccessMode::Consume,
+                }],
+            })],
+        );
+
+        let verifier = AlwaysOkVerifier;
+        let vctx = ValidationContext {
+            mode: ValidationMode::Commit,
+            current_block: chain.block,
+            chain: &chain,
+            verifier: &verifier,
+            loom_coin_type: loom_tt(),
+        };
+        let validated = validate_ptb(&tx, &vctx).unwrap();
+        let mut exec = PtbExecutor::with_ctx_arc(
+            &chain,
+            &runner,
+            loom_tt(),
+            Hash32([0; 32]),
+            Arc::clone(&ctx),
+        );
+        let report = exec.execute(validated);
+        assert!(!report.success, "report: {report:?}");
+        assert!(matches!(
+            report.reverted_with,
+            Some(PtbError::InvariantFailed { ref name, cmd_idx })
+                if name == "coin_value_non_decreasing" && cmd_idx == 0
+        ));
+        assert!(
+            report.invariant_outcomes.iter().any(|o| {
+                o.name == "coin_value_non_decreasing"
+                    && o.cmd_idx == 0
+                    && o.verdict == InvariantVerdict::Violated
+            }),
+            "expected delete-path violation, got {:?}",
+            report.invariant_outcomes
+        );
+    }
+
+    #[test]
+    fn object_delete_invariant_out_of_fuel_preempts_fail_closed_verdict() {
+        use crate::chain_iface::{FieldLayoutStub, ObjectTypeDeclStub};
+        let chain = MockChain::new();
+        let (_petal, signer, gas_id) = build_pkg(&chain);
+        let coin_petal = Hash32([0; 32]);
+        let coin_id = ObjectId([0xD0; 32]);
+
+        chain.put_path("/coin", coin_petal);
+        chain.put_object(make_coin(0xD0, signer, 100, 0));
+        chain.put_petal(
+            coin_petal,
+            vec![],
+            PetalManifestStub {
+                module_path: "/coin".to_string(),
+                functions: vec![FunctionDeclStub {
+                    view: false,
+                    name: "delete".to_string(),
+                    type_params: vec![],
+                    args: vec![ArgDeclStub::Object {
+                        ty: loom_tt(),
+                        mode: AccessMode::Consume,
+                    }],
+                    returns: vec![],
+                    required_signers: 0,
+                    required_capabilities: vec![],
+                    attached_invariants: vec![InvariantDeclStub {
+                        name: "coin_value_non_decreasing".to_string(),
+                        wasm_export: "__inv_coin".to_string(),
+                        predicate: PredicateAstStub::FieldGe {
+                            lhs: "after.value".to_string(),
+                            rhs: "before.value".to_string(),
+                        },
+                        argspec: vec![],
+                        target: InvariantTargetStub::ObjectType {
+                            name: "Coin".to_string(),
+                        },
+                    }],
+                }],
+                object_types: vec![ObjectTypeDeclStub {
+                    name: "Coin".to_string(),
+                    abilities: Default::default(),
+                    field_layout: vec![FieldLayoutStub {
+                        name: "value".to_string(),
+                        offset: 0,
+                        width: 16,
+                    }],
+                    ..Default::default()
+                }],
+                external_type_refs: vec![],
+                ..Default::default()
+            },
+        );
+
+        let ctx = Arc::new(Mutex::new(PtbHostCtx::new()));
+        let mut runner = AssertingRunner::new(Arc::clone(&ctx));
+        runner.set("delete", build_outputs(&[]), 5);
+        runner
+            .host_deletes
+            .borrow_mut()
+            .insert("delete".to_string(), vec![coin_id]);
+
+        let mut tx = sample_signed_ptb(
+            signer,
+            gas_id,
+            vec![Command::Move(MoveCmd {
+                petal: PetalRef {
+                    path: "/coin".to_string(),
+                    hash: Some(coin_petal),
+                },
+                function: "delete".to_string(),
+                type_args: vec![],
+                args: vec![Arg::Object {
+                    id: coin_id,
+                    expected_version: ExpectedVersion(0),
+                    access_mode: AccessMode::Consume,
+                }],
+            })],
+        );
+        tx.gas_budget = 5;
+
+        let verifier = AlwaysOkVerifier;
+        let vctx = ValidationContext {
+            mode: ValidationMode::Commit,
+            current_block: chain.block,
+            chain: &chain,
+            verifier: &verifier,
+            loom_coin_type: loom_tt(),
+        };
+        let validated = validate_ptb(&tx, &vctx).unwrap();
+        let mut exec = PtbExecutor::with_ctx_arc(
+            &chain,
+            &runner,
+            loom_tt(),
+            Hash32([0; 32]),
+            Arc::clone(&ctx),
+        );
+        let report = exec.execute(validated);
+        assert!(!report.success, "report: {report:?}");
+        assert!(matches!(
+            report.reverted_with,
+            Some(PtbError::OutOfFuel { cmd_idx: 0, .. })
+        ));
+        assert!(
+            report.invariant_outcomes.is_empty(),
+            "out-of-fuel must preempt deleted-row predicate evaluation, got {:?}",
+            report.invariant_outcomes
+        );
+    }
+
+    #[test]
     fn repeated_move_object_arg_uses_current_command_access_mode() {
         let chain = MockChain::new();
         let (petal, signer, gas_id) = build_pkg(&chain);
         let obj_id = ObjectId([0xA7; 32]);
         chain.put_object(make_non_coin_resource(0xA7, signer, 1, 0));
+        chain.put_petal(
+            Hash32([0x99; 32]),
+            vec![],
+            PetalManifestStub {
+                module_path: "/vault".to_string(),
+                object_types: vec![ObjectTypeDeclStub {
+                    name: "Vault".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
         chain.put_petal(
             petal,
             vec![],

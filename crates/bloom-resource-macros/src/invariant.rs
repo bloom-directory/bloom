@@ -2,28 +2,58 @@
 //!
 //! ```ignore
 //! #[invariant(
-//!     name = "reserve_product_non_decreasing",
-//!     target = "Pool<A, B, S>",
-//!     pred  = |p: &Pool<A, B, S>| S::k(p) >= p.k_last
+//!     name   = "pool_k_non_decreasing",
+//!     target = "Pool",   // base object-type name; fires on each Pool mutation
+//!     pred   = |before, after| after.reserve_a * after.reserve_b >= before.k_last
+//!     text   = "the pool constant-product k never decreases across a swap", // optional
 //! )]
-//! pub fn swap_a_for_b<A, B, S>(...) -> Coin<B> { ... }
+//! pub fn swap_exact_in<A, B>(...) -> Coin<B> { ... }
 //! ```
 //!
-//! In phase 1 the macro records the invariant decl (name, target,
-//! predicate AST best-effort, wasm export name) onto the function as a
-//! tagged attribute that the petal-level macro later collects. The
-//! emitted `__inv_<idx>` body is a stub (see [`crate::codegen::emit_invariant_shim`]).
+//! The `pred` closure compares an object's `before`/`after` state; reference
+//! fields as `before.<field>` / `after.<field>`. The macro lowers it to a
+//! [`PredicateAst`] and the petal-level macro compiles a real `__inv_<idx>`
+//! evaluator from it (see [`crate::codegen::emit_invariant_shim`]).
 //!
-//! `pred` is parsed best-effort into [`PredicateAst`]; unrecognized
-//! shapes round-trip as [`PredicateAst::Opaque`].
+//! **Supported predicate shapes:** comparisons (`>=`, `<=`, `==`) between field
+//! or bounded-arithmetic (`*`, `+`, `u128` literals) expressions, composed
+//! with boolean `&&`/`||`/`!` (ADR-015) — lowered to
+//! [`PredicateAst::FieldGe`]/`FieldLe`/`FieldEq`, [`PredicateAst::ArithCmp`],
+//! and [`PredicateAst::And`]/`Or`/`Not`. Only fixed-prefix unsigned-integer
+//! fields (`u8`..`u128`) are addressable as numeric invariant fields; `bool`
+//! is intentionally excluded rather than modeled as `u8` (ADR-011).
+//! Subtraction (`-`) lowers but is **rejected at deploy** for now: the guest
+//! fails closed to Violated on underflow while the trusted interpreter returns
+//! Indeterminate, and the differential gate does not yet cover that split.
+//! Nested bounded arithmetic and bounded arithmetic on both sides of a
+//! comparison are also rejected at deploy until the trusted interpreter uses
+//! exact `U256` semantics throughout — use a single `+`/`*` expression on one
+//! side of the comparison for now.
+//!
+//! **Unsupported shapes are rejected at deploy** (fail-closed, ADR-014):
+//! `S::k(p)`-style calls and any closure that doesn't lower to a supported
+//! shape ([`PredicateAst::Opaque`]) are refused by `validate_chain_wasm`, not
+//! silently accepted — the generated `__inv_<idx>` evaluator returns `0`
+//! (Violated) for these arms rather than running any original closure.
+//! Predicates that are statically vacuous (always-true / always-false) are
+//! likewise rejected (ADR-003 intent-conformance).
+//!
+//! See `docs/guides/authoring-invariants.md` for the full author guide and
+//! `docs/research/formal-verification/08-implementation-status.md` for status.
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{Attribute, BinOp, Expr, ExprBinary, ExprClosure, ExprField, ExprPath, ItemFn, Meta};
+use syn::{
+    Attribute, BinOp, Expr, ExprBinary, ExprClosure, ExprField, ExprPath, ExprUnary, ItemFn, Meta,
+    UnOp,
+};
 
 use crate::ast::{attr_is_named, parse_str_value};
 use crate::error::err_spanned;
-use bloom_petal_manifest::types::{InvariantDecl, InvariantTarget, PredicateAst};
+use bloom_petal_manifest::types::{
+    ArithExpr, BoundedArithOp, CmpOp, InvariantDecl, InvariantTarget, OverflowPolicy, PredicateAst,
+    Widening,
+};
 
 /// Parsed `#[invariant(...)]` attribute.
 #[derive(Debug, Clone)]
@@ -35,6 +65,9 @@ pub(crate) struct InvariantAttr {
     pub target: Option<String>,
     /// Predicate closure expr (parsed for AST shape).
     pub pred: Option<Expr>,
+    /// Optional natural-language claim paired with the predicate (ADR-003,
+    /// spec↔intent). Stored in the manifest's `InvariantDecl.human_text`.
+    pub text: Option<String>,
 }
 
 impl InvariantAttr {
@@ -59,6 +92,7 @@ impl InvariantAttr {
         let mut name: Option<String> = None;
         let mut target: Option<String> = None;
         let mut pred: Option<Expr> = None;
+        let mut text: Option<String> = None;
 
         if let Meta::List(list) = &outer.meta {
             let nested = list.parse_args_with(
@@ -75,10 +109,13 @@ impl InvariantAttr {
                     Meta::NameValue(nv) if nv.path.is_ident("pred") => {
                         pred = Some(nv.value.clone());
                     }
+                    Meta::NameValue(nv) if nv.path.is_ident("text") => {
+                        text = Some(parse_str_value(nv)?);
+                    }
                     other => {
                         return Err(err_spanned(
                             other,
-                            "unknown #[invariant] argument; expected `name`, `target`, or `pred`",
+                            "unknown #[invariant] argument; expected `name`, `target`, `pred`, or `text`",
                         ));
                     }
                 }
@@ -94,6 +131,7 @@ impl InvariantAttr {
             })?,
             target,
             pred,
+            text,
         })
     }
 }
@@ -118,28 +156,71 @@ pub(crate) fn build_decl(attr: &InvariantAttr, host_fn: &ItemFn, idx: u16) -> In
         target,
         predicate,
         wasm_export: format!("__inv_{}", idx),
+        human_text: attr.text.clone().unwrap_or_default(),
     }
 }
 
 /// Lower a Rust `Expr` into a best-effort [`PredicateAst`]. Unknown
-/// shapes round-trip as [`PredicateAst::Opaque`] — the body of the
-/// generated `__inv_<idx>` export still runs the original closure
-/// (spec §12.3: machine-readability is best-effort).
+/// shapes round-trip as [`PredicateAst::Opaque`], which the generated
+/// `__inv_<idx>` evaluator lowers to `0` (Violated — fail-closed) and
+/// `validate_chain_wasm` rejects at deploy; there is no fallback to running
+/// the original closure on-chain.
 pub(crate) fn predicate_ast_of(expr: &Expr) -> PredicateAst {
-    // Strip leading parens and (the common case) a closure to get to
-    // the body.
+    // Strip the closure wrapper, then lower the body recursively.
     let body = match expr {
         Expr::Closure(ExprClosure { body, .. }) => body.as_ref(),
-        Expr::Paren(p) => p.expr.as_ref(),
+        other => other,
+    };
+    lower_predicate(body)
+}
+
+/// Recursively lower a predicate expression. Handles boolean composition
+/// (`&&`, `||`, `!`) by recursion; leaves are field / bounded-arithmetic
+/// comparisons. Unknown shapes round-trip as [`PredicateAst::Opaque`].
+fn lower_predicate(expr: &Expr) -> PredicateAst {
+    let body = match expr {
+        Expr::Paren(p) => return lower_predicate(p.expr.as_ref()),
         other => other,
     };
 
-    // Bin-op: `lhs <cmp> rhs`.
+    // Boolean negation: `!inner`.
+    if let Expr::Unary(ExprUnary {
+        op: UnOp::Not(_),
+        expr,
+        ..
+    }) = body
+    {
+        return PredicateAst::Not(Box::new(lower_predicate(expr)));
+    }
+
+    // Bin-op: boolean composition `&&` / `||`, else a `lhs <cmp> rhs` leaf.
     if let Expr::Binary(ExprBinary {
         left, op, right, ..
     }) = body
     {
-        let (lhs_name, rhs_name) = (field_name_of(left), field_name_of(right));
+        match op {
+            BinOp::And(_) => {
+                return PredicateAst::And(
+                    Box::new(lower_predicate(left)),
+                    Box::new(lower_predicate(right)),
+                );
+            }
+            BinOp::Or(_) => {
+                return PredicateAst::Or(
+                    Box::new(lower_predicate(left)),
+                    Box::new(lower_predicate(right)),
+                );
+            }
+            _ => {}
+        }
+        // Simple field comparison. Use *qualified* names (`after.reserve_a`,
+        // not `reserve_a`) so the leaf matches the flat field-table scope
+        // keys the host builds (`before.<f>` / `after.<f>`); an unqualified
+        // name would never resolve and the predicate would fail closed.
+        let (lhs_name, rhs_name) = (
+            qualified_field_name_of(left),
+            qualified_field_name_of(right),
+        );
         if let (Some(l), Some(r)) = (lhs_name, rhs_name) {
             return match op {
                 BinOp::Ge(_) => PredicateAst::FieldGe { lhs: l, rhs: r },
@@ -147,6 +228,18 @@ pub(crate) fn predicate_ast_of(expr: &Expr) -> PredicateAst {
                 BinOp::Eq(_) => PredicateAst::FieldEq { lhs: l, rhs: r },
                 _ => PredicateAst::Opaque,
             };
+        }
+
+        // Bounded-arithmetic comparison, e.g.
+        // `after.reserve_a * after.reserve_b >= before.k_last` (plan §7).
+        if let Some(cmp) = cmp_op_of(op) {
+            if let (Some(l), Some(r)) = (arith_expr_of(left), arith_expr_of(right)) {
+                return PredicateAst::ArithCmp {
+                    op: cmp,
+                    lhs: l,
+                    rhs: r,
+                };
+            }
         }
 
         // `S::k(p) >= p.k_last` — pool-style invariant (spec §12.1).
@@ -162,6 +255,71 @@ pub(crate) fn predicate_ast_of(expr: &Expr) -> PredicateAst {
     }
 
     PredicateAst::Opaque
+}
+
+/// Map a comparison `BinOp` to a [`CmpOp`].
+fn cmp_op_of(op: &BinOp) -> Option<CmpOp> {
+    match op {
+        BinOp::Ge(_) => Some(CmpOp::Ge),
+        BinOp::Le(_) => Some(CmpOp::Le),
+        BinOp::Eq(_) => Some(CmpOp::Eq),
+        _ => None,
+    }
+}
+
+/// Lower an arithmetic sub-expression over scope fields into an
+/// [`ArithExpr`]. Recognizes qualified field accesses (`after.reserve_a`),
+/// `u128` literals, and `*`/`+`/`-` of such. Returns `None` for shapes
+/// outside the v1 vocabulary (the predicate then falls back to `Opaque`).
+fn arith_expr_of(e: &Expr) -> Option<ArithExpr> {
+    match e {
+        Expr::Paren(p) => arith_expr_of(&p.expr),
+        Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(i),
+            ..
+        }) => i.base10_parse::<u128>().ok().map(ArithExpr::Literal),
+        Expr::Binary(ExprBinary {
+            left, op, right, ..
+        }) => {
+            let arith_op = match op {
+                BinOp::Mul(_) => BoundedArithOp::Mul,
+                BinOp::Add(_) => BoundedArithOp::Add,
+                BinOp::Sub(_) => BoundedArithOp::Sub,
+                _ => return None,
+            };
+            Some(ArithExpr::Bounded {
+                op: arith_op,
+                lhs: Box::new(arith_expr_of(left)?),
+                rhs: Box::new(arith_expr_of(right)?),
+                // 256-bit intermediates hold any product of two u128s, so
+                // the comparison never overflows; overflow elsewhere is
+                // surfaced as indeterminate (ADR-009).
+                widening: Widening::U256,
+                on_overflow: OverflowPolicy::Indeterminate,
+            })
+        }
+        _ => qualified_field_name_of(e).map(ArithExpr::Field),
+    }
+}
+
+/// Extract a qualified field name from a `<base>.<field>` access, e.g.
+/// `after.reserve_a` → `"after.reserve_a"`. A bare single-segment path
+/// (`reserve_a`) returns itself.
+fn qualified_field_name_of(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Field(ExprField {
+            base,
+            member: syn::Member::Named(field),
+            ..
+        }) => {
+            let base = qualified_field_name_of(base)?;
+            Some(format!("{base}.{field}"))
+        }
+        Expr::Path(ExprPath { path, .. }) if path.segments.len() == 1 => {
+            Some(path.segments[0].ident.to_string())
+        }
+        _ => None,
+    }
 }
 
 /// Extract a bare field name from a `<receiver>.<field>` access expr.
@@ -250,12 +408,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_text_attr() {
+        let a = InvariantAttr::parse(quote! { name = "x", text = "a never decreases" }).unwrap();
+        assert_eq!(a.name, "x");
+        assert_eq!(a.text.as_deref(), Some("a never decreases"));
+        assert!(a.target.is_none());
+        assert!(a.pred.is_none());
+    }
+
+    #[test]
+    fn parse_full_attr_with_text() {
+        let a = InvariantAttr::parse(quote! {
+            name = "x", target = "Pool", pred = |before, after| after.a >= before.a,
+            text = "a never decreases across any mutation"
+        })
+        .unwrap();
+        assert_eq!(a.name, "x");
+        assert_eq!(a.target.as_deref(), Some("Pool"));
+        assert!(a.pred.is_some());
+        assert_eq!(
+            a.text.as_deref(),
+            Some("a never decreases across any mutation")
+        );
+    }
+
+    #[test]
     fn predicate_field_ge_recognized() {
         let e: Expr = syn::parse2(quote! { |p: &Pool| p.a >= p.b }).unwrap();
         match predicate_ast_of(&e) {
             PredicateAst::FieldGe { lhs, rhs } => {
-                assert_eq!(lhs, "a");
-                assert_eq!(rhs, "b");
+                assert_eq!(lhs, "p.a");
+                assert_eq!(rhs, "p.b");
+            }
+            other => panic!("expected FieldGe, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn predicate_field_ge_qualifies_before_after_names() {
+        // A simple before/after comparison must produce the *qualified*
+        // names that match the runtime scope keys — otherwise the leaf
+        // would never resolve and the invariant would fail closed.
+        let e: Expr =
+            syn::parse2(quote! { |before, after| after.reserve_a >= before.k_last }).unwrap();
+        match predicate_ast_of(&e) {
+            PredicateAst::FieldGe { lhs, rhs } => {
+                assert_eq!(lhs, "after.reserve_a");
+                assert_eq!(rhs, "before.k_last");
             }
             other => panic!("expected FieldGe, got {:?}", other),
         }
@@ -271,6 +470,36 @@ mod tests {
     fn predicate_field_eq_recognized() {
         let e: Expr = syn::parse2(quote! { |p: &Pool| p.a == p.b }).unwrap();
         assert!(matches!(predicate_ast_of(&e), PredicateAst::FieldEq { .. }));
+    }
+
+    #[test]
+    fn predicate_boolean_composition_lowers() {
+        // The corrected pool_k form: k non-decreasing OR a liquidity event.
+        let e: Expr = syn::parse2(quote! {
+            |before, after| after.reserve_a * after.reserve_b >= before.k_last
+                || !(after.lp_supply == before.lp_supply)
+        })
+        .unwrap();
+        match predicate_ast_of(&e) {
+            PredicateAst::Or(l, r) => {
+                assert!(matches!(*l, PredicateAst::ArithCmp { .. }));
+                match *r {
+                    PredicateAst::Not(inner) => {
+                        assert!(matches!(*inner, PredicateAst::FieldEq { .. }))
+                    }
+                    other => panic!("expected Not(FieldEq), got {other:?}"),
+                }
+            }
+            other => panic!("expected Or, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn predicate_and_lowers() {
+        let e: Expr =
+            syn::parse2(quote! { |before, after| after.a >= before.a && after.a <= after.cap })
+                .unwrap();
+        assert!(matches!(predicate_ast_of(&e), PredicateAst::And(_, _)));
     }
 
     #[test]
@@ -298,6 +527,22 @@ mod tests {
             InvariantTarget::ObjectType { name } => assert_eq!(name, "Pool<A>"),
             _ => panic!("expected ObjectType target"),
         }
+    }
+
+    #[test]
+    fn build_decl_with_text_passes_human_text_through() {
+        let f: ItemFn = syn::parse2(quote! { pub fn swap() {} }).unwrap();
+        let a = InvariantAttr::parse(quote! { name = "x", text = "a never decreases" }).unwrap();
+        let d = build_decl(&a, &f, 0);
+        assert_eq!(d.human_text, "a never decreases");
+    }
+
+    #[test]
+    fn build_decl_without_text_has_empty_human_text() {
+        let f: ItemFn = syn::parse2(quote! { pub fn swap() {} }).unwrap();
+        let a = InvariantAttr::parse(quote! { name = "x" }).unwrap();
+        let d = build_decl(&a, &f, 0);
+        assert_eq!(d.human_text, "");
     }
 
     #[test]

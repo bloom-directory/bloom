@@ -23,7 +23,7 @@
 //! - `inner_kind = 2` (ExpireAt): the cap stops honouring at
 //!   block height `expires_at_block`.
 //!
-//! These kinds compose with the boolean `revoked` flag: a revoked cap
+//! These kinds compose with the `revoked` flag: a revoked cap
 //! is inactive regardless of kind.
 //!
 //! ## Layout
@@ -32,7 +32,7 @@
 //! - 32 bytes: `id` placeholder
 //! - 1 byte: `inner_kind`
 //! - 8 bytes BE: `expires_at_block`
-//! - 1 byte: `revoked` (`0`/`1`)
+//! - 1 byte: `revoked` flag (`0`/`1`)
 //!
 //! See `tests/payload_roundtrip.rs` for the wire-level snapshot.
 
@@ -125,8 +125,10 @@ pub mod cap {
         /// Block height at which an `ExpireAt` cap stops honouring.
         /// Ignored when `inner_kind != INNER_KIND_EXPIRE_AT`.
         expires_at_block: u64,
-        /// Set by [`revoke`] — once true the cap is permanently inactive.
-        revoked: bool,
+        /// Set by [`revoke`] — once nonzero the cap is permanently inactive.
+        /// Stored as `u8` rather than `bool` so invariant scopes can address
+        /// it as a numeric field.
+        revoked: u8,
         _marker: PhantomData<T>,
     }
 
@@ -203,6 +205,16 @@ pub mod cap {
     /// authorizes this operation; the runtime cap-check ensures the
     /// caller actually holds a matching revoke cap. Preserves the
     /// current inner-kind and expiry.
+    ///
+    /// Invariant (fires on *every* `Cap` mutation, ADR-010): revocation is
+    /// permanent — `revoked` never goes 1→0 — and both discriminants stay in
+    /// range. Demonstrates the framework on a non-DEX petal and uses boolean
+    /// composition (`&&` over field and bounded comparisons).
+    #[invariant(
+        name = "cap_revoked_is_monotone",
+        target = "Cap",
+        pred = |before, after| after.revoked >= before.revoked && after.revoked <= 1 && after.inner_kind <= 2
+    )]
     pub fn revoke<T>(_rc: &Capability<RevokeCap<T>>, cap: &mut Resource<Cap<T>>) {
         let (kind, exp, _revoked) = read_cap_fields(cap.handle());
         write_cap_fields(cap.handle(), kind, exp, true);
@@ -268,7 +280,7 @@ pub mod cap {
             id: UID::from_bytes([0u8; 32]),
             inner_kind,
             expires_at_block,
-            revoked,
+            revoked: revoked as u8,
             _marker: PhantomData,
         }
         .canonical_encode()
@@ -278,7 +290,7 @@ pub mod cap {
     /// expires_at_block, revoked)`.
     fn decode_cap_payload(buf: &[u8]) -> Option<(u8, u64, bool)> {
         let cap = Cap::<Erased>::canonical_decode(buf).ok()?;
-        Some((cap.inner_kind, cap.expires_at_block, cap.revoked))
+        Some((cap.inner_kind, cap.expires_at_block, cap.revoked != 0))
     }
 
     /// Materialize a fresh `Cap<T>` in the borrow table.

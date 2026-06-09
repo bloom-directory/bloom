@@ -44,6 +44,11 @@ pub enum CodecError {
     /// A length value was outside the helper's declared bounds.
     #[error("invalid length: {0}")]
     InvalidLength(u64),
+    /// A recursively-decoded structure (e.g. a predicate AST) nested
+    /// deeper than the decoder's bound. Guards against a malicious blob
+    /// stack-overflowing the decoder.
+    #[error("recursion limit exceeded while decoding")]
+    RecursionLimit,
 }
 
 /// Read `N` bytes from `rdr`, advancing the cursor.

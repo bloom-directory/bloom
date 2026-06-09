@@ -237,6 +237,95 @@ impl ChainPetalRunner {
             }
         }
     }
+
+    /// Observation-only invariant dispatch.
+    ///
+    /// Invariants must not be able to mutate the live PTB host context or
+    /// advance the threaded chain snapshot. Run them with no `PtbHostCtx`,
+    /// against a cloned snapshot, and always restore the original checkpoint
+    /// after the VM returns.
+    fn dispatch_invariant(
+        &self,
+        petal_hash: &Hash32,
+        export_name: String,
+        scope_buf: Vec<u8>,
+        fuel_budget: u64,
+    ) -> Result<PetalCallResult, PtbError> {
+        let wasm = self
+            .petals
+            .get(petal_hash)
+            .ok_or(PtbError::PetalNotFound { hash: *petal_hash })?
+            .clone();
+
+        let mut snap_slot = self.snapshot.lock().expect("snapshot mutex poisoned");
+        let checkpoint = snap_slot
+            .as_ref()
+            .expect("ChainPetalRunner snapshot missing")
+            .clone();
+
+        let input = ChainCallInput {
+            wasm,
+            external_manifests: self
+                .petals
+                .iter()
+                .filter_map(|(hash, wasm)| extract_petal_manifest_v0(wasm).map(|m| (*hash, m)))
+                .collect(),
+            entry: ChainEntry::Function(export_name),
+            contract_address: Address(petal_hash.0),
+            msg_sender: self.msg_sender,
+            msg_value: 0,
+            calldata: scope_buf,
+            block: self.block.clone(),
+            fuel: fuel_budget,
+            snapshot: checkpoint.clone(),
+            ptb_ctx: None,
+        };
+
+        let result = match PetalVm::run_chain_call(input) {
+            Ok(out) => {
+                if let Some(reason) = out.revert_reason {
+                    let _ = reason;
+                    Err(PtbError::PetalAbort {
+                        cmd_idx: 0,
+                        code: -1,
+                        fuel_used: out.fuel_used,
+                    })
+                } else {
+                    Ok(PetalCallResult {
+                        ret_buf: out.return_data.unwrap_or_default(),
+                        fuel_used: out.fuel_used,
+                    })
+                }
+            }
+            Err(e) => {
+                let trap_fuel_used = match &e {
+                    PetalError::ChainCallTrap { fuel_used, .. } => *fuel_used,
+                    _ => fuel_budget,
+                };
+                let msg = e.to_string().to_lowercase();
+                if msg.contains("out of fuel")
+                    || msg.contains("outoffuel")
+                    || msg.contains("all fuel consumed")
+                    || msg.contains("fuel exhausted")
+                {
+                    Err(PtbError::OutOfFuel {
+                        cmd_idx: 0,
+                        limit: fuel_budget,
+                        used: trap_fuel_used,
+                    })
+                } else {
+                    Err(PtbError::PetalAbort {
+                        cmd_idx: 0,
+                        code: -2,
+                        fuel_used: trap_fuel_used,
+                    })
+                }
+            }
+        };
+
+        *snap_slot = Some(checkpoint);
+        result
+    }
 }
 
 fn calldata_with_type_args(type_args: &[TypeTag], args_buf: &[u8]) -> Result<Vec<u8>, PtbError> {
@@ -311,20 +400,35 @@ impl PetalRunner for ChainPetalRunner {
     ) -> Result<InvariantResult, PtbError> {
         // Invariant exports are already in `__inv_<n>` form — pass
         // through unchanged.
-        let result = self.dispatch(
+        match self.dispatch_invariant(
             petal_hash,
             export_name.to_string(),
             scope_buf.to_vec(),
             fuel_budget,
-        )?;
-        // The invariant ABI is `() -> i32`; bloom-resource-macros
-        // wraps it so the returned buffer's first byte is 1 (ok) or 0
-        // (failed). An empty buffer is treated as failure (conservative).
-        let ok = result.ret_buf.first().copied() == Some(1);
-        Ok(InvariantResult {
-            ok,
-            fuel_used: result.fuel_used,
-        })
+        ) {
+            Ok(result) => {
+                // The invariant ABI is `() -> i32`; bloom-resource-macros
+                // wraps it so the returned buffer's first byte is 1 (ok)
+                // or 0 (failed). An empty buffer is treated as failure
+                // (conservative).
+                let ok = result.ret_buf.first().copied() == Some(1);
+                Ok(InvariantResult {
+                    ok,
+                    fuel_used: result.fuel_used,
+                    indeterminate: false,
+                })
+            }
+            // Out-of-fuel during invariant evaluation is *indeterminate*,
+            // not a violation (ADR-002): the predicate was too expensive
+            // to decide, so the host must not revert on it. `dispatch`
+            // has already surfaced fuel exhaustion as `OutOfFuel`.
+            Err(PtbError::OutOfFuel { .. }) => Ok(InvariantResult {
+                ok: false,
+                fuel_used: fuel_budget,
+                indeterminate: true,
+            }),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -335,7 +439,13 @@ impl PetalRunner for ChainPetalRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bloom_chain_state::State;
+    use bloom_chain_state::{Account, State};
+    use bloom_chain_types::digest::tags;
+    use bloom_script::executor::LogEntry;
+
+    fn wat(src: &str) -> Vec<u8> {
+        wat::parse_str(src).expect("valid wat fixture")
+    }
 
     fn block_ctx() -> BlockCtx {
         BlockCtx {
@@ -424,5 +534,92 @@ mod tests {
         assert_eq!(const_len, 16);
         assert_eq!(&cursor[..const_len], &42u128.to_be_bytes());
         assert!(cursor[const_len..].is_empty());
+    }
+
+    #[test]
+    fn invariant_call_does_not_mutate_ptb_host_context() {
+        let wasm = wat(r#"
+            (module
+              (import "chain" "petal.return" (func $ret (param i32 i32)))
+              (import "log" "emit" (func $emit (param i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 0) "\01")
+              (data (i32.const 8) "topic")
+              (data (i32.const 16) "data")
+              (func (export "__inv_0") (param i32 i32) (result i32)
+                (drop (call $emit (i32.const 8) (i32.const 5) (i32.const 16) (i32.const 4)))
+                (call $ret (i32.const 0) (i32.const 1))
+                i32.const 0)
+            )
+            "#);
+        let petal_hash = bloom_chain_types::digest::blake3_tagged(tags::PETAL, &wasm);
+        let mut petals = BTreeMap::new();
+        petals.insert(petal_hash, wasm);
+
+        let mut host = PtbHostCtx::new();
+        host.current_petal_hash = Hash32([0xAA; 32]);
+        host.logs.push(LogEntry {
+            petal: Hash32([0xBB; 32]),
+            topic: b"existing".to_vec(),
+            data: b"log".to_vec(),
+        });
+        let ctx = Arc::new(Mutex::new(host));
+        let runner = ChainPetalRunner::new(
+            petals,
+            Arc::clone(&ctx),
+            State::new().snapshot(),
+            block_ctx(),
+            Address([0u8; 32]),
+        );
+
+        let result = runner
+            .call_invariant(&petal_hash, "__inv_0", &[], 1_000_000)
+            .expect("invariant call succeeds");
+        assert!(result.ok);
+
+        let ctx = ctx.lock().expect("PtbHostCtx mutex poisoned");
+        assert_eq!(ctx.current_petal_hash, Hash32([0xAA; 32]));
+        assert_eq!(ctx.logs.len(), 1);
+        assert_eq!(ctx.logs[0].topic, b"existing");
+    }
+
+    #[test]
+    fn invariant_call_preserves_runner_snapshot() {
+        let wasm = wat(r#"
+            (module
+              (import "chain" "petal.return" (func $ret (param i32 i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 0) "\01")
+              (func (export "__inv_0") (param i32 i32) (result i32)
+                (call $ret (i32.const 0) (i32.const 1))
+                i32.const 0)
+            )
+            "#);
+        let petal_hash = bloom_chain_types::digest::blake3_tagged(tags::PETAL, &wasm);
+        let mut petals = BTreeMap::new();
+        petals.insert(petal_hash, wasm);
+
+        let addr = Address([0x42; 32]);
+        let mut state = State::new();
+        let mut acct = Account::empty();
+        acct.nonce = 7;
+        state.set_account(addr, acct);
+        let ctx = Arc::new(Mutex::new(PtbHostCtx::new()));
+        let runner = ChainPetalRunner::new(
+            petals,
+            ctx,
+            state.snapshot(),
+            block_ctx(),
+            Address([0u8; 32]),
+        );
+
+        let result = runner
+            .call_invariant(&petal_hash, "__inv_0", &[], 1_000_000)
+            .expect("invariant call succeeds");
+        assert!(result.ok);
+
+        let final_snap = runner.into_snapshot();
+        let acct = final_snap.get_account(&addr).expect("account preserved");
+        assert_eq!(acct.nonce, 7);
     }
 }

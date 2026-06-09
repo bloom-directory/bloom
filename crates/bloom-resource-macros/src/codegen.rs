@@ -15,10 +15,12 @@
 use bloom_objects::TypeTag;
 use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
-use syn::{GenericArgument, Ident, PathArguments, Type, TypePath};
+use syn::{GenericArgument, Ident, LitByteStr, PathArguments, Type, TypePath};
 
 use bloom_petal_manifest::codec as manifest_codec;
-use bloom_petal_manifest::types::{ArgKind, PetalManifestV0};
+use bloom_petal_manifest::types::{
+    ArgKind, ArithExpr, BoundedArithOp, CmpOp, PetalManifestV0, PredicateAst,
+};
 
 // ---------------------------------------------------------------------------
 // Manifest blob embedding
@@ -793,29 +795,250 @@ pub(crate) fn emit_dispatch_helper() -> TokenStream {
 /// Build the `__inv_<idx>` wasm export that runs the invariant predicate
 /// against an encoded scope buffer (spec §12.2).
 ///
-/// Like [`emit_petal_shim`], the body is currently a `return 1` stub
-/// (predicate always satisfied). The shim signature matches the spec
-/// so the chain can call it.
-pub(crate) fn emit_invariant_shim(idx: u16) -> TokenStream {
+/// The body is the real lowering of `predicate` produced by
+/// [`emit_predicate_eval`]: a pure `__bloom_inv_<idx>_eval(&[u8]) -> i32`
+/// that reads named fields from the flat field-table scope and returns `1`
+/// (satisfied) / `0` (violated or — fail-closed — indeterminate). The
+/// `#[cfg(wasm32)]` export wraps it with the chain-VM calldata/return ABI:
+/// it reads the scope via `chain.msg.calldata.read` and delivers the 1/0
+/// verdict byte through `chain.petal.return` (the `i32` return is
+/// vestigial — `petal_return` traps). The earlier `return 1` stub is gone.
+pub(crate) fn emit_invariant_shim(idx: u16, predicate: &PredicateAst) -> TokenStream {
     let export_name = format!("__inv_{}", idx);
     let shim_ident = format_ident!("__bloom_inv_{}", idx);
+    let eval_ident = format_ident!("__bloom_inv_{}_eval", idx);
+    let body = emit_predicate_eval(predicate);
 
     quote! {
-        /// Auto-generated wasm export shim for `#[invariant]` (spec
-        /// §12.1). Returns `1` (satisfied) as a stub until the
-        /// predicate-AST → wasm-body lowering lands.
-        #[cfg(target_arch = "wasm32")]
-        #[unsafe(export_name = #export_name)]
-        pub extern "C" fn #shim_ident(_scope_ptr: i32, _scope_len: i32) -> i32 {
-            1
+        /// Auto-generated predicate evaluator for `#[invariant]` (spec
+        /// §12.1). Reads the flat field-table scope buffer and returns
+        /// `1` (satisfied) / `0` (violated). Pure and architecture-agnostic
+        /// so host-side differential tests can drive it with a slice; the
+        /// wasm export below wraps it with the chain-VM calldata/return ABI.
+        #[allow(dead_code)]
+        pub fn #eval_ident(scope: &[u8]) -> i32 {
+            #body
         }
 
-        /// Host-side mirror of the invariant shim.
-        #[cfg(not(target_arch = "wasm32"))]
-        #[allow(dead_code)]
-        pub fn #shim_ident(_scope_ptr: i32, _scope_len: i32) -> i32 {
-            1
+        /// Wasm export shim. The chain VM delivers the scope buffer as
+        /// calldata (read via `chain.msg.calldata.read`) and consumes the
+        /// verdict via `chain.petal.return` — the same ABI as `__petal_*`
+        /// shims (a 1/0 byte; the host reads `ret_buf[0]`). The `i32`
+        /// return is vestigial: `petal_return` traps.
+        #[cfg(target_arch = "wasm32")]
+        #[unsafe(export_name = #export_name)]
+        pub extern "C" fn #shim_ident(__scope_offset: i32, __scope_len: i32) -> i32 {
+            let __scope: ::std::vec::Vec<u8> = if __scope_len <= 0 {
+                ::std::vec::Vec::new()
+            } else {
+                ::bloom_resource::host::calldata_read(__scope_offset, __scope_len as usize)
+            };
+            let __verdict = #eval_ident(&__scope) as u8;
+            // `petal_return` traps (diverges); the `-> i32` is vestigial.
+            ::bloom_resource::host::petal_return(&[__verdict])
         }
+    }
+}
+
+/// Emit the per-module invariant runtime: scope field lookup plus
+/// 256-bit checked arithmetic shared by every `__inv_<idx>` evaluator.
+/// Emitted once when a petal declares at least one invariant.
+pub(crate) fn emit_invariant_runtime() -> TokenStream {
+    quote! {
+        /// Shared runtime for `#[invariant]` predicate evaluators.
+        /// 256-bit values are `(hi, lo)`; operands fit in `u128`.
+        #[allow(dead_code)]
+        mod __bloom_inv_rt {
+            /// 256-bit unsigned integer as `(hi, lo)`.
+            pub type U256 = (u128, u128);
+
+            /// Widen a `u128` to `U256`.
+            pub fn widen(v: u128) -> U256 {
+                (0, v)
+            }
+
+            /// Find a named `u128` field in the flat field-table scope
+            /// buffer (`bloom_script::invariant_scope` wire format).
+            pub fn lookup(scope: &[u8], name: &[u8]) -> Option<u128> {
+                fn take<'a>(s: &'a [u8], i: &mut usize, n: usize) -> Option<&'a [u8]> {
+                    let end = i.checked_add(n)?;
+                    let out = s.get(*i..end)?;
+                    *i = end;
+                    Some(out)
+                }
+                fn u16_be(b: &[u8]) -> usize {
+                    ((b[0] as usize) << 8) | b[1] as usize
+                }
+                let mut i = 0usize;
+                take(scope, &mut i, 1)?; // scope_kind
+                let tlen = u16_be(take(scope, &mut i, 2)?);
+                take(scope, &mut i, tlen)?; // target_name
+                take(scope, &mut i, 4)?; // petal_version
+                let count = u16_be(take(scope, &mut i, 2)?);
+                for _ in 0..count {
+                    let nlen = u16_be(take(scope, &mut i, 2)?);
+                    let entry = take(scope, &mut i, nlen)?;
+                    let val = take(scope, &mut i, 16)?;
+                    if entry == name {
+                        let mut b = [0u8; 16];
+                        b.copy_from_slice(val);
+                        return Some(u128::from_be_bytes(b));
+                    }
+                }
+                None
+            }
+
+            /// Compare two `U256`s. `op`: 0 = `>=`, 1 = `<=`, 2 = `==`.
+            pub fn cmp(op: u8, l: U256, r: U256) -> bool {
+                match op {
+                    0 => l.0 > r.0 || (l.0 == r.0 && l.1 >= r.1),
+                    1 => l.0 < r.0 || (l.0 == r.0 && l.1 <= r.1),
+                    _ => l == r,
+                }
+            }
+
+            /// 256-bit product of two `u128`-bounded values. `None` if an
+            /// operand exceeds `u128` (outside the v1 domain).
+            pub fn mul(a: U256, b: U256) -> Option<U256> {
+                if a.0 != 0 || b.0 != 0 {
+                    return None;
+                }
+                let (x, y) = (a.1, b.1);
+                let (xl, xh) = (x as u64 as u128, x >> 64);
+                let (yl, yh) = (y as u64 as u128, y >> 64);
+                let ll = xl * yl;
+                let lh = xl * yh;
+                let hl = xh * yl;
+                let hh = xh * yh;
+                let (mid, carry) = lh.overflowing_add(hl);
+                let mid_lo = mid << 64;
+                let mid_hi = (mid >> 64) | ((carry as u128) << 64);
+                let (lo, c) = ll.overflowing_add(mid_lo);
+                let hi = hh.wrapping_add(mid_hi).wrapping_add(c as u128);
+                Some((hi, lo))
+            }
+
+            /// 256-bit checked addition. `None` on 256-bit overflow.
+            pub fn add(a: U256, b: U256) -> Option<U256> {
+                let (lo, c) = a.1.overflowing_add(b.1);
+                let hi = a.0.checked_add(b.0)?.checked_add(c as u128)?;
+                Some((hi, lo))
+            }
+
+            /// 256-bit subtraction. `None` on underflow.
+            pub fn sub(a: U256, b: U256) -> Option<U256> {
+                if !cmp(0, a, b) {
+                    return None; // a < b
+                }
+                let (lo, borrow) = a.1.overflowing_sub(b.1);
+                let hi = a.0 - b.0 - borrow as u128;
+                Some((hi, lo))
+            }
+        }
+    }
+}
+
+/// Lower a [`PredicateAst`] to a Rust expression returning `1` (satisfied)
+/// or `0` (violated/indeterminate — fail-closed). Unsupported shapes lower
+/// to `0` and are rejected by chain admission.
+fn emit_predicate_eval(p: &PredicateAst) -> TokenStream {
+    match p {
+        PredicateAst::ArithCmp { op, lhs, rhs } => {
+            let l = emit_arith(lhs);
+            let r = emit_arith(rhs);
+            let op = cmp_op_byte(*op);
+            quote! {
+                match (#l, #r) {
+                    (Some(l), Some(r)) => if __bloom_inv_rt::cmp(#op, l, r) { 1 } else { 0 },
+                    _ => 0,
+                }
+            }
+        }
+        PredicateAst::FieldGe { lhs, rhs } => emit_field_cmp(0, lhs, rhs),
+        PredicateAst::FieldLe { lhs, rhs } => emit_field_cmp(1, lhs, rhs),
+        PredicateAst::FieldEq { lhs, rhs } => emit_field_cmp(2, lhs, rhs),
+        // Boolean composition (short-circuit over the 1/0 leaf results).
+        PredicateAst::And(a, b) => {
+            let (a, b) = (emit_predicate_eval(a), emit_predicate_eval(b));
+            quote! { if (#a) == 0 { 0 } else { #b } }
+        }
+        PredicateAst::Or(a, b) => {
+            let (a, b) = (emit_predicate_eval(a), emit_predicate_eval(b));
+            quote! { if (#a) == 1 { 1 } else { #b } }
+        }
+        PredicateAst::Not(inner) => {
+            let inner = emit_predicate_eval(inner);
+            quote! { 1 - (#inner) }
+        }
+        // Shapes the flat field-table evaluator cannot enforce: fail
+        // *closed* (`0` = violated). Deploy-time validation
+        // (`validate_chain_wasm` via `predicate_is_enforceable`) rejects
+        // these outright; this is defense-in-depth so an unenforceable
+        // predicate can never silently pass if one slips through.
+        PredicateAst::StrategyKNonDecreasing { .. }
+        | PredicateAst::AllPoolsKNonDecreasing
+        | PredicateAst::Opaque => quote! { 0 },
+    }
+}
+
+fn emit_field_cmp(op: u8, lhs: &str, rhs: &str) -> TokenStream {
+    let lhs = LitByteStr::new(lhs.as_bytes(), Span::call_site());
+    let rhs = LitByteStr::new(rhs.as_bytes(), Span::call_site());
+    quote! {
+        match (
+            __bloom_inv_rt::lookup(scope, #lhs),
+            __bloom_inv_rt::lookup(scope, #rhs),
+        ) {
+            (Some(l), Some(r)) => if __bloom_inv_rt::cmp(
+                #op,
+                __bloom_inv_rt::widen(l),
+                __bloom_inv_rt::widen(r),
+            ) { 1 } else { 0 },
+            _ => 0,
+        }
+    }
+}
+
+/// Lower an [`ArithExpr`] to a Rust expression of type
+/// `Option<__bloom_inv_rt::U256>` (`None` ⇒ indeterminate).
+///
+/// This lowering is intentionally broader than the deployable v1 surface.
+/// Admission rejects nested bounded arithmetic and bounded arithmetic on both
+/// sides until the trusted interpreter uses exact `U256`; see
+/// `predicate_uses_unsupported_arithmetic_shape`.
+fn emit_arith(e: &ArithExpr) -> TokenStream {
+    match e {
+        ArithExpr::Field(name) => {
+            let name = LitByteStr::new(name.as_bytes(), Span::call_site());
+            quote! { __bloom_inv_rt::lookup(scope, #name).map(__bloom_inv_rt::widen) }
+        }
+        ArithExpr::Literal(v) => {
+            let v = proc_macro2::Literal::u128_suffixed(*v);
+            quote! { Some(__bloom_inv_rt::widen(#v)) }
+        }
+        ArithExpr::Bounded { op, lhs, rhs, .. } => {
+            let l = emit_arith(lhs);
+            let r = emit_arith(rhs);
+            let f = match op {
+                BoundedArithOp::Add => quote! { __bloom_inv_rt::add },
+                BoundedArithOp::Sub => quote! { __bloom_inv_rt::sub },
+                BoundedArithOp::Mul => quote! { __bloom_inv_rt::mul },
+            };
+            quote! {
+                match (#l, #r) {
+                    (Some(a), Some(b)) => #f(a, b),
+                    _ => None,
+                }
+            }
+        }
+    }
+}
+
+fn cmp_op_byte(op: CmpOp) -> u8 {
+    match op {
+        CmpOp::Ge => 0,
+        CmpOp::Le => 1,
+        CmpOp::Eq => 2,
     }
 }
 
@@ -903,9 +1126,54 @@ mod tests {
 
     #[test]
     fn invariant_shim_uses_proper_export_name() {
-        let s = emit_invariant_shim(7).to_string();
+        let s = emit_invariant_shim(7, &PredicateAst::Opaque).to_string();
         assert!(s.contains("__inv_7"));
-        assert!(s.contains("_scope_ptr"));
+        assert!(s.contains("__bloom_inv_7_eval"));
+        // Uses the calldata/return ABI, not a raw memory pointer.
+        assert!(s.contains("calldata_read"));
+        assert!(s.contains("petal_return"));
+    }
+
+    #[test]
+    fn invariant_shim_lowers_arith_cmp() {
+        let pred = PredicateAst::ArithCmp {
+            op: CmpOp::Ge,
+            lhs: ArithExpr::Bounded {
+                op: BoundedArithOp::Mul,
+                lhs: Box::new(ArithExpr::Field("after.reserve_a".to_string())),
+                rhs: Box::new(ArithExpr::Field("after.reserve_b".to_string())),
+                widening: Widening::U256,
+                on_overflow: OverflowPolicy::Indeterminate,
+            },
+            rhs: ArithExpr::Field("before.k_last".to_string()),
+        };
+        let s = emit_invariant_shim(0, &pred).to_string();
+        assert!(s.contains("__bloom_inv_rt :: mul"));
+        assert!(s.contains("__bloom_inv_rt :: cmp"));
+        assert!(s.contains("after.reserve_a"));
+        assert!(s.contains("before.k_last"));
+    }
+
+    #[test]
+    fn invariant_shim_lowers_literal_and_boolean() {
+        // `after.inner_kind <= 2 && !(after.x == before.x)` — exercises a
+        // suffixed `u128` literal (regression: must emit `2u128`, not `2 u128`)
+        // plus And/Not short-circuit lowering.
+        let pred = PredicateAst::And(
+            Box::new(PredicateAst::ArithCmp {
+                op: CmpOp::Le,
+                lhs: ArithExpr::Field("after.inner_kind".to_string()),
+                rhs: ArithExpr::Literal(2),
+            }),
+            Box::new(PredicateAst::Not(Box::new(PredicateAst::FieldEq {
+                lhs: "after.x".to_string(),
+                rhs: "before.x".to_string(),
+            }))),
+        );
+        let s = emit_invariant_shim(0, &pred).to_string();
+        assert!(s.contains("2u128"), "literal must be suffixed: {s}");
+        assert!(!s.contains("2 u128"), "literal must not be space-split");
+        assert!(s.contains("1 - ("), "Not lowers to 1 - (inner)");
     }
 
     #[test]

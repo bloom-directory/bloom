@@ -341,10 +341,14 @@ mod tests {
                     FieldDecl {
                         name: "id".to_string(),
                         ty: builtin("UID"),
+                        offset: Some(0),
+                        width: Some(32),
                     },
                     FieldDecl {
                         name: "name".to_string(),
                         ty: builtin("String"),
+                        offset: None,
+                        width: None,
                     },
                 ],
             }],
@@ -382,6 +386,8 @@ mod tests {
                 fields: vec![FieldDecl {
                     name: "value".to_string(),
                     ty: TypeTag::Generic { idx: 0 },
+                    offset: None,
+                    width: None,
                 }],
             }],
             ..Default::default()
@@ -453,6 +459,8 @@ mod tests {
                 fields: vec![FieldDecl {
                     name: "foreign".to_string(),
                     ty: TypeTag::External { ref_idx: 0 },
+                    offset: None,
+                    width: None,
                 }],
                 ..Default::default()
             }],
@@ -464,6 +472,8 @@ mod tests {
                 fields: vec![FieldDecl {
                     name: "value".to_string(),
                     ty: builtin("u64"),
+                    offset: None,
+                    width: Some(8),
                 }],
                 ..Default::default()
             }],
@@ -506,6 +516,8 @@ mod tests {
                 fields: vec![FieldDecl {
                     name: "foreign".to_string(),
                     ty: TypeTag::External { ref_idx: 0 },
+                    offset: None,
+                    width: None,
                 }],
                 ..Default::default()
             }],
