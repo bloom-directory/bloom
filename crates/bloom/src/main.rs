@@ -42,7 +42,7 @@ const DEFAULT_MOUNT_PATH: &str = "/bloom";
     name = "bloom",
     version,
     about = "Bloom — an agentic Ethereum wallet as a virtual filesystem",
-    long_about = "Bloom mounts Ethereum and EVM chains as files for agents. Read balances, contracts, ENS, prices, and status with cat/ls; stage wallet actions by writing intents into an outbox; confirm only after reviewing the generated plan. New agents should read https://bloom.directory/SKILL.md, then run bloom init and bloom vfs cat /docs/README.md."
+    long_about = "Bloom mounts an agentic Ethereum wallet as a directory for agents. Read balances, contracts, ENS, prices, and status with cat/ls; stage wallet actions by writing intents into an outbox; confirm only after reviewing the generated plan. New agents should read https://bloom.directory/SKILL.md, then run bloom init and bloom serve --mount ~/bloom. Use bloom vfs only as a fallback when mounting is unavailable."
 )]
 struct Cli {
     /// Override home directory (default: ~/.bloom).
@@ -357,7 +357,9 @@ async fn run(cli: Cli) -> Result<()> {
             println!("home: {}", d.home.root().display());
             println!("config: {}", d.home.config_path().display());
             println!("chains: {:?}", d.chains.list_names());
-            println!("next: bloom vfs cat /docs/README.md");
+            println!("next: mkdir -p ~/bloom && bloom serve --mount ~/bloom");
+            println!("then: ls ~/bloom && cat ~/bloom/docs/README.md");
+            println!("fallback: bloom vfs cat /docs/README.md");
             println!("agent setup: https://bloom.directory/SKILL.md");
             Ok(())
         }

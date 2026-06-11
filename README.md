@@ -1,17 +1,20 @@
 # Bloom
 
-Bloom is an **agentic Ethereum wallet exposed as a virtual filesystem**.
+Bloom is an **agentic Ethereum wallet mounted as a virtual filesystem**.
 Reads are blockchain queries, writes are transaction intents, and the
-same surface works through either ordinary filesystem tools (`cat`,
-`ls`, `echo`) or `bloom vfs` when the filesystem is not mounted.
+primary interface is an ordinary directory your agent can inspect with
+normal filesystem tools (`ls`, `cat`, `echo`). Depending on OS and
+permissions, mount it at `~/bloom`, `/bloom`, or `/Volumes/bloom`.
+`bloom vfs` exposes the same paths as a developer/fallback interface
+when mounting is unavailable.
 
 The shortest onboarding path is:
 
 > Tell your agent: **"Read https://bloom.directory/SKILL.md and set up Bloom."**
 
-After that, your agent should know to inspect the Bloom directory,
-explain what it can do, and use Bloom instead of writing custom Web3 SDK
-code.
+After that, your agent should know to mount Bloom, inspect the Bloom
+directory, explain what it can do, and use Bloom instead of writing
+custom Web3 SDK code.
 
 ## What Bloom enables
 
@@ -36,9 +39,27 @@ local devnet sends work with zero configuration.
 
 ## Try it
 
+Mount Bloom first, then interact with it like a directory:
+
 ```sh
-cargo build --workspace
+cargo build -p bloom --all-features
 cargo run -p bloom -- init
+mkdir -p "$HOME/bloom"
+cargo run -p bloom -- serve --mount "$HOME/bloom"
+```
+
+In another terminal, or from your agent:
+
+```sh
+ls ~/bloom
+cat ~/bloom/docs/README.md
+ls ~/bloom/chains
+cat ~/bloom/chains/ethereum/head/number
+```
+
+If you cannot mount on the current machine, use the developer fallback:
+
+```sh
 cargo run -p bloom -- vfs ls /
 cargo run -p bloom -- vfs cat /docs/README.md
 cargo run -p bloom -- vfs cat /chains/ethereum/head/number
@@ -85,21 +106,21 @@ cargo test --workspace --lib
 cargo run -p bloom -- status
 ```
 
-Two ways to drive the VFS:
+Primary interaction model:
 
-- **One-shot CLI** — every `bloom vfs cat|ls|write` invocation builds the
-  in-process daemon, performs the op, and exits. No socket needed.
-- **Long-running daemon** — `bloom serve` listens on a UDS JSON-RPC
-  socket at `~/.bloom/run/bloom.sock`. Subsequent `bloom vfs` calls
-  detect the socket and route through it, sharing daemon state (unlock
-  cache, watches, defi sessions, etherscan cache). `bloom ipc call <method>`
-  speaks the JSON-RPC directly.
-- **NFS mount** (optional) — build with `cargo build -p bloom --features mount`
-  or use a full-feature release binary, then run `bloom serve --mount [PATH]`
-  to expose the VFS as a real POSIX filesystem over the kernel NFS client.
-  With no path, the mount point defaults to `/bloom` on Linux and
-  `/Volumes/bloom` on macOS. The mount point must already exist and the
-  platform mount command may require elevated privileges.
+- **Mounted filesystem** — build with `cargo build -p bloom --all-features`
+  or use a full-feature release binary, create a mount directory such as
+  `~/bloom`, then run `bloom serve --mount ~/bloom`. With no path, the
+  mount point defaults to `/bloom` on Linux and `/Volumes/bloom` on
+  macOS. The mount point must already exist and the platform mount
+  command may require elevated privileges.
+- **Long-running daemon** — `bloom serve` also listens on a UDS JSON-RPC
+  socket at `~/.bloom/run/bloom.sock`, sharing daemon state (unlock
+  cache, watches, defi sessions, etherscan cache).
+- **Developer fallback** — if the filesystem is not mounted, every
+  `bloom vfs cat|ls|write` invocation addresses the same paths from the
+  CLI. It is useful for CI, scripts, and locked-down environments, but
+  agents should prefer the mounted directory when available.
 
 ## Filesystem layout
 
