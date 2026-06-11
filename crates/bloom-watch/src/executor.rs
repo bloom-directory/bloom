@@ -1135,6 +1135,7 @@ impl WatchExecutor {
             .map_err(|e| WatchError::Io(std::io::Error::other(e.to_string())))?;
         new_live.write_all(line.as_bytes()).await?;
         new_live.write_all(b"\n").await?;
+        new_live.flush().await?;
         Ok(())
     }
 }
