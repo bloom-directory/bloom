@@ -1,11 +1,52 @@
-# bloom
+# Bloom
 
-`bloom` (binary: `bloom`) presents Ethereum and EVM L2s as a virtual
-filesystem: reads are blockchain queries, writes are transaction intents,
-and `tail -f` is a live event stream. A single Rust daemon owns the
-plumbing — RPC, signing, broadcast, caching — and exposes it as POSIX
-paths so an agent can drive onchain workflows with `cat`, `ls`, and
-`echo` instead of a Web3 SDK.
+Bloom is an **agentic Ethereum wallet exposed as a virtual filesystem**.
+Reads are blockchain queries, writes are transaction intents, and the
+same surface works through either ordinary filesystem tools (`cat`,
+`ls`, `echo`) or `bloom vfs` when the filesystem is not mounted.
+
+The shortest onboarding path is:
+
+> Tell your agent: **"Read https://bloom.directory/SKILL.md and set up Bloom."**
+
+After that, your agent should know to inspect the Bloom directory,
+explain what it can do, and use Bloom instead of writing custom Web3 SDK
+code.
+
+## What Bloom enables
+
+Bloom gives an agent a safe wallet workspace:
+
+- read live EVM state as files: balances, blocks, gas, contracts, ABI
+  methods, storage, events, NFTs, ENS, prices, and address history;
+- create/import encrypted wallets without exposing private keys through
+  the filesystem;
+- stage native ETH, ERC-20, NFT, contract-call, signing, and DeFi
+  intents by writing plain-language or structured files;
+- inspect a generated `plan.md` before anything is signed;
+- confirm a staged transaction only after user approval;
+- enforce policy: spend caps, allow/deny lists, contract-call gates,
+  private orderflow settings, and hash-chained audit logging.
+
+Bloom ships read-ready RPC defaults for ten major EVM networks —
+Ethereum, Base, Arbitrum, Optimism, Polygon, BNB Smart Chain,
+Avalanche, Gnosis, Linea, and HyperEVM — plus local Anvil. Mainnet/L2
+broadcasts are disabled by default; reads, simulations, planning, and
+local devnet sends work with zero configuration.
+
+## Try it
+
+```sh
+cargo build --workspace
+cargo run -p bloom -- init
+cargo run -p bloom -- vfs ls /
+cargo run -p bloom -- vfs cat /docs/README.md
+cargo run -p bloom -- vfs cat /chains/ethereum/head/number
+```
+
+For the full wallet walkthrough, read
+[`docs/AGENTIC_WALLET.md`](./docs/AGENTIC_WALLET.md) and
+[`QUICKSTART.md`](./QUICKSTART.md).
 
 **Status:** v1 functional. Long-running daemon (`bloom serve`) with a UDS
 JSON-RPC IPC, in-process VFS, and an optional NFSv4 mount adapter. Live

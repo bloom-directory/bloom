@@ -1,6 +1,12 @@
-# bloom virtual filesystem
+# Bloom virtual filesystem
 
-This is the help file vendored into the daemon.
+Bloom is an agentic Ethereum wallet exposed as a virtual filesystem.
+Agents can inspect chains with reads, stage wallet actions with writes,
+and review generated plans before any transaction is signed.
+
+If you are setting Bloom up for a user, start from
+`https://bloom.directory/SKILL.md`; it is the canonical agent setup
+prompt.
 
 ## Running
 
@@ -37,6 +43,11 @@ elevated privileges. Without a mount, the same paths are available through
 - `ens/` — forward / reverse / text / contenthash resolution.
 - `prices/` — DefiLlama price oracle (current / historical).
 - `addressbook/` — local petname directory.
+
+Default config includes read-ready RPCs for Ethereum, Base, Arbitrum,
+Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, HyperEVM,
+and local Anvil. Live-network broadcasts remain disabled until the user
+opts in via config.
 
 ## Reading
 

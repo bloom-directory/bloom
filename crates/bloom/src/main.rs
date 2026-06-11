@@ -41,7 +41,8 @@ const DEFAULT_MOUNT_PATH: &str = "/bloom";
 #[command(
     name = "bloom",
     version,
-    about = "bloom — Ethereum as a virtual filesystem"
+    about = "Bloom — an agentic Ethereum wallet as a virtual filesystem",
+    long_about = "Bloom mounts Ethereum and EVM chains as files for agents. Read balances, contracts, ENS, prices, and status with cat/ls; stage wallet actions by writing intents into an outbox; confirm only after reviewing the generated plan. New agents should read https://bloom.directory/SKILL.md, then run bloom init and bloom vfs cat /docs/README.md."
 )]
 struct Cli {
     /// Override home directory (default: ~/.bloom).
@@ -356,6 +357,8 @@ async fn run(cli: Cli) -> Result<()> {
             println!("home: {}", d.home.root().display());
             println!("config: {}", d.home.config_path().display());
             println!("chains: {:?}", d.chains.list_names());
+            println!("next: bloom vfs cat /docs/README.md");
+            println!("agent setup: https://bloom.directory/SKILL.md");
             Ok(())
         }
         Cmd::Status => {
@@ -363,10 +366,13 @@ async fn run(cli: Cli) -> Result<()> {
             println!("version: {}", env!("CARGO_PKG_VERSION"));
             println!("home: {}", d.home.root().display());
             println!("chains: {:?}", d.chains.list_names());
+            println!("default_chain: {}", d.config.default_chain);
             println!(
                 "block_mainnet_broadcast: {}",
                 d.config.block_mainnet_broadcast
             );
+            println!("try: bloom vfs ls /");
+            println!("wallet: bloom wallet new alice --passphrase <passphrase>");
             Ok(())
         }
         Cmd::Vfs(VfsCmd::Cat { path }) => {

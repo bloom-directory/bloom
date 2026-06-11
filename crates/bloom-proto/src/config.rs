@@ -183,7 +183,7 @@ fn default_nfs_listen() -> String {
     "127.0.0.1:12049".to_string()
 }
 fn default_chain_name() -> String {
-    "anvil".to_string()
+    "ethereum".to_string()
 }
 fn default_stage_ttl() -> std::time::Duration {
     std::time::Duration::from_secs(3600)
@@ -216,15 +216,144 @@ fn default_proxy_detection_backend() -> Backend {
     Backend::Rpc
 }
 
+fn evm_chain(
+    name: &str,
+    chain_id: u64,
+    rpc_urls: &[&str],
+    display_name: &str,
+    native_symbol: &str,
+) -> ChainSpec {
+    ChainSpec {
+        name: name.to_string(),
+        chain_id,
+        rpc_urls: rpc_urls.iter().map(|u| (*u).to_string()).collect(),
+        rpc_endpoints: Vec::new(),
+        allow_broadcast: false,
+        etherscan_api_url: None,
+        display_name: Some(display_name.to_string()),
+        native_symbol: native_symbol.to_string(),
+        native_decimals: 18,
+        legacy_tx: false,
+    }
+}
+
+fn default_chains() -> BTreeMap<String, ChainSpec> {
+    let mut chains = BTreeMap::new();
+    for spec in [
+        evm_chain(
+            "ethereum",
+            1,
+            &[
+                "https://ethereum-rpc.publicnode.com",
+                "https://eth.llamarpc.com",
+            ],
+            "Ethereum Mainnet",
+            "ETH",
+        ),
+        evm_chain(
+            "base",
+            8453,
+            &["https://mainnet.base.org", "https://base.llamarpc.com"],
+            "Base Mainnet",
+            "ETH",
+        ),
+        evm_chain(
+            "arbitrum",
+            42161,
+            &[
+                "https://arb1.arbitrum.io/rpc",
+                "https://arbitrum-one-rpc.publicnode.com",
+            ],
+            "Arbitrum One",
+            "ETH",
+        ),
+        evm_chain(
+            "optimism",
+            10,
+            &[
+                "https://mainnet.optimism.io",
+                "https://optimism-rpc.publicnode.com",
+            ],
+            "OP Mainnet",
+            "ETH",
+        ),
+        evm_chain(
+            "polygon",
+            137,
+            &[
+                "https://polygon-rpc.com",
+                "https://polygon-bor-rpc.publicnode.com",
+            ],
+            "Polygon PoS",
+            "POL",
+        ),
+        evm_chain(
+            "bsc",
+            56,
+            &[
+                "https://bsc-dataseed.binance.org",
+                "https://bsc-rpc.publicnode.com",
+            ],
+            "BNB Smart Chain",
+            "BNB",
+        ),
+        evm_chain(
+            "avalanche",
+            43114,
+            &[
+                "https://api.avax.network/ext/bc/C/rpc",
+                "https://avalanche-c-chain-rpc.publicnode.com",
+            ],
+            "Avalanche C-Chain",
+            "AVAX",
+        ),
+        evm_chain(
+            "gnosis",
+            100,
+            &[
+                "https://rpc.gnosischain.com",
+                "https://gnosis-rpc.publicnode.com",
+            ],
+            "Gnosis Chain",
+            "xDAI",
+        ),
+        evm_chain(
+            "linea",
+            59144,
+            &[
+                "https://rpc.linea.build",
+                "https://linea-rpc.publicnode.com",
+            ],
+            "Linea",
+            "ETH",
+        ),
+        evm_chain(
+            "hyperliquid",
+            999,
+            &["https://rpc.hyperliquid.xyz/evm"],
+            "HyperEVM",
+            "HYPE",
+        ),
+        ChainSpec::anvil_default(),
+    ] {
+        chains.insert(spec.name.clone(), spec);
+    }
+    chains
+}
+
 impl Config {
-    /// A safe local-dev default: Anvil only, no broadcast on mainnet ids.
+    /// A safe agentic-wallet default: ten read-ready public EVM networks plus Anvil.
+    ///
+    /// Live networks default to read-only (`allow_broadcast = false`) and the
+    /// global mainnet broadcast kill-switch stays enabled. Users can inspect
+    /// balances, contracts, ENS, prices, and stage plans immediately with zero
+    /// config, then opt into live broadcasts deliberately.
     pub fn local_default() -> Self {
-        let mut chains = BTreeMap::new();
-        chains.insert("anvil".to_string(), ChainSpec::anvil_default());
+        let chains = default_chains();
         Config {
             mount_path: default_mount_path(),
             nfs_listen_addr: default_nfs_listen(),
-            default_chain: "anvil".to_string(),
+            default_chain: default_chain_name(),
             stage_ttl: default_stage_ttl(),
             chains,
             etherscan: None,
@@ -299,7 +428,7 @@ impl Config {
     pub fn is_mainnet_id(chain_id: u64) -> bool {
         matches!(
             chain_id,
-            1 | 10 | 137 | 8453 | 42161 | 56 | 43114 | 100 | 250 | 324 | 59144 | 534352
+            1 | 10 | 56 | 100 | 137 | 250 | 324 | 999 | 8453 | 42161 | 43114 | 59144 | 534352
         )
     }
 
@@ -328,13 +457,21 @@ mod tests {
     #[test]
     fn local_default_shape() {
         let cfg = Config::local_default();
-        assert_eq!(cfg.default_chain, "anvil");
+        assert_eq!(cfg.default_chain, "ethereum");
         assert_eq!(cfg.mount_path, "/bloom");
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.block_mainnet_broadcast);
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
-        assert_eq!(cfg.chains.len(), 1);
+        assert_eq!(cfg.chains.len(), 11);
+        let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
+        assert_eq!(ethereum.chain_id, 1);
+        assert!(!ethereum.allow_broadcast);
+        assert!(!ethereum.rpc_urls.is_empty());
+        let base = cfg.chains.get("base").expect("base entry");
+        assert_eq!(base.chain_id, 8453);
+        let hyperliquid = cfg.chains.get("hyperliquid").expect("hyperliquid entry");
+        assert_eq!(hyperliquid.chain_id, 999);
         let anvil = cfg.chains.get("anvil").expect("anvil entry");
         assert_eq!(anvil.chain_id, 31337);
         assert!(!anvil.rpc_urls.is_empty());
@@ -400,7 +537,7 @@ mod tests {
         assert!(!path.exists());
         let cfg = Config::load_or_init(&path).unwrap();
         assert!(path.exists());
-        assert_eq!(cfg.default_chain, "anvil");
+        assert_eq!(cfg.default_chain, "ethereum");
         // Second call should load, not overwrite — round-trip equivalent.
         let cfg2 = Config::load_or_init(&path).unwrap();
         assert_configs_equivalent(&cfg, &cfg2);
@@ -482,13 +619,15 @@ mod tests {
     fn chain_lookup_by_name() {
         let cfg = Config::local_default();
         assert!(cfg.chain("anvil").is_some());
-        assert!(cfg.chain("ethereum").is_none());
+        assert!(cfg.chain("ethereum").is_some());
+        assert!(cfg.chain("hyperliquid").is_some());
+        assert!(cfg.chain("ghost").is_none());
     }
 
     #[test]
     fn is_mainnet_id_matches_known_ids() {
         for id in [
-            1, 10, 137, 8453, 42161, 56, 43114, 100, 250, 324, 59144, 534352,
+            1, 10, 56, 100, 137, 250, 324, 999, 8453, 42161, 43114, 59144, 534352,
         ] {
             assert!(Config::is_mainnet_id(id), "{id} should be mainnet");
         }

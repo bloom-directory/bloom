@@ -1,9 +1,15 @@
 # Quickstart
 
-A short Anvil-backed walkthrough of the `bloom` CLI. The CLI's `vfs`
-subcommands are the v1 substitute for the optional NFS mount: every
-`cat` / `ls` / `write` here is what an agent would otherwise do
-through the mounted `/bloom/` tree.
+A short wallet-first walkthrough of the `bloom` CLI. Bloom is an agentic
+Ethereum wallet exposed as a virtual filesystem: every `cat` / `ls` /
+`write` here is what an agent would otherwise do through the mounted
+`/bloom/` tree.
+
+If you are delegating setup to an agent, the fastest path is:
+
+```text
+Read https://bloom.directory/SKILL.md and set up Bloom.
+```
 
 ## Prerequisites
 
@@ -22,8 +28,11 @@ BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- init
 ```
 
 This prints the home dir, config path, and configured chains. The
-default config registers an `anvil` chain at `http://127.0.0.1:8545`
-and leaves `block_mainnet_broadcast = true` (broadcasts blocked).
+default config registers ten read-ready public EVM chains (Ethereum,
+Base, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis,
+Linea, HyperEVM) plus `anvil` at `http://127.0.0.1:8545`. Live-network
+broadcasts are blocked by default (`block_mainnet_broadcast = true` and
+per-chain `allow_broadcast = false`).
 
 ## 2. Start a local devnet
 
@@ -182,6 +191,10 @@ it expire after the configured TTL) cancels the stage.
   needed; default slippage is 50 bps.
 - **Prices** — keyless DefiLlama at `prices/spot/<coin>(.usd)` and
   `prices/change_24h/<coin>`.
+- **Zero-config chain reads** — Ethereum, Base, Arbitrum, Optimism,
+  Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, HyperEVM, and
+  Anvil are present after `bloom init`; live-network broadcasts remain
+  opt-in.
 - **Address book** — `addressbook/<alias>` round-trips via FS.
 - **EIP-712 / personal_sign / raw-hash signing** — write to
   `wallets/<w>/sign/{message,hash,typed_data}`; the signature lands at
