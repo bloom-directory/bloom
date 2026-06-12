@@ -8,6 +8,15 @@ permissions, mount it at `~/bloom`, `/bloom`, or `/Volumes/bloom`.
 `bloom vfs` exposes the same paths as a developer/fallback interface
 when mounting is unavailable.
 
+## Alpha disclosure
+
+Bloom is **experimental, unaudited alpha software**. Do not treat it as a
+production wallet, do not use it with funds you cannot afford to lose, and
+review every generated transaction plan before signing. Default public
+network broadcasts are blocked, but reads, simulations, local devnet flows,
+and any explicitly enabled broadcast paths should still be treated as
+high-risk until the code has been independently audited.
+
 The shortest onboarding path is:
 
 > Tell your agent: **"Read https://bloom.directory/SKILL.md and set up Bloom."**

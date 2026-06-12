@@ -37,12 +37,14 @@ const DEFAULT_MOUNT_PATH: &str = "/Volumes/bloom";
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const DEFAULT_MOUNT_PATH: &str = "/bloom";
 
+const ALPHA_DISCLOSURE: &str = "⚠️  Bloom is experimental, unaudited alpha software. Do not use with funds you cannot afford to lose. Review every generated transaction plan before signing.";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "bloom",
     version,
     about = "Bloom — an agentic Ethereum wallet as a virtual filesystem",
-    long_about = "Bloom mounts an agentic Ethereum wallet as a directory for agents. Read balances, contracts, ENS, prices, and status with cat/ls; stage wallet actions by writing intents into an outbox; confirm only after reviewing the generated plan. New agents should read https://bloom.directory/SKILL.md, then run bloom init and bloom serve --mount ~/bloom. Use bloom vfs only as a fallback when mounting is unavailable."
+    long_about = "Bloom mounts an agentic Ethereum wallet as a directory for agents. EXPERIMENTAL / UNAUDITED ALPHA: do not use with funds you cannot afford to lose, and review every generated transaction plan before signing. Read balances, contracts, ENS, prices, and status with cat/ls; stage wallet actions by writing intents into an outbox; confirm only after reviewing the generated plan. New agents should read https://bloom.directory/SKILL.md, then run bloom init and bloom serve --mount ~/bloom. Use bloom vfs only as a fallback when mounting is unavailable."
 )]
 struct Cli {
     /// Override home directory (default: ~/.bloom).
@@ -353,6 +355,7 @@ async fn run(cli: Cli) -> Result<()> {
 
     match cli.cmd {
         Cmd::Init => {
+            eprintln!("{ALPHA_DISCLOSURE}");
             let d = Daemon::from_home(home.clone()).context("init daemon")?;
             println!("home: {}", d.home.root().display());
             println!("config: {}", d.home.config_path().display());
@@ -632,6 +635,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Serve { mount } => {
+            eprintln!("{ALPHA_DISCLOSURE}");
             let d = Daemon::from_home(home).context("build daemon")?;
             // Spawn the outbox expiry sweeper for the lifetime of the
             // serve command (fix #3). The handle is dropped (and the task
