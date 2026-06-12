@@ -8,8 +8,6 @@ permissions, mount it at `~/bloom`, `/bloom`, or `/Volumes/bloom`.
 `bloom vfs` exposes the same paths as a developer/fallback interface
 when mounting is unavailable.
 
-## Alpha disclosure
-
 Bloom is **experimental, unaudited alpha software**. Do not treat it as a
 production wallet, do not use it with funds you cannot afford to lose, and
 review every generated transaction plan before signing. Default public
@@ -103,9 +101,6 @@ The workspace is split into 15 crates:
 | `bloom-prices` | DefiLlama keyless price oracle. |
 | `bloom-proto` | Shared types: paths, configs (`Config`/`BackendsConfig`), audit records, address book, intents, policy, plan, units. |
 | `bloom-it` | Integration-test harness crate. |
-
-See `docs/specs/2026-05-08-bloom-design.md` for the full design and
-`docs/AUDIT.md` for the per-section spec-to-artifact map.
 
 ## Build and run
 
