@@ -55,7 +55,7 @@ Reads are RPC / API queries. Examples:
 
 ```sh
 cat /bloom/chains/anvil/head/number
-cat /bloom/chains/ethereum/blocks/19000000/json
+cat /bloom/chains/ethereum/blocks/19000000/full.json
 cat /bloom/wallets/alice/chains/anvil/balance.eth
 cat /bloom/wallets/alice/chains/ethereum/history.json
 cat /bloom/tools/keccak/hello
@@ -65,6 +65,25 @@ cat /bloom/ens/vitalik.eth/avatar
 cat /bloom/ens/vitalik.eth/text/url
 cat /bloom/prices/spot/eth.usd
 cat /bloom/addressbook/alice
+```
+
+Some virtual collections, such as `chains/<chain>/blocks/`, are too large to
+enumerate. Address known block numbers directly; each block directory exposes
+`full.json`.
+
+Transaction-by-hash reads expose a small directory of receipt and transaction
+views:
+
+```sh
+TX=0x...
+ls /bloom/chains/ethereum/tx/$TX/
+cat /bloom/chains/ethereum/tx/$TX/status
+cat /bloom/chains/ethereum/tx/$TX/gas_used
+cat /bloom/chains/ethereum/tx/$TX/block_number
+cat /bloom/chains/ethereum/tx/$TX/full.json
+cat /bloom/chains/ethereum/tx/$TX/receipt.json
+cat /bloom/chains/ethereum/tx/$TX/logs.json
+cat /bloom/chains/ethereum/tx/$TX/error.json
 ```
 
 NFT reads (auto-detects ERC-721 vs ERC-1155 via ERC-165):

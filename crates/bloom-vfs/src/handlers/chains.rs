@@ -12,7 +12,7 @@
 //! - `chains/<chain>/addresses/<addr>/nonce`
 //! - `chains/<chain>/addresses/<addr>/code` (hex bytecode)
 //! - `chains/<chain>/addresses/<addr>/tokens/<token>/{balance,balance.raw,balance.formatted,symbol,decimals}`
-//! - `chains/<chain>/tx/<hash>/{receipt.json,status,block_number,gas_used,logs.json,full.json}`
+//! - `chains/<chain>/tx/<hash>/{receipt.json,status,block_number,gas_used,logs.json,full.json,error.json}`
 //! - `chains/<chain>/gas/current.json`
 //!
 //! Etherscan-backed (only mounted when an etherscan client is provided):
@@ -434,6 +434,8 @@ const ADDRESS_FILES_ETHERSCAN: &[&str] = &["txs", "internal_txs", "erc20_txs", "
 const ADDRESS_FILES_ENS: &[&str] = &["ens"];
 
 const CONTRACT_FILES_ETHERSCAN: &[&str] = &["source", "abi"];
+
+const BLOCK_FILES: &[&str] = &["full.json"];
 
 const TX_FILES: &[&str] = &[
     "receipt.json",
@@ -1082,6 +1084,10 @@ impl ChainsHandler {
                 Entry::file("timestamp"),
                 Entry::file("full.json"),
             ]),
+            3 if segs[1] == "blocks" => {
+                // /chains/<chain>/blocks/<number>
+                Ok(BLOCK_FILES.iter().map(|n| Entry::file(n)).collect())
+            }
             2 if segs[1] == "gas" => Ok(vec![Entry::file("current.json")]),
             3 if segs[1] == "addresses" => {
                 // /chains/<chain>/addresses/<addr>
@@ -1570,6 +1576,40 @@ mod tests {
     fn etherscan_to(addr: SocketAddr) -> Arc<EtherscanClient> {
         let url = Url::parse(&format!("http://{addr}/api")).unwrap();
         Arc::new(EtherscanClient::with_base_url("test_key".into(), url))
+    }
+
+    #[tokio::test]
+    async fn block_number_dir_lists_full_json_leaf() {
+        let h = ChainsHandler::new(anvil_registry());
+        let chain_name = h.registry.list_names()[0].clone();
+        let p = VfsPath::parse(&format!("/{chain}/blocks/2", chain = chain_name)).unwrap();
+
+        let entries = h.list(&p).await.unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "full.json");
+        assert_eq!(entries[0].kind, crate::handler::EntryKind::File);
+    }
+
+    #[tokio::test]
+    async fn tx_hash_dir_lists_documented_leaves() {
+        let h = ChainsHandler::new(anvil_registry());
+        let chain_name = h.registry.list_names()[0].clone();
+        let p = VfsPath::parse(&format!(
+            "/{chain}/tx/0x0000000000000000000000000000000000000000000000000000000000000000",
+            chain = chain_name
+        ))
+        .unwrap();
+
+        let names: Vec<String> = h
+            .list(&p)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+
+        assert_eq!(names, TX_FILES);
     }
 
     #[tokio::test]
