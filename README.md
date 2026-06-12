@@ -1,4 +1,21 @@
-# Bloom
+<p align="center">
+  <img src="docs/assets/bloom-wordmark.png" alt="Bloom" width="420">
+</p>
+
+<p align="center">
+  <a href="https://github.com/bloom-directory/bloom/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/bloom-directory/bloom/ci.yml?branch=master&style=flat-square&label=ci"></a>
+  <a href="https://github.com/bloom-directory/bloom/releases"><img alt="Release" src="https://img.shields.io/github/v/release/bloom-directory/bloom?include_prereleases&style=flat-square"></a>
+  <a href="./LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-141310?style=flat-square"></a>
+  <img alt="Rust 1.85+" src="https://img.shields.io/badge/rust-1.85%2B-a8324c?style=flat-square">
+</p>
+
+<p align="center">
+  <a href="./QUICKSTART.md"><strong>Quickstart</strong></a>
+  ·
+  <a href="./docs/AGENTIC_WALLET.md"><strong>Wallet guide</strong></a>
+  ·
+  <a href="https://bloom.directory/SKILL.md"><strong>Agent setup skill</strong></a>
+</p>
 
 Bloom is an **agentic Ethereum wallet mounted as a virtual filesystem**.
 Reads are blockchain queries, writes are transaction intents, and the
