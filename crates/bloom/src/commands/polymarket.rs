@@ -432,7 +432,13 @@ async fn execute(
 
     draft.limit_price_micro = quote.price_micro;
     draft.size_micro = quote.size_micro;
-    draft.amount_microusd = trade::usd_leg(&quote);
+    // Buys keep the user's requested USD budget durable: `amount_input` above
+    // re-derives shares from it, so a retry uses the same bound rather than the
+    // smaller rounded realized spend. Sells record the realized proceeds.
+    // (See `OrderReceipt::amount_microusd`.)
+    if draft.side == Side::Sell {
+        draft.amount_microusd = trade::usd_leg(&quote);
+    }
     draft.tick_micro = snap.tick_micro;
     draft.min_order_size_micro = snap.min_size_micro;
     draft.neg_risk = snap.neg_risk;
@@ -522,7 +528,7 @@ async fn execute(
     store.save_draft(&mut draft)?;
     println!("{}", render_plan_md(&draft));
     println!("signing exactly the order above (passkey review hash {review_hash}).");
-    let _ = store.audit(
+    if let Err(e) = store.audit(
         &draft.wallet,
         "passkey_review_presented",
         serde_json::json!({
@@ -533,7 +539,14 @@ async fn execute(
                 .display()
                 .to_string(),
         }),
-    );
+    ) {
+        eprintln!(
+            "warning: failed to record the passkey_review_presented audit for \
+             draft {} ({e}); proceeding (the persisted review intent remains the \
+             durable record)",
+            draft.id
+        );
+    }
 
     // Ceremony last.
     unlock_wallet_with_intent(d, &draft.wallet, passphrase, Some(intent)).await?;
@@ -553,18 +566,29 @@ async fn execute(
         .salt
         .try_into()
         .map_err(|_| anyhow::anyhow!("internal error: order salt does not fit u64"))?;
+    // Persist the salt BEFORE signing (so a lost POST can still be reconciled),
+    // but do NOT claim the order is signed — the signature does not exist yet.
+    // Status stays `Draft`; a `signing_prepared` marker records the checkpoint.
     draft.salt = Some(salt);
-    draft.status = DraftStatus::Signed;
-    store.save_draft(&mut draft)?; // durable before the POST, for reconciliation
+    store.save_draft(&mut draft)?;
     store.audit(
         &draft.wallet,
-        "order_signed",
+        "signing_prepared",
         serde_json::json!({ "draft_id": draft.id, "salt": salt, "signature_type": tf.signature_type }),
     )?;
 
     let sig = order::sign_order_for_type(&signed, &signer, pm_cfg.chain_id, draft.neg_risk)
         .await
         .context("sign order")?;
+
+    // The signature now exists — only now is the order durably "signed".
+    draft.status = DraftStatus::Signed;
+    store.save_draft(&mut draft)?;
+    store.audit(
+        &draft.wallet,
+        "order_signed",
+        serde_json::json!({ "draft_id": draft.id, "salt": salt, "signature_type": tf.signature_type }),
+    )?;
     let body = order::OrderBody::from_signed(&signed, &sig, &creds.key, draft.order_type)
         .context("build order body")?;
 

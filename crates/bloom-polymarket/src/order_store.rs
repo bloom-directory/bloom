@@ -122,7 +122,9 @@ pub struct OrderDraft {
     /// re-evaluates policy from current config and receipts.
     pub policy_checks: serde_json::Value,
     pub status: DraftStatus,
-    /// Salt of the signed order, once signed (needed for reconciliation).
+    /// Salt of the built order, persisted just before signing so a lost POST
+    /// can be reconciled (set at the `signing_prepared` step, before the
+    /// signature exists).
     pub salt: Option<u64>,
     pub clob_order_id: Option<String>,
     pub clob_status: Option<String>,
@@ -151,7 +153,10 @@ pub struct OrderReceipt {
     /// CLOB signature type the order carried.
     #[serde(default)]
     pub signature_type: u8,
-    /// USD leg posted, micro-USD. BUY receipts count toward the daily cap.
+    /// USD leg, micro-USD: the **requested buy budget** (not the exact quoted
+    /// maker spend — buys keep the user's bound so retries don't drift) or the
+    /// **realized sell proceeds**. BUY receipts count toward the daily cap
+    /// (budget ≥ realized, so the cap is conservative / over-counts, fail-safe).
     pub amount_microusd: u64,
     pub limit_price_micro: u64,
     pub size_micro: u64,
