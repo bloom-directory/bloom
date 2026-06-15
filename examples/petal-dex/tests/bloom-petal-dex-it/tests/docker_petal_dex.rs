@@ -2900,7 +2900,14 @@ async fn exercise_live_petal_vfs_mount(
     };
 
     let rpc = format!("127.0.0.1:{}", HOST_RPC_PORTS[0]);
-    let short_home = short_home_symlink(home)?;
+    let serve_home = tmpdir.join("petal-vfs-serve-home");
+    if serve_home.exists() {
+        std::fs::remove_dir_all(&serve_home)
+            .with_context(|| format!("remove old serve home {}", serve_home.display()))?;
+    }
+    std::fs::create_dir_all(&serve_home)
+        .with_context(|| format!("create serve home {}", serve_home.display()))?;
+    let short_home = short_home_symlink(&serve_home)?;
     let serve_stdout_path = tmpdir.join("petal-vfs-serve.stdout.log");
     let serve_stderr_path = tmpdir.join("petal-vfs-serve.stderr.log");
     let serve_stdout = std::fs::File::create(&serve_stdout_path)

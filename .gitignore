@@ -6,6 +6,8 @@ target/
 test.env
 *.local.toml
 .worktrees/
+# Downloaded CI log bundles dropped in the repo root during triage.
+/logs_*/
 .claude/worktrees/
 .claude/scheduled_tasks.lock
 .claude/settings.local.json

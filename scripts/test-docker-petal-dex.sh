@@ -113,6 +113,13 @@ teardown() {
         {
             printf '=== docker compose ps ===\n'
             cat "$log_dir/docker-compose-ps.txt" 2>/dev/null || true
+            printf '\n=== host home/run ownership ===\n'
+            for i in $(seq 0 $((BLOOM_VALIDATOR_COUNT - 1))); do
+                printf -- '-- home%s --\n' "$i"
+                ls -ldn "$BLOOM_DOCKER_TMPDIR/home$i" \
+                    "$BLOOM_DOCKER_TMPDIR/home$i/run" \
+                    "$BLOOM_DOCKER_TMPDIR/home$i/run/.daemon.lock" 2>&1 || true
+            done
             for i in $(seq 0 $((BLOOM_VALIDATOR_COUNT - 1))); do
                 printf '\n=== bloom-val%s health ===\n' "$i"
                 cat "$log_dir/bloom-val$i.health.txt" 2>/dev/null || true
