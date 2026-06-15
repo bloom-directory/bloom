@@ -2076,12 +2076,14 @@ dependencies = [
  "bloom-chain-node",
  "bloom-chain-types",
  "bloom-daemon",
+ "bloom-defi",
  "bloom-keystore",
  "bloom-mount",
  "bloom-objects",
  "bloom-petal-fungible",
  "bloom-petal-manifest",
  "bloom-petals",
+ "bloom-polymarket",
  "bloom-proto",
  "bloom-ptb-builder",
  "bloom-script",
@@ -2103,6 +2105,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "url",
  "wat",
 ]
 
@@ -2223,6 +2226,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "blake3",
  "bloom-chain",
  "bloom-chain-node",
  "bloom-chain-types",
@@ -2234,6 +2238,7 @@ dependencies = [
  "bloom-mount",
  "bloom-objects",
  "bloom-petals",
+ "bloom-polymarket",
  "bloom-prices",
  "bloom-proto",
  "bloom-ptb-builder",
@@ -2367,6 +2372,7 @@ dependencies = [
  "open",
  "parking_lot 0.12.5",
  "rand 0.8.6",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tempfile",
@@ -2624,6 +2630,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-polymarket"
+version = "0.1.0"
+dependencies = [
+ "alloy 2.0.5",
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "hex",
+ "hmac",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "bloom-prices"
 version = "0.1.0"
 dependencies = [
@@ -2646,6 +2674,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "dirs 5.0.1",
+ "fs2",
  "hex",
  "humantime-serde",
  "parking_lot 0.12.5",
@@ -2789,6 +2818,7 @@ dependencies = [
  "alloy 2.0.5",
  "anyhow",
  "async-trait",
+ "blake3",
  "bloom-chain",
  "bloom-keystore",
  "bloom-mempool",
@@ -2835,6 +2865,7 @@ dependencies = [
  "bloom-objects",
  "bloom-petal-fungible",
  "bloom-petal-manifest",
+ "bloom-polymarket",
  "bloom-prices",
  "bloom-proto",
  "bloom-ptb-builder",

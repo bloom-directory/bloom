@@ -11,9 +11,11 @@
 //! | `lookup`   | `{ "path": "/..." }`                  | `{ "name", "kind", ... }` |
 //! | `read`     | `{ "path": "/..." }`                  | `{ "bytes_b64": "..." }`  |
 //! | `write`    | `{ "path": "/...", "bytes_b64": "" }` | `null`                    |
+//! | `write_unlocked` | `{ "path": "/...", "bytes_b64": "", "wallet": "...", "passphrase"? }` | `null` |
 //! | `list`     | `{ "path": "/..." }`                  | `[ entry, ... ]`          |
 //! | `version`  | `null`                                | `"x.y.z"`                 |
 //! | `chains`   | `null`                                | `[ "ethereum", ... ]`     |
+//! | `wallet.sign_policy` | `{ "wallet": "..." }`          | `null`                    |
 //! | `shutdown` | `null`                                | `null`                    |
 //!
 //! Wire framing is one JSON document per line. Encoding/decoding errors
@@ -25,7 +27,9 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use bloom_keystore::{Keystore, WalletKind};
 use bloom_petals::{Capability, PetalError, PetalRunner, RunOptions, VfsHost};
+use bloom_proto::{CeremonyIntent, CeremonyIntentKind};
 use bloom_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -116,6 +120,7 @@ pub struct IpcServer {
     pub vfs: Vfs,
     pub version: String,
     pub chains: Vec<String>,
+    keystore: Option<Keystore>,
     petals: Option<PetalRunner>,
     /// Pre-wrapped `Arc<Vfs>` for building [`VfsHost`] per `petals.run`.
     /// We keep it next to the bare `vfs` clone so the existing handler
@@ -131,10 +136,19 @@ impl IpcServer {
             vfs,
             version: version.into(),
             chains,
+            keystore: None,
             petals: None,
             vfs_arc,
             shutdown: Arc::new(Notify::new()),
         }
+    }
+
+    /// Enable IPC methods that need wallet unlock state, such as
+    /// `write_unlocked`. The daemon remains the single writer; the client only
+    /// requests the ceremony.
+    pub fn with_keystore(mut self, keystore: Keystore) -> Self {
+        self.keystore = Some(keystore);
+        self
     }
 
     /// Enable `petals.*` IPC methods. Without this the methods return
@@ -270,6 +284,14 @@ impl IpcServer {
                 Ok(()) => Response::ok(id, Value::Null),
                 Err(e) => map_handler_err(id, e),
             },
+            "write_unlocked" => match self.do_write_unlocked(&req.params).await {
+                Ok(()) => Response::ok(id, Value::Null),
+                Err(e) => map_handler_err(id, e),
+            },
+            "wallet.sign_policy" => match self.do_wallet_sign_policy(&req.params).await {
+                Ok(()) => Response::ok(id, Value::Null),
+                Err(e) => map_handler_err(id, e),
+            },
             "list" => match self.do_list(&req.params).await {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_handler_err(id, e),
@@ -319,15 +341,141 @@ impl IpcServer {
 
     async fn do_write(&self, params: &Value) -> Result<(), HandlerError> {
         let path = parse_path(params)?;
-        let bytes = if let Some(s) = params.get("bytes_b64").and_then(|v| v.as_str()) {
-            B64.decode(s)
-                .map_err(|e| HandlerError::invalid(format!("bytes_b64: {e}")))?
-        } else if let Some(s) = params.get("text").and_then(|v| v.as_str()) {
-            s.as_bytes().to_vec()
-        } else {
-            return Err(HandlerError::invalid("write needs bytes_b64 or text"));
-        };
+        if write_path_uses_wallet_signer(&path) {
+            return Err(HandlerError::PermissionDenied);
+        }
+        let bytes = parse_write_bytes(params)?;
         self.vfs.write(&path, &bytes).await
+    }
+
+    async fn do_write_unlocked(&self, params: &Value) -> Result<(), HandlerError> {
+        let path = parse_path(params)?;
+        let mut bytes = parse_write_bytes(params)?;
+        let wallet = params
+            .get("wallet")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| HandlerError::invalid("write_unlocked needs wallet"))?;
+        let passphrase = params.get("passphrase").and_then(|v| v.as_str());
+        let keystore = self
+            .keystore
+            .as_ref()
+            .ok_or_else(|| HandlerError::Unsupported("write_unlocked not enabled".into()))?;
+        let info = keystore
+            .info(wallet)
+            .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?;
+        match info.kind {
+            WalletKind::PasskeyGated => {
+                // A daemon may have a signer cached from a previous ceremony.
+                // `write_unlocked` is the explicit "fresh user present" lane
+                // for VFS writes that sign or broadcast, so force the browser
+                // review instead of reusing that cached signer.
+                keystore.lock(wallet);
+                let intent = write_unlocked_intent(
+                    wallet,
+                    &path,
+                    &bytes,
+                    Some(bloom_proto::checksum_address(&info.address)),
+                    keystore.root().parent().map(|home| home.join("outbox")),
+                );
+                let reviewed_intent_hash = intent.intent_hash();
+                if let Some(home) = keystore.root().parent() {
+                    persist_outbox_review_intent(wallet, &path, &home.join("outbox"), &intent)
+                        .map_err(|e| HandlerError::backend(e.to_string()))?;
+                }
+                let editable_policy = if is_wallet_policy_write(wallet, &path) {
+                    Some(String::from_utf8_lossy(&bytes).to_string())
+                } else {
+                    None
+                };
+                let edited_policy = keystore
+                    .unlock_passkey_with_intent_and_policy_edit(
+                        wallet,
+                        Some(intent),
+                        editable_policy,
+                    )
+                    .await
+                    .map_err(|e: bloom_keystore::KeystoreError| {
+                        HandlerError::backend(e.to_string())
+                    })?;
+                if let Some(policy) = edited_policy {
+                    bytes = policy.into_bytes();
+                } else if is_outbox_confirm_write(wallet, &path) {
+                    if let Some(home) = keystore.root().parent() {
+                        persist_outbox_review_approved(
+                            wallet,
+                            &path,
+                            &home.join("outbox"),
+                            &reviewed_intent_hash,
+                        )
+                        .map_err(|e| HandlerError::backend(e.to_string()))?;
+                    }
+                    bytes.extend_from_slice(
+                        format!("\nreview_hash={reviewed_intent_hash}").as_bytes(),
+                    );
+                }
+            }
+            _ => keystore
+                .unlock(wallet, passphrase.unwrap_or(""))
+                .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?,
+        }
+        self.vfs.write(&path, &bytes).await
+    }
+
+    async fn do_wallet_sign_policy(&self, params: &Value) -> Result<(), HandlerError> {
+        let wallet = params
+            .get("wallet")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| HandlerError::invalid("wallet.sign_policy needs wallet"))?;
+        let keystore = self
+            .keystore
+            .as_ref()
+            .ok_or_else(|| HandlerError::Unsupported("wallet.sign_policy not enabled".into()))?;
+        let (policy_toml, kind) = keystore
+            .raw_policy(wallet)
+            .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?;
+        if kind == WalletKind::PasskeyGated {
+            let wallet_dir = keystore.root().join(wallet);
+            let policy_path = wallet_dir.join("policy.toml");
+            let address = std::fs::read_to_string(wallet_dir.join("address"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let policy_digest = blake3::hash(policy_toml.as_bytes()).to_hex().to_string();
+            let mut intent =
+                CeremonyIntent::new(wallet, "Sign Wallet Policy", CeremonyIntentKind::SignPolicy);
+            intent.wallet_address = address;
+            intent.summary_lines = vec![
+                format!("Review rules for wallet '{wallet}'."),
+                "This does not move money or place a trade.".into(),
+                "After approval, Bloom uses these rules to decide what is allowed.".into(),
+            ];
+            intent.policy_lines = policy_toml.lines().map(str::to_string).collect();
+            intent.risk_lines = vec![
+                "Approving these rules can change what Bloom allows later.".into(),
+                "The OS passkey prompt only proves your presence; review the details on this page."
+                    .into(),
+            ];
+            intent.artifact_paths = vec![policy_path.display().to_string()];
+            intent.canonical_subject = serde_json::json!({
+                "kind": "sign_policy",
+                "wallet": wallet,
+                "policy_path": policy_path,
+                "policy_blake3": policy_digest,
+            });
+            if let Ok(bytes) = serde_json::to_vec_pretty(&intent) {
+                let review_path = wallet_dir.join("policy.review.json");
+                let _ = std::fs::write(&review_path, bytes);
+            }
+            keystore.lock(wallet);
+            keystore
+                .unlock_passkey_with_intent(wallet, Some(intent))
+                .await
+                .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?;
+        }
+        keystore
+            .sign_policy(wallet)
+            .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?;
+        Ok(())
     }
 
     async fn do_list(&self, params: &Value) -> Result<Value, HandlerError> {
@@ -478,6 +626,426 @@ impl IpcServer {
     }
 }
 
+fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
+    let segs = path.segments();
+    match segs {
+        // Wallet outbox confirm intentionally reaches the VFS
+        // handler: the tx engine's central authorization evaluator decides
+        // whether policy permits autonomous execution or needs fresh review.
+        //
+        // Cancel/replace consume a signer and are not fully covered by the
+        // outbox-confirm review-hash marker flow, so they must use
+        // write_unlocked rather than a plain IPC write.
+        [root, _wallet, chains, _chain, outbox, pending, _id, action]
+            if root == "wallets"
+                && chains == "chains"
+                && outbox == "outbox"
+                && pending == "pending"
+                && matches!(action.as_str(), "cancel" | "replace") =>
+        {
+            true
+        }
+        // wallets/<wallet>/sign/{message,hash,typed_data}
+        [root, _wallet, sign, kind]
+            if root == "wallets"
+                && sign == "sign"
+                && matches!(kind.as_str(), "message" | "hash" | "typed_data") =>
+        {
+            true
+        }
+        // polymarket/onboard/<wallet>/begin signs CLOB auth and relayer/deposit-wallet operations.
+        [root, action, _wallet, begin]
+            if root == "polymarket" && action == "onboard" && begin == "begin" =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+fn is_wallet_policy_write(wallet: &str, path: &VfsPath) -> bool {
+    matches!(
+        path.segments(),
+        [root, w, file] if root == "wallets" && w == wallet && file == "policy.toml"
+    )
+}
+
+fn is_outbox_confirm_write(wallet: &str, path: &VfsPath) -> bool {
+    matches!(
+        path.segments(),
+        [root, w, chains, _chain, outbox, pending, _id, confirm]
+            if root == "wallets"
+                && w == wallet
+                && chains == "chains"
+                && outbox == "outbox"
+                && pending == "pending"
+                && confirm == "confirm"
+    )
+}
+
+fn outbox_confirm_dir(wallet: &str, path: &VfsPath, outbox_root: &Path) -> Option<PathBuf> {
+    let [root, w, chains, chain, outbox, pending, id, confirm] = path.segments() else {
+        return None;
+    };
+    if root == "wallets"
+        && w == wallet
+        && chains == "chains"
+        && outbox == "outbox"
+        && pending == "pending"
+        && confirm == "confirm"
+    {
+        Some(
+            outbox_root
+                .join(wallet)
+                .join(chain)
+                .join("pending")
+                .join(id),
+        )
+    } else {
+        None
+    }
+}
+
+fn persist_outbox_review_intent(
+    wallet: &str,
+    path: &VfsPath,
+    outbox_root: &Path,
+    intent: &CeremonyIntent,
+) -> std::io::Result<()> {
+    let Some(dir) = outbox_confirm_dir(wallet, path, outbox_root) else {
+        return Ok(());
+    };
+    std::fs::write(
+        dir.join("review_intent.json"),
+        serde_json::to_vec_pretty(intent).map_err(|e| std::io::Error::other(e.to_string()))?,
+    )
+}
+
+fn persist_outbox_review_approved(
+    wallet: &str,
+    path: &VfsPath,
+    outbox_root: &Path,
+    intent_hash: &str,
+) -> std::io::Result<()> {
+    let Some(dir) = outbox_confirm_dir(wallet, path, outbox_root) else {
+        return Ok(());
+    };
+    let approved = serde_json::json!({
+        "schema": "bloom.review_approved.v1",
+        "intent_hash": intent_hash,
+    });
+    std::fs::write(
+        dir.join("review_approved.json"),
+        serde_json::to_vec_pretty(&approved).map_err(|e| std::io::Error::other(e.to_string()))?,
+    )
+}
+
+fn write_unlocked_intent(
+    wallet: &str,
+    path: &VfsPath,
+    body: &[u8],
+    wallet_address: Option<String>,
+    outbox_root: Option<PathBuf>,
+) -> CeremonyIntent {
+    let path_s = path.to_string_path();
+    let segs = path.segments();
+    let is_wallet_policy_write = matches!(
+        segs,
+        [root, w, file] if root == "wallets" && w == wallet && file == "policy.toml"
+    );
+    if is_wallet_policy_write {
+        let policy_text = String::from_utf8_lossy(body);
+        let policy_digest = blake3::hash(body).to_hex().to_string();
+        let mut intent = CeremonyIntent::new(
+            wallet,
+            "Approve Wallet Policy Write",
+            CeremonyIntentKind::SignPolicy,
+        );
+        intent.wallet_address = wallet_address;
+        intent.summary_lines = vec![
+            format!("Review rules for wallet '{wallet}'."),
+            "This does not move money or place a trade.".into(),
+            "After approval, Bloom uses these rules to decide what is allowed.".into(),
+        ];
+        intent.policy_lines = policy_text.lines().map(str::to_string).collect();
+        intent.risk_lines = vec![
+            "Approving these rules can change what Bloom allows later.".into(),
+            "The OS passkey prompt only proves your presence; review the details on this page."
+                .into(),
+        ];
+        intent.artifact_paths = vec![path_s.clone()];
+        intent.canonical_subject = json!({
+            "kind": "vfs_policy_write",
+            "wallet": wallet,
+            "path": path_s,
+            "policy_blake3": policy_digest,
+        });
+        return intent;
+    }
+
+    if let Some(intent) = outbox_confirm_unlock_intent(
+        wallet,
+        &path_s,
+        segs,
+        wallet_address.clone(),
+        outbox_root.as_deref(),
+    ) {
+        return intent;
+    }
+
+    // Polymarket onboarding `begin` is far more than a generic write: it can
+    // deploy the deposit wallet, sign an eight-grant approval batch, mint CLOB
+    // credentials, and auto-create a (revocable, submission-only) builder API
+    // key. Show the reviewer exactly that, with one source of truth for the
+    // grant list, instead of a bare path.
+    let is_pm_onboard_begin = matches!(
+        segs,
+        [root, action, _w, begin]
+            if root == "polymarket" && action == "onboard" && begin == "begin"
+    );
+    if is_pm_onboard_begin {
+        let mut intent = CeremonyIntent::new(
+            wallet,
+            "Approve Polymarket Onboarding",
+            CeremonyIntentKind::WalletUnlock,
+        );
+        let mut summary = vec![
+            format!("Run Polymarket onboarding for wallet '{wallet}'."),
+            "May deploy your deposit wallet, mint CLOB credentials, and create a \
+             revocable builder API key (relayer submission auth only — never fund authority)."
+                .to_string(),
+            "Signs one approval batch granting these eight spends from your deposit wallet:"
+                .to_string(),
+        ];
+        summary.extend(
+            bloom_polymarket::wallet::V2_APPROVAL_LABELS
+                .iter()
+                .map(|l| format!("  - {l}")),
+        );
+        intent.summary_lines = summary;
+        intent.risk_lines = vec![
+            "approve(MAX) grants unlimited pUSD spending to the V2 contracts; \
+             revoke later with `bloom polymarket revoke-approvals`."
+                .into(),
+            "The OS passkey prompt will show bloom/localhost, not these details.".into(),
+        ];
+        intent.artifact_paths = vec![path_s.clone()];
+        intent.canonical_subject = json!({
+            "kind": "polymarket_onboard_begin",
+            "wallet": wallet,
+            "path": path_s,
+            "approvals": bloom_polymarket::wallet::V2_APPROVAL_LABELS,
+        });
+        return intent;
+    }
+
+    let mut intent = CeremonyIntent::new(
+        wallet,
+        "Approve VFS Wallet Write",
+        CeremonyIntentKind::WalletUnlock,
+    );
+    intent.summary_lines = vec![
+        format!("Approve one VFS write for wallet '{wallet}'."),
+        format!("Path: {path_s}"),
+    ];
+    intent.risk_lines = vec![
+        "This unlock is scoped to the foreground write request.".into(),
+        "The OS passkey prompt will show bloom/localhost, not the VFS path.".into(),
+    ];
+    intent.artifact_paths = vec![path_s.clone()];
+    intent.canonical_subject = json!({
+        "kind": "vfs_write_unlocked",
+        "wallet": wallet,
+        "path": path_s,
+    });
+    intent
+}
+
+fn outbox_confirm_unlock_intent(
+    wallet: &str,
+    path_s: &str,
+    segs: &[String],
+    wallet_address: Option<String>,
+    outbox_root: Option<&Path>,
+) -> Option<CeremonyIntent> {
+    let [root, w, chains, chain, outbox, pending, id, confirm] = segs else {
+        return None;
+    };
+    if root != "wallets"
+        || w != wallet
+        || chains != "chains"
+        || outbox != "outbox"
+        || pending != "pending"
+        || confirm != "confirm"
+    {
+        return None;
+    }
+    let plan_path = outbox_root?
+        .join(wallet)
+        .join(chain)
+        .join("pending")
+        .join(id)
+        .join("plan.md");
+    let plan = std::fs::read_to_string(&plan_path).ok()?;
+    let plan_hash = blake3::hash(plan.as_bytes()).to_hex().to_string();
+    let defi_review = find_defi_review_for_outbox(outbox_root?, wallet, id);
+    let mut intent = CeremonyIntent::new(
+        wallet,
+        format!("Approve {} Transaction", chain),
+        CeremonyIntentKind::EvmTransaction,
+    );
+    intent.wallet_address = wallet_address;
+    intent.summary_lines = defi_review
+        .as_ref()
+        .map(|review| review.summary_lines.clone())
+        .unwrap_or_default();
+    if !intent.summary_lines.is_empty() {
+        intent.summary_lines.push("Transaction to sign:".into());
+    }
+    intent.summary_lines.extend(
+        plan.lines()
+            .filter(|line| {
+                line.starts_with("Wallet:")
+                    || line.starts_with("From:")
+                    || line.starts_with("To:")
+                    || line.starts_with("Chain:")
+                    || line.starts_with("Value:")
+                    || line.starts_with("Nonce:")
+                    || line.starts_with("Gas:")
+                    || line.starts_with("Data:")
+            })
+            .map(|line| line.trim().to_string()),
+    );
+    if intent.summary_lines.is_empty() {
+        intent
+            .summary_lines
+            .push(format!("Broadcast staged transaction {id} on {chain}."));
+    }
+    intent.risk_lines = defi_review
+        .as_ref()
+        .map(|review| review.risk_lines.clone())
+        .unwrap_or_default();
+    intent.risk_lines.extend(vec![
+        "Approving will sign and broadcast this transaction.".into(),
+        "For cross-chain routes, source-chain confirmation is not destination settlement.".into(),
+        "The OS passkey prompt only proves your presence; review the transaction on this page."
+            .into(),
+    ]);
+    intent.policy_lines = defi_review
+        .as_ref()
+        .map(|review| {
+            let mut lines: Vec<String> = review.plan_md.lines().map(str::to_string).collect();
+            lines.extend(["".into(), "---".into(), "".into()]);
+            lines.extend(plan.lines().map(str::to_string));
+            lines
+        })
+        .unwrap_or_else(|| plan.lines().map(str::to_string).collect());
+    intent.artifact_paths = vec![path_s.to_string(), plan_path.display().to_string()];
+    if let Some(review) = &defi_review {
+        intent
+            .artifact_paths
+            .push(format!("defi session {}", review.id));
+    }
+    intent.canonical_subject = json!({
+        "kind": "outbox_confirm",
+        "wallet": wallet,
+        "chain": chain,
+        "outbox_id": id,
+        "path": path_s,
+        "plan_blake3": plan_hash,
+        "defi_session_id": defi_review.as_ref().map(|review| review.id.as_str()),
+        "defi_plan_blake3": defi_review.as_ref().map(|review| review.plan_hash.as_str()),
+    });
+    Some(intent)
+}
+
+#[derive(Debug, Clone)]
+struct DefiReview {
+    id: String,
+    plan_md: String,
+    plan_hash: String,
+    summary_lines: Vec<String>,
+    risk_lines: Vec<String>,
+}
+
+fn find_defi_review_for_outbox(
+    outbox_root: &Path,
+    wallet: &str,
+    outbox_id: &str,
+) -> Option<DefiReview> {
+    let home = if outbox_root.file_name().is_some_and(|name| name == "outbox") {
+        outbox_root.parent().unwrap_or(outbox_root)
+    } else {
+        outbox_root
+    };
+    let sessions = home.join("defi").join(wallet).join("sessions");
+    for entry in std::fs::read_dir(sessions).ok()? {
+        let path = entry.ok()?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&path).ok()?;
+        let value: Value = serde_json::from_str(&raw).ok()?;
+        let staged = value
+            .get("staged_ids")
+            .and_then(|v| v.as_array())
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(outbox_id)));
+        if !staged {
+            continue;
+        }
+        let id = value
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let plan_md = value
+            .get("plan_md")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let plan_hash = blake3::hash(plan_md.as_bytes()).to_hex().to_string();
+        let mut summary_lines = vec![format!("DeFi route intent {id}:")];
+        summary_lines.extend(plan_md.lines().filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with("Intent:")
+                || trimmed.starts_with("Chain:")
+                || trimmed.starts_with("Dest chain:")
+                || trimmed.starts_with("Receiver:")
+                || trimmed.starts_with("Token in:")
+                || trimmed.starts_with("Token out:")
+                || trimmed.starts_with("Slippage:")
+                || trimmed.starts_with("Router:")
+                || trimmed.starts_with("Protocols:")
+                || trimmed.starts_with("Tx value:")
+            {
+                Some(trimmed.to_string())
+            } else {
+                None
+            }
+        }));
+        let risk_lines = value
+            .get("policy_checks")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|check| check.get("outcome").and_then(|v| v.as_str()) == Some("warn"))
+            .filter_map(|check| {
+                let rule = check.get("rule").and_then(|v| v.as_str()).unwrap_or("defi");
+                let message = check.get("message").and_then(|v| v.as_str())?;
+                Some(format!("{rule}: {message}"))
+            })
+            .collect();
+        return Some(DefiReview {
+            id,
+            plan_md,
+            plan_hash,
+            summary_lines,
+            risk_lines,
+        });
+    }
+    None
+}
+
 fn parse_caps(v: Option<&Value>) -> Result<BTreeSet<Capability>, PetalError> {
     let Some(v) = v else {
         return Ok(BTreeSet::new());
@@ -508,6 +1076,17 @@ fn parse_path(params: &Value) -> Result<VfsPath, HandlerError> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| HandlerError::invalid("missing 'path'"))?;
     VfsPath::parse(s).map_err(|e| HandlerError::invalid(format!("bad path: {e}")))
+}
+
+fn parse_write_bytes(params: &Value) -> Result<Vec<u8>, HandlerError> {
+    if let Some(s) = params.get("bytes_b64").and_then(|v| v.as_str()) {
+        B64.decode(s)
+            .map_err(|e| HandlerError::invalid(format!("bytes_b64: {e}")))
+    } else if let Some(s) = params.get("text").and_then(|v| v.as_str()) {
+        Ok(s.as_bytes().to_vec())
+    } else {
+        Err(HandlerError::invalid("write needs bytes_b64 or text"))
+    }
 }
 
 fn entry_to_json(e: &Entry) -> Value {
@@ -634,6 +1213,164 @@ mod tests {
                 Arc::new(SingleFileHandler::new("greet", b"hi\n".to_vec())),
             )
             .build()
+    }
+
+    #[test]
+    fn plain_ipc_write_rejects_signer_consuming_paths() {
+        for path in [
+            "/wallets/minnow/sign/message",
+            "/wallets/minnow/sign/hash",
+            "/wallets/minnow/sign/typed_data",
+            "/polymarket/onboard/minnow/begin",
+        ] {
+            let p = VfsPath::parse(path).unwrap();
+            assert!(write_path_uses_wallet_signer(&p), "{path}");
+        }
+
+        for path in [
+            "/defi/intents/minnow/0001/confirm",
+            "/polymarket/trade/minnow/new",
+            "/wallets/minnow/chains/polygon/outbox/new.tx",
+            "/wallets/minnow/chains/polygon/outbox/pending/0001/confirm",
+        ] {
+            let p = VfsPath::parse(path).unwrap();
+            assert!(!write_path_uses_wallet_signer(&p), "{path}");
+        }
+
+        for path in [
+            "/wallets/minnow/chains/polygon/outbox/pending/0001/cancel",
+            "/wallets/minnow/chains/polygon/outbox/pending/0001/replace",
+        ] {
+            let p = VfsPath::parse(path).unwrap();
+            assert!(write_path_uses_wallet_signer(&p), "{path}");
+        }
+    }
+
+    #[test]
+    fn onboard_begin_unlock_intent_lists_grants_not_just_the_path() {
+        let p = VfsPath::parse("/polymarket/onboard/minnow/begin").unwrap();
+        let intent = write_unlocked_intent("minnow", &p, b"y", None, None);
+        // The reviewer must see the concrete onboarding effects, not a bare path.
+        let text = intent.summary_lines.join("\n");
+        assert!(text.contains("approve(MAX) -> CTF Exchange V2"), "{text}");
+        assert!(text.contains("setApprovalForAll(true)"), "{text}");
+        assert!(text.contains("builder API key"), "{text}");
+        assert_eq!(
+            intent.canonical_subject["kind"], "polymarket_onboard_begin",
+            "onboarding has a distinct hashed subject from a generic write"
+        );
+        // A generic write keeps the old, minimal intent.
+        let g = write_unlocked_intent(
+            "minnow",
+            &VfsPath::parse("/wallets/minnow/sign/message").unwrap(),
+            b"hello",
+            None,
+            None,
+        );
+        assert_eq!(g.canonical_subject["kind"], "vfs_write_unlocked");
+        assert!(g.intent_hash() != intent.intent_hash());
+    }
+
+    #[test]
+    fn policy_write_unlock_intent_shows_policy_body() {
+        let p = VfsPath::parse("/wallets/minnow/policy.toml").unwrap();
+        let body = b"[defi]\nrequire_calldata_verification = false\n";
+        let intent = write_unlocked_intent("minnow", &p, body, Some("0xabc".into()), None);
+        assert_eq!(intent.kind, CeremonyIntentKind::SignPolicy);
+        assert_eq!(intent.canonical_subject["kind"], "vfs_policy_write");
+        assert_eq!(intent.wallet_address.as_deref(), Some("0xabc"));
+        let policy = intent.policy_lines.join("\n");
+        assert!(policy.contains("require_calldata_verification = false"));
+        assert!(intent.summary_lines.join("\n").contains("Review rules"));
+    }
+
+    #[test]
+    fn outbox_confirm_unlock_intent_shows_staged_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp
+            .path()
+            .join("minnow")
+            .join("base")
+            .join("pending")
+            .join("0001-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("plan.md"),
+            "# Staged tx 0001-test\n\nWallet: minnow\nFrom:   0xabc\nTo:     0xdef\nChain:  base (id 8453)\nValue:  0.1 ETH\nNonce:  7\nGas:    limit=1\nData:   4 bytes\n",
+        )
+        .unwrap();
+        let p =
+            VfsPath::parse("/wallets/minnow/chains/base/outbox/pending/0001-test/confirm").unwrap();
+        let intent = write_unlocked_intent(
+            "minnow",
+            &p,
+            b"y",
+            Some("0xabc".into()),
+            Some(tmp.path().to_path_buf()),
+        );
+        assert_eq!(intent.title, "Approve base Transaction");
+        assert_eq!(intent.kind, CeremonyIntentKind::EvmTransaction);
+        assert_eq!(intent.canonical_subject["kind"], "outbox_confirm");
+        assert!(intent.summary_lines.join("\n").contains("Value:  0.1 ETH"));
+        assert!(
+            intent
+                .policy_lines
+                .join("\n")
+                .contains("# Staged tx 0001-test")
+        );
+    }
+
+    #[test]
+    fn outbox_confirm_unlock_intent_includes_defi_route_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outbox_root = tmp.path().join("outbox");
+        let dir = outbox_root
+            .join("minnow")
+            .join("base")
+            .join("pending")
+            .join("0001-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("plan.md"),
+            "# Staged tx 0001-test\n\nWallet: minnow\nFrom:   0xabc\nTo:     0xdef\nChain:  base (id 8453)\nValue:  0.1 ETH\nNonce:  7\nGas:    limit=1\nData:   4 bytes\n",
+        )
+        .unwrap();
+        let sessions = tmp.path().join("defi").join("minnow").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("0001-route.json"),
+            serde_json::to_vec_pretty(&json!({
+                "id": "0001-route",
+                "staged_ids": ["0001-test"],
+                "plan_md": "# DeFi intent\n\nIntent:    swap 5 USDC to MATIC\nChain:     base (id 8453)\nDest chain:polygon (id 137)\nReceiver:  0xabc\nToken in:  USDC amount=5000000 (raw)\nToken out: MATIC amountOut≈1\nSlippage:  50 bps\nRouter:    0xrouter\nProtocols: stargate -> 1inch\nTx value:  1 wei\n",
+                "policy_checks": [
+                    {
+                        "outcome": "warn",
+                        "rule": "defi.min_output",
+                        "message": "minimum-output is quote-derived"
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let p =
+            VfsPath::parse("/wallets/minnow/chains/base/outbox/pending/0001-test/confirm").unwrap();
+        let intent =
+            write_unlocked_intent("minnow", &p, b"y", Some("0xabc".into()), Some(outbox_root));
+        let summary = intent.summary_lines.join("\n");
+        assert!(summary.contains("DeFi route intent 0001-route"));
+        assert!(summary.contains("Intent:    swap 5 USDC to MATIC"));
+        assert!(summary.contains("Transaction to sign:"));
+        assert!(intent.risk_lines.join("\n").contains("defi.min_output"));
+        assert!(intent.policy_lines.join("\n").contains("# DeFi intent"));
+        assert!(
+            intent
+                .policy_lines
+                .join("\n")
+                .contains("# Staged tx 0001-test")
+        );
+        assert_eq!(intent.canonical_subject["defi_session_id"], "0001-route");
     }
 
     #[tokio::test]

@@ -8,9 +8,34 @@ test.env
 .worktrees/
 .claude/worktrees/
 .claude/scheduled_tasks.lock
+.claude/settings.local.json
 
 # Literature-inquiry raw corpus + full-text third-party papers. These are
 # large machine-generated artifacts (and the full text carries third-party
 # copyright), so they live in an external store, not the repo. The
 # synthesized markdown under lit/ stays tracked. See lit/RESEARCH.md.
 docs/research/formal-verification/lit/data/
+
+# Local-only agent/PR docs — kept on disk, deliberately never committed.
+AGENTS.md
+CLAUDE.md
+DIRECTION.md
+PR.md
+
+# Local-only docs/examples — kept on disk, deliberately out of the PR.
+# Active implementation plans belong in tracked docs/plans/. Completed/superseded
+# plans are archived locally under docs/archive/ (history, not shipped). Use
+# docs/.scratch/ for temporary local notes.
+docs/archive/
+docs/.scratch/
+docs/research/README.md
+docs/research/strategy/
+docs/research/formal-verification/nl-to-invariant/data/
+docs/STRATEGY.md
+docs/direction-overview.html
+docs/strategy-overview.html
+docs/evm-tx-path-audit-2026-06-12.md
+docs/polymarket-audit-2026-06-12.md
+# Live probe log — contains real owner/deposit addresses and trade amounts.
+docs/polymarket-discovery-findings.md
+examples/polymarket-probe/

@@ -41,6 +41,10 @@ pub struct Config {
     pub etherscan: Option<EtherscanConfig>,
     #[serde(default)]
     pub enso: Option<EnsoConfig>,
+    /// Polymarket v2 read surface. Presence of `[polymarket]` opts the
+    /// `polymarket/` VFS subtree in (like `[enso]` opts in `defi/`).
+    #[serde(default)]
+    pub polymarket: Option<PolymarketConfig>,
     #[serde(default)]
     pub mempool: BTreeMap<String, MempoolChainConfig>,
     #[serde(default)]
@@ -158,6 +162,62 @@ pub struct EnsoConfig {
     pub api_url: String,
 }
 
+/// Polymarket v2 client configuration. Every field has a default so a bare
+/// `[polymarket]` TOML table parses to the public-endpoint defaults on Polygon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolymarketConfig {
+    #[serde(default = "default_gamma_url")]
+    pub gamma_url: String,
+    #[serde(default = "default_data_url")]
+    pub data_url: String,
+    #[serde(default = "default_clob_url")]
+    pub clob_url: String,
+    /// Relayer for gasless deposit-wallet deploys/batches (onboarding).
+    #[serde(default = "default_relayer_url")]
+    pub relayer_url: String,
+    /// Settlement chain id (Polygon mainnet by default).
+    #[serde(default = "default_polymarket_chain_id")]
+    pub chain_id: u64,
+    /// Optional builder code for order attribution (unused by the read surface).
+    #[serde(default)]
+    pub builder_code: Option<String>,
+    /// Manual relayer API key + the address that owns it — sent as
+    /// `RELAYER_API_KEY` / `RELAYER_API_KEY_ADDRESS` headers on relayer calls.
+    /// Create one at `polymarket.com/settings?tab=api-keys`. Optional advanced
+    /// override: the default path auto-creates a **builder API key** instead
+    /// (see `builder_key_mode`). When set, it takes precedence over the
+    /// builder key.
+    #[serde(default)]
+    pub relayer_api_key: Option<String>,
+    #[serde(default)]
+    pub relayer_api_key_address: Option<String>,
+    /// How the relayer credential is obtained for the (default) deposit-wallet
+    /// trading mode:
+    /// - `"auto"` (default): bloom creates a **builder API key** from the
+    ///   wallet's CLOB credentials (`POST /auth/builder-api-key`) and uses it
+    ///   for relayer submission auth. Disclosed during onboarding; revocable
+    ///   with `bloom polymarket builder-keys revoke`. Submission auth only —
+    ///   it never holds wallet authority.
+    /// - `"manual"`: only the `relayer_api_key`/`relayer_api_key_address`
+    ///   pair is used; refuse with setup instructions when absent.
+    /// - `"disabled"`: never create or use relayer auth automatically;
+    ///   deposit-wallet trading is unavailable.
+    #[serde(default = "default_builder_key_mode")]
+    pub builder_key_mode: String,
+    /// Explicit opt-in to the legacy EOA onboarding mode (signatureType 0).
+    /// The V2 CLOB rejects EOA makers at order placement ("maker address not
+    /// allowed"), so this mode cannot trade — it exists for read/creds-only
+    /// setups and backward compatibility.
+    #[serde(default)]
+    pub legacy_eoa_mode: bool,
+}
+
+fn default_builder_key_mode() -> String {
+    "auto".into()
+}
+// Note: the geoblock endpoint is deliberately NOT configurable — it is a
+// non-bypassable refuse-line (see `bloom_polymarket::geoblock`).
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MempoolChainConfig {
     /// Provider id — must match a `bloom_mempool::providers::*` adapter
@@ -193,6 +253,21 @@ fn default_etherscan_url() -> String {
 }
 fn default_enso_url() -> String {
     "https://api.enso.finance".to_string()
+}
+fn default_gamma_url() -> String {
+    "https://gamma-api.polymarket.com".to_string()
+}
+fn default_data_url() -> String {
+    "https://data-api.polymarket.com".to_string()
+}
+fn default_clob_url() -> String {
+    "https://clob.polymarket.com".to_string()
+}
+fn default_relayer_url() -> String {
+    "https://relayer-v2.polymarket.com".to_string()
+}
+fn default_polymarket_chain_id() -> u64 {
+    137
 }
 fn default_mainnet_block() -> bool {
     true
@@ -358,6 +433,7 @@ impl Config {
             chains,
             etherscan: None,
             enso: None,
+            polymarket: None,
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
             block_mainnet_broadcast: true,
@@ -494,6 +570,34 @@ mod tests {
         let s = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&s).unwrap();
         assert_configs_equivalent(&cfg, &back);
+    }
+
+    #[test]
+    fn bare_polymarket_block_parses_to_public_defaults() {
+        let pm: PolymarketConfig = toml::from_str("").unwrap();
+        assert_eq!(pm.gamma_url, "https://gamma-api.polymarket.com");
+        assert_eq!(pm.data_url, "https://data-api.polymarket.com");
+        assert_eq!(pm.clob_url, "https://clob.polymarket.com");
+        assert_eq!(pm.relayer_url, "https://relayer-v2.polymarket.com");
+        assert_eq!(pm.chain_id, 137);
+        assert!(pm.builder_code.is_none());
+        // Absent relayer key → EOA path is selected downstream.
+        assert!(pm.relayer_api_key.is_none() && pm.relayer_api_key_address.is_none());
+
+        // Overrides stick and round-trip.
+        let pm: PolymarketConfig =
+            toml::from_str("relayer_url = \"http://localhost:1\"\nchain_id = 80002\n").unwrap();
+        assert_eq!(pm.relayer_url, "http://localhost:1");
+        assert_eq!(pm.chain_id, 80_002);
+        let back: PolymarketConfig = toml::from_str(&toml::to_string(&pm).unwrap()).unwrap();
+        assert_eq!(back.relayer_url, pm.relayer_url);
+
+        // Relayer key present → deposit-wallet path is selected downstream.
+        let pm: PolymarketConfig =
+            toml::from_str("relayer_api_key = \"k-123\"\nrelayer_api_key_address = \"0xabc\"\n")
+                .unwrap();
+        assert_eq!(pm.relayer_api_key.as_deref(), Some("k-123"));
+        assert_eq!(pm.relayer_api_key_address.as_deref(), Some("0xabc"));
     }
 
     #[test]

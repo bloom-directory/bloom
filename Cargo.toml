@@ -9,6 +9,7 @@ members = [
   "crates/bloom-keystore",
   "crates/bloom-mempool",
   "crates/bloom-defi",
+  "crates/bloom-polymarket",
   "crates/bloom-watch",
   "crates/bloom-mount",
   "crates/bloom-proto",
@@ -75,6 +76,7 @@ hex = "0.4"
 blake3 = "1"
 sha3 = "0.10"
 sha2 = "0.10"
+hmac = "0.12"
 base64 = "0.22"
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
@@ -91,6 +93,7 @@ tempfile = "3"
 once_cell = "1"
 futures = "0.3"
 lru = "0.12"
+fs2 = "0.4"
 wasmtime = { version = "26", default-features = false, features = ["async", "cranelift", "runtime", "cache", "parallel-compilation"] }
 wasmtime-wasi = "26"
 wat = "1"
@@ -118,6 +121,7 @@ bloom-tx       = { path = "crates/bloom-tx" }
 bloom-vfs      = { path = "crates/bloom-vfs" }
 bloom-tools    = { path = "crates/bloom-tools" }
 bloom-defi     = { path = "crates/bloom-defi" }
+bloom-polymarket = { path = "crates/bloom-polymarket" }
 bloom-watch    = { path = "crates/bloom-watch" }
 bloom-mount    = { path = "crates/bloom-mount" }
 bloom-etherscan = { path = "crates/bloom-etherscan" }

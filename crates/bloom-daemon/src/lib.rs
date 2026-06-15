@@ -23,8 +23,9 @@ use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
 use bloom_keystore::Keystore;
 use bloom_petals::{NameRegistry, PetalRunner, PetalStore, PetalVm, PetalsHandler};
+use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient, GeoblockClient};
 use bloom_prices::PricesClient;
-use bloom_proto::{AddressBook, AuditLog, Config, HomeDir};
+use bloom_proto::{AddressBook, AuditLog, Config, HomeDir, HomeWritePermit};
 use bloom_revert::{
     AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
     OpenchainDecoder, boxed,
@@ -32,10 +33,11 @@ use bloom_revert::{
 use bloom_script::{ChainStateIface, PqSignature, PtbTx};
 use bloom_tx::outbox::Outbox;
 use bloom_tx::tx_engine::TxEngine;
+use bloom_vfs::handlers::polymarket::{ChainClientReader, PolymarketOnboarding, build_onboarder};
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
-    AddressBookHandler, ChainsHandler, DefiHandler, DocsHandler, EnsHandler, PricesHandler,
-    SimulateHandler, StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
+    AddressBookHandler, ChainsHandler, DefiHandler, DocsHandler, EnsHandler, PolymarketHandler,
+    PricesHandler, SimulateHandler, StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
 };
 use bloom_vfs::tx_handler::PtbSubmitter;
 use bloom_vfs::{HandlerError, PathCache, Vfs};
@@ -74,6 +76,7 @@ pub struct Daemon {
     pub chains: ChainRegistry,
     pub keystore: Keystore,
     pub tx_engine: TxEngine,
+    pub home_write_permit: Option<Arc<HomeWritePermit>>,
     pub address_book: Arc<AddressBook>,
     pub audit: Arc<AuditLog>,
     pub vfs: Vfs,
@@ -93,6 +96,23 @@ impl Daemon {
     /// Build a fully-wired daemon from the home directory, materialising
     /// any missing subdirs as needed.
     pub fn from_home(home: HomeDir) -> Result<Self, DaemonError> {
+        Self::from_home_inner(home, None)
+    }
+
+    /// Build a daemon with a held home write permit. VFS write surfaces use
+    /// this permit for TxEngine mutations; callers that omit it get a daemon
+    /// suitable for reads/tests but not outbox writes.
+    pub fn from_home_with_permit(
+        home: HomeDir,
+        permit: Arc<HomeWritePermit>,
+    ) -> Result<Self, DaemonError> {
+        Self::from_home_inner(home, Some(permit))
+    }
+
+    fn from_home_inner(
+        home: HomeDir,
+        home_write_permit: Option<Arc<HomeWritePermit>>,
+    ) -> Result<Self, DaemonError> {
         home.ensure()?;
         let config_path = home.config_path();
         let config_existed = config_path.exists();
@@ -452,6 +472,7 @@ impl Daemon {
                         tx_engine.clone(),
                         address_book.clone(),
                     )
+                    .with_home_write_permit_opt(home_write_permit.clone())
                     .with_mempool_indexes(mempool_indexes.clone()),
                 ) as _,
             )
@@ -531,12 +552,85 @@ impl Daemon {
                         tx_engine.clone(),
                         address_book_arc.clone(),
                     )
+                    .with_home_write_permit_opt(home_write_permit.clone())
                     .with_default_chain(config.default_chain.clone())
+                    .with_store_root(home.root().join("defi"))
+                    .with_polymarket_root(home.polymarket_dir())
                     .with_revert_decoder(decoder_chain.clone()),
                 ) as _,
             );
         } else {
             debug!("daemon.defi_skipped: no [enso] config");
+        }
+
+        // Polymarket: public read surface (Gamma/Data/CLOB) plus, when a
+        // `[chains]` entry matches the Polymarket chain id (Polygon 137), the
+        // onboarding state machine and L2 account views. Mount whenever a
+        // `[polymarket]` block exists; a bare block uses the public defaults.
+        // Signing never leaves the daemon (Keystore::signer → KeystoreSigner);
+        // the geoblock refuse-line is deliberately not configurable.
+        if let Some(pm_cfg) = &config.polymarket {
+            let pm_url = |raw: &str| match url::Url::parse(raw) {
+                Ok(u) => Some(u),
+                Err(e) => {
+                    warn!(url = %raw, error = %e, "daemon.polymarket_url_invalid_using_default");
+                    None
+                }
+            };
+            let mut gamma = GammaClient::new();
+            if let Some(u) = pm_url(&pm_cfg.gamma_url) {
+                gamma = gamma.with_base_url(u);
+            }
+            let mut data = DataClient::new();
+            if let Some(u) = pm_url(&pm_cfg.data_url) {
+                data = data.with_base_url(u);
+            }
+            let mut clob = ClobClient::new(pm_cfg.chain_id);
+            if let Some(u) = pm_url(&pm_cfg.clob_url) {
+                clob = clob.with_base_url(u);
+            }
+
+            let mut handler = PolymarketHandler::new(gamma, data, clob.clone(), keystore.clone())
+                .with_order_store(bloom_polymarket::OrderStore::new(home.polymarket_dir()))
+                .with_fund_store(home.polymarket_dir());
+            // Resolve the settlement chain by id — onboarding needs RPC reads
+            // (code/balances/allowances) for its idempotency probes.
+            let polygon = chains
+                .list_names()
+                .into_iter()
+                .filter_map(|n| chains.get(&n))
+                .find(|c| c.spec().chain_id == pm_cfg.chain_id);
+            match polygon {
+                Some(chain_client) => {
+                    let state_dir = home.polymarket_dir();
+                    let chain: Arc<dyn bloom_polymarket::ChainReader> =
+                        Arc::new(ChainClientReader(chain_client.clone()));
+                    // Factory selects the path (relayer_api_key present ⇒
+                    // deposit-wallet, else EOA) and applies the configured URLs.
+                    let onboarder = build_onboarder(pm_cfg, chain_client, &state_dir);
+                    debug!(
+                        chain_id = pm_cfg.chain_id,
+                        "daemon.polymarket_onboarding_wired"
+                    );
+                    handler = handler
+                        .with_onboarding(PolymarketOnboarding {
+                            onboarder: Arc::new(onboarder),
+                            geoblock: Arc::new(GeoblockClient::new()),
+                            creds: CredentialStore::new(&state_dir),
+                            chain,
+                        })
+                        .with_audit(audit_arc.clone());
+                }
+                None => warn!(
+                    chain_id = pm_cfg.chain_id,
+                    "polymarket onboarding disabled: no [chains.*] entry with this chain_id; \
+                     mounting the read surface only"
+                ),
+            }
+            debug!(chain_id = pm_cfg.chain_id, "daemon.polymarket_mounted");
+            vfs_builder = vfs_builder.mount("polymarket", Arc::new(handler) as _);
+        } else {
+            debug!("daemon.polymarket_skipped: no [polymarket] config");
         }
 
         let vfs = vfs_builder
@@ -702,6 +796,7 @@ impl Daemon {
             chains,
             keystore,
             tx_engine,
+            home_write_permit,
             address_book: address_book_arc,
             audit: audit_arc,
             vfs,

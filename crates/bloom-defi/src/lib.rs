@@ -70,6 +70,11 @@ impl RoutingStrategy {
 pub struct RouteRequest {
     pub from_address: Address,
     pub chain_id: u64,
+    /// Destination chain id for cross-chain routes. When set, Enso
+    /// bridges the input token and executes the route on the
+    /// destination chain. The returned tx is still broadcast on
+    /// `chain_id` (source chain).
+    pub destination_chain_id: Option<u64>,
     pub token_in: Address,
     pub token_out: Address,
     /// Decimal stringified raw amount (token decimals applied by caller).
@@ -92,6 +97,7 @@ impl RouteRequest {
         Self {
             from_address,
             chain_id,
+            destination_chain_id: None,
             token_in,
             token_out,
             amount_in,
@@ -114,6 +120,9 @@ impl RouteRequest {
         ];
         if let Some(s) = self.routing_strategy {
             q.push(("routingStrategy", s.as_str().to_string()));
+        }
+        if let Some(d) = self.destination_chain_id {
+            q.push(("destinationChainId", d.to_string()));
         }
         if let Some(r) = self.receiver {
             q.push(("receiver", format!("0x{:x}", r)));
@@ -168,9 +177,70 @@ pub struct RouteResponse {
     /// Opaque route description.
     #[serde(default)]
     pub route: serde_json::Value,
-    /// Price impact in % (0.0..100.0), if Enso reports it.
+    /// **Enso-reported, unit UNVERIFIED.** Observed raw values like `291` and
+    /// `15` on near-1:1 routes make the unit (percent? bps? score?) ambiguous,
+    /// so this is **display-only** and must never drive a policy threshold
+    /// (Enso route discovery finding D8). Surfaces in plans labelled
+    /// "Enso-reported".
     #[serde(default)]
     pub price_impact: Option<f64>,
+    /// Destination chain id extracted from the first bridging hop
+    /// in `route`. Populated post-deserialisation by [`EnsoClient::route`].
+    #[serde(skip)]
+    pub destination_chain_id: Option<u64>,
+}
+
+impl RouteResponse {
+    /// Conservatively extract protocol names from the opaque `route` array.
+    ///
+    /// Returns `(protocols, unknown)`. `unknown = true` means bloom could not
+    /// parse the metadata (route is not an array, or no hop carried a
+    /// recognisable `protocol`/`name` field) — callers must fail closed on it.
+    /// Names are lower-cased and de-duplicated in encounter order.
+    pub fn protocols(&self) -> (Vec<String>, bool) {
+        let Some(hops) = self.route.as_array() else {
+            return (Vec::new(), true);
+        };
+        let mut names: Vec<String> = Vec::new();
+        let mut saw_field = false;
+        for hop in hops {
+            let name = hop
+                .get("protocol")
+                .or_else(|| hop.get("name"))
+                .or_else(|| hop.get("project"));
+            if let Some(n) = name.and_then(|v| v.as_str()) {
+                saw_field = true;
+                let lc = n.trim().to_lowercase();
+                if !lc.is_empty() && !names.contains(&lc) {
+                    names.push(lc);
+                }
+            }
+        }
+        // An array with hops but no protocol field anywhere ⇒ unparsed.
+        let unknown = !hops.is_empty() && !saw_field;
+        (names, unknown)
+    }
+
+    /// Whether the route's tx calldata encodes `receiver` as a 20-byte word.
+    ///
+    /// A WP0 receiver calldata-diff probe (placeholder receivers, Base→Polygon
+    /// and Polygon→Polygon pUSD routes) showed Enso encodes the requested
+    /// `receiver` **verbatim** in `tx.data` — once for a same-chain route, twice
+    /// for the cross-chain bridge route — and that each route's calldata
+    /// contains only its own requested receiver. So, since Bloom builds the
+    /// route with `receiver = <expected>`, this confirms Enso honored that
+    /// receiver rather than substituting a different one.
+    ///
+    /// Scope: this is a *consistency* check against an accidental / swapped /
+    /// stale route response — **not** a defense against a malicious Enso
+    /// (explicitly out of the plan's threat model: a hostile service could embed
+    /// the expected address as a decoy while crediting another). Receiver offsets
+    /// are route-shape-dependent, so this checks presence, not a fixed offset;
+    /// for cross-chain, full assurance still requires destination settlement
+    /// proof (WP5).
+    pub fn calldata_contains_receiver(&self, receiver: Address) -> bool {
+        self.tx.data.windows(20).any(|w| w == receiver.as_slice())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,7 +355,13 @@ impl EnsoClient {
                 body,
             });
         }
-        let v: RouteResponse = serde_json::from_str(&body)?;
+        let mut v: RouteResponse = serde_json::from_str(&body)?;
+        // Extract destination_chain_id from the first bridging hop.
+        if let Some(hops) = v.route.as_array() {
+            v.destination_chain_id = hops
+                .iter()
+                .find_map(|hop| hop.get("destinationChainId")?.as_u64());
+        }
         tracing::debug!(
             chain_id = req.chain_id,
             token_in = %req.token_in,
@@ -381,6 +457,223 @@ impl EnsoClient {
             "enso.quote.ok"
         );
         Ok(v)
+    }
+}
+
+// --- Enso Quoter: simulate + validate ------------------------------------
+//
+// A separate service (`quoter.api.enso.build`) from the route API. `simulate`
+// returns an Enso-attested effect model plus a `simulationId`; `validate` binds
+// an exact tx (chainId/from/to/data/value) to that id. The wire shapes were
+// pinned by the WP0 live probe (docs/plans/2026-06-13-enso-simulation-
+// verification.md): `tokenIn`/`tokenOut`/`amountIn` are arrays, `chainId` is
+// required both top-level and inside `transaction`, and `validate` is keyed by
+// `simulationId`. Mutating any of the five tx fields flips its `checks` entry.
+
+const DEFAULT_QUOTER_URL: &str = "https://quoter.api.enso.build";
+
+fn ser_u256_dec<S: serde::Serializer>(v: &U256, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&v.to_string())
+}
+
+/// The exact transaction the quoter simulates/validates. `value` serialises as
+/// a decimal string and `data` as 0x-hex, matching the route tx wire shape.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuoterTx {
+    pub chain_id: u64,
+    pub from: Address,
+    pub to: Address,
+    pub data: Bytes,
+    #[serde(serialize_with = "ser_u256_dec")]
+    pub value: U256,
+}
+
+impl QuoterTx {
+    /// Build from a route's tx on `chain_id` (the source chain for x-chain).
+    pub fn from_route_tx(chain_id: u64, tx: &RouteTx) -> Self {
+        Self {
+            chain_id,
+            from: tx.from,
+            to: tx.to,
+            data: tx.data.clone(),
+            value: tx.value,
+        }
+    }
+}
+
+/// `POST /api/v1/simulate` request. Token arrays support multi-in/out routes.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimulateRequest {
+    pub chain_id: u64,
+    pub transaction: QuoterTx,
+    pub token_in: Vec<Address>,
+    pub token_out: Vec<Address>,
+    pub amount_in: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination_chain_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_strategy: Option<RoutingStrategy>,
+}
+
+/// `POST /api/v1/validate` request.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateRequest {
+    pub simulation_id: String,
+    pub transaction: QuoterTx,
+}
+
+/// `simulate` response.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimulateResponse {
+    pub simulation_id: String,
+    #[serde(default)]
+    pub chain_id: Option<u64>,
+    pub result: SimulateResult,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SimulateResult {
+    /// `"Success"` or `"Error"` (Quoter OpenAPI enum).
+    pub status: String,
+    /// **Output amounts in wei**, parallel to the request's `tokenOut` array.
+    /// Per the Quoter OpenAPI this is `string[]` — amounts only, with **no
+    /// token, address, or receiver**. So a `/simulate` result can prove an
+    /// output *amount* (a min-output floor) but **cannot attribute output to a
+    /// receiver**; receiver verification must come from decoding the route's
+    /// receiver argument or from destination settlement (WP5), not from here.
+    /// Empty even on `status:"Success"` when the tx produced nothing — see
+    /// [`SimulateResponse::produced_output`].
+    #[serde(default)]
+    pub amount_out: Vec<String>,
+    #[serde(default)]
+    pub gas: Option<String>,
+    /// Error detail when `status == "Error"`.
+    #[serde(default)]
+    pub error: Option<serde_json::Value>,
+    /// Any fields beyond the modelled OpenAPI shape, preserved raw for audit.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl SimulateResponse {
+    /// Enso reported the simulation status as success.
+    pub fn status_success(&self) -> bool {
+        self.result.status.eq_ignore_ascii_case("success")
+    }
+
+    /// Whether any output effect was attributed at all.
+    pub fn amount_out_nonempty(&self) -> bool {
+        !self.result.amount_out.is_empty()
+    }
+
+    /// **The real success gate.** WP0 proved `status:"Success"` alone is not
+    /// enough — an unfunded tx returns success with an empty `amountOut`. A
+    /// route only "produced output" when status is success AND `amountOut` is
+    /// non-empty. Token/receiver/floor checks layer on top of this (WP3).
+    pub fn produced_output(&self) -> bool {
+        self.status_success() && self.amount_out_nonempty()
+    }
+}
+
+/// `validate` response. Every `checks` field must be true for `valid`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateResponse {
+    pub valid: bool,
+    #[serde(default)]
+    pub simulation_id: Option<String>,
+    pub checks: ValidateChecks,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidateChecks {
+    pub chain_id: bool,
+    pub data: bool,
+    pub to: bool,
+    pub value: bool,
+    pub from: bool,
+}
+
+/// Client for the Enso Quoter (`simulate`/`validate`). Mirrors [`EnsoClient`]'s
+/// `Bearer <key>` auth and env-key handling, against a different base URL.
+#[derive(Debug, Clone)]
+pub struct QuoterClient {
+    base_url: Url,
+    http: reqwest::Client,
+    api_key: String,
+}
+
+impl QuoterClient {
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self {
+            base_url: Url::parse(DEFAULT_QUOTER_URL).expect("hardcoded default url is valid"),
+            http: reqwest::Client::new(),
+            api_key: api_key.into(),
+        }
+    }
+
+    /// From `BLOOM_ENSO_KEY` (preferred) or `ENSO_API_KEY` — the same key the
+    /// route API uses.
+    pub fn from_env() -> Result<Self, EnsoError> {
+        let key = std::env::var("BLOOM_ENSO_KEY")
+            .ok()
+            .or_else(|| std::env::var("ENSO_API_KEY").ok())
+            .filter(|k| !k.is_empty())
+            .ok_or(EnsoError::MissingKey)?;
+        Ok(Self::new(key))
+    }
+
+    pub fn with_base_url(mut self, base: Url) -> Self {
+        self.base_url = base;
+        self
+    }
+
+    pub fn base_url(&self) -> &Url {
+        &self.base_url
+    }
+
+    fn auth(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.api_key.is_empty() {
+            rb
+        } else {
+            rb.bearer_auth(&self.api_key)
+        }
+    }
+
+    /// `POST /api/v1/simulate`.
+    pub async fn simulate(&self, req: &SimulateRequest) -> Result<SimulateResponse, EnsoError> {
+        let url = self.base_url.join("/api/v1/simulate")?;
+        let resp = self.auth(self.http.post(url).json(req)).send().await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(EnsoError::Api {
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        Ok(serde_json::from_str(&text)?)
+    }
+
+    /// `POST /api/v1/validate`.
+    pub async fn validate(&self, req: &ValidateRequest) -> Result<ValidateResponse, EnsoError> {
+        let url = self.base_url.join("/api/v1/validate")?;
+        let resp = self.auth(self.http.post(url).json(req)).send().await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(EnsoError::Api {
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        Ok(serde_json::from_str(&text)?)
     }
 }
 
@@ -510,6 +803,12 @@ pub fn resolve_token_symbol(chain_id: u64, sym: &str) -> Option<Address> {
         (1, "WETH") => "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".parse().ok(),
         (1, "WBTC") => "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599".parse().ok(),
         (10, "USDC") => "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85".parse().ok(),
+        (137, "USDC") => "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359".parse().ok(),
+        (137, "USDT") => "0xc2132D05D31c914a87C6611C10748AEb04B58e8F".parse().ok(),
+        (137, "WETH") => "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619".parse().ok(),
+        (42161, "USDC") => "0xaf88d065e77c8cC2239327C5EDb3A432268e5831".parse().ok(),
+        (42161, "USDT") => "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9".parse().ok(),
+        (42161, "WETH") => "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1".parse().ok(),
         (8453, "USDC") => "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".parse().ok(),
         _ => None,
     };
@@ -655,6 +954,59 @@ mod tests {
         assert_eq!(r.price_impact, Some(0.12));
     }
 
+    #[test]
+    fn protocol_extraction_and_unknown_fail_closed() {
+        let mk = |route: serde_json::Value| RouteResponse {
+            tx: RouteTx {
+                to: "0x0000000000000000000000000000000000000002"
+                    .parse()
+                    .unwrap(),
+                data: Default::default(),
+                value: U256::ZERO,
+                from: "0x0000000000000000000000000000000000000001"
+                    .parse()
+                    .unwrap(),
+            },
+            amount_out: "1".into(),
+            gas: None,
+            route,
+            price_impact: None,
+            destination_chain_id: None,
+        };
+        // multi-hop with protocol fields → parsed, ordered, de-duped
+        let (p, unk) = mk(serde_json::json!([
+            {"protocol":"Stargate"}, {"protocol":"odos"}, {"protocol":"odos"}
+        ]))
+        .protocols();
+        assert_eq!(p, vec!["stargate", "odos"]);
+        assert!(!unk);
+        // array with no protocol field anywhere → unknown (fail closed)
+        let (p, unk) = mk(serde_json::json!([{"tokenIn":"0x.."}])).protocols();
+        assert!(p.is_empty() && unk);
+        // non-array route → unknown
+        let (p, unk) = mk(serde_json::json!({"opaque":true})).protocols();
+        assert!(p.is_empty() && unk);
+    }
+
+    /// `priceImpact` is Enso-reported with an unverified unit; surprising raw
+    /// values must round-trip untouched (no silent reinterpretation as %/bps).
+    #[test]
+    fn price_impact_raw_value_is_preserved_not_reinterpreted() {
+        let body = r#"{
+            "tx":{"from":"0x0000000000000000000000000000000000000001",
+                  "to":"0x0000000000000000000000000000000000000002",
+                  "data":"0x","value":"0"},
+            "amountOut":"1000000","route":[{"protocol":"enso"}],
+            "priceImpact": 291
+        }"#;
+        let r: RouteResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            r.price_impact,
+            Some(291.0),
+            "raw value must not be rescaled"
+        );
+    }
+
     #[tokio::test]
     async fn route_propagates_api_error() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -742,6 +1094,7 @@ mod tests {
         let req = RouteRequest {
             from_address: from,
             chain_id: 1,
+            destination_chain_id: None,
             token_in: eth,
             token_out: usdc,
             amount_in: U256::from(1_000_000_000_000_000_000u128), // 1 ETH
@@ -760,5 +1113,113 @@ mod tests {
             }
             Err(e) => panic!("live Enso route failed: {e}"),
         }
+    }
+
+    // --- Quoter (simulate/validate), parsing captured WP0 fixtures ---------
+
+    #[test]
+    fn quoter_simulate_success_with_empty_output_is_not_produced_output() {
+        let body = include_str!("../tests/fixtures/quoter_simulate_success_empty_output.json");
+        let r: SimulateResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(r.simulation_id, "30d53f44-78ba-413d-b401-2a3a5b230806");
+        assert_eq!(r.chain_id, Some(8453));
+        assert!(r.status_success(), "status is Success");
+        assert!(!r.amount_out_nonempty(), "amountOut is empty");
+        // WP0: a Success status with empty amountOut must NOT count as output.
+        assert!(!r.produced_output());
+    }
+
+    #[test]
+    fn quoter_simulate_populated_amounts_parse_as_wei_strings() {
+        // Schema-representative (Quoter OpenAPI: amountOut is string[] wei, no
+        // receiver). A non-empty amountOut on Success = output produced; the
+        // amounts are usable as a min-output floor, but carry no receiver.
+        let body = r#"{"simulationId":"x","chainId":8453,
+            "result":{"status":"Success","amountOut":["5040656"],"gas":"564908"}}"#;
+        let r: SimulateResponse = serde_json::from_str(body).unwrap();
+        assert!(r.produced_output());
+        assert_eq!(r.result.amount_out, vec!["5040656".to_string()]);
+        // amounts are plain wei strings, parseable for a floor comparison.
+        assert_eq!(r.result.amount_out[0].parse::<u128>().unwrap(), 5_040_656);
+    }
+
+    #[test]
+    fn route_calldata_contains_requested_receiver() {
+        // Real Enso same-chain route calldata captured with a placeholder
+        // receiver (0x2222…); the WP0 calldata-diff probe found the receiver
+        // encoded verbatim in tx.data.
+        let body = include_str!("../tests/fixtures/route_same_chain_receiver_placeholder.json");
+        let r: RouteResponse = serde_json::from_str(body).unwrap();
+        let recv: Address = "0x2222222222222222222222222222222222222222"
+            .parse()
+            .unwrap();
+        let other: Address = "0x4444444444444444444444444444444444444444"
+            .parse()
+            .unwrap();
+        assert!(
+            r.calldata_contains_receiver(recv),
+            "the requested receiver must be encoded in the route calldata"
+        );
+        assert!(
+            !r.calldata_contains_receiver(other),
+            "an address we did not request must not be found"
+        );
+    }
+
+    #[test]
+    fn quoter_validate_fixtures_parse_checks() {
+        let body = include_str!("../tests/fixtures/quoter_validate_valid.json");
+        let r: ValidateResponse = serde_json::from_str(body).unwrap();
+        assert!(r.valid);
+        let c = r.checks;
+        assert!(c.chain_id && c.data && c.to && c.value && c.from);
+
+        let body = include_str!("../tests/fixtures/quoter_validate_invalid.json");
+        let r: ValidateResponse = serde_json::from_str(body).unwrap();
+        assert!(!r.valid);
+        assert!(!r.checks.data, "the mutated data byte must fail its check");
+        assert!(r.checks.to && r.checks.value && r.checks.from && r.checks.chain_id);
+    }
+
+    #[test]
+    fn simulate_request_serialises_to_the_wp0_shape() {
+        // All-lowercase addresses: avoids EIP-55 checksum parsing in the test.
+        let tx = QuoterTx {
+            chain_id: 8453,
+            from: "0x1111111111111111111111111111111111111111"
+                .parse()
+                .unwrap(),
+            to: "0xf75584ef6673ad213a685a1b58cc0330b8ea22cf"
+                .parse()
+                .unwrap(),
+            data: Bytes::from(vec![0xde, 0xad]),
+            value: U256::from(71995316158156u64),
+        };
+        let req = SimulateRequest {
+            chain_id: 8453,
+            transaction: tx,
+            token_in: vec![
+                "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+                    .parse()
+                    .unwrap(),
+            ],
+            token_out: vec![
+                "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
+                    .parse()
+                    .unwrap(),
+            ],
+            amount_in: vec!["5052843".into()],
+            destination_chain_id: Some(137),
+            routing_strategy: Some(RoutingStrategy::Router),
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        // arrays + chainId top-level AND nested + decimal-string value.
+        assert!(v["tokenIn"].is_array() && v["tokenOut"].is_array() && v["amountIn"].is_array());
+        assert_eq!(v["chainId"], 8453);
+        assert_eq!(v["transaction"]["chainId"], 8453);
+        assert_eq!(v["transaction"]["value"], "71995316158156");
+        assert_eq!(v["amountIn"][0], "5052843");
+        assert_eq!(v["routingStrategy"], "router");
+        assert_eq!(v["destinationChainId"], 137);
     }
 }

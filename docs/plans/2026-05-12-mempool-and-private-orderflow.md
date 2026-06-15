@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement mempool observability, nonce-conflict detection, gas-bump suggestions, private orderflow routing, and stage-time MEV/sandwich warnings, addressing README.md:167 and the v1 non-goal at `docs/specs/2026-05-08-bloom-eth-design.md:78`.
+**Goal:** Implement mempool observability, nonce-conflict detection, gas-bump suggestions, private orderflow routing, and stage-time MEV/sandwich warnings, addressing README.md:167 and the v1 non-goal at `docs/specs/2026-05-08-bloom-design.md`.
 
 **Architecture:** One new crate (`bloom-mempool`) owns the read-side mempool stream + index + provider traits + heuristic. `bloom-tx`, `bloom-rpc`, `bloom-vfs`, and `bloom-daemon` are extended to wire the new logic into staging, broadcast, the VFS, and the daemon lifecycle. Provider abstractions (`MempoolProvider`, `PrivateRpcProvider`) keep external dependencies behind feature flags. Reference spec: `docs/specs/2026-05-12-mempool-and-private-orderflow-design.md`.
 

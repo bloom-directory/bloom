@@ -524,6 +524,36 @@ impl Keystore {
         Ok(out)
     }
 
+    /// Raw `policy.toml` content + wallet kind, **without** signature
+    /// verification. For displaying what `sign_policy` is about to sign:
+    /// the only time re-signing is needed is precisely when the file is
+    /// modified-but-unsigned, so verification here would make `sign-policy`
+    /// unusable for its purpose. The authorization is the unlock ceremony
+    /// that follows, with this content shown first.
+    pub fn raw_policy(&self, name: &str) -> Result<(String, WalletKind), KeystoreError> {
+        Self::validate_name(name)?;
+        let dir = self.wallet_path(name);
+        if !dir.exists() {
+            return Err(KeystoreError::NotFound(name.into()));
+        }
+        let kind: WalletKind = match read_trim(&dir.join("kind"))?.as_str() {
+            "local" => WalletKind::Local,
+            "watch" => WalletKind::Watch,
+            "passkey" => WalletKind::PasskeyGated,
+            other => return Err(KeystoreError::Malformed(format!("kind: {other}"))),
+        };
+        let policy_path = dir.join("policy.toml");
+        let content = if policy_path.exists() {
+            fs::read_to_string(&policy_path).map_err(|source| KeystoreError::Io {
+                path: policy_path,
+                source,
+            })?
+        } else {
+            String::new()
+        };
+        Ok((content, kind))
+    }
+
     pub fn info(&self, name: &str) -> Result<WalletInfo, KeystoreError> {
         Self::validate_name(name)?;
         let dir = self.wallet_path(name);

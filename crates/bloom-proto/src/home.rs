@@ -1,7 +1,10 @@
 //! On-disk layout under `~/.bloom/`.
 
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -14,6 +17,8 @@ pub enum HomeError {
         #[source]
         source: std::io::Error,
     },
+    #[error("Bloom home is already open for writing (lock={path})")]
+    WriteLockHeld { path: PathBuf },
 }
 
 /// Resolves and creates the bloom home directory tree.
@@ -118,6 +123,77 @@ impl HomeDir {
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")
     }
+    /// Polymarket per-wallet state (CLOB creds + onboarding state).
+    pub fn polymarket_dir(&self) -> PathBuf {
+        self.root.join("polymarket")
+    }
+
+    pub fn canonical_root(&self) -> Result<PathBuf, HomeError> {
+        std::fs::canonicalize(&self.root).map_err(|source| HomeError::Io {
+            path: self.root.clone(),
+            source,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct HomeWritePermit {
+    home: PathBuf,
+    path: PathBuf,
+    _file: File,
+}
+
+impl HomeWritePermit {
+    pub fn acquire(home: &HomeDir) -> Result<Self, HomeError> {
+        fs::create_dir_all(home.root()).map_err(|source| HomeError::Io {
+            path: home.root().to_path_buf(),
+            source,
+        })?;
+        let canonical_home = home.canonical_root()?;
+        let run_dir = canonical_home.join("run");
+        fs::create_dir_all(&run_dir).map_err(|source| HomeError::Io {
+            path: run_dir.clone(),
+            source,
+        })?;
+        let path = run_dir.join(".daemon.lock");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| HomeError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.try_lock_exclusive()
+            .map_err(|_| HomeError::WriteLockHeld { path: path.clone() })?;
+        file.set_len(0).map_err(|source| HomeError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        write!(file, "{}", std::process::id()).map_err(|source| HomeError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        file.flush().map_err(|source| HomeError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        Ok(Self {
+            home: canonical_home,
+            path,
+            _file: file,
+        })
+    }
+
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 fn shellexpand_local(raw: &str) -> String {
@@ -221,5 +297,25 @@ mod tests {
             let home = HomeDir::resolve("~/foo/bar").unwrap();
             assert_eq!(home.root(), real_home.join("foo").join("bar"));
         }
+    }
+
+    #[test]
+    fn write_permit_excludes_second_holder() {
+        let td = tempdir().unwrap();
+        let home = HomeDir::at(td.path());
+        let first = HomeWritePermit::acquire(&home).unwrap();
+        let second = HomeWritePermit::acquire(&home);
+        assert!(matches!(second, Err(HomeError::WriteLockHeld { .. })));
+        drop(first);
+        let third = HomeWritePermit::acquire(&home).unwrap();
+        assert!(third.path().ends_with("run/.daemon.lock"));
+    }
+
+    #[test]
+    fn write_permit_canonicalizes_home() {
+        let td = tempdir().unwrap();
+        let home = HomeDir::at(td.path().join(".").join(""));
+        let permit = HomeWritePermit::acquire(&home).unwrap();
+        assert_eq!(permit.home(), td.path().canonicalize().unwrap());
     }
 }

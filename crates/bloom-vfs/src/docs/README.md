@@ -31,6 +31,8 @@ elevated privileges. Without a mount, the same paths are available through
 - `wallets/<name>/` — managed wallets, outbox write surface, history,
   allowances, ENS reverse, sign / EIP-712 surfaces.
 - `defi/intents/` — Enso-mediated DeFi intents (write `quote` / `execute`).
+- `polymarket/` — prediction-market reads, onboarding, and trade drafts
+  (opt-in + human-gated; drive with `bloom polymarket ...`; see `docs/examples.md`).
 - `watch/` — long-running subscriptions (head, addr, log) executed by the
   daemon and persisted to JSONL.
 - `simulate/` — out-of-band tx simulation with state overrides

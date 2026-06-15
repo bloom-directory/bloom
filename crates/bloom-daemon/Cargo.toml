@@ -29,6 +29,7 @@ bloom-tx.workspace = true
 bloom-vfs.workspace = true
 bloom-tools.workspace = true
 bloom-defi.workspace = true
+bloom-polymarket.workspace = true
 bloom-watch.workspace = true
 bloom-mount.workspace = true
 bloom-ens.workspace = true
@@ -53,6 +54,7 @@ parking_lot.workspace = true
 alloy.workspace = true
 url.workspace = true
 base64.workspace = true
+blake3.workspace = true
 hex.workspace = true
 futures.workspace = true
 

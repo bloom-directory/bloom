@@ -25,7 +25,7 @@ use alloy::signers::SignerSync;
 use async_trait::async_trait;
 use bloom_chain::ChainRegistry;
 use bloom_keystore::Keystore;
-use bloom_proto::{AddressBook, RawIntent, format_units};
+use bloom_proto::{AddressBook, HomeWritePermit, RawIntent, format_units};
 use bloom_tx::{
     intent_parser,
     outbox::OutboxState,
@@ -41,6 +41,7 @@ pub struct WalletsHandler {
     pub chains: ChainRegistry,
     pub tx_engine: TxEngine,
     pub address_book: Arc<AddressBook>,
+    pub home_write_permit: Option<Arc<HomeWritePermit>>,
     pub mempool_indexes:
         Arc<std::collections::BTreeMap<String, Arc<bloom_mempool::PendingTxIndex>>>,
 }
@@ -57,8 +58,19 @@ impl WalletsHandler {
             chains,
             tx_engine,
             address_book: Arc::new(address_book),
+            home_write_permit: None,
             mempool_indexes: Arc::new(std::collections::BTreeMap::new()),
         }
+    }
+
+    pub fn with_home_write_permit(mut self, permit: Arc<HomeWritePermit>) -> Self {
+        self.home_write_permit = Some(permit);
+        self
+    }
+
+    pub fn with_home_write_permit_opt(mut self, permit: Option<Arc<HomeWritePermit>>) -> Self {
+        self.home_write_permit = permit;
+        self
     }
 
     pub fn with_mempool_indexes(
@@ -67,6 +79,14 @@ impl WalletsHandler {
     ) -> Self {
         self.mempool_indexes = Arc::new(indexes);
         self
+    }
+
+    fn write_permit(&self) -> Result<&HomeWritePermit, HandlerError> {
+        self.home_write_permit.as_deref().ok_or_else(|| {
+            HandlerError::backend(
+                "wallet write surface is not attached to a home write permit; refusing mutation",
+            )
+        })
     }
 
     fn wallet_dir_entries(kind: bloom_keystore::WalletKind) -> Vec<Entry> {
@@ -110,6 +130,18 @@ fn err_be(e: impl std::fmt::Display) -> HandlerError {
 /// [`OutboxState`], rejecting anything else as NotFound.
 fn parse_state_seg(s: &str) -> Result<OutboxState, HandlerError> {
     OutboxState::parse(s).ok_or_else(|| HandlerError::not_found(format!("outbox state '{}'", s)))
+}
+
+fn split_confirm_review_hash(confirm_text: &str) -> (&str, Option<&str>) {
+    let mut lines = confirm_text.lines();
+    let first = lines.next().unwrap_or(confirm_text).trim();
+    let review_hash = lines.find_map(|line| {
+        line.trim()
+            .strip_prefix("review_hash=")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    });
+    (first, review_hash)
 }
 
 #[async_trait]
@@ -702,6 +734,7 @@ impl WalletsHandler {
                 let staged = self
                     .tx_engine
                     .stage(
+                        self.write_permit()?,
                         wallet,
                         info.address,
                         intent,
@@ -727,6 +760,15 @@ impl WalletsHandler {
                         "confirm requires non-empty content (e.g. 'y' or override token)",
                     ));
                 }
+                if confirm_text.eq_ignore_ascii_case("cancel") {
+                    self.write_permit()?;
+                    self.tx_engine
+                        .outbox
+                        .cancel(wallet, chain, id)
+                        .map_err(err_be)?;
+                    return Ok(());
+                }
+                let (confirm_text, reviewed_intent_hash) = split_confirm_review_hash(confirm_text);
                 let signer = self
                     .keystore
                     .signer(wallet)
@@ -734,6 +776,7 @@ impl WalletsHandler {
                 let _staged = self
                     .tx_engine
                     .confirm(
+                        self.write_permit()?,
                         wallet,
                         chain,
                         id,
@@ -741,6 +784,7 @@ impl WalletsHandler {
                         &signer,
                         &info.policy,
                         confirm_text,
+                        reviewed_intent_hash,
                     )
                     .await
                     .map_err(|e| match e {
@@ -768,7 +812,17 @@ impl WalletsHandler {
                     .map_err(|_| HandlerError::PermissionDenied)?;
                 let _ = self
                     .tx_engine
-                    .cancel(wallet, chain, id, &client, &signer, 10, &info.policy)
+                    .cancel(
+                        self.write_permit()?,
+                        wallet,
+                        chain,
+                        id,
+                        &client,
+                        &signer,
+                        10,
+                        &info.policy,
+                        None,
+                    )
                     .await
                     .map_err(err_be)?;
                 Ok(())
@@ -799,6 +853,7 @@ impl WalletsHandler {
                 let _ = self
                     .tx_engine
                     .replace_with_intent(
+                        self.write_permit()?,
                         wallet,
                         chain,
                         id,
@@ -808,6 +863,7 @@ impl WalletsHandler {
                         Some(intent),
                         Some(self.address_book.as_ref()),
                         &info.policy,
+                        None,
                     )
                     .await
                     .map_err(err_be)?;
@@ -1061,7 +1117,10 @@ mod tests {
         let outbox = Outbox::new(&outbox_root).unwrap();
         let tx_engine = TxEngine::new(outbox, 60_000, false);
         let address_book = AddressBook::default();
-        let handler = WalletsHandler::new(keystore, chains, tx_engine, address_book);
+        let home = bloom_proto::HomeDir::at(tmp.path().join("home"));
+        let permit = Arc::new(HomeWritePermit::acquire(&home).unwrap());
+        let handler = WalletsHandler::new(keystore, chains, tx_engine, address_book)
+            .with_home_write_permit(permit);
         let sign_dir = ks_root.join("alice").join("sign");
         Fixture {
             _tmp: tmp,
@@ -1330,6 +1389,39 @@ mod tests {
         // Whitespace-only is also rejected.
         let r = f.handler.write(&p, b"   \n\t").await;
         assert!(matches!(r, Err(HandlerError::Invalid(_))), "got: {r:?}");
+    }
+
+    #[tokio::test]
+    async fn confirm_cancel_discards_pending_locally() {
+        let f = make_handler_with_chain(true);
+        seed_pending(&f, "0001-test");
+        let p = VfsPath::parse(&format!(
+            "/{}/chains/anvil/outbox/pending/0001-test/confirm",
+            f.wallet_name
+        ))
+        .unwrap();
+        f.handler.write(&p, b"cancel").await.unwrap();
+
+        let entry = f
+            .handler
+            .tx_engine
+            .outbox
+            .read(&f.wallet_name, "anvil", "0001-test")
+            .unwrap();
+        assert_eq!(entry.state, OutboxState::Failed);
+        assert!(!entry.dir.join("broadcast_attempted.json").exists());
+        assert!(!entry.dir.join("raw_tx").exists());
+    }
+
+    #[test]
+    fn confirm_review_hash_metadata_is_split_from_confirm_text() {
+        let (confirm, hash) = split_confirm_review_hash("y\nreview_hash=abc123\n");
+        assert_eq!(confirm, "y");
+        assert_eq!(hash, Some("abc123"));
+
+        let (confirm, hash) = split_confirm_review_hash("override");
+        assert_eq!(confirm, "override");
+        assert_eq!(hash, None);
     }
 
     /// Fix #2 + #10: writing `outbox/sent/<id>/confirm` is not a valid

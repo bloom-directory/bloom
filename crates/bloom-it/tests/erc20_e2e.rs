@@ -121,7 +121,8 @@ async fn erc20_stage_fails_when_decimals_unreadable() -> Result<()> {
     let chain = ChainClient::new(anvil_chain_spec(&rpc_url)).map_err(|e| anyhow!("chain: {e}"))?;
 
     let tmp = tempfile::tempdir()?;
-    let outbox = Outbox::new(tmp.path()).map_err(|e| anyhow!("outbox: {e}"))?;
+    let permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(tmp.path()))?;
+    let outbox = Outbox::new(tmp.path().join("outbox")).map_err(|e| anyhow!("outbox: {e}"))?;
     let engine = TxEngine::new(outbox, 60_000, false);
 
     let from = ANVIL_ADDR0.parse().unwrap();
@@ -139,7 +140,15 @@ async fn erc20_stage_fails_when_decimals_unreadable() -> Result<()> {
     };
 
     let res = engine
-        .stage("alice", from, intent, &chain, &Policy::permissive(), None)
+        .stage(
+            &permit,
+            "alice",
+            from,
+            intent,
+            &chain,
+            &Policy::permissive(),
+            None,
+        )
         .await;
     let err = match res {
         Ok(_) => return Err(anyhow!("expected staging to fail (no code at USDC addr)")),
@@ -163,7 +172,8 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
     let chain = ChainClient::new(anvil_chain_spec(&rpc_url)).map_err(|e| anyhow!("chain: {e}"))?;
 
     let tmp = tempfile::tempdir()?;
-    let outbox = Outbox::new(tmp.path()).map_err(|e| anyhow!("outbox: {e}"))?;
+    let permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(tmp.path()))?;
+    let outbox = Outbox::new(tmp.path().join("outbox")).map_err(|e| anyhow!("outbox: {e}"))?;
     let engine = TxEngine::new(outbox, 60_000, false);
 
     // Use anvil's prefunded account #0 as the signer.
@@ -184,7 +194,15 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
     };
 
     let staged = engine
-        .stage("alice", from, intent, &chain, &Policy::permissive(), None)
+        .stage(
+            &permit,
+            "alice",
+            from,
+            intent,
+            &chain,
+            &Policy::permissive(),
+            None,
+        )
         .await
         .map_err(|e| anyhow!("stage: {e}"))?;
     let original_nonce = staged.nonce;
@@ -196,6 +214,7 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
 
     let confirmed = engine
         .confirm(
+            &permit,
             "alice",
             "anvil",
             &staged.id,
@@ -203,6 +222,7 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
             &signer,
             &Policy::permissive(),
             "y",
+            None,
         )
         .await
         .map_err(|e| anyhow!("confirm: {e}"))?;
@@ -211,6 +231,7 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
     // Replace with +15% fees.
     let replaced = engine
         .replace(
+            &permit,
             "alice",
             "anvil",
             &staged.id,
@@ -218,6 +239,7 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
             &signer,
             15,
             &Policy::permissive(),
+            None,
         )
         .await
         .map_err(|e| anyhow!("replace: {e}"))?;

@@ -1,0 +1,27 @@
+[package]
+name = "bloom-polymarket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Polymarket v2 client (Gamma/Data/CLOB reads + L1/L2 auth signing) for bloom"
+
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+tracing.workspace = true
+url.workspace = true
+alloy.workspace = true
+hex.workspace = true
+rand.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile.workspace = true

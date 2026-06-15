@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::network::EthereumWallet;
 use alloy::network::{NetworkTransactionBuilder, TransactionBuilder};
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::rpc::types::eth::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
@@ -39,8 +39,8 @@ sol! {
     }
 }
 use bloom_proto::{
-    AddressBook, ChainSpec, NftAction, NftRef, Policy, RawIntent, RawIntentBody, StagedTx,
-    TokenRef, TxStatus, parse_amount, parse_eth, parse_units,
+    AddressBook, ChainSpec, HomeWritePermit, NftAction, NftRef, Policy, RawIntent, RawIntentBody,
+    StagedTx, TokenRef, TxStatus, parse_amount, parse_eth, parse_units,
 };
 use parking_lot::RwLock;
 use thiserror::Error;
@@ -48,7 +48,10 @@ use tracing::{debug, info};
 
 use crate::bump_scanner::MempoolIndexes;
 use crate::intent_parser::ParseError;
-use crate::outbox::{Outbox, OutboxError, OutboxState};
+use crate::outbox::{
+    BroadcastAttempt, BroadcastAttemptKind, BroadcastTransport, Outbox, OutboxError, OutboxState,
+    SameNonceAttemptQuery,
+};
 use crate::policy_engine;
 
 /// Pluggable name resolver. Implemented by an ENS adapter outside the
@@ -76,6 +79,8 @@ pub enum TxEngineError {
     PolicyDenied,
     #[error("broadcast disabled for chain '{0}' (set allow_broadcast=true)")]
     BroadcastDisabled(String),
+    #[error("broadcast approval required: {0}")]
+    BroadcastApprovalRequired(String),
     #[error("not yet implemented: {0}")]
     Unimplemented(String),
     #[error("signer: {0}")]
@@ -90,6 +95,14 @@ pub enum TxEngineError {
     PrivateBroadcast(String),
     #[error("private RPC provider {provider} does not support chain {chain_id}")]
     PrivateProviderChainMismatch { provider: String, chain_id: u64 },
+    #[error("broadcast returned hash {returned}, expected signed tx hash {expected}")]
+    BroadcastHashMismatch { expected: String, returned: String },
+    #[error("broadcast attempt for tx '{id}' is ambiguous: {reason}")]
+    BroadcastAttemptAmbiguous { id: String, reason: String },
+    #[error("home write permit does not match tx outbox home (permit={permit}, outbox={outbox})")]
+    HomeWritePermitMismatch { permit: String, outbox: String },
+    #[error("home write permit check failed: {0}")]
+    HomeWritePermit(String),
     #[error("tx '{id}' is in status {status}, expected pending or unmined sent")]
     InvalidTxStatus { id: String, status: String },
     #[error(
@@ -104,6 +117,16 @@ type TokenCache = Arc<RwLock<HashMap<(u64, Address), TokenMeta>>>;
 /// Per-(chain_id, provider_id) map of configured private RPC providers
 /// used by `broadcast` when `policy.private.enabled == true`.
 type PrivateRpcs = Arc<RwLock<BTreeMap<(u64, String), Arc<dyn bloom_mempool::PrivateRpcProvider>>>>;
+
+struct SignedRawTx {
+    raw: Bytes,
+    hash: B256,
+}
+
+struct SubmitResult {
+    transport: BroadcastTransport,
+    returned_hash: Option<B256>,
+}
 
 /// Stub `QuoteOracle` for stage-time MEV heuristics. It holds a
 /// `ChainClient` reference so a real implementation can `eth_call` a
@@ -227,6 +250,23 @@ impl TxEngine {
             .entry(key)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    fn assert_write_permit(&self, permit: &HomeWritePermit) -> Result<(), TxEngineError> {
+        let outbox_home = self
+            .outbox
+            .root()
+            .parent()
+            .unwrap_or_else(|| self.outbox.root())
+            .canonicalize()
+            .map_err(|e| TxEngineError::HomeWritePermit(e.to_string()))?;
+        if permit.home() != outbox_home {
+            return Err(TxEngineError::HomeWritePermitMismatch {
+                permit: permit.home().display().to_string(),
+                outbox: outbox_home.display().to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Register the `PendingTxIndex` for `chain`. Calling stage on this
@@ -719,8 +759,10 @@ impl TxEngine {
 
     /// Stage a tx for a wallet on a chain. The caller is responsible for
     /// looking up the wallet's address.
+    #[allow(clippy::too_many_arguments)]
     pub async fn stage(
         &self,
+        permit: &HomeWritePermit,
         wallet: &str,
         from: Address,
         intent: RawIntent,
@@ -728,6 +770,7 @@ impl TxEngine {
         policy: &Policy,
         address_book: Option<&AddressBook>,
     ) -> Result<StagedTx, TxEngineError> {
+        self.assert_write_permit(permit)?;
         let spec: &ChainSpec = chain.spec();
         let chain_id = chain.chain_id().await?;
 
@@ -785,6 +828,16 @@ impl TxEngine {
         // the same nonce.
         let nonce_mutex = self.nonce_lock_for(wallet, &spec.name, from);
         let _nonce_guard = nonce_mutex.lock().await;
+        let now_ms = now_ms();
+        let swept = self.outbox.sweep_expired(now_ms)?;
+        if swept > 0 {
+            tracing::info!(
+                wallet,
+                chain = %spec.name,
+                swept,
+                "tx.outbox_swept_expired_before_stage"
+            );
+        }
         let nonce = match intent.nonce {
             Some(n) => n,
             None => {
@@ -851,7 +904,6 @@ impl TxEngine {
             }
         };
 
-        let now_ms = now_ms();
         let (max_fee_field, prio_field, gas_price_field) = if spec.legacy_tx {
             (None, None, Some(gas_price.to_string()))
         } else {
@@ -1049,6 +1101,7 @@ impl TxEngine {
     #[allow(clippy::too_many_arguments)]
     pub async fn confirm(
         &self,
+        permit: &HomeWritePermit,
         wallet: &str,
         chain_name: &str,
         id: &str,
@@ -1056,11 +1109,22 @@ impl TxEngine {
         signer: &PrivateKeySigner,
         policy: &Policy,
         confirm_text: &str,
+        reviewed_intent_hash: Option<&str>,
     ) -> Result<StagedTx, TxEngineError> {
+        self.assert_write_permit(permit)?;
         let entry = self
             .outbox
             .read_in_state(wallet, chain_name, id, OutboxState::Pending)?;
         let mut staged = entry.staged.clone();
+
+        if let Some(attempt) = self
+            .outbox
+            .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
+        {
+            return self
+                .reconcile_confirm_attempt(&entry, attempt, chain, policy, reviewed_intent_hash)
+                .await;
+        }
 
         // Expiry check: stage TTL is enforced regardless of whether the
         // sweeper has run yet. We use wall-clock here; sweep_expired is the
@@ -1128,8 +1192,23 @@ impl TxEngine {
             );
             return Err(TxEngineError::BroadcastDisabled(spec.name.clone()));
         }
+        self.ensure_action_authorized(
+            &staged,
+            policy,
+            reviewed_intent_hash,
+            bloom_proto::AuthorizationSurface::Cli,
+        )?;
 
-        let tx_hash = self.broadcast(&staged, chain, signer, policy).await?;
+        let tx_hash = self
+            .submit_with_marker(
+                &entry,
+                BroadcastAttemptKind::Confirm,
+                &staged,
+                chain,
+                signer,
+                policy,
+            )
+            .await?;
         info!(id=%staged.id, hash=%format!("{:#x}", tx_hash), "tx.broadcast");
 
         staged.status = TxStatus::Sent;
@@ -1152,17 +1231,177 @@ impl TxEngine {
         Ok(staged)
     }
 
-    /// Build, sign and broadcast a single concrete `StagedTx`. When
-    /// `policy.private.enabled` is set and the staged chain is supported
-    /// by Bloom's private-orderflow policy, routes through the registered
-    /// `PrivateRpcProvider` instead of `ChainClient::send_raw`.
-    async fn broadcast(
+    async fn reconcile_confirm_attempt(
+        &self,
+        entry: &crate::outbox::OutboxEntry,
+        attempt: BroadcastAttempt,
+        chain: &ChainClient,
+        policy: &Policy,
+        reviewed_intent_hash: Option<&str>,
+    ) -> Result<StagedTx, TxEngineError> {
+        let tx_hash: B256 = attempt
+            .tx_hash
+            .parse()
+            .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
+        if chain.tx_by_hash(tx_hash).await?.is_some() || chain.receipt(tx_hash).await?.is_some() {
+            return self.finalize_sent(entry, tx_hash);
+        }
+
+        let from: Address = attempt
+            .from
+            .parse()
+            .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
+        let chain_nonce = chain.nonce(from).await?;
+        if chain_nonce > attempt.nonce {
+            self.write_reconcile_ambiguous(
+                entry,
+                format!(
+                    "account nonce advanced to {chain_nonce}, but tx {} was not found",
+                    attempt.tx_hash
+                ),
+            )?;
+            return Err(TxEngineError::BroadcastAttemptAmbiguous {
+                id: entry.staged.id.clone(),
+                reason: "account nonce advanced but attempted tx hash is absent".into(),
+            });
+        }
+
+        if let Some(body) = self.build_nonce_conflict_body(&entry.staged.chain, from, attempt.nonce)
+        {
+            self.write_reconcile_ambiguous(entry, body.to_string())?;
+            return Err(TxEngineError::BroadcastAttemptAmbiguous {
+                id: entry.staged.id.clone(),
+                reason: "external pending tx already occupies this nonce".into(),
+            });
+        }
+        let other_attempts = self
+            .outbox
+            .broadcast_attempts_for_nonce(SameNonceAttemptQuery {
+                wallet: &entry.staged.wallet,
+                chain: &entry.staged.chain,
+                from: &attempt.from,
+                chain_id: attempt.chain_id,
+                nonce: attempt.nonce,
+                excluding_id: &entry.staged.id,
+                excluding_kind: BroadcastAttemptKind::Confirm,
+            })?;
+        if !other_attempts.is_empty() {
+            self.write_reconcile_ambiguous(
+                entry,
+                format!("other same-nonce attempts exist: {}", other_attempts.len()),
+            )?;
+            return Err(TxEngineError::BroadcastAttemptAmbiguous {
+                id: entry.staged.id.clone(),
+                reason: "another known broadcast attempt occupies this nonce".into(),
+            });
+        }
+
+        match attempt.transport {
+            BroadcastTransport::PrivateRpc => {
+                self.write_reconcile_ambiguous(
+                    entry,
+                    "private relay attempt absent from public RPC; refusing to leak to public mempool",
+                )?;
+                Err(TxEngineError::BroadcastAttemptAmbiguous {
+                    id: entry.staged.id.clone(),
+                    reason: "private relay attempt unresolved".into(),
+                })
+            }
+            BroadcastTransport::PublicRpc => {
+                let spec = chain.spec();
+                let is_mainnet = bloom_proto::Config::is_mainnet_id(spec.chain_id);
+                if (self.block_mainnet_broadcast && is_mainnet) || !spec.allow_broadcast {
+                    return Err(TxEngineError::BroadcastDisabled(spec.name.clone()));
+                }
+                if policy.private.enabled {
+                    self.write_reconcile_ambiguous(
+                        entry,
+                        "current policy requests private routing; refusing to replay old public attempt automatically",
+                    )?;
+                    return Err(TxEngineError::BroadcastAttemptAmbiguous {
+                        id: entry.staged.id.clone(),
+                        reason: "current policy changed to private routing".into(),
+                    });
+                }
+                self.ensure_action_authorized(
+                    &entry.staged,
+                    policy,
+                    reviewed_intent_hash,
+                    bloom_proto::AuthorizationSurface::Cli,
+                )?;
+                let raw = self.outbox.read_broadcast_raw_tx(
+                    entry,
+                    BroadcastAttemptKind::Confirm,
+                    &attempt,
+                )?;
+                let returned = chain.send_raw(Bytes::from(raw)).await.map_err(|e| {
+                    let _ = self
+                        .write_reconcile_ambiguous(entry, format!("public resubmit failed: {e}"));
+                    TxEngineError::Chain(e)
+                })?;
+                if returned != tx_hash {
+                    return Err(TxEngineError::BroadcastHashMismatch {
+                        expected: format!("{:#x}", tx_hash),
+                        returned: format!("{:#x}", returned),
+                    });
+                }
+                self.finalize_sent(entry, tx_hash)
+            }
+        }
+    }
+
+    fn finalize_sent(
+        &self,
+        entry: &crate::outbox::OutboxEntry,
+        tx_hash: B256,
+    ) -> Result<StagedTx, TxEngineError> {
+        let mut staged = entry.staged.clone();
+        staged.status = TxStatus::Sent;
+        staged.tx_hash = Some(format!("{:#x}", tx_hash));
+        let new_dir = self
+            .outbox
+            .transition(entry, crate::outbox::OutboxState::Sent)?;
+        self.outbox.write_artefact(
+            &new_dir,
+            "intent.json",
+            &serde_json::to_vec_pretty(&staged).unwrap(),
+        )?;
+        self.outbox.write_artefact(
+            &new_dir,
+            "tx_hash",
+            staged.tx_hash.as_ref().unwrap().as_bytes(),
+        )?;
+        Ok(staged)
+    }
+
+    fn write_reconcile_ambiguous(
+        &self,
+        entry: &crate::outbox::OutboxEntry,
+        reason: impl Into<String>,
+    ) -> Result<(), TxEngineError> {
+        let body = serde_json::json!({
+            "schema": "bloom.reconcile_ambiguous.v1",
+            "id": entry.staged.id,
+            "wallet": entry.staged.wallet,
+            "chain": entry.staged.chain,
+            "nonce": entry.staged.nonce,
+            "reason": reason.into(),
+            "created_ms": now_ms(),
+        });
+        self.outbox.write_artefact(
+            &entry.dir,
+            "reconcile_ambiguous.json",
+            &serde_json::to_vec_pretty(&body).unwrap(),
+        )?;
+        Ok(())
+    }
+
+    async fn build_signed_raw_tx(
         &self,
         staged: &StagedTx,
         chain: &ChainClient,
         signer: &PrivateKeySigner,
-        policy: &Policy,
-    ) -> Result<alloy::primitives::B256, TxEngineError> {
+    ) -> Result<SignedRawTx, TxEngineError> {
         let to_addr: Address = staged
             .to
             .parse()
@@ -1213,7 +1452,18 @@ impl TxEngine {
         let mut buf = Vec::new();
         alloy::eips::Encodable2718::encode_2718(&tx_envelope, &mut buf);
         let raw = Bytes::from(buf);
-        let hash = if policy.private.enabled {
+        let hash = alloy::primitives::keccak256(&raw);
+        Ok(SignedRawTx { raw, hash })
+    }
+
+    async fn submit_signed_raw(
+        &self,
+        staged: &StagedTx,
+        chain: &ChainClient,
+        policy: &Policy,
+        signed: &SignedRawTx,
+    ) -> Result<SubmitResult, TxEngineError> {
+        if policy.private.enabled {
             if !matches!(
                 staged.chain_id,
                 bloom_mempool::MAINNET_CHAIN_ID | bloom_mempool::SEPOLIA_CHAIN_ID
@@ -1222,12 +1472,259 @@ impl TxEngine {
                     chain.spec().name.clone(),
                 ));
             }
-            self.submit_via_private(staged.chain_id, &policy.private.provider, &raw)
-                .await?
+            let returned = self
+                .submit_via_private(staged.chain_id, &policy.private.provider, &signed.raw)
+                .await?;
+            Ok(SubmitResult {
+                transport: BroadcastTransport::PrivateRpc,
+                returned_hash: Some(returned),
+            })
         } else {
-            chain.send_raw(raw).await?
+            let returned = chain.send_raw(signed.raw.clone()).await?;
+            if returned != signed.hash {
+                return Err(TxEngineError::BroadcastHashMismatch {
+                    expected: format!("{:#x}", signed.hash),
+                    returned: format!("{:#x}", returned),
+                });
+            }
+            Ok(SubmitResult {
+                transport: BroadcastTransport::PublicRpc,
+                returned_hash: Some(returned),
+            })
+        }
+    }
+
+    async fn submit_with_marker(
+        &self,
+        entry: &crate::outbox::OutboxEntry,
+        kind: BroadcastAttemptKind,
+        staged: &StagedTx,
+        chain: &ChainClient,
+        signer: &PrivateKeySigner,
+        policy: &Policy,
+    ) -> Result<B256, TxEngineError> {
+        self.ensure_broadcast_allowed(chain.spec())?;
+        if policy.private.enabled
+            && !matches!(
+                staged.chain_id,
+                bloom_mempool::MAINNET_CHAIN_ID | bloom_mempool::SEPOLIA_CHAIN_ID
+            )
+        {
+            return Err(TxEngineError::PrivateNotSupportedOnChain(
+                chain.spec().name.clone(),
+            ));
+        }
+        let signed = self.build_signed_raw_tx(staged, chain, signer).await?;
+        self.outbox
+            .write_broadcast_raw_tx(entry, kind, &signed.raw)?;
+        let attempt = BroadcastAttempt {
+            schema: "bloom.broadcast_attempted.v1".into(),
+            tx_hash: format!("{:#x}", signed.hash),
+            raw_tx_blake3: blake3::hash(&signed.raw).to_hex().to_string(),
+            raw_tx_path: kind.raw_name().into(),
+            from: staged.from.clone(),
+            to: staged.to.clone(),
+            nonce: staged.nonce,
+            chain_id: staged.chain_id,
+            created_ms: now_ms(),
+            transport: if policy.private.enabled {
+                BroadcastTransport::PrivateRpc
+            } else {
+                BroadcastTransport::PublicRpc
+            },
+            private_provider: policy
+                .private
+                .enabled
+                .then(|| policy.private.provider.clone()),
         };
-        Ok(hash)
+        self.outbox.write_broadcast_attempt(entry, kind, &attempt)?;
+        let submitted = self
+            .submit_signed_raw(staged, chain, policy, &signed)
+            .await?;
+        if matches!(submitted.transport, BroadcastTransport::PublicRpc)
+            && submitted.returned_hash != Some(signed.hash)
+        {
+            return Err(TxEngineError::BroadcastHashMismatch {
+                expected: format!("{:#x}", signed.hash),
+                returned: submitted
+                    .returned_hash
+                    .map(|h| format!("{:#x}", h))
+                    .unwrap_or_else(|| "<none>".into()),
+            });
+        }
+        Ok(signed.hash)
+    }
+
+    fn ensure_broadcast_allowed(&self, spec: &ChainSpec) -> Result<(), TxEngineError> {
+        let is_mainnet = bloom_proto::Config::is_mainnet_id(spec.chain_id);
+        if (self.block_mainnet_broadcast && is_mainnet) || !spec.allow_broadcast {
+            return Err(TxEngineError::BroadcastDisabled(spec.name.clone()));
+        }
+        Ok(())
+    }
+
+    fn ensure_action_authorized(
+        &self,
+        staged: &StagedTx,
+        policy: &Policy,
+        reviewed_intent_hash: Option<&str>,
+        surface: bloom_proto::AuthorizationSurface,
+    ) -> Result<(), TxEngineError> {
+        let reviewed_intent_hash =
+            self.verified_reviewed_intent_hash(staged, reviewed_intent_hash)?;
+        let budget = self.budget_snapshot(&staged.wallet)?;
+        let subject = self.authorization_subject(staged);
+        match bloom_proto::evaluate_action_authorization(
+            policy,
+            &staged.policy_checks,
+            &subject,
+            Some(&budget),
+            reviewed_intent_hash.as_deref(),
+            surface,
+        ) {
+            bloom_proto::AutonomyDecision::ApprovedFreshReview { .. }
+            | bloom_proto::AutonomyDecision::ApprovedAutonomous { .. } => Ok(()),
+            // Scoped run capabilities are NOT implemented: no evaluator produces
+            // this decision today, so accepting it would be a latent
+            // broadcast-authorization gap if a producer is ever added without
+            // re-reviewing this path. Fail closed until the system actually lands.
+            bloom_proto::AutonomyDecision::ApprovedCapability { .. } => {
+                Err(TxEngineError::BroadcastApprovalRequired(
+                    "scoped run capabilities are not implemented; fresh review required".into(),
+                ))
+            }
+            bloom_proto::AutonomyDecision::NeedsFreshReview { reason }
+            | bloom_proto::AutonomyDecision::Denied { reason } => {
+                Err(TxEngineError::BroadcastApprovalRequired(reason))
+            }
+        }
+    }
+
+    fn verified_reviewed_intent_hash(
+        &self,
+        staged: &StagedTx,
+        reviewed_intent_hash: Option<&str>,
+    ) -> Result<Option<String>, TxEngineError> {
+        let Some(hash) = reviewed_intent_hash
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        let entry = self
+            .outbox
+            .read(&staged.wallet, &staged.chain, &staged.id)?;
+        let path = entry.dir.join("review_intent.json");
+        let body = std::fs::read(&path).map_err(|_| {
+            TxEngineError::BroadcastApprovalRequired(
+                "review hash supplied but no review_intent.json is stored for this outbox entry"
+                    .into(),
+            )
+        })?;
+        let intent: bloom_proto::CeremonyIntent = serde_json::from_slice(&body).map_err(|e| {
+            TxEngineError::BroadcastApprovalRequired(format!(
+                "stored review_intent.json is invalid: {e}"
+            ))
+        })?;
+        let expected = intent.intent_hash();
+        if hash != expected {
+            return Err(TxEngineError::BroadcastApprovalRequired(
+                "review hash does not match the stored review intent for this outbox entry".into(),
+            ));
+        }
+        let approved_path = entry.dir.join("review_approved.json");
+        let approved_body = std::fs::read(&approved_path).map_err(|_| {
+            TxEngineError::BroadcastApprovalRequired(
+                "review hash supplied but no passkey approval marker is stored for this outbox entry"
+                    .into(),
+            )
+        })?;
+        let approved: serde_json::Value = serde_json::from_slice(&approved_body).map_err(|e| {
+            TxEngineError::BroadcastApprovalRequired(format!(
+                "stored review_approved.json is invalid: {e}"
+            ))
+        })?;
+        if approved
+            .get("intent_hash")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            != Some(hash)
+        {
+            return Err(TxEngineError::BroadcastApprovalRequired(
+                "passkey approval marker does not match the reviewed intent hash".into(),
+            ));
+        }
+        Ok(Some(hash.to_string()))
+    }
+
+    fn authorization_subject(&self, staged: &StagedTx) -> bloom_proto::AuthorizationSubject {
+        let value_wei = U256::from_str_radix(&staged.value_wei, 10).unwrap_or(U256::ZERO);
+        let data_nonempty = staged
+            .data_hex
+            .trim_start_matches("0x")
+            .bytes()
+            .any(|b| b != b'0');
+        let value_moving = value_wei > U256::ZERO
+            || staged.token.is_some()
+            || staged.nft.is_some()
+            || data_nonempty;
+        bloom_proto::AuthorizationSubject {
+            kind: "evm_tx".into(),
+            wallet: staged.wallet.clone(),
+            chain: Some(staged.chain.clone()),
+            subject_hash: format!(
+                "{}:{}:{}:{}:{}:{}:{}",
+                staged.chain_id,
+                staged.from,
+                staged.to,
+                staged.value_wei,
+                staged.data_hex,
+                staged.nonce,
+                staged.id
+            ),
+            total_value_usd_micro: staged.usd_value.and_then(f64_to_micro_usd),
+            value_moving,
+            // A staged EVM transaction is byte-immutable: the evaluator is
+            // authorizing the exact to/value/data/nonce persisted in outbox.
+            // DeFi route receiver/min-output verification remains represented
+            // by policy checks attached during staging.
+            calldata_verified: true,
+        }
+    }
+
+    fn budget_snapshot(&self, wallet: &str) -> Result<bloom_proto::BudgetSnapshot, TxEngineError> {
+        const DAY_MS: u128 = 24 * 60 * 60 * 1000;
+        const WEEK_MS: u128 = 7 * DAY_MS;
+        const MONTH_MS: u128 = 30 * DAY_MS;
+        let now = now_ms();
+        let day = self
+            .outbox
+            .sum_usd_since(wallet, now.saturating_sub(DAY_MS))?;
+        let week = self
+            .outbox
+            .sum_usd_since(wallet, now.saturating_sub(WEEK_MS))?;
+        let month = self
+            .outbox
+            .sum_usd_since(wallet, now.saturating_sub(MONTH_MS))?;
+        Ok(bloom_proto::BudgetSnapshot {
+            spent_day_micro_usd: f64_to_micro_usd(day).unwrap_or(i128::MAX),
+            spent_week_micro_usd: f64_to_micro_usd(week).unwrap_or(i128::MAX),
+            spent_month_micro_usd: f64_to_micro_usd(month).unwrap_or(i128::MAX),
+        })
+    }
+
+    #[cfg(test)]
+    async fn broadcast(
+        &self,
+        staged: &StagedTx,
+        chain: &ChainClient,
+        signer: &PrivateKeySigner,
+        policy: &Policy,
+    ) -> Result<B256, TxEngineError> {
+        let signed = self.build_signed_raw_tx(staged, chain, signer).await?;
+        self.submit_signed_raw(staged, chain, policy, &signed)
+            .await?;
+        Ok(signed.hash)
     }
 
     fn read_replaceable_entry(
@@ -1268,6 +1765,7 @@ impl TxEngine {
     #[allow(clippy::too_many_arguments)]
     pub async fn replace(
         &self,
+        permit: &HomeWritePermit,
         wallet: &str,
         chain_name: &str,
         original_id: &str,
@@ -1275,8 +1773,10 @@ impl TxEngine {
         signer: &PrivateKeySigner,
         bump_pct: u32,
         policy: &Policy,
+        reviewed_intent_hash: Option<&str>,
     ) -> Result<StagedTx, TxEngineError> {
         self.replace_with_intent(
+            permit,
             wallet,
             chain_name,
             original_id,
@@ -1286,6 +1786,7 @@ impl TxEngine {
             None,
             None,
             policy,
+            reviewed_intent_hash,
         )
         .await
     }
@@ -1300,6 +1801,7 @@ impl TxEngine {
     #[allow(clippy::too_many_arguments)]
     pub async fn replace_with_intent(
         &self,
+        permit: &HomeWritePermit,
         wallet: &str,
         chain_name: &str,
         original_id: &str,
@@ -1309,7 +1811,9 @@ impl TxEngine {
         substitute: Option<RawIntent>,
         address_book: Option<&AddressBook>,
         policy: &Policy,
+        reviewed_intent_hash: Option<&str>,
     ) -> Result<StagedTx, TxEngineError> {
+        self.assert_write_permit(permit)?;
         let bump = bump_pct.max(10);
         let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
         let original = &entry.staged;
@@ -1336,10 +1840,30 @@ impl TxEngine {
             bumped.data_hex = data_hex;
             bumped.token = token;
             bumped.nft = nft;
+            bumped.policy_checks.push(bloom_proto::PolicyCheck {
+                rule: "replacement.substitute".into(),
+                outcome: bloom_proto::PolicyOutcome::Deny,
+                message: "same-nonce replacement with substituted to/value/data is disabled; stage a fresh transaction instead".into(),
+            });
         }
         bump_fees_in_place(&mut bumped, bump);
+        self.ensure_action_authorized(
+            &bumped,
+            policy,
+            reviewed_intent_hash,
+            bloom_proto::AuthorizationSurface::Cli,
+        )?;
 
-        let tx_hash = self.broadcast(&bumped, chain, signer, policy).await?;
+        let tx_hash = self
+            .submit_with_marker(
+                &entry,
+                BroadcastAttemptKind::Replacement,
+                &bumped,
+                chain,
+                signer,
+                policy,
+            )
+            .await?;
         bumped.tx_hash = Some(format!("{:#x}", tx_hash));
         bumped.status = TxStatus::Sent;
 
@@ -1353,6 +1877,9 @@ impl TxEngine {
             "replacement_intent.json",
             &serde_json::to_vec_pretty(&bumped).unwrap(),
         )?;
+        let _ = self
+            .outbox
+            .remove_broadcast_raw_tx(&entry, BroadcastAttemptKind::Replacement);
         info!(
             id = %original.id,
             replacement = %bumped.tx_hash.as_deref().unwrap_or(""),
@@ -1368,6 +1895,7 @@ impl TxEngine {
     #[allow(clippy::too_many_arguments)]
     pub async fn cancel(
         &self,
+        permit: &HomeWritePermit,
         wallet: &str,
         chain_name: &str,
         original_id: &str,
@@ -1375,7 +1903,9 @@ impl TxEngine {
         signer: &PrivateKeySigner,
         bump_pct: u32,
         policy: &Policy,
+        reviewed_intent_hash: Option<&str>,
     ) -> Result<StagedTx, TxEngineError> {
+        self.assert_write_permit(permit)?;
         let bump = bump_pct.max(10);
         let entry = self.read_replaceable_entry(wallet, chain_name, original_id)?;
         let original = &entry.staged;
@@ -1388,8 +1918,23 @@ impl TxEngine {
         cancel_tx.data_hex = "0x".to_string();
         cancel_tx.token = None;
         bump_fees_in_place(&mut cancel_tx, bump);
+        self.ensure_action_authorized(
+            &cancel_tx,
+            policy,
+            reviewed_intent_hash,
+            bloom_proto::AuthorizationSurface::Cli,
+        )?;
 
-        let tx_hash = self.broadcast(&cancel_tx, chain, signer, policy).await?;
+        let tx_hash = self
+            .submit_with_marker(
+                &entry,
+                BroadcastAttemptKind::CancelReplacement,
+                &cancel_tx,
+                chain,
+                signer,
+                policy,
+            )
+            .await?;
         cancel_tx.tx_hash = Some(format!("{:#x}", tx_hash));
         cancel_tx.status = TxStatus::Cancelled;
 
@@ -1403,6 +1948,9 @@ impl TxEngine {
             "cancel_intent.json",
             &serde_json::to_vec_pretty(&cancel_tx).unwrap(),
         )?;
+        let _ = self
+            .outbox
+            .remove_broadcast_raw_tx(&entry, BroadcastAttemptKind::CancelReplacement);
         if entry.state != OutboxState::Failed
             && let Err(e) = self.outbox.transition(&entry, OutboxState::Failed)
         {
@@ -1489,6 +2037,18 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn f64_to_micro_usd(v: f64) -> Option<i128> {
+    if !v.is_finite() || v < 0.0 {
+        return None;
+    }
+    let micro = (v * 1_000_000.0).round();
+    if micro > i128::MAX as f64 {
+        None
+    } else {
+        Some(micro as i128)
+    }
 }
 
 /// Approve amount: accepts `"max"` (alias for 2^256 - 1) or a decimal
@@ -1859,7 +2419,7 @@ mod tests {
     /// confirm flow is meant to be honouring.
     fn fake_engine(stage_ttl_ms: u128) -> (TxEngine, bloom_proto::ChainSpec, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let outbox = crate::outbox::Outbox::new(dir.path()).unwrap();
+        let outbox = crate::outbox::Outbox::new(dir.path().join("outbox")).unwrap();
         let engine = TxEngine::new(outbox, stage_ttl_ms, false);
         let spec = bloom_proto::ChainSpec {
             name: "anvil".into(),
@@ -1878,12 +2438,17 @@ mod tests {
         (engine, spec, dir)
     }
 
+    fn permit_for(dir: &tempfile::TempDir) -> HomeWritePermit {
+        bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(dir.path())).unwrap()
+    }
+
     /// Fix #2: writing `pending/<sent-id>/confirm` must not rebroadcast
     /// — the engine must refuse to confirm an id that no longer lives in
     /// `pending`.
     #[tokio::test]
     async fn confirm_rejects_id_already_in_sent() {
-        let (engine, spec, _dir) = fake_engine(60_000);
+        let (engine, spec, dir) = fake_engine(60_000);
+        let permit = permit_for(&dir);
         let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
         let signer = alloy::signers::local::PrivateKeySigner::random();
         let policy = bloom_proto::Policy::default();
@@ -1901,7 +2466,17 @@ mod tests {
             .unwrap();
 
         let r = engine
-            .confirm("alice", "anvil", "0001-test", &chain, &signer, &policy, "y")
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-test",
+                &chain,
+                &signer,
+                &policy,
+                "y",
+                None,
+            )
             .await;
         match r {
             Err(TxEngineError::Outbox(OutboxError::StateMismatch { actual, .. })) => {
@@ -1916,7 +2491,8 @@ mod tests {
     /// chain URL is never touched.
     #[tokio::test]
     async fn confirm_rejects_expired_stage() {
-        let (engine, spec, _dir) = fake_engine(60_000);
+        let (engine, spec, dir) = fake_engine(60_000);
+        let permit = permit_for(&dir);
         let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
         let signer = alloy::signers::local::PrivateKeySigner::random();
         let policy = bloom_proto::Policy::default();
@@ -1927,7 +2503,17 @@ mod tests {
         engine.outbox.write_pending(&staged, "p").unwrap();
 
         let r = engine
-            .confirm("alice", "anvil", "0001-test", &chain, &signer, &policy, "y")
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-test",
+                &chain,
+                &signer,
+                &policy,
+                "y",
+                None,
+            )
             .await;
         match r {
             Err(TxEngineError::Outbox(OutboxError::StagedExpired { id, .. })) => {
@@ -1935,6 +2521,213 @@ mod tests {
             }
             other => panic!("expected StagedExpired, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn confirm_writes_broadcast_attempt_before_public_submit_error() {
+        let (engine, spec, dir) = fake_engine(60_000);
+        let permit = permit_for(&dir);
+        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let policy = bloom_proto::Policy::default();
+
+        let mut staged = fake_staged_1559("0001-attempt");
+        staged.expires_ms = now_ms() + 60_000;
+        engine.outbox.write_pending(&staged, "p").unwrap();
+
+        let r = engine
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-attempt",
+                &chain,
+                &signer,
+                &policy,
+                "y",
+                None,
+            )
+            .await;
+        assert!(r.is_err(), "unreachable public RPC should fail");
+        let entry = engine
+            .outbox
+            .read_in_state(
+                "alice",
+                "anvil",
+                "0001-attempt",
+                crate::outbox::OutboxState::Pending,
+            )
+            .unwrap();
+        let attempt = engine
+            .outbox
+            .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)
+            .unwrap()
+            .expect("confirm attempt marker");
+        assert_eq!(attempt.transport, BroadcastTransport::PublicRpc);
+        assert!(entry.dir.join("raw_tx").exists());
+    }
+
+    #[tokio::test]
+    async fn replace_and_cancel_by_replacement_write_broadcast_attempts_before_submit_error() {
+        let (engine, spec, dir) = fake_engine(60_000);
+        let permit = permit_for(&dir);
+        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let policy = bloom_proto::Policy::default();
+
+        let mut staged = fake_staged_1559("0001-replace");
+        staged.expires_ms = now_ms() + 60_000;
+        engine.outbox.write_pending(&staged, "p").unwrap();
+        let r = engine
+            .replace(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-replace",
+                &chain,
+                &signer,
+                10,
+                &policy,
+                None,
+            )
+            .await;
+        assert!(r.is_err(), "unreachable public RPC should fail");
+        let entry = engine
+            .outbox
+            .read_in_state(
+                "alice",
+                "anvil",
+                "0001-replace",
+                crate::outbox::OutboxState::Pending,
+            )
+            .unwrap();
+        assert!(
+            engine
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Replacement)
+                .unwrap()
+                .is_some(),
+            "replacement marker"
+        );
+        assert!(entry.dir.join("replacement_raw_tx").exists());
+
+        let mut staged = fake_staged_1559("0002-cancel");
+        staged.expires_ms = now_ms() + 60_000;
+        engine.outbox.write_pending(&staged, "p").unwrap();
+        let r = engine
+            .cancel(
+                &permit,
+                "alice",
+                "anvil",
+                "0002-cancel",
+                &chain,
+                &signer,
+                10,
+                &policy,
+                None,
+            )
+            .await;
+        assert!(r.is_err(), "unreachable public RPC should fail");
+        let entry = engine
+            .outbox
+            .read_in_state(
+                "alice",
+                "anvil",
+                "0002-cancel",
+                crate::outbox::OutboxState::Pending,
+            )
+            .unwrap();
+        assert!(
+            engine
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::CancelReplacement)
+                .unwrap()
+                .is_some(),
+            "cancel replacement marker"
+        );
+        assert!(entry.dir.join("cancel_raw_tx").exists());
+    }
+
+    #[tokio::test]
+    async fn replace_and_cancel_by_replacement_respect_broadcast_gate() {
+        let (engine, mut spec, dir) = fake_engine(60_000);
+        spec.allow_broadcast = false;
+        let permit = permit_for(&dir);
+        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let policy = bloom_proto::Policy::default();
+
+        let mut staged = fake_staged_1559("0001-replace-gated");
+        staged.expires_ms = now_ms() + 60_000;
+        engine.outbox.write_pending(&staged, "p").unwrap();
+        let r = engine
+            .replace(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-replace-gated",
+                &chain,
+                &signer,
+                10,
+                &policy,
+                None,
+            )
+            .await;
+        assert!(matches!(r, Err(TxEngineError::BroadcastDisabled(_))));
+        let entry = engine
+            .outbox
+            .read_in_state(
+                "alice",
+                "anvil",
+                "0001-replace-gated",
+                crate::outbox::OutboxState::Pending,
+            )
+            .unwrap();
+        assert!(
+            engine
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Replacement)
+                .unwrap()
+                .is_none(),
+            "broadcast-disabled replacement must not write marker"
+        );
+        assert!(!entry.dir.join("replacement_raw_tx").exists());
+
+        let mut staged = fake_staged_1559("0002-cancel-gated");
+        staged.expires_ms = now_ms() + 60_000;
+        engine.outbox.write_pending(&staged, "p").unwrap();
+        let r = engine
+            .cancel(
+                &permit,
+                "alice",
+                "anvil",
+                "0002-cancel-gated",
+                &chain,
+                &signer,
+                10,
+                &policy,
+                None,
+            )
+            .await;
+        assert!(matches!(r, Err(TxEngineError::BroadcastDisabled(_))));
+        let entry = engine
+            .outbox
+            .read_in_state(
+                "alice",
+                "anvil",
+                "0002-cancel-gated",
+                crate::outbox::OutboxState::Pending,
+            )
+            .unwrap();
+        assert!(
+            engine
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::CancelReplacement)
+                .unwrap()
+                .is_none(),
+            "broadcast-disabled cancel must not write marker"
+        );
+        assert!(!entry.dir.join("cancel_raw_tx").exists());
     }
 
     // -------------------------------------------------------------------
@@ -2249,7 +3042,8 @@ mod tests {
     async fn confirm_uses_policy_override_token() {
         use bloom_proto::policy::{PolicyAutomation, PolicyCaps, PolicyCheck, PolicyOutcome};
 
-        let (engine, spec, _dir) = fake_engine(60_000);
+        let (engine, spec, dir) = fake_engine(60_000);
+        let permit = permit_for(&dir);
         let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
         let signer = alloy::signers::local::PrivateKeySigner::random();
 
@@ -2275,7 +3069,17 @@ mod tests {
 
         // "y" must be rejected — needs the policy's override token.
         let r = engine
-            .confirm("alice", "anvil", "0001-test", &chain, &signer, &policy, "y")
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-test",
+                &chain,
+                &signer,
+                &policy,
+                "y",
+                None,
+            )
             .await;
         assert!(matches!(r, Err(TxEngineError::PolicyDenied)));
 
@@ -2283,6 +3087,7 @@ mod tests {
         // overrides it.
         let r = engine
             .confirm(
+                &permit,
                 "alice",
                 "anvil",
                 "0001-test",
@@ -2290,6 +3095,7 @@ mod tests {
                 &signer,
                 &policy,
                 "override",
+                None,
             )
             .await;
         assert!(matches!(r, Err(TxEngineError::PolicyDenied)));
@@ -2300,6 +3106,7 @@ mod tests {
         // through.
         let r = engine
             .confirm(
+                &permit,
                 "alice",
                 "anvil",
                 "0001-test",
@@ -2307,6 +3114,7 @@ mod tests {
                 &signer,
                 &policy,
                 "yolo",
+                None,
             )
             .await;
         match r {
@@ -2322,7 +3130,8 @@ mod tests {
     async fn policy_hard_deny_blocks_confirm_and_marks_failed() {
         use bloom_proto::policy::{PolicyCheck, PolicyOutcome};
 
-        let (engine, spec, _dir) = fake_engine(60_000);
+        let (engine, spec, dir) = fake_engine(60_000);
+        let permit = permit_for(&dir);
         let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
         let signer = alloy::signers::local::PrivateKeySigner::random();
         let policy = bloom_proto::Policy::default();
@@ -2337,7 +3146,17 @@ mod tests {
         engine.outbox.write_pending(&staged, "p").unwrap();
 
         let r = engine
-            .confirm("alice", "anvil", "0001-test", &chain, &signer, &policy, "y")
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-test",
+                &chain,
+                &signer,
+                &policy,
+                "y",
+                None,
+            )
             .await;
         assert!(
             matches!(r, Err(TxEngineError::PolicyDenied)),
@@ -2361,7 +3180,8 @@ mod tests {
     async fn policy_soft_warn_requires_override_sentinel() {
         use bloom_proto::policy::{PolicyCheck, PolicyOutcome};
 
-        let (engine, spec, _dir) = fake_engine(60_000);
+        let (engine, spec, dir) = fake_engine(60_000);
+        let permit = permit_for(&dir);
         let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
         let signer = alloy::signers::local::PrivateKeySigner::random();
         let policy = bloom_proto::Policy::default(); // override_sentinel() == "override"
@@ -2377,7 +3197,17 @@ mod tests {
 
         // Wrong text — must be rejected.
         let r = engine
-            .confirm("alice", "anvil", "0001-test", &chain, &signer, &policy, "y")
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-test",
+                &chain,
+                &signer,
+                &policy,
+                "y",
+                None,
+            )
             .await;
         assert!(
             matches!(r, Err(TxEngineError::PolicyDenied)),
@@ -2397,6 +3227,7 @@ mod tests {
         // the policy gate was successfully passed.
         let r = engine
             .confirm(
+                &permit,
                 "alice",
                 "anvil",
                 "0001-test",
@@ -2404,12 +3235,185 @@ mod tests {
                 &signer,
                 &policy,
                 "override",
+                None,
             )
             .await;
         match r {
             Err(TxEngineError::PolicyDenied) => panic!("override sentinel did not bypass warn"),
             Ok(_) => panic!("unexpected broadcast success on unreachable RPC"),
             Err(_) => {} // any other error means the policy gate was passed
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_approval_required_blocks_confirm_before_rpc() {
+        let (engine, spec, dir) = fake_engine(60_000);
+        let permit = permit_for(&dir);
+        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let mut policy = bloom_proto::Policy::default();
+        policy.approval.require_broadcast_approval = true;
+
+        let mut staged = fake_staged_1559("0001-approval");
+        staged.value_wei = "1".into();
+        staged.usd_value = Some(0.01);
+        staged.expires_ms = now_ms() + 60_000;
+        engine.outbox.write_pending(&staged, "p").unwrap();
+
+        let r = engine
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-approval",
+                &chain,
+                &signer,
+                &policy,
+                "y",
+                None,
+            )
+            .await;
+        assert!(
+            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(_))),
+            "expected approval refusal, got {r:?}"
+        );
+
+        let r = engine
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-approval",
+                &chain,
+                &signer,
+                &policy,
+                "y",
+                Some("reviewed"),
+            )
+            .await;
+        assert!(
+            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(ref e)) if e.contains("review_intent")),
+            "expected missing review artifact refusal, got {r:?}"
+        );
+
+        let entry = engine
+            .outbox
+            .read("alice", "anvil", "0001-approval")
+            .unwrap();
+        let intent = bloom_proto::CeremonyIntent::new(
+            "alice",
+            "Approve anvil Transaction",
+            bloom_proto::CeremonyIntentKind::EvmTransaction,
+        )
+        .subject(serde_json::json!({
+            "kind": "outbox_confirm",
+            "wallet": "alice",
+            "chain": "anvil",
+            "outbox_id": "0001-approval",
+        }));
+        let review_hash = intent.intent_hash();
+        engine
+            .outbox
+            .write_artefact(
+                &entry.dir,
+                "review_intent.json",
+                &serde_json::to_vec_pretty(&intent).unwrap(),
+            )
+            .unwrap();
+        engine
+            .outbox
+            .write_artefact(
+                &entry.dir,
+                "review_approved.json",
+                &serde_json::to_vec_pretty(&serde_json::json!({
+                    "schema": "bloom.review_approved.v1",
+                    "intent_hash": review_hash,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let r = engine
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-approval",
+                &chain,
+                &signer,
+                &policy,
+                "y",
+                Some(&review_hash),
+            )
+            .await;
+        match r {
+            Err(TxEngineError::BroadcastApprovalRequired(_)) => {
+                panic!("review hash should satisfy approval gate")
+            }
+            Ok(_) => panic!("unexpected broadcast success on unreachable RPC"),
+            Err(_) => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn under_policy_autonomy_requires_usd_and_limits() {
+        let (engine, spec, dir) = fake_engine(60_000);
+        let permit = permit_for(&dir);
+        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let mut policy = bloom_proto::Policy::default();
+        policy.approval.agent_autonomy = Some(bloom_proto::AgentAutonomyMode::UnderPolicy);
+        policy.limits.max_tx_usd = Some("3".into());
+        policy.limits.max_day_usd = Some("10".into());
+
+        let mut no_usd = fake_staged_1559("0001-no-usd");
+        no_usd.value_wei = "1".into();
+        no_usd.expires_ms = now_ms() + 60_000;
+        engine.outbox.write_pending(&no_usd, "p").unwrap();
+
+        let r = engine
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-no-usd",
+                &chain,
+                &signer,
+                &policy,
+                "y",
+                None,
+            )
+            .await;
+        assert!(
+            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(ref e)) if e.contains("USD valuation")),
+            "expected unknown USD refusal, got {r:?}"
+        );
+
+        let mut priced = fake_staged_1559("0002-priced");
+        priced.value_wei = "1".into();
+        priced.usd_value = Some(2.0);
+        priced.expires_ms = now_ms() + 60_000;
+        engine.outbox.write_pending(&priced, "p").unwrap();
+
+        let r = engine
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0002-priced",
+                &chain,
+                &signer,
+                &policy,
+                "y",
+                None,
+            )
+            .await;
+        match r {
+            Err(TxEngineError::BroadcastApprovalRequired(e)) => {
+                panic!("under-policy tx should pass approval gate, got {e}")
+            }
+            Ok(_) => panic!("unexpected broadcast success on unreachable RPC"),
+            Err(_) => {}
         }
     }
 

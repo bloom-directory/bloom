@@ -47,6 +47,32 @@ fn help_lists_all_subcommands() {
 }
 
 #[test]
+fn vfs_write_help_lists_unlock_flags() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args(["vfs", "write", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--unlock-wallet"))
+        .stdout(predicate::str::contains("--passphrase"))
+        // The dual-runtime guidance an agent needs: in-process daemon (bypasses
+        // IPC) and the foreground requirement for the passkey ceremony.
+        .stdout(predicate::str::contains("in-process"))
+        .stdout(predicate::str::contains("FOREGROUND"));
+}
+
+#[test]
+fn polymarket_help_lists_obligations() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args(["polymarket", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("obligations"))
+        .stdout(predicate::str::contains("redeem"));
+}
+
+#[test]
 fn status_prints_version_and_chain_summary() {
     let home = fresh_home();
     bloom_cmd(home.path())
@@ -138,6 +164,133 @@ fn vfs_cat_status_version_returns_pkg_version() {
         .assert()
         .success()
         .stdout(predicate::eq(expected));
+}
+
+#[test]
+fn vfs_default_missing_socket_falls_back_in_process() {
+    let home = fresh_home();
+    let socket = home.path().join("run").join("bloom.sock");
+    assert!(
+        !socket.exists(),
+        "fresh home should not have a daemon socket"
+    );
+
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/status/version"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn vfs_explicit_missing_endpoint_fails_closed() {
+    let home = fresh_home();
+    let socket = home.path().join("run").join("missing.sock");
+    let endpoint = format!("unix:{}", socket.display());
+
+    bloom_cmd(home.path())
+        .args(["--connect", &endpoint, "vfs", "cat", "/status/version"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("explicit Bloom endpoint")
+                .and(predicate::str::contains(socket.display().to_string())),
+        );
+}
+
+#[test]
+fn vfs_legacy_ipc_socket_env_fails_closed() {
+    let home = fresh_home();
+    let socket = home.path().join("run").join("missing-legacy.sock");
+
+    bloom_cmd(home.path())
+        .env("BLOOM_IPC_SOCKET", &socket)
+        .args(["vfs", "ls", "/"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("explicit Bloom endpoint")
+                .and(predicate::str::contains(socket.display().to_string())),
+        );
+}
+
+#[test]
+fn rpc_endpoint_env_beats_legacy_ipc_socket_env() {
+    let home = fresh_home();
+    let rpc_socket = home.path().join("run").join("rpc-missing.sock");
+    let legacy_socket = home.path().join("run").join("legacy-missing.sock");
+    let rpc_endpoint = format!("unix:{}", rpc_socket.display());
+
+    bloom_cmd(home.path())
+        .env("BLOOM_RPC_ENDPOINT", rpc_endpoint)
+        .env("BLOOM_IPC_SOCKET", &legacy_socket)
+        .args(["vfs", "ls", "/"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains(rpc_socket.display().to_string())
+                .and(predicate::str::contains(legacy_socket.display().to_string()).not()),
+        );
+}
+
+#[test]
+fn connect_flag_beats_rpc_endpoint_env() {
+    let home = fresh_home();
+    let flag_socket = home.path().join("run").join("flag-missing.sock");
+    let env_socket = home.path().join("run").join("env-missing.sock");
+    let flag_endpoint = format!("unix:{}", flag_socket.display());
+    let env_endpoint = format!("unix:{}", env_socket.display());
+
+    bloom_cmd(home.path())
+        .env("BLOOM_RPC_ENDPOINT", env_endpoint)
+        .args(["--connect", &flag_endpoint, "vfs", "ls", "/"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains(flag_socket.display().to_string())
+                .and(predicate::str::contains(env_socket.display().to_string()).not()),
+        );
+}
+
+#[test]
+fn ipc_socket_flag_beats_rpc_endpoint_env() {
+    let home = fresh_home();
+    let flag_socket = home.path().join("run").join("ipc-flag-missing.sock");
+    let env_socket = home.path().join("run").join("env-missing.sock");
+    let env_endpoint = format!("unix:{}", env_socket.display());
+
+    bloom_cmd(home.path())
+        .env("BLOOM_RPC_ENDPOINT", env_endpoint)
+        .args([
+            "--ipc-socket",
+            flag_socket.to_str().unwrap(),
+            "vfs",
+            "ls",
+            "/",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains(flag_socket.display().to_string())
+                .and(predicate::str::contains(env_socket.display().to_string()).not()),
+        );
+}
+
+#[test]
+fn serve_refuses_when_home_write_lock_is_live() {
+    let home = fresh_home();
+    let _permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(home.path()))
+        .expect("hold home write permit");
+    let lock = home.path().join("run").join(".daemon.lock");
+
+    bloom_cmd(home.path())
+        .arg("serve")
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("already open for writing")
+                .and(predicate::str::contains(lock.display().to_string())),
+        );
 }
 
 #[test]

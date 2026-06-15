@@ -824,7 +824,12 @@ cat <<'EOF' > /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/replace
 send 0.02 eth to 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on anvil
 EOF
 
-# Cancel: fires a self-send replacement at the same nonce with a >=10% bump.
+# Local discard before broadcast: move the pending entry to failed without
+# signing anything.
+echo cancel > /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/confirm
+
+# On-chain cancel after a prior broadcast attempt: fires a self-send
+# replacement at the same nonce with a >=10% bump.
 echo y > /bloom/wallets/alice/chains/anvil/outbox/pending/$ID/cancel
 ```
 
@@ -1041,8 +1046,9 @@ There are always two confirms:
 2. `wallets/<w>/chains/<c>/outbox/pending/<tx-id>/confirm` — the
    actual broadcast, where ordering, gas, and policy checks live.
 
-Sessions are in-memory only and evaporate on daemon restart; the
-outbox entry is the durable artefact.
+Sessions are durable under `~/.bloom/defi/<wallet>/sessions/`; one-shot
+`.../new` writes can be followed by later one-shot reads/confirm. Confirm is
+idempotent per prepared intent and reuses an already staged outbox entry.
 
 ### Session layout
 
@@ -1057,10 +1063,12 @@ defi/
         plan.md           (human narrative)
         tx.json           (the prepared RawIntent list)
         simulation.json   (eth_call result; recomputed on each cat)
+        settlement.json   (latest destination-chain settlement observation)
+        wait_settlement   (blocking settlement poller for cross-chain legs)
         confirm           (writable; stages tx.json into outbox)
 ```
 
-Session IDs look like `0001-12345` (seq + ms suffix).
+Session IDs include sequence, process id, and high-resolution timestamp.
 
 ### Lifecycle: USDC → ETH on Ethereum (auto-approve)
 
@@ -1075,7 +1083,7 @@ ls /bloom/defi/intents/alice/
 
 # 3) Inspect.
 ls /bloom/defi/intents/alice/0001-12345/
-# intent.txt  route.json  plan.md  tx.json  simulation.json  confirm
+# intent.txt  route.json  plan.md  tx.json  simulation.json  settlement.json  wait_settlement  confirm
 
 cat /bloom/defi/intents/alice/0001-12345/plan.md
 # # DeFi intent
@@ -1110,11 +1118,11 @@ echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/<approve-id>/confir
 echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/<swap-id>/confirm
 ```
 
-### JSON-explicit and slippage override
+### JSON-explicit, receiver, and slippage override
 
-The handler accepts NL-only `echo '...' > new`, or a JSON body with
-`intent`, optional `chain`, and optional `slippage_bps`. The `intent`
-field itself stays in NL form — it's what the Enso parser consumes.
+The handler accepts NL-only `echo '...' > new`, or JSON with `intent`,
+optional `chain`, `destination_chain`, `receiver`, and `slippage_bps`.
+`intent` stays in NL form for the Enso parser.
 
 ```sh
 echo '{"intent":"swap 100 usdc to eth","chain":"ethereum"}' \
@@ -1124,6 +1132,12 @@ echo '{"intent":"swap 100 usdc to eth","chain":"ethereum"}' \
 echo '{"intent":"swap 100 usdc to eth","slippage_bps":100}' \
   > /bloom/defi/intents/alice/new
 
+# Cross-chain routes must have a receiver. If omitted, Bloom defaults receiver
+# to the wallet EOA; for special destinations such as a Polymarket deposit
+# wallet, pass it explicitly and inspect `Receiver:` in plan.md.
+echo '{"intent":"swap 4.2 usdc to 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174","chain":"base","destination_chain":"polygon","receiver":"0x1000000000000000000000000000000000000001","slippage_bps":50}' \
+  > /bloom/defi/intents/alice/new
+
 # To feed an explicit token address, embed the hex in the NL string:
 echo 'swap 100 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 to ETH' \
   > /bloom/defi/intents/alice/new
@@ -1131,6 +1145,21 @@ echo 'swap 100 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 to ETH' \
 
 NL-only writes always use the 50-bps default; only the JSON form
 carries `slippage_bps`.
+
+### Cross-chain settlement
+
+For a cross-chain route, source-chain broadcast is not completion. After the
+outbox transaction is broadcast, read:
+
+```sh
+cat /bloom/defi/intents/alice/<session>/settlement.json
+cat /bloom/defi/intents/alice/<session>/wait_settlement
+```
+
+`settlement.json` reports chains, token, receiver, expected output, observed
+destination balance, and status. `wait_settlement` blocks until the destination
+token delta is observed or exits with `timeout_check_bridge`. Only create or
+confirm a dependent second leg after status is `destination_received`.
 
 ### More swap examples
 

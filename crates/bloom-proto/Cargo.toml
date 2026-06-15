@@ -19,6 +19,7 @@ tracing.workspace = true
 parking_lot.workspace = true
 alloy.workspace = true
 dirs.workspace = true
+fs2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

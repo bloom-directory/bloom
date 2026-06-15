@@ -2,22 +2,186 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>bloom — Authenticate</title>
+  <title>bloom - Review Passkey Action</title>
   <style>
-    body{font-family:monospace;max-width:560px;margin:80px auto;padding:0 20px}
-    h1{font-size:1.1em;margin-bottom:0.3em}
-    p{color:#555;margin-top:0;font-size:0.9em}
-    #status{margin-top:1.2em;padding:1em;background:#f4f4f4;border-radius:4px;line-height:1.5}
-    .ok{background:#d4edda;color:#155724}
-    .err{background:#f8d7da;color:#721c24}
+    :root{
+      color-scheme:light;
+      --bg:#f6f7f9;
+      --panel:#fff;
+      --text:#171b21;
+      --muted:#667085;
+      --line:#d8dee8;
+      --soft:#eef2f7;
+      --accent:#0f766e;
+      --accent-2:#0b5fff;
+      --danger:#b42318;
+      --warn-bg:#fff7df;
+      --ok-bg:#e8f7ee;
+      --err-bg:#ffedea;
+      --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+      --sans:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans)}
+    main{max-width:1040px;margin:0 auto;padding:32px 20px 44px}
+    header{display:flex;gap:18px;align-items:flex-start;justify-content:space-between;margin-bottom:18px}
+    h1{font-size:24px;line-height:1.2;margin:0 0 8px;font-weight:720;letter-spacing:0}
+    p{color:var(--muted);margin:0;font-size:14px;line-height:1.5}
+    a{color:var(--accent-2);text-decoration:none}
+    a:hover{text-decoration:underline}
+    .grid{display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:16px;align-items:start}
+    .panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 2px rgba(16,24,40,.04)}
+    .panel h2{font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin:0;padding:14px 16px;border-bottom:1px solid var(--line)}
+    .panel-body{padding:16px}
+    .kv{display:grid;grid-template-columns:88px minmax(0,1fr);gap:8px 12px;font-size:14px}
+    .label{color:var(--muted)}
+    .value{min-width:0;overflow-wrap:anywhere}
+    .hash{font-family:var(--mono);font-size:18px;font-weight:700;letter-spacing:.04em}
+    .kind{font-family:var(--mono);font-size:13px}
+    ul.clean{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+    ul.clean li{border:1px solid var(--line);background:#fbfcfe;border-radius:6px;padding:10px 11px;line-height:1.45;font-size:14px;overflow-wrap:anywhere}
+    .risk li{border-color:#f2d3a3;background:#fffaf0}
+    .policy-box{border-top:1px solid var(--line);overflow:auto;background:#0f1720;max-height:520px}
+    .policy-line{display:grid;grid-template-columns:52px minmax(max-content,1fr);font-family:var(--mono);font-size:12.5px;line-height:1.55;min-width:max-content}
+    .policy-line .no{color:#8792a2;background:#111b26;text-align:right;padding:0 10px;border-right:1px solid #263241;user-select:none}
+    .policy-line .code{white-space:pre;padding:0 12px;color:#d7e1ee}
+    .policy-line:nth-child(even) .code{background:#111a24}
+    .policy-line a{color:#7dd3fc}
+    .choice{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .choice-card{border:1px solid var(--line);border-radius:8px;background:#fbfcfe;padding:13px;text-align:left;color:var(--text);cursor:pointer}
+    .choice-card h3{font-size:14px;margin:0 0 7px;color:var(--text)}
+    .choice-card p{font-size:13px;margin:0;color:var(--muted)}
+    .choice-card.primary{border-color:var(--line);background:#fbfcfe}
+    .choice-card.selected{border-color:#0f766e;box-shadow:0 0 0 2px rgba(15,118,110,.14)}
+    .choice-card:focus{outline:2px solid #0b5fff;outline-offset:2px}
+    .choice-card .picked{display:none;margin-top:10px;font-size:12px;font-weight:700;color:#0f766e}
+    .choice-card.selected .picked{display:block}
+    .simple-policy{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:14px 0}
+    .simple-card{border:1px solid var(--line);border-radius:8px;background:#fbfcfe;padding:12px}
+    .simple-card strong{display:block;font-size:13px;margin-bottom:4px;color:var(--text)}
+    .simple-card span{display:block;font-size:13px;line-height:1.4;color:var(--muted);overflow-wrap:anywhere}
+    details{border:1px solid var(--line);border-radius:8px;background:#fbfcfe}
+    summary{cursor:pointer;padding:12px 14px;color:var(--muted);font-size:13px}
+    pre{margin:0;padding:0 14px 14px;white-space:pre-wrap;word-break:break-word;font-family:var(--mono);font-size:12px;color:#344054}
+    .actions{display:flex;gap:10px;align-items:center;margin-top:16px}
+    button{font:600 14px var(--sans);padding:10px 14px;border:1px solid #172033;background:#172033;color:white;border-radius:6px;cursor:pointer}
+    button.secondary{background:white;color:#172033;border-color:var(--line)}
+    button.choice-card{border:1px solid var(--line);background:#fbfcfe;color:var(--text);padding:13px}
+    button.choice-card.primary{border-color:var(--line);background:#fbfcfe}
+    button.choice-card.selected{border-color:#0f766e;background:#e6f6f2;box-shadow:0 0 0 3px rgba(15,118,110,.2)}
+    button:disabled{opacity:.55;cursor:not-allowed}
+    #status{margin-top:14px;padding:12px 14px;border-radius:8px;line-height:1.45;font-size:14px;border:1px solid #f0d28a;background:var(--warn-bg);color:#7a4d00}
+    #status.ok{background:var(--ok-bg);border-color:#b7e4c4;color:#14532d}
+    #status.err{background:var(--err-bg);border-color:#f5b5ae;color:#7a1f16}
+    .hidden{display:none}
+    .address{font-family:var(--mono);font-size:13px}
+    @media(max-width:850px){
+      main{padding:22px 12px 34px}
+      header{display:block}
+      .grid{grid-template-columns:1fr}
+      .kv{grid-template-columns:74px minmax(0,1fr)}
+      .choice{grid-template-columns:1fr}
+      .simple-policy{grid-template-columns:1fr}
+    }
   </style>
 </head>
 <body>
-  <h1>bloom — Authenticate with Passkey</h1>
-  <p>This page completes passkey authentication for your bloom wallet.</p>
-  <div id="status">Starting authentication…</div>
+<main>
+  <header>
+    <div>
+      <h1 id="title">Review passkey action</h1>
+      <p>
+        Review the exact Bloom action before the OS/browser passkey prompt opens.
+        The passkey prompt proves user presence for bloom/localhost; it does not
+        display these details itself.
+      </p>
+    </div>
+  </header>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>Action</h2>
+      <div class="panel-body">
+        <ul id="summary" class="clean"></ul>
+      </div>
+    </section>
+
+    <aside class="panel">
+      <h2>Identity</h2>
+      <div class="panel-body kv">
+        <div class="label">Wallet</div><div id="wallet" class="value">loading...</div>
+        <div class="label">Address</div><div id="address" class="value address">-</div>
+        <div class="label">Kind</div><div id="kind" class="value kind">-</div>
+        <div class="label">Hash</div><div id="hash" class="value hash">-</div>
+      </div>
+    </aside>
+  </div>
+
+  <section id="policyWrap" class="panel hidden" style="margin-top:16px">
+    <h2 id="policyTitle">Policy</h2>
+    <div class="panel-body">
+      <div id="policyDecision" class="hidden" style="margin-bottom:14px">
+        <p style="margin-bottom:12px">
+          This policy decides how much autonomy Bloom has. You can require a
+          fresh passkey approval for every money-moving action, or let Bloom
+          act by itself only when an action fits these rules.
+        </p>
+        <div class="choice">
+          <button class="choice-card" type="button" data-autonomy-mode="prompt_all">
+            <h3>Manual approval for every action</h3>
+            <p>Bloom still uses this policy as guardrails, but it must ask you
+              before every money-moving action.</p>
+            <span class="picked">Selected</span>
+          </button>
+          <button class="choice-card primary" type="button" data-autonomy-mode="under_policy">
+            <h3>Agent-guided by signed policy</h3>
+            <p>Approve this policy as the boundary. Bloom may proceed
+              autonomously for matching actions, and must refuse anything
+              outside the allowed chains, receivers, routers, caps, and risk
+              settings.</p>
+            <span class="picked">Selected</span>
+          </button>
+        </div>
+        <p id="policyPlainEnglish" style="margin-top:12px"></p>
+      </div>
+      <div id="policySimple" class="simple-policy"></div>
+      <details id="rawPolicyDetails">
+        <summary>Advanced: raw policy.toml</summary>
+        <div id="policy" class="policy-box"></div>
+      </details>
+    </div>
+  </section>
+
+  <section id="riskWrap" class="panel hidden" style="margin-top:16px">
+    <h2>Important Notes</h2>
+    <div class="panel-body">
+      <ul id="risk" class="clean risk"></ul>
+    </div>
+  </section>
+
+  <section id="artifactWrap" class="panel hidden" style="margin-top:16px">
+    <h2>Artifacts</h2>
+    <div class="panel-body">
+      <ul id="artifacts" class="clean"></ul>
+    </div>
+  </section>
+
+  <section id="subjectWrap" class="hidden" style="margin-top:16px">
+    <details>
+      <summary>Canonical subject used for the intent hash</summary>
+      <pre id="subject"></pre>
+    </details>
+  </section>
+
+  <div class="actions">
+    <button id="approve" disabled>Approve and Continue</button>
+    <button id="reject" class="secondary">Reject</button>
+  </div>
+  <div id="status">Loading review...</div>
+</main>
 <script>
 var TK=new URLSearchParams(location.search).get('t')||'';
+var CURRENT_INTENT=null;
 function dec(s){
   s=s.replace(/-/g,'+').replace(/_/g,'/');
   while(s.length%4)s+='=';
@@ -27,39 +191,285 @@ function enc(b){
   return btoa(String.fromCharCode(...new Uint8Array(b)))
     .replace(/\+/g,'-').replace(/\//g,'_').replace(/=/g,'');
 }
+function explorerFor(text){
+  const s=(text||'').toLowerCase();
+  if(s.includes('base')) return 'https://basescan.org/address/';
+  if(s.includes('polygon')||s.includes('polymarket')||s.includes('pusd')||s.includes('matic')) return 'https://polygonscan.com/address/';
+  return 'https://etherscan.io/address/';
+}
+function appendLinkedText(parent,text){
+  const re=/0x[a-fA-F0-9]{40}/g;
+  let last=0,m,base=explorerFor(text);
+  while((m=re.exec(text))!==null){
+    if(m.index>last) parent.appendChild(document.createTextNode(text.slice(last,m.index)));
+    const a=document.createElement('a');
+    a.href=base+m[0];
+    a.target='_blank';
+    a.rel='noopener noreferrer';
+    a.textContent=m[0];
+    parent.appendChild(a);
+    last=m.index+m[0].length;
+  }
+  if(last<text.length) parent.appendChild(document.createTextNode(text.slice(last)));
+}
+function li(parent,text){
+  const el=document.createElement('li');
+  appendLinkedText(el,String(text));
+  parent.appendChild(el);
+}
+function policyLine(parent,text,n){
+  const row=document.createElement('div');
+  row.className='policy-line';
+  const no=document.createElement('span');
+  no.className='no';
+  no.textContent=String(n).padStart(3,' ');
+  const code=document.createElement('span');
+  code.className='code';
+  appendLinkedText(code,String(text));
+  row.appendChild(no);
+  row.appendChild(code);
+  parent.appendChild(row);
+}
+function setLinked(id,text){
+  const el=document.getElementById(id);
+  el.textContent='';
+  appendLinkedText(el,String(text||'-'));
+}
+function isPolicyIntent(i){
+  const subj=i&&i.canonical_subject?i.canonical_subject:{};
+  return i.kind==='sign_policy' || subj.kind==='vfs_policy_write' || subj.kind==='sign_policy';
+}
+function currentPolicyText(){
+  const i=CURRENT_INTENT||{};
+  return (i.policy_lines||[]).join('\n');
+}
+function getAutonomyMode(text){
+  const lines=String(text||'').split(/\r?\n/);
+  let inApproval=false;
+  for(const line of lines){
+    const trimmed=line.trim();
+    const section=trimmed.match(/^\[([^\]]+)\]\s*$/);
+    if(section){
+      inApproval=section[1].trim()==='approval';
+      continue;
+    }
+    if(inApproval){
+      const m=trimmed.match(/^agent_autonomy\s*=\s*"([^"]+)"/);
+      if(m) return m[1];
+    }
+  }
+  return 'disabled';
+}
+function lineValue(text,key){
+  const re=new RegExp('^\\s*'+key.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'\\s*=\\s*(.+?)\\s*$','m');
+  const m=String(text||'').match(re);
+  return m?m[1].replace(/^"|"$/g,''):'';
+}
+function sectionText(text,name){
+  const lines=String(text||'').split(/\r?\n/);
+  let out=[],inside=false;
+  for(const line of lines){
+    const section=line.trim().match(/^\[([^\]]+)\]\s*$/);
+    if(section){
+      if(inside) break;
+      inside=section[1].trim()===name;
+      continue;
+    }
+    if(inside) out.push(line);
+  }
+  return out.join('\n');
+}
+function arrayValues(section,key){
+  const s=String(section||'');
+  const idx=s.indexOf(key);
+  if(idx<0) return [];
+  const after=s.slice(idx);
+  const one=after.match(new RegExp(key+'\\s*=\\s*\\[([^\\]]*)\\]'));
+  if(!one) return [];
+  return (one[1].match(/"([^"]+)"/g)||[]).map(x=>x.slice(1,-1));
+}
+function boolValue(section,key){
+  const v=lineValue(section,key).toLowerCase();
+  if(v==='true') return true;
+  if(v==='false') return false;
+  return null;
+}
+function shortAddressList(values){
+  if(!values.length) return 'None listed.';
+  const shown=values.slice(0,2).map(function(v){
+    const addr=(v.match(/0x[a-fA-F0-9]{40}/g)||[]).pop();
+    return addr?addr.slice(0,6)+'...'+addr.slice(-4):v;
+  }).join(', ');
+  return values.length>2?shown+' and '+(values.length-2)+' more':shown;
+}
+function simpleCard(parent,title,text){
+  const card=document.createElement('div');
+  card.className='simple-card';
+      const h=document.createElement('strong');
+  h.textContent=title;
+  const body=document.createElement('span');
+  appendLinkedText(body,text);
+  card.appendChild(h);
+  card.appendChild(body);
+  parent.appendChild(card);
+}
+function setPolicyModePresentation(mode){
+  const title=document.getElementById('policyTitle');
+  const details=document.getElementById('rawPolicyDetails');
+  const plain=document.getElementById('policyPlainEnglish');
+  if(mode==='under_policy'){
+    title.textContent='Agent Rules';
+    details.open=false;
+    details.querySelector('summary').textContent='Advanced: exact policy.toml';
+    plain.textContent='Bloom may act without asking only when an action fits these rules.';
+  }else{
+    title.textContent='Safety Limits';
+    details.open=false;
+    details.querySelector('summary').textContent='Advanced: exact safety limits';
+    plain.textContent='Bloom will ask before every money-moving action. These limits can still block actions that are outside your guardrails.';
+  }
+}
+function renderSimplePolicy(text){
+  const parent=document.getElementById('policySimple');
+  parent.textContent='';
+  const mode=getAutonomyMode(text);
+  setPolicyModePresentation(mode);
+  const defi=sectionText(text,'defi');
+  const polymarket=sectionText(text,'polymarket');
+  const caps=sectionText(text,'caps');
+  const sources=arrayValues(defi,'allowed_source_chains');
+  const dests=arrayValues(defi,'allowed_destination_chains');
+  const receivers=arrayValues(defi,'allowed_receivers');
+  const routers=arrayValues(defi,'allowed_routers');
+  const calldata=boolValue(defi,'require_calldata_verification');
+  let modeText='Bloom must ask before moving money.';
+  if(mode==='prompt_all') modeText='Bloom must ask you before every money-moving action. The policy still blocks actions outside these guardrails.';
+  if(mode==='under_policy') modeText='Bloom may act by itself only when the action fits these guardrails.';
+  simpleCard(parent,mode==='under_policy'?'Autonomy':'Approval',modeText);
+  if(mode==='prompt_all'){
+    simpleCard(parent,'Hard stops','Bloom can still refuse actions outside these safety limits, even if you later approve.');
+    simpleCard(parent,'Allowed receivers',shortAddressList(receivers));
+    simpleCard(parent,'Safety check',calldata===false?'Calldata verification is off for matching DeFi routes.':'Calldata verification is on. Bloom refuses routes it cannot verify.');
+    simpleCard(parent,'Native coin cap','Refuse native coin value above '+(lineValue(caps,'max_value_eth')||'no cap')+'.');
+    return;
+  }
+  simpleCard(parent,'DeFi swaps',boolValue(defi,'enabled')===false?'Swaps are off.':'Swaps may start on '+(sources.join(', ')||'no chain listed')+' and end on '+(dests.join(', ')||'no chain listed')+'.');
+  simpleCard(parent,'Allowed receivers',shortAddressList(receivers));
+  simpleCard(parent,'Allowed routers',shortAddressList(routers));
+  simpleCard(parent,'Safety check',calldata===false?'Calldata verification is off. Bloom must rely on the quoted route staying inside the policy.':'Calldata verification is on. Bloom refuses routes it cannot verify.');
+  simpleCard(parent,'Polymarket',boolValue(polymarket,'enabled')===true?'Trading is on. Max order $'+(lineValue(polymarket,'max_order_usd')||'?')+', daily max $'+(lineValue(polymarket,'max_daily_usd')||'?')+'.':'Trading is off.');
+  simpleCard(parent,'Native coin cap','Refuse native coin value above '+(lineValue(caps,'max_value_eth')||'no cap')+'. Ask for extra care above '+(lineValue(caps,'require_override_above_eth')||'no threshold')+'.');
+}
+function setSelectedAutonomy(mode){
+  document.querySelectorAll('[data-autonomy-mode]').forEach(function(btn){
+    btn.classList.toggle('selected',btn.getAttribute('data-autonomy-mode')===mode);
+  });
+}
+function classifyWebauthnError(e){
+  const name=e&&e.name?e.name:'Error';
+  const msg=e&&e.message?e.message:'';
+  if(name==='NotAllowedError'){
+    return 'Passkey user verification failed, was cancelled, or timed out. Do not change wallet state; retry only with the user present. '+msg;
+  }
+  if(name==='NotSupportedError'){
+    return 'Authenticator or browser does not support this passkey operation. Try Chrome/Safari or the correct authenticator. '+msg;
+  }
+  if(msg.indexOf('connection')!==-1||msg.indexOf('Receiving end')!==-1||msg.indexOf('extension')!==-1){
+    return 'A browser extension is interfering with passkey authentication. Disable extension passkey management for this browser. '+msg;
+  }
+  return name+': '+msg;
+}
+function isRetryableWebauthnError(e){
+  const name=e&&e.name?e.name:'Error';
+  return name==='NotAllowedError' || name==='AbortError' || name==='InvalidStateError';
+}
+async function loadIntent(){
+  const st=document.getElementById('status');
+  const data=await(await fetch('/intent.json')).json();
+  const i=data.intent||{};
+  CURRENT_INTENT=i;
+  document.getElementById('title').textContent=i.title||'Review passkey action';
+  document.getElementById('wallet').textContent=i.wallet||'unknown';
+  setLinked('address',i.wallet_address||'-');
+  document.getElementById('kind').textContent=i.kind||'unknown';
+  document.getElementById('hash').textContent=data.intent_hash||'-';
+  const summary=document.getElementById('summary');
+  summary.textContent='';
+  if(isPolicyIntent(i)){
+    li(summary,'You are reviewing wallet rules for '+(i.wallet||'this wallet')+'.');
+    li(summary,'This does not move money or place a trade.');
+    li(summary,'After approval, Bloom uses these rules to decide what is allowed.');
+  }else{
+    (i.summary_lines&&i.summary_lines.length?i.summary_lines:['No action summary was provided.']).forEach(x=>li(summary,x));
+  }
+  if(i.policy_lines&&i.policy_lines.length){
+    document.getElementById('policyWrap').classList.remove('hidden');
+    if(isPolicyIntent(i)){
+      document.getElementById('policyDecision').classList.remove('hidden');
+    }else{
+      document.getElementById('policyTitle').textContent='Transaction Details';
+      document.getElementById('rawPolicyDetails').open=true;
+      document.getElementById('rawPolicyDetails').querySelector('summary').textContent='Full staged transaction plan';
+    }
+    const policy=document.getElementById('policy');
+    policy.textContent='';
+    i.policy_lines.forEach((x,idx)=>policyLine(policy,x,idx+1));
+    renderSimplePolicy(i.policy_lines.join('\n'));
+    setSelectedAutonomy(getAutonomyMode(i.policy_lines.join('\n')));
+  }
+  if(i.risk_lines&&i.risk_lines.length){
+    document.getElementById('riskWrap').classList.remove('hidden');
+    const risk=document.getElementById('risk');
+    risk.textContent='';
+    i.risk_lines.forEach(x=>li(risk,x));
+  }
+  if(i.artifact_paths&&i.artifact_paths.length){
+    document.getElementById('artifactWrap').classList.remove('hidden');
+    const artifacts=document.getElementById('artifacts');
+    artifacts.textContent='';
+    i.artifact_paths.forEach(x=>li(artifacts,x));
+  }
+  if(i.canonical_subject&&i.canonical_subject!==null){
+    document.getElementById('subjectWrap').classList.remove('hidden');
+    document.getElementById('subject').textContent=JSON.stringify(i.canonical_subject,null,2);
+  }
+  st.textContent='Compare the intent hash with the terminal, then approve to open the passkey prompt.';
+  document.getElementById('approve').disabled=false;
+}
 async function run(){
   const st=document.getElementById('status');
+  const approve=document.getElementById('approve');
+  approve.disabled=true;
+  approve.textContent='Waiting...';
   if(!navigator.credentials||!navigator.credentials.get){
     st.className='err';
     st.textContent='WebAuthn is not available in this browser. Try Chrome or Safari on this device.';
+    approve.textContent='Approve and Continue';
     return;
   }
   try{
+    await fetch('/reviewed',{method:'POST',headers:{'x-bloom-token':TK}});
     const opts=await(await fetch('/challenge')).json();
     opts.publicKey.challenge=dec(opts.publicKey.challenge);
     if(opts.publicKey.allowCredentials)
       opts.publicKey.allowCredentials=opts.publicKey.allowCredentials.map(c=>({...c,id:dec(c.id)}));
-    // Decode PRF salt if present (injected by server when unlocking a PRF wallet).
-    // Capture as a variable so the fallback path below can reuse it.
     var prfSaltBytes=null;
     if(opts.publicKey.extensions&&opts.publicKey.extensions.prf&&opts.publicKey.extensions.prf.eval&&opts.publicKey.extensions.prf.eval.first){
       prfSaltBytes=dec(opts.publicKey.extensions.prf.eval.first);
       opts.publicKey.extensions.prf.eval.first=prfSaltBytes;
     }
-    st.textContent='Waiting for passkey interaction (Touch ID / security key)…';
+    st.className='';
+    st.textContent='Waiting for passkey interaction (Touch ID / security key)...';
     const cred=await navigator.credentials.get(opts);
 
-    // Extract PRF output and send it before submitting the auth credential.
     const ext=cred.getClientExtensionResults();
     const prfFirst=ext&&ext.prf&&ext.prf.results&&ext.prf.results.first;
     if(prfFirst){
       await fetch('/prf-output',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({prf_output_b64:enc(prfFirst),client_data_json_b64:enc(cred.response.clientDataJSON)})});
     }else if(prfSaltBytes&&ext&&ext.prf&&ext.prf.enabled){
-      // PRF is supported but output was not returned in the primary get() call.
-      // Run a secondary get() with a fresh challenge to extract the PRF output,
-      // then submit the original credential to /auth as usual.
-      st.textContent='Almost done — please authenticate once more to complete PRF extraction…';
+      st.textContent='Almost done - please authenticate once more to complete PRF extraction...';
       const challengeData=await(await fetch('/auth-challenge')).json();
+      if(challengeData.error) throw new Error(challengeData.error);
       const fallbackChallenge=dec(challengeData.challenge);
       const credId=new Uint8Array(cred.rawId);
       const fallbackOpts={
@@ -75,7 +485,7 @@ async function run(){
       const fallbackPrfFirst=fallbackExt&&fallbackExt.prf&&fallbackExt.prf.results&&fallbackExt.prf.results.first;
       if(!fallbackPrfFirst){
         st.className='err';
-        st.textContent='PRF output not available from your authenticator. Supported: Touch ID (macOS/iOS), YubiKey 5+, Windows Hello (Chrome 147+), security keys with hmac-secret. On Linux: Chromium has no built-in passkey manager — install Google Chrome instead.';
+        st.textContent='PRF output not available from your authenticator. Supported: Touch ID (macOS/iOS), YubiKey 5+, Windows Hello (Chrome 147+), security keys with hmac-secret. On Linux: Chromium has no built-in passkey manager - install Google Chrome instead.';
         return;
       }
       await fetch('/prf-output',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({prf_output_b64:enc(fallbackPrfFirst),client_data_json_b64:enc(fallbackCred.response.clientDataJSON)})});
@@ -91,27 +501,69 @@ async function run(){
       }
     })});
     st.className='ok';
-    st.textContent='✓ Authentication successful. You can close this tab.';
+    st.textContent='Authentication successful. You can close this tab.';
   }catch(e){
     st.className='err';
-    var m=e.message||'';
-    if(m.indexOf('connection')!==-1||m.indexOf('Receiving end')!==-1||m.indexOf('extension')!==-1){
-      st.innerHTML='A browser extension is interfering with passkey authentication.<br><br>Fix: in your browser extension settings, disable passkey management for Bitwarden (or whichever extension is intercepting). On Linux, do <b>not</b> use incognito — passkeys are not saved to the OS keychain from incognito mode. Alternatively, install Google Chrome (not Chromium) and disable Bitwarden passkeys there.<br><br>Error: '+m;
+    st.textContent='Error: '+classifyWebauthnError(e);
+    if(isRetryableWebauthnError(e)){
+      approve.disabled=false;
+      approve.textContent='Retry Passkey';
+      st.textContent+=' The action has not been signed. Check the review hash and retry from this page.';
     }else{
-      st.textContent='Error: '+m;
+      approve.textContent='Approve and Continue';
     }
   }
 }
+document.getElementById('approve').addEventListener('click',function(){
+  run();
+});
+document.getElementById('reject').addEventListener('click',function(){
+  fetch('/reject',{method:'POST',headers:{'x-bloom-token':TK}}).catch(function(){});
+  document.getElementById('status').className='err';
+  document.getElementById('status').textContent='Rejected. Close this tab and stop the command in the terminal.';
+});
+document.querySelectorAll('[data-autonomy-mode]').forEach(function(btn){
+  btn.addEventListener('click',async function(){
+    const mode=btn.getAttribute('data-autonomy-mode');
+    const st=document.getElementById('status');
+    const previous=getAutonomyMode(currentPolicyText());
+    setSelectedAutonomy(mode);
+    document.getElementById('approve').disabled=true;
+    st.className='';
+    st.textContent='Updating policy choice...';
+    try{
+      const r=await fetch('/policy-autonomy',{method:'POST',headers:{'Content-Type':'application/json','x-bloom-token':TK},body:JSON.stringify({mode:mode})});
+      if(!r.ok){
+        let err='Could not update policy choice.';
+        try{
+          const body=await r.json();
+          if(body&&body.error) err=body.error;
+        }catch(_e){}
+        setSelectedAutonomy(previous);
+        st.className='err';
+        st.textContent=err;
+        return;
+      }
+      await loadIntent();
+      st.className='ok';
+      st.textContent='Updated. Review the simple summary and hash, then approve or reject.';
+    }catch(e){
+      setSelectedAutonomy(previous);
+      st.className='err';
+      st.textContent='Could not update policy choice: '+(e&&e.message?e.message:e);
+    }
+  });
+});
 window.addEventListener('unhandledrejection',function(e){
   const st=document.getElementById('status');
   st.className='err';
-  st.textContent='Error: '+e.reason.message+' (disable extension passkey management, or install Google Chrome on Linux)';
+  st.textContent='Error: '+classifyWebauthnError(e.reason||e);
   e.preventDefault();
 });
-run().catch(function(e){
+loadIntent().catch(function(e){
   const st=document.getElementById('status');
   st.className='err';
-  st.textContent='Error: '+e.message+' (disable extension passkey management, or install Google Chrome on Linux)';
+  st.textContent='Error loading review: '+e.message;
 });
 </script>
 </body>

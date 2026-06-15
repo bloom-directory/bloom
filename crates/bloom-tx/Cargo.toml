@@ -12,6 +12,7 @@ bloom-rpc.workspace = true
 bloom-keystore.workspace = true
 bloom-mempool.workspace = true
 bloom-tools.workspace = true
+blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

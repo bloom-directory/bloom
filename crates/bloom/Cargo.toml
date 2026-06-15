@@ -27,8 +27,11 @@ wat.workspace = true
 bloom-mount = { workspace = true, optional = true }
 bloom-keystore.workspace = true
 bloom-chain.workspace = true
+bloom-defi.workspace = true
 bloom-tx.workspace = true
+url.workspace = true
 bloom-vfs.workspace = true
+bloom-polymarket.workspace = true
 bloom-tools.workspace = true
 bloom-petals.workspace = true
 bloom-ptb-builder.workspace = true

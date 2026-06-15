@@ -24,10 +24,12 @@
 //! impersonate), and `localhost` keeps credentials portable across machines
 //! and satisfies the WebAuthn origin-domain check.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::response::Html;
+use axum::http::header::{CACHE_CONTROL, PRAGMA};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
@@ -35,6 +37,8 @@ use parking_lot::Mutex;
 use rand::RngCore;
 use url::Url;
 use webauthn_rs::prelude::*;
+
+use bloom_proto::CeremonyIntent;
 
 // ── constants ────────────────────────────────────────────────────────────────
 
@@ -152,6 +156,30 @@ fn bind_local(port: u16, ctx: &str) -> Result<tokio::net::TcpListener, String> {
     sock.bind(format!("127.0.0.1:{port}").parse().expect("valid addr"))
         .map_err(|e| format!("cannot bind port {port} for {ctx}: {e}"))?;
     sock.listen(128).map_err(|e| format!("listen: {e}"))
+}
+
+fn default_unlock_intent(wallet_name: &str, wallet_dir: &Path) -> CeremonyIntent {
+    let mut intent = CeremonyIntent::new(
+        wallet_name,
+        "Unlock Wallet",
+        bloom_proto::CeremonyIntentKind::WalletUnlock,
+    );
+    intent.wallet_address = std::fs::read_to_string(wallet_dir.join("address"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    intent
+        .summary_lines
+        .push("Unlock wallet key for this foreground command.".into());
+    intent
+        .risk_lines
+        .push("The OS passkey prompt will show bloom/localhost, not transaction details.".into());
+    intent.canonical_subject = serde_json::json!({
+        "kind": "wallet_unlock",
+        "wallet": wallet_name,
+        "address": intent.wallet_address,
+    });
+    intent
 }
 
 // ── builder ──────────────────────────────────────────────────────────────────
@@ -305,12 +333,14 @@ pub(crate) async fn register_ceremony(
 /// If `prf_salt` is `None` (legacy/non-PRF path), no PRF extension is
 /// injected and the second element of the return tuple is `None`.
 ///
-/// Returns `(AuthenticationResult, Option<prf_output>)`. The caller must
-/// update the credential counter if `auth_result.needs_update()`.
+/// Returns `(AuthenticationResult, Option<prf_output>, Option<edited_policy>)`.
+/// The caller must update the credential counter if `auth_result.needs_update()`.
 pub(crate) async fn auth_ceremony(
     credential: &Passkey,
     prf_salt: Option<&[u8; 32]>,
-) -> Result<(AuthenticationResult, Option<[u8; 32]>), String> {
+    intent: Option<CeremonyIntent>,
+    editable_policy: Option<String>,
+) -> Result<(AuthenticationResult, Option<[u8; 32]>, Option<String>), String> {
     let webauthn = build_webauthn()?;
 
     let (rcr, auth_state) = webauthn
@@ -333,6 +363,9 @@ pub(crate) async fn auth_ceremony(
         challenge_json,
         challenge_b64,
         token: gen_token(),
+        intent: Arc::new(Mutex::new(intent)),
+        editable_policy: Arc::new(Mutex::new(editable_policy)),
+        reviewed: Arc::new(Mutex::new(false)),
         prf_output: Arc::new(Mutex::new(None)),
         fallback_challenge: Arc::new(Mutex::new(None)),
         tx: Arc::new(Mutex::new(Some(tx))),
@@ -353,6 +386,13 @@ pub(crate) async fn auth_ceremony(
         "[bloom] Opening browser for passkey authentication — \
          complete the ceremony at {url}"
     );
+    if let Some(intent) = state.intent.lock().as_ref() {
+        eprintln!(
+            "[bloom] Review intent: {} ({})",
+            intent.title,
+            intent.intent_hash()
+        );
+    }
     if let Err(e) = launch_browser(&url) {
         state.shutdown.notify_one();
         let _ = server.await;
@@ -382,7 +422,8 @@ pub(crate) async fn auth_ceremony(
         .map_err(|e| format!("finish_passkey_authentication: {e}"))?;
 
     let prf_output = state.prf_output.lock().take();
-    Ok((auth_result, prf_output))
+    let edited_policy = state.editable_policy.lock().take();
+    Ok((auth_result, prf_output, edited_policy))
 }
 
 // ── axum apps ─────────────────────────────────────────────────────────────────
@@ -653,6 +694,9 @@ async fn reg_auth_challenge(State(state): State<RegState>) -> Json<serde_json::V
 
 /// Issue a random challenge for the fallback PRF extraction flow (authentication).
 async fn auth_auth_challenge(State(state): State<AuthState>) -> Json<serde_json::Value> {
+    if !*state.reviewed.lock() {
+        return Json(serde_json::json!({ "error": "review_required" }));
+    }
     issue_fallback_challenge(&state.fallback_challenge)
 }
 
@@ -685,6 +729,13 @@ struct AuthState {
     /// Per-server capability token embedded in the launched URL; required on
     /// state-changing requests by `require_token`.
     token: String,
+    /// Human-review payload displayed before WebAuthn starts.
+    intent: Arc<Mutex<Option<CeremonyIntent>>>,
+    /// Optional editable policy draft. When present, `/policy-edit` updates
+    /// both this text and the intent digest shown on the review page.
+    editable_policy: Arc<Mutex<Option<String>>>,
+    /// Set by POST /reviewed when the user clicks the review-page approval.
+    reviewed: Arc<Mutex<bool>>,
     /// Filled by POST /prf-output.
     prf_output: Arc<Mutex<Option<[u8; 32]>>>,
     /// Set by GET /auth-challenge on the fallback PRF extraction path.
@@ -697,6 +748,12 @@ fn build_auth_app(state: AuthState) -> Router {
     let token = state.token.clone();
     Router::new()
         .route("/", get(auth_index))
+        .route("/intent.json", get(auth_intent))
+        .route("/reviewed", post(auth_reviewed))
+        .route("/reject", post(auth_reject))
+        .route("/edit-policy", post(auth_edit_policy))
+        .route("/policy-edit", post(auth_policy_edit))
+        .route("/policy-autonomy", post(auth_policy_autonomy))
         .route("/challenge", get(auth_challenge))
         .route("/auth-challenge", get(auth_auth_challenge))
         .route("/prf-output", post(auth_prf_output))
@@ -706,13 +763,221 @@ fn build_auth_app(state: AuthState) -> Router {
         .with_state(state)
 }
 
-async fn auth_index() -> Html<&'static str> {
-    Html(AUTH_HTML)
+async fn auth_index() -> Response {
+    (
+        [
+            (CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+            (PRAGMA, "no-cache"),
+        ],
+        Html(AUTH_HTML),
+    )
+        .into_response()
+}
+
+async fn auth_intent(State(state): State<AuthState>) -> Response {
+    let intent = state.intent.lock().clone().unwrap_or_else(|| {
+        CeremonyIntent::new(
+            "unknown",
+            "Unlock Wallet",
+            bloom_proto::CeremonyIntentKind::WalletUnlock,
+        )
+    });
+    (
+        [
+            (CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+            (PRAGMA, "no-cache"),
+        ],
+        Json(serde_json::json!({
+            "intent": intent,
+            "intent_hash": intent.intent_hash(),
+        })),
+    )
+        .into_response()
+}
+
+async fn auth_reviewed(State(state): State<AuthState>) -> axum::http::StatusCode {
+    *state.reviewed.lock() = true;
+    axum::http::StatusCode::OK
+}
+
+async fn auth_reject(State(state): State<AuthState>) -> axum::http::StatusCode {
+    state.tx.lock().take();
+    state.shutdown.notify_one();
+    axum::http::StatusCode::OK
+}
+
+async fn auth_edit_policy(State(state): State<AuthState>) -> axum::http::StatusCode {
+    *state.reviewed.lock() = false;
+    axum::http::StatusCode::OK
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PolicyEditBody {
+    policy_text: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PolicyAutonomyBody {
+    mode: String,
+}
+
+fn set_policy_autonomy(text: &str, mode: &str) -> Result<String, String> {
+    if !matches!(mode, "prompt_all" | "under_policy") {
+        return Err("expected mode prompt_all or under_policy".into());
+    }
+
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    if text.ends_with('\n') {
+        lines.push(String::new());
+    }
+
+    let mut approval_start = None;
+    let mut approval_end = lines.len();
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed == "[approval]" {
+            approval_start = Some(idx);
+            approval_end = lines.len();
+            for (j, later) in lines.iter().enumerate().skip(idx + 1) {
+                let t = later.trim();
+                if t.starts_with('[') && t.ends_with(']') {
+                    approval_end = j;
+                    break;
+                }
+            }
+            break;
+        }
+    }
+
+    match approval_start {
+        Some(start) => {
+            let mut replaced = false;
+            for line in lines.iter_mut().take(approval_end).skip(start + 1) {
+                if line.trim_start().starts_with("agent_autonomy") {
+                    *line = format!("agent_autonomy = \"{mode}\"");
+                    replaced = true;
+                    break;
+                }
+            }
+            if !replaced {
+                lines.insert(start + 1, format!("agent_autonomy = \"{mode}\""));
+            }
+        }
+        None => {
+            lines.splice(
+                0..0,
+                [
+                    "[approval]".to_string(),
+                    format!("agent_autonomy = \"{mode}\""),
+                    String::new(),
+                ],
+            );
+        }
+    }
+
+    let updated = lines.join("\n");
+    toml::from_str::<bloom_proto::Policy>(&updated)
+        .map_err(|e| format!("policy would be invalid after changing autonomy: {e}"))?;
+    Ok(updated)
+}
+
+fn update_policy_intent(state: &AuthState, policy_text: &str) -> String {
+    let digest = blake3::hash(policy_text.as_bytes()).to_hex().to_string();
+    if let Some(intent) = state.intent.lock().as_mut() {
+        intent.policy_lines = policy_text.lines().map(str::to_string).collect();
+        for line in &mut intent.summary_lines {
+            if line.starts_with("Policy digest: ") {
+                *line = format!("Policy digest: {digest}");
+            }
+        }
+        if let Some(obj) = intent.canonical_subject.as_object_mut() {
+            obj.insert(
+                "policy_blake3".to_string(),
+                serde_json::Value::String(digest.clone()),
+            );
+        }
+    }
+    digest
+}
+
+async fn auth_policy_edit(
+    State(state): State<AuthState>,
+    Json(body): Json<PolicyEditBody>,
+) -> Response {
+    if state.editable_policy.lock().is_none() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "this review does not have an editable policy draft"
+            })),
+        )
+            .into_response();
+    }
+    if let Err(e) = toml::from_str::<bloom_proto::Policy>(&body.policy_text) {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("invalid policy.toml: {e}")
+            })),
+        )
+            .into_response();
+    }
+    *state.reviewed.lock() = false;
+    *state.editable_policy.lock() = Some(body.policy_text.clone());
+    let digest = update_policy_intent(&state, &body.policy_text);
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "policy_blake3": digest })),
+    )
+        .into_response()
+}
+
+async fn auth_policy_autonomy(
+    State(state): State<AuthState>,
+    Json(body): Json<PolicyAutonomyBody>,
+) -> Response {
+    let Some(current) = state.editable_policy.lock().clone() else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "this review does not have an editable policy draft"
+            })),
+        )
+            .into_response();
+    };
+    let updated = match set_policy_autonomy(&current, body.mode.trim()) {
+        Ok(updated) => updated,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": e })),
+            )
+                .into_response();
+        }
+    };
+    *state.reviewed.lock() = false;
+    *state.editable_policy.lock() = Some(updated.clone());
+    let digest = update_policy_intent(&state, &updated);
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "mode": body.mode.trim(),
+            "policy_blake3": digest
+        })),
+    )
+        .into_response()
 }
 
 async fn auth_challenge(
     State(state): State<AuthState>,
 ) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
+    if !*state.reviewed.lock() {
+        return Err(axum::http::StatusCode::PRECONDITION_REQUIRED);
+    }
     serde_json::from_str(&state.challenge_json)
         .map(Json)
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)
@@ -722,6 +987,9 @@ async fn auth_prf_output(
     State(state): State<AuthState>,
     Json(body): Json<PrfOutputBody>,
 ) -> axum::http::StatusCode {
+    if !*state.reviewed.lock() {
+        return axum::http::StatusCode::PRECONDITION_REQUIRED;
+    }
     match parse_prf_output_body(&body, &state.challenge_b64, &state.fallback_challenge) {
         Ok(arr) => {
             // Reject a second PRF output rather than letting a late/racing POST
@@ -741,6 +1009,9 @@ async fn auth_post(
     State(state): State<AuthState>,
     Json(cred): Json<PublicKeyCredential>,
 ) -> axum::http::StatusCode {
+    if !*state.reviewed.lock() {
+        return axum::http::StatusCode::PRECONDITION_REQUIRED;
+    }
     let sent = state
         .tx
         .lock()
@@ -1091,7 +1362,8 @@ impl super::Keystore {
 
         // Generate the default policy string before the ceremony so the
         // browser page can display it for the user to review.
-        let default_policy = Policy::default();
+        let mut default_policy = Policy::default();
+        default_policy.approval.agent_autonomy = Some(bloom_proto::AgentAutonomyMode::Disabled);
         let policy_toml_str = toml::to_string_pretty(&default_policy)
             .map_err(|e| KeystoreError::Policy(e.to_string()))?;
 
@@ -1212,10 +1484,36 @@ impl super::Keystore {
     /// The ceremony uses the PRF extension to derive the wrap key from the
     /// authenticator's internal secret, then decrypts and caches the signer.
     pub async fn unlock_passkey(&self, name: &str) -> Result<(), KeystoreError> {
+        self.unlock_passkey_with_intent(name, None).await
+    }
+
+    /// Unlock a passkey wallet and display a ceremony intent before the
+    /// WebAuthn prompt. Callers that know the concrete action should pass it;
+    /// generic unlocks get a safe default intent.
+    pub async fn unlock_passkey_with_intent(
+        &self,
+        name: &str,
+        intent: Option<bloom_proto::CeremonyIntent>,
+    ) -> Result<(), KeystoreError> {
+        self.unlock_passkey_with_intent_and_policy_edit(name, intent, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// As [`Self::unlock_passkey_with_intent`], but lets the browser review
+    /// page edit a policy draft and returns the final approved text.
+    pub async fn unlock_passkey_with_intent_and_policy_edit(
+        &self,
+        name: &str,
+        intent: Option<bloom_proto::CeremonyIntent>,
+        editable_policy: Option<String>,
+    ) -> Result<Option<String>, KeystoreError> {
         Self::validate_name(name)?;
-        // Fast path: already unlocked — skip the browser ceremony.
-        if self.is_unlocked(name) {
-            return Ok(());
+        // Fast path only for generic unlocks. If the caller supplied a concrete
+        // intent or editable policy, the browser review is part of the
+        // authorization boundary and must run even when a signer is cached.
+        if self.is_unlocked(name) && intent.is_none() && editable_policy.is_none() {
+            return Ok(editable_policy);
         }
         let dir = self.wallet_path(name);
         if !dir.exists() {
@@ -1241,11 +1539,14 @@ impl super::Keystore {
             .try_into()
             .map_err(|_| KeystoreError::Malformed("prf.salt length != 32".into()))?;
 
+        let intent = intent.or_else(|| Some(default_unlock_intent(name, &dir)));
+
         // Authentication ceremony — injects the PRF salt into the challenge.
         // Returns (auth_result, Some(prf_output)).
-        let (auth_result, prf_output_opt) = auth_ceremony(&credential, Some(&prf_salt))
-            .await
-            .map_err(KeystoreError::PasskeyCeremony)?;
+        let (auth_result, prf_output_opt, edited_policy) =
+            auth_ceremony(&credential, Some(&prf_salt), intent, editable_policy)
+                .await
+                .map_err(KeystoreError::PasskeyCeremony)?;
 
         // Persist updated counter if the authenticator incremented it. This
         // happens before the decrypt below; if decryption later fails the
@@ -1282,7 +1583,7 @@ impl super::Keystore {
             .write()
             .insert(name.to_string(), Arc::new(signer));
         tracing::debug!(wallet = name, "keystore.passkey_unlocked");
-        Ok(())
+        Ok(edited_policy)
     }
 
     /// Re-bind a PRF-based passkey wallet to a new passkey credential.
@@ -1461,9 +1762,327 @@ impl super::Keystore {
                 source,
             })?;
 
+        // Never sign a policy the engine cannot parse — a signed-but-broken
+        // policy.toml would brick every wallet operation behind a valid sig.
+        toml::from_str::<bloom_proto::Policy>(&content).map_err(|e| {
+            KeystoreError::Policy(format!("refusing to sign unparseable policy.toml: {e}"))
+        })?;
+
         let signer = self.signer(name)?; // must be unlocked
         write_policy_sig(&dir, name, &content, &signer)?;
         tracing::debug!(wallet = name, "keystore.policy_signed");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ceremony_gate_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// Build an `AuthState` with review NOT yet given and a minimal but valid
+    /// challenge JSON (so `/challenge` parses *after* review).
+    fn unreviewed_state() -> AuthState {
+        AuthState {
+            challenge_json: r#"{"publicKey":{"challenge":"AAAA"}}"#.to_string(),
+            challenge_b64: "AAAA".to_string(),
+            token: "test-token".to_string(),
+            intent: Arc::new(Mutex::new(Some(bloom_proto::CeremonyIntent::new(
+                "minnow",
+                "Sign Polygon Transaction",
+                bloom_proto::CeremonyIntentKind::EvmTransaction,
+            )))),
+            editable_policy: Arc::new(Mutex::new(None)),
+            reviewed: Arc::new(Mutex::new(false)),
+            prf_output: Arc::new(Mutex::new(None)),
+            fallback_challenge: Arc::new(Mutex::new(None)),
+            tx: Arc::new(Mutex::new(Some(tokio::sync::oneshot::channel().0))),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Serve `build_auth_app` on an ephemeral port; returns the base URL.
+    async fn serve(state: AuthState) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = build_auth_app(state.clone());
+        let shutdown = state.shutdown.clone();
+        let h = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move { shutdown.notified().await })
+                .await;
+        });
+        (format!("http://127.0.0.1:{}", addr.port()), h)
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::new()
+    }
+
+    /// The core safety invariant: no WebAuthn challenge is served before the
+    /// user has reviewed and approved.
+    #[tokio::test]
+    async fn challenge_refuses_428_before_review_then_allows_after() {
+        let state = unreviewed_state();
+        let (base, _h) = serve(state.clone()).await;
+        let c = client();
+
+        // GET /challenge before review → 428 Precondition Required.
+        let r = c.get(format!("{base}/challenge")).send().await.unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            428,
+            "challenge must refuse before review"
+        );
+
+        // /auth-challenge (fallback PRF path) must not issue a real challenge.
+        let r = c
+            .get(format!("{base}/auth-challenge"))
+            .send()
+            .await
+            .unwrap();
+        let body = r.text().await.unwrap();
+        assert!(
+            body.contains("review_required"),
+            "auth-challenge before review: {body}"
+        );
+
+        // Approve.
+        let r = c
+            .post(format!("{base}/reviewed"))
+            .header("x-bloom-token", "test-token")
+            .header("origin", format!("http://localhost:{CEREMONY_PORT}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+
+        // Now /challenge succeeds.
+        let r = c.get(format!("{base}/challenge")).send().await.unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            200,
+            "challenge must serve after review"
+        );
+        state.shutdown.notify_one();
+    }
+
+    /// The POST signing-input gate (`/prf-output`) also refuses before review —
+    /// same guard as `/auth`, exercised through the token+origin middleware.
+    #[tokio::test]
+    async fn prf_output_refuses_428_before_review() {
+        let state = unreviewed_state();
+        let (base, _h) = serve(state.clone()).await;
+        let r = client()
+            .post(format!("{base}/prf-output"))
+            .header("x-bloom-token", "test-token")
+            .header("origin", format!("http://localhost:{CEREMONY_PORT}"))
+            .json(&serde_json::json!({
+                "prf_output_b64": "AAAA",
+                "client_data_json_b64": "AAAA"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status().as_u16(),
+            428,
+            "prf-output must refuse before review"
+        );
+        state.shutdown.notify_one();
+    }
+
+    /// `/intent.json` returns the intent and a matching short hash.
+    #[tokio::test]
+    async fn intent_json_returns_matching_hash() {
+        let state = unreviewed_state();
+        let expected = state.intent.lock().clone().unwrap().intent_hash();
+        let (base, _h) = serve(state.clone()).await;
+        let v: serde_json::Value = client()
+            .get(format!("{base}/intent.json"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["intent_hash"].as_str(), Some(expected.as_str()));
+        assert_eq!(v["intent"]["kind"].as_str(), Some("evm_transaction"));
+        state.shutdown.notify_one();
+    }
+
+    /// `/reject` cancels the ceremony promptly (drops the sender, notifies
+    /// shutdown) so the CLI exits instead of waiting for timeout.
+    #[tokio::test]
+    async fn reject_cancels_promptly() {
+        let state = unreviewed_state();
+        let (base, h) = serve(state.clone()).await;
+        let r = client()
+            .post(format!("{base}/reject"))
+            .header("x-bloom-token", "test-token")
+            .header("origin", format!("http://localhost:{CEREMONY_PORT}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        // graceful shutdown should complete quickly
+        tokio::time::timeout(std::time::Duration::from_secs(2), h)
+            .await
+            .expect("server should shut down after /reject")
+            .unwrap();
+    }
+
+    /// `/edit-policy` leaves the auth sender and review server alive so the
+    /// browser can show editing instructions instead of disappearing.
+    #[tokio::test]
+    async fn edit_policy_keeps_page_alive() {
+        let state = unreviewed_state();
+        let (base, h) = serve(state.clone()).await;
+        let r = client()
+            .post(format!("{base}/edit-policy"))
+            .header("x-bloom-token", "test-token")
+            .header("origin", format!("http://localhost:{CEREMONY_PORT}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert!(state.tx.lock().is_some());
+        assert!(!*state.reviewed.lock());
+        let intent = client()
+            .get(format!("{base}/intent.json"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(intent.status().as_u16(), 200);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), h)
+                .await
+                .is_err(),
+            "server should remain alive after /edit-policy"
+        );
+        state.shutdown.notify_one();
+    }
+
+    #[tokio::test]
+    async fn policy_edit_rejects_invalid_policy() {
+        let state = unreviewed_state();
+        *state.editable_policy.lock() =
+            Some("[approval]\nagent_autonomy = \"prompt_all\"\n".into());
+        let (base, _h) = serve(state.clone()).await;
+        let r = client()
+            .post(format!("{base}/policy-edit"))
+            .header("x-bloom-token", "test-token")
+            .header("origin", format!("http://localhost:{CEREMONY_PORT}"))
+            .json(&serde_json::json!({
+                "policy_text": "[approval]\nagent_autonomy = \"autopilot\"\n"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 400);
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["ok"].as_bool(), Some(false));
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("invalid policy.toml")
+        );
+        assert_eq!(
+            state.editable_policy.lock().as_deref(),
+            Some("[approval]\nagent_autonomy = \"prompt_all\"\n")
+        );
+        state.shutdown.notify_one();
+    }
+
+    #[tokio::test]
+    async fn policy_edit_accepts_valid_policy_and_updates_hash() {
+        let state = unreviewed_state();
+        *state.editable_policy.lock() =
+            Some("[approval]\nagent_autonomy = \"prompt_all\"\n".into());
+        if let Some(intent) = state.intent.lock().as_mut() {
+            intent.canonical_subject = serde_json::json!({
+                "kind": "vfs_policy_write",
+                "policy_blake3": "old"
+            });
+        }
+        let text = "[approval]\nagent_autonomy = \"under_policy\"\n";
+        let (base, _h) = serve(state.clone()).await;
+        let r = client()
+            .post(format!("{base}/policy-edit"))
+            .header("x-bloom-token", "test-token")
+            .header("origin", format!("http://localhost:{CEREMONY_PORT}"))
+            .json(&serde_json::json!({ "policy_text": text }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(state.editable_policy.lock().as_deref(), Some(text));
+        let intent = state.intent.lock().clone().unwrap();
+        let digest = blake3::hash(text.as_bytes()).to_hex().to_string();
+        assert_eq!(
+            intent.policy_lines,
+            vec!["[approval]", "agent_autonomy = \"under_policy\""]
+        );
+        assert_eq!(
+            intent.canonical_subject["policy_blake3"].as_str(),
+            Some(digest.as_str())
+        );
+        state.shutdown.notify_one();
+    }
+
+    #[tokio::test]
+    async fn policy_autonomy_updates_only_policy_mode() {
+        let state = unreviewed_state();
+        *state.editable_policy.lock() =
+            Some("[caps]\nmax_value_eth = 0.1\n\n[approval]\n\n[defi]\nenabled = true\n".into());
+        if let Some(intent) = state.intent.lock().as_mut() {
+            intent.canonical_subject = serde_json::json!({
+                "kind": "vfs_policy_write",
+                "policy_blake3": "old"
+            });
+        }
+        let (base, _h) = serve(state.clone()).await;
+        let r = client()
+            .post(format!("{base}/policy-autonomy"))
+            .header("x-bloom-token", "test-token")
+            .header("origin", format!("http://localhost:{CEREMONY_PORT}"))
+            .json(&serde_json::json!({ "mode": "under_policy" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        let updated = state.editable_policy.lock().clone().unwrap();
+        assert!(updated.contains("[approval]\nagent_autonomy = \"under_policy\""));
+        assert!(updated.contains("[defi]\nenabled = true"));
+        let intent = state.intent.lock().clone().unwrap();
+        assert!(
+            intent
+                .policy_lines
+                .join("\n")
+                .contains("agent_autonomy = \"under_policy\"")
+        );
+        assert_ne!(
+            intent.canonical_subject["policy_blake3"].as_str(),
+            Some("old")
+        );
+        state.shutdown.notify_one();
+    }
+
+    /// POSTs without the per-server token are rejected by the middleware.
+    #[tokio::test]
+    async fn post_without_token_is_forbidden() {
+        let state = unreviewed_state();
+        let (base, _h) = serve(state.clone()).await;
+        let r = client()
+            .post(format!("{base}/reviewed"))
+            .header("origin", format!("http://localhost:{CEREMONY_PORT}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 403, "missing token must be forbidden");
+        // and review state is unchanged
+        assert!(!*state.reviewed.lock());
+        state.shutdown.notify_one();
     }
 }

@@ -3,12 +3,14 @@
 //! Layout: `<home>/outbox/<wallet>/<chain>/{pending,sent,failed}/<id>/...`
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use bloom_proto::{StagedTx, TxStatus};
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// A parsed view of a `<root>/<wallet>/<chain>/sent/<id>/intent.json` entry.
@@ -106,6 +108,66 @@ pub struct OutboxEntry {
     pub state: OutboxState,
     pub staged: StagedTx,
     pub dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BroadcastTransport {
+    PublicRpc,
+    PrivateRpc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BroadcastAttemptKind {
+    Confirm,
+    Replacement,
+    CancelReplacement,
+}
+
+impl BroadcastAttemptKind {
+    pub fn marker_name(self) -> &'static str {
+        match self {
+            Self::Confirm => "broadcast_attempted.json",
+            Self::Replacement => "replacement_broadcast_attempted.json",
+            Self::CancelReplacement => "cancel_broadcast_attempted.json",
+        }
+    }
+
+    pub fn raw_name(self) -> &'static str {
+        match self {
+            Self::Confirm => "raw_tx",
+            Self::Replacement => "replacement_raw_tx",
+            Self::CancelReplacement => "cancel_raw_tx",
+        }
+    }
+
+    const ALL: [Self; 3] = [Self::Confirm, Self::Replacement, Self::CancelReplacement];
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BroadcastAttempt {
+    pub schema: String,
+    pub tx_hash: String,
+    pub raw_tx_blake3: String,
+    pub raw_tx_path: String,
+    pub from: String,
+    pub to: String,
+    pub nonce: u64,
+    pub chain_id: u64,
+    pub created_ms: u128,
+    pub transport: BroadcastTransport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_provider: Option<String>,
+}
+
+pub struct SameNonceAttemptQuery<'a> {
+    pub wallet: &'a str,
+    pub chain: &'a str,
+    pub from: &'a str,
+    pub chain_id: u64,
+    pub nonce: u64,
+    pub excluding_id: &'a str,
+    pub excluding_kind: BroadcastAttemptKind,
 }
 
 #[derive(Clone)]
@@ -224,6 +286,123 @@ impl Outbox {
         let path = dir.join("mev_risk.json");
         fs::write(&path, serde_json::to_vec_pretty(report)?)?;
         Ok(path)
+    }
+
+    pub fn write_broadcast_attempt(
+        &self,
+        entry: &OutboxEntry,
+        kind: BroadcastAttemptKind,
+        attempt: &BroadcastAttempt,
+    ) -> Result<PathBuf, OutboxError> {
+        let path = entry.dir.join(kind.marker_name());
+        fs::write(&path, serde_json::to_vec_pretty(attempt)?)?;
+        Ok(path)
+    }
+
+    pub fn read_broadcast_attempt(
+        &self,
+        entry: &OutboxEntry,
+        kind: BroadcastAttemptKind,
+    ) -> Result<Option<BroadcastAttempt>, OutboxError> {
+        let path = entry.dir.join(kind.marker_name());
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+    }
+
+    pub fn write_broadcast_raw_tx(
+        &self,
+        entry: &OutboxEntry,
+        kind: BroadcastAttemptKind,
+        raw: &[u8],
+    ) -> Result<PathBuf, OutboxError> {
+        let path = entry.dir.join(kind.raw_name());
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&path)?;
+        file.write_all(raw)?;
+        Ok(path)
+    }
+
+    pub fn read_broadcast_raw_tx(
+        &self,
+        entry: &OutboxEntry,
+        kind: BroadcastAttemptKind,
+        attempt: &BroadcastAttempt,
+    ) -> Result<Vec<u8>, OutboxError> {
+        let expected = kind.raw_name();
+        if attempt.raw_tx_path != expected {
+            return Err(OutboxError::InvalidId(format!(
+                "broadcast raw path '{}' did not match expected '{}'",
+                attempt.raw_tx_path, expected
+            )));
+        }
+        let raw = fs::read(entry.dir.join(expected))?;
+        let got = blake3::hash(&raw).to_hex().to_string();
+        if got != attempt.raw_tx_blake3 {
+            return Err(OutboxError::InvalidId(format!(
+                "broadcast raw tx hash mismatch for {}",
+                entry.staged.id
+            )));
+        }
+        Ok(raw)
+    }
+
+    pub fn remove_broadcast_raw_tx(
+        &self,
+        entry: &OutboxEntry,
+        kind: BroadcastAttemptKind,
+    ) -> Result<(), OutboxError> {
+        let path = entry.dir.join(kind.raw_name());
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn broadcast_attempts_for_nonce(
+        &self,
+        query: SameNonceAttemptQuery<'_>,
+    ) -> Result<Vec<(String, OutboxState, BroadcastAttemptKind, BroadcastAttempt)>, OutboxError>
+    {
+        let mut out = Vec::new();
+        for state in [OutboxState::Pending, OutboxState::Sent, OutboxState::Failed] {
+            let dir = self.state_dir(query.wallet, query.chain, state)?;
+            if !dir.exists() {
+                continue;
+            }
+            for entry in fs::read_dir(&dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let id = entry.file_name().to_string_lossy().to_string();
+                for kind in BroadcastAttemptKind::ALL {
+                    if id == query.excluding_id && kind == query.excluding_kind {
+                        continue;
+                    }
+                    let path = entry.path().join(kind.marker_name());
+                    if !path.exists() {
+                        continue;
+                    }
+                    let attempt: BroadcastAttempt = serde_json::from_slice(&fs::read(path)?)?;
+                    if attempt.chain_id == query.chain_id
+                        && attempt.nonce == query.nonce
+                        && attempt.from.eq_ignore_ascii_case(query.from)
+                    {
+                        out.push((id.clone(), state, kind, attempt));
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Return the highest nonce among all `pending/<wallet>/<chain>/<id>/intent.json`
@@ -359,6 +538,11 @@ impl Outbox {
             fs::remove_dir_all(&target)?;
         }
         fs::rename(&entry.dir, &target)?;
+        if matches!(new_state, OutboxState::Sent | OutboxState::Failed) {
+            for kind in BroadcastAttemptKind::ALL {
+                let _ = fs::remove_file(target.join(kind.raw_name()));
+            }
+        }
         Ok(target)
     }
 
@@ -450,7 +634,7 @@ impl Outbox {
     }
 
     pub fn cancel(&self, wallet: &str, chain: &str, id: &str) -> Result<(), OutboxError> {
-        let entry = self.read(wallet, chain, id)?;
+        let entry = self.read_in_state(wallet, chain, id, OutboxState::Pending)?;
         let mut staged = entry.staged.clone();
         staged.status = TxStatus::Cancelled;
         let entry = OutboxEntry {
@@ -699,6 +883,149 @@ mod tests {
         let _new_dir = ob.transition(&entry, OutboxState::Sent).unwrap();
         let after = ob.read("alice", "anvil", "a").unwrap();
         assert_eq!(after.state, OutboxState::Sent);
+    }
+
+    #[test]
+    fn artefact_survives_transition_to_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let staged = fake_staged("art");
+        ob.write_pending(&staged, "# plan").unwrap();
+        let entry = ob.read("alice", "anvil", "art").unwrap();
+        ob.write_artefact(&entry.dir, "review_intent.json", b"{\"title\":\"x\"}")
+            .unwrap();
+        // pending → sent renames the dir; the artifact must ride along.
+        ob.transition(&entry, OutboxState::Sent).unwrap();
+        let sent_dir = ob.sent_dir("alice", "anvil", "art").unwrap();
+        let body = std::fs::read(sent_dir.join("review_intent.json")).unwrap();
+        assert_eq!(body, b"{\"title\":\"x\"}");
+    }
+
+    #[test]
+    fn broadcast_attempt_and_raw_tx_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let staged = fake_staged("attempt");
+        ob.write_pending(&staged, "# plan").unwrap();
+        let entry = ob.read("alice", "anvil", "attempt").unwrap();
+        let raw = b"\x02\xc0";
+        let attempt = BroadcastAttempt {
+            schema: "bloom.broadcast_attempted.v1".into(),
+            tx_hash: "0xabababababababababababababababababababababababababababababababab".into(),
+            raw_tx_blake3: blake3::hash(raw).to_hex().to_string(),
+            raw_tx_path: BroadcastAttemptKind::Confirm.raw_name().into(),
+            from: staged.from.clone(),
+            to: staged.to.clone(),
+            nonce: staged.nonce,
+            chain_id: staged.chain_id,
+            created_ms: 1,
+            transport: BroadcastTransport::PublicRpc,
+            private_provider: None,
+        };
+
+        ob.write_broadcast_raw_tx(&entry, BroadcastAttemptKind::Confirm, raw)
+            .unwrap();
+        ob.write_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm, &attempt)
+            .unwrap();
+
+        let read = ob
+            .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.tx_hash, attempt.tx_hash);
+        let read_raw = ob
+            .read_broadcast_raw_tx(&entry, BroadcastAttemptKind::Confirm, &read)
+            .unwrap();
+        assert_eq!(read_raw, raw);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(entry.dir.join("raw_tx"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn broadcast_raw_tx_is_removed_on_transition() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let staged = fake_staged("raw-cleanup");
+        ob.write_pending(&staged, "# plan").unwrap();
+        let entry = ob.read("alice", "anvil", "raw-cleanup").unwrap();
+        ob.write_broadcast_raw_tx(&entry, BroadcastAttemptKind::Confirm, b"\x01")
+            .unwrap();
+        ob.transition(&entry, OutboxState::Sent).unwrap();
+        let sent_dir = ob.sent_dir("alice", "anvil", "raw-cleanup").unwrap();
+        assert!(!sent_dir.join("raw_tx").exists());
+    }
+
+    #[test]
+    fn outbox_cancel_local_discard_does_not_write_broadcast_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        ob.write_pending(&fake_staged("local-cancel"), "p").unwrap();
+        ob.cancel("alice", "anvil", "local-cancel").unwrap();
+        let entry = ob.read("alice", "anvil", "local-cancel").unwrap();
+        assert_eq!(entry.state, OutboxState::Failed);
+        assert!(!entry.dir.join("broadcast_attempted.json").exists());
+        assert!(!entry.dir.join("raw_tx").exists());
+    }
+
+    #[test]
+    fn outbox_cancel_local_discard_requires_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        ob.write_pending(&fake_staged("sent-cancel"), "p").unwrap();
+        let entry = ob.read("alice", "anvil", "sent-cancel").unwrap();
+        ob.transition(&entry, OutboxState::Sent).unwrap();
+
+        let err = ob.cancel("alice", "anvil", "sent-cancel").unwrap_err();
+        assert!(matches!(err, OutboxError::StateMismatch { .. }));
+        let entry = ob.read("alice", "anvil", "sent-cancel").unwrap();
+        assert_eq!(entry.state, OutboxState::Sent);
+    }
+
+    #[test]
+    fn broadcast_attempts_for_nonce_finds_other_kind_same_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let staged = fake_staged("same-id");
+        ob.write_pending(&staged, "# plan").unwrap();
+        let entry = ob.read("alice", "anvil", "same-id").unwrap();
+        let attempt = BroadcastAttempt {
+            schema: "bloom.broadcast_attempted.v1".into(),
+            tx_hash: "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd".into(),
+            raw_tx_blake3: blake3::hash(b"x").to_hex().to_string(),
+            raw_tx_path: BroadcastAttemptKind::Replacement.raw_name().into(),
+            from: staged.from.clone(),
+            to: staged.to.clone(),
+            nonce: staged.nonce,
+            chain_id: staged.chain_id,
+            created_ms: 1,
+            transport: BroadcastTransport::PublicRpc,
+            private_provider: None,
+        };
+        ob.write_broadcast_attempt(&entry, BroadcastAttemptKind::Replacement, &attempt)
+            .unwrap();
+
+        let hits = ob
+            .broadcast_attempts_for_nonce(SameNonceAttemptQuery {
+                wallet: "alice",
+                chain: "anvil",
+                from: &staged.from,
+                chain_id: staged.chain_id,
+                nonce: staged.nonce,
+                excluding_id: "same-id",
+                excluding_kind: BroadcastAttemptKind::Confirm,
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].2, BroadcastAttemptKind::Replacement);
     }
 
     #[test]
