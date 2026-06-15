@@ -1507,7 +1507,11 @@ async fn run(cli: Cli) -> Result<()> {
             run_petals(home, cmd).await
         }
         Cmd::Chain(cmd) => {
-            let _home_permit = HomeWritePermit::acquire(&home)?;
+            let _home_permit = if cmd.requires_home_write_lock() {
+                Some(HomeWritePermit::acquire(&home)?)
+            } else {
+                None
+            };
             commands::chain::run_chain(&home, cmd).await
         }
         Cmd::Pipe {

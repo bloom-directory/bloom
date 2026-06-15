@@ -258,6 +258,18 @@ pub enum ChainCmd {
     },
 }
 
+impl ChainCmd {
+    pub fn requires_home_write_lock(&self) -> bool {
+        matches!(
+            self,
+            ChainCmd::Init { .. }
+                | ChainCmd::Keygen { .. }
+                | ChainCmd::RunValidator { .. }
+                | ChainCmd::Testnet { .. }
+        )
+    }
+}
+
 /// `bloom chain query ...` subcommands.
 #[derive(Subcommand, Debug)]
 pub enum QueryCmd {

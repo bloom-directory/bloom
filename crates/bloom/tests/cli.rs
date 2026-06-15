@@ -294,6 +294,32 @@ fn serve_refuses_when_home_write_lock_is_live() {
 }
 
 #[test]
+fn chain_health_does_not_take_home_write_lock() {
+    let home = fresh_home();
+    let _permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(home.path()))
+        .expect("hold home write permit");
+
+    bloom_cmd(home.path())
+        .args(["chain", "health"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already open for writing").not());
+}
+
+#[test]
+fn chain_ls_validators_does_not_take_home_write_lock() {
+    let home = fresh_home();
+    let _permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(home.path()))
+        .expect("hold home write permit");
+
+    bloom_cmd(home.path())
+        .args(["chain", "ls-validators"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already open for writing").not());
+}
+
+#[test]
 fn wallet_new_then_list_round_trip() {
     let home = fresh_home();
     let create = bloom_cmd(home.path())
