@@ -93,14 +93,18 @@ const TX_TIMEOUT: Duration = Duration::from_secs(60);
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker-compose stack; run via scripts/test-docker-petal-dex.sh"]
 async fn docker_petal_dex_acceptance() -> Result<()> {
-    require_docker_harness("docker_petal_dex_acceptance")?;
+    if !require_docker_harness("docker_petal_dex_acceptance") {
+        return Ok(());
+    }
     Box::pin(docker_petal_dex_acceptance_inner(false)).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker-compose stack; run via scripts/test-docker-petal-vfs.sh"]
 async fn docker_petal_vfs_acceptance() -> Result<()> {
-    require_docker_harness("docker_petal_vfs_acceptance")?;
+    if !require_docker_harness("docker_petal_vfs_acceptance") {
+        return Ok(());
+    }
     Box::pin(docker_petal_dex_acceptance_inner(true)).await
 }
 
@@ -115,12 +119,12 @@ fn prints_ptb_signer_registry_entry_for_docker_script() {
     );
 }
 
-fn require_docker_harness(test_name: &str) -> Result<()> {
+fn require_docker_harness(test_name: &str) -> bool {
     if std::env::var_os("BLOOM_DOCKER_TMPDIR").is_none() {
         eprintln!("skipping {test_name}: run via scripts/test-docker-petal-dex.sh");
-        return Ok(());
+        return false;
     }
-    Ok(())
+    true
 }
 
 async fn docker_petal_dex_acceptance_inner(vfs_only: bool) -> Result<()> {

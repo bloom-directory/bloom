@@ -109,6 +109,42 @@ fn anvil_chain_spec(rpc_url: &str) -> ChainSpec {
     spec
 }
 
+fn write_review_artifacts(
+    outbox: &Outbox,
+    wallet: &str,
+    chain: &str,
+    id: &str,
+    kind: &str,
+) -> Result<String> {
+    let entry = outbox.read(wallet, chain, id)?;
+    let intent = bloom_proto::CeremonyIntent::new(
+        wallet,
+        "Approve anvil Transaction",
+        bloom_proto::CeremonyIntentKind::EvmTransaction,
+    )
+    .subject(serde_json::json!({
+        "kind": kind,
+        "wallet": wallet,
+        "chain": chain,
+        "outbox_id": id,
+    }));
+    let review_hash = intent.intent_hash();
+    outbox.write_artefact(
+        &entry.dir,
+        "review_intent.json",
+        &serde_json::to_vec_pretty(&intent)?,
+    )?;
+    outbox.write_artefact(
+        &entry.dir,
+        "review_approved.json",
+        &serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "bloom.review_approved.v1",
+            "intent_hash": review_hash,
+        }))?,
+    )?;
+    Ok(review_hash)
+}
+
 /// Stage an ERC-20 transfer to a hardcoded token symbol that resolves
 /// to the canonical mainnet address. On a fresh anvil there is no code
 /// at that address, so `decimals()` returns empty and stage fails with
@@ -212,6 +248,13 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
         .ok_or_else(|| anyhow!("missing max_fee_per_gas"))?
         .parse()?;
 
+    let confirm_review_hash = write_review_artifacts(
+        &engine.outbox,
+        "alice",
+        "anvil",
+        &staged.id,
+        "outbox_confirm",
+    )?;
     let confirmed = engine
         .confirm(
             &permit,
@@ -222,13 +265,20 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
             &signer,
             &Policy::permissive(),
             "y",
-            None,
+            Some(&confirm_review_hash),
         )
         .await
         .map_err(|e| anyhow!("confirm: {e}"))?;
     assert!(confirmed.tx_hash.is_some(), "confirm produced no tx hash");
 
     // Replace with +15% fees.
+    let replace_review_hash = write_review_artifacts(
+        &engine.outbox,
+        "alice",
+        "anvil",
+        &staged.id,
+        "outbox_replace",
+    )?;
     let replaced = engine
         .replace(
             &permit,
@@ -239,7 +289,7 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
             &signer,
             15,
             &Policy::permissive(),
-            None,
+            Some(&replace_review_hash),
         )
         .await
         .map_err(|e| anyhow!("replace: {e}"))?;

@@ -12,12 +12,13 @@
 //! Requires the `anvil` and `cast` binaries from Foundry to be available
 //! at `~/.foundry/bin/{anvil,cast}` (or on `$PATH`).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use bloom_daemon::Daemon;
 use bloom_it::{cast_send, spawn_anvil};
-use bloom_proto::{ChainSpec, Config, HomeDir};
+use bloom_proto::{ChainSpec, Config, HomeDir, HomeWritePermit};
 use bloom_vfs::VfsPath;
 use bloom_vfs::handler::Handler;
 use tokio::time::sleep;
@@ -65,7 +66,8 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     let home_root = tmp.path().to_path_buf();
     write_config(&home_root, &rpc_url)?;
     let home = HomeDir::at(&home_root);
-    let daemon = Daemon::from_home(home).map_err(|e| anyhow!("daemon: {e}"))?;
+    let permit = Arc::new(HomeWritePermit::acquire(&home)?);
+    let daemon = Daemon::from_home_with_permit(home, permit).map_err(|e| anyhow!("daemon: {e}"))?;
 
     // 3. Create a wallet via the keystore.
     let passphrase = "integration-test-pass";
@@ -151,7 +153,10 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     let _: serde_json::Value =
         serde_json::from_slice(&policy_bytes).context("policy_check.json must be valid JSON")?;
 
-    // 8. Unlock the wallet, then write `confirm` to broadcast.
+    // 8. Unlock the wallet, persist a synthetic reviewed intent, then write
+    // `confirm` to broadcast. The real CLI writes these artifacts after the
+    // browser/passkey review; the test bypasses UI but still exercises the
+    // fresh-review authorization gate.
     daemon
         .keystore
         .unlock("alice", passphrase)
@@ -160,9 +165,39 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
         "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/confirm"
     ))
     .unwrap();
+    let review_intent = bloom_proto::CeremonyIntent::new(
+        "alice",
+        "Approve anvil Transaction",
+        bloom_proto::CeremonyIntentKind::EvmTransaction,
+    )
+    .subject(serde_json::json!({
+        "kind": "outbox_confirm",
+        "wallet": "alice",
+        "chain": "anvil",
+        "outbox_id": pending_id,
+    }));
+    let review_hash = review_intent.intent_hash();
+    let pending_outbox_dir = home_root
+        .join("outbox")
+        .join("alice")
+        .join("anvil")
+        .join("pending")
+        .join(&pending_id);
+    std::fs::write(
+        pending_outbox_dir.join("review_intent.json"),
+        serde_json::to_vec_pretty(&review_intent)?,
+    )?;
+    std::fs::write(
+        pending_outbox_dir.join("review_approved.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "bloom.review_approved.v1",
+            "intent_hash": review_hash,
+        }))?,
+    )?;
+    let confirm_body = format!("y\nreview_hash={review_hash}\n");
     daemon
         .vfs
-        .write(&confirm_path, b"y")
+        .write(&confirm_path, confirm_body.as_bytes())
         .await
         .map_err(|e| anyhow!("confirm write: {e}"))?;
 
