@@ -2960,11 +2960,11 @@ async fn exercise_live_petal_vfs_mount(
         sleep(Duration::from_millis(250)).await;
     }
 
-    let direct = direct_petal_vfs_answer(&short_home)?;
-    let argv = run_mounted_petal_endpoint(&answer_endpoint, &short_home, &rpc, &path_env, None)?;
+    let direct = direct_petal_vfs_answer(home)?;
+    let argv = run_mounted_petal_endpoint(&answer_endpoint, home, &rpc, &path_env, None)?;
     let stdin = run_mounted_petal_endpoint(
         &answer_endpoint,
-        &short_home,
+        home,
         &rpc,
         &path_env,
         Some(serde_json::json!({
@@ -3041,11 +3041,11 @@ async fn exercise_live_petal_vfs_mount(
         bail!("VFS counter was not shared after create: {counter}");
     }
 
-    let direct_before = direct_petal_vfs_counter_value(&short_home, &counter_id)?;
+    let direct_before = direct_petal_vfs_counter_value(home, &counter_id)?;
     eprintln!("[petals-vfs] reading mounted counter before mutation");
     let mounted_before = run_mounted_petal_endpoint(
         &counter_endpoint,
-        &short_home,
+        home,
         &rpc,
         &path_env,
         Some(serde_json::json!({
@@ -3068,7 +3068,7 @@ async fn exercise_live_petal_vfs_mount(
     .to_string();
     let set_receipt = run_mounted_petal_endpoint_with_args(
         &set_counter_endpoint,
-        &short_home,
+        home,
         &rpc,
         &path_env,
         &["--arg".to_string(), counter_arg],
@@ -3087,11 +3087,11 @@ async fn exercise_live_petal_vfs_mount(
     let latest = current_height(&clients[0]).await?;
     wait_all_reach_height(clients, latest).await?;
 
-    let direct_after = direct_petal_vfs_counter_value(&short_home, &counter_id)?;
+    let direct_after = direct_petal_vfs_counter_value(home, &counter_id)?;
     eprintln!("[petals-vfs] reading mounted counter after mutation");
     let mounted_after = run_mounted_petal_endpoint(
         &counter_endpoint,
-        &short_home,
+        home,
         &rpc,
         &path_env,
         Some(serde_json::json!({
@@ -3118,7 +3118,7 @@ async fn exercise_live_petal_vfs_mount(
     );
     let pipe_success = run_mounted_petal_endpoint_raw_stdin(
         &pipe_endpoint,
-        &short_home,
+        home,
         &rpc,
         &path_env,
         &[
@@ -3142,7 +3142,7 @@ async fn exercise_live_petal_vfs_mount(
 
     let mounted_after_pipe = run_mounted_petal_endpoint(
         &counter_endpoint,
-        &short_home,
+        home,
         &rpc,
         &path_env,
         Some(serde_json::json!({
@@ -3205,7 +3205,7 @@ async fn exercise_live_petal_vfs_mount(
     );
     let pipe_revert = run_mounted_petal_endpoint_raw_stdin(
         &pipe_endpoint,
-        &short_home,
+        home,
         &rpc,
         &path_env,
         &[
@@ -3228,7 +3228,7 @@ async fn exercise_live_petal_vfs_mount(
     wait_all_reach_height(clients, latest).await?;
     let mounted_after_revert_pipe = run_mounted_petal_endpoint(
         &counter_endpoint,
-        &short_home,
+        home,
         &rpc,
         &path_env,
         Some(serde_json::json!({
