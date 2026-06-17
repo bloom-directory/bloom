@@ -61,6 +61,12 @@ impl RequestsHandler {
         Ok(())
     }
 
+    fn latest_target(&self) -> String {
+        self.read_latest()
+            .map(|(s, i)| format!("{s}/{i}"))
+            .unwrap_or_else(|_| "pending".into())
+    }
+
     fn read_latest(&self) -> Result<(String, String), HandlerError> {
         let raw = fs::read_to_string(self.latest_path())
             .map_err(|_| HandlerError::NotFound("/requests/latest".into()))?;
@@ -93,8 +99,14 @@ impl RequestsHandler {
         let text = std::str::from_utf8(input)
             .map_err(|_| HandlerError::invalid("request input must be UTF-8"))?;
         let request = parse_request(text)?;
-        let wallet = self.select_wallet(request.wallet.as_deref())?;
         let id = new_request_id();
+        let wallet = match self.select_wallet(request.wallet.as_deref()) {
+            Ok(wallet) => wallet,
+            Err(err) => {
+                self.write_failed_request(&id, &request, "", &err.to_string())?;
+                return Ok(id);
+            }
+        };
         let host = request.url.host_str().unwrap_or("unknown").to_string();
 
         let mut req = self.client.request(
@@ -298,6 +310,26 @@ impl RequestsHandler {
         Ok(total)
     }
 
+    fn write_failed_request(
+        &self,
+        id: &str,
+        request: &ParsedRequest,
+        wallet: &str,
+        error: &str,
+    ) -> Result<(), HandlerError> {
+        let dir = self.req_dir("failed", id);
+        fs::create_dir_all(dir.join("response"))?;
+        write_request_artifacts(&dir, request, wallet, "failed")?;
+        fs::write(dir.join("status"), b"failed\n")?;
+        fs::write(dir.join("error.txt"), format!("{error}\n"))?;
+        write_json(
+            dir.join("audit.json"),
+            &json!({"request_id": id, "event": "failed", "error": error, "reads_spent": false}),
+        )?;
+        self.write_latest("failed", id)?;
+        Ok(())
+    }
+
     fn confirm(&self, id: &str, data: &[u8]) -> Result<(), HandlerError> {
         let value = String::from_utf8_lossy(data).trim().to_ascii_lowercase();
         let pending = self.req_dir("pending", id);
@@ -356,14 +388,8 @@ impl Handler for RequestsHandler {
         let segs = path.segments();
         match segs {
             [] => Ok(Entry::dir("requests")),
-            [one] if one == "new" => Ok(Entry::writable_file("new")),
-            [one] if one == "latest" => Ok(Entry::symlink(
-                "latest",
-                &self
-                    .read_latest()
-                    .map(|(s, i)| format!("{s}/{i}"))
-                    .unwrap_or_else(|_| "pending".into()),
-            )),
+            [one] if one == "new" || one == "new.dry-run" => Ok(Entry::writable_file(one)),
+            [one] if one == "latest" => Ok(Entry::symlink("latest", &self.latest_target())),
             [one] if matches!(one.as_str(), "pending" | "sent" | "failed" | "sessions") => {
                 Ok(Entry::dir(one))
             }
@@ -393,7 +419,8 @@ impl Handler for RequestsHandler {
         match segs {
             [] => Ok(vec![
                 Entry::writable_file("new"),
-                Entry::symlink("latest", "pending/latest"),
+                Entry::writable_file("new.dry-run"),
+                Entry::symlink("latest", &self.latest_target()),
                 Entry::dir("pending"),
                 Entry::dir("sent"),
                 Entry::dir("failed"),
@@ -433,11 +460,19 @@ impl Handler for RequestsHandler {
             [state, id, name] if matches!(state.as_str(), "pending" | "sent" | "failed") => {
                 fs::read(self.req_dir(state, id).join(name)).map_err(Into::into)
             }
+            [reference, name] => {
+                let (state, id) = self.resolve_ref(reference)?;
+                fs::read(self.req_dir(&state, &id).join(name)).map_err(Into::into)
+            }
             [state, id, response, name]
                 if matches!(state.as_str(), "pending" | "sent" | "failed")
                     && response == "response" =>
             {
                 fs::read(self.req_dir(state, id).join("response").join(name)).map_err(Into::into)
+            }
+            [reference, response, name] if response == "response" => {
+                let (state, id) = self.resolve_ref(reference)?;
+                fs::read(self.req_dir(&state, &id).join("response").join(name)).map_err(Into::into)
             }
             [state, id, name] if state == "sessions" => {
                 fs::read(self.requests_root().join("sessions").join(id).join(name))
@@ -450,8 +485,8 @@ impl Handler for RequestsHandler {
     async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
         let segs = path.segments();
         match segs {
-            [one] if one == "new" => {
-                self.create_request(data, false).await?;
+            [one] if one == "new" || one == "new.dry-run" => {
+                self.create_request(data, one == "new.dry-run").await?;
                 Ok(())
             }
             [reference, action] if action == "confirm" => {
@@ -1059,14 +1094,107 @@ fn new_request_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::path::VfsPath;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    struct Fixture {
+        _tmp: tempfile::TempDir,
+        handler: RequestsHandler,
+    }
+
+    fn fixture(default_wallet: Option<&str>) -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let keystore = Keystore::new(tmp.path().join("keystore")).unwrap();
+        keystore.create_local("alice", "pw").unwrap();
+        Fixture {
+            handler: RequestsHandler::new(
+                tmp.path().join("home"),
+                keystore,
+                default_wallet.map(str::to_string),
+            ),
+            _tmp: tmp,
+        }
+    }
+
+    async fn mock_server(
+        status: u16,
+        headers: &[(&str, &str)],
+        body: &'static [u8],
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_for_task = count.clone();
+        let header_lines = headers
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}\r\n"))
+            .collect::<String>();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                count_for_task.fetch_add(1, Ordering::SeqCst);
+                let header_lines = header_lines.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let reason = if status == 402 {
+                        "Payment Required"
+                    } else {
+                        "OK"
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\n{header_lines}\r\n",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    socket.write_all(body).await.unwrap();
+                });
+            }
+        });
+        (format!("http://{addr}/resource"), count)
+    }
 
     #[test]
-    fn parses_one_line_with_attrs() {
+    fn parses_one_line_toml_and_http_message_forms() {
         let req =
             parse_request("GET https://example.com/a wallet=research max_amount_usd=0.05").unwrap();
         assert_eq!(req.method, "GET");
         assert_eq!(req.wallet.as_deref(), Some("research"));
         assert_eq!(req.max_amount_usd, Some(0.05));
+
+        let req = parse_request(
+            r#"method = "POST"
+url = "https://api.example.com/inference"
+wallet = "research"
+max_amount_usd = "0.05"
+
+[headers]
+content-type = "application/json"
+
+[body]
+inline = '{"prompt":"hi"}'
+"#,
+        )
+        .unwrap();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.wallet.as_deref(), Some("research"));
+        assert_eq!(req.headers["content-type"], "application/json");
+        assert_eq!(req.body.as_deref(), Some(r#"{"prompt":"hi"}"#));
+
+        let req = parse_request(
+            "POST https://api.example.com/inference\ncontent-type: application/json\n\n{\"prompt\":\"hi\"}",
+        )
+        .unwrap();
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.headers["content-type"], "application/json");
+        assert_eq!(req.body.as_deref(), Some(r#"{"prompt":"hi"}"#));
     }
 
     #[test]
@@ -1187,5 +1315,121 @@ mod tests {
                 .iter()
                 .any(|c| c.rule == "caps.require_confirm_above_usd" && c.result == "warn")
         );
+    #[tokio::test]
+    async fn free_request_moves_to_sent_and_reads_body_receipt_without_http_side_effects() {
+        let f = fixture(Some("alice"));
+        let (url, hits) = mock_server(200, &[("content-type", "text/plain")], b"hello\n").await;
+        let id = f
+            .handler
+            .create_request(format!("GET {url}").as_bytes(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            f.handler.read_latest().unwrap(),
+            ("sent".into(), id.clone())
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            f.handler
+                .read(&VfsPath::parse(&format!("/sent/{id}/response/body")).unwrap())
+                .await
+                .unwrap(),
+            b"hello\n"
+        );
+        assert_eq!(
+            f.handler
+                .read(&VfsPath::parse(&format!("/{id}/response/body")).unwrap())
+                .await
+                .unwrap(),
+            b"hello\n"
+        );
+        let receipt = String::from_utf8(
+            f.handler
+                .read(&VfsPath::parse(&format!("/{id}/receipt.json")).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(receipt.contains("\"protocol\": \"free\""));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "reads must not re-issue HTTP"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_paid_request_stages_pending_plan_and_cancel_moves_failed() {
+        let f = fixture(Some("alice"));
+        let body = br#"{"accepts":[{"network":"base","asset":"USDC","maxAmountRequired":"1000"}]}"#;
+        let (url, _hits) = mock_server(402, &[("x-payment-required", "1")], body).await;
+        f.handler
+            .write(
+                &VfsPath::parse("/new.dry-run").unwrap(),
+                format!("GET {url}").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (state, id) = f.handler.read_latest().unwrap();
+        assert_eq!(state, "pending");
+        let plan = String::from_utf8(
+            f.handler
+                .read(&VfsPath::parse("/latest/plan.md").unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(plan.contains("Dry run: true"));
+        assert!(plan.contains("Payment method: paid_http:x402/one_time"));
+        f.handler
+            .write(
+                &VfsPath::parse(&format!("/pending/{id}/cancel")).unwrap(),
+                b"y",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            f.handler.read_latest().unwrap(),
+            ("failed".into(), id.clone())
+        );
+        let error = String::from_utf8(
+            f.handler
+                .read(&VfsPath::parse(&format!("/failed/{id}/error.txt")).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(error.contains("cancelled by user"));
+    }
+
+    #[tokio::test]
+    async fn multiple_wallet_without_default_creates_failed_request_before_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keystore = Keystore::new(tmp.path().join("keystore")).unwrap();
+        keystore.create_local("alice", "pw").unwrap();
+        keystore.create_local("bob", "pw").unwrap();
+        let handler = RequestsHandler::new(tmp.path().join("home"), keystore, None);
+        let (url, hits) = mock_server(200, &[], b"should-not-be-fetched").await;
+
+        let id = handler
+            .create_request(format!("GET {url}").as_bytes(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            handler.read_latest().unwrap(),
+            ("failed".into(), id.clone())
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        let error = String::from_utf8(
+            handler
+                .read(&VfsPath::parse(&format!("/failed/{id}/error.txt")).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(error.contains("multiple wallets are available"));
+        assert!(error.contains("alice"));
+        assert!(error.contains("bob"));
     }
 }

@@ -8,7 +8,13 @@
 //! in-process `IpcServer` to verify the "socket exists → route via IPC"
 //! branch in the CLI's vfs subcommand.
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::Path;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 use assert_cmd::Command;
@@ -28,6 +34,41 @@ fn bloom_cmd(home: &Path) -> Command {
 
 fn fresh_home() -> TempDir {
     tempfile::tempdir().expect("create temp home")
+}
+
+fn http_fixture(
+    status: u16,
+    headers: &[(&str, &str)],
+    body: &'static [u8],
+) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock HTTP server");
+    let addr = listener.local_addr().expect("mock server addr");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_for_thread = hits.clone();
+    let header_lines = headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .collect::<String>();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            hits_for_thread.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf);
+            let reason = if status == 402 {
+                "Payment Required"
+            } else {
+                "OK"
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\n{header_lines}\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+        }
+    });
+    (format!("http://{addr}/resource"), hits)
 }
 
 #[test]
@@ -384,6 +425,55 @@ fn wallet_new_via_env_passphrase() {
     assert!(
         bob_dir.join("encrypted.key").exists(),
         "expected keystore/bob/encrypted.key to be written"
+    );
+}
+
+#[test]
+fn request_cli_dry_run_uses_vfs_lifecycle_and_body_receipt_helpers() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args(["wallet", "new", "alice"])
+        .env("BLOOM_PASSPHRASE", "pw")
+        .assert()
+        .success();
+
+    let (url, hits) = http_fixture(200, &[("content-type", "text/plain")], b"cli-body\n");
+    let new = bloom_cmd(home.path())
+        .args(["request", "new", "--dry-run", &format!("GET {url}")])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("request: sent/"))
+        .stdout(predicate::str::contains("dry_run: true"))
+        .get_output()
+        .stdout
+        .clone();
+    let new = String::from_utf8(new).unwrap();
+    let id = new
+        .lines()
+        .find_map(|line| line.strip_prefix("request: sent/"))
+        .expect("request id in request new output")
+        .trim()
+        .to_string();
+
+    bloom_cmd(home.path())
+        .args(["request", "plan", "latest"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Dry run: true"));
+    bloom_cmd(home.path())
+        .args(["request", "body", &id])
+        .assert()
+        .success()
+        .stdout(predicate::eq("cli-body\n"));
+    bloom_cmd(home.path())
+        .args(["request", "receipt", &id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"protocol\": \"free\""));
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "read helpers must not re-issue HTTP"
     );
 }
 
