@@ -126,6 +126,24 @@ fn build_write_daemon(home: HomeDir) -> Result<(Arc<HomeWritePermit>, Daemon)> {
     Ok((permit, daemon))
 }
 
+fn set_default_wallet_if_empty(home: &HomeDir, wallet: &str) -> Result<bool> {
+    let path = home.config_path();
+    let mut cfg = bloom_proto::Config::load_or_init(&path)
+        .with_context(|| format!("load config {}", path.display()))?;
+    if cfg
+        .default_wallet
+        .as_deref()
+        .is_none_or(|w| w.trim().is_empty())
+    {
+        cfg.default_wallet = Some(wallet.to_string());
+        cfg.save(&path)
+            .with_context(|| format!("save config {}", path.display()))?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "bloom",
@@ -164,6 +182,9 @@ enum Cmd {
     /// Wallet management.
     #[command(subcommand)]
     Wallet(WalletCmd),
+    /// Paid/free HTTP requests via the `/requests` VFS surface.
+    #[command(subcommand)]
+    Request(RequestCmd),
     /// Run the daemon as a long-lived process.
     Serve {
         /// IPC endpoint to bind.
@@ -492,6 +513,29 @@ enum BuilderKeysCmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum RequestCmd {
+    /// Create a request from one-line, TOML, or HTTP-message-like input.
+    New {
+        /// Request text, e.g. `GET https://example.com/data`.
+        request: String,
+        /// Paying wallet. If omitted, config.default_wallet or the only wallet is used.
+        #[arg(long)]
+        wallet: Option<String>,
+        /// Stage/probe only; never spends or signs.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show the staged payment plan for an id or `latest`.
+    Plan { id: String },
+    /// Confirm a pending paid request.
+    Confirm { id: String },
+    /// Print response body for an id or `latest`.
+    Body { id: String },
+    /// Print receipt JSON for an id or `latest`.
+    Receipt { id: String },
+}
+
+#[derive(Subcommand, Debug)]
 enum WalletCmd {
     /// Create a new wallet. Pass `--passkey` for a browser WebAuthn ceremony;
     /// defaults to passphrase-encrypted local wallet.
@@ -734,6 +778,10 @@ async fn run(cli: Cli) -> Result<()> {
             println!("chains: {:?}", d.chains.list_names());
             println!("default_chain: {}", d.config.default_chain);
             println!(
+                "default_wallet: {}",
+                d.config.default_wallet.as_deref().unwrap_or("<none>")
+            );
+            println!(
                 "block_mainnet_broadcast: {}",
                 d.config.block_mainnet_broadcast
             );
@@ -938,6 +986,63 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Request(RequestCmd::New {
+            request,
+            wallet,
+            dry_run,
+        }) => {
+            let (_home_permit, d) = build_write_daemon(home)?;
+            let mut body = request;
+            if let Some(wallet) = wallet {
+                body.push(' ');
+                body.push_str(&format!("wallet={wallet}"));
+            }
+            d.vfs
+                .write(&VfsPath::parse("/requests/new")?, body.as_bytes())
+                .await
+                .context("request new")?;
+            let latest = d
+                .vfs
+                .read(&VfsPath::parse("/requests/latest")?)
+                .await
+                .context("read latest request")?;
+            let latest = String::from_utf8_lossy(&latest);
+            println!("request: {}", latest.trim());
+            if dry_run {
+                println!("dry_run: true (unpaid probe/staging only; no spend/signing)");
+            }
+            Ok(())
+        }
+        Cmd::Request(RequestCmd::Plan { id }) => {
+            let d = Daemon::from_home(home).context("build daemon")?;
+            let path = VfsPath::parse(&format!("/requests/{id}/plan.md"))?;
+            let bytes = d.vfs.read(&path).await.context("request plan")?;
+            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+            Ok(())
+        }
+        Cmd::Request(RequestCmd::Confirm { id }) => {
+            let (_home_permit, d) = build_write_daemon(home)?;
+            let path = VfsPath::parse(&format!("/requests/{id}/confirm"))?;
+            d.vfs
+                .write(&path, b"confirm")
+                .await
+                .context("request confirm")?;
+            Ok(())
+        }
+        Cmd::Request(RequestCmd::Body { id }) => {
+            let d = Daemon::from_home(home).context("build daemon")?;
+            let path = VfsPath::parse(&format!("/requests/{id}/response/body"))?;
+            let bytes = d.vfs.read(&path).await.context("request body")?;
+            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+            Ok(())
+        }
+        Cmd::Request(RequestCmd::Receipt { id }) => {
+            let d = Daemon::from_home(home).context("build daemon")?;
+            let path = VfsPath::parse(&format!("/requests/{id}/receipt.json"))?;
+            let bytes = d.vfs.read(&path).await.context("request receipt")?;
+            std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
+            Ok(())
+        }
         Cmd::Wallet(WalletCmd::New {
             name,
             passkey,
@@ -954,6 +1059,13 @@ async fn run(cli: Cli) -> Result<()> {
                 d.keystore.create_local(&name, pass)?
             };
             println!("created wallet '{}': {}", info.name, info.address);
+            if set_default_wallet_if_empty(&d.home, &info.name)? {
+                println!(
+                    "default_wallet: {} (set in {})",
+                    info.name,
+                    d.home.config_path().display()
+                );
+            }
             if let Some(ref key) = info.recovery_key {
                 acknowledge_recovery_key(&info.name, key);
             }
@@ -976,6 +1088,13 @@ async fn run(cli: Cli) -> Result<()> {
                 d.keystore.import_hex(&name, &private_key, pass)?
             };
             println!("imported wallet '{}': {}", info.name, info.address);
+            if set_default_wallet_if_empty(&d.home, &info.name)? {
+                println!(
+                    "default_wallet: {} (set in {})",
+                    info.name,
+                    d.home.config_path().display()
+                );
+            }
             if let Some(ref key) = info.recovery_key {
                 acknowledge_recovery_key(&info.name, key);
             }

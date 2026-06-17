@@ -37,7 +37,8 @@ use bloom_vfs::handlers::polymarket::{ChainClientReader, PolymarketOnboarding, b
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
     AddressBookHandler, ChainsHandler, DefiHandler, DocsHandler, EnsHandler, PolymarketHandler,
-    PricesHandler, SimulateHandler, StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
+    PricesHandler, RequestsHandler, SimulateHandler, StatusHandler, ToolsHandler, WalletsHandler,
+    WatchHandler,
 };
 use bloom_vfs::tx_handler::PtbSubmitter;
 use bloom_vfs::{HandlerError, PathCache, Vfs};
@@ -477,6 +478,14 @@ impl Daemon {
                 ) as _,
             )
             .mount("tools", Arc::new(ToolsHandler::new()) as _)
+            .mount(
+                "requests",
+                Arc::new(RequestsHandler::new(
+                    home.root().to_path_buf(),
+                    keystore.clone(),
+                    config.default_wallet.clone(),
+                )) as _,
+            )
             .mount("status", status_handler.clone() as _)
             .mount("docs", Arc::new(DocsHandler::new()) as _)
             .mount(
