@@ -126,12 +126,18 @@ impl RequestsHandler {
         if status == 402 {
             let challenge = normalize_challenge(&headers, &body, &request.url);
             let policy = self.wallet_policy(&wallet)?;
+            let spent_24h_usd = self.sum_paid_usd_last_24h(&wallet)?;
             let checks = evaluate_payment_policy(
                 &policy,
-                &host,
-                challenge.asset.as_deref(),
-                challenge.network.as_deref(),
-                challenge.amount_usd,
+                PolicyEvalInput {
+                    host: &host,
+                    asset: challenge.asset.as_deref(),
+                    network: challenge.network.as_deref(),
+                    intent: &challenge.intent,
+                    amount_usd: challenge.amount_usd,
+                    request_max_amount_usd: request.max_amount_usd,
+                    spent_24h_usd,
+                },
             );
             let dir = self.req_dir("pending", &id);
             fs::create_dir_all(dir.join("response"))?;
@@ -243,28 +249,84 @@ impl RequestsHandler {
             .map_err(|e| HandlerError::backend(e.to_string()))
     }
 
+    fn sum_paid_usd_last_24h(&self, wallet: &str) -> Result<f64, HandlerError> {
+        let since = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(24 * 60 * 60);
+        let mut total = 0.0;
+        let sent_root = self.requests_root().join("sent");
+        if !sent_root.exists() {
+            return Ok(total);
+        }
+        for entry in fs::read_dir(sent_root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let dir = entry.path();
+            let modified = entry
+                .metadata()?
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if modified < since {
+                continue;
+            }
+            let Ok(receipt) = read_json::<serde_json::Value>(dir.join("receipt.json")) else {
+                continue;
+            };
+            if receipt.get("wallet").and_then(|v| v.as_str()) != Some(wallet) {
+                continue;
+            }
+            let protocol = receipt
+                .get("protocol")
+                .and_then(|v| v.as_str())
+                .unwrap_or("free");
+            if protocol == "free" {
+                continue;
+            }
+            total += receipt
+                .get("amount_usd")
+                .and_then(json_number)
+                .or_else(|| receipt.get("amount").and_then(json_number))
+                .unwrap_or(0.0);
+        }
+        Ok(total)
+    }
+
     fn confirm(&self, id: &str, data: &[u8]) -> Result<(), HandlerError> {
         let value = String::from_utf8_lossy(data).trim().to_ascii_lowercase();
-        if !matches!(value.as_str(), "y" | "yes" | "confirm" | "override") {
-            return Err(HandlerError::invalid(
-                "confirm accepts y, yes, confirm, or override",
-            ));
-        }
         let pending = self.req_dir("pending", id);
         if !pending.exists() {
             return Err(HandlerError::NotFound(format!("/requests/pending/{id}")));
         }
         let payment: serde_json::Value = read_json(pending.join("payment_method.json"))?;
         let checks: Vec<PolicyCheck> = read_json(pending.join("policy_check.json"))?;
+        let request_meta: serde_json::Value = read_json(pending.join("request.toml"))?;
+        let wallet = request_meta
+            .get("wallet")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| HandlerError::backend("request metadata missing wallet"))?;
+        let policy = self.wallet_policy(wallet)?;
+        let sentinel = policy.override_sentinel().to_ascii_lowercase();
+        if !matches!(value.as_str(), "y" | "yes" | "confirm") && value != sentinel {
+            return Err(HandlerError::invalid(format!(
+                "confirm accepts y, yes, confirm, or policy override sentinel '{sentinel}'"
+            )));
+        }
         if checks.iter().any(|c| c.result == "deny") {
             return Err(HandlerError::invalid(
                 "hard payment policy denial blocks confirmation",
             ));
         }
-        if checks.iter().any(|c| c.result == "warn") && value != "override" {
-            return Err(HandlerError::invalid(
-                "payment policy warning requires override",
-            ));
+        if checks.iter().any(|c| c.result == "warn") && value != sentinel {
+            return Err(HandlerError::invalid(format!(
+                "payment policy warning requires override sentinel '{sentinel}'"
+            )));
         }
         write_json(
             pending.join("credential.json"),
@@ -588,6 +650,20 @@ fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Normalize
                 .and_then(|v| v.as_str())
         })
         .map(str::to_string);
+    let amount_usd = body_json
+        .pointer("/amountUsd")
+        .and_then(json_number)
+        .or_else(|| body_json.pointer("/amount_usd").and_then(json_number))
+        .or_else(|| {
+            body_json
+                .pointer("/accepts/0/amountUsd")
+                .and_then(json_number)
+        })
+        .or_else(|| {
+            body_json
+                .pointer("/accepts/0/amount_usd")
+                .and_then(json_number)
+        });
     NormalizedChallenge {
         protocol: protocol.into(),
         intent: intent.into(),
@@ -596,7 +672,7 @@ fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Normalize
         network,
         asset,
         amount,
-        amount_usd: None,
+        amount_usd,
         headers: header_map,
     }
 }
@@ -616,80 +692,245 @@ struct PolicyCheck {
     detail: String,
 }
 
-fn evaluate_payment_policy(
-    policy: &Policy,
-    host: &str,
-    asset: Option<&str>,
-    network: Option<&str>,
+#[derive(Debug, Clone, Copy)]
+struct PolicyEvalInput<'a> {
+    host: &'a str,
+    asset: Option<&'a str>,
+    network: Option<&'a str>,
+    intent: &'a str,
     amount_usd: Option<f64>,
-) -> Vec<PolicyCheck> {
+    request_max_amount_usd: Option<f64>,
+    spent_24h_usd: f64,
+}
+
+fn evaluate_payment_policy(policy: &Policy, input: PolicyEvalInput<'_>) -> Vec<PolicyCheck> {
     let mut out = Vec::new();
     let payments = &policy.payments;
-    if !payments.enabled {
-        out.push(PolicyCheck {
-            rule: "payments.enabled".into(),
-            result: "deny".into(),
-            detail: "wallet policy has not enabled paid HTTP".into(),
-        });
+    let host = input.host.to_ascii_lowercase();
+    let asset = input.asset;
+    let network = input.network;
+    let amount_usd = input.amount_usd;
+    push_check(
+        &mut out,
+        "payments.enabled",
+        payments.enabled,
+        if payments.enabled {
+            "paid HTTP enabled".into()
+        } else {
+            "wallet policy has not enabled paid HTTP".into()
+        },
+        false,
+    );
+    push_check(
+        &mut out,
+        "payments.require_plan",
+        payments.require_plan,
+        if payments.require_plan {
+            "staged plan is required before confirmation".into()
+        } else {
+            "paid HTTP requires a staged plan before confirmation".into()
+        },
+        false,
+    );
+
+    if contains_ci(&payments.http.deny_hosts, &host) {
+        out.push(deny("payments.http.deny_hosts", format!("{host} denied")));
+    }
+    if !payments.http.allow_hosts.is_empty() && !contains_ci(&payments.http.allow_hosts, &host) {
+        out.push(deny(
+            "payments.http.allow_hosts",
+            format!("{host} not allowed"),
+        ));
+    } else if !payments.http.allow_hosts.is_empty() {
+        out.push(pass("payments.http.allow_hosts", format!("{host} allowed")));
+    }
+
+    if let Some(asset) = asset {
+        if contains_ci(&payments.assets.deny, asset) {
+            out.push(deny("payments.assets.deny", format!("{asset} denied")));
+        }
+        if !payments.assets.allow.is_empty() && !contains_ci(&payments.assets.allow, asset) {
+            out.push(deny(
+                "payments.assets.allow",
+                format!("{asset} not allowed"),
+            ));
+        } else if !payments.assets.allow.is_empty() {
+            out.push(pass("payments.assets.allow", format!("{asset} allowed")));
+        }
+    }
+    if let Some(network) = network {
+        if contains_ci(&payments.networks.deny, network) {
+            out.push(deny("payments.networks.deny", format!("{network} denied")));
+        }
+        if !payments.networks.allow.is_empty() && !contains_ci(&payments.networks.allow, network) {
+            out.push(deny(
+                "payments.networks.allow",
+                format!("{network} not allowed"),
+            ));
+        } else if !payments.networks.allow.is_empty() {
+            out.push(pass(
+                "payments.networks.allow",
+                format!("{network} allowed"),
+            ));
+        }
+    }
+
+    if let Some(usd) = amount_usd {
+        if let Some(cap) = min_cap([policy.caps.per_tx_usd, payments.http.per_request_usd]) {
+            if usd > cap {
+                out.push(deny(
+                    "payments.http.per_request_usd",
+                    format_usd_cmp(usd, ">", cap),
+                ));
+            } else {
+                out.push(pass(
+                    "payments.http.per_request_usd",
+                    format_usd_cmp(usd, "<=", cap),
+                ));
+            }
+        }
+        if let Some(cap) = input.request_max_amount_usd {
+            if usd > cap {
+                out.push(deny(
+                    "request.max_amount_usd",
+                    format_usd_cmp(usd, ">", cap),
+                ));
+            } else {
+                out.push(pass(
+                    "request.max_amount_usd",
+                    format_usd_cmp(usd, "<=", cap),
+                ));
+            }
+        }
+        if let Some(cap) = min_cap([policy.caps.per_day_usd, payments.http.per_day_usd]) {
+            let total = input.spent_24h_usd + usd;
+            if total > cap {
+                out.push(deny(
+                    "payments.http.per_day_usd",
+                    format!("{} spent+request > {} cap", usd_fmt(total), usd_fmt(cap)),
+                ));
+            } else {
+                out.push(pass(
+                    "payments.http.per_day_usd",
+                    format!("{} spent+request <= {} cap", usd_fmt(total), usd_fmt(cap)),
+                ));
+            }
+        }
+        if let Some(warn) = policy.caps.require_confirm_above_usd {
+            if usd > warn {
+                out.push(warn_check(
+                    "caps.require_confirm_above_usd",
+                    format_usd_cmp(usd, ">", warn),
+                ));
+            } else {
+                out.push(pass(
+                    "caps.require_confirm_above_usd",
+                    format_usd_cmp(usd, "<=", warn),
+                ));
+            }
+        }
+        if input.intent == "session" {
+            if !payments.sessions.enabled {
+                out.push(deny(
+                    "payments.sessions.enabled",
+                    "session payments are disabled",
+                ));
+            } else {
+                out.push(pass(
+                    "payments.sessions.enabled",
+                    "session payments enabled",
+                ));
+            }
+            if let Some(cap) = payments.sessions.max_deposit_usd {
+                if usd > cap {
+                    out.push(deny(
+                        "payments.sessions.max_deposit_usd",
+                        format_usd_cmp(usd, ">", cap),
+                    ));
+                } else {
+                    out.push(pass(
+                        "payments.sessions.max_deposit_usd",
+                        format_usd_cmp(usd, "<=", cap),
+                    ));
+                }
+            }
+            if let Some(cap) = payments.sessions.max_session_spend_usd {
+                if usd > cap {
+                    out.push(deny(
+                        "payments.sessions.max_session_spend_usd",
+                        format_usd_cmp(usd, ">", cap),
+                    ));
+                } else {
+                    out.push(pass(
+                        "payments.sessions.max_session_spend_usd",
+                        format_usd_cmp(usd, "<=", cap),
+                    ));
+                }
+            }
+        }
     } else {
-        out.push(PolicyCheck {
-            rule: "payments.enabled".into(),
-            result: "pass".into(),
-            detail: "paid HTTP enabled".into(),
-        });
+        out.push(warn_check(
+            "payments.amount_usd",
+            "paid HTTP challenge did not expose a USD-denominated amount; review before confirming",
+        ));
     }
-    if payments.http.deny_hosts.contains(host) {
-        out.push(PolicyCheck {
-            rule: "payments.http.deny_hosts".into(),
-            result: "deny".into(),
-            detail: format!("{host} denied"),
-        });
-    }
-    if !payments.http.allow_hosts.is_empty() && !payments.http.allow_hosts.contains(host) {
-        out.push(PolicyCheck {
-            rule: "payments.http.allow_hosts".into(),
-            result: "deny".into(),
-            detail: format!("{host} not allowed"),
-        });
-    }
-    if let (Some(asset), allow) = (asset, &payments.assets.allow) {
-        if !allow.is_empty() && !allow.contains(asset) {
-            out.push(PolicyCheck {
-                rule: "payments.assets.allow".into(),
-                result: "deny".into(),
-                detail: format!("{asset} not allowed"),
-            });
-        }
-    }
-    if let (Some(network), allow) = (network, &payments.networks.allow) {
-        if !allow.is_empty() && !allow.contains(network) {
-            out.push(PolicyCheck {
-                rule: "payments.networks.allow".into(),
-                result: "deny".into(),
-                detail: format!("{network} not allowed"),
-            });
-        }
-    }
-    if let (Some(usd), Some(cap)) = (
-        amount_usd,
-        payments.http.per_request_usd.or(policy.caps.per_tx_usd),
-    ) {
-        if usd > cap {
-            out.push(PolicyCheck {
-                rule: "payments.http.per_request_usd".into(),
-                result: "deny".into(),
-                detail: format!("{usd} > {cap}"),
-            });
-        }
-    }
-    if out.is_empty() {
-        out.push(PolicyCheck {
-            rule: "payments".into(),
-            result: "pass".into(),
-            detail: "no payment-specific restriction matched".into(),
-        });
-    }
+
     out
+}
+
+fn push_check(out: &mut Vec<PolicyCheck>, rule: &str, pass_ok: bool, detail: String, warn: bool) {
+    out.push(PolicyCheck {
+        rule: rule.into(),
+        result: if pass_ok {
+            "pass"
+        } else if warn {
+            "warn"
+        } else {
+            "deny"
+        }
+        .into(),
+        detail,
+    });
+}
+
+fn pass(rule: &str, detail: impl Into<String>) -> PolicyCheck {
+    PolicyCheck {
+        rule: rule.into(),
+        result: "pass".into(),
+        detail: detail.into(),
+    }
+}
+fn warn_check(rule: &str, detail: impl Into<String>) -> PolicyCheck {
+    PolicyCheck {
+        rule: rule.into(),
+        result: "warn".into(),
+        detail: detail.into(),
+    }
+}
+fn deny(rule: &str, detail: impl Into<String>) -> PolicyCheck {
+    PolicyCheck {
+        rule: rule.into(),
+        result: "deny".into(),
+        detail: detail.into(),
+    }
+}
+fn contains_ci(set: &std::collections::BTreeSet<String>, needle: &str) -> bool {
+    set.iter().any(|v| v.eq_ignore_ascii_case(needle))
+}
+fn min_cap<const N: usize>(values: [Option<f64>; N]) -> Option<f64> {
+    values.into_iter().flatten().reduce(f64::min)
+}
+fn format_usd_cmp(a: f64, op: &str, b: f64) -> String {
+    format!("{} {op} {}", usd_fmt(a), usd_fmt(b))
+}
+fn usd_fmt(v: f64) -> String {
+    format!("${v:.6}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
+fn json_number(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64().or_else(|| v.as_str()?.parse().ok())
 }
 
 fn render_plan(
@@ -714,6 +955,8 @@ fn render_plan(
             ch.amount.as_deref().unwrap_or("unknown"),
             if checks.iter().any(|c| c.result == "deny") {
                 "denied"
+            } else if checks.iter().any(|c| c.result == "warn") {
+                "warning_requires_override"
             } else {
                 "allowed"
             },
@@ -832,11 +1075,12 @@ mod tests {
         h.insert("x-payment-required", HeaderValue::from_static("1"));
         let c = normalize_challenge(
             &h,
-            br#"{"accepts":[{"network":"base","asset":"USDC"}]}"#,
+            b"{\"accepts\":[{\"network\":\"base\",\"asset\":\"USDC\",\"amountUsd\":\"0.04\"}]}",
             &Url::parse("https://merchant.test/").unwrap(),
         );
         assert_eq!(c.protocol, "x402");
         assert_eq!(c.asset.as_deref(), Some("USDC"));
+        assert_eq!(c.amount_usd, Some(0.04));
         let mut h = HeaderMap::new();
         h.insert(
             "www-authenticate",
@@ -845,5 +1089,103 @@ mod tests {
         let c = normalize_challenge(&h, b"{}", &Url::parse("https://mpp.test/").unwrap());
         assert_eq!(c.protocol, "mpp");
         assert_eq!(c.intent, "session");
+    }
+
+    #[test]
+    fn payment_policy_uses_most_restrictive_http_and_global_caps() {
+        let mut policy = Policy::default();
+        policy.payments.enabled = true;
+        policy.payments.http.per_request_usd = Some(1.00);
+        policy.caps.per_tx_usd = Some(0.04);
+        let req = ParsedRequest {
+            method: "GET".into(),
+            url: Url::parse("https://merchant.test/data").unwrap(),
+            wallet: Some("alice".into()),
+            max_amount_usd: Some(0.04),
+            headers: BTreeMap::new(),
+            body: None,
+        };
+        let checks = evaluate_payment_policy(
+            &policy,
+            PolicyEvalInput {
+                host: "merchant.test",
+                asset: Some("USDC"),
+                network: Some("base"),
+                intent: "one_time",
+                amount_usd: Some(0.045),
+                request_max_amount_usd: req.max_amount_usd,
+                spent_24h_usd: 0.0,
+            },
+        );
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.rule == "payments.http.per_request_usd" && c.result == "deny")
+        );
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.rule == "request.max_amount_usd" && c.result == "deny")
+        );
+    }
+
+    #[test]
+    fn payment_policy_enforces_denies_allowlists_daily_warnings_and_sessions() {
+        let mut policy = Policy::default();
+        policy.payments.enabled = true;
+        policy.caps.per_day_usd = Some(10.0);
+        policy.caps.require_confirm_above_usd = Some(0.25);
+        policy.payments.http.per_day_usd = Some(1.0);
+        policy
+            .payments
+            .http
+            .allow_hosts
+            .insert("merchant.test".into());
+        policy
+            .payments
+            .http
+            .deny_hosts
+            .insert("blocked.test".into());
+        policy.payments.assets.allow.insert("USDC".into());
+        policy.payments.assets.deny.insert("SCAM".into());
+        policy.payments.networks.allow.insert("base".into());
+        policy.payments.networks.deny.insert("mainnet".into());
+        policy.payments.sessions.max_deposit_usd = Some(0.50);
+        policy.payments.sessions.max_session_spend_usd = Some(0.75);
+
+        let checks = evaluate_payment_policy(
+            &policy,
+            PolicyEvalInput {
+                host: "blocked.test",
+                asset: Some("SCAM"),
+                network: Some("mainnet"),
+                intent: "session",
+                amount_usd: Some(0.80),
+                request_max_amount_usd: None,
+                spent_24h_usd: 0.30,
+            },
+        );
+        for rule in [
+            "payments.http.deny_hosts",
+            "payments.http.allow_hosts",
+            "payments.assets.deny",
+            "payments.assets.allow",
+            "payments.networks.deny",
+            "payments.networks.allow",
+            "payments.http.per_day_usd",
+            "payments.sessions.enabled",
+            "payments.sessions.max_deposit_usd",
+            "payments.sessions.max_session_spend_usd",
+        ] {
+            assert!(
+                checks.iter().any(|c| c.rule == rule && c.result == "deny"),
+                "missing deny for {rule}: {checks:?}"
+            );
+        }
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.rule == "caps.require_confirm_above_usd" && c.result == "warn")
+        );
     }
 }
