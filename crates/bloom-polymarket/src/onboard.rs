@@ -1056,7 +1056,7 @@ mod tests {
 
     #[test]
     fn legacy_account_json_without_in_flight_field_deserializes() {
-        // A pre-existing account.json (e.g. minnow-passkey) predates
+        // A pre-existing account.json (e.g. WALLET_NAME) predates
         // `in_flight_deadline_ms`. `#[serde(default)]` must let it load as None.
         let legacy = r#"{
             "wallet":"minnow","owner":"0x2000000000000000000000000000000000000002",

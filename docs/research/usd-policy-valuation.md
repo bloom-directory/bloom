@@ -26,7 +26,7 @@ large swaps will be gated. Today a $50,000 USDC→ETH swap and a $5 one are trea
 the failure is *silent* (a warn, not a denial). This is the crux: a control users trust is not
 actually applied.
 
-Live repro (this session): `minnow-passkey` swap `4.226422 USDC → ETH` on Base.
+Live repro (this session): `WALLET_NAME` swap `4.226422 USDC → ETH` on Base.
 `outbox/.../policy_check.json` showed `caps.max_value_eth: pass (value 0)` and
 `caps.usd: warn (no price quote available)`. The "~$4.23" figure came from the **Enso quote**, never
 from bloom's policy valuation.
@@ -135,4 +135,4 @@ cross-check against an independent oracle.
 - `crates/bloom-vfs/src/handlers/defi.rs` — Enso route build (`create_session`) and `eth_call`
   simulation (`simulate_session`).
 - `crates/bloom-proto/src/intent.rs:118` — `RawIntent` / `gas_limit_hint` precedent.
-- Live repro: `~/.bloom/keystore/minnow-passkey` swap `0002-82415`, `policy_check.json` `caps.usd` warn.
+- Live repro: `~/.bloom/keystore/WALLET_NAME` swap `0002-82415`, `policy_check.json` `caps.usd` warn.
