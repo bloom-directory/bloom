@@ -58,6 +58,10 @@ pub struct Policy {
     /// open-ended `defi/intents` route surface refuses until opted in.
     #[serde(default)]
     pub defi: crate::defi_policy::DefiPolicy,
+    /// Paid HTTP request policy (`[payments]`). Defaults to disabled — paid
+    /// request confirmation requires explicit wallet policy opt-in.
+    #[serde(default)]
+    pub payments: PaymentsPolicy,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -251,6 +255,58 @@ impl Policy {
             AgentAutonomyMode::Disabled
         }
     }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct PaymentsPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_require_plan")]
+    pub require_plan: bool,
+    #[serde(default)]
+    pub require_confirm_for_new_merchant: bool,
+    #[serde(default)]
+    pub http: PaymentsHttpPolicy,
+    #[serde(default)]
+    pub sessions: PaymentsSessionsPolicy,
+    #[serde(default)]
+    pub assets: PolicyAllowDeny,
+    #[serde(default)]
+    pub networks: PolicyAllowDeny,
+}
+
+fn default_require_plan() -> bool {
+    true
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct PaymentsHttpPolicy {
+    #[serde(default)]
+    pub per_request_usd: Option<f64>,
+    #[serde(default)]
+    pub per_day_usd: Option<f64>,
+    #[serde(default)]
+    pub allow_hosts: BTreeSet<String>,
+    #[serde(default)]
+    pub deny_hosts: BTreeSet<String>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct PaymentsSessionsPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub max_deposit_usd: Option<f64>,
+    #[serde(default)]
+    pub max_session_spend_usd: Option<f64>,
+    #[serde(default = "default_true")]
+    pub require_confirm_to_open: bool,
+    #[serde(default = "default_true")]
+    pub require_confirm_to_top_up: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]

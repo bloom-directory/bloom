@@ -28,6 +28,9 @@ pub struct Config {
     /// Address the NFS server listens on. Loopback only by default.
     #[serde(default = "default_nfs_listen")]
     pub nfs_listen_addr: String,
+    /// Default wallet used when a request/command omits an explicit wallet.
+    #[serde(default)]
+    pub default_wallet: Option<String>,
     /// Default chain to use when an intent omits `chain`.
     #[serde(default = "default_chain_name")]
     pub default_chain: String,
@@ -428,6 +431,7 @@ impl Config {
         Config {
             mount_path: default_mount_path(),
             nfs_listen_addr: default_nfs_listen(),
+            default_wallet: None,
             default_chain: default_chain_name(),
             stage_ttl: default_stage_ttl(),
             chains,
@@ -478,6 +482,16 @@ impl Config {
                 "default_chain={} not in chains",
                 self.default_chain
             )));
+        }
+        if self
+            .default_wallet
+            .as_deref()
+            .map(|w| w.trim().is_empty())
+            .unwrap_or(false)
+        {
+            return Err(ConfigError::Invalid(
+                "default_wallet must not be empty".into(),
+            ));
         }
         for (k, c) in &self.chains {
             if k != &c.name {
@@ -534,6 +548,7 @@ mod tests {
     fn local_default_shape() {
         let cfg = Config::local_default();
         assert_eq!(cfg.default_chain, "ethereum");
+        assert!(cfg.default_wallet.is_none());
         assert_eq!(cfg.mount_path, "/bloom");
         assert_eq!(cfg.nfs_listen_addr, "127.0.0.1:12049");
         assert!(cfg.block_mainnet_broadcast);
@@ -667,6 +682,46 @@ mod tests {
             ConfigError::Invalid(m) => assert!(m.contains("default_chain=ghost"), "msg: {m}"),
             other => panic!("expected Invalid, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn default_wallet_round_trips_and_empty_is_rejected() {
+        let mut cfg = Config::local_default();
+        cfg.default_wallet = Some("alice".to_string());
+        let s = toml::to_string_pretty(&cfg).unwrap();
+        assert!(s.contains("default_wallet = \"alice\""));
+        let back: Config = toml::from_str(&s).unwrap();
+        assert_eq!(back.default_wallet.as_deref(), Some("alice"));
+
+        cfg.default_wallet = Some("   ".to_string());
+        let err = cfg.validate().unwrap_err();
+        match err {
+            ConfigError::Invalid(m) => assert!(m.contains("default_wallet"), "msg: {m}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn older_config_without_default_wallet_parses() {
+        let cfg: Config = toml::from_str(
+            r#"
+mount_path = "/bloom"
+nfs_listen_addr = "127.0.0.1:12049"
+default_chain = "anvil"
+stage_ttl = "30m"
+block_mainnet_broadcast = true
+
+[chains.anvil]
+name = "anvil"
+chain_id = 31337
+rpc_urls = ["http://127.0.0.1:8545"]
+native_symbol = "ETH"
+allow_broadcast = true
+"#,
+        )
+        .unwrap();
+        assert!(cfg.default_wallet.is_none());
+        cfg.validate().unwrap();
     }
 
     #[test]

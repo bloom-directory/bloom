@@ -40,6 +40,7 @@ fn help_lists_all_subcommands() {
         .stdout(predicate::str::contains("status"))
         .stdout(predicate::str::contains("vfs"))
         .stdout(predicate::str::contains("wallet"))
+        .stdout(predicate::str::contains("request"))
         .stdout(predicate::str::contains("serve"))
         .stdout(predicate::str::contains("ipc"))
         .stdout(predicate::str::contains("petals"))
@@ -103,6 +104,7 @@ fn vfs_ls_root_lists_top_level_handlers() {
         "status",
         "wallets",
         "tools",
+        "requests",
         "docs",
     ] {
         assert!(
@@ -330,6 +332,15 @@ fn wallet_new_then_list_round_trip() {
     assert!(
         create_out.contains("created wallet 'alice'"),
         "unexpected create output: {create_out}"
+    );
+    assert!(
+        create_out.contains("default_wallet: alice"),
+        "first wallet creation should announce default wallet selection: {create_out}"
+    );
+    let config = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    assert!(
+        config.contains("default_wallet = \"alice\""),
+        "config should persist default wallet, got:\n{config}"
     );
     // Address line is `created wallet 'alice': 0x...` — capture and reuse
     // the address to assert the listing matches what was just minted.

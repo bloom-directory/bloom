@@ -551,23 +551,33 @@ credential. It may perform the unpaid probe and stage a plan.
 10. Session/channel spend must track cumulative amounts, not only per-request
     voucher amounts.
 
-## 16. Open questions
+## 16. Decisions
 
-1. Should Bloom add a daemon-level default wallet, or should defaulting remain
-   “only if exactly one wallet exists” for v1?
-2. Should named policy profiles live under each wallet later?
+Resolved for the implementation pass:
 
-   ```text
-   /bloom/wallets/<wallet>/policies/research.toml
-   /bloom/wallets/<wallet>/policies/media.toml
-   ```
+1. Implement all milestones in this spec, with tests for the introduced VFS,
+   policy, adapter, wallet-default, and CLI behavior.
+2. Add a daemon-level `default_wallet` in `config.toml`. It is used after an
+   explicit request wallet and before the single-wallet fallback. When the first
+   wallet is created/imported and no default is configured, Bloom sets it as the
+   default and prints an obvious message with the config path.
+3. Retain successful free HTTP responses in the same `/bloom/requests/sent/<id>`
+   tree as paid requests.
+4. Implement both x402 and Tempo MPP challenge handling/adapters while keeping
+   protocol names as request metadata only, never top-level VFS namespaces.
+5. Keep session/channel state under `/bloom/requests/sessions`.
+6. `credential.json` contains redacted/public metadata only. Raw signed vouchers,
+   bearer credentials, private keys, passphrases, or replayable secrets must
+   never enter the VFS.
 
-3. Should free HTTP requests live in the same `/bloom/requests` tree, or should
-   this tree only retain paid/staged requests?
-4. How much raw credential material can safely be stored for each protocol
-   without enabling replay?
-5. Should session/channel operations have a first-class `/bloom/sessions` tree,
-   or stay nested under `/bloom/requests/sessions`?
+Deferred question:
+
+- Named policy profiles under each wallet may be considered later:
+
+  ```text
+  /bloom/wallets/<wallet>/policies/research.toml
+  /bloom/wallets/<wallet>/policies/media.toml
+  ```
 
 ## 17. Milestones
 
