@@ -1,5 +1,7 @@
 <p align="center">
-  <img src="docs/assets/bloom-wordmark.png" alt="Bloom" width="420">
+  <a href="https://bloom.directory">
+    <img src="docs/assets/bloom-wordmark.png" alt="Bloom">
+  </a>
 </p>
 
 <p align="center">
