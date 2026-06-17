@@ -381,7 +381,7 @@ impl RequestsHandler {
             let challenge = normalize_challenge(&headers, &body, &request.url);
             let policy = self.wallet_policy(&wallet)?;
             let spent_24h_usd = self.sum_paid_usd_last_24h(&wallet)?;
-            let checks = evaluate_payment_policy(
+            let mut checks = evaluate_payment_policy(
                 &policy,
                 PolicyEvalInput {
                     host: &host,
@@ -393,6 +393,21 @@ impl RequestsHandler {
                     spent_24h_usd,
                 },
             );
+            let already_spent = challenge
+                .session_id
+                .as_deref()
+                .and_then(|sid| {
+                    fs::read_to_string(
+                        self.requests_root()
+                            .join("sessions")
+                            .join(sid)
+                            .join("spent"),
+                    )
+                    .ok()
+                    .and_then(|s| parse_money(&s))
+                })
+                .unwrap_or(0.0);
+            checks.extend(evaluate_session_policy(&policy, &challenge, already_spent));
             let dir = self.req_dir("pending", &id);
             fs::create_dir_all(dir.join("response"))?;
             write_request_artifacts(&dir, &request, &wallet, "pending")?;
@@ -698,12 +713,14 @@ impl RequestsHandler {
             pending.join("credential.json"),
             &json!({
                 "redacted": true,
-                "protocol": "x402",
+                "protocol": challenge.protocol,
                 "intent": challenge.intent,
                 "scheme": requirement.scheme,
                 "network": requirement.network,
                 "asset": requirement.asset,
                 "pay_to": requirement.pay_to,
+                "charge_id": challenge.charge_id,
+                "session_id": challenge.session_id,
                 "material": "not_stored",
                 "secret_material_in_vfs": false,
                 "public": credential.public_metadata,
@@ -725,8 +742,11 @@ impl RequestsHandler {
                 "amount": requirement.amount,
                 "currency": requirement.asset,
                 "network": requirement.network,
-                "protocol": "x402",
+                "protocol": challenge.protocol,
+                "intent": challenge.intent,
                 "scheme": requirement.scheme,
+                "charge_id": challenge.charge_id,
+                "session_id": challenge.session_id,
                 "amount_usd": challenge.amount_usd,
                 "response_status": status,
                 "credential_redacted": true,
@@ -737,6 +757,9 @@ impl RequestsHandler {
             &json!({"request_id": id, "event": "confirmed_and_retried", "reads_spent": false, "credential_redacted": true}),
         )?;
         let target_state = if status < 400 { "sent" } else { "failed" };
+        if target_state == "sent" && challenge.intent == "session" {
+            update_session_state(&self.requests_root(), &challenge, id, &wallet)?;
+        }
         fs::write(pending.join("status"), format!("{target_state}\n"))?;
         let target = self.req_dir(target_state, id);
         if target.exists() {
@@ -764,6 +787,13 @@ impl Handler for RequestsHandler {
             }
             [state, _id, name] if matches!(state.as_str(), "pending" | "sent" | "failed") => {
                 if matches!(name.as_str(), "confirm" | "cancel") {
+                    Ok(Entry::writable_file(name))
+                } else {
+                    Ok(Entry::file(name))
+                }
+            }
+            [state, _id, name] if state == "sessions" => {
+                if matches!(name.as_str(), "topup" | "close") {
                     Ok(Entry::writable_file(name))
                 } else {
                     Ok(Entry::file(name))
@@ -797,6 +827,9 @@ impl Handler for RequestsHandler {
             }
             [state, id] if matches!(state.as_str(), "pending" | "sent" | "failed") => {
                 list_entries(self.req_dir(state, id))
+            }
+            [state, id] if state == "sessions" => {
+                list_entries(self.requests_root().join("sessions").join(id))
             }
             [state, id, response]
                 if matches!(state.as_str(), "pending" | "sent" | "failed")
@@ -866,6 +899,24 @@ impl Handler for RequestsHandler {
             }
             [state, id, action] if state == "pending" && action == "confirm" => {
                 self.confirm(id, data).await
+            }
+            [state, id, action] if state == "sessions" && action == "topup" => {
+                let dir = self.requests_root().join("sessions").join(id);
+                if !dir.exists() {
+                    return Err(HandlerError::NotFound(format!("/requests/sessions/{id}")));
+                }
+                fs::write(
+                    dir.join("status"),
+                    b"topup_unsupported_no_durable_channel\n",
+                )
+                .map_err(Into::into)
+            }
+            [state, id, action] if state == "sessions" && action == "close" => {
+                let dir = self.requests_root().join("sessions").join(id);
+                if !dir.exists() {
+                    return Err(HandlerError::NotFound(format!("/requests/sessions/{id}")));
+                }
+                fs::write(dir.join("status"), b"closed_mock\n").map_err(Into::into)
             }
             [state, id, action] if state == "pending" && action == "cancel" => {
                 let pending = self.req_dir(state, id);
@@ -992,6 +1043,10 @@ pub struct NormalizedChallenge {
     asset: Option<String>,
     amount: Option<String>,
     amount_usd: Option<f64>,
+    charge_id: Option<String>,
+    session_id: Option<String>,
+    deposit_amount: Option<String>,
+    deposit_usd: Option<f64>,
     headers: BTreeMap<String, String>,
     accepts: Vec<PaymentRequirement>,
 }
@@ -1009,7 +1064,17 @@ pub struct PaymentRequirement {
 
 impl NormalizedChallenge {
     fn payment_method(&self) -> serde_json::Value {
-        json!({"protocol": self.protocol, "intent": self.intent, "network": self.network, "asset": self.asset, "merchant": self.merchant})
+        json!({
+            "protocol": self.protocol,
+            "intent": self.intent,
+            "network": self.network,
+            "asset": self.asset,
+            "merchant": self.merchant,
+            "charge_id": self.charge_id,
+            "session_id": self.session_id,
+            "deposit_amount": self.deposit_amount,
+            "deposit_usd": self.deposit_usd,
+        })
     }
 }
 
@@ -1019,62 +1084,127 @@ fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Normalize
         .get("www-authenticate")
         .cloned()
         .unwrap_or_default();
-    let lower = www.to_ascii_lowercase();
+    let lower_www = www.to_ascii_lowercase();
     let body_json: serde_json::Value = serde_json::from_slice(body).unwrap_or_else(|_| json!({}));
+    let lower_body_protocol = json_string(&body_json, &["protocol", "paymentProtocol", "scheme"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let body_type = json_string(&body_json, &["type", "kind", "challengeType"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
     let protocol = if header_map.keys().any(|k| k.starts_with("x-payment"))
         || body_json.get("x402Version").is_some()
         || body_json.get("accepts").is_some()
     {
         "x402"
-    } else if lower.contains("payment") || lower.contains("mpp") {
+    } else if lower_www.contains("tempo")
+        || lower_www.contains("mpp")
+        || lower_body_protocol.contains("tempo")
+        || lower_body_protocol.contains("mpp")
+        || body_json.get("charge").is_some()
+        || body_json.get("session").is_some()
+    {
+        "mpp"
+    } else if lower_www.contains("payment") {
         "mpp"
     } else {
         "unknown"
     };
-    let intent = if lower.contains("session") || body_json.get("session").is_some() {
+    let intent = if lower_www.contains("session")
+        || body_json.get("session").is_some()
+        || body_type == "session"
+    {
         "session"
     } else {
         "one_time"
     };
     let accepts = parse_payment_requirements(&body_json);
-    let network = body_json
-        .pointer("/network")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| accepts.first().and_then(|a| a.network.clone()));
-    let asset = body_json
-        .pointer("/asset")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| accepts.first().and_then(|a| a.asset.clone()));
-    let amount = body_json
-        .pointer("/amount")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| accepts.first().and_then(|a| a.amount.clone()));
-    let amount_usd = body_json
-        .pointer("/amountUsd")
-        .and_then(json_number)
-        .or_else(|| body_json.pointer("/amount_usd").and_then(json_number))
+    let session = body_json.get("session").unwrap_or(&serde_json::Value::Null);
+    let charge = body_json.get("charge").unwrap_or(&serde_json::Value::Null);
+    let network = json_string(&body_json, &["network"])
+        .or_else(|| json_string(session, &["network"]))
+        .or_else(|| json_string(charge, &["network"]))
         .or_else(|| {
             body_json
-                .pointer("/accepts/0/amountUsd")
-                .and_then(json_number)
-        })
-        .or_else(|| {
-            body_json
-                .pointer("/accepts/0/amount_usd")
-                .and_then(json_number)
+                .pointer("/accepts/0/network")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
         });
+    let asset = json_string(&body_json, &["asset", "currency"])
+        .or_else(|| json_string(session, &["asset", "currency"]))
+        .or_else(|| json_string(charge, &["asset", "currency"]))
+        .or_else(|| {
+            body_json
+                .pointer("/accepts/0/asset")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        });
+    let amount = if intent == "session" {
+        json_string(session, &["voucherAmount", "amount", "price", "cost"])
+            .or_else(|| json_string(&body_json, &["voucherAmount", "amount", "price", "cost"]))
+    } else {
+        json_string(charge, &["amount", "price", "cost"])
+            .or_else(|| json_string(&body_json, &["amount", "price", "cost"]))
+            .or_else(|| {
+                body_json
+                    .pointer("/accepts/0/maxAmountRequired")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+    };
+    let amount_usd = if intent == "session" {
+        json_f64(session, &["voucherAmountUsd", "amountUsd", "usd"])
+            .or_else(|| json_f64(&body_json, &["voucherAmountUsd", "amountUsd", "usd"]))
+            .or_else(|| amount.as_deref().and_then(parse_money))
+    } else {
+        json_f64(charge, &["amountUsd", "usd"])
+            .or_else(|| json_f64(&body_json, &["amountUsd", "usd"]))
+            .or_else(|| {
+                body_json
+                    .pointer("/accepts/0/amountUsd")
+                    .and_then(json_number)
+            })
+            .or_else(|| {
+                body_json
+                    .pointer("/accepts/0/amount_usd")
+                    .and_then(json_number)
+            })
+            .or_else(|| amount.as_deref().and_then(parse_money))
+    };
+    let deposit_amount = json_string(session, &["depositAmount", "deposit", "topUpAmount"])
+        .or_else(|| json_string(&body_json, &["depositAmount", "deposit", "topUpAmount"]));
+    let deposit_usd = json_f64(
+        session,
+        &["depositAmountUsd", "depositUsd", "topUpAmountUsd"],
+    )
+    .or_else(|| {
+        json_f64(
+            &body_json,
+            &["depositAmountUsd", "depositUsd", "topUpAmountUsd"],
+        )
+    })
+    .or_else(|| deposit_amount.as_deref().and_then(parse_money));
+    let merchant = json_string(charge, &["merchant", "merchantId"])
+        .or_else(|| json_string(session, &["merchant", "merchantId"]))
+        .or_else(|| json_string(&body_json, &["merchant", "merchantId"]))
+        .unwrap_or_else(|| url.host_str().unwrap_or("unknown").into());
+
     NormalizedChallenge {
         protocol: protocol.into(),
         intent: intent.into(),
-        merchant: url.host_str().unwrap_or("unknown").into(),
+        merchant,
         realm: extract_realm(&www),
         network,
         asset,
         amount,
         amount_usd,
+        charge_id: json_string(charge, &["id", "chargeId"])
+            .or_else(|| json_string(&body_json, &["chargeId"])),
+        session_id: json_string(session, &["id", "sessionId"])
+            .or_else(|| json_string(&body_json, &["sessionId"])),
+        deposit_amount,
+        deposit_usd,
         headers: header_map,
         accepts,
     }
@@ -1109,6 +1239,32 @@ fn parse_payment_requirements(body_json: &serde_json::Value) -> Vec<PaymentRequi
             raw: v,
         })
         .collect()
+}
+
+fn json_string(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|k| {
+        v.get(*k).and_then(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .or_else(|| v.as_f64().map(trim_money))
+        })
+    })
+}
+
+fn json_f64(v: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|k| {
+        v.get(*k)
+            .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(parse_money)))
+    })
+}
+
+fn parse_money(raw: &str) -> Option<f64> {
+    raw.trim().trim_start_matches('$').parse().ok()
+}
+
+fn trim_money(v: f64) -> String {
+    let s = format!("{v:.6}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 fn extract_realm(s: &str) -> Option<String> {
@@ -1403,6 +1559,137 @@ fn select_payment_requirement(
     })
 }
 
+fn evaluate_session_policy(
+    policy: &Policy,
+    challenge: &NormalizedChallenge,
+    already_spent_usd: f64,
+) -> Vec<PolicyCheck> {
+    let mut out = Vec::new();
+    if challenge.intent != "session" {
+        return out;
+    }
+    let sessions = &policy.payments.sessions;
+    if !sessions.enabled {
+        out.push(PolicyCheck {
+            rule: "payments.sessions.enabled".into(),
+            result: "deny".into(),
+            detail: "wallet policy has not enabled payment sessions".into(),
+        });
+    } else {
+        out.push(PolicyCheck {
+            rule: "payments.sessions.enabled".into(),
+            result: "pass".into(),
+            detail: "payment sessions enabled".into(),
+        });
+    }
+    if let (Some(deposit), Some(cap)) = (challenge.deposit_usd, sessions.max_deposit_usd) {
+        out.push(PolicyCheck {
+            rule: "payments.sessions.max_deposit_usd".into(),
+            result: if deposit > cap { "deny" } else { "pass" }.into(),
+            detail: format!(
+                "{} {} {}",
+                trim_money(deposit),
+                if deposit > cap { ">" } else { "<=" },
+                trim_money(cap)
+            ),
+        });
+    }
+    if let (Some(amount), Some(cap)) = (challenge.amount_usd, sessions.max_session_spend_usd) {
+        let projected = already_spent_usd + amount;
+        out.push(PolicyCheck {
+            rule: "payments.sessions.max_session_spend_usd".into(),
+            result: if projected > cap { "deny" } else { "pass" }.into(),
+            detail: format!(
+                "projected cumulative {} {} {}",
+                trim_money(projected),
+                if projected > cap { ">" } else { "<=" },
+                trim_money(cap)
+            ),
+        });
+    }
+    out
+}
+
+/// Records a redacted, append-only voucher trail after a session-intent paid
+/// retry settles. This is *not* a durable Tempo MPP channel: real channel
+/// reuse, top-up, and close primitives from `mpp-rs` are not linked in this
+/// crate, so the session is marked `settled_no_durable_channel` rather than
+/// `open` to avoid overclaiming a reusable channel.
+fn update_session_state(
+    requests_root: &Path,
+    challenge: &NormalizedChallenge,
+    request_id: &str,
+    wallet: &str,
+) -> Result<(), HandlerError> {
+    let session_id = challenge
+        .session_id
+        .clone()
+        .unwrap_or_else(|| format!("session_{request_id}"));
+    let dir = requests_root.join("sessions").join(&session_id);
+    fs::create_dir_all(&dir)?;
+    let previous_spent = fs::read_to_string(dir.join("spent"))
+        .ok()
+        .and_then(|s| parse_money(&s))
+        .unwrap_or(0.0);
+    let amount = challenge.amount_usd.unwrap_or_else(|| {
+        challenge
+            .amount
+            .as_deref()
+            .and_then(parse_money)
+            .unwrap_or(0.0)
+    });
+    let deposited = challenge.deposit_usd.unwrap_or_else(|| {
+        fs::read_to_string(dir.join("deposited"))
+            .ok()
+            .and_then(|s| parse_money(&s))
+            .unwrap_or(0.0)
+    });
+    let spent = previous_spent + amount;
+    fs::write(dir.join("merchant"), format!("{}\n", challenge.merchant))?;
+    fs::write(dir.join("wallet"), format!("{wallet}\n"))?;
+    fs::write(
+        dir.join("network"),
+        format!("{}\n", challenge.network.as_deref().unwrap_or("unknown")),
+    )?;
+    fs::write(
+        dir.join("asset"),
+        format!("{}\n", challenge.asset.as_deref().unwrap_or("unknown")),
+    )?;
+    fs::write(
+        dir.join("deposited"),
+        format!("{}\n", trim_money(deposited)),
+    )?;
+    fs::write(dir.join("spent"), format!("{}\n", trim_money(spent)))?;
+    fs::write(
+        dir.join("remaining"),
+        format!("{}\n", trim_money((deposited - spent).max(0.0))),
+    )?;
+    fs::write(dir.join("status"), b"settled_no_durable_channel\n")?;
+    fs::write(
+        dir.join("limitations.md"),
+        b"Durable Tempo MPP channel reuse, top-up, and close are not implemented; \
+this session records a redacted voucher trail only. The `topup` and `close` \
+control files are limitation stubs pending a real mpp-rs Tempo provider.\n",
+    )?;
+    let voucher = json!({
+        "request_id": request_id,
+        "amount": challenge.amount,
+        "amount_usd": challenge.amount_usd,
+        "credential": "redacted",
+        "secret_material_in_vfs": false
+    });
+    let mut line =
+        serde_json::to_vec(&voucher).map_err(|e| HandlerError::backend(e.to_string()))?;
+    line.push(b'\n');
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("vouchers.jsonl"))?;
+    file.write_all(&line)?;
+    Ok(())
+}
+
 fn render_plan(
     req: &ParsedRequest,
     wallet: &str,
@@ -1647,7 +1934,7 @@ inline = '{"prompt":"hi"}'
         let mut h = HeaderMap::new();
         h.insert(
             "www-authenticate",
-            HeaderValue::from_static("Payment realm=\"tempo\", session"),
+            HeaderValue::from_static(r#"Payment realm="tempo", session"#),
         );
         let c = normalize_challenge(&h, b"{}", &Url::parse("https://mpp.test/").unwrap());
         assert_eq!(c.protocol, "mpp");
@@ -1689,6 +1976,77 @@ inline = '{"prompt":"hi"}'
             checks
                 .iter()
                 .any(|c| c.rule == "request.max_amount_usd" && c.result == "deny")
+        );
+    }
+
+    #[test]
+    fn parses_tempo_charge_challenge_metadata() {
+        let c = normalize_challenge(
+            &HeaderMap::new(),
+            br#"{
+                "protocol": "tempo-mpp",
+                "type": "Charge",
+                "network": "tempo",
+                "asset": "pathUSD",
+                "amount": "0.25",
+                "amountUsd": 0.25,
+                "charge": {"id": "ch_123", "merchant": "merchant-42"}
+            }"#,
+            &Url::parse("https://mpp.test/pay").unwrap(),
+        );
+        assert_eq!(c.protocol, "mpp");
+        assert_eq!(c.intent, "one_time");
+        assert_eq!(c.network.as_deref(), Some("tempo"));
+        assert_eq!(c.asset.as_deref(), Some("pathUSD"));
+        assert_eq!(c.amount.as_deref(), Some("0.25"));
+        assert_eq!(c.amount_usd, Some(0.25));
+        assert_eq!(c.charge_id.as_deref(), Some("ch_123"));
+        assert_eq!(c.merchant, "merchant-42");
+    }
+
+    #[test]
+    fn parses_tempo_session_challenge_and_enforces_cumulative_cap() {
+        let c = normalize_challenge(
+            &HeaderMap::new(),
+            br#"{
+                "protocol": "tempo-mpp",
+                "type": "Session",
+                "network": "tempo",
+                "asset": "pathUSD",
+                "session": {
+                    "id": "sess_abc",
+                    "voucherAmount": "0.40",
+                    "voucherAmountUsd": 0.40,
+                    "depositAmount": "2.00",
+                    "depositAmountUsd": 2.00
+                }
+            }"#,
+            &Url::parse("https://mpp.test/data").unwrap(),
+        );
+        assert_eq!(c.protocol, "mpp");
+        assert_eq!(c.intent, "session");
+        assert_eq!(c.session_id.as_deref(), Some("sess_abc"));
+        assert_eq!(c.amount_usd, Some(0.40));
+        assert_eq!(c.deposit_usd, Some(2.00));
+
+        let policy = Policy {
+            payments: bloom_proto::policy::PaymentsPolicy {
+                enabled: true,
+                sessions: bloom_proto::policy::PaymentsSessionsPolicy {
+                    enabled: true,
+                    max_deposit_usd: Some(2.0),
+                    max_session_spend_usd: Some(1.0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let checks = evaluate_session_policy(&policy, &c, 0.70);
+        assert!(
+            checks
+                .iter()
+                .any(|c| c.rule == "payments.sessions.max_session_spend_usd" && c.result == "deny")
         );
     }
 
@@ -1868,5 +2226,35 @@ inline = '{"prompt":"hi"}'
         assert!(error.contains("multiple wallets are available"));
         assert!(error.contains("alice"));
         assert!(error.contains("bob"));
+    }
+
+    #[tokio::test]
+    async fn session_reads_have_no_side_effects() {
+        let dir = tempfile::tempdir().unwrap();
+        let keystore = Keystore::new(dir.path().join("keystore")).unwrap();
+        let handler = RequestsHandler::new(dir.path(), keystore, None);
+        let session_dir = dir.path().join("requests/sessions/sess_read");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(session_dir.join("spent"), "0.25\n").unwrap();
+        fs::write(
+            session_dir.join("vouchers.jsonl"),
+            "{\"request_id\":\"req_a\"}\n",
+        )
+        .unwrap();
+
+        let before = fs::read_to_string(session_dir.join("vouchers.jsonl")).unwrap();
+        let first = handler
+            .read(&VfsPath::parse("/sessions/sess_read/spent").unwrap())
+            .await
+            .unwrap();
+        let second = handler
+            .read(&VfsPath::parse("/sessions/sess_read/spent").unwrap())
+            .await
+            .unwrap();
+        let after = fs::read_to_string(session_dir.join("vouchers.jsonl")).unwrap();
+
+        assert_eq!(first, b"0.25\n");
+        assert_eq!(second, b"0.25\n");
+        assert_eq!(before, after);
     }
 }

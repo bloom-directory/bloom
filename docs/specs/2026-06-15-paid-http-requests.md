@@ -608,6 +608,18 @@ Deferred question:
 - Enforce cumulative spend caps.
 - Support top-up and close flows with explicit confirmation.
 
+Implementation note: Tempo MPP charges and sessions are normalized and policy-gated
+(including cumulative session-spend caps) and share the same confirm path as x402 —
+the real keystore/passkey signer runs only after confirmation and policy approval, the
+paid retry is a real HTTP request, and a failed retry transitions the request to the
+`failed` state. Only redacted credential metadata, receipts, audit entries, and
+cumulative session spend are written; no raw vouchers or replayable secret material are
+stored in the VFS. Durable Tempo MPP channel reuse, top-up, and close are **not**
+implemented: no real `mpp-rs` Tempo signer/deposit/open/top-up/close primitives are
+linked into `bloom-vfs` yet, so a settled session is marked
+`settled_no_durable_channel` (never `open`) and the `topup`/`close` control files are
+limitation stubs pending a real provider.
+
 ### Milestone 5 — CLI parity
 
 - Add `bloom request` commands matching VFS semantics.
