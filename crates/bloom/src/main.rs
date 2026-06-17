@@ -998,7 +998,14 @@ async fn run(cli: Cli) -> Result<()> {
                 body.push_str(&format!("wallet={wallet}"));
             }
             d.vfs
-                .write(&VfsPath::parse("/requests/new")?, body.as_bytes())
+                .write(
+                    &VfsPath::parse(if dry_run {
+                        "/requests/new.dry-run"
+                    } else {
+                        "/requests/new"
+                    })?,
+                    body.as_bytes(),
+                )
                 .await
                 .context("request new")?;
             let latest = d
