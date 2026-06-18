@@ -396,8 +396,8 @@ read-only operational surface later:
     ├── remaining
     ├── status
     ├── vouchers.jsonl
-    ├── topup       # writable side-effect sink, optional later
-    └── close       # writable side-effect sink, optional later
+    ├── topup       # writable side-effect sink only when a fresh scoped challenge is staged
+    └── close       # writable side-effect sink only when a fresh scoped challenge is staged
 ```
 
 If this feels too payment-specific for `/requests`, a later top-level
@@ -455,8 +455,18 @@ without requiring the user to understand protocol-specific folders.
 ### `credential.json`
 
 Redacted metadata only. Never expose a reusable bearer credential, private key,
-raw signed voucher if replayable, or secret token unless it is specifically safe
-as a receipt/public proof.
+raw signed voucher if replayable, raw `Authorization` value, signed transaction,
+or secret token unless it is specifically safe as a receipt/public proof.
+
+### Wallet signing and passkey unlocks
+
+Tempo MPP confirmation always obtains the signer through Bloom's unlocked
+keystore path (`Keystore::signer(wallet)`). Passkey-gated wallets are supported
+when their foreground `unlock-passkey` / `unlock_passkey` flow has populated the
+same unlocked signer cache; they are not a separate unsupported wallet type.
+Locked local wallets fail before MPP credential creation. Locked passkey wallets
+fail with an explicit instruction to run the foreground passkey unlock flow before
+writing `confirm`.
 
 ### `receipt.json`
 
@@ -612,22 +622,27 @@ Implementation note: the Tempo MPP adapter uses the real `mpp` Rust SDK
 (`TempoProvider`/`TempoSessionProvider`) for Payment challenge parsing, Tempo
 charge/session credential creation, and Authorization/Payment-Receipt formatting.
 Tempo MPP charges and sessions are normalized and policy-gated (including
-cumulative session-spend caps) and share the same confirm path as x402: the real
-keystore/passkey signer runs only after confirmation and policy approval, x402
-keeps its keystore signer with a staged request-id–bound EIP-3009 nonce, the paid
-retry is a real HTTP request, and a failed retry (HTTP >= 400 or a
-signing/settlement error) transitions the request to the `failed` state. Only
-redacted credential metadata, receipts, audit entries, and cumulative session
-spend are written; no raw Authorization headers, signed transactions, voucher
-signatures, or other replayable secret material are stored in the VFS.
+cumulative session-spend caps) and share the same confirm path as x402: signing
+runs only after confirmation and policy approval, x402 keeps its keystore signer
+with a staged request-id–bound EIP-3009 nonce, the paid retry is a real HTTP
+request, and a failed retry (HTTP >= 400 or a signing/settlement error)
+transitions the request to the `failed` state. Tempo MPP signing uses
+`Keystore::signer(wallet)`, so passkey-gated wallets work after the foreground
+`unlock_passkey` flow has unlocked the signer and locked passkey wallets fail
+before credential creation with an unlock-specific error.
 
+Only redacted credential metadata, receipts, audit entries, and cumulative
+session spend are written; no raw Authorization headers, signed transactions,
+voucher signatures, or other replayable secret material are stored in the VFS.
 Durable Tempo MPP channel reuse, top-up, and close are **not** implemented: no
 `mpp-rs` channel open/deposit/top-up/close primitives are linked into
 `bloom-vfs`, so a settled session is marked `settled_no_durable_channel` (never
 `open`) to avoid overclaiming a reusable channel. The `topup` and `close` control
-files refuse to fabricate credentials from redacted session metadata — top-up
-must be confirmed from a fresh Tempo MPP session challenge and close requires a
-live `TempoSessionProvider` channel registry.
+files are not advertised as writable controls and direct writes fail with a
+precise unavailable-until-fresh-challenge error instead of synthesizing
+credentials from redacted metadata; top-up must be confirmed from a fresh Tempo
+MPP session challenge and close requires a live `TempoSessionProvider` channel
+registry.
 
 ### Milestone 5 — CLI parity
 

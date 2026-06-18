@@ -803,9 +803,16 @@ impl Handler for RequestsHandler {
                     Ok(Entry::file(name))
                 }
             }
-            [state, _id, name] if state == "sessions" => {
+            [state, id, name] if state == "sessions" => {
+                let file = self.requests_root().join("sessions").join(id).join(name);
                 if matches!(name.as_str(), "topup" | "close") {
-                    Ok(Entry::writable_file(name))
+                    if file.exists() {
+                        Ok(Entry::writable_file(name))
+                    } else {
+                        Err(HandlerError::NotFound(format!(
+                            "/requests/sessions/{id}/{name}: control unavailable until a fresh Tempo MPP session challenge is staged"
+                        )))
+                    }
                 } else {
                     Ok(Entry::file(name))
                 }
@@ -917,7 +924,7 @@ impl Handler for RequestsHandler {
                     return Err(HandlerError::NotFound(format!("/requests/sessions/{id}")));
                 }
                 Err(HandlerError::invalid(
-                    "session top-up must be confirmed from a fresh Tempo MPP session challenge; refusing to fabricate a top-up credential from redacted session metadata",
+                    "session top-up is unavailable from redacted session metadata; stage and confirm a fresh Tempo MPP session challenge that authorizes top-up before writing this control",
                 ))
             }
             [state, id, action] if state == "sessions" && action == "close" => {
@@ -926,7 +933,7 @@ impl Handler for RequestsHandler {
                     return Err(HandlerError::NotFound(format!("/requests/sessions/{id}")));
                 }
                 Err(HandlerError::invalid(
-                    "session close requires a live TempoSessionProvider channel registry; refusing to fabricate a close voucher from redacted session metadata",
+                    "session close is unavailable from redacted session metadata; stage and confirm a fresh Tempo MPP session challenge that authorizes close before writing this control",
                 ))
             }
             [state, id, action] if state == "pending" && action == "cancel" => {
@@ -1694,6 +1701,33 @@ struct RealMppBackend {
     rpc_url: String,
 }
 
+impl RealMppBackend {
+    fn signer_error(&self, wallet: &str, err: KeystoreError) -> HandlerError {
+        match err {
+            KeystoreError::Locked(_) => {
+                let kind = self
+                    .keystore
+                    .raw_policy(wallet)
+                    .ok()
+                    .map(|(_, kind)| kind)
+                    .or_else(|| self.keystore.info(wallet).ok().map(|info| info.kind));
+                if kind == Some(WalletKind::PasskeyGated) {
+                    HandlerError::invalid(format!(
+                        "passkey wallet '{wallet}' is locked; run the foreground passkey unlock flow (`unlock-passkey` / Keystore::unlock_passkey) before confirming Tempo MPP payments"
+                    ))
+                } else {
+                    HandlerError::invalid(format!(
+                        "wallet '{wallet}' is locked; unlock it before confirming Tempo MPP payments"
+                    ))
+                }
+            }
+            other => HandlerError::invalid(format!(
+                "wallet '{wallet}' cannot be used for Tempo MPP signing: {other}"
+            )),
+        }
+    }
+}
+
 struct PaymentExecution {
     credential_metadata: serde_json::Value,
     receipt_raw: serde_json::Value,
@@ -1725,11 +1759,10 @@ impl PaymentBackend for RealMppBackend {
                 "only Tempo MPP challenges can be confirmed by the real MPP backend",
             ));
         }
-        let signer = self.keystore.signer(wallet).map_err(|e| {
-            HandlerError::invalid(format!(
-                "wallet '{wallet}' must be unlocked for Tempo MPP signing: {e}"
-            ))
-        })?;
+        let signer = self
+            .keystore
+            .signer(wallet)
+            .map_err(|e| self.signer_error(wallet, e))?;
         let payment_challenge = parse_stored_mpp_challenge(challenge)?;
         let credential = match challenge.intent.as_str() {
             "charge" => {
@@ -2743,6 +2776,153 @@ inline = '{"prompt":"hi"}'
         let receipt: serde_json::Value =
             read_json(dir.path().join("requests/sent/req_1/receipt.json")).unwrap();
         assert_eq!(receipt["session_id"], "sess_1");
+    }
+
+    #[tokio::test]
+    async fn locked_local_wallet_fails_before_tempo_signing_with_clear_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let keystore = Keystore::new(dir.path().join("keystore")).unwrap();
+        keystore.create_local("alice", "secret").unwrap();
+        let backend = RealMppBackend {
+            keystore,
+            client: reqwest::Client::new(),
+            rpc_url: "https://rpc.example.com".to_string(),
+        };
+        let challenge = NormalizedChallenge {
+            protocol: "mpp".into(),
+            intent: "charge".into(),
+            merchant: "merchant.test".into(),
+            realm: Some("merchant.test".into()),
+            network: Some("tempo".into()),
+            asset: Some("pathUSD".into()),
+            amount: Some("0".into()),
+            amount_usd: Some(0.0),
+            charge_id: Some("ch_locked".into()),
+            session_id: None,
+            deposit_amount: None,
+            deposit_usd: None,
+            chain_id: Some(42431),
+            unit_type: None,
+            channel_id: None,
+            challenge_id: Some("challenge-locked".into()),
+            request: None,
+            headers: BTreeMap::new(),
+        };
+        let request = parse_request("GET https://merchant.test/pay wallet=alice").unwrap();
+
+        let msg = match backend
+            .confirm(
+                &challenge,
+                &request,
+                "alice",
+                &Policy::default(),
+                "req_locked",
+            )
+            .await
+        {
+            Ok(_) => panic!("locked wallet unexpectedly signed Tempo MPP credential"),
+            Err(err) => err.to_string(),
+        };
+        assert!(msg.contains("wallet 'alice' is locked"), "{msg}");
+        assert!(msg.contains("unlock"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn locked_passkey_wallet_error_points_to_foreground_unlock_passkey_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        let keystore = Keystore::new(dir.path().join("keystore")).unwrap();
+        keystore.create_local("passkey_alice", "secret").unwrap();
+        fs::write(dir.path().join("keystore/passkey_alice/kind"), b"passkey").unwrap();
+        let backend = RealMppBackend {
+            keystore,
+            client: reqwest::Client::new(),
+            rpc_url: "https://rpc.example.com".to_string(),
+        };
+        let challenge = NormalizedChallenge {
+            protocol: "mpp".into(),
+            intent: "charge".into(),
+            merchant: "merchant.test".into(),
+            realm: Some("merchant.test".into()),
+            network: Some("tempo".into()),
+            asset: Some("pathUSD".into()),
+            amount: Some("0".into()),
+            amount_usd: Some(0.0),
+            charge_id: Some("ch_passkey_locked".into()),
+            session_id: None,
+            deposit_amount: None,
+            deposit_usd: None,
+            chain_id: Some(42431),
+            unit_type: None,
+            channel_id: None,
+            challenge_id: Some("challenge-passkey-locked".into()),
+            request: None,
+            headers: BTreeMap::new(),
+        };
+        let request = parse_request("GET https://merchant.test/pay wallet=passkey_alice").unwrap();
+
+        let msg = match backend
+            .confirm(
+                &challenge,
+                &request,
+                "passkey_alice",
+                &Policy::default(),
+                "req_passkey_locked",
+            )
+            .await
+        {
+            Ok(_) => panic!("locked passkey wallet unexpectedly signed Tempo MPP credential"),
+            Err(err) => err.to_string(),
+        };
+        assert!(msg.contains("passkey wallet"), "{msg}");
+        assert!(msg.contains("unlock-passkey"), "{msg}");
+        assert!(msg.contains("foreground"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn session_topup_and_close_controls_are_not_advertised_without_fresh_challenge() {
+        let dir = tempfile::tempdir().unwrap();
+        let keystore = Keystore::new(dir.path().join("keystore")).unwrap();
+        let handler = RequestsHandler::new(dir.path(), keystore, None);
+        let session_dir = dir.path().join("requests/sessions/sess_controls");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(session_dir.join("status"), "open\n").unwrap();
+        fs::write(session_dir.join("spent"), "0.25\n").unwrap();
+
+        let topup_lookup = handler
+            .lookup(&VfsPath::parse("/sessions/sess_controls/topup").unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(topup_lookup, HandlerError::NotFound(_)));
+        let close_lookup = handler
+            .lookup(&VfsPath::parse("/sessions/sess_controls/close").unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(close_lookup, HandlerError::NotFound(_)));
+
+        let topup_write = handler
+            .write(
+                &VfsPath::parse("/sessions/sess_controls/topup").unwrap(),
+                b"100",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            topup_write
+                .to_string()
+                .contains("fresh Tempo MPP session challenge")
+        );
+        let close_write = handler
+            .write(
+                &VfsPath::parse("/sessions/sess_controls/close").unwrap(),
+                b"close",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            close_write
+                .to_string()
+                .contains("fresh Tempo MPP session challenge")
+        );
     }
 
     #[tokio::test]
