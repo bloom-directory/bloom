@@ -20,6 +20,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use bloom_keystore::{Keystore, KeystoreError, WalletKind};
 use bloom_proto::Policy;
+use mpp::client::{PaymentProvider, TempoProvider, TempoSessionProvider};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -631,6 +632,16 @@ impl RequestsHandler {
             .to_string();
         let host = request.url.host_str().unwrap_or("unknown").to_string();
         let mut challenge: NormalizedChallenge = read_json(pending.join("challenge.json"))?;
+        if challenge.protocol == "mpp" && challenge.network.as_deref() == Some("tempo") {
+            let backend = RealMppBackend {
+                keystore: self.keystore.clone(),
+                client: self.client.clone(),
+                rpc_url: std::env::var("BLOOM_TEMPO_RPC_URL")
+                    .unwrap_or_else(|_| "https://rpc.moderato.tempo.xyz".to_string()),
+            };
+            confirm_with_backend(&self.root, id, data, &backend).await?;
+            return Ok(());
+        }
         let policy = self.wallet_policy(&wallet)?;
         let sentinel = policy.override_sentinel().to_ascii_lowercase();
         if !matches!(value.as_str(), "y" | "yes" | "confirm") && value != sentinel {
@@ -905,18 +916,18 @@ impl Handler for RequestsHandler {
                 if !dir.exists() {
                     return Err(HandlerError::NotFound(format!("/requests/sessions/{id}")));
                 }
-                fs::write(
-                    dir.join("status"),
-                    b"topup_unsupported_no_durable_channel\n",
-                )
-                .map_err(Into::into)
+                Err(HandlerError::invalid(
+                    "session top-up must be confirmed from a fresh Tempo MPP session challenge; refusing to fabricate a top-up credential from redacted session metadata",
+                ))
             }
             [state, id, action] if state == "sessions" && action == "close" => {
                 let dir = self.requests_root().join("sessions").join(id);
                 if !dir.exists() {
                     return Err(HandlerError::NotFound(format!("/requests/sessions/{id}")));
                 }
-                fs::write(dir.join("status"), b"closed_mock\n").map_err(Into::into)
+                Err(HandlerError::invalid(
+                    "session close requires a live TempoSessionProvider channel registry; refusing to fabricate a close voucher from redacted session metadata",
+                ))
             }
             [state, id, action] if state == "pending" && action == "cancel" => {
                 let pending = self.req_dir(state, id);
@@ -1047,6 +1058,11 @@ pub struct NormalizedChallenge {
     session_id: Option<String>,
     deposit_amount: Option<String>,
     deposit_usd: Option<f64>,
+    chain_id: Option<u64>,
+    unit_type: Option<String>,
+    channel_id: Option<String>,
+    challenge_id: Option<String>,
+    request: Option<serde_json::Value>,
     headers: BTreeMap<String, String>,
     accepts: Vec<PaymentRequirement>,
 }
@@ -1072,14 +1088,58 @@ impl NormalizedChallenge {
             "merchant": self.merchant,
             "charge_id": self.charge_id,
             "session_id": self.session_id,
+            "channel_id": self.channel_id,
             "deposit_amount": self.deposit_amount,
             "deposit_usd": self.deposit_usd,
+            "chain_id": self.chain_id,
+            "unit_type": self.unit_type,
         })
     }
 }
 
 fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> NormalizedChallenge {
     let header_map = headers_to_string_map(headers);
+    let www_values = headers
+        .get_all(reqwest::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>();
+    if let Some(challenge) = mpp::parse_www_authenticate_all(www_values)
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|c| c.method.as_str() == "tempo")
+    {
+        if let Ok(value) = challenge.request.decode::<serde_json::Value>() {
+            let method_details = value
+                .get("methodDetails")
+                .unwrap_or(&serde_json::Value::Null);
+            let amount = json_string(&value, &["amount"]);
+            let deposit_amount = json_string(&value, &["suggestedDeposit"]);
+            let channel_id = json_string(method_details, &["channelId"])
+                .or_else(|| json_string(&value, &["sessionId"]));
+            return NormalizedChallenge {
+                protocol: "mpp".into(),
+                intent: challenge.intent.as_str().to_string(),
+                merchant: challenge.realm.clone(),
+                realm: Some(challenge.realm),
+                network: Some("tempo".into()),
+                asset: json_string(&value, &["currency"]),
+                amount_usd: amount.as_deref().and_then(parse_money),
+                amount,
+                charge_id: json_string(&value, &["externalId"]),
+                session_id: channel_id.clone(),
+                deposit_usd: deposit_amount.as_deref().and_then(parse_money),
+                deposit_amount,
+                chain_id: method_details.get("chainId").and_then(|v| v.as_u64()),
+                unit_type: json_string(&value, &["unitType"]),
+                channel_id,
+                challenge_id: Some(challenge.id),
+                request: Some(value),
+                headers: header_map,
+                accepts: Vec::new(),
+            };
+        }
+    }
     let www = header_map
         .get("www-authenticate")
         .cloned()
@@ -1117,7 +1177,7 @@ fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Normalize
     {
         "session"
     } else {
-        "one_time"
+        "charge"
     };
     let accepts = parse_payment_requirements(&body_json);
     let session = body_json.get("session").unwrap_or(&serde_json::Value::Null);
@@ -1205,6 +1265,11 @@ fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Normalize
             .or_else(|| json_string(&body_json, &["sessionId"])),
         deposit_amount,
         deposit_usd,
+        chain_id: None,
+        unit_type: None,
+        channel_id: None,
+        challenge_id: None,
+        request: None,
         headers: header_map,
         accepts,
     }
@@ -1610,6 +1675,337 @@ fn evaluate_session_policy(
     out
 }
 
+#[async_trait]
+trait PaymentBackend: Send + Sync {
+    fn name(&self) -> &'static str;
+    async fn confirm(
+        &self,
+        challenge: &NormalizedChallenge,
+        request: &ParsedRequest,
+        wallet: &str,
+        policy: &Policy,
+        request_id: &str,
+    ) -> Result<PaymentExecution, HandlerError>;
+}
+
+struct RealMppBackend {
+    keystore: Keystore,
+    client: reqwest::Client,
+    rpc_url: String,
+}
+
+struct PaymentExecution {
+    credential_metadata: serde_json::Value,
+    receipt_raw: serde_json::Value,
+    response_status: u16,
+    response_headers: HeaderMap,
+    response_body: Vec<u8>,
+}
+
+struct ConfirmResult {
+    final_state: String,
+}
+
+#[async_trait]
+impl PaymentBackend for RealMppBackend {
+    fn name(&self) -> &'static str {
+        "mpp_tempo"
+    }
+
+    async fn confirm(
+        &self,
+        challenge: &NormalizedChallenge,
+        request: &ParsedRequest,
+        wallet: &str,
+        policy: &Policy,
+        _request_id: &str,
+    ) -> Result<PaymentExecution, HandlerError> {
+        if challenge.protocol != "mpp" || challenge.network.as_deref() != Some("tempo") {
+            return Err(HandlerError::invalid(
+                "only Tempo MPP challenges can be confirmed by the real MPP backend",
+            ));
+        }
+        let signer = self.keystore.signer(wallet).map_err(|e| {
+            HandlerError::invalid(format!(
+                "wallet '{wallet}' must be unlocked for Tempo MPP signing: {e}"
+            ))
+        })?;
+        let payment_challenge = parse_stored_mpp_challenge(challenge)?;
+        let credential = match challenge.intent.as_str() {
+            "charge" => {
+                let provider = TempoProvider::new((*signer).clone(), &self.rpc_url)
+                    .map_err(|e| HandlerError::backend(format!("TempoProvider: {e}")))?;
+                provider.pay(&payment_challenge).await
+            }
+            "session" => {
+                let mut provider = TempoSessionProvider::new((*signer).clone(), &self.rpc_url)
+                    .map_err(|e| HandlerError::backend(format!("TempoSessionProvider: {e}")))?;
+                if let Some(max) = policy
+                    .payments
+                    .sessions
+                    .max_deposit_usd
+                    .and_then(f64_to_u128_amount)
+                {
+                    provider = provider.with_max_deposit(max);
+                }
+                provider.pay(&payment_challenge).await
+            }
+            other => {
+                return Err(HandlerError::invalid(format!(
+                    "unsupported MPP intent '{other}'"
+                )));
+            }
+        }
+        .map_err(|e| HandlerError::backend(format!("Tempo MPP credential: {e}")))?;
+        let authorization = mpp::format_authorization(&credential)
+            .map_err(|e| HandlerError::backend(format!("format MPP Authorization: {e}")))?;
+        let authorization_sha256 = bloom_tools::sha256_hex(authorization.as_bytes());
+        let credential_value = serde_json::to_value(&credential).map_err(|e| {
+            HandlerError::backend(format!("serialize MPP credential metadata: {e}"))
+        })?;
+        let retry = retry_paid_request(&self.client, request, &authorization).await?;
+        let receipt_raw = retry
+            .headers
+            .get("payment-receipt")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| mpp::parse_receipt(h).ok())
+            .and_then(|r| serde_json::to_value(r).ok())
+            .unwrap_or_else(|| json!({}));
+        Ok(PaymentExecution {
+            credential_metadata: json!({
+                "redacted": true,
+                "protocol": challenge.protocol,
+                "intent": challenge.intent,
+                "backend": self.name(),
+                "authorization_sha256": authorization_sha256,
+                "source": credential_value.get("source").cloned(),
+                "payload_type": credential_value.get("payload").and_then(|p| p.get("type")).cloned(),
+                "charge_id": challenge.charge_id,
+                "session_id": challenge.session_id,
+                "channel_id": challenge.channel_id,
+                "secret_material_in_vfs": false,
+                "raw_authorization_stored": false,
+                "raw_signed_payload_stored": false
+            }),
+            receipt_raw,
+            response_status: retry.status,
+            response_headers: retry.headers,
+            response_body: retry.body,
+        })
+    }
+}
+
+async fn confirm_with_backend(
+    root: &Path,
+    id: &str,
+    data: &[u8],
+    backend: &dyn PaymentBackend,
+) -> Result<ConfirmResult, HandlerError> {
+    let value = String::from_utf8_lossy(data).trim().to_ascii_lowercase();
+    if !matches!(value.as_str(), "y" | "yes" | "confirm" | "override") {
+        return Err(HandlerError::invalid(
+            "confirm accepts y, yes, confirm, or override",
+        ));
+    }
+    let requests_root = root.join("requests");
+    let pending = requests_root.join("pending").join(id);
+    if !pending.exists() {
+        return Err(HandlerError::NotFound(format!("/requests/pending/{id}")));
+    }
+    let checks: Vec<PolicyCheck> = read_json(pending.join("policy_check.json"))?;
+    if checks.iter().any(|c| c.result == "deny") {
+        return Err(HandlerError::invalid(
+            "hard payment policy denial blocks confirmation",
+        ));
+    }
+    if checks.iter().any(|c| c.result == "warn") && value != "override" {
+        return Err(HandlerError::invalid(
+            "payment policy warning requires override",
+        ));
+    }
+    let challenge: NormalizedChallenge = read_json(pending.join("challenge.json"))?;
+    let request_value: serde_json::Value = read_json(pending.join("request.toml"))?;
+    let request = parsed_request_from_artifact(&request_value)?;
+    let wallet = request_value
+        .get("wallet")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| HandlerError::backend("request artifact missing wallet"))?
+        .to_string();
+    let policy = backend_policy_for_wallet(root, &wallet).unwrap_or_default();
+    let execution = backend
+        .confirm(&challenge, &request, &wallet, &policy, id)
+        .await?;
+    fs::create_dir_all(pending.join("response"))?;
+    write_json(
+        pending.join("credential.json"),
+        &execution.credential_metadata,
+    )?;
+    fs::write(
+        pending.join("response/status"),
+        format!("{}\n", execution.response_status),
+    )?;
+    fs::write(pending.join("response/body"), &execution.response_body)?;
+    write_json(
+        pending.join("response/headers.json"),
+        &headers_to_json(&execution.response_headers),
+    )?;
+    let sha = bloom_tools::sha256_hex(&execution.response_body);
+    fs::write(pending.join("response/body.sha256"), format!("{sha}\n"))?;
+    write_json(
+        pending.join("receipt.json"),
+        &json!({
+            "request_id": id,
+            "wallet": request_json_field(&pending, "wallet"),
+            "merchant": challenge.merchant,
+            "amount": challenge.amount,
+            "currency": challenge.asset,
+            "network": challenge.network,
+            "protocol": challenge.protocol,
+            "intent": challenge.intent,
+            "tx_hash": null,
+            "session_id": challenge.session_id,
+            "response_sha256": sha,
+            "mock_backend": false,
+            "raw": execution.receipt_raw
+        }),
+    )?;
+    write_json(
+        pending.join("audit.json"),
+        &json!({
+            "request_id": id,
+            "event": "confirmed_and_retried",
+            "backend": backend.name(),
+            "reads_spent": false,
+            "secret_material_in_vfs": false
+        }),
+    )?;
+    if challenge.intent == "session" {
+        let wallet = request_json_field(&pending, "wallet")
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string();
+        update_session_state(&requests_root, &challenge, id, &wallet)?;
+    }
+    fs::write(pending.join("status"), b"sent\n")?;
+    fs::create_dir_all(requests_root.join("sent"))?;
+    let sent = requests_root.join("sent").join(id);
+    if sent.exists() {
+        fs::remove_dir_all(&sent)?;
+    }
+    fs::rename(&pending, &sent)?;
+    fs::write(requests_root.join("latest"), format!("sent/{id}\n"))?;
+    Ok(ConfirmResult {
+        final_state: "sent".into(),
+    })
+}
+
+fn parse_stored_mpp_challenge(
+    challenge: &NormalizedChallenge,
+) -> Result<mpp::PaymentChallenge, HandlerError> {
+    challenge
+        .headers
+        .get("www-authenticate")
+        .and_then(|h| {
+            mpp::parse_www_authenticate_all([h.as_str()])
+                .into_iter()
+                .filter_map(Result::ok)
+                .find(|c| c.method.as_str() == "tempo" && c.intent.as_str() == challenge.intent)
+        })
+        .ok_or_else(|| {
+            HandlerError::backend(
+                "stored challenge is missing a parseable Tempo MPP WWW-Authenticate header",
+            )
+        })
+}
+
+fn f64_to_u128_amount(v: f64) -> Option<u128> {
+    if v.is_finite() && v >= 0.0 {
+        Some(v.floor() as u128)
+    } else {
+        None
+    }
+}
+
+fn parsed_request_from_artifact(v: &serde_json::Value) -> Result<ParsedRequest, HandlerError> {
+    let method = v
+        .get("method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("GET")
+        .to_string();
+    let url = v
+        .get("url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| HandlerError::backend("request artifact missing url"))?;
+    let headers = v
+        .get("headers")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    Ok(ParsedRequest {
+        method,
+        url: Url::parse(url).map_err(|e| HandlerError::backend(format!("stored url: {e}")))?,
+        wallet: v.get("wallet").and_then(|v| v.as_str()).map(str::to_string),
+        max_amount_usd: v.get("max_amount_usd").and_then(|v| v.as_f64()),
+        headers,
+        body: None,
+    })
+}
+
+fn backend_policy_for_wallet(root: &Path, wallet: &str) -> Result<Policy, HandlerError> {
+    let raw = fs::read_to_string(root.join("keystore").join(wallet).join("policy.toml"))?;
+    toml::from_str(&raw).map_err(|e| HandlerError::backend(e.to_string()))
+}
+
+struct RetryResponse {
+    status: u16,
+    headers: HeaderMap,
+    body: Vec<u8>,
+}
+
+async fn retry_paid_request(
+    client: &reqwest::Client,
+    request: &ParsedRequest,
+    authorization: &str,
+) -> Result<RetryResponse, HandlerError> {
+    let mut req = client.request(
+        request.method.parse().unwrap_or(reqwest::Method::GET),
+        request.url.clone(),
+    );
+    for (k, v) in &request.headers {
+        let name = HeaderName::from_bytes(k.as_bytes())
+            .map_err(|e| HandlerError::invalid(format!("invalid header {k}: {e}")))?;
+        let val = HeaderValue::from_str(v)
+            .map_err(|e| HandlerError::invalid(format!("invalid header {k}: {e}")))?;
+        req = req.header(name, val);
+    }
+    req = req.header(reqwest::header::AUTHORIZATION, authorization);
+    if let Some(body) = &request.body {
+        req = req.body(body.clone());
+    }
+    let response = req
+        .send()
+        .await
+        .map_err(|e| HandlerError::backend(format!("paid HTTP retry failed: {e}")))?;
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| HandlerError::backend(format!("read paid HTTP retry response: {e}")))?
+        .to_vec();
+    Ok(RetryResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+fn request_json_field(dir: &Path, field: &str) -> serde_json::Value {
+    read_json::<serde_json::Value>(dir.join("request.toml"))
+        .ok()
+        .and_then(|v| v.get(field).cloned())
+        .unwrap_or(serde_json::Value::Null)
+}
+
 /// Records a redacted, append-only voucher trail after a session-intent paid
 /// retry settles. This is *not* a durable Tempo MPP channel: real channel
 /// reuse, top-up, and close primitives from `mpp-rs` are not linked in this
@@ -1995,13 +2391,62 @@ inline = '{"prompt":"hi"}'
             &Url::parse("https://mpp.test/pay").unwrap(),
         );
         assert_eq!(c.protocol, "mpp");
-        assert_eq!(c.intent, "one_time");
+        assert_eq!(c.intent, "charge");
         assert_eq!(c.network.as_deref(), Some("tempo"));
         assert_eq!(c.asset.as_deref(), Some("pathUSD"));
         assert_eq!(c.amount.as_deref(), Some("0.25"));
         assert_eq!(c.amount_usd, Some(0.25));
         assert_eq!(c.charge_id.as_deref(), Some("ch_123"));
         assert_eq!(c.merchant, "merchant-42");
+    }
+
+    #[tokio::test]
+    async fn parses_real_mpp_payment_header_and_formats_real_tempo_charge_credential() {
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let request = mpp::protocol::core::Base64UrlJson::from_value(&json!({
+            "amount": "0",
+            "currency": "0x20c0000000000000000000000000000000000000",
+            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "methodDetails": { "chainId": 42431 }
+        }))
+        .unwrap();
+        let challenge = mpp::PaymentChallenge::new(
+            "challenge-123",
+            "merchant.test",
+            "tempo",
+            "charge",
+            request,
+        );
+        let header = mpp::format_www_authenticate(&challenge).unwrap();
+        let mut h = HeaderMap::new();
+        h.insert(
+            reqwest::header::WWW_AUTHENTICATE,
+            HeaderValue::from_str(&header).unwrap(),
+        );
+
+        let normalized =
+            normalize_challenge(&h, b"", &Url::parse("https://merchant.test/pay").unwrap());
+        assert_eq!(normalized.protocol, "mpp");
+        assert_eq!(normalized.intent, "charge");
+        assert_eq!(normalized.network.as_deref(), Some("tempo"));
+        assert_eq!(
+            normalized.asset.as_deref(),
+            Some("0x20c0000000000000000000000000000000000000")
+        );
+        assert_eq!(normalized.amount.as_deref(), Some("0"));
+        assert_eq!(normalized.chain_id, Some(42431));
+
+        let provider = TempoProvider::new(signer.clone(), "https://rpc.example.com").unwrap();
+        let credential = provider.pay(&challenge).await.unwrap();
+        let auth = mpp::format_authorization(&credential).unwrap();
+        assert!(auth.starts_with("Payment "));
+        assert_eq!(
+            credential.source,
+            Some(mpp::PaymentCredential::evm_did(
+                42431,
+                &signer.address().to_string()
+            ))
+        );
     }
 
     #[test]
@@ -2226,6 +2671,78 @@ inline = '{"prompt":"hi"}'
         assert!(error.contains("multiple wallets are available"));
         assert!(error.contains("alice"));
         assert!(error.contains("bob"));
+    }
+
+    struct StaticMppTestBackend;
+
+    #[async_trait]
+    impl PaymentBackend for StaticMppTestBackend {
+        fn name(&self) -> &'static str {
+            "mpp_tempo_test_double"
+        }
+
+        async fn confirm(
+            &self,
+            challenge: &NormalizedChallenge,
+            _request: &ParsedRequest,
+            _wallet: &str,
+            _policy: &Policy,
+            _request_id: &str,
+        ) -> Result<PaymentExecution, HandlerError> {
+            Ok(PaymentExecution {
+                credential_metadata: json!({
+                    "redacted": true,
+                    "backend": self.name(),
+                    "protocol": challenge.protocol,
+                    "intent": challenge.intent,
+                    "secret_material_in_vfs": false,
+                    "raw_authorization_stored": false,
+                    "raw_signed_payload_stored": false
+                }),
+                receipt_raw: json!({"backend": self.name()}),
+                response_status: 200,
+                response_headers: HeaderMap::new(),
+                response_body: b"paid response\n".to_vec(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn mpp_confirm_redacts_credentials_and_updates_session_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = dir.path().join("requests/pending/req_1");
+        fs::create_dir_all(&pending).unwrap();
+        let challenge = normalize_challenge(
+            &HeaderMap::new(),
+            br#"{"protocol":"tempo-mpp","type":"Session","network":"tempo","asset":"pathUSD","session":{"id":"sess_1","voucherAmount":"0.10","voucherAmountUsd":0.10,"depositAmount":"1.00","depositAmountUsd":1.00}}"#,
+            &Url::parse("https://mpp.test/data").unwrap(),
+        );
+        write_json(pending.join("challenge.json"), &challenge).unwrap();
+        let payment = challenge.payment_method();
+        write_json(pending.join("payment_method.json"), &payment).unwrap();
+        let empty_checks: Vec<PolicyCheck> = vec![];
+        write_json(pending.join("policy_check.json"), &empty_checks).unwrap();
+        write_json(
+            pending.join("request.toml"),
+            &json!({"method":"GET","url":"https://mpp.test/data","wallet":"alice","headers":{}}),
+        )
+        .unwrap();
+        fs::write(pending.join("request.http"), "GET https://mpp.test/data\n").unwrap();
+        fs::write(pending.join("status"), "pending\n").unwrap();
+
+        let result = confirm_with_backend(dir.path(), "req_1", b"confirm", &StaticMppTestBackend)
+            .await
+            .unwrap();
+        assert_eq!(result.final_state, "sent");
+        let credential: serde_json::Value =
+            read_json(dir.path().join("requests/sent/req_1/credential.json")).unwrap();
+        assert_eq!(credential["secret_material_in_vfs"], false);
+        assert!(credential.get("raw_voucher").is_none());
+        let spent = fs::read_to_string(dir.path().join("requests/sessions/sess_1/spent")).unwrap();
+        assert_eq!(spent.trim(), "0.1");
+        let receipt: serde_json::Value =
+            read_json(dir.path().join("requests/sent/req_1/receipt.json")).unwrap();
+        assert_eq!(receipt["session_id"], "sess_1");
     }
 
     #[tokio::test]

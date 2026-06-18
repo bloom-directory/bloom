@@ -608,17 +608,26 @@ Deferred question:
 - Enforce cumulative spend caps.
 - Support top-up and close flows with explicit confirmation.
 
-Implementation note: Tempo MPP charges and sessions are normalized and policy-gated
-(including cumulative session-spend caps) and share the same confirm path as x402 —
-the real keystore/passkey signer runs only after confirmation and policy approval, the
-paid retry is a real HTTP request, and a failed retry transitions the request to the
-`failed` state. Only redacted credential metadata, receipts, audit entries, and
-cumulative session spend are written; no raw vouchers or replayable secret material are
-stored in the VFS. Durable Tempo MPP channel reuse, top-up, and close are **not**
-implemented: no real `mpp-rs` Tempo signer/deposit/open/top-up/close primitives are
-linked into `bloom-vfs` yet, so a settled session is marked
-`settled_no_durable_channel` (never `open`) and the `topup`/`close` control files are
-limitation stubs pending a real provider.
+Implementation note: the Tempo MPP adapter uses the real `mpp` Rust SDK
+(`TempoProvider`/`TempoSessionProvider`) for Payment challenge parsing, Tempo
+charge/session credential creation, and Authorization/Payment-Receipt formatting.
+Tempo MPP charges and sessions are normalized and policy-gated (including
+cumulative session-spend caps) and share the same confirm path as x402: the real
+keystore/passkey signer runs only after confirmation and policy approval, x402
+keeps its keystore signer with a staged request-id–bound EIP-3009 nonce, the paid
+retry is a real HTTP request, and a failed retry (HTTP >= 400 or a
+signing/settlement error) transitions the request to the `failed` state. Only
+redacted credential metadata, receipts, audit entries, and cumulative session
+spend are written; no raw Authorization headers, signed transactions, voucher
+signatures, or other replayable secret material are stored in the VFS.
+
+Durable Tempo MPP channel reuse, top-up, and close are **not** implemented: no
+`mpp-rs` channel open/deposit/top-up/close primitives are linked into
+`bloom-vfs`, so a settled session is marked `settled_no_durable_channel` (never
+`open`) to avoid overclaiming a reusable channel. The `topup` and `close` control
+files refuse to fabricate credentials from redacted session metadata — top-up
+must be confirmed from a fresh Tempo MPP session challenge and close requires a
+live `TempoSessionProvider` channel registry.
 
 ### Milestone 5 — CLI parity
 
