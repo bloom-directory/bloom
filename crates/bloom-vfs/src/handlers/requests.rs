@@ -1184,7 +1184,9 @@ fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Normalize
     } else {
         "unknown"
     };
-    let intent = if lower_www.contains("session")
+    let intent = if protocol == "x402" {
+        "one_time"
+    } else if lower_www.contains("session")
         || body_json.get("session").is_some()
         || body_type == "session"
     {
@@ -1343,6 +1345,13 @@ fn parse_money(raw: &str) -> Option<f64> {
 fn trim_money(v: f64) -> String {
     let s = format!("{v:.6}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+fn paid_http_intent_label(intent: &str) -> &str {
+    match intent {
+        "charge" => "one_time",
+        other => other,
+    }
 }
 
 fn extract_realm(s: &str) -> Option<String> {
@@ -2148,7 +2157,7 @@ fn render_plan(
             wallet,
             host,
             ch.protocol,
-            ch.intent,
+            paid_http_intent_label(&ch.intent),
             ch.network.as_deref().unwrap_or("unknown"),
             ch.asset.as_deref().unwrap_or("unknown"),
             ch.amount.as_deref().unwrap_or("unknown"),
@@ -2934,6 +2943,7 @@ inline = '{"prompt":"hi"}'
             challenge_id: Some("challenge-locked".into()),
             request: None,
             headers: BTreeMap::new(),
+            accepts: Vec::new(),
         };
         let request = parse_request("GET https://merchant.test/pay wallet=alice").unwrap();
 
@@ -2984,6 +2994,7 @@ inline = '{"prompt":"hi"}'
             challenge_id: Some("challenge-passkey-locked".into()),
             request: None,
             headers: BTreeMap::new(),
+            accepts: Vec::new(),
         };
         let request = parse_request("GET https://merchant.test/pay wallet=passkey_alice").unwrap();
 
