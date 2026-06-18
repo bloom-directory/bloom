@@ -141,14 +141,14 @@ impl HeimdallDecompileDecoder {
         if let Some(entry) = self.in_memory.read().await.get(&codehash).cloned() {
             return entry;
         }
-        if let Some(dir) = &self.cache_dir {
-            if let Some(abi) = read_disk_cache(dir, codehash) {
-                self.in_memory
-                    .write()
-                    .await
-                    .insert(codehash, Some(abi.clone()));
-                return Some(abi);
-            }
+        if let Some(dir) = &self.cache_dir
+            && let Some(abi) = read_disk_cache(dir, codehash)
+        {
+            self.in_memory
+                .write()
+                .await
+                .insert(codehash, Some(abi.clone()));
+            return Some(abi);
         }
 
         let abi = match self.run_decompile(code).await {
@@ -159,10 +159,10 @@ impl HeimdallDecompileDecoder {
             }
         };
 
-        if let Some(dir) = &self.cache_dir {
-            if let Err(e) = write_disk_cache(dir, codehash, &abi) {
-                tracing::debug!(error = %e, "heimdall.cache_write_failed");
-            }
+        if let Some(dir) = &self.cache_dir
+            && let Err(e) = write_disk_cache(dir, codehash, &abi)
+        {
+            tracing::debug!(error = %e, "heimdall.cache_write_failed");
         }
         self.in_memory
             .write()

@@ -11,7 +11,7 @@
 //! - `wallets/<wallet>/public_key`                                  — secp256k1 pubkey hex
 //! - `wallets/<wallet>/kind`                                        — local/watch
 //! - `wallets/<wallet>/policy.toml`                                 — read+write policy
-//! - `wallets/<wallet>/chains/<chain>/balance(.eth|.raw)`           — native balance
+//! - `wallets/<wallet>/chains/<chain>/{balance,balance.raw,balance.json}` — native balance
 //! - `wallets/<wallet>/chains/<chain>/nonce`
 //! - `wallets/<wallet>/chains/<chain>/outbox/new.tx`                — write to stage
 //! - `wallets/<wallet>/chains/<chain>/outbox/pending/<id>/<file>`   — read staged
@@ -25,7 +25,7 @@ use alloy::signers::SignerSync;
 use async_trait::async_trait;
 use bloom_chain::ChainRegistry;
 use bloom_keystore::Keystore;
-use bloom_proto::{AddressBook, HomeWritePermit, RawIntent, format_units};
+use bloom_proto::{AddressBook, HomeWritePermit, RawIntent};
 use bloom_tx::{
     intent_parser,
     outbox::OutboxState,
@@ -193,6 +193,22 @@ impl Handler for WalletsHandler {
             );
         }
         r
+    }
+
+    fn cache_ttl(&self, path: &VfsPath) -> Option<std::time::Duration> {
+        let segs = path.segments();
+        match segs {
+            [_, s, _, leaf]
+                if s == "chains"
+                    && matches!(
+                        leaf.as_str(),
+                        "balance" | "balance.raw" | "balance.json" | "nonce"
+                    ) =>
+            {
+                Some(super::balances::LIVE_BALANCE_TTL)
+            }
+            _ => None,
+        }
     }
 
     /// Defense-in-depth gate against the mount layer rendering at
@@ -373,7 +389,7 @@ impl WalletsHandler {
             .ok_or_else(|| HandlerError::not_found(format!("chain '{}'", chain)))?;
         match rest {
             [] => Ok(Entry::dir(chain)),
-            [s] if s == "balance" || s == "balance.eth" || s == "balance.raw" || s == "nonce" => {
+            [s] if s == "balance" || s == "balance.raw" || s == "balance.json" || s == "nonce" => {
                 Ok(Entry::file(s))
             }
             [s] if s == "pending_external.jsonl" || s == "nonce_conflicts.json" => {
@@ -498,19 +514,30 @@ impl WalletsHandler {
             .get(chain)
             .ok_or_else(|| HandlerError::not_found(format!("chain '{}'", chain)))?;
         match rest {
-            [s] if s == "balance" || s == "balance.raw" => {
-                let bal = client.balance(info.address).await.map_err(err_be)?;
-                Ok(format!("{}\n", bal).into_bytes())
-            }
-            [s] if s == "balance.eth" => {
+            [s] if s == "balance" => {
                 let bal = client.balance(info.address).await.map_err(err_be)?;
                 let spec = client.spec();
-                Ok(format!(
-                    "{} {}\n",
-                    format_units(bal, spec.native_decimals),
-                    spec.native_symbol
-                )
-                .into_bytes())
+                Ok(super::balances::display_line(
+                    bal,
+                    spec.native_decimals,
+                    &spec.native_symbol,
+                ))
+            }
+            [s] if s == "balance.raw" => {
+                let bal = client.balance(info.address).await.map_err(err_be)?;
+                Ok(super::balances::raw_line(bal))
+            }
+            [s] if s == "balance.json" => {
+                let bal = client.balance(info.address).await.map_err(err_be)?;
+                let spec = client.spec();
+                Ok(super::balances::balance_json(
+                    chain,
+                    "native",
+                    None,
+                    &spec.native_symbol,
+                    spec.native_decimals,
+                    bal,
+                ))
             }
             [s] if s == "nonce" => {
                 let n = client.nonce(info.address).await.map_err(err_be)?;
@@ -644,8 +671,8 @@ impl WalletsHandler {
         match rest {
             [] => Ok(vec![
                 Entry::file("balance"),
-                Entry::file("balance.eth"),
                 Entry::file("balance.raw"),
+                Entry::file("balance.json"),
                 Entry::file("nonce"),
                 Entry::file("pending_external.jsonl"),
                 Entry::file("nonce_conflicts.json"),
@@ -1129,6 +1156,21 @@ mod tests {
             wallet_addr: info.address,
             sign_dir,
         }
+    }
+
+    #[tokio::test]
+    async fn balance_cache_ttl_covers_wallet_native_balance_leaves() {
+        let f = make_handler_with_chain(true);
+        for leaf in ["balance", "balance.raw", "balance.json", "nonce"] {
+            let p = VfsPath::parse(&format!("/alice/chains/anvil/{leaf}")).unwrap();
+            assert_eq!(
+                f.handler.cache_ttl(&p),
+                Some(super::super::balances::LIVE_BALANCE_TTL),
+                "leaf {leaf}"
+            );
+        }
+        let outbox = VfsPath::parse("/alice/chains/anvil/outbox").unwrap();
+        assert_eq!(f.handler.cache_ttl(&outbox), None);
     }
 
     /// Write a synthetic staged tx directly into the outbox so the tests

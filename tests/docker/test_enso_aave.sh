@@ -135,9 +135,9 @@ read_wallet_balance_breadcrumb "$MNT" "$CHAIN" "$WALLET" "$DEST1"
 # mode anvil_setBalance guarantees 10 ETH; in live mode the wallet
 # must already hold > swap+gas. We use awk for the comparison because
 # `[[ ... -lt ... ]]` is integer-only and the balance is decimal.
-[[ -n "$BAL_ETH" && "$BAL_ETH" != "0" ]] || fail "$WALLET ETH balance is 0"
-if ! awk -v b="$BAL_ETH" -v s="$SWAP_AMOUNT_ETH" 'BEGIN { exit !(b+0 > s+0) }'; then
-    fail "$WALLET ETH balance ($BAL_ETH) is not greater than swap amount ($SWAP_AMOUNT_ETH); top up before retrying"
+[[ -n "$BAL_NATIVE" && "$BAL_NATIVE" != "0" ]] || fail "$WALLET native balance is 0"
+if ! awk -v b="$BAL_NATIVE" -v s="$SWAP_AMOUNT_ETH" 'BEGIN { exit !(b+0 > s+0) }'; then
+    fail "$WALLET native balance ($BAL_NATIVE) is not greater than swap amount ($SWAP_AMOUNT_ETH); top up before retrying"
 fi
 
 # ---------- post the intent through the mount ----------

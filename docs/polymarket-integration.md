@@ -44,8 +44,8 @@ instruction to trade.
 - Passkey/WebAuthn proves user presence, not transaction content. Bloom opens a
   local browser review page and prints a matching review hash; this is a local
   consistency check, not a hardware trusted display.
-- Scoped run capabilities are the next auth milestone; see
-  `docs/plans/2026-06-13-scoped-agent-run-capabilities-roadmap.md`.
+- Scoped run capabilities are the next auth milestone and remain tracked in the
+  active plan queue.
 
 ## Funding And Approvals
 

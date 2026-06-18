@@ -110,6 +110,10 @@ wasmparser = "0.218"
 webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation"] }
 open = "5"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+# QR rendering for deposit addresses. `svg` is a dependency-free string renderer
+# (for `wallet address --qr-out`); we drop the heavy `image`/PNG renderer. The
+# built-in unicode renderer covers the terminal QR.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 # Ethereum stack
 alloy = { version = "2", features = ["full", "signer-local", "rpc-types", "providers", "provider-http", "consensus", "network", "rlp", "json-abi", "k256", "eips", "essentials", "contract", "transport-throttle", "json-rpc"] }

@@ -43,6 +43,25 @@ WP0 probed `https://quoter.api.enso.build` on 2026-06-14:
   `RouteResponse::calldata_contains_receiver(addr)` as a consistency check, not
   a malicious-Enso defense.
 
+Polymarket funding probe on 2026-06-17:
+
+- Enso does route Polygon native → pUSD (`PUSD =
+  0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB`) today. A live Bloom dry-run for
+  `--target-pusd 6 --max-spend 90 --from-token native` returned an Enso router
+  route via `bitget` to the resolved Polymarket deposit wallet.
+- The observed route was roughly `79.0367 POL -> >= 6.121186 pUSD`. Given POL at
+  about `$0.077` at probe time, this was not obviously a bad route; agents
+  confused by old MATIC price intuition may overestimate the native balance's
+  USD value.
+- The route still produced quote-only warnings: minimum output was the Enso quote
+  floor, not simulation-verified, and receiver/min-output verification remains
+  incomplete until this plan lands.
+- EVM policy denied the staged tx because the route attached about `79` native
+  units while the wallet cap was `max_value_eth = 0.1`. This is a native-token
+  quantity cap, not a USD cap. Do not solve that by broadening caps inside this
+  verification work; surface the quantity clearly and require normal policy
+  review.
+
 Autonomous cross-chain DeFi remains denied until both the calldata receiver
 consistency check and live destination settlement proof hold. Same-chain routes
 may use the calldata consistency check once min-output simulation policy exists.
@@ -189,6 +208,9 @@ decoder.
 - receiver must be the authoritative deposit wallet/funding address;
 - target pUSD amount must be proven by simulated output or settlement;
 - quote-only funding is denied for autonomous mode.
+- dry-run/review artifacts must say whether the route is merely quote-backed or
+  simulation-verified, and must include the native input quantity separately from
+  any optional USD estimate.
 
 Direct pUSD owner-to-deposit transfers are simple ERC-20 transfers and can use
 decoded standard calldata plus normal TxEngine policy.
@@ -203,6 +225,8 @@ decoded standard calldata plus normal TxEngine policy.
 - Policy denies below-floor output.
 - Policy denies unverified receiver for autonomous VFS.
 - Foreground quote-only path requires explicit signed policy opt-in.
+- Polymarket native→pUSD route fixtures preserve output token, receiver, native
+  value, protocols, and quote-only warning state.
 - VFS `confirm` refreshes validation immediately before staging.
 - Cross-chain dependent action refuses until live settlement proof exists.
 

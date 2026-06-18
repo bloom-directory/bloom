@@ -14,12 +14,17 @@ ignored `docs/.scratch/`.
   min-output and settlement remain before unattended use.
 - `2026-06-13-policy-browser-editor.md` — separate validated policy editor;
   fuzzy search belongs there, not as a separate active plan.
+- `2026-06-16-wallet-agenda-entanglement-scan.md` — live-first wallet agenda
+  and cross-protocol entanglement scan design; Phase 0 not yet built.
+- `2026-06-17-next-priorities-mcp-first.md` — prioritization note for building
+  a read-only MCP interface before larger agent-facing surfaces.
 
 ## Removed From Active Set
 
 Live-run notes and superseded drafts for passkey review pages, Polymarket
-funding/auth UX, VFS exit UX, agent-friendly IPC, and broad policy autonomy are
-implemented, stale, or covered by the active plans above.
+funding/auth UX, VFS exit UX, agent-friendly IPC, deposit QR export, native
+balance display, Polymarket account workflow clarity, and broad policy autonomy
+are implemented, stale, or covered by the active plans above.
 
 ## Older Open Work
 

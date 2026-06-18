@@ -11,6 +11,21 @@ If you are delegating setup to an agent, the fastest path is:
 Read https://bloom.directory/SKILL.md and set up Bloom.
 ```
 
+## Agent-first shape
+
+Bloom's primary surface is the VFS. Use `init` to create the home directory,
+`wallet` commands for explicit key management, and `vfs cat|ls|write` for the
+same paths an agent sees through the mount. There is no separate top-level
+onboarding dashboard; first-run setup is just the same primitives in sequence:
+create a wallet, show its deposit QR, then inspect balances and staged actions
+through the VFS.
+
+Fund the deposit address, then review every staged plan before signing. Caps
+and allow/deny live in each wallet's `policy.toml`; value-moving actions still
+go through the stage → review → confirm outbox flow. Polymarket trading
+additionally requires `bloom polymarket onboard <wallet>` (see `AGENTS.md`).
+Re-display a deposit address any time with `bloom wallet address <name> --qr`.
+
 ## Prerequisites
 
 - Rust toolchain — pinned via `rust-toolchain.toml` (installed
@@ -179,7 +194,7 @@ it expire after the configured TTL) cancels the stage.
   and contract `source` / `abi`. Requires an `[etherscan]` block in
   `config.toml`.
 - **ERC-20 reads** — `chains/<c>/addresses/<a>/tokens/<token>/{balance,
-  balance.raw,balance.formatted,symbol,decimals}` (live `eth_call`).
+  balance.raw,balance.json,symbol,decimals}` (live `eth_call`).
 - **ENS** — recipient names like `vitalik.eth` resolve in tx intents
   via the canonical mainnet registry; forward resolution is also
   exposed at `ens/<name>.eth`.

@@ -59,7 +59,7 @@ wait_for_mount "$SENTINEL" "$DAEMON_PID" "$LOGFILE" 90
 read_chain_head_breadcrumb "$MNT" "$CHAIN"
 read_wallet_balance_breadcrumb "$MNT" "$CHAIN" "$WALLET" "$DEST1"
 
-[[ -n "$BAL_ETH" && "$BAL_ETH" != "0" ]] || fail "$WALLET ETH balance is 0 after anvil_setBalance"
+[[ -n "$BAL_NATIVE" && "$BAL_NATIVE" != "0" ]] || fail "$WALLET native balance is 0 after anvil_setBalance"
 
 # ---------- 1. stage + confirm a native-ETH send via the outbox ----------
 OUTBOX="$MNT/wallets/$WALLET/chains/$CHAIN/outbox"
