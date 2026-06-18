@@ -3,13 +3,22 @@
 //! This handler owns the `/requests` VFS tree. Reads only expose durable
 //! artefacts; payment/signing boundaries are writable control files.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use alloy::dyn_abi::Eip712Domain;
+use alloy::primitives::{Address, B256, U256, keccak256};
+use alloy::signers::SignerSync;
+use alloy::sol;
+use alloy::sol_types::SolStruct;
 use async_trait::async_trait;
-use bloom_keystore::Keystore;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use bloom_keystore::{Keystore, KeystoreError, WalletKind};
 use bloom_proto::Policy;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -25,6 +34,233 @@ pub struct RequestsHandler {
     keystore: Keystore,
     default_wallet: Option<String>,
     client: reqwest::Client,
+    x402_signer: Arc<dyn X402PaymentSigner>,
+}
+
+pub trait X402PaymentSigner: Send + Sync {
+    fn sign_x402_payment(
+        &self,
+        ctx: &X402SignContext<'_>,
+    ) -> Result<X402PaymentCredential, HandlerError>;
+}
+
+pub struct X402SignContext<'a> {
+    pub wallet: &'a str,
+    /// Stable id of the staged pending request. The nonce in
+    /// `TransferWithAuthorization` is derived from this so it is bound to the
+    /// request the user actually confirmed, not a fresh id generated at sign
+    /// time.
+    pub request_id: &'a str,
+    pub request: &'a ParsedRequest,
+    pub challenge: &'a NormalizedChallenge,
+    pub requirement: &'a PaymentRequirement,
+}
+
+pub struct X402PaymentCredential {
+    /// The secret-bearing value sent as the `X-PAYMENT` retry header. This is
+    /// intentionally never persisted to credential.json.
+    pub header_value: String,
+    /// Redacted/public metadata safe to expose in the VFS.
+    pub public_metadata: serde_json::Value,
+}
+
+sol! {
+    #[allow(missing_docs)]
+    struct TransferWithAuthorization {
+        address from;
+        address to;
+        uint256 value;
+        uint256 validAfter;
+        uint256 validBefore;
+        bytes32 nonce;
+    }
+}
+
+pub struct KeystoreX402PaymentSigner {
+    keystore: Keystore,
+}
+
+impl KeystoreX402PaymentSigner {
+    pub fn new(keystore: Keystore) -> Self {
+        Self { keystore }
+    }
+}
+
+impl X402PaymentSigner for KeystoreX402PaymentSigner {
+    fn sign_x402_payment(
+        &self,
+        ctx: &X402SignContext<'_>,
+    ) -> Result<X402PaymentCredential, HandlerError> {
+        let signer = self.keystore.signer(ctx.wallet).map_err(|e| {
+            HandlerError::backend(x402_keystore_signer_error(ctx.wallet, &self.keystore, e))
+        })?;
+        let info = self.keystore.info(ctx.wallet).map_err(|e| {
+            HandlerError::backend(format!("x402 signer wallet metadata unavailable: {e}"))
+        })?;
+        let scheme = ctx.requirement.scheme.as_deref().unwrap_or("exact");
+        if scheme != "exact" {
+            return Err(HandlerError::backend(format!(
+                "x402 keystore signer supports exact EVM requirements, got scheme '{scheme}'"
+            )));
+        }
+        let network = ctx
+            .requirement
+            .network
+            .as_deref()
+            .ok_or_else(|| HandlerError::backend("x402 requirement missing network"))?;
+        let chain_id = x402_evm_chain_id(network)?;
+        let asset = parse_x402_address(ctx.requirement.asset.as_deref(), "asset")?;
+        let pay_to = parse_x402_address(ctx.requirement.pay_to.as_deref(), "payTo")?;
+        let now = unix_seconds();
+        let valid_after = U256::from(now.saturating_sub(600));
+        let valid_before = U256::from(now + x402_max_timeout_seconds(ctx.requirement));
+        let nonce = x402_nonce(ctx, now);
+        let value = U256::from_str_radix(ctx.requirement.amount.as_deref().unwrap_or("0"), 10)
+            .map_err(|e| HandlerError::backend(format!("x402 amount is not uint256: {e}")))?;
+        let authorization = json!({
+            "from": info.address.to_string(),
+            "to": pay_to.to_string(),
+            "value": value.to_string(),
+            "validAfter": valid_after.to_string(),
+            "validBefore": valid_before.to_string(),
+            "nonce": nonce.to_string(),
+        });
+        let auth = TransferWithAuthorization {
+            from: info.address,
+            to: pay_to,
+            value,
+            validAfter: valid_after,
+            validBefore: valid_before,
+            nonce,
+        };
+        let domain = Eip712Domain {
+            name: x402_requirement_extra_str(ctx.requirement, "name").map(Cow::Owned),
+            version: x402_requirement_extra_str(ctx.requirement, "version").map(Cow::Owned),
+            chain_id: Some(U256::from(chain_id)),
+            verifying_contract: Some(asset),
+            ..Eip712Domain::default()
+        };
+        let digest = auth.eip712_signing_hash(&domain);
+        let signature = signer
+            .sign_hash_sync(&digest)
+            .map_err(|e| HandlerError::backend(format!("x402 keystore signing failed: {e}")))?
+            .to_string();
+        let header = json!({
+            "x402Version": 1,
+            "scheme": scheme,
+            "network": network,
+            "payload": {
+                "signature": signature,
+                "authorization": authorization,
+            },
+        });
+        let header_bytes = serde_json::to_vec(&header)
+            .map_err(|e| HandlerError::backend(format!("serialize x402 header: {e}")))?;
+        Ok(X402PaymentCredential {
+            header_value: STANDARD.encode(header_bytes),
+            public_metadata: json!({
+                "signer_backend": "bloom-keystore",
+                "wallet": ctx.wallet,
+                "wallet_kind": wallet_kind_label(info.kind),
+                "address": info.address.to_string(),
+                "scheme": scheme,
+                "network": network,
+                "asset": asset.to_string(),
+                "pay_to": pay_to.to_string(),
+                "resource": ctx.requirement.resource.as_deref().unwrap_or(ctx.request.url.as_str()),
+                "authorization": authorization,
+                "signature": "redacted",
+            }),
+        })
+    }
+}
+
+fn parse_x402_address(value: Option<&str>, field: &str) -> Result<Address, HandlerError> {
+    value
+        .ok_or_else(|| HandlerError::backend(format!("x402 requirement missing {field}")))?
+        .parse::<Address>()
+        .map_err(|e| {
+            HandlerError::backend(format!(
+                "x402 requirement {field} is not an EVM address: {e}"
+            ))
+        })
+}
+
+fn x402_evm_chain_id(network: &str) -> Result<u64, HandlerError> {
+    match network {
+        "abstract" => Ok(2741),
+        "abstract-testnet" => Ok(11124),
+        "base-sepolia" => Ok(84532),
+        "base" => Ok(8453),
+        "avalanche-fuji" => Ok(43113),
+        "avalanche" => Ok(43114),
+        "iotex" => Ok(4689),
+        "sei" => Ok(1329),
+        "sei-testnet" => Ok(1328),
+        "polygon" => Ok(137),
+        "polygon-amoy" => Ok(80002),
+        "peaq" => Ok(3338),
+        "story" => Ok(1514),
+        "educhain" => Ok(41923),
+        "skale-base-sepolia" => Ok(324705682),
+        other => Err(HandlerError::backend(format!(
+            "x402 keystore signer supports EVM networks only; unsupported network '{other}'"
+        ))),
+    }
+}
+
+fn x402_requirement_extra_str(req: &PaymentRequirement, key: &str) -> Option<String> {
+    req.raw
+        .get("extra")
+        .and_then(|v| v.get(key))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+fn x402_max_timeout_seconds(req: &PaymentRequirement) -> u64 {
+    req.raw
+        .get("maxTimeoutSeconds")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(60)
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn x402_nonce(ctx: &X402SignContext<'_>, now: u64) -> B256 {
+    keccak256(
+        format!(
+            "{}:{}:{}:{now}",
+            ctx.wallet, ctx.request.url, ctx.request_id
+        )
+        .as_bytes(),
+    )
+}
+
+fn wallet_kind_label(kind: WalletKind) -> &'static str {
+    match kind {
+        WalletKind::Local => "local",
+        WalletKind::Watch => "watch",
+        WalletKind::PasskeyGated => "passkey",
+    }
+}
+
+fn x402_keystore_signer_error(wallet: &str, keystore: &Keystore, err: KeystoreError) -> String {
+    match err {
+        KeystoreError::Locked(_) => match keystore.info(wallet).map(|i| i.kind) {
+            Ok(WalletKind::PasskeyGated) => format!(
+                "wallet '{wallet}' is locked; passkey wallets must be foreground-unlocked with unlock_passkey before confirming this paid request"
+            ),
+            _ => format!(
+                "wallet '{wallet}' is locked; unlock the wallet before confirming this paid request"
+            ),
+        },
+        other => format!("x402 keystore signer unavailable for wallet '{wallet}': {other}"),
+    }
 }
 
 impl RequestsHandler {
@@ -35,10 +271,16 @@ impl RequestsHandler {
     ) -> Self {
         Self {
             root: root.into(),
-            keystore,
+            keystore: keystore.clone(),
             default_wallet,
             client: reqwest::Client::new(),
+            x402_signer: Arc::new(KeystoreX402PaymentSigner::new(keystore)),
         }
+    }
+
+    pub fn with_x402_signer(mut self, signer: Arc<dyn X402PaymentSigner>) -> Self {
+        self.x402_signer = signer;
+        self
     }
 
     fn requests_root(&self) -> PathBuf {
@@ -330,26 +572,83 @@ impl RequestsHandler {
         Ok(())
     }
 
-    fn confirm(&self, id: &str, data: &[u8]) -> Result<(), HandlerError> {
+    async fn confirm(&self, id: &str, data: &[u8]) -> Result<(), HandlerError> {
         let value = String::from_utf8_lossy(data).trim().to_ascii_lowercase();
         let pending = self.req_dir("pending", id);
         if !pending.exists() {
             return Err(HandlerError::NotFound(format!("/requests/pending/{id}")));
         }
-        let payment: serde_json::Value = read_json(pending.join("payment_method.json"))?;
-        let checks: Vec<PolicyCheck> = read_json(pending.join("policy_check.json"))?;
-        let request_meta: serde_json::Value = read_json(pending.join("request.toml"))?;
-        let wallet = request_meta
-            .get("wallet")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| HandlerError::backend("request metadata missing wallet"))?;
-        let policy = self.wallet_policy(wallet)?;
+        let request_json: serde_json::Value = read_json(pending.join("request.toml"))?;
+        let request = ParsedRequest {
+            method: request_json
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("GET")
+                .to_string(),
+            url: Url::parse(
+                request_json
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| HandlerError::backend("request.toml missing url"))?,
+            )
+            .map_err(|e| HandlerError::backend(format!("stored request url: {e}")))?,
+            wallet: request_json
+                .get("wallet")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            max_amount_usd: request_json.get("max_amount_usd").and_then(|v| v.as_f64()),
+            headers: serde_json::from_value(
+                request_json
+                    .get("headers")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            )
+            .map_err(|e| HandlerError::backend(format!("stored request headers: {e}")))?,
+            body: request_json
+                .get("body")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        };
+        let wallet = request
+            .wallet
+            .as_deref()
+            .ok_or_else(|| HandlerError::backend("request.toml missing wallet"))?
+            .to_string();
+        let host = request.url.host_str().unwrap_or("unknown").to_string();
+        let mut challenge: NormalizedChallenge = read_json(pending.join("challenge.json"))?;
+        let policy = self.wallet_policy(&wallet)?;
         let sentinel = policy.override_sentinel().to_ascii_lowercase();
         if !matches!(value.as_str(), "y" | "yes" | "confirm") && value != sentinel {
             return Err(HandlerError::invalid(format!(
                 "confirm accepts y, yes, confirm, or policy override sentinel '{sentinel}'"
             )));
         }
+        let requirement = select_payment_requirement(&challenge, &policy, &host)
+            .or_else(|| challenge.accepts.first().cloned())
+            .unwrap_or_else(|| PaymentRequirement {
+                scheme: None,
+                network: challenge.network.clone(),
+                asset: challenge.asset.clone(),
+                amount: challenge.amount.clone(),
+                pay_to: None,
+                resource: None,
+                raw: json!({}),
+            });
+        challenge.network = requirement.network.clone();
+        challenge.asset = requirement.asset.clone();
+        challenge.amount = requirement.amount.clone();
+        let checks = evaluate_payment_policy(
+            &policy,
+            PolicyEvalInput {
+                host: &host,
+                asset: challenge.asset.as_deref(),
+                network: challenge.network.as_deref(),
+                intent: &challenge.intent,
+                amount_usd: challenge.amount_usd,
+                request_max_amount_usd: request.max_amount_usd,
+                spent_24h_usd: self.sum_paid_usd_last_24h(&wallet)?,
+            },
+        );
         if checks.iter().any(|c| c.result == "deny") {
             return Err(HandlerError::invalid(
                 "hard payment policy denial blocks confirmation",
@@ -360,24 +659,91 @@ impl RequestsHandler {
                 "payment policy warning requires override sentinel '{sentinel}'"
             )));
         }
+        let credential = self.x402_signer.sign_x402_payment(&X402SignContext {
+            wallet: &wallet,
+            request_id: id,
+            request: &request,
+            challenge: &challenge,
+            requirement: &requirement,
+        })?;
+
+        let mut retry = self.client.request(
+            request.method.parse().unwrap_or(reqwest::Method::GET),
+            request.url.clone(),
+        );
+        for (k, v) in &request.headers {
+            let name = HeaderName::from_bytes(k.as_bytes())
+                .map_err(|e| HandlerError::invalid(format!("invalid header {k}: {e}")))?;
+            let val = HeaderValue::from_str(v)
+                .map_err(|e| HandlerError::invalid(format!("invalid header {k}: {e}")))?;
+            retry = retry.header(name, val);
+        }
+        retry = retry.header("X-PAYMENT", credential.header_value.clone());
+        if let Some(body) = &request.body {
+            retry = retry.body(body.clone());
+        }
+        let response = retry
+            .send()
+            .await
+            .map_err(|e| HandlerError::backend(format!("paid HTTP retry failed: {e}")))?;
+        let status = response.status().as_u16();
+        let response_headers = response.headers().clone();
+        let response_body = response
+            .bytes()
+            .await
+            .map_err(|e| HandlerError::backend(format!("read paid HTTP response: {e}")))?
+            .to_vec();
+        let sha = bloom_tools::sha256_hex(&response_body);
         write_json(
             pending.join("credential.json"),
             &json!({
                 "redacted": true,
-                "protocol": payment.get("protocol"),
-                "intent": payment.get("intent"),
+                "protocol": "x402",
+                "intent": challenge.intent,
+                "scheme": requirement.scheme,
+                "network": requirement.network,
+                "asset": requirement.asset,
+                "pay_to": requirement.pay_to,
                 "material": "not_stored",
-                "secret_material_in_vfs": false
+                "secret_material_in_vfs": false,
+                "public": credential.public_metadata,
             }),
         )?;
-        fs::write(pending.join("status"), b"failed\n")?;
-        fs::write(pending.join("error.txt"), b"payment execution adapter is staged but no signer/settlement backend is configured; no credential or secret was stored in the VFS\n")?;
-        let failed = self.req_dir("failed", id);
-        if failed.exists() {
-            fs::remove_dir_all(&failed)?;
+        fs::write(pending.join("response/status"), format!("{status}\n"))?;
+        write_json(
+            pending.join("response/headers.json"),
+            &headers_to_json(&response_headers),
+        )?;
+        fs::write(pending.join("response/body"), &response_body)?;
+        fs::write(pending.join("response/body.sha256"), format!("{sha}\n"))?;
+        write_json(
+            pending.join("receipt.json"),
+            &json!({
+                "request_id": id,
+                "wallet": wallet,
+                "merchant": host,
+                "amount": requirement.amount,
+                "currency": requirement.asset,
+                "network": requirement.network,
+                "protocol": "x402",
+                "scheme": requirement.scheme,
+                "amount_usd": challenge.amount_usd,
+                "response_status": status,
+                "credential_redacted": true,
+            }),
+        )?;
+        write_json(
+            pending.join("audit.json"),
+            &json!({"request_id": id, "event": "confirmed_and_retried", "reads_spent": false, "credential_redacted": true}),
+        )?;
+        let target_state = if status < 400 { "sent" } else { "failed" };
+        fs::write(pending.join("status"), format!("{target_state}\n"))?;
+        let target = self.req_dir(target_state, id);
+        if target.exists() {
+            fs::remove_dir_all(&target)?;
         }
-        fs::rename(&pending, &failed)?;
-        self.write_latest("failed", id)?;
+        fs::rename(&pending, &target)?;
+        self.write_latest(target_state, id)?;
         Ok(())
     }
 }
@@ -496,10 +862,10 @@ impl Handler for RequestsHandler {
                         "only pending requests can be confirmed",
                     ));
                 }
-                self.confirm(&id, data)
+                self.confirm(&id, data).await
             }
             [state, id, action] if state == "pending" && action == "confirm" => {
-                self.confirm(id, data)
+                self.confirm(id, data).await
             }
             [state, id, action] if state == "pending" && action == "cancel" => {
                 let pending = self.req_dir(state, id);
@@ -518,7 +884,7 @@ impl Handler for RequestsHandler {
 }
 
 #[derive(Debug, Clone)]
-struct ParsedRequest {
+pub struct ParsedRequest {
     method: String,
     url: Url,
     wallet: Option<String>,
@@ -617,7 +983,7 @@ fn parse_request(input: &str) -> Result<ParsedRequest, HandlerError> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct NormalizedChallenge {
+pub struct NormalizedChallenge {
     protocol: String,
     intent: String,
     merchant: String,
@@ -627,6 +993,18 @@ struct NormalizedChallenge {
     amount: Option<String>,
     amount_usd: Option<f64>,
     headers: BTreeMap<String, String>,
+    accepts: Vec<PaymentRequirement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaymentRequirement {
+    pub scheme: Option<String>,
+    pub network: Option<String>,
+    pub asset: Option<String>,
+    pub amount: Option<String>,
+    pub pay_to: Option<String>,
+    pub resource: Option<String>,
+    pub raw: serde_json::Value,
 }
 
 impl NormalizedChallenge {
@@ -658,33 +1036,22 @@ fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Normalize
     } else {
         "one_time"
     };
+    let accepts = parse_payment_requirements(&body_json);
     let network = body_json
         .pointer("/network")
         .and_then(|v| v.as_str())
-        .or_else(|| {
-            body_json
-                .pointer("/accepts/0/network")
-                .and_then(|v| v.as_str())
-        })
-        .map(str::to_string);
+        .map(str::to_string)
+        .or_else(|| accepts.first().and_then(|a| a.network.clone()));
     let asset = body_json
         .pointer("/asset")
         .and_then(|v| v.as_str())
-        .or_else(|| {
-            body_json
-                .pointer("/accepts/0/asset")
-                .and_then(|v| v.as_str())
-        })
-        .map(str::to_string);
+        .map(str::to_string)
+        .or_else(|| accepts.first().and_then(|a| a.asset.clone()));
     let amount = body_json
         .pointer("/amount")
         .and_then(|v| v.as_str())
-        .or_else(|| {
-            body_json
-                .pointer("/accepts/0/maxAmountRequired")
-                .and_then(|v| v.as_str())
-        })
-        .map(str::to_string);
+        .map(str::to_string)
+        .or_else(|| accepts.first().and_then(|a| a.amount.clone()));
     let amount_usd = body_json
         .pointer("/amountUsd")
         .and_then(json_number)
@@ -709,7 +1076,39 @@ fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Normalize
         amount,
         amount_usd,
         headers: header_map,
+        accepts,
     }
+}
+
+fn parse_payment_requirements(body_json: &serde_json::Value) -> Vec<PaymentRequirement> {
+    let accepts = body_json
+        .get("accepts")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_else(|| vec![body_json.clone()]);
+    accepts
+        .into_iter()
+        .filter(|v| v.is_object())
+        .map(|v| PaymentRequirement {
+            scheme: v.get("scheme").and_then(|x| x.as_str()).map(str::to_string),
+            network: v
+                .get("network")
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
+            asset: v.get("asset").and_then(|x| x.as_str()).map(str::to_string),
+            amount: v
+                .get("maxAmountRequired")
+                .or_else(|| v.get("amount"))
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
+            pay_to: v.get("payTo").and_then(|x| x.as_str()).map(str::to_string),
+            resource: v
+                .get("resource")
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
+            raw: v,
+        })
+        .collect()
 }
 
 fn extract_realm(s: &str) -> Option<String> {
@@ -966,6 +1365,42 @@ fn usd_fmt(v: f64) -> String {
 }
 fn json_number(v: &serde_json::Value) -> Option<f64> {
     v.as_f64().or_else(|| v.as_str()?.parse().ok())
+}
+
+fn select_payment_requirement(
+    challenge: &NormalizedChallenge,
+    policy: &Policy,
+    host: &str,
+) -> Option<PaymentRequirement> {
+    let candidates = if challenge.accepts.is_empty() {
+        vec![PaymentRequirement {
+            scheme: None,
+            network: challenge.network.clone(),
+            asset: challenge.asset.clone(),
+            amount: challenge.amount.clone(),
+            pay_to: None,
+            resource: None,
+            raw: json!({}),
+        }]
+    } else {
+        challenge.accepts.clone()
+    };
+    candidates.into_iter().find(|req| {
+        !evaluate_payment_policy(
+            policy,
+            PolicyEvalInput {
+                host,
+                asset: req.asset.as_deref(),
+                network: req.network.as_deref(),
+                intent: &challenge.intent,
+                amount_usd: challenge.amount_usd,
+                request_max_amount_usd: None,
+                spent_24h_usd: 0.0,
+            },
+        )
+        .iter()
+        .any(|c| c.result == "deny")
+    })
 }
 
 fn render_plan(
@@ -1315,6 +1750,8 @@ inline = '{"prompt":"hi"}'
                 .iter()
                 .any(|c| c.rule == "caps.require_confirm_above_usd" && c.result == "warn")
         );
+    }
+
     #[tokio::test]
     async fn free_request_moves_to_sent_and_reads_body_receipt_without_http_side_effects() {
         let f = fixture(Some("alice"));
