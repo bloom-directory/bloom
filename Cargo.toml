@@ -3,6 +3,9 @@ members = [
   "crates/bloom",
   "crates/bloom-daemon",
   "crates/bloom-vfs",
+  "crates/bloom-paid-mpp",
+  "crates/bloom-paid-x402",
+  "crates/bloom-paid-http",
   "crates/bloom-chain",
   "crates/bloom-rpc",
   "crates/bloom-tx",
@@ -120,6 +123,9 @@ bloom-rpc      = { path = "crates/bloom-rpc" }
 bloom-chain    = { path = "crates/bloom-chain" }
 bloom-tx       = { path = "crates/bloom-tx" }
 bloom-vfs      = { path = "crates/bloom-vfs" }
+bloom-paid-mpp = { path = "crates/bloom-paid-mpp" }
+bloom-paid-x402 = { path = "crates/bloom-paid-x402" }
+bloom-paid-http = { path = "crates/bloom-paid-http" }
 bloom-tools    = { path = "crates/bloom-tools" }
 bloom-defi     = { path = "crates/bloom-defi" }
 bloom-polymarket = { path = "crates/bloom-polymarket" }
