@@ -50,7 +50,7 @@ Default TTLs (handler overrides):
 | chains | `chains/<c>/head/*` | 1s |
 | chains | `chains/<c>/gas/*` | 2s |
 | chains | `chains/<c>/tx/<hash>/*` | 60s |
-| chains | `chains/<c>/addresses/<a>/{balance,balance.eth,balance.raw,nonce}` | 5s |
+| chains | `chains/<c>/addresses/<a>/{balance,balance.raw,balance.json,nonce}` | 5s |
 | chains | `chains/<c>/addresses/<a>/{code,is_contract}` | 1 day |
 | chains | `chains/<c>/addresses/<a>/{txs,internal_txs,erc20_txs,erc721_txs}` | 30s |
 | chains | `chains/<c>/contracts/<a>/{source,abi}` | 7 days |
@@ -68,11 +68,11 @@ data or rely on their own internal caches, e.g. the etherscan client).
 | Surface | VFS path(s) | Status | Implementation / Tests |
 |---|---|---|---|
 | Chains: head/safe/finalized, gas, fee history, eth_call, receipts, tx lookups, logs | `chains/<chain>/...` | shipped | `crates/bloom-vfs/src/handlers/chains.rs` + `chains_history.rs` |
-| ERC-20 reads (balance / symbol / decimals) | `chains/<chain>/addresses/<a>/tokens/<token>/{balance,balance.raw,balance.formatted,symbol,decimals}` | shipped | `chains.rs` + `crates/bloom-chain/src/lib.rs::ChainClient::erc20_*` |
+| ERC-20 reads (balance / symbol / decimals) | `chains/<chain>/addresses/<a>/tokens/<token>/{balance,balance.raw,balance.json,symbol,decimals}` | shipped | `chains.rs` + `crates/bloom-chain/src/lib.rs::ChainClient::erc20_*` |
 | Tx lookups | `chains/<chain>/tx/<hash>/{receipt.json,status,block_number,gas_used,logs.json,full.json}` | shipped | `chains.rs` (eth_getTransactionByHash + receipt) |
 | Etherscan history (txs, internal, ERC-20, ERC-721, source, abi) | `chains/<chain>/addresses/<a>/{txs,internal_txs,erc20_txs,erc721_txs}` and `chains/<chain>/contracts/<a>/{source,abi}` | shipped | `chains_history.rs` + `crates/bloom-etherscan/src/lib.rs` (TTL cache in `cache.rs`) |
 | Wallets: VFS-driven creation (local / import / watch) | `wallets/new` (writable) | shipped | `wallets.rs::write_new_wallet` + `parse_new_wallet_spec` |
-| Wallets: metadata, balance, nonce, policy round-trip | `wallets/<w>/{address,public_key,kind,policy.toml,chains/<c>/{balance,balance.eth,balance.raw,nonce}}` | shipped | `wallets.rs`; covered by outbox tests + `acceptance.sh` |
+| Wallets: metadata, balance, nonce, policy round-trip | `wallets/<w>/{address,public_key,kind,policy.toml,chains/<c>/{balance,balance.raw,balance.json,nonce}}` | shipped | `wallets.rs`; covered by outbox tests + `acceptance.sh` |
 | Wallets: outbox stage / confirm | `wallets/<w>/chains/<c>/outbox/{new.tx,pending/<id>/{plan.md,policy_check.json,confirm},sent/<id>/*,failed/<id>/*}` | shipped | `wallets.rs::write_outbox` → `crates/bloom-tx/src/tx_engine.rs`. Intents: `send` (native + ERC-20), `approve`, `call`, `raw`, plus NFT writes — `nft_transfer` (auto-detects ERC-721 vs ERC-1155, optional `safe`/`amount`/`data`), `nft_approve` (per-token, ERC-721 only), `nft_approve_all` (`setApprovalForAll`, policy-warned). |
 | Wallets: sign — EIP-191 + raw hash + EIP-712 | `wallets/<w>/sign/{message,hash,typed_data}` (+ `.sig`) | shipped | `wallets.rs::write_sign` |
 | DeFi (Enso intents, route quoting, stage-confirm) | `defi/intents/<wallet>/{new,<sess>/{intent.txt,route.json,plan.md,tx.json,simulation.json,confirm}}` | shipped | `crates/bloom-vfs/src/handlers/defi.rs` + `crates/bloom-defi/src/lib.rs` |

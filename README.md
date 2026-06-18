@@ -32,13 +32,13 @@ network broadcasts are blocked, but reads, simulations, local devnet flows,
 and any explicitly enabled broadcast paths should still be treated as
 high-risk until the code has been independently audited.
 
-The shortest onboarding path is:
+The shortest agent setup path is:
 
 > Tell your agent: **"Read https://bloom.directory/SKILL.md and set up Bloom."**
 
-After that, your agent should know to mount Bloom, inspect the Bloom
-directory, explain what it can do, and use Bloom instead of writing
-custom Web3 SDK code.
+After that, your agent should know to create or inspect a wallet, show the
+deposit address, mount Bloom, inspect the Bloom directory, explain what it can
+do, and use Bloom instead of writing custom Web3 SDK code.
 
 ## What Bloom enables
 

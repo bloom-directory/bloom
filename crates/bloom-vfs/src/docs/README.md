@@ -58,7 +58,7 @@ Reads are RPC / API queries. Examples:
 ```sh
 cat /bloom/chains/anvil/head/number
 cat /bloom/chains/ethereum/blocks/19000000/full.json
-cat /bloom/wallets/alice/chains/anvil/balance.eth
+cat /bloom/wallets/alice/chains/anvil/balance        # "1.5 ETH" (display); also balance.raw, balance.json
 cat /bloom/wallets/alice/chains/ethereum/history.json
 cat /bloom/tools/keccak/hello
 cat /bloom/tools/abi/decode/<sig>/<hex>

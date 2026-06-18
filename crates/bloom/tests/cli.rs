@@ -376,6 +376,89 @@ fn wallet_new_via_env_passphrase() {
     );
 }
 
+#[test]
+fn status_on_empty_keystore_points_to_wallet_creation() {
+    let home = fresh_home();
+    let assert = bloom_cmd(home.path()).args(["status"]).assert().success();
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        out.contains("no wallets yet"),
+        "empty status should say no wallet exists:\n{out}"
+    );
+    assert!(
+        out.contains("bloom wallet new main --passkey"),
+        "status should point at the explicit wallet command:\n{out}"
+    );
+}
+
+/// `wallet address <name>` prints the bare checksummed address; adding `--qr`
+/// prepends a scannable QR block while keeping the address line.
+#[test]
+fn wallet_address_with_and_without_qr() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args(["wallet", "new", "alice", "--passphrase", "addr-smoke-pass"])
+        .assert()
+        .success();
+
+    let plain = bloom_cmd(home.path())
+        .args(["wallet", "address", "alice"])
+        .assert()
+        .success();
+    let plain_out = String::from_utf8(plain.get_output().stdout.clone()).unwrap();
+    let addr = plain_out.trim();
+    assert!(
+        addr.starts_with("0x") && addr.len() == 42,
+        "plain output should be a bare address, got: {plain_out:?}"
+    );
+
+    let qr = bloom_cmd(home.path())
+        .args(["wallet", "address", "alice", "--qr"])
+        .assert()
+        .success();
+    let qr_out = String::from_utf8(qr.get_output().stdout.clone()).unwrap();
+    assert!(
+        qr_out.contains(addr),
+        "--qr output must still include the address:\n{qr_out}"
+    );
+    assert!(
+        qr_out.lines().count() > plain_out.lines().count(),
+        "--qr should add a QR block above the address:\n{qr_out}"
+    );
+}
+
+/// `wallet address <name> --qr-out <path>` writes a scannable SVG QR file and
+/// still prints the address; the SVG is a real `<svg>` document.
+#[test]
+fn wallet_address_qr_out_writes_svg() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args(["wallet", "new", "alice", "--passphrase", "qr-out-pass"])
+        .assert()
+        .success();
+    let svg_path = home.path().join("deposit.svg");
+    let out = bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "address",
+            "alice",
+            "--qr-out",
+            svg_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    // The bare address still goes to stdout (scriptable).
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(stdout.trim().starts_with("0x"), "stdout: {stdout:?}");
+    // The SVG file exists and is a real SVG document.
+    let svg = std::fs::read_to_string(&svg_path).expect("qr svg written");
+    assert!(
+        svg.contains("<svg") && svg.contains("</svg>"),
+        "expected an SVG document, got: {}",
+        &svg[..svg.len().min(80)]
+    );
+}
+
 /// Spin up an in-process `IpcServer` bound to the home's default socket
 /// path, then invoke the CLI so its `vfs` subcommand routes through IPC.
 /// The CLI's local-vs-IPC selection keys solely off `socket.exists()`, so

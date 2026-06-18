@@ -326,8 +326,8 @@ read_chain_head_breadcrumb() {
 read_wallet_balance_breadcrumb() {
     local mnt=$1 chain=$2 wallet=$3 address=$4
 
-    echo '::group::wallet eth balance' >&2
-    BAL_ETH=$(cat "$mnt/chains/$chain/addresses/$address/balance.eth" | tr -d '\n')
-    log "$wallet ($address) ETH balance: $BAL_ETH"
+    echo '::group::wallet native balance' >&2
+    BAL_NATIVE=$(cat "$mnt/chains/$chain/addresses/$address/balance" | tr -d '\n')
+    log "$wallet ($address) native balance: $BAL_NATIVE"
     echo '::endgroup::' >&2
 }

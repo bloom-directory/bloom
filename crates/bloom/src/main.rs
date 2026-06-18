@@ -12,6 +12,7 @@ mod commands {
     pub mod chain;
     pub mod pipe;
     pub mod polymarket;
+    pub mod qr;
 }
 
 use std::path::{Path, PathBuf};
@@ -191,7 +192,7 @@ enum Cmd {
     /// Manage wasm petals: install, run, list, name.
     #[command(subcommand)]
     Petals(PetalsCmd),
-    /// Polymarket: onboard a wallet.
+    /// Polymarket venue workflows.
     #[command(subcommand)]
     Polymarket(PolymarketCmd),
     /// Initialise ~/.bloom with default config + dirs.
@@ -513,6 +514,17 @@ enum WalletCmd {
     },
     /// List configured wallets.
     List,
+    /// Print a wallet's deposit address. Default output is the bare checksummed
+    /// address (one line, scriptable); `--qr` adds a scannable QR block above it,
+    /// and `--qr-out <path>` writes a scannable SVG of the address to a file.
+    Address {
+        name: String,
+        #[arg(long)]
+        qr: bool,
+        /// Write a scannable SVG QR of the deposit address to this path.
+        #[arg(long, value_name = "PATH")]
+        qr_out: Option<PathBuf>,
+    },
     /// Unlock a wallet for the lifetime of the process.
     /// For passkey wallets the passphrase is not needed — a browser
     /// ceremony is opened instead.
@@ -721,8 +733,9 @@ async fn run(cli: Cli) -> Result<()> {
             println!("home: {}", d.home.root().display());
             println!("config: {}", d.home.config_path().display());
             println!("chains: {:?}", d.chains.list_names());
-            println!("next: mkdir -p ~/bloom && bloom serve --mount ~/bloom");
-            println!("then: ls ~/bloom && cat ~/bloom/docs/README.md");
+            println!("next: bloom wallet new main --passkey");
+            println!("then: bloom wallet address main --qr");
+            println!("mount: mkdir -p ~/bloom && bloom serve --mount ~/bloom");
             println!("fallback: bloom vfs cat /docs/README.md");
             println!("agent setup: https://bloom.directory/SKILL.md");
             Ok(())
@@ -738,7 +751,12 @@ async fn run(cli: Cli) -> Result<()> {
                 d.config.block_mainnet_broadcast
             );
             println!("try: bloom vfs ls /");
-            println!("wallet: bloom wallet new alice --passphrase <passphrase>");
+            if d.keystore.list()?.is_empty() {
+                println!("no wallets yet — create one with bloom wallet new main --passkey");
+            } else {
+                println!("deposit: bloom wallet address <wallet> --qr");
+                println!("agent workflow: browse the mounted VFS or use bloom vfs cat/ls/write");
+            }
             Ok(())
         }
         Cmd::Vfs(VfsCmd::Cat { path }) => {
@@ -957,6 +975,10 @@ async fn run(cli: Cli) -> Result<()> {
             if let Some(ref key) = info.recovery_key {
                 acknowledge_recovery_key(&info.name, key);
             }
+            // Show the deposit QR + address right away — a fresh wallet's first
+            // need is to receive funds.
+            println!("\n── deposit ──");
+            commands::qr::print_deposit(&bloom_proto::checksum_address(&info.address));
             Ok(())
         }
         Cmd::Wallet(WalletCmd::Import {
@@ -991,6 +1013,26 @@ async fn run(cli: Cli) -> Result<()> {
                 };
                 println!("{}\t{}\t{}", info.name, info.address, kind);
             }
+            Ok(())
+        }
+        Cmd::Wallet(WalletCmd::Address { name, qr, qr_out }) => {
+            let d = Daemon::from_home(home).context("build daemon")?;
+            let info = d.keystore.info(&name)?;
+            let address = bloom_proto::checksum_address(&info.address);
+            if let Some(path) = qr_out {
+                match commands::qr::render_qr_svg(&address) {
+                    Some(svg) => {
+                        std::fs::write(&path, svg)
+                            .with_context(|| format!("write QR SVG to {}", path.display()))?;
+                        eprintln!("wrote deposit QR SVG: {}", path.display());
+                    }
+                    None => anyhow::bail!("address too large to encode as a QR code"),
+                }
+            }
+            if qr && let Some(code) = commands::qr::render_qr(&address) {
+                println!("{code}");
+            }
+            println!("{address}");
             Ok(())
         }
         Cmd::Wallet(WalletCmd::Unlock { name, passphrase }) => {

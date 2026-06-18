@@ -126,8 +126,9 @@ cat /bloom/chains/ethereum/head/full.json | jq '.header.baseFeePerGas'
 
 ```sh
 # vitalik.eth
-cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/balance       # wei (decimal)
-cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/balance.eth   # "1.234 ETH"
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/balance       # "1.234 ETH" (display, with symbol)
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/balance.raw   # wei (integer base units)
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/balance.json  # { symbol, decimals, raw, formatted, display }
 cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/nonce
 cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/code          # 0x for EOA
 cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/is_contract   # true / false
@@ -148,13 +149,13 @@ Allowances are not exposed here — read them via the token contract's
 
 ```sh
 ls /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48/
-# → balance, balance.raw, balance.formatted, symbol, decimals
+# → balance, balance.raw, balance.json, symbol, decimals
 
-cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48/balance.formatted   # "1234.56 USDC"
+cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48/balance   # "1234.56 USDC" (display, with symbol)
 cat /bloom/chains/ethereum/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2/symbol            # → WETH
 
 # Same shape on Base (USDC on Base):
-cat /bloom/chains/base/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913/balance.formatted
+cat /bloom/chains/base/addresses/0xd8dA6BF26964aF9D7eeD9e03E53415D37aA96045/tokens/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913/balance
 ```
 
 ### Transactions and receipts
@@ -620,9 +621,9 @@ cat /bloom/wallets/alice/kind             # local | watch
 cat /bloom/wallets/alice/policy.toml      # current policy
 
 # Per-chain native balance + nonce.
-cat /bloom/wallets/alice/chains/base/balance       # raw wei
-cat /bloom/wallets/alice/chains/base/balance.eth   # human "0.123 ETH"
-cat /bloom/wallets/alice/chains/base/balance.raw
+cat /bloom/wallets/alice/chains/base/balance       # human "0.123 ETH" (display, with symbol)
+cat /bloom/wallets/alice/chains/base/balance.raw   # raw wei (integer base units)
+cat /bloom/wallets/alice/chains/base/balance.json  # { symbol, decimals, raw, formatted, display }
 cat /bloom/wallets/alice/chains/base/nonce
 ```
 
@@ -631,7 +632,7 @@ reader at `chains/<c>/addresses/<addr>/tokens/<token>/...`:
 
 ```sh
 ALICE=$(cat /bloom/wallets/alice/address)
-cat /bloom/chains/base/addresses/$ALICE/tokens/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913/balance.formatted
+cat /bloom/chains/base/addresses/$ALICE/tokens/0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913/balance
 ```
 
 ### Signing

@@ -1,4 +1,5 @@
 pub mod addressbook;
+mod balances;
 pub mod chains;
 pub mod chains_contracts;
 mod chains_history;

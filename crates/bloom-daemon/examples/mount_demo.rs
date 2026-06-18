@@ -65,14 +65,15 @@ async fn main() -> anyhow::Result<()> {
     //                                  the in-memory unlock.
     if let Ok(name) = std::env::var("BLOOM_TEST_WALLET_NAME") {
         let pass = std::env::var("BLOOM_TEST_WALLET_PASSPHRASE").unwrap_or_default();
-        if let Ok(key) = std::env::var("BLOOM_TEST_WALLET_KEY") {
-            if !key.is_empty() && daemon.keystore.info(&name).is_err() {
-                daemon
-                    .keystore
-                    .import_hex(&name, &key, &pass)
-                    .map_err(|e| anyhow::anyhow!("import {}: {}", name, e))?;
-                tracing::info!(wallet = %name, "test fixture: wallet imported");
-            }
+        if let Ok(key) = std::env::var("BLOOM_TEST_WALLET_KEY")
+            && !key.is_empty()
+            && daemon.keystore.info(&name).is_err()
+        {
+            daemon
+                .keystore
+                .import_hex(&name, &key, &pass)
+                .map_err(|e| anyhow::anyhow!("import {}: {}", name, e))?;
+            tracing::info!(wallet = %name, "test fixture: wallet imported");
         }
         daemon
             .keystore

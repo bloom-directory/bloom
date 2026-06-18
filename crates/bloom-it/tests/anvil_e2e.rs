@@ -84,7 +84,7 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     sleep(Duration::from_millis(250)).await;
 
     // 5. Verify the balance is reflected through the VFS.
-    let bal_path = VfsPath::parse("/wallets/alice/chains/anvil/balance.eth").unwrap();
+    let bal_path = VfsPath::parse("/wallets/alice/chains/anvil/balance").unwrap();
     let bal_bytes = daemon
         .vfs
         .read(&bal_path)
@@ -93,7 +93,7 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     let bal_str = String::from_utf8(bal_bytes)?;
     assert!(
         bal_str.contains("ETH"),
-        "balance.eth missing 'ETH' suffix: {bal_str:?}"
+        "balance missing native symbol suffix: {bal_str:?}"
     );
     assert!(
         bal_str.starts_with("10"),
