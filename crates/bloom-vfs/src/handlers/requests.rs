@@ -989,20 +989,21 @@ fn parse_request(input: &str) -> Result<ParsedRequest, HandlerError> {
     if trimmed.is_empty() {
         return Err(HandlerError::invalid("empty request"));
     }
-    if trimmed.contains("url") && trimmed.contains('=') {
-        if let Ok(t) = toml::from_str::<TomlRequest>(trimmed) {
-            return Ok(ParsedRequest {
-                method: t
-                    .method
-                    .unwrap_or_else(|| "GET".into())
-                    .to_ascii_uppercase(),
-                url: Url::parse(&t.url).map_err(|e| HandlerError::invalid(format!("url: {e}")))?,
-                wallet: t.wallet,
-                max_amount_usd: t.max_amount_usd.as_deref().and_then(|v| v.parse().ok()),
-                headers: t.headers,
-                body: t.body.and_then(|b| b.inline),
-            });
-        }
+    if trimmed.contains("url")
+        && trimmed.contains('=')
+        && let Ok(t) = toml::from_str::<TomlRequest>(trimmed)
+    {
+        return Ok(ParsedRequest {
+            method: t
+                .method
+                .unwrap_or_else(|| "GET".into())
+                .to_ascii_uppercase(),
+            url: Url::parse(&t.url).map_err(|e| HandlerError::invalid(format!("url: {e}")))?,
+            wallet: t.wallet,
+            max_amount_usd: t.max_amount_usd.as_deref().and_then(|v| v.parse().ok()),
+            headers: t.headers,
+            body: t.body.and_then(|b| b.inline),
+        });
     }
     let mut lines = trimmed.lines();
     let first = lines.next().unwrap().trim();
@@ -1117,41 +1118,46 @@ fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Normalize
         .iter()
         .filter_map(|v| v.to_str().ok())
         .collect::<Vec<_>>();
-    if let Some(challenge) = mpp::parse_www_authenticate_all(www_values)
+    if let Some((challenge, value)) = mpp::parse_www_authenticate_all(www_values)
         .into_iter()
         .filter_map(Result::ok)
         .find(|c| c.method.as_str() == "tempo")
+        .and_then(|challenge| {
+            challenge
+                .request
+                .decode::<serde_json::Value>()
+                .ok()
+                .map(|value| (challenge, value))
+        })
     {
-        if let Ok(value) = challenge.request.decode::<serde_json::Value>() {
-            let method_details = value
-                .get("methodDetails")
-                .unwrap_or(&serde_json::Value::Null);
-            let amount = json_string(&value, &["amount"]);
-            let deposit_amount = json_string(&value, &["suggestedDeposit"]);
-            let channel_id = json_string(method_details, &["channelId"])
-                .or_else(|| json_string(&value, &["sessionId"]));
-            return NormalizedChallenge {
-                protocol: "mpp".into(),
-                intent: challenge.intent.as_str().to_string(),
-                merchant: challenge.realm.clone(),
-                realm: Some(challenge.realm),
-                network: Some("tempo".into()),
-                asset: json_string(&value, &["currency"]),
-                amount_usd: amount.as_deref().and_then(parse_money),
-                amount,
-                charge_id: json_string(&value, &["externalId"]),
-                session_id: channel_id.clone(),
-                deposit_usd: deposit_amount.as_deref().and_then(parse_money),
-                deposit_amount,
-                chain_id: method_details.get("chainId").and_then(|v| v.as_u64()),
-                unit_type: json_string(&value, &["unitType"]),
-                channel_id,
-                challenge_id: Some(challenge.id),
-                request: Some(value),
-                headers: header_map,
-                accepts: Vec::new(),
-            };
-        }
+        let method_details = value
+            .get("methodDetails")
+            .unwrap_or(&serde_json::Value::Null);
+        let amount = json_string(&value, &["amount"]);
+        let deposit_amount = json_string(&value, &["suggestedDeposit"]);
+        let channel_id = json_string(method_details, &["channelId"])
+            .or_else(|| json_string(&value, &["sessionId"]));
+        return NormalizedChallenge {
+            protocol: "mpp".into(),
+            intent: challenge.intent.as_str().to_string(),
+            merchant: challenge.realm.clone(),
+            realm: Some(challenge.realm),
+            network: Some("tempo".into()),
+            asset: json_string(&value, &["currency"]),
+            amount_usd: amount.as_deref().and_then(parse_money),
+            amount,
+            charge_id: json_string(&value, &["externalId"]),
+            session_id: channel_id.clone(),
+            deposit_usd: deposit_amount.as_deref().and_then(parse_money),
+            deposit_amount,
+            chain_id: method_details.get("chainId").and_then(|v| v.as_u64()),
+            unit_type: json_string(&value, &["unitType"]),
+            channel_id,
+            challenge_id: Some(challenge.id),
+            request: Some(value),
+            headers: header_map,
+            accepts: Vec::new(),
+        };
     }
     let www = header_map
         .get("www-authenticate")
@@ -1173,13 +1179,12 @@ fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Normalize
         "x402"
     } else if lower_www.contains("tempo")
         || lower_www.contains("mpp")
+        || lower_www.contains("payment")
         || lower_body_protocol.contains("tempo")
         || lower_body_protocol.contains("mpp")
         || body_json.get("charge").is_some()
         || body_json.get("session").is_some()
     {
-        "mpp"
-    } else if lower_www.contains("payment") {
         "mpp"
     } else {
         "unknown"
