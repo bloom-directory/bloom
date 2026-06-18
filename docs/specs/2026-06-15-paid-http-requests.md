@@ -634,10 +634,14 @@ before credential creation with an unlock-specific error.
 Only redacted credential metadata, receipts, audit entries, and cumulative
 session spend are written; no raw Authorization headers, signed transactions,
 voucher signatures, or other replayable secret material are stored in the VFS.
-Durable Tempo MPP channel reuse, top-up, and close are **not** implemented: no
-`mpp-rs` channel open/deposit/top-up/close primitives are linked into
-`bloom-vfs`, so a settled session is marked `settled_no_durable_channel` (never
-`open`) to avoid overclaiming a reusable channel. The `topup` and `close` control
+Durable Tempo MPP channel reuse, top-up, and close are **not** implemented: the
+adapter constructs a fresh `TempoSessionProvider` per confirm and records only
+redacted session metadata, and no `mpp-rs` channel open/deposit/top-up/close
+primitives are linked into `bloom-vfs`, so durable provider channel
+registry/reuse, efficient repeated vouchers, and top-up/close from persisted
+channel state are deferred product work rather than implemented behavior. A
+settled session is therefore marked `settled_no_durable_channel` (never `open`)
+to avoid overclaiming a reusable channel. The `topup` and `close` control
 files are not advertised as writable controls and direct writes fail with a
 precise unavailable-until-fresh-challenge error instead of synthesizing
 credentials from redacted metadata; top-up must be confirmed from a fresh Tempo

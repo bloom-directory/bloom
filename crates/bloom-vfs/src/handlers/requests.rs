@@ -639,7 +639,13 @@ impl RequestsHandler {
                 rpc_url: std::env::var("BLOOM_TEMPO_RPC_URL")
                     .unwrap_or_else(|_| "https://rpc.moderato.tempo.xyz".to_string()),
             };
-            confirm_with_backend(&self.root, id, data, &backend).await?;
+            let result = confirm_with_backend(&self.root, id, data, &backend).await?;
+            if !matches!(result.final_state.as_str(), "sent" | "failed") {
+                return Err(HandlerError::backend(format!(
+                    "unexpected paid request final state: {}",
+                    result.final_state
+                )));
+            }
             return Ok(());
         }
         let policy = self.wallet_policy(&wallet)?;
@@ -1868,6 +1874,8 @@ async fn confirm_with_backend(
     let execution = backend
         .confirm(&challenge, &request, &wallet, &policy, id)
         .await?;
+    let succeeded = execution.response_status < 400;
+    let final_state = if succeeded { "sent" } else { "failed" };
     fs::create_dir_all(pending.join("response"))?;
     write_json(
         pending.join("credential.json"),
@@ -1908,27 +1916,32 @@ async fn confirm_with_backend(
             "request_id": id,
             "event": "confirmed_and_retried",
             "backend": backend.name(),
+            "response_status": execution.response_status,
+            "paid_retry_succeeded": succeeded,
             "reads_spent": false,
             "secret_material_in_vfs": false
         }),
     )?;
-    if challenge.intent == "session" {
+    if succeeded && challenge.intent == "session" {
         let wallet = request_json_field(&pending, "wallet")
             .as_str()
             .unwrap_or("unknown")
             .to_string();
         update_session_state(&requests_root, &challenge, id, &wallet)?;
     }
-    fs::write(pending.join("status"), b"sent\n")?;
-    fs::create_dir_all(requests_root.join("sent"))?;
-    let sent = requests_root.join("sent").join(id);
-    if sent.exists() {
-        fs::remove_dir_all(&sent)?;
+    fs::write(pending.join("status"), format!("{final_state}\n"))?;
+    fs::create_dir_all(requests_root.join(final_state))?;
+    let dest = requests_root.join(final_state).join(id);
+    if dest.exists() {
+        fs::remove_dir_all(&dest)?;
     }
-    fs::rename(&pending, &sent)?;
-    fs::write(requests_root.join("latest"), format!("sent/{id}\n"))?;
+    fs::rename(&pending, &dest)?;
+    fs::write(
+        requests_root.join("latest"),
+        format!("{final_state}/{id}\n"),
+    )?;
     Ok(ConfirmResult {
-        final_state: "sent".into(),
+        final_state: final_state.into(),
     })
 }
 
@@ -2773,9 +2786,123 @@ inline = '{"prompt":"hi"}'
         assert!(credential.get("raw_voucher").is_none());
         let spent = fs::read_to_string(dir.path().join("requests/sessions/sess_1/spent")).unwrap();
         assert_eq!(spent.trim(), "0.1");
+        let session_status =
+            fs::read_to_string(dir.path().join("requests/sessions/sess_1/status")).unwrap();
+        assert_eq!(session_status.trim(), "settled_no_durable_channel");
         let receipt: serde_json::Value =
             read_json(dir.path().join("requests/sent/req_1/receipt.json")).unwrap();
         assert_eq!(receipt["session_id"], "sess_1");
+        assert_eq!(receipt["mock_backend"], false);
+        let audit: serde_json::Value =
+            read_json(dir.path().join("requests/sent/req_1/audit.json")).unwrap();
+        assert_eq!(audit["paid_retry_succeeded"], true);
+        assert_eq!(audit["response_status"], 200);
+    }
+
+    struct FailingMppTestBackend;
+
+    #[async_trait]
+    impl PaymentBackend for FailingMppTestBackend {
+        fn name(&self) -> &'static str {
+            "mpp_tempo_test_double_failing"
+        }
+
+        async fn confirm(
+            &self,
+            challenge: &NormalizedChallenge,
+            _request: &ParsedRequest,
+            _wallet: &str,
+            _policy: &Policy,
+            _request_id: &str,
+        ) -> Result<PaymentExecution, HandlerError> {
+            Ok(PaymentExecution {
+                credential_metadata: json!({
+                    "redacted": true,
+                    "backend": self.name(),
+                    "protocol": challenge.protocol,
+                    "intent": challenge.intent,
+                    "secret_material_in_vfs": false,
+                    "raw_authorization_stored": false,
+                    "raw_signed_payload_stored": false
+                }),
+                receipt_raw: json!({"backend": self.name()}),
+                response_status: 500,
+                response_headers: HeaderMap::new(),
+                response_body: b"merchant error\n".to_vec(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn mpp_confirm_failed_paid_retry_routes_to_failed_and_skips_session_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = dir.path().join("requests/pending/req_fail");
+        fs::create_dir_all(&pending).unwrap();
+        let challenge = normalize_challenge(
+            &HeaderMap::new(),
+            br#"{"protocol":"tempo-mpp","type":"Session","network":"tempo","asset":"pathUSD","session":{"id":"sess_fail","voucherAmount":"0.10","voucherAmountUsd":0.10,"depositAmount":"1.00","depositAmountUsd":1.00}}"#,
+            &Url::parse("https://mpp.test/data").unwrap(),
+        );
+        write_json(pending.join("challenge.json"), &challenge).unwrap();
+        write_json(
+            pending.join("payment_method.json"),
+            &challenge.payment_method(),
+        )
+        .unwrap();
+        let empty_checks: Vec<PolicyCheck> = vec![];
+        write_json(pending.join("policy_check.json"), &empty_checks).unwrap();
+        write_json(
+            pending.join("request.toml"),
+            &json!({"method":"GET","url":"https://mpp.test/data","wallet":"alice","headers":{}}),
+        )
+        .unwrap();
+        fs::write(pending.join("request.http"), "GET https://mpp.test/data\n").unwrap();
+        fs::write(pending.join("status"), "pending\n").unwrap();
+
+        let result =
+            confirm_with_backend(dir.path(), "req_fail", b"confirm", &FailingMppTestBackend)
+                .await
+                .unwrap();
+        assert_eq!(result.final_state, "failed");
+
+        let failed = dir.path().join("requests/failed/req_fail");
+        let sent = dir.path().join("requests/sent/req_fail");
+        let still_pending = dir.path().join("requests/pending/req_fail");
+        assert!(failed.exists(), "failed/<id> should exist");
+        assert!(!sent.exists(), "sent/<id> must not exist for failed retry");
+        assert!(
+            !still_pending.exists(),
+            "pending/<id> must be moved out after confirm"
+        );
+
+        let status = fs::read_to_string(failed.join("status")).unwrap();
+        assert_eq!(status.trim(), "failed");
+        let response_status = fs::read_to_string(failed.join("response/status")).unwrap();
+        assert_eq!(response_status.trim(), "500");
+        let body = fs::read(failed.join("response/body")).unwrap();
+        assert_eq!(body, b"merchant error\n");
+        assert!(failed.join("response/headers.json").exists());
+        assert!(failed.join("response/body.sha256").exists());
+
+        let latest = fs::read_to_string(dir.path().join("requests/latest")).unwrap();
+        assert_eq!(latest.trim(), "failed/req_fail");
+
+        let receipt: serde_json::Value = read_json(failed.join("receipt.json")).unwrap();
+        assert_eq!(receipt["session_id"], "sess_fail");
+        assert_eq!(receipt["mock_backend"], false);
+        let audit: serde_json::Value = read_json(failed.join("audit.json")).unwrap();
+        assert_eq!(audit["paid_retry_succeeded"], false);
+        assert_eq!(audit["response_status"], 500);
+        assert_eq!(audit["secret_material_in_vfs"], false);
+        let credential: serde_json::Value = read_json(failed.join("credential.json")).unwrap();
+        assert_eq!(credential["secret_material_in_vfs"], false);
+        assert!(credential.get("raw_voucher").is_none());
+
+        let session_dir = dir.path().join("requests/sessions/sess_fail");
+        assert!(
+            !session_dir.exists(),
+            "failed paid retry must not create/open/update the MPP session state"
+        );
     }
 
     #[tokio::test]
