@@ -2612,6 +2612,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-paid-http"
+version = "0.1.0"
+dependencies = [
+ "bloom-proto",
+ "mpp",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "toml 0.8.23",
+ "url",
+]
+
+[[package]]
+name = "bloom-paid-mpp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bloom-keystore",
+ "bloom-paid-http",
+ "bloom-proto",
+ "bloom-tools",
+ "mpp",
+ "reqwest 0.12.28",
+ "serde_json",
+]
+
+[[package]]
+name = "bloom-paid-x402"
+version = "0.1.0"
+dependencies = [
+ "alloy 2.0.5",
+ "base64 0.22.1",
+ "bloom-keystore",
+ "bloom-paid-http",
+ "serde_json",
+]
+
+[[package]]
 name = "bloom-petal-cap"
 version = "0.1.0"
 dependencies = [
@@ -3034,6 +3072,9 @@ dependencies = [
  "bloom-keystore",
  "bloom-mempool",
  "bloom-objects",
+ "bloom-paid-http",
+ "bloom-paid-mpp",
+ "bloom-paid-x402",
  "bloom-petal-fungible",
  "bloom-petal-manifest",
  "bloom-polymarket",
