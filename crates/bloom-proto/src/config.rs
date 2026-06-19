@@ -336,6 +336,13 @@ fn default_chains() -> BTreeMap<String, ChainSpec> {
             "ETH",
         ),
         evm_chain(
+            "tempo",
+            4217,
+            &["https://rpc.tempo.xyz"],
+            "Tempo Mainnet",
+            "ETH",
+        ),
+        evm_chain(
             "arbitrum",
             42161,
             &[
@@ -554,13 +561,16 @@ mod tests {
         assert!(cfg.block_mainnet_broadcast);
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
-        assert_eq!(cfg.chains.len(), 11);
+        assert_eq!(cfg.chains.len(), 12);
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
         assert_eq!(ethereum.chain_id, 1);
         assert!(!ethereum.allow_broadcast);
         assert!(!ethereum.rpc_urls.is_empty());
         let base = cfg.chains.get("base").expect("base entry");
         assert_eq!(base.chain_id, 8453);
+        let tempo = cfg.chains.get("tempo").expect("tempo entry");
+        assert_eq!(tempo.chain_id, 4217);
+        assert_eq!(tempo.rpc_urls, vec!["https://rpc.tempo.xyz"]);
         let hyperliquid = cfg.chains.get("hyperliquid").expect("hyperliquid entry");
         assert_eq!(hyperliquid.chain_id, 999);
         let anvil = cfg.chains.get("anvil").expect("anvil entry");

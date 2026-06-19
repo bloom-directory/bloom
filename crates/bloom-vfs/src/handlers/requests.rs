@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use bloom_keystore::Keystore;
 use bloom_paid_http::{
-    NormalizedChallenge, ParsedRequest, PaymentRequirement, PolicyCheck, PolicyEvalInput,
-    evaluate_payment_policy, evaluate_session_policy, headers_to_string_map, json_number,
-    normalize_challenge, paid_http_intent_label, parse_money, parse_request,
-    select_payment_requirement, trim_money,
+    EmptyPaidHttpChainRpcResolver, NormalizedChallenge, PaidHttpChainRpcResolver, ParsedRequest,
+    PaymentRequirement, PolicyCheck, PolicyEvalInput, evaluate_payment_policy,
+    evaluate_session_policy, headers_to_string_map, json_number, normalize_challenge,
+    paid_http_intent_label, parse_money, parse_request, select_payment_requirement, trim_money,
 };
 use bloom_paid_mpp::{PaymentBackend, RealMppBackend};
 use bloom_paid_x402::{KeystoreX402PaymentSigner, X402PaymentSigner, X402SignContext};
@@ -34,6 +34,7 @@ pub struct RequestsHandler {
     default_wallet: Option<String>,
     client: reqwest::Client,
     x402_signer: Arc<dyn X402PaymentSigner>,
+    paid_http_rpc_resolver: Arc<dyn PaidHttpChainRpcResolver>,
 }
 
 impl RequestsHandler {
@@ -48,11 +49,20 @@ impl RequestsHandler {
             default_wallet,
             client: reqwest::Client::new(),
             x402_signer: Arc::new(KeystoreX402PaymentSigner::new(keystore)),
+            paid_http_rpc_resolver: Arc::new(EmptyPaidHttpChainRpcResolver),
         }
     }
 
     pub fn with_x402_signer(mut self, signer: Arc<dyn X402PaymentSigner>) -> Self {
         self.x402_signer = signer;
+        self
+    }
+
+    pub fn with_paid_http_rpc_resolver(
+        mut self,
+        resolver: Arc<dyn PaidHttpChainRpcResolver>,
+    ) -> Self {
+        self.paid_http_rpc_resolver = resolver;
         self
     }
 
@@ -408,8 +418,7 @@ impl RequestsHandler {
             let backend = RealMppBackend {
                 keystore: self.keystore.clone(),
                 client: self.client.clone(),
-                rpc_url: std::env::var("BLOOM_TEMPO_RPC_URL")
-                    .unwrap_or_else(|_| "https://rpc.moderato.tempo.xyz".to_string()),
+                rpc_resolver: Arc::clone(&self.paid_http_rpc_resolver),
             };
             let result = confirm_with_backend(&self.root, id, data, &backend).await?;
             if !matches!(result.final_state.as_str(), "sent" | "failed") {
@@ -471,7 +480,9 @@ impl RequestsHandler {
                 request: &request,
                 challenge: &challenge,
                 requirement: &requirement,
+                rpc_resolver: self.paid_http_rpc_resolver.as_ref(),
             })
+            .await
             .map_err(HandlerError::backend)?;
 
         let mut retry = self.client.request(
@@ -485,7 +496,7 @@ impl RequestsHandler {
                 .map_err(|e| HandlerError::invalid(format!("invalid header {k}: {e}")))?;
             retry = retry.header(name, val);
         }
-        retry = retry.header("X-PAYMENT", credential.header_value.clone());
+        retry = retry.header(credential.header_name, credential.header_value.clone());
         if let Some(body) = &request.body {
             retry = retry.body(body.clone());
         }
@@ -514,6 +525,7 @@ impl RequestsHandler {
                 "charge_id": challenge.charge_id,
                 "session_id": challenge.session_id,
                 "material": "not_stored",
+                "header_name": credential.header_name,
                 "secret_material_in_vfs": false,
                 "public": credential.public_metadata,
             }),
@@ -869,7 +881,7 @@ fn parsed_request_from_artifact(v: &serde_json::Value) -> Result<ParsedRequest, 
         wallet: v.get("wallet").and_then(|v| v.as_str()).map(str::to_string),
         max_amount_usd: v.get("max_amount_usd").and_then(|v| v.as_f64()),
         headers,
-        body: None,
+        body: v.get("body").and_then(|v| v.as_str()).map(str::to_string),
     })
 }
 
@@ -1016,12 +1028,26 @@ fn write_request_artifacts(
 ) -> Result<(), HandlerError> {
     write_json(
         dir.join("request.toml"),
-        &json!({"method": req.method, "url": req.url.as_str(), "wallet": wallet, "max_amount_usd": req.max_amount_usd, "headers": req.headers, "state": state}),
+        &json!({
+            "method": req.method,
+            "url": req.url.as_str(),
+            "wallet": wallet,
+            "max_amount_usd": req.max_amount_usd,
+            "headers": req.headers,
+            "body": req.body,
+            "state": state
+        }),
     )?;
-    fs::write(
-        dir.join("request.http"),
-        format!("{} {}\n", req.method, req.url),
-    )?;
+    let mut http = format!("{} {}\n", req.method, req.url);
+    for (k, v) in &req.headers {
+        http.push_str(&format!("{k}: {v}\n"));
+    }
+    if let Some(body) = &req.body {
+        http.push('\n');
+        http.push_str(body);
+        http.push('\n');
+    }
+    fs::write(dir.join("request.http"), http)?;
     Ok(())
 }
 
@@ -1184,6 +1210,35 @@ inline = '{"prompt":"hi"}'
         assert_eq!(req.method, "POST");
         assert_eq!(req.headers["content-type"], "application/json");
         assert_eq!(req.body.as_deref(), Some(r#"{"prompt":"hi"}"#));
+    }
+
+    #[test]
+    fn request_artifacts_preserve_body_for_paid_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = parse_request(
+            r#"method = "POST"
+url = "https://api.example.com/inference"
+wallet = "research"
+max_amount_usd = "0.05"
+
+[headers]
+content-type = "application/json"
+
+[body]
+inline = '{"prompt":"hi"}'
+"#,
+        )
+        .unwrap();
+        write_request_artifacts(dir.path(), &req, "research", "pending").unwrap();
+
+        let stored: serde_json::Value = read_json(dir.path().join("request.toml")).unwrap();
+        assert_eq!(stored["body"], r#"{"prompt":"hi"}"#);
+        let reloaded = parsed_request_from_artifact(&stored).unwrap();
+        assert_eq!(reloaded.body.as_deref(), Some(r#"{"prompt":"hi"}"#));
+
+        let http = fs::read_to_string(dir.path().join("request.http")).unwrap();
+        assert!(http.contains("content-type: application/json\n\n"));
+        assert!(http.ends_with("{\"prompt\":\"hi\"}\n"));
     }
 
     #[test]
@@ -1735,11 +1790,7 @@ inline = '{"prompt":"hi"}'
         let dir = tempfile::tempdir().unwrap();
         let keystore = Keystore::new(dir.path().join("keystore")).unwrap();
         keystore.create_local("alice", "secret").unwrap();
-        let backend = RealMppBackend {
-            keystore,
-            client: reqwest::Client::new(),
-            rpc_url: "https://rpc.example.com".to_string(),
-        };
+        let backend = RealMppBackend::without_rpc_resolver(keystore, reqwest::Client::new());
         let challenge = NormalizedChallenge {
             protocol: "mpp".into(),
             intent: "charge".into(),
@@ -1786,11 +1837,7 @@ inline = '{"prompt":"hi"}'
         let keystore = Keystore::new(dir.path().join("keystore")).unwrap();
         keystore.create_local("passkey_alice", "secret").unwrap();
         fs::write(dir.path().join("keystore/passkey_alice/kind"), b"passkey").unwrap();
-        let backend = RealMppBackend {
-            keystore,
-            client: reqwest::Client::new(),
-            rpc_url: "https://rpc.example.com".to_string(),
-        };
+        let backend = RealMppBackend::without_rpc_resolver(keystore, reqwest::Client::new());
         let challenge = NormalizedChallenge {
             protocol: "mpp".into(),
             intent: "charge".into(),

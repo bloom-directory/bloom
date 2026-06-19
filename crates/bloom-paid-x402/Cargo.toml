@@ -10,4 +10,10 @@ bloom-paid-http.workspace = true
 bloom-keystore.workspace = true
 serde_json.workspace = true
 alloy.workspace = true
-base64.workspace = true
+async-trait.workspace = true
+x402-chain-eip155 = { version = "2.0.0", features = ["client", "telemetry"] }
+x402-types = "2.0.0"
+
+[dev-dependencies]
+reqwest.workspace = true
+url.workspace = true

@@ -992,11 +992,7 @@ async fn run(cli: Cli) -> Result<()> {
             dry_run,
         }) => {
             let (_home_permit, d) = build_write_daemon(home)?;
-            let mut body = request;
-            if let Some(wallet) = wallet {
-                body.push(' ');
-                body.push_str(&format!("wallet={wallet}"));
-            }
+            let body = request_body_with_wallet(request, wallet.as_deref());
             d.vfs
                 .write(
                     &VfsPath::parse(if dry_run {
@@ -2174,6 +2170,24 @@ fn persist_outbox_review_approved(
     Ok(())
 }
 
+fn request_body_with_wallet(mut request: String, wallet: Option<&str>) -> String {
+    let Some(wallet) = wallet else {
+        return request;
+    };
+    if request.trim_start().starts_with("url") || request.trim_start().starts_with("method") {
+        request.push('\n');
+        request.push_str(&format!("wallet = \"{wallet}\""));
+        return request;
+    }
+    let Some(first_newline) = request.find('\n') else {
+        request.push(' ');
+        request.push_str(&format!("wallet={wallet}"));
+        return request;
+    };
+    request.insert_str(first_newline, &format!(" wallet={wallet}"));
+    request
+}
+
 #[cfg(not(feature = "mount"))]
 async fn mount_bloom(daemon: &Daemon, mount: Option<&std::path::Path>) -> Result<Option<()>> {
     let _ = daemon;
@@ -2200,4 +2214,39 @@ async fn unmount_bloom(handle: Option<bloom_mount::NfsMountHandle>) -> Result<()
 async fn unmount_bloom(handle: Option<()>) -> Result<()> {
     let _ = handle;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_body_with_wallet;
+
+    #[test]
+    fn request_wallet_injection_preserves_http_message_body() {
+        let input = concat!(
+            "POST https://api.example.com/data\n",
+            "content-type: application/json\n",
+            "\n",
+            "{\"ok\":true}"
+        )
+        .to_string();
+
+        let output = request_body_with_wallet(input, Some("gavin"));
+
+        assert!(output.starts_with("POST https://api.example.com/data wallet=gavin\n"));
+        assert!(output.ends_with("\n\n{\"ok\":true}"));
+        assert!(!output.ends_with("wallet=gavin"));
+    }
+
+    #[test]
+    fn request_wallet_injection_keeps_one_line_request_attrs() {
+        let output = request_body_with_wallet(
+            "GET https://api.example.com/data max_amount_usd=0.05".to_string(),
+            Some("gavin"),
+        );
+
+        assert_eq!(
+            output,
+            "GET https://api.example.com/data max_amount_usd=0.05 wallet=gavin"
+        );
+    }
 }

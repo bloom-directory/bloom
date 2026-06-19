@@ -1,54 +1,40 @@
 //! x402 protocol adapter for Bloom paid HTTP requests.
 
-use std::borrow::Cow;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use alloy::dyn_abi::Eip712Domain;
-use alloy::primitives::{Address, B256, U256, keccak256};
-use alloy::signers::SignerSync;
-use alloy::sol;
-use alloy::sol_types::SolStruct;
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use async_trait::async_trait;
 use bloom_keystore::{Keystore, KeystoreError, WalletKind};
-use bloom_paid_http::{NormalizedChallenge, ParsedRequest, PaymentRequirement};
+use bloom_paid_http::{
+    NormalizedChallenge, PaidHttpChainRpcResolver, ParsedRequest, PaymentRequirement,
+};
 use serde_json::json;
+use x402_chain_eip155::{V1Eip155ExactClient, V2Eip155ExactClient};
+use x402_types::proto::{self, OriginalJson};
+use x402_types::scheme::client::X402SchemeClient;
+use x402_types::util::Base64Bytes;
 
+#[async_trait]
 pub trait X402PaymentSigner: Send + Sync {
-    fn sign_x402_payment(&self, ctx: &X402SignContext<'_>)
-    -> Result<X402PaymentCredential, String>;
+    async fn sign_x402_payment(
+        &self,
+        ctx: &X402SignContext<'_>,
+    ) -> Result<X402PaymentCredential, String>;
 }
 
 pub struct X402SignContext<'a> {
     pub wallet: &'a str,
-    /// Stable id of the staged pending request. The nonce in
-    /// `TransferWithAuthorization` is derived from this so it is bound to the
-    /// request the user actually confirmed, not a fresh id generated at sign
-    /// time.
     pub request_id: &'a str,
     pub request: &'a ParsedRequest,
     pub challenge: &'a NormalizedChallenge,
     pub requirement: &'a PaymentRequirement,
+    pub rpc_resolver: &'a dyn PaidHttpChainRpcResolver,
 }
 
 pub struct X402PaymentCredential {
-    /// The secret-bearing value sent as the `X-PAYMENT` retry header. This is
-    /// intentionally never persisted to credential.json.
+    /// Header name/value to send on the paid retry. x402 V1 uses `X-Payment`;
+    /// V2 uses `Payment-Signature`.
+    pub header_name: &'static str,
     pub header_value: String,
     /// Redacted/public metadata safe to expose in the VFS.
     pub public_metadata: serde_json::Value,
-}
-
-sol! {
-    #[allow(missing_docs)]
-    struct TransferWithAuthorization {
-        address from;
-        address to;
-        uint256 value;
-        uint256 validAfter;
-        uint256 validBefore;
-        bytes32 nonce;
-    }
 }
 
 pub struct KeystoreX402PaymentSigner {
@@ -61,8 +47,9 @@ impl KeystoreX402PaymentSigner {
     }
 }
 
+#[async_trait]
 impl X402PaymentSigner for KeystoreX402PaymentSigner {
-    fn sign_x402_payment(
+    async fn sign_x402_payment(
         &self,
         ctx: &X402SignContext<'_>,
     ) -> Result<X402PaymentCredential, String> {
@@ -74,144 +61,102 @@ impl X402PaymentSigner for KeystoreX402PaymentSigner {
             .keystore
             .info(ctx.wallet)
             .map_err(|e| format!("x402 signer wallet metadata unavailable: {e}"))?;
-        let scheme = ctx.requirement.scheme.as_deref().unwrap_or("exact");
-        if scheme != "exact" {
+        let payment_required = parse_payment_required(ctx.challenge)?;
+        let candidate = select_candidate(&payment_required, signer).ok_or_else(|| {
+            "x402 upstream signer found no matching EIP-155 exact payment option".to_string()
+        })?;
+        if let Some(network) = ctx.requirement.network.as_deref() {
+            let candidate_network = candidate.chain_id.to_string();
+            if candidate_network != network {
+                return Err(format!(
+                    "x402 selected network {candidate_network}, expected staged network {network}"
+                ));
+            }
+        }
+        if let Some(asset) = ctx.requirement.asset.as_deref()
+            && !candidate.asset.eq_ignore_ascii_case(asset)
+        {
             return Err(format!(
-                "x402 keystore signer supports exact EVM requirements, got scheme '{scheme}'"
+                "x402 selected asset {}, expected staged asset {asset}",
+                candidate.asset
             ));
         }
-        let network = ctx
-            .requirement
-            .network
-            .as_deref()
-            .ok_or_else(|| "x402 requirement missing network".to_string())?;
-        let chain_id = x402_evm_chain_id(network)?;
-        let asset = parse_x402_address(ctx.requirement.asset.as_deref(), "asset")?;
-        let pay_to = parse_x402_address(ctx.requirement.pay_to.as_deref(), "payTo")?;
-        let now = unix_seconds();
-        let valid_after = U256::from(now.saturating_sub(600));
-        let valid_before = U256::from(now + x402_max_timeout_seconds(ctx.requirement));
-        let nonce = x402_nonce(ctx, now);
-        let value = U256::from_str_radix(ctx.requirement.amount.as_deref().unwrap_or("0"), 10)
-            .map_err(|e| format!("x402 amount is not uint256: {e}"))?;
-        let authorization = json!({
-            "from": info.address.to_string(),
-            "to": pay_to.to_string(),
-            "value": value.to_string(),
-            "validAfter": valid_after.to_string(),
-            "validBefore": valid_before.to_string(),
-            "nonce": nonce.to_string(),
-        });
-        let auth = TransferWithAuthorization {
-            from: info.address,
-            to: pay_to,
-            value,
-            validAfter: valid_after,
-            validBefore: valid_before,
-            nonce,
+        if let Some(pay_to) = ctx.requirement.pay_to.as_deref()
+            && !candidate.pay_to.eq_ignore_ascii_case(pay_to)
+        {
+            return Err(format!(
+                "x402 selected pay_to {}, expected staged pay_to {pay_to}",
+                candidate.pay_to
+            ));
+        }
+        let header_value = candidate
+            .sign()
+            .await
+            .map_err(|e| format!("x402 upstream signing failed: {e}"))?;
+        let header_name = match payment_required {
+            proto::PaymentRequired::V1(_) => "X-Payment",
+            proto::PaymentRequired::V2(_) => "Payment-Signature",
         };
-        let domain = Eip712Domain {
-            name: x402_requirement_extra_str(ctx.requirement, "name").map(Cow::Owned),
-            version: x402_requirement_extra_str(ctx.requirement, "version").map(Cow::Owned),
-            chain_id: Some(U256::from(chain_id)),
-            verifying_contract: Some(asset),
-            ..Eip712Domain::default()
-        };
-        let digest = auth.eip712_signing_hash(&domain);
-        let signature = signer
-            .sign_hash_sync(&digest)
-            .map_err(|e| format!("x402 keystore signing failed: {e}"))?
-            .to_string();
-        let header = json!({
-            "x402Version": 1,
-            "scheme": scheme,
-            "network": network,
-            "payload": {
-                "signature": signature,
-                "authorization": authorization,
-            },
-        });
-        let header_bytes =
-            serde_json::to_vec(&header).map_err(|e| format!("serialize x402 header: {e}"))?;
+        let configured_rpc_urls = ctx
+            .rpc_resolver
+            .http_rpc_urls_for_chain_id_opt(eip155_chain_id_u64(&candidate.chain_id));
         Ok(X402PaymentCredential {
-            header_value: STANDARD.encode(header_bytes),
+            header_name,
+            header_value,
             public_metadata: json!({
-                "signer_backend": "bloom-keystore",
+                "signer_backend": "x402-chain-eip155",
                 "wallet": ctx.wallet,
                 "wallet_kind": wallet_kind_label(info.kind),
                 "address": info.address.to_string(),
-                "scheme": scheme,
-                "network": network,
-                "asset": asset.to_string(),
-                "pay_to": pay_to.to_string(),
+                "scheme": candidate.scheme,
+                "x402_version": candidate.x402_version,
+                "network": candidate.chain_id.to_string(),
+                "asset": candidate.asset,
+                "amount": candidate.amount.to_string(),
+                "pay_to": candidate.pay_to,
+                "rpc_urls_configured": configured_rpc_urls.len(),
                 "resource": ctx.requirement.resource.as_deref().unwrap_or(ctx.request.url.as_str()),
-                "authorization": authorization,
+                "request_id": ctx.request_id,
                 "signature": "redacted",
             }),
         })
     }
 }
 
-fn parse_x402_address(value: Option<&str>, field: &str) -> Result<Address, String> {
-    value
-        .ok_or_else(|| format!("x402 requirement missing {field}"))?
-        .parse::<Address>()
-        .map_err(|e| format!("x402 requirement {field} is not an EVM address: {e}"))
-}
-
-fn x402_evm_chain_id(network: &str) -> Result<u64, String> {
-    match network {
-        "abstract" => Ok(2741),
-        "abstract-testnet" => Ok(11124),
-        "base-sepolia" => Ok(84532),
-        "base" => Ok(8453),
-        "avalanche-fuji" => Ok(43113),
-        "avalanche" => Ok(43114),
-        "iotex" => Ok(4689),
-        "sei" => Ok(1329),
-        "sei-testnet" => Ok(1328),
-        "polygon" => Ok(137),
-        "polygon-amoy" => Ok(80002),
-        "peaq" => Ok(3338),
-        "story" => Ok(1514),
-        "educhain" => Ok(41923),
-        "skale-base-sepolia" => Ok(324705682),
-        other => Err(format!(
-            "x402 keystore signer supports EVM networks only; unsupported network '{other}'"
-        )),
+fn parse_payment_required(
+    challenge: &NormalizedChallenge,
+) -> Result<proto::PaymentRequired, String> {
+    if let Some(header) = challenge.headers.get("payment-required") {
+        let bytes = Base64Bytes::from(header.as_bytes())
+            .decode()
+            .map_err(|e| format!("decode x402 Payment-Required header: {e}"))?;
+        let parsed = serde_json::from_slice::<proto::v2::PaymentRequired<OriginalJson>>(&bytes)
+            .map_err(|e| format!("parse x402 v2 Payment-Required header: {e}"))?;
+        return Ok(proto::PaymentRequired::V2(parsed));
     }
+    let value = json!({
+        "x402Version": 1,
+        "accepts": challenge.accepts.iter().map(|req| req.raw.clone()).collect::<Vec<_>>(),
+        "error": null,
+    });
+    let parsed = serde_json::from_value::<proto::v1::PaymentRequired<OriginalJson>>(value)
+        .map_err(|e| format!("parse x402 v1 challenge: {e}"))?;
+    Ok(proto::PaymentRequired::V1(parsed))
 }
 
-fn x402_requirement_extra_str(req: &PaymentRequirement, key: &str) -> Option<String> {
-    req.raw
-        .get("extra")
-        .and_then(|v| v.get(key))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
+fn select_candidate(
+    payment_required: &proto::PaymentRequired,
+    signer: std::sync::Arc<alloy::signers::local::PrivateKeySigner>,
+) -> Option<x402_types::scheme::client::PaymentCandidate> {
+    let mut candidates = V2Eip155ExactClient::new(signer.clone()).accept(payment_required);
+    candidates.extend(V1Eip155ExactClient::new(signer).accept(payment_required));
+    candidates.into_iter().next()
 }
 
-fn x402_max_timeout_seconds(req: &PaymentRequirement) -> u64 {
-    req.raw
-        .get("maxTimeoutSeconds")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(60)
-}
-
-fn unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn x402_nonce(ctx: &X402SignContext<'_>, now: u64) -> B256 {
-    keccak256(
-        format!(
-            "{}:{}:{}:{now}",
-            ctx.wallet, ctx.request.url, ctx.request_id
-        )
-        .as_bytes(),
-    )
+fn eip155_chain_id_u64(chain_id: &x402_types::chain::ChainId) -> Option<u64> {
+    (chain_id.namespace() == "eip155")
+        .then(|| chain_id.reference().parse().ok())
+        .flatten()
 }
 
 fn wallet_kind_label(kind: WalletKind) -> &'static str {
@@ -233,5 +178,36 @@ fn x402_keystore_signer_error(wallet: &str, keystore: &Keystore, err: KeystoreEr
             ),
         },
         other => format!("x402 keystore signer unavailable for wallet '{wallet}': {other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_payment_required;
+    use bloom_paid_http::normalize_challenge;
+    use reqwest::header::{HeaderMap, HeaderValue};
+    use url::Url;
+
+    #[test]
+    fn parses_nansen_v2_payment_required_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "payment-required",
+            HeaderValue::from_static(
+                "eyJ4NDAyVmVyc2lvbiI6MiwiZXJyb3IiOiJQYXltZW50IHJlcXVpcmVkIiwicmVzb3VyY2UiOnsidXJsIjoiaHR0cHM6Ly9hcGkubmFuc2VuLmFpL2FwaS92MS90b2tlbi1zY3JlZW5lciIsImRlc2NyaXB0aW9uIjoiUmV0cmlldmUgdG9rZW4gc2NyZWVuZXIgZGF0YSIsIm1pbWVUeXBlIjoiIn0sImFjY2VwdHMiOlt7InNjaGVtZSI6ImV4YWN0IiwibmV0d29yayI6ImVpcDE1NTo4NDUzIiwiYXNzZXQiOiIweDgzMzU4OWZDRDZlRGI2RTA4ZjRjN0MzMkQ0ZjcxYjU0YmRBMDI5MTMiLCJhbW91bnQiOiIxMDAwMCIsInBheVRvIjoiMHg5MzA1M2YxZTdBNWVGRURhNTMyRmU2OUNiYkU0M2NCRWMzQTBGMTNmIiwibWF4VGltZW91dFNlY29uZHMiOjMwMCwiZXh0cmEiOnsibmFtZSI6IlVTRCBDb2luIiwidmVyc2lvbiI6IjIifX1dfQ==",
+            ),
+        );
+        let challenge = normalize_challenge(
+            &headers,
+            br#"{"x402Version":2,"accepts":[]}"#,
+            &Url::parse("https://api.nansen.ai/api/v1/token-screener").unwrap(),
+        );
+        let parsed = parse_payment_required(&challenge).unwrap();
+        match parsed {
+            x402_types::proto::PaymentRequired::V2(v2) => {
+                assert_eq!(v2.accepts.len(), 1);
+            }
+            _ => panic!("expected v2 payment required"),
+        }
     }
 }
