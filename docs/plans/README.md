@@ -18,6 +18,9 @@ ignored `docs/.scratch/`.
   and cross-protocol entanglement scan design; Phase 0 not yet built.
 - `2026-06-17-next-priorities-mcp-first.md` — prioritization note for building
   a read-only MCP interface before larger agent-facing surfaces.
+- `2026-06-19-hyperliquid-integration-hardening.md` — correctness,
+  durability, testing, and maintainability plan for Hyperliquid bounded
+  sessions and trading paths.
 
 ## Removed From Active Set
 

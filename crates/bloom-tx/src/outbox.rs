@@ -39,6 +39,31 @@ pub struct SentEntry {
     pub mined: bool,
 }
 
+/// Filename of the mined-outcome sibling artefact, written by the
+/// reconciliation loop next to a `sent/<id>/` entry. We never mutate the
+/// write-once `intent.json` (its mtime is the `sent_at` proxy), so the mined
+/// status lives here instead.
+pub const RECEIPT_FILE: &str = "receipt.json";
+
+/// Persistent record of a sent tx's mined outcome.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MinedReceipt {
+    /// `"success"` or `"reverted"`.
+    pub outcome: String,
+    pub tx_hash: String,
+    #[serde(default)]
+    pub block_number: Option<u64>,
+    /// Decoded revert reason (best-effort) when `outcome == "reverted"`.
+    #[serde(default)]
+    pub revert_reason: Option<String>,
+}
+
+impl MinedReceipt {
+    pub fn is_success(&self) -> bool {
+        self.outcome == "success"
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum OutboxError {
     #[error("io: {0}")]
@@ -633,6 +658,46 @@ impl Outbox {
         Ok(())
     }
 
+    /// Set `depends_on` on a still-pending entry by rewriting its
+    /// `intent.json`. Used by the DeFi layer to record that a route must not
+    /// broadcast until its preceding approve has mined successfully.
+    pub fn set_pending_depends_on(
+        &self,
+        wallet: &str,
+        chain: &str,
+        id: &str,
+        dep_id: &str,
+    ) -> Result<(), OutboxError> {
+        let entry = self.read_in_state(wallet, chain, id, OutboxState::Pending)?;
+        let mut staged = entry.staged;
+        staged.depends_on = Some(dep_id.to_string());
+        fs::write(
+            entry.dir.join("intent.json"),
+            serde_json::to_vec_pretty(&staged)?,
+        )?;
+        Ok(())
+    }
+
+    /// Read the mined-outcome `receipt.json` for an entry in any state, if the
+    /// reconciliation loop has written one yet.
+    pub fn read_receipt(
+        &self,
+        wallet: &str,
+        chain: &str,
+        id: &str,
+    ) -> Result<Option<MinedReceipt>, OutboxError> {
+        let entry = match self.read(wallet, chain, id) {
+            Ok(e) => e,
+            Err(OutboxError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let path = entry.dir.join(RECEIPT_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&fs::read(&path)?)?))
+    }
+
     pub fn cancel(&self, wallet: &str, chain: &str, id: &str) -> Result<(), OutboxError> {
         let entry = self.read_in_state(wallet, chain, id, OutboxState::Pending)?;
         let mut staged = entry.staged.clone();
@@ -814,7 +879,10 @@ fn parse_sent_entry(
         .ok()
         .and_then(|m| m.modified().ok())
         .unwrap_or_else(std::time::SystemTime::now);
-    let mined = matches!(staged.status, TxStatus::Success | TxStatus::Reverted);
+    // The mined outcome is recorded as a `receipt.json` sibling (the write-once
+    // intent.json is never mutated). Treat either signal as mined.
+    let mined = dir.join(RECEIPT_FILE).exists()
+        || matches!(staged.status, TxStatus::Success | TxStatus::Reverted);
     Some(SentEntry {
         wallet: wallet.to_string(),
         chain: chain.to_string(),
@@ -859,6 +927,7 @@ mod tests {
             token: None,
             nft: None,
             usd_value: None,
+            depends_on: None,
         }
     }
 
@@ -871,6 +940,48 @@ mod tests {
         let read = ob.read("alice", "anvil", "0001-test").unwrap();
         assert_eq!(read.staged.id, "0001-test");
         assert_eq!(read.state, OutboxState::Pending);
+    }
+
+    #[test]
+    fn set_pending_depends_on_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        ob.write_pending(&fake_staged("route"), "# plan").unwrap();
+        ob.set_pending_depends_on("alice", "anvil", "route", "approve")
+            .unwrap();
+        let read = ob.read("alice", "anvil", "route").unwrap();
+        assert_eq!(read.staged.depends_on.as_deref(), Some("approve"));
+    }
+
+    #[test]
+    fn read_receipt_reflects_written_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let mut staged = fake_staged("dep");
+        staged.tx_hash = Some(format!("{:#x}", alloy::primitives::B256::repeat_byte(7)));
+        // parse_sent_entry requires a fee field + tx_hash to surface the entry.
+        staged.max_fee_per_gas = Some("100".into());
+        staged.max_priority_fee_per_gas = Some("10".into());
+        ob.write_pending(&staged, "# plan").unwrap();
+        let entry = ob.read("alice", "anvil", "dep").unwrap();
+        ob.transition(&entry, OutboxState::Sent).unwrap();
+        // No receipt yet.
+        assert!(ob.read_receipt("alice", "anvil", "dep").unwrap().is_none());
+        // Walk sees it as not-yet-mined.
+        assert!(!ob.walk_all_sent().unwrap()[0].mined);
+        // Write a success receipt → read_receipt + mined both reflect it.
+        let rec = MinedReceipt {
+            outcome: "success".into(),
+            tx_hash: staged.tx_hash.clone().unwrap(),
+            block_number: Some(123),
+            revert_reason: None,
+        };
+        let se = &ob.walk_all_sent().unwrap()[0];
+        ob.write_sent_sibling(se, RECEIPT_FILE, &serde_json::to_vec(&rec).unwrap())
+            .unwrap();
+        let got = ob.read_receipt("alice", "anvil", "dep").unwrap().unwrap();
+        assert!(got.is_success());
+        assert!(ob.walk_all_sent().unwrap()[0].mined);
     }
 
     #[test]

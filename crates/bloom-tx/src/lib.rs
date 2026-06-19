@@ -7,6 +7,8 @@ pub mod intent_parser;
 pub mod oracle;
 pub mod outbox;
 pub mod policy_engine;
+pub mod reconcile;
+pub mod session;
 pub mod tx_engine;
 
 pub use bump_scanner::{BasefeeProvider, BumpScanner, BumpScannerConfig, MempoolIndexes};

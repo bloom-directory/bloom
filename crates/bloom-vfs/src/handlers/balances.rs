@@ -57,3 +57,80 @@ pub(crate) fn balance_json(
     v.push(b'\n');
     v
 }
+
+/// Pretty JSON facts for the ERC-20 `balance.json` leaf, with explicit
+/// metadata provenance. Unlike [`balance_json`] (native, where decimals
+/// and symbol come from the chain spec and are always known), token
+/// metadata is read on-chain and can be unresolved. When `symbol` or
+/// `decimals` is `None` they are emitted as `null`, `formatted`/`display`
+/// are omitted (can't compute without decimals), and `metadata_status` is
+/// `"fallback"` — so an agent never mistakes degraded metadata for real
+/// values. `raw` is always present.
+pub(crate) fn token_balance_json(
+    chain: &str,
+    token_address: &str,
+    symbol: Option<&str>,
+    decimals: Option<u8>,
+    raw: U256,
+) -> Vec<u8> {
+    let metadata_status = if symbol.is_some() && decimals.is_some() {
+        "ok"
+    } else {
+        "fallback"
+    };
+    let formatted = decimals.map(|d| format_units(raw, d));
+    let display = match (formatted.as_deref(), symbol) {
+        (Some(f), Some(s)) => Some(format!("{f} {s}")),
+        _ => None,
+    };
+    let obj = serde_json::json!({
+        "chain": chain,
+        "asset": "erc20",
+        "address": token_address,
+        "symbol": symbol,
+        "decimals": decimals,
+        "raw": raw.to_string(),
+        "formatted": formatted,
+        "display": display,
+        "metadata_status": metadata_status,
+    });
+    let mut v = serde_json::to_vec_pretty(&obj).expect("token balance json serializes");
+    v.push(b'\n');
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_balance_json_ok_when_metadata_resolved() {
+        let bytes = token_balance_json(
+            "base",
+            "0xToken",
+            Some("USDC"),
+            Some(6),
+            U256::from(1_500_000u64),
+        );
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["metadata_status"], "ok");
+        assert_eq!(v["symbol"], "USDC");
+        assert_eq!(v["decimals"], 6);
+        assert_eq!(v["formatted"], "1.5");
+        assert_eq!(v["display"], "1.5 USDC");
+        assert_eq!(v["raw"], "1500000");
+    }
+
+    #[test]
+    fn token_balance_json_flags_fallback_with_nulls() {
+        let bytes = token_balance_json("base", "0xToken", None, None, U256::from(42u64));
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["metadata_status"], "fallback");
+        assert!(v["symbol"].is_null(), "symbol must be null, not '?'");
+        assert!(v["decimals"].is_null(), "decimals must be null, not 18");
+        assert!(v["formatted"].is_null());
+        assert!(v["display"].is_null());
+        // The raw integer is still trustworthy and present.
+        assert_eq!(v["raw"], "42");
+    }
+}

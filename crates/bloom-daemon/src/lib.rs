@@ -21,6 +21,7 @@ use bloom_chain_types::types::{Address as ChainAddress, PubKeyBytes, SigBytes};
 use bloom_defi::EnsoClient;
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
+use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork};
 use bloom_keystore::Keystore;
 use bloom_paid_http::PaidHttpChainRpcResolver;
 use bloom_petals::{NameRegistry, PetalRunner, PetalStore, PetalVm, PetalsHandler};
@@ -37,9 +38,9 @@ use bloom_tx::tx_engine::TxEngine;
 use bloom_vfs::handlers::polymarket::{ChainClientReader, PolymarketOnboarding, build_onboarder};
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
-    AddressBookHandler, ChainsHandler, DefiHandler, DocsHandler, EnsHandler, PolymarketHandler,
-    PricesHandler, RequestsHandler, SimulateHandler, StatusHandler, ToolsHandler, WalletsHandler,
-    WatchHandler,
+    AddressBookHandler, ChainsHandler, DefiHandler, DocsHandler, EnsHandler, HyperliquidHandler,
+    PolymarketHandler, PricesHandler, RequestsHandler, SimulateHandler, StatusHandler,
+    ToolsHandler, WalletsHandler, WatchHandler,
 };
 use bloom_vfs::tx_handler::PtbSubmitter;
 use bloom_vfs::{HandlerError, PathCache, Vfs};
@@ -477,7 +478,8 @@ impl Daemon {
                         address_book.clone(),
                     )
                     .with_home_write_permit_opt(home_write_permit.clone())
-                    .with_mempool_indexes(mempool_indexes.clone()),
+                    .with_mempool_indexes(mempool_indexes.clone())
+                    .with_polymarket_root(home.polymarket_dir()),
                 ) as _,
             )
             .mount("tools", Arc::new(ToolsHandler::new()) as _)
@@ -557,6 +559,18 @@ impl Daemon {
                 warn!("enso api_key empty; mounting defi/ for keyless access (rate-limited)");
             }
             debug!("daemon.defi_mounted");
+            // Hyperliquid deposit goal: bridge address + deposit chain, from
+            // `[hyperliquid]` config when present, else the mainnet defaults.
+            let (hl_bridge, hl_deposit_chain_id) = {
+                let cfg = config.hyperliquid.clone().unwrap_or_default();
+                let bridge = cfg.bridge_address.parse().unwrap_or_else(|_| {
+                    warn!(addr = %cfg.bridge_address, "daemon.hyperliquid_bridge_invalid_using_default");
+                    bloom_proto::hyperliquid::MAINNET_BRIDGE
+                        .parse()
+                        .expect("valid bridge const")
+                });
+                (bridge, cfg.deposit_chain_id)
+            };
             vfs_builder = vfs_builder.mount(
                 "defi",
                 Arc::new(
@@ -571,7 +585,8 @@ impl Daemon {
                     .with_default_chain(config.default_chain.clone())
                     .with_store_root(home.root().join("defi"))
                     .with_polymarket_root(home.polymarket_dir())
-                    .with_revert_decoder(decoder_chain.clone()),
+                    .with_revert_decoder(decoder_chain.clone())
+                    .with_hyperliquid(hl_bridge, hl_deposit_chain_id),
                 ) as _,
             );
         } else {
@@ -648,6 +663,36 @@ impl Daemon {
             debug!("daemon.polymarket_skipped: no [polymarket] config");
         }
 
+        // Hyperliquid: HyperCore Info reads plus explicit Exchange writes.
+        // HyperEVM remains the normal `chains/hyperliquid` JSON-RPC surface;
+        // this block is for the separate `api.hyperliquid.xyz` HyperCore API.
+        if let Some(hl_cfg) = &config.hyperliquid {
+            let hl_url = |raw: &str| match url::Url::parse(raw) {
+                Ok(u) => Some(u),
+                Err(e) => {
+                    warn!(url = %raw, error = %e, "daemon.hyperliquid_url_invalid_using_default");
+                    None
+                }
+            };
+            let mut mainnet = HyperliquidClient::new(HyperliquidNetwork::Mainnet);
+            if let Some(u) = hl_url(&hl_cfg.mainnet_url) {
+                mainnet = mainnet.with_base_url(u);
+            }
+            let mut testnet = HyperliquidClient::new(HyperliquidNetwork::Testnet);
+            if let Some(u) = hl_url(&hl_cfg.testnet_url) {
+                testnet = testnet.with_base_url(u);
+            }
+            debug!("daemon.hyperliquid_mounted");
+            let handler = Arc::new(
+                HyperliquidHandler::new(mainnet, testnet, keystore.clone())
+                    .with_store_root(home.root().join("hyperliquid")),
+            );
+            handler.clone().start_monitoring();
+            vfs_builder = vfs_builder.mount("hyperliquid", handler as _);
+        } else {
+            debug!("daemon.hyperliquid_skipped: no [hyperliquid] config");
+        }
+
         let vfs = vfs_builder
             .with_audit(audit_arc.clone())
             .with_cache(path_cache)
@@ -719,6 +764,19 @@ impl Daemon {
             let shutdown = scanner.spawn();
             bump_shutdown.push(shutdown);
             debug!("daemon.bump_scanner_spawned");
+        }
+
+        // Spawn the receipt reconciler: every ~15s it walks sent/ entries and
+        // records each broadcast tx's mined outcome (success/reverted) as a
+        // `receipt.json` sibling. The same-chain dependency gate and the bump
+        // scanner read it. Runs regardless of mempool config.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let reconciler = Arc::new(bloom_tx::reconcile::Reconciler::new(
+                tx_engine.outbox.clone(),
+                chains.clone(),
+            ));
+            bump_shutdown.push(reconciler.spawn());
+            debug!("daemon.reconciler_spawned");
         }
 
         // Spawn the backends probe task. Every 60s it:
@@ -794,7 +852,10 @@ impl Daemon {
             debug!("daemon.backends_probe_spawned");
         }
 
-        info!(
+        // `debug!`, not `info!`: the CLI builds a daemon in-process for
+        // every `vfs cat`/`ls`, so at default verbosity this line would
+        // print before each value and clutter agent/visual output.
+        debug!(
             home = %home.root().display(),
             chains = ?config.chains.keys().collect::<Vec<_>>(),
             etherscan = etherscan_arc.is_some(),
@@ -1420,6 +1481,7 @@ ws_url = "wss://example.invalid"
             token: None,
             nft: None,
             usd_value: None,
+            depends_on: None,
         };
         d.tx_engine.outbox.write_pending(&staged, "p").unwrap();
         let n = d.tx_engine.outbox.sweep_expired(2).unwrap();

@@ -62,6 +62,10 @@ pub struct Policy {
     /// request confirmation requires explicit wallet policy opt-in.
     #[serde(default)]
     pub payments: PaymentsPolicy,
+    /// Hyperliquid action policy (`[hyperliquid]`). Caps default to
+    /// unconfigured (no constraint); unknown action kinds always deny.
+    #[serde(default)]
+    pub hyperliquid: crate::hyperliquid_policy::HyperliquidPolicy,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

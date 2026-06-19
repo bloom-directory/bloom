@@ -31,6 +31,11 @@ pub struct ParsedAmount {
     /// The original numeric portion as a string (for downstream decimal
     /// resolution against a token's `decimals`).
     pub number: String,
+    /// Whether a unit/symbol suffix was explicitly written (`"10 wei"`,
+    /// `"10 usdc"`) versus a bare integer that defaulted to `wei` (`"10"`).
+    /// Lets the ERC-20 path reject an explicit *native* unit on a token
+    /// amount while still accepting a bare integer as a human token amount.
+    pub explicit_unit: bool,
 }
 
 impl ParsedAmount {
@@ -70,6 +75,7 @@ pub fn parse_amount(s: &str) -> Result<ParsedAmount, UnitError> {
         raw,
         unit,
         number: num_part.to_string(),
+        explicit_unit: first_alpha.is_some(),
     })
 }
 
@@ -188,6 +194,26 @@ mod tests {
         assert!(p.raw.is_none());
         assert_eq!(p.unit, "usdc");
         assert_eq!(p.number, "10");
+        assert!(p.explicit_unit);
+    }
+
+    #[test]
+    fn explicit_unit_distinguishes_bare_integer_from_wei() {
+        // Bare integer defaults to wei but is NOT an explicit unit, so the
+        // ERC-20 path may treat it as a human token amount.
+        let bare = parse_amount("10").unwrap();
+        assert_eq!(bare.unit, "wei");
+        assert!(!bare.explicit_unit);
+        // Explicit "wei" is flagged so the ERC-20 path can reject it on a token.
+        let wei = parse_amount("10 wei").unwrap();
+        assert_eq!(wei.unit, "wei");
+        assert!(wei.explicit_unit);
+        assert!(wei.is_native());
+        // "base" is an explicit, non-native unit meaning raw token base units.
+        let base = parse_amount("10000000 base").unwrap();
+        assert_eq!(base.unit, "base");
+        assert!(base.explicit_unit);
+        assert!(!base.is_native());
     }
 
     #[test]

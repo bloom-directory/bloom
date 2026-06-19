@@ -48,6 +48,10 @@ pub struct Config {
     /// `polymarket/` VFS subtree in (like `[enso]` opts in `defi/`).
     #[serde(default)]
     pub polymarket: Option<PolymarketConfig>,
+    /// Hyperliquid HyperCore read/write surface. Presence of `[hyperliquid]`
+    /// opts the `hyperliquid/` VFS subtree in.
+    #[serde(default)]
+    pub hyperliquid: Option<HyperliquidConfig>,
     #[serde(default)]
     pub mempool: BTreeMap<String, MempoolChainConfig>,
     #[serde(default)]
@@ -221,6 +225,34 @@ fn default_builder_key_mode() -> String {
 // Note: the geoblock endpoint is deliberately NOT configurable — it is a
 // non-bypassable refuse-line (see `bloom_polymarket::geoblock`).
 
+/// Hyperliquid HyperCore API configuration. Every field has a default so a
+/// bare `[hyperliquid]` TOML table uses the official public endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HyperliquidConfig {
+    #[serde(default = "default_hyperliquid_mainnet_url")]
+    pub mainnet_url: String,
+    #[serde(default = "default_hyperliquid_testnet_url")]
+    pub testnet_url: String,
+    /// Bridge2 contract that credits deposits (native USDC on Arbitrum).
+    /// Defaults to the mainnet bridge; not a magic literal in the route code.
+    #[serde(default = "default_hyperliquid_bridge")]
+    pub bridge_address: String,
+    /// Chain whose native USDC the bridge credits (Arbitrum One).
+    #[serde(default = "default_hyperliquid_deposit_chain_id")]
+    pub deposit_chain_id: u64,
+}
+
+impl Default for HyperliquidConfig {
+    fn default() -> Self {
+        Self {
+            mainnet_url: default_hyperliquid_mainnet_url(),
+            testnet_url: default_hyperliquid_testnet_url(),
+            bridge_address: default_hyperliquid_bridge(),
+            deposit_chain_id: default_hyperliquid_deposit_chain_id(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MempoolChainConfig {
     /// Provider id — must match a `bloom_mempool::providers::*` adapter
@@ -268,6 +300,18 @@ fn default_clob_url() -> String {
 }
 fn default_relayer_url() -> String {
     "https://relayer-v2.polymarket.com".to_string()
+}
+fn default_hyperliquid_mainnet_url() -> String {
+    "https://api.hyperliquid.xyz".to_string()
+}
+fn default_hyperliquid_testnet_url() -> String {
+    "https://api.hyperliquid-testnet.xyz".to_string()
+}
+fn default_hyperliquid_bridge() -> String {
+    crate::hyperliquid::MAINNET_BRIDGE.to_string()
+}
+fn default_hyperliquid_deposit_chain_id() -> u64 {
+    crate::hyperliquid::DEPOSIT_CHAIN_ID
 }
 fn default_polymarket_chain_id() -> u64 {
     137
@@ -445,6 +489,7 @@ impl Config {
             etherscan: None,
             enso: None,
             polymarket: None,
+            hyperliquid: None,
             mempool: BTreeMap::new(),
             private_rpc: BTreeMap::new(),
             block_mainnet_broadcast: true,
@@ -561,6 +606,7 @@ mod tests {
         assert!(cfg.block_mainnet_broadcast);
         assert!(cfg.etherscan.is_none());
         assert!(cfg.enso.is_none());
+        assert!(cfg.hyperliquid.is_none());
         assert_eq!(cfg.chains.len(), 12);
         let ethereum = cfg.chains.get("ethereum").expect("ethereum entry");
         assert_eq!(ethereum.chain_id, 1);
@@ -623,6 +669,18 @@ mod tests {
                 .unwrap();
         assert_eq!(pm.relayer_api_key.as_deref(), Some("k-123"));
         assert_eq!(pm.relayer_api_key_address.as_deref(), Some("0xabc"));
+    }
+
+    #[test]
+    fn bare_hyperliquid_block_parses_to_public_defaults() {
+        let hl: HyperliquidConfig = toml::from_str("").unwrap();
+        assert_eq!(hl.mainnet_url, "https://api.hyperliquid.xyz");
+        assert_eq!(hl.testnet_url, "https://api.hyperliquid-testnet.xyz");
+
+        let hl: HyperliquidConfig =
+            toml::from_str("mainnet_url = \"http://localhost:3001\"\n").unwrap();
+        assert_eq!(hl.mainnet_url, "http://localhost:3001");
+        assert_eq!(hl.testnet_url, "https://api.hyperliquid-testnet.xyz");
     }
 
     #[test]

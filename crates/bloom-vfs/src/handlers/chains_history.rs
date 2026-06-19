@@ -21,7 +21,13 @@ pub const DEFAULT_PAGE_SIZE: u32 = 50;
 
 pub(crate) fn map_err(e: DataSourceError) -> HandlerError {
     match e {
-        DataSourceError::Unsupported(s) => HandlerError::Unsupported(s),
+        // Name the working fallback so an agent that hits an unsupported
+        // history endpoint learns that direct balance reads still work.
+        DataSourceError::Unsupported(s) => HandlerError::Unsupported(format!(
+            "{s} — transfer history is unavailable via the configured backend; \
+             known token balances remain readable at \
+             chains/<chain>/addresses/<addr>/tokens/<token>/balance.json (see tokens/README.md)"
+        )),
         DataSourceError::RateLimit => HandlerError::backend("etherscan rate limited"),
         DataSourceError::NotFound(s) => HandlerError::not_found(s),
         DataSourceError::Backend(s) => HandlerError::backend(s),
@@ -95,6 +101,50 @@ pub async fn read_erc20_txs(
         .await
         .map_err(map_err)?;
     json_bytes(&txs)
+}
+
+/// Discover ERC-20 tokens an address has interacted with, derived from
+/// its recent token-transfer history. Used to populate the `discovered`
+/// list in `tokens/known.json`. Deduped by checksummed contract address,
+/// most-recent first. The raw `DataSourceError` is preserved (mapped)
+/// so the caller can distinguish "unsupported" from a transient failure.
+pub async fn discover_erc20_tokens(
+    src: &Arc<dyn AddressHistorySource>,
+    chain_id: u64,
+    addr: Address,
+) -> Result<Vec<super::well_known_tokens::DiscoveredEntry>, HandlerError> {
+    use std::collections::HashSet;
+
+    let txs = src
+        .get_token_tx(
+            chain_id,
+            addr,
+            None,
+            0,
+            99_999_999,
+            1,
+            DEFAULT_PAGE_SIZE,
+            Sort::Desc,
+        )
+        .await
+        .map_err(map_err)?;
+
+    let mut seen: HashSet<Address> = HashSet::new();
+    let mut out = Vec::new();
+    for t in &txs {
+        let Ok(token) = t.contract_address.parse::<Address>() else {
+            continue;
+        };
+        if !seen.insert(token) {
+            continue;
+        }
+        out.push(super::well_known_tokens::DiscoveredEntry {
+            address: bloom_proto::checksum_address(&token),
+            symbol: t.token_symbol.clone(),
+            source: "history",
+        });
+    }
+    Ok(out)
 }
 
 pub async fn read_erc721_txs(

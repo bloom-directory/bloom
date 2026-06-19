@@ -7,7 +7,8 @@
 //! Paths handled:
 //! - `wallets/`                                                     — list wallets
 //! - `wallets/new`                                                  — write to create wallet (plain name or TOML spec)
-//! - `wallets/<wallet>/address`                                     — checksummed address
+//! - `wallets/<wallet>/address`                                     — checksummed owner/signer address
+//! - `wallets/<wallet>/addresses.json`                              — owner/signer + role addresses (e.g. Polymarket deposit/funder)
 //! - `wallets/<wallet>/public_key`                                  — secp256k1 pubkey hex
 //! - `wallets/<wallet>/kind`                                        — local/watch
 //! - `wallets/<wallet>/policy.toml`                                 — read+write policy
@@ -44,6 +45,9 @@ pub struct WalletsHandler {
     pub home_write_permit: Option<Arc<HomeWritePermit>>,
     pub mempool_indexes:
         Arc<std::collections::BTreeMap<String, Arc<bloom_mempool::PendingTxIndex>>>,
+    /// Read-only Polymarket onboarding state, used to surface a wallet's
+    /// deposit/funder address alongside its owner EOA in `addresses.json`.
+    pub polymarket_onboard: Option<bloom_polymarket::OnboardStore>,
 }
 
 impl WalletsHandler {
@@ -60,7 +64,16 @@ impl WalletsHandler {
             address_book: Arc::new(address_book),
             home_write_permit: None,
             mempool_indexes: Arc::new(std::collections::BTreeMap::new()),
+            polymarket_onboard: None,
         }
+    }
+
+    /// Attach the Polymarket state root so `addresses.json` can surface the
+    /// wallet's deposit/funder address. Read-only: loads persisted
+    /// `account.json`, never resolves the live factory.
+    pub fn with_polymarket_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.polymarket_onboard = Some(bloom_polymarket::OnboardStore::new(root));
+        self
     }
 
     pub fn with_home_write_permit(mut self, permit: Arc<HomeWritePermit>) -> Self {
@@ -81,6 +94,59 @@ impl WalletsHandler {
         self
     }
 
+    /// Role-labeled address view for a wallet. The keystore `address` is both
+    /// the `owner` and the `signer` (the owner key signs); any derived role
+    /// address (e.g. the Polymarket deposit/funder wallet) is listed under
+    /// `roles` with its provenance, sourced from persisted onboarding state.
+    fn addresses_json(
+        &self,
+        wallet: &str,
+        info: &bloom_keystore::WalletInfo,
+    ) -> Result<Vec<u8>, HandlerError> {
+        use bloom_keystore::{PolicyStatus, WalletKind};
+
+        let kind = match info.kind {
+            WalletKind::Local => "local",
+            WalletKind::Watch => "watch",
+            WalletKind::PasskeyGated => "passkey",
+        };
+        let policy_status = match self.keystore.policy_status(wallet).map_err(err_be)? {
+            PolicyStatus::Signed => "signed",
+            PolicyStatus::Unsigned => "unsigned",
+            PolicyStatus::Stale => "stale",
+            PolicyStatus::NotApplicable => "not_applicable",
+        };
+        let owner = bloom_proto::checksum_address(&info.address);
+
+        let mut roles = serde_json::Map::new();
+        if let Some(store) = &self.polymarket_onboard
+            && let Ok(Some(st)) = store.load(wallet)
+        {
+            roles.insert(
+                "polymarket_deposit_wallet".to_string(),
+                serde_json::json!({
+                    "address": st.deposit_wallet,
+                    "source": st.deposit_wallet_source,
+                    "fundable": st.deposit_wallet_fundable,
+                    "note": "Polymarket trade funder/maker — NOT the wallet owner. \
+                             Funds sent here are controlled via the owner key.",
+                }),
+            );
+        }
+
+        let body = serde_json::json!({
+            "wallet": wallet,
+            "kind": kind,
+            "owner": owner,
+            "signer": owner,
+            "policy_status": policy_status,
+            "roles": serde_json::Value::Object(roles),
+        });
+        let mut out = serde_json::to_vec_pretty(&body).map_err(err_be)?;
+        out.push(b'\n');
+        Ok(out)
+    }
+
     fn write_permit(&self) -> Result<&HomeWritePermit, HandlerError> {
         self.home_write_permit.as_deref().ok_or_else(|| {
             HandlerError::backend(
@@ -89,14 +155,96 @@ impl WalletsHandler {
         })
     }
 
+    fn policy_session_dir_entries() -> Vec<Entry> {
+        vec![Entry::writable_file("new"), Entry::file("active.json")]
+    }
+
+    /// List this wallet's live policy sessions.
+    fn policy_session_active_json(&self, wallet: &str) -> Result<Vec<u8>, HandlerError> {
+        let sessions: Vec<serde_json::Value> = self
+            .tx_engine
+            .session_store()
+            .active(now_ms())
+            .into_iter()
+            .filter(|s| s.wallet == wallet)
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "chains": s.chains.iter().copied().collect::<Vec<u64>>(),
+                    "expires_ms": s.expires_ms,
+                    "max_micro_usd": s.max_micro_usd,
+                    "spent_micro_usd": s.spent_micro_usd,
+                    "allowed_pending_ids": s.allowed_pending_ids.iter().cloned().collect::<Vec<String>>(),
+                })
+            })
+            .collect();
+        let mut out = serde_json::to_vec_pretty(&serde_json::json!({ "sessions": sessions }))
+            .map_err(err_be)?;
+        out.push(b'\n');
+        Ok(out)
+    }
+
+    /// Mint a bounded policy session from a descriptor written to
+    /// `policy-session/new`. The descriptor is the security envelope: the
+    /// chains, total USD cap, TTL, and the exact pending-tx ids it authorizes.
+    fn mint_policy_session(&self, wallet: &str, data: &[u8]) -> Result<(), HandlerError> {
+        // Each authorized tx is a (chain_id, outbox id) pair — outbox ids are
+        // unique only within a chain, so the allowlist must be chain-qualified.
+        #[derive(serde::Deserialize)]
+        struct PendingId {
+            chain_id: u64,
+            id: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Descriptor {
+            /// Total spend cap in USD (dollars).
+            max_usd: f64,
+            ttl_secs: u64,
+            #[serde(default)]
+            pending_ids: Vec<PendingId>,
+        }
+        let d: Descriptor = serde_json::from_slice(data)
+            .map_err(|e| HandlerError::invalid(format!("policy-session descriptor: {e}")))?;
+        if d.pending_ids.is_empty() || d.ttl_secs == 0 || d.max_usd <= 0.0 {
+            return Err(HandlerError::invalid(
+                "policy-session requires non-empty pending_ids ({chain_id,id} pairs), \
+                 ttl_secs > 0, and max_usd > 0",
+            ));
+        }
+        // Chains are derived from the authorized pairs; the allowlist holds
+        // chain-qualified keys so a same-id tx on another chain can't slip in.
+        let chains = d.pending_ids.iter().map(|p| p.chain_id).collect();
+        let allowed_pending_ids = d
+            .pending_ids
+            .iter()
+            .map(|p| bloom_tx::session::pending_key(p.chain_id, &p.id))
+            .collect();
+        let now = now_ms();
+        let id = format!("{wallet}-{now:x}");
+        let session = bloom_tx::session::ActiveSession {
+            id: id.clone(),
+            wallet: wallet.to_string(),
+            chains,
+            expires_ms: now + (d.ttl_secs as u128) * 1000,
+            max_micro_usd: (d.max_usd * 1_000_000.0) as i128,
+            spent_micro_usd: 0,
+            allowed_pending_ids,
+        };
+        self.tx_engine.session_store().mint(session);
+        tracing::info!(wallet, session = %id, "wallet.policy_session.minted");
+        Ok(())
+    }
+
     fn wallet_dir_entries(kind: bloom_keystore::WalletKind) -> Vec<Entry> {
         let mut entries = vec![
             Entry::file("address"),
+            Entry::file("addresses.json"),
             Entry::file("public_key"),
             Entry::file("kind"),
             Entry::file("policy.toml"),
             Entry::dir("chains"),
             Entry::dir("sign"),
+            Entry::dir("policy-session"),
         ];
         if kind == bloom_keystore::WalletKind::PasskeyGated {
             entries.push(Entry::writable_file("unlock-passkey"));
@@ -124,6 +272,13 @@ impl WalletsHandler {
 
 fn err_be(e: impl std::fmt::Display) -> HandlerError {
     HandlerError::backend(e.to_string())
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 /// Parse a state segment (`pending` / `sent` / `failed`) into an
@@ -249,12 +404,12 @@ impl WalletsHandler {
             return Ok(Entry::writable_file("new"));
         }
         let wallet = &segs[0];
-        let info = self.keystore.info(wallet).map_err(err_be)?;
+        let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
         if segs.len() == 1 {
             return Ok(Entry::dir(wallet));
         }
         match segs[1].as_str() {
-            "address" | "public_key" | "kind" => Ok(Entry::file(&segs[1])),
+            "address" | "addresses.json" | "public_key" | "kind" => Ok(Entry::file(&segs[1])),
             "policy.toml" => Ok(Entry::writable_file("policy.toml")),
             "unlock-passkey" if info.kind == bloom_keystore::WalletKind::PasskeyGated => {
                 Ok(Entry::writable_file("unlock-passkey"))
@@ -277,6 +432,13 @@ impl WalletsHandler {
                 }
                 _ => self.lookup_chain(wallet, &segs[2], &segs[3..]).await,
             },
+            "policy-session" => match segs.len() {
+                2 => Ok(Entry::dir("policy-session")),
+                3 if segs[2] == "new" => Ok(Entry::writable_file("new")),
+                3 if segs[2] == "active.json" => Ok(Entry::file("active.json")),
+                4 if segs[3] == "revoke" => Ok(Entry::writable_file("revoke")),
+                _ => Err(HandlerError::not_found(path.to_string_path())),
+            },
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
     }
@@ -290,11 +452,12 @@ impl WalletsHandler {
             return Ok(b"# write a wallet name (plain text) or a TOML spec to create a wallet\n# examples:\n#   echo alice > /wallets/new\n#   printf 'name = \"alice\"\\nkind = \"local\"\\n' > /wallets/new\n# kind: local | import (with private_key) | watch (with address)\n".to_vec());
         }
         let wallet = &segs[0];
-        let info = self.keystore.info(wallet).map_err(err_be)?;
+        let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
         match segs.get(1).map(|s| s.as_str()).unwrap_or("") {
             "address" => {
                 Ok(format!("{}\n", bloom_proto::checksum_address(&info.address)).into_bytes())
             }
+            "addresses.json" => self.addresses_json(wallet, &info),
             "public_key" => Ok(format!("0x{}\n", info.pubkey_hex).into_bytes()),
             "kind" => {
                 let s = match info.kind {
@@ -309,6 +472,9 @@ impl WalletsHandler {
                 Ok(body.into_bytes())
             }
             "chains" if segs.len() >= 4 => self.read_chain(wallet, &segs[2], &segs[3..]).await,
+            "policy-session" if segs.len() == 3 && segs[2] == "active.json" => {
+                self.policy_session_active_json(wallet)
+            }
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
     }
@@ -346,6 +512,24 @@ impl WalletsHandler {
             self.keystore.unlock_passkey(wallet).await.map_err(err_be)?;
             return Ok(());
         }
+        // Mint a bounded policy session (one ceremony authorizes many in-bounds
+        // confirms). The IPC/CLI ceremony lane renders the envelope before this
+        // write lands for passkey wallets.
+        if segs.len() == 3 && segs[1] == "policy-session" && segs[2] == "new" {
+            self.write_permit()?;
+            return self.mint_policy_session(wallet, data);
+        }
+        if segs.len() == 4 && segs[1] == "policy-session" && segs[3] == "revoke" {
+            self.write_permit()?;
+            return if self.tx_engine.session_store().revoke(&segs[2]) {
+                Ok(())
+            } else {
+                Err(HandlerError::not_found(format!(
+                    "policy session '{}'",
+                    segs[2]
+                )))
+            };
+        }
         Err(HandlerError::PermissionDenied)
     }
 
@@ -358,7 +542,7 @@ impl WalletsHandler {
             return Ok(out);
         }
         let wallet = &segs[0];
-        let info = self.keystore.info(wallet).map_err(err_be)?;
+        let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
         match segs.len() {
             1 => Ok(Self::wallet_dir_entries(info.kind)),
             2 if segs[1] == "chains" => Ok(self
@@ -368,6 +552,7 @@ impl WalletsHandler {
                 .map(|n| Entry::dir(&n))
                 .collect()),
             2 if segs[1] == "sign" => Ok(Self::sign_dir_entries()),
+            2 if segs[1] == "policy-session" => Ok(Self::policy_session_dir_entries()),
             n if n >= 3 && segs[1] == "chains" => {
                 self.list_chain(wallet, &segs[2], &segs[3..]).await
             }
@@ -508,7 +693,8 @@ impl WalletsHandler {
         chain: &str,
         rest: &[String],
     ) -> Result<Vec<u8>, HandlerError> {
-        let info = self.keystore.info(wallet).map_err(err_be)?;
+        // Read-only chain leaves (balance/nonce): never gated on policy sig.
+        let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
         let client = self
             .chains
             .get(chain)
@@ -663,7 +849,7 @@ impl WalletsHandler {
         chain: &str,
         rest: &[String],
     ) -> Result<Vec<Entry>, HandlerError> {
-        let _info = self.keystore.info(wallet).map_err(err_be)?;
+        let _info = self.keystore.info_unverified(wallet).map_err(err_be)?;
         let _client = self
             .chains
             .get(chain)
@@ -1199,6 +1385,7 @@ mod tests {
             token: None,
             nft: None,
             usd_value: None,
+            depends_on: None,
         };
         f.handler
             .tx_engine
@@ -1367,6 +1554,106 @@ mod tests {
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"alice"));
         assert!(names.contains(&"new"));
+    }
+
+    #[tokio::test]
+    async fn addresses_json_reports_owner_and_signer() {
+        let f = make_handler();
+        let p = VfsPath::parse(&format!("/{}/addresses.json", f.wallet_name)).unwrap();
+        let body = f.handler.read(&p).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let owner = bloom_proto::checksum_address(&f.wallet_addr);
+        assert_eq!(v["wallet"], "alice");
+        assert_eq!(v["owner"], owner);
+        assert_eq!(v["signer"], owner, "owner and signer are the same EOA");
+        // Local wallet: no signed policy required, no role addresses known.
+        assert_eq!(v["policy_status"], "not_applicable");
+        assert!(v["roles"].as_object().unwrap().is_empty());
+        // addresses.json is also a listed dir entry.
+        let dir = VfsPath::parse(&format!("/{}", f.wallet_name)).unwrap();
+        let names: Vec<String> = f
+            .handler
+            .list(&dir)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "addresses.json"));
+    }
+
+    #[tokio::test]
+    async fn addresses_json_surfaces_polymarket_deposit_wallet() {
+        let f = make_handler();
+        let pm_root = f._tmp.path().join("polymarket");
+        let owner = f.wallet_addr;
+        let deposit = "0x3855000000000000000000000000000000000166";
+        let st: bloom_polymarket::OnboardState = serde_json::from_value(serde_json::json!({
+            "wallet": "alice",
+            "owner": bloom_proto::checksum_address(&owner),
+            "deposit_wallet": deposit,
+            "deposit_wallet_source": "live_factory_resolved",
+            "deposit_wallet_fundable": true,
+            "chain_id": 137,
+            "stage": "complete",
+            "deploy_tx_id": null,
+            "approve_tx_id": null,
+            "pusd_balance": null,
+            "creds_present": true,
+            "last_error": null,
+            "updated_ms": 0,
+        }))
+        .unwrap();
+        bloom_polymarket::OnboardStore::new(&pm_root)
+            .save("alice", &st)
+            .unwrap();
+
+        let handler = f.handler.clone().with_polymarket_root(&pm_root);
+        let p = VfsPath::parse("/alice/addresses.json").unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&handler.read(&p).await.unwrap()).unwrap();
+        let role = &v["roles"]["polymarket_deposit_wallet"];
+        assert_eq!(role["address"], deposit);
+        assert_eq!(role["source"], "live_factory_resolved");
+        assert_eq!(role["fundable"], true);
+        // Owner must NOT equal the deposit wallet — the bug we are guarding.
+        assert_ne!(v["owner"], role["address"]);
+    }
+
+    #[tokio::test]
+    async fn policy_session_mint_list_revoke() {
+        let f = make_handler();
+        let new_p = VfsPath::parse("/alice/policy-session/new").unwrap();
+        let body = br#"{"max_usd":10,"ttl_secs":600,"pending_ids":[{"chain_id":42161,"id":"0001-a"},{"chain_id":8453,"id":"0001-b"}]}"#;
+        f.handler.write(&new_p, body).await.unwrap();
+
+        let active_p = VfsPath::parse("/alice/policy-session/active.json").unwrap();
+        let v: serde_json::Value =
+            serde_json::from_slice(&f.handler.read(&active_p).await.unwrap()).unwrap();
+        let sessions = v["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["max_micro_usd"], 10_000_000);
+        let id = sessions[0]["id"].as_str().unwrap().to_string();
+
+        // The minted session actually authorizes a covered confirm.
+        assert!(
+            f.handler
+                .tx_engine
+                .session_store()
+                .authorize_and_debit("alice", 42161, "0001-a", Some(1_000_000), now_ms())
+                .is_some()
+        );
+
+        // Revoke clears it.
+        let revoke_p = VfsPath::parse(&format!("/alice/policy-session/{id}/revoke")).unwrap();
+        f.handler.write(&revoke_p, b"y").await.unwrap();
+        let v2: serde_json::Value =
+            serde_json::from_slice(&f.handler.read(&active_p).await.unwrap()).unwrap();
+        assert!(v2["sessions"].as_array().unwrap().is_empty());
+
+        // A degenerate descriptor (no chains/ids) is rejected.
+        let bad = br#"{"chains":[],"max_usd":10,"ttl_secs":600,"pending_ids":[]}"#;
+        assert!(f.handler.write(&new_p, bad).await.is_err());
     }
 
     #[tokio::test]

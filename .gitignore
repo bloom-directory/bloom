@@ -41,3 +41,4 @@ docs/polymarket-audit-2026-06-12.md
 # Live probe log — contains real owner/deposit addresses and trade amounts.
 docs/polymarket-discovery-findings.md
 examples/polymarket-probe/
+AGENTS.local.md

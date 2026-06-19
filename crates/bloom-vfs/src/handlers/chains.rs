@@ -196,11 +196,18 @@ impl ChainsHandler {
             .ok_or_else(|| HandlerError::not_found(format!("chain '{}'", name)))
     }
 
+    /// Resolve ERC-20 `(decimals, symbol)`. Each element is `None` when
+    /// the on-chain call could not be resolved — a revert, a non-standard
+    /// token, or an RPC failure (the chain client collapses all three
+    /// into `None`). Callers must treat `None` as *unknown*, never as real
+    /// data, so a degraded RPC can't masquerade as `? / 18`. Only
+    /// fully-resolved metadata is cached, so recovery is not blocked by a
+    /// cached fallback for the whole metadata TTL.
     async fn token_metadata(
         &self,
         client: &ChainClient,
         token: alloy::primitives::Address,
-    ) -> Result<(u8, String), HandlerError> {
+    ) -> Result<(Option<u8>, Option<String>), HandlerError> {
         let key = TokenMetadataKey {
             chain_id: client.spec().chain_id,
             token,
@@ -208,28 +215,90 @@ impl ChainsHandler {
         if let Some(meta) = self.token_metadata_cache.lock().get(&key)
             && meta.expires_at > Instant::now()
         {
-            return Ok((meta.decimals, meta.symbol.clone()));
+            return Ok((Some(meta.decimals), Some(meta.symbol.clone())));
         }
 
-        let decimals = client
-            .erc20_decimals(token)
-            .await
-            .map_err(err_be)?
-            .unwrap_or(18);
-        let symbol = client
-            .erc20_symbol(token)
-            .await
-            .map_err(err_be)?
-            .unwrap_or_else(|| "?".into());
-        self.token_metadata_cache.lock().insert(
-            key,
-            TokenMetadata {
-                decimals,
-                symbol: symbol.clone(),
-                expires_at: Instant::now() + super::balances::TOKEN_METADATA_TTL,
-            },
-        );
+        let decimals = client.erc20_decimals(token).await.map_err(err_be)?;
+        let symbol = client.erc20_symbol(token).await.map_err(err_be)?;
+
+        if let (Some(dec), Some(sym)) = (decimals, symbol.as_ref()) {
+            self.token_metadata_cache.lock().insert(
+                key,
+                TokenMetadata {
+                    decimals: dec,
+                    symbol: sym.clone(),
+                    expires_at: Instant::now() + super::balances::TOKEN_METADATA_TTL,
+                },
+            );
+        }
         Ok((decimals, symbol))
+    }
+
+    /// Build the `tokens/known.json` payload: curated majors for this
+    /// chain plus, when an address-history backend is available, tokens
+    /// the holder has recently transferred. `discovery_backend` tells the
+    /// agent whether history-based discovery actually ran.
+    async fn tokens_known_json(
+        &self,
+        client: &ChainClient,
+        chain: &str,
+        holder: alloy::primitives::Address,
+    ) -> Result<Vec<u8>, HandlerError> {
+        use super::well_known_tokens::{self as wkt, DiscoveredEntry, KnownEntry, KnownJson};
+
+        let chain_id = client.spec().chain_id;
+
+        let known: Vec<KnownEntry> = wkt::for_chain(chain_id)
+            .iter()
+            .filter_map(|t| {
+                let addr = t.address.parse::<alloy::primitives::Address>().ok()?;
+                Some(KnownEntry {
+                    address: checksum_address(&addr),
+                    symbol: t.symbol.to_string(),
+                    decimals: t.decimals,
+                    source: "well-known",
+                })
+            })
+            .collect();
+
+        let (discovery_backend, discovered): (&str, Vec<DiscoveredEntry>) =
+            match self.backends.address_history {
+                Backend::Etherscan => match self.address_history.as_ref() {
+                    Some(src) => {
+                        match chains_history::discover_erc20_tokens(src, chain_id, holder).await {
+                            Ok(d) => ("etherscan", d),
+                            // Etherscan configured but history unavailable here.
+                            Err(HandlerError::Unsupported(_)) => ("unsupported", Vec::new()),
+                            // Transient failure: report the backend, empty list.
+                            Err(_) => ("etherscan", Vec::new()),
+                        }
+                    }
+                    None => ("unsupported", Vec::new()),
+                },
+                Backend::Rpc => ("rpc", Vec::new()),
+                Backend::Indexer => ("indexer", Vec::new()),
+            };
+
+        let note = if discovery_backend == "etherscan" {
+            "known = curated majors; discovered = tokens this address recently \
+             transferred. Read tokens/<address>/balance.json for any token."
+        } else {
+            "known = curated majors. History-based discovery is unavailable on \
+             this chain/backend; read tokens/<address>/balance.json for any token \
+             you know."
+        }
+        .to_string();
+
+        let payload = KnownJson {
+            chain: chain.to_string(),
+            discovery_backend: discovery_backend.to_string(),
+            note,
+            known,
+            discovered,
+        };
+        let mut bytes = serde_json::to_vec_pretty(&payload).map_err(err_be)?;
+        bytes.push(b'\n');
+        Ok(bytes)
     }
 
     /// Resolve the contract-metadata source. Returns `NotFound` with an
@@ -508,6 +577,20 @@ const TOKEN_FILES: &[&str] = &[
     "decimals",
 ];
 
+/// Self-describing meta-files served directly under `addresses/<a>/tokens/`
+/// so an agent that `ls`-es the directory finds the path grammar and a
+/// list of common/discovered tokens, instead of an empty listing.
+const TOKENS_DIR_FILES: &[&str] = &["README.md", "known.json"];
+
+/// Body of `addresses/<a>/tokens/README.md` (vendored, like `DocsHandler`).
+const TOKENS_README: &str = include_str!("../docs/tokens.md");
+
+/// Returned when `symbol()`/`decimals()` can't be resolved. The chain
+/// client collapses revert, non-standard token, and RPC failure into one
+/// `None`, so the message names all three rather than implying real data.
+const ERC20_METADATA_UNAVAILABLE: &str = "erc20 metadata unavailable: symbol()/decimals() reverted, RPC failed, or non-standard \
+     token. Read balance.raw for the integer balance, or balance.json for raw + metadata_status.";
+
 #[async_trait]
 impl Handler for ChainsHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
@@ -623,6 +706,9 @@ impl ChainsHandler {
                     } else {
                         Err(HandlerError::not_found(path.to_string_path()))
                     }
+                }
+                5 if segs[3] == "tokens" && TOKENS_DIR_FILES.contains(&segs[4].as_str()) => {
+                    Ok(Entry::file(&segs[4]))
                 }
                 5 if segs[3] == "tokens" => Ok(Entry::dir(&segs[4])),
                 6 if segs[3] == "tokens" => {
@@ -797,6 +883,14 @@ impl ChainsHandler {
                     _ => Err(HandlerError::NotAFile(path.to_string_path())),
                 }
             }
+            "addresses" if segs.len() == 5 && segs[3] == "tokens" => {
+                let holder = parse_addr(&segs[2])?;
+                match segs[4].as_str() {
+                    "README.md" => Ok(TOKENS_README.as_bytes().to_vec()),
+                    "known.json" => self.tokens_known_json(&client, chain, holder).await,
+                    _ => Err(HandlerError::NotAFile(path.to_string_path())),
+                }
+            }
             "addresses" if segs.len() == 6 && segs[3] == "tokens" => {
                 let holder = parse_addr(&segs[2])?;
                 let token = parse_addr(&segs[4])?;
@@ -807,8 +901,15 @@ impl ChainsHandler {
                             .await
                             .map_err(err_be)?
                             .ok_or_else(|| HandlerError::backend("erc20 balanceOf reverted"))?;
-                        let (dec, sym) = self.token_metadata(&client, token).await?;
-                        Ok(super::balances::display_line(bal, dec, &sym))
+                        // Don't fabricate a display line from `? / 18`: a
+                        // formatted value with the wrong decimals is worse
+                        // than a clear error pointing at balance.raw.
+                        match self.token_metadata(&client, token).await? {
+                            (Some(dec), Some(sym)) => {
+                                Ok(super::balances::display_line(bal, dec, &sym))
+                            }
+                            _ => Err(HandlerError::backend(ERC20_METADATA_UNAVAILABLE)),
+                        }
                     }
                     "balance.raw" => {
                         let bal = client
@@ -825,22 +926,28 @@ impl ChainsHandler {
                             .map_err(err_be)?
                             .ok_or_else(|| HandlerError::backend("erc20 balanceOf reverted"))?;
                         let (dec, sym) = self.token_metadata(&client, token).await?;
-                        Ok(super::balances::balance_json(
+                        // Carries `metadata_status` + null fields when
+                        // metadata couldn't be resolved, so degraded reads
+                        // are visibly degraded rather than `? / 18`.
+                        Ok(super::balances::token_balance_json(
                             chain,
-                            "erc20",
-                            Some(&checksum_address(&token)),
-                            &sym,
+                            &checksum_address(&token),
+                            sym.as_deref(),
                             dec,
                             bal,
                         ))
                     }
                     "symbol" => {
                         let (_, sym) = self.token_metadata(&client, token).await?;
+                        let sym =
+                            sym.ok_or_else(|| HandlerError::backend(ERC20_METADATA_UNAVAILABLE))?;
                         Ok(format!("{sym}\n").into_bytes())
                     }
                     "decimals" => {
                         let (dec, _) = self.token_metadata(&client, token).await?;
-                        Ok(format!("{}\n", dec).into_bytes())
+                        let dec =
+                            dec.ok_or_else(|| HandlerError::backend(ERC20_METADATA_UNAVAILABLE))?;
+                        Ok(format!("{dec}\n").into_bytes())
                     }
                     _ => Err(HandlerError::NotAFile(path.to_string_path())),
                 }
@@ -1181,6 +1288,12 @@ impl ChainsHandler {
                     }
                 }
                 Ok(entries)
+            }
+            4 if segs[1] == "addresses" && segs[3] == "tokens" => {
+                // /chains/<chain>/addresses/<addr>/tokens — self-describing
+                // meta-files (README + known.json). Tokens themselves are
+                // addressed directly, not enumerated as fake dir entries.
+                Ok(TOKENS_DIR_FILES.iter().map(|n| Entry::file(n)).collect())
             }
             5 if segs[1] == "addresses" && segs[3] == "tokens" => {
                 // /chains/<chain>/addresses/<addr>/tokens/<token>
@@ -1692,6 +1805,87 @@ mod tests {
             .collect();
 
         assert_eq!(names, TX_FILES);
+    }
+
+    #[tokio::test]
+    async fn tokens_dir_lists_meta_files() {
+        let h = ChainsHandler::new(anvil_registry());
+        let chain = h.registry.list_names()[0].clone();
+        let p = VfsPath::parse(&format!(
+            "/{chain}/addresses/0x0000000000000000000000000000000000000001/tokens"
+        ))
+        .unwrap();
+
+        let names: Vec<String> = h
+            .list(&p)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, TOKENS_DIR_FILES);
+    }
+
+    #[tokio::test]
+    async fn tokens_lookup_resolves_meta_and_token_dir() {
+        use crate::handler::EntryKind;
+        let h = ChainsHandler::new(anvil_registry());
+        let chain = h.registry.list_names()[0].clone();
+        let base = format!("/{chain}/addresses/0x0000000000000000000000000000000000000001/tokens");
+
+        // README.md resolves as a file.
+        let readme = h
+            .lookup(&VfsPath::parse(&format!("{base}/README.md")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(readme.kind, EntryKind::File);
+
+        // A token contract address resolves as a directory.
+        let token = h
+            .lookup(
+                &VfsPath::parse(&format!(
+                    "{base}/0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(token.kind, EntryKind::Dir);
+    }
+
+    #[tokio::test]
+    async fn tokens_readme_documents_balance_json() {
+        let h = ChainsHandler::new(anvil_registry());
+        let chain = h.registry.list_names()[0].clone();
+        let p = VfsPath::parse(&format!(
+            "/{chain}/addresses/0x0000000000000000000000000000000000000001/tokens/README.md"
+        ))
+        .unwrap();
+
+        let bytes = h.read(&p).await.unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            s.contains("balance.json"),
+            "README must document balance.json"
+        );
+    }
+
+    #[tokio::test]
+    async fn tokens_known_json_parses_with_discovery_backend() {
+        // No etherscan source wired → discovery unavailable, but the
+        // payload must still be valid JSON naming the backend state.
+        let h = ChainsHandler::new(anvil_registry());
+        let chain = h.registry.list_names()[0].clone();
+        let p = VfsPath::parse(&format!(
+            "/{chain}/addresses/0x0000000000000000000000000000000000000001/tokens/known.json"
+        ))
+        .unwrap();
+
+        let bytes = h.read(&p).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["discovery_backend"], "unsupported");
+        assert!(v["known"].is_array());
+        assert!(v["discovered"].is_array());
     }
 
     #[tokio::test]

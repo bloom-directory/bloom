@@ -109,6 +109,10 @@ pub enum TxEngineError {
         "Enso quote is {age}s old (expires ~5 min) — re-run the intent for a fresh route, or write 'override' to broadcast anyway"
     )]
     EnsoQuoteStale { age: u64 },
+    #[error("dependency '{dep_id}' not satisfied: {reason}")]
+    DependencyNotSatisfied { dep_id: String, reason: String },
+    #[error("pre-broadcast simulation reverted: {reason} — write 'override' to broadcast anyway")]
+    SimulationReverted { reason: String },
 }
 
 /// In-memory cache for ERC-20 metadata keyed by `(chain_id, address)`.
@@ -216,6 +220,9 @@ pub struct TxEngine {
     /// microseconds only (HashMap lookup/insert); the inner
     /// `tokio::sync::Mutex` is the actual per-sender stage lock.
     nonce_locks: NonceLocks,
+    /// Bounded policy sessions: one ceremony authorizes many in-bounds
+    /// confirms without a fresh per-tx review. See [`crate::session`].
+    session_store: crate::session::SessionStore,
 }
 
 impl TxEngine {
@@ -230,7 +237,13 @@ impl TxEngine {
             mempool_indexes: Arc::new(RwLock::new(BTreeMap::new())),
             private_rpcs: Arc::new(RwLock::new(BTreeMap::new())),
             nonce_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            session_store: crate::session::SessionStore::new(),
         }
+    }
+
+    /// Access the bounded policy-session store (mint/revoke/list live here).
+    pub fn session_store(&self) -> &crate::session::SessionStore {
+        &self.session_store
     }
 
     /// Return (or create) the per-(wallet, chain, from) `tokio::sync::Mutex`
@@ -524,7 +537,26 @@ impl TxEngine {
                     let meta = self.token_meta(chain, token_addr, &sym_hint).await?;
                     let parsed =
                         parse_amount(value).map_err(|e| TxEngineError::Amount(e.to_string()))?;
-                    let amount = parse_units(&parsed.number, meta.decimals)
+                    // A native metric unit (wei/gwei/eth) on an ERC-20 amount is
+                    // ambiguous — it would be silently rescaled by token
+                    // decimals. Reject it and point at the unambiguous forms.
+                    // A bare integer (explicit_unit == false) is still accepted
+                    // as a human token amount.
+                    if parsed.explicit_unit && parsed.is_native() {
+                        return Err(TxEngineError::Amount(format!(
+                            "'{value}' uses a native unit ('{}') for an ERC-20 token; write a human \
+                             amount like '10 {}' or raw base units like '10000000 base'",
+                            parsed.unit, meta.symbol
+                        )));
+                    }
+                    // `base` means the number is already in token base units —
+                    // do not rescale by decimals.
+                    let scale = if parsed.unit == "base" {
+                        0
+                    } else {
+                        meta.decimals
+                    };
+                    let amount = parse_units(&parsed.number, scale)
                         .map_err(|e| TxEngineError::Amount(e.to_string()))?;
                     let call = IERC20::transferCall {
                         to: to_addr,
@@ -1067,6 +1099,7 @@ impl TxEngine {
             token: token_for_plan,
             nft: nft_for_plan,
             usd_value: policy_ctx.usd_value,
+            depends_on: None,
         };
         staged.policy_checks = policy_engine::evaluate(
             policy,
@@ -1138,6 +1171,14 @@ impl TxEngine {
             }));
         }
 
+        // Same-chain dependency gate: a tx that depends on another (e.g. a
+        // route that spends an approve) must not broadcast until that
+        // predecessor has mined *successfully*. A reverted predecessor still
+        // consumed its nonce, so this is an explicit refuse — never a reshuffle.
+        if let Some(dep_id) = staged.depends_on.clone() {
+            self.ensure_dependency_satisfied(wallet, chain_name, &dep_id)?;
+        }
+
         // Policy gate.
         let hard = policy_engine::has_hard_violation(&staged.policy_checks);
         if hard {
@@ -1192,14 +1233,37 @@ impl TxEngine {
             );
             return Err(TxEngineError::BroadcastDisabled(spec.name.clone()));
         }
-        self.ensure_action_authorized(
-            &staged,
-            policy,
-            reviewed_intent_hash,
-            bloom_proto::AuthorizationSurface::Cli,
-        )?;
+        // Pre-broadcast simulation first (no side effects): eth_call against
+        // current state so a tx that would revert is caught here instead of
+        // burning gas. The override sentinel forces it through.
+        if !override_text {
+            self.simulate_or_reject(&staged, chain).await?;
+        }
 
-        let tx_hash = self
+        // Authorization. The policy gates above (hard deny / unoverridden warn)
+        // have already passed, so a bounded policy session may authorize this
+        // confirm without a fresh per-tx review; otherwise fall back to the
+        // standard per-tx authorization. The session debit is atomic; we refund
+        // it if the broadcast then fails.
+        let session_debit = self.session_store.authorize_and_debit(
+            wallet,
+            staged.chain_id,
+            &staged.id,
+            self.authorization_subject(&staged).total_value_usd_micro,
+            now_ms(),
+        );
+        if let Some((ref sid, _)) = session_debit {
+            debug!(id = %staged.id, session = %sid, "tx.authorized_by_session");
+        } else {
+            self.ensure_action_authorized(
+                &staged,
+                policy,
+                reviewed_intent_hash,
+                bloom_proto::AuthorizationSurface::Cli,
+            )?;
+        }
+
+        let tx_hash = match self
             .submit_with_marker(
                 &entry,
                 BroadcastAttemptKind::Confirm,
@@ -1208,7 +1272,16 @@ impl TxEngine {
                 signer,
                 policy,
             )
-            .await?;
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                if let Some((sid, amt)) = session_debit {
+                    self.session_store.refund(&sid, amt);
+                }
+                return Err(e);
+            }
+        };
         info!(id=%staged.id, hash=%format!("{:#x}", tx_hash), "tx.broadcast");
 
         staged.status = TxStatus::Sent;
@@ -1561,6 +1634,85 @@ impl TxEngine {
             return Err(TxEngineError::BroadcastDisabled(spec.name.clone()));
         }
         Ok(())
+    }
+
+    /// Refuse to broadcast when a same-chain dependency has not mined
+    /// successfully. Both "not yet confirmed" and "reverted/failed" are hard
+    /// refusals: broadcasting a dependent tx before its predecessor confirms
+    /// is precisely the footgun this guards against.
+    fn ensure_dependency_satisfied(
+        &self,
+        wallet: &str,
+        chain: &str,
+        dep_id: &str,
+    ) -> Result<(), TxEngineError> {
+        let reject = |reason: &str| {
+            Err(TxEngineError::DependencyNotSatisfied {
+                dep_id: dep_id.to_string(),
+                reason: reason.to_string(),
+            })
+        };
+        let entry = match self.outbox.read(wallet, chain, dep_id) {
+            Ok(e) => e,
+            Err(OutboxError::NotFound(_)) => return reject("predecessor not found in the outbox"),
+            Err(e) => return Err(e.into()),
+        };
+        match entry.state {
+            crate::outbox::OutboxState::Failed => reject("predecessor failed or was cancelled"),
+            crate::outbox::OutboxState::Pending => {
+                reject("predecessor is still pending (not broadcast)")
+            }
+            crate::outbox::OutboxState::Sent => {
+                match self.outbox.read_receipt(wallet, chain, dep_id)? {
+                    Some(r) if r.is_success() => Ok(()),
+                    Some(r) => {
+                        let detail = r
+                            .revert_reason
+                            .map(|s| format!(": {s}"))
+                            .unwrap_or_default();
+                        Err(TxEngineError::DependencyNotSatisfied {
+                            dep_id: dep_id.to_string(),
+                            reason: format!("predecessor reverted{detail}"),
+                        })
+                    }
+                    None => reject("predecessor broadcast but not yet confirmed"),
+                }
+            }
+        }
+    }
+
+    /// `eth_call` the staged tx against current state; reject on revert. RPC
+    /// failures simulating are non-fatal (don't block broadcast on infra).
+    async fn simulate_or_reject(
+        &self,
+        staged: &StagedTx,
+        chain: &ChainClient,
+    ) -> Result<(), TxEngineError> {
+        let from: Address = staged
+            .from
+            .parse()
+            .map_err(|_| TxEngineError::Address(staged.from.clone()))?;
+        let to: Address = staged
+            .to
+            .parse()
+            .map_err(|_| TxEngineError::Address(staged.to.clone()))?;
+        let value = U256::from_str_radix(&staged.value_wei, 10).unwrap_or(U256::ZERO);
+        let data = staged.data_hex.parse::<Bytes>().unwrap_or_default();
+        let req = TransactionRequest::default()
+            .from(from)
+            .to(to)
+            .value(value)
+            .input(data.into());
+        match chain.eth_call_capture_revert(req, None).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(returndata)) => Err(TxEngineError::SimulationReverted {
+                reason: crate::reconcile::decode_revert(&returndata),
+            }),
+            Err(e) => {
+                debug!(id = %staged.id, error = %e, "tx.simulate_unavailable");
+                Ok(())
+            }
+        }
     }
 
     fn ensure_action_authorized(
@@ -2176,17 +2328,14 @@ fn short_addr_label(a: &Address) -> String {
     }
 }
 
-/// Hardcoded list of common ERC-20 addresses. Anvil mainnet forks share
-/// chain id 31337 with vanilla Anvil — the lookup is best-effort and a
+/// Resolve a common ERC-20 symbol to its address via the shared
+/// `bloom_proto::tokens` table (the single source of truth across the send
+/// path, route path, and VFS token surface). Anvil mainnet forks share chain
+/// id 31337 with vanilla Anvil, so they reuse the Ethereum (id 1) majors; a
 /// caller can always pass a 0x address explicitly.
 fn lookup_known_token(chain_id: u64, symbol_upper: &str) -> Option<&'static str> {
-    let hit: Option<&'static str> = match (chain_id, symbol_upper) {
-        (1, "USDC") | (31337, "USDC") => Some("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
-        (1, "USDT") | (31337, "USDT") => Some("0xdAC17F958D2ee523a2206206994597C13D831ec7"),
-        (1, "DAI") | (31337, "DAI") => Some("0x6B175474E89094C44Da98b954EedeAC495271d0F"),
-        (1, "WETH") | (31337, "WETH") => Some("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
-        _ => None,
-    };
+    let lookup_chain = if chain_id == 31337 { 1 } else { chain_id };
+    let hit = bloom_proto::tokens::resolve_symbol(lookup_chain, symbol_upper).map(|t| t.address);
     if hit.is_none() {
         debug!(chain_id, symbol = symbol_upper, "tx.known_token_miss");
     }
@@ -2225,6 +2374,7 @@ mod tests {
             token: None,
             nft: None,
             usd_value: None,
+            depends_on: None,
         }
     }
 
@@ -2274,6 +2424,24 @@ mod tests {
         assert!(matches!(err, TxEngineError::Token(_)));
     }
 
+    #[test]
+    fn resolve_token_symbol_resolves_on_arbitrum() {
+        // Regression: USDC by symbol must resolve on non-mainnet chains via the
+        // shared bloom_proto::tokens table (previously only chains 1/31337).
+        let (a, sym) = TxEngine::resolve_token_address("USDC", 42161).unwrap();
+        assert_eq!(
+            format!("{a:#x}"),
+            "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+        );
+        assert_eq!(sym, "USDC");
+    }
+
+    #[test]
+    fn resolve_token_symbol_resolves_on_polygon_and_base() {
+        assert!(TxEngine::resolve_token_address("USDC", 137).is_ok());
+        assert!(TxEngine::resolve_token_address("USDC", 8453).is_ok());
+    }
+
     // -------------------------------------------------------------------
     // Nonce-conflict body tests. These exercise the index lookup +
     // body shape directly; the full stage() path is covered elsewhere
@@ -2307,6 +2475,71 @@ mod tests {
         let outbox = crate::outbox::Outbox::new(dir.path()).unwrap();
         let engine = TxEngine::new(outbox, 60_000, false);
         (engine, dir)
+    }
+
+    #[test]
+    fn dependency_gate_blocks_until_predecessor_succeeds() {
+        use crate::outbox::{MinedReceipt, OutboxState, RECEIPT_FILE};
+        let (engine, _dir) = nonce_conflict_engine();
+
+        // No predecessor in the outbox → refused.
+        assert!(matches!(
+            engine.ensure_dependency_satisfied("alice", "anvil", "approve"),
+            Err(TxEngineError::DependencyNotSatisfied { .. })
+        ));
+
+        // Predecessor staged but still pending → refused.
+        let mut dep = fake_staged_1559("approve");
+        dep.tx_hash = Some(format!("{:#x}", B256::repeat_byte(9)));
+        engine.outbox.write_pending(&dep, "# plan").unwrap();
+        assert!(matches!(
+            engine.ensure_dependency_satisfied("alice", "anvil", "approve"),
+            Err(TxEngineError::DependencyNotSatisfied { .. })
+        ));
+
+        // Broadcast (sent) but no receipt yet → refused (waiting to confirm).
+        let entry = engine.outbox.read("alice", "anvil", "approve").unwrap();
+        engine.outbox.transition(&entry, OutboxState::Sent).unwrap();
+        assert!(matches!(
+            engine.ensure_dependency_satisfied("alice", "anvil", "approve"),
+            Err(TxEngineError::DependencyNotSatisfied { .. })
+        ));
+
+        // Reverted receipt → refused, with the reason surfaced.
+        let se = &engine.outbox.walk_all_sent().unwrap()[0];
+        let reverted = MinedReceipt {
+            outcome: "reverted".into(),
+            tx_hash: dep.tx_hash.clone().unwrap(),
+            block_number: Some(1),
+            revert_reason: Some("ERC20: insufficient allowance".into()),
+        };
+        engine
+            .outbox
+            .write_sent_sibling(se, RECEIPT_FILE, &serde_json::to_vec(&reverted).unwrap())
+            .unwrap();
+        match engine.ensure_dependency_satisfied("alice", "anvil", "approve") {
+            Err(TxEngineError::DependencyNotSatisfied { reason, .. }) => {
+                assert!(reason.contains("reverted"))
+            }
+            other => panic!("expected reverted refusal, got {other:?}"),
+        }
+
+        // Success receipt → allowed.
+        let success = MinedReceipt {
+            outcome: "success".into(),
+            tx_hash: dep.tx_hash.clone().unwrap(),
+            block_number: Some(1),
+            revert_reason: None,
+        };
+        engine
+            .outbox
+            .write_sent_sibling(se, RECEIPT_FILE, &serde_json::to_vec(&success).unwrap())
+            .unwrap();
+        assert!(
+            engine
+                .ensure_dependency_satisfied("alice", "anvil", "approve")
+                .is_ok()
+        );
     }
 
     #[test]

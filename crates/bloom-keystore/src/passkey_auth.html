@@ -33,6 +33,17 @@
     .panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;box-shadow:0 1px 2px rgba(16,24,40,.04)}
     .panel h2{font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin:0;padding:14px 16px;border-bottom:1px solid var(--line)}
     .panel-body{padding:16px}
+    .hero{padding:20px;border:1px solid #c9d7ef;background:linear-gradient(180deg,#ffffff 0%,#f7fbff 100%)}
+    .hero-title{font-size:28px;line-height:1.1;margin:0 0 8px;font-weight:760}
+    .hero-copy{font-size:15px;line-height:1.55;color:#475467;max-width:760px}
+    .hero-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:16px}
+    .hero-stat{border:1px solid var(--line);border-radius:8px;background:#fff;padding:12px}
+    .hero-stat strong{display:block;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:6px}
+    .hero-stat span{display:block;font-size:15px;line-height:1.35;color:var(--text);overflow-wrap:anywhere}
+    .hero-note{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px;margin-top:14px}
+    .hero-box{border:1px solid #d7e3f4;border-radius:8px;background:#fff;padding:13px}
+    .hero-box strong{display:block;font-size:13px;margin-bottom:6px}
+    .hero-box p{font-size:13px;color:#475467}
     .kv{display:grid;grid-template-columns:88px minmax(0,1fr);gap:8px 12px;font-size:14px}
     .label{color:var(--muted)}
     .value{min-width:0;overflow-wrap:anywhere}
@@ -79,9 +90,15 @@
       main{padding:22px 12px 34px}
       header{display:block}
       .grid{grid-template-columns:1fr}
+      .hero-grid{grid-template-columns:1fr 1fr}
+      .hero-note{grid-template-columns:1fr}
       .kv{grid-template-columns:74px minmax(0,1fr)}
       .choice{grid-template-columns:1fr}
       .simple-policy{grid-template-columns:1fr}
+    }
+    @media(max-width:560px){
+      .hero-grid{grid-template-columns:1fr}
+      .hero-title{font-size:24px}
     }
   </style>
 </head>
@@ -91,12 +108,30 @@
     <div>
       <h1 id="title">Review passkey action</h1>
       <p>
-        Review the exact Bloom action before the OS/browser passkey prompt opens.
+        Review the authority you are granting before the OS/browser passkey prompt opens.
         The passkey prompt proves user presence for bloom/localhost; it does not
-        display these details itself.
+        show venue, risk, or size details itself.
       </p>
     </div>
   </header>
+
+  <section id="heroWrap" class="panel hero hidden" style="margin-bottom:16px">
+    <div>
+      <h2 id="heroTitle" class="hero-title">Review authorization</h2>
+      <p id="heroCopy" class="hero-copy"></p>
+    </div>
+    <div id="heroGrid" class="hero-grid"></div>
+    <div class="hero-note">
+      <div class="hero-box">
+        <strong>What you are authorizing</strong>
+        <p id="heroWhat"></p>
+      </div>
+      <div class="hero-box">
+        <strong>What the next prompt will show</strong>
+        <p id="heroPrompt"></p>
+      </div>
+    </div>
+  </section>
 
   <div class="grid">
     <section class="panel">
@@ -313,6 +348,23 @@ function simpleCard(parent,title,text){
   card.appendChild(body);
   parent.appendChild(card);
 }
+function heroStat(parent,title,text){
+  const card=document.createElement('div');
+  card.className='hero-stat';
+  const h=document.createElement('strong');
+  h.textContent=title;
+  const body=document.createElement('span');
+  appendLinkedText(body,text);
+  card.appendChild(h);
+  card.appendChild(body);
+  parent.appendChild(card);
+}
+function summaryLineValue(lines,prefix){
+  for(const line of (lines||[])){
+    if(String(line).startsWith(prefix)) return String(line).slice(prefix.length).trim();
+  }
+  return '';
+}
 function setPolicyModePresentation(mode){
   const title=document.getElementById('policyTitle');
   const details=document.getElementById('rawPolicyDetails');
@@ -328,6 +380,101 @@ function setPolicyModePresentation(mode){
     details.querySelector('summary').textContent='Advanced: exact safety limits';
     plain.textContent='Bloom will ask before every money-moving action. These limits can still block actions that are outside your guardrails.';
   }
+}
+function isHyperliquidIntent(i){
+  const subj=i&&i.canonical_subject?i.canonical_subject:{};
+  return subj.kind==='hyperliquid_agent_session_grant' || subj.kind==='hyperliquid_vfs_write';
+}
+function buttonLabelForIntent(i){
+  if(isHyperliquidIntent(i)){
+    const summary=i&&i.summary_lines?i.summary_lines:[];
+    if((i.canonical_subject||{}).kind==='hyperliquid_agent_session_grant'){
+      const markets=lineValue((i.policy_lines||[]).join('\n'),'allowed_assets')||'Trading';
+      return 'Authorize '+markets+' Trading Session';
+    }
+    const file=(i.canonical_subject||{}).file||summaryLineValue(summary,'Action file:');
+    if(file==='order.json') return 'Authorize Hyperliquid Order';
+    if(file==='cancel.json') return 'Authorize Hyperliquid Cancel';
+    if(file==='schedule_cancel.json') return 'Authorize Dead-Man Switch';
+    if(file==='update_leverage.json') return 'Authorize Leverage Update';
+    return 'Authorize Hyperliquid Action';
+  }
+  if(isPolicyIntent(i)) return 'Approve Policy';
+  return 'Approve and Continue';
+}
+function sessionDurationText(raw){
+  const secs=parseInt(String(raw||''),10);
+  if(!isFinite(secs)||secs<=0) return 'Not stated';
+  if(secs%3600===0) return (secs/3600)+' hour'+(secs===3600?'':'s');
+  if(secs%60===0) return (secs/60)+' minute'+(secs===60?'':'s');
+  return secs+' seconds';
+}
+function renderHyperliquidReview(text,subject){
+  const parent=document.getElementById('policySimple');
+  parent.textContent='';
+  const network=subject&&subject.network?subject.network:'mainnet';
+  simpleCard(parent,'Authority','Bounded Hyperliquid trading session on '+network+'.');
+  simpleCard(parent,'Session key',lineValue(text,'session_key')||'Trade-only API wallet');
+  simpleCard(parent,'Duration',sessionDurationText(lineValue(text,'max_session_secs')));
+  simpleCard(parent,'Allowed markets',lineValue(text,'allowed_assets')||'Not stated');
+  simpleCard(parent,'Order types',lineValue(text,'allowed_order_types')||'Not stated');
+  simpleCard(parent,'Max position',lineValue(text,'max_position_usd')||'Not stated');
+  simpleCard(parent,'Max order notional',lineValue(text,'max_notional_usd')||'Not stated');
+  simpleCard(parent,'Max loss',lineValue(text,'max_loss_usd')||'Not stated');
+  simpleCard(parent,'Max leverage',lineValue(text,'max_leverage')||'Not stated');
+  simpleCard(parent,'Withdrawals',lineValue(text,'withdrawals')||'Not allowed');
+  simpleCard(parent,'Transfers',lineValue(text,'transfers')||'Not allowed');
+}
+function renderHero(i){
+  const wrap=document.getElementById('heroWrap');
+  const title=document.getElementById('heroTitle');
+  const copy=document.getElementById('heroCopy');
+  const what=document.getElementById('heroWhat');
+  const prompt=document.getElementById('heroPrompt');
+  const grid=document.getElementById('heroGrid');
+  grid.textContent='';
+  wrap.classList.remove('hidden');
+  if(isHyperliquidIntent(i)){
+    const text=(i.policy_lines||[]).join('\n');
+    const summary=i.summary_lines||[];
+    const isSession=(i.canonical_subject||{}).kind==='hyperliquid_agent_session_grant';
+    title.textContent=isSession?'Authorize Hyperliquid trading session':'Authorize Hyperliquid action';
+    copy.textContent=isSession
+      ?'This approval lets Bloom trade within the exact bounds below until the session expires or is stopped.'
+      :'This approval signs one Hyperliquid action. Review the exact market and risk limits below before continuing.';
+    heroStat(grid,'Wallet',i.wallet||'Unknown');
+    heroStat(grid,'Venue','Hyperliquid '+(((i.canonical_subject||{}).network)||'mainnet'));
+    heroStat(grid,'Markets',lineValue(text,'allowed_assets')||'Not stated');
+    heroStat(grid,'Duration',sessionDurationText(lineValue(text,'max_session_secs')));
+    heroStat(grid,'Order Types',lineValue(text,'allowed_order_types')||'Not stated');
+    heroStat(grid,'Max Position',lineValue(text,'max_position_usd')||'Not stated');
+    heroStat(grid,'Max Loss',lineValue(text,'max_loss_usd')||'Not stated');
+    heroStat(grid,'Agent Name',summaryLineValue(summary,'Agent name:')||'bloom-session');
+    what.textContent=isSession
+      ?'A trade-only Hyperliquid API wallet may place matching trades without more passkey prompts until expiry or stop. Withdrawals and third-party transfers remain blocked.'
+      :'Bloom will submit exactly one Hyperliquid action. This does not grant an open-ended trading session.';
+    prompt.textContent='The native passkey prompt will only show bloom/localhost and ask for user presence. It will not repeat these trading bounds, market names, or dollar limits.';
+    return;
+  }
+  if(isPolicyIntent(i)){
+    title.textContent='Approve wallet policy';
+    copy.textContent='This approval changes Bloom’s authorization rules. It does not place a trade or move funds by itself.';
+    heroStat(grid,'Wallet',i.wallet||'Unknown');
+    heroStat(grid,'Surface','Wallet policy');
+    heroStat(grid,'Effect','Changes future authorization');
+    heroStat(grid,'Prompt','Passkey review');
+    what.textContent='You are approving the rules Bloom will use later when deciding what is allowed.';
+    prompt.textContent='The native passkey prompt will only show bloom/localhost. It will not describe the policy contents.';
+    return;
+  }
+  title.textContent=i.title||'Review authorization';
+  copy.textContent='Review the exact action below before opening the passkey prompt.';
+  heroStat(grid,'Wallet',i.wallet||'Unknown');
+  heroStat(grid,'Kind',i.kind||'unknown');
+  heroStat(grid,'Hash',document.getElementById('hash').textContent||'-');
+  heroStat(grid,'Prompt','Passkey review');
+  what.textContent='Bloom will proceed only for the reviewed foreground action.';
+  prompt.textContent='The native passkey prompt will only show bloom/localhost and confirm your presence.';
 }
 function renderSimplePolicy(text){
   const parent=document.getElementById('policySimple');
@@ -393,6 +540,7 @@ async function loadIntent(){
   setLinked('address',i.wallet_address||'-');
   document.getElementById('kind').textContent=i.kind||'unknown';
   document.getElementById('hash').textContent=data.intent_hash||'-';
+  renderHero(i);
   const summary=document.getElementById('summary');
   summary.textContent='';
   if(isPolicyIntent(i)){
@@ -406,6 +554,10 @@ async function loadIntent(){
     document.getElementById('policyWrap').classList.remove('hidden');
     if(isPolicyIntent(i)){
       document.getElementById('policyDecision').classList.remove('hidden');
+    }else if(isHyperliquidIntent(i)){
+      document.getElementById('policyTitle').textContent='Trading Bounds';
+      document.getElementById('rawPolicyDetails').open=false;
+      document.getElementById('rawPolicyDetails').querySelector('summary').textContent='Technical details';
     }else{
       document.getElementById('policyTitle').textContent='Transaction Details';
       document.getElementById('rawPolicyDetails').open=true;
@@ -414,8 +566,12 @@ async function loadIntent(){
     const policy=document.getElementById('policy');
     policy.textContent='';
     i.policy_lines.forEach((x,idx)=>policyLine(policy,x,idx+1));
-    renderSimplePolicy(i.policy_lines.join('\n'));
-    setSelectedAutonomy(getAutonomyMode(i.policy_lines.join('\n')));
+    if(isHyperliquidIntent(i)){
+      renderHyperliquidReview(i.policy_lines.join('\n'),i.canonical_subject||{});
+    }else{
+      renderSimplePolicy(i.policy_lines.join('\n'));
+      setSelectedAutonomy(getAutonomyMode(i.policy_lines.join('\n')));
+    }
   }
   if(i.risk_lines&&i.risk_lines.length){
     document.getElementById('riskWrap').classList.remove('hidden');
@@ -433,18 +589,23 @@ async function loadIntent(){
     document.getElementById('subjectWrap').classList.remove('hidden');
     document.getElementById('subject').textContent=JSON.stringify(i.canonical_subject,null,2);
   }
-  st.textContent='Compare the intent hash with the terminal, then approve to open the passkey prompt.';
-  document.getElementById('approve').disabled=false;
+  const approve=document.getElementById('approve');
+  approve.textContent=buttonLabelForIntent(i);
+  st.textContent=isHyperliquidIntent(i)
+    ?'Review the trading bounds above. The next OS prompt will only confirm bloom/localhost, not these market and risk details.'
+    :'Review the authorization above, then continue to the passkey prompt.';
+  approve.disabled=false;
 }
 async function run(){
   const st=document.getElementById('status');
   const approve=document.getElementById('approve');
+  const normalLabel=buttonLabelForIntent(CURRENT_INTENT||{});
   approve.disabled=true;
   approve.textContent='Waiting...';
   if(!navigator.credentials||!navigator.credentials.get){
     st.className='err';
     st.textContent='WebAuthn is not available in this browser. Try Chrome or Safari on this device.';
-    approve.textContent='Approve and Continue';
+    approve.textContent=normalLabel;
     return;
   }
   try{
@@ -510,7 +671,7 @@ async function run(){
       approve.textContent='Retry Passkey';
       st.textContent+=' The action has not been signed. Check the review hash and retry from this page.';
     }else{
-      approve.textContent='Approve and Continue';
+      approve.textContent=normalLabel;
     }
   }
 }
