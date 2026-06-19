@@ -2,11 +2,14 @@
 
 use async_trait::async_trait;
 use bloom_keystore::{Keystore, KeystoreError, WalletKind};
-use bloom_paid_http::{NormalizedChallenge, ParsedRequest};
+use bloom_paid_http::{
+    EmptyPaidHttpChainRpcResolver, NormalizedChallenge, PaidHttpChainRpcResolver, ParsedRequest,
+};
 use bloom_proto::Policy;
 use mpp::client::{PaymentProvider, TempoProvider, TempoSessionProvider};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
+use std::sync::Arc;
 
 #[async_trait]
 pub trait PaymentBackend: Send + Sync {
@@ -24,16 +27,24 @@ pub trait PaymentBackend: Send + Sync {
 pub struct RealMppBackend {
     pub keystore: Keystore,
     pub client: reqwest::Client,
-    pub rpc_url: String,
+    pub rpc_resolver: Arc<dyn PaidHttpChainRpcResolver>,
 }
 
 impl RealMppBackend {
-    pub fn new(keystore: Keystore, client: reqwest::Client, rpc_url: String) -> Self {
+    pub fn new(
+        keystore: Keystore,
+        client: reqwest::Client,
+        rpc_resolver: Arc<dyn PaidHttpChainRpcResolver>,
+    ) -> Self {
         Self {
             keystore,
             client,
-            rpc_url,
+            rpc_resolver,
         }
+    }
+
+    pub fn without_rpc_resolver(keystore: Keystore, client: reqwest::Client) -> Self {
+        Self::new(keystore, client, Arc::new(EmptyPaidHttpChainRpcResolver))
     }
 
     fn signer_error(&self, wallet: &str, err: KeystoreError) -> String {
@@ -91,15 +102,24 @@ impl PaymentBackend for RealMppBackend {
             .keystore
             .signer(wallet)
             .map_err(|e| self.signer_error(wallet, e))?;
+        let chain_id = challenge
+            .chain_id
+            .ok_or_else(|| "Tempo MPP challenge missing chainId".to_string())?;
+        let rpc_url = self
+            .rpc_resolver
+            .http_rpc_url_for_chain_id(chain_id)
+            .ok_or_else(|| {
+                format!("no configured HTTP RPC URL for Tempo MPP chain_id {chain_id}")
+            })?;
         let payment_challenge = parse_stored_mpp_challenge(challenge)?;
         let credential = match challenge.intent.as_str() {
             "charge" => {
-                let provider = TempoProvider::new((*signer).clone(), &self.rpc_url)
+                let provider = TempoProvider::new((*signer).clone(), &rpc_url)
                     .map_err(|e| format!("TempoProvider: {e}"))?;
                 provider.pay(&payment_challenge).await
             }
             "session" => {
-                let mut provider = TempoSessionProvider::new((*signer).clone(), &self.rpc_url)
+                let mut provider = TempoSessionProvider::new((*signer).clone(), &rpc_url)
                     .map_err(|e| format!("TempoSessionProvider: {e}"))?;
                 if let Some(max) = policy
                     .payments
@@ -143,7 +163,9 @@ impl PaymentBackend for RealMppBackend {
                 "channel_id": challenge.channel_id,
                 "secret_material_in_vfs": false,
                 "raw_authorization_stored": false,
-                "raw_signed_payload_stored": false
+                "raw_signed_payload_stored": false,
+                "chain_id": chain_id,
+                "rpc_url_configured": true
             }),
             receipt_raw,
             response_status: retry.status,
@@ -194,6 +216,9 @@ async fn retry_paid_request(
         request.url.clone(),
     );
     for (k, v) in &request.headers {
+        if k.eq_ignore_ascii_case(reqwest::header::AUTHORIZATION.as_str()) {
+            continue;
+        }
         let name =
             HeaderName::from_bytes(k.as_bytes()).map_err(|e| format!("invalid header {k}: {e}"))?;
         let val = HeaderValue::from_str(v).map_err(|e| format!("invalid header {k}: {e}"))?;
@@ -219,4 +244,53 @@ async fn retry_paid_request(
         headers,
         body,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    #[tokio::test]
+    async fn paid_retry_replaces_probe_authorization_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap();
+            let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+            tx.send(raw).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+                .unwrap();
+        });
+
+        let mut headers = BTreeMap::new();
+        headers.insert("authorization".to_string(), "Payment".to_string());
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let request = ParsedRequest {
+            method: "POST".to_string(),
+            url: format!("http://{addr}/paid").parse().unwrap(),
+            wallet: Some("gavin".to_string()),
+            max_amount_usd: None,
+            headers,
+            body: Some(r#"{"ok":true}"#.to_string()),
+        };
+
+        let response =
+            retry_paid_request(&reqwest::Client::new(), &request, "Payment signed").await;
+        assert_eq!(response.unwrap().status, 200);
+
+        let raw = rx.recv().unwrap();
+        let auth_lines: Vec<_> = raw
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+            .collect();
+        assert_eq!(auth_lines, vec!["authorization: Payment signed"]);
+    }
 }

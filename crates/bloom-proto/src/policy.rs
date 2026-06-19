@@ -257,7 +257,7 @@ impl Policy {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaymentsPolicy {
     #[serde(default)]
     pub enabled: bool,
@@ -277,6 +277,20 @@ pub struct PaymentsPolicy {
 
 fn default_require_plan() -> bool {
     true
+}
+
+impl Default for PaymentsPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            require_plan: default_require_plan(),
+            require_confirm_for_new_merchant: false,
+            http: PaymentsHttpPolicy::default(),
+            sessions: PaymentsSessionsPolicy::default(),
+            assets: PolicyAllowDeny::default(),
+            networks: PolicyAllowDeny::default(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -662,6 +676,8 @@ mod tests {
         assert!(!p.mev.fail_on_high_risk);
         assert_eq!(p.bump.stuck_after_secs, 90);
         assert_eq!(p.bump.basefee_overrun_pct, 20);
+        assert!(!p.payments.enabled);
+        assert!(p.payments.require_plan);
     }
 
     #[test]

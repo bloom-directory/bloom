@@ -22,10 +22,11 @@ use bloom_defi::EnsoClient;
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
 use bloom_keystore::Keystore;
+use bloom_paid_http::PaidHttpChainRpcResolver;
 use bloom_petals::{NameRegistry, PetalRunner, PetalStore, PetalVm, PetalsHandler};
 use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient, GeoblockClient};
 use bloom_prices::PricesClient;
-use bloom_proto::{AddressBook, AuditLog, Config, HomeDir, HomeWritePermit};
+use bloom_proto::{AddressBook, AuditLog, ChainSpec, Config, HomeDir, HomeWritePermit};
 use bloom_revert::{
     AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
     OpenchainDecoder, boxed,
@@ -135,6 +136,8 @@ impl Daemon {
         for c in clients {
             chains.add(c);
         }
+        let paid_http_rpc_resolver: Arc<dyn PaidHttpChainRpcResolver> =
+            Arc::new(ConfigPaidHttpRpcResolver::from_config(&config));
 
         // Build per-chain mempool indexes + handlers from [mempool.<chain>]
         // config. Each entry creates an LRU index, a VFS handler, and
@@ -480,11 +483,14 @@ impl Daemon {
             .mount("tools", Arc::new(ToolsHandler::new()) as _)
             .mount(
                 "requests",
-                Arc::new(RequestsHandler::new(
-                    home.root().to_path_buf(),
-                    keystore.clone(),
-                    config.default_wallet.clone(),
-                )) as _,
+                Arc::new(
+                    RequestsHandler::new(
+                        home.root().to_path_buf(),
+                        keystore.clone(),
+                        config.default_wallet.clone(),
+                    )
+                    .with_paid_http_rpc_resolver(paid_http_rpc_resolver.clone()),
+                ) as _,
             )
             .mount("status", status_handler.clone() as _)
             .mount("docs", Arc::new(DocsHandler::new()) as _)
@@ -962,6 +968,41 @@ impl bloom_tx::bump_scanner::BasefeeProvider for ChainBasefeeProvider {
         let fh = client.fee_history(1).await.ok()?;
         fh.base_fee_per_gas.last().copied()
     }
+}
+
+#[derive(Debug, Clone)]
+struct ConfigPaidHttpRpcResolver {
+    by_chain_id: std::collections::BTreeMap<u64, Vec<String>>,
+}
+
+impl ConfigPaidHttpRpcResolver {
+    fn from_config(config: &Config) -> Self {
+        let by_chain_id = config
+            .chains
+            .values()
+            .filter_map(|spec| {
+                let urls = http_rpc_urls(spec);
+                (!urls.is_empty()).then_some((spec.chain_id, urls))
+            })
+            .collect();
+        Self { by_chain_id }
+    }
+}
+
+impl PaidHttpChainRpcResolver for ConfigPaidHttpRpcResolver {
+    fn http_rpc_urls_for_chain_id(&self, chain_id: u64) -> Vec<String> {
+        self.by_chain_id.get(&chain_id).cloned().unwrap_or_default()
+    }
+}
+
+fn http_rpc_urls(spec: &ChainSpec) -> Vec<String> {
+    let mut endpoints = spec.endpoints();
+    endpoints.sort_by(|a, b| b.weight.cmp(&a.weight));
+    endpoints
+        .into_iter()
+        .map(|endpoint| endpoint.url)
+        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+        .collect()
 }
 
 fn pick_ens_client(chains: &ChainRegistry) -> Option<EnsClient> {

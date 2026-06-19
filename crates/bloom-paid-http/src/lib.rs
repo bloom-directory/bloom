@@ -2,11 +2,35 @@
 
 use std::collections::BTreeMap;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use bloom_proto::Policy;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use url::Url;
+
+pub trait PaidHttpChainRpcResolver: Send + Sync {
+    fn http_rpc_urls_for_chain_id(&self, chain_id: u64) -> Vec<String>;
+
+    fn http_rpc_url_for_chain_id(&self, chain_id: u64) -> Option<String> {
+        self.http_rpc_urls_for_chain_id(chain_id).into_iter().next()
+    }
+
+    fn http_rpc_urls_for_chain_id_opt(&self, chain_id: Option<u64>) -> Vec<String> {
+        chain_id
+            .map(|chain_id| self.http_rpc_urls_for_chain_id(chain_id))
+            .unwrap_or_default()
+    }
+}
+
+pub struct EmptyPaidHttpChainRpcResolver;
+
+impl PaidHttpChainRpcResolver for EmptyPaidHttpChainRpcResolver {
+    fn http_rpc_urls_for_chain_id(&self, _chain_id: u64) -> Vec<String> {
+        Vec::new()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ParsedRequest {
@@ -182,6 +206,7 @@ pub fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Norma
             .get("methodDetails")
             .unwrap_or(&serde_json::Value::Null);
         let amount = json_string(&value, &["amount"]);
+        let asset = json_string(&value, &["currency"]);
         let deposit_amount = json_string(&value, &["suggestedDeposit"]);
         let channel_id = json_string(method_details, &["channelId"])
             .or_else(|| json_string(&value, &["sessionId"]));
@@ -191,12 +216,12 @@ pub fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Norma
             merchant: challenge.realm.clone(),
             realm: Some(challenge.realm),
             network: Some("tempo".into()),
-            asset: json_string(&value, &["currency"]),
-            amount_usd: amount.as_deref().and_then(parse_money),
+            asset: asset.clone(),
+            amount_usd: parse_payment_amount_usd(asset.as_deref(), amount.as_deref()),
             amount,
             charge_id: json_string(&value, &["externalId"]),
             session_id: channel_id.clone(),
-            deposit_usd: deposit_amount.as_deref().and_then(parse_money),
+            deposit_usd: parse_payment_amount_usd(asset.as_deref(), deposit_amount.as_deref()),
             deposit_amount,
             chain_id: method_details.get("chainId").and_then(|v| v.as_u64()),
             unit_type: json_string(&value, &["unitType"]),
@@ -212,7 +237,12 @@ pub fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Norma
         .cloned()
         .unwrap_or_default();
     let lower_www = www.to_ascii_lowercase();
-    let body_json: serde_json::Value = serde_json::from_slice(body).unwrap_or_else(|_| json!({}));
+    let body_json: serde_json::Value = header_map
+        .get("payment-required")
+        .and_then(|value| B64.decode(value).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .or_else(|| serde_json::from_slice(body).ok())
+        .unwrap_or_else(|| json!({}));
     let lower_body_protocol = json_string(&body_json, &["protocol", "paymentProtocol", "scheme"])
         .unwrap_or_default()
         .to_ascii_lowercase();
@@ -277,6 +307,7 @@ pub fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Norma
             .or_else(|| {
                 body_json
                     .pointer("/accepts/0/maxAmountRequired")
+                    .or_else(|| body_json.pointer("/accepts/0/amount"))
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
             })
@@ -284,7 +315,7 @@ pub fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Norma
     let amount_usd = if intent == "session" {
         json_f64(session, &["voucherAmountUsd", "amountUsd", "usd"])
             .or_else(|| json_f64(&body_json, &["voucherAmountUsd", "amountUsd", "usd"]))
-            .or_else(|| amount.as_deref().and_then(parse_money))
+            .or_else(|| parse_payment_amount_usd(asset.as_deref(), amount.as_deref()))
     } else {
         json_f64(charge, &["amountUsd", "usd"])
             .or_else(|| json_f64(&body_json, &["amountUsd", "usd"]))
@@ -298,7 +329,7 @@ pub fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Norma
                     .pointer("/accepts/0/amount_usd")
                     .and_then(json_number)
             })
-            .or_else(|| amount.as_deref().and_then(parse_money))
+            .or_else(|| parse_payment_amount_usd(asset.as_deref(), amount.as_deref()))
     };
     let deposit_amount = json_string(session, &["depositAmount", "deposit", "topUpAmount"])
         .or_else(|| json_string(&body_json, &["depositAmount", "deposit", "topUpAmount"]));
@@ -312,7 +343,7 @@ pub fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Norma
             &["depositAmountUsd", "depositUsd", "topUpAmountUsd"],
         )
     })
-    .or_else(|| deposit_amount.as_deref().and_then(parse_money));
+    .or_else(|| parse_payment_amount_usd(asset.as_deref(), deposit_amount.as_deref()));
     let merchant = json_string(charge, &["merchant", "merchantId"])
         .or_else(|| json_string(session, &["merchant", "merchantId"]))
         .or_else(|| json_string(&body_json, &["merchant", "merchantId"]))
@@ -393,6 +424,29 @@ pub fn json_f64(v: &serde_json::Value, keys: &[&str]) -> Option<f64> {
 
 pub fn parse_money(raw: &str) -> Option<f64> {
     raw.trim().trim_start_matches('$').parse().ok()
+}
+
+pub fn parse_payment_amount_usd(asset: Option<&str>, amount: Option<&str>) -> Option<f64> {
+    let raw = amount?.trim();
+    if raw.contains('.') || raw.starts_with('$') {
+        return parse_money(raw);
+    }
+    if asset.is_some_and(is_known_six_decimal_usd_asset) {
+        return raw.parse::<f64>().ok().map(|v| v / 1_000_000.0);
+    }
+    parse_money(raw)
+}
+
+fn is_known_six_decimal_usd_asset(asset: &str) -> bool {
+    matches!(
+        asset.to_ascii_lowercase().as_str(),
+        // USDC on Base.
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+            // USDC on Tempo, as advertised by Nansen's MPP challenges.
+            | "0x20c000000000000000000000b9537d11c60e8b50"
+            // USD0 on Tempo.
+            | "0x779ded0c9e1022225f8e0630b35a9b54be713736"
+    )
 }
 
 pub fn trim_money(v: f64) -> String {
@@ -760,4 +814,48 @@ pub fn headers_to_string_map(headers: &HeaderMap) -> BTreeMap<String, String> {
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_challenge, parse_payment_amount_usd};
+    use reqwest::header::{HeaderMap, HeaderValue};
+    use url::Url;
+
+    #[test]
+    fn parses_known_payment_stablecoin_base_units_as_usd() {
+        assert_eq!(
+            parse_payment_amount_usd(
+                Some("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+                Some("10000")
+            ),
+            Some(0.01)
+        );
+        assert_eq!(
+            parse_payment_amount_usd(
+                Some("0x20C000000000000000000000b9537d11c60E8b50"),
+                Some("50000")
+            ),
+            Some(0.05)
+        );
+    }
+
+    #[test]
+    fn normalizes_nansen_x402_v2_payment_required_header_amount() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "payment-required",
+            HeaderValue::from_static(
+                "eyJ4NDAyVmVyc2lvbiI6MiwiZXJyb3IiOiJQYXltZW50IHJlcXVpcmVkIiwicmVzb3VyY2UiOnsidXJsIjoiaHR0cHM6Ly9hcGkubmFuc2VuLmFpL2FwaS92MS90b2tlbi1zY3JlZW5lciIsImRlc2NyaXB0aW9uIjoiUmV0cmlldmUgdG9rZW4gc2NyZWVuZXIgZGF0YSIsIm1pbWVUeXBlIjoiIn0sImFjY2VwdHMiOlt7InNjaGVtZSI6ImV4YWN0IiwibmV0d29yayI6ImVpcDE1NTo4NDUzIiwiYXNzZXQiOiIweDgzMzU4OWZDRDZlRGI2RTA4ZjRjN0MzMkQ0ZjcxYjU0YmRBMDI5MTMiLCJhbW91bnQiOiIxMDAwMCIsInBheVRvIjoiMHg5MzA1M2YxZTdBNWVGRURhNTMyRmU2OUNiYkU0M2NCRWMzQTBGMTNmIiwibWF4VGltZW91dFNlY29uZHMiOjMwMCwiZXh0cmEiOnsibmFtZSI6IlVTRCBDb2luIiwidmVyc2lvbiI6IjIifX1dfQ==",
+            ),
+        );
+        let challenge = normalize_challenge(
+            &headers,
+            b"{}",
+            &Url::parse("https://api.nansen.ai/api/v1/token-screener").unwrap(),
+        );
+        assert_eq!(challenge.protocol, "x402");
+        assert_eq!(challenge.amount.as_deref(), Some("10000"));
+        assert_eq!(challenge.amount_usd, Some(0.01));
+    }
 }
