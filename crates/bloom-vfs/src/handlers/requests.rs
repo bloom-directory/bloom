@@ -1461,7 +1461,7 @@ inline = '{"prompt":"hi"}'
         let request = mpp::protocol::core::Base64UrlJson::from_value(&json!({
             "amount": "0",
             "currency": "0x20c0000000000000000000000000000000000000",
-            "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+            "recipient": "0x000000000000000000000000000000000000cafe",
             "methodDetails": { "chainId": 42431 }
         }))
         .unwrap();
