@@ -216,7 +216,7 @@ async fn retry_paid_request(
         request.url.clone(),
     );
     for (k, v) in &request.headers {
-        if k.eq_ignore_ascii_case(reqwest::header::AUTHORIZATION.as_str()) {
+        if is_sensitive_retry_header(k) {
             continue;
         }
         let name =
@@ -244,6 +244,19 @@ async fn retry_paid_request(
         headers,
         body,
     })
+}
+
+fn is_sensitive_retry_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "x-payment"
+            | "payment-signature"
+            | "x-api-key"
+            | "api-key"
+            | "apikey"
+    )
 }
 
 #[cfg(test)]

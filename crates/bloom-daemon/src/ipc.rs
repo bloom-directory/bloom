@@ -659,6 +659,15 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
+        // Confirming a paid HTTP request can sign x402 or Tempo MPP payment
+        // credentials. It must go through write_unlocked rather than plain IPC
+        // so a cached daemon signer is not consumed silently.
+        [root, _reference, action] if root == "requests" && action == "confirm" => true,
+        [root, state, _id, action]
+            if root == "requests" && state == "pending" && action == "confirm" =>
+        {
+            true
+        }
         _ => false,
     }
 }
@@ -1222,6 +1231,9 @@ mod tests {
             "/wallets/minnow/sign/hash",
             "/wallets/minnow/sign/typed_data",
             "/polymarket/onboard/minnow/begin",
+            "/requests/latest/confirm",
+            "/requests/req_123/confirm",
+            "/requests/pending/req_123/confirm",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(write_path_uses_wallet_signer(&p), "{path}");
@@ -1232,6 +1244,8 @@ mod tests {
             "/polymarket/trade/minnow/new",
             "/wallets/minnow/chains/polygon/outbox/new.tx",
             "/wallets/minnow/chains/polygon/outbox/pending/0001/confirm",
+            "/requests/new",
+            "/requests/pending/req_123/cancel",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(!write_path_uses_wallet_signer(&p), "{path}");

@@ -414,13 +414,57 @@ impl RequestsHandler {
             .to_string();
         let host = request.url.host_str().unwrap_or("unknown").to_string();
         let mut challenge: NormalizedChallenge = read_json(pending.join("challenge.json"))?;
+        let policy = self.wallet_policy(&wallet)?;
+        let sentinel = policy.override_sentinel().to_ascii_lowercase();
+        if !matches!(value.as_str(), "y" | "yes" | "confirm") && value != sentinel.as_str() {
+            return Err(HandlerError::invalid(format!(
+                "confirm accepts y, yes, confirm, or policy override sentinel '{sentinel}'"
+            )));
+        }
         if challenge.protocol == "mpp" && challenge.network.as_deref() == Some("tempo") {
+            let already_spent = challenge
+                .session_id
+                .as_deref()
+                .and_then(|sid| session_dir_name(sid).ok())
+                .and_then(|sid| {
+                    fs::read_to_string(
+                        self.requests_root()
+                            .join("sessions")
+                            .join(sid)
+                            .join("spent"),
+                    )
+                    .ok()
+                    .and_then(|s| parse_money(&s))
+                })
+                .unwrap_or(0.0);
+            let mut checks = evaluate_payment_policy(
+                &policy,
+                PolicyEvalInput {
+                    host: &host,
+                    asset: challenge.asset.as_deref(),
+                    network: challenge.network.as_deref(),
+                    intent: &challenge.intent,
+                    amount_usd: challenge.amount_usd,
+                    request_max_amount_usd: request.max_amount_usd,
+                    spent_24h_usd: self.sum_paid_usd_last_24h(&wallet)?,
+                },
+            );
+            checks.extend(evaluate_session_policy(&policy, &challenge, already_spent));
             let backend = RealMppBackend {
                 keystore: self.keystore.clone(),
                 client: self.client.clone(),
                 rpc_resolver: Arc::clone(&self.paid_http_rpc_resolver),
             };
-            let result = confirm_with_backend(&self.root, id, data, &backend).await?;
+            let result = confirm_with_backend(
+                &self.root,
+                id,
+                data,
+                &backend,
+                Some(&policy),
+                Some(checks),
+                Some(&sentinel),
+            )
+            .await?;
             if !matches!(result.final_state.as_str(), "sent" | "failed") {
                 return Err(HandlerError::backend(format!(
                     "unexpected paid request final state: {}",
@@ -428,13 +472,6 @@ impl RequestsHandler {
                 )));
             }
             return Ok(());
-        }
-        let policy = self.wallet_policy(&wallet)?;
-        let sentinel = policy.override_sentinel().to_ascii_lowercase();
-        if !matches!(value.as_str(), "y" | "yes" | "confirm") && value != sentinel {
-            return Err(HandlerError::invalid(format!(
-                "confirm accepts y, yes, confirm, or policy override sentinel '{sentinel}'"
-            )));
         }
         let requirement = select_payment_requirement(&challenge, &policy, &host)
             .or_else(|| challenge.accepts.first().cloned())
@@ -467,7 +504,7 @@ impl RequestsHandler {
                 "hard payment policy denial blocks confirmation",
             ));
         }
-        if checks.iter().any(|c| c.result == "warn") && value != sentinel {
+        if checks.iter().any(|c| c.result == "warn") && value != sentinel.as_str() {
             return Err(HandlerError::invalid(format!(
                 "payment policy warning requires override sentinel '{sentinel}'"
             )));
@@ -490,6 +527,9 @@ impl RequestsHandler {
             request.url.clone(),
         );
         for (k, v) in &request.headers {
+            if is_sensitive_request_header(k) {
+                continue;
+            }
             let name = HeaderName::from_bytes(k.as_bytes())
                 .map_err(|e| HandlerError::invalid(format!("invalid header {k}: {e}")))?;
             let val = HeaderValue::from_str(v)
@@ -745,6 +785,7 @@ impl Handler for RequestsHandler {
     }
 }
 
+#[derive(Debug)]
 struct ConfirmResult {
     final_state: String,
 }
@@ -754,28 +795,35 @@ async fn confirm_with_backend(
     id: &str,
     data: &[u8],
     backend: &dyn PaymentBackend,
+    policy_override: Option<&Policy>,
+    checks_override: Option<Vec<PolicyCheck>>,
+    sentinel_override: Option<&str>,
 ) -> Result<ConfirmResult, HandlerError> {
     let value = String::from_utf8_lossy(data).trim().to_ascii_lowercase();
-    if !matches!(value.as_str(), "y" | "yes" | "confirm" | "override") {
-        return Err(HandlerError::invalid(
-            "confirm accepts y, yes, confirm, or override",
-        ));
+    let sentinel = sentinel_override.unwrap_or("override").to_ascii_lowercase();
+    if !matches!(value.as_str(), "y" | "yes" | "confirm") && value != sentinel.as_str() {
+        return Err(HandlerError::invalid(format!(
+            "confirm accepts y, yes, confirm, or policy override sentinel '{sentinel}'"
+        )));
     }
     let requests_root = root.join("requests");
     let pending = requests_root.join("pending").join(id);
     if !pending.exists() {
         return Err(HandlerError::NotFound(format!("/requests/pending/{id}")));
     }
-    let checks: Vec<PolicyCheck> = read_json(pending.join("policy_check.json"))?;
+    let checks: Vec<PolicyCheck> = match checks_override {
+        Some(checks) => checks,
+        None => read_json(pending.join("policy_check.json"))?,
+    };
     if checks.iter().any(|c| c.result == "deny") {
         return Err(HandlerError::invalid(
             "hard payment policy denial blocks confirmation",
         ));
     }
-    if checks.iter().any(|c| c.result == "warn") && value != "override" {
-        return Err(HandlerError::invalid(
-            "payment policy warning requires override",
-        ));
+    if checks.iter().any(|c| c.result == "warn") && value != sentinel.as_str() {
+        return Err(HandlerError::invalid(format!(
+            "payment policy warning requires override sentinel '{sentinel}'"
+        )));
     }
     let challenge: NormalizedChallenge = read_json(pending.join("challenge.json"))?;
     let request_value: serde_json::Value = read_json(pending.join("request.toml"))?;
@@ -785,9 +833,16 @@ async fn confirm_with_backend(
         .and_then(|v| v.as_str())
         .ok_or_else(|| HandlerError::backend("request artifact missing wallet"))?
         .to_string();
-    let policy = backend_policy_for_wallet(root, &wallet).unwrap_or_default();
+    let fallback_policy;
+    let policy = match policy_override {
+        Some(policy) => policy,
+        None => {
+            fallback_policy = backend_policy_for_wallet(root, &wallet).unwrap_or_default();
+            &fallback_policy
+        }
+    };
     let execution = backend
-        .confirm(&challenge, &request, &wallet, &policy, id)
+        .confirm(&challenge, &request, &wallet, policy, id)
         .await
         .map_err(HandlerError::backend)?;
     let succeeded = execution.response_status < 400;
@@ -912,6 +967,7 @@ fn update_session_state(
         .session_id
         .clone()
         .unwrap_or_else(|| format!("session_{request_id}"));
+    let session_id = session_dir_name(&session_id)?;
     let dir = requests_root.join("sessions").join(&session_id);
     fs::create_dir_all(&dir)?;
     let previous_spent = fs::read_to_string(dir.join("spent"))
@@ -1033,14 +1089,19 @@ fn write_request_artifacts(
             "url": req.url.as_str(),
             "wallet": wallet,
             "max_amount_usd": req.max_amount_usd,
-            "headers": req.headers,
+            "headers": redacted_headers(&req.headers),
             "body": req.body,
             "state": state
         }),
     )?;
     let mut http = format!("{} {}\n", req.method, req.url);
     for (k, v) in &req.headers {
-        http.push_str(&format!("{k}: {v}\n"));
+        let value = if is_sensitive_request_header(k) {
+            "redacted"
+        } else {
+            v
+        };
+        http.push_str(&format!("{k}: {value}\n"));
     }
     if let Some(body) = &req.body {
         http.push('\n');
@@ -1054,6 +1115,54 @@ fn write_request_artifacts(
 fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
     json!(headers_to_string_map(headers))
 }
+
+fn redacted_headers(headers: &std::collections::BTreeMap<String, String>) -> serde_json::Value {
+    json!(
+        headers
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    if is_sensitive_request_header(k) {
+                        "redacted".to_string()
+                    } else {
+                        v.clone()
+                    },
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    )
+}
+
+fn is_sensitive_request_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "x-payment"
+            | "payment-signature"
+            | "x-api-key"
+            | "api-key"
+            | "apikey"
+    )
+}
+
+fn session_dir_name(raw: &str) -> Result<String, HandlerError> {
+    let name = raw.trim();
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || Path::new(name).is_absolute()
+    {
+        return Err(HandlerError::invalid(format!(
+            "invalid paid request session id '{raw}'"
+        )));
+    }
+    Ok(name.to_string())
+}
+
 fn write_json(path: impl AsRef<Path>, v: &impl Serialize) -> Result<(), HandlerError> {
     fs::write(
         path,
@@ -1239,6 +1348,26 @@ inline = '{"prompt":"hi"}'
         let http = fs::read_to_string(dir.path().join("request.http")).unwrap();
         assert!(http.contains("content-type: application/json\n\n"));
         assert!(http.ends_with("{\"prompt\":\"hi\"}\n"));
+    }
+
+    #[test]
+    fn request_artifacts_redact_sensitive_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = parse_request(
+            "GET https://api.example.com/data\nauthorization: Bearer secret\nx-api-key: key-123\naccept: application/json",
+        )
+        .unwrap();
+        write_request_artifacts(dir.path(), &req, "research", "pending").unwrap();
+
+        let stored: serde_json::Value = read_json(dir.path().join("request.toml")).unwrap();
+        assert_eq!(stored["headers"]["authorization"], "redacted");
+        assert_eq!(stored["headers"]["x-api-key"], "redacted");
+        assert_eq!(stored["headers"]["accept"], "application/json");
+        let http = fs::read_to_string(dir.path().join("request.http")).unwrap();
+        assert!(http.contains("authorization: redacted\n"), "{http}");
+        assert!(http.contains("x-api-key: redacted\n"), "{http}");
+        assert!(!http.contains("Bearer secret"), "{http}");
+        assert!(!http.contains("key-123"), "{http}");
     }
 
     #[test]
@@ -1656,9 +1785,17 @@ inline = '{"prompt":"hi"}'
         fs::write(pending.join("request.http"), "GET https://mpp.test/data\n").unwrap();
         fs::write(pending.join("status"), "pending\n").unwrap();
 
-        let result = confirm_with_backend(dir.path(), "req_1", b"confirm", &StaticMppTestBackend)
-            .await
-            .unwrap();
+        let result = confirm_with_backend(
+            dir.path(),
+            "req_1",
+            b"confirm",
+            &StaticMppTestBackend,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.final_state, "sent");
         let credential: serde_json::Value =
             read_json(dir.path().join("requests/sent/req_1/credential.json")).unwrap();
@@ -1677,6 +1814,64 @@ inline = '{"prompt":"hi"}'
             read_json(dir.path().join("requests/sent/req_1/audit.json")).unwrap();
         assert_eq!(audit["paid_retry_succeeded"], true);
         assert_eq!(audit["response_status"], 200);
+    }
+
+    #[tokio::test]
+    async fn mpp_confirm_rechecks_current_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = dir.path().join("requests/pending/req_policy");
+        fs::create_dir_all(&pending).unwrap();
+        let challenge = normalize_challenge(
+            &HeaderMap::new(),
+            br#"{"protocol":"tempo-mpp","type":"Charge","network":"tempo","asset":"pathUSD","amount":"0.10","amountUsd":0.10}"#,
+            &Url::parse("https://mpp.test/data").unwrap(),
+        );
+        write_json(pending.join("challenge.json"), &challenge).unwrap();
+        let staged_checks: Vec<PolicyCheck> = vec![];
+        write_json(pending.join("policy_check.json"), &staged_checks).unwrap();
+        write_json(
+            pending.join("request.toml"),
+            &json!({"method":"GET","url":"https://mpp.test/data","wallet":"alice","headers":{}}),
+        )
+        .unwrap();
+        fs::write(pending.join("status"), "pending\n").unwrap();
+        let current_checks = vec![PolicyCheck {
+            rule: "payments.enabled".into(),
+            result: "deny".into(),
+            detail: "wallet policy has not enabled paid HTTP".into(),
+        }];
+
+        let err = confirm_with_backend(
+            dir.path(),
+            "req_policy",
+            b"confirm",
+            &StaticMppTestBackend,
+            Some(&Policy::default()),
+            Some(current_checks),
+            Some("approve-spend"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("hard payment policy denial"));
+    }
+
+    #[test]
+    fn mpp_session_id_must_be_single_safe_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let requests_root = dir.path().join("requests");
+        let mut challenge = normalize_challenge(
+            &HeaderMap::new(),
+            br#"{"protocol":"tempo-mpp","type":"Session","network":"tempo","asset":"pathUSD","session":{"id":"../escape","voucherAmount":"0.10","voucherAmountUsd":0.10}}"#,
+            &Url::parse("https://mpp.test/data").unwrap(),
+        );
+        let err =
+            update_session_state(&requests_root, &challenge, "req_escape", "alice").unwrap_err();
+        assert!(err.to_string().contains("invalid paid request session id"));
+        assert!(!dir.path().join("escape").exists());
+
+        challenge.session_id = Some("sess_safe".into());
+        update_session_state(&requests_root, &challenge, "req_safe", "alice").unwrap();
+        assert!(requests_root.join("sessions").join("sess_safe").exists());
     }
 
     struct FailingMppTestBackend;
@@ -1739,10 +1934,17 @@ inline = '{"prompt":"hi"}'
         fs::write(pending.join("request.http"), "GET https://mpp.test/data\n").unwrap();
         fs::write(pending.join("status"), "pending\n").unwrap();
 
-        let result =
-            confirm_with_backend(dir.path(), "req_fail", b"confirm", &FailingMppTestBackend)
-                .await
-                .unwrap();
+        let result = confirm_with_backend(
+            dir.path(),
+            "req_fail",
+            b"confirm",
+            &FailingMppTestBackend,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.final_state, "failed");
 
         let failed = dir.path().join("requests/failed/req_fail");

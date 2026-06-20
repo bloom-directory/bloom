@@ -997,7 +997,7 @@ impl PaidHttpChainRpcResolver for ConfigPaidHttpRpcResolver {
 
 fn http_rpc_urls(spec: &ChainSpec) -> Vec<String> {
     let mut endpoints = spec.endpoints();
-    endpoints.sort_by(|a, b| b.weight.cmp(&a.weight));
+    endpoints.sort_by_key(|endpoint| std::cmp::Reverse(endpoint.weight));
     endpoints
         .into_iter()
         .map(|endpoint| endpoint.url)
