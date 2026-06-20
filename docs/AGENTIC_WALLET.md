@@ -31,6 +31,9 @@ An agent using Bloom can:
 - stage native ETH, ERC-20, NFT, contract-call, signing, and DeFi intents by writing plain-language or structured files;
 - read a generated `plan.md` before any transaction is signed;
 - confirm a staged transaction only after user approval;
+- make free or paid HTTP requests through `/requests`, with paid HTTP 402
+  challenges staged for review before any x402 or Tempo MPP credential is
+  signed;
 - enforce wallet policy: spend caps, allow/deny lists, contract-call gates, private orderflow preferences, and audit logging;
 - use ten major read-ready EVM networks immediately after `bloom init`: Ethereum, Base, Arbitrum, Optimism, Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, and HyperEVM, plus local Anvil.
 
@@ -62,6 +65,74 @@ bloom vfs write \
 bloom vfs ls /wallets/alice/chains/anvil/outbox/pending
 bloom vfs cat /wallets/alice/chains/anvil/outbox/pending/<id>/plan.md
 ```
+
+## Paid HTTP requests
+
+Bloom can make ordinary HTTP requests through the same filesystem model. If a
+server responds with an HTTP 402 payment challenge, Bloom stages a payment plan
+and waits for explicit confirmation before signing or spending. Agents should
+use the `/requests` surface instead of protocol-specific x402 or Tempo MPP
+paths.
+
+```sh
+bloom vfs write /requests/new \
+  --data 'GET https://example.com/paid-api'
+bloom vfs cat /requests/latest/plan.md
+bloom vfs write /requests/latest/confirm --data confirm
+bloom vfs cat /requests/latest/response/body
+bloom vfs cat /requests/latest/receipt.json
+```
+
+For structured requests, include a wallet and spending cap:
+
+```toml
+method = "POST"
+url = "https://api.example.com/inference"
+wallet = "research"
+max_amount_usd = "0.05"
+
+[headers]
+content-type = "application/json"
+
+[body]
+inline = '{"prompt":"summarize this document"}'
+```
+
+Paid requests are denied by default. Enable them in the paying wallet's
+`policy.toml`, and keep both global and request-local caps tight:
+
+```toml
+[payments]
+enabled = true
+require_plan = true
+
+[payments.http]
+per_request_usd = 0.05
+per_day_usd = 5.00
+allow_hosts = ["api.example.com"]
+deny_hosts = []
+
+[payments.sessions]
+enabled = true
+max_deposit_usd = 2.00
+max_session_spend_usd = 10.00
+
+[payments.assets]
+allow = ["USDC", "pathUSD"]
+deny = []
+
+[payments.networks]
+allow = ["base", "tempo"]
+deny = []
+```
+
+The confirm path re-checks the current wallet policy. Hard denials block the
+request; warnings require the wallet policy's override sentinel instead of a
+plain `confirm` write. Request artifacts redact sensitive headers such as
+`authorization`, API keys, and payment credentials.
+
+The detailed design and current path contract live in
+[`docs/specs/2026-06-15-paid-http-requests.md`](./specs/2026-06-15-paid-http-requests.md).
 
 ## Why filesystem-first matters
 
