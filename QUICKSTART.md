@@ -206,6 +206,17 @@ it expire after the configured TTL) cancels the stage.
   needed; default slippage is 50 bps.
 - **Prices** — keyless DefiLlama at `prices/spot/<coin>(.usd)` and
   `prices/change_24h/<coin>`.
+- **Hyperliquid** — perp and spot market data, order books, candles,
+  account state at `/hyperliquid/<network>/...`. Agent sessions
+  (one-time approveAgent, then bounded trading) at
+  `/hyperliquid/<network>/agent_sessions/<wallet>/...`. One-off
+  owner-signed writes at `/hyperliquid/<network>/exchange/<wallet>/...`
+  labeled ADVANCED. Read `/hyperliquid/README.md`.
+- **Polymarket** — prediction-market trading via CLI (`bloom polymarket
+  ...`). VFS staging at `/polymarket/...`. A capability primitive
+  (scoped approve, TTL, caps) is in active development — see
+  `docs/plans/2026-06-20-agent-obvious-capability-model.md`.
+  Read `/polymarket/README.md`.
 - **Zero-config chain reads** — Ethereum, Base, Arbitrum, Optimism,
   Polygon, BNB Smart Chain, Avalanche, Gnosis, Linea, HyperEVM, and
   Anvil are present after `bloom init`; live-network broadcasts remain

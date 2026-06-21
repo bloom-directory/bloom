@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,10 +13,13 @@ use bloom_hyperliquid::{
     pretty_json, sign_submit_payload, signed_payload, user_signed_payload,
 };
 use bloom_keystore::{Keystore, ephemeral::EphemeralAgentKey};
+use bloom_proto::hyperliquid_policy::HyperliquidPolicy;
 use bloom_proto::{
-    BreachAction, HyperliquidSession, SessionStatus, resolve_hyperliquid_agent_session_name,
+    BreachAction, CapabilityStatus, CapabilityViewEntry, HyperliquidSession, SessionStatus,
+    SigningModel, Venue, resolve_hyperliquid_agent_session_name,
 };
 use parking_lot::Mutex;
+use rand::RngCore;
 use serde_json::{Value, json};
 
 use crate::handler::{Entry, Handler, HandlerError};
@@ -66,6 +69,8 @@ const SESSION_FILES: [&str; 12] = [
     "orphan_close_all",
     "audit.jsonl",
 ];
+const SEALED_AGENT_KEY_FILE: &str = ".agent_key.sealed";
+const AGENT_KEY_KEK_FILE: &str = ".agent_key_kek";
 
 const README: &[u8] = br#"# Hyperliquid VFS
 
@@ -222,6 +227,103 @@ impl HyperliquidHandler {
                 self.monitor_sessions_once().await;
             }
         });
+    }
+
+    pub fn capability_views_for(&self, wallet: &str) -> Vec<CapabilityViewEntry> {
+        let sessions = self.sessions.lock();
+        sessions
+            .iter()
+            .filter_map(|(_, guard)| {
+                let active = guard.lock();
+                if active.wallet != wallet {
+                    return None;
+                }
+                let s = &active.session;
+                let now = bloom_proto::capability::now_ms_u128();
+                let status = if s.status == SessionStatus::Expired {
+                    CapabilityStatus::Expired
+                } else if s.status == SessionStatus::Halted {
+                    CapabilityStatus::Halted
+                } else if active.stopped {
+                    CapabilityStatus::Revoked
+                } else if active.stale_since_ms.is_some() {
+                    CapabilityStatus::Orphaned
+                } else {
+                    CapabilityStatus::Active
+                };
+                let mut allowed = vec![format!(
+                    "place orders on {}",
+                    if s.bounds.allowed_assets.is_empty() {
+                        "all assets"
+                    } else {
+                        "allowed assets"
+                    }
+                )];
+                if !s.bounds.allowed_assets.is_empty() {
+                    allowed.push(format!(
+                        "assets: {}",
+                        s.bounds
+                            .allowed_assets
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+                if let Some(n) = s.bounds.max_notional_usd {
+                    allowed.push(format!("max order: ${:.2}", n as f64 / 1_000_000.0));
+                }
+                if let Some(p) = s.bounds.max_position_usd {
+                    allowed.push(format!("max position: ${:.2}", p as f64 / 1_000_000.0));
+                }
+                if let Some(lev) = s.bounds.max_leverage {
+                    allowed.push(format!("max leverage: {lev}x"));
+                }
+                let mut denied = Vec::new();
+                if s.bounds.withdrawal_cap_usd.is_some() || s.bounds.transfer_cap_usd.is_some() {
+                    denied.push("withdrawals and transfers are denied for agent sessions".into());
+                }
+                Some(CapabilityViewEntry {
+                    id: s.id.clone(),
+                    wallet: wallet.to_string(),
+                    venue: Venue::Hyperliquid,
+                    signing_model: SigningModel::HoldsDelegatedKey,
+                    created_ms: s.created_ms,
+                    expires_ms: Some(s.expires_ms),
+                    expires_in_secs: if s.expires_ms > now {
+                        Some(((s.expires_ms - now) / 1000) as u64)
+                    } else {
+                        None
+                    },
+                    status,
+                    limits: serde_json::json!({
+                        "max_notional_usd": s.bounds.max_notional_usd,
+                        "max_position_usd": s.bounds.max_position_usd,
+                        "max_loss_usd": s.bounds.max_loss_usd,
+                        "max_leverage": s.bounds.max_leverage,
+                        "allowed_assets": s.bounds.allowed_assets,
+                    }),
+                    next_write_path: format!(
+                        "/hyperliquid/{}/agent_sessions/{}/{}/order.json",
+                        active.network, wallet, s.id
+                    ),
+                    revoke_path: format!(
+                        "/hyperliquid/{}/agent_sessions/{}/{}/stop",
+                        active.network, wallet, s.id
+                    ),
+                    audit_ref: format!(
+                        "/hyperliquid/{}/agent_sessions/{}/{}/audit.jsonl",
+                        active.network, wallet, s.id
+                    ),
+                    review_ref: format!(
+                        "/hyperliquid/{}/agent_sessions/{}/{}/session.json",
+                        active.network, wallet, s.id
+                    ),
+                    allowed,
+                    denied,
+                })
+            })
+            .collect()
     }
 
     fn client(&self, network: &str) -> Result<&HyperliquidClient, HandlerError> {
@@ -436,6 +538,7 @@ impl HyperliquidHandler {
         let agent = EphemeralAgentKey::generate();
         let agent_address = agent.address();
         let agent_name = resolve_hyperliquid_agent_session_name(req.agent_name.as_deref());
+        let agent_key_persisted = self.persist_agent_key(network_name, wallet, &id, &agent)?;
         let user = format!("{:#x}", info.address);
         let clearinghouse = client
             .info(json!({"type": "clearinghouseState", "user": user}))
@@ -498,6 +601,7 @@ impl HyperliquidHandler {
             last_cleanup_error: None,
             last_snapshot_ok_ms: Some(nonce),
             stale_since_ms: None,
+            agent_key_persisted,
         };
         let key = Self::session_key(network_name, wallet, &id);
         let active = Arc::new(Mutex::new(active));
@@ -518,6 +622,7 @@ impl HyperliquidHandler {
                 "approve_payload": payload,
                 "approve_response": approve_response,
                 "starting_account_value_micro": snapshot.account_value,
+                "agent_key_persisted": agent_key_persisted,
             }),
         )?;
         self.persist_response(
@@ -530,6 +635,7 @@ impl HyperliquidHandler {
                 "agent_name": agent_name,
                 "approve_response": approve_response,
                 "starting_account_value_micro": snapshot.account_value,
+                "agent_key_persisted": agent_key_persisted,
             }),
         )?;
         self.clear_pre_approval_marker(network_name, wallet, &id)?;
@@ -595,7 +701,13 @@ impl HyperliquidHandler {
     ) -> Result<Value, HandlerError> {
         let active = match self.active_session_if_present(network_name, wallet, id) {
             Some(active) => active,
-            None => return self.read_orphaned_session_status(network_name, wallet, id),
+            None => match self
+                .try_recover_persisted_session(client, network_name, wallet, id)
+                .await?
+            {
+                Some(active) => active,
+                None => return self.read_orphaned_session_status(network_name, wallet, id),
+            },
         };
         self.refresh_session_snapshot(client, &active, false)
             .await?;
@@ -673,6 +785,21 @@ impl HyperliquidHandler {
             .cloned()
     }
 
+    async fn active_session_or_recover(
+        &self,
+        client: &HyperliquidClient,
+        network: &str,
+        wallet: &str,
+        id: &str,
+    ) -> Result<Arc<Mutex<ActiveHlSession>>, HandlerError> {
+        if let Some(active) = self.active_session_if_present(network, wallet, id) {
+            return Ok(active);
+        }
+        self.try_recover_persisted_session(client, network, wallet, id)
+            .await?
+            .ok_or_else(|| HandlerError::NotFound(format!("agent session {id}")))
+    }
+
     async fn submit_session_action(
         &self,
         client: &HyperliquidClient,
@@ -681,7 +808,9 @@ impl HyperliquidHandler {
         req: SignSubmit,
     ) -> Result<(), HandlerError> {
         validate_write_file_matches_action(target.file, req.action.kind())?;
-        let active = self.active_session(target.network, target.wallet, target.id)?;
+        let active = self
+            .active_session_or_recover(client, target.network, target.wallet, target.id)
+            .await?;
         {
             let mut guard = active.lock();
             if guard.stopped || guard.session.status != SessionStatus::Active {
@@ -1148,7 +1277,9 @@ impl HyperliquidHandler {
         id: &str,
         forced: bool,
     ) -> Result<Value, HandlerError> {
-        let active = self.active_session(network_name, wallet, id)?;
+        let active = self
+            .active_session_or_recover(client, network_name, wallet, id)
+            .await?;
         let (agent_signer, user) = {
             let guard = active.lock();
             if guard.stopped {
@@ -1237,7 +1368,9 @@ impl HyperliquidHandler {
         let cancel_response = self
             .cancel_all_session_orders(client, network, network_name, wallet, id, forced)
             .await?;
-        let active = self.active_session(network_name, wallet, id)?;
+        let active = self
+            .active_session_or_recover(client, network_name, wallet, id)
+            .await?;
         let (agent_signer, user) = {
             let guard = active.lock();
             let owner = self
@@ -1753,6 +1886,122 @@ impl HyperliquidHandler {
         }
     }
 
+    fn agent_key_kek_path(&self) -> Result<PathBuf, HandlerError> {
+        let Some(root) = &self.store_root else {
+            return Err(HandlerError::NotFound("agent key store".into()));
+        };
+        Ok(root.join(AGENT_KEY_KEK_FILE))
+    }
+
+    fn load_or_create_agent_key_kek(&self) -> Result<Option<[u8; 32]>, HandlerError> {
+        let Some(root) = &self.store_root else {
+            return Ok(None);
+        };
+        std::fs::create_dir_all(root)?;
+        let path = self.agent_key_kek_path()?;
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                    HandlerError::invalid(format!(
+                        "Hyperliquid agent key KEK at {} must be exactly 32 bytes",
+                        path.display()
+                    ))
+                })?;
+                Ok(Some(arr))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut arr = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut arr);
+                write_secret_file(&path, &arr)?;
+                Ok(Some(arr))
+            }
+            Err(e) => Err(HandlerError::Io(e)),
+        }
+    }
+
+    fn load_agent_key_kek(&self) -> Result<Option<[u8; 32]>, HandlerError> {
+        let Some(_) = &self.store_root else {
+            return Ok(None);
+        };
+        let path = self.agent_key_kek_path()?;
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                    HandlerError::invalid(format!(
+                        "Hyperliquid agent key KEK at {} must be exactly 32 bytes",
+                        path.display()
+                    ))
+                })?;
+                Ok(Some(arr))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(HandlerError::Io(e)),
+        }
+    }
+
+    fn sealed_agent_key_path(
+        &self,
+        network: &str,
+        wallet: &str,
+        session: &str,
+    ) -> Result<PathBuf, HandlerError> {
+        Ok(self
+            .session_store_dir(network, wallet, session)?
+            .join(SEALED_AGENT_KEY_FILE))
+    }
+
+    fn persist_agent_key(
+        &self,
+        network: &str,
+        wallet: &str,
+        session: &str,
+        agent: &EphemeralAgentKey,
+    ) -> Result<bool, HandlerError> {
+        let Some(kek) = self.load_or_create_agent_key_kek()? else {
+            return Ok(false);
+        };
+        let path = self.sealed_agent_key_path(network, wallet, session)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let blob = agent
+            .seal(&kek)
+            .map_err(|e| HandlerError::backend(e.to_string()))?;
+        write_secret_file(&path, &blob)?;
+        Ok(true)
+    }
+
+    fn open_persisted_agent_key(
+        &self,
+        network: &str,
+        wallet: &str,
+        session: &str,
+        expected_address: &str,
+    ) -> Result<Option<EphemeralAgentKey>, HandlerError> {
+        let path = self.sealed_agent_key_path(network, wallet, session)?;
+        let blob = match std::fs::read(&path) {
+            Ok(blob) => blob,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(HandlerError::Io(e)),
+        };
+        let Some(kek) = self.load_agent_key_kek()? else {
+            return Ok(None);
+        };
+        let agent = EphemeralAgentKey::open(&blob, &kek).map_err(|e| {
+            HandlerError::invalid(format!(
+                "sealed Hyperliquid agent key for session '{session}' could not be opened: {e}"
+            ))
+        })?;
+        let actual_address = format!("{:#x}", agent.address());
+        if actual_address.eq_ignore_ascii_case(expected_address) {
+            Ok(Some(agent))
+        } else {
+            Err(HandlerError::invalid(format!(
+                "sealed Hyperliquid agent key address {actual_address} does not match persisted session agent {expected_address}",
+            )))
+        }
+    }
+
     fn warn_pre_approval_markers(&self) {
         let Some(root) = &self.store_root else {
             return;
@@ -1871,16 +2120,36 @@ impl HyperliquidHandler {
         let mut value = self
             .persisted_session_status_value(network, wallet, session)?
             .ok_or_else(|| HandlerError::NotFound(format!("agent session {session}")))?;
+        let sealed_key_present = self
+            .sealed_agent_key_path(network, wallet, session)
+            .map(|path| path.exists())
+            .unwrap_or(false);
+        let has_bounds = value.get("bounds").is_some();
         if let Some(obj) = value.as_object_mut() {
             obj.insert("orphaned".into(), Value::Bool(true));
             obj.insert("tradable".into(), Value::Bool(false));
             obj.insert("breach_action".into(), Value::String("None".into()));
             obj.insert(
+                "agent_key_persisted".into(),
+                Value::Bool(sealed_key_present),
+            );
+            obj.insert(
+                "key_persistence".into(),
+                Value::String(if sealed_key_present {
+                    "sealed_local".into()
+                } else {
+                    "memory_only".into()
+                }),
+            );
+            obj.insert(
                 "orphan_reason".into(),
-                Value::String(
-                    "ephemeral agent key was in daemon memory and is unavailable after restart"
-                        .into(),
-                ),
+                Value::String(if sealed_key_present && !has_bounds {
+                    "sealed agent key is present, but this session was created before policy bounds were persisted; owner-signed orphan cleanup is required".into()
+                } else if sealed_key_present {
+                    "sealed agent key is present, but Bloom could not verify recovery; check daemon KEK and Hyperliquid extraAgents".into()
+                } else {
+                    "ephemeral agent key was in daemon memory and is unavailable after restart".into()
+                }),
             );
         }
         Ok(value)
@@ -1900,6 +2169,100 @@ impl HyperliquidHandler {
         };
         let value: Value = serde_json::from_slice(&bytes).map_err(err_json)?;
         Ok(Some(value))
+    }
+
+    async fn try_recover_persisted_session(
+        &self,
+        client: &HyperliquidClient,
+        network: &str,
+        wallet: &str,
+        id: &str,
+    ) -> Result<Option<Arc<Mutex<ActiveHlSession>>>, HandlerError> {
+        if let Some(active) = self.active_session_if_present(network, wallet, id) {
+            return Ok(Some(active));
+        }
+        let Some(value) = self.persisted_session_status_value(network, wallet, id)? else {
+            return Ok(None);
+        };
+        let persisted = match persisted_active_session_from_value(network, wallet, id, &value) {
+            Ok(persisted) => persisted,
+            Err(e) => {
+                tracing::warn!(
+                    network,
+                    wallet,
+                    session = id,
+                    error = %e,
+                    "hyperliquid.agent_sessions.recovery_metadata_invalid"
+                );
+                return Ok(None);
+            }
+        };
+        let Some(agent) =
+            self.open_persisted_agent_key(network, wallet, id, &persisted.session.agent_address)?
+        else {
+            return Ok(None);
+        };
+        let owner = self
+            .keystore
+            .info(wallet)
+            .map_err(|e| HandlerError::backend(e.to_string()))?
+            .address;
+        let extra_agents = match client
+            .info(json!({"type": "extraAgents", "user": format!("{owner:#x}")}))
+            .await
+        {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(
+                    network,
+                    wallet,
+                    session = id,
+                    error = %e,
+                    "hyperliquid.agent_sessions.recovery_extra_agents_failed"
+                );
+                return Ok(None);
+            }
+        };
+        if !extra_agents_contains_agent(&extra_agents, &persisted.session.agent_address) {
+            tracing::warn!(
+                network,
+                wallet,
+                session = id,
+                agent = persisted.session.agent_address,
+                "hyperliquid.agent_sessions.recovery_agent_not_approved"
+            );
+            return Ok(None);
+        }
+        let key = Self::session_key(network, wallet, id);
+        let recovered = Arc::new(Mutex::new(ActiveHlSession {
+            network: network.to_string(),
+            wallet: wallet.to_string(),
+            agent,
+            session: persisted.session,
+            stopped: persisted.stopped,
+            cleanup_started_ms: persisted.cleanup_started_ms,
+            cleanup_completed_ms: persisted.cleanup_completed_ms,
+            last_cleanup_error: persisted.last_cleanup_error,
+            last_snapshot_ok_ms: persisted.last_snapshot_ok_ms,
+            stale_since_ms: persisted.stale_since_ms,
+            agent_key_persisted: true,
+        }));
+        let mut sessions = self.sessions.lock();
+        let active = sessions
+            .entry(key)
+            .or_insert_with(|| recovered.clone())
+            .clone();
+        drop(sessions);
+        self.append_session_audit(
+            network,
+            wallet,
+            id,
+            &json!({
+                "event": "recovered_sealed_agent_key",
+                "agent_address": active.lock().session.agent_address,
+            }),
+        )?;
+        Ok(Some(active))
     }
 
     fn list_agent_session_wallets(&self, network: &str) -> Result<Vec<Entry>, HandlerError> {
@@ -2460,6 +2823,19 @@ struct ActiveHlSession {
     /// Unix-ms since which risk snapshots have been failing (None when fresh).
     /// `stale = stale_since_ms.is_some()`.
     stale_since_ms: Option<u64>,
+    /// True when the agent key was sealed to disk and can be recovered after
+    /// daemon restart with the local Hyperliquid agent-key KEK.
+    agent_key_persisted: bool,
+}
+
+struct PersistedActiveSession {
+    session: HyperliquidSession,
+    stopped: bool,
+    cleanup_started_ms: Option<u64>,
+    cleanup_completed_ms: Option<u64>,
+    last_cleanup_error: Option<String>,
+    last_snapshot_ok_ms: Option<u64>,
+    stale_since_ms: Option<u64>,
 }
 
 struct SessionSlotReservation {
@@ -2478,6 +2854,123 @@ fn session_blocks_create(active: &ActiveHlSession, now_ms: u128) -> bool {
         && active.session.status == SessionStatus::Active
         && !active.session.is_expired(now_ms)
         && active.cleanup_completed_ms.is_none()
+}
+
+fn persisted_active_session_from_value(
+    network: &str,
+    wallet: &str,
+    id: &str,
+    value: &Value,
+) -> Result<PersistedActiveSession, HandlerError> {
+    let stopped = value
+        .get("stopped")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let cleanup_completed_ms = optional_u64(value, "cleanup_completed_ms");
+    if stopped || cleanup_completed_ms.is_some() {
+        return Err(HandlerError::invalid(format!(
+            "persisted agent session {id} is stopped or already cleaned up"
+        )));
+    }
+    let persisted_network = value
+        .get("network")
+        .and_then(Value::as_str)
+        .unwrap_or(network);
+    if persisted_network != network {
+        return Err(HandlerError::invalid(format!(
+            "persisted agent session {id} belongs to network {persisted_network}, not {network}"
+        )));
+    }
+    let persisted_wallet = value
+        .get("wallet")
+        .and_then(Value::as_str)
+        .unwrap_or(wallet);
+    if persisted_wallet != wallet {
+        return Err(HandlerError::invalid(format!(
+            "persisted agent session {id} belongs to wallet {persisted_wallet}, not {wallet}"
+        )));
+    }
+    let persisted_id = value.get("id").and_then(Value::as_str).unwrap_or(id);
+    if persisted_id != id {
+        return Err(HandlerError::invalid(format!(
+            "persisted agent session id mismatch: expected {id}, got {persisted_id}"
+        )));
+    }
+    let status = parse_session_status(value.get("status").and_then(Value::as_str).unwrap_or(""))?;
+    let agent_address = required_str(value, "agent_address")?.to_string();
+    let bounds_value = value.get("bounds").cloned().ok_or_else(|| {
+        HandlerError::invalid(format!(
+            "persisted agent session {id} cannot be recovered because session.json does not include policy bounds"
+        ))
+    })?;
+    let bounds: HyperliquidPolicy = serde_json::from_value(bounds_value).map_err(err_json)?;
+    let created_ms = required_u128(value, "created_ms")?;
+    let starting_account_value_micro = optional_u64(value, "starting_account_value_micro");
+    let mut session = HyperliquidSession::new(
+        id.to_string(),
+        wallet.to_string(),
+        agent_address,
+        bounds,
+        starting_account_value_micro,
+        created_ms,
+    );
+    session.expires_ms = required_u128(value, "expires_ms")?;
+    session.account_value_micro = optional_u64(value, "account_value_micro");
+    session.unrealized_loss_micro = optional_u64(value, "unrealized_loss_micro").unwrap_or(0);
+    session.cumulative_notional_micro =
+        optional_u64(value, "cumulative_notional_micro").unwrap_or(0);
+    session.open_orders = optional_u64(value, "open_orders")
+        .unwrap_or(0)
+        .try_into()
+        .unwrap_or(u32::MAX);
+    session.open_positions = optional_u64(value, "open_positions")
+        .unwrap_or(0)
+        .try_into()
+        .unwrap_or(u32::MAX);
+    session.status = status;
+    Ok(PersistedActiveSession {
+        session,
+        stopped,
+        cleanup_started_ms: optional_u64(value, "cleanup_started_ms"),
+        cleanup_completed_ms,
+        last_cleanup_error: value
+            .get("last_cleanup_error")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        last_snapshot_ok_ms: optional_u64(value, "last_snapshot_ok_ms"),
+        stale_since_ms: optional_u64(value, "stale_since_ms"),
+    })
+}
+
+fn parse_session_status(status: &str) -> Result<SessionStatus, HandlerError> {
+    match status {
+        "Active" => Ok(SessionStatus::Active),
+        "Expired" => Ok(SessionStatus::Expired),
+        "Halted" => Ok(SessionStatus::Halted),
+        other => Err(HandlerError::invalid(format!(
+            "unknown Hyperliquid session status '{other}'"
+        ))),
+    }
+}
+
+fn required_str<'a>(value: &'a Value, key: &str) -> Result<&'a str, HandlerError> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| HandlerError::invalid(format!("persisted session is missing {key}")))
+}
+
+fn required_u128(value: &Value, key: &str) -> Result<u128, HandlerError> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .map(u128::from)
+        .ok_or_else(|| HandlerError::invalid(format!("persisted session is missing {key}")))
+}
+
+fn optional_u64(value: &Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(Value::as_u64)
 }
 
 struct PersistedOrphanRecoverySession {
@@ -2540,6 +3033,30 @@ fn extra_agents_contains_agent(extra_agents: &Value, agent_address: &str) -> boo
     visit(extra_agents, &needle)
 }
 
+fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<(), HandlerError> {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+        let tmp = path.with_extension("tmp");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(tmp, path)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+}
+
 struct SessionActionTarget<'a> {
     network: &'a str,
     wallet: &'a str,
@@ -2581,6 +3098,7 @@ fn session_status_json_with_orphaned(
         "network": active.network,
         "wallet": active.wallet,
         "agent_address": active.session.agent_address,
+        "bounds": active.session.bounds,
         "status": format!("{:?}", active.session.status),
         "stopped": active.stopped,
         "orphaned": orphaned,
@@ -2603,6 +3121,8 @@ fn session_status_json_with_orphaned(
         "stale": active.stale_since_ms.is_some(),
         "last_snapshot_ok_ms": active.last_snapshot_ok_ms,
         "stale_since_ms": active.stale_since_ms,
+        "agent_key_persisted": active.agent_key_persisted,
+        "key_persistence": if active.agent_key_persisted { "sealed_local" } else { "memory_only" },
         "breach_action": format!("{breach_action:?}"),
     })
 }
@@ -3055,6 +3575,7 @@ mod tests {
             last_cleanup_error: None,
             last_snapshot_ok_ms,
             stale_since_ms,
+            agent_key_persisted: false,
         }
     }
 
@@ -3119,6 +3640,25 @@ mod tests {
         assert_eq!(v["tradable"], false);
     }
 
+    #[test]
+    fn session_status_persists_bounds_needed_for_recovery() {
+        let mut active = active_for_status(Some(123), None);
+        active.session.bounds.max_notional_usd = Some(12_000_000);
+        active.agent_key_persisted = true;
+        let v = session_status_json_with_orphaned(&active, BreachAction::None, false);
+        assert_eq!(v["bounds"]["max_notional_usd"], "12");
+        assert_eq!(v["agent_key_persisted"], true);
+        assert_eq!(v["key_persistence"], "sealed_local");
+
+        let recovered = persisted_active_session_from_value("mainnet", "alice", "s1", &v).unwrap();
+        assert_eq!(recovered.session.bounds.max_notional_usd, Some(12_000_000));
+        assert_eq!(
+            recovered.session.agent_address,
+            active.session.agent_address
+        );
+        assert_eq!(recovered.session.status, SessionStatus::Active);
+    }
+
     fn handler() -> HyperliquidHandler {
         let dir = std::env::temp_dir().join(format!(
             "bloom-hl-test-{}-{}",
@@ -3132,6 +3672,37 @@ mod tests {
                 .with_base_url(url::Url::parse(TESTNET_API_URL).unwrap()),
             Keystore::new(dir).unwrap(),
         )
+    }
+
+    #[test]
+    fn persisted_agent_key_round_trips_and_rejects_wrong_address() {
+        let h = handler().with_store_root(std::env::temp_dir().join(format!(
+            "bloom-hl-key-store-{}-{}",
+            std::process::id(),
+            bloom_hyperliquid::now_ms()
+        )));
+        let agent = EphemeralAgentKey::generate();
+        let expected = format!("{:#x}", agent.address());
+        assert!(
+            h.persist_agent_key("mainnet", "minnow", "session-1", &agent)
+                .unwrap()
+        );
+        let recovered = h
+            .open_persisted_agent_key("mainnet", "minnow", "session-1", &expected)
+            .unwrap()
+            .expect("sealed key");
+        assert_eq!(format!("{:#x}", recovered.address()), expected);
+
+        match h.open_persisted_agent_key(
+            "mainnet",
+            "minnow",
+            "session-1",
+            "0x0000000000000000000000000000000000000000",
+        ) {
+            Err(HandlerError::Invalid(msg)) => assert!(msg.contains("does not match")),
+            Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => panic!("wrong persisted agent address should be rejected"),
+        }
     }
 
     #[tokio::test]
@@ -3347,6 +3918,7 @@ mod tests {
             last_cleanup_error: None,
             last_snapshot_ok_ms: None,
             stale_since_ms: None,
+            agent_key_persisted: false,
         };
         h.sessions.lock().insert(
             HyperliquidHandler::session_key("mainnet", "minnow", "session-1"),
@@ -3456,6 +4028,7 @@ mod tests {
             last_cleanup_error: None,
             last_snapshot_ok_ms: None,
             stale_since_ms: None,
+            agent_key_persisted: false,
         };
         h.sessions.lock().insert(
             HyperliquidHandler::session_key("mainnet", "minnow", "session-1"),
@@ -3494,6 +4067,7 @@ mod tests {
             last_cleanup_error: None,
             last_snapshot_ok_ms: None,
             stale_since_ms: None,
+            agent_key_persisted: false,
         };
         h.sessions.lock().insert(
             HyperliquidHandler::session_key("mainnet", "minnow", "session-1"),

@@ -211,6 +211,11 @@ and example crates used by the broader Bloom runtime and examples.
 - **Policy enforcement before signing.** Per-wallet `policy.toml`
   enforces caps, recipient allow/deny lists, contract-call gates,
   private orderflow settings, and automation thresholds.
+- **Passkey policy review is plain-language first.** `bloom wallet
+  sign-policy <wallet>` opens a local review page where the user chooses
+  whether Bloom must ask before every money-moving action or may act later
+  only when the action passes the signed policy. Technical hashes and raw
+  policy TOML stay behind advanced details.
 - **Private orderflow is opt-in and fail-closed.** On unsupported
   chains, private broadcast returns an error instead of silently falling
   back to public RPC.

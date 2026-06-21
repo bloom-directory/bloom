@@ -21,6 +21,10 @@ ignored `docs/.scratch/`.
 - `2026-06-19-hyperliquid-integration-hardening.md` — correctness,
   durability, testing, and maintainability plan for Hyperliquid bounded
   sessions and trading paths.
+- `2026-06-20-agent-obvious-capability-model.md` — make capabilities the
+  default agent path across all venues: read-only `/wallets/<w>/capabilities/`
+  roll-up, `/next.md` aggregator, auto-lock-on-expiry for
+  owner-signing capabilities, and a Polymarket capability primitive.
 
 ## Removed From Active Set
 

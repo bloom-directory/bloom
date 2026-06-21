@@ -153,6 +153,17 @@ This is intentionally stronger than repeated passkey prompts per order, but it
 also means the daemon is temporarily trusted with live trading authority inside
 the policy envelope.
 
+The owner passkey review must be plain-language first. It should answer:
+
+- what Bloom can do: trade on Hyperliquid inside the listed limits
+- for how long: the configured session TTL
+- how large: max order, max position, max loss, and max leverage
+- what Bloom cannot do: withdrawals and third-party transfers
+
+Internal ceremony fields such as intent hashes, path names, and raw canonical
+subjects are audit/debug details and belong behind advanced details, not in the
+main user decision.
+
 ## Cleanup expectations
 
 Normal lifecycle:

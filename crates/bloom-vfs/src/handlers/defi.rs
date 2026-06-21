@@ -49,6 +49,42 @@ use serde::{Deserialize, Serialize};
 /// When `token_in == NATIVE_TOKEN_ADDR`, no ERC-20 approval is needed.
 const NATIVE_TOKEN_ADDR: Address = address!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
 
+const ROOT_FILES: [&str; 1] = ["README.md"];
+
+const README: &[u8] = br#"# DeFi Intents (Enso Shortcuts)
+
+## Quick Start for Agents
+
+### 1. Create an intent
+```json
+ write: /defi/intents/<wallet>/new
+ example: {"intent":"swap 100 usdc to eth","chain":"ethereum"}
+ or just NL text: swap 100 usdc to eth
+```
+
+### 2. Inspect the plan
+```json
+ read: /defi/intents/<wallet>/<session>/plan.md
+ read: /defi/intents/<wallet>/<session>/route.json
+ read: /defi/intents/<wallet>/<session>/tx.json
+ read: /defi/intents/<wallet>/<session>/simulation.json
+```
+
+### 3. Confirm (two confirms required)
+```json
+ write: /defi/intents/<wallet>/<session>/confirm    # Stage into outbox
+ write: /wallets/<wallet>/chains/<chain>/outbox/pending/<id>/confirm  # Broadcast
+```
+
+## Safety Model
+
+- Route discovery uses the Enso Shortcuts API (requires BLOOM_ENSO_KEY)
+- Simulation is re-run on each read; reverts are decoded
+- Auto-approve handles ERC-20 allowances when needed
+- Broadcast requires the standard outbox confirm (owner gate)
+- Settlement verification for cross-chain routes: read settlement.json and wait_settlement
+"#;
+
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
 
@@ -1241,6 +1277,9 @@ impl DefiHandler {
         if segs.is_empty() {
             return Ok(Entry::dir(""));
         }
+        if segs.len() == 1 && ROOT_FILES.contains(&segs[0].as_str()) {
+            return Ok(Entry::file(&segs[0]));
+        }
         match segs[0].as_str() {
             "intents" => match segs.len() {
                 1 => Ok(Entry::dir("intents")),
@@ -1271,6 +1310,9 @@ impl DefiHandler {
 
     async fn read_inner(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let segs = path.segments();
+        if segs.len() == 1 && ROOT_FILES.contains(&segs[0].as_str()) {
+            return Ok(README.to_vec());
+        }
         if segs.len() != 4 || segs[0] != "intents" {
             return Err(HandlerError::NotAFile(path.to_string_path()));
         }
@@ -1365,7 +1407,7 @@ impl DefiHandler {
     async fn list_inner(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         let segs = path.segments();
         match segs.len() {
-            0 => Ok(vec![Entry::dir("intents")]),
+            0 => Ok(vec![Entry::file("README.md"), Entry::dir("intents")]),
             1 if segs[0] == "intents" => Ok(self
                 .list_session_wallets()
                 .into_iter()

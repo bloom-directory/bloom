@@ -790,6 +790,7 @@ async fn auth_intent(State(state): State<AuthState>) -> Response {
         Json(serde_json::json!({
             "intent": intent,
             "intent_hash": intent.intent_hash(),
+            "editable_policy": state.editable_policy.lock().is_some(),
         })),
     )
         .into_response()
@@ -1908,6 +1909,7 @@ mod ceremony_gate_tests {
             .unwrap();
         assert_eq!(v["intent_hash"].as_str(), Some(expected.as_str()));
         assert_eq!(v["intent"]["kind"].as_str(), Some("evm_transaction"));
+        assert_eq!(v["editable_policy"].as_bool(), Some(false));
         state.shutdown.notify_one();
     }
 
@@ -1992,6 +1994,24 @@ mod ceremony_gate_tests {
             state.editable_policy.lock().as_deref(),
             Some("[approval]\nagent_autonomy = \"prompt_all\"\n")
         );
+        state.shutdown.notify_one();
+    }
+
+    #[tokio::test]
+    async fn intent_json_marks_editable_policy_reviews() {
+        let state = unreviewed_state();
+        *state.editable_policy.lock() =
+            Some("[approval]\nagent_autonomy = \"prompt_all\"\n".into());
+        let (base, _h) = serve(state.clone()).await;
+        let v: serde_json::Value = client()
+            .get(format!("{base}/intent.json"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(v["editable_policy"].as_bool(), Some(true));
         state.shutdown.notify_one();
     }
 

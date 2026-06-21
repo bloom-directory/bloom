@@ -8,6 +8,7 @@
 
 pub mod address;
 pub mod audit;
+pub mod capability;
 pub mod ceremony;
 pub mod chain;
 pub mod config;
@@ -26,6 +27,7 @@ pub mod units;
 
 pub use address::{AddressBook, AddressBookError, checksum_address, parse_address};
 pub use audit::{AuditLog, AuditRecord};
+pub use capability::{CapabilityStatus, CapabilityView, CapabilityViewEntry, SigningModel, Venue};
 pub use ceremony::{CeremonyIntent, CeremonyIntentKind};
 pub use chain::{ChainId, ChainRef, ChainSpec, EndpointSpec, default_endpoint_weight};
 pub use config::{

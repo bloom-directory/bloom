@@ -19,20 +19,70 @@ Useful commands:
 For more information, start in the `/docs` folder. It contains the canonical
 VFS usage notes and examples exposed by the mounted tree.
 
-Most paths are read-only views over chain, wallet, status, pricing, ENS, and
-tooling data. Treat writable paths as actions: writes may stage transactions,
-create watched resources, or update local bloom state. Read the nearby docs and
-directory contents before writing.
+## Security model
+
+bloom gatekeeps every value-moving action through capabilities:
+
+- **Reads are always safe.** No signing, no ceremony, no wallet needed for chain
+  state, balances, prices, books, candles, account state.
+- **Direct writes require owner approval.** The outbox stage-confirm flow,
+  one-off Hyperliquid exchange orders, and Polymarket trades each cross an
+  owner gate (passkey ceremony or local passphrase unlock).
+- **Automated action uses a capability.** Create a bounded session/capability
+  first — the human approves the bounds once, then the agent operates inside
+  them without re-prompting until expiry, breach, or revocation.
+- **The owner key is never handed off.** For capabilities that depend on owner
+  signing (EVM, Polymarket — the target model, not yet shipped), the key will
+  reside in daemon RAM for a bounded window and auto-lock on expiry.
+  Hyperliquid already uses an ephemeral agent key that does not need the
+  owner key after session creation.
+
+To see what a wallet can do without a human, check its per-chain state and
+outbox, or its Hyperliquid sessions under `/hyperliquid/<net>/agent_sessions/`.
+A read-only `/wallets/<wallet>/capabilities/` roll-up and a VFS-root `/next.md`
+aggregator are in active development (see
+`docs/plans/2026-06-20-agent-obvious-capability-model.md`).
+
+Read `/hyperliquid/README.md` for Hyperliquid trading (session-first).
+Read `/polymarket/README.md` for prediction-market trading.
+Read `/defi/README.md` for DeFi intents via Enso shortcuts.
+
+## Hyperliquid (session-first)
+
+Hyperliquid trading has two signing models:
+
+- **Agent sessions (RECOMMENDED):** one `approveAgent` ceremony creates an
+  ephemeral trading key. The agent trades inside policy bounds without further
+  human prompts. The session auto-expires and auto-flattens positions on breach.
+  Create at `/hyperliquid/mainnet/agent_sessions/<wallet>/new.json`.
+  Trade through the session at
+  `/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/order.json`.
+
+- **Direct exchange writes (ADVANCED):** owner-signed one-off actions for
+  emergencies. Requires the wallet to be unlocked. Paths under
+  `/hyperliquid/<network>/exchange/<wallet>/...`.
 
 ## Polymarket
 
 Prediction-market trading lives under `/polymarket` and is driven by the
 `bloom polymarket ...` commands. It is **opt-in and human-gated**: a wallet
 trades only after `[polymarket] enabled = true` is set in its `policy.toml`, and
-value-moving steps open a passkey review ceremony that needs a human present —
-or unlock a **local** (passphrase) wallet via `BLOOM_PASSPHRASE` for headless
-runs. Start at `/docs/examples.md` (the Polymarket section: prerequisites + the
-onboard → fund → order → confirm happy path) and read `docs/polymarket-integration.md`
-in the repo for the full spec and caveats. Funds move only through the CLI
-(`fund`, `fund --request`, `onboard --target-pusd`); the VFS surface stages and
-reviews, it never signs.
+today every value-moving action opens a fresh passkey review ceremony. A
+Polymarket capability primitive (scoped approve, TTL, caps) is in active
+development — see `docs/plans/2026-06-20-agent-obvious-capability-model.md`.
+
+Start at `/docs/examples.md` (the Polymarket section) and read
+`docs/polymarket-integration.md` in the repo for the full spec. Funds move only
+through the CLI; the VFS surface stages and reviews, it never signs.
+
+## Passkey policy mode
+
+For passkey wallets, policy edits must be re-signed with
+`bloom wallet sign-policy <wallet>`. The browser page lets the human choose:
+
+- `Ask me every time`: money-moving actions need a fresh passkey review.
+- `Let Bloom use these rules`: agents may proceed only when every signed policy
+  check passes.
+
+Do not treat `under_policy` as a blanket unlock. It is permission to act inside
+the wallet's signed caps, allowlists, and surface-specific rules.

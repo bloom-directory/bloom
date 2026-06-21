@@ -1,21 +1,33 @@
-target/
-**/*.rs.bk
-.DS_Store
-~/.bloom
-.env
-test.env
-*.local.toml
-.worktrees/
-# Downloaded CI log bundles dropped in the repo root during triage.
-/logs_*/
-.claude/worktrees/
-.claude/scheduled_tasks.lock
-.claude/settings.local.json
+# Built workspace — Cargo target/ is gitignored by default, but we
+# also ignore generated alloy fragments and the local binary.
 
-# Literature-inquiry raw corpus + full-text third-party papers. These are
-# large machine-generated artifacts (and the full text carries third-party
-# copyright), so they live in an external store, not the repo. The
-# synthesized markdown under lit/ stays tracked. See lit/RESEARCH.md.
+target/
+target-docker/
+
+# Dependencies that are explicitly vendored for offline builds.
+# .vendor/ stores a snapshot of crates.io deps; re-generate via:
+#   cargo vendor --locked  # (do not commit)
+
+.vendor/
+
+# Local user configuration — copy this file to an ignored key path
+# before adding real API keys.
+config.local.toml
+.env
+.test.env
+
+# Local test state — home directories created by the test harness
+# or by `scripts/play.sh`.
+.bloom-local/
+.bloom-play/
+
+# Per-seat local scratch notes — not tracked, but always available.
+# Create this file under `docs/.scratch/` if you need a place for
+# work-in-progress notes.
+docs/.scratch/
+
+# Generated litigation search data — the indexing scripts produce
+# synthesized markdown under lit/ and nl-to-invariant/ stays tracked.
 docs/research/formal-verification/lit/data/
 
 # Local-only agent/PR docs — kept on disk, deliberately never committed.

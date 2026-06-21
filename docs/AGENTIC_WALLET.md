@@ -135,6 +135,34 @@ plain `confirm` write. Request artifacts redact sensitive headers such as
 The detailed design and current path contract live in
 [`docs/specs/2026-06-15-paid-http-requests.md`](./specs/2026-06-15-paid-http-requests.md).
 
+## Wallet policy and passkey review
+
+Each wallet has one `policy.toml`. Different sections cover different surfaces:
+
+- `[approval]` decides whether Bloom must ask before each money-moving action or may act later inside signed rules.
+- `[limits]` provides cross-surface USD budgets for autonomous execution.
+- `[caps]` applies broad EVM transaction caps.
+- `[defi]`, `[polymarket]`, `[payments]`, and `[hyperliquid]` add surface-specific limits.
+
+For passkey wallets, editing `policy.toml` is not enough. The policy must be
+signed:
+
+```sh
+bloom wallet sign-policy <wallet>
+```
+
+The signing page is intentionally plain-language first. It asks the user to
+choose one of two modes:
+
+- **Ask me every time**: Bloom can prepare actions, but money-moving work needs
+  another passkey review.
+- **Let Bloom use these rules**: Bloom may act later without another passkey
+  prompt only when every signed policy check passes.
+
+Signing a policy does not move money by itself. It changes the rules Bloom will
+use later. Raw TOML, review IDs, and hashes are available in advanced details
+for audit/debugging, but agents should explain the plain-language choice.
+
 ## Why filesystem-first matters
 
 Agents are already good at navigating files. Bloom turns wallet operations into ordinary file operations, so agents can discover capabilities with `ls`, read docs with `cat`, stage actions with writes, and explain the plan before asking the user to approve anything.

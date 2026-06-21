@@ -26,7 +26,10 @@ use alloy::signers::SignerSync;
 use async_trait::async_trait;
 use bloom_chain::ChainRegistry;
 use bloom_keystore::Keystore;
-use bloom_proto::{AddressBook, HomeWritePermit, RawIntent};
+use bloom_proto::{
+    AddressBook, CapabilityStatus, CapabilityViewEntry, HomeWritePermit, RawIntent, SigningModel,
+    Venue,
+};
 use bloom_tx::{
     intent_parser,
     outbox::OutboxState,
@@ -48,6 +51,8 @@ pub struct WalletsHandler {
     /// Read-only Polymarket onboarding state, used to surface a wallet's
     /// deposit/funder address alongside its owner EOA in `addresses.json`.
     pub polymarket_onboard: Option<bloom_polymarket::OnboardStore>,
+    /// Optional Hyperliquid handler for capability roll-up aggregation.
+    pub hyperliquid_handler: Option<Arc<crate::handlers::hyperliquid::HyperliquidHandler>>,
 }
 
 impl WalletsHandler {
@@ -65,6 +70,7 @@ impl WalletsHandler {
             home_write_permit: None,
             mempool_indexes: Arc::new(std::collections::BTreeMap::new()),
             polymarket_onboard: None,
+            hyperliquid_handler: None,
         }
     }
 
@@ -83,6 +89,14 @@ impl WalletsHandler {
 
     pub fn with_home_write_permit_opt(mut self, permit: Option<Arc<HomeWritePermit>>) -> Self {
         self.home_write_permit = permit;
+        self
+    }
+
+    pub fn with_hyperliquid_handler(
+        mut self,
+        hl: Option<Arc<crate::handlers::hyperliquid::HyperliquidHandler>>,
+    ) -> Self {
+        self.hyperliquid_handler = hl;
         self
     }
 
@@ -116,6 +130,7 @@ impl WalletsHandler {
             PolicyStatus::Stale => "stale",
             PolicyStatus::NotApplicable => "not_applicable",
         };
+        let unlocked = self.keystore.is_unlocked(wallet);
         let owner = bloom_proto::checksum_address(&info.address);
 
         let mut roles = serde_json::Map::new();
@@ -140,11 +155,160 @@ impl WalletsHandler {
             "owner": owner,
             "signer": owner,
             "policy_status": policy_status,
+            "unlocked": unlocked,
             "roles": serde_json::Value::Object(roles),
         });
         let mut out = serde_json::to_vec_pretty(&body).map_err(err_be)?;
         out.push(b'\n');
         Ok(out)
+    }
+
+    fn evm_capability_views_for(&self, wallet: &str) -> Vec<CapabilityViewEntry> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let sessions = self.tx_engine.session_store().active(now_ms);
+        let mut out = Vec::new();
+        for s in sessions {
+            if s.wallet != wallet {
+                continue;
+            }
+            let status = if s.expires_ms <= now_ms {
+                CapabilityStatus::Expired
+            } else {
+                CapabilityStatus::Active
+            };
+            let chains_display: Vec<String> = s.chains.iter().map(|id| id.to_string()).collect();
+            let limits = serde_json::json!({
+                "max_usd": s.max_micro_usd as f64 / 1_000_000.0,
+                "spent_usd": s.spent_micro_usd as f64 / 1_000_000.0,
+                "chains": &chains_display,
+                "allowed_pending_ids": s.allowed_pending_ids,
+            });
+            let pending_ids: Vec<&str> = s
+                .allowed_pending_ids
+                .iter()
+                .map(|s| s.as_str())
+                .take(10)
+                .collect();
+            let mut allowed = vec![format!(
+                "confirm {} pending tx ids",
+                s.allowed_pending_ids.len()
+            )];
+            if !chains_display.is_empty() {
+                allowed.push(format!("on chains: {}", chains_display.join(", ")));
+            }
+            allowed.push(format!(
+                "max total spend: ${:.2}",
+                s.max_micro_usd as f64 / 1_000_000.0
+            ));
+            if s.spent_micro_usd > 0 {
+                allowed.push(format!(
+                    "spent: ${:.2}",
+                    s.spent_micro_usd as f64 / 1_000_000.0
+                ));
+            }
+            let denied = vec!["tx ids not listed above require a fresh review".to_string()];
+            out.push(CapabilityViewEntry {
+                id: s.id.clone(),
+                wallet: wallet.to_string(),
+                venue: Venue::EvmOutbox,
+                signing_model: SigningModel::AuthorizesOwnerSigning,
+                created_ms: 0, // EVM sessions don't track creation time
+                expires_ms: Some(s.expires_ms),
+                expires_in_secs: if s.expires_ms > now_ms {
+                    Some(((s.expires_ms - now_ms) / 1000) as u64)
+                } else {
+                    None
+                },
+                status,
+                limits,
+                next_write_path: if let Some(first) = pending_ids.first() {
+                    let outbox_id = first.split_once(':').map(|(_, id)| id).unwrap_or(first);
+                    format!(
+                        "/wallets/{wallet}/chains/{chain}/outbox/pending/{id}/confirm",
+                        wallet = wallet,
+                        chain = "ethereum",
+                        id = outbox_id
+                    )
+                } else {
+                    format!("/wallets/{wallet}/chains/ethereum/outbox/pending/.../confirm")
+                },
+                revoke_path: format!("/wallets/{wallet}/policy-session/{}/revoke", s.id),
+                audit_ref: "/status/audit/head".to_string(),
+                review_ref: format!("/wallets/{wallet}/policy-session/active.json"),
+                allowed,
+                denied,
+            });
+        }
+        out
+    }
+
+    fn all_capability_views_for(&self, wallet: &str) -> Vec<CapabilityViewEntry> {
+        let mut all = self.evm_capability_views_for(wallet);
+        if let Some(ref hl) = self.hyperliquid_handler {
+            let hl_views = hl.capability_views_for(wallet);
+            all.extend(hl_views);
+        }
+        all.sort_by(|a, b| {
+            a.created_ms
+                .cmp(&b.created_ms)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        all
+    }
+
+    fn capabilities_active_json(&self, wallet: &str) -> Result<Vec<u8>, HandlerError> {
+        let entries = self.all_capability_views_for(wallet);
+        let mut out = serde_json::to_vec_pretty(&entries).map_err(err_be)?;
+        out.push(b'\n');
+        Ok(out)
+    }
+
+    fn capabilities_active_md(&self, wallet: &str) -> Result<Vec<u8>, HandlerError> {
+        let entries = self.all_capability_views_for(wallet);
+        let mut md = String::new();
+        md.push_str(&format!("# Capabilities for `{wallet}`\n\n"));
+        if entries.is_empty() {
+            md.push_str("No active capabilities.\n\n");
+            md.push_str("Create a Hyperliquid session at `/hyperliquid/<net>/agent_sessions/{wallet}/new.json`");
+            md.push_str(" or an EVM policy session at `/wallets/{wallet}/policy-session/new`.\n");
+        } else {
+            for c in &entries {
+                md.push_str(&format!(
+                    "## {} ({})\n\n",
+                    c.id,
+                    match c.venue {
+                        Venue::Hyperliquid => "Hyperliquid",
+                        Venue::EvmOutbox => "EVM outbox",
+                        Venue::Polymarket => "Polymarket",
+                        Venue::Defi => "DeFi",
+                    }
+                ));
+                md.push_str(&format!("- **Signing model:** {:?}\n", c.signing_model));
+                md.push_str(&format!("- **Status:** {:?}\n", c.status));
+                if let Some(secs) = c.expires_in_secs {
+                    md.push_str(&format!("- **Expires in:** {secs}s\n"));
+                }
+                md.push_str(&format!("- **Next write:** `{}`\n", c.next_write_path));
+                md.push_str(&format!("- **Stop:** `{}`\n", c.revoke_path));
+                if !c.allowed.is_empty() {
+                    md.push_str("- **Allowed:**\n");
+                    for a in &c.allowed {
+                        md.push_str(&format!("  - {a}\n"));
+                    }
+                }
+                if !c.denied.is_empty() {
+                    md.push_str("- **Denied:**\n");
+                    for d in &c.denied {
+                        md.push_str(&format!("  - {d}\n"));
+                    }
+                }
+                md.push('\n');
+            }
+        }
+        Ok(md.into_bytes())
     }
 
     fn write_permit(&self) -> Result<&HomeWritePermit, HandlerError> {
@@ -245,6 +409,7 @@ impl WalletsHandler {
             Entry::dir("chains"),
             Entry::dir("sign"),
             Entry::dir("policy-session"),
+            Entry::dir("capabilities"),
         ];
         if kind == bloom_keystore::WalletKind::PasskeyGated {
             entries.push(Entry::writable_file("unlock-passkey"));
@@ -439,6 +604,12 @@ impl WalletsHandler {
                 4 if segs[3] == "revoke" => Ok(Entry::writable_file("revoke")),
                 _ => Err(HandlerError::not_found(path.to_string_path())),
             },
+            "capabilities" => match segs.len() {
+                2 => Ok(Entry::dir("capabilities")),
+                3 if segs[2] == "active.json" => Ok(Entry::file("active.json")),
+                3 if segs[2] == "active.md" => Ok(Entry::file("active.md")),
+                _ => Err(HandlerError::not_found(path.to_string_path())),
+            },
             _ => Err(HandlerError::not_found(path.to_string_path())),
         }
     }
@@ -474,6 +645,12 @@ impl WalletsHandler {
             "chains" if segs.len() >= 4 => self.read_chain(wallet, &segs[2], &segs[3..]).await,
             "policy-session" if segs.len() == 3 && segs[2] == "active.json" => {
                 self.policy_session_active_json(wallet)
+            }
+            "capabilities" if segs.len() == 3 && segs[2] == "active.json" => {
+                self.capabilities_active_json(wallet)
+            }
+            "capabilities" if segs.len() == 3 && segs[2] == "active.md" => {
+                self.capabilities_active_md(wallet)
             }
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
@@ -982,10 +1159,25 @@ impl WalletsHandler {
                     return Ok(());
                 }
                 let (confirm_text, reviewed_intent_hash) = split_confirm_review_hash(confirm_text);
-                let signer = self
-                    .keystore
-                    .signer(wallet)
-                    .map_err(|_| HandlerError::PermissionDenied)?;
+                let signer = self.keystore.signer(wallet).map_err(|e| {
+                    HandlerError::invalid(format!(
+                        "wallet '{wallet}' is locked.\n\
+                         \n\
+                         For automated EVM transactions: create a policy session first.\n\
+                         Create a session at: /wallets/{wallet}/policy-session/new\n\
+                         A policy session lets you confirm listed pending ids without\n\
+                         re-prompting for each one, while the wallet is unlocked.\n\
+                         \n\
+                         For one-off actions:\n\
+                         Daemon (bloom serve): unlock the wallet first, then write:\n\
+                           bloom wallet unlock {wallet}\n\
+                         One-shot CLI: pass --unlock-wallet or --passphrase to the command:\n\
+                           bloom wallet confirm {wallet} <chain> <id> --unlock-wallet {wallet}\n\
+                           bloom vfs write /wallets/{wallet}/... --unlock-wallet {wallet}\n\
+                         \n\
+                         Underlying error: {e}"
+                    ))
+                })?;
                 let _staged = self
                     .tx_engine
                     .confirm(
@@ -1019,10 +1211,24 @@ impl WalletsHandler {
                         "cancel requires non-empty content (e.g. 'y' or override token)",
                     ));
                 }
-                let signer = self
-                    .keystore
-                    .signer(wallet)
-                    .map_err(|_| HandlerError::PermissionDenied)?;
+                let signer = self.keystore.signer(wallet).map_err(|e| {
+                    HandlerError::invalid(format!(
+                        "wallet '{wallet}' is locked.\n\
+                         \n\
+                         For automated EVM transactions: create a policy session first.\n\
+                         Create a session at: /wallets/{wallet}/policy-session/new\n\
+                         A policy session lets you cancel listed pending ids without\n\
+                         re-prompting for each one, while the wallet is unlocked.\n\
+                         \n\
+                          For one-off actions:\n\
+                         Daemon (bloom serve): unlock the wallet first, then write:\n\
+                           bloom wallet unlock {wallet}\n\
+                         One-shot CLI: pass --unlock-wallet or --passphrase to the command:\n\
+                           bloom wallet cancel {wallet} <chain> <id> --unlock-wallet {wallet}\n\
+                         \n\
+                         Underlying error: {e}"
+                    ))
+                })?;
                 let _ = self
                     .tx_engine
                     .cancel(
@@ -1054,10 +1260,24 @@ impl WalletsHandler {
                     ));
                 }
                 let intent: RawIntent = intent_parser::parse(body).map_err(err_be)?;
-                let signer = self
-                    .keystore
-                    .signer(wallet)
-                    .map_err(|_| HandlerError::PermissionDenied)?;
+                let signer = self.keystore.signer(wallet).map_err(|e| {
+                    HandlerError::invalid(format!(
+                        "wallet '{wallet}' is locked.\n\
+                         \n\
+                         For automated EVM transactions: create a policy session first.\n\
+                         Create a session at: /wallets/{wallet}/policy-session/new\n\
+                         A policy session lets you replace listed pending ids without\n\
+                         re-prompting for each one, while the wallet is unlocked.\n\
+                         \n\
+                         For one-off actions:\n\
+                         Daemon (bloom serve): unlock the wallet first, then write:\n\
+                           bloom wallet unlock {wallet}\n\
+                         One-shot CLI: pass --unlock-wallet or --passphrase to the command:\n\
+                           bloom vfs write /wallets/{wallet}/... --unlock-wallet {wallet}\n\
+                         \n\
+                         Underlying error: {e}"
+                    ))
+                })?;
                 // Bump at >= 10% (mempool floor) and substitute the
                 // calldata derived from the new intent — same nonce,
                 // possibly different to / value / data. Use the
@@ -1568,6 +1788,9 @@ mod tests {
         assert_eq!(v["signer"], owner, "owner and signer are the same EOA");
         // Local wallet: no signed policy required, no role addresses known.
         assert_eq!(v["policy_status"], "not_applicable");
+        // Local wallet is unlocked at creation time; passkey wallets start
+        // locked and require an unlock ceremony.
+        assert_eq!(v["unlocked"], true);
         assert!(v["roles"].as_object().unwrap().is_empty());
         // addresses.json is also a listed dir entry.
         let dir = VfsPath::parse(&format!("/{}", f.wallet_name)).unwrap();

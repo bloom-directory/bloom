@@ -47,6 +47,7 @@ url.workspace = true
 lru.workspace = true
 reqwest.workspace = true
 base64.workspace = true
+rand.workspace = true
 mpp.workspace = true
 
 [dev-dependencies]

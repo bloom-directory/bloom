@@ -467,7 +467,43 @@ impl Daemon {
                         .with_mempool_handlers(mempool_handlers.clone())
                         .with_revert_decoder(decoder_chain.clone()),
                 ) as _,
-            )
+            );
+
+        let hyperliquid_handler: Option<Arc<HyperliquidHandler>> = if let Some(hl_cfg) =
+            &config.hyperliquid
+        {
+            let hl_url = |raw: &str| match url::Url::parse(raw) {
+                Ok(u) => Some(u),
+                Err(e) => {
+                    warn!(url = %raw, error = %e, "daemon.hyperliquid_url_invalid_using_default");
+                    None
+                }
+            };
+            let mut mainnet = HyperliquidClient::new(HyperliquidNetwork::Mainnet);
+            if let Some(u) = hl_url(&hl_cfg.mainnet_url) {
+                mainnet = mainnet.with_base_url(u);
+            }
+            let mut testnet = HyperliquidClient::new(HyperliquidNetwork::Testnet);
+            if let Some(u) = hl_url(&hl_cfg.testnet_url) {
+                testnet = testnet.with_base_url(u);
+            }
+            debug!("daemon.hyperliquid_mounted");
+            let handler = Arc::new(
+                HyperliquidHandler::new(mainnet, testnet, keystore.clone())
+                    .with_store_root(home.root().join("hyperliquid")),
+            );
+            handler.clone().start_monitoring();
+            Some(handler)
+        } else {
+            debug!("daemon.hyperliquid_skipped: no [hyperliquid] config");
+            None
+        };
+
+        if let Some(ref hl) = hyperliquid_handler {
+            vfs_builder = vfs_builder.mount("hyperliquid", hl.clone() as _);
+        }
+
+        vfs_builder = vfs_builder
             .mount(
                 "wallets",
                 Arc::new(
@@ -479,7 +515,8 @@ impl Daemon {
                     )
                     .with_home_write_permit_opt(home_write_permit.clone())
                     .with_mempool_indexes(mempool_indexes.clone())
-                    .with_polymarket_root(home.polymarket_dir()),
+                    .with_polymarket_root(home.polymarket_dir())
+                    .with_hyperliquid_handler(hyperliquid_handler.clone()),
                 ) as _,
             )
             .mount("tools", Arc::new(ToolsHandler::new()) as _)
@@ -663,35 +700,142 @@ impl Daemon {
             debug!("daemon.polymarket_skipped: no [polymarket] config");
         }
 
-        // Hyperliquid: HyperCore Info reads plus explicit Exchange writes.
-        // HyperEVM remains the normal `chains/hyperliquid` JSON-RPC surface;
-        // this block is for the separate `api.hyperliquid.xyz` HyperCore API.
-        if let Some(hl_cfg) = &config.hyperliquid {
-            let hl_url = |raw: &str| match url::Url::parse(raw) {
-                Ok(u) => Some(u),
-                Err(e) => {
-                    warn!(url = %raw, error = %e, "daemon.hyperliquid_url_invalid_using_default");
-                    None
+        // /next.md — brutally-scoped next-action aggregator for agents.
+        // Answers: what wallets need attention, what confirms are pending,
+        // what capabilities are active/expired/orphaned, what risk data is stale.
+        let next_keystore = keystore.clone();
+        let next_tx_engine = tx_engine.clone();
+        let next_hl = hyperliquid_handler.clone();
+        let next_renderer: Arc<dyn Fn() -> Vec<u8> + Send + Sync> = Arc::new(move || {
+            let mut md = String::from("# Next Actions\n\n");
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+
+            // 1. Unsigned-policy passkey wallets
+            let mut unsigned = Vec::new();
+            if let Ok(infos) = next_keystore.list() {
+                for info in &infos {
+                    let status = next_keystore.policy_status(&info.name).unwrap_or(
+                        bloom_keystore::PolicyStatus::NotApplicable,
+                    );
+                    if status == bloom_keystore::PolicyStatus::Unsigned
+                        || status == bloom_keystore::PolicyStatus::Stale
+                    {
+                        unsigned.push(format!(
+                            "- `{}`: policy is **{:?}** — run `bloom wallet sign-policy {}` to enable agent trading",
+                            info.name, status, info.name
+                        ));
+                    }
                 }
-            };
-            let mut mainnet = HyperliquidClient::new(HyperliquidNetwork::Mainnet);
-            if let Some(u) = hl_url(&hl_cfg.mainnet_url) {
-                mainnet = mainnet.with_base_url(u);
             }
-            let mut testnet = HyperliquidClient::new(HyperliquidNetwork::Testnet);
-            if let Some(u) = hl_url(&hl_cfg.testnet_url) {
-                testnet = testnet.with_base_url(u);
+            if !unsigned.is_empty() {
+                md.push_str("## Unsigned Policies\n\n");
+                for u in &unsigned {
+                    md.push_str(u);
+                    md.push('\n');
+                }
+                md.push('\n');
             }
-            debug!("daemon.hyperliquid_mounted");
-            let handler = Arc::new(
-                HyperliquidHandler::new(mainnet, testnet, keystore.clone())
-                    .with_store_root(home.root().join("hyperliquid")),
-            );
-            handler.clone().start_monitoring();
-            vfs_builder = vfs_builder.mount("hyperliquid", handler as _);
-        } else {
-            debug!("daemon.hyperliquid_skipped: no [hyperliquid] config");
-        }
+
+            // 2. Pending outbox confirms
+            let mut pending_confirms = Vec::new();
+            if let Ok(infos) = next_keystore.list() {
+                for info in &infos {
+                    let sessions = next_tx_engine.session_store().active(now_ms);
+                    let has_session = sessions.iter().any(|s| s.wallet == info.name);
+                    if has_session {
+                        for s in &sessions {
+                            if s.wallet != info.name {
+                                continue;
+                            }
+                            if s.expires_ms > now_ms {
+                                pending_confirms.push(format!(
+                                    "- `{}`: {} pending tx ids, session `{}` active (expires in {}s)",
+                                    info.name,
+                                    s.allowed_pending_ids.len(),
+                                    s.id,
+                                    ((s.expires_ms - now_ms) / 1000)
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            if !pending_confirms.is_empty() {
+                md.push_str("## Pending Outbox Confirms\n\n");
+                for p in &pending_confirms {
+                    md.push_str(p);
+                    md.push('\n');
+                }
+                md.push('\n');
+            }
+
+            // 3. Capability status (HL sessions)
+            if let Some(ref hl) = next_hl {
+                let mut expired = Vec::new();
+                let mut orphaned = Vec::new();
+                let mut stale = Vec::new();
+                if let Ok(infos) = next_keystore.list() {
+                    for info in &infos {
+                        let views = hl.capability_views_for(&info.name);
+                        for v in &views {
+                            match v.status {
+                                bloom_proto::CapabilityStatus::Expired => {
+                                    expired.push(format!("- `{}` session `{}`: **expired** — no new orders accepted", info.name, v.id));
+                                }
+                                bloom_proto::CapabilityStatus::Orphaned => {
+                                    orphaned.push(format!(
+                                        "- `{}` session `{}`: **orphaned** — daemon lost the agent key after restart. Owner must recover via `orphan_cancel_all` or `orphan_close_all` at `{}`",
+                                        info.name, v.id, v.revoke_path
+                                    ));
+                                }
+                                bloom_proto::CapabilityStatus::Active => {
+                                    if let Some(secs) = v.expires_in_secs {
+                                        if secs < 300 {
+                                            stale.push(format!("- `{}` session `{}`: expiring in {}s", info.name, v.id, secs));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                if !expired.is_empty() {
+                    md.push_str("## Expired Sessions\n\n");
+                    for e in &expired {
+                        md.push_str(e);
+                        md.push('\n');
+                    }
+                    md.push('\n');
+                }
+                if !orphaned.is_empty() {
+                    md.push_str("## Orphaned Sessions (Needs Owner)\n\n");
+                    for o in &orphaned {
+                        md.push_str(o);
+                        md.push('\n');
+                    }
+                    md.push('\n');
+                }
+                if !stale.is_empty() {
+                    md.push_str("## Expiring Soon\n\n");
+                    for s in &stale {
+                        md.push_str(s);
+                        md.push('\n');
+                    }
+                    md.push('\n');
+                }
+            }
+
+            if unsigned.is_empty() && pending_confirms.is_empty() && next_hl.is_none() {
+                md.push_str("No wallets with pending actions.\n\n");
+                md.push_str("All policies are signed, no outbox confirms await review, and no Hyperliquid sessions are active.\n");
+            }
+            md.into_bytes()
+        });
+        vfs_builder = vfs_builder.with_root_dynamic("next.md", next_renderer);
 
         let vfs = vfs_builder
             .with_audit(audit_arc.clone())

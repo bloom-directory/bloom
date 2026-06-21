@@ -444,7 +444,7 @@ impl IpcServer {
             let policy_digest = blake3::hash(policy_toml.as_bytes()).to_hex().to_string();
             let mut intent =
                 CeremonyIntent::new(wallet, "Sign Wallet Policy", CeremonyIntentKind::SignPolicy);
-            intent.wallet_address = address;
+            intent.wallet_address = address.clone();
             intent.summary_lines = vec![
                 format!("Review rules for wallet '{wallet}'."),
                 "This does not move money or place a trade.".into(),
@@ -463,15 +463,49 @@ impl IpcServer {
                 "policy_path": policy_path,
                 "policy_blake3": policy_digest,
             });
-            if let Ok(bytes) = serde_json::to_vec_pretty(&intent) {
+            keystore.lock(wallet);
+            let reviewed_policy = keystore
+                .unlock_passkey_with_intent_and_policy_edit(
+                    wallet,
+                    Some(intent),
+                    Some(policy_toml.clone()),
+                )
+                .await
+                .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?;
+            let final_policy = reviewed_policy.unwrap_or(policy_toml);
+            toml::from_str::<bloom_proto::Policy>(&final_policy)
+                .map_err(|e| HandlerError::backend(format!("reviewed policy.toml: {e}")))?;
+            if final_policy != std::fs::read_to_string(&policy_path).unwrap_or_default() {
+                std::fs::write(&policy_path, final_policy.as_bytes())
+                    .map_err(|e| HandlerError::backend(format!("write policy.toml: {e}")))?;
+            }
+            let final_digest = blake3::hash(final_policy.as_bytes()).to_hex().to_string();
+            let mut reviewed_intent =
+                CeremonyIntent::new(wallet, "Sign Wallet Policy", CeremonyIntentKind::SignPolicy);
+            reviewed_intent.wallet_address = address;
+            reviewed_intent.summary_lines = vec![
+                format!("Review rules for wallet '{wallet}'."),
+                "This does not move money or place a trade.".into(),
+                "After approval, Bloom uses these rules to decide what is allowed.".into(),
+                format!("Policy digest: {final_digest}"),
+            ];
+            reviewed_intent.policy_lines = final_policy.lines().map(str::to_string).collect();
+            reviewed_intent.risk_lines = vec![
+                "Approving these rules can change what Bloom allows later.".into(),
+                "The OS passkey prompt only proves your presence; review the details on this page."
+                    .into(),
+            ];
+            reviewed_intent.artifact_paths = vec![policy_path.display().to_string()];
+            reviewed_intent.canonical_subject = serde_json::json!({
+                "kind": "sign_policy",
+                "wallet": wallet,
+                "policy_path": policy_path,
+                "policy_blake3": final_digest,
+            });
+            if let Ok(bytes) = serde_json::to_vec_pretty(&reviewed_intent) {
                 let review_path = wallet_dir.join("policy.review.json");
                 let _ = std::fs::write(&review_path, bytes);
             }
-            keystore.lock(wallet);
-            keystore
-                .unlock_passkey_with_intent(wallet, Some(intent))
-                .await
-                .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?;
         }
         keystore
             .sign_policy(wallet)
