@@ -152,7 +152,9 @@ pub fn provision_network(parent: &Path, count: usize) -> Result<Vec<ChainNodeCon
         .with_context(|| format!("create parent dir {}", parent.display()))?;
 
     let bin = bloom_bin();
+    let cli_home = parent.join(".bloom-home");
     let out = StdCommand::new(&bin)
+        .env("BLOOM_HOME", &cli_home)
         .arg("chain")
         .arg("testnet")
         .arg("--validators")

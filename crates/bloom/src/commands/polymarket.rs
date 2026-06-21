@@ -1771,6 +1771,7 @@ pub async fn fund(d: &Daemon, args: FundArgs) -> Result<()> {
                 gas: GasStrategy::Auto,
                 nonce: None,
                 gas_limit_hint: None,
+                usd_value_hint: None,
             });
         }
     }
@@ -1784,6 +1785,7 @@ pub async fn fund(d: &Daemon, args: FundArgs) -> Result<()> {
         gas: GasStrategy::Auto,
         nonce: None,
         gas_limit_hint: route.gas.as_deref().and_then(|g| g.parse().ok()),
+        usd_value_hint: None,
     });
 
     // Any bail after staging MUST discard the staged entries: pending outbox
@@ -2038,6 +2040,7 @@ async fn transfer_pusd_to_funding(
         gas: GasStrategy::Auto,
         nonce: None,
         gas_limit_hint: None,
+        usd_value_hint: Some(units::format_units(U256::from(missing_micro), 6)),
     };
     let staged = match d
         .tx_engine

@@ -1056,17 +1056,20 @@ impl TxEngine {
         let needs_usd = policy.caps.per_tx_usd.is_some()
             || policy.caps.require_confirm_above_usd.is_some()
             || policy.caps.per_day_usd.is_some();
-        policy_ctx.usd_value = if needs_usd && value_wei > U256::ZERO {
-            if let Some(oracle) = &self.price_oracle {
+        policy_ctx.usd_value = intent
+            .usd_value_hint
+            .as_deref()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0);
+        if policy_ctx.usd_value.is_none() && needs_usd && value_wei > U256::ZERO {
+            policy_ctx.usd_value = if let Some(oracle) = &self.price_oracle {
                 oracle
                     .native_usd(&spec.name, value_wei, spec.native_decimals)
                     .await
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
+        }
         // Trailing 24h USD spend across all chains for this wallet.
         // Only consulted when the policy actually has a per_day cap;
         // we still set it whenever a USD rule fires so plan.md / audit

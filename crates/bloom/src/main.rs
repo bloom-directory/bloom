@@ -26,7 +26,7 @@ use bloom_daemon::Daemon;
 use bloom_daemon::ipc::{IpcClient, IpcServer, default_socket_path};
 use bloom_hyperliquid::{
     CancelWire, ExchangeAction, Grouping, HyperliquidClient, HyperliquidNetwork, HyperliquidSigner,
-    LimitOrderType, OrderTypeWire, OrderWire, SignSubmit, TimeInForce, pretty_json,
+    LimitOrderType, OrderTypeWire, OrderWire, SignSubmit, TimeInForce, UsdSendRequest, pretty_json,
     sign_submit_payload,
 };
 use bloom_proto::{CeremonyIntent, CeremonyIntentKind, HomeDir, HomeWritePermit};
@@ -620,6 +620,17 @@ enum HyperliquidCmd {
         coin: String,
         #[arg(long, default_value = "mainnet")]
         network: String,
+    },
+    /// Transfer USDC internally between Hyperliquid accounts (usdSend, owner-signed).
+    /// Requires transfer_cap_usd in the wallet [hyperliquid] policy.
+    SendAsset {
+        wallet: String,
+        destination: String,
+        amount: String,
+        #[arg(long, default_value = "mainnet")]
+        network: String,
+        #[arg(long, env = "BLOOM_PASSPHRASE", hide = true)]
+        passphrase: Option<String>,
     },
     /// Unlock once, place a far-away post-only perp order, then cancel it if it rests.
     TestPostOnlyCancel {
@@ -2770,6 +2781,29 @@ async fn handle_hyperliquid(home: HomeDir, cmd: HyperliquidCmd) -> Result<()> {
             print_hl_info(&home, &network, body).await
         }
         HyperliquidCmd::Session { command } => handle_hl_session(home, command).await,
+        HyperliquidCmd::SendAsset {
+            wallet,
+            destination,
+            amount,
+            network,
+            passphrase,
+        } => {
+            let path = format!("/hyperliquid/{network}/exchange/{wallet}/send_asset.json");
+            let body = serde_json::to_vec(&UsdSendRequest {
+                destination,
+                amount,
+                nonce: None,
+            })?;
+            hl_session_ipc_write_unlocked(&home, &path, body, &wallet, passphrase.as_deref())
+                .await?;
+            let last_response =
+                format!("/hyperliquid/{network}/exchange/{wallet}/last_response.json");
+            match hl_session_ipc_read(&home, &last_response).await {
+                Ok(bytes) => std::io::Write::write_all(&mut std::io::stdout(), &bytes)?,
+                Err(_) => println!("usdSend submitted"),
+            }
+            Ok(())
+        }
         HyperliquidCmd::TestReads {
             user,
             coin,

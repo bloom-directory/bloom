@@ -9,8 +9,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bloom_hyperliquid::{
     CancelWire, ExchangeAction, Grouping, HyperliquidClient, HyperliquidNetwork, HyperliquidSigner,
-    LimitOrderType, OrderTypeWire, OrderWire, SignSubmit, SignedSubmit, TimeInForce, parse_address,
-    pretty_json, sign_submit_payload, signed_payload, user_signed_payload,
+    LimitOrderType, OrderTypeWire, OrderWire, SignSubmit, SignedSubmit, TimeInForce,
+    UsdSendRequest, parse_address, pretty_json, sign_submit_payload, signed_payload,
+    user_signed_payload,
 };
 use bloom_keystore::{Keystore, ephemeral::EphemeralAgentKey};
 use bloom_proto::hyperliquid_policy::HyperliquidPolicy;
@@ -46,12 +47,13 @@ const USER_FILES: [&str; 8] = [
     "rate_limit.json",
     "extra_agents.json",
 ];
-const EXCHANGE_WRITE_FILES: [&str; 5] = [
+const EXCHANGE_WRITE_FILES: [&str; 6] = [
     "order.json",
     "cancel.json",
     "schedule_cancel.json",
     "update_leverage.json",
     "raw_signed.json",
+    "send_asset.json",
 ];
 const EXCHANGE_READ_FILES: [&str; 1] = ["last_response.json"];
 const SESSION_ROOT_FILES: [&str; 1] = ["new.json"];
@@ -102,6 +104,7 @@ Signed writes:
 - /hyperliquid/<network>/exchange/<wallet>/schedule_cancel.json
 - /hyperliquid/<network>/exchange/<wallet>/update_leverage.json
 - /hyperliquid/<network>/exchange/<wallet>/raw_signed.json
+- /hyperliquid/<network>/exchange/<wallet>/send_asset.json  (usdSend: internal USDC transfer, owner-signed)
 
 Agent sessions:
 - /hyperliquid/<network>/agent_sessions/<wallet>/new.json
@@ -232,8 +235,8 @@ impl HyperliquidHandler {
     pub fn capability_views_for(&self, wallet: &str) -> Vec<CapabilityViewEntry> {
         let sessions = self.sessions.lock();
         sessions
-            .iter()
-            .filter_map(|(_, guard)| {
+            .values()
+            .filter_map(|guard| {
                 let active = guard.lock();
                 if active.wallet != wallet {
                     return None;
@@ -1577,6 +1580,67 @@ impl HyperliquidHandler {
         Ok(())
     }
 
+    /// Sign and submit a `usdSend` (internal USDC transfer) using the **owner**
+    /// wallet key — user-signed EIP-712, not an L1 action. Agent session keys
+    /// cannot authorize `usdSend` on the Hyperliquid side.
+    async fn submit_usd_send(
+        &self,
+        client: &HyperliquidClient,
+        network: HyperliquidNetwork,
+        network_name: &str,
+        wallet: &str,
+        req: UsdSendRequest,
+    ) -> Result<(), HandlerError> {
+        use bloom_proto::{HyperliquidActionCtx, HyperliquidPolicy};
+        let dest = parse_address(&req.destination).map_err(err_invalid)?;
+        // Parse amount to micro-USD for the policy cap comparison.
+        let amount_micro = req
+            .amount
+            .parse::<f64>()
+            .map(|f| (f * 1_000_000.0) as u64)
+            .ok();
+        let policy: HyperliquidPolicy = self
+            .keystore
+            .info(wallet)
+            .map_err(|e| HandlerError::backend(e.to_string()))?
+            .policy
+            .hyperliquid;
+        if !policy.is_configured() {
+            return Err(HandlerError::invalid(
+                "usdSend requires a configured [hyperliquid] policy block with transfer_cap_usd",
+            ));
+        }
+        let ctx = HyperliquidActionCtx {
+            wallet: wallet.to_string(),
+            action_kind: "usdSend".to_string(),
+            notional_microusd: amount_micro,
+            snapshot_readable: true,
+            ..Default::default()
+        };
+        use bloom_proto::{PolicyOutcome, evaluate_hyperliquid_action};
+        let checks = evaluate_hyperliquid_action(&policy, &ctx);
+        if let Some(deny) = checks.iter().find(|c| c.outcome == PolicyOutcome::Deny) {
+            return Err(HandlerError::invalid(format!(
+                "Hyperliquid policy denied [{}]: {}",
+                deny.rule, deny.message
+            )));
+        }
+        let signer = self.keystore.signer(wallet).map_err(|e| {
+            HandlerError::PermissionDenied
+                .with_context(format!("wallet '{wallet}' is locked or unavailable: {e}"))
+        })?;
+        let signer = HyperliquidSigner::new(signer);
+        let nonce = req.nonce.unwrap_or_else(bloom_hyperliquid::now_ms);
+        let (action, signature) = signer
+            .sign_usd_send(network, dest, &req.amount, nonce)
+            .await
+            .map_err(err_be)?;
+        let payload = user_signed_payload(action, nonce, signature);
+        let response = client.exchange(payload).await.map_err(err_be)?;
+        self.persist_response(network_name, wallet, "send_asset.json", &response)?;
+        Ok(())
+    }
+
     /// Evaluate the wallet's verified `[hyperliquid]` policy against an exchange
     /// action before signing. Denies on any hard violation. Snapshot-derived
     /// caps (position/loss) fetch live clearinghouse state only when configured,
@@ -2690,6 +2754,12 @@ impl Handler for HyperliquidHandler {
                 self.persist_response(network_raw, wallet, file, &response)?;
                 Ok(())
             }
+            "send_asset.json" => {
+                let req: UsdSendRequest = serde_json::from_slice(data)
+                    .map_err(|e| HandlerError::invalid(format!("request json: {e}")))?;
+                self.submit_usd_send(client, network, network_raw, wallet, req)
+                    .await
+            }
             _ => Err(HandlerError::PermissionDenied),
         }
     }
@@ -3256,6 +3326,15 @@ fn format_hl_close_price(value: f64) -> Result<String, HandlerError> {
 
 fn exchange_hint(file: &str) -> Vec<u8> {
     let value = match file {
+        "send_asset.json" => json!({
+            "description": "internal USDC transfer (usdSend): owner-signed EIP-712, requires transfer_cap_usd in [hyperliquid] policy",
+            "required": ["destination", "amount"],
+            "optional": ["nonce"],
+            "example": {
+                "destination": "0x0000000000000000000000000000000000000000",
+                "amount": "100"
+            }
+        }),
         "raw_signed.json" => json!({
             "description": "write a fully signed Hyperliquid exchange payload; Bloom rejects malformed request bodies, validates the typed action against policy, then validates nested statuses",
             "required": ["action", "nonce", "signature"],

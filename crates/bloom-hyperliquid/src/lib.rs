@@ -265,6 +265,36 @@ impl HyperliquidSigner {
         Ok(SignatureJson::from_signature(&sig))
     }
 
+    /// Sign a Hyperliquid **`usdSend`** (internal USDC transfer) — user-signed
+    /// EIP-712, same `HyperliquidSignTransaction` domain as `approveAgent`
+    /// (chainId = Arbitrum). Owner-only: agent keys cannot authorize transfers.
+    pub async fn sign_usd_send(
+        &self,
+        network: HyperliquidNetwork,
+        destination: Address,
+        amount: &str,
+        nonce: u64,
+    ) -> Result<(Value, SignatureJson)> {
+        let typed = usd_send_typed_data(network, destination, amount, nonce)?;
+        let hash = typed
+            .eip712_signing_hash()
+            .map_err(|e| HyperliquidError::signing(format!("eip712: {e}")))?;
+        let sig = self
+            .signer
+            .sign_hash(&hash)
+            .await
+            .map_err(|e| HyperliquidError::signing(e.to_string()))?;
+        let action = json!({
+            "type": "usdSend",
+            "hyperliquidChain": network.chain_name(),
+            "signatureChainId": format!("0x{:x}", network.signature_chain_id()),
+            "destination": format!("{destination:#x}"),
+            "amount": amount,
+            "time": nonce,
+        });
+        Ok((action, SignatureJson::from_signature(&sig)))
+    }
+
     /// Sign a Hyperliquid **`approveAgent`** action — a *user-signed* EIP-712
     /// action (domain `HyperliquidSignTransaction`), distinct from the L1
     /// order/cancel scheme in [`Self::sign_l1_action`]. One owner signature
@@ -342,6 +372,56 @@ fn approve_agent_typed_data(
 /// signature}` (no `vaultAddress`, unlike L1 submits).
 pub fn user_signed_payload(action: Value, nonce: u64, signature: SignatureJson) -> Value {
     json!({ "action": action, "nonce": nonce, "signature": signature })
+}
+
+/// Request body for writing to `send_asset.json` / `usdSend`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsdSendRequest {
+    /// Destination address (0x-prefixed 42-char hex).
+    pub destination: String,
+    /// Transfer amount as a plain USD decimal string, e.g. `"100"` or `"50.5"`.
+    pub amount: String,
+    /// Optional ms-timestamp nonce. Generated from `now_ms()` if absent.
+    #[serde(default)]
+    pub nonce: Option<u64>,
+}
+
+fn usd_send_typed_data(
+    network: HyperliquidNetwork,
+    destination: Address,
+    amount: &str,
+    nonce: u64,
+) -> Result<TypedData> {
+    let value = json!({
+        "types": {
+            "EIP712Domain": [
+                {"name": "name", "type": "string"},
+                {"name": "version", "type": "string"},
+                {"name": "chainId", "type": "uint256"},
+                {"name": "verifyingContract", "type": "address"}
+            ],
+            "HyperliquidTransaction:UsdSend": [
+                {"name": "hyperliquidChain", "type": "string"},
+                {"name": "destination", "type": "string"},
+                {"name": "amount", "type": "string"},
+                {"name": "time", "type": "uint64"}
+            ]
+        },
+        "primaryType": "HyperliquidTransaction:UsdSend",
+        "domain": {
+            "name": "HyperliquidSignTransaction",
+            "version": "1",
+            "chainId": network.signature_chain_id(),
+            "verifyingContract": "0x0000000000000000000000000000000000000000"
+        },
+        "message": {
+            "hyperliquidChain": network.chain_name(),
+            "destination": format!("{destination:#x}"),
+            "amount": amount,
+            "time": nonce
+        }
+    });
+    serde_json::from_value(value).map_err(HyperliquidError::Json)
 }
 
 fn agent_typed_data(network: HyperliquidNetwork, connection_id: B256) -> Result<TypedData> {
@@ -791,6 +871,42 @@ mod tests {
             grouping: Grouping::Na,
             builder: None,
         }
+    }
+
+    #[tokio::test]
+    async fn usd_send_signs_user_action_and_recovers_owner() {
+        let pk = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let owner: PrivateKeySigner = pk.parse().unwrap();
+        let owner_addr = owner.address();
+        let signer = HyperliquidSigner::new(Arc::new(owner));
+        let dest: Address = "0x000000000000000000000000000000000000dead"
+            .parse()
+            .unwrap();
+        let nonce = 1_700_000_001_000u64;
+
+        let (action, sig) = signer
+            .sign_usd_send(HyperliquidNetwork::Mainnet, dest, "100", nonce)
+            .await
+            .unwrap();
+
+        assert_eq!(action["type"], "usdSend");
+        assert_eq!(action["hyperliquidChain"], "Mainnet");
+        assert_eq!(action["signatureChainId"], "0xa4b1");
+        assert_eq!(
+            action["destination"],
+            "0x000000000000000000000000000000000000dead"
+        );
+        assert_eq!(action["amount"], "100");
+        assert_eq!(action["time"], nonce);
+
+        let typed = usd_send_typed_data(HyperliquidNetwork::Mainnet, dest, "100", nonce).unwrap();
+        let hash = typed.eip712_signing_hash().unwrap();
+        let recovered = format!("0x{}{}{:02x}", &sig.r[2..], &sig.s[2..], sig.v)
+            .parse::<Signature>()
+            .unwrap()
+            .recover_address_from_prehash(&hash)
+            .unwrap();
+        assert_eq!(recovered, owner_addr);
     }
 
     #[tokio::test]

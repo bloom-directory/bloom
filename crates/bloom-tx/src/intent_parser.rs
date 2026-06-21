@@ -160,6 +160,7 @@ impl LooseIntent {
             gas,
             nonce: self.nonce,
             gas_limit_hint: None,
+            usd_value_hint: None,
         })
     }
 }
@@ -200,6 +201,7 @@ pub fn parse(input: &str) -> Result<RawIntent, ParseError> {
             },
             nonce: None,
             gas_limit_hint: None,
+            usd_value_hint: None,
         });
     }
     if s.starts_with("nft ") {
@@ -321,6 +323,7 @@ fn parse_nft_shell(line: &str) -> Result<RawIntent, ParseError> {
         gas: bloom_proto::GasStrategy::Auto,
         nonce: None,
         gas_limit_hint: None,
+        usd_value_hint: None,
     })
 }
 

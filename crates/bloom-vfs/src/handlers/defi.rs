@@ -697,6 +697,7 @@ impl DefiHandler {
             gas: GasStrategy::Auto,
             nonce: None,
             gas_limit_hint: None,
+            usd_value_hint: None,
         };
         let staged = self
             .tx_engine
@@ -798,9 +799,11 @@ impl DefiHandler {
                     gas: GasStrategy::Auto,
                     nonce: None,
                     gas_limit_hint: None,
+                    usd_value_hint: None,
                 });
             }
         }
+        let route_usd_value_hint = route_usd_value_hint(&req, &route);
         intents.push(RawIntent {
             body: RawIntentBody::Raw {
                 to: checksum_address(&route.tx.to),
@@ -811,6 +814,7 @@ impl DefiHandler {
             gas: GasStrategy::Auto,
             nonce: None,
             gas_limit_hint: route.gas.as_deref().and_then(|g| g.parse().ok()),
+            usd_value_hint: route_usd_value_hint,
         });
 
         // Evaluate `[defi]` route policy for display + review (the hard gate
@@ -1516,6 +1520,27 @@ fn decimals_for_symbol(chain_id: u64, sym: &str) -> u8 {
         .unwrap_or(18)
 }
 
+fn route_usd_value_hint(req: &RouteRequest, route: &RouteResponse) -> Option<String> {
+    let out_chain = req.destination_chain_id.unwrap_or(req.chain_id);
+    let token = bloom_proto::tokens::for_chain(out_chain).iter().find(|t| {
+        t.address
+            .eq_ignore_ascii_case(&format!("0x{:x}", req.token_out))
+            && matches!(t.symbol, "USDC" | "USDT" | "DAI")
+    })?;
+    let raw = route.amount_out.parse::<U256>().ok()?;
+    let human = format_units(raw, token.decimals);
+    if human
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite())
+        .is_some()
+    {
+        Some(human)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RouteTokenDisplay {
     token_in: TokenDisplay,
@@ -1834,6 +1859,7 @@ mod tests {
             gas: GasStrategy::Auto,
             nonce: None,
             gas_limit_hint: None,
+            usd_value_hint: None,
         }];
         let now = now_ms();
         DefiSession {
@@ -1962,6 +1988,69 @@ mod tests {
     }
 
     #[test]
+    fn route_usd_value_hint_uses_stablecoin_output() {
+        let usdc = resolve_token_symbol(8453, "USDC").unwrap();
+        let req = RouteRequest {
+            from_address: Address::ZERO,
+            chain_id: 137,
+            destination_chain_id: Some(8453),
+            token_in: NATIVE_TOKEN_ADDR,
+            token_out: usdc,
+            amount_in: U256::from(94_000_000_000_000_000_000u128),
+            slippage_bps: 100,
+            routing_strategy: Some(RoutingStrategy::Router),
+            receiver: Some(Address::ZERO),
+        };
+        let route = RouteResponse {
+            tx: bloom_defi::RouteTx {
+                from: Address::ZERO,
+                to: Address::ZERO,
+                data: Default::default(),
+                value: req.amount_in,
+            },
+            amount_out: "7619717".into(),
+            gas: None,
+            route: serde_json::Value::Null,
+            price_impact: None,
+            destination_chain_id: Some(8453),
+        };
+        assert_eq!(
+            route_usd_value_hint(&req, &route).as_deref(),
+            Some("7.619717")
+        );
+    }
+
+    #[test]
+    fn route_usd_value_hint_ignores_non_stable_output() {
+        let weth = resolve_token_symbol(8453, "WETH").unwrap();
+        let req = RouteRequest {
+            from_address: Address::ZERO,
+            chain_id: 137,
+            destination_chain_id: Some(8453),
+            token_in: NATIVE_TOKEN_ADDR,
+            token_out: weth,
+            amount_in: U256::from(1u64),
+            slippage_bps: 50,
+            routing_strategy: Some(RoutingStrategy::Router),
+            receiver: None,
+        };
+        let route = RouteResponse {
+            tx: bloom_defi::RouteTx {
+                from: Address::ZERO,
+                to: Address::ZERO,
+                data: Default::default(),
+                value: U256::ZERO,
+            },
+            amount_out: "1".into(),
+            gas: None,
+            route: serde_json::Value::Null,
+            price_impact: None,
+            destination_chain_id: Some(8453),
+        };
+        assert!(route_usd_value_hint(&req, &route).is_none());
+    }
+
+    #[test]
     fn render_plan_md_includes_key_fields() {
         let req = RouteRequest {
             from_address: Address::ZERO,
@@ -1997,6 +2086,7 @@ mod tests {
             gas: GasStrategy::Auto,
             nonce: None,
             gas_limit_hint: None,
+            usd_value_hint: None,
         }];
         let ctx = test_route_ctx(&req, &route);
         let checks = bloom_proto::evaluate_defi_route(&bloom_proto::DefiPolicy::default(), &ctx);
@@ -2064,6 +2154,7 @@ mod tests {
                 gas: GasStrategy::Auto,
                 nonce: None,
                 gas_limit_hint: None,
+                usd_value_hint: None,
             },
             RawIntent {
                 body: RawIntentBody::Raw {
@@ -2075,6 +2166,7 @@ mod tests {
                 gas: GasStrategy::Auto,
                 nonce: None,
                 gas_limit_hint: None,
+                usd_value_hint: None,
             },
         ];
         let ctx = test_route_ctx(&req, &route);

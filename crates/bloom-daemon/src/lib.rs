@@ -717,9 +717,9 @@ impl Daemon {
             let mut unsigned = Vec::new();
             if let Ok(infos) = next_keystore.list() {
                 for info in &infos {
-                    let status = next_keystore.policy_status(&info.name).unwrap_or(
-                        bloom_keystore::PolicyStatus::NotApplicable,
-                    );
+                    let status = next_keystore
+                        .policy_status(&info.name)
+                        .unwrap_or(bloom_keystore::PolicyStatus::NotApplicable);
                     if status == bloom_keystore::PolicyStatus::Unsigned
                         || status == bloom_keystore::PolicyStatus::Stale
                     {
@@ -783,7 +783,10 @@ impl Daemon {
                         for v in &views {
                             match v.status {
                                 bloom_proto::CapabilityStatus::Expired => {
-                                    expired.push(format!("- `{}` session `{}`: **expired** — no new orders accepted", info.name, v.id));
+                                    expired.push(format!(
+                                        "- `{}` session `{}`: **expired** — no new orders accepted",
+                                        info.name, v.id
+                                    ));
                                 }
                                 bloom_proto::CapabilityStatus::Orphaned => {
                                     orphaned.push(format!(
@@ -792,10 +795,13 @@ impl Daemon {
                                     ));
                                 }
                                 bloom_proto::CapabilityStatus::Active => {
-                                    if let Some(secs) = v.expires_in_secs {
-                                        if secs < 300 {
-                                            stale.push(format!("- `{}` session `{}`: expiring in {}s", info.name, v.id, secs));
-                                        }
+                                    if let Some(secs) = v.expires_in_secs
+                                        && secs < 300
+                                    {
+                                        stale.push(format!(
+                                            "- `{}` session `{}`: expiring in {}s",
+                                            info.name, v.id, secs
+                                        ));
                                     }
                                 }
                                 _ => {}

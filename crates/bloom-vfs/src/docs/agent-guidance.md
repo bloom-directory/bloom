@@ -47,6 +47,60 @@ Read `/hyperliquid/README.md` for Hyperliquid trading (session-first).
 Read `/polymarket/README.md` for prediction-market trading.
 Read `/defi/README.md` for DeFi intents via Enso shortcuts.
 
+## Paid HTTP
+
+Paid HTTP requests live under `/requests`. Agents should stage the request,
+read `plan.md`, and confirm only when the quoted cost, network, asset, and
+merchant match the task. Bloom handles x402 internally; agents should not look
+for a separate `/x402` path.
+
+Example paid search:
+
+```sh
+bloom vfs write /requests/new \
+  --data 'POST https://api.exa.ai/search wallet=<wallet> max_amount_usd=0.05
+content-type: application/json
+
+{"query":"latest Base USDC x402 developer tools","numResults":5,"type":"auto"}'
+
+bloom vfs cat /requests/latest/plan.md
+bloom vfs write /requests/latest/confirm --data confirm
+bloom vfs cat /requests/latest/response/body
+bloom vfs cat /requests/latest/receipt.json
+```
+
+Wallet-native paid endpoints that passed live checks:
+
+```sh
+# Pre-swap token safety for Base USDC + WETH.
+bloom vfs write /requests/new \
+  --data 'GET https://x402.fiasignals.com/token-safety/batch?chain=base&token_addresses=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913,0x4200000000000000000000000000000000000006 wallet=<wallet> max_amount_usd=0.05'
+
+# Hyperliquid trader score.
+bloom vfs write /requests/new \
+  --data 'POST https://graphadvocate.com/hyperliquid/score wallet=<wallet> max_amount_usd=0.03
+content-type: application/json
+
+{"user":"0x..."}'
+
+# Polymarket ghost-fill risk.
+bloom vfs write /requests/new \
+  --data 'POST https://graphadvocate.com/polymarket/risk wallet=<wallet> max_amount_usd=0.03
+content-type: application/json
+
+{"wallet":"0x..."}'
+
+# Onchain data routing to GraphQL or REST.
+bloom vfs write /requests/new \
+  --data 'POST https://graphadvocate.com/route wallet=<wallet> max_amount_usd=0.02
+content-type: application/json
+
+{"request":"Find the best subgraph for Uniswap V3 pools on Base and give me a ready GraphQL query for top pools by TVL"}'
+```
+
+Prefer request-local USD caps. If `plan.md` says policy is denied, do not retry
+blindly; inspect the wallet policy or ask the human to change it.
+
 ## Hyperliquid (session-first)
 
 Hyperliquid trading has two signing models:

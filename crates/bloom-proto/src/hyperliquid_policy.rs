@@ -238,10 +238,36 @@ pub fn evaluate_hyperliquid_action(
                 format!("action '{}' is recognized", ctx.action_kind),
             ));
         }
-        "withdraw" | "withdraw3" | "usdSend" | "spotSend" | "usdClassTransfer"
-        | "agentSendAsset" => {
-            // These don't exist in bloom-hyperliquid yet; when added they must
-            // map to withdrawal_cap_usd / transfer_cap_usd. Until then, deny.
+        "usdSend" => {
+            // Owner-signed internal USDC transfer. Requires transfer_cap_usd;
+            // no cap configured = deny (transfers are opt-in, not default-allow).
+            return match policy.transfer_cap_usd {
+                None => vec![check(
+                    "action",
+                    PolicyOutcome::Deny,
+                    "usdSend requires transfer_cap_usd in the wallet [hyperliquid] policy",
+                )],
+                Some(cap) => match ctx.notional_microusd {
+                    Some(amount) if amount > cap => vec![check(
+                        "transfer_cap_usd",
+                        PolicyOutcome::Deny,
+                        format!("transfer {} exceeds cap {}", fmt_usd(amount), fmt_usd(cap)),
+                    )],
+                    Some(amount) => vec![check(
+                        "transfer_cap_usd",
+                        PolicyOutcome::Pass,
+                        format!("transfer {} within cap {}", fmt_usd(amount), fmt_usd(cap)),
+                    )],
+                    None => vec![check(
+                        "transfer_cap_usd",
+                        PolicyOutcome::Deny,
+                        "transfer amount unknown; fail closed",
+                    )],
+                },
+            };
+        }
+        "withdraw" | "withdraw3" | "spotSend" | "usdClassTransfer" | "agentSendAsset" => {
+            // Not yet policy-enforced; deny until mapped.
             return vec![check(
                 "action",
                 PolicyOutcome::Deny,
@@ -507,11 +533,34 @@ mod tests {
     #[test]
     fn withdraw_transfer_kinds_default_deny() {
         let p = HyperliquidPolicy::default();
-        for kind in ["withdraw3", "usdSend", "spotSend", "usdClassTransfer"] {
+        for kind in ["withdraw3", "spotSend", "usdClassTransfer"] {
             let mut ctx = order_ctx("BTC");
             ctx.action_kind = kind.into();
             assert!(denied(&evaluate_hyperliquid_action(&p, &ctx)), "{kind}");
         }
+        // usdSend without transfer_cap_usd is also denied.
+        let mut ctx = order_ctx("BTC");
+        ctx.action_kind = "usdSend".into();
+        ctx.notional_microusd = Some(100 * MICRO_USD);
+        assert!(denied(&evaluate_hyperliquid_action(&p, &ctx)));
+    }
+
+    #[test]
+    fn usd_send_allowed_within_transfer_cap() {
+        let p = HyperliquidPolicy {
+            transfer_cap_usd: Some(200 * MICRO_USD),
+            ..Default::default()
+        };
+        let mut ctx = order_ctx("BTC");
+        ctx.action_kind = "usdSend".into();
+        ctx.notional_microusd = Some(100 * MICRO_USD);
+        assert!(!denied(&evaluate_hyperliquid_action(&p, &ctx)));
+
+        // Over the cap.
+        let mut ctx2 = order_ctx("BTC");
+        ctx2.action_kind = "usdSend".into();
+        ctx2.notional_microusd = Some(300 * MICRO_USD);
+        assert!(denied(&evaluate_hyperliquid_action(&p, &ctx2)));
     }
 
     #[test]

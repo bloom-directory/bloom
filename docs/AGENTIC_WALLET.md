@@ -99,6 +99,56 @@ content-type = "application/json"
 inline = '{"prompt":"summarize this document"}'
 ```
 
+Example: paid web search through Exa's x402 endpoint:
+
+```sh
+bloom vfs write /requests/new \
+  --data 'POST https://api.exa.ai/search wallet=research max_amount_usd=0.05
+content-type: application/json
+
+{"query":"latest Base USDC x402 developer tools","numResults":5,"type":"auto"}'
+
+bloom vfs cat /requests/latest/plan.md
+bloom vfs write /requests/latest/confirm --data confirm
+bloom vfs cat /requests/latest/response/body
+bloom vfs cat /requests/latest/receipt.json
+```
+
+Use a low `max_amount_usd` and read `plan.md` before confirmation. In a live
+test, Exa quoted and settled `$0.007` USDC on Base for one search request.
+
+Examples that passed live wallet-native checks:
+
+```sh
+# Pre-swap token safety for Base USDC + WETH. Live test: $0.03 USDC.
+bloom vfs write /requests/new \
+  --data 'GET https://x402.fiasignals.com/token-safety/batch?chain=base&token_addresses=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913,0x4200000000000000000000000000000000000006 wallet=research max_amount_usd=0.05'
+
+# Hyperliquid trader score. Live test: $0.02 USDC.
+bloom vfs write /requests/new \
+  --data 'POST https://graphadvocate.com/hyperliquid/score wallet=research max_amount_usd=0.03
+content-type: application/json
+
+{"user":"0x..."}'
+
+# Polymarket ghost-fill risk. Live test: $0.02 USDC.
+bloom vfs write /requests/new \
+  --data 'POST https://graphadvocate.com/polymarket/risk wallet=research max_amount_usd=0.03
+content-type: application/json
+
+{"wallet":"0x..."}'
+
+# Onchain data routing to GraphQL or REST. Live test: $0.01 USDC.
+bloom vfs write /requests/new \
+  --data 'POST https://graphadvocate.com/route wallet=research max_amount_usd=0.02
+content-type: application/json
+
+{"request":"Find the best subgraph for Uniswap V3 pools on Base and give me a ready GraphQL query for top pools by TVL"}'
+```
+
+These examples produce pre-trade risk checks, venue-specific wallet
+intelligence, or onchain data routes that can affect a wallet action.
+
 Paid requests are denied by default. Enable them in the paying wallet's
 `policy.toml`, and keep both global and request-local caps tight:
 

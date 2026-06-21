@@ -333,11 +333,7 @@ impl VfsBuilder {
         self
     }
 
-    pub fn with_root_dynamic(
-        mut self,
-        name: &str,
-        renderer: Arc<RootContentRenderer>,
-    ) -> Self {
+    pub fn with_root_dynamic(mut self, name: &str, renderer: Arc<RootContentRenderer>) -> Self {
         self.root_dynamic.insert(name.into(), renderer);
         self
     }
