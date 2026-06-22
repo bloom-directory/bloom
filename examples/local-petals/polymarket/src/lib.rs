@@ -5,6 +5,7 @@
 //! per-petal private `store_*` imports. It intentionally does not call the
 //! native `polymarket/` VFS handler.
 
+use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::Address;
@@ -27,6 +28,7 @@ use url::Url;
 const MAX_HTTP_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STORE_BYTES: usize = 1024 * 1024;
 const MAX_LIST_BYTES: usize = 256 * 1024;
+const MAX_POLICY_BYTES: usize = 256 * 1024;
 const MARKETS_LIST_LIMIT: u32 = 20;
 
 const GAMMA: &str = "https://gamma-api.polymarket.com";
@@ -685,26 +687,19 @@ fn write_trade_new(wallet: &str, body: &[u8]) -> DispatchResponse {
         book_snapshot_secs: now_secs(),
         status: "review".into(),
     };
+    let policy_check = match trade_policy_check(wallet, &draft) {
+        Ok(check) => check,
+        Err(resp) => return resp,
+    };
     let base = format!("trade/{wallet}/drafts/{id}");
     if let DispatchResponse::Error { .. } =
         store_put_json(&format!("{base}/order.json"), &draft, false)
     {
         return error(-4, "failed to store draft");
     }
-    if let DispatchResponse::Error { .. } = store_put_json(
-        &format!("{base}/policy_check.json"),
-        &serde_json::json!({
-            "status": "blocked",
-            "reason": "value-moving posting is disabled until policy, locking, receipt, and sell-preflight parity are ported",
-            "active": draft.active,
-            "closed": draft.closed,
-            "binary_outcomes": draft.binary_outcomes,
-            "order_book_enabled": draft.order_book_enabled,
-            "size_at_or_above_min": draft.size_micro >= draft.min_order_size_micro,
-            "signing_enabled": false
-        }),
-        false,
-    ) {
+    if let DispatchResponse::Error { .. } =
+        store_put_json(&format!("{base}/policy_check.json"), &policy_check, false)
+    {
         return error(-4, "failed to store policy check");
     }
     if let DispatchResponse::Error { .. } = store_put_json(
@@ -905,6 +900,334 @@ fn build_trade_quote(
     .map_err(polymarket_error)
 }
 
+fn trade_policy_check(
+    wallet: &str,
+    draft: &StoreTradeDraft,
+) -> Result<serde_json::Value, DispatchResponse> {
+    let policy = wallet_policy(wallet)?;
+    let (receipt_store_readable, daily_posted_microusd) = daily_posted_microusd(wallet);
+    let ctx = LocalPolymarketOrderCtx {
+        slug: draft.slug.clone(),
+        condition_id: draft.condition_id.clone(),
+        side: match draft.side {
+            Side::Buy => LocalPolicySide::Buy,
+            Side::Sell => LocalPolicySide::Sell,
+        },
+        amount_microusd: draft.amount_micro,
+        limit_price_micro: draft.limit_price_micro,
+        active: draft.active,
+        closed: draft.closed,
+        order_book_enabled: draft.order_book_enabled,
+        binary_outcomes: draft.binary_outcomes,
+        neg_risk: draft.neg_risk,
+        receipt_store_readable,
+        daily_posted_microusd,
+    };
+    let checks = evaluate_local_polymarket_order(&policy.polymarket, &ctx);
+    let deny = local_policy_has_deny(&checks);
+    let warn = local_policy_has_warn(&checks);
+    let policy_status = if deny {
+        "denied"
+    } else if warn {
+        "warn"
+    } else {
+        "passed"
+    };
+    Ok(serde_json::json!({
+        "status": "blocked",
+        "reason": "value-moving posting is disabled until policy, locking, receipt, and sell-preflight parity are ported",
+        "policy_status": policy_status,
+        "policy_deny": deny,
+        "policy_warn": warn,
+        "policy_checks": checks,
+        "receipt_store_readable": receipt_store_readable,
+        "daily_posted_microusd": daily_posted_microusd,
+        "receipt_audit_parity": false,
+        "active": draft.active,
+        "closed": draft.closed,
+        "binary_outcomes": draft.binary_outcomes,
+        "order_book_enabled": draft.order_book_enabled,
+        "size_at_or_above_min": draft.size_micro >= draft.min_order_size_micro,
+        "signing_enabled": false,
+        "posting_enabled": false
+    }))
+}
+
+fn wallet_policy(wallet: &str) -> Result<LocalWalletPolicy, DispatchResponse> {
+    let bytes =
+        bloom_petal_sdk::vfs_read(&format!("wallets/{wallet}/policy.toml"), MAX_POLICY_BYTES)
+            .map_err(sdk_error)?;
+    let raw = core::str::from_utf8(&bytes)
+        .map_err(|e| error(-4, format!("wallet policy is not utf-8: {e}")))?;
+    toml::from_str(raw).map_err(|e| error(-4, format!("wallet policy parse: {e}")))
+}
+
+fn daily_posted_microusd(wallet: &str) -> (bool, Option<u64>) {
+    let prefix = format!("trade/{wallet}/receipts/");
+    let keys = match bloom_petal_sdk::store_list(&prefix, MAX_LIST_BYTES) {
+        Ok(keys) => keys,
+        Err(_) => return (false, None),
+    };
+    let cutoff = now_millis().saturating_sub(24 * 60 * 60 * 1000);
+    let mut total = 0u64;
+    for key in keys {
+        if !key.ends_with("/receipt.json") {
+            continue;
+        }
+        let Some(bytes) = store_get(&key) else {
+            return (false, None);
+        };
+        let receipt: StoreTradeReceiptPolicy = match serde_json::from_slice(&bytes) {
+            Ok(receipt) => receipt,
+            Err(_) => return (false, None),
+        };
+        if receipt.posted_ms < cutoff || receipt.side != Side::Buy {
+            continue;
+        }
+        if matches!(receipt.clob_status.as_str(), "rejected" | "unmatched") {
+            continue;
+        }
+        total = total.saturating_add(receipt.amount_microusd);
+    }
+    (true, Some(total))
+}
+
+fn evaluate_local_polymarket_order(
+    policy: &LocalPolymarketPolicy,
+    ctx: &LocalPolymarketOrderCtx,
+) -> Vec<LocalPolicyCheck> {
+    let mut out = Vec::new();
+    if !policy.enabled {
+        out.push(local_policy_check(
+            "enabled",
+            LocalPolicyOutcome::Deny,
+            "Polymarket trading is disabled for this wallet; set [polymarket] enabled = true in the wallet policy to opt in",
+        ));
+    } else {
+        out.push(local_policy_check(
+            "enabled",
+            LocalPolicyOutcome::Pass,
+            "trading enabled",
+        ));
+    }
+
+    if ctx.closed || !ctx.active {
+        out.push(local_policy_check(
+            "market",
+            LocalPolicyOutcome::Deny,
+            format!(
+                "market is not tradable (active={}, closed={})",
+                ctx.active, ctx.closed
+            ),
+        ));
+    } else if !ctx.order_book_enabled {
+        out.push(local_policy_check(
+            "market",
+            LocalPolicyOutcome::Deny,
+            "market has no order book enabled",
+        ));
+    } else if !ctx.binary_outcomes {
+        out.push(local_policy_check(
+            "market",
+            LocalPolicyOutcome::Deny,
+            "market is malformed or not a binary YES/NO market",
+        ));
+    } else {
+        out.push(local_policy_check(
+            "market",
+            LocalPolicyOutcome::Pass,
+            "active, order book enabled, binary outcomes",
+        ));
+    }
+
+    out.push(local_policy_list_check(
+        "slug",
+        &ctx.slug,
+        &policy.allowed_slugs,
+        &policy.denied_slugs,
+    ));
+    out.push(local_policy_list_check(
+        "condition_id",
+        &ctx.condition_id,
+        &policy.allowed_condition_ids,
+        &policy.denied_condition_ids,
+    ));
+
+    if ctx.neg_risk && !policy.allow_neg_risk {
+        out.push(local_policy_check(
+            "neg_risk",
+            LocalPolicyOutcome::Deny,
+            "neg-risk markets are disabled by policy (allow_neg_risk = false)",
+        ));
+    } else {
+        out.push(local_policy_check(
+            "neg_risk",
+            LocalPolicyOutcome::Pass,
+            format!("neg_risk={} permitted", ctx.neg_risk),
+        ));
+    }
+
+    if ctx.side == LocalPolicySide::Sell {
+        out.push(local_policy_check(
+            "caps",
+            LocalPolicyOutcome::Pass,
+            "sell orders are risk-reducing; USD caps not applied",
+        ));
+        return out;
+    }
+
+    if let Some(cap) = policy.max_order_usd {
+        if ctx.amount_microusd > cap {
+            out.push(local_policy_check(
+                "max_order_usd",
+                LocalPolicyOutcome::Deny,
+                format!(
+                    "order {} USD exceeds max_order_usd {}",
+                    format_micro(ctx.amount_microusd),
+                    format_micro(cap)
+                ),
+            ));
+        } else {
+            out.push(local_policy_check(
+                "max_order_usd",
+                LocalPolicyOutcome::Pass,
+                format!(
+                    "{} <= {}",
+                    format_micro(ctx.amount_microusd),
+                    format_micro(cap)
+                ),
+            ));
+        }
+    }
+
+    if let Some(cap) = policy.max_daily_usd {
+        match (ctx.receipt_store_readable, ctx.daily_posted_microusd) {
+            (false, _) | (_, None) => out.push(local_policy_check(
+                "max_daily_usd",
+                LocalPolicyOutcome::Deny,
+                "daily cap configured but posted exposure is unknown (receipt store unreadable) - refusing rather than trading uncapped",
+            )),
+            (true, Some(daily)) => {
+                let total = daily.saturating_add(ctx.amount_microusd);
+                if total > cap {
+                    out.push(local_policy_check(
+                        "max_daily_usd",
+                        LocalPolicyOutcome::Deny,
+                        format!(
+                            "posted {} USD + order {} USD exceeds max_daily_usd {}",
+                            format_micro(daily),
+                            format_micro(ctx.amount_microusd),
+                            format_micro(cap)
+                        ),
+                    ));
+                } else {
+                    out.push(local_policy_check(
+                        "max_daily_usd",
+                        LocalPolicyOutcome::Pass,
+                        format!(
+                            "{} + {} <= {}",
+                            format_micro(daily),
+                            format_micro(ctx.amount_microusd),
+                            format_micro(cap)
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    if let Some(maxp) = policy.max_price {
+        if ctx.limit_price_micro > maxp {
+            out.push(local_policy_check(
+                "max_price",
+                LocalPolicyOutcome::Deny,
+                format!(
+                    "limit price {} exceeds policy max_price {}",
+                    format_micro(ctx.limit_price_micro),
+                    format_micro(maxp)
+                ),
+            ));
+        } else {
+            out.push(local_policy_check(
+                "max_price",
+                LocalPolicyOutcome::Pass,
+                format!(
+                    "{} <= {}",
+                    format_micro(ctx.limit_price_micro),
+                    format_micro(maxp)
+                ),
+            ));
+        }
+    }
+
+    if let Some(threshold) = policy.require_flag_above_usd
+        && ctx.amount_microusd > threshold
+    {
+        out.push(local_policy_check(
+            "require_flag_above_usd",
+            LocalPolicyOutcome::Warn,
+            format!(
+                "order {} USD is above {} - acknowledge before value-moving post",
+                format_micro(ctx.amount_microusd),
+                format_micro(threshold)
+            ),
+        ));
+    }
+
+    out
+}
+
+fn local_policy_check(
+    rule: &str,
+    outcome: LocalPolicyOutcome,
+    message: impl Into<String>,
+) -> LocalPolicyCheck {
+    LocalPolicyCheck {
+        rule: format!("polymarket.{rule}"),
+        outcome,
+        message: message.into(),
+    }
+}
+
+fn local_policy_list_check(
+    name: &str,
+    value: &str,
+    allowed: &BTreeSet<String>,
+    denied: &BTreeSet<String>,
+) -> LocalPolicyCheck {
+    if denied.contains(value) {
+        local_policy_check(
+            name,
+            LocalPolicyOutcome::Deny,
+            format!("'{value}' is denylisted"),
+        )
+    } else if !allowed.is_empty() && !allowed.contains(value) {
+        local_policy_check(
+            name,
+            LocalPolicyOutcome::Deny,
+            format!("'{value}' is not on the allowlist (allowlist-only mode)"),
+        )
+    } else {
+        local_policy_check(
+            name,
+            LocalPolicyOutcome::Pass,
+            format!("'{value}' permitted"),
+        )
+    }
+}
+
+fn local_policy_has_deny(checks: &[LocalPolicyCheck]) -> bool {
+    checks
+        .iter()
+        .any(|check| check.outcome == LocalPolicyOutcome::Deny)
+}
+
+fn local_policy_has_warn(checks: &[LocalPolicyCheck]) -> bool {
+    checks
+        .iter()
+        .any(|check| check.outcome == LocalPolicyOutcome::Warn)
+}
+
 fn parse_api_float_micro(value: f64, field: &str) -> Result<u64, DispatchResponse> {
     if !value.is_finite() || value < 0.0 {
         return Err(error(-4, format!("{field} is not a non-negative number")));
@@ -1050,6 +1373,19 @@ fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchRespon
     draft.best_bid_micro = snapshot.best_bid_micro;
     draft.book_snapshot_secs = now_secs();
     draft.status = "revalidated".into();
+    let policy_check = match trade_policy_check(wallet, &draft) {
+        Ok(check) => check,
+        Err(resp) => return resp,
+    };
+    let policy_deny = policy_check
+        .get("policy_deny")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    let policy_status = policy_check
+        .get("policy_status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
     if let DispatchResponse::Error { .. } = store_put_json(
         &format!("{base}/quote.json"),
         &serde_json::json!({
@@ -1080,21 +1416,23 @@ fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchRespon
     ) {
         return error(-4, "failed to store quote");
     }
-    if let DispatchResponse::Error { .. } = store_put_json(
-        &format!("{base}/policy_check.json"),
-        &serde_json::json!({
-            "status": "blocked",
-            "reason": "value-moving posting is disabled until policy, locking, receipt, and sell-preflight parity are ported",
-            "active": draft.active,
-            "closed": draft.closed,
-            "binary_outcomes": draft.binary_outcomes,
-            "order_book_enabled": draft.order_book_enabled,
-            "size_at_or_above_min": draft.size_micro >= draft.min_order_size_micro,
-            "signing_enabled": false
-        }),
-        false,
-    ) {
+    if let DispatchResponse::Error { .. } =
+        store_put_json(&format!("{base}/policy_check.json"), &policy_check, false)
+    {
         return error(-4, "failed to store policy check");
+    }
+    if policy_deny {
+        match bloom_petal_sdk::store_del(&format!("{base}/review_intent.json")) {
+            Ok(()) | Err(SdkError::Host(HostStatus::NotFound)) => {}
+            Err(_) => return error(-4, "failed to clear stale review intent"),
+        }
+        draft.status = "policy_denied".into();
+        if let DispatchResponse::Error { .. } =
+            store_put_json(&format!("{base}/order.json"), &draft, false)
+        {
+            return error(-4, "failed to store denied draft");
+        }
+        return error(-3, "Polymarket policy denied; see policy_check.json");
     }
     if let DispatchResponse::Error { .. } = store_put_json(
         &format!("{base}/review_intent.json"),
@@ -1114,6 +1452,7 @@ fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchRespon
             "maker": format_micro(draft.maker_micro),
             "taker": format_micro(draft.taker_micro),
             "neg_risk": draft.neg_risk,
+            "policy_status": policy_status,
             "status": "final_review_staged",
             "signing_enabled": false,
             "posting_enabled": false
@@ -1594,6 +1933,13 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
 fn sdk_error(e: SdkError) -> DispatchResponse {
     match e {
         SdkError::Host(HostStatus::NotFound) => error(-1, "not found"),
@@ -1648,6 +1994,127 @@ struct GeoblockStatus {
     region: String,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+struct LocalWalletPolicy {
+    #[serde(default)]
+    polymarket: LocalPolymarketPolicy,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LocalPolymarketPolicy {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default, with = "local_micro_opt")]
+    max_order_usd: Option<u64>,
+    #[serde(default, with = "local_micro_opt")]
+    max_daily_usd: Option<u64>,
+    #[serde(default, with = "local_micro_opt")]
+    require_flag_above_usd: Option<u64>,
+    #[serde(default, with = "local_micro_opt")]
+    max_price: Option<u64>,
+    #[serde(default = "default_true")]
+    allow_neg_risk: bool,
+    #[serde(default)]
+    allowed_slugs: BTreeSet<String>,
+    #[serde(default)]
+    denied_slugs: BTreeSet<String>,
+    #[serde(default)]
+    allowed_condition_ids: BTreeSet<String>,
+    #[serde(default)]
+    denied_condition_ids: BTreeSet<String>,
+}
+
+impl Default for LocalPolymarketPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_order_usd: None,
+            max_daily_usd: None,
+            require_flag_above_usd: None,
+            max_price: None,
+            allow_neg_risk: true,
+            allowed_slugs: BTreeSet::new(),
+            denied_slugs: BTreeSet::new(),
+            allowed_condition_ids: BTreeSet::new(),
+            denied_condition_ids: BTreeSet::new(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+mod local_micro_opt {
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            S(String),
+            I(i64),
+            F(f64),
+        }
+        match Option::<Raw>::deserialize(d)? {
+            None => Ok(None),
+            Some(Raw::S(s)) => super::parse_micro(s.trim())
+                .map(Some)
+                .map_err(D::Error::custom),
+            Some(Raw::I(i)) => {
+                if i < 0 {
+                    return Err(D::Error::custom("USD amount cannot be negative"));
+                }
+                (i as u64)
+                    .checked_mul(1_000_000)
+                    .map(Some)
+                    .ok_or_else(|| D::Error::custom("USD amount too large"))
+            }
+            Some(Raw::F(f)) => super::parse_micro(&format!("{f}"))
+                .map(Some)
+                .map_err(D::Error::custom),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalPolicySide {
+    Buy,
+    Sell,
+}
+
+#[derive(Debug, Clone)]
+struct LocalPolymarketOrderCtx {
+    slug: String,
+    condition_id: String,
+    side: LocalPolicySide,
+    amount_microusd: u64,
+    limit_price_micro: u64,
+    active: bool,
+    closed: bool,
+    order_book_enabled: bool,
+    binary_outcomes: bool,
+    neg_risk: bool,
+    receipt_store_readable: bool,
+    daily_posted_microusd: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LocalPolicyOutcome {
+    Pass,
+    Warn,
+    Deny,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LocalPolicyCheck {
+    rule: String,
+    outcome: LocalPolicyOutcome,
+    message: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct TradeRevalidateRequest {
     revalidate: bool,
@@ -1683,6 +2150,14 @@ struct StoreTradeDraft {
     best_bid_micro: Option<u64>,
     book_snapshot_secs: u64,
     status: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StoreTradeReceiptPolicy {
+    side: Side,
+    amount_microusd: u64,
+    clob_status: String,
+    posted_ms: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -1777,6 +2252,23 @@ mod tests {
         }
     }
 
+    fn policy_ctx() -> LocalPolymarketOrderCtx {
+        LocalPolymarketOrderCtx {
+            slug: "example".into(),
+            condition_id: "0xabc".into(),
+            side: LocalPolicySide::Buy,
+            amount_microusd: 10_000_000,
+            limit_price_micro: 695_000,
+            active: true,
+            closed: false,
+            order_book_enabled: true,
+            binary_outcomes: true,
+            neg_risk: false,
+            receipt_store_readable: true,
+            daily_posted_microusd: Some(0),
+        }
+    }
+
     #[test]
     fn path_validation_rejects_escape_segments() {
         assert!(validate_relative_path("").is_ok());
@@ -1845,5 +2337,68 @@ mod tests {
         let err = choose_trade_limit(Side::Sell, true, 691_000, 691_000, &snap)
             .expect_err("tick rounding should fall below min price");
         assert!(matches!(err, DispatchResponse::Error { code: -3, .. }));
+    }
+
+    #[test]
+    fn local_policy_defaults_to_disabled() {
+        let policy: LocalWalletPolicy = toml::from_str("").unwrap();
+        let checks = evaluate_local_polymarket_order(&policy.polymarket, &policy_ctx());
+        assert!(local_policy_has_deny(&checks));
+        assert!(checks.iter().any(|check| {
+            check.rule == "polymarket.enabled" && check.outcome == LocalPolicyOutcome::Deny
+        }));
+    }
+
+    #[test]
+    fn local_policy_parses_decimal_caps() {
+        let policy: LocalWalletPolicy = toml::from_str(
+            r#"
+[polymarket]
+enabled = true
+max_order_usd = "10"
+max_daily_usd = "25.5"
+require_flag_above_usd = 5
+max_price = "0.75"
+allow_neg_risk = false
+denied_slugs = ["blocked-market"]
+"#,
+        )
+        .unwrap();
+        assert!(policy.polymarket.enabled);
+        assert_eq!(policy.polymarket.max_order_usd, Some(10_000_000));
+        assert_eq!(policy.polymarket.max_daily_usd, Some(25_500_000));
+        assert_eq!(policy.polymarket.require_flag_above_usd, Some(5_000_000));
+        assert_eq!(policy.polymarket.max_price, Some(750_000));
+        assert!(!policy.polymarket.allow_neg_risk);
+        assert!(policy.polymarket.denied_slugs.contains("blocked-market"));
+
+        let float_policy: LocalWalletPolicy =
+            toml::from_str("[polymarket]\nenabled = true\nmax_price = 0.1\n").unwrap();
+        assert_eq!(float_policy.polymarket.max_price, Some(100_000));
+    }
+
+    #[test]
+    fn local_policy_daily_cap_fails_closed_when_receipts_unknown() {
+        let policy: LocalWalletPolicy = toml::from_str(
+            r#"
+[polymarket]
+enabled = true
+max_daily_usd = "100"
+"#,
+        )
+        .unwrap();
+        let mut ctx = policy_ctx();
+        ctx.receipt_store_readable = false;
+        let checks = evaluate_local_polymarket_order(&policy.polymarket, &ctx);
+        assert!(checks.iter().any(|check| {
+            check.rule == "polymarket.max_daily_usd" && check.outcome == LocalPolicyOutcome::Deny
+        }));
+
+        ctx.receipt_store_readable = true;
+        ctx.daily_posted_microusd = None;
+        let checks = evaluate_local_polymarket_order(&policy.polymarket, &ctx);
+        assert!(checks.iter().any(|check| {
+            check.rule == "polymarket.max_daily_usd" && check.outcome == LocalPolicyOutcome::Deny
+        }));
     }
 }

@@ -243,6 +243,26 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     assert!(final_review_text.contains(r#""posting_enabled": false"#));
     assert_eq!(host.sign_calls.lock().unwrap().len(), 1);
 
+    let stale_denied_host = Arc::new(MockHost::fixture_with_policy(b""));
+    let stale_denied = dispatch_trade_revalidate(&runner, stale_denied_host.clone(), "0001").await;
+    assert!(matches!(
+        stale_denied,
+        DispatchResponse::Error { code: -3, message } if message.contains("policy denied")
+    ));
+    assert_eq!(stale_denied_host.sign_calls.lock().unwrap().len(), 0);
+    assert!(matches!(
+        private.get(&install.hash, "trade/alice/drafts/0001/review_intent.json"),
+        Err(HostError::NotFound(_))
+    ));
+    let denied_order = private
+        .get(&install.hash, "trade/alice/drafts/0001/order.json")
+        .unwrap();
+    assert!(
+        String::from_utf8(denied_order)
+            .unwrap()
+            .contains(r#""status": "policy_denied""#)
+    );
+
     router
         .write(
             &VfsPath::parse("polymarket/trade/alice/new").unwrap(),
@@ -265,18 +285,42 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         Err(HostError::NotFound(_))
     ));
 
+    let denied_policy_host = Arc::new(MockHost::fixture_with_policy(b""));
+    let denied_policy =
+        dispatch_trade_revalidate(&runner, denied_policy_host.clone(), "0002").await;
+    assert!(matches!(
+        denied_policy,
+        DispatchResponse::Error { code: -3, message } if message.contains("policy denied")
+    ));
+    assert_eq!(denied_policy_host.sign_calls.lock().unwrap().len(), 0);
+    let policy_check = private
+        .get(&install.hash, "trade/alice/drafts/0002/policy_check.json")
+        .unwrap();
+    let policy_check_text = String::from_utf8(policy_check).unwrap();
+    assert!(policy_check_text.contains(r#""policy_status": "denied""#));
+    assert!(policy_check_text.contains(r#""outcome": "deny""#));
+    assert!(policy_check_text.contains("polymarket.enabled"));
+
+    router
+        .write(
+            &VfsPath::parse("polymarket/trade/alice/new").unwrap(),
+            br#"{"slug":"test-market","outcome":"yes","amount":"1","max_price":"0.10"}"#,
+        )
+        .await
+        .unwrap();
+
     let drift_host = Arc::new(MockHost::fixture_with_trade_market(
         br#"{"slug":"test-market","conditionId":"changed","clobTokenIds":["333","444"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true}"#,
         "333",
     ));
-    let drift = dispatch_trade_revalidate(&runner, drift_host.clone(), "0002").await;
+    let drift = dispatch_trade_revalidate(&runner, drift_host.clone(), "0003").await;
     assert!(matches!(
         drift,
         DispatchResponse::Error { code: -3, message } if message.contains("token id changed")
     ));
     assert_eq!(drift_host.sign_calls.lock().unwrap().len(), 0);
     assert!(matches!(
-        private.get(&install.hash, "trade/alice/receipts/0002/receipt.json"),
+        private.get(&install.hash, "trade/alice/receipts/0003/receipt.json"),
         Err(HostError::NotFound(_))
     ));
     let condition_drift_host = Arc::new(MockHost::fixture_with_trade_market(
@@ -284,7 +328,7 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         "111",
     ));
     let condition_drift =
-        dispatch_trade_revalidate(&runner, condition_drift_host.clone(), "0002").await;
+        dispatch_trade_revalidate(&runner, condition_drift_host.clone(), "0003").await;
     assert!(matches!(
         condition_drift,
         DispatchResponse::Error { code: -3, message } if message.contains("condition id changed")
@@ -297,7 +341,7 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         br#"{"market":"cond","asset_id":"111","tick_size":"0.01","min_order_size":"1","neg_risk":true,"last_trade_price":"0.09","bids":[{"price":"0.08","size":"10"}],"asks":[{"price":"0.09","size":"10"}]}"#,
     ));
     let neg_risk_drift =
-        dispatch_trade_revalidate(&runner, neg_risk_drift_host.clone(), "0002").await;
+        dispatch_trade_revalidate(&runner, neg_risk_drift_host.clone(), "0003").await;
     assert!(matches!(
         neg_risk_drift,
         DispatchResponse::Error { code: -3, message } if message.contains("neg-risk changed")
@@ -343,7 +387,9 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
             .filter(|call| call.starts_with("read "))
             .all(|call| matches!(
                 call.as_str(),
-                "read wallets/alice/address" | "read wallets/0xalice/address"
+                "read wallets/alice/address"
+                    | "read wallets/alice/policy.toml"
+                    | "read wallets/0xalice/address"
             ))
     );
     let http_calls = host.http_calls.lock().unwrap();
@@ -432,6 +478,7 @@ fn assert_no_onboard_private_state(private: &PrivateStore, hash: &str) {
 struct MockHost {
     responses: BTreeMap<String, Vec<u8>>,
     statuses: BTreeMap<String, u16>,
+    policy_body: Vec<u8>,
     http_calls: Mutex<Vec<(String, String)>>,
     vfs_calls: Mutex<Vec<String>>,
     sign_calls: Mutex<Vec<SignRequest>>,
@@ -442,6 +489,12 @@ impl MockHost {
         Self::fixture_with_geoblock_body(
             br#"{"blocked":false,"ip":"1.2.3.4","country":"AR","region":"X"}"#,
         )
+    }
+
+    fn fixture_with_policy(policy_body: &[u8]) -> Self {
+        let mut host = Self::fixture();
+        host.policy_body = policy_body.to_vec();
+        host
     }
 
     fn fixture_with_geoblock_body(geoblock_body: &[u8]) -> Self {
@@ -478,6 +531,13 @@ impl MockHost {
 
     fn fixture_with_geoblock_response(geoblock_body: &[u8], geoblock_status: u16) -> Self {
         let mut host = Self::default();
+        host.policy_body = br#"[polymarket]
+enabled = true
+max_order_usd = "5"
+max_daily_usd = "100"
+max_price = "0.20"
+"#
+        .to_vec();
         host.responses.insert(
             "GET https://gamma-api.polymarket.com/markets?closed=false&limit=20&order=volumeNum&ascending=false".into(),
             br#"[{"slug":"test-market","conditionId":"cond","clobTokenIds":["111","222"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true}]"#.to_vec(),
@@ -540,6 +600,8 @@ impl PetalHost for MockHost {
         self.vfs_calls.lock().unwrap().push(format!("read {path}"));
         if path == "wallets/alice/address" {
             Ok(b"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266\n".to_vec())
+        } else if path == "wallets/alice/policy.toml" {
+            Ok(self.policy_body.clone())
         } else if path == "wallets/0xalice/address" {
             Ok(b"0x0000000000000000000000000000000000000001\n".to_vec())
         } else {
