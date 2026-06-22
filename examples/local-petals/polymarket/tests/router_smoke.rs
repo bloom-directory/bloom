@@ -4,7 +4,6 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::Address;
 use async_trait::async_trait;
 use bloom_petal_manifest::extract_local_petal_manifest;
 use bloom_petals::abi::{
@@ -15,8 +14,6 @@ use bloom_petals::{
     RunOptions,
 };
 use bloom_petals::{NetPolicy, private_store::PrivateStore};
-use bloom_polymarket::POLYGON;
-use bloom_polymarket::eip712::derive_deposit_wallet_address;
 use bloom_vfs::Handler;
 use bloom_vfs::path::VfsPath;
 
@@ -207,17 +204,15 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         .unwrap();
     let status = wait_for_creds(&router).await;
     assert_eq!(status["creds_present"], true);
-    assert_eq!(status["deposit_wallet"]["fundable"], false);
-    assert_eq!(
-        status["deposit_wallet"]["source"],
-        "local_estimate_unverified"
-    );
+    assert_eq!(status["deposit_wallet"]["fundable"], true);
+    assert_eq!(status["deposit_wallet"]["source"], "live_factory_resolved");
     let approvals = router
         .read(&VfsPath::parse("polymarket/onboard/alice/approvals.json").unwrap())
         .await
         .unwrap();
     let approvals: serde_json::Value = serde_json::from_slice(&approvals).unwrap();
-    assert_eq!(approvals["deposit_wallet_fundable"], false);
+    assert_eq!(approvals["deposit_wallet_fundable"], true);
+    assert_eq!(approvals["deposit_wallet_source"], "live_factory_resolved");
     assert_eq!(approvals["calls"].as_array().unwrap().len(), 8);
     assert_eq!(host.sign_calls.lock().unwrap().len(), 1);
 
@@ -837,7 +832,12 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
                 "read wallets/alice/address"
                     | "read wallets/alice/policy.toml"
                     | "read wallets/0xalice/address"
-            ))
+            ) || (call.starts_with("read chains/polygon/contracts/")
+                && (call.contains("/methods/implementation@")
+                    || call.contains("/methods/predictWalletAddress@")
+                    || call.contains("/methods/balanceOf@")
+                    || call.contains("/methods/isApprovedForAll@"))
+                && call.ends_with(".read")))
     );
     let http_calls = host.http_calls.lock().unwrap();
     assert!(
@@ -1093,10 +1093,7 @@ max_price = "0.20"
             "GET https://data-api.polymarket.com/positions?user=0x0000000000000000000000000000000000000001".into(),
             br#"[{"title":"Alias Position","asset":"222","conditionId":"cond","outcome":"No"}]"#.to_vec(),
         );
-        let owner: Address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
-            .parse()
-            .unwrap();
-        let deposit = derive_deposit_wallet_address(&owner, POLYGON).to_checksum(None);
+        let deposit = "0x3000000000000000000000000000000000000003";
         host.responses.insert(
             format!("GET https://data-api.polymarket.com/positions?user={deposit}"),
             br#"[{"title":"Sell Position","asset":"111","size":2.0}]"#.to_vec(),
@@ -1164,6 +1161,22 @@ impl PetalHost for MockHost {
         } else if path == "wallets/0xalice/address" {
             Ok(b"0x0000000000000000000000000000000000000001\n".to_vec())
         } else if path.starts_with("chains/polygon/contracts/")
+            && path.contains("/methods/implementation@")
+            && path.ends_with(".read")
+        {
+            Ok(
+                br#"{"decoded":["0x2000000000000000000000000000000000000002"],"raw":"0x"}"#
+                    .to_vec(),
+            )
+        } else if path.starts_with("chains/polygon/contracts/")
+            && path.contains("/methods/predictWalletAddress@")
+            && path.ends_with(".read")
+        {
+            Ok(
+                br#"{"decoded":["0x3000000000000000000000000000000000000003"],"raw":"0x"}"#
+                    .to_vec(),
+            )
+        } else if path.starts_with("chains/polygon/contracts/")
             && path.contains("/methods/balanceOf@")
             && path.ends_with(".read")
         {
@@ -1195,7 +1208,9 @@ impl PetalHost for MockHost {
         self.vfs_calls.lock().unwrap().push(format!("write {path}"));
         if path.starts_with("chains/polygon/contracts/")
             && ((path.contains("/methods/balanceOf@") && path.ends_with(".read"))
-                || (path.contains("/methods/isApprovedForAll@") && path.ends_with(".read")))
+                || (path.contains("/methods/isApprovedForAll@") && path.ends_with(".read"))
+                || (path.contains("/methods/implementation@") && path.ends_with(".read"))
+                || (path.contains("/methods/predictWalletAddress@") && path.ends_with(".read")))
         {
             self.vfs_writes
                 .lock()

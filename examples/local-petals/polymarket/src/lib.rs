@@ -14,7 +14,7 @@ use bloom_petal_sdk::{
     HttpRequest, SdkError, SignRequest,
 };
 use bloom_polymarket::eip712::{
-    CTF, CTF_EXCHANGE_V2, NEG_RISK_EXCHANGE_V2, clob_auth_signing_hash,
+    CTF, CTF_EXCHANGE_V2, FACTORY, NEG_RISK_EXCHANGE_V2, clob_auth_signing_hash,
     derive_deposit_wallet_address,
 };
 use bloom_polymarket::order::{
@@ -251,7 +251,12 @@ fn read_meta(file: &str) -> DispatchResponse {
                 {
                     "id": "onboarding_credentials",
                     "surface": ["onboard/*/begin", "onboard/*/status.json", "onboard/*/approvals.json"],
-                    "evidence": "geoblock-gated CLOB auth signature through sign_hash and private credential storage"
+                    "evidence": "geoblock-gated live factory deposit-wallet resolution plus CLOB auth signature through sign_hash and private credential storage"
+                },
+                {
+                    "id": "factory_resolved_deposit_wallet",
+                    "surface": ["onboard/*/status.json", "onboard/*/approvals.json", "fund/*/new", "trade/*/drafts/*/revalidate", "trade/*/drafts/*/post"],
+                    "evidence": "funding and posting paths require a persisted live_factory_resolved deposit wallet instead of the display-only local CREATE2 estimate"
                 },
                 {
                     "id": "buy_posting",
@@ -280,6 +285,11 @@ fn read_meta(file: &str) -> DispatchResponse {
                 }
             ],
             "remaining_blockers": [
+                {
+                    "id": "onboarding_deploy_fund_approve_sync",
+                    "status": "blocked",
+                    "reason": "local begin resolves the live factory wallet and manages CLOB credentials, but it does not yet drive native deploy, fund, approve, and CLOB balance/allowance sync stages end-to-end"
+                },
                 {
                     "id": "graduation_signoff",
                     "status": "pending",
@@ -502,6 +512,10 @@ fn write_onboard_begin(wallet: &str) -> DispatchResponse {
     if let Err(resp) = check_geoblock() {
         return resp;
     }
+    let deposit = match predict_deposit_wallet(owner) {
+        Ok(deposit) => deposit,
+        Err(resp) => return resp,
+    };
     let timestamp = now_secs();
     let hash = clob_auth_signing_hash(owner, timestamp, CLOB_AUTH_NONCE, POLYGON);
     let signature = match bloom_petal_sdk::sign_hash(&SignRequest {
@@ -534,13 +548,14 @@ fn write_onboard_begin(wallet: &str) -> DispatchResponse {
     {
         return error(-4, "failed to store CLOB credentials");
     }
-    let status = local_onboard_status(
+    let status = local_onboard_status_with_live_deposit(
         wallet,
         owner,
+        deposit,
         "creds",
         false,
         true,
-        "CLOB credentials stored in the private petal store; approval/funding stages pending",
+        "CLOB credentials stored in the private petal store; deposit wallet resolved from the live factory; deploy/fund/approval automation is still pending",
     );
     store_put_json(&format!("onboard/{wallet}/status.json"), &status, false)
 }
@@ -621,6 +636,36 @@ fn local_onboard_status(
     })
 }
 
+fn local_onboard_status_with_live_deposit(
+    wallet: &str,
+    owner: Address,
+    deposit: Address,
+    stage: &str,
+    running: bool,
+    creds_present: bool,
+    message: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "wallet": wallet,
+        "owner": owner.to_checksum(None),
+        "stage": stage,
+        "running": running,
+        "tradeable": false,
+        "creds_present": creds_present,
+        "deposit_wallet": {
+            "address": deposit.to_checksum(None),
+            "source": "live_factory_resolved",
+            "fundable": true,
+            "warning": serde_json::Value::Null
+        },
+        "approvals": {
+            "required": true,
+            "preview_path": format!("onboard/{wallet}/approvals.json")
+        },
+        "message": message
+    })
+}
+
 fn local_status_for_wallet(
     wallet: &str,
     owner: Address,
@@ -656,8 +701,70 @@ fn local_status_for_wallet(
     }
 }
 
+fn resolved_deposit_wallet(wallet: &str, owner: Address) -> Result<Address, DispatchResponse> {
+    let status = local_status_for_wallet(wallet, owner)?;
+    let deposit = status
+        .get("deposit_wallet")
+        .and_then(|value| value.get("address"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            error(
+                -3,
+                "wallet is not onboarded; write onboard/<wallet>/begin first",
+            )
+        })?;
+    let source = status
+        .get("deposit_wallet")
+        .and_then(|value| value.get("source"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let fundable = status
+        .get("deposit_wallet")
+        .and_then(|value| value.get("fundable"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if source != "live_factory_resolved" || !fundable {
+        return Err(error(
+            -3,
+            "deposit wallet is not factory-resolved; write onboard/<wallet>/begin before funding or posting",
+        ));
+    }
+    deposit
+        .parse::<Address>()
+        .map_err(|e| error(-4, format!("stored deposit wallet parse: {e}")))
+}
+
 fn approval_preview(wallet: &str, owner: Address) -> serde_json::Value {
-    let deposit = derive_deposit_wallet_address(&owner, POLYGON);
+    let status = local_status_for_wallet(wallet, owner).ok();
+    let deposit = status
+        .as_ref()
+        .and_then(|status| {
+            status
+                .get("deposit_wallet")
+                .and_then(|value| value.get("address"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .and_then(|address| address.parse::<Address>().ok())
+        .unwrap_or_else(|| derive_deposit_wallet_address(&owner, POLYGON));
+    let deposit_source = status
+        .as_ref()
+        .and_then(|status| {
+            status
+                .get("deposit_wallet")
+                .and_then(|value| value.get("source"))
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("local_estimate_unverified");
+    let raw_deposit_fundable = status
+        .as_ref()
+        .and_then(|status| {
+            status
+                .get("deposit_wallet")
+                .and_then(|value| value.get("fundable"))
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false);
+    let deposit_fundable = raw_deposit_fundable && deposit_source == "live_factory_resolved";
     let calls: Vec<serde_json::Value> = v2_approval_calls()
         .iter()
         .zip(V2_APPROVAL_LABELS)
@@ -674,9 +781,13 @@ fn approval_preview(wallet: &str, owner: Address) -> serde_json::Value {
         "wallet": wallet,
         "owner": format!("{owner:#x}"),
         "deposit_wallet": deposit.to_checksum(None),
-        "deposit_wallet_source": "local_estimate_unverified",
-        "deposit_wallet_fundable": false,
-        "warning": "do not fund this locally derived estimate; full onboarding must resolve the live factory address before funding or approvals",
+        "deposit_wallet_source": deposit_source,
+        "deposit_wallet_fundable": deposit_fundable,
+        "warning": if deposit_fundable {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String("do not fund this locally derived estimate; full onboarding must resolve the live factory address before funding or approvals".into())
+        },
         "chain_id": POLYGON,
         "calls": calls,
         "signing": "preview_only"
@@ -1178,11 +1289,11 @@ fn audited_receipt_ids_since(wallet: &str, cutoff_ms: u128) -> Result<Vec<String
 fn verify_sell_preflight(
     wallet: &str,
     owner: Address,
+    deposit: Address,
     token_id: &str,
     size_micro: u64,
     neg_risk: bool,
 ) -> Result<serde_json::Value, DispatchResponse> {
-    let deposit = derive_deposit_wallet_address(&owner, POLYGON);
     let deposit_user = deposit.to_checksum(None);
     let data_api_holding_micro = get_json::<Vec<Position>>(&url_with_query(
         &format!("{DATA}/positions"),
@@ -1259,7 +1370,7 @@ fn verify_sell_preflight(
         "ctf_approval_checked": true,
         "reason": "sell preflight passed CLOB conditional balance, on-chain CTF balance, and CTF operator approval checks; Data API holdings are included as corroborating evidence when available",
         "deposit_wallet": deposit.to_checksum(None),
-        "deposit_wallet_source": "local_derivation",
+        "deposit_wallet_source": "live_factory_resolved",
         "token_id": token_id,
         "requested_size_micro": size_micro,
         "requested_size": format_micro(size_micro),
@@ -1319,6 +1430,43 @@ fn read_chain_ctf_approval(deposit: Address, operator: Address) -> Result<bool, 
         .first()
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| error(-4, "chain CTF approval response is not a boolean"))
+}
+
+fn predict_deposit_wallet(owner: Address) -> Result<Address, DispatchResponse> {
+    let implementation = read_chain_address(
+        FACTORY,
+        "implementation",
+        &serde_json::json!({ "args": [] }),
+        "factory implementation",
+    )?;
+    let wallet_id = format!("0x{}{}", "00".repeat(12), hex::encode(owner.as_slice()));
+    read_chain_address(
+        FACTORY,
+        "predictWalletAddress",
+        &serde_json::json!({
+            "args": [implementation.to_checksum(None), wallet_id]
+        }),
+        "factory predictWalletAddress",
+    )
+}
+
+fn read_chain_address(
+    contract: Address,
+    method: &str,
+    body: &serde_json::Value,
+    label: &str,
+) -> Result<Address, DispatchResponse> {
+    let response = read_chain_method(contract, method, body)?;
+    let decoded = response
+        .get("decoded")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| error(-4, format!("{label} response missing decoded array")))?;
+    decoded
+        .first()
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| error(-4, format!("{label} response is not an address")))?
+        .parse::<Address>()
+        .map_err(|e| error(-4, format!("{label} address parse: {e}")))
 }
 
 fn read_chain_method(
@@ -1749,7 +1897,10 @@ fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchRespon
         Ok(address) => address,
         Err(resp) => return resp,
     };
-    let funder = derive_deposit_wallet_address(&owner, POLYGON);
+    let funder = match resolved_deposit_wallet(wallet, owner) {
+        Ok(funder) => funder,
+        Err(resp) => return resp,
+    };
 
     draft.limit_price_micro = quote.price_micro;
     draft.size_micro = quote.size_micro;
@@ -1834,6 +1985,7 @@ fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchRespon
         match verify_sell_preflight(
             wallet,
             owner,
+            funder,
             &draft.token_id,
             draft.size_micro,
             draft.neg_risk,
@@ -2016,9 +2168,11 @@ fn refresh_trade_post_inputs(
         return Err(error(-3, "Polymarket policy denied; see policy_check.json"));
     }
     let sell_preflight = if draft.side == Side::Sell {
+        let funder = resolved_deposit_wallet(wallet, owner)?;
         let preflight = verify_sell_preflight(
             wallet,
             owner,
+            funder,
             &draft.token_id,
             draft.size_micro,
             draft.neg_risk,
@@ -2136,7 +2290,10 @@ fn write_trade_post(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
         Ok(address) => address,
         Err(resp) => return resp,
     };
-    let funder = derive_deposit_wallet_address(&owner, POLYGON);
+    let funder = match resolved_deposit_wallet(wallet, owner) {
+        Ok(funder) => funder,
+        Err(resp) => return resp,
+    };
     let (policy_check, sell_preflight) =
         match refresh_trade_post_inputs(wallet, &base, &mut draft, owner) {
             Ok(inputs) => inputs,
@@ -2538,6 +2695,14 @@ fn write_fund_new(wallet: &str, body: &[u8]) -> DispatchResponse {
     if let Err(e) = validate_wallet_name(wallet) {
         return error(-3, e.to_string());
     }
+    let owner = match wallet_address(wallet) {
+        Ok(address) => address,
+        Err(resp) => return resp,
+    };
+    let deposit = match resolved_deposit_wallet(wallet, owner) {
+        Ok(deposit) => deposit,
+        Err(resp) => return resp,
+    };
     let req: FundNewRequest = match serde_json::from_slice(body) {
         Ok(req) => req,
         Err(e) => return error(-3, format!("fund request JSON: {e}")),
@@ -2559,6 +2724,8 @@ fn write_fund_new(wallet: &str, body: &[u8]) -> DispatchResponse {
         max_spend: req.max_spend,
         from_token: req.from_token.unwrap_or_else(|| "native".into()),
         slippage_bps: req.slippage_bps,
+        deposit_wallet: deposit.to_checksum(None),
+        deposit_wallet_source: "live_factory_resolved".into(),
         status: "draft".into(),
     };
     store_put_json(
@@ -3365,9 +3532,11 @@ fn render_trade_plan(draft: &StoreTradeDraft) -> String {
 
 fn render_fund_plan(session: &StoreFundSession) -> String {
     format!(
-        "# Polymarket funding request {}\n\nWallet: {}\nTarget pUSD: {}\nMax spend: {}\nFrom token: {}\nSlippage bps: {}\nStatus: {}\n",
+        "# Polymarket funding request {}\n\nWallet: {}\nReceiver: {} ({})\nTarget pUSD: {}\nMax spend: {}\nFrom token: {}\nSlippage bps: {}\nStatus: {}\n",
         session.id,
         session.wallet,
+        session.deposit_wallet,
+        session.deposit_wallet_source,
         session.target_pusd,
         session.max_spend,
         session.from_token,
@@ -3838,6 +4007,10 @@ struct StoreFundSession {
     max_spend: String,
     from_token: String,
     slippage_bps: u16,
+    #[serde(default)]
+    deposit_wallet: String,
+    #[serde(default)]
+    deposit_wallet_source: String,
     status: String,
 }
 
