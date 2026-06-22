@@ -14,7 +14,9 @@ use bloom_petal_sdk::{
 };
 use bloom_polymarket::eip712::clob_auth_signing_hash;
 use bloom_polymarket::order::{OrderType, parse_micro};
-use bloom_polymarket::signer::{POLY_ADDRESS, POLY_NONCE, POLY_SIGNATURE, POLY_TIMESTAMP};
+use bloom_polymarket::signer::{
+    POLY_ADDRESS, POLY_NONCE, POLY_SIGNATURE, POLY_TIMESTAMP, l2_headers,
+};
 use bloom_polymarket::types::{Market, Side};
 use bloom_polymarket::{Credentials, OrderBook, POLYGON, Position, Trade, validate_wallet_name};
 use serde::{Deserialize, Serialize};
@@ -299,23 +301,33 @@ fn read_account(wallet: &str, file: &str) -> DispatchResponse {
     if let Err(e) = validate_wallet_name(wallet) {
         return error(-3, e.to_string());
     }
+    let owner = match wallet_address(wallet) {
+        Ok(address) => address,
+        Err(resp) => return resp,
+    };
+    let creds = match load_creds(wallet) {
+        Ok(creds) => creds,
+        Err(resp) => return resp,
+    };
     match file {
-        "portfolio.json" => read_store_json_or_default(
-            &format!("account/{wallet}/portfolio.json"),
-            serde_json::json!({
+        "portfolio.json" => match clob_l2_get_json(
+            owner,
+            &creds,
+            "/balance-allowance",
+            &[("asset_type", "COLLATERAL"), ("signature_type", "3")],
+        ) {
+            Ok(clob_balance_allowance) => read_json_value(&serde_json::json!({
                 "wallet": wallet,
-                "credentials_present": store_get(&format!("creds/{wallet}/clob.json")).is_some(),
-                "message": "authenticated CLOB account view pending sign/store credential flow"
-            }),
-        ),
-        "orders.json" => read_store_json_or_default(
-            &format!("account/{wallet}/orders.json"),
-            serde_json::json!({
-                "wallet": wallet,
-                "orders": [],
-                "message": "authenticated CLOB order read pending sign/store credential flow"
-            }),
-        ),
+                "owner": format!("{owner:#x}"),
+                "credentials_present": true,
+                "clob_balance_allowance": clob_balance_allowance
+            })),
+            Err(resp) => resp,
+        },
+        "orders.json" => match clob_l2_get_json(owner, &creds, "/data/orders", &[]) {
+            Ok(orders) => read_json_value(&orders),
+            Err(resp) => resp,
+        },
         _ => error(-3, "not an account file"),
     }
 }
@@ -620,6 +632,64 @@ fn clob_auth_request(
         serde_json::from_slice(&resp.body).map_err(|e| error(-4, format!("json: {e}")))?;
     creds.nonce = CLOB_AUTH_NONCE;
     Ok(creds)
+}
+
+fn load_creds(wallet: &str) -> Result<Credentials, DispatchResponse> {
+    let Some(bytes) = store_get(&format!("creds/{wallet}/clob.json")) else {
+        return Err(error(
+            -3,
+            format!("wallet '{wallet}' is not onboarded; write onboard/{wallet}/begin first"),
+        ));
+    };
+    serde_json::from_slice(&bytes).map_err(|e| error(-4, format!("corrupt credentials: {e}")))
+}
+
+fn clob_l2_get_json(
+    owner: Address,
+    creds: &Credentials,
+    path: &str,
+    query: &[(&str, &str)],
+) -> Result<serde_json::Value, DispatchResponse> {
+    let timestamp = now_secs();
+    let headers = l2_headers(
+        owner,
+        &creds.key,
+        &creds.passphrase,
+        &creds.secret,
+        timestamp,
+        "GET",
+        path,
+        "",
+    )
+    .map_err(|e| error(-4, e.to_string()))?;
+    let url = url_with_query(&format!("{CLOB}{path}"), query);
+    let resp = bloom_petal_sdk::http_fetch(
+        &HttpRequest {
+            method: "GET".into(),
+            url,
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| (name.into(), value))
+                .collect(),
+            body: Vec::new(),
+        },
+        MAX_HTTP_BYTES,
+    )
+    .map_err(sdk_error)?;
+    if !(200..300).contains(&resp.status) {
+        return Err(error(
+            -4,
+            format!(
+                "CLOB account error (status {}): {}",
+                resp.status,
+                String::from_utf8_lossy(&resp.body)
+            ),
+        ));
+    }
+    if resp.body.iter().all(|b| b.is_ascii_whitespace()) {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_slice(&resp.body).map_err(|e| error(-4, format!("json: {e}")))
 }
 
 fn wallet_address(wallet: &str) -> Result<Address, DispatchResponse> {

@@ -19,7 +19,7 @@ paths = ["/positions*", "/trades*", "/activity*"]
 [[net.allow]]
 host = "clob.polymarket.com"
 methods = ["GET", "POST"]
-paths = ["/book*", "/midpoint*", "/spread*", "/price*", "/auth/*"]
+paths = ["/book*", "/midpoint*", "/spread*", "/price*", "/auth/*", "/data/orders*", "/balance-allowance*"]
 
 [[endpoint]]
 path = "markets/*"

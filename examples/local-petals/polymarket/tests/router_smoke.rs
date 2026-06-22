@@ -132,18 +132,30 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     assert!(String::from_utf8(draft).unwrap().contains("test-market"));
     let creds = private.get(&install.hash, "creds/alice/clob.json").unwrap();
     let creds_text = String::from_utf8(creds).unwrap();
-    assert!(creds_text.contains("secret-value"));
+    assert!(creds_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
     let account = router
         .read(&VfsPath::parse("polymarket/account/alice/portfolio.json").unwrap())
         .await
         .unwrap();
     let account_text = String::from_utf8(account).unwrap();
     assert!(account_text.contains("credentials_present"));
-    assert!(!account_text.contains("secret-value"));
+    assert!(account_text.contains("clob_balance_allowance"));
+    assert!(!account_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+    let orders = router
+        .read(&VfsPath::parse("polymarket/account/alice/orders.json").unwrap())
+        .await
+        .unwrap();
+    let orders_text = String::from_utf8(orders).unwrap();
+    assert!(orders_text.contains("order-1"));
+    assert!(!orders_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
 
     assert_eq!(
         host.vfs_calls.lock().unwrap().as_slice(),
-        ["read wallets/alice/address"]
+        [
+            "read wallets/alice/address",
+            "read wallets/alice/address",
+            "read wallets/alice/address"
+        ]
     );
     assert_eq!(host.sign_calls.lock().unwrap().len(), 1);
     assert!(
@@ -194,7 +206,15 @@ impl MockHost {
         );
         host.responses.insert(
             "POST https://clob.polymarket.com/auth/api-key".into(),
-            br#"{"apiKey":"api-key","secret":"secret-value","passphrase":"pass-value"}"#.to_vec(),
+            br#"{"apiKey":"api-key","secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","passphrase":"pass-value"}"#.to_vec(),
+        );
+        host.responses.insert(
+            "GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=3".into(),
+            br#"{"balance":"123","allowance":"456"}"#.to_vec(),
+        );
+        host.responses.insert(
+            "GET https://clob.polymarket.com/data/orders".into(),
+            br#"[{"id":"order-1","status":"LIVE"}]"#.to_vec(),
         );
         host
     }
