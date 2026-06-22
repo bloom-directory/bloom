@@ -4,7 +4,22 @@ name = "polymarket"
 [provides]
 kind = "vfs"
 mount = "polymarket"
-caps = ["vfs.read", "vfs.write"]
+caps = ["net.fetch", "store"]
+
+[[net.allow]]
+host = "gamma-api.polymarket.com"
+methods = ["GET"]
+paths = ["/markets*", "/public-search*"]
+
+[[net.allow]]
+host = "data-api.polymarket.com"
+methods = ["GET"]
+paths = ["/positions*", "/trades*", "/activity*"]
+
+[[net.allow]]
+host = "clob.polymarket.com"
+methods = ["GET"]
+paths = ["/book*", "/midpoint*", "/spread*", "/price*"]
 
 [[endpoint]]
 path = "markets/*"

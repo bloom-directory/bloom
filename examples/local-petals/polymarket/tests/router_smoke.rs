@@ -5,17 +5,19 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bloom_petal_manifest::extract_local_petal_manifest;
+use bloom_petals::abi::{HttpRequest, HttpResponse};
 use bloom_petals::{
     HostError, NameRegistry, PetalHost, PetalMode, PetalRouter, PetalRunner, PetalStore, PetalVm,
 };
+use bloom_petals::{NetPolicy, private_store::PrivateStore};
 use bloom_vfs::Handler;
 use bloom_vfs::path::VfsPath;
 
 #[tokio::test]
-async fn compiled_polymarket_bridge_proxies_native_vfs_surface() {
+async fn compiled_polymarket_petal_uses_http_and_private_store() {
     let root = workspace_root();
     if !wasm32_wasip1_installed(&root) {
-        eprintln!("skipping polymarket bridge smoke test: wasm32-wasip1 target is not installed");
+        eprintln!("skipping polymarket petal smoke test: wasm32-wasip1 target is not installed");
         return;
     }
     let target_dir = root.join("target/local-petal-polymarket-test");
@@ -48,19 +50,20 @@ async fn compiled_polymarket_bridge_proxies_native_vfs_surface() {
             .iter()
             .map(|cap| cap.as_str())
             .collect::<Vec<_>>(),
-        vec!["vfs.read", "vfs.write"]
+        vec!["net.fetch", "store"]
     );
+    assert_eq!(manifest.net.as_ref().unwrap().allow.len(), 3);
 
     let tmp = tempfile::tempdir().unwrap();
     let store = PetalStore::open(tmp.path().join("store")).unwrap();
     let registry = Arc::new(NameRegistry::open(tmp.path().join("names")).unwrap());
     let runner = PetalRunner::new(store, registry, PetalVm::new().unwrap());
-    runner
+    let (install, _) = runner
         .install(&wasm, None, &BTreeSet::new(), PetalMode::Local)
         .unwrap();
 
-    let host = Arc::new(MockVfsHost::fixture());
-    let router = PetalRouter::new(runner, host.clone());
+    let host = Arc::new(MockHost::fixture());
+    let router = PetalRouter::new(runner.clone(), host.clone());
 
     let root_entries = router
         .list(&VfsPath::parse("polymarket").unwrap())
@@ -69,27 +72,52 @@ async fn compiled_polymarket_bridge_proxies_native_vfs_surface() {
     assert!(root_entries.iter().any(|entry| entry.name == "markets"));
     assert!(root_entries.iter().any(|entry| entry.name == "trade"));
 
+    let markets = router
+        .list(&VfsPath::parse("polymarket/markets").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(markets.len(), 1);
+    assert_eq!(markets[0].name, "test-market");
+
     let market = router
         .read(&VfsPath::parse("polymarket/markets/test-market/market.json").unwrap())
         .await
         .unwrap();
-    assert_eq!(market, br#"{"slug":"test-market"}"#);
+    let market: serde_json::Value = serde_json::from_slice(&market).unwrap();
+    assert_eq!(market["slug"], "test-market");
+
+    let book = router
+        .read(&VfsPath::parse("polymarket/markets/test-market/book.json").unwrap())
+        .await
+        .unwrap();
+    let book: serde_json::Value = serde_json::from_slice(&book).unwrap();
+    assert_eq!(book["asset_id"], "yes-token");
 
     router
         .write(
             &VfsPath::parse("polymarket/trade/alice/new").unwrap(),
-            br#"{"slug":"test-market"}"#,
+            br#"{"slug":"test-market","outcome":"yes","amount":"1","max_price":"0.10"}"#,
         )
         .await
         .unwrap();
-    assert_eq!(
-        host.writes
-            .lock()
-            .unwrap()
-            .get("polymarket/trade/alice/new"),
-        Some(&br#"{"slug":"test-market"}"#.to_vec())
-    );
+    let drafts = router
+        .list(&VfsPath::parse("polymarket/trade/alice/drafts").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(drafts[0].name, "0001");
+    let plan = router
+        .read(&VfsPath::parse("polymarket/trade/alice/drafts/0001/plan.md").unwrap())
+        .await
+        .unwrap();
+    assert!(String::from_utf8(plan).unwrap().contains("test-market"));
 
+    let private = PrivateStore::open(tmp.path().join("data")).unwrap();
+    let draft = private
+        .get(&install.hash, "trade/alice/drafts/0001/order.json")
+        .unwrap();
+    assert!(String::from_utf8(draft).unwrap().contains("test-market"));
+
+    assert!(host.vfs_calls.lock().unwrap().is_empty());
     assert!(
         router
             .write(
@@ -102,65 +130,83 @@ async fn compiled_polymarket_bridge_proxies_native_vfs_surface() {
 }
 
 #[derive(Default)]
-struct MockVfsHost {
-    reads: BTreeMap<String, Vec<u8>>,
-    lists: BTreeMap<String, Vec<String>>,
-    writes: Mutex<BTreeMap<String, Vec<u8>>>,
+struct MockHost {
+    responses: BTreeMap<String, Vec<u8>>,
+    http_calls: Mutex<Vec<(String, String)>>,
+    vfs_calls: Mutex<Vec<String>>,
 }
 
-impl MockVfsHost {
+impl MockHost {
     fn fixture() -> Self {
         let mut host = Self::default();
-        host.lists.insert(
-            "polymarket".into(),
-            vec!["markets".into(), "search".into(), "trade".into()],
+        host.responses.insert(
+            "GET https://gamma-api.polymarket.com/markets?closed=false&limit=20&order=volumeNum&ascending=false".into(),
+            br#"[{"slug":"test-market","conditionId":"cond","clobTokenIds":["yes-token","no-token"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true}]"#.to_vec(),
         );
-        host.lists
-            .insert("polymarket/markets".into(), vec!["test-market".into()]);
-        host.lists.insert(
-            "polymarket/markets/test-market".into(),
-            vec!["market.json".into(), "book.json".into()],
+        host.responses.insert(
+            "GET https://gamma-api.polymarket.com/markets/slug/test-market".into(),
+            br#"{"slug":"test-market","conditionId":"cond","clobTokenIds":["yes-token","no-token"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true}"#.to_vec(),
         );
-        host.lists
-            .insert("polymarket/trade".into(), vec!["alice".into()]);
-        host.lists.insert(
-            "polymarket/trade/alice".into(),
-            vec!["new".into(), "drafts".into()],
+        host.responses.insert(
+            "GET https://clob.polymarket.com/book?token_id=yes-token".into(),
+            br#"{"market":"cond","asset_id":"yes-token","tick_size":"0.01","min_order_size":"1","neg_risk":false,"last_trade_price":"0.42","bids":[],"asks":[]}"#.to_vec(),
         );
-        host.reads.insert(
-            "polymarket/markets/test-market/market.json".into(),
-            br#"{"slug":"test-market"}"#.to_vec(),
+        host.responses.insert(
+            "GET https://clob.polymarket.com/midpoint?token_id=yes-token".into(),
+            br#"{"mid":"0.42"}"#.to_vec(),
         );
-        host.reads.insert(
-            "polymarket/markets/test-market/book.json".into(),
-            br#"{"bids":[],"asks":[]}"#.to_vec(),
+        host.responses.insert(
+            "GET https://clob.polymarket.com/spread?token_id=yes-token".into(),
+            br#"{"spread":"0.01"}"#.to_vec(),
+        );
+        host.responses.insert(
+            "GET https://clob.polymarket.com/price?token_id=yes-token&side=BUY".into(),
+            br#"{"price":"0.43"}"#.to_vec(),
         );
         host
     }
 }
 
 #[async_trait]
-impl PetalHost for MockVfsHost {
+impl PetalHost for MockHost {
     async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
-        self.reads
-            .get(path)
-            .cloned()
-            .ok_or_else(|| HostError::NotFound(path.into()))
+        self.vfs_calls.lock().unwrap().push(format!("read {path}"));
+        Err(HostError::Denied("vfs not expected".into()))
     }
 
     async fn vfs_list(&self, path: &str) -> Result<Vec<String>, HostError> {
-        self.lists
-            .get(path)
-            .cloned()
-            .ok_or_else(|| HostError::Invalid(format!("{path} is not a dir")))
+        self.vfs_calls.lock().unwrap().push(format!("list {path}"));
+        Err(HostError::Denied("vfs not expected".into()))
     }
 
-    async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
-        self.writes
+    async fn vfs_write(&self, path: &str, _bytes: &[u8]) -> Result<(), HostError> {
+        self.vfs_calls.lock().unwrap().push(format!("write {path}"));
+        Err(HostError::Denied("vfs not expected".into()))
+    }
+
+    async fn http_fetch(
+        &self,
+        req: HttpRequest,
+        policy: NetPolicy,
+        max_response_bytes: usize,
+    ) -> Result<HttpResponse, HostError> {
+        policy.check(&req.method, &req.url)?;
+        self.http_calls
             .lock()
             .unwrap()
-            .insert(path.into(), bytes.to_vec());
-        Ok(())
+            .push((req.method.clone(), req.url.clone()));
+        let key = format!("{} {}", req.method, req.url);
+        let body = self
+            .responses
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| HostError::NotFound(key.clone()))?;
+        assert!(body.len() <= max_response_bytes);
+        Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body,
+        })
     }
 }
 

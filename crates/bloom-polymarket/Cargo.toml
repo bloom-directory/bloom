@@ -5,17 +5,21 @@ edition.workspace = true
 license.workspace = true
 description = "Polymarket v2 client (Gamma/Data/CLOB reads + L1/L2 auth signing) for bloom"
 
+[features]
+default = ["native-client"]
+native-client = ["dep:reqwest", "dep:tokio"]
+
 [dependencies]
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
-tokio.workspace = true
-reqwest.workspace = true
+tokio = { version = "1", default-features = false, features = ["time"], optional = true }
+reqwest = { workspace = true, optional = true }
 tracing.workspace = true
 url.workspace = true
-alloy.workspace = true
+alloy = { version = "2", default-features = false, features = ["dyn-abi", "k256", "signer-local", "sol-types", "std"] }
 hex.workspace = true
 rand.workspace = true
 sha2.workspace = true

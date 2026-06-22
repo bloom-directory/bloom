@@ -2405,9 +2405,13 @@ dependencies = [
  "bloom-petal-manifest",
  "bloom-petal-sdk",
  "bloom-petals",
+ "bloom-polymarket",
  "bloom-vfs",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
+ "url",
 ]
 
 [[package]]

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Example local Bloom handler petal that proxies the native Polymarket VFS surface"
+description = "Example local Bloom handler petal for the Polymarket VFS surface"
 publish = false
 
 [lib]
@@ -13,7 +13,11 @@ name = "bloom_local_petal_polymarket"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+bloom-polymarket = { path = "../../../crates/bloom-polymarket", default-features = false }
 bloom-petal-sdk = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

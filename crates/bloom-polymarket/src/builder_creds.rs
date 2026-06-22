@@ -96,7 +96,7 @@ impl BuilderCredentialStore {
     }
 
     pub fn save(&self, wallet: &str, creds: &BuilderCredentials) -> Result<()> {
-        crate::onboard::validate_wallet_name(wallet)?;
+        crate::validate_wallet_name(wallet)?;
         let dir = self.wallet_dir(wallet);
         fs::create_dir_all(&dir)?;
         #[cfg(unix)]
@@ -115,7 +115,7 @@ impl BuilderCredentialStore {
     }
 
     pub fn load(&self, wallet: &str) -> Result<Option<BuilderCredentials>> {
-        crate::onboard::validate_wallet_name(wallet)?;
+        crate::validate_wallet_name(wallet)?;
         match fs::read(self.creds_path(wallet)) {
             Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -124,7 +124,7 @@ impl BuilderCredentialStore {
     }
 
     pub fn delete(&self, wallet: &str) -> Result<()> {
-        crate::onboard::validate_wallet_name(wallet)?;
+        crate::validate_wallet_name(wallet)?;
         match fs::remove_file(self.creds_path(wallet)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

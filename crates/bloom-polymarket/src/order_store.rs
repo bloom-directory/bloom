@@ -25,10 +25,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::onboard::validate_wallet_name;
 use crate::order::OrderType;
 use crate::types::Side;
-use crate::{PolymarketError, Result};
+use crate::{PolymarketError, Result, validate_wallet_name};
 
 const LOCK_STALE_MS: u128 = 5 * 60 * 1000;
 

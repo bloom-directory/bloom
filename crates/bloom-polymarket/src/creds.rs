@@ -6,7 +6,6 @@
 //! (PR-4b) constructs the store with `~/.bloom/polymarket`.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::types::Credentials;
@@ -32,20 +31,28 @@ impl CredentialStore {
 
     /// Persist `creds` for `wallet` at mode `0o600` (dir `0o700`).
     pub fn save(&self, wallet: &str, creds: &Credentials) -> Result<()> {
-        crate::onboard::validate_wallet_name(wallet)?;
+        crate::validate_wallet_name(wallet)?;
         let dir = self.wallet_dir(wallet);
         fs::create_dir_all(&dir)?;
-        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+        }
         let path = self.creds_path(wallet);
         let body = serde_json::to_vec_pretty(creds)?;
         fs::write(&path, &body)?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 
     /// Load `wallet`'s credentials, or `None` if not yet stored.
     pub fn load(&self, wallet: &str) -> Result<Option<Credentials>> {
-        crate::onboard::validate_wallet_name(wallet)?;
+        crate::validate_wallet_name(wallet)?;
         let path = self.creds_path(wallet);
         match fs::read(&path) {
             Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
@@ -58,7 +65,7 @@ impl CredentialStore {
     /// have stored credentials (and must not escape the store dir), so it reads
     /// as `false` rather than touching the filesystem with an unchecked path.
     pub fn exists(&self, wallet: &str) -> bool {
-        if crate::onboard::validate_wallet_name(wallet).is_err() {
+        if crate::validate_wallet_name(wallet).is_err() {
             return false;
         }
         Path::new(&self.creds_path(wallet)).exists()
@@ -92,16 +99,20 @@ mod tests {
         assert_eq!(loaded.secret, sample().secret);
         assert_eq!(loaded.nonce, 7);
 
-        let mode = fs::metadata(dir.path().join("alice/creds.json"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(
-            mode & 0o777,
-            0o600,
-            "creds.json must be 0600, got {:o}",
-            mode & 0o777
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.path().join("alice/creds.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "creds.json must be 0600, got {:o}",
+                mode & 0o777
+            );
+        }
     }
 
     #[test]
