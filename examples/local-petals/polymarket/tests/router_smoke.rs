@@ -190,7 +190,7 @@ impl MockHost {
         );
         host.responses.insert(
             "GET https://clob.polymarket.com/book?token_id=yes-token".into(),
-            br#"{"market":"cond","asset_id":"yes-token","tick_size":"0.01","min_order_size":"1","neg_risk":false,"last_trade_price":"0.42","bids":[],"asks":[]}"#.to_vec(),
+            br#"{"market":"cond","asset_id":"yes-token","tick_size":"0.01","min_order_size":"1","neg_risk":false,"last_trade_price":"0.09","bids":[{"price":"0.08","size":"10"}],"asks":[{"price":"0.09","size":"10"}]}"#.to_vec(),
         );
         host.responses.insert(
             "GET https://clob.polymarket.com/midpoint?token_id=yes-token".into(),

@@ -13,7 +13,9 @@ use bloom_petal_sdk::{
     HttpRequest, SdkError, SignRequest,
 };
 use bloom_polymarket::eip712::clob_auth_signing_hash;
-use bloom_polymarket::order::{OrderType, parse_micro};
+use bloom_polymarket::order::{
+    LimitQuote, OrderType, format_micro, parse_micro, quantize_marketable_limit, quantize_price,
+};
 use bloom_polymarket::signer::{
     POLY_ADDRESS, POLY_NONCE, POLY_SIGNATURE, POLY_TIMESTAMP, l2_headers,
 };
@@ -435,17 +437,68 @@ fn write_trade_new(wallet: &str, body: &[u8]) -> DispatchResponse {
         None if req.limit_price.is_some() => OrderType::GTC,
         None => OrderType::FAK,
     };
+    let snapshot = match trade_snapshot(&req.slug, &req.outcome) {
+        Ok(snapshot) => snapshot,
+        Err(resp) => return resp,
+    };
+    let marketable = req.limit_price.is_none();
+    let pinned_limit_micro = match req.limit_price.as_deref() {
+        Some(limit) => match parse_micro(limit.trim()) {
+            Ok(value) if value > 0 => value,
+            Ok(_) => return error(-3, "limit_price must be > 0"),
+            Err(e) => return error(-3, e.to_string()),
+        },
+        None => bound_micro,
+    };
+    if !marketable {
+        match side {
+            Side::Buy if pinned_limit_micro > bound_micro => {
+                return error(-3, "limit_price exceeds max_price");
+            }
+            Side::Sell if pinned_limit_micro < bound_micro => {
+                return error(-3, "limit_price is below min_price");
+            }
+            _ => {}
+        }
+    }
+    let limit_micro =
+        match choose_trade_limit(side, marketable, bound_micro, pinned_limit_micro, &snapshot) {
+            Ok(limit) => limit,
+            Err(resp) => return resp,
+        };
+    let quote = match build_trade_quote(side, amount_micro, limit_micro, &snapshot, order_type) {
+        Ok(quote) => quote,
+        Err(resp) => return resp,
+    };
     let id = next_id(&format!("trade/{wallet}/drafts/"), "/order.json");
     let draft = StoreTradeDraft {
         id: id.clone(),
         wallet: wallet.into(),
         slug: req.slug,
-        outcome: req.outcome,
+        question: snapshot.market.question,
+        condition_id: snapshot.market.condition_id,
+        outcome: snapshot.outcome,
+        token_id: snapshot.token_id,
         side,
         order_type,
         amount_micro,
         price_bound_micro: bound_micro,
         limit_price: req.limit_price,
+        marketable,
+        limit_price_micro: quote.price_micro,
+        size_micro: quote.size_micro,
+        maker_micro: quote.maker_micro,
+        taker_micro: quote.taker_micro,
+        tick_micro: snapshot.tick_micro,
+        min_order_size_micro: snapshot.min_size_micro,
+        neg_risk: snapshot.neg_risk,
+        active: snapshot.active,
+        closed: snapshot.closed,
+        order_book_enabled: snapshot.order_book_enabled,
+        binary_outcomes: true,
+        best_ask_micro: snapshot.best_ask_micro,
+        best_bid_micro: snapshot.best_bid_micro,
+        book_snapshot_secs: now_secs(),
         status: "review".into(),
     };
     let base = format!("trade/{wallet}/drafts/{id}");
@@ -457,8 +510,13 @@ fn write_trade_new(wallet: &str, body: &[u8]) -> DispatchResponse {
     if let DispatchResponse::Error { .. } = store_put_json(
         &format!("{base}/policy_check.json"),
         &serde_json::json!({
-            "status": "pending",
-            "message": "policy evaluation remains in the native daemon until full signing port"
+            "status": "passed",
+            "active": draft.active,
+            "closed": draft.closed,
+            "binary_outcomes": draft.binary_outcomes,
+            "order_book_enabled": draft.order_book_enabled,
+            "size_at_or_above_min": draft.size_micro >= draft.min_order_size_micro,
+            "signing_pending": true
         }),
         false,
     ) {
@@ -469,9 +527,26 @@ fn write_trade_new(wallet: &str, body: &[u8]) -> DispatchResponse {
         &serde_json::json!({
             "side": draft.side,
             "order_type": draft.order_type.as_str(),
+            "marketable": draft.marketable,
             "amount_micro": draft.amount_micro,
+            "amount": format_micro(draft.amount_micro),
             "price_bound_micro": draft.price_bound_micro,
-            "status": "staged"
+            "price_bound": format_micro(draft.price_bound_micro),
+            "limit_price_micro": draft.limit_price_micro,
+            "limit_price": format_micro(draft.limit_price_micro),
+            "size_micro": draft.size_micro,
+            "size": format_micro(draft.size_micro),
+            "maker_micro": draft.maker_micro,
+            "maker": format_micro(draft.maker_micro),
+            "taker_micro": draft.taker_micro,
+            "taker": format_micro(draft.taker_micro),
+            "tick_micro": draft.tick_micro,
+            "tick": format_micro(draft.tick_micro),
+            "min_order_size_micro": draft.min_order_size_micro,
+            "min_order_size": format_micro(draft.min_order_size_micro),
+            "best_ask_micro": draft.best_ask_micro,
+            "best_bid_micro": draft.best_bid_micro,
+            "status": "quoted"
         }),
         false,
     ) {
@@ -482,6 +557,11 @@ fn write_trade_new(wallet: &str, body: &[u8]) -> DispatchResponse {
         &serde_json::json!({
             "wallet": wallet,
             "draft_id": id,
+            "slug": draft.slug,
+            "outcome": draft.outcome,
+            "token_id": draft.token_id,
+            "limit_price": format_micro(draft.limit_price_micro),
+            "size": format_micro(draft.size_micro),
             "status": "created"
         }),
         false,
@@ -489,6 +569,222 @@ fn write_trade_new(wallet: &str, body: &[u8]) -> DispatchResponse {
         return error(-4, "failed to store review intent");
     }
     DispatchResponse::Write
+}
+
+fn trade_snapshot(slug: &str, outcome: &str) -> Result<TradeSnapshot, DispatchResponse> {
+    let market: Market = get_json(&format!("{GAMMA}/markets/slug/{slug}"))?;
+    if !market.is_binary() {
+        return Err(error(
+            -3,
+            format!("market '{slug}' is not a binary YES/NO market"),
+        ));
+    }
+    if !market.active {
+        return Err(error(-3, format!("market '{slug}' is not active")));
+    }
+    if market.closed {
+        return Err(error(-3, format!("market '{slug}' is closed")));
+    }
+    if !market.enable_order_book {
+        return Err(error(
+            -3,
+            format!("market '{slug}' does not have the order book enabled"),
+        ));
+    }
+    let outcome = match outcome.to_ascii_uppercase().as_str() {
+        "YES" => "YES",
+        "NO" => "NO",
+        other => return Err(error(-3, format!("outcome must be YES or NO, got {other}"))),
+    };
+    let token_id = match outcome {
+        "YES" => market.yes_token_id(),
+        "NO" => market.no_token_id(),
+        _ => None,
+    }
+    .ok_or_else(|| error(-3, format!("market '{slug}' has no {outcome} token id")))?
+    .to_string();
+    let book: OrderBook = get_json(&url_with_query(
+        &format!("{CLOB}/book"),
+        &[("token_id", &token_id)],
+    ))?;
+    if !book.asset_id.is_empty() && book.asset_id != token_id {
+        return Err(error(
+            -4,
+            format!(
+                "CLOB book token mismatch: requested {token_id}, received {}",
+                book.asset_id
+            ),
+        ));
+    }
+    if !book.market.is_empty()
+        && !market.condition_id.is_empty()
+        && book.market != market.condition_id
+    {
+        return Err(error(
+            -4,
+            format!(
+                "CLOB book condition mismatch: Gamma {} vs CLOB {}",
+                market.condition_id, book.market
+            ),
+        ));
+    }
+    if book.neg_risk != market.neg_risk {
+        return Err(error(
+            -4,
+            format!(
+                "neg_risk mismatch for '{slug}': Gamma={} CLOB={}",
+                market.neg_risk, book.neg_risk
+            ),
+        ));
+    }
+    let tick_micro = if book.tick_size.trim().is_empty() {
+        match market.order_price_min_tick_size {
+            Some(tick) => parse_api_float_micro(tick, "orderPriceMinTickSize")?,
+            None => return Err(error(-4, "CLOB book omitted tick_size")),
+        }
+    } else {
+        parse_micro(&book.tick_size).map_err(|e| error(-4, e.to_string()))?
+    };
+    let min_size_micro = if book.min_order_size.trim().is_empty() {
+        match market.order_min_size {
+            Some(size) => parse_api_float_micro(size, "orderMinSize")?,
+            None => 0,
+        }
+    } else {
+        parse_micro(&book.min_order_size).map_err(|e| error(-4, e.to_string()))?
+    };
+    let best_ask_micro = best_price(&book.asks, true)?;
+    let best_bid_micro = best_price(&book.bids, false)?;
+    Ok(TradeSnapshot {
+        market,
+        outcome: outcome.into(),
+        token_id,
+        neg_risk: book.neg_risk,
+        tick_micro,
+        min_size_micro,
+        best_ask_micro,
+        best_bid_micro,
+        active: true,
+        closed: false,
+        order_book_enabled: true,
+    })
+}
+
+fn best_price(
+    levels: &[bloom_polymarket::types::BookLevel],
+    ask: bool,
+) -> Result<Option<u64>, DispatchResponse> {
+    let mut best: Option<u64> = None;
+    for level in levels {
+        let price = parse_micro(&level.price).map_err(|e| error(-4, e.to_string()))?;
+        best = Some(match best {
+            None => price,
+            Some(existing) if ask => existing.min(price),
+            Some(existing) => existing.max(price),
+        });
+    }
+    Ok(best)
+}
+
+fn choose_trade_limit(
+    side: Side,
+    marketable: bool,
+    bound_micro: u64,
+    pinned_limit_micro: u64,
+    snapshot: &TradeSnapshot,
+) -> Result<u64, DispatchResponse> {
+    if !marketable {
+        return Ok(quantize_price(
+            pinned_limit_micro,
+            snapshot.tick_micro,
+            side,
+        ));
+    }
+    match side {
+        Side::Buy => {
+            let Some(ask) = snapshot.best_ask_micro else {
+                return Err(error(-3, "order book has no asks"));
+            };
+            if ask > bound_micro {
+                return Err(error(
+                    -3,
+                    format!(
+                        "best ask {} exceeds max price {}",
+                        format_micro(ask),
+                        format_micro(bound_micro)
+                    ),
+                ));
+            }
+            Ok(quantize_marketable_limit(ask, snapshot.tick_micro, side))
+        }
+        Side::Sell => {
+            let Some(bid) = snapshot.best_bid_micro else {
+                return Err(error(-3, "order book has no bids"));
+            };
+            if bid < bound_micro {
+                return Err(error(
+                    -3,
+                    format!(
+                        "best bid {} is below min price {}",
+                        format_micro(bid),
+                        format_micro(bound_micro)
+                    ),
+                ));
+            }
+            let limit = quantize_marketable_limit(bid, snapshot.tick_micro, side);
+            if limit < bound_micro {
+                return Err(error(
+                    -3,
+                    format!(
+                        "tick quantization gives {} below min price {}",
+                        format_micro(limit),
+                        format_micro(bound_micro)
+                    ),
+                ));
+            }
+            Ok(limit)
+        }
+    }
+}
+
+fn build_trade_quote(
+    side: Side,
+    amount_micro: u64,
+    limit_micro: u64,
+    snapshot: &TradeSnapshot,
+    order_type: OrderType,
+) -> Result<LimitQuote, DispatchResponse> {
+    let market_class = matches!(order_type, OrderType::FAK | OrderType::FOK);
+    let quote = match (side, market_class) {
+        (Side::Buy, true) => {
+            LimitQuote::market_buy_from_spend(amount_micro, limit_micro, snapshot.tick_micro)
+        }
+        (Side::Buy, false) => {
+            LimitQuote::buy_from_spend(amount_micro, limit_micro, snapshot.tick_micro)
+        }
+        (Side::Sell, _) => {
+            LimitQuote::sell_from_shares(amount_micro, limit_micro, snapshot.tick_micro)
+        }
+    }
+    .map_err(|e| error(-3, e.to_string()))?;
+    if quote.size_micro < snapshot.min_size_micro {
+        return Err(error(
+            -3,
+            format!(
+                "order size {} shares is below market minimum {}",
+                format_micro(quote.size_micro),
+                format_micro(snapshot.min_size_micro)
+            ),
+        ));
+    }
+    Ok(quote)
+}
+
+fn parse_api_float_micro(value: f64, field: &str) -> Result<u64, DispatchResponse> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(error(-4, format!("{field} is not a non-negative number")));
+    }
+    parse_micro(&format!("{value:.6}")).map_err(|e| error(-4, e.to_string()))
 }
 
 fn read_trade(wallet: &str, kind: &str, id: &str, file: &str) -> DispatchResponse {
@@ -815,14 +1111,19 @@ fn render_onboard_plan(wallet: &str) -> String {
 
 fn render_trade_plan(draft: &StoreTradeDraft) -> String {
     format!(
-        "# Polymarket order draft {}\n\nWallet: {}\nMarket: {}\nOutcome: {}\nSide: {:?}\nAmount micro: {}\nPrice bound micro: {}\nStatus: {}\n\nSigning and posting are pending the full sign_hash port.\n",
+        "# Polymarket order draft {}\n\nWallet: {}\nMarket: {}\nQuestion: {}\nOutcome: {}\nToken: {}\nSide: {:?}\nOrder type: {}\nAmount: {}\nPrice bound: {}\nLimit price: {}\nSize: {}\nStatus: {}\n\nThe draft is live-quoted from Gamma/CLOB and ready for review. Signing and posting are still pending.\n",
         draft.id,
         draft.wallet,
         draft.slug,
+        draft.question,
         draft.outcome,
+        draft.token_id,
         draft.side,
-        draft.amount_micro,
-        draft.price_bound_micro,
+        draft.order_type.as_str(),
+        format_micro(draft.amount_micro),
+        format_micro(draft.price_bound_micro),
+        format_micro(draft.limit_price_micro),
+        format_micro(draft.size_micro),
         draft.status
     )
 }
@@ -1006,13 +1307,46 @@ struct StoreTradeDraft {
     id: String,
     wallet: String,
     slug: String,
+    question: String,
+    condition_id: String,
     outcome: String,
+    token_id: String,
     side: Side,
     order_type: OrderType,
     amount_micro: u64,
     price_bound_micro: u64,
     limit_price: Option<String>,
+    marketable: bool,
+    limit_price_micro: u64,
+    size_micro: u64,
+    maker_micro: u64,
+    taker_micro: u64,
+    tick_micro: u64,
+    min_order_size_micro: u64,
+    neg_risk: bool,
+    active: bool,
+    closed: bool,
+    order_book_enabled: bool,
+    binary_outcomes: bool,
+    best_ask_micro: Option<u64>,
+    best_bid_micro: Option<u64>,
+    book_snapshot_secs: u64,
     status: String,
+}
+
+#[derive(Debug, Clone)]
+struct TradeSnapshot {
+    market: Market,
+    outcome: String,
+    token_id: String,
+    neg_risk: bool,
+    tick_micro: u64,
+    min_size_micro: u64,
+    best_ask_micro: Option<u64>,
+    best_bid_micro: Option<u64>,
+    active: bool,
+    closed: bool,
+    order_book_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1043,6 +1377,40 @@ fn default_slippage_bps() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn market() -> Market {
+        Market {
+            id: "1".into(),
+            slug: "example".into(),
+            question: "Example?".into(),
+            condition_id: "0xabc".into(),
+            clob_token_ids: vec!["111".into(), "222".into()],
+            outcomes: vec!["Yes".into(), "No".into()],
+            outcome_prices: Vec::new(),
+            active: true,
+            closed: false,
+            enable_order_book: true,
+            order_price_min_tick_size: None,
+            order_min_size: None,
+            neg_risk: false,
+        }
+    }
+
+    fn snapshot(best_ask_micro: Option<u64>, best_bid_micro: Option<u64>) -> TradeSnapshot {
+        TradeSnapshot {
+            market: market(),
+            outcome: "YES".into(),
+            token_id: "111".into(),
+            neg_risk: false,
+            tick_micro: 10_000,
+            min_size_micro: 5_000_000,
+            best_ask_micro,
+            best_bid_micro,
+            active: true,
+            closed: false,
+            order_book_enabled: true,
+        }
+    }
 
     #[test]
     fn path_validation_rejects_escape_segments() {
@@ -1086,5 +1454,27 @@ mod tests {
             url,
             "https://gamma-api.polymarket.com/public-search?q=hello+world"
         );
+    }
+
+    #[test]
+    fn trade_quote_uses_live_best_ask_and_market_buy_rounding() {
+        let snap = snapshot(Some(695_000), Some(690_000));
+        let limit = choose_trade_limit(Side::Buy, true, 700_000, 700_000, &snap).unwrap();
+        assert_eq!(limit, 690_000);
+
+        let quote =
+            build_trade_quote(Side::Buy, 10_000_000, limit, &snap, OrderType::FAK).expect("quote");
+        assert_eq!(quote.side, Side::Buy);
+        assert_eq!(quote.price_micro, 690_000);
+        assert_eq!(quote.maker_micro, 10_000_000);
+        assert!(quote.size_micro >= snap.min_size_micro);
+    }
+
+    #[test]
+    fn trade_limit_rejects_sell_when_tick_rounding_breaks_min_price() {
+        let snap = snapshot(Some(700_000), Some(695_000));
+        let err = choose_trade_limit(Side::Sell, true, 691_000, 691_000, &snap)
+            .expect_err("tick rounding should fall below min price");
+        assert!(matches!(err, DispatchResponse::Error { code: -3, .. }));
     }
 }
