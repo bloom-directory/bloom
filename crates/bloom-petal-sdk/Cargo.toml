@@ -1,0 +1,15 @@
+[package]
+name = "bloom-petal-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Guest-side SDK for Bloom local handler petals: dispatch ABI, host imports, and export helpers"
+
+[lib]
+name = "bloom_petal_sdk"
+
+[features]
+default = ["std"]
+std = []

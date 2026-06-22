@@ -2602,6 +2602,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-petal-sdk"
+version = "0.1.0"
+
+[[package]]
 name = "bloom-petals"
 version = "0.1.0"
 dependencies = [
