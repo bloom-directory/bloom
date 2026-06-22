@@ -1597,6 +1597,7 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                 let cs: Vec<&str> = meta.caps.iter().map(|c| c.as_str()).collect();
                 println!("caps: {}", cs.join(", "));
             }
+            print_local_petal_consent(&meta, d.petals.store().private_data_root());
             Ok(())
         }
         PetalsCmd::Run {
@@ -1699,6 +1700,82 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                 println!("not installed: {hash}");
             }
             Ok(())
+        }
+    }
+}
+
+fn print_local_petal_consent(
+    meta: &bloom_petals::PetalMeta,
+    private_data_root: std::path::PathBuf,
+) {
+    let Some(manifest) = &meta.local_manifest else {
+        return;
+    };
+    println!("app_mount: apps/{}/", manifest.provides.mount);
+    if manifest
+        .provides
+        .caps
+        .iter()
+        .any(|cap| cap.as_str() == "store")
+    {
+        println!(
+            "private_store: {}",
+            private_data_root.join(&meta.hash).display()
+        );
+    }
+    if manifest
+        .provides
+        .caps
+        .iter()
+        .any(|cap| cap.as_str() == "sign")
+    {
+        println!("signing: may request daemon-mediated signatures");
+    }
+    if let Some(net) = &manifest.net
+        && !net.allow.is_empty()
+    {
+        println!("network:");
+        for rule in &net.allow {
+            let methods = rule
+                .effective_methods()
+                .into_iter()
+                .map(|method| method.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            let paths = rule
+                .paths
+                .as_ref()
+                .map(|paths| paths.join(","))
+                .unwrap_or_else(|| "/*".to_string());
+            println!(
+                "  - host={} methods=[{}] paths=[{}]",
+                rule.host, methods, paths
+            );
+        }
+    }
+    if !manifest.endpoint.is_empty() {
+        println!("endpoints:");
+        for endpoint in &manifest.endpoint {
+            let mut flags = Vec::new();
+            if endpoint.write {
+                flags.push("write");
+            }
+            if endpoint.async_dispatch {
+                flags.push("async");
+            }
+            if endpoint.read_side_effecting {
+                flags.push("read_side_effecting");
+            }
+            if let Some(ttl) = endpoint.cache_ttl_ms {
+                println!(
+                    "  - {} cache_ttl_ms={} flags=[{}]",
+                    endpoint.path,
+                    ttl,
+                    flags.join(",")
+                );
+            } else {
+                println!("  - {} flags=[{}]", endpoint.path, flags.join(","));
+            }
         }
     }
 }

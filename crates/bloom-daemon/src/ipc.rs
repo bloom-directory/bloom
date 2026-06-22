@@ -512,6 +512,10 @@ impl IpcServer {
             }
         };
         let (result, meta) = runner.install(&bytes, name, &caps, mode)?;
+        let local_manifest = meta.local_manifest.clone();
+        let app_mount = local_manifest
+            .as_ref()
+            .map(|manifest| format!("apps/{}/", manifest.provides.mount));
         Ok(json!({
             "hash": result.hash,
             "size": result.size,
@@ -520,6 +524,8 @@ impl IpcServer {
             "caps": meta.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
             "installed_at_ms": meta.installed_at_ms,
             "mode": meta.mode_str(),
+            "app_mount": app_mount,
+            "local_manifest": local_manifest,
         }))
     }
 
@@ -577,6 +583,8 @@ impl IpcServer {
                 "caps": meta.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
                 "installed_at_ms": meta.installed_at_ms,
                 "mode": meta.mode_str(),
+                "app_mount": meta.local_manifest.as_ref().map(|manifest| format!("apps/{}/", manifest.provides.mount)),
+                "local_manifest": meta.local_manifest,
             }));
         }
         Ok(Value::Array(out))

@@ -8,17 +8,20 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bloom_petal_manifest::local::LocalPetalManifest;
 use bloom_vfs::handler::HandlerError;
 use bloom_vfs::path::VfsPath;
 use bloom_vfs::{Handler, Vfs};
+use parking_lot::RwLock;
 
+use crate::DispatchRequest;
 use crate::error::PetalError;
 use crate::host::{HostError, PetalHost};
 use crate::meta::{Capability, PetalMeta};
 use crate::policy::NetPolicy;
 use crate::registry::NameRegistry;
 use crate::store::{InstallResult, PetalStore};
-use crate::vm::{PetalVm, RunOptions, RunOutput};
+use crate::vm::{DispatchOutput, PetalVm, RunOptions, RunOutput};
 
 /// Wraps an `Arc<Vfs>` so a petal's `bloom.vfs_read`/`vfs_write` calls
 /// land on the live VFS (and therefore on the same daemon state the
@@ -37,15 +40,67 @@ impl VfsHost {
 impl PetalHost for VfsHost {
     async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
         let path = VfsPath::parse(path).map_err(|e| HostError::Invalid(format!("path: {e}")))?;
+        deny_apps_subtree(&path)?;
         self.vfs.read(&path).await.map_err(host_from_handler)
     }
 
     async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
         let path = VfsPath::parse(path).map_err(|e| HostError::Invalid(format!("path: {e}")))?;
+        deny_apps_subtree(&path)?;
         self.vfs
             .write(&path, bytes)
             .await
             .map_err(host_from_handler)
+    }
+}
+
+fn deny_apps_subtree(path: &VfsPath) -> Result<(), HostError> {
+    if path.first() == Some("apps") {
+        return Err(HostError::Denied(
+            "petals may not call other apps through vfs imports".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// A VFS host whose router is set after the daemon finishes building the VFS.
+///
+/// `apps/` needs a [`PetalHost`] while the VFS builder is still being wired,
+/// but the host itself should point at the final router. This tiny indirection
+/// avoids disabling `vfs.read`/`vfs.write` for app petals.
+#[derive(Default)]
+pub struct LateVfsHost {
+    vfs: RwLock<Option<Arc<Vfs>>>,
+}
+
+impl LateVfsHost {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set(&self, vfs: Arc<Vfs>) {
+        *self.vfs.write() = Some(vfs);
+    }
+
+    fn current(&self) -> Result<Arc<Vfs>, HostError> {
+        self.vfs
+            .read()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| HostError::Backend("VFS host not initialised".into()))
+    }
+}
+
+#[async_trait]
+impl PetalHost for LateVfsHost {
+    async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+        let vfs = self.current()?;
+        VfsHost::new(vfs).vfs_read(path).await
+    }
+
+    async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
+        let vfs = self.current()?;
+        VfsHost::new(vfs).vfs_write(path, bytes).await
     }
 }
 
@@ -187,6 +242,36 @@ impl PetalRunner {
             .ok_or_else(|| PetalError::NotFound(name_or_hash.to_string()))
     }
 
+    pub fn local_mounts(&self) -> Result<Vec<(String, String)>, PetalError> {
+        let mut out = Vec::new();
+        for hash in self
+            .store
+            .list_hashes_by_mode(crate::meta::PetalMode::Local)?
+        {
+            let meta = self.store.load_meta(&hash)?;
+            if let Some(manifest) = meta.local_manifest {
+                out.push((manifest.provides.mount, hash));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    pub fn resolve_mount(&self, mount: &str) -> Result<String, PetalError> {
+        self.local_mounts()?
+            .into_iter()
+            .find_map(|(candidate, hash)| (candidate == mount).then_some(hash))
+            .ok_or_else(|| PetalError::NotFound(format!("apps/{mount}")))
+    }
+
+    pub fn local_manifest_for_mount(&self, mount: &str) -> Result<LocalPetalManifest, PetalError> {
+        let hash = self.resolve_mount(mount)?;
+        self.store
+            .load_meta(&hash)?
+            .local_manifest
+            .ok_or_else(|| PetalError::NotFound(format!("apps/{mount}")))
+    }
+
     /// Run a petal by name or hash. The caps used at runtime are the
     /// petal's declared caps, intersected with `cap_mask` if provided
     /// (`None` means "use the petal's declared caps"). Callers that
@@ -224,6 +309,38 @@ impl PetalRunner {
         }
         self.vm
             .run(&wasm, stdin, caps, host, &hash, meta.mode, opts)
+            .await
+    }
+
+    pub async fn dispatch_mount(
+        &self,
+        mount: &str,
+        request: DispatchRequest,
+        host: Arc<dyn PetalHost>,
+        cap_mask: Option<BTreeSet<Capability>>,
+        opts: RunOptions,
+    ) -> Result<DispatchOutput, PetalError> {
+        let hash = self.resolve_mount(mount)?;
+        let wasm = self.store.read_wasm(&hash)?;
+        let meta = self.store.load_meta(&hash)?;
+        let Some(manifest) = &meta.local_manifest else {
+            return Err(PetalError::NotFound(format!("apps/{mount}")));
+        };
+        let caps = match cap_mask {
+            Some(mask) => meta.caps.intersection(&mask).copied().collect(),
+            None => meta.caps.clone(),
+        };
+        let declared = NetPolicy::from_manifest(manifest);
+        let mut opts = opts;
+        opts.net_policy = Some(match opts.net_policy {
+            Some(mask) => declared.intersect(&mask),
+            None => declared,
+        });
+        if opts.private_store_root.is_none() {
+            opts.private_store_root = Some(self.store.private_data_root());
+        }
+        self.vm
+            .dispatch(&wasm, request, caps, host, &hash, opts)
             .await
     }
 }
@@ -361,6 +478,27 @@ paths = ["/markets*"]
         }
     }
 
+    struct StaticHandler;
+
+    #[async_trait::async_trait]
+    impl Handler for StaticHandler {
+        async fn lookup(&self, path: &VfsPath) -> Result<bloom_vfs::Entry, HandlerError> {
+            if path.is_root() {
+                Ok(bloom_vfs::Entry::dir(""))
+            } else {
+                Ok(bloom_vfs::Entry::read_only_file("x"))
+            }
+        }
+
+        async fn read(&self, _path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+            Ok(b"reachable".to_vec())
+        }
+
+        async fn write(&self, _path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn install_from_wat_then_run_by_name() {
         let (_d, r) = runner();
@@ -386,6 +524,22 @@ paths = ["/markets*"]
             .unwrap();
         assert_eq!(out.exit_code, 0);
         assert_eq!(out.stdout, b"hi from petal\n");
+    }
+
+    #[tokio::test]
+    async fn vfs_host_denies_apps_subtree_to_prevent_petal_recursion() {
+        let vfs = Vfs::builder()
+            .mount("apps", Arc::new(StaticHandler) as _)
+            .build();
+        let host = VfsHost::new(Arc::new(vfs));
+        assert!(matches!(
+            host.vfs_read("apps/demo/file").await,
+            Err(HostError::Denied(_))
+        ));
+        assert!(matches!(
+            host.vfs_write("apps/demo/file", b"x").await,
+            Err(HostError::Denied(_))
+        ));
     }
 
     #[tokio::test]

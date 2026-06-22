@@ -7,6 +7,7 @@ use crate::host::HostError;
 
 const MAX_STRING_LEN: usize = 64 * 1024;
 const MAX_HEADERS: usize = 256;
+const MAX_LIST_ENTRIES: usize = 8192;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpRequest {
@@ -30,6 +31,50 @@ pub struct SignRequest {
     pub purpose: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchOp {
+    Lookup,
+    List,
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchRequest {
+    pub op: DispatchOp,
+    pub path: String,
+    pub body: Vec<u8>,
+    pub ctx: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchEntryKind {
+    Dir,
+    File,
+    WritableFile,
+    ExecutableFile,
+    Symlink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchEntry {
+    pub name: String,
+    pub kind: DispatchEntryKind,
+    pub size: u64,
+    pub mode: u32,
+    pub ttl_hint_ms: Option<u64>,
+    pub link_target: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchResponse {
+    Lookup(DispatchEntry),
+    List(Vec<DispatchEntry>),
+    Read(Vec<u8>),
+    Write,
+    Error { code: i32, message: String },
+}
+
 pub fn encode_http_request(req: &HttpRequest) -> Vec<u8> {
     let mut out = Vec::new();
     put_string(&mut out, &req.method);
@@ -37,6 +82,96 @@ pub fn encode_http_request(req: &HttpRequest) -> Vec<u8> {
     put_headers(&mut out, &req.headers);
     put_bytes(&mut out, &req.body);
     out
+}
+
+pub fn encode_dispatch_request(req: &DispatchRequest) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(match req.op {
+        DispatchOp::Lookup => 0,
+        DispatchOp::List => 1,
+        DispatchOp::Read => 2,
+        DispatchOp::Write => 3,
+    });
+    put_string(&mut out, &req.path);
+    put_bytes(&mut out, &req.body);
+    put_headers(&mut out, &req.ctx);
+    out
+}
+
+pub fn decode_dispatch_request(bytes: &[u8]) -> Result<DispatchRequest, HostError> {
+    let mut r = Reader::new(bytes);
+    let op = match r.u8()? {
+        0 => DispatchOp::Lookup,
+        1 => DispatchOp::List,
+        2 => DispatchOp::Read,
+        3 => DispatchOp::Write,
+        _ => return Err(HostError::Invalid("unknown dispatch op".into())),
+    };
+    let path = r.string()?;
+    let body = r.bytes()?.to_vec();
+    let ctx = r.headers()?;
+    r.finish()?;
+    Ok(DispatchRequest {
+        op,
+        path,
+        body,
+        ctx,
+    })
+}
+
+pub fn encode_dispatch_response(resp: &DispatchResponse) -> Vec<u8> {
+    let mut out = Vec::new();
+    match resp {
+        DispatchResponse::Lookup(entry) => {
+            out.push(0);
+            put_entry(&mut out, entry);
+        }
+        DispatchResponse::List(entries) => {
+            out.push(1);
+            put_u32(&mut out, entries.len() as u32);
+            for entry in entries {
+                put_entry(&mut out, entry);
+            }
+        }
+        DispatchResponse::Read(bytes) => {
+            out.push(2);
+            put_bytes(&mut out, bytes);
+        }
+        DispatchResponse::Write => out.push(3),
+        DispatchResponse::Error { code, message } => {
+            out.push(4);
+            put_i32(&mut out, *code);
+            put_string(&mut out, message);
+        }
+    }
+    out
+}
+
+pub fn decode_dispatch_response(bytes: &[u8]) -> Result<DispatchResponse, HostError> {
+    let mut r = Reader::new(bytes);
+    let response = match r.u8()? {
+        0 => DispatchResponse::Lookup(r.entry()?),
+        1 => {
+            let count = r.u32()? as usize;
+            if count > MAX_LIST_ENTRIES {
+                return Err(HostError::Invalid("too many dispatch entries".into()));
+            }
+            let mut entries = Vec::with_capacity(count);
+            for _ in 0..count {
+                entries.push(r.entry()?);
+            }
+            DispatchResponse::List(entries)
+        }
+        2 => DispatchResponse::Read(r.bytes()?.to_vec()),
+        3 => DispatchResponse::Write,
+        4 => DispatchResponse::Error {
+            code: r.i32()?,
+            message: r.string()?,
+        },
+        _ => return Err(HostError::Invalid("unknown dispatch response tag".into())),
+    };
+    r.finish()?;
+    Ok(response)
 }
 
 pub fn decode_http_request(bytes: &[u8]) -> Result<HttpRequest, HostError> {
@@ -137,6 +272,41 @@ fn put_headers(out: &mut Vec<u8>, headers: &[(String, String)]) {
     }
 }
 
+fn put_entry(out: &mut Vec<u8>, entry: &DispatchEntry) {
+    put_string(out, &entry.name);
+    out.push(match entry.kind {
+        DispatchEntryKind::Dir => 0,
+        DispatchEntryKind::File => 1,
+        DispatchEntryKind::WritableFile => 2,
+        DispatchEntryKind::ExecutableFile => 3,
+        DispatchEntryKind::Symlink => 4,
+    });
+    put_u64(out, entry.size);
+    put_u32(out, entry.mode);
+    put_opt_u64(out, entry.ttl_hint_ms);
+    put_opt_string(out, entry.link_target.as_deref());
+}
+
+fn put_opt_u64(out: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            put_u64(out, value);
+        }
+        None => out.push(0),
+    }
+}
+
+fn put_opt_string(out: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            out.push(1);
+            put_string(out, value);
+        }
+        None => out.push(0),
+    }
+}
+
 fn put_string(out: &mut Vec<u8>, s: &str) {
     put_bytes(out, s.as_bytes());
 }
@@ -147,6 +317,14 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 fn put_u32(out: &mut Vec<u8>, n: u32) {
+    out.extend_from_slice(&n.to_le_bytes());
+}
+
+fn put_i32(out: &mut Vec<u8>, n: i32) {
+    out.extend_from_slice(&n.to_le_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, n: u64) {
     out.extend_from_slice(&n.to_le_bytes());
 }
 
@@ -168,9 +346,23 @@ impl<'a> Reader<'a> {
         }
     }
 
+    fn u8(&mut self) -> Result<u8, HostError> {
+        Ok(self.take(1)?[0])
+    }
+
     fn u32(&mut self) -> Result<u32, HostError> {
         let raw = self.take(4)?;
         Ok(u32::from_le_bytes(raw.try_into().expect("len checked")))
+    }
+
+    fn i32(&mut self) -> Result<i32, HostError> {
+        let raw = self.take(4)?;
+        Ok(i32::from_le_bytes(raw.try_into().expect("len checked")))
+    }
+
+    fn u64(&mut self) -> Result<u64, HostError> {
+        let raw = self.take(8)?;
+        Ok(u64::from_le_bytes(raw.try_into().expect("len checked")))
     }
 
     fn bytes(&mut self) -> Result<&'a [u8], HostError> {
@@ -196,6 +388,46 @@ impl<'a> Reader<'a> {
             out.push((self.string()?, self.string()?));
         }
         Ok(out)
+    }
+
+    fn entry(&mut self) -> Result<DispatchEntry, HostError> {
+        let name = self.string()?;
+        let kind = match self.u8()? {
+            0 => DispatchEntryKind::Dir,
+            1 => DispatchEntryKind::File,
+            2 => DispatchEntryKind::WritableFile,
+            3 => DispatchEntryKind::ExecutableFile,
+            4 => DispatchEntryKind::Symlink,
+            _ => return Err(HostError::Invalid("unknown dispatch entry kind".into())),
+        };
+        let size = self.u64()?;
+        let mode = self.u32()?;
+        let ttl_hint_ms = self.opt_u64()?;
+        let link_target = self.opt_string()?;
+        Ok(DispatchEntry {
+            name,
+            kind,
+            size,
+            mode,
+            ttl_hint_ms,
+            link_target,
+        })
+    }
+
+    fn opt_u64(&mut self) -> Result<Option<u64>, HostError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.u64()?)),
+            _ => Err(HostError::Invalid("invalid option tag".into())),
+        }
+    }
+
+    fn opt_string(&mut self) -> Result<Option<String>, HostError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.string()?)),
+            _ => Err(HostError::Invalid("invalid option tag".into())),
+        }
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8], HostError> {
@@ -240,5 +472,32 @@ mod tests {
             decode_sign_request(&bad),
             Err(HostError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn dispatch_roundtrip() {
+        let req = DispatchRequest {
+            op: DispatchOp::Write,
+            path: "orders/new".into(),
+            body: b"body".to_vec(),
+            ctx: vec![("wallet".into(), "alice".into())],
+        };
+        assert_eq!(
+            decode_dispatch_request(&encode_dispatch_request(&req)).unwrap(),
+            req
+        );
+
+        let resp = DispatchResponse::List(vec![DispatchEntry {
+            name: "status.json".into(),
+            kind: DispatchEntryKind::File,
+            size: 12,
+            mode: 0o444,
+            ttl_hint_ms: Some(5000),
+            link_target: None,
+        }]);
+        assert_eq!(
+            decode_dispatch_response(&encode_dispatch_response(&resp)).unwrap(),
+            resp
+        );
     }
 }

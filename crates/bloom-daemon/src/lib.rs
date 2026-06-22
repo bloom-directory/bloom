@@ -22,7 +22,9 @@ use bloom_defi::EnsoClient;
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
 use bloom_keystore::Keystore;
-use bloom_petals::{NameRegistry, PetalRunner, PetalStore, PetalVm, PetalsHandler};
+use bloom_petals::{
+    LateVfsHost, NameRegistry, PetalRouter, PetalRunner, PetalStore, PetalVm, PetalsHandler,
+};
 use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient, GeoblockClient};
 use bloom_prices::PricesClient;
 use bloom_proto::{AddressBook, AuditLog, Config, HomeDir, HomeWritePermit};
@@ -445,12 +447,17 @@ impl Daemon {
         );
         let petal_vm = PetalVm::new().map_err(|e| DaemonError::Audit(format!("petals vm: {e}")))?;
         let petals = PetalRunner::new(petal_store.clone(), petal_registry.clone(), petal_vm);
+        let petal_app_host = Arc::new(LateVfsHost::new());
         debug!(root = %petals_root.display(), "daemon.petals_initialised");
 
         let mut vfs_builder = Vfs::builder()
             .mount(
                 "public",
                 Arc::new(PetalsHandler::new(petal_store, petal_registry)) as _,
+            )
+            .mount(
+                "apps",
+                Arc::new(PetalRouter::new(petals.clone(), petal_app_host.clone())) as _,
             )
             .mount(
                 "chains",
@@ -637,6 +644,7 @@ impl Daemon {
             .with_audit(audit_arc.clone())
             .with_cache(path_cache)
             .build();
+        petal_app_host.set(Arc::new(vfs.clone()));
 
         // Start the watch executor so any pre-existing specs on disk are
         // sampled and any new ones registered by the WatchHandler get
@@ -1171,6 +1179,7 @@ mod tests {
         assert!(d.vfs.handler("addressbook").is_some());
         assert!(d.vfs.handler("ens").is_some());
         assert!(d.vfs.handler("public").is_some());
+        assert!(d.vfs.handler("apps").is_some());
         assert!(d.vfs.handler("petals").is_some());
     }
 

@@ -40,7 +40,8 @@ use wasmtime_wasi::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 
 use crate::abi::{
-    decode_http_request, decode_sign_request, encode_http_response, encode_string_list,
+    DispatchRequest, DispatchResponse, decode_dispatch_response, decode_http_request,
+    decode_sign_request, encode_dispatch_request, encode_http_response, encode_string_list,
 };
 use crate::error::PetalError;
 use crate::host::{HostError, PetalHost};
@@ -98,6 +99,12 @@ pub struct RunOutput {
     /// or called `proc_exit(N)`.
     pub exit_code: i32,
     /// Fuel consumed, when fuel metering is enabled (always, for us).
+    pub fuel_consumed: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DispatchOutput {
+    pub response: DispatchResponse,
     pub fuel_consumed: u64,
 }
 
@@ -205,6 +212,65 @@ impl PetalVm {
             fuel_consumed,
         })
     }
+
+    /// Dispatch one VFS operation into a local handler petal.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dispatch(
+        &self,
+        wasm: &[u8],
+        request: DispatchRequest,
+        caps: BTreeSet<Capability>,
+        host: Arc<dyn PetalHost>,
+        petal_hash: &str,
+        opts: RunOptions,
+    ) -> Result<DispatchOutput, PetalError> {
+        let module =
+            Module::new(&self.engine, wasm).map_err(|e| PetalError::InvalidWasm(e.to_string()))?;
+        let stdout = MemoryOutputPipe::new(STDOUT_CAP);
+        let stderr = MemoryOutputPipe::new(STDOUT_CAP);
+        let mut wasi_builder = WasiCtxBuilder::new();
+        wasi_builder
+            .stdin(MemoryInputPipe::new(Vec::new()))
+            .stdout(stdout)
+            .stderr(stderr);
+        let wasi_ctx = wasi_builder.build_p1();
+
+        let mut store = Store::new(
+            &self.engine,
+            StoreData {
+                wasi: wasi_ctx,
+                host,
+                caps,
+                petal_hash: petal_hash.to_string(),
+                net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
+                http_response_cap: opts.http_response_cap,
+                private_store: match opts.private_store_root.clone() {
+                    Some(root) => Some(
+                        PrivateStore::open(root)
+                            .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
+                    ),
+                    None => None,
+                },
+            },
+        );
+        store
+            .set_fuel(opts.fuel)
+            .map_err(|e| PetalError::vm(e.to_string()))?;
+        store.limiter(move |_| Box::leak(Box::new(MemLimiter::new(opts.memory_pages))));
+
+        let mut linker = Linker::<StoreData>::new(&self.engine);
+        link_wasi_for_mode(&mut linker, crate::meta::PetalMode::Local)
+            .map_err(|e| PetalError::vm(e.to_string()))?;
+        link_imports_for_mode(&mut linker, crate::meta::PetalMode::Local)
+            .map_err(|e| PetalError::vm(e.to_string()))?;
+
+        let response = dispatch_once(&mut store, &linker, &module, &request).await?;
+        let fuel_consumed = opts.fuel.saturating_sub(store.get_fuel().unwrap_or(0));
+        Ok(DispatchOutput {
+            response,
+            fuel_consumed,
+        })
+    }
 }
 
 async fn run_command(
@@ -240,6 +306,47 @@ async fn run_command(
             }
         }
     }
+}
+
+async fn dispatch_once(
+    store: &mut Store<StoreData>,
+    linker: &Linker<StoreData>,
+    module: &Module,
+    request: &DispatchRequest,
+) -> Result<DispatchResponse, PetalError> {
+    let instance = linker
+        .instantiate_async(&mut *store, module)
+        .await
+        .map_err(|e| PetalError::vm(format!("dispatch instantiate: {e}")))?;
+    let alloc = instance
+        .get_typed_func::<i32, i32>(&mut *store, "petal_alloc")
+        .map_err(|e| PetalError::vm(format!("missing petal_alloc: {e}")))?;
+    let dispatch = instance
+        .get_typed_func::<(i32, i32), i64>(&mut *store, "petal_dispatch")
+        .map_err(|e| PetalError::vm(format!("missing petal_dispatch: {e}")))?;
+    let request_bytes = encode_dispatch_request(request);
+    if request_bytes.len() > i32::MAX as usize {
+        return Err(PetalError::vm("dispatch request too large"));
+    }
+    let req_ptr = alloc
+        .call_async(&mut *store, request_bytes.len() as i32)
+        .await
+        .map_err(|e| PetalError::vm(format!("petal_alloc trapped: {e}")))?;
+    let mem = instance
+        .get_memory(&mut *store, "memory")
+        .ok_or_else(|| PetalError::vm("dispatch petal did not export memory"))?;
+    write_bytes_store(&mem, &mut *store, req_ptr, &request_bytes)
+        .map_err(|code| PetalError::vm(format!("write dispatch request failed: {code}")))?;
+    let packed = dispatch
+        .call_async(&mut *store, (req_ptr, request_bytes.len() as i32))
+        .await
+        .map_err(|e| PetalError::vm(format!("petal_dispatch trapped: {e}")))?;
+    let packed = packed as u64;
+    let resp_ptr = (packed >> 32) as i32;
+    let resp_len = (packed & 0xffff_ffff) as i32;
+    let response_bytes = read_bytes_store(&mem, &mut *store, resp_ptr, resp_len)
+        .map_err(|code| PetalError::vm(format!("read dispatch response failed: {code}")))?;
+    decode_dispatch_response(&response_bytes).map_err(|e| PetalError::vm(e.to_string()))
 }
 
 fn link_wasi_for_mode(
@@ -689,6 +796,26 @@ fn read_bytes(
     Ok(slice.to_vec())
 }
 
+fn read_bytes_store(
+    mem: &Memory,
+    store: &mut Store<StoreData>,
+    ptr: i32,
+    len: i32,
+) -> Result<Vec<u8>, i32> {
+    if ptr < 0 || len < 0 {
+        return Err(HostError::Invalid("negative ptr/len".into()).as_wasm_code());
+    }
+    let data = mem.data(&mut *store);
+    let start = ptr as usize;
+    let end = start
+        .checked_add(len as usize)
+        .ok_or(HostError::Invalid("ptr+len overflow".into()).as_wasm_code())?;
+    let slice = data
+        .get(start..end)
+        .ok_or(HostError::Invalid("oob read".into()).as_wasm_code())?;
+    Ok(slice.to_vec())
+}
+
 fn write_bytes(
     mem: &Memory,
     caller: &mut Caller<'_, StoreData>,
@@ -699,6 +826,27 @@ fn write_bytes(
         return Err(HostError::Invalid("negative ptr".into()).as_wasm_code());
     }
     let data = mem.data_mut(caller);
+    let start = ptr as usize;
+    let end = start
+        .checked_add(bytes.len())
+        .ok_or(HostError::Invalid("ptr+len overflow".into()).as_wasm_code())?;
+    let slot = data
+        .get_mut(start..end)
+        .ok_or(HostError::Invalid("oob write".into()).as_wasm_code())?;
+    slot.copy_from_slice(bytes);
+    Ok(())
+}
+
+fn write_bytes_store(
+    mem: &Memory,
+    store: &mut Store<StoreData>,
+    ptr: i32,
+    bytes: &[u8],
+) -> Result<(), i32> {
+    if ptr < 0 {
+        return Err(HostError::Invalid("negative ptr".into()).as_wasm_code());
+    }
+    let data = mem.data_mut(&mut *store);
     let start = ptr as usize;
     let end = start
         .checked_add(bytes.len())
@@ -755,7 +903,8 @@ impl Default for PetalVm {
 mod tests {
     use super::*;
     use crate::abi::{
-        HttpRequest, HttpResponse, SignRequest, encode_http_request, encode_sign_request,
+        DispatchOp, DispatchRequest, DispatchResponse, HttpRequest, HttpResponse, SignRequest,
+        encode_dispatch_response, encode_http_request, encode_sign_request,
     };
     use crate::host::DenyHost;
     use crate::meta::PetalMode;
@@ -889,6 +1038,26 @@ mod tests {
             key.len(),
             value.len(),
             key.len()
+        )
+    }
+
+    fn dispatch_read_response_wat(response: &[u8]) -> String {
+        let len = response.len();
+        format!(
+            r#"
+        (module
+          (memory (export "memory") 1)
+          (data (i32.const 2048) "{}")
+          (func (export "petal_alloc") (param $len i32) (result i32)
+            (i32.const 1024))
+          (func (export "petal_dispatch") (param $ptr i32) (param $len i32) (result i64)
+            (i64.or
+              (i64.shl (i64.const 2048) (i64.const 32))
+              (i64.const {})))
+        )
+    "#,
+            wat_bytes(response),
+            len
         )
     }
 
@@ -1297,6 +1466,52 @@ paths = ["/markets*"]
             .unwrap();
         assert_eq!(out.stdout, vec![invalid_byte()]);
         assert!(!tmp.path().join("creds").exists());
+    }
+
+    #[tokio::test]
+    async fn dispatch_calls_petal_dispatch_and_decodes_response() {
+        let vm = PetalVm::new().unwrap();
+        let response = encode_dispatch_response(&DispatchResponse::Read(b"hello".to_vec()));
+        let out = vm
+            .dispatch(
+                &wat(&dispatch_read_response_wat(&response)),
+                DispatchRequest {
+                    op: DispatchOp::Read,
+                    path: "status.json".into(),
+                    body: Vec::new(),
+                    ctx: Vec::new(),
+                },
+                BTreeSet::new(),
+                Arc::new(DenyHost),
+                VALID_HASH,
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.response, DispatchResponse::Read(b"hello".to_vec()));
+        assert!(out.fuel_consumed > 0);
+    }
+
+    #[tokio::test]
+    async fn dispatch_requires_alloc_and_dispatch_exports() {
+        let vm = PetalVm::new().unwrap();
+        let err = vm
+            .dispatch(
+                &wat("(module (memory (export \"memory\") 1))"),
+                DispatchRequest {
+                    op: DispatchOp::Lookup,
+                    path: "".into(),
+                    body: Vec::new(),
+                    ctx: Vec::new(),
+                },
+                BTreeSet::new(),
+                Arc::new(DenyHost),
+                VALID_HASH,
+                RunOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("missing petal_alloc"));
     }
 
     #[tokio::test]
