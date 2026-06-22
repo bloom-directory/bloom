@@ -2081,6 +2081,72 @@ fn write_trade_post(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
             store_put_json(&format!("{base}/order.json"), &draft, false)
         }
         Err(resp) => {
+            if let Some(raw_response) =
+                reconcile_ambiguous_post(owner, &creds, &draft, funder, salt)
+            {
+                let status = clob_response_status(&raw_response);
+                let clob_order_id = clob_response_order_id(&raw_response);
+                let filled_size_micro = clob_response_filled_size_micro(&raw_response);
+                let posted_ms = now_millis();
+                let receipt = StoreTradeReceipt {
+                    draft_id: id.into(),
+                    wallet: wallet.into(),
+                    slug: draft.slug.clone(),
+                    token_id: draft.token_id.clone(),
+                    side: draft.side,
+                    order_type: draft.order_type,
+                    funder: Some(funder.to_checksum(None)),
+                    signature_type: SIG_TYPE_POLY_1271,
+                    amount_microusd: draft.amount_micro,
+                    limit_price_micro: draft.limit_price_micro,
+                    size_micro: draft.size_micro,
+                    salt,
+                    clob_order_id: clob_order_id.clone(),
+                    clob_status: status.clone(),
+                    filled_size_micro,
+                    raw_response: clob_reconciled_public_summary(
+                        &status,
+                        &clob_order_id,
+                        filled_size_micro,
+                    ),
+                    review_intent_hash: Some(review_intent_hash),
+                    posted_ms,
+                };
+                if let DispatchResponse::Error { .. } = store_put_json(
+                    &format!("{base}/post_attempt.json"),
+                    &serde_json::json!({
+                        "wallet": wallet,
+                        "draft_id": id,
+                        "owner": owner.to_checksum(None),
+                        "funder": funder.to_checksum(None),
+                        "salt": salt,
+                        "review_intent_hash": receipt.review_intent_hash.clone(),
+                        "order_body_blake3": body_hash,
+                        "reconciled_ms": posted_ms,
+                        "status": "reconciled_open_order",
+                        "clob_order_id": clob_order_id,
+                        "clob_status": status
+                    }),
+                    false,
+                ) {
+                    return error(-4, "failed to store reconciled post attempt");
+                }
+                if let DispatchResponse::Error { .. } = store_trade_receipt(wallet, id, &receipt) {
+                    return error(-4, "failed to store reconciled receipt");
+                }
+                draft.status = if clob_status_excluded_from_daily_cap(
+                    receipt.clob_status.as_str(),
+                    Some(draft.order_type),
+                ) {
+                    "rejected".into()
+                } else {
+                    "posted".into()
+                };
+                draft.clob_order_id = receipt.clob_order_id;
+                draft.clob_status = Some(receipt.clob_status);
+                draft.last_error = None;
+                return store_put_json(&format!("{base}/order.json"), &draft, false);
+            }
             let posted_ms = now_millis();
             let receipt = StoreTradeReceipt {
                 draft_id: id.into(),
@@ -2682,12 +2748,209 @@ fn clob_status_excluded_from_daily_cap(status: &str, order_type: Option<OrderTyp
         || (status == "unmatched" && order_type.is_some_and(|order_type| !order_type.can_rest()))
 }
 
+fn reconcile_ambiguous_post(
+    owner: Address,
+    creds: &Credentials,
+    draft: &StoreTradeDraft,
+    funder: Address,
+    salt: u64,
+) -> Option<serde_json::Value> {
+    let open_orders = clob_l2_get_json(owner, creds, "/data/orders", &[]).ok()?;
+    find_matching_open_order(&open_orders, draft, funder, salt)
+}
+
+fn find_matching_open_order(
+    raw: &serde_json::Value,
+    draft: &StoreTradeDraft,
+    funder: Address,
+    salt: u64,
+) -> Option<serde_json::Value> {
+    match raw {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find(|item| open_order_matches_draft(item, draft, funder, salt))
+            .cloned(),
+        serde_json::Value::Object(map) => ["orders", "data", "results"]
+            .iter()
+            .filter_map(|key| map.get(*key))
+            .find_map(|value| find_matching_open_order(value, draft, funder, salt)),
+        _ => None,
+    }
+}
+
+fn open_order_matches_draft(
+    item: &serde_json::Value,
+    draft: &StoreTradeDraft,
+    funder: Address,
+    salt: u64,
+) -> bool {
+    if clob_response_order_id(item).is_none() {
+        return false;
+    }
+    if matches!(
+        clob_response_status(item).as_str(),
+        "rejected" | "cancelled" | "canceled"
+    ) {
+        return false;
+    }
+    let Some(salts) = (match clob_order_field_u64s(item, &["salt"]) {
+        Ok(values) => values,
+        Err(()) => return false,
+    }) else {
+        return false;
+    };
+    if salts.iter().any(|value| *value != salt) {
+        return false;
+    }
+
+    let mut matched_fields = 0usize;
+    if let Some(values) = match clob_order_field_strings(
+        item,
+        &["asset_id", "assetId", "token_id", "tokenId", "tokenID"],
+    ) {
+        Ok(values) => values,
+        Err(()) => return false,
+    } {
+        if values.iter().any(|value| value != &draft.token_id) {
+            return false;
+        }
+        matched_fields += 1;
+    }
+    if let Some(values) = match clob_order_field_strings(item, &["maker", "signer", "funder"]) {
+        Ok(values) => values,
+        Err(()) => return false,
+    } {
+        let expected = funder.to_checksum(None);
+        if values
+            .iter()
+            .any(|value| !address_strings_equal(value, &expected))
+        {
+            return false;
+        }
+        matched_fields += 1;
+    }
+    if clob_order_fields(item, &["side"])
+        .into_iter()
+        .try_fold(false, |_, value| clob_side_value_matches(value, draft.side))
+        .unwrap_or(false)
+    {
+        matched_fields += 1;
+    } else if !clob_order_fields(item, &["side"]).is_empty() {
+        return false;
+    }
+    if let Some(values) = match clob_order_field_strings(item, &["orderType", "order_type"]) {
+        Ok(values) => values,
+        Err(()) => return false,
+    } {
+        if values
+            .iter()
+            .any(|value| !value.eq_ignore_ascii_case(draft.order_type.as_str()))
+        {
+            return false;
+        }
+        matched_fields += 1;
+    }
+    if let Some(values) = match clob_order_field_u64s(item, &["makerAmount", "maker_amount"]) {
+        Ok(values) => values,
+        Err(()) => return false,
+    } {
+        if values.iter().any(|value| *value != draft.maker_micro) {
+            return false;
+        }
+        matched_fields += 1;
+    }
+    if let Some(values) = match clob_order_field_u64s(item, &["takerAmount", "taker_amount"]) {
+        Ok(values) => values,
+        Err(()) => return false,
+    } {
+        if values.iter().any(|value| *value != draft.taker_micro) {
+            return false;
+        }
+        matched_fields += 1;
+    }
+
+    matched_fields >= 2
+}
+
+fn clob_order_fields<'a>(
+    item: &'a serde_json::Value,
+    names: &[&str],
+) -> Vec<&'a serde_json::Value> {
+    let mut values = Vec::new();
+    for name in names {
+        if let Some(value) = item.get(*name) {
+            values.push(value);
+        }
+    }
+    if let Some(order) = item.get("order") {
+        for name in names {
+            if let Some(value) = order.get(*name) {
+                values.push(value);
+            }
+        }
+    }
+    values
+}
+
+fn clob_order_field_strings(
+    item: &serde_json::Value,
+    names: &[&str],
+) -> Result<Option<Vec<String>>, ()> {
+    let mut values = Vec::new();
+    for value in clob_order_fields(item, names) {
+        match value {
+            serde_json::Value::String(s) => values.push(s.clone()),
+            serde_json::Value::Number(n) => values.push(n.to_string()),
+            _ => return Err(()),
+        }
+    }
+    Ok((!values.is_empty()).then_some(values))
+}
+
+fn clob_order_field_u64s(item: &serde_json::Value, names: &[&str]) -> Result<Option<Vec<u64>>, ()> {
+    let mut values = Vec::new();
+    for value in clob_order_fields(item, names) {
+        let Some(parsed) = (match value {
+            serde_json::Value::Number(n) => n.as_u64(),
+            serde_json::Value::String(s) => s.parse::<u64>().ok(),
+            _ => None,
+        }) else {
+            return Err(());
+        };
+        values.push(parsed);
+    }
+    Ok((!values.is_empty()).then_some(values))
+}
+
+fn address_strings_equal(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+fn clob_side_value_matches(value: &serde_json::Value, side: Side) -> Result<bool, bool> {
+    let matches = match value {
+        serde_json::Value::String(s) => {
+            let normalized = s.trim().to_ascii_uppercase();
+            match side {
+                Side::Buy => normalized == "BUY" || normalized == "0",
+                Side::Sell => normalized == "SELL" || normalized == "1",
+            }
+        }
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .is_some_and(|value| matches!((value, side), (0, Side::Buy) | (1, Side::Sell))),
+        _ => return Err(false),
+    };
+    matches.then_some(true).ok_or(false)
+}
+
 fn clob_response_order_id(raw: &serde_json::Value) -> Option<String> {
     raw.get("orderID")
         .or_else(|| raw.get("orderId"))
         .or_else(|| raw.get("order_id"))
         .or_else(|| raw.get("id"))
         .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
         .map(str::to_string)
 }
 
@@ -2738,6 +3001,20 @@ fn clob_response_public_summary(
         "status": status,
         "order_id": order_id,
         "filled_size_micro": filled_size_micro,
+        "response_redacted": true
+    })
+}
+
+fn clob_reconciled_public_summary(
+    status: &str,
+    order_id: &Option<String>,
+    filled_size_micro: Option<u64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": status,
+        "order_id": order_id,
+        "filled_size_micro": filled_size_micro,
+        "reconciled_from": "open_orders",
         "response_redacted": true
     })
 }
@@ -3368,6 +3645,43 @@ mod tests {
         }
     }
 
+    fn draft() -> StoreTradeDraft {
+        StoreTradeDraft {
+            id: "0001".into(),
+            wallet: "alice".into(),
+            slug: "example".into(),
+            question: "Example?".into(),
+            condition_id: "0xabc".into(),
+            outcome: "YES".into(),
+            token_id: "111".into(),
+            side: Side::Buy,
+            order_type: OrderType::FAK,
+            amount_micro: 1_000_000,
+            price_bound_micro: 100_000,
+            limit_price: None,
+            marketable: true,
+            limit_price_micro: 90_000,
+            size_micro: 11_111_100,
+            maker_micro: 1_000_000,
+            taker_micro: 11_111_100,
+            tick_micro: 10_000,
+            min_order_size_micro: 1_000_000,
+            neg_risk: false,
+            active: true,
+            closed: false,
+            order_book_enabled: true,
+            binary_outcomes: true,
+            best_ask_micro: Some(90_000),
+            best_bid_micro: Some(80_000),
+            book_snapshot_secs: 1,
+            status: "signed".into(),
+            salt: Some(42),
+            clob_order_id: None,
+            clob_status: None,
+            last_error: None,
+        }
+    }
+
     #[test]
     fn path_validation_rejects_escape_segments() {
         assert!(validate_relative_path("").is_ok());
@@ -3423,6 +3737,116 @@ mod tests {
             "rejected",
             Some(OrderType::GTC)
         ));
+    }
+
+    #[test]
+    fn open_order_reconciliation_requires_salt_and_stable_fields() {
+        let draft = draft();
+        let funder: Address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+            .parse()
+            .unwrap();
+        let matched = serde_json::json!({
+            "id": "order-1",
+            "status": "live",
+            "salt": 42,
+            "maker": funder.to_checksum(None),
+            "asset_id": "111",
+            "side": "BUY",
+            "orderType": "FAK",
+            "makerAmount": "1000000",
+            "takerAmount": "11111100"
+        });
+        assert!(open_order_matches_draft(&matched, &draft, funder, 42));
+
+        let wrong_token = serde_json::json!({
+            "id": "order-1",
+            "status": "live",
+            "salt": 42,
+            "maker": funder.to_checksum(None),
+            "asset_id": "222",
+            "side": "BUY"
+        });
+        assert!(!open_order_matches_draft(&wrong_token, &draft, funder, 42));
+
+        let weak = serde_json::json!({
+            "id": "order-1",
+            "status": "live",
+            "salt": 42,
+            "asset_id": "111"
+        });
+        assert!(!open_order_matches_draft(&weak, &draft, funder, 42));
+
+        let cancelled = serde_json::json!({
+            "id": "order-1",
+            "status": "cancelled",
+            "salt": 42,
+            "maker": funder.to_checksum(None),
+            "asset_id": "111",
+            "side": "BUY"
+        });
+        assert!(!open_order_matches_draft(&cancelled, &draft, funder, 42));
+
+        let contradictory_nested = serde_json::json!({
+            "id": "order-1",
+            "status": "live",
+            "salt": 42,
+            "maker": funder.to_checksum(None),
+            "asset_id": "111",
+            "side": "BUY",
+            "order": {
+                "tokenId": "222",
+                "side": "SELL"
+            }
+        });
+        assert!(!open_order_matches_draft(
+            &contradictory_nested,
+            &draft,
+            funder,
+            42
+        ));
+
+        let malformed_nested = serde_json::json!({
+            "id": "order-1",
+            "status": "live",
+            "salt": 42,
+            "maker": funder.to_checksum(None),
+            "asset_id": "111",
+            "side": "BUY",
+            "order": {
+                "salt": "wrong"
+            }
+        });
+        assert!(!open_order_matches_draft(
+            &malformed_nested,
+            &draft,
+            funder,
+            42
+        ));
+
+        let empty_id = serde_json::json!({
+            "id": "   ",
+            "status": "live",
+            "salt": 42,
+            "maker": funder.to_checksum(None),
+            "asset_id": "111",
+            "side": "BUY"
+        });
+        assert!(!open_order_matches_draft(&empty_id, &draft, funder, 42));
+
+        let nested = serde_json::json!({
+            "id": "order-1",
+            "status": "live",
+            "order": {
+                "salt": "42",
+                "maker": funder.to_checksum(None),
+                "tokenId": "111"
+            }
+        });
+        assert_eq!(
+            find_matching_open_order(&serde_json::json!({"data": [nested]}), &draft, funder, 42)
+                .and_then(|order| clob_response_order_id(&order)),
+            Some("order-1".into())
+        );
     }
 
     #[test]

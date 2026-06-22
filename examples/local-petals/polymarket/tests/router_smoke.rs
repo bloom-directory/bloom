@@ -658,6 +658,55 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     );
     assert_eq!(gtc_host.sign_calls.lock().unwrap().len(), 1);
 
+    let reconcile_host = Arc::new(MockHost::fixture_with_reconciled_open_order(
+        "order-reconciled-1",
+    ));
+    router
+        .write(
+            &VfsPath::parse("polymarket/trade/alice/new").unwrap(),
+            br#"{"slug":"test-market","outcome":"yes","amount":"1","max_price":"0.10"}"#,
+        )
+        .await
+        .unwrap();
+    let reconcile_revalidated =
+        dispatch_trade_revalidate(&runner, reconcile_host.clone(), "0009").await;
+    assert!(matches!(reconcile_revalidated, DispatchResponse::Write));
+    let reconciled_post = dispatch_trade_post(&runner, reconcile_host.clone(), "0009").await;
+    assert!(matches!(reconciled_post, DispatchResponse::Write));
+    let reconciled_receipt = private
+        .get(&install.hash, "trade/alice/receipts/0009/receipt.json")
+        .unwrap();
+    let reconciled_receipt_text = String::from_utf8(reconciled_receipt).unwrap();
+    assert!(reconciled_receipt_text.contains(r#""clob_status": "live""#));
+    assert!(reconciled_receipt_text.contains(r#""clob_order_id": "order-reconciled-1""#));
+    assert!(reconciled_receipt_text.contains(r#""reconciled_from": "open_orders""#));
+    assert!(reconciled_receipt_text.contains("response_redacted"));
+    assert!(!reconciled_receipt_text.contains("gateway timeout"));
+    let reconciled_order = private
+        .get(&install.hash, "trade/alice/drafts/0009/order.json")
+        .unwrap();
+    let reconciled_order_text = String::from_utf8(reconciled_order).unwrap();
+    assert!(reconciled_order_text.contains(r#""status": "posted""#));
+    assert!(reconciled_order_text.contains(r#""clob_order_id": "order-reconciled-1""#));
+    let reconciled_attempt = private
+        .get(&install.hash, "trade/alice/drafts/0009/post_attempt.json")
+        .unwrap();
+    let reconciled_attempt_text = String::from_utf8(reconciled_attempt).unwrap();
+    assert!(reconciled_attempt_text.contains("reconciled_open_order"));
+    assert!(reconciled_attempt_text.contains("order_body_blake3"));
+    assert!(!reconciled_attempt_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+    let reconcile_calls = reconcile_host.http_calls.lock().unwrap();
+    assert!(
+        reconcile_calls.iter().any(|(method, url)| {
+            method == "POST" && url == "https://clob.polymarket.com/order"
+        })
+    );
+    assert!(reconcile_calls.iter().any(|(method, url)| {
+        method == "GET" && url == "https://clob.polymarket.com/data/orders"
+    }));
+    drop(reconcile_calls);
+    assert_eq!(reconcile_host.sign_calls.lock().unwrap().len(), 1);
+
     let draft = private
         .get(&install.hash, "trade/alice/drafts/0001/order.json")
         .unwrap();
@@ -840,6 +889,7 @@ struct MockHost {
     responses: BTreeMap<String, Vec<u8>>,
     statuses: BTreeMap<String, u16>,
     policy_body: Vec<u8>,
+    dynamic_open_order_id: Option<String>,
     http_calls: Mutex<Vec<(String, String)>>,
     http_bodies: Mutex<Vec<(String, String, Vec<u8>)>>,
     vfs_calls: Mutex<Vec<String>>,
@@ -872,6 +922,18 @@ impl MockHost {
             "DELETE https://clob.polymarket.com/order".into(),
             format!(r#"{{"canceled":["{order_id}"],"not_canceled":{{}}}}"#).into_bytes(),
         );
+        host
+    }
+
+    fn fixture_with_reconciled_open_order(order_id: &str) -> Self {
+        let mut host = Self::fixture();
+        host.statuses
+            .insert("POST https://clob.polymarket.com/order".into(), 502);
+        host.responses.insert(
+            "POST https://clob.polymarket.com/order".into(),
+            br#"{"error":"gateway timeout after order submit"}"#.to_vec(),
+        );
+        host.dynamic_open_order_id = Some(order_id.to_string());
         host
     }
 
@@ -1051,6 +1113,42 @@ impl PetalHost for MockHost {
             req.body.clone(),
         ));
         let key = format!("{} {}", req.method, req.url);
+        if req.method == "GET"
+            && req.url == "https://clob.polymarket.com/data/orders"
+            && let Some(order_id) = &self.dynamic_open_order_id
+        {
+            let post_body = self
+                .http_bodies
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(method, url, _)| {
+                    method == "POST" && url == "https://clob.polymarket.com/order"
+                })
+                .map(|(_, _, body)| body.clone())
+                .expect("post body should exist before reconciliation");
+            let posted: serde_json::Value = serde_json::from_slice(&post_body).unwrap();
+            let order = posted.get("order").unwrap();
+            let body = serde_json::json!([{
+                "id": order_id,
+                "status": "live",
+                "salt": order["salt"].clone(),
+                "maker": order["maker"].clone(),
+                "asset_id": order["tokenId"].clone(),
+                "side": order["side"].clone(),
+                "orderType": posted["orderType"].clone(),
+                "makerAmount": order["makerAmount"].clone(),
+                "takerAmount": order["takerAmount"].clone()
+            }]);
+            let body = serde_json::to_vec(&body).unwrap();
+            assert!(body.len() <= max_response_bytes);
+            return Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body,
+            });
+        }
         let body = self
             .responses
             .get(&key)
