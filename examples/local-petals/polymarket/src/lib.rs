@@ -14,8 +14,8 @@ use bloom_petal_sdk::{
     HttpRequest, SdkError, SignRequest,
 };
 use bloom_polymarket::eip712::{
-    CTF, CTF_EXCHANGE_V2, FACTORY, NEG_RISK_EXCHANGE_V2, clob_auth_signing_hash,
-    derive_deposit_wallet_address,
+    CTF, CTF_COLLATERAL_ADAPTER, CTF_EXCHANGE_V2, FACTORY, NEG_RISK_CTF_COLLATERAL_ADAPTER,
+    NEG_RISK_EXCHANGE_V2, PUSD, clob_auth_signing_hash, derive_deposit_wallet_address,
 };
 use bloom_polymarket::order::{
     LimitQuote, OrderBody, OrderParams, OrderType, SIG_TYPE_POLY_1271, build_order, format_micro,
@@ -38,6 +38,7 @@ const MAX_STORE_BYTES: usize = 1024 * 1024;
 const MAX_LIST_BYTES: usize = 256 * 1024;
 const MAX_POLICY_BYTES: usize = 256 * 1024;
 const MAX_CHAIN_METHOD_BYTES: usize = 256 * 1024;
+const MAX_CHAIN_READ_BYTES: usize = 256 * 1024;
 const MARKETS_LIST_LIMIT: u32 = 20;
 const TRADE_LOCK_STALE_MS: u128 = 5 * 60 * 1000;
 
@@ -259,6 +260,11 @@ fn read_meta(file: &str) -> DispatchResponse {
                     "evidence": "funding and posting paths require a persisted live_factory_resolved deposit wallet instead of the display-only local CREATE2 estimate"
                 },
                 {
+                    "id": "read_only_onboarding_stage_probes",
+                    "surface": ["onboard/*/status.json", "account/*/portfolio.json", "trade/*/drafts/*/revalidate", "trade/*/drafts/*/post"],
+                    "evidence": "local status recomputes deployed/funded/approved/credentialed/CLOB-synced readiness from VFS chain reads plus private credentials; posting requires stage=complete"
+                },
+                {
                     "id": "buy_posting",
                     "surface": ["trade/*/drafts/*/revalidate", "trade/*/drafts/*/post"],
                     "evidence": "final-review-bound POLY_1271 buy posting with private receipt/audit records"
@@ -288,7 +294,7 @@ fn read_meta(file: &str) -> DispatchResponse {
                 {
                     "id": "onboarding_deploy_fund_approve_sync",
                     "status": "blocked",
-                    "reason": "local begin resolves the live factory wallet and manages CLOB credentials, but it does not yet drive native deploy, fund, approve, and CLOB balance/allowance sync stages end-to-end"
+                    "reason": "local begin resolves the live factory wallet and manages CLOB credentials, and read-only probes gate posting on complete readiness, but it does not yet drive native relayer deploy, approval batch, or CLOB update stages end-to-end"
                 },
                 {
                     "id": "graduation_signoff",
@@ -548,15 +554,10 @@ fn write_onboard_begin(wallet: &str) -> DispatchResponse {
     {
         return error(-4, "failed to store CLOB credentials");
     }
-    let status = local_onboard_status_with_live_deposit(
-        wallet,
-        owner,
-        deposit,
-        "creds",
-        false,
-        true,
-        "CLOB credentials stored in the private petal store; deposit wallet resolved from the live factory; deploy/fund/approval automation is still pending",
-    );
+    let status = match refreshed_live_onboard_status(wallet, owner, deposit, true) {
+        Ok(status) => status,
+        Err(resp) => return resp,
+    };
     store_put_json(&format!("onboard/{wallet}/status.json"), &status, false)
 }
 
@@ -643,14 +644,16 @@ fn local_onboard_status_with_live_deposit(
     stage: &str,
     running: bool,
     creds_present: bool,
+    tradeable: bool,
     message: &str,
+    probes: serde_json::Value,
 ) -> serde_json::Value {
     serde_json::json!({
         "wallet": wallet,
         "owner": owner.to_checksum(None),
         "stage": stage,
         "running": running,
-        "tradeable": false,
+        "tradeable": tradeable,
         "creds_present": creds_present,
         "deposit_wallet": {
             "address": deposit.to_checksum(None),
@@ -662,11 +665,127 @@ fn local_onboard_status_with_live_deposit(
             "required": true,
             "preview_path": format!("onboard/{wallet}/approvals.json")
         },
+        "probes": probes,
         "message": message
     })
 }
 
+fn refreshed_live_onboard_status(
+    wallet: &str,
+    owner: Address,
+    deposit: Address,
+    creds_present: bool,
+) -> Result<serde_json::Value, DispatchResponse> {
+    let deployed = read_chain_deposit_wallet_deployed(deposit)?;
+    let pusd_balance = if deployed {
+        read_chain_erc20_balance(PUSD, deposit)?
+    } else {
+        U256::ZERO
+    };
+    let approvals_in_place = if deployed && !pusd_balance.is_zero() {
+        read_chain_v2_approvals(deposit)?
+    } else {
+        false
+    };
+    let (clob_synced, clob_balance, clob_allowance) =
+        if deployed && !pusd_balance.is_zero() && approvals_in_place && creds_present {
+            let creds = load_creds(wallet)?;
+            read_clob_collateral_sync(owner, &creds)?
+        } else {
+            (false, None, None)
+        };
+
+    let (stage, tradeable, message) = if !deployed {
+        (
+            "deploy",
+            false,
+            "deposit wallet resolved from the live factory; waiting for the native relayer deploy stage",
+        )
+    } else if pusd_balance.is_zero() {
+        (
+            "fund",
+            false,
+            "deposit wallet is deployed; waiting for pUSD funding",
+        )
+    } else if !approvals_in_place {
+        (
+            "approve",
+            false,
+            "deposit wallet holds pUSD; waiting for V2 exchange and adapter approvals",
+        )
+    } else if !creds_present {
+        (
+            "creds",
+            false,
+            "deposit wallet is funded and approved; write begin to mint or derive CLOB credentials",
+        )
+    } else if !clob_synced {
+        (
+            "sync",
+            false,
+            "deposit wallet is funded and approved; waiting for CLOB collateral balance/allowance sync",
+        )
+    } else {
+        (
+            "complete",
+            true,
+            "local read-only probes show the deposit wallet is deployed, funded, approved, credentialed, and CLOB-synced",
+        )
+    };
+
+    Ok(local_onboard_status_with_live_deposit(
+        wallet,
+        owner,
+        deposit,
+        stage,
+        false,
+        creds_present,
+        tradeable,
+        message,
+        serde_json::json!({
+            "source": "vfs_chain_and_clob_read_only",
+            "deposit_wallet_deployed": deployed,
+            "pusd_balance_raw": pusd_balance.to_string(),
+            "approvals_in_place": approvals_in_place,
+            "clob_collateral_balance_raw": clob_balance.map(|v| v.to_string()),
+            "clob_collateral_allowance_raw": clob_allowance.map(|v| v.to_string()),
+            "clob_collateral_synced": clob_synced
+        }),
+    ))
+}
+
 fn local_status_for_wallet(
+    wallet: &str,
+    owner: Address,
+) -> Result<serde_json::Value, DispatchResponse> {
+    let status = stored_status_for_wallet(wallet, owner)?;
+    let deposit_value = status.get("deposit_wallet");
+    let source = deposit_value
+        .and_then(|value| value.get("source"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if source != "live_factory_resolved" {
+        return Ok(status);
+    }
+    let deposit = deposit_value
+        .and_then(|value| value.get("address"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| error(-4, "stored onboarding status is missing deposit wallet"))?
+        .parse::<Address>()
+        .map_err(|e| error(-4, format!("stored deposit wallet parse: {e}")))?;
+    let creds_present = store_get(&format!("creds/{wallet}/clob.json")).is_some();
+    let refreshed = refreshed_live_onboard_status(wallet, owner, deposit, creds_present)?;
+    if refreshed != status {
+        if let DispatchResponse::Error { .. } =
+            store_put_json(&format!("onboard/{wallet}/status.json"), &refreshed, false)
+        {
+            return Err(error(-4, "failed to refresh onboarding status"));
+        }
+    }
+    Ok(refreshed)
+}
+
+fn stored_status_for_wallet(
     wallet: &str,
     owner: Address,
 ) -> Result<serde_json::Value, DispatchResponse> {
@@ -701,18 +820,43 @@ fn local_status_for_wallet(
     }
 }
 
-fn resolved_deposit_wallet(wallet: &str, owner: Address) -> Result<Address, DispatchResponse> {
+fn fundable_deposit_wallet(wallet: &str, owner: Address) -> Result<Address, DispatchResponse> {
+    let status = stored_status_for_wallet(wallet, owner)?;
+    fundable_deposit_wallet_from_status(&status).ok_or_else(|| {
+        error(
+            -3,
+            "deposit wallet is not factory-resolved; write onboard/<wallet>/begin before funding",
+        )
+    })
+}
+
+fn tradeable_deposit_wallet(wallet: &str, owner: Address) -> Result<Address, DispatchResponse> {
     let status = local_status_for_wallet(wallet, owner)?;
+    let deposit = fundable_deposit_wallet_from_status(&status).ok_or_else(|| {
+        error(
+            -3,
+            "deposit wallet is not factory-resolved; write onboard/<wallet>/begin before posting",
+        )
+    })?;
+    if status.get("stage").and_then(serde_json::Value::as_str) != Some("complete")
+        || !status
+            .get("tradeable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    {
+        return Err(error(
+            -3,
+            "wallet onboarding is not complete; read onboard/<wallet>/status.json and complete deploy, fund, approve, credentials, and CLOB sync before posting",
+        ));
+    }
+    Ok(deposit)
+}
+
+fn fundable_deposit_wallet_from_status(status: &serde_json::Value) -> Option<Address> {
     let deposit = status
         .get("deposit_wallet")
         .and_then(|value| value.get("address"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            error(
-                -3,
-                "wallet is not onboarded; write onboard/<wallet>/begin first",
-            )
-        })?;
+        .and_then(serde_json::Value::as_str)?;
     let source = status
         .get("deposit_wallet")
         .and_then(|value| value.get("source"))
@@ -724,18 +868,13 @@ fn resolved_deposit_wallet(wallet: &str, owner: Address) -> Result<Address, Disp
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     if source != "live_factory_resolved" || !fundable {
-        return Err(error(
-            -3,
-            "deposit wallet is not factory-resolved; write onboard/<wallet>/begin before funding or posting",
-        ));
+        return None;
     }
-    deposit
-        .parse::<Address>()
-        .map_err(|e| error(-4, format!("stored deposit wallet parse: {e}")))
+    deposit.parse::<Address>().ok()
 }
 
 fn approval_preview(wallet: &str, owner: Address) -> serde_json::Value {
-    let status = local_status_for_wallet(wallet, owner).ok();
+    let status = stored_status_for_wallet(wallet, owner).ok();
     let deposit = status
         .as_ref()
         .and_then(|status| {
@@ -1432,6 +1571,120 @@ fn read_chain_ctf_approval(deposit: Address, operator: Address) -> Result<bool, 
         .ok_or_else(|| error(-4, "chain CTF approval response is not a boolean"))
 }
 
+fn read_chain_deposit_wallet_deployed(address: Address) -> Result<bool, DispatchResponse> {
+    let path = format!(
+        "chains/polygon/contracts/{}/proxy/implementation",
+        address.to_checksum(None)
+    );
+    let bytes = bloom_petal_sdk::vfs_read(&path, MAX_CHAIN_READ_BYTES)
+        .map_err(|e| sdk_error_with_context("read deposit wallet proxy implementation", e))?;
+    let text = core::str::from_utf8(&bytes)
+        .map_err(|_| error(-4, "chain proxy implementation response is not UTF-8"))?;
+    let text = text.trim();
+    if text == "not a proxy" {
+        return Ok(false);
+    }
+    text.parse::<Address>().map(|_| true).map_err(|e| {
+        error(
+            -4,
+            format!("chain proxy implementation response is not an address: {e}"),
+        )
+    })
+}
+
+fn read_chain_erc20_balance(token: Address, holder: Address) -> Result<U256, DispatchResponse> {
+    let response = read_chain_method(
+        token,
+        "balanceOf",
+        &serde_json::json!({
+            "args": [holder.to_checksum(None)]
+        }),
+    )?;
+    read_decoded_u256(&response, "chain ERC20 balanceOf")
+}
+
+fn read_chain_erc20_allowance(
+    token: Address,
+    owner: Address,
+    spender: Address,
+) -> Result<U256, DispatchResponse> {
+    let response = read_chain_method(
+        token,
+        "allowance",
+        &serde_json::json!({
+            "args": [owner.to_checksum(None), spender.to_checksum(None)]
+        }),
+    )?;
+    read_decoded_u256(&response, "chain ERC20 allowance")
+}
+
+fn read_chain_v2_approvals(deposit: Address) -> Result<bool, DispatchResponse> {
+    let floor = allowance_floor();
+    for spender in v2_spenders() {
+        if read_chain_erc20_allowance(PUSD, deposit, spender)? < floor {
+            return Ok(false);
+        }
+    }
+    for operator in v2_spenders() {
+        if !read_chain_ctf_approval(deposit, operator)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn read_clob_collateral_sync(
+    owner: Address,
+    creds: &Credentials,
+) -> Result<(bool, Option<U256>, Option<U256>), DispatchResponse> {
+    let value = clob_l2_get_json(
+        owner,
+        creds,
+        "/balance-allowance",
+        &[("asset_type", "COLLATERAL"), ("signature_type", "3")],
+    )?;
+    let balance = value.get("balance").and_then(parse_json_u256);
+    let allowance = value.get("allowance").and_then(parse_json_u256);
+    Ok((
+        balance.map(|v| !v.is_zero()).unwrap_or(false)
+            && allowance.map(|v| !v.is_zero()).unwrap_or(false),
+        balance,
+        allowance,
+    ))
+}
+
+fn read_decoded_u256(response: &serde_json::Value, label: &str) -> Result<U256, DispatchResponse> {
+    let decoded = response
+        .get("decoded")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| error(-4, format!("{label} response missing decoded array")))?;
+    let raw = decoded
+        .first()
+        .ok_or_else(|| error(-4, format!("{label} response missing value")))?;
+    parse_json_u256(raw).ok_or_else(|| error(-4, format!("{label} response is not a uint256")))
+}
+
+fn parse_json_u256(value: &serde_json::Value) -> Option<U256> {
+    match value {
+        serde_json::Value::String(s) => s.trim().parse::<U256>().ok(),
+        serde_json::Value::Number(n) => n.as_u64().map(U256::from),
+        _ => None,
+    }
+}
+
+fn allowance_floor() -> U256 {
+    U256::from(1) << 160
+}
+
+fn v2_spenders() -> [Address; 4] {
+    [
+        CTF_EXCHANGE_V2,
+        NEG_RISK_EXCHANGE_V2,
+        CTF_COLLATERAL_ADAPTER,
+        NEG_RISK_CTF_COLLATERAL_ADAPTER,
+    ]
+}
+
 fn predict_deposit_wallet(owner: Address) -> Result<Address, DispatchResponse> {
     let implementation = read_chain_address(
         FACTORY,
@@ -1897,7 +2150,7 @@ fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchRespon
         Ok(address) => address,
         Err(resp) => return resp,
     };
-    let funder = match resolved_deposit_wallet(wallet, owner) {
+    let funder = match tradeable_deposit_wallet(wallet, owner) {
         Ok(funder) => funder,
         Err(resp) => return resp,
     };
@@ -2168,7 +2421,7 @@ fn refresh_trade_post_inputs(
         return Err(error(-3, "Polymarket policy denied; see policy_check.json"));
     }
     let sell_preflight = if draft.side == Side::Sell {
-        let funder = resolved_deposit_wallet(wallet, owner)?;
+        let funder = tradeable_deposit_wallet(wallet, owner)?;
         let preflight = verify_sell_preflight(
             wallet,
             owner,
@@ -2290,7 +2543,7 @@ fn write_trade_post(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
         Ok(address) => address,
         Err(resp) => return resp,
     };
-    let funder = match resolved_deposit_wallet(wallet, owner) {
+    let funder = match tradeable_deposit_wallet(wallet, owner) {
         Ok(funder) => funder,
         Err(resp) => return resp,
     };
@@ -2699,7 +2952,7 @@ fn write_fund_new(wallet: &str, body: &[u8]) -> DispatchResponse {
         Ok(address) => address,
         Err(resp) => return resp,
     };
-    let deposit = match resolved_deposit_wallet(wallet, owner) {
+    let deposit = match fundable_deposit_wallet(wallet, owner) {
         Ok(deposit) => deposit,
         Err(resp) => return resp,
     };
