@@ -22,6 +22,8 @@ use bloom_polymarket::trade as shared_trade;
 use bloom_polymarket::types::{Market, Side};
 use bloom_polymarket::wallet::{V2_APPROVAL_LABELS, v2_approval_calls};
 use bloom_polymarket::{Credentials, OrderBook, POLYGON, Position, Trade, validate_wallet_name};
+use rand::RngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -30,6 +32,7 @@ const MAX_STORE_BYTES: usize = 1024 * 1024;
 const MAX_LIST_BYTES: usize = 256 * 1024;
 const MAX_POLICY_BYTES: usize = 256 * 1024;
 const MARKETS_LIST_LIMIT: u32 = 20;
+const TRADE_LOCK_STALE_MS: u128 = 5 * 60 * 1000;
 
 const GAMMA: &str = "https://gamma-api.polymarket.com";
 const DATA: &str = "https://data-api.polymarket.com";
@@ -68,7 +71,7 @@ const TRADE_NEW_HINT: &str = r#"write JSON to create a reviewable draft, e.g.
 const FUND_NEW_HINT: &str = r#"write JSON to create a reviewable pUSD funding request, e.g.
 {"target_pusd":"10","max_spend":"100","from_token":"native","slippage_bps":50}
 "#;
-const TRADE_REVALIDATE_HINT: &str = r#"write {"revalidate":true} to revalidate this draft and stage the final review artifact. Signing/posting remains disabled until policy, locking, and receipt parity are ported.
+const TRADE_REVALIDATE_HINT: &str = r#"write {"revalidate":true} to revalidate this draft and stage the final review artifact. Signing/posting remains disabled until chain-backed preflight, posting, receipt writing, and cancel/expiry parity are ported.
 "#;
 
 #[cfg_attr(target_family = "wasm", unsafe(link_section = "bloom_petal_manifest"))]
@@ -935,7 +938,7 @@ fn trade_policy_check(
     };
     Ok(serde_json::json!({
         "status": "blocked",
-        "reason": "value-moving posting is disabled until policy, locking, receipt, and sell-preflight parity are ported",
+        "reason": "value-moving posting is disabled until chain-backed preflight, posting, receipt writing, and cancel/expiry parity are ported",
         "policy_status": policy_status,
         "policy_deny": deny,
         "policy_warn": warn,
@@ -1431,6 +1434,10 @@ fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchRespon
         return error(-3, "revalidate must be true");
     }
     let base = format!("trade/{wallet}/drafts/{id}");
+    let _lock = match acquire_trade_lock(wallet, id) {
+        Ok(lock) => lock,
+        Err(resp) => return resp,
+    };
     let Some(bytes) = store_get(&format!("{base}/order.json")) else {
         return error(-1, "draft not found");
     };
@@ -1852,6 +1859,91 @@ fn read_store(key: &str) -> DispatchResponse {
         Ok(bytes) => DispatchResponse::Read(bytes),
         Err(SdkError::Host(HostStatus::NotFound)) => error(-1, "not found"),
         Err(e) => sdk_error(e),
+    }
+}
+
+fn acquire_trade_lock(wallet: &str, draft_id: &str) -> Result<StoreTradeLock, DispatchResponse> {
+    let key = format!("trade/{wallet}/.lock");
+    for attempt in 0..2 {
+        let bytes = trade_lock_body(wallet, draft_id)?;
+        match bloom_petal_sdk::store_put_new(&key, &bytes, false) {
+            Ok(()) => {
+                return Ok(StoreTradeLock {
+                    key,
+                    expected: bytes,
+                });
+            }
+            Err(SdkError::Host(HostStatus::Denied)) if attempt == 0 => {
+                let Some(stale_bytes) = trade_lock_stale_bytes(&key) else {
+                    return Err(error(
+                        -3,
+                        format!("another trade operation holds the lock for wallet '{wallet}'"),
+                    ));
+                };
+                match bloom_petal_sdk::store_del_if_value(&key, &stale_bytes) {
+                    Ok(()) | Err(SdkError::Host(HostStatus::NotFound)) => continue,
+                    Err(SdkError::Host(HostStatus::Denied)) => {
+                        return Err(error(
+                            -3,
+                            format!(
+                                "another trade operation refreshed the lock for wallet '{wallet}'"
+                            ),
+                        ));
+                    }
+                    Err(e) => return Err(sdk_error(e)),
+                }
+            }
+            Err(SdkError::Host(HostStatus::Denied)) => {
+                return Err(error(
+                    -3,
+                    format!("another trade operation holds the lock for wallet '{wallet}'"),
+                ));
+            }
+            Err(e) => return Err(sdk_error(e)),
+        }
+    }
+    Err(error(
+        -3,
+        format!("another trade operation holds the lock for wallet '{wallet}'"),
+    ))
+}
+
+fn trade_lock_body(wallet: &str, draft_id: &str) -> Result<Vec<u8>, DispatchResponse> {
+    let mut token = [0u8; 16];
+    OsRng
+        .try_fill_bytes(&mut token)
+        .map_err(|e| error(-4, format!("trade lock random token: {e}")))?;
+    let body = serde_json::json!({
+        "wallet": wallet,
+        "draft_id": draft_id,
+        "acquired_ms": now_millis(),
+        "token": hex::encode(token)
+    });
+    serde_json::to_vec(&body).map_err(|e| error(-4, format!("json: {e}")))
+}
+
+fn trade_lock_stale_bytes(key: &str) -> Option<Vec<u8>> {
+    match bloom_petal_sdk::store_get(key, MAX_STORE_BYTES) {
+        Ok(bytes) => {
+            let stale = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| v.get("acquired_ms").and_then(serde_json::Value::as_u64))
+                .map(|acquired| now_millis().saturating_sub(acquired as u128) > TRADE_LOCK_STALE_MS)
+                .unwrap_or(true);
+            stale.then_some(bytes)
+        }
+        Err(_) => None,
+    }
+}
+
+struct StoreTradeLock {
+    key: String,
+    expected: Vec<u8>,
+}
+
+impl Drop for StoreTradeLock {
+    fn drop(&mut self) {
+        let _ = bloom_petal_sdk::store_del_if_value(&self.key, &self.expected);
     }
 }
 

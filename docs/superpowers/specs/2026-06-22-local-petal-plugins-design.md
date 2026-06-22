@@ -229,9 +229,14 @@ credentials stay invisible to other agents and handlers — a guarantee a mounte
 not give.
 
 - `store_put(key, value, secret_flag)` — atomic write (temp + rename).
+- `store_put_new(key, value, secret_flag)` — atomic create-if-absent; returns `Denied` if the key
+  already exists. Used for lock/sentinel records where replacement would be unsafe.
 - `store_get(key) -> value | NotFound`.
 - `store_list(prefix) -> [key]`.
 - `store_del(key)`.
+- `store_del_if_value(key, expected_value)` — compare-delete; removes the key only if its current
+  bytes match `expected_value`, otherwise returns `Denied`. Used to release/break lock records
+  without deleting another caller's newer lock.
 
 Keys are namespaced per petal hash; one petal cannot read another's store. Maps directly onto
 Polymarket's `CredentialStore` (secret), `OrderStore` (salts/intents/receipts), and onboarding

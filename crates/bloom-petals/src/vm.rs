@@ -686,6 +686,42 @@ fn link_bloom_v1_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
 
     linker.func_wrap_async(
         "bloom.v1",
+        "store_put_new",
+        |mut caller: Caller<'_, StoreData>,
+         params: (i32, i32, i32, i32, i32)|
+         -> Box<dyn std::future::Future<Output = i32> + Send + '_> {
+            let (key_ptr, key_len, val_ptr, val_len, secret_flag) = params;
+            Box::new(async move {
+                if !caller.data().caps.contains(&Capability::Store) {
+                    log_denied(caller.data(), "store_put_new");
+                    return HostError::Denied("store".into()).as_wasm_code();
+                }
+                let mem = match get_memory(&mut caller) {
+                    Some(m) => m,
+                    None => return HostError::Invalid("no exported memory".into()).as_wasm_code(),
+                };
+                let key = match read_string(&mem, &mut caller, key_ptr, key_len) {
+                    Ok(s) => s,
+                    Err(c) => return c,
+                };
+                let value = match read_bytes(&mem, &mut caller, val_ptr, val_len) {
+                    Ok(b) => b,
+                    Err(c) => return c,
+                };
+                let Some(store) = caller.data().private_store.clone() else {
+                    return HostError::Denied("store unavailable".into()).as_wasm_code();
+                };
+                let petal_hash = caller.data().petal_hash.clone();
+                match store.put_new(&petal_hash, &key, &value, secret_flag != 0) {
+                    Ok(()) => 0,
+                    Err(e) => e.as_wasm_code(),
+                }
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "bloom.v1",
         "store_list",
         |mut caller: Caller<'_, StoreData>,
          params: (i32, i32, i32, i32)|
@@ -747,6 +783,42 @@ fn link_bloom_v1_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
                 };
                 let petal_hash = caller.data().petal_hash.clone();
                 match store.del(&petal_hash, &key) {
+                    Ok(()) => 0,
+                    Err(e) => e.as_wasm_code(),
+                }
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "bloom.v1",
+        "store_del_if_value",
+        |mut caller: Caller<'_, StoreData>,
+         params: (i32, i32, i32, i32)|
+         -> Box<dyn std::future::Future<Output = i32> + Send + '_> {
+            let (key_ptr, key_len, expected_ptr, expected_len) = params;
+            Box::new(async move {
+                if !caller.data().caps.contains(&Capability::Store) {
+                    log_denied(caller.data(), "store_del_if_value");
+                    return HostError::Denied("store".into()).as_wasm_code();
+                }
+                let mem = match get_memory(&mut caller) {
+                    Some(m) => m,
+                    None => return HostError::Invalid("no exported memory".into()).as_wasm_code(),
+                };
+                let key = match read_string(&mem, &mut caller, key_ptr, key_len) {
+                    Ok(s) => s,
+                    Err(c) => return c,
+                };
+                let expected = match read_bytes(&mem, &mut caller, expected_ptr, expected_len) {
+                    Ok(b) => b,
+                    Err(c) => return c,
+                };
+                let Some(store) = caller.data().private_store.clone() else {
+                    return HostError::Denied("store unavailable".into()).as_wasm_code();
+                };
+                let petal_hash = caller.data().petal_hash.clone();
+                match store.del_if_value(&petal_hash, &key, &expected) {
                     Ok(()) => 0,
                     Err(e) => e.as_wasm_code(),
                 }
@@ -1082,6 +1154,101 @@ mod tests {
             key.len(),
             value.len(),
             key.len()
+        )
+    }
+
+    fn store_put_new_probe(key: &str, first: &[u8], second: &[u8]) -> String {
+        format!(
+            r#"
+        (module
+          (import "bloom.v1" "store_put_new"
+            (func $store_put_new (param i32 i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "fd_write"
+            (func $fd_write (param i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "proc_exit"
+            (func $exit (param i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 0) "{}")
+          (data (i32.const 128) "{}")
+          (data (i32.const 256) "{}")
+          (data (i32.const 400) "\9c\01\00\00\01\00\00\00")
+          (func (export "_start")
+            (local $n i32)
+            (call $store_put_new
+              (i32.const 0)
+              (i32.const {})
+              (i32.const 128)
+              (i32.const {})
+              (i32.const 0))
+            drop
+            (local.set $n
+              (call $store_put_new
+                (i32.const 0)
+                (i32.const {})
+                (i32.const 256)
+                (i32.const {})
+                (i32.const 0)))
+            (i32.store8 (i32.const 412) (local.get $n))
+            (call $fd_write (i32.const 1) (i32.const 400) (i32.const 1) (i32.const 420))
+            drop
+            (call $exit (i32.const 0)))
+        )
+    "#,
+            wat_bytes(key.as_bytes()),
+            wat_bytes(first),
+            wat_bytes(second),
+            key.len(),
+            first.len(),
+            key.len(),
+            second.len()
+        )
+    }
+
+    fn store_del_if_value_probe(key: &str, value: &[u8], expected: &[u8]) -> String {
+        format!(
+            r#"
+        (module
+          (import "bloom.v1" "store_put"
+            (func $store_put (param i32 i32 i32 i32 i32) (result i32)))
+          (import "bloom.v1" "store_del_if_value"
+            (func $store_del_if_value (param i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "fd_write"
+            (func $fd_write (param i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "proc_exit"
+            (func $exit (param i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 0) "{}")
+          (data (i32.const 128) "{}")
+          (data (i32.const 256) "{}")
+          (data (i32.const 400) "\9c\01\00\00\01\00\00\00")
+          (func (export "_start")
+            (local $n i32)
+            (call $store_put
+              (i32.const 0)
+              (i32.const {})
+              (i32.const 128)
+              (i32.const {})
+              (i32.const 0))
+            drop
+            (local.set $n
+              (call $store_del_if_value
+                (i32.const 0)
+                (i32.const {})
+                (i32.const 256)
+                (i32.const {})))
+            (i32.store8 (i32.const 412) (local.get $n))
+            (call $fd_write (i32.const 1) (i32.const 400) (i32.const 1) (i32.const 420))
+            drop
+            (call $exit (i32.const 0)))
+        )
+    "#,
+            wat_bytes(key.as_bytes()),
+            wat_bytes(value),
+            wat_bytes(expected),
+            key.len(),
+            value.len(),
+            key.len(),
+            expected.len()
         )
     }
 
@@ -1564,6 +1731,68 @@ paths = ["/markets*"]
         assert_eq!(
             std::fs::read(tmp.path().join(VALID_HASH).join("creds/api.json")).unwrap(),
             b"secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_put_new_refuses_overwrite() {
+        let tmp = TempDir::new().unwrap();
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::Store);
+        let opts = RunOptions {
+            private_store_root: Some(tmp.path().to_path_buf()),
+            ..RunOptions::default()
+        };
+        let vm = PetalVm::new().unwrap();
+        let out = vm
+            .run(
+                &wat(&store_put_new_probe("orders/.lock", b"first", b"second")),
+                Vec::new(),
+                caps,
+                Arc::new(MockHost::default()),
+                VALID_HASH,
+                PetalMode::Local,
+                opts,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, vec![denied_byte()]);
+        assert_eq!(
+            std::fs::read(tmp.path().join(VALID_HASH).join("orders/.lock")).unwrap(),
+            b"first"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_del_if_value_refuses_changed_value() {
+        let tmp = TempDir::new().unwrap();
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::Store);
+        let opts = RunOptions {
+            private_store_root: Some(tmp.path().to_path_buf()),
+            ..RunOptions::default()
+        };
+        let vm = PetalVm::new().unwrap();
+        let out = vm
+            .run(
+                &wat(&store_del_if_value_probe(
+                    "orders/.lock",
+                    b"first",
+                    b"second",
+                )),
+                Vec::new(),
+                caps,
+                Arc::new(MockHost::default()),
+                VALID_HASH,
+                PetalMode::Local,
+                opts,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, vec![denied_byte()]);
+        assert_eq!(
+            std::fs::read(tmp.path().join(VALID_HASH).join("orders/.lock")).unwrap(),
+            b"first"
         );
     }
 

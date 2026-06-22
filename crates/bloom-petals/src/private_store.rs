@@ -1,6 +1,7 @@
 //! Per-petal private key/value storage for `bloom.v1.store_*`.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crate::host::HostError;
 use crate::store::is_valid_hex_hash;
@@ -23,6 +24,7 @@ impl PrivateStore {
 
     pub fn get(&self, petal_hash: &str, key: &str) -> Result<Vec<u8>, HostError> {
         let path = self.key_path(petal_hash, key)?;
+        let _guard = store_op_guard()?;
         match std::fs::read(&path) {
             Ok(bytes) => Ok(bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -43,15 +45,40 @@ impl PrivateStore {
         let dir = path
             .parent()
             .ok_or_else(|| HostError::Invalid("store key has no parent".into()))?;
+        let _guard = store_op_guard()?;
         std::fs::create_dir_all(dir)
             .map_err(|e| HostError::Backend(format!("store mkdir: {e}")))?;
         atomic_write(&path, value, secret)
             .map_err(|e| HostError::Backend(format!("store put: {e}")))
     }
 
+    pub fn put_new(
+        &self,
+        petal_hash: &str,
+        key: &str,
+        value: &[u8],
+        secret: bool,
+    ) -> Result<(), HostError> {
+        let path = self.key_path(petal_hash, key)?;
+        let dir = path
+            .parent()
+            .ok_or_else(|| HostError::Invalid("store key has no parent".into()))?;
+        let _guard = store_op_guard()?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| HostError::Backend(format!("store mkdir: {e}")))?;
+        create_new_file(&path, value, secret).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                HostError::Denied("store key already exists".into())
+            } else {
+                HostError::Backend(format!("store put_new: {e}"))
+            }
+        })
+    }
+
     pub fn list(&self, petal_hash: &str, prefix: &str) -> Result<Vec<String>, HostError> {
         validate_prefix(prefix)?;
         let dir = self.petal_dir(petal_hash)?;
+        let _guard = store_op_guard()?;
         let mut out = Vec::new();
         if !dir.exists() {
             return Ok(out);
@@ -63,10 +90,38 @@ impl PrivateStore {
 
     pub fn del(&self, petal_hash: &str, key: &str) -> Result<(), HostError> {
         let path = self.key_path(petal_hash, key)?;
+        let _guard = store_op_guard()?;
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(HostError::Backend(format!("store del: {e}"))),
+        }
+    }
+
+    pub fn del_if_value(
+        &self,
+        petal_hash: &str,
+        key: &str,
+        expected: &[u8],
+    ) -> Result<(), HostError> {
+        let path = self.key_path(petal_hash, key)?;
+        let _guard = store_op_guard()?;
+        let current = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(HostError::NotFound(key.into()));
+            }
+            Err(e) => return Err(HostError::Backend(format!("store del_if_value read: {e}"))),
+        };
+        if current != expected {
+            return Err(HostError::Denied("store key value changed".into()));
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(HostError::NotFound(key.into()))
+            }
+            Err(e) => Err(HostError::Backend(format!("store del_if_value: {e}"))),
         }
     }
 
@@ -81,6 +136,14 @@ impl PrivateStore {
         validate_key(key)?;
         Ok(self.petal_dir(petal_hash)?.join(key))
     }
+}
+
+fn store_op_guard() -> Result<MutexGuard<'static, ()>, HostError> {
+    static STORE_OP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    STORE_OP_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| HostError::Backend("store operation lock poisoned".into()))
 }
 
 pub fn validate_key(key: &str) -> Result<(), HostError> {
@@ -160,23 +223,34 @@ fn atomic_write(path: &Path, data: &[u8], secret: bool) -> std::io::Result<()> {
         .file_name()
         .ok_or_else(|| std::io::Error::other("path has no file name"))?;
     let tmp = dir.join(format!(".{}.tmp", file_name.to_string_lossy()));
-    write_file_with_mode(&tmp, data, secret)?;
+    write_file_with_mode(&tmp, data, secret, false)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
+fn create_new_file(path: &Path, data: &[u8], secret: bool) -> std::io::Result<()> {
+    write_file_with_mode(path, data, secret, true)
+}
+
 #[cfg(unix)]
-fn write_file_with_mode(path: &Path, data: &[u8], secret: bool) -> std::io::Result<()> {
+fn write_file_with_mode(
+    path: &Path,
+    data: &[u8],
+    secret: bool,
+    create_new: bool,
+) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let mode = if secret { 0o600 } else { 0o644 };
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .open(path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).mode(mode);
+    if create_new {
+        opts.create_new(true);
+    } else {
+        opts.create(true).truncate(true);
+    }
+    let mut file = opts.open(path)?;
     file.set_permissions(std::fs::Permissions::from_mode(mode))?;
     file.write_all(data)?;
     file.sync_all()?;
@@ -184,8 +258,23 @@ fn write_file_with_mode(path: &Path, data: &[u8], secret: bool) -> std::io::Resu
 }
 
 #[cfg(not(unix))]
-fn write_file_with_mode(path: &Path, data: &[u8], _secret: bool) -> std::io::Result<()> {
-    std::fs::write(path, data)
+fn write_file_with_mode(
+    path: &Path,
+    data: &[u8],
+    _secret: bool,
+    create_new: bool,
+) -> std::io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true);
+    if create_new {
+        opts.create_new(true);
+    } else {
+        opts.create(true).truncate(true);
+    }
+    use std::io::Write;
+    let mut file = opts.open(path)?;
+    file.write_all(data)?;
+    file.sync_all()
 }
 
 #[cfg(test)]
@@ -212,6 +301,37 @@ mod tests {
         assert_eq!(store.get(HASH, "creds/api.json").unwrap(), b"secret");
         assert!(matches!(
             store.get(other, "creds/api.json"),
+            Err(HostError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn put_new_refuses_existing_key() {
+        let dir = TempDir::new().unwrap();
+        let store = PrivateStore::open(dir.path()).unwrap();
+        store
+            .put_new(HASH, "orders/.lock", b"first", false)
+            .unwrap();
+        assert!(matches!(
+            store.put_new(HASH, "orders/.lock", b"second", false),
+            Err(HostError::Denied(_))
+        ));
+        assert_eq!(store.get(HASH, "orders/.lock").unwrap(), b"first");
+    }
+
+    #[test]
+    fn del_if_value_only_removes_matching_value() {
+        let dir = TempDir::new().unwrap();
+        let store = PrivateStore::open(dir.path()).unwrap();
+        store.put(HASH, "orders/.lock", b"first", false).unwrap();
+        assert!(matches!(
+            store.del_if_value(HASH, "orders/.lock", b"second"),
+            Err(HostError::Denied(_))
+        ));
+        assert_eq!(store.get(HASH, "orders/.lock").unwrap(), b"first");
+        store.del_if_value(HASH, "orders/.lock", b"first").unwrap();
+        assert!(matches!(
+            store.get(HASH, "orders/.lock"),
             Err(HostError::NotFound(_))
         ));
     }
@@ -251,6 +371,21 @@ mod tests {
         let store = PrivateStore::open(dir.path()).unwrap();
         store.put(HASH, "creds/api.json", b"secret", true).unwrap();
         let path = store.root().join(HASH).join("creds/api.json");
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn put_new_secret_files_are_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let store = PrivateStore::open(dir.path()).unwrap();
+        store
+            .put_new(HASH, "creds/new.json", b"secret", true)
+            .unwrap();
+        let path = store.root().join(HASH).join("creds/new.json");
         let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }

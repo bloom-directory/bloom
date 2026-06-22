@@ -388,6 +388,27 @@ pub fn store_put(key: &str, value: &[u8], secret: bool) -> Result<(), SdkError> 
     }
 }
 
+pub fn store_put_new(key: &str, value: &[u8], secret: bool) -> Result<(), SdkError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (key, value, secret);
+        Err(SdkError::HostUnavailable)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let status = unsafe {
+            raw::store_put_new(
+                key.as_ptr() as i32,
+                checked_i32(key.len())?,
+                value.as_ptr() as i32,
+                checked_i32(value.len())?,
+                i32::from(secret),
+            )
+        };
+        host_unit(status)
+    }
+}
+
 pub fn store_list(prefix: &str, max_response_bytes: usize) -> Result<Vec<String>, SdkError> {
     #[cfg(not(target_arch = "wasm32"))]
     let raw = call_blob4_unavailable(prefix.as_bytes(), max_response_bytes)?;
@@ -405,6 +426,26 @@ pub fn store_del(key: &str) -> Result<(), SdkError> {
     #[cfg(target_arch = "wasm32")]
     {
         let status = unsafe { raw::store_del(key.as_ptr() as i32, checked_i32(key.len())?) };
+        host_unit(status)
+    }
+}
+
+pub fn store_del_if_value(key: &str, expected: &[u8]) -> Result<(), SdkError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (key, expected);
+        Err(SdkError::HostUnavailable)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let status = unsafe {
+            raw::store_del_if_value(
+                key.as_ptr() as i32,
+                checked_i32(key.len())?,
+                expected.as_ptr() as i32,
+                checked_i32(expected.len())?,
+            )
+        };
         host_unit(status)
     }
 }
@@ -742,8 +783,21 @@ mod raw {
             value_len: i32,
             secret_flag: i32,
         ) -> i32;
+        pub fn store_put_new(
+            key_ptr: i32,
+            key_len: i32,
+            value_ptr: i32,
+            value_len: i32,
+            secret_flag: i32,
+        ) -> i32;
         pub fn store_list(prefix_ptr: i32, prefix_len: i32, dst_ptr: i32, dst_max: i32) -> i32;
         pub fn store_del(key_ptr: i32, key_len: i32) -> i32;
+        pub fn store_del_if_value(
+            key_ptr: i32,
+            key_len: i32,
+            expected_ptr: i32,
+            expected_len: i32,
+        ) -> i32;
     }
 }
 
@@ -868,6 +922,14 @@ mod tests {
             vfs_list("wallets", 1024),
             Err(SdkError::HostUnavailable)
         ));
+        assert!(matches!(
+            store_put_new("x", b"y", false),
+            Err(SdkError::HostUnavailable)
+        ));
         assert!(matches!(store_del("x"), Err(SdkError::HostUnavailable)));
+        assert!(matches!(
+            store_del_if_value("x", b"y"),
+            Err(SdkError::HostUnavailable)
+        ));
     }
 }

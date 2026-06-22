@@ -452,7 +452,8 @@ pub fn local_capability_for_import(
         "vfs_write" => LocalCapability::VfsWrite,
         "http_fetch" => LocalCapability::NetFetch,
         "sign_hash" => LocalCapability::Sign,
-        "store_get" | "store_put" | "store_list" | "store_del" => LocalCapability::Store,
+        "store_get" | "store_put" | "store_put_new" | "store_list" | "store_del"
+        | "store_del_if_value" => LocalCapability::Store,
         other => {
             return invalid(format!("unknown bloom.v1 host import {other:?}"));
         }
@@ -523,6 +524,18 @@ caps = []
 host = "example.com"
 "#;
         assert!(parse_local_manifest_toml(no_cap.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn atomic_store_imports_use_store_capability() {
+        assert_eq!(
+            local_capability_for_import("bloom.v1", "store_put_new").unwrap(),
+            Some(LocalCapability::Store)
+        );
+        assert_eq!(
+            local_capability_for_import("bloom.v1", "store_del_if_value").unwrap(),
+            Some(LocalCapability::Store)
+        );
     }
 
     #[test]

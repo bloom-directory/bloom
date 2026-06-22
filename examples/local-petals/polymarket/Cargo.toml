@@ -17,6 +17,7 @@ alloy = { version = "2", default-features = false, features = ["dyn-abi", "k256"
 bloom-polymarket = { path = "../../../crates/bloom-polymarket", default-features = false }
 bloom-petal-sdk = { workspace = true }
 hex = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

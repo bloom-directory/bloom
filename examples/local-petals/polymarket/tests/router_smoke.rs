@@ -433,6 +433,52 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
             .contains(r#""status": "preflight_denied""#)
     );
 
+    router
+        .write(
+            &VfsPath::parse("polymarket/trade/alice/new").unwrap(),
+            br#"{"slug":"test-market","outcome":"yes","side":"sell","amount":"1","min_price":"0.05"}"#,
+        )
+        .await
+        .unwrap();
+    let lock_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    private
+        .put(
+            &install.hash,
+            "trade/alice/.lock",
+            format!(r#"{{"wallet":"alice","acquired_ms":{lock_ms}}}"#).as_bytes(),
+            false,
+        )
+        .unwrap();
+    let locked = dispatch_trade_revalidate(&runner, Arc::new(MockHost::fixture()), "0006").await;
+    assert!(matches!(
+        locked,
+        DispatchResponse::Error { code: -3, message } if message.contains("holds the lock")
+    ));
+    let locked_review = private
+        .get(&install.hash, "trade/alice/drafts/0006/review_intent.json")
+        .unwrap();
+    let locked_review_text = String::from_utf8(locked_review).unwrap();
+    assert!(locked_review_text.contains(r#""status": "created""#));
+    assert!(!locked_review_text.contains("final_review_staged"));
+    private
+        .put(
+            &install.hash,
+            "trade/alice/.lock",
+            br#"{"wallet":"alice","acquired_ms":0}"#,
+            false,
+        )
+        .unwrap();
+    let stale_lock_revalidated =
+        dispatch_trade_revalidate(&runner, Arc::new(MockHost::fixture()), "0006").await;
+    assert!(matches!(stale_lock_revalidated, DispatchResponse::Write));
+    assert!(matches!(
+        private.get(&install.hash, "trade/alice/.lock"),
+        Err(HostError::NotFound(_))
+    ));
+
     let draft = private
         .get(&install.hash, "trade/alice/drafts/0001/order.json")
         .unwrap();
