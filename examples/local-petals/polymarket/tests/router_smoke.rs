@@ -97,6 +97,19 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     let market: serde_json::Value = serde_json::from_slice(&market).unwrap();
     assert_eq!(market["slug"], "test-market");
 
+    let positions = router
+        .read(&VfsPath::parse("polymarket/positions/alice/positions.json").unwrap())
+        .await
+        .unwrap();
+    let positions_text = String::from_utf8(positions).unwrap();
+    assert!(positions_text.contains("Example Position"));
+    let alias_positions = router
+        .read(&VfsPath::parse("polymarket/positions/0xalice/positions.json").unwrap())
+        .await
+        .unwrap();
+    let alias_positions_text = String::from_utf8(alias_positions).unwrap();
+    assert!(alias_positions_text.contains("Alias Position"));
+
     let book = router
         .read(&VfsPath::parse("polymarket/markets/test-market/book.json").unwrap())
         .await
@@ -126,6 +139,27 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     assert_eq!(approvals["deposit_wallet_fundable"], false);
     assert_eq!(approvals["calls"].as_array().unwrap().len(), 8);
 
+    let private = PrivateStore::open(tmp.path().join("data")).unwrap();
+    let status_key = "onboard/alice/status.json";
+    let saved_status = private.get(&install.hash, status_key).unwrap();
+    private
+        .put(
+            &install.hash,
+            status_key,
+            br#"{"wallet":"alice","owner":"0x0000000000000000000000000000000000000001","stage":"creds","creds_present":true,"tradeable":false,"deposit_wallet":{"address":"0x0000000000000000000000000000000000000002","source":"stale","fundable":true}}"#,
+            false,
+        )
+        .unwrap();
+    assert!(
+        router
+            .read(&VfsPath::parse("polymarket/account/alice/portfolio.json").unwrap())
+            .await
+            .is_err()
+    );
+    private
+        .put(&install.hash, status_key, &saved_status, false)
+        .unwrap();
+
     router
         .write(
             &VfsPath::parse("polymarket/trade/alice/new").unwrap(),
@@ -143,7 +177,6 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         .await
         .unwrap();
     assert!(String::from_utf8(plan).unwrap().contains("test-market"));
-    let private = PrivateStore::open(tmp.path().join("data")).unwrap();
     let draft = private
         .get(&install.hash, "trade/alice/drafts/0001/order.json")
         .unwrap();
@@ -158,6 +191,8 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     let account_text = String::from_utf8(account).unwrap();
     assert!(account_text.contains("credentials_present"));
     assert!(account_text.contains("clob_balance_allowance"));
+    assert!(account_text.contains("deposit_wallet"));
+    assert!(account_text.contains("onboarding_state"));
     assert!(!account_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
     let orders = router
         .read(&VfsPath::parse("polymarket/account/alice/orders.json").unwrap())
@@ -179,7 +214,10 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         vfs_calls
             .iter()
             .filter(|call| call.starts_with("read "))
-            .all(|call| call == "read wallets/alice/address")
+            .all(|call| matches!(
+                call.as_str(),
+                "read wallets/alice/address" | "read wallets/0xalice/address"
+            ))
     );
     assert_eq!(host.sign_calls.lock().unwrap().len(), 1);
     assert!(
@@ -211,6 +249,14 @@ impl MockHost {
         host.responses.insert(
             "GET https://gamma-api.polymarket.com/markets/slug/test-market".into(),
             br#"{"slug":"test-market","conditionId":"cond","clobTokenIds":["111","222"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true}"#.to_vec(),
+        );
+        host.responses.insert(
+            "GET https://data-api.polymarket.com/positions?user=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".into(),
+            br#"[{"title":"Example Position","asset":"111","conditionId":"cond","outcome":"Yes"}]"#.to_vec(),
+        );
+        host.responses.insert(
+            "GET https://data-api.polymarket.com/positions?user=0x0000000000000000000000000000000000000001".into(),
+            br#"[{"title":"Alias Position","asset":"222","conditionId":"cond","outcome":"No"}]"#.to_vec(),
         );
         host.responses.insert(
             "GET https://clob.polymarket.com/book?token_id=111".into(),
@@ -250,6 +296,8 @@ impl PetalHost for MockHost {
         self.vfs_calls.lock().unwrap().push(format!("read {path}"));
         if path == "wallets/alice/address" {
             Ok(b"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266\n".to_vec())
+        } else if path == "wallets/0xalice/address" {
+            Ok(b"0x0000000000000000000000000000000000000001\n".to_vec())
         } else {
             Err(HostError::NotFound(path.into()))
         }
@@ -258,7 +306,7 @@ impl PetalHost for MockHost {
     async fn vfs_list(&self, path: &str) -> Result<Vec<String>, HostError> {
         self.vfs_calls.lock().unwrap().push(format!("list {path}"));
         if path == "wallets" {
-            Ok(vec!["alice".into(), "new".into()])
+            Ok(vec!["alice".into(), "0xalice".into(), "new".into()])
         } else {
             Err(HostError::Denied("vfs not expected".into()))
         }

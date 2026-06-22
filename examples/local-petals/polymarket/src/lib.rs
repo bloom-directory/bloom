@@ -246,31 +246,44 @@ fn read_search(query: &str) -> DispatchResponse {
     }
 }
 
-fn read_positions(address: &str, file: &str) -> DispatchResponse {
+fn read_positions(user: &str, file: &str) -> DispatchResponse {
+    let user = match resolve_position_user(user) {
+        Ok(user) => user,
+        Err(resp) => return resp,
+    };
     match file {
         "positions.json" => match get_json::<Vec<Position>>(&url_with_query(
             &format!("{DATA}/positions"),
-            &[("user", address)],
+            &[("user", &user)],
         )) {
             Ok(value) => read_json_value(&value),
             Err(resp) => resp,
         },
         "trades.json" => match get_json::<Vec<Trade>>(&url_with_query(
             &format!("{DATA}/trades"),
-            &[("user", address)],
+            &[("user", &user)],
         )) {
             Ok(value) => read_json_value(&value),
             Err(resp) => resp,
         },
         "activity.json" => match get_json::<serde_json::Value>(&url_with_query(
             &format!("{DATA}/activity"),
-            &[("user", address)],
+            &[("user", &user)],
         )) {
             Ok(value) => read_json_value(&value),
             Err(resp) => resp,
         },
         _ => error(-3, "not a positions file"),
     }
+}
+
+fn resolve_position_user(segment: &str) -> Result<String, DispatchResponse> {
+    if segment.starts_with("0x") || segment.starts_with("0X") {
+        if let Ok(address) = segment.parse::<Address>() {
+            return Ok(address.to_checksum(None));
+        }
+    }
+    wallet_address(segment).map(|address| address.to_checksum(None))
 }
 
 fn read_onboard(wallet: &str, file: &str) -> DispatchResponse {
@@ -280,15 +293,11 @@ fn read_onboard(wallet: &str, file: &str) -> DispatchResponse {
     match file {
         "begin" => DispatchResponse::Read(BEGIN_HINT.into()),
         "status.json" => {
-            let default = match wallet_address(wallet) {
-                Ok(owner) => local_onboard_status(
-                    wallet,
-                    owner,
-                    "not_started",
-                    false,
-                    false,
-                    "write begin to mint or derive CLOB credentials",
-                ),
+            let status = match wallet_address(wallet) {
+                Ok(owner) => match local_status_for_wallet(wallet, owner) {
+                    Ok(status) => status,
+                    Err(resp) => return resp,
+                },
                 Err(_) => serde_json::json!({
                     "wallet": wallet,
                     "stage": "not_started",
@@ -297,7 +306,7 @@ fn read_onboard(wallet: &str, file: &str) -> DispatchResponse {
                     "message": "write begin to mint or derive CLOB credentials"
                 }),
             };
-            read_store_json_or_default(&format!("onboard/{wallet}/status.json"), default)
+            read_json_value(&status)
         }
         "plan.md" => DispatchResponse::Read(render_onboard_plan(wallet).into_bytes()),
         "approvals.json" => match wallet_address(wallet) {
@@ -327,12 +336,27 @@ fn read_account(wallet: &str, file: &str) -> DispatchResponse {
             "/balance-allowance",
             &[("asset_type", "COLLATERAL"), ("signature_type", "3")],
         ) {
-            Ok(clob_balance_allowance) => read_json_value(&serde_json::json!({
-                "wallet": wallet,
-                "owner": format!("{owner:#x}"),
-                "credentials_present": true,
-                "clob_balance_allowance": clob_balance_allowance
-            })),
+            Ok(clob_balance_allowance) => {
+                let status = match local_status_for_wallet(wallet, owner) {
+                    Ok(status) => status,
+                    Err(resp) => return resp,
+                };
+                read_json_value(&serde_json::json!({
+                    "wallet": wallet,
+                    "owner": format!("{owner:#x}"),
+                    "credentials_present": true,
+                    "clob_balance_allowance": clob_balance_allowance,
+                    "deposit_wallet": status
+                        .get("deposit_wallet")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    "onboarding_state": {
+                        "stage": status.get("stage").cloned().unwrap_or(serde_json::Value::Null),
+                        "creds_present": status.get("creds_present").cloned().unwrap_or(serde_json::Value::Bool(true)),
+                        "tradeable": status.get("tradeable").cloned().unwrap_or(serde_json::Value::Bool(false))
+                    }
+                }))
+            }
             Err(resp) => resp,
         },
         "orders.json" => match clob_l2_get_json(owner, &creds, "/data/orders", &[]) {
@@ -422,6 +446,41 @@ fn local_onboard_status(
         },
         "message": message
     })
+}
+
+fn local_status_for_wallet(
+    wallet: &str,
+    owner: Address,
+) -> Result<serde_json::Value, DispatchResponse> {
+    match store_get(&format!("onboard/{wallet}/status.json"))
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    {
+        Some(status) => {
+            let expected = owner.to_checksum(None);
+            let Some(stored_owner) = status.get("owner").and_then(serde_json::Value::as_str) else {
+                return Err(error(-4, "stored onboarding status is missing owner"));
+            };
+            let stored_owner = stored_owner
+                .parse::<Address>()
+                .map_err(|e| error(-4, format!("stored onboarding owner parse: {e}")))?
+                .to_checksum(None);
+            if stored_owner != expected {
+                return Err(error(
+                    -3,
+                    "stored onboarding status belongs to a different wallet owner",
+                ));
+            }
+            Ok(status)
+        }
+        None => Ok(local_onboard_status(
+            wallet,
+            owner,
+            "not_started",
+            false,
+            false,
+            "write begin to mint or derive CLOB credentials",
+        )),
+    }
 }
 
 fn approval_preview(wallet: &str, owner: Address) -> serde_json::Value {
@@ -1044,13 +1103,6 @@ fn store_put_json<T: Serialize>(key: &str, value: &T, secret: bool) -> DispatchR
     match bloom_petal_sdk::store_put(key, &bytes, secret) {
         Ok(()) => DispatchResponse::Write,
         Err(e) => sdk_error(e),
-    }
-}
-
-fn read_store_json_or_default(key: &str, default: serde_json::Value) -> DispatchResponse {
-    match store_get(key) {
-        Some(bytes) => DispatchResponse::Read(bytes),
-        None => read_json_value(&default),
     }
 }
 
