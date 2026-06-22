@@ -6,16 +6,18 @@
 //! native `polymarket/` VFS handler.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use bloom_petal_sdk::{
     DispatchEntry, DispatchEntryKind, DispatchOp, DispatchRequest, DispatchResponse, HostStatus,
     HttpRequest, SdkError, SignRequest,
 };
 use bloom_polymarket::eip712::{
-    CTF, CTF_COLLATERAL_ADAPTER, CTF_EXCHANGE_V2, FACTORY, NEG_RISK_CTF_COLLATERAL_ADAPTER,
-    NEG_RISK_EXCHANGE_V2, PUSD, clob_auth_signing_hash, derive_deposit_wallet_address,
+    Batch, CTF, CTF_COLLATERAL_ADAPTER, CTF_EXCHANGE_V2, FACTORY, NEG_RISK_CTF_COLLATERAL_ADAPTER,
+    NEG_RISK_EXCHANGE_V2, PUSD, batch_signing_hash, clob_auth_signing_hash,
+    derive_deposit_wallet_address,
 };
 use bloom_polymarket::order::{
     LimitQuote, OrderBody, OrderParams, OrderType, SIG_TYPE_POLY_1271, build_order, format_micro,
@@ -27,7 +29,9 @@ use bloom_polymarket::signer::{
 use bloom_polymarket::trade as shared_trade;
 use bloom_polymarket::types::{Market, Side};
 use bloom_polymarket::wallet::{V2_APPROVAL_LABELS, v2_approval_calls};
-use bloom_polymarket::{Credentials, OrderBook, POLYGON, Position, Trade, validate_wallet_name};
+use bloom_polymarket::{
+    BuilderCredentials, Credentials, OrderBook, POLYGON, Position, Trade, validate_wallet_name,
+};
 use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -46,7 +50,11 @@ const GAMMA: &str = "https://gamma-api.polymarket.com";
 const DATA: &str = "https://data-api.polymarket.com";
 const CLOB: &str = "https://clob.polymarket.com";
 const POLYMARKET_WEB: &str = "https://polymarket.com";
+const RELAYER: &str = "https://relayer-v2.polymarket.com";
 const CLOB_AUTH_NONCE: u32 = 0;
+const ONBOARD_POLL_TIMEOUT_SECS: u64 = 180;
+const ONBOARD_POLL_INTERVAL_SECS: u64 = 2;
+const BATCH_DEADLINE_SECS: u64 = 3600;
 
 const ROOT_DIRS: [&str; 8] = [
     "markets",
@@ -236,6 +244,7 @@ fn read_meta(file: &str) -> DispatchResponse {
             "no_on_chain_code_touched_by_local_petal": true,
             "secret_storage": {
                 "clob_credentials": "private_store_only",
+                "builder_credentials": "private_store_only",
                 "public_vfs_receipts": "redacted_summaries_only"
             },
             "implemented": [
@@ -265,6 +274,11 @@ fn read_meta(file: &str) -> DispatchResponse {
                     "evidence": "local status recomputes deployed/funded/approved/credentialed/CLOB-synced readiness from VFS chain reads plus private credentials; posting requires stage=complete"
                 },
                 {
+                    "id": "onboarding_relayer_deploy_approve_sync",
+                    "surface": ["onboard/*/begin", "onboard/*/status.json"],
+                    "evidence": "local begin auto-mints private builder credentials, submits relayer WALLET-CREATE and signed V2 approval WALLET batches when live probes show they are needed, polls confirmation, rests at fund when pUSD is absent, and calls CLOB balance-allowance update before marking complete"
+                },
+                {
                     "id": "buy_posting",
                     "surface": ["trade/*/drafts/*/revalidate", "trade/*/drafts/*/post"],
                     "evidence": "final-review-bound POLY_1271 buy posting with private receipt/audit records"
@@ -291,11 +305,6 @@ fn read_meta(file: &str) -> DispatchResponse {
                 }
             ],
             "remaining_blockers": [
-                {
-                    "id": "onboarding_deploy_fund_approve_sync",
-                    "status": "blocked",
-                    "reason": "local begin resolves the live factory wallet and manages CLOB credentials, and read-only probes gate posting on complete readiness, but it does not yet drive native relayer deploy, approval batch, or CLOB update stages end-to-end"
-                },
                 {
                     "id": "graduation_signoff",
                     "status": "pending",
@@ -554,11 +563,13 @@ fn write_onboard_begin(wallet: &str) -> DispatchResponse {
     {
         return error(-4, "failed to store CLOB credentials");
     }
-    let status = match refreshed_live_onboard_status(wallet, owner, deposit, true) {
-        Ok(status) => status,
-        Err(resp) => return resp,
-    };
-    store_put_json(&format!("onboard/{wallet}/status.json"), &status, false)
+    match run_onboard_stages(wallet, owner, deposit, &creds) {
+        Ok(status) => store_put_json(&format!("onboard/{wallet}/status.json"), &status, false),
+        Err(resp) => {
+            let _ = persist_onboard_failure(wallet, owner, deposit, &resp);
+            resp
+        }
+    }
 }
 
 fn check_geoblock() -> Result<(), DispatchResponse> {
@@ -754,6 +765,307 @@ fn refreshed_live_onboard_status(
     ))
 }
 
+fn run_onboard_stages(
+    wallet: &str,
+    owner: Address,
+    deposit: Address,
+    creds: &Credentials,
+) -> Result<serde_json::Value, DispatchResponse> {
+    let mut deploy_tx_id = stored_status_for_wallet(wallet, owner)
+        .ok()
+        .and_then(|status| {
+            status
+                .get("deploy_tx_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    let mut approve_tx_id = stored_status_for_wallet(wallet, owner)
+        .ok()
+        .and_then(|status| {
+            status
+                .get("approve_tx_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+
+    if !read_chain_deposit_wallet_deployed(deposit)? {
+        let _builder = ensure_builder_credentials(wallet, owner, creds)?;
+        let tx = relayer_submit_with_builder_repair(
+            wallet,
+            owner,
+            creds,
+            serde_json::json!({
+                "type": "WALLET-CREATE",
+                "from": owner.to_checksum(None),
+                "to": FACTORY.to_checksum(None),
+            }),
+        )?;
+        deploy_tx_id = Some(tx.id.clone());
+        persist_onboard_status(
+            wallet,
+            owner,
+            deposit,
+            true,
+            OnboardStatusExtra {
+                stage: Some("deploy"),
+                deploy_tx_id: deploy_tx_id.clone(),
+                approve_tx_id: approve_tx_id.clone(),
+                in_flight_deadline_ms: Some(onboard_in_flight_deadline_ms()),
+                relayer_auth: Some("builder_key_auto"),
+                last_error: None,
+            },
+        )?;
+        let confirmed = match relayer_poll_confirmed(&tx) {
+            Ok(done) => done,
+            Err(resp) => {
+                let msg = dispatch_error_message(&resp);
+                persist_onboard_status(
+                    wallet,
+                    owner,
+                    deposit,
+                    true,
+                    OnboardStatusExtra {
+                        stage: Some("deploy"),
+                        deploy_tx_id,
+                        approve_tx_id,
+                        in_flight_deadline_ms: None,
+                        relayer_auth: Some("builder_key_auto"),
+                        last_error: Some(msg),
+                    },
+                )?;
+                return Err(resp);
+            }
+        };
+        deploy_tx_id = Some(confirmed.id);
+        if !read_chain_deposit_wallet_deployed(deposit)? {
+            let msg = "relayer confirmed the deploy but no proxy implementation exists at the deposit wallet".to_string();
+            persist_onboard_status(
+                wallet,
+                owner,
+                deposit,
+                true,
+                OnboardStatusExtra {
+                    stage: Some("deploy"),
+                    deploy_tx_id,
+                    approve_tx_id,
+                    in_flight_deadline_ms: None,
+                    relayer_auth: Some("builder_key_auto"),
+                    last_error: Some(msg.clone()),
+                },
+            )?;
+            return Err(error(-4, msg));
+        }
+    }
+
+    let pusd_balance = read_chain_erc20_balance(PUSD, deposit)?;
+    if pusd_balance.is_zero() {
+        return persist_onboard_status(
+            wallet,
+            owner,
+            deposit,
+            true,
+            OnboardStatusExtra {
+                stage: Some("fund"),
+                deploy_tx_id,
+                approve_tx_id,
+                in_flight_deadline_ms: None,
+                relayer_auth: Some("builder_key_auto"),
+                last_error: None,
+            },
+        );
+    }
+
+    if !read_chain_v2_approvals(deposit)? {
+        let _builder = ensure_builder_credentials(wallet, owner, creds)?;
+        let nonce = relayer_wallet_nonce(owner)?;
+        let deadline = now_secs().saturating_add(BATCH_DEADLINE_SECS);
+        let tx = relayer_submit_with_builder_repair(
+            wallet,
+            owner,
+            creds,
+            relayer_batch_body(wallet, owner, deposit, nonce, deadline)?,
+        )?;
+        approve_tx_id = Some(tx.id.clone());
+        persist_onboard_status(
+            wallet,
+            owner,
+            deposit,
+            true,
+            OnboardStatusExtra {
+                stage: Some("approve"),
+                deploy_tx_id: deploy_tx_id.clone(),
+                approve_tx_id: approve_tx_id.clone(),
+                in_flight_deadline_ms: Some(onboard_in_flight_deadline_ms()),
+                relayer_auth: Some("builder_key_auto"),
+                last_error: None,
+            },
+        )?;
+        let confirmed = match relayer_poll_confirmed(&tx) {
+            Ok(done) => done,
+            Err(resp) => {
+                let msg = dispatch_error_message(&resp);
+                persist_onboard_status(
+                    wallet,
+                    owner,
+                    deposit,
+                    true,
+                    OnboardStatusExtra {
+                        stage: Some("approve"),
+                        deploy_tx_id,
+                        approve_tx_id,
+                        in_flight_deadline_ms: None,
+                        relayer_auth: Some("builder_key_auto"),
+                        last_error: Some(msg),
+                    },
+                )?;
+                return Err(resp);
+            }
+        };
+        approve_tx_id = Some(confirmed.id);
+        if !read_chain_v2_approvals(deposit)? {
+            let msg = "approvals confirmed but on-chain allowances are still missing".to_string();
+            persist_onboard_status(
+                wallet,
+                owner,
+                deposit,
+                true,
+                OnboardStatusExtra {
+                    stage: Some("approve"),
+                    deploy_tx_id,
+                    approve_tx_id,
+                    in_flight_deadline_ms: None,
+                    relayer_auth: Some("builder_key_auto"),
+                    last_error: Some(msg.clone()),
+                },
+            )?;
+            return Err(error(-4, msg));
+        }
+    }
+
+    persist_onboard_status(
+        wallet,
+        owner,
+        deposit,
+        true,
+        OnboardStatusExtra {
+            stage: Some("sync"),
+            deploy_tx_id: deploy_tx_id.clone(),
+            approve_tx_id: approve_tx_id.clone(),
+            in_flight_deadline_ms: Some(onboard_in_flight_deadline_ms()),
+            relayer_auth: Some("builder_key_auto"),
+            last_error: None,
+        },
+    )?;
+    clob_l2_get_json(
+        owner,
+        creds,
+        "/balance-allowance/update",
+        &[("asset_type", "COLLATERAL"), ("signature_type", "3")],
+    )?;
+    persist_onboard_status(
+        wallet,
+        owner,
+        deposit,
+        true,
+        OnboardStatusExtra {
+            stage: None,
+            deploy_tx_id,
+            approve_tx_id,
+            in_flight_deadline_ms: None,
+            relayer_auth: Some("builder_key_auto"),
+            last_error: None,
+        },
+    )
+}
+
+#[derive(Default)]
+struct OnboardStatusExtra {
+    stage: Option<&'static str>,
+    deploy_tx_id: Option<String>,
+    approve_tx_id: Option<String>,
+    in_flight_deadline_ms: Option<u128>,
+    relayer_auth: Option<&'static str>,
+    last_error: Option<String>,
+}
+
+fn persist_onboard_status(
+    wallet: &str,
+    owner: Address,
+    deposit: Address,
+    creds_present: bool,
+    extra: OnboardStatusExtra,
+) -> Result<serde_json::Value, DispatchResponse> {
+    let mut status = refreshed_live_onboard_status(wallet, owner, deposit, creds_present)?;
+    if let Some(obj) = status.as_object_mut() {
+        if let Some(stage) = extra.stage {
+            obj.insert("stage".into(), serde_json::Value::String(stage.into()));
+            obj.insert(
+                "tradeable".into(),
+                serde_json::Value::Bool(stage == "complete"),
+            );
+        }
+        obj.insert(
+            "deploy_tx_id".into(),
+            extra
+                .deploy_tx_id
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
+        );
+        obj.insert(
+            "approve_tx_id".into(),
+            extra
+                .approve_tx_id
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
+        );
+        obj.insert(
+            "in_flight_deadline_ms".into(),
+            extra
+                .in_flight_deadline_ms
+                .map(|v| serde_json::Value::String(v.to_string()))
+                .unwrap_or(serde_json::Value::Null),
+        );
+        obj.insert(
+            "relayer_auth".into(),
+            extra
+                .relayer_auth
+                .map(|v| serde_json::Value::String(v.into()))
+                .unwrap_or(serde_json::Value::Null),
+        );
+        obj.insert(
+            "last_error".into(),
+            extra
+                .last_error
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
+    if let DispatchResponse::Error { .. } =
+        store_put_json(&format!("onboard/{wallet}/status.json"), &status, false)
+    {
+        return Err(error(-4, "failed to persist onboarding status"));
+    }
+    Ok(status)
+}
+
+fn persist_onboard_failure(
+    wallet: &str,
+    owner: Address,
+    deposit: Address,
+    resp: &DispatchResponse,
+) -> Result<serde_json::Value, DispatchResponse> {
+    persist_onboard_status(
+        wallet,
+        owner,
+        deposit,
+        store_get(&format!("creds/{wallet}/clob.json")).is_some(),
+        OnboardStatusExtra {
+            last_error: Some(dispatch_error_message(resp)),
+            ..OnboardStatusExtra::default()
+        },
+    )
+}
+
 fn local_status_for_wallet(
     wallet: &str,
     owner: Address,
@@ -774,7 +1086,8 @@ fn local_status_for_wallet(
         .parse::<Address>()
         .map_err(|e| error(-4, format!("stored deposit wallet parse: {e}")))?;
     let creds_present = store_get(&format!("creds/{wallet}/clob.json")).is_some();
-    let refreshed = refreshed_live_onboard_status(wallet, owner, deposit, creds_present)?;
+    let mut refreshed = refreshed_live_onboard_status(wallet, owner, deposit, creds_present)?;
+    preserve_onboard_metadata(&status, &mut refreshed);
     if refreshed != status {
         if let DispatchResponse::Error { .. } =
             store_put_json(&format!("onboard/{wallet}/status.json"), &refreshed, false)
@@ -783,6 +1096,36 @@ fn local_status_for_wallet(
         }
     }
     Ok(refreshed)
+}
+
+fn preserve_onboard_metadata(previous: &serde_json::Value, refreshed: &mut serde_json::Value) {
+    let refreshed_complete =
+        refreshed.get("stage").and_then(serde_json::Value::as_str) == Some("complete");
+    let Some(obj) = refreshed.as_object_mut() else {
+        return;
+    };
+    for key in ["deploy_tx_id", "approve_tx_id", "relayer_auth"] {
+        if let Some(value) = previous.get(key) {
+            obj.insert(key.into(), value.clone());
+        }
+    }
+    if previous
+        .get("in_flight_deadline_ms")
+        .is_some_and(|value| !value.is_null())
+        && !refreshed_complete
+    {
+        obj.insert(
+            "in_flight_deadline_ms".into(),
+            previous["in_flight_deadline_ms"].clone(),
+        );
+    }
+    if previous
+        .get("last_error")
+        .is_some_and(|value| !value.is_null())
+        && !refreshed_complete
+    {
+        obj.insert("last_error".into(), previous["last_error"].clone());
+    }
 }
 
 fn stored_status_for_wallet(
@@ -3082,6 +3425,387 @@ fn load_creds(wallet: &str) -> Result<Credentials, DispatchResponse> {
     serde_json::from_slice(&bytes).map_err(|e| error(-4, format!("corrupt credentials: {e}")))
 }
 
+fn load_builder_credentials(wallet: &str) -> Result<Option<BuilderCredentials>, DispatchResponse> {
+    match bloom_petal_sdk::store_get(&format!("creds/{wallet}/builder.json"), MAX_STORE_BYTES) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| error(-4, format!("corrupt builder credentials: {e}"))),
+        Err(SdkError::Host(HostStatus::NotFound)) => Ok(None),
+        Err(e) => Err(sdk_error(e)),
+    }
+}
+
+fn save_builder_credentials(
+    wallet: &str,
+    creds: &BuilderCredentials,
+) -> Result<(), DispatchResponse> {
+    if let DispatchResponse::Error { .. } =
+        store_put_json(&format!("creds/{wallet}/builder.json"), creds, true)
+    {
+        return Err(error(-4, "failed to store builder credentials"));
+    }
+    Ok(())
+}
+
+fn delete_builder_credentials(wallet: &str) -> Result<(), DispatchResponse> {
+    match bloom_petal_sdk::store_del(&format!("creds/{wallet}/builder.json")) {
+        Ok(()) | Err(SdkError::Host(HostStatus::NotFound)) => Ok(()),
+        Err(e) => Err(sdk_error(e)),
+    }
+}
+
+fn ensure_builder_credentials(
+    wallet: &str,
+    owner: Address,
+    clob_creds: &Credentials,
+) -> Result<BuilderCredentials, DispatchResponse> {
+    if let Some(creds) = load_builder_credentials(wallet)? {
+        return Ok(creds);
+    }
+    let raw = clob_l2_post_json(owner, clob_creds, "/auth/builder-api-key", "")?;
+    let mut creds: BuilderCredentials =
+        serde_json::from_value(raw).map_err(|e| error(-4, format!("builder key JSON: {e}")))?;
+    creds.created_at_ms = now_millis();
+    creds.source = "clob_l2_auth".into();
+    save_builder_credentials(wallet, &creds)?;
+    Ok(creds)
+}
+
+#[derive(Debug, Clone)]
+struct LocalRelayerTx {
+    id: String,
+    state: String,
+}
+
+impl LocalRelayerTx {
+    fn is_confirmed(&self) -> bool {
+        self.state == "STATE_CONFIRMED"
+    }
+
+    fn is_failed(&self) -> bool {
+        let state = self.state.to_ascii_uppercase();
+        state.contains("FAIL") || state.contains("INVALID")
+    }
+}
+
+fn relayer_submit_with_builder_repair(
+    wallet: &str,
+    owner: Address,
+    clob_creds: &Credentials,
+    body: serde_json::Value,
+) -> Result<LocalRelayerTx, DispatchResponse> {
+    let mut builder = ensure_builder_credentials(wallet, owner, clob_creds)?;
+    match relayer_submit(&builder, &body) {
+        Ok(tx) => Ok(tx),
+        Err(RelayerHttpError {
+            status: 401 | 403, ..
+        }) => {
+            delete_builder_credentials(wallet)?;
+            builder = ensure_builder_credentials(wallet, owner, clob_creds)?;
+            relayer_submit(&builder, &body).map_err(relayer_http_error)
+        }
+        Err(err) => Err(relayer_http_error(err)),
+    }
+}
+
+#[derive(Debug)]
+struct RelayerHttpError {
+    status: u16,
+    body: String,
+}
+
+fn relayer_submit(
+    builder: &BuilderCredentials,
+    body: &serde_json::Value,
+) -> Result<LocalRelayerTx, RelayerHttpError> {
+    let body = serde_json::to_string(body).map_err(|e| RelayerHttpError {
+        status: 0,
+        body: format!("relayer body JSON: {e}"),
+    })?;
+    let headers =
+        builder_headers(builder, "POST", "/submit", &body).map_err(|message| RelayerHttpError {
+            status: 0,
+            body: message,
+        })?;
+    let mut headers: Vec<(String, String)> = headers
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect();
+    headers.push(("content-type".into(), "application/json".into()));
+    let resp = bloom_petal_sdk::http_fetch(
+        &HttpRequest {
+            method: "POST".into(),
+            url: format!("{RELAYER}/submit"),
+            headers,
+            body: body.into_bytes(),
+        },
+        MAX_HTTP_BYTES,
+    )
+    .map_err(|e| RelayerHttpError {
+        status: 0,
+        body: e.message().to_string(),
+    })?;
+    if !(200..300).contains(&resp.status) {
+        return Err(RelayerHttpError {
+            status: resp.status,
+            body: format!(
+                "relayer /submit response body redacted ({} bytes)",
+                resp.body.len()
+            ),
+        });
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&resp.body).map_err(|e| RelayerHttpError {
+            status: resp.status,
+            body: format!("relayer submit JSON: {e}"),
+        })?;
+    parse_relayer_submit_response(&value).map_err(|body| RelayerHttpError {
+        status: resp.status,
+        body,
+    })
+}
+
+fn relayer_wallet_nonce(owner: Address) -> Result<u64, DispatchResponse> {
+    let value = relayer_get_json(&url_with_query(
+        &format!("{RELAYER}/nonce"),
+        &[("address", &format!("{owner:#x}")), ("type", "WALLET")],
+    ))?;
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+        .or_else(|| value.get("nonce").and_then(parse_json_u64))
+        .ok_or_else(|| error(-4, format!("relayer /nonce response unparsable: {value}")))
+}
+
+fn relayer_poll_confirmed(tx: &LocalRelayerTx) -> Result<LocalRelayerTx, DispatchResponse> {
+    let deadline = now_secs().saturating_add(ONBOARD_POLL_TIMEOUT_SECS);
+    loop {
+        let cur = relayer_transaction(&tx.id)?;
+        if cur.is_confirmed() {
+            return Ok(cur);
+        }
+        if cur.is_failed() {
+            return Err(error(-4, format!("relayer tx {} {}", cur.id, cur.state)));
+        }
+        if now_secs() >= deadline {
+            return Err(error(
+                -4,
+                format!(
+                    "relayer tx {} not confirmed before timeout (last: {})",
+                    cur.id, cur.state
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_secs(ONBOARD_POLL_INTERVAL_SECS));
+    }
+}
+
+fn relayer_transaction(id: &str) -> Result<LocalRelayerTx, DispatchResponse> {
+    let value = relayer_get_json(&url_with_query(
+        &format!("{RELAYER}/transaction"),
+        &[("id", id)],
+    ))?;
+    parse_relayer_transaction_response(id, &value).map_err(|message| error(-4, message))
+}
+
+fn relayer_get_json(url: &str) -> Result<serde_json::Value, DispatchResponse> {
+    let resp = bloom_petal_sdk::http_fetch(
+        &HttpRequest {
+            method: "GET".into(),
+            url: url.into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        },
+        MAX_HTTP_BYTES,
+    )
+    .map_err(sdk_error)?;
+    if !(200..300).contains(&resp.status) {
+        return Err(error(
+            -4,
+            format!(
+                "relayer error (status {}): {}",
+                resp.status,
+                String::from_utf8_lossy(&resp.body)
+            ),
+        ));
+    }
+    serde_json::from_slice(&resp.body).map_err(|e| error(-4, format!("relayer JSON: {e}")))
+}
+
+fn relayer_batch_body(
+    wallet: &str,
+    owner: Address,
+    deposit: Address,
+    nonce: u64,
+    deadline: u64,
+) -> Result<serde_json::Value, DispatchResponse> {
+    let calls = v2_approval_calls();
+    let batch = Batch {
+        wallet: deposit,
+        nonce: U256::from(nonce),
+        deadline: U256::from(deadline),
+        calls: calls.clone(),
+    };
+    let hash = batch_signing_hash(&batch, POLYGON, deposit);
+    let signature = sign_hash_hex(wallet, "polymarket.relayer_batch", hash)?;
+    let calls_json: Vec<serde_json::Value> = calls
+        .iter()
+        .map(|call| {
+            serde_json::json!({
+                "target": call.target.to_checksum(None),
+                "value": call.value.to_string(),
+                "data": format!("0x{}", hex::encode(call.data.as_ref())),
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "type": "WALLET",
+        "from": owner.to_checksum(None),
+        "to": FACTORY.to_checksum(None),
+        "nonce": nonce.to_string(),
+        "signature": signature,
+        "depositWalletParams": {
+            "depositWallet": deposit.to_checksum(None),
+            "deadline": deadline.to_string(),
+            "calls": calls_json,
+        },
+    }))
+}
+
+fn sign_hash_hex(wallet: &str, purpose: &str, hash: B256) -> Result<String, DispatchResponse> {
+    match bloom_petal_sdk::sign_hash(&SignRequest {
+        wallet: wallet.into(),
+        hash32: hash.into(),
+        purpose: purpose.into(),
+    }) {
+        Ok(sig) if sig.len() == 65 => Ok(format!("0x{}", hex::encode(sig))),
+        Ok(sig) => Err(error(-4, format!("sign_hash returned {} bytes", sig.len()))),
+        Err(e) => Err(sdk_error(e)),
+    }
+}
+
+fn builder_headers(
+    creds: &BuilderCredentials,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Result<Vec<(&'static str, String)>, String> {
+    let timestamp = now_secs().to_string();
+    let signature = builder_hmac_signature(&creds.secret, &timestamp, method, path, body)?;
+    Ok(vec![
+        ("POLY_BUILDER_API_KEY", creds.key.clone()),
+        ("POLY_BUILDER_TIMESTAMP", timestamp),
+        ("POLY_BUILDER_PASSPHRASE", creds.passphrase.clone()),
+        ("POLY_BUILDER_SIGNATURE", signature),
+    ])
+}
+
+fn builder_hmac_signature(
+    secret: &str,
+    timestamp: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Result<String, String> {
+    use base64::Engine as _;
+    use hmac::Mac as _;
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(secret)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(secret))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(secret))
+        .map_err(|e| format!("builder secret base64: {e}"))?;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&decoded)
+        .map_err(|e| format!("builder hmac key: {e}"))?;
+    mac.update(format!("{timestamp}{method}{path}{body}").as_bytes());
+    let out = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+    Ok(out.replace('+', "-").replace('/', "_"))
+}
+
+fn parse_relayer_submit_response(value: &serde_json::Value) -> Result<LocalRelayerTx, String> {
+    let id = ["transactionID", "transactionId", "transaction_id", "id"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .ok_or_else(|| format!("relayer /submit response missing transaction id: {value}"))?;
+    let state = value
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("STATE_NEW");
+    Ok(LocalRelayerTx {
+        id: id.into(),
+        state: state.into(),
+    })
+}
+
+fn parse_relayer_transaction_response(
+    id: &str,
+    value: &serde_json::Value,
+) -> Result<LocalRelayerTx, String> {
+    let tx = match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find(|item| relayer_tx_id_matches(item, id))
+            .or_else(|| items.first())
+            .ok_or_else(|| format!("empty relayer /transaction response for {id}"))?,
+        other => other,
+    };
+    let state = tx
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("relayer /transaction response for {id} missing state: {value}"))?;
+    let parsed_id = ["transactionID", "transactionId", "transaction_id", "id"]
+        .iter()
+        .find_map(|key| tx.get(*key).and_then(serde_json::Value::as_str))
+        .unwrap_or(id);
+    Ok(LocalRelayerTx {
+        id: parsed_id.into(),
+        state: state.into(),
+    })
+}
+
+fn relayer_tx_id_matches(value: &serde_json::Value, id: &str) -> bool {
+    ["transactionID", "transactionId", "transaction_id", "id"]
+        .iter()
+        .any(|key| value.get(*key).and_then(serde_json::Value::as_str) == Some(id))
+}
+
+fn relayer_http_error(err: RelayerHttpError) -> DispatchResponse {
+    if err.status == 401 || err.status == 403 {
+        return error(
+            -4,
+            format!(
+                "relayer rejected builder authentication (status {}): {}",
+                err.status, err.body
+            ),
+        );
+    }
+    if err.status == 0 {
+        error(-4, err.body)
+    } else {
+        error(
+            -4,
+            format!("relayer error (status {}): {}", err.status, err.body),
+        )
+    }
+}
+
+fn parse_json_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+}
+
+fn onboard_in_flight_deadline_ms() -> u128 {
+    now_millis().saturating_add((ONBOARD_POLL_TIMEOUT_SECS as u128).saturating_mul(1000))
+}
+
+fn dispatch_error_message(resp: &DispatchResponse) -> String {
+    match resp {
+        DispatchResponse::Error { message, .. } => message.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
 fn clob_l2_get_json(
     owner: Address,
     creds: &Credentials,
@@ -3760,7 +4484,7 @@ fn read_json_value<T: Serialize>(value: &T) -> DispatchResponse {
 
 fn render_onboard_plan(wallet: &str) -> String {
     format!(
-        "# Polymarket onboarding\n\nWallet: {wallet}\n\nWrite `begin` to request a daemon-keystore CLOB auth signature, mint or derive CLOB API credentials, and store them in the private petal store. Funding and approval stages are still pending.\n"
+        "# Polymarket onboarding\n\nWallet: {wallet}\n\nWrite `begin` to request daemon-keystore signatures for CLOB auth and any required deposit-wallet approval batch, store CLOB and builder credentials in the private petal store, deploy the live-factory deposit wallet when needed, rest at `fund` until pUSD arrives, then approve and sync CLOB buying power before marking the wallet tradeable.\n"
     )
 }
 
@@ -4403,6 +5127,29 @@ mod tests {
             Some(DispatchEntryKind::WritableFile)
         );
         assert_eq!(path_kind("trade/alice/new/extra"), None);
+    }
+
+    #[test]
+    fn completed_onboard_refresh_clears_stale_in_flight_marker() {
+        let previous = serde_json::json!({
+            "deploy_tx_id": "tx-d",
+            "approve_tx_id": "tx-a",
+            "relayer_auth": "builder_key_auto",
+            "in_flight_deadline_ms": "123",
+            "last_error": "old error"
+        });
+        let mut refreshed = serde_json::json!({
+            "stage": "complete",
+            "tradeable": true
+        });
+
+        preserve_onboard_metadata(&previous, &mut refreshed);
+
+        assert_eq!(refreshed["deploy_tx_id"], "tx-d");
+        assert_eq!(refreshed["approve_tx_id"], "tx-a");
+        assert_eq!(refreshed["relayer_auth"], "builder_key_auto");
+        assert!(refreshed.get("in_flight_deadline_ms").is_none());
+        assert!(refreshed.get("last_error").is_none());
     }
 
     #[test]

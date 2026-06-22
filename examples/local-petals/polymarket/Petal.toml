@@ -24,17 +24,22 @@ paths = ["/api/geoblock"]
 [[net.allow]]
 host = "clob.polymarket.com"
 methods = ["GET"]
-paths = ["/book", "/midpoint", "/spread", "/price", "/auth/derive-api-key", "/data/orders", "/balance-allowance"]
+paths = ["/book", "/midpoint", "/spread", "/price", "/auth/derive-api-key", "/auth/builder-api-key", "/data/orders", "/balance-allowance", "/balance-allowance/update"]
 
 [[net.allow]]
 host = "clob.polymarket.com"
 methods = ["POST"]
-paths = ["/auth/api-key", "/order"]
+paths = ["/auth/api-key", "/auth/builder-api-key", "/order"]
 
 [[net.allow]]
 host = "clob.polymarket.com"
 methods = ["DELETE"]
 paths = ["/order"]
+
+[[net.allow]]
+host = "relayer-v2.polymarket.com"
+methods = ["GET", "POST"]
+paths = ["/nonce", "/submit", "/transaction"]
 
 [[endpoint]]
 path = "markets/*"

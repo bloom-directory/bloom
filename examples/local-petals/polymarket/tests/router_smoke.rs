@@ -58,7 +58,7 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
             .collect::<Vec<_>>(),
         vec!["vfs.read", "vfs.write", "net.fetch", "sign", "store"]
     );
-    assert_eq!(manifest.net.as_ref().unwrap().allow.len(), 6);
+    assert_eq!(manifest.net.as_ref().unwrap().allow.len(), 7);
 
     let tmp = tempfile::tempdir().unwrap();
     let store = PetalStore::open(tmp.path().join("store")).unwrap();
@@ -142,6 +142,8 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
             .any(|item| item["id"] == "gtd_orders")
     );
     assert!(!parity_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+    assert!(!parity_text.contains("YnVpbGRlci1zZWNyZXQtYnVpbGRlci1zZWNyZXQ="));
+    assert!(!parity_text.contains("builder-pass"));
     assert!(
         router
             .write(
@@ -224,6 +226,81 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     assert_eq!(host.sign_calls.lock().unwrap().len(), 1);
 
     let status_key = "onboard/alice/status.json";
+    let approval_host = Arc::new(MockHost::fixture_with_pusd_allowance(false));
+    let approval_run = dispatch_onboard_begin(&runner, approval_host.clone()).await;
+    assert!(matches!(approval_run, DispatchResponse::Write));
+    assert!(
+        approval_host
+            .http_bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, url, body)| method == "POST"
+                && url == "https://relayer-v2.polymarket.com/submit"
+                && String::from_utf8_lossy(body).contains(r#""type":"WALLET""#))
+    );
+    assert!(
+        approval_host
+            .vfs_writes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(path, _)| path.contains("/methods/allowance@"))
+    );
+    assert_eq!(approval_host.sign_calls.lock().unwrap().len(), 2);
+    let approved_status = private.get(&install.hash, status_key).unwrap();
+    let approved_status: serde_json::Value = serde_json::from_slice(&approved_status).unwrap();
+    assert_eq!(approved_status["stage"], "complete");
+    assert_eq!(approved_status["approve_tx_id"], "tx-approve");
+    assert_eq!(approved_status["relayer_auth"], "builder_key_auto");
+    assert_eq!(approved_status["last_error"], serde_json::Value::Null);
+    let builder_creds = private
+        .get(&install.hash, "creds/alice/builder.json")
+        .unwrap();
+    let builder_creds_text = String::from_utf8(builder_creds).unwrap();
+    assert!(builder_creds_text.contains("YnVpbGRlci1zZWNyZXQtYnVpbGRlci1zZWNyZXQ="));
+    assert!(builder_creds_text.contains("builder-pass"));
+    let approved_status_text = String::from_utf8(
+        private
+            .get(&install.hash, "onboard/alice/status.json")
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!approved_status_text.contains("YnVpbGRlci1zZWNyZXQtYnVpbGRlci1zZWNyZXQ="));
+    assert!(!approved_status_text.contains("builder-pass"));
+
+    let relayer_error_host = Arc::new(MockHost::fixture_with_relayer_submit_error(
+        500,
+        br#"{"error":"echo YnVpbGRlci1zZWNyZXQtYnVpbGRlci1zZWNyZXQ= builder-pass"}"#,
+    ));
+    let relayer_error = dispatch_onboard_begin(&runner, relayer_error_host.clone()).await;
+    assert!(matches!(
+        relayer_error,
+        DispatchResponse::Error { code: -4, message }
+            if message.contains("relayer error (status 500)")
+                && message.contains("redacted")
+                && !message.contains("builder-pass")
+                && !message.contains("YnVpbGRlci1zZWNyZXQtYnVpbGRlci1zZWNyZXQ=")
+    ));
+    let relayer_error_status = private.get(&install.hash, status_key).unwrap();
+    let relayer_error_status_text = String::from_utf8(relayer_error_status).unwrap();
+    assert!(relayer_error_status_text.contains("relayer error (status 500)"));
+    assert!(relayer_error_status_text.contains("redacted"));
+    assert!(relayer_error_status_text.contains(r#""in_flight_deadline_ms": null"#));
+    assert!(!relayer_error_status_text.contains("builder-pass"));
+    assert!(!relayer_error_status_text.contains("YnVpbGRlci1zZWNyZXQtYnVpbGRlci1zZWNyZXQ="));
+
+    let sync_error_host = Arc::new(MockHost::fixture_with_sync_error());
+    let sync_error = dispatch_onboard_begin(&runner, sync_error_host.clone()).await;
+    assert!(matches!(
+        sync_error,
+        DispatchResponse::Error { code: -4, message } if message.contains("CLOB account error (status 500)")
+    ));
+    let sync_error_status = private.get(&install.hash, status_key).unwrap();
+    let sync_error_status_text = String::from_utf8(sync_error_status).unwrap();
+    assert!(sync_error_status_text.contains("CLOB account error (status 500): sync failed"));
+    assert!(sync_error_status_text.contains(r#""in_flight_deadline_ms": null"#));
+
     let saved_status = private.get(&install.hash, status_key).unwrap();
     private
         .put(
@@ -843,6 +920,8 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     assert!(account_text.contains("deposit_wallet"));
     assert!(account_text.contains("onboarding_state"));
     assert!(!account_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+    assert!(!account_text.contains("YnVpbGRlci1zZWNyZXQtYnVpbGRlci1zZWNyZXQ="));
+    assert!(!account_text.contains("builder-pass"));
     let orders = router
         .read(&VfsPath::parse("polymarket/account/alice/orders.json").unwrap())
         .await
@@ -850,6 +929,8 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     let orders_text = String::from_utf8(orders).unwrap();
     assert!(orders_text.contains("order-1"));
     assert!(!orders_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+    assert!(!orders_text.contains("YnVpbGRlci1zZWNyZXQtYnVpbGRlci1zZWNyZXQ="));
+    assert!(!orders_text.contains("builder-pass"));
 
     let vfs_calls = host.vfs_calls.lock().unwrap().clone();
     assert!(
@@ -1022,6 +1103,7 @@ struct MockHost {
     chain_pusd_allowance_ok: bool,
     chain_ctf_balance_micro: u64,
     chain_ctf_approved: bool,
+    relayer_submit_response: Option<(u16, Vec<u8>)>,
     http_calls: Mutex<Vec<(String, String)>>,
     http_bodies: Mutex<Vec<(String, String, Vec<u8>)>>,
     vfs_calls: Mutex<Vec<String>>,
@@ -1076,9 +1158,29 @@ impl MockHost {
         host
     }
 
+    fn fixture_with_pusd_allowance(allowance_ok: bool) -> Self {
+        let mut host = Self::fixture();
+        host.chain_pusd_allowance_ok = allowance_ok;
+        host
+    }
+
     fn fixture_with_deposit_deployed(deployed: bool) -> Self {
         let mut host = Self::fixture();
         host.deposit_wallet_deployed = deployed;
+        host
+    }
+
+    fn fixture_with_relayer_submit_error(status: u16, body: &[u8]) -> Self {
+        let mut host = Self::fixture_with_pusd_allowance(false);
+        host.relayer_submit_response = Some((status, body.to_vec()));
+        host
+    }
+
+    fn fixture_with_sync_error() -> Self {
+        let mut host = Self::fixture();
+        let key = "GET https://clob.polymarket.com/balance-allowance/update?asset_type=COLLATERAL&signature_type=3";
+        host.statuses.insert(key.into(), 500);
+        host.responses.insert(key.into(), b"sync failed".to_vec());
         host
     }
 
@@ -1178,6 +1280,10 @@ max_price = "0.20"
             br#"{"apiKey":"api-key","secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","passphrase":"pass-value"}"#.to_vec(),
         );
         host.responses.insert(
+            "POST https://clob.polymarket.com/auth/builder-api-key".into(),
+            br#"{"apiKey":"builder-key","secret":"YnVpbGRlci1zZWNyZXQtYnVpbGRlci1zZWNyZXQ=","passphrase":"builder-pass"}"#.to_vec(),
+        );
+        host.responses.insert(
             "POST https://clob.polymarket.com/order".into(),
             br#"{"status":"matched","orderID":"order-post-1","size_matched":"11.11","requestBody":{"signature":"0xechoed-signature"},"payload":"accepted signature 0xechoed-signature"}"#.to_vec(),
         );
@@ -1190,6 +1296,10 @@ max_price = "0.20"
             br#"{"balance":"2000000","allowance":"2000000"}"#.to_vec(),
         );
         host.responses.insert(
+            "GET https://clob.polymarket.com/balance-allowance/update?asset_type=COLLATERAL&signature_type=3".into(),
+            br#"{"balance":"2000000","allowance":"2000000","updated":true}"#.to_vec(),
+        );
+        host.responses.insert(
             "GET https://clob.polymarket.com/balance-allowance?asset_type=CONDITIONAL&token_id=111&signature_type=3".into(),
             br#"{"balance":"2000000","allowance":"2000000"}"#.to_vec(),
         );
@@ -1198,6 +1308,18 @@ max_price = "0.20"
             br#"[{"id":"order-1","status":"LIVE"}]"#.to_vec(),
         );
         host
+    }
+
+    fn relayer_submit_seen(&self, needle: &str) -> bool {
+        self.http_bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, url, body)| {
+                method == "POST"
+                    && url == "https://relayer-v2.polymarket.com/submit"
+                    && String::from_utf8_lossy(body).contains(needle)
+            })
     }
 }
 
@@ -1214,7 +1336,7 @@ impl PetalHost for MockHost {
         } else if path.starts_with("chains/polygon/contracts/")
             && path.ends_with("/proxy/implementation")
         {
-            if self.deposit_wallet_deployed {
+            if self.deposit_wallet_deployed || self.relayer_submit_seen("WALLET-CREATE") {
                 Ok(b"0x2000000000000000000000000000000000000002\n".to_vec())
             } else {
                 Ok(b"not a proxy\n".to_vec())
@@ -1265,11 +1387,12 @@ impl PetalHost for MockHost {
             && path.contains("/methods/allowance@")
             && path.ends_with(".read")
         {
-            let allowance = if self.chain_pusd_allowance_ok {
-                U256::MAX
-            } else {
-                U256::ZERO
-            };
+            let allowance =
+                if self.chain_pusd_allowance_ok || self.relayer_submit_seen(r#""WALLET""#) {
+                    U256::MAX
+                } else {
+                    U256::ZERO
+                };
             Ok(format!(r#"{{"decoded":["{allowance}"],"raw":"0x"}}"#).into_bytes())
         } else if path.starts_with("chains/polygon/contracts/")
             && path.contains("/methods/isApprovedForAll@")
@@ -1325,6 +1448,56 @@ impl PetalHost for MockHost {
             req.url.clone(),
             req.body.clone(),
         ));
+        if req.method == "GET"
+            && req
+                .url
+                .starts_with("https://relayer-v2.polymarket.com/nonce?")
+        {
+            return Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: br#"{"nonce":7}"#.to_vec(),
+            });
+        }
+        if req.method == "POST" && req.url == "https://relayer-v2.polymarket.com/submit" {
+            if let Some((status, body)) = &self.relayer_submit_response {
+                return Ok(HttpResponse {
+                    status: *status,
+                    headers: Vec::new(),
+                    body: body.clone(),
+                });
+            }
+            let body = String::from_utf8_lossy(&req.body);
+            let id = if body.contains("WALLET-CREATE") {
+                "tx-deploy"
+            } else {
+                "tx-approve"
+            };
+            return Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: format!(r#"{{"transactionID":"{id}","state":"STATE_NEW"}}"#).into_bytes(),
+            });
+        }
+        if req.method == "GET"
+            && req
+                .url
+                .starts_with("https://relayer-v2.polymarket.com/transaction?")
+        {
+            let id = if req.url.contains("tx-deploy") {
+                "tx-deploy"
+            } else {
+                "tx-approve"
+            };
+            return Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: format!(
+                    r#"{{"transactionID":"{id}","state":"STATE_CONFIRMED","transactionHash":"0xabc"}}"#
+                )
+                .into_bytes(),
+            });
+        }
         let key = format!("{} {}", req.method, req.url);
         if req.method == "GET"
             && req.url == "https://clob.polymarket.com/data/orders"
