@@ -2401,12 +2401,14 @@ dependencies = [
 name = "bloom-local-petal-polymarket"
 version = "0.1.0"
 dependencies = [
+ "alloy 2.0.5",
  "async-trait",
  "bloom-petal-manifest",
  "bloom-petal-sdk",
  "bloom-petals",
  "bloom-polymarket",
  "bloom-vfs",
+ "hex",
  "serde",
  "serde_json",
  "tempfile",

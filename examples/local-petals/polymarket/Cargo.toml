@@ -13,8 +13,10 @@ name = "bloom_local_petal_polymarket"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+alloy = { version = "2", default-features = false, features = ["dyn-abi", "k256", "signer-local", "sol-types", "std"] }
 bloom-polymarket = { path = "../../../crates/bloom-polymarket", default-features = false }
 bloom-petal-sdk = { workspace = true }
+hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }

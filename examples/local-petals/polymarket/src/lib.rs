@@ -5,13 +5,18 @@
 //! per-petal private `store_*` imports. It intentionally does not call the
 //! native `polymarket/` VFS handler.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use alloy::primitives::Address;
 use bloom_petal_sdk::{
     DispatchEntry, DispatchEntryKind, DispatchOp, DispatchRequest, DispatchResponse, HostStatus,
-    HttpRequest, SdkError,
+    HttpRequest, SdkError, SignRequest,
 };
+use bloom_polymarket::eip712::clob_auth_signing_hash;
 use bloom_polymarket::order::{OrderType, parse_micro};
+use bloom_polymarket::signer::{POLY_ADDRESS, POLY_NONCE, POLY_SIGNATURE, POLY_TIMESTAMP};
 use bloom_polymarket::types::{Market, Side};
-use bloom_polymarket::{OrderBook, Position, Trade, validate_wallet_name};
+use bloom_polymarket::{Credentials, OrderBook, POLYGON, Position, Trade, validate_wallet_name};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -23,6 +28,7 @@ const MARKETS_LIST_LIMIT: u32 = 20;
 const GAMMA: &str = "https://gamma-api.polymarket.com";
 const DATA: &str = "https://data-api.polymarket.com";
 const CLOB: &str = "https://clob.polymarket.com";
+const CLOB_AUTH_NONCE: u32 = 0;
 
 const ROOT_DIRS: [&str; 7] = [
     "markets",
@@ -47,7 +53,7 @@ const DRAFT_FILES: [&str; 5] = [
 ];
 
 const BEGIN_HINT: &str =
-    "write anything here to record an onboarding attempt; signing is still pending\n";
+    "write anything here to mint or derive CLOB credentials with the daemon keystore\n";
 const TRADE_NEW_HINT: &str = r#"write JSON to create a reviewable draft, e.g.
 {"slug":"will-canada-win-the-2026-fifa-world-cup-755","outcome":"yes","amount":"1","max_price":"0.01"}
 "#;
@@ -276,14 +282,14 @@ fn read_onboard(wallet: &str, file: &str) -> DispatchResponse {
                 "stage": "not_started",
                 "running": false,
                 "tradeable": false,
-                "message": "write begin to start local-petal onboarding; signing flow pending"
+                "message": "write begin to mint or derive CLOB credentials"
             }),
         ),
         "plan.md" => DispatchResponse::Read(render_onboard_plan(wallet).into_bytes()),
         "approvals.json" => read_json_value(&serde_json::json!({
             "wallet": wallet,
             "approvals": [],
-            "signing": "pending"
+            "signing": "clob_auth_available"
         })),
         _ => error(-3, "not an onboard file"),
     }
@@ -318,12 +324,50 @@ fn write_onboard_begin(wallet: &str) -> DispatchResponse {
     if let Err(e) = validate_wallet_name(wallet) {
         return error(-3, e.to_string());
     }
+    let owner = match wallet_address(wallet) {
+        Ok(address) => address,
+        Err(resp) => return resp,
+    };
+    let timestamp = now_secs();
+    let hash = clob_auth_signing_hash(owner, timestamp, CLOB_AUTH_NONCE, POLYGON);
+    let signature = match bloom_petal_sdk::sign_hash(&SignRequest {
+        wallet: wallet.into(),
+        hash32: hash.into(),
+        purpose: "polymarket.clob_auth".into(),
+    }) {
+        Ok(sig) if sig.len() == 65 => format!("0x{}", hex::encode(sig)),
+        Ok(sig) => return error(-4, format!("sign_hash returned {} bytes", sig.len())),
+        Err(e) => return sdk_error(e),
+    };
+    let headers = [
+        (POLY_ADDRESS, format!("{owner:#x}")),
+        (POLY_NONCE, CLOB_AUTH_NONCE.to_string()),
+        (POLY_SIGNATURE, signature),
+        (POLY_TIMESTAMP, timestamp.to_string()),
+    ];
+    let creds = match clob_auth_request("POST", "/auth/api-key", &headers) {
+        Ok(creds) => creds,
+        Err(DispatchResponse::Error { code, .. }) if code == -4 => {
+            match clob_auth_request("GET", "/auth/derive-api-key", &headers) {
+                Ok(creds) => creds,
+                Err(resp) => return resp,
+            }
+        }
+        Err(resp) => return resp,
+    };
+    if let DispatchResponse::Error { .. } =
+        store_put_json(&format!("creds/{wallet}/clob.json"), &creds, true)
+    {
+        return error(-4, "failed to store CLOB credentials");
+    }
     let status = serde_json::json!({
         "wallet": wallet,
-        "stage": "started",
+        "owner": format!("{owner:#x}"),
+        "stage": "creds",
         "running": false,
         "tradeable": false,
-        "message": "local-petal onboarding state created; sign_hash integration pending"
+        "creds_present": true,
+        "message": "CLOB credentials stored in the private petal store; approval/funding stages pending"
     });
     store_put_json(&format!("onboard/{wallet}/status.json"), &status, false)
 }
@@ -544,6 +588,50 @@ fn get_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, DispatchResp
     serde_json::from_slice(&resp.body).map_err(|e| error(-4, format!("json: {e}")))
 }
 
+fn clob_auth_request(
+    method: &str,
+    path: &str,
+    headers: &[(&str, String)],
+) -> Result<Credentials, DispatchResponse> {
+    let resp = bloom_petal_sdk::http_fetch(
+        &HttpRequest {
+            method: method.into(),
+            url: format!("{CLOB}{path}"),
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).into(), value.clone()))
+                .collect(),
+            body: Vec::new(),
+        },
+        MAX_HTTP_BYTES,
+    )
+    .map_err(sdk_error)?;
+    if !(200..300).contains(&resp.status) {
+        return Err(error(
+            -4,
+            format!(
+                "CLOB auth error (status {}): {}",
+                resp.status,
+                String::from_utf8_lossy(&resp.body)
+            ),
+        ));
+    }
+    let mut creds: Credentials =
+        serde_json::from_slice(&resp.body).map_err(|e| error(-4, format!("json: {e}")))?;
+    creds.nonce = CLOB_AUTH_NONCE;
+    Ok(creds)
+}
+
+fn wallet_address(wallet: &str) -> Result<Address, DispatchResponse> {
+    let path = format!("wallets/{wallet}/address");
+    let bytes = bloom_petal_sdk::vfs_read(&path, 128).map_err(sdk_error)?;
+    let raw = core::str::from_utf8(&bytes)
+        .map_err(|e| error(-4, format!("wallet address is not utf-8: {e}")))?
+        .trim();
+    raw.parse::<Address>()
+        .map_err(|e| error(-4, format!("wallet address parse: {e}")))
+}
+
 fn http(
     method: &str,
     url: &str,
@@ -651,7 +739,7 @@ fn read_json_value<T: Serialize>(value: &T) -> DispatchResponse {
 
 fn render_onboard_plan(wallet: &str) -> String {
     format!(
-        "# Polymarket onboarding\n\nWallet: {wallet}\n\nStatus: local-petal state is staged. The sign_hash-backed onboarding run is pending.\n"
+        "# Polymarket onboarding\n\nWallet: {wallet}\n\nWrite `begin` to request a daemon-keystore CLOB auth signature, mint or derive CLOB API credentials, and store them in the private petal store. Funding and approval stages are still pending.\n"
     )
 }
 
@@ -797,6 +885,13 @@ fn url_with_query(base: &str, pairs: &[(&str, &str)]) -> String {
         url.query_pairs_mut().append_pair(key, value);
     }
     url.to_string()
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn sdk_error(e: SdkError) -> DispatchResponse {

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bloom_petal_manifest::extract_local_petal_manifest;
-use bloom_petals::abi::{HttpRequest, HttpResponse};
+use bloom_petals::abi::{HttpRequest, HttpResponse, SignRequest};
 use bloom_petals::{
     HostError, NameRegistry, PetalHost, PetalMode, PetalRouter, PetalRunner, PetalStore, PetalVm,
 };
@@ -50,7 +50,7 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
             .iter()
             .map(|cap| cap.as_str())
             .collect::<Vec<_>>(),
-        vec!["net.fetch", "store"]
+        vec!["vfs.read", "net.fetch", "sign", "store"]
     );
     assert_eq!(manifest.net.as_ref().unwrap().allow.len(), 3);
 
@@ -95,6 +95,20 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
 
     router
         .write(
+            &VfsPath::parse("polymarket/onboard/alice/begin").unwrap(),
+            b"go",
+        )
+        .await
+        .unwrap();
+    let status = router
+        .read(&VfsPath::parse("polymarket/onboard/alice/status.json").unwrap())
+        .await
+        .unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&status).unwrap();
+    assert_eq!(status["creds_present"], true);
+
+    router
+        .write(
             &VfsPath::parse("polymarket/trade/alice/new").unwrap(),
             br#"{"slug":"test-market","outcome":"yes","amount":"1","max_price":"0.10"}"#,
         )
@@ -116,8 +130,22 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         .get(&install.hash, "trade/alice/drafts/0001/order.json")
         .unwrap();
     assert!(String::from_utf8(draft).unwrap().contains("test-market"));
+    let creds = private.get(&install.hash, "creds/alice/clob.json").unwrap();
+    let creds_text = String::from_utf8(creds).unwrap();
+    assert!(creds_text.contains("secret-value"));
+    let account = router
+        .read(&VfsPath::parse("polymarket/account/alice/portfolio.json").unwrap())
+        .await
+        .unwrap();
+    let account_text = String::from_utf8(account).unwrap();
+    assert!(account_text.contains("credentials_present"));
+    assert!(!account_text.contains("secret-value"));
 
-    assert!(host.vfs_calls.lock().unwrap().is_empty());
+    assert_eq!(
+        host.vfs_calls.lock().unwrap().as_slice(),
+        ["read wallets/alice/address"]
+    );
+    assert_eq!(host.sign_calls.lock().unwrap().len(), 1);
     assert!(
         router
             .write(
@@ -134,6 +162,7 @@ struct MockHost {
     responses: BTreeMap<String, Vec<u8>>,
     http_calls: Mutex<Vec<(String, String)>>,
     vfs_calls: Mutex<Vec<String>>,
+    sign_calls: Mutex<Vec<SignRequest>>,
 }
 
 impl MockHost {
@@ -163,6 +192,10 @@ impl MockHost {
             "GET https://clob.polymarket.com/price?token_id=yes-token&side=BUY".into(),
             br#"{"price":"0.43"}"#.to_vec(),
         );
+        host.responses.insert(
+            "POST https://clob.polymarket.com/auth/api-key".into(),
+            br#"{"apiKey":"api-key","secret":"secret-value","passphrase":"pass-value"}"#.to_vec(),
+        );
         host
     }
 }
@@ -171,7 +204,11 @@ impl MockHost {
 impl PetalHost for MockHost {
     async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
         self.vfs_calls.lock().unwrap().push(format!("read {path}"));
-        Err(HostError::Denied("vfs not expected".into()))
+        if path == "wallets/alice/address" {
+            Ok(b"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266\n".to_vec())
+        } else {
+            Err(HostError::NotFound(path.into()))
+        }
     }
 
     async fn vfs_list(&self, path: &str) -> Result<Vec<String>, HostError> {
@@ -207,6 +244,11 @@ impl PetalHost for MockHost {
             headers: Vec::new(),
             body,
         })
+    }
+
+    async fn sign_hash(&self, req: SignRequest) -> Result<Vec<u8>, HostError> {
+        self.sign_calls.lock().unwrap().push(req);
+        Ok(vec![7u8; 65])
     }
 }
 
