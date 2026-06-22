@@ -265,17 +265,33 @@ impl ChainsHandler {
 
     /// Decompose `methods/<name>.<leaf>` into (`name`, `leaf`). Returns
     /// `None` if the trailing segment doesn't look like one of our
-    /// `.read`/`.tx`/`.sig` leaves.
+    /// `.read`/`.tx`/`.sig` leaves. Callers that need race-resistant staged
+    /// bodies may use the unlisted `methods/<name>@<nonce>.{read,tx}` form;
+    /// the nonce is part of the pending-body key but not the ABI method name.
     fn split_method_leaf(seg: &str) -> Option<(&str, &str)> {
         for leaf in METHOD_LEAVES {
             let pat = format!(".{leaf}");
-            if let Some(name) = seg.strip_suffix(&pat)
+            if let Some(raw_name) = seg.strip_suffix(&pat)
+                && let Some((name, scoped)) = Self::split_scoped_method_name(raw_name)
                 && !name.is_empty()
+                && (!scoped || *leaf != "sig")
             {
                 return Some((name, leaf));
             }
         }
         None
+    }
+
+    fn split_scoped_method_name(raw_name: &str) -> Option<(&str, bool)> {
+        match raw_name.split_once('@') {
+            Some((name, nonce)) if Self::is_method_body_nonce(nonce) => Some((name, true)),
+            Some(_) => None,
+            None => Some((raw_name, false)),
+        }
+    }
+
+    fn is_method_body_nonce(nonce: &str) -> bool {
+        (16..=64).contains(&nonce.len()) && nonce.bytes().all(|b| b.is_ascii_hexdigit())
     }
 
     async fn lookup_contracts(
@@ -2026,6 +2042,56 @@ mod tests {
         assert_eq!(calldata.len(), 2 + 4 * 2 + 32 * 2 + 32 * 2);
         // The "to" comes back checksummed.
         assert_eq!(v["to"], SAMPLE_ADDR);
+    }
+
+    #[tokio::test]
+    async fn scoped_method_body_paths_do_not_collide_with_legacy_path() {
+        let es = spawn_erc20_etherscan().await;
+        let rpc = spawn_rpc(31338, std::collections::HashMap::new());
+        let h =
+            ChainsHandler::new(registry_for_rpc(rpc, 31338)).with_etherscan(Some(etherscan_to(es)));
+        let legacy = VfsPath::parse(&format!(
+            "/test/contracts/{SAMPLE_ADDR}/methods/transfer.tx"
+        ))
+        .unwrap();
+        let scoped = VfsPath::parse(&format!(
+            "/test/contracts/{SAMPLE_ADDR}/methods/transfer@0123456789abcdef.tx"
+        ))
+        .unwrap();
+
+        h.write(
+            &legacy,
+            serde_json::json!({"args": [SAMPLE_ADDR, "1000"]})
+                .to_string()
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        h.write(
+            &scoped,
+            serde_json::json!({"args": [SAMPLE_ADDR, "2000"]})
+                .to_string()
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+        let scoped_v: serde_json::Value =
+            serde_json::from_slice(&h.read(&scoped).await.unwrap()).unwrap();
+        let legacy_v: serde_json::Value =
+            serde_json::from_slice(&h.read(&legacy).await.unwrap()).unwrap();
+        assert!(
+            scoped_v["calldata"]
+                .as_str()
+                .unwrap()
+                .ends_with("00000000000000000000000000000000000000000000000000000000000007d0")
+        );
+        assert!(
+            legacy_v["calldata"]
+                .as_str()
+                .unwrap()
+                .ends_with("00000000000000000000000000000000000000000000000000000000000003e8")
+        );
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@ name = "polymarket"
 [provides]
 kind = "vfs"
 mount = "polymarket"
-caps = ["vfs.read", "net.fetch", "sign", "store"]
+caps = ["vfs.read", "vfs.write", "net.fetch", "sign", "store"]
 
 [[net.allow]]
 host = "gamma-api.polymarket.com"

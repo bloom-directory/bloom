@@ -57,7 +57,7 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
             .iter()
             .map(|cap| cap.as_str())
             .collect::<Vec<_>>(),
-        vec!["vfs.read", "net.fetch", "sign", "store"]
+        vec!["vfs.read", "vfs.write", "net.fetch", "sign", "store"]
     );
     assert_eq!(manifest.net.as_ref().unwrap().allow.len(), 6);
 
@@ -122,11 +122,18 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     assert_eq!(parity_json["graduation_ready"], false);
     assert!(parity_json["implemented"].as_array().unwrap().len() >= 7);
     assert!(
-        parity_json["remaining_blockers"]
+        parity_json["implemented"]
             .as_array()
             .unwrap()
             .iter()
             .any(|item| item["id"] == "authoritative_sell_posting")
+    );
+    assert!(
+        parity_json["remaining_blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "graduation_signoff")
     );
     assert!(
         parity_json["native_unsupported_or_deferred"]
@@ -439,14 +446,16 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     let sell_review_text = String::from_utf8(sell_review).unwrap();
     assert!(sell_review_text.contains("final_review_staged"));
     assert!(sell_review_text.contains("sell_preflight"));
-    assert!(sell_review_text.contains("limited_pass"));
-    assert!(sell_review_text.contains(r#""preflight_complete_for_posting": false"#));
-    assert!(sell_review_text.contains("data_api_and_clob_conditional_balance"));
-    assert!(sell_review_text.contains(r#""posting_enabled": false"#));
+    assert!(sell_review_text.contains(r#""status": "pass""#));
+    assert!(sell_review_text.contains(r#""preflight_complete_for_posting": true"#));
+    assert!(sell_review_text.contains("clob_conditional_balance_and_chain_ctf"));
+    assert!(sell_review_text.contains(r#""chain_ctf_balance_checked": true"#));
+    assert!(sell_review_text.contains(r#""ctf_approval_checked": true"#));
+    assert!(sell_review_text.contains(r#""posting_enabled": true"#));
 
     let sell_denied = dispatch_trade_revalidate(
         &runner,
-        Arc::new(MockHost::fixture_with_deposit_position_size("0.5")),
+        Arc::new(MockHost::fixture_with_chain_ctf_balance_micro(500_000)),
         "0005",
     )
     .await;
@@ -741,6 +750,51 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     drop(reconcile_calls);
     assert_eq!(reconcile_host.sign_calls.lock().unwrap().len(), 1);
 
+    let sell_post_host = Arc::new(MockHost::fixture_with_order_id("order-sell-1"));
+    router
+        .write(
+            &VfsPath::parse("polymarket/trade/alice/new").unwrap(),
+            br#"{"slug":"test-market","outcome":"yes","side":"sell","amount":"1","min_price":"0.05"}"#,
+        )
+        .await
+        .unwrap();
+    let sell_post_revalidated =
+        dispatch_trade_revalidate(&runner, sell_post_host.clone(), "0010").await;
+    assert!(matches!(sell_post_revalidated, DispatchResponse::Write));
+    let sell_posted = dispatch_trade_post(&runner, sell_post_host.clone(), "0010").await;
+    assert!(matches!(sell_posted, DispatchResponse::Write));
+    let sell_receipt = private
+        .get(&install.hash, "trade/alice/receipts/0010/receipt.json")
+        .unwrap();
+    let sell_receipt_text = String::from_utf8(sell_receipt).unwrap();
+    assert!(sell_receipt_text.contains(r#""side": "SELL""#));
+    assert!(sell_receipt_text.contains(r#""clob_order_id": "order-sell-1""#));
+    assert!(
+        sell_post_host
+            .http_bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, url, body)| method == "POST"
+                && url == "https://clob.polymarket.com/order"
+                && String::from_utf8_lossy(body).contains(r#""side":"SELL""#))
+    );
+    let sell_vfs_writes = sell_post_host.vfs_writes.lock().unwrap();
+    assert!(
+        sell_vfs_writes
+            .iter()
+            .any(|(path, body)| path.contains("/methods/balanceOf@")
+                && path.ends_with(".read")
+                && String::from_utf8_lossy(body).contains(r#""111""#))
+    );
+    assert!(sell_vfs_writes.iter().any(|(path, body)| {
+        path.contains("/methods/isApprovedForAll@")
+            && path.ends_with(".read")
+            && String::from_utf8_lossy(body).contains("0xE111180000d2663C0091e4f400237545B87B996B")
+    }));
+    drop(sell_vfs_writes);
+    assert_eq!(sell_post_host.sign_calls.lock().unwrap().len(), 1);
+
     let draft = private
         .get(&install.hash, "trade/alice/drafts/0001/order.json")
         .unwrap();
@@ -924,9 +978,12 @@ struct MockHost {
     statuses: BTreeMap<String, u16>,
     policy_body: Vec<u8>,
     dynamic_open_order_id: Option<String>,
+    chain_ctf_balance_micro: u64,
+    chain_ctf_approved: bool,
     http_calls: Mutex<Vec<(String, String)>>,
     http_bodies: Mutex<Vec<(String, String, Vec<u8>)>>,
     vfs_calls: Mutex<Vec<String>>,
+    vfs_writes: Mutex<Vec<(String, Vec<u8>)>>,
     sign_calls: Mutex<Vec<SignRequest>>,
 }
 
@@ -971,16 +1028,9 @@ impl MockHost {
         host
     }
 
-    fn fixture_with_deposit_position_size(size: &str) -> Self {
+    fn fixture_with_chain_ctf_balance_micro(balance_micro: u64) -> Self {
         let mut host = Self::fixture();
-        let owner: Address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
-            .parse()
-            .unwrap();
-        let deposit = derive_deposit_wallet_address(&owner, POLYGON).to_checksum(None);
-        host.responses.insert(
-            format!("GET https://data-api.polymarket.com/positions?user={deposit}"),
-            format!(r#"[{{"title":"Sell Position","asset":"111","size":{size}}}]"#).into_bytes(),
-        );
+        host.chain_ctf_balance_micro = balance_micro;
         host
     }
 
@@ -1018,6 +1068,8 @@ impl MockHost {
 
     fn fixture_with_geoblock_response(geoblock_body: &[u8], geoblock_status: u16) -> Self {
         let mut host = Self::default();
+        host.chain_ctf_balance_micro = 2_000_000;
+        host.chain_ctf_approved = true;
         host.policy_body = br#"[polymarket]
 enabled = true
 max_order_usd = "5"
@@ -1111,6 +1163,20 @@ impl PetalHost for MockHost {
             Ok(self.policy_body.clone())
         } else if path == "wallets/0xalice/address" {
             Ok(b"0x0000000000000000000000000000000000000001\n".to_vec())
+        } else if path.starts_with("chains/polygon/contracts/")
+            && path.contains("/methods/balanceOf@")
+            && path.ends_with(".read")
+        {
+            Ok(format!(
+                r#"{{"decoded":["{}"],"raw":"0x"}}"#,
+                self.chain_ctf_balance_micro
+            )
+            .into_bytes())
+        } else if path.starts_with("chains/polygon/contracts/")
+            && path.contains("/methods/isApprovedForAll@")
+            && path.ends_with(".read")
+        {
+            Ok(format!(r#"{{"decoded":[{}],"raw":"0x"}}"#, self.chain_ctf_approved).into_bytes())
         } else {
             Err(HostError::NotFound(path.into()))
         }
@@ -1125,9 +1191,20 @@ impl PetalHost for MockHost {
         }
     }
 
-    async fn vfs_write(&self, path: &str, _bytes: &[u8]) -> Result<(), HostError> {
+    async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
         self.vfs_calls.lock().unwrap().push(format!("write {path}"));
-        Err(HostError::Denied("vfs not expected".into()))
+        if path.starts_with("chains/polygon/contracts/")
+            && ((path.contains("/methods/balanceOf@") && path.ends_with(".read"))
+                || (path.contains("/methods/isApprovedForAll@") && path.ends_with(".read")))
+        {
+            self.vfs_writes
+                .lock()
+                .unwrap()
+                .push((path.to_string(), bytes.to_vec()));
+            Ok(())
+        } else {
+            Err(HostError::Denied("vfs not expected".into()))
+        }
     }
 
     async fn http_fetch(

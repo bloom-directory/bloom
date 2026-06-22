@@ -13,7 +13,10 @@ use bloom_petal_sdk::{
     DispatchEntry, DispatchEntryKind, DispatchOp, DispatchRequest, DispatchResponse, HostStatus,
     HttpRequest, SdkError, SignRequest,
 };
-use bloom_polymarket::eip712::{clob_auth_signing_hash, derive_deposit_wallet_address};
+use bloom_polymarket::eip712::{
+    CTF, CTF_EXCHANGE_V2, NEG_RISK_EXCHANGE_V2, clob_auth_signing_hash,
+    derive_deposit_wallet_address,
+};
 use bloom_polymarket::order::{
     LimitQuote, OrderBody, OrderParams, OrderType, SIG_TYPE_POLY_1271, build_order, format_micro,
     parse_micro, poly1271_digest, wrap_poly1271_signature,
@@ -34,6 +37,7 @@ const MAX_HTTP_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STORE_BYTES: usize = 1024 * 1024;
 const MAX_LIST_BYTES: usize = 256 * 1024;
 const MAX_POLICY_BYTES: usize = 256 * 1024;
+const MAX_CHAIN_METHOD_BYTES: usize = 256 * 1024;
 const MARKETS_LIST_LIMIT: u32 = 20;
 const TRADE_LOCK_STALE_MS: u128 = 5 * 60 * 1000;
 
@@ -79,9 +83,9 @@ const TRADE_NEW_HINT: &str = r#"write JSON to create a reviewable draft, e.g.
 const FUND_NEW_HINT: &str = r#"write JSON to create a reviewable pUSD funding request, e.g.
 {"target_pusd":"10","max_spend":"100","from_token":"native","slippage_bps":50}
 "#;
-const TRADE_REVALIDATE_HINT: &str = r#"write {"revalidate":true} to revalidate this draft and stage the final review artifact. Buy drafts can then be posted by writing {"post":true} to post; resting GTC orders can be cancelled from their receipt. Sells remain disabled until authoritative chain CTF balance and approval checks are ported.
+const TRADE_REVALIDATE_HINT: &str = r#"write {"revalidate":true} to revalidate this draft and stage the final review artifact. Revalidated drafts can then be posted by writing {"post":true} to post; resting GTC orders can be cancelled from their receipt.
 "#;
-const TRADE_POST_HINT: &str = r#"write {"post":true} to sign and post a revalidated buy draft, then write a private receipt. This performs a value-moving CLOB POST /order.
+const TRADE_POST_HINT: &str = r#"write {"post":true} to sign and post a revalidated draft, then write a private receipt. This performs a value-moving CLOB POST /order.
 "#;
 const TRADE_CANCEL_HINT: &str = r#"write {"cancel":true} to cancel the posted CLOB order recorded by this receipt. Cancelling uses CLOB DELETE /order and updates the private receipt/draft status.
 "#;
@@ -255,6 +259,11 @@ fn read_meta(file: &str) -> DispatchResponse {
                     "evidence": "final-review-bound POLY_1271 buy posting with private receipt/audit records"
                 },
                 {
+                    "id": "authoritative_sell_posting",
+                    "surface": ["trade/*/drafts/*/revalidate", "trade/*/drafts/*/post"],
+                    "evidence": "sell posting is gated by CLOB conditional balance and chain CTF balanceOf/isApprovedForAll reads through the host VFS; Data API holdings are recorded as corroborating evidence only"
+                },
+                {
                     "id": "ambiguous_post_reconciliation",
                     "surface": ["trade/*/drafts/*/post"],
                     "evidence": "lost POST outcomes reconcile only against strongly matched L2 /data/orders responses"
@@ -271,11 +280,6 @@ fn read_meta(file: &str) -> DispatchResponse {
                 }
             ],
             "remaining_blockers": [
-                {
-                    "id": "authoritative_sell_posting",
-                    "status": "blocked",
-                    "reason": "local petal has only Data API and CLOB conditional-balance evidence for sells; posting remains disabled until authoritative chain CTF balance and isApprovedForAll checks are available through an approved host/VFS seam"
-                },
                 {
                     "id": "graduation_signoff",
                     "status": "pending",
@@ -1046,7 +1050,7 @@ fn trade_policy_check(
     };
     let posting_enabled = !deny && draft.side == Side::Buy && draft.order_type != OrderType::GTD;
     let reason = if draft.side == Side::Sell {
-        "sell posting is disabled until authoritative chain CTF balance and approval checks are ported"
+        "sell posting requires passing authoritative chain CTF balance and approval checks"
     } else if draft.order_type == OrderType::GTD {
         "GTD posting is disabled until expiry parity is ported"
     } else {
@@ -1070,6 +1074,15 @@ fn trade_policy_check(
         "signing_enabled": posting_enabled,
         "posting_enabled": posting_enabled
     }))
+}
+
+fn enable_trade_posting(policy_check: &mut serde_json::Value, reason: &str) {
+    if let Some(obj) = policy_check.as_object_mut() {
+        obj.insert("status".into(), serde_json::Value::String("ready".into()));
+        obj.insert("reason".into(), serde_json::Value::String(reason.into()));
+        obj.insert("signing_enabled".into(), serde_json::Value::Bool(true));
+        obj.insert("posting_enabled".into(), serde_json::Value::Bool(true));
+    }
 }
 
 fn wallet_policy(wallet: &str) -> Result<LocalWalletPolicy, DispatchResponse> {
@@ -1167,29 +1180,22 @@ fn verify_sell_preflight(
     owner: Address,
     token_id: &str,
     size_micro: u64,
+    neg_risk: bool,
 ) -> Result<serde_json::Value, DispatchResponse> {
     let deposit = derive_deposit_wallet_address(&owner, POLYGON);
     let deposit_user = deposit.to_checksum(None);
-    let positions = get_json::<Vec<Position>>(&url_with_query(
+    let data_api_holding_micro = get_json::<Vec<Position>>(&url_with_query(
         &format!("{DATA}/positions"),
         &[("user", &deposit_user)],
-    ))?;
-    let held_micro = positions
-        .iter()
-        .find(|position| position.asset == token_id)
-        .and_then(position_size_micro)
-        .unwrap_or(0);
-    if held_micro < size_micro {
-        return Err(error(
-            -3,
-            format!(
-                "cannot sell {} shares: derived deposit wallet {} holds only {}",
-                format_micro(size_micro),
-                deposit.to_checksum(None),
-                format_micro(held_micro)
-            ),
-        ));
-    }
+    ))
+    .ok()
+    .map(|positions| {
+        positions
+            .iter()
+            .find(|position| position.asset == token_id)
+            .and_then(position_size_micro)
+            .unwrap_or(0)
+    });
 
     let creds = load_creds(wallet)?;
     let clob_balance_allowance = clob_l2_get_json(
@@ -1216,27 +1222,128 @@ fn verify_sell_preflight(
             ),
         ));
     }
+    let operator = if neg_risk {
+        NEG_RISK_EXCHANGE_V2
+    } else {
+        CTF_EXCHANGE_V2
+    };
+    let chain_ctf_balance = read_chain_ctf_balance(deposit, token_id)?;
+    if chain_ctf_balance < size_micro {
+        return Err(error(
+            -3,
+            format!(
+                "cannot sell {} shares: on-chain CTF balance for derived deposit wallet {} is only {}",
+                format_micro(size_micro),
+                deposit.to_checksum(None),
+                format_micro(chain_ctf_balance)
+            ),
+        ));
+    }
+    let ctf_approved = read_chain_ctf_approval(deposit, operator)?;
+    if !ctf_approved {
+        return Err(error(
+            -3,
+            format!(
+                "cannot sell before passkey: deposit wallet {} has not approved {} for CTF tokens. Re-run onboarding to restore approvals.",
+                deposit.to_checksum(None),
+                operator.to_checksum(None)
+            ),
+        ));
+    }
 
     Ok(serde_json::json!({
-        "status": "limited_pass",
-        "source": "data_api_and_clob_conditional_balance",
-        "preflight_complete_for_posting": false,
-        "chain_ctf_balance_checked": false,
-        "ctf_approval_checked": false,
-        "reason": "authoritative on-chain CTF balance and approval checks are not ported to the local petal; signing/posting remain disabled",
+        "status": "pass",
+        "source": "clob_conditional_balance_and_chain_ctf",
+        "preflight_complete_for_posting": true,
+        "chain_ctf_balance_checked": true,
+        "ctf_approval_checked": true,
+        "reason": "sell preflight passed CLOB conditional balance, on-chain CTF balance, and CTF operator approval checks; Data API holdings are included as corroborating evidence when available",
         "deposit_wallet": deposit.to_checksum(None),
-        "deposit_wallet_source": "local_estimate_unverified",
+        "deposit_wallet_source": "local_derivation",
         "token_id": token_id,
         "requested_size_micro": size_micro,
         "requested_size": format_micro(size_micro),
-        "data_api_holding_micro": held_micro,
-        "data_api_holding": format_micro(held_micro),
+        "data_api_holding_checked": data_api_holding_micro.is_some(),
+        "data_api_holding_micro": data_api_holding_micro,
+        "data_api_holding": data_api_holding_micro.map(format_micro),
         "clob_balance_micro": clob_balance_micro,
         "clob_balance": format_micro(clob_balance_micro),
         "clob_balance_allowance": clob_balance_allowance,
-        "signing_enabled": false,
-        "posting_enabled": false
+        "chain_ctf_contract": CTF.to_checksum(None),
+        "chain_ctf_balance_micro": chain_ctf_balance,
+        "chain_ctf_balance": format_micro(chain_ctf_balance),
+        "ctf_operator": operator.to_checksum(None),
+        "ctf_operator_kind": if neg_risk { "neg_risk_exchange_v2" } else { "ctf_exchange_v2" },
+        "ctf_approved_for_all": ctf_approved,
+        "signing_enabled": true,
+        "posting_enabled": true
     }))
+}
+
+fn read_chain_ctf_balance(deposit: Address, token_id: &str) -> Result<u64, DispatchResponse> {
+    let response = read_chain_method(
+        CTF,
+        "balanceOf",
+        &serde_json::json!({
+            "args": [deposit.to_checksum(None), token_id]
+        }),
+    )?;
+    let decoded = response
+        .get("decoded")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| error(-4, "chain CTF balanceOf response missing decoded array"))?;
+    let raw = decoded
+        .first()
+        .ok_or_else(|| error(-4, "chain CTF balanceOf response missing balance"))?;
+    parse_clob_raw_micro(raw).ok_or_else(|| error(-4, "chain CTF balance is not a u64"))
+}
+
+fn read_chain_ctf_approval(deposit: Address, operator: Address) -> Result<bool, DispatchResponse> {
+    let response = read_chain_method(
+        CTF,
+        "isApprovedForAll",
+        &serde_json::json!({
+            "args": [deposit.to_checksum(None), operator.to_checksum(None)]
+        }),
+    )?;
+    let decoded = response
+        .get("decoded")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            error(
+                -4,
+                "chain CTF isApprovedForAll response missing decoded array",
+            )
+        })?;
+    decoded
+        .first()
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| error(-4, "chain CTF approval response is not a boolean"))
+}
+
+fn read_chain_method(
+    contract: Address,
+    method: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, DispatchResponse> {
+    let nonce = chain_method_nonce();
+    let path = format!(
+        "chains/polygon/contracts/{}/methods/{method}@{nonce}.read",
+        contract.to_checksum(None)
+    );
+    let bytes =
+        serde_json::to_vec(body).map_err(|e| error(-4, format!("chain method body: {e}")))?;
+    bloom_petal_sdk::vfs_write(&path, &bytes)
+        .map_err(|e| sdk_error_with_context("stage chain method read", e))?;
+    let response = bloom_petal_sdk::vfs_read(&path, MAX_CHAIN_METHOD_BYTES)
+        .map_err(|e| sdk_error_with_context("read chain method result", e))?;
+    serde_json::from_slice(&response).map_err(|e| error(-4, format!("chain method JSON: {e}")))
+}
+
+fn chain_method_nonce() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
 }
 
 fn position_size_micro(position: &Position) -> Option<u64> {
@@ -1662,7 +1769,7 @@ fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchRespon
     draft.best_bid_micro = snapshot.best_bid_micro;
     draft.book_snapshot_secs = now_secs();
     draft.status = "revalidated".into();
-    let policy_check = match trade_policy_check(wallet, &draft) {
+    let mut policy_check = match trade_policy_check(wallet, &draft) {
         Ok(check) => check,
         Err(resp) => return resp,
     };
@@ -1705,12 +1812,12 @@ fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchRespon
     ) {
         return error(-4, "failed to store quote");
     }
-    if let DispatchResponse::Error { .. } =
-        store_put_json(&format!("{base}/policy_check.json"), &policy_check, false)
-    {
-        return error(-4, "failed to store policy check");
-    }
     if policy_deny {
+        if let DispatchResponse::Error { .. } =
+            store_put_json(&format!("{base}/policy_check.json"), &policy_check, false)
+        {
+            return error(-4, "failed to store policy check");
+        }
         match bloom_petal_sdk::store_del(&format!("{base}/review_intent.json")) {
             Ok(()) | Err(SdkError::Host(HostStatus::NotFound)) => {}
             Err(_) => return error(-4, "failed to clear stale review intent"),
@@ -1724,8 +1831,20 @@ fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchRespon
         return error(-3, "Polymarket policy denied; see policy_check.json");
     }
     let sell_preflight = if draft.side == Side::Sell {
-        match verify_sell_preflight(wallet, owner, &draft.token_id, draft.size_micro) {
-            Ok(preflight) => Some(preflight),
+        match verify_sell_preflight(
+            wallet,
+            owner,
+            &draft.token_id,
+            draft.size_micro,
+            draft.neg_risk,
+        ) {
+            Ok(preflight) => {
+                enable_trade_posting(
+                    &mut policy_check,
+                    "sell can be posted after final review because chain CTF balance and approval checks passed",
+                );
+                Some(preflight)
+            }
             Err(resp) => {
                 match bloom_petal_sdk::store_del(&format!("{base}/review_intent.json")) {
                     Ok(()) | Err(SdkError::Host(HostStatus::NotFound)) => {}
@@ -1743,6 +1862,15 @@ fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchRespon
     } else {
         None
     };
+    if let DispatchResponse::Error { .. } =
+        store_put_json(&format!("{base}/policy_check.json"), &policy_check, false)
+    {
+        return error(-4, "failed to store policy check");
+    }
+    let posting_enabled = policy_check
+        .get("posting_enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     if let DispatchResponse::Error { .. } = store_put_json(
         &format!("{base}/review_intent.json"),
         &serde_json::json!({
@@ -1764,8 +1892,8 @@ fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchRespon
             "policy_status": policy_status,
             "sell_preflight": sell_preflight,
             "status": "final_review_staged",
-            "signing_enabled": draft.side == Side::Buy,
-            "posting_enabled": draft.side == Side::Buy
+            "signing_enabled": posting_enabled,
+            "posting_enabled": posting_enabled
         }),
         false,
     ) {
@@ -1779,7 +1907,7 @@ fn refresh_trade_post_inputs(
     base: &str,
     draft: &mut StoreTradeDraft,
     owner: Address,
-) -> Result<serde_json::Value, DispatchResponse> {
+) -> Result<(serde_json::Value, Option<serde_json::Value>), DispatchResponse> {
     let snapshot = trade_snapshot(&draft.slug, &draft.outcome)?;
     if snapshot.token_id != draft.token_id {
         return Err(error(
@@ -1834,16 +1962,11 @@ fn refresh_trade_post_inputs(
     draft.best_ask_micro = snapshot.best_ask_micro;
     draft.best_bid_micro = snapshot.best_bid_micro;
     draft.book_snapshot_secs = now_secs();
-    let policy_check = trade_policy_check(wallet, draft)?;
+    let mut policy_check = trade_policy_check(wallet, draft)?;
     let policy_deny = policy_check
         .get("policy_deny")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
-    if let DispatchResponse::Error { .. } =
-        store_put_json(&format!("{base}/policy_check.json"), &policy_check, false)
-    {
-        return Err(error(-4, "failed to store policy check"));
-    }
     if let DispatchResponse::Error { .. } = store_put_json(
         &format!("{base}/quote.json"),
         &serde_json::json!({
@@ -1875,6 +1998,11 @@ fn refresh_trade_post_inputs(
         return Err(error(-4, "failed to store quote"));
     }
     if policy_deny {
+        if let DispatchResponse::Error { .. } =
+            store_put_json(&format!("{base}/policy_check.json"), &policy_check, false)
+        {
+            return Err(error(-4, "failed to store policy check"));
+        }
         match bloom_petal_sdk::store_del(&format!("{base}/review_intent.json")) {
             Ok(()) | Err(SdkError::Host(HostStatus::NotFound)) => {}
             Err(_) => return Err(error(-4, "failed to clear stale review intent")),
@@ -1887,10 +2015,28 @@ fn refresh_trade_post_inputs(
         }
         return Err(error(-3, "Polymarket policy denied; see policy_check.json"));
     }
-    if draft.side == Side::Sell {
-        let _ = verify_sell_preflight(wallet, owner, &draft.token_id, draft.size_micro)?;
+    let sell_preflight = if draft.side == Side::Sell {
+        let preflight = verify_sell_preflight(
+            wallet,
+            owner,
+            &draft.token_id,
+            draft.size_micro,
+            draft.neg_risk,
+        )?;
+        enable_trade_posting(
+            &mut policy_check,
+            "sell can be posted after final review because chain CTF balance and approval checks passed",
+        );
+        Some(preflight)
+    } else {
+        None
+    };
+    if let DispatchResponse::Error { .. } =
+        store_put_json(&format!("{base}/policy_check.json"), &policy_check, false)
+    {
+        return Err(error(-4, "failed to store policy check"));
     }
-    Ok(policy_check)
+    Ok((policy_check, sell_preflight))
 }
 
 fn review_intent_matches_draft(
@@ -1899,6 +2045,7 @@ fn review_intent_matches_draft(
     owner: Address,
     funder: Address,
     policy_check: &serde_json::Value,
+    sell_preflight: Option<&serde_json::Value>,
 ) -> Result<(), String> {
     let side = match draft.side {
         Side::Buy => "BUY",
@@ -1933,6 +2080,16 @@ fn review_intent_matches_draft(
     }
     if review.get("neg_risk").and_then(serde_json::Value::as_bool) != Some(draft.neg_risk) {
         return Err("final review field 'neg_risk' no longer matches live post inputs".into());
+    }
+    if draft.side == Side::Sell {
+        let Some(fresh) = sell_preflight else {
+            return Err("final review field 'sell_preflight' is missing live post evidence".into());
+        };
+        if review.get("sell_preflight") != Some(fresh) {
+            return Err(
+                "final review field 'sell_preflight' no longer matches live post inputs".into(),
+            );
+        }
     }
     Ok(())
 }
@@ -1972,12 +2129,6 @@ fn write_trade_post(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
     if draft.order_type == OrderType::GTD {
         return error(-3, "posting GTD orders is pending expiry parity");
     }
-    if draft.side == Side::Sell {
-        return error(
-            -3,
-            "local sell posting requires authoritative chain CTF balance and approval checks",
-        );
-    }
     if let Err(resp) = check_geoblock() {
         return resp;
     }
@@ -1986,10 +2137,11 @@ fn write_trade_post(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
         Err(resp) => return resp,
     };
     let funder = derive_deposit_wallet_address(&owner, POLYGON);
-    let policy_check = match refresh_trade_post_inputs(wallet, &base, &mut draft, owner) {
-        Ok(policy_check) => policy_check,
-        Err(resp) => return resp,
-    };
+    let (policy_check, sell_preflight) =
+        match refresh_trade_post_inputs(wallet, &base, &mut draft, owner) {
+            Ok(inputs) => inputs,
+            Err(resp) => return resp,
+        };
     let review_intent_bytes =
         match bloom_petal_sdk::store_get(&format!("{base}/review_intent.json"), MAX_STORE_BYTES) {
             Ok(bytes) => bytes,
@@ -2013,9 +2165,14 @@ fn write_trade_post(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
     {
         return error(-3, "final review intent does not enable posting");
     }
-    if let Err(message) =
-        review_intent_matches_draft(&review_intent, &draft, owner, funder, &policy_check)
-    {
+    if let Err(message) = review_intent_matches_draft(
+        &review_intent,
+        &draft,
+        owner,
+        funder,
+        &policy_check,
+        sell_preflight.as_ref(),
+    ) {
         return error(
             -3,
             format!("{message}; write revalidate again before posting"),
@@ -3371,6 +3528,18 @@ fn sdk_error(e: SdkError) -> DispatchResponse {
         }
         other => error(-4, other.message()),
     }
+}
+
+fn sdk_error_with_context(context: &str, e: SdkError) -> DispatchResponse {
+    let code = match &e {
+        SdkError::Host(HostStatus::NotFound) => -1,
+        SdkError::Host(HostStatus::Denied) => -2,
+        SdkError::Host(HostStatus::Invalid) => -3,
+        SdkError::Host(HostStatus::Backend) => -4,
+        SdkError::Host(HostStatus::BufferTooSmall { .. }) => -5,
+        _ => -4,
+    };
+    error(code, format!("{context}: {}", e.message()))
 }
 
 fn polymarket_error(e: bloom_polymarket::PolymarketError) -> DispatchResponse {
