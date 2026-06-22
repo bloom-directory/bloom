@@ -31,7 +31,7 @@ use bloom_petals::{
 };
 use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient, GeoblockClient};
 use bloom_prices::PricesClient;
-use bloom_proto::{AddressBook, AuditLog, Config, HomeDir, HomeWritePermit};
+use bloom_proto::{AddressBook, AuditLog, AuditRecord, Config, HomeDir, HomeWritePermit};
 use bloom_revert::{
     AbiSource, BuiltinDecoder, DecoderChain, EtherscanAbiDecoder, EtherscanAbiSource,
     OpenchainDecoder, boxed,
@@ -78,10 +78,11 @@ struct DaemonPetalHost {
     vfs: Arc<LateVfsHost>,
     keystore: Keystore,
     http: reqwest::Client,
+    audit: Arc<AuditLog>,
 }
 
 impl DaemonPetalHost {
-    fn new(vfs: Arc<LateVfsHost>, keystore: Keystore) -> Self {
+    fn new(vfs: Arc<LateVfsHost>, keystore: Keystore, audit: Arc<AuditLog>) -> Self {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(20))
@@ -91,6 +92,65 @@ impl DaemonPetalHost {
             vfs,
             keystore,
             http,
+            audit,
+        }
+    }
+
+    fn audit_http_fetch(
+        &self,
+        method: &str,
+        url: &str,
+        outcome: &str,
+        status: Option<u16>,
+        body_len: Option<usize>,
+        error: Option<&str>,
+    ) {
+        let mut data = serde_json::json!({
+            "method": method,
+            "target": audit_http_target(url),
+            "outcome": outcome,
+        });
+        if let Some(status) = status {
+            data["status"] = serde_json::json!(status);
+        }
+        if let Some(body_len) = body_len {
+            data["body_len"] = serde_json::json!(body_len);
+        }
+        if let Some(error) = error {
+            data["error"] = serde_json::json!(error);
+        }
+        if let Err(e) = self.audit.append(AuditRecord {
+            ts_ms: 0,
+            kind: "petal.http_fetch".into(),
+            wallet: None,
+            chain: None,
+            data,
+            prev: String::new(),
+            digest: String::new(),
+        }) {
+            warn!(error = %e, "petal.http_fetch.audit_append_failed");
+        }
+    }
+
+    fn audit_sign_hash(&self, req: &SignRequest, outcome: &str, error: Option<&str>) {
+        let mut data = serde_json::json!({
+            "purpose": req.purpose.as_str(),
+            "hash32_sha256": bloom_tools::sha256_hex(&req.hash32),
+            "outcome": outcome,
+        });
+        if let Some(error) = error {
+            data["error"] = serde_json::json!(error);
+        }
+        if let Err(e) = self.audit.append(AuditRecord {
+            ts_ms: 0,
+            kind: "petal.sign_hash".into(),
+            wallet: Some(req.wallet.clone()),
+            chain: None,
+            data,
+            prev: String::new(),
+            digest: String::new(),
+        }) {
+            warn!(wallet = %req.wallet, error = %e, "petal.sign_hash.audit_append_failed");
         }
     }
 }
@@ -115,18 +175,45 @@ impl PetalHost for DaemonPetalHost {
         policy: NetPolicy,
         max_response_bytes: usize,
     ) -> Result<HttpResponse, HostError> {
-        policy.check(&req.method, &req.url)?;
-        let method = reqwest::Method::from_bytes(req.method.as_bytes())
-            .map_err(|e| HostError::Invalid(format!("http method: {e}")))?;
+        if let Err(e) = policy.check(&req.method, &req.url) {
+            self.audit_http_fetch(
+                &req.method,
+                &req.url,
+                "denied",
+                None,
+                None,
+                Some(&e.to_string()),
+            );
+            return Err(e);
+        }
+        let method = reqwest::Method::from_bytes(req.method.as_bytes()).map_err(|e| {
+            let err = HostError::Invalid(format!("http method: {e}"));
+            self.audit_http_fetch(
+                &req.method,
+                &req.url,
+                "error",
+                None,
+                None,
+                Some(&err.to_string()),
+            );
+            err
+        })?;
         let mut builder = self.http.request(method, &req.url);
         for (name, value) in req.headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
-        let resp = builder
-            .body(req.body)
-            .send()
-            .await
-            .map_err(|e| HostError::Backend(format!("http_fetch send: {e}")))?;
+        let resp = builder.body(req.body).send().await.map_err(|e| {
+            let err = HostError::Backend(format!("http_fetch send: {e}"));
+            self.audit_http_fetch(
+                &req.method,
+                &req.url,
+                "error",
+                None,
+                None,
+                Some(&err.to_string()),
+            );
+            err
+        })?;
         let status = resp.status().as_u16();
         let headers = resp
             .headers()
@@ -143,17 +230,54 @@ impl PetalHost for DaemonPetalHost {
                 .map(|len| len > max_response_bytes)
                 .unwrap_or(true)
         }) {
-            return Err(HostError::Backend("http response too large".into()));
+            let err = HostError::Backend("http response too large".into());
+            self.audit_http_fetch(
+                &req.method,
+                &req.url,
+                "error",
+                Some(status),
+                None,
+                Some(&err.to_string()),
+            );
+            return Err(err);
         }
         let mut body = Vec::new();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| HostError::Backend(format!("http_fetch body: {e}")))?;
+            let chunk = chunk.map_err(|e| {
+                let err = HostError::Backend(format!("http_fetch body: {e}"));
+                self.audit_http_fetch(
+                    &req.method,
+                    &req.url,
+                    "error",
+                    Some(status),
+                    Some(body.len()),
+                    Some(&err.to_string()),
+                );
+                err
+            })?;
             if body.len().saturating_add(chunk.len()) > max_response_bytes {
-                return Err(HostError::Backend("http response too large".into()));
+                let err = HostError::Backend("http response too large".into());
+                self.audit_http_fetch(
+                    &req.method,
+                    &req.url,
+                    "error",
+                    Some(status),
+                    Some(body.len().saturating_add(chunk.len())),
+                    Some(&err.to_string()),
+                );
+                return Err(err);
             }
             body.extend_from_slice(&chunk);
         }
+        self.audit_http_fetch(
+            &req.method,
+            &req.url,
+            "ok",
+            Some(status),
+            Some(body.len()),
+            None,
+        );
         Ok(HttpResponse {
             status,
             headers,
@@ -165,18 +289,34 @@ impl PetalHost for DaemonPetalHost {
         let signer = self
             .keystore
             .signer(&req.wallet)
-            .map_err(host_error_from_keystore)?;
+            .map_err(host_error_from_keystore)
+            .inspect_err(|e| self.audit_sign_hash(&req, "denied", Some(&e.to_string())))?;
         let hash = B256::from(req.hash32);
-        let sig = signer
-            .sign_hash_sync(&hash)
-            .map_err(|e| HostError::Backend(format!("sign_hash: {e}")))?;
+        let sig = signer.sign_hash_sync(&hash).map_err(|e| {
+            let err = HostError::Backend(format!("sign_hash: {e}"));
+            self.audit_sign_hash(&req, "error", Some(&err.to_string()));
+            err
+        })?;
         tracing::info!(
             target: "bloom_daemon::petal_host",
             wallet = %req.wallet,
             purpose = %req.purpose,
             "petal.sign_hash"
         );
+        self.audit_sign_hash(&req, "ok", None);
         Ok(sig.as_bytes().to_vec())
+    }
+}
+
+fn audit_http_target(raw: &str) -> serde_json::Value {
+    match url::Url::parse(raw) {
+        Ok(url) => serde_json::json!({
+            "scheme": url.scheme(),
+            "host": url.host_str(),
+            "port": url.port(),
+            "path": url.path(),
+        }),
+        Err(_) => serde_json::json!({ "invalid": true }),
     }
 }
 
@@ -573,6 +713,7 @@ impl Daemon {
         let petal_app_host = Arc::new(DaemonPetalHost::new(
             petal_vfs_host.clone(),
             keystore.clone(),
+            audit_arc.clone(),
         ));
         debug!(root = %petals_root.display(), "daemon.petals_initialised");
 
@@ -1322,8 +1463,13 @@ mod tests {
     async fn daemon_petal_host_signs_hash_with_unlocked_keystore_wallet() {
         let dir = tempfile::tempdir().unwrap();
         let keystore = Keystore::new(dir.path().join("keystore")).unwrap();
+        let audit = Arc::new(AuditLog::open(dir.path().join("audit.jsonl")).unwrap());
         keystore.create_local("alice", "passphrase").unwrap();
-        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), keystore.clone());
+        let host = DaemonPetalHost::new(
+            Arc::new(LateVfsHost::new()),
+            keystore.clone(),
+            audit.clone(),
+        );
 
         let locked = host
             .sign_hash(SignRequest {
@@ -1345,6 +1491,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sig.len(), 65);
+
+        let records = audit.tail(10).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].kind, "petal.sign_hash");
+        assert_eq!(records[0].wallet.as_deref(), Some("alice"));
+        assert_eq!(records[0].data["outcome"], "denied");
+        assert_eq!(records[1].kind, "petal.sign_hash");
+        assert_eq!(records[1].wallet.as_deref(), Some("alice"));
+        assert_eq!(records[1].data["outcome"], "ok");
     }
 
     /// A pre-existing watch spec on disk should be loaded into the

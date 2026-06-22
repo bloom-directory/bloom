@@ -124,12 +124,64 @@ impl Handler for PetalRouter {
         if rest.is_empty() {
             return Err(HandlerError::PermissionDenied);
         }
-        if !self
-            .endpoint_hint(path)
-            .map(|hint| hint.write)
+        let hint = self.endpoint_hint(path);
+        if !hint.as_ref().map(|hint| hint.write).unwrap_or(false) {
+            return Err(HandlerError::PermissionDenied);
+        }
+        if hint
+            .as_ref()
+            .map(|hint| hint.async_dispatch)
             .unwrap_or(false)
         {
-            return Err(HandlerError::PermissionDenied);
+            let runner = self.runner.clone();
+            let host = self.host.clone();
+            let mount = mount.to_string();
+            let dispatch_path = rest;
+            let body = data.to_vec();
+            tokio::spawn(async move {
+                let result = runner
+                    .dispatch_mount(
+                        &mount,
+                        DispatchRequest {
+                            op: DispatchOp::Write,
+                            path: dispatch_path,
+                            body,
+                            ctx: Vec::new(),
+                        },
+                        host,
+                        None,
+                        RunOptions::default(),
+                    )
+                    .await;
+                match result {
+                    Ok(out) => match out.response {
+                        DispatchResponse::Write => {}
+                        DispatchResponse::Error { code, message } => {
+                            tracing::warn!(
+                                mount = %mount,
+                                code,
+                                error = %message,
+                                "async petal write returned error"
+                            );
+                        }
+                        other => {
+                            tracing::warn!(
+                                mount = %mount,
+                                response = ?other,
+                                "async petal write returned unexpected response"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            mount = %mount,
+                            error = %e,
+                            "async petal write failed"
+                        );
+                    }
+                }
+            });
+            return Ok(());
         }
         match self
             .dispatch(mount, DispatchOp::Write, rest, data.to_vec())
@@ -199,6 +251,12 @@ impl Handler for PetalRouter {
 
 fn entry_to_vfs(entry: DispatchEntry) -> Result<Entry, HandlerError> {
     validate_entry_name(&entry.name)?;
+    if entry.kind == DispatchEntryKind::Symlink {
+        let Some(target) = entry.link_target.as_deref() else {
+            return Err(HandlerError::invalid("symlink entry missing link target"));
+        };
+        validate_link_target(target)?;
+    }
     let (kind, default_mode) = match entry.kind {
         DispatchEntryKind::Dir => (EntryKind::Dir, 0o755),
         DispatchEntryKind::File => (EntryKind::File, 0o444),
@@ -228,6 +286,28 @@ fn validate_entry_name(name: &str) -> Result<(), HandlerError> {
     if name.contains('/') || name.contains('\\') || name.bytes().any(|b| b == 0) {
         return Err(HandlerError::invalid(format!(
             "dispatch entry name must be a single path segment: {name:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_link_target(target: &str) -> Result<(), HandlerError> {
+    if target.is_empty() || target.starts_with('/') {
+        return Err(HandlerError::invalid(format!(
+            "dispatch symlink target must be mount-relative: {target:?}"
+        )));
+    }
+    if target.contains('\\') || target.bytes().any(|b| b == 0) {
+        return Err(HandlerError::invalid(format!(
+            "dispatch symlink target contains invalid bytes: {target:?}"
+        )));
+    }
+    if target
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(HandlerError::invalid(format!(
+            "dispatch symlink target must not contain dot or empty segments: {target:?}"
         )));
     }
     Ok(())
@@ -527,6 +607,36 @@ write = true
     }
 
     #[tokio::test]
+    async fn async_writable_endpoint_returns_after_enqueue() {
+        let (_d, runner) = runner();
+        runner
+            .install(
+                &embedded_app_with_manifest_tail(
+                    DispatchResponse::Error {
+                        code: -4,
+                        message: "background failure".into(),
+                    },
+                    "demo",
+                    r#"
+[[endpoint]]
+path = "writable"
+write = true
+async = true
+"#,
+                ),
+                None,
+                &BTreeSet::new(),
+                PetalMode::Local,
+            )
+            .unwrap();
+        let router = PetalRouter::new(runner, Arc::new(DenyHost));
+        router
+            .write(&VfsPath::parse("demo/writable").unwrap(), b"x")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn side_effecting_reads_are_not_cacheable() {
         let (_d, runner) = runner();
         runner
@@ -579,6 +689,66 @@ read_side_effecting = true
             .await
             .unwrap_err();
         assert!(matches!(err, HandlerError::Invalid(_)));
+    }
+
+    #[tokio::test]
+    async fn symlink_targets_must_stay_mount_relative() {
+        for target in ["/wallets/alice", "../wallets", "ok/../wallets", "bad\\path"] {
+            let (_d, runner) = runner();
+            runner
+                .install(
+                    &embedded_app(
+                        DispatchResponse::Lookup(DispatchEntry {
+                            name: "link".into(),
+                            kind: DispatchEntryKind::Symlink,
+                            size: 0,
+                            mode: 0,
+                            ttl_hint_ms: None,
+                            link_target: Some(target.into()),
+                        }),
+                        "demo",
+                    ),
+                    None,
+                    &BTreeSet::new(),
+                    PetalMode::Local,
+                )
+                .unwrap();
+            let router = PetalRouter::new(runner, Arc::new(DenyHost));
+            let err = router
+                .lookup(&VfsPath::parse("demo/link").unwrap())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, HandlerError::Invalid(_)),
+                "expected invalid symlink target {target:?}, got {err:?}"
+            );
+        }
+
+        let (_d, runner) = runner();
+        runner
+            .install(
+                &embedded_app(
+                    DispatchResponse::Lookup(DispatchEntry {
+                        name: "link".into(),
+                        kind: DispatchEntryKind::Symlink,
+                        size: 0,
+                        mode: 0,
+                        ttl_hint_ms: None,
+                        link_target: Some("child/file".into()),
+                    }),
+                    "demo",
+                ),
+                None,
+                &BTreeSet::new(),
+                PetalMode::Local,
+            )
+            .unwrap();
+        let router = PetalRouter::new(runner, Arc::new(DenyHost));
+        let entry = router
+            .lookup(&VfsPath::parse("demo/link").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(entry.link_target.as_deref(), Some("child/file"));
     }
 
     #[test]

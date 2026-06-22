@@ -100,11 +100,7 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         )
         .await
         .unwrap();
-    let status = router
-        .read(&VfsPath::parse("polymarket/onboard/alice/status.json").unwrap())
-        .await
-        .unwrap();
-    let status: serde_json::Value = serde_json::from_slice(&status).unwrap();
+    let status = wait_for_creds(&router).await;
     assert_eq!(status["creds_present"], true);
     assert_eq!(status["deposit_wallet"]["fundable"], false);
     assert_eq!(
@@ -160,15 +156,12 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     assert!(orders_text.contains("order-1"));
     assert!(!orders_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
 
-    assert_eq!(
-        host.vfs_calls.lock().unwrap().as_slice(),
-        [
-            "read wallets/alice/address",
-            "read wallets/alice/address",
-            "read wallets/alice/address",
-            "read wallets/alice/address",
-            "read wallets/alice/address"
-        ]
+    let vfs_calls = host.vfs_calls.lock().unwrap().clone();
+    assert!(vfs_calls.len() >= 5);
+    assert!(
+        vfs_calls
+            .iter()
+            .all(|call| call == "read wallets/alice/address")
     );
     assert_eq!(host.sign_calls.lock().unwrap().len(), 1);
     assert!(
@@ -307,4 +300,18 @@ fn wasm32_wasip1_installed(root: &Path) -> bool {
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .any(|line| line.trim() == "wasm32-wasip1")
+}
+
+async fn wait_for_creds(router: &PetalRouter) -> serde_json::Value {
+    let path = VfsPath::parse("polymarket/onboard/alice/status.json").unwrap();
+    for _ in 0..50 {
+        let status = router.read(&path).await.unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&status).unwrap();
+        if status["creds_present"] == true {
+            return status;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let status = router.read(&path).await.unwrap();
+    serde_json::from_slice(&status).unwrap()
 }

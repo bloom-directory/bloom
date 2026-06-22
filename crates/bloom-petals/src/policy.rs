@@ -77,6 +77,13 @@ impl NetPolicy {
         if url.scheme() != "https" {
             return Err(HostError::Denied("net.fetch requires https".into()));
         }
+        if let Some(port) = url.port() {
+            if port != 443 {
+                return Err(HostError::Denied(format!(
+                    "net.fetch disallows non-default https port {port}"
+                )));
+            }
+        }
         let host = url
             .host_str()
             .ok_or_else(|| HostError::Invalid("url missing host".into()))?
@@ -195,6 +202,16 @@ paths = ["/markets*", "/auth/*", "/wallets/*/orders"]
             policy
                 .check("GET", "https://api.example.com/markets")
                 .is_ok()
+        );
+        assert!(
+            policy
+                .check("GET", "https://api.example.com:443/markets")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check("GET", "https://api.example.com:8443/markets")
+                .is_err()
         );
         assert!(
             policy
