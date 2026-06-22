@@ -31,6 +31,11 @@ host = "clob.polymarket.com"
 methods = ["POST"]
 paths = ["/auth/api-key", "/order"]
 
+[[net.allow]]
+host = "clob.polymarket.com"
+methods = ["DELETE"]
+paths = ["/order"]
+
 [[endpoint]]
 path = "markets/*"
 cache_ttl_ms = 5000
@@ -96,6 +101,10 @@ write = true
 
 [[endpoint]]
 path = "trade/*/drafts/*/post"
+write = true
+
+[[endpoint]]
+path = "trade/*/receipts/*/cancel"
 write = true
 
 [[endpoint]]

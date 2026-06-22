@@ -66,6 +66,8 @@ const DRAFT_FILES: [&str; 6] = [
     "post_attempt.json",
 ];
 const DRAFT_WRITABLE_FILES: [&str; 2] = ["revalidate", "post"];
+const RECEIPT_FILES: [&str; 1] = ["receipt.json"];
+const RECEIPT_WRITABLE_FILES: [&str; 1] = ["cancel"];
 
 const BEGIN_HINT: &str =
     "write anything here to mint or derive CLOB credentials with the daemon keystore\n";
@@ -75,9 +77,11 @@ const TRADE_NEW_HINT: &str = r#"write JSON to create a reviewable draft, e.g.
 const FUND_NEW_HINT: &str = r#"write JSON to create a reviewable pUSD funding request, e.g.
 {"target_pusd":"10","max_spend":"100","from_token":"native","slippage_bps":50}
 "#;
-const TRADE_REVALIDATE_HINT: &str = r#"write {"revalidate":true} to revalidate this draft and stage the final review artifact. Non-resting buy drafts can then be posted by writing {"post":true} to post; sells remain disabled until authoritative chain CTF balance and approval checks are ported.
+const TRADE_REVALIDATE_HINT: &str = r#"write {"revalidate":true} to revalidate this draft and stage the final review artifact. Buy drafts can then be posted by writing {"post":true} to post; resting GTC orders can be cancelled from their receipt. Sells remain disabled until authoritative chain CTF balance and approval checks are ported.
 "#;
-const TRADE_POST_HINT: &str = r#"write {"post":true} to sign and post a revalidated non-resting buy draft, then write a private receipt. This performs a value-moving CLOB POST /order.
+const TRADE_POST_HINT: &str = r#"write {"post":true} to sign and post a revalidated buy draft, then write a private receipt. This performs a value-moving CLOB POST /order.
+"#;
+const TRADE_CANCEL_HINT: &str = r#"write {"cancel":true} to cancel the posted CLOB order recorded by this receipt. Cancelling uses CLOB DELETE /order and updates the private receipt/draft status.
 "#;
 
 #[cfg_attr(target_family = "wasm", unsafe(link_section = "bloom_petal_manifest"))]
@@ -149,7 +153,11 @@ fn list(relative: &str) -> DispatchResponse {
             out.extend(strings(&DRAFT_WRITABLE_FILES));
             out
         }
-        (Some("trade"), 4) if segs[2] == "receipts" => vec!["receipt.json".into()],
+        (Some("trade"), 4) if segs[2] == "receipts" => {
+            let mut out = strings(&RECEIPT_FILES);
+            out.extend(strings(&RECEIPT_WRITABLE_FILES));
+            out
+        }
         _ => Vec::new(),
     };
     DispatchResponse::List(
@@ -199,6 +207,9 @@ fn write(relative: &str, body: &[u8]) -> DispatchResponse {
         }
         (Some("trade"), 5) if segs[2] == "drafts" && segs[4] == "post" => {
             write_trade_post(segs[1], segs[3], body)
+        }
+        (Some("trade"), 5) if segs[2] == "receipts" && segs[4] == "cancel" => {
+            write_trade_cancel(segs[1], segs[3], body)
         }
         (Some("fund"), 3) if segs[2] == "new" => write_fund_new(segs[1], body),
         _ => error(-2, "path is not writable"),
@@ -949,13 +960,13 @@ fn trade_policy_check(
     } else {
         "passed"
     };
-    let posting_enabled = !deny && draft.side == Side::Buy && !draft.order_type.can_rest();
+    let posting_enabled = !deny && draft.side == Side::Buy && draft.order_type != OrderType::GTD;
     let reason = if draft.side == Side::Sell {
         "sell posting is disabled until authoritative chain CTF balance and approval checks are ported"
-    } else if draft.order_type.can_rest() {
-        "resting order posting is disabled until cancel/expiry parity is ported"
+    } else if draft.order_type == OrderType::GTD {
+        "GTD posting is disabled until expiry parity is ported"
     } else {
-        "non-resting buy can be posted after final review by writing to the post endpoint"
+        "buy can be posted after final review by writing to the post endpoint; resting GTC orders can be cancelled from their receipt"
     };
     Ok(serde_json::json!({
         "status": "blocked",
@@ -1025,7 +1036,7 @@ fn daily_posted_microusd(wallet: &str) -> (bool, Option<u64>) {
         if receipt.posted_ms < cutoff || receipt.side != Side::Buy {
             continue;
         }
-        if matches!(receipt.clob_status.as_str(), "rejected" | "unmatched") {
+        if clob_status_excluded_from_daily_cap(receipt.clob_status.as_str(), receipt.order_type) {
             continue;
         }
         total = total.saturating_add(receipt.amount_microusd);
@@ -1439,6 +1450,7 @@ fn read_trade(wallet: &str, kind: &str, id: &str, file: &str) -> DispatchRespons
         ("receipts", "receipt.json") => {
             read_store(&format!("trade/{wallet}/receipts/{id}/receipt.json"))
         }
+        ("receipts", "cancel") => DispatchResponse::Read(TRADE_CANCEL_HINT.into()),
         _ => error(-3, "not a trade file"),
     }
 }
@@ -1488,11 +1500,8 @@ fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchRespon
             format!("draft {id} is '{}' and cannot be revalidated", draft.status),
         );
     }
-    if draft.order_type.can_rest() {
-        return error(
-            -3,
-            "posting resting GTC/GTD orders is pending cancel/expiry parity",
-        );
+    if draft.order_type == OrderType::GTD {
+        return error(-3, "posting GTD orders is pending expiry parity");
     }
     if let Err(resp) = check_geoblock() {
         return resp;
@@ -1876,11 +1885,8 @@ fn write_trade_post(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
             ),
         );
     }
-    if draft.order_type.can_rest() {
-        return error(
-            -3,
-            "posting resting GTC/GTD orders is pending cancel/expiry parity",
-        );
+    if draft.order_type == OrderType::GTD {
+        return error(-3, "posting GTD orders is pending expiry parity");
     }
     if draft.side == Side::Sell {
         return error(
@@ -2063,11 +2069,12 @@ fn write_trade_post(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
             if let DispatchResponse::Error { .. } = store_trade_receipt(wallet, id, &receipt) {
                 return error(-4, "failed to store receipt");
             }
-            draft.status = if matches!(status.as_str(), "rejected" | "unmatched") {
-                "rejected".into()
-            } else {
-                "posted".into()
-            };
+            draft.status =
+                if clob_status_excluded_from_daily_cap(status.as_str(), Some(draft.order_type)) {
+                    "rejected".into()
+                } else {
+                    "posted".into()
+                };
             draft.clob_order_id = clob_order_id;
             draft.clob_status = Some(status);
             draft.last_error = None;
@@ -2119,6 +2126,105 @@ fn write_trade_post(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
             )
         }
     }
+}
+
+fn write_trade_cancel(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
+    if let Err(e) = validate_wallet_name(wallet) {
+        return error(-3, e.to_string());
+    }
+    if !is_safe_segment(id) {
+        return error(-3, "invalid receipt id");
+    }
+    let req: TradeCancelRequest = match serde_json::from_slice(body) {
+        Ok(req) => req,
+        Err(e) => return error(-3, format!("cancel JSON: {e}")),
+    };
+    if !req.cancel {
+        return error(-3, "cancel must be true");
+    }
+    let _lock = match acquire_trade_lock(wallet, id) {
+        Ok(lock) => lock,
+        Err(resp) => return resp,
+    };
+    let receipt_key = format!("trade/{wallet}/receipts/{id}/receipt.json");
+    let Some(bytes) = store_get(&receipt_key) else {
+        return error(-1, "receipt not found");
+    };
+    let mut receipt: StoreTradeReceipt = match serde_json::from_slice(&bytes) {
+        Ok(receipt) => receipt,
+        Err(e) => return error(-4, format!("corrupt receipt: {e}")),
+    };
+    if receipt.wallet != wallet || receipt.draft_id != id {
+        return error(-4, "receipt identity mismatch");
+    }
+    if receipt.clob_status == "cancelled" {
+        if let Err(resp) = mark_trade_draft_cancelled(wallet, id) {
+            return resp;
+        }
+        return DispatchResponse::Write;
+    }
+    let Some(order_id) = receipt.clob_order_id.clone() else {
+        return error(-3, "receipt has no CLOB order id to cancel");
+    };
+    let owner = match wallet_address(wallet) {
+        Ok(address) => address,
+        Err(resp) => return resp,
+    };
+    let creds = match load_creds(wallet) {
+        Ok(creds) => creds,
+        Err(resp) => return resp,
+    };
+    let body = serde_json::json!({ "orderID": order_id }).to_string();
+    let raw = match clob_l2_delete_json(owner, &creds, "/order", &body) {
+        Ok(raw) => raw,
+        Err(resp) => return resp,
+    };
+    if !clob_cancel_confirmed(&raw, &order_id) {
+        return error(-4, "CLOB cancel response did not confirm cancellation");
+    }
+    receipt.clob_status = "cancelled".into();
+    receipt.raw_response = serde_json::json!({
+        "status": "cancelled",
+        "order_id": order_id,
+        "response_redacted": true
+    });
+    if let DispatchResponse::Error { .. } = append_trade_audit(
+        wallet,
+        "order_cancelled",
+        serde_json::json!({
+            "draft_id": id,
+            "clob_order_id": order_id,
+        }),
+    ) {
+        return error(-4, "failed to write cancel audit");
+    }
+    if let DispatchResponse::Error { .. } = store_put_json(&receipt_key, &receipt, false) {
+        return error(-4, "failed to update receipt");
+    }
+    if let Err(resp) = mark_trade_draft_cancelled(wallet, id) {
+        return resp;
+    }
+    DispatchResponse::Write
+}
+
+fn mark_trade_draft_cancelled(wallet: &str, id: &str) -> Result<(), DispatchResponse> {
+    let draft_key = format!("trade/{wallet}/drafts/{id}/order.json");
+    if let Some(bytes) = store_get(&draft_key) {
+        let mut draft: StoreTradeDraft = match serde_json::from_slice(&bytes) {
+            Ok(draft) => draft,
+            Err(e) => return Err(error(-4, format!("corrupt draft: {e}"))),
+        };
+        if draft.wallet != wallet || draft.id != id {
+            return Err(error(-4, "draft identity mismatch"));
+        }
+        draft.status = "cancelled".into();
+        draft.clob_status = Some("cancelled".into());
+        draft.last_error = None;
+        if let DispatchResponse::Error { .. } = store_put_json(&draft_key, &draft, false) {
+            return Err(error(-4, "failed to update draft"));
+        }
+    }
+    Ok(())
 }
 
 fn write_fund_new(wallet: &str, body: &[u8]) -> DispatchResponse {
@@ -2340,6 +2446,49 @@ fn clob_l2_post_json(
     serde_json::from_slice(&resp.body).map_err(|e| error(-4, format!("json: {e}")))
 }
 
+fn clob_l2_delete_json(
+    owner: Address,
+    creds: &Credentials,
+    path: &str,
+    body: &str,
+) -> Result<serde_json::Value, DispatchResponse> {
+    let timestamp = now_secs();
+    let headers = l2_headers(
+        owner,
+        &creds.key,
+        &creds.passphrase,
+        &creds.secret,
+        timestamp,
+        "DELETE",
+        path,
+        body,
+    )
+    .map_err(|e| error(-4, e.to_string()))?;
+    let resp = bloom_petal_sdk::http_fetch(
+        &HttpRequest {
+            method: "DELETE".into(),
+            url: format!("{CLOB}{path}"),
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| (name.into(), value))
+                .collect(),
+            body: body.as_bytes().to_vec(),
+        },
+        MAX_HTTP_BYTES,
+    )
+    .map_err(sdk_error)?;
+    if !(200..300).contains(&resp.status) {
+        return Err(error(
+            -4,
+            format!("CLOB cancel error (status {})", resp.status),
+        ));
+    }
+    if resp.body.iter().all(|b| b.is_ascii_whitespace()) {
+        return Ok(serde_json::json!({ "status": "empty" }));
+    }
+    serde_json::from_slice(&resp.body).map_err(|e| error(-4, format!("json: {e}")))
+}
+
 fn wallet_address(wallet: &str) -> Result<Address, DispatchResponse> {
     let path = format!("wallets/{wallet}/address");
     let bytes = bloom_petal_sdk::vfs_read(&path, 128).map_err(sdk_error)?;
@@ -2528,6 +2677,11 @@ fn clob_response_status(raw: &serde_json::Value) -> String {
         .to_ascii_lowercase()
 }
 
+fn clob_status_excluded_from_daily_cap(status: &str, order_type: Option<OrderType>) -> bool {
+    status == "rejected"
+        || (status == "unmatched" && order_type.is_some_and(|order_type| !order_type.can_rest()))
+}
+
 fn clob_response_order_id(raw: &serde_json::Value) -> Option<String> {
     raw.get("orderID")
         .or_else(|| raw.get("orderId"))
@@ -2548,6 +2702,31 @@ fn clob_response_filled_size_micro(raw: &serde_json::Value) -> Option<u64> {
                 .and_then(|f| parse_api_float_micro(f, "filled_size").ok()),
             _ => None,
         })
+}
+
+fn clob_cancel_confirmed(raw: &serde_json::Value, order_id: &str) -> bool {
+    let status_cancelled = raw
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .map(|status| {
+            let status = status.to_ascii_lowercase();
+            status == "cancelled" || status == "canceled"
+        })
+        .unwrap_or(false);
+    let status_order_matches = raw
+        .get("orderID")
+        .or_else(|| raw.get("orderId"))
+        .or_else(|| raw.get("order_id"))
+        .or_else(|| raw.get("id"))
+        .and_then(serde_json::Value::as_str)
+        == Some(order_id);
+    let listed_cancelled = raw
+        .get("canceled")
+        .or_else(|| raw.get("cancelled"))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.iter().any(|item| item.as_str() == Some(order_id)))
+        .unwrap_or(false);
+    listed_cancelled || (status_cancelled && status_order_matches)
 }
 
 fn clob_response_public_summary(
@@ -2740,8 +2919,13 @@ fn path_kind(relative: &str) -> Option<DispatchEntryKind> {
         (Some("trade"), 5) if segs[2] == "drafts" && DRAFT_WRITABLE_FILES.contains(&segs[4]) => {
             Some(DispatchEntryKind::WritableFile)
         }
-        (Some("trade"), 5) if segs[2] == "receipts" && segs[4] == "receipt.json" => {
+        (Some("trade"), 5) if segs[2] == "receipts" && RECEIPT_FILES.contains(&segs[4]) => {
             Some(DispatchEntryKind::File)
+        }
+        (Some("trade"), 5)
+            if segs[2] == "receipts" && RECEIPT_WRITABLE_FILES.contains(&segs[4]) =>
+        {
+            Some(DispatchEntryKind::WritableFile)
         }
         _ => None,
     }
@@ -2998,6 +3182,11 @@ struct TradePostRequest {
     post: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct TradeCancelRequest {
+    cancel: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoreTradeDraft {
     id: String,
@@ -3041,12 +3230,14 @@ struct StoreTradeDraft {
 #[derive(Debug, Clone, Deserialize)]
 struct StoreTradeReceiptPolicy {
     side: Side,
+    #[serde(default)]
+    order_type: Option<OrderType>,
     amount_microusd: u64,
     clob_status: String,
     posted_ms: u128,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoreTradeReceipt {
     draft_id: String,
     wallet: String,
@@ -3210,7 +3401,28 @@ mod tests {
             path_kind("trade/alice/receipts/0001/receipt.json"),
             Some(DispatchEntryKind::File)
         );
+        assert_eq!(
+            path_kind("trade/alice/receipts/0001/cancel"),
+            Some(DispatchEntryKind::WritableFile)
+        );
         assert_eq!(path_kind("trade/alice/new/extra"), None);
+    }
+
+    #[test]
+    fn unmatched_resting_receipts_still_count_as_exposure() {
+        assert!(clob_status_excluded_from_daily_cap(
+            "unmatched",
+            Some(OrderType::FAK)
+        ));
+        assert!(!clob_status_excluded_from_daily_cap(
+            "unmatched",
+            Some(OrderType::GTC)
+        ));
+        assert!(!clob_status_excluded_from_daily_cap("unmatched", None));
+        assert!(clob_status_excluded_from_daily_cap(
+            "rejected",
+            Some(OrderType::GTC)
+        ));
     }
 
     #[test]

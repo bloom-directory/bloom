@@ -59,7 +59,7 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
             .collect::<Vec<_>>(),
         vec!["vfs.read", "net.fetch", "sign", "store"]
     );
-    assert_eq!(manifest.net.as_ref().unwrap().allow.len(), 5);
+    assert_eq!(manifest.net.as_ref().unwrap().allow.len(), 6);
 
     let tmp = tempfile::tempdir().unwrap();
     let store = PetalStore::open(tmp.path().join("store")).unwrap();
@@ -529,6 +529,134 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     assert!(audit_text.contains("receipt_written"));
     assert!(audit_text.contains("0007"));
     assert_eq!(host.sign_calls.lock().unwrap().len(), 2);
+    let cancel_hint = router
+        .read(&VfsPath::parse("polymarket/trade/alice/receipts/0007/cancel").unwrap())
+        .await
+        .unwrap();
+    assert!(String::from_utf8(cancel_hint).unwrap().contains("cancel"));
+    let cancelled = dispatch_trade_cancel(&runner, host.clone(), "0007").await;
+    assert!(matches!(cancelled, DispatchResponse::Write));
+    let cancelled_receipt = private
+        .get(&install.hash, "trade/alice/receipts/0007/receipt.json")
+        .unwrap();
+    let cancelled_receipt_text = String::from_utf8(cancelled_receipt).unwrap();
+    assert!(cancelled_receipt_text.contains(r#""clob_status": "cancelled""#));
+    assert!(cancelled_receipt_text.contains("response_redacted"));
+    assert!(!cancelled_receipt_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+    let cancelled_order = private
+        .get(&install.hash, "trade/alice/drafts/0007/order.json")
+        .unwrap();
+    assert!(
+        String::from_utf8(cancelled_order)
+            .unwrap()
+            .contains(r#""status": "cancelled""#)
+    );
+    let cancel_audit = private
+        .get(&install.hash, "trade/alice/audit.jsonl")
+        .unwrap();
+    assert!(
+        String::from_utf8(cancel_audit)
+            .unwrap()
+            .contains("order_cancelled")
+    );
+    assert_eq!(host.sign_calls.lock().unwrap().len(), 2);
+    assert!(
+        host.http_bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, url, body)| method == "DELETE"
+                && url == "https://clob.polymarket.com/order"
+                && body == br#"{"orderID":"order-post-1"}"#)
+    );
+    let delete_count_after_cancel = host
+        .http_bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(method, url, _)| method == "DELETE" && url == "https://clob.polymarket.com/order")
+        .count();
+    let mut stale_cancelled_order: serde_json::Value = serde_json::from_slice(
+        &private
+            .get(&install.hash, "trade/alice/drafts/0007/order.json")
+            .unwrap(),
+    )
+    .unwrap();
+    stale_cancelled_order["status"] = "posted".into();
+    stale_cancelled_order["clob_status"] = "matched".into();
+    private
+        .put(
+            &install.hash,
+            "trade/alice/drafts/0007/order.json",
+            &serde_json::to_vec_pretty(&stale_cancelled_order).unwrap(),
+            false,
+        )
+        .unwrap();
+    let idempotent_cancel = dispatch_trade_cancel(&runner, host.clone(), "0007").await;
+    assert!(matches!(idempotent_cancel, DispatchResponse::Write));
+    let delete_count_after_retry = host
+        .http_bodies
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(method, url, _)| method == "DELETE" && url == "https://clob.polymarket.com/order")
+        .count();
+    assert_eq!(delete_count_after_retry, delete_count_after_cancel);
+    let repaired_order = private
+        .get(&install.hash, "trade/alice/drafts/0007/order.json")
+        .unwrap();
+    assert!(
+        String::from_utf8(repaired_order)
+            .unwrap()
+            .contains(r#""status": "cancelled""#)
+    );
+
+    let gtc_host = Arc::new(MockHost::fixture_with_order_id("order-post-gtc"));
+    router
+        .write(
+            &VfsPath::parse("polymarket/trade/alice/new").unwrap(),
+            br#"{"slug":"test-market","outcome":"yes","amount":"1","max_price":"0.10","limit_price":"0.10","order_type":"GTC"}"#,
+        )
+        .await
+        .unwrap();
+    let gtc_revalidated = dispatch_trade_revalidate(&runner, gtc_host.clone(), "0008").await;
+    assert!(matches!(gtc_revalidated, DispatchResponse::Write));
+    let gtc_posted = dispatch_trade_post(&runner, gtc_host.clone(), "0008").await;
+    assert!(matches!(gtc_posted, DispatchResponse::Write));
+    let gtc_receipt = private
+        .get(&install.hash, "trade/alice/receipts/0008/receipt.json")
+        .unwrap();
+    let gtc_receipt_text = String::from_utf8(gtc_receipt).unwrap();
+    assert!(gtc_receipt_text.contains(r#""order_type": "GTC""#));
+    assert!(gtc_receipt_text.contains(r#""clob_order_id": "order-post-gtc""#));
+    assert!(gtc_receipt_text.contains(r#""clob_status": "unmatched""#));
+    let gtc_posted_order = private
+        .get(&install.hash, "trade/alice/drafts/0008/order.json")
+        .unwrap();
+    let gtc_posted_order_text = String::from_utf8(gtc_posted_order).unwrap();
+    assert!(gtc_posted_order_text.contains(r#""status": "posted""#));
+    assert!(gtc_posted_order_text.contains(r#""clob_status": "unmatched""#));
+    let gtc_cancelled = dispatch_trade_cancel(&runner, gtc_host.clone(), "0008").await;
+    assert!(matches!(gtc_cancelled, DispatchResponse::Write));
+    let gtc_cancelled_receipt = private
+        .get(&install.hash, "trade/alice/receipts/0008/receipt.json")
+        .unwrap();
+    assert!(
+        String::from_utf8(gtc_cancelled_receipt)
+            .unwrap()
+            .contains(r#""clob_status": "cancelled""#)
+    );
+    assert!(
+        gtc_host
+            .http_bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(method, url, body)| method == "DELETE"
+                && url == "https://clob.polymarket.com/order"
+                && body == br#"{"orderID":"order-post-gtc"}"#)
+    );
+    assert_eq!(gtc_host.sign_calls.lock().unwrap().len(), 1);
 
     let draft = private
         .get(&install.hash, "trade/alice/drafts/0001/order.json")
@@ -584,6 +712,11 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         http_calls
             .iter()
             .any(|(method, url)| method == "POST" && url == "https://clob.polymarket.com/order")
+    );
+    assert!(
+        http_calls
+            .iter()
+            .any(|(method, url)| method == "DELETE" && url == "https://clob.polymarket.com/order")
     );
     drop(http_calls);
     assert!(
@@ -662,6 +795,29 @@ async fn dispatch_trade_post(
         .response
 }
 
+async fn dispatch_trade_cancel(
+    runner: &PetalRunner,
+    host: Arc<MockHost>,
+    id: &str,
+) -> DispatchResponse {
+    runner
+        .dispatch_mount(
+            "polymarket",
+            DispatchRequest {
+                op: DispatchOp::Write,
+                path: format!("trade/alice/receipts/{id}/cancel"),
+                body: br#"{"cancel":true}"#.to_vec(),
+                ctx: Vec::new(),
+            },
+            host,
+            None,
+            RunOptions::default(),
+        )
+        .await
+        .unwrap()
+        .response
+}
+
 fn assert_no_onboard_private_state(private: &PrivateStore, hash: &str) {
     assert!(
         matches!(
@@ -685,6 +841,7 @@ struct MockHost {
     statuses: BTreeMap<String, u16>,
     policy_body: Vec<u8>,
     http_calls: Mutex<Vec<(String, String)>>,
+    http_bodies: Mutex<Vec<(String, String, Vec<u8>)>>,
     vfs_calls: Mutex<Vec<String>>,
     sign_calls: Mutex<Vec<SignRequest>>,
 }
@@ -699,6 +856,22 @@ impl MockHost {
     fn fixture_with_policy(policy_body: &[u8]) -> Self {
         let mut host = Self::fixture();
         host.policy_body = policy_body.to_vec();
+        host
+    }
+
+    fn fixture_with_order_id(order_id: &str) -> Self {
+        let mut host = Self::fixture();
+        host.responses.insert(
+            "POST https://clob.polymarket.com/order".into(),
+            format!(
+                r#"{{"status":"unmatched","orderID":"{order_id}","requestBody":{{"signature":"0xechoed-signature"}}}}"#
+            )
+            .into_bytes(),
+        );
+        host.responses.insert(
+            "DELETE https://clob.polymarket.com/order".into(),
+            format!(r#"{{"canceled":["{order_id}"],"not_canceled":{{}}}}"#).into_bytes(),
+        );
         host
     }
 
@@ -813,6 +986,10 @@ max_price = "0.20"
             br#"{"status":"matched","orderID":"order-post-1","size_matched":"11.11","requestBody":{"signature":"0xechoed-signature"},"payload":"accepted signature 0xechoed-signature"}"#.to_vec(),
         );
         host.responses.insert(
+            "DELETE https://clob.polymarket.com/order".into(),
+            br#"{"canceled":["order-post-1"],"not_canceled":{}}"#.to_vec(),
+        );
+        host.responses.insert(
             "GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=3".into(),
             br#"{"balance":"123","allowance":"456"}"#.to_vec(),
         );
@@ -868,6 +1045,11 @@ impl PetalHost for MockHost {
             .lock()
             .unwrap()
             .push((req.method.clone(), req.url.clone()));
+        self.http_bodies.lock().unwrap().push((
+            req.method.clone(),
+            req.url.clone(),
+            req.body.clone(),
+        ));
         let key = format!("{} {}", req.method, req.url);
         let body = self
             .responses
