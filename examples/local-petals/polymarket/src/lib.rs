@@ -942,7 +942,7 @@ fn trade_policy_check(
         "policy_checks": checks,
         "receipt_store_readable": receipt_store_readable,
         "daily_posted_microusd": daily_posted_microusd,
-        "receipt_audit_parity": false,
+        "receipt_audit_parity": true,
         "active": draft.active,
         "closed": draft.closed,
         "binary_outcomes": draft.binary_outcomes,
@@ -969,6 +969,23 @@ fn daily_posted_microusd(wallet: &str) -> (bool, Option<u64>) {
         Err(_) => return (false, None),
     };
     let cutoff = now_millis().saturating_sub(24 * 60 * 60 * 1000);
+    let mut present = BTreeSet::new();
+    for key in &keys {
+        let rest = key.strip_prefix(&prefix).unwrap_or(key);
+        let Some(id) = rest.strip_suffix("/receipt.json") else {
+            continue;
+        };
+        present.insert(id.to_string());
+    }
+    let audited = match audited_receipt_ids_since(wallet, cutoff) {
+        Ok(ids) => ids,
+        Err(_) => return (false, None),
+    };
+    for id in audited {
+        if !present.contains(&id) {
+            return (false, None);
+        }
+    }
     let mut total = 0u64;
     for key in keys {
         if !key.ends_with("/receipt.json") {
@@ -990,6 +1007,40 @@ fn daily_posted_microusd(wallet: &str) -> (bool, Option<u64>) {
         total = total.saturating_add(receipt.amount_microusd);
     }
     (true, Some(total))
+}
+
+fn audited_receipt_ids_since(wallet: &str, cutoff_ms: u128) -> Result<Vec<String>, SdkError> {
+    let key = format!("trade/{wallet}/audit.jsonl");
+    let bytes = match bloom_petal_sdk::store_get(&key, MAX_STORE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(SdkError::Host(HostStatus::NotFound)) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let text = core::str::from_utf8(&bytes).map_err(|_| SdkError::Host(HostStatus::Invalid))?;
+    let mut ids = Vec::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("event").and_then(serde_json::Value::as_str) != Some("receipt_written") {
+            continue;
+        }
+        let ts = v
+            .get("ts_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u128;
+        if ts < cutoff_ms {
+            continue;
+        }
+        if let Some(id) = v
+            .get("details")
+            .and_then(|details| details.get("draft_id"))
+            .and_then(serde_json::Value::as_str)
+        {
+            ids.push(id.to_string());
+        }
+    }
+    Ok(ids)
 }
 
 fn evaluate_local_polymarket_order(

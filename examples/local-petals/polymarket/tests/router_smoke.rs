@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bloom_petal_manifest::extract_local_petal_manifest;
@@ -308,19 +309,56 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         )
         .await
         .unwrap();
+    let audit_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let audit_line = format!(
+        r#"{{"ts_ms":{audit_ms},"event":"receipt_written","details":{{"draft_id":"0099","clob_status":"matched","amount_microusd":1000000}}}}
+"#
+    );
+    private
+        .put(
+            &install.hash,
+            "trade/alice/audit.jsonl",
+            audit_line.as_bytes(),
+            false,
+        )
+        .unwrap();
+    let truncated_receipts =
+        dispatch_trade_revalidate(&runner, Arc::new(MockHost::fixture()), "0003").await;
+    assert!(matches!(
+        truncated_receipts,
+        DispatchResponse::Error { code: -3, message } if message.contains("policy denied")
+    ));
+    let policy_check = private
+        .get(&install.hash, "trade/alice/drafts/0003/policy_check.json")
+        .unwrap();
+    let policy_check_text = String::from_utf8(policy_check).unwrap();
+    assert!(policy_check_text.contains(r#""receipt_audit_parity": true"#));
+    assert!(policy_check_text.contains(r#""receipt_store_readable": false"#));
+    assert!(policy_check_text.contains("polymarket.max_daily_usd"));
+
+    router
+        .write(
+            &VfsPath::parse("polymarket/trade/alice/new").unwrap(),
+            br#"{"slug":"test-market","outcome":"yes","amount":"1","max_price":"0.10"}"#,
+        )
+        .await
+        .unwrap();
 
     let drift_host = Arc::new(MockHost::fixture_with_trade_market(
         br#"{"slug":"test-market","conditionId":"changed","clobTokenIds":["333","444"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true}"#,
         "333",
     ));
-    let drift = dispatch_trade_revalidate(&runner, drift_host.clone(), "0003").await;
+    let drift = dispatch_trade_revalidate(&runner, drift_host.clone(), "0004").await;
     assert!(matches!(
         drift,
         DispatchResponse::Error { code: -3, message } if message.contains("token id changed")
     ));
     assert_eq!(drift_host.sign_calls.lock().unwrap().len(), 0);
     assert!(matches!(
-        private.get(&install.hash, "trade/alice/receipts/0003/receipt.json"),
+        private.get(&install.hash, "trade/alice/receipts/0004/receipt.json"),
         Err(HostError::NotFound(_))
     ));
     let condition_drift_host = Arc::new(MockHost::fixture_with_trade_market(
@@ -328,7 +366,7 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         "111",
     ));
     let condition_drift =
-        dispatch_trade_revalidate(&runner, condition_drift_host.clone(), "0003").await;
+        dispatch_trade_revalidate(&runner, condition_drift_host.clone(), "0004").await;
     assert!(matches!(
         condition_drift,
         DispatchResponse::Error { code: -3, message } if message.contains("condition id changed")
@@ -341,7 +379,7 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         br#"{"market":"cond","asset_id":"111","tick_size":"0.01","min_order_size":"1","neg_risk":true,"last_trade_price":"0.09","bids":[{"price":"0.08","size":"10"}],"asks":[{"price":"0.09","size":"10"}]}"#,
     ));
     let neg_risk_drift =
-        dispatch_trade_revalidate(&runner, neg_risk_drift_host.clone(), "0003").await;
+        dispatch_trade_revalidate(&runner, neg_risk_drift_host.clone(), "0004").await;
     assert!(matches!(
         neg_risk_drift,
         DispatchResponse::Error { code: -3, message } if message.contains("neg-risk changed")
