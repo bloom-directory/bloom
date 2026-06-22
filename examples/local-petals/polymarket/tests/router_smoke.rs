@@ -106,6 +106,18 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         .unwrap();
     let status: serde_json::Value = serde_json::from_slice(&status).unwrap();
     assert_eq!(status["creds_present"], true);
+    assert_eq!(status["deposit_wallet"]["fundable"], false);
+    assert_eq!(
+        status["deposit_wallet"]["source"],
+        "local_estimate_unverified"
+    );
+    let approvals = router
+        .read(&VfsPath::parse("polymarket/onboard/alice/approvals.json").unwrap())
+        .await
+        .unwrap();
+    let approvals: serde_json::Value = serde_json::from_slice(&approvals).unwrap();
+    assert_eq!(approvals["deposit_wallet_fundable"], false);
+    assert_eq!(approvals["calls"].as_array().unwrap().len(), 8);
 
     router
         .write(
@@ -151,6 +163,8 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     assert_eq!(
         host.vfs_calls.lock().unwrap().as_slice(),
         [
+            "read wallets/alice/address",
+            "read wallets/alice/address",
             "read wallets/alice/address",
             "read wallets/alice/address",
             "read wallets/alice/address"

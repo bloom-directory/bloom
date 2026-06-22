@@ -12,7 +12,7 @@ use bloom_petal_sdk::{
     DispatchEntry, DispatchEntryKind, DispatchOp, DispatchRequest, DispatchResponse, HostStatus,
     HttpRequest, SdkError, SignRequest,
 };
-use bloom_polymarket::eip712::clob_auth_signing_hash;
+use bloom_polymarket::eip712::{clob_auth_signing_hash, derive_deposit_wallet_address};
 use bloom_polymarket::order::{
     LimitQuote, OrderType, format_micro, parse_micro, quantize_marketable_limit, quantize_price,
 };
@@ -20,6 +20,7 @@ use bloom_polymarket::signer::{
     POLY_ADDRESS, POLY_NONCE, POLY_SIGNATURE, POLY_TIMESTAMP, l2_headers,
 };
 use bloom_polymarket::types::{Market, Side};
+use bloom_polymarket::wallet::{V2_APPROVAL_LABELS, v2_approval_calls};
 use bloom_polymarket::{Credentials, OrderBook, POLYGON, Position, Trade, validate_wallet_name};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -279,22 +280,31 @@ fn read_onboard(wallet: &str, file: &str) -> DispatchResponse {
     }
     match file {
         "begin" => DispatchResponse::Read(BEGIN_HINT.into()),
-        "status.json" => read_store_json_or_default(
-            &format!("onboard/{wallet}/status.json"),
-            serde_json::json!({
-                "wallet": wallet,
-                "stage": "not_started",
-                "running": false,
-                "tradeable": false,
-                "message": "write begin to mint or derive CLOB credentials"
-            }),
-        ),
+        "status.json" => {
+            let default = match wallet_address(wallet) {
+                Ok(owner) => local_onboard_status(
+                    wallet,
+                    owner,
+                    "not_started",
+                    false,
+                    false,
+                    "write begin to mint or derive CLOB credentials",
+                ),
+                Err(_) => serde_json::json!({
+                    "wallet": wallet,
+                    "stage": "not_started",
+                    "running": false,
+                    "tradeable": false,
+                    "message": "write begin to mint or derive CLOB credentials"
+                }),
+            };
+            read_store_json_or_default(&format!("onboard/{wallet}/status.json"), default)
+        }
         "plan.md" => DispatchResponse::Read(render_onboard_plan(wallet).into_bytes()),
-        "approvals.json" => read_json_value(&serde_json::json!({
-            "wallet": wallet,
-            "approvals": [],
-            "signing": "clob_auth_available"
-        })),
+        "approvals.json" => match wallet_address(wallet) {
+            Ok(owner) => read_json_value(&approval_preview(wallet, owner)),
+            Err(resp) => resp,
+        },
         _ => error(-3, "not an onboard file"),
     }
 }
@@ -374,16 +384,72 @@ fn write_onboard_begin(wallet: &str) -> DispatchResponse {
     {
         return error(-4, "failed to store CLOB credentials");
     }
-    let status = serde_json::json!({
+    let status = local_onboard_status(
+        wallet,
+        owner,
+        "creds",
+        false,
+        true,
+        "CLOB credentials stored in the private petal store; approval/funding stages pending",
+    );
+    store_put_json(&format!("onboard/{wallet}/status.json"), &status, false)
+}
+
+fn local_onboard_status(
+    wallet: &str,
+    owner: Address,
+    stage: &str,
+    running: bool,
+    creds_present: bool,
+    message: &str,
+) -> serde_json::Value {
+    let deposit = derive_deposit_wallet_address(&owner, POLYGON);
+    serde_json::json!({
         "wallet": wallet,
         "owner": format!("{owner:#x}"),
-        "stage": "creds",
-        "running": false,
+        "stage": stage,
+        "running": running,
         "tradeable": false,
-        "creds_present": true,
-        "message": "CLOB credentials stored in the private petal store; approval/funding stages pending"
-    });
-    store_put_json(&format!("onboard/{wallet}/status.json"), &status, false)
+        "creds_present": creds_present,
+        "deposit_wallet": {
+            "address": deposit.to_checksum(None),
+            "source": "local_estimate_unverified",
+            "fundable": false,
+            "warning": "do not fund this local estimate; full onboarding must resolve the live factory address first"
+        },
+        "approvals": {
+            "required": true,
+            "preview_path": format!("onboard/{wallet}/approvals.json")
+        },
+        "message": message
+    })
+}
+
+fn approval_preview(wallet: &str, owner: Address) -> serde_json::Value {
+    let deposit = derive_deposit_wallet_address(&owner, POLYGON);
+    let calls: Vec<serde_json::Value> = v2_approval_calls()
+        .iter()
+        .zip(V2_APPROVAL_LABELS)
+        .map(|(call, label)| {
+            serde_json::json!({
+                "label": label,
+                "target": format!("{:#x}", call.target),
+                "value": call.value.to_string(),
+                "data": format!("0x{}", hex::encode(call.data.as_ref())),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "wallet": wallet,
+        "owner": format!("{owner:#x}"),
+        "deposit_wallet": deposit.to_checksum(None),
+        "deposit_wallet_source": "local_estimate_unverified",
+        "deposit_wallet_fundable": false,
+        "warning": "do not fund this locally derived estimate; full onboarding must resolve the live factory address before funding or approvals",
+        "chain_id": POLYGON,
+        "calls": calls,
+        "signing": "preview_only"
+    })
 }
 
 fn write_trade_new(wallet: &str, body: &[u8]) -> DispatchResponse {
