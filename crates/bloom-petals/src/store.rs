@@ -53,6 +53,16 @@ impl PetalStore {
         &self.base
     }
 
+    /// Root for per-petal private data. In the normal daemon layout,
+    /// `base` is `~/.bloom/petals/store`, so this returns
+    /// `~/.bloom/petals/data`.
+    pub fn private_data_root(&self) -> PathBuf {
+        self.base
+            .parent()
+            .map(|p| p.join("data"))
+            .unwrap_or_else(|| self.base.join("data"))
+    }
+
     fn object_path(&self, hash: &str) -> PathBuf {
         self.base.join(OBJECTS).join(hash)
     }
@@ -97,6 +107,7 @@ impl PetalStore {
                 name: None,
                 caps: BTreeSet::new(),
                 mode,
+                local_manifest: None,
             },
             Err(e) => return Err(e),
         };
@@ -148,7 +159,7 @@ impl PetalStore {
         }
     }
 
-    fn write_meta(&self, meta: &PetalMeta) -> Result<(), PetalError> {
+    pub(crate) fn write_meta(&self, meta: &PetalMeta) -> Result<(), PetalError> {
         let body = serde_json::to_vec_pretty(meta)?;
         atomic_write(&self.meta_path(&meta.hash), &body)?;
         Ok(())

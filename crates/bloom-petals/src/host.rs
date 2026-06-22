@@ -8,6 +8,9 @@
 
 use async_trait::async_trait;
 
+use crate::abi::{HttpRequest, HttpResponse, SignRequest};
+use crate::policy::NetPolicy;
+
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
     #[error("not found: {0}")]
@@ -40,6 +43,23 @@ pub trait PetalHost: Send + Sync {
     /// Write `bytes` to the writable file at `path` in the surrounding
     /// VFS.
     async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError>;
+
+    /// Perform a daemon-mediated HTTP request. Default-deny; production
+    /// hosts opt in explicitly.
+    async fn http_fetch(
+        &self,
+        _req: HttpRequest,
+        _policy: NetPolicy,
+        _max_response_bytes: usize,
+    ) -> Result<HttpResponse, HostError> {
+        Err(HostError::Denied("http_fetch".into()))
+    }
+
+    /// Sign a precomputed 32-byte hash with a daemon-held wallet key.
+    /// Default-deny; keys never cross into the petal.
+    async fn sign_hash(&self, _req: SignRequest) -> Result<Vec<u8>, HostError> {
+        Err(HostError::Denied("sign_hash".into()))
+    }
 }
 
 /// An always-denying host. Useful as a default and in tests where the
@@ -93,6 +113,29 @@ mod tests {
         assert!(matches!(h.vfs_read("any").await, Err(HostError::Denied(_))));
         assert!(matches!(
             h.vfs_write("any", b"x").await,
+            Err(HostError::Denied(_))
+        ));
+        assert!(matches!(
+            h.http_fetch(
+                HttpRequest {
+                    method: "GET".into(),
+                    url: "https://example.com/".into(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                },
+                NetPolicy::deny_all(),
+                1024,
+            )
+            .await,
+            Err(HostError::Denied(_))
+        ));
+        assert!(matches!(
+            h.sign_hash(SignRequest {
+                wallet: "0x0".into(),
+                hash32: [0u8; 32],
+                purpose: "test".into(),
+            })
+            .await,
             Err(HostError::Denied(_))
         ));
     }

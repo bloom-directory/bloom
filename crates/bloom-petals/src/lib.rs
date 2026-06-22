@@ -14,21 +14,31 @@
 
 #![forbid(unsafe_code)]
 
+pub mod abi;
 pub mod chain_vm;
 pub mod error;
 pub mod handler;
 pub mod host;
 pub mod meta;
+pub mod policy;
+pub mod private_store;
 pub mod registry;
 pub mod runner;
 pub mod store;
 pub mod vm;
 
+pub use abi::{
+    HttpRequest, HttpResponse, SignRequest, decode_http_request, decode_http_response,
+    decode_sign_request, decode_string_list, encode_http_request, encode_http_response,
+    encode_sign_request, encode_string_list,
+};
 pub use chain_vm::{BlockCtx, ChainCallInput, ChainCallOutput, ChainCtx, ChainEntry, LogEntry};
 pub use error::PetalError;
 pub use handler::PetalsHandler;
 pub use host::{HostError, PetalHost};
 pub use meta::{Capability, PetalMeta, PetalMode};
+pub use policy::NetPolicy;
+pub use private_store::PrivateStore;
 pub use registry::{NameRegistry, validate_name};
 pub use runner::{PetalRunner, VfsHost};
 pub use store::{InstallResult, PetalStore};

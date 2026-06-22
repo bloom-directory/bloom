@@ -31,6 +31,7 @@
 //! metadata declared the corresponding capability.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store};
@@ -38,13 +39,19 @@ use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 
+use crate::abi::{
+    decode_http_request, decode_sign_request, encode_http_response, encode_string_list,
+};
 use crate::error::PetalError;
 use crate::host::{HostError, PetalHost};
 use crate::meta::Capability;
+use crate::policy::NetPolicy;
+use crate::private_store::PrivateStore;
 
 const DEFAULT_FUEL: u64 = 100_000_000;
 const DEFAULT_MEMORY_PAGES: u32 = 256; // 16 MiB (64 KiB pages).
 const STDOUT_CAP: usize = 1 << 20; // 1 MiB.
+const DEFAULT_HTTP_RESPONSE_CAP: usize = 8 * 1024 * 1024;
 
 /// State threaded through `Store<StoreData>`. Owns the WASI context,
 /// the host bridge, and the capability set for the petal in flight.
@@ -53,12 +60,21 @@ pub struct StoreData {
     host: Arc<dyn PetalHost>,
     caps: BTreeSet<Capability>,
     petal_hash: String,
+    net_policy: NetPolicy,
+    http_response_cap: usize,
+    private_store: Option<PrivateStore>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RunOptions {
     pub fuel: u64,
     pub memory_pages: u32,
+    /// Optional runtime network mask. When running through [`PetalRunner`],
+    /// this is intersected with the manifest-declared policy and can only
+    /// narrow it. Direct VM callers that omit it get deny-all.
+    pub net_policy: Option<NetPolicy>,
+    pub http_response_cap: usize,
+    pub private_store_root: Option<PathBuf>,
 }
 
 impl Default for RunOptions {
@@ -66,6 +82,9 @@ impl Default for RunOptions {
         Self {
             fuel: DEFAULT_FUEL,
             memory_pages: DEFAULT_MEMORY_PAGES,
+            net_policy: None,
+            http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,
+            private_store_root: None,
         }
     }
 }
@@ -152,6 +171,15 @@ impl PetalVm {
                 host,
                 caps,
                 petal_hash: petal_hash.to_string(),
+                net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
+                http_response_cap: opts.http_response_cap,
+                private_store: match opts.private_store_root.clone() {
+                    Some(root) => Some(
+                        PrivateStore::open(root)
+                            .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
+                    ),
+                    None => None,
+                },
             },
         );
         store
@@ -247,8 +275,15 @@ fn link_imports_for_mode(
 }
 
 fn link_local_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
+    link_vfs_imports(linker, "bloom")?;
+    link_vfs_imports(linker, "bloom.v1")?;
+    link_bloom_v1_imports(linker)?;
+    Ok(())
+}
+
+fn link_vfs_imports(linker: &mut Linker<StoreData>, module: &'static str) -> anyhow::Result<()> {
     linker.func_wrap_async(
-        "bloom",
+        module,
         "vfs_read",
         |mut caller: Caller<'_, StoreData>,
          params: (i32, i32, i32, i32)|
@@ -290,7 +325,7 @@ fn link_local_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     )?;
 
     linker.func_wrap_async(
-        "bloom",
+        module,
         "vfs_write",
         |mut caller: Caller<'_, StoreData>,
          params: (i32, i32, i32, i32)|
@@ -325,6 +360,251 @@ fn link_local_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn link_bloom_v1_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
+    linker.func_wrap_async(
+        "bloom.v1",
+        "http_fetch",
+        |mut caller: Caller<'_, StoreData>,
+         params: (i32, i32, i32, i32)|
+         -> Box<dyn std::future::Future<Output = i32> + Send + '_> {
+            let (req_ptr, req_len, dst_ptr, dst_max) = params;
+            Box::new(async move {
+                if !caller.data().caps.contains(&Capability::NetFetch) {
+                    log_denied(caller.data(), "http_fetch");
+                    return HostError::Denied("net.fetch".into()).as_wasm_code();
+                }
+                let mem = match get_memory(&mut caller) {
+                    Some(m) => m,
+                    None => return HostError::Invalid("no exported memory".into()).as_wasm_code(),
+                };
+                let req_bytes = match read_bytes(&mem, &mut caller, req_ptr, req_len) {
+                    Ok(b) => b,
+                    Err(c) => return c,
+                };
+                let req = match decode_http_request(&req_bytes) {
+                    Ok(req) => req,
+                    Err(e) => return e.as_wasm_code(),
+                };
+                let audit = http_audit_target(&req.url);
+                let effective_policy = caller.data().net_policy.clone();
+                if let Err(e) = effective_policy.check(&req.method, &req.url) {
+                    tracing::info!(
+                        target: "bloom_petals::vm",
+                        petal = %caller.data().petal_hash,
+                        method = %req.method,
+                        host = audit.host.as_deref().unwrap_or("<invalid>"),
+                        path = audit.path.as_deref().unwrap_or("<invalid>"),
+                        "http_fetch denied by net policy"
+                    );
+                    return e.as_wasm_code();
+                }
+                let host = caller.data().host.clone();
+                let cap = caller.data().http_response_cap;
+                let req_body_len = req.body.len();
+                let method = req.method.clone();
+                match host.http_fetch(req, effective_policy, cap).await {
+                    Ok(resp) => {
+                        let encoded = encode_http_response(&resp);
+                        if resp.body.len() > cap || encoded.len() > cap {
+                            return HostError::Backend("http response too large".into())
+                                .as_wasm_code();
+                        }
+                        tracing::info!(
+                            target: "bloom_petals::vm",
+                            petal = %caller.data().petal_hash,
+                            method = %method,
+                            host = audit.host.as_deref().unwrap_or("<invalid>"),
+                            path = audit.path.as_deref().unwrap_or("<invalid>"),
+                            status = resp.status,
+                            request_bytes = req_body_len,
+                            response_bytes = resp.body.len(),
+                            "http_fetch allowed"
+                        );
+                        write_blob_response(&mem, &mut caller, dst_ptr, dst_max, &encoded)
+                    }
+                    Err(e) => e.as_wasm_code(),
+                }
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "bloom.v1",
+        "sign_hash",
+        |mut caller: Caller<'_, StoreData>,
+         params: (i32, i32, i32, i32)|
+         -> Box<dyn std::future::Future<Output = i32> + Send + '_> {
+            let (req_ptr, req_len, dst_ptr, dst_max) = params;
+            Box::new(async move {
+                if !caller.data().caps.contains(&Capability::Sign) {
+                    log_denied(caller.data(), "sign_hash");
+                    return HostError::Denied("sign".into()).as_wasm_code();
+                }
+                let mem = match get_memory(&mut caller) {
+                    Some(m) => m,
+                    None => return HostError::Invalid("no exported memory".into()).as_wasm_code(),
+                };
+                let req_bytes = match read_bytes(&mem, &mut caller, req_ptr, req_len) {
+                    Ok(b) => b,
+                    Err(c) => return c,
+                };
+                let req = match decode_sign_request(&req_bytes) {
+                    Ok(req) => req,
+                    Err(e) => return e.as_wasm_code(),
+                };
+                let host = caller.data().host.clone();
+                match host.sign_hash(req).await {
+                    Ok(sig) if sig.len() == 65 => {
+                        write_blob_response(&mem, &mut caller, dst_ptr, dst_max, &sig)
+                    }
+                    Ok(_) => HostError::Backend("sign_hash returned non-65-byte signature".into())
+                        .as_wasm_code(),
+                    Err(e) => e.as_wasm_code(),
+                }
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "bloom.v1",
+        "store_get",
+        |mut caller: Caller<'_, StoreData>,
+         params: (i32, i32, i32, i32)|
+         -> Box<dyn std::future::Future<Output = i32> + Send + '_> {
+            let (key_ptr, key_len, dst_ptr, dst_max) = params;
+            Box::new(async move {
+                if !caller.data().caps.contains(&Capability::Store) {
+                    log_denied(caller.data(), "store_get");
+                    return HostError::Denied("store".into()).as_wasm_code();
+                }
+                let mem = match get_memory(&mut caller) {
+                    Some(m) => m,
+                    None => return HostError::Invalid("no exported memory".into()).as_wasm_code(),
+                };
+                let key = match read_string(&mem, &mut caller, key_ptr, key_len) {
+                    Ok(s) => s,
+                    Err(c) => return c,
+                };
+                let Some(store) = caller.data().private_store.clone() else {
+                    return HostError::Denied("store unavailable".into()).as_wasm_code();
+                };
+                let petal_hash = caller.data().petal_hash.clone();
+                match store.get(&petal_hash, &key) {
+                    Ok(bytes) => write_blob_response(&mem, &mut caller, dst_ptr, dst_max, &bytes),
+                    Err(e) => e.as_wasm_code(),
+                }
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "bloom.v1",
+        "store_put",
+        |mut caller: Caller<'_, StoreData>,
+         params: (i32, i32, i32, i32, i32)|
+         -> Box<dyn std::future::Future<Output = i32> + Send + '_> {
+            let (key_ptr, key_len, val_ptr, val_len, secret_flag) = params;
+            Box::new(async move {
+                if !caller.data().caps.contains(&Capability::Store) {
+                    log_denied(caller.data(), "store_put");
+                    return HostError::Denied("store".into()).as_wasm_code();
+                }
+                let mem = match get_memory(&mut caller) {
+                    Some(m) => m,
+                    None => return HostError::Invalid("no exported memory".into()).as_wasm_code(),
+                };
+                let key = match read_string(&mem, &mut caller, key_ptr, key_len) {
+                    Ok(s) => s,
+                    Err(c) => return c,
+                };
+                let value = match read_bytes(&mem, &mut caller, val_ptr, val_len) {
+                    Ok(b) => b,
+                    Err(c) => return c,
+                };
+                let Some(store) = caller.data().private_store.clone() else {
+                    return HostError::Denied("store unavailable".into()).as_wasm_code();
+                };
+                let petal_hash = caller.data().petal_hash.clone();
+                match store.put(&petal_hash, &key, &value, secret_flag != 0) {
+                    Ok(()) => 0,
+                    Err(e) => e.as_wasm_code(),
+                }
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "bloom.v1",
+        "store_list",
+        |mut caller: Caller<'_, StoreData>,
+         params: (i32, i32, i32, i32)|
+         -> Box<dyn std::future::Future<Output = i32> + Send + '_> {
+            let (prefix_ptr, prefix_len, dst_ptr, dst_max) = params;
+            Box::new(async move {
+                if !caller.data().caps.contains(&Capability::Store) {
+                    log_denied(caller.data(), "store_list");
+                    return HostError::Denied("store".into()).as_wasm_code();
+                }
+                let mem = match get_memory(&mut caller) {
+                    Some(m) => m,
+                    None => return HostError::Invalid("no exported memory".into()).as_wasm_code(),
+                };
+                let prefix = match read_string(&mem, &mut caller, prefix_ptr, prefix_len) {
+                    Ok(s) => s,
+                    Err(c) => return c,
+                };
+                let Some(store) = caller.data().private_store.clone() else {
+                    return HostError::Denied("store unavailable".into()).as_wasm_code();
+                };
+                let petal_hash = caller.data().petal_hash.clone();
+                match store.list(&petal_hash, &prefix) {
+                    Ok(keys) => write_blob_response(
+                        &mem,
+                        &mut caller,
+                        dst_ptr,
+                        dst_max,
+                        &encode_string_list(&keys),
+                    ),
+                    Err(e) => e.as_wasm_code(),
+                }
+            })
+        },
+    )?;
+
+    linker.func_wrap_async(
+        "bloom.v1",
+        "store_del",
+        |mut caller: Caller<'_, StoreData>,
+         params: (i32, i32)|
+         -> Box<dyn std::future::Future<Output = i32> + Send + '_> {
+            let (key_ptr, key_len) = params;
+            Box::new(async move {
+                if !caller.data().caps.contains(&Capability::Store) {
+                    log_denied(caller.data(), "store_del");
+                    return HostError::Denied("store".into()).as_wasm_code();
+                }
+                let mem = match get_memory(&mut caller) {
+                    Some(m) => m,
+                    None => return HostError::Invalid("no exported memory".into()).as_wasm_code(),
+                };
+                let key = match read_string(&mem, &mut caller, key_ptr, key_len) {
+                    Ok(s) => s,
+                    Err(c) => return c,
+                };
+                let Some(store) = caller.data().private_store.clone() else {
+                    return HostError::Denied("store unavailable".into()).as_wasm_code();
+                };
+                let petal_hash = caller.data().petal_hash.clone();
+                match store.del(&petal_hash, &key) {
+                    Ok(()) => 0,
+                    Err(e) => e.as_wasm_code(),
+                }
+            })
+        },
+    )?;
+    Ok(())
+}
+
 fn log_denied(d: &StoreData, op: &str) {
     tracing::info!(
         target: "bloom_petals::vm",
@@ -332,6 +612,47 @@ fn log_denied(d: &StoreData, op: &str) {
         op,
         "host capability denied"
     );
+}
+
+fn write_blob_response(
+    mem: &Memory,
+    caller: &mut Caller<'_, StoreData>,
+    dst_ptr: i32,
+    dst_max: i32,
+    bytes: &[u8],
+) -> i32 {
+    if dst_max < 0 {
+        return HostError::Invalid("dst_max < 0".into()).as_wasm_code();
+    }
+    if bytes.len() > i32::MAX as usize {
+        return HostError::Backend("response too large".into()).as_wasm_code();
+    }
+    if bytes.len() > dst_max as usize {
+        return -((bytes.len() as i32).saturating_add(PetalVm::OVERFLOW_BIAS));
+    }
+    match write_bytes(mem, caller, dst_ptr, bytes) {
+        Ok(()) => bytes.len() as i32,
+        Err(c) => c,
+    }
+}
+
+#[derive(Debug)]
+struct HttpAuditTarget {
+    host: Option<String>,
+    path: Option<String>,
+}
+
+fn http_audit_target(url: &str) -> HttpAuditTarget {
+    match url::Url::parse(url) {
+        Ok(parsed) => HttpAuditTarget {
+            host: parsed.host_str().map(|h| h.to_ascii_lowercase()),
+            path: Some(parsed.path().to_string()),
+        },
+        Err(_) => HttpAuditTarget {
+            host: None,
+            path: None,
+        },
+    }
 }
 
 fn get_memory(caller: &mut Caller<'_, StoreData>) -> Option<Memory> {
@@ -433,15 +754,142 @@ impl Default for PetalVm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::{
+        HttpRequest, HttpResponse, SignRequest, encode_http_request, encode_sign_request,
+    };
     use crate::host::DenyHost;
     use crate::meta::PetalMode;
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::collections::HashMap;
+    use tempfile::TempDir;
+
+    const VALID_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     /// Compile a WAT snippet to wasm bytes.
     fn wat(src: &str) -> Vec<u8> {
         wat::parse_str(src).expect("valid WAT")
+    }
+
+    fn wat_bytes(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("\\{b:02x}")).collect()
+    }
+
+    fn denied_byte() -> u8 {
+        (HostError::Denied("".into()).as_wasm_code() as i8) as u8
+    }
+
+    fn invalid_byte() -> u8 {
+        (HostError::Invalid("".into()).as_wasm_code() as i8) as u8
+    }
+
+    fn http_probe(req: &[u8]) -> String {
+        format!(
+            r#"
+        (module
+          (import "bloom.v1" "http_fetch"
+            (func $http_fetch (param i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "fd_write"
+            (func $fd_write (param i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "proc_exit"
+            (func $exit (param i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 0) "{}")
+          (data (i32.const 400) "\9c\01\00\00\01\00\00\00")
+          (func (export "_start")
+            (local $n i32)
+            (local.set $n
+              (call $http_fetch
+                (i32.const 0)
+                (i32.const {})
+                (i32.const 1024)
+                (i32.const 4096)))
+            (i32.store8 (i32.const 412) (local.get $n))
+            (call $fd_write (i32.const 1) (i32.const 400) (i32.const 1) (i32.const 420))
+            drop
+            (call $exit (i32.const 0)))
+        )
+    "#,
+            wat_bytes(req),
+            req.len()
+        )
+    }
+
+    fn sign_probe(req: &[u8]) -> String {
+        format!(
+            r#"
+        (module
+          (import "bloom.v1" "sign_hash"
+            (func $sign_hash (param i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "fd_write"
+            (func $fd_write (param i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "proc_exit"
+            (func $exit (param i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 0) "{}")
+          (data (i32.const 400) "\9c\01\00\00\01\00\00\00")
+          (func (export "_start")
+            (local $n i32)
+            (local.set $n
+              (call $sign_hash
+                (i32.const 0)
+                (i32.const {})
+                (i32.const 1024)
+                (i32.const 128)))
+            (i32.store8 (i32.const 412) (local.get $n))
+            (call $fd_write (i32.const 1) (i32.const 400) (i32.const 1) (i32.const 420))
+            drop
+            (call $exit (i32.const 0)))
+        )
+    "#,
+            wat_bytes(req),
+            req.len()
+        )
+    }
+
+    fn store_put_get_probe(key: &str, value: &[u8]) -> String {
+        format!(
+            r#"
+        (module
+          (import "bloom.v1" "store_put"
+            (func $store_put (param i32 i32 i32 i32 i32) (result i32)))
+          (import "bloom.v1" "store_get"
+            (func $store_get (param i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "fd_write"
+            (func $fd_write (param i32 i32 i32 i32) (result i32)))
+          (import "wasi_snapshot_preview1" "proc_exit"
+            (func $exit (param i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 0) "{}")
+          (data (i32.const 128) "{}")
+          (data (i32.const 400) "\9c\01\00\00\01\00\00\00")
+          (func (export "_start")
+            (local $n i32)
+            (call $store_put
+              (i32.const 0)
+              (i32.const {})
+              (i32.const 128)
+              (i32.const {})
+              (i32.const 1))
+            drop
+            (local.set $n
+              (call $store_get
+                (i32.const 0)
+                (i32.const {})
+                (i32.const 1024)
+                (i32.const 256)))
+            (i32.store8 (i32.const 412) (local.get $n))
+            (call $fd_write (i32.const 1) (i32.const 400) (i32.const 1) (i32.const 420))
+            drop
+            (call $exit (i32.const 0)))
+        )
+    "#,
+            wat_bytes(key.as_bytes()),
+            wat_bytes(value),
+            key.len(),
+            value.len(),
+            key.len()
+        )
     }
 
     /// Smallest valid WASI command: imports `proc_exit(0)` and calls it.
@@ -563,6 +1011,8 @@ mod tests {
     #[derive(Default)]
     struct MockHost {
         store: Mutex<HashMap<String, Vec<u8>>>,
+        http_calls: Mutex<Vec<HttpRequest>>,
+        sign_calls: Mutex<Vec<SignRequest>>,
     }
 
     #[async_trait]
@@ -577,6 +1027,30 @@ mod tests {
         async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
             self.store.lock().insert(path.into(), bytes.to_vec());
             Ok(())
+        }
+
+        async fn http_fetch(
+            &self,
+            req: HttpRequest,
+            policy: NetPolicy,
+            max_response_bytes: usize,
+        ) -> Result<HttpResponse, HostError> {
+            policy.check(&req.method, &req.url)?;
+            self.http_calls.lock().push(req);
+            let resp = HttpResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "text/plain".into())],
+                body: b"ok".to_vec(),
+            };
+            if resp.body.len() > max_response_bytes {
+                return Err(HostError::Backend("too large".into()));
+            }
+            Ok(resp)
+        }
+
+        async fn sign_hash(&self, req: SignRequest) -> Result<Vec<u8>, HostError> {
+            self.sign_calls.lock().push(req);
+            Ok(vec![7u8; 65])
         }
     }
 
@@ -598,10 +1072,7 @@ mod tests {
             .await
             .unwrap();
         // -2 as a single byte = 254.
-        assert_eq!(
-            out.stdout,
-            vec![(HostError::Denied("".into()).as_wasm_code() as i8) as u8]
-        );
+        assert_eq!(out.stdout, vec![denied_byte()]);
     }
 
     #[tokio::test]
@@ -624,6 +1095,208 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.stdout, vec![5u8]); // "VALUE".len()
+    }
+
+    #[tokio::test]
+    async fn http_fetch_denied_without_capability_before_host_call() {
+        let req = encode_http_request(&HttpRequest {
+            method: "GET".into(),
+            url: "https://api.example.com/markets".into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        });
+        let vm = PetalVm::new().unwrap();
+        let host = Arc::new(MockHost::default());
+        let out = vm
+            .run(
+                &wat(&http_probe(&req)),
+                Vec::new(),
+                BTreeSet::new(),
+                host.clone(),
+                VALID_HASH,
+                PetalMode::Local,
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, vec![denied_byte()]);
+        assert!(host.http_calls.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_fetch_denied_by_net_policy_before_host_call() {
+        let req = encode_http_request(&HttpRequest {
+            method: "GET".into(),
+            url: "https://evil.example.com/markets".into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        });
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::NetFetch);
+        let manifest = bloom_petal_manifest::local::parse_local_manifest_toml(
+            br#"
+schema = "bloom.petal.local.v1"
+name = "netty"
+[provides]
+kind = "vfs"
+mount = "netty"
+caps = ["net.fetch"]
+[[net.allow]]
+host = "api.example.com"
+methods = ["GET"]
+paths = ["/markets*"]
+"#,
+        )
+        .unwrap();
+        let opts = RunOptions {
+            net_policy: Some(NetPolicy::from_manifest(&manifest)),
+            ..RunOptions::default()
+        };
+        let vm = PetalVm::new().unwrap();
+        let host = Arc::new(MockHost::default());
+        let out = vm
+            .run(
+                &wat(&http_probe(&req)),
+                Vec::new(),
+                caps,
+                host.clone(),
+                VALID_HASH,
+                PetalMode::Local,
+                opts,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, vec![denied_byte()]);
+        assert!(host.http_calls.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_fetch_allowed_by_cap_and_net_policy() {
+        let req = encode_http_request(&HttpRequest {
+            method: "GET".into(),
+            url: "https://api.example.com/markets".into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        });
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::NetFetch);
+        let manifest = bloom_petal_manifest::local::parse_local_manifest_toml(
+            br#"
+schema = "bloom.petal.local.v1"
+name = "netty"
+[provides]
+kind = "vfs"
+mount = "netty"
+caps = ["net.fetch"]
+[[net.allow]]
+host = "api.example.com"
+methods = ["GET"]
+paths = ["/markets*"]
+"#,
+        )
+        .unwrap();
+        let opts = RunOptions {
+            net_policy: Some(NetPolicy::from_manifest(&manifest)),
+            ..RunOptions::default()
+        };
+        let vm = PetalVm::new().unwrap();
+        let host = Arc::new(MockHost::default());
+        let out = vm
+            .run(
+                &wat(&http_probe(&req)),
+                Vec::new(),
+                caps,
+                host.clone(),
+                VALID_HASH,
+                PetalMode::Local,
+                opts,
+            )
+            .await
+            .unwrap();
+        assert_eq!(host.http_calls.lock().len(), 1);
+        assert!(out.stdout[0] > 0);
+    }
+
+    #[tokio::test]
+    async fn sign_hash_allowed_by_cap() {
+        let req = encode_sign_request(&SignRequest {
+            wallet: "0xabc".into(),
+            hash32: [9u8; 32],
+            purpose: "polymarket-order".into(),
+        });
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::Sign);
+        let vm = PetalVm::new().unwrap();
+        let host = Arc::new(MockHost::default());
+        let out = vm
+            .run(
+                &wat(&sign_probe(&req)),
+                Vec::new(),
+                caps,
+                host.clone(),
+                VALID_HASH,
+                PetalMode::Local,
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, vec![65]);
+        assert_eq!(host.sign_calls.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn store_put_get_uses_private_petal_directory() {
+        let tmp = TempDir::new().unwrap();
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::Store);
+        let opts = RunOptions {
+            private_store_root: Some(tmp.path().to_path_buf()),
+            ..RunOptions::default()
+        };
+        let vm = PetalVm::new().unwrap();
+        let out = vm
+            .run(
+                &wat(&store_put_get_probe("creds/api.json", b"secret")),
+                Vec::new(),
+                caps,
+                Arc::new(MockHost::default()),
+                VALID_HASH,
+                PetalMode::Local,
+                opts,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, vec![6]);
+        assert_eq!(
+            std::fs::read(tmp.path().join(VALID_HASH).join("creds/api.json")).unwrap(),
+            b"secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_rejects_traversal_key() {
+        let tmp = TempDir::new().unwrap();
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::Store);
+        let opts = RunOptions {
+            private_store_root: Some(tmp.path().to_path_buf()),
+            ..RunOptions::default()
+        };
+        let vm = PetalVm::new().unwrap();
+        let out = vm
+            .run(
+                &wat(&store_put_get_probe("../creds", b"secret")),
+                Vec::new(),
+                caps,
+                Arc::new(MockHost::default()),
+                VALID_HASH,
+                PetalMode::Local,
+                opts,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, vec![invalid_byte()]);
+        assert!(!tmp.path().join("creds").exists());
     }
 
     #[tokio::test]

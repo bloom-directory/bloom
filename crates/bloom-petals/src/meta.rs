@@ -2,18 +2,28 @@
 
 use std::collections::BTreeSet;
 
+use bloom_petal_manifest::local::LocalPetalManifest;
 use serde::{Deserialize, Serialize};
 
 /// Capabilities a petal can request. Default is deny.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
-    /// May call `bloom_vfs_read`.
+    /// May call `vfs_read`.
     #[serde(rename = "vfs.read")]
     VfsRead,
-    /// May call `bloom_vfs_write`.
+    /// May call `vfs_write`.
     #[serde(rename = "vfs.write")]
     VfsWrite,
+    /// May call `http_fetch`.
+    #[serde(rename = "net.fetch")]
+    NetFetch,
+    /// May call `sign_hash`.
+    #[serde(rename = "sign")]
+    Sign,
+    /// May call `store_*`.
+    #[serde(rename = "store")]
+    Store,
 }
 
 impl Capability {
@@ -21,6 +31,9 @@ impl Capability {
         match self {
             Capability::VfsRead => "vfs.read",
             Capability::VfsWrite => "vfs.write",
+            Capability::NetFetch => "net.fetch",
+            Capability::Sign => "sign",
+            Capability::Store => "store",
         }
     }
 
@@ -28,6 +41,9 @@ impl Capability {
         match s {
             "vfs.read" => Some(Capability::VfsRead),
             "vfs.write" => Some(Capability::VfsWrite),
+            "net.fetch" => Some(Capability::NetFetch),
+            "sign" => Some(Capability::Sign),
+            "store" => Some(Capability::Store),
             _ => None,
         }
     }
@@ -72,6 +88,8 @@ pub struct PetalMeta {
     pub caps: BTreeSet<Capability>,
     #[serde(default)]
     pub mode: PetalMode,
+    #[serde(default)]
+    pub local_manifest: Option<LocalPetalManifest>,
 }
 
 impl PetalMeta {
@@ -86,7 +104,7 @@ impl PetalMeta {
 
 /// Validate that a (mode, caps) pair is allowed at install time.
 ///
-/// - `Local` may declare `{vfs.read, vfs.write}`.
+/// - `Local` may declare `{vfs.read, vfs.write, net.fetch, sign, store}`.
 /// - `Chain` declares no capabilities (all access is via chain host imports).
 ///
 /// Returns `Err` on the first offending capability; the remaining caps
@@ -98,7 +116,14 @@ pub fn validate_mode_caps(
     for cap in caps {
         let ok = matches!(
             (mode, *cap),
-            (PetalMode::Local, Capability::VfsRead | Capability::VfsWrite)
+            (
+                PetalMode::Local,
+                Capability::VfsRead
+                    | Capability::VfsWrite
+                    | Capability::NetFetch
+                    | Capability::Sign
+                    | Capability::Store
+            )
         );
         // Chain mode has no declared capabilities — any cap is an error.
         if !ok || mode == PetalMode::Chain {
@@ -119,8 +144,14 @@ mod tests {
     fn capability_string_roundtrip() {
         assert_eq!(Capability::VfsRead.as_str(), "vfs.read");
         assert_eq!(Capability::VfsWrite.as_str(), "vfs.write");
+        assert_eq!(Capability::NetFetch.as_str(), "net.fetch");
+        assert_eq!(Capability::Sign.as_str(), "sign");
+        assert_eq!(Capability::Store.as_str(), "store");
         assert_eq!(Capability::parse("vfs.read"), Some(Capability::VfsRead));
         assert_eq!(Capability::parse("vfs.write"), Some(Capability::VfsWrite));
+        assert_eq!(Capability::parse("net.fetch"), Some(Capability::NetFetch));
+        assert_eq!(Capability::parse("sign"), Some(Capability::Sign));
+        assert_eq!(Capability::parse("store"), Some(Capability::Store));
         assert_eq!(Capability::parse("nope"), None);
     }
 
@@ -135,6 +166,7 @@ mod tests {
             name: Some("hello".into()),
             caps,
             mode: PetalMode::default(),
+            local_manifest: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         let m2: PetalMeta = serde_json::from_str(&s).unwrap();
@@ -189,6 +221,7 @@ mod tests {
             name: None,
             caps: BTreeSet::new(),
             mode: PetalMode::Chain,
+            local_manifest: None,
         };
         let m2: PetalMeta = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(
