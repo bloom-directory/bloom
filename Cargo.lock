@@ -2386,6 +2386,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-local-petal-misc-tools"
+version = "0.1.0"
+dependencies = [
+ "bloom-petal-manifest",
+ "bloom-petal-sdk",
+ "bloom-petals",
+ "bloom-vfs",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "bloom-mempool"
 version = "0.1.0"
 dependencies = [
