@@ -18,8 +18,13 @@ paths = ["/positions*", "/trades*", "/activity*"]
 
 [[net.allow]]
 host = "clob.polymarket.com"
-methods = ["GET", "POST"]
-paths = ["/book*", "/midpoint*", "/spread*", "/price*", "/auth/*", "/data/orders*", "/balance-allowance*", "/order"]
+methods = ["GET"]
+paths = ["/book", "/midpoint", "/spread", "/price", "/auth/derive-api-key", "/data/orders", "/balance-allowance"]
+
+[[net.allow]]
+host = "clob.polymarket.com"
+methods = ["POST"]
+paths = ["/auth/api-key"]
 
 [[endpoint]]
 path = "markets/*"
@@ -78,10 +83,6 @@ cache_ttl_ms = 5000
 
 [[endpoint]]
 path = "trade/*/new"
-write = true
-
-[[endpoint]]
-path = "trade/*/drafts/*/confirm"
 write = true
 
 [[endpoint]]

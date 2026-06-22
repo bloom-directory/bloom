@@ -26,8 +26,8 @@ use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
 use bloom_keystore::Keystore;
 use bloom_petals::{
-    HostError, LateVfsHost, NameRegistry, PetalHost, PetalRouter, PetalRunner, PetalStore, PetalVm,
-    PetalsHandler, SignRequest,
+    HostError, HttpRequest, HttpResponse, LateVfsHost, NameRegistry, NetPolicy, PetalHost,
+    PetalRouter, PetalRunner, PetalStore, PetalVm, PetalsHandler, SignRequest,
 };
 use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient, GeoblockClient};
 use bloom_prices::PricesClient;
@@ -48,6 +48,7 @@ use bloom_vfs::handlers::{
 use bloom_vfs::tx_handler::PtbSubmitter;
 use bloom_vfs::{HandlerError, PathCache, Vfs};
 use bloom_watch::{WatchExecutor, WatchRegistry};
+use futures::StreamExt;
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -76,11 +77,21 @@ pub enum DaemonError {
 struct DaemonPetalHost {
     vfs: Arc<LateVfsHost>,
     keystore: Keystore,
+    http: reqwest::Client,
 }
 
 impl DaemonPetalHost {
     fn new(vfs: Arc<LateVfsHost>, keystore: Keystore) -> Self {
-        Self { vfs, keystore }
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(20))
+            .build()
+            .expect("daemon petal http client must build");
+        Self {
+            vfs,
+            keystore,
+            http,
+        }
     }
 }
 
@@ -96,6 +107,58 @@ impl PetalHost for DaemonPetalHost {
 
     async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
         self.vfs.vfs_write(path, bytes).await
+    }
+
+    async fn http_fetch(
+        &self,
+        req: HttpRequest,
+        policy: NetPolicy,
+        max_response_bytes: usize,
+    ) -> Result<HttpResponse, HostError> {
+        policy.check(&req.method, &req.url)?;
+        let method = reqwest::Method::from_bytes(req.method.as_bytes())
+            .map_err(|e| HostError::Invalid(format!("http method: {e}")))?;
+        let mut builder = self.http.request(method, &req.url);
+        for (name, value) in req.headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        let resp = builder
+            .body(req.body)
+            .send()
+            .await
+            .map_err(|e| HostError::Backend(format!("http_fetch send: {e}")))?;
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        if resp.content_length().is_some_and(|len| {
+            usize::try_from(len)
+                .map(|len| len > max_response_bytes)
+                .unwrap_or(true)
+        }) {
+            return Err(HostError::Backend("http response too large".into()));
+        }
+        let mut body = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| HostError::Backend(format!("http_fetch body: {e}")))?;
+            if body.len().saturating_add(chunk.len()) > max_response_bytes {
+                return Err(HostError::Backend("http response too large".into()));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(HttpResponse {
+            status,
+            headers,
+            body,
+        })
     }
 
     async fn sign_hash(&self, req: SignRequest) -> Result<Vec<u8>, HostError> {

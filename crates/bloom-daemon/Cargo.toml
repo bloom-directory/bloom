@@ -57,6 +57,7 @@ base64.workspace = true
 blake3.workspace = true
 hex.workspace = true
 futures.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
 
 [dev-dependencies]
 tempfile.workspace = true

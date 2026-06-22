@@ -52,7 +52,7 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
             .collect::<Vec<_>>(),
         vec!["vfs.read", "net.fetch", "sign", "store"]
     );
-    assert_eq!(manifest.net.as_ref().unwrap().allow.len(), 3);
+    assert_eq!(manifest.net.as_ref().unwrap().allow.len(), 4);
 
     let tmp = tempfile::tempdir().unwrap();
     let store = PetalStore::open(tmp.path().join("store")).unwrap();
@@ -124,20 +124,6 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         .await
         .unwrap();
     assert!(String::from_utf8(plan).unwrap().contains("test-market"));
-    router
-        .write(
-            &VfsPath::parse("polymarket/trade/alice/drafts/0001/confirm").unwrap(),
-            br#"{"confirm":true}"#,
-        )
-        .await
-        .unwrap();
-    let receipt = router
-        .read(&VfsPath::parse("polymarket/trade/alice/receipts/0001/receipt.json").unwrap())
-        .await
-        .unwrap();
-    let receipt_text = String::from_utf8(receipt).unwrap();
-    assert!(receipt_text.contains("order-123"));
-
     let private = PrivateStore::open(tmp.path().join("data")).unwrap();
     let draft = private
         .get(&install.hash, "trade/alice/drafts/0001/order.json")
@@ -167,11 +153,10 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         [
             "read wallets/alice/address",
             "read wallets/alice/address",
-            "read wallets/alice/address",
             "read wallets/alice/address"
         ]
     );
-    assert_eq!(host.sign_calls.lock().unwrap().len(), 2);
+    assert_eq!(host.sign_calls.lock().unwrap().len(), 1);
     assert!(
         router
             .write(
@@ -229,10 +214,6 @@ impl MockHost {
         host.responses.insert(
             "GET https://clob.polymarket.com/data/orders".into(),
             br#"[{"id":"order-1","status":"LIVE"}]"#.to_vec(),
-        );
-        host.responses.insert(
-            "POST https://clob.polymarket.com/order".into(),
-            br#"{"status":"matched","orderID":"order-123","takingAmount":"1"}"#.to_vec(),
         );
         host
     }
