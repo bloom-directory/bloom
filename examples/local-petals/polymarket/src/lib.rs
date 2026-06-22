@@ -105,24 +105,24 @@ fn list(relative: &str) -> DispatchResponse {
             Err(resp) => return resp,
         },
         (Some("markets"), 2) => strings(&MARKET_FILES),
-        (Some("positions"), 1) => Vec::new(),
+        (Some("positions"), 1) => vfs_wallets_or_store(""),
         (Some("positions"), 2) => strings(&POSITION_FILES),
-        (Some("onboard"), 1) => store_wallets("onboard/"),
+        (Some("onboard"), 1) => vfs_wallets_or_store("onboard/"),
         (Some("onboard"), 2) => {
             let mut out = vec!["begin".to_string()];
             out.extend(strings(&ONBOARD_FILES));
             out
         }
-        (Some("account"), 1) => store_wallets("creds/"),
+        (Some("account"), 1) => vfs_wallets_or_store("creds/"),
         (Some("account"), 2) => strings(&ACCOUNT_FILES),
-        (Some("fund"), 1) => store_wallets("fund/"),
+        (Some("fund"), 1) => vfs_wallets_or_store("fund/"),
         (Some("fund"), 2) => {
             let mut out = vec!["new".to_string()];
             out.extend(store_ids(&format!("fund/{}/requests/", segs[1]), ".json"));
             out
         }
         (Some("fund"), 3) if segs[2] != "new" => strings(&FUND_FILES),
-        (Some("trade"), 1) => store_wallets("trade/"),
+        (Some("trade"), 1) => vfs_wallets_or_store("trade/"),
         (Some("trade"), 2) => vec!["new".into(), "drafts".into(), "receipts".into()],
         (Some("trade"), 3) if segs[2] == "drafts" => {
             store_ids(&format!("trade/{}/drafts/", segs[1]), "/order.json")
@@ -1127,6 +1127,26 @@ fn store_wallets(prefix: &str) -> Vec<String> {
             && !out.iter().any(|existing| existing == wallet)
         {
             out.push(wallet.to_string());
+        }
+    }
+    out.sort();
+    out
+}
+
+fn vfs_wallets_or_store(store_prefix: &str) -> Vec<String> {
+    match bloom_petal_sdk::vfs_list("wallets", MAX_LIST_BYTES) {
+        Ok(names) => safe_wallet_names(names),
+        Err(_) if store_prefix.is_empty() => Vec::new(),
+        Err(_) => store_wallets(store_prefix),
+    }
+}
+
+fn safe_wallet_names(names: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for name in names {
+        if name != "new" && is_safe_segment(&name) && !out.iter().any(|existing| existing == &name)
+        {
+            out.push(name);
         }
     }
     out.sort();

@@ -72,6 +72,17 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     assert!(root_entries.iter().any(|entry| entry.name == "markets"));
     assert!(root_entries.iter().any(|entry| entry.name == "trade"));
 
+    for root in ["positions", "onboard", "account", "fund", "trade"] {
+        let entries = router
+            .list(&VfsPath::parse(&format!("polymarket/{root}")).unwrap())
+            .await
+            .unwrap();
+        assert!(
+            entries.iter().any(|entry| entry.name == "alice"),
+            "{root} should enumerate keystore wallet alice"
+        );
+    }
+
     let markets = router
         .list(&VfsPath::parse("polymarket/markets").unwrap())
         .await
@@ -157,10 +168,17 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     assert!(!orders_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
 
     let vfs_calls = host.vfs_calls.lock().unwrap().clone();
-    assert!(vfs_calls.len() >= 5);
     assert!(
         vfs_calls
             .iter()
+            .filter(|call| *call == "list wallets")
+            .count()
+            >= 5
+    );
+    assert!(
+        vfs_calls
+            .iter()
+            .filter(|call| call.starts_with("read "))
             .all(|call| call == "read wallets/alice/address")
     );
     assert_eq!(host.sign_calls.lock().unwrap().len(), 1);
@@ -239,7 +257,11 @@ impl PetalHost for MockHost {
 
     async fn vfs_list(&self, path: &str) -> Result<Vec<String>, HostError> {
         self.vfs_calls.lock().unwrap().push(format!("list {path}"));
-        Err(HostError::Denied("vfs not expected".into()))
+        if path == "wallets" {
+            Ok(vec!["alice".into(), "new".into()])
+        } else {
+            Err(HostError::Denied("vfs not expected".into()))
+        }
     }
 
     async fn vfs_write(&self, path: &str, _bytes: &[u8]) -> Result<(), HostError> {
