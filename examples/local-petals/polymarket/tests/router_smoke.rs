@@ -213,6 +213,97 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         .await
         .unwrap();
     assert!(String::from_utf8(plan).unwrap().contains("test-market"));
+    let revalidate_hint = router
+        .read(&VfsPath::parse("polymarket/trade/alice/drafts/0001/revalidate").unwrap())
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8(revalidate_hint)
+            .unwrap()
+            .contains("revalidate")
+    );
+    router
+        .write(
+            &VfsPath::parse("polymarket/trade/alice/drafts/0001/revalidate").unwrap(),
+            br#"{"revalidate":true}"#,
+        )
+        .await
+        .unwrap();
+    let revalidated = private
+        .get(&install.hash, "trade/alice/drafts/0001/order.json")
+        .unwrap();
+    let revalidated_text = String::from_utf8(revalidated).unwrap();
+    assert!(revalidated_text.contains(r#""status": "revalidated""#));
+    let final_review = router
+        .read(&VfsPath::parse("polymarket/trade/alice/drafts/0001/review_intent.json").unwrap())
+        .await
+        .unwrap();
+    let final_review_text = String::from_utf8(final_review).unwrap();
+    assert!(final_review_text.contains("final_review_staged"));
+    assert!(final_review_text.contains(r#""posting_enabled": false"#));
+    assert_eq!(host.sign_calls.lock().unwrap().len(), 1);
+
+    router
+        .write(
+            &VfsPath::parse("polymarket/trade/alice/new").unwrap(),
+            br#"{"slug":"test-market","outcome":"yes","amount":"1","max_price":"0.10"}"#,
+        )
+        .await
+        .unwrap();
+    let blocked_revalidate_host = Arc::new(MockHost::fixture_with_geoblock_body(
+        br#"{"blocked":true,"country":"XX","region":"YY"}"#,
+    ));
+    let blocked_revalidate =
+        dispatch_trade_revalidate(&runner, blocked_revalidate_host.clone(), "0002").await;
+    assert!(matches!(
+        blocked_revalidate,
+        DispatchResponse::Error { code: -3, message } if message.contains("country=XX")
+    ));
+    assert_eq!(blocked_revalidate_host.sign_calls.lock().unwrap().len(), 0);
+    assert!(matches!(
+        private.get(&install.hash, "trade/alice/receipts/0002/receipt.json"),
+        Err(HostError::NotFound(_))
+    ));
+
+    let drift_host = Arc::new(MockHost::fixture_with_trade_market(
+        br#"{"slug":"test-market","conditionId":"changed","clobTokenIds":["333","444"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true}"#,
+        "333",
+    ));
+    let drift = dispatch_trade_revalidate(&runner, drift_host.clone(), "0002").await;
+    assert!(matches!(
+        drift,
+        DispatchResponse::Error { code: -3, message } if message.contains("token id changed")
+    ));
+    assert_eq!(drift_host.sign_calls.lock().unwrap().len(), 0);
+    assert!(matches!(
+        private.get(&install.hash, "trade/alice/receipts/0002/receipt.json"),
+        Err(HostError::NotFound(_))
+    ));
+    let condition_drift_host = Arc::new(MockHost::fixture_with_trade_market(
+        br#"{"slug":"test-market","conditionId":"changed","clobTokenIds":["111","222"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true}"#,
+        "111",
+    ));
+    let condition_drift =
+        dispatch_trade_revalidate(&runner, condition_drift_host.clone(), "0002").await;
+    assert!(matches!(
+        condition_drift,
+        DispatchResponse::Error { code: -3, message } if message.contains("condition id changed")
+    ));
+    assert_eq!(condition_drift_host.sign_calls.lock().unwrap().len(), 0);
+
+    let neg_risk_drift_host = Arc::new(MockHost::fixture_with_trade_market_and_book(
+        br#"{"slug":"test-market","conditionId":"cond","clobTokenIds":["111","222"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true,"negRisk":true}"#,
+        "111",
+        br#"{"market":"cond","asset_id":"111","tick_size":"0.01","min_order_size":"1","neg_risk":true,"last_trade_price":"0.09","bids":[{"price":"0.08","size":"10"}],"asks":[{"price":"0.09","size":"10"}]}"#,
+    ));
+    let neg_risk_drift =
+        dispatch_trade_revalidate(&runner, neg_risk_drift_host.clone(), "0002").await;
+    assert!(matches!(
+        neg_risk_drift,
+        DispatchResponse::Error { code: -3, message } if message.contains("neg-risk changed")
+    ));
+    assert_eq!(neg_risk_drift_host.sign_calls.lock().unwrap().len(), 0);
+
     let draft = private
         .get(&install.hash, "trade/alice/drafts/0001/order.json")
         .unwrap();
@@ -255,13 +346,18 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
                 "read wallets/alice/address" | "read wallets/0xalice/address"
             ))
     );
+    let http_calls = host.http_calls.lock().unwrap();
     assert!(
-        host.http_calls
-            .lock()
-            .unwrap()
+        http_calls
             .iter()
             .any(|(_, url)| url == "https://polymarket.com/api/geoblock")
     );
+    assert!(
+        !http_calls
+            .iter()
+            .any(|(method, url)| method == "POST" && url == "https://clob.polymarket.com/order")
+    );
+    drop(http_calls);
     assert!(
         router
             .write(
@@ -281,6 +377,29 @@ async fn dispatch_onboard_begin(runner: &PetalRunner, host: Arc<MockHost>) -> Di
                 op: DispatchOp::Write,
                 path: "onboard/alice/begin".into(),
                 body: b"go".to_vec(),
+                ctx: Vec::new(),
+            },
+            host,
+            None,
+            RunOptions::default(),
+        )
+        .await
+        .unwrap()
+        .response
+}
+
+async fn dispatch_trade_revalidate(
+    runner: &PetalRunner,
+    host: Arc<MockHost>,
+    id: &str,
+) -> DispatchResponse {
+    runner
+        .dispatch_mount(
+            "polymarket",
+            DispatchRequest {
+                op: DispatchOp::Write,
+                path: format!("trade/alice/drafts/{id}/revalidate"),
+                body: br#"{"revalidate":true}"#.to_vec(),
                 ctx: Vec::new(),
             },
             host,
@@ -327,6 +446,34 @@ impl MockHost {
 
     fn fixture_with_geoblock_body(geoblock_body: &[u8]) -> Self {
         Self::fixture_with_geoblock_response(geoblock_body, 200)
+    }
+
+    fn fixture_with_trade_market(market_body: &[u8], token_id: &str) -> Self {
+        Self::fixture_with_trade_market_and_book(
+            market_body,
+            token_id,
+            format!(
+                r#"{{"market":"changed","asset_id":"{token_id}","tick_size":"0.01","min_order_size":"1","neg_risk":false,"last_trade_price":"0.09","bids":[{{"price":"0.08","size":"10"}}],"asks":[{{"price":"0.09","size":"10"}}]}}"#
+            )
+            .as_bytes(),
+        )
+    }
+
+    fn fixture_with_trade_market_and_book(
+        market_body: &[u8],
+        token_id: &str,
+        book_body: &[u8],
+    ) -> Self {
+        let mut host = Self::fixture();
+        host.responses.insert(
+            "GET https://gamma-api.polymarket.com/markets/slug/test-market".into(),
+            market_body.to_vec(),
+        );
+        host.responses.insert(
+            format!("GET https://clob.polymarket.com/book?token_id={token_id}"),
+            book_body.to_vec(),
+        );
+        host
     }
 
     fn fixture_with_geoblock_response(geoblock_body: &[u8], geoblock_status: u16) -> Self {

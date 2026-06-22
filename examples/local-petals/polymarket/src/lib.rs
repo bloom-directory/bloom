@@ -56,6 +56,7 @@ const DRAFT_FILES: [&str; 5] = [
     "quote.json",
     "review_intent.json",
 ];
+const DRAFT_WRITABLE_FILES: [&str; 1] = ["revalidate"];
 
 const BEGIN_HINT: &str =
     "write anything here to mint or derive CLOB credentials with the daemon keystore\n";
@@ -64,6 +65,8 @@ const TRADE_NEW_HINT: &str = r#"write JSON to create a reviewable draft, e.g.
 "#;
 const FUND_NEW_HINT: &str = r#"write JSON to create a reviewable pUSD funding request, e.g.
 {"target_pusd":"10","max_spend":"100","from_token":"native","slippage_bps":50}
+"#;
+const TRADE_REVALIDATE_HINT: &str = r#"write {"revalidate":true} to revalidate this draft and stage the final review artifact. Signing/posting remains disabled until policy, locking, and receipt parity are ported.
 "#;
 
 #[cfg_attr(target_family = "wasm", unsafe(link_section = "bloom_petal_manifest"))]
@@ -130,7 +133,11 @@ fn list(relative: &str) -> DispatchResponse {
         (Some("trade"), 3) if segs[2] == "receipts" => {
             store_ids(&format!("trade/{}/receipts/", segs[1]), "/receipt.json")
         }
-        (Some("trade"), 4) if segs[2] == "drafts" => strings(&DRAFT_FILES),
+        (Some("trade"), 4) if segs[2] == "drafts" => {
+            let mut out = strings(&DRAFT_FILES);
+            out.extend(strings(&DRAFT_WRITABLE_FILES));
+            out
+        }
         (Some("trade"), 4) if segs[2] == "receipts" => vec!["receipt.json".into()],
         _ => Vec::new(),
     };
@@ -176,6 +183,9 @@ fn write(relative: &str, body: &[u8]) -> DispatchResponse {
     match (segs.first().copied(), segs.len()) {
         (Some("onboard"), 3) if segs[2] == "begin" => write_onboard_begin(segs[1]),
         (Some("trade"), 3) if segs[2] == "new" => write_trade_new(segs[1], body),
+        (Some("trade"), 5) if segs[2] == "drafts" && segs[4] == "revalidate" => {
+            write_trade_revalidate(segs[1], segs[3], body)
+        }
         (Some("fund"), 3) if segs[2] == "new" => write_fund_new(segs[1], body),
         _ => error(-2, "path is not writable"),
     }
@@ -684,13 +694,14 @@ fn write_trade_new(wallet: &str, body: &[u8]) -> DispatchResponse {
     if let DispatchResponse::Error { .. } = store_put_json(
         &format!("{base}/policy_check.json"),
         &serde_json::json!({
-            "status": "passed",
+            "status": "blocked",
+            "reason": "value-moving posting is disabled until policy, locking, receipt, and sell-preflight parity are ported",
             "active": draft.active,
             "closed": draft.closed,
             "binary_outcomes": draft.binary_outcomes,
             "order_book_enabled": draft.order_book_enabled,
             "size_at_or_above_min": draft.size_micro >= draft.min_order_size_micro,
-            "signing_pending": true
+            "signing_enabled": false
         }),
         false,
     ) {
@@ -919,11 +930,199 @@ fn read_trade(wallet: &str, kind: &str, id: &str, file: &str) -> DispatchRespons
         ("drafts", "order.json" | "policy_check.json" | "quote.json" | "review_intent.json") => {
             read_store(&format!("trade/{wallet}/drafts/{id}/{file}"))
         }
+        ("drafts", "revalidate") => DispatchResponse::Read(TRADE_REVALIDATE_HINT.into()),
         ("receipts", "receipt.json") => {
             read_store(&format!("trade/{wallet}/receipts/{id}/receipt.json"))
         }
         _ => error(-3, "not a trade file"),
     }
+}
+
+fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
+    if let Err(e) = validate_wallet_name(wallet) {
+        return error(-3, e.to_string());
+    }
+    if !is_safe_segment(id) {
+        return error(-3, "invalid draft id");
+    }
+    let req: TradeRevalidateRequest = match serde_json::from_slice(body) {
+        Ok(req) => req,
+        Err(e) => return error(-3, format!("revalidate JSON: {e}")),
+    };
+    if !req.revalidate {
+        return error(-3, "revalidate must be true");
+    }
+    let base = format!("trade/{wallet}/drafts/{id}");
+    let Some(bytes) = store_get(&format!("{base}/order.json")) else {
+        return error(-1, "draft not found");
+    };
+    let mut draft: StoreTradeDraft = match serde_json::from_slice(&bytes) {
+        Ok(draft) => draft,
+        Err(e) => return error(-4, format!("corrupt draft: {e}")),
+    };
+    if draft.wallet != wallet || draft.id != id {
+        return error(-4, "draft identity mismatch");
+    }
+    if draft.status != "review" && draft.status != "revalidated" {
+        return error(
+            -3,
+            format!("draft {id} is '{}' and cannot be revalidated", draft.status),
+        );
+    }
+    if draft.order_type.can_rest() {
+        return error(
+            -3,
+            "posting resting GTC/GTD orders is pending cancel/expiry parity",
+        );
+    }
+    if let Err(resp) = check_geoblock() {
+        return resp;
+    }
+
+    let snapshot = match trade_snapshot(&draft.slug, &draft.outcome) {
+        Ok(snapshot) => snapshot,
+        Err(resp) => return resp,
+    };
+    if snapshot.token_id != draft.token_id {
+        return error(
+            -3,
+            "token id changed between draft and revalidate; refusing",
+        );
+    }
+    if snapshot.market.condition_id != draft.condition_id {
+        return error(
+            -3,
+            "condition id changed between draft and revalidate; refusing",
+        );
+    }
+    if snapshot.neg_risk != draft.neg_risk {
+        return error(
+            -3,
+            "neg-risk changed between draft and revalidate; refusing",
+        );
+    }
+    let amount_input = match draft.side {
+        Side::Buy => draft.amount_micro.max(1),
+        Side::Sell => draft.size_micro,
+    };
+    let limit_micro = match choose_trade_limit(
+        draft.side,
+        draft.marketable,
+        draft.price_bound_micro,
+        draft.limit_price_micro,
+        &snapshot,
+    ) {
+        Ok(limit) => limit,
+        Err(resp) => return resp,
+    };
+    let quote = match build_trade_quote(
+        draft.side,
+        amount_input,
+        limit_micro,
+        &snapshot,
+        draft.order_type,
+    ) {
+        Ok(quote) => quote,
+        Err(resp) => return resp,
+    };
+
+    let owner = match wallet_address(wallet) {
+        Ok(address) => address,
+        Err(resp) => return resp,
+    };
+    let funder = derive_deposit_wallet_address(&owner, POLYGON);
+
+    draft.limit_price_micro = quote.price_micro;
+    draft.size_micro = quote.size_micro;
+    draft.maker_micro = quote.maker_micro;
+    draft.taker_micro = quote.taker_micro;
+    if draft.side == Side::Sell {
+        draft.amount_micro = draft.taker_micro;
+    }
+    draft.tick_micro = snapshot.tick_micro;
+    draft.min_order_size_micro = snapshot.min_size_micro;
+    draft.neg_risk = snapshot.neg_risk;
+    draft.active = snapshot.active;
+    draft.closed = snapshot.closed;
+    draft.order_book_enabled = snapshot.order_book_enabled;
+    draft.binary_outcomes = snapshot.market.is_binary();
+    draft.best_ask_micro = snapshot.best_ask_micro;
+    draft.best_bid_micro = snapshot.best_bid_micro;
+    draft.book_snapshot_secs = now_secs();
+    draft.status = "revalidated".into();
+    if let DispatchResponse::Error { .. } = store_put_json(
+        &format!("{base}/quote.json"),
+        &serde_json::json!({
+            "side": draft.side,
+            "order_type": draft.order_type.as_str(),
+            "marketable": draft.marketable,
+            "amount_micro": draft.amount_micro,
+            "amount": format_micro(draft.amount_micro),
+            "price_bound_micro": draft.price_bound_micro,
+            "price_bound": format_micro(draft.price_bound_micro),
+            "limit_price_micro": draft.limit_price_micro,
+            "limit_price": format_micro(draft.limit_price_micro),
+            "size_micro": draft.size_micro,
+            "size": format_micro(draft.size_micro),
+            "maker_micro": draft.maker_micro,
+            "maker": format_micro(draft.maker_micro),
+            "taker_micro": draft.taker_micro,
+            "taker": format_micro(draft.taker_micro),
+            "tick_micro": draft.tick_micro,
+            "tick": format_micro(draft.tick_micro),
+            "min_order_size_micro": draft.min_order_size_micro,
+            "min_order_size": format_micro(draft.min_order_size_micro),
+            "best_ask_micro": draft.best_ask_micro,
+            "best_bid_micro": draft.best_bid_micro,
+            "status": "revalidated"
+        }),
+        false,
+    ) {
+        return error(-4, "failed to store quote");
+    }
+    if let DispatchResponse::Error { .. } = store_put_json(
+        &format!("{base}/policy_check.json"),
+        &serde_json::json!({
+            "status": "blocked",
+            "reason": "value-moving posting is disabled until policy, locking, receipt, and sell-preflight parity are ported",
+            "active": draft.active,
+            "closed": draft.closed,
+            "binary_outcomes": draft.binary_outcomes,
+            "order_book_enabled": draft.order_book_enabled,
+            "size_at_or_above_min": draft.size_micro >= draft.min_order_size_micro,
+            "signing_enabled": false
+        }),
+        false,
+    ) {
+        return error(-4, "failed to store policy check");
+    }
+    if let DispatchResponse::Error { .. } = store_put_json(
+        &format!("{base}/review_intent.json"),
+        &serde_json::json!({
+            "wallet": wallet,
+            "draft_id": id,
+            "owner": owner.to_checksum(None),
+            "funder": funder.to_checksum(None),
+            "slug": draft.slug,
+            "condition_id": draft.condition_id,
+            "outcome": draft.outcome,
+            "token_id": draft.token_id,
+            "side": draft.side,
+            "order_type": draft.order_type.as_str(),
+            "limit_price": format_micro(draft.limit_price_micro),
+            "size": format_micro(draft.size_micro),
+            "maker": format_micro(draft.maker_micro),
+            "taker": format_micro(draft.taker_micro),
+            "neg_risk": draft.neg_risk,
+            "status": "final_review_staged",
+            "signing_enabled": false,
+            "posting_enabled": false
+        }),
+        false,
+    ) {
+        return error(-4, "failed to store review intent");
+    }
+    store_put_json(&format!("{base}/order.json"), &draft, false)
 }
 
 fn write_fund_new(wallet: &str, body: &[u8]) -> DispatchResponse {
@@ -1326,6 +1525,9 @@ fn path_kind(relative: &str) -> Option<DispatchEntryKind> {
         (Some("trade"), 5) if segs[2] == "drafts" && DRAFT_FILES.contains(&segs[4]) => {
             Some(DispatchEntryKind::File)
         }
+        (Some("trade"), 5) if segs[2] == "drafts" && DRAFT_WRITABLE_FILES.contains(&segs[4]) => {
+            Some(DispatchEntryKind::WritableFile)
+        }
         (Some("trade"), 5) if segs[2] == "receipts" && segs[4] == "receipt.json" => {
             Some(DispatchEntryKind::File)
         }
@@ -1444,6 +1646,11 @@ struct GeoblockStatus {
     country: String,
     #[serde(default)]
     region: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TradeRevalidateRequest {
+    revalidate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1594,6 +1801,10 @@ mod tests {
         assert_eq!(
             path_kind("trade/alice/drafts/0001/plan.md"),
             Some(DispatchEntryKind::File)
+        );
+        assert_eq!(
+            path_kind("trade/alice/drafts/0001/revalidate"),
+            Some(DispatchEntryKind::WritableFile)
         );
         assert_eq!(
             path_kind("trade/alice/receipts/0001/receipt.json"),

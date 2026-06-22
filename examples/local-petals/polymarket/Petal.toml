@@ -91,6 +91,10 @@ path = "trade/*/new"
 write = true
 
 [[endpoint]]
+path = "trade/*/drafts/*/revalidate"
+write = true
+
+[[endpoint]]
 path = "fund/*"
 cache_ttl_ms = 5000
 
