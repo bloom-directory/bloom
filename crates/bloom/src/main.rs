@@ -881,33 +881,48 @@ async fn run(cli: Cli) -> Result<()> {
                             .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
                     }
                 }
+                let onboard_status_path = polymarket_onboard_status_path(&p);
+                let previous_onboard_status = match &onboard_status_path {
+                    Some(status_path) => {
+                        let status_path =
+                            VfsPath::parse(status_path).context("parse status path")?;
+                        d.vfs.read(&status_path).await.ok().and_then(|bytes| {
+                            serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+                        })
+                    }
+                    None => None,
+                };
+
                 d.vfs.write(&p, &body).await.context("vfs write")?;
 
                 // If this is a polymarket `begin` write, the handler spawned a background
                 // task. In in-process mode we must poll until the task reaches a stable
                 // stage, else the process exits and kills the task.
-                let segs = p.segments();
-                if segs.len() == 4
-                    && segs[0] == "polymarket"
-                    && segs[1] == "onboard"
-                    && segs[3] == "begin"
-                {
-                    let wallet_name = segs[2].clone();
+                if let Some(status_path) = onboard_status_path {
+                    let poll_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(240);
+                    let mut saw_post_write_status_change = previous_onboard_status.is_none();
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        let status_path = VfsPath::parse(&format!(
-                            "polymarket/onboard/{wallet_name}/status.json"
-                        ))
-                        .context("parse status path")?;
-                        if let Ok(bytes) = d.vfs.read(&status_path).await
+                        let parsed_status_path =
+                            VfsPath::parse(&status_path).context("parse status path")?;
+                        if let Ok(bytes) = d.vfs.read(&parsed_status_path).await
                             && let Ok(st) = serde_json::from_slice::<serde_json::Value>(&bytes)
                         {
+                            if previous_onboard_status.as_ref() != Some(&st) {
+                                saw_post_write_status_change = true;
+                            }
                             let stage = st["stage"].as_str().unwrap_or("unknown");
                             info!(stage, "polymarket.onboard.stage");
-                            if matches!(stage, "complete" | "fund") || st["last_error"].is_string()
-                            {
+                            let fresh_terminal = stage == "complete"
+                                || (saw_post_write_status_change
+                                    && (stage == "fund" || st["last_error"].is_string()));
+                            if fresh_terminal {
                                 if stage == "fund" {
-                                    let addr = st["deposit_wallet"].as_str().unwrap_or("?");
+                                    let addr = st["deposit_wallet"]
+                                        .as_str()
+                                        .or_else(|| st["deposit_wallet"]["address"].as_str())
+                                        .unwrap_or("?");
                                     println!("fund the EOA: {addr}");
                                     println!(
                                         "send POL (gas) and pUSD to this address on Polygon, then re-run"
@@ -915,6 +930,11 @@ async fn run(cli: Cli) -> Result<()> {
                                 }
                                 break;
                             }
+                        }
+                        if std::time::Instant::now() >= poll_deadline {
+                            anyhow::bail!(
+                                "polymarket onboarding did not report a stable status before timeout; read {status_path} for progress"
+                            );
                         }
                     }
                 }
@@ -1658,13 +1678,19 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                 let meta = d.petals.store().load_meta(&h).context("load meta")?;
                 let n = name_for_hash.get(&h).map(String::as_str).unwrap_or("-");
                 let caps: Vec<&str> = meta.caps.iter().map(|c| c.as_str()).collect();
+                let app = meta
+                    .local_manifest
+                    .as_ref()
+                    .map(|m| format!("  app=apps/{}/", m.provides.mount))
+                    .unwrap_or_default();
                 println!(
-                    "{}  {:<7}  {:>7}  caps=[{}]  name={}",
+                    "{}  {:<7}  {:>7}  caps=[{}]  name={}{}",
                     &meta.hash[..12],
                     meta.mode.as_str(),
                     meta.size,
                     caps.join(","),
-                    n
+                    n,
+                    app
                 );
             }
             Ok(())
@@ -1701,6 +1727,53 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+fn polymarket_onboard_status_path(path: &VfsPath) -> Option<String> {
+    let segs = path.segments();
+    if segs.len() == 4 && segs[0] == "polymarket" && segs[1] == "onboard" && segs[3] == "begin" {
+        let wallet = segs[2].clone();
+        return Some(format!("polymarket/onboard/{wallet}/status.json"));
+    }
+    if segs.len() == 5
+        && segs[0] == "apps"
+        && segs[1] == "polymarket"
+        && segs[2] == "onboard"
+        && segs[4] == "begin"
+    {
+        let wallet = segs[3].clone();
+        return Some(format!("apps/polymarket/onboard/{wallet}/status.json"));
+    }
+    None
+}
+
+#[cfg(test)]
+mod local_petal_cli_tests {
+    use super::*;
+
+    #[test]
+    fn polymarket_onboard_status_path_covers_native_and_apps_mounts() {
+        assert_eq!(
+            polymarket_onboard_status_path(
+                &VfsPath::parse("polymarket/onboard/alice/begin").unwrap()
+            )
+            .as_deref(),
+            Some("polymarket/onboard/alice/status.json")
+        );
+        assert_eq!(
+            polymarket_onboard_status_path(
+                &VfsPath::parse("apps/polymarket/onboard/alice/begin").unwrap()
+            )
+            .as_deref(),
+            Some("apps/polymarket/onboard/alice/status.json")
+        );
+        assert_eq!(
+            polymarket_onboard_status_path(
+                &VfsPath::parse("apps/other/onboard/alice/begin").unwrap()
+            ),
+            None
+        );
     }
 }
 

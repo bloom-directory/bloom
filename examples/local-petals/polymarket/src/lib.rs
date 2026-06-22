@@ -1039,6 +1039,10 @@ fn persist_onboard_status(
                 .map(serde_json::Value::String)
                 .unwrap_or(serde_json::Value::Null),
         );
+        obj.insert(
+            "status_updated_ms".into(),
+            serde_json::Value::String(now_millis().to_string()),
+        );
     }
     if let DispatchResponse::Error { .. } =
         store_put_json(&format!("onboard/{wallet}/status.json"), &status, false)
@@ -1104,7 +1108,12 @@ fn preserve_onboard_metadata(previous: &serde_json::Value, refreshed: &mut serde
     let Some(obj) = refreshed.as_object_mut() else {
         return;
     };
-    for key in ["deploy_tx_id", "approve_tx_id", "relayer_auth"] {
+    for key in [
+        "deploy_tx_id",
+        "approve_tx_id",
+        "relayer_auth",
+        "status_updated_ms",
+    ] {
         if let Some(value) = previous.get(key) {
             obj.insert(key.into(), value.clone());
         }
@@ -3402,11 +3411,7 @@ fn clob_auth_request(
     if !(200..300).contains(&resp.status) {
         return Err(error(
             -4,
-            format!(
-                "CLOB auth error (status {}): {}",
-                resp.status,
-                String::from_utf8_lossy(&resp.body)
-            ),
+            format!("CLOB auth error (status {})", resp.status),
         ));
     }
     let mut creds: Credentials =
@@ -3842,9 +3847,9 @@ fn clob_l2_get_json(
         return Err(error(
             -4,
             format!(
-                "CLOB account error (status {}): {}",
+                "CLOB account error (status {}): response body redacted ({} bytes)",
                 resp.status,
-                String::from_utf8_lossy(&resp.body)
+                resp.body.len()
             ),
         ));
     }
@@ -5136,7 +5141,8 @@ mod tests {
             "approve_tx_id": "tx-a",
             "relayer_auth": "builder_key_auto",
             "in_flight_deadline_ms": "123",
-            "last_error": "old error"
+            "last_error": "old error",
+            "status_updated_ms": "456"
         });
         let mut refreshed = serde_json::json!({
             "stage": "complete",
@@ -5148,6 +5154,7 @@ mod tests {
         assert_eq!(refreshed["deploy_tx_id"], "tx-d");
         assert_eq!(refreshed["approve_tx_id"], "tx-a");
         assert_eq!(refreshed["relayer_auth"], "builder_key_auto");
+        assert_eq!(refreshed["status_updated_ms"], "456");
         assert!(refreshed.get("in_flight_deadline_ms").is_none());
         assert!(refreshed.get("last_error").is_none());
     }

@@ -101,6 +101,18 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     assert_eq!(denied_geo_host.sign_calls.lock().unwrap().len(), 0);
     assert_no_onboard_private_state(&private, &install.hash);
 
+    let clob_auth_error_host = Arc::new(MockHost::fixture_with_clob_auth_error());
+    let clob_auth_error = dispatch_onboard_begin(&runner, clob_auth_error_host.clone()).await;
+    assert!(matches!(
+        clob_auth_error,
+        DispatchResponse::Error { code: -4, message }
+            if message.contains("CLOB auth error (status 500)")
+                && !message.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+                && !message.contains("pass-value")
+    ));
+    assert_eq!(clob_auth_error_host.sign_calls.lock().unwrap().len(), 1);
+    assert_no_onboard_private_state(&private, &install.hash);
+
     let host = Arc::new(MockHost::fixture());
     let router = PetalRouter::new(runner.clone(), host.clone());
 
@@ -298,7 +310,10 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     ));
     let sync_error_status = private.get(&install.hash, status_key).unwrap();
     let sync_error_status_text = String::from_utf8(sync_error_status).unwrap();
-    assert!(sync_error_status_text.contains("CLOB account error (status 500): sync failed"));
+    assert!(
+        sync_error_status_text.contains("CLOB account error (status 500): response body redacted")
+    );
+    assert!(!sync_error_status_text.contains("sync failed"));
     assert!(sync_error_status_text.contains(r#""in_flight_deadline_ms": null"#));
 
     let saved_status = private.get(&install.hash, status_key).unwrap();
@@ -1181,6 +1196,22 @@ impl MockHost {
         let key = "GET https://clob.polymarket.com/balance-allowance/update?asset_type=COLLATERAL&signature_type=3";
         host.statuses.insert(key.into(), 500);
         host.responses.insert(key.into(), b"sync failed".to_vec());
+        host
+    }
+
+    fn fixture_with_clob_auth_error() -> Self {
+        let mut host = Self::fixture();
+        for key in [
+            "POST https://clob.polymarket.com/auth/api-key",
+            "GET https://clob.polymarket.com/auth/derive-api-key",
+        ] {
+            host.statuses.insert(key.into(), 500);
+            host.responses.insert(
+                key.into(),
+                br#"{"error":"echo AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= pass-value"}"#
+                    .to_vec(),
+            );
+        }
         host
     }
 
