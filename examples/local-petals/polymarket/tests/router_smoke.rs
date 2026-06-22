@@ -111,6 +111,40 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         .unwrap();
     assert!(root_entries.iter().any(|entry| entry.name == "markets"));
     assert!(root_entries.iter().any(|entry| entry.name == "trade"));
+    assert!(root_entries.iter().any(|entry| entry.name == "meta"));
+    let parity = router
+        .read(&VfsPath::parse("polymarket/meta/parity.json").unwrap())
+        .await
+        .unwrap();
+    let parity_text = String::from_utf8(parity).unwrap();
+    let parity_json: serde_json::Value = serde_json::from_str(&parity_text).unwrap();
+    assert_eq!(parity_json["kind"], "polymarket_local_petal_parity");
+    assert_eq!(parity_json["graduation_ready"], false);
+    assert!(parity_json["implemented"].as_array().unwrap().len() >= 7);
+    assert!(
+        parity_json["remaining_blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "authoritative_sell_posting")
+    );
+    assert!(
+        parity_json["native_unsupported_or_deferred"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "gtd_orders")
+    );
+    assert!(!parity_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+    assert!(
+        router
+            .write(
+                &VfsPath::parse("polymarket/meta/parity.json").unwrap(),
+                b"{}"
+            )
+            .await
+            .is_err()
+    );
 
     for root in ["positions", "onboard", "account", "fund", "trade"] {
         let entries = router

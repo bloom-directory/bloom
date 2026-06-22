@@ -45,6 +45,10 @@ path = "markets/*/*"
 cache_ttl_ms = 5000
 
 [[endpoint]]
+path = "meta/*"
+cache_ttl_ms = 30000
+
+[[endpoint]]
 path = "search/*"
 cache_ttl_ms = 30000
 

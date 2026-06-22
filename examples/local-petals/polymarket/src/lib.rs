@@ -43,7 +43,7 @@ const CLOB: &str = "https://clob.polymarket.com";
 const POLYMARKET_WEB: &str = "https://polymarket.com";
 const CLOB_AUTH_NONCE: u32 = 0;
 
-const ROOT_DIRS: [&str; 7] = [
+const ROOT_DIRS: [&str; 8] = [
     "markets",
     "search",
     "positions",
@@ -51,7 +51,9 @@ const ROOT_DIRS: [&str; 7] = [
     "account",
     "trade",
     "fund",
+    "meta",
 ];
+const META_FILES: [&str; 1] = ["parity.json"];
 const MARKET_FILES: [&str; 3] = ["market.json", "book.json", "prices.json"];
 const POSITION_FILES: [&str; 3] = ["positions.json", "trades.json", "activity.json"];
 const ONBOARD_FILES: [&str; 3] = ["status.json", "plan.md", "approvals.json"];
@@ -123,6 +125,7 @@ fn list(relative: &str) -> DispatchResponse {
             Err(resp) => return resp,
         },
         (Some("markets"), 2) => strings(&MARKET_FILES),
+        (Some("meta"), 1) => strings(&META_FILES),
         (Some("positions"), 1) => vfs_wallets_or_store(""),
         (Some("positions"), 2) => strings(&POSITION_FILES),
         (Some("onboard"), 1) => vfs_wallets_or_store("onboard/"),
@@ -182,6 +185,7 @@ fn read(relative: &str) -> DispatchResponse {
     let segs = split(relative);
     match (segs.first().copied(), segs.len()) {
         (Some("markets"), 3) => read_market(segs[1], segs[2]),
+        (Some("meta"), 2) => read_meta(segs[1]),
         (Some("search"), 2) => read_search(segs[1]),
         (Some("positions"), 3) => read_positions(segs[1], segs[2]),
         (Some("onboard"), 3) => read_onboard(segs[1], segs[2]),
@@ -213,6 +217,86 @@ fn write(relative: &str, body: &[u8]) -> DispatchResponse {
         }
         (Some("fund"), 3) if segs[2] == "new" => write_fund_new(segs[1], body),
         _ => error(-2, "path is not writable"),
+    }
+}
+
+fn read_meta(file: &str) -> DispatchResponse {
+    match file {
+        "parity.json" => read_json_value(&serde_json::json!({
+            "kind": "polymarket_local_petal_parity",
+            "mount": "apps/polymarket",
+            "native_handler": "polymarket",
+            "status": "draft_not_graduated",
+            "graduation_ready": false,
+            "no_on_chain_code_touched_by_local_petal": true,
+            "secret_storage": {
+                "clob_credentials": "private_store_only",
+                "public_vfs_receipts": "redacted_summaries_only"
+            },
+            "implemented": [
+                {
+                    "id": "market_reads",
+                    "surface": ["markets/*/market.json", "markets/*/book.json", "markets/*/prices.json"],
+                    "evidence": "HTTP via manifest allowlisted Gamma/CLOB reads"
+                },
+                {
+                    "id": "positions_and_account_reads",
+                    "surface": ["positions/*/*.json", "account/*/portfolio.json", "account/*/orders.json"],
+                    "evidence": "wallet-resolved Data API and L2 CLOB account reads"
+                },
+                {
+                    "id": "onboarding_credentials",
+                    "surface": ["onboard/*/begin", "onboard/*/status.json", "onboard/*/approvals.json"],
+                    "evidence": "geoblock-gated CLOB auth signature through sign_hash and private credential storage"
+                },
+                {
+                    "id": "buy_posting",
+                    "surface": ["trade/*/drafts/*/revalidate", "trade/*/drafts/*/post"],
+                    "evidence": "final-review-bound POLY_1271 buy posting with private receipt/audit records"
+                },
+                {
+                    "id": "ambiguous_post_reconciliation",
+                    "surface": ["trade/*/drafts/*/post"],
+                    "evidence": "lost POST outcomes reconcile only against strongly matched L2 /data/orders responses"
+                },
+                {
+                    "id": "resting_gtc_cancel",
+                    "surface": ["trade/*/receipts/*/cancel"],
+                    "evidence": "GTC buy posting is paired with exact DELETE /order cancel from private receipt order id"
+                },
+                {
+                    "id": "local_policy_and_daily_cap",
+                    "surface": ["trade/*/drafts/*/policy_check.json"],
+                    "evidence": "wallet policy, receipt-audit parity, and daily exposure checks fail closed"
+                }
+            ],
+            "remaining_blockers": [
+                {
+                    "id": "authoritative_sell_posting",
+                    "status": "blocked",
+                    "reason": "local petal has only Data API and CLOB conditional-balance evidence for sells; posting remains disabled until authoritative chain CTF balance and isApprovedForAll checks are available through an approved host/VFS seam"
+                },
+                {
+                    "id": "graduation_signoff",
+                    "status": "pending",
+                    "reason": "native polymarket/ remains authoritative until a final parity run verifies local apps/polymarket end-to-end behavior, public VFS redaction, and operational migration/coexistence details"
+                }
+            ],
+            "native_unsupported_or_deferred": [
+                {
+                    "id": "gtd_orders",
+                    "status": "not_required_for_native_parity",
+                    "reason": "the current native handler rejects GTD orders; the local petal also rejects GTD pending a future expiry policy"
+                }
+            ],
+            "graduation_requirements": [
+                "all implemented surfaces pass focused and broader validation",
+                "adversarial review has no unresolved findings",
+                "public VFS reads contain no CLOB credential secret or raw signed order body",
+                "remaining blockers are either implemented or explicitly accepted before replacing native polymarket/"
+            ]
+        })),
+        _ => error(-3, "not a meta file"),
     }
 }
 
@@ -3162,6 +3246,8 @@ fn path_kind(relative: &str) -> Option<DispatchEntryKind> {
         (Some("markets"), 1) => Some(DispatchEntryKind::Dir),
         (Some("markets"), 2) => Some(DispatchEntryKind::Dir),
         (Some("markets"), 3) if MARKET_FILES.contains(&segs[2]) => Some(DispatchEntryKind::File),
+        (Some("meta"), 1) => Some(DispatchEntryKind::Dir),
+        (Some("meta"), 2) if META_FILES.contains(&segs[1]) => Some(DispatchEntryKind::File),
         (Some("search"), 1) => Some(DispatchEntryKind::Dir),
         (Some("search"), 2) => Some(DispatchEntryKind::File),
         (Some("positions"), 1) => Some(DispatchEntryKind::Dir),
@@ -3699,6 +3785,8 @@ mod tests {
             path_kind("markets/foo/book.json"),
             Some(DispatchEntryKind::File)
         );
+        assert_eq!(path_kind("meta"), Some(DispatchEntryKind::Dir));
+        assert_eq!(path_kind("meta/parity.json"), Some(DispatchEntryKind::File));
         assert_eq!(
             path_kind("onboard/alice/begin"),
             Some(DispatchEntryKind::WritableFile)
