@@ -29,7 +29,7 @@ paths = ["/book", "/midpoint", "/spread", "/price", "/auth/derive-api-key", "/da
 [[net.allow]]
 host = "clob.polymarket.com"
 methods = ["POST"]
-paths = ["/auth/api-key"]
+paths = ["/auth/api-key", "/order"]
 
 [[endpoint]]
 path = "markets/*"
@@ -92,6 +92,10 @@ write = true
 
 [[endpoint]]
 path = "trade/*/drafts/*/revalidate"
+write = true
+
+[[endpoint]]
+path = "trade/*/drafts/*/post"
 write = true
 
 [[endpoint]]

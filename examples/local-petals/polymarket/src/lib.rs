@@ -8,13 +8,16 @@
 use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use bloom_petal_sdk::{
     DispatchEntry, DispatchEntryKind, DispatchOp, DispatchRequest, DispatchResponse, HostStatus,
     HttpRequest, SdkError, SignRequest,
 };
 use bloom_polymarket::eip712::{clob_auth_signing_hash, derive_deposit_wallet_address};
-use bloom_polymarket::order::{LimitQuote, OrderType, format_micro, parse_micro};
+use bloom_polymarket::order::{
+    LimitQuote, OrderBody, OrderParams, OrderType, SIG_TYPE_POLY_1271, build_order, format_micro,
+    parse_micro, poly1271_digest, wrap_poly1271_signature,
+};
 use bloom_polymarket::signer::{
     POLY_ADDRESS, POLY_NONCE, POLY_SIGNATURE, POLY_TIMESTAMP, l2_headers,
 };
@@ -54,14 +57,15 @@ const POSITION_FILES: [&str; 3] = ["positions.json", "trades.json", "activity.js
 const ONBOARD_FILES: [&str; 3] = ["status.json", "plan.md", "approvals.json"];
 const ACCOUNT_FILES: [&str; 2] = ["portfolio.json", "orders.json"];
 const FUND_FILES: [&str; 3] = ["plan.md", "request.json", "status.json"];
-const DRAFT_FILES: [&str; 5] = [
+const DRAFT_FILES: [&str; 6] = [
     "plan.md",
     "order.json",
     "policy_check.json",
     "quote.json",
     "review_intent.json",
+    "post_attempt.json",
 ];
-const DRAFT_WRITABLE_FILES: [&str; 1] = ["revalidate"];
+const DRAFT_WRITABLE_FILES: [&str; 2] = ["revalidate", "post"];
 
 const BEGIN_HINT: &str =
     "write anything here to mint or derive CLOB credentials with the daemon keystore\n";
@@ -71,7 +75,9 @@ const TRADE_NEW_HINT: &str = r#"write JSON to create a reviewable draft, e.g.
 const FUND_NEW_HINT: &str = r#"write JSON to create a reviewable pUSD funding request, e.g.
 {"target_pusd":"10","max_spend":"100","from_token":"native","slippage_bps":50}
 "#;
-const TRADE_REVALIDATE_HINT: &str = r#"write {"revalidate":true} to revalidate this draft and stage the final review artifact. Signing/posting remains disabled until chain-backed preflight, posting, receipt writing, and cancel/expiry parity are ported.
+const TRADE_REVALIDATE_HINT: &str = r#"write {"revalidate":true} to revalidate this draft and stage the final review artifact. Non-resting buy drafts can then be posted by writing {"post":true} to post; sells remain disabled until authoritative chain CTF balance and approval checks are ported.
+"#;
+const TRADE_POST_HINT: &str = r#"write {"post":true} to sign and post a revalidated non-resting buy draft, then write a private receipt. This performs a value-moving CLOB POST /order.
 "#;
 
 #[cfg_attr(target_family = "wasm", unsafe(link_section = "bloom_petal_manifest"))]
@@ -190,6 +196,9 @@ fn write(relative: &str, body: &[u8]) -> DispatchResponse {
         (Some("trade"), 3) if segs[2] == "new" => write_trade_new(segs[1], body),
         (Some("trade"), 5) if segs[2] == "drafts" && segs[4] == "revalidate" => {
             write_trade_revalidate(segs[1], segs[3], body)
+        }
+        (Some("trade"), 5) if segs[2] == "drafts" && segs[4] == "post" => {
+            write_trade_post(segs[1], segs[3], body)
         }
         (Some("fund"), 3) if segs[2] == "new" => write_fund_new(segs[1], body),
         _ => error(-2, "path is not writable"),
@@ -689,6 +698,10 @@ fn write_trade_new(wallet: &str, body: &[u8]) -> DispatchResponse {
         best_bid_micro: snapshot.best_bid_micro,
         book_snapshot_secs: now_secs(),
         status: "review".into(),
+        salt: None,
+        clob_order_id: None,
+        clob_status: None,
+        last_error: None,
     };
     let policy_check = match trade_policy_check(wallet, &draft) {
         Ok(check) => check,
@@ -936,9 +949,17 @@ fn trade_policy_check(
     } else {
         "passed"
     };
+    let posting_enabled = !deny && draft.side == Side::Buy && !draft.order_type.can_rest();
+    let reason = if draft.side == Side::Sell {
+        "sell posting is disabled until authoritative chain CTF balance and approval checks are ported"
+    } else if draft.order_type.can_rest() {
+        "resting order posting is disabled until cancel/expiry parity is ported"
+    } else {
+        "non-resting buy can be posted after final review by writing to the post endpoint"
+    };
     Ok(serde_json::json!({
         "status": "blocked",
-        "reason": "value-moving posting is disabled until chain-backed preflight, posting, receipt writing, and cancel/expiry parity are ported",
+        "reason": reason,
         "policy_status": policy_status,
         "policy_deny": deny,
         "policy_warn": warn,
@@ -951,8 +972,8 @@ fn trade_policy_check(
         "binary_outcomes": draft.binary_outcomes,
         "order_book_enabled": draft.order_book_enabled,
         "size_at_or_above_min": draft.size_micro >= draft.min_order_size_micro,
-        "signing_enabled": false,
-        "posting_enabled": false
+        "signing_enabled": posting_enabled,
+        "posting_enabled": posting_enabled
     }))
 }
 
@@ -1408,15 +1429,34 @@ fn read_trade(wallet: &str, kind: &str, id: &str, file: &str) -> DispatchRespons
             };
             DispatchResponse::Read(render_trade_plan(&draft).into_bytes())
         }
-        ("drafts", "order.json" | "policy_check.json" | "quote.json" | "review_intent.json") => {
-            read_store(&format!("trade/{wallet}/drafts/{id}/{file}"))
-        }
+        (
+            "drafts",
+            "order.json" | "policy_check.json" | "quote.json" | "review_intent.json"
+            | "post_attempt.json",
+        ) => read_store(&format!("trade/{wallet}/drafts/{id}/{file}")),
         ("drafts", "revalidate") => DispatchResponse::Read(TRADE_REVALIDATE_HINT.into()),
+        ("drafts", "post") => DispatchResponse::Read(TRADE_POST_HINT.into()),
         ("receipts", "receipt.json") => {
             read_store(&format!("trade/{wallet}/receipts/{id}/receipt.json"))
         }
         _ => error(-3, "not a trade file"),
     }
+}
+
+fn load_trade_draft(
+    wallet: &str,
+    id: &str,
+    base: &str,
+) -> Result<StoreTradeDraft, DispatchResponse> {
+    let Some(bytes) = store_get(&format!("{base}/order.json")) else {
+        return Err(error(-1, "draft not found"));
+    };
+    let draft: StoreTradeDraft =
+        serde_json::from_slice(&bytes).map_err(|e| error(-4, format!("corrupt draft: {e}")))?;
+    if draft.wallet != wallet || draft.id != id {
+        return Err(error(-4, "draft identity mismatch"));
+    }
+    Ok(draft)
 }
 
 fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
@@ -1438,16 +1478,10 @@ fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchRespon
         Ok(lock) => lock,
         Err(resp) => return resp,
     };
-    let Some(bytes) = store_get(&format!("{base}/order.json")) else {
-        return error(-1, "draft not found");
-    };
-    let mut draft: StoreTradeDraft = match serde_json::from_slice(&bytes) {
+    let mut draft = match load_trade_draft(wallet, id, &base) {
         Ok(draft) => draft,
-        Err(e) => return error(-4, format!("corrupt draft: {e}")),
+        Err(resp) => return resp,
     };
-    if draft.wallet != wallet || draft.id != id {
-        return error(-4, "draft identity mismatch");
-    }
     if draft.status != "review" && draft.status != "revalidated" {
         return error(
             -3,
@@ -1637,14 +1671,454 @@ fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchRespon
             "policy_status": policy_status,
             "sell_preflight": sell_preflight,
             "status": "final_review_staged",
-            "signing_enabled": false,
-            "posting_enabled": false
+            "signing_enabled": draft.side == Side::Buy,
+            "posting_enabled": draft.side == Side::Buy
         }),
         false,
     ) {
         return error(-4, "failed to store review intent");
     }
     store_put_json(&format!("{base}/order.json"), &draft, false)
+}
+
+fn refresh_trade_post_inputs(
+    wallet: &str,
+    base: &str,
+    draft: &mut StoreTradeDraft,
+    owner: Address,
+) -> Result<serde_json::Value, DispatchResponse> {
+    let snapshot = trade_snapshot(&draft.slug, &draft.outcome)?;
+    if snapshot.token_id != draft.token_id {
+        return Err(error(
+            -3,
+            "token id changed between draft and post; refusing",
+        ));
+    }
+    if snapshot.market.condition_id != draft.condition_id {
+        return Err(error(
+            -3,
+            "condition id changed between draft and post; refusing",
+        ));
+    }
+    if snapshot.neg_risk != draft.neg_risk {
+        return Err(error(
+            -3,
+            "neg-risk changed between draft and post; refusing",
+        ));
+    }
+    let amount_input = match draft.side {
+        Side::Buy => draft.amount_micro.max(1),
+        Side::Sell => draft.size_micro,
+    };
+    let limit_micro = choose_trade_limit(
+        draft.side,
+        draft.marketable,
+        draft.price_bound_micro,
+        draft.limit_price_micro,
+        &snapshot,
+    )?;
+    let quote = build_trade_quote(
+        draft.side,
+        amount_input,
+        limit_micro,
+        &snapshot,
+        draft.order_type,
+    )?;
+    draft.limit_price_micro = quote.price_micro;
+    draft.size_micro = quote.size_micro;
+    draft.maker_micro = quote.maker_micro;
+    draft.taker_micro = quote.taker_micro;
+    if draft.side == Side::Sell {
+        draft.amount_micro = draft.taker_micro;
+    }
+    draft.tick_micro = snapshot.tick_micro;
+    draft.min_order_size_micro = snapshot.min_size_micro;
+    draft.neg_risk = snapshot.neg_risk;
+    draft.active = snapshot.active;
+    draft.closed = snapshot.closed;
+    draft.order_book_enabled = snapshot.order_book_enabled;
+    draft.binary_outcomes = snapshot.market.is_binary();
+    draft.best_ask_micro = snapshot.best_ask_micro;
+    draft.best_bid_micro = snapshot.best_bid_micro;
+    draft.book_snapshot_secs = now_secs();
+    let policy_check = trade_policy_check(wallet, draft)?;
+    let policy_deny = policy_check
+        .get("policy_deny")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    if let DispatchResponse::Error { .. } =
+        store_put_json(&format!("{base}/policy_check.json"), &policy_check, false)
+    {
+        return Err(error(-4, "failed to store policy check"));
+    }
+    if let DispatchResponse::Error { .. } = store_put_json(
+        &format!("{base}/quote.json"),
+        &serde_json::json!({
+            "side": draft.side,
+            "order_type": draft.order_type.as_str(),
+            "marketable": draft.marketable,
+            "amount_micro": draft.amount_micro,
+            "amount": format_micro(draft.amount_micro),
+            "price_bound_micro": draft.price_bound_micro,
+            "price_bound": format_micro(draft.price_bound_micro),
+            "limit_price_micro": draft.limit_price_micro,
+            "limit_price": format_micro(draft.limit_price_micro),
+            "size_micro": draft.size_micro,
+            "size": format_micro(draft.size_micro),
+            "maker_micro": draft.maker_micro,
+            "maker": format_micro(draft.maker_micro),
+            "taker_micro": draft.taker_micro,
+            "taker": format_micro(draft.taker_micro),
+            "tick_micro": draft.tick_micro,
+            "tick": format_micro(draft.tick_micro),
+            "min_order_size_micro": draft.min_order_size_micro,
+            "min_order_size": format_micro(draft.min_order_size_micro),
+            "best_ask_micro": draft.best_ask_micro,
+            "best_bid_micro": draft.best_bid_micro,
+            "status": "post_revalidated"
+        }),
+        false,
+    ) {
+        return Err(error(-4, "failed to store quote"));
+    }
+    if policy_deny {
+        match bloom_petal_sdk::store_del(&format!("{base}/review_intent.json")) {
+            Ok(()) | Err(SdkError::Host(HostStatus::NotFound)) => {}
+            Err(_) => return Err(error(-4, "failed to clear stale review intent")),
+        }
+        draft.status = "policy_denied".into();
+        if let DispatchResponse::Error { .. } =
+            store_put_json(&format!("{base}/order.json"), draft, false)
+        {
+            return Err(error(-4, "failed to store denied draft"));
+        }
+        return Err(error(-3, "Polymarket policy denied; see policy_check.json"));
+    }
+    if draft.side == Side::Sell {
+        let _ = verify_sell_preflight(wallet, owner, &draft.token_id, draft.size_micro)?;
+    }
+    Ok(policy_check)
+}
+
+fn review_intent_matches_draft(
+    review: &serde_json::Value,
+    draft: &StoreTradeDraft,
+    owner: Address,
+    funder: Address,
+    policy_check: &serde_json::Value,
+) -> Result<(), String> {
+    let side = match draft.side {
+        Side::Buy => "BUY",
+        Side::Sell => "SELL",
+    };
+    let policy_status = policy_check
+        .get("policy_status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    for (field, expected) in [
+        ("wallet", draft.wallet.clone()),
+        ("draft_id", draft.id.clone()),
+        ("owner", owner.to_checksum(None)),
+        ("funder", funder.to_checksum(None)),
+        ("slug", draft.slug.clone()),
+        ("condition_id", draft.condition_id.clone()),
+        ("outcome", draft.outcome.clone()),
+        ("token_id", draft.token_id.clone()),
+        ("side", side.to_string()),
+        ("order_type", draft.order_type.as_str().to_string()),
+        ("limit_price", format_micro(draft.limit_price_micro)),
+        ("size", format_micro(draft.size_micro)),
+        ("maker", format_micro(draft.maker_micro)),
+        ("taker", format_micro(draft.taker_micro)),
+        ("policy_status", policy_status.to_string()),
+    ] {
+        if review.get(field).and_then(serde_json::Value::as_str) != Some(expected.as_str()) {
+            return Err(format!(
+                "final review field '{field}' no longer matches live post inputs"
+            ));
+        }
+    }
+    if review.get("neg_risk").and_then(serde_json::Value::as_bool) != Some(draft.neg_risk) {
+        return Err("final review field 'neg_risk' no longer matches live post inputs".into());
+    }
+    Ok(())
+}
+
+fn write_trade_post(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
+    if let Err(e) = validate_wallet_name(wallet) {
+        return error(-3, e.to_string());
+    }
+    if !is_safe_segment(id) {
+        return error(-3, "invalid draft id");
+    }
+    let req: TradePostRequest = match serde_json::from_slice(body) {
+        Ok(req) => req,
+        Err(e) => return error(-3, format!("post JSON: {e}")),
+    };
+    if !req.post {
+        return error(-3, "post must be true");
+    }
+    let base = format!("trade/{wallet}/drafts/{id}");
+    let _lock = match acquire_trade_lock(wallet, id) {
+        Ok(lock) => lock,
+        Err(resp) => return resp,
+    };
+    let mut draft = match load_trade_draft(wallet, id, &base) {
+        Ok(draft) => draft,
+        Err(resp) => return resp,
+    };
+    if draft.status != "revalidated" {
+        return error(
+            -3,
+            format!(
+                "draft {id} is '{}' and cannot be posted; write revalidate first",
+                draft.status
+            ),
+        );
+    }
+    if draft.order_type.can_rest() {
+        return error(
+            -3,
+            "posting resting GTC/GTD orders is pending cancel/expiry parity",
+        );
+    }
+    if draft.side == Side::Sell {
+        return error(
+            -3,
+            "local sell posting requires authoritative chain CTF balance and approval checks",
+        );
+    }
+    if let Err(resp) = check_geoblock() {
+        return resp;
+    }
+    let owner = match wallet_address(wallet) {
+        Ok(address) => address,
+        Err(resp) => return resp,
+    };
+    let funder = derive_deposit_wallet_address(&owner, POLYGON);
+    let policy_check = match refresh_trade_post_inputs(wallet, &base, &mut draft, owner) {
+        Ok(policy_check) => policy_check,
+        Err(resp) => return resp,
+    };
+    let review_intent_bytes =
+        match bloom_petal_sdk::store_get(&format!("{base}/review_intent.json"), MAX_STORE_BYTES) {
+            Ok(bytes) => bytes,
+            Err(SdkError::Host(HostStatus::NotFound)) => {
+                return error(-3, "missing final review intent; write revalidate first");
+            }
+            Err(e) => return sdk_error(e),
+        };
+    let review_intent: serde_json::Value = match serde_json::from_slice(&review_intent_bytes) {
+        Ok(value) => value,
+        Err(e) => return error(-4, format!("corrupt review intent: {e}")),
+    };
+    if review_intent
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        != Some("final_review_staged")
+        || review_intent
+            .get("posting_enabled")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return error(-3, "final review intent does not enable posting");
+    }
+    if let Err(message) =
+        review_intent_matches_draft(&review_intent, &draft, owner, funder, &policy_check)
+    {
+        return error(
+            -3,
+            format!("{message}; write revalidate again before posting"),
+        );
+    }
+    let review_intent_hash = blake3_hex(&review_intent_bytes);
+    let creds = match load_creds(wallet) {
+        Ok(creds) => creds,
+        Err(resp) => return resp,
+    };
+    let token_id = match draft.token_id.parse::<U256>() {
+        Ok(token_id) => token_id,
+        Err(e) => return error(-4, format!("token id parse: {e}")),
+    };
+    let order = build_order(&OrderParams {
+        token_id,
+        maker: funder,
+        quote: LimitQuote {
+            side: draft.side,
+            price_micro: draft.limit_price_micro,
+            size_micro: draft.size_micro,
+            maker_micro: draft.maker_micro,
+            taker_micro: draft.taker_micro,
+        },
+        builder_code: None,
+        signature_type: SIG_TYPE_POLY_1271,
+    });
+    let salt = match u64::try_from(order.salt) {
+        Ok(salt) => salt,
+        Err(_) => return error(-4, "order salt does not fit in u64"),
+    };
+    draft.salt = Some(salt);
+    draft.status = "signing_prepared".into();
+    draft.last_error = None;
+    let digest = poly1271_digest(&order, POLYGON, draft.neg_risk);
+    let digest_hash = blake3_hex(digest.as_slice());
+    if let DispatchResponse::Error { .. } =
+        store_put_json(&format!("{base}/order.json"), &draft, false)
+    {
+        return error(-4, "failed to store signing-prepared draft");
+    }
+    if let DispatchResponse::Error { .. } = store_put_json(
+        &format!("{base}/post_attempt.json"),
+        &serde_json::json!({
+            "wallet": wallet,
+            "draft_id": id,
+            "owner": owner.to_checksum(None),
+            "funder": funder.to_checksum(None),
+            "salt": salt,
+            "review_intent_hash": review_intent_hash.clone(),
+            "poly1271_digest_blake3": digest_hash,
+            "prepared_ms": now_millis(),
+            "status": "signing_prepared"
+        }),
+        false,
+    ) {
+        return error(-4, "failed to store signing-prepared post attempt");
+    }
+    let inner_sig = match bloom_petal_sdk::sign_hash(&SignRequest {
+        wallet: wallet.into(),
+        hash32: digest.into(),
+        purpose: "polymarket.order.poly1271".into(),
+    }) {
+        Ok(sig) if sig.len() == 65 => sig,
+        Ok(sig) => return error(-4, format!("sign_hash returned {} bytes", sig.len())),
+        Err(e) => return sdk_error(e),
+    };
+    let signature = match wrap_poly1271_signature(&order, &inner_sig, POLYGON, draft.neg_risk) {
+        Ok(signature) => signature,
+        Err(e) => return polymarket_error(e),
+    };
+    let order_body = match OrderBody::from_signed(&order, &signature, &creds.key, draft.order_type)
+    {
+        Ok(body) => body,
+        Err(e) => return polymarket_error(e),
+    };
+    let body_str = match serde_json::to_string(&order_body) {
+        Ok(body) => body,
+        Err(e) => return error(-4, format!("order body json: {e}")),
+    };
+    let body_hash = blake3_hex(body_str.as_bytes());
+    if let DispatchResponse::Error { .. } = store_put_json(
+        &format!("{base}/post_attempt.json"),
+        &serde_json::json!({
+            "wallet": wallet,
+            "draft_id": id,
+            "owner": owner.to_checksum(None),
+            "funder": funder.to_checksum(None),
+            "salt": salt,
+            "review_intent_hash": review_intent_hash.clone(),
+            "order_body_blake3": body_hash.clone(),
+            "signed_ms": now_millis(),
+            "status": "signed"
+        }),
+        false,
+    ) {
+        return error(-4, "failed to store post attempt");
+    }
+    draft.status = "signed".into();
+    if let DispatchResponse::Error { .. } =
+        store_put_json(&format!("{base}/order.json"), &draft, false)
+    {
+        return error(-4, "failed to store signed draft");
+    }
+    match clob_l2_post_json(owner, &creds, "/order", &body_str) {
+        Ok(raw_response) => {
+            let status = clob_response_status(&raw_response);
+            let clob_order_id = clob_response_order_id(&raw_response);
+            let filled_size_micro = clob_response_filled_size_micro(&raw_response);
+            let posted_ms = now_millis();
+            let receipt = StoreTradeReceipt {
+                draft_id: id.into(),
+                wallet: wallet.into(),
+                slug: draft.slug.clone(),
+                token_id: draft.token_id.clone(),
+                side: draft.side,
+                order_type: draft.order_type,
+                funder: Some(funder.to_checksum(None)),
+                signature_type: SIG_TYPE_POLY_1271,
+                amount_microusd: draft.amount_micro,
+                limit_price_micro: draft.limit_price_micro,
+                size_micro: draft.size_micro,
+                salt,
+                clob_order_id: clob_order_id.clone(),
+                clob_status: status.clone(),
+                filled_size_micro,
+                raw_response: clob_response_public_summary(
+                    &status,
+                    &clob_order_id,
+                    filled_size_micro,
+                ),
+                review_intent_hash: Some(review_intent_hash),
+                posted_ms,
+            };
+            if let DispatchResponse::Error { .. } = store_trade_receipt(wallet, id, &receipt) {
+                return error(-4, "failed to store receipt");
+            }
+            draft.status = if matches!(status.as_str(), "rejected" | "unmatched") {
+                "rejected".into()
+            } else {
+                "posted".into()
+            };
+            draft.clob_order_id = clob_order_id;
+            draft.clob_status = Some(status);
+            draft.last_error = None;
+            store_put_json(&format!("{base}/order.json"), &draft, false)
+        }
+        Err(resp) => {
+            let posted_ms = now_millis();
+            let receipt = StoreTradeReceipt {
+                draft_id: id.into(),
+                wallet: wallet.into(),
+                slug: draft.slug.clone(),
+                token_id: draft.token_id.clone(),
+                side: draft.side,
+                order_type: draft.order_type,
+                funder: Some(funder.to_checksum(None)),
+                signature_type: SIG_TYPE_POLY_1271,
+                amount_microusd: draft.amount_micro,
+                limit_price_micro: draft.limit_price_micro,
+                size_micro: draft.size_micro,
+                salt,
+                clob_order_id: None,
+                clob_status: "ambiguous".into(),
+                filled_size_micro: None,
+                raw_response: serde_json::json!({
+                    "error": "post outcome unknown after signing",
+                    "body_hash": body_hash
+                }),
+                review_intent_hash: Some(review_intent_hash),
+                posted_ms,
+            };
+            draft.status = "ambiguous".into();
+            draft.clob_status = Some("ambiguous".into());
+            draft.last_error = Some("post outcome unknown after signing".into());
+            if let DispatchResponse::Error { .. } =
+                store_put_json(&format!("{base}/order.json"), &draft, false)
+            {
+                return error(-4, "post outcome ambiguous and failed to store draft state");
+            }
+            if let DispatchResponse::Error { .. } = store_trade_receipt(wallet, id, &receipt) {
+                return error(
+                    -4,
+                    "post outcome ambiguous and failed to persist receipt/audit",
+                );
+            }
+            let _ = resp;
+            error(
+                -4,
+                "CLOB post outcome unknown after signing; ambiguous receipt written",
+            )
+        }
+    }
 }
 
 fn write_fund_new(wallet: &str, body: &[u8]) -> DispatchResponse {
@@ -1823,6 +2297,49 @@ fn clob_l2_get_json(
     serde_json::from_slice(&resp.body).map_err(|e| error(-4, format!("json: {e}")))
 }
 
+fn clob_l2_post_json(
+    owner: Address,
+    creds: &Credentials,
+    path: &str,
+    body: &str,
+) -> Result<serde_json::Value, DispatchResponse> {
+    let timestamp = now_secs();
+    let headers = l2_headers(
+        owner,
+        &creds.key,
+        &creds.passphrase,
+        &creds.secret,
+        timestamp,
+        "POST",
+        path,
+        body,
+    )
+    .map_err(|e| error(-4, e.to_string()))?;
+    let resp = bloom_petal_sdk::http_fetch(
+        &HttpRequest {
+            method: "POST".into(),
+            url: format!("{CLOB}{path}"),
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| (name.into(), value))
+                .collect(),
+            body: body.as_bytes().to_vec(),
+        },
+        MAX_HTTP_BYTES,
+    )
+    .map_err(sdk_error)?;
+    if !(200..300).contains(&resp.status) {
+        return Err(error(
+            -4,
+            format!("CLOB post error (status {})", resp.status),
+        ));
+    }
+    if resp.body.iter().all(|b| b.is_ascii_whitespace()) {
+        return Ok(serde_json::json!({ "status": "posted" }));
+    }
+    serde_json::from_slice(&resp.body).map_err(|e| error(-4, format!("json: {e}")))
+}
+
 fn wallet_address(wallet: &str) -> Result<Address, DispatchResponse> {
     let path = format!("wallets/{wallet}/address");
     let bytes = bloom_petal_sdk::vfs_read(&path, 128).map_err(sdk_error)?;
@@ -1960,6 +2477,94 @@ fn store_put_json<T: Serialize>(key: &str, value: &T, secret: bool) -> DispatchR
         Ok(()) => DispatchResponse::Write,
         Err(e) => sdk_error(e),
     }
+}
+
+fn store_trade_receipt(wallet: &str, id: &str, receipt: &StoreTradeReceipt) -> DispatchResponse {
+    let audit_resp = append_trade_audit(
+        wallet,
+        "receipt_written",
+        serde_json::json!({
+            "draft_id": id,
+            "clob_status": receipt.clob_status,
+            "amount_microusd": receipt.amount_microusd,
+        }),
+    );
+    if let DispatchResponse::Error { .. } = audit_resp {
+        return audit_resp;
+    }
+    store_put_json(
+        &format!("trade/{wallet}/receipts/{id}/receipt.json"),
+        receipt,
+        false,
+    )
+}
+
+fn append_trade_audit(wallet: &str, event: &str, details: serde_json::Value) -> DispatchResponse {
+    let key = format!("trade/{wallet}/audit.jsonl");
+    let mut text = match bloom_petal_sdk::store_get(&key, MAX_STORE_BYTES) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(SdkError::Host(HostStatus::NotFound)) => String::new(),
+        Err(e) => return sdk_error(e),
+    };
+    let line = serde_json::json!({
+        "ts_ms": now_millis(),
+        "event": event,
+        "details": details,
+    });
+    text.push_str(&line.to_string());
+    text.push('\n');
+    match bloom_petal_sdk::store_put(&key, text.as_bytes(), false) {
+        Ok(()) => DispatchResponse::Write,
+        Err(e) => sdk_error(e),
+    }
+}
+
+fn clob_response_status(raw: &serde_json::Value) -> String {
+    raw.get("status")
+        .or_else(|| raw.get("orderStatus"))
+        .or_else(|| raw.get("order_status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("posted")
+        .to_ascii_lowercase()
+}
+
+fn clob_response_order_id(raw: &serde_json::Value) -> Option<String> {
+    raw.get("orderID")
+        .or_else(|| raw.get("orderId"))
+        .or_else(|| raw.get("order_id"))
+        .or_else(|| raw.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn clob_response_filled_size_micro(raw: &serde_json::Value) -> Option<u64> {
+    raw.get("size_matched")
+        .or_else(|| raw.get("matched_size"))
+        .or_else(|| raw.get("filled_size"))
+        .and_then(|value| match value {
+            serde_json::Value::String(s) => parse_micro(s).ok(),
+            serde_json::Value::Number(n) => n
+                .as_f64()
+                .and_then(|f| parse_api_float_micro(f, "filled_size").ok()),
+            _ => None,
+        })
+}
+
+fn clob_response_public_summary(
+    status: &str,
+    order_id: &Option<String>,
+    filled_size_micro: Option<u64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": status,
+        "order_id": order_id,
+        "filled_size_micro": filled_size_micro,
+        "response_redacted": true
+    })
+}
+
+fn blake3_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
 }
 
 fn store_wallets(prefix: &str) -> Vec<String> {
@@ -2388,6 +2993,11 @@ struct TradeRevalidateRequest {
     revalidate: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct TradePostRequest {
+    post: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoreTradeDraft {
     id: String,
@@ -2418,6 +3028,14 @@ struct StoreTradeDraft {
     best_bid_micro: Option<u64>,
     book_snapshot_secs: u64,
     status: String,
+    #[serde(default)]
+    salt: Option<u64>,
+    #[serde(default)]
+    clob_order_id: Option<String>,
+    #[serde(default)]
+    clob_status: Option<String>,
+    #[serde(default)]
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2425,6 +3043,28 @@ struct StoreTradeReceiptPolicy {
     side: Side,
     amount_microusd: u64,
     clob_status: String,
+    posted_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StoreTradeReceipt {
+    draft_id: String,
+    wallet: String,
+    slug: String,
+    token_id: String,
+    side: Side,
+    order_type: OrderType,
+    funder: Option<String>,
+    signature_type: u8,
+    amount_microusd: u64,
+    limit_price_micro: u64,
+    size_micro: u64,
+    salt: u64,
+    clob_order_id: Option<String>,
+    clob_status: String,
+    filled_size_micro: Option<u64>,
+    raw_response: serde_json::Value,
+    review_intent_hash: Option<String>,
     posted_ms: u128,
 }
 

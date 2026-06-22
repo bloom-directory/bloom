@@ -2404,6 +2404,7 @@ version = "0.1.0"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
+ "blake3",
  "bloom-petal-manifest",
  "bloom-petal-sdk",
  "bloom-petals",

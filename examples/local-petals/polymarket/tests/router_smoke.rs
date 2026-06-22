@@ -244,7 +244,7 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         .unwrap();
     let final_review_text = String::from_utf8(final_review).unwrap();
     assert!(final_review_text.contains("final_review_staged"));
-    assert!(final_review_text.contains(r#""posting_enabled": false"#));
+    assert!(final_review_text.contains(r#""posting_enabled": true"#));
     assert_eq!(host.sign_calls.lock().unwrap().len(), 1);
 
     let stale_denied_host = Arc::new(MockHost::fixture_with_policy(b""));
@@ -479,6 +479,57 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         Err(HostError::NotFound(_))
     ));
 
+    private
+        .del(&install.hash, "trade/alice/audit.jsonl")
+        .unwrap();
+    router
+        .write(
+            &VfsPath::parse("polymarket/trade/alice/new").unwrap(),
+            br#"{"slug":"test-market","outcome":"yes","amount":"1","max_price":"0.10"}"#,
+        )
+        .await
+        .unwrap();
+    let post_revalidated =
+        dispatch_trade_revalidate(&runner, Arc::new(MockHost::fixture()), "0007").await;
+    assert!(matches!(post_revalidated, DispatchResponse::Write));
+    let post_hint = router
+        .read(&VfsPath::parse("polymarket/trade/alice/drafts/0007/post").unwrap())
+        .await
+        .unwrap();
+    assert!(String::from_utf8(post_hint).unwrap().contains("post"));
+    let posted = dispatch_trade_post(&runner, host.clone(), "0007").await;
+    assert!(matches!(posted, DispatchResponse::Write));
+    let posted_order = private
+        .get(&install.hash, "trade/alice/drafts/0007/order.json")
+        .unwrap();
+    let posted_order_text = String::from_utf8(posted_order).unwrap();
+    assert!(posted_order_text.contains(r#""status": "posted""#));
+    assert!(posted_order_text.contains(r#""clob_order_id": "order-post-1""#));
+    let post_attempt = private
+        .get(&install.hash, "trade/alice/drafts/0007/post_attempt.json")
+        .unwrap();
+    let post_attempt_text = String::from_utf8(post_attempt).unwrap();
+    assert!(post_attempt_text.contains("order_body_blake3"));
+    assert!(!post_attempt_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+    let receipt = private
+        .get(&install.hash, "trade/alice/receipts/0007/receipt.json")
+        .unwrap();
+    let receipt_text = String::from_utf8(receipt).unwrap();
+    assert!(receipt_text.contains(r#""clob_status": "matched""#));
+    assert!(receipt_text.contains(r#""clob_order_id": "order-post-1""#));
+    assert!(receipt_text.contains("response_redacted"));
+    assert!(!receipt_text.contains("0xechoed-signature"));
+    assert!(!receipt_text.contains("requestBody"));
+    assert!(!receipt_text.contains("accepted signature"));
+    assert!(!receipt_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+    let audit = private
+        .get(&install.hash, "trade/alice/audit.jsonl")
+        .unwrap();
+    let audit_text = String::from_utf8(audit).unwrap();
+    assert!(audit_text.contains("receipt_written"));
+    assert!(audit_text.contains("0007"));
+    assert_eq!(host.sign_calls.lock().unwrap().len(), 2);
+
     let draft = private
         .get(&install.hash, "trade/alice/drafts/0001/order.json")
         .unwrap();
@@ -530,7 +581,7 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
             .any(|(_, url)| url == "https://polymarket.com/api/geoblock")
     );
     assert!(
-        !http_calls
+        http_calls
             .iter()
             .any(|(method, url)| method == "POST" && url == "https://clob.polymarket.com/order")
     );
@@ -577,6 +628,29 @@ async fn dispatch_trade_revalidate(
                 op: DispatchOp::Write,
                 path: format!("trade/alice/drafts/{id}/revalidate"),
                 body: br#"{"revalidate":true}"#.to_vec(),
+                ctx: Vec::new(),
+            },
+            host,
+            None,
+            RunOptions::default(),
+        )
+        .await
+        .unwrap()
+        .response
+}
+
+async fn dispatch_trade_post(
+    runner: &PetalRunner,
+    host: Arc<MockHost>,
+    id: &str,
+) -> DispatchResponse {
+    runner
+        .dispatch_mount(
+            "polymarket",
+            DispatchRequest {
+                op: DispatchOp::Write,
+                path: format!("trade/alice/drafts/{id}/post"),
+                body: br#"{"post":true}"#.to_vec(),
                 ctx: Vec::new(),
             },
             host,
@@ -733,6 +807,10 @@ max_price = "0.20"
         host.responses.insert(
             "POST https://clob.polymarket.com/auth/api-key".into(),
             br#"{"apiKey":"api-key","secret":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","passphrase":"pass-value"}"#.to_vec(),
+        );
+        host.responses.insert(
+            "POST https://clob.polymarket.com/order".into(),
+            br#"{"status":"matched","orderID":"order-post-1","size_matched":"11.11","requestBody":{"signature":"0xechoed-signature"},"payload":"accepted signature 0xechoed-signature"}"#.to_vec(),
         );
         host.responses.insert(
             "GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=3".into(),

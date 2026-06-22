@@ -14,6 +14,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 alloy = { version = "2", default-features = false, features = ["dyn-abi", "k256", "signer-local", "sol-types", "std"] }
+blake3 = { workspace = true }
 bloom-polymarket = { path = "../../../crates/bloom-polymarket", default-features = false }
 bloom-petal-sdk = { workspace = true }
 hex = { workspace = true }
