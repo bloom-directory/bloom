@@ -17,6 +17,11 @@ methods = ["GET"]
 paths = ["/positions*", "/trades*", "/activity*"]
 
 [[net.allow]]
+host = "polymarket.com"
+methods = ["GET"]
+paths = ["/api/geoblock"]
+
+[[net.allow]]
 host = "clob.polymarket.com"
 methods = ["GET"]
 paths = ["/book", "/midpoint", "/spread", "/price", "/auth/derive-api-key", "/data/orders", "/balance-allowance"]

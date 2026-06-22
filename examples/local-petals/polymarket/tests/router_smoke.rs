@@ -5,9 +5,12 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bloom_petal_manifest::extract_local_petal_manifest;
-use bloom_petals::abi::{HttpRequest, HttpResponse, SignRequest};
+use bloom_petals::abi::{
+    DispatchOp, DispatchRequest, DispatchResponse, HttpRequest, HttpResponse, SignRequest,
+};
 use bloom_petals::{
     HostError, NameRegistry, PetalHost, PetalMode, PetalRouter, PetalRunner, PetalStore, PetalVm,
+    RunOptions,
 };
 use bloom_petals::{NetPolicy, private_store::PrivateStore};
 use bloom_vfs::Handler;
@@ -52,7 +55,7 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
             .collect::<Vec<_>>(),
         vec!["vfs.read", "net.fetch", "sign", "store"]
     );
-    assert_eq!(manifest.net.as_ref().unwrap().allow.len(), 4);
+    assert_eq!(manifest.net.as_ref().unwrap().allow.len(), 5);
 
     let tmp = tempfile::tempdir().unwrap();
     let store = PetalStore::open(tmp.path().join("store")).unwrap();
@@ -61,6 +64,39 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     let (install, _) = runner
         .install(&wasm, None, &BTreeSet::new(), PetalMode::Local)
         .unwrap();
+    let private = PrivateStore::open(tmp.path().join("data")).unwrap();
+
+    let blocked_host = Arc::new(MockHost::fixture_with_geoblock_body(
+        br#"{"blocked":true,"country":"XX","region":"YY"}"#,
+    ));
+    let blocked = dispatch_onboard_begin(&runner, blocked_host.clone()).await;
+    assert!(matches!(
+        blocked,
+        DispatchResponse::Error { code: -3, message } if message.contains("country=XX")
+    ));
+    assert_eq!(blocked_host.sign_calls.lock().unwrap().len(), 0);
+    assert_no_onboard_private_state(&private, &install.hash);
+
+    let invalid_geo_host = Arc::new(MockHost::fixture_with_geoblock_body(b"<html>nope</html>"));
+    let invalid_geo = dispatch_onboard_begin(&runner, invalid_geo_host.clone()).await;
+    assert!(matches!(
+        invalid_geo,
+        DispatchResponse::Error { code: -3, message } if message.contains("could not verify region availability")
+    ));
+    assert_eq!(invalid_geo_host.sign_calls.lock().unwrap().len(), 0);
+    assert_no_onboard_private_state(&private, &install.hash);
+
+    let denied_geo_host = Arc::new(MockHost::fixture_with_geoblock_response(
+        br#"{"blocked":false}"#,
+        403,
+    ));
+    let denied_geo = dispatch_onboard_begin(&runner, denied_geo_host.clone()).await;
+    assert!(matches!(
+        denied_geo,
+        DispatchResponse::Error { code: -3, message } if message.contains("geoblock status 403")
+    ));
+    assert_eq!(denied_geo_host.sign_calls.lock().unwrap().len(), 0);
+    assert_no_onboard_private_state(&private, &install.hash);
 
     let host = Arc::new(MockHost::fixture());
     let router = PetalRouter::new(runner.clone(), host.clone());
@@ -138,8 +174,8 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     let approvals: serde_json::Value = serde_json::from_slice(&approvals).unwrap();
     assert_eq!(approvals["deposit_wallet_fundable"], false);
     assert_eq!(approvals["calls"].as_array().unwrap().len(), 8);
+    assert_eq!(host.sign_calls.lock().unwrap().len(), 1);
 
-    let private = PrivateStore::open(tmp.path().join("data")).unwrap();
     let status_key = "onboard/alice/status.json";
     let saved_status = private.get(&install.hash, status_key).unwrap();
     private
@@ -219,7 +255,13 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
                 "read wallets/alice/address" | "read wallets/0xalice/address"
             ))
     );
-    assert_eq!(host.sign_calls.lock().unwrap().len(), 1);
+    assert!(
+        host.http_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, url)| url == "https://polymarket.com/api/geoblock")
+    );
     assert!(
         router
             .write(
@@ -231,9 +273,46 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     );
 }
 
+async fn dispatch_onboard_begin(runner: &PetalRunner, host: Arc<MockHost>) -> DispatchResponse {
+    runner
+        .dispatch_mount(
+            "polymarket",
+            DispatchRequest {
+                op: DispatchOp::Write,
+                path: "onboard/alice/begin".into(),
+                body: b"go".to_vec(),
+                ctx: Vec::new(),
+            },
+            host,
+            None,
+            RunOptions::default(),
+        )
+        .await
+        .unwrap()
+        .response
+}
+
+fn assert_no_onboard_private_state(private: &PrivateStore, hash: &str) {
+    assert!(
+        matches!(
+            private.get(hash, "creds/alice/clob.json"),
+            Err(HostError::NotFound(_))
+        ),
+        "blocked geoblock must not write CLOB credentials"
+    );
+    assert!(
+        matches!(
+            private.get(hash, "onboard/alice/status.json"),
+            Err(HostError::NotFound(_))
+        ),
+        "blocked geoblock must not write onboarding status"
+    );
+}
+
 #[derive(Default)]
 struct MockHost {
     responses: BTreeMap<String, Vec<u8>>,
+    statuses: BTreeMap<String, u16>,
     http_calls: Mutex<Vec<(String, String)>>,
     vfs_calls: Mutex<Vec<String>>,
     sign_calls: Mutex<Vec<SignRequest>>,
@@ -241,6 +320,16 @@ struct MockHost {
 
 impl MockHost {
     fn fixture() -> Self {
+        Self::fixture_with_geoblock_body(
+            br#"{"blocked":false,"ip":"1.2.3.4","country":"AR","region":"X"}"#,
+        )
+    }
+
+    fn fixture_with_geoblock_body(geoblock_body: &[u8]) -> Self {
+        Self::fixture_with_geoblock_response(geoblock_body, 200)
+    }
+
+    fn fixture_with_geoblock_response(geoblock_body: &[u8], geoblock_status: u16) -> Self {
         let mut host = Self::default();
         host.responses.insert(
             "GET https://gamma-api.polymarket.com/markets?closed=false&limit=20&order=volumeNum&ascending=false".into(),
@@ -257,6 +346,14 @@ impl MockHost {
         host.responses.insert(
             "GET https://data-api.polymarket.com/positions?user=0x0000000000000000000000000000000000000001".into(),
             br#"[{"title":"Alias Position","asset":"222","conditionId":"cond","outcome":"No"}]"#.to_vec(),
+        );
+        host.responses.insert(
+            "GET https://polymarket.com/api/geoblock".into(),
+            geoblock_body.to_vec(),
+        );
+        host.statuses.insert(
+            "GET https://polymarket.com/api/geoblock".into(),
+            geoblock_status,
         );
         host.responses.insert(
             "GET https://clob.polymarket.com/book?token_id=111".into(),
@@ -334,9 +431,10 @@ impl PetalHost for MockHost {
             .get(&key)
             .cloned()
             .ok_or_else(|| HostError::NotFound(key.clone()))?;
+        let status = self.statuses.get(&key).copied().unwrap_or(200);
         assert!(body.len() <= max_response_bytes);
         Ok(HttpResponse {
-            status: 200,
+            status,
             headers: Vec::new(),
             body,
         })

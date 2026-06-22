@@ -32,6 +32,7 @@ const MARKETS_LIST_LIMIT: u32 = 20;
 const GAMMA: &str = "https://gamma-api.polymarket.com";
 const DATA: &str = "https://data-api.polymarket.com";
 const CLOB: &str = "https://clob.polymarket.com";
+const POLYMARKET_WEB: &str = "https://polymarket.com";
 const CLOB_AUTH_NONCE: u32 = 0;
 
 const ROOT_DIRS: [&str; 7] = [
@@ -375,6 +376,9 @@ fn write_onboard_begin(wallet: &str) -> DispatchResponse {
         Ok(address) => address,
         Err(resp) => return resp,
     };
+    if let Err(resp) = check_geoblock() {
+        return resp;
+    }
     let timestamp = now_secs();
     let hash = clob_auth_signing_hash(owner, timestamp, CLOB_AUTH_NONCE, POLYGON);
     let signature = match bloom_petal_sdk::sign_hash(&SignRequest {
@@ -416,6 +420,52 @@ fn write_onboard_begin(wallet: &str) -> DispatchResponse {
         "CLOB credentials stored in the private petal store; approval/funding stages pending",
     );
     store_put_json(&format!("onboard/{wallet}/status.json"), &status, false)
+}
+
+fn check_geoblock() -> Result<(), DispatchResponse> {
+    let resp = bloom_petal_sdk::http_fetch(
+        &HttpRequest {
+            method: "GET".into(),
+            url: format!("{POLYMARKET_WEB}/api/geoblock"),
+            headers: Vec::new(),
+            body: Vec::new(),
+        },
+        MAX_HTTP_BYTES,
+    )
+    .map_err(|e| {
+        error(
+            -3,
+            format!(
+                "could not verify region availability (geoblock check failed: {}); refusing",
+                e.message()
+            ),
+        )
+    })?;
+    if !(200..300).contains(&resp.status) {
+        return Err(error(
+            -3,
+            format!(
+                "could not verify region availability (geoblock status {}); refusing",
+                resp.status
+            ),
+        ));
+    }
+    let status: GeoblockStatus = serde_json::from_slice(&resp.body).map_err(|e| {
+        error(
+            -3,
+            format!("could not verify region availability (geoblock JSON: {e}); refusing"),
+        )
+    })?;
+    if status.blocked {
+        return Err(error(
+            -3,
+            format!(
+                "Polymarket is unavailable in your region (country={}, region={}); refusing to onboard",
+                status.country, status.region
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn local_onboard_status(
@@ -1384,6 +1434,16 @@ struct TradeNewRequest {
     limit_price: Option<String>,
     #[serde(default)]
     order_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GeoblockStatus {
+    #[serde(default)]
+    blocked: bool,
+    #[serde(default)]
+    country: String,
+    #[serde(default)]
+    region: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
