@@ -13,12 +13,11 @@ use bloom_petal_sdk::{
     HttpRequest, SdkError, SignRequest,
 };
 use bloom_polymarket::eip712::{clob_auth_signing_hash, derive_deposit_wallet_address};
-use bloom_polymarket::order::{
-    LimitQuote, OrderType, format_micro, parse_micro, quantize_marketable_limit, quantize_price,
-};
+use bloom_polymarket::order::{LimitQuote, OrderType, format_micro, parse_micro};
 use bloom_polymarket::signer::{
     POLY_ADDRESS, POLY_NONCE, POLY_SIGNATURE, POLY_TIMESTAMP, l2_headers,
 };
+use bloom_polymarket::trade as shared_trade;
 use bloom_polymarket::types::{Market, Side};
 use bloom_polymarket::wallet::{V2_APPROVAL_LABELS, v2_approval_calls};
 use bloom_polymarket::{Credentials, OrderBook, POLYGON, Position, Trade, validate_wallet_name};
@@ -759,58 +758,14 @@ fn choose_trade_limit(
     pinned_limit_micro: u64,
     snapshot: &TradeSnapshot,
 ) -> Result<u64, DispatchResponse> {
-    if !marketable {
-        return Ok(quantize_price(
-            pinned_limit_micro,
-            snapshot.tick_micro,
-            side,
-        ));
-    }
-    match side {
-        Side::Buy => {
-            let Some(ask) = snapshot.best_ask_micro else {
-                return Err(error(-3, "order book has no asks"));
-            };
-            if ask > bound_micro {
-                return Err(error(
-                    -3,
-                    format!(
-                        "best ask {} exceeds max price {}",
-                        format_micro(ask),
-                        format_micro(bound_micro)
-                    ),
-                ));
-            }
-            Ok(quantize_marketable_limit(ask, snapshot.tick_micro, side))
-        }
-        Side::Sell => {
-            let Some(bid) = snapshot.best_bid_micro else {
-                return Err(error(-3, "order book has no bids"));
-            };
-            if bid < bound_micro {
-                return Err(error(
-                    -3,
-                    format!(
-                        "best bid {} is below min price {}",
-                        format_micro(bid),
-                        format_micro(bound_micro)
-                    ),
-                ));
-            }
-            let limit = quantize_marketable_limit(bid, snapshot.tick_micro, side);
-            if limit < bound_micro {
-                return Err(error(
-                    -3,
-                    format!(
-                        "tick quantization gives {} below min price {}",
-                        format_micro(limit),
-                        format_micro(bound_micro)
-                    ),
-                ));
-            }
-            Ok(limit)
-        }
-    }
+    shared_trade::choose_limit(
+        side,
+        marketable,
+        bound_micro,
+        pinned_limit_micro,
+        &snapshot.as_shared(),
+    )
+    .map_err(polymarket_error)
 }
 
 fn build_trade_quote(
@@ -820,30 +775,14 @@ fn build_trade_quote(
     snapshot: &TradeSnapshot,
     order_type: OrderType,
 ) -> Result<LimitQuote, DispatchResponse> {
-    let market_class = matches!(order_type, OrderType::FAK | OrderType::FOK);
-    let quote = match (side, market_class) {
-        (Side::Buy, true) => {
-            LimitQuote::market_buy_from_spend(amount_micro, limit_micro, snapshot.tick_micro)
-        }
-        (Side::Buy, false) => {
-            LimitQuote::buy_from_spend(amount_micro, limit_micro, snapshot.tick_micro)
-        }
-        (Side::Sell, _) => {
-            LimitQuote::sell_from_shares(amount_micro, limit_micro, snapshot.tick_micro)
-        }
-    }
-    .map_err(|e| error(-3, e.to_string()))?;
-    if quote.size_micro < snapshot.min_size_micro {
-        return Err(error(
-            -3,
-            format!(
-                "order size {} shares is below market minimum {}",
-                format_micro(quote.size_micro),
-                format_micro(snapshot.min_size_micro)
-            ),
-        ));
-    }
-    Ok(quote)
+    shared_trade::build_quote(
+        side,
+        amount_micro,
+        limit_micro,
+        &snapshot.as_shared(),
+        order_type,
+    )
+    .map_err(polymarket_error)
 }
 
 fn parse_api_float_micro(value: f64, field: &str) -> Result<u64, DispatchResponse> {
@@ -1364,6 +1303,13 @@ fn sdk_error(e: SdkError) -> DispatchResponse {
     }
 }
 
+fn polymarket_error(e: bloom_polymarket::PolymarketError) -> DispatchResponse {
+    match e {
+        bloom_polymarket::PolymarketError::Invalid(message) => error(-3, message),
+        other => error(-4, other.to_string()),
+    }
+}
+
 fn error(code: i32, message: impl Into<String>) -> DispatchResponse {
     DispatchResponse::Error {
         code,
@@ -1433,6 +1379,20 @@ struct TradeSnapshot {
     active: bool,
     closed: bool,
     order_book_enabled: bool,
+}
+
+impl TradeSnapshot {
+    fn as_shared(&self) -> shared_trade::Snapshot {
+        shared_trade::Snapshot {
+            market: self.market.clone(),
+            token_id: self.token_id.clone(),
+            neg_risk: self.neg_risk,
+            tick_micro: self.tick_micro,
+            min_size_micro: self.min_size_micro,
+            best_ask_micro: self.best_ask_micro,
+            best_bid_micro: self.best_bid_micro,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -322,6 +322,7 @@ mod tests {
     /// **UUPS ERC-1967** clones, not BeaconProxy. If this ever fails, the clone
     /// shape changed and `derive_deposit_wallet_address` must be revisited
     /// before any fund-moving use.
+    #[cfg(feature = "native-client")]
     #[tokio::test]
     #[ignore = "hits a live Polygon RPC (set POLYGON_RPC_URL)"]
     async fn factory_beacon_reverts_confirming_uups() {

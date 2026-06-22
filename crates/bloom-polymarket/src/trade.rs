@@ -4,11 +4,15 @@
 //! differed only in error type; this is the single source of truth. It returns
 //! [`PolymarketError`]; each caller maps it (anyhow `?` / VFS `err_be`).
 
+#[cfg(feature = "native-client")]
 use crate::clob::ClobClient;
+#[cfg(feature = "native-client")]
 use crate::gamma::GammaClient;
 use crate::order::{self, LimitQuote, OrderType};
 use crate::order_store::{DraftStatus, OrderDraft};
-use crate::types::{BookLevel, Market, Side};
+#[cfg(feature = "native-client")]
+use crate::types::BookLevel;
+use crate::types::{Market, Side};
 use crate::{PolymarketError, Result};
 
 /// Live market view used at both draft and confirm time.
@@ -26,6 +30,7 @@ pub struct Snapshot {
 /// Fetch and cross-check the live market for `slug`/`outcome`. Refuses anything
 /// that must not be signed against: a non-V2 CLOB, a non-binary market, an
 /// unknown outcome, or a CLOB↔Gamma disagreement on neg-risk / condition id.
+#[cfg(feature = "native-client")]
 pub async fn snapshot(
     gamma: &GammaClient,
     clob: &ClobClient,

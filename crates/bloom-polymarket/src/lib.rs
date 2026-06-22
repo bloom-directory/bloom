@@ -48,7 +48,6 @@ pub mod relayer;
 pub mod signer;
 #[cfg(test)]
 pub(crate) mod testutil;
-#[cfg(feature = "native-client")]
 pub mod trade;
 pub mod types;
 pub mod wallet;
