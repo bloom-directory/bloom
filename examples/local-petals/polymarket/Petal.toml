@@ -1,0 +1,82 @@
+schema = "bloom.petal.local.v1"
+name = "polymarket"
+
+[provides]
+kind = "vfs"
+mount = "polymarket"
+caps = ["vfs.read", "vfs.write"]
+
+[[endpoint]]
+path = "markets/*"
+cache_ttl_ms = 5000
+
+[[endpoint]]
+path = "markets/*/*"
+cache_ttl_ms = 5000
+
+[[endpoint]]
+path = "search/*"
+cache_ttl_ms = 30000
+
+[[endpoint]]
+path = "positions/*"
+cache_ttl_ms = 10000
+
+[[endpoint]]
+path = "positions/*/*"
+cache_ttl_ms = 10000
+
+[[endpoint]]
+path = "onboard/*"
+
+[[endpoint]]
+path = "onboard/*/*"
+
+[[endpoint]]
+path = "onboard/*/begin"
+write = true
+async = true
+
+[[endpoint]]
+path = "account/*"
+cache_ttl_ms = 5000
+
+[[endpoint]]
+path = "account/*/*"
+cache_ttl_ms = 5000
+
+[[endpoint]]
+path = "trade/*"
+cache_ttl_ms = 5000
+
+[[endpoint]]
+path = "trade/*/*"
+cache_ttl_ms = 5000
+
+[[endpoint]]
+path = "trade/*/*/*"
+cache_ttl_ms = 5000
+
+[[endpoint]]
+path = "trade/*/*/*/*"
+cache_ttl_ms = 5000
+
+[[endpoint]]
+path = "trade/*/new"
+write = true
+
+[[endpoint]]
+path = "fund/*"
+cache_ttl_ms = 5000
+
+[[endpoint]]
+path = "fund/*/*"
+cache_ttl_ms = 5000
+
+[[endpoint]]
+path = "fund/*/*/*"
+cache_ttl_ms = 5000
+
+[[endpoint]]
+path = "fund/*/new"
+write = true
