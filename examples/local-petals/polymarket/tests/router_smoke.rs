@@ -4,6 +4,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use alloy::primitives::Address;
 use async_trait::async_trait;
 use bloom_petal_manifest::extract_local_petal_manifest;
 use bloom_petals::abi::{
@@ -14,6 +15,8 @@ use bloom_petals::{
     RunOptions,
 };
 use bloom_petals::{NetPolicy, private_store::PrivateStore};
+use bloom_polymarket::POLYGON;
+use bloom_polymarket::eip712::derive_deposit_wallet_address;
 use bloom_vfs::Handler;
 use bloom_vfs::path::VfsPath;
 
@@ -386,6 +389,50 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     ));
     assert_eq!(neg_risk_drift_host.sign_calls.lock().unwrap().len(), 0);
 
+    router
+        .write(
+            &VfsPath::parse("polymarket/trade/alice/new").unwrap(),
+            br#"{"slug":"test-market","outcome":"yes","side":"sell","amount":"1","min_price":"0.05"}"#,
+        )
+        .await
+        .unwrap();
+    let sell_revalidated =
+        dispatch_trade_revalidate(&runner, Arc::new(MockHost::fixture()), "0005").await;
+    assert!(matches!(sell_revalidated, DispatchResponse::Write));
+    let sell_review = private
+        .get(&install.hash, "trade/alice/drafts/0005/review_intent.json")
+        .unwrap();
+    let sell_review_text = String::from_utf8(sell_review).unwrap();
+    assert!(sell_review_text.contains("final_review_staged"));
+    assert!(sell_review_text.contains("sell_preflight"));
+    assert!(sell_review_text.contains("limited_pass"));
+    assert!(sell_review_text.contains(r#""preflight_complete_for_posting": false"#));
+    assert!(sell_review_text.contains("data_api_and_clob_conditional_balance"));
+    assert!(sell_review_text.contains(r#""posting_enabled": false"#));
+
+    let sell_denied = dispatch_trade_revalidate(
+        &runner,
+        Arc::new(MockHost::fixture_with_deposit_position_size("0.5")),
+        "0005",
+    )
+    .await;
+    assert!(matches!(
+        sell_denied,
+        DispatchResponse::Error { code: -3, message } if message.contains("cannot sell")
+    ));
+    assert!(matches!(
+        private.get(&install.hash, "trade/alice/drafts/0005/review_intent.json"),
+        Err(HostError::NotFound(_))
+    ));
+    let sell_order = private
+        .get(&install.hash, "trade/alice/drafts/0005/order.json")
+        .unwrap();
+    assert!(
+        String::from_utf8(sell_order)
+            .unwrap()
+            .contains(r#""status": "preflight_denied""#)
+    );
+
     let draft = private
         .get(&install.hash, "trade/alice/drafts/0001/order.json")
         .unwrap();
@@ -535,6 +582,19 @@ impl MockHost {
         host
     }
 
+    fn fixture_with_deposit_position_size(size: &str) -> Self {
+        let mut host = Self::fixture();
+        let owner: Address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+            .parse()
+            .unwrap();
+        let deposit = derive_deposit_wallet_address(&owner, POLYGON).to_checksum(None);
+        host.responses.insert(
+            format!("GET https://data-api.polymarket.com/positions?user={deposit}"),
+            format!(r#"[{{"title":"Sell Position","asset":"111","size":{size}}}]"#).into_bytes(),
+        );
+        host
+    }
+
     fn fixture_with_geoblock_body(geoblock_body: &[u8]) -> Self {
         Self::fixture_with_geoblock_response(geoblock_body, 200)
     }
@@ -592,6 +652,14 @@ max_price = "0.20"
             "GET https://data-api.polymarket.com/positions?user=0x0000000000000000000000000000000000000001".into(),
             br#"[{"title":"Alias Position","asset":"222","conditionId":"cond","outcome":"No"}]"#.to_vec(),
         );
+        let owner: Address = "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+            .parse()
+            .unwrap();
+        let deposit = derive_deposit_wallet_address(&owner, POLYGON).to_checksum(None);
+        host.responses.insert(
+            format!("GET https://data-api.polymarket.com/positions?user={deposit}"),
+            br#"[{"title":"Sell Position","asset":"111","size":2.0}]"#.to_vec(),
+        );
         host.responses.insert(
             "GET https://polymarket.com/api/geoblock".into(),
             geoblock_body.to_vec(),
@@ -623,6 +691,10 @@ max_price = "0.20"
         host.responses.insert(
             "GET https://clob.polymarket.com/balance-allowance?asset_type=COLLATERAL&signature_type=3".into(),
             br#"{"balance":"123","allowance":"456"}"#.to_vec(),
+        );
+        host.responses.insert(
+            "GET https://clob.polymarket.com/balance-allowance?asset_type=CONDITIONAL&token_id=111&signature_type=3".into(),
+            br#"{"balance":"2000000","allowance":"2000000"}"#.to_vec(),
         );
         host.responses.insert(
             "GET https://clob.polymarket.com/data/orders".into(),

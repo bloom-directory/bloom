@@ -1043,6 +1043,110 @@ fn audited_receipt_ids_since(wallet: &str, cutoff_ms: u128) -> Result<Vec<String
     Ok(ids)
 }
 
+fn verify_sell_preflight(
+    wallet: &str,
+    owner: Address,
+    token_id: &str,
+    size_micro: u64,
+) -> Result<serde_json::Value, DispatchResponse> {
+    let deposit = derive_deposit_wallet_address(&owner, POLYGON);
+    let deposit_user = deposit.to_checksum(None);
+    let positions = get_json::<Vec<Position>>(&url_with_query(
+        &format!("{DATA}/positions"),
+        &[("user", &deposit_user)],
+    ))?;
+    let held_micro = positions
+        .iter()
+        .find(|position| position.asset == token_id)
+        .and_then(position_size_micro)
+        .unwrap_or(0);
+    if held_micro < size_micro {
+        return Err(error(
+            -3,
+            format!(
+                "cannot sell {} shares: derived deposit wallet {} holds only {}",
+                format_micro(size_micro),
+                deposit.to_checksum(None),
+                format_micro(held_micro)
+            ),
+        ));
+    }
+
+    let creds = load_creds(wallet)?;
+    let clob_balance_allowance = clob_l2_get_json(
+        owner,
+        &creds,
+        "/balance-allowance",
+        &[
+            ("asset_type", "CONDITIONAL"),
+            ("token_id", token_id),
+            ("signature_type", "3"),
+        ],
+    )?;
+    let clob_balance_micro = clob_balance_allowance
+        .get("balance")
+        .and_then(parse_clob_raw_micro)
+        .ok_or_else(|| error(-4, "CLOB conditional balance response missing balance"))?;
+    if clob_balance_micro < size_micro {
+        return Err(error(
+            -3,
+            format!(
+                "cannot sell {} shares: CLOB conditional balance reports only {}",
+                format_micro(size_micro),
+                format_micro(clob_balance_micro)
+            ),
+        ));
+    }
+
+    Ok(serde_json::json!({
+        "status": "limited_pass",
+        "source": "data_api_and_clob_conditional_balance",
+        "preflight_complete_for_posting": false,
+        "chain_ctf_balance_checked": false,
+        "ctf_approval_checked": false,
+        "reason": "authoritative on-chain CTF balance and approval checks are not ported to the local petal; signing/posting remain disabled",
+        "deposit_wallet": deposit.to_checksum(None),
+        "deposit_wallet_source": "local_estimate_unverified",
+        "token_id": token_id,
+        "requested_size_micro": size_micro,
+        "requested_size": format_micro(size_micro),
+        "data_api_holding_micro": held_micro,
+        "data_api_holding": format_micro(held_micro),
+        "clob_balance_micro": clob_balance_micro,
+        "clob_balance": format_micro(clob_balance_micro),
+        "clob_balance_allowance": clob_balance_allowance,
+        "signing_enabled": false,
+        "posting_enabled": false
+    }))
+}
+
+fn position_size_micro(position: &Position) -> Option<u64> {
+    position
+        .size
+        .and_then(|size| parse_json_f64_micro(size).ok())
+}
+
+fn parse_clob_raw_micro(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                Some(u)
+            } else {
+                n.as_f64().and_then(|f| parse_json_f64_micro(f).ok())
+            }
+        }
+        _ => None,
+    }
+}
+
+fn parse_json_f64_micro(value: f64) -> Result<u64, DispatchResponse> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(error(-4, "decimal value is not a non-negative number"));
+    }
+    parse_micro(&format!("{value}")).map_err(|e| error(-4, e.to_string()))
+}
+
 fn evaluate_local_polymarket_order(
     policy: &LocalPolymarketPolicy,
     ctx: &LocalPolymarketOrderCtx,
@@ -1485,6 +1589,26 @@ fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchRespon
         }
         return error(-3, "Polymarket policy denied; see policy_check.json");
     }
+    let sell_preflight = if draft.side == Side::Sell {
+        match verify_sell_preflight(wallet, owner, &draft.token_id, draft.size_micro) {
+            Ok(preflight) => Some(preflight),
+            Err(resp) => {
+                match bloom_petal_sdk::store_del(&format!("{base}/review_intent.json")) {
+                    Ok(()) | Err(SdkError::Host(HostStatus::NotFound)) => {}
+                    Err(_) => return error(-4, "failed to clear stale review intent"),
+                }
+                draft.status = "preflight_denied".into();
+                if let DispatchResponse::Error { .. } =
+                    store_put_json(&format!("{base}/order.json"), &draft, false)
+                {
+                    return error(-4, "failed to store denied draft");
+                }
+                return resp;
+            }
+        }
+    } else {
+        None
+    };
     if let DispatchResponse::Error { .. } = store_put_json(
         &format!("{base}/review_intent.json"),
         &serde_json::json!({
@@ -1504,6 +1628,7 @@ fn write_trade_revalidate(wallet: &str, id: &str, body: &[u8]) -> DispatchRespon
             "taker": format_micro(draft.taker_micro),
             "neg_risk": draft.neg_risk,
             "policy_status": policy_status,
+            "sell_preflight": sell_preflight,
             "status": "final_review_staged",
             "signing_enabled": false,
             "posting_enabled": false
