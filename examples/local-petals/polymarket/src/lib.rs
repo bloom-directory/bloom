@@ -7,14 +7,16 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use bloom_petal_sdk::{
     DispatchEntry, DispatchEntryKind, DispatchOp, DispatchRequest, DispatchResponse, HostStatus,
     HttpRequest, SdkError, SignRequest,
 };
-use bloom_polymarket::eip712::clob_auth_signing_hash;
+use bloom_polymarket::eip712::{clob_auth_signing_hash, derive_deposit_wallet_address};
 use bloom_polymarket::order::{
-    LimitQuote, OrderType, format_micro, parse_micro, quantize_marketable_limit, quantize_price,
+    LimitQuote, OrderBody, OrderParams, OrderType, SIG_TYPE_POLY_1271, build_order, format_micro,
+    parse_micro, poly1271_digest, quantize_marketable_limit, quantize_price,
+    wrap_poly1271_signature,
 };
 use bloom_polymarket::signer::{
     POLY_ADDRESS, POLY_NONCE, POLY_SIGNATURE, POLY_TIMESTAMP, l2_headers,
@@ -55,6 +57,7 @@ const DRAFT_FILES: [&str; 5] = [
     "quote.json",
     "review_intent.json",
 ];
+const DRAFT_WRITABLE_FILES: [&str; 1] = ["confirm"];
 
 const BEGIN_HINT: &str =
     "write anything here to mint or derive CLOB credentials with the daemon keystore\n";
@@ -63,6 +66,8 @@ const TRADE_NEW_HINT: &str = r#"write JSON to create a reviewable draft, e.g.
 "#;
 const FUND_NEW_HINT: &str = r#"write JSON to create a reviewable pUSD funding request, e.g.
 {"target_pusd":"10","max_spend":"100","from_token":"native","slippage_bps":50}
+"#;
+const TRADE_CONFIRM_HINT: &str = r#"write {"confirm":true} to sign and post this FAK/FOK order draft
 "#;
 
 #[cfg_attr(target_family = "wasm", unsafe(link_section = "bloom_petal_manifest"))]
@@ -129,7 +134,11 @@ fn list(relative: &str) -> DispatchResponse {
         (Some("trade"), 3) if segs[2] == "receipts" => {
             store_ids(&format!("trade/{}/receipts/", segs[1]), "/receipt.json")
         }
-        (Some("trade"), 4) if segs[2] == "drafts" => strings(&DRAFT_FILES),
+        (Some("trade"), 4) if segs[2] == "drafts" => {
+            let mut out = strings(&DRAFT_FILES);
+            out.extend(strings(&DRAFT_WRITABLE_FILES));
+            out
+        }
         (Some("trade"), 4) if segs[2] == "receipts" => vec!["receipt.json".into()],
         _ => Vec::new(),
     };
@@ -175,6 +184,9 @@ fn write(relative: &str, body: &[u8]) -> DispatchResponse {
     match (segs.first().copied(), segs.len()) {
         (Some("onboard"), 3) if segs[2] == "begin" => write_onboard_begin(segs[1]),
         (Some("trade"), 3) if segs[2] == "new" => write_trade_new(segs[1], body),
+        (Some("trade"), 5) if segs[2] == "drafts" && segs[4] == "confirm" => {
+            write_trade_confirm(segs[1], segs[3], body)
+        }
         (Some("fund"), 3) if segs[2] == "new" => write_fund_new(segs[1], body),
         _ => error(-2, "path is not writable"),
     }
@@ -805,10 +817,172 @@ fn read_trade(wallet: &str, kind: &str, id: &str, file: &str) -> DispatchRespons
         ("drafts", "order.json" | "policy_check.json" | "quote.json" | "review_intent.json") => {
             read_store(&format!("trade/{wallet}/drafts/{id}/{file}"))
         }
+        ("drafts", "confirm") => DispatchResponse::Read(TRADE_CONFIRM_HINT.into()),
         ("receipts", "receipt.json") => {
             read_store(&format!("trade/{wallet}/receipts/{id}/receipt.json"))
         }
         _ => error(-3, "not a trade file"),
+    }
+}
+
+fn write_trade_confirm(wallet: &str, id: &str, body: &[u8]) -> DispatchResponse {
+    if let Err(e) = validate_wallet_name(wallet) {
+        return error(-3, e.to_string());
+    }
+    if !is_safe_segment(id) {
+        return error(-3, "invalid draft id");
+    }
+    let req: TradeConfirmRequest = match serde_json::from_slice(body) {
+        Ok(req) => req,
+        Err(e) => return error(-3, format!("confirm JSON: {e}")),
+    };
+    if !req.confirm {
+        return error(-3, "confirm must be true");
+    }
+    let base = format!("trade/{wallet}/drafts/{id}");
+    let Some(bytes) = store_get(&format!("{base}/order.json")) else {
+        return error(-1, "draft not found");
+    };
+    let mut draft: StoreTradeDraft = match serde_json::from_slice(&bytes) {
+        Ok(draft) => draft,
+        Err(e) => return error(-4, format!("corrupt draft: {e}")),
+    };
+    if draft.wallet != wallet || draft.id != id {
+        return error(-4, "draft identity mismatch");
+    }
+    if draft.status != "review" {
+        return error(
+            -3,
+            format!("draft {id} is '{}' and cannot be confirmed", draft.status),
+        );
+    }
+    if draft.order_type.can_rest() {
+        return error(
+            -3,
+            "posting resting GTC/GTD orders is pending cancel/expiry parity",
+        );
+    }
+    let creds = match load_creds(wallet) {
+        Ok(creds) => creds,
+        Err(resp) => return resp,
+    };
+    let owner = match wallet_address(wallet) {
+        Ok(address) => address,
+        Err(resp) => return resp,
+    };
+    let funder = derive_deposit_wallet_address(&owner, POLYGON);
+    let quote = LimitQuote {
+        side: draft.side,
+        price_micro: draft.limit_price_micro,
+        size_micro: draft.size_micro,
+        maker_micro: draft.maker_micro,
+        taker_micro: draft.taker_micro,
+    };
+    let token_id = match draft.token_id.parse::<U256>() {
+        Ok(token_id) => token_id,
+        Err(e) => return error(-4, format!("token id parse: {e}")),
+    };
+    let order = build_order(&OrderParams {
+        token_id,
+        maker: funder,
+        quote,
+        builder_code: None,
+        signature_type: SIG_TYPE_POLY_1271,
+    });
+    let salt: u64 = match order.salt.try_into() {
+        Ok(salt) => salt,
+        Err(_) => return error(-4, "order salt does not fit in u64"),
+    };
+    let digest = poly1271_digest(&order, POLYGON, draft.neg_risk);
+    let inner = match bloom_petal_sdk::sign_hash(&SignRequest {
+        wallet: wallet.into(),
+        hash32: digest.into(),
+        purpose: "polymarket.order.poly1271".into(),
+    }) {
+        Ok(sig) if sig.len() == 65 => sig,
+        Ok(sig) => return error(-4, format!("sign_hash returned {} bytes", sig.len())),
+        Err(e) => return sdk_error(e),
+    };
+    let signature = match wrap_poly1271_signature(&order, &inner, POLYGON, draft.neg_risk) {
+        Ok(signature) => signature,
+        Err(e) => return error(-4, e.to_string()),
+    };
+    let order_body = match OrderBody::from_signed(&order, &signature, &creds.key, draft.order_type)
+    {
+        Ok(body) => body,
+        Err(e) => return error(-4, e.to_string()),
+    };
+    let (status, raw) = match clob_l2_post_json(owner, &creds, "/order", &order_body) {
+        Ok(resp) => resp,
+        Err(resp) => return resp,
+    };
+    let ok = (200..300).contains(&status);
+    let clob_status = if ok {
+        raw.get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("posted")
+            .to_string()
+    } else {
+        "rejected".to_string()
+    };
+    let order_id = raw
+        .get("orderID")
+        .or_else(|| raw.get("orderId"))
+        .and_then(|s| s.as_str())
+        .map(str::to_string);
+    let filled_size_micro = raw
+        .get("takingAmount")
+        .or_else(|| raw.get("makingAmount"))
+        .and_then(|s| s.as_str())
+        .and_then(|s| parse_micro(s).ok());
+
+    draft.status = if ok {
+        "posted".into()
+    } else {
+        "rejected".into()
+    };
+    if let DispatchResponse::Error { .. } =
+        store_put_json(&format!("{base}/order.json"), &draft, false)
+    {
+        return error(-4, "failed to update draft");
+    }
+    let receipt = StoreTradeReceipt {
+        draft_id: draft.id.clone(),
+        wallet: draft.wallet.clone(),
+        slug: draft.slug.clone(),
+        token_id: draft.token_id.clone(),
+        side: draft.side,
+        order_type: draft.order_type,
+        funder: Some(format!("{funder:#x}")),
+        signature_type: SIG_TYPE_POLY_1271,
+        amount_microusd: match draft.side {
+            Side::Buy => draft.amount_micro,
+            Side::Sell => draft.taker_micro,
+        },
+        limit_price_micro: draft.limit_price_micro,
+        size_micro: draft.size_micro,
+        salt,
+        clob_order_id: order_id,
+        clob_status: clob_status.clone(),
+        filled_size_micro,
+        raw_response: serde_json::json!({
+            "http_status": status,
+            "body": raw
+        }),
+        review_intent_hash: None,
+        posted_ms: now_millis(),
+    };
+    if let DispatchResponse::Error { .. } = store_put_json(
+        &format!("trade/{wallet}/receipts/{id}/receipt.json"),
+        &receipt,
+        false,
+    ) {
+        return error(-4, "failed to store receipt");
+    }
+    if ok {
+        DispatchResponse::Write
+    } else {
+        error(-4, format!("CLOB rejected the order (HTTP {status})"))
     }
 }
 
@@ -986,6 +1160,48 @@ fn clob_l2_get_json(
         return Ok(serde_json::Value::Null);
     }
     serde_json::from_slice(&resp.body).map_err(|e| error(-4, format!("json: {e}")))
+}
+
+fn clob_l2_post_json<T: Serialize>(
+    owner: Address,
+    creds: &Credentials,
+    path: &str,
+    body: &T,
+) -> Result<(u16, serde_json::Value), DispatchResponse> {
+    let body = serde_json::to_string(body).map_err(|e| error(-4, format!("json: {e}")))?;
+    let timestamp = now_secs();
+    let mut headers = l2_headers(
+        owner,
+        &creds.key,
+        &creds.passphrase,
+        &creds.secret,
+        timestamp,
+        "POST",
+        path,
+        &body,
+    )
+    .map_err(|e| error(-4, e.to_string()))?;
+    headers.push(("Content-Type", "application/json".into()));
+    let resp = bloom_petal_sdk::http_fetch(
+        &HttpRequest {
+            method: "POST".into(),
+            url: format!("{CLOB}{path}"),
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| (name.into(), value))
+                .collect(),
+            body: body.into_bytes(),
+        },
+        MAX_HTTP_BYTES,
+    )
+    .map_err(sdk_error)?;
+    let value = if resp.body.iter().all(|b| b.is_ascii_whitespace()) {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&resp.body)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": String::from_utf8_lossy(&resp.body) }))
+    };
+    Ok((resp.status, value))
 }
 
 fn wallet_address(wallet: &str) -> Result<Address, DispatchResponse> {
@@ -1196,6 +1412,9 @@ fn path_kind(relative: &str) -> Option<DispatchEntryKind> {
         (Some("trade"), 4) if segs[2] == "drafts" || segs[2] == "receipts" => {
             Some(DispatchEntryKind::Dir)
         }
+        (Some("trade"), 5) if segs[2] == "drafts" && DRAFT_WRITABLE_FILES.contains(&segs[4]) => {
+            Some(DispatchEntryKind::WritableFile)
+        }
         (Some("trade"), 5) if segs[2] == "drafts" && DRAFT_FILES.contains(&segs[4]) => {
             Some(DispatchEntryKind::File)
         }
@@ -1265,6 +1484,13 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
 fn sdk_error(e: SdkError) -> DispatchResponse {
     match e {
         SdkError::Host(HostStatus::NotFound) => error(-1, "not found"),
@@ -1300,6 +1526,11 @@ struct TradeNewRequest {
     limit_price: Option<String>,
     #[serde(default)]
     order_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TradeConfirmRequest {
+    confirm: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1347,6 +1578,28 @@ struct TradeSnapshot {
     active: bool,
     closed: bool,
     order_book_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoreTradeReceipt {
+    draft_id: String,
+    wallet: String,
+    slug: String,
+    token_id: String,
+    side: Side,
+    order_type: OrderType,
+    funder: Option<String>,
+    signature_type: u8,
+    amount_microusd: u64,
+    limit_price_micro: u64,
+    size_micro: u64,
+    salt: u64,
+    clob_order_id: Option<String>,
+    clob_status: String,
+    filled_size_micro: Option<u64>,
+    raw_response: serde_json::Value,
+    review_intent_hash: Option<String>,
+    posted_ms: u128,
 }
 
 #[derive(Debug, Clone, Deserialize)]

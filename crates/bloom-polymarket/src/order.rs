@@ -490,16 +490,41 @@ pub async fn sign_order_poly1271(
             order.signatureType
         )));
     }
-    let contents_hash = order.eip712_hash_struct();
-    let app_domain_separator = ctf_exchange_domain(chain_id, neg_risk).hash_struct();
     let digest = poly1271_digest(order, chain_id, neg_risk);
     let inner = signer.sign_eip712_hash(&digest).await?;
+    wrap_poly1271_signature(order, &inner.as_bytes(), chain_id, neg_risk)
+}
 
+/// Wrap a raw 65-byte owner EOA signature for a POLY_1271 deposit-wallet order.
+///
+/// This is the synchronous half of [`sign_order_poly1271`], exposed so wasm
+/// petals can ask the host to sign [`poly1271_digest`] without receiving key
+/// material or depending on native keystore types.
+pub fn wrap_poly1271_signature(
+    order: &Order,
+    inner_signature: &[u8],
+    chain_id: u64,
+    neg_risk: bool,
+) -> Result<String> {
+    if order.signatureType != SIG_TYPE_POLY_1271 {
+        return Err(PolymarketError::invalid(format!(
+            "wrap_poly1271_signature called on signatureType {}",
+            order.signatureType
+        )));
+    }
+    if inner_signature.len() != 65 {
+        return Err(PolymarketError::invalid(format!(
+            "POLY_1271 inner signature must be 65 bytes, got {}",
+            inner_signature.len()
+        )));
+    }
+    let contents_hash = order.eip712_hash_struct();
+    let app_domain_separator = ctf_exchange_domain(chain_id, neg_risk).hash_struct();
     let type_len =
         u16::try_from(ORDER_TYPE_STRING.len()).expect("order type string length fits in u16");
     let mut wrapped = String::with_capacity(2 + 130 + 64 + 64 + ORDER_TYPE_STRING.len() * 2 + 4);
     wrapped.push_str("0x");
-    wrapped.push_str(&hex::encode(inner.as_bytes()));
+    wrapped.push_str(&hex::encode(inner_signature));
     wrapped.push_str(&hex::encode(app_domain_separator.as_slice()));
     wrapped.push_str(&hex::encode(contents_hash.as_slice()));
     wrapped.push_str(&hex::encode(ORDER_TYPE_STRING.as_bytes()));
@@ -889,6 +914,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(wrapped, EXPECTED_NORMAL);
+        let digest = poly1271_digest(&order, crate::POLYGON, false);
+        let inner = signer.sign_eip712_hash(&digest).await.unwrap();
+        let wrapped_from_inner =
+            wrap_poly1271_signature(&order, &inner.as_bytes(), crate::POLYGON, false).unwrap();
+        assert_eq!(wrapped_from_inner, EXPECTED_NORMAL);
+
         let wrapped = sign_order_poly1271(&order, &signer, crate::POLYGON, true)
             .await
             .unwrap();
@@ -910,6 +941,8 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(wrap_poly1271_signature(&wrong, &[7u8; 65], crate::POLYGON, false).is_err());
+        assert!(wrap_poly1271_signature(&order, &[7u8; 64], crate::POLYGON, false).is_err());
     }
 
     #[test]

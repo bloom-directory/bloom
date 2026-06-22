@@ -91,7 +91,7 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         .await
         .unwrap();
     let book: serde_json::Value = serde_json::from_slice(&book).unwrap();
-    assert_eq!(book["asset_id"], "yes-token");
+    assert_eq!(book["asset_id"], "111");
 
     router
         .write(
@@ -124,6 +124,19 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         .await
         .unwrap();
     assert!(String::from_utf8(plan).unwrap().contains("test-market"));
+    router
+        .write(
+            &VfsPath::parse("polymarket/trade/alice/drafts/0001/confirm").unwrap(),
+            br#"{"confirm":true}"#,
+        )
+        .await
+        .unwrap();
+    let receipt = router
+        .read(&VfsPath::parse("polymarket/trade/alice/receipts/0001/receipt.json").unwrap())
+        .await
+        .unwrap();
+    let receipt_text = String::from_utf8(receipt).unwrap();
+    assert!(receipt_text.contains("order-123"));
 
     let private = PrivateStore::open(tmp.path().join("data")).unwrap();
     let draft = private
@@ -154,10 +167,11 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         [
             "read wallets/alice/address",
             "read wallets/alice/address",
+            "read wallets/alice/address",
             "read wallets/alice/address"
         ]
     );
-    assert_eq!(host.sign_calls.lock().unwrap().len(), 1);
+    assert_eq!(host.sign_calls.lock().unwrap().len(), 2);
     assert!(
         router
             .write(
@@ -182,26 +196,26 @@ impl MockHost {
         let mut host = Self::default();
         host.responses.insert(
             "GET https://gamma-api.polymarket.com/markets?closed=false&limit=20&order=volumeNum&ascending=false".into(),
-            br#"[{"slug":"test-market","conditionId":"cond","clobTokenIds":["yes-token","no-token"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true}]"#.to_vec(),
+            br#"[{"slug":"test-market","conditionId":"cond","clobTokenIds":["111","222"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true}]"#.to_vec(),
         );
         host.responses.insert(
             "GET https://gamma-api.polymarket.com/markets/slug/test-market".into(),
-            br#"{"slug":"test-market","conditionId":"cond","clobTokenIds":["yes-token","no-token"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true}"#.to_vec(),
+            br#"{"slug":"test-market","conditionId":"cond","clobTokenIds":["111","222"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true}"#.to_vec(),
         );
         host.responses.insert(
-            "GET https://clob.polymarket.com/book?token_id=yes-token".into(),
-            br#"{"market":"cond","asset_id":"yes-token","tick_size":"0.01","min_order_size":"1","neg_risk":false,"last_trade_price":"0.09","bids":[{"price":"0.08","size":"10"}],"asks":[{"price":"0.09","size":"10"}]}"#.to_vec(),
+            "GET https://clob.polymarket.com/book?token_id=111".into(),
+            br#"{"market":"cond","asset_id":"111","tick_size":"0.01","min_order_size":"1","neg_risk":false,"last_trade_price":"0.09","bids":[{"price":"0.08","size":"10"}],"asks":[{"price":"0.09","size":"10"}]}"#.to_vec(),
         );
         host.responses.insert(
-            "GET https://clob.polymarket.com/midpoint?token_id=yes-token".into(),
+            "GET https://clob.polymarket.com/midpoint?token_id=111".into(),
             br#"{"mid":"0.42"}"#.to_vec(),
         );
         host.responses.insert(
-            "GET https://clob.polymarket.com/spread?token_id=yes-token".into(),
+            "GET https://clob.polymarket.com/spread?token_id=111".into(),
             br#"{"spread":"0.01"}"#.to_vec(),
         );
         host.responses.insert(
-            "GET https://clob.polymarket.com/price?token_id=yes-token&side=BUY".into(),
+            "GET https://clob.polymarket.com/price?token_id=111&side=BUY".into(),
             br#"{"price":"0.43"}"#.to_vec(),
         );
         host.responses.insert(
@@ -215,6 +229,10 @@ impl MockHost {
         host.responses.insert(
             "GET https://clob.polymarket.com/data/orders".into(),
             br#"[{"id":"order-1","status":"LIVE"}]"#.to_vec(),
+        );
+        host.responses.insert(
+            "POST https://clob.polymarket.com/order".into(),
+            br#"{"status":"matched","orderID":"order-123","takingAmount":"1"}"#.to_vec(),
         );
         host
     }
