@@ -13,6 +13,9 @@ mod price_oracle;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use alloy::primitives::B256;
+use alloy::signers::SignerSync;
+use async_trait::async_trait;
 use bloom_chain::{ChainClient, ChainRegistry};
 use bloom_chain_node::rpc::{RpcChainAdapter, RpcClient};
 use bloom_chain_types::ssz::Encode;
@@ -23,7 +26,8 @@ use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
 use bloom_keystore::Keystore;
 use bloom_petals::{
-    LateVfsHost, NameRegistry, PetalRouter, PetalRunner, PetalStore, PetalVm, PetalsHandler,
+    HostError, LateVfsHost, NameRegistry, PetalHost, PetalRouter, PetalRunner, PetalStore, PetalVm,
+    PetalsHandler, SignRequest,
 };
 use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient, GeoblockClient};
 use bloom_prices::PricesClient;
@@ -67,6 +71,61 @@ pub enum DaemonError {
     Io(#[from] std::io::Error),
     #[error("watch: {0}")]
     Watch(String),
+}
+
+struct DaemonPetalHost {
+    vfs: Arc<LateVfsHost>,
+    keystore: Keystore,
+}
+
+impl DaemonPetalHost {
+    fn new(vfs: Arc<LateVfsHost>, keystore: Keystore) -> Self {
+        Self { vfs, keystore }
+    }
+}
+
+#[async_trait]
+impl PetalHost for DaemonPetalHost {
+    async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+        self.vfs.vfs_read(path).await
+    }
+
+    async fn vfs_list(&self, path: &str) -> Result<Vec<String>, HostError> {
+        self.vfs.vfs_list(path).await
+    }
+
+    async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
+        self.vfs.vfs_write(path, bytes).await
+    }
+
+    async fn sign_hash(&self, req: SignRequest) -> Result<Vec<u8>, HostError> {
+        let signer = self
+            .keystore
+            .signer(&req.wallet)
+            .map_err(host_error_from_keystore)?;
+        let hash = B256::from(req.hash32);
+        let sig = signer
+            .sign_hash_sync(&hash)
+            .map_err(|e| HostError::Backend(format!("sign_hash: {e}")))?;
+        tracing::info!(
+            target: "bloom_daemon::petal_host",
+            wallet = %req.wallet,
+            purpose = %req.purpose,
+            "petal.sign_hash"
+        );
+        Ok(sig.as_bytes().to_vec())
+    }
+}
+
+fn host_error_from_keystore(err: bloom_keystore::KeystoreError) -> HostError {
+    match err {
+        bloom_keystore::KeystoreError::NotFound(wallet) => HostError::NotFound(wallet),
+        bloom_keystore::KeystoreError::InvalidName(wallet) => HostError::Invalid(wallet),
+        bloom_keystore::KeystoreError::Locked(wallet) => {
+            HostError::Denied(format!("wallet '{wallet}' is locked"))
+        }
+        other => HostError::Backend(other.to_string()),
+    }
 }
 
 /// All wired-up state the daemon owns. Cheap to clone (everything is
@@ -447,7 +506,11 @@ impl Daemon {
         );
         let petal_vm = PetalVm::new().map_err(|e| DaemonError::Audit(format!("petals vm: {e}")))?;
         let petals = PetalRunner::new(petal_store.clone(), petal_registry.clone(), petal_vm);
-        let petal_app_host = Arc::new(LateVfsHost::new());
+        let petal_vfs_host = Arc::new(LateVfsHost::new());
+        let petal_app_host = Arc::new(DaemonPetalHost::new(
+            petal_vfs_host.clone(),
+            keystore.clone(),
+        ));
         debug!(root = %petals_root.display(), "daemon.petals_initialised");
 
         let mut vfs_builder = Vfs::builder()
@@ -644,7 +707,7 @@ impl Daemon {
             .with_audit(audit_arc.clone())
             .with_cache(path_cache)
             .build();
-        petal_app_host.set(Arc::new(vfs.clone()));
+        petal_vfs_host.set(Arc::new(vfs.clone()));
 
         // Start the watch executor so any pre-existing specs on disk are
         // sampled and any new ones registered by the WatchHandler get
@@ -1190,6 +1253,35 @@ mod tests {
         let d = Daemon::from_home(home).unwrap();
         assert!(tx_chain_state_adapter(&d.home).is_some());
         assert!(d.vfs.handler("tx").is_some());
+    }
+
+    #[tokio::test]
+    async fn daemon_petal_host_signs_hash_with_unlocked_keystore_wallet() {
+        let dir = tempfile::tempdir().unwrap();
+        let keystore = Keystore::new(dir.path().join("keystore")).unwrap();
+        keystore.create_local("alice", "passphrase").unwrap();
+        let host = DaemonPetalHost::new(Arc::new(LateVfsHost::new()), keystore.clone());
+
+        let locked = host
+            .sign_hash(SignRequest {
+                wallet: "alice".into(),
+                hash32: [1u8; 32],
+                purpose: "test".into(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(locked, HostError::Denied(_)));
+
+        keystore.unlock("alice", "passphrase").unwrap();
+        let sig = host
+            .sign_hash(SignRequest {
+                wallet: "alice".into(),
+                hash32: [1u8; 32],
+                purpose: "test".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(sig.len(), 65);
     }
 
     /// A pre-existing watch spec on disk should be loaded into the
