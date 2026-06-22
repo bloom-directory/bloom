@@ -1,0 +1,25 @@
+[package]
+name = "bloom-local-petal-portfolio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Example local Bloom handler petal that builds a wallet portfolio table via vfs.read"
+publish = false
+
+[lib]
+name = "bloom_local_petal_portfolio"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bloom-petal-sdk = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+bloom-petal-manifest = { workspace = true }
+bloom-petals = { workspace = true }
+bloom-vfs = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+

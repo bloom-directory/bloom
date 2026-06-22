@@ -38,6 +38,7 @@ members = [
   "crates/bloom-petal-it",
   # ---- example apps (not part of the protocol) ----
   "examples/local-petals/misc-tools",
+  "examples/local-petals/portfolio",
   "examples/petal-dex/crates/bloom-dex-math",
   "examples/petal-dex/crates/bloom-petal-dex-cpmm",
   "examples/petal-dex/crates/bloom-petal-dex-faucet",
@@ -147,6 +148,7 @@ bloom-ptb-builder = { path = "crates/bloom-ptb-builder" }
 bloom-petal-fungible = { path = "crates/bloom-petal-fungible", version = "0.1.0" }
 # ---- example petal DEX crates (not part of the protocol) ----
 bloom-local-petal-misc-tools = { path = "examples/local-petals/misc-tools" }
+bloom-local-petal-portfolio = { path = "examples/local-petals/portfolio" }
 bloom-dex-math    = { path = "examples/petal-dex/crates/bloom-dex-math" }
 bloom-petal-dex-cpmm = { path = "examples/petal-dex/crates/bloom-petal-dex-cpmm", version = "0.1.0" }
 bloom-petal-dex-faucet = { path = "examples/petal-dex/crates/bloom-petal-dex-faucet" }

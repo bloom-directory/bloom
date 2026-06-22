@@ -1,0 +1,12 @@
+schema = "bloom.petal.local.v1"
+name = "portfolio"
+
+[provides]
+kind = "vfs"
+mount = "portfolio"
+caps = ["vfs.read"]
+
+[[endpoint]]
+path = "summary.md"
+cache_ttl_ms = 5000
+

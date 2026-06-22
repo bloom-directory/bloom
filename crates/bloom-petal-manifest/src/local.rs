@@ -448,7 +448,7 @@ pub fn local_capability_for_import(
         return Ok(None);
     }
     let cap = match name {
-        "vfs_read" => LocalCapability::VfsRead,
+        "vfs_read" | "vfs_list" => LocalCapability::VfsRead,
         "vfs_write" => LocalCapability::VfsWrite,
         "http_fetch" => LocalCapability::NetFetch,
         "sign_hash" => LocalCapability::Sign,
@@ -615,6 +615,10 @@ caps = []
         assert_eq!(
             local_capability_for_import("bloom.v1", "http_fetch").unwrap(),
             Some(LocalCapability::NetFetch)
+        );
+        assert_eq!(
+            local_capability_for_import("bloom.v1", "vfs_list").unwrap(),
+            Some(LocalCapability::VfsRead)
         );
         assert_eq!(
             local_capability_for_import("wasi_snapshot_preview1", "fd_write").unwrap(),

@@ -297,20 +297,43 @@ pub fn decode_dispatch_response(bytes: &[u8]) -> Result<DispatchResponse, SdkErr
 }
 
 pub fn http_fetch(req: &HttpRequest, max_response_bytes: usize) -> Result<HttpResponse, SdkError> {
-    let raw = call_blob4(
-        &encode_http_request(req),
-        max_response_bytes,
-        RawImport::HttpFetch,
-    )?;
+    let input = encode_http_request(req);
+    #[cfg(not(target_arch = "wasm32"))]
+    let raw = call_blob4_unavailable(&input, max_response_bytes)?;
+    #[cfg(target_arch = "wasm32")]
+    let raw = call_blob4_raw(&input, max_response_bytes, raw::http_fetch)?;
     decode_http_response(&raw)
 }
 
 pub fn sign_hash(req: &SignRequest) -> Result<Vec<u8>, SdkError> {
-    call_blob4(&encode_sign_request(req), 65, RawImport::SignHash)
+    let input = encode_sign_request(req);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        call_blob4_unavailable(&input, 65)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_blob4_raw(&input, 65, raw::sign_hash)
+    }
 }
 
 pub fn vfs_read(path: &str, max_response_bytes: usize) -> Result<Vec<u8>, SdkError> {
-    call_blob4(path.as_bytes(), max_response_bytes, RawImport::VfsRead)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        call_blob4_unavailable(path.as_bytes(), max_response_bytes)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_blob4_raw(path.as_bytes(), max_response_bytes, raw::vfs_read)
+    }
+}
+
+pub fn vfs_list(path: &str, max_response_bytes: usize) -> Result<Vec<String>, SdkError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let raw = call_blob4_unavailable(path.as_bytes(), max_response_bytes)?;
+    #[cfg(target_arch = "wasm32")]
+    let raw = call_blob4_raw(path.as_bytes(), max_response_bytes, raw::vfs_list)?;
+    decode_string_list(&raw)
 }
 
 pub fn vfs_write(path: &str, bytes: &[u8]) -> Result<(), SdkError> {
@@ -334,7 +357,14 @@ pub fn vfs_write(path: &str, bytes: &[u8]) -> Result<(), SdkError> {
 }
 
 pub fn store_get(key: &str, max_response_bytes: usize) -> Result<Vec<u8>, SdkError> {
-    call_blob4(key.as_bytes(), max_response_bytes, RawImport::StoreGet)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        call_blob4_unavailable(key.as_bytes(), max_response_bytes)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        call_blob4_raw(key.as_bytes(), max_response_bytes, raw::store_get)
+    }
 }
 
 pub fn store_put(key: &str, value: &[u8], secret: bool) -> Result<(), SdkError> {
@@ -359,7 +389,10 @@ pub fn store_put(key: &str, value: &[u8], secret: bool) -> Result<(), SdkError> 
 }
 
 pub fn store_list(prefix: &str, max_response_bytes: usize) -> Result<Vec<String>, SdkError> {
-    let raw = call_blob4(prefix.as_bytes(), max_response_bytes, RawImport::StoreList)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let raw = call_blob4_unavailable(prefix.as_bytes(), max_response_bytes)?;
+    #[cfg(target_arch = "wasm32")]
+    let raw = call_blob4_raw(prefix.as_bytes(), max_response_bytes, raw::store_list)?;
     decode_string_list(&raw)
 }
 
@@ -414,70 +447,35 @@ macro_rules! export_dispatch {
     };
 }
 
-fn call_blob4(
+#[cfg(not(target_arch = "wasm32"))]
+fn call_blob4_unavailable(input: &[u8], max_response_bytes: usize) -> Result<Vec<u8>, SdkError> {
+    checked_i32(input.len())?;
+    checked_i32(max_response_bytes)?;
+    Err(SdkError::HostUnavailable)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn call_blob4_raw(
     input: &[u8],
     max_response_bytes: usize,
-    import: RawImport,
+    raw_fn: unsafe extern "C" fn(i32, i32, i32, i32) -> i32,
 ) -> Result<Vec<u8>, SdkError> {
     checked_i32(input.len())?;
     checked_i32(max_response_bytes)?;
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let _ = (input, max_response_bytes, import);
-        Err(SdkError::HostUnavailable)
+    let mut dst = Vec::<u8>::with_capacity(max_response_bytes);
+    let status = unsafe {
+        raw_fn(
+            input.as_ptr() as i32,
+            input.len() as i32,
+            dst.as_mut_ptr() as i32,
+            max_response_bytes as i32,
+        )
+    };
+    let len = host_len(status, max_response_bytes)?;
+    unsafe {
+        dst.set_len(len);
     }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let mut dst = Vec::<u8>::with_capacity(max_response_bytes);
-        let status = unsafe {
-            match import {
-                RawImport::HttpFetch => raw::http_fetch(
-                    input.as_ptr() as i32,
-                    input.len() as i32,
-                    dst.as_mut_ptr() as i32,
-                    max_response_bytes as i32,
-                ),
-                RawImport::SignHash => raw::sign_hash(
-                    input.as_ptr() as i32,
-                    input.len() as i32,
-                    dst.as_mut_ptr() as i32,
-                    max_response_bytes as i32,
-                ),
-                RawImport::VfsRead => raw::vfs_read(
-                    input.as_ptr() as i32,
-                    input.len() as i32,
-                    dst.as_mut_ptr() as i32,
-                    max_response_bytes as i32,
-                ),
-                RawImport::StoreGet => raw::store_get(
-                    input.as_ptr() as i32,
-                    input.len() as i32,
-                    dst.as_mut_ptr() as i32,
-                    max_response_bytes as i32,
-                ),
-                RawImport::StoreList => raw::store_list(
-                    input.as_ptr() as i32,
-                    input.len() as i32,
-                    dst.as_mut_ptr() as i32,
-                    max_response_bytes as i32,
-                ),
-            }
-        };
-        let len = host_len(status, max_response_bytes)?;
-        unsafe {
-            dst.set_len(len);
-        }
-        Ok(dst)
-    }
-}
-
-#[derive(Clone, Copy)]
-enum RawImport {
-    HttpFetch,
-    SignHash,
-    VfsRead,
-    StoreGet,
-    StoreList,
+    Ok(dst)
 }
 
 #[cfg(any(test, target_arch = "wasm32"))]
@@ -734,6 +732,7 @@ mod raw {
         pub fn http_fetch(req_ptr: i32, req_len: i32, dst_ptr: i32, dst_max: i32) -> i32;
         pub fn sign_hash(req_ptr: i32, req_len: i32, dst_ptr: i32, dst_max: i32) -> i32;
         pub fn vfs_read(path_ptr: i32, path_len: i32, dst_ptr: i32, dst_max: i32) -> i32;
+        pub fn vfs_list(path_ptr: i32, path_len: i32, dst_ptr: i32, dst_max: i32) -> i32;
         pub fn vfs_write(path_ptr: i32, path_len: i32, bytes_ptr: i32, bytes_len: i32) -> i32;
         pub fn store_get(key_ptr: i32, key_len: i32, dst_ptr: i32, dst_max: i32) -> i32;
         pub fn store_put(
@@ -863,6 +862,10 @@ mod tests {
     fn non_wasm_host_calls_are_unavailable() {
         assert!(matches!(
             vfs_read("status/version", 16),
+            Err(SdkError::HostUnavailable)
+        ));
+        assert!(matches!(
+            vfs_list("wallets", 1024),
             Err(SdkError::HostUnavailable)
         ));
         assert!(matches!(store_del("x"), Err(SdkError::HostUnavailable)));

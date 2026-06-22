@@ -384,6 +384,7 @@ fn link_imports_for_mode(
 fn link_local_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     link_vfs_imports(linker, "bloom")?;
     link_vfs_imports(linker, "bloom.v1")?;
+    link_vfs_list_import(linker, "bloom.v1")?;
     link_bloom_v1_imports(linker)?;
     Ok(())
 }
@@ -464,6 +465,49 @@ fn link_vfs_imports(linker: &mut Linker<StoreData>, module: &'static str) -> any
             })
         },
     )?;
+    Ok(())
+}
+
+fn link_vfs_list_import(
+    linker: &mut Linker<StoreData>,
+    module: &'static str,
+) -> anyhow::Result<()> {
+    linker.func_wrap_async(
+        module,
+        "vfs_list",
+        |mut caller: Caller<'_, StoreData>,
+         params: (i32, i32, i32, i32)|
+         -> Box<dyn std::future::Future<Output = i32> + Send + '_> {
+            let (path_ptr, path_len, dst_ptr, dst_max) = params;
+            Box::new(async move {
+                let cap_ok = caller.data().caps.contains(&Capability::VfsRead);
+                if !cap_ok {
+                    log_denied(caller.data(), "vfs_list");
+                    return HostError::Denied("vfs.read".into()).as_wasm_code();
+                }
+                let mem = match get_memory(&mut caller) {
+                    Some(m) => m,
+                    None => return HostError::Invalid("no exported memory".into()).as_wasm_code(),
+                };
+                let path = match read_string(&mem, &mut caller, path_ptr, path_len) {
+                    Ok(s) => s,
+                    Err(c) => return c,
+                };
+                let host = caller.data().host.clone();
+                match host.vfs_list(&path).await {
+                    Ok(names) => write_blob_response(
+                        &mem,
+                        &mut caller,
+                        dst_ptr,
+                        dst_max,
+                        &encode_string_list(&names),
+                    ),
+                    Err(e) => e.as_wasm_code(),
+                }
+            })
+        },
+    )?;
+
     Ok(())
 }
 
@@ -1180,6 +1224,7 @@ mod tests {
     #[derive(Default)]
     struct MockHost {
         store: Mutex<HashMap<String, Vec<u8>>>,
+        lists: Mutex<HashMap<String, Vec<String>>>,
         http_calls: Mutex<Vec<HttpRequest>>,
         sign_calls: Mutex<Vec<SignRequest>>,
     }
@@ -1188,6 +1233,13 @@ mod tests {
     impl PetalHost for MockHost {
         async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
             self.store
+                .lock()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| HostError::NotFound(path.into()))
+        }
+        async fn vfs_list(&self, path: &str) -> Result<Vec<String>, HostError> {
+            self.lists
                 .lock()
                 .get(path)
                 .cloned()
@@ -1264,6 +1316,79 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.stdout, vec![5u8]); // "VALUE".len()
+    }
+
+    #[tokio::test]
+    async fn vfs_list_returns_encoded_payload_length_when_allowed() {
+        let vm = PetalVm::new().unwrap();
+        let host = Arc::new(MockHost::default());
+        host.lists
+            .lock()
+            .insert("wallets".into(), vec!["alice".into(), "bob".into()]);
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::VfsRead);
+        let wat = r#"
+        (module
+          (import "bloom.v1" "vfs_list"
+            (func $vfs_list (param i32 i32 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 0) "wallets")
+          ;; DispatchResponse::Read([0])
+          (data (i32.const 300) "\02\01\00\00\00\00")
+          (func (export "petal_alloc") (param $len i32) (result i32)
+            (i32.const 1024))
+          (func (export "petal_dispatch") (param $ptr i32) (param $len i32) (result i64)
+            (i32.store8
+              (i32.const 305)
+              (call $vfs_list
+                (i32.const 0)
+                (i32.const 7)
+                (i32.const 64)
+                (i32.const 256)))
+            (i64.or
+              (i64.shl (i64.extend_i32_u (i32.const 300)) (i64.const 32))
+              (i64.extend_i32_u (i32.const 6)))))
+        "#;
+        let out = vm
+            .dispatch(
+                &wat::parse_str(&wat).unwrap(),
+                DispatchRequest {
+                    op: DispatchOp::Read,
+                    path: "summary.md".into(),
+                    body: Vec::new(),
+                    ctx: Vec::new(),
+                },
+                caps,
+                host.clone(),
+                "h",
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out.response,
+            DispatchResponse::Read(vec![
+                encode_string_list(&vec!["alice".to_string(), "bob".to_string()]).len() as u8
+            ])
+        );
+
+        let out = vm
+            .dispatch(
+                &wat::parse_str(wat).unwrap(),
+                DispatchRequest {
+                    op: DispatchOp::Read,
+                    path: "summary.md".into(),
+                    body: Vec::new(),
+                    ctx: Vec::new(),
+                },
+                BTreeSet::new(),
+                host,
+                "h",
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.response, DispatchResponse::Read(vec![denied_byte()]));
     }
 
     #[tokio::test]

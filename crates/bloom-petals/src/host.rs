@@ -40,6 +40,9 @@ pub trait PetalHost: Send + Sync {
     /// Read the file at `path` from the surrounding VFS.
     async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError>;
 
+    /// List child entry names at `path` from the surrounding VFS.
+    async fn vfs_list(&self, path: &str) -> Result<Vec<String>, HostError>;
+
     /// Write `bytes` to the writable file at `path` in the surrounding
     /// VFS.
     async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError>;
@@ -69,6 +72,9 @@ pub struct DenyHost;
 #[async_trait]
 impl PetalHost for DenyHost {
     async fn vfs_read(&self, _path: &str) -> Result<Vec<u8>, HostError> {
+        Err(HostError::Denied("DenyHost".into()))
+    }
+    async fn vfs_list(&self, _path: &str) -> Result<Vec<String>, HostError> {
         Err(HostError::Denied("DenyHost".into()))
     }
     async fn vfs_write(&self, _path: &str, _bytes: &[u8]) -> Result<(), HostError> {
@@ -111,6 +117,7 @@ mod tests {
     async fn deny_host_denies_both_directions() {
         let h = DenyHost;
         assert!(matches!(h.vfs_read("any").await, Err(HostError::Denied(_))));
+        assert!(matches!(h.vfs_list("any").await, Err(HostError::Denied(_))));
         assert!(matches!(
             h.vfs_write("any", b"x").await,
             Err(HostError::Denied(_))

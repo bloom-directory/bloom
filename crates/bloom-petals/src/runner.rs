@@ -44,6 +44,16 @@ impl PetalHost for VfsHost {
         self.vfs.read(&path).await.map_err(host_from_handler)
     }
 
+    async fn vfs_list(&self, path: &str) -> Result<Vec<String>, HostError> {
+        let path = VfsPath::parse(path).map_err(|e| HostError::Invalid(format!("path: {e}")))?;
+        deny_apps_subtree(&path)?;
+        self.vfs
+            .list(&path)
+            .await
+            .map(|entries| entries.into_iter().map(|entry| entry.name).collect())
+            .map_err(host_from_handler)
+    }
+
     async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
         let path = VfsPath::parse(path).map_err(|e| HostError::Invalid(format!("path: {e}")))?;
         deny_apps_subtree(&path)?;
@@ -96,6 +106,11 @@ impl PetalHost for LateVfsHost {
     async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
         let vfs = self.current()?;
         VfsHost::new(vfs).vfs_read(path).await
+    }
+
+    async fn vfs_list(&self, path: &str) -> Result<Vec<String>, HostError> {
+        let vfs = self.current()?;
+        VfsHost::new(vfs).vfs_list(path).await
     }
 
     async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
@@ -456,6 +471,10 @@ paths = ["/markets*"]
             Err(HostError::Denied("vfs".into()))
         }
 
+        async fn vfs_list(&self, _path: &str) -> Result<Vec<String>, HostError> {
+            Err(HostError::Denied("vfs".into()))
+        }
+
         async fn vfs_write(&self, _path: &str, _bytes: &[u8]) -> Result<(), HostError> {
             Err(HostError::Denied("vfs".into()))
         }
@@ -539,6 +558,14 @@ paths = ["/markets*"]
         assert!(matches!(
             host.vfs_write("apps/demo/file", b"x").await,
             Err(HostError::Denied(_))
+        ));
+        assert!(matches!(
+            host.vfs_list("apps/demo").await,
+            Err(HostError::Denied(_))
+        ));
+        assert!(matches!(
+            host.vfs_list("../wallets").await,
+            Err(HostError::Invalid(_))
         ));
     }
 
