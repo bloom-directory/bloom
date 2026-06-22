@@ -42,6 +42,7 @@
     .hero-stat{border:1px solid var(--line);border-radius:8px;background:#fff;padding:12px}
     .hero-stat strong{display:block;font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:6px}
     .hero-stat span{display:block;font-size:15px;line-height:1.35;color:var(--text);overflow-wrap:anywhere}
+    .hero-stat span.unlimited-warn{color:#d32f2f;font-weight:700}
     .hero-note{display:grid;grid-template-columns:minmax(0,1fr);gap:10px;margin-top:14px}
     .hero-box{border:1px solid #d7e3f4;border-radius:8px;background:#fff;padding:13px}
     .hero-box strong{display:block;font-size:13px;margin-bottom:6px}
@@ -79,6 +80,7 @@
     .simple-card{border:1px solid var(--line);border-radius:8px;background:#fbfcfe;padding:12px}
     .simple-card strong{display:block;font-size:13px;margin-bottom:4px;color:var(--text)}
     .simple-card span{display:block;font-size:13px;line-height:1.4;color:var(--muted);overflow-wrap:anywhere}
+    .simple-card span.unlimited-warn{color:#d32f2f;font-weight:700}
     details{border:1px solid var(--line);border-radius:8px;background:#fbfcfe}
     summary{cursor:pointer;padding:12px 14px;color:var(--muted);font-size:13px}
     pre{margin:0;padding:0 14px 14px;white-space:pre-wrap;word-break:break-word;font-family:var(--mono);font-size:12px;color:#344054}
@@ -366,6 +368,7 @@ function simpleCard(parent,title,text){
       const h=document.createElement('strong');
   h.textContent=title;
   const body=document.createElement('span');
+  if(String(text).indexOf('UNLIMITED')>=0) body.className='unlimited-warn';
   appendLinkedText(body,text);
   card.appendChild(h);
   card.appendChild(body);
@@ -377,6 +380,7 @@ function heroStat(parent,title,text){
   const h=document.createElement('strong');
   h.textContent=title;
   const body=document.createElement('span');
+  if(String(text).indexOf('UNLIMITED')>=0) body.className='unlimited-warn';
   appendLinkedText(body,text);
   card.appendChild(h);
   card.appendChild(body);

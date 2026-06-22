@@ -52,9 +52,11 @@ bloom vfs cat /docs/README.md
 bloom vfs cat /chains/ethereum/head/number
 bloom vfs cat /prices/spot/eth.usd
 
-# 3. Create a demo wallet. Private keys stay in the encrypted keystore,
-# not in /bloom.
-BLOOM_PASSPHRASE=devonly bloom wallet new alice --passphrase devonly
+# 3. Create a demo wallet. Passkey is the default — a WebAuthn ceremony runs
+# in the browser. For a passphrase wallet in dev, use --local with
+# --allow-passphrase-wallet and --passphrase-file. Private keys stay in the
+# encrypted keystore, not in /bloom.
+bloom wallet new alice
 bloom wallet list
 
 # 4. Stage a devnet transaction when Anvil is running.

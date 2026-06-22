@@ -63,6 +63,21 @@ impl SessionStore {
         self.inner.write().remove(id).is_some()
     }
 
+    /// Revoke a session only if it belongs to `wallet`. Prevents one wallet's
+    /// path from revoking another wallet's session by guessing its id (session
+    /// ids embed the owning wallet but are otherwise opaque to callers). Returns
+    /// `false` when the id is unknown *or* owned by a different wallet.
+    pub fn revoke_for(&self, wallet: &str, id: &str) -> bool {
+        let mut guard = self.inner.write();
+        match guard.get(id) {
+            Some(s) if s.wallet == wallet => {
+                guard.remove(id);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn prune_expired(&self, now_ms: u128) {
         self.inner.write().retain(|_, s| s.expires_ms > now_ms);
     }
@@ -85,12 +100,20 @@ impl SessionStore {
     /// the allowlist, and — when the tx's USD value is known — `spent + value
     /// <= max`. The check and debit happen under one write lock, so two
     /// concurrent confirms cannot both pass against the same pre-debit budget.
+    ///
+    /// Unpriced txs (`tx_micro_usd == None`) are handled by `value_moving`: a
+    /// value-moving tx with no USD valuation **fails closed** (no session covers
+    /// it) rather than debiting 0 and slipping the dollar cap — otherwise a
+    /// burst of unpriced transfers could drain a wallet under a priced budget.
+    /// A value-neutral unpriced tx (no native value/token/NFT/calldata) is bound
+    /// by the explicit id allowlist alone and debits 0.
     pub fn authorize_and_debit(
         &self,
         wallet: &str,
         chain_id: u64,
         pending_id: &str,
         tx_micro_usd: Option<i128>,
+        value_moving: bool,
         now_ms: u128,
     ) -> Option<(SessionId, i128)> {
         let key = pending_key(chain_id, pending_id);
@@ -113,7 +136,11 @@ impl SessionStore {
                     s.spent_micro_usd = s.spent_micro_usd.saturating_add(v);
                     v
                 }
-                // Unpriced tx: the explicit id allowlist is the bound; debit 0.
+                // Unpriced value-moving tx: we can't debit it against the dollar
+                // cap, so no session may silently cover it (fail closed).
+                None if value_moving => continue,
+                // Unpriced value-neutral tx: the explicit id allowlist is the
+                // bound; debit 0.
                 None => 0,
             };
             return Some((s.id.clone(), debit));
@@ -157,13 +184,13 @@ mod tests {
         // The same bare id on Arbitrum (42161) must NOT be authorized.
         assert!(
             store
-                .authorize_and_debit("alice", 42161, "0001-a", Some(1), 1)
+                .authorize_and_debit("alice", 42161, "0001-a", Some(1), true, 1)
                 .is_none()
         );
         // The exact (chain, id) it was minted for is authorized.
         assert!(
             store
-                .authorize_and_debit("alice", 8453, "0001-a", Some(1), 1)
+                .authorize_and_debit("alice", 8453, "0001-a", Some(1), true, 1)
                 .is_some()
         );
     }
@@ -174,7 +201,7 @@ mod tests {
         store.mint(session("s1", 10_000_000, &["0001-a"]));
         assert!(
             store
-                .authorize_and_debit("alice", 42161, "0001-a", Some(1_000_000), 1)
+                .authorize_and_debit("alice", 42161, "0001-a", Some(1_000_000), true, 1)
                 .is_some()
         );
     }
@@ -186,25 +213,25 @@ mod tests {
         // expired
         assert!(
             store
-                .authorize_and_debit("alice", 42161, "0001-a", Some(1), 99_999)
+                .authorize_and_debit("alice", 42161, "0001-a", Some(1), true, 99_999)
                 .is_none()
         );
         // chain not in set
         assert!(
             store
-                .authorize_and_debit("alice", 1, "0001-a", Some(1), 1)
+                .authorize_and_debit("alice", 1, "0001-a", Some(1), true, 1)
                 .is_none()
         );
         // id not in allowlist
         assert!(
             store
-                .authorize_and_debit("alice", 42161, "0009-z", Some(1), 1)
+                .authorize_and_debit("alice", 42161, "0009-z", Some(1), true, 1)
                 .is_none()
         );
         // wrong wallet
         assert!(
             store
-                .authorize_and_debit("bob", 42161, "0001-a", Some(1), 1)
+                .authorize_and_debit("bob", 42161, "0001-a", Some(1), true, 1)
                 .is_none()
         );
     }
@@ -215,19 +242,19 @@ mod tests {
         store.mint(session("s1", 10_000_000, &["a", "b"]));
         assert!(
             store
-                .authorize_and_debit("alice", 42161, "a", Some(7_000_000), 1)
+                .authorize_and_debit("alice", 42161, "a", Some(7_000_000), true, 1)
                 .is_some()
         );
         // Second confirm would exceed the $10 cap → refused.
         assert!(
             store
-                .authorize_and_debit("alice", 42161, "b", Some(4_000_000), 1)
+                .authorize_and_debit("alice", 42161, "b", Some(4_000_000), true, 1)
                 .is_none()
         );
         // A smaller one still fits.
         assert!(
             store
-                .authorize_and_debit("alice", 42161, "b", Some(3_000_000), 1)
+                .authorize_and_debit("alice", 42161, "b", Some(3_000_000), true, 1)
                 .is_some()
         );
     }
@@ -237,15 +264,32 @@ mod tests {
         let store = SessionStore::new();
         store.mint(session("s1", 10_000_000, &["a"]));
         let (id, amt) = store
-            .authorize_and_debit("alice", 42161, "a", Some(9_000_000), 1)
+            .authorize_and_debit("alice", 42161, "a", Some(9_000_000), true, 1)
             .unwrap();
         store.refund(&id, amt);
         // Full budget available again.
         assert!(
             store
-                .authorize_and_debit("alice", 42161, "a", Some(9_000_000), 1)
+                .authorize_and_debit("alice", 42161, "a", Some(9_000_000), true, 1)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn unpriced_value_moving_tx_fails_closed() {
+        let store = SessionStore::new();
+        store.mint(session("s1", 10_000_000, &["a"]));
+        // No USD valuation + value-moving → no session may cover it.
+        assert!(
+            store
+                .authorize_and_debit("alice", 42161, "a", None, true, 1)
+                .is_none()
+        );
+        // No USD valuation + value-neutral → covered by the id allowlist, debit 0.
+        let (_, debit) = store
+            .authorize_and_debit("alice", 42161, "a", None, false, 1)
+            .expect("value-neutral unpriced tx is covered");
+        assert_eq!(debit, 0);
     }
 
     #[test]
@@ -257,5 +301,18 @@ mod tests {
         store.mint(session("s2", 1, &["a"]));
         store.prune_expired(99_999); // past expiry
         assert!(store.active(1).is_empty());
+    }
+
+    #[test]
+    fn revoke_for_is_wallet_scoped() {
+        let store = SessionStore::new();
+        store.mint(session("s1", 1, &["a"])); // owned by "alice"
+        // A different wallet path cannot revoke alice's session by id.
+        assert!(!store.revoke_for("bob", "s1"));
+        // Unknown id is also rejected.
+        assert!(!store.revoke_for("alice", "nope"));
+        // The owning wallet can revoke it.
+        assert!(store.revoke_for("alice", "s1"));
+        assert!(!store.revoke_for("alice", "s1"));
     }
 }

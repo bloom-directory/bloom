@@ -23,6 +23,7 @@ pub mod handlers;
 pub mod paginate;
 pub mod path;
 pub mod petals_handler;
+pub mod policy_session_review;
 pub mod router;
 pub mod tx_handler;
 

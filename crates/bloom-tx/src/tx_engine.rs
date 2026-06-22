@@ -1248,11 +1248,13 @@ impl TxEngine {
         // confirm without a fresh per-tx review; otherwise fall back to the
         // standard per-tx authorization. The session debit is atomic; we refund
         // it if the broadcast then fails.
+        let subject = self.authorization_subject(&staged);
         let session_debit = self.session_store.authorize_and_debit(
             wallet,
             staged.chain_id,
             &staged.id,
-            self.authorization_subject(&staged).total_value_usd_micro,
+            subject.total_value_usd_micro,
+            subject.value_moving,
             now_ms(),
         );
         if let Some((ref sid, _)) = session_debit {

@@ -17,7 +17,7 @@ use bloom_keystore::{Keystore, ephemeral::EphemeralAgentKey};
 use bloom_proto::hyperliquid_policy::HyperliquidPolicy;
 use bloom_proto::{
     BreachAction, CapabilityStatus, CapabilityViewEntry, HyperliquidSession, SessionStatus,
-    SigningModel, Venue, resolve_hyperliquid_agent_session_name,
+    SigningModel, Venue, parse_units, prelude::U256, resolve_hyperliquid_agent_session_name,
 };
 use parking_lot::Mutex;
 use rand::RngCore;
@@ -233,16 +233,19 @@ impl HyperliquidHandler {
     }
 
     pub fn capability_views_for(&self, wallet: &str) -> Vec<CapabilityViewEntry> {
-        let sessions = self.sessions.lock();
-        sessions
-            .values()
-            .filter_map(|guard| {
+        let mut entries = Vec::new();
+        // In-memory sessions. Track (network, id) so the on-disk scan below can
+        // skip anything already represented here.
+        let mut in_memory: HashSet<(String, String)> = HashSet::new();
+        {
+            let sessions = self.sessions.lock();
+            for guard in sessions.values() {
                 let active = guard.lock();
                 if active.wallet != wallet {
-                    return None;
+                    continue;
                 }
                 let s = &active.session;
-                let now = bloom_proto::capability::now_ms_u128();
+                in_memory.insert((active.network.clone(), s.id.clone()));
                 let status = if s.status == SessionStatus::Expired {
                     CapabilityStatus::Expired
                 } else if s.status == SessionStatus::Halted {
@@ -250,83 +253,104 @@ impl HyperliquidHandler {
                 } else if active.stopped {
                     CapabilityStatus::Revoked
                 } else if active.stale_since_ms.is_some() {
-                    CapabilityStatus::Orphaned
+                    // Still in memory (key intact) but the risk snapshot is
+                    // stale — NOT an orphaned/lost key.
+                    CapabilityStatus::Stale
                 } else {
                     CapabilityStatus::Active
                 };
-                let mut allowed = vec![format!(
-                    "place orders on {}",
-                    if s.bounds.allowed_assets.is_empty() {
-                        "all assets"
-                    } else {
-                        "allowed assets"
-                    }
-                )];
-                if !s.bounds.allowed_assets.is_empty() {
-                    allowed.push(format!(
-                        "assets: {}",
-                        s.bounds
-                            .allowed_assets
-                            .iter()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
-                if let Some(n) = s.bounds.max_notional_usd {
-                    allowed.push(format!("max order: ${:.2}", n as f64 / 1_000_000.0));
-                }
-                if let Some(p) = s.bounds.max_position_usd {
-                    allowed.push(format!("max position: ${:.2}", p as f64 / 1_000_000.0));
-                }
-                if let Some(lev) = s.bounds.max_leverage {
-                    allowed.push(format!("max leverage: {lev}x"));
-                }
-                let mut denied = Vec::new();
-                if s.bounds.withdrawal_cap_usd.is_some() || s.bounds.transfer_cap_usd.is_some() {
-                    denied.push("withdrawals and transfers are denied for agent sessions".into());
-                }
-                Some(CapabilityViewEntry {
-                    id: s.id.clone(),
-                    wallet: wallet.to_string(),
-                    venue: Venue::Hyperliquid,
-                    signing_model: SigningModel::HoldsDelegatedKey,
-                    created_ms: s.created_ms,
-                    expires_ms: Some(s.expires_ms),
-                    expires_in_secs: if s.expires_ms > now {
-                        Some(((s.expires_ms - now) / 1000) as u64)
-                    } else {
-                        None
-                    },
+                entries.push(hl_capability_entry(
+                    &active.network,
+                    wallet,
+                    &s.id,
+                    &s.bounds,
+                    s.created_ms,
+                    s.expires_ms,
                     status,
-                    limits: serde_json::json!({
-                        "max_notional_usd": s.bounds.max_notional_usd,
-                        "max_position_usd": s.bounds.max_position_usd,
-                        "max_loss_usd": s.bounds.max_loss_usd,
-                        "max_leverage": s.bounds.max_leverage,
-                        "allowed_assets": s.bounds.allowed_assets,
-                    }),
-                    next_write_path: format!(
-                        "/hyperliquid/{}/agent_sessions/{}/{}/order.json",
-                        active.network, wallet, s.id
-                    ),
-                    revoke_path: format!(
-                        "/hyperliquid/{}/agent_sessions/{}/{}/stop",
-                        active.network, wallet, s.id
-                    ),
-                    audit_ref: format!(
-                        "/hyperliquid/{}/agent_sessions/{}/{}/audit.jsonl",
-                        active.network, wallet, s.id
-                    ),
-                    review_ref: format!(
-                        "/hyperliquid/{}/agent_sessions/{}/{}/session.json",
-                        active.network, wallet, s.id
-                    ),
-                    allowed,
-                    denied,
-                })
-            })
-            .collect()
+                ));
+            }
+        }
+        // Persisted sessions left behind by a daemon restart (key not in the
+        // in-memory map) are genuinely orphaned and would otherwise be invisible
+        // here. Surface them so the owner sees they need recovery.
+        entries.extend(self.persisted_orphan_capability_views(wallet, &in_memory));
+        entries
+    }
+
+    /// Scan the on-disk session store for this wallet's still-active persisted
+    /// sessions that are NOT in the in-memory map, and render them as orphaned
+    /// capability entries needing owner recovery.
+    fn persisted_orphan_capability_views(
+        &self,
+        wallet: &str,
+        in_memory: &HashSet<(String, String)>,
+    ) -> Vec<CapabilityViewEntry> {
+        let Some(root) = &self.store_root else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for network in ["mainnet", "testnet"] {
+            let wallet_dir = root.join("agent_sessions").join(network).join(wallet);
+            let Ok(read_dir) = std::fs::read_dir(&wallet_dir) else {
+                continue;
+            };
+            for entry in read_dir.flatten() {
+                if !entry.path().is_dir() {
+                    continue;
+                }
+                let Some(id) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if in_memory.contains(&(network.to_string(), id.clone())) {
+                    continue;
+                }
+                let session_path = entry.path().join("session.json");
+                let Ok(bytes) = std::fs::read(&session_path) else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+                    continue;
+                };
+                // Only surface sessions that are still live (not stopped /
+                // cleaned up / expired); finished ones are not pending recovery.
+                let stopped = value
+                    .get("stopped")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let cleaned = optional_u64(&value, "cleanup_completed_ms").is_some();
+                let status_str = value.get("status").and_then(Value::as_str).unwrap_or("");
+                if stopped || cleaned || status_str != "Active" {
+                    continue;
+                }
+                let Some(bounds) = value
+                    .get("bounds")
+                    .cloned()
+                    .and_then(|b| serde_json::from_value::<HyperliquidPolicy>(b).ok())
+                else {
+                    continue;
+                };
+                let created_ms = value
+                    .get("created_ms")
+                    .and_then(Value::as_u64)
+                    .map(u128::from)
+                    .unwrap_or(0);
+                let expires_ms = value
+                    .get("expires_ms")
+                    .and_then(Value::as_u64)
+                    .map(u128::from)
+                    .unwrap_or(0);
+                out.push(hl_capability_entry(
+                    network,
+                    wallet,
+                    &id,
+                    &bounds,
+                    created_ms,
+                    expires_ms,
+                    CapabilityStatus::Orphaned,
+                ));
+            }
+        }
+        out
     }
 
     fn client(&self, network: &str) -> Result<&HyperliquidClient, HandlerError> {
@@ -528,9 +552,9 @@ impl HyperliquidHandler {
             .info(wallet)
             .map_err(|e| HandlerError::backend(e.to_string()))?;
         let policy = info.policy.hyperliquid.clone();
-        if !policy.is_configured() {
+        if !policy.is_session_capable() {
             return Err(HandlerError::invalid(
-                "refusing to create Hyperliquid agent session without a configured wallet [hyperliquid] policy",
+                "refusing to create Hyperliquid agent session: wallet [hyperliquid] policy must set allowed_assets, max_notional_usd, max_position_usd, and max_loss_usd",
             ));
         }
         let owner_signer = self.keystore.signer(wallet).map_err(|e| {
@@ -542,7 +566,13 @@ impl HyperliquidHandler {
         let agent_address = agent.address();
         let agent_name = resolve_hyperliquid_agent_session_name(req.agent_name.as_deref());
         let agent_key_persisted = self.persist_agent_key(network_name, wallet, &id, &agent)?;
-        let user = format!("{:#x}", info.address);
+        // Risk is monitored on the account the session actually trades: the vault
+        // when one is requested, otherwise the master wallet.
+        let vault_address = req.vault_address.clone();
+        let user = match vault_address.as_deref() {
+            Some(v) => v.to_string(),
+            None => format!("{:#x}", info.address),
+        };
         let clearinghouse = client
             .info(json!({"type": "clearinghouseState", "user": user}))
             .await
@@ -563,6 +593,11 @@ impl HyperliquidHandler {
         let approve_response = match client.exchange(payload.clone()).await {
             Ok(response) => response,
             Err(e) => {
+                if agent_key_persisted
+                    && let Ok(path) = self.sealed_agent_key_path(network_name, wallet, &id)
+                {
+                    let _ = std::fs::remove_file(&path);
+                }
                 let extra_agents = client
                     .info(json!({"type": "extraAgents", "user": format!("{:#x}", info.address)}))
                     .await
@@ -597,6 +632,7 @@ impl HyperliquidHandler {
             network: network_name.to_string(),
             wallet: wallet.to_string(),
             agent,
+            vault_address,
             session,
             stopped: false,
             cleanup_started_ms: None,
@@ -758,8 +794,13 @@ impl HyperliquidHandler {
         active: &Arc<Mutex<ActiveHlSession>>,
         orphaned: bool,
     ) -> Result<Option<HlSnapshot>, HandlerError> {
-        let owner = active.lock().wallet.clone();
-        let snapshot = self.hl_account_snapshot(client, &owner).await;
+        let (owner, vault_address) = {
+            let guard = active.lock();
+            (guard.wallet.clone(), guard.vault_address.clone())
+        };
+        let snapshot = self
+            .hl_account_snapshot(client, &owner, vault_address.as_deref())
+            .await;
         let mut guard = active.lock();
         self.apply_snapshot_to_session(&mut guard, snapshot.as_ref());
         self.persist_session_metadata(&guard, orphaned)?;
@@ -814,6 +855,17 @@ impl HyperliquidHandler {
         let active = self
             .active_session_or_recover(client, target.network, target.wallet, target.id)
             .await?;
+        // A submit must target the same account the session is scoped to, so it
+        // can't route orders to an account the monitor/cleanup won't cover.
+        {
+            let guard = active.lock();
+            if !vault_matches(guard.vault_address.as_deref(), req.vault_address.as_deref()) {
+                return Err(HandlerError::invalid(format!(
+                    "submit vaultAddress {:?} does not match the session's account {:?}",
+                    req.vault_address, guard.vault_address
+                )));
+            }
+        }
         {
             let mut guard = active.lock();
             if guard.stopped || guard.session.status != SessionStatus::Active {
@@ -839,11 +891,13 @@ impl HyperliquidHandler {
                 }
             }
         }
+        let bounds = active.lock().session.bounds.clone();
         self.enforce_hyperliquid_policy(
             client,
             target.wallet,
             &req.action,
             req.vault_address.as_deref(),
+            Some(&bounds),
         )
         .await?;
         let signer = {
@@ -922,6 +976,21 @@ impl HyperliquidHandler {
             .info(json!({"type": "openOrders", "user": user}))
             .await
             .map_err(err_be)?;
+        let meta = client.info(json!({"type": "meta"})).await.map_err(err_be)?;
+        let coin_to_asset: HashMap<String, u32> = meta
+            .get("universe")
+            .and_then(|u| u.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .enumerate()
+                    .filter_map(|(idx, entry)| {
+                        let coin = entry.get("name")?.as_str()?.to_string();
+                        let asset = u32::try_from(idx).ok()?;
+                        Some((coin, asset))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut cancels = Vec::new();
         if let Some(orders) = open_orders.as_array() {
             for order in orders {
@@ -930,10 +999,10 @@ impl HyperliquidHandler {
                 };
                 let asset = match order.get("asset").and_then(Value::as_u64) {
                     Some(asset) => Some(asset as u32),
-                    None => match order.get("coin").and_then(Value::as_str) {
-                        Some(coin) => self.hl_asset_for_coin(client, coin).await,
-                        None => None,
-                    },
+                    None => order
+                        .get("coin")
+                        .and_then(Value::as_str)
+                        .and_then(|c| coin_to_asset.get(c).copied()),
                 };
                 if let Some(asset) = asset {
                     cancels.push(CancelWire { asset, oid });
@@ -954,6 +1023,26 @@ impl HyperliquidHandler {
             .info(json!({"type": "clearinghouseState", "user": user}))
             .await
             .map_err(err_be)?;
+        let meta = client.info(json!({"type": "meta"})).await.map_err(err_be)?;
+        let coin_info: HashMap<String, (u32, usize)> = meta
+            .get("universe")
+            .and_then(|u| u.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .enumerate()
+                    .filter_map(|(idx, entry)| {
+                        let coin = entry.get("name")?.as_str()?.to_string();
+                        let asset = u32::try_from(idx).ok()?;
+                        let sz_decimals = entry
+                            .get("szDecimals")?
+                            .as_u64()
+                            .and_then(|n| usize::try_from(n).ok())
+                            .unwrap_or(5);
+                        Some((coin, (asset, sz_decimals)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut closes = Vec::new();
         if let Some(positions) = clearinghouse
             .get("assetPositions")
@@ -976,7 +1065,7 @@ impl HyperliquidHandler {
                 if szi == 0.0 {
                     continue;
                 }
-                let Some(asset) = self.hl_asset_for_coin(client, coin).await else {
+                let Some(&(asset, sz_decimals)) = coin_info.get(coin) else {
                     continue;
                 };
                 let book = client
@@ -993,12 +1082,7 @@ impl HyperliquidHandler {
                     asset,
                     is_buy: close_is_buy,
                     price: format_hl_close_price(px)?,
-                    size: format_decimal(
-                        szi.abs(),
-                        self.hl_sz_decimals_for_coin(client, coin)
-                            .await
-                            .unwrap_or(5),
-                    ),
+                    size: format_decimal(szi.abs(), sz_decimals),
                     reduce_only: true,
                     order_type: OrderTypeWire {
                         limit: Some(LimitOrderType {
@@ -1043,9 +1127,12 @@ impl HyperliquidHandler {
             return Err(HandlerError::NotFound(format!("agent session {id}")));
         }
         let session = persisted_orphan_recovery_session(&session_path, id)?;
+        // Address-only: a safety-cleanup / recovery path needs the identity, not
+        // the trading policy. Use the unverified accessor so a stale/edited
+        // passkey policy signature can't block owner-signed cancel/close.
         let owner = self
             .keystore
-            .info(wallet)
+            .info_unverified(wallet)
             .map_err(|e| HandlerError::backend(e.to_string()))?
             .address;
         let extra_agents = client
@@ -1065,6 +1152,39 @@ impl HyperliquidHandler {
         Ok(HyperliquidSigner::new(signer))
     }
 
+    /// The vault/subaccount a persisted (orphaned) session traded on, recovered
+    /// from its `session.json` so owner-signed cleanup flattens the right account.
+    fn orphan_session_vault(
+        &self,
+        network_name: &str,
+        wallet: &str,
+        id: &str,
+    ) -> Result<Option<String>, HandlerError> {
+        let session_path = self
+            .session_store_dir(network_name, wallet, id)?
+            .join("session.json");
+        Ok(persisted_orphan_recovery_session(&session_path, id)?.vault_address)
+    }
+
+    /// Account address to query for orphan recovery: the session's vault when
+    /// set, else the owner wallet (address-only → unverified accessor).
+    fn orphan_recovery_user(
+        &self,
+        wallet: &str,
+        vault_address: Option<&str>,
+    ) -> Result<String, HandlerError> {
+        match vault_address {
+            Some(v) => Ok(v.to_string()),
+            None => Ok(format!(
+                "{:#x}",
+                self.keystore
+                    .info_unverified(wallet)
+                    .map_err(|e| HandlerError::backend(e.to_string()))?
+                    .address
+            )),
+        }
+    }
+
     /// Sign a Cancel / reduce-only-close action with the OWNER key and submit,
     /// recording an explicit owner-recovery audit event.
     #[allow(clippy::too_many_arguments)]
@@ -1077,6 +1197,7 @@ impl HyperliquidHandler {
         id: &str,
         owner: &HyperliquidSigner,
         action: ExchangeAction,
+        vault_address: Option<String>,
         event: &str,
     ) -> Result<Value, HandlerError> {
         let payload = sign_submit_payload(
@@ -1085,7 +1206,7 @@ impl HyperliquidHandler {
             SignSubmit {
                 action,
                 nonce: Some(bloom_hyperliquid::now_ms()),
-                vault_address: None,
+                vault_address,
                 expires_after: Some(bloom_hyperliquid::now_ms() + 60_000),
             },
         )
@@ -1112,12 +1233,8 @@ impl HyperliquidHandler {
         let owner_signer = self
             .orphan_owner_signer(client, network_name, wallet, id)
             .await?;
-        let owner = self
-            .keystore
-            .info(wallet)
-            .map_err(|e| HandlerError::backend(e.to_string()))?
-            .address;
-        let user = format!("{owner:#x}");
+        let vault_address = self.orphan_session_vault(network_name, wallet, id)?;
+        let user = self.orphan_recovery_user(wallet, vault_address.as_deref())?;
         let cancels = self.collect_cancel_wires(client, &user).await?;
         if cancels.is_empty() {
             let response = json!({"status": "noop", "reason": "no open orders"});
@@ -1143,6 +1260,7 @@ impl HyperliquidHandler {
                 id,
                 &owner_signer,
                 action,
+                vault_address,
                 "orphan_cancel_all",
             )
             .await?;
@@ -1207,12 +1325,8 @@ impl HyperliquidHandler {
         let owner_signer = self
             .orphan_owner_signer(client, network_name, wallet, id)
             .await?;
-        let owner = self
-            .keystore
-            .info(wallet)
-            .map_err(|e| HandlerError::backend(e.to_string()))?
-            .address;
-        let user = format!("{owner:#x}");
+        let vault_address = self.orphan_session_vault(network_name, wallet, id)?;
+        let user = self.orphan_recovery_user(wallet, vault_address.as_deref())?;
         // Cancel resting orders first, then reduce-only-close positions.
         let cancels = self.collect_cancel_wires(client, &user).await?;
         let cancel_response = if cancels.is_empty() {
@@ -1229,6 +1343,7 @@ impl HyperliquidHandler {
                     cancels,
                     fast: Some(true),
                 },
+                vault_address.clone(),
                 "orphan_cancel_all",
             )
             .await?
@@ -1259,6 +1374,7 @@ impl HyperliquidHandler {
                 id,
                 &owner_signer,
                 action,
+                vault_address,
                 "orphan_close_all",
             )
             .await?;
@@ -1283,21 +1399,30 @@ impl HyperliquidHandler {
         let active = self
             .active_session_or_recover(client, network_name, wallet, id)
             .await?;
-        let (agent_signer, user) = {
+        let (agent_signer, user, vault_address) = {
             let guard = active.lock();
             if guard.stopped {
                 return Err(HandlerError::invalid(
                     "Hyperliquid agent session is stopped",
                 ));
             }
-            let owner = self
-                .keystore
-                .info(&guard.wallet)
-                .map_err(|e| HandlerError::backend(e.to_string()))?
-                .address;
+            // Cancel orders on the account the session trades (vault or master).
+            // Address-only → unverified accessor (a tampered policy sig must not
+            // block safety cleanup).
+            let user = match guard.vault_address.as_deref() {
+                Some(v) => v.to_string(),
+                None => format!(
+                    "{:#x}",
+                    self.keystore
+                        .info_unverified(&guard.wallet)
+                        .map_err(|e| HandlerError::backend(e.to_string()))?
+                        .address
+                ),
+            };
             (
                 HyperliquidSigner::new(guard.agent.signer()),
-                format!("{owner:#x}"),
+                user,
+                guard.vault_address.clone(),
             )
         };
         let cancels = self.collect_cancel_wires(client, &user).await?;
@@ -1316,7 +1441,8 @@ impl HyperliquidHandler {
             fast: Some(true),
         };
         if !forced {
-            self.enforce_hyperliquid_policy(client, wallet, &action, None)
+            let bounds = active.lock().session.bounds.clone();
+            self.enforce_hyperliquid_policy(client, wallet, &action, None, Some(&bounds))
                 .await?;
         }
         let payload = sign_submit_payload(
@@ -1325,7 +1451,7 @@ impl HyperliquidHandler {
             SignSubmit {
                 action,
                 nonce: Some(bloom_hyperliquid::now_ms()),
-                vault_address: None,
+                vault_address: vault_address.clone(),
                 expires_after: Some(bloom_hyperliquid::now_ms() + 60_000),
             },
         )
@@ -1374,16 +1500,24 @@ impl HyperliquidHandler {
         let active = self
             .active_session_or_recover(client, network_name, wallet, id)
             .await?;
-        let (agent_signer, user) = {
+        let (agent_signer, user, vault_address) = {
             let guard = active.lock();
-            let owner = self
-                .keystore
-                .info(&guard.wallet)
-                .map_err(|e| HandlerError::backend(e.to_string()))?
-                .address;
+            // Flatten positions on the account the session trades (vault or
+            // master). Address-only → unverified accessor.
+            let user = match guard.vault_address.as_deref() {
+                Some(v) => v.to_string(),
+                None => format!(
+                    "{:#x}",
+                    self.keystore
+                        .info_unverified(&guard.wallet)
+                        .map_err(|e| HandlerError::backend(e.to_string()))?
+                        .address
+                ),
+            };
             (
                 HyperliquidSigner::new(guard.agent.signer()),
-                format!("{owner:#x}"),
+                user,
+                guard.vault_address.clone(),
             )
         };
         let closes = self.collect_reduce_only_closes(client, &user).await?;
@@ -1405,7 +1539,8 @@ impl HyperliquidHandler {
         // Forced = monitor safety flatten of an already-approved session; skip
         // trading policy so a later policy edit can't block the close.
         if !forced {
-            self.enforce_hyperliquid_policy(client, wallet, &action, None)
+            let bounds = active.lock().session.bounds.clone();
+            self.enforce_hyperliquid_policy(client, wallet, &action, None, Some(&bounds))
                 .await?;
         }
         let payload = sign_submit_payload(
@@ -1414,7 +1549,7 @@ impl HyperliquidHandler {
             SignSubmit {
                 action,
                 nonce: Some(bloom_hyperliquid::now_ms()),
-                vault_address: None,
+                vault_address: vault_address.clone(),
                 expires_after: Some(bloom_hyperliquid::now_ms() + 60_000),
             },
         )
@@ -1484,11 +1619,9 @@ impl HyperliquidHandler {
             }
             {
                 let mut guard = active.lock();
-                guard.cleanup_started_ms.get_or_insert_with(|| {
-                    u128::from(bloom_hyperliquid::now_ms())
-                        .try_into()
-                        .unwrap_or(u64::MAX)
-                });
+                guard
+                    .cleanup_started_ms
+                    .get_or_insert_with(bloom_hyperliquid::now_ms);
                 guard.last_cleanup_error = None;
                 let _ = self.persist_session_metadata(&guard, false);
             }
@@ -1565,8 +1698,14 @@ impl HyperliquidHandler {
     ) -> Result<(), HandlerError> {
         // Policy boundary: no exchange action signs just because the wallet is
         // unlocked. Evaluate the verified per-wallet [hyperliquid] policy first.
-        self.enforce_hyperliquid_policy(client, wallet, &req.action, req.vault_address.as_deref())
-            .await?;
+        self.enforce_hyperliquid_policy(
+            client,
+            wallet,
+            &req.action,
+            req.vault_address.as_deref(),
+            None,
+        )
+        .await?;
         let signer = self.keystore.signer(wallet).map_err(|e| {
             HandlerError::PermissionDenied
                 .with_context(format!("wallet '{wallet}' is locked or unavailable: {e}"))
@@ -1593,12 +1732,8 @@ impl HyperliquidHandler {
     ) -> Result<(), HandlerError> {
         use bloom_proto::{HyperliquidActionCtx, HyperliquidPolicy};
         let dest = parse_address(&req.destination).map_err(err_invalid)?;
-        // Parse amount to micro-USD for the policy cap comparison.
-        let amount_micro = req
-            .amount
-            .parse::<f64>()
-            .map(|f| (f * 1_000_000.0) as u64)
-            .ok();
+        // Parse amount exactly to micro-USDC for the policy cap comparison.
+        let amount_micro = Some(parse_usdc_micro_amount(&req.amount)?);
         let policy: HyperliquidPolicy = self
             .keystore
             .info(wallet)
@@ -1651,18 +1786,25 @@ impl HyperliquidHandler {
         wallet: &str,
         action: &ExchangeAction,
         vault_address: Option<&str>,
+        bounds: Option<&HyperliquidPolicy>,
     ) -> Result<(), HandlerError> {
-        use bloom_proto::{
-            HyperliquidActionCtx, HyperliquidPolicy, PolicyOutcome, evaluate_hyperliquid_action,
+        use bloom_proto::{HyperliquidActionCtx, PolicyOutcome, evaluate_hyperliquid_action};
+        // For agent sessions, the security envelope is the bounds approved at the
+        // session ceremony (persisted on the session) — NOT the wallet's current
+        // [hyperliquid] policy, which an operator could widen after approval. The
+        // one-shot owner-signed paths pass `None` and use the verified live
+        // policy (a passkey wallet's unsigned/tampered policy must not authorize
+        // trades).
+        let policy: HyperliquidPolicy = match bounds {
+            Some(b) => b.clone(),
+            None => {
+                self.keystore
+                    .info(wallet)
+                    .map_err(|e| HandlerError::backend(e.to_string()))?
+                    .policy
+                    .hyperliquid
+            }
         };
-        // Verified policy: a passkey wallet's unsigned/tampered policy must not
-        // authorize trades.
-        let policy: HyperliquidPolicy = self
-            .keystore
-            .info(wallet)
-            .map_err(|e| HandlerError::backend(e.to_string()))?
-            .policy
-            .hyperliquid;
         // Trading is opt-in: an unconfigured [hyperliquid] policy denies all
         // signed actions, matching the agent-session ceremony (which already
         // requires a configured policy). No silent permissive default.
@@ -1684,20 +1826,26 @@ impl HyperliquidHandler {
                 let need_snapshot =
                     policy.max_position_usd.is_some() || policy.max_loss_usd.is_some();
                 let snapshot = if need_snapshot {
-                    self.hl_account_snapshot(client, wallet).await
+                    self.hl_account_snapshot(client, wallet, vault_address)
+                        .await
                 } else {
                     None
                 };
+                let meta = client.info(json!({"type": "meta"})).await.ok();
+                let asset_to_coin = perp_asset_to_coin_map(meta.as_ref());
                 for o in orders {
                     let order_type = if o.order_type.trigger.is_some() {
                         "trigger"
                     } else {
                         "limit"
                     };
-                    let coin = self.hl_coin_for_asset(client, o.asset).await;
+                    let coin = asset_to_coin.get(&o.asset).cloned();
                     let position = snapshot
                         .as_ref()
                         .and_then(|s| coin.as_deref().and_then(|c| s.position_micro(c)));
+                    let resting = snapshot
+                        .as_ref()
+                        .and_then(|s| coin.as_deref().and_then(|c| s.resting_micro(c)));
                     ctxs.push(HyperliquidActionCtx {
                         wallet: wallet.to_string(),
                         action_kind: kind.clone(),
@@ -1708,6 +1856,7 @@ impl HyperliquidHandler {
                         vault_or_subaccount: vault,
                         notional_microusd: notional_micro(&o.size, &o.price),
                         position_microusd: position,
+                        resting_notional_microusd: resting,
                         est_unrealized_loss_microusd: snapshot
                             .as_ref()
                             .and_then(|s| s.unrealized_loss),
@@ -1716,10 +1865,15 @@ impl HyperliquidHandler {
                     });
                 }
             }
-            ExchangeAction::UpdateLeverage { leverage, .. } => {
+            ExchangeAction::UpdateLeverage {
+                asset, leverage, ..
+            } => {
+                let meta = client.info(json!({"type": "meta"})).await.ok();
+                let asset_to_coin = perp_asset_to_coin_map(meta.as_ref());
                 ctxs.push(HyperliquidActionCtx {
                     wallet: wallet.to_string(),
                     action_kind: kind.clone(),
+                    asset: asset_to_coin.get(asset).cloned(),
                     leverage: Some(*leverage),
                     vault_or_subaccount: vault,
                     snapshot_readable: true,
@@ -1750,51 +1904,36 @@ impl HyperliquidHandler {
         Ok(())
     }
 
-    /// Resolve a perp asset index to its coin symbol via the meta universe.
-    /// Best-effort: `None` on any lookup failure (the evaluator's asset
-    /// allowlist then simply can't match, which only matters when one is set).
-    async fn hl_coin_for_asset(&self, client: &HyperliquidClient, asset: u32) -> Option<String> {
-        let meta = client.info(json!({"type": "meta"})).await.ok()?;
-        meta.get("universe")?
-            .as_array()?
-            .get(asset as usize)?
-            .get("name")?
-            .as_str()
-            .map(str::to_string)
-    }
-
-    async fn hl_asset_for_coin(&self, client: &HyperliquidClient, coin: &str) -> Option<u32> {
-        let meta = client.info(json!({"type": "meta"})).await.ok()?;
-        meta.get("universe")?
-            .as_array()?
-            .iter()
-            .position(|entry| entry.get("name").and_then(Value::as_str) == Some(coin))
-            .and_then(|idx| u32::try_from(idx).ok())
-    }
-
-    async fn hl_sz_decimals_for_coin(
-        &self,
-        client: &HyperliquidClient,
-        coin: &str,
-    ) -> Option<usize> {
-        let meta = client.info(json!({"type": "meta"})).await.ok()?;
-        sz_decimals_by_coin(&meta, coin)
-    }
-
     /// Fetch + parse the wallet's clearinghouse snapshot for the stateful caps.
     /// `None` when unreadable → callers fail closed.
     async fn hl_account_snapshot(
         &self,
         client: &HyperliquidClient,
         wallet: &str,
+        vault_address: Option<&str>,
     ) -> Option<HlSnapshot> {
-        let address = self.keystore.info(wallet).ok()?.address;
-        let user = format!("{address:#x}");
+        // Snapshot the account the session trades on: the vault when set, else
+        // the master wallet. Address-only, so use the unverified accessor — a
+        // tampered policy signature must not silently blind risk monitoring.
+        let user = match vault_address {
+            Some(v) => v.to_string(),
+            None => format!("{:#x}", self.keystore.info_unverified(wallet).ok()?.address),
+        };
         let v = client
             .info(json!({"type": "clearinghouseState", "user": user}))
             .await
             .ok()?;
-        Some(HlSnapshot::from_clearinghouse(&v))
+        let mut snapshot = HlSnapshot::from_clearinghouse(&v);
+        // Resting open-order notional feeds the position cap. Fail closed if it
+        // can't be read: leave `resting_notional` = None so the evaluator denies
+        // a risk-adding order while a position cap is configured.
+        if let Ok(orders) = client
+            .info(json!({"type": "openOrders", "user": user}))
+            .await
+        {
+            snapshot.apply_open_orders(&orders);
+        }
+        Some(snapshot)
     }
 
     fn persist_response(
@@ -2266,9 +2405,12 @@ impl HyperliquidHandler {
         else {
             return Ok(None);
         };
+        // Address-only: a safety-cleanup / recovery path needs the identity, not
+        // the trading policy. Use the unverified accessor so a stale/edited
+        // passkey policy signature can't block owner-signed cancel/close.
         let owner = self
             .keystore
-            .info(wallet)
+            .info_unverified(wallet)
             .map_err(|e| HandlerError::backend(e.to_string()))?
             .address;
         let extra_agents = match client
@@ -2302,6 +2444,7 @@ impl HyperliquidHandler {
             network: network.to_string(),
             wallet: wallet.to_string(),
             agent,
+            vault_address: persisted.vault_address,
             session: persisted.session,
             stopped: persisted.stopped,
             cleanup_started_ms: persisted.cleanup_started_ms,
@@ -2740,6 +2883,7 @@ impl Handler for HyperliquidHandler {
                     wallet,
                     &req.action,
                     req.vault_address.as_deref(),
+                    None,
                 )
                 .await?;
                 let payload = signed_payload(
@@ -2877,12 +3021,20 @@ impl Handler for HyperliquidHandler {
 struct AgentSessionCreate {
     id: Option<String>,
     agent_name: Option<String>,
+    /// Vault/subaccount this session trades on. When set, the session's risk
+    /// monitoring and cleanup target this account (not the master wallet), and
+    /// every submit must carry a matching `vaultAddress`.
+    #[serde(default)]
+    vault_address: Option<String>,
 }
 
 struct ActiveHlSession {
     network: String,
     wallet: String,
     agent: EphemeralAgentKey,
+    /// Vault/subaccount address (hex) this session trades on, or `None` for the
+    /// master wallet account. Determines which account is monitored and flattened.
+    vault_address: Option<String>,
     session: HyperliquidSession,
     stopped: bool,
     cleanup_started_ms: Option<u64>,
@@ -2900,6 +3052,7 @@ struct ActiveHlSession {
 
 struct PersistedActiveSession {
     session: HyperliquidSession,
+    vault_address: Option<String>,
     stopped: bool,
     cleanup_started_ms: Option<u64>,
     cleanup_completed_ms: Option<u64>,
@@ -2998,8 +3151,14 @@ fn persisted_active_session_from_value(
         .try_into()
         .unwrap_or(u32::MAX);
     session.status = status;
+    let vault_address = value
+        .get("vault_address")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     Ok(PersistedActiveSession {
         session,
+        vault_address,
         stopped,
         cleanup_started_ms: optional_u64(value, "cleanup_started_ms"),
         cleanup_completed_ms,
@@ -3043,8 +3202,18 @@ fn optional_u64(value: &Value, key: &str) -> Option<u64> {
     value.get(key).and_then(Value::as_u64)
 }
 
+fn parse_usdc_micro_amount(amount: &str) -> Result<u64, HandlerError> {
+    let parsed = bloom_proto::parse_units(amount.trim(), 6)
+        .map_err(|e| HandlerError::invalid(format!("invalid USDC amount '{amount}': {e}")))?;
+    u64::try_from(parsed)
+        .map_err(|_| HandlerError::invalid(format!("USDC amount '{amount}' is too large")))
+}
+
 struct PersistedOrphanRecoverySession {
     agent_address: String,
+    /// Vault/subaccount the session traded on, recovered so owner-signed cleanup
+    /// flattens the right account.
+    vault_address: Option<String>,
 }
 
 fn persisted_orphan_recovery_session(
@@ -3087,7 +3256,15 @@ fn persisted_orphan_recovery_session(
             ))
         })?
         .to_ascii_lowercase();
-    Ok(PersistedOrphanRecoverySession { agent_address })
+    let vault_address = value
+        .get("vault_address")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Ok(PersistedOrphanRecoverySession {
+        agent_address,
+        vault_address,
+    })
 }
 
 fn extra_agents_contains_agent(extra_agents: &Value, agent_address: &str) -> bool {
@@ -3145,6 +3322,79 @@ fn session_status_json(active: &ActiveHlSession, breach_action: BreachAction) ->
     session_status_json_with_orphaned(active, breach_action, false)
 }
 
+/// Build a Hyperliquid capability view entry from a session's bounds. Shared by
+/// the in-memory roll-up and the persisted-orphan scan so both render identically.
+fn hl_capability_entry(
+    network: &str,
+    wallet: &str,
+    id: &str,
+    bounds: &HyperliquidPolicy,
+    created_ms: u128,
+    expires_ms: u128,
+    status: CapabilityStatus,
+) -> CapabilityViewEntry {
+    let now = bloom_proto::capability::now_ms_u128();
+    let mut allowed = vec![format!(
+        "place orders on {}",
+        if bounds.allowed_assets.is_empty() {
+            "all assets"
+        } else {
+            "allowed assets"
+        }
+    )];
+    if !bounds.allowed_assets.is_empty() {
+        allowed.push(format!(
+            "assets: {}",
+            bounds
+                .allowed_assets
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(n) = bounds.max_notional_usd {
+        allowed.push(format!("max order: ${:.2}", n as f64 / 1_000_000.0));
+    }
+    if let Some(p) = bounds.max_position_usd {
+        allowed.push(format!("max position: ${:.2}", p as f64 / 1_000_000.0));
+    }
+    if let Some(lev) = bounds.max_leverage {
+        allowed.push(format!("max leverage: {lev}x"));
+    }
+    let mut denied = Vec::new();
+    if bounds.withdrawal_cap_usd.is_some() || bounds.transfer_cap_usd.is_some() {
+        denied.push("withdrawals and transfers are denied for agent sessions".into());
+    }
+    CapabilityViewEntry {
+        id: id.to_string(),
+        wallet: wallet.to_string(),
+        venue: Venue::Hyperliquid,
+        signing_model: SigningModel::HoldsDelegatedKey,
+        created_ms,
+        expires_ms: Some(expires_ms),
+        expires_in_secs: if expires_ms > now {
+            Some(((expires_ms - now) / 1000) as u64)
+        } else {
+            None
+        },
+        status,
+        limits: serde_json::json!({
+            "max_notional_usd": bounds.max_notional_usd,
+            "max_position_usd": bounds.max_position_usd,
+            "max_loss_usd": bounds.max_loss_usd,
+            "max_leverage": bounds.max_leverage,
+            "allowed_assets": bounds.allowed_assets,
+        }),
+        next_write_path: format!("/hyperliquid/{network}/agent_sessions/{wallet}/{id}/order.json"),
+        revoke_path: format!("/hyperliquid/{network}/agent_sessions/{wallet}/{id}/stop"),
+        audit_ref: format!("/hyperliquid/{network}/agent_sessions/{wallet}/{id}/audit.jsonl"),
+        review_ref: format!("/hyperliquid/{network}/agent_sessions/{wallet}/{id}/session.json"),
+        allowed,
+        denied,
+    }
+}
+
 fn session_is_tradable(
     active: &ActiveHlSession,
     breach_action: BreachAction,
@@ -3168,6 +3418,7 @@ fn session_status_json_with_orphaned(
         "network": active.network,
         "wallet": active.wallet,
         "agent_address": active.session.agent_address,
+        "vault_address": active.vault_address,
         "bounds": active.session.bounds,
         "status": format!("{:?}", active.session.status),
         "stopped": active.stopped,
@@ -3280,6 +3531,7 @@ fn asset_context_by_coin(value: Value, coin: &str) -> Result<Value, HandlerError
     }))
 }
 
+#[cfg(test)]
 fn sz_decimals_by_coin(meta: &Value, coin: &str) -> Option<usize> {
     meta.get("universe")?
         .as_array()?
@@ -3525,18 +3777,42 @@ fn action_notional_micro(action: &ExchangeAction) -> Option<u64> {
     }
 }
 
+fn perp_asset_to_coin_map(meta: Option<&Value>) -> HashMap<u32, String> {
+    meta.and_then(|m| m.get("universe"))
+        .and_then(|u| u.as_array())
+        .map(|arr| {
+            arr.iter()
+                .enumerate()
+                .filter_map(|(idx, entry)| {
+                    let coin = entry.get("name")?.as_str()?.to_string();
+                    let asset = u32::try_from(idx).ok()?;
+                    Some((asset, coin))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Order notional = size × price, in micro-USD (perps are USD-margined).
 /// `None` when either is unparseable, which the evaluator treats as fail-closed
 /// when a notional cap is configured.
-fn notional_micro(size: &str, price: &str) -> Option<u64> {
-    let s: f64 = size.trim().parse().ok()?;
-    let p: f64 = price.trim().parse().ok()?;
-    let micro = (s * p * 1_000_000.0).round();
-    if micro.is_finite() && micro >= 0.0 {
-        Some(micro as u64)
-    } else {
-        None
+/// Whether a submit's `vaultAddress` matches the session's scoped account.
+/// Both `None` (master account) matches; addresses compare case-insensitively
+/// since hex casing is not significant.
+fn vault_matches(session: Option<&str>, req: Option<&str>) -> bool {
+    match (session, req) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
     }
+}
+
+fn notional_micro(size: &str, price: &str) -> Option<u64> {
+    let size_micro: U256 = parse_units(size.trim(), 6).ok()?; // size in micro-base
+    let price_micro: U256 = parse_units(price.trim(), 6).ok()?; // price in micro-USD
+    let notional_micro = size_micro * price_micro; // (size * 1e6) * (price * 1e6) = size*price * 1e12
+    let notional_micro: u64 = (notional_micro / U256::from(1_000_000)).try_into().ok()?; // / 1e6 = size*price * 1e6
+    Some(notional_micro)
 }
 
 /// Parsed slice of a wallet's `clearinghouseState` for the stateful caps.
@@ -3546,25 +3822,29 @@ struct HlSnapshot {
     unrealized_loss: Option<u64>,
     /// Per-coin absolute position notional, micro-USD.
     positions: std::collections::HashMap<String, u64>,
+    /// Per-coin resting (unfilled) open-order notional, micro-USD. `None` until
+    /// the `openOrders` query is applied — the position cap fails closed while
+    /// this is unavailable so a burst of resting orders can't slip the cap.
+    resting_notional: Option<std::collections::HashMap<String, u64>>,
     open_orders: u32,
     open_positions: u32,
 }
 
 impl HlSnapshot {
     fn from_clearinghouse(v: &Value) -> Self {
-        let to_micro = |x: f64| -> u64 {
-            let m = (x.abs() * 1_000_000.0).round();
-            if m.is_finite() { m as u64 } else { 0 }
+        let str_to_micro = |s: &str| -> Option<u64> {
+            parse_units(s.trim(), 6)
+                .ok()
+                .and_then(|u| u.try_into().ok())
         };
         let account_value = v
             .get("marginSummary")
             .and_then(|m| m.get("accountValue"))
             .and_then(|a| a.as_str())
-            .and_then(|s| s.parse::<f64>().ok())
-            .map(to_micro);
+            .and_then(str_to_micro);
 
         let mut positions = std::collections::HashMap::new();
-        let mut loss_sum = 0.0f64;
+        let mut loss_sum = U256::ZERO;
         let mut open_positions = 0u32;
         if let Some(arr) = v.get("assetPositions").and_then(|p| p.as_array()) {
             for ap in arr {
@@ -3572,30 +3852,29 @@ impl HlSnapshot {
                     continue;
                 };
                 if let (Some(coin), Some(pv)) = (
-                    pos.get("coin").and_then(|c| c.as_str()),
-                    pos.get("positionValue")
-                        .and_then(|p| p.as_str())
-                        .and_then(|s| s.parse::<f64>().ok()),
-                ) {
-                    positions.insert(coin.to_string(), to_micro(pv));
-                    if pv != 0.0 {
+                    pos.get("coin").and_then(Value::as_str),
+                    pos.get("positionValue").and_then(Value::as_str),
+                ) && let Some(micro) = str_to_micro(pv)
+                {
+                    positions.insert(coin.to_string(), micro);
+                    if micro != 0 {
                         open_positions = open_positions.saturating_add(1);
                     }
                 }
-                if let Some(upnl) = pos
-                    .get("unrealizedPnl")
-                    .and_then(|p| p.as_str())
-                    .and_then(|s| s.parse::<f64>().ok())
-                    && upnl < 0.0
+                if let Some(upnl_str) = pos.get("unrealizedPnl").and_then(|p| p.as_str())
+                    && upnl_str.starts_with('-')
+                    && let Some(loss_micro) = str_to_micro(&upnl_str[1..])
                 {
-                    loss_sum += -upnl;
+                    loss_sum = loss_sum.saturating_add(U256::from(loss_micro));
                 }
             }
         }
+        let unrealized_loss: Option<u64> = loss_sum.try_into().ok();
         HlSnapshot {
             account_value,
-            unrealized_loss: Some(to_micro(loss_sum)),
+            unrealized_loss,
             positions,
+            resting_notional: None,
             open_orders: v
                 .get("openOrders")
                 .and_then(Value::as_array)
@@ -3604,8 +3883,47 @@ impl HlSnapshot {
         }
     }
 
+    /// Fold a HyperCore `openOrders` response into per-coin resting notional
+    /// (`sz × limitPx`). Sets `resting_notional` to `Some(..)` even when there
+    /// are no orders, so the position cap can distinguish "no resting orders"
+    /// from "orders unknown" (which fails closed).
+    fn apply_open_orders(&mut self, v: &Value) {
+        let mut resting: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut count = 0u32;
+        if let Some(arr) = v.as_array() {
+            for o in arr {
+                count = count.saturating_add(1);
+                let (Some(coin), Some(sz), Some(px)) = (
+                    o.get("coin").and_then(Value::as_str),
+                    o.get("sz").and_then(Value::as_str),
+                    o.get("limitPx").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                if let Some(micro) = notional_micro(sz, px) {
+                    *resting.entry(coin.to_string()).or_insert(0) = resting
+                        .get(coin)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(micro);
+                }
+            }
+        }
+        self.open_orders = count;
+        self.resting_notional = Some(resting);
+    }
+
     fn position_micro(&self, coin: &str) -> Option<u64> {
         self.positions.get(coin).copied()
+    }
+
+    /// Resting open-order notional for `coin`. `None` when open orders were not
+    /// successfully fetched (caller fails the position cap closed); `Some(0)`
+    /// when fetched but the coin has no resting orders.
+    fn resting_micro(&self, coin: &str) -> Option<u64> {
+        self.resting_notional
+            .as_ref()
+            .map(|m| m.get(coin).copied().unwrap_or(0))
     }
 }
 
@@ -3630,6 +3948,17 @@ impl HandlerErrorContext for HandlerError {
 mod tests {
     use super::*;
     use bloom_hyperliquid::{MAINNET_API_URL, TESTNET_API_URL};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{}-{}",
+            prefix,
+            NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     fn active_for_status(
         last_snapshot_ok_ms: Option<u64>,
@@ -3647,6 +3976,7 @@ mod tests {
             network: "mainnet".into(),
             wallet: "alice".into(),
             agent: EphemeralAgentKey::generate(),
+            vault_address: None,
             session,
             stopped: false,
             cleanup_started_ms: None,
@@ -3738,12 +4068,18 @@ mod tests {
         assert_eq!(recovered.session.status, SessionStatus::Active);
     }
 
+    #[test]
+    fn usd_send_amount_policy_parse_is_exact_micro_usdc() {
+        assert_eq!(parse_usdc_micro_amount("0.001").unwrap(), 1_000);
+        assert_eq!(parse_usdc_micro_amount("4.95").unwrap(), 4_950_000);
+        assert_eq!(parse_usdc_micro_amount("1.000001").unwrap(), 1_000_001);
+        assert!(parse_usdc_micro_amount("1.0000001").is_err());
+        assert!(parse_usdc_micro_amount("-1").is_err());
+        assert!(parse_usdc_micro_amount("18446744073710").is_err());
+    }
+
     fn handler() -> HyperliquidHandler {
-        let dir = std::env::temp_dir().join(format!(
-            "bloom-hl-test-{}-{}",
-            std::process::id(),
-            bloom_hyperliquid::now_ms()
-        ));
+        let dir = unique_test_dir("bloom-hl-test");
         HyperliquidHandler::new(
             HyperliquidClient::new(HyperliquidNetwork::Mainnet)
                 .with_base_url(url::Url::parse(MAINNET_API_URL).unwrap()),
@@ -3755,11 +4091,7 @@ mod tests {
 
     #[test]
     fn persisted_agent_key_round_trips_and_rejects_wrong_address() {
-        let h = handler().with_store_root(std::env::temp_dir().join(format!(
-            "bloom-hl-key-store-{}-{}",
-            std::process::id(),
-            bloom_hyperliquid::now_ms()
-        )));
+        let h = handler().with_store_root(unique_test_dir("bloom-hl-key-store"));
         let agent = EphemeralAgentKey::generate();
         let expected = format!("{:#x}", agent.address());
         assert!(
@@ -3914,11 +4246,7 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_agent_sessions_are_discoverable_after_restart() {
-        let store = std::env::temp_dir().join(format!(
-            "bloom-hl-store-{}-{}",
-            std::process::id(),
-            bloom_hyperliquid::now_ms()
-        ));
+        let store = unique_test_dir("bloom-hl-store");
         let h = handler().with_store_root(store.clone());
         let session_dir = store
             .join("agent_sessions")
@@ -3960,11 +4288,7 @@ mod tests {
 
     #[tokio::test]
     async fn live_status_wins_over_persisted_orphaned_copy() {
-        let store = std::env::temp_dir().join(format!(
-            "bloom-hl-store-{}-{}",
-            std::process::id(),
-            bloom_hyperliquid::now_ms()
-        ));
+        let store = unique_test_dir("bloom-hl-store");
         let h = handler().with_store_root(store.clone());
         let session_dir = store
             .join("agent_sessions")
@@ -3990,6 +4314,7 @@ mod tests {
             network: "mainnet".into(),
             wallet: "minnow".into(),
             agent: EphemeralAgentKey::generate(),
+            vault_address: None,
             session,
             stopped: false,
             cleanup_started_ms: None,
@@ -4014,11 +4339,7 @@ mod tests {
 
     #[test]
     fn persisted_session_last_response_includes_payload() {
-        let store = std::env::temp_dir().join(format!(
-            "bloom-hl-store-{}-{}",
-            std::process::id(),
-            bloom_hyperliquid::now_ms()
-        ));
+        let store = unique_test_dir("bloom-hl-store");
         let h = handler().with_store_root(store.clone());
         let payload = json!({
             "action": {
@@ -4058,11 +4379,7 @@ mod tests {
 
     #[test]
     fn create_guard_rejects_live_persisted_session() {
-        let store = std::env::temp_dir().join(format!(
-            "bloom-hl-store-{}-{}",
-            std::process::id(),
-            bloom_hyperliquid::now_ms()
-        ));
+        let store = unique_test_dir("bloom-hl-store");
         let h = handler().with_store_root(store.clone());
         let session_dir = store
             .join("agent_sessions")
@@ -4100,6 +4417,7 @@ mod tests {
             network: "mainnet".into(),
             wallet: "minnow".into(),
             agent: EphemeralAgentKey::generate(),
+            vault_address: None,
             session,
             stopped: false,
             cleanup_started_ms: None,
@@ -4139,6 +4457,7 @@ mod tests {
             network: "mainnet".into(),
             wallet: "minnow".into(),
             agent: EphemeralAgentKey::generate(),
+            vault_address: None,
             session,
             stopped: true,
             cleanup_started_ms: None,
@@ -4179,11 +4498,7 @@ mod tests {
 
     #[test]
     fn orphan_recovery_releases_persisted_create_guard() {
-        let store = std::env::temp_dir().join(format!(
-            "bloom-hl-store-{}-{}",
-            std::process::id(),
-            bloom_hyperliquid::now_ms()
-        ));
+        let store = unique_test_dir("bloom-hl-store");
         let h = handler().with_store_root(store.clone());
         let session_dir = store
             .join("agent_sessions")
@@ -4223,11 +4538,7 @@ mod tests {
 
     #[test]
     fn orphan_recovery_requires_live_orphan_persisted_state() {
-        let dir = std::env::temp_dir().join(format!(
-            "bloom-hl-orphan-state-{}-{}",
-            std::process::id(),
-            bloom_hyperliquid::now_ms()
-        ));
+        let dir = unique_test_dir("bloom-hl-orphan-state");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session.json");
         std::fs::write(

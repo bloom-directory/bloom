@@ -419,6 +419,22 @@ impl IpcServer {
                 .unlock(wallet, passphrase.unwrap_or(""))
                 .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?,
         }
+        // For a policy-session mint, persist the one-time reviewed-intent approval
+        // marker the VFS mint handler requires. The passkey branch bound this exact
+        // descriptor in its ceremony; the passphrase branch's unlock is the presence
+        // proof. Either way a real ceremony happened, so the marker is authorized.
+        if is_policy_session_new(wallet, &path)
+            && let Some(home) = keystore.root().parent()
+        {
+            let intent =
+                bloom_proto::policy_session_mint_intent(wallet, &path.to_string_path(), &bytes);
+            bloom_vfs::policy_session_review::persist_review_approved(
+                home,
+                wallet,
+                &intent.intent_hash(),
+            )
+            .map_err(|e| HandlerError::backend(e.to_string()))?;
+        }
         self.vfs.write(&path, &bytes).await
     }
 
@@ -737,6 +753,10 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
+        // Wallet policy writes (policy.toml) redefine what the daemon allows.
+        // They must go through write_unlocked so the user reviews the change
+        // before the re-sign — never silently re-signed with a cached signer.
+        [root, _wallet, file] if root == "wallets" && file == "policy.toml" => true,
         _ => false,
     }
 }
@@ -745,6 +765,14 @@ fn is_wallet_policy_write(wallet: &str, path: &VfsPath) -> bool {
     matches!(
         path.segments(),
         [root, w, file] if root == "wallets" && w == wallet && file == "policy.toml"
+    )
+}
+
+fn is_policy_session_new(wallet: &str, path: &VfsPath) -> bool {
+    matches!(
+        path.segments(),
+        [root, w, ps, leaf]
+            if root == "wallets" && w == wallet && ps == "policy-session" && leaf == "new"
     )
 }
 
@@ -871,64 +899,8 @@ fn write_unlocked_intent(
             if root == "wallets" && w == wallet && ps == "policy-session" && leaf == "new"
     );
     if is_policy_session_new {
-        let body_digest = blake3::hash(body).to_hex().to_string();
-        let descriptor: serde_json::Value =
-            serde_json::from_slice(body).unwrap_or(serde_json::Value::Null);
-        let mut intent = CeremonyIntent::new(
-            wallet,
-            "Approve Batch-Signing Session",
-            CeremonyIntentKind::RunCapability,
-        );
+        let mut intent = bloom_proto::policy_session_mint_intent(wallet, &path_s, body);
         intent.wallet_address = wallet_address;
-        // pending_ids are {chain_id, id} pairs; render chain-qualified ids so the
-        // human approves exact (chain, id) pairs, and derive the chain list.
-        let pairs: Vec<(u64, String)> = descriptor
-            .get("pending_ids")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|p| {
-                        Some((
-                            p.get("chain_id")?.as_u64()?,
-                            p.get("id")?.as_str()?.to_string(),
-                        ))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let chains = {
-            let mut cs: Vec<String> = pairs.iter().map(|(c, _)| c.to_string()).collect();
-            cs.sort();
-            cs.dedup();
-            cs.join(", ")
-        };
-        let ids: Vec<String> = pairs.iter().map(|(c, i)| format!("{c}:{i}")).collect();
-        intent.summary_lines = vec![
-            format!("Mint a batch-signing session for wallet '{wallet}'."),
-            "After approval, the listed transactions can broadcast WITHOUT another passkey prompt — within these bounds:".into(),
-            format!("Chains: {chains}"),
-            format!(
-                "Max total spend: {} USD",
-                descriptor.get("max_usd").map(|v| v.to_string()).unwrap_or_else(|| "?".into())
-            ),
-            format!(
-                "Expires in: {} seconds",
-                descriptor.get("ttl_secs").map(|v| v.to_string()).unwrap_or_else(|| "?".into())
-            ),
-            format!("Authorizes exactly {} transaction id(s): {}", ids.len(), ids.join(", ")),
-        ];
-        intent.risk_lines = vec![
-            "These transactions will broadcast without a further prompt once approved.".into(),
-            "Only the listed ids, chains, and total USD are authorized; nothing else.".into(),
-            "Revoke early by writing to policy-session/<id>/revoke.".into(),
-        ];
-        intent.artifact_paths = vec![path_s.clone()];
-        intent.canonical_subject = json!({
-            "kind": "vfs_policy_session_mint",
-            "wallet": wallet,
-            "path": path_s,
-            "descriptor_blake3": body_digest,
-        });
         return intent;
     }
 
@@ -1394,6 +1366,7 @@ mod tests {
             "/wallets/minnow/sign/message",
             "/wallets/minnow/sign/hash",
             "/wallets/minnow/sign/typed_data",
+            "/wallets/minnow/policy.toml",
             "/polymarket/onboard/minnow/begin",
             "/requests/latest/confirm",
             "/requests/req_123/confirm",

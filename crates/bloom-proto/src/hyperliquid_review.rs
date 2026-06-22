@@ -96,6 +96,9 @@ pub fn hyperliquid_write_unlock_intent(
         "Review the JSON body and path before approving.".into(),
     ];
     intent.artifact_paths = vec![path_s.to_string()];
+    if !policy_lines.is_empty() {
+        intent.policy_lines = policy_lines;
+    }
     intent.canonical_subject = json!({
         "kind": "hyperliquid_vfs_write",
         "wallet": wallet,
@@ -135,6 +138,8 @@ fn hyperliquid_policy_review_lines(wallet_policy_toml: Option<&str>) -> Vec<Stri
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
+    } else {
+        lines.push("allowed_assets = \"UNLIMITED — any market\"".into());
     }
     if !hl.allowed_order_types.is_empty() {
         lines.push(format!(
@@ -146,18 +151,30 @@ fn hyperliquid_policy_review_lines(wallet_policy_toml: Option<&str>) -> Vec<Stri
                 .join(", ")
         ));
     }
-    if let Some(v) = hl.max_notional_usd {
-        lines.push(format!("max_notional_usd = \"${}\"", format_usd_micro(v)));
-    }
-    if let Some(v) = hl.max_position_usd {
-        lines.push(format!("max_position_usd = \"${}\"", format_usd_micro(v)));
-    }
-    if let Some(v) = hl.max_loss_usd {
-        lines.push(format!("max_loss_usd = \"${}\"", format_usd_micro(v)));
-    }
-    if let Some(v) = hl.max_leverage {
-        lines.push(format!("max_leverage = \"{v}x\""));
-    }
+    lines.push(format!(
+        "max_notional_usd = \"{}\"",
+        hl.max_notional_usd
+            .map(|v| format!("${}", format_usd_micro(v)))
+            .unwrap_or_else(|| "UNLIMITED — no per-order cap".into())
+    ));
+    lines.push(format!(
+        "max_position_usd = \"{}\"",
+        hl.max_position_usd
+            .map(|v| format!("${}", format_usd_micro(v)))
+            .unwrap_or_else(|| "UNLIMITED — no position cap".into())
+    ));
+    lines.push(format!(
+        "max_loss_usd = \"{}\"",
+        hl.max_loss_usd
+            .map(|v| format!("${}", format_usd_micro(v)))
+            .unwrap_or_else(|| "UNLIMITED — no loss stop".into())
+    ));
+    lines.push(format!(
+        "max_leverage = \"{}\"",
+        hl.max_leverage
+            .map(|v| format!("{v}x"))
+            .unwrap_or_else(|| "UNLIMITED".into())
+    ));
     if let Some(v) = hl.max_session_secs {
         lines.push(format!("max_session_secs = \"{v}\""));
     }
@@ -259,5 +276,42 @@ allow_vault_or_subaccount = false
         .unwrap();
         let summary = intent.summary_lines.join("\n");
         assert!(summary.contains("Agent name: bloom-session"));
+    }
+
+    #[test]
+    fn review_lines_show_unlimited_when_caps_missing() {
+        let policy = r#"
+[hyperliquid]
+allowed_assets = ["BTC"]
+max_session_secs = 1800
+"#;
+        let lines = hyperliquid_policy_review_lines(Some(policy)).join("\n");
+        // Caps that ARE set should show their values.
+        assert!(lines.contains("allowed_assets = \"BTC\""));
+        assert!(lines.contains("max_session_secs = \"1800\""));
+        // Caps that are NOT set must show UNLIMITED — never silently absent.
+        assert!(lines.contains("max_notional_usd = \"UNLIMITED"));
+        assert!(lines.contains("max_position_usd = \"UNLIMITED"));
+        assert!(lines.contains("max_loss_usd = \"UNLIMITED"));
+        assert!(lines.contains("max_leverage = \"UNLIMITED"));
+    }
+
+    #[test]
+    fn review_lines_show_actual_values_when_all_caps_set() {
+        let policy = r#"
+[hyperliquid]
+allowed_assets = ["BTC", "SOL"]
+max_notional_usd = "100"
+max_position_usd = "500"
+max_loss_usd = "50"
+max_leverage = 10
+"#;
+        let lines = hyperliquid_policy_review_lines(Some(policy)).join("\n");
+        assert!(lines.contains("allowed_assets = \"BTC, SOL\""));
+        assert!(lines.contains("max_notional_usd = \"$100\""));
+        assert!(lines.contains("max_position_usd = \"$500\""));
+        assert!(lines.contains("max_loss_usd = \"$50\""));
+        assert!(lines.contains("max_leverage = \"10x\""));
+        assert!(!lines.contains("UNLIMITED"));
     }
 }

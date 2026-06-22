@@ -612,6 +612,22 @@ pub struct PolicyCheck {
     pub message: String,
 }
 
+impl PolicyCheck {
+    /// Construct a check with a `"<venue>.<rule>"` namespaced rule field.
+    pub fn for_venue(
+        venue: &str,
+        rule: &str,
+        outcome: PolicyOutcome,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            rule: format!("{venue}.{rule}"),
+            outcome,
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyOutcome {
@@ -622,6 +638,16 @@ pub enum PolicyOutcome {
     /// Hard violation. Confirm rejected unless an "override" sentinel is
     /// written.
     Deny,
+}
+
+/// True when any check is a hard denial.
+pub fn has_deny(checks: &[PolicyCheck]) -> bool {
+    checks.iter().any(|c| c.outcome == PolicyOutcome::Deny)
+}
+
+/// True when any check is a soft warning.
+pub fn has_warn(checks: &[PolicyCheck]) -> bool {
+    checks.iter().any(|c| c.outcome == PolicyOutcome::Warn)
 }
 
 impl Policy {

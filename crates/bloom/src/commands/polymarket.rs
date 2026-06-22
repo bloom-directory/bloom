@@ -139,7 +139,7 @@ fn evaluate_policy(
         daily_posted_microusd: daily,
     };
     let checks = pm_policy::evaluate_polymarket_order(&info.policy.polymarket, &ctx);
-    let deny = pm_policy::has_deny(&checks);
+    let deny = bloom_proto::has_deny(&checks);
     Ok((checks, deny))
 }
 
@@ -469,7 +469,7 @@ async fn execute(
              from the command line; edit the wallet's policy.toml to change it."
         );
     }
-    if pm_policy::has_warn(&checks) && !confirm_risk {
+    if bloom_proto::has_warn(&checks) && !confirm_risk {
         store.save_draft(&mut draft)?;
         println!("{}", render_plan_md(&draft));
         bail!("policy warning requires explicit acknowledgement: re-run with --confirm-risk");
@@ -3214,7 +3214,7 @@ mod tests {
         let checks = bloom_proto::evaluate_defi_route(&policy, &fund_ctx(recv, pusd, router));
 
         assert!(
-            !bloom_proto::defi_has_deny(&checks),
+            !bloom_proto::has_deny(&checks),
             "funding route fact gaps should warn, not deny"
         );
         assert!(
@@ -3232,14 +3232,16 @@ mod tests {
 
         // wrong receiver → deny
         let bad_recv = "0x000000000000000000000000000000000000dead";
-        assert!(bloom_proto::defi_has_deny(
-            &bloom_proto::evaluate_defi_route(&policy, &fund_ctx(bad_recv, pusd, router))
-        ));
+        assert!(bloom_proto::has_deny(&bloom_proto::evaluate_defi_route(
+            &policy,
+            &fund_ctx(bad_recv, pusd, router)
+        )));
         // wrong token-out → deny (receiver literal no longer matches)
         let usdc = "0x2791bca1f2de4661ed88a30c99a7a9449aa84174";
-        assert!(bloom_proto::defi_has_deny(
-            &bloom_proto::evaluate_defi_route(&policy, &fund_ctx(recv, usdc, router))
-        ));
+        assert!(bloom_proto::has_deny(&bloom_proto::evaluate_defi_route(
+            &policy,
+            &fund_ctx(recv, usdc, router)
+        )));
     }
 
     /// Wiring consequence: a same-chain route whose calldata encodes the deposit
@@ -3255,7 +3257,7 @@ mod tests {
         let mut verified = fund_ctx(recv, pusd, router);
         verified.receiver_verified = true; // as the fund path now sets it (same-chain)
         let checks = bloom_proto::evaluate_defi_route(&policy, &verified);
-        assert!(!bloom_proto::defi_has_deny(&checks));
+        assert!(!bloom_proto::has_deny(&checks));
         assert!(
             !checks.iter().any(|c| {
                 c.rule == "defi.receiver_verified" && c.outcome == bloom_proto::PolicyOutcome::Warn

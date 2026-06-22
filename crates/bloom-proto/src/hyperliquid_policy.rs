@@ -24,9 +24,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::policy::{PolicyCheck, PolicyOutcome};
 
-/// One USD in micro-units.
-pub const MICRO_USD: u64 = 1_000_000;
-
 fn default_true() -> bool {
     true
 }
@@ -44,25 +41,25 @@ pub struct HyperliquidPolicy {
     #[serde(default)]
     pub allowed_order_types: BTreeSet<String>,
     /// Max per-order notional, micro-USD (TOML decimal string, e.g. `"500"`).
-    #[serde(default, with = "micro_opt")]
+    #[serde(default, with = "crate::serde_micro")]
     pub max_notional_usd: Option<u64>,
     /// Max absolute position notional per asset, micro-USD (needs snapshot).
-    #[serde(default, with = "micro_opt")]
+    #[serde(default, with = "crate::serde_micro")]
     pub max_position_usd: Option<u64>,
     /// Max tolerated loss before a new action may add more risk, micro-USD
     /// (needs snapshot). The pure per-action evaluator intentionally keys off
     /// the current unrealized-loss estimate only; realized session drawdown is
     /// a session-lifecycle concern enforced by the monitoring loop.
-    #[serde(default, with = "micro_opt")]
+    #[serde(default, with = "crate::serde_micro")]
     pub max_loss_usd: Option<u64>,
     /// Max leverage multiplier.
     #[serde(default)]
     pub max_leverage: Option<u32>,
     /// Max single withdrawal, micro-USD (enforced once a withdraw action lands).
-    #[serde(default, with = "micro_opt")]
+    #[serde(default, with = "crate::serde_micro")]
     pub withdrawal_cap_usd: Option<u64>,
     /// Max single transfer, micro-USD (enforced once a transfer action lands).
-    #[serde(default, with = "micro_opt")]
+    #[serde(default, with = "crate::serde_micro")]
     pub transfer_cap_usd: Option<u64>,
     /// Max bounded-session duration in seconds (consumed by Phase 2 sessions).
     #[serde(default)]
@@ -99,6 +96,16 @@ impl HyperliquidPolicy {
             || !self.allow_builder_fees
             || !self.allow_vault_or_subaccount
     }
+
+    /// True when the policy has the minimum caps required to mint a bounded
+    /// trading session. Without all four of these an agent session would have
+    /// no meaningful per-order size, position, or loss limit.
+    pub fn is_session_capable(&self) -> bool {
+        !self.allowed_assets.is_empty()
+            && self.max_notional_usd.is_some()
+            && self.max_position_usd.is_some()
+            && self.max_loss_usd.is_some()
+    }
 }
 
 impl Default for HyperliquidPolicy {
@@ -118,55 +125,6 @@ impl Default for HyperliquidPolicy {
             allow_twap: true,
             allow_builder_fees: true,
             allow_vault_or_subaccount: true,
-        }
-    }
-}
-
-/// Serde for `Option<u64>` micro-USD: accepts decimal strings / ints / floats,
-/// serializes as a decimal string. Mirrors `polymarket_policy::micro_opt`.
-mod micro_opt {
-    use serde::de::Error as _;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    fn parse_decimal_micro(s: &str) -> Result<u64, String> {
-        let v = crate::units::parse_units(s.trim(), 6)
-            .map_err(|e| format!("bad USD amount '{s}': {e}"))?;
-        u64::try_from(v).map_err(|_| format!("USD amount '{s}' too large"))
-    }
-
-    pub fn serialize<S: Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
-        match v {
-            None => s.serialize_none(),
-            Some(micro) => s.serialize_some(&crate::units::format_units(
-                alloy::primitives::U256::from(*micro),
-                6,
-            )),
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            S(String),
-            I(i64),
-            F(f64),
-        }
-        match Option::<Raw>::deserialize(d)? {
-            None => Ok(None),
-            Some(Raw::S(s)) => parse_decimal_micro(&s).map(Some).map_err(D::Error::custom),
-            Some(Raw::I(i)) => {
-                if i < 0 {
-                    return Err(D::Error::custom("USD amount cannot be negative"));
-                }
-                (i as u64)
-                    .checked_mul(super::MICRO_USD)
-                    .map(Some)
-                    .ok_or_else(|| D::Error::custom("USD amount too large"))
-            }
-            Some(Raw::F(f)) => parse_decimal_micro(&format!("{f}"))
-                .map(Some)
-                .map_err(D::Error::custom),
         }
     }
 }
@@ -191,6 +149,12 @@ pub struct HyperliquidActionCtx {
     // ── caller-fetched live snapshot ──
     /// Current absolute position notional for `asset`, micro-USD.
     pub position_microusd: Option<u64>,
+    /// Notional of this wallet's already-resting (unfilled) open orders for
+    /// `asset`, micro-USD. Counted toward the `max_position_usd` projection so a
+    /// burst of individually-under-cap orders can't collectively breach the cap
+    /// on fill. `None` means the caller couldn't read open orders; when a
+    /// position cap is configured this fails closed.
+    pub resting_notional_microusd: Option<u64>,
     /// Estimated unrealized loss, micro-USD (the per-action loss signal; the
     /// session monitor's account-value drawdown is the real loss stop).
     pub est_unrealized_loss_microusd: Option<u64>,
@@ -199,16 +163,10 @@ pub struct HyperliquidActionCtx {
     pub snapshot_readable: bool,
 }
 
-fn fmt_usd(micro: u64) -> String {
-    crate::units::format_units(alloy::primitives::U256::from(micro), 6)
-}
+use crate::serde_micro::fmt_usd;
 
 fn check(rule: &str, outcome: PolicyOutcome, message: impl Into<String>) -> PolicyCheck {
-    PolicyCheck {
-        rule: format!("hyperliquid.{rule}"),
-        outcome,
-        message: message.into(),
-    }
+    PolicyCheck::for_venue("hyperliquid", rule, outcome, message)
 }
 
 /// Is this action risk-reducing (cancels, reduce-only orders)? Such actions
@@ -218,6 +176,50 @@ fn is_risk_reducing(ctx: &HyperliquidActionCtx) -> bool {
         ctx.action_kind.as_str(),
         "cancel" | "cancelByCloid" | "scheduleCancel"
     ) || (ctx.action_kind == "order" && ctx.reduce_only)
+}
+
+/// Asset allowlist gate. Fail closed: when an allowlist is set but the coin
+/// couldn't be resolved (`ctx.asset == None` — a perp-meta lookup failure or a
+/// spot order), deny rather than silently skip the gate. Shared by the order
+/// path and the updateLeverage path.
+fn push_asset_check(
+    out: &mut Vec<PolicyCheck>,
+    policy: &HyperliquidPolicy,
+    ctx: &HyperliquidActionCtx,
+) {
+    match (&ctx.asset, policy.allowed_assets.is_empty()) {
+        (Some(asset), false) if !policy.allowed_assets.contains(asset) => out.push(check(
+            "asset",
+            PolicyOutcome::Deny,
+            format!("'{asset}' is not on the allowed_assets allowlist"),
+        )),
+        (Some(asset), _) => out.push(check(
+            "asset",
+            PolicyOutcome::Pass,
+            format!("'{asset}' permitted"),
+        )),
+        (None, false) => out.push(check(
+            "asset",
+            PolicyOutcome::Deny,
+            "asset could not be resolved while an allowed_assets allowlist is set (fail closed)",
+        )),
+        (None, true) => {}
+    }
+}
+
+/// Vault/subaccount gate. Shared by the order path and the updateLeverage path.
+fn push_vault_check(
+    out: &mut Vec<PolicyCheck>,
+    policy: &HyperliquidPolicy,
+    ctx: &HyperliquidActionCtx,
+) {
+    if ctx.vault_or_subaccount && !policy.allow_vault_or_subaccount {
+        out.push(check(
+            "vault",
+            PolicyOutcome::Deny,
+            "vault/subaccount actions are disabled by policy",
+        ));
+    }
 }
 
 /// Evaluate one Hyperliquid action. Returns the full check list (passes
@@ -286,9 +288,13 @@ pub fn evaluate_hyperliquid_action(
         }
     }
 
-    // updateLeverage: gate on max_leverage and finish.
+    // updateLeverage: gate on max_leverage, but still honor the asset allowlist
+    // and the vault/subaccount gate — a leverage change targets a specific coin
+    // and can be aimed at a vault/subaccount, so those bounds must apply here too.
     if ctx.action_kind == "updateLeverage" {
         out.push(leverage_check(policy, ctx.leverage));
+        push_asset_check(&mut out, policy, ctx);
+        push_vault_check(&mut out, policy, ctx);
         return out;
     }
 
@@ -306,27 +312,7 @@ pub fn evaluate_hyperliquid_action(
     }
 
     // ── order ──
-    // Asset allowlist. Fail closed: when an allowlist is set but the coin
-    // couldn't be resolved (`ctx.asset == None` — a perp-meta lookup failure or
-    // a spot order), deny rather than silently skip the gate.
-    match (&ctx.asset, policy.allowed_assets.is_empty()) {
-        (Some(asset), false) if !policy.allowed_assets.contains(asset) => out.push(check(
-            "asset",
-            PolicyOutcome::Deny,
-            format!("'{asset}' is not on the allowed_assets allowlist"),
-        )),
-        (Some(asset), _) => out.push(check(
-            "asset",
-            PolicyOutcome::Pass,
-            format!("'{asset}' permitted"),
-        )),
-        (None, false) => out.push(check(
-            "asset",
-            PolicyOutcome::Deny,
-            "asset could not be resolved while an allowed_assets allowlist is set (fail closed)",
-        )),
-        (None, true) => {}
-    }
+    push_asset_check(&mut out, policy, ctx);
 
     // Order-type allowlist + per-type allow flags.
     if let Some(ot) = &ctx.order_type {
@@ -371,13 +357,7 @@ pub fn evaluate_hyperliquid_action(
             "builder-fee orders are disabled by policy",
         ));
     }
-    if ctx.vault_or_subaccount && !policy.allow_vault_or_subaccount {
-        out.push(check(
-            "vault",
-            PolicyOutcome::Deny,
-            "vault/subaccount actions are disabled by policy",
-        ));
-    }
+    push_vault_check(&mut out, policy, ctx);
 
     // Risk-adding caps below apply only to risk-adding orders.
     if is_risk_reducing(ctx) {
@@ -422,27 +402,42 @@ pub fn evaluate_hyperliquid_action(
     }
 
     if let Some(cap) = policy.max_position_usd {
-        // Projected position ≈ current + this order's notional (upper bound).
-        let projected = ctx
-            .position_microusd
-            .unwrap_or(0)
-            .saturating_add(ctx.notional_microusd.unwrap_or(0));
-        if projected > cap {
-            out.push(check(
+        // Projected exposure ≈ current position + already-resting open-order
+        // notional + this order's notional. Resting orders must be counted so
+        // a series of individually-under-cap orders can't collectively breach
+        // the cap once they fill. Fail closed when the resting figure is
+        // unavailable (same posture as `snapshot_readable`): a configured cap
+        // we can't fully evaluate must not silently pass.
+        match ctx.resting_notional_microusd {
+            None => out.push(check(
                 "max_position_usd",
                 PolicyOutcome::Deny,
-                format!(
-                    "projected position {} exceeds cap {}",
-                    fmt_usd(projected),
-                    fmt_usd(cap)
-                ),
-            ));
-        } else {
-            out.push(check(
-                "max_position_usd",
-                PolicyOutcome::Pass,
-                format!("{} <= {}", fmt_usd(projected), fmt_usd(cap)),
-            ));
+                "position cap configured but resting open-order notional is unavailable (fail closed)",
+            )),
+            Some(resting) => {
+                let projected = ctx
+                    .position_microusd
+                    .unwrap_or(0)
+                    .saturating_add(resting)
+                    .saturating_add(ctx.notional_microusd.unwrap_or(0));
+                if projected > cap {
+                    out.push(check(
+                        "max_position_usd",
+                        PolicyOutcome::Deny,
+                        format!(
+                            "projected position {} exceeds cap {}",
+                            fmt_usd(projected),
+                            fmt_usd(cap)
+                        ),
+                    ));
+                } else {
+                    out.push(check(
+                        "max_position_usd",
+                        PolicyOutcome::Pass,
+                        format!("{} <= {}", fmt_usd(projected), fmt_usd(cap)),
+                    ));
+                }
+            }
         }
     }
 
@@ -499,6 +494,7 @@ fn leverage_check(policy: &HyperliquidPolicy, leverage: Option<u32>) -> PolicyCh
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serde_micro::MICRO_USD;
 
     fn order_ctx(asset: &str) -> HyperliquidActionCtx {
         HyperliquidActionCtx {
@@ -661,5 +657,136 @@ mod tests {
             ..Default::default()
         };
         assert!(!denied(&evaluate_hyperliquid_action(&p, &ctx)));
+    }
+
+    #[test]
+    fn is_session_capable_requires_all_critical_caps() {
+        // Default policy with no caps is NOT session-capable.
+        assert!(!HyperliquidPolicy::default().is_session_capable());
+
+        // allowed_assets alone is not enough.
+        let p = HyperliquidPolicy {
+            allowed_assets: BTreeSet::from(["BTC".to_string()]),
+            ..Default::default()
+        };
+        assert!(!p.is_session_capable());
+
+        // Adding max_notional_usd is still not enough.
+        let p = HyperliquidPolicy {
+            allowed_assets: BTreeSet::from(["BTC".to_string()]),
+            max_notional_usd: Some(100 * MICRO_USD),
+            ..Default::default()
+        };
+        assert!(!p.is_session_capable());
+
+        // Adding max_position_usd is still not enough.
+        let p = HyperliquidPolicy {
+            allowed_assets: BTreeSet::from(["BTC".to_string()]),
+            max_notional_usd: Some(100 * MICRO_USD),
+            max_position_usd: Some(500 * MICRO_USD),
+            ..Default::default()
+        };
+        assert!(!p.is_session_capable());
+
+        // All four required caps → session-capable.
+        let p = HyperliquidPolicy {
+            allowed_assets: BTreeSet::from(["BTC".to_string()]),
+            max_notional_usd: Some(100 * MICRO_USD),
+            max_position_usd: Some(500 * MICRO_USD),
+            max_loss_usd: Some(50 * MICRO_USD),
+            ..Default::default()
+        };
+        assert!(p.is_session_capable());
+    }
+
+    #[test]
+    fn update_leverage_honors_asset_allowlist() {
+        // updateLeverage on a coin outside allowed_assets must be denied even
+        // though the leverage itself is within cap.
+        let p = HyperliquidPolicy {
+            allowed_assets: BTreeSet::from(["BTC".to_string()]),
+            max_leverage: Some(10),
+            ..Default::default()
+        };
+        let ctx = HyperliquidActionCtx {
+            action_kind: "updateLeverage".into(),
+            asset: Some("ETH".into()),
+            leverage: Some(5),
+            snapshot_readable: true,
+            ..Default::default()
+        };
+        assert!(denied(&evaluate_hyperliquid_action(&p, &ctx)));
+
+        // Same change on an allowlisted coin within the leverage cap passes.
+        let ctx_ok = HyperliquidActionCtx {
+            action_kind: "updateLeverage".into(),
+            asset: Some("BTC".into()),
+            leverage: Some(5),
+            snapshot_readable: true,
+            ..Default::default()
+        };
+        assert!(!denied(&evaluate_hyperliquid_action(&p, &ctx_ok)));
+    }
+
+    #[test]
+    fn update_leverage_honors_vault_gate() {
+        let p = HyperliquidPolicy {
+            allow_vault_or_subaccount: false,
+            ..Default::default()
+        };
+        let ctx = HyperliquidActionCtx {
+            action_kind: "updateLeverage".into(),
+            asset: Some("BTC".into()),
+            leverage: Some(2),
+            vault_or_subaccount: true,
+            snapshot_readable: true,
+            ..Default::default()
+        };
+        assert!(denied(&evaluate_hyperliquid_action(&p, &ctx)));
+    }
+
+    #[test]
+    fn max_position_counts_resting_open_orders() {
+        let p = HyperliquidPolicy {
+            max_position_usd: Some(1_000 * MICRO_USD),
+            ..Default::default()
+        };
+        // position 0 + resting 950 + this order 100 = 1050 > 1000 → denied,
+        // even though the new order alone (100) is far under the cap.
+        let mut ctx = order_ctx("BTC");
+        ctx.position_microusd = Some(0);
+        ctx.resting_notional_microusd = Some(950 * MICRO_USD);
+        assert!(denied(&evaluate_hyperliquid_action(&p, &ctx)));
+
+        // position 0 + resting 800 + 100 = 900 <= 1000 → allowed.
+        let mut ctx_ok = order_ctx("BTC");
+        ctx_ok.position_microusd = Some(0);
+        ctx_ok.resting_notional_microusd = Some(800 * MICRO_USD);
+        assert!(!denied(&evaluate_hyperliquid_action(&p, &ctx_ok)));
+    }
+
+    #[test]
+    fn max_position_fails_closed_without_resting_notional() {
+        let p = HyperliquidPolicy {
+            max_position_usd: Some(1_000 * MICRO_USD),
+            ..Default::default()
+        };
+        // Snapshot readable but resting open-order notional unavailable → deny.
+        let mut ctx = order_ctx("BTC");
+        ctx.position_microusd = Some(0);
+        ctx.resting_notional_microusd = None;
+        assert!(denied(&evaluate_hyperliquid_action(&p, &ctx)));
+    }
+
+    #[test]
+    fn is_configured_still_true_with_any_field() {
+        // is_configured() is the weaker gate for one-shot trades.
+        // It should remain true with just one field set.
+        let p = HyperliquidPolicy {
+            max_session_secs: Some(3600),
+            ..Default::default()
+        };
+        assert!(p.is_configured());
+        assert!(!p.is_session_capable()); // but NOT session-capable
     }
 }

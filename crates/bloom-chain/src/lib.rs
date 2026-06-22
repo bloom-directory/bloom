@@ -839,6 +839,16 @@ impl ChainRegistry {
         self.inner.read().keys().cloned().collect()
     }
 
+    /// Resolve a registered chain's path segment name from its numeric id, e.g.
+    /// `42161` → `"arbitrum"`. Used to render chain-qualified paths.
+    pub fn name_for_chain_id(&self, chain_id: u64) -> Option<String> {
+        self.inner
+            .read()
+            .values()
+            .find(|c| c.spec().chain_id == chain_id)
+            .map(|c| c.spec().name.clone())
+    }
+
     pub fn from_chains<I: IntoIterator<Item = ChainSpec>>(specs: I) -> Result<Self, ChainError> {
         let r = Self::new();
         for s in specs {

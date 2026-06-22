@@ -36,6 +36,15 @@ fn fresh_home() -> TempDir {
     tempfile::tempdir().expect("create temp home")
 }
 
+/// Write `passphrase` to a file under `home` and return its path string. Used
+/// to feed `--passphrase-file` for non-interactive passphrase-wallet creation
+/// (the only way to create a local wallet without a tty — passkey is default).
+fn write_passphrase_file(home: &Path, passphrase: &str) -> String {
+    let path = home.join(".passphrase");
+    std::fs::write(&path, passphrase).expect("write passphrase file");
+    path.to_string_lossy().into_owned()
+}
+
 fn http_fixture(
     status: u16,
     headers: &[(&str, &str)],
@@ -365,8 +374,17 @@ fn chain_ls_validators_does_not_take_home_write_lock() {
 #[test]
 fn wallet_new_then_list_round_trip() {
     let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "smoke-test-pass");
     let create = bloom_cmd(home.path())
-        .args(["wallet", "new", "alice", "--passphrase", "smoke-test-pass"])
+        .args([
+            "wallet",
+            "new",
+            "alice",
+            "--local",
+            "--allow-passphrase-wallet",
+            "--passphrase-file",
+            &pass_file,
+        ])
         .assert()
         .success();
     let create_out = String::from_utf8(create.get_output().stdout.clone()).unwrap();
@@ -407,13 +425,22 @@ fn wallet_new_then_list_round_trip() {
 }
 
 #[test]
-fn wallet_new_via_env_passphrase() {
-    // BLOOM_PASSPHRASE feeds the same arg via env. Confirms the env path
-    // works and that the wallet ends up in the keystore directory on disk.
+fn wallet_new_local_via_passphrase_file() {
+    // BLOOM_PASSPHRASE no longer creates wallets — passkey is the default, and
+    // passphrase-wallet creation must be explicit: --local +
+    // --allow-passphrase-wallet + --passphrase-file (non-interactive).
     let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "env-pass-1");
     bloom_cmd(home.path())
-        .args(["wallet", "new", "bob"])
-        .env("BLOOM_PASSPHRASE", "env-pass-1")
+        .args([
+            "wallet",
+            "new",
+            "bob",
+            "--local",
+            "--allow-passphrase-wallet",
+            "--passphrase-file",
+            &pass_file,
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("created wallet 'bob'"));
@@ -426,14 +453,82 @@ fn wallet_new_via_env_passphrase() {
         bob_dir.join("encrypted.key").exists(),
         "expected keystore/bob/encrypted.key to be written"
     );
+    assert!(
+        bob_dir.join("RECOVERY.txt").exists(),
+        "passphrase wallets must write a RECOVERY.txt"
+    );
+}
+
+/// Creating a passphrase wallet non-interactively WITHOUT --allow-passphrase-wallet
+/// must fail closed — this is the gate that stops an agent from silently minting
+/// a passphrase wallet. (assert_cmd stdin is not a tty.)
+#[test]
+fn wallet_new_local_refused_without_ack_when_noninteractive() {
+    let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "pw");
+    let assert = bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "new",
+            "sneaky",
+            "--local",
+            "--passphrase-file",
+            &pass_file,
+        ])
+        .assert()
+        .failure();
+    let err = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+    assert!(
+        err.contains("--allow-passphrase-wallet"),
+        "error should demand the ack flag, got: {err}"
+    );
+    // Nothing was created.
+    assert!(
+        !home.path().join("keystore").join("sneaky").exists(),
+        "no wallet directory should exist after a refused creation"
+    );
+}
+
+/// A successful wallet creation appends a first-class `wallet.created` audit
+/// record — the CLI path does not flow through the VFS router, so without this
+/// event a CLI-created wallet leaves no trail (the original eth-long-1 bug).
+#[test]
+fn wallet_created_audit_event() {
+    let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "audit-pass");
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "new",
+            "audited",
+            "--local",
+            "--allow-passphrase-wallet",
+            "--passphrase-file",
+            &pass_file,
+        ])
+        .assert()
+        .success();
+    let audit = std::fs::read_to_string(home.path().join("audit.jsonl")).unwrap();
+    assert!(
+        audit.contains("\"kind\":\"wallet.created\"") && audit.contains("audited"),
+        "audit log should contain a wallet.created event for 'audited', got:\n{audit}"
+    );
 }
 
 #[test]
 fn request_cli_dry_run_uses_vfs_lifecycle_and_body_receipt_helpers() {
     let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "pw");
     bloom_cmd(home.path())
-        .args(["wallet", "new", "alice"])
-        .env("BLOOM_PASSPHRASE", "pw")
+        .args([
+            "wallet",
+            "new",
+            "alice",
+            "--local",
+            "--allow-passphrase-wallet",
+            "--passphrase-file",
+            &pass_file,
+        ])
         .assert()
         .success();
 
@@ -487,7 +582,7 @@ fn status_on_empty_keystore_points_to_wallet_creation() {
         "empty status should say no wallet exists:\n{out}"
     );
     assert!(
-        out.contains("bloom wallet new main --passkey"),
+        out.contains("bloom wallet new main"),
         "status should point at the explicit wallet command:\n{out}"
     );
 }
@@ -497,8 +592,17 @@ fn status_on_empty_keystore_points_to_wallet_creation() {
 #[test]
 fn wallet_address_with_and_without_qr() {
     let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "addr-smoke-pass");
     bloom_cmd(home.path())
-        .args(["wallet", "new", "alice", "--passphrase", "addr-smoke-pass"])
+        .args([
+            "wallet",
+            "new",
+            "alice",
+            "--local",
+            "--allow-passphrase-wallet",
+            "--passphrase-file",
+            &pass_file,
+        ])
         .assert()
         .success();
 
@@ -533,8 +637,17 @@ fn wallet_address_with_and_without_qr() {
 #[test]
 fn wallet_address_qr_out_writes_svg() {
     let home = fresh_home();
+    let pass_file = write_passphrase_file(home.path(), "qr-out-pass");
     bloom_cmd(home.path())
-        .args(["wallet", "new", "alice", "--passphrase", "qr-out-pass"])
+        .args([
+            "wallet",
+            "new",
+            "alice",
+            "--local",
+            "--allow-passphrase-wallet",
+            "--passphrase-file",
+            &pass_file,
+        ])
         .assert()
         .success();
     let svg_path = home.path().join("deposit.svg");

@@ -33,9 +33,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::policy::{PolicyCheck, PolicyOutcome};
 
-/// One USD in micro-units.
-pub const MICRO_USD: u64 = 1_000_000;
-
 fn default_true() -> bool {
     true
 }
@@ -48,16 +45,16 @@ pub struct PolymarketPolicy {
     #[serde(default)]
     pub enabled: bool,
     /// Hard cap per order, micro-USD (TOML: decimal string, e.g. `"10"`).
-    #[serde(default, with = "micro_opt")]
+    #[serde(default, with = "crate::serde_micro")]
     pub max_order_usd: Option<u64>,
     /// Hard cap on posted exposure per trailing 24 h, micro-USD.
-    #[serde(default, with = "micro_opt")]
+    #[serde(default, with = "crate::serde_micro")]
     pub max_daily_usd: Option<u64>,
     /// Orders above this require the explicit `--confirm-risk` flag (Warn).
-    #[serde(default, with = "micro_opt")]
+    #[serde(default, with = "crate::serde_micro")]
     pub require_flag_above_usd: Option<u64>,
     /// Hard cap on the limit price per share (micro, `"0.75"` → 750000).
-    #[serde(default, with = "micro_opt")]
+    #[serde(default, with = "crate::serde_micro")]
     pub max_price: Option<u64>,
     /// Whether neg-risk markets may be traded.
     #[serde(default = "default_true")]
@@ -88,62 +85,6 @@ impl Default for PolymarketPolicy {
         }
     }
 }
-
-/// Serde for `Option<u64>` micro-USD: accepts decimal strings (preferred) and
-/// integers/floats (converted via their shortest decimal representation so no
-/// binary-float dust leaks into policy). Serializes back as a decimal string.
-mod micro_opt {
-    use serde::de::Error as _;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn parse_decimal_micro(s: &str) -> Result<u64, String> {
-        let v = crate::units::parse_units(s.trim(), 6)
-            .map_err(|e| format!("bad USD amount '{s}': {e}"))?;
-        u64::try_from(v).map_err(|_| format!("USD amount '{s}' too large"))
-    }
-
-    pub fn serialize<S: Serializer>(v: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
-        match v {
-            None => s.serialize_none(),
-            Some(micro) => s.serialize_some(&crate::units::format_units(
-                alloy::primitives::U256::from(*micro),
-                6,
-            )),
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Raw {
-            S(String),
-            I(i64),
-            F(f64),
-        }
-        match Option::<Raw>::deserialize(d)? {
-            None => Ok(None),
-            Some(Raw::S(s)) => parse_decimal_micro(&s).map(Some).map_err(D::Error::custom),
-            Some(Raw::I(i)) => {
-                if i < 0 {
-                    return Err(D::Error::custom("USD amount cannot be negative"));
-                }
-                (i as u64)
-                    .checked_mul(super::MICRO_USD)
-                    .map(Some)
-                    .ok_or_else(|| D::Error::custom("USD amount too large"))
-            }
-            Some(Raw::F(f)) => {
-                // Shortest decimal repr round-trips the intended value
-                // ("0.1" not "0.1000000000000000055…").
-                parse_decimal_micro(&format!("{f}"))
-                    .map(Some)
-                    .map_err(D::Error::custom)
-            }
-        }
-    }
-}
-
-pub use micro_opt::parse_decimal_micro;
 
 /// Order side for policy purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,16 +117,10 @@ pub struct PolymarketOrderCtx {
     pub daily_posted_microusd: Option<u64>,
 }
 
-fn fmt_usd(micro: u64) -> String {
-    crate::units::format_units(alloy::primitives::U256::from(micro), 6)
-}
+use crate::serde_micro::fmt_usd;
 
 fn check(rule: &str, outcome: PolicyOutcome, message: impl Into<String>) -> PolicyCheck {
-    PolicyCheck {
-        rule: format!("polymarket.{rule}"),
-        outcome,
-        message: message.into(),
-    }
+    PolicyCheck::for_venue("polymarket", rule, outcome, message)
 }
 
 /// Evaluate one Polymarket order against policy. Returns the full check list
@@ -391,19 +326,11 @@ pub fn evaluate_polymarket_order(
     out
 }
 
-/// Any Deny in the set? Deny-level failures are never CLI-bypassable.
-pub fn has_deny(checks: &[PolicyCheck]) -> bool {
-    checks.iter().any(|c| c.outcome == PolicyOutcome::Deny)
-}
-
-/// Any Warn in the set? Warns are acknowledged with `--confirm-risk`.
-pub fn has_warn(checks: &[PolicyCheck]) -> bool {
-    checks.iter().any(|c| c.outcome == PolicyOutcome::Warn)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::{has_deny, has_warn};
+    use crate::serde_micro::MICRO_USD;
 
     fn open_ctx() -> PolymarketOrderCtx {
         PolymarketOrderCtx {

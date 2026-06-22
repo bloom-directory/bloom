@@ -20,6 +20,7 @@
 //! - `wallets/<wallet>/chains/<chain>/outbox/sent/<id>/<file>`      — read sent
 //! - `wallets/<wallet>/chains/<chain>/outbox/failed/<id>/<file>`    — read failed
 
+use std::path::Path;
 use std::sync::Arc;
 
 use alloy::signers::SignerSync;
@@ -164,10 +165,7 @@ impl WalletsHandler {
     }
 
     fn evm_capability_views_for(&self, wallet: &str) -> Vec<CapabilityViewEntry> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+        let now_ms = bloom_proto::capability::now_ms_u128();
         let sessions = self.tx_engine.session_store().active(now_ms);
         let mut out = Vec::new();
         for s in sessions {
@@ -225,15 +223,24 @@ impl WalletsHandler {
                 status,
                 limits,
                 next_write_path: if let Some(first) = pending_ids.first() {
-                    let outbox_id = first.split_once(':').map(|(_, id)| id).unwrap_or(first);
-                    format!(
-                        "/wallets/{wallet}/chains/{chain}/outbox/pending/{id}/confirm",
-                        wallet = wallet,
-                        chain = "ethereum",
-                        id = outbox_id
-                    )
+                    // Pending keys are chain-qualified: `"{chain_id}:{outbox_id}"`.
+                    // Resolve the chain segment from the id rather than assuming a
+                    // single chain, so multi-chain sessions render a confirm path
+                    // that actually resolves.
+                    let (chain, outbox_id) = match first.split_once(':') {
+                        Some((chain_id, id)) => {
+                            let chain = chain_id
+                                .parse::<u64>()
+                                .ok()
+                                .and_then(|cid| self.chains.name_for_chain_id(cid))
+                                .unwrap_or_else(|| chain_id.to_string());
+                            (chain, id)
+                        }
+                        None => ("ethereum".to_string(), *first),
+                    };
+                    format!("/wallets/{wallet}/chains/{chain}/outbox/pending/{outbox_id}/confirm")
                 } else {
-                    format!("/wallets/{wallet}/chains/ethereum/outbox/pending/.../confirm")
+                    format!("/wallets/{wallet}/policy-session/active.json")
                 },
                 revoke_path: format!("/wallets/{wallet}/policy-session/{}/revoke", s.id),
                 audit_ref: "/status/audit/head".to_string(),
@@ -373,6 +380,29 @@ impl WalletsHandler {
             return Err(HandlerError::invalid(
                 "policy-session requires non-empty pending_ids ({chain_id,id} pairs), \
                  ttl_secs > 0, and max_usd > 0",
+            ));
+        }
+        // Minting creates future signing authority, so it must prove the exact
+        // descriptor was human-reviewed — not merely that the daemon is unlocked.
+        // The IPC ceremony lane persists a one-time approval marker keyed by the
+        // reviewed-intent hash of this descriptor; require and consume it here so
+        // the VFS layer is safe regardless of how the write arrives.
+        let path = format!("/wallets/{wallet}/policy-session/new");
+        let intent = bloom_proto::policy_session_mint_intent(wallet, &path, data);
+        let home = self
+            .keystore
+            .root()
+            .parent()
+            .ok_or_else(|| HandlerError::backend("keystore root has no parent home dir"))?
+            .to_path_buf();
+        if !crate::policy_session_review::consume_review_approved(
+            &home,
+            wallet,
+            &intent.intent_hash(),
+        ) {
+            return Err(HandlerError::invalid(
+                "policy-session mint requires a fresh reviewed-intent approval; \
+                 mint through the IPC ceremony lane (bloom wallet ... policy-session)",
             ));
         }
         // Chains are derived from the authorized pairs; the allowlist holds
@@ -620,7 +650,7 @@ impl WalletsHandler {
             return Err(HandlerError::NotAFile(path.to_string_path()));
         }
         if segs.len() == 1 && segs[0] == "new" {
-            return Ok(b"# write a wallet name (plain text) or a TOML spec to create a wallet\n# examples:\n#   echo alice > /wallets/new\n#   printf 'name = \"alice\"\\nkind = \"local\"\\n' > /wallets/new\n# kind: local | import (with private_key) | watch (with address)\n".to_vec());
+            return Ok(b"# write a wallet name (plain text) or a TOML spec to create a wallet\n# defaults to a passkey (WebAuthn) wallet; passkey is the safe default.\n# examples:\n#   echo alice > /wallets/new                          # passkey ceremony\n#   printf 'name = \"alice\"\\nkind = \"watch\"\\naddress = \"0xabc\"\\n' > /wallets/new\n# kind: passkey (default) | local | import (with private_key) | watch (with address)\n# local/import require allow_passphrase_wallet = true and a passphrase field.\n".to_vec());
         }
         let wallet = &segs[0];
         let info = self.keystore.info_unverified(wallet).map_err(err_be)?;
@@ -698,7 +728,9 @@ impl WalletsHandler {
         }
         if segs.len() == 4 && segs[1] == "policy-session" && segs[3] == "revoke" {
             self.write_permit()?;
-            return if self.tx_engine.session_store().revoke(&segs[2]) {
+            // Wallet-scoped: a session may only be revoked through its owning
+            // wallet's path, so one wallet can't revoke another's session by id.
+            return if self.tx_engine.session_store().revoke_for(wallet, &segs[2]) {
                 Ok(())
             } else {
                 Err(HandlerError::not_found(format!(
@@ -1366,37 +1398,49 @@ impl WalletsHandler {
         }
 
         let spec = parse_new_wallet_spec(body)?;
-        let env_pass = std::env::var("BLOOM_PASSPHRASE").ok();
-        let pass = spec
-            .passphrase
-            .as_deref()
-            .or(env_pass.as_deref())
-            .unwrap_or("");
+
+        // Passphrase wallets (local/import) require an explicit acknowledgment.
+        // Without this gate an agent could write `kind = "local"` + a
+        // machine-chosen passphrase to /wallets/new and silently mint a
+        // fund-holding wallet — passkey is the default for a reason.
+        let passphrase_kind = matches!(spec.kind.as_str(), "local" | "import");
+        if passphrase_kind {
+            if !spec.allow_passphrase_wallet {
+                return Err(HandlerError::invalid(
+                    "creating a passphrase (kind=local/import) wallet via the VFS requires \
+                     allow_passphrase_wallet = true in the spec; passkey is the default — omit \
+                     kind (or use kind = \"passkey\") for a WebAuthn ceremony",
+                ));
+            }
+            if spec.passphrase.as_deref().unwrap_or("").is_empty() {
+                return Err(HandlerError::invalid(
+                    "passphrase required in the TOML spec for kind=local/import",
+                ));
+            }
+        }
 
         let info = match spec.kind.as_str() {
             "local" => {
-                if pass.is_empty() {
-                    return Err(HandlerError::invalid(
-                        "passphrase required (set BLOOM_PASSPHRASE or include 'passphrase' in the TOML spec)",
-                    ));
-                }
-                self.keystore
+                let pass = spec.passphrase.as_deref().unwrap_or("");
+                let info = self
+                    .keystore
                     .create_local(&spec.name, pass)
-                    .map_err(err_be)?
+                    .map_err(err_be)?;
+                write_passphrase_recovery(self.keystore.root(), &spec.name, pass)?;
+                info
             }
             "import" => {
-                if pass.is_empty() {
-                    return Err(HandlerError::invalid(
-                        "passphrase required (set BLOOM_PASSPHRASE or include 'passphrase' in the TOML spec)",
-                    ));
-                }
+                let pass = spec.passphrase.as_deref().unwrap_or("");
                 let key = spec
                     .private_key
                     .as_deref()
                     .ok_or_else(|| HandlerError::invalid("import requires private_key"))?;
-                self.keystore
+                let info = self
+                    .keystore
                     .import_hex(&spec.name, key, pass)
-                    .map_err(err_be)?
+                    .map_err(err_be)?;
+                write_passphrase_recovery(self.keystore.root(), &spec.name, pass)?;
+                info
             }
             "watch" => {
                 let addr_str = spec
@@ -1441,8 +1485,63 @@ struct NewWalletSpec {
     name: String,
     kind: String,
     passphrase: Option<String>,
+    /// Explicit acknowledgment required to create a passphrase (local/import)
+    /// wallet via the VFS. Prevents silent agent creation of passphrase wallets
+    /// — passkey is the default.
+    allow_passphrase_wallet: bool,
     address: Option<String>,
     private_key: Option<String>,
+}
+
+/// Write `<keystore_root>/<name>/RECOVERY.txt` (mode 0600) containing the
+/// passphrase. Surfaces the agent/caller-chosen secret so a passphrase wallet
+/// created via the VFS can never be fully silent.
+fn write_passphrase_recovery(
+    keystore_root: &Path,
+    name: &str,
+    passphrase: &str,
+) -> Result<(), HandlerError> {
+    let path = keystore_root.join(name).join("RECOVERY.txt");
+    let body = format!(
+        "Bloom passphrase-wallet recovery\n\
+         wallet: {name}\n\
+         \n\
+         passphrase: {passphrase}\n\
+         \n\
+         This wallet was created with a passphrase via the VFS. Store this file\n\
+         securely or migrate to a passkey wallet and remove this file.\n"
+    );
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let tmp = path.with_extension("tmp");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| HandlerError::backend(format!("create {}: {e}", tmp.display())))?;
+        file.write_all(body.as_bytes())
+            .map_err(|e| HandlerError::backend(format!("write {}: {e}", tmp.display())))?;
+        file.sync_all()
+            .map_err(|e| HandlerError::backend(format!("sync {}: {e}", tmp.display())))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| HandlerError::backend(format!("rename {}: {e}", path.display())))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, body.as_bytes())
+            .map_err(|e| HandlerError::backend(format!("write {}: {e}", path.display())))?;
+    }
+    tracing::warn!(
+        wallet = name,
+        path = %path.display(),
+        "wallet.passphrase_recovery_written"
+    );
+    Ok(())
 }
 
 fn parse_new_wallet_spec(body: &str) -> Result<NewWalletSpec, HandlerError> {
@@ -1450,7 +1549,7 @@ fn parse_new_wallet_spec(body: &str) -> Result<NewWalletSpec, HandlerError> {
     if !trimmed.contains('=') && !trimmed.contains('\n') {
         return Ok(NewWalletSpec {
             name: trimmed.to_string(),
-            kind: "local".into(),
+            kind: "passkey".into(),
             ..Default::default()
         });
     }
@@ -1465,7 +1564,7 @@ fn parse_new_wallet_spec(body: &str) -> Result<NewWalletSpec, HandlerError> {
     let kind = table
         .get("kind")
         .and_then(|v| v.as_str())
-        .unwrap_or("local")
+        .unwrap_or("passkey")
         .to_string();
     Ok(NewWalletSpec {
         name,
@@ -1474,6 +1573,10 @@ fn parse_new_wallet_spec(body: &str) -> Result<NewWalletSpec, HandlerError> {
             .get("passphrase")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        allow_passphrase_wallet: table
+            .get("allow_passphrase_wallet")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         address: table
             .get("address")
             .and_then(|v| v.as_str())
@@ -1517,6 +1620,16 @@ mod tests {
 
     fn make_handler() -> Fixture {
         make_handler_with_chain(false)
+    }
+
+    /// Simulate the IPC ceremony lane writing the one-time mint approval marker
+    /// for `body`, so a direct handler `write` to `policy-session/new` is allowed.
+    fn approve_mint(f: &Fixture, wallet: &str, body: &[u8]) {
+        let path = format!("/wallets/{wallet}/policy-session/new");
+        let intent = bloom_proto::policy_session_mint_intent(wallet, &path, body);
+        let home = f.handler.keystore.root().parent().unwrap().to_path_buf();
+        crate::policy_session_review::persist_review_approved(&home, wallet, &intent.intent_hash())
+            .unwrap();
     }
 
     /// Build a wallet fixture; when `with_chain` is true a stub `anvil`
@@ -1715,26 +1828,59 @@ mod tests {
         f.handler
             .write(
                 &p,
-                b"name = \"bob\"\nkind = \"local\"\npassphrase = \"p\"\n",
+                b"name = \"bob\"\nkind = \"local\"\npassphrase = \"p\"\nallow_passphrase_wallet = true\n",
             )
             .await
             .unwrap();
         let info = f.handler.keystore.info("bob").unwrap();
         assert!(matches!(info.kind, bloom_keystore::WalletKind::Local));
+        // Passphrase wallets must surface a recovery file so they can never be
+        // created fully silently.
+        let recovery = f.handler.keystore.root().join("bob").join("RECOVERY.txt");
+        assert!(
+            recovery.exists(),
+            "expected RECOVERY.txt at {}",
+            recovery.display()
+        );
+        let body = std::fs::read_to_string(&recovery).unwrap();
+        assert!(body.contains("passphrase: p"));
     }
 
-    /// Writing a plain name string without BLOOM_PASSPHRASE or a TOML
-    /// passphrase must return an Invalid error — empty passphrases are
-    /// no longer accepted for local wallets.
+    /// A `kind = "local"` spec WITHOUT `allow_passphrase_wallet = true` must be
+    /// rejected — this is the gate that prevents an agent from silently writing
+    /// a passphrase wallet via the VFS.
     #[tokio::test]
-    async fn write_new_wallet_plain_name_rejected_without_passphrase() {
+    async fn write_new_wallet_local_rejected_without_allow_flag() {
         let f = make_handler();
         let p = VfsPath::parse("/new").unwrap();
-        let r = f.handler.write(&p, b"bob").await;
+        let r = f
+            .handler
+            .write(
+                &p,
+                b"name = \"sneaky\"\nkind = \"local\"\npassphrase = \"p\"\n",
+            )
+            .await;
         assert!(
             matches!(r, Err(HandlerError::Invalid(_))),
-            "expected Invalid error for plain name without passphrase, got: {r:?}"
+            "expected Invalid error without allow_passphrase_wallet, got: {r:?}"
         );
+        // And nothing was created.
+        assert!(f.handler.keystore.info("sneaky").is_err());
+    }
+
+    /// A plain name spec now defaults to passkey (the safe default), so it
+    /// can never silently produce a passphrase (`local`) wallet.
+    #[test]
+    fn parse_new_wallet_spec_plain_name_defaults_to_passkey() {
+        let spec = parse_new_wallet_spec("alice").unwrap();
+        assert_eq!(spec.name, "alice");
+        assert_eq!(spec.kind, "passkey");
+    }
+
+    #[test]
+    fn parse_new_wallet_spec_toml_without_kind_defaults_to_passkey() {
+        let spec = parse_new_wallet_spec("name = \"bob\"\n").unwrap();
+        assert_eq!(spec.kind, "passkey");
     }
 
     #[tokio::test]
@@ -1755,7 +1901,7 @@ mod tests {
         // Anvil's first signer; use just for deterministic round-trip check.
         let key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
         let body = format!(
-            "name = \"imported\"\nkind = \"import\"\nprivate_key = \"{}\"\npassphrase = \"x\"\n",
+            "name = \"imported\"\nkind = \"import\"\nprivate_key = \"{}\"\npassphrase = \"x\"\nallow_passphrase_wallet = true\n",
             key
         );
         f.handler.write(&p, body.as_bytes()).await.unwrap();
@@ -1848,6 +1994,10 @@ mod tests {
         let f = make_handler();
         let new_p = VfsPath::parse("/alice/policy-session/new").unwrap();
         let body = br#"{"max_usd":10,"ttl_secs":600,"pending_ids":[{"chain_id":42161,"id":"0001-a"},{"chain_id":8453,"id":"0001-b"}]}"#;
+        // Mint requires a reviewed-intent approval marker (normally written by the
+        // IPC ceremony lane); a write without one is refused.
+        assert!(f.handler.write(&new_p, body).await.is_err());
+        approve_mint(&f, "alice", body);
         f.handler.write(&new_p, body).await.unwrap();
 
         let active_p = VfsPath::parse("/alice/policy-session/active.json").unwrap();
@@ -1863,7 +2013,7 @@ mod tests {
             f.handler
                 .tx_engine
                 .session_store()
-                .authorize_and_debit("alice", 42161, "0001-a", Some(1_000_000), now_ms())
+                .authorize_and_debit("alice", 42161, "0001-a", Some(1_000_000), true, now_ms())
                 .is_some()
         );
 
@@ -1877,6 +2027,43 @@ mod tests {
         // A degenerate descriptor (no chains/ids) is rejected.
         let bad = br#"{"chains":[],"max_usd":10,"ttl_secs":600,"pending_ids":[]}"#;
         assert!(f.handler.write(&new_p, bad).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn capability_confirm_path_uses_real_chain_segment() {
+        let f = make_handler();
+        // Register arbitrum so chain-id 42161 resolves to its path segment.
+        let spec = bloom_proto::ChainSpec {
+            name: "arbitrum".into(),
+            chain_id: 42161,
+            rpc_urls: vec!["http://127.0.0.1:1".into()],
+            rpc_endpoints: Vec::new(),
+            allow_broadcast: true,
+            etherscan_api_url: None,
+            display_name: None,
+            native_symbol: "ETH".into(),
+            native_decimals: 18,
+            legacy_tx: false,
+        };
+        f.handler
+            .chains
+            .add(bloom_chain::ChainClient::new(spec).unwrap());
+
+        let new_p = VfsPath::parse("/alice/policy-session/new").unwrap();
+        let body =
+            br#"{"max_usd":10,"ttl_secs":600,"pending_ids":[{"chain_id":42161,"id":"0001-a"}]}"#;
+        approve_mint(&f, "alice", body);
+        f.handler.write(&new_p, body).await.unwrap();
+
+        let views = f.handler.evm_capability_views_for("alice");
+        assert_eq!(views.len(), 1);
+        assert!(
+            views[0].next_write_path.contains("/chains/arbitrum/"),
+            "expected arbitrum segment, got {}",
+            views[0].next_write_path
+        );
+        assert!(views[0].next_write_path.contains("0001-a"));
+        assert!(!views[0].next_write_path.contains("ethereum"));
     }
 
     #[tokio::test]

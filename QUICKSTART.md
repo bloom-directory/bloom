@@ -62,28 +62,31 @@ ignore them and create our own wallet.
 
 ## 3. Create a wallet
 
-The keystore encrypts the key with `BLOOM_PASSPHRASE` (argon2id +
-chacha20poly1305). For a demo, any passphrase works.
-
-The CLI shortcut and the VFS write are equivalent — wallets are
-first-class VFS citizens:
+The default wallet kind is **passkey** (WebAuthn) — a browser ceremony runs
+and no passphrase is needed. For a quick local demo you can instead create a
+**passphrase** wallet with `--local` (non-interactive creation also needs
+`--allow-passphrase-wallet` and `--passphrase-file`):
 
 ```sh
-# CLI shortcut
-BLOOM_HOME=/tmp/bloom-demo BLOOM_PASSPHRASE=devonly \
-  cargo run -p bloom -- wallet new alice --passphrase devonly
+# Passkey wallet (default) — opens a browser WebAuthn ceremony:
+BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- wallet new alice
+
+# Passphrase wallet for dev/CI (writes a RECOVERY.txt next to the key):
+echo devonly > /tmp/pw.txt
+BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- wallet new alice \
+  --local --allow-passphrase-wallet --passphrase-file /tmp/pw.txt
 
 # Equivalent VFS write (what an agent would do over the mount).
-# Plain text body = create a local wallet with that name.
-BLOOM_HOME=/tmp/bloom-demo BLOOM_PASSPHRASE=devonly \
-  cargo run -p bloom -- vfs write /wallets/new --data 'alice'
+# Plain text body = create a passkey wallet with that name.
+BLOOM_HOME=/tmp/bloom-demo cargo run -p bloom -- vfs write /wallets/new --data 'alice'
 
-# Full TOML form for import / watch:
+# Full TOML form for import / watch / passphrase:
 #   name = "alice"
-#   kind = "import"        # or "local" (default) | "watch"
-#   private_key = "0x..."  # required for import
-#   address = "0x..."      # required for watch
-#   passphrase = "..."     # optional; falls back to BLOOM_PASSPHRASE
+#   kind = "local"        # or "passkey" (default) | "import" | "watch"
+#   private_key = "0x..." # required for import
+#   address = "0x..."     # required for watch
+#   passphrase = "..."    # required for local/import
+#   allow_passphrase_wallet = true  # required for local/import
 ```
 
 You'll get back something like `created wallet 'alice': 0x...`. List

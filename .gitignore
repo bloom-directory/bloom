@@ -37,9 +37,10 @@ DIRECTION.md
 PR.md
 
 # Local-only docs/examples — kept on disk, deliberately out of the PR.
-# Active implementation plans belong in tracked docs/plans/. Completed/superseded
-# plans are archived locally under docs/archive/ (history, not shipped). Use
-# docs/.scratch/ for temporary local notes.
+# Implementation plans are local-only (may reference private wallets, internal
+# direction, WIP trade strategy). Superseded plans are archived locally under
+# docs/archive/. Use docs/.scratch/ for temporary local notes.
+docs/plans/
 docs/archive/
 docs/.scratch/
 docs/research/README.md
@@ -52,5 +53,8 @@ docs/evm-tx-path-audit-2026-06-12.md
 docs/polymarket-audit-2026-06-12.md
 # Live probe log — contains real owner/deposit addresses and trade amounts.
 docs/polymarket-discovery-findings.md
+docs/research/usd-policy-valuation.md
 examples/polymarket-probe/
+# Local-only live trading script — names a private wallet + owner address.
+scripts/hl_session_trader.sh
 AGENTS.local.md
