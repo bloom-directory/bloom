@@ -3,7 +3,9 @@
 use std::collections::BTreeSet;
 
 use bloom_petal_manifest::local::LocalPetalManifest;
+use serde::Deserialize;
 
+use crate::error::PetalError;
 use crate::host::HostError;
 
 /// Effective network allowlist for a single petal invocation.
@@ -39,6 +41,30 @@ impl NetPolicy {
             })
             .unwrap_or_default();
         Self { rules }
+    }
+
+    pub fn from_v2_manifest_toml(bytes: &[u8]) -> Result<Self, PetalError> {
+        let manifest_toml = std::str::from_utf8(bytes)
+            .map_err(|_| PetalError::InvalidWasm("petal.toml is not utf-8".into()))?;
+        let manifest: V2PolicyManifest = toml::from_str(manifest_toml)?;
+        let rules = manifest
+            .net
+            .map(|net| {
+                net.allow
+                    .into_iter()
+                    .map(|rule| NetRule {
+                        host: rule.host.to_ascii_lowercase(),
+                        methods: rule
+                            .methods
+                            .into_iter()
+                            .map(|method| method.to_ascii_uppercase())
+                            .collect(),
+                        paths: rule.paths.unwrap_or_default(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Self { rules })
     }
 
     /// Intersect this policy with a runtime mask. Masks can only narrow.
@@ -105,6 +131,25 @@ struct NetRule {
     methods: BTreeSet<String>,
     /// Empty means any path.
     paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2PolicyManifest {
+    net: Option<V2NetPolicy>,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2NetPolicy {
+    #[serde(default)]
+    allow: Vec<V2NetRule>,
+}
+
+#[derive(Debug, Deserialize)]
+struct V2NetRule {
+    host: String,
+    #[serde(default)]
+    methods: Vec<String>,
+    paths: Option<Vec<String>>,
 }
 
 impl NetRule {
@@ -273,5 +318,33 @@ paths = ["/markets*", "/auth/*", "/wallets/*/orders"]
                 .check("GET", "https://api.example.com/auth/key")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn v2_manifest_policy_enforces_https_host_method_and_path() {
+        let policy = NetPolicy::from_v2_manifest_toml(
+            br#"
+schema = "bloom.petal.local-app.v2"
+name = "echo"
+
+[[net.allow]]
+host = "api.example.com"
+methods = ["GET"]
+paths = ["/markets*"]
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            policy
+                .check("GET", "https://api.example.com/markets/1")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check("POST", "https://api.example.com/markets/1")
+                .is_err()
+        );
+        assert!(policy.check("GET", "https://evil.example.com/").is_err());
     }
 }

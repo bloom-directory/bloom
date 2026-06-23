@@ -203,6 +203,8 @@ impl PetalStore {
             Err(e) => return Err(e),
         };
 
+        self.reject_duplicate_app_name(&hash, &package.name)?;
+
         if !already_present {
             let tmp = self.package_tmp_path(&hash);
             match std::fs::remove_dir_all(&tmp) {
@@ -268,6 +270,21 @@ impl PetalStore {
             meta,
             package.route_index,
         ))
+    }
+
+    fn reject_duplicate_app_name(&self, hash: &str, name: &str) -> Result<(), PetalError> {
+        for existing_hash in self.list_package_hashes()? {
+            if existing_hash == hash {
+                continue;
+            }
+            let meta = self.load_meta(&existing_hash)?;
+            if meta.local_app.as_ref().is_some_and(|app| app.name == name) {
+                return Err(PetalError::InvalidWasm(format!(
+                    "v2 app root {name:?} is already installed by package {existing_hash}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn verify_existing_app_package(&self, package: &PreparedAppPackage) -> Result<(), PetalError> {
@@ -789,6 +806,38 @@ name = "echo"
         let err = store.install_app_package_dir(&package).unwrap_err();
         assert!(err.to_string().contains("artifact"));
         assert!(err.to_string().contains("hash mismatch"));
+    }
+
+    #[test]
+    fn install_app_package_rejects_duplicate_app_name() {
+        let (d, store) = store();
+        let first = d.path().join("pkg-a");
+        write_file(
+            &first,
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
+        write_file(&first, "README.md", b"# echo");
+        write_file(&first, "AGENTS.md", b"# echo agents");
+        write_file(&first, "app/echo/one.txt.wasm", &compat_wasm("one"));
+        store.install_app_package_dir(&first).unwrap();
+
+        let second = d.path().join("pkg-b");
+        write_file(
+            &second,
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
+        write_file(&second, "README.md", b"# echo");
+        write_file(&second, "AGENTS.md", b"# echo agents");
+        write_file(&second, "app/echo/two.txt.wasm", &compat_wasm("two"));
+
+        let err = store.install_app_package_dir(&second).unwrap_err();
+        assert!(err.to_string().contains("already installed"));
     }
 
     #[test]

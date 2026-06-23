@@ -14,14 +14,15 @@ use bloom_vfs::path::VfsPath;
 use bloom_vfs::{Handler, Vfs};
 use parking_lot::RwLock;
 
-use crate::DispatchRequest;
 use crate::error::PetalError;
 use crate::host::{HostError, PetalHost};
 use crate::meta::{Capability, PetalMeta};
 use crate::policy::NetPolicy;
 use crate::registry::NameRegistry;
 use crate::store::{InstallResult, PetalStore};
+use crate::v2::{RouteAbi, RouteEntryKind, RouteIndex, RouteIndexRecord, RouteOp};
 use crate::vm::{DispatchOutput, PetalVm, RunOptions, RunOutput};
+use crate::{DispatchOp, DispatchRequest};
 
 /// Wraps an `Arc<Vfs>` so a petal's `bloom.vfs_read`/`vfs_write` calls
 /// land on the live VFS (and therefore on the same daemon state the
@@ -137,6 +138,13 @@ pub struct PetalRunner {
     store: PetalStore,
     registry: Arc<NameRegistry>,
     vm: PetalVm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalAppRouteMatch {
+    pub hash: String,
+    pub route: RouteIndexRecord,
+    pub params: Vec<(String, String)>,
 }
 
 impl PetalRunner {
@@ -272,11 +280,80 @@ impl PetalRunner {
         Ok(out)
     }
 
+    pub fn local_app_mounts(&self) -> Result<Vec<(String, String)>, PetalError> {
+        let mut out = Vec::new();
+        for hash in self.store.list_package_hashes()? {
+            let meta = self.store.load_meta(&hash)?;
+            if let Some(app) = meta.local_app {
+                out.push((app.name, hash));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
     pub fn resolve_mount(&self, mount: &str) -> Result<String, PetalError> {
         self.local_mounts()?
             .into_iter()
             .find_map(|(candidate, hash)| (candidate == mount).then_some(hash))
             .ok_or_else(|| PetalError::NotFound(format!("apps/{mount}")))
+    }
+
+    pub fn resolve_app_mount(&self, mount: &str) -> Result<String, PetalError> {
+        self.local_app_mounts()?
+            .into_iter()
+            .find_map(|(candidate, hash)| (candidate == mount).then_some(hash))
+            .ok_or_else(|| PetalError::NotFound(format!("apps/{mount}")))
+    }
+
+    pub fn load_app_route_index(&self, mount: &str) -> Result<RouteIndex, PetalError> {
+        let hash = self.resolve_app_mount(mount)?;
+        self.store.load_route_index(&hash)
+    }
+
+    pub fn local_app_route(
+        &self,
+        mount: &str,
+        op: DispatchOp,
+        path: &str,
+    ) -> Result<LocalAppRouteMatch, PetalError> {
+        validate_runtime_route_path(path)?;
+        let hash = self.resolve_app_mount(mount)?;
+        let index = self.store.load_route_index(&hash)?;
+        let Some(matched) = match_index_for_op(&index, op, path) else {
+            return Err(PetalError::NotFound(app_path(mount, path)));
+        };
+        let required_op = route_op(op);
+        if !matched.route.ops.contains(&required_op) {
+            return Err(PetalError::ModeUnsupported(format!(
+                "v2 route {} does not support {required_op:?}",
+                matched.route.route_id
+            )));
+        }
+        Ok(LocalAppRouteMatch {
+            hash,
+            route: matched.route.clone(),
+            params: matched.params,
+        })
+    }
+
+    pub fn local_app_has_descendant(&self, mount: &str, path: &str) -> Result<bool, PetalError> {
+        validate_runtime_route_path(path)?;
+        let index = self.load_app_route_index(mount)?;
+        Ok(index
+            .routes
+            .iter()
+            .any(|route| route_has_descendant(&route.pattern, path)))
+    }
+
+    pub fn local_app_static_list(
+        &self,
+        mount: &str,
+        path: &str,
+    ) -> Result<Vec<crate::DispatchEntry>, PetalError> {
+        validate_runtime_route_path(path)?;
+        let index = self.load_app_route_index(mount)?;
+        Ok(static_list_entries(&index, path))
     }
 
     pub fn local_manifest_for_mount(&self, mount: &str) -> Result<LocalPetalManifest, PetalError> {
@@ -358,6 +435,66 @@ impl PetalRunner {
             .dispatch(&wasm, request, caps, host, &hash, opts)
             .await
     }
+
+    pub async fn dispatch_app_route(
+        &self,
+        mount: &str,
+        mut request: DispatchRequest,
+        host: Arc<dyn PetalHost>,
+        cap_mask: Option<BTreeSet<Capability>>,
+        opts: RunOptions,
+    ) -> Result<DispatchOutput, PetalError> {
+        let matched = self.local_app_route(mount, request.op, &request.path)?;
+        if matched.route.abi != RouteAbi::CompatPetalDispatchV1 {
+            return Err(PetalError::ModeUnsupported(format!(
+                "v2 route ABI {:?} is not supported by the compat runner",
+                matched.route.abi
+            )));
+        }
+        request.ctx.extend(matched.params);
+        request
+            .ctx
+            .push(("bloom.route_id".into(), matched.route.route_id.clone()));
+
+        let mut caps = matched
+            .route
+            .install_metadata
+            .required_caps
+            .iter()
+            .map(|cap| {
+                v2_capability(cap).ok_or_else(|| {
+                    PetalError::InvalidWasm(format!(
+                        "v2 route {} has unknown required cap {cap:?}",
+                        matched.route.route_id
+                    ))
+                })
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if let Some(mask) = cap_mask {
+            caps = caps.intersection(&mask).copied().collect();
+        }
+
+        let wasm = self
+            .store
+            .read_route_artifact(&matched.hash, &matched.route.route_id)?;
+        let mut opts = opts;
+        if opts.private_store_root.is_none() {
+            opts.private_store_root = Some(self.store.private_data_root());
+        }
+        let declared = self.v2_net_policy(&matched.hash)?;
+        opts.net_policy = Some(match opts.net_policy {
+            Some(mask) => declared.intersect(&mask),
+            None => declared,
+        });
+        self.vm
+            .dispatch(&wasm, request, caps, host, &matched.hash, opts)
+            .await
+    }
+
+    fn v2_net_policy(&self, hash: &str) -> Result<NetPolicy, PetalError> {
+        let manifest = std::fs::read(self.store.package_path(hash)?.join("source/petal.toml"))?;
+        NetPolicy::from_v2_manifest_toml(&manifest)
+    }
 }
 
 fn requires_local_manifest(cap: &Capability) -> bool {
@@ -365,6 +502,169 @@ fn requires_local_manifest(cap: &Capability) -> bool {
         cap,
         Capability::NetFetch | Capability::Sign | Capability::Store
     )
+}
+
+fn route_op(op: DispatchOp) -> RouteOp {
+    match op {
+        DispatchOp::Lookup => RouteOp::Lookup,
+        DispatchOp::List => RouteOp::List,
+        DispatchOp::Read => RouteOp::Read,
+        DispatchOp::Write => RouteOp::Write,
+    }
+}
+
+fn match_index_for_op<'a>(
+    index: &'a RouteIndex,
+    op: DispatchOp,
+    path: &str,
+) -> Option<crate::v2::RouteIndexMatch<'a>> {
+    match op {
+        DispatchOp::Lookup => index
+            .match_route(path)
+            .or_else(|| match_special_route(index, path, "$lookup")),
+        DispatchOp::List => match_special_route(index, path, "$list"),
+        DispatchOp::Read | DispatchOp::Write => index.match_route(path),
+    }
+}
+
+fn match_special_route<'a>(
+    index: &'a RouteIndex,
+    path: &str,
+    special: &str,
+) -> Option<crate::v2::RouteIndexMatch<'a>> {
+    let candidate = special_route_path(path, special);
+    let matched = index.match_route(&candidate)?;
+    if route_segments(&matched.route.pattern).last().copied() == Some(special) {
+        Some(matched)
+    } else {
+        None
+    }
+}
+
+fn validate_runtime_route_path(path: &str) -> Result<(), PetalError> {
+    if path.starts_with('/')
+        || path.contains('\\')
+        || path.bytes().any(|b| b == 0)
+        || (!path.is_empty()
+            && path.split('/').any(|segment| {
+                segment.is_empty() || segment == "." || segment == ".." || segment.starts_with('$')
+            }))
+    {
+        return Err(PetalError::InvalidWasm(format!(
+            "invalid v2 runtime route path {path:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn special_route_path(path: &str, special: &str) -> String {
+    if path.is_empty() {
+        special.to_string()
+    } else {
+        format!("{path}/{special}")
+    }
+}
+
+fn v2_capability(cap: &str) -> Option<Capability> {
+    match cap {
+        "bloom:http" => Some(Capability::NetFetch),
+        "bloom:store" => Some(Capability::Store),
+        "bloom:sign" => Some(Capability::Sign),
+        "bloom:vfs.read" => Some(Capability::VfsRead),
+        "bloom:vfs.write" => Some(Capability::VfsWrite),
+        _ => Capability::parse(cap),
+    }
+}
+
+fn app_path(mount: &str, path: &str) -> String {
+    if path.is_empty() {
+        format!("apps/{mount}")
+    } else {
+        format!("apps/{mount}/{path}")
+    }
+}
+
+fn route_has_descendant(pattern: &str, path: &str) -> bool {
+    let pattern_segments = route_segments(pattern);
+    let path_segments = route_segments(path);
+    if path_segments.len() >= pattern_segments.len() {
+        return false;
+    }
+    path_segments
+        .iter()
+        .zip(pattern_segments.iter())
+        .all(|(value, pattern)| route_segment_matches(pattern, value))
+}
+
+fn static_list_entries(index: &RouteIndex, path: &str) -> Vec<crate::DispatchEntry> {
+    use crate::{DispatchEntry, DispatchEntryKind};
+    use std::collections::BTreeMap;
+
+    let path_segments = route_segments(path);
+    let mut entries = BTreeMap::<String, DispatchEntryKind>::new();
+    for route in &index.routes {
+        let pattern_segments = route_segments(&route.pattern);
+        if path_segments.len() >= pattern_segments.len() {
+            continue;
+        }
+        if !path_segments
+            .iter()
+            .zip(pattern_segments.iter())
+            .all(|(value, pattern)| route_segment_matches(pattern, value))
+        {
+            continue;
+        }
+        let next = pattern_segments[path_segments.len()];
+        if next.starts_with('$') || next.starts_with('[') {
+            continue;
+        }
+        let kind = if path_segments.len() + 1 == pattern_segments.len()
+            && route.kind == RouteEntryKind::File
+        {
+            DispatchEntryKind::File
+        } else {
+            DispatchEntryKind::Dir
+        };
+        entries
+            .entry(next.to_string())
+            .and_modify(|existing| {
+                if kind == DispatchEntryKind::Dir {
+                    *existing = DispatchEntryKind::Dir;
+                }
+            })
+            .or_insert(kind);
+    }
+    entries
+        .into_iter()
+        .map(|(name, kind)| DispatchEntry {
+            name,
+            kind,
+            size: 0,
+            mode: 0,
+            ttl_hint_ms: None,
+            link_target: None,
+        })
+        .collect()
+}
+
+fn route_segments(path: &str) -> Vec<&str> {
+    if path.is_empty() {
+        Vec::new()
+    } else {
+        path.split('/').collect()
+    }
+}
+
+fn route_segment_matches(pattern: &str, value: &str) -> bool {
+    if let Some(rest) = pattern.strip_prefix('[')
+        && let Some(end) = rest.find(']')
+    {
+        let suffix = &rest[end + 1..];
+        return value
+            .strip_suffix(suffix)
+            .is_some_and(|bound| !bound.is_empty());
+    }
+    pattern == value
 }
 
 #[cfg(test)]

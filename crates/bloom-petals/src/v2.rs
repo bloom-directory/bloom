@@ -46,6 +46,12 @@ pub struct RouteMatch<'a> {
     pub params: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteIndexMatch<'a> {
+    pub route: &'a RouteIndexRecord,
+    pub params: Vec<(String, String)>,
+}
+
 #[derive(Debug, Deserialize)]
 struct PetalToml {
     #[serde(default)]
@@ -264,6 +270,7 @@ impl PreparedAppPackage {
             let source_bytes = file_bytes(&files, &source_path)?;
             let validation = validate_route_wasm(&source_path, source_bytes, &allowed_caps)?;
             let artifact_path = format!("artifacts/routes/{}.wasm", route.route_id);
+            let (kind, ops) = route_kind_and_ops(&source_path);
             route_index.routes.push(RouteIndexRecord {
                 route_id: route.route_id,
                 pattern: route.pattern,
@@ -271,21 +278,8 @@ impl PreparedAppPackage {
                 artifact_path,
                 artifact_hash: hex::encode(blake3::hash(source_bytes).as_bytes()),
                 abi: validation.abi,
-                kind: RouteEntryKind::File,
-                ops: match validation.abi {
-                    RouteAbi::ComponentBloomRoute010 => vec![
-                        RouteOp::Lookup,
-                        RouteOp::List,
-                        RouteOp::Read,
-                        RouteOp::Write,
-                    ],
-                    RouteAbi::CompatPetalDispatchV1 => vec![
-                        RouteOp::Lookup,
-                        RouteOp::List,
-                        RouteOp::Read,
-                        RouteOp::Write,
-                    ],
-                },
+                kind,
+                ops,
                 params: route.params,
                 specificity: route.specificity.as_array(),
                 install_metadata: InstallRouteMetadata {
@@ -306,6 +300,36 @@ impl PreparedAppPackage {
             files,
             route_index,
         })
+    }
+}
+
+fn route_kind_and_ops(source_path: &str) -> (RouteEntryKind, Vec<RouteOp>) {
+    match source_path.rsplit('/').next().unwrap_or_default() {
+        "$index.wasm" => (RouteEntryKind::Dir, vec![RouteOp::Lookup, RouteOp::Read]),
+        "$list.wasm" => (RouteEntryKind::Dir, vec![RouteOp::List]),
+        "$lookup.wasm" => (RouteEntryKind::File, vec![RouteOp::Lookup]),
+        _ => (RouteEntryKind::File, vec![RouteOp::Lookup, RouteOp::Read]),
+    }
+}
+
+impl RouteIndex {
+    pub fn match_route(&self, path: &str) -> Option<RouteIndexMatch<'_>> {
+        let path = normalize_request_path(path)?;
+        let mut best: Option<RouteIndexMatch<'_>> = None;
+        for route in &self.routes {
+            let Some(params) = match_pattern(&route.pattern, path) else {
+                continue;
+            };
+            let candidate = RouteIndexMatch { route, params };
+            if best
+                .as_ref()
+                .map(|best| route.specificity > best.route.specificity)
+                .unwrap_or(true)
+            {
+                best = Some(candidate);
+            }
+        }
+        best
     }
 }
 
@@ -763,6 +787,12 @@ fn validate_route_wasm(
                             import.module, import.name
                         )));
                     };
+                    if cap == "bloom:sign" {
+                        return Err(PetalError::InvalidWasm(format!(
+                            "{path}: compatibility route import {}.{} is unsupported until v2 sign-intent policy enforcement is implemented",
+                            import.module, import.name
+                        )));
+                    }
                     validate_compat_import_sig(path, import.module, import.name, import_type)?;
                     if !allowed_caps.contains(cap) {
                         return Err(PetalError::InvalidWasm(format!(
@@ -1558,6 +1588,33 @@ allowed = ["bloom:vfs.read"]
             package.route_index.routes[0].install_metadata.required_caps,
             vec!["bloom:vfs.read".to_string()]
         );
+    }
+
+    #[test]
+    fn v2_compat_sign_imports_are_rejected_until_intent_policy_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_manifest_and_route(
+            tmp.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+[caps]
+allowed = ["bloom:sign"]
+"#,
+            &wat::parse_str(
+                r#"
+                (module
+                  (import "bloom.v1" "sign_hash"
+                    (func $sign_hash (param i32 i32 i32 i32) (result i32)))
+                  (memory (export "memory") 1)
+                  (func (export "petal_alloc") (param i32) (result i32) (i32.const 1024))
+                  (func (export "petal_dispatch") (param i32 i32) (result i64) (i64.const 0)))
+                "#,
+            )
+            .unwrap(),
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("sign-intent policy"));
     }
 
     #[test]
