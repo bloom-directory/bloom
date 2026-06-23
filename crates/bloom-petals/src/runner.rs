@@ -870,6 +870,45 @@ paths = ["/markets*"]
     }
 
     #[tokio::test]
+    async fn component_app_routes_fail_closed_until_component_runner_exists() {
+        let (dir, r) = runner();
+        let package = dir.path().join("component-app");
+        write_package_file(
+            &package,
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
+        write_package_file(&package, "README.md", b"# echo");
+        write_package_file(&package, "AGENTS.md", b"# echo agents");
+        write_package_file(
+            &package,
+            "app/echo/message.txt.wasm",
+            include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
+        );
+        r.store().install_app_package_dir(&package).unwrap();
+
+        let err = r
+            .dispatch_app_route(
+                "echo",
+                DispatchRequest {
+                    op: DispatchOp::Read,
+                    path: "message.txt".into(),
+                    body: Vec::new(),
+                    ctx: Vec::new(),
+                },
+                Arc::new(crate::host::DenyHost),
+                None,
+                RunOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PetalError::ModeUnsupported(_)));
+        assert!(err.to_string().contains("compat runner"));
+    }
+
+    #[tokio::test]
     async fn resolve_prefers_hash_then_name() {
         let (_d, r) = runner();
         let (res, _) = r
@@ -886,6 +925,12 @@ paths = ["/markets*"]
             r.resolve("nope").unwrap_err(),
             PetalError::NotFound(_)
         ));
+    }
+
+    fn write_package_file(root: &std::path::Path, rel: &str, body: &[u8]) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
     }
 
     #[tokio::test]

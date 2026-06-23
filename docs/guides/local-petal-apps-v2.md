@@ -10,9 +10,12 @@ Required files:
 - `AGENTS.md`
 - at least one `app/<name>/**/*.wasm` route
 
-Current bootstrap support accepts compatibility `petal_dispatch` core-WASM
-routes. Component routes are rejected until `bloom:route@0.1.0` WIT validation
-and execution are implemented.
+Current bootstrap support runs compatibility `petal_dispatch` core-WASM routes.
+Component routes are validated against `bloom:route@0.1.0` at build/install time
+but still fail closed at dispatch until the component runner is implemented.
+Current component validation accepts direct route components with Bloom-owned
+WIT imports only; package-local shared component imports land with composition
+support.
 
 Useful commands:
 

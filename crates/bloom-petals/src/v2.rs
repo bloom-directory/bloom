@@ -10,7 +10,13 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use wasmparser::{ExternalKind, FuncType, Parser, Payload, TypeRef, ValType, Validator};
+use wasmparser::{
+    CanonicalFunction, ComponentAlias, ComponentDefinedType, ComponentExternalKind,
+    ComponentFuncResult, ComponentFuncType, ComponentOuterAliasKind, ComponentType,
+    ComponentTypeRef as WasmComponentTypeRef, ComponentValType, ExternalKind, FuncType,
+    InstanceTypeDeclaration, Parser, Payload, PrimitiveValType as ComponentPrimitiveValType,
+    TypeBounds as WasmComponentTypeBounds, TypeRef, ValType, Validator,
+};
 
 use crate::error::PetalError;
 
@@ -943,13 +949,25 @@ fn validate_route_wasm(
     let mut alloc_export: Option<u32> = None;
     let mut dispatch_export: Option<u32> = None;
     let mut saw_component = false;
+    let mut component_types = Vec::new();
+    let mut component_func_type_indices = Vec::new();
+    let mut component_instance_route_type_imports = Vec::new();
+    let mut component_exports = Vec::new();
     let mut required_caps = BTreeSet::new();
+    let mut parse_depth = 0usize;
     for payload in Parser::new(0).parse_all(wasm) {
-        match payload.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))? {
+        let payload = payload.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))?;
+        let current_depth = parse_depth;
+        match payload {
             Payload::Version { encoding, .. } => {
-                saw_component = matches!(encoding, wasmparser::Encoding::Component);
+                if current_depth == 0 {
+                    saw_component |= matches!(encoding, wasmparser::Encoding::Component);
+                }
             }
             Payload::ExportSection(reader) => {
+                if saw_component || current_depth != 0 {
+                    continue;
+                }
                 for export in reader {
                     let export =
                         export.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))?;
@@ -964,11 +982,17 @@ fn validate_route_wasm(
                 }
             }
             Payload::TypeSection(reader) => {
+                if saw_component || current_depth != 0 {
+                    continue;
+                }
                 for ty in reader.into_iter_err_on_gc_types() {
                     types.push(ty.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))?);
                 }
             }
             Payload::FunctionSection(reader) => {
+                if saw_component || current_depth != 0 {
+                    continue;
+                }
                 for type_index in reader {
                     func_type_indices.push(
                         type_index.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))?,
@@ -976,6 +1000,9 @@ fn validate_route_wasm(
                 }
             }
             Payload::ImportSection(reader) => {
+                if saw_component || current_depth != 0 {
+                    continue;
+                }
                 for import in reader {
                     let import =
                         import.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))?;
@@ -1017,24 +1044,215 @@ fn validate_route_wasm(
                     required_caps.insert(cap.to_string());
                 }
             }
+            Payload::ComponentTypeSection(reader) => {
+                if current_depth != 0 {
+                    continue;
+                }
+                for ty in reader {
+                    component_types.push(ComponentTypeEntry::Type(
+                        ty.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))?,
+                    ));
+                }
+            }
+            Payload::ComponentImportSection(reader) => {
+                if current_depth != 0 {
+                    continue;
+                }
+                for import in reader {
+                    let import =
+                        import.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))?;
+                    let name = import.name.0;
+                    let kind = import.ty.kind();
+                    if kind == ComponentExternalKind::Type {
+                        let route_type = match import.ty {
+                            WasmComponentTypeRef::Type(WasmComponentTypeBounds::Eq(index)) => {
+                                component_route_type_import(name).filter(|route_type| {
+                                    is_component_route_type_index(
+                                        &component_types,
+                                        index,
+                                        route_type,
+                                    )
+                                })
+                            }
+                            _ => None,
+                        };
+                        let Some(route_type) = route_type else {
+                            return Err(PetalError::InvalidWasm(format!(
+                                "{path}: component route imports unsupported host item {name:?}"
+                            )));
+                        };
+                        component_types.push(ComponentTypeEntry::RouteType(route_type));
+                        continue;
+                    }
+                    if kind != ComponentExternalKind::Instance {
+                        return Err(PetalError::InvalidWasm(format!(
+                            "{path}: component route import {name:?} must be an interface instance"
+                        )));
+                    }
+                    let Some(caps) = component_import_caps(name) else {
+                        return Err(PetalError::InvalidWasm(format!(
+                            "{path}: component route imports unsupported host item {name:?}"
+                        )));
+                    };
+                    let host_interface = component_host_interface(name);
+                    let route_types_instance = if caps.is_empty()
+                        && name == "bloom:route/types@0.1.0"
+                    {
+                        match import.ty {
+                            WasmComponentTypeRef::Instance(type_index)
+                                if is_route_types_instance(type_index, &component_types) =>
+                            {
+                                true
+                            }
+                            _ => {
+                                return Err(PetalError::InvalidWasm(format!(
+                                    "{path}: component route import {name:?} has invalid bloom:route@0.1.0 types"
+                                )));
+                            }
+                        }
+                    } else {
+                        match (host_interface, import.ty) {
+                            (Some(interface), WasmComponentTypeRef::Instance(type_index))
+                                if is_host_interface_instance(
+                                    interface,
+                                    type_index,
+                                    &component_types,
+                                ) => {}
+                            (Some(_), _) => {
+                                return Err(PetalError::InvalidWasm(format!(
+                                    "{path}: component route import {name:?} has invalid Bloom WIT interface shape"
+                                )));
+                            }
+                            (None, _) => {}
+                        }
+                        false
+                    };
+                    for cap in caps {
+                        if *cap == "bloom:sign" {
+                            return Err(PetalError::InvalidWasm(format!(
+                                "{path}: component route import {name:?} is unsupported until v2 sign-intent policy enforcement is implemented"
+                            )));
+                        }
+                        if !allowed_caps.contains(*cap) {
+                            return Err(PetalError::InvalidWasm(format!(
+                                "{path}: component route import {name:?} requires missing petal.toml cap {cap}",
+                            )));
+                        }
+                        required_caps.insert((*cap).to_string());
+                    }
+                    component_instance_route_type_imports.push(route_types_instance);
+                }
+            }
+            Payload::ComponentCanonicalSection(reader) => {
+                if current_depth != 0 {
+                    continue;
+                }
+                for func in reader {
+                    let func = func.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))?;
+                    if let CanonicalFunction::Lift { type_index, .. } = func {
+                        component_func_type_indices.push(type_index);
+                    }
+                }
+            }
+            Payload::ComponentAliasSection(reader) => {
+                if current_depth != 0 {
+                    continue;
+                }
+                for alias in reader {
+                    let alias =
+                        alias.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))?;
+                    match alias {
+                        ComponentAlias::InstanceExport {
+                            kind: ComponentExternalKind::Type,
+                            instance_index,
+                            name,
+                            ..
+                        } => component_types.push(
+                            component_instance_route_type_imports
+                                .get(instance_index as usize)
+                                .copied()
+                                .unwrap_or(false)
+                                .then(|| component_route_type_import(name))
+                                .flatten()
+                                .map(ComponentTypeEntry::RouteType)
+                                .unwrap_or(ComponentTypeEntry::Unknown),
+                        ),
+                        ComponentAlias::InstanceExport {
+                            kind: ComponentExternalKind::Func,
+                            ..
+                        } => component_func_type_indices.push(u32::MAX),
+                        ComponentAlias::Outer {
+                            kind: ComponentOuterAliasKind::Type,
+                            ..
+                        } => component_types.push(ComponentTypeEntry::Unknown),
+                        ComponentAlias::CoreInstanceExport { .. }
+                        | ComponentAlias::Outer { .. } => {}
+                        ComponentAlias::InstanceExport { .. } => {}
+                    }
+                }
+            }
             Payload::ComponentExportSection(reader) => {
+                if current_depth != 0 {
+                    continue;
+                }
                 for export in reader {
-                    export.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))?;
+                    let export =
+                        export.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))?;
+                    let name = export.name.0;
+                    if component_route_export(name).is_some()
+                        && export.kind != ComponentExternalKind::Func
+                    {
+                        return Err(PetalError::InvalidWasm(format!(
+                            "{path}: component route export {name:?} must be a function"
+                        )));
+                    }
+                    if export.kind == ComponentExternalKind::Func {
+                        let type_index = match export.ty {
+                            Some(WasmComponentTypeRef::Func(type_index)) => Some(type_index),
+                            Some(_) => None,
+                            None => component_func_type_indices
+                                .get(export.index as usize)
+                                .copied(),
+                        };
+                        if let Some(type_index) = type_index {
+                            component_func_type_indices.push(type_index);
+                        }
+                        component_exports.push(ComponentRouteExport {
+                            name: name.to_string(),
+                            type_index,
+                        });
+                    }
                 }
             }
             Payload::StartSection { func, .. } => {
+                if saw_component || current_depth != 0 {
+                    continue;
+                }
                 return Err(PetalError::InvalidWasm(format!(
                     "{path}: compatibility route declares start function {func}; start sections are not allowed"
                 )));
+            }
+            Payload::ModuleSection { .. } | Payload::ComponentSection { .. } => {
+                parse_depth += 1;
+            }
+            Payload::End(_) => {
+                parse_depth = parse_depth.saturating_sub(1);
             }
             _ => {}
         }
     }
 
     if saw_component {
-        return Err(PetalError::InvalidWasm(format!(
-            "{path}: component route validation for bloom:route@0.1.0 is not implemented yet"
-        )));
+        validate_component_route_exports(
+            path,
+            &component_exports,
+            &component_func_type_indices,
+            &component_types,
+        )?;
+        return Ok(RouteValidation {
+            abi: RouteAbi::ComponentBloomRoute010,
+            required_caps: required_caps.into_iter().collect(),
+        });
     }
 
     if !has_memory_export {
@@ -1076,6 +1294,923 @@ fn validate_route_wasm(
         abi: RouteAbi::CompatPetalDispatchV1,
         required_caps: required_caps.into_iter().collect(),
     })
+}
+
+#[derive(Debug)]
+struct ComponentRouteExport {
+    name: String,
+    type_index: Option<u32>,
+}
+
+#[derive(Debug)]
+enum ComponentTypeEntry<'a> {
+    Type(ComponentType<'a>),
+    RouteType(&'static str),
+    Unknown,
+}
+
+fn validate_component_route_exports(
+    path: &str,
+    exports: &[ComponentRouteExport],
+    func_type_indices: &[u32],
+    types: &[ComponentTypeEntry<'_>],
+) -> Result<(), PetalError> {
+    if component_route_export_type("metadata", exports, func_type_indices).is_none() {
+        return Err(PetalError::InvalidWasm(format!(
+            "{path}: component route missing bloom:route@0.1.0 metadata export"
+        )));
+    }
+    for required in required_component_handler_exports(path) {
+        if component_route_export_type(required, exports, func_type_indices).is_none() {
+            return Err(PetalError::InvalidWasm(format!(
+                "{path}: component route missing bloom:route@0.1.0 {required:?} export"
+            )));
+        }
+    }
+    for export in exports {
+        let Some(expected) = component_route_export(&export.name) else {
+            continue;
+        };
+        let type_index = component_route_export_type(&export.name, exports, func_type_indices)
+            .ok_or_else(|| {
+                PetalError::InvalidWasm(format!(
+                    "{path}: component route export {:?} is missing a function type",
+                    export.name
+                ))
+            })?;
+        let ty = component_func_type(path, type_index, types)?;
+        validate_component_route_func_sig(path, expected, ty, types)?;
+    }
+    Ok(())
+}
+
+fn component_route_export_type(
+    name: &str,
+    exports: &[ComponentRouteExport],
+    _func_type_indices: &[u32],
+) -> Option<u32> {
+    exports
+        .iter()
+        .find(|export| export.name == name)
+        .and_then(|export| export.type_index)
+}
+
+fn required_component_handler_exports(path: &str) -> &'static [&'static str] {
+    match path.rsplit('/').next().unwrap_or_default() {
+        "$index.wasm" => &["lookup", "read"],
+        "$list.wasm" => &["list"],
+        "$lookup.wasm" => &["lookup"],
+        _ => &["lookup", "read"],
+    }
+}
+
+fn component_route_export(name: &str) -> Option<&'static str> {
+    match name {
+        "metadata" => Some("metadata"),
+        "lookup" => Some("lookup"),
+        "list" => Some("list"),
+        "read" => Some("read"),
+        "write" => Some("write"),
+        _ => None,
+    }
+}
+
+fn component_route_type_import(name: &str) -> Option<&'static str> {
+    match name {
+        "ctx" => Some("ctx"),
+        "entry-kind" => Some("entry-kind"),
+        "entry" => Some("entry"),
+        "route-meta" => Some("route-meta"),
+        "route-error" => Some("route-error"),
+        _ => None,
+    }
+}
+
+fn component_import_caps(name: &str) -> Option<&'static [&'static str]> {
+    let (package, interface, version) = component_import_package_interface(name)?;
+    if version != "0.1.0" {
+        return None;
+    }
+    match (package, interface) {
+        ("bloom:route", "types") => Some(&[]),
+        ("bloom:http", "fetch") => Some(&["bloom:http"]),
+        ("bloom:store", "kv") => Some(&["bloom:store"]),
+        ("bloom:sign", "signing") => Some(&["bloom:sign"]),
+        ("bloom:chain", "read") => Some(&["bloom:chain"]),
+        ("bloom:vfs", "readwrite") => Some(&["bloom:vfs.read", "bloom:vfs.write"]),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ComponentHostInterface {
+    HttpFetch,
+    StoreKv,
+    SignSigning,
+    ChainRead,
+    VfsReadwrite,
+}
+
+fn component_host_interface(name: &str) -> Option<ComponentHostInterface> {
+    let (package, interface, version) = component_import_package_interface(name)?;
+    if version != "0.1.0" {
+        return None;
+    }
+    match (package, interface) {
+        ("bloom:http", "fetch") => Some(ComponentHostInterface::HttpFetch),
+        ("bloom:store", "kv") => Some(ComponentHostInterface::StoreKv),
+        ("bloom:sign", "signing") => Some(ComponentHostInterface::SignSigning),
+        ("bloom:chain", "read") => Some(ComponentHostInterface::ChainRead),
+        ("bloom:vfs", "readwrite") => Some(ComponentHostInterface::VfsReadwrite),
+        _ => None,
+    }
+}
+
+fn component_import_package_interface(name: &str) -> Option<(&str, &str, &str)> {
+    let (_, rest) = name.split_once(':')?;
+    let (package_rest, interface) = rest.split_once('/')?;
+    let (interface, version) = interface.split_once('@')?;
+    Some((
+        &name[..("bloom:".len() + package_rest.len())],
+        interface,
+        version,
+    ))
+}
+
+fn component_func_type<'a>(
+    path: &str,
+    type_index: u32,
+    types: &'a [ComponentTypeEntry<'a>],
+) -> Result<&'a ComponentFuncType<'a>, PetalError> {
+    match types.get(type_index as usize) {
+        Some(ComponentTypeEntry::Type(ComponentType::Func(ty))) => Ok(ty),
+        _ => Err(PetalError::InvalidWasm(format!(
+            "{path}: component route export references missing function type {type_index}"
+        ))),
+    }
+}
+
+fn validate_component_route_func_sig(
+    path: &str,
+    export: &str,
+    ty: &ComponentFuncType<'_>,
+    types: &[ComponentTypeEntry<'_>],
+) -> Result<(), PetalError> {
+    let params = ty.params.as_ref();
+    match export {
+        "metadata" | "lookup" | "list" | "read" => {
+            if params.len() != 1 || params[0].0 != "ctx" || !is_route_ctx(&params[0].1, types, 0) {
+                return Err(PetalError::InvalidWasm(format!(
+                    "{path}: component route export {export:?} has invalid bloom:route@0.1.0 params"
+                )));
+            }
+        }
+        "write" => {
+            if params.len() != 2
+                || params[0].0 != "ctx"
+                || !is_route_ctx(&params[0].1, types, 0)
+                || params[1].0 != "body"
+                || !is_list_of(&params[1].1, types, is_u8, 0)
+            {
+                return Err(PetalError::InvalidWasm(format!(
+                    "{path}: component route export {export:?} has invalid bloom:route@0.1.0 params"
+                )));
+            }
+        }
+        _ => return Ok(()),
+    }
+
+    let Some((_, result_ty)) = single_component_result(&ty.results) else {
+        return Err(PetalError::InvalidWasm(format!(
+            "{path}: component route export {export:?} must return a single result"
+        )));
+    };
+    let ok = match export {
+        "metadata" => RouteOkType::RouteMeta,
+        "lookup" => RouteOkType::Entry,
+        "list" => RouteOkType::EntryList,
+        "read" => RouteOkType::Bytes,
+        "write" => RouteOkType::Unit,
+        _ => unreachable!("route exports checked above"),
+    };
+    if !is_route_result(result_ty, types, ok, 0) {
+        return Err(PetalError::InvalidWasm(format!(
+            "{path}: component route export {export:?} has invalid bloom:route@0.1.0 result"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum RouteOkType {
+    RouteMeta,
+    Entry,
+    EntryList,
+    Bytes,
+    Unit,
+}
+
+fn single_component_result<'a>(
+    result: &'a ComponentFuncResult<'a>,
+) -> Option<(Option<&'a str>, &'a ComponentValType)> {
+    let mut iter = result.iter();
+    let first = iter.next()?;
+    iter.next().is_none().then_some(first)
+}
+
+fn is_route_result(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    ok: RouteOkType,
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Result { ok: result_ok, err } = defined else {
+            return false;
+        };
+        let ok_matches = match (ok, result_ok) {
+            (RouteOkType::Unit, None) => true,
+            (RouteOkType::RouteMeta, Some(ty)) => is_route_meta(ty, types, depth),
+            (RouteOkType::Entry, Some(ty)) => is_route_entry(ty, types, depth),
+            (RouteOkType::EntryList, Some(ty)) => is_list_of(ty, types, is_route_entry, depth),
+            (RouteOkType::Bytes, Some(ty)) => is_list_of(ty, types, is_u8, depth),
+            _ => false,
+        };
+        ok_matches && err.is_some_and(|ty| is_route_error(&ty, types, depth))
+    })
+}
+
+fn with_defined_type(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+    f: impl FnOnce(&ComponentDefinedType<'_>, &[ComponentTypeEntry<'_>], usize) -> bool,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    let ComponentValType::Type(index) = ty else {
+        return false;
+    };
+    match types.get(*index as usize) {
+        Some(ComponentTypeEntry::Type(ComponentType::Defined(defined))) => {
+            f(defined, types, depth + 1)
+        }
+        _ => false,
+    }
+}
+
+fn is_route_type_import(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    expected: &str,
+) -> bool {
+    let ComponentValType::Type(index) = ty else {
+        return false;
+    };
+    matches!(
+        types.get(*index as usize),
+        Some(ComponentTypeEntry::RouteType(name)) if *name == expected
+    )
+}
+
+fn is_component_route_type_index(
+    types: &[ComponentTypeEntry<'_>],
+    index: u32,
+    expected: &str,
+) -> bool {
+    matches!(
+        types.get(index as usize),
+        Some(ComponentTypeEntry::RouteType(name)) if *name == expected
+    )
+}
+
+fn cloned_component_type_entry<'a>(
+    types: &[ComponentTypeEntry<'a>],
+    index: u32,
+) -> Option<ComponentTypeEntry<'a>> {
+    match types.get(index as usize)? {
+        ComponentTypeEntry::Type(ty) => Some(ComponentTypeEntry::Type(ty.clone())),
+        ComponentTypeEntry::RouteType(name) => Some(ComponentTypeEntry::RouteType(name)),
+        ComponentTypeEntry::Unknown => Some(ComponentTypeEntry::Unknown),
+    }
+}
+
+fn is_route_types_instance<'a>(type_index: u32, types: &[ComponentTypeEntry<'a>]) -> bool {
+    let Some(ComponentTypeEntry::Type(ComponentType::Instance(declarations))) =
+        types.get(type_index as usize)
+    else {
+        return false;
+    };
+
+    let mut local_types = Vec::new();
+    let mut ctx = None;
+    let mut entry_kind = None;
+    let mut entry = None;
+    let mut route_error = None;
+    let mut route_meta = None;
+    let mut exported_types = BTreeSet::new();
+
+    for declaration in declarations.as_ref() {
+        match declaration {
+            InstanceTypeDeclaration::Type(ty) => {
+                local_types.push(ComponentTypeEntry::Type(ty.clone()));
+            }
+            InstanceTypeDeclaration::Export { name, ty } => {
+                let Some(route_type) = component_route_type_import(name.0) else {
+                    return false;
+                };
+                let WasmComponentTypeRef::Type(WasmComponentTypeBounds::Eq(index)) = *ty else {
+                    return false;
+                };
+                if !exported_types.insert(route_type) {
+                    return false;
+                }
+                match route_type {
+                    "ctx" => ctx = Some(index),
+                    "entry-kind" => entry_kind = Some(index),
+                    "entry" => entry = Some(index),
+                    "route-error" => route_error = Some(index),
+                    "route-meta" => route_meta = Some(index),
+                    _ => unreachable!("route type import names checked above"),
+                }
+                let Some(entry) = cloned_component_type_entry(&local_types, index) else {
+                    return false;
+                };
+                local_types.push(entry);
+            }
+            InstanceTypeDeclaration::CoreType(_) | InstanceTypeDeclaration::Alias(_) => {
+                return false;
+            }
+        }
+    }
+
+    route_type_export_matches(ctx, &local_types, is_route_ctx)
+        && route_type_export_matches(entry_kind, &local_types, is_entry_kind)
+        && route_type_export_matches(entry, &local_types, is_route_entry)
+        && route_type_export_matches(route_error, &local_types, is_route_error)
+        && route_type_export_matches(route_meta, &local_types, is_route_meta)
+}
+
+#[derive(Clone, Copy)]
+enum HostTypeExport {
+    HttpRequest,
+    HttpResponse,
+    ChainRequest,
+    ChainResponse,
+    VfsEntryKind,
+    VfsEntry,
+}
+
+#[derive(Clone, Copy)]
+enum HostFuncExport {
+    HttpFetch,
+    StoreGet,
+    StorePut,
+    StoreList,
+    StoreDelete,
+    SignHash,
+    ChainCall,
+    VfsLookup,
+    VfsList,
+    VfsRead,
+    VfsWrite,
+}
+
+fn is_host_interface_instance<'a>(
+    interface: ComponentHostInterface,
+    type_index: u32,
+    types: &[ComponentTypeEntry<'a>],
+) -> bool {
+    let Some(ComponentTypeEntry::Type(ComponentType::Instance(declarations))) =
+        types.get(type_index as usize)
+    else {
+        return false;
+    };
+
+    let mut local_types = Vec::new();
+    let mut exported_types = BTreeSet::new();
+    let mut exported_funcs = BTreeSet::new();
+
+    for declaration in declarations.as_ref() {
+        match declaration {
+            InstanceTypeDeclaration::Type(ty) => {
+                local_types.push(ComponentTypeEntry::Type(ty.clone()));
+            }
+            InstanceTypeDeclaration::Export { name, ty } => match *ty {
+                WasmComponentTypeRef::Type(WasmComponentTypeBounds::Eq(index)) => {
+                    let Some(expected) = host_type_export(interface, name.0) else {
+                        return false;
+                    };
+                    if !host_type_export_matches(expected, index, &local_types)
+                        || !exported_types.insert(name.0)
+                    {
+                        return false;
+                    }
+                    let Some(entry) = cloned_component_type_entry(&local_types, index) else {
+                        return false;
+                    };
+                    local_types.push(entry);
+                }
+                WasmComponentTypeRef::Func(func_type_index) => {
+                    let Some(expected) = host_func_export(interface, name.0) else {
+                        return false;
+                    };
+                    if !host_func_export_matches(expected, func_type_index, &local_types)
+                        || !exported_funcs.insert(name.0)
+                    {
+                        return false;
+                    }
+                }
+                _ => return false,
+            },
+            InstanceTypeDeclaration::CoreType(_) | InstanceTypeDeclaration::Alias(_) => {
+                return false;
+            }
+        }
+    }
+
+    required_host_type_exports(interface)
+        .iter()
+        .all(|name| exported_types.contains(name))
+        && required_host_func_exports(interface)
+            .iter()
+            .all(|name| exported_funcs.contains(name))
+}
+
+fn host_type_export(interface: ComponentHostInterface, name: &str) -> Option<HostTypeExport> {
+    match (interface, name) {
+        (ComponentHostInterface::HttpFetch, "request") => Some(HostTypeExport::HttpRequest),
+        (ComponentHostInterface::HttpFetch, "response") => Some(HostTypeExport::HttpResponse),
+        (ComponentHostInterface::ChainRead, "request") => Some(HostTypeExport::ChainRequest),
+        (ComponentHostInterface::ChainRead, "response") => Some(HostTypeExport::ChainResponse),
+        (ComponentHostInterface::VfsReadwrite, "entry-kind") => Some(HostTypeExport::VfsEntryKind),
+        (ComponentHostInterface::VfsReadwrite, "entry") => Some(HostTypeExport::VfsEntry),
+        _ => None,
+    }
+}
+
+fn host_func_export(interface: ComponentHostInterface, name: &str) -> Option<HostFuncExport> {
+    match (interface, name) {
+        (ComponentHostInterface::HttpFetch, "fetch") => Some(HostFuncExport::HttpFetch),
+        (ComponentHostInterface::StoreKv, "get") => Some(HostFuncExport::StoreGet),
+        (ComponentHostInterface::StoreKv, "put") => Some(HostFuncExport::StorePut),
+        (ComponentHostInterface::StoreKv, "list") => Some(HostFuncExport::StoreList),
+        (ComponentHostInterface::StoreKv, "delete") => Some(HostFuncExport::StoreDelete),
+        (ComponentHostInterface::SignSigning, "sign-hash") => Some(HostFuncExport::SignHash),
+        (ComponentHostInterface::ChainRead, "call") => Some(HostFuncExport::ChainCall),
+        (ComponentHostInterface::VfsReadwrite, "lookup") => Some(HostFuncExport::VfsLookup),
+        (ComponentHostInterface::VfsReadwrite, "list") => Some(HostFuncExport::VfsList),
+        (ComponentHostInterface::VfsReadwrite, "read") => Some(HostFuncExport::VfsRead),
+        (ComponentHostInterface::VfsReadwrite, "write") => Some(HostFuncExport::VfsWrite),
+        _ => None,
+    }
+}
+
+fn required_host_type_exports(interface: ComponentHostInterface) -> &'static [&'static str] {
+    match interface {
+        ComponentHostInterface::HttpFetch => &["request", "response"],
+        ComponentHostInterface::ChainRead => &["request", "response"],
+        ComponentHostInterface::VfsReadwrite => &["entry-kind", "entry"],
+        ComponentHostInterface::StoreKv | ComponentHostInterface::SignSigning => &[],
+    }
+}
+
+fn required_host_func_exports(interface: ComponentHostInterface) -> &'static [&'static str] {
+    match interface {
+        ComponentHostInterface::HttpFetch => &["fetch"],
+        ComponentHostInterface::StoreKv => &["get", "put", "list", "delete"],
+        ComponentHostInterface::SignSigning => &["sign-hash"],
+        ComponentHostInterface::ChainRead => &["call"],
+        ComponentHostInterface::VfsReadwrite => &["lookup", "list", "read", "write"],
+    }
+}
+
+fn host_type_export_matches(
+    expected: HostTypeExport,
+    index: u32,
+    types: &[ComponentTypeEntry<'_>],
+) -> bool {
+    let ty = ComponentValType::Type(index);
+    match expected {
+        HostTypeExport::HttpRequest => is_http_request(&ty, types, 0),
+        HostTypeExport::HttpResponse => is_http_response(&ty, types, 0),
+        HostTypeExport::ChainRequest => is_chain_request(&ty, types, 0),
+        HostTypeExport::ChainResponse => is_chain_response(&ty, types, 0),
+        HostTypeExport::VfsEntryKind => is_entry_kind(&ty, types, 0),
+        HostTypeExport::VfsEntry => is_route_entry(&ty, types, 0),
+    }
+}
+
+fn host_func_export_matches(
+    expected: HostFuncExport,
+    type_index: u32,
+    types: &[ComponentTypeEntry<'_>],
+) -> bool {
+    let Some(ComponentTypeEntry::Type(ComponentType::Func(ty))) = types.get(type_index as usize)
+    else {
+        return false;
+    };
+    let params = ty.params.as_ref();
+    match expected {
+        HostFuncExport::HttpFetch => {
+            params_match(params, types, &[("req", is_http_request)])
+                && result_matches(&ty.results, types, HostOkType::HttpResponse)
+        }
+        HostFuncExport::StoreGet => {
+            params_match(
+                params,
+                types,
+                &[("namespace", is_string_type), ("key", is_string_type)],
+            ) && result_matches(&ty.results, types, HostOkType::OptionalBytes)
+        }
+        HostFuncExport::StorePut => {
+            params_match(
+                params,
+                types,
+                &[
+                    ("namespace", is_string_type),
+                    ("key", is_string_type),
+                    ("value", is_byte_list),
+                    ("secret", is_bool_type),
+                ],
+            ) && result_matches(&ty.results, types, HostOkType::Unit)
+        }
+        HostFuncExport::StoreList => {
+            params_match(
+                params,
+                types,
+                &[("namespace", is_string_type), ("prefix", is_string_type)],
+            ) && result_matches(&ty.results, types, HostOkType::StringList)
+        }
+        HostFuncExport::StoreDelete => {
+            params_match(
+                params,
+                types,
+                &[("namespace", is_string_type), ("key", is_string_type)],
+            ) && result_matches(&ty.results, types, HostOkType::Unit)
+        }
+        HostFuncExport::SignHash => {
+            params_match(
+                params,
+                types,
+                &[
+                    ("wallet", is_string_type),
+                    ("hash32", is_byte_list),
+                    ("intent", is_string_type),
+                ],
+            ) && result_matches(&ty.results, types, HostOkType::Bytes)
+        }
+        HostFuncExport::ChainCall => {
+            params_match(params, types, &[("req", is_chain_request)])
+                && result_matches(&ty.results, types, HostOkType::ChainResponse)
+        }
+        HostFuncExport::VfsLookup => {
+            params_match(params, types, &[("path", is_string_type)])
+                && result_matches(&ty.results, types, HostOkType::VfsEntry)
+        }
+        HostFuncExport::VfsList => {
+            params_match(params, types, &[("path", is_string_type)])
+                && result_matches(&ty.results, types, HostOkType::VfsEntryList)
+        }
+        HostFuncExport::VfsRead => {
+            params_match(params, types, &[("path", is_string_type)])
+                && result_matches(&ty.results, types, HostOkType::Bytes)
+        }
+        HostFuncExport::VfsWrite => {
+            params_match(
+                params,
+                types,
+                &[("path", is_string_type), ("body", is_byte_list)],
+            ) && result_matches(&ty.results, types, HostOkType::Unit)
+        }
+    }
+}
+
+type ValPredicate = fn(&ComponentValType, &[ComponentTypeEntry<'_>], usize) -> bool;
+
+fn params_match(
+    params: &[(&str, ComponentValType)],
+    types: &[ComponentTypeEntry<'_>],
+    expected: &[(&str, ValPredicate)],
+) -> bool {
+    params.len() == expected.len()
+        && params
+            .iter()
+            .zip(expected)
+            .all(|((name, ty), (expected_name, predicate))| {
+                name == expected_name && predicate(ty, types, 0)
+            })
+}
+
+#[derive(Clone, Copy)]
+enum HostOkType {
+    Unit,
+    Bytes,
+    OptionalBytes,
+    StringList,
+    HttpResponse,
+    ChainResponse,
+    VfsEntry,
+    VfsEntryList,
+}
+
+fn result_matches(
+    result: &ComponentFuncResult<'_>,
+    types: &[ComponentTypeEntry<'_>],
+    ok: HostOkType,
+) -> bool {
+    let Some((_, result_ty)) = single_component_result(result) else {
+        return false;
+    };
+    with_defined_type(result_ty, types, 0, |defined, types, depth| {
+        let ComponentDefinedType::Result { ok: result_ok, err } = defined else {
+            return false;
+        };
+        let ok_matches = match (ok, result_ok) {
+            (HostOkType::Unit, None) => true,
+            (HostOkType::Bytes, Some(ty)) => is_byte_list(ty, types, depth),
+            (HostOkType::OptionalBytes, Some(ty)) => is_option_of(ty, types, is_byte_list, depth),
+            (HostOkType::StringList, Some(ty)) => is_list_of(ty, types, is_string_type, depth),
+            (HostOkType::HttpResponse, Some(ty)) => is_http_response(ty, types, depth),
+            (HostOkType::ChainResponse, Some(ty)) => is_chain_response(ty, types, depth),
+            (HostOkType::VfsEntry, Some(ty)) => is_route_entry(ty, types, depth),
+            (HostOkType::VfsEntryList, Some(ty)) => is_list_of(ty, types, is_route_entry, depth),
+            _ => false,
+        };
+        ok_matches && err.is_some_and(|ty| is_string(&ty))
+    })
+}
+
+fn route_type_export_matches(
+    index: Option<u32>,
+    types: &[ComponentTypeEntry<'_>],
+    predicate: fn(&ComponentValType, &[ComponentTypeEntry<'_>], usize) -> bool,
+) -> bool {
+    index.is_some_and(|index| predicate(&ComponentValType::Type(index), types, 0))
+}
+
+fn is_route_ctx(ty: &ComponentValType, types: &[ComponentTypeEntry<'_>], depth: usize) -> bool {
+    if is_route_type_import(ty, types, "ctx") {
+        return true;
+    }
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        fields.as_ref().len() == 5
+            && fields[0].0 == "app-root"
+            && is_string(&fields[0].1)
+            && fields[1].0 == "package-hash"
+            && is_string(&fields[1].1)
+            && fields[2].0 == "path"
+            && is_string(&fields[2].1)
+            && fields[3].0 == "params"
+            && is_list_of(&fields[3].1, types, is_string_tuple, depth)
+            && fields[4].0 == "actor"
+            && is_option_of(&fields[4].1, types, is_string_type, depth)
+    })
+}
+
+fn is_route_entry(ty: &ComponentValType, types: &[ComponentTypeEntry<'_>], depth: usize) -> bool {
+    if is_route_type_import(ty, types, "entry") {
+        return true;
+    }
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        fields.as_ref().len() == 5
+            && fields[0].0 == "name"
+            && is_string(&fields[0].1)
+            && fields[1].0 == "kind"
+            && is_entry_kind(&fields[1].1, types, depth)
+            && fields[2].0 == "mode"
+            && is_u32(&fields[2].1)
+            && fields[3].0 == "size"
+            && is_option_of(&fields[3].1, types, is_u64, depth)
+            && fields[4].0 == "link-target"
+            && is_option_of(&fields[4].1, types, is_string_type, depth)
+    })
+}
+
+fn is_route_meta(ty: &ComponentValType, types: &[ComponentTypeEntry<'_>], depth: usize) -> bool {
+    if is_route_type_import(ty, types, "route-meta") {
+        return true;
+    }
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        fields.as_ref().len() == 10
+            && fields[0].0 == "kind"
+            && is_entry_kind(&fields[0].1, types, depth)
+            && fields[1].0 == "mode"
+            && is_u32(&fields[1].1)
+            && fields[2].0 == "cache-ttl-ms"
+            && is_option_of(&fields[2].1, types, is_u64, depth)
+            && fields[3].0 == "side-effecting-read"
+            && is_bool(&fields[3].1)
+            && fields[4].0 == "write-async"
+            && is_bool(&fields[4].1)
+            && fields[5].0 == "description"
+            && is_option_of(&fields[5].1, types, is_string_type, depth)
+            && fields[6].0 == "consent-summary"
+            && is_option_of(&fields[6].1, types, is_string_type, depth)
+            && fields[7].0 == "required-caps"
+            && is_list_of(&fields[7].1, types, is_string_type, depth)
+            && fields[8].0 == "sign-intent"
+            && is_option_of(&fields[8].1, types, is_string_type, depth)
+            && fields[9].0 == "executable"
+            && is_bool(&fields[9].1)
+    })
+}
+
+fn is_route_error(ty: &ComponentValType, types: &[ComponentTypeEntry<'_>], depth: usize) -> bool {
+    if is_route_type_import(ty, types, "route-error") {
+        return true;
+    }
+    with_defined_type(ty, types, depth, |defined, _types, _depth| {
+        let ComponentDefinedType::Variant(cases) = defined else {
+            return false;
+        };
+        let expected = [
+            "not-found",
+            "not-a-dir",
+            "denied",
+            "invalid",
+            "backend",
+            "unsupported",
+        ];
+        cases.as_ref().len() == expected.len()
+            && cases.iter().zip(expected).all(|(case, expected_name)| {
+                case.name == expected_name && case.ty.as_ref().is_some_and(is_string)
+            })
+    })
+}
+
+fn is_entry_kind(ty: &ComponentValType, types: &[ComponentTypeEntry<'_>], depth: usize) -> bool {
+    if is_route_type_import(ty, types, "entry-kind") {
+        return true;
+    }
+    with_defined_type(ty, types, depth, |defined, _types, _depth| {
+        matches!(
+            defined,
+            ComponentDefinedType::Enum(tags) if tags.as_ref() == &["dir", "file", "symlink"]
+        )
+    })
+}
+
+fn is_list_of(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    item: fn(&ComponentValType, &[ComponentTypeEntry<'_>], usize) -> bool,
+    depth: usize,
+) -> bool {
+    with_defined_type(
+        ty,
+        types,
+        depth,
+        |defined, types, depth| matches!(defined, ComponentDefinedType::List(inner) if item(inner, types, depth)),
+    )
+}
+
+fn is_option_of(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    inner: fn(&ComponentValType, &[ComponentTypeEntry<'_>], usize) -> bool,
+    depth: usize,
+) -> bool {
+    with_defined_type(
+        ty,
+        types,
+        depth,
+        |defined, types, depth| matches!(defined, ComponentDefinedType::Option(option) if inner(option, types, depth)),
+    )
+}
+
+fn is_string_tuple(ty: &ComponentValType, types: &[ComponentTypeEntry<'_>], depth: usize) -> bool {
+    with_defined_type(ty, types, depth, |defined, _types, _depth| {
+        matches!(
+            defined,
+            ComponentDefinedType::Tuple(items)
+                if items.as_ref().len() == 2 && is_string(&items[0]) && is_string(&items[1])
+        )
+    })
+}
+
+fn is_http_request(ty: &ComponentValType, types: &[ComponentTypeEntry<'_>], depth: usize) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        fields.as_ref().len() == 4
+            && fields[0].0 == "method"
+            && is_string(&fields[0].1)
+            && fields[1].0 == "url"
+            && is_string(&fields[1].1)
+            && fields[2].0 == "headers"
+            && is_list_of(&fields[2].1, types, is_string_tuple, depth)
+            && fields[3].0 == "body"
+            && is_byte_list(&fields[3].1, types, depth)
+    })
+}
+
+fn is_http_response(ty: &ComponentValType, types: &[ComponentTypeEntry<'_>], depth: usize) -> bool {
+    with_defined_type(ty, types, depth, |defined, types, depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        fields.as_ref().len() == 3
+            && fields[0].0 == "status"
+            && is_u16(&fields[0].1)
+            && fields[1].0 == "headers"
+            && is_list_of(&fields[1].1, types, is_string_tuple, depth)
+            && fields[2].0 == "body"
+            && is_byte_list(&fields[2].1, types, depth)
+    })
+}
+
+fn is_chain_request(ty: &ComponentValType, types: &[ComponentTypeEntry<'_>], depth: usize) -> bool {
+    with_defined_type(ty, types, depth, |defined, _types, _depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        fields.as_ref().len() == 3
+            && fields[0].0 == "chain"
+            && is_string(&fields[0].1)
+            && fields[1].0 == "method"
+            && is_string(&fields[1].1)
+            && fields[2].0 == "params-json"
+            && is_string(&fields[2].1)
+    })
+}
+
+fn is_chain_response(
+    ty: &ComponentValType,
+    types: &[ComponentTypeEntry<'_>],
+    depth: usize,
+) -> bool {
+    with_defined_type(ty, types, depth, |defined, _types, _depth| {
+        let ComponentDefinedType::Record(fields) = defined else {
+            return false;
+        };
+        fields.as_ref().len() == 1 && fields[0].0 == "result-json" && is_string(&fields[0].1)
+    })
+}
+
+fn is_byte_list(ty: &ComponentValType, types: &[ComponentTypeEntry<'_>], depth: usize) -> bool {
+    is_list_of(ty, types, is_u8, depth)
+}
+
+fn is_bool_type(ty: &ComponentValType, _types: &[ComponentTypeEntry<'_>], _depth: usize) -> bool {
+    is_bool(ty)
+}
+
+fn is_bool(ty: &ComponentValType) -> bool {
+    matches!(
+        ty,
+        ComponentValType::Primitive(ComponentPrimitiveValType::Bool)
+    )
+}
+
+fn is_string(ty: &ComponentValType) -> bool {
+    matches!(
+        ty,
+        ComponentValType::Primitive(ComponentPrimitiveValType::String)
+    )
+}
+
+fn is_string_type(ty: &ComponentValType, _types: &[ComponentTypeEntry<'_>], _depth: usize) -> bool {
+    is_string(ty)
+}
+
+fn is_u8(ty: &ComponentValType, _types: &[ComponentTypeEntry<'_>], _depth: usize) -> bool {
+    matches!(
+        ty,
+        ComponentValType::Primitive(ComponentPrimitiveValType::U8)
+    )
+}
+
+fn is_u16(ty: &ComponentValType) -> bool {
+    matches!(
+        ty,
+        ComponentValType::Primitive(ComponentPrimitiveValType::U16)
+    )
+}
+
+fn is_u32(ty: &ComponentValType) -> bool {
+    matches!(
+        ty,
+        ComponentValType::Primitive(ComponentPrimitiveValType::U32)
+    )
+}
+
+fn is_u64(ty: &ComponentValType, _types: &[ComponentTypeEntry<'_>], _depth: usize) -> bool {
+    matches!(
+        ty,
+        ComponentValType::Primitive(ComponentPrimitiveValType::U64)
+    )
 }
 
 fn exported_func_type<'a>(
@@ -1438,6 +2573,11 @@ mod tests {
     use crate::vm::{PetalVm, RunOptions};
 
     use super::*;
+    use wasm_encoder::{
+        CanonicalOption, CodeSection, ComponentBuilder, ComponentExportKind, ComponentTypeRef,
+        ExportKind, ExportSection, Function, FunctionSection, InstanceType, Instruction, Module,
+        PrimitiveValType, TypeSection,
+    };
 
     #[test]
     fn v2_scanner_matches_static_and_dynamic_routes() {
@@ -2099,20 +3239,187 @@ allowed = ["bloom:http"]
     }
 
     #[test]
-    fn v2_component_routes_are_rejected_until_wit_validation_exists() {
+    fn v2_component_routes_are_validated_as_bloom_route_010() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_route(tmp.path(), route_component_no_imports());
+
+        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
+        let route = &package.route_index.routes[0];
+        assert_eq!(route.abi, RouteAbi::ComponentBloomRoute010);
+        assert!(route.install_metadata.required_caps.is_empty());
+    }
+
+    #[test]
+    fn v2_component_routes_reject_wrong_route_export_signatures() {
         let tmp = tempfile::tempdir().unwrap();
         write_v2_package_with_route(
             tmp.path(),
-            &wat::parse_str(
-                r#"
-                (component)
-                "#,
-            )
-            .unwrap(),
+            &route_component(&["metadata", "lookup", "read"], &[]),
         );
 
         let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("component route validation"));
+        assert!(err.to_string().contains("invalid bloom:route@0.1.0"));
+    }
+
+    #[test]
+    fn v2_component_routes_require_metadata_export() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_route(tmp.path(), &route_component(&["read"], &[]));
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("metadata export"));
+    }
+
+    #[test]
+    fn v2_component_routes_ignore_nested_route_exports_for_abi_validation() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_route(tmp.path(), &route_component_with_nested_route_exports());
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("metadata export"));
+    }
+
+    #[test]
+    fn v2_component_routes_require_handler_for_route_kind() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_package_file(
+            tmp.path(),
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
+        write_package_file(tmp.path(), "README.md", b"# echo");
+        write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
+        write_package_file(
+            tmp.path(),
+            "app/echo/$list.wasm",
+            &route_component(&["metadata", "read"], &[]),
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("\"list\" export"));
+    }
+
+    #[test]
+    fn v2_component_regular_file_routes_require_lookup_and_read_exports() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_route(tmp.path(), &route_component(&["metadata", "read"], &[]));
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("\"lookup\" export"));
+    }
+
+    #[test]
+    fn v2_component_imports_require_declared_caps_and_record_them() {
+        let wasm = route_component_http();
+
+        let missing = tempfile::tempdir().unwrap();
+        write_v2_package_with_route(missing.path(), &wasm);
+        let err = PreparedAppPackage::from_dir(missing.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires missing petal.toml cap bloom:http")
+        );
+
+        let allowed = tempfile::tempdir().unwrap();
+        write_v2_package_with_manifest_and_route(
+            allowed.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+[caps]
+allowed = ["bloom:http"]
+"#,
+            &wasm,
+        );
+        let package = PreparedAppPackage::from_dir(allowed.path()).unwrap();
+        assert_eq!(
+            package.route_index.routes[0].install_metadata.required_caps,
+            vec!["bloom:http".to_string()]
+        );
+    }
+
+    #[test]
+    fn v2_component_imports_require_exact_bloom_wit_versions() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_manifest_and_route(
+            tmp.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+[caps]
+allowed = ["bloom:http"]
+"#,
+            &route_component(&["metadata", "read"], &["bloom:http/fetch@999.0.0"]),
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("unsupported host item"));
+    }
+
+    #[test]
+    fn v2_component_imports_must_be_interface_instances() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_manifest_and_route(
+            tmp.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+[caps]
+allowed = ["bloom:http"]
+"#,
+            &route_component_with_func_import("bloom:http/fetch@0.1.0"),
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("must be an interface instance"));
+    }
+
+    #[test]
+    fn v2_component_imports_require_bloom_wit_interface_shapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_manifest_and_route(
+            tmp.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+[caps]
+allowed = ["bloom:http"]
+"#,
+            &route_component(&["metadata", "read"], &["bloom:http/fetch@0.1.0"]),
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid Bloom WIT interface shape")
+        );
+    }
+
+    #[test]
+    fn v2_component_routes_reject_non_bloom_imports() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_route(
+            tmp.path(),
+            &route_component(&["metadata", "read"], &["wasi:http/outgoing-handler@0.2.0"]),
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("unsupported host item"));
+    }
+
+    #[test]
+    fn v2_component_sign_imports_are_rejected_until_intent_policy_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_manifest_and_route(
+            tmp.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+[caps]
+allowed = ["bloom:sign"]
+"#,
+            route_component_sign(),
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("sign-intent policy"));
     }
 
     #[tokio::test]
@@ -2177,6 +3484,92 @@ name = "echo"
         write_package_file(root, "README.md", b"# echo");
         write_package_file(root, "AGENTS.md", b"# echo agents");
         write_package_file(root, "app/echo/hello.txt.wasm", route);
+    }
+
+    fn route_component_no_imports() -> &'static [u8] {
+        include_bytes!("../tests/fixtures/route_component_no_imports.wasm")
+    }
+
+    fn route_component_http() -> &'static [u8] {
+        include_bytes!("../tests/fixtures/route_component_http.wasm")
+    }
+
+    fn route_component_sign() -> &'static [u8] {
+        include_bytes!("../tests/fixtures/route_component_sign.wasm")
+    }
+
+    fn route_component(exports: &[&str], imports: &[&str]) -> Vec<u8> {
+        route_component_builder(exports, imports).finish()
+    }
+
+    fn route_component_with_func_import(import: &str) -> Vec<u8> {
+        let mut builder = ComponentBuilder::default();
+        let (func_type, mut ty) = builder.type_function();
+        ty.params(std::iter::empty::<(&str, PrimitiveValType)>())
+            .results(std::iter::empty::<(&str, PrimitiveValType)>());
+        builder.import(import, ComponentTypeRef::Func(func_type));
+        builder.finish()
+    }
+
+    fn route_component_with_nested_route_exports() -> Vec<u8> {
+        let mut builder = ComponentBuilder::default();
+        builder.component(route_component_builder(&["metadata", "read"], &[]));
+        builder.finish()
+    }
+
+    fn route_component_builder(exports: &[&str], imports: &[&str]) -> ComponentBuilder {
+        let mut builder = ComponentBuilder::default();
+        let (func_type, mut ty) = builder.type_function();
+        ty.params(std::iter::empty::<(&str, PrimitiveValType)>())
+            .results(std::iter::empty::<(&str, PrimitiveValType)>());
+
+        let instance_type = builder.type_instance(&InstanceType::new());
+        for import in imports {
+            builder.import(import, ComponentTypeRef::Instance(instance_type));
+        }
+
+        let module = route_component_core_module(exports);
+        let module = builder.core_module(&module);
+        let instance = builder.core_instantiate(module, std::iter::empty::<(&str, _)>());
+        for export in exports {
+            let core_func = builder.core_alias_export(
+                instance,
+                &format!("__bloom_route_{export}"),
+                ExportKind::Func,
+            );
+            let func =
+                builder.lift_func(core_func, func_type, std::iter::empty::<CanonicalOption>());
+            builder.export(export, ComponentExportKind::Func, func, None);
+        }
+        builder
+    }
+
+    fn route_component_core_module(exports: &[&str]) -> Module {
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+
+        let mut functions = FunctionSection::new();
+        let mut export_section = ExportSection::new();
+        let mut code = CodeSection::new();
+        for (idx, export) in exports.iter().enumerate() {
+            functions.function(0);
+            export_section.export(
+                &format!("__bloom_route_{export}"),
+                ExportKind::Func,
+                idx as u32,
+            );
+            let mut function = Function::new([]);
+            function.instruction(&Instruction::End);
+            code.function(&function);
+        }
+
+        let mut module = Module::new();
+        module
+            .section(&types)
+            .section(&functions)
+            .section(&export_section)
+            .section(&code);
+        module
     }
 
     fn compat_wasm(body: &str) -> Vec<u8> {

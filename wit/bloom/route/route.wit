@@ -1,0 +1,63 @@
+package bloom:route@0.1.0;
+
+interface types {
+  record ctx {
+    app-root: string,
+    package-hash: string,
+    path: string,
+    params: list<tuple<string, string>>,
+    actor: option<string>,
+  }
+
+  enum entry-kind {
+    dir,
+    file,
+    symlink,
+  }
+
+  record entry {
+    name: string,
+    kind: entry-kind,
+    mode: u32,
+    size: option<u64>,
+    link-target: option<string>,
+  }
+
+  record route-meta {
+    kind: entry-kind,
+    mode: u32,
+    cache-ttl-ms: option<u64>,
+    side-effecting-read: bool,
+    write-async: bool,
+    description: option<string>,
+    consent-summary: option<string>,
+    required-caps: list<string>,
+    sign-intent: option<string>,
+    executable: bool,
+  }
+
+  variant route-error {
+    not-found(string),
+    not-a-dir(string),
+    denied(string),
+    invalid(string),
+    backend(string),
+    unsupported(string),
+  }
+}
+
+world route-file {
+  use types.{ctx, entry, route-error, route-meta};
+
+  import bloom:http/fetch@0.1.0;
+  import bloom:store/kv@0.1.0;
+  import bloom:sign/signing@0.1.0;
+  import bloom:chain/read@0.1.0;
+  import bloom:vfs/readwrite@0.1.0;
+
+  export metadata: func(ctx: ctx) -> result<route-meta, route-error>;
+  export lookup: func(ctx: ctx) -> result<entry, route-error>;
+  export %list: func(ctx: ctx) -> result<list<entry>, route-error>;
+  export read: func(ctx: ctx) -> result<list<u8>, route-error>;
+  export write: func(ctx: ctx, body: list<u8>) -> result<_, route-error>;
+}

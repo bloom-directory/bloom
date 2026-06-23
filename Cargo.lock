@@ -2698,6 +2698,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "url",
+ "wasm-encoder 0.218.1",
  "wasmparser 0.218.1",
  "wasmtime",
  "wasmtime-wasi",
