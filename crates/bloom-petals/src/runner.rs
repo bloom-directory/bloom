@@ -445,13 +445,8 @@ impl PetalRunner {
         opts: RunOptions,
     ) -> Result<DispatchOutput, PetalError> {
         let matched = self.local_app_route(mount, request.op, &request.path)?;
-        if matched.route.abi != RouteAbi::CompatPetalDispatchV1 {
-            return Err(PetalError::ModeUnsupported(format!(
-                "v2 route ABI {:?} is not supported by the compat runner",
-                matched.route.abi
-            )));
-        }
-        request.ctx.extend(matched.params);
+        let route_params = matched.params.clone();
+        request.ctx.extend(route_params.clone());
         request
             .ctx
             .push(("bloom.route_id".into(), matched.route.route_id.clone()));
@@ -486,9 +481,27 @@ impl PetalRunner {
             Some(mask) => declared.intersect(&mask),
             None => declared,
         });
-        self.vm
-            .dispatch(&wasm, request, caps, host, &matched.hash, opts)
-            .await
+        match matched.route.abi {
+            RouteAbi::CompatPetalDispatchV1 => {
+                self.vm
+                    .dispatch(&wasm, request, caps, host, &matched.hash, opts)
+                    .await
+            }
+            RouteAbi::ComponentBloomRoute010 => {
+                self.vm
+                    .dispatch_component_route(
+                        &wasm,
+                        request,
+                        caps,
+                        host,
+                        &matched.hash,
+                        mount,
+                        route_params,
+                        opts,
+                    )
+                    .await
+            }
+        }
     }
 
     fn v2_net_policy(&self, hash: &str) -> Result<NetPolicy, PetalError> {
@@ -870,7 +883,7 @@ paths = ["/markets*"]
     }
 
     #[tokio::test]
-    async fn component_app_routes_fail_closed_until_component_runner_exists() {
+    async fn component_app_routes_use_component_runner_and_surface_component_errors() {
         let (dir, r) = runner();
         let package = dir.path().join("component-app");
         write_package_file(
@@ -904,8 +917,8 @@ name = "echo"
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, PetalError::ModeUnsupported(_)));
-        assert!(err.to_string().contains("compat runner"));
+        assert!(!matches!(err, PetalError::ModeUnsupported(_)));
+        assert!(err.to_string().contains("component route"));
     }
 
     #[tokio::test]

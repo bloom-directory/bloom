@@ -34,13 +34,14 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use wasmtime::component::{Component, Linker as ComponentLinker, Val as ComponentVal};
 use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 
 use crate::abi::{
-    DispatchRequest, DispatchResponse, decode_dispatch_response, decode_http_request,
+    DispatchOp, DispatchRequest, DispatchResponse, decode_dispatch_response, decode_http_request,
     decode_sign_request, encode_dispatch_request, encode_http_response, encode_string_list,
 };
 use crate::error::PetalError;
@@ -53,6 +54,8 @@ const DEFAULT_FUEL: u64 = 100_000_000;
 const DEFAULT_MEMORY_PAGES: u32 = 256; // 16 MiB (64 KiB pages).
 const STDOUT_CAP: usize = 1 << 20; // 1 MiB.
 const DEFAULT_HTTP_RESPONSE_CAP: usize = 8 * 1024 * 1024;
+pub(crate) const COMPONENT_NOT_A_DIR_CODE: i32 = -101;
+pub(crate) const COMPONENT_UNSUPPORTED_CODE: i32 = -102;
 
 /// State threaded through `Store<StoreData>`. Owns the WASI context,
 /// the host bridge, and the capability set for the petal in flight.
@@ -127,6 +130,7 @@ impl PetalVm {
         let mut config = Config::new();
         config.async_support(true);
         config.consume_fuel(true);
+        config.wasm_component_model(true);
         // Reasonable defaults for production. Cranelift compiles
         // modules just-in-time on the first instantiate.
         config.cranelift_opt_level(wasmtime::OptLevel::Speed);
@@ -270,6 +274,327 @@ impl PetalVm {
             response,
             fuel_consumed,
         })
+    }
+
+    /// Dispatch one VFS operation into a `bloom:route@0.1.0` component.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dispatch_component_route(
+        &self,
+        wasm: &[u8],
+        request: DispatchRequest,
+        caps: BTreeSet<Capability>,
+        host: Arc<dyn PetalHost>,
+        petal_hash: &str,
+        app_root: &str,
+        route_params: Vec<(String, String)>,
+        opts: RunOptions,
+    ) -> Result<DispatchOutput, PetalError> {
+        let component = Component::from_binary(&self.engine, wasm)
+            .map_err(|e| PetalError::InvalidWasm(e.to_string()))?;
+        let wasi_ctx = WasiCtxBuilder::new().build_p1();
+        let mut store = Store::new(
+            &self.engine,
+            StoreData {
+                wasi: wasi_ctx,
+                host,
+                caps,
+                petal_hash: petal_hash.to_string(),
+                net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
+                http_response_cap: opts.http_response_cap,
+                private_store: match opts.private_store_root.clone() {
+                    Some(root) => Some(
+                        PrivateStore::open(root)
+                            .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
+                    ),
+                    None => None,
+                },
+            },
+        );
+        store
+            .set_fuel(opts.fuel)
+            .map_err(|e| PetalError::vm(e.to_string()))?;
+        store.limiter(move |_| Box::leak(Box::new(MemLimiter::new(opts.memory_pages))));
+
+        let mut linker = ComponentLinker::<StoreData>::new(&self.engine);
+        linker
+            .define_unknown_imports_as_traps(&component)
+            .map_err(|e| PetalError::vm(e.to_string()))?;
+
+        let instance = linker
+            .instantiate_async(&mut store, &component)
+            .await
+            .map_err(|e| PetalError::vm(format!("component instantiate: {e}")))?;
+        let export = route_component_export_name(request.op);
+        let func = instance.get_func(&mut store, export).ok_or_else(|| {
+            PetalError::InvalidWasm(format!("component route missing {export:?} export"))
+        })?;
+        let params = route_component_params(&request, app_root, petal_hash, route_params);
+        let mut results = vec![ComponentVal::Bool(false)];
+        func.call_async(&mut store, &params, &mut results)
+            .await
+            .map_err(|e| PetalError::vm(format!("component route {export}: {e}")))?;
+        func.post_return_async(&mut store)
+            .await
+            .map_err(|e| PetalError::vm(format!("component route {export} post-return: {e}")))?;
+        let response = route_component_response(request.op, results.remove(0))?;
+        let fuel_consumed = opts.fuel.saturating_sub(store.get_fuel().unwrap_or(0));
+        Ok(DispatchOutput {
+            response,
+            fuel_consumed,
+        })
+    }
+}
+
+fn route_component_export_name(op: DispatchOp) -> &'static str {
+    match op {
+        DispatchOp::Lookup => "lookup",
+        DispatchOp::List => "list",
+        DispatchOp::Read => "read",
+        DispatchOp::Write => "write",
+    }
+}
+
+fn route_component_params(
+    request: &DispatchRequest,
+    app_root: &str,
+    petal_hash: &str,
+    route_params: Vec<(String, String)>,
+) -> Vec<ComponentVal> {
+    let mut params = Vec::new();
+    let actor = request
+        .ctx
+        .iter()
+        .find_map(|(name, value)| (name == "actor").then(|| value.clone()));
+    let route_params = route_params
+        .into_iter()
+        .map(|(name, value)| {
+            ComponentVal::Tuple(vec![
+                ComponentVal::String(name),
+                ComponentVal::String(value),
+            ])
+        })
+        .collect::<Vec<_>>();
+    params.push(ComponentVal::Record(vec![
+        (
+            "app-root".into(),
+            ComponentVal::String(app_root.to_string()),
+        ),
+        (
+            "package-hash".into(),
+            ComponentVal::String(petal_hash.to_string()),
+        ),
+        ("path".into(), ComponentVal::String(request.path.clone())),
+        ("params".into(), ComponentVal::List(route_params)),
+        (
+            "actor".into(),
+            ComponentVal::Option(actor.map(|actor| Box::new(ComponentVal::String(actor)))),
+        ),
+    ]));
+    if request.op == DispatchOp::Write {
+        params.push(ComponentVal::List(
+            request.body.iter().copied().map(ComponentVal::U8).collect(),
+        ));
+    }
+    params
+}
+
+fn route_component_response(
+    op: DispatchOp,
+    val: ComponentVal,
+) -> Result<DispatchResponse, PetalError> {
+    let ok = match val {
+        ComponentVal::Result(Ok(Some(ok))) => *ok,
+        ComponentVal::Result(Ok(None)) if op == DispatchOp::Write => {
+            return Ok(DispatchResponse::Write);
+        }
+        ComponentVal::Result(Err(Some(err))) => {
+            let (code, message) = route_component_error(*err)?;
+            return Ok(DispatchResponse::Error { code, message });
+        }
+        ComponentVal::Result(Err(None)) => {
+            return Ok(DispatchResponse::Error {
+                code: HostError::Backend("component route error".into()).as_wasm_code(),
+                message: "component route returned an empty error".into(),
+            });
+        }
+        other => {
+            return Err(PetalError::vm(format!(
+                "component route returned unexpected value {other:?}"
+            )));
+        }
+    };
+    match op {
+        DispatchOp::Lookup => Ok(DispatchResponse::Lookup(route_component_entry(ok)?)),
+        DispatchOp::List => {
+            let ComponentVal::List(entries) = ok else {
+                return Err(PetalError::vm("component list returned non-list"));
+            };
+            entries
+                .into_iter()
+                .map(route_component_entry)
+                .collect::<Result<Vec<_>, _>>()
+                .map(DispatchResponse::List)
+        }
+        DispatchOp::Read => {
+            let ComponentVal::List(bytes) = ok else {
+                return Err(PetalError::vm("component read returned non-list"));
+            };
+            bytes
+                .into_iter()
+                .map(|byte| match byte {
+                    ComponentVal::U8(byte) => Ok(byte),
+                    other => Err(PetalError::vm(format!(
+                        "component read returned non-u8 byte {other:?}"
+                    ))),
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(DispatchResponse::Read)
+        }
+        DispatchOp::Write => Err(PetalError::vm(
+            "component write returned unexpected ok payload",
+        )),
+    }
+}
+
+fn route_component_error(err: ComponentVal) -> Result<(i32, String), PetalError> {
+    let ComponentVal::Variant(name, payload) = err else {
+        return Err(PetalError::vm("component route error is not a variant"));
+    };
+    let message = match payload.map(|payload| *payload) {
+        Some(ComponentVal::String(message)) => message,
+        Some(other) => {
+            return Err(PetalError::vm(format!(
+                "component route error payload is not a string: {other:?}"
+            )));
+        }
+        None => String::new(),
+    };
+    let code = match name.as_str() {
+        "not-found" => HostError::NotFound(message.clone()).as_wasm_code(),
+        "denied" => HostError::Denied(message.clone()).as_wasm_code(),
+        "invalid" => HostError::Invalid(message.clone()).as_wasm_code(),
+        "backend" => HostError::Backend(message.clone()).as_wasm_code(),
+        "not-a-dir" => COMPONENT_NOT_A_DIR_CODE,
+        "unsupported" => COMPONENT_UNSUPPORTED_CODE,
+        _ => HostError::Backend(format!("unknown component route error {name}")).as_wasm_code(),
+    };
+    Ok((code, message))
+}
+
+fn route_component_entry(val: ComponentVal) -> Result<crate::abi::DispatchEntry, PetalError> {
+    let fields = component_record(val, "entry")?;
+    let name = component_string_field(&fields, "name")?;
+    let kind = match component_enum_field(&fields, "kind")?.as_str() {
+        "dir" => crate::abi::DispatchEntryKind::Dir,
+        "file" => crate::abi::DispatchEntryKind::File,
+        "symlink" => crate::abi::DispatchEntryKind::Symlink,
+        other => {
+            return Err(PetalError::vm(format!(
+                "component entry has unknown kind {other:?}"
+            )));
+        }
+    };
+    let mode = component_u32_field(&fields, "mode")?;
+    let size = component_optional_u64_field(&fields, "size")?.unwrap_or(0);
+    let link_target = component_optional_string_field(&fields, "link-target")?;
+    Ok(crate::abi::DispatchEntry {
+        name,
+        kind,
+        size,
+        mode,
+        ttl_hint_ms: None,
+        link_target,
+    })
+}
+
+fn component_record(
+    val: ComponentVal,
+    label: &str,
+) -> Result<Vec<(String, ComponentVal)>, PetalError> {
+    match val {
+        ComponentVal::Record(fields) => Ok(fields),
+        other => Err(PetalError::vm(format!(
+            "component {label} is not a record: {other:?}"
+        ))),
+    }
+}
+
+fn component_field<'a>(
+    fields: &'a [(String, ComponentVal)],
+    name: &str,
+) -> Result<&'a ComponentVal, PetalError> {
+    fields
+        .iter()
+        .find_map(|(field, value)| (field == name).then_some(value))
+        .ok_or_else(|| PetalError::vm(format!("component record missing field {name:?}")))
+}
+
+fn component_string_field(
+    fields: &[(String, ComponentVal)],
+    name: &str,
+) -> Result<String, PetalError> {
+    match component_field(fields, name)? {
+        ComponentVal::String(value) => Ok(value.clone()),
+        other => Err(PetalError::vm(format!(
+            "component field {name:?} is not a string: {other:?}"
+        ))),
+    }
+}
+
+fn component_enum_field(
+    fields: &[(String, ComponentVal)],
+    name: &str,
+) -> Result<String, PetalError> {
+    match component_field(fields, name)? {
+        ComponentVal::Enum(value) => Ok(value.clone()),
+        other => Err(PetalError::vm(format!(
+            "component field {name:?} is not an enum: {other:?}"
+        ))),
+    }
+}
+
+fn component_u32_field(fields: &[(String, ComponentVal)], name: &str) -> Result<u32, PetalError> {
+    match component_field(fields, name)? {
+        ComponentVal::U32(value) => Ok(*value),
+        other => Err(PetalError::vm(format!(
+            "component field {name:?} is not a u32: {other:?}"
+        ))),
+    }
+}
+
+fn component_optional_u64_field(
+    fields: &[(String, ComponentVal)],
+    name: &str,
+) -> Result<Option<u64>, PetalError> {
+    match component_field(fields, name)? {
+        ComponentVal::Option(None) => Ok(None),
+        ComponentVal::Option(Some(value)) => match value.as_ref() {
+            ComponentVal::U64(value) => Ok(Some(*value)),
+            other => Err(PetalError::vm(format!(
+                "component field {name:?} option is not a u64: {other:?}"
+            ))),
+        },
+        other => Err(PetalError::vm(format!(
+            "component field {name:?} is not an option: {other:?}"
+        ))),
+    }
+}
+
+fn component_optional_string_field(
+    fields: &[(String, ComponentVal)],
+    name: &str,
+) -> Result<Option<String>, PetalError> {
+    match component_field(fields, name)? {
+        ComponentVal::Option(None) => Ok(None),
+        ComponentVal::Option(Some(value)) => match value.as_ref() {
+            ComponentVal::String(value) => Ok(Some(value.clone())),
+            other => Err(PetalError::vm(format!(
+                "component field {name:?} option is not a string: {other:?}"
+            ))),
+        },
+        other => Err(PetalError::vm(format!(
+            "component field {name:?} is not an option: {other:?}"
+        ))),
     }
 }
 
@@ -1866,6 +2191,130 @@ paths = ["/markets*"]
             .await
             .unwrap_err();
         assert!(err.to_string().contains("missing petal_alloc"));
+    }
+
+    #[test]
+    fn component_route_response_maps_read_lookup_and_errors() {
+        let params = route_component_params(
+            &DispatchRequest {
+                op: DispatchOp::Read,
+                path: "alice.txt".into(),
+                body: Vec::new(),
+                ctx: vec![
+                    ("name".into(), "spoofed".into()),
+                    ("actor".into(), "agent".into()),
+                    ("bloom.route_id".into(), "r000001".into()),
+                ],
+            },
+            "echo",
+            VALID_HASH,
+            vec![("name".into(), "alice".into())],
+        );
+        let ComponentVal::Record(ctx) = &params[0] else {
+            panic!("ctx was not a record");
+        };
+        let ComponentVal::List(bound_params) = component_field(ctx, "params").unwrap() else {
+            panic!("ctx.params was not a list");
+        };
+        assert_eq!(
+            bound_params,
+            &[ComponentVal::Tuple(vec![
+                ComponentVal::String("name".into()),
+                ComponentVal::String("alice".into())
+            ])]
+        );
+
+        let read = route_component_response(
+            DispatchOp::Read,
+            ComponentVal::Result(Ok(Some(Box::new(ComponentVal::List(vec![
+                ComponentVal::U8(b'o'),
+                ComponentVal::U8(b'k'),
+            ]))))),
+        )
+        .unwrap();
+        assert_eq!(read, DispatchResponse::Read(b"ok".to_vec()));
+
+        let lookup = route_component_response(
+            DispatchOp::Lookup,
+            ComponentVal::Result(Ok(Some(Box::new(component_entry(
+                "status.json",
+                "file",
+                Some(2),
+            ))))),
+        )
+        .unwrap();
+        assert_eq!(
+            lookup,
+            DispatchResponse::Lookup(crate::abi::DispatchEntry {
+                name: "status.json".into(),
+                kind: crate::abi::DispatchEntryKind::File,
+                size: 2,
+                mode: 0o644,
+                ttl_hint_ms: None,
+                link_target: None,
+            })
+        );
+
+        let denied = route_component_response(
+            DispatchOp::Read,
+            ComponentVal::Result(Err(Some(Box::new(ComponentVal::Variant(
+                "denied".into(),
+                Some(Box::new(ComponentVal::String("no".into()))),
+            ))))),
+        )
+        .unwrap();
+        assert_eq!(
+            denied,
+            DispatchResponse::Error {
+                code: HostError::Denied("no".into()).as_wasm_code(),
+                message: "no".into(),
+            }
+        );
+
+        let not_a_dir = route_component_response(
+            DispatchOp::Lookup,
+            ComponentVal::Result(Err(Some(Box::new(ComponentVal::Variant(
+                "not-a-dir".into(),
+                Some(Box::new(ComponentVal::String("plain-file".into()))),
+            ))))),
+        )
+        .unwrap();
+        assert_eq!(
+            not_a_dir,
+            DispatchResponse::Error {
+                code: COMPONENT_NOT_A_DIR_CODE,
+                message: "plain-file".into(),
+            }
+        );
+
+        let unsupported = route_component_response(
+            DispatchOp::Write,
+            ComponentVal::Result(Err(Some(Box::new(ComponentVal::Variant(
+                "unsupported".into(),
+                Some(Box::new(ComponentVal::String("write".into()))),
+            ))))),
+        )
+        .unwrap();
+        assert_eq!(
+            unsupported,
+            DispatchResponse::Error {
+                code: COMPONENT_UNSUPPORTED_CODE,
+                message: "write".into(),
+            }
+        );
+    }
+
+    fn component_entry(name: &str, kind: &str, size: Option<u64>) -> ComponentVal {
+        ComponentVal::Record(vec![
+            ("name".into(), ComponentVal::String(name.into())),
+            ("kind".into(), ComponentVal::Enum(kind.into())),
+            ("mode".into(), ComponentVal::U32(0o644)),
+            (
+                "size".into(),
+                ComponentVal::Option(size.map(|size| Box::new(ComponentVal::U64(size)))),
+            ),
+            ("link-target".into(), ComponentVal::Option(None)),
+        ])
     }
 
     #[tokio::test]

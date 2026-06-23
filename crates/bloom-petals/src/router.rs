@@ -17,7 +17,7 @@ use crate::abi::{DispatchEntry, DispatchEntryKind, DispatchOp, DispatchRequest, 
 use crate::error::PetalError;
 use crate::host::PetalHost;
 use crate::runner::PetalRunner;
-use crate::vm::RunOptions;
+use crate::vm::{COMPONENT_NOT_A_DIR_CODE, COMPONENT_UNSUPPORTED_CODE, RunOptions};
 
 #[derive(Clone)]
 pub struct PetalRouter {
@@ -499,6 +499,10 @@ fn dispatch_error(code: i32, message: String, path: String) -> HandlerError {
         -2 => HandlerError::PermissionDenied,
         -3 => HandlerError::Invalid(message),
         -4 => HandlerError::Backend(message),
+        COMPONENT_NOT_A_DIR_CODE => {
+            HandlerError::NotADir(if message.is_empty() { path } else { message })
+        }
+        COMPONENT_UNSUPPORTED_CODE => HandlerError::Unsupported(message),
         _ => HandlerError::Backend(format!("petal dispatch error {code}: {message}")),
     }
 }
@@ -1346,6 +1350,22 @@ read_side_effecting = true
         assert!(endpoint_matches("markets/*", "markets/123"));
         assert!(!endpoint_matches("markets/*", "markets/123/outcomes"));
         assert!(!endpoint_matches("markets*", "other"));
+    }
+
+    #[test]
+    fn component_route_error_codes_preserve_vfs_semantics() {
+        assert!(matches!(
+            dispatch_error(
+                COMPONENT_NOT_A_DIR_CODE,
+                "plain-file".into(),
+                "demo/plain-file".into()
+            ),
+            HandlerError::NotADir(path) if path == "plain-file"
+        ));
+        assert!(matches!(
+            dispatch_error(COMPONENT_UNSUPPORTED_CODE, "write".into(), "demo/file".into()),
+            HandlerError::Unsupported(op) if op == "write"
+        ));
     }
 
     #[test]
