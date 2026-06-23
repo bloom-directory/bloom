@@ -210,6 +210,12 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         .unwrap();
     let book: serde_json::Value = serde_json::from_slice(&book).unwrap();
     assert_eq!(book["asset_id"], "111");
+    let prices = router
+        .read(&VfsPath::parse("polymarket/markets/test-market/prices.json").unwrap())
+        .await
+        .unwrap();
+    let prices: serde_json::Value = serde_json::from_slice(&prices).unwrap();
+    assert_eq!(prices["token_id"], "111");
 
     router
         .write(
@@ -236,6 +242,22 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     assert_eq!(approvals["deposit_wallet_source"], "live_factory_resolved");
     assert_eq!(approvals["calls"].as_array().unwrap().len(), 8);
     assert_eq!(host.sign_calls.lock().unwrap().len(), 1);
+    router
+        .write(
+            &VfsPath::parse("polymarket/fund/alice/new").unwrap(),
+            br#"{"target_pusd":"10","max_spend":"100","from_token":"native","slippage_bps":50}"#,
+        )
+        .await
+        .unwrap();
+    let fund_plan = router
+        .read(&VfsPath::parse("polymarket/fund/alice/0001/plan.md").unwrap())
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8(fund_plan)
+            .unwrap()
+            .contains("Polymarket funding request")
+    );
 
     let status_key = "onboard/alice/status.json";
     let approval_host = Arc::new(MockHost::fixture_with_pusd_allowance(false));
@@ -688,6 +710,16 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     assert!(!receipt_text.contains("requestBody"));
     assert!(!receipt_text.contains("accepted signature"));
     assert!(!receipt_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+    let public_posted_receipt = router
+        .read(&VfsPath::parse("polymarket/trade/alice/receipts/0007/receipt.json").unwrap())
+        .await
+        .unwrap();
+    let public_posted_receipt_text = String::from_utf8(public_posted_receipt).unwrap();
+    assert!(public_posted_receipt_text.contains(r#""clob_status": "matched""#));
+    assert_public_text_redacted(
+        "trade/alice/receipts/0007/receipt.json",
+        &public_posted_receipt_text,
+    );
     let audit = private
         .get(&install.hash, "trade/alice/audit.jsonl")
         .unwrap();
@@ -796,6 +828,16 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     assert!(gtc_receipt_text.contains(r#""order_type": "GTC""#));
     assert!(gtc_receipt_text.contains(r#""clob_order_id": "order-post-gtc""#));
     assert!(gtc_receipt_text.contains(r#""clob_status": "unmatched""#));
+    let public_gtc_receipt = router
+        .read(&VfsPath::parse("polymarket/trade/alice/receipts/0008/receipt.json").unwrap())
+        .await
+        .unwrap();
+    let public_gtc_receipt_text = String::from_utf8(public_gtc_receipt).unwrap();
+    assert!(public_gtc_receipt_text.contains(r#""clob_status": "unmatched""#));
+    assert_public_text_redacted(
+        "trade/alice/receipts/0008/receipt.json",
+        &public_gtc_receipt_text,
+    );
     let gtc_posted_order = private
         .get(&install.hash, "trade/alice/drafts/0008/order.json")
         .unwrap();
@@ -934,18 +976,52 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     assert!(account_text.contains("clob_balance_allowance"));
     assert!(account_text.contains("deposit_wallet"));
     assert!(account_text.contains("onboarding_state"));
-    assert!(!account_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
-    assert!(!account_text.contains("YnVpbGRlci1zZWNyZXQtYnVpbGRlci1zZWNyZXQ="));
-    assert!(!account_text.contains("builder-pass"));
+    assert_public_text_redacted("account/alice/portfolio.json", &account_text);
     let orders = router
         .read(&VfsPath::parse("polymarket/account/alice/orders.json").unwrap())
         .await
         .unwrap();
     let orders_text = String::from_utf8(orders).unwrap();
     assert!(orders_text.contains("order-1"));
-    assert!(!orders_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
-    assert!(!orders_text.contains("YnVpbGRlci1zZWNyZXQtYnVpbGRlci1zZWNyZXQ="));
-    assert!(!orders_text.contains("builder-pass"));
+    assert_public_text_redacted("account/alice/orders.json", &orders_text);
+
+    let public_paths = [
+        "polymarket/meta/parity.json",
+        "polymarket/markets/test-market/market.json",
+        "polymarket/markets/test-market/book.json",
+        "polymarket/markets/test-market/prices.json",
+        "polymarket/positions/alice/positions.json",
+        "polymarket/positions/0xalice/positions.json",
+        "polymarket/onboard/alice/begin",
+        "polymarket/onboard/alice/status.json",
+        "polymarket/onboard/alice/plan.md",
+        "polymarket/onboard/alice/approvals.json",
+        "polymarket/fund/alice/new",
+        "polymarket/fund/alice/0001/plan.md",
+        "polymarket/fund/alice/0001/request.json",
+        "polymarket/fund/alice/0001/status.json",
+        "polymarket/account/alice/portfolio.json",
+        "polymarket/account/alice/orders.json",
+        "polymarket/trade/alice/new",
+        "polymarket/trade/alice/drafts/0007/plan.md",
+        "polymarket/trade/alice/drafts/0007/order.json",
+        "polymarket/trade/alice/drafts/0007/policy_check.json",
+        "polymarket/trade/alice/drafts/0007/quote.json",
+        "polymarket/trade/alice/drafts/0007/review_intent.json",
+        "polymarket/trade/alice/drafts/0007/post_attempt.json",
+        "polymarket/trade/alice/drafts/0007/revalidate",
+        "polymarket/trade/alice/drafts/0007/post",
+        "polymarket/trade/alice/receipts/0007/receipt.json",
+        "polymarket/trade/alice/receipts/0007/cancel",
+        "polymarket/trade/alice/receipts/0008/receipt.json",
+        "polymarket/trade/alice/receipts/0009/receipt.json",
+        "polymarket/trade/alice/receipts/0010/receipt.json",
+    ];
+    for path in public_paths {
+        let bytes = router.read(&VfsPath::parse(path).unwrap()).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert_public_text_redacted(path, &text);
+    }
 
     let vfs_calls = host.vfs_calls.lock().unwrap().clone();
     assert!(
@@ -1105,6 +1181,25 @@ fn assert_no_onboard_private_state(private: &PrivateStore, hash: &str) {
         ),
         "blocked geoblock must not write onboarding status"
     );
+}
+
+fn assert_public_text_redacted(label: &str, text: &str) {
+    for forbidden in [
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "YnVpbGRlci1zZWNyZXQtYnVpbGRlci1zZWNyZXQ=",
+        "pass-value",
+        "builder-pass",
+        "api-key",
+        "builder-key",
+        "0xechoed-signature",
+        "requestBody",
+        "accepted signature",
+    ] {
+        assert!(
+            !text.contains(forbidden),
+            "public VFS read {label} leaked forbidden token {forbidden:?}: {text}"
+        );
+    }
 }
 
 #[derive(Default)]
