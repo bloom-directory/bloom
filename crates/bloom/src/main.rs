@@ -1616,10 +1616,13 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
             }
             let package = bloom_petals::v2::build_app_package_dir(&package_dir)
                 .with_context(|| format!("build app package {package_dir}"))?;
+            let consent = bloom_petals::v2::app_consent_summary(&package)
+                .context("build app consent summary")?;
             println!("hash: {}", package.hash);
             println!("app_mount: apps/{}/", package.name);
             println!("routes: {}", package.route_index.routes.len());
             println!("artifacts: {package_dir}/artifacts");
+            print_v2_app_consent(&consent);
             if let Some(out) = out {
                 let file =
                     std::fs::File::create(&out).with_context(|| format!("create archive {out}"))?;
@@ -1639,14 +1642,24 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
     match cmd {
         PetalsCmd::Install { path, name, caps } => {
             if path != "-" {
-                let meta = std::fs::metadata(&path).with_context(|| format!("stat {path}"))?;
-                if meta.is_dir() || path.ends_with(".petal.tar") {
+                let path_meta = std::fs::metadata(&path).with_context(|| format!("stat {path}"))?;
+                let is_app_dir = path_meta.is_dir();
+                if is_app_dir || path.ends_with(".petal.tar") {
                     if name.is_some() || !caps.is_empty() {
                         anyhow::bail!(
                             "--name and --cap apply only to single-WASM installs; v2 app packages use petal.toml"
                         );
                     }
-                    let (result, meta, index) = if meta.is_dir() {
+                    let consent_package = if is_app_dir {
+                        bloom_petals::v2::PreparedAppPackage::from_dir(&path)
+                            .with_context(|| format!("read app package dir {path}"))?
+                    } else {
+                        bloom_petals::v2::PreparedAppPackage::from_petal_tar(&path)
+                            .with_context(|| format!("read app package archive {path}"))?
+                    };
+                    let consent = bloom_petals::v2::app_consent_summary(&consent_package)
+                        .context("build app consent summary")?;
+                    let (result, meta, index) = if is_app_dir {
                         d.petals
                             .store()
                             .install_app_package_dir(&path)
@@ -1667,6 +1680,7 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                         println!("app_mount: apps/{}/", app.name);
                     }
                     println!("routes: {}", index.routes.len());
+                    print_v2_app_consent(&consent);
                     return Ok(());
                 }
             }
@@ -1981,6 +1995,75 @@ fn print_local_petal_consent(
                 );
             } else {
                 println!("  - {} flags=[{}]", endpoint.path, flags.join(","));
+            }
+        }
+    }
+}
+
+fn print_v2_app_consent(summary: &bloom_petals::v2::AppConsentSummary) {
+    println!("consent:");
+    if let Some(package_summary) = &summary.package_summary {
+        println!("  summary: {package_summary}");
+    }
+    println!("  docs: {}", summary.docs.join(", "));
+    if !summary.capabilities.is_empty() {
+        println!("  capabilities: {}", summary.capabilities.join(", "));
+    }
+    if !summary.network.is_empty() {
+        println!("  network:");
+        for rule in &summary.network {
+            println!(
+                "    - host={} methods=[{}] paths=[{}]",
+                rule.host,
+                rule.methods.join(","),
+                rule.paths.join(",")
+            );
+        }
+    }
+    if !summary.sign_intents.is_empty() {
+        println!("  signing_intents: {}", summary.sign_intents.join(", "));
+    }
+    if !summary.store_namespaces.is_empty() {
+        println!("  private_store:");
+        for ns in &summary.store_namespaces {
+            let visibility = if ns.secret { "secret" } else { "private" };
+            println!("    - {} {}", ns.namespace, visibility);
+        }
+    }
+    if !summary.routes.is_empty() {
+        println!("  routes:");
+        for route in &summary.routes {
+            let ops = route
+                .ops
+                .iter()
+                .map(|op| format!("{op:?}").to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut flags = Vec::new();
+            if route.side_effecting_read {
+                flags.push("side_effecting_read".to_string());
+            }
+            if route.write_async {
+                flags.push("write_async".to_string());
+            }
+            if let Some(ttl) = route.cache_ttl_ms {
+                flags.push(format!("cache_ttl_ms={ttl}"));
+            }
+            let caps = if route.required_caps.is_empty() {
+                "-".to_string()
+            } else {
+                route.required_caps.join(",")
+            };
+            if flags.is_empty() {
+                println!("    - {} ops=[{}] caps=[{}]", route.path, ops, caps);
+            } else {
+                println!(
+                    "    - {} ops=[{}] caps=[{}] flags=[{}]",
+                    route.path,
+                    ops,
+                    caps,
+                    flags.join(",")
+                );
             }
         }
     }

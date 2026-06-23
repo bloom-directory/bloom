@@ -67,9 +67,21 @@ struct PetalToml {
     schema: Option<String>,
     name: String,
     #[serde(default)]
+    consent: ConsentPolicy,
+    #[serde(default)]
     caps: PetalCaps,
     #[serde(default)]
+    net: NetPolicyToml,
+    #[serde(default)]
     sign: SignPolicy,
+    #[serde(default)]
+    store: StorePolicy,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ConsentPolicy {
+    #[serde(default)]
+    summary: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -79,9 +91,32 @@ struct PetalCaps {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct NetPolicyToml {
+    #[serde(default)]
+    allow: Vec<NetAllowToml>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct NetAllowToml {
+    host: String,
+    #[serde(default)]
+    methods: Vec<String>,
+    #[serde(default)]
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct SignPolicy {
     #[serde(default)]
     allowed_intents: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StorePolicy {
+    #[serde(default)]
+    namespaces: Vec<String>,
+    #[serde(default)]
+    secret_namespaces: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +155,43 @@ pub struct BuildManifestRoute {
     pub artifact_path: String,
     pub artifact_hash: String,
     pub abi: RouteAbi,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppConsentSummary {
+    pub name: String,
+    pub app_mount: String,
+    pub package_summary: Option<String>,
+    pub docs: Vec<String>,
+    pub capabilities: Vec<String>,
+    pub network: Vec<AppConsentNetRule>,
+    pub sign_intents: Vec<String>,
+    pub store_namespaces: Vec<AppConsentStoreNamespace>,
+    pub routes: Vec<AppConsentRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppConsentNetRule {
+    pub host: String,
+    pub methods: Vec<String>,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppConsentStoreNamespace {
+    pub namespace: String,
+    pub secret: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppConsentRoute {
+    pub path: String,
+    pub kind: RouteEntryKind,
+    pub ops: Vec<RouteOp>,
+    pub required_caps: Vec<String>,
+    pub cache_ttl_ms: Option<u64>,
+    pub side_effecting_read: bool,
+    pub write_async: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -421,6 +493,88 @@ pub fn build_app_package_dir(root: impl AsRef<Path>) -> Result<PreparedAppPackag
     )?;
 
     PreparedAppPackage::from_dir(root)
+}
+
+pub fn app_consent_summary(package: &PreparedAppPackage) -> Result<AppConsentSummary, PetalError> {
+    let manifest_bytes = file_bytes(&package.files, "petal.toml")?;
+    let manifest_toml = std::str::from_utf8(manifest_bytes)
+        .map_err(|_| PetalError::InvalidWasm("petal.toml is not utf-8".into()))?;
+    let manifest: PetalToml = toml::from_str(manifest_toml)?;
+    let mut capabilities = manifest.caps.allowed.clone();
+    capabilities.sort();
+    capabilities.dedup();
+
+    let mut sign_intents = manifest.sign.allowed_intents.clone();
+    sign_intents.sort();
+    sign_intents.dedup();
+
+    let secret_namespaces = manifest
+        .store
+        .secret_namespaces
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut store_namespace_names = manifest.store.namespaces.clone();
+    store_namespace_names.extend(secret_namespaces.iter().cloned());
+    store_namespace_names.sort();
+    store_namespace_names.dedup();
+    let store_namespaces = store_namespace_names
+        .into_iter()
+        .map(|namespace| AppConsentStoreNamespace {
+            secret: secret_namespaces.contains(&namespace),
+            namespace,
+        })
+        .collect();
+
+    let network = manifest
+        .net
+        .allow
+        .into_iter()
+        .map(|rule| AppConsentNetRule {
+            host: rule.host,
+            methods: rule
+                .methods
+                .into_iter()
+                .map(|method| method.to_ascii_uppercase())
+                .collect(),
+            paths: if rule.paths.is_empty() {
+                vec!["/*".to_string()]
+            } else {
+                rule.paths
+            },
+        })
+        .collect();
+
+    let routes = package
+        .route_index
+        .routes
+        .iter()
+        .map(|route| AppConsentRoute {
+            path: if route.pattern.is_empty() {
+                format!("/apps/{}", package.name)
+            } else {
+                format!("/apps/{}/{}", package.name, route.pattern)
+            },
+            kind: route.kind,
+            ops: route.ops.clone(),
+            required_caps: route.install_metadata.required_caps.clone(),
+            cache_ttl_ms: route.install_metadata.cache_ttl_ms,
+            side_effecting_read: route.install_metadata.side_effecting_read,
+            write_async: route.install_metadata.write_async,
+        })
+        .collect();
+
+    Ok(AppConsentSummary {
+        name: package.name.clone(),
+        app_mount: format!("apps/{}/", package.name),
+        package_summary: manifest.consent.summary,
+        docs: vec!["README.md".into(), "AGENTS.md".into()],
+        capabilities,
+        network,
+        sign_intents,
+        store_namespaces,
+        routes,
+    })
 }
 
 fn build_manifest_for_package(package: &PreparedAppPackage) -> Result<BuildManifest, PetalError> {
@@ -2738,6 +2892,75 @@ name = "echo"
         assert_eq!(dir.hash, tar.hash);
         assert_eq!(dir.route_index.routes, tar.route_index.routes);
         assert_eq!(dir.route_index.routes[0].route_id, "r000001");
+    }
+
+    #[test]
+    fn v2_app_consent_summary_includes_manifest_policy_docs_and_routes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_package_file(
+            tmp.path(),
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+
+[consent]
+summary = "Expose echo routes and use mediated host capabilities."
+
+[caps]
+allowed = ["bloom:http", "bloom:store", "bloom:sign"]
+
+[[net.allow]]
+host = "api.example.com"
+methods = ["get"]
+paths = ["/status"]
+
+[sign]
+allowed_intents = ["echo.test"]
+
+[store]
+namespaces = ["orders"]
+secret_namespaces = ["credentials"]
+"#,
+        );
+        write_package_file(tmp.path(), "README.md", b"# echo");
+        write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
+        write_package_file(tmp.path(), "app/echo/hello.txt.wasm", &compat_wasm("hello"));
+
+        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
+        let summary = app_consent_summary(&package).unwrap();
+
+        assert_eq!(summary.name, "echo");
+        assert_eq!(summary.app_mount, "apps/echo/");
+        assert_eq!(
+            summary.package_summary.as_deref(),
+            Some("Expose echo routes and use mediated host capabilities.")
+        );
+        assert_eq!(summary.docs, vec!["README.md", "AGENTS.md"]);
+        assert_eq!(
+            summary.capabilities,
+            vec!["bloom:http", "bloom:sign", "bloom:store"]
+        );
+        assert_eq!(summary.network.len(), 1);
+        assert_eq!(summary.network[0].host, "api.example.com");
+        assert_eq!(summary.network[0].methods, vec!["GET"]);
+        assert_eq!(summary.network[0].paths, vec!["/status"]);
+        assert_eq!(summary.sign_intents, vec!["echo.test"]);
+        assert_eq!(
+            summary.store_namespaces,
+            vec![
+                AppConsentStoreNamespace {
+                    namespace: "credentials".into(),
+                    secret: true,
+                },
+                AppConsentStoreNamespace {
+                    namespace: "orders".into(),
+                    secret: false,
+                },
+            ]
+        );
+        assert_eq!(summary.routes.len(), 1);
+        assert_eq!(summary.routes[0].path, "/apps/echo/hello.txt");
+        assert_eq!(summary.routes[0].ops, vec![RouteOp::Lookup, RouteOp::Read]);
     }
 
     #[test]
