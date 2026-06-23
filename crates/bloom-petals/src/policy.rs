@@ -77,12 +77,12 @@ impl NetPolicy {
         if url.scheme() != "https" {
             return Err(HostError::Denied("net.fetch requires https".into()));
         }
-        if let Some(port) = url.port() {
-            if port != 443 {
-                return Err(HostError::Denied(format!(
-                    "net.fetch disallows non-default https port {port}"
-                )));
-            }
+        if let Some(port) = url.port()
+            && port != 443
+        {
+            return Err(HostError::Denied(format!(
+                "net.fetch disallows non-default https port {port}"
+            )));
         }
         let host = url
             .host_str()

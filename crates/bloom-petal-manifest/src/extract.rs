@@ -94,12 +94,12 @@ pub fn validate_local_wasm_imports(
 ) -> Result<(), LocalManifestError> {
     let required = local_import_capabilities(wasm)?;
     let declared = manifest.cap_set();
-    for cap in required.difference(&declared) {
+    if let Some(cap) = required.difference(&declared).next() {
         return Err(LocalManifestError::Invalid(format!(
             "wasm imports host capability {cap} but manifest does not declare it"
         )));
     }
-    for cap in declared.difference(&required) {
+    if let Some(cap) = declared.difference(&required).next() {
         return Err(LocalManifestError::Invalid(format!(
             "manifest declares capability {cap} but wasm does not import it"
         )));

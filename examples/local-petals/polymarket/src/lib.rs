@@ -550,7 +550,7 @@ fn write_onboard_begin(wallet: &str) -> DispatchResponse {
     ];
     let creds = match clob_auth_request("POST", "/auth/api-key", &headers) {
         Ok(creds) => creds,
-        Err(DispatchResponse::Error { code, .. }) if code == -4 => {
+        Err(DispatchResponse::Error { code: -4, .. }) => {
             match clob_auth_request("GET", "/auth/derive-api-key", &headers) {
                 Ok(creds) => creds,
                 Err(resp) => return resp,
@@ -648,36 +648,38 @@ fn local_onboard_status(
     })
 }
 
-fn local_onboard_status_with_live_deposit(
-    wallet: &str,
+struct LiveOnboardStatus<'a> {
+    wallet: &'a str,
     owner: Address,
     deposit: Address,
-    stage: &str,
+    stage: &'a str,
     running: bool,
     creds_present: bool,
     tradeable: bool,
-    message: &str,
+    message: &'a str,
     probes: serde_json::Value,
-) -> serde_json::Value {
+}
+
+fn local_onboard_status_with_live_deposit(status: LiveOnboardStatus<'_>) -> serde_json::Value {
     serde_json::json!({
-        "wallet": wallet,
-        "owner": owner.to_checksum(None),
-        "stage": stage,
-        "running": running,
-        "tradeable": tradeable,
-        "creds_present": creds_present,
+        "wallet": status.wallet,
+        "owner": status.owner.to_checksum(None),
+        "stage": status.stage,
+        "running": status.running,
+        "tradeable": status.tradeable,
+        "creds_present": status.creds_present,
         "deposit_wallet": {
-            "address": deposit.to_checksum(None),
+            "address": status.deposit.to_checksum(None),
             "source": "live_factory_resolved",
             "fundable": true,
             "warning": serde_json::Value::Null
         },
         "approvals": {
             "required": true,
-            "preview_path": format!("onboard/{wallet}/approvals.json")
+            "preview_path": format!("onboard/{}/approvals.json", status.wallet)
         },
-        "probes": probes,
-        "message": message
+        "probes": status.probes,
+        "message": status.message
     })
 }
 
@@ -744,16 +746,16 @@ fn refreshed_live_onboard_status(
         )
     };
 
-    Ok(local_onboard_status_with_live_deposit(
+    Ok(local_onboard_status_with_live_deposit(LiveOnboardStatus {
         wallet,
         owner,
         deposit,
         stage,
-        false,
+        running: false,
         creds_present,
         tradeable,
         message,
-        serde_json::json!({
+        probes: serde_json::json!({
             "source": "vfs_chain_and_clob_read_only",
             "deposit_wallet_deployed": deployed,
             "pusd_balance_raw": pusd_balance.to_string(),
@@ -762,7 +764,7 @@ fn refreshed_live_onboard_status(
             "clob_collateral_allowance_raw": clob_allowance.map(|v| v.to_string()),
             "clob_collateral_synced": clob_synced
         }),
-    ))
+    }))
 }
 
 fn run_onboard_stages(

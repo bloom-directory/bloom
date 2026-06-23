@@ -372,7 +372,7 @@ fn resolve_redirect_target(current_url: &str, location: &str) -> Result<String, 
 
 fn redirect_method(method: &str, status: u16) -> String {
     let upper = method.to_ascii_uppercase();
-    if matches!(status, 301 | 302 | 303) && upper != "GET" && upper != "HEAD" {
+    if matches!(status, 301..=303) && upper != "GET" && upper != "HEAD" {
         "GET".into()
     } else {
         upper

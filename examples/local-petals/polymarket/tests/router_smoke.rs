@@ -931,16 +931,15 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     assert!(reconciled_attempt_text.contains("reconciled_open_order"));
     assert!(reconciled_attempt_text.contains("order_body_blake3"));
     assert!(!reconciled_attempt_text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
-    let reconcile_calls = reconcile_host.http_calls.lock().unwrap();
-    assert!(
-        reconcile_calls.iter().any(|(method, url)| {
+    {
+        let reconcile_calls = reconcile_host.http_calls.lock().unwrap();
+        assert!(reconcile_calls.iter().any(|(method, url)| {
             method == "POST" && url == "https://clob.polymarket.com/order"
-        })
-    );
-    assert!(reconcile_calls.iter().any(|(method, url)| {
-        method == "GET" && url == "https://clob.polymarket.com/data/orders"
-    }));
-    drop(reconcile_calls);
+        }));
+        assert!(reconcile_calls.iter().any(|(method, url)| {
+            method == "GET" && url == "https://clob.polymarket.com/data/orders"
+        }));
+    }
     assert_eq!(reconcile_host.sign_calls.lock().unwrap().len(), 1);
 
     let sell_post_host = Arc::new(MockHost::fixture_with_order_id("order-sell-1"));
@@ -972,20 +971,22 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
                 && url == "https://clob.polymarket.com/order"
                 && String::from_utf8_lossy(body).contains(r#""side":"SELL""#))
     );
-    let sell_vfs_writes = sell_post_host.vfs_writes.lock().unwrap();
-    assert!(
-        sell_vfs_writes
-            .iter()
-            .any(|(path, body)| path.contains("/methods/balanceOf@")
+    {
+        let sell_vfs_writes = sell_post_host.vfs_writes.lock().unwrap();
+        assert!(
+            sell_vfs_writes
+                .iter()
+                .any(|(path, body)| path.contains("/methods/balanceOf@")
+                    && path.ends_with(".read")
+                    && String::from_utf8_lossy(body).contains(r#""111""#))
+        );
+        assert!(sell_vfs_writes.iter().any(|(path, body)| {
+            path.contains("/methods/isApprovedForAll@")
                 && path.ends_with(".read")
-                && String::from_utf8_lossy(body).contains(r#""111""#))
-    );
-    assert!(sell_vfs_writes.iter().any(|(path, body)| {
-        path.contains("/methods/isApprovedForAll@")
-            && path.ends_with(".read")
-            && String::from_utf8_lossy(body).contains("0xE111180000d2663C0091e4f400237545B87B996B")
-    }));
-    drop(sell_vfs_writes);
+                && String::from_utf8_lossy(body)
+                    .contains("0xE111180000d2663C0091e4f400237545B87B996B")
+        }));
+    }
     assert_eq!(sell_post_host.sign_calls.lock().unwrap().len(), 1);
 
     let draft = private
@@ -1081,23 +1082,22 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
                         || call.contains("/methods/isApprovedForAll@"))
                     && call.ends_with(".read")))
     );
-    let http_calls = host.http_calls.lock().unwrap();
-    assert!(
-        http_calls
-            .iter()
-            .any(|(_, url)| url == "https://polymarket.com/api/geoblock")
-    );
-    assert!(
-        http_calls
-            .iter()
-            .any(|(method, url)| method == "POST" && url == "https://clob.polymarket.com/order")
-    );
-    assert!(
-        http_calls
-            .iter()
-            .any(|(method, url)| method == "DELETE" && url == "https://clob.polymarket.com/order")
-    );
-    drop(http_calls);
+    {
+        let http_calls = host.http_calls.lock().unwrap();
+        assert!(
+            http_calls
+                .iter()
+                .any(|(_, url)| url == "https://polymarket.com/api/geoblock")
+        );
+        assert!(http_calls.iter().any(|(method, url)| method == "POST"
+            && url == "https://clob.polymarket.com/order"));
+        assert!(
+            http_calls
+                .iter()
+                .any(|(method, url)| method == "DELETE"
+                    && url == "https://clob.polymarket.com/order")
+        );
+    }
     assert!(
         router
             .write(
@@ -1374,19 +1374,21 @@ impl MockHost {
     }
 
     fn fixture_with_geoblock_response(geoblock_body: &[u8], geoblock_status: u16) -> Self {
-        let mut host = Self::default();
-        host.deposit_wallet_deployed = true;
-        host.chain_pusd_balance_micro = 2_000_000;
-        host.chain_pusd_allowance_ok = true;
-        host.chain_ctf_balance_micro = 2_000_000;
-        host.chain_ctf_approved = true;
-        host.policy_body = br#"[polymarket]
+        let mut host = Self {
+            deposit_wallet_deployed: true,
+            chain_pusd_balance_micro: 2_000_000,
+            chain_pusd_allowance_ok: true,
+            chain_ctf_balance_micro: 2_000_000,
+            chain_ctf_approved: true,
+            policy_body: br#"[polymarket]
 enabled = true
 max_order_usd = "5"
 max_daily_usd = "100"
 max_price = "0.20"
 "#
-        .to_vec();
+            .to_vec(),
+            ..Self::default()
+        };
         host.responses.insert(
             "GET https://gamma-api.polymarket.com/markets?closed=false&limit=20&order=volumeNum&ascending=false".into(),
             br#"[{"slug":"test-market","conditionId":"cond","clobTokenIds":["111","222"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true}]"#.to_vec(),

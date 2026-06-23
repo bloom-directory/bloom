@@ -1518,7 +1518,7 @@ mod tests {
         "#;
         let out = vm
             .dispatch(
-                &wat::parse_str(&wat).unwrap(),
+                &wat::parse_str(wat).unwrap(),
                 DispatchRequest {
                     op: DispatchOp::Read,
                     path: "summary.md".into(),
@@ -1535,7 +1535,7 @@ mod tests {
         assert_eq!(
             out.response,
             DispatchResponse::Read(vec![
-                encode_string_list(&vec!["alice".to_string(), "bob".to_string()]).len() as u8
+                encode_string_list(&["alice".to_string(), "bob".to_string()]).len() as u8
             ])
         );
 
