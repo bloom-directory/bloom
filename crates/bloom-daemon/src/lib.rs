@@ -1623,15 +1623,13 @@ mod tests {
 
     #[test]
     fn petal_http_redirect_targets_are_revalidated_by_policy() {
-        let manifest = bloom_petal_manifest::local::parse_local_manifest_toml(
+        let policy = NetPolicy::from_v2_manifest_toml(
             br#"
-schema = "bloom.petal.local.v1"
+schema = "bloom.petal.local-app.v2"
 name = "redirector"
 
-[provides]
-kind = "vfs"
-mount = "redirector"
-caps = ["net.fetch"]
+[caps]
+allowed = ["bloom:http"]
 
 [[net.allow]]
 host = "api.example.com"
@@ -1640,7 +1638,6 @@ paths = ["/start", "/next"]
 "#,
         )
         .unwrap();
-        let policy = NetPolicy::from_manifest(&manifest);
 
         let allowed = resolve_redirect_target("https://api.example.com/start", "/next").unwrap();
         assert!(policy.check("GET", &allowed).is_ok());

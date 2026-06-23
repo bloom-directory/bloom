@@ -2,7 +2,6 @@
 
 use std::collections::BTreeSet;
 
-use bloom_petal_manifest::local::LocalPetalManifest;
 use serde::{Deserialize, Serialize};
 
 /// Capabilities a petal can request. Default is deny.
@@ -94,8 +93,6 @@ pub struct PetalMeta {
     #[serde(default)]
     pub mode: PetalMode,
     #[serde(default)]
-    pub local_manifest: Option<LocalPetalManifest>,
-    #[serde(default)]
     pub local_app: Option<LocalAppMeta>,
 }
 
@@ -183,7 +180,6 @@ mod tests {
             name: Some("hello".into()),
             caps,
             mode: PetalMode::default(),
-            local_manifest: None,
             local_app: None,
         };
         let s = serde_json::to_string(&m).unwrap();
@@ -239,7 +235,6 @@ mod tests {
             name: None,
             caps: BTreeSet::new(),
             mode: PetalMode::Chain,
-            local_manifest: None,
             local_app: None,
         };
         let m2: PetalMeta = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();

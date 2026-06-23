@@ -2954,23 +2954,24 @@ mod tests {
         });
         let mut caps = BTreeSet::new();
         caps.insert(Capability::NetFetch);
-        let manifest = bloom_petal_manifest::local::parse_local_manifest_toml(
-            br#"
-schema = "bloom.petal.local.v1"
+        let opts = RunOptions {
+            net_policy: Some(
+                NetPolicy::from_v2_manifest_toml(
+                    br#"
+schema = "bloom.petal.local-app.v2"
 name = "netty"
-[provides]
-kind = "vfs"
-mount = "netty"
-caps = ["net.fetch"]
+
+[caps]
+allowed = ["bloom:http"]
+
 [[net.allow]]
 host = "api.example.com"
 methods = ["GET"]
 paths = ["/markets*"]
 "#,
-        )
-        .unwrap();
-        let opts = RunOptions {
-            net_policy: Some(NetPolicy::from_manifest(&manifest)),
+                )
+                .unwrap(),
+            ),
             ..RunOptions::default()
         };
         let vm = PetalVm::new().unwrap();
@@ -3001,23 +3002,24 @@ paths = ["/markets*"]
         });
         let mut caps = BTreeSet::new();
         caps.insert(Capability::NetFetch);
-        let manifest = bloom_petal_manifest::local::parse_local_manifest_toml(
-            br#"
-schema = "bloom.petal.local.v1"
+        let opts = RunOptions {
+            net_policy: Some(
+                NetPolicy::from_v2_manifest_toml(
+                    br#"
+schema = "bloom.petal.local-app.v2"
 name = "netty"
-[provides]
-kind = "vfs"
-mount = "netty"
-caps = ["net.fetch"]
+
+[caps]
+allowed = ["bloom:http"]
+
 [[net.allow]]
 host = "api.example.com"
 methods = ["GET"]
 paths = ["/markets*"]
 "#,
-        )
-        .unwrap();
-        let opts = RunOptions {
-            net_policy: Some(NetPolicy::from_manifest(&manifest)),
+                )
+                .unwrap(),
+            ),
             ..RunOptions::default()
         };
         let vm = PetalVm::new().unwrap();

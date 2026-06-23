@@ -99,11 +99,6 @@ const TRADE_POST_HINT: &str = r#"write {"post":true} to sign and post a revalida
 const TRADE_CANCEL_HINT: &str = r#"write {"cancel":true} to cancel the posted CLOB order recorded by this receipt. Cancelling uses CLOB DELETE /order and updates the private receipt/draft status.
 "#;
 
-#[cfg_attr(target_family = "wasm", unsafe(link_section = "bloom_petal_manifest"))]
-#[used]
-pub static BLOOM_LOCAL_MANIFEST: [u8; include_bytes!("../Petal.toml").len()] =
-    *include_bytes!("../Petal.toml");
-
 bloom_petal_sdk::export_dispatch!(handle);
 
 pub fn handle(req: DispatchRequest) -> DispatchResponse {

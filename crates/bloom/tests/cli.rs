@@ -30,47 +30,6 @@ fn fresh_home() -> TempDir {
     tempfile::tempdir().expect("create temp home")
 }
 
-fn wat_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("\\{b:02x}")).collect()
-}
-
-fn local_dispatch_wasm(response: bloom_petals::abi::DispatchResponse, mount: &str) -> Vec<u8> {
-    let response = bloom_petals::abi::encode_dispatch_response(&response);
-    let wat = format!(
-        r#"
-        (module
-          (memory (export "memory") 1)
-          (global $heap (mut i32) (i32.const 1024))
-          (data (i32.const 64) "{}")
-          (func (export "petal_alloc") (param $len i32) (result i32)
-            (local $ptr i32)
-            (local.set $ptr (global.get $heap))
-            (global.set $heap (i32.add (global.get $heap) (local.get $len)))
-            (local.get $ptr))
-          (func (export "petal_dispatch") (param $ptr i32) (param $len i32) (result i64)
-            (i64.or
-              (i64.shl (i64.extend_i32_u (i32.const 64)) (i64.const 32))
-              (i64.extend_i32_u (i32.const {}))))
-        )
-        "#,
-        wat_bytes(&response),
-        response.len()
-    );
-    let wasm = wat::parse_str(&wat).unwrap();
-    let manifest = format!(
-        r#"
-schema = "bloom.petal.local.v1"
-name = "{mount}"
-
-[provides]
-kind = "vfs"
-mount = "{mount}"
-caps = []
-"#
-    );
-    bloom_petal_manifest::embed_local_manifest_section(&wasm, manifest.as_bytes()).unwrap()
-}
-
 #[test]
 fn help_lists_all_subcommands() {
     let home = fresh_home();
@@ -589,53 +548,6 @@ fn petals_install_then_ls_then_run() {
         .success();
     let stdout_hash = String::from_utf8(run_by_hash.get_output().stdout.clone()).unwrap();
     assert_eq!(stdout_hash, "hello from cli petal\n");
-}
-
-#[test]
-fn local_petal_install_prints_consent_and_serves_under_apps() {
-    let home = fresh_home();
-    let wasm_path = home.path().join("demo-app.wasm");
-    let wasm = local_dispatch_wasm(
-        bloom_petals::abi::DispatchResponse::Read(b"hello from apps\n".to_vec()),
-        "demo",
-    );
-    std::fs::write(&wasm_path, wasm).unwrap();
-
-    let install = bloom_cmd(home.path())
-        .args(["petals", "install", wasm_path.to_str().unwrap()])
-        .assert()
-        .success();
-    let install_out = String::from_utf8(install.get_output().stdout.clone()).unwrap();
-    assert!(
-        install_out.contains("app_mount: apps/demo/"),
-        "install should print local app mount consent; got:\n{install_out}"
-    );
-
-    let ls_apps = bloom_cmd(home.path())
-        .args(["vfs", "ls", "/apps"])
-        .assert()
-        .success();
-    let ls_apps_out = String::from_utf8(ls_apps.get_output().stdout.clone()).unwrap();
-    assert!(
-        ls_apps_out.lines().any(|line| line.starts_with("demo")),
-        "apps root should list installed local petal mount; got:\n{ls_apps_out}"
-    );
-
-    bloom_cmd(home.path())
-        .args(["vfs", "cat", "/apps/demo/file.txt"])
-        .assert()
-        .success()
-        .stdout(predicate::eq("hello from apps\n"));
-
-    let ls_petals = bloom_cmd(home.path())
-        .args(["petals", "ls"])
-        .assert()
-        .success();
-    let ls_petals_out = String::from_utf8(ls_petals.get_output().stdout.clone()).unwrap();
-    assert!(
-        ls_petals_out.contains("app=apps/demo/"),
-        "petals ls should show local app mount; got:\n{ls_petals_out}"
-    );
 }
 
 /// `bloom petals name <name> <hash>` binds a petname, and `name <name>`

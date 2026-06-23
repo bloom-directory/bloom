@@ -127,10 +127,11 @@ Every interface here is chosen so the deferred work drops in without a format or
 
 ## 2. Manifest (`petal.toml`)
 
-Authored as a file, embedded in the wasm as the `bloom_petal_manifest` custom section.
+Superseded by the v2 local app package `petal.toml`; manifests are packaged
+alongside route artifacts instead of embedded in a single wasm.
 
 ```toml
-schema = "bloom.petal.local.v1"
+schema = "bloom.petal.local-app.v2"
 name   = "polymarket"
 
 [provides]

@@ -138,7 +138,6 @@ impl PetalStore {
                 name: None,
                 caps: BTreeSet::new(),
                 mode,
-                local_manifest: None,
                 local_app: None,
             },
             Err(e) => return Err(e),
@@ -195,7 +194,7 @@ impl PetalStore {
 
         let existing_meta = match self.load_meta(&hash) {
             Ok(existing) => {
-                if existing.mode != PetalMode::Local || existing.local_manifest.is_some() {
+                if existing.mode != PetalMode::Local {
                     return Err(PetalError::ModeConflict {
                         existing: existing.mode,
                     });
@@ -240,7 +239,6 @@ impl PetalStore {
                 name: None,
                 caps: BTreeSet::new(),
                 mode: PetalMode::Local,
-                local_manifest: None,
                 local_app: None,
             },
         };

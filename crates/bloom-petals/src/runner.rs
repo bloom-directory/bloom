@@ -8,7 +8,6 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bloom_petal_manifest::local::LocalPetalManifest;
 use bloom_vfs::handler::HandlerError;
 use bloom_vfs::path::VfsPath;
 use bloom_vfs::{Handler, Vfs};
@@ -192,49 +191,7 @@ impl PetalRunner {
                 .map_err(|_| PetalError::InvalidWasm("not wasm and not utf-8 WAT".into()))?;
             wat::parse_str(s).map_err(|e| PetalError::InvalidWasm(format!("wat: {e}")))?
         };
-        let local_manifest = if mode == crate::meta::PetalMode::Local
-            && bloom_petal_manifest::extract_petal_manifest_bytes(&wasm).is_some()
-        {
-            let occupied = self
-                .store
-                .list_hashes_by_mode(crate::meta::PetalMode::Local)?
-                .into_iter()
-                .filter_map(|hash| self.store.load_meta(&hash).ok())
-                .filter_map(|meta| meta.local_manifest.map(|m| m.provides.mount))
-                .collect::<Vec<_>>();
-            Some(
-                bloom_petal_manifest::extract_local_petal_manifest(
-                    &wasm,
-                    occupied.iter().map(String::as_str),
-                )
-                .map_err(|e| PetalError::InvalidWasm(format!("local manifest: {e}")))?,
-            )
-        } else {
-            None
-        };
-        let effective_caps = local_manifest
-            .as_ref()
-            .map(|manifest| {
-                manifest
-                    .cap_set()
-                    .into_iter()
-                    .filter_map(|cap| Capability::parse(cap.as_str()))
-                    .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_else(|| caps.clone());
-        if local_manifest.is_none() && effective_caps.iter().any(requires_local_manifest) {
-            return Err(PetalError::InvalidWasm(
-                "net.fetch, sign, and store require an embedded local manifest".into(),
-            ));
-        }
-        if local_manifest.is_some() && !caps.is_empty() && *caps != effective_caps {
-            return Err(PetalError::CapMismatch);
-        }
-        let (result, mut meta) = self.store.install(&wasm, name, &effective_caps, mode)?;
-        if meta.local_manifest != local_manifest {
-            meta.local_manifest = local_manifest;
-            self.store.write_meta(&meta)?;
-        }
+        let (result, meta) = self.store.install(&wasm, name, caps, mode)?;
         if let Some(n) = name {
             self.registry.set(n, &result.hash)?;
         }
@@ -269,21 +226,6 @@ impl PetalRunner {
             .ok_or_else(|| PetalError::NotFound(name_or_hash.to_string()))
     }
 
-    pub fn local_mounts(&self) -> Result<Vec<(String, String)>, PetalError> {
-        let mut out = Vec::new();
-        for hash in self
-            .store
-            .list_hashes_by_mode(crate::meta::PetalMode::Local)?
-        {
-            let meta = self.store.load_meta(&hash)?;
-            if let Some(manifest) = meta.local_manifest {
-                out.push((manifest.provides.mount, hash));
-            }
-        }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(out)
-    }
-
     pub fn local_app_mounts(&self) -> Result<Vec<(String, String)>, PetalError> {
         let mut out = Vec::new();
         for hash in self.store.list_package_hashes()? {
@@ -294,13 +236,6 @@ impl PetalRunner {
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
-    }
-
-    pub fn resolve_mount(&self, mount: &str) -> Result<String, PetalError> {
-        self.local_mounts()?
-            .into_iter()
-            .find_map(|(candidate, hash)| (candidate == mount).then_some(hash))
-            .ok_or_else(|| PetalError::NotFound(format!("apps/{mount}")))
     }
 
     pub fn resolve_app_mount(&self, mount: &str) -> Result<String, PetalError> {
@@ -379,14 +314,6 @@ impl PetalRunner {
         Ok(static_list_entries(&index, path))
     }
 
-    pub fn local_manifest_for_mount(&self, mount: &str) -> Result<LocalPetalManifest, PetalError> {
-        let hash = self.resolve_mount(mount)?;
-        self.store
-            .load_meta(&hash)?
-            .local_manifest
-            .ok_or_else(|| PetalError::NotFound(format!("apps/{mount}")))
-    }
-
     /// Run a petal by name or hash. The caps used at runtime are the
     /// petal's declared caps, intersected with `cap_mask` if provided
     /// (`None` means "use the petal's declared caps"). Callers that
@@ -404,7 +331,7 @@ impl PetalRunner {
         let hash = self.resolve(name_or_hash)?;
         let wasm = self.store.read_wasm(&hash)?;
         let meta = self.store.load_meta(&hash)?;
-        let mut caps: BTreeSet<Capability> = match cap_mask {
+        let caps: BTreeSet<Capability> = match cap_mask {
             Some(mask) => meta.caps.intersection(&mask).copied().collect(),
             None => meta.caps.clone(),
         };
@@ -412,50 +339,9 @@ impl PetalRunner {
         if opts.private_store_root.is_none() {
             opts.private_store_root = Some(self.store.private_data_root());
         }
-        if let Some(manifest) = &meta.local_manifest {
-            let declared = NetPolicy::from_manifest(manifest);
-            opts.net_policy = Some(match opts.net_policy {
-                Some(mask) => declared.intersect(&mask),
-                None => declared,
-            });
-        } else {
-            caps.retain(|cap| !requires_local_manifest(cap));
-            opts.net_policy = None;
-        }
+        opts.net_policy = None;
         self.vm
             .run(&wasm, stdin, caps, host, &hash, meta.mode, opts)
-            .await
-    }
-
-    pub async fn dispatch_mount(
-        &self,
-        mount: &str,
-        request: DispatchRequest,
-        host: Arc<dyn PetalHost>,
-        cap_mask: Option<BTreeSet<Capability>>,
-        opts: RunOptions,
-    ) -> Result<DispatchOutput, PetalError> {
-        let hash = self.resolve_mount(mount)?;
-        let wasm = self.store.read_wasm(&hash)?;
-        let meta = self.store.load_meta(&hash)?;
-        let Some(manifest) = &meta.local_manifest else {
-            return Err(PetalError::NotFound(format!("apps/{mount}")));
-        };
-        let caps = match cap_mask {
-            Some(mask) => meta.caps.intersection(&mask).copied().collect(),
-            None => meta.caps.clone(),
-        };
-        let declared = NetPolicy::from_manifest(manifest);
-        let mut opts = opts;
-        opts.net_policy = Some(match opts.net_policy {
-            Some(mask) => declared.intersect(&mask),
-            None => declared,
-        });
-        if opts.private_store_root.is_none() {
-            opts.private_store_root = Some(self.store.private_data_root());
-        }
-        self.vm
-            .dispatch(&wasm, request, caps, host, &hash, opts)
             .await
     }
 
@@ -591,13 +477,6 @@ impl PetalRunner {
         let manifest = std::fs::read(self.store.package_path(hash)?.join("source/petal.toml"))?;
         store_policy_from_v2_manifest_toml(&manifest)
     }
-}
-
-fn requires_local_manifest(cap: &Capability) -> bool {
-    matches!(
-        cap,
-        Capability::NetFetch | Capability::Sign | Capability::Store | Capability::Chain
-    )
 }
 
 fn route_op(op: DispatchOp) -> RouteOp {
@@ -799,8 +678,7 @@ fn route_segment_matches(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::{DispatchResponse, HttpRequest, HttpResponse, encode_http_request};
-    use parking_lot::Mutex;
+    use crate::abi::DispatchResponse;
     use tempfile::TempDir;
 
     fn runner() -> (TempDir, PetalRunner) {
@@ -826,105 +704,6 @@ mod tests {
             (call $exit (i32.const 0)))
         )
     "#;
-
-    fn wat_bytes(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("\\{b:02x}")).collect()
-    }
-
-    fn http_probe_wat(req: &[u8]) -> String {
-        format!(
-            r#"
-        (module
-          (import "bloom.v1" "http_fetch"
-            (func $http_fetch (param i32 i32 i32 i32) (result i32)))
-          (import "wasi_snapshot_preview1" "fd_write"
-            (func $fd_write (param i32 i32 i32 i32) (result i32)))
-          (import "wasi_snapshot_preview1" "proc_exit"
-            (func $exit (param i32)))
-          (memory (export "memory") 1)
-          (data (i32.const 0) "{}")
-          (data (i32.const 400) "\9c\01\00\00\01\00\00\00")
-          (func (export "_start")
-            (local $n i32)
-            (local.set $n
-              (call $http_fetch
-                (i32.const 0)
-                (i32.const {})
-                (i32.const 1024)
-                (i32.const 4096)))
-            (i32.store8 (i32.const 412) (local.get $n))
-            (call $fd_write (i32.const 1) (i32.const 400) (i32.const 1) (i32.const 420))
-            drop
-            (call $exit (i32.const 0)))
-        )
-    "#,
-            wat_bytes(req),
-            req.len()
-        )
-    }
-
-    fn embedded_net_petal() -> Vec<u8> {
-        let req = encode_http_request(&HttpRequest {
-            method: "GET".into(),
-            url: "https://api.example.com/markets".into(),
-            headers: Vec::new(),
-            body: Vec::new(),
-        });
-        let wasm = wat::parse_str(http_probe_wat(&req)).unwrap();
-        bloom_petal_manifest::embed_local_manifest_section(
-            &wasm,
-            br#"
-schema = "bloom.petal.local.v1"
-name = "netty"
-[provides]
-kind = "vfs"
-mount = "netty"
-caps = ["net.fetch"]
-[[net.allow]]
-host = "api.example.com"
-methods = ["GET"]
-paths = ["/markets*"]
-"#,
-        )
-        .unwrap()
-    }
-
-    #[derive(Default)]
-    struct HttpHost {
-        calls: Mutex<Vec<HttpRequest>>,
-    }
-
-    #[async_trait]
-    impl PetalHost for HttpHost {
-        async fn vfs_read(&self, _path: &str) -> Result<Vec<u8>, HostError> {
-            Err(HostError::Denied("vfs".into()))
-        }
-
-        async fn vfs_list(&self, _path: &str) -> Result<Vec<String>, HostError> {
-            Err(HostError::Denied("vfs".into()))
-        }
-
-        async fn vfs_write(&self, _path: &str, _bytes: &[u8]) -> Result<(), HostError> {
-            Err(HostError::Denied("vfs".into()))
-        }
-
-        async fn http_fetch(
-            &self,
-            req: HttpRequest,
-            policy: NetPolicy,
-            max_response_bytes: usize,
-        ) -> Result<HttpResponse, HostError> {
-            policy.check(&req.method, &req.url)?;
-            self.calls.lock().push(req);
-            let body = b"ok".to_vec();
-            assert!(body.len() <= max_response_bytes);
-            Ok(HttpResponse {
-                status: 200,
-                headers: Vec::new(),
-                body,
-            })
-        }
-    }
 
     struct StaticHandler;
 
@@ -1201,145 +980,5 @@ name = "echo"
         assert!(removed);
         assert!(!r.store().contains(&res.hash));
         assert!(r.registry().lookup("byename").is_none());
-    }
-
-    #[tokio::test]
-    async fn embedded_manifest_net_policy_is_used_by_runner_and_can_be_narrowed() {
-        let (_d, r) = runner();
-        let (res, meta) = r
-            .install(
-                &embedded_net_petal(),
-                Some("netty"),
-                &BTreeSet::new(),
-                crate::meta::PetalMode::Local,
-            )
-            .unwrap();
-        assert!(meta.local_manifest.is_some());
-        assert!(meta.caps.contains(&Capability::NetFetch));
-
-        let host = Arc::new(HttpHost::default());
-        let out = r
-            .run(
-                "netty",
-                Vec::new(),
-                host.clone(),
-                None,
-                RunOptions::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(host.calls.lock().len(), 1);
-        assert!(out.stdout[0] > 0);
-
-        let manifest = r
-            .store()
-            .load_meta(&res.hash)
-            .unwrap()
-            .local_manifest
-            .unwrap();
-        let mut mask = NetPolicy::from_manifest(&manifest);
-        let deny_manifest = bloom_petal_manifest::local::parse_local_manifest_toml(
-            br#"
-schema = "bloom.petal.local.v1"
-name = "nettymask"
-[provides]
-kind = "vfs"
-mount = "nettymask"
-caps = ["net.fetch"]
-[[net.allow]]
-host = "api.example.com"
-methods = ["POST"]
-paths = ["/markets*"]
-"#,
-        )
-        .unwrap();
-        mask = mask.intersect(&NetPolicy::from_manifest(&deny_manifest));
-        let out = r
-            .run(
-                "netty",
-                Vec::new(),
-                host.clone(),
-                None,
-                RunOptions {
-                    net_policy: Some(mask),
-                    ..RunOptions::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            out.stdout,
-            vec![(HostError::Denied("".into()).as_wasm_code() as i8) as u8]
-        );
-        assert_eq!(host.calls.lock().len(), 1);
-    }
-
-    #[test]
-    fn no_manifest_install_rejects_sensitive_caps() {
-        let (_d, r) = runner();
-        let mut caps = BTreeSet::new();
-        caps.insert(Capability::NetFetch);
-        assert!(matches!(
-            r.install(
-                HELLO_WAT.as_bytes(),
-                Some("legacy-net"),
-                &caps,
-                crate::meta::PetalMode::Local,
-            ),
-            Err(PetalError::InvalidWasm(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn no_manifest_metadata_cannot_use_runtime_net_policy_as_grant() {
-        let (_d, r) = runner();
-        let req = encode_http_request(&HttpRequest {
-            method: "GET".into(),
-            url: "https://api.example.com/markets".into(),
-            headers: Vec::new(),
-            body: Vec::new(),
-        });
-        let wasm = wat::parse_str(http_probe_wat(&req)).unwrap();
-        let mut caps = BTreeSet::new();
-        caps.insert(Capability::NetFetch);
-        let (res, _) = r
-            .store()
-            .install(&wasm, None, &caps, crate::meta::PetalMode::Local)
-            .unwrap();
-        r.registry().set("legacy-net", &res.hash).unwrap();
-        let manifest = bloom_petal_manifest::local::parse_local_manifest_toml(
-            br#"
-schema = "bloom.petal.local.v1"
-name = "netty"
-[provides]
-kind = "vfs"
-mount = "netty"
-caps = ["net.fetch"]
-[[net.allow]]
-host = "api.example.com"
-methods = ["GET"]
-paths = ["/markets*"]
-"#,
-        )
-        .unwrap();
-        let host = Arc::new(HttpHost::default());
-        let out = r
-            .run(
-                "legacy-net",
-                Vec::new(),
-                host.clone(),
-                None,
-                RunOptions {
-                    net_policy: Some(NetPolicy::from_manifest(&manifest)),
-                    ..RunOptions::default()
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            out.stdout,
-            vec![(HostError::Denied("".into()).as_wasm_code() as i8) as u8]
-        );
-        assert!(host.calls.lock().is_empty());
     }
 }

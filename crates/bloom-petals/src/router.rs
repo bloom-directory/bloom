@@ -1,15 +1,14 @@
-//! VFS router for local petal-provided apps.
+//! VFS router for v2 local petal app packages.
 //!
 //! The daemon mounts this handler at `apps/`. The first path segment selects
-//! an installed local petal mount from its embedded manifest; the remaining
-//! path is passed to the petal's `petal_dispatch` export.
+//! an installed v2 app package; the remaining path is passed to the matched
+//! app route artifact.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bloom_petal_manifest::local::EndpointSpec;
 use bloom_vfs::handler::{Entry, EntryKind, Handler, HandlerError};
 use bloom_vfs::path::VfsPath;
 
@@ -36,45 +35,6 @@ impl PetalRouter {
         };
         let rest = rest.join("/");
         Ok((mount, rest))
-    }
-
-    fn endpoint_hint(&self, path: &VfsPath) -> Option<EndpointSpec> {
-        let (mount, rest) = Self::mount_path(path).ok()?;
-        if rest.is_empty() {
-            return None;
-        }
-        let manifest = self.runner.local_manifest_for_mount(mount).ok()?;
-        manifest
-            .endpoint
-            .into_iter()
-            .filter(|endpoint| endpoint_matches(&endpoint.path, &rest))
-            .max_by_key(|endpoint| endpoint_specificity(&endpoint.path))
-    }
-
-    async fn dispatch(
-        &self,
-        mount: &str,
-        op: DispatchOp,
-        path: String,
-        body: Vec<u8>,
-    ) -> Result<DispatchResponse, HandlerError> {
-        let out = self
-            .runner
-            .dispatch_mount(
-                mount,
-                DispatchRequest {
-                    op,
-                    path,
-                    body,
-                    ctx: Vec::new(),
-                },
-                self.host.clone(),
-                None,
-                RunOptions::default(),
-            )
-            .await
-            .map_err(map_petal_err)?;
-        Ok(out.response)
     }
 
     fn is_v2_app(&self, mount: &str) -> bool {
@@ -115,47 +75,38 @@ impl Handler for PetalRouter {
             [] => Ok(Entry::dir("")),
             [mount] => {
                 if !self.is_v2_app(mount) {
-                    self.runner.resolve_mount(mount).map_err(map_petal_err)?;
+                    return Err(HandlerError::NotFound(path.to_string_path()));
                 }
                 Ok(Entry::dir(mount))
             }
             _ => {
                 let (mount, rest) = Self::mount_path(path)?;
-                if self.is_v2_app(mount) {
-                    match self
-                        .dispatch_v2(mount, DispatchOp::Lookup, rest.clone(), Vec::new())
-                        .await
-                    {
-                        Ok(DispatchResponse::Lookup(entry)) => return entry_to_vfs(entry),
-                        Ok(DispatchResponse::Error { code, message }) => {
-                            return Err(dispatch_error(code, message, path.to_string_path()));
-                        }
-                        Ok(other) => return Err(unexpected_response("lookup", other)),
-                        Err(HandlerError::NotFound(_))
-                            if self
-                                .runner
-                                .local_app_has_descendant(mount, &rest)
-                                .map_err(map_petal_err)? =>
-                        {
-                            let name = path
-                                .segments()
-                                .last()
-                                .map(String::as_str)
-                                .unwrap_or_default();
-                            return Ok(Entry::dir(name));
-                        }
-                        Err(e) => return Err(e),
-                    }
+                if !self.is_v2_app(mount) {
+                    return Err(HandlerError::NotFound(path.to_string_path()));
                 }
                 match self
-                    .dispatch(mount, DispatchOp::Lookup, rest, Vec::new())
-                    .await?
+                    .dispatch_v2(mount, DispatchOp::Lookup, rest.clone(), Vec::new())
+                    .await
                 {
-                    DispatchResponse::Lookup(entry) => entry_to_vfs(entry),
-                    DispatchResponse::Error { code, message } => {
+                    Ok(DispatchResponse::Lookup(entry)) => entry_to_vfs(entry),
+                    Ok(DispatchResponse::Error { code, message }) => {
                         Err(dispatch_error(code, message, path.to_string_path()))
                     }
-                    other => Err(unexpected_response("lookup", other)),
+                    Ok(other) => Err(unexpected_response("lookup", other)),
+                    Err(HandlerError::NotFound(_))
+                        if self
+                            .runner
+                            .local_app_has_descendant(mount, &rest)
+                            .map_err(map_petal_err)? =>
+                    {
+                        let name = path
+                            .segments()
+                            .last()
+                            .map(String::as_str)
+                            .unwrap_or_default();
+                        Ok(Entry::dir(name))
+                    }
+                    Err(e) => Err(e),
                 }
             }
         }
@@ -166,20 +117,11 @@ impl Handler for PetalRouter {
         if rest.is_empty() {
             return Err(HandlerError::NotAFile(path.to_string_path()));
         }
-        if self.is_v2_app(mount) {
-            return match self
-                .dispatch_v2(mount, DispatchOp::Read, rest, Vec::new())
-                .await?
-            {
-                DispatchResponse::Read(bytes) => Ok(bytes),
-                DispatchResponse::Error { code, message } => {
-                    Err(dispatch_error(code, message, path.to_string_path()))
-                }
-                other => Err(unexpected_response("read", other)),
-            };
+        if !self.is_v2_app(mount) {
+            return Err(HandlerError::NotFound(path.to_string_path()));
         }
         match self
-            .dispatch(mount, DispatchOp::Read, rest, Vec::new())
+            .dispatch_v2(mount, DispatchOp::Read, rest, Vec::new())
             .await?
         {
             DispatchResponse::Read(bytes) => Ok(bytes),
@@ -195,113 +137,45 @@ impl Handler for PetalRouter {
         if rest.is_empty() {
             return Err(HandlerError::PermissionDenied);
         }
-        if self.is_v2_app(mount) {
-            let (_, runtime_metadata) = self
-                .runner
-                .local_app_route_runtime_metadata(
-                    mount,
-                    DispatchOp::Write,
-                    &rest,
-                    RunOptions::default(),
-                )
-                .await
-                .map_err(map_petal_err)?;
-            if runtime_metadata.write_async {
-                let runner = self.runner.clone();
-                let host = self.host.clone();
-                let mount = mount.to_string();
-                let request = DispatchRequest {
-                    op: DispatchOp::Write,
-                    path: rest,
-                    body: data.to_vec(),
-                    ctx: Vec::new(),
-                };
-                tokio::spawn(async move {
-                    let result = runner
-                        .dispatch_app_route(&mount, request, host, None, RunOptions::default())
-                        .await;
-                    if let Err(e) = result {
-                        tracing::warn!(
-                            mount = %mount,
-                            error = %e,
-                            "async v2 petal write failed"
-                        );
-                    }
-                });
-                return Ok(());
-            }
-            return match self
-                .dispatch_v2(mount, DispatchOp::Write, rest, data.to_vec())
-                .await?
-            {
-                DispatchResponse::Write => Ok(()),
-                DispatchResponse::Error { code, message } => {
-                    Err(dispatch_error(code, message, path.to_string_path()))
-                }
-                other => Err(unexpected_response("write", other)),
-            };
+        if !self.is_v2_app(mount) {
+            return Err(HandlerError::NotFound(path.to_string_path()));
         }
-        let hint = self.endpoint_hint(path);
-        if !hint.as_ref().map(|hint| hint.write).unwrap_or(false) {
-            return Err(HandlerError::PermissionDenied);
-        }
-        if hint
-            .as_ref()
-            .map(|hint| hint.async_dispatch)
-            .unwrap_or(false)
-        {
+        let (_, runtime_metadata) = self
+            .runner
+            .local_app_route_runtime_metadata(
+                mount,
+                DispatchOp::Write,
+                &rest,
+                RunOptions::default(),
+            )
+            .await
+            .map_err(map_petal_err)?;
+        if runtime_metadata.write_async {
             let runner = self.runner.clone();
             let host = self.host.clone();
             let mount = mount.to_string();
-            let dispatch_path = rest;
-            let body = data.to_vec();
+            let request = DispatchRequest {
+                op: DispatchOp::Write,
+                path: rest,
+                body: data.to_vec(),
+                ctx: Vec::new(),
+            };
             tokio::spawn(async move {
                 let result = runner
-                    .dispatch_mount(
-                        &mount,
-                        DispatchRequest {
-                            op: DispatchOp::Write,
-                            path: dispatch_path,
-                            body,
-                            ctx: Vec::new(),
-                        },
-                        host,
-                        None,
-                        RunOptions::default(),
-                    )
+                    .dispatch_app_route(&mount, request, host, None, RunOptions::default())
                     .await;
-                match result {
-                    Ok(out) => match out.response {
-                        DispatchResponse::Write => {}
-                        DispatchResponse::Error { code, message } => {
-                            tracing::warn!(
-                                mount = %mount,
-                                code,
-                                error = %message,
-                                "async petal write returned error"
-                            );
-                        }
-                        other => {
-                            tracing::warn!(
-                                mount = %mount,
-                                response = ?other,
-                                "async petal write returned unexpected response"
-                            );
-                        }
-                    },
-                    Err(e) => {
-                        tracing::warn!(
-                            mount = %mount,
-                            error = %e,
-                            "async petal write failed"
-                        );
-                    }
+                if let Err(e) = result {
+                    tracing::warn!(
+                        mount = %mount,
+                        error = %e,
+                        "async v2 petal write failed"
+                    );
                 }
             });
             return Ok(());
         }
         match self
-            .dispatch(mount, DispatchOp::Write, rest, data.to_vec())
+            .dispatch_v2(mount, DispatchOp::Write, rest, data.to_vec())
             .await?
         {
             DispatchResponse::Write => Ok(()),
@@ -316,9 +190,6 @@ impl Handler for PetalRouter {
         match path.segments() {
             [] => {
                 let mut mounts = BTreeMap::new();
-                for (mount, _hash) in self.runner.local_mounts().map_err(map_petal_err)? {
-                    mounts.insert(mount, ());
-                }
                 for (mount, _hash) in self.runner.local_app_mounts().map_err(map_petal_err)? {
                     mounts.insert(mount, ());
                 }
@@ -346,20 +217,7 @@ impl Handler for PetalRouter {
                     Err(e) => Err(e),
                 }
             }
-            [mount] => {
-                match self
-                    .dispatch(mount, DispatchOp::List, String::new(), Vec::new())
-                    .await?
-                {
-                    DispatchResponse::List(entries) => {
-                        entries.into_iter().map(entry_to_vfs).collect()
-                    }
-                    DispatchResponse::Error { code, message } => {
-                        Err(dispatch_error(code, message, path.to_string_path()))
-                    }
-                    other => Err(unexpected_response("list", other)),
-                }
-            }
+            [mount] => Err(HandlerError::NotFound(mount.to_string())),
             _ => {
                 let (mount, rest) = Self::mount_path(path)?;
                 if self.is_v2_app(mount) {
@@ -384,18 +242,7 @@ impl Handler for PetalRouter {
                         Err(e) => Err(e),
                     };
                 }
-                match self
-                    .dispatch(mount, DispatchOp::List, rest, Vec::new())
-                    .await?
-                {
-                    DispatchResponse::List(entries) => {
-                        entries.into_iter().map(entry_to_vfs).collect()
-                    }
-                    DispatchResponse::Error { code, message } => {
-                        Err(dispatch_error(code, message, path.to_string_path()))
-                    }
-                    other => Err(unexpected_response("list", other)),
-                }
+                Err(HandlerError::NotFound(path.to_string_path()))
             }
         }
     }
@@ -412,10 +259,7 @@ impl Handler for PetalRouter {
                 .and_then(|matched| matched.route.install_metadata.cache_ttl_ms)
                 .map(Duration::from_millis);
         }
-        self.endpoint_hint(path)
-            .filter(|hint| !hint.read_side_effecting)
-            .and_then(|hint| hint.cache_ttl_ms)
-            .map(Duration::from_millis)
+        None
     }
 
     fn is_read_side_effecting(&self, path: &VfsPath) -> bool {
@@ -429,9 +273,7 @@ impl Handler for PetalRouter {
                 .map(|matched| matched.route.install_metadata.side_effecting_read)
                 .unwrap_or(false);
         }
-        self.endpoint_hint(path)
-            .map(|hint| hint.read_side_effecting)
-            .unwrap_or(false)
+        false
     }
 }
 
@@ -519,42 +361,6 @@ fn unexpected_response(op: &str, response: DispatchResponse) -> HandlerError {
     ))
 }
 
-fn endpoint_matches(glob: &str, path: &str) -> bool {
-    let glob_segs: Vec<&str> = glob.split('/').collect();
-    let path_segs: Vec<&str> = path.split('/').collect();
-    if glob_segs.len() != path_segs.len() {
-        return false;
-    }
-    glob_segs
-        .iter()
-        .zip(path_segs)
-        .all(|(glob, path)| match *glob {
-            "*" => true,
-            _ if glob.ends_with('*') => path.starts_with(glob.trim_end_matches('*')),
-            _ => *glob == path,
-        })
-}
-
-fn endpoint_specificity(glob: &str) -> (usize, usize, usize) {
-    let mut literal_bytes = 0;
-    let mut exact_segments = 0;
-    let mut wildcard_segments = 0;
-    for segment in glob.split('/') {
-        if segment == "*" || segment.ends_with('*') {
-            wildcard_segments += 1;
-            literal_bytes += segment.trim_end_matches('*').len();
-        } else {
-            exact_segments += 1;
-            literal_bytes += segment.len();
-        }
-    }
-    (
-        literal_bytes,
-        exact_segments,
-        usize::MAX - wildcard_segments,
-    )
-}
-
 fn map_petal_err(e: PetalError) -> HandlerError {
     match e {
         PetalError::NotFound(s) => HandlerError::NotFound(s),
@@ -591,13 +397,11 @@ mod tests {
         DispatchEntryKind, HttpRequest, HttpResponse, encode_dispatch_response, encode_http_request,
     };
     use crate::host::{DenyHost, PetalHost};
-    use crate::meta::PetalMode;
     use crate::policy::NetPolicy;
     use crate::registry::NameRegistry;
     use crate::store::PetalStore;
     use crate::vm::PetalVm;
     use parking_lot::Mutex;
-    use std::collections::BTreeSet;
     use tempfile::TempDir;
 
     fn runner() -> (TempDir, PetalRunner) {
@@ -673,10 +477,6 @@ mod tests {
         wat::parse_str(&wat).unwrap()
     }
 
-    fn embedded_app(response: DispatchResponse, mount: &str) -> Vec<u8> {
-        embedded_app_with_manifest_tail(response, mount, "")
-    }
-
     fn write_v2_package_route(root: &std::path::Path, route: &str, wasm: &[u8]) {
         write_v2_package_route_with_manifest(
             root,
@@ -704,29 +504,6 @@ name = "echo"
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
-    }
-
-    fn embedded_app_with_manifest_tail(
-        response: DispatchResponse,
-        mount: &str,
-        manifest_tail: &str,
-    ) -> Vec<u8> {
-        let manifest = format!(
-            r#"
-schema = "bloom.petal.local.v1"
-name = "{mount}"
-[provides]
-kind = "vfs"
-mount = "{mount}"
-caps = []
-{manifest_tail}
-"#
-        );
-        bloom_petal_manifest::embed_local_manifest_section(
-            &dispatch_wat(response),
-            manifest.as_bytes(),
-        )
-        .unwrap()
     }
 
     #[derive(Default)]
@@ -771,24 +548,6 @@ caps = []
     }
 
     #[tokio::test]
-    async fn root_lists_manifest_mounts() {
-        let (_d, runner_with_no_write) = runner();
-        runner_with_no_write
-            .install(
-                &embedded_app(DispatchResponse::Write, "demo"),
-                None,
-                &BTreeSet::new(),
-                PetalMode::Local,
-            )
-            .unwrap();
-        let router = PetalRouter::new(runner_with_no_write, Arc::new(DenyHost));
-        let entries = router.list(&VfsPath::root()).await.unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "demo");
-        assert_eq!(entries[0].kind, EntryKind::Dir);
-    }
-
-    #[tokio::test]
     async fn root_lists_v2_app_packages() {
         let (d, runner) = runner();
         let package = d.path().join("pkg");
@@ -804,25 +563,6 @@ caps = []
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "echo");
         assert_eq!(entries[0].kind, EntryKind::Dir);
-    }
-
-    #[tokio::test]
-    async fn read_dispatches_to_mount_relative_path() {
-        let (_d, runner_with_write) = runner();
-        runner_with_write
-            .install(
-                &embedded_app(DispatchResponse::Read(b"hello".to_vec()), "demo"),
-                None,
-                &BTreeSet::new(),
-                PetalMode::Local,
-            )
-            .unwrap();
-        let router = PetalRouter::new(runner_with_write, Arc::new(DenyHost));
-        let bytes = router
-            .read(&VfsPath::parse("demo/file.txt").unwrap())
-            .await
-            .unwrap();
-        assert_eq!(bytes, b"hello");
     }
 
     #[tokio::test]
@@ -1108,28 +848,24 @@ paths = ["/markets*"]
 
     #[tokio::test]
     async fn lookup_maps_dispatch_entry_metadata() {
-        let (_d, runner_with_no_write) = runner();
-        runner_with_no_write
-            .install(
-                &embedded_app(
-                    DispatchResponse::Lookup(DispatchEntry {
-                        name: "run".into(),
-                        kind: DispatchEntryKind::ExecutableFile,
-                        size: 7,
-                        mode: 0,
-                        ttl_hint_ms: None,
-                        link_target: None,
-                    }),
-                    "demo",
-                ),
-                None,
-                &BTreeSet::new(),
-                PetalMode::Local,
-            )
-            .unwrap();
-        let router = PetalRouter::new(runner_with_no_write, Arc::new(DenyHost));
+        let (d, runner) = runner();
+        let package = d.path().join("pkg");
+        write_v2_package_route(
+            &package,
+            "app/echo/run.wasm",
+            &dispatch_wat(DispatchResponse::Lookup(DispatchEntry {
+                name: "run".into(),
+                kind: DispatchEntryKind::ExecutableFile,
+                size: 7,
+                mode: 0,
+                ttl_hint_ms: None,
+                link_target: None,
+            })),
+        );
+        runner.store().install_app_package_dir(&package).unwrap();
+        let router = PetalRouter::new(runner, Arc::new(DenyHost));
         let entry = router
-            .lookup(&VfsPath::parse("demo/run").unwrap())
+            .lookup(&VfsPath::parse("echo/run").unwrap())
             .await
             .unwrap();
         assert_eq!(entry.name, "run");
@@ -1140,151 +876,45 @@ paths = ["/markets*"]
 
     #[tokio::test]
     async fn dispatch_error_maps_to_handler_error() {
-        let (_d, runner_with_write) = runner();
-        runner_with_write
-            .install(
-                &embedded_app(
-                    DispatchResponse::Error {
-                        code: -1,
-                        message: "missing".into(),
-                    },
-                    "demo",
-                ),
-                None,
-                &BTreeSet::new(),
-                PetalMode::Local,
-            )
-            .unwrap();
-        let router = PetalRouter::new(runner_with_write, Arc::new(DenyHost));
+        let (d, runner) = runner();
+        let package = d.path().join("pkg");
+        write_v2_package_route(
+            &package,
+            "app/echo/nope.wasm",
+            &dispatch_wat(DispatchResponse::Error {
+                code: -1,
+                message: "missing".into(),
+            }),
+        );
+        runner.store().install_app_package_dir(&package).unwrap();
+        let router = PetalRouter::new(runner, Arc::new(DenyHost));
         let err = router
-            .read(&VfsPath::parse("demo/nope").unwrap())
+            .read(&VfsPath::parse("echo/nope").unwrap())
             .await
             .unwrap_err();
         assert!(matches!(err, HandlerError::NotFound(s) if s == "missing"));
     }
 
     #[tokio::test]
-    async fn write_requires_declared_writable_endpoint() {
-        let (_d, runner_with_no_write) = runner();
-        runner_with_no_write
-            .install(
-                &embedded_app(DispatchResponse::Write, "demo"),
-                None,
-                &BTreeSet::new(),
-                PetalMode::Local,
-            )
-            .unwrap();
-        let router = PetalRouter::new(runner_with_no_write, Arc::new(DenyHost));
-        let err = router
-            .write(&VfsPath::parse("demo/hidden").unwrap(), b"x")
-            .await
-            .unwrap_err();
-        assert!(matches!(err, HandlerError::PermissionDenied));
-
-        let (_d, runner_with_write) = runner();
-        runner_with_write
-            .install(
-                &embedded_app_with_manifest_tail(
-                    DispatchResponse::Write,
-                    "demo",
-                    r#"
-[[endpoint]]
-path = "writable"
-write = true
-"#,
-                ),
-                None,
-                &BTreeSet::new(),
-                PetalMode::Local,
-            )
-            .unwrap();
-        let router = PetalRouter::new(runner_with_write, Arc::new(DenyHost));
-        router
-            .write(&VfsPath::parse("demo/writable").unwrap(), b"x")
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn async_writable_endpoint_returns_after_enqueue() {
-        let (_d, runner) = runner();
-        runner
-            .install(
-                &embedded_app_with_manifest_tail(
-                    DispatchResponse::Error {
-                        code: -4,
-                        message: "background failure".into(),
-                    },
-                    "demo",
-                    r#"
-[[endpoint]]
-path = "writable"
-write = true
-async = true
-"#,
-                ),
-                None,
-                &BTreeSet::new(),
-                PetalMode::Local,
-            )
-            .unwrap();
-        let router = PetalRouter::new(runner, Arc::new(DenyHost));
-        router
-            .write(&VfsPath::parse("demo/writable").unwrap(), b"x")
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn side_effecting_reads_are_not_cacheable() {
-        let (_d, runner) = runner();
-        runner
-            .install(
-                &embedded_app_with_manifest_tail(
-                    DispatchResponse::Read(b"secret".to_vec()),
-                    "demo",
-                    r#"
-[[endpoint]]
-path = "sign"
-cache_ttl_ms = 60000
-read_side_effecting = true
-"#,
-                ),
-                None,
-                &BTreeSet::new(),
-                PetalMode::Local,
-            )
-            .unwrap();
-        let router = PetalRouter::new(runner, Arc::new(DenyHost));
-        let path = VfsPath::parse("demo/sign").unwrap();
-        assert!(router.is_read_side_effecting(&path));
-        assert_eq!(router.cache_ttl(&path), None);
-    }
-
-    #[tokio::test]
     async fn dispatch_entry_names_must_be_plain_segments() {
-        let (_d, runner) = runner();
-        runner
-            .install(
-                &embedded_app(
-                    DispatchResponse::Lookup(DispatchEntry {
-                        name: "../wallets".into(),
-                        kind: DispatchEntryKind::File,
-                        size: 0,
-                        mode: 0,
-                        ttl_hint_ms: None,
-                        link_target: None,
-                    }),
-                    "demo",
-                ),
-                None,
-                &BTreeSet::new(),
-                PetalMode::Local,
-            )
-            .unwrap();
+        let (d, runner) = runner();
+        let package = d.path().join("pkg");
+        write_v2_package_route(
+            &package,
+            "app/echo/bad.wasm",
+            &dispatch_wat(DispatchResponse::Lookup(DispatchEntry {
+                name: "../wallets".into(),
+                kind: DispatchEntryKind::File,
+                size: 0,
+                mode: 0,
+                ttl_hint_ms: None,
+                link_target: None,
+            })),
+        );
+        runner.store().install_app_package_dir(&package).unwrap();
         let router = PetalRouter::new(runner, Arc::new(DenyHost));
         let err = router
-            .lookup(&VfsPath::parse("demo/bad").unwrap())
+            .lookup(&VfsPath::parse("echo/bad").unwrap())
             .await
             .unwrap_err();
         assert!(matches!(err, HandlerError::Invalid(_)));
@@ -1293,28 +923,24 @@ read_side_effecting = true
     #[tokio::test]
     async fn symlink_targets_must_stay_mount_relative() {
         for target in ["/wallets/alice", "../wallets", "ok/../wallets", "bad\\path"] {
-            let (_d, runner) = runner();
-            runner
-                .install(
-                    &embedded_app(
-                        DispatchResponse::Lookup(DispatchEntry {
-                            name: "link".into(),
-                            kind: DispatchEntryKind::Symlink,
-                            size: 0,
-                            mode: 0,
-                            ttl_hint_ms: None,
-                            link_target: Some(target.into()),
-                        }),
-                        "demo",
-                    ),
-                    None,
-                    &BTreeSet::new(),
-                    PetalMode::Local,
-                )
-                .unwrap();
+            let (d, runner) = runner();
+            let package = d.path().join("pkg");
+            write_v2_package_route(
+                &package,
+                "app/echo/link.wasm",
+                &dispatch_wat(DispatchResponse::Lookup(DispatchEntry {
+                    name: "link".into(),
+                    kind: DispatchEntryKind::Symlink,
+                    size: 0,
+                    mode: 0,
+                    ttl_hint_ms: None,
+                    link_target: Some(target.into()),
+                })),
+            );
+            runner.store().install_app_package_dir(&package).unwrap();
             let router = PetalRouter::new(runner, Arc::new(DenyHost));
             let err = router
-                .lookup(&VfsPath::parse("demo/link").unwrap())
+                .lookup(&VfsPath::parse("echo/link").unwrap())
                 .await
                 .unwrap_err();
             assert!(
@@ -1323,39 +949,27 @@ read_side_effecting = true
             );
         }
 
-        let (_d, runner) = runner();
-        runner
-            .install(
-                &embedded_app(
-                    DispatchResponse::Lookup(DispatchEntry {
-                        name: "link".into(),
-                        kind: DispatchEntryKind::Symlink,
-                        size: 0,
-                        mode: 0,
-                        ttl_hint_ms: None,
-                        link_target: Some("child/file".into()),
-                    }),
-                    "demo",
-                ),
-                None,
-                &BTreeSet::new(),
-                PetalMode::Local,
-            )
-            .unwrap();
+        let (d, runner) = runner();
+        let package = d.path().join("pkg");
+        write_v2_package_route(
+            &package,
+            "app/echo/link.wasm",
+            &dispatch_wat(DispatchResponse::Lookup(DispatchEntry {
+                name: "link".into(),
+                kind: DispatchEntryKind::Symlink,
+                size: 0,
+                mode: 0,
+                ttl_hint_ms: None,
+                link_target: Some("child/file".into()),
+            })),
+        );
+        runner.store().install_app_package_dir(&package).unwrap();
         let router = PetalRouter::new(runner, Arc::new(DenyHost));
         let entry = router
-            .lookup(&VfsPath::parse("demo/link").unwrap())
+            .lookup(&VfsPath::parse("echo/link").unwrap())
             .await
             .unwrap();
         assert_eq!(entry.link_target.as_deref(), Some("child/file"));
-    }
-
-    #[test]
-    fn endpoint_globs_are_segment_scoped() {
-        assert!(endpoint_matches("markets*", "markets-open"));
-        assert!(endpoint_matches("markets/*", "markets/123"));
-        assert!(!endpoint_matches("markets/*", "markets/123/outcomes"));
-        assert!(!endpoint_matches("markets*", "other"));
     }
 
     #[test]
@@ -1372,11 +986,5 @@ read_side_effecting = true
             dispatch_error(COMPONENT_UNSUPPORTED_CODE, "write".into(), "demo/file".into()),
             HandlerError::Unsupported(op) if op == "write"
         ));
-    }
-
-    #[test]
-    fn endpoint_specificity_prefers_exact_paths() {
-        assert!(endpoint_specificity("markets/123") > endpoint_specificity("markets/*"));
-        assert!(endpoint_specificity("markets-open") > endpoint_specificity("markets*"));
     }
 }

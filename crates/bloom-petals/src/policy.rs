@@ -1,8 +1,7 @@
-//! Runtime network policy for local petals.
+//! Runtime network policy for v2 local app petals.
 
 use std::collections::BTreeSet;
 
-use bloom_petal_manifest::local::LocalPetalManifest;
 use serde::Deserialize;
 
 use crate::error::PetalError;
@@ -18,29 +17,6 @@ impl NetPolicy {
     /// Default-deny policy.
     pub fn deny_all() -> Self {
         Self { rules: Vec::new() }
-    }
-
-    /// Build policy from a parsed local manifest.
-    pub fn from_manifest(manifest: &LocalPetalManifest) -> Self {
-        let rules = manifest
-            .net
-            .as_ref()
-            .map(|net| {
-                net.allow
-                    .iter()
-                    .map(|rule| NetRule {
-                        host: rule.host.to_ascii_lowercase(),
-                        methods: rule
-                            .effective_methods()
-                            .into_iter()
-                            .map(|m| m.as_str().to_string())
-                            .collect(),
-                        paths: rule.paths.clone().unwrap_or_default(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Self { rules }
     }
 
     pub fn from_v2_manifest_toml(bytes: &[u8]) -> Result<Self, PetalError> {
@@ -303,13 +279,11 @@ mod tests {
 
     fn manifest_toml() -> &'static [u8] {
         br#"
-schema = "bloom.petal.local.v1"
+schema = "bloom.petal.local-app.v2"
 name = "netty"
 
-[provides]
-kind = "vfs"
-mount = "netty"
-caps = ["net.fetch"]
+[caps]
+allowed = ["bloom:http"]
 
 [[net.allow]]
 host = "api.example.com"
@@ -320,9 +294,7 @@ paths = ["/markets*", "/auth/*", "/wallets/*/orders"]
 
     #[test]
     fn policy_enforces_https_host_method_and_path() {
-        let manifest = bloom_petal_manifest::local::parse_local_manifest_toml(manifest_toml())
-            .expect("valid manifest");
-        let policy = NetPolicy::from_manifest(&manifest);
+        let policy = NetPolicy::from_v2_manifest_toml(manifest_toml()).expect("valid manifest");
         assert!(
             policy
                 .check("GET", "https://api.example.com/markets")
@@ -372,9 +344,7 @@ paths = ["/markets*", "/auth/*", "/wallets/*/orders"]
 
     #[test]
     fn runtime_mask_only_narrows() {
-        let manifest = bloom_petal_manifest::local::parse_local_manifest_toml(manifest_toml())
-            .expect("valid manifest");
-        let declared = NetPolicy::from_manifest(&manifest);
+        let declared = NetPolicy::from_v2_manifest_toml(manifest_toml()).expect("valid manifest");
         let mask = NetPolicy {
             rules: vec![NetRule {
                 host: "api.example.com".into(),

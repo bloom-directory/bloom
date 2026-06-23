@@ -1722,7 +1722,6 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                 let cs: Vec<&str> = meta.caps.iter().map(|c| c.as_str()).collect();
                 println!("caps: {}", cs.join(", "));
             }
-            print_local_petal_consent(&meta, d.petals.store().private_data_root());
             Ok(())
         }
         PetalsCmd::App(_) => unreachable!("petal app commands are handled before daemon startup"),
@@ -1789,19 +1788,13 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                 let meta = d.petals.store().load_meta(&h).context("load meta")?;
                 let n = name_for_hash.get(&h).map(String::as_str).unwrap_or("-");
                 let caps: Vec<&str> = meta.caps.iter().map(|c| c.as_str()).collect();
-                let app = meta
-                    .local_manifest
-                    .as_ref()
-                    .map(|m| format!("  app=apps/{}/", m.provides.mount))
-                    .unwrap_or_default();
                 println!(
-                    "{}  {:<7}  {:>7}  caps=[{}]  name={}{}",
+                    "{}  {:<7}  {:>7}  caps=[{}]  name={}",
                     &meta.hash[..12],
                     meta.mode.as_str(),
                     meta.size,
                     caps.join(","),
-                    n,
-                    app
+                    n
                 );
             }
             for h in package_hashes {
@@ -1921,82 +1914,6 @@ mod local_petal_cli_tests {
             )
             .is_ok()
         );
-    }
-}
-
-fn print_local_petal_consent(
-    meta: &bloom_petals::PetalMeta,
-    private_data_root: std::path::PathBuf,
-) {
-    let Some(manifest) = &meta.local_manifest else {
-        return;
-    };
-    println!("app_mount: apps/{}/", manifest.provides.mount);
-    if manifest
-        .provides
-        .caps
-        .iter()
-        .any(|cap| cap.as_str() == "store")
-    {
-        println!(
-            "private_store: {}",
-            private_data_root.join(&meta.hash).display()
-        );
-    }
-    if manifest
-        .provides
-        .caps
-        .iter()
-        .any(|cap| cap.as_str() == "sign")
-    {
-        println!("signing: may request daemon-mediated signatures");
-    }
-    if let Some(net) = &manifest.net
-        && !net.allow.is_empty()
-    {
-        println!("network:");
-        for rule in &net.allow {
-            let methods = rule
-                .effective_methods()
-                .into_iter()
-                .map(|method| method.as_str())
-                .collect::<Vec<_>>()
-                .join(",");
-            let paths = rule
-                .paths
-                .as_ref()
-                .map(|paths| paths.join(","))
-                .unwrap_or_else(|| "/*".to_string());
-            println!(
-                "  - host={} methods=[{}] paths=[{}]",
-                rule.host, methods, paths
-            );
-        }
-    }
-    if !manifest.endpoint.is_empty() {
-        println!("endpoints:");
-        for endpoint in &manifest.endpoint {
-            let mut flags = Vec::new();
-            if endpoint.write {
-                flags.push("write");
-            }
-            if endpoint.async_dispatch {
-                flags.push("async");
-            }
-            if endpoint.read_side_effecting {
-                flags.push("read_side_effecting");
-            }
-            if let Some(ttl) = endpoint.cache_ttl_ms {
-                println!(
-                    "  - {} cache_ttl_ms={} flags=[{}]",
-                    endpoint.path,
-                    ttl,
-                    flags.join(",")
-                );
-            } else {
-                println!("  - {} flags=[{}]", endpoint.path, flags.join(","));
-            }
-        }
     }
 }
 
