@@ -20,7 +20,10 @@ use crate::meta::{Capability, PetalMeta};
 use crate::policy::NetPolicy;
 use crate::registry::NameRegistry;
 use crate::store::{InstallResult, PetalStore};
-use crate::v2::{RouteAbi, RouteEntryKind, RouteIndex, RouteIndexRecord, RouteOp};
+use crate::v2::{
+    RouteAbi, RouteEntryKind, RouteIndex, RouteIndexRecord, RouteOp,
+    sign_intents_from_v2_manifest_toml,
+};
 use crate::vm::{DispatchOutput, PetalVm, RunOptions, RunOutput};
 use crate::{DispatchOp, DispatchRequest};
 
@@ -481,6 +484,11 @@ impl PetalRunner {
             Some(mask) => declared.intersect(&mask),
             None => declared,
         });
+        let declared_sign_intents = self.v2_sign_intents(&matched.hash)?;
+        opts.sign_intents = Some(match opts.sign_intents {
+            Some(mask) => declared_sign_intents.intersection(&mask).cloned().collect(),
+            None => declared_sign_intents,
+        });
         match matched.route.abi {
             RouteAbi::CompatPetalDispatchV1 => {
                 self.vm
@@ -507,6 +515,11 @@ impl PetalRunner {
     fn v2_net_policy(&self, hash: &str) -> Result<NetPolicy, PetalError> {
         let manifest = std::fs::read(self.store.package_path(hash)?.join("source/petal.toml"))?;
         NetPolicy::from_v2_manifest_toml(&manifest)
+    }
+
+    fn v2_sign_intents(&self, hash: &str) -> Result<BTreeSet<String>, PetalError> {
+        let manifest = std::fs::read(self.store.package_path(hash)?.join("source/petal.toml"))?;
+        sign_intents_from_v2_manifest_toml(&manifest)
     }
 }
 

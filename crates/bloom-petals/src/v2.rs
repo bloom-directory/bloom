@@ -68,12 +68,20 @@ struct PetalToml {
     name: String,
     #[serde(default)]
     caps: PetalCaps,
+    #[serde(default)]
+    sign: SignPolicy,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct PetalCaps {
     #[serde(default)]
     allowed: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SignPolicy {
+    #[serde(default)]
+    allowed_intents: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,6 +284,13 @@ impl PreparedAppPackage {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
+        let allowed_sign_intents = manifest
+            .sign
+            .allowed_intents
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        validate_sign_policy(&allowed_caps, &allowed_sign_intents)?;
         let route_files = route_records_from_files(&files, &app_root)?;
         if route_files.is_empty() {
             return Err(PetalError::InvalidWasm(format!(
@@ -295,12 +310,21 @@ impl PreparedAppPackage {
         for route in route_files {
             let source_path = route.source_path.to_string_lossy().replace('\\', "/");
             let source_bytes = file_bytes(&files, &source_path)?;
-            let validation = validate_route_wasm(&source_path, source_bytes, &allowed_caps)?;
+            let validation = validate_route_wasm(
+                &source_path,
+                source_bytes,
+                &allowed_caps,
+                &allowed_sign_intents,
+            )?;
             let artifact_path = format!("artifacts/routes/{}.wasm", route.route_id);
             let artifact_bytes =
                 if let Some(artifact_bytes) = optional_file_bytes(&files, &artifact_path) {
-                    let artifact_validation =
-                        validate_route_wasm(&artifact_path, artifact_bytes, &allowed_caps)?;
+                    let artifact_validation = validate_route_wasm(
+                        &artifact_path,
+                        artifact_bytes,
+                        &allowed_caps,
+                        &allowed_sign_intents,
+                    )?;
                     if artifact_validation != validation {
                         return Err(PetalError::InvalidWasm(format!(
                             "v2 package artifact {} ABI/caps do not match source route",
@@ -347,6 +371,26 @@ impl PreparedAppPackage {
         verify_prepared_package(self)?;
         write_package_tar(&self.files, writer)
     }
+}
+
+pub fn sign_intents_from_v2_manifest_toml(bytes: &[u8]) -> Result<BTreeSet<String>, PetalError> {
+    let manifest_toml = std::str::from_utf8(bytes)
+        .map_err(|_| PetalError::InvalidWasm("petal.toml is not utf-8".into()))?;
+    let manifest: PetalToml = toml::from_str(manifest_toml)?;
+    let allowed_caps = manifest
+        .caps
+        .allowed
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let allowed_sign_intents = manifest
+        .sign
+        .allowed_intents
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    validate_sign_policy(&allowed_caps, &allowed_sign_intents)?;
+    Ok(allowed_sign_intents)
 }
 
 pub fn build_app_package_dir(root: impl AsRef<Path>) -> Result<PreparedAppPackage, PetalError> {
@@ -937,6 +981,7 @@ fn validate_route_wasm(
     path: &str,
     wasm: &[u8],
     allowed_caps: &BTreeSet<String>,
+    allowed_sign_intents: &BTreeSet<String>,
 ) -> Result<RouteValidation, PetalError> {
     Validator::new()
         .validate_all(wasm)
@@ -1028,9 +1073,9 @@ fn validate_route_wasm(
                             import.module, import.name
                         )));
                     };
-                    if cap == "bloom:sign" {
+                    if cap == "bloom:sign" && allowed_sign_intents.is_empty() {
                         return Err(PetalError::InvalidWasm(format!(
-                            "{path}: compatibility route import {}.{} is unsupported until v2 sign-intent policy enforcement is implemented",
+                            "{path}: compatibility route import {}.{} requires [sign].allowed_intents",
                             import.module, import.name
                         )));
                     }
@@ -1128,9 +1173,9 @@ fn validate_route_wasm(
                         false
                     };
                     for cap in caps {
-                        if *cap == "bloom:sign" {
+                        if *cap == "bloom:sign" && allowed_sign_intents.is_empty() {
                             return Err(PetalError::InvalidWasm(format!(
-                                "{path}: component route import {name:?} is unsupported until v2 sign-intent policy enforcement is implemented"
+                                "{path}: component route import {name:?} requires [sign].allowed_intents"
                             )));
                         }
                         if !allowed_caps.contains(*cap) {
@@ -2366,6 +2411,38 @@ fn validate_app_name(name: &str) -> Result<(), PetalError> {
     }
 }
 
+fn validate_sign_policy(
+    allowed_caps: &BTreeSet<String>,
+    allowed_sign_intents: &BTreeSet<String>,
+) -> Result<(), PetalError> {
+    if allowed_caps.contains("bloom:sign") && allowed_sign_intents.is_empty() {
+        return Err(PetalError::InvalidWasm(
+            "v2 package cap bloom:sign requires [sign].allowed_intents".into(),
+        ));
+    }
+    for intent in allowed_sign_intents {
+        validate_sign_intent(intent)?;
+    }
+    Ok(())
+}
+
+fn validate_sign_intent(intent: &str) -> Result<(), PetalError> {
+    if intent.is_empty() || intent.len() > 128 {
+        return Err(PetalError::InvalidWasm(
+            "v2 sign intent must be 1..128 bytes".into(),
+        ));
+    }
+    if !intent
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':'))
+    {
+        return Err(PetalError::InvalidWasm(format!(
+            "v2 sign intent {intent:?} contains an unsupported byte"
+        )));
+    }
+    Ok(())
+}
+
 fn scan_routes(
     app_root: &Path,
     dir: &Path,
@@ -3110,17 +3187,15 @@ allowed = ["bloom:vfs.read"]
     }
 
     #[test]
-    fn v2_compat_sign_imports_are_rejected_until_intent_policy_exists() {
+    fn v2_compat_sign_imports_require_intent_policy() {
         let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
-            tmp.path(),
-            br#"schema = "bloom.petal.local-app.v2"
+        let manifest_without_policy = br#"schema = "bloom.petal.local-app.v2"
 name = "echo"
 [caps]
 allowed = ["bloom:sign"]
-"#,
-            &wat::parse_str(
-                r#"
+"#;
+        let wasm = wat::parse_str(
+            r#"
                 (module
                   (import "bloom.v1" "sign_hash"
                     (func $sign_hash (param i32 i32 i32 i32) (result i32)))
@@ -3128,12 +3203,32 @@ allowed = ["bloom:sign"]
                   (func (export "petal_alloc") (param i32) (result i32) (i32.const 1024))
                   (func (export "petal_dispatch") (param i32 i32) (result i64) (i64.const 0)))
                 "#,
-            )
-            .unwrap(),
-        );
+        )
+        .unwrap();
+        write_v2_package_with_manifest_and_route(tmp.path(), manifest_without_policy, &wasm);
 
         let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("sign-intent policy"));
+        assert!(err.to_string().contains("[sign].allowed_intents"));
+
+        let allowed = tempfile::tempdir().unwrap();
+        write_v2_package_with_manifest_and_route(
+            allowed.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+[caps]
+allowed = ["bloom:sign"]
+
+[sign]
+allowed_intents = ["test.intent"]
+"#,
+            &wasm,
+        );
+
+        let package = PreparedAppPackage::from_dir(allowed.path()).unwrap();
+        assert_eq!(
+            package.route_index.routes[0].install_metadata.required_caps,
+            vec!["bloom:sign".to_string()]
+        );
     }
 
     #[test]
@@ -3406,7 +3501,7 @@ allowed = ["bloom:http"]
     }
 
     #[test]
-    fn v2_component_sign_imports_are_rejected_until_intent_policy_exists() {
+    fn v2_component_sign_imports_require_intent_policy() {
         let tmp = tempfile::tempdir().unwrap();
         write_v2_package_with_manifest_and_route(
             tmp.path(),
@@ -3419,7 +3514,27 @@ allowed = ["bloom:sign"]
         );
 
         let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("sign-intent policy"));
+        assert!(err.to_string().contains("[sign].allowed_intents"));
+
+        let allowed = tempfile::tempdir().unwrap();
+        write_v2_package_with_manifest_and_route(
+            allowed.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+[caps]
+allowed = ["bloom:sign"]
+
+[sign]
+allowed_intents = ["test.intent"]
+"#,
+            route_component_sign(),
+        );
+
+        let package = PreparedAppPackage::from_dir(allowed.path()).unwrap();
+        assert_eq!(
+            package.route_index.routes[0].install_metadata.required_caps,
+            vec!["bloom:sign".to_string()]
+        );
     }
 
     #[tokio::test]

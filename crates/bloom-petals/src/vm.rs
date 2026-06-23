@@ -66,6 +66,7 @@ pub struct StoreData {
     caps: BTreeSet<Capability>,
     petal_hash: String,
     net_policy: NetPolicy,
+    sign_intents: Option<BTreeSet<String>>,
     http_response_cap: usize,
     private_store: Option<PrivateStore>,
 }
@@ -78,6 +79,9 @@ pub struct RunOptions {
     /// this is intersected with the manifest-declared policy and can only
     /// narrow it. Direct VM callers that omit it get deny-all.
     pub net_policy: Option<NetPolicy>,
+    /// Optional signing intent allow-list. `None` preserves legacy/direct VM
+    /// behavior; v2 package dispatch sets this from `[sign].allowed_intents`.
+    pub sign_intents: Option<BTreeSet<String>>,
     pub http_response_cap: usize,
     pub private_store_root: Option<PathBuf>,
 }
@@ -88,6 +92,7 @@ impl Default for RunOptions {
             fuel: DEFAULT_FUEL,
             memory_pages: DEFAULT_MEMORY_PAGES,
             net_policy: None,
+            sign_intents: None,
             http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,
             private_store_root: None,
         }
@@ -184,6 +189,7 @@ impl PetalVm {
                 caps,
                 petal_hash: petal_hash.to_string(),
                 net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
+                sign_intents: opts.sign_intents.clone(),
                 http_response_cap: opts.http_response_cap,
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
@@ -248,6 +254,7 @@ impl PetalVm {
                 caps,
                 petal_hash: petal_hash.to_string(),
                 net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
+                sign_intents: opts.sign_intents.clone(),
                 http_response_cap: opts.http_response_cap,
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
@@ -301,6 +308,7 @@ impl PetalVm {
                 caps,
                 petal_hash: petal_hash.to_string(),
                 net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
+                sign_intents: opts.sign_intents.clone(),
                 http_response_cap: opts.http_response_cap,
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
@@ -929,6 +937,20 @@ async fn component_sign_hash(
         Ok(intent) => intent,
         Err(e) => return set_component_result(results, component_host_err(e)),
     };
+    if !sign_intent_allowed(store.data(), &intent) {
+        tracing::info!(
+            target: "bloom_petals::vm",
+            petal = %store.data().petal_hash,
+            intent = %intent,
+            "component sign_hash denied by sign intent policy"
+        );
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied(format!(
+                "sign intent {intent:?} is not allowed"
+            ))),
+        );
+    }
     let host = store.data().host.clone();
     match host
         .sign_hash(SignRequest {
@@ -1080,6 +1102,13 @@ fn component_err(message: impl Into<String>) -> ComponentVal {
 
 fn component_host_err(err: HostError) -> ComponentVal {
     component_err(err.to_string())
+}
+
+fn sign_intent_allowed(data: &StoreData, intent: &str) -> bool {
+    data.sign_intents
+        .as_ref()
+        .map(|allowed| allowed.contains(intent))
+        .unwrap_or(true)
 }
 
 fn component_string(val: &ComponentVal, label: &str) -> Result<String, HostError> {
@@ -1614,6 +1643,19 @@ fn link_bloom_v1_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
                     Ok(req) => req,
                     Err(e) => return e.as_wasm_code(),
                 };
+                if !sign_intent_allowed(caller.data(), &req.purpose) {
+                    tracing::info!(
+                        target: "bloom_petals::vm",
+                        petal = %caller.data().petal_hash,
+                        intent = %req.purpose,
+                        "sign_hash denied by sign intent policy"
+                    );
+                    return HostError::Denied(format!(
+                        "sign intent {:?} is not allowed",
+                        req.purpose
+                    ))
+                    .as_wasm_code();
+                }
                 let host = caller.data().host.clone();
                 match host.sign_hash(req).await {
                     Ok(sig) if sig.len() == 65 => {
@@ -2720,6 +2762,37 @@ paths = ["/markets*"]
     }
 
     #[tokio::test]
+    async fn sign_hash_denied_by_sign_intent_policy_before_host_call() {
+        let req = encode_sign_request(&SignRequest {
+            wallet: "0xabc".into(),
+            hash32: [9u8; 32],
+            purpose: "polymarket-order".into(),
+        });
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::Sign);
+        let opts = RunOptions {
+            sign_intents: Some(BTreeSet::from(["polymarket-auth".to_string()])),
+            ..RunOptions::default()
+        };
+        let vm = PetalVm::new().unwrap();
+        let host = Arc::new(MockHost::default());
+        let out = vm
+            .run(
+                &wat(&sign_probe(&req)),
+                Vec::new(),
+                caps,
+                host.clone(),
+                VALID_HASH,
+                PetalMode::Local,
+                opts,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, vec![denied_byte()]);
+        assert!(host.sign_calls.lock().is_empty());
+    }
+
+    #[tokio::test]
     async fn store_put_get_uses_private_petal_directory() {
         let tmp = TempDir::new().unwrap();
         let mut caps = BTreeSet::new();
@@ -3173,6 +3246,22 @@ paths = ["/status"]
         assert_component_ok_bytes(&sign[0], &[7u8; 65]);
         assert_eq!(host.sign_calls.lock().len(), 1);
 
+        store.data_mut().sign_intents = Some(BTreeSet::from(["test.allowed".to_string()]));
+        let mut denied_sign = vec![ComponentVal::Bool(false)];
+        component_sign_hash(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("alice".into()),
+                component_bytes(vec![3u8; 32]),
+                ComponentVal::String("test.denied".into()),
+            ],
+            &mut denied_sign,
+        )
+        .await
+        .unwrap();
+        assert_component_err_contains(&denied_sign[0], "not allowed");
+        assert_eq!(host.sign_calls.lock().len(), 1);
+
         let mut read = vec![ComponentVal::Bool(false)];
         component_vfs_read(
             store.as_context_mut(),
@@ -3322,6 +3411,7 @@ paths = ["/status"]
                 caps,
                 petal_hash: VALID_HASH.into(),
                 net_policy,
+                sign_intents: None,
                 http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,
                 private_store,
             },
