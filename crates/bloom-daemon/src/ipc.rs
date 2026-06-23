@@ -567,7 +567,8 @@ impl IpcServer {
             name_for_hash.entry(hash.clone()).or_insert(name.clone());
         }
         let hashes = runner.store().list_hashes()?;
-        let mut out = Vec::with_capacity(hashes.len());
+        let package_hashes = runner.store().list_package_hashes()?;
+        let mut out = Vec::with_capacity(hashes.len() + package_hashes.len());
         for hash in hashes {
             let meta = runner.store().load_meta(&hash)?;
             out.push(json!({
@@ -577,6 +578,23 @@ impl IpcServer {
                 "caps": meta.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
                 "installed_at_ms": meta.installed_at_ms,
                 "mode": meta.mode_str(),
+            }));
+        }
+        for hash in package_hashes {
+            let meta = runner.store().load_meta(&hash)?;
+            let app_mount = meta
+                .local_app
+                .as_ref()
+                .map(|app| format!("apps/{}/", app.name));
+            out.push(json!({
+                "hash": meta.hash,
+                "size": meta.size,
+                "name": name_for_hash.get(&meta.hash).cloned(),
+                "caps": meta.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+                "installed_at_ms": meta.installed_at_ms,
+                "mode": meta.mode_str(),
+                "app_mount": app_mount,
+                "local_app": meta.local_app,
             }));
         }
         Ok(Value::Array(out))

@@ -29,10 +29,22 @@ copy_polymarket_route() {
   cp "$wasm" "$out/app/polymarket/$rel"
 }
 
+mark_polymarket_write_route() {
+  local out="$1"
+  local rel="$2"
+  local sidecar="$out/app/polymarket/${rel%.wasm}.route.toml"
+  cat >"$sidecar" <<EOF
+abi = "compat-petal-dispatch"
+component = "app/polymarket/$rel"
+ops = ["lookup", "read", "write"]
+EOF
+}
+
 build_polymarket() {
   local src="$root/polymarket"
   local out="$build_root/polymarket"
-  local wasm="$root/../../target/wasm32-wasip1/release/bloom_local_petal_polymarket.wasm"
+  local target_root="${CARGO_TARGET_DIR:-$root/../../target}"
+  local wasm="$target_root/wasm32-wasip1/release/bloom_local_petal_polymarket.wasm"
 
   cargo build -p bloom-local-petal-polymarket --target wasm32-wasip1 --release
 
@@ -78,6 +90,13 @@ build_polymarket() {
   copy_polymarket_route "$out" "$wasm" 'trade/[wallet]/receipts/$list.wasm'
   copy_polymarket_route "$out" "$wasm" 'trade/[wallet]/receipts/[id]/receipt.json.wasm'
   copy_polymarket_route "$out" "$wasm" 'trade/[wallet]/receipts/[id]/cancel.wasm'
+
+  mark_polymarket_write_route "$out" 'onboard/[wallet]/begin.wasm'
+  mark_polymarket_write_route "$out" 'fund/[wallet]/new.wasm'
+  mark_polymarket_write_route "$out" 'trade/[wallet]/new.wasm'
+  mark_polymarket_write_route "$out" 'trade/[wallet]/drafts/[id]/revalidate.wasm'
+  mark_polymarket_write_route "$out" 'trade/[wallet]/drafts/[id]/post.wasm'
+  mark_polymarket_write_route "$out" 'trade/[wallet]/receipts/[id]/cancel.wasm'
 
   echo "built $out"
 }

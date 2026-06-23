@@ -75,7 +75,7 @@ impl Handler for PetalsHandler {
             [mode_seg, hash, rest @ ..] if is_mode_dir(mode_seg) && is_valid_hex_hash(hash) => {
                 let expected_mode = mode_for_seg(mode_seg);
                 let meta = self.store.load_meta(hash).map_err(map_err)?;
-                if meta.mode != expected_mode {
+                if meta.mode != expected_mode || meta.local_app.is_some() {
                     return Err(HandlerError::NotFound(path.to_string_path()));
                 }
                 match rest {
@@ -101,7 +101,7 @@ impl Handler for PetalsHandler {
                     return Err(HandlerError::NotFound(path.to_string_path()));
                 };
                 let meta = self.store.load_meta(&hash).map_err(map_err)?;
-                if meta.mode != expected_mode {
+                if meta.mode != expected_mode || meta.local_app.is_some() {
                     return Err(HandlerError::NotFound(path.to_string_path()));
                 }
                 Ok(Entry::symlink(name, &hash))
@@ -126,7 +126,7 @@ impl Handler for PetalsHandler {
             [mode_seg, hash, child] if is_mode_dir(mode_seg) && is_valid_hex_hash(hash) => {
                 let expected_mode = mode_for_seg(mode_seg);
                 let meta = self.store.load_meta(hash).map_err(map_err)?;
-                if meta.mode != expected_mode {
+                if meta.mode != expected_mode || meta.local_app.is_some() {
                     return Err(HandlerError::NotFound(path.to_string_path()));
                 }
                 match child.as_str() {
@@ -199,7 +199,7 @@ impl Handler for PetalsHandler {
             [mode_seg, hash] if is_mode_dir(mode_seg) && is_valid_hex_hash(hash) => {
                 let expected_mode = mode_for_seg(mode_seg);
                 let meta = self.store.load_meta(hash).map_err(map_err)?;
-                if meta.mode != expected_mode {
+                if meta.mode != expected_mode || meta.local_app.is_some() {
                     return Err(HandlerError::NotFound(path.to_string_path()));
                 }
                 let mut wasm = Entry::read_only_file("wasm");

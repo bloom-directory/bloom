@@ -173,6 +173,8 @@ struct RouteSidecarToml {
     component: String,
     #[serde(default)]
     imports: Vec<String>,
+    #[serde(default)]
+    ops: Vec<RouteOp>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -198,6 +200,7 @@ struct RouteSidecar {
     abi: RouteSidecarAbi,
     component: String,
     imports: Vec<String>,
+    ops: Vec<RouteOp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -501,7 +504,12 @@ impl PreparedAppPackage {
                 source_validation
             };
             let (kind, mut ops) = route_kind_and_ops(&source_path);
-            let install_metadata = install_metadata_for_route(
+            if let Some(sidecar) = &sidecar
+                && !sidecar.ops.is_empty()
+            {
+                ops = sidecar.ops.clone();
+            }
+            let mut install_metadata = install_metadata_for_route(
                 &hash,
                 &manifest.name,
                 &route,
@@ -511,6 +519,9 @@ impl PreparedAppPackage {
                 &allowed_caps,
                 &allowed_sign_intents,
             )?;
+            if kind == RouteEntryKind::File && ops.contains(&RouteOp::Write) {
+                install_metadata.mode |= 0o222;
+            }
             if kind == RouteEntryKind::File
                 && install_metadata.mode & 0o222 != 0
                 && !ops.contains(&RouteOp::Write)
@@ -1105,7 +1116,11 @@ fn route_sidecar(
     let toml = std::str::from_utf8(bytes)
         .map_err(|_| PetalError::InvalidWasm(format!("v2 route sidecar {path} is not utf-8")))?;
     let parsed: RouteSidecarToml = toml::from_str(toml)?;
-    validate_route_sidecar_path(&path, &parsed.component, true)?;
+    if parsed.abi == RouteSidecarAbi::CompatPetalDispatch {
+        validate_route_sidecar_wasm_path(&path, &parsed.component)?;
+    } else {
+        validate_route_sidecar_path(&path, &parsed.component, true)?;
+    }
     for import in &parsed.imports {
         validate_route_sidecar_path(&path, import, false)?;
     }
@@ -1115,6 +1130,7 @@ fn route_sidecar(
         abi: parsed.abi,
         component: parsed.component,
         imports: parsed.imports,
+        ops: parsed.ops,
     }))
 }
 
@@ -1123,12 +1139,7 @@ fn validate_route_sidecar_path(
     rel: &str,
     primary: bool,
 ) -> Result<(), PetalError> {
-    validate_package_path(rel)?;
-    if !rel.ends_with(".wasm") {
-        return Err(PetalError::InvalidWasm(format!(
-            "v2 route sidecar {sidecar_path} path {rel:?} must point to a .wasm component"
-        )));
-    }
+    validate_route_sidecar_wasm_path(sidecar_path, rel)?;
     let allowed = if primary {
         rel.starts_with("modules/") || rel.starts_with("components/")
     } else {
@@ -1142,6 +1153,16 @@ fn validate_route_sidecar_path(
             } else {
                 "components/"
             }
+        )));
+    }
+    Ok(())
+}
+
+fn validate_route_sidecar_wasm_path(sidecar_path: &str, rel: &str) -> Result<(), PetalError> {
+    validate_package_path(rel)?;
+    if !rel.ends_with(".wasm") {
+        return Err(PetalError::InvalidWasm(format!(
+            "v2 route sidecar {sidecar_path} path {rel:?} must point to a .wasm component"
         )));
     }
     Ok(())
@@ -3999,6 +4020,7 @@ imports = ["components/missing.wasm"]
             abi: RouteSidecarAbi::Component,
             component: "modules/root.wasm".into(),
             imports: vec!["components/helper.wasm".into()],
+            ops: Vec::new(),
         };
 
         let composed = route_sidecar_artifact(&files, "r000001", &sidecar).unwrap();
