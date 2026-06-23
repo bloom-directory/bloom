@@ -3581,9 +3581,13 @@ paths = ["/markets*"]
         ]);
 
         let mut denied = vec![ComponentVal::Bool(false)];
-        component_chain_call(store.as_context_mut(), &[req.clone()], &mut denied)
-            .await
-            .unwrap();
+        component_chain_call(
+            store.as_context_mut(),
+            std::slice::from_ref(&req),
+            &mut denied,
+        )
+        .await
+        .unwrap();
         assert_component_err_contains(&denied[0], "denied");
         assert!(host.chain_calls.lock().is_empty());
 
@@ -3778,11 +3782,12 @@ paths = ["/status"]
             err.to_string().contains("component route read"),
             "unexpected component error: {err}"
         );
-        let calls = host.http_calls.lock();
-        assert_eq!(calls.len(), 1, "component error before host call: {err}");
-        assert_eq!(calls[0].method, "GET");
-        assert_eq!(calls[0].url, "https://api.example.com/status");
-        drop(calls);
+        {
+            let calls = host.http_calls.lock();
+            assert_eq!(calls.len(), 1, "component error before host call: {err}");
+            assert_eq!(calls[0].method, "GET");
+            assert_eq!(calls[0].url, "https://api.example.com/status");
+        }
 
         let denied_host = Arc::new(MockHost::default());
         let err = vm

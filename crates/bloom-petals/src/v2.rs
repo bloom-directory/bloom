@@ -2848,7 +2848,7 @@ fn is_entry_kind(ty: &ComponentValType, types: &[ComponentTypeEntry<'_>], depth:
     with_defined_type(ty, types, depth, |defined, _types, _depth| {
         matches!(
             defined,
-            ComponentDefinedType::Enum(tags) if tags.as_ref() == &["dir", "file", "symlink"]
+            ComponentDefinedType::Enum(tags) if tags.as_ref() == ["dir", "file", "symlink"]
         )
     })
 }
@@ -4732,7 +4732,7 @@ name = "echo"
         let wasm = route_component_http();
 
         let missing = tempfile::tempdir().unwrap();
-        write_v2_package_with_route(missing.path(), &wasm);
+        write_v2_package_with_route(missing.path(), wasm);
         let err = PreparedAppPackage::from_dir(missing.path()).unwrap_err();
         assert!(
             err.to_string()
@@ -4747,7 +4747,7 @@ name = "echo"
 [caps]
 allowed = ["bloom:http"]
 "#,
-            &wasm,
+            wasm,
         );
         let package = PreparedAppPackage::from_dir(allowed.path()).unwrap();
         assert_eq!(
