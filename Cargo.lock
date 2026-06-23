@@ -2237,6 +2237,7 @@ dependencies = [
  "bloom-mempool",
  "bloom-mount",
  "bloom-objects",
+ "bloom-petal-manifest",
  "bloom-petals",
  "bloom-polymarket",
  "bloom-prices",

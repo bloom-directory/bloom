@@ -54,6 +54,8 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+const PETAL_HTTP_MAX_REDIRECTS: usize = 5;
+
 #[derive(Debug, Error)]
 pub enum DaemonError {
     #[error("home: {0}")]
@@ -175,114 +177,167 @@ impl PetalHost for DaemonPetalHost {
         policy: NetPolicy,
         max_response_bytes: usize,
     ) -> Result<HttpResponse, HostError> {
-        if let Err(e) = policy.check(&req.method, &req.url) {
-            self.audit_http_fetch(
-                &req.method,
-                &req.url,
-                "denied",
-                None,
-                None,
-                Some(&e.to_string()),
-            );
-            return Err(e);
-        }
-        let method = reqwest::Method::from_bytes(req.method.as_bytes()).map_err(|e| {
-            let err = HostError::Invalid(format!("http method: {e}"));
-            self.audit_http_fetch(
-                &req.method,
-                &req.url,
-                "error",
-                None,
-                None,
-                Some(&err.to_string()),
-            );
-            err
-        })?;
-        let mut builder = self.http.request(method, &req.url);
-        for (name, value) in req.headers {
-            builder = builder.header(name.as_str(), value.as_str());
-        }
-        let resp = builder.body(req.body).send().await.map_err(|e| {
-            let err = HostError::Backend(format!("http_fetch send: {e}"));
-            self.audit_http_fetch(
-                &req.method,
-                &req.url,
-                "error",
-                None,
-                None,
-                Some(&err.to_string()),
-            );
-            err
-        })?;
-        let status = resp.status().as_u16();
-        let headers = resp
-            .headers()
-            .iter()
-            .map(|(name, value)| {
-                (
-                    name.as_str().to_string(),
-                    value.to_str().unwrap_or_default().to_string(),
-                )
-            })
-            .collect();
-        if resp.content_length().is_some_and(|len| {
-            usize::try_from(len)
-                .map(|len| len > max_response_bytes)
-                .unwrap_or(true)
-        }) {
-            let err = HostError::Backend("http response too large".into());
-            self.audit_http_fetch(
-                &req.method,
-                &req.url,
-                "error",
-                Some(status),
-                None,
-                Some(&err.to_string()),
-            );
-            return Err(err);
-        }
-        let mut body = Vec::new();
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| {
-                let err = HostError::Backend(format!("http_fetch body: {e}"));
-                self.audit_http_fetch(
-                    &req.method,
-                    &req.url,
-                    "error",
-                    Some(status),
-                    Some(body.len()),
-                    Some(&err.to_string()),
-                );
+        let mut method = req.method;
+        let mut url = req.url;
+        let mut body = req.body;
+        let mut headers = req.headers;
+        for redirect_count in 0..=PETAL_HTTP_MAX_REDIRECTS {
+            if let Err(e) = policy.check(&method, &url) {
+                self.audit_http_fetch(&method, &url, "denied", None, None, Some(&e.to_string()));
+                return Err(e);
+            }
+            let reqwest_method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| {
+                let err = HostError::Invalid(format!("http method: {e}"));
+                self.audit_http_fetch(&method, &url, "error", None, None, Some(&err.to_string()));
                 err
             })?;
-            if body.len().saturating_add(chunk.len()) > max_response_bytes {
+            let mut builder = self.http.request(reqwest_method, &url);
+            for (name, value) in &headers {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+            let resp = builder.body(body.clone()).send().await.map_err(|e| {
+                let err = HostError::Backend(format!("http_fetch send: {e}"));
+                self.audit_http_fetch(&method, &url, "error", None, None, Some(&err.to_string()));
+                err
+            })?;
+            let status = resp.status().as_u16();
+            if resp.status().is_redirection() {
+                let location = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let Some(location) = location else {
+                    let err = HostError::Backend("http redirect missing Location".into());
+                    self.audit_http_fetch(
+                        &method,
+                        &url,
+                        "error",
+                        Some(status),
+                        None,
+                        Some(&err.to_string()),
+                    );
+                    return Err(err);
+                };
+                if redirect_count == PETAL_HTTP_MAX_REDIRECTS {
+                    let err = HostError::Backend("http redirect limit exceeded".into());
+                    self.audit_http_fetch(
+                        &method,
+                        &url,
+                        "error",
+                        Some(status),
+                        None,
+                        Some(&err.to_string()),
+                    );
+                    return Err(err);
+                }
+                let next_url = match resolve_redirect_target(&url, &location) {
+                    Ok(url) => url,
+                    Err(e) => {
+                        self.audit_http_fetch(
+                            &method,
+                            &url,
+                            "error",
+                            Some(status),
+                            None,
+                            Some(&e.to_string()),
+                        );
+                        return Err(e);
+                    }
+                };
+                let next_method = redirect_method(&method, status);
+                if let Err(e) = policy.check(&next_method, &next_url) {
+                    self.audit_http_fetch(
+                        &method,
+                        &url,
+                        "denied_redirect",
+                        Some(status),
+                        None,
+                        Some(&e.to_string()),
+                    );
+                    return Err(e);
+                }
+                if let Err(e) =
+                    prepare_redirect_request(&url, &next_url, &next_method, &mut headers, &mut body)
+                {
+                    self.audit_http_fetch(
+                        &method,
+                        &url,
+                        "denied_redirect",
+                        Some(status),
+                        None,
+                        Some(&e.to_string()),
+                    );
+                    return Err(e);
+                }
+                self.audit_http_fetch(&method, &url, "redirect", Some(status), None, None);
+                method = next_method;
+                url = next_url;
+                continue;
+            }
+            let headers = resp
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.as_str().to_string(),
+                        value.to_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+            if resp.content_length().is_some_and(|len| {
+                usize::try_from(len)
+                    .map(|len| len > max_response_bytes)
+                    .unwrap_or(true)
+            }) {
                 let err = HostError::Backend("http response too large".into());
                 self.audit_http_fetch(
-                    &req.method,
-                    &req.url,
+                    &method,
+                    &url,
                     "error",
                     Some(status),
-                    Some(body.len().saturating_add(chunk.len())),
+                    None,
                     Some(&err.to_string()),
                 );
                 return Err(err);
             }
-            body.extend_from_slice(&chunk);
+            let mut body = Vec::new();
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|e| {
+                    let err = HostError::Backend(format!("http_fetch body: {e}"));
+                    self.audit_http_fetch(
+                        &method,
+                        &url,
+                        "error",
+                        Some(status),
+                        Some(body.len()),
+                        Some(&err.to_string()),
+                    );
+                    err
+                })?;
+                if body.len().saturating_add(chunk.len()) > max_response_bytes {
+                    let err = HostError::Backend("http response too large".into());
+                    self.audit_http_fetch(
+                        &method,
+                        &url,
+                        "error",
+                        Some(status),
+                        Some(body.len().saturating_add(chunk.len())),
+                        Some(&err.to_string()),
+                    );
+                    return Err(err);
+                }
+                body.extend_from_slice(&chunk);
+            }
+            self.audit_http_fetch(&method, &url, "ok", Some(status), Some(body.len()), None);
+            return Ok(HttpResponse {
+                status,
+                headers,
+                body,
+            });
         }
-        self.audit_http_fetch(
-            &req.method,
-            &req.url,
-            "ok",
-            Some(status),
-            Some(body.len()),
-            None,
-        );
-        Ok(HttpResponse {
-            status,
-            headers,
-            body,
-        })
+        unreachable!("bounded redirect loop returns before exhausting iterator")
     }
 
     async fn sign_hash(&self, req: SignRequest) -> Result<Vec<u8>, HostError> {
@@ -306,6 +361,53 @@ impl PetalHost for DaemonPetalHost {
         self.audit_sign_hash(&req, "ok", None);
         Ok(sig.as_bytes().to_vec())
     }
+}
+
+fn resolve_redirect_target(current_url: &str, location: &str) -> Result<String, HostError> {
+    let base = url::Url::parse(current_url).map_err(|e| HostError::Invalid(format!("url: {e}")))?;
+    base.join(location)
+        .map(|url| url.to_string())
+        .map_err(|e| HostError::Invalid(format!("redirect location: {e}")))
+}
+
+fn redirect_method(method: &str, status: u16) -> String {
+    let upper = method.to_ascii_uppercase();
+    if matches!(status, 301 | 302 | 303) && upper != "GET" && upper != "HEAD" {
+        "GET".into()
+    } else {
+        upper
+    }
+}
+
+fn prepare_redirect_request(
+    current_url: &str,
+    next_url: &str,
+    next_method: &str,
+    headers: &mut Vec<(String, String)>,
+    body: &mut Vec<u8>,
+) -> Result<(), HostError> {
+    let same_origin = same_origin(current_url, next_url)?;
+    let bodyless = matches!(next_method, "GET" | "HEAD");
+    if !same_origin {
+        headers.clear();
+        if !bodyless && !body.is_empty() {
+            return Err(HostError::Denied(
+                "cross-origin redirect would replay request body".into(),
+            ));
+        }
+    }
+    if bodyless {
+        body.clear();
+    }
+    Ok(())
+}
+
+fn same_origin(a: &str, b: &str) -> Result<bool, HostError> {
+    let a = url::Url::parse(a).map_err(|e| HostError::Invalid(format!("url: {e}")))?;
+    let b = url::Url::parse(b).map_err(|e| HostError::Invalid(format!("url: {e}")))?;
+    Ok(a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default())
 }
 
 fn audit_http_target(raw: &str) -> serde_json::Value {
@@ -1500,6 +1602,118 @@ mod tests {
         assert_eq!(records[1].kind, "petal.sign_hash");
         assert_eq!(records[1].wallet.as_deref(), Some("alice"));
         assert_eq!(records[1].data["outcome"], "ok");
+    }
+
+    #[test]
+    fn petal_http_redirect_targets_are_resolved_against_current_url() {
+        assert_eq!(
+            resolve_redirect_target("https://api.example.com/a/b?x=1", "../next").unwrap(),
+            "https://api.example.com/next"
+        );
+        assert_eq!(
+            resolve_redirect_target(
+                "https://api.example.com/a/b",
+                "https://cdn.example.com/final"
+            )
+            .unwrap(),
+            "https://cdn.example.com/final"
+        );
+        assert!(resolve_redirect_target("https://api.example.com/a/b", "http://[bad").is_err());
+    }
+
+    #[test]
+    fn petal_http_redirect_targets_are_revalidated_by_policy() {
+        let manifest = bloom_petal_manifest::local::parse_local_manifest_toml(
+            br#"
+schema = "bloom.petal.local.v1"
+name = "redirector"
+
+[provides]
+kind = "vfs"
+mount = "redirector"
+caps = ["net.fetch"]
+
+[[net.allow]]
+host = "api.example.com"
+methods = ["GET"]
+paths = ["/start", "/next"]
+"#,
+        )
+        .unwrap();
+        let policy = NetPolicy::from_manifest(&manifest);
+
+        let allowed = resolve_redirect_target("https://api.example.com/start", "/next").unwrap();
+        assert!(policy.check("GET", &allowed).is_ok());
+
+        let denied =
+            resolve_redirect_target("https://api.example.com/start", "https://evil.example/next")
+                .unwrap();
+        assert!(matches!(
+            policy.check("GET", &denied),
+            Err(HostError::Denied(_))
+        ));
+    }
+
+    #[test]
+    fn petal_http_redirect_method_preserves_or_converts_by_status() {
+        assert_eq!(redirect_method("POST", 301), "GET");
+        assert_eq!(redirect_method("POST", 302), "GET");
+        assert_eq!(redirect_method("POST", 307), "POST");
+        assert_eq!(redirect_method("patch", 308), "PATCH");
+        assert_eq!(redirect_method("POST", 303), "GET");
+        assert_eq!(redirect_method("HEAD", 303), "HEAD");
+    }
+
+    #[test]
+    fn petal_http_cross_origin_redirect_strips_headers_and_blocks_body_replay() {
+        let mut headers = vec![
+            ("Authorization".into(), "Bearer secret".into()),
+            ("X-CLOB-Api-Key".into(), "secret".into()),
+        ];
+        let mut body = b"secret-body".to_vec();
+        let err = prepare_redirect_request(
+            "https://api.example.com/start",
+            "https://cdn.example.com/final",
+            "POST",
+            &mut headers,
+            &mut body,
+        )
+        .unwrap_err();
+        assert!(matches!(err, HostError::Denied(_)));
+        assert!(headers.is_empty());
+        assert_eq!(body, b"secret-body");
+
+        let mut headers = vec![("Authorization".into(), "Bearer secret".into())];
+        let mut body = b"secret-body".to_vec();
+        prepare_redirect_request(
+            "https://api.example.com/start",
+            "https://cdn.example.com/final",
+            "GET",
+            &mut headers,
+            &mut body,
+        )
+        .unwrap();
+        assert!(headers.is_empty());
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn petal_http_same_origin_redirect_preserves_headers_but_clears_get_body() {
+        let mut headers = vec![("Authorization".into(), "Bearer secret".into())];
+        let mut body = b"secret-body".to_vec();
+        prepare_redirect_request(
+            "https://api.example.com/start",
+            "https://api.example.com/final",
+            "GET",
+            &mut headers,
+            &mut body,
+        )
+        .unwrap();
+        assert_eq!(
+            headers,
+            vec![("Authorization".into(), "Bearer secret".into())]
+        );
+        assert!(body.is_empty());
     }
 
     /// A pre-existing watch spec on disk should be loaded into the

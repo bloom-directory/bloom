@@ -62,3 +62,4 @@ reqwest = { workspace = true, features = ["stream"] }
 [dev-dependencies]
 tempfile.workspace = true
 bloom-test-util = { path = "../bloom-test-util" }
+bloom-petal-manifest.workspace = true
