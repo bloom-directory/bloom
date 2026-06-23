@@ -190,6 +190,12 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         .unwrap();
     let market: serde_json::Value = serde_json::from_slice(&market).unwrap();
     assert_eq!(market["slug"], "test-market");
+    let search = router
+        .read(&VfsPath::parse("polymarket/search/test-market").unwrap())
+        .await
+        .unwrap();
+    let search_text = String::from_utf8(search).unwrap();
+    assert!(search_text.contains("Search Result"));
 
     let positions = router
         .read(&VfsPath::parse("polymarket/positions/alice/positions.json").unwrap())
@@ -197,6 +203,18 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         .unwrap();
     let positions_text = String::from_utf8(positions).unwrap();
     assert!(positions_text.contains("Example Position"));
+    let trades = router
+        .read(&VfsPath::parse("polymarket/positions/alice/trades.json").unwrap())
+        .await
+        .unwrap();
+    let trades_text = String::from_utf8(trades).unwrap();
+    assert!(trades_text.contains(r#""side": "BUY""#));
+    let activity = router
+        .read(&VfsPath::parse("polymarket/positions/alice/activity.json").unwrap())
+        .await
+        .unwrap();
+    let activity_text = String::from_utf8(activity).unwrap();
+    assert!(activity_text.contains("Example Activity"));
     let alias_positions = router
         .read(&VfsPath::parse("polymarket/positions/0xalice/positions.json").unwrap())
         .await
@@ -990,7 +1008,10 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         "polymarket/markets/test-market/market.json",
         "polymarket/markets/test-market/book.json",
         "polymarket/markets/test-market/prices.json",
+        "polymarket/search/test-market",
         "polymarket/positions/alice/positions.json",
+        "polymarket/positions/alice/trades.json",
+        "polymarket/positions/alice/activity.json",
         "polymarket/positions/0xalice/positions.json",
         "polymarket/onboard/alice/begin",
         "polymarket/onboard/alice/status.json",
@@ -1365,8 +1386,20 @@ max_price = "0.20"
             br#"{"slug":"test-market","conditionId":"cond","clobTokenIds":["111","222"],"outcomes":["Yes","No"],"active":true,"closed":false,"enableOrderBook":true}"#.to_vec(),
         );
         host.responses.insert(
+            "GET https://gamma-api.polymarket.com/public-search?q=test-market".into(),
+            br#"{"markets":[{"slug":"test-market","question":"Search Result"}]}"#.to_vec(),
+        );
+        host.responses.insert(
             "GET https://data-api.polymarket.com/positions?user=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".into(),
             br#"[{"title":"Example Position","asset":"111","conditionId":"cond","outcome":"Yes"}]"#.to_vec(),
+        );
+        host.responses.insert(
+            "GET https://data-api.polymarket.com/trades?user=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".into(),
+            br#"[{"asset":"111","conditionId":"cond","side":"BUY","size":1.0,"price":0.42,"timestamp":1710000000}]"#.to_vec(),
+        );
+        host.responses.insert(
+            "GET https://data-api.polymarket.com/activity?user=0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".into(),
+            br#"{"activity":[{"title":"Example Activity","asset":"111"}]}"#.to_vec(),
         );
         host.responses.insert(
             "GET https://data-api.polymarket.com/positions?user=0x0000000000000000000000000000000000000001".into(),
