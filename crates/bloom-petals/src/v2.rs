@@ -15,6 +15,7 @@ use wasmparser::{ExternalKind, FuncType, Parser, Payload, TypeRef, ValType, Vali
 use crate::error::PetalError;
 
 pub const ROUTE_INDEX_SCHEMA: &str = "bloom.petal.route-index.v1";
+pub const BUILD_MANIFEST_SCHEMA: &str = "bloom.petal.build-manifest.v1";
 const PACKAGE_DIGEST_PREFIX: &[u8] = b"bloom.petal.package.v2\0";
 const TAR_NAME_LEN: usize = 100;
 const TAR_PREFIX_LEN: usize = 155;
@@ -87,6 +88,24 @@ pub struct PreparedAppPackage {
     pub name: String,
     pub files: Vec<NormalizedPackageFile>,
     pub route_index: RouteIndex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildManifest {
+    pub schema: String,
+    pub source_package_hash: String,
+    pub routes: Vec<BuildManifestRoute>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildManifestRoute {
+    pub route_id: String,
+    pub pattern: String,
+    pub source_path: String,
+    pub source_hash: String,
+    pub artifact_path: String,
+    pub artifact_hash: String,
+    pub abi: RouteAbi,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,13 +291,27 @@ impl PreparedAppPackage {
             let source_bytes = file_bytes(&files, &source_path)?;
             let validation = validate_route_wasm(&source_path, source_bytes, &allowed_caps)?;
             let artifact_path = format!("artifacts/routes/{}.wasm", route.route_id);
+            let artifact_bytes =
+                if let Some(artifact_bytes) = optional_file_bytes(&files, &artifact_path) {
+                    let artifact_validation =
+                        validate_route_wasm(&artifact_path, artifact_bytes, &allowed_caps)?;
+                    if artifact_validation != validation {
+                        return Err(PetalError::InvalidWasm(format!(
+                            "v2 package artifact {} ABI/caps do not match source route",
+                            route.route_id
+                        )));
+                    }
+                    artifact_bytes
+                } else {
+                    source_bytes
+                };
             let (kind, ops) = route_kind_and_ops(&source_path);
             route_index.routes.push(RouteIndexRecord {
                 route_id: route.route_id,
                 pattern: route.pattern,
                 source_path,
                 artifact_path,
-                artifact_hash: hex::encode(blake3::hash(source_bytes).as_bytes()),
+                artifact_hash: hex::encode(blake3::hash(artifact_bytes).as_bytes()),
                 abi: validation.abi,
                 kind,
                 ops,
@@ -307,6 +340,126 @@ impl PreparedAppPackage {
     pub fn write_petal_tar(&self, writer: impl Write) -> Result<(), PetalError> {
         verify_prepared_package(self)?;
         write_package_tar(&self.files, writer)
+    }
+}
+
+pub fn build_app_package_dir(root: impl AsRef<Path>) -> Result<PreparedAppPackage, PetalError> {
+    let root = root.as_ref();
+    PetalAppPackage::scan_dir(root)?;
+    validate_generated_artifact_paths(root)?;
+    remove_generated_artifacts(root)?;
+    let source_package = PreparedAppPackage::from_dir(root)?;
+    let manifest = build_manifest_for_package(&source_package)?;
+
+    for route in &source_package.route_index.routes {
+        let source = source_package
+            .files
+            .iter()
+            .find(|file| file.path == route.source_path)
+            .ok_or_else(|| {
+                PetalError::InvalidWasm(format!(
+                    "route index source missing from package: {}",
+                    route.source_path
+                ))
+            })?;
+        write_package_file(root, &route.artifact_path, &source.bytes)?;
+    }
+    write_package_file(
+        root,
+        "artifacts/build-manifest.json",
+        &serde_json::to_vec_pretty(&manifest)?,
+    )?;
+
+    PreparedAppPackage::from_dir(root)
+}
+
+fn build_manifest_for_package(package: &PreparedAppPackage) -> Result<BuildManifest, PetalError> {
+    let mut routes = Vec::with_capacity(package.route_index.routes.len());
+    for route in &package.route_index.routes {
+        let source = package
+            .files
+            .iter()
+            .find(|file| file.path == route.source_path)
+            .ok_or_else(|| {
+                PetalError::InvalidWasm(format!(
+                    "route index source missing from package: {}",
+                    route.source_path
+                ))
+            })?;
+        let artifact_hash = hex::encode(blake3::hash(&source.bytes).as_bytes());
+        routes.push(BuildManifestRoute {
+            route_id: route.route_id.clone(),
+            pattern: route.pattern.clone(),
+            source_path: route.source_path.clone(),
+            source_hash: artifact_hash.clone(),
+            artifact_path: route.artifact_path.clone(),
+            artifact_hash,
+            abi: route.abi,
+        });
+    }
+    Ok(BuildManifest {
+        schema: BUILD_MANIFEST_SCHEMA.to_string(),
+        source_package_hash: package.hash.clone(),
+        routes,
+    })
+}
+
+fn validate_generated_artifact_paths(root: &Path) -> Result<(), PetalError> {
+    let artifacts = root.join("artifacts");
+    if let Ok(meta) = std::fs::symlink_metadata(&artifacts)
+        && !meta.is_dir()
+    {
+        return Err(PetalError::InvalidWasm(
+            "v2 package artifacts path must be a directory".into(),
+        ));
+    }
+
+    let routes = artifacts.join("routes");
+    if let Ok(meta) = std::fs::symlink_metadata(&routes)
+        && !meta.is_dir()
+    {
+        return Err(PetalError::InvalidWasm(
+            "v2 package artifacts/routes path must be a directory".into(),
+        ));
+    }
+
+    let manifest = artifacts.join("build-manifest.json");
+    if let Ok(meta) = std::fs::symlink_metadata(&manifest)
+        && !meta.is_file()
+    {
+        return Err(PetalError::InvalidWasm(
+            "v2 package artifacts/build-manifest.json path must be a file".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn remove_generated_artifacts(root: &Path) -> Result<(), PetalError> {
+    let artifacts = root.join("artifacts");
+    let routes = artifacts.join("routes");
+    match std::fs::remove_dir_all(&routes) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(PetalError::Io(e)),
+    }?;
+
+    let manifest = artifacts.join("build-manifest.json");
+    match std::fs::remove_file(&manifest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(PetalError::Io(e)),
+    }?;
+    match std::fs::remove_dir(&artifacts) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(PetalError::Io(e)),
     }
 }
 
@@ -405,6 +558,17 @@ fn collect_package_dir(root: &Path) -> Result<Vec<NormalizedPackageFile>, PetalE
     let mut files = Vec::new();
     collect_package_dir_inner(root, root, &mut files)?;
     Ok(files)
+}
+
+fn write_package_file(root: &Path, rel: &str, bytes: &[u8]) -> Result<(), PetalError> {
+    validate_package_path(rel)?;
+    let path = root.join(rel);
+    let parent = path.parent().ok_or_else(|| {
+        PetalError::InvalidWasm(format!("v2 package output path has no parent: {rel}"))
+    })?;
+    std::fs::create_dir_all(parent)?;
+    std::fs::write(path, bytes)?;
+    Ok(())
 }
 
 fn collect_package_dir_inner(
@@ -646,6 +810,13 @@ fn file_bytes<'a>(files: &'a [NormalizedPackageFile], path: &str) -> Result<&'a 
         .ok()
         .map(|idx| files[idx].bytes.as_slice())
         .ok_or_else(|| PetalError::InvalidWasm(format!("v2 package missing required file {path}")))
+}
+
+fn optional_file_bytes<'a>(files: &'a [NormalizedPackageFile], path: &str) -> Option<&'a [u8]> {
+    files
+        .binary_search_by(|file| file.path.as_str().cmp(path))
+        .ok()
+        .map(|idx| files[idx].bytes.as_slice())
 }
 
 fn route_records_from_files(
@@ -1403,6 +1574,95 @@ name = "echo"
         }
         let from_tar = PreparedAppPackage::from_reader(std::io::Cursor::new(tar_bytes)).unwrap();
         assert_eq!(from_tar.hash, package.hash);
+    }
+
+    #[test]
+    fn v2_build_app_package_dir_writes_artifacts_and_manifest_deterministically() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package(tmp.path());
+
+        let first = build_app_package_dir(tmp.path()).unwrap();
+        let artifact_path = tmp.path().join("artifacts/routes/r000001.wasm");
+        let manifest_path = tmp.path().join("artifacts/build-manifest.json");
+        let source = std::fs::read(tmp.path().join("app/echo/hello.txt.wasm")).unwrap();
+        let artifact = std::fs::read(&artifact_path).unwrap();
+        assert_eq!(artifact, source);
+
+        let manifest: BuildManifest =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.schema, BUILD_MANIFEST_SCHEMA);
+        assert_eq!(manifest.routes.len(), 1);
+        assert_eq!(manifest.routes[0].route_id, "r000001");
+        assert_eq!(manifest.routes[0].source_path, "app/echo/hello.txt.wasm");
+        assert_eq!(
+            manifest.routes[0].artifact_path,
+            "artifacts/routes/r000001.wasm"
+        );
+        let source_hash = hex::encode(blake3::hash(&source).as_bytes());
+        assert_eq!(manifest.routes[0].source_hash, source_hash);
+        assert_eq!(manifest.routes[0].artifact_hash, source_hash);
+        assert_ne!(manifest.source_package_hash, first.hash);
+        assert!(
+            first
+                .files
+                .iter()
+                .any(|file| file.path == "artifacts/build-manifest.json")
+        );
+        assert!(
+            first
+                .files
+                .iter()
+                .any(|file| file.path == "artifacts/routes/r000001.wasm")
+        );
+
+        let second = build_app_package_dir(tmp.path()).unwrap();
+        assert_eq!(second.hash, first.hash);
+        assert_eq!(second.route_index, first.route_index);
+    }
+
+    #[test]
+    fn v2_build_app_package_dir_replaces_stale_generated_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package(tmp.path());
+        write_package_file(
+            tmp.path(),
+            "artifacts/routes/r000001.wasm",
+            b"stale invalid wasm",
+        );
+        write_package_file(
+            tmp.path(),
+            "artifacts/build-manifest.json",
+            b"stale invalid manifest",
+        );
+
+        let package = build_app_package_dir(tmp.path()).unwrap();
+        let route = &package.route_index.routes[0];
+        let artifact = std::fs::read(tmp.path().join(&route.artifact_path)).unwrap();
+        let source = std::fs::read(tmp.path().join(&route.source_path)).unwrap();
+        assert_eq!(artifact, source);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v2_build_app_package_dir_rejects_symlinked_artifacts_without_deleting_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_v2_package(tmp.path());
+        std::fs::write(outside.path().join("sentinel"), b"keep").unwrap();
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("artifacts")).unwrap();
+
+        let err = build_app_package_dir(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("non-regular file")
+                || err
+                    .to_string()
+                    .contains("artifacts path must be a directory"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(outside.path().join("sentinel")).unwrap(),
+            b"keep"
+        );
     }
 
     #[test]

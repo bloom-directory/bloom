@@ -218,17 +218,8 @@ impl PetalStore {
                 write_package_file(&tmp.join(SOURCE), &file.path, &file.bytes)?;
             }
             for route in &package.route_index.routes {
-                let source = package
-                    .files
-                    .iter()
-                    .find(|file| file.path == route.source_path)
-                    .ok_or_else(|| {
-                        PetalError::InvalidWasm(format!(
-                            "route index source missing from package: {}",
-                            route.source_path
-                        ))
-                    })?;
-                write_package_file(&tmp, &route.artifact_path, &source.bytes)?;
+                let artifact = route_artifact_bytes(&package, route)?;
+                write_package_file(&tmp, &route.artifact_path, artifact)?;
             }
             let index_bytes = serde_json::to_vec_pretty(&package.route_index)?;
             atomic_write(&tmp.join(ROUTE_INDEX), &index_bytes)?;
@@ -485,6 +476,36 @@ fn write_package_file(root: &Path, rel: &str, data: &[u8]) -> Result<(), PetalEr
     std::fs::create_dir_all(parent)?;
     atomic_write(&path, data)?;
     Ok(())
+}
+
+fn route_artifact_bytes<'a>(
+    package: &'a PreparedAppPackage,
+    route: &crate::v2::RouteIndexRecord,
+) -> Result<&'a [u8], PetalError> {
+    let file = package
+        .files
+        .iter()
+        .find(|file| file.path == route.artifact_path)
+        .or_else(|| {
+            package
+                .files
+                .iter()
+                .find(|file| file.path == route.source_path)
+        })
+        .ok_or_else(|| {
+            PetalError::InvalidWasm(format!(
+                "route index artifact/source missing from package: {} / {}",
+                route.artifact_path, route.source_path
+            ))
+        })?;
+    let artifact_hash = hex::encode(blake3::hash(&file.bytes).as_bytes());
+    if artifact_hash != route.artifact_hash {
+        return Err(PetalError::InvalidWasm(format!(
+            "v2 package artifact {} hash mismatch",
+            route.route_id
+        )));
+    }
+    Ok(file.bytes.as_slice())
 }
 
 fn collect_meta_hashes(dir: PathBuf, out: &mut BTreeSet<String>) -> Result<(), PetalError> {
@@ -775,6 +796,37 @@ name = "echo"
         let (again, _, _) = store.install_app_package_dir(&package).unwrap();
         assert_eq!(again.hash, result.hash);
         assert!(again.already_present);
+    }
+
+    #[test]
+    fn install_app_package_uses_packaged_route_artifact_when_present() {
+        let (d, store) = store();
+        let package = d.path().join("pkg");
+        write_file(
+            &package,
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
+        write_file(&package, "README.md", b"# echo");
+        write_file(&package, "AGENTS.md", b"# echo agents");
+        let source = compat_wasm("source");
+        let artifact = compat_wasm("artifact");
+        write_file(&package, "app/echo/hello.txt.wasm", &source);
+        write_file(&package, "artifacts/routes/r000001.wasm", &artifact);
+
+        let (result, _, index) = store.install_app_package_dir(&package).unwrap();
+        assert_eq!(
+            index.routes[0].artifact_hash,
+            hex::encode(blake3::hash(&artifact).as_bytes())
+        );
+        assert_eq!(
+            store
+                .read_route_artifact(&result.hash, &index.routes[0].route_id)
+                .unwrap(),
+            artifact
+        );
     }
 
     #[test]

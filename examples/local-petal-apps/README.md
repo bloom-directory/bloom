@@ -9,7 +9,7 @@ Build installable package directories:
 ./examples/local-petal-apps/build-demo-apps.sh
 ```
 
-Validate and archive a package:
+Build route artifacts and archive a package:
 
 ```sh
 cargo run -p bloom -- petal app build examples/local-petal-apps/build/echo --out /tmp/echo.petal.tar

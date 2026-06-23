@@ -624,6 +624,25 @@ async fn main() -> ExitCode {
     }
 }
 
+fn reject_archive_output_inside_package(package_dir: &str, out: &str) -> Result<()> {
+    let package_dir = std::fs::canonicalize(package_dir)
+        .with_context(|| format!("canonicalize package dir {package_dir}"))?;
+    let out_path = std::path::Path::new(out);
+    let out_parent = out_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let out_parent = std::fs::canonicalize(out_parent)
+        .with_context(|| format!("canonicalize archive parent {out}"))?;
+    let out_abs = out_parent.join(out_path.file_name().unwrap_or_default());
+    if out_abs.starts_with(&package_dir) {
+        anyhow::bail!(
+            "--out must be outside the package directory so archives are not packaged into future builds"
+        );
+    }
+    Ok(())
+}
+
 /// Returns `None` when no daemon socket is present (daemon not started),
 /// propagating all other errors normally. A stale socket (file exists but
 /// connection refused) is removed and surfaced as an error rather than
@@ -1592,11 +1611,15 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
 
     let cmd = match cmd {
         PetalsCmd::App(PetalAppCmd::Build { package_dir, out }) => {
-            let package = bloom_petals::v2::PreparedAppPackage::from_dir(&package_dir)
-                .with_context(|| format!("validate app package {package_dir}"))?;
+            if let Some(out) = out.as_deref() {
+                reject_archive_output_inside_package(&package_dir, out)?;
+            }
+            let package = bloom_petals::v2::build_app_package_dir(&package_dir)
+                .with_context(|| format!("build app package {package_dir}"))?;
             println!("hash: {}", package.hash);
             println!("app_mount: apps/{}/", package.name);
             println!("routes: {}", package.route_index.routes.len());
+            println!("artifacts: {package_dir}/artifacts");
             if let Some(out) = out {
                 let file =
                     std::fs::File::create(&out).with_context(|| format!("create archive {out}"))?;
@@ -1862,6 +1885,27 @@ mod local_petal_cli_tests {
                 &VfsPath::parse("apps/other/onboard/alice/begin").unwrap()
             ),
             None
+        );
+    }
+
+    #[test]
+    fn petal_app_build_rejects_archive_output_inside_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let package = tmp.path().join("pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        assert!(
+            reject_archive_output_inside_package(
+                package.to_str().unwrap(),
+                package.join("app.petal.tar").to_str().unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            reject_archive_output_inside_package(
+                package.to_str().unwrap(),
+                tmp.path().join("app.petal.tar").to_str().unwrap()
+            )
+            .is_ok()
         );
     }
 }

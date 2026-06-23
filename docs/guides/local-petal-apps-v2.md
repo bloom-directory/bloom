@@ -23,6 +23,9 @@ bloom petals install app.petal.tar
 bloom petals ls
 ```
 
+`bloom petal app build` validates the package, writes generated route artifacts
+under `artifacts/`, and emits a deterministic `.petal.tar` when `--out` is set.
+
 Example demos live under `examples/local-petal-apps`. Build their WAT sources
 into installable package directories with:
 
