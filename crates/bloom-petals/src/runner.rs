@@ -485,10 +485,11 @@ impl PetalRunner {
             None => declared,
         });
         let declared_sign_intents = self.v2_sign_intents(&matched.hash)?;
-        opts.sign_intents = Some(match opts.sign_intents {
-            Some(mask) => declared_sign_intents.intersection(&mask).cloned().collect(),
-            None => declared_sign_intents,
-        });
+        opts.sign_intents = Some(route_sign_intents(
+            declared_sign_intents,
+            matched.route.install_metadata.sign_intent.as_deref(),
+            opts.sign_intents,
+        ));
         let declared_store_policy = self.v2_store_policy(&matched.hash)?;
         opts.store_namespaces = Some(match opts.store_namespaces {
             Some(mask) => declared_store_policy.intersect(&mask),
@@ -616,6 +617,24 @@ fn v2_capability(cap: &str) -> Option<Capability> {
     }
 }
 
+fn route_sign_intents(
+    declared_sign_intents: BTreeSet<String>,
+    route_sign_intent: Option<&str>,
+    runtime_mask: Option<BTreeSet<String>>,
+) -> BTreeSet<String> {
+    let route_limited = match route_sign_intent {
+        Some(intent) if declared_sign_intents.contains(intent) => {
+            BTreeSet::from([intent.to_string()])
+        }
+        Some(_) => BTreeSet::new(),
+        None => declared_sign_intents,
+    };
+    match runtime_mask {
+        Some(mask) => route_limited.intersection(&mask).cloned().collect(),
+        None => route_limited,
+    }
+}
+
 fn app_path(mount: &str, path: &str) -> String {
     if path.is_empty() {
         format!("apps/{mount}")
@@ -710,7 +729,7 @@ fn route_segment_matches(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::abi::{HttpRequest, HttpResponse, encode_http_request};
+    use crate::abi::{DispatchResponse, HttpRequest, HttpResponse, encode_http_request};
     use parking_lot::Mutex;
     use tempfile::TempDir;
 
@@ -910,7 +929,7 @@ paths = ["/markets*"]
     }
 
     #[tokio::test]
-    async fn component_app_routes_use_component_runner_and_surface_component_errors() {
+    async fn component_app_routes_use_component_runner() {
         let (dir, r) = runner();
         let package = dir.path().join("component-app");
         write_package_file(
@@ -929,7 +948,7 @@ name = "echo"
         );
         r.store().install_app_package_dir(&package).unwrap();
 
-        let err = r
+        let out = r
             .dispatch_app_route(
                 "echo",
                 DispatchRequest {
@@ -943,9 +962,8 @@ name = "echo"
                 RunOptions::default(),
             )
             .await
-            .unwrap_err();
-        assert!(!matches!(err, PetalError::ModeUnsupported(_)));
-        assert!(err.to_string().contains("component route"));
+            .unwrap();
+        assert_eq!(out.response, DispatchResponse::Read(b"component".to_vec()));
     }
 
     #[tokio::test]
@@ -976,6 +994,28 @@ name = "echo"
     #[test]
     fn v2_capability_maps_chain_to_local_host_capability() {
         assert_eq!(v2_capability("bloom:chain"), Some(Capability::Chain));
+    }
+
+    #[test]
+    fn v2_route_sign_intent_narrows_manifest_and_runtime_masks() {
+        let declared = BTreeSet::from(["safe.intent".to_string(), "wide.intent".to_string()]);
+        assert_eq!(
+            route_sign_intents(declared.clone(), Some("safe.intent"), None),
+            BTreeSet::from(["safe.intent".to_string()])
+        );
+        assert_eq!(
+            route_sign_intents(
+                declared.clone(),
+                Some("safe.intent"),
+                Some(BTreeSet::from(["wide.intent".to_string()]))
+            ),
+            BTreeSet::new()
+        );
+        assert_eq!(
+            route_sign_intents(declared.clone(), Some("unknown.intent"), None),
+            BTreeSet::new()
+        );
+        assert_eq!(route_sign_intents(declared.clone(), None, None), declared);
     }
 
     #[tokio::test]

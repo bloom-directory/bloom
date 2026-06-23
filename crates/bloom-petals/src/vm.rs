@@ -72,6 +72,25 @@ pub struct StoreData {
     private_store: Option<PrivateStore>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComponentRouteMetadata {
+    pub kind: ComponentRouteEntryKind,
+    pub mode: u32,
+    pub cache_ttl_ms: Option<u64>,
+    pub side_effecting_read: bool,
+    pub write_async: bool,
+    pub required_caps: Vec<String>,
+    pub sign_intent: Option<String>,
+    pub executable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentRouteEntryKind {
+    Dir,
+    File,
+    Symlink,
+}
+
 #[derive(Debug, Clone)]
 pub struct RunOptions {
     pub fuel: u64,
@@ -361,6 +380,76 @@ impl PetalVm {
             fuel_consumed,
         })
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn component_route_metadata(
+        &self,
+        wasm: &[u8],
+        caps: BTreeSet<Capability>,
+        host: Arc<dyn PetalHost>,
+        petal_hash: &str,
+        app_root: &str,
+        path: &str,
+        route_params: Vec<(String, String)>,
+        opts: RunOptions,
+    ) -> Result<ComponentRouteMetadata, PetalError> {
+        let component = Component::from_binary(&self.engine, wasm)
+            .map_err(|e| PetalError::InvalidWasm(e.to_string()))?;
+        let wasi_ctx = WasiCtxBuilder::new().build_p1();
+        let mut store = Store::new(
+            &self.engine,
+            StoreData {
+                wasi: wasi_ctx,
+                host,
+                caps,
+                petal_hash: petal_hash.to_string(),
+                net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
+                sign_intents: opts.sign_intents.clone(),
+                store_namespaces: opts.store_namespaces.clone(),
+                http_response_cap: opts.http_response_cap,
+                private_store: match opts.private_store_root.clone() {
+                    Some(root) => Some(
+                        PrivateStore::open(root)
+                            .map_err(|e| PetalError::vm(format!("private store open: {e}")))?,
+                    ),
+                    None => None,
+                },
+            },
+        );
+        store
+            .set_fuel(opts.fuel)
+            .map_err(|e| PetalError::vm(e.to_string()))?;
+        store.limiter(move |_| Box::leak(Box::new(MemLimiter::new(opts.memory_pages))));
+
+        let mut linker = ComponentLinker::<StoreData>::new(&self.engine);
+        linker
+            .define_unknown_imports_as_traps(&component)
+            .map_err(|e| PetalError::vm(e.to_string()))?;
+        link_component_host_imports(&mut linker).map_err(|e| PetalError::vm(e.to_string()))?;
+
+        let instance = linker
+            .instantiate_async(&mut store, &component)
+            .await
+            .map_err(|e| PetalError::vm(format!("component instantiate: {e}")))?;
+        let func = instance.get_func(&mut store, "metadata").ok_or_else(|| {
+            PetalError::InvalidWasm("component route missing \"metadata\" export".into())
+        })?;
+        let request = DispatchRequest {
+            op: DispatchOp::Lookup,
+            path: path.to_string(),
+            body: Vec::new(),
+            ctx: Vec::new(),
+        };
+        let params = route_component_params(&request, app_root, petal_hash, route_params);
+        let mut results = vec![ComponentVal::Bool(false)];
+        func.call_async(&mut store, &params, &mut results)
+            .await
+            .map_err(|e| PetalError::vm(format!("component route metadata: {e}")))?;
+        func.post_return_async(&mut store)
+            .await
+            .map_err(|e| PetalError::vm(format!("component route metadata post-return: {e}")))?;
+        route_component_metadata_result(results.remove(0))
+    }
 }
 
 fn route_component_export_name(op: DispatchOp) -> &'static str {
@@ -525,6 +614,55 @@ fn route_component_entry(val: ComponentVal) -> Result<crate::abi::DispatchEntry,
     })
 }
 
+fn route_component_metadata_result(
+    val: ComponentVal,
+) -> Result<ComponentRouteMetadata, PetalError> {
+    let ok = match val {
+        ComponentVal::Result(Ok(Some(ok))) => *ok,
+        ComponentVal::Result(Err(Some(err))) => {
+            let (code, message) = route_component_error(*err)?;
+            return Err(PetalError::vm(format!(
+                "component metadata returned error {code}: {message}"
+            )));
+        }
+        ComponentVal::Result(Err(None)) => {
+            return Err(PetalError::vm(
+                "component metadata returned an empty error".to_string(),
+            ));
+        }
+        other => {
+            return Err(PetalError::vm(format!(
+                "component metadata returned unexpected value {other:?}"
+            )));
+        }
+    };
+    route_component_metadata(ok)
+}
+
+fn route_component_metadata(val: ComponentVal) -> Result<ComponentRouteMetadata, PetalError> {
+    let fields = component_record(val, "route-meta")?;
+    let kind = match component_enum_field(&fields, "kind")?.as_str() {
+        "dir" => ComponentRouteEntryKind::Dir,
+        "file" => ComponentRouteEntryKind::File,
+        "symlink" => ComponentRouteEntryKind::Symlink,
+        other => {
+            return Err(PetalError::vm(format!(
+                "component route-meta has unknown kind {other:?}"
+            )));
+        }
+    };
+    Ok(ComponentRouteMetadata {
+        kind,
+        mode: component_u32_field(&fields, "mode")?,
+        cache_ttl_ms: component_optional_u64_field(&fields, "cache-ttl-ms")?,
+        side_effecting_read: component_bool_field(&fields, "side-effecting-read")?,
+        write_async: component_bool_field(&fields, "write-async")?,
+        required_caps: component_string_list_field(&fields, "required-caps")?,
+        sign_intent: component_optional_string_field(&fields, "sign-intent")?,
+        executable: component_bool_field(&fields, "executable")?,
+    })
+}
+
 fn component_record(
     val: ComponentVal,
     label: &str,
@@ -547,6 +685,15 @@ fn component_field<'a>(
         .ok_or_else(|| PetalError::vm(format!("component record missing field {name:?}")))
 }
 
+fn component_bool_field(fields: &[(String, ComponentVal)], name: &str) -> Result<bool, PetalError> {
+    match component_field(fields, name)? {
+        ComponentVal::Bool(value) => Ok(*value),
+        other => Err(PetalError::vm(format!(
+            "component field {name:?} is not a bool: {other:?}"
+        ))),
+    }
+}
+
 fn component_string_field(
     fields: &[(String, ComponentVal)],
     name: &str,
@@ -557,6 +704,26 @@ fn component_string_field(
             "component field {name:?} is not a string: {other:?}"
         ))),
     }
+}
+
+fn component_string_list_field(
+    fields: &[(String, ComponentVal)],
+    name: &str,
+) -> Result<Vec<String>, PetalError> {
+    let ComponentVal::List(values) = component_field(fields, name)? else {
+        return Err(PetalError::vm(format!(
+            "component field {name:?} is not a list"
+        )));
+    };
+    values
+        .iter()
+        .map(|value| match value {
+            ComponentVal::String(value) => Ok(value.clone()),
+            other => Err(PetalError::vm(format!(
+                "component field {name:?} contains non-string value {other:?}"
+            ))),
+        })
+        .collect()
 }
 
 fn component_enum_field(

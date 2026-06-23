@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use wasmparser::{
@@ -19,7 +20,9 @@ use wasmparser::{
 };
 
 use crate::error::PetalError;
+use crate::host::DenyHost;
 use crate::policy::StoreNamespacePolicy;
+use crate::vm::{ComponentRouteEntryKind, ComponentRouteMetadata, PetalVm, RunOptions};
 
 pub const ROUTE_INDEX_SCHEMA: &str = "bloom.petal.route-index.v1";
 pub const BUILD_MANIFEST_SCHEMA: &str = "bloom.petal.build-manifest.v1";
@@ -411,6 +414,16 @@ impl PreparedAppPackage {
                     source_bytes
                 };
             let (kind, ops) = route_kind_and_ops(&source_path);
+            let install_metadata = install_metadata_for_route(
+                &hash,
+                &manifest.name,
+                &route,
+                kind,
+                &validation,
+                artifact_bytes,
+                &allowed_caps,
+                &allowed_sign_intents,
+            )?;
             route_index.routes.push(RouteIndexRecord {
                 route_id: route.route_id,
                 pattern: route.pattern,
@@ -422,15 +435,7 @@ impl PreparedAppPackage {
                 ops,
                 params: route.params,
                 specificity: route.specificity.as_array(),
-                install_metadata: InstallRouteMetadata {
-                    mode: 0o444,
-                    cache_ttl_ms: None,
-                    side_effecting_read: false,
-                    write_async: false,
-                    executable: false,
-                    required_caps: validation.required_caps,
-                    sign_intent: None,
-                },
+                install_metadata,
             });
         }
 
@@ -446,6 +451,147 @@ impl PreparedAppPackage {
         verify_prepared_package(self)?;
         write_package_tar(&self.files, writer)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_metadata_for_route(
+    package_hash: &str,
+    app_root: &str,
+    route: &RouteRecord,
+    route_kind: RouteEntryKind,
+    validation: &RouteValidation,
+    artifact_bytes: &[u8],
+    allowed_caps: &BTreeSet<String>,
+    allowed_sign_intents: &BTreeSet<String>,
+) -> Result<InstallRouteMetadata, PetalError> {
+    let mut metadata = InstallRouteMetadata {
+        mode: 0o444,
+        cache_ttl_ms: None,
+        side_effecting_read: false,
+        write_async: false,
+        executable: false,
+        required_caps: validation.required_caps.clone(),
+        sign_intent: None,
+    };
+
+    if validation.abi != RouteAbi::ComponentBloomRoute010 || !route.params.is_empty() {
+        return Ok(metadata);
+    }
+
+    let component_metadata =
+        evaluate_static_component_metadata(package_hash, app_root, route, artifact_bytes)?;
+    validate_component_metadata_policy(
+        &route.route_id,
+        route_kind,
+        &component_metadata,
+        &validation.required_caps,
+        allowed_caps,
+        allowed_sign_intents,
+    )?;
+    metadata.mode = component_metadata.mode;
+    metadata.cache_ttl_ms = component_metadata.cache_ttl_ms;
+    metadata.side_effecting_read = component_metadata.side_effecting_read;
+    metadata.write_async = component_metadata.write_async;
+    metadata.executable = component_metadata.executable;
+    metadata.required_caps = component_metadata.required_caps;
+    metadata.sign_intent = component_metadata.sign_intent;
+    Ok(metadata)
+}
+
+fn evaluate_static_component_metadata(
+    package_hash: &str,
+    app_root: &str,
+    route: &RouteRecord,
+    artifact_bytes: &[u8],
+) -> Result<ComponentRouteMetadata, PetalError> {
+    let wasm = artifact_bytes.to_vec();
+    let package_hash = package_hash.to_string();
+    let app_root = app_root.to_string();
+    let path = route.pattern.clone();
+    let handle = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(PetalError::Io)?;
+        runtime.block_on(async move {
+            PetalVm::new()?
+                .component_route_metadata(
+                    &wasm,
+                    BTreeSet::new(),
+                    Arc::new(DenyHost),
+                    &package_hash,
+                    &app_root,
+                    &path,
+                    Vec::new(),
+                    RunOptions::default(),
+                )
+                .await
+        })
+    });
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(PetalError::vm(
+            "component route metadata evaluator panicked",
+        )),
+    }
+}
+
+fn validate_component_metadata_policy(
+    route_id: &str,
+    route_kind: RouteEntryKind,
+    metadata: &ComponentRouteMetadata,
+    import_required_caps: &[String],
+    allowed_caps: &BTreeSet<String>,
+    allowed_sign_intents: &BTreeSet<String>,
+) -> Result<(), PetalError> {
+    let metadata_kind = match metadata.kind {
+        ComponentRouteEntryKind::Dir => RouteEntryKind::Dir,
+        ComponentRouteEntryKind::File => RouteEntryKind::File,
+        ComponentRouteEntryKind::Symlink => RouteEntryKind::Symlink,
+    };
+    if metadata_kind != route_kind {
+        return Err(PetalError::InvalidWasm(format!(
+            "v2 route {route_id} metadata kind {:?} does not match route kind {:?}",
+            metadata_kind, route_kind
+        )));
+    }
+    if metadata.executable {
+        return Err(PetalError::InvalidWasm(format!(
+            "v2 route {route_id} metadata executable=true is not supported"
+        )));
+    }
+    if metadata.mode & !0o777 != 0 {
+        return Err(PetalError::InvalidWasm(format!(
+            "v2 route {route_id} metadata mode must be a unix permission mode"
+        )));
+    }
+    let import_caps = import_required_caps.iter().collect::<BTreeSet<_>>();
+    for cap in &metadata.required_caps {
+        if !allowed_caps.contains(cap) {
+            return Err(PetalError::InvalidWasm(format!(
+                "v2 route {route_id} metadata requires missing petal.toml cap {cap}"
+            )));
+        }
+        if !import_caps.contains(cap) {
+            return Err(PetalError::InvalidWasm(format!(
+                "v2 route {route_id} metadata required cap {cap} was not declared by route imports"
+            )));
+        }
+    }
+    if let Some(intent) = &metadata.sign_intent {
+        if !metadata.required_caps.iter().any(|cap| cap == "bloom:sign") {
+            return Err(PetalError::InvalidWasm(format!(
+                "v2 route {route_id} metadata sign_intent requires bloom:sign"
+            )));
+        }
+        if !allowed_sign_intents.contains(intent) {
+            return Err(PetalError::InvalidWasm(format!(
+                "v2 route {route_id} metadata sign_intent {intent:?} is not allowed"
+            )));
+        }
+        validate_sign_intent(intent)?;
+    }
+    Ok(())
 }
 
 pub fn sign_intents_from_v2_manifest_toml(bytes: &[u8]) -> Result<BTreeSet<String>, PetalError> {
@@ -3692,6 +3838,31 @@ allowed = ["bloom:http"]
     }
 
     #[test]
+    fn v2_static_component_metadata_is_cached_in_route_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_route(tmp.path(), route_component_metadata());
+
+        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
+        let metadata = &package.route_index.routes[0].install_metadata;
+        assert_eq!(metadata.mode, 0o640);
+        assert_eq!(metadata.cache_ttl_ms, Some(2000));
+        assert!(metadata.side_effecting_read);
+        assert!(metadata.write_async);
+        assert!(!metadata.executable);
+        assert!(metadata.required_caps.is_empty());
+        assert_eq!(metadata.sign_intent, None);
+    }
+
+    #[test]
+    fn v2_static_component_metadata_rejects_executable_routes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_route(tmp.path(), route_component_executable());
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("executable=true"));
+    }
+
+    #[test]
     fn v2_component_routes_reject_wrong_route_export_signatures() {
         let tmp = tempfile::tempdir().unwrap();
         write_v2_package_with_route(
@@ -4043,6 +4214,14 @@ name = "echo"
 
     fn route_component_sign() -> &'static [u8] {
         include_bytes!("../tests/fixtures/route_component_sign.wasm")
+    }
+
+    fn route_component_metadata() -> &'static [u8] {
+        include_bytes!("../tests/fixtures/route_component_metadata.wasm")
+    }
+
+    fn route_component_executable() -> &'static [u8] {
+        include_bytes!("../tests/fixtures/route_component_executable.wasm")
     }
 
     fn route_component(exports: &[&str], imports: &[&str]) -> Vec<u8> {
