@@ -9,6 +9,7 @@ use bloom_petals::{
 };
 use bloom_vfs::Handler;
 use bloom_vfs::path::VfsPath;
+use wasmparser::{Parser, Payload};
 
 #[tokio::test]
 async fn compiled_misc_tools_petal_installs_and_serves_via_router() {
@@ -36,6 +37,7 @@ async fn compiled_misc_tools_petal_installs_and_serves_via_router() {
     let wasm_path = target_dir.join("wasm32-wasip1/debug/bloom_local_petal_misc_tools.wasm");
     let wasm = std::fs::read(&wasm_path)
         .unwrap_or_else(|e| panic!("read wasm {}: {e}", wasm_path.display()));
+    assert_wasm_exports(&wasm, ["memory", "petal_alloc", "petal_dispatch"]);
 
     let manifest = extract_local_petal_manifest(&wasm, std::iter::empty::<&str>())
         .expect("local manifest must extract");
@@ -80,6 +82,25 @@ async fn compiled_misc_tools_petal_installs_and_serves_via_router() {
         .await
         .unwrap();
     assert!(String::from_utf8(gas).unwrap().contains("\"fast_gwei\":30"));
+}
+
+fn assert_wasm_exports<const N: usize>(wasm: &[u8], expected: [&str; N]) {
+    let mut exports = BTreeSet::new();
+    for payload in Parser::new(0).parse_all(wasm) {
+        let payload = payload.expect("wasm payload must parse");
+        if let Payload::ExportSection(section) = payload {
+            for export in section {
+                let export = export.expect("wasm export must parse");
+                exports.insert(export.name.to_string());
+            }
+        }
+    }
+    for name in expected {
+        assert!(
+            exports.contains(name),
+            "compiled local petal wasm must export {name}; exports={exports:?}"
+        );
+    }
 }
 
 fn workspace_root() -> PathBuf {

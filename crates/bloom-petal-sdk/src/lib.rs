@@ -12,6 +12,8 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+pub use bloom_petal_sdk_macros::petal;
+
 const MAX_STRING_LEN: usize = 64 * 1024;
 const MAX_HEADERS: usize = 256;
 const MAX_LIST_ENTRIES: usize = 8192;
@@ -450,8 +452,7 @@ pub fn store_del_if_value(key: &str, expected: &[u8]) -> Result<(), SdkError> {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn petal_alloc(len: usize) -> *mut u8 {
+pub fn petal_alloc(len: usize) -> *mut u8 {
     let mut buf = Vec::<u8>::with_capacity(len);
     let ptr = buf.as_mut_ptr();
     core::mem::forget(buf);
@@ -481,6 +482,11 @@ where
 #[macro_export]
 macro_rules! export_dispatch {
     ($handler:path) => {
+        #[unsafe(no_mangle)]
+        pub extern "C" fn petal_alloc(len: usize) -> *mut u8 {
+            $crate::petal_alloc(len)
+        }
+
         #[unsafe(no_mangle)]
         pub extern "C" fn petal_dispatch(ptr: i32, len: i32) -> i64 {
             $crate::dispatch_export(ptr, len, $handler)

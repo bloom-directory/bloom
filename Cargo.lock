@@ -2397,6 +2397,7 @@ dependencies = [
  "bloom-vfs",
  "tempfile",
  "tokio",
+ "wasmparser 0.218.1",
 ]
 
 [[package]]
@@ -2656,6 +2657,19 @@ dependencies = [
 [[package]]
 name = "bloom-petal-sdk"
 version = "0.1.0"
+dependencies = [
+ "bloom-petal-sdk-macros",
+]
+
+[[package]]
+name = "bloom-petal-sdk-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
 
 [[package]]
 name = "bloom-petals"

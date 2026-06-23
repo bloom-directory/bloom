@@ -9,8 +9,7 @@ use bloom_petal_sdk::{
 pub static BLOOM_LOCAL_MANIFEST: [u8; include_bytes!("../Petal.toml").len()] =
     *include_bytes!("../Petal.toml");
 
-bloom_petal_sdk::export_dispatch!(handle);
-
+#[bloom_petal_sdk::petal]
 pub fn handle(req: DispatchRequest) -> DispatchResponse {
     match req.op {
         DispatchOp::Lookup => lookup(&req.path),

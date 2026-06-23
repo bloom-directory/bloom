@@ -13,3 +13,6 @@ name = "bloom_petal_sdk"
 [features]
 default = ["std"]
 std = []
+
+[dependencies]
+bloom-petal-sdk-macros.workspace = true

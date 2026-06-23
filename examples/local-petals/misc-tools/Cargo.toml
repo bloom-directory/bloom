@@ -21,4 +21,4 @@ bloom-petals = { workspace = true }
 bloom-vfs = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
-
+wasmparser = { workspace = true }
