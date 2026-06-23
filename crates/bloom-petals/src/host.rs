@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 
-use crate::abi::{HttpRequest, HttpResponse, SignRequest};
+use crate::abi::{ChainRequest, ChainResponse, HttpRequest, HttpResponse, SignRequest};
 use crate::policy::NetPolicy;
 
 #[derive(Debug, thiserror::Error)]
@@ -62,6 +62,12 @@ pub trait PetalHost: Send + Sync {
     /// Default-deny; keys never cross into the petal.
     async fn sign_hash(&self, _req: SignRequest) -> Result<Vec<u8>, HostError> {
         Err(HostError::Denied("sign_hash".into()))
+    }
+
+    /// Perform a daemon-mediated chain read. Default-deny; production hosts
+    /// opt in explicitly so chain RPC access remains policy mediated.
+    async fn chain_read(&self, _req: ChainRequest) -> Result<ChainResponse, HostError> {
+        Err(HostError::Denied("chain_read".into()))
     }
 }
 
@@ -141,6 +147,15 @@ mod tests {
                 wallet: "0x0".into(),
                 hash32: [0u8; 32],
                 purpose: "test".into(),
+            })
+            .await,
+            Err(HostError::Denied(_))
+        ));
+        assert!(matches!(
+            h.chain_read(ChainRequest {
+                chain: "polygon".into(),
+                method: "eth_call".into(),
+                params_json: "{}".into(),
             })
             .await,
             Err(HostError::Denied(_))

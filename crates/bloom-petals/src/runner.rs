@@ -526,7 +526,7 @@ impl PetalRunner {
 fn requires_local_manifest(cap: &Capability) -> bool {
     matches!(
         cap,
-        Capability::NetFetch | Capability::Sign | Capability::Store
+        Capability::NetFetch | Capability::Sign | Capability::Store | Capability::Chain
     )
 }
 
@@ -596,6 +596,7 @@ fn v2_capability(cap: &str) -> Option<Capability> {
         "bloom:http" => Some(Capability::NetFetch),
         "bloom:store" => Some(Capability::Store),
         "bloom:sign" => Some(Capability::Sign),
+        "bloom:chain" => Some(Capability::Chain),
         "bloom:vfs.read" => Some(Capability::VfsRead),
         "bloom:vfs.write" => Some(Capability::VfsWrite),
         _ => Capability::parse(cap),
@@ -957,6 +958,11 @@ name = "echo"
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn v2_capability_maps_chain_to_local_host_capability() {
+        assert_eq!(v2_capability("bloom:chain"), Some(Capability::Chain));
     }
 
     #[tokio::test]

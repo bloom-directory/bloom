@@ -18,8 +18,9 @@ exports are invoked by the component runner. Component routes can call mediated
 `bloom:vfs/readwrite@0.1.0`, and `bloom:sign/signing@0.1.0` imports when the
 package manifest grants the matching capability. Signing routes must also
 declare `[sign].allowed_intents`, and runtime host calls are denied unless the
-requested intent is in that allow-list. `bloom:chain/read@0.1.0` currently
-returns an unsupported error, and package-local shared component imports land
+requested intent is in that allow-list. `bloom:chain/read@0.1.0` is linked
+through a mediated host adapter and defaults to denied unless the embedding
+host provides chain read support. Package-local shared component imports land
 with composition support.
 
 Useful commands:

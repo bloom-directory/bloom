@@ -31,6 +31,18 @@ pub struct SignRequest {
     pub purpose: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainRequest {
+    pub chain: String,
+    pub method: String,
+    pub params_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainResponse {
+    pub result_json: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchOp {
     Lookup,

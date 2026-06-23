@@ -24,6 +24,9 @@ pub enum Capability {
     /// May call `store_*`.
     #[serde(rename = "store")]
     Store,
+    /// May perform mediated chain reads.
+    #[serde(rename = "chain")]
+    Chain,
 }
 
 impl Capability {
@@ -34,6 +37,7 @@ impl Capability {
             Capability::NetFetch => "net.fetch",
             Capability::Sign => "sign",
             Capability::Store => "store",
+            Capability::Chain => "chain",
         }
     }
 
@@ -44,6 +48,7 @@ impl Capability {
             "net.fetch" => Some(Capability::NetFetch),
             "sign" => Some(Capability::Sign),
             "store" => Some(Capability::Store),
+            "chain" => Some(Capability::Chain),
             _ => None,
         }
     }
@@ -113,7 +118,7 @@ impl PetalMeta {
 
 /// Validate that a (mode, caps) pair is allowed at install time.
 ///
-/// - `Local` may declare `{vfs.read, vfs.write, net.fetch, sign, store}`.
+/// - `Local` may declare `{vfs.read, vfs.write, net.fetch, sign, store, chain}`.
 /// - `Chain` declares no capabilities (all access is via chain host imports).
 ///
 /// Returns `Err` on the first offending capability; the remaining caps
@@ -132,6 +137,7 @@ pub fn validate_mode_caps(
                     | Capability::NetFetch
                     | Capability::Sign
                     | Capability::Store
+                    | Capability::Chain
             )
         );
         // Chain mode has no declared capabilities — any cap is an error.
@@ -156,11 +162,13 @@ mod tests {
         assert_eq!(Capability::NetFetch.as_str(), "net.fetch");
         assert_eq!(Capability::Sign.as_str(), "sign");
         assert_eq!(Capability::Store.as_str(), "store");
+        assert_eq!(Capability::Chain.as_str(), "chain");
         assert_eq!(Capability::parse("vfs.read"), Some(Capability::VfsRead));
         assert_eq!(Capability::parse("vfs.write"), Some(Capability::VfsWrite));
         assert_eq!(Capability::parse("net.fetch"), Some(Capability::NetFetch));
         assert_eq!(Capability::parse("sign"), Some(Capability::Sign));
         assert_eq!(Capability::parse("store"), Some(Capability::Store));
+        assert_eq!(Capability::parse("chain"), Some(Capability::Chain));
         assert_eq!(Capability::parse("nope"), None);
     }
 
@@ -276,6 +284,13 @@ mod tests {
         assert!(
             validate_mode_caps(PetalMode::Local, &vfs_read).is_ok(),
             "Local + {{vfs.read}} should be ok"
+        );
+
+        let mut chain = BTreeSet::new();
+        chain.insert(Capability::Chain);
+        assert!(
+            validate_mode_caps(PetalMode::Local, &chain).is_ok(),
+            "Local + {{chain}} should be ok"
         );
     }
 }

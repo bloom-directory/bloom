@@ -41,9 +41,9 @@ use wasmtime_wasi::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 
 use crate::abi::{
-    DispatchOp, DispatchRequest, DispatchResponse, SignRequest, decode_dispatch_response,
-    decode_http_request, decode_sign_request, encode_dispatch_request, encode_http_response,
-    encode_string_list,
+    ChainRequest, ChainResponse, DispatchOp, DispatchRequest, DispatchResponse, SignRequest,
+    decode_dispatch_response, decode_http_request, decode_sign_request, encode_dispatch_request,
+    encode_http_response, encode_string_list,
 };
 use crate::error::PetalError;
 use crate::host::{HostError, PetalHost};
@@ -655,13 +655,8 @@ fn link_component_host_imports(linker: &mut ComponentLinker<StoreData>) -> anyho
     }
     {
         let mut chain = linker.instance("bloom:chain/read@0.1.0")?;
-        chain.func_new_async("call", |_store, _params, results| {
-            Box::new(async move {
-                set_component_result(
-                    results,
-                    component_err("bloom:chain/read is not implemented"),
-                )
-            })
+        chain.func_new_async("call", |store, params, results| {
+            Box::new(async move { component_chain_call(store, params, results).await })
         })?;
     }
     Ok(())
@@ -973,6 +968,37 @@ async fn component_sign_hash(
     }
 }
 
+async fn component_chain_call(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    if !store.data().caps.contains(&Capability::Chain) {
+        log_denied(store.data(), "component_chain_call");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("chain".into())),
+        );
+    }
+    let req = match params {
+        [ComponentVal::Record(fields)] => component_chain_request(fields),
+        _ => Err(HostError::Invalid(
+            "invalid bloom:chain.read call params".into(),
+        )),
+    };
+    let req = match req {
+        Ok(req) => req,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let host = store.data().host.clone();
+    match host.chain_read(req).await {
+        Ok(resp) => {
+            set_component_result(results, component_ok(Some(component_chain_response(resp))))
+        }
+        Err(e) => set_component_result(results, component_host_err(e)),
+    }
+}
+
 async fn component_vfs_lookup(
     store: StoreContextMut<'_, StoreData>,
     params: &[ComponentVal],
@@ -1209,6 +1235,21 @@ fn component_http_response(resp: crate::abi::HttpResponse) -> ComponentVal {
         ("headers".into(), component_headers(resp.headers)),
         ("body".into(), component_bytes(resp.body)),
     ])
+}
+
+fn component_chain_request(fields: &[(String, ComponentVal)]) -> Result<ChainRequest, HostError> {
+    Ok(ChainRequest {
+        chain: component_record_string(fields, "chain")?,
+        method: component_record_string(fields, "method")?,
+        params_json: component_record_string(fields, "params-json")?,
+    })
+}
+
+fn component_chain_response(resp: ChainResponse) -> ComponentVal {
+    ComponentVal::Record(vec![(
+        "result-json".into(),
+        ComponentVal::String(resp.result_json),
+    )])
 }
 
 fn component_record_string(
@@ -2449,6 +2490,7 @@ mod tests {
         vfs_reads: Mutex<Vec<String>>,
         http_calls: Mutex<Vec<HttpRequest>>,
         sign_calls: Mutex<Vec<SignRequest>>,
+        chain_calls: Mutex<Vec<ChainRequest>>,
     }
 
     #[async_trait]
@@ -2495,6 +2537,13 @@ mod tests {
         async fn sign_hash(&self, req: SignRequest) -> Result<Vec<u8>, HostError> {
             self.sign_calls.lock().push(req);
             Ok(vec![7u8; 65])
+        }
+
+        async fn chain_read(&self, req: ChainRequest) -> Result<ChainResponse, HostError> {
+            self.chain_calls.lock().push(req);
+            Ok(ChainResponse {
+                result_json: r#"{"ok":true}"#.into(),
+            })
         }
     }
 
@@ -3187,6 +3236,42 @@ paths = ["/markets*"]
     }
 
     #[tokio::test]
+    async fn component_chain_adapter_enforces_caps_and_uses_mediated_host() {
+        let host = Arc::new(MockHost::default());
+        let mut store = component_test_store(BTreeSet::new(), None, host.clone());
+        let req = ComponentVal::Record(vec![
+            ("chain".into(), ComponentVal::String("polygon".into())),
+            ("method".into(), ComponentVal::String("eth_call".into())),
+            (
+                "params-json".into(),
+                ComponentVal::String(r#"{"to":"0x1"}"#.into()),
+            ),
+        ]);
+
+        let mut denied = vec![ComponentVal::Bool(false)];
+        component_chain_call(store.as_context_mut(), &[req.clone()], &mut denied)
+            .await
+            .unwrap();
+        assert_component_err_contains(&denied[0], "denied");
+        assert!(host.chain_calls.lock().is_empty());
+
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::Chain);
+        let mut store = component_test_store(caps, None, host.clone());
+        let mut allowed = vec![ComponentVal::Bool(false)];
+        component_chain_call(store.as_context_mut(), &[req], &mut allowed)
+            .await
+            .unwrap();
+        assert_component_ok_chain_result(&allowed[0], r#"{"ok":true}"#);
+
+        let calls = host.chain_calls.lock();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].chain, "polygon");
+        assert_eq!(calls[0].method, "eth_call");
+        assert_eq!(calls[0].params_json, r#"{"to":"0x1"}"#);
+    }
+
+    #[tokio::test]
     async fn component_http_sign_and_vfs_adapters_use_mediated_host() {
         let host = Arc::new(MockHost::default());
         host.store
@@ -3484,6 +3569,19 @@ paths = ["/status"]
         };
         let body = component_record_field(fields, "body").unwrap();
         assert_eq!(component_byte_list(body, "body").unwrap(), expected);
+    }
+
+    fn assert_component_ok_chain_result(value: &ComponentVal, expected: &str) {
+        let ComponentVal::Result(Ok(Some(payload))) = value else {
+            panic!("expected component ok result, got {value:?}");
+        };
+        let ComponentVal::Record(fields) = payload.as_ref() else {
+            panic!("expected response record payload, got {payload:?}");
+        };
+        assert_eq!(
+            component_record_string(fields, "result-json").unwrap(),
+            expected
+        );
     }
 
     fn assert_component_ok_entry_names(value: &ComponentVal, expected: &[&str]) {
