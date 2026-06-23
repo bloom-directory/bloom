@@ -16,6 +16,7 @@ bloom-script.workspace = true
 bloom-value.workspace = true
 url.workspace = true
 wasmparser = "0.218"
+wasm-compose = "0.252"
 async-trait.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
@@ -31,8 +32,8 @@ parking_lot.workspace = true
 wasmtime.workspace = true
 wasmtime-wasi.workspace = true
 wat.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 futures.workspace = true
 wasm-encoder = "0.218"

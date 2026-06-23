@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use wasm_compose::{
+    composer::ComponentComposer,
+    config::{Config as ComposeConfig, Dependency as ComposeDependency},
+};
 use wasmparser::{
     CanonicalFunction, ComponentAlias, ComponentDefinedType, ComponentExternalKind,
     ComponentFuncResult, ComponentFuncType, ComponentOuterAliasKind, ComponentType,
@@ -159,6 +163,40 @@ pub struct BuildManifestRoute {
     pub artifact_path: String,
     pub artifact_hash: String,
     pub abi: RouteAbi,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteSidecarToml {
+    abi: RouteSidecarAbi,
+    component: String,
+    #[serde(default)]
+    imports: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RouteSidecarAbi {
+    Component,
+    CompatPetalDispatch,
+}
+
+impl RouteSidecarAbi {
+    fn route_abi(self) -> RouteAbi {
+        match self {
+            RouteSidecarAbi::Component => RouteAbi::ComponentBloomRoute010,
+            RouteSidecarAbi::CompatPetalDispatch => RouteAbi::CompatPetalDispatchV1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RouteSidecar {
+    path: String,
+    app_name: String,
+    abi: RouteSidecarAbi,
+    component: String,
+    imports: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,31 +426,79 @@ impl PreparedAppPackage {
         for route in route_files {
             let source_path = route.source_path.to_string_lossy().replace('\\', "/");
             let source_bytes = file_bytes(&files, &source_path)?;
-            let validation = validate_route_wasm(
-                &source_path,
-                source_bytes,
-                &allowed_caps,
-                &allowed_sign_intents,
-            )?;
             let artifact_path = format!("artifacts/routes/{}.wasm", route.route_id);
-            let artifact_bytes =
-                if let Some(artifact_bytes) = optional_file_bytes(&files, &artifact_path) {
+            let artifact_bytes = route_artifact_bytes_from_files(
+                &files,
+                &manifest.name,
+                &route.route_id,
+                &source_path,
+                &artifact_path,
+            )?;
+            let sidecar = route_sidecar(&files, &manifest.name, &source_path)?;
+            let validation = if let Some(sidecar) = &sidecar {
+                let package_imports = sidecar_package_import_names(sidecar, &route.route_id)?;
+                let source_validation = validate_route_wasm_with_package_imports(
+                    &source_path,
+                    source_bytes,
+                    &allowed_caps,
+                    &allowed_sign_intents,
+                    &package_imports,
+                )?;
+                if source_validation.abi != sidecar.abi.route_abi() {
+                    return Err(PetalError::InvalidWasm(format!(
+                        "v2 route sidecar {} declares {:?} but source route validates as {:?}",
+                        sidecar.path, sidecar.abi, source_validation.abi
+                    )));
+                }
+                let sidecar_source_validation = validate_route_wasm_with_package_imports(
+                    &sidecar.component,
+                    file_bytes(&files, &sidecar.component)?,
+                    &allowed_caps,
+                    &allowed_sign_intents,
+                    &package_imports,
+                )?;
+                if sidecar_source_validation.abi != source_validation.abi {
+                    return Err(PetalError::InvalidWasm(format!(
+                        "v2 route sidecar {} component ABI does not match source route",
+                        sidecar.path
+                    )));
+                }
+                let artifact_validation = validate_composed_route_artifact_wasm(
+                    &artifact_path,
+                    &artifact_bytes,
+                    &allowed_caps,
+                    &allowed_sign_intents,
+                )?;
+                if artifact_validation.abi != source_validation.abi {
+                    return Err(PetalError::InvalidWasm(format!(
+                        "v2 package artifact {} ABI does not match source route",
+                        route.route_id
+                    )));
+                }
+                artifact_validation
+            } else {
+                let source_validation = validate_route_wasm(
+                    &source_path,
+                    source_bytes,
+                    &allowed_caps,
+                    &allowed_sign_intents,
+                )?;
+                if optional_file_bytes(&files, &artifact_path).is_some() {
                     let artifact_validation = validate_route_wasm(
                         &artifact_path,
-                        artifact_bytes,
+                        &artifact_bytes,
                         &allowed_caps,
                         &allowed_sign_intents,
                     )?;
-                    if artifact_validation != validation {
+                    if artifact_validation != source_validation {
                         return Err(PetalError::InvalidWasm(format!(
                             "v2 package artifact {} ABI/caps do not match source route",
                             route.route_id
                         )));
                     }
-                    artifact_bytes
-                } else {
-                    source_bytes
-                };
+                }
+                source_validation
+            };
             let (kind, ops) = route_kind_and_ops(&source_path);
             let install_metadata = install_metadata_for_route(
                 &hash,
@@ -420,7 +506,7 @@ impl PreparedAppPackage {
                 &route,
                 kind,
                 &validation,
-                artifact_bytes,
+                &artifact_bytes,
                 &allowed_caps,
                 &allowed_sign_intents,
             )?;
@@ -429,7 +515,7 @@ impl PreparedAppPackage {
                 pattern: route.pattern,
                 source_path,
                 artifact_path,
-                artifact_hash: hex::encode(blake3::hash(artifact_bytes).as_bytes()),
+                artifact_hash: hex::encode(blake3::hash(&artifact_bytes).as_bytes()),
                 abi: validation.abi,
                 kind,
                 ops,
@@ -640,17 +726,8 @@ pub fn build_app_package_dir(root: impl AsRef<Path>) -> Result<PreparedAppPackag
     let manifest = build_manifest_for_package(&source_package)?;
 
     for route in &source_package.route_index.routes {
-        let source = source_package
-            .files
-            .iter()
-            .find(|file| file.path == route.source_path)
-            .ok_or_else(|| {
-                PetalError::InvalidWasm(format!(
-                    "route index source missing from package: {}",
-                    route.source_path
-                ))
-            })?;
-        write_package_file(root, &route.artifact_path, &source.bytes)?;
+        let artifact = route_artifact_bytes(&source_package, route)?;
+        write_package_file(root, &route.artifact_path, &artifact)?;
     }
     write_package_file(
         root,
@@ -756,12 +833,14 @@ fn build_manifest_for_package(package: &PreparedAppPackage) -> Result<BuildManif
                     route.source_path
                 ))
             })?;
-        let artifact_hash = hex::encode(blake3::hash(&source.bytes).as_bytes());
+        let artifact = route_artifact_bytes(package, route)?;
+        let source_hash = hex::encode(blake3::hash(&source.bytes).as_bytes());
+        let artifact_hash = hex::encode(blake3::hash(&artifact).as_bytes());
         routes.push(BuildManifestRoute {
             route_id: route.route_id.clone(),
             pattern: route.pattern.clone(),
             source_path: route.source_path.clone(),
-            source_hash: artifact_hash.clone(),
+            source_hash,
             artifact_path: route.artifact_path.clone(),
             artifact_hash,
             abi: route.abi,
@@ -772,6 +851,215 @@ fn build_manifest_for_package(package: &PreparedAppPackage) -> Result<BuildManif
         source_package_hash: package.hash.clone(),
         routes,
     })
+}
+
+pub(crate) fn route_artifact_bytes(
+    package: &PreparedAppPackage,
+    route: &RouteIndexRecord,
+) -> Result<Vec<u8>, PetalError> {
+    route_artifact_bytes_from_files(
+        &package.files,
+        &package.name,
+        &route.route_id,
+        &route.source_path,
+        &route.artifact_path,
+    )
+}
+
+fn route_artifact_bytes_from_files(
+    files: &[NormalizedPackageFile],
+    app_name: &str,
+    route_id: &str,
+    source_path: &str,
+    artifact_path: &str,
+) -> Result<Vec<u8>, PetalError> {
+    let sidecar = route_sidecar(files, app_name, source_path)?;
+    let generated_artifact = optional_file_bytes(files, artifact_path);
+    let expected = if let Some(sidecar) = sidecar {
+        let expected = route_sidecar_artifact(files, route_id, &sidecar)?;
+        if let Some(artifact) = generated_artifact {
+            if blake3::hash(artifact) != blake3::hash(&expected) {
+                return Err(PetalError::InvalidWasm(format!(
+                    "v2 package artifact {route_id} does not match route sidecar composition"
+                )));
+            }
+            return Ok(artifact.to_vec());
+        }
+        expected
+    } else {
+        file_bytes(files, source_path)?.to_vec()
+    };
+    Ok(generated_artifact
+        .map(|artifact| artifact.to_vec())
+        .unwrap_or(expected))
+}
+
+fn route_sidecar_artifact(
+    files: &[NormalizedPackageFile],
+    route_id: &str,
+    sidecar: &RouteSidecar,
+) -> Result<Vec<u8>, PetalError> {
+    let component = file_bytes(files, &sidecar.component)?.to_vec();
+    if sidecar.abi == RouteSidecarAbi::CompatPetalDispatch {
+        if !sidecar.imports.is_empty() {
+            return Err(PetalError::InvalidWasm(format!(
+                "v2 route {route_id} compat sidecar cannot declare component imports"
+            )));
+        }
+        return Ok(component);
+    }
+    if sidecar.imports.is_empty() {
+        return Ok(component);
+    }
+    compose_route_component(files, route_id, sidecar)
+}
+
+fn compose_route_component(
+    files: &[NormalizedPackageFile],
+    route_id: &str,
+    sidecar: &RouteSidecar,
+) -> Result<Vec<u8>, PetalError> {
+    let tmp = tempfile::tempdir().map_err(PetalError::Io)?;
+    let root = tmp.path();
+    write_package_file(
+        root,
+        &sidecar.component,
+        file_bytes(files, &sidecar.component)?,
+    )?;
+    let mut config = ComposeConfig {
+        dir: root.to_path_buf(),
+        disallow_imports: false,
+        ..ComposeConfig::default()
+    };
+    for import in &sidecar.imports {
+        write_package_file(root, import, file_bytes(files, import)?)?;
+        let path = PathBuf::from(import);
+        for name in sidecar_import_names(sidecar, import, route_id)? {
+            insert_compose_dependency(&mut config, &name, &path, route_id)?;
+        }
+    }
+    ComponentComposer::new(&root.join(&sidecar.component), &config)
+        .compose()
+        .map_err(|e| {
+            PetalError::InvalidWasm(format!(
+                "v2 route {route_id} component composition failed: {e}"
+            ))
+        })
+}
+
+fn insert_compose_dependency(
+    config: &mut ComposeConfig,
+    name: &str,
+    path: &Path,
+    route_id: &str,
+) -> Result<(), PetalError> {
+    if let Some(existing) = config.dependencies.get(name) {
+        if existing.path != path {
+            return Err(PetalError::InvalidWasm(format!(
+                "v2 route {route_id} sidecar maps dependency {name:?} to both {} and {}",
+                existing.path.display(),
+                path.display()
+            )));
+        }
+        return Ok(());
+    }
+    config.dependencies.insert(
+        name.to_string(),
+        ComposeDependency {
+            path: path.to_path_buf(),
+        },
+    );
+    Ok(())
+}
+
+fn sidecar_package_import_names(
+    sidecar: &RouteSidecar,
+    route_id: &str,
+) -> Result<BTreeSet<String>, PetalError> {
+    let mut names = BTreeSet::new();
+    for import in &sidecar.imports {
+        names.extend(sidecar_import_names(sidecar, import, route_id)?);
+    }
+    Ok(names)
+}
+
+fn sidecar_import_names(
+    sidecar: &RouteSidecar,
+    import: &str,
+    route_id: &str,
+) -> Result<Vec<String>, PetalError> {
+    let stem = Path::new(import)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| {
+            PetalError::InvalidWasm(format!(
+                "v2 route {route_id} sidecar import {import:?} has no utf-8 stem"
+            ))
+        })?;
+    let mut names = vec![stem.to_string()];
+    if let Some(path_alias) = import.strip_suffix(".wasm") {
+        names.push(path_alias.to_string());
+    }
+    names.push(format!("bloom:{}/{stem}", sidecar.app_name));
+    names.push(format!("bloom:{}/{stem}@0.1.0", sidecar.app_name));
+    Ok(names)
+}
+
+fn route_sidecar(
+    files: &[NormalizedPackageFile],
+    app_name: &str,
+    source_path: &str,
+) -> Result<Option<RouteSidecar>, PetalError> {
+    let Some(stem) = source_path.strip_suffix(".wasm") else {
+        return Ok(None);
+    };
+    let path = format!("{stem}.route.toml");
+    let Some(bytes) = optional_file_bytes(files, &path) else {
+        return Ok(None);
+    };
+    let toml = std::str::from_utf8(bytes)
+        .map_err(|_| PetalError::InvalidWasm(format!("v2 route sidecar {path} is not utf-8")))?;
+    let parsed: RouteSidecarToml = toml::from_str(toml)?;
+    validate_route_sidecar_path(&path, &parsed.component, true)?;
+    for import in &parsed.imports {
+        validate_route_sidecar_path(&path, import, false)?;
+    }
+    Ok(Some(RouteSidecar {
+        path,
+        app_name: app_name.to_string(),
+        abi: parsed.abi,
+        component: parsed.component,
+        imports: parsed.imports,
+    }))
+}
+
+fn validate_route_sidecar_path(
+    sidecar_path: &str,
+    rel: &str,
+    primary: bool,
+) -> Result<(), PetalError> {
+    validate_package_path(rel)?;
+    if !rel.ends_with(".wasm") {
+        return Err(PetalError::InvalidWasm(format!(
+            "v2 route sidecar {sidecar_path} path {rel:?} must point to a .wasm component"
+        )));
+    }
+    let allowed = if primary {
+        rel.starts_with("modules/") || rel.starts_with("components/")
+    } else {
+        rel.starts_with("components/")
+    };
+    if !allowed {
+        return Err(PetalError::InvalidWasm(format!(
+            "v2 route sidecar {sidecar_path} path {rel:?} must be package-local under {}",
+            if primary {
+                "modules/ or components/"
+            } else {
+                "components/"
+            }
+        )));
+    }
+    Ok(())
 }
 
 fn validate_generated_artifact_paths(root: &Path) -> Result<(), PetalError> {
@@ -1303,6 +1591,43 @@ fn validate_route_wasm(
     allowed_caps: &BTreeSet<String>,
     allowed_sign_intents: &BTreeSet<String>,
 ) -> Result<RouteValidation, PetalError> {
+    validate_route_wasm_inner(path, wasm, allowed_caps, allowed_sign_intents, None, false)
+}
+
+fn validate_route_wasm_with_package_imports(
+    path: &str,
+    wasm: &[u8],
+    allowed_caps: &BTreeSet<String>,
+    allowed_sign_intents: &BTreeSet<String>,
+    allowed_package_imports: &BTreeSet<String>,
+) -> Result<RouteValidation, PetalError> {
+    validate_route_wasm_inner(
+        path,
+        wasm,
+        allowed_caps,
+        allowed_sign_intents,
+        Some(allowed_package_imports),
+        false,
+    )
+}
+
+fn validate_composed_route_artifact_wasm(
+    path: &str,
+    wasm: &[u8],
+    allowed_caps: &BTreeSet<String>,
+    allowed_sign_intents: &BTreeSet<String>,
+) -> Result<RouteValidation, PetalError> {
+    validate_route_wasm_inner(path, wasm, allowed_caps, allowed_sign_intents, None, true)
+}
+
+fn validate_route_wasm_inner(
+    path: &str,
+    wasm: &[u8],
+    allowed_caps: &BTreeSet<String>,
+    allowed_sign_intents: &BTreeSet<String>,
+    allowed_package_imports: Option<&BTreeSet<String>>,
+    allow_untyped_component_alias_exports: bool,
+) -> Result<RouteValidation, PetalError> {
     Validator::new()
         .validate_all(wasm)
         .map_err(|e| PetalError::InvalidWasm(format!("{path}: invalid route wasm: {e}")))?;
@@ -1455,6 +1780,12 @@ fn validate_route_wasm(
                         return Err(PetalError::InvalidWasm(format!(
                             "{path}: component route import {name:?} must be an interface instance"
                         )));
+                    }
+                    if allowed_package_imports
+                        .is_some_and(|package_imports| package_imports.contains(name))
+                    {
+                        component_instance_route_type_imports.push(false);
+                        continue;
                     }
                     let Some(caps) = component_import_caps(name) else {
                         return Err(PetalError::InvalidWasm(format!(
@@ -1615,6 +1946,7 @@ fn validate_route_wasm(
             &component_exports,
             &component_func_type_indices,
             &component_types,
+            allow_untyped_component_alias_exports,
         )?;
         return Ok(RouteValidation {
             abi: RouteAbi::ComponentBloomRoute010,
@@ -1681,6 +2013,7 @@ fn validate_component_route_exports(
     exports: &[ComponentRouteExport],
     func_type_indices: &[u32],
     types: &[ComponentTypeEntry<'_>],
+    allow_untyped_alias_exports: bool,
 ) -> Result<(), PetalError> {
     if component_route_export_type("metadata", exports, func_type_indices).is_none() {
         return Err(PetalError::InvalidWasm(format!(
@@ -1705,6 +2038,9 @@ fn validate_component_route_exports(
                     export.name
                 ))
             })?;
+        if allow_untyped_alias_exports && type_index == u32::MAX {
+            continue;
+        }
         let ty = component_func_type(path, type_index, types)?;
         validate_component_route_func_sig(path, expected, ty, types)?;
     }
@@ -3333,6 +3669,305 @@ name = "echo"
     }
 
     #[test]
+    fn v2_route_sidecar_builds_artifact_from_module_component() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_package_file(
+            tmp.path(),
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
+        write_package_file(tmp.path(), "README.md", b"# echo");
+        write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
+        write_package_file(
+            tmp.path(),
+            "app/echo/message.txt.wasm",
+            route_component_no_imports(),
+        );
+        write_package_file(
+            tmp.path(),
+            "app/echo/message.txt.route.toml",
+            br#"abi = "component"
+component = "modules/message.wasm"
+"#,
+        );
+        write_package_file(
+            tmp.path(),
+            "modules/message.wasm",
+            route_component_metadata(),
+        );
+
+        let package = build_app_package_dir(tmp.path()).unwrap();
+        let route = &package.route_index.routes[0];
+        let artifact = std::fs::read(tmp.path().join(&route.artifact_path)).unwrap();
+        assert_eq!(artifact, route_component_metadata());
+        assert_eq!(
+            route.artifact_hash,
+            hex::encode(blake3::hash(route_component_metadata()).as_bytes())
+        );
+        assert_eq!(route.install_metadata.cache_ttl_ms, Some(2000));
+        let manifest: BuildManifest = serde_json::from_slice(
+            &std::fs::read(tmp.path().join("artifacts/build-manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(
+            manifest.routes[0].source_hash,
+            manifest.routes[0].artifact_hash
+        );
+    }
+
+    #[test]
+    fn v2_route_sidecar_rejects_non_component_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_route(tmp.path(), route_component_metadata());
+        write_package_file(
+            tmp.path(),
+            "app/echo/hello.txt.route.toml",
+            br#"abi = "component"
+component = "app/echo/hello.txt.wasm"
+"#,
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("modules/ or components/"));
+    }
+
+    #[test]
+    fn v2_route_sidecar_rejects_abi_hint_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_package_file(
+            tmp.path(),
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
+        write_package_file(tmp.path(), "README.md", b"# echo");
+        write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
+        write_package_file(
+            tmp.path(),
+            "app/echo/message.txt.wasm",
+            route_component_no_imports(),
+        );
+        write_package_file(
+            tmp.path(),
+            "app/echo/message.txt.route.toml",
+            br#"abi = "compat-petal-dispatch"
+component = "modules/message.wasm"
+"#,
+        );
+        write_package_file(
+            tmp.path(),
+            "modules/message.wasm",
+            route_component_metadata(),
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("declares CompatPetalDispatch"));
+    }
+
+    #[test]
+    fn v2_route_sidecar_still_requires_valid_route_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_package_file(
+            tmp.path(),
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
+        write_package_file(tmp.path(), "README.md", b"# echo");
+        write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
+        write_package_file(tmp.path(), "app/echo/message.txt.wasm", b"not wasm");
+        write_package_file(
+            tmp.path(),
+            "app/echo/message.txt.route.toml",
+            br#"abi = "component"
+component = "modules/message.wasm"
+"#,
+        );
+        write_package_file(
+            tmp.path(),
+            "modules/message.wasm",
+            route_component_metadata(),
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("invalid route wasm"));
+    }
+
+    #[test]
+    fn v2_route_sidecar_rejects_mismatched_generated_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_package_file(
+            tmp.path(),
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
+        write_package_file(tmp.path(), "README.md", b"# echo");
+        write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
+        write_package_file(
+            tmp.path(),
+            "app/echo/message.txt.wasm",
+            route_component_no_imports(),
+        );
+        write_package_file(
+            tmp.path(),
+            "app/echo/message.txt.route.toml",
+            br#"abi = "component"
+component = "modules/message.wasm"
+"#,
+        );
+        write_package_file(
+            tmp.path(),
+            "modules/message.wasm",
+            route_component_metadata(),
+        );
+        write_package_file(
+            tmp.path(),
+            "artifacts/routes/r000001.wasm",
+            route_component_no_imports(),
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match route sidecar composition")
+        );
+    }
+
+    #[test]
+    fn v2_route_sidecar_rejects_missing_import_component() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_package_file(
+            tmp.path(),
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
+        write_package_file(tmp.path(), "README.md", b"# echo");
+        write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
+        write_package_file(
+            tmp.path(),
+            "app/echo/message.txt.wasm",
+            route_component_no_imports(),
+        );
+        write_package_file(
+            tmp.path(),
+            "app/echo/message.txt.route.toml",
+            br#"abi = "component"
+component = "modules/message.wasm"
+imports = ["components/missing.wasm"]
+"#,
+        );
+        write_package_file(
+            tmp.path(),
+            "modules/message.wasm",
+            route_component_metadata(),
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("components/missing.wasm"));
+    }
+
+    #[test]
+    fn v2_route_sidecar_composes_package_local_import_alias() {
+        let root = wat::parse_str(
+            r#"
+(component
+  (import "bloom:echo/helper@0.1.0" (instance))
+)
+"#,
+        )
+        .unwrap();
+        let helper = wat::parse_str(
+            r#"
+(component
+  (instance)
+  (export "bloom:echo/helper@0.1.0" (instance 0))
+)
+"#,
+        )
+        .unwrap();
+        let files = normalize_files(vec![
+            NormalizedPackageFile {
+                path: "components/helper.wasm".into(),
+                bytes: helper,
+            },
+            NormalizedPackageFile {
+                path: "modules/root.wasm".into(),
+                bytes: root.clone(),
+            },
+        ])
+        .unwrap();
+        let sidecar = RouteSidecar {
+            path: "app/echo/message.txt.route.toml".into(),
+            app_name: "echo".into(),
+            abi: RouteSidecarAbi::Component,
+            component: "modules/root.wasm".into(),
+            imports: vec!["components/helper.wasm".into()],
+        };
+
+        let composed = route_sidecar_artifact(&files, "r000001", &sidecar).unwrap();
+        Validator::new().validate_all(&composed).unwrap();
+        assert_ne!(blake3::hash(&root), blake3::hash(&composed));
+    }
+
+    #[test]
+    fn v2_route_sidecar_builds_route_with_package_local_import() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_package_file(
+            tmp.path(),
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
+        write_package_file(tmp.path(), "README.md", b"# echo");
+        write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
+        write_package_file(
+            tmp.path(),
+            "app/echo/message.txt.wasm",
+            route_component_package_import(),
+        );
+        write_package_file(
+            tmp.path(),
+            "app/echo/message.txt.route.toml",
+            br#"abi = "component"
+component = "modules/message.wasm"
+imports = ["components/helper.wasm"]
+"#,
+        );
+        write_package_file(
+            tmp.path(),
+            "modules/message.wasm",
+            route_component_package_import(),
+        );
+        write_package_file(
+            tmp.path(),
+            "components/helper.wasm",
+            &package_local_helper_component(),
+        );
+
+        let package = build_app_package_dir(tmp.path()).unwrap();
+        let route = &package.route_index.routes[0];
+        let artifact = std::fs::read(tmp.path().join(&route.artifact_path)).unwrap();
+        Validator::new().validate_all(&artifact).unwrap();
+        assert_ne!(
+            blake3::hash(route_component_package_import()),
+            blake3::hash(&artifact)
+        );
+        assert_eq!(
+            route.artifact_hash,
+            hex::encode(blake3::hash(&artifact).as_bytes())
+        );
+    }
+
+    #[test]
     fn v2_tar_rejects_duplicate_and_traversal_paths() {
         let duplicate =
             PreparedAppPackage::from_reader(std::io::Cursor::new(package_tar_bytes(vec![
@@ -4220,8 +4855,24 @@ name = "echo"
         include_bytes!("../tests/fixtures/route_component_metadata.wasm")
     }
 
+    fn route_component_package_import() -> &'static [u8] {
+        include_bytes!("../tests/fixtures/route_component_package_import.wasm")
+    }
+
     fn route_component_executable() -> &'static [u8] {
         include_bytes!("../tests/fixtures/route_component_executable.wasm")
+    }
+
+    fn package_local_helper_component() -> Vec<u8> {
+        wat::parse_str(
+            r#"
+(component
+  (instance)
+  (export "bloom:echo/helper@0.1.0" (instance 0))
+)
+"#,
+        )
+        .unwrap()
     }
 
     fn route_component(exports: &[&str], imports: &[&str]) -> Vec<u8> {

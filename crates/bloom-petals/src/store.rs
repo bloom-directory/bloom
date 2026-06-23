@@ -19,7 +19,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::PetalError;
 use crate::meta::{Capability, LocalAppMeta, PetalMeta, PetalMode};
-use crate::v2::{PreparedAppPackage, ROUTE_INDEX_SCHEMA, RouteIndex, verify_prepared_package};
+use crate::v2::{
+    PreparedAppPackage, ROUTE_INDEX_SCHEMA, RouteIndex, route_artifact_bytes,
+    verify_prepared_package,
+};
 
 const OBJECTS: &str = "objects";
 const META: &str = "meta";
@@ -218,8 +221,8 @@ impl PetalStore {
                 write_package_file(&tmp.join(SOURCE), &file.path, &file.bytes)?;
             }
             for route in &package.route_index.routes {
-                let artifact = route_artifact_bytes(&package, route)?;
-                write_package_file(&tmp, &route.artifact_path, artifact)?;
+                let artifact = checked_route_artifact_bytes(&package, route)?;
+                write_package_file(&tmp, &route.artifact_path, &artifact)?;
             }
             let index_bytes = serde_json::to_vec_pretty(&package.route_index)?;
             atomic_write(&tmp.join(ROUTE_INDEX), &index_bytes)?;
@@ -478,34 +481,19 @@ fn write_package_file(root: &Path, rel: &str, data: &[u8]) -> Result<(), PetalEr
     Ok(())
 }
 
-fn route_artifact_bytes<'a>(
-    package: &'a PreparedAppPackage,
+fn checked_route_artifact_bytes(
+    package: &PreparedAppPackage,
     route: &crate::v2::RouteIndexRecord,
-) -> Result<&'a [u8], PetalError> {
-    let file = package
-        .files
-        .iter()
-        .find(|file| file.path == route.artifact_path)
-        .or_else(|| {
-            package
-                .files
-                .iter()
-                .find(|file| file.path == route.source_path)
-        })
-        .ok_or_else(|| {
-            PetalError::InvalidWasm(format!(
-                "route index artifact/source missing from package: {} / {}",
-                route.artifact_path, route.source_path
-            ))
-        })?;
-    let artifact_hash = hex::encode(blake3::hash(&file.bytes).as_bytes());
+) -> Result<Vec<u8>, PetalError> {
+    let artifact = route_artifact_bytes(package, route)?;
+    let artifact_hash = hex::encode(blake3::hash(&artifact).as_bytes());
     if artifact_hash != route.artifact_hash {
         return Err(PetalError::InvalidWasm(format!(
             "v2 package artifact {} hash mismatch",
             route.route_id
         )));
     }
-    Ok(file.bytes.as_slice())
+    Ok(artifact)
 }
 
 fn collect_meta_hashes(dir: PathBuf, out: &mut BTreeSet<String>) -> Result<(), PetalError> {
