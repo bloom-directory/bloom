@@ -1,0 +1,7 @@
+schema = "bloom.petal.local-app.v2"
+name = "gas-now"
+version = "0.1.0"
+description = "Minimal v2 local app package for gas endpoint routing examples."
+
+[caps]
+allowed = []

@@ -189,7 +189,7 @@ enum Cmd {
     #[command(subcommand)]
     Ipc(IpcCmd),
     /// Manage wasm petals: install, run, list, name.
-    #[command(subcommand)]
+    #[command(subcommand, visible_alias = "petal")]
     Petals(PetalsCmd),
     /// Polymarket: onboard a wallet.
     #[command(subcommand)]
@@ -263,9 +263,9 @@ enum VfsCmd {
 
 #[derive(Subcommand, Debug)]
 enum PetalsCmd {
-    /// Install a wasm (or WAT) module at `<path>`. Accepts `-` for stdin.
+    /// Install a wasm/WAT module, v2 package directory, or `.petal.tar`.
     Install {
-        /// Path to a `.wasm` or `.wat` file, or `-` for stdin.
+        /// Path to a `.wasm`, `.wat`, package directory, `.petal.tar`, or `-` for stdin.
         path: String,
         /// Petname to bind to the resulting hash.
         #[arg(long)]
@@ -275,6 +275,9 @@ enum PetalsCmd {
         #[arg(long = "cap", value_name = "CAP")]
         caps: Vec<String>,
     },
+    /// Author and validate v2 local app packages.
+    #[command(subcommand)]
+    App(PetalAppCmd),
     /// Run a petal by petname or hash.
     Run {
         /// Petname or 64-char hex hash.
@@ -297,6 +300,18 @@ enum PetalsCmd {
     Uninstall {
         /// 64-char hex content hash of the petal to remove.
         hash: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PetalAppCmd {
+    /// Validate a v2 package directory and optionally emit a deterministic `.petal.tar`.
+    Build {
+        /// Package directory containing petal.toml, README.md, AGENTS.md, and app/<name>/.
+        package_dir: String,
+        /// Write a deterministic `.petal.tar` archive.
+        #[arg(long, value_name = "ARCHIVE")]
+        out: Option<String>,
     },
 }
 
@@ -1575,11 +1590,64 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
 
     use bloom_petals::{Capability, RunOptions, VfsHost};
 
+    let cmd = match cmd {
+        PetalsCmd::App(PetalAppCmd::Build { package_dir, out }) => {
+            let package = bloom_petals::v2::PreparedAppPackage::from_dir(&package_dir)
+                .with_context(|| format!("validate app package {package_dir}"))?;
+            println!("hash: {}", package.hash);
+            println!("app_mount: apps/{}/", package.name);
+            println!("routes: {}", package.route_index.routes.len());
+            if let Some(out) = out {
+                let file =
+                    std::fs::File::create(&out).with_context(|| format!("create archive {out}"))?;
+                package
+                    .write_petal_tar(file)
+                    .with_context(|| format!("write archive {out}"))?;
+                println!("archive: {out}");
+            }
+            return Ok(());
+        }
+        other => other,
+    };
+
     let d = Daemon::from_home(home).context("build daemon")?;
     let vfs_arc = std::sync::Arc::new(d.vfs.clone());
 
     match cmd {
         PetalsCmd::Install { path, name, caps } => {
+            if path != "-" {
+                let meta = std::fs::metadata(&path).with_context(|| format!("stat {path}"))?;
+                if meta.is_dir() || path.ends_with(".petal.tar") {
+                    if name.is_some() || !caps.is_empty() {
+                        anyhow::bail!(
+                            "--name and --cap apply only to single-WASM installs; v2 app packages use petal.toml"
+                        );
+                    }
+                    let (result, meta, index) = if meta.is_dir() {
+                        d.petals
+                            .store()
+                            .install_app_package_dir(&path)
+                            .with_context(|| format!("install app package dir {path}"))?
+                    } else {
+                        d.petals
+                            .store()
+                            .install_app_package_tar(&path)
+                            .with_context(|| format!("install app package archive {path}"))?
+                    };
+                    println!("hash: {}", result.hash);
+                    println!("mode: local-app");
+                    println!("size: {} bytes", result.size);
+                    if result.already_present {
+                        println!("note: already installed");
+                    }
+                    if let Some(app) = &meta.local_app {
+                        println!("app_mount: apps/{}/", app.name);
+                    }
+                    println!("routes: {}", index.routes.len());
+                    return Ok(());
+                }
+            }
+
             let bytes = if path == "-" {
                 let mut buf = Vec::new();
                 std::io::stdin()
@@ -1620,6 +1688,7 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
             print_local_petal_consent(&meta, d.petals.store().private_data_root());
             Ok(())
         }
+        PetalsCmd::App(_) => unreachable!("petal app commands are handled before daemon startup"),
         PetalsCmd::Run {
             name_or_hash,
             input,
@@ -1670,7 +1739,12 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                 name_for_hash.entry(h.clone()).or_insert(n.clone());
             }
             let hashes = d.petals.store().list_hashes().context("list petals")?;
-            if hashes.is_empty() {
+            let package_hashes = d
+                .petals
+                .store()
+                .list_package_hashes()
+                .context("list app packages")?;
+            if hashes.is_empty() && package_hashes.is_empty() {
                 println!("(no petals installed)");
                 return Ok(());
             }
@@ -1690,6 +1764,21 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                     meta.size,
                     caps.join(","),
                     n,
+                    app
+                );
+            }
+            for h in package_hashes {
+                let meta = d.petals.store().load_meta(&h).context("load meta")?;
+                let app = meta
+                    .local_app
+                    .as_ref()
+                    .map(|app| format!("  app=apps/{}/", app.name))
+                    .unwrap_or_default();
+                println!(
+                    "{}  {:<7}  {:>7}  caps=[]  name=-{}",
+                    &meta.hash[..12],
+                    "app",
+                    meta.size,
                     app
                 );
             }

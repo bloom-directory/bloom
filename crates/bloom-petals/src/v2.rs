@@ -6,7 +6,7 @@
 //! matures.
 
 use std::collections::BTreeSet;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,8 @@ use crate::error::PetalError;
 
 pub const ROUTE_INDEX_SCHEMA: &str = "bloom.petal.route-index.v1";
 const PACKAGE_DIGEST_PREFIX: &[u8] = b"bloom.petal.package.v2\0";
+const TAR_NAME_LEN: usize = 100;
+const TAR_PREFIX_LEN: usize = 155;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PetalAppPackage {
@@ -301,6 +303,11 @@ impl PreparedAppPackage {
             route_index,
         })
     }
+
+    pub fn write_petal_tar(&self, writer: impl Write) -> Result<(), PetalError> {
+        verify_prepared_package(self)?;
+        write_package_tar(&self.files, writer)
+    }
 }
 
 fn route_kind_and_ops(source_path: &str) -> (RouteEntryKind, Vec<RouteOp>) {
@@ -376,7 +383,22 @@ pub fn validate_package_path(path: &str) -> Result<(), PetalError> {
             "invalid v2 package path {path:?}"
         )));
     }
+    if !path_fits_ustar(path) {
+        return Err(PetalError::InvalidWasm(format!(
+            "v2 package path {path:?} is too long for strict .petal.tar archives"
+        )));
+    }
     Ok(())
+}
+
+fn path_fits_ustar(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.len() <= TAR_NAME_LEN {
+        return true;
+    }
+    path.rmatch_indices('/').any(|(idx, _)| {
+        idx <= TAR_PREFIX_LEN && bytes.len().saturating_sub(idx + 1) <= TAR_NAME_LEN
+    })
 }
 
 fn collect_package_dir(root: &Path) -> Result<Vec<NormalizedPackageFile>, PetalError> {
@@ -451,6 +473,27 @@ fn read_package_tar(reader: impl Read) -> Result<Vec<NormalizedPackageFile>, Pet
         });
     }
     Ok(files)
+}
+
+fn write_package_tar(
+    files: &[NormalizedPackageFile],
+    writer: impl Write,
+) -> Result<(), PetalError> {
+    let files = normalize_files(files.to_vec())?;
+    let mut builder = tar::Builder::new(writer);
+    for file in &files {
+        let mut header = tar::Header::new_ustar();
+        header.set_size(file.bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        builder.append_data(&mut header, &file.path, file.bytes.as_slice())?;
+    }
+    builder.finish()?;
+    Ok(())
 }
 
 fn validate_tar_entry_header(entry: &tar::Entry<'_, impl Read>) -> Result<(), PetalError> {
@@ -1228,7 +1271,13 @@ mod tests {
     #[test]
     fn v2_scanner_matches_static_and_dynamic_routes() {
         let tmp = tempfile::tempdir().unwrap();
-        write_package_file(tmp.path(), "petal.toml", br#"name = "echo""#);
+        write_package_file(
+            tmp.path(),
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
         write_package_file(tmp.path(), "README.md", b"# echo");
         write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
         write_package_file(tmp.path(), "app/echo/hello.txt.wasm", b"\0asm");
@@ -1262,6 +1311,23 @@ mod tests {
     }
 
     #[test]
+    fn v2_scanner_rejects_paths_too_long_for_strict_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_package_file(tmp.path(), "petal.toml", br#"name = "echo""#);
+        write_package_file(tmp.path(), "README.md", b"# echo");
+        write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
+        let file_name = format!("{}.wasm", "a".repeat(TAR_NAME_LEN + 1));
+        write_package_file(
+            tmp.path(),
+            &format!("app/echo/{file_name}"),
+            &compat_wasm("hello"),
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("too long for strict .petal.tar"));
+    }
+
+    #[test]
     fn v2_tar_and_dir_inputs_share_normalized_hash() {
         let tmp = tempfile::tempdir().unwrap();
         write_v2_package(tmp.path());
@@ -1284,6 +1350,59 @@ name = "echo"
         assert_eq!(dir.hash, tar.hash);
         assert_eq!(dir.route_index.routes, tar.route_index.routes);
         assert_eq!(dir.route_index.routes[0].route_id, "r000001");
+    }
+
+    #[test]
+    fn v2_write_petal_tar_emits_installable_deterministic_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package(tmp.path());
+        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
+
+        let mut first = Vec::new();
+        package.write_petal_tar(&mut first).unwrap();
+        let mut second = Vec::new();
+        package.write_petal_tar(&mut second).unwrap();
+        assert_eq!(first, second);
+
+        let from_tar = PreparedAppPackage::from_reader(std::io::Cursor::new(first)).unwrap();
+        assert_eq!(from_tar.hash, package.hash);
+        assert_eq!(from_tar.route_index, package.route_index);
+    }
+
+    #[test]
+    fn v2_write_petal_tar_uses_strict_headers_for_ustar_split_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_package_file(
+            tmp.path(),
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
+        write_package_file(tmp.path(), "README.md", b"# echo");
+        write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
+        let route_path = format!(
+            "app/echo/{}/hello.txt.wasm",
+            "nested-static-segment".repeat(4)
+        );
+        assert!(route_path.len() > TAR_NAME_LEN);
+        write_package_file(tmp.path(), &route_path, &compat_wasm("hello"));
+        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
+
+        let mut tar_bytes = Vec::new();
+        package.write_petal_tar(&mut tar_bytes).unwrap();
+
+        let mut archive = tar::Archive::new(std::io::Cursor::new(&tar_bytes));
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            let ty = entry.header().entry_type();
+            assert!(!ty.is_pax_global_extensions());
+            assert!(!ty.is_pax_local_extensions());
+            assert!(!ty.is_gnu_longname());
+            assert!(!ty.is_gnu_longlink());
+        }
+        let from_tar = PreparedAppPackage::from_reader(std::io::Cursor::new(tar_bytes)).unwrap();
+        assert_eq!(from_tar.hash, package.hash);
     }
 
     #[test]
