@@ -1247,20 +1247,22 @@ fn validate_route_wasm(
                             import.module, import.name
                         )));
                     };
-                    if cap == "bloom:sign" && allowed_sign_intents.is_empty() {
-                        return Err(PetalError::InvalidWasm(format!(
-                            "{path}: compatibility route import {}.{} requires [sign].allowed_intents",
-                            import.module, import.name
-                        )));
-                    }
                     validate_compat_import_sig(path, import.module, import.name, import_type)?;
-                    if !allowed_caps.contains(cap) {
-                        return Err(PetalError::InvalidWasm(format!(
-                            "{path}: compatibility route import {}.{} requires missing petal.toml cap {cap}",
-                            import.module, import.name
-                        )));
+                    if let Some(cap) = cap {
+                        if cap == "bloom:sign" && allowed_sign_intents.is_empty() {
+                            return Err(PetalError::InvalidWasm(format!(
+                                "{path}: compatibility route import {}.{} requires [sign].allowed_intents",
+                                import.module, import.name
+                            )));
+                        }
+                        if !allowed_caps.contains(cap) {
+                            return Err(PetalError::InvalidWasm(format!(
+                                "{path}: compatibility route import {}.{} requires missing petal.toml cap {cap}",
+                                import.module, import.name
+                            )));
+                        }
+                        required_caps.insert(cap.to_string());
                     }
-                    required_caps.insert(cap.to_string());
                 }
             }
             Payload::ComponentTypeSection(reader) => {
@@ -2520,21 +2522,39 @@ fn compat_import_signature(
             &[ValType::I32],
         )),
         ("bloom.v1", "store_del") => Some((&[ValType::I32, ValType::I32], &[ValType::I32])),
+        ("wasi_snapshot_preview1", "environ_get" | "environ_sizes_get" | "random_get") => {
+            Some((&[ValType::I32, ValType::I32], &[ValType::I32]))
+        }
+        ("wasi_snapshot_preview1", "clock_time_get") => {
+            Some((&[ValType::I32, ValType::I64, ValType::I32], &[ValType::I32]))
+        }
+        ("wasi_snapshot_preview1", "fd_write" | "poll_oneoff") => Some((
+            &[ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            &[ValType::I32],
+        )),
+        ("wasi_snapshot_preview1", "proc_exit") => Some((&[ValType::I32], &[])),
         _ => None,
     }
 }
 
-fn compat_import_cap(module: &str, name: &str) -> Option<&'static str> {
+fn compat_import_cap(module: &str, name: &str) -> Option<Option<&'static str>> {
     match (module, name) {
-        ("bloom", "vfs_read") | ("bloom.v1", "vfs_read" | "vfs_list") => Some("bloom:vfs.read"),
-        ("bloom", "vfs_write") | ("bloom.v1", "vfs_write") => Some("bloom:vfs.write"),
-        ("bloom.v1", "http_fetch") => Some("bloom:http"),
-        ("bloom.v1", "sign_hash") => Some("bloom:sign"),
+        ("bloom", "vfs_read") | ("bloom.v1", "vfs_read" | "vfs_list") => {
+            Some(Some("bloom:vfs.read"))
+        }
+        ("bloom", "vfs_write") | ("bloom.v1", "vfs_write") => Some(Some("bloom:vfs.write")),
+        ("bloom.v1", "http_fetch") => Some(Some("bloom:http")),
+        ("bloom.v1", "sign_hash") => Some(Some("bloom:sign")),
         (
             "bloom.v1",
             "store_get" | "store_put" | "store_put_new" | "store_del" | "store_del_if_value"
             | "store_list",
-        ) => Some("bloom:store"),
+        ) => Some(Some("bloom:store")),
+        (
+            "wasi_snapshot_preview1",
+            "clock_time_get" | "environ_get" | "environ_sizes_get" | "fd_write" | "poll_oneoff"
+            | "proc_exit" | "random_get",
+        ) => Some(None),
         _ => None,
     }
 }
@@ -3281,8 +3301,10 @@ name = "echo"
             &wat::parse_str(
                 r#"
                 (module
-                  (import "wasi_snapshot_preview1" "fd_write"
-                    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+                  (import "wasi_snapshot_preview1" "path_open"
+                    (func $path_open
+                      (param i32 i32 i32 i32 i32 i64 i64 i32 i32)
+                      (result i32)))
                   (memory (export "memory") 1)
                   (func (export "petal_alloc") (param i32) (result i32) (i32.const 1024))
                   (func (export "petal_dispatch") (param i32 i32) (result i64) (i64.const 0)))
@@ -3293,7 +3315,48 @@ name = "echo"
 
         let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("unsupported host function"));
-        assert!(err.to_string().contains("wasi_snapshot_preview1.fd_write"));
+        assert!(err.to_string().contains("wasi_snapshot_preview1.path_open"));
+    }
+
+    #[test]
+    fn v2_compat_routes_accept_preview1_runtime_imports_without_caps() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_route(
+            tmp.path(),
+            &wat::parse_str(
+                r#"
+                (module
+                  (import "wasi_snapshot_preview1" "clock_time_get"
+                    (func $clock_time_get (param i32 i64 i32) (result i32)))
+                  (import "wasi_snapshot_preview1" "environ_get"
+                    (func $environ_get (param i32 i32) (result i32)))
+                  (import "wasi_snapshot_preview1" "environ_sizes_get"
+                    (func $environ_sizes_get (param i32 i32) (result i32)))
+                  (import "wasi_snapshot_preview1" "fd_write"
+                    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+                  (import "wasi_snapshot_preview1" "poll_oneoff"
+                    (func $poll_oneoff (param i32 i32 i32 i32) (result i32)))
+                  (import "wasi_snapshot_preview1" "proc_exit"
+                    (func $proc_exit (param i32)))
+                  (import "wasi_snapshot_preview1" "random_get"
+                    (func $random_get (param i32 i32) (result i32)))
+                  (memory (export "memory") 1)
+                  (func (export "petal_alloc") (param i32) (result i32) (i32.const 1024))
+                  (func (export "petal_dispatch") (param i32 i32) (result i64)
+                    (drop (call $clock_time_get (i32.const 0) (i64.const 0) (i32.const 64)))
+                    (drop (call $environ_get (i32.const 96) (i32.const 128)))
+                    (drop (call $environ_sizes_get (i32.const 160) (i32.const 164)))
+                    (drop (call $fd_write (i32.const 1) (i32.const 192) (i32.const 0) (i32.const 196)))
+                    (drop (call $poll_oneoff (i32.const 224) (i32.const 256) (i32.const 0) (i32.const 260)))
+                    (drop (call $random_get (i32.const 288) (i32.const 8)))
+                    (if (i32.const 0) (then (call $proc_exit (i32.const 1))))
+                    (i64.const 0)))
+                "#,
+            )
+            .unwrap(),
+        );
+
+        PreparedAppPackage::from_dir(tmp.path()).unwrap();
     }
 
     #[test]

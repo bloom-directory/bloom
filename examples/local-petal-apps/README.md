@@ -9,6 +9,12 @@ Build installable package directories:
 ./examples/local-petal-apps/build-demo-apps.sh
 ```
 
+Build the larger Polymarket parity package:
+
+```sh
+./examples/local-petal-apps/build-demo-apps.sh polymarket
+```
+
 Build route artifacts and archive a package:
 
 ```sh
@@ -22,5 +28,6 @@ cargo run -p bloom -- petals install examples/local-petal-apps/build/echo
 cargo run -p bloom -- vfs cat apps/echo/message.txt
 ```
 
-Current bootstrap demos use the compatibility `petal_dispatch` ABI. Component
-route demos should replace these once the `bloom:route@0.1.0` runner lands.
+Current bootstrap demos use the compatibility `petal_dispatch` ABI. The
+Polymarket package wraps the existing compatibility petal across the v2 route
+tree while componentized Polymarket route modules mature.
