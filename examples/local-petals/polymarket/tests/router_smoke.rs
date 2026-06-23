@@ -130,7 +130,8 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
     let parity_text = String::from_utf8(parity).unwrap();
     let parity_json: serde_json::Value = serde_json::from_str(&parity_text).unwrap();
     assert_eq!(parity_json["kind"], "polymarket_local_petal_parity");
-    assert_eq!(parity_json["graduation_ready"], false);
+    assert_eq!(parity_json["status"], "ready_for_graduation");
+    assert_eq!(parity_json["graduation_ready"], true);
     assert!(parity_json["implemented"].as_array().unwrap().len() >= 7);
     assert!(
         parity_json["implemented"]
@@ -143,8 +144,17 @@ async fn compiled_polymarket_petal_uses_http_and_private_store() {
         parity_json["remaining_blockers"]
             .as_array()
             .unwrap()
+            .is_empty()
+    );
+    assert!(
+        parity_json["graduation_evidence"]
+            .as_array()
+            .unwrap()
             .iter()
-            .any(|item| item["id"] == "graduation_signoff")
+            .any(|item| item
+                .as_str()
+                .unwrap()
+                .contains("compiled wasm router smoke"))
     );
     assert!(
         parity_json["native_unsupported_or_deferred"]

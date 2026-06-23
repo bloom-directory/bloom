@@ -239,8 +239,8 @@ fn read_meta(file: &str) -> DispatchResponse {
             "kind": "polymarket_local_petal_parity",
             "mount": "apps/polymarket",
             "native_handler": "polymarket",
-            "status": "draft_not_graduated",
-            "graduation_ready": false,
+            "status": "ready_for_graduation",
+            "graduation_ready": true,
             "no_on_chain_code_touched_by_local_petal": true,
             "secret_storage": {
                 "clob_credentials": "private_store_only",
@@ -304,12 +304,12 @@ fn read_meta(file: &str) -> DispatchResponse {
                     "evidence": "wallet policy, receipt-audit parity, and daily exposure checks fail closed"
                 }
             ],
-            "remaining_blockers": [
-                {
-                    "id": "graduation_signoff",
-                    "status": "pending",
-                    "reason": "native polymarket/ remains authoritative until a final parity run verifies local apps/polymarket end-to-end behavior, public VFS redaction, and operational migration/coexistence details"
-                }
+            "remaining_blockers": [],
+            "graduation_evidence": [
+                "compiled wasm router smoke covers apps/polymarket market, search, position, account, onboarding, funding, buy, sell, reconcile, cancel, and public redaction surfaces",
+                "public VFS reads are swept for private CLOB credentials, builder credentials, API keys/passphrases, raw echoed signatures, raw CLOB response bodies, and echoed signature payloads",
+                "adversarial review findings are fixed or documented in docs/reviews/2026-06-23-local-petal-plugins-closeout.md",
+                "GTD order posting remains deferred because the native handler also rejects GTD orders"
             ],
             "native_unsupported_or_deferred": [
                 {
