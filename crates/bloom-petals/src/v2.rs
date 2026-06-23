@@ -19,6 +19,7 @@ use wasmparser::{
 };
 
 use crate::error::PetalError;
+use crate::policy::StoreNamespacePolicy;
 
 pub const ROUTE_INDEX_SCHEMA: &str = "bloom.petal.route-index.v1";
 pub const BUILD_MANIFEST_SCHEMA: &str = "bloom.petal.build-manifest.v1";
@@ -75,7 +76,7 @@ struct PetalToml {
     #[serde(default)]
     sign: SignPolicy,
     #[serde(default)]
-    store: StorePolicy,
+    store: StorePolicyToml,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -112,7 +113,7 @@ struct SignPolicy {
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct StorePolicy {
+struct StorePolicyToml {
     #[serde(default)]
     namespaces: Vec<String>,
     #[serde(default)]
@@ -363,6 +364,8 @@ impl PreparedAppPackage {
             .cloned()
             .collect::<BTreeSet<_>>();
         validate_sign_policy(&allowed_caps, &allowed_sign_intents)?;
+        let store_policy = store_policy_from_manifest(&manifest);
+        validate_store_policy(&allowed_caps, &store_policy)?;
         let route_files = route_records_from_files(&files, &app_root)?;
         if route_files.is_empty() {
             return Err(PetalError::InvalidWasm(format!(
@@ -463,6 +466,23 @@ pub fn sign_intents_from_v2_manifest_toml(bytes: &[u8]) -> Result<BTreeSet<Strin
         .collect::<BTreeSet<_>>();
     validate_sign_policy(&allowed_caps, &allowed_sign_intents)?;
     Ok(allowed_sign_intents)
+}
+
+pub fn store_policy_from_v2_manifest_toml(
+    bytes: &[u8],
+) -> Result<StoreNamespacePolicy, PetalError> {
+    let manifest_toml = std::str::from_utf8(bytes)
+        .map_err(|_| PetalError::InvalidWasm("petal.toml is not utf-8".into()))?;
+    let manifest: PetalToml = toml::from_str(manifest_toml)?;
+    let allowed_caps = manifest
+        .caps
+        .allowed
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let policy = store_policy_from_manifest(&manifest);
+    validate_store_policy(&allowed_caps, &policy)?;
+    Ok(policy)
 }
 
 pub fn build_app_package_dir(root: impl AsRef<Path>) -> Result<PreparedAppPackage, PetalError> {
@@ -2580,6 +2600,47 @@ fn validate_sign_policy(
     Ok(())
 }
 
+fn store_policy_from_manifest(manifest: &PetalToml) -> StoreNamespacePolicy {
+    StoreNamespacePolicy::from_namespaces(
+        manifest.store.namespaces.iter().cloned(),
+        manifest.store.secret_namespaces.iter().cloned(),
+    )
+}
+
+fn validate_store_policy(
+    allowed_caps: &BTreeSet<String>,
+    policy: &StoreNamespacePolicy,
+) -> Result<(), PetalError> {
+    if allowed_caps.contains("bloom:store") && policy.is_empty() {
+        return Err(PetalError::InvalidWasm(
+            "v2 package cap bloom:store requires [store].namespaces or [store].secret_namespaces"
+                .into(),
+        ));
+    }
+    for namespace in policy.namespaces() {
+        validate_store_namespace(namespace)?;
+    }
+    Ok(())
+}
+
+fn validate_store_namespace(namespace: &str) -> Result<(), PetalError> {
+    if namespace.is_empty() || namespace.len() > 128 {
+        return Err(PetalError::InvalidWasm(
+            "v2 store namespace must be 1..128 bytes".into(),
+        ));
+    }
+    if namespace.contains('/')
+        || !namespace
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
+        return Err(PetalError::InvalidWasm(format!(
+            "v2 store namespace {namespace:?} contains an unsupported byte"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_sign_intent(intent: &str) -> Result<(), PetalError> {
     if intent.is_empty() || intent.len() > 128 {
         return Err(PetalError::InvalidWasm(
@@ -3758,6 +3819,91 @@ allowed_intents = ["test.intent"]
             package.route_index.routes[0].install_metadata.required_caps,
             vec!["bloom:sign".to_string()]
         );
+    }
+
+    #[test]
+    fn v2_store_cap_requires_declared_namespaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_manifest_and_route(
+            tmp.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+[caps]
+allowed = ["bloom:store"]
+"#,
+            route_component_no_imports(),
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("[store].namespaces"));
+
+        let allowed = tempfile::tempdir().unwrap();
+        write_v2_package_with_manifest_and_route(
+            allowed.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+[caps]
+allowed = ["bloom:store"]
+
+[store]
+namespaces = ["orders"]
+secret_namespaces = ["credentials"]
+"#,
+            route_component_no_imports(),
+        );
+        let policy = store_policy_from_v2_manifest_toml(
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+[caps]
+allowed = ["bloom:store"]
+
+[store]
+namespaces = ["orders"]
+secret_namespaces = ["credentials"]
+"#,
+        )
+        .unwrap();
+        assert!(policy.namespaces().contains("orders"));
+        assert!(policy.namespaces().contains("credentials"));
+        assert!(policy.secret_namespaces().contains("credentials"));
+        PreparedAppPackage::from_dir(allowed.path()).unwrap();
+    }
+
+    #[test]
+    fn v2_store_namespaces_reject_ambiguous_path_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_manifest_and_route(
+            tmp.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+[caps]
+allowed = ["bloom:store"]
+
+[store]
+namespaces = ["orders/archive"]
+"#,
+            route_component_no_imports(),
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("unsupported byte"));
+
+        let drive = tempfile::tempdir().unwrap();
+        write_v2_package_with_manifest_and_route(
+            drive.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+[caps]
+allowed = ["bloom:store"]
+
+[store]
+namespaces = ["C:"]
+"#,
+            route_component_no_imports(),
+        );
+
+        let err = PreparedAppPackage::from_dir(drive.path()).unwrap_err();
+        assert!(err.to_string().contains("unsupported byte"));
     }
 
     #[tokio::test]

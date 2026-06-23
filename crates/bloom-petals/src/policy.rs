@@ -125,6 +125,86 @@ impl NetPolicy {
     }
 }
 
+/// Effective private-store namespace policy for a single petal invocation.
+///
+/// `None` at the VM `RunOptions` level preserves legacy/direct VM behavior.
+/// When present for v2 apps, a route may only touch declared namespaces and
+/// secret writes must match the namespace's declared visibility.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StoreNamespacePolicy {
+    private: BTreeSet<String>,
+    secret: BTreeSet<String>,
+}
+
+impl StoreNamespacePolicy {
+    pub fn from_namespaces(
+        private: impl IntoIterator<Item = String>,
+        secret: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let secret = secret.into_iter().collect::<BTreeSet<_>>();
+        let mut private = private.into_iter().collect::<BTreeSet<_>>();
+        private.extend(secret.iter().cloned());
+        Self { private, secret }
+    }
+
+    pub fn namespaces(&self) -> &BTreeSet<String> {
+        &self.private
+    }
+
+    pub fn secret_namespaces(&self) -> &BTreeSet<String> {
+        &self.secret
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.private.is_empty()
+    }
+
+    /// Intersect a manifest policy with a runtime mask. Namespaces must be
+    /// present in both policies; secret classification is preserved if either
+    /// side marks the namespace secret so a mask cannot downgrade secret writes.
+    pub fn intersect(&self, mask: &StoreNamespacePolicy) -> Self {
+        let private = self
+            .private
+            .intersection(&mask.private)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let secret_union = self
+            .secret
+            .union(&mask.secret)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let secret = private
+            .intersection(&secret_union)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        Self { private, secret }
+    }
+
+    pub fn check_namespace(&self, namespace: &str) -> Result<(), HostError> {
+        if self.private.contains(namespace) {
+            Ok(())
+        } else {
+            Err(HostError::Denied(format!(
+                "store namespace {namespace:?} is not allowed"
+            )))
+        }
+    }
+
+    pub fn check_put(&self, namespace: &str, secret: bool) -> Result<(), HostError> {
+        self.check_namespace(namespace)?;
+        let declared_secret = self.secret.contains(namespace);
+        match (declared_secret, secret) {
+            (true, true) | (false, false) => Ok(()),
+            (true, false) => Err(HostError::Denied(format!(
+                "store namespace {namespace:?} requires secret writes"
+            ))),
+            (false, true) => Err(HostError::Denied(format!(
+                "store namespace {namespace:?} is not declared secret"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NetRule {
     host: String,
@@ -318,6 +398,32 @@ paths = ["/markets*", "/auth/*", "/wallets/*/orders"]
                 .check("GET", "https://api.example.com/auth/key")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn store_namespace_runtime_mask_only_narrows_and_preserves_secret_visibility() {
+        let declared = StoreNamespacePolicy::from_namespaces(
+            ["orders".to_string(), "funding".to_string()],
+            ["credentials".to_string()],
+        );
+        let mask = StoreNamespacePolicy::from_namespaces(
+            [
+                "orders".to_string(),
+                "credentials".to_string(),
+                "sessions".to_string(),
+            ],
+            Vec::new(),
+        );
+
+        let narrowed = declared.intersect(&mask);
+        assert!(narrowed.check_namespace("orders").is_ok());
+        assert!(narrowed.check_namespace("credentials").is_ok());
+        assert!(narrowed.check_namespace("funding").is_err());
+        assert!(narrowed.check_namespace("sessions").is_err());
+        assert!(narrowed.check_put("orders", false).is_ok());
+        assert!(narrowed.check_put("orders", true).is_err());
+        assert!(narrowed.check_put("credentials", true).is_ok());
+        assert!(narrowed.check_put("credentials", false).is_err());
     }
 
     #[test]

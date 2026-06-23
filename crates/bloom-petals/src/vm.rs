@@ -48,7 +48,7 @@ use crate::abi::{
 use crate::error::PetalError;
 use crate::host::{HostError, PetalHost};
 use crate::meta::Capability;
-use crate::policy::NetPolicy;
+use crate::policy::{NetPolicy, StoreNamespacePolicy};
 use crate::private_store::PrivateStore;
 
 const DEFAULT_FUEL: u64 = 100_000_000;
@@ -67,6 +67,7 @@ pub struct StoreData {
     petal_hash: String,
     net_policy: NetPolicy,
     sign_intents: Option<BTreeSet<String>>,
+    store_namespaces: Option<StoreNamespacePolicy>,
     http_response_cap: usize,
     private_store: Option<PrivateStore>,
 }
@@ -82,6 +83,9 @@ pub struct RunOptions {
     /// Optional signing intent allow-list. `None` preserves legacy/direct VM
     /// behavior; v2 package dispatch sets this from `[sign].allowed_intents`.
     pub sign_intents: Option<BTreeSet<String>>,
+    /// Optional private-store namespace policy. `None` preserves legacy/direct
+    /// VM behavior; v2 package dispatch sets this from `[store]`.
+    pub store_namespaces: Option<StoreNamespacePolicy>,
     pub http_response_cap: usize,
     pub private_store_root: Option<PathBuf>,
 }
@@ -93,6 +97,7 @@ impl Default for RunOptions {
             memory_pages: DEFAULT_MEMORY_PAGES,
             net_policy: None,
             sign_intents: None,
+            store_namespaces: None,
             http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,
             private_store_root: None,
         }
@@ -190,6 +195,7 @@ impl PetalVm {
                 petal_hash: petal_hash.to_string(),
                 net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
                 sign_intents: opts.sign_intents.clone(),
+                store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
@@ -255,6 +261,7 @@ impl PetalVm {
                 petal_hash: petal_hash.to_string(),
                 net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
                 sign_intents: opts.sign_intents.clone(),
+                store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
@@ -309,6 +316,7 @@ impl PetalVm {
                 petal_hash: petal_hash.to_string(),
                 net_policy: opts.net_policy.clone().unwrap_or_else(NetPolicy::deny_all),
                 sign_intents: opts.sign_intents.clone(),
+                store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
@@ -740,6 +748,9 @@ async fn component_store_get(
         Ok(v) => v,
         Err(e) => return set_component_result(results, component_host_err(e)),
     };
+    if let Err(e) = store_namespace_allowed(store.data(), &namespace) {
+        return set_component_result(results, component_host_err(e));
+    }
     let key = match namespaced_store_key(&namespace, &key) {
         Ok(key) => key,
         Err(e) => return set_component_result(results, component_host_err(e)),
@@ -799,6 +810,9 @@ async fn component_store_put(
         Ok(secret) => secret,
         Err(e) => return set_component_result(results, component_host_err(e)),
     };
+    if let Err(e) = store_namespace_put_allowed(store.data(), &namespace, secret) {
+        return set_component_result(results, component_host_err(e));
+    }
     let key = match namespaced_store_key(&namespace, &key) {
         Ok(key) => key,
         Err(e) => return set_component_result(results, component_host_err(e)),
@@ -832,6 +846,9 @@ async fn component_store_list(
         Ok(v) => v,
         Err(e) => return set_component_result(results, component_host_err(e)),
     };
+    if let Err(e) = store_namespace_allowed(store.data(), &namespace) {
+        return set_component_result(results, component_host_err(e));
+    }
     let store_prefix = match namespaced_store_prefix(&namespace, &prefix) {
         Ok(prefix) => prefix,
         Err(e) => return set_component_result(results, component_host_err(e)),
@@ -873,6 +890,9 @@ async fn component_store_delete(
         Ok(v) => v,
         Err(e) => return set_component_result(results, component_host_err(e)),
     };
+    if let Err(e) = store_namespace_allowed(store.data(), &namespace) {
+        return set_component_result(results, component_host_err(e));
+    }
     let key = match namespaced_store_key(&namespace, &key) {
         Ok(key) => key,
         Err(e) => return set_component_result(results, component_host_err(e)),
@@ -1135,6 +1155,55 @@ fn sign_intent_allowed(data: &StoreData, intent: &str) -> bool {
         .as_ref()
         .map(|allowed| allowed.contains(intent))
         .unwrap_or(true)
+}
+
+fn store_namespace_allowed(data: &StoreData, namespace: &str) -> Result<(), HostError> {
+    match &data.store_namespaces {
+        Some(policy) => policy.check_namespace(namespace),
+        None => Ok(()),
+    }
+}
+
+fn store_namespace_put_allowed(
+    data: &StoreData,
+    namespace: &str,
+    secret: bool,
+) -> Result<(), HostError> {
+    match &data.store_namespaces {
+        Some(policy) => policy.check_put(namespace, secret),
+        None => Ok(()),
+    }
+}
+
+fn raw_store_key_allowed(data: &StoreData, key: &str) -> Result<(), HostError> {
+    let namespace = raw_store_namespace(key)?;
+    store_namespace_allowed(data, namespace)
+}
+
+fn raw_store_put_allowed(data: &StoreData, key: &str, secret: bool) -> Result<(), HostError> {
+    let namespace = raw_store_namespace(key)?;
+    store_namespace_put_allowed(data, namespace, secret)
+}
+
+fn raw_store_prefix_for_policy(data: &StoreData, prefix: &str) -> Result<String, HostError> {
+    if data.store_namespaces.is_none() {
+        return Ok(prefix.to_string());
+    }
+    let namespace = raw_store_namespace(prefix)?;
+    store_namespace_allowed(data, namespace)?;
+    if prefix == namespace {
+        Ok(format!("{namespace}/"))
+    } else {
+        Ok(prefix.to_string())
+    }
+}
+
+fn raw_store_namespace(key_or_prefix: &str) -> Result<&str, HostError> {
+    key_or_prefix
+        .split('/')
+        .next()
+        .filter(|namespace| !namespace.is_empty())
+        .ok_or_else(|| HostError::Invalid("store key missing namespace".into()))
 }
 
 fn component_string(val: &ComponentVal, label: &str) -> Result<String, HostError> {
@@ -1730,6 +1799,9 @@ fn link_bloom_v1_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
                     Ok(s) => s,
                     Err(c) => return c,
                 };
+                if let Err(e) = raw_store_key_allowed(caller.data(), &key) {
+                    return e.as_wasm_code();
+                }
                 let Some(store) = caller.data().private_store.clone() else {
                     return HostError::Denied("store unavailable".into()).as_wasm_code();
                 };
@@ -1766,6 +1838,9 @@ fn link_bloom_v1_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
                     Ok(b) => b,
                     Err(c) => return c,
                 };
+                if let Err(e) = raw_store_put_allowed(caller.data(), &key, secret_flag != 0) {
+                    return e.as_wasm_code();
+                }
                 let Some(store) = caller.data().private_store.clone() else {
                     return HostError::Denied("store unavailable".into()).as_wasm_code();
                 };
@@ -1802,6 +1877,9 @@ fn link_bloom_v1_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
                     Ok(b) => b,
                     Err(c) => return c,
                 };
+                if let Err(e) = raw_store_put_allowed(caller.data(), &key, secret_flag != 0) {
+                    return e.as_wasm_code();
+                }
                 let Some(store) = caller.data().private_store.clone() else {
                     return HostError::Denied("store unavailable".into()).as_wasm_code();
                 };
@@ -1833,6 +1911,10 @@ fn link_bloom_v1_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
                 let prefix = match read_string(&mem, &mut caller, prefix_ptr, prefix_len) {
                     Ok(s) => s,
                     Err(c) => return c,
+                };
+                let prefix = match raw_store_prefix_for_policy(caller.data(), &prefix) {
+                    Ok(prefix) => prefix,
+                    Err(e) => return e.as_wasm_code(),
                 };
                 let Some(store) = caller.data().private_store.clone() else {
                     return HostError::Denied("store unavailable".into()).as_wasm_code();
@@ -1872,6 +1954,9 @@ fn link_bloom_v1_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
                     Ok(s) => s,
                     Err(c) => return c,
                 };
+                if let Err(e) = raw_store_key_allowed(caller.data(), &key) {
+                    return e.as_wasm_code();
+                }
                 let Some(store) = caller.data().private_store.clone() else {
                     return HostError::Denied("store unavailable".into()).as_wasm_code();
                 };
@@ -1908,6 +1993,9 @@ fn link_bloom_v1_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
                     Ok(b) => b,
                     Err(c) => return c,
                 };
+                if let Err(e) = raw_store_key_allowed(caller.data(), &key) {
+                    return e.as_wasm_code();
+                }
                 let Some(store) = caller.data().private_store.clone() else {
                     return HostError::Denied("store unavailable".into()).as_wasm_code();
                 };
@@ -3146,6 +3234,55 @@ paths = ["/markets*"]
             Some(PrivateStore::open(tmp.path()).unwrap()),
             Arc::new(DenyHost),
         );
+        store.data_mut().store_namespaces = Some(StoreNamespacePolicy::from_namespaces(
+            ["orders".to_string()],
+            ["credentials".to_string()],
+        ));
+
+        let mut wrong_namespace = vec![ComponentVal::Bool(false)];
+        component_store_put(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("sessions".into()),
+                ComponentVal::String("drafts/a.json".into()),
+                component_bytes(b"blocked".to_vec()),
+                ComponentVal::Bool(false),
+            ],
+            &mut wrong_namespace,
+        )
+        .await
+        .unwrap();
+        assert_component_err_contains(&wrong_namespace[0], "not allowed");
+
+        let mut secret_mismatch = vec![ComponentVal::Bool(false)];
+        component_store_put(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("orders".into()),
+                ComponentVal::String("drafts/secret.json".into()),
+                component_bytes(b"blocked".to_vec()),
+                ComponentVal::Bool(true),
+            ],
+            &mut secret_mismatch,
+        )
+        .await
+        .unwrap();
+        assert_component_err_contains(&secret_mismatch[0], "not declared secret");
+
+        let mut secret_without_flag = vec![ComponentVal::Bool(false)];
+        component_store_put(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("credentials".into()),
+                ComponentVal::String("api-key".into()),
+                component_bytes(b"blocked".to_vec()),
+                ComponentVal::Bool(false),
+            ],
+            &mut secret_without_flag,
+        )
+        .await
+        .unwrap();
+        assert_component_err_contains(&secret_without_flag[0], "requires secret writes");
 
         let mut put = vec![ComponentVal::Bool(false)];
         component_store_put(
@@ -3233,6 +3370,32 @@ paths = ["/markets*"]
         .await
         .unwrap();
         assert_component_ok_optional_bytes(&missing[0], None);
+    }
+
+    #[test]
+    fn raw_compat_store_namespace_policy_uses_first_key_segment() {
+        let host = Arc::new(DenyHost);
+        let mut store = component_test_store(BTreeSet::new(), None, host);
+        store.data_mut().store_namespaces = Some(StoreNamespacePolicy::from_namespaces(
+            ["orders".to_string()],
+            ["credentials".to_string()],
+        ));
+
+        assert!(raw_store_key_allowed(store.data(), "orders/drafts/a.json").is_ok());
+        assert_eq!(
+            raw_store_prefix_for_policy(store.data(), "orders").unwrap(),
+            "orders/"
+        );
+        assert_eq!(
+            raw_store_prefix_for_policy(store.data(), "orders/drafts").unwrap(),
+            "orders/drafts"
+        );
+        assert!(raw_store_put_allowed(store.data(), "credentials/api-key", true).is_ok());
+        assert!(raw_store_key_allowed(store.data(), "sessions/x").is_err());
+        assert!(raw_store_prefix_for_policy(store.data(), "orders2").is_err());
+        assert!(raw_store_put_allowed(store.data(), "orders/x", true).is_err());
+        assert!(raw_store_put_allowed(store.data(), "credentials/x", false).is_err());
+        assert!(raw_store_key_allowed(store.data(), "").is_err());
     }
 
     #[tokio::test]
@@ -3497,6 +3660,7 @@ paths = ["/status"]
                 petal_hash: VALID_HASH.into(),
                 net_policy,
                 sign_intents: None,
+                store_namespaces: None,
                 http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,
                 private_store,
             },

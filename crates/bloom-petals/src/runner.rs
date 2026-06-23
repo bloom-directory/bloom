@@ -22,7 +22,7 @@ use crate::registry::NameRegistry;
 use crate::store::{InstallResult, PetalStore};
 use crate::v2::{
     RouteAbi, RouteEntryKind, RouteIndex, RouteIndexRecord, RouteOp,
-    sign_intents_from_v2_manifest_toml,
+    sign_intents_from_v2_manifest_toml, store_policy_from_v2_manifest_toml,
 };
 use crate::vm::{DispatchOutput, PetalVm, RunOptions, RunOutput};
 use crate::{DispatchOp, DispatchRequest};
@@ -489,6 +489,11 @@ impl PetalRunner {
             Some(mask) => declared_sign_intents.intersection(&mask).cloned().collect(),
             None => declared_sign_intents,
         });
+        let declared_store_policy = self.v2_store_policy(&matched.hash)?;
+        opts.store_namespaces = Some(match opts.store_namespaces {
+            Some(mask) => declared_store_policy.intersect(&mask),
+            None => declared_store_policy,
+        });
         match matched.route.abi {
             RouteAbi::CompatPetalDispatchV1 => {
                 self.vm
@@ -520,6 +525,14 @@ impl PetalRunner {
     fn v2_sign_intents(&self, hash: &str) -> Result<BTreeSet<String>, PetalError> {
         let manifest = std::fs::read(self.store.package_path(hash)?.join("source/petal.toml"))?;
         sign_intents_from_v2_manifest_toml(&manifest)
+    }
+
+    fn v2_store_policy(
+        &self,
+        hash: &str,
+    ) -> Result<crate::policy::StoreNamespacePolicy, PetalError> {
+        let manifest = std::fs::read(self.store.package_path(hash)?.join("source/petal.toml"))?;
+        store_policy_from_v2_manifest_toml(&manifest)
     }
 }
 
