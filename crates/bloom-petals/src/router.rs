@@ -196,11 +196,17 @@ impl Handler for PetalRouter {
             return Err(HandlerError::PermissionDenied);
         }
         if self.is_v2_app(mount) {
-            let matched = self
+            let (_, runtime_metadata) = self
                 .runner
-                .local_app_route(mount, DispatchOp::Write, &rest)
+                .local_app_route_runtime_metadata(
+                    mount,
+                    DispatchOp::Write,
+                    &rest,
+                    RunOptions::default(),
+                )
+                .await
                 .map_err(map_petal_err)?;
-            if matched.route.install_metadata.write_async {
+            if runtime_metadata.write_async {
                 let runner = self.runner.clone();
                 let host = self.host.clone();
                 let mount = mount.to_string();

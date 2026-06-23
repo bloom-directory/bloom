@@ -341,6 +341,25 @@ impl PetalRunner {
         })
     }
 
+    pub async fn local_app_route_runtime_metadata(
+        &self,
+        mount: &str,
+        op: DispatchOp,
+        path: &str,
+        opts: RunOptions,
+    ) -> Result<(LocalAppRouteMatch, InstallRouteMetadata), PetalError> {
+        let matched = self.local_app_route(mount, op, path)?;
+        let wasm = self
+            .store
+            .read_route_artifact(&matched.hash, &matched.route.route_id)?;
+        let declared_sign_intents = self.v2_sign_intents(&matched.hash)?;
+        let metadata = self
+            .runtime_app_route_metadata(&matched, mount, path, &wasm, &declared_sign_intents, &opts)
+            .await?;
+        enforce_runtime_route_op(op, &matched, &metadata)?;
+        Ok((matched, metadata))
+    }
+
     pub fn local_app_has_descendant(&self, mount: &str, path: &str) -> Result<bool, PetalError> {
         validate_runtime_route_path(path)?;
         let index = self.load_app_route_index(mount)?;
@@ -1039,6 +1058,19 @@ name = "echo"
         let route = &index.routes[0];
         assert_eq!(route.install_metadata.mode, 0o666);
         assert!(route.install_metadata.side_effecting_read);
+        assert!(route.install_metadata.write_async);
+
+        let (_, runtime_metadata) = r
+            .local_app_route_runtime_metadata(
+                "echo",
+                DispatchOp::Read,
+                "alice.txt",
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(runtime_metadata.mode, 0o444);
+        assert!(!runtime_metadata.write_async);
 
         let out = r
             .dispatch_app_route(
@@ -1080,6 +1112,7 @@ name = "echo"
         let route = &index.routes[0];
         assert!(route.ops.contains(&RouteOp::Write));
         assert_eq!(route.install_metadata.mode, 0o666);
+        assert!(route.install_metadata.write_async);
 
         let err = r
             .dispatch_app_route(
