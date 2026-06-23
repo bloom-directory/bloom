@@ -35,14 +35,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use wasmtime::component::{Component, Linker as ComponentLinker, Val as ComponentVal};
-use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store};
+use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store, StoreContextMut};
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 
 use crate::abi::{
-    DispatchOp, DispatchRequest, DispatchResponse, decode_dispatch_response, decode_http_request,
-    decode_sign_request, encode_dispatch_request, encode_http_response, encode_string_list,
+    DispatchOp, DispatchRequest, DispatchResponse, SignRequest, decode_dispatch_response,
+    decode_http_request, decode_sign_request, encode_dispatch_request, encode_http_response,
+    encode_string_list,
 };
 use crate::error::PetalError;
 use crate::host::{HostError, PetalHost};
@@ -319,6 +320,7 @@ impl PetalVm {
         linker
             .define_unknown_imports_as_traps(&component)
             .map_err(|e| PetalError::vm(e.to_string()))?;
+        link_component_host_imports(&mut linker).map_err(|e| PetalError::vm(e.to_string()))?;
 
         let instance = linker
             .instantiate_async(&mut store, &component)
@@ -596,6 +598,690 @@ fn component_optional_string_field(
             "component field {name:?} is not an option: {other:?}"
         ))),
     }
+}
+
+fn link_component_host_imports(linker: &mut ComponentLinker<StoreData>) -> anyhow::Result<()> {
+    linker.allow_shadowing(true);
+
+    {
+        let mut http = linker.instance("bloom:http/fetch@0.1.0")?;
+        http.func_new_async("fetch", |store, params, results| {
+            Box::new(async move { component_http_fetch(store, params, results).await })
+        })?;
+    }
+    {
+        let mut store = linker.instance("bloom:store/kv@0.1.0")?;
+        store.func_new_async("get", |store, params, results| {
+            Box::new(async move { component_store_get(store, params, results).await })
+        })?;
+        store.func_new_async("put", |store, params, results| {
+            Box::new(async move { component_store_put(store, params, results).await })
+        })?;
+        store.func_new_async("list", |store, params, results| {
+            Box::new(async move { component_store_list(store, params, results).await })
+        })?;
+        store.func_new_async("delete", |store, params, results| {
+            Box::new(async move { component_store_delete(store, params, results).await })
+        })?;
+    }
+    {
+        let mut sign = linker.instance("bloom:sign/signing@0.1.0")?;
+        sign.func_new_async("sign-hash", |store, params, results| {
+            Box::new(async move { component_sign_hash(store, params, results).await })
+        })?;
+    }
+    {
+        let mut vfs = linker.instance("bloom:vfs/readwrite@0.1.0")?;
+        vfs.func_new_async("lookup", |store, params, results| {
+            Box::new(async move { component_vfs_lookup(store, params, results).await })
+        })?;
+        vfs.func_new_async("list", |store, params, results| {
+            Box::new(async move { component_vfs_list(store, params, results).await })
+        })?;
+        vfs.func_new_async("read", |store, params, results| {
+            Box::new(async move { component_vfs_read(store, params, results).await })
+        })?;
+        vfs.func_new_async("write", |store, params, results| {
+            Box::new(async move { component_vfs_write(store, params, results).await })
+        })?;
+    }
+    {
+        let mut chain = linker.instance("bloom:chain/read@0.1.0")?;
+        chain.func_new_async("call", |_store, _params, results| {
+            Box::new(async move {
+                set_component_result(
+                    results,
+                    component_err("bloom:chain/read is not implemented"),
+                )
+            })
+        })?;
+    }
+    Ok(())
+}
+
+async fn component_http_fetch(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    let req = match params {
+        [ComponentVal::Record(fields)] => component_http_request(fields),
+        _ => Err(HostError::Invalid("invalid bloom:http.fetch params".into())),
+    };
+    let req = match req {
+        Ok(req) => req,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+
+    if !store.data().caps.contains(&Capability::NetFetch) {
+        log_denied(store.data(), "component_http_fetch");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("net.fetch".into())),
+        );
+    }
+    let audit = http_audit_target(&req.url);
+    let effective_policy = store.data().net_policy.clone();
+    if let Err(e) = effective_policy.check(&req.method, &req.url) {
+        tracing::info!(
+            target: "bloom_petals::vm",
+            petal = %store.data().petal_hash,
+            method = %req.method,
+            host = audit.host.as_deref().unwrap_or("<invalid>"),
+            path = audit.path.as_deref().unwrap_or("<invalid>"),
+            "component http.fetch denied by net policy"
+        );
+        return set_component_result(results, component_host_err(e));
+    }
+    let host = store.data().host.clone();
+    let cap = store.data().http_response_cap;
+    let petal_hash = store.data().petal_hash.clone();
+    let req_body_len = req.body.len();
+    let method = req.method.clone();
+    match host.http_fetch(req, effective_policy, cap).await {
+        Ok(resp) if resp.body.len() <= cap => {
+            tracing::info!(
+                target: "bloom_petals::vm",
+                petal = %petal_hash,
+                method = %method,
+                host = audit.host.as_deref().unwrap_or("<invalid>"),
+                path = audit.path.as_deref().unwrap_or("<invalid>"),
+                status = resp.status,
+                request_bytes = req_body_len,
+                response_bytes = resp.body.len(),
+                "component http.fetch allowed"
+            );
+            set_component_result(results, component_ok(Some(component_http_response(resp))))
+        }
+        Ok(_) => set_component_result(
+            results,
+            component_host_err(HostError::Backend("http response too large".into())),
+        ),
+        Err(e) => set_component_result(results, component_host_err(e)),
+    }
+}
+
+async fn component_store_get(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    if !store.data().caps.contains(&Capability::Store) {
+        log_denied(store.data(), "component_store_get");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("store".into())),
+        );
+    }
+    let (namespace, key) = match component_namespace_key(params) {
+        Ok(v) => v,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let key = match namespaced_store_key(&namespace, &key) {
+        Ok(key) => key,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let Some(private_store) = store.data().private_store.clone() else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("store unavailable".into())),
+        );
+    };
+    let petal_hash = store.data().petal_hash.clone();
+    match private_store.get(&petal_hash, &key) {
+        Ok(bytes) => set_component_result(
+            results,
+            component_ok(Some(ComponentVal::Option(Some(Box::new(component_bytes(
+                bytes,
+            )))))),
+        ),
+        Err(HostError::NotFound(_)) => {
+            set_component_result(results, component_ok(Some(ComponentVal::Option(None))))
+        }
+        Err(e) => set_component_result(results, component_host_err(e)),
+    }
+}
+
+async fn component_store_put(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    if !store.data().caps.contains(&Capability::Store) {
+        log_denied(store.data(), "component_store_put");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("store".into())),
+        );
+    }
+    let [namespace, key, value, secret] = params else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Invalid("invalid bloom:store.put params".into())),
+        );
+    };
+    let namespace = match component_string(namespace, "namespace") {
+        Ok(namespace) => namespace,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let key = match component_string(key, "key") {
+        Ok(key) => key,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let value = match component_byte_list(value, "value") {
+        Ok(value) => value,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let secret = match component_bool(secret, "secret") {
+        Ok(secret) => secret,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let key = match namespaced_store_key(&namespace, &key) {
+        Ok(key) => key,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let Some(private_store) = store.data().private_store.clone() else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("store unavailable".into())),
+        );
+    };
+    let petal_hash = store.data().petal_hash.clone();
+    match private_store.put(&petal_hash, &key, &value, secret) {
+        Ok(()) => set_component_result(results, component_ok(None)),
+        Err(e) => set_component_result(results, component_host_err(e)),
+    }
+}
+
+async fn component_store_list(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    if !store.data().caps.contains(&Capability::Store) {
+        log_denied(store.data(), "component_store_list");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("store".into())),
+        );
+    }
+    let (namespace, prefix) = match component_namespace_key(params) {
+        Ok(v) => v,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let store_prefix = match namespaced_store_prefix(&namespace, &prefix) {
+        Ok(prefix) => prefix,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let Some(private_store) = store.data().private_store.clone() else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("store unavailable".into())),
+        );
+    };
+    let petal_hash = store.data().petal_hash.clone();
+    match private_store.list(&petal_hash, &store_prefix) {
+        Ok(keys) => {
+            let namespace_prefix = format!("{namespace}/");
+            let keys = keys
+                .into_iter()
+                .filter_map(|key| key.strip_prefix(&namespace_prefix).map(str::to_string))
+                .map(ComponentVal::String)
+                .collect();
+            set_component_result(results, component_ok(Some(ComponentVal::List(keys))))
+        }
+        Err(e) => set_component_result(results, component_host_err(e)),
+    }
+}
+
+async fn component_store_delete(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    if !store.data().caps.contains(&Capability::Store) {
+        log_denied(store.data(), "component_store_delete");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("store".into())),
+        );
+    }
+    let (namespace, key) = match component_namespace_key(params) {
+        Ok(v) => v,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let key = match namespaced_store_key(&namespace, &key) {
+        Ok(key) => key,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let Some(private_store) = store.data().private_store.clone() else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("store unavailable".into())),
+        );
+    };
+    let petal_hash = store.data().petal_hash.clone();
+    match private_store.del(&petal_hash, &key) {
+        Ok(()) => set_component_result(results, component_ok(None)),
+        Err(e) => set_component_result(results, component_host_err(e)),
+    }
+}
+
+async fn component_sign_hash(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    if !store.data().caps.contains(&Capability::Sign) {
+        log_denied(store.data(), "component_sign_hash");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("sign".into())),
+        );
+    }
+    let [wallet, hash, intent] = params else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Invalid(
+                "invalid bloom:sign.sign-hash params".into(),
+            )),
+        );
+    };
+    let wallet = match component_string(wallet, "wallet") {
+        Ok(wallet) => wallet,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let hash = match component_byte_list(hash, "hash32") {
+        Ok(hash) => hash,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    if hash.len() != 32 {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Invalid(
+                "sign-hash requires a 32-byte hash".into(),
+            )),
+        );
+    }
+    let mut hash32 = [0u8; 32];
+    hash32.copy_from_slice(&hash);
+    let intent = match component_string(intent, "intent") {
+        Ok(intent) => intent,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let host = store.data().host.clone();
+    match host
+        .sign_hash(SignRequest {
+            wallet,
+            hash32,
+            purpose: intent,
+        })
+        .await
+    {
+        Ok(sig) if sig.len() == 65 => {
+            set_component_result(results, component_ok(Some(component_bytes(sig))))
+        }
+        Ok(_) => set_component_result(
+            results,
+            component_host_err(HostError::Backend(
+                "sign_hash returned non-65-byte signature".into(),
+            )),
+        ),
+        Err(e) => set_component_result(results, component_host_err(e)),
+    }
+}
+
+async fn component_vfs_lookup(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    if !store.data().caps.contains(&Capability::VfsRead) {
+        log_denied(store.data(), "component_vfs_lookup");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("vfs.read".into())),
+        );
+    }
+    let path = match component_single_string_param(params, "path") {
+        Ok(path) => path,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let host = store.data().host.clone();
+    match host.vfs_list(&path).await {
+        Ok(_) => set_component_result(
+            results,
+            component_ok(Some(component_vfs_entry(&path, "dir", 0o755, None, None))),
+        ),
+        Err(e) => set_component_result(results, component_host_err(e)),
+    }
+}
+
+async fn component_vfs_list(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    if !store.data().caps.contains(&Capability::VfsRead) {
+        log_denied(store.data(), "component_vfs_list");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("vfs.read".into())),
+        );
+    }
+    let path = match component_single_string_param(params, "path") {
+        Ok(path) => path,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let host = store.data().host.clone();
+    match host.vfs_list(&path).await {
+        Ok(names) => {
+            let entries = names
+                .into_iter()
+                .map(|name| component_vfs_entry(&name, "file", 0o644, None, None))
+                .collect();
+            set_component_result(results, component_ok(Some(ComponentVal::List(entries))))
+        }
+        Err(e) => set_component_result(results, component_host_err(e)),
+    }
+}
+
+async fn component_vfs_read(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    if !store.data().caps.contains(&Capability::VfsRead) {
+        log_denied(store.data(), "component_vfs_read");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("vfs.read".into())),
+        );
+    }
+    let path = match component_single_string_param(params, "path") {
+        Ok(path) => path,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let host = store.data().host.clone();
+    match host.vfs_read(&path).await {
+        Ok(bytes) => set_component_result(results, component_ok(Some(component_bytes(bytes)))),
+        Err(e) => set_component_result(results, component_host_err(e)),
+    }
+}
+
+async fn component_vfs_write(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    if !store.data().caps.contains(&Capability::VfsWrite) {
+        log_denied(store.data(), "component_vfs_write");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("vfs.write".into())),
+        );
+    }
+    let [path, body] = params else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Invalid("invalid bloom:vfs.write params".into())),
+        );
+    };
+    let path = match component_string(path, "path") {
+        Ok(path) => path,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let body = match component_byte_list(body, "body") {
+        Ok(body) => body,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let host = store.data().host.clone();
+    match host.vfs_write(&path, &body).await {
+        Ok(()) => set_component_result(results, component_ok(None)),
+        Err(e) => set_component_result(results, component_host_err(e)),
+    }
+}
+
+fn set_component_result(results: &mut [ComponentVal], val: ComponentVal) -> anyhow::Result<()> {
+    let [result] = results else {
+        anyhow::bail!("component host function expected one result slot");
+    };
+    *result = val;
+    Ok(())
+}
+
+fn component_ok(value: Option<ComponentVal>) -> ComponentVal {
+    ComponentVal::Result(Ok(value.map(Box::new)))
+}
+
+fn component_err(message: impl Into<String>) -> ComponentVal {
+    ComponentVal::Result(Err(Some(Box::new(ComponentVal::String(message.into())))))
+}
+
+fn component_host_err(err: HostError) -> ComponentVal {
+    component_err(err.to_string())
+}
+
+fn component_string(val: &ComponentVal, label: &str) -> Result<String, HostError> {
+    match val {
+        ComponentVal::String(value) => Ok(value.clone()),
+        other => Err(HostError::Invalid(format!(
+            "component {label} expected string, got {other:?}"
+        ))),
+    }
+}
+
+fn component_bool(val: &ComponentVal, label: &str) -> Result<bool, HostError> {
+    match val {
+        ComponentVal::Bool(value) => Ok(*value),
+        other => Err(HostError::Invalid(format!(
+            "component {label} expected bool, got {other:?}"
+        ))),
+    }
+}
+
+fn component_byte_list(val: &ComponentVal, label: &str) -> Result<Vec<u8>, HostError> {
+    let ComponentVal::List(items) = val else {
+        return Err(HostError::Invalid(format!(
+            "component {label} expected list<u8>, got {val:?}"
+        )));
+    };
+    items
+        .iter()
+        .map(|item| match item {
+            ComponentVal::U8(byte) => Ok(*byte),
+            other => Err(HostError::Invalid(format!(
+                "component {label} expected u8 item, got {other:?}"
+            ))),
+        })
+        .collect()
+}
+
+fn component_bytes(bytes: Vec<u8>) -> ComponentVal {
+    ComponentVal::List(bytes.into_iter().map(ComponentVal::U8).collect())
+}
+
+fn component_single_string_param(
+    params: &[ComponentVal],
+    label: &str,
+) -> Result<String, HostError> {
+    let [value] = params else {
+        return Err(HostError::Invalid(format!(
+            "component expected single {label} param"
+        )));
+    };
+    component_string(value, label)
+}
+
+fn component_namespace_key(params: &[ComponentVal]) -> Result<(String, String), HostError> {
+    let [namespace, key] = params else {
+        return Err(HostError::Invalid(
+            "component store function expected namespace and key/prefix".into(),
+        ));
+    };
+    Ok((
+        component_string(namespace, "namespace")?,
+        component_string(key, "key")?,
+    ))
+}
+
+fn namespaced_store_key(namespace: &str, key: &str) -> Result<String, HostError> {
+    if namespace.is_empty() {
+        return Err(HostError::Invalid("store namespace is empty".into()));
+    }
+    Ok(format!("{namespace}/{key}"))
+}
+
+fn namespaced_store_prefix(namespace: &str, prefix: &str) -> Result<String, HostError> {
+    if namespace.is_empty() {
+        return Err(HostError::Invalid("store namespace is empty".into()));
+    }
+    if prefix.is_empty() {
+        Ok(format!("{namespace}/"))
+    } else {
+        Ok(format!("{namespace}/{prefix}"))
+    }
+}
+
+fn component_http_request(
+    fields: &[(String, ComponentVal)],
+) -> Result<crate::abi::HttpRequest, HostError> {
+    Ok(crate::abi::HttpRequest {
+        method: component_record_string(fields, "method")?,
+        url: component_record_string(fields, "url")?,
+        headers: component_record_headers(fields, "headers")?,
+        body: component_record_bytes(fields, "body")?,
+    })
+}
+
+fn component_http_response(resp: crate::abi::HttpResponse) -> ComponentVal {
+    ComponentVal::Record(vec![
+        ("status".into(), ComponentVal::U16(resp.status)),
+        ("headers".into(), component_headers(resp.headers)),
+        ("body".into(), component_bytes(resp.body)),
+    ])
+}
+
+fn component_record_string(
+    fields: &[(String, ComponentVal)],
+    name: &str,
+) -> Result<String, HostError> {
+    component_string(component_record_field(fields, name)?, name)
+}
+
+fn component_record_bytes(
+    fields: &[(String, ComponentVal)],
+    name: &str,
+) -> Result<Vec<u8>, HostError> {
+    component_byte_list(component_record_field(fields, name)?, name)
+}
+
+fn component_record_headers(
+    fields: &[(String, ComponentVal)],
+    name: &str,
+) -> Result<Vec<(String, String)>, HostError> {
+    component_headers_from_val(component_record_field(fields, name)?, name)
+}
+
+fn component_record_field<'a>(
+    fields: &'a [(String, ComponentVal)],
+    name: &str,
+) -> Result<&'a ComponentVal, HostError> {
+    fields
+        .iter()
+        .find_map(|(field, value)| (field == name).then_some(value))
+        .ok_or_else(|| HostError::Invalid(format!("component record missing field {name:?}")))
+}
+
+fn component_headers_from_val(
+    val: &ComponentVal,
+    label: &str,
+) -> Result<Vec<(String, String)>, HostError> {
+    let ComponentVal::List(items) = val else {
+        return Err(HostError::Invalid(format!(
+            "component {label} expected list<tuple<string,string>>, got {val:?}"
+        )));
+    };
+    items
+        .iter()
+        .map(|item| {
+            let ComponentVal::Tuple(parts) = item else {
+                return Err(HostError::Invalid(format!(
+                    "component {label} expected tuple item, got {item:?}"
+                )));
+            };
+            let [key, value] = parts.as_slice() else {
+                return Err(HostError::Invalid(format!(
+                    "component {label} expected pair tuple"
+                )));
+            };
+            Ok((
+                component_string(key, "header-name")?,
+                component_string(value, "header-value")?,
+            ))
+        })
+        .collect()
+}
+
+fn component_headers(headers: Vec<(String, String)>) -> ComponentVal {
+    ComponentVal::List(
+        headers
+            .into_iter()
+            .map(|(key, value)| {
+                ComponentVal::Tuple(vec![ComponentVal::String(key), ComponentVal::String(value)])
+            })
+            .collect(),
+    )
+}
+
+fn component_vfs_entry(
+    name: &str,
+    kind: &str,
+    mode: u32,
+    size: Option<u64>,
+    link_target: Option<String>,
+) -> ComponentVal {
+    ComponentVal::Record(vec![
+        ("name".into(), ComponentVal::String(vfs_entry_name(name))),
+        ("kind".into(), ComponentVal::Enum(kind.into())),
+        ("mode".into(), ComponentVal::U32(mode)),
+        (
+            "size".into(),
+            ComponentVal::Option(size.map(|size| Box::new(ComponentVal::U64(size)))),
+        ),
+        (
+            "link-target".into(),
+            ComponentVal::Option(link_target.map(|target| Box::new(ComponentVal::String(target)))),
+        ),
+    ])
+}
+
+fn vfs_entry_name(path_or_name: &str) -> String {
+    path_or_name
+        .rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(path_or_name)
+        .to_string()
 }
 
 async fn run_command(
@@ -1353,6 +2039,7 @@ mod tests {
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use tempfile::TempDir;
+    use wasmtime::AsContextMut;
 
     const VALID_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -1717,6 +2404,7 @@ mod tests {
     struct MockHost {
         store: Mutex<HashMap<String, Vec<u8>>>,
         lists: Mutex<HashMap<String, Vec<String>>>,
+        vfs_reads: Mutex<Vec<String>>,
         http_calls: Mutex<Vec<HttpRequest>>,
         sign_calls: Mutex<Vec<SignRequest>>,
     }
@@ -1724,6 +2412,7 @@ mod tests {
     #[async_trait]
     impl PetalHost for MockHost {
         async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
+            self.vfs_reads.lock().push(path.into());
             self.store
                 .lock()
                 .get(path)
@@ -2302,6 +2991,445 @@ paths = ["/markets*"]
                 message: "write".into(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn component_store_adapter_enforces_caps_and_namespaces_keys() {
+        let tmp = TempDir::new().unwrap();
+        let mut store = component_test_store(
+            BTreeSet::new(),
+            Some(PrivateStore::open(tmp.path()).unwrap()),
+            Arc::new(DenyHost),
+        );
+
+        let mut denied = vec![ComponentVal::Bool(false)];
+        component_store_put(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("orders".into()),
+                ComponentVal::String("drafts/a.json".into()),
+                component_bytes(b"one".to_vec()),
+                ComponentVal::Bool(false),
+            ],
+            &mut denied,
+        )
+        .await
+        .unwrap();
+        assert_component_err_contains(&denied[0], "denied");
+
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::Store);
+        let mut store = component_test_store(
+            caps,
+            Some(PrivateStore::open(tmp.path()).unwrap()),
+            Arc::new(DenyHost),
+        );
+
+        let mut put = vec![ComponentVal::Bool(false)];
+        component_store_put(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("orders".into()),
+                ComponentVal::String("drafts/a.json".into()),
+                component_bytes(b"one".to_vec()),
+                ComponentVal::Bool(false),
+            ],
+            &mut put,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_none(&put[0]);
+
+        let mut invalid = vec![ComponentVal::Bool(false)];
+        component_store_put(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("orders".into()),
+                ComponentVal::String("../escape".into()),
+                component_bytes(b"nope".to_vec()),
+                ComponentVal::Bool(false),
+            ],
+            &mut invalid,
+        )
+        .await
+        .unwrap();
+        assert_component_err_contains(&invalid[0], "escapes namespace");
+
+        assert_eq!(
+            std::fs::read(tmp.path().join(VALID_HASH).join("orders/drafts/a.json")).unwrap(),
+            b"one"
+        );
+
+        let mut get = vec![ComponentVal::Bool(false)];
+        component_store_get(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("orders".into()),
+                ComponentVal::String("drafts/a.json".into()),
+            ],
+            &mut get,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_optional_bytes(&get[0], Some(b"one"));
+
+        let mut list = vec![ComponentVal::Bool(false)];
+        component_store_list(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("orders".into()),
+                ComponentVal::String("drafts".into()),
+            ],
+            &mut list,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_string_list(&list[0], &["drafts/a.json"]);
+
+        let mut delete = vec![ComponentVal::Bool(false)];
+        component_store_delete(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("orders".into()),
+                ComponentVal::String("drafts/a.json".into()),
+            ],
+            &mut delete,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_none(&delete[0]);
+
+        let mut missing = vec![ComponentVal::Bool(false)];
+        component_store_get(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("orders".into()),
+                ComponentVal::String("drafts/a.json".into()),
+            ],
+            &mut missing,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_optional_bytes(&missing[0], None);
+    }
+
+    #[tokio::test]
+    async fn component_http_sign_and_vfs_adapters_use_mediated_host() {
+        let host = Arc::new(MockHost::default());
+        host.store
+            .lock()
+            .insert("wallets/alice.txt".into(), b"alice".to_vec());
+        host.lists
+            .lock()
+            .insert("wallets".into(), vec!["alice.txt".into()]);
+
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::NetFetch);
+        caps.insert(Capability::Sign);
+        caps.insert(Capability::VfsRead);
+        caps.insert(Capability::VfsWrite);
+        let policy = NetPolicy::from_v2_manifest_toml(
+            br#"
+[[net.allow]]
+host = "api.example.com"
+methods = ["GET"]
+paths = ["/status"]
+"#,
+        )
+        .unwrap();
+        let mut store = component_test_store_with_policy(caps, None, host.clone(), policy);
+
+        let mut http = vec![ComponentVal::Bool(false)];
+        component_http_fetch(
+            store.as_context_mut(),
+            &[ComponentVal::Record(vec![
+                ("method".into(), ComponentVal::String("GET".into())),
+                (
+                    "url".into(),
+                    ComponentVal::String("https://api.example.com/status".into()),
+                ),
+                ("headers".into(), ComponentVal::List(Vec::new())),
+                ("body".into(), component_bytes(Vec::new())),
+            ])],
+            &mut http,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_http_body(&http[0], b"ok");
+        assert_eq!(host.http_calls.lock().len(), 1);
+
+        let mut sign = vec![ComponentVal::Bool(false)];
+        component_sign_hash(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("alice".into()),
+                component_bytes(vec![3u8; 32]),
+                ComponentVal::String("test.intent".into()),
+            ],
+            &mut sign,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_bytes(&sign[0], &[7u8; 65]);
+        assert_eq!(host.sign_calls.lock().len(), 1);
+
+        let mut read = vec![ComponentVal::Bool(false)];
+        component_vfs_read(
+            store.as_context_mut(),
+            &[ComponentVal::String("wallets/alice.txt".into())],
+            &mut read,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_bytes(&read[0], b"alice");
+
+        let mut list = vec![ComponentVal::Bool(false)];
+        component_vfs_list(
+            store.as_context_mut(),
+            &[ComponentVal::String("wallets".into())],
+            &mut list,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_entry_names(&list[0], &["alice.txt"]);
+
+        host.vfs_reads.lock().clear();
+        let mut lookup = vec![ComponentVal::Bool(false)];
+        component_vfs_lookup(
+            store.as_context_mut(),
+            &[ComponentVal::String("wallets/alice.txt".into())],
+            &mut lookup,
+        )
+        .await
+        .unwrap();
+        assert_component_err_contains(&lookup[0], "not found");
+        assert!(
+            host.vfs_reads.lock().is_empty(),
+            "component vfs.lookup must not perform side-effecting reads"
+        );
+
+        let mut write = vec![ComponentVal::Bool(false)];
+        component_vfs_write(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("wallets/bob.txt".into()),
+                component_bytes(b"bob".to_vec()),
+            ],
+            &mut write,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_none(&write[0]);
+        assert_eq!(
+            host.store.lock().get("wallets/bob.txt").cloned().unwrap(),
+            b"bob"
+        );
+    }
+
+    #[tokio::test]
+    async fn component_dispatch_links_http_import_and_enforces_caps() {
+        let wasm = wat::parse_str(include_str!(
+            "../tests/fixtures/route_component_http_calls_fetch.wat"
+        ))
+        .unwrap();
+        let policy = NetPolicy::from_v2_manifest_toml(
+            br#"
+[[net.allow]]
+host = "api.example.com"
+methods = ["GET"]
+paths = ["/status"]
+"#,
+        )
+        .unwrap();
+        let request = DispatchRequest {
+            op: DispatchOp::Read,
+            path: "message.txt".into(),
+            body: Vec::new(),
+            ctx: Vec::new(),
+        };
+
+        let vm = PetalVm::new().unwrap();
+        let host = Arc::new(MockHost::default());
+        let mut caps = BTreeSet::new();
+        caps.insert(Capability::NetFetch);
+        let err = vm
+            .dispatch_component_route(
+                &wasm,
+                request.clone(),
+                caps,
+                host.clone(),
+                VALID_HASH,
+                "apps/echo",
+                Vec::new(),
+                RunOptions {
+                    net_policy: Some(policy.clone()),
+                    ..RunOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("component route read"),
+            "unexpected component error: {err}"
+        );
+        let calls = host.http_calls.lock();
+        assert_eq!(calls.len(), 1, "component error before host call: {err}");
+        assert_eq!(calls[0].method, "GET");
+        assert_eq!(calls[0].url, "https://api.example.com/status");
+        drop(calls);
+
+        let denied_host = Arc::new(MockHost::default());
+        let err = vm
+            .dispatch_component_route(
+                &wasm,
+                request,
+                BTreeSet::new(),
+                denied_host.clone(),
+                VALID_HASH,
+                "apps/echo",
+                Vec::new(),
+                RunOptions {
+                    net_policy: Some(policy),
+                    ..RunOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("component route read"));
+        assert!(denied_host.http_calls.lock().is_empty());
+    }
+
+    fn component_test_store(
+        caps: BTreeSet<Capability>,
+        private_store: Option<PrivateStore>,
+        host: Arc<dyn PetalHost>,
+    ) -> Store<StoreData> {
+        component_test_store_with_policy(caps, private_store, host, NetPolicy::deny_all())
+    }
+
+    fn component_test_store_with_policy(
+        caps: BTreeSet<Capability>,
+        private_store: Option<PrivateStore>,
+        host: Arc<dyn PetalHost>,
+        net_policy: NetPolicy,
+    ) -> Store<StoreData> {
+        let vm = PetalVm::new().unwrap();
+        Store::new(
+            &vm.engine,
+            StoreData {
+                wasi: WasiCtxBuilder::new().build_p1(),
+                host,
+                caps,
+                petal_hash: VALID_HASH.into(),
+                net_policy,
+                http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,
+                private_store,
+            },
+        )
+    }
+
+    fn assert_component_ok_none(value: &ComponentVal) {
+        assert!(matches!(value, ComponentVal::Result(Ok(None))));
+    }
+
+    fn assert_component_err_contains(value: &ComponentVal, needle: &str) {
+        let ComponentVal::Result(Err(Some(payload))) = value else {
+            panic!("expected component err result, got {value:?}");
+        };
+        let ComponentVal::String(message) = payload.as_ref() else {
+            panic!("expected string error payload, got {payload:?}");
+        };
+        assert!(
+            message.contains(needle),
+            "expected {message:?} to contain {needle:?}"
+        );
+    }
+
+    fn assert_component_ok_optional_bytes(value: &ComponentVal, expected: Option<&[u8]>) {
+        let ComponentVal::Result(Ok(Some(payload))) = value else {
+            panic!("expected component ok result, got {value:?}");
+        };
+        let ComponentVal::Option(option) = payload.as_ref() else {
+            panic!("expected option payload, got {payload:?}");
+        };
+        match (option.as_ref().map(|v| v.as_ref()), expected) {
+            (None, None) => {}
+            (Some(ComponentVal::List(items)), Some(expected)) => {
+                let bytes = items
+                    .iter()
+                    .map(|item| match item {
+                        ComponentVal::U8(byte) => *byte,
+                        other => panic!("expected u8 item, got {other:?}"),
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(bytes, expected);
+            }
+            other => panic!("unexpected optional bytes payload: {other:?}"),
+        }
+    }
+
+    fn assert_component_ok_bytes(value: &ComponentVal, expected: &[u8]) {
+        let ComponentVal::Result(Ok(Some(payload))) = value else {
+            panic!("expected component ok result, got {value:?}");
+        };
+        let ComponentVal::List(items) = payload.as_ref() else {
+            panic!("expected byte list payload, got {payload:?}");
+        };
+        let bytes = items
+            .iter()
+            .map(|item| match item {
+                ComponentVal::U8(byte) => *byte,
+                other => panic!("expected u8 item, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bytes, expected);
+    }
+
+    fn assert_component_ok_http_body(value: &ComponentVal, expected: &[u8]) {
+        let ComponentVal::Result(Ok(Some(payload))) = value else {
+            panic!("expected component ok result, got {value:?}");
+        };
+        let ComponentVal::Record(fields) = payload.as_ref() else {
+            panic!("expected response record payload, got {payload:?}");
+        };
+        let body = component_record_field(fields, "body").unwrap();
+        assert_eq!(component_byte_list(body, "body").unwrap(), expected);
+    }
+
+    fn assert_component_ok_entry_names(value: &ComponentVal, expected: &[&str]) {
+        let ComponentVal::Result(Ok(Some(payload))) = value else {
+            panic!("expected component ok result, got {value:?}");
+        };
+        let ComponentVal::List(items) = payload.as_ref() else {
+            panic!("expected entry list payload, got {payload:?}");
+        };
+        let names = items
+            .iter()
+            .map(|item| {
+                let ComponentVal::Record(fields) = item else {
+                    panic!("expected entry record, got {item:?}");
+                };
+                component_record_string(fields, "name").unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, expected);
+    }
+
+    fn assert_component_ok_string_list(value: &ComponentVal, expected: &[&str]) {
+        let ComponentVal::Result(Ok(Some(payload))) = value else {
+            panic!("expected component ok result, got {value:?}");
+        };
+        let ComponentVal::List(items) = payload.as_ref() else {
+            panic!("expected list payload, got {payload:?}");
+        };
+        let values = items
+            .iter()
+            .map(|item| match item {
+                ComponentVal::String(value) => value.as_str(),
+                other => panic!("expected string item, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, expected);
     }
 
     fn component_entry(name: &str, kind: &str, size: Option<u64>) -> ComponentVal {
