@@ -1,0 +1,998 @@
+# Local Petal Plugins (v2) — File-Driven WASM App Design
+
+Status: draft v2, incorporating review feedback from v1
+Date: 2026-06-23
+Scope: local/off-chain Petal apps: content-addressed, WASM-first packages that create VFS surfaces by shipping a filesystem-shaped route tree. No chain scoring/staking/zk/consensus in this slice.
+
+---
+
+## 0. Summary
+
+v1 treated a Petal as a WASM module with a manifest-declared VFS mount:
+
+```toml
+[provides]
+kind = "vfs"
+mount = "polymarket"
+```
+
+v2 changes the mental model:
+
+> A published Petal app is a content-addressed package whose `app/` directory is the VFS declaration.
+
+The filesystem tree itself declares the user-facing routes, in the same spirit as file-based routing in Next.js. Bloom still provides the custom VFS layer: it maps `lookup`/`list`/`read`/`write` into WASM calls, enforces capability policy, mediates HTTP/signing/store/chain access, caches reads, and audits side effects. But Bloom no longer needs a package-level manifest that enumerates VFS paths or a single `mount = "..."` declaration.
+
+A package can contain many WASM modules. Small per-file/per-route modules are acceptable and encouraged when they make the app easier to reason about. Shared code should be factored through the WebAssembly Component Model and WIT interfaces rather than forcing a single monolithic module.
+
+---
+
+## 1. Goals
+
+1. **Natural VFS creation.** Petal authors create a directory tree under `app/`; Bloom exposes that tree under `/apps/`.
+2. **WASM-first, language-neutral.** Petals are components/modules with WIT-defined interfaces. Rust is only one producer language.
+3. **Modular app packages.** A Petal app may ship many route modules and shared components.
+4. **Minimal top-level metadata.** Keep only package identity and security policy in top-level metadata. Do not duplicate the route tree in a manifest.
+5. **Self-describing route behavior.** Route modules export metadata functions for entry kind, TTL, side-effect behavior, async-write behavior, and human-readable route descriptions.
+6. **Required docs.** Every package includes `README.md` for developers/contributors and `AGENTS.md` for users/agents operating on Bloom.
+7. **Strict host mediation.** HTTP, signing, private store, VFS reads/writes, and chain reads are daemon-mediated host capabilities with top-level policy limits.
+8. **Polymarket parity.** The architecture must be capable of replacing the current native `polymarket/` handler.
+
+---
+
+## 1.1 Implementation decisions
+
+These decisions close the v2 design questions for the first concrete implementation.
+
+1. **WIT package names and versions.** Bloom-owned route and host interfaces use
+   semver-versioned WIT packages:
+   - `bloom:route@0.1.0`
+   - `bloom:http@0.1.0`
+   - `bloom:store@0.1.0`
+   - `bloom:sign@0.1.0`
+   - `bloom:chain@0.1.0`
+   - `bloom:vfs@0.1.0`
+
+   Breaking ABI changes create a new major version that can be linked beside
+   older versions. Minor versions may add optional exports/imports only when old
+   packages keep validating and running unchanged.
+
+2. **Composition model.** Bloom stores the original content-addressed package
+   files, but the first implementation composes or adapts route modules at
+   install time into runnable route artifacts. Runtime dispatch selects a
+   prevalidated artifact by route id. A later runtime component-graph executor
+   may replace this without changing package shape.
+
+3. **Bootstrap ABI.** v2 accepts two route ABIs:
+   - the component route ABI defined by `bloom:route@0.1.0`;
+   - a compatibility ABI based on the current core-WASM `petal_dispatch`
+     envelope.
+
+   Compatibility routes are allowed for bootstrap and migration from v1. New
+   v2-stable examples should use the component ABI once the runner exists.
+
+4. **Route conflicts.** Route trie matching is deterministic:
+   - static segments outrank dynamic `[param]` segments;
+   - more segments outrank fewer segments;
+   - files outrank directory index handlers at the same path;
+   - equal-specificity routes conflict and fail install;
+   - `$lookup.wasm` may refine dynamic existence/type but may not override a
+     more-specific static route.
+
+5. **Single app root.** v2 packages expose exactly one root:
+   `app/<name>/`, mounted at `/apps/<name>/`. Multi-root packages are deferred.
+
+6. **Metadata timing.** Bloom evaluates metadata for static routes at install
+   and caches it by package hash. Dynamic route metadata may be evaluated at
+   first use with the bound params and cached by `(package hash, route id,
+   params)` when the metadata is pure. Runtime metadata may narrow behavior
+   below install-time policy, but can never widen capabilities, network access,
+   signing intents, writeability, async behavior, or side-effect flags.
+
+7. **Executable files.** First-class executable files are deferred. v2 reserves
+   `route-meta.executable = bool`; the initial implementation must reject
+   `executable = true` as unsupported. For now, write routes are the command
+   surface.
+
+8. **Native aliasing.** `/apps/polymarket` remains the petal-backed surface
+   while parity is proven. Replacing or aliasing native `/polymarket` is a
+   separate migration decision after parity signoff.
+
+---
+
+## 2. Non-goals for this slice
+
+- On-chain Petal scoring/staking/consensus.
+- zk execution.
+- Open-ended WASI filesystem or socket access.
+- Dynamic untrusted host imports outside Bloom-defined WIT worlds.
+- Direct arbitrary peer-to-peer module import at runtime without package-level composition/verification.
+- Perfect component deduplication in v1 of implementation; the format should allow it, but the first runner may instantiate route modules directly while composition matures.
+
+---
+
+## 3. Package shape
+
+A local app Petal is a content-addressed package directory or archive. The
+package hash covers all package files: route tree, modules/components, WIT
+files, generated artifacts when present, and top-level metadata.
+
+Example:
+
+```text
+polymarket.petal/
+  petal.toml                  # package identity + security policy only
+  README.md                   # required developer/contributor documentation
+  AGENTS.md                   # required user/agent-facing operating documentation
+
+  wit/
+    bloom-host.wit            # host capability interfaces used by this package
+    polymarket-types.wit      # shared app/domain types
+
+  components/
+    gamma-client.wasm
+    clob-client.wasm
+    data-client.wasm
+    order-core.wasm
+    policy-core.wasm
+    onboard-core.wasm
+
+  modules/
+    markets-list.wasm
+    market-file.wasm
+    search-file.wasm
+    positions-file.wasm
+    onboard-file.wasm
+    account-file.wasm
+    fund-file.wasm
+    trade-new.wasm
+    trade-draft-file.wasm
+    receipts-file.wasm
+
+  app/
+    polymarket/
+      $index.wasm
+      markets/
+        $list.wasm
+        [slug]/
+          market.json.wasm
+          book.json.wasm
+          prices.json.wasm
+      search/
+        [query].json.wasm
+      positions/
+        [wallet]/
+          positions.json.wasm
+          trades.json.wasm
+          activity.json.wasm
+      onboard/
+        [wallet]/
+          begin.wasm
+          status.json.wasm
+          plan.md.wasm
+          approvals.json.wasm
+      account/
+        [wallet]/
+          portfolio.json.wasm
+          orders.json.wasm
+      fund/
+        [wallet]/
+          new.wasm
+          [id]/
+            plan.md.wasm
+            request.json.wasm
+            status.json.wasm
+      trade/
+        [wallet]/
+          new.wasm
+          drafts/
+            $list.wasm
+            [id]/
+              plan.md.wasm
+              order.json.wasm
+              policy_check.json.wasm
+              quote.json.wasm
+              review_intent.json.wasm
+          receipts/
+            $list.wasm
+            [id]/
+              receipt.json.wasm
+```
+
+`app/` is authoritative for VFS shape. Bloom exposes this package at:
+
+```text
+/apps/polymarket/...
+```
+
+because the first segment under `app/` is `polymarket/`. For now, Bloom derives the app root from `name`, so the package must place its route tree at `app/<name>/`. Multi-root packages can be reconsidered later.
+
+### Package archive format
+
+The first implementation accepts either:
+
+- a package directory; or
+- a `.petal.tar` archive containing the same package files.
+
+`.petal.tar` is an uncompressed POSIX tar archive with package-root-relative
+paths. Compression is deferred so the first implementation does not depend on a
+compression format for install, hashing, or reproducible build behavior. A
+future `.petal.tar.zst` wrapper can be added without changing the canonical
+package digest.
+
+Archive entries must obey these rules:
+
+- paths are UTF-8, relative, and use `/`;
+- paths must not be absolute, empty, contain `.` or `..` segments, contain `\`,
+  or contain NUL bytes;
+- entries are regular files or directories only; symlinks, hardlinks, device
+  nodes, sparse files, and extended attributes are rejected;
+- file modes are normalized to `0644` unless an entry is a generated runnable
+  artifact under `artifacts/`, in which case `0755` is accepted but not
+  semantically required;
+- owner, group, uid, gid, mtime, atime, ctime, and platform-specific metadata
+  are ignored by Bloom's package digest and should be emitted as zero by build
+  tooling;
+- duplicate paths are an install error.
+
+The canonical package digest is **not** BLAKE3 of the raw tar bytes. It is
+BLAKE3 over Bloom's normalized file-set encoding, so installing a directory and
+installing a `.petal.tar` with identical files produce the same package hash.
+The encoding is:
+
+```text
+bloom.petal.package.v2\0
+for each regular file sorted by path bytes:
+  path_len_u32_le || path_utf8 || file_len_u64_le || blake3(file_bytes)
+```
+
+Directory entries are not hashed directly; they are implied by file paths.
+
+Required package files:
+
+- `petal.toml`
+- `README.md`
+- `AGENTS.md`
+- `app/<name>/...`
+
+Optional conventional directories:
+
+- `wit/`
+- `components/`
+- `modules/`
+- `artifacts/` generated by `bloom petal app build`
+
+Generated artifacts are covered by the package hash when present, but install
+still treats them as untrusted. Install must validate route sources, sidecar
+build hints, imports, artifact hashes, and artifact ABI before dispatch can use
+an artifact.
+
+---
+
+## 4. Route-file conventions
+
+The route tree is a declarative filesystem with WASM leaves.
+
+### Static paths
+
+```text
+app/polymarket/markets/[slug]/book.json.wasm
+```
+
+creates a dynamic readable file route:
+
+```text
+/apps/polymarket/markets/<slug>/book.json
+```
+
+### Dynamic segments
+
+Segments in square brackets bind params:
+
+```text
+[wallet]
+[slug]
+[id]
+[query].json
+```
+
+For `/apps/polymarket/trade/alice/drafts/abc/plan.md`, params are:
+
+```json
+{"wallet":"alice","id":"abc"}
+```
+
+### Special route modules
+
+- `$index.wasm` describes or handles the directory itself.
+- `$list.wasm` dynamically lists directory children.
+- `$lookup.wasm` optionally resolves existence/type for dynamic paths where static inference is insufficient.
+
+### File modules
+
+A `*.wasm` file under `app/` represents the VFS node without the `.wasm` suffix. The module exports metadata plus handlers. Whether it is read-only, writable, executable, async, cacheable, etc. is returned by the module’s metadata export.
+
+---
+
+## 5. Route component interface
+
+Route modules implement the `bloom:route@0.1.0` world. The names below define
+the v2 bootstrap ABI and may be expanded only under the versioning rules in
+§1.1.
+
+```wit
+package bloom:route@0.1.0;
+
+interface types {
+  record ctx {
+    app-root: string,
+    package-hash: string,
+    path: string,
+    params: list<tuple<string, string>>,
+    actor: option<string>,
+  }
+
+  enum entry-kind { dir, file, symlink }
+
+  record entry {
+    name: string,
+    kind: entry-kind,
+    mode: u32,
+    size: option<u64>,
+    link-target: option<string>,
+  }
+
+  record route-meta {
+    kind: entry-kind,
+    mode: u32,
+    cache-ttl-ms: option<u64>,
+    side-effecting-read: bool,
+    write-async: bool,
+    description: option<string>,
+    consent-summary: option<string>,
+    required-caps: list<string>,
+    sign-intent: option<string>,
+    executable: bool,
+  }
+
+  variant route-error {
+    not-found(string),
+    not-a-dir(string),
+    denied(string),
+    invalid(string),
+    backend(string),
+    unsupported(string),
+  }
+}
+
+world route-file {
+  import bloom:http/fetch;
+  import bloom:store/kv;
+  import bloom:sign/signing;
+  import bloom:chain/read;
+  import bloom:vfs/readwrite;
+
+  export metadata: func(ctx: types.ctx) -> result<types.route-meta, types.route-error>;
+  export lookup: func(ctx: types.ctx) -> result<types.entry, types.route-error>;
+  export list: func(ctx: types.ctx) -> result<list<types.entry>, types.route-error>;
+  export read: func(ctx: types.ctx) -> result<list<u8>, types.route-error>;
+  export write: func(ctx: types.ctx, body: list<u8>) -> result<_, types.route-error>;
+}
+```
+
+A route module does not need to export every handler. For example, a read-only file may export only `metadata` and `read`. Bloom maps missing exports to `unsupported` or derives defaults where safe.
+
+### Why metadata is exported by WASM
+
+Route behavior should live with the route implementation. That avoids scattering `route.toml` files and lets route behavior be computed from code when necessary.
+
+For example:
+
+- `metadata(...).side-effecting-read = true` for a signing/broadcast endpoint.
+- `metadata(...).write-async = true` for `onboard/[wallet]/begin`.
+- `metadata(...).cache-ttl-ms = 2000` for order-book reads.
+- `metadata(...).required-caps = ["bloom:http", "bloom:store"]` for a route that fetches data and reads private state.
+
+Bloom evaluates and caches metadata according to §1.1. Metadata is
+package-controlled declaration bounded by top-level security policy. It can
+narrow package-level permissions, never widen them.
+
+---
+
+## 6. Top-level `petal.toml`
+
+The top-level metadata file exists for package identity and security policy only. It does not enumerate VFS routes.
+
+```toml
+schema = "bloom.petal.local-app.v2"
+name = "polymarket"
+version = "0.1.0"
+description = "Polymarket markets, onboarding, funding, and reviewable trading as a Bloom VFS app."
+
+# README.md and AGENTS.md are required package files. Their paths are fixed by Bloom
+# and are not configurable here. README.md is developer/contributor-facing;
+# AGENTS.md is the user/agent-facing operating guide that agents on Bloom should read.
+
+[consent]
+summary = "Expose /apps/polymarket, fetch Polymarket APIs, store per-wallet CLOB credentials/order state, request wallet signatures for Polymarket auth/orders/onboarding."
+
+[caps]
+allowed = [
+  "bloom:http",
+  "bloom:store",
+  "bloom:sign",
+  "bloom:chain",
+  "bloom:vfs.read"
+]
+
+# Top-level network allowlist. Route/module metadata can narrow this but never widen it.
+[[net.allow]]
+host = "gamma-api.polymarket.com"
+methods = ["GET"]
+paths = ["/markets*", "/events*"]
+
+[[net.allow]]
+host = "data-api.polymarket.com"
+methods = ["GET"]
+paths = ["/*"]
+
+[[net.allow]]
+host = "clob.polymarket.com"
+methods = ["GET", "POST", "DELETE"]
+paths = [
+  "/",
+  "/book",
+  "/price",
+  "/midpoint",
+  "/spread",
+  "/markets*",
+  "/auth/*",
+  "/order",
+  "/orders*",
+  "/cancel",
+  "/balance-allowance*"
+]
+
+[sign]
+# Purpose tags a route may request. Route metadata/host call must choose one of these.
+allowed_intents = [
+  "polymarket.clob_auth",
+  "polymarket.deposit_wallet_batch",
+  "polymarket.order"
+]
+
+[store]
+# Declares private store namespaces for consent and policy. Actual keys are accessed through bloom:store.
+namespaces = [
+  "credentials",
+  "orders",
+  "onboarding",
+  "funding"
+]
+secret_namespaces = ["credentials"]
+```
+
+The manifest answers questions Bloom cannot safely derive from arbitrary route code:
+
+- which hosts/methods/paths may be fetched;
+- which signing purpose tags are allowed;
+- which broad host capabilities may be linked;
+- package-level human-readable consent.
+
+The app root is derived from `name` for now, so `name = "polymarket"` exposes `app/polymarket/` at `/apps/polymarket/`. The package hash algorithm is selected by Bloom, not by the package; this design continues to assume BLAKE3 content addressing.
+
+Everything about the VFS hierarchy itself lives under `app/`.
+
+---
+
+## 7. Host capabilities as Bloom components
+
+Privileged I/O is exposed as Bloom-defined WIT interfaces. Route modules/components import these capabilities. Bloom enforces the top-level manifest policy on every call.
+
+### HTTP
+
+```wit
+interface bloom:http {
+  record request {
+    method: string,
+    url: string,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+  }
+
+  record response {
+    status: u16,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+  }
+
+  fetch: func(req: request) -> result<response, string>;
+}
+```
+
+Rules:
+
+- HTTPS only.
+- Match method/host/path against `net.allow`.
+- Redirects are revalidated.
+- Response size/timeouts are daemon-controlled.
+- Audit method, host, path, status, byte counts; never log secrets.
+
+### Private store
+
+```wit
+interface bloom:store {
+  get: func(namespace: string, key: string) -> result<option<list<u8>>, string>;
+  put: func(namespace: string, key: string, value: list<u8>, secret: bool) -> result<_, string>;
+  list: func(namespace: string, prefix: string) -> result<list<string>, string>;
+  delete: func(namespace: string, key: string) -> result<_, string>;
+}
+```
+
+Store is per package hash and private to that app. Secret namespaces are not surfaced in the public VFS.
+
+### Signing
+
+```wit
+interface bloom:sign {
+  sign-hash: func(wallet: string, hash32: list<u8>, intent: string) -> result<list<u8>, string>;
+}
+```
+
+The route must pass an intent allowed by `petal.toml`. Bloom audits wallet/hash/intent and applies future scoped-run policy. Key material never enters WASM.
+
+### Chain reads
+
+```wit
+interface bloom:chain {
+  code-len: func(chain-id: u64, address: string) -> result<u64, string>;
+  erc20-balance: func(chain-id: u64, token: string, holder: string) -> result<string, string>;
+  erc20-allowance: func(chain-id: u64, token: string, owner: string, spender: string) -> result<string, string>;
+  is-approved-for-all: func(chain-id: u64, token: string, owner: string, operator: string) -> result<bool, string>;
+  eth-call: func(chain-id: u64, to: string, data: list<u8>) -> result<list<u8>, string>;
+}
+```
+
+For Polymarket, this replaces the native `ChainReader` adapter used by onboarding.
+
+---
+
+## 8. Component composition and code sharing
+
+v2 intentionally leans into WASM components rather than avoiding small modules. Shared logic ships as components under `components/`, and route modules import typed WIT interfaces from those components. The first implementation composes route modules with shared components into runnable artifacts at install time and stores those artifacts beside the original package files. A future runtime component-graph executor can instantiate the raw component graph directly without changing the package format.
+
+Example component graph:
+
+```text
+market-file.wasm
+  imports bloom:polymarket/gamma-client
+  imports bloom:polymarket/clob-client
+  imports bloom:http/fetch
+
+trade-new.wasm
+  imports bloom:polymarket/order-core
+  imports bloom:polymarket/policy-core
+  imports bloom:polymarket/clob-client
+  imports bloom:store/kv
+  imports bloom:sign/signing
+```
+
+This is language-neutral: a TypeScript route module can import a Rust-built order component if both speak WIT.
+
+### Practical note
+
+The current Bloom petal runner is WASI Preview 1 command-style. Implementing v2 means adding a component-aware runner and, for bootstrap, a compatibility adapter for the existing `petal_dispatch` ABI. Compatibility is a migration bridge, not the long-term authoring target.
+
+### Build and composition command
+
+The first CLI build command is:
+
+```text
+bloom petal app build <package-dir> [--out <archive.petal.tar>]
+```
+
+It performs local authoring/build validation and may emit a deterministic
+`.petal.tar`. It does not install the package.
+
+Required behavior:
+
+1. Validate `petal.toml`, required docs, and `app/<name>/`.
+2. Discover route leaves under `app/<name>/`.
+3. Validate every route leaf is either:
+   - a component route implementing `bloom:route@0.1.0`; or
+   - a compatibility route implementing the current `petal_dispatch` ABI.
+4. Inspect component/core-WASM imports and reject imports outside Bloom-owned
+   WIT packages, package-local components, or the compatibility host import set.
+5. Compose each component route with package-local shared components into a
+   runnable artifact when composition metadata is present. Compatibility routes
+   are copied into artifacts unchanged with an adapter descriptor.
+6. Write generated artifacts under `artifacts/routes/<route-id>.wasm` and write
+   `artifacts/build-manifest.json`.
+7. If `--out` is set, emit a deterministic `.petal.tar` using the archive rules
+   in §3.
+
+The build manifest is authoring output, not the trusted install record. Install
+must rescan and revalidate the package, recompute the route index, and verify
+that artifact hashes match route-index expectations.
+
+Initial composition metadata is intentionally simple. A route leaf may sit next
+to a same-stem `.route.toml` file during the bootstrap period:
+
+```toml
+abi = "component" # or "compat-petal-dispatch"
+component = "modules/market-file.wasm"
+imports = [
+  "components/gamma-client.wasm",
+  "components/clob-client.wasm",
+]
+```
+
+These sidecar files are build hints only. They do not declare VFS routes, do not
+grant capabilities, and may not widen `petal.toml` policy.
+
+---
+
+## 9. Bloom routing algorithm
+
+At install:
+
+1. Validate `petal.toml` schema/security policy and require top-level `README.md` and `AGENTS.md`.
+2. Hash package contents with Bloom's fixed content-addressing algorithm.
+3. Derive the app root from `name`, scan `app/<name>/`, and build a route trie from directories, dynamic segments, and `*.wasm` route files.
+4. Validate that every route module is a valid WASM module/component implementing `bloom:route@0.1.0` or the accepted `petal_dispatch` compatibility ABI.
+5. Inspect declared imports and reject anything outside allowed Bloom interfaces.
+6. Compose/adapt route modules into runnable artifacts and store them beside the original package files.
+7. Call `metadata` for static routes to build the install consent display and route cache hints.
+8. Store package metadata, route index, and install-time route metadata.
+
+At runtime:
+
+1. `/apps/` lists installed app roots.
+2. Match path against the route trie.
+3. Bind dynamic params.
+4. Select the matching route module and operation.
+5. Load cached metadata or call `metadata` for dynamic route params when needed.
+6. Enforce manifest policy on linked imports and host calls.
+7. Call `lookup`/`list`/`read`/`write`.
+8. Map route errors to VFS errors.
+9. Cache/audit according to route metadata and global policy.
+
+### On-disk package store and route index
+
+v2 adds an app-package store beside the existing single-WASM petal store. The
+layout is rooted at the same petals store base:
+
+```text
+<base>/
+  objects/<hash>                 # existing v1 single-WASM objects
+  meta/<hash>.json               # existing + v2 package metadata
+  packages/<hash>/
+    source/                      # normalized package files
+    artifacts/routes/<id>.wasm   # install-validated runnable route artifacts
+    route-index.json             # install-derived route index
+```
+
+Install writes to a temporary `packages/.<hash>.tmp/` directory and atomically
+renames it to `packages/<hash>/` only after validation succeeds. `meta/<hash>.json`
+is written last, so a package is not considered installed without metadata.
+
+The route index is JSON for v2 bootstrap readability and reviewability. It is
+part of install output, not package input. Bloom may replace the on-disk encoding
+later while keeping the logical fields stable.
+
+```json
+{
+  "schema": "bloom.petal.route-index.v1",
+  "package_hash": "hex-blake3",
+  "name": "polymarket",
+  "app_root": "polymarket",
+  "policy_hash": "hex-blake3-of-normalized-petal-toml-policy",
+  "routes": [
+    {
+      "route_id": "r001",
+      "pattern": "markets/[slug]/book.json",
+      "source_path": "app/polymarket/markets/[slug]/book.json.wasm",
+      "artifact_path": "artifacts/routes/r001.wasm",
+      "artifact_hash": "hex-blake3",
+      "abi": "component:bloom:route@0.1.0",
+      "kind": "file",
+      "ops": ["lookup", "read"],
+      "params": ["slug"],
+      "specificity": [3, 2, 1],
+      "install_metadata": {
+        "mode": 420,
+        "cache_ttl_ms": 2000,
+        "side_effecting_read": false,
+        "write_async": false,
+        "executable": false,
+        "required_caps": ["bloom:http"],
+        "sign_intent": null
+      }
+    }
+  ]
+}
+```
+
+Field rules:
+
+- `route_id` is assigned deterministically by sorting route patterns by path
+  bytes and numbering from `r000001`.
+- `pattern` is app-root-relative and omits the leading `/apps/<name>/`.
+- `artifact_path` is package-root-relative under `artifacts/routes/`.
+- `artifact_hash` is BLAKE3 of the runnable artifact bytes.
+- `abi` is either `component:bloom:route@0.1.0` or
+  `compat:petal-dispatch-v1`.
+- `specificity` is the route-sort key used by the trie. The initial tuple is
+  `[segment_count, static_segment_count, file_score]`; conflicts after full
+  route comparison are install errors.
+- `install_metadata` is the static metadata result used for consent, caching,
+  side-effect classification, and write behavior. Dynamic metadata can narrow
+  these values at runtime but cannot widen them.
+
+---
+
+## 10. Polymarket decomposition
+
+The current native handler exposes these VFS areas:
+
+```text
+polymarket/
+  markets/
+  search/
+  positions/
+  onboard/
+  account/
+  fund/
+  trade/
+```
+
+A v2 Petal app can represent that directly under `app/polymarket/`.
+
+### Route modules
+
+```text
+markets-list.wasm
+  lists active markets from Gamma
+
+market-file.wasm
+  handles market.json, book.json, prices.json for [slug]
+  imports gamma-client, clob-client
+  cache: market.json ~30s, book/prices ~2s
+
+search-file.wasm
+  handles search/[query].json
+  imports gamma-client
+  cache: ~30s
+
+positions-file.wasm
+  handles positions/[wallet]/{positions,trades,activity}.json
+  imports data-client, bloom:vfs.read for wallet/address lookup if needed
+  cache: ~10s
+
+onboard-file.wasm
+  handles onboard/[wallet]/begin + status/plan/approvals
+  imports bloom:chain, bloom:sign, bloom:store, clob-client, optional relayer component
+  begin.write metadata: write-async = true
+  onboard status metadata: cache-ttl = none
+
+account-file.wasm
+  handles account/[wallet]/{portfolio,orders}.json
+  imports bloom:store, clob-client, data-client, bloom:chain
+  cache: ~5s
+
+fund-file.wasm
+  handles fund/[wallet]/new and fund/[wallet]/[id]/*
+  imports bloom:store, bloom:vfs.read, policy-core
+  creates staged funding requests only
+
+trade-new.wasm
+  handles trade/[wallet]/new
+  imports gamma-client, clob-client, order-core, policy-core, bloom:store
+  creates reviewable drafts, no immediate order submission unless route/package policy allows it
+
+trade-draft-file.wasm
+  handles draft plan/order/policy/quote/review_intent reads
+  imports bloom:store
+
+receipts-file.wasm
+  handles receipts listing and receipt.json reads
+  imports bloom:store
+```
+
+### Shared components
+
+```text
+gamma-client.wasm
+  wraps Gamma API over bloom:http
+
+data-client.wasm
+  wraps Data API over bloom:http
+
+clob-client.wasm
+  wraps CLOB API over bloom:http and exposes typed operations
+
+order-core.wasm
+  EIP-712 order hash/build/quote math
+
+policy-core.wasm
+  Polymarket order policy evaluation
+
+onboard-core.wasm
+  idempotent derive/deploy/fund/approve/creds/sync state machine over bloom:chain, bloom:sign, bloom:store, clob/relayer clients
+```
+
+### Why small route modules are acceptable
+
+The earlier concern was duplicated code and repeated instantiation. In v2, both are manageable:
+
+- duplicated code is reduced by component composition;
+- compiled module/component caches make instantiation cheaper;
+- hot routes can later be kept resident without changing route shape;
+- per-file modules make audit, review, permissions, and mental model cleaner;
+- not every route needs all Polymarket dependencies linked.
+
+For example, `book.json.wasm` should not need onboarding, store secret access, or signing. `begin.wasm` should not need market listing code. Small modules let the security boundary follow the route.
+
+---
+
+## 11. Install consent
+
+Consent is derived from three sources:
+
+1. top-level `petal.toml` security policy;
+2. required `AGENTS.md` user/agent-facing guidance;
+3. scanned route tree under `app/<name>/`;
+4. route `metadata` exports.
+
+Example generated install summary:
+
+```text
+petal: polymarket  hash: 9f86…
+
+VFS app roots:
+  /apps/polymarket
+
+Routes:
+  /apps/polymarket/markets/**        read market data
+  /apps/polymarket/onboard/*/begin   writable async onboarding trigger
+  /apps/polymarket/trade/*/new       writable draft creation
+  /apps/polymarket/fund/*/new        writable funding request staging
+
+May fetch:
+  GET        gamma-api.polymarket.com/markets*, /events*
+  GET        data-api.polymarket.com/*
+  GET/POST   clob.polymarket.com/auth/*, /order, /book, ...
+  DELETE     clob.polymarket.com/cancel
+
+May request signatures for intents:
+  polymarket.clob_auth
+  polymarket.deposit_wallet_batch
+  polymarket.order
+
+Private store namespaces:
+  credentials  secret
+  orders       private
+  onboarding   private
+  funding      private
+```
+
+Route-provided `consent-summary` strings can make this friendlier, but the top-level policy remains the hard bound.
+
+---
+
+## 12. Resolved implementation questions
+
+The original v2 draft listed eight open questions. They are resolved for the
+first implementation by §1.1:
+
+1. WIT package names use Bloom-owned semver packages such as
+   `bloom:route@0.1.0`.
+2. Bloom stores raw package files but composes/adapts route artifacts at install
+   time for the first runner.
+3. Both component routes and the current `petal_dispatch` compatibility ABI are
+   accepted during bootstrap.
+4. Route conflicts are deterministic and equal-specificity overlaps fail
+   install.
+5. v2 packages expose one app root: `app/<name>/`.
+6. Static metadata is evaluated at install; dynamic metadata is evaluated lazily
+   and cached by package hash/route/params where pure.
+7. Executable files are reserved but unsupported in the first implementation.
+8. Native `/polymarket` aliasing is deferred until after petal parity signoff.
+
+Remaining implementation details to decide during build:
+
+- the exact component-composition engine/library used behind
+  `bloom petal app build`;
+- whether dynamic metadata can declare itself pure/cacheable explicitly or is
+  treated as non-cacheable unless proven static;
+- the future compressed archive wrapper, if needed.
+
+---
+
+## 12.1 Implementation risk notes
+
+The v2 direction is implementable, but future implementers should expect a
+small spike before committing to the full Polymarket decomposition.
+
+- **Wasmtime component hosting is real, but check the pinned version.**
+  Wasmtime exposes a `wasmtime::component` API with `Component`, component
+  `Linker`, and WIT `bindgen!`, and supports async component bindings. Bloom
+  currently pins an older Wasmtime than the latest docs, so verify the exact API
+  and async ergonomics available in the repo before designing `PetalAppRunner`.
+  Useful starting points:
+  - <https://docs.rs/wasmtime/latest/wasmtime/component/index.html>
+  - <https://docs.wasmtime.dev/api/wasmtime/component/bindgen_examples/_7_async/index.html>
+
+- **Composition tooling is the main unknown.** Install-time composition matches
+  the Component Model: a primary route component's imports can be wired to
+  dependency component exports to produce a new runnable `.wasm` component. WAC
+  and `wasm-tools`/`wasm-compose` are the first tools to investigate. Before
+  implementing package install broadly, prove one tiny route component plus one
+  shared component can be composed, loaded, and dispatched by Bloom.
+  Useful starting points:
+  - <https://component-model.bytecodealliance.org/composing-and-distributing/composing.html>
+  - <https://github.com/bytecodealliance/wac>
+  - <https://docs.rs/wasm-compose>
+
+- **`cargo-component` is useful but experimental.** Its README explicitly says
+  it is not stable and upgrades may break existing component projects. It is a
+  good Rust authoring path, especially for custom WIT interfaces, but Bloom's
+  package format should not depend on `cargo-component`-specific metadata.
+  Useful starting point:
+  - <https://github.com/bytecodealliance/cargo-component>
+
+- **`wit-bindgen` is the right guest binding layer.** It is designed for WIT and
+  the Component Model, supports multiple guest languages, and maps directly to
+  the language-neutral goal. Route ABI changes should start in WIT, not in a
+  Rust-only SDK shape.
+  Useful starting point:
+  - <https://github.com/bytecodealliance/wit-bindgen>
+
+- **Keep the compatibility ABI as a bridge.** Supporting current
+  `petal_dispatch` routes reduces migration risk and lets v2 route scanning land
+  before the component runner is complete. Treat it as a bootstrap path, not the
+  long-term authoring model.
+
+- **Default dynamic metadata to conservative behavior.** Until purity/cache
+  semantics are formalized, dynamic metadata should be evaluated at runtime and
+  treated as non-cacheable unless the route has install-time static metadata
+  proving a narrower safe behavior.
+
+---
+
+## 13. Recommended implementation path
+
+1. Add package/directory install support with `app/<name>/` route-tree scanning,
+   required `README.md` and `AGENTS.md`, and one-root validation.
+2. Implement the route trie, conflict rules from §1.1, and static VFS exposure
+   under `/apps`.
+3. Define and check in `bloom:route@0.1.0` plus host capability WIT packages.
+4. Implement route-module validation for both component routes and the
+   `petal_dispatch` compatibility ABI.
+5. Compose/adapt route modules at install time into runnable artifacts and store
+   a route index keyed by package hash.
+6. Implement `PetalAppRunner` metadata/lookup/list/read/write dispatch over the
+   route index, reusing the existing v1 host-capability enforcement where
+   possible.
+7. Start with small demo apps: `echo`, `hash`, `gas-now`.
+8. Build Polymarket as a v2 app with modular route files and shared Polymarket
+   clients/core logic composed through WIT components.
+9. Run native `/polymarket` and `/apps/polymarket` side-by-side until parity is
+   proven; decide alias/replacement only after that signoff.
+
+---
+
+## 14. Key design shift from v1
+
+v1 asked the manifest to declare:
+
+```text
+this petal provides VFS mount X
+```
+
+v2 asks the package to show Bloom its app filesystem:
+
+```text
+app/polymarket/... is the VFS surface
+```
+
+The manifest becomes a security and consent boundary, not a route declaration language. Route modules become self-describing WASM components. Bloom remains the trusted router and capability enforcer.

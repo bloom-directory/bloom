@@ -26,6 +26,7 @@ pub mod registry;
 pub mod router;
 pub mod runner;
 pub mod store;
+pub mod v2;
 pub mod vm;
 
 pub use abi::{
@@ -46,4 +47,5 @@ pub use registry::{NameRegistry, validate_name};
 pub use router::PetalRouter;
 pub use runner::{LateVfsHost, PetalRunner, VfsHost};
 pub use store::{InstallResult, PetalStore};
+pub use v2::{PetalAppPackage, RouteMatch, RouteRecord, RouteSpecificity};
 pub use vm::{PetalVm, RunOptions, RunOutput};
