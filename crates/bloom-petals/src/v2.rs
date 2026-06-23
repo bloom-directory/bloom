@@ -131,6 +131,7 @@ struct StorePolicyToml {
 struct RouteValidation {
     abi: RouteAbi,
     required_caps: Vec<String>,
+    has_write_export: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -499,7 +500,7 @@ impl PreparedAppPackage {
                 }
                 source_validation
             };
-            let (kind, ops) = route_kind_and_ops(&source_path);
+            let (kind, mut ops) = route_kind_and_ops(&source_path);
             let install_metadata = install_metadata_for_route(
                 &hash,
                 &manifest.name,
@@ -510,6 +511,12 @@ impl PreparedAppPackage {
                 &allowed_caps,
                 &allowed_sign_intents,
             )?;
+            if kind == RouteEntryKind::File
+                && install_metadata.mode & 0o222 != 0
+                && !ops.contains(&RouteOp::Write)
+            {
+                ops.push(RouteOp::Write);
+            }
             route_index.routes.push(RouteIndexRecord {
                 route_id: route.route_id,
                 pattern: route.pattern,
@@ -551,9 +558,14 @@ fn install_metadata_for_route(
     allowed_sign_intents: &BTreeSet<String>,
 ) -> Result<InstallRouteMetadata, PetalError> {
     let mut metadata = InstallRouteMetadata {
-        mode: 0o444,
+        mode: if validation.abi == RouteAbi::ComponentBloomRoute010 && validation.has_write_export {
+            0o666
+        } else {
+            0o444
+        },
         cache_ttl_ms: None,
-        side_effecting_read: false,
+        side_effecting_read: validation.abi == RouteAbi::ComponentBloomRoute010
+            && !route.params.is_empty(),
         write_async: false,
         executable: false,
         required_caps: validation.required_caps.clone(),
@@ -582,6 +594,77 @@ fn install_metadata_for_route(
     metadata.required_caps = component_metadata.required_caps;
     metadata.sign_intent = component_metadata.sign_intent;
     Ok(metadata)
+}
+
+pub fn narrow_runtime_route_metadata(
+    route: &RouteIndexRecord,
+    metadata: &ComponentRouteMetadata,
+    allowed_sign_intents: &BTreeSet<String>,
+) -> Result<InstallRouteMetadata, PetalError> {
+    let install = &route.install_metadata;
+    let install_caps = install
+        .required_caps
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    validate_component_metadata_policy(
+        &route.route_id,
+        route.kind,
+        metadata,
+        &install.required_caps,
+        &install_caps,
+        allowed_sign_intents,
+    )?;
+    if metadata.mode & !install.mode != 0 {
+        return Err(PetalError::InvalidWasm(format!(
+            "v2 route {} runtime metadata mode widens install-time mode",
+            route.route_id
+        )));
+    }
+    if !install.side_effecting_read && metadata.side_effecting_read {
+        return Err(PetalError::InvalidWasm(format!(
+            "v2 route {} runtime metadata widens side-effecting-read",
+            route.route_id
+        )));
+    }
+    if !install.write_async && metadata.write_async {
+        return Err(PetalError::InvalidWasm(format!(
+            "v2 route {} runtime metadata widens write-async",
+            route.route_id
+        )));
+    }
+    match (install.cache_ttl_ms, metadata.cache_ttl_ms) {
+        (None, Some(_)) => {
+            return Err(PetalError::InvalidWasm(format!(
+                "v2 route {} runtime metadata widens cacheability",
+                route.route_id
+            )));
+        }
+        (Some(max), Some(ttl)) if ttl > max => {
+            return Err(PetalError::InvalidWasm(format!(
+                "v2 route {} runtime metadata widens cache ttl",
+                route.route_id
+            )));
+        }
+        _ => {}
+    }
+    if let Some(install_intent) = &install.sign_intent
+        && metadata.sign_intent.as_ref() != Some(install_intent)
+    {
+        return Err(PetalError::InvalidWasm(format!(
+            "v2 route {} runtime metadata widens sign intent",
+            route.route_id
+        )));
+    }
+    Ok(InstallRouteMetadata {
+        mode: metadata.mode,
+        cache_ttl_ms: metadata.cache_ttl_ms,
+        side_effecting_read: metadata.side_effecting_read,
+        write_async: metadata.write_async,
+        executable: metadata.executable,
+        required_caps: metadata.required_caps.clone(),
+        sign_intent: metadata.sign_intent.clone(),
+    })
 }
 
 fn evaluate_static_component_metadata(
@@ -1941,7 +2024,7 @@ fn validate_route_wasm_inner(
     }
 
     if saw_component {
-        validate_component_route_exports(
+        let has_write_export = validate_component_route_exports(
             path,
             &component_exports,
             &component_func_type_indices,
@@ -1951,6 +2034,7 @@ fn validate_route_wasm_inner(
         return Ok(RouteValidation {
             abi: RouteAbi::ComponentBloomRoute010,
             required_caps: required_caps.into_iter().collect(),
+            has_write_export,
         });
     }
 
@@ -1992,6 +2076,7 @@ fn validate_route_wasm_inner(
     Ok(RouteValidation {
         abi: RouteAbi::CompatPetalDispatchV1,
         required_caps: required_caps.into_iter().collect(),
+        has_write_export: false,
     })
 }
 
@@ -2014,7 +2099,9 @@ fn validate_component_route_exports(
     func_type_indices: &[u32],
     types: &[ComponentTypeEntry<'_>],
     allow_untyped_alias_exports: bool,
-) -> Result<(), PetalError> {
+) -> Result<bool, PetalError> {
+    let has_write_export =
+        component_route_export_type("write", exports, func_type_indices).is_some();
     if component_route_export_type("metadata", exports, func_type_indices).is_none() {
         return Err(PetalError::InvalidWasm(format!(
             "{path}: component route missing bloom:route@0.1.0 metadata export"
@@ -2044,7 +2131,7 @@ fn validate_component_route_exports(
         let ty = component_func_type(path, type_index, types)?;
         validate_component_route_func_sig(path, expected, ty, types)?;
     }
-    Ok(())
+    Ok(has_write_export)
 }
 
 fn component_route_export_type(
@@ -4478,7 +4565,8 @@ allowed = ["bloom:http"]
         write_v2_package_with_route(tmp.path(), route_component_metadata());
 
         let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
-        let metadata = &package.route_index.routes[0].install_metadata;
+        let route = &package.route_index.routes[0];
+        let metadata = &route.install_metadata;
         assert_eq!(metadata.mode, 0o640);
         assert_eq!(metadata.cache_ttl_ms, Some(2000));
         assert!(metadata.side_effecting_read);
@@ -4486,6 +4574,7 @@ allowed = ["bloom:http"]
         assert!(!metadata.executable);
         assert!(metadata.required_caps.is_empty());
         assert_eq!(metadata.sign_intent, None);
+        assert!(route.ops.contains(&RouteOp::Write));
     }
 
     #[test]
@@ -4495,6 +4584,84 @@ allowed = ["bloom:http"]
 
         let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("executable=true"));
+    }
+
+    #[test]
+    fn v2_runtime_component_metadata_can_only_narrow_install_metadata() {
+        let route = RouteIndexRecord {
+            route_id: "r000001".into(),
+            pattern: "[name].txt".into(),
+            source_path: "app/echo/[name].txt.wasm".into(),
+            artifact_path: "artifacts/routes/r000001.wasm".into(),
+            artifact_hash: "00".repeat(32),
+            abi: RouteAbi::ComponentBloomRoute010,
+            kind: RouteEntryKind::File,
+            ops: vec![RouteOp::Lookup, RouteOp::Read, RouteOp::Write],
+            params: vec!["name".into()],
+            specificity: [1, 0, 1],
+            install_metadata: InstallRouteMetadata {
+                mode: 0o666,
+                cache_ttl_ms: Some(5000),
+                side_effecting_read: true,
+                write_async: true,
+                executable: false,
+                required_caps: vec!["bloom:http".into(), "bloom:store".into()],
+                sign_intent: None,
+            },
+        };
+        let metadata = ComponentRouteMetadata {
+            kind: ComponentRouteEntryKind::File,
+            mode: 0o444,
+            cache_ttl_ms: Some(1000),
+            side_effecting_read: false,
+            write_async: false,
+            executable: false,
+            required_caps: vec!["bloom:store".into()],
+            sign_intent: None,
+        };
+
+        let narrowed = narrow_runtime_route_metadata(&route, &metadata, &BTreeSet::new()).unwrap();
+        assert_eq!(narrowed.mode, 0o444);
+        assert_eq!(narrowed.cache_ttl_ms, Some(1000));
+        assert_eq!(narrowed.required_caps, vec!["bloom:store".to_string()]);
+    }
+
+    #[test]
+    fn v2_runtime_component_metadata_rejects_widening() {
+        let route = RouteIndexRecord {
+            route_id: "r000001".into(),
+            pattern: "[name].txt".into(),
+            source_path: "app/echo/[name].txt.wasm".into(),
+            artifact_path: "artifacts/routes/r000001.wasm".into(),
+            artifact_hash: "00".repeat(32),
+            abi: RouteAbi::ComponentBloomRoute010,
+            kind: RouteEntryKind::File,
+            ops: vec![RouteOp::Lookup, RouteOp::Read],
+            params: vec!["name".into()],
+            specificity: [1, 0, 1],
+            install_metadata: InstallRouteMetadata {
+                mode: 0o444,
+                cache_ttl_ms: None,
+                side_effecting_read: false,
+                write_async: false,
+                executable: false,
+                required_caps: vec!["bloom:store".into()],
+                sign_intent: None,
+            },
+        };
+        let metadata = ComponentRouteMetadata {
+            kind: ComponentRouteEntryKind::File,
+            mode: 0o644,
+            cache_ttl_ms: Some(1000),
+            side_effecting_read: false,
+            write_async: false,
+            executable: false,
+            required_caps: vec!["bloom:store".into()],
+            sign_intent: None,
+        };
+
+        let err = narrow_runtime_route_metadata(&route, &metadata, &BTreeSet::new()).unwrap_err();
+        assert!(err.to_string().contains("widens install-time mode"));
     }
 
     #[test]

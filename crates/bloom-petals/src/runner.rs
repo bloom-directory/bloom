@@ -15,14 +15,15 @@ use bloom_vfs::{Handler, Vfs};
 use parking_lot::RwLock;
 
 use crate::error::PetalError;
-use crate::host::{HostError, PetalHost};
+use crate::host::{DenyHost, HostError, PetalHost};
 use crate::meta::{Capability, PetalMeta};
 use crate::policy::NetPolicy;
 use crate::registry::NameRegistry;
 use crate::store::{InstallResult, PetalStore};
 use crate::v2::{
-    RouteAbi, RouteEntryKind, RouteIndex, RouteIndexRecord, RouteOp,
-    sign_intents_from_v2_manifest_toml, store_policy_from_v2_manifest_toml,
+    InstallRouteMetadata, RouteAbi, RouteEntryKind, RouteIndex, RouteIndexRecord, RouteOp,
+    narrow_runtime_route_metadata, sign_intents_from_v2_manifest_toml,
+    store_policy_from_v2_manifest_toml,
 };
 use crate::vm::{DispatchOutput, PetalVm, RunOptions, RunOutput};
 use crate::{DispatchOp, DispatchRequest};
@@ -454,9 +455,22 @@ impl PetalRunner {
             .ctx
             .push(("bloom.route_id".into(), matched.route.route_id.clone()));
 
-        let mut caps = matched
-            .route
-            .install_metadata
+        let wasm = self
+            .store
+            .read_route_artifact(&matched.hash, &matched.route.route_id)?;
+        let declared_sign_intents = self.v2_sign_intents(&matched.hash)?;
+        let runtime_metadata = self
+            .runtime_app_route_metadata(
+                &matched,
+                mount,
+                &request.path,
+                &wasm,
+                &declared_sign_intents,
+                &opts,
+            )
+            .await?;
+        enforce_runtime_route_op(request.op, &matched, &runtime_metadata)?;
+        let mut caps = runtime_metadata
             .required_caps
             .iter()
             .map(|cap| {
@@ -471,10 +485,6 @@ impl PetalRunner {
         if let Some(mask) = cap_mask {
             caps = caps.intersection(&mask).copied().collect();
         }
-
-        let wasm = self
-            .store
-            .read_route_artifact(&matched.hash, &matched.route.route_id)?;
         let mut opts = opts;
         if opts.private_store_root.is_none() {
             opts.private_store_root = Some(self.store.private_data_root());
@@ -484,10 +494,9 @@ impl PetalRunner {
             Some(mask) => declared.intersect(&mask),
             None => declared,
         });
-        let declared_sign_intents = self.v2_sign_intents(&matched.hash)?;
         opts.sign_intents = Some(route_sign_intents(
             declared_sign_intents,
-            matched.route.install_metadata.sign_intent.as_deref(),
+            runtime_metadata.sign_intent.as_deref(),
             opts.sign_intents,
         ));
         let declared_store_policy = self.v2_store_policy(&matched.hash)?;
@@ -516,6 +525,34 @@ impl PetalRunner {
                     .await
             }
         }
+    }
+
+    async fn runtime_app_route_metadata(
+        &self,
+        matched: &LocalAppRouteMatch,
+        mount: &str,
+        path: &str,
+        wasm: &[u8],
+        declared_sign_intents: &BTreeSet<String>,
+        opts: &RunOptions,
+    ) -> Result<InstallRouteMetadata, PetalError> {
+        if matched.route.abi != RouteAbi::ComponentBloomRoute010 || matched.params.is_empty() {
+            return Ok(matched.route.install_metadata.clone());
+        }
+        let metadata = self
+            .vm
+            .component_route_metadata(
+                wasm,
+                BTreeSet::new(),
+                Arc::new(DenyHost),
+                &matched.hash,
+                mount,
+                path,
+                matched.params.clone(),
+                opts.clone(),
+            )
+            .await?;
+        narrow_runtime_route_metadata(&matched.route, &metadata, declared_sign_intents)
     }
 
     fn v2_net_policy(&self, hash: &str) -> Result<NetPolicy, PetalError> {
@@ -551,6 +588,20 @@ fn route_op(op: DispatchOp) -> RouteOp {
         DispatchOp::Read => RouteOp::Read,
         DispatchOp::Write => RouteOp::Write,
     }
+}
+
+fn enforce_runtime_route_op(
+    op: DispatchOp,
+    matched: &LocalAppRouteMatch,
+    metadata: &InstallRouteMetadata,
+) -> Result<(), PetalError> {
+    if op == DispatchOp::Write && metadata.mode & 0o222 == 0 {
+        return Err(PetalError::ModeUnsupported(format!(
+            "v2 route {} is not writable at runtime",
+            matched.route.route_id
+        )));
+    }
+    Ok(())
 }
 
 fn match_index_for_op<'a>(
@@ -964,6 +1015,88 @@ name = "echo"
             .await
             .unwrap();
         assert_eq!(out.response, DispatchResponse::Read(b"component".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn dynamic_component_app_routes_evaluate_runtime_metadata() {
+        let (dir, r) = runner();
+        let package = dir.path().join("dynamic-component-app");
+        write_package_file(
+            &package,
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
+        write_package_file(&package, "README.md", b"# echo");
+        write_package_file(&package, "AGENTS.md", b"# echo agents");
+        write_package_file(
+            &package,
+            "app/echo/[name].txt.wasm",
+            include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
+        );
+        let (_, _, index) = r.store().install_app_package_dir(&package).unwrap();
+        let route = &index.routes[0];
+        assert_eq!(route.install_metadata.mode, 0o666);
+        assert!(route.install_metadata.side_effecting_read);
+
+        let out = r
+            .dispatch_app_route(
+                "echo",
+                DispatchRequest {
+                    op: DispatchOp::Read,
+                    path: "alice.txt".into(),
+                    body: Vec::new(),
+                    ctx: Vec::new(),
+                },
+                Arc::new(crate::host::DenyHost),
+                None,
+                RunOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.response, DispatchResponse::Read(b"component".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn dynamic_component_runtime_metadata_can_deny_write() {
+        let (dir, r) = runner();
+        let package = dir.path().join("dynamic-component-write-app");
+        write_package_file(
+            &package,
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
+        write_package_file(&package, "README.md", b"# echo");
+        write_package_file(&package, "AGENTS.md", b"# echo agents");
+        write_package_file(
+            &package,
+            "app/echo/[name].txt.wasm",
+            include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
+        );
+        let (_, _, index) = r.store().install_app_package_dir(&package).unwrap();
+        let route = &index.routes[0];
+        assert!(route.ops.contains(&RouteOp::Write));
+        assert_eq!(route.install_metadata.mode, 0o666);
+
+        let err = r
+            .dispatch_app_route(
+                "echo",
+                DispatchRequest {
+                    op: DispatchOp::Write,
+                    path: "alice.txt".into(),
+                    body: b"update".to_vec(),
+                    ctx: Vec::new(),
+                },
+                Arc::new(crate::host::DenyHost),
+                None,
+                RunOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not writable at runtime"));
     }
 
     #[tokio::test]
