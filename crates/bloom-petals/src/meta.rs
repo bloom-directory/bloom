@@ -90,6 +90,15 @@ pub struct PetalMeta {
     pub mode: PetalMode,
     #[serde(default)]
     pub local_manifest: Option<LocalPetalManifest>,
+    #[serde(default)]
+    pub local_app: Option<LocalAppMeta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalAppMeta {
+    pub name: String,
+    pub app_root: String,
+    pub route_index_schema: String,
 }
 
 impl PetalMeta {
@@ -167,6 +176,7 @@ mod tests {
             caps,
             mode: PetalMode::default(),
             local_manifest: None,
+            local_app: None,
         };
         let s = serde_json::to_string(&m).unwrap();
         let m2: PetalMeta = serde_json::from_str(&s).unwrap();
@@ -222,6 +232,7 @@ mod tests {
             caps: BTreeSet::new(),
             mode: PetalMode::Chain,
             local_manifest: None,
+            local_app: None,
         };
         let m2: PetalMeta = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(
