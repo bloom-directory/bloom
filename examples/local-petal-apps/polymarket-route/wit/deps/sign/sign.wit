@@ -1,5 +1,0 @@
-package bloom:sign@0.1.0;
-
-interface signing {
-  sign-hash: func(wallet: string, hash32: list<u8>, intent: string) -> result<list<u8>, string>;
-}
