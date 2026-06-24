@@ -1,7 +1,0 @@
-schema = "bloom.petal.local-app.v2"
-name = "echo"
-version = "0.1.0"
-description = "Minimal v2 local app package that returns a static echo payload."
-
-[caps]
-allowed = []

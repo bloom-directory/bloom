@@ -30,15 +30,11 @@ members = [
   "crates/bloom-resource",
   "crates/bloom-resource-macros",
   "crates/bloom-petal-manifest",
-  "crates/bloom-petal-sdk",
-  "crates/bloom-petal-sdk-macros",
   "crates/bloom-script",
   "crates/bloom-ptb-builder",
   "crates/bloom-petal-fungible",
   "crates/bloom-test-util",
   "crates/bloom-petal-it",
-  # ---- example apps (not part of the protocol) ----
-  "examples/local-petals/polymarket",
   "examples/petal-dex/crates/bloom-dex-math",
   "examples/petal-dex/crates/bloom-petal-dex-cpmm",
   "examples/petal-dex/crates/bloom-petal-dex-faucet",
@@ -143,13 +139,10 @@ bloom-objects     = { path = "crates/bloom-objects" }
 bloom-resource    = { path = "crates/bloom-resource" }
 bloom-resource-macros = { path = "crates/bloom-resource-macros" }
 bloom-petal-manifest = { path = "crates/bloom-petal-manifest" }
-bloom-petal-sdk = { path = "crates/bloom-petal-sdk" }
-bloom-petal-sdk-macros = { path = "crates/bloom-petal-sdk-macros" }
 bloom-script      = { path = "crates/bloom-script" }
 bloom-ptb-builder = { path = "crates/bloom-ptb-builder" }
 bloom-petal-fungible = { path = "crates/bloom-petal-fungible", version = "0.1.0" }
 # ---- example petal DEX crates (not part of the protocol) ----
-bloom-local-petal-polymarket = { path = "examples/local-petals/polymarket" }
 bloom-dex-math    = { path = "examples/petal-dex/crates/bloom-dex-math" }
 bloom-petal-dex-cpmm = { path = "examples/petal-dex/crates/bloom-petal-dex-cpmm", version = "0.1.0" }
 bloom-petal-dex-faucet = { path = "examples/petal-dex/crates/bloom-petal-dex-faucet" }

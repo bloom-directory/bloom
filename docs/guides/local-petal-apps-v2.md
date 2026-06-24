@@ -10,9 +10,8 @@ Required files:
 - `AGENTS.md`
 - at least one `app/<name>/**/*.wasm` route
 
-Current bootstrap support runs compatibility `petal_dispatch` core-WASM routes
-and direct `bloom:route@0.1.0` component routes. Component route imports are
-validated against Bloom-owned WIT at build/install time; direct component
+v2 apps run only `bloom:route@0.1.0` component routes. Component route imports
+are validated against Bloom-owned WIT at build/install time; direct component
 exports are invoked by the component runner. Component routes can call mediated
 `bloom:http/fetch@0.1.0`, `bloom:store/kv@0.1.0`, and
 `bloom:vfs/readwrite@0.1.0`, and `bloom:sign/signing@0.1.0` imports when the
@@ -35,15 +34,5 @@ bloom petals ls
 `bloom petal app build` validates the package, writes generated route artifacts
 under `artifacts/`, and emits a deterministic `.petal.tar` when `--out` is set.
 
-Example demos live under `examples/local-petal-apps`. Build their WAT sources
-into installable package directories with:
-
-```sh
-./examples/local-petal-apps/build-demo-apps.sh
-```
-
-Then install one:
-
-```sh
-cargo run -p bloom -- petals install examples/local-petal-apps/build/echo
-```
+Route artifacts must be WebAssembly components; raw core-WASM route artifacts
+are rejected.

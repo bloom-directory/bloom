@@ -28,9 +28,7 @@ struct OnDisk {
 }
 
 /// Reserved top-level names that must NOT be usable as petal names —
-/// otherwise the symlink in `public/` would collide with the literal
-/// directory that exposes the registry or other handler-managed
-/// children. Keep in sync with `PetalsHandler::list`.
+/// otherwise legacy name bindings could collide with handler-managed children.
 const RESERVED_NAMES: &[&str] = &["names"];
 
 #[derive(Debug)]

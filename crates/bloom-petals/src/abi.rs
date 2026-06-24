@@ -1,4 +1,4 @@
-//! Binary blob ABI used by `bloom.v1` host imports.
+//! Binary blob helpers shared by mediated host adapters.
 //!
 //! The Wasm boundary only sees `(ptr, len)` byte blobs. This module is the
 //! shared definition for how those blobs are encoded.

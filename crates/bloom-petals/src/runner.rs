@@ -15,16 +15,16 @@ use parking_lot::RwLock;
 
 use crate::error::PetalError;
 use crate::host::{DenyHost, HostError, PetalHost};
-use crate::meta::{Capability, PetalMeta};
+use crate::meta::Capability;
 use crate::policy::NetPolicy;
 use crate::registry::NameRegistry;
-use crate::store::{InstallResult, PetalStore};
+use crate::store::PetalStore;
 use crate::v2::{
     InstallRouteMetadata, RouteAbi, RouteEntryKind, RouteIndex, RouteIndexRecord, RouteOp,
     narrow_runtime_route_metadata, sign_intents_from_v2_manifest_toml,
     store_policy_from_v2_manifest_toml,
 };
-use crate::vm::{DispatchOutput, PetalVm, RunOptions, RunOutput};
+use crate::vm::{DispatchOutput, PetalVm, RunOptions};
 use crate::{DispatchOp, DispatchRequest};
 
 /// Wraps an `Arc<Vfs>` so a petal's `bloom.vfs_read`/`vfs_write` calls
@@ -167,37 +167,6 @@ impl PetalRunner {
         &self.registry
     }
 
-    /// Install a petal from raw bytes. Accepts either a wasm binary
-    /// (starting with `\0asm`) or WAT source — WAT is compiled in
-    /// memory before hashing, so the on-disk hash is always the
-    /// canonical wasm.
-    ///
-    /// `(mode, caps)` is validated against [`validate_mode_caps`] before
-    /// any bytes are parsed. Re-installing the same hash under a different
-    /// mode is rejected with `ModeConflict` by the store.
-    pub fn install(
-        &self,
-        bytes: &[u8],
-        name: Option<&str>,
-        caps: &BTreeSet<Capability>,
-        mode: crate::meta::PetalMode,
-    ) -> Result<(InstallResult, PetalMeta), PetalError> {
-        crate::meta::validate_mode_caps(mode, caps)?;
-        let wasm = if bytes.starts_with(b"\0asm") {
-            bytes.to_vec()
-        } else {
-            // Try WAT.
-            let s = std::str::from_utf8(bytes)
-                .map_err(|_| PetalError::InvalidWasm("not wasm and not utf-8 WAT".into()))?;
-            wat::parse_str(s).map_err(|e| PetalError::InvalidWasm(format!("wat: {e}")))?
-        };
-        let (result, meta) = self.store.install(&wasm, name, caps, mode)?;
-        if let Some(n) = name {
-            self.registry.set(n, &result.hash)?;
-        }
-        Ok((result, meta))
-    }
-
     /// Remove an installed petal and any petname pointing at it.
     /// Returns true if anything was removed.
     pub fn uninstall(&self, hash: &str) -> Result<bool, PetalError> {
@@ -314,37 +283,6 @@ impl PetalRunner {
         Ok(static_list_entries(&index, path))
     }
 
-    /// Run a petal by name or hash. The caps used at runtime are the
-    /// petal's declared caps, intersected with `cap_mask` if provided
-    /// (`None` means "use the petal's declared caps"). Callers that
-    /// want to *further restrict* what a petal can do can pass a
-    /// narrower mask; they cannot grant capabilities the petal didn't
-    /// declare.
-    pub async fn run(
-        &self,
-        name_or_hash: &str,
-        stdin: Vec<u8>,
-        host: Arc<dyn PetalHost>,
-        cap_mask: Option<BTreeSet<Capability>>,
-        opts: RunOptions,
-    ) -> Result<RunOutput, PetalError> {
-        let hash = self.resolve(name_or_hash)?;
-        let wasm = self.store.read_wasm(&hash)?;
-        let meta = self.store.load_meta(&hash)?;
-        let caps: BTreeSet<Capability> = match cap_mask {
-            Some(mask) => meta.caps.intersection(&mask).copied().collect(),
-            None => meta.caps.clone(),
-        };
-        let mut opts = opts;
-        if opts.private_store_root.is_none() {
-            opts.private_store_root = Some(self.store.private_data_root());
-        }
-        opts.net_policy = None;
-        self.vm
-            .run(&wasm, stdin, caps, host, &hash, meta.mode, opts)
-            .await
-    }
-
     pub async fn dispatch_app_route(
         &self,
         mount: &str,
@@ -409,27 +347,18 @@ impl PetalRunner {
             Some(mask) => declared_store_policy.intersect(&mask),
             None => declared_store_policy,
         });
-        match matched.route.abi {
-            RouteAbi::CompatPetalDispatchV1 => {
-                self.vm
-                    .dispatch(&wasm, request, caps, host, &matched.hash, opts)
-                    .await
-            }
-            RouteAbi::ComponentBloomRoute010 => {
-                self.vm
-                    .dispatch_component_route(
-                        &wasm,
-                        request,
-                        caps,
-                        host,
-                        &matched.hash,
-                        mount,
-                        route_params,
-                        opts,
-                    )
-                    .await
-            }
-        }
+        self.vm
+            .dispatch_component_route(
+                &wasm,
+                request,
+                caps,
+                host,
+                &matched.hash,
+                mount,
+                route_params,
+                opts,
+            )
+            .await
     }
 
     async fn runtime_app_route_metadata(
@@ -689,22 +618,6 @@ mod tests {
         (dir, PetalRunner::new(store, reg, vm))
     }
 
-    const HELLO_WAT: &str = r#"
-        (module
-          (import "wasi_snapshot_preview1" "fd_write"
-            (func $fd_write (param i32 i32 i32 i32) (result i32)))
-          (import "wasi_snapshot_preview1" "proc_exit"
-            (func $exit (param i32)))
-          (memory (export "memory") 1)
-          (data (i32.const 0) "hi from petal\n")
-          (data (i32.const 32) "\00\00\00\00\0e\00\00\00")
-          (func (export "_start")
-            (call $fd_write (i32.const 1) (i32.const 32) (i32.const 1) (i32.const 48))
-            drop
-            (call $exit (i32.const 0)))
-        )
-    "#;
-
     struct StaticHandler;
 
     #[async_trait::async_trait]
@@ -724,33 +637,6 @@ mod tests {
         async fn write(&self, _path: &VfsPath, _data: &[u8]) -> Result<(), HandlerError> {
             Ok(())
         }
-    }
-
-    #[tokio::test]
-    async fn install_from_wat_then_run_by_name() {
-        let (_d, r) = runner();
-        let (res, _meta) = r
-            .install(
-                HELLO_WAT.as_bytes(),
-                Some("hello"),
-                &BTreeSet::new(),
-                crate::meta::PetalMode::Local,
-            )
-            .unwrap();
-        // Registry now maps `hello` to the installed hash.
-        assert_eq!(r.registry().lookup("hello"), Some(res.hash.clone()));
-        let out = r
-            .run(
-                "hello",
-                Vec::new(),
-                Arc::new(crate::host::DenyHost),
-                None,
-                RunOptions::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(out.exit_code, 0);
-        assert_eq!(out.stdout, b"hi from petal\n");
     }
 
     #[tokio::test]
@@ -911,25 +797,6 @@ name = "echo"
         assert!(err.to_string().contains("not writable at runtime"));
     }
 
-    #[tokio::test]
-    async fn resolve_prefers_hash_then_name() {
-        let (_d, r) = runner();
-        let (res, _) = r
-            .install(
-                HELLO_WAT.as_bytes(),
-                Some("aname"),
-                &BTreeSet::new(),
-                crate::meta::PetalMode::Local,
-            )
-            .unwrap();
-        assert_eq!(r.resolve(&res.hash).unwrap(), res.hash);
-        assert_eq!(r.resolve("aname").unwrap(), res.hash);
-        assert!(matches!(
-            r.resolve("nope").unwrap_err(),
-            PetalError::NotFound(_)
-        ));
-    }
-
     fn write_package_file(root: &std::path::Path, rel: &str, body: &[u8]) {
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -961,24 +828,5 @@ name = "echo"
             BTreeSet::new()
         );
         assert_eq!(route_sign_intents(declared.clone(), None, None), declared);
-    }
-
-    #[tokio::test]
-    async fn uninstall_removes_object_meta_and_petname() {
-        let (_d, r) = runner();
-        let (res, _) = r
-            .install(
-                HELLO_WAT.as_bytes(),
-                Some("byename"),
-                &BTreeSet::new(),
-                crate::meta::PetalMode::Local,
-            )
-            .unwrap();
-        assert!(r.store().contains(&res.hash));
-        assert_eq!(r.registry().lookup("byename"), Some(res.hash.clone()));
-        let removed = r.uninstall(&res.hash).unwrap();
-        assert!(removed);
-        assert!(!r.store().contains(&res.hash));
-        assert!(r.registry().lookup("byename").is_none());
     }
 }

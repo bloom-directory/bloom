@@ -27,7 +27,7 @@ use bloom_etherscan::EtherscanClient;
 use bloom_keystore::Keystore;
 use bloom_petals::{
     HostError, HttpRequest, HttpResponse, LateVfsHost, NameRegistry, NetPolicy, PetalHost,
-    PetalRouter, PetalRunner, PetalStore, PetalVm, PetalsHandler, SignRequest,
+    PetalRouter, PetalRunner, PetalStore, PetalVm, SignRequest,
 };
 use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient, GeoblockClient};
 use bloom_prices::PricesClient;
@@ -799,9 +799,9 @@ impl Daemon {
 
         // Build the petals runtime: content-addressed store under
         // `~/.bloom/petals/store`, name registry under
-        // `~/.bloom/petals/registry`, and a wasmtime engine. The handler
-        // exposed at `public/` reads from both, while the runner glues
-        // them together for IPC-driven install/run.
+        // `~/.bloom/petals/registry`, and a wasmtime engine. Local app
+        // packages mount under `apps/`; raw single-WASM local petals are not
+        // exposed.
         let petals_root = home.root().join("petals");
         let petal_store = PetalStore::open(petals_root.join("store"))
             .map_err(|e| DaemonError::Audit(format!("petals store: {e}")))?;
@@ -820,10 +820,6 @@ impl Daemon {
         debug!(root = %petals_root.display(), "daemon.petals_initialised");
 
         let mut vfs_builder = Vfs::builder()
-            .mount(
-                "public",
-                Arc::new(PetalsHandler::new(petal_store, petal_registry)) as _,
-            )
             .mount(
                 "apps",
                 Arc::new(PetalRouter::new(petals.clone(), petal_app_host.clone())) as _,
@@ -1547,9 +1543,7 @@ mod tests {
         assert!(d.vfs.handler("prices").is_some());
         assert!(d.vfs.handler("addressbook").is_some());
         assert!(d.vfs.handler("ens").is_some());
-        assert!(d.vfs.handler("public").is_some());
         assert!(d.vfs.handler("apps").is_some());
-        assert!(d.vfs.handler("petals").is_some());
     }
 
     #[test]

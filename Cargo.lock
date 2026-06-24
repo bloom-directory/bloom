@@ -2394,25 +2394,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bloom-local-petal-polymarket"
-version = "0.1.0"
-dependencies = [
- "alloy 2.0.5",
- "base64 0.22.1",
- "blake3",
- "bloom-petal-sdk",
- "bloom-polymarket",
- "hex",
- "hmac",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "sha2",
- "toml 0.8.23",
- "url",
-]
-
-[[package]]
 name = "bloom-mempool"
 version = "0.1.0"
 dependencies = [
@@ -2626,23 +2607,6 @@ dependencies = [
  "thiserror 2.0.18",
  "toml 0.8.23",
  "wasmparser 0.218.1",
-]
-
-[[package]]
-name = "bloom-petal-sdk"
-version = "0.1.0"
-dependencies = [
- "bloom-petal-sdk-macros",
-]
-
-[[package]]
-name = "bloom-petal-sdk-macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]

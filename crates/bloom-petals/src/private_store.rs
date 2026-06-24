@@ -1,4 +1,4 @@
-//! Per-petal private key/value storage for `bloom.v1.store_*`.
+//! Per-petal private key/value storage for component routes.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};

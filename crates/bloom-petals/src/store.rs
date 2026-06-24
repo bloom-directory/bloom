@@ -739,8 +739,8 @@ name = "echo"
         );
         write_file(&package, "README.md", b"# echo");
         write_file(&package, "AGENTS.md", b"# echo agents");
-        let wasm = compat_wasm("hello");
-        write_file(&package, "app/echo/[name].txt.wasm", &wasm);
+        let wasm = route_component_wasm();
+        write_file(&package, "app/echo/[name].txt.wasm", wasm);
 
         let (result, meta, index) = store.install_app_package_dir(&package).unwrap();
 
@@ -758,7 +758,7 @@ name = "echo"
         let route = &index.routes[0];
         assert_eq!(route.route_id, "r000001");
         assert_eq!(route.pattern, "[name].txt");
-        assert_eq!(route.abi, crate::v2::RouteAbi::CompatPetalDispatchV1);
+        assert_eq!(route.abi, crate::v2::RouteAbi::ComponentBloomRoute010);
         assert_eq!(
             store
                 .read_route_artifact(&result.hash, &route.route_id)
@@ -797,15 +797,15 @@ name = "echo"
         );
         write_file(&package, "README.md", b"# echo");
         write_file(&package, "AGENTS.md", b"# echo agents");
-        let source = compat_wasm("source");
-        let artifact = compat_wasm("artifact");
-        write_file(&package, "app/echo/hello.txt.wasm", &source);
-        write_file(&package, "artifacts/routes/r000001.wasm", &artifact);
+        let source = route_component_wasm();
+        let artifact = route_component_wasm();
+        write_file(&package, "app/echo/hello.txt.wasm", source);
+        write_file(&package, "artifacts/routes/r000001.wasm", artifact);
 
         let (result, _, index) = store.install_app_package_dir(&package).unwrap();
         assert_eq!(
             index.routes[0].artifact_hash,
-            hex::encode(blake3::hash(&artifact).as_bytes())
+            hex::encode(blake3::hash(artifact).as_bytes())
         );
         assert_eq!(
             store
@@ -828,7 +828,7 @@ name = "echo"
         );
         write_file(&package, "README.md", b"# echo");
         write_file(&package, "AGENTS.md", b"# echo agents");
-        write_file(&package, "app/echo/hello.txt.wasm", &compat_wasm("hello"));
+        write_file(&package, "app/echo/hello.txt.wasm", route_component_wasm());
 
         let (result, _, index) = store.install_app_package_dir(&package).unwrap();
         let route_id = &index.routes[0].route_id;
@@ -859,7 +859,7 @@ name = "echo"
         );
         write_file(&first, "README.md", b"# echo");
         write_file(&first, "AGENTS.md", b"# echo agents");
-        write_file(&first, "app/echo/one.txt.wasm", &compat_wasm("one"));
+        write_file(&first, "app/echo/one.txt.wasm", route_component_wasm());
         store.install_app_package_dir(&first).unwrap();
 
         let second = d.path().join("pkg-b");
@@ -872,7 +872,7 @@ name = "echo"
         );
         write_file(&second, "README.md", b"# echo");
         write_file(&second, "AGENTS.md", b"# echo agents");
-        write_file(&second, "app/echo/two.txt.wasm", &compat_wasm("two"));
+        write_file(&second, "app/echo/two.txt.wasm", route_component_wasm());
 
         let err = store.install_app_package_dir(&second).unwrap_err();
         assert!(err.to_string().contains("already installed"));
@@ -924,7 +924,7 @@ name = "echo"
         write_file(
             &package_dir,
             "app/echo/hello.txt.wasm",
-            &compat_wasm("hello"),
+            route_component_wasm(),
         );
 
         let mut package = PreparedAppPackage::from_dir(&package_dir).unwrap();
@@ -951,7 +951,7 @@ name = "echo"
         write_file(
             &package_dir,
             "app/echo/hello.txt.wasm",
-            &compat_wasm("hello"),
+            route_component_wasm(),
         );
 
         let mut package = PreparedAppPackage::from_dir(&package_dir).unwrap();
@@ -970,27 +970,7 @@ name = "echo"
         std::fs::write(path, body).unwrap();
     }
 
-    fn compat_wasm(body: &str) -> Vec<u8> {
-        let body = body.as_bytes();
-        let mut response = vec![2];
-        response.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        response.extend_from_slice(body);
-        let escaped = response
-            .iter()
-            .map(|byte| format!("\\{byte:02x}"))
-            .collect::<String>();
-        wat::parse_str(format!(
-            r#"
-            (module
-              (memory (export "memory") 1)
-              (data (i32.const 0) "{escaped}")
-              (func (export "petal_alloc") (param i32) (result i32)
-                (i32.const 1024))
-              (func (export "petal_dispatch") (param i32 i32) (result i64)
-                (i64.const {packed})))
-            "#,
-            packed = response.len()
-        ))
-        .unwrap()
+    fn route_component_wasm() -> &'static [u8] {
+        include_bytes!("../tests/fixtures/route_component_no_imports.wasm")
     }
 }

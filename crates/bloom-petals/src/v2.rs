@@ -1,9 +1,8 @@
 //! Experimental v2 file-driven local app package scanner.
 //!
 //! This is intentionally incremental: it scans `app/<name>/.../*.wasm`
-//! route trees, prepares content-addressed package records, and supports the
-//! existing `petal_dispatch` compatibility ABI while the component runner
-//! matures.
+//! route trees and prepares content-addressed package records. Route
+//! artifacts must be `bloom:route@0.1.0` components.
 
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
@@ -18,9 +17,9 @@ use wasm_compose::{
 use wasmparser::{
     CanonicalFunction, ComponentAlias, ComponentDefinedType, ComponentExternalKind,
     ComponentFuncResult, ComponentFuncType, ComponentOuterAliasKind, ComponentType,
-    ComponentTypeRef as WasmComponentTypeRef, ComponentValType, ExternalKind, FuncType,
-    InstanceTypeDeclaration, Parser, Payload, PrimitiveValType as ComponentPrimitiveValType,
-    TypeBounds as WasmComponentTypeBounds, TypeRef, ValType, Validator,
+    ComponentTypeRef as WasmComponentTypeRef, ComponentValType, InstanceTypeDeclaration, Parser,
+    Payload, PrimitiveValType as ComponentPrimitiveValType, TypeBounds as WasmComponentTypeBounds,
+    Validator,
 };
 
 use crate::error::PetalError;
@@ -181,14 +180,12 @@ struct RouteSidecarToml {
 #[serde(rename_all = "kebab-case")]
 enum RouteSidecarAbi {
     Component,
-    CompatPetalDispatch,
 }
 
 impl RouteSidecarAbi {
     fn route_abi(self) -> RouteAbi {
         match self {
             RouteSidecarAbi::Component => RouteAbi::ComponentBloomRoute010,
-            RouteSidecarAbi::CompatPetalDispatch => RouteAbi::CompatPetalDispatchV1,
         }
     }
 }
@@ -270,8 +267,6 @@ pub struct RouteIndexRecord {
 pub enum RouteAbi {
     #[serde(rename = "component:bloom:route@0.1.0")]
     ComponentBloomRoute010,
-    #[serde(rename = "compat:petal-dispatch-v1")]
-    CompatPetalDispatchV1,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -996,14 +991,6 @@ fn route_sidecar_artifact(
     sidecar: &RouteSidecar,
 ) -> Result<Vec<u8>, PetalError> {
     let component = file_bytes(files, &sidecar.component)?.to_vec();
-    if sidecar.abi == RouteSidecarAbi::CompatPetalDispatch {
-        if !sidecar.imports.is_empty() {
-            return Err(PetalError::InvalidWasm(format!(
-                "v2 route {route_id} compat sidecar cannot declare component imports"
-            )));
-        }
-        return Ok(component);
-    }
     if sidecar.imports.is_empty() {
         return Ok(component);
     }
@@ -1116,11 +1103,7 @@ fn route_sidecar(
     let toml = std::str::from_utf8(bytes)
         .map_err(|_| PetalError::InvalidWasm(format!("v2 route sidecar {path} is not utf-8")))?;
     let parsed: RouteSidecarToml = toml::from_str(toml)?;
-    if parsed.abi == RouteSidecarAbi::CompatPetalDispatch {
-        validate_route_sidecar_wasm_path(&path, &parsed.component)?;
-    } else {
-        validate_route_sidecar_path(&path, &parsed.component, true)?;
-    }
+    validate_route_sidecar_path(&path, &parsed.component, true)?;
     for import in &parsed.imports {
         validate_route_sidecar_path(&path, import, false)?;
     }
@@ -1738,12 +1721,6 @@ fn validate_route_wasm_inner(
         .validate_all(wasm)
         .map_err(|e| PetalError::InvalidWasm(format!("{path}: invalid route wasm: {e}")))?;
 
-    let mut has_memory_export = false;
-    let mut types = Vec::new();
-    let mut func_type_indices = Vec::new();
-    let mut imported_func_count = 0usize;
-    let mut alloc_export: Option<u32> = None;
-    let mut dispatch_export: Option<u32> = None;
     let mut saw_component = false;
     let mut component_types = Vec::new();
     let mut component_func_type_indices = Vec::new();
@@ -1758,88 +1735,6 @@ fn validate_route_wasm_inner(
             Payload::Version { encoding, .. } => {
                 if current_depth == 0 {
                     saw_component |= matches!(encoding, wasmparser::Encoding::Component);
-                }
-            }
-            Payload::ExportSection(reader) => {
-                if saw_component || current_depth != 0 {
-                    continue;
-                }
-                for export in reader {
-                    let export =
-                        export.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))?;
-                    match (export.name, export.kind) {
-                        ("memory", ExternalKind::Memory) => has_memory_export = true,
-                        ("petal_alloc", ExternalKind::Func) => alloc_export = Some(export.index),
-                        ("petal_dispatch", ExternalKind::Func) => {
-                            dispatch_export = Some(export.index)
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Payload::TypeSection(reader) => {
-                if saw_component || current_depth != 0 {
-                    continue;
-                }
-                for ty in reader.into_iter_err_on_gc_types() {
-                    types.push(ty.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))?);
-                }
-            }
-            Payload::FunctionSection(reader) => {
-                if saw_component || current_depth != 0 {
-                    continue;
-                }
-                for type_index in reader {
-                    func_type_indices.push(
-                        type_index.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))?,
-                    );
-                }
-            }
-            Payload::ImportSection(reader) => {
-                if saw_component || current_depth != 0 {
-                    continue;
-                }
-                for import in reader {
-                    let import =
-                        import.map_err(|e| PetalError::InvalidWasm(format!("{path}: {e}")))?;
-                    let TypeRef::Func(_type_index) = import.ty else {
-                        return Err(PetalError::InvalidWasm(format!(
-                            "{path}: compatibility route import {}.{} must be a function",
-                            import.module, import.name
-                        )));
-                    };
-                    let TypeRef::Func(type_index) = import.ty else {
-                        unreachable!("checked above");
-                    };
-                    let import_type = types.get(type_index as usize).ok_or_else(|| {
-                        PetalError::InvalidWasm(format!(
-                            "{path}: compatibility route import {}.{} references missing function type",
-                            import.module, import.name
-                        ))
-                    })?;
-                    imported_func_count += 1;
-                    let Some(cap) = compat_import_cap(import.module, import.name) else {
-                        return Err(PetalError::InvalidWasm(format!(
-                            "{path}: compatibility route imports unsupported host function {}.{}",
-                            import.module, import.name
-                        )));
-                    };
-                    validate_compat_import_sig(path, import.module, import.name, import_type)?;
-                    if let Some(cap) = cap {
-                        if cap == "bloom:sign" && allowed_sign_intents.is_empty() {
-                            return Err(PetalError::InvalidWasm(format!(
-                                "{path}: compatibility route import {}.{} requires [sign].allowed_intents",
-                                import.module, import.name
-                            )));
-                        }
-                        if !allowed_caps.contains(cap) {
-                            return Err(PetalError::InvalidWasm(format!(
-                                "{path}: compatibility route import {}.{} requires missing petal.toml cap {cap}",
-                                import.module, import.name
-                            )));
-                        }
-                        required_caps.insert(cap.to_string());
-                    }
                 }
             }
             Payload::ComponentTypeSection(reader) => {
@@ -2028,14 +1923,6 @@ fn validate_route_wasm_inner(
                     }
                 }
             }
-            Payload::StartSection { func, .. } => {
-                if saw_component || current_depth != 0 {
-                    continue;
-                }
-                return Err(PetalError::InvalidWasm(format!(
-                    "{path}: compatibility route declares start function {func}; start sections are not allowed"
-                )));
-            }
             Payload::ModuleSection { .. } | Payload::ComponentSection { .. } => {
                 parse_depth += 1;
             }
@@ -2061,46 +1948,9 @@ fn validate_route_wasm_inner(
         });
     }
 
-    if !has_memory_export {
-        return Err(PetalError::InvalidWasm(format!(
-            "{path}: compatibility route missing Memory export \"memory\""
-        )));
-    }
-    let alloc_type = exported_func_type(
-        path,
-        "petal_alloc",
-        alloc_export,
-        imported_func_count,
-        &func_type_indices,
-        &types,
-    )?;
-    let dispatch_type = exported_func_type(
-        path,
-        "petal_dispatch",
-        dispatch_export,
-        imported_func_count,
-        &func_type_indices,
-        &types,
-    )?;
-    validate_func_sig(
-        path,
-        "petal_alloc",
-        alloc_type,
-        &[ValType::I32],
-        &[ValType::I32],
-    )?;
-    validate_func_sig(
-        path,
-        "petal_dispatch",
-        dispatch_type,
-        &[ValType::I32, ValType::I32],
-        &[ValType::I64],
-    )?;
-    Ok(RouteValidation {
-        abi: RouteAbi::CompatPetalDispatchV1,
-        required_caps: required_caps.into_iter().collect(),
-        has_write_export: false,
-    })
+    Err(PetalError::InvalidWasm(format!(
+        "{path}: v2 routes must be bloom:route@0.1.0 components"
+    )))
 }
 
 #[derive(Debug)]
@@ -3026,131 +2876,6 @@ fn is_u64(ty: &ComponentValType, _types: &[ComponentTypeEntry<'_>], _depth: usiz
     )
 }
 
-fn exported_func_type<'a>(
-    path: &str,
-    name: &str,
-    export_index: Option<u32>,
-    imported_func_count: usize,
-    func_type_indices: &[u32],
-    types: &'a [FuncType],
-) -> Result<&'a FuncType, PetalError> {
-    let Some(export_index) = export_index else {
-        return Err(PetalError::InvalidWasm(format!(
-            "{path}: compatibility route missing Func export {name:?}"
-        )));
-    };
-    let export_index = export_index as usize;
-    if export_index < imported_func_count {
-        return Err(PetalError::InvalidWasm(format!(
-            "{path}: compatibility route export {name:?} must be defined by the route module"
-        )));
-    }
-    let local_index = export_index - imported_func_count;
-    let Some(type_index) = func_type_indices.get(local_index).copied() else {
-        return Err(PetalError::InvalidWasm(format!(
-            "{path}: compatibility route export {name:?} references missing function"
-        )));
-    };
-    types.get(type_index as usize).ok_or_else(|| {
-        PetalError::InvalidWasm(format!(
-            "{path}: compatibility route export {name:?} references missing function type"
-        ))
-    })
-}
-
-fn validate_func_sig(
-    path: &str,
-    name: &str,
-    ty: &FuncType,
-    params: &[ValType],
-    results: &[ValType],
-) -> Result<(), PetalError> {
-    if ty.params() == params && ty.results() == results {
-        Ok(())
-    } else {
-        Err(PetalError::InvalidWasm(format!(
-            "{path}: compatibility route export {name:?} has invalid signature"
-        )))
-    }
-}
-
-fn validate_compat_import_sig(
-    path: &str,
-    module: &str,
-    name: &str,
-    ty: &FuncType,
-) -> Result<(), PetalError> {
-    let Some((params, results)) = compat_import_signature(module, name) else {
-        return Ok(());
-    };
-    validate_func_sig(path, &format!("{module}.{name}"), ty, params, results)
-}
-
-fn compat_import_signature(
-    module: &str,
-    name: &str,
-) -> Option<(&'static [ValType], &'static [ValType])> {
-    match (module, name) {
-        ("bloom", "vfs_read" | "vfs_write") => Some((
-            &[ValType::I32, ValType::I32, ValType::I32, ValType::I32],
-            &[ValType::I32],
-        )),
-        (
-            "bloom.v1",
-            "vfs_read" | "vfs_write" | "vfs_list" | "http_fetch" | "sign_hash" | "store_get"
-            | "store_list" | "store_del_if_value",
-        ) => Some((
-            &[ValType::I32, ValType::I32, ValType::I32, ValType::I32],
-            &[ValType::I32],
-        )),
-        ("bloom.v1", "store_put" | "store_put_new") => Some((
-            &[
-                ValType::I32,
-                ValType::I32,
-                ValType::I32,
-                ValType::I32,
-                ValType::I32,
-            ],
-            &[ValType::I32],
-        )),
-        ("bloom.v1", "store_del") => Some((&[ValType::I32, ValType::I32], &[ValType::I32])),
-        ("wasi_snapshot_preview1", "environ_get" | "environ_sizes_get" | "random_get") => {
-            Some((&[ValType::I32, ValType::I32], &[ValType::I32]))
-        }
-        ("wasi_snapshot_preview1", "clock_time_get") => {
-            Some((&[ValType::I32, ValType::I64, ValType::I32], &[ValType::I32]))
-        }
-        ("wasi_snapshot_preview1", "fd_write" | "poll_oneoff") => Some((
-            &[ValType::I32, ValType::I32, ValType::I32, ValType::I32],
-            &[ValType::I32],
-        )),
-        ("wasi_snapshot_preview1", "proc_exit") => Some((&[ValType::I32], &[])),
-        _ => None,
-    }
-}
-
-fn compat_import_cap(module: &str, name: &str) -> Option<Option<&'static str>> {
-    match (module, name) {
-        ("bloom", "vfs_read") | ("bloom.v1", "vfs_read" | "vfs_list") => {
-            Some(Some("bloom:vfs.read"))
-        }
-        ("bloom", "vfs_write") | ("bloom.v1", "vfs_write") => Some(Some("bloom:vfs.write")),
-        ("bloom.v1", "http_fetch") => Some(Some("bloom:http")),
-        ("bloom.v1", "sign_hash") => Some(Some("bloom:sign")),
-        (
-            "bloom.v1",
-            "store_get" | "store_put" | "store_put_new" | "store_del" | "store_del_if_value"
-            | "store_list",
-        ) => Some(Some("bloom:store")),
-        (
-            "wasi_snapshot_preview1",
-            "clock_time_get" | "environ_get" | "environ_sizes_get" | "fd_write" | "poll_oneoff"
-            | "proc_exit" | "random_get",
-        ) => Some(None),
-        _ => None,
-    }
-}
-
 fn validate_route_id_arg(route_id: &str) -> Result<(), PetalError> {
     let valid = route_id.len() == 7
         && route_id.starts_with('r')
@@ -3470,11 +3195,6 @@ fn dynamic_segment(segment: &str) -> Result<Option<(&str, &str)>, PetalError> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::Arc;
-
-    use crate::abi::{DispatchOp, DispatchRequest, DispatchResponse};
-    use crate::host::DenyHost;
-    use crate::vm::{PetalVm, RunOptions};
 
     use super::*;
     use wasm_encoder::{
@@ -3535,7 +3255,7 @@ name = "echo"
         write_package_file(
             tmp.path(),
             &format!("app/echo/{file_name}"),
-            &compat_wasm("hello"),
+            route_component_no_imports(),
         );
 
         let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
@@ -3547,7 +3267,7 @@ name = "echo"
         let tmp = tempfile::tempdir().unwrap();
         write_v2_package(tmp.path());
         let dir = PreparedAppPackage::from_dir(tmp.path()).unwrap();
-        let wasm = compat_wasm("hello");
+        let wasm = route_component_no_imports();
         let tar = PreparedAppPackage::from_reader(std::io::Cursor::new(package_tar_bytes(vec![
             ("README.md", b"# echo".as_slice()),
             ("AGENTS.md", b"# echo agents".as_slice()),
@@ -3558,7 +3278,7 @@ name = "echo"
 "#
                 .as_slice(),
             ),
-            ("app/echo/hello.txt.wasm", wasm.as_slice()),
+            ("app/echo/hello.txt.wasm", wasm),
         ])))
         .unwrap();
 
@@ -3597,7 +3317,11 @@ secret_namespaces = ["credentials"]
         );
         write_package_file(tmp.path(), "README.md", b"# echo");
         write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
-        write_package_file(tmp.path(), "app/echo/hello.txt.wasm", &compat_wasm("hello"));
+        write_package_file(
+            tmp.path(),
+            "app/echo/hello.txt.wasm",
+            route_component_no_imports(),
+        );
 
         let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
         let summary = app_consent_summary(&package).unwrap();
@@ -3670,7 +3394,7 @@ name = "echo"
             "nested-static-segment".repeat(4)
         );
         assert!(route_path.len() > TAR_NAME_LEN);
-        write_package_file(tmp.path(), &route_path, &compat_wasm("hello"));
+        write_package_file(tmp.path(), &route_path, route_component_no_imports());
         let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
 
         let mut tar_bytes = Vec::new();
@@ -3841,40 +3565,6 @@ component = "app/echo/hello.txt.wasm"
 
         let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("modules/ or components/"));
-    }
-
-    #[test]
-    fn v2_route_sidecar_rejects_abi_hint_mismatch() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_package_file(
-            tmp.path(),
-            "petal.toml",
-            br#"schema = "bloom.petal.local-app.v2"
-name = "echo"
-"#,
-        );
-        write_package_file(tmp.path(), "README.md", b"# echo");
-        write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
-        write_package_file(
-            tmp.path(),
-            "app/echo/message.txt.wasm",
-            route_component_no_imports(),
-        );
-        write_package_file(
-            tmp.path(),
-            "app/echo/message.txt.route.toml",
-            br#"abi = "compat-petal-dispatch"
-component = "modules/message.wasm"
-"#,
-        );
-        write_package_file(
-            tmp.path(),
-            "modules/message.wasm",
-            route_component_metadata(),
-        );
-
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("declares CompatPetalDispatch"));
     }
 
     #[test]
@@ -4186,298 +3876,13 @@ imports = ["components/helper.wasm"]
     }
 
     #[test]
-    fn v2_compat_routes_reject_unsupported_imports() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_route(
-            tmp.path(),
-            &wat::parse_str(
-                r#"
-                (module
-                  (import "wasi_snapshot_preview1" "path_open"
-                    (func $path_open
-                      (param i32 i32 i32 i32 i32 i64 i64 i32 i32)
-                      (result i32)))
-                  (memory (export "memory") 1)
-                  (func (export "petal_alloc") (param i32) (result i32) (i32.const 1024))
-                  (func (export "petal_dispatch") (param i32 i32) (result i64) (i64.const 0)))
-                "#,
-            )
-            .unwrap(),
-        );
-
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("unsupported host function"));
-        assert!(err.to_string().contains("wasi_snapshot_preview1.path_open"));
-    }
-
-    #[test]
-    fn v2_compat_routes_accept_preview1_runtime_imports_without_caps() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_route(
-            tmp.path(),
-            &wat::parse_str(
-                r#"
-                (module
-                  (import "wasi_snapshot_preview1" "clock_time_get"
-                    (func $clock_time_get (param i32 i64 i32) (result i32)))
-                  (import "wasi_snapshot_preview1" "environ_get"
-                    (func $environ_get (param i32 i32) (result i32)))
-                  (import "wasi_snapshot_preview1" "environ_sizes_get"
-                    (func $environ_sizes_get (param i32 i32) (result i32)))
-                  (import "wasi_snapshot_preview1" "fd_write"
-                    (func $fd_write (param i32 i32 i32 i32) (result i32)))
-                  (import "wasi_snapshot_preview1" "poll_oneoff"
-                    (func $poll_oneoff (param i32 i32 i32 i32) (result i32)))
-                  (import "wasi_snapshot_preview1" "proc_exit"
-                    (func $proc_exit (param i32)))
-                  (import "wasi_snapshot_preview1" "random_get"
-                    (func $random_get (param i32 i32) (result i32)))
-                  (memory (export "memory") 1)
-                  (func (export "petal_alloc") (param i32) (result i32) (i32.const 1024))
-                  (func (export "petal_dispatch") (param i32 i32) (result i64)
-                    (drop (call $clock_time_get (i32.const 0) (i64.const 0) (i32.const 64)))
-                    (drop (call $environ_get (i32.const 96) (i32.const 128)))
-                    (drop (call $environ_sizes_get (i32.const 160) (i32.const 164)))
-                    (drop (call $fd_write (i32.const 1) (i32.const 192) (i32.const 0) (i32.const 196)))
-                    (drop (call $poll_oneoff (i32.const 224) (i32.const 256) (i32.const 0) (i32.const 260)))
-                    (drop (call $random_get (i32.const 288) (i32.const 8)))
-                    (if (i32.const 0) (then (call $proc_exit (i32.const 1))))
-                    (i64.const 0)))
-                "#,
-            )
-            .unwrap(),
-        );
-
-        PreparedAppPackage::from_dir(tmp.path()).unwrap();
-    }
-
-    #[test]
-    fn v2_compat_routes_require_correct_export_kinds() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_route(
-            tmp.path(),
-            &wat::parse_str(
-                r#"
-                (module
-                  (memory 1)
-                  (global $petal_dispatch (export "petal_dispatch") i64 (i64.const 0))
-                  (export "memory" (memory 0))
-                  (func (export "petal_alloc") (param i32) (result i32) (i32.const 1024)))
-                "#,
-            )
-            .unwrap(),
-        );
-
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("missing Func export \"petal_dispatch\"")
-        );
-    }
-
-    #[test]
-    fn v2_compat_routes_require_dispatch_signatures() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_route(
-            tmp.path(),
-            &wat::parse_str(
-                r#"
-                (module
-                  (memory (export "memory") 1)
-                  (func (export "petal_alloc") (param i64) (result i32) (i32.const 1024))
-                  (func (export "petal_dispatch") (param i32 i32) (result i64) (i64.const 0)))
-                "#,
-            )
-            .unwrap(),
-        );
-
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("export \"petal_alloc\" has invalid signature")
-        );
-    }
-
-    #[test]
-    fn v2_compat_routes_require_valid_wasm() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_route(
-            tmp.path(),
-            &wat::parse_str(
-                r#"
-                (module
-                  (memory (export "memory") 1)
-                  (func (export "petal_alloc") (param i32) (result i32) (i32.const 1024))
-                  (func (export "petal_dispatch") (param i32 i32) (result i64)))
-                "#,
-            )
-            .unwrap(),
-        );
-
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("invalid route wasm"));
-    }
-
-    #[test]
-    fn v2_compat_routes_reject_start_sections() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_route(
-            tmp.path(),
-            &wat::parse_str(
-                r#"
-                (module
-                  (memory (export "memory") 1)
-                  (func $init)
-                  (start $init)
-                  (func (export "petal_alloc") (param i32) (result i32) (i32.const 1024))
-                  (func (export "petal_dispatch") (param i32 i32) (result i64) (i64.const 0)))
-                "#,
-            )
-            .unwrap(),
-        );
-
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("start sections are not allowed"));
-    }
-
-    #[test]
-    fn v2_compat_imports_must_be_functions() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
-            tmp.path(),
-            br#"schema = "bloom.petal.local-app.v2"
-name = "echo"
-[caps]
-allowed = ["bloom:http"]
-"#,
-            &wat::parse_str(
-                r#"
-                (module
-                  (import "bloom.v1" "http_fetch" (memory 1))
-                  (memory (export "memory") 1)
-                  (func (export "petal_alloc") (param i32) (result i32) (i32.const 1024))
-                  (func (export "petal_dispatch") (param i32 i32) (result i64) (i64.const 0)))
-                "#,
-            )
-            .unwrap(),
-        );
-
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("must be a function"));
-    }
-
-    #[test]
-    fn v2_compat_imports_require_host_signatures() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
-            tmp.path(),
-            br#"schema = "bloom.petal.local-app.v2"
-name = "echo"
-[caps]
-allowed = ["bloom:http"]
-"#,
-            &wat::parse_str(
-                r#"
-                (module
-                  (import "bloom.v1" "http_fetch" (func $http_fetch (param i32) (result i32)))
-                  (memory (export "memory") 1)
-                  (func (export "petal_alloc") (param i32) (result i32) (i32.const 1024))
-                  (func (export "petal_dispatch") (param i32 i32) (result i64) (i64.const 0)))
-                "#,
-            )
-            .unwrap(),
-        );
-
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("export \"bloom.v1.http_fetch\" has invalid signature")
-        );
-    }
-
-    #[test]
-    fn v2_compat_imports_accept_legacy_bloom_vfs_namespace() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
-            tmp.path(),
-            br#"schema = "bloom.petal.local-app.v2"
-name = "echo"
-[caps]
-allowed = ["bloom:vfs.read"]
-"#,
-            &wat::parse_str(
-                r#"
-                (module
-                  (import "bloom" "vfs_read"
-                    (func $vfs_read (param i32 i32 i32 i32) (result i32)))
-                  (memory (export "memory") 1)
-                  (func (export "petal_alloc") (param i32) (result i32) (i32.const 1024))
-                  (func (export "petal_dispatch") (param i32 i32) (result i64) (i64.const 0)))
-                "#,
-            )
-            .unwrap(),
-        );
-
-        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
-        assert_eq!(
-            package.route_index.routes[0].install_metadata.required_caps,
-            vec!["bloom:vfs.read".to_string()]
-        );
-    }
-
-    #[test]
-    fn v2_compat_sign_imports_require_intent_policy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let manifest_without_policy = br#"schema = "bloom.petal.local-app.v2"
-name = "echo"
-[caps]
-allowed = ["bloom:sign"]
-"#;
-        let wasm = wat::parse_str(
-            r#"
-                (module
-                  (import "bloom.v1" "sign_hash"
-                    (func $sign_hash (param i32 i32 i32 i32) (result i32)))
-                  (memory (export "memory") 1)
-                  (func (export "petal_alloc") (param i32) (result i32) (i32.const 1024))
-                  (func (export "petal_dispatch") (param i32 i32) (result i64) (i64.const 0)))
-                "#,
-        )
-        .unwrap();
-        write_v2_package_with_manifest_and_route(tmp.path(), manifest_without_policy, &wasm);
-
-        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("[sign].allowed_intents"));
-
-        let allowed = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
-            allowed.path(),
-            br#"schema = "bloom.petal.local-app.v2"
-name = "echo"
-[caps]
-allowed = ["bloom:sign"]
-
-[sign]
-allowed_intents = ["test.intent"]
-"#,
-            &wasm,
-        );
-
-        let package = PreparedAppPackage::from_dir(allowed.path()).unwrap();
-        assert_eq!(
-            package.route_index.routes[0].install_metadata.required_caps,
-            vec!["bloom:sign".to_string()]
-        );
-    }
-
-    #[test]
     fn v2_rejects_extra_app_roots() {
         let tmp = tempfile::tempdir().unwrap();
         write_v2_package(tmp.path());
         write_package_file(
             tmp.path(),
             "app/other/hello.txt.wasm",
-            &compat_wasm("wrong root"),
+            route_component_no_imports(),
         );
 
         let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
@@ -4492,7 +3897,7 @@ allowed_intents = ["test.intent"]
             br#"schema = "bloom.petal.local-app.v2"
 name = "echo"
 "#,
-            &compat_wasm("index"),
+            route_component_no_imports(),
         );
         std::fs::rename(
             tmp.path().join("app/echo/hello.txt.wasm"),
@@ -4502,17 +3907,16 @@ name = "echo"
         write_package_file(
             tmp.path(),
             "app/echo/items/$list.wasm",
-            &compat_wasm("list"),
+            route_component_no_imports(),
         );
         write_package_file(
             tmp.path(),
             "app/echo/items/[id]/$lookup.wasm",
-            &compat_wasm("lookup"),
+            route_component_no_imports(),
         );
 
-        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
+        let package = PetalAppPackage::scan_dir(tmp.path()).unwrap();
         let patterns = package
-            .route_index
             .routes
             .iter()
             .map(|route| route.pattern.as_str())
@@ -4531,45 +3935,6 @@ name = "echo"
         let package = PetalAppPackage::scan_dir(tmp.path()).unwrap();
         let matched = package.match_route("").unwrap();
         assert_eq!(matched.route.pattern, "");
-    }
-
-    #[test]
-    fn v2_compat_imports_require_declared_caps_and_record_them() {
-        let wasm = wat::parse_str(
-            r#"
-            (module
-              (import "bloom.v1" "http_fetch"
-                (func $http_fetch (param i32 i32 i32 i32) (result i32)))
-              (memory (export "memory") 1)
-              (func (export "petal_alloc") (param i32) (result i32) (i32.const 1024))
-              (func (export "petal_dispatch") (param i32 i32) (result i64) (i64.const 0)))
-            "#,
-        )
-        .unwrap();
-
-        let missing = tempfile::tempdir().unwrap();
-        write_v2_package_with_route(missing.path(), &wasm);
-        let err = PreparedAppPackage::from_dir(missing.path()).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("requires missing petal.toml cap bloom:http")
-        );
-
-        let allowed = tempfile::tempdir().unwrap();
-        write_v2_package_with_manifest_and_route(
-            allowed.path(),
-            br#"schema = "bloom.petal.local-app.v2"
-name = "echo"
-[caps]
-allowed = ["bloom:http"]
-"#,
-            &wasm,
-        );
-        let package = PreparedAppPackage::from_dir(allowed.path()).unwrap();
-        assert_eq!(
-            package.route_index.routes[0].install_metadata.required_caps,
-            vec!["bloom:http".to_string()]
-        );
     }
 
     #[test]
@@ -4966,43 +4331,6 @@ namespaces = ["C:"]
         assert!(err.to_string().contains("unsupported byte"));
     }
 
-    #[tokio::test]
-    async fn v2_route_dispatches_through_compat_petal_dispatch() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_package_file(tmp.path(), "petal.toml", br#"name = "echo""#);
-        write_package_file(tmp.path(), "README.md", b"# echo");
-        write_package_file(tmp.path(), "AGENTS.md", b"# echo agents");
-        let wasm = wat::parse_str(compat_read_wat("hello v2")).unwrap();
-        write_package_file(tmp.path(), "app/echo/[name].txt.wasm", &wasm);
-
-        let package = PetalAppPackage::scan_dir(tmp.path()).unwrap();
-        let matched = package.match_route("alice.txt").unwrap();
-        assert_eq!(matched.params, vec![("name".into(), "alice".into())]);
-
-        let route_wasm = std::fs::read(&matched.route.source_path).unwrap();
-        let output = PetalVm::new()
-            .unwrap()
-            .dispatch(
-                &route_wasm,
-                DispatchRequest {
-                    op: DispatchOp::Read,
-                    path: "alice.txt".into(),
-                    body: Vec::new(),
-                    ctx: matched.params,
-                },
-                BTreeSet::new(),
-                Arc::new(DenyHost),
-                "v2-test-package",
-                RunOptions::default(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            output.response,
-            DispatchResponse::Read(b"hello v2".to_vec())
-        );
-    }
-
     fn write_package_file(root: &Path, rel: &str, body: &[u8]) {
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -5010,7 +4338,7 @@ namespaces = ["C:"]
     }
 
     fn write_v2_package(root: &Path) {
-        write_v2_package_with_route(root, &compat_wasm("hello"));
+        write_v2_package_with_route(root, route_component_no_imports());
     }
 
     fn write_v2_package_with_route(root: &Path, route: &[u8]) {
@@ -5138,10 +4466,6 @@ name = "echo"
             .section(&export_section)
             .section(&code);
         module
-    }
-
-    fn compat_wasm(body: &str) -> Vec<u8> {
-        wat::parse_str(compat_read_wat(body)).unwrap()
     }
 
     fn package_tar_bytes(entries: Vec<(&str, &[u8])>) -> Vec<u8> {
@@ -5344,28 +4668,5 @@ name = "echo"
         let gnu = header.as_gnu_mut().unwrap();
         gnu.set_atime(atime);
         gnu.set_ctime(ctime);
-    }
-
-    fn compat_read_wat(body: &str) -> String {
-        let body = body.as_bytes();
-        let mut response = vec![2];
-        response.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        response.extend_from_slice(body);
-        let escaped = response
-            .iter()
-            .map(|byte| format!("\\{byte:02x}"))
-            .collect::<String>();
-        format!(
-            r#"
-            (module
-              (memory (export "memory") 1)
-              (data (i32.const 0) "{escaped}")
-              (func (export "petal_alloc") (param i32) (result i32)
-                (i32.const 1024))
-              (func (export "petal_dispatch") (param i32 i32) (result i64)
-                (i64.const {packed})))
-            "#,
-            packed = response.len()
-        )
     }
 }

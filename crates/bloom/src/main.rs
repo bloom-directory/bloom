@@ -263,39 +263,16 @@ enum VfsCmd {
 
 #[derive(Subcommand, Debug)]
 enum PetalsCmd {
-    /// Install a wasm/WAT module, v2 package directory, or `.petal.tar`.
+    /// Install a v2 package directory or `.petal.tar`.
     Install {
-        /// Path to a `.wasm`, `.wat`, package directory, `.petal.tar`, or `-` for stdin.
+        /// Path to a package directory or `.petal.tar`.
         path: String,
-        /// Petname to bind to the resulting hash.
-        #[arg(long)]
-        name: Option<String>,
-        /// Capabilities to grant. Repeat to grant multiple, e.g.
-        /// `--cap vfs.read --cap vfs.write`.
-        #[arg(long = "cap", value_name = "CAP")]
-        caps: Vec<String>,
     },
     /// Author and validate v2 local app packages.
     #[command(subcommand)]
     App(PetalAppCmd),
-    /// Run a petal by petname or hash.
-    Run {
-        /// Petname or 64-char hex hash.
-        name_or_hash: String,
-        /// File to feed to the petal as stdin (default: empty). `-` means
-        /// read from this process's stdin.
-        #[arg(long)]
-        input: Option<String>,
-        /// Restrict capabilities for this run to the listed set
-        /// (intersected with the petal's declared caps). Without this
-        /// flag, the petal runs with all of its declared caps.
-        #[arg(long = "cap", value_name = "CAP")]
-        cap_mask: Vec<String>,
-    },
     /// List installed petals.
     Ls,
-    /// Bind `<name>` to `<hash>`. Omit `<hash>` to remove the binding.
-    Name { name: String, hash: Option<String> },
     /// Remove an installed petal (and any petname pointing at it).
     Uninstall {
         /// 64-char hex content hash of the petal to remove.
@@ -1604,11 +1581,6 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
-    use std::collections::BTreeSet;
-    use std::io::Read;
-
-    use bloom_petals::{Capability, RunOptions, VfsHost};
-
     let cmd = match cmd {
         PetalsCmd::App(PetalAppCmd::Build { package_dir, out }) => {
             if let Some(out) = out.as_deref() {
@@ -1637,165 +1609,59 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
     };
 
     let d = Daemon::from_home(home).context("build daemon")?;
-    let vfs_arc = std::sync::Arc::new(d.vfs.clone());
 
     match cmd {
-        PetalsCmd::Install { path, name, caps } => {
-            if path != "-" {
-                let path_meta = std::fs::metadata(&path).with_context(|| format!("stat {path}"))?;
-                let is_app_dir = path_meta.is_dir();
-                if is_app_dir || path.ends_with(".petal.tar") {
-                    if name.is_some() || !caps.is_empty() {
-                        anyhow::bail!(
-                            "--name and --cap apply only to single-WASM installs; v2 app packages use petal.toml"
-                        );
-                    }
-                    let consent_package = if is_app_dir {
-                        bloom_petals::v2::PreparedAppPackage::from_dir(&path)
-                            .with_context(|| format!("read app package dir {path}"))?
-                    } else {
-                        bloom_petals::v2::PreparedAppPackage::from_petal_tar(&path)
-                            .with_context(|| format!("read app package archive {path}"))?
-                    };
-                    let consent = bloom_petals::v2::app_consent_summary(&consent_package)
-                        .context("build app consent summary")?;
-                    let (result, meta, index) = if is_app_dir {
-                        d.petals
-                            .store()
-                            .install_app_package_dir(&path)
-                            .with_context(|| format!("install app package dir {path}"))?
-                    } else {
-                        d.petals
-                            .store()
-                            .install_app_package_tar(&path)
-                            .with_context(|| format!("install app package archive {path}"))?
-                    };
-                    println!("hash: {}", result.hash);
-                    println!("mode: local-app");
-                    println!("size: {} bytes", result.size);
-                    if result.already_present {
-                        println!("note: already installed");
-                    }
-                    if let Some(app) = &meta.local_app {
-                        println!("app_mount: apps/{}/", app.name);
-                    }
-                    println!("routes: {}", index.routes.len());
-                    print_v2_app_consent(&consent);
-                    return Ok(());
-                }
+        PetalsCmd::Install { path } => {
+            let path_meta = std::fs::metadata(&path).with_context(|| format!("stat {path}"))?;
+            let is_app_dir = path_meta.is_dir();
+            if !is_app_dir && !path.ends_with(".petal.tar") {
+                anyhow::bail!(
+                    "petals install only accepts v2 package directories or .petal.tar archives"
+                );
             }
-
-            let bytes = if path == "-" {
-                let mut buf = Vec::new();
-                std::io::stdin()
-                    .read_to_end(&mut buf)
-                    .context("read stdin")?;
-                buf
+            let consent_package = if is_app_dir {
+                bloom_petals::v2::PreparedAppPackage::from_dir(&path)
+                    .with_context(|| format!("read app package dir {path}"))?
             } else {
-                std::fs::read(&path).with_context(|| format!("read {path}"))?
+                bloom_petals::v2::PreparedAppPackage::from_petal_tar(&path)
+                    .with_context(|| format!("read app package archive {path}"))?
             };
-            let mut cap_set: BTreeSet<Capability> = BTreeSet::new();
-            for c in &caps {
-                let cap = Capability::parse(c)
-                    .ok_or_else(|| anyhow::anyhow!("unknown capability: {c:?}"))?;
-                cap_set.insert(cap);
-            }
-            let (result, meta) = d
-                .petals
-                .install(
-                    &bytes,
-                    name.as_deref(),
-                    &cap_set,
-                    bloom_petals::PetalMode::Local,
-                )
-                .context("install petal")?;
+            let consent = bloom_petals::v2::app_consent_summary(&consent_package)
+                .context("build app consent summary")?;
+            let (result, meta, index) = if is_app_dir {
+                d.petals
+                    .store()
+                    .install_app_package_dir(&path)
+                    .with_context(|| format!("install app package dir {path}"))?
+            } else {
+                d.petals
+                    .store()
+                    .install_app_package_tar(&path)
+                    .with_context(|| format!("install app package archive {path}"))?
+            };
             println!("hash: {}", result.hash);
-            println!("mode: {}", meta.mode.as_str());
+            println!("mode: local-app");
             println!("size: {} bytes", result.size);
             if result.already_present {
-                println!("note: already installed (caps unioned with existing)");
+                println!("note: already installed");
             }
-            if let Some(n) = &meta.name {
-                println!("name: {n}");
+            if let Some(app) = &meta.local_app {
+                println!("app_mount: apps/{}/", app.name);
             }
-            if !meta.caps.is_empty() {
-                let cs: Vec<&str> = meta.caps.iter().map(|c| c.as_str()).collect();
-                println!("caps: {}", cs.join(", "));
-            }
+            println!("routes: {}", index.routes.len());
+            print_v2_app_consent(&consent);
             Ok(())
         }
         PetalsCmd::App(_) => unreachable!("petal app commands are handled before daemon startup"),
-        PetalsCmd::Run {
-            name_or_hash,
-            input,
-            cap_mask,
-        } => {
-            let stdin = match input.as_deref() {
-                Some("-") => {
-                    let mut buf = Vec::new();
-                    std::io::stdin()
-                        .read_to_end(&mut buf)
-                        .context("read stdin")?;
-                    buf
-                }
-                Some(p) => std::fs::read(p).with_context(|| format!("read {p}"))?,
-                None => Vec::new(),
-            };
-            let cap_mask = if cap_mask.is_empty() {
-                None
-            } else {
-                let mut s: BTreeSet<Capability> = BTreeSet::new();
-                for c in &cap_mask {
-                    let cap = Capability::parse(c)
-                        .ok_or_else(|| anyhow::anyhow!("unknown capability: {c:?}"))?;
-                    s.insert(cap);
-                }
-                Some(s)
-            };
-            let host = std::sync::Arc::new(VfsHost::new(vfs_arc.clone()));
-            let out = d
-                .petals
-                .run(&name_or_hash, stdin, host, cap_mask, RunOptions::default())
-                .await
-                .context("run petal")?;
-            use std::io::Write;
-            // Stream stdout/stderr to the user verbatim so they can pipe
-            // a petal's output. Exit code goes to the parent process.
-            std::io::stdout().write_all(&out.stdout).ok();
-            std::io::stderr().write_all(&out.stderr).ok();
-            if out.exit_code != 0 {
-                anyhow::bail!("petal exited with code {}", out.exit_code);
-            }
-            Ok(())
-        }
         PetalsCmd::Ls => {
-            let names = d.petals.registry().snapshot();
-            let mut name_for_hash: std::collections::BTreeMap<String, String> = Default::default();
-            for (n, h) in &names {
-                name_for_hash.entry(h.clone()).or_insert(n.clone());
-            }
-            let hashes = d.petals.store().list_hashes().context("list petals")?;
             let package_hashes = d
                 .petals
                 .store()
                 .list_package_hashes()
                 .context("list app packages")?;
-            if hashes.is_empty() && package_hashes.is_empty() {
+            if package_hashes.is_empty() {
                 println!("(no petals installed)");
                 return Ok(());
-            }
-            for h in hashes {
-                let meta = d.petals.store().load_meta(&h).context("load meta")?;
-                let n = name_for_hash.get(&h).map(String::as_str).unwrap_or("-");
-                let caps: Vec<&str> = meta.caps.iter().map(|c| c.as_str()).collect();
-                println!(
-                    "{}  {:<7}  {:>7}  caps=[{}]  name={}",
-                    &meta.hash[..12],
-                    meta.mode.as_str(),
-                    meta.size,
-                    caps.join(","),
-                    n
-                );
             }
             for h in package_hashes {
                 let meta = d.petals.store().load_meta(&h).context("load meta")?;
@@ -1814,29 +1680,6 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
             }
             Ok(())
         }
-        PetalsCmd::Name { name, hash } => match hash {
-            Some(h) => {
-                d.petals
-                    .registry()
-                    .set(&name, &h)
-                    .with_context(|| format!("bind name {name} -> {h}"))?;
-                println!("bound {name} -> {h}");
-                Ok(())
-            }
-            None => {
-                let removed = d
-                    .petals
-                    .registry()
-                    .unset(&name)
-                    .with_context(|| format!("unset name {name}"))?;
-                if removed {
-                    println!("removed name {name}");
-                } else {
-                    println!("name {name} was not bound");
-                }
-                Ok(())
-            }
-        },
         PetalsCmd::Uninstall { hash } => {
             let removed = d.petals.uninstall(&hash).context("uninstall petal")?;
             if removed {

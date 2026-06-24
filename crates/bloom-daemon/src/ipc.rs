@@ -28,12 +28,11 @@ use std::sync::Arc;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use bloom_keystore::{Keystore, WalletKind};
-use bloom_petals::{Capability, PetalError, PetalRunner, RunOptions, VfsHost};
+use bloom_petals::{PetalError, PetalRunner};
 use bloom_proto::{CeremonyIntent, CeremonyIntentKind};
 use bloom_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -122,23 +121,17 @@ pub struct IpcServer {
     pub chains: Vec<String>,
     keystore: Option<Keystore>,
     petals: Option<PetalRunner>,
-    /// Pre-wrapped `Arc<Vfs>` for building [`VfsHost`] per `petals.run`.
-    /// We keep it next to the bare `vfs` clone so the existing handler
-    /// surface stays untouched.
-    vfs_arc: Arc<Vfs>,
     shutdown: Arc<Notify>,
 }
 
 impl IpcServer {
     pub fn new(vfs: Vfs, version: impl Into<String>, chains: Vec<String>) -> Self {
-        let vfs_arc = Arc::new(vfs.clone());
         Self {
             vfs,
             version: version.into(),
             chains,
             keystore: None,
             petals: None,
-            vfs_arc,
             shutdown: Arc::new(Notify::new()),
         }
     }
@@ -296,23 +289,7 @@ impl IpcServer {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_handler_err(id, e),
             },
-            "petals.install" => match self.do_petals_install(&req.params).await {
-                Ok(v) => Response::ok(id, v),
-                Err(e) => map_petal_err(id, e),
-            },
-            "petals.run" => match self.do_petals_run(&req.params).await {
-                Ok(v) => Response::ok(id, v),
-                Err(e) => map_petal_err(id, e),
-            },
             "petals.list" => match self.do_petals_list().await {
-                Ok(v) => Response::ok(id, v),
-                Err(e) => map_petal_err(id, e),
-            },
-            "petals.resolve" => match self.do_petals_resolve(&req.params).await {
-                Ok(v) => Response::ok(id, v),
-                Err(e) => map_petal_err(id, e),
-            },
-            "petals.name" => match self.do_petals_name(&req.params).await {
                 Ok(v) => Response::ok(id, v),
                 Err(e) => map_petal_err(id, e),
             },
@@ -490,96 +467,10 @@ impl IpcServer {
             .ok_or_else(|| PetalError::vm("petals not enabled on this daemon"))
     }
 
-    /// `params`: `{ bytes_b64? | text?, name?, caps?: ["vfs.read","vfs.write"] }`.
-    /// Either `bytes_b64` (raw wasm or WAT) or `text` (WAT only) must be set.
-    async fn do_petals_install(&self, params: &Value) -> Result<Value, PetalError> {
-        let runner = self.petals()?;
-        let bytes = if let Some(s) = params.get("bytes_b64").and_then(|v| v.as_str()) {
-            B64.decode(s)
-                .map_err(|e| PetalError::vm(format!("bytes_b64: {e}")))?
-        } else if let Some(s) = params.get("text").and_then(|v| v.as_str()) {
-            s.as_bytes().to_vec()
-        } else {
-            return Err(PetalError::vm("install needs bytes_b64 or text"));
-        };
-        let name = params.get("name").and_then(|v| v.as_str());
-        let caps = parse_caps(params.get("caps"))?;
-        let mode = match params.get("mode").and_then(|v| v.as_str()) {
-            None => bloom_petals::PetalMode::Local,
-            Some("local") => bloom_petals::PetalMode::Local,
-            Some(other) => {
-                return Err(PetalError::vm(format!("install: unknown mode {other:?}")));
-            }
-        };
-        let (result, meta) = runner.install(&bytes, name, &caps, mode)?;
-        Ok(json!({
-            "hash": result.hash,
-            "size": result.size,
-            "already_present": result.already_present,
-            "name": meta.name,
-            "caps": meta.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-            "installed_at_ms": meta.installed_at_ms,
-            "mode": meta.mode_str(),
-        }))
-    }
-
-    /// `params`: `{ name_or_hash, stdin_b64?, input?, cap_mask?: ["vfs.read",...] }`.
-    /// `cap_mask` narrows the petal's declared caps; absent ⇒ use them as-is.
-    async fn do_petals_run(&self, params: &Value) -> Result<Value, PetalError> {
-        let runner = self.petals()?;
-        let target = params
-            .get("name_or_hash")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| PetalError::vm("missing 'name_or_hash'"))?;
-        let stdin = if let Some(s) = params.get("stdin_b64").and_then(|v| v.as_str()) {
-            B64.decode(s)
-                .map_err(|e| PetalError::vm(format!("stdin_b64: {e}")))?
-        } else if let Some(s) = params.get("input").and_then(|v| v.as_str()) {
-            s.as_bytes().to_vec()
-        } else {
-            Vec::new()
-        };
-        let cap_mask = match params.get("cap_mask") {
-            Some(v) if !v.is_null() => Some(parse_caps(Some(v))?),
-            _ => None,
-        };
-        let host = Arc::new(VfsHost::new(self.vfs_arc.clone()));
-        let out = runner
-            .run(target, stdin, host, cap_mask, RunOptions::default())
-            .await?;
-        let meta = runner.store().load_meta(&runner.resolve(target)?)?;
-        Ok(json!({
-            "exit_code": out.exit_code,
-            "stdout_b64": B64.encode(&out.stdout),
-            "stderr_b64": B64.encode(&out.stderr),
-            "fuel_consumed": out.fuel_consumed,
-            "mode": meta.mode_str(),
-        }))
-    }
-
     async fn do_petals_list(&self) -> Result<Value, PetalError> {
         let runner = self.petals()?;
-        let names = runner.registry().snapshot();
-        // Build a hash → first-matching-name reverse map so each entry
-        // can carry its registered name (or null).
-        let mut name_for_hash: std::collections::BTreeMap<String, String> = Default::default();
-        for (name, hash) in &names {
-            name_for_hash.entry(hash.clone()).or_insert(name.clone());
-        }
-        let hashes = runner.store().list_hashes()?;
         let package_hashes = runner.store().list_package_hashes()?;
-        let mut out = Vec::with_capacity(hashes.len() + package_hashes.len());
-        for hash in hashes {
-            let meta = runner.store().load_meta(&hash)?;
-            out.push(json!({
-                "hash": meta.hash,
-                "size": meta.size,
-                "name": name_for_hash.get(&meta.hash).cloned(),
-                "caps": meta.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-                "installed_at_ms": meta.installed_at_ms,
-                "mode": meta.mode_str(),
-            }));
-        }
+        let mut out = Vec::with_capacity(package_hashes.len());
         for hash in package_hashes {
             let meta = runner.store().load_meta(&hash)?;
             let app_mount = meta
@@ -589,7 +480,6 @@ impl IpcServer {
             out.push(json!({
                 "hash": meta.hash,
                 "size": meta.size,
-                "name": name_for_hash.get(&meta.hash).cloned(),
                 "caps": meta.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
                 "installed_at_ms": meta.installed_at_ms,
                 "mode": meta.mode_str(),
@@ -598,39 +488,6 @@ impl IpcServer {
             }));
         }
         Ok(Value::Array(out))
-    }
-
-    async fn do_petals_resolve(&self, params: &Value) -> Result<Value, PetalError> {
-        let runner = self.petals()?;
-        let target = params
-            .get("name_or_hash")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| PetalError::vm("missing 'name_or_hash'"))?;
-        let hash = runner.resolve(target)?;
-        Ok(json!({ "hash": hash }))
-    }
-
-    /// `params`: `{ name, hash? }`. Omitted/empty `hash` unsets the name.
-    async fn do_petals_name(&self, params: &Value) -> Result<Value, PetalError> {
-        let runner = self.petals()?;
-        let name = params
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| PetalError::vm("missing 'name'"))?;
-        let hash = params
-            .get("hash")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty());
-        match hash {
-            Some(h) => {
-                runner.registry().set(name, h)?;
-                Ok(json!({ "name": name, "hash": h }))
-            }
-            None => {
-                let removed = runner.registry().unset(name)?;
-                Ok(json!({ "name": name, "removed": removed }))
-            }
-        }
     }
 
     async fn do_petals_uninstall(&self, params: &Value) -> Result<Value, PetalError> {
@@ -1062,30 +919,6 @@ fn find_defi_review_for_outbox(
         });
     }
     None
-}
-
-fn parse_caps(v: Option<&Value>) -> Result<BTreeSet<Capability>, PetalError> {
-    let Some(v) = v else {
-        return Ok(BTreeSet::new());
-    };
-    if v.is_null() {
-        return Ok(BTreeSet::new());
-    }
-    let arr = v
-        .as_array()
-        .ok_or_else(|| PetalError::vm("'caps' must be an array of strings"))?;
-    let mut out = BTreeSet::new();
-    for item in arr {
-        let s = item
-            .as_str()
-            .ok_or_else(|| PetalError::vm("'caps' entries must be strings"))?;
-        out.insert(Capability::parse(s).ok_or_else(|| {
-            PetalError::vm(format!(
-                "unknown capability {s:?}; expected 'vfs.read' or 'vfs.write'"
-            ))
-        })?);
-    }
-    Ok(out)
 }
 
 fn parse_path(params: &Value) -> Result<VfsPath, HandlerError> {
