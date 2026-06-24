@@ -13,7 +13,8 @@ on:
       - crates/bloom-chain*/**
       - crates/bloom-petal*/**
       - examples/petal-dex/**
-      - examples/local-petal-apps/**
+      - docs/guides/local-petal-apps-v2.md
+      - docs/superpowers/specs/2026-06-24-external-petal-repos-and-github-source-installs.md
   push:
     branches:
       - master
@@ -44,6 +45,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Build bloom CLI for subprocess tests
         run: cargo build -p bloom --bin bloom
+      - name: Install wasm-tools
+        run: cargo install wasm-tools --version 1.249.0 --locked
       - name: Build workspace (release-ish; debug is fine for acceptance)
         run: cargo build --workspace --tests
       - name: Run --ignored acceptance tests

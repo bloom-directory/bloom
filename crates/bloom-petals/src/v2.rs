@@ -1329,6 +1329,9 @@ fn collect_package_dir_inner(
         let path = entry.path();
         let ty = entry.file_type()?;
         if ty.is_dir() {
+            if should_skip_package_dir(root, &path) {
+                continue;
+            }
             collect_package_dir_inner(root, &path, files)?;
         } else if ty.is_file() {
             let rel = path
@@ -1348,6 +1351,21 @@ fn collect_package_dir_inner(
         }
     }
     Ok(())
+}
+
+fn should_skip_package_dir(root: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    matches!(
+        rel.components()
+            .next()
+            .and_then(|component| component.as_os_str().to_str()),
+        Some(".git" | ".jj" | "target")
+    ) || path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "target")
 }
 
 fn read_package_tar(reader: impl Read) -> Result<Vec<NormalizedPackageFile>, PetalError> {
@@ -3300,61 +3318,6 @@ name = "echo"
 
         let err = PetalAppPackage::scan_dir(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("conflicting v2 routes"));
-    }
-
-    #[test]
-    fn polymarket_v2_example_package_validates() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .unwrap();
-        let source = root.join("examples/local-petal-apps/polymarket");
-        let tmp = tempfile::tempdir().unwrap();
-        for file in ["petal.toml", "README.md", "AGENTS.md"] {
-            std::fs::copy(source.join(file), tmp.path().join(file)).unwrap();
-        }
-
-        let output = std::process::Command::new("bash")
-            .arg(root.join("examples/local-petal-apps/build-polymarket-v2.sh"))
-            .env("POLYMARKET_APP_DIR", tmp.path())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "polymarket v2 build failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
-
-        assert_eq!(package.name, "polymarket");
-        assert_eq!(package.route_index.routes.len(), 62);
-        assert!(
-            package
-                .route_index
-                .routes
-                .iter()
-                .all(|route| route.abi == RouteAbi::ComponentBloomRoute010)
-        );
-        assert!(
-            package
-                .route_index
-                .match_route("markets/some-slug")
-                .is_some()
-        );
-        assert!(
-            package
-                .route_index
-                .match_route("trade/alice/new")
-                .is_some_and(|matched| matched.route.ops.contains(&RouteOp::Write))
-        );
-        assert!(
-            package
-                .route_index
-                .match_route("positions/alice/positions.json")
-                .is_some()
-        );
     }
 
     #[test]

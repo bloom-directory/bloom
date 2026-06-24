@@ -13,6 +13,7 @@ mod commands {
     pub mod pipe;
     pub mod polymarket;
 }
+mod github_source;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -263,10 +264,13 @@ enum VfsCmd {
 
 #[derive(Subcommand, Debug)]
 enum PetalsCmd {
-    /// Install a v2 package directory or `.petal.tar`.
+    /// Install a v2 package directory, `.petal.tar`, or trusted GitHub source repository.
     Install {
-        /// Path to a package directory or `.petal.tar`.
+        /// Path to a package directory, `.petal.tar`, or trusted GitHub source repository URL.
         path: String,
+        /// Git tag, branch, or commit SHA to install from a GitHub source repository.
+        #[arg(long = "ref", value_name = "TAG_OR_SHA")]
+        ref_: Option<String>,
     },
     /// Author and validate v2 local app packages.
     #[command(subcommand)]
@@ -1608,15 +1612,47 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
         other => other,
     };
 
-    let d = Daemon::from_home(home).context("build daemon")?;
+    let d = Daemon::from_home(home.clone()).context("build daemon")?;
 
     match cmd {
-        PetalsCmd::Install { path } => {
+        PetalsCmd::Install { path, ref_ } => {
+            if let Some(repo) = github_source::parse_github_install_url(&path)? {
+                let installed =
+                    github_source::install_github_source(&home, &d, &repo, ref_.as_deref())?;
+                println!();
+                println!("hash: {}", installed.result.hash);
+                println!("mode: local-app");
+                println!("size: {} bytes", installed.result.size);
+                if installed.result.already_present {
+                    println!("note: already installed");
+                }
+                if let Some(app) = &installed.meta.local_app {
+                    println!("app_mount: apps/{}/", app.name);
+                }
+                println!("routes: {}", installed.index.routes.len());
+                println!(
+                    "source: {}/{}@{}",
+                    installed.provenance.owner,
+                    installed.provenance.repo,
+                    installed
+                        .provenance
+                        .selected_tag
+                        .as_deref()
+                        .unwrap_or(&installed.provenance.requested_ref)
+                );
+                println!("resolved_commit: {}", installed.provenance.resolved_commit);
+                print_v2_app_consent(&installed.consent);
+                return Ok(());
+            }
+
+            if ref_.is_some() {
+                anyhow::bail!("--ref is only supported for trusted GitHub source installs");
+            }
             let path_meta = std::fs::metadata(&path).with_context(|| format!("stat {path}"))?;
             let is_app_dir = path_meta.is_dir();
             if !is_app_dir && !path.ends_with(".petal.tar") {
                 anyhow::bail!(
-                    "petals install only accepts v2 package directories or .petal.tar archives"
+                    "petals install only accepts v2 package directories, .petal.tar archives, or trusted GitHub source repositories"
                 );
             }
             let consent_package = if is_app_dir {
@@ -1670,12 +1706,20 @@ async fn run_petals(home: HomeDir, cmd: PetalsCmd) -> Result<()> {
                     .as_ref()
                     .map(|app| format!("  app=apps/{}/", app.name))
                     .unwrap_or_default();
+                let source = meta.source.as_ref().map_or_else(String::new, |source| {
+                    let selected = source
+                        .selected_tag
+                        .as_deref()
+                        .unwrap_or(&source.requested_ref);
+                    format!("  source={}/{}@{}", source.owner, source.repo, selected)
+                });
                 println!(
-                    "{}  {:<7}  {:>7}  caps=[]  name=-{}",
+                    "{}  {:<7}  {:>7}  caps=[]  name=-{}{}",
                     &meta.hash[..12],
                     "app",
                     meta.size,
-                    app
+                    app,
+                    source
                 );
             }
             Ok(())

@@ -35,11 +35,22 @@ Useful commands:
 bloom petal app build path/to/package --out app.petal.tar
 bloom petals install path/to/package
 bloom petals install app.petal.tar
+bloom petals install https://github.com/bloom-directory/bloom-petal-polymarket
+bloom petals install https://github.com/bloom-directory/bloom-petal-polymarket --ref v0.1.0
 bloom petals ls
 ```
 
 `bloom petal app build` validates the package, writes generated route artifacts
 under `artifacts/`, and emits a deterministic `.petal.tar` when `--out` is set.
+
+`bloom petals install <trusted-github-url>` accepts source repositories under
+`bloom-directory`. By default it installs the latest SemVer-like tag; pass
+`--ref <tag-or-sha>` to pin a tag, branch, or commit explicitly. GitHub source
+repos must declare `[build] command = "..."` in `petal.toml`; Bloom runs that
+trusted command locally, validates the generated v2 package through the same
+package pipeline as local directories and `.petal.tar` archives, then records
+the source URL, selected tag/ref, resolved commit, and package hash in install
+metadata. Raw remote `.wasm` URLs and unsupported GitHub owners are rejected.
 
 Route artifacts must be WebAssembly components; raw core-WASM route artifacts
 are rejected.

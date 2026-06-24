@@ -237,6 +237,61 @@ fn v2_app_cli_build_install_list_and_vfs_read_happy_path() {
 }
 
 #[test]
+#[ignore = "clones and builds the public Polymarket Petal source repo"]
+fn github_source_install_polymarket_dispatches_parity() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args([
+            "petals",
+            "install",
+            "https://github.com/bloom-directory/bloom-petal-polymarket",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Selected tag: v0.1.0"))
+        .stdout(predicate::str::contains(
+            "source: bloom-directory/bloom-petal-polymarket@v0.1.0",
+        ))
+        .stdout(predicate::str::contains("routes: 67"));
+
+    bloom_cmd(home.path())
+        .args(["petals", "ls"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "source=bloom-directory/bloom-petal-polymarket@v0.1.0",
+        ));
+
+    bloom_cmd(home.path())
+        .args(["vfs", "cat", "/apps/polymarket/meta/parity.json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("polymarket_v2_petal_parity"));
+}
+
+#[test]
+fn petals_install_rejects_untrusted_owner_and_raw_remote_wasm() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args(["petals", "install", "https://github.com/not-bloom/petal"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unsupported GitHub owner"));
+
+    bloom_cmd(home.path())
+        .args([
+            "petals",
+            "install",
+            "https://github.com/bloom-directory/petal/raw/main/route.wasm",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "raw remote .wasm installs are not supported",
+        ));
+}
+
+#[test]
 fn vfs_default_missing_socket_falls_back_in_process() {
     let home = fresh_home();
     let socket = home.path().join("run").join("bloom.sock");

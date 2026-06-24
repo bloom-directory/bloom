@@ -18,7 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::error::PetalError;
-use crate::meta::{Capability, LocalAppMeta, PetalMeta, PetalMode};
+use crate::meta::{Capability, LocalAppMeta, PetalMeta, PetalMode, PetalSourceProvenance};
 use crate::v2::{
     PreparedAppPackage, ROUTE_INDEX_SCHEMA, RouteIndex, route_artifact_bytes,
     verify_prepared_package,
@@ -139,6 +139,7 @@ impl PetalStore {
                 caps: BTreeSet::new(),
                 mode,
                 local_app: None,
+                source: None,
             },
             Err(e) => return Err(e),
         };
@@ -180,6 +181,14 @@ impl PetalStore {
     pub fn install_prepared_app_package(
         &self,
         package: PreparedAppPackage,
+    ) -> Result<(InstallResult, PetalMeta, RouteIndex), PetalError> {
+        self.install_prepared_app_package_with_source(package, None)
+    }
+
+    pub fn install_prepared_app_package_with_source(
+        &self,
+        package: PreparedAppPackage,
+        source: Option<PetalSourceProvenance>,
     ) -> Result<(InstallResult, PetalMeta, RouteIndex), PetalError> {
         verify_prepared_package(&package)?;
         let hash = package.hash.clone();
@@ -240,6 +249,7 @@ impl PetalStore {
                 caps: BTreeSet::new(),
                 mode: PetalMode::Local,
                 local_app: None,
+                source: None,
             },
         };
         meta.name = Some(package.name.clone());
@@ -251,6 +261,7 @@ impl PetalStore {
             app_root: package.route_index.app_root.clone(),
             route_index_schema: ROUTE_INDEX_SCHEMA.to_string(),
         });
+        meta.source = source;
         self.write_meta(&meta)?;
 
         Ok((
@@ -555,7 +566,7 @@ fn validate_route_id_arg(route_id: &str) -> Result<(), PetalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::meta::PetalMode;
+    use crate::meta::{PetalMode, PetalSourceProvenance};
     use crate::v2::PreparedAppPackage;
     use tempfile::TempDir;
 
@@ -782,6 +793,45 @@ name = "echo"
         let (again, _, _) = store.install_app_package_dir(&package).unwrap();
         assert_eq!(again.hash, result.hash);
         assert!(again.already_present);
+    }
+
+    #[test]
+    fn install_app_package_persists_source_provenance() {
+        let (d, store) = store();
+        let package_dir = d.path().join("pkg");
+        write_file(
+            &package_dir,
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+"#,
+        );
+        write_file(&package_dir, "README.md", b"# echo");
+        write_file(&package_dir, "AGENTS.md", b"# echo agents");
+        write_file(
+            &package_dir,
+            "app/echo/[name].txt.wasm",
+            route_component_wasm(),
+        );
+
+        let package = PreparedAppPackage::from_dir(&package_dir).unwrap();
+        let provenance = PetalSourceProvenance {
+            source_kind: "github".into(),
+            url: "https://github.com/bloom-directory/bloom-petal-echo".into(),
+            owner: "bloom-directory".into(),
+            repo: "bloom-petal-echo".into(),
+            requested_ref: "v0.1.0".into(),
+            resolved_commit: "0123456789abcdef".into(),
+            selected_tag: Some("v0.1.0".into()),
+            package_hash: package.hash.clone(),
+        };
+        let (result, meta, _) = store
+            .install_prepared_app_package_with_source(package, Some(provenance.clone()))
+            .unwrap();
+
+        assert_eq!(meta.source.as_ref(), Some(&provenance));
+        let loaded = store.load_meta(&result.hash).unwrap();
+        assert_eq!(loaded.source.as_ref(), Some(&provenance));
     }
 
     #[test]
