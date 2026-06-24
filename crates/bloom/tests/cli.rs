@@ -248,9 +248,9 @@ fn github_source_install_polymarket_dispatches_parity() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Selected tag: v0.1.0"))
+        .stdout(predicate::str::contains("Selected tag: v0.1.1"))
         .stdout(predicate::str::contains(
-            "source: bloom-directory/bloom-petal-polymarket@v0.1.0",
+            "source: bloom-directory/bloom-petal-polymarket@v0.1.1",
         ))
         .stdout(predicate::str::contains("routes: 67"));
 
@@ -259,7 +259,7 @@ fn github_source_install_polymarket_dispatches_parity() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "source=bloom-directory/bloom-petal-polymarket@v0.1.0",
+            "source=bloom-directory/bloom-petal-polymarket@v0.1.1",
         ));
 
     bloom_cmd(home.path())
