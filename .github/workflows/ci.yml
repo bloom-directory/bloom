@@ -58,8 +58,6 @@ jobs:
           rustup target add wasm32-unknown-unknown
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
-      - name: Install wasm-tools
-        run: cargo install wasm-tools --version 1.249.0 --locked
       - name: Free runner disk space
         run: |
           df -h
@@ -75,6 +73,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-targets: false
+      - name: Install wasm-tools
+        run: cargo install wasm-tools --version 1.249.0 --locked
       - name: Run tests
         run: cargo nextest run --workspace --no-fail-fast -E 'not (binary(chain_testnet_provision) | binary(chain_smoke))'
       - name: Run doctests
