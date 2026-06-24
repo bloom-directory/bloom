@@ -14,7 +14,7 @@ use bloom_vfs::{Handler, Vfs};
 use parking_lot::RwLock;
 
 use crate::error::PetalError;
-use crate::host::{DenyHost, HostError, PetalHost};
+use crate::host::{DenyHost, HostError, HostVfsEntry, HostVfsEntryKind, PetalHost};
 use crate::meta::Capability;
 use crate::policy::NetPolicy;
 use crate::registry::NameRegistry;
@@ -42,19 +42,29 @@ impl VfsHost {
 
 #[async_trait]
 impl PetalHost for VfsHost {
+    async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
+        let path = VfsPath::parse(path).map_err(|e| HostError::Invalid(format!("path: {e}")))?;
+        deny_apps_subtree(&path)?;
+        self.vfs
+            .lookup(&path)
+            .await
+            .map(host_entry_from_vfs)
+            .map_err(host_from_handler)
+    }
+
     async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
         let path = VfsPath::parse(path).map_err(|e| HostError::Invalid(format!("path: {e}")))?;
         deny_apps_subtree(&path)?;
         self.vfs.read(&path).await.map_err(host_from_handler)
     }
 
-    async fn vfs_list(&self, path: &str) -> Result<Vec<String>, HostError> {
+    async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
         let path = VfsPath::parse(path).map_err(|e| HostError::Invalid(format!("path: {e}")))?;
         deny_apps_subtree(&path)?;
         self.vfs
             .list(&path)
             .await
-            .map(|entries| entries.into_iter().map(|entry| entry.name).collect())
+            .map(|entries| entries.into_iter().map(host_entry_from_vfs).collect())
             .map_err(host_from_handler)
     }
 
@@ -107,12 +117,17 @@ impl LateVfsHost {
 
 #[async_trait]
 impl PetalHost for LateVfsHost {
+    async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
+        let vfs = self.current()?;
+        VfsHost::new(vfs).vfs_lookup(path).await
+    }
+
     async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
         let vfs = self.current()?;
         VfsHost::new(vfs).vfs_read(path).await
     }
 
-    async fn vfs_list(&self, path: &str) -> Result<Vec<String>, HostError> {
+    async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
         let vfs = self.current()?;
         VfsHost::new(vfs).vfs_list(path).await
     }
@@ -120,6 +135,21 @@ impl PetalHost for LateVfsHost {
     async fn vfs_write(&self, path: &str, bytes: &[u8]) -> Result<(), HostError> {
         let vfs = self.current()?;
         VfsHost::new(vfs).vfs_write(path, bytes).await
+    }
+}
+
+fn host_entry_from_vfs(entry: bloom_vfs::handler::Entry) -> HostVfsEntry {
+    let kind = match entry.kind {
+        bloom_vfs::handler::EntryKind::Dir => HostVfsEntryKind::Dir,
+        bloom_vfs::handler::EntryKind::File => HostVfsEntryKind::File,
+        bloom_vfs::handler::EntryKind::Symlink => HostVfsEntryKind::Symlink,
+    };
+    HostVfsEntry {
+        name: entry.name,
+        kind,
+        mode: entry.mode,
+        size: Some(entry.size),
+        link_target: entry.link_target,
     }
 }
 

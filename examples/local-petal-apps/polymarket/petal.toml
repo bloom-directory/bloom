@@ -1,0 +1,8 @@
+schema = "bloom.petal.local-app.v2"
+name = "polymarket"
+
+[consent]
+summary = "Expose the native Polymarket VFS surface as a v2 Petal app through mediated VFS route components."
+
+[caps]
+allowed = ["bloom:vfs.read", "bloom:vfs.write"]

@@ -3246,6 +3246,42 @@ name = "echo"
     }
 
     #[test]
+    fn polymarket_v2_example_package_validates() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("examples/local-petal-apps/polymarket");
+        let package = PreparedAppPackage::from_dir(&root).unwrap();
+
+        assert_eq!(package.name, "polymarket");
+        assert_eq!(package.route_index.routes.len(), 62);
+        assert!(
+            package
+                .route_index
+                .routes
+                .iter()
+                .all(|route| route.abi == RouteAbi::ComponentBloomRoute010)
+        );
+        assert!(
+            package
+                .route_index
+                .match_route("markets/some-slug")
+                .is_some()
+        );
+        assert!(
+            package
+                .route_index
+                .match_route("trade/alice/new")
+                .is_some_and(|matched| matched.route.ops.contains(&RouteOp::Write))
+        );
+        assert!(
+            package
+                .route_index
+                .match_route("positions/alice/positions.json")
+                .is_some()
+        );
+    }
+
+    #[test]
     fn v2_scanner_rejects_paths_too_long_for_strict_archive() {
         let tmp = tempfile::tempdir().unwrap();
         write_package_file(tmp.path(), "petal.toml", br#"name = "echo""#);

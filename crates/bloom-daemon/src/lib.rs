@@ -26,8 +26,8 @@ use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
 use bloom_keystore::Keystore;
 use bloom_petals::{
-    HostError, HttpRequest, HttpResponse, LateVfsHost, NameRegistry, NetPolicy, PetalHost,
-    PetalRouter, PetalRunner, PetalStore, PetalVm, SignRequest,
+    HostError, HostVfsEntry, HttpRequest, HttpResponse, LateVfsHost, NameRegistry, NetPolicy,
+    PetalHost, PetalRouter, PetalRunner, PetalStore, PetalVm, SignRequest,
 };
 use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient, GeoblockClient};
 use bloom_prices::PricesClient;
@@ -159,11 +159,15 @@ impl DaemonPetalHost {
 
 #[async_trait]
 impl PetalHost for DaemonPetalHost {
+    async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
+        self.vfs.vfs_lookup(path).await
+    }
+
     async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
         self.vfs.vfs_read(path).await
     }
 
-    async fn vfs_list(&self, path: &str) -> Result<Vec<String>, HostError> {
+    async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
         self.vfs.vfs_list(path).await
     }
 

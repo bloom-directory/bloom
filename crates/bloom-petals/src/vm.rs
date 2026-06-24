@@ -44,7 +44,7 @@ use crate::abi::{
     ChainRequest, ChainResponse, DispatchOp, DispatchRequest, DispatchResponse, SignRequest,
 };
 use crate::error::PetalError;
-use crate::host::{HostError, PetalHost};
+use crate::host::{HostError, HostVfsEntry, HostVfsEntryKind, PetalHost};
 use crate::meta::Capability;
 use crate::policy::{NetPolicy, StoreNamespacePolicy};
 use crate::private_store::PrivateStore;
@@ -1140,11 +1140,8 @@ async fn component_vfs_lookup(
         Err(e) => return set_component_result(results, component_host_err(e)),
     };
     let host = store.data().host.clone();
-    match host.vfs_list(&path).await {
-        Ok(_) => set_component_result(
-            results,
-            component_ok(Some(component_vfs_entry(&path, "dir", 0o755, None, None))),
-        ),
+    match host.vfs_lookup(&path).await {
+        Ok(entry) => set_component_result(results, component_ok(Some(component_vfs_entry(entry)))),
         Err(e) => set_component_result(results, component_host_err(e)),
     }
 }
@@ -1168,10 +1165,7 @@ async fn component_vfs_list(
     let host = store.data().host.clone();
     match host.vfs_list(&path).await {
         Ok(names) => {
-            let entries = names
-                .into_iter()
-                .map(|name| component_vfs_entry(&name, "file", 0o644, None, None))
-                .collect();
+            let entries = names.into_iter().map(component_vfs_entry).collect();
             set_component_result(results, component_ok(Some(ComponentVal::List(entries))))
         }
         Err(e) => set_component_result(results, component_host_err(e)),
@@ -1466,24 +1460,30 @@ fn component_headers(headers: Vec<(String, String)>) -> ComponentVal {
     )
 }
 
-fn component_vfs_entry(
-    name: &str,
-    kind: &str,
-    mode: u32,
-    size: Option<u64>,
-    link_target: Option<String>,
-) -> ComponentVal {
+fn component_vfs_entry(entry: HostVfsEntry) -> ComponentVal {
+    let kind = match entry.kind {
+        HostVfsEntryKind::Dir => "dir",
+        HostVfsEntryKind::File => "file",
+        HostVfsEntryKind::Symlink => "symlink",
+    };
     ComponentVal::Record(vec![
-        ("name".into(), ComponentVal::String(vfs_entry_name(name))),
+        (
+            "name".into(),
+            ComponentVal::String(vfs_entry_name(&entry.name)),
+        ),
         ("kind".into(), ComponentVal::Enum(kind.into())),
-        ("mode".into(), ComponentVal::U32(mode)),
+        ("mode".into(), ComponentVal::U32(entry.mode)),
         (
             "size".into(),
-            ComponentVal::Option(size.map(|size| Box::new(ComponentVal::U64(size)))),
+            ComponentVal::Option(entry.size.map(|size| Box::new(ComponentVal::U64(size)))),
         ),
         (
             "link-target".into(),
-            ComponentVal::Option(link_target.map(|target| Box::new(ComponentVal::String(target)))),
+            ComponentVal::Option(
+                entry
+                    .link_target
+                    .map(|target| Box::new(ComponentVal::String(target))),
+            ),
         ),
     ])
 }
@@ -1914,7 +1914,7 @@ mod tests {
     #[derive(Default)]
     struct MockHost {
         store: Mutex<HashMap<String, Vec<u8>>>,
-        lists: Mutex<HashMap<String, Vec<String>>>,
+        lists: Mutex<HashMap<String, Vec<HostVfsEntry>>>,
         vfs_reads: Mutex<Vec<String>>,
         http_calls: Mutex<Vec<HttpRequest>>,
         sign_calls: Mutex<Vec<SignRequest>>,
@@ -1923,6 +1923,28 @@ mod tests {
 
     #[async_trait]
     impl PetalHost for MockHost {
+        async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError> {
+            if self.store.lock().contains_key(path) {
+                return Ok(HostVfsEntry {
+                    name: vfs_entry_name(path),
+                    kind: HostVfsEntryKind::File,
+                    mode: 0o644,
+                    size: None,
+                    link_target: None,
+                });
+            }
+            if self.lists.lock().contains_key(path) {
+                return Ok(HostVfsEntry {
+                    name: vfs_entry_name(path),
+                    kind: HostVfsEntryKind::Dir,
+                    mode: 0o755,
+                    size: None,
+                    link_target: None,
+                });
+            }
+            Err(HostError::NotFound(path.into()))
+        }
+
         async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError> {
             self.vfs_reads.lock().push(path.into());
             self.store
@@ -1931,7 +1953,7 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| HostError::NotFound(path.into()))
         }
-        async fn vfs_list(&self, path: &str) -> Result<Vec<String>, HostError> {
+        async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
             self.lists
                 .lock()
                 .get(path)
@@ -2344,9 +2366,16 @@ mod tests {
         host.store
             .lock()
             .insert("wallets/alice.txt".into(), b"alice".to_vec());
-        host.lists
-            .lock()
-            .insert("wallets".into(), vec!["alice.txt".into()]);
+        host.lists.lock().insert(
+            "wallets".into(),
+            vec![HostVfsEntry {
+                name: "alice.txt".into(),
+                kind: HostVfsEntryKind::File,
+                mode: 0o644,
+                size: Some(5),
+                link_target: None,
+            }],
+        );
 
         let mut caps = BTreeSet::new();
         caps.insert(Capability::NetFetch);
@@ -2443,7 +2472,7 @@ paths = ["/status"]
         )
         .await
         .unwrap();
-        assert_component_err_contains(&lookup[0], "not found");
+        assert_component_ok_entry(&lookup[0], "alice.txt", "file", 0o644);
         assert!(
             host.vfs_reads.lock().is_empty(),
             "component vfs.lookup must not perform side-effecting reads"
@@ -2670,6 +2699,32 @@ paths = ["/status"]
             })
             .collect::<Vec<_>>();
         assert_eq!(names, expected);
+    }
+
+    fn assert_component_ok_entry(
+        value: &ComponentVal,
+        expected_name: &str,
+        expected_kind: &str,
+        expected_mode: u32,
+    ) {
+        let ComponentVal::Result(Ok(Some(payload))) = value else {
+            panic!("expected component ok result, got {value:?}");
+        };
+        let ComponentVal::Record(fields) = payload.as_ref() else {
+            panic!("expected entry record payload, got {payload:?}");
+        };
+        assert_eq!(
+            component_record_string(fields, "name").unwrap(),
+            expected_name
+        );
+        assert!(matches!(
+            component_record_field(fields, "kind").unwrap(),
+            ComponentVal::Enum(kind) if kind == expected_kind
+        ));
+        assert_eq!(
+            component_record_field(fields, "mode").unwrap(),
+            &ComponentVal::U32(expected_mode)
+        );
     }
 
     fn assert_component_ok_string_list(value: &ComponentVal, expected: &[&str]) {

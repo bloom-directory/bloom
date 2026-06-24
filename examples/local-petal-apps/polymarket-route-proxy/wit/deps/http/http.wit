@@ -1,0 +1,18 @@
+package bloom:http@0.1.0;
+
+interface fetch {
+  record request {
+    method: string,
+    url: string,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+  }
+
+  record response {
+    status: u16,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+  }
+
+  fetch: func(req: request) -> result<response, string>;
+}

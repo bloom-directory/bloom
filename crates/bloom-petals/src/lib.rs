@@ -34,7 +34,7 @@ pub use abi::{
 };
 pub use chain_vm::{BlockCtx, ChainCallInput, ChainCallOutput, ChainCtx, ChainEntry, LogEntry};
 pub use error::PetalError;
-pub use host::{DenyHost, HostError, PetalHost};
+pub use host::{DenyHost, HostError, HostVfsEntry, HostVfsEntryKind, PetalHost};
 pub use meta::{Capability, PetalMeta, PetalMode};
 pub use policy::NetPolicy;
 pub use private_store::PrivateStore;

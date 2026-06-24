@@ -1,0 +1,15 @@
+package bloom:chain@0.1.0;
+
+interface read {
+  record request {
+    chain: string,
+    method: string,
+    params-json: string,
+  }
+
+  record response {
+    result-json: string,
+  }
+
+  call: func(req: request) -> result<response, string>;
+}

@@ -11,6 +11,22 @@ use async_trait::async_trait;
 use crate::abi::{ChainRequest, ChainResponse, HttpRequest, HttpResponse, SignRequest};
 use crate::policy::NetPolicy;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostVfsEntryKind {
+    Dir,
+    File,
+    Symlink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostVfsEntry {
+    pub name: String,
+    pub kind: HostVfsEntryKind,
+    pub mode: u32,
+    pub size: Option<u64>,
+    pub link_target: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
     #[error("not found: {0}")]
@@ -37,11 +53,14 @@ impl HostError {
 
 #[async_trait]
 pub trait PetalHost: Send + Sync {
+    /// Look up an entry at `path` from the surrounding VFS.
+    async fn vfs_lookup(&self, path: &str) -> Result<HostVfsEntry, HostError>;
+
     /// Read the file at `path` from the surrounding VFS.
     async fn vfs_read(&self, path: &str) -> Result<Vec<u8>, HostError>;
 
-    /// List child entry names at `path` from the surrounding VFS.
-    async fn vfs_list(&self, path: &str) -> Result<Vec<String>, HostError>;
+    /// List child entries at `path` from the surrounding VFS.
+    async fn vfs_list(&self, path: &str) -> Result<Vec<HostVfsEntry>, HostError>;
 
     /// Write `bytes` to the writable file at `path` in the surrounding
     /// VFS.
@@ -77,10 +96,13 @@ pub struct DenyHost;
 
 #[async_trait]
 impl PetalHost for DenyHost {
+    async fn vfs_lookup(&self, _path: &str) -> Result<HostVfsEntry, HostError> {
+        Err(HostError::Denied("DenyHost".into()))
+    }
     async fn vfs_read(&self, _path: &str) -> Result<Vec<u8>, HostError> {
         Err(HostError::Denied("DenyHost".into()))
     }
-    async fn vfs_list(&self, _path: &str) -> Result<Vec<String>, HostError> {
+    async fn vfs_list(&self, _path: &str) -> Result<Vec<HostVfsEntry>, HostError> {
         Err(HostError::Denied("DenyHost".into()))
     }
     async fn vfs_write(&self, _path: &str, _bytes: &[u8]) -> Result<(), HostError> {
