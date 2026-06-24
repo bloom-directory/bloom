@@ -389,3 +389,74 @@ fn map_petal_err(e: PetalError) -> HandlerError {
         )),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bloom_vfs::{Handler, Vfs, VfsPath};
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::host::DenyHost;
+    use crate::registry::NameRegistry;
+    use crate::store::PetalStore;
+    use crate::vm::PetalVm;
+
+    fn runner() -> (TempDir, PetalRunner) {
+        let dir = TempDir::new().unwrap();
+        let store = PetalStore::open(dir.path().join("store")).unwrap();
+        let reg = Arc::new(NameRegistry::open(dir.path().join("reg")).unwrap());
+        let vm = PetalVm::new().unwrap();
+        (dir, PetalRunner::new(store, reg, vm))
+    }
+
+    fn write_package_file(root: &std::path::Path, rel: &str, body: &[u8]) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn write_demo_package(root: &std::path::Path) {
+        write_package_file(
+            root,
+            "petal.toml",
+            br#"schema = "bloom.petal.local-app.v2"
+name = "demo"
+"#,
+        );
+        write_package_file(root, "README.md", b"# demo");
+        write_package_file(root, "AGENTS.md", b"# demo agents");
+        write_package_file(
+            root,
+            "app/demo/hello.txt.wasm",
+            include_bytes!("../tests/fixtures/route_component_no_imports.wasm"),
+        );
+    }
+
+    #[tokio::test]
+    async fn mounted_apps_vfs_dispatches_installed_v2_routes() {
+        let (dir, runner) = runner();
+        let package = dir.path().join("demo-app");
+        write_demo_package(&package);
+        runner.store().install_app_package_dir(&package).unwrap();
+
+        let router = PetalRouter::new(runner, Arc::new(DenyHost));
+        let vfs = Vfs::builder().mount("apps", Arc::new(router)).build();
+
+        let apps = vfs.list(&VfsPath::parse("/apps").unwrap()).await.unwrap();
+        assert!(apps.iter().any(|entry| entry.name == "demo"));
+
+        let app_entries = vfs
+            .list(&VfsPath::parse("/apps/demo").unwrap())
+            .await
+            .unwrap();
+        assert!(app_entries.iter().any(|entry| entry.name == "hello.txt"));
+
+        let bytes = vfs
+            .read(&VfsPath::parse("/apps/demo/hello.txt").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"component");
+    }
+}

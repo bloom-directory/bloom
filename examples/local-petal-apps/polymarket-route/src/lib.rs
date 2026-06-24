@@ -1,4 +1,5 @@
 #![allow(clippy::too_many_arguments)]
+#![cfg_attr(test, allow(dead_code))]
 
 //! Local Polymarket handler petal.
 //!
@@ -86,6 +87,7 @@ impl Guest for Route {
     }
 }
 
+#[cfg(not(test))]
 export!(Route);
 
 fn component_getrandom(buf: &mut [u8]) -> Result<(), getrandom::Error> {
@@ -310,10 +312,8 @@ mod bloom_petal_sdk {
     }
 
     pub fn store_put_new(key: &str, value: &[u8], secret: bool) -> Result<(), SdkError> {
-        if store_get(key, usize::MAX).is_ok() {
-            return Err(SdkError::Host(HostStatus::Denied));
-        }
-        store_put(key, value, secret)
+        let namespace = namespace_for_key(key, secret);
+        store::put_new(namespace, key, value, namespace == SECRET_NS).map_err(host_err)
     }
 
     pub fn store_del(key: &str) -> Result<(), SdkError> {
@@ -322,12 +322,8 @@ mod bloom_petal_sdk {
     }
 
     pub fn store_del_if_value(key: &str, expected: &[u8]) -> Result<(), SdkError> {
-        match store_get(key, usize::MAX) {
-            Ok(value) if value == expected => store_del(key),
-            Ok(_) => Err(SdkError::Host(HostStatus::Denied)),
-            Err(SdkError::Host(HostStatus::NotFound)) => Ok(()),
-            Err(e) => Err(e),
-        }
+        let namespace = namespace_for_key(key, false);
+        store::delete_if_value(namespace, key, expected).map_err(host_err)
     }
 
     pub fn store_list(prefix: &str, max_bytes: usize) -> Result<Vec<String>, SdkError> {
@@ -5469,6 +5465,34 @@ mod tests {
         }
     }
 
+    fn clob_manifest_allows(method: &str, path: &str) -> bool {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../polymarket/petal.toml")).unwrap();
+        manifest
+            .get("net")
+            .and_then(|net| net.get("allow"))
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|entry| {
+                entry.get("host").and_then(toml::Value::as_str) == Some("clob.polymarket.com")
+                    && entry
+                        .get("methods")
+                        .and_then(toml::Value::as_array)
+                        .is_some_and(|methods| {
+                            methods
+                                .iter()
+                                .any(|allowed| allowed.as_str() == Some(method))
+                        })
+                    && entry
+                        .get("paths")
+                        .and_then(toml::Value::as_array)
+                        .is_some_and(|paths| {
+                            paths.iter().any(|allowed| allowed.as_str() == Some(path))
+                        })
+            })
+    }
+
     #[test]
     fn path_validation_rejects_escape_segments() {
         assert!(validate_relative_path("").is_ok());
@@ -5509,6 +5533,18 @@ mod tests {
             Some(DispatchEntryKind::WritableFile)
         );
         assert_eq!(path_kind("trade/alice/new/extra"), None);
+    }
+
+    #[test]
+    fn manifest_allows_only_required_clob_methods_for_runtime_paths() {
+        assert!(clob_manifest_allows("post", "/auth/builder-api-key"));
+        assert!(clob_manifest_allows("post", "/balance-allowance/update"));
+        assert!(clob_manifest_allows("get", "/balance-allowance"));
+        assert!(clob_manifest_allows("delete", "/order"));
+
+        assert!(!clob_manifest_allows("get", "/auth/builder-api-key"));
+        assert!(!clob_manifest_allows("post", "/data/orders"));
+        assert!(!clob_manifest_allows("delete", "/balance-allowance/update"));
     }
 
     #[test]

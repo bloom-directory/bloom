@@ -2059,7 +2059,9 @@ fn component_import_caps(name: &str) -> Option<&'static [&'static str]> {
         ("bloom:http", "fetch") => Some(&["bloom:http"]),
         ("bloom:store", "kv") => Some(&["bloom:store"]),
         ("bloom:sign", "signing") => Some(&["bloom:sign"]),
-        ("bloom:chain", "read") => Some(&["bloom:chain"]),
+        // Fail closed until the production daemon host mediates chain reads.
+        // The VM can link this interface for future/runtime tests, but v2
+        // install validation must not accept apps that will deny at runtime.
         ("bloom:vfs", "readwrite") => Some(&["bloom:vfs.read", "bloom:vfs.write"]),
         ("bloom:env", "runtime") => Some(&[]),
         _ => None,
@@ -2333,8 +2335,10 @@ enum HostFuncExport {
     HttpFetch,
     StoreGet,
     StorePut,
+    StorePutNew,
     StoreList,
     StoreDelete,
+    StoreDeleteIfValue,
     SignHash,
     ChainCall,
     VfsLookup,
@@ -2423,8 +2427,12 @@ fn host_func_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
         (ComponentHostInterface::HttpFetch, "fetch") => Some(HostFuncExport::HttpFetch),
         (ComponentHostInterface::StoreKv, "get") => Some(HostFuncExport::StoreGet),
         (ComponentHostInterface::StoreKv, "put") => Some(HostFuncExport::StorePut),
+        (ComponentHostInterface::StoreKv, "put-new") => Some(HostFuncExport::StorePutNew),
         (ComponentHostInterface::StoreKv, "list") => Some(HostFuncExport::StoreList),
         (ComponentHostInterface::StoreKv, "delete") => Some(HostFuncExport::StoreDelete),
+        (ComponentHostInterface::StoreKv, "delete-if-value") => {
+            Some(HostFuncExport::StoreDeleteIfValue)
+        }
         (ComponentHostInterface::SignSigning, "sign-hash") => Some(HostFuncExport::SignHash),
         (ComponentHostInterface::ChainRead, "call") => Some(HostFuncExport::ChainCall),
         (ComponentHostInterface::VfsReadwrite, "lookup") => Some(HostFuncExport::VfsLookup),
@@ -2452,7 +2460,9 @@ fn required_host_type_exports(interface: ComponentHostInterface) -> &'static [&'
 fn required_host_func_exports(interface: ComponentHostInterface) -> &'static [&'static str] {
     match interface {
         ComponentHostInterface::HttpFetch => &["fetch"],
-        ComponentHostInterface::StoreKv => &["get", "put", "list", "delete"],
+        ComponentHostInterface::StoreKv => {
+            &["get", "put", "put-new", "list", "delete", "delete-if-value"]
+        }
         ComponentHostInterface::SignSigning => &["sign-hash"],
         ComponentHostInterface::ChainRead => &["call"],
         ComponentHostInterface::VfsReadwrite => &["lookup", "list", "read", "write"],
@@ -2510,6 +2520,18 @@ fn host_func_export_matches(
                 ],
             ) && result_matches(&ty.results, types, HostOkType::Unit)
         }
+        HostFuncExport::StorePutNew => {
+            params_match(
+                params,
+                types,
+                &[
+                    ("namespace", is_string_type),
+                    ("key", is_string_type),
+                    ("value", is_byte_list),
+                    ("secret", is_bool_type),
+                ],
+            ) && result_matches(&ty.results, types, HostOkType::Unit)
+        }
         HostFuncExport::StoreList => {
             params_match(
                 params,
@@ -2522,6 +2544,17 @@ fn host_func_export_matches(
                 params,
                 types,
                 &[("namespace", is_string_type), ("key", is_string_type)],
+            ) && result_matches(&ty.results, types, HostOkType::Unit)
+        }
+        HostFuncExport::StoreDeleteIfValue => {
+            params_match(
+                params,
+                types,
+                &[
+                    ("namespace", is_string_type),
+                    ("key", is_string_type),
+                    ("expected", is_byte_list),
+                ],
             ) && result_matches(&ty.results, types, HostOkType::Unit)
         }
         HostFuncExport::SignHash => {
@@ -4220,6 +4253,24 @@ allowed = ["bloom:http"]
             package.route_index.routes[0].install_metadata.required_caps,
             vec!["bloom:http".to_string()]
         );
+    }
+
+    #[test]
+    fn v2_component_chain_imports_fail_closed_until_host_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_v2_package_with_manifest_and_route(
+            tmp.path(),
+            br#"schema = "bloom.petal.local-app.v2"
+name = "echo"
+[caps]
+allowed = ["bloom:chain"]
+"#,
+            &route_component(&["metadata", "read"], &["bloom:chain/read@0.1.0"]),
+        );
+
+        let err = PreparedAppPackage::from_dir(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("unsupported host item"));
+        assert!(err.to_string().contains("bloom:chain/read@0.1.0"));
     }
 
     #[test]

@@ -12,15 +12,22 @@ Required files:
 
 v2 apps run only `bloom:route@0.1.0` component routes. Component route imports
 are validated against Bloom-owned WIT at build/install time; direct component
-exports are invoked by the component runner. Component routes can call mediated
-`bloom:http/fetch@0.1.0`, `bloom:store/kv@0.1.0`, and
+exports are invoked by the component runner. Each normal file route must export
+the full `route-file` world: `metadata`, `lookup`, `list`, `read`, and `write`.
+Unsupported operations should return `route-error.unsupported`. Component routes
+can call mediated `bloom:http/fetch@0.1.0`, `bloom:store/kv@0.1.0`, and
 `bloom:vfs/readwrite@0.1.0`, and `bloom:sign/signing@0.1.0` imports when the
 package manifest grants the matching capability. Signing routes must also
 declare `[sign].allowed_intents`, and runtime host calls are denied unless the
-requested intent is in that allow-list. `bloom:chain/read@0.1.0` is linked
-through a mediated host adapter and defaults to denied unless the embedding
-host provides chain read support. Package-local shared component imports land
-with composition support.
+requested intent is in that allow-list. `bloom:store/kv@0.1.0` includes atomic
+`put-new` and `delete-if-value` operations for route locks/idempotency.
+`bloom:chain/read@0.1.0` is linked
+through the component runner for future host support, but install validation
+currently rejects it until the daemon mediates production chain reads. Its WIT
+shape is one generic JSON call: `call({ chain, method, params-json }) ->
+{ result-json }`. `bloom:env/runtime@0.1.0` provides mediated runtime utilities
+(`now-ms` and `random-bytes`). Package-local shared component imports land with
+composition support.
 
 Useful commands:
 

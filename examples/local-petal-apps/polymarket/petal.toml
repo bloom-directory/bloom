@@ -19,19 +19,32 @@ paths = ["/positions", "/trades", "/activity"]
 
 [[net.allow]]
 host = "clob.polymarket.com"
-methods = ["get", "post", "delete"]
+methods = ["get"]
 paths = [
-  "/auth/api-key",
   "/auth/derive-api-key",
   "/balance-allowance",
   "/book",
   "/data/orders",
   "/midpoint",
-  "/order",
   "/orders",
   "/price",
   "/spread",
 ]
+
+[[net.allow]]
+host = "clob.polymarket.com"
+methods = ["post"]
+paths = [
+  "/auth/api-key",
+  "/auth/builder-api-key",
+  "/balance-allowance/update",
+  "/order",
+]
+
+[[net.allow]]
+host = "clob.polymarket.com"
+methods = ["delete"]
+paths = ["/order"]
 
 [[net.allow]]
 host = "polymarket.com"

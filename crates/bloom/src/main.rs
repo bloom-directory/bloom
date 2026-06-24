@@ -188,7 +188,7 @@ enum Cmd {
     /// Talk to a running `bloom serve` over its UDS JSON-RPC socket.
     #[command(subcommand)]
     Ipc(IpcCmd),
-    /// Manage wasm petals: install, run, list, name.
+    /// Manage wasm petals: install, app, list, uninstall.
     #[command(subcommand, visible_alias = "petal")]
     Petals(PetalsCmd),
     /// Polymarket: onboard a wallet.

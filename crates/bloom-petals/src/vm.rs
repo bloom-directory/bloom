@@ -739,11 +739,17 @@ fn link_component_host_imports(linker: &mut ComponentLinker<StoreData>) -> anyho
         store.func_new_async("put", |store, params, results| {
             Box::new(async move { component_store_put(store, params, results).await })
         })?;
+        store.func_new_async("put-new", |store, params, results| {
+            Box::new(async move { component_store_put_new(store, params, results).await })
+        })?;
         store.func_new_async("list", |store, params, results| {
             Box::new(async move { component_store_list(store, params, results).await })
         })?;
         store.func_new_async("delete", |store, params, results| {
             Box::new(async move { component_store_delete(store, params, results).await })
+        })?;
+        store.func_new_async("delete-if-value", |store, params, results| {
+            Box::new(async move { component_store_delete_if_value(store, params, results).await })
         })?;
     }
     {
@@ -945,6 +951,62 @@ async fn component_store_put(
     }
 }
 
+async fn component_store_put_new(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    if !store.data().caps.contains(&Capability::Store) {
+        log_denied(store.data(), "component_store_put_new");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("store".into())),
+        );
+    }
+    let [namespace, key, value, secret] = params else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Invalid(
+                "invalid bloom:store.put-new params".into(),
+            )),
+        );
+    };
+    let namespace = match component_string(namespace, "namespace") {
+        Ok(namespace) => namespace,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let key = match component_string(key, "key") {
+        Ok(key) => key,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let value = match component_byte_list(value, "value") {
+        Ok(value) => value,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let secret = match component_bool(secret, "secret") {
+        Ok(secret) => secret,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    if let Err(e) = store_namespace_put_allowed(store.data(), &namespace, secret) {
+        return set_component_result(results, component_host_err(e));
+    }
+    let key = match namespaced_store_key(&namespace, &key) {
+        Ok(key) => key,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let Some(private_store) = store.data().private_store.clone() else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("store unavailable".into())),
+        );
+    };
+    let petal_hash = store.data().petal_hash.clone();
+    match private_store.put_new(&petal_hash, &key, &value, secret) {
+        Ok(()) => set_component_result(results, component_ok(None)),
+        Err(e) => set_component_result(results, component_host_err(e)),
+    }
+}
+
 async fn component_store_list(
     store: StoreContextMut<'_, StoreData>,
     params: &[ComponentVal],
@@ -1020,6 +1082,58 @@ async fn component_store_delete(
     };
     let petal_hash = store.data().petal_hash.clone();
     match private_store.del(&petal_hash, &key) {
+        Ok(()) => set_component_result(results, component_ok(None)),
+        Err(e) => set_component_result(results, component_host_err(e)),
+    }
+}
+
+async fn component_store_delete_if_value(
+    store: StoreContextMut<'_, StoreData>,
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    if !store.data().caps.contains(&Capability::Store) {
+        log_denied(store.data(), "component_store_delete_if_value");
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("store".into())),
+        );
+    }
+    let [namespace, key, expected] = params else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Invalid(
+                "invalid bloom:store.delete-if-value params".into(),
+            )),
+        );
+    };
+    let namespace = match component_string(namespace, "namespace") {
+        Ok(namespace) => namespace,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let key = match component_string(key, "key") {
+        Ok(key) => key,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let expected = match component_byte_list(expected, "expected") {
+        Ok(expected) => expected,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    if let Err(e) = store_namespace_allowed(store.data(), &namespace) {
+        return set_component_result(results, component_host_err(e));
+    }
+    let key = match namespaced_store_key(&namespace, &key) {
+        Ok(key) => key,
+        Err(e) => return set_component_result(results, component_host_err(e)),
+    };
+    let Some(private_store) = store.data().private_store.clone() else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Denied("store unavailable".into())),
+        );
+    };
+    let petal_hash = store.data().petal_hash.clone();
+    match private_store.del_if_value(&petal_hash, &key, &expected) {
         Ok(()) => set_component_result(results, component_ok(None)),
         Err(e) => set_component_result(results, component_host_err(e)),
     }
@@ -2318,6 +2432,64 @@ mod tests {
             std::fs::read(tmp.path().join(VALID_HASH).join("orders/drafts/a.json")).unwrap(),
             b"one"
         );
+
+        let mut put_new_existing = vec![ComponentVal::Bool(false)];
+        component_store_put_new(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("orders".into()),
+                ComponentVal::String("drafts/a.json".into()),
+                component_bytes(b"two".to_vec()),
+                ComponentVal::Bool(false),
+            ],
+            &mut put_new_existing,
+        )
+        .await
+        .unwrap();
+        assert_component_err_contains(&put_new_existing[0], "already exists");
+
+        let mut put_new = vec![ComponentVal::Bool(false)];
+        component_store_put_new(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("orders".into()),
+                ComponentVal::String("locks/a.json".into()),
+                component_bytes(b"lock".to_vec()),
+                ComponentVal::Bool(false),
+            ],
+            &mut put_new,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_none(&put_new[0]);
+
+        let mut delete_wrong_value = vec![ComponentVal::Bool(false)];
+        component_store_delete_if_value(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("orders".into()),
+                ComponentVal::String("locks/a.json".into()),
+                component_bytes(b"other".to_vec()),
+            ],
+            &mut delete_wrong_value,
+        )
+        .await
+        .unwrap();
+        assert_component_err_contains(&delete_wrong_value[0], "value changed");
+
+        let mut delete_if_value = vec![ComponentVal::Bool(false)];
+        component_store_delete_if_value(
+            store.as_context_mut(),
+            &[
+                ComponentVal::String("orders".into()),
+                ComponentVal::String("locks/a.json".into()),
+                component_bytes(b"lock".to_vec()),
+            ],
+            &mut delete_if_value,
+        )
+        .await
+        .unwrap();
+        assert_component_ok_none(&delete_if_value[0]);
 
         let mut get = vec![ComponentVal::Bool(false)];
         component_store_get(
