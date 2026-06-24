@@ -2625,6 +2625,7 @@ dependencies = [
  "bloom-value",
  "bloom-vfs",
  "futures",
+ "getrandom 0.2.17",
  "hex",
  "parking_lot 0.12.5",
  "serde",

@@ -3,11 +3,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 APP="$ROOT/examples/local-petal-apps/polymarket"
-PROXY="$ROOT/examples/local-petal-apps/polymarket-route-proxy"
+ROUTE="$ROOT/examples/local-petal-apps/polymarket-route"
 OUT="$APP/app/polymarket"
 TMP="$ROOT/target/polymarket-v2"
-CORE="$PROXY/target/wasm32-unknown-unknown/release/bloom_polymarket_v2_route_proxy.wasm"
-COMPONENT="$TMP/polymarket-route-proxy.wasm"
+CORE="$ROUTE/target/wasm32-unknown-unknown/release/bloom_polymarket_v2_route.wasm"
+COMPONENT="$TMP/polymarket-route.wasm"
 
 routes=(
   '$index'
@@ -75,7 +75,7 @@ routes=(
 )
 
 cargo build \
-  --manifest-path "$PROXY/Cargo.toml" \
+  --manifest-path "$ROUTE/Cargo.toml" \
   --target wasm32-unknown-unknown \
   --release
 

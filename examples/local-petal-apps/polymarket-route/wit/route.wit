@@ -54,6 +54,7 @@ world route-file {
   import bloom:sign/signing@0.1.0;
   import bloom:chain/read@0.1.0;
   import bloom:vfs/readwrite@0.1.0;
+  import bloom:env/runtime@0.1.0;
 
   export metadata: func(ctx: ctx) -> result<route-meta, route-error>;
   export lookup: func(ctx: ctx) -> result<entry, route-error>;

@@ -33,6 +33,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use wasmtime::component::{Component, Linker as ComponentLinker, Val as ComponentVal};
 use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store, StoreContextMut};
@@ -53,6 +54,7 @@ const DEFAULT_FUEL: u64 = 100_000_000;
 const DEFAULT_MEMORY_PAGES: u32 = 256; // 16 MiB (64 KiB pages).
 const STDOUT_CAP: usize = 1 << 20; // 1 MiB.
 const DEFAULT_HTTP_RESPONSE_CAP: usize = 8 * 1024 * 1024;
+const DEFAULT_RANDOM_BYTES_CAP: u32 = 1024 * 1024;
 pub(crate) const COMPONENT_NOT_A_DIR_CODE: i32 = -101;
 pub(crate) const COMPONENT_UNSUPPORTED_CODE: i32 = -102;
 
@@ -771,6 +773,15 @@ fn link_component_host_imports(linker: &mut ComponentLinker<StoreData>) -> anyho
             Box::new(async move { component_chain_call(store, params, results).await })
         })?;
     }
+    {
+        let mut env = linker.instance("bloom:env/runtime@0.1.0")?;
+        env.func_new_async("now-ms", |_store, _params, results| {
+            Box::new(async move { component_env_now_ms(results).await })
+        })?;
+        env.func_new_async("random-bytes", |_store, params, results| {
+            Box::new(async move { component_env_random_bytes(params, results).await })
+        })?;
+    }
     Ok(())
 }
 
@@ -1226,6 +1237,47 @@ async fn component_vfs_write(
         Ok(()) => set_component_result(results, component_ok(None)),
         Err(e) => set_component_result(results, component_host_err(e)),
     }
+}
+
+async fn component_env_now_ms(results: &mut [ComponentVal]) -> anyhow::Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| anyhow::anyhow!("system time before unix epoch: {e}"))?
+        .as_millis();
+    let now = u64::try_from(now).map_err(|_| anyhow::anyhow!("system time overflow"))?;
+    set_component_result(results, component_ok(Some(ComponentVal::U64(now))))
+}
+
+async fn component_env_random_bytes(
+    params: &[ComponentVal],
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    let [len] = params else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Invalid(
+                "invalid bloom:env.random-bytes params".into(),
+            )),
+        );
+    };
+    let ComponentVal::U32(len) = len else {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Invalid(
+                "invalid bloom:env.random-bytes len".into(),
+            )),
+        );
+    };
+    if *len > DEFAULT_RANDOM_BYTES_CAP {
+        return set_component_result(
+            results,
+            component_host_err(HostError::Invalid("random-bytes length too large".into())),
+        );
+    }
+    let mut bytes = vec![0u8; *len as usize];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("random-bytes unavailable: {e}"))?;
+    set_component_result(results, component_ok(Some(component_bytes(bytes))))
 }
 
 fn set_component_result(results: &mut [ComponentVal], val: ComponentVal) -> anyhow::Result<()> {

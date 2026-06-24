@@ -2061,6 +2061,7 @@ fn component_import_caps(name: &str) -> Option<&'static [&'static str]> {
         ("bloom:sign", "signing") => Some(&["bloom:sign"]),
         ("bloom:chain", "read") => Some(&["bloom:chain"]),
         ("bloom:vfs", "readwrite") => Some(&["bloom:vfs.read", "bloom:vfs.write"]),
+        ("bloom:env", "runtime") => Some(&[]),
         _ => None,
     }
 }
@@ -2072,6 +2073,7 @@ enum ComponentHostInterface {
     SignSigning,
     ChainRead,
     VfsReadwrite,
+    EnvRuntime,
 }
 
 fn component_host_interface(name: &str) -> Option<ComponentHostInterface> {
@@ -2085,6 +2087,7 @@ fn component_host_interface(name: &str) -> Option<ComponentHostInterface> {
         ("bloom:sign", "signing") => Some(ComponentHostInterface::SignSigning),
         ("bloom:chain", "read") => Some(ComponentHostInterface::ChainRead),
         ("bloom:vfs", "readwrite") => Some(ComponentHostInterface::VfsReadwrite),
+        ("bloom:env", "runtime") => Some(ComponentHostInterface::EnvRuntime),
         _ => None,
     }
 }
@@ -2338,6 +2341,8 @@ enum HostFuncExport {
     VfsList,
     VfsRead,
     VfsWrite,
+    EnvNowMs,
+    EnvRandomBytes,
 }
 
 fn is_host_interface_instance<'a>(
@@ -2426,6 +2431,10 @@ fn host_func_export(interface: ComponentHostInterface, name: &str) -> Option<Hos
         (ComponentHostInterface::VfsReadwrite, "list") => Some(HostFuncExport::VfsList),
         (ComponentHostInterface::VfsReadwrite, "read") => Some(HostFuncExport::VfsRead),
         (ComponentHostInterface::VfsReadwrite, "write") => Some(HostFuncExport::VfsWrite),
+        (ComponentHostInterface::EnvRuntime, "now-ms") => Some(HostFuncExport::EnvNowMs),
+        (ComponentHostInterface::EnvRuntime, "random-bytes") => {
+            Some(HostFuncExport::EnvRandomBytes)
+        }
         _ => None,
     }
 }
@@ -2435,6 +2444,7 @@ fn required_host_type_exports(interface: ComponentHostInterface) -> &'static [&'
         ComponentHostInterface::HttpFetch => &["request", "response"],
         ComponentHostInterface::ChainRead => &["request", "response"],
         ComponentHostInterface::VfsReadwrite => &["entry-kind", "entry"],
+        ComponentHostInterface::EnvRuntime => &[],
         ComponentHostInterface::StoreKv | ComponentHostInterface::SignSigning => &[],
     }
 }
@@ -2446,6 +2456,7 @@ fn required_host_func_exports(interface: ComponentHostInterface) -> &'static [&'
         ComponentHostInterface::SignSigning => &["sign-hash"],
         ComponentHostInterface::ChainRead => &["call"],
         ComponentHostInterface::VfsReadwrite => &["lookup", "list", "read", "write"],
+        ComponentHostInterface::EnvRuntime => &["now-ms", "random-bytes"],
     }
 }
 
@@ -2547,6 +2558,13 @@ fn host_func_export_matches(
                 &[("path", is_string_type), ("body", is_byte_list)],
             ) && result_matches(&ty.results, types, HostOkType::Unit)
         }
+        HostFuncExport::EnvNowMs => {
+            params.is_empty() && result_matches(&ty.results, types, HostOkType::U64)
+        }
+        HostFuncExport::EnvRandomBytes => {
+            params_match(params, types, &[("len", is_u32_type)])
+                && result_matches(&ty.results, types, HostOkType::Bytes)
+        }
     }
 }
 
@@ -2576,6 +2594,7 @@ enum HostOkType {
     ChainResponse,
     VfsEntry,
     VfsEntryList,
+    U64,
 }
 
 fn result_matches(
@@ -2599,6 +2618,7 @@ fn result_matches(
             (HostOkType::ChainResponse, Some(ty)) => is_chain_response(ty, types, depth),
             (HostOkType::VfsEntry, Some(ty)) => is_route_entry(ty, types, depth),
             (HostOkType::VfsEntryList, Some(ty)) => is_list_of(ty, types, is_route_entry, depth),
+            (HostOkType::U64, Some(ty)) => is_u64(ty, types, depth),
             _ => false,
         };
         ok_matches && err.is_some_and(|ty| is_string(&ty))
@@ -2867,6 +2887,10 @@ fn is_u32(ty: &ComponentValType) -> bool {
         ty,
         ComponentValType::Primitive(ComponentPrimitiveValType::U32)
     )
+}
+
+fn is_u32_type(ty: &ComponentValType, _types: &[ComponentTypeEntry<'_>], _depth: usize) -> bool {
+    is_u32(ty)
 }
 
 fn is_u64(ty: &ComponentValType, _types: &[ComponentTypeEntry<'_>], _depth: usize) -> bool {

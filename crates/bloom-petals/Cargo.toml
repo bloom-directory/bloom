@@ -29,6 +29,7 @@ tracing.workspace = true
 blake3.workspace = true
 hex.workspace = true
 parking_lot.workspace = true
+getrandom = "0.2"
 wasmtime.workspace = true
 wasmtime-wasi.workspace = true
 wat.workspace = true
