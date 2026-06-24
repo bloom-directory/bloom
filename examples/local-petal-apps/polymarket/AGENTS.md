@@ -6,5 +6,5 @@
   signing, and mediated wallet/chain VFS imports, but it must not delegate to
   the legacy native `polymarket/...` VFS handler.
 - After changing `../polymarket-route/src/lib.rs` or the route list, run
-  `examples/local-petal-apps/build-polymarket-v2.sh` and commit the regenerated
-  `.wasm` artifacts.
+  `examples/local-petal-apps/build-polymarket-v2.sh` to regenerate local route
+  artifacts for validation. Do not commit generated `.wasm` artifacts.

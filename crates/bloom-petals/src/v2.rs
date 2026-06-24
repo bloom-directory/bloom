@@ -3273,8 +3273,27 @@ name = "echo"
     fn polymarket_v2_example_package_validates() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
-            .join("examples/local-petal-apps/polymarket");
-        let package = PreparedAppPackage::from_dir(&root).unwrap();
+            .canonicalize()
+            .unwrap();
+        let source = root.join("examples/local-petal-apps/polymarket");
+        let tmp = tempfile::tempdir().unwrap();
+        for file in ["petal.toml", "README.md", "AGENTS.md"] {
+            std::fs::copy(source.join(file), tmp.path().join(file)).unwrap();
+        }
+
+        let output = std::process::Command::new("bash")
+            .arg(root.join("examples/local-petal-apps/build-polymarket-v2.sh"))
+            .env("POLYMARKET_APP_DIR", tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "polymarket v2 build failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let package = PreparedAppPackage::from_dir(tmp.path()).unwrap();
 
         assert_eq!(package.name, "polymarket");
         assert_eq!(package.route_index.routes.len(), 62);

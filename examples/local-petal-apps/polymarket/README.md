@@ -10,8 +10,11 @@ relayer signatures, and reads mediated wallet/chain state through the host VFS
 imports. It uses only the v2 route ABI and does not delegate to the legacy
 native `polymarket/...` VFS handler.
 
-Regenerate the checked-in route components with:
+Generate the route components with:
 
 ```sh
 examples/local-petal-apps/build-polymarket-v2.sh
 ```
+
+The generated `app/polymarket/**/*.wasm` files are ignored build output and
+should not be committed.

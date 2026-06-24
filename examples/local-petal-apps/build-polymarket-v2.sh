@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-APP="$ROOT/examples/local-petal-apps/polymarket"
+APP="${POLYMARKET_APP_DIR:-$ROOT/examples/local-petal-apps/polymarket}"
 ROUTE="$ROOT/examples/local-petal-apps/polymarket-route"
 OUT="$APP/app/polymarket"
 TMP="$ROOT/target/polymarket-v2"
