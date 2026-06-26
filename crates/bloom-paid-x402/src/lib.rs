@@ -65,13 +65,13 @@ impl X402PaymentSigner for KeystoreX402PaymentSigner {
         let candidate = select_candidate(&payment_required, signer).ok_or_else(|| {
             "x402 upstream signer found no matching EIP-155 exact payment option".to_string()
         })?;
-        if let Some(network) = ctx.requirement.network.as_deref() {
-            if !x402_network_matches(&candidate.chain_id, network) {
-                let candidate_network = candidate.chain_id.to_string();
-                return Err(format!(
-                    "x402 selected network {candidate_network}, expected staged network {network}"
-                ));
-            }
+        if let Some(network) = ctx.requirement.network.as_deref()
+            && !x402_network_matches(&candidate.chain_id, network)
+        {
+            let candidate_network = candidate.chain_id.to_string();
+            return Err(format!(
+                "x402 selected network {candidate_network}, expected staged network {network}"
+            ));
         }
         if let Some(asset) = ctx.requirement.asset.as_deref()
             && !candidate.asset.eq_ignore_ascii_case(asset)

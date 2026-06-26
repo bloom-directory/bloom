@@ -530,6 +530,9 @@ enum RequestCmd {
     /// Confirm a pending paid request.
     Confirm {
         id: String,
+        /// Confirmation text to write. Use the wallet policy override sentinel to accept soft warnings.
+        #[arg(long, default_value = "confirm")]
+        confirm_text: String,
         /// Unlock this wallet for confirmation when signing is required.
         #[arg(long)]
         unlock_wallet: Option<String>,
@@ -1033,10 +1036,12 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Request(RequestCmd::Confirm {
             id,
+            confirm_text,
             unlock_wallet,
             passphrase,
         }) => {
             let path = VfsPath::parse(&format!("/requests/{id}/confirm"))?;
+            let confirm_bytes = confirm_text.into_bytes();
             if let Some(wallet) = unlock_wallet {
                 let client = IpcClient::new(&client_endpoint.socket);
                 let ipc_res = try_ipc(
@@ -1045,7 +1050,7 @@ async fn run(cli: Cli) -> Result<()> {
                     "write_unlocked",
                     serde_json::json!({
                         "path": format!("/requests/{id}/confirm"),
-                        "bytes_b64": B64.encode(b"confirm"),
+                        "bytes_b64": B64.encode(&confirm_bytes),
                         "wallet": &wallet,
                         "passphrase": passphrase.as_deref(),
                     }),
@@ -1074,7 +1079,7 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 d.vfs
-                    .write(&path, b"confirm")
+                    .write(&path, &confirm_bytes)
                     .await
                     .context("request confirm")?;
                 return Ok(());
@@ -1082,7 +1087,7 @@ async fn run(cli: Cli) -> Result<()> {
 
             let (_home_permit, d) = build_write_daemon(home)?;
             d.vfs
-                .write(&path, b"confirm")
+                .write(&path, &confirm_bytes)
                 .await
                 .context("request confirm")?;
             Ok(())
@@ -2231,15 +2236,14 @@ fn request_body_with_wallet(mut request: String, wallet: Option<&str>) -> String
     };
     if let Ok(mut value) = toml::from_str::<toml::Value>(&request)
         && value.get("url").and_then(|v| v.as_str()).is_some()
+        && let Some(table) = value.as_table_mut()
     {
-        if let Some(table) = value.as_table_mut() {
-            table.insert("wallet".into(), toml::Value::String(wallet.into()));
-            return toml::to_string_pretty(&value).unwrap_or_else(|_| {
-                request.push('\n');
-                request.push_str(&format!("wallet = \"{wallet}\""));
-                request
-            });
-        }
+        table.insert("wallet".into(), toml::Value::String(wallet.into()));
+        return toml::to_string_pretty(&value).unwrap_or_else(|_| {
+            request.push('\n');
+            request.push_str(&format!("wallet = \"{wallet}\""));
+            request
+        });
     }
     let Some(first_newline) = request.find('\n') else {
         request.push(' ');

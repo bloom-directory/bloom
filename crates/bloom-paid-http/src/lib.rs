@@ -492,6 +492,7 @@ pub fn evaluate_payment_policy(policy: &Policy, input: PolicyEvalInput<'_>) -> V
     let host = input.host.to_ascii_lowercase();
     let asset = input.asset;
     let network = input.network;
+    let network_aliases = network_aliases(network);
     let amount_usd = input.amount_usd;
     push_check(
         &mut out,
@@ -542,10 +543,12 @@ pub fn evaluate_payment_policy(policy: &Policy, input: PolicyEvalInput<'_>) -> V
         }
     }
     if let Some(network) = network {
-        if contains_ci(&payments.networks.deny, network) {
+        if contains_network(&payments.networks.deny, &network_aliases) {
             out.push(deny("payments.networks.deny", format!("{network} denied")));
         }
-        if !payments.networks.allow.is_empty() && !contains_ci(&payments.networks.allow, network) {
+        if !payments.networks.allow.is_empty()
+            && !contains_network(&payments.networks.allow, &network_aliases)
+        {
             out.push(deny(
                 "payments.networks.allow",
                 format!("{network} not allowed"),
@@ -700,6 +703,55 @@ fn deny(rule: &str, detail: impl Into<String>) -> PolicyCheck {
 fn contains_ci(set: &std::collections::BTreeSet<String>, needle: &str) -> bool {
     set.iter().any(|v| v.eq_ignore_ascii_case(needle))
 }
+
+fn contains_network(set: &std::collections::BTreeSet<String>, aliases: &[String]) -> bool {
+    set.iter()
+        .any(|v| aliases.iter().any(|alias| v.eq_ignore_ascii_case(alias)))
+}
+
+fn network_aliases(network: Option<&str>) -> Vec<String> {
+    let Some(network) = network else {
+        return Vec::new();
+    };
+    let mut out = vec![network.to_string()];
+    let lower = network.to_ascii_lowercase();
+    match lower.as_str() {
+        "base" | "base-mainnet" | "eip155:8453" | "8453" => {
+            out.extend([
+                "base".into(),
+                "base-mainnet".into(),
+                "eip155:8453".into(),
+                "8453".into(),
+            ]);
+        }
+        "ethereum" | "mainnet" | "eip155:1" | "1" => {
+            out.extend([
+                "ethereum".into(),
+                "mainnet".into(),
+                "eip155:1".into(),
+                "1".into(),
+            ]);
+        }
+        "polygon" | "matic" | "eip155:137" | "137" => {
+            out.extend([
+                "polygon".into(),
+                "matic".into(),
+                "eip155:137".into(),
+                "137".into(),
+            ]);
+        }
+        _ => {
+            if let Some(reference) = lower.strip_prefix("eip155:") {
+                out.push(reference.to_string());
+            } else if lower.chars().all(|c| c.is_ascii_digit()) {
+                out.push(format!("eip155:{lower}"));
+            }
+        }
+    }
+    out.sort_by_key(|v| v.to_ascii_lowercase());
+    out.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    out
+}
 fn min_cap<const N: usize>(values: [Option<f64>; N]) -> Option<f64> {
     values.into_iter().flatten().reduce(f64::min)
 }
@@ -718,8 +770,8 @@ pub fn json_number(v: &serde_json::Value) -> Option<f64> {
 
 pub fn select_payment_requirement(
     challenge: &NormalizedChallenge,
-    policy: &Policy,
-    host: &str,
+    _policy: &Policy,
+    _host: &str,
 ) -> Option<PaymentRequirement> {
     let candidates = if challenge.accepts.is_empty() {
         vec![PaymentRequirement {
@@ -734,22 +786,23 @@ pub fn select_payment_requirement(
     } else {
         challenge.accepts.clone()
     };
-    candidates.into_iter().find(|req| {
-        !evaluate_payment_policy(
-            policy,
-            PolicyEvalInput {
-                host,
-                asset: req.asset.as_deref(),
-                network: req.network.as_deref(),
-                intent: &challenge.intent,
-                amount_usd: challenge.amount_usd,
-                request_max_amount_usd: None,
-                spent_24h_usd: 0.0,
-            },
-        )
-        .iter()
-        .any(|c| c.result == "deny")
-    })
+    candidates.into_iter().find(signer_supports_requirement)
+}
+
+pub fn payment_requirement_amount_usd(req: &PaymentRequirement) -> Option<f64> {
+    req.raw
+        .get("amountUsd")
+        .and_then(json_number)
+        .or_else(|| req.raw.get("amount_usd").and_then(json_number))
+        .or_else(|| parse_payment_amount_usd(req.asset.as_deref(), req.amount.as_deref()))
+}
+
+pub fn signer_supports_requirement(req: &PaymentRequirement) -> bool {
+    let Some(scheme) = req.scheme.as_deref() else {
+        return true;
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    scheme.contains("exact") && (scheme.contains("eip155") || req.network.is_some())
 }
 
 pub fn evaluate_session_policy(

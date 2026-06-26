@@ -12,7 +12,7 @@ use bloom_paid_http::{
     EmptyPaidHttpChainRpcResolver, NormalizedChallenge, PaidHttpChainRpcResolver, ParsedRequest,
     PaymentRequirement, PolicyCheck, PolicyEvalInput, evaluate_payment_policy,
     evaluate_session_policy, json_number, normalize_challenge, paid_http_intent_label, parse_money,
-    parse_request, select_payment_requirement, trim_money,
+    parse_request, payment_requirement_amount_usd, select_payment_requirement, trim_money,
 };
 use bloom_paid_mpp::{PaymentBackend, RealMppBackend};
 use bloom_paid_x402::{
@@ -166,9 +166,27 @@ impl RequestsHandler {
             .to_vec();
 
         if status == 402 {
-            let challenge = normalize_challenge(&headers, &body, &request.url);
+            let mut challenge = normalize_challenge(&headers, &body, &request.url);
             let policy = self.wallet_policy(&wallet)?;
             let spent_24h_usd = self.sum_paid_usd_last_24h(&wallet)?;
+            let selected_requirement = if challenge.protocol == "x402" {
+                let selected =
+                    select_payment_requirement(&challenge, &policy, &host).ok_or_else(|| {
+                        HandlerError::invalid(
+                            "no signer-supported x402 payment requirement satisfies wallet policy",
+                        )
+                    })?;
+                challenge.network = selected.network.clone();
+                challenge.asset = selected.asset.clone();
+                challenge.amount = selected.amount.clone();
+                Some(selected)
+            } else {
+                None
+            };
+            let policy_amount_usd = selected_requirement
+                .as_ref()
+                .and_then(payment_requirement_amount_usd)
+                .or(challenge.amount_usd);
             let mut checks = evaluate_payment_policy(
                 &policy,
                 PolicyEvalInput {
@@ -176,7 +194,7 @@ impl RequestsHandler {
                     asset: challenge.asset.as_deref(),
                     network: challenge.network.as_deref(),
                     intent: &challenge.intent,
-                    amount_usd: challenge.amount_usd,
+                    amount_usd: policy_amount_usd,
                     request_max_amount_usd: request.max_amount_usd,
                     spent_24h_usd,
                 },
@@ -199,10 +217,11 @@ impl RequestsHandler {
             let dir = self.req_dir("pending", &id);
             fs::create_dir_all(dir.join("response"))?;
             write_request_artifacts(&dir, &request, &wallet, "pending")?;
+            write_private_replay_request(&dir, &request)?;
             fs::write(dir.join("status"), b"pending\n")?;
             write_json(dir.join("dry_run.json"), &json!({"dry_run": dry_run}))?;
             fs::write(dir.join("challenge.raw"), &body)?;
-            write_json(dir.join("challenge.json"), &challenge)?;
+            write_json(dir.join("challenge.json"), &redacted_challenge(&challenge))?;
             write_json(dir.join("payment_method.json"), &challenge.payment_method())?;
             write_json(dir.join("policy_check.json"), &checks)?;
             fs::write(
@@ -393,37 +412,14 @@ impl RequestsHandler {
                 "dry-run paid requests are non-confirmable; stage the request through /requests/new to spend or sign",
             ));
         }
-        let request_json: serde_json::Value = read_json(pending.join("request.toml"))?;
-        let request = ParsedRequest {
-            method: request_json
-                .get("method")
-                .and_then(|v| v.as_str())
-                .unwrap_or("GET")
-                .to_string(),
-            url: Url::parse(
-                request_json
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| HandlerError::backend("request.toml missing url"))?,
-            )
-            .map_err(|e| HandlerError::backend(format!("stored request url: {e}")))?,
-            wallet: request_json
-                .get("wallet")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            max_amount_usd: request_json.get("max_amount_usd").and_then(|v| v.as_f64()),
-            headers: serde_json::from_value(
-                request_json
-                    .get("headers")
-                    .cloned()
-                    .unwrap_or_else(|| json!({})),
-            )
-            .map_err(|e| HandlerError::backend(format!("stored request headers: {e}")))?,
-            body: request_json
-                .get("body")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-        };
+        let mut request_json: serde_json::Value = read_json(pending.join("request.toml"))?;
+        if let (Ok(private_replay), Some(obj)) = (
+            read_json::<serde_json::Value>(pending.join("private/request_replay.json")),
+            request_json.as_object_mut(),
+        ) {
+            obj.insert("_private_replay".to_string(), private_replay);
+        }
+        let request = parsed_request_from_artifact(&request_json)?;
         let wallet = request
             .wallet
             .as_deref()
@@ -504,6 +500,8 @@ impl RequestsHandler {
         challenge.network = requirement.network.clone();
         challenge.asset = requirement.asset.clone();
         challenge.amount = requirement.amount.clone();
+        let policy_amount_usd =
+            payment_requirement_amount_usd(&requirement).or(challenge.amount_usd);
         let checks = evaluate_payment_policy(
             &policy,
             PolicyEvalInput {
@@ -511,7 +509,7 @@ impl RequestsHandler {
                 asset: challenge.asset.as_deref(),
                 network: challenge.network.as_deref(),
                 intent: &challenge.intent,
-                amount_usd: challenge.amount_usd,
+                amount_usd: policy_amount_usd,
                 request_max_amount_usd: request.max_amount_usd,
                 spent_24h_usd: self.sum_paid_usd_last_24h(&wallet)?,
             },
@@ -666,6 +664,7 @@ impl RequestsHandler {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fail_signed_x402_request(
         &self,
         id: &str,
@@ -748,7 +747,7 @@ impl RequestsHandler {
 impl Handler for RequestsHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
         let segs = path.segments();
-        validate_vfs_segments(&segs)?;
+        validate_vfs_segments(segs)?;
         match segs {
             [] => Ok(Entry::dir("requests")),
             [one] if one == "new" || one == "new.dry-run" => Ok(Entry::writable_file(one)),
@@ -793,7 +792,7 @@ impl Handler for RequestsHandler {
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         self.ensure_layout()?;
         let segs = path.segments();
-        validate_vfs_segments(&segs)?;
+        validate_vfs_segments(segs)?;
         match segs {
             [] => Ok(vec![
                 Entry::writable_file("new"),
@@ -825,7 +824,7 @@ impl Handler for RequestsHandler {
 
     async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let segs = path.segments();
-        validate_vfs_segments(&segs)?;
+        validate_vfs_segments(segs)?;
         match segs {
             [one] if one == "latest" => {
                 let (state, id) = self.read_latest()?;
@@ -866,7 +865,7 @@ impl Handler for RequestsHandler {
 
     async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
         let segs = path.segments();
-        validate_vfs_segments(&segs)?;
+        validate_vfs_segments(segs)?;
         match segs {
             [one] if one == "new" || one == "new.dry-run" => {
                 self.create_request(data, one == "new.dry-run").await?;
@@ -970,7 +969,13 @@ async fn confirm_with_backend(
         )));
     }
     let challenge: NormalizedChallenge = read_json(pending.join("challenge.json"))?;
-    let request_value: serde_json::Value = read_json(pending.join("request.toml"))?;
+    let mut request_value: serde_json::Value = read_json(pending.join("request.toml"))?;
+    if let (Ok(private_replay), Some(obj)) = (
+        read_json::<serde_json::Value>(pending.join("private/request_replay.json")),
+        request_value.as_object_mut(),
+    ) {
+        obj.insert("_private_replay".to_string(), private_replay);
+    }
     let request = parsed_request_from_artifact(&request_value)?;
     let wallet = request_value
         .get("wallet")
@@ -985,6 +990,23 @@ async fn confirm_with_backend(
             &fallback_policy
         }
     };
+    if pending.join("signed_credential.json").exists() {
+        return Err(HandlerError::invalid(
+            "this pending request already minted a payment credential; cancel and stage a fresh request instead of re-confirming",
+        ));
+    }
+    if backend.name() == "mpp_tempo" {
+        write_json(
+            pending.join("signed_credential.json"),
+            &json!({
+                "request_id": id,
+                "protocol": challenge.protocol,
+                "backend": backend.name(),
+                "credential_material": "redacted",
+                "single_use_retry_started": true,
+            }),
+        )?;
+    }
     let execution = backend
         .confirm(&challenge, &request, &wallet, policy, id)
         .await
@@ -1070,17 +1092,27 @@ fn parsed_request_from_artifact(v: &serde_json::Value) -> Result<ParsedRequest, 
         .get("url")
         .and_then(|v| v.as_str())
         .ok_or_else(|| HandlerError::backend("request artifact missing url"))?;
-    let headers = v
+    let replay = v
+        .get("_private_replay")
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Null);
+    let headers = replay
         .get("headers")
+        .or_else(|| v.get("headers"))
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
+    let body = replay
+        .get("body")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| v.get("body").and_then(|v| v.as_str()).map(str::to_string));
     Ok(ParsedRequest {
         method,
         url: Url::parse(url).map_err(|e| HandlerError::backend(format!("stored url: {e}")))?,
         wallet: v.get("wallet").and_then(|v| v.as_str()).map(str::to_string),
         max_amount_usd: v.get("max_amount_usd").and_then(|v| v.as_f64()),
         headers,
-        body: v.get("body").and_then(|v| v.as_str()).map(str::to_string),
+        body,
     })
 }
 
@@ -1220,6 +1252,25 @@ fn render_plan(
     }
 }
 
+fn redacted_challenge(challenge: &NormalizedChallenge) -> NormalizedChallenge {
+    let mut redacted = challenge.clone();
+    redacted.headers = redacted
+        .headers
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                if is_sensitive_response_header(k) {
+                    "redacted".to_string()
+                } else {
+                    v.clone()
+                },
+            )
+        })
+        .collect();
+    redacted
+}
+
 fn write_request_artifacts(
     dir: &Path,
     req: &ParsedRequest,
@@ -1248,13 +1299,25 @@ fn write_request_artifacts(
         };
         http.push_str(&format!("{k}: {value}\n"));
     }
-    if let Some(body) = &req.body {
+    if req.body.is_some() {
         http.push('\n');
-        http.push_str(body);
-        http.push('\n');
+        http.push_str("[body redacted; private replay copy retained for confirm]\n");
     }
     fs::write(dir.join("request.http"), http)?;
     Ok(())
+}
+
+fn write_private_replay_request(dir: &Path, req: &ParsedRequest) -> Result<(), HandlerError> {
+    fs::create_dir_all(dir.join("private"))?;
+    write_json(
+        dir.join("private/request_replay.json"),
+        &json!({
+            "method": req.method,
+            "url": req.url.as_str(),
+            "headers": req.headers,
+            "body": req.body,
+        }),
+    )
 }
 
 fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
@@ -1297,6 +1360,7 @@ fn is_sensitive_request_header(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "authorization"
             | "proxy-authorization"
+            | "cookie"
             | "x-payment"
             | "payment-signature"
             | "x-api-key"
