@@ -11,8 +11,8 @@ use bloom_keystore::Keystore;
 use bloom_paid_http::{
     EmptyPaidHttpChainRpcResolver, NormalizedChallenge, PaidHttpChainRpcResolver, ParsedRequest,
     PaymentRequirement, PolicyCheck, PolicyEvalInput, evaluate_payment_policy,
-    evaluate_session_policy, headers_to_string_map, json_number, normalize_challenge,
-    paid_http_intent_label, parse_money, parse_request, select_payment_requirement, trim_money,
+    evaluate_session_policy, json_number, normalize_challenge, paid_http_intent_label, parse_money,
+    parse_request, select_payment_requirement, trim_money,
 };
 use bloom_paid_mpp::{PaymentBackend, RealMppBackend};
 use bloom_paid_x402::{KeystoreX402PaymentSigner, X402PaymentSigner, X402SignContext};
@@ -139,6 +139,9 @@ impl RequestsHandler {
             request.url.clone(),
         );
         for (k, v) in &request.headers {
+            if is_sensitive_request_header(k) {
+                continue;
+            }
             let name = HeaderName::from_bytes(k.as_bytes())
                 .map_err(|e| HandlerError::invalid(format!("invalid header {k}: {e}")))?;
             let val = HeaderValue::from_str(v)
@@ -646,6 +649,7 @@ impl RequestsHandler {
 impl Handler for RequestsHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
         let segs = path.segments();
+        validate_vfs_segments(&segs)?;
         match segs {
             [] => Ok(Entry::dir("requests")),
             [one] if one == "new" || one == "new.dry-run" => Ok(Entry::writable_file(one)),
@@ -690,6 +694,7 @@ impl Handler for RequestsHandler {
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         self.ensure_layout()?;
         let segs = path.segments();
+        validate_vfs_segments(&segs)?;
         match segs {
             [] => Ok(vec![
                 Entry::writable_file("new"),
@@ -721,6 +726,7 @@ impl Handler for RequestsHandler {
 
     async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let segs = path.segments();
+        validate_vfs_segments(&segs)?;
         match segs {
             [one] if one == "latest" => {
                 let (state, id) = self.read_latest()?;
@@ -761,6 +767,7 @@ impl Handler for RequestsHandler {
 
     async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
         let segs = path.segments();
+        validate_vfs_segments(&segs)?;
         match segs {
             [one] if one == "new" || one == "new.dry-run" => {
                 self.create_request(data, one == "new.dry-run").await?;
@@ -1128,7 +1135,8 @@ fn write_request_artifacts(
             "wallet": wallet,
             "max_amount_usd": req.max_amount_usd,
             "headers": redacted_headers(&req.headers),
-            "body": req.body,
+            "body_redacted": req.body.is_some(),
+            "body_sha256": req.body.as_deref().map(|body| bloom_tools::sha256_hex(body.as_bytes())),
             "state": state
         }),
     )?;
@@ -1151,7 +1159,20 @@ fn write_request_artifacts(
 }
 
 fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
-    json!(headers_to_string_map(headers))
+    json!(
+        headers
+            .iter()
+            .map(|(k, v)| {
+                let name = k.as_str().to_ascii_lowercase();
+                let value = if is_sensitive_response_header(&name) {
+                    "redacted".to_string()
+                } else {
+                    v.to_str().unwrap_or("").to_string()
+                };
+                (name, value)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    )
 }
 
 fn redacted_headers(headers: &std::collections::BTreeMap<String, String>) -> serde_json::Value {
@@ -1185,20 +1206,51 @@ fn is_sensitive_request_header(name: &str) -> bool {
     )
 }
 
+fn is_sensitive_response_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "www-authenticate"
+            | "set-cookie"
+            | "cookie"
+            | "x-payment"
+            | "payment-signature"
+            | "payment-receipt"
+            | "x-api-key"
+            | "api-key"
+            | "apikey"
+    )
+}
+
 fn session_dir_name(raw: &str) -> Result<String, HandlerError> {
     let name = raw.trim();
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains('/')
-        || name.contains('\\')
-        || Path::new(name).is_absolute()
-    {
+    if !is_safe_fs_component(name) {
         return Err(HandlerError::invalid(format!(
             "invalid paid request session id '{raw}'"
         )));
     }
     Ok(name.to_string())
+}
+
+fn is_safe_fs_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !Path::new(name).is_absolute()
+}
+
+fn validate_vfs_segments(segs: &[String]) -> Result<(), HandlerError> {
+    for seg in segs {
+        if !is_safe_fs_component(seg) {
+            return Err(HandlerError::invalid(format!(
+                "invalid paid request path segment '{seg}'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn write_json(path: impl AsRef<Path>, v: &impl Serialize) -> Result<(), HandlerError> {
@@ -1243,11 +1295,12 @@ fn list_entries(path: PathBuf) -> Result<Vec<Entry>, HandlerError> {
     Ok(out)
 }
 fn new_request_id() -> String {
-    let ms = SystemTime::now()
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    format!("req_{ms}")
+        .unwrap_or_default();
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("req_{}_{}_{}", now.as_millis(), now.subsec_nanos(), seq)
 }
 
 #[cfg(test)]
