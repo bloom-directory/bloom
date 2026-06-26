@@ -2174,10 +2174,17 @@ fn request_body_with_wallet(mut request: String, wallet: Option<&str>) -> String
     let Some(wallet) = wallet else {
         return request;
     };
-    if request.trim_start().starts_with("url") || request.trim_start().starts_with("method") {
-        request.push('\n');
-        request.push_str(&format!("wallet = \"{wallet}\""));
-        return request;
+    if let Ok(mut value) = toml::from_str::<toml::Value>(&request)
+        && value.get("url").and_then(|v| v.as_str()).is_some()
+    {
+        if let Some(table) = value.as_table_mut() {
+            table.insert("wallet".into(), toml::Value::String(wallet.into()));
+            return toml::to_string_pretty(&value).unwrap_or_else(|_| {
+                request.push('\n');
+                request.push_str(&format!("wallet = \"{wallet}\""));
+                request
+            });
+        }
     }
     let Some(first_newline) = request.find('\n') else {
         request.push(' ');
@@ -2248,5 +2255,25 @@ mod tests {
             output,
             "GET https://api.example.com/data max_amount_usd=0.05 wallet=gavin"
         );
+    }
+
+    #[test]
+    fn request_wallet_injection_handles_toml_comments_and_reordered_keys() {
+        let output = request_body_with_wallet(
+            concat!(
+                "# paid request\n",
+                "method = \"POST\"\n",
+                "url = \"https://api.example.com/data\"\n",
+                "max_amount_usd = \"0.05\"\n",
+            )
+            .to_string(),
+            Some("gavin"),
+        );
+
+        let parsed: toml::Value = toml::from_str(&output).unwrap();
+        assert_eq!(parsed["url"].as_str(), Some("https://api.example.com/data"));
+        assert_eq!(parsed["method"].as_str(), Some("POST"));
+        assert_eq!(parsed["wallet"].as_str(), Some("gavin"));
+        assert_eq!(parsed["max_amount_usd"].as_str(), Some("0.05"));
     }
 }

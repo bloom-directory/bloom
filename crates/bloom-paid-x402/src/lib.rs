@@ -66,8 +66,8 @@ impl X402PaymentSigner for KeystoreX402PaymentSigner {
             "x402 upstream signer found no matching EIP-155 exact payment option".to_string()
         })?;
         if let Some(network) = ctx.requirement.network.as_deref() {
-            let candidate_network = candidate.chain_id.to_string();
-            if candidate_network != network {
+            if !x402_network_matches(&candidate.chain_id, network) {
+                let candidate_network = candidate.chain_id.to_string();
                 return Err(format!(
                     "x402 selected network {candidate_network}, expected staged network {network}"
                 ));
@@ -157,6 +157,14 @@ fn eip155_chain_id_u64(chain_id: &x402_types::chain::ChainId) -> Option<u64> {
     (chain_id.namespace() == "eip155")
         .then(|| chain_id.reference().parse().ok())
         .flatten()
+}
+
+fn x402_network_matches(candidate: &x402_types::chain::ChainId, staged: &str) -> bool {
+    if candidate.to_string().eq_ignore_ascii_case(staged) {
+        return true;
+    }
+    x402_types::chain::ChainId::from_network_name(staged)
+        .is_some_and(|normalized| normalized == *candidate)
 }
 
 fn wallet_kind_label(kind: WalletKind) -> &'static str {

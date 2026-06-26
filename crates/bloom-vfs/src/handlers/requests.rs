@@ -195,6 +195,7 @@ impl RequestsHandler {
             fs::create_dir_all(dir.join("response"))?;
             write_request_artifacts(&dir, &request, &wallet, "pending")?;
             fs::write(dir.join("status"), b"pending\n")?;
+            write_json(dir.join("dry_run.json"), &json!({"dry_run": dry_run}))?;
             fs::write(dir.join("challenge.raw"), &body)?;
             write_json(dir.join("challenge.json"), &challenge)?;
             write_json(dir.join("payment_method.json"), &challenge.payment_method())?;
@@ -376,6 +377,17 @@ impl RequestsHandler {
         if !pending.exists() {
             return Err(HandlerError::NotFound(format!("/requests/pending/{id}")));
         }
+        let dry_run: serde_json::Value =
+            read_json(pending.join("dry_run.json")).unwrap_or_else(|_| json!({"dry_run": false}));
+        if dry_run
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return Err(HandlerError::invalid(
+                "dry-run paid requests are non-confirmable; stage the request through /requests/new to spend or sign",
+            ));
+        }
         let request_json: serde_json::Value = read_json(pending.join("request.toml"))?;
         let request = ParsedRequest {
             method: request_json
@@ -509,6 +521,11 @@ impl RequestsHandler {
                 "payment policy warning requires override sentinel '{sentinel}'"
             )));
         }
+        if pending.join("signed_credential.json").exists() {
+            return Err(HandlerError::invalid(
+                "this pending request already minted a payment credential; cancel and stage a fresh request instead of re-confirming",
+            ));
+        }
         let credential = self
             .x402_signer
             .sign_x402_payment(&X402SignContext {
@@ -521,6 +538,16 @@ impl RequestsHandler {
             })
             .await
             .map_err(HandlerError::backend)?;
+        write_json(
+            pending.join("signed_credential.json"),
+            &json!({
+                "request_id": id,
+                "protocol": challenge.protocol,
+                "header_name": credential.header_name,
+                "credential_material": "redacted",
+                "single_use_retry_started": true,
+            }),
+        )?;
 
         let mut retry = self.client.request(
             request.method.parse().unwrap_or(reqwest::Method::GET),
@@ -810,6 +837,17 @@ async fn confirm_with_backend(
     let pending = requests_root.join("pending").join(id);
     if !pending.exists() {
         return Err(HandlerError::NotFound(format!("/requests/pending/{id}")));
+    }
+    let dry_run: serde_json::Value =
+        read_json(pending.join("dry_run.json")).unwrap_or_else(|_| json!({"dry_run": false}));
+    if dry_run
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(HandlerError::invalid(
+            "dry-run paid requests are non-confirmable; stage the request through /requests/new to spend or sign",
+        ));
     }
     let checks: Vec<PolicyCheck> = match checks_override {
         Some(checks) => checks,
@@ -1676,6 +1714,22 @@ inline = '{"prompt":"hi"}'
         )
         .unwrap();
         assert!(plan.contains("Dry run: true"));
+        let dry_run: serde_json::Value =
+            read_json(f.handler.req_dir("pending", &id).join("dry_run.json")).unwrap();
+        assert_eq!(dry_run["dry_run"], true);
+        let confirm_err = f
+            .handler
+            .write(
+                &VfsPath::parse(&format!("/pending/{id}/confirm")).unwrap(),
+                b"confirm",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            confirm_err
+                .to_string()
+                .contains("dry-run paid requests are non-confirmable")
+        );
         assert!(plan.contains("Payment method: paid_http:x402/one_time"));
         f.handler
             .write(

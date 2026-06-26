@@ -317,19 +317,18 @@ pub fn normalize_challenge(headers: &HeaderMap, body: &[u8], url: &Url) -> Norma
             .or_else(|| json_f64(&body_json, &["voucherAmountUsd", "amountUsd", "usd"]))
             .or_else(|| parse_payment_amount_usd(asset.as_deref(), amount.as_deref()))
     } else {
-        json_f64(charge, &["amountUsd", "usd"])
-            .or_else(|| json_f64(&body_json, &["amountUsd", "usd"]))
-            .or_else(|| {
-                body_json
-                    .pointer("/accepts/0/amountUsd")
-                    .and_then(json_number)
-            })
+        let requirement_amount_usd = body_json
+            .pointer("/accepts/0/amountUsd")
+            .and_then(json_number)
             .or_else(|| {
                 body_json
                     .pointer("/accepts/0/amount_usd")
                     .and_then(json_number)
             })
-            .or_else(|| parse_payment_amount_usd(asset.as_deref(), amount.as_deref()))
+            .or_else(|| parse_payment_amount_usd(asset.as_deref(), amount.as_deref()));
+        requirement_amount_usd
+            .or_else(|| json_f64(charge, &["amountUsd", "usd"]))
+            .or_else(|| json_f64(&body_json, &["amountUsd", "usd"]))
     };
     let deposit_amount = json_string(session, &["depositAmount", "deposit", "topUpAmount"])
         .or_else(|| json_string(&body_json, &["depositAmount", "deposit", "topUpAmount"]));
@@ -845,9 +844,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "payment-required",
-            HeaderValue::from_static(
-                "eyJ4NDAyVmVyc2lvbiI6MiwiZXJyb3IiOiJQYXltZW50IHJlcXVpcmVkIiwicmVzb3VyY2UiOnsidXJsIjoiaHR0cHM6Ly9hcGkubmFuc2VuLmFpL2FwaS92MS90b2tlbi1zY3JlZW5lciIsImRlc2NyaXB0aW9uIjoiUmV0cmlldmUgdG9rZW4gc2NyZWVuZXIgZGF0YSIsIm1pbWVUeXBlIjoiIn0sImFjY2VwdHMiOlt7InNjaGVtZSI6ImV4YWN0IiwibmV0d29yayI6ImVpcDE1NTo4NDUzIiwiYXNzZXQiOiIweDgzMzU4OWZDRDZlRGI2RTA4ZjRjN0MzMkQ0ZjcxYjU0YmRBMDI5MTMiLCJhbW91bnQiOiIxMDAwMCIsInBheVRvIjoiMHg5MzA1M2YxZTdBNWVGRURhNTMyRmU2OUNiYkU0M2NCRWMzQTBGMTNmIiwibWF4VGltZW91dFNlY29uZHMiOjMwMCwiZXh0cmEiOnsibmFtZSI6IlVTRCBDb2luIiwidmVyc2lvbiI6IjIifX1dfQ==",
-            ),
+            HeaderValue::from_static("eyJ4ND...1dfQ=="),
         );
         let challenge = normalize_challenge(
             &headers,
@@ -857,5 +854,17 @@ mod tests {
         assert_eq!(challenge.protocol, "x402");
         assert_eq!(challenge.amount.as_deref(), Some("10000"));
         assert_eq!(challenge.amount_usd, Some(0.01));
+    }
+
+    #[test]
+    fn x402_policy_cost_prefers_selected_requirement_over_top_level_usd() {
+        let challenge = normalize_challenge(
+            &HeaderMap::new(),
+            br#"{"amountUsd":0.01,"accepts":[{"network":"base","asset":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","maxAmountRequired":"5000000"}]}"#,
+            &Url::parse("https://merchant.test/pay").unwrap(),
+        );
+
+        assert_eq!(challenge.amount.as_deref(), Some("5000000"));
+        assert_eq!(challenge.amount_usd, Some(5.0));
     }
 }

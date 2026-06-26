@@ -90,7 +90,7 @@ impl PaymentBackend for RealMppBackend {
         challenge: &NormalizedChallenge,
         request: &ParsedRequest,
         wallet: &str,
-        policy: &Policy,
+        _policy: &Policy,
         _request_id: &str,
     ) -> Result<PaymentExecution, String> {
         if challenge.protocol != "mpp" || challenge.network.as_deref() != Some("tempo") {
@@ -119,16 +119,8 @@ impl PaymentBackend for RealMppBackend {
                 provider.pay(&payment_challenge).await
             }
             "session" => {
-                let mut provider = TempoSessionProvider::new((*signer).clone(), &rpc_url)
+                let provider = TempoSessionProvider::new((*signer).clone(), &rpc_url)
                     .map_err(|e| format!("TempoSessionProvider: {e}"))?;
-                if let Some(max) = policy
-                    .payments
-                    .sessions
-                    .max_deposit_usd
-                    .and_then(f64_to_u128_amount)
-                {
-                    provider = provider.with_max_deposit(max);
-                }
                 provider.pay(&payment_challenge).await
             }
             other => {
@@ -190,14 +182,6 @@ fn parse_stored_mpp_challenge(
         .ok_or_else(|| {
             "stored challenge is missing a parseable Tempo MPP WWW-Authenticate header".to_string()
         })
-}
-
-fn f64_to_u128_amount(v: f64) -> Option<u128> {
-    if v.is_finite() && v >= 0.0 {
-        Some(v.floor() as u128)
-    } else {
-        None
-    }
 }
 
 pub struct RetryResponse {
