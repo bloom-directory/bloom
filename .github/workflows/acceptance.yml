@@ -13,8 +13,6 @@ on:
       - crates/bloom-chain*/**
       - crates/bloom-petal*/**
       - examples/petal-dex/**
-      - docs/guides/local-petal-apps-v2.md
-      - docs/superpowers/specs/2026-06-24-external-petal-repos-and-github-source-installs.md
   push:
     branches:
       - master

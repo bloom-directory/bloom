@@ -70,6 +70,7 @@ pub struct StoreData {
     store_namespaces: Option<StoreNamespacePolicy>,
     http_response_cap: usize,
     private_store: Option<PrivateStore>,
+    deterministic_env: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +108,8 @@ pub struct RunOptions {
     pub store_namespaces: Option<StoreNamespacePolicy>,
     pub http_response_cap: usize,
     pub private_store_root: Option<PathBuf>,
+    /// Force mediated env helpers to deterministic values for install-time checks.
+    pub deterministic_env: bool,
 }
 
 impl Default for RunOptions {
@@ -119,6 +122,7 @@ impl Default for RunOptions {
             store_namespaces: None,
             http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,
             private_store_root: None,
+            deterministic_env: false,
         }
     }
 }
@@ -216,6 +220,7 @@ impl PetalVm {
                 sign_intents: opts.sign_intents.clone(),
                 store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
+                deterministic_env: opts.deterministic_env,
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
                         PrivateStore::open(root)
@@ -276,6 +281,7 @@ impl PetalVm {
                 sign_intents: opts.sign_intents.clone(),
                 store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
+                deterministic_env: opts.deterministic_env,
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
                         PrivateStore::open(root)
@@ -346,6 +352,7 @@ impl PetalVm {
                 sign_intents: opts.sign_intents.clone(),
                 store_namespaces: opts.store_namespaces.clone(),
                 http_response_cap: opts.http_response_cap,
+                deterministic_env: opts.deterministic_env,
                 private_store: match opts.private_store_root.clone() {
                     Some(root) => Some(
                         PrivateStore::open(root)
@@ -781,11 +788,11 @@ fn link_component_host_imports(linker: &mut ComponentLinker<StoreData>) -> anyho
     }
     {
         let mut env = linker.instance("bloom:env/runtime@0.1.0")?;
-        env.func_new_async("now-ms", |_store, _params, results| {
-            Box::new(async move { component_env_now_ms(results).await })
+        env.func_new_async("now-ms", |store, _params, results| {
+            Box::new(async move { component_env_now_ms(store, results).await })
         })?;
-        env.func_new_async("random-bytes", |_store, params, results| {
-            Box::new(async move { component_env_random_bytes(params, results).await })
+        env.func_new_async("random-bytes", |store, params, results| {
+            Box::new(async move { component_env_random_bytes(store, params, results).await })
         })?;
     }
     Ok(())
@@ -1353,16 +1360,24 @@ async fn component_vfs_write(
     }
 }
 
-async fn component_env_now_ms(results: &mut [ComponentVal]) -> anyhow::Result<()> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| anyhow::anyhow!("system time before unix epoch: {e}"))?
-        .as_millis();
-    let now = u64::try_from(now).map_err(|_| anyhow::anyhow!("system time overflow"))?;
+async fn component_env_now_ms(
+    store: StoreContextMut<'_, StoreData>,
+    results: &mut [ComponentVal],
+) -> anyhow::Result<()> {
+    let now = if store.data().deterministic_env {
+        0
+    } else {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| anyhow::anyhow!("system time before unix epoch: {e}"))?
+            .as_millis();
+        u64::try_from(now).map_err(|_| anyhow::anyhow!("system time overflow"))?
+    };
     set_component_result(results, component_ok(Some(ComponentVal::U64(now))))
 }
 
 async fn component_env_random_bytes(
+    store: StoreContextMut<'_, StoreData>,
     params: &[ComponentVal],
     results: &mut [ComponentVal],
 ) -> anyhow::Result<()> {
@@ -1389,8 +1404,10 @@ async fn component_env_random_bytes(
         );
     }
     let mut bytes = vec![0u8; *len as usize];
-    getrandom::getrandom(&mut bytes)
-        .map_err(|e| anyhow::anyhow!("random-bytes unavailable: {e}"))?;
+    if !store.data().deterministic_env {
+        getrandom::getrandom(&mut bytes)
+            .map_err(|e| anyhow::anyhow!("random-bytes unavailable: {e}"))?;
+    }
     set_component_result(results, component_ok(Some(component_bytes(bytes))))
 }
 
@@ -2820,6 +2837,7 @@ paths = ["/status"]
                 sign_intents: None,
                 store_namespaces: None,
                 http_response_cap: DEFAULT_HTTP_RESPONSE_CAP,
+                deterministic_env: false,
                 private_store,
             },
         )

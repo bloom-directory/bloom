@@ -583,7 +583,6 @@ fn install_metadata_for_route(
     if validation.abi != RouteAbi::ComponentBloomRoute010 || !route.params.is_empty() {
         return Ok(metadata);
     }
-
     let component_metadata =
         evaluate_static_component_metadata(package_hash, app_root, route, artifact_bytes)?;
     validate_component_metadata_policy(
@@ -700,7 +699,10 @@ fn evaluate_static_component_metadata(
                     &app_root,
                     &path,
                     Vec::new(),
-                    RunOptions::default(),
+                    RunOptions {
+                        deterministic_env: true,
+                        ..RunOptions::default()
+                    },
                 )
                 .await
         })

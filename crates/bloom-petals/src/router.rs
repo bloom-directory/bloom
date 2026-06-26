@@ -114,9 +114,6 @@ impl Handler for PetalRouter {
 
     async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let (mount, rest) = Self::mount_path(path)?;
-        if rest.is_empty() {
-            return Err(HandlerError::NotAFile(path.to_string_path()));
-        }
         if !self.is_v2_app(mount) {
             return Err(HandlerError::NotFound(path.to_string_path()));
         }

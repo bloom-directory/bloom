@@ -245,6 +245,8 @@ fn github_source_install_polymarket_dispatches_parity() {
             "petals",
             "install",
             "https://github.com/bloom-directory/bloom-petal-polymarket",
+            "--ref",
+            "v0.1.1",
         ])
         .assert()
         .success()
