@@ -133,7 +133,35 @@ impl PaymentBackend for RealMppBackend {
         let authorization_sha256 = bloom_tools::sha256_hex(authorization.as_bytes());
         let credential_value = serde_json::to_value(&credential)
             .map_err(|e| format!("serialize MPP credential metadata: {e}"))?;
-        let retry = retry_paid_request(&self.client, request, &authorization).await?;
+        let retry = match retry_paid_request(&self.client, request, &authorization).await {
+            Ok(retry) => retry,
+            Err(err) => {
+                return Ok(PaymentExecution {
+                    credential_metadata: json!({
+                        "redacted": true,
+                        "protocol": challenge.protocol,
+                        "intent": challenge.intent,
+                        "backend": self.name(),
+                        "authorization_sha256": authorization_sha256,
+                        "source": credential_value.get("source").cloned(),
+                        "payload_type": credential_value.get("payload").and_then(|p| p.get("type")).cloned(),
+                        "charge_id": challenge.charge_id,
+                        "session_id": challenge.session_id,
+                        "channel_id": challenge.channel_id,
+                        "secret_material_in_vfs": false,
+                        "raw_authorization_stored": false,
+                        "raw_signed_payload_stored": false,
+                        "chain_id": chain_id,
+                        "rpc_url_configured": true,
+                        "post_authorization_error": err,
+                    }),
+                    receipt_raw: json!({"error": err}),
+                    response_status: 0,
+                    response_headers: HeaderMap::new(),
+                    response_body: format!("{err}\n").into_bytes(),
+                });
+            }
+        };
         let receipt_raw = retry
             .headers
             .get("payment-receipt")

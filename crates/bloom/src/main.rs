@@ -528,7 +528,15 @@ enum RequestCmd {
     /// Show the staged payment plan for an id or `latest`.
     Plan { id: String },
     /// Confirm a pending paid request.
-    Confirm { id: String },
+    Confirm {
+        id: String,
+        /// Unlock this wallet for confirmation when signing is required.
+        #[arg(long)]
+        unlock_wallet: Option<String>,
+        /// Passphrase for `--unlock-wallet` local wallets. Passkey wallets open a WebAuthn ceremony instead.
+        #[arg(long, env = "BLOOM_PASSPHRASE")]
+        passphrase: Option<String>,
+    },
     /// Print response body for an id or `latest`.
     Body { id: String },
     /// Print receipt JSON for an id or `latest`.
@@ -1023,9 +1031,56 @@ async fn run(cli: Cli) -> Result<()> {
             std::io::Write::write_all(&mut std::io::stdout(), &bytes)?;
             Ok(())
         }
-        Cmd::Request(RequestCmd::Confirm { id }) => {
-            let (_home_permit, d) = build_write_daemon(home)?;
+        Cmd::Request(RequestCmd::Confirm {
+            id,
+            unlock_wallet,
+            passphrase,
+        }) => {
             let path = VfsPath::parse(&format!("/requests/{id}/confirm"))?;
+            if let Some(wallet) = unlock_wallet {
+                let client = IpcClient::new(&client_endpoint.socket);
+                let ipc_res = try_ipc(
+                    &client,
+                    &client_endpoint,
+                    "write_unlocked",
+                    serde_json::json!({
+                        "path": format!("/requests/{id}/confirm"),
+                        "bytes_b64": B64.encode(b"confirm"),
+                        "wallet": &wallet,
+                        "passphrase": passphrase.as_deref(),
+                    }),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "ipc unlocked request confirm via {}",
+                        client_endpoint.display
+                    )
+                })?;
+                if ipc_res.is_some() {
+                    debug!(endpoint = %client_endpoint.display, "cli.request.confirm_unlocked.via_ipc");
+                    return Ok(());
+                }
+
+                let (_home_permit, d) = build_write_daemon(home)?;
+                let info = d.keystore.info(&wallet)?;
+                match info.kind {
+                    bloom_keystore::WalletKind::PasskeyGated => {
+                        d.keystore.unlock_passkey(&wallet).await?;
+                    }
+                    _ => {
+                        d.keystore
+                            .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
+                    }
+                }
+                d.vfs
+                    .write(&path, b"confirm")
+                    .await
+                    .context("request confirm")?;
+                return Ok(());
+            }
+
+            let (_home_permit, d) = build_write_daemon(home)?;
             d.vfs
                 .write(&path, b"confirm")
                 .await

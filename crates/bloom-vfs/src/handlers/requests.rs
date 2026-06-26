@@ -15,7 +15,9 @@ use bloom_paid_http::{
     parse_request, select_payment_requirement, trim_money,
 };
 use bloom_paid_mpp::{PaymentBackend, RealMppBackend};
-use bloom_paid_x402::{KeystoreX402PaymentSigner, X402PaymentSigner, X402SignContext};
+use bloom_paid_x402::{
+    KeystoreX402PaymentSigner, X402PaymentCredential, X402PaymentSigner, X402SignContext,
+};
 use bloom_proto::Policy;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -570,17 +572,37 @@ impl RequestsHandler {
         if let Some(body) = &request.body {
             retry = retry.body(body.clone());
         }
-        let response = retry
-            .send()
-            .await
-            .map_err(|e| HandlerError::backend(format!("paid HTTP retry failed: {e}")))?;
-        let status = response.status().as_u16();
-        let response_headers = response.headers().clone();
-        let response_body = response
-            .bytes()
-            .await
-            .map_err(|e| HandlerError::backend(format!("read paid HTTP response: {e}")))?
-            .to_vec();
+        let retry_result: Result<(u16, HeaderMap, Vec<u8>), String> = async {
+            let response = retry
+                .send()
+                .await
+                .map_err(|e| format!("paid HTTP retry failed: {e}"))?;
+            let status = response.status().as_u16();
+            let response_headers = response.headers().clone();
+            let response_body = response
+                .bytes()
+                .await
+                .map_err(|e| format!("read paid HTTP response: {e}"))?
+                .to_vec();
+            Ok((status, response_headers, response_body))
+        }
+        .await;
+        let (status, response_headers, response_body) = match retry_result {
+            Ok(parts) => parts,
+            Err(err) => {
+                self.fail_signed_x402_request(
+                    id,
+                    &pending,
+                    &credential,
+                    &challenge,
+                    &requirement,
+                    &wallet,
+                    &host,
+                    &err,
+                )?;
+                return Ok(());
+            }
+        };
         let sha = bloom_tools::sha256_hex(&response_body);
         write_json(
             pending.join("credential.json"),
@@ -642,6 +664,83 @@ impl RequestsHandler {
         fs::rename(&pending, &target)?;
         self.write_latest(target_state, id)?;
         Ok(())
+    }
+
+    fn fail_signed_x402_request(
+        &self,
+        id: &str,
+        pending: &Path,
+        credential: &X402PaymentCredential,
+        challenge: &NormalizedChallenge,
+        requirement: &PaymentRequirement,
+        wallet: &str,
+        host: &str,
+        error: &str,
+    ) -> Result<(), HandlerError> {
+        fs::create_dir_all(pending.join("response"))?;
+        write_json(
+            pending.join("credential.json"),
+            &json!({
+                "redacted": true,
+                "protocol": challenge.protocol,
+                "intent": challenge.intent,
+                "scheme": requirement.scheme,
+                "network": requirement.network,
+                "asset": requirement.asset,
+                "pay_to": requirement.pay_to,
+                "charge_id": challenge.charge_id,
+                "session_id": challenge.session_id,
+                "material": "not_stored",
+                "header_name": credential.header_name,
+                "secret_material_in_vfs": false,
+                "public": credential.public_metadata,
+            }),
+        )?;
+        let body = format!("{error}\n");
+        let sha = bloom_tools::sha256_hex(body.as_bytes());
+        fs::write(pending.join("response/status"), b"0\n")?;
+        write_json(pending.join("response/headers.json"), &json!({}))?;
+        fs::write(pending.join("response/body"), body.as_bytes())?;
+        fs::write(pending.join("response/body.sha256"), format!("{sha}\n"))?;
+        fs::write(pending.join("error.txt"), body.as_bytes())?;
+        write_json(
+            pending.join("receipt.json"),
+            &json!({
+                "request_id": id,
+                "wallet": wallet,
+                "merchant": host,
+                "amount": requirement.amount,
+                "currency": requirement.asset,
+                "network": requirement.network,
+                "protocol": challenge.protocol,
+                "intent": challenge.intent,
+                "scheme": requirement.scheme,
+                "charge_id": challenge.charge_id,
+                "session_id": challenge.session_id,
+                "amount_usd": challenge.amount_usd,
+                "response_status": 0,
+                "credential_redacted": true,
+                "error": error,
+            }),
+        )?;
+        write_json(
+            pending.join("audit.json"),
+            &json!({
+                "request_id": id,
+                "event": "signed_retry_failed",
+                "paid_retry_succeeded": false,
+                "credential_redacted": true,
+                "secret_material_in_vfs": false,
+                "error": error,
+            }),
+        )?;
+        fs::write(pending.join("status"), b"failed\n")?;
+        let target = self.req_dir("failed", id);
+        if target.exists() {
+            fs::remove_dir_all(&target)?;
+        }
+        fs::rename(pending, &target)?;
+        self.write_latest("failed", id)
     }
 }
 
