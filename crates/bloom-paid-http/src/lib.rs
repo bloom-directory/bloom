@@ -897,7 +897,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "payment-required",
-            HeaderValue::from_static("eyJ4ND...1dfQ=="),
+            HeaderValue::from_static("eyJ4NDAyVmVyc2lvbiI6MiwiYWNjZXB0cyI6W3sic2NoZW1lIjoiZXhhY3QiLCJuZXR3b3JrIjoiYmFzZSIsImFzc2V0IjoiMHg4MzM1ODlmQ0Q2ZURiNkUwOGY0YzdDMzJENGY3MWI1NGJkQTAyOTEzIiwibWF4QW1vdW50UmVxdWlyZWQiOiIxMDAwMCIsInBheVRvIjoiMHgwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAxIn1dfQ=="),
         );
         let challenge = normalize_challenge(
             &headers,

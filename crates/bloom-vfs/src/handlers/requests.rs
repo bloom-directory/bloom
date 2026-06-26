@@ -1593,15 +1593,30 @@ inline = '{"prompt":"hi"}'
         )
         .unwrap();
         write_request_artifacts(dir.path(), &req, "research", "pending").unwrap();
+        write_private_replay_request(dir.path(), &req).unwrap();
 
         let stored: serde_json::Value = read_json(dir.path().join("request.toml")).unwrap();
-        assert_eq!(stored["body"], r#"{"prompt":"hi"}"#);
-        let reloaded = parsed_request_from_artifact(&stored).unwrap();
+        assert_eq!(stored["body_redacted"], true);
+        assert_eq!(stored["body"], serde_json::Value::Null);
+
+        let private_replay: serde_json::Value =
+            read_json(dir.path().join("private/request_replay.json")).unwrap();
+        assert_eq!(private_replay["body"], r#"{"prompt":"hi"}"#);
+        let mut reloaded_artifact = stored.clone();
+        reloaded_artifact
+            .as_object_mut()
+            .unwrap()
+            .insert("_private_replay".into(), private_replay);
+        let reloaded = parsed_request_from_artifact(&reloaded_artifact).unwrap();
         assert_eq!(reloaded.body.as_deref(), Some(r#"{"prompt":"hi"}"#));
 
         let http = fs::read_to_string(dir.path().join("request.http")).unwrap();
         assert!(http.contains("content-type: application/json\n\n"));
-        assert!(http.ends_with("{\"prompt\":\"hi\"}\n"));
+        assert!(
+            http.ends_with("[body redacted; private replay copy retained for confirm]\n"),
+            "{http}"
+        );
+        assert!(!http.contains(r#"{"prompt":"hi"}"#), "{http}");
     }
 
     #[test]
