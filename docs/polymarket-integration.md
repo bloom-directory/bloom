@@ -43,8 +43,11 @@ instruction to trade.
   <wallet> --data confirm`; this dispatches to the same funding engine as
   `bloom polymarket fund <wallet> --request <id>`.
 - Drafts and receipts are durable and read-only under
-  `polymarket/trade/<wallet>/{drafts,receipts}/...`; confirmation stays in the
-  CLI for ceremony and fresh policy checks.
+  `polymarket/trade/<wallet>/{drafts,receipts}/...`; draft confirmation can be
+  executed with `bloom vfs write
+  /polymarket/trade/<wallet>/drafts/<id>/confirm --unlock-wallet <wallet>
+  --data confirm`, which dispatches to the same order engine as
+  `bloom polymarket confirm <wallet> <id>`.
 - Passkey/WebAuthn proves user presence, not transaction content. Bloom opens a
   local browser review page and prints a matching review hash; this is a local
   consistency check, not a hardware trusted display.
@@ -172,7 +175,7 @@ Steps:
    `bloom vfs write /polymarket/fund/<w>/new --data '{"target_pusd":"3","max_spend":"0.1"}'`
    then `bloom vfs write /polymarket/fund/<w>/<id>/confirm --unlock-wallet <w> --data confirm`
 3. `bloom polymarket order <w> <slug> yes <usd> --max-price <p> --dry-run`
-4. `bloom polymarket confirm <w> <draft-id>`
+4. `bloom vfs write /polymarket/trade/<w>/drafts/<draft-id>/confirm --unlock-wallet <w> --data confirm`
 5. Exit with `sell` or `cancel` if it rested.
 6. `redeem` only after Data API reports `redeemable:true`.
 7. `withdraw-pusd <w> all`

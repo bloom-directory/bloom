@@ -218,8 +218,9 @@ it expire after the configured TTL) cancels the stage.
 - **Polymarket** — prediction-market trading via CLI (`bloom polymarket
   ...`). VFS staging at `/polymarket/...`; pUSD funding requests can be
   confirmed with `bloom vfs write /polymarket/fund/<wallet>/<id>/confirm
-  --unlock-wallet <wallet> --data confirm`, while trade draft confirmation
-  still uses `bloom polymarket confirm`. A capability primitive (scoped
+  --unlock-wallet <wallet> --data confirm`, and trade drafts can be posted with
+  `bloom vfs write /polymarket/trade/<wallet>/drafts/<id>/confirm
+  --unlock-wallet <wallet> --data confirm`. A capability primitive (scoped
   approve, TTL, caps) is in active development — see
   `docs/plans/2026-06-20-agent-obvious-capability-model.md`.
   Read `/polymarket/README.md`.

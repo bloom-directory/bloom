@@ -1585,7 +1585,8 @@ echo '{"asset":"ETH","is_cross":false,"leverage":5}' \
 Prediction-market trading via the `bloom polymarket ...` CLI plus the
 `/polymarket/` VFS surface. VFS can stage trade drafts and pUSD funding
 requests; funding requests can be confirmed with foreground
-`bloom vfs write --unlock-wallet`. Trade draft signing still lives in
+`bloom vfs write --unlock-wallet`. Trade drafts can be posted through the same
+foreground VFS pattern, which dispatches to the same execution path as
 `bloom polymarket confirm`. Read `/polymarket/README.md` for the full safety
 model.
 
@@ -1615,6 +1616,11 @@ echo '{"slug":"will-canada-win-2026-world-cup-755",
 cat /bloom/polymarket/trade/<wallet>/drafts/<id>/plan.md
 
 # 4) Confirm (requires unlock or passkey ceremony per trade)
+bloom vfs write /polymarket/trade/<wallet>/drafts/<id>/confirm \
+  --unlock-wallet <wallet> \
+  --data confirm
+
+# Equivalent dedicated CLI command:
 bloom polymarket confirm <wallet> <id>
 ```
 

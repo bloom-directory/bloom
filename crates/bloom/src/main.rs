@@ -1297,6 +1297,19 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             };
             if let Some(wallet) = unlock_wallet {
+                if let Some(confirm) = polymarket_trade_confirm_write(&wallet, &p, &body)? {
+                    let (_home_permit, d) = build_write_daemon(home)?;
+                    commands::polymarket::confirm(
+                        &d,
+                        &wallet,
+                        &confirm.draft_id,
+                        confirm.confirm_risk,
+                        passphrase.as_deref(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
                 if let Some(confirm) = polymarket_fund_confirm_write(&wallet, &p, &body)? {
                     let (_home_permit, d) = build_write_daemon(home)?;
                     commands::polymarket::fund_from_request(
@@ -3091,6 +3104,12 @@ struct PolymarketFundConfirmWrite {
     confirm_risk: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolymarketTradeConfirmWrite {
+    draft_id: String,
+    confirm_risk: bool,
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct PolymarketFundConfirmBody {
     #[serde(default)]
@@ -3099,6 +3118,60 @@ struct PolymarketFundConfirmBody {
     dry_run: bool,
     #[serde(default)]
     confirm_risk: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PolymarketTradeConfirmBody {
+    #[serde(default)]
+    confirm: Option<bool>,
+    #[serde(default)]
+    confirm_risk: bool,
+}
+
+fn polymarket_trade_confirm_write(
+    wallet: &str,
+    path: &VfsPath,
+    body: &[u8],
+) -> Result<Option<PolymarketTradeConfirmWrite>> {
+    let segs = path.segments();
+    let [root, trade, w, drafts, draft_id, confirm] = segs else {
+        return Ok(None);
+    };
+    if root != "polymarket" || trade != "trade" || drafts != "drafts" || confirm != "confirm" {
+        return Ok(None);
+    }
+    if w != wallet {
+        bail!("unlock wallet '{wallet}' does not match Polymarket trade confirm path wallet '{w}'");
+    }
+    validate_polymarket_artifact_id(draft_id, "trade draft")?;
+    let body = std::str::from_utf8(body).context("polymarket trade confirm body must be utf-8")?;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        bail!("polymarket trade confirm requires body 'confirm', 'y', or JSON/TOML confirmation");
+    }
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "confirm" | "y" | "yes"
+    ) {
+        return Ok(Some(PolymarketTradeConfirmWrite {
+            draft_id: draft_id.clone(),
+            confirm_risk: false,
+        }));
+    }
+
+    let parsed: PolymarketTradeConfirmBody = serde_json::from_str(trimmed)
+        .or_else(|json_err| {
+            toml::from_str(trimmed).map_err(|toml_err| {
+                anyhow::anyhow!("confirm body must be 'confirm', 'y', JSON, or TOML: JSON: {json_err}; TOML: {toml_err}")
+            })
+        })?;
+    if parsed.confirm != Some(true) {
+        bail!("polymarket trade confirm body must set confirm=true");
+    }
+    Ok(Some(PolymarketTradeConfirmWrite {
+        draft_id: draft_id.clone(),
+        confirm_risk: parsed.confirm_risk,
+    }))
 }
 
 fn polymarket_fund_confirm_write(
@@ -3116,7 +3189,7 @@ fn polymarket_fund_confirm_write(
     if w != wallet {
         bail!("unlock wallet '{wallet}' does not match Polymarket fund confirm path wallet '{w}'");
     }
-    validate_polymarket_request_id(request_id)?;
+    validate_polymarket_artifact_id(request_id, "fund request")?;
     let body = std::str::from_utf8(body).context("polymarket fund confirm body must be utf-8")?;
     let trimmed = body.trim();
     if trimmed.is_empty() {
@@ -3149,9 +3222,9 @@ fn polymarket_fund_confirm_write(
     }))
 }
 
-fn validate_polymarket_request_id(id: &str) -> Result<()> {
+fn validate_polymarket_artifact_id(id: &str, label: &str) -> Result<()> {
     if id.is_empty() || id.contains('/') || id.contains('\\') || id == "." || id == ".." {
-        bail!("invalid Polymarket fund request id '{id}'");
+        bail!("invalid Polymarket {label} id '{id}'");
     }
     Ok(())
 }
@@ -3957,7 +4030,9 @@ async fn unmount_bloom(handle: Option<()>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{polymarket_fund_confirm_write, request_body_with_wallet};
+    use super::{
+        polymarket_fund_confirm_write, polymarket_trade_confirm_write, request_body_with_wallet,
+    };
     use bloom_vfs::VfsPath;
 
     #[test]
@@ -4056,6 +4131,80 @@ content-type = "application/json"
 
         assert!(
             polymarket_fund_confirm_write("my-wallet", &path, b"confirm")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn polymarket_trade_confirm_vfs_write_accepts_ack_body() {
+        let path =
+            VfsPath::parse("/polymarket/trade/my-wallet/drafts/order-000000001/confirm").unwrap();
+        let parsed = polymarket_trade_confirm_write("my-wallet", &path, b"confirm")
+            .unwrap()
+            .expect("trade confirm path");
+
+        assert_eq!(parsed.draft_id, "order-000000001");
+        assert!(!parsed.confirm_risk);
+    }
+
+    #[test]
+    fn polymarket_trade_confirm_vfs_write_accepts_structured_body() {
+        let path =
+            VfsPath::parse("/polymarket/trade/my-wallet/drafts/order-000000002/confirm").unwrap();
+        let parsed = polymarket_trade_confirm_write(
+            "my-wallet",
+            &path,
+            br#"{"confirm":true,"confirm_risk":true}"#,
+        )
+        .unwrap()
+        .expect("trade confirm path");
+
+        assert_eq!(parsed.draft_id, "order-000000002");
+        assert!(parsed.confirm_risk);
+    }
+
+    #[test]
+    fn polymarket_trade_confirm_vfs_write_accepts_toml_body() {
+        let path =
+            VfsPath::parse("/polymarket/trade/my-wallet/drafts/order-000000003/confirm").unwrap();
+        let parsed = polymarket_trade_confirm_write(
+            "my-wallet",
+            &path,
+            b"confirm = true\nconfirm_risk = true\n",
+        )
+        .unwrap()
+        .expect("trade confirm path");
+
+        assert_eq!(parsed.draft_id, "order-000000003");
+        assert!(parsed.confirm_risk);
+    }
+
+    #[test]
+    fn polymarket_trade_confirm_vfs_write_rejects_mismatched_wallet() {
+        let path =
+            VfsPath::parse("/polymarket/trade/other/drafts/order-000000001/confirm").unwrap();
+        let err = polymarket_trade_confirm_write("my-wallet", &path, b"confirm").unwrap_err();
+
+        assert!(err.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn polymarket_trade_confirm_vfs_write_rejects_unconfirmed_body() {
+        let path =
+            VfsPath::parse("/polymarket/trade/my-wallet/drafts/order-000000001/confirm").unwrap();
+        let err = polymarket_trade_confirm_write("my-wallet", &path, br#"{"confirm":false}"#)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("confirm=true"));
+    }
+
+    #[test]
+    fn polymarket_trade_confirm_vfs_write_ignores_other_paths() {
+        let path = VfsPath::parse("/polymarket/trade/my-wallet/new").unwrap();
+
+        assert!(
+            polymarket_trade_confirm_write("my-wallet", &path, b"confirm")
                 .unwrap()
                 .is_none()
         );

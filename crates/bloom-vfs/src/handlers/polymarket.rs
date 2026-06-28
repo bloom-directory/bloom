@@ -64,23 +64,26 @@ const README: &[u8] = br#"# Polymarket Trading
  /polymarket/account/<wallet>/status.json  # Onboarding state
 ```
 
-### 2. Trading (CURRENT: per-trade human ceremony)
+### 2. Trading (per-trade owner ceremony)
 Every value-moving action re-crosses the owner gate today:
 ```json
  bloom polymarket order <wallet> ...
  bloom polymarket sell <wallet> ...
  bloom polymarket confirm <wallet> <id>
+ bloom vfs write /polymarket/trade/<wallet>/drafts/<id>/confirm --unlock-wallet <wallet> --data confirm
 ```
 
 A Polymarket capability primitive (scoped approve, TTL, caps, bounded window
 with no per-trade ceremony) is in active development. See
 `docs/plans/2026-06-20-agent-obvious-capability-model.md` for status.
 
-### 3. VFS staging and fund execution
-Drafts can be created in the VFS but order signing still requires the CLI:
+### 3. VFS staging and foreground confirmation
+Drafts can be created in the VFS and confirmed through the foreground CLI VFS
+write path, which unlocks the wallet in the same process that signs:
 ```json
  write: /polymarket/trade/<wallet>/new     # Create a reviewable draft
  read:  /polymarket/trade/<wallet>/drafts/<id>/plan.md
+ write: /polymarket/trade/<wallet>/drafts/<id>/confirm   # use bloom vfs write --unlock-wallet <wallet>
 ```
 
 Funding requests can be staged and then executed through the foreground CLI VFS
@@ -96,6 +99,9 @@ write path, which unlocks the wallet in the same process that signs:
 - Policy checks (slug allow/deny, max order, max daily) run per action
 - Onboarding must complete (`bloom polymarket onboard <wallet>`) before any trade
 - Every value-moving CLI action requires a passkey ceremony or unlocked local wallet
+- Trade draft confirmation uses `bloom vfs write --unlock-wallet <wallet>` so
+  the existing CLI order engine re-checks geoblock, policy, stale draft status,
+  holdings, locks, signing, CLOB post/reconcile, receipts, and audit gates
 - Fund request confirmation uses `bloom vfs write --unlock-wallet <wallet>` so
   the existing CLI funding engine re-reads live balances/routes and applies the
   standard tx-engine policy, plan, review, signing, broadcast, and audit gates
@@ -104,7 +110,14 @@ write path, which unlocks the wallet in the same process that signs:
 const BEGIN_HINT: &[u8] = b"write anything here to (re)run onboarding; run in the foreground for passkey wallets; rests at 'fund' for pUSD; progress + liveness: status.json\n";
 const TRADE_NEW_HINT: &[u8] = br#"write JSON to create a reviewable draft, e.g.
 {"slug":"will-canada-win-the-2026-fifa-world-cup-755","outcome":"yes","amount":"1","max_price":"0.01"}
-Then read drafts/<id>/plan.md. Confirmation still uses `bloom polymarket confirm <wallet> <id>` until the VFS signing path is wired.
+Then read drafts/<id>/plan.md and confirm it with:
+bloom vfs write /polymarket/trade/<wallet>/drafts/<id>/confirm --unlock-wallet <wallet> --data confirm
+"#;
+const TRADE_CONFIRM_HINT: &[u8] = br#"write "confirm" here through the foreground CLI VFS path:
+bloom vfs write /polymarket/trade/<wallet>/drafts/<id>/confirm --unlock-wallet <wallet> --data confirm
+
+The confirm path dispatches to the same Polymarket order execution core as:
+bloom polymarket confirm <wallet> <id>
 "#;
 const FUND_NEW_HINT: &[u8] = br#"write JSON to create a reviewable pUSD funding request, e.g.
 {"target_pusd":"10","max_spend":"100","from_token":"native","slippage_bps":50}
@@ -424,10 +437,10 @@ impl PolymarketHandler {
         self
     }
 
-    /// Enable the read-only `trade/` subtree (order drafts + receipts).
-    /// There is deliberately no writable confirm path here: confirmation
-    /// needs a wallet unlock and fresh policy evaluation, which stay in the
-    /// CLI (`bloom polymarket confirm`).
+    /// Enable the `trade/` subtree (order drafts + receipts). Draft confirms
+    /// are discoverable, but direct handler writes refuse with foreground
+    /// `bloom vfs write --unlock-wallet` guidance so the signer ceremony stays
+    /// in the process that signs.
     pub fn with_order_store(mut self, store: OrderStore) -> Self {
         self.orders = Some(Arc::new(store));
         self
@@ -830,6 +843,9 @@ impl PolymarketHandler {
                 3 if segs[2] == "new" => Ok(Entry::writable_file("new")),
                 3 if segs[2] == "drafts" || segs[2] == "receipts" => Ok(Entry::dir(&segs[2])),
                 4 if segs[2] == "drafts" || segs[2] == "receipts" => Ok(Entry::dir(&segs[3])),
+                5 if segs[2] == "drafts" && segs[4] == "confirm" => {
+                    Ok(Entry::writable_file("confirm"))
+                }
                 5 if segs[2] == "drafts" && DRAFT_FILES.contains(&segs[4].as_str()) => {
                     Ok(Entry::file(&segs[4]))
                 }
@@ -893,6 +909,9 @@ impl PolymarketHandler {
             (Some("fund"), 4) if segs[3] == "confirm" => Ok(FUND_CONFIRM_HINT.to_vec()),
             (Some("fund"), 4) => self.read_fund(path, &segs[1], &segs[2], &segs[3]),
             (Some("trade"), 3) if segs[2] == "new" => Ok(TRADE_NEW_HINT.to_vec()),
+            (Some("trade"), 5) if segs[2] == "drafts" && segs[4] == "confirm" => {
+                Ok(TRADE_CONFIRM_HINT.to_vec())
+            }
             (Some("trade"), 5) => self.read_trade(path, &segs[1], &segs[2], &segs[3], &segs[4]),
             (Some("README.md"), 1) => Ok(README.to_vec()),
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
@@ -1513,6 +1532,15 @@ impl PolymarketHandler {
             }
             return self.create_trade_draft(&segs[1], _data).await;
         }
+        if segs.len() == 5 && segs[0] == "trade" && segs[2] == "drafts" && segs[4] == "confirm" {
+            return Err(HandlerError::Unsupported(
+                "trade draft confirmation must run through the foreground CLI VFS path so the \
+                 wallet unlock and signer live in the same process: \
+                 bloom vfs write /polymarket/trade/<wallet>/drafts/<id>/confirm \
+                 --unlock-wallet <wallet> --data confirm"
+                    .into(),
+            ));
+        }
         if !(segs.len() == 3 && segs[0] == "onboard" && segs[2] == "begin") {
             return Err(HandlerError::PermissionDenied);
         }
@@ -1687,7 +1715,9 @@ impl PolymarketHandler {
                 Ok(ids.iter().map(|id| Entry::dir(id)).collect())
             }
             (Some("trade"), 4) if segs[2] == "drafts" => {
-                Ok(DRAFT_FILES.iter().map(|f| Entry::file(f)).collect())
+                let mut entries: Vec<Entry> = DRAFT_FILES.iter().map(|f| Entry::file(f)).collect();
+                entries.push(Entry::writable_file("confirm"));
+                Ok(entries)
             }
             (Some("trade"), 4) if segs[2] == "receipts" => Ok(vec![Entry::file("receipt.json")]),
             _ => Err(HandlerError::NotADir(path.to_string_path())),
@@ -1873,6 +1903,7 @@ mod tests {
             .unwrap();
         let names: Vec<_> = files.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"plan.md") && names.contains(&"policy_check.json"));
+        assert!(names.contains(&"confirm"));
 
         let plan = h
             .read(&p(&format!("/trade/w/drafts/{}/plan.md", draft.id)))
@@ -1916,11 +1947,13 @@ mod tests {
         let intent: serde_json::Value = serde_json::from_slice(&intent).unwrap();
         assert_eq!(intent["title"], "Polymarket order");
 
-        assert!(
-            h.lookup(&p(&format!("/trade/w/drafts/{}/confirm", draft.id)))
-                .await
-                .is_err()
-        );
+        let confirm_path = p(&format!("/trade/w/drafts/{}/confirm", draft.id));
+        assert_eq!(h.lookup(&confirm_path).await.unwrap().mode, 0o644);
+        let hint = String::from_utf8(h.read(&confirm_path).await.unwrap()).unwrap();
+        assert!(hint.contains("bloom vfs write"));
+        assert!(hint.contains("bloom polymarket confirm"));
+        let err = h.write(&confirm_path, b"confirm").await.unwrap_err();
+        assert!(err.to_string().contains("foreground CLI VFS path"));
         assert!(handler_with(None, None).lookup(&p("/trade")).await.is_err());
     }
 

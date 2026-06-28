@@ -72,7 +72,7 @@ Rollback/non-goals:
 - does not implement mounted daemon signing;
 - does not implement Polymarket trade draft confirm.
 
-## 1. Polymarket trade draft confirm/post via VFS
+## 1. Implemented: Polymarket trade draft confirm/post via foreground VFS CLI
 
 Goal: add a writable confirmation path for order and sell-to-close drafts.
 
@@ -99,14 +99,15 @@ bloom vfs write /polymarket/trade/<wallet>/drafts/<id>/confirm \
   --data '{"confirm":true,"confirm_risk":true}'
 ```
 
-Shared core function to call:
+Shared core function called:
 
-- Extract `commands::polymarket::confirm` / internal `execute` into a reusable
-  service callable from both the CLI command and VFS foreground dispatch.
-- Keep CLI text formatting in the command layer and VFS path/body parsing in
-  the VFS layer.
+- `commands::polymarket::confirm`, which loads the durable draft and calls the
+  existing internal `execute` path used by `bloom polymarket confirm`.
+- VFS path/body parsing stays in the command layer; the mounted VFS handler only
+  exposes discovery/help and refuses direct execution with foreground CLI
+  guidance.
 
-Safety invariants:
+Safety invariants preserved:
 
 - stale draft refusal;
 - geoblock behavior identical to CLI;
@@ -117,31 +118,33 @@ Safety invariants:
 - CLOB post rejection/ambiguous reconciliation behavior unchanged;
 - receipt/audit artifacts identical to CLI.
 
-Tests to add:
+Tests added:
 
 - parser/routing tests for confirm path and body;
-- stale draft refusal;
-- policy deny and warning-without-confirm-risk refusal;
-- geoblock blocked/outage behavior for buy vs sell-to-close;
-- mocked CLOB success/rejection/ambiguous reconciliation;
-- receipt/audit artifact parity between CLI confirm and VFS confirm;
-- no secret material in VFS output.
+- mounted VFS handler discovery/read/refusal test for `drafts/<id>/confirm`;
+- subprocess parity smoke test proving `bloom polymarket confirm` and
+  `bloom vfs write /polymarket/trade/<wallet>/drafts/<id>/confirm
+  --unlock-wallet <wallet> --data confirm` share the same durable missing-draft
+  refusal before network/signing work.
 
-Docs to update:
+Docs updated:
 
 - Polymarket VFS README string;
+- `docs/parity/VFS_CLI_PARITY_LEDGER.md`;
 - `docs/polymarket-integration.md`;
 - `EXAMPLES.md`;
 - `QUICKSTART.md`;
-- parity ledger Track A candidate list.
+- `README.md`.
 
 Rollback/non-goals:
 
 - rollback by removing the VFS dispatch and keeping CLI confirm only;
 - do not add a second order signer/poster;
 - do not weaken geoblock, stale-draft, policy, lock, or receipt guarantees.
+- mounted/IPC handler execution remains intentionally unsupported because the
+  signer ceremony must live in the foreground process.
 
-## 2. Polymarket risk-reducing VFS actions
+## 2. Next: Polymarket risk-reducing VFS actions
 
 Goal: expose cancel, redeem, revoke approvals, and possibly pUSD withdraw
 through VFS action paths when their shared cores are extractable.

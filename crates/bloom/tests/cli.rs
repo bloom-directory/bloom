@@ -219,6 +219,32 @@ fn polymarket_help_lists_obligations() {
 }
 
 #[test]
+fn polymarket_vfs_trade_confirm_reaches_cli_confirm_path_for_durable_drafts() {
+    let home = fresh_home();
+    let expected = "no draft order-000000001 for wallet my-wallet";
+
+    bloom_cmd(home.path())
+        .args(["polymarket", "confirm", "my-wallet", "order-000000001"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(expected));
+
+    bloom_cmd(home.path())
+        .args([
+            "vfs",
+            "write",
+            "/polymarket/trade/my-wallet/drafts/order-000000001/confirm",
+            "--unlock-wallet",
+            "my-wallet",
+            "--data",
+            "confirm",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(expected));
+}
+
+#[test]
 fn status_prints_version_and_chain_summary() {
     let home = fresh_home();
     bloom_cmd(home.path())
