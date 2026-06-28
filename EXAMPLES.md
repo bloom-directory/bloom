@@ -1582,9 +1582,12 @@ echo '{"asset":"ETH","is_cross":false,"leverage":5}' \
 
 ## 17. Polymarket trading
 
-Prediction-market trading via the `bloom polymarket ...` CLI. VFS surface
-at `/polymarket/` is staging and read-only review; signing lives in the CLI.
-Read `/polymarket/README.md` for the full safety model.
+Prediction-market trading via the `bloom polymarket ...` CLI plus the
+`/polymarket/` VFS surface. VFS can stage trade drafts and pUSD funding
+requests; funding requests can be confirmed with foreground
+`bloom vfs write --unlock-wallet`. Trade draft signing still lives in
+`bloom polymarket confirm`. Read `/polymarket/README.md` for the full safety
+model.
 
 ### Quick path
 
@@ -1594,6 +1597,15 @@ bloom polymarket onboard <wallet>
 
 # 2) Fund (send pUSD to the deposit wallet)
 bloom polymarket fund <wallet> --target-pusd 10 --max-spend 100
+
+# Or stage/review a funding request through VFS, then execute the same request
+# through the foreground CLI VFS path.
+bloom vfs write /polymarket/fund/<wallet>/new \
+  --data '{"target_pusd":"10","max_spend":"100","from_token":"native","slippage_bps":50}'
+cat /bloom/polymarket/fund/<wallet>/<fund-id>/plan.md
+bloom vfs write /polymarket/fund/<wallet>/<fund-id>/confirm \
+  --unlock-wallet <wallet> \
+  --data confirm
 
 # 3) Stage a draft in the VFS
 echo '{"slug":"will-canada-win-2026-world-cup-755",

@@ -216,8 +216,11 @@ it expire after the configured TTL) cancels the stage.
   owner-signed writes at `/hyperliquid/<network>/exchange/<wallet>/...`
   labeled ADVANCED. Read `/hyperliquid/README.md`.
 - **Polymarket** — prediction-market trading via CLI (`bloom polymarket
-  ...`). VFS staging at `/polymarket/...`. A capability primitive
-  (scoped approve, TTL, caps) is in active development — see
+  ...`). VFS staging at `/polymarket/...`; pUSD funding requests can be
+  confirmed with `bloom vfs write /polymarket/fund/<wallet>/<id>/confirm
+  --unlock-wallet <wallet> --data confirm`, while trade draft confirmation
+  still uses `bloom polymarket confirm`. A capability primitive (scoped
+  approve, TTL, caps) is in active development — see
   `docs/plans/2026-06-20-agent-obvious-capability-model.md`.
   Read `/polymarket/README.md`.
 - **Zero-config chain reads** — Ethereum, Base, Arbitrum, Optimism,

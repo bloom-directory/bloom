@@ -1,5 +1,5 @@
 //! `polymarket/...` VFS surface: public market reads, onboarding, account
-//! views, staged funding requests, and read-only trade drafts/receipts.
+//! views, staged funding requests, and trade draft/receipt reviews.
 
 use std::collections::HashSet;
 use std::fs;
@@ -76,11 +76,18 @@ A Polymarket capability primitive (scoped approve, TTL, caps, bounded window
 with no per-trade ceremony) is in active development. See
 `docs/plans/2026-06-20-agent-obvious-capability-model.md` for status.
 
-### 3. VFS staging (read-only review)
-Drafts can be created in the VFS but signing still requires the CLI:
+### 3. VFS staging and fund execution
+Drafts can be created in the VFS but order signing still requires the CLI:
 ```json
  write: /polymarket/trade/<wallet>/new     # Create a reviewable draft
  read:  /polymarket/trade/<wallet>/drafts/<id>/plan.md
+```
+
+Funding requests can be staged and then executed through the foreground CLI VFS
+write path, which unlocks the wallet in the same process that signs:
+```json
+ write: /polymarket/fund/<wallet>/new
+ write: /polymarket/fund/<wallet>/<id>/confirm   # use bloom vfs write --unlock-wallet <wallet>
 ```
 
 ## Safety Model
@@ -89,7 +96,9 @@ Drafts can be created in the VFS but signing still requires the CLI:
 - Policy checks (slug allow/deny, max order, max daily) run per action
 - Onboarding must complete (`bloom polymarket onboard <wallet>`) before any trade
 - Every value-moving CLI action requires a passkey ceremony or unlocked local wallet
-- Funds move only through the CLI; the VFS stages and reviews, it never signs
+- Fund request confirmation uses `bloom vfs write --unlock-wallet <wallet>` so
+  the existing CLI funding engine re-reads live balances/routes and applies the
+  standard tx-engine policy, plan, review, signing, broadcast, and audit gates
 "#;
 
 const BEGIN_HINT: &[u8] = b"write anything here to (re)run onboarding; run in the foreground for passkey wallets; rests at 'fund' for pUSD; progress + liveness: status.json\n";
@@ -99,7 +108,14 @@ Then read drafts/<id>/plan.md. Confirmation still uses `bloom polymarket confirm
 "#;
 const FUND_NEW_HINT: &[u8] = br#"write JSON to create a reviewable pUSD funding request, e.g.
 {"target_pusd":"10","max_spend":"100","from_token":"native","slippage_bps":50}
-Then read <id>/plan.md. Confirmation/staging is not wired on this VFS path yet.
+Then read <id>/plan.md and execute it with:
+bloom vfs write /polymarket/fund/<wallet>/<id>/confirm --unlock-wallet <wallet> --data confirm
+"#;
+const FUND_CONFIRM_HINT: &[u8] = br#"write "confirm" here through the foreground CLI VFS path:
+bloom vfs write /polymarket/fund/<wallet>/<id>/confirm --unlock-wallet <wallet> --data confirm
+
+The confirm path dispatches to the same Polymarket funding execution core as:
+bloom polymarket fund <wallet> --request <id>
 "#;
 
 fn now_ms_u128() -> u128 {
@@ -805,6 +821,7 @@ impl PolymarketHandler {
                 3 if segs[2] == "new" => Ok(Entry::writable_file("new")),
                 3 => Ok(Entry::dir(&segs[2])),
                 4 if FUND_FILES.contains(&segs[3].as_str()) => Ok(Entry::file(&segs[3])),
+                4 if segs[3] == "confirm" => Ok(Entry::writable_file("confirm")),
                 _ => Err(HandlerError::not_found(path.to_string_path())),
             },
             "trade" if self.orders.is_some() => match segs.len() {
@@ -873,6 +890,7 @@ impl PolymarketHandler {
             (Some("onboard"), 3) => self.read_onboard(path, &segs[1], &segs[2]).await,
             (Some("account"), 3) => self.read_account(path, &segs[1], &segs[2]).await,
             (Some("fund"), 3) if segs[2] == "new" => Ok(FUND_NEW_HINT.to_vec()),
+            (Some("fund"), 4) if segs[3] == "confirm" => Ok(FUND_CONFIRM_HINT.to_vec()),
             (Some("fund"), 4) => self.read_fund(path, &segs[1], &segs[2], &segs[3]),
             (Some("trade"), 3) if segs[2] == "new" => Ok(TRADE_NEW_HINT.to_vec()),
             (Some("trade"), 5) => self.read_trade(path, &segs[1], &segs[2], &segs[3], &segs[4]),
@@ -1480,6 +1498,15 @@ impl PolymarketHandler {
             }
             return self.create_fund_request(path, &segs[1], _data).await;
         }
+        if segs.len() == 4 && segs[0] == "fund" && segs[3] == "confirm" {
+            return Err(HandlerError::Unsupported(
+                "fund confirmation must run through the foreground CLI VFS path so the \
+                 wallet unlock and signer live in the same process: \
+                 bloom vfs write /polymarket/fund/<wallet>/<id>/confirm \
+                 --unlock-wallet <wallet> --data confirm"
+                    .into(),
+            ));
+        }
         if segs.len() == 3 && segs[0] == "trade" && segs[2] == "new" {
             if _data.is_empty() {
                 return Err(HandlerError::invalid("empty trade new request"));
@@ -1633,7 +1660,9 @@ impl PolymarketHandler {
             }
             (Some("fund"), 3) if segs[2] != "new" => {
                 self.fund_root_or_not_found(path)?;
-                Ok(FUND_FILES.iter().map(|f| Entry::file(f)).collect())
+                let mut entries: Vec<Entry> = FUND_FILES.iter().map(|f| Entry::file(f)).collect();
+                entries.push(Entry::writable_file("confirm"));
+                Ok(entries)
             }
             (Some("trade"), 1) => {
                 self.orders_or_not_found(path)?;
@@ -2524,5 +2553,25 @@ mod tests {
         assert_eq!(req["max_spend"], "60");
         assert_eq!(req["status"], "draft");
         assert_eq!(req["deposit_wallet_fundable"], true);
+
+        let confirm_path = p(&format!("/fund/alice/{id}/confirm"));
+        assert_eq!(f.handler.lookup(&confirm_path).await.unwrap().mode, 0o644);
+        let entries = f
+            .handler
+            .list(&p(&format!("/fund/alice/{id}")))
+            .await
+            .unwrap();
+        assert!(entries.iter().any(|entry| entry.name == "confirm"));
+        let hint = f.handler.read(&confirm_path).await.unwrap();
+        assert!(String::from_utf8_lossy(&hint).contains("bloom vfs write"));
+        let err = f
+            .handler
+            .write(&confirm_path, b"confirm")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("foreground CLI VFS path"),
+            "expected foreground CLI guidance, got: {err}"
+        );
     }
 }
