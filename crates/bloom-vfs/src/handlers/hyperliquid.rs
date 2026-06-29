@@ -1109,7 +1109,6 @@ impl HyperliquidHandler {
     /// orphaned (persisted but not in the in-memory map) and the owner is unlocked.
     async fn orphan_owner_signer(
         &self,
-        client: &HyperliquidClient,
         network_name: &str,
         wallet: &str,
         id: &str,
@@ -1127,23 +1126,13 @@ impl HyperliquidHandler {
             return Err(HandlerError::NotFound(format!("agent session {id}")));
         }
         let session = persisted_orphan_recovery_session(&session_path, id)?;
-        // Address-only: a safety-cleanup / recovery path needs the identity, not
-        // the trading policy. Use the unverified accessor so a stale/edited
-        // passkey policy signature can't block owner-signed cancel/close.
-        let owner = self
-            .keystore
-            .info_unverified(wallet)
-            .map_err(|e| HandlerError::backend(e.to_string()))?
-            .address;
-        let extra_agents = client
-            .info(json!({"type": "extraAgents", "user": format!("{owner:#x}")}))
-            .await
-            .map_err(err_be)?;
-        if !extra_agents_contains_agent(&extra_agents, &session.agent_address) {
-            return Err(HandlerError::invalid(format!(
-                "persisted agent session {id} is no longer approved on Hyperliquid; purge it instead of using owner recovery"
-            )));
-        }
+        tracing::debug!(
+            network = network_name,
+            wallet,
+            session = id,
+            agent_address = %session.agent_address,
+            "hyperliquid.orphan_recovery_owner_signer"
+        );
         let signer = self.keystore.signer(wallet).map_err(|e| {
             HandlerError::PermissionDenied.with_context(format!(
                 "owner wallet '{wallet}' must be unlocked for orphan recovery: {e}"
@@ -1230,9 +1219,7 @@ impl HyperliquidHandler {
         wallet: &str,
         id: &str,
     ) -> Result<Value, HandlerError> {
-        let owner_signer = self
-            .orphan_owner_signer(client, network_name, wallet, id)
-            .await?;
+        let owner_signer = self.orphan_owner_signer(network_name, wallet, id).await?;
         let vault_address = self.orphan_session_vault(network_name, wallet, id)?;
         let user = self.orphan_recovery_user(wallet, vault_address.as_deref())?;
         let cancels = self.collect_cancel_wires(client, &user).await?;
@@ -1322,9 +1309,7 @@ impl HyperliquidHandler {
         wallet: &str,
         id: &str,
     ) -> Result<Value, HandlerError> {
-        let owner_signer = self
-            .orphan_owner_signer(client, network_name, wallet, id)
-            .await?;
+        let owner_signer = self.orphan_owner_signer(network_name, wallet, id).await?;
         let vault_address = self.orphan_session_vault(network_name, wallet, id)?;
         let user = self.orphan_recovery_user(wallet, vault_address.as_deref())?;
         // Cancel resting orders first, then reduce-only-close positions.
@@ -1427,6 +1412,12 @@ impl HyperliquidHandler {
         };
         let cancels = self.collect_cancel_wires(client, &user).await?;
         if cancels.is_empty() {
+            if forced {
+                let post_submit = self
+                    .refresh_session_snapshot(client, &active, false)
+                    .await?;
+                require_forced_cancel_clean(post_submit.as_ref())?;
+            }
             let response = json!({"status": "noop", "reason": "no open orders"});
             self.append_session_audit(
                 network_name,
@@ -1461,6 +1452,9 @@ impl HyperliquidHandler {
         let post_submit = self
             .refresh_session_snapshot(client, &active, false)
             .await?;
+        if forced {
+            require_forced_cancel_clean(post_submit.as_ref())?;
+        }
         self.append_session_audit(
             network_name,
             wallet,
@@ -1522,6 +1516,12 @@ impl HyperliquidHandler {
         };
         let closes = self.collect_reduce_only_closes(client, &user).await?;
         if closes.is_empty() {
+            if forced {
+                let post_submit = self
+                    .refresh_session_snapshot(client, &active, false)
+                    .await?;
+                require_forced_close_clean(post_submit.as_ref())?;
+            }
             let response = json!({"status": "noop", "reason": "no open positions", "cancel_all": cancel_response});
             self.append_session_audit(
                 network_name,
@@ -1559,6 +1559,9 @@ impl HyperliquidHandler {
         let post_submit = self
             .refresh_session_snapshot(client, &active, false)
             .await?;
+        if forced {
+            require_forced_close_clean(post_submit.as_ref())?;
+        }
         let response = json!({"cancel_all": cancel_response, "close": close_response});
         self.append_session_audit(
             network_name,
@@ -1808,7 +1811,7 @@ impl HyperliquidHandler {
         // Trading is opt-in: an unconfigured [hyperliquid] policy denies all
         // signed actions, matching the agent-session ceremony (which already
         // requires a configured policy). No silent permissive default.
-        if !policy.is_configured() {
+        if !policy.is_trading_configured() {
             return Err(HandlerError::invalid(
                 "Hyperliquid trading is not enabled for this wallet — add a [hyperliquid] policy \
                  block (allowed_assets / max_notional_usd / …) to its policy.toml",
@@ -1833,6 +1836,7 @@ impl HyperliquidHandler {
                 };
                 let meta = client.info(json!({"type": "meta"})).await.ok();
                 let asset_to_coin = perp_asset_to_coin_map(meta.as_ref());
+                let mut projected_by_coin: HashMap<String, u64> = HashMap::new();
                 for o in orders {
                     let order_type = if o.order_type.trigger.is_some() {
                         "trigger"
@@ -1840,21 +1844,26 @@ impl HyperliquidHandler {
                         "limit"
                     };
                     let coin = asset_to_coin.get(&o.asset).cloned();
-                    let position = snapshot
-                        .as_ref()
-                        .and_then(|s| coin.as_deref().and_then(|c| s.position_micro(c)));
+                    let notional = notional_micro(&o.size, &o.price);
+                    let position = coin.as_ref().and_then(|c| {
+                        if let Some(projected) = projected_by_coin.get(c) {
+                            Some(*projected)
+                        } else {
+                            snapshot.as_ref().and_then(|s| s.position_micro(c))
+                        }
+                    });
                     let resting = snapshot
                         .as_ref()
                         .and_then(|s| coin.as_deref().and_then(|c| s.resting_micro(c)));
                     ctxs.push(HyperliquidActionCtx {
                         wallet: wallet.to_string(),
                         action_kind: kind.clone(),
-                        asset: coin,
+                        asset: coin.clone(),
                         reduce_only: o.reduce_only,
                         order_type: Some(order_type.to_string()),
                         builder_fee,
                         vault_or_subaccount: vault,
-                        notional_microusd: notional_micro(&o.size, &o.price),
+                        notional_microusd: notional,
                         position_microusd: position,
                         resting_notional_microusd: resting,
                         est_unrealized_loss_microusd: snapshot
@@ -1863,6 +1872,12 @@ impl HyperliquidHandler {
                         snapshot_readable: !need_snapshot || snapshot.is_some(),
                         ..Default::default()
                     });
+                    if !o.reduce_only
+                        && let (Some(coin), Some(notional)) = (coin, notional)
+                    {
+                        let current = position.unwrap_or(0);
+                        projected_by_coin.insert(coin, current.saturating_add(notional));
+                    }
                 }
             }
             ExchangeAction::UpdateLeverage {
@@ -3232,16 +3247,9 @@ fn persisted_orphan_recovery_session(
         .get("stopped")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let orphaned = value
-        .get("orphaned")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let tradable = value
-        .get("tradable")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
     let status = value.get("status").and_then(Value::as_str).unwrap_or("");
-    if stopped || !orphaned || tradable || status != "Active" {
+    let cleanup_completed_ms = optional_u64(&value, "cleanup_completed_ms");
+    if stopped || cleanup_completed_ms.is_some() || status != "Active" {
         return Err(HandlerError::invalid(format!(
             "persisted agent session {id} is not eligible for orphan recovery"
         )));
@@ -3459,6 +3467,36 @@ fn snapshot_json(snapshot: Option<&HlSnapshot>) -> Value {
         }),
         None => Value::Null,
     }
+}
+
+fn require_forced_cancel_clean(snapshot: Option<&HlSnapshot>) -> Result<(), HandlerError> {
+    let Some(snapshot) = snapshot else {
+        return Err(HandlerError::backend(
+            "forced cancel cleanup could not verify post-submit account state",
+        ));
+    };
+    if snapshot.open_orders != 0 {
+        return Err(HandlerError::backend(format!(
+            "forced cancel cleanup left {} open order(s)",
+            snapshot.open_orders
+        )));
+    }
+    Ok(())
+}
+
+fn require_forced_close_clean(snapshot: Option<&HlSnapshot>) -> Result<(), HandlerError> {
+    let Some(snapshot) = snapshot else {
+        return Err(HandlerError::backend(
+            "forced close cleanup could not verify post-submit account state",
+        ));
+    };
+    if snapshot.open_orders != 0 || snapshot.open_positions != 0 {
+        return Err(HandlerError::backend(format!(
+            "forced close cleanup left {} open order(s) and {} open position(s)",
+            snapshot.open_orders, snapshot.open_positions
+        )));
+    }
+    Ok(())
 }
 
 fn coin_from_json_file(file: &str) -> Result<String, HandlerError> {
@@ -3845,10 +3883,13 @@ impl HlSnapshot {
 
         let mut positions = std::collections::HashMap::new();
         let mut loss_sum = U256::ZERO;
+        let mut loss_readable = false;
         let mut open_positions = 0u32;
         if let Some(arr) = v.get("assetPositions").and_then(|p| p.as_array()) {
+            loss_readable = true;
             for ap in arr {
                 let Some(pos) = ap.get("position") else {
+                    loss_readable = false;
                     continue;
                 };
                 if let (Some(coin), Some(pv)) = (
@@ -3861,15 +3902,28 @@ impl HlSnapshot {
                         open_positions = open_positions.saturating_add(1);
                     }
                 }
-                if let Some(upnl_str) = pos.get("unrealizedPnl").and_then(|p| p.as_str())
-                    && upnl_str.starts_with('-')
-                    && let Some(loss_micro) = str_to_micro(&upnl_str[1..])
-                {
-                    loss_sum = loss_sum.saturating_add(U256::from(loss_micro));
+                match pos.get("unrealizedPnl").and_then(|p| p.as_str()) {
+                    Some(upnl_str) if upnl_str.starts_with('-') => {
+                        if let Some(loss_micro) = str_to_micro(&upnl_str[1..]) {
+                            loss_sum = loss_sum.saturating_add(U256::from(loss_micro));
+                        } else {
+                            loss_readable = false;
+                        }
+                    }
+                    Some(upnl_str) => {
+                        if str_to_micro(upnl_str).is_none() {
+                            loss_readable = false;
+                        }
+                    }
+                    None => loss_readable = false,
                 }
             }
         }
-        let unrealized_loss: Option<u64> = loss_sum.try_into().ok();
+        let unrealized_loss: Option<u64> = if loss_readable {
+            loss_sum.try_into().ok()
+        } else {
+            None
+        };
         HlSnapshot {
             account_value,
             unrealized_loss,
@@ -4551,6 +4605,14 @@ mod tests {
 
         std::fs::write(
             &path,
+            br#"{"id":"session-1","wallet":"minnow","agent_address":"0xabc","status":"Active","stopped":false,"orphaned":false,"tradable":true}"#,
+        )
+        .unwrap();
+        let session = persisted_orphan_recovery_session(&path, "session-1").unwrap();
+        assert_eq!(session.agent_address, "0xabc");
+
+        std::fs::write(
+            &path,
             br#"{"id":"session-1","wallet":"minnow","agent_address":"0xabc","status":"Expired","stopped":true,"orphaned":false,"tradable":false}"#,
         )
         .unwrap();
@@ -4657,5 +4719,20 @@ mod tests {
         assert_eq!(s.position_micro("SOL"), None);
         // Only the negative uPnL counts as loss (25.5), the +10 is ignored.
         assert_eq!(s.unrealized_loss, Some(25_500_000));
+    }
+
+    #[test]
+    fn snapshot_marks_unrealized_loss_unreadable_when_pnl_missing() {
+        let v = json!({
+            "marginSummary": { "accountValue": "1000.0" },
+            "assetPositions": [
+                { "position": { "coin": "BTC", "positionValue": "500.0" } }
+            ]
+        });
+        let s = HlSnapshot::from_clearinghouse(&v);
+        assert_eq!(s.unrealized_loss, None);
+
+        let s = HlSnapshot::from_clearinghouse(&json!({}));
+        assert_eq!(s.unrealized_loss, None);
     }
 }

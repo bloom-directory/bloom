@@ -435,6 +435,20 @@ impl IpcServer {
             )
             .map_err(|e| HandlerError::backend(e.to_string()))?;
         }
+        // Paid request confirms can sign x402 or Tempo MPP credentials. The VFS
+        // handler consumes this one-time marker so direct mounted writes cannot
+        // reuse a cached signer without passing through write_unlocked.
+        if let Some(home) = keystore.root().parent()
+            && let Some(id) = request_confirm_id(home, &path)
+        {
+            let confirm_value = String::from_utf8_lossy(&bytes).trim().to_ascii_lowercase();
+            bloom_vfs::handlers::requests::persist_request_confirm_approved(
+                home,
+                &id,
+                wallet,
+                &confirm_value,
+            )?;
+        }
         self.vfs.write(&path, &bytes).await
     }
 
@@ -748,7 +762,11 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
                 && branch == "exchange"
                 && matches!(
                     leaf.as_str(),
-                    "order.json" | "cancel.json" | "schedule_cancel.json" | "update_leverage.json"
+                    "order.json"
+                        | "cancel.json"
+                        | "schedule_cancel.json"
+                        | "update_leverage.json"
+                        | "send_asset.json"
                 ) =>
         {
             true
@@ -759,6 +777,30 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         [root, _wallet, file] if root == "wallets" && file == "policy.toml" => true,
         _ => false,
     }
+}
+
+fn request_confirm_id(home: &Path, path: &VfsPath) -> Option<String> {
+    match path.segments() {
+        [root, reference, action] if root == "requests" && action == "confirm" => {
+            if reference == "latest" {
+                latest_pending_request_id(home)
+            } else {
+                Some(reference.to_string())
+            }
+        }
+        [root, state, id, action]
+            if root == "requests" && state == "pending" && action == "confirm" =>
+        {
+            Some(id.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn latest_pending_request_id(home: &Path) -> Option<String> {
+    let latest = std::fs::read_to_string(home.join("requests").join("latest")).ok()?;
+    let (state, id) = latest.trim().split_once('/')?;
+    (state == "pending").then(|| id.to_string())
 }
 
 fn is_wallet_policy_write(wallet: &str, path: &VfsPath) -> bool {
@@ -1378,6 +1420,7 @@ mod tests {
             "/hyperliquid/mainnet/exchange/minnow/cancel.json",
             "/hyperliquid/mainnet/exchange/minnow/schedule_cancel.json",
             "/hyperliquid/mainnet/exchange/minnow/update_leverage.json",
+            "/hyperliquid/mainnet/exchange/minnow/send_asset.json",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(write_path_uses_wallet_signer(&p), "{path}");

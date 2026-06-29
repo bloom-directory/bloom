@@ -97,6 +97,23 @@ impl HyperliquidPolicy {
             || !self.allow_vault_or_subaccount
     }
 
+    /// True when the policy contains at least one trading constraint. Transfer
+    /// and session-only fields do not make owner-signed orders safe by
+    /// themselves.
+    pub fn is_trading_configured(&self) -> bool {
+        !self.allowed_assets.is_empty()
+            || !self.allowed_order_types.is_empty()
+            || self.max_notional_usd.is_some()
+            || self.max_position_usd.is_some()
+            || self.max_loss_usd.is_some()
+            || self.max_leverage.is_some()
+            || !self.allow_reduce_only
+            || !self.allow_trigger_orders
+            || !self.allow_twap
+            || !self.allow_builder_fees
+            || !self.allow_vault_or_subaccount
+    }
+
     /// True when the policy has the minimum caps required to mint a bounded
     /// trading session. Without all four of these an agent session would have
     /// no meaningful per-order size, position, or loss limit.
@@ -447,9 +464,13 @@ pub fn evaluate_hyperliquid_action(
         // snapshot only. Session-level realized + unrealized drawdown belongs
         // to the Hyperliquid session monitor, which can halt and flatten
         // independently of this pure action evaluator.
-        let loss = ctx.est_unrealized_loss_microusd.unwrap_or(0);
-        if loss > cap {
-            out.push(check(
+        match ctx.est_unrealized_loss_microusd {
+            None => out.push(check(
+                "max_loss_usd",
+                PolicyOutcome::Deny,
+                "loss cap configured but unrealized-loss snapshot is unavailable (fail closed)",
+            )),
+            Some(loss) if loss > cap => out.push(check(
                 "max_loss_usd",
                 PolicyOutcome::Deny,
                 format!(
@@ -457,13 +478,12 @@ pub fn evaluate_hyperliquid_action(
                     fmt_usd(loss),
                     fmt_usd(cap)
                 ),
-            ));
-        } else {
-            out.push(check(
+            )),
+            Some(loss) => out.push(check(
                 "max_loss_usd",
                 PolicyOutcome::Pass,
                 format!("loss {} <= {}", fmt_usd(loss), fmt_usd(cap)),
-            ));
+            )),
         }
     }
 
@@ -607,6 +627,17 @@ mod tests {
         };
         let mut ctx = order_ctx("BTC");
         ctx.snapshot_readable = false;
+        assert!(denied(&evaluate_hyperliquid_action(&p, &ctx)));
+    }
+
+    #[test]
+    fn loss_cap_fails_closed_without_loss_snapshot() {
+        let p = HyperliquidPolicy {
+            max_loss_usd: Some(20 * MICRO_USD),
+            ..Default::default()
+        };
+        let mut ctx = order_ctx("BTC");
+        ctx.est_unrealized_loss_microusd = None;
         assert!(denied(&evaluate_hyperliquid_action(&p, &ctx)));
     }
 
@@ -788,5 +819,28 @@ mod tests {
         };
         assert!(p.is_configured());
         assert!(!p.is_session_capable()); // but NOT session-capable
+    }
+
+    #[test]
+    fn trading_config_excludes_transfer_and_session_only_fields() {
+        let transfer_only = HyperliquidPolicy {
+            transfer_cap_usd: Some(100 * MICRO_USD),
+            withdrawal_cap_usd: Some(100 * MICRO_USD),
+            max_session_secs: Some(60),
+            ..Default::default()
+        };
+        assert!(transfer_only.is_configured());
+        assert!(!transfer_only.is_trading_configured());
+        assert!(!transfer_only.is_session_capable());
+
+        let session_capable = HyperliquidPolicy {
+            allowed_assets: BTreeSet::from(["BTC".to_string()]),
+            max_notional_usd: Some(10 * MICRO_USD),
+            max_position_usd: Some(100 * MICRO_USD),
+            max_loss_usd: Some(5 * MICRO_USD),
+            ..Default::default()
+        };
+        assert!(session_capable.is_trading_configured());
+        assert!(session_capable.is_session_capable());
     }
 }

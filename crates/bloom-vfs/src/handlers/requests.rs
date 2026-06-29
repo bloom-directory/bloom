@@ -27,6 +27,8 @@ use url::Url;
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
 
+const CONFIRM_APPROVAL_FILE: &str = ".confirm_approved.json";
+
 #[derive(Clone)]
 pub struct RequestsHandler {
     root: PathBuf,
@@ -412,6 +414,7 @@ impl RequestsHandler {
             .as_deref()
             .ok_or_else(|| HandlerError::backend("request.toml missing wallet"))?
             .to_string();
+        consume_request_confirm_approved(&pending, &wallet, &value)?;
         let host = request.url.host_str().unwrap_or("unknown").to_string();
         let mut challenge: NormalizedChallenge = read_json(pending.join("challenge.json"))?;
         let policy = self.wallet_policy(&wallet)?;
@@ -613,6 +616,50 @@ impl RequestsHandler {
         self.write_latest(target_state, id)?;
         Ok(())
     }
+}
+
+pub fn persist_request_confirm_approved(
+    root: &Path,
+    id: &str,
+    wallet: &str,
+    confirm_value: &str,
+) -> Result<(), HandlerError> {
+    let dir = root.join("requests").join("pending").join(id);
+    fs::write(
+        dir.join(CONFIRM_APPROVAL_FILE),
+        serde_json::to_vec_pretty(&json!({
+            "schema": "bloom.requests.confirm_approved.v1",
+            "wallet": wallet,
+            "confirm_value": confirm_value,
+        }))
+        .map_err(|e| HandlerError::backend(e.to_string()))?,
+    )?;
+    Ok(())
+}
+
+fn consume_request_confirm_approved(
+    pending: &Path,
+    wallet: &str,
+    confirm_value: &str,
+) -> Result<(), HandlerError> {
+    let path = pending.join(CONFIRM_APPROVAL_FILE);
+    let approval: serde_json::Value = read_json(&path).map_err(|e| match e {
+        HandlerError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            HandlerError::invalid("request confirm requires write_unlocked approval")
+        }
+        other => other,
+    })?;
+    let ok = approval.get("schema").and_then(|v| v.as_str())
+        == Some("bloom.requests.confirm_approved.v1")
+        && approval.get("wallet").and_then(|v| v.as_str()) == Some(wallet)
+        && approval.get("confirm_value").and_then(|v| v.as_str()) == Some(confirm_value);
+    if !ok {
+        return Err(HandlerError::invalid(
+            "request confirm approval does not match wallet or confirmation text",
+        ));
+    }
+    fs::remove_file(path)?;
+    Ok(())
 }
 
 #[async_trait]
@@ -1243,6 +1290,18 @@ mod tests {
             ),
             _tmp: tmp,
         }
+    }
+
+    #[test]
+    fn request_confirm_approval_is_matching_and_one_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pending = tmp.path().join("requests").join("pending").join("req_1");
+        std::fs::create_dir_all(&pending).unwrap();
+
+        persist_request_confirm_approved(tmp.path(), "req_1", "alice", "confirm").unwrap();
+        assert!(consume_request_confirm_approved(&pending, "alice", "y").is_err());
+        assert!(consume_request_confirm_approved(&pending, "alice", "confirm").is_ok());
+        assert!(consume_request_confirm_approved(&pending, "alice", "confirm").is_err());
     }
 
     async fn mock_server(

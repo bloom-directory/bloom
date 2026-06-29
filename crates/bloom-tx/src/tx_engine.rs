@@ -1282,7 +1282,13 @@ impl TxEngine {
             Ok(h) => h,
             Err(e) => {
                 if let Some((sid, amt)) = session_debit {
-                    self.session_store.refund(&sid, amt);
+                    let attempted = self
+                        .outbox
+                        .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
+                        .is_some();
+                    if !attempted {
+                        self.session_store.refund(&sid, amt);
+                    }
                 }
                 return Err(e);
             }
@@ -2803,6 +2809,54 @@ mod tests {
             .expect("confirm attempt marker");
         assert_eq!(attempt.transport, BroadcastTransport::PublicRpc);
         assert!(entry.dir.join("raw_tx").exists());
+    }
+
+    #[tokio::test]
+    async fn confirm_keeps_session_debit_after_broadcast_attempt_error() {
+        let (engine, spec, dir) = fake_engine(60_000);
+        let permit = permit_for(&dir);
+        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let policy = bloom_proto::Policy::default();
+
+        let mut staged = fake_staged_1559("0001-session-attempt");
+        staged.expires_ms = now_ms() + 60_000;
+        staged.usd_value = Some(2.0);
+        engine.outbox.write_pending(&staged, "p").unwrap();
+        engine.session_store.mint(crate::session::ActiveSession {
+            id: "session-attempt".into(),
+            wallet: "alice".into(),
+            chains: std::collections::BTreeSet::from([31337]),
+            expires_ms: now_ms() + 60_000,
+            max_micro_usd: 5_000_000,
+            spent_micro_usd: 0,
+            allowed_pending_ids: std::collections::BTreeSet::from([crate::session::pending_key(
+                31337,
+                "0001-session-attempt",
+            )]),
+        });
+
+        let r = engine
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-session-attempt",
+                &chain,
+                &signer,
+                &policy,
+                "y",
+                None,
+            )
+            .await;
+        assert!(r.is_err(), "unreachable public RPC should fail");
+        let session = engine
+            .session_store
+            .active(now_ms())
+            .into_iter()
+            .find(|s| s.id == "session-attempt")
+            .expect("session remains active");
+        assert_eq!(session.spent_micro_usd, 2_000_000);
     }
 
     #[tokio::test]
