@@ -60,9 +60,7 @@ fn polymarket_clob_client(pm_cfg: &bloom_proto::config::PolymarketConfig) -> Clo
     clob
 }
 
-fn polymarket_geoblock_client(
-    pm_cfg: &bloom_proto::config::PolymarketConfig,
-) -> GeoblockClient {
+fn polymarket_geoblock_client(pm_cfg: &bloom_proto::config::PolymarketConfig) -> GeoblockClient {
     let Ok(base) = url::Url::parse(&pm_cfg.gamma_url) else {
         return GeoblockClient::new();
     };
@@ -177,10 +175,7 @@ fn evaluate_policy(
 }
 
 /// Geoblock gate, differentiated by what the operation does to risk.
-async fn geoblock_gate(
-    pm_cfg: &bloom_proto::config::PolymarketConfig,
-    side: Side,
-) -> Result<()> {
+async fn geoblock_gate(pm_cfg: &bloom_proto::config::PolymarketConfig, side: Side) -> Result<()> {
     match polymarket_geoblock_client(pm_cfg).check().await {
         Ok(geo) if geo.blocked => {
             // Affirmative block: no new trades, buy or sell. (Cancel has its

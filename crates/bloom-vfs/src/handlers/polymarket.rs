@@ -93,6 +93,27 @@ write path, which unlocks the wallet in the same process that signs:
  write: /polymarket/fund/<wallet>/<id>/confirm   # use bloom vfs write --unlock-wallet <wallet>
 ```
 
+### 4. Risk-reducing and exit actions (foreground confirmation)
+Redeem, revoke-approvals, and pUSD withdraw are owner-signed, so the mounted
+handler advertises the path and refuses direct execution; confirm through the
+foreground CLI VFS write path so the signer ceremony stays in-process:
+```json
+ write: /polymarket/redeem/<wallet>/<slug>/confirm                  --unlock-wallet <wallet> --data confirm
+ write: /polymarket/revoke-approvals/<wallet>/request/confirm       --unlock-wallet <wallet> --data confirm
+ write: /polymarket/withdraw/<wallet>/pusd/confirm                  --unlock-wallet <wallet> --data '{"confirm":true,"amount":"<amount|all>"}'
+```
+Each dispatches to the same core as the matching CLI command (`bloom polymarket
+redeem|revoke-approvals|withdraw-pusd`). Print the plan first with the CLI
+`--dry-run` flag. pUSD withdraw requires an explicit `amount` in the body (the
+path carries no amount slot); a bare `confirm` is rejected.
+
+Cancel is risk-reducing and uses stored CLOB credentials (no owner signing), so
+it executes directly in the VFS -- no foreground ceremony is needed:
+```json
+ write: /polymarket/trade/<wallet>/orders/<order-id>/cancel          --data confirm
+```
+Discover resting order ids with `/polymarket/account/<wallet>/orders.json`.
+
 ## Safety Model
 
 - Reads are always safe (no signing needed)
@@ -105,6 +126,11 @@ write path, which unlocks the wallet in the same process that signs:
 - Fund request confirmation uses `bloom vfs write --unlock-wallet <wallet>` so
   the existing CLI funding engine re-reads live balances/routes and applies the
   standard tx-engine policy, plan, review, signing, broadcast, and audit gates
+- Redeem, revoke-approvals, and pUSD withdraw confirmation use
+  `bloom vfs write --unlock-wallet <wallet>` so the existing CLI cores re-check
+  onboarding state, redeemable status / pUSD balance, the passkey ceremony, the
+  gasless relayer batch, and (for revoke) post-confirm on-chain allowance
+  verification -- the mounted handler only advertises and refuses
 "#;
 
 const BEGIN_HINT: &[u8] = b"write anything here to (re)run onboarding; run in the foreground for passkey wallets; rests at 'fund' for pUSD; progress + liveness: status.json\n";
@@ -129,6 +155,44 @@ bloom vfs write /polymarket/fund/<wallet>/<id>/confirm --unlock-wallet <wallet> 
 
 The confirm path dispatches to the same Polymarket funding execution core as:
 bloom polymarket fund <wallet> --request <id>
+"#;
+const REDEEM_CONFIRM_HINT: &[u8] = br#"write "confirm" here through the foreground CLI VFS path:
+bloom vfs write /polymarket/redeem/<wallet>/<slug>/confirm --unlock-wallet <wallet> --data confirm
+
+The confirm path dispatches to the same Polymarket redemption core as:
+bloom polymarket redeem <wallet> <slug>
+
+Print the plan first with: bloom polymarket redeem <wallet> <slug> --dry-run
+"#;
+const REVOKE_APPROVALS_CONFIRM_HINT: &[u8] = br#"write "confirm" here through the foreground CLI VFS path:
+bloom vfs write /polymarket/revoke-approvals/<wallet>/request/confirm --unlock-wallet <wallet> --data confirm
+
+The confirm path dispatches to the same Polymarket revoke-approvals core as:
+bloom polymarket revoke-approvals <wallet>
+
+Print the plan first with: bloom polymarket revoke-approvals <wallet> --dry-run
+"#;
+const WITHDRAW_PUSD_CONFIRM_HINT: &[u8] = br#"write a JSON/TOML body here through the foreground CLI VFS path, e.g.
+{"confirm":true,"amount":"all"}
+bloom vfs write /polymarket/withdraw/<wallet>/pusd/confirm --unlock-wallet <wallet> --data '{"confirm":true,"amount":"10"}'
+
+The amount is value-moving and must be stated in the body (the path carries no
+amount slot); a bare "confirm" is rejected. The confirm path dispatches to the
+same Polymarket pUSD withdrawal core as:
+bloom polymarket withdraw-pusd <wallet> <amount|all>
+
+Print the plan first with: bloom polymarket withdraw-pusd <wallet> <amount|all> --dry-run
+"#;
+const CANCEL_HINT: &[u8] = br#"write "confirm" here to cancel this resting CLOB order.
+
+Cancellation is risk-reducing and executes directly in the VFS -- no wallet
+unlock is needed because it uses the wallet's stored CLOB credentials (L2 auth
+only). Geoblock is warning-only for cancel.
+
+Equivalent CLI:
+bloom polymarket cancel <wallet> <order-id>
+
+Discover resting order ids with: bloom vfs cat /polymarket/account/<wallet>/orders.json
 "#;
 
 fn now_ms_u128() -> u128 {
@@ -529,6 +593,79 @@ impl PolymarketHandler {
             .map(str::to_string)
             .ok_or_else(|| HandlerError::not_found(format!("market '{slug}' has no CLOB token")))
     }
+
+    /// Direct VFS execution of `bloom polymarket cancel`. Cancel is
+    /// risk-reducing and uses stored CLOB credentials (L2 auth only, no owner
+    /// signing), so unlike the value-moving confirm paths it can run inside the
+    /// mounted handler rather than being forced through the foreground ceremony.
+    ///
+    /// # Handler-Executable Criteria
+    /// An operation may execute directly in the mounted handler (bypassing the
+    /// foreground ceremony) only if ALL of the following are true:
+    /// - No EVM owner signing is required (L2 CLOB credentials only).
+    /// - The operation is risk-reducing (cannot move funds or increase risk).
+    /// - Geoblock is warning-only (the operation proceeds even if blocked).
+    ///
+    /// If any criterion is false, the operation MUST go through the foreground
+    /// confirm path (`bloom vfs write --unlock-wallet`). The regression test
+    /// `only_cancel_is_handler_executable_all_other_writes_refuse` guards this
+    /// boundary so adding a new handler-executable path is a conscious decision.
+    async fn execute_cancel(&self, wallet: &str, order_id: &str) -> Result<(), HandlerError> {
+        validate_wallet_name(wallet).map_err(err_be)?;
+        // order-id path-traversal guard (real format validation is the CLOB's job).
+        if order_id.is_empty()
+            || order_id.contains('/')
+            || order_id.contains('\\')
+            || order_id == "."
+            || order_id == ".."
+        {
+            return Err(HandlerError::invalid(format!(
+                "invalid Polymarket order id '{order_id}'"
+            )));
+        }
+        // Resolve all local state first so durable refusals happen before any
+        // network call (geoblock is warning-only for cancel, mirroring the CLI).
+        let info = self
+            .keystore
+            .info(wallet)
+            .map_err(|e| HandlerError::not_found(format!("wallet '{wallet}': {e}")))?;
+        let ob = self.onboarding.as_ref().ok_or_else(|| {
+            HandlerError::invalid(
+                "polymarket onboarding is not wired: the daemon needs a [chains] entry \
+                 whose chain_id matches [polymarket].chain_id (Polygon = 137)",
+            )
+        })?;
+        let creds =
+            ob.creds.load(wallet).map_err(err_be)?.ok_or_else(|| {
+                HandlerError::invalid("wallet not onboarded (no CLOB credentials)")
+            })?;
+        // Geoblock is warning-only for cancel (risk-reducing); it never blocks.
+        match GeoblockClient::new().check().await {
+            Ok(geo) if geo.blocked => {
+                tracing::warn!("geoblock reports blocked; cancel proceeds (risk-reducing)");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("geoblock check unavailable ({e}); cancel proceeds"),
+        }
+        let store = self
+            .orders
+            .as_deref()
+            .ok_or_else(|| HandlerError::invalid("polymarket order store is not configured"))?;
+        let _lock = store.lock(wallet).map_err(err_be)?;
+        let result = self
+            .clob
+            .cancel_order(&creds, info.address, order_id)
+            .await
+            .map_err(err_be)?;
+        store
+            .audit(
+                wallet,
+                "order_cancelled",
+                serde_json::json!({ "order_id": order_id, "response": result }),
+            )
+            .map_err(err_be)?;
+        Ok(())
+    }
 }
 
 fn err_be(e: PolymarketError) -> HandlerError {
@@ -852,6 +989,43 @@ impl PolymarketHandler {
                 5 if segs[2] == "receipts" && segs[4] == "receipt.json" => {
                     Ok(Entry::file(&segs[4]))
                 }
+                3 if segs[2] == "orders" => Ok(Entry::dir("orders")),
+                4 if segs[2] == "orders" => Ok(Entry::dir(&segs[3])),
+                5 if segs[2] == "orders" && segs[4] == "cancel" => {
+                    Ok(Entry::writable_file("cancel"))
+                }
+                _ => Err(HandlerError::not_found(path.to_string_path())),
+            },
+            // Redeem is foreground-confirm only: the handler advertises the
+            // confirm leaf and renders guidance; execution is refused here and
+            // routed through the foreground CLI so the signer is in-process.
+            "redeem" if self.orders.is_some() => match segs.len() {
+                1 => Ok(Entry::dir("redeem")),
+                2 => Ok(Entry::dir(&segs[1])),
+                3 => Ok(Entry::dir(&segs[2])),
+                4 if segs[3] == "confirm" => Ok(Entry::writable_file("confirm")),
+                _ => Err(HandlerError::not_found(path.to_string_path())),
+            },
+            // Revoke-approvals is a singleton action keyed by the literal
+            // `request` segment; foreground-confirm only.
+            "revoke-approvals" if self.orders.is_some() => match segs.len() {
+                1 => Ok(Entry::dir("revoke-approvals")),
+                2 => Ok(Entry::dir(&segs[1])),
+                3 if segs[2] == "request" => Ok(Entry::dir("request")),
+                4 if segs[2] == "request" && segs[3] == "confirm" => {
+                    Ok(Entry::writable_file("confirm"))
+                }
+                _ => Err(HandlerError::not_found(path.to_string_path())),
+            },
+            // pUSD withdraw is a singleton action keyed by the literal `pusd`
+            // segment; foreground-confirm only. The amount travels in the body.
+            "withdraw" if self.orders.is_some() => match segs.len() {
+                1 => Ok(Entry::dir("withdraw")),
+                2 => Ok(Entry::dir(&segs[1])),
+                3 if segs[2] == "pusd" => Ok(Entry::dir("pusd")),
+                4 if segs[2] == "pusd" && segs[3] == "confirm" => {
+                    Ok(Entry::writable_file("confirm"))
+                }
                 _ => Err(HandlerError::not_found(path.to_string_path())),
             },
             _ => Err(HandlerError::not_found(path.to_string_path())),
@@ -912,7 +1086,17 @@ impl PolymarketHandler {
             (Some("trade"), 5) if segs[2] == "drafts" && segs[4] == "confirm" => {
                 Ok(TRADE_CONFIRM_HINT.to_vec())
             }
+            (Some("trade"), 5) if segs[2] == "orders" && segs[4] == "cancel" => {
+                Ok(CANCEL_HINT.to_vec())
+            }
             (Some("trade"), 5) => self.read_trade(path, &segs[1], &segs[2], &segs[3], &segs[4]),
+            (Some("redeem"), 4) if segs[3] == "confirm" => Ok(REDEEM_CONFIRM_HINT.to_vec()),
+            (Some("revoke-approvals"), 4) if segs[2] == "request" && segs[3] == "confirm" => {
+                Ok(REVOKE_APPROVALS_CONFIRM_HINT.to_vec())
+            }
+            (Some("withdraw"), 4) if segs[2] == "pusd" && segs[3] == "confirm" => {
+                Ok(WITHDRAW_PUSD_CONFIRM_HINT.to_vec())
+            }
             (Some("README.md"), 1) => Ok(README.to_vec()),
             _ => Err(HandlerError::NotAFile(path.to_string_path())),
         }
@@ -1541,6 +1725,50 @@ impl PolymarketHandler {
                     .into(),
             ));
         }
+        // Cancel is risk-reducing and uses stored CLOB creds (no owner signing),
+        // so it executes directly here rather than refusing like the confirm paths.
+        if segs.len() == 5 && segs[0] == "trade" && segs[2] == "orders" && segs[4] == "cancel" {
+            let trimmed = std::str::from_utf8(_data)
+                .map(|s| s.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            if !matches!(trimmed.as_str(), "confirm" | "y" | "yes") {
+                return Err(HandlerError::invalid(
+                    "cancel request body must be 'confirm', 'y', or 'yes'",
+                ));
+            }
+            return self.execute_cancel(&segs[1], &segs[3]).await;
+        }
+        if segs.len() == 4 && segs[0] == "redeem" && segs[3] == "confirm" {
+            return Err(HandlerError::Unsupported(
+                "redeem confirmation must run through the foreground CLI VFS path so the \
+                 wallet unlock and signer live in the same process: \
+                 bloom vfs write /polymarket/redeem/<wallet>/<slug>/confirm \
+                 --unlock-wallet <wallet> --data confirm"
+                    .into(),
+            ));
+        }
+        if segs.len() == 4
+            && segs[0] == "revoke-approvals"
+            && segs[2] == "request"
+            && segs[3] == "confirm"
+        {
+            return Err(HandlerError::Unsupported(
+                "revoke-approvals confirmation must run through the foreground CLI VFS path so the \
+                 wallet unlock and signer live in the same process: \
+                 bloom vfs write /polymarket/revoke-approvals/<wallet>/request/confirm \
+                 --unlock-wallet <wallet> --data confirm"
+                    .into(),
+            ));
+        }
+        if segs.len() == 4 && segs[0] == "withdraw" && segs[2] == "pusd" && segs[3] == "confirm" {
+            return Err(HandlerError::Unsupported(
+                "pUSD withdrawal confirmation must run through the foreground CLI VFS path so the \
+                 wallet unlock and signer live in the same process: \
+                 bloom vfs write /polymarket/withdraw/<wallet>/pusd/confirm \
+                 --unlock-wallet <wallet> --data '{\"confirm\":true,\"amount\":\"<amount|all>\"}'"
+                    .into(),
+            ));
+        }
         if !(segs.len() == 3 && segs[0] == "onboard" && segs[2] == "begin") {
             return Err(HandlerError::PermissionDenied);
         }
@@ -1630,7 +1858,10 @@ impl PolymarketHandler {
                 entries.push(Entry::dir("positions"));
                 entries.push(Entry::dir("search"));
                 if self.orders.is_some() {
+                    entries.push(Entry::dir("redeem"));
                     entries.push(Entry::dir("trade"));
+                    entries.push(Entry::dir("revoke-approvals"));
+                    entries.push(Entry::dir("withdraw"));
                 }
                 Ok(entries)
             }
@@ -1701,6 +1932,7 @@ impl PolymarketHandler {
                 Ok(vec![
                     Entry::writable_file("new"),
                     Entry::dir("drafts"),
+                    Entry::dir("orders"),
                     Entry::dir("receipts"),
                 ])
             }
@@ -1714,12 +1946,39 @@ impl PolymarketHandler {
                 let ids = store.list_receipts(&segs[1]).map_err(err_be)?;
                 Ok(ids.iter().map(|id| Entry::dir(id)).collect())
             }
+            // Resting CLOB order-ids come from the live book/account views, not
+            // the local store, so the orders dir is not enumerable by id here.
+            (Some("trade"), 3) if segs[2] == "orders" => Ok(Vec::new()),
             (Some("trade"), 4) if segs[2] == "drafts" => {
                 let mut entries: Vec<Entry> = DRAFT_FILES.iter().map(|f| Entry::file(f)).collect();
                 entries.push(Entry::writable_file("confirm"));
                 Ok(entries)
             }
             (Some("trade"), 4) if segs[2] == "receipts" => Ok(vec![Entry::file("receipt.json")]),
+            (Some("trade"), 4) if segs[2] == "orders" => Ok(vec![Entry::writable_file("cancel")]),
+            // redeem/<wallet>/ — slugs are arbitrary (discovered via markets/),
+            // so the wallet dir is not enumerable; the confirm leaf is reachable
+            // by lookup once the slug is known.
+            (Some("redeem"), 1) => {
+                self.orders_or_not_found(path)?;
+                self.list_keystore_wallets()
+            }
+            (Some("redeem"), 2) => Ok(Vec::new()),
+            (Some("redeem"), 3) => Ok(vec![Entry::writable_file("confirm")]),
+            (Some("revoke-approvals"), 1) => {
+                self.orders_or_not_found(path)?;
+                self.list_keystore_wallets()
+            }
+            (Some("revoke-approvals"), 2) => Ok(vec![Entry::dir("request")]),
+            (Some("revoke-approvals"), 3) if segs[2] == "request" => {
+                Ok(vec![Entry::writable_file("confirm")])
+            }
+            (Some("withdraw"), 1) => {
+                self.orders_or_not_found(path)?;
+                self.list_keystore_wallets()
+            }
+            (Some("withdraw"), 2) => Ok(vec![Entry::dir("pusd")]),
+            (Some("withdraw"), 3) if segs[2] == "pusd" => Ok(vec![Entry::writable_file("confirm")]),
             _ => Err(HandlerError::NotADir(path.to_string_path())),
         }
     }
@@ -1955,6 +2214,170 @@ mod tests {
         let err = h.write(&confirm_path, b"confirm").await.unwrap_err();
         assert!(err.to_string().contains("foreground CLI VFS path"));
         assert!(handler_with(None, None).lookup(&p("/trade")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn action_surfaces_advertise_and_refuse_direct_execution() {
+        // These action paths are foreground-confirm only: the mounted handler
+        // must advertise the confirm leaf, render guidance on read, and refuse
+        // direct writes so the signer ceremony stays in the foreground process.
+        let store_dir = tempfile::tempdir().unwrap();
+        let h = handler_with(None, None).with_order_store(OrderStore::new(store_dir.path()));
+
+        // Root discovery: all three action namespaces appear alongside trade.
+        let root = h.list(&p("/")).await.unwrap();
+        let root_names: Vec<_> = root.iter().map(|e| e.name.as_str()).collect();
+        assert!(root_names.contains(&"redeem"));
+        assert!(root_names.contains(&"revoke-approvals"));
+        assert!(root_names.contains(&"withdraw"));
+
+        // redeem/<wallet>/<slug>/confirm
+        let redeem = p("/redeem/my-wallet/some-slug/confirm");
+        assert_eq!(h.lookup(&redeem).await.unwrap().mode, 0o644);
+        let hint = String::from_utf8(h.read(&redeem).await.unwrap()).unwrap();
+        assert!(hint.contains("bloom vfs write"));
+        assert!(hint.contains("bloom polymarket redeem"));
+        let wallets = h.list(&p("/redeem")).await.unwrap();
+        assert!(wallets.is_empty()); // no keystore wallets in the test root
+        let err = h.write(&redeem, b"confirm").await.unwrap_err();
+        assert!(err.to_string().contains("foreground CLI VFS path"));
+
+        // revoke-approvals/<wallet>/request/confirm
+        let revoke = p("/revoke-approvals/my-wallet/request/confirm");
+        assert_eq!(h.lookup(&revoke).await.unwrap().mode, 0o644);
+        let hint = String::from_utf8(h.read(&revoke).await.unwrap()).unwrap();
+        assert!(hint.contains("bloom vfs write"));
+        assert!(hint.contains("bloom polymarket revoke-approvals"));
+        let req_listing = h.list(&p("/revoke-approvals/my-wallet")).await.unwrap();
+        let req_names: Vec<_> = req_listing.iter().map(|e| e.name.as_str()).collect();
+        assert!(req_names.contains(&"request"));
+        let confirm_listing = h
+            .list(&p("/revoke-approvals/my-wallet/request"))
+            .await
+            .unwrap();
+        let confirm_names: Vec<_> = confirm_listing.iter().map(|e| e.name.as_str()).collect();
+        assert!(confirm_names.contains(&"confirm"));
+        let err = h.write(&revoke, b"confirm").await.unwrap_err();
+        assert!(err.to_string().contains("foreground CLI VFS path"));
+
+        // withdraw/<wallet>/pusd/confirm
+        let withdraw = p("/withdraw/my-wallet/pusd/confirm");
+        assert_eq!(h.lookup(&withdraw).await.unwrap().mode, 0o644);
+        let hint = String::from_utf8(h.read(&withdraw).await.unwrap()).unwrap();
+        assert!(hint.contains("bloom vfs write"));
+        assert!(hint.contains("bloom polymarket withdraw-pusd"));
+        assert!(hint.contains("amount")); // guidance must mention the amount requirement
+        let pusd_listing = h.list(&p("/withdraw/my-wallet")).await.unwrap();
+        let pusd_names: Vec<_> = pusd_listing.iter().map(|e| e.name.as_str()).collect();
+        assert!(pusd_names.contains(&"pusd"));
+        let err = h.write(&withdraw, b"confirm").await.unwrap_err();
+        assert!(err.to_string().contains("foreground CLI VFS path"));
+
+        // Without order_store wired, the action namespaces are not discoverable
+        // (consistent with trade).
+        let bare = handler_with(None, None);
+        assert!(bare.lookup(&p("/redeem")).await.is_err());
+        assert!(bare.lookup(&p("/revoke-approvals")).await.is_err());
+        assert!(bare.lookup(&p("/withdraw")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_surface_advertises_and_executes_in_handler() {
+        // Cancel is risk-reducing and uses stored CLOB creds (no owner signing),
+        // so it executes directly in the handler — it must NOT refuse with the
+        // foreground guidance like the value-moving confirm paths.
+        let store_dir = tempfile::tempdir().unwrap();
+        let h = handler_with(None, None).with_order_store(OrderStore::new(store_dir.path()));
+
+        // Discovery: the orders dir is listed under trade/<wallet>/ and the
+        // cancel leaf is writable with a guidance hint.
+        let trade_w = h.list(&p("/trade/my-wallet")).await.unwrap();
+        let names: Vec<_> = trade_w.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"orders"));
+
+        let cancel_path = p("/trade/my-wallet/orders/0xSOMEORDER/cancel");
+        assert_eq!(h.lookup(&cancel_path).await.unwrap().mode, 0o644);
+        let hint = String::from_utf8(h.read(&cancel_path).await.unwrap()).unwrap();
+        assert!(hint.contains("bloom polymarket cancel"));
+        let order_listing = h
+            .list(&p("/trade/my-wallet/orders/0xSOMEORDER"))
+            .await
+            .unwrap();
+        let order_names: Vec<_> = order_listing.iter().map(|e| e.name.as_str()).collect();
+        assert!(order_names.contains(&"cancel"));
+
+        // An empty body is rejected.
+        let err = h.write(&cancel_path, b"").await.unwrap_err();
+        assert!(err.to_string().contains("'confirm', 'y', or 'yes'"));
+
+        // A non-confirm body is rejected.
+        let err = h.write(&cancel_path, b"garbage").await.unwrap_err();
+        assert!(err.to_string().contains("'confirm', 'y', or 'yes'"));
+
+        // The execution path runs in-handler and fails at a durable pre-network
+        // gate (unknown wallet / onboarding not wired / no creds) — proving cancel
+        // executes here rather than refusing like the foreground-confirm paths.
+        let err = h.write(&cancel_path, b"confirm").await.unwrap_err();
+        let msg = err.to_string();
+        // Crucially, cancel is NOT a foreground-refusal path.
+        assert!(
+            !msg.contains("foreground CLI VFS path"),
+            "cancel must not refuse: {msg}"
+        );
+        assert!(
+            msg.contains("not found")
+                || msg.contains("onboarding is not wired")
+                || msg.contains("not onboarded"),
+            "expected a durable pre-network refusal, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_cancel_is_handler_executable_all_other_writes_refuse() {
+        // Regression guard: the ONLY write path that executes directly in the
+        // handler (bypassing the foreground ceremony) is
+        // trade/<w>/orders/<id>/cancel. Every other writable action path must
+        // refuse with foreground guidance. If a new handler-executable path is
+        // added, update this test explicitly so the boundary stays intentional.
+        let store_dir = tempfile::tempdir().unwrap();
+        let h = handler_with(None, None).with_order_store(OrderStore::new(store_dir.path()));
+
+        // Cancel: executes (fails at durable pre-network gate, NOT a refusal).
+        let err = h
+            .write(&p("/trade/my-wallet/orders/0xORDER/cancel"), b"confirm")
+            .await
+            .unwrap_err();
+        assert!(
+            !err.to_string().contains("foreground CLI VFS path"),
+            "cancel must not refuse: {err}"
+        );
+
+        // Redeem: refuses (foreground).
+        let err = h
+            .write(&p("/redeem/my-wallet/some-slug/confirm"), b"confirm")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("foreground CLI VFS path"));
+
+        // Revoke-approvals: refuses (foreground).
+        let err = h
+            .write(
+                &p("/revoke-approvals/my-wallet/request/confirm"),
+                b"confirm",
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("foreground CLI VFS path"));
+
+        // Withdraw: refuses (foreground).
+        let err = h
+            .write(
+                &p("/withdraw/my-wallet/pusd/confirm"),
+                br#"{"confirm":true,"amount":"all"}"#,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("foreground CLI VFS path"));
     }
 
     struct ArmedChain;

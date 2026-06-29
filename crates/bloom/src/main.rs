@@ -1324,6 +1324,44 @@ async fn run(cli: Cli) -> Result<()> {
                     return Ok(());
                 }
 
+                if let Some(req) = polymarket_redeem_confirm_write(&wallet, &p, &body)? {
+                    let (_home_permit, d) = build_write_daemon(home)?;
+                    commands::polymarket::redeem(
+                        &d,
+                        &wallet,
+                        &req.slug,
+                        false,
+                        passphrase.as_deref(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
+                if polymarket_revoke_approvals_confirm_write(&wallet, &p, &body)?.is_some() {
+                    let (_home_permit, d) = build_write_daemon(home)?;
+                    commands::polymarket::revoke_approvals(
+                        &d,
+                        &wallet,
+                        false,
+                        passphrase.as_deref(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
+                if let Some(req) = polymarket_withdraw_pusd_confirm_write(&wallet, &p, &body)? {
+                    let (_home_permit, d) = build_write_daemon(home)?;
+                    commands::polymarket::withdraw_pusd(
+                        &d,
+                        &wallet,
+                        &req.amount,
+                        false,
+                        passphrase.as_deref(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
                 let client = IpcClient::new(&client_endpoint.socket);
                 let ipc_res = try_ipc(
                     &client,
@@ -3128,6 +3166,45 @@ struct PolymarketTradeConfirmBody {
     confirm_risk: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolymarketRedeemConfirmWrite {
+    slug: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolymarketRevokeApprovalsConfirmWrite;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolymarketWithdrawPusdConfirmWrite {
+    amount: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PolymarketRedeemConfirmBody {
+    #[serde(default)]
+    confirm: Option<bool>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PolymarketRevokeApprovalsConfirmBody {
+    #[serde(default)]
+    confirm: Option<bool>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PolymarketWithdrawPusdConfirmBody {
+    #[serde(default)]
+    confirm: Option<bool>,
+    #[serde(default)]
+    amount: Option<String>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
 fn polymarket_trade_confirm_write(
     wallet: &str,
     path: &VfsPath,
@@ -3220,6 +3297,186 @@ fn polymarket_fund_confirm_write(
         dry_run: parsed.dry_run,
         confirm_risk: parsed.confirm_risk,
     }))
+}
+
+/// `bloom vfs write /polymarket/redeem/<wallet>/<slug>/confirm --unlock-wallet
+/// <wallet> --data confirm` → foreground dispatch to the shared redeem core.
+/// Slug is carried by the path; the body is an affirmative ack only.
+fn polymarket_redeem_confirm_write(
+    wallet: &str,
+    path: &VfsPath,
+    body: &[u8],
+) -> Result<Option<PolymarketRedeemConfirmWrite>> {
+    let segs = path.segments();
+    let [root, redeem, w, slug, confirm] = segs else {
+        return Ok(None);
+    };
+    if root != "polymarket" || redeem != "redeem" || confirm != "confirm" {
+        return Ok(None);
+    }
+    if w != wallet {
+        bail!(
+            "unlock wallet '{wallet}' does not match Polymarket redeem confirm path wallet '{w}'"
+        );
+    }
+    validate_polymarket_artifact_id(slug, "redeem slug")?;
+    let body = std::str::from_utf8(body).context("polymarket redeem confirm body must be utf-8")?;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        bail!("polymarket redeem confirm requires body 'confirm', 'y', or JSON/TOML confirmation");
+    }
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "confirm" | "y" | "yes"
+    ) {
+        return Ok(Some(PolymarketRedeemConfirmWrite { slug: slug.clone() }));
+    }
+    let parsed: PolymarketRedeemConfirmBody = serde_json::from_str(trimmed)
+        .or_else(|json_err| {
+            toml::from_str(trimmed).map_err(|toml_err| {
+                anyhow::anyhow!(
+                    "confirm body must be 'confirm', 'y', JSON, or TOML: JSON: {json_err}; TOML: {toml_err}"
+                )
+            })
+        })?;
+    if parsed.confirm != Some(true) {
+        bail!("polymarket redeem confirm body must set confirm=true");
+    }
+    if parsed.dry_run {
+        bail!(
+            "dry-run is not available on the redeem confirm path; use \
+             'bloom polymarket redeem <wallet> <slug> --dry-run' for a plan-only run"
+        );
+    }
+    Ok(Some(PolymarketRedeemConfirmWrite { slug: slug.clone() }))
+}
+
+/// `bloom vfs write /polymarket/revoke-approvals/<wallet>/request/confirm
+/// --unlock-wallet <wallet> --data confirm` → foreground dispatch to the shared
+/// revoke-approvals core. Singleton action (no id beyond the literal `request`).
+fn polymarket_revoke_approvals_confirm_write(
+    wallet: &str,
+    path: &VfsPath,
+    body: &[u8],
+) -> Result<Option<PolymarketRevokeApprovalsConfirmWrite>> {
+    let segs = path.segments();
+    let [root, revoke, w, request, confirm] = segs else {
+        return Ok(None);
+    };
+    if root != "polymarket"
+        || revoke != "revoke-approvals"
+        || request != "request"
+        || confirm != "confirm"
+    {
+        return Ok(None);
+    }
+    if w != wallet {
+        bail!(
+            "unlock wallet '{wallet}' does not match Polymarket revoke-approvals confirm path wallet '{w}'"
+        );
+    }
+    let body = std::str::from_utf8(body)
+        .context("polymarket revoke-approvals confirm body must be utf-8")?;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        bail!(
+            "polymarket revoke-approvals confirm requires body 'confirm', 'y', or JSON/TOML confirmation"
+        );
+    }
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "confirm" | "y" | "yes"
+    ) {
+        return Ok(Some(PolymarketRevokeApprovalsConfirmWrite));
+    }
+    let parsed: PolymarketRevokeApprovalsConfirmBody = serde_json::from_str(trimmed)
+        .or_else(|json_err| {
+            toml::from_str(trimmed).map_err(|toml_err| {
+                anyhow::anyhow!(
+                    "confirm body must be 'confirm', 'y', JSON, or TOML: JSON: {json_err}; TOML: {toml_err}"
+                )
+            })
+        })?;
+    if parsed.confirm != Some(true) {
+        bail!("polymarket revoke-approvals confirm body must set confirm=true");
+    }
+    if parsed.dry_run {
+        bail!(
+            "dry-run is not available on the revoke-approvals confirm path; use \
+             'bloom polymarket revoke-approvals <wallet> --dry-run' for a plan-only run"
+        );
+    }
+    Ok(Some(PolymarketRevokeApprovalsConfirmWrite))
+}
+
+/// `bloom vfs write /polymarket/withdraw/<wallet>/pusd/confirm --unlock-wallet
+/// <wallet> --data '{"confirm":true,"amount":"<amount|all>"}'` → foreground
+/// dispatch to the shared withdraw-pusd core. The amount is value-moving and
+/// MUST be stated in the body (the path carries no amount slot); a bare `confirm`
+/// ack is rejected so an agent cannot accidentally withdraw all pUSD.
+fn polymarket_withdraw_pusd_confirm_write(
+    wallet: &str,
+    path: &VfsPath,
+    body: &[u8],
+) -> Result<Option<PolymarketWithdrawPusdConfirmWrite>> {
+    let segs = path.segments();
+    let [root, withdraw, w, pusd, confirm] = segs else {
+        return Ok(None);
+    };
+    if root != "polymarket" || withdraw != "withdraw" || pusd != "pusd" || confirm != "confirm" {
+        return Ok(None);
+    }
+    if w != wallet {
+        bail!(
+            "unlock wallet '{wallet}' does not match Polymarket withdraw-pusd confirm path wallet '{w}'"
+        );
+    }
+    let body =
+        std::str::from_utf8(body).context("polymarket withdraw-pusd confirm body must be utf-8")?;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        bail!(
+            "polymarket withdraw-pusd confirm requires a JSON/TOML body with confirm=true and amount, e.g. {{\"confirm\":true,\"amount\":\"all\"}}"
+        );
+    }
+    // A bare ack is intentionally rejected: the amount is value-moving and must
+    // be stated explicitly so an agent cannot default to withdrawing everything.
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "confirm" | "y" | "yes"
+    ) {
+        bail!(
+            "polymarket withdraw-pusd confirm requires an explicit amount in the body (the path \
+             carries no amount); use e.g. {{\"confirm\":true,\"amount\":\"all\"}} or \
+             {{\"confirm\":true,\"amount\":\"10\"}}"
+        );
+    }
+    let parsed: PolymarketWithdrawPusdConfirmBody = serde_json::from_str(trimmed)
+        .or_else(|json_err| {
+            toml::from_str(trimmed).map_err(|toml_err| {
+                anyhow::anyhow!(
+                    "confirm body must be JSON or TOML with confirm=true and amount: JSON: {json_err}; TOML: {toml_err}"
+                )
+            })
+        })?;
+    if parsed.confirm != Some(true) {
+        bail!("polymarket withdraw-pusd confirm body must set confirm=true");
+    }
+    if parsed.dry_run {
+        bail!(
+            "dry-run is not available on the withdraw-pusd confirm path; use \
+             'bloom polymarket withdraw-pusd <wallet> <amount|all> --dry-run' for a plan-only run"
+        );
+    }
+    let amount = parsed.amount.ok_or_else(|| {
+        anyhow::anyhow!(
+            "polymarket withdraw-pusd confirm body must include an explicit amount \
+             (the path carries no amount slot); use e.g. {{\"confirm\":true,\"amount\":\"all\"}} \
+             or {{\"confirm\":true,\"amount\":\"10\"}}"
+        )
+    })?;
+    validate_polymarket_artifact_id(&amount, "withdraw amount")?;
+    Ok(Some(PolymarketWithdrawPusdConfirmWrite { amount }))
 }
 
 fn validate_polymarket_artifact_id(id: &str, label: &str) -> Result<()> {
@@ -4031,7 +4288,9 @@ async fn unmount_bloom(handle: Option<()>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        polymarket_fund_confirm_write, polymarket_trade_confirm_write, request_body_with_wallet,
+        polymarket_fund_confirm_write, polymarket_redeem_confirm_write,
+        polymarket_revoke_approvals_confirm_write, polymarket_trade_confirm_write,
+        polymarket_withdraw_pusd_confirm_write, request_body_with_wallet,
     };
     use bloom_vfs::VfsPath;
 
@@ -4207,6 +4466,269 @@ content-type = "application/json"
             polymarket_trade_confirm_write("my-wallet", &path, b"confirm")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn polymarket_redeem_confirm_vfs_write_accepts_ack_body() {
+        let path =
+            VfsPath::parse("/polymarket/redeem/my-wallet/will-some-slug-resolve/confirm").unwrap();
+        let parsed = polymarket_redeem_confirm_write("my-wallet", &path, b"confirm")
+            .unwrap()
+            .expect("redeem confirm path");
+
+        assert_eq!(parsed.slug, "will-some-slug-resolve");
+    }
+
+    #[test]
+    fn polymarket_redeem_confirm_vfs_write_accepts_structured_body() {
+        let path =
+            VfsPath::parse("/polymarket/redeem/my-wallet/will-some-slug-resolve/confirm").unwrap();
+        let parsed = polymarket_redeem_confirm_write("my-wallet", &path, br#"{"confirm":true}"#)
+            .unwrap()
+            .expect("redeem confirm path");
+
+        assert_eq!(parsed.slug, "will-some-slug-resolve");
+    }
+
+    #[test]
+    fn polymarket_redeem_confirm_vfs_write_accepts_toml_body() {
+        let path =
+            VfsPath::parse("/polymarket/redeem/my-wallet/will-some-slug-resolve/confirm").unwrap();
+        let parsed = polymarket_redeem_confirm_write("my-wallet", &path, b"confirm = true\n")
+            .unwrap()
+            .expect("redeem confirm path");
+
+        assert_eq!(parsed.slug, "will-some-slug-resolve");
+    }
+
+    #[test]
+    fn polymarket_redeem_confirm_vfs_write_rejects_mismatched_wallet() {
+        let path =
+            VfsPath::parse("/polymarket/redeem/other/will-some-slug-resolve/confirm").unwrap();
+        let err = polymarket_redeem_confirm_write("my-wallet", &path, b"confirm").unwrap_err();
+
+        assert!(err.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn polymarket_redeem_confirm_vfs_write_rejects_unconfirmed_body() {
+        let path =
+            VfsPath::parse("/polymarket/redeem/my-wallet/will-some-slug-resolve/confirm").unwrap();
+        let err = polymarket_redeem_confirm_write("my-wallet", &path, br#"{"confirm":false}"#)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("confirm=true"));
+    }
+
+    #[test]
+    fn polymarket_redeem_confirm_vfs_write_ignores_other_paths() {
+        let path = VfsPath::parse("/polymarket/redeem/my-wallet/some-slug").unwrap();
+
+        assert!(
+            polymarket_redeem_confirm_write("my-wallet", &path, b"confirm")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn polymarket_revoke_approvals_confirm_vfs_write_accepts_ack_body() {
+        let path =
+            VfsPath::parse("/polymarket/revoke-approvals/my-wallet/request/confirm").unwrap();
+        polymarket_revoke_approvals_confirm_write("my-wallet", &path, b"confirm")
+            .unwrap()
+            .expect("revoke-approvals confirm path");
+    }
+
+    #[test]
+    fn polymarket_revoke_approvals_confirm_vfs_write_accepts_structured_body() {
+        let path =
+            VfsPath::parse("/polymarket/revoke-approvals/my-wallet/request/confirm").unwrap();
+        polymarket_revoke_approvals_confirm_write("my-wallet", &path, br#"{"confirm":true}"#)
+            .unwrap()
+            .expect("revoke-approvals confirm path");
+    }
+
+    #[test]
+    fn polymarket_revoke_approvals_confirm_vfs_write_rejects_mismatched_wallet() {
+        let path = VfsPath::parse("/polymarket/revoke-approvals/other/request/confirm").unwrap();
+        let err =
+            polymarket_revoke_approvals_confirm_write("my-wallet", &path, b"confirm").unwrap_err();
+
+        assert!(err.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn polymarket_revoke_approvals_confirm_vfs_write_rejects_unconfirmed_body() {
+        let path =
+            VfsPath::parse("/polymarket/revoke-approvals/my-wallet/request/confirm").unwrap();
+        let err =
+            polymarket_revoke_approvals_confirm_write("my-wallet", &path, br#"{"confirm":false}"#)
+                .unwrap_err();
+
+        assert!(err.to_string().contains("confirm=true"));
+    }
+
+    #[test]
+    fn polymarket_revoke_approvals_confirm_vfs_write_ignores_other_paths() {
+        let path = VfsPath::parse("/polymarket/revoke-approvals/my-wallet/request").unwrap();
+
+        assert!(
+            polymarket_revoke_approvals_confirm_write("my-wallet", &path, b"confirm")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn polymarket_withdraw_pusd_confirm_vfs_write_accepts_all_body() {
+        let path = VfsPath::parse("/polymarket/withdraw/my-wallet/pusd/confirm").unwrap();
+        let parsed = polymarket_withdraw_pusd_confirm_write(
+            "my-wallet",
+            &path,
+            br#"{"confirm":true,"amount":"all"}"#,
+        )
+        .unwrap()
+        .expect("withdraw-pusd confirm path");
+
+        assert_eq!(parsed.amount, "all");
+    }
+
+    #[test]
+    fn polymarket_withdraw_pusd_confirm_vfs_write_accepts_amount_body() {
+        let path = VfsPath::parse("/polymarket/withdraw/my-wallet/pusd/confirm").unwrap();
+        let parsed = polymarket_withdraw_pusd_confirm_write(
+            "my-wallet",
+            &path,
+            br#"{"confirm":true,"amount":"10.5"}"#,
+        )
+        .unwrap()
+        .expect("withdraw-pusd confirm path");
+
+        assert_eq!(parsed.amount, "10.5");
+    }
+
+    #[test]
+    fn polymarket_withdraw_pusd_confirm_vfs_write_accepts_toml_body() {
+        let path = VfsPath::parse("/polymarket/withdraw/my-wallet/pusd/confirm").unwrap();
+        let parsed = polymarket_withdraw_pusd_confirm_write(
+            "my-wallet",
+            &path,
+            b"confirm = true\namount = \"all\"\n",
+        )
+        .unwrap()
+        .expect("withdraw-pusd confirm path");
+
+        assert_eq!(parsed.amount, "all");
+    }
+
+    #[test]
+    fn polymarket_withdraw_pusd_confirm_vfs_write_rejects_bare_ack() {
+        let path = VfsPath::parse("/polymarket/withdraw/my-wallet/pusd/confirm").unwrap();
+        let err =
+            polymarket_withdraw_pusd_confirm_write("my-wallet", &path, b"confirm").unwrap_err();
+
+        assert!(err.to_string().contains("explicit amount"), "got: {err}");
+    }
+
+    #[test]
+    fn polymarket_withdraw_pusd_confirm_vfs_write_rejects_missing_amount() {
+        let path = VfsPath::parse("/polymarket/withdraw/my-wallet/pusd/confirm").unwrap();
+        let err =
+            polymarket_withdraw_pusd_confirm_write("my-wallet", &path, br#"{"confirm":true}"#)
+                .unwrap_err();
+
+        assert!(err.to_string().contains("explicit amount"), "got: {err}");
+    }
+
+    #[test]
+    fn polymarket_withdraw_pusd_confirm_vfs_write_rejects_mismatched_wallet() {
+        let path = VfsPath::parse("/polymarket/withdraw/other/pusd/confirm").unwrap();
+        let err = polymarket_withdraw_pusd_confirm_write(
+            "my-wallet",
+            &path,
+            br#"{"confirm":true,"amount":"all"}"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn polymarket_withdraw_pusd_confirm_vfs_write_rejects_unconfirmed_body() {
+        let path = VfsPath::parse("/polymarket/withdraw/my-wallet/pusd/confirm").unwrap();
+        let err = polymarket_withdraw_pusd_confirm_write(
+            "my-wallet",
+            &path,
+            br#"{"confirm":false,"amount":"all"}"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("confirm=true"));
+    }
+
+    #[test]
+    fn polymarket_withdraw_pusd_confirm_vfs_write_ignores_other_paths() {
+        let path = VfsPath::parse("/polymarket/withdraw/my-wallet/pusd").unwrap();
+
+        assert!(
+            polymarket_withdraw_pusd_confirm_write(
+                "my-wallet",
+                &path,
+                br#"{"confirm":true,"amount":"all"}"#,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn polymarket_redeem_confirm_vfs_write_rejects_dry_run() {
+        let path = VfsPath::parse("/polymarket/redeem/my-wallet/some-slug/confirm").unwrap();
+        let err = polymarket_redeem_confirm_write(
+            "my-wallet",
+            &path,
+            br#"{"confirm":true,"dry_run":true}"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("dry-run is not available"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn polymarket_revoke_approvals_confirm_vfs_write_rejects_dry_run() {
+        let path =
+            VfsPath::parse("/polymarket/revoke-approvals/my-wallet/request/confirm").unwrap();
+        let err = polymarket_revoke_approvals_confirm_write(
+            "my-wallet",
+            &path,
+            br#"{"confirm":true,"dry_run":true}"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("dry-run is not available"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn polymarket_withdraw_pusd_confirm_vfs_write_rejects_dry_run() {
+        let path = VfsPath::parse("/polymarket/withdraw/my-wallet/pusd/confirm").unwrap();
+        let err = polymarket_withdraw_pusd_confirm_write(
+            "my-wallet",
+            &path,
+            br#"{"confirm":true,"amount":"all","dry_run":true}"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("dry-run is not available"),
+            "got: {err}"
         );
     }
 }

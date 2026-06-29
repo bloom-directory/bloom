@@ -245,6 +245,108 @@ fn polymarket_vfs_trade_confirm_reaches_cli_confirm_path_for_durable_drafts() {
 }
 
 #[test]
+fn polymarket_vfs_redeem_confirm_shares_cli_redeem_core() {
+    // Both the CLI command and the foreground VFS confirm path must dispatch
+    // into the same redeem core and fail at the same durable refusal (no
+    // [polymarket] config) before any network or signing work.
+    let home = fresh_home();
+    let expected = "no [polymarket] block in config.toml";
+
+    bloom_cmd(home.path())
+        .args(["polymarket", "redeem", "my-wallet", "some-slug"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(expected));
+
+    bloom_cmd(home.path())
+        .args([
+            "vfs",
+            "write",
+            "/polymarket/redeem/my-wallet/some-slug/confirm",
+            "--unlock-wallet",
+            "my-wallet",
+            "--data",
+            "confirm",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(expected));
+}
+
+#[test]
+fn polymarket_vfs_revoke_approvals_confirm_shares_cli_core() {
+    let home = fresh_home();
+    let expected = "no [polymarket] block in config.toml";
+
+    bloom_cmd(home.path())
+        .args(["polymarket", "revoke-approvals", "my-wallet"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(expected));
+
+    bloom_cmd(home.path())
+        .args([
+            "vfs",
+            "write",
+            "/polymarket/revoke-approvals/my-wallet/request/confirm",
+            "--unlock-wallet",
+            "my-wallet",
+            "--data",
+            "confirm",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(expected));
+}
+
+#[test]
+fn polymarket_vfs_withdraw_pusd_confirm_shares_cli_core() {
+    let home = fresh_home();
+    let expected = "no [polymarket] block in config.toml";
+
+    // CLI: amount is a positional; VFS: amount rides in the confirm body.
+    bloom_cmd(home.path())
+        .args(["polymarket", "withdraw-pusd", "my-wallet", "all"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(expected));
+
+    bloom_cmd(home.path())
+        .args([
+            "vfs",
+            "write",
+            "/polymarket/withdraw/my-wallet/pusd/confirm",
+            "--unlock-wallet",
+            "my-wallet",
+            "--data",
+            r#"{"confirm":true,"amount":"all"}"#,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(expected));
+}
+
+#[test]
+fn polymarket_vfs_withdraw_pusd_confirm_rejects_bare_ack() {
+    // A bare ack has no amount; the foreground decoder must refuse before any
+    // daemon/network work so an agent cannot default to withdrawing everything.
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args([
+            "vfs",
+            "write",
+            "/polymarket/withdraw/my-wallet/pusd/confirm",
+            "--unlock-wallet",
+            "my-wallet",
+            "--data",
+            "confirm",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("explicit amount"));
+}
+
+#[test]
 fn status_prints_version_and_chain_summary() {
     let home = fresh_home();
     bloom_cmd(home.path())

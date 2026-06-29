@@ -48,6 +48,23 @@ instruction to trade.
   /polymarket/trade/<wallet>/drafts/<id>/confirm --unlock-wallet <wallet>
   --data confirm`, which dispatches to the same order engine as
   `bloom polymarket confirm <wallet> <id>`.
+- Risk-reducing and exit actions now have VFS parity. Redeem, revoke-approvals,
+  and pUSD withdraw are owner-signed, so the mounted handler advertises the path
+  and refuses direct execution; confirm through the foreground CLI VFS path:
+  `bloom vfs write /polymarket/redeem/<wallet>/<slug>/confirm --unlock-wallet
+  <wallet> --data confirm`,
+  `bloom vfs write /polymarket/revoke-approvals/<wallet>/request/confirm
+  --unlock-wallet <wallet> --data confirm`, and
+  `bloom vfs write /polymarket/withdraw/<wallet>/pusd/confirm --unlock-wallet
+  <wallet> --data '{"confirm":true,"amount":"<amount|all>"}'`. Each dispatches to
+  the same core as `bloom polymarket redeem|revoke-approvals|withdraw-pusd`; print
+  the plan first with the CLI `--dry-run` flag. pUSD withdraw requires an
+  explicit `amount` in the body (the path carries no amount slot).
+- Cancel is risk-reducing and uses stored CLOB credentials (no owner signing), so
+  it executes directly in the VFS — no foreground ceremony is needed:
+  `bloom vfs write /polymarket/trade/<wallet>/orders/<order-id>/cancel --data
+  confirm`, dispatching to the same cancel core as
+  `bloom polymarket cancel <wallet> <order-id>`.
 - Passkey/WebAuthn proves user presence, not transaction content. Bloom opens a
   local browser review page and prints a matching review hash; this is a local
   consistency check, not a hardware trusted display.
@@ -176,10 +193,14 @@ Steps:
    then `bloom vfs write /polymarket/fund/<w>/<id>/confirm --unlock-wallet <w> --data confirm`
 3. `bloom polymarket order <w> <slug> yes <usd> --max-price <p> --dry-run`
 4. `bloom vfs write /polymarket/trade/<w>/drafts/<draft-id>/confirm --unlock-wallet <w> --data confirm`
-5. Exit with `sell` or `cancel` if it rested.
-6. `redeem` only after Data API reports `redeemable:true`.
-7. `withdraw-pusd <w> all`
-8. `revoke-approvals <w>` and confirm allowances are zero.
+5. Exit with `sell` or `cancel` if it rested; `cancel` also works via VFS at
+   `/polymarket/trade/<w>/orders/<order-id>/cancel` (direct, no unlock).
+6. `redeem` only after Data API reports `redeemable:true`; also confirmable via
+   `/polymarket/redeem/<w>/<slug>/confirm --unlock-wallet <w>`.
+7. `withdraw-pusd <w> all`; also via
+   `/polymarket/withdraw/<w>/pusd/confirm --unlock-wallet <w> --data '{"confirm":true,"amount":"all"}'`.
+8. `revoke-approvals <w>` and confirm allowances are zero; also via
+   `/polymarket/revoke-approvals/<w>/request/confirm --unlock-wallet <w> --data confirm`.
 
 Capture relayer/CLOB requests and responses during the run, but canonicalize
 before committing fixtures: remove auth headers, API keys, passphrases,

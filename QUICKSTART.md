@@ -220,7 +220,14 @@ it expire after the configured TTL) cancels the stage.
   confirmed with `bloom vfs write /polymarket/fund/<wallet>/<id>/confirm
   --unlock-wallet <wallet> --data confirm`, and trade drafts can be posted with
   `bloom vfs write /polymarket/trade/<wallet>/drafts/<id>/confirm
-  --unlock-wallet <wallet> --data confirm`. A capability primitive (scoped
+  --unlock-wallet <wallet> --data confirm`. Exit actions also have VFS parity:
+  cancel runs directly at `/polymarket/trade/<wallet>/orders/<order-id>/cancel`
+  (no unlock — risk-reducing, CLOB creds only), while redeem, revoke-approvals,
+  and pUSD withdraw are owner-signed and confirm through the foreground path
+  (`/polymarket/redeem/<wallet>/<slug>/confirm`,
+  `/polymarket/revoke-approvals/<wallet>/request/confirm`,
+  `/polymarket/withdraw/<wallet>/pusd/confirm` with
+  `--data '{"confirm":true,"amount":"..."}'`). A capability primitive (scoped
   approve, TTL, caps) is in active development — see
   `docs/plans/2026-06-20-agent-obvious-capability-model.md`.
   Read `/polymarket/README.md`.

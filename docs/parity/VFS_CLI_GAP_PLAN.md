@@ -144,10 +144,11 @@ Rollback/non-goals:
 - mounted/IPC handler execution remains intentionally unsupported because the
   signer ceremony must live in the foreground process.
 
-## 2. Next: Polymarket risk-reducing VFS actions
+## 2. Implemented: Polymarket risk-reducing VFS actions
 
-Goal: expose cancel, redeem, revoke approvals, and possibly pUSD withdraw
-through VFS action paths when their shared cores are extractable.
+Goal: expose cancel, redeem, revoke approvals, and pUSD withdraw through VFS
+action paths. Cancel executes directly (no signing); the three owner-signed
+actions follow the foreground-confirm pattern.
 
 User story: an agent can discover and execute operational safety actions from
 the same `/polymarket` namespace used for positions and account state.
@@ -164,19 +165,41 @@ bloom polymarket withdraw-pusd <wallet> <amount|all> [--dry-run]
 Exact proposed VFS paths and bodies:
 
 ```text
-/polymarket/orders/<wallet>/<order-id>/cancel
-/polymarket/redeem/<wallet>/<slug>/{plan.md,confirm}
-/polymarket/approvals/<wallet>/revoke/{plan.md,confirm}
-/polymarket/withdraw/<wallet>/pusd/{plan.md,confirm}
+/polymarket/trade/<wallet>/orders/<order-id>/cancel              # direct handler exec (no unlock)
+/polymarket/redeem/<wallet>/<slug>/{plan.md,confirm}             # foreground confirm
+/polymarket/revoke-approvals/<wallet>/request/{plan.md,confirm}  # foreground confirm
+/polymarket/withdraw/<wallet>/pusd/{plan.md,confirm}             # foreground confirm
 ```
 
-Body: `confirm`, `y`, or JSON/TOML with `confirm=true`, `dry_run`, and
-`confirm_risk` where the underlying command supports risk acknowledgement.
+Path convention keeps `<wallet>` immediately after `/polymarket` and an id slot
+throughout, matching fund (`/polymarket/fund/<wallet>/<id>/...`) and trade
+(`/polymarket/trade/<wallet>/drafts/<id>/...`). Resting CLOB orders live under
+the trade namespace. `revoke-approvals` and `withdraw` are singleton actions, so
+their id slot is the literal `request` / `pusd` segment.
+
+Body: `confirm`, `y`, or JSON/TOML with `confirm=true` and optional
+`confirm_risk`. `dry_run` is **rejected on `/confirm`** (confirm is execute);
+the dry-run representation is the read-side `plan.md`. `cancel` accepts only the
+ack body (`confirm`/`y`/`yes`); it takes no `--unlock-wallet` and no risk fields.
+
+Execution shapes:
+
+- `cancel` runs **directly in the mounted VFS handler** (like `new` paths) because
+  it uses stored CLOB credentials and performs no owner signing.
+- `redeem`, `revoke-approvals`, and `withdraw-pusd` follow the **foreground
+  confirm** pattern established by fund/trade-confirm: the mounted handler
+  advertises the path and renders guidance but refuses direct execution, because
+  the signer ceremony must live in the foreground process.
 
 Shared core function to call:
 
-- Extract reusable service functions from the existing CLI implementations.
+- Extract reusable service functions (`redeem_service`, `revoke_approvals_service`,
+  `withdraw_pusd_service`, `cancel_service`) from the existing CLI
+  implementations; CLI handlers delegate to them.
 - Keep `submit_and_confirm_wallet_batch` as the shared relayer batch helper.
+- The post-confirm on-chain verification loop in `revoke_approvals` (re-reading
+  allowances and `isApprovedForAll` after the batch lands) must stay **inside**
+  `revoke_approvals_service` so CLI and VFS cannot diverge on the safety check.
 
 Safety invariants:
 
@@ -186,18 +209,29 @@ Safety invariants:
 - withdraw checks deposit-wallet pUSD balance;
 - all owner-signed relayer operations use passkey/local unlock and order lock.
 
-Tests to add:
+Tests added:
 
-- mocked relayer/Data/CLOB tests for success and refusal cases;
-- dry-run artifact tests;
-- post-confirm state verification tests;
-- no-secret-leak tests.
+- CLI parser tests for redeem/revoke-approvals/withdraw-pusd confirm bodies (ack,
+  JSON, TOML, wallet mismatch, unconfirmed, ignore-other; withdraw also rejects
+  bare ack and missing amount);
+- VFS handler test proving all three owner-signed surfaces advertise `confirm`,
+  render guidance, and refuse direct handler execution; and that cancel
+  advertises, renders guidance, and executes in-handler (failing on a durable
+  pre-network gate rather than refusing);
+- CLI subprocess parity smoke tests proving `bloom polymarket
+  redeem|revoke-approvals|withdraw-pusd` and the matching
+  `bloom vfs write .../confirm --unlock-wallet` paths share the same durable
+  refusal (no `[polymarket]` config) before any network/signing work; plus a
+  test that withdraw confirm rejects a bare ack.
 
-Docs to update:
+Docs updated:
 
 - `docs/polymarket-integration.md`;
 - `/polymarket/README.md`;
-- examples for risk-reducing actions.
+- `EXAMPLES.md`;
+- `QUICKSTART.md`;
+- `docs/parity/VFS_CLI_PARITY_LEDGER.md` (cancel/redeem/revoke/withdraw rows
+  flipped to `parity`).
 
 Rollback/non-goals:
 

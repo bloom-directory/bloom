@@ -1622,6 +1622,26 @@ bloom vfs write /polymarket/trade/<wallet>/drafts/<id>/confirm \
 
 # Equivalent dedicated CLI command:
 bloom polymarket confirm <wallet> <id>
+
+# 5) Cancel a resting order — risk-reducing, runs directly in the VFS (no unlock)
+bloom vfs write /polymarket/trade/<wallet>/orders/<order-id> \
+  --data confirm
+# Equivalent: bloom polymarket cancel <wallet> <order-id>
+
+# 6) Exit actions after resolution (owner-signed → foreground CLI VFS path)
+bloom polymarket redeem <wallet> <slug> --dry-run        # print the plan first
+bloom vfs write /polymarket/redeem/<wallet>/<slug>/confirm \
+  --unlock-wallet <wallet> --data confirm
+# Equivalent: bloom polymarket redeem <wallet> <slug>
+
+bloom vfs write /polymarket/withdraw/<wallet>/pusd/confirm \
+  --unlock-wallet <wallet> \
+  --data '{"confirm":true,"amount":"all"}'
+# Equivalent: bloom polymarket withdraw-pusd <wallet> all
+
+bloom vfs write /polymarket/revoke-approvals/<wallet>/request/confirm \
+  --unlock-wallet <wallet> --data confirm
+# Equivalent: bloom polymarket revoke-approvals <wallet>
 ```
 
 A Polymarket capability primitive (scoped approve, TTL, caps,
