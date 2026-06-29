@@ -79,14 +79,13 @@ mod wallet_name {
 
     pub fn validate_wallet_name(name: &str) -> Result<()> {
         if name.is_empty()
-            || name.contains('/')
-            || name.contains('\\')
-            || name.contains('\0')
-            || name == "."
-            || name == ".."
+            || name.len() > 64
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         {
             return Err(PolymarketError::invalid(format!(
-                "invalid wallet name '{name}'"
+                "invalid wallet name {name:?}: must be 1-64 chars of [A-Za-z0-9_-]"
             )));
         }
         Ok(())

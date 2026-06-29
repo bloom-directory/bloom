@@ -514,6 +514,13 @@ impl PreparedAppPackage {
                 &allowed_caps,
                 &allowed_sign_intents,
             )?;
+            validate_writable_route_has_write_export(
+                &route.route_id,
+                kind,
+                &ops,
+                &install_metadata,
+                &validation,
+            )?;
             if kind == RouteEntryKind::File && ops.contains(&RouteOp::Write) {
                 install_metadata.mode |= 0o222;
             }
@@ -1219,6 +1226,24 @@ fn route_kind_and_ops(source_path: &str) -> (RouteEntryKind, Vec<RouteOp>) {
         "$lookup.wasm" => (RouteEntryKind::File, vec![RouteOp::Lookup]),
         _ => (RouteEntryKind::File, vec![RouteOp::Lookup, RouteOp::Read]),
     }
+}
+
+fn validate_writable_route_has_write_export(
+    route_id: &str,
+    kind: RouteEntryKind,
+    ops: &[RouteOp],
+    install_metadata: &InstallRouteMetadata,
+    validation: &RouteValidation,
+) -> Result<(), PetalError> {
+    if kind == RouteEntryKind::File
+        && (ops.contains(&RouteOp::Write) || install_metadata.mode & 0o222 != 0)
+        && !validation.has_write_export
+    {
+        return Err(PetalError::InvalidWasm(format!(
+            "v2 route {route_id} advertises write but has no write export"
+        )));
+    }
+    Ok(())
 }
 
 impl RouteIndex {
@@ -4041,6 +4066,47 @@ name = "echo"
         assert!(metadata.required_caps.is_empty());
         assert_eq!(metadata.sign_intent, None);
         assert!(route.ops.contains(&RouteOp::Write));
+    }
+
+    #[test]
+    fn v2_writable_routes_require_write_export() {
+        let validation = RouteValidation {
+            abi: RouteAbi::ComponentBloomRoute010,
+            required_caps: Vec::new(),
+            has_write_export: false,
+        };
+        let metadata = InstallRouteMetadata {
+            mode: 0o444,
+            cache_ttl_ms: None,
+            side_effecting_read: false,
+            write_async: false,
+            executable: false,
+            required_caps: Vec::new(),
+            sign_intent: None,
+        };
+        let err = validate_writable_route_has_write_export(
+            "r000001",
+            RouteEntryKind::File,
+            &[RouteOp::Lookup, RouteOp::Write],
+            &metadata,
+            &validation,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("has no write export"));
+
+        let metadata = InstallRouteMetadata {
+            mode: 0o644,
+            ..metadata
+        };
+        let err = validate_writable_route_has_write_export(
+            "r000001",
+            RouteEntryKind::File,
+            &[RouteOp::Lookup, RouteOp::Read],
+            &metadata,
+            &validation,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("has no write export"));
     }
 
     #[test]

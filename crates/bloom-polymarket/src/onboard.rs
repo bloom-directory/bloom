@@ -265,23 +265,9 @@ impl OnboardStore {
     }
 }
 
-/// Reject wallet names that could escape the per-wallet directory. The VFS
-/// additionally requires the name to resolve in the keystore; this guard makes
-/// the stores safe even for direct library callers.
+/// Reject wallet names that the Bloom keystore cannot resolve.
 pub fn validate_wallet_name(name: &str) -> Result<()> {
-    let ok = !name.is_empty()
-        && name.len() <= 128
-        && !name.starts_with('.')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-    if ok {
-        Ok(())
-    } else {
-        Err(PolymarketError::invalid(format!(
-            "invalid wallet name {name:?}: must be 1-128 chars of [A-Za-z0-9._-], not starting with '.'"
-        )))
-    }
+    crate::validate_wallet_name(name)
 }
 
 /// A side effect worth auditing, reported as it happens. Carries identifiers
@@ -1041,15 +1027,17 @@ mod tests {
             "a/b",
             "a\\b",
             ".hidden",
+            "alice.prod",
+            "alice prod",
             "a/../b",
-            &"x".repeat(129),
+            &"x".repeat(65),
         ] {
             assert!(
                 validate_wallet_name(bad).is_err(),
                 "{bad:?} must be rejected"
             );
         }
-        for good in ["alice", "my-wallet_2", "a.b"] {
+        for good in ["alice", "my-wallet_2"] {
             validate_wallet_name(good).unwrap();
         }
     }
