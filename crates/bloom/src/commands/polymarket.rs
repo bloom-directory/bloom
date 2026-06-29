@@ -44,6 +44,39 @@ fn now_ms() -> u128 {
 /// a `u16` alone would admit 655.35% slippage.
 const MAX_FUND_SLIPPAGE_BPS: u16 = 1000;
 
+fn polymarket_gamma_client(pm_cfg: &bloom_proto::config::PolymarketConfig) -> GammaClient {
+    let mut gamma = GammaClient::new();
+    if let Ok(url) = url::Url::parse(&pm_cfg.gamma_url) {
+        gamma = gamma.with_base_url(url);
+    }
+    gamma
+}
+
+fn polymarket_clob_client(pm_cfg: &bloom_proto::config::PolymarketConfig) -> ClobClient {
+    let mut clob = ClobClient::new(pm_cfg.chain_id);
+    if let Ok(url) = url::Url::parse(&pm_cfg.clob_url) {
+        clob = clob.with_base_url(url);
+    }
+    clob
+}
+
+fn polymarket_geoblock_client(
+    pm_cfg: &bloom_proto::config::PolymarketConfig,
+) -> GeoblockClient {
+    let Ok(base) = url::Url::parse(&pm_cfg.gamma_url) else {
+        return GeoblockClient::new();
+    };
+    let host = base.host_str().unwrap_or_default();
+    let is_local = matches!(host, "127.0.0.1" | "localhost" | "::1");
+    if !is_local {
+        return GeoblockClient::new();
+    }
+    match base.join("/api/geoblock") {
+        Ok(url) => GeoblockClient::new().with_base_url_for_tests(url.to_string()),
+        Err(_) => GeoblockClient::new(),
+    }
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -144,8 +177,11 @@ fn evaluate_policy(
 }
 
 /// Geoblock gate, differentiated by what the operation does to risk.
-async fn geoblock_gate(side: Side) -> Result<()> {
-    match GeoblockClient::new().check().await {
+async fn geoblock_gate(
+    pm_cfg: &bloom_proto::config::PolymarketConfig,
+    side: Side,
+) -> Result<()> {
+    match polymarket_geoblock_client(pm_cfg).check().await {
         Ok(geo) if geo.blocked => {
             // Affirmative block: no new trades, buy or sell. (Cancel has its
             // own warn-only path — retracting an offer is not a trade.)
@@ -288,8 +324,8 @@ pub async fn place(d: &Daemon, args: PlaceArgs) -> Result<()> {
         bail!("GTD orders are not supported (no expiration plumbing)");
     }
 
-    let gamma = GammaClient::new();
-    let clob = ClobClient::new(pm_cfg.chain_id);
+    let gamma = polymarket_gamma_client(pm_cfg);
+    let clob = polymarket_clob_client(pm_cfg);
     let snap = trade::snapshot(&gamma, &clob, &args.slug, &args.outcome).await?;
 
     // Sell-to-close only: never sell more than current holdings. Positions
@@ -384,11 +420,11 @@ async fn execute(
         .context("no [polymarket] block in config.toml")?;
 
     let _lock = store.lock(&draft.wallet)?;
-    geoblock_gate(draft.side).await?;
+    geoblock_gate(pm_cfg, draft.side).await?;
 
     // Revalidate everything against the live market; the draft is a snapshot.
-    let gamma = GammaClient::new();
-    let clob = ClobClient::new(pm_cfg.chain_id);
+    let gamma = polymarket_gamma_client(pm_cfg);
+    let clob = polymarket_clob_client(pm_cfg);
     let snap = trade::snapshot(&gamma, &clob, &draft.slug, &draft.outcome).await?;
     if snap.token_id != draft.token_id {
         bail!("token id changed between draft and confirm — refusing");
