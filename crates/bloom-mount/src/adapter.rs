@@ -128,6 +128,77 @@ fn blake3_like_hash(bytes: &[u8]) -> u64 {
     h
 }
 
+fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
+    let segs = path.segments();
+    match segs {
+        [root, _wallet, chains, _chain, outbox, pending, _id, action]
+            if root == "wallets"
+                && chains == "chains"
+                && outbox == "outbox"
+                && pending == "pending"
+                && matches!(action.as_str(), "cancel" | "replace") =>
+        {
+            true
+        }
+        [root, _wallet, sign, kind]
+            if root == "wallets"
+                && sign == "sign"
+                && matches!(kind.as_str(), "message" | "hash" | "typed_data") =>
+        {
+            true
+        }
+        [root, action, _wallet, begin]
+            if root == "polymarket" && action == "onboard" && begin == "begin" =>
+        {
+            true
+        }
+        [root, _reference, action] if root == "requests" && action == "confirm" => true,
+        [root, state, _id, action]
+            if root == "requests" && state == "pending" && action == "confirm" =>
+        {
+            true
+        }
+        [root, _wallet, ps, leaf]
+            if root == "wallets" && ps == "policy-session" && leaf == "new" =>
+        {
+            true
+        }
+        [root, _network, branch, _wallet, leaf]
+            if root == "hyperliquid" && branch == "agent_sessions" && leaf == "new.json" =>
+        {
+            true
+        }
+        [root, _network, branch, _wallet, _session, leaf]
+            if root == "hyperliquid"
+                && branch == "agent_sessions"
+                && matches!(leaf.as_str(), "orphan_cancel_all" | "orphan_close_all") =>
+        {
+            true
+        }
+        [root, _network, branch, _wallet, leaf]
+            if root == "hyperliquid"
+                && branch == "exchange"
+                && matches!(
+                    leaf.as_str(),
+                    "order.json"
+                        | "cancel.json"
+                        | "schedule_cancel.json"
+                        | "update_leverage.json"
+                        | "send_asset.json"
+                ) =>
+        {
+            true
+        }
+        [root, _wallet, leaf] if root == "wallets" && leaf == "policy.toml" => true,
+        [root, _wallet, chains, _chain, leaf]
+            if root == "wallets" && chains == "chains" && leaf == "policy.toml" =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Convert a `HandlerError` from the VFS into the matching NFS error.
 fn map_err(e: HandlerError) -> FsError {
     match e {
@@ -524,6 +595,9 @@ impl BloomFs {
     /// defensive about it).
     async fn flush_path(&self, path: &VfsPath) -> FsResult<()> {
         if let Some(bytes) = self.take_complete_buffer(path) {
+            if mount_write_path_uses_wallet_signer(path) {
+                return Err(FsError::PermissionDenied);
+            }
             trace!(path = %path.to_string_path(), bytes = bytes.len(), "mount.adapter.flush");
             self.vfs.write(path, &bytes).await.map_err(map_err)?;
             // The rendered view is now stale; drop it so the next read re-renders.
@@ -1022,6 +1096,9 @@ impl FileSystem for BloomFs {
         };
 
         if let Some(payload) = complete_payload {
+            if mount_write_path_uses_wallet_signer(&path) {
+                return Err(FsError::PermissionDenied);
+            }
             self.vfs.write(&path, &payload).await.map_err(map_err)?;
             // Persisted new bytes — invalidate any stale rendered view.
             self.render_cache.invalidate(&path);
@@ -1058,6 +1135,9 @@ impl FileSystem for BloomFs {
         })?;
         let parent_path = Self::path_of(parent);
         let child = parent_path.join(&decoded);
+        if mount_write_path_uses_wallet_signer(&child) {
+            return Err(FsError::PermissionDenied);
+        }
         self.vfs.write(&child, &[]).await.map_err(map_err)?;
         self.render_cache.invalidate(&child);
         let e = self.vfs.lookup(&child).await.map_err(map_err)?;
@@ -1249,6 +1329,52 @@ mod tests {
         let ctx = fake_ctx();
         let attrs = fs.getattr(&ctx, &BloomHandle::Root).await.unwrap();
         assert_eq!(attrs.object_type, ObjectType::Directory);
+    }
+
+    #[tokio::test]
+    async fn mount_write_rejects_signer_consuming_paths() {
+        let fs = BloomFs::new(Vfs::builder().build());
+        let ctx = fake_ctx();
+        let handle = BloomHandle::Path {
+            kind: HandleKind::File,
+            path: VfsPath::parse("/hyperliquid/mainnet/exchange/minnow/order.json").unwrap(),
+        };
+
+        let err = fs
+            .write(
+                &ctx,
+                &handle,
+                0,
+                Bytes::from_static(b"{}"),
+                WriteStability::FileSync,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FsError::PermissionDenied));
+    }
+
+    #[tokio::test]
+    async fn mount_create_rejects_signer_consuming_paths() {
+        let fs = BloomFs::new(Vfs::builder().build());
+        let ctx = fake_ctx();
+        let parent = BloomHandle::Path {
+            kind: HandleKind::Dir,
+            path: VfsPath::parse("/hyperliquid/mainnet/exchange/minnow").unwrap(),
+        };
+
+        let err = fs
+            .create(
+                &ctx,
+                &parent,
+                "order.json",
+                CreateRequest {
+                    kind: CreateKind::File,
+                    attrs: SetAttrs::default(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FsError::PermissionDenied));
     }
 
     #[tokio::test]

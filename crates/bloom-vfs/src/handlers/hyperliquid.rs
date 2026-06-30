@@ -3860,6 +3860,7 @@ struct HlSnapshot {
     unrealized_loss: Option<u64>,
     /// Per-coin absolute position notional, micro-USD.
     positions: std::collections::HashMap<String, u64>,
+    positions_readable: bool,
     /// Per-coin resting (unfilled) open-order notional, micro-USD. `None` until
     /// the `openOrders` query is applied — the position cap fails closed while
     /// this is unavailable so a burst of resting orders can't slip the cap.
@@ -3884,23 +3885,31 @@ impl HlSnapshot {
         let mut positions = std::collections::HashMap::new();
         let mut loss_sum = U256::ZERO;
         let mut loss_readable = false;
+        let mut positions_readable = false;
         let mut open_positions = 0u32;
         if let Some(arr) = v.get("assetPositions").and_then(|p| p.as_array()) {
+            positions_readable = true;
             loss_readable = true;
             for ap in arr {
                 let Some(pos) = ap.get("position") else {
+                    positions_readable = false;
                     loss_readable = false;
                     continue;
                 };
                 if let (Some(coin), Some(pv)) = (
                     pos.get("coin").and_then(Value::as_str),
                     pos.get("positionValue").and_then(Value::as_str),
-                ) && let Some(micro) = str_to_micro(pv)
-                {
-                    positions.insert(coin.to_string(), micro);
-                    if micro != 0 {
-                        open_positions = open_positions.saturating_add(1);
+                ) {
+                    if let Some(micro) = str_to_micro(pv) {
+                        positions.insert(coin.to_string(), micro);
+                        if micro != 0 {
+                            open_positions = open_positions.saturating_add(1);
+                        }
+                    } else {
+                        positions_readable = false;
                     }
+                } else {
+                    positions_readable = false;
                 }
                 match pos.get("unrealizedPnl").and_then(|p| p.as_str()) {
                     Some(upnl_str) if upnl_str.starts_with('-') => {
@@ -3928,6 +3937,7 @@ impl HlSnapshot {
             account_value,
             unrealized_loss,
             positions,
+            positions_readable,
             resting_notional: None,
             open_orders: v
                 .get("openOrders")
@@ -3968,7 +3978,8 @@ impl HlSnapshot {
     }
 
     fn position_micro(&self, coin: &str) -> Option<u64> {
-        self.positions.get(coin).copied()
+        self.positions_readable
+            .then(|| self.positions.get(coin).copied().unwrap_or(0))
     }
 
     /// Resting open-order notional for `coin`. `None` when open orders were not
@@ -4716,7 +4727,7 @@ mod tests {
         assert_eq!(s.account_value, Some(1_000_000_000));
         assert_eq!(s.position_micro("BTC"), Some(500_000_000));
         assert_eq!(s.position_micro("ETH"), Some(100_000_000));
-        assert_eq!(s.position_micro("SOL"), None);
+        assert_eq!(s.position_micro("SOL"), Some(0));
         // Only the negative uPnL counts as loss (25.5), the +10 is ignored.
         assert_eq!(s.unrealized_loss, Some(25_500_000));
     }
@@ -4734,5 +4745,23 @@ mod tests {
 
         let s = HlSnapshot::from_clearinghouse(&json!({}));
         assert_eq!(s.unrealized_loss, None);
+    }
+
+    #[test]
+    fn snapshot_marks_positions_unreadable_when_position_value_missing() {
+        let v = json!({
+            "assetPositions": [
+                { "position": { "coin": "BTC", "unrealizedPnl": "0" } }
+            ]
+        });
+        let s = HlSnapshot::from_clearinghouse(&v);
+        assert_eq!(s.position_micro("BTC"), None);
+        assert_eq!(s.position_micro("SOL"), None);
+    }
+
+    #[test]
+    fn snapshot_treats_valid_empty_positions_as_zero() {
+        let s = HlSnapshot::from_clearinghouse(&json!({ "assetPositions": [] }));
+        assert_eq!(s.position_micro("BTC"), Some(0));
     }
 }

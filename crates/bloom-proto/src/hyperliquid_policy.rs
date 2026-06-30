@@ -423,18 +423,21 @@ pub fn evaluate_hyperliquid_action(
         // notional + this order's notional. Resting orders must be counted so
         // a series of individually-under-cap orders can't collectively breach
         // the cap once they fill. Fail closed when the resting figure is
-        // unavailable (same posture as `snapshot_readable`): a configured cap
-        // we can't fully evaluate must not silently pass.
-        match ctx.resting_notional_microusd {
-            None => out.push(check(
+        // unavailable, and when the current position is unavailable, because a
+        // configured cap we can't fully evaluate must not silently pass.
+        match (ctx.position_microusd, ctx.resting_notional_microusd) {
+            (None, _) => out.push(check(
+                "max_position_usd",
+                PolicyOutcome::Deny,
+                "position cap configured but current position is unavailable (fail closed)",
+            )),
+            (_, None) => out.push(check(
                 "max_position_usd",
                 PolicyOutcome::Deny,
                 "position cap configured but resting open-order notional is unavailable (fail closed)",
             )),
-            Some(resting) => {
-                let projected = ctx
-                    .position_microusd
-                    .unwrap_or(0)
+            (Some(position), Some(resting)) => {
+                let projected = position
                     .saturating_add(resting)
                     .saturating_add(ctx.notional_microusd.unwrap_or(0));
                 if projected > cap {
@@ -806,6 +809,18 @@ mod tests {
         let mut ctx = order_ctx("BTC");
         ctx.position_microusd = Some(0);
         ctx.resting_notional_microusd = None;
+        assert!(denied(&evaluate_hyperliquid_action(&p, &ctx)));
+    }
+
+    #[test]
+    fn max_position_fails_closed_without_current_position() {
+        let p = HyperliquidPolicy {
+            max_position_usd: Some(1_000 * MICRO_USD),
+            ..Default::default()
+        };
+        let mut ctx = order_ctx("BTC");
+        ctx.position_microusd = None;
+        ctx.resting_notional_microusd = Some(0);
         assert!(denied(&evaluate_hyperliquid_action(&p, &ctx)));
     }
 
