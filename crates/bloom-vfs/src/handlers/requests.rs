@@ -12,7 +12,8 @@ use bloom_paid_http::{
     EmptyPaidHttpChainRpcResolver, NormalizedChallenge, PaidHttpChainRpcResolver, ParsedRequest,
     PaymentRequirement, PolicyCheck, PolicyEvalInput, evaluate_payment_policy,
     evaluate_session_policy, headers_to_string_map, json_number, normalize_challenge,
-    paid_http_intent_label, parse_money, parse_request, select_payment_requirement, trim_money,
+    paid_http_intent_label, parse_money, parse_payment_amount_usd, parse_request,
+    select_payment_requirement, trim_money,
 };
 use bloom_paid_mpp::{PaymentBackend, RealMppBackend};
 use bloom_paid_x402::{KeystoreX402PaymentSigner, X402PaymentSigner, X402SignContext};
@@ -346,7 +347,12 @@ impl RequestsHandler {
             total += receipt
                 .get("amount_usd")
                 .and_then(json_number)
-                .or_else(|| receipt.get("amount").and_then(json_number))
+                .or_else(|| {
+                    parse_payment_amount_usd(
+                        receipt.get("currency").and_then(|v| v.as_str()),
+                        receipt.get("amount").and_then(|v| v.as_str()),
+                    )
+                })
                 .unwrap_or(0.0);
         }
         Ok(total)
@@ -1302,6 +1308,30 @@ mod tests {
         assert!(consume_request_confirm_approved(&pending, "alice", "y").is_err());
         assert!(consume_request_confirm_approved(&pending, "alice", "confirm").is_ok());
         assert!(consume_request_confirm_approved(&pending, "alice", "confirm").is_err());
+    }
+
+    #[test]
+    fn spent_usd_history_converts_mpp_base_units_like_x402() {
+        let f = fixture(Some("alice"));
+        let sent = f.handler.requests_root().join("sent/req_mpp_paid");
+        fs::create_dir_all(&sent).unwrap();
+        write_json(
+            sent.join("receipt.json"),
+            &json!({
+                "request_id": "req_mpp_paid",
+                "wallet": "alice",
+                "merchant": "api.nansen.ai",
+                "amount": "10000",
+                "currency": "0x20C000000000000000000000b9537d11c60E8b50",
+                "network": "tempo",
+                "protocol": "mpp",
+                "intent": "charge"
+            }),
+        )
+        .unwrap();
+
+        let spent = f.handler.sum_paid_usd_last_24h("alice").unwrap();
+        assert!((spent - 0.01).abs() < f64::EPSILON, "{spent}");
     }
 
     async fn mock_server(
