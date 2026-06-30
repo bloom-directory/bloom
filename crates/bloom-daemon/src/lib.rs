@@ -682,7 +682,15 @@ impl Daemon {
                     handler = handler
                         .with_onboarding(PolymarketOnboarding {
                             onboarder: Arc::new(onboarder),
-                            geoblock: Arc::new(GeoblockClient::new()),
+                            geoblock: Arc::new({
+                                let geo_base = url::Url::parse(&pm_cfg.gamma_url).ok()
+                                    .filter(|u| matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "::1")))
+                                    .and_then(|u| u.join("/api/geoblock").ok());
+                                match geo_base {
+                                    Some(url) => GeoblockClient::new().with_base_url_for_tests(url.to_string()),
+                                    None => GeoblockClient::new(),
+                                }
+                            }),
                             creds: CredentialStore::new(&state_dir),
                             chain,
                         })

@@ -3091,7 +3091,7 @@ pub async fn cancel(d: &Daemon, wallet: &str, order_id: &str) -> Result<()> {
         .as_ref()
         .context("no [polymarket] block in config.toml")?;
 
-    match GeoblockClient::new().check().await {
+    match polymarket_geoblock_client(pm_cfg).check().await {
         Ok(geo) if geo.blocked => {
             eprintln!("warning: geoblock reports blocked; cancel proceeds (risk-reducing)");
         }
@@ -3106,7 +3106,7 @@ pub async fn cancel(d: &Daemon, wallet: &str, order_id: &str) -> Result<()> {
 
     let store = OrderStore::new(d.home.polymarket_dir());
     let _lock = store.lock(wallet)?;
-    let clob = ClobClient::new(pm_cfg.chain_id);
+    let clob = polymarket_clob_client(pm_cfg);
     let result = clob
         .cancel_order(&creds, info.address, order_id)
         .await

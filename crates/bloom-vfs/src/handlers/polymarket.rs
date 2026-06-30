@@ -640,7 +640,7 @@ impl PolymarketHandler {
                 HandlerError::invalid("wallet not onboarded (no CLOB credentials)")
             })?;
         // Geoblock is warning-only for cancel (risk-reducing); it never blocks.
-        match GeoblockClient::new().check().await {
+        match ob.geoblock.check().await {
             Ok(geo) if geo.blocked => {
                 tracing::warn!("geoblock reports blocked; cancel proceeds (risk-reducing)");
             }
