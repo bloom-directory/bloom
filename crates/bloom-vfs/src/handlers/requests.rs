@@ -11,9 +11,9 @@ use bloom_keystore::Keystore;
 use bloom_paid_http::{
     EmptyPaidHttpChainRpcResolver, NormalizedChallenge, PaidHttpChainRpcResolver, ParsedRequest,
     PaymentRequirement, PolicyCheck, PolicyEvalInput, evaluate_payment_policy,
-    evaluate_session_policy, headers_to_string_map, json_number, normalize_challenge,
+    evaluate_session_policy, is_sensitive_paid_http_header, json_number, normalize_challenge,
     paid_http_intent_label, parse_money, parse_payment_amount_usd, parse_request,
-    select_payment_requirement, trim_money,
+    select_payment_requirement, selected_requirement_amount_usd, trim_money,
 };
 use bloom_paid_mpp::{PaymentBackend, RealMppBackend};
 use bloom_paid_x402::{KeystoreX402PaymentSigner, X402PaymentSigner, X402SignContext};
@@ -22,6 +22,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
@@ -106,13 +107,14 @@ impl RequestsHandler {
     }
 
     fn resolve_ref(&self, raw: &str) -> Result<(String, String), HandlerError> {
+        let raw = safe_fs_component(raw, "request id")?;
         if raw == "latest" {
             return self.read_latest();
         }
         for state in ["pending", "sent", "failed"] {
-            let path = self.requests_root().join(state).join(raw);
+            let path = self.requests_root().join(state).join(&raw);
             if path.exists() {
-                return Ok((state.to_string(), raw.to_string()));
+                return Ok((state.to_string(), raw));
             }
         }
         Err(HandlerError::NotFound(raw.into()))
@@ -142,6 +144,9 @@ impl RequestsHandler {
             request.url.clone(),
         );
         for (k, v) in &request.headers {
+            if is_sensitive_request_header(k) && !is_mpp_probe_marker_header(k, v) {
+                continue;
+            }
             let name = HeaderName::from_bytes(k.as_bytes())
                 .map_err(|e| HandlerError::invalid(format!("invalid header {k}: {e}")))?;
             let val = HeaderValue::from_str(v)
@@ -167,14 +172,27 @@ impl RequestsHandler {
             let challenge = normalize_challenge(&headers, &body, &request.url);
             let policy = self.wallet_policy(&wallet)?;
             let spent_24h_usd = self.sum_paid_usd_last_24h(&wallet)?;
+            let policy_requirement = select_payment_requirement(&challenge, &policy, &host)
+                .or_else(|| challenge.accepts.first().cloned())
+                .unwrap_or_else(|| PaymentRequirement {
+                    scheme: None,
+                    network: challenge.network.clone(),
+                    asset: challenge.asset.clone(),
+                    amount: challenge.amount.clone(),
+                    pay_to: None,
+                    resource: None,
+                    raw: json!({}),
+                });
+            let policy_amount_usd =
+                selected_requirement_amount_usd(&challenge, &policy_requirement);
             let mut checks = evaluate_payment_policy(
                 &policy,
                 PolicyEvalInput {
                     host: &host,
-                    asset: challenge.asset.as_deref(),
-                    network: challenge.network.as_deref(),
+                    asset: policy_requirement.asset.as_deref(),
+                    network: policy_requirement.network.as_deref(),
                     intent: &challenge.intent,
-                    amount_usd: challenge.amount_usd,
+                    amount_usd: policy_amount_usd,
                     request_max_amount_usd: request.max_amount_usd,
                     spent_24h_usd,
                 },
@@ -196,7 +214,7 @@ impl RequestsHandler {
             checks.extend(evaluate_session_policy(&policy, &challenge, already_spent));
             let dir = self.req_dir("pending", &id);
             fs::create_dir_all(dir.join("response"))?;
-            write_request_artifacts(&dir, &request, &wallet, "pending")?;
+            write_request_artifacts(&dir, &request, &wallet, "pending", dry_run)?;
             fs::write(dir.join("status"), b"pending\n")?;
             fs::write(dir.join("challenge.raw"), &body)?;
             write_json(dir.join("challenge.json"), &challenge)?;
@@ -212,14 +230,14 @@ impl RequestsHandler {
             )?;
             write_json(
                 dir.join("audit.json"),
-                &json!({"request_id": id, "event": "staged", "reads_spent": false}),
+                &json!({"request_id": id, "event": "staged", "reads_spent": false, "dry_run": dry_run}),
             )?;
             self.write_latest("pending", &id)?;
             Ok(id)
         } else {
             let dir = self.req_dir("sent", &id);
             fs::create_dir_all(dir.join("response"))?;
-            write_request_artifacts(&dir, &request, &wallet, "sent")?;
+            write_request_artifacts(&dir, &request, &wallet, "sent", dry_run)?;
             fs::write(dir.join("status"), b"sent\n")?;
             fs::write(
                 dir.join("plan.md"),
@@ -228,7 +246,7 @@ impl RequestsHandler {
             fs::write(dir.join("response/status"), format!("{status}\n"))?;
             write_json(
                 dir.join("response/headers.json"),
-                &headers_to_json(&headers),
+                &public_headers_to_json(&headers),
             )?;
             fs::write(dir.join("response/body"), &body)?;
             let sha = bloom_tools::sha256_hex(&body);
@@ -367,7 +385,7 @@ impl RequestsHandler {
     ) -> Result<(), HandlerError> {
         let dir = self.req_dir("failed", id);
         fs::create_dir_all(dir.join("response"))?;
-        write_request_artifacts(&dir, request, wallet, "failed")?;
+        write_request_artifacts(&dir, request, wallet, "failed", false)?;
         fs::write(dir.join("status"), b"failed\n")?;
         fs::write(dir.join("error.txt"), format!("{error}\n"))?;
         write_json(
@@ -385,36 +403,21 @@ impl RequestsHandler {
             return Err(HandlerError::NotFound(format!("/requests/pending/{id}")));
         }
         let request_json: serde_json::Value = read_json(pending.join("request.toml"))?;
-        let request = ParsedRequest {
-            method: request_json
-                .get("method")
-                .and_then(|v| v.as_str())
-                .unwrap_or("GET")
-                .to_string(),
-            url: Url::parse(
-                request_json
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| HandlerError::backend("request.toml missing url"))?,
-            )
-            .map_err(|e| HandlerError::backend(format!("stored request url: {e}")))?,
-            wallet: request_json
-                .get("wallet")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            max_amount_usd: request_json.get("max_amount_usd").and_then(|v| v.as_f64()),
-            headers: serde_json::from_value(
-                request_json
-                    .get("headers")
-                    .cloned()
-                    .unwrap_or_else(|| json!({})),
-            )
-            .map_err(|e| HandlerError::backend(format!("stored request headers: {e}")))?,
-            body: request_json
-                .get("body")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-        };
+        if request_json
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return Err(HandlerError::invalid(
+                "dry-run paid requests cannot be confirmed; stage a fresh request with /requests/new",
+            ));
+        }
+        if pending.join("private/credential_minted.json").exists() {
+            return Err(HandlerError::invalid(
+                "this pending request already minted a payment credential; cancel and stage a fresh request instead of re-confirming",
+            ));
+        }
+        let request = parsed_request_from_dir(&pending)?;
         let wallet = request
             .wallet
             .as_deref()
@@ -453,7 +456,18 @@ impl RequestsHandler {
                     asset: challenge.asset.as_deref(),
                     network: challenge.network.as_deref(),
                     intent: &challenge.intent,
-                    amount_usd: challenge.amount_usd,
+                    amount_usd: selected_requirement_amount_usd(
+                        &challenge,
+                        &PaymentRequirement {
+                            scheme: None,
+                            network: challenge.network.clone(),
+                            asset: challenge.asset.clone(),
+                            amount: challenge.amount.clone(),
+                            pay_to: None,
+                            resource: None,
+                            raw: json!({}),
+                        },
+                    ),
                     request_max_amount_usd: request.max_amount_usd,
                     spent_24h_usd: self.sum_paid_usd_last_24h(&wallet)?,
                 },
@@ -496,6 +510,7 @@ impl RequestsHandler {
         challenge.network = requirement.network.clone();
         challenge.asset = requirement.asset.clone();
         challenge.amount = requirement.amount.clone();
+        let amount_usd = selected_requirement_amount_usd(&challenge, &requirement);
         let checks = evaluate_payment_policy(
             &policy,
             PolicyEvalInput {
@@ -503,7 +518,7 @@ impl RequestsHandler {
                 asset: challenge.asset.as_deref(),
                 network: challenge.network.as_deref(),
                 intent: &challenge.intent,
-                amount_usd: challenge.amount_usd,
+                amount_usd,
                 request_max_amount_usd: request.max_amount_usd,
                 spent_24h_usd: self.sum_paid_usd_last_24h(&wallet)?,
             },
@@ -531,95 +546,47 @@ impl RequestsHandler {
             .await
             .map_err(HandlerError::backend)?;
 
-        let mut retry = self.client.request(
-            request.method.parse().unwrap_or(reqwest::Method::GET),
-            request.url.clone(),
-        );
-        for (k, v) in &request.headers {
-            if is_sensitive_request_header(k) {
-                continue;
-            }
-            let name = HeaderName::from_bytes(k.as_bytes())
-                .map_err(|e| HandlerError::invalid(format!("invalid header {k}: {e}")))?;
-            let val = HeaderValue::from_str(v)
-                .map_err(|e| HandlerError::invalid(format!("invalid header {k}: {e}")))?;
-            retry = retry.header(name, val);
-        }
-        retry = retry.header(credential.header_name, credential.header_value.clone());
-        if let Some(body) = &request.body {
-            retry = retry.body(body.clone());
-        }
-        let response = retry
-            .send()
-            .await
-            .map_err(|e| HandlerError::backend(format!("paid HTTP retry failed: {e}")))?;
-        let status = response.status().as_u16();
-        let response_headers = response.headers().clone();
-        let response_body = response
-            .bytes()
-            .await
-            .map_err(|e| HandlerError::backend(format!("read paid HTTP response: {e}")))?
-            .to_vec();
-        let sha = bloom_tools::sha256_hex(&response_body);
-        write_json(
-            pending.join("credential.json"),
-            &json!({
-                "redacted": true,
-                "protocol": challenge.protocol,
-                "intent": challenge.intent,
-                "scheme": requirement.scheme,
-                "network": requirement.network,
-                "asset": requirement.asset,
-                "pay_to": requirement.pay_to,
-                "charge_id": challenge.charge_id,
-                "session_id": challenge.session_id,
-                "material": "not_stored",
-                "header_name": credential.header_name,
-                "secret_material_in_vfs": false,
-                "public": credential.public_metadata,
-            }),
+        let credential_metadata = json!({
+            "redacted": true,
+            "protocol": challenge.protocol,
+            "intent": challenge.intent,
+            "scheme": requirement.scheme,
+            "network": requirement.network,
+            "asset": requirement.asset,
+            "pay_to": requirement.pay_to,
+            "charge_id": challenge.charge_id,
+            "session_id": challenge.session_id,
+            "material": "not_stored",
+            "header_name": credential.header_name,
+            "secret_material_in_vfs": false,
+            "public": credential.public_metadata,
+        });
+        write_minted_marker(&pending, id, &credential_metadata)?;
+        let retry = retry_paid_request(
+            &self.client,
+            &request,
+            credential.header_name,
+            &credential.header_value,
+        )
+        .await;
+        finalize_paid_retry(
+            &self.requests_root(),
+            &pending,
+            id,
+            &wallet,
+            &host,
+            &challenge,
+            &requirement,
+            amount_usd,
+            credential_metadata,
+            retry,
         )?;
-        fs::write(pending.join("response/status"), format!("{status}\n"))?;
-        write_json(
-            pending.join("response/headers.json"),
-            &headers_to_json(&response_headers),
-        )?;
-        fs::write(pending.join("response/body"), &response_body)?;
-        fs::write(pending.join("response/body.sha256"), format!("{sha}\n"))?;
-        write_json(
-            pending.join("receipt.json"),
-            &json!({
-                "request_id": id,
-                "wallet": wallet,
-                "merchant": host,
-                "amount": requirement.amount,
-                "currency": requirement.asset,
-                "network": requirement.network,
-                "protocol": challenge.protocol,
-                "intent": challenge.intent,
-                "scheme": requirement.scheme,
-                "charge_id": challenge.charge_id,
-                "session_id": challenge.session_id,
-                "amount_usd": challenge.amount_usd,
-                "response_status": status,
-                "credential_redacted": true,
-            }),
-        )?;
-        write_json(
-            pending.join("audit.json"),
-            &json!({"request_id": id, "event": "confirmed_and_retried", "reads_spent": false, "credential_redacted": true}),
-        )?;
-        let target_state = if status < 400 { "sent" } else { "failed" };
-        if target_state == "sent" && challenge.intent == "session" {
-            update_session_state(&self.requests_root(), &challenge, id, &wallet)?;
-        }
-        fs::write(pending.join("status"), format!("{target_state}\n"))?;
-        let target = self.req_dir(target_state, id);
-        if target.exists() {
-            fs::remove_dir_all(&target)?;
-        }
-        fs::rename(&pending, &target)?;
-        self.write_latest(target_state, id)?;
+        let final_state = if self.req_dir("sent", id).exists() {
+            "sent"
+        } else {
+            "failed"
+        };
+        self.write_latest(final_state, id)?;
         Ok(())
     }
 }
@@ -671,6 +638,7 @@ fn consume_request_confirm_approved(
 #[async_trait]
 impl Handler for RequestsHandler {
     async fn lookup(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
+        validate_vfs_segments(path)?;
         let segs = path.segments();
         match segs {
             [] => Ok(Entry::dir("requests")),
@@ -714,6 +682,7 @@ impl Handler for RequestsHandler {
     }
 
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        validate_vfs_segments(path)?;
         self.ensure_layout()?;
         let segs = path.segments();
         match segs {
@@ -746,6 +715,7 @@ impl Handler for RequestsHandler {
     }
 
     async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
+        validate_vfs_segments(path)?;
         let segs = path.segments();
         match segs {
             [one] if one == "latest" => {
@@ -786,6 +756,7 @@ impl Handler for RequestsHandler {
     }
 
     async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+        validate_vfs_segments(path)?;
         let segs = path.segments();
         match segs {
             [one] if one == "new" || one == "new.dry-run" => {
@@ -880,7 +851,21 @@ async fn confirm_with_backend(
     }
     let challenge: NormalizedChallenge = read_json(pending.join("challenge.json"))?;
     let request_value: serde_json::Value = read_json(pending.join("request.toml"))?;
-    let request = parsed_request_from_artifact(&request_value)?;
+    if request_value
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(HandlerError::invalid(
+            "dry-run paid requests cannot be confirmed; stage a fresh request with /requests/new",
+        ));
+    }
+    if pending.join("private/credential_minted.json").exists() {
+        return Err(HandlerError::invalid(
+            "this pending request already minted a payment credential; cancel and stage a fresh request instead of re-confirming",
+        ));
+    }
+    let request = parsed_request_from_dir(&pending)?;
     let wallet = request_value
         .get("wallet")
         .and_then(|v| v.as_str())
@@ -895,71 +880,39 @@ async fn confirm_with_backend(
         }
     };
     let execution = backend
-        .confirm(&challenge, &request, &wallet, policy, id)
+        .prepare(&challenge, &request, &wallet, policy, id)
         .await
         .map_err(HandlerError::backend)?;
-    let succeeded = execution.response_status < 400;
-    let final_state = if succeeded { "sent" } else { "failed" };
-    fs::create_dir_all(pending.join("response"))?;
-    write_json(
-        pending.join("credential.json"),
-        &execution.credential_metadata,
+    write_minted_marker(&pending, id, &execution.credential_metadata)?;
+    let retry = retry_paid_request(
+        &reqwest::Client::new(),
+        &request,
+        execution.header_name,
+        &execution.header_value,
+    )
+    .await;
+    let requirement = PaymentRequirement {
+        scheme: None,
+        network: challenge.network.clone(),
+        asset: challenge.asset.clone(),
+        amount: challenge.amount.clone(),
+        pay_to: None,
+        resource: None,
+        raw: json!({}),
+    };
+    let amount_usd = selected_requirement_amount_usd(&challenge, &requirement);
+    let final_state = finalize_paid_retry(
+        &requests_root,
+        &pending,
+        id,
+        &wallet,
+        &challenge.merchant,
+        &challenge,
+        &requirement,
+        amount_usd,
+        execution.credential_metadata,
+        retry,
     )?;
-    fs::write(
-        pending.join("response/status"),
-        format!("{}\n", execution.response_status),
-    )?;
-    fs::write(pending.join("response/body"), &execution.response_body)?;
-    write_json(
-        pending.join("response/headers.json"),
-        &headers_to_json(&execution.response_headers),
-    )?;
-    let sha = bloom_tools::sha256_hex(&execution.response_body);
-    fs::write(pending.join("response/body.sha256"), format!("{sha}\n"))?;
-    write_json(
-        pending.join("receipt.json"),
-        &json!({
-            "request_id": id,
-            "wallet": request_json_field(&pending, "wallet"),
-            "merchant": challenge.merchant,
-            "amount": challenge.amount,
-            "currency": challenge.asset,
-            "network": challenge.network,
-            "protocol": challenge.protocol,
-            "intent": challenge.intent,
-            "tx_hash": null,
-            "session_id": challenge.session_id,
-            "response_sha256": sha,
-            "mock_backend": false,
-            "raw": execution.receipt_raw
-        }),
-    )?;
-    write_json(
-        pending.join("audit.json"),
-        &json!({
-            "request_id": id,
-            "event": "confirmed_and_retried",
-            "backend": backend.name(),
-            "response_status": execution.response_status,
-            "paid_retry_succeeded": succeeded,
-            "reads_spent": false,
-            "secret_material_in_vfs": false
-        }),
-    )?;
-    if succeeded && challenge.intent == "session" {
-        let wallet = request_json_field(&pending, "wallet")
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string();
-        update_session_state(&requests_root, &challenge, id, &wallet)?;
-    }
-    fs::write(pending.join("status"), format!("{final_state}\n"))?;
-    fs::create_dir_all(requests_root.join(final_state))?;
-    let dest = requests_root.join(final_state).join(id);
-    if dest.exists() {
-        fs::remove_dir_all(&dest)?;
-    }
-    fs::rename(&pending, &dest)?;
     fs::write(
         requests_root.join("latest"),
         format!("{final_state}/{id}\n"),
@@ -967,6 +920,16 @@ async fn confirm_with_backend(
     Ok(ConfirmResult {
         final_state: final_state.into(),
     })
+}
+
+fn parsed_request_from_dir(dir: &Path) -> Result<ParsedRequest, HandlerError> {
+    let mut request =
+        parsed_request_from_artifact(&read_json::<serde_json::Value>(dir.join("request.toml"))?)?;
+    let private_body = dir.join("private/request_body");
+    if private_body.exists() {
+        request.body = Some(fs::read_to_string(private_body)?);
+    }
+    Ok(request)
 }
 
 fn parsed_request_from_artifact(v: &serde_json::Value) -> Result<ParsedRequest, HandlerError> {
@@ -996,13 +959,6 @@ fn parsed_request_from_artifact(v: &serde_json::Value) -> Result<ParsedRequest, 
 fn backend_policy_for_wallet(root: &Path, wallet: &str) -> Result<Policy, HandlerError> {
     let raw = fs::read_to_string(root.join("keystore").join(wallet).join("policy.toml"))?;
     toml::from_str(&raw).map_err(|e| HandlerError::backend(e.to_string()))
-}
-
-fn request_json_field(dir: &Path, field: &str) -> serde_json::Value {
-    read_json::<serde_json::Value>(dir.join("request.toml"))
-        .ok()
-        .and_then(|v| v.get(field).cloned())
-        .unwrap_or(serde_json::Value::Null)
 }
 
 /// Records a redacted, append-only voucher trail after a session-intent paid
@@ -1134,7 +1090,19 @@ fn write_request_artifacts(
     req: &ParsedRequest,
     wallet: &str,
     state: &str,
+    dry_run: bool,
 ) -> Result<(), HandlerError> {
+    fs::create_dir_all(dir.join("private"))?;
+    let (body_redacted, body_len, body_sha256) = if let Some(body) = &req.body {
+        fs::write(dir.join("private/request_body"), body)?;
+        (
+            true,
+            Some(body.len()),
+            Some(bloom_tools::sha256_hex(body.as_bytes())),
+        )
+    } else {
+        (false, None, None)
+    };
     write_json(
         dir.join("request.toml"),
         &json!({
@@ -1143,7 +1111,11 @@ fn write_request_artifacts(
             "wallet": wallet,
             "max_amount_usd": req.max_amount_usd,
             "headers": redacted_headers(&req.headers),
-            "body": req.body,
+            "body": if body_redacted { serde_json::Value::String("redacted".into()) } else { serde_json::Value::Null },
+            "body_redacted": body_redacted,
+            "body_len": body_len,
+            "body_sha256": body_sha256,
+            "dry_run": dry_run,
             "state": state
         }),
     )?;
@@ -1156,17 +1128,193 @@ fn write_request_artifacts(
         };
         http.push_str(&format!("{k}: {value}\n"));
     }
-    if let Some(body) = &req.body {
+    if req.body.is_some() {
         http.push('\n');
-        http.push_str(body);
+        http.push_str("[request body redacted; see body_sha256 in request.toml]");
         http.push('\n');
     }
     fs::write(dir.join("request.http"), http)?;
     Ok(())
 }
 
-fn headers_to_json(headers: &HeaderMap) -> serde_json::Value {
-    json!(headers_to_string_map(headers))
+#[derive(Debug)]
+struct PaidRetryResponse {
+    status: u16,
+    headers: HeaderMap,
+    body: Vec<u8>,
+}
+
+async fn retry_paid_request(
+    client: &reqwest::Client,
+    request: &ParsedRequest,
+    payment_header_name: &str,
+    payment_header_value: &str,
+) -> Result<PaidRetryResponse, HandlerError> {
+    let mut retry = client.request(
+        request.method.parse().unwrap_or(reqwest::Method::GET),
+        request.url.clone(),
+    );
+    for (k, v) in &request.headers {
+        if is_sensitive_request_header(k) {
+            continue;
+        }
+        let name = HeaderName::from_bytes(k.as_bytes())
+            .map_err(|e| HandlerError::invalid(format!("invalid header {k}: {e}")))?;
+        let val = HeaderValue::from_str(v)
+            .map_err(|e| HandlerError::invalid(format!("invalid header {k}: {e}")))?;
+        retry = retry.header(name, val);
+    }
+    let name = HeaderName::from_bytes(payment_header_name.as_bytes()).map_err(|e| {
+        HandlerError::backend(format!("invalid paid HTTP credential header name: {e}"))
+    })?;
+    let value = HeaderValue::from_str(payment_header_value).map_err(|e| {
+        HandlerError::backend(format!("invalid paid HTTP credential header value: {e}"))
+    })?;
+    retry = retry.header(name, value);
+    if let Some(body) = &request.body {
+        retry = retry.body(body.clone());
+    }
+    let response = retry
+        .send()
+        .await
+        .map_err(|e| HandlerError::backend(format!("paid HTTP retry failed: {e}")))?;
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| HandlerError::backend(format!("read paid HTTP response: {e}")))?
+        .to_vec();
+    Ok(PaidRetryResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+fn write_minted_marker(
+    pending: &Path,
+    id: &str,
+    credential_metadata: &serde_json::Value,
+) -> Result<(), HandlerError> {
+    fs::create_dir_all(pending.join("private"))?;
+    write_json(pending.join("credential.json"), credential_metadata)?;
+    write_json(
+        pending.join("private/credential_minted.json"),
+        &json!({
+            "request_id": id,
+            "credential_redacted": true,
+            "secret_material_in_vfs": false
+        }),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_paid_retry(
+    requests_root: &Path,
+    pending: &Path,
+    id: &str,
+    wallet: &str,
+    merchant: &str,
+    challenge: &NormalizedChallenge,
+    requirement: &PaymentRequirement,
+    amount_usd: Option<f64>,
+    credential_metadata: serde_json::Value,
+    retry: Result<PaidRetryResponse, HandlerError>,
+) -> Result<String, HandlerError> {
+    fs::create_dir_all(pending.join("response"))?;
+    write_json(pending.join("credential.json"), &credential_metadata)?;
+    let (status, response_headers, response_body, retry_error) = match retry {
+        Ok(response) => (response.status, response.headers, response.body, None),
+        Err(err) => (
+            599,
+            HeaderMap::new(),
+            format!("{err}\n").into_bytes(),
+            Some(err.to_string()),
+        ),
+    };
+    fs::write(pending.join("response/status"), format!("{status}\n"))?;
+    write_json(
+        pending.join("response/headers.json"),
+        &public_headers_to_json(&response_headers),
+    )?;
+    fs::write(pending.join("response/body"), &response_body)?;
+    let sha = bloom_tools::sha256_hex(&response_body);
+    fs::write(pending.join("response/body.sha256"), format!("{sha}\n"))?;
+    if let Some(error) = &retry_error {
+        fs::write(pending.join("error.txt"), format!("{error}\n"))?;
+    }
+    let receipt_raw = response_headers
+        .get("payment-receipt")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| mpp::parse_receipt(h).ok())
+        .and_then(|r| serde_json::to_value(r).ok())
+        .unwrap_or_else(|| json!({}));
+    write_json(
+        pending.join("receipt.json"),
+        &json!({
+            "request_id": id,
+            "wallet": wallet,
+            "merchant": merchant,
+            "amount": requirement.amount,
+            "currency": requirement.asset,
+            "network": requirement.network,
+            "protocol": challenge.protocol,
+            "intent": challenge.intent,
+            "scheme": requirement.scheme,
+            "charge_id": challenge.charge_id,
+            "session_id": challenge.session_id,
+            "amount_usd": amount_usd,
+            "response_status": status,
+            "response_sha256": sha,
+            "credential_redacted": true,
+            "raw": receipt_raw,
+        }),
+    )?;
+    let succeeded = status < 400 && retry_error.is_none();
+    write_json(
+        pending.join("audit.json"),
+        &json!({
+            "request_id": id,
+            "event": "confirmed_and_retried",
+            "response_status": status,
+            "paid_retry_succeeded": succeeded,
+            "retry_error": retry_error,
+            "reads_spent": false,
+            "credential_redacted": true,
+            "secret_material_in_vfs": false
+        }),
+    )?;
+    let final_state = if succeeded { "sent" } else { "failed" };
+    if succeeded && challenge.intent == "session" {
+        update_session_state(requests_root, challenge, id, wallet)?;
+    }
+    fs::write(pending.join("status"), format!("{final_state}\n"))?;
+    fs::create_dir_all(requests_root.join(final_state))?;
+    let dest = requests_root
+        .join(final_state)
+        .join(safe_fs_component(id, "request id")?);
+    if dest.exists() {
+        return Err(HandlerError::backend(format!(
+            "request destination already exists for id {id}"
+        )));
+    }
+    fs::rename(pending, &dest)?;
+    Ok(final_state.into())
+}
+
+fn public_headers_to_json(headers: &HeaderMap) -> serde_json::Value {
+    let mut map = std::collections::BTreeMap::new();
+    for (name, value) in headers {
+        let key = name.as_str().to_ascii_lowercase();
+        let rendered = if is_sensitive_response_header(&key) {
+            "redacted".to_string()
+        } else {
+            value.to_str().unwrap_or("<non-utf8>").to_string()
+        };
+        map.insert(key, rendered);
+    }
+    json!(map)
 }
 
 fn redacted_headers(headers: &std::collections::BTreeMap<String, String>) -> serde_json::Value {
@@ -1188,32 +1336,45 @@ fn redacted_headers(headers: &std::collections::BTreeMap<String, String>) -> ser
 }
 
 fn is_sensitive_request_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "authorization"
-            | "proxy-authorization"
-            | "x-payment"
-            | "payment-signature"
-            | "x-api-key"
-            | "api-key"
-            | "apikey"
-    )
+    is_sensitive_paid_http_header(name)
+}
+
+fn is_mpp_probe_marker_header(name: &str, value: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization") && value.trim().eq_ignore_ascii_case("Payment")
+}
+
+fn is_sensitive_response_header(name: &str) -> bool {
+    is_sensitive_paid_http_header(name)
+        || matches!(
+            name.to_ascii_lowercase().as_str(),
+            "www-authenticate" | "payment-required"
+        )
 }
 
 fn session_dir_name(raw: &str) -> Result<String, HandlerError> {
+    safe_fs_component(raw, "paid request session id")
+}
+
+fn safe_fs_component(raw: &str, label: &str) -> Result<String, HandlerError> {
     let name = raw.trim();
     if name.is_empty()
         || name == "."
         || name == ".."
         || name.contains('/')
         || name.contains('\\')
+        || name.contains('\0')
         || Path::new(name).is_absolute()
     {
-        return Err(HandlerError::invalid(format!(
-            "invalid paid request session id '{raw}'"
-        )));
+        return Err(HandlerError::invalid(format!("invalid {label} '{raw}'")));
     }
     Ok(name.to_string())
+}
+
+fn validate_vfs_segments(path: &VfsPath) -> Result<(), HandlerError> {
+    for segment in path.segments() {
+        safe_fs_component(segment, "VFS path segment")?;
+    }
+    Ok(())
 }
 
 fn write_json(path: impl AsRef<Path>, v: &impl Serialize) -> Result<(), HandlerError> {
@@ -1245,6 +1406,9 @@ fn list_entries(path: PathBuf) -> Result<Vec<Entry>, HandlerError> {
     for e in fs::read_dir(path)? {
         let e = e?;
         let name = e.file_name().to_string_lossy().to_string();
+        if name == "private" {
+            continue;
+        }
         let ty = e.file_type()?;
         out.push(if ty.is_dir() {
             Entry::dir(&name)
@@ -1258,11 +1422,13 @@ fn list_entries(path: PathBuf) -> Result<Vec<Entry>, HandlerError> {
     Ok(out)
 }
 fn new_request_id() -> String {
+    static REQUEST_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    format!("req_{ms}")
+    let n = REQUEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("req_{ms}_{n}")
 }
 
 #[cfg(test)]
@@ -1270,6 +1436,7 @@ mod tests {
     use super::*;
     use crate::path::VfsPath;
     use bloom_paid_mpp::PaymentExecution;
+    use bloom_paid_x402::X402PaymentCredential;
     use mpp::client::{PaymentProvider, TempoProvider};
     use std::collections::BTreeMap;
     use std::sync::{
@@ -1282,6 +1449,25 @@ mod tests {
     struct Fixture {
         _tmp: tempfile::TempDir,
         handler: RequestsHandler,
+    }
+
+    struct StaticX402Signer {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl X402PaymentSigner for StaticX402Signer {
+        async fn sign_x402_payment(
+            &self,
+            _ctx: &X402SignContext<'_>,
+        ) -> Result<X402PaymentCredential, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(X402PaymentCredential {
+                header_name: "X-Payment",
+                header_value: "signed-x402".into(),
+                public_metadata: json!({"test": true}),
+            })
+        }
     }
 
     fn fixture(default_wallet: Option<&str>) -> Fixture {
@@ -1374,6 +1560,178 @@ mod tests {
         (format!("http://{addr}/resource"), count)
     }
 
+    async fn capture_server(
+        status: u16,
+        body: &'static [u8],
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = socket.read(&mut buf).await.unwrap();
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            let response = format!(
+                "HTTP/1.1 {status} OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+        });
+        (format!("http://{addr}/resource"), rx)
+    }
+
+    #[test]
+    fn request_ids_include_collision_disambiguator() {
+        let id = new_request_id();
+        assert!(id.starts_with("req_"));
+        assert!(id.rsplit_once('_').is_some(), "{id}");
+    }
+
+    #[tokio::test]
+    async fn dry_run_paid_request_cannot_be_confirmed() {
+        let f = fixture(Some("alice"));
+        let body = br#"{"accepts":[{"network":"base","asset":"USDC","maxAmountRequired":"1000"}]}"#;
+        let (url, _hits) = mock_server(402, &[("x-payment-required", "1")], body).await;
+        let id = f
+            .handler
+            .create_request(format!("GET {url}").as_bytes(), true)
+            .await
+            .unwrap();
+
+        let err = f
+            .handler
+            .write(
+                &VfsPath::parse(&format!("/pending/{id}/confirm")).unwrap(),
+                b"confirm",
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("dry-run"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn unpaid_probe_strips_sensitive_payment_headers() {
+        let f = fixture(Some("alice"));
+        let (url, raw_rx) = capture_server(200, b"ok").await;
+        f.handler
+            .create_request(
+                format!(
+                    "GET {url}\nauthorization: Payment\nproxy-authorization: Bearer secret\nx-payment: old\npayment-signature: old\nx-api-key: key\naccept: application/json"
+                )
+                .as_bytes(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let raw = raw_rx.await.unwrap().to_ascii_lowercase();
+        assert!(raw.contains("authorization: payment"), "{raw}");
+        assert!(!raw.contains("proxy-authorization:"), "{raw}");
+        assert!(!raw.contains("x-payment:"), "{raw}");
+        assert!(!raw.contains("payment-signature:"), "{raw}");
+        assert!(!raw.contains("x-api-key:"), "{raw}");
+        assert!(raw.contains("accept: application/json"), "{raw}");
+    }
+
+    #[tokio::test]
+    async fn public_response_headers_are_redacted() {
+        let f = fixture(Some("alice"));
+        let (url, _hits) = mock_server(
+            200,
+            &[
+                ("set-cookie", "sid=secret"),
+                ("payment-receipt", "secret-receipt"),
+                ("content-type", "application/json"),
+            ],
+            b"{}",
+        )
+        .await;
+        let id = f
+            .handler
+            .create_request(format!("GET {url}").as_bytes(), false)
+            .await
+            .unwrap();
+        let headers: serde_json::Value = serde_json::from_slice(
+            &f.handler
+                .read(&VfsPath::parse(&format!("/sent/{id}/response/headers.json")).unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(headers["set-cookie"], "redacted");
+        assert_eq!(headers["payment-receipt"], "redacted");
+        assert_eq!(headers["content-type"], "application/json");
+    }
+
+    #[tokio::test]
+    async fn decoded_unsafe_vfs_segments_are_rejected() {
+        let f = fixture(Some("alice"));
+        let path = VfsPath::root().join("pending").join("bad/seg");
+        let err = f.handler.read(&path).await.unwrap_err();
+        assert!(err.to_string().contains("invalid"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn x402_retry_failure_moves_failed_and_does_not_resign() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let f = fixture(Some("alice"));
+        let mut policy = Policy::default();
+        policy.payments.enabled = true;
+        policy.payments.require_plan = true;
+        f.handler
+            .keystore
+            .write_policy("alice", toml::to_string_pretty(&policy).unwrap().as_bytes())
+            .unwrap();
+        let handler = f.handler.with_x402_signer(Arc::new(StaticX402Signer {
+            calls: calls.clone(),
+        }));
+        let pending = handler.requests_root().join("pending/req_retry_fail");
+        fs::create_dir_all(&pending).unwrap();
+        let challenge = normalize_challenge(
+            &HeaderMap::new(),
+            br#"{"x402Version":1,"accepts":[{"network":"base","asset":"USDC","maxAmountRequired":"1000"}]}"#,
+            &Url::parse("http://127.0.0.1:9/pay").unwrap(),
+        );
+        write_json(pending.join("challenge.json"), &challenge).unwrap();
+        write_json(
+            pending.join("payment_method.json"),
+            &challenge.payment_method(),
+        )
+        .unwrap();
+        let empty_checks: Vec<PolicyCheck> = vec![];
+        write_json(pending.join("policy_check.json"), &empty_checks).unwrap();
+        write_json(
+            pending.join("request.toml"),
+            &json!({"method":"GET","url":"http://127.0.0.1:9/pay","wallet":"alice","headers":{},"dry_run":false}),
+        )
+        .unwrap();
+        fs::write(pending.join("status"), "pending\n").unwrap();
+
+        persist_request_confirm_approved(
+            handler.root.as_path(),
+            "req_retry_fail",
+            "alice",
+            "confirm",
+        )
+        .unwrap();
+        handler.confirm("req_retry_fail", b"confirm").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            handler
+                .requests_root()
+                .join("failed/req_retry_fail")
+                .exists()
+        );
+        let err = handler
+            .confirm("req_retry_fail", b"confirm")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("pending"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn parses_one_line_toml_and_http_message_forms() {
         let req =
@@ -1427,16 +1785,18 @@ inline = '{"prompt":"hi"}'
 "#,
         )
         .unwrap();
-        write_request_artifacts(dir.path(), &req, "research", "pending").unwrap();
+        write_request_artifacts(dir.path(), &req, "research", "pending", false).unwrap();
 
         let stored: serde_json::Value = read_json(dir.path().join("request.toml")).unwrap();
-        assert_eq!(stored["body"], r#"{"prompt":"hi"}"#);
-        let reloaded = parsed_request_from_artifact(&stored).unwrap();
+        assert_eq!(stored["body"], "redacted");
+        assert_eq!(stored["body_redacted"], true);
+        let reloaded = parsed_request_from_dir(dir.path()).unwrap();
         assert_eq!(reloaded.body.as_deref(), Some(r#"{"prompt":"hi"}"#));
 
         let http = fs::read_to_string(dir.path().join("request.http")).unwrap();
         assert!(http.contains("content-type: application/json\n\n"));
-        assert!(http.ends_with("{\"prompt\":\"hi\"}\n"));
+        assert!(!http.contains("{\"prompt\":\"hi\"}"));
+        assert!(http.contains("request body redacted"));
     }
 
     #[test]
@@ -1446,7 +1806,7 @@ inline = '{"prompt":"hi"}'
             "GET https://api.example.com/data\nauthorization: Bearer secret\nx-api-key: key-123\naccept: application/json",
         )
         .unwrap();
-        write_request_artifacts(dir.path(), &req, "research", "pending").unwrap();
+        write_request_artifacts(dir.path(), &req, "research", "pending", false).unwrap();
 
         let stored: serde_json::Value = read_json(dir.path().join("request.toml")).unwrap();
         assert_eq!(stored["headers"]["authorization"], "redacted");
@@ -1825,7 +2185,7 @@ inline = '{"prompt":"hi"}'
             "mpp_tempo_test_double"
         }
 
-        async fn confirm(
+        async fn prepare(
             &self,
             challenge: &NormalizedChallenge,
             _request: &ParsedRequest,
@@ -1843,10 +2203,8 @@ inline = '{"prompt":"hi"}'
                     "raw_authorization_stored": false,
                     "raw_signed_payload_stored": false
                 }),
-                receipt_raw: json!({"backend": self.name()}),
-                response_status: 200,
-                response_headers: HeaderMap::new(),
-                response_body: b"paid response\n".to_vec(),
+                header_name: "Authorization",
+                header_value: "Payment test".into(),
             })
         }
     }
@@ -1856,10 +2214,16 @@ inline = '{"prompt":"hi"}'
         let dir = tempfile::tempdir().unwrap();
         let pending = dir.path().join("requests/pending/req_1");
         fs::create_dir_all(&pending).unwrap();
+        let (url, _hits) = mock_server(
+            200,
+            &[("payment-receipt", r#"{"status":"success"}"#)],
+            b"paid response\n",
+        )
+        .await;
         let challenge = normalize_challenge(
             &HeaderMap::new(),
             br#"{"protocol":"tempo-mpp","type":"Session","network":"tempo","asset":"pathUSD","session":{"id":"sess_1","voucherAmount":"0.10","voucherAmountUsd":0.10,"depositAmount":"1.00","depositAmountUsd":1.00}}"#,
-            &Url::parse("https://mpp.test/data").unwrap(),
+            &Url::parse(&url).unwrap(),
         );
         write_json(pending.join("challenge.json"), &challenge).unwrap();
         let payment = challenge.payment_method();
@@ -1868,7 +2232,7 @@ inline = '{"prompt":"hi"}'
         write_json(pending.join("policy_check.json"), &empty_checks).unwrap();
         write_json(
             pending.join("request.toml"),
-            &json!({"method":"GET","url":"https://mpp.test/data","wallet":"alice","headers":{}}),
+            &json!({"method":"GET","url":url,"wallet":"alice","headers":{}}),
         )
         .unwrap();
         fs::write(pending.join("request.http"), "GET https://mpp.test/data\n").unwrap();
@@ -1898,7 +2262,6 @@ inline = '{"prompt":"hi"}'
         let receipt: serde_json::Value =
             read_json(dir.path().join("requests/sent/req_1/receipt.json")).unwrap();
         assert_eq!(receipt["session_id"], "sess_1");
-        assert_eq!(receipt["mock_backend"], false);
         let audit: serde_json::Value =
             read_json(dir.path().join("requests/sent/req_1/audit.json")).unwrap();
         assert_eq!(audit["paid_retry_succeeded"], true);
@@ -1971,7 +2334,7 @@ inline = '{"prompt":"hi"}'
             "mpp_tempo_test_double_failing"
         }
 
-        async fn confirm(
+        async fn prepare(
             &self,
             challenge: &NormalizedChallenge,
             _request: &ParsedRequest,
@@ -1989,10 +2352,8 @@ inline = '{"prompt":"hi"}'
                     "raw_authorization_stored": false,
                     "raw_signed_payload_stored": false
                 }),
-                receipt_raw: json!({"backend": self.name()}),
-                response_status: 500,
-                response_headers: HeaderMap::new(),
-                response_body: b"merchant error\n".to_vec(),
+                header_name: "Authorization",
+                header_value: "Payment test".into(),
             })
         }
     }
@@ -2002,10 +2363,11 @@ inline = '{"prompt":"hi"}'
         let dir = tempfile::tempdir().unwrap();
         let pending = dir.path().join("requests/pending/req_fail");
         fs::create_dir_all(&pending).unwrap();
+        let (url, _hits) = mock_server(500, &[], b"merchant error\n").await;
         let challenge = normalize_challenge(
             &HeaderMap::new(),
             br#"{"protocol":"tempo-mpp","type":"Session","network":"tempo","asset":"pathUSD","session":{"id":"sess_fail","voucherAmount":"0.10","voucherAmountUsd":0.10,"depositAmount":"1.00","depositAmountUsd":1.00}}"#,
-            &Url::parse("https://mpp.test/data").unwrap(),
+            &Url::parse(&url).unwrap(),
         );
         write_json(pending.join("challenge.json"), &challenge).unwrap();
         write_json(
@@ -2017,7 +2379,7 @@ inline = '{"prompt":"hi"}'
         write_json(pending.join("policy_check.json"), &empty_checks).unwrap();
         write_json(
             pending.join("request.toml"),
-            &json!({"method":"GET","url":"https://mpp.test/data","wallet":"alice","headers":{}}),
+            &json!({"method":"GET","url":url,"wallet":"alice","headers":{}}),
         )
         .unwrap();
         fs::write(pending.join("request.http"), "GET https://mpp.test/data\n").unwrap();
@@ -2060,7 +2422,6 @@ inline = '{"prompt":"hi"}'
 
         let receipt: serde_json::Value = read_json(failed.join("receipt.json")).unwrap();
         assert_eq!(receipt["session_id"], "sess_fail");
-        assert_eq!(receipt["mock_backend"], false);
         let audit: serde_json::Value = read_json(failed.join("audit.json")).unwrap();
         assert_eq!(audit["paid_retry_succeeded"], false);
         assert_eq!(audit["response_status"], 500);
@@ -2106,7 +2467,7 @@ inline = '{"prompt":"hi"}'
         let request = parse_request("GET https://merchant.test/pay wallet=alice").unwrap();
 
         let msg = match backend
-            .confirm(
+            .prepare(
                 &challenge,
                 &request,
                 "alice",
@@ -2153,7 +2514,7 @@ inline = '{"prompt":"hi"}'
         let request = parse_request("GET https://merchant.test/pay wallet=passkey_alice").unwrap();
 
         let msg = match backend
-            .confirm(
+            .prepare(
                 &challenge,
                 &request,
                 "passkey_alice",

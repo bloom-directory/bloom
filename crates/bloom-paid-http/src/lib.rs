@@ -437,6 +437,24 @@ pub fn parse_payment_amount_usd(asset: Option<&str>, amount: Option<&str>) -> Op
     parse_money(raw)
 }
 
+pub fn selected_requirement_amount_usd(
+    challenge: &NormalizedChallenge,
+    requirement: &PaymentRequirement,
+) -> Option<f64> {
+    parse_payment_amount_usd(requirement.asset.as_deref(), requirement.amount.as_deref())
+        .or(challenge.amount_usd)
+}
+
+pub fn usd_to_atomic_units(asset: Option<&str>, usd: f64) -> Option<u128> {
+    if !usd.is_finite() || usd < 0.0 {
+        return None;
+    }
+    if asset.is_some_and(is_known_six_decimal_usd_asset) {
+        return Some((usd * 1_000_000.0).floor() as u128);
+    }
+    Some(usd.floor() as u128)
+}
+
 fn is_known_six_decimal_usd_asset(asset: &str) -> bool {
     matches!(
         asset.to_ascii_lowercase().as_str(),
@@ -446,6 +464,37 @@ fn is_known_six_decimal_usd_asset(asset: &str) -> bool {
             | "0x20c000000000000000000000b9537d11c60e8b50"
             // USD0 on Tempo.
             | "0x779ded0c9e1022225f8e0630b35a9b54be713736"
+    )
+}
+
+pub fn normalize_paid_http_network(network: &str) -> String {
+    let raw = network.trim().to_ascii_lowercase();
+    match raw.as_str() {
+        "base" | "8453" | "eip155:8453" => "eip155:8453".into(),
+        "tempo" | "42431" | "eip155:42431" => "eip155:42431".into(),
+        other if other.starts_with("eip155:") => other.into(),
+        other if other.chars().all(|c| c.is_ascii_digit()) => format!("eip155:{other}"),
+        other => other.into(),
+    }
+}
+
+pub fn networks_equivalent(a: &str, b: &str) -> bool {
+    normalize_paid_http_network(a) == normalize_paid_http_network(b)
+}
+
+pub fn is_sensitive_paid_http_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "x-payment"
+            | "payment-signature"
+            | "payment-receipt"
+            | "set-cookie"
+            | "cookie"
+            | "x-api-key"
+            | "api-key"
+            | "apikey"
     )
 }
 
@@ -543,10 +592,12 @@ pub fn evaluate_payment_policy(policy: &Policy, input: PolicyEvalInput<'_>) -> V
         }
     }
     if let Some(network) = network {
-        if contains_ci(&payments.networks.deny, network) {
+        if contains_network(&payments.networks.deny, network) {
             out.push(deny("payments.networks.deny", format!("{network} denied")));
         }
-        if !payments.networks.allow.is_empty() && !contains_ci(&payments.networks.allow, network) {
+        if !payments.networks.allow.is_empty()
+            && !contains_network(&payments.networks.allow, network)
+        {
             out.push(deny(
                 "payments.networks.allow",
                 format!("{network} not allowed"),
@@ -701,6 +752,11 @@ fn deny(rule: &str, detail: impl Into<String>) -> PolicyCheck {
 fn contains_ci(set: &std::collections::BTreeSet<String>, needle: &str) -> bool {
     set.iter().any(|v| v.eq_ignore_ascii_case(needle))
 }
+fn contains_network(set: &std::collections::BTreeSet<String>, needle: &str) -> bool {
+    let normalized = normalize_paid_http_network(needle);
+    set.iter()
+        .any(|v| v.eq_ignore_ascii_case(needle) || normalize_paid_http_network(v) == normalized)
+}
 fn min_cap<const N: usize>(values: [Option<f64>; N]) -> Option<f64> {
     values.into_iter().flatten().reduce(f64::min)
 }
@@ -743,7 +799,7 @@ pub fn select_payment_requirement(
                 asset: req.asset.as_deref(),
                 network: req.network.as_deref(),
                 intent: &challenge.intent,
-                amount_usd: challenge.amount_usd,
+                amount_usd: selected_requirement_amount_usd(challenge, req),
                 request_max_amount_usd: None,
                 spent_24h_usd: 0.0,
             },
@@ -818,6 +874,10 @@ pub fn headers_to_string_map(headers: &HeaderMap) -> BTreeMap<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        PaymentRequirement, networks_equivalent, selected_requirement_amount_usd,
+        usd_to_atomic_units,
+    };
     use super::{normalize_challenge, parse_payment_amount_usd};
     use reqwest::header::{HeaderMap, HeaderValue};
     use url::Url;
@@ -857,5 +917,35 @@ mod tests {
         assert_eq!(challenge.protocol, "x402");
         assert_eq!(challenge.amount.as_deref(), Some("10000"));
         assert_eq!(challenge.amount_usd, Some(0.01));
+    }
+
+    #[test]
+    fn selected_requirement_cost_wins_over_low_merchant_usd() {
+        let mut challenge = normalize_challenge(
+            &reqwest::header::HeaderMap::new(),
+            br#"{"x402Version":1,"amountUsd":0.01,"accepts":[{"network":"base","asset":"0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913","maxAmountRequired":"5000000"}]}"#,
+            &url::Url::parse("https://merchant.test/pay").unwrap(),
+        );
+        challenge.amount_usd = Some(0.01);
+        let req = PaymentRequirement {
+            scheme: None,
+            network: Some("base".into()),
+            asset: Some("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".into()),
+            amount: Some("5000000".into()),
+            pay_to: None,
+            resource: None,
+            raw: serde_json::json!({}),
+        };
+        assert_eq!(selected_requirement_amount_usd(&challenge, &req), Some(5.0));
+    }
+
+    #[test]
+    fn shared_network_and_atomic_amount_helpers_cover_x402_and_mpp() {
+        assert!(networks_equivalent("base", "eip155:8453"));
+        assert!(networks_equivalent("tempo", "eip155:42431"));
+        assert_eq!(
+            usd_to_atomic_units(Some("0x20C000000000000000000000b9537d11c60E8b50"), 5.0),
+            Some(5_000_000)
+        );
     }
 }

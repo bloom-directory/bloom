@@ -552,8 +552,11 @@ enum RequestCmd {
         /// staged request.
         #[arg(long)]
         wallet: Option<String>,
-        /// Passphrase for a local/imported paying wallet (passkey wallets prompt).
+        /// Alias for `--wallet`, kept for parity with `bloom vfs write`.
         #[arg(long)]
+        unlock_wallet: Option<String>,
+        /// Passphrase for a local/imported paying wallet (passkey wallets prompt).
+        #[arg(long, env = "BLOOM_PASSPHRASE")]
         passphrase: Option<String>,
     },
     /// Print response body for an id or `latest`.
@@ -1376,6 +1379,15 @@ async fn run(cli: Cli) -> Result<()> {
                         &intent.intent_hash(),
                     )?;
                 }
+                if let Some(id) = request_confirm_id(d.home.root(), &p) {
+                    let confirm_value = String::from_utf8_lossy(&body).trim().to_ascii_lowercase();
+                    bloom_vfs::handlers::requests::persist_request_confirm_approved(
+                        d.home.root(),
+                        &id,
+                        &wallet,
+                        &confirm_value,
+                    )?;
+                }
                 d.vfs.write(&p, &body).await.context("vfs write")?;
 
                 // If this is a polymarket `begin` write, the handler spawned a background
@@ -1474,21 +1486,21 @@ async fn run(cli: Cli) -> Result<()> {
             id,
             text,
             wallet,
+            unlock_wallet,
             passphrase,
         }) => {
             let path = format!("/requests/{id}/confirm");
             let p = VfsPath::parse(&path)?;
             let body = text.into_bytes();
-            // Confirming a paid request signs payment credentials, so it must go
-            // through the wallet-signer ceremony — resolve the paying wallet
-            // (from --wallet or the staged request) and route via write_unlocked.
             let client = IpcClient::new(&client_endpoint.socket);
+            let wallet = unlock_wallet.or(wallet);
             let wallet = match wallet {
                 Some(w) => Some(w),
                 None => read_request_wallet(&client, &client_endpoint, &home, &id).await?,
             };
-            let wallet = wallet
-                .context("could not determine paying wallet for this request; pass --wallet")?;
+            let wallet = wallet.context(
+                "could not determine paying wallet for this request; pass --wallet or --unlock-wallet",
+            )?;
             let ipc_res = try_ipc(
                 &client,
                 &client_endpoint,
@@ -1506,7 +1518,6 @@ async fn run(cli: Cli) -> Result<()> {
                 debug!(endpoint = %client_endpoint.display, "cli.request.confirm.via_ipc");
                 return Ok(());
             }
-            // No daemon: fall back to an in-process unlock + write.
             debug!("cli.request.confirm.via_inproc: no daemon socket present");
             let (_home_permit, d) = build_write_daemon(home)?;
             let info = d.keystore.info(&wallet)?;
@@ -1533,6 +1544,12 @@ async fn run(cli: Cli) -> Result<()> {
                         .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
                 }
             }
+            bloom_vfs::handlers::requests::persist_request_confirm_approved(
+                d.home.root(),
+                &id,
+                &wallet,
+                &String::from_utf8_lossy(&body).trim().to_ascii_lowercase(),
+            )?;
             d.vfs.write(&p, &body).await.context("request confirm")?;
             Ok(())
         }
@@ -2962,6 +2979,30 @@ fn is_policy_session_new(wallet: &str, path: &VfsPath) -> bool {
     )
 }
 
+fn request_confirm_id(home: &std::path::Path, path: &VfsPath) -> Option<String> {
+    match path.segments() {
+        [root, reference, action] if root == "requests" && action == "confirm" => {
+            if reference == "latest" {
+                latest_pending_request_id(home)
+            } else {
+                Some(reference.to_string())
+            }
+        }
+        [root, state, id, action]
+            if root == "requests" && state == "pending" && action == "confirm" =>
+        {
+            Some(id.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn latest_pending_request_id(home: &std::path::Path) -> Option<String> {
+    let latest = std::fs::read_to_string(home.join("requests").join("latest")).ok()?;
+    let (state, id) = latest.trim().split_once('/')?;
+    (state == "pending").then(|| id.to_string())
+}
+
 fn is_outbox_confirm_write(wallet: &str, path: &VfsPath) -> bool {
     matches!(
         path.segments(),
@@ -3038,10 +3079,17 @@ fn request_body_with_wallet(mut request: String, wallet: Option<&str>) -> String
     let Some(wallet) = wallet else {
         return request;
     };
-    if request.trim_start().starts_with("url") || request.trim_start().starts_with("method") {
-        request.push('\n');
-        request.push_str(&format!("wallet = \"{wallet}\""));
-        return request;
+    if let Ok(mut value) = request.parse::<toml::Value>()
+        && value.get("url").is_some()
+        && let Some(table) = value.as_table_mut()
+    {
+        table.insert("wallet".into(), toml::Value::String(wallet.to_string()));
+        return toml::to_string_pretty(&value).unwrap_or_else(|_| {
+            let mut fallback = request.clone();
+            fallback.push('\n');
+            fallback.push_str(&format!("wallet = \"{wallet}\""));
+            fallback
+        });
     }
     let Some(first_newline) = request.find('\n') else {
         request.push(' ');
@@ -3798,6 +3846,30 @@ mod tests {
         assert_eq!(
             output,
             "GET https://api.example.com/data max_amount_usd=0.05 wallet=gavin"
+        );
+    }
+
+    #[test]
+    fn request_wallet_injection_preserves_valid_toml_shape() {
+        let output = request_body_with_wallet(
+            r#"# comment before keys
+max_amount_usd = "0.05"
+url = "https://api.example.com/data"
+method = "POST"
+
+[headers]
+content-type = "application/json"
+"#
+            .to_string(),
+            Some("gavin"),
+        );
+        let parsed: toml::Value = output.parse().unwrap();
+        assert_eq!(parsed["wallet"].as_str(), Some("gavin"));
+        assert_eq!(parsed["url"].as_str(), Some("https://api.example.com/data"));
+        assert_eq!(parsed["method"].as_str(), Some("POST"));
+        assert_eq!(
+            parsed["headers"]["content-type"].as_str(),
+            Some("application/json")
         );
     }
 }

@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use bloom_keystore::{Keystore, KeystoreError, WalletKind};
 use bloom_paid_http::{
     NormalizedChallenge, PaidHttpChainRpcResolver, ParsedRequest, PaymentRequirement,
+    networks_equivalent,
 };
 use serde_json::json;
 use x402_chain_eip155::{V1Eip155ExactClient, V2Eip155ExactClient};
@@ -67,7 +68,7 @@ impl X402PaymentSigner for KeystoreX402PaymentSigner {
         })?;
         if let Some(network) = ctx.requirement.network.as_deref() {
             let candidate_network = candidate.chain_id.to_string();
-            if candidate_network != network {
+            if !networks_equivalent(&candidate_network, network) {
                 return Err(format!(
                     "x402 selected network {candidate_network}, expected staged network {network}"
                 ));
