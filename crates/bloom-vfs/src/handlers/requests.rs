@@ -117,7 +117,7 @@ impl RequestsHandler {
                 return Ok((state.to_string(), raw));
             }
         }
-        Err(HandlerError::NotFound(raw.into()))
+        Err(HandlerError::NotFound(raw))
     }
 
     fn req_dir(&self, state: &str, id: &str) -> PathBuf {
@@ -917,9 +917,7 @@ async fn confirm_with_backend(
         requests_root.join("latest"),
         format!("{final_state}/{id}\n"),
     )?;
-    Ok(ConfirmResult {
-        final_state: final_state.into(),
-    })
+    Ok(ConfirmResult { final_state })
 }
 
 fn parsed_request_from_dir(dir: &Path) -> Result<ParsedRequest, HandlerError> {
