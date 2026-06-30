@@ -1,5 +1,6 @@
 //! x402 protocol adapter for Bloom paid HTTP requests.
 
+use alloy::primitives::U256;
 use async_trait::async_trait;
 use bloom_keystore::{Keystore, KeystoreError, WalletKind};
 use bloom_paid_http::{
@@ -63,33 +64,10 @@ impl X402PaymentSigner for KeystoreX402PaymentSigner {
             .info(ctx.wallet)
             .map_err(|e| format!("x402 signer wallet metadata unavailable: {e}"))?;
         let payment_required = parse_payment_required(ctx.challenge)?;
-        let candidate = select_candidate(&payment_required, signer).ok_or_else(|| {
-            "x402 upstream signer found no matching EIP-155 exact payment option".to_string()
-        })?;
-        if let Some(network) = ctx.requirement.network.as_deref() {
-            let candidate_network = candidate.chain_id.to_string();
-            if !networks_equivalent(&candidate_network, network) {
-                return Err(format!(
-                    "x402 selected network {candidate_network}, expected staged network {network}"
-                ));
-            }
-        }
-        if let Some(asset) = ctx.requirement.asset.as_deref()
-            && !candidate.asset.eq_ignore_ascii_case(asset)
-        {
-            return Err(format!(
-                "x402 selected asset {}, expected staged asset {asset}",
-                candidate.asset
-            ));
-        }
-        if let Some(pay_to) = ctx.requirement.pay_to.as_deref()
-            && !candidate.pay_to.eq_ignore_ascii_case(pay_to)
-        {
-            return Err(format!(
-                "x402 selected pay_to {}, expected staged pay_to {pay_to}",
-                candidate.pay_to
-            ));
-        }
+        let candidate =
+            select_candidate(&payment_required, signer, ctx.requirement)?.ok_or_else(|| {
+                "x402 upstream signer found no matching selected payment option".to_string()
+            })?;
         let header_value = candidate
             .sign()
             .await
@@ -148,10 +126,52 @@ fn parse_payment_required(
 fn select_candidate(
     payment_required: &proto::PaymentRequired,
     signer: std::sync::Arc<alloy::signers::local::PrivateKeySigner>,
-) -> Option<x402_types::scheme::client::PaymentCandidate> {
+    requirement: &PaymentRequirement,
+) -> Result<Option<x402_types::scheme::client::PaymentCandidate>, String> {
     let mut candidates = V2Eip155ExactClient::new(signer.clone()).accept(payment_required);
     candidates.extend(V1Eip155ExactClient::new(signer).accept(payment_required));
-    candidates.into_iter().next()
+    for candidate in candidates {
+        if candidate_matches_requirement(&candidate, requirement)? {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn candidate_matches_requirement(
+    candidate: &x402_types::scheme::client::PaymentCandidate,
+    requirement: &PaymentRequirement,
+) -> Result<bool, String> {
+    if let Some(scheme) = requirement.scheme.as_deref()
+        && !candidate.scheme.eq_ignore_ascii_case(scheme)
+    {
+        return Ok(false);
+    }
+    if let Some(network) = requirement.network.as_deref() {
+        let candidate_network = candidate.chain_id.to_string();
+        if !networks_equivalent(&candidate_network, network) {
+            return Ok(false);
+        }
+    }
+    if let Some(asset) = requirement.asset.as_deref()
+        && !candidate.asset.eq_ignore_ascii_case(asset)
+    {
+        return Ok(false);
+    }
+    if let Some(pay_to) = requirement.pay_to.as_deref()
+        && !candidate.pay_to.eq_ignore_ascii_case(pay_to)
+    {
+        return Ok(false);
+    }
+    if let Some(amount) = requirement.amount.as_deref() {
+        let expected = amount
+            .parse::<U256>()
+            .map_err(|e| format!("selected x402 requirement amount is not a valid integer: {e}"))?;
+        if candidate.amount != expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn eip155_chain_id_u64(chain_id: &x402_types::chain::ChainId) -> Option<u64> {
@@ -184,10 +204,35 @@ fn x402_keystore_signer_error(wallet: &str, keystore: &Keystore, err: KeystoreEr
 
 #[cfg(test)]
 mod tests {
-    use super::parse_payment_required;
+    use super::{candidate_matches_requirement, parse_payment_required};
+    use alloy::primitives::U256;
+    use async_trait::async_trait;
     use bloom_paid_http::normalize_challenge;
     use reqwest::header::{HeaderMap, HeaderValue};
     use url::Url;
+    use x402_types::chain::ChainId;
+    use x402_types::scheme::client::{PaymentCandidate, PaymentCandidateSigner, X402Error};
+
+    struct DummyPaymentSigner;
+
+    #[async_trait]
+    impl PaymentCandidateSigner for DummyPaymentSigner {
+        async fn sign_payment(&self) -> Result<String, X402Error> {
+            Ok("signed".into())
+        }
+    }
+
+    fn candidate(amount: u64) -> PaymentCandidate {
+        PaymentCandidate {
+            chain_id: "eip155:8453".parse::<ChainId>().unwrap(),
+            asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".into(),
+            amount: U256::from(amount),
+            scheme: "exact".into(),
+            x402_version: 1,
+            pay_to: "0x93053f1e7A5eFEDa532Fe69CbbE43cBEc3A0F13f".into(),
+            signer: Box::new(DummyPaymentSigner),
+        }
+    }
 
     #[test]
     fn parses_nansen_v2_payment_required_header() {
@@ -210,5 +255,21 @@ mod tests {
             }
             _ => panic!("expected v2 payment required"),
         }
+    }
+
+    #[test]
+    fn candidate_match_requires_selected_atomic_amount() {
+        let requirement = bloom_paid_http::PaymentRequirement {
+            scheme: Some("exact".into()),
+            network: Some("base".into()),
+            asset: Some("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913".into()),
+            amount: Some("10000".into()),
+            pay_to: Some("0x93053f1e7A5eFEDa532Fe69CbbE43cBEc3A0F13f".into()),
+            resource: None,
+            raw: serde_json::json!({}),
+        };
+
+        assert!(candidate_matches_requirement(&candidate(10_000), &requirement).unwrap());
+        assert!(!candidate_matches_requirement(&candidate(5_000_000), &requirement).unwrap());
     }
 }

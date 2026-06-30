@@ -1544,9 +1544,11 @@ async fn run(cli: Cli) -> Result<()> {
                         .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
                 }
             }
+            let approval_id = request_confirm_id(d.home.root(), &p)
+                .context("request confirm path does not target a pending paid request")?;
             bloom_vfs::handlers::requests::persist_request_confirm_approved(
                 d.home.root(),
-                &id,
+                &approval_id,
                 &wallet,
                 &String::from_utf8_lossy(&body).trim().to_ascii_lowercase(),
             )?;

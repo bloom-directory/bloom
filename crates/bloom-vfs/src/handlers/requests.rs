@@ -329,49 +329,51 @@ impl RequestsHandler {
             .as_secs()
             .saturating_sub(24 * 60 * 60);
         let mut total = 0.0;
-        let sent_root = self.requests_root().join("sent");
-        if !sent_root.exists() {
-            return Ok(total);
-        }
-        for entry in fs::read_dir(sent_root)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+        for state in ["sent", "failed"] {
+            let root = self.requests_root().join(state);
+            if !root.exists() {
                 continue;
             }
-            let dir = entry.path();
-            let modified = entry
-                .metadata()?
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            if modified < since {
-                continue;
+            for entry in fs::read_dir(root)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let dir = entry.path();
+                let modified = entry
+                    .metadata()?
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if modified < since {
+                    continue;
+                }
+                let Ok(receipt) = read_json::<serde_json::Value>(dir.join("receipt.json")) else {
+                    continue;
+                };
+                if receipt.get("wallet").and_then(|v| v.as_str()) != Some(wallet) {
+                    continue;
+                }
+                let protocol = receipt
+                    .get("protocol")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("free");
+                if protocol == "free" {
+                    continue;
+                }
+                total += receipt
+                    .get("amount_usd")
+                    .and_then(json_number)
+                    .or_else(|| {
+                        parse_payment_amount_usd(
+                            receipt.get("currency").and_then(|v| v.as_str()),
+                            receipt.get("amount").and_then(|v| v.as_str()),
+                        )
+                    })
+                    .unwrap_or(0.0);
             }
-            let Ok(receipt) = read_json::<serde_json::Value>(dir.join("receipt.json")) else {
-                continue;
-            };
-            if receipt.get("wallet").and_then(|v| v.as_str()) != Some(wallet) {
-                continue;
-            }
-            let protocol = receipt
-                .get("protocol")
-                .and_then(|v| v.as_str())
-                .unwrap_or("free");
-            if protocol == "free" {
-                continue;
-            }
-            total += receipt
-                .get("amount_usd")
-                .and_then(json_number)
-                .or_else(|| {
-                    parse_payment_amount_usd(
-                        receipt.get("currency").and_then(|v| v.as_str()),
-                        receipt.get("amount").and_then(|v| v.as_str()),
-                    )
-                })
-                .unwrap_or(0.0);
         }
         Ok(total)
     }
@@ -426,6 +428,7 @@ impl RequestsHandler {
         consume_request_confirm_approved(&pending, &wallet, &value)?;
         let host = request.url.host_str().unwrap_or("unknown").to_string();
         let mut challenge: NormalizedChallenge = read_json(pending.join("challenge.json"))?;
+        validate_session_state_target(&challenge, id)?;
         let policy = self.wallet_policy(&wallet)?;
         let sentinel = policy.override_sentinel().to_ascii_lowercase();
         if !matches!(value.as_str(), "y" | "yes" | "confirm") && value != sentinel.as_str() {
@@ -597,7 +600,8 @@ pub fn persist_request_confirm_approved(
     wallet: &str,
     confirm_value: &str,
 ) -> Result<(), HandlerError> {
-    let dir = root.join("requests").join("pending").join(id);
+    let id = safe_fs_component(id, "request id")?;
+    let dir = root.join("requests").join("pending").join(&id);
     fs::write(
         dir.join(CONFIRM_APPROVAL_FILE),
         serde_json::to_vec_pretty(&json!({
@@ -850,6 +854,7 @@ async fn confirm_with_backend(
         )));
     }
     let challenge: NormalizedChallenge = read_json(pending.join("challenge.json"))?;
+    validate_session_state_target(&challenge, id)?;
     let request_value: serde_json::Value = read_json(pending.join("request.toml"))?;
     if request_value
         .get("dry_run")
@@ -1037,6 +1042,21 @@ control files are limitation stubs pending a real mpp-rs Tempo provider.\n",
         .append(true)
         .open(dir.join("vouchers.jsonl"))?;
     file.write_all(&line)?;
+    Ok(())
+}
+
+fn validate_session_state_target(
+    challenge: &NormalizedChallenge,
+    request_id: &str,
+) -> Result<(), HandlerError> {
+    if challenge.intent == "session" {
+        let session_id = challenge
+            .session_id
+            .as_deref()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("session_{request_id}"));
+        session_dir_name(&session_id)?;
+    }
     Ok(())
 }
 
@@ -1495,6 +1515,19 @@ mod tests {
     }
 
     #[test]
+    fn request_confirm_approval_rejects_unsafe_request_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pending = tmp.path().join("requests").join("pending").join("req_1");
+        std::fs::create_dir_all(&pending).unwrap();
+
+        let err =
+            persist_request_confirm_approved(tmp.path(), "../pending/req_1", "alice", "confirm")
+                .unwrap_err();
+        assert!(err.to_string().contains("invalid request id"), "{err}");
+        assert!(!pending.join(CONFIRM_APPROVAL_FILE).exists());
+    }
+
+    #[test]
     fn spent_usd_history_converts_mpp_base_units_like_x402() {
         let f = fixture(Some("alice"));
         let sent = f.handler.requests_root().join("sent/req_mpp_paid");
@@ -1516,6 +1549,33 @@ mod tests {
 
         let spent = f.handler.sum_paid_usd_last_24h("alice").unwrap();
         assert!((spent - 0.01).abs() < f64::EPSILON, "{spent}");
+    }
+
+    #[test]
+    fn spent_usd_history_counts_paid_failed_retries() {
+        let f = fixture(Some("alice"));
+        let failed = f.handler.requests_root().join("failed/req_paid_failed");
+        fs::create_dir_all(&failed).unwrap();
+        write_json(
+            failed.join("receipt.json"),
+            &json!({
+                "request_id": "req_paid_failed",
+                "wallet": "alice",
+                "merchant": "api.example.test",
+                "amount_usd": 0.25,
+                "currency": "USDC",
+                "network": "base",
+                "protocol": "x402",
+                "intent": "charge",
+                "response_status": 500,
+                "credential_redacted": true,
+                "raw": {"status": "success"}
+            }),
+        )
+        .unwrap();
+
+        let spent = f.handler.sum_paid_usd_last_24h("alice").unwrap();
+        assert!((spent - 0.25).abs() < f64::EPSILON, "{spent}");
     }
 
     async fn mock_server(
@@ -2303,6 +2363,41 @@ inline = '{"prompt":"hi"}'
         .await
         .unwrap_err();
         assert!(err.to_string().contains("hard payment policy denial"));
+    }
+
+    #[tokio::test]
+    async fn mpp_confirm_rejects_unsafe_session_id_before_minting() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = dir.path().join("requests/pending/req_escape");
+        fs::create_dir_all(&pending).unwrap();
+        let challenge = normalize_challenge(
+            &HeaderMap::new(),
+            br#"{"protocol":"tempo-mpp","type":"Session","network":"tempo","asset":"pathUSD","session":{"id":"../escape","voucherAmount":"0.10","voucherAmountUsd":0.10,"depositAmount":"1.00","depositAmountUsd":1.00}}"#,
+            &Url::parse("https://mpp.test/data").unwrap(),
+        );
+        write_json(pending.join("challenge.json"), &challenge).unwrap();
+        let empty_checks: Vec<PolicyCheck> = vec![];
+        write_json(pending.join("policy_check.json"), &empty_checks).unwrap();
+        write_json(
+            pending.join("request.toml"),
+            &json!({"method":"GET","url":"https://mpp.test/data","wallet":"alice","headers":{}}),
+        )
+        .unwrap();
+        fs::write(pending.join("status"), "pending\n").unwrap();
+
+        let err = confirm_with_backend(
+            dir.path(),
+            "req_escape",
+            b"confirm",
+            &StaticMppTestBackend,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid paid request session id"));
+        assert!(!pending.join("private/credential_minted.json").exists());
     }
 
     #[test]
