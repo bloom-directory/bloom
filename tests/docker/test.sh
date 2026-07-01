@@ -27,6 +27,9 @@ source "$SCRIPT_DIR/lib.sh"
 HOME_DIR=/tmp/bloom-home
 
 prepare_home_dir "$HOME_DIR"
+mkdir -p "$HOME_DIR/requests/pending/req-symlink"
+printf '%s\n' 'pending/req-symlink' > "$HOME_DIR/requests/latest"
+printf '%s\n' 'mount latest plan' > "$HOME_DIR/requests/pending/req-symlink/plan.md"
 build_mount_demo
 # No wallet, no chain config — this test is mount-surface only.
 start_mount_demo "$MNT" "$HOME_DIR" "$PIDFILE" "$LOGFILE"
@@ -57,6 +60,28 @@ echo "::endgroup::"
 echo "::group::cat $MNT/tools/keccak/abc"
 if ! cat "$MNT/tools/keccak/abc"; then
     echo "FAIL: tools/keccak/abc unreadable" >&2
+    fail_count=1
+fi
+echo "::endgroup::"
+
+# Regression for VFS symlinks over NFS. `/requests/latest` is exposed
+# by the VFS as a dynamic symlink (latest -> pending/<id>). The CLI path
+# worked because RequestsHandler special-cases `latest` during `read`,
+# but the kernel mount follows the advertised symlink and therefore
+# requires the NFS adapter to implement READLINK.
+echo "::group::read $MNT/requests/latest"
+if ! latest_target=$(readlink "$MNT/requests/latest"); then
+    echo "FAIL: requests/latest readlink failed" >&2
+    fail_count=1
+elif [ "$latest_target" != "pending/req-symlink" ]; then
+    echo "FAIL: requests/latest target [$latest_target]" >&2
+    fail_count=1
+fi
+if ! latest_plan=$(cat "$MNT/requests/latest/plan.md"); then
+    echo "FAIL: requests/latest/plan.md unreadable" >&2
+    fail_count=1
+elif [ "$latest_plan" != "mount latest plan" ]; then
+    echo "FAIL: requests/latest/plan.md content [$latest_plan]" >&2
     fail_count=1
 fi
 echo "::endgroup::"

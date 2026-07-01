@@ -25,7 +25,7 @@ use bytes::Bytes;
 use embednfs::{
     AccessMask, Attrs, CommitSupport, CreateKind, CreateRequest, CreateResult, DirEntry, DirPage,
     FileSystem, FsError, FsResult, FsStats, ObjectType, ReadResult, RequestContext, SetAttrs,
-    Timestamp, WriteResult, WriteStability,
+    Symlinks, Timestamp, WriteResult, WriteStability,
 };
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
@@ -243,6 +243,14 @@ fn entry_to_attrs(path: &VfsPath, e: &Entry, size: u64) -> Attrs {
         EntryKind::File => ObjectType::File,
         EntryKind::Symlink => ObjectType::Symlink,
     };
+    let size = if e.kind == EntryKind::Symlink && size == 0 {
+        e.link_target
+            .as_ref()
+            .map(|target| target.len() as u64)
+            .unwrap_or(0)
+    } else {
+        size
+    };
     let mut a = Attrs::new(ot, fileid_for(path));
     a.size = size;
     a.space_used = size;
@@ -251,7 +259,7 @@ fn entry_to_attrs(path: &VfsPath, e: &Entry, size: u64) -> Attrs {
     a.mtime = ts;
     a.atime = ts;
     a.ctime = ts;
-    if e.kind == EntryKind::File {
+    if matches!(e.kind, EntryKind::File | EntryKind::Symlink) {
         a.change = file_change_now();
     }
     a
@@ -1190,6 +1198,36 @@ impl FileSystem for BloomFs {
         // flushes the per-handle write buffer.
         Some(self)
     }
+
+    fn symlinks(&self) -> Option<&dyn Symlinks<BloomHandle>> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl Symlinks<BloomHandle> for BloomFs {
+    async fn create_symlink(
+        &self,
+        _ctx: &RequestContext,
+        _parent: &BloomHandle,
+        _name: &str,
+        _target: &str,
+        _attrs: &SetAttrs,
+    ) -> FsResult<CreateResult<BloomHandle>> {
+        Err(FsError::Unsupported)
+    }
+
+    async fn readlink(&self, _ctx: &RequestContext, handle: &BloomHandle) -> FsResult<String> {
+        let path = match handle {
+            BloomHandle::Root => return Err(FsError::InvalidInput),
+            BloomHandle::Path { path, .. } => path,
+        };
+        let entry = self.vfs.lookup(path).await.map_err(map_err)?;
+        match entry.kind {
+            EntryKind::Symlink => entry.link_target.ok_or(FsError::InvalidInput),
+            _ => Err(FsError::InvalidInput),
+        }
+    }
 }
 
 #[async_trait]
@@ -1232,6 +1270,7 @@ mod tests {
             }
             match p.first() {
                 Some("hello") => Ok(Entry::file("hello")),
+                Some("latest") => Ok(Entry::symlink("latest", "pending/req-1")),
                 _ => Err(HandlerError::NotFound(p.to_string_path())),
             }
         }
@@ -1240,7 +1279,10 @@ mod tests {
         }
         async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
             if p.is_root() {
-                Ok(vec![Entry::file("hello")])
+                Ok(vec![
+                    Entry::file("hello"),
+                    Entry::symlink("latest", "pending/req-1"),
+                ])
             } else {
                 Err(HandlerError::NotADir(p.to_string_path()))
             }
@@ -1389,6 +1431,24 @@ mod tests {
         let r = fs.read(&ctx, &hello, 0, 1024).await.unwrap();
         assert_eq!(&r.data[..], b"world\n");
         assert!(r.eof);
+    }
+
+    #[tokio::test]
+    async fn readlink_returns_vfs_symlink_target() {
+        let vfs = Vfs::builder()
+            .mount("echo", Arc::new(StaticHandler))
+            .build();
+        let fs = BloomFs::new(vfs);
+        let ctx = fake_ctx();
+        let echo = fs.lookup(&ctx, &BloomHandle::Root, "echo").await.unwrap();
+        let latest = fs.lookup(&ctx, &echo, "latest").await.unwrap();
+        let attrs = fs.getattr(&ctx, &latest).await.unwrap();
+        assert_eq!(attrs.object_type, ObjectType::Symlink);
+        assert_eq!(attrs.size, "pending/req-1".len() as u64);
+
+        let symlinks = fs.symlinks().expect("BloomFs must advertise READLINK");
+        let target = symlinks.readlink(&ctx, &latest).await.unwrap();
+        assert_eq!(target, "pending/req-1");
     }
 
     #[tokio::test]
