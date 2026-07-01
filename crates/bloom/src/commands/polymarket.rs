@@ -60,6 +60,14 @@ fn polymarket_clob_client(pm_cfg: &bloom_proto::config::PolymarketConfig) -> Clo
     clob
 }
 
+fn polymarket_data_client(pm_cfg: &bloom_proto::config::PolymarketConfig) -> DataClient {
+    let mut data = DataClient::new();
+    if let Ok(url) = url::Url::parse(&pm_cfg.data_url) {
+        data = data.with_base_url(url);
+    }
+    data
+}
+
 fn polymarket_geoblock_client(pm_cfg: &bloom_proto::config::PolymarketConfig) -> GeoblockClient {
     let Ok(base) = url::Url::parse(&pm_cfg.gamma_url) else {
         return GeoblockClient::new();
@@ -2473,7 +2481,7 @@ pub async fn redeem(
         .parse()
         .context("corrupt deposit_wallet in onboarding state")?;
     let funder_s = bloom_proto::checksum_address(&deposit_wallet);
-    let gamma = GammaClient::new();
+    let gamma = polymarket_gamma_client(pm_cfg);
     let market = gamma
         .market_by_slug(slug)
         .await
@@ -2497,7 +2505,7 @@ pub async fn redeem(
         .context("market has no YES token id")?;
     let no = market.no_token_id().context("market has no NO token id")?;
 
-    let data = DataClient::new();
+    let data = polymarket_data_client(pm_cfg);
     let positions = data
         .positions(&funder_s)
         .await
