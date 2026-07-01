@@ -12,12 +12,14 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
 use assert_cmd::Command;
+use async_trait::async_trait;
+use bloom_vfs::{Entry, Handler, HandlerError, VfsPath};
 use predicates::prelude::*;
 use tempfile::TempDir;
 
@@ -43,6 +45,99 @@ fn write_passphrase_file(home: &Path, passphrase: &str) -> String {
     let path = home.join(".passphrase");
     std::fs::write(&path, passphrase).expect("write passphrase file");
     path.to_string_lossy().into_owned()
+}
+
+#[derive(Default)]
+struct RecordingWriteHandler {
+    writes: Mutex<Vec<(String, Vec<u8>)>>,
+}
+
+impl RecordingWriteHandler {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn writes(&self) -> Vec<(String, Vec<u8>)> {
+        self.writes.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl Handler for RecordingWriteHandler {
+    async fn lookup(&self, p: &VfsPath) -> Result<Entry, HandlerError> {
+        if p.is_root() {
+            return Ok(Entry::dir(""));
+        }
+        Ok(Entry::writable_file(
+            p.segments().last().map(String::as_str).unwrap_or("write"),
+        ))
+    }
+
+    async fn list(&self, p: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
+        if p.is_root() {
+            Ok(vec![])
+        } else {
+            Err(HandlerError::NotADir(p.to_string_path()))
+        }
+    }
+
+    async fn write(&self, p: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
+        self.writes
+            .lock()
+            .unwrap()
+            .push((p.to_string_path(), data.to_vec()));
+        Ok(())
+    }
+}
+
+fn spawn_ipc_server(
+    home: &Path,
+    vfs: bloom_vfs::Vfs,
+) -> (bloom_daemon::ipc::IpcServer, std::thread::JoinHandle<()>) {
+    use bloom_daemon::ipc::{IpcServer, default_socket_path};
+
+    let socket = default_socket_path(home);
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+    let server = IpcServer::new(vfs, "ipc-test-version", vec!["ipc-chain".into()]);
+    let server_for_thread = server.clone();
+    let socket_for_thread = socket.clone();
+    let server_thread = std::thread::spawn(move || {
+        rt.block_on(async move {
+            server_for_thread
+                .serve(&socket_for_thread)
+                .await
+                .expect("ipc serve");
+        });
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        if std::time::Instant::now() >= deadline {
+            panic!("ipc server never created socket at {}", socket.display());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    (server, server_thread)
+}
+
+fn stop_ipc_server(
+    server: bloom_daemon::ipc::IpcServer,
+    server_thread: std::thread::JoinHandle<()>,
+) {
+    server.trigger_shutdown();
+    let join_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !server_thread.is_finished() {
+        if std::time::Instant::now() >= join_deadline {
+            panic!("ipc server thread did not exit after shutdown");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    server_thread.join().expect("ipc server thread panicked");
 }
 
 fn http_fixture(
@@ -368,6 +463,84 @@ fn chain_ls_validators_does_not_take_home_write_lock() {
         .args(["chain", "ls-validators"])
         .assert()
         .failure()
+        .stderr(predicate::str::contains("already open for writing").not());
+}
+
+#[test]
+fn request_new_routes_via_ipc_when_home_write_lock_is_live() {
+    use bloom_vfs::Vfs;
+
+    let home = fresh_home();
+    let _permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(home.path()))
+        .expect("hold home write permit");
+    let requests = RecordingWriteHandler::new();
+    let vfs = Vfs::builder().mount("requests", requests.clone()).build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+
+    bloom_cmd(home.path())
+        .args([
+            "request",
+            "new",
+            "--dry-run",
+            "--wallet",
+            "alice",
+            "GET https://example.com",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("already open for writing").not())
+        .stdout(predicate::str::contains("dry_run: true"));
+
+    stop_ipc_server(server, server_thread);
+    let writes = requests.writes();
+    assert_eq!(writes.len(), 1, "writes={writes:?}");
+    assert_eq!(writes[0].0, "/new.dry-run");
+    assert_eq!(
+        String::from_utf8_lossy(&writes[0].1),
+        "GET https://example.com wallet=alice"
+    );
+}
+
+#[test]
+fn wallet_stage_routes_via_ipc_when_home_write_lock_is_live() {
+    use bloom_vfs::Vfs;
+
+    let home = fresh_home();
+    let _permit = bloom_proto::HomeWritePermit::acquire(&bloom_proto::HomeDir::at(home.path()))
+        .expect("hold home write permit");
+    let wallets = RecordingWriteHandler::new();
+    let vfs = Vfs::builder().mount("wallets", wallets.clone()).build();
+    let (server, server_thread) = spawn_ipc_server(home.path(), vfs);
+    let intent = "send 0.001 eth to 0x0000000000000000000000000000000000000000 on anvil";
+
+    bloom_cmd(home.path())
+        .args(["wallet", "stage", "alice", "anvil", "--intent", intent])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("already open for writing").not());
+
+    stop_ipc_server(server, server_thread);
+    let writes = wallets.writes();
+    assert_eq!(writes.len(), 1, "writes={writes:?}");
+    assert_eq!(writes[0].0, "/alice/chains/anvil/outbox/new.tx");
+    assert_eq!(String::from_utf8_lossy(&writes[0].1), intent);
+}
+
+#[test]
+fn wallet_stage_without_daemon_uses_in_process_parser() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args([
+            "wallet",
+            "stage",
+            "alice",
+            "anvil",
+            "--intent",
+            "not an intent",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("parse intent"))
         .stderr(predicate::str::contains("already open for writing").not());
 }
 

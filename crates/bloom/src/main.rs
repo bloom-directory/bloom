@@ -1450,17 +1450,32 @@ async fn run(cli: Cli) -> Result<()> {
             wallet,
             dry_run,
         }) => {
-            let (_home_permit, d) = build_write_daemon(home)?;
             let body = request_body_with_wallet(request, wallet.as_deref());
+            let path = if dry_run {
+                "/requests/new.dry-run"
+            } else {
+                "/requests/new"
+            };
+            let client = IpcClient::new(&client_endpoint.socket);
+            let ipc_res = try_ipc(
+                &client,
+                &client_endpoint,
+                "write",
+                serde_json::json!({ "path": path, "bytes_b64": B64.encode(body.as_bytes()) }),
+            )
+            .await
+            .with_context(|| format!("ipc request new via {}", client_endpoint.display))?;
+            if ipc_res.is_some() {
+                debug!(endpoint = %client_endpoint.display, "cli.request.new.via_ipc");
+                if dry_run {
+                    println!("dry_run: true (unpaid probe/staging only; no spend/signing)");
+                }
+                return Ok(());
+            }
+            debug!("cli.request.new.via_inproc: no daemon socket present");
+            let (_home_permit, d) = build_write_daemon(home)?;
             d.vfs
-                .write(
-                    &VfsPath::parse(if dry_run {
-                        "/requests/new.dry-run"
-                    } else {
-                        "/requests/new"
-                    })?,
-                    body.as_bytes(),
-                )
+                .write(&VfsPath::parse(path)?, body.as_bytes())
                 .await
                 .context("request new")?;
             let latest = d
@@ -1913,7 +1928,6 @@ async fn run(cli: Cli) -> Result<()> {
             chain,
             intent,
         }) => {
-            let (home_permit, d) = build_write_daemon(home)?;
             let body = match intent {
                 Some(s) => s,
                 None => {
@@ -1922,6 +1936,22 @@ async fn run(cli: Cli) -> Result<()> {
                     buf
                 }
             };
+            let path = format!("/wallets/{wallet}/chains/{chain}/outbox/new.tx");
+            let client = IpcClient::new(&client_endpoint.socket);
+            let ipc_res = try_ipc(
+                &client,
+                &client_endpoint,
+                "write",
+                serde_json::json!({ "path": path, "bytes_b64": B64.encode(body.as_bytes()) }),
+            )
+            .await
+            .with_context(|| format!("ipc wallet stage via {}", client_endpoint.display))?;
+            if ipc_res.is_some() {
+                debug!(endpoint = %client_endpoint.display, "cli.wallet.stage.via_ipc");
+                return Ok(());
+            }
+            debug!("cli.wallet.stage.via_inproc: no daemon socket present");
+            let (home_permit, d) = build_write_daemon(home)?;
             let parsed = bloom_tx::intent_parser::parse(&body).context("parse intent")?;
             let info = d.keystore.info(&wallet)?;
             let client = d
@@ -1950,6 +1980,28 @@ async fn run(cli: Cli) -> Result<()> {
             passphrase,
             text,
         }) => {
+            let path = format!("/wallets/{wallet}/chains/{chain}/outbox/pending/{id}/confirm");
+            let body = text.into_bytes();
+            let client = IpcClient::new(&client_endpoint.socket);
+            let ipc_res = try_ipc(
+                &client,
+                &client_endpoint,
+                "write_unlocked",
+                serde_json::json!({
+                    "path": path,
+                    "bytes_b64": B64.encode(&body),
+                    "wallet": &wallet,
+                    "passphrase": passphrase.as_deref(),
+                }),
+            )
+            .await
+            .with_context(|| format!("ipc wallet confirm via {}", client_endpoint.display))?;
+            if ipc_res.is_some() {
+                debug!(endpoint = %client_endpoint.display, "cli.wallet.confirm.via_ipc");
+                return Ok(());
+            }
+            debug!("cli.wallet.confirm.via_inproc: no daemon socket present");
+            let text = String::from_utf8(body).expect("wallet confirm text originated as UTF-8");
             let (home_permit, d) = build_write_daemon(home)?;
             let info = d.keystore.info(&wallet)?;
             let mut reviewed_intent_hash: Option<String> = None;
