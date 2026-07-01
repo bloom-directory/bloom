@@ -17,9 +17,9 @@ use bloom_polymarket::order::{self, OrderType};
 use bloom_polymarket::order_store::{OrderDraft, render_plan_md};
 use bloom_polymarket::trade;
 use bloom_polymarket::{
-    ChainReader, ClobClient, CredentialStore, DataClient, GammaClient, GeoblockClient,
-    KeystoreSigner, OnboardEvent, OnboardState, Onboarder, OrderStore, PolymarketError, Side,
-    Stage, validate_wallet_name,
+    BuilderCredentialStore, ChainReader, ClobClient, CredentialStore, DataClient, GammaClient,
+    GeoblockClient, KeystoreSigner, OnboardEvent, OnboardState, Onboarder, OrderStore,
+    PolymarketError, Side, Stage, validate_wallet_name,
 };
 use bloom_proto::audit::{AuditLog, AuditRecord};
 use bloom_proto::polymarket_policy::{self as pm_policy, PolicySide, PolymarketOrderCtx};
@@ -193,6 +193,16 @@ Equivalent CLI:
 bloom polymarket cancel <wallet> <order-id>
 
 Discover resting order ids with: bloom vfs cat /polymarket/account/<wallet>/orders.json
+"#;
+
+const BUILDER_KEYS_REVOKE_HINT: &[u8] = br#"write "confirm" here to revoke the account builder API key, or JSON/TOML with an explicit key id:
+{"confirm":true,"key":"<builder-key-id>"}
+
+This mutates relayer submission auth only. Builder keys cannot move funds, and
+no builder secret/passphrase is exposed through the VFS.
+
+Equivalent CLI:
+bloom polymarket builder-keys revoke <wallet> [key]
 "#;
 
 fn now_ms_u128() -> u128 {
@@ -475,6 +485,8 @@ pub struct PolymarketHandler {
     orders: Option<Arc<OrderStore>>,
     /// Durable pUSD funding request reviews (`fund/`).
     fund_root: Option<PathBuf>,
+    /// Stored builder-key metadata/secret file manager. VFS only exposes key ids.
+    builder_store: Option<BuilderCredentialStore>,
     audit: Option<Arc<AuditLog>>,
     /// Wallets with an onboarding run in flight (single-flight guard).
     running: Arc<StdMutex<HashSet<String>>>,
@@ -490,6 +502,7 @@ impl PolymarketHandler {
             onboarding: None,
             orders: None,
             fund_root: None,
+            builder_store: None,
             audit: None,
             running: Arc::default(),
         }
@@ -516,9 +529,27 @@ impl PolymarketHandler {
         self
     }
 
+    /// Enable `builder-keys/` redacted list/revoke parity with the CLI.
+    pub fn with_builder_key_store(mut self, store: BuilderCredentialStore) -> Self {
+        self.builder_store = Some(store);
+        self
+    }
+
     fn orders_or_not_found(&self, path: &VfsPath) -> Result<&OrderStore, HandlerError> {
         self.orders
             .as_deref()
+            .ok_or_else(|| HandlerError::not_found(path.to_string_path()))
+    }
+
+    fn builder_keys_or_not_found(
+        &self,
+        path: &VfsPath,
+    ) -> Result<&BuilderCredentialStore, HandlerError> {
+        if self.onboarding.is_none() {
+            return Err(HandlerError::not_found(path.to_string_path()));
+        }
+        self.builder_store
+            .as_ref()
             .ok_or_else(|| HandlerError::not_found(path.to_string_path()))
     }
 
@@ -607,9 +638,9 @@ impl PolymarketHandler {
     /// - Geoblock is warning-only (the operation proceeds even if blocked).
     ///
     /// If any criterion is false, the operation MUST go through the foreground
-    /// confirm path (`bloom vfs write --unlock-wallet`). The regression test
-    /// `only_cancel_is_handler_executable_all_other_writes_refuse` guards this
-    /// boundary so adding a new handler-executable path is a conscious decision.
+    /// confirm path (`bloom vfs write --unlock-wallet`). Builder-key revoke is
+    /// another direct CLOB-auth operation: it mutates relayer submission auth
+    /// but cannot move funds and requires no owner signing.
     async fn execute_cancel(&self, wallet: &str, order_id: &str) -> Result<(), HandlerError> {
         validate_wallet_name(wallet).map_err(err_be)?;
         // order-id path-traversal guard (real format validation is the CLOB's job).
@@ -666,6 +697,129 @@ impl PolymarketHandler {
             .map_err(err_be)?;
         Ok(())
     }
+
+    async fn read_builder_keys(
+        &self,
+        path: &VfsPath,
+        wallet: &str,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let store = self.builder_keys_or_not_found(path)?;
+        let info = self
+            .keystore
+            .info(wallet)
+            .map_err(|e| HandlerError::not_found(format!("wallet '{wallet}': {e}")))?;
+        let ob = self.onboarding_or_not_found(path)?;
+        let creds =
+            ob.creds.load(wallet).map_err(err_be)?.ok_or_else(|| {
+                HandlerError::invalid("wallet not onboarded (no CLOB credentials)")
+            })?;
+        let stored = store.load(wallet).map_err(err_be)?.map(|b| b.key);
+        let keys = self
+            .clob
+            .list_builder_api_keys(&creds, info.address)
+            .await
+            .map_err(err_be)?;
+        let rows: Vec<_> = keys
+            .into_iter()
+            .map(|k| {
+                serde_json::json!({
+                    "key": k.key,
+                    "created_at": k.created_at,
+                    "revoked_at": k.revoked_at,
+                    "stored_by_bloom": stored.as_deref() == Some(k.key.as_str()),
+                })
+            })
+            .collect();
+        pretty(&serde_json::json!({
+            "wallet": wallet,
+            "keys": rows,
+            "secrets_exposed": false,
+        }))
+    }
+
+    async fn execute_builder_key_revoke(
+        &self,
+        wallet: &str,
+        data: &[u8],
+    ) -> Result<(), HandlerError> {
+        validate_wallet_name(wallet).map_err(err_be)?;
+        let key = parse_builder_key_revoke_body(data)?;
+        if self.builder_store.is_none() {
+            return Err(HandlerError::not_found("builder-keys"));
+        }
+        let info = self
+            .keystore
+            .info(wallet)
+            .map_err(|e| HandlerError::not_found(format!("wallet '{wallet}': {e}")))?;
+        let ob = self.onboarding.as_ref().ok_or_else(|| {
+            HandlerError::invalid(
+                "polymarket onboarding is not wired: the daemon needs a [chains] entry \
+                 whose chain_id matches [polymarket].chain_id (Polygon = 137)",
+            )
+        })?;
+        let creds =
+            ob.creds.load(wallet).map_err(err_be)?.ok_or_else(|| {
+                HandlerError::invalid("wallet not onboarded (no CLOB credentials)")
+            })?;
+        self.clob
+            .revoke_builder_api_key(&creds, info.address, key.as_deref())
+            .await
+            .map_err(err_be)?;
+
+        if let Some(store) = self.builder_store.as_ref()
+            && let Some(stored) = store.load(wallet).map_err(err_be)?
+            && (key.is_none() || key.as_deref() == Some(stored.key.as_str()))
+        {
+            store.delete(wallet).map_err(err_be)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BuilderKeyRevokeBody {
+    #[serde(default)]
+    confirm: Option<bool>,
+    #[serde(default)]
+    key: Option<String>,
+}
+
+fn parse_builder_key_revoke_body(data: &[u8]) -> Result<Option<String>, HandlerError> {
+    let body = std::str::from_utf8(data)
+        .map_err(|_| HandlerError::invalid("builder-key revoke body must be utf-8"))?;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Err(HandlerError::invalid(
+            "builder-key revoke requires body 'confirm', 'y', or JSON/TOML with confirm=true",
+        ));
+    }
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "confirm" | "y" | "yes"
+    ) {
+        return Ok(None);
+    }
+    let parsed: BuilderKeyRevokeBody = match serde_json::from_str(trimmed) {
+        Ok(parsed) => parsed,
+        Err(json_err) => toml::from_str(trimmed).map_err(|toml_err| {
+            HandlerError::invalid(format!(
+                "confirm body must be 'confirm', 'y', JSON, or TOML: JSON: {json_err}; TOML: {toml_err}"
+            ))
+        })?,
+    };
+    if parsed.confirm != Some(true) {
+        return Err(HandlerError::invalid(
+            "builder-key revoke body must set confirm=true",
+        ));
+    }
+    if let Some(key) = parsed.key.as_deref()
+        && (key.is_empty() || key.contains('/') || key.contains('\\') || key == "." || key == "..")
+    {
+        return Err(HandlerError::invalid(format!(
+            "invalid Polymarket builder key id '{key}'"
+        )));
+    }
+    Ok(parsed.key)
 }
 
 fn err_be(e: PolymarketError) -> HandlerError {
@@ -965,6 +1119,15 @@ impl PolymarketHandler {
                 3 if ACCOUNT_FILES.contains(&segs[2].as_str()) => Ok(Entry::file(&segs[2])),
                 _ => Err(HandlerError::not_found(path.to_string_path())),
             },
+            "builder-keys" if self.builder_store.is_some() && self.onboarding_wired() => {
+                match segs.len() {
+                    1 => Ok(Entry::dir("builder-keys")),
+                    2 => Ok(Entry::dir(&segs[1])),
+                    3 if segs[2] == "keys.json" => Ok(Entry::file("keys.json")),
+                    3 if segs[2] == "revoke" => Ok(Entry::writable_file("revoke")),
+                    _ => Err(HandlerError::not_found(path.to_string_path())),
+                }
+            }
             "fund" if self.fund_wired() => match segs.len() {
                 1 => Ok(Entry::dir("fund")),
                 2 => Ok(Entry::dir(&segs[1])),
@@ -1079,6 +1242,12 @@ impl PolymarketHandler {
             }
             (Some("onboard"), 3) => self.read_onboard(path, &segs[1], &segs[2]).await,
             (Some("account"), 3) => self.read_account(path, &segs[1], &segs[2]).await,
+            (Some("builder-keys"), 3) if segs[2] == "keys.json" => {
+                self.read_builder_keys(path, &segs[1]).await
+            }
+            (Some("builder-keys"), 3) if segs[2] == "revoke" => {
+                Ok(BUILDER_KEYS_REVOKE_HINT.to_vec())
+            }
             (Some("fund"), 3) if segs[2] == "new" => Ok(FUND_NEW_HINT.to_vec()),
             (Some("fund"), 4) if segs[3] == "confirm" => Ok(FUND_CONFIRM_HINT.to_vec()),
             (Some("fund"), 4) => self.read_fund(path, &segs[1], &segs[2], &segs[3]),
@@ -1738,6 +1907,9 @@ impl PolymarketHandler {
             }
             return self.execute_cancel(&segs[1], &segs[3]).await;
         }
+        if segs.len() == 3 && segs[0] == "builder-keys" && segs[2] == "revoke" {
+            return self.execute_builder_key_revoke(&segs[1], _data).await;
+        }
         if segs.len() == 4 && segs[0] == "redeem" && segs[3] == "confirm" {
             return Err(HandlerError::Unsupported(
                 "redeem confirmation must run through the foreground CLI VFS path so the \
@@ -1852,6 +2024,9 @@ impl PolymarketHandler {
                 if self.onboarding_wired() {
                     entries.push(Entry::dir("onboard"));
                 }
+                if self.builder_store.is_some() && self.onboarding_wired() {
+                    entries.push(Entry::dir("builder-keys"));
+                }
                 if self.fund_wired() {
                     entries.push(Entry::dir("fund"));
                 }
@@ -1903,6 +2078,14 @@ impl PolymarketHandler {
                 self.onboarding_or_not_found(path)?;
                 Ok(ACCOUNT_FILES.iter().map(|f| Entry::file(f)).collect())
             }
+            (Some("builder-keys"), 1) => {
+                self.builder_keys_or_not_found(path)?;
+                self.list_keystore_wallets()
+            }
+            (Some("builder-keys"), 2) => Ok(vec![
+                Entry::file("keys.json"),
+                Entry::writable_file("revoke"),
+            ]),
             (Some("fund"), 1) => {
                 self.fund_root_or_not_found(path)?;
                 self.list_keystore_wallets()
@@ -2333,12 +2516,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_cancel_is_handler_executable_all_other_writes_refuse() {
-        // Regression guard: the ONLY write path that executes directly in the
-        // handler (bypassing the foreground ceremony) is
-        // trade/<w>/orders/<id>/cancel. Every other writable action path must
-        // refuse with foreground guidance. If a new handler-executable path is
-        // added, update this test explicitly so the boundary stays intentional.
+    async fn clob_auth_actions_execute_but_owner_signed_writes_refuse() {
+        // Regression guard: direct handler execution is limited to operations
+        // that use stored CLOB/L2 auth and do not require owner signing. Owner-
+        // signed value-moving paths must still refuse with foreground guidance.
         let store_dir = tempfile::tempdir().unwrap();
         let h = handler_with(None, None).with_order_store(OrderStore::new(store_dir.path()));
 
@@ -2378,6 +2559,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("foreground CLI VFS path"));
+    }
+
+    #[test]
+    fn builder_key_revoke_body_accepts_ack_or_explicit_key() {
+        assert_eq!(parse_builder_key_revoke_body(b"confirm").unwrap(), None);
+        assert_eq!(
+            parse_builder_key_revoke_body(br#"{"confirm":true,"key":"builder-key-1"}"#).unwrap(),
+            Some("builder-key-1".to_string())
+        );
+        assert_eq!(
+            parse_builder_key_revoke_body(
+                br#"
+confirm = true
+key = "builder-key-2"
+"#
+            )
+            .unwrap(),
+            Some("builder-key-2".to_string())
+        );
+    }
+
+    #[test]
+    fn builder_key_revoke_body_rejects_unconfirmed_or_unsafe_key() {
+        let err = parse_builder_key_revoke_body(br#"{"confirm":false}"#).unwrap_err();
+        assert!(err.to_string().contains("confirm=true"));
+
+        let err = parse_builder_key_revoke_body(br#"{"confirm":true,"key":"../x"}"#).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid Polymarket builder key id")
+        );
     }
 
     struct ArmedChain;

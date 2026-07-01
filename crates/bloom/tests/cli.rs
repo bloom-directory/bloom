@@ -208,6 +208,18 @@ fn vfs_write_help_lists_unlock_flags() {
 }
 
 #[test]
+fn wallet_help_lists_outbox_cancel_and_replace() {
+    let home = fresh_home();
+    bloom_cmd(home.path())
+        .args(["wallet", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cancel"))
+        .stdout(predicate::str::contains("replace"))
+        .stdout(predicate::str::contains("confirm"));
+}
+
+#[test]
 fn polymarket_help_lists_obligations() {
     let home = fresh_home();
     bloom_cmd(home.path())

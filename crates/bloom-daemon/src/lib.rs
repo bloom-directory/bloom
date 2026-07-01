@@ -659,7 +659,10 @@ impl Daemon {
 
             let mut handler = PolymarketHandler::new(gamma, data, clob.clone(), keystore.clone())
                 .with_order_store(bloom_polymarket::OrderStore::new(home.polymarket_dir()))
-                .with_fund_store(home.polymarket_dir());
+                .with_fund_store(home.polymarket_dir())
+                .with_builder_key_store(bloom_polymarket::BuilderCredentialStore::new(
+                    home.polymarket_dir(),
+                ));
             // Resolve the settlement chain by id — onboarding needs RPC reads
             // (code/balances/allowances) for its idempotency probes.
             let polygon = chains
@@ -683,11 +686,18 @@ impl Daemon {
                         .with_onboarding(PolymarketOnboarding {
                             onboarder: Arc::new(onboarder),
                             geoblock: Arc::new({
-                                let geo_base = url::Url::parse(&pm_cfg.gamma_url).ok()
-                                    .filter(|u| matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "::1")))
+                                let geo_base = url::Url::parse(&pm_cfg.gamma_url)
+                                    .ok()
+                                    .filter(|u| {
+                                        matches!(
+                                            u.host_str(),
+                                            Some("127.0.0.1" | "localhost" | "::1")
+                                        )
+                                    })
                                     .and_then(|u| u.join("/api/geoblock").ok());
                                 match geo_base {
-                                    Some(url) => GeoblockClient::new().with_base_url_for_tests(url.to_string()),
+                                    Some(url) => GeoblockClient::new()
+                                        .with_base_url_for_tests(url.to_string()),
                                     None => GeoblockClient::new(),
                                 }
                             }),

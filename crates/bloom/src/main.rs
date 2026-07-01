@@ -821,6 +821,28 @@ enum WalletCmd {
         #[arg(long, default_value = "y")]
         text: String,
     },
+    /// Unlock then submit a same-nonce self-send replacement to cancel a staged tx.
+    Cancel {
+        wallet: String,
+        chain: String,
+        id: String,
+        #[arg(long, env = "BLOOM_PASSPHRASE")]
+        passphrase: Option<String>,
+        /// Confirmation text. Must be non-empty.
+        #[arg(long, default_value = "y")]
+        text: String,
+    },
+    /// Unlock then submit a same-nonce replacement tx from a new intent body.
+    Replace {
+        wallet: String,
+        chain: String,
+        id: String,
+        /// Replacement intent body (JSON, TOML, or shell-style). If omitted, read stdin.
+        #[arg(long)]
+        intent: Option<String>,
+        #[arg(long, env = "BLOOM_PASSPHRASE")]
+        passphrase: Option<String>,
+    },
     /// Unlock once, review a batch of staged txs, then broadcast them in order.
     ///
     /// Each TX is `chain:id`, for example `base:0001-abc`.
@@ -2176,6 +2198,56 @@ async fn run(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
+        Cmd::Wallet(WalletCmd::Cancel {
+            wallet,
+            chain,
+            id,
+            passphrase,
+            text,
+        }) => {
+            wallet_outbox_action_vfs_write(
+                home,
+                &client_endpoint,
+                wallet.clone(),
+                chain,
+                id.clone(),
+                "cancel",
+                text.into_bytes(),
+                passphrase,
+            )
+            .await?;
+            println!("cancel submitted for {id}");
+            Ok(())
+        }
+        Cmd::Wallet(WalletCmd::Replace {
+            wallet,
+            chain,
+            id,
+            intent,
+            passphrase,
+        }) => {
+            let body = match intent {
+                Some(s) => s,
+                None => {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+                    buf
+                }
+            };
+            wallet_outbox_action_vfs_write(
+                home,
+                &client_endpoint,
+                wallet,
+                chain,
+                id.clone(),
+                "replace",
+                body.into_bytes(),
+                passphrase,
+            )
+            .await?;
+            println!("replacement submitted for {id}");
+            Ok(())
+        }
         Cmd::Wallet(WalletCmd::ConfirmBatch {
             wallet,
             txs,
@@ -3133,6 +3205,76 @@ fn is_outbox_confirm_write(wallet: &str, path: &VfsPath) -> bool {
                 && pending == "pending"
                 && confirm == "confirm"
     )
+}
+
+async fn wallet_outbox_action_vfs_write(
+    home: HomeDir,
+    client_endpoint: &ResolvedEndpoint,
+    wallet: String,
+    chain: String,
+    id: String,
+    action: &str,
+    body: Vec<u8>,
+    passphrase: Option<String>,
+) -> Result<()> {
+    if !matches!(action, "cancel" | "replace") {
+        bail!("unsupported wallet outbox action '{action}'");
+    }
+    let path = format!("/wallets/{wallet}/chains/{chain}/outbox/pending/{id}/{action}");
+    let client = IpcClient::new(&client_endpoint.socket);
+    let ipc_res = try_ipc(
+        &client,
+        client_endpoint,
+        "write_unlocked",
+        serde_json::json!({
+            "path": path,
+            "bytes_b64": B64.encode(&body),
+            "wallet": &wallet,
+            "passphrase": passphrase.as_deref(),
+        }),
+    )
+    .await
+    .with_context(|| format!("ipc wallet outbox {action} via {}", client_endpoint.display))?;
+    if ipc_res.is_some() {
+        debug!(endpoint = %client_endpoint.display, action, "cli.wallet.outbox_action.via_ipc");
+        return Ok(());
+    }
+
+    debug!(
+        action,
+        "cli.wallet.outbox_action.via_inproc: no daemon socket present"
+    );
+    let p = VfsPath::parse(&path)?;
+    let (_home_permit, d) = build_write_daemon(home)?;
+    let info = d.keystore.info(&wallet)?;
+    match info.kind {
+        bloom_keystore::WalletKind::PasskeyGated => {
+            let intent = vfs_write_unlock_intent(
+                &wallet,
+                &p,
+                &body,
+                Some(bloom_proto::checksum_address(&info.address)),
+                Some(&d.home.outbox_dir()),
+                d.keystore
+                    .raw_policy(&wallet)
+                    .ok()
+                    .map(|(p, _)| p)
+                    .as_deref(),
+            );
+            d.keystore
+                .unlock_passkey_with_intent(&wallet, Some(intent))
+                .await?;
+        }
+        _ => {
+            d.keystore
+                .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
+        }
+    }
+    d.vfs
+        .write(&p, &body)
+        .await
+        .with_context(|| format!("wallet outbox {action}"))?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
