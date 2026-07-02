@@ -98,34 +98,6 @@ fn home_write_permit(d: &Daemon) -> Result<&HomeWritePermit> {
     })
 }
 
-fn persist_outbox_review_approved(
-    d: &Daemon,
-    wallet: &str,
-    chain_name: &str,
-    id: &str,
-    review_hash: &str,
-) -> Result<()> {
-    let entry = d
-        .tx_engine
-        .outbox
-        .read(wallet, chain_name, id)
-        .with_context(|| format!("read outbox entry {id} before writing review approval"))?;
-    let approved = serde_json::json!({
-        "schema": "bloom.review_approved.v1",
-        "intent_hash": review_hash,
-        "approved_ms": now_ms(),
-    });
-    d.tx_engine
-        .outbox
-        .write_artefact(
-            &entry.dir,
-            "review_approved.json",
-            &serde_json::to_vec_pretty(&approved)?,
-        )
-        .with_context(|| format!("write review approval marker for staged tx {id}"))?;
-    Ok(())
-}
-
 /// Arguments shared by `order` (buy) and `sell`.
 pub struct PlaceArgs {
     pub wallet: String,
@@ -1962,9 +1934,6 @@ pub async fn fund(d: &Daemon, args: FundArgs) -> Result<()> {
         }
     }
     unlock_wallet_with_intent(d, &args.wallet, args.passphrase.as_deref(), Some(intent)).await?;
-    for id in &staged_ids {
-        persist_outbox_review_approved(d, &args.wallet, &chain_name, id, &reviewed_intent_hash)?;
-    }
     let signer = d.keystore.signer(&args.wallet)?;
     let confirm_text = if any_warn {
         info.policy.override_sentinel().to_string()
@@ -2173,13 +2142,6 @@ async fn transfer_pusd_to_funding(
             .write_artefact(&entry.dir, "review_intent.json", &bytes);
     }
     unlock_wallet_with_intent(d, &args.wallet, args.passphrase.as_deref(), Some(intent)).await?;
-    persist_outbox_review_approved(
-        d,
-        &args.wallet,
-        chain_name,
-        &staged.id,
-        &reviewed_intent_hash,
-    )?;
     let signer = d.keystore.signer(&args.wallet)?;
     let confirm_text = if any_warn {
         info.policy.override_sentinel().to_string()

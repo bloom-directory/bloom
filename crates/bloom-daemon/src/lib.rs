@@ -13,6 +13,7 @@ mod price_oracle;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bloom_auth::{AuthStore, StoreApprovalVerifier};
 use bloom_chain::{ChainClient, ChainRegistry};
 use bloom_chain_node::rpc::{RpcChainAdapter, RpcClient};
 use bloom_chain_types::ssz::Encode;
@@ -22,7 +23,7 @@ use bloom_defi::EnsoClient;
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
 use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork};
-use bloom_keystore::Keystore;
+use bloom_keystore::{Keystore, KeystoreApprovalSignatureVerifier};
 use bloom_paid_http::PaidHttpChainRpcResolver;
 use bloom_petals::{NameRegistry, PetalRunner, PetalStore, PetalVm, PetalsHandler};
 use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient, GeoblockClient};
@@ -43,7 +44,7 @@ use bloom_vfs::handlers::{
     ToolsHandler, WalletsHandler, WatchHandler,
 };
 use bloom_vfs::tx_handler::PtbSubmitter;
-use bloom_vfs::{HandlerError, PathCache, Vfs};
+use bloom_vfs::{AuthServices, HandlerError, PathCache, Vfs};
 use bloom_watch::{WatchExecutor, WatchRegistry};
 use thiserror::Error;
 use tokio::sync::watch;
@@ -82,6 +83,7 @@ pub struct Daemon {
     pub home_write_permit: Option<Arc<HomeWritePermit>>,
     pub address_book: Arc<AddressBook>,
     pub audit: Arc<AuditLog>,
+    pub auth_services: AuthServices,
     pub vfs: Vfs,
     pub petals: PetalRunner,
     pub watch_registry: Arc<WatchRegistry>,
@@ -277,6 +279,18 @@ impl Daemon {
         let audit =
             AuditLog::open(home.audit_path()).map_err(|e| DaemonError::Audit(e.to_string()))?;
         let audit_arc = Arc::new(audit.clone());
+        let auth_store = AuthStore::open(home.root().join("auth").join("auth.sqlite"))
+            .map_err(|e| DaemonError::Audit(format!("auth store: {e}")))?;
+        let auth_verifier = Arc::new(StoreApprovalVerifier::new(
+            auth_store,
+            KeystoreApprovalSignatureVerifier::new(keystore.clone()),
+        ));
+        tx_engine = tx_engine.with_auth_services(auth_verifier.clone(), auth_verifier.clone());
+        let auth_services = AuthServices::new(
+            Some(auth_verifier.clone()),
+            Some(auth_verifier.clone()),
+            Some(auth_verifier),
+        );
         let path_cache = Arc::new(PathCache::new());
 
         let watch_registry = Arc::new(
@@ -490,6 +504,7 @@ impl Daemon {
             debug!("daemon.hyperliquid_mounted");
             let handler = Arc::new(
                 HyperliquidHandler::new(mainnet, testnet, keystore.clone())
+                    .with_auth_services(auth_services.clone())
                     .with_store_root(home.root().join("hyperliquid")),
             );
             handler.clone().start_monitoring();
@@ -513,6 +528,7 @@ impl Daemon {
                         tx_engine.clone(),
                         address_book.clone(),
                     )
+                    .with_auth_services(auth_services.clone())
                     .with_home_write_permit_opt(home_write_permit.clone())
                     .with_mempool_indexes(mempool_indexes.clone())
                     .with_polymarket_root(home.polymarket_dir())
@@ -528,6 +544,7 @@ impl Daemon {
                         keystore.clone(),
                         config.default_wallet.clone(),
                     )
+                    .with_auth_services(auth_services.clone())
                     .with_paid_http_rpc_resolver(paid_http_rpc_resolver.clone()),
                 ) as _,
             )
@@ -618,6 +635,7 @@ impl Daemon {
                         tx_engine.clone(),
                         address_book_arc.clone(),
                     )
+                    .with_auth_services(auth_services.clone())
                     .with_home_write_permit_opt(home_write_permit.clone())
                     .with_default_chain(config.default_chain.clone())
                     .with_store_root(home.root().join("defi"))
@@ -658,6 +676,7 @@ impl Daemon {
             }
 
             let mut handler = PolymarketHandler::new(gamma, data, clob.clone(), keystore.clone())
+                .with_auth_services(auth_services.clone())
                 .with_order_store(bloom_polymarket::OrderStore::new(home.polymarket_dir()))
                 .with_fund_store(home.polymarket_dir())
                 .with_builder_key_store(bloom_polymarket::BuilderCredentialStore::new(
@@ -701,6 +720,7 @@ impl Daemon {
                                     None => GeoblockClient::new(),
                                 }
                             }),
+                            auth_dir: state_dir.clone(),
                             creds: CredentialStore::new(&state_dir),
                             chain,
                         })
@@ -1043,6 +1063,7 @@ impl Daemon {
             home_write_permit,
             address_book: address_book_arc,
             audit: audit_arc,
+            auth_services,
             vfs,
             petals,
             watch_registry,

@@ -2295,6 +2295,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloom-auth"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "bloom-auth-api",
+ "bloom-prices",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "bloom-auth-api"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "blake3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "bloom-chain"
 version = "0.1.0"
 dependencies = [
@@ -2412,6 +2439,8 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
+ "bloom-auth",
+ "bloom-auth-api",
  "bloom-chain",
  "bloom-chain-node",
  "bloom-chain-types",
@@ -2565,9 +2594,11 @@ dependencies = [
  "alloy 2.0.5",
  "anyhow",
  "argon2",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "blake3",
+ "bloom-auth-api",
  "bloom-chain-types",
  "bloom-proto",
  "chacha20poly1305",
@@ -2580,6 +2611,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -2922,6 +2954,7 @@ dependencies = [
  "alloy 2.0.5",
  "anyhow",
  "blake3",
+ "bloom-auth-api",
  "dirs 5.0.1",
  "fs2",
  "hex",
@@ -3067,7 +3100,9 @@ dependencies = [
  "alloy 2.0.5",
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "blake3",
+ "bloom-auth-api",
  "bloom-chain",
  "bloom-keystore",
  "bloom-mempool",
@@ -3076,6 +3111,7 @@ dependencies = [
  "bloom-tools",
  "hex",
  "parking_lot 0.12.5",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "tempfile",
@@ -3104,6 +3140,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "blake3",
+ "bloom-auth-api",
  "bloom-chain",
  "bloom-chain-types",
  "bloom-defi",

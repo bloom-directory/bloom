@@ -61,6 +61,14 @@ pub struct HyperliquidPolicy {
     /// Max single transfer, micro-USD (enforced once a transfer action lands).
     #[serde(default, with = "crate::serde_micro")]
     pub transfer_cap_usd: Option<u64>,
+    /// Permitted Hyperliquid `usdSend` destinations. Empty means no
+    /// destination is authorized for auto-sign/session use.
+    #[serde(default)]
+    pub allowed_usd_send_destinations: BTreeSet<String>,
+    /// Explicitly blocked Hyperliquid `usdSend` destinations. Deny wins over
+    /// allow.
+    #[serde(default)]
+    pub denied_usd_send_destinations: BTreeSet<String>,
     /// Max bounded-session duration in seconds (consumed by Phase 2 sessions).
     #[serde(default)]
     pub max_session_secs: Option<u64>,
@@ -89,6 +97,8 @@ impl HyperliquidPolicy {
             || self.max_leverage.is_some()
             || self.withdrawal_cap_usd.is_some()
             || self.transfer_cap_usd.is_some()
+            || !self.allowed_usd_send_destinations.is_empty()
+            || !self.denied_usd_send_destinations.is_empty()
             || self.max_session_secs.is_some()
             || !self.allow_reduce_only
             || !self.allow_trigger_orders
@@ -136,6 +146,8 @@ impl Default for HyperliquidPolicy {
             max_leverage: None,
             withdrawal_cap_usd: None,
             transfer_cap_usd: None,
+            allowed_usd_send_destinations: BTreeSet::new(),
+            denied_usd_send_destinations: BTreeSet::new(),
             max_session_secs: None,
             allow_reduce_only: true,
             allow_trigger_orders: true,
@@ -163,6 +175,8 @@ pub struct HyperliquidActionCtx {
     pub leverage: Option<u32>,
     /// Order notional (size × price), micro-USD, when computable.
     pub notional_microusd: Option<u64>,
+    /// Destination address for transfer-like actions such as `usdSend`.
+    pub destination: Option<String>,
     // ── caller-fetched live snapshot ──
     /// Current absolute position notional for `asset`, micro-USD.
     pub position_microusd: Option<u64>,
@@ -239,6 +253,59 @@ fn push_vault_check(
     }
 }
 
+fn push_usd_send_destination_check(
+    out: &mut Vec<PolicyCheck>,
+    policy: &HyperliquidPolicy,
+    ctx: &HyperliquidActionCtx,
+) {
+    let Some(destination) = ctx.destination.as_deref().map(normalize_destination) else {
+        out.push(check(
+            "usd_send_destination",
+            PolicyOutcome::Deny,
+            "usdSend destination is unknown; fail closed",
+        ));
+        return;
+    };
+    if contains_destination(&policy.denied_usd_send_destinations, &destination) {
+        out.push(check(
+            "usd_send_destination",
+            PolicyOutcome::Deny,
+            format!("{destination} is denied for usdSend"),
+        ));
+        return;
+    }
+    if policy.allowed_usd_send_destinations.is_empty() {
+        out.push(check(
+            "usd_send_destination",
+            PolicyOutcome::Deny,
+            "usdSend requires allowed_usd_send_destinations in [hyperliquid] policy",
+        ));
+        return;
+    }
+    if contains_destination(&policy.allowed_usd_send_destinations, &destination) {
+        out.push(check(
+            "usd_send_destination",
+            PolicyOutcome::Pass,
+            format!("{destination} is allowed for usdSend"),
+        ));
+    } else {
+        out.push(check(
+            "usd_send_destination",
+            PolicyOutcome::Deny,
+            format!("{destination} is not in allowed_usd_send_destinations"),
+        ));
+    }
+}
+
+fn contains_destination(list: &BTreeSet<String>, destination: &str) -> bool {
+    list.iter()
+        .any(|candidate| normalize_destination(candidate) == destination)
+}
+
+fn normalize_destination(destination: &str) -> String {
+    destination.trim().to_ascii_lowercase()
+}
+
 /// Evaluate one Hyperliquid action. Returns the full check list (passes
 /// included). Deny-level outcomes are not CLI-bypassable; `Warn` is.
 pub fn evaluate_hyperliquid_action(
@@ -259,31 +326,40 @@ pub fn evaluate_hyperliquid_action(
         }
         "usdSend" => {
             // Owner-signed internal USDC transfer. Requires transfer_cap_usd;
-            // no cap configured = deny (transfers are opt-in, not default-allow).
-            return match policy.transfer_cap_usd {
-                None => vec![check(
+            // no cap configured = deny. It also requires a destination allowlist
+            // match so in-policy cannot mean "send capped funds anywhere".
+            let mut checks = Vec::new();
+            checks.push(check(
+                "action",
+                PolicyOutcome::Pass,
+                "action 'usdSend' is recognized",
+            ));
+            match policy.transfer_cap_usd {
+                None => checks.push(check(
                     "action",
                     PolicyOutcome::Deny,
                     "usdSend requires transfer_cap_usd in the wallet [hyperliquid] policy",
-                )],
+                )),
                 Some(cap) => match ctx.notional_microusd {
-                    Some(amount) if amount > cap => vec![check(
+                    Some(amount) if amount > cap => checks.push(check(
                         "transfer_cap_usd",
                         PolicyOutcome::Deny,
                         format!("transfer {} exceeds cap {}", fmt_usd(amount), fmt_usd(cap)),
-                    )],
-                    Some(amount) => vec![check(
+                    )),
+                    Some(amount) => checks.push(check(
                         "transfer_cap_usd",
                         PolicyOutcome::Pass,
                         format!("transfer {} within cap {}", fmt_usd(amount), fmt_usd(cap)),
-                    )],
-                    None => vec![check(
+                    )),
+                    None => checks.push(check(
                         "transfer_cap_usd",
                         PolicyOutcome::Deny,
                         "transfer amount unknown; fail closed",
-                    )],
+                    )),
                 },
-            };
+            }
+            push_usd_send_destination_check(&mut checks, policy, ctx);
+            return checks;
         }
         "withdraw" | "withdraw3" | "spotSend" | "usdClassTransfer" | "agentSendAsset" => {
             // Not yet policy-enforced; deny until mapped.
@@ -565,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn usd_send_allowed_within_transfer_cap() {
+    fn usd_send_requires_transfer_cap_and_allowed_destination() {
         let p = HyperliquidPolicy {
             transfer_cap_usd: Some(200 * MICRO_USD),
             ..Default::default()
@@ -573,13 +649,61 @@ mod tests {
         let mut ctx = order_ctx("BTC");
         ctx.action_kind = "usdSend".into();
         ctx.notional_microusd = Some(100 * MICRO_USD);
+        ctx.destination = Some("0xabc".into());
+        assert!(denied(&evaluate_hyperliquid_action(&p, &ctx)));
+
+        let p = HyperliquidPolicy {
+            transfer_cap_usd: Some(200 * MICRO_USD),
+            allowed_usd_send_destinations: BTreeSet::from(["0xAbC".to_string()]),
+            ..Default::default()
+        };
         assert!(!denied(&evaluate_hyperliquid_action(&p, &ctx)));
 
         // Over the cap.
         let mut ctx2 = order_ctx("BTC");
         ctx2.action_kind = "usdSend".into();
         ctx2.notional_microusd = Some(300 * MICRO_USD);
+        ctx2.destination = Some("0xabc".into());
         assert!(denied(&evaluate_hyperliquid_action(&p, &ctx2)));
+
+        let p = HyperliquidPolicy {
+            transfer_cap_usd: Some(200 * MICRO_USD),
+            allowed_usd_send_destinations: BTreeSet::from(["0xabc".to_string()]),
+            denied_usd_send_destinations: BTreeSet::from(["0xABC".to_string()]),
+            ..Default::default()
+        };
+        assert!(denied(&evaluate_hyperliquid_action(&p, &ctx)));
+    }
+
+    #[test]
+    fn usd_send_destination_policy_parses_from_toml() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            hyperliquid: HyperliquidPolicy,
+        }
+
+        let parsed: Wrapper = toml::from_str(
+            r#"
+[hyperliquid]
+transfer_cap_usd = "25"
+allowed_usd_send_destinations = ["0xabc", "0xdef"]
+denied_usd_send_destinations = ["0xbad"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.hyperliquid.transfer_cap_usd, Some(25 * MICRO_USD));
+        assert!(
+            parsed
+                .hyperliquid
+                .allowed_usd_send_destinations
+                .contains("0xabc")
+        );
+        assert!(
+            parsed
+                .hyperliquid
+                .denied_usd_send_destinations
+                .contains("0xbad")
+        );
     }
 
     #[test]

@@ -49,6 +49,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
+use bloom_auth_api::{
+    ApprovalSignature, ApprovalSignatureVerifier, AuthApiError, UnsignedApproval,
+};
 use bloom_proto::{Policy, checksum_address};
 
 // ── errors ────────────────────────────────────────────────────────────────────
@@ -928,6 +931,36 @@ impl Keystore {
             policy: default_policy,
             recovery_key: None,
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct KeystoreApprovalSignatureVerifier {
+    keystore: Keystore,
+}
+
+impl KeystoreApprovalSignatureVerifier {
+    pub fn new(keystore: Keystore) -> Self {
+        Self { keystore }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApprovalSignatureVerifier for KeystoreApprovalSignatureVerifier {
+    async fn verify_signature(
+        &self,
+        unsigned: &UnsignedApproval,
+        signature: &ApprovalSignature,
+        _now_ms: u64,
+    ) -> Result<(), AuthApiError> {
+        match self
+            .keystore
+            .verify_approval_signature_with_passkey(unsigned, signature)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => Err(AuthApiError::Denied(e.to_string())),
+        }
     }
 }
 

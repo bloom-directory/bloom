@@ -9,6 +9,9 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use bloom_auth_api::{Approval, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader};
 use bloom_chain::ChainClient;
 use bloom_keystore::{Keystore, KeystoreError};
 use bloom_polymarket::eip712::{PUSD, PUSD_DECIMALS};
@@ -23,6 +26,7 @@ use bloom_polymarket::{
 };
 use bloom_proto::audit::{AuditLog, AuditRecord};
 use bloom_proto::polymarket_policy::{self as pm_policy, PolicySide, PolymarketOrderCtx};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::handler::{Entry, Handler, HandlerError};
@@ -51,6 +55,9 @@ const DRAFT_FILES: [&str; 5] = [
 ];
 
 const ROOT_FILES: [&str; 1] = ["README.md"];
+const APPROVAL_FILE: &str = "approval.json";
+const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
+const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
 
 const README: &[u8] = br#"# Polymarket Trading
 
@@ -107,8 +114,8 @@ redeem|revoke-approvals|withdraw-pusd`). Print the plan first with the CLI
 `--dry-run` flag. pUSD withdraw requires an explicit `amount` in the body (the
 path carries no amount slot); a bare `confirm` is rejected.
 
-Cancel is risk-reducing and uses stored CLOB credentials (no owner signing), so
-it executes directly in the VFS -- no foreground ceremony is needed:
+Cancel uses stored CLOB credentials (no owner signing), so it executes directly
+in the VFS only after compliance checks pass:
 ```json
  write: /polymarket/trade/<wallet>/orders/<order-id>/cancel          --data confirm
 ```
@@ -185,9 +192,9 @@ Print the plan first with: bloom polymarket withdraw-pusd <wallet> <amount|all> 
 "#;
 const CANCEL_HINT: &[u8] = br#"write "confirm" here to cancel this resting CLOB order.
 
-Cancellation is risk-reducing and executes directly in the VFS -- no wallet
+Cancellation executes directly in the VFS after compliance checks -- no wallet
 unlock is needed because it uses the wallet's stored CLOB credentials (L2 auth
-only). Geoblock is warning-only for cancel.
+only). Geoblock and jurisdiction checks are hard gates for cancel.
 
 Equivalent CLI:
 bloom polymarket cancel <wallet> <order-id>
@@ -212,11 +219,80 @@ fn now_ms_u128() -> u128 {
         .unwrap_or(0)
 }
 
+fn pm_now_ms_u64() -> u64 {
+    now_ms_u128().try_into().unwrap_or(u64::MAX)
+}
+
+fn polymarket_onboard_auth_dir(root: &Path, wallet: &str) -> Result<PathBuf, HandlerError> {
+    validate_wallet_name(wallet).map_err(err_be)?;
+    Ok(root.join(wallet))
+}
+
+fn polymarket_onboard_entry_id(wallet: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.polymarket.onboard.entry.v1");
+    hasher.update(wallet.as_bytes());
+    format!("pm-onboard-{}", hasher.finalize().to_hex())
+}
+
+fn polymarket_onboard_envelope(
+    wallet: &str,
+    owner_address: &str,
+) -> Result<CanonicalEnvelope, HandlerError> {
+    let subject = serde_json::to_vec(&serde_json::json!({
+        "schema": "bloom.polymarket_onboard_subject.v1",
+        "wallet": wallet,
+        "owner_address": owner_address,
+        "approvals": bloom_polymarket::wallet::V2_APPROVAL_LABELS,
+        "effects": [
+            "deploy_deposit_wallet_if_needed",
+            "approve_v2_spenders",
+            "mint_clob_credentials",
+            "create_builder_key_if_configured",
+            "sync_buying_power"
+        ],
+    }))
+    .map_err(|e| HandlerError::backend(format!("encode Polymarket onboarding intent: {e}")))?;
+    Ok(CanonicalEnvelope::new(
+        CanonicalIntentHeader {
+            schema: "bloom.intent_header.v1".into(),
+            wallet: wallet.to_string(),
+            surface: "polymarket".into(),
+            entry_id: polymarket_onboard_entry_id(wallet),
+            executor_id: "polymarket-onboard".into(),
+            network: "polygon".into(),
+            account: wallet.to_string(),
+            action_kind: "onboard".into(),
+            value_movement: false,
+            authority_change: true,
+        },
+        "polymarket_onboard",
+        "bloom.polymarket_onboard_subject.v1",
+        subject,
+    ))
+}
+
+fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<(), HandlerError> {
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(value)
+            .map_err(|e| HandlerError::backend(format!("encode auth json: {e}")))?,
+    )?;
+    Ok(())
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Result<T, HandlerError> {
+    let bytes = fs::read(path)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| HandlerError::backend(format!("read auth json: {e}")))
+}
+
 /// The onboarding/account dependencies, bundled so the read-only handler keeps
 /// its constructor and the daemon opts in via [`PolymarketHandler::with_onboarding`].
 pub struct PolymarketOnboarding {
     pub onboarder: Arc<Onboarder>,
     pub geoblock: Arc<GeoblockClient>,
+    pub auth_dir: PathBuf,
     /// Read access to stored CLOB credentials (for the `account/` views).
     pub creds: CredentialStore,
     /// Chain reads for the `account/` views (same adapter the onboarder uses).
@@ -490,6 +566,7 @@ pub struct PolymarketHandler {
     audit: Option<Arc<AuditLog>>,
     /// Wallets with an onboarding run in flight (single-flight guard).
     running: Arc<StdMutex<HashSet<String>>>,
+    auth_services: crate::AuthServices,
 }
 
 impl PolymarketHandler {
@@ -505,7 +582,13 @@ impl PolymarketHandler {
             builder_store: None,
             audit: None,
             running: Arc::default(),
+            auth_services: crate::AuthServices::default(),
         }
+    }
+
+    pub fn with_auth_services(mut self, auth_services: crate::AuthServices) -> Self {
+        self.auth_services = auth_services;
+        self
     }
 
     /// Enable the `onboard/` + `account/` subtrees.
@@ -635,7 +718,7 @@ impl PolymarketHandler {
     /// foreground ceremony) only if ALL of the following are true:
     /// - No EVM owner signing is required (L2 CLOB credentials only).
     /// - The operation is risk-reducing (cannot move funds or increase risk).
-    /// - Geoblock is warning-only (the operation proceeds even if blocked).
+    /// - Geoblock and jurisdiction checks pass.
     ///
     /// If any criterion is false, the operation MUST go through the foreground
     /// confirm path (`bloom vfs write --unlock-wallet`). Builder-key revoke is
@@ -655,7 +738,7 @@ impl PolymarketHandler {
             )));
         }
         // Resolve all local state first so durable refusals happen before any
-        // network call (geoblock is warning-only for cancel, mirroring the CLI).
+        // network call. Compliance gates are hard, even for cancels.
         let info = self
             .keystore
             .info(wallet)
@@ -670,13 +753,19 @@ impl PolymarketHandler {
             ob.creds.load(wallet).map_err(err_be)?.ok_or_else(|| {
                 HandlerError::invalid("wallet not onboarded (no CLOB credentials)")
             })?;
-        // Geoblock is warning-only for cancel (risk-reducing); it never blocks.
         match ob.geoblock.check().await {
             Ok(geo) if geo.blocked => {
-                tracing::warn!("geoblock reports blocked; cancel proceeds (risk-reducing)");
+                return Err(HandlerError::invalid(format!(
+                    "Polymarket geoblock denied cancel for wallet '{wallet}' (country={}, region={})",
+                    geo.country, geo.region
+                )));
             }
             Ok(_) => {}
-            Err(e) => tracing::warn!("geoblock check unavailable ({e}); cancel proceeds"),
+            Err(e) => {
+                return Err(HandlerError::invalid(format!(
+                    "could not verify Polymarket region availability before cancel: {e}"
+                )));
+            }
         }
         let store = self
             .orders
@@ -1894,8 +1983,9 @@ impl PolymarketHandler {
                     .into(),
             ));
         }
-        // Cancel is risk-reducing and uses stored CLOB creds (no owner signing),
-        // so it executes directly here rather than refusing like the confirm paths.
+        // Cancel uses stored CLOB creds (no owner signing), so it executes
+        // directly here after compliance checks rather than refusing like the
+        // owner-signed confirm paths.
         if segs.len() == 5 && segs[0] == "trade" && segs[2] == "orders" && segs[4] == "cancel" {
             let trimmed = std::str::from_utf8(_data)
                 .map(|s| s.trim().to_ascii_lowercase())
@@ -1955,13 +2045,6 @@ impl PolymarketHandler {
         validate_wallet_name(wallet).map_err(err_be)?;
         // Wallet must exist…
         self.wallet_address(wallet)?;
-        // …and be unlocked: signing (approval batch, ClobAuth) needs the key.
-        let signer_arc = self.keystore.signer(wallet).map_err(|e| match e {
-            KeystoreError::Locked(_) => HandlerError::invalid(format!(
-                "wallet '{wallet}' is locked; unlock it before onboarding"
-            )),
-            other => HandlerError::backend(other.to_string()),
-        })?;
         // Geoblock refuse-line: blocked or unverifiable → refuse. No bypass.
         let geo = ob.geoblock.check().await.map_err(err_be)?;
         if geo.blocked {
@@ -1971,6 +2054,14 @@ impl PolymarketHandler {
                 geo.country, geo.region
             )));
         }
+        self.prepare_onboard_layer_b(ob, wallet).await?;
+        // …and be unlocked: signing (approval batch, ClobAuth) needs the key.
+        let signer_arc = self.keystore.signer(wallet).map_err(|e| match e {
+            KeystoreError::Locked(_) => HandlerError::invalid(format!(
+                "wallet '{wallet}' is locked; unlock it before onboarding"
+            )),
+            other => HandlerError::backend(other.to_string()),
+        })?;
         // Single-flight per wallet.
         if !self.running.lock().unwrap().insert(wallet.to_string()) {
             return Err(HandlerError::invalid(format!(
@@ -2009,6 +2100,61 @@ impl PolymarketHandler {
             }
         });
         Ok(())
+    }
+
+    async fn prepare_onboard_layer_b(
+        &self,
+        ob: &PolymarketOnboarding,
+        wallet: &str,
+    ) -> Result<(), HandlerError> {
+        if !self.auth_services.is_wired() {
+            return Ok(());
+        }
+        let info = self
+            .keystore
+            .info(wallet)
+            .map_err(|e| HandlerError::backend(e.to_string()))?;
+        let envelope = polymarket_onboard_envelope(wallet, &format!("{:#x}", info.address))?;
+        let now = pm_now_ms_u64();
+        let staged = self
+            .auth_services
+            .require_writer()?
+            .stage_entry(envelope, AssuranceLevel::Hardened, now)
+            .await
+            .map_err(|e| {
+                HandlerError::backend(format!("stage Polymarket onboarding auth entry: {e}"))
+            })?;
+        let dir = polymarket_onboard_auth_dir(&ob.auth_dir, wallet)?;
+        fs::create_dir_all(&dir)?;
+        let approval_path = dir.join(APPROVAL_FILE);
+        if approval_path.exists() {
+            let approval: Approval = read_json(&approval_path)?;
+            self.auth_services
+                .require_approval_verifier()?
+                .verify_and_consume(approval, pm_now_ms_u64())
+                .await
+                .map_err(|e| HandlerError::invalid(format!("Layer B approval rejected: {e}")))?;
+            return Ok(());
+        }
+        let mut nonce_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        let server_nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
+        let challenge = self
+            .auth_services
+            .require_writer()?
+            .issue_challenge(
+                "polymarket",
+                &staged.entry_id,
+                &server_nonce,
+                pm_now_ms_u64().saturating_add(APPROVAL_TTL_MS),
+                pm_now_ms_u64(),
+            )
+            .await
+            .map_err(|e| {
+                HandlerError::backend(format!("issue Polymarket onboarding challenge: {e}"))
+            })?;
+        write_json(dir.join(APPROVAL_CHALLENGE_FILE), &challenge)?;
+        Err(HandlerError::PermissionDenied)
     }
 
     async fn list_inner(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
@@ -2466,9 +2612,9 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_surface_advertises_and_executes_in_handler() {
-        // Cancel is risk-reducing and uses stored CLOB creds (no owner signing),
-        // so it executes directly in the handler — it must NOT refuse with the
-        // foreground guidance like the value-moving confirm paths.
+        // Cancel uses stored CLOB creds (no owner signing), so it executes
+        // directly in the handler after compliance checks. It must NOT refuse
+        // with foreground guidance like the value-moving confirm paths.
         let store_dir = tempfile::tempdir().unwrap();
         let h = handler_with(None, None).with_order_store(OrderStore::new(store_dir.path()));
 
@@ -2559,6 +2705,71 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("foreground CLI VFS path"));
+    }
+
+    #[tokio::test]
+    async fn cancel_geoblock_blocked_is_hard_denial() {
+        let (addr, _s) = spawn_scripted(vec![(
+            "/api/geoblock",
+            r#"{"blocked":true,"ip":"1.1.1.1","country":"XX","region":"YY"}"#.to_string(),
+        )])
+        .await;
+        let f = onboard_fixture(addr, true).await;
+        f.handler
+            .onboarding
+            .as_ref()
+            .unwrap()
+            .creds
+            .save(
+                "alice",
+                &bloom_polymarket::types::Credentials {
+                    key: "k-1".into(),
+                    secret: "c2VjcmV0LXZhbHVl".into(),
+                    passphrase: "pp-hidden".into(),
+                    nonce: 0,
+                },
+            )
+            .unwrap();
+
+        let err = f
+            .handler
+            .write(&p("/trade/alice/orders/0xORDER/cancel"), b"confirm")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("geoblock denied cancel"), "{err}");
+        assert!(err.to_string().contains("country=XX"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn cancel_geoblock_unavailable_is_hard_denial() {
+        let (addr, _s) = spawn_scripted(vec![]).await;
+        let f = onboard_fixture(addr, true).await;
+        f.handler
+            .onboarding
+            .as_ref()
+            .unwrap()
+            .creds
+            .save(
+                "alice",
+                &bloom_polymarket::types::Credentials {
+                    key: "k-1".into(),
+                    secret: "c2VjcmV0LXZhbHVl".into(),
+                    passphrase: "pp-hidden".into(),
+                    nonce: 0,
+                },
+            )
+            .unwrap();
+
+        let err = f
+            .handler
+            .write(&p("/trade/alice/orders/0xORDER/cancel"), b"confirm")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("could not verify Polymarket region availability before cancel"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2668,6 +2879,7 @@ key = "builder-key-2"
             geoblock: Arc::new(
                 GeoblockClient::new().with_base_url_for_tests(format!("{base}/api/geoblock")),
             ),
+            auth_dir: state_dir.path().to_path_buf(),
             creds: CredentialStore::new(state_dir.path()),
             chain,
         })

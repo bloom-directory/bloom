@@ -13,6 +13,12 @@ use alloy::rpc::types::eth::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::SolCall;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use bloom_auth_api::{
+    Approval, ApprovalVerifier, AssuranceLevel, AuthEntryState, AuthStoreWriter, CanonicalEnvelope,
+    CanonicalIntentHeader, NonceState,
+};
 use bloom_chain::{ChainClient, ChainError, IERC20, NftKind};
 
 // Local NFT-write interfaces. `bloom-chain` declares the read shapes for
@@ -193,6 +199,10 @@ struct TokenMeta {
 type NonceLocks =
     Arc<parking_lot::Mutex<HashMap<(String, String, Address), Arc<tokio::sync::Mutex<()>>>>>;
 
+const OUTBOX_APPROVAL_FILE: &str = "approval.json";
+const OUTBOX_APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
+const OUTBOX_APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
+
 /// Stage / confirm the lifecycle.
 #[derive(Clone)]
 pub struct TxEngine {
@@ -223,6 +233,8 @@ pub struct TxEngine {
     /// Bounded policy sessions: one ceremony authorizes many in-bounds
     /// confirms without a fresh per-tx review. See [`crate::session`].
     session_store: crate::session::SessionStore,
+    approval_verifier: Option<Arc<dyn ApprovalVerifier>>,
+    auth_writer: Option<Arc<dyn AuthStoreWriter>>,
 }
 
 impl TxEngine {
@@ -238,7 +250,19 @@ impl TxEngine {
             private_rpcs: Arc::new(RwLock::new(BTreeMap::new())),
             nonce_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             session_store: crate::session::SessionStore::new(),
+            approval_verifier: None,
+            auth_writer: None,
         }
+    }
+
+    pub fn with_auth_services(
+        mut self,
+        approval_verifier: Arc<dyn ApprovalVerifier>,
+        auth_writer: Arc<dyn AuthStoreWriter>,
+    ) -> Self {
+        self.approval_verifier = Some(approval_verifier);
+        self.auth_writer = Some(auth_writer);
+        self
     }
 
     /// Access the bounded policy-session store (mint/revoke/list live here).
@@ -1036,16 +1060,20 @@ impl TxEngine {
                 } else {
                     bloom_proto::PolicyOutcome::Pass
                 };
-                staged_policy_extras.push(bloom_proto::PolicyCheck {
-                    rule: "nft.approve_all".into(),
-                    outcome,
-                    message: if *approved {
+                staged_policy_extras.push(if *approved {
+                    bloom_proto::PolicyCheck::soft(
+                        "nft.approve_all",
+                        outcome,
                         format!(
                             "operator-wide approval to {op_disp} — review carefully (write override token to confirm)"
-                        )
-                    } else {
-                        format!("revoking operator-wide approval for {op_disp}")
-                    },
+                        ),
+                    )
+                } else {
+                    bloom_proto::PolicyCheck::informational(
+                        "nft.approve_all",
+                        outcome,
+                        format!("revoking operator-wide approval for {op_disp}"),
+                    )
                 });
             }
             RawIntentBody::Enso { .. } => {}
@@ -1261,11 +1289,13 @@ impl TxEngine {
             debug!(id = %staged.id, session = %sid, "tx.authorized_by_session");
         } else {
             self.ensure_action_authorized(
+                &entry,
                 &staged,
                 policy,
                 reviewed_intent_hash,
                 bloom_proto::AuthorizationSurface::Cli,
-            )?;
+            )
+            .await?;
         }
 
         let tx_hash = match self
@@ -1408,11 +1438,13 @@ impl TxEngine {
                     });
                 }
                 self.ensure_action_authorized(
+                    entry,
                     &entry.staged,
                     policy,
                     reviewed_intent_hash,
                     bloom_proto::AuthorizationSurface::Cli,
-                )?;
+                )
+                .await?;
                 let raw = self.outbox.read_broadcast_raw_tx(
                     entry,
                     BroadcastAttemptKind::Confirm,
@@ -1726,17 +1758,44 @@ impl TxEngine {
         }
     }
 
-    fn ensure_action_authorized(
+    async fn ensure_action_authorized(
         &self,
+        entry: &crate::outbox::OutboxEntry,
         staged: &StagedTx,
         policy: &Policy,
         reviewed_intent_hash: Option<&str>,
         surface: bloom_proto::AuthorizationSurface,
     ) -> Result<(), TxEngineError> {
-        let reviewed_intent_hash =
-            self.verified_reviewed_intent_hash(staged, reviewed_intent_hash)?;
         let budget = self.budget_snapshot(&staged.wallet)?;
         let subject = self.authorization_subject(staged);
+        let initial = bloom_proto::evaluate_action_authorization(
+            policy,
+            &staged.policy_checks,
+            &subject,
+            Some(&budget),
+            None,
+            surface.clone(),
+        );
+        match initial {
+            bloom_proto::AutonomyDecision::ApprovedAutonomous { .. } => return Ok(()),
+            bloom_proto::AutonomyDecision::ApprovedFreshReview { .. } => return Ok(()),
+            bloom_proto::AutonomyDecision::ApprovedCapability { .. } => {
+                return Err(TxEngineError::BroadcastApprovalRequired(
+                    "scoped run capabilities are not implemented; fresh review required".into(),
+                ));
+            }
+            bloom_proto::AutonomyDecision::Denied { reason } => {
+                return Err(TxEngineError::BroadcastApprovalRequired(reason));
+            }
+            bloom_proto::AutonomyDecision::NeedsFreshReview { .. } => {}
+        }
+
+        let reviewed_intent_hash = if self.approval_verifier.is_some() || self.auth_writer.is_some()
+        {
+            Some(self.ensure_layer_b_outbox_approval(entry, staged).await?)
+        } else {
+            self.verified_reviewed_intent_hash(staged, reviewed_intent_hash)?
+        };
         match bloom_proto::evaluate_action_authorization(
             policy,
             &staged.policy_checks,
@@ -1761,6 +1820,90 @@ impl TxEngine {
                 Err(TxEngineError::BroadcastApprovalRequired(reason))
             }
         }
+    }
+
+    async fn ensure_layer_b_outbox_approval(
+        &self,
+        entry: &crate::outbox::OutboxEntry,
+        staged: &StagedTx,
+    ) -> Result<String, TxEngineError> {
+        let verifier = self.approval_verifier.as_ref().ok_or_else(|| {
+            TxEngineError::BroadcastApprovalRequired(
+                "Layer B approval verifier is not wired".into(),
+            )
+        })?;
+        let writer = self.auth_writer.as_ref().ok_or_else(|| {
+            TxEngineError::BroadcastApprovalRequired(
+                "Layer B auth store writer is not wired".into(),
+            )
+        })?;
+        let envelope = outbox_canonical_envelope(staged)?;
+        let auth_entry = writer
+            .stage_entry(envelope, AssuranceLevel::Convenience, now_ms() as u64)
+            .await
+            .map_err(|e| {
+                TxEngineError::BroadcastApprovalRequired(format!(
+                    "stage outbox auth entry failed: {e}"
+                ))
+            })?;
+        if matches!(
+            auth_entry.state,
+            AuthEntryState::Approved | AuthEntryState::Submitting
+        ) && auth_entry.nonce_state == NonceState::Consumed
+        {
+            return Ok(auth_entry.intent_hash);
+        }
+        let approval_path = entry.dir.join(OUTBOX_APPROVAL_FILE);
+        if approval_path.exists() {
+            let approval_body = std::fs::read(&approval_path).map_err(|e| {
+                TxEngineError::BroadcastApprovalRequired(format!("read approval.json: {e}"))
+            })?;
+            let approval: Approval = serde_json::from_slice(&approval_body).map_err(|e| {
+                TxEngineError::BroadcastApprovalRequired(format!(
+                    "stored approval.json is invalid: {e}"
+                ))
+            })?;
+            verifier
+                .verify_and_consume(approval, now_ms() as u64)
+                .await
+                .map_err(|e| {
+                    TxEngineError::BroadcastApprovalRequired(format!(
+                        "Layer B approval rejected: {e}"
+                    ))
+                })?;
+            return Ok(auth_entry.intent_hash);
+        }
+
+        let mut nonce = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+        let nonce = URL_SAFE_NO_PAD.encode(nonce);
+        let challenge = writer
+            .issue_challenge(
+                "outbox",
+                &auth_entry.entry_id,
+                &nonce,
+                (now_ms() as u64).saturating_add(OUTBOX_APPROVAL_TTL_MS),
+                now_ms() as u64,
+            )
+            .await
+            .map_err(|e| {
+                TxEngineError::BroadcastApprovalRequired(format!(
+                    "issue outbox approval challenge failed: {e}"
+                ))
+            })?;
+        let challenge_body = serde_json::to_vec_pretty(&challenge).map_err(|e| {
+            TxEngineError::BroadcastApprovalRequired(format!("encode approval challenge: {e}"))
+        })?;
+        std::fs::write(
+            entry.dir.join(OUTBOX_APPROVAL_CHALLENGE_FILE),
+            challenge_body,
+        )
+        .map_err(|e| {
+            TxEngineError::BroadcastApprovalRequired(format!("write approval challenge: {e}"))
+        })?;
+        Err(TxEngineError::BroadcastApprovalRequired(
+            "outbox confirm requires signed Layer B approval; local password wallets can only auto-confirm actions that remain in policy".into(),
+        ))
     }
 
     fn verified_reviewed_intent_hash(
@@ -2003,19 +2146,21 @@ impl TxEngine {
             bumped.data_hex = data_hex;
             bumped.token = token;
             bumped.nft = nft;
-            bumped.policy_checks.push(bloom_proto::PolicyCheck {
-                rule: "replacement.substitute".into(),
-                outcome: bloom_proto::PolicyOutcome::Deny,
-                message: "same-nonce replacement with substituted to/value/data is disabled; stage a fresh transaction instead".into(),
-            });
+            bumped.policy_checks.push(bloom_proto::PolicyCheck::hard(
+                "replacement.substitute",
+                bloom_proto::PolicyOutcome::Deny,
+                "same-nonce replacement with substituted to/value/data is disabled; stage a fresh transaction instead",
+            ));
         }
         bump_fees_in_place(&mut bumped, bump);
         self.ensure_action_authorized(
+            &entry,
             &bumped,
             policy,
             reviewed_intent_hash,
             bloom_proto::AuthorizationSurface::Cli,
-        )?;
+        )
+        .await?;
 
         let tx_hash = self
             .submit_with_marker(
@@ -2082,11 +2227,13 @@ impl TxEngine {
         cancel_tx.token = None;
         bump_fees_in_place(&mut cancel_tx, bump);
         self.ensure_action_authorized(
+            &entry,
             &cancel_tx,
             policy,
             reviewed_intent_hash,
             bloom_proto::AuthorizationSurface::Cli,
-        )?;
+        )
+        .await?;
 
         let tx_hash = self
             .submit_with_marker(
@@ -2200,6 +2347,35 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn outbox_entry_id(staged: &StagedTx) -> String {
+    format!("{}:{}", staged.chain_id, staged.id)
+}
+
+fn outbox_canonical_envelope(staged: &StagedTx) -> Result<CanonicalEnvelope, TxEngineError> {
+    let subject = serde_json::to_vec(&serde_json::json!({
+        "schema": "bloom.outbox_subject.v1",
+        "staged": staged,
+    }))
+    .map_err(|e| TxEngineError::BroadcastApprovalRequired(format!("encode outbox subject: {e}")))?;
+    Ok(CanonicalEnvelope::new(
+        CanonicalIntentHeader {
+            schema: "bloom.intent_header.v1".into(),
+            wallet: staged.wallet.clone(),
+            surface: "outbox".into(),
+            entry_id: outbox_entry_id(staged),
+            executor_id: "evm-broadcast".into(),
+            network: staged.chain.clone(),
+            account: staged.from.clone(),
+            action_kind: "evm_confirm".into(),
+            value_movement: true,
+            authority_change: false,
+        },
+        "outbox",
+        "bloom.outbox_subject.v1",
+        subject,
+    ))
 }
 
 fn f64_to_micro_usd(v: f64) -> Option<i128> {
@@ -2360,7 +2536,152 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use bloom_auth_api::{
+        APPROVAL_SCHEMA_V1, ApprovalCaps, ApprovalSignature, AuthApiError, AuthEntryRecord,
+        AuthEntryState, ChallengeRecord, NonceState, SignerKind,
+    };
     use bloom_proto::TxStatus;
+
+    struct RejectingTestVerifier;
+
+    #[async_trait::async_trait]
+    impl ApprovalVerifier for RejectingTestVerifier {
+        async fn verify_and_consume(
+            &self,
+            _approval: Approval,
+            _now_ms: u64,
+        ) -> Result<(), AuthApiError> {
+            Err(AuthApiError::Denied("test verifier rejects".into()))
+        }
+    }
+
+    struct AcceptingTestVerifier;
+
+    #[async_trait::async_trait]
+    impl ApprovalVerifier for AcceptingTestVerifier {
+        async fn verify_and_consume(
+            &self,
+            approval: Approval,
+            _now_ms: u64,
+        ) -> Result<(), AuthApiError> {
+            if approval.surface != "outbox" {
+                return Err(AuthApiError::Denied("wrong surface".into()));
+            }
+            Ok(())
+        }
+    }
+
+    struct ChallengeOnlyWriter;
+
+    #[async_trait::async_trait]
+    impl AuthStoreWriter for ChallengeOnlyWriter {
+        async fn stage_entry(
+            &self,
+            envelope: CanonicalEnvelope,
+            assurance: AssuranceLevel,
+            now_ms: u64,
+        ) -> Result<AuthEntryRecord, AuthApiError> {
+            Ok(AuthEntryRecord {
+                surface: envelope.header.surface.clone(),
+                entry_id: envelope.header.entry_id.clone(),
+                state: AuthEntryState::Staged,
+                intent_hash: envelope.intent_hash()?,
+                assurance,
+                nonce: None,
+                nonce_state: NonceState::Unused,
+                reservation_id: None,
+                updated_ms: now_ms,
+            })
+        }
+
+        async fn issue_challenge(
+            &self,
+            surface: &str,
+            entry_id: &str,
+            server_nonce: &str,
+            expiry_ms: u64,
+            _now_ms: u64,
+        ) -> Result<ChallengeRecord, AuthApiError> {
+            Ok(ChallengeRecord {
+                surface: surface.to_string(),
+                entry_id: entry_id.to_string(),
+                intent_hash: "outbox-intent".to_string(),
+                server_nonce: server_nonce.to_string(),
+                assurance: AssuranceLevel::Convenience,
+                expiry_ms,
+            })
+        }
+
+        async fn issue_review_session(
+            &self,
+            review_session_id: &str,
+            surface: &str,
+            entry_id: &str,
+            expires_ms: u64,
+            now_ms: u64,
+        ) -> Result<bloom_auth_api::ReviewSessionRecord, AuthApiError> {
+            Ok(bloom_auth_api::ReviewSessionRecord {
+                review_session_id: review_session_id.to_string(),
+                surface: surface.to_string(),
+                entry_id: entry_id.to_string(),
+                intent_hash: "outbox-intent".to_string(),
+                assurance: AssuranceLevel::Convenience,
+                expires_ms,
+                consumed_ms: None,
+                created_ms: now_ms,
+            })
+        }
+    }
+
+    struct PreApprovedWriter;
+
+    #[async_trait::async_trait]
+    impl AuthStoreWriter for PreApprovedWriter {
+        async fn stage_entry(
+            &self,
+            envelope: CanonicalEnvelope,
+            assurance: AssuranceLevel,
+            now_ms: u64,
+        ) -> Result<AuthEntryRecord, AuthApiError> {
+            Ok(AuthEntryRecord {
+                surface: envelope.header.surface.clone(),
+                entry_id: envelope.header.entry_id.clone(),
+                state: AuthEntryState::Approved,
+                intent_hash: envelope.intent_hash()?,
+                assurance,
+                nonce: Some("already-consumed".into()),
+                nonce_state: NonceState::Consumed,
+                reservation_id: None,
+                updated_ms: now_ms,
+            })
+        }
+
+        async fn issue_challenge(
+            &self,
+            _surface: &str,
+            _entry_id: &str,
+            _server_nonce: &str,
+            _expiry_ms: u64,
+            _now_ms: u64,
+        ) -> Result<ChallengeRecord, AuthApiError> {
+            Err(AuthApiError::Denied(
+                "pre-approved retry must not issue a new challenge".into(),
+            ))
+        }
+
+        async fn issue_review_session(
+            &self,
+            _review_session_id: &str,
+            _surface: &str,
+            _entry_id: &str,
+            _expires_ms: u64,
+            _now_ms: u64,
+        ) -> Result<bloom_auth_api::ReviewSessionRecord, AuthApiError> {
+            Err(AuthApiError::Denied(
+                "pre-approved retry must not issue a review session".into(),
+            ))
+        }
+    }
 
     fn fake_staged_1559(id: &str) -> StagedTx {
         StagedTx {
@@ -3352,11 +3673,11 @@ mod tests {
         let mut staged = fake_staged_1559("0001-test");
         staged.expires_ms = now_ms() + 60_000;
         // Inject a Warn check directly so the override gate fires.
-        staged.policy_checks = vec![PolicyCheck {
-            rule: "test.warn".into(),
-            outcome: PolicyOutcome::Warn,
-            message: "soft cap".into(),
-        }];
+        staged.policy_checks = vec![PolicyCheck::soft(
+            "test.warn",
+            PolicyOutcome::Warn,
+            "soft cap",
+        )];
         engine.outbox.write_pending(&staged, "p").unwrap();
 
         // "y" must be rejected — needs the policy's override token.
@@ -3430,11 +3751,11 @@ mod tests {
 
         let mut staged = fake_staged_1559("0001-test");
         staged.expires_ms = now_ms() + 60_000;
-        staged.policy_checks = vec![PolicyCheck {
-            rule: "caps.max_value_eth".into(),
-            outcome: PolicyOutcome::Deny,
-            message: "value exceeds max".into(),
-        }];
+        staged.policy_checks = vec![PolicyCheck::hard(
+            "caps.max_value_eth",
+            PolicyOutcome::Deny,
+            "value exceeds max",
+        )];
         engine.outbox.write_pending(&staged, "p").unwrap();
 
         let r = engine
@@ -3480,11 +3801,11 @@ mod tests {
 
         let mut staged = fake_staged_1559("0001-test");
         staged.expires_ms = now_ms() + 60_000;
-        staged.policy_checks = vec![PolicyCheck {
-            rule: "caps.warn_value_eth".into(),
-            outcome: PolicyOutcome::Warn,
-            message: "soft cap exceeded".into(),
-        }];
+        staged.policy_checks = vec![PolicyCheck::soft(
+            "caps.warn_value_eth",
+            PolicyOutcome::Warn,
+            "soft cap exceeded",
+        )];
         engine.outbox.write_pending(&staged, "p").unwrap();
 
         // Wrong text — must be rejected.
@@ -3641,6 +3962,195 @@ mod tests {
         match r {
             Err(TxEngineError::BroadcastApprovalRequired(_)) => {
                 panic!("review hash should satisfy approval gate")
+            }
+            Ok(_) => panic!("unexpected broadcast success on unreachable RPC"),
+            Err(_) => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn wired_auth_outbox_confirm_ignores_legacy_marker_and_issues_challenge() {
+        let (engine, spec, dir) = fake_engine(60_000);
+        let engine = engine.with_auth_services(
+            Arc::new(RejectingTestVerifier),
+            Arc::new(ChallengeOnlyWriter),
+        );
+        let permit = permit_for(&dir);
+        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let mut policy = bloom_proto::Policy::default();
+        policy.approval.require_broadcast_approval = true;
+
+        let mut staged = fake_staged_1559("0001-layer-b");
+        staged.value_wei = "1".into();
+        staged.usd_value = Some(0.01);
+        staged.expires_ms = now_ms() + 60_000;
+        engine.outbox.write_pending(&staged, "p").unwrap();
+
+        let entry = engine
+            .outbox
+            .read("alice", "anvil", "0001-layer-b")
+            .unwrap();
+        let legacy_hash = "legacy-reviewed-hash";
+        engine
+            .outbox
+            .write_artefact(&entry.dir, "review_intent.json", br#"{"schema":"legacy"}"#)
+            .unwrap();
+        engine
+            .outbox
+            .write_artefact(
+                &entry.dir,
+                "review_approved.json",
+                &serde_json::to_vec_pretty(&serde_json::json!({
+                    "schema": "bloom.review_approved.v1",
+                    "intent_hash": legacy_hash,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+        let r = engine
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-layer-b",
+                &chain,
+                &signer,
+                &policy,
+                "y",
+                Some(legacy_hash),
+            )
+            .await;
+        assert!(
+            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(ref e)) if e.contains("Layer B")),
+            "expected Layer B challenge refusal, got {r:?}"
+        );
+        let challenge: ChallengeRecord = serde_json::from_slice(
+            &std::fs::read(entry.dir.join(OUTBOX_APPROVAL_CHALLENGE_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(challenge.surface, "outbox");
+        assert_eq!(challenge.entry_id, outbox_entry_id(&staged));
+        assert_eq!(challenge.intent_hash, "outbox-intent");
+    }
+
+    #[tokio::test]
+    async fn wired_auth_outbox_confirm_accepts_approval_without_legacy_marker() {
+        let (engine, spec, dir) = fake_engine(60_000);
+        let engine = engine.with_auth_services(
+            Arc::new(AcceptingTestVerifier),
+            Arc::new(ChallengeOnlyWriter),
+        );
+        let permit = permit_for(&dir);
+        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let mut policy = bloom_proto::Policy::default();
+        policy.approval.require_broadcast_approval = true;
+
+        let mut staged = fake_staged_1559("0001-layer-b-ok");
+        staged.value_wei = "1".into();
+        staged.usd_value = Some(0.01);
+        staged.expires_ms = now_ms() + 60_000;
+        engine.outbox.write_pending(&staged, "p").unwrap();
+        let entry = engine
+            .outbox
+            .read("alice", "anvil", "0001-layer-b-ok")
+            .unwrap();
+        engine
+            .outbox
+            .write_artefact(
+                &entry.dir,
+                OUTBOX_APPROVAL_FILE,
+                &serde_json::to_vec_pretty(&Approval {
+                    schema: APPROVAL_SCHEMA_V1.into(),
+                    wallet: "alice".into(),
+                    surface: "outbox".into(),
+                    entry_id: outbox_entry_id(&staged),
+                    intent_hash: "outbox-intent".into(),
+                    executor_id: "evm-broadcast".into(),
+                    network: "anvil".into(),
+                    assurance: AssuranceLevel::Convenience,
+                    server_nonce: "nonce-1".into(),
+                    caps: ApprovalCaps::default(),
+                    expiry_ms: now_ms() as u64 + 60_000,
+                    signer_kind: SignerKind::Test,
+                    credential_id: None,
+                    review_session_id: None,
+                    signature: ApprovalSignature::Test {
+                        sig_hex: "00".into(),
+                    },
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+        let r = engine
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-layer-b-ok",
+                &chain,
+                &signer,
+                &policy,
+                "y",
+                None,
+            )
+            .await;
+        match r {
+            Err(TxEngineError::BroadcastApprovalRequired(e)) => {
+                panic!("signed approval should satisfy approval gate: {e}")
+            }
+            Ok(_) => panic!("unexpected broadcast success on unreachable RPC"),
+            Err(_) => {}
+        }
+        let entry = engine
+            .outbox
+            .read("alice", "anvil", "0001-layer-b-ok")
+            .unwrap();
+        assert!(
+            engine
+                .outbox
+                .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn wired_auth_outbox_confirm_retries_consumed_approval_for_same_intent() {
+        let (engine, spec, dir) = fake_engine(60_000);
+        let engine =
+            engine.with_auth_services(Arc::new(RejectingTestVerifier), Arc::new(PreApprovedWriter));
+        let permit = permit_for(&dir);
+        let chain = bloom_chain::ChainClient::new(spec.clone()).unwrap();
+        let signer = alloy::signers::local::PrivateKeySigner::random();
+        let mut policy = bloom_proto::Policy::default();
+        policy.approval.require_broadcast_approval = true;
+
+        let mut staged = fake_staged_1559("0001-layer-b-retry");
+        staged.value_wei = "1".into();
+        staged.usd_value = Some(0.01);
+        staged.expires_ms = now_ms() + 60_000;
+        engine.outbox.write_pending(&staged, "p").unwrap();
+
+        let r = engine
+            .confirm(
+                &permit,
+                "alice",
+                "anvil",
+                "0001-layer-b-retry",
+                &chain,
+                &signer,
+                &policy,
+                "y",
+                None,
+            )
+            .await;
+        match r {
+            Err(TxEngineError::BroadcastApprovalRequired(e)) => {
+                panic!("consumed approval for same intent should satisfy retry gate: {e}")
             }
             Ok(_) => panic!("unexpected broadcast success on unreachable RPC"),
             Err(_) => {}

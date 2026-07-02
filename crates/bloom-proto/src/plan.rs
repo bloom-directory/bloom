@@ -334,16 +334,19 @@ Write `y` to `confirm` to broadcast, `cancel` to discard, `override` to bypass s
             PolicyCheck {
                 rule: "max_value".to_string(),
                 outcome: PolicyOutcome::Pass,
+                class: crate::PolicyRuleClass::Informational,
                 message: "ok".to_string(),
             },
             PolicyCheck {
                 rule: "allowlist".to_string(),
                 outcome: PolicyOutcome::Warn,
+                class: crate::PolicyRuleClass::Soft,
                 message: "recipient not on allowlist".to_string(),
             },
             PolicyCheck {
                 rule: "block_mainnet".to_string(),
                 outcome: PolicyOutcome::Deny,
+                class: crate::PolicyRuleClass::Hard,
                 message: "broadcast denied".to_string(),
             },
         ];

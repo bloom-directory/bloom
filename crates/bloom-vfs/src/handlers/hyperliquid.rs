@@ -7,6 +7,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use bloom_auth_api::{Approval, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader};
 use bloom_hyperliquid::{
     CancelWire, ExchangeAction, Grouping, HyperliquidClient, HyperliquidNetwork, HyperliquidSigner,
     LimitOrderType, OrderTypeWire, OrderWire, SignSubmit, SignedSubmit, TimeInForce,
@@ -21,6 +24,7 @@ use bloom_proto::{
 };
 use parking_lot::Mutex;
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::handler::{Entry, Handler, HandlerError};
@@ -73,6 +77,28 @@ const SESSION_FILES: [&str; 12] = [
 ];
 const SEALED_AGENT_KEY_FILE: &str = ".agent_key.sealed";
 const AGENT_KEY_KEK_FILE: &str = ".agent_key_kek";
+const APPROVAL_FILE: &str = "approval.json";
+const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
+const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
+const USD_SEND_PENDING_FILE: &str = "usd_send_pending.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingUsdSend {
+    destination: String,
+    amount: String,
+    nonce: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AgentSessionSubject<'a> {
+    schema: &'static str,
+    network: &'a str,
+    wallet: &'a str,
+    session_id: &'a str,
+    agent_name: Option<&'a str>,
+    vault_address: Option<&'a str>,
+    frozen_policy: &'a HyperliquidPolicy,
+}
 
 const README: &[u8] = br#"# Hyperliquid VFS
 
@@ -198,6 +224,7 @@ pub struct HyperliquidHandler {
     store_root: Option<PathBuf>,
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<ActiveHlSession>>>>>,
     pending_sessions: Arc<Mutex<HashSet<String>>>,
+    auth_services: crate::AuthServices,
 }
 
 impl HyperliquidHandler {
@@ -209,7 +236,13 @@ impl HyperliquidHandler {
             store_root: None,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             pending_sessions: Arc::new(Mutex::new(HashSet::new())),
+            auth_services: crate::AuthServices::default(),
         }
+    }
+
+    pub fn with_auth_services(mut self, auth_services: crate::AuthServices) -> Self {
+        self.auth_services = auth_services;
+        self
     }
 
     pub fn with_store_root(mut self, root: PathBuf) -> Self {
@@ -544,7 +577,15 @@ impl HyperliquidHandler {
         req: AgentSessionCreate,
     ) -> Result<(), HandlerError> {
         let nonce = bloom_hyperliquid::now_ms();
-        let id = req.id.unwrap_or_else(|| format!("hl-{}", nonce));
+        let id = match req.id.clone() {
+            Some(id) => id,
+            None if self.auth_services.is_wired() => {
+                return Err(HandlerError::invalid(
+                    "Hyperliquid Layer B agent-session approval requires an explicit stable id",
+                ));
+            }
+            None => format!("hl-{}", nonce),
+        };
         safe_segment(&id)?;
         let reservation = self.reserve_session_slot(network_name, wallet, &id)?;
         let info = self
@@ -557,6 +598,8 @@ impl HyperliquidHandler {
                 "refusing to create Hyperliquid agent session: wallet [hyperliquid] policy must set allowed_assets, max_notional_usd, max_position_usd, and max_loss_usd",
             ));
         }
+        self.prepare_agent_session_layer_b(network_name, wallet, &id, &req, &policy)
+            .await?;
         let owner_signer = self.keystore.signer(wallet).map_err(|e| {
             HandlerError::PermissionDenied
                 .with_context(format!("wallet '{wallet}' is locked or unavailable: {e}"))
@@ -1752,6 +1795,7 @@ impl HyperliquidHandler {
             wallet: wallet.to_string(),
             action_kind: "usdSend".to_string(),
             notional_microusd: amount_micro,
+            destination: Some(req.destination.clone()),
             snapshot_readable: true,
             ..Default::default()
         };
@@ -1763,12 +1807,14 @@ impl HyperliquidHandler {
                 deny.rule, deny.message
             )));
         }
+        let nonce = self
+            .prepare_usd_send_layer_b(network_name, wallet, &req, &checks)
+            .await?;
         let signer = self.keystore.signer(wallet).map_err(|e| {
             HandlerError::PermissionDenied
                 .with_context(format!("wallet '{wallet}' is locked or unavailable: {e}"))
         })?;
         let signer = HyperliquidSigner::new(signer);
-        let nonce = req.nonce.unwrap_or_else(bloom_hyperliquid::now_ms);
         let (action, signature) = signer
             .sign_usd_send(network, dest, &req.amount, nonce)
             .await
@@ -1776,7 +1822,120 @@ impl HyperliquidHandler {
         let payload = user_signed_payload(action, nonce, signature);
         let response = client.exchange(payload).await.map_err(err_be)?;
         self.persist_response(network_name, wallet, "send_asset.json", &response)?;
+        let _ = self.clear_usd_send_pending(network_name, wallet);
         Ok(())
+    }
+
+    async fn prepare_usd_send_layer_b(
+        &self,
+        network: &str,
+        wallet: &str,
+        req: &UsdSendRequest,
+        checks: &[bloom_proto::PolicyCheck],
+    ) -> Result<u64, HandlerError> {
+        if !self.auth_services.is_wired() {
+            return Ok(req.nonce.unwrap_or_else(bloom_hyperliquid::now_ms));
+        }
+        let pending = self.load_or_create_usd_send_pending(network, wallet, req)?;
+        if pending.destination != req.destination || pending.amount != req.amount {
+            return Err(HandlerError::invalid(
+                "a different Hyperliquid usdSend is already pending approval; approve/cancel it before staging another",
+            ));
+        }
+        let envelope = hyperliquid_usd_send_envelope(network, wallet, &pending, checks)?;
+        let staged = self
+            .auth_services
+            .require_writer()?
+            .stage_entry(envelope, AssuranceLevel::Convenience, now_ms_u64())
+            .await
+            .map_err(|e| {
+                HandlerError::backend(format!("stage Hyperliquid usdSend auth entry: {e}"))
+            })?;
+        let dir = self.usd_send_auth_dir(network, wallet)?;
+        let approval_path = dir.join(APPROVAL_FILE);
+        if approval_path.exists() {
+            let approval: Approval = read_json(&approval_path)?;
+            self.auth_services
+                .require_approval_verifier()?
+                .verify_and_consume(approval, now_ms_u64())
+                .await
+                .map_err(|e| HandlerError::invalid(format!("Layer B approval rejected: {e}")))?;
+            return Ok(pending.nonce);
+        }
+        let mut nonce_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        let server_nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
+        let challenge = self
+            .auth_services
+            .require_writer()?
+            .issue_challenge(
+                "hyperliquid",
+                &staged.entry_id,
+                &server_nonce,
+                now_ms_u64().saturating_add(APPROVAL_TTL_MS),
+                now_ms_u64(),
+            )
+            .await
+            .map_err(|e| {
+                HandlerError::backend(format!("issue Hyperliquid usdSend challenge: {e}"))
+            })?;
+        write_json(dir.join(APPROVAL_CHALLENGE_FILE), &challenge)?;
+        Err(HandlerError::PermissionDenied)
+    }
+
+    async fn prepare_agent_session_layer_b(
+        &self,
+        network: &str,
+        wallet: &str,
+        session_id: &str,
+        req: &AgentSessionCreate,
+        policy: &HyperliquidPolicy,
+    ) -> Result<(), HandlerError> {
+        if !self.auth_services.is_wired() {
+            return Ok(());
+        }
+        let envelope =
+            hyperliquid_agent_session_envelope(network, wallet, session_id, req, policy)?;
+        let now = now_ms_u64();
+        let staged = self
+            .auth_services
+            .require_writer()?
+            .stage_entry(envelope, AssuranceLevel::Hardened, now)
+            .await
+            .map_err(|e| {
+                HandlerError::backend(format!("stage Hyperliquid agent-session auth entry: {e}"))
+            })?;
+        let dir = self.session_store_dir(network, wallet, session_id)?;
+        std::fs::create_dir_all(&dir)?;
+        let approval_path = dir.join(APPROVAL_FILE);
+        if approval_path.exists() {
+            let approval: Approval = read_json(&approval_path)?;
+            self.auth_services
+                .require_approval_verifier()?
+                .verify_and_consume(approval, now_ms_u64())
+                .await
+                .map_err(|e| HandlerError::invalid(format!("Layer B approval rejected: {e}")))?;
+            return Ok(());
+        }
+        let mut nonce_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        let server_nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
+        let challenge = self
+            .auth_services
+            .require_writer()?
+            .issue_challenge(
+                "hyperliquid",
+                &staged.entry_id,
+                &server_nonce,
+                now_ms_u64().saturating_add(APPROVAL_TTL_MS),
+                now_ms_u64(),
+            )
+            .await
+            .map_err(|e| {
+                HandlerError::backend(format!("issue Hyperliquid agent-session challenge: {e}"))
+            })?;
+        write_json(dir.join(APPROVAL_CHALLENGE_FILE), &challenge)?;
+        Err(HandlerError::PermissionDenied)
     }
 
     /// Evaluate the wallet's verified `[hyperliquid]` policy against an exchange
@@ -1973,6 +2132,53 @@ impl HyperliquidHandler {
             "response": response,
         });
         std::fs::write(dir.join("last_response.json"), pretty_json(&body))?;
+        Ok(())
+    }
+
+    fn usd_send_auth_dir(&self, network: &str, wallet: &str) -> Result<PathBuf, HandlerError> {
+        let Some(root) = &self.store_root else {
+            return Err(HandlerError::NotFound("Hyperliquid store root".into()));
+        };
+        Ok(root
+            .join("exchange")
+            .join(safe_segment(network)?)
+            .join(safe_segment(wallet)?))
+    }
+
+    fn load_or_create_usd_send_pending(
+        &self,
+        network: &str,
+        wallet: &str,
+        req: &UsdSendRequest,
+    ) -> Result<PendingUsdSend, HandlerError> {
+        let dir = self.usd_send_auth_dir(network, wallet)?;
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(USD_SEND_PENDING_FILE);
+        if path.exists() {
+            return read_json(path);
+        }
+        let pending = PendingUsdSend {
+            destination: req.destination.clone(),
+            amount: req.amount.clone(),
+            nonce: req.nonce.unwrap_or_else(bloom_hyperliquid::now_ms),
+        };
+        write_json(path, &pending)?;
+        Ok(pending)
+    }
+
+    fn clear_usd_send_pending(&self, network: &str, wallet: &str) -> Result<(), HandlerError> {
+        let dir = self.usd_send_auth_dir(network, wallet)?;
+        for file in [
+            USD_SEND_PENDING_FILE,
+            APPROVAL_FILE,
+            APPROVAL_CHALLENGE_FILE,
+        ] {
+            match std::fs::remove_file(dir.join(file)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(HandlerError::Io(e)),
+            }
+        }
         Ok(())
     }
 
@@ -3032,7 +3238,7 @@ impl Handler for HyperliquidHandler {
     }
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentSessionCreate {
     id: Option<String>,
     agent_name: Option<String>,
@@ -3767,6 +3973,117 @@ fn safe_segment(raw: &str) -> Result<String, HandlerError> {
         return Err(HandlerError::invalid("unsafe hyperliquid store segment"));
     }
     Ok(raw.to_string())
+}
+
+fn now_ms_u64() -> u64 {
+    bloom_hyperliquid::now_ms()
+}
+
+fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<(), HandlerError> {
+    std::fs::write(path, serde_json::to_vec_pretty(value).map_err(err_json)?)?;
+    Ok(())
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Result<T, HandlerError> {
+    let bytes = std::fs::read(path)?;
+    serde_json::from_slice(&bytes).map_err(err_json)
+}
+
+fn hyperliquid_usd_send_entry_id(network: &str, wallet: &str, pending: &PendingUsdSend) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.hyperliquid.usd_send.entry.v1");
+    hasher.update(network.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(wallet.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(pending.destination.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(pending.amount.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(&pending.nonce.to_be_bytes());
+    format!("hl-usdsend-{}", hasher.finalize().to_hex())
+}
+
+fn hyperliquid_usd_send_envelope(
+    network: &str,
+    wallet: &str,
+    pending: &PendingUsdSend,
+    checks: &[bloom_proto::PolicyCheck],
+) -> Result<CanonicalEnvelope, HandlerError> {
+    let subject = serde_json::to_vec(&json!({
+        "schema": "bloom.hyperliquid_usd_send_subject.v1",
+        "network": network,
+        "wallet": wallet,
+        "destination": pending.destination,
+        "amount": pending.amount,
+        "nonce": pending.nonce,
+        "policy_checks": checks,
+    }))
+    .map_err(err_json)?;
+    Ok(CanonicalEnvelope::new(
+        CanonicalIntentHeader {
+            schema: "bloom.intent_header.v1".into(),
+            wallet: wallet.to_string(),
+            surface: "hyperliquid".into(),
+            entry_id: hyperliquid_usd_send_entry_id(network, wallet, pending),
+            executor_id: "hyperliquid-usd-send".into(),
+            network: network.to_string(),
+            account: wallet.to_string(),
+            action_kind: "usdSend".into(),
+            value_movement: true,
+            authority_change: false,
+        },
+        "hyperliquid_usd_send",
+        "bloom.hyperliquid_usd_send_subject.v1",
+        subject,
+    ))
+}
+
+fn hyperliquid_agent_session_entry_id(network: &str, wallet: &str, session_id: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.hyperliquid.agent_session.entry.v1");
+    hasher.update(network.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(wallet.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(session_id.as_bytes());
+    format!("hl-session-{}", hasher.finalize().to_hex())
+}
+
+fn hyperliquid_agent_session_envelope(
+    network: &str,
+    wallet: &str,
+    session_id: &str,
+    req: &AgentSessionCreate,
+    policy: &HyperliquidPolicy,
+) -> Result<CanonicalEnvelope, HandlerError> {
+    let subject = AgentSessionSubject {
+        schema: "bloom.hyperliquid_agent_session_subject.v1",
+        network,
+        wallet,
+        session_id,
+        agent_name: req.agent_name.as_deref(),
+        vault_address: req.vault_address.as_deref(),
+        frozen_policy: policy,
+    };
+    let subject = serde_json::to_vec(&subject).map_err(err_json)?;
+    Ok(CanonicalEnvelope::new(
+        CanonicalIntentHeader {
+            schema: "bloom.intent_header.v1".into(),
+            wallet: wallet.to_string(),
+            surface: "hyperliquid".into(),
+            entry_id: hyperliquid_agent_session_entry_id(network, wallet, session_id),
+            executor_id: "hyperliquid-agent-session".into(),
+            network: network.to_string(),
+            account: wallet.to_string(),
+            action_kind: "approveAgent".into(),
+            value_movement: false,
+            authority_change: true,
+        },
+        "hyperliquid_agent_session",
+        "bloom.hyperliquid_agent_session_subject.v1",
+        subject,
+    ))
 }
 
 fn extend_safe_dir_names(
