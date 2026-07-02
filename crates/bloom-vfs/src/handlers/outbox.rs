@@ -159,7 +159,7 @@ impl Handler for OutboxHandler {
                             .map(|mtime| (mtime, e.file_name()))
                     })
                     .collect();
-                entries.sort_by(|a, b| b.0.cmp(&a.0));
+                entries.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
                 let (_, name) = entries
                     .first()
                     .ok_or_else(|| HandlerError::NotFound("no pending actions".into()))?;

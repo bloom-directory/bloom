@@ -77,6 +77,15 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
         .map_err(|e| anyhow!("create_local: {e}"))?;
     let alice_addr = format!("{:#x}", info.address);
 
+    // Write a permissive under_policy policy so the value-moving send
+    // below is auto-approved without Sealed Approval (which requires a
+    // passkey — unavailable in integration tests).
+    let wallet_dir = tmp.path().join("keystore").join("alice");
+    std::fs::write(
+        wallet_dir.join("policy.toml"),
+        "[approval]\nagent_autonomy = \"under_policy\"\n\n[limits]\nmax_tx_usd = \"1000\"\nmax_day_usd = \"10000\"\n",
+    )?;
+
     // 4. Fund alice from anvil's prefunded #0 via `cast send`.
     fund_via_cast(&rpc_url, &alice_addr, 10).await?;
 
@@ -109,6 +118,7 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
         "to": recipient,
         "value": "1 eth",
         "chain": "anvil",
+        "usd_value_hint": "1",
     })
     .to_string();
     let new_tx_path = VfsPath::parse("/wallets/alice/chains/anvil/outbox/new.tx").unwrap();
@@ -153,10 +163,10 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     let _: serde_json::Value =
         serde_json::from_slice(&policy_bytes).context("policy_check.json must be valid JSON")?;
 
-    // 8. Unlock the wallet, persist a synthetic reviewed intent, then write
-    // `confirm` to broadcast. The real CLI writes these artifacts after the
-    // browser/passkey review; the test bypasses UI but still exercises the
-    // fresh-review authorization gate.
+    // 8. Unlock the wallet, then write `confirm` to broadcast.
+    // The wallet's policy.toml has agent_autonomy=under_policy with
+    // generous limits, so value-moving actions within budget are
+    // auto-approved without Sealed Approval.
     daemon
         .keystore
         .unlock("alice", passphrase)
@@ -165,36 +175,7 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
         "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/confirm"
     ))
     .unwrap();
-    let review_intent = bloom_proto::CeremonyIntent::new(
-        "alice",
-        "Approve anvil Transaction",
-        bloom_proto::CeremonyIntentKind::EvmTransaction,
-    )
-    .subject(serde_json::json!({
-        "kind": "outbox_confirm",
-        "wallet": "alice",
-        "chain": "anvil",
-        "outbox_id": pending_id,
-    }));
-    let review_hash = review_intent.intent_hash();
-    let pending_outbox_dir = home_root
-        .join("outbox")
-        .join("alice")
-        .join("anvil")
-        .join("pending")
-        .join(&pending_id);
-    std::fs::write(
-        pending_outbox_dir.join("review_intent.json"),
-        serde_json::to_vec_pretty(&review_intent)?,
-    )?;
-    std::fs::write(
-        pending_outbox_dir.join("review_approved.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "schema": "bloom.review_approved.v1",
-            "intent_hash": review_hash,
-        }))?,
-    )?;
-    let confirm_body = format!("y\nreview_hash={review_hash}\n");
+    let confirm_body = "y\n";
     daemon
         .vfs
         .write(&confirm_path, confirm_body.as_bytes())
