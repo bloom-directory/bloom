@@ -2453,6 +2453,14 @@ mod approval_uv_tests {
         root: &std::path::Path,
         wallet: &str,
     ) -> ed25519_dalek::SigningKey {
+        wallet_with_software_credential_counter(root, wallet, 0)
+    }
+
+    fn wallet_with_software_credential_counter(
+        root: &std::path::Path,
+        wallet: &str,
+        counter: u32,
+    ) -> ed25519_dalek::SigningKey {
         let dir = root.join(wallet);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("kind"), "passkey\n").unwrap();
@@ -2468,7 +2476,7 @@ mod approval_uv_tests {
             "cred": {
                 "cred_id": Base64UrlSafeData::from(b"cred-uv-test".to_vec()),
                 "cred": cose,
-                "counter": 0,
+                "counter": counter,
                 "transports": null,
                 "user_verified": false,
                 "backup_eligible": false,
@@ -2492,6 +2500,15 @@ mod approval_uv_tests {
         unsigned: &UnsignedApproval,
         flags: u8,
     ) -> ApprovalSignature {
+        assertion_with_flags_and_counter(signing, unsigned, flags, 0)
+    }
+
+    fn assertion_with_flags_and_counter(
+        signing: &ed25519_dalek::SigningKey,
+        unsigned: &UnsignedApproval,
+        flags: u8,
+        counter: u32,
+    ) -> ApprovalSignature {
         let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
         let challenge = unsigned.challenge_hash().unwrap();
         let client_data = serde_json::json!({
@@ -2504,7 +2521,7 @@ mod approval_uv_tests {
         let mut auth_data = Vec::with_capacity(37);
         auth_data.extend_from_slice(&Sha256::digest(RP_ID.as_bytes()));
         auth_data.push(flags);
-        auth_data.extend_from_slice(&0u32.to_be_bytes());
+        auth_data.extend_from_slice(&counter.to_be_bytes());
         let mut signed = auth_data.clone();
         signed.extend_from_slice(&Sha256::digest(&client_data_bytes));
         let signature = signing.sign(&signed);
@@ -2603,6 +2620,37 @@ mod approval_uv_tests {
                 &unsigned,
                 &ApprovalSignature::WebAuthnAssertion(record),
             )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("finish_passkey_authentication"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn counter_incrementing_assertion_verifies_once_then_replay_rejected() {
+        // Hardware-key path: the authenticator reports a real signature counter
+        // (stored 5, assertion 6). The daemon verifier is the only place that
+        // persists counter updates — `sign_approval_with_passkey` must not,
+        // because the daemon re-verifies the same assertion and a pre-bumped
+        // stored counter reads as a cloned authenticator, denying every
+        // approval from counter-incrementing keys.
+        let td = tempfile::tempdir().unwrap();
+        let ks = crate::Keystore::new(td.path()).unwrap();
+        let signing = wallet_with_software_credential_counter(td.path(), "hw-wallet", 5);
+        let unsigned = unsigned_approval("hw-wallet", AssuranceLevel::Hardened);
+        let signature = assertion_with_flags_and_counter(&signing, &unsigned, UP | UV, 6);
+        ks.verify_approval_signature_with_passkey(&unsigned, &signature)
+            .await
+            .unwrap();
+
+        // The daemon persisted the bump: replaying the identical assertion now
+        // fails the clone check (counter 6 is no longer greater than stored 6).
+        let stored = std::fs::read_to_string(td.path().join("hw-wallet/passkey.json")).unwrap();
+        assert!(stored.contains("\"counter\":6"), "{stored}");
+        let err = ks
+            .verify_approval_signature_with_passkey(&unsigned, &signature)
             .await
             .unwrap_err();
         assert!(

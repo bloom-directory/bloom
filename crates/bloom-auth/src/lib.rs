@@ -171,6 +171,7 @@ impl AuthStore {
                 assurance TEXT NOT NULL,
                 nonce TEXT,
                 nonce_state TEXT NOT NULL DEFAULT 'unused',
+                challenge_expiry_ms INTEGER,
                 reservation_id TEXT,
                 updated_ms INTEGER NOT NULL,
                 PRIMARY KEY(surface, entry_id)
@@ -319,7 +320,7 @@ impl AuthStore {
             .ok_or_else(|| AuthStoreError::Denied("entry is not challengeable".into()))?;
         tx.execute(
             "UPDATE auth_entries
-             SET state = ?3, nonce = ?4, nonce_state = ?5, updated_ms = ?6
+             SET state = ?3, nonce = ?4, nonce_state = ?5, challenge_expiry_ms = ?6, updated_ms = ?7
              WHERE surface = ?1 AND entry_id = ?2 AND nonce_state = 'unused'",
             params![
                 surface,
@@ -327,6 +328,7 @@ impl AuthStore {
                 AuthEntryState::Challenged.as_str(),
                 server_nonce,
                 NonceState::Unused.as_str(),
+                expiry_ms as i64,
                 now_ms as i64,
             ],
         )?;
@@ -569,17 +571,27 @@ impl AuthStore {
         now_ms: u64,
     ) -> Result<(), AuthStoreError> {
         let tx = self.conn.transaction()?;
-        let (entry_intent_hash, entry_assurance, entry_nonce, nonce_state): (
+        let (entry_intent_hash, entry_assurance, entry_nonce, nonce_state, challenge_expiry_ms): (
             String,
             String,
             Option<String>,
             String,
+            Option<i64>,
         ) = tx
             .query_row(
-                "SELECT intent_hash, assurance, nonce, nonce_state FROM auth_entries
+                "SELECT intent_hash, assurance, nonce, nonce_state, challenge_expiry_ms
+                 FROM auth_entries
                  WHERE surface = ?1 AND entry_id = ?2",
                 params![approval.surface, approval.entry_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or_else(|| AuthStoreError::Denied("entry not found".into()))?;
@@ -595,6 +607,15 @@ impl AuthStore {
         if parse_nonce_state(&nonce_state)? != NonceState::Unused {
             return Err(AuthStoreError::Denied(
                 "server_nonce already consumed".into(),
+            ));
+        }
+        // The TTL is daemon-issued, not client-attested: the approval must carry
+        // exactly the expiry that was persisted when the challenge was minted,
+        // otherwise a compromised client could inflate the window and bank a
+        // signed approval for later execution.
+        if challenge_expiry_ms != Some(approval.expiry_ms as i64) {
+            return Err(AuthStoreError::Denied(
+                "approval expiry does not match issued challenge".into(),
             ));
         }
         let (envelope_json, sealed_at_ms): (String, i64) = tx.query_row(
@@ -1251,7 +1272,9 @@ mod tests {
             assurance: entry.assurance,
             server_nonce: entry.nonce.clone().unwrap(),
             caps: ApprovalCaps::default(),
-            expiry_ms: 500,
+            // Matches the expiry every test issues its challenge with; consume
+            // requires equality with the persisted challenge_expiry_ms.
+            expiry_ms: 220,
             signer_kind: SignerKind::Password,
             credential_id: None,
             review_session_id: None,
@@ -1374,6 +1397,37 @@ mod tests {
         assert_eq!(prev_digest, "0".repeat(64));
         assert_eq!(digest.len(), 64);
         assert_ne!(digest, "0".repeat(64));
+    }
+
+    #[test]
+    fn inflated_expiry_approval_is_denied_and_does_not_burn_nonce() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        let env = envelope();
+        store
+            .stage_entry(&env, AssuranceLevel::Convenience, 100)
+            .unwrap();
+        store
+            .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
+            .unwrap();
+        let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
+        let sealed = store.sealed_intent(&entry.intent_hash).unwrap().unwrap();
+        let mut approval = approval_for(&entry, &sealed);
+        // A compromised client extends the window it signs over; the daemon
+        // must hold it to the expiry persisted at challenge issuance.
+        approval.expiry_ms = u64::MAX;
+
+        let err = store
+            .consume_verified_approval_transactionally(&approval, 150)
+            .unwrap_err();
+        assert!(err.to_string().contains("issued challenge"), "{err}");
+        let still_unused = store.auth_entry("requests", "req_1").unwrap().unwrap();
+        assert_eq!(still_unused.nonce_state, NonceState::Unused);
+
+        // The honest approval (matching issued expiry) still consumes.
+        let approval = approval_for(&entry, &sealed);
+        store
+            .consume_verified_approval_transactionally(&approval, 150)
+            .unwrap();
     }
 
     #[test]
