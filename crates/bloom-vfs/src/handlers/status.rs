@@ -5,7 +5,6 @@
 //! - `status/version`                            — daemon version (text)
 //! - `status/uptime`                             — `Ns\n` or `HH:MM:SS\n`
 //! - `status/started_at`                         — RFC3339 timestamp
-//! - `status/home`                               — absolute home dir path
 //! - `status/daemon.json`                        — combined summary
 //! - `status/chains/`                            — list of chain names
 //! - `status/chains/<chain>/chain_id`            — numeric chain id
@@ -18,7 +17,6 @@
 //!     `success_rate`, `last_block`
 //! - `status/audit/head`                         — hex of head record digest
 //! - `status/audit/count`                        — total entries (decimal)
-//! - `status/audit/last`                         — JSON of the most recent N=10 entries
 //! - `status/cache/etherscan_entries`            — count of cached etherscan files
 //! - `status/cache/prices_entries`               — count of cached price responses
 //! - `status/policies/block_mainnet_broadcast`   — `true`/`false`
@@ -52,9 +50,6 @@ use crate::path::VfsPath;
 /// Tunables for status reads.
 const PING_TIMEOUT: Duration = Duration::from_millis(750);
 const CHAIN_CACHE_TTL: Duration = Duration::from_secs(2);
-/// Cap on how many recent audit entries `status/audit/last` returns.
-const AUDIT_LAST_N: usize = 10;
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MempoolBackendStatus {
     pub provider: String,
@@ -290,23 +285,44 @@ impl StatusHandler {
     }
 
     fn redact_url(raw: &str) -> String {
-        // Strip api keys appearing as the final URL path segment or as
-        // common query params. Best-effort; on parse failure we return
-        // the original.
+        // Strip api keys appearing in URL userinfo, as the final URL path
+        // segment, or as common query params. Best-effort; on parse failure we
+        // return the original.
         let mut redacted = match url::Url::parse(raw) {
             Ok(u) => u,
             Err(_) => return raw.to_string(),
         };
+        if !redacted.username().is_empty() {
+            let _ = redacted.set_username("***");
+        }
+        if redacted.password().is_some() {
+            let _ = redacted.set_password(Some("***"));
+        }
         // Redact suspicious query params.
         let q: Vec<(String, String)> = redacted
             .query_pairs()
             .map(|(k, v)| {
                 let lower = k.to_ascii_lowercase();
-                let val = if matches!(
+                let secret_like = matches!(
                     lower.as_str(),
-                    "apikey" | "api_key" | "key" | "token" | "access_token"
-                ) && !v.is_empty()
-                {
+                    "apikey"
+                        | "api_key"
+                        | "key"
+                        | "token"
+                        | "access_token"
+                        | "auth"
+                        | "authorization"
+                        | "password"
+                        | "passwd"
+                        | "pwd"
+                        | "signature"
+                        | "sig"
+                ) || lower.ends_with("_key")
+                    || lower.ends_with("-key")
+                    || lower.contains("token")
+                    || lower.contains("secret")
+                    || lower.contains("signature");
+                let val = if secret_like && !v.is_empty() {
                     "***".to_string()
                 } else {
                     v.into_owned()
@@ -433,7 +449,6 @@ struct DaemonInfo {
     started_unix_ms: u128,
     started_at: String,
     uptime_secs: u64,
-    home: String,
     chains: Vec<String>,
 }
 
@@ -472,12 +487,7 @@ impl StatusHandler {
     async fn lookup_inner(&self, path: &VfsPath) -> Result<Entry, HandlerError> {
         match path.segments() {
             [] => Ok(Entry::dir("")),
-            [s] if s == "daemon.json"
-                || s == "version"
-                || s == "uptime"
-                || s == "started_at"
-                || s == "home" =>
-            {
+            [s] if s == "daemon.json" || s == "version" || s == "uptime" || s == "started_at" => {
                 Ok(Entry::file(s))
             }
             [s] if s == "chains"
@@ -550,7 +560,7 @@ impl StatusHandler {
                     Err(HandlerError::not_found(path.to_string_path()))
                 }
             }
-            [a, leaf] if a == "audit" && matches!(leaf.as_str(), "head" | "count" | "last") => {
+            [a, leaf] if a == "audit" && matches!(leaf.as_str(), "head" | "count") => {
                 Ok(Entry::file(leaf))
             }
             [a, leaf]
@@ -589,14 +599,12 @@ impl StatusHandler {
             [s] if s == "version" => Ok(format!("{}\n", self.version).into_bytes()),
             [s] if s == "uptime" => Ok(format!("{}\n", self.uptime_string()).into_bytes()),
             [s] if s == "started_at" => Ok(format!("{}\n", self.started_at_rfc3339()).into_bytes()),
-            [s] if s == "home" => Ok(format!("{}\n", self.home.display()).into_bytes()),
             [s] if s == "daemon.json" => {
                 let info = DaemonInfo {
                     version: self.version.clone(),
                     started_unix_ms: self.started_unix_ms(),
                     started_at: self.started_at_rfc3339(),
                     uptime_secs: self.uptime_secs(),
-                    home: self.home.display().to_string(),
                     chains: self.chains.list_names(),
                 };
                 Ok(serde_json::to_vec_pretty(&info).unwrap())
@@ -677,13 +685,6 @@ impl StatusHandler {
                     .map_err(|e| HandlerError::backend(e.to_string()))?;
                 Ok(format!("{}\n", n).into_bytes())
             }
-            [a, leaf] if a == "audit" && leaf == "last" => {
-                let recs = self
-                    .audit
-                    .tail(AUDIT_LAST_N)
-                    .map_err(|e| HandlerError::backend(e.to_string()))?;
-                Ok(serde_json::to_vec_pretty(&recs).unwrap())
-            }
             [a, leaf] if a == "cache" && leaf == "etherscan_entries" => {
                 Ok(format!("{}\n", self.etherscan_entries()).into_bytes())
             }
@@ -758,7 +759,6 @@ impl StatusHandler {
                 Entry::file("version"),
                 Entry::file("uptime"),
                 Entry::file("started_at"),
-                Entry::file("home"),
                 Entry::dir("chains"),
                 Entry::dir("audit"),
                 Entry::dir("cache"),
@@ -815,11 +815,7 @@ impl StatusHandler {
                     Entry::file("last_block"),
                 ])
             }
-            [a] if a == "audit" => Ok(vec![
-                Entry::file("head"),
-                Entry::file("count"),
-                Entry::file("last"),
-            ]),
+            [a] if a == "audit" => Ok(vec![Entry::file("head"), Entry::file("count")]),
             [a] if a == "cache" => Ok(vec![
                 Entry::file("etherscan_entries"),
                 Entry::file("prices_entries"),
@@ -859,9 +855,8 @@ impl StatusHandler {
     fn cache_ttl_inner(&self, path: &VfsPath) -> Option<Duration> {
         let segs = path.segments();
         match segs.first().map(|s| s.as_str()) {
-            // `audit/last` walks the file but is otherwise pure I/O;
-            // we don't want to cache it because users tail it for live
-            // events. Same for `audit/head`/`count` — keep them live.
+            // Keep audit counters live; raw audit records are intentionally
+            // not exposed through the mounted status VFS.
             Some("audit") => None,
             // Chain probes hit RPC; the handler also has its own
             // 2s probe cache, but caching at the router avoids even
@@ -870,7 +865,7 @@ impl StatusHandler {
             // Filesystem counts. Cheap, but cap polling.
             Some("cache" | "wallets" | "outbox") => Some(Duration::from_secs(5)),
             // Daemon-static fields.
-            Some("version" | "started_at" | "home") => Some(Duration::from_secs(86_400)),
+            Some("version" | "started_at") => Some(Duration::from_secs(86_400)),
             Some("uptime" | "daemon.json") => Some(Duration::from_secs(2)),
             Some("policies") => Some(Duration::from_secs(60)),
             // `backends/*` is mostly static config (per-feature backend
@@ -1037,7 +1032,6 @@ mod tests {
             "version",
             "uptime",
             "started_at",
-            "home",
             "chains",
             "audit",
             "cache",
@@ -1048,6 +1042,26 @@ mod tests {
         ] {
             assert!(names.contains(&required), "missing top-level: {required}");
         }
+    }
+
+    #[tokio::test]
+    async fn status_does_not_expose_home_or_raw_audit_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = make_handler(dir.path());
+
+        assert!(h.read(&VfsPath::parse("home").unwrap()).await.is_err());
+        assert!(
+            h.read(&VfsPath::parse("audit/last").unwrap())
+                .await
+                .is_err()
+        );
+
+        let daemon = h
+            .read(&VfsPath::parse("daemon.json").unwrap())
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&daemon).unwrap();
+        assert!(value.get("home").is_none());
     }
 
     #[tokio::test]
@@ -1197,6 +1211,22 @@ mod tests {
 
         let red2 = StatusHandler::redact_url("https://api.example.com/api?apikey=topsecret123");
         assert!(!red2.contains("topsecret123"), "got: {red2}");
+    }
+
+    #[test]
+    fn redacts_url_userinfo_and_secret_query_params() {
+        let red = StatusHandler::redact_url(
+            "https://rpc_user:rpc_password@rpc.example.com/path?auth=letmein&signature=abc123&chain=base",
+        );
+
+        assert!(!red.contains("rpc_user"), "got: {red}");
+        assert!(!red.contains("rpc_password"), "got: {red}");
+        assert!(!red.contains("letmein"), "got: {red}");
+        assert!(!red.contains("abc123"), "got: {red}");
+        assert!(red.contains("***:***@"), "got: {red}");
+        assert!(red.contains("auth=***"), "got: {red}");
+        assert!(red.contains("signature=***"), "got: {red}");
+        assert!(red.contains("chain=base"), "got: {red}");
     }
 
     #[tokio::test]
