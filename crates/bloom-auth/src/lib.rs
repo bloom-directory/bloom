@@ -242,7 +242,8 @@ impl AuthStore {
                 action_id TEXT NOT NULL,
                 wallet TEXT NOT NULL,
                 created_ms INTEGER NOT NULL,
-                PRIMARY KEY(surface, venue_local_id)
+                PRIMARY KEY(surface, venue_local_id),
+                UNIQUE(action_id)
             );
             "#,
         )?;
@@ -251,6 +252,14 @@ impl AuthStore {
 
     /// Allocate a globally-unique `action_id` and record the
     /// `(surface, venue_local_id) → action_id` mapping so it survives restart.
+    ///
+    /// The id is derived deterministically from `(surface, venue_local_id)`
+    /// (see [`derive_action_id`]), so re-allocating the same pair is idempotent
+    /// and two distinct pairs can never collide — including when they are staged
+    /// in the same millisecond. `now_ms` is recorded as `created_ms` only; it is
+    /// never part of the id. (An earlier `surface-<now_ms>` format collided for
+    /// two same-surface actions staged in one millisecond, since the whole id
+    /// derived from the clock and the table had no `action_id` uniqueness guard.)
     pub fn allocate_action_id(
         &mut self,
         surface: &str,
@@ -269,19 +278,29 @@ impl AuthStore {
         if let Some(id) = existing {
             return Ok(id);
         }
-        let action_id = format!(
-            "{}-{:08x}-{:05}",
-            surface,
-            now_ms,
-            (now_ms % 100_000) as u32
-        );
+        let action_id = derive_action_id(surface, venue_local_id);
         tx.execute(
             "INSERT OR IGNORE INTO action_id_map(surface, venue_local_id, action_id, wallet, created_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![surface, venue_local_id, &action_id, wallet, now_ms as i64],
         )?;
+        // Return the authoritative persisted id. A `None` read-back means the
+        // row was not written — i.e. the derived id hit the `UNIQUE(action_id)`
+        // guard against a *different* pair (a 128-bit BLAKE3 collision) — so we
+        // fail closed rather than hand back an id that maps somewhere else.
+        let persisted: Option<String> = tx
+            .query_row(
+                "SELECT action_id FROM action_id_map WHERE surface = ?1 AND venue_local_id = ?2",
+                params![surface, venue_local_id],
+                |row| row.get(0),
+            )
+            .ok();
         tx.commit()?;
-        Ok(action_id)
+        persisted.ok_or_else(|| {
+            AuthStoreError::Denied(format!(
+                "action_id collision for {surface}/{venue_local_id}"
+            ))
+        })
     }
 
     /// Look up the central `action_id` for a `(surface, venue_local_id)` pair.
@@ -1285,6 +1304,22 @@ fn parse_signer_kind(value: &str) -> Result<SignerKind, AuthStoreError> {
     }
 }
 
+/// Derive a globally-unique, path-safe `action_id` from the
+/// `(surface, venue_local_id)` pair. Deterministic (so re-allocation is
+/// idempotent) and injective across distinct pairs modulo a 128-bit BLAKE3
+/// collision. The `surface` prefix keeps ids human-readable in the outbox; the
+/// hash covers `surface` and `venue_local_id` with a separator so no two
+/// distinct pairs alias.
+fn derive_action_id(surface: &str, venue_local_id: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.action_id.v1");
+    hasher.update(surface.as_bytes());
+    hasher.update(&[0x1f]);
+    hasher.update(venue_local_id.as_bytes());
+    let hex = hasher.finalize().to_hex().to_string();
+    format!("{surface}-{}", &hex[..32])
+}
+
 fn audit_digest(prev_digest: &str, event: &str, record_json: &str, created_ms: u64) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bloom.auth.audit.v1");
@@ -1908,5 +1943,42 @@ mod tests {
             .allocate_action_id("outbox", "0002-b", "alice", 3_000)
             .unwrap();
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn same_millisecond_actions_get_distinct_action_ids() {
+        // Regression: an earlier `surface-<now_ms>` id collided for two actions
+        // staged in the same millisecond on the same surface (the whole id came
+        // from the clock and the table had no `action_id` uniqueness guard),
+        // corrupting the shared central-outbox slot. Ids now derive from
+        // `(surface, venue_local_id)`, so a shared timestamp is irrelevant.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("auth.sqlite");
+        let mut store = AuthStore::open(&db_path).unwrap();
+        let now = 1_720_000_000_000;
+
+        let a = store
+            .allocate_action_id("evm", "0001-a", "alice", now)
+            .unwrap();
+        let b = store
+            .allocate_action_id("evm", "0002-b", "alice", now)
+            .unwrap();
+        assert_ne!(a, b, "same-ms distinct actions must not share an action_id");
+
+        // Same pair at the same instant is still idempotent.
+        let a_again = store
+            .allocate_action_id("evm", "0001-a", "alice", now)
+            .unwrap();
+        assert_eq!(a, a_again);
+
+        // Both rows persisted and each resolves back to its own id.
+        assert_eq!(
+            store.lookup_action_id("evm", "0001-a").unwrap().as_deref(),
+            Some(a.as_str())
+        );
+        assert_eq!(
+            store.lookup_action_id("evm", "0002-b").unwrap().as_deref(),
+            Some(b.as_str())
+        );
     }
 }
