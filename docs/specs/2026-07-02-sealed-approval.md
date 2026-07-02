@@ -244,7 +244,9 @@ At stage time the daemon must:
 1. parse and validate the requested action;
 2. construct a canonical intent;
 3. persist it in daemon-controlled storage;
-4. compute `intent_hash` over canonical bytes;
+4. compute `intent_hash = BLAKE3("bloom.intent.v1" || canonical_bytes)`, encoded
+   as lowercase, full-length, untruncated hex. The `bloom.intent.v1` domain tag
+   MUST be bumped whenever the canonical schema changes;
 5. expose only projections of that sealed action through VFS paths.
 
 Once sealed, canonical bytes are immutable. A venue path cannot mutate the
@@ -458,7 +460,9 @@ SealedAction {
 ```
 
 `intent_hash` is the content address of the canonical representation consumed
-by the Petal.
+by the Petal: `BLAKE3("bloom.intent.v1" || canonical_bytes)`, lowercase
+full-length hex (see §5.2). It is distinct from the WebAuthn challenge hash,
+which uses the `bloom.approval.v1` domain tag (§5.7).
 
 Field meanings:
 
@@ -687,8 +691,10 @@ challenge and ceremony are required before wallet-key signing can resume.
   latest -> pending/<action_id>
 ```
 
-`latest` resolves to the most recently staged pending action (by modification
-time). If no actions are pending, `latest` is absent. It is an ergonomic
+`latest` resolves to the most recently staged pending action, determined by the
+modification time of `intent.json` (which is immutable after staging per §5.2,
+so later artefact writes like `approval.json` do not affect ordering). If no
+actions are pending, `latest` is absent. It is an ergonomic
 shortcut, not an authorization primitive — approvals must bind concrete
 `action_id` values and must never bind `latest` (§5.7).
 

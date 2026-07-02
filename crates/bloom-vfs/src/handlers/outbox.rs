@@ -152,7 +152,8 @@ impl Handler for OutboxHandler {
                     .map_err(|e| HandlerError::backend(e.to_string()))?
                     .filter_map(|e| e.ok())
                     .filter_map(|e| {
-                        e.metadata()
+                        let intent = e.path().join("intent.json");
+                        std::fs::metadata(&intent)
                             .and_then(|m| m.modified())
                             .ok()
                             .map(|mtime| (mtime, e.file_name()))
@@ -361,6 +362,26 @@ mod tests {
 
         let entry = h.lookup(&VfsPath::parse("latest").unwrap()).await.unwrap();
         assert_eq!(entry.name, "act-new");
+    }
+
+    #[tokio::test]
+    async fn latest_ignores_later_artefact_writes() {
+        let h = handler();
+        h.outbox.stage("act-old", b"{}", "h1", "p1", b"[]").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        h.outbox.stage("act-new", b"{}", "h2", "p2", b"[]").unwrap();
+
+        // Simulate writing an approval into the older action — this must
+        // NOT bump its position in the latest ordering, because latest
+        // tracks staging time, not modification time.
+        let approval_dir = h.outbox.action_dir("pending", "act-old");
+        std::fs::write(approval_dir.join("approval.json"), b"{}").unwrap();
+
+        let entry = h.lookup(&VfsPath::parse("latest").unwrap()).await.unwrap();
+        assert_eq!(
+            entry.name, "act-new",
+            "latest must reflect staging order, not artefact-write order"
+        );
     }
 
     #[tokio::test]
