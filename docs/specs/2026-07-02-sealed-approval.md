@@ -73,6 +73,21 @@ or source digest recorded by the daemon. It must still be present in sealed
 intent and grant records so the model is compatible with dynamically loaded
 WASM Petals.
 
+MVP first-party digests may be hardcoded placeholders only while first-party
+Petals are still built into the daemon. Placeholder constants must be named and
+documented as temporary non-attestation values in code, for example:
+
+```text
+first-party-placeholder:evm-wallet:v0
+first-party-placeholder:paid-http:v0
+```
+
+Every placeholder must carry a TODO stating that it is not a real tamper
+evidence boundary and must be replaced by reproducible build/source digests
+before untrusted or dynamically loaded Petals can receive signing grants.
+Audit/status output must label placeholder digests as placeholders so operators
+do not mistake them for code attestation.
+
 **Assurance**  
 Approval assurance is one of:
 
@@ -86,10 +101,31 @@ expand authority, and any configured high-value threshold require `hardened`.
 Assurance describes the strength of a fresh user approval ceremony. It does not
 mean every agent action requires a passkey prompt. Agents may perform actions
 without a new passkey ceremony when the daemon can authorize them entirely under
-already-sealed policy, frozen session caps, standing venue credentials, or other
-bounded authority that was previously minted by Sealed Approval. If an action
-needs new wallet-key signing authority or exceeds policy/session limits, it must
-stage a sealed action and obtain the required approval assurance.
+signed policy plus active bounded authority that was previously minted by
+Sealed Approval. If an action needs new wallet-key signing authority, lacks an
+active session/capability, or exceeds policy/session limits, it must stage a
+sealed action and obtain the required approval assurance.
+
+**Autonomy**
+Autonomy is not a wallet kind. It is derived authority for a passkey wallet:
+signed `policy.toml` defines what may run without a fresh ceremony, and live
+session/capability state provides the actual signing or venue authority. A
+passkey wallet remains the root authority for policy changes, re-keying, and
+minting or expanding autonomous capability.
+
+For example, an x402 request that spends `$0.01` may execute without a fresh
+passkey ceremony when all of these are true:
+
+1. signed wallet policy enables autonomy for that surface/action;
+2. the action fits global wallet limits and the Petal-specific policy snapshot;
+3. the cross-Bloom budget ledger has remaining reserved+spent capacity;
+4. the daemon has an active bounded signing/session capability for the wallet;
+5. the action does not change authority or expand policy.
+
+Policy alone does not decrypt a passkey wallet after cold start. If no active
+owner-signing session, delegated credential, service credential, or other
+bounded capability can authorize the action, Bloom must request fresh Sealed
+Approval even for a low-value action.
 
 **Signed approval**  
 The `approval.json` record written for an action. It contains no secret key
@@ -590,8 +626,8 @@ grant persistence = never
 ```
 
 `expiry_ms` must be less than or equal to the signed approval expiry. On grant
-consume, expiry, revoke, sleep/lock-screen event, daemon shutdown, or Petal
-failure, any decrypted wallet key material held for that grant must be zeroized.
+consume, expiry, revoke, daemon shutdown, or Petal failure, any decrypted wallet
+key material held for that grant must be zeroized.
 Concurrent grants are allowed only if they bind different `action_id` values;
 there must be at most one live grant per `(wallet, action_id, petal_id,
 petal_digest)`.
@@ -618,7 +654,7 @@ Field meanings:
 - `max_signatures`: total wallet signatures allowed under this grant.
 - `consumed_signature_count`: number of signatures already produced.
 - `revoked`: in-memory kill switch set by failure, expiry handling, explicit
-  revoke, lock-screen/sleep, or daemon shutdown.
+  revoke, or daemon shutdown.
 
 The grant does not need `require_attestation`: `sign-hash` always requires a
 structured attestation in this model, including for actions that are "only"
@@ -728,10 +764,10 @@ action.
 
 No onchain enforcement is implied for owner-signing sessions. The security
 boundary is local daemon enforcement plus frozen caps and audit. If the daemon
-restarts, sleeps, locks, crashes, or loses the in-memory signer, the session
-becomes unusable or orphaned and requires a fresh Sealed Approval ceremony to
-resume. The owner key, wallet DEK, PRF output, and grants must never be written
-to disk to preserve the session.
+restarts, crashes, or loses the in-memory signer, the session becomes unusable
+or orphaned and requires a fresh Sealed Approval ceremony to resume. The owner
+key, wallet DEK, PRF output, and grants must never be written to disk to
+preserve the session.
 
 All standing sessions must be:
 
@@ -751,6 +787,12 @@ monitor failures. High-cap sessions should fail safe by halting new actions and
 attempting risk-reducing cleanup. If a session is intentionally fail-stale, its
 status must surface `stale_since_ms` and the central audit must record the
 staleness.
+
+Revoking owner-signing sessions on OS sleep, wake, and lock-screen events is
+future hardening work, not an MVP requirement. Until platform-specific event
+hooks are implemented, the MVP must still revoke or orphan sessions on daemon
+restart/crash, explicit revoke, expiry, budget exhaustion, and loss of
+in-memory signing material.
 
 ## 8. Petal Signing Host API
 
@@ -1040,6 +1082,187 @@ The standing-authority invariant remains:
 > reach the mount: bounded in amount, constrained in destination/asset/surface,
 > and limited to risk-reducing operations where applicable.
 
+### 9.1 Cross-Bloom Autonomy Policy
+
+Wallet policy must support cross-Bloom autonomy limits that apply before
+surface-specific policy. This is how a wallet can allow low-value x402,
+payment, EVM transfer, DeFi, or venue actions without requiring a fresh passkey
+ceremony per action.
+
+Example target policy:
+
+```toml
+[autonomy]
+enabled = true
+max_tx_usd = "0.05"
+max_day_usd = "5.00"
+max_week_usd = "25.00"
+require_passkey_above_usd = "5.00"
+
+[autonomy.assets]
+allow = ["USDC"]
+deny = []
+
+[autonomy.destinations]
+allow = ["0xKnownAddress...", "x402:merchant.example"]
+deny = []
+
+[autonomy.surfaces]
+allow = ["requests", "wallets", "payments", "defi"]
+deny = []
+```
+
+Autonomy limits are global wallet limits. Surface/Petal policies may be more
+restrictive, but cannot widen the global autonomy policy. For example, a
+`$0.01` x402 request may skip fresh approval only if it fits `[autonomy]`,
+`[payments]`, merchant/destination rules, active session/capability scope, and
+budget state. The same daily cap must count spend across all Bloom surfaces,
+not just `/requests`.
+
+The target parsed shape is:
+
+```text
+AutonomyPolicy {
+  enabled,
+  max_tx_usd,
+  max_day_usd,
+  max_week_usd,
+  max_month_usd,
+  require_passkey_above_usd,
+  allowed_assets,
+  denied_assets,
+  allowed_destinations,
+  denied_destinations,
+  allowed_surfaces,
+  denied_surfaces,
+  allowed_action_kinds,
+  denied_action_kinds,
+}
+```
+
+Field meanings:
+
+- `enabled`: master gate. Defaults to false.
+- `max_tx_usd`, `max_day_usd`, `max_week_usd`, `max_month_usd`: global
+  cross-surface caps parsed as integer micro-USD.
+- `require_passkey_above_usd`: fresh approval threshold even when caps remain.
+- `allowed_assets`/`denied_assets`: asset allow/deny sets; deny wins.
+- `allowed_destinations`/`denied_destinations`: address, merchant, or venue
+  destination sets; deny wins.
+- `allowed_surfaces`/`denied_surfaces`: Bloom surfaces where autonomy may be
+  used.
+- `allowed_action_kinds`/`denied_action_kinds`: normalized action classes that
+  may or may not run autonomously.
+
+Autonomy is evaluated before Petal-specific signing. If it denies, no session
+or Petal policy can override it. If it passes, the action still needs active
+bounded authority: an owner-signing session, delegated session credential,
+service credential, or other Sealed-Approval-minted capability.
+
+### 9.2 Session Records and Budget Ledger
+
+The implementation must model standing authority explicitly rather than hiding
+it in an unlocked signer cache.
+
+Target durable and in-memory records:
+
+```text
+StandingSession {
+  session_id,
+  wallet,
+  session_kind,        // delegated_credential | owner_signing | service_auth
+  surface,
+  petal_id,
+  petal_digest,
+  policy_version,
+  scope,
+  budget_ledger_id,
+  status,              // active | expired | revoked | orphaned | halted | stale
+  created_ms,
+  expires_ms,
+  revoked_ms,
+  orphaned_ms,
+  last_error,
+}
+
+SessionScope {
+  networks,
+  assets,
+  destinations,
+  action_kinds,
+  methods,
+  max_tx_usd,
+  max_day_usd,
+  max_week_usd,
+  max_month_usd,
+  max_fee_policy,
+  extra,
+}
+
+SessionBudgetLedger {
+  ledger_id,
+  wallet,
+  session_id,
+  window,
+  reserved_micro_usd,
+  spent_micro_usd,
+  released_micro_usd,
+  updated_ms,
+}
+
+SessionUseRequest {
+  request_id,
+  session_id,
+  wallet,
+  surface,
+  petal_id,
+  action_kind,
+  amount_micro_usd,
+  asset,
+  destination,
+  canonical_subject_hash,
+  attestation,
+  created_ms,
+}
+
+SessionUseReceipt {
+  request_id,
+  session_id,
+  reservation_id,
+  status,              // reserved | signed | broadcast | confirmed | failed | released
+  tx_hash,
+  spent_micro_usd,
+  error,
+  updated_ms,
+}
+```
+
+Budget accounting must be transactional. Before signing or dispatch, the daemon
+must acquire the relevant session/wallet lock, validate scope, and reserve the
+amount. Caps count `reserved + spent`, not only confirmed spend, so concurrent
+agent writes cannot overspend a daily cap. Failed, rejected, or expired attempts
+release their reservation; confirmed results move reserved amount to spent.
+Receipt reconciliation must handle retry, replacement, dropped transaction,
+failed transaction, and chain reorg behavior conservatively. If reconciliation
+is unavailable and a cap depends on it, fail closed or halt the session.
+
+Session status behavior:
+
+- `active`: may accept in-scope session-use requests.
+- `expired`: TTL elapsed; no new requests.
+- `revoked`: owner or daemon explicitly revoked.
+- `orphaned`: persistent metadata remains, but required in-memory signing
+  material or delegated secret is gone.
+- `halted`: risk, reconciliation, or policy breach stopped the session.
+- `stale`: monitor data is stale and this session type explicitly allows
+  fail-stale behavior; otherwise use `halted`.
+
+Agents must receive deterministic denial strings such as
+`session_orphaned_requires_reapproval`, `session_budget_exhausted`, and
+`session_scope_mismatch`. Reapproval stages a new sealed action, usually
+pre-filled with the prior session scope, and records the orphan/reapproval in
+central audit.
+
 ## 10. Local Wallet Removal and Migration
 
 Local/passphrase wallets are not part of the target product.
@@ -1105,6 +1328,29 @@ WebAuthn PRF output. Adding a passkey unwraps the DEK with an existing
 credential, registers the new credential, and writes a new `wrapped_dek`.
 Removing a passkey revokes or deletes only that credential's wrapper. Replacing
 the last passkey must require an explicit recovery/migration ceremony.
+
+Autonomy does not introduce an `autonomous` wallet kind. A wallet that supports
+autonomous agent execution is still `kind = "passkey"` at rest. Its derived
+authority lives in signed policy plus runtime/durable capability records:
+
+```text
+passkey wallet root authority:
+  credentials/<credential_id>/wrapped_dek
+  policy.toml
+  policy.toml.sig
+
+derived authority:
+  standing sessions
+  delegated credentials
+  service credentials
+  budget ledgers
+  audit records
+```
+
+Root authority operations, including policy expansion, re-keying, recovery, and
+minting or expanding sessions, require Sealed Approval. Derived authority may
+act without another ceremony only while it remains within signed policy, frozen
+session scope, and current budget state.
 
 ## 11. Required Codebase Gap Closures
 
@@ -1221,13 +1467,47 @@ This implementation must:
 
 - keep owner signing material in daemon memory only;
 - persist only non-secret session metadata, frozen caps, counters, and audit;
-- deny after daemon restart, sleep, lock, crash recovery, expiry, revoke, or
-  budget exhaustion;
+- deny after daemon restart, crash recovery, expiry, revoke, budget exhaustion,
+  or loss of in-memory signing material;
 - enforce exact token, recipient, chain, method, TTL, fee policy, and rolling
   daily cap before each signature;
 - audit every attempted and successful session use;
 - require a new Sealed Approval for any cap, recipient, token, chain, method, or
   TTL expansion.
+
+### 11.9 Implement Cross-Bloom Autonomy and Budgeting
+
+Implement `[autonomy]` wallet policy and a transactional cross-Bloom budget
+ledger. The policy must apply before Petal-specific policy and count spending
+across `/requests`, `/wallets`, `/payments`, `/defi`, Polymarket, Hyperliquid,
+and future Petals.
+
+This implementation must:
+
+- default autonomy to disabled;
+- parse USD caps as integer micro-USD;
+- enforce allow/deny sets for assets, destinations, surfaces, and action kinds;
+- require active bounded authority before any autonomous signature or dispatch;
+- reserve budget before signing and count `reserved + spent` against caps;
+- release reservations on failed/expired attempts;
+- reconcile confirmed receipts conservatively;
+- fail closed or halt the session when budget state or required reconciliation
+  state is unavailable.
+
+### 11.10 Document Placeholder Petal Digests
+
+Until first-party digest provenance is implemented, hardcode placeholder
+`petal_digest` values only behind explicit constants with TODO comments stating
+that they are temporary and not a real tamper-evidence boundary. Audit and
+status output must identify them as placeholders. Removing placeholder digests
+is required before enabling untrusted/dynamic Petals to receive signing grants.
+
+### 11.11 Future Work: OS Lock/Sleep Revocation
+
+Platform-specific revocation on OS sleep, wake, and lock-screen events is
+future hardening work. It is not required for the MVP. The MVP must still fail
+closed on daemon restart, crash recovery, explicit revoke, expiry, budget
+exhaustion, and loss of in-memory signing material.
 
 ## 12. Acceptance Criteria
 
@@ -1246,8 +1526,8 @@ The codebase fully implements this spec when:
 8. Grants are in-memory, short-lived, Petal-scoped, sealed-intent-scoped, and
    auditable.
 9. Owner-signing sessions are in-memory-only for owner key material, bounded by
-   frozen caps, revoked or orphaned on restart/sleep/lock, and audited on every
-   use.
+   frozen caps, revoked or orphaned on restart/crash/lost signer, and audited on
+   every use.
 10. First-party EVM, paid HTTP, DeFi, Polymarket, and Hyperliquid components are
    represented as Petals for authorization purposes.
 11. Venue directories are projections over central `/outbox` actions.
@@ -1276,9 +1556,21 @@ The codebase fully implements this spec when:
 23. Tests cover the EVM owner-signing session use case: one hardened approval
    mints a session that can send within a `100 USDC/day` configured cap to one
    configured recipient without another ceremony, while wrong token, wrong
-   recipient, wrong chain, over-budget, expired, restarted, locked, or revoked
+   recipient, wrong chain, over-budget, expired, restarted, orphaned, or revoked
    sessions deny.
-24. Tests document the remaining MVP trust boundary: the daemon validates
+24. Tests cover cross-Bloom autonomy: a low-value x402 request can execute
+   without fresh approval when signed policy, active bounded authority, and
+   global budget allow it; the same request denies when policy is disabled,
+   budget is exhausted, destination/asset/surface is blocked, or no active
+   authority exists.
+25. Tests cover budget reservation concurrency: `reserved + spent` prevents two
+   simultaneous autonomous actions from exceeding the daily cap.
+26. Tests cover deterministic session denial strings such as
+   `session_orphaned_requires_reapproval`, `session_budget_exhausted`, and
+   `session_scope_mismatch`.
+27. Tests assert first-party placeholder `petal_digest` values are labeled as
+   placeholders in audit/status output.
+28. Tests document the remaining MVP trust boundary: the daemon validates
    attestations against policy, but trusts approved Petals that attestations
    honestly describe `hash32`.
 
@@ -1292,11 +1584,13 @@ The codebase fully implements this spec when:
 4. Build central `/outbox` and projection plumbing.
 5. Convert one first-party Petal end to end, preferably wallet EVM tx confirm.
 6. Implement one-ceremony passkey assertion + PRF grant minting.
-7. Implement EVM owner-signing sessions for bounded agent transfers.
-8. Convert requests, DeFi, Polymarket, and Hyperliquid.
-9. Remove or hard-disable `bloom-chain` and `pipe` signers.
-10. Enforce hard/step-up policy taxonomy across all policy engines.
-11. Update user docs and examples to use Sealed Approval terminology.
+7. Implement placeholder first-party Petal identity constants with clear TODOs.
+8. Implement cross-Bloom autonomy policy and budget ledgers.
+9. Implement EVM owner-signing sessions for bounded agent transfers.
+10. Convert requests, DeFi, Polymarket, and Hyperliquid.
+11. Remove or hard-disable `bloom-chain` and `pipe` signers.
+12. Enforce hard/step-up policy taxonomy across all policy engines.
+13. Update user docs and examples to use Sealed Approval terminology.
 
 ## 14. Current Implementation Anchors
 
