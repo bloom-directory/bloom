@@ -426,12 +426,10 @@ impl RequestsHandler {
     }
 
     async fn stage_auth_entry(&self, subject: PaidHttpAuthSubject<'_>) -> Result<(), HandlerError> {
-        let Some(writer) = self.auth_services.writer() else {
-            return Ok(());
-        };
+        let writer = self.auth_services.require_writer()?;
         let envelope = paid_http_canonical_envelope(subject)?;
         let staged = writer
-            .stage_entry(envelope, AssuranceLevel::Convenience, now_ms())
+            .stage_entry(envelope, AssuranceLevel::Standard, now_ms())
             .await
             .map_err(|e| HandlerError::backend(format!("stage paid-http auth entry: {e}")))?;
         fs::write(
@@ -441,13 +439,16 @@ impl RequestsHandler {
         Ok(())
     }
 
-    async fn require_layer_b_confirm_approval(
+    async fn require_sealed_confirm_approval(
         &self,
         pending: &Path,
         id: &str,
     ) -> Result<(), HandlerError> {
         if !self.auth_services.is_wired() {
-            return Ok(());
+            return Err(HandlerError::Unsupported(
+                "Sealed Approval services are not fully wired; paid request confirmation is fail-closed"
+                    .into(),
+            ));
         }
         let approval_path = pending.join(APPROVAL_FILE);
         if approval_path.exists() {
@@ -456,16 +457,16 @@ impl RequestsHandler {
                 .require_approval_verifier()?
                 .verify_and_consume(approval, now_ms())
                 .await
-                .map_err(|e| HandlerError::invalid(format!("Layer B approval rejected: {e}")))?;
+                .map_err(|e| HandlerError::invalid(format!("Sealed Approval rejected: {e}")))?;
             return Ok(());
         }
 
-        let challenge = self.issue_layer_b_confirm_challenge(id).await?;
+        let challenge = self.issue_sealed_confirm_challenge(id).await?;
         write_json(pending.join(APPROVAL_CHALLENGE_FILE), &challenge)?;
         Err(HandlerError::PermissionDenied)
     }
 
-    async fn issue_layer_b_confirm_challenge(
+    async fn issue_sealed_confirm_challenge(
         &self,
         id: &str,
     ) -> Result<ChallengeRecord, HandlerError> {
@@ -513,11 +514,7 @@ impl RequestsHandler {
             .as_deref()
             .ok_or_else(|| HandlerError::backend("request.toml missing wallet"))?
             .to_string();
-        if self.auth_services.is_wired() {
-            self.require_layer_b_confirm_approval(&pending, id).await?;
-        } else {
-            consume_request_confirm_approved(&pending, &wallet, &value)?;
-        }
+        self.require_sealed_confirm_approval(&pending, id).await?;
         let host = request.url.host_str().unwrap_or("unknown").to_string();
         let mut challenge: NormalizedChallenge = read_json(pending.join("challenge.json"))?;
         validate_session_state_target(&challenge, id)?;
@@ -1610,7 +1607,8 @@ mod tests {
     use crate::path::VfsPath;
     use bloom_auth_api::{
         APPROVAL_SCHEMA_V1, ApprovalCaps, ApprovalSignature, ApprovalVerifier, AuthApiError,
-        AuthEntryRecord, AuthEntryState, AuthStoreWriter, NonceState, SignerKind,
+        AuthEntryRecord, AuthEntryState, AuthStoreView, AuthStoreWriter, NonceState,
+        SealedIntentRecord, SignerKind,
     };
     use bloom_paid_mpp::PaymentExecution;
     use bloom_paid_x402::X402PaymentCredential;
@@ -1654,6 +1652,37 @@ mod tests {
     }
 
     #[async_trait]
+    impl AuthStoreView for ChallengeOnlyWriter {
+        async fn sealed_intent(
+            &self,
+            intent_hash: &str,
+        ) -> Result<SealedIntentRecord, AuthApiError> {
+            let envelope = CanonicalEnvelope::new(
+                CanonicalIntentHeader {
+                    schema: "bloom.intent_header.v1".into(),
+                    wallet: "alice".into(),
+                    surface: "requests".into(),
+                    entry_id: "test".into(),
+                    executor_id: "paid-http".into(),
+                    network: "base".into(),
+                    account: "default".into(),
+                    action_kind: "x402_payment".into(),
+                    value_movement: true,
+                    authority_change: false,
+                },
+                "paid_http",
+                "paid_http.v1",
+                b"{}".to_vec(),
+            );
+            Ok(SealedIntentRecord {
+                intent_hash: intent_hash.to_string(),
+                envelope,
+                sealed_at_ms: now_ms(),
+            })
+        }
+    }
+
+    #[async_trait]
     impl AuthStoreWriter for ChallengeOnlyWriter {
         async fn stage_entry(
             &self,
@@ -1688,7 +1717,7 @@ mod tests {
                 entry_id: entry_id.to_string(),
                 intent_hash: "abc123".to_string(),
                 server_nonce: server_nonce.to_string(),
-                assurance: AssuranceLevel::Convenience,
+                assurance: AssuranceLevel::Standard,
                 expiry_ms,
             })
         }
@@ -1706,7 +1735,7 @@ mod tests {
                 surface: surface.to_string(),
                 entry_id: entry_id.to_string(),
                 intent_hash: "abc123".to_string(),
-                assurance: AssuranceLevel::Convenience,
+                assurance: AssuranceLevel::Standard,
                 expires_ms,
                 consumed_ms: None,
                 created_ms: now_ms,
@@ -2086,7 +2115,14 @@ mod tests {
             .keystore
             .write_policy("alice", toml::to_string_pretty(&policy).unwrap().as_bytes())
             .unwrap();
-        let auth_services = AuthServices::new(None, None, Some(Arc::new(ChallengeOnlyWriter)));
+        let auth_store = Arc::new(ChallengeOnlyWriter);
+        let auth_services = AuthServices::new(
+            Some(Arc::new(AcceptingVerifier {
+                calls: Arc::new(AtomicUsize::new(0)),
+            })),
+            Some(auth_store.clone()),
+            Some(auth_store),
+        );
         let handler = f
             .handler
             .with_auth_services(auth_services)
@@ -2141,12 +2177,13 @@ mod tests {
             .keystore
             .write_policy("alice", toml::to_string_pretty(&policy).unwrap().as_bytes())
             .unwrap();
+        let auth_store = Arc::new(ChallengeOnlyWriter);
         let auth_services = AuthServices::new(
             Some(Arc::new(AcceptingVerifier {
                 calls: verifier_calls.clone(),
             })),
-            None,
-            None,
+            Some(auth_store.clone()),
+            Some(auth_store),
         );
         let handler = f
             .handler
@@ -2185,7 +2222,7 @@ mod tests {
                 intent_hash: "abc123".into(),
                 executor_id: "paid-http".into(),
                 network: "base".into(),
-                assurance: AssuranceLevel::Convenience,
+                assurance: AssuranceLevel::Standard,
                 server_nonce: "nonce-1".into(),
                 caps: ApprovalCaps::default(),
                 expiry_ms: now_ms() + 60_000,

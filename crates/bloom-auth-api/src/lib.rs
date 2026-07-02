@@ -1,4 +1,4 @@
-//! Shared authorization API for Bloom Layer B.
+//! Shared authorization API for Bloom Sealed Approval.
 //!
 //! This crate intentionally contains only stable data types and traits. The
 //! concrete store, verifier, and signer integrations live outside the VFS-facing
@@ -18,14 +18,15 @@ pub const APPROVAL_CHALLENGE_DOMAIN: &[u8] = b"bloom.approval.v1";
 #[serde(rename_all = "snake_case")]
 pub enum AssuranceLevel {
     #[default]
-    Convenience,
+    #[serde(alias = "convenience")]
+    Standard,
     Hardened,
 }
 
 impl AssuranceLevel {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Convenience => "convenience",
+            Self::Standard => "standard",
             Self::Hardened => "hardened",
         }
     }
@@ -43,11 +44,8 @@ pub enum SignerKind {
 impl SignerKind {
     pub fn satisfies(self, assurance: AssuranceLevel) -> bool {
         match assurance {
-            AssuranceLevel::Convenience => {
-                matches!(
-                    self,
-                    SignerKind::Password | SignerKind::PasskeyBrowser | SignerKind::PasskeyCtap
-                )
+            AssuranceLevel::Standard => {
+                matches!(self, SignerKind::PasskeyBrowser | SignerKind::PasskeyCtap)
             }
             AssuranceLevel::Hardened => {
                 matches!(self, SignerKind::PasskeyBrowser | SignerKind::PasskeyCtap)
@@ -316,6 +314,74 @@ pub struct StandingAuthorityGrant {
     pub caps: ApprovalCaps,
     pub issued_ms: u64,
     pub expiry_ms: u64,
+    pub revoked_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PetalIdentity {
+    pub petal_id: String,
+    pub petal_digest: String,
+    pub petal_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedApprovalChallenge {
+    pub schema: String,
+    pub action_id: String,
+    pub wallet: String,
+    pub surface: String,
+    pub intent_hash: String,
+    pub petal: PetalIdentity,
+    pub server_nonce: String,
+    pub assurance: AssuranceLevel,
+    pub daemon_terms_digest: String,
+    pub petal_policy_digest: String,
+    pub policy_version: u64,
+    pub expiry_ms: u64,
+}
+
+impl SealedApprovalChallenge {
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, AuthApiError> {
+        serde_json::to_vec(self).map_err(AuthApiError::Json)
+    }
+
+    pub fn challenge_hash(&self) -> Result<[u8; 32], AuthApiError> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(APPROVAL_CHALLENGE_DOMAIN);
+        hasher.update(&self.canonical_bytes()?);
+        Ok(*hasher.finalize().as_bytes())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignerTransport {
+    BrowserWebauthn,
+    NativeCtap2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedSealedApproval {
+    pub schema: String,
+    pub challenge: SealedApprovalChallenge,
+    pub signer_transport: SignerTransport,
+    pub webauthn_assertion: WebAuthnAssertionRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedApprovalGrant {
+    pub grant_id: String,
+    pub action_id: String,
+    pub intent_hash: String,
+    pub wallet: String,
+    pub petal: PetalIdentity,
+    pub assurance: AssuranceLevel,
+    pub petal_policy_digest: String,
+    pub policy_version: u64,
+    pub issued_ms: u64,
+    pub expiry_ms: u64,
+    pub max_signatures: u32,
+    pub consumed_signatures: u32,
     pub revoked_ms: Option<u64>,
 }
 
@@ -739,7 +805,7 @@ mod tests {
             intent_hash: "0".repeat(64),
             executor_id: "evm".into(),
             network: "base".into(),
-            assurance: AssuranceLevel::Convenience,
+            assurance: AssuranceLevel::Standard,
             server_nonce: "nonce".into(),
             caps: ApprovalCaps::default(),
             expiry_ms: 42,
@@ -843,16 +909,24 @@ mod tests {
             envelope: env,
             sealed_at_ms: 1,
         };
-        approval_for(&sealed, AssuranceLevel::Convenience, SignerKind::Password)
-            .validate_against_sealed(&sealed, 100)
-            .unwrap();
+        approval_for(
+            &sealed,
+            AssuranceLevel::Standard,
+            SignerKind::PasskeyBrowser,
+        )
+        .validate_against_sealed(&sealed, 100)
+        .unwrap();
 
         let err = approval_for(&sealed, AssuranceLevel::Hardened, SignerKind::Password)
             .validate_against_sealed(&sealed, 100)
             .unwrap_err();
         assert!(err.to_string().contains("does not satisfy"), "{err}");
 
-        let mut wrong = approval_for(&sealed, AssuranceLevel::Convenience, SignerKind::Password);
+        let mut wrong = approval_for(
+            &sealed,
+            AssuranceLevel::Standard,
+            SignerKind::PasskeyBrowser,
+        );
         wrong.network = "wrong".into();
         let err = wrong.validate_against_sealed(&sealed, 100).unwrap_err();
         assert!(err.to_string().contains("network mismatch"), "{err}");
@@ -866,18 +940,23 @@ mod tests {
             envelope: env,
             sealed_at_ms: 1,
         };
-        let err = approval_for(&sealed, AssuranceLevel::Convenience, SignerKind::Password)
-            .validate_against_sealed(&sealed, 200)
-            .unwrap_err();
+        let err = approval_for(
+            &sealed,
+            AssuranceLevel::Standard,
+            SignerKind::PasskeyBrowser,
+        )
+        .validate_against_sealed(&sealed, 200)
+        .unwrap_err();
         assert!(err.to_string().contains("expired"), "{err}");
     }
 
     #[test]
     fn signer_kind_enforces_assurance_levels() {
-        assert!(SignerKind::Password.satisfies(AssuranceLevel::Convenience));
+        assert!(!SignerKind::Password.satisfies(AssuranceLevel::Standard));
         assert!(!SignerKind::Password.satisfies(AssuranceLevel::Hardened));
+        assert!(SignerKind::PasskeyBrowser.satisfies(AssuranceLevel::Standard));
         assert!(SignerKind::PasskeyBrowser.satisfies(AssuranceLevel::Hardened));
-        assert!(!SignerKind::Test.satisfies(AssuranceLevel::Convenience));
+        assert!(!SignerKind::Test.satisfies(AssuranceLevel::Standard));
     }
 
     #[test]

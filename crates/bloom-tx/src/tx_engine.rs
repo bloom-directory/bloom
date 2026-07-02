@@ -1839,7 +1839,7 @@ impl TxEngine {
         })?;
         let envelope = outbox_canonical_envelope(staged)?;
         let auth_entry = writer
-            .stage_entry(envelope, AssuranceLevel::Convenience, now_ms() as u64)
+            .stage_entry(envelope, AssuranceLevel::Standard, now_ms() as u64)
             .await
             .map_err(|e| {
                 TxEngineError::BroadcastApprovalRequired(format!(
@@ -2607,7 +2607,7 @@ mod tests {
                 entry_id: entry_id.to_string(),
                 intent_hash: "outbox-intent".to_string(),
                 server_nonce: server_nonce.to_string(),
-                assurance: AssuranceLevel::Convenience,
+                assurance: AssuranceLevel::Standard,
                 expiry_ms,
             })
         }
@@ -2625,7 +2625,7 @@ mod tests {
                 surface: surface.to_string(),
                 entry_id: entry_id.to_string(),
                 intent_hash: "outbox-intent".to_string(),
-                assurance: AssuranceLevel::Convenience,
+                assurance: AssuranceLevel::Standard,
                 expires_ms,
                 consumed_ms: None,
                 created_ms: now_ms,
@@ -4070,7 +4070,7 @@ mod tests {
                     intent_hash: "outbox-intent".into(),
                     executor_id: "evm-broadcast".into(),
                     network: "anvil".into(),
-                    assurance: AssuranceLevel::Convenience,
+                    assurance: AssuranceLevel::Standard,
                     server_nonce: "nonce-1".into(),
                     caps: ApprovalCaps::default(),
                     expiry_ms: now_ms() as u64 + 60_000,

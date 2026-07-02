@@ -1846,7 +1846,7 @@ impl HyperliquidHandler {
         let staged = self
             .auth_services
             .require_writer()?
-            .stage_entry(envelope, AssuranceLevel::Convenience, now_ms_u64())
+            .stage_entry(envelope, AssuranceLevel::Standard, now_ms_u64())
             .await
             .map_err(|e| {
                 HandlerError::backend(format!("stage Hyperliquid usdSend auth entry: {e}"))

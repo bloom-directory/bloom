@@ -2118,10 +2118,8 @@ mod ceremony_gate_tests {
     #[test]
     fn hardened_assurance_requires_user_verified_flag() {
         assert!(require_user_verification_for_assurance(AssuranceLevel::Hardened, true).is_ok());
-        assert!(
-            require_user_verification_for_assurance(AssuranceLevel::Convenience, false).is_ok()
-        );
-        assert!(require_user_verification_for_assurance(AssuranceLevel::Convenience, true).is_ok());
+        assert!(require_user_verification_for_assurance(AssuranceLevel::Standard, false).is_ok());
+        assert!(require_user_verification_for_assurance(AssuranceLevel::Standard, true).is_ok());
         let err =
             require_user_verification_for_assurance(AssuranceLevel::Hardened, false).unwrap_err();
         assert!(err.contains("user-verified"), "{err}");
@@ -2567,7 +2565,7 @@ mod approval_uv_tests {
         let td = tempfile::tempdir().unwrap();
         let ks = crate::Keystore::new(td.path()).unwrap();
         let signing = wallet_with_software_credential(td.path(), "uv-wallet");
-        let unsigned = unsigned_approval("uv-wallet", AssuranceLevel::Convenience);
+        let unsigned = unsigned_approval("uv-wallet", AssuranceLevel::Standard);
         let signature = assertion_with_flags(&signing, &unsigned, UP);
         // Stricter than the Decision 4 minimum (convenience may accept
         // presence-only): the shared ceremony policy requires UV for every
@@ -2585,7 +2583,7 @@ mod approval_uv_tests {
         let td = tempfile::tempdir().unwrap();
         let ks = crate::Keystore::new(td.path()).unwrap();
         let signing = wallet_with_software_credential(td.path(), "uv-wallet");
-        let unsigned = unsigned_approval("uv-wallet", AssuranceLevel::Convenience);
+        let unsigned = unsigned_approval("uv-wallet", AssuranceLevel::Standard);
         let signature = assertion_with_flags(&signing, &unsigned, UP | UV);
         ks.verify_approval_signature_with_passkey(&unsigned, &signature)
             .await
@@ -2597,7 +2595,7 @@ mod approval_uv_tests {
         let td = tempfile::tempdir().unwrap();
         let ks = crate::Keystore::new(td.path()).unwrap();
         let signing = wallet_with_software_credential(td.path(), "uv-wallet");
-        let unsigned = unsigned_approval("uv-wallet", AssuranceLevel::Convenience);
+        let unsigned = unsigned_approval("uv-wallet", AssuranceLevel::Standard);
         let other = unsigned_approval("uv-wallet", AssuranceLevel::Hardened);
         // Assertion minted for a different approval payload must not verify,
         // even though it is a valid signature from the right credential.

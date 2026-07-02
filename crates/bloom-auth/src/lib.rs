@@ -1169,7 +1169,7 @@ fn parse_nonce_state(value: &str) -> Result<NonceState, AuthStoreError> {
 
 fn parse_assurance(value: &str) -> Result<AssuranceLevel, AuthStoreError> {
     match value {
-        "convenience" => Ok(AssuranceLevel::Convenience),
+        "standard" | "convenience" => Ok(AssuranceLevel::Standard),
         "hardened" => Ok(AssuranceLevel::Hardened),
         other => Err(AuthStoreError::InvalidAssurance(other.to_string())),
     }
@@ -1235,9 +1235,10 @@ impl AuthStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use bloom_auth_api::{
         APPROVAL_SCHEMA_V1, ApprovalCaps, ApprovalSignature, CanonicalEnvelope,
-        CanonicalIntentHeader, SignerKind,
+        CanonicalIntentHeader, SignerKind, WebAuthnAssertionRecord,
     };
 
     fn envelope() -> CanonicalEnvelope {
@@ -1261,7 +1262,7 @@ mod tests {
     }
 
     fn approval_for(entry: &AuthEntryRecord, sealed: &SealedIntentRecord) -> Approval {
-        Approval {
+        let mut approval = Approval {
             schema: APPROVAL_SCHEMA_V1.into(),
             wallet: sealed.envelope.header.wallet.clone(),
             surface: entry.surface.clone(),
@@ -1275,12 +1276,28 @@ mod tests {
             // Matches the expiry every test issues its challenge with; consume
             // requires equality with the persisted challenge_expiry_ms.
             expiry_ms: 220,
-            signer_kind: SignerKind::Password,
-            credential_id: None,
+            signer_kind: SignerKind::PasskeyCtap,
+            credential_id: Some("test-credential".into()),
             review_session_id: None,
-            signature: ApprovalSignature::PasswordMac {
-                mac_hex: "test-only".into(),
-            },
+            signature: ApprovalSignature::WebAuthnAssertion(WebAuthnAssertionRecord {
+                credential_id: "test-credential".into(),
+                authenticator_data_b64: "AA".into(),
+                client_data_json_b64: "AA".into(),
+                signature_b64: "AA".into(),
+                user_handle_b64: None,
+            }),
+        };
+        refresh_approval_assertion(&mut approval);
+        approval
+    }
+
+    fn refresh_approval_assertion(approval: &mut Approval) {
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(approval.unsigned_payload().challenge_hash().unwrap());
+        if let ApprovalSignature::WebAuthnAssertion(assertion) = &mut approval.signature {
+            assertion.client_data_json_b64 = base64::engine::general_purpose::STANDARD.encode(
+                serde_json::to_vec(&serde_json::json!({ "challenge": challenge })).unwrap(),
+            );
         }
     }
 
@@ -1313,7 +1330,7 @@ mod tests {
         let mut store = AuthStore::open_in_memory_for_tests().unwrap();
         let env = envelope();
         let staged = store
-            .stage_entry(&env, AssuranceLevel::Convenience, 100)
+            .stage_entry(&env, AssuranceLevel::Standard, 100)
             .unwrap();
         assert_eq!(staged.state, AuthEntryState::Staged);
         assert_eq!(staged.nonce_state, NonceState::Unused);
@@ -1324,7 +1341,7 @@ mod tests {
             .unwrap();
         assert_eq!(challenge.intent_hash, staged.intent_hash);
         assert_eq!(challenge.server_nonce, "nonce-1");
-        assert_eq!(challenge.assurance, AssuranceLevel::Convenience);
+        assert_eq!(challenge.assurance, AssuranceLevel::Standard);
 
         let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
         assert_eq!(entry.state, AuthEntryState::Challenged);
@@ -1337,10 +1354,10 @@ mod tests {
         let mut store = AuthStore::open_in_memory_for_tests().unwrap();
         let env = envelope();
         let first = store
-            .stage_entry(&env, AssuranceLevel::Convenience, 100)
+            .stage_entry(&env, AssuranceLevel::Standard, 100)
             .unwrap();
         let second = store
-            .stage_entry(&env, AssuranceLevel::Convenience, 101)
+            .stage_entry(&env, AssuranceLevel::Standard, 101)
             .unwrap();
         assert_eq!(second.intent_hash, first.intent_hash);
         assert_eq!(second.updated_ms, first.updated_ms);
@@ -1357,7 +1374,7 @@ mod tests {
         );
         assert!(
             store
-                .stage_entry(&changed, AssuranceLevel::Convenience, 103)
+                .stage_entry(&changed, AssuranceLevel::Standard, 103)
                 .is_err()
         );
     }
@@ -1367,7 +1384,7 @@ mod tests {
         let mut store = AuthStore::open_in_memory_for_tests().unwrap();
         let env = envelope();
         store
-            .stage_entry(&env, AssuranceLevel::Convenience, 100)
+            .stage_entry(&env, AssuranceLevel::Standard, 100)
             .unwrap();
         store
             .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
@@ -1404,7 +1421,7 @@ mod tests {
         let mut store = AuthStore::open_in_memory_for_tests().unwrap();
         let env = envelope();
         store
-            .stage_entry(&env, AssuranceLevel::Convenience, 100)
+            .stage_entry(&env, AssuranceLevel::Standard, 100)
             .unwrap();
         store
             .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
@@ -1438,7 +1455,7 @@ mod tests {
             let mut store = AuthStore::open(&path).unwrap();
             let env = envelope();
             store
-                .stage_entry(&env, AssuranceLevel::Convenience, 100)
+                .stage_entry(&env, AssuranceLevel::Standard, 100)
                 .unwrap();
             store
                 .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
@@ -1467,7 +1484,7 @@ mod tests {
         let mut store = AuthStore::open_in_memory_for_tests().unwrap();
         let env = envelope();
         store
-            .stage_entry(&env, AssuranceLevel::Convenience, 100)
+            .stage_entry(&env, AssuranceLevel::Standard, 100)
             .unwrap();
         store
             .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
@@ -1493,7 +1510,7 @@ mod tests {
         let mut store = AuthStore::open(&path).unwrap();
         let env = envelope();
         store
-            .stage_entry(&env, AssuranceLevel::Convenience, 100)
+            .stage_entry(&env, AssuranceLevel::Standard, 100)
             .unwrap();
         store
             .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
@@ -1652,6 +1669,7 @@ mod tests {
         let mut approval = approval_for(&entry, &sealed);
         approval.signer_kind = SignerKind::PasskeyCtap;
         approval.review_session_id = Some("review-1".into());
+        refresh_approval_assertion(&mut approval);
 
         store
             .consume_verified_approval_transactionally(&approval, 150)

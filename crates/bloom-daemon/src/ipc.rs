@@ -11,7 +11,6 @@
 //! | `lookup`   | `{ "path": "/..." }`                  | `{ "name", "kind", ... }` |
 //! | `read`     | `{ "path": "/..." }`                  | `{ "bytes_b64": "..." }`  |
 //! | `write`    | `{ "path": "/...", "bytes_b64": "" }` | `null`                    |
-//! | `write_unlocked` | `{ "path": "/...", "bytes_b64": "", "wallet": "...", "passphrase"? }` | `null` |
 //! | `list`     | `{ "path": "/..." }`                  | `[ entry, ... ]`          |
 //! | `version`  | `null`                                | `"x.y.z"`                 |
 //! | `chains`   | `null`                                | `[ "ethereum", ... ]`     |
@@ -294,10 +293,11 @@ impl IpcServer {
                 Ok(()) => Response::ok(id, Value::Null),
                 Err(e) => map_handler_err(id, e),
             },
-            "write_unlocked" => match self.do_write_unlocked(&req.params).await {
-                Ok(()) => Response::ok(id, Value::Null),
-                Err(e) => map_handler_err(id, e),
-            },
+            "write_unlocked" => Response::err(
+                id,
+                -32601,
+                "write_unlocked was removed; stage a central Sealed Approval action instead",
+            ),
             "wallet.sign_policy" => match self.do_wallet_sign_policy(&req.params).await {
                 Ok(()) => Response::ok(id, Value::Null),
                 Err(e) => map_handler_err(id, e),
@@ -2032,5 +2032,30 @@ allow_vault_or_subaccount = false
 
         server.trigger_shutdown();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn write_unlocked_is_removed() {
+        let server = IpcServer::new(vfs(), "0", vec![]);
+        let response = server
+            .dispatch(Request {
+                jsonrpc: "2.0".into(),
+                id: json!(9),
+                method: "write_unlocked".into(),
+                params: json!({
+                    "path": "/stub/greet",
+                    "bytes_b64": B64.encode(b"hi"),
+                    "wallet": "minnow"
+                }),
+            })
+            .await;
+        let v = serde_json::to_value(response).unwrap();
+        assert_eq!(v["error"]["code"], -32601);
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("write_unlocked was removed")
+        );
     }
 }
