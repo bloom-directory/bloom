@@ -687,6 +687,11 @@ challenge and ceremony are required before wallet-key signing can resume.
   latest -> pending/<action_id>
 ```
 
+`latest` resolves to the most recently staged pending action (by modification
+time). If no actions are pending, `latest` is absent. It is an ergonomic
+shortcut, not an authorization primitive — approvals must bind concrete
+`action_id` values and must never bind `latest` (§5.7).
+
 Writing to `approval.json` is allowed, but provenance is irrelevant. The daemon
 must verify the signature, nonce, expiry, intent hash, Petal identity, and grant
 contract summary.

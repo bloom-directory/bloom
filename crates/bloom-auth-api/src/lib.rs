@@ -100,11 +100,21 @@ impl CanonicalEnvelope {
     }
 
     pub fn intent_hash(&self) -> Result<String, AuthApiError> {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(INTENT_HASH_DOMAIN);
-        hasher.update(&self.canonical_bytes()?);
-        Ok(hasher.finalize().to_hex().to_string())
+        Ok(intent_hash_of(&self.canonical_bytes()?))
     }
+}
+
+/// Compute the domain-separated `intent_hash` over raw canonical bytes.
+///
+/// Uses BLAKE3 with the `bloom.intent.v1` domain tag.  This is the single
+/// hash function that must be used anywhere an `intent_hash` is produced —
+/// in [`CanonicalEnvelope::intent_hash`], in central outbox projections, and
+/// in future sealed-action challenge preimages.
+pub fn intent_hash_of(canonical_bytes: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(INTENT_HASH_DOMAIN);
+    hasher.update(canonical_bytes);
+    hasher.finalize().to_hex().to_string()
 }
 
 pub trait CanonicalSubject {
@@ -731,6 +741,36 @@ mod tests {
         let bh = b.intent_hash().unwrap();
         assert_eq!(ah.len(), 64);
         assert_ne!(ah, bh);
+    }
+
+    #[test]
+    fn intent_hash_of_matches_envelope_method() {
+        let env = CanonicalEnvelope::new(
+            header(),
+            "paid_http",
+            "paid_http.v1",
+            br#"{"a":1}"#.to_vec(),
+        );
+        let via_method = env.intent_hash().unwrap();
+        let via_fn = intent_hash_of(&env.canonical_bytes().unwrap());
+        assert_eq!(via_method, via_fn);
+    }
+
+    #[test]
+    fn intent_hash_of_uses_domain_tag() {
+        let bytes = br#"{"x":42}"#;
+        let with_domain = intent_hash_of(bytes);
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"bloom.intent.v1");
+        hasher.update(bytes);
+        let manual = hasher.finalize().to_hex().to_string();
+
+        assert_eq!(with_domain, manual);
+
+        let mut no_domain = blake3::Hasher::new();
+        no_domain.update(bytes);
+        assert_ne!(with_domain, no_domain.finalize().to_hex().to_string());
     }
 
     #[test]

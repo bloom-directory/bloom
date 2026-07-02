@@ -148,13 +148,21 @@ impl Handler for OutboxHandler {
                 if !pending.exists() {
                     return Err(HandlerError::NotFound("outbox/latest".into()));
                 }
-                let mut entries = std::fs::read_dir(&pending)
-                    .map_err(|e| HandlerError::backend(e.to_string()))?;
-                let latest = entries
-                    .next()
-                    .ok_or_else(|| HandlerError::NotFound("no pending actions".into()))?
-                    .map_err(|e| HandlerError::backend(e.to_string()))?;
-                Ok(Entry::dir(latest.file_name().to_string_lossy().as_ref()))
+                let mut entries: Vec<_> = std::fs::read_dir(&pending)
+                    .map_err(|e| HandlerError::backend(e.to_string()))?
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| {
+                        e.metadata()
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .map(|mtime| (mtime, e.file_name()))
+                    })
+                    .collect();
+                entries.sort_by(|a, b| b.0.cmp(&a.0));
+                let (_, name) = entries
+                    .first()
+                    .ok_or_else(|| HandlerError::NotFound("no pending actions".into()))?;
+                Ok(Entry::dir(name.to_string_lossy().as_ref()))
             }
             [state, action_id] if STATES.contains(state) => {
                 validate_action_id(action_id)?;
@@ -342,5 +350,23 @@ mod tests {
         let h = handler();
         let p = VfsPath::parse("pending/../etc/intent.json").unwrap();
         assert!(h.lookup(&p).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn latest_returns_most_recently_staged() {
+        let h = handler();
+        h.outbox.stage("act-old", b"{}", "h1", "p1", b"[]").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        h.outbox.stage("act-new", b"{}", "h2", "p2", b"[]").unwrap();
+
+        let entry = h.lookup(&VfsPath::parse("latest").unwrap()).await.unwrap();
+        assert_eq!(entry.name, "act-new");
+    }
+
+    #[tokio::test]
+    async fn latest_not_found_when_empty() {
+        let h = handler();
+        let result = h.lookup(&VfsPath::parse("latest").unwrap()).await;
+        assert!(result.is_err());
     }
 }

@@ -90,7 +90,7 @@ impl CentralOutboxProjection for EvmOutboxProjection {
         plan_md: &str,
         policy_check_json: &[u8],
     ) -> Result<(), String> {
-        let intent_hash = sha256_hex(intent_json);
+        let intent_hash = bloom_auth_api::intent_hash_of(intent_json);
         self.central
             .stage(
                 action_id,
@@ -107,13 +107,6 @@ impl CentralOutboxProjection for EvmOutboxProjection {
             .transition(action_id, from, to)
             .map_err(|e| e.to_string())
     }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
 }
 
 #[derive(Debug, Error)]
