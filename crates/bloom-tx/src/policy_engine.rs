@@ -73,41 +73,41 @@ pub fn evaluate(
 
     if let Some(max) = effective_caps.max_value_eth {
         if value_f > max {
-            out.push(PolicyCheck {
-                rule: "caps.max_value_eth".into(),
-                outcome: PolicyOutcome::Deny,
-                message: format!("value {} > max {}", value_human, max),
-            });
+            out.push(PolicyCheck::hard(
+                "caps.max_value_eth",
+                PolicyOutcome::Deny,
+                format!("value {} > max {}", value_human, max),
+            ));
         } else {
-            out.push(PolicyCheck {
-                rule: "caps.max_value_eth".into(),
-                outcome: PolicyOutcome::Pass,
-                message: format!("value {} <= max {}", value_human, max),
-            });
+            out.push(PolicyCheck::informational(
+                "caps.max_value_eth",
+                PolicyOutcome::Pass,
+                format!("value {} <= max {}", value_human, max),
+            ));
         }
     }
 
     if let Some(soft) = effective_caps.require_override_above_eth
         && value_f > soft
     {
-        out.push(PolicyCheck {
-            rule: "caps.require_override_above_eth".into(),
-            outcome: PolicyOutcome::Warn,
-            message: format!(
+        out.push(PolicyCheck::soft(
+            "caps.require_override_above_eth",
+            PolicyOutcome::Warn,
+            format!(
                 "value {} > soft {} — write `override` to confirm",
                 value_human, soft
             ),
-        });
+        ));
     }
 
     if let Some(auto_below) = policy.automation.auto_confirm_below_eth
         && value_f <= auto_below
     {
-        out.push(PolicyCheck {
-            rule: "automation.auto_confirm_below_eth".into(),
-            outcome: PolicyOutcome::Pass,
-            message: "value within auto-confirm threshold".into(),
-        });
+        out.push(PolicyCheck::informational(
+            "automation.auto_confirm_below_eth",
+            PolicyOutcome::Pass,
+            "value within auto-confirm threshold",
+        ));
     }
 
     // ----- USD caps -----------------------------------------------------------
@@ -123,29 +123,27 @@ pub fn evaluate(
         (true, Some(usd)) => {
             if let Some(max_usd) = effective_caps.per_tx_usd {
                 if usd > max_usd {
-                    out.push(PolicyCheck {
-                        rule: "caps.per_tx_usd".into(),
-                        outcome: PolicyOutcome::Deny,
-                        message: format!("usd {usd:.2} > max {max_usd:.2}"),
-                    });
+                    out.push(PolicyCheck::hard(
+                        "caps.per_tx_usd",
+                        PolicyOutcome::Deny,
+                        format!("usd {usd:.2} > max {max_usd:.2}"),
+                    ));
                 } else {
-                    out.push(PolicyCheck {
-                        rule: "caps.per_tx_usd".into(),
-                        outcome: PolicyOutcome::Pass,
-                        message: format!("usd {usd:.2} <= max {max_usd:.2}"),
-                    });
+                    out.push(PolicyCheck::informational(
+                        "caps.per_tx_usd",
+                        PolicyOutcome::Pass,
+                        format!("usd {usd:.2} <= max {max_usd:.2}"),
+                    ));
                 }
             }
             if let Some(soft_usd) = effective_caps.require_confirm_above_usd
                 && usd > soft_usd
             {
-                out.push(PolicyCheck {
-                    rule: "caps.require_confirm_above_usd".into(),
-                    outcome: PolicyOutcome::Warn,
-                    message: format!(
-                        "usd {usd:.2} > soft {soft_usd:.2} — write override token to confirm"
-                    ),
-                });
+                out.push(PolicyCheck::soft(
+                    "caps.require_confirm_above_usd",
+                    PolicyOutcome::Warn,
+                    format!("usd {usd:.2} > soft {soft_usd:.2} — write override token to confirm"),
+                ));
             }
             // The rolling counter is sourced from the outbox itself by
             // tx_engine::stage (sum of usd_value across this wallet's
@@ -158,39 +156,39 @@ pub fn evaluate(
                     Some(prior) => {
                         let total = prior + usd;
                         if total > per_day {
-                            out.push(PolicyCheck {
-                                rule: "caps.per_day_usd".into(),
-                                outcome: PolicyOutcome::Deny,
-                                message: format!(
+                            out.push(PolicyCheck::hard(
+                                "caps.per_day_usd",
+                                PolicyOutcome::Deny,
+                                format!(
                                     "rolling 24h usd {prior:.2} + {usd:.2} > cap {per_day:.2}"
                                 ),
-                            });
+                            ));
                         } else {
-                            out.push(PolicyCheck {
-                                rule: "caps.per_day_usd".into(),
-                                outcome: PolicyOutcome::Pass,
-                                message: format!(
+                            out.push(PolicyCheck::informational(
+                                "caps.per_day_usd",
+                                PolicyOutcome::Pass,
+                                format!(
                                     "rolling 24h usd {total:.2} <= cap {per_day:.2}"
                                 ),
-                            });
+                            ));
                         }
                     }
-                    None => out.push(PolicyCheck {
-                        rule: "caps.per_day_usd".into(),
-                        outcome: PolicyOutcome::Warn,
-                        message: format!(
+                    None => out.push(PolicyCheck::soft(
+                        "caps.per_day_usd",
+                        PolicyOutcome::Warn,
+                        format!(
                             "per_day_usd cap {per_day:.2} configured but rolling-window state unavailable"
                         ),
-                    }),
+                    )),
                 }
             }
         }
         (true, None) => {
-            out.push(PolicyCheck {
-                rule: "caps.usd".into(),
-                outcome: PolicyOutcome::Warn,
-                message: "USD caps configured but no price quote available; rule skipped".into(),
-            });
+            out.push(PolicyCheck::soft(
+                "caps.usd",
+                PolicyOutcome::Warn,
+                "USD caps configured but no price quote available; rule skipped",
+            ));
         }
         (false, _) => {}
     }
@@ -313,35 +311,35 @@ fn check_allow_deny(
     };
 
     if !block.deny.is_empty() && block.deny.iter().any(|s| matches_one(s)) {
-        out.push(PolicyCheck {
-            rule: format!("{section}.deny"),
-            outcome: PolicyOutcome::Deny,
-            message: format!(
+        out.push(PolicyCheck::hard(
+            format!("{section}.deny"),
+            PolicyOutcome::Deny,
+            format!(
                 "{} on deny list",
                 target.unwrap_or_else(|| symbol.unwrap_or("(unknown)"))
             ),
-        });
+        ));
     }
     if !block.allow.is_empty() {
         let hit = block.allow.iter().any(|s| matches_one(s));
         if hit {
-            out.push(PolicyCheck {
-                rule: format!("{section}.allow"),
-                outcome: PolicyOutcome::Pass,
-                message: format!(
+            out.push(PolicyCheck::informational(
+                format!("{section}.allow"),
+                PolicyOutcome::Pass,
+                format!(
                     "{} on allow list",
                     target.unwrap_or_else(|| symbol.unwrap_or("(unknown)"))
                 ),
-            });
+            ));
         } else {
-            out.push(PolicyCheck {
-                rule: format!("{section}.allow"),
-                outcome: PolicyOutcome::Deny,
-                message: format!(
+            out.push(PolicyCheck::hard(
+                format!("{section}.allow"),
+                PolicyOutcome::Deny,
+                format!(
                     "{} not on allow list",
                     target.unwrap_or_else(|| symbol.unwrap_or("(unknown)"))
                 ),
-            });
+            ));
         }
     }
 }
@@ -368,11 +366,11 @@ fn check_lists(
             // Allowlist with nothing to check is a hard miss — we can't
             // confirm the tx falls inside the list.
             if matches!(mode, ListMode::Allow) {
-                out.push(PolicyCheck {
-                    rule: rule.into(),
-                    outcome: PolicyOutcome::Deny,
-                    message: "allowlist set but tx has no relevant address".into(),
-                });
+                out.push(PolicyCheck::hard(
+                    rule,
+                    PolicyOutcome::Deny,
+                    "allowlist set but tx has no relevant address",
+                ));
             }
             return;
         }
@@ -382,22 +380,22 @@ fn check_lists(
         .iter()
         .any(|s| s.trim().to_ascii_lowercase() == target_lc);
     match (mode, hit) {
-        (ListMode::Deny, true) => out.push(PolicyCheck {
-            rule: rule.into(),
-            outcome: PolicyOutcome::Deny,
-            message: format!("{} is denylisted", target_lc),
-        }),
+        (ListMode::Deny, true) => out.push(PolicyCheck::hard(
+            rule,
+            PolicyOutcome::Deny,
+            format!("{} is denylisted", target_lc),
+        )),
         (ListMode::Deny, false) => {}
-        (ListMode::Allow, true) => out.push(PolicyCheck {
-            rule: rule.into(),
-            outcome: PolicyOutcome::Pass,
-            message: format!("{} is on allowlist", target_lc),
-        }),
-        (ListMode::Allow, false) => out.push(PolicyCheck {
-            rule: rule.into(),
-            outcome: PolicyOutcome::Deny,
-            message: format!("{} not on allowlist", target_lc),
-        }),
+        (ListMode::Allow, true) => out.push(PolicyCheck::informational(
+            rule,
+            PolicyOutcome::Pass,
+            format!("{} is on allowlist", target_lc),
+        )),
+        (ListMode::Allow, false) => out.push(PolicyCheck::hard(
+            rule,
+            PolicyOutcome::Deny,
+            format!("{} not on allowlist", target_lc),
+        )),
     }
 }
 

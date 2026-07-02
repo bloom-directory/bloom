@@ -2,6 +2,8 @@
 members = [
   "crates/bloom",
   "crates/bloom-daemon",
+  "crates/bloom-auth-api",
+  "crates/bloom-auth",
   "crates/bloom-vfs",
   "crates/bloom-paid-mpp",
   "crates/bloom-paid-x402",
@@ -145,6 +147,8 @@ bloom-prices   = { path = "crates/bloom-prices" }
 bloom-revert   = { path = "crates/bloom-revert" }
 bloom-petals   = { path = "crates/bloom-petals" }
 bloom-daemon   = { path = "crates/bloom-daemon" }
+bloom-auth-api = { path = "crates/bloom-auth-api" }
+bloom-auth     = { path = "crates/bloom-auth" }
 bloom-chain-types = { path = "crates/bloom-chain-types" }
 bloom-chain-state = { path = "crates/bloom-chain-state" }
 bloom-chain-node = { path = "crates/bloom-chain-node" }

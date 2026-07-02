@@ -7,6 +7,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use bloom_auth_api::{
+    Approval, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, ChallengeRecord,
+};
 use bloom_keystore::Keystore;
 use bloom_paid_http::{
     EmptyPaidHttpChainRpcResolver, NormalizedChallenge, PaidHttpChainRpcResolver, ParsedRequest,
@@ -26,10 +31,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 
+use crate::auth::AuthServices;
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
 
 const CONFIRM_APPROVAL_FILE: &str = ".confirm_approved.json";
+const APPROVAL_FILE: &str = "approval.json";
+const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
+const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Clone)]
 pub struct RequestsHandler {
@@ -39,6 +48,7 @@ pub struct RequestsHandler {
     client: reqwest::Client,
     x402_signer: Arc<dyn X402PaymentSigner>,
     paid_http_rpc_resolver: Arc<dyn PaidHttpChainRpcResolver>,
+    auth_services: AuthServices,
 }
 
 impl RequestsHandler {
@@ -54,7 +64,13 @@ impl RequestsHandler {
             client: reqwest::Client::new(),
             x402_signer: Arc::new(KeystoreX402PaymentSigner::new(keystore)),
             paid_http_rpc_resolver: Arc::new(EmptyPaidHttpChainRpcResolver),
+            auth_services: AuthServices::default(),
         }
+    }
+
+    pub fn with_auth_services(mut self, auth_services: AuthServices) -> Self {
+        self.auth_services = auth_services;
+        self
     }
 
     pub fn with_x402_signer(mut self, signer: Arc<dyn X402PaymentSigner>) -> Self {
@@ -232,6 +248,17 @@ impl RequestsHandler {
                 dir.join("audit.json"),
                 &json!({"request_id": id, "event": "staged", "reads_spent": false, "dry_run": dry_run}),
             )?;
+            self.stage_auth_entry(
+                &id,
+                &request,
+                &wallet,
+                &host,
+                &challenge,
+                &policy_requirement,
+                &checks,
+                dry_run,
+            )
+            .await?;
             self.write_latest("pending", &id)?;
             Ok(id)
         } else {
@@ -398,6 +425,86 @@ impl RequestsHandler {
         Ok(())
     }
 
+    async fn stage_auth_entry(
+        &self,
+        id: &str,
+        request: &ParsedRequest,
+        wallet: &str,
+        host: &str,
+        challenge: &NormalizedChallenge,
+        requirement: &PaymentRequirement,
+        checks: &[PolicyCheck],
+        dry_run: bool,
+    ) -> Result<(), HandlerError> {
+        let Some(writer) = self.auth_services.writer() else {
+            return Ok(());
+        };
+        let envelope = paid_http_canonical_envelope(
+            id,
+            request,
+            wallet,
+            host,
+            challenge,
+            requirement,
+            checks,
+            dry_run,
+        )?;
+        let staged = writer
+            .stage_entry(envelope, AssuranceLevel::Convenience, now_ms())
+            .await
+            .map_err(|e| HandlerError::backend(format!("stage paid-http auth entry: {e}")))?;
+        fs::write(
+            self.req_dir("pending", id).join("intent_hash"),
+            format!("{}\n", staged.intent_hash),
+        )?;
+        Ok(())
+    }
+
+    async fn require_layer_b_confirm_approval(
+        &self,
+        pending: &Path,
+        id: &str,
+    ) -> Result<(), HandlerError> {
+        if !self.auth_services.is_wired() {
+            return Ok(());
+        }
+        let approval_path = pending.join(APPROVAL_FILE);
+        if approval_path.exists() {
+            let approval: Approval = read_json(&approval_path)?;
+            self.auth_services
+                .require_approval_verifier()?
+                .verify_and_consume(approval, now_ms())
+                .await
+                .map_err(|e| HandlerError::invalid(format!("Layer B approval rejected: {e}")))?;
+            return Ok(());
+        }
+
+        let challenge = self.issue_layer_b_confirm_challenge(id).await?;
+        write_json(pending.join(APPROVAL_CHALLENGE_FILE), &challenge)?;
+        Err(HandlerError::PermissionDenied)
+    }
+
+    async fn issue_layer_b_confirm_challenge(
+        &self,
+        id: &str,
+    ) -> Result<ChallengeRecord, HandlerError> {
+        let now = now_ms();
+        let mut nonce = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+        let nonce = URL_SAFE_NO_PAD.encode(nonce);
+        self.auth_services
+            .require_writer()?
+            .issue_challenge(
+                "requests",
+                id,
+                &nonce,
+                now.saturating_add(APPROVAL_TTL_MS),
+                now,
+            )
+            .await
+            .map_err(|e| HandlerError::backend(format!("issue paid-http approval challenge: {e}")))
+    }
+
     async fn confirm(&self, id: &str, data: &[u8]) -> Result<(), HandlerError> {
         let value = String::from_utf8_lossy(data).trim().to_ascii_lowercase();
         let pending = self.req_dir("pending", id);
@@ -425,7 +532,11 @@ impl RequestsHandler {
             .as_deref()
             .ok_or_else(|| HandlerError::backend("request.toml missing wallet"))?
             .to_string();
-        consume_request_confirm_approved(&pending, &wallet, &value)?;
+        if self.auth_services.is_wired() {
+            self.require_layer_b_confirm_approval(&pending, id).await?;
+        } else {
+            consume_request_confirm_approved(&pending, &wallet, &value)?;
+        }
         let host = request.url.host_str().unwrap_or("unknown").to_string();
         let mut challenge: NormalizedChallenge = read_json(pending.join("challenge.json"))?;
         validate_session_state_target(&challenge, id)?;
@@ -1449,10 +1560,71 @@ fn new_request_id() -> String {
     format!("req_{ms}_{n}")
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn paid_http_canonical_envelope(
+    id: &str,
+    request: &ParsedRequest,
+    wallet: &str,
+    host: &str,
+    challenge: &NormalizedChallenge,
+    requirement: &PaymentRequirement,
+    checks: &[PolicyCheck],
+    dry_run: bool,
+) -> Result<CanonicalEnvelope, HandlerError> {
+    let network = requirement
+        .network
+        .as_deref()
+        .or(challenge.network.as_deref())
+        .unwrap_or("unknown")
+        .to_string();
+    let subject = serde_json::to_vec(&json!({
+        "schema": "bloom.paid_http_subject.v1",
+        "request_id": id,
+        "method": request.method,
+        "url": request.url.as_str(),
+        "host": host,
+        "headers": request.headers,
+        "body_sha256": request.body.as_ref().map(|body| bloom_tools::sha256_hex(body.as_bytes())),
+        "challenge": challenge,
+        "selected_requirement": requirement,
+        "policy_checks": checks,
+        "dry_run": dry_run,
+    }))
+    .map_err(|e| HandlerError::backend(e.to_string()))?;
+    Ok(CanonicalEnvelope::new(
+        CanonicalIntentHeader {
+            schema: "bloom.intent_header.v1".into(),
+            wallet: wallet.to_string(),
+            surface: "requests".into(),
+            entry_id: id.to_string(),
+            executor_id: "paid-http".into(),
+            network,
+            account: "default".into(),
+            action_kind: "paid_http_confirm".into(),
+            value_movement: true,
+            authority_change: false,
+        },
+        "paid_http",
+        "bloom.paid_http_subject.v1",
+        subject,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::path::VfsPath;
+    use bloom_auth_api::{
+        APPROVAL_SCHEMA_V1, ApprovalCaps, ApprovalSignature, ApprovalVerifier, AuthApiError,
+        AuthEntryRecord, AuthEntryState, AuthStoreWriter, NonceState, SignerKind,
+    };
     use bloom_paid_mpp::PaymentExecution;
     use bloom_paid_x402::X402PaymentCredential;
     use mpp::client::{PaymentProvider, TempoProvider};
@@ -1471,6 +1643,88 @@ mod tests {
 
     struct StaticX402Signer {
         calls: Arc<AtomicUsize>,
+    }
+
+    struct ChallengeOnlyWriter;
+
+    struct AcceptingVerifier {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ApprovalVerifier for AcceptingVerifier {
+        async fn verify_and_consume(
+            &self,
+            approval: Approval,
+            _now_ms: u64,
+        ) -> Result<(), AuthApiError> {
+            if approval.surface != "requests" {
+                return Err(AuthApiError::Denied("wrong surface".into()));
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl AuthStoreWriter for ChallengeOnlyWriter {
+        async fn stage_entry(
+            &self,
+            envelope: CanonicalEnvelope,
+            assurance: AssuranceLevel,
+            now_ms: u64,
+        ) -> Result<AuthEntryRecord, AuthApiError> {
+            let intent_hash = envelope.intent_hash()?;
+            Ok(AuthEntryRecord {
+                surface: envelope.header.surface.clone(),
+                entry_id: envelope.header.entry_id.clone(),
+                state: AuthEntryState::Staged,
+                intent_hash,
+                assurance,
+                nonce: None,
+                nonce_state: NonceState::Unused,
+                reservation_id: None,
+                updated_ms: now_ms,
+            })
+        }
+
+        async fn issue_challenge(
+            &self,
+            surface: &str,
+            entry_id: &str,
+            server_nonce: &str,
+            expiry_ms: u64,
+            _now_ms: u64,
+        ) -> Result<ChallengeRecord, AuthApiError> {
+            Ok(ChallengeRecord {
+                surface: surface.to_string(),
+                entry_id: entry_id.to_string(),
+                intent_hash: "abc123".to_string(),
+                server_nonce: server_nonce.to_string(),
+                assurance: AssuranceLevel::Convenience,
+                expiry_ms,
+            })
+        }
+
+        async fn issue_review_session(
+            &self,
+            review_session_id: &str,
+            surface: &str,
+            entry_id: &str,
+            expires_ms: u64,
+            now_ms: u64,
+        ) -> Result<bloom_auth_api::ReviewSessionRecord, AuthApiError> {
+            Ok(bloom_auth_api::ReviewSessionRecord {
+                review_session_id: review_session_id.to_string(),
+                surface: surface.to_string(),
+                entry_id: entry_id.to_string(),
+                intent_hash: "abc123".to_string(),
+                assurance: AssuranceLevel::Convenience,
+                expires_ms,
+                consumed_ms: None,
+                created_ms: now_ms,
+            })
+        }
     }
 
     #[async_trait]
@@ -1525,6 +1779,50 @@ mod tests {
                 .unwrap_err();
         assert!(err.to_string().contains("invalid request id"), "{err}");
         assert!(!pending.join(CONFIRM_APPROVAL_FILE).exists());
+    }
+
+    #[test]
+    fn paid_http_canonical_envelope_commits_to_selected_plan() {
+        let request = parse_request("GET https://merchant.test/pay wallet=alice").unwrap();
+        let challenge = normalize_challenge(
+            &HeaderMap::new(),
+            br#"{"x402Version":1,"accepts":[{"network":"base","asset":"USDC","maxAmountRequired":"1000","payTo":"0x1234"}]}"#,
+            &request.url,
+        );
+        let requirement = challenge.accepts[0].clone();
+        let checks: Vec<PolicyCheck> = vec![];
+        let env = paid_http_canonical_envelope(
+            "req_1",
+            &request,
+            "alice",
+            "merchant.test",
+            &challenge,
+            &requirement,
+            &checks,
+            false,
+        )
+        .unwrap();
+        assert_eq!(env.header.surface, "requests");
+        assert_eq!(env.header.entry_id, "req_1");
+        assert_eq!(env.header.executor_id, "paid-http");
+        assert_eq!(env.header.network, "base");
+        assert_eq!(env.subject_kind, "paid_http");
+        let hash1 = env.intent_hash().unwrap();
+
+        let mut other_req = requirement;
+        other_req.network = Some("polygon".into());
+        let other = paid_http_canonical_envelope(
+            "req_1",
+            &request,
+            "alice",
+            "merchant.test",
+            &challenge,
+            &other_req,
+            &checks,
+            false,
+        )
+        .unwrap();
+        assert_ne!(hash1, other.intent_hash().unwrap());
     }
 
     #[test]
@@ -1788,6 +2086,141 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("pending"), "{err}");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn wired_auth_confirm_ignores_legacy_marker_and_issues_challenge() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let f = fixture(Some("alice"));
+        let mut policy = Policy::default();
+        policy.payments.enabled = true;
+        policy.payments.require_plan = true;
+        f.handler
+            .keystore
+            .write_policy("alice", toml::to_string_pretty(&policy).unwrap().as_bytes())
+            .unwrap();
+        let auth_services = AuthServices::new(None, None, Some(Arc::new(ChallengeOnlyWriter)));
+        let handler = f
+            .handler
+            .with_auth_services(auth_services)
+            .with_x402_signer(Arc::new(StaticX402Signer {
+                calls: calls.clone(),
+            }));
+        let pending = handler.requests_root().join("pending/req_layer_b");
+        fs::create_dir_all(&pending).unwrap();
+        let challenge = normalize_challenge(
+            &HeaderMap::new(),
+            br#"{"x402Version":1,"accepts":[{"network":"base","asset":"USDC","maxAmountRequired":"1000"}]}"#,
+            &Url::parse("http://127.0.0.1:9/pay").unwrap(),
+        );
+        write_json(pending.join("challenge.json"), &challenge).unwrap();
+        write_json(
+            pending.join("payment_method.json"),
+            &challenge.payment_method(),
+        )
+        .unwrap();
+        let empty_checks: Vec<PolicyCheck> = vec![];
+        write_json(pending.join("policy_check.json"), &empty_checks).unwrap();
+        write_json(
+            pending.join("request.toml"),
+            &json!({"method":"GET","url":"http://127.0.0.1:9/pay","wallet":"alice","headers":{},"dry_run":false}),
+        )
+        .unwrap();
+        fs::write(pending.join("status"), "pending\n").unwrap();
+
+        persist_request_confirm_approved(handler.root.as_path(), "req_layer_b", "alice", "confirm")
+            .unwrap();
+        let err = handler
+            .confirm("req_layer_b", b"confirm")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandlerError::PermissionDenied), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let challenge: ChallengeRecord = read_json(pending.join(APPROVAL_CHALLENGE_FILE)).unwrap();
+        assert_eq!(challenge.surface, "requests");
+        assert_eq!(challenge.entry_id, "req_layer_b");
+        assert_eq!(challenge.intent_hash, "abc123");
+    }
+
+    #[tokio::test]
+    async fn wired_auth_confirm_accepts_approval_without_legacy_marker() {
+        let signer_calls = Arc::new(AtomicUsize::new(0));
+        let verifier_calls = Arc::new(AtomicUsize::new(0));
+        let f = fixture(Some("alice"));
+        let mut policy = Policy::default();
+        policy.payments.enabled = true;
+        policy.payments.require_plan = true;
+        f.handler
+            .keystore
+            .write_policy("alice", toml::to_string_pretty(&policy).unwrap().as_bytes())
+            .unwrap();
+        let auth_services = AuthServices::new(
+            Some(Arc::new(AcceptingVerifier {
+                calls: verifier_calls.clone(),
+            })),
+            None,
+            None,
+        );
+        let handler = f
+            .handler
+            .with_auth_services(auth_services)
+            .with_x402_signer(Arc::new(StaticX402Signer {
+                calls: signer_calls.clone(),
+            }));
+        let pending = handler.requests_root().join("pending/req_layer_b_ok");
+        fs::create_dir_all(&pending).unwrap();
+        let challenge = normalize_challenge(
+            &HeaderMap::new(),
+            br#"{"x402Version":1,"accepts":[{"network":"base","asset":"USDC","maxAmountRequired":"1000"}]}"#,
+            &Url::parse("http://127.0.0.1:9/pay").unwrap(),
+        );
+        write_json(pending.join("challenge.json"), &challenge).unwrap();
+        write_json(
+            pending.join("payment_method.json"),
+            &challenge.payment_method(),
+        )
+        .unwrap();
+        let empty_checks: Vec<PolicyCheck> = vec![];
+        write_json(pending.join("policy_check.json"), &empty_checks).unwrap();
+        write_json(
+            pending.join("request.toml"),
+            &json!({"method":"GET","url":"http://127.0.0.1:9/pay","wallet":"alice","headers":{},"dry_run":false}),
+        )
+        .unwrap();
+        fs::write(pending.join("status"), "pending\n").unwrap();
+        write_json(
+            pending.join(APPROVAL_FILE),
+            &Approval {
+                schema: APPROVAL_SCHEMA_V1.into(),
+                wallet: "alice".into(),
+                surface: "requests".into(),
+                entry_id: "req_layer_b_ok".into(),
+                intent_hash: "abc123".into(),
+                executor_id: "paid-http".into(),
+                network: "base".into(),
+                assurance: AssuranceLevel::Convenience,
+                server_nonce: "nonce-1".into(),
+                caps: ApprovalCaps::default(),
+                expiry_ms: now_ms() + 60_000,
+                signer_kind: SignerKind::Test,
+                credential_id: None,
+                review_session_id: None,
+                signature: ApprovalSignature::Test {
+                    sig_hex: "00".into(),
+                },
+            },
+        )
+        .unwrap();
+
+        handler.confirm("req_layer_b_ok", b"confirm").await.unwrap();
+        assert_eq!(verifier_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(signer_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            handler
+                .requests_root()
+                .join("failed/req_layer_b_ok")
+                .exists()
+        );
     }
 
     #[test]
@@ -2348,6 +2781,7 @@ inline = '{"prompt":"hi"}'
         let current_checks = vec![PolicyCheck {
             rule: "payments.enabled".into(),
             result: "deny".into(),
+            class: bloom_paid_http::PolicyRuleClass::Hard,
             detail: "wallet policy has not enabled paid HTTP".into(),
         }];
 

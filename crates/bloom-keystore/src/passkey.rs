@@ -38,6 +38,9 @@ use rand::RngCore;
 use url::Url;
 use webauthn_rs::prelude::*;
 
+use bloom_auth_api::{
+    ApprovalSignature, AssuranceLevel, SignerKind, UnsignedApproval, WebAuthnAssertionRecord,
+};
 use bloom_proto::CeremonyIntent;
 
 // ── constants ────────────────────────────────────────────────────────────────
@@ -145,6 +148,90 @@ fn inject_prf_into_challenge_json(
         }
     }
     v
+}
+
+fn patch_request_challenge_json(
+    challenge_json: &str,
+    challenge: &[u8; 32],
+    require_uv: bool,
+) -> Result<String, String> {
+    let challenge_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge);
+    let mut v: serde_json::Value =
+        serde_json::from_str(challenge_json).map_err(|e| e.to_string())?;
+    let Some(pk) = v.get_mut("publicKey").and_then(|v| v.as_object_mut()) else {
+        return Err("challenge JSON missing publicKey object".into());
+    };
+    pk.insert("challenge".into(), serde_json::Value::String(challenge_b64));
+    if require_uv {
+        pk.insert(
+            "userVerification".into(),
+            serde_json::Value::String("required".into()),
+        );
+    }
+    serde_json::to_string(&v).map_err(|e| e.to_string())
+}
+
+/// Layer-B assurance gate on the WebAuthn UV flag: `Hardened` approvals need a
+/// user-verified assertion (PIN/biometric), never a presence-only tap.
+///
+/// webauthn-rs's `Passkey` API currently also enforces UV (its
+/// `start_passkey_authentication` hardcodes `UserVerificationPolicy::Required`),
+/// but that is an implementation detail of the dependency. This gate makes the
+/// hardened-requires-UV invariant explicit in bloom so it survives library
+/// upgrades or a future decision to relax convenience-level ceremonies.
+fn require_user_verification_for_assurance(
+    assurance: AssuranceLevel,
+    user_verified: bool,
+) -> Result<(), String> {
+    if assurance == AssuranceLevel::Hardened && !user_verified {
+        return Err(
+            "hardened approval requires a user-verified WebAuthn assertion \
+             (UV flag not set; presence-only is not sufficient)"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn patch_passkey_authentication_challenge(
+    state: PasskeyAuthentication,
+    challenge: &[u8; 32],
+) -> Result<PasskeyAuthentication, String> {
+    let challenge_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge);
+    let mut v = serde_json::to_value(state).map_err(|e| e.to_string())?;
+    let Some(ast) = v.get_mut("ast").and_then(|v| v.as_object_mut()) else {
+        return Err("passkey authentication state missing ast object".into());
+    };
+    ast.insert("challenge".into(), serde_json::Value::String(challenge_b64));
+    serde_json::from_value(v).map_err(|e| e.to_string())
+}
+
+fn b64_field(value: &impl serde::Serialize, field: &'static str) -> Result<String, String> {
+    serde_json::to_value(value)
+        .map_err(|e| format!("{field}: {e}"))?
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("{field}: expected base64 string"))
+}
+
+fn webauthn_assertion_record(
+    credential: &PublicKeyCredential,
+) -> Result<WebAuthnAssertionRecord, String> {
+    Ok(WebAuthnAssertionRecord {
+        credential_id: credential.id.clone(),
+        authenticator_data_b64: b64_field(
+            &credential.response.authenticator_data,
+            "authenticatorData",
+        )?,
+        client_data_json_b64: b64_field(&credential.response.client_data_json, "clientDataJSON")?,
+        signature_b64: b64_field(&credential.response.signature, "signature")?,
+        user_handle_b64: credential
+            .response
+            .user_handle
+            .as_ref()
+            .map(|v| b64_field(v, "userHandle"))
+            .transpose()?,
+    })
 }
 
 /// Bind a local TCP listener on `127.0.0.1:{port}`. `ctx` is used in error
@@ -333,21 +420,34 @@ pub(crate) async fn register_ceremony(
 /// If `prf_salt` is `None` (legacy/non-PRF path), no PRF extension is
 /// injected and the second element of the return tuple is `None`.
 ///
-/// Returns `(AuthenticationResult, Option<prf_output>, Option<edited_policy>)`.
+pub(crate) struct AuthCeremonyResult {
+    auth_result: AuthenticationResult,
+    prf_output: Option<[u8; 32]>,
+    edited_policy: Option<String>,
+    credential: PublicKeyCredential,
+}
+
+/// Returns a verified authentication ceremony result.
 /// The caller must update the credential counter if `auth_result.needs_update()`.
 pub(crate) async fn auth_ceremony(
     credential: &Passkey,
     prf_salt: Option<&[u8; 32]>,
     intent: Option<CeremonyIntent>,
     editable_policy: Option<String>,
-) -> Result<(AuthenticationResult, Option<[u8; 32]>, Option<String>), String> {
+    challenge_override: Option<[u8; 32]>,
+    require_uv: bool,
+) -> Result<AuthCeremonyResult, String> {
     let webauthn = build_webauthn()?;
 
-    let (rcr, auth_state) = webauthn
+    let (rcr, mut auth_state) = webauthn
         .start_passkey_authentication(std::slice::from_ref(credential))
         .map_err(|e| format!("start_passkey_authentication: {e}"))?;
 
     let mut challenge_json = serde_json::to_string(&rcr).map_err(|e| e.to_string())?;
+    if let Some(challenge) = challenge_override {
+        challenge_json = patch_request_challenge_json(&challenge_json, &challenge, require_uv)?;
+        auth_state = patch_passkey_authentication_challenge(auth_state, &challenge)?;
+    }
 
     // Inject PRF extension if a salt is provided.
     if let Some(salt) = prf_salt {
@@ -423,7 +523,12 @@ pub(crate) async fn auth_ceremony(
 
     let prf_output = state.prf_output.lock().take();
     let edited_policy = state.editable_policy.lock().take();
-    Ok((auth_result, prf_output, edited_policy))
+    Ok(AuthCeremonyResult {
+        auth_result,
+        prf_output,
+        edited_policy,
+        credential: pkc,
+    })
 }
 
 // ── axum apps ─────────────────────────────────────────────────────────────────
@@ -1348,6 +1453,10 @@ fn unique_rebind_backup_dir(root: &std::path::Path, name: &str) -> std::path::Pa
 // ── impl Keystore — passkey operations ───────────────────────────────────────
 
 impl super::Keystore {
+    fn from_auth_api(err: bloom_auth_api::AuthApiError) -> KeystoreError {
+        KeystoreError::PasskeyCredential(err.to_string())
+    }
+
     /// Inner: write wallet files and run the registration ceremony.
     /// Called by `create_passkey` and `import_passkey`.
     pub(super) async fn import_passkey_inner(
@@ -1544,23 +1653,30 @@ impl super::Keystore {
 
         // Authentication ceremony — injects the PRF salt into the challenge.
         // Returns (auth_result, Some(prf_output)).
-        let (auth_result, prf_output_opt, edited_policy) =
-            auth_ceremony(&credential, Some(&prf_salt), intent, editable_policy)
-                .await
-                .map_err(KeystoreError::PasskeyCeremony)?;
+        let ceremony = auth_ceremony(
+            &credential,
+            Some(&prf_salt),
+            intent,
+            editable_policy,
+            None,
+            false,
+        )
+        .await
+        .map_err(KeystoreError::PasskeyCeremony)?;
 
         // Persist updated counter if the authenticator incremented it. This
         // happens before the decrypt below; if decryption later fails the
         // monotonic counter is harmlessly bumped (no security impact — it only
         // ever moves forward) while the unlock still returns an error.
-        if auth_result.needs_update() {
-            credential.update_credential(&auth_result);
+        if ceremony.auth_result.needs_update() {
+            credential.update_credential(&ceremony.auth_result);
             let updated_json = serde_json::to_string(&credential)
                 .map_err(|e| KeystoreError::Malformed(format!("passkey re-serialise: {e}")))?;
             write_atomic(&dir.join("passkey.json"), updated_json.as_bytes())?;
         }
 
-        let mut prf_output = prf_output_opt
+        let mut prf_output = ceremony
+            .prf_output
             .ok_or_else(|| KeystoreError::PasskeyCeremony(PRF_NOT_SUPPORTED_MSG.into()))?;
 
         let enc_blob =
@@ -1584,7 +1700,146 @@ impl super::Keystore {
             .write()
             .insert(name.to_string(), Arc::new(signer));
         tracing::debug!(wallet = name, "keystore.passkey_unlocked");
-        Ok(edited_policy)
+        Ok(ceremony.edited_policy)
+    }
+
+    /// Run a passkey ceremony whose WebAuthn challenge is the Layer-B approval
+    /// payload hash, returning the verified assertion as an approval signature.
+    ///
+    /// This does not decrypt or cache the wallet signing key. It proves user
+    /// presence/verification for the approval payload itself, so the resulting
+    /// assertion can authorize out-of-policy or authority-changing actions
+    /// without making the wallet key resident in daemon memory.
+    pub async fn sign_approval_with_passkey(
+        &self,
+        name: &str,
+        unsigned: &UnsignedApproval,
+        intent: Option<bloom_proto::CeremonyIntent>,
+    ) -> Result<ApprovalSignature, KeystoreError> {
+        Self::validate_name(name)?;
+        let dir = self.wallet_path(name);
+        if !dir.exists() {
+            return Err(KeystoreError::NotFound(name.into()));
+        }
+        let kind_str = read_trim(&dir.join("kind"))?;
+        if kind_str != "passkey" {
+            return Err(KeystoreError::PasskeyCredential(format!(
+                "approval signing requires a passkey wallet (wallet '{name}' is '{kind_str}')"
+            )));
+        }
+        if unsigned.wallet != name {
+            return Err(KeystoreError::PasskeyCredential(format!(
+                "approval wallet '{}' does not match passkey wallet '{name}'",
+                unsigned.wallet
+            )));
+        }
+        if !matches!(
+            unsigned.signer_kind,
+            SignerKind::PasskeyBrowser | SignerKind::PasskeyCtap
+        ) {
+            return Err(KeystoreError::PasskeyCredential(format!(
+                "approval signer_kind {:?} is not a passkey signer",
+                unsigned.signer_kind
+            )));
+        }
+
+        let passkey_json = std::fs::read_to_string(dir.join("passkey.json")).map_err(|source| {
+            KeystoreError::Io {
+                path: dir.join("passkey.json"),
+                source,
+            }
+        })?;
+        let mut credential: Passkey = serde_json::from_str(&passkey_json)
+            .map_err(|e| KeystoreError::PasskeyCredential(e.to_string()))?;
+        let challenge = unsigned.challenge_hash().map_err(Self::from_auth_api)?;
+        let require_uv = unsigned.assurance == AssuranceLevel::Hardened;
+        let ceremony = auth_ceremony(&credential, None, intent, None, Some(challenge), require_uv)
+            .await
+            .map_err(KeystoreError::PasskeyCeremony)?;
+
+        if ceremony.auth_result.needs_update() {
+            credential.update_credential(&ceremony.auth_result);
+            let updated_json = serde_json::to_string(&credential)
+                .map_err(|e| KeystoreError::Malformed(format!("passkey re-serialise: {e}")))?;
+            write_atomic(&dir.join("passkey.json"), updated_json.as_bytes())?;
+        }
+
+        require_user_verification_for_assurance(
+            unsigned.assurance,
+            ceremony.auth_result.user_verified(),
+        )
+        .map_err(KeystoreError::PasskeyCredential)?;
+
+        let assertion = webauthn_assertion_record(&ceremony.credential)
+            .map_err(KeystoreError::PasskeyCredential)?;
+        ApprovalSignature::WebAuthnAssertion(assertion.clone())
+            .validate_for_unsigned(unsigned)
+            .map_err(Self::from_auth_api)?;
+        Ok(ApprovalSignature::WebAuthnAssertion(assertion))
+    }
+
+    pub async fn verify_approval_signature_with_passkey(
+        &self,
+        unsigned: &UnsignedApproval,
+        signature: &ApprovalSignature,
+    ) -> Result<(), KeystoreError> {
+        signature
+            .validate_for_unsigned(unsigned)
+            .map_err(Self::from_auth_api)?;
+        let ApprovalSignature::WebAuthnAssertion(assertion) = signature else {
+            return Err(KeystoreError::PasskeyCredential(
+                "approval signature is not a WebAuthn assertion".into(),
+            ));
+        };
+        Self::validate_name(&unsigned.wallet)?;
+        let dir = self.wallet_path(&unsigned.wallet);
+        let passkey_json = std::fs::read_to_string(dir.join("passkey.json")).map_err(|source| {
+            KeystoreError::Io {
+                path: dir.join("passkey.json"),
+                source,
+            }
+        })?;
+        let mut credential: Passkey = serde_json::from_str(&passkey_json)
+            .map_err(|e| KeystoreError::PasskeyCredential(e.to_string()))?;
+        let webauthn = build_webauthn().map_err(KeystoreError::PasskeyCredential)?;
+        let (_rcr, auth_state) = webauthn
+            .start_passkey_authentication(std::slice::from_ref(&credential))
+            .map_err(|e| {
+                KeystoreError::PasskeyCredential(format!("start_passkey_authentication: {e}"))
+            })?;
+        let challenge = unsigned.challenge_hash().map_err(Self::from_auth_api)?;
+        let auth_state = patch_passkey_authentication_challenge(auth_state, &challenge)
+            .map_err(KeystoreError::PasskeyCredential)?;
+        let mut response = serde_json::json!({
+            "authenticatorData": assertion.authenticator_data_b64,
+            "clientDataJSON": assertion.client_data_json_b64,
+            "signature": assertion.signature_b64,
+        });
+        if let Some(user_handle) = &assertion.user_handle_b64 {
+            response["userHandle"] = serde_json::Value::String(user_handle.clone());
+        }
+        let pkc_value = serde_json::json!({
+            "id": assertion.credential_id,
+            "rawId": assertion.credential_id,
+            "type": "public-key",
+            "response": response,
+        });
+        let pkc: PublicKeyCredential = serde_json::from_value(pkc_value)
+            .map_err(|e| KeystoreError::PasskeyCredential(e.to_string()))?;
+        let auth_result = webauthn
+            .finish_passkey_authentication(&pkc, &auth_state)
+            .map_err(|e| {
+                KeystoreError::PasskeyCredential(format!("finish_passkey_authentication: {e}"))
+            })?;
+        require_user_verification_for_assurance(unsigned.assurance, auth_result.user_verified())
+            .map_err(KeystoreError::PasskeyCredential)?;
+        if auth_result.needs_update() {
+            credential.update_credential(&auth_result);
+            let updated_json = serde_json::to_string(&credential)
+                .map_err(|e| KeystoreError::Malformed(format!("passkey re-serialise: {e}")))?;
+            write_atomic(&dir.join("passkey.json"), updated_json.as_bytes())?;
+        }
+        Ok(())
     }
 
     /// Re-bind a PRF-based passkey wallet to a new passkey credential.
@@ -1818,6 +2073,52 @@ mod ceremony_gate_tests {
 
     fn client() -> reqwest::Client {
         reqwest::Client::new()
+    }
+
+    #[test]
+    fn approval_challenge_patch_updates_request_json() {
+        let challenge = [7u8; 32];
+        let challenge_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge);
+        let patched = patch_request_challenge_json(
+            r#"{"publicKey":{"challenge":"AAAA","timeout":60000}}"#,
+            &challenge,
+            false,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&patched).unwrap();
+        assert_eq!(
+            v["publicKey"]["challenge"].as_str(),
+            Some(challenge_b64.as_str())
+        );
+        assert!(v["publicKey"].get("userVerification").is_none());
+    }
+
+    #[test]
+    fn approval_challenge_patch_requires_uv_for_hardened() {
+        let challenge = [7u8; 32];
+        let patched = patch_request_challenge_json(
+            r#"{"publicKey":{"challenge":"AAAA","timeout":60000}}"#,
+            &challenge,
+            true,
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&patched).unwrap();
+        assert_eq!(
+            v["publicKey"]["userVerification"].as_str(),
+            Some("required")
+        );
+    }
+
+    #[test]
+    fn hardened_assurance_requires_user_verified_flag() {
+        assert!(require_user_verification_for_assurance(AssuranceLevel::Hardened, true).is_ok());
+        assert!(
+            require_user_verification_for_assurance(AssuranceLevel::Convenience, false).is_ok()
+        );
+        assert!(require_user_verification_for_assurance(AssuranceLevel::Convenience, true).is_ok());
+        let err =
+            require_user_verification_for_assurance(AssuranceLevel::Hardened, false).unwrap_err();
+        assert!(err.contains("user-verified"), "{err}");
     }
 
     /// The core safety invariant: no WebAuthn challenge is served before the
@@ -2104,5 +2405,203 @@ mod ceremony_gate_tests {
         // and review state is unchanged
         assert!(!*state.reviewed.lock());
         state.shutdown.notify_one();
+    }
+}
+
+/// End-to-end UV enforcement tests using a software Ed25519 WebAuthn
+/// credential registered *without* UV (`user_verified: false`, policy
+/// `preferred`). They pin the invariant that a presence-only assertion never
+/// authorizes an approval: today webauthn-rs's hardcoded Required policy
+/// rejects it first, and `require_user_verification_for_assurance` keeps the
+/// hardened guarantee even if that library default ever changes.
+#[cfg(test)]
+mod approval_uv_tests {
+    use super::*;
+    use bloom_auth_api::{APPROVAL_SCHEMA_V1, ApprovalCaps};
+    use ed25519_dalek::Signer as _;
+    use sha2::{Digest, Sha256};
+
+    const UP: u8 = 0x01;
+    const UV: u8 = 0x04;
+
+    fn unsigned_approval(wallet: &str, assurance: AssuranceLevel) -> UnsignedApproval {
+        UnsignedApproval {
+            schema: APPROVAL_SCHEMA_V1.into(),
+            wallet: wallet.into(),
+            surface: "outbox".into(),
+            entry_id: "tx_1".into(),
+            intent_hash: "0".repeat(64),
+            executor_id: "evm".into(),
+            network: "base".into(),
+            assurance,
+            server_nonce: "nonce-1".into(),
+            caps: ApprovalCaps::default(),
+            expiry_ms: u64::MAX,
+            signer_kind: SignerKind::PasskeyBrowser,
+            credential_id: None,
+            review_session_id: None,
+        }
+    }
+
+    fn wallet_with_software_credential(
+        root: &std::path::Path,
+        wallet: &str,
+    ) -> ed25519_dalek::SigningKey {
+        let dir = root.join(wallet);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("kind"), "passkey\n").unwrap();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let cose = COSEKey {
+            type_: COSEAlgorithm::EDDSA,
+            key: COSEKeyType::EC_OKP(COSEOKPKey {
+                curve: EDDSACurve::ED25519,
+                x: signing.verifying_key().to_bytes().to_vec().into(),
+            }),
+        };
+        let passkey_json = serde_json::json!({
+            "cred": {
+                "cred_id": Base64UrlSafeData::from(b"cred-uv-test".to_vec()),
+                "cred": cose,
+                "counter": 0,
+                "transports": null,
+                "user_verified": false,
+                "backup_eligible": false,
+                "backup_state": false,
+                "registration_policy": "preferred",
+                "extensions": {},
+                "attestation": ParsedAttestation::default(),
+                "attestation_format": AttestationFormat::None,
+            }
+        });
+        std::fs::write(
+            dir.join("passkey.json"),
+            serde_json::to_vec(&passkey_json).unwrap(),
+        )
+        .unwrap();
+        signing
+    }
+
+    fn assertion_with_flags(
+        signing: &ed25519_dalek::SigningKey,
+        unsigned: &UnsignedApproval,
+        flags: u8,
+    ) -> ApprovalSignature {
+        let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let challenge = unsigned.challenge_hash().unwrap();
+        let client_data = serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": b64(&challenge),
+            "origin": format!("http://localhost:{CEREMONY_PORT}"),
+            "crossOrigin": false,
+        });
+        let client_data_bytes = serde_json::to_vec(&client_data).unwrap();
+        let mut auth_data = Vec::with_capacity(37);
+        auth_data.extend_from_slice(&Sha256::digest(RP_ID.as_bytes()));
+        auth_data.push(flags);
+        auth_data.extend_from_slice(&0u32.to_be_bytes());
+        let mut signed = auth_data.clone();
+        signed.extend_from_slice(&Sha256::digest(&client_data_bytes));
+        let signature = signing.sign(&signed);
+        ApprovalSignature::WebAuthnAssertion(WebAuthnAssertionRecord {
+            credential_id: b64(b"cred-uv-test"),
+            authenticator_data_b64: b64(&auth_data),
+            client_data_json_b64: b64(&client_data_bytes),
+            signature_b64: b64(&signature.to_bytes()),
+            user_handle_b64: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn hardened_verification_rejects_presence_only_assertion() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = crate::Keystore::new(td.path()).unwrap();
+        let signing = wallet_with_software_credential(td.path(), "uv-wallet");
+        let unsigned = unsigned_approval("uv-wallet", AssuranceLevel::Hardened);
+        let signature = assertion_with_flags(&signing, &unsigned, UP);
+        let err = ks
+            .verify_approval_signature_with_passkey(&unsigned, &signature)
+            .await
+            .unwrap_err();
+        // Rejected by webauthn-rs's Required policy today; the assurance gate
+        // gives the same answer if the library default ever changes.
+        assert!(err.to_string().contains("verified"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn hardened_verification_accepts_user_verified_assertion() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = crate::Keystore::new(td.path()).unwrap();
+        let signing = wallet_with_software_credential(td.path(), "uv-wallet");
+        let unsigned = unsigned_approval("uv-wallet", AssuranceLevel::Hardened);
+        let signature = assertion_with_flags(&signing, &unsigned, UP | UV);
+        ks.verify_approval_signature_with_passkey(&unsigned, &signature)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn convenience_verification_currently_rejects_presence_only_assertion() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = crate::Keystore::new(td.path()).unwrap();
+        let signing = wallet_with_software_credential(td.path(), "uv-wallet");
+        let unsigned = unsigned_approval("uv-wallet", AssuranceLevel::Convenience);
+        let signature = assertion_with_flags(&signing, &unsigned, UP);
+        // Stricter than the Decision 4 minimum (convenience may accept
+        // presence-only): the shared ceremony policy requires UV for every
+        // assertion. Relaxing convenience is a deliberate future change; this
+        // test makes sure it doesn't happen by accident.
+        let err = ks
+            .verify_approval_signature_with_passkey(&unsigned, &signature)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("verified"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn convenience_verification_accepts_user_verified_assertion() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = crate::Keystore::new(td.path()).unwrap();
+        let signing = wallet_with_software_credential(td.path(), "uv-wallet");
+        let unsigned = unsigned_approval("uv-wallet", AssuranceLevel::Convenience);
+        let signature = assertion_with_flags(&signing, &unsigned, UP | UV);
+        ks.verify_approval_signature_with_passkey(&unsigned, &signature)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn verification_rejects_tampered_assertion_signature() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = crate::Keystore::new(td.path()).unwrap();
+        let signing = wallet_with_software_credential(td.path(), "uv-wallet");
+        let unsigned = unsigned_approval("uv-wallet", AssuranceLevel::Convenience);
+        let other = unsigned_approval("uv-wallet", AssuranceLevel::Hardened);
+        // Assertion minted for a different approval payload must not verify,
+        // even though it is a valid signature from the right credential.
+        let ApprovalSignature::WebAuthnAssertion(mut record) =
+            assertion_with_flags(&signing, &other, UP | UV)
+        else {
+            unreachable!()
+        };
+        let challenge = unsigned.challenge_hash().unwrap();
+        let client_data = serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge),
+            "origin": format!("http://localhost:{CEREMONY_PORT}"),
+            "crossOrigin": false,
+        });
+        record.client_data_json_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&client_data).unwrap());
+        let err = ks
+            .verify_approval_signature_with_passkey(
+                &unsigned,
+                &ApprovalSignature::WebAuthnAssertion(record),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("finish_passkey_authentication"),
+            "{err}"
+        );
     }
 }

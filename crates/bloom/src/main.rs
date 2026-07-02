@@ -1420,7 +1420,6 @@ async fn run(cli: Cli) -> Result<()> {
                                 .map(|(p, _)| p)
                                 .as_deref(),
                         );
-                        let reviewed_intent_hash = intent.intent_hash();
                         persist_outbox_review_intent(&wallet, &p, &d.home.outbox_dir(), &intent)?;
                         let editable_policy = if is_wallet_policy_write(&wallet, &p) {
                             Some(String::from_utf8_lossy(&body).to_string())
@@ -1437,43 +1436,12 @@ async fn run(cli: Cli) -> Result<()> {
                             .await?;
                         if let Some(policy) = edited_policy {
                             body = policy.into_bytes();
-                        } else if is_outbox_confirm_write(&wallet, &p) {
-                            persist_outbox_review_approved(
-                                &wallet,
-                                &p,
-                                &d.home.outbox_dir(),
-                                &reviewed_intent_hash,
-                            )?;
-                            body.extend_from_slice(
-                                format!("\nreview_hash={reviewed_intent_hash}").as_bytes(),
-                            );
                         }
                     }
                     _ => {
                         d.keystore
                             .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
                     }
-                }
-                if is_policy_session_new(&wallet, &p) {
-                    let intent = bloom_proto::policy_session_mint_intent(
-                        &wallet,
-                        &p.to_string_path(),
-                        &body,
-                    );
-                    bloom_vfs::policy_session_review::persist_review_approved(
-                        d.home.root(),
-                        &wallet,
-                        &intent.intent_hash(),
-                    )?;
-                }
-                if let Some(id) = request_confirm_id(d.home.root(), &p) {
-                    let confirm_value = String::from_utf8_lossy(&body).trim().to_ascii_lowercase();
-                    bloom_vfs::handlers::requests::persist_request_confirm_approved(
-                        d.home.root(),
-                        &id,
-                        &wallet,
-                        &confirm_value,
-                    )?;
                 }
                 d.vfs.write(&p, &body).await.context("vfs write")?;
 
@@ -1646,14 +1614,6 @@ async fn run(cli: Cli) -> Result<()> {
                         .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
                 }
             }
-            let approval_id = request_confirm_id(d.home.root(), &p)
-                .context("request confirm path does not target a pending paid request")?;
-            bloom_vfs::handlers::requests::persist_request_confirm_approved(
-                d.home.root(),
-                &approval_id,
-                &wallet,
-                &String::from_utf8_lossy(&body).trim().to_ascii_lowercase(),
-            )?;
             d.vfs.write(&p, &body).await.context("request confirm")?;
             Ok(())
         }
@@ -2152,19 +2112,6 @@ async fn run(cli: Cli) -> Result<()> {
                     d.keystore
                         .unlock_passkey_with_intent(&wallet, intent)
                         .await?;
-                    if let Some(hash) = &reviewed_intent_hash
-                        && let Ok(entry) = d.tx_engine.outbox.read(&wallet, &chain, &id)
-                    {
-                        let approved = serde_json::json!({
-                            "schema": "bloom.review_approved.v1",
-                            "intent_hash": hash,
-                        });
-                        let _ = d.tx_engine.outbox.write_artefact(
-                            &entry.dir,
-                            "review_approved.json",
-                            &serde_json::to_vec_pretty(&approved)?,
-                        );
-                    }
                 }
                 _ => {
                     d.keystore
@@ -2358,19 +2305,6 @@ async fn run(cli: Cli) -> Result<()> {
                     d.keystore
                         .unlock_passkey_with_intent(&wallet, Some(intent))
                         .await?;
-                    let approved = serde_json::json!({
-                        "schema": "bloom.review_approved.v1",
-                        "intent_hash": hash,
-                        "scope": "batch",
-                    });
-                    let approved_bytes = serde_json::to_vec_pretty(&approved)?;
-                    for entry in &entries {
-                        let _ = d.tx_engine.outbox.write_artefact(
-                            &entry.dir,
-                            "review_approved.json",
-                            &approved_bytes,
-                        );
-                    }
                     reviewed_intent_hash = Some(hash);
                 }
                 _ => {
@@ -2435,7 +2369,8 @@ async fn run(cli: Cli) -> Result<()> {
             info!(home = %d.home.root().display(), chains = ?chains, endpoint = %endpoint.display, socket = %socket.display(), mount = ?mount, "cli.serve.starting");
             let server = IpcServer::new(d.vfs.clone(), env!("CARGO_PKG_VERSION"), chains)
                 .with_keystore(d.keystore.clone())
-                .with_petals(d.petals.clone());
+                .with_petals(d.petals.clone())
+                .with_auth_services(d.auth_services.clone());
             let server2 = server.clone();
             // Trigger graceful shutdown on Ctrl-C or SIGTERM.
             let shutdown = tokio::spawn(async move {
@@ -3170,43 +3105,6 @@ fn is_policy_session_new(wallet: &str, path: &VfsPath) -> bool {
     )
 }
 
-fn request_confirm_id(home: &std::path::Path, path: &VfsPath) -> Option<String> {
-    match path.segments() {
-        [root, reference, action] if root == "requests" && action == "confirm" => {
-            if reference == "latest" {
-                latest_pending_request_id(home)
-            } else {
-                Some(reference.to_string())
-            }
-        }
-        [root, state, id, action]
-            if root == "requests" && state == "pending" && action == "confirm" =>
-        {
-            Some(id.to_string())
-        }
-        _ => None,
-    }
-}
-
-fn latest_pending_request_id(home: &std::path::Path) -> Option<String> {
-    let latest = std::fs::read_to_string(home.join("requests").join("latest")).ok()?;
-    let (state, id) = latest.trim().split_once('/')?;
-    (state == "pending").then(|| id.to_string())
-}
-
-fn is_outbox_confirm_write(wallet: &str, path: &VfsPath) -> bool {
-    matches!(
-        path.segments(),
-        [root, w, chains, _chain, outbox, pending, _id, confirm]
-            if root == "wallets"
-                && w == wallet
-                && chains == "chains"
-                && outbox == "outbox"
-                && pending == "pending"
-                && confirm == "confirm"
-    )
-}
-
 async fn wallet_outbox_action_vfs_write(
     home: HomeDir,
     client_endpoint: &ResolvedEndpoint,
@@ -3663,26 +3561,6 @@ fn persist_outbox_review_intent(
     std::fs::write(
         dir.join("review_intent.json"),
         serde_json::to_vec_pretty(intent)?,
-    )?;
-    Ok(())
-}
-
-fn persist_outbox_review_approved(
-    wallet: &str,
-    path: &VfsPath,
-    outbox_root: &Path,
-    intent_hash: &str,
-) -> Result<()> {
-    let Some(dir) = outbox_confirm_dir(wallet, path, outbox_root) else {
-        return Ok(());
-    };
-    let approved = serde_json::json!({
-        "schema": "bloom.review_approved.v1",
-        "intent_hash": intent_hash,
-    });
-    std::fs::write(
-        dir.join("review_approved.json"),
-        serde_json::to_vec_pretty(&approved)?,
     )?;
     Ok(())
 }

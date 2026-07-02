@@ -27,10 +27,13 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use bloom_auth_api::{
+    APPROVAL_SCHEMA_V1, Approval, ApprovalCaps, ChallengeRecord, SignerKind, UnsignedApproval,
+};
 use bloom_keystore::{Keystore, WalletKind};
 use bloom_petals::{Capability, PetalError, PetalRunner, RunOptions, VfsHost};
 use bloom_proto::{CeremonyIntent, CeremonyIntentKind};
-use bloom_vfs::{Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
+use bloom_vfs::{AuthServices, Entry, EntryKind, Handler, HandlerError, Vfs, VfsPath};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -122,6 +125,7 @@ pub struct IpcServer {
     pub chains: Vec<String>,
     keystore: Option<Keystore>,
     petals: Option<PetalRunner>,
+    auth_services: AuthServices,
     /// Pre-wrapped `Arc<Vfs>` for building [`VfsHost`] per `petals.run`.
     /// We keep it next to the bare `vfs` clone so the existing handler
     /// surface stays untouched.
@@ -138,6 +142,7 @@ impl IpcServer {
             chains,
             keystore: None,
             petals: None,
+            auth_services: AuthServices::default(),
             vfs_arc,
             shutdown: Arc::new(Notify::new()),
         }
@@ -155,6 +160,11 @@ impl IpcServer {
     /// `-32601 method not found`.
     pub fn with_petals(mut self, runner: PetalRunner) -> Self {
         self.petals = Some(runner);
+        self
+    }
+
+    pub fn with_auth_services(mut self, auth_services: AuthServices) -> Self {
+        self.auth_services = auth_services;
         self
     }
 
@@ -363,6 +373,7 @@ impl IpcServer {
         let info = keystore
             .info(wallet)
             .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?;
+        let mut layer_b_approval_written = false;
         match info.kind {
             WalletKind::PasskeyGated => {
                 // A daemon may have a signer cached from a previous ceremony.
@@ -400,7 +411,28 @@ impl IpcServer {
                     })?;
                 if let Some(policy) = edited_policy {
                     bytes = policy.into_bytes();
-                } else if is_outbox_confirm_write(wallet, &path) {
+                } else {
+                    layer_b_approval_written = self
+                        .maybe_sign_layer_b_approval(
+                            keystore,
+                            wallet,
+                            &path,
+                            &bytes,
+                            Some(write_unlocked_intent(
+                                wallet,
+                                &path,
+                                &bytes,
+                                Some(bloom_proto::checksum_address(&info.address)),
+                                keystore.root().parent().map(|home| home.join("outbox")),
+                                keystore.raw_policy(wallet).ok().map(|(p, _)| p).as_deref(),
+                            )),
+                        )
+                        .await?;
+                }
+                if !self.auth_services.is_wired()
+                    && !layer_b_approval_written
+                    && is_outbox_confirm_write(wallet, &path)
+                {
                     if let Some(home) = keystore.root().parent() {
                         persist_outbox_review_approved(
                             wallet,
@@ -415,9 +447,20 @@ impl IpcServer {
                     );
                 }
             }
-            _ => keystore
-                .unlock(wallet, passphrase.unwrap_or(""))
-                .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?,
+            _ => {
+                keystore.unlock(wallet, passphrase.unwrap_or("")).map_err(
+                    |e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()),
+                )?;
+                if self.auth_services.is_wired()
+                    && let Some((challenge_path, _approval_path)) =
+                        layer_b_approval_paths(keystore, wallet, &path, &bytes)
+                    && challenge_path.exists()
+                {
+                    return Err(HandlerError::Unsupported(
+                        "fresh Layer B approval requires a passkey wallet; local password wallets can only auto-confirm actions that remain in policy".into(),
+                    ));
+                }
+            }
         }
         // For a policy-session mint, persist the one-time reviewed-intent approval
         // marker the VFS mint handler requires. The passkey branch bound this exact
@@ -425,6 +468,8 @@ impl IpcServer {
         // proof. Either way a real ceremony happened, so the marker is authorized.
         if is_policy_session_new(wallet, &path)
             && let Some(home) = keystore.root().parent()
+            && !layer_b_approval_written
+            && !self.auth_services.is_wired()
         {
             let intent =
                 bloom_proto::policy_session_mint_intent(wallet, &path.to_string_path(), &bytes);
@@ -440,6 +485,8 @@ impl IpcServer {
         // reuse a cached signer without passing through write_unlocked.
         if let Some(home) = keystore.root().parent()
             && let Some(id) = request_confirm_id(home, &path)
+            && !layer_b_approval_written
+            && !self.auth_services.is_wired()
         {
             let confirm_value = String::from_utf8_lossy(&bytes).trim().to_ascii_lowercase();
             bloom_vfs::handlers::requests::persist_request_confirm_approved(
@@ -450,6 +497,96 @@ impl IpcServer {
             )?;
         }
         self.vfs.write(&path, &bytes).await
+    }
+
+    async fn maybe_sign_layer_b_approval(
+        &self,
+        keystore: &Keystore,
+        wallet: &str,
+        path: &VfsPath,
+        bytes: &[u8],
+        intent: Option<CeremonyIntent>,
+    ) -> Result<bool, HandlerError> {
+        let Some((challenge_path, approval_path)) =
+            layer_b_approval_paths(keystore, wallet, path, bytes)
+        else {
+            return Ok(false);
+        };
+        if !challenge_path.exists() {
+            return Ok(false);
+        }
+        let challenge_body = std::fs::read(&challenge_path)?;
+        let challenge: ChallengeRecord = serde_json::from_slice(&challenge_body)
+            .map_err(|e| HandlerError::backend(format!("read approval challenge: {e}")))?;
+        let sealed = self
+            .auth_services
+            .require_store()?
+            .sealed_intent(&challenge.intent_hash)
+            .await
+            .map_err(|e| HandlerError::backend(format!("read sealed intent: {e}")))?;
+        let review_session_id = if challenge.assurance == bloom_auth_api::AssuranceLevel::Hardened {
+            let review_session_id = hardened_review_session_id(&challenge);
+            self.auth_services
+                .require_writer()?
+                .issue_review_session(
+                    &review_session_id,
+                    &challenge.surface,
+                    &challenge.entry_id,
+                    challenge.expiry_ms,
+                    ipc_now_ms(),
+                )
+                .await
+                .map_err(|e| HandlerError::backend(format!("issue review session: {e}")))?;
+            Some(review_session_id)
+        } else {
+            None
+        };
+        let unsigned = UnsignedApproval {
+            schema: APPROVAL_SCHEMA_V1.into(),
+            wallet: wallet.to_string(),
+            surface: challenge.surface.clone(),
+            entry_id: challenge.entry_id.clone(),
+            intent_hash: challenge.intent_hash.clone(),
+            executor_id: sealed.envelope.header.executor_id.clone(),
+            network: sealed.envelope.header.network.clone(),
+            assurance: challenge.assurance,
+            server_nonce: challenge.server_nonce.clone(),
+            caps: ApprovalCaps::default(),
+            expiry_ms: challenge.expiry_ms,
+            signer_kind: SignerKind::PasskeyBrowser,
+            credential_id: None,
+            review_session_id,
+        };
+        let signature = keystore
+            .sign_approval_with_passkey(wallet, &unsigned, intent)
+            .await
+            .map_err(|e| HandlerError::backend(format!("sign Layer B approval: {e}")))?;
+        let approval = Approval {
+            schema: unsigned.schema,
+            wallet: unsigned.wallet,
+            surface: unsigned.surface,
+            entry_id: unsigned.entry_id,
+            intent_hash: unsigned.intent_hash,
+            executor_id: unsigned.executor_id,
+            network: unsigned.network,
+            assurance: unsigned.assurance,
+            server_nonce: unsigned.server_nonce,
+            caps: unsigned.caps,
+            expiry_ms: unsigned.expiry_ms,
+            signer_kind: unsigned.signer_kind,
+            credential_id: unsigned.credential_id,
+            review_session_id: unsigned.review_session_id,
+            signature,
+        };
+        if let Some(parent) = approval_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(
+            approval_path,
+            serde_json::to_vec_pretty(&approval)
+                .map_err(|e| HandlerError::backend(format!("encode approval: {e}")))?,
+        )?;
+        Ok(true)
     }
 
     async fn do_wallet_sign_policy(&self, params: &Value) -> Result<(), HandlerError> {
@@ -831,6 +968,68 @@ fn is_outbox_confirm_write(wallet: &str, path: &VfsPath) -> bool {
     )
 }
 
+fn layer_b_approval_paths(
+    keystore: &Keystore,
+    wallet: &str,
+    path: &VfsPath,
+    bytes: &[u8],
+) -> Option<(PathBuf, PathBuf)> {
+    let home = keystore.root().parent()?;
+    if let Some(id) = request_confirm_id(home, path) {
+        let dir = home.join("requests").join("pending").join(id);
+        return Some((
+            dir.join("approval_challenge.json"),
+            dir.join("approval.json"),
+        ));
+    }
+    if let Some(dir) = outbox_confirm_dir(wallet, path, &home.join("outbox")) {
+        return Some((
+            dir.join("approval_challenge.json"),
+            dir.join("approval.json"),
+        ));
+    }
+    if is_policy_session_new(wallet, path) {
+        let entry_id = policy_session_entry_id(wallet, bytes);
+        let dir = keystore
+            .root()
+            .join(wallet)
+            .join("policy-session")
+            .join(entry_id);
+        return Some((
+            dir.join("approval_challenge.json"),
+            dir.join("approval.json"),
+        ));
+    }
+    if let Some(dir) = polymarket_onboard_dir(home, wallet, path) {
+        return Some((
+            dir.join("approval_challenge.json"),
+            dir.join("approval.json"),
+        ));
+    }
+    if let Some(dir) = hyperliquid_usd_send_dir(home, wallet, path) {
+        return Some((
+            dir.join("approval_challenge.json"),
+            dir.join("approval.json"),
+        ));
+    }
+    if let Some(dir) = hyperliquid_agent_session_dir(home, wallet, path, bytes) {
+        return Some((
+            dir.join("approval_challenge.json"),
+            dir.join("approval.json"),
+        ));
+    }
+    None
+}
+
+fn policy_session_entry_id(wallet: &str, data: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.policy_session.entry.v1");
+    hasher.update(wallet.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(data);
+    format!("ps-{}", hasher.finalize().to_hex())
+}
+
 fn outbox_confirm_dir(wallet: &str, path: &VfsPath, outbox_root: &Path) -> Option<PathBuf> {
     let [root, w, chains, chain, outbox, pending, id, confirm] = path.segments() else {
         return None;
@@ -852,6 +1051,93 @@ fn outbox_confirm_dir(wallet: &str, path: &VfsPath, outbox_root: &Path) -> Optio
     } else {
         None
     }
+}
+
+fn polymarket_onboard_dir(home: &Path, wallet: &str, path: &VfsPath) -> Option<PathBuf> {
+    let [root, action, w, leaf] = path.segments() else {
+        return None;
+    };
+    if root == "polymarket" && action == "onboard" && w == wallet && leaf == "begin" {
+        Some(home.join("polymarket").join(safe_layer_b_segment(wallet)?))
+    } else {
+        None
+    }
+}
+
+fn hyperliquid_usd_send_dir(home: &Path, wallet: &str, path: &VfsPath) -> Option<PathBuf> {
+    let [root, network, branch, w, leaf] = path.segments() else {
+        return None;
+    };
+    if root == "hyperliquid" && branch == "exchange" && w == wallet && leaf == "send_asset.json" {
+        Some(
+            home.join("hyperliquid")
+                .join("exchange")
+                .join(safe_layer_b_segment(network)?)
+                .join(safe_layer_b_segment(wallet)?),
+        )
+    } else {
+        None
+    }
+}
+
+fn hyperliquid_agent_session_dir(
+    home: &Path,
+    wallet: &str,
+    path: &VfsPath,
+    bytes: &[u8],
+) -> Option<PathBuf> {
+    let [root, network, branch, w, leaf] = path.segments() else {
+        return None;
+    };
+    if !(root == "hyperliquid" && branch == "agent_sessions" && w == wallet && leaf == "new.json") {
+        return None;
+    }
+    let body: Value = serde_json::from_slice(bytes).ok()?;
+    let session_id = body.get("id")?.as_str()?;
+    Some(
+        home.join("hyperliquid")
+            .join("agent_sessions")
+            .join(safe_layer_b_segment(network)?)
+            .join(safe_layer_b_segment(wallet)?)
+            .join(safe_layer_b_segment(session_id)?),
+    )
+}
+
+fn safe_layer_b_segment(raw: &str) -> Option<String> {
+    if raw.is_empty()
+        || raw == "."
+        || raw == ".."
+        || raw.len() > 128
+        || !raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+fn hardened_review_session_id(challenge: &ChallengeRecord) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.review_session.v1");
+    hasher.update(challenge.surface.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(challenge.entry_id.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(challenge.intent_hash.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(challenge.server_nonce.as_bytes());
+    format!("review-{}", hasher.finalize().to_hex())
+}
+
+fn ipc_now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn persist_outbox_review_intent(

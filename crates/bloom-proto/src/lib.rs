@@ -50,9 +50,12 @@ pub use intent::{
 };
 pub use plan::{NftAction, NftRef, PlanRender, StagedTx, TokenRef, TxStatus};
 pub use policy::{
-    AgentAutonomyMode, ApprovalPolicy, AuthorizationSubject, AuthorizationSurface,
-    AutonomyDecision, BroadcastApprovalDecision, BudgetSnapshot, LimitsPolicy, Policy, PolicyCheck,
-    PolicyOutcome, evaluate_action_authorization, evaluate_broadcast_approval, has_deny, has_warn,
+    AgentAutonomyMode, ApprovalPolicy, ApprovalStepUpPolicy, AuthorizationSubject,
+    AuthorizationSurface, AutonomyDecision, BroadcastApprovalDecision, BudgetSnapshot,
+    LimitsPolicy, Policy, PolicyCheck, PolicyEditClass, PolicyOutcome, PolicyRuleClass,
+    StepUpRuleCeiling, StepUpRuleCeilingValidation, classify_policy_edit,
+    evaluate_action_authorization, evaluate_broadcast_approval, has_deny, has_soft_violation,
+    has_warn, validate_step_up_rule_ceilings,
 };
 pub use polymarket_policy::{
     PolicySide, PolymarketOrderCtx, PolymarketPolicy, evaluate_polymarket_order,

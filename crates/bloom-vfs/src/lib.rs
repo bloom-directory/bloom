@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
 pub mod cache;
 pub mod handler;
 pub mod handlers;
@@ -27,6 +28,7 @@ pub mod policy_session_review;
 pub mod router;
 pub mod tx_handler;
 
+pub use auth::AuthServices;
 pub use cache::PathCache;
 pub use handler::{Entry, EntryKind, Handler, HandlerError};
 pub use paginate::{PAGE_SIZE, Projection, page_indices, page_name, page_slice, parse_page_name};
