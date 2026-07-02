@@ -2205,16 +2205,16 @@ async fn run(cli: Cli) -> Result<()> {
             passphrase,
             text,
         }) => {
-            wallet_outbox_action_vfs_write(
+            wallet_outbox_action_vfs_write(WalletOutboxActionWrite {
                 home,
-                &client_endpoint,
-                wallet.clone(),
+                client_endpoint: &client_endpoint,
+                wallet: wallet.clone(),
                 chain,
-                id.clone(),
-                "cancel",
-                text.into_bytes(),
+                id: id.clone(),
+                action: "cancel",
+                body: text.into_bytes(),
                 passphrase,
-            )
+            })
             .await?;
             println!("cancel submitted for {id}");
             Ok(())
@@ -2234,16 +2234,16 @@ async fn run(cli: Cli) -> Result<()> {
                     buf
                 }
             };
-            wallet_outbox_action_vfs_write(
+            wallet_outbox_action_vfs_write(WalletOutboxActionWrite {
                 home,
-                &client_endpoint,
+                client_endpoint: &client_endpoint,
                 wallet,
                 chain,
-                id.clone(),
-                "replace",
-                body.into_bytes(),
+                id: id.clone(),
+                action: "replace",
+                body: body.into_bytes(),
                 passphrase,
-            )
+            })
             .await?;
             println!("replacement submitted for {id}");
             Ok(())
@@ -3207,16 +3207,28 @@ fn is_outbox_confirm_write(wallet: &str, path: &VfsPath) -> bool {
     )
 }
 
-async fn wallet_outbox_action_vfs_write(
+struct WalletOutboxActionWrite<'a> {
     home: HomeDir,
-    client_endpoint: &ResolvedEndpoint,
+    client_endpoint: &'a ResolvedEndpoint,
     wallet: String,
     chain: String,
     id: String,
-    action: &str,
+    action: &'a str,
     body: Vec<u8>,
     passphrase: Option<String>,
-) -> Result<()> {
+}
+
+async fn wallet_outbox_action_vfs_write(input: WalletOutboxActionWrite<'_>) -> Result<()> {
+    let WalletOutboxActionWrite {
+        home,
+        client_endpoint,
+        wallet,
+        chain,
+        id,
+        action,
+        body,
+        passphrase,
+    } = input;
     if !matches!(action, "cancel" | "replace") {
         bail!("unsupported wallet outbox action '{action}'");
     }
