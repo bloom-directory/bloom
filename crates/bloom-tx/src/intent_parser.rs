@@ -65,6 +65,8 @@ struct LooseIntent {
     safe: Option<bool>,
     #[serde(default)]
     approved: Option<bool>,
+    #[serde(default)]
+    usd_value_hint: Option<String>,
 }
 
 impl LooseIntent {
@@ -160,7 +162,7 @@ impl LooseIntent {
             gas,
             nonce: self.nonce,
             gas_limit_hint: None,
-            usd_value_hint: None,
+            usd_value_hint: self.usd_value_hint,
         })
     }
 }
