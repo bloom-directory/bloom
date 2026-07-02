@@ -273,7 +273,8 @@ Forbidden:
 - writing decrypted wallet keys to disk;
 - persisting grants;
 - using a passphrase fallback;
-- caching a raw unlocked signer outside a grant.
+- caching a raw unlocked signer outside a grant or an approved owner-signing
+  session.
 
 ### 5.5 Grant Scope
 
@@ -679,16 +680,70 @@ venue credential may authorize later bounded operations without another user
 ceremony. Those later operations still write central audit records and must be
 checked against the frozen session caps.
 
-Venue session credentials are first-class secrets distinct from wallet signing
-authority. They must be:
+Bloom supports two session classes:
+
+1. **Delegated-credential sessions**, where the approved action mints a venue
+   credential distinct from the owner wallet key, such as a Hyperliquid agent
+   key.
+2. **Owner-signing sessions**, where the approved action authorizes the daemon
+   to keep the owner wallet signing key resident in daemon memory behind a
+   frozen, host-enforced session policy for longer than a single action.
+
+Owner-signing sessions are necessary for chains or venues that do not provide a
+native delegation mechanism and where Bloom must support long-running agent
+work without deploying onchain contracts. They are more sensitive than
+delegated-credential sessions because the owner key remains the signer, so they
+must be explicit in the plan and audit copy and must use `assurance =
+"hardened"` unless wallet policy sets an even stricter requirement.
+
+Concrete required use case: an agent may be approved once to send up to
+`100 USDC` per rolling day to a known address from an EVM wallet, without
+requiring a passkey ceremony for each transfer and without deploying an onchain
+contract. The initial Sealed Approval action mints an
+`evm_owner_signing_session` with a sealed policy snapshot that fixes:
+
+```text
+wallet
+chain_id
+token_contract = USDC
+recipient
+rolling_window = 24h
+max_amount = 100 USDC
+allowed_method = ERC20.transfer(recipient, amount)
+max_fee_policy
+ttl
+fail_safe_behavior
+```
+
+Later agent writes stage session-use transfer requests against that session. A
+session-use request does not carry a fresh `approval.json`; it binds to the
+approved `session_id`, sealed session scope, and current budget state, and it
+must produce a central audit record. The daemon may sign and broadcast only if
+the request exactly matches the sealed session scope, the daily budget has not
+been exhausted, fee policy passes, the session is live, and the signing
+attestation matches the constructed ERC-20 transfer digest. Any different
+token, recipient, method, chain, amount over the remaining daily budget, policy
+expansion, or expired/revoked/lost session must stage a new Sealed Approval
+action.
+
+No onchain enforcement is implied for owner-signing sessions. The security
+boundary is local daemon enforcement plus frozen caps and audit. If the daemon
+restarts, sleeps, locks, crashes, or loses the in-memory signer, the session
+becomes unusable or orphaned and requires a fresh Sealed Approval ceremony to
+resume. The owner key, wallet DEK, PRF output, and grants must never be written
+to disk to preserve the session.
+
+All standing sessions must be:
 
 - minted only by a Sealed Approval action;
-- stored outside the VFS with owner-only filesystem permissions;
+- stored outside the VFS with owner-only filesystem permissions when they have
+  persistent non-wallet secret material; owner-signing sessions may persist only
+  non-secret session metadata and caps;
 - scoped to wallet, venue, network, action classes, caps, and TTL;
 - revocable;
 - frozen at mint time so later policy edits cannot widen a live credential;
 - audited centrally on mint, use, expiry, revoke, and recovery;
-- limited to one live credential per `(wallet, venue, network)` unless a spec
+- limited to one live session per `(wallet, venue, network)` unless a spec
   for safe concurrency exists.
 
 Each session type must explicitly choose fail-safe or fail-stale behavior for
@@ -1084,6 +1139,8 @@ audit result
 This includes:
 
 - wallet EVM tx broadcast, replace, cancel;
+- EVM owner-signing session minting and bounded session use, including the
+  `100 USDC/day to a known address` use case;
 - wallet policy edits and policy signing through the first-party
   `wallet-policy` Petal;
 - paid HTTP x402/MPP confirms and session deposits;
@@ -1153,12 +1210,32 @@ actions, execute from sealed proposed policy bytes, sign `policy.toml.sig`
 through the grant host API, and atomically install `policy.toml` plus
 `policy.toml.sig` only after approval and execution succeed.
 
+### 11.8 Implement EVM Owner-Signing Sessions
+
+Implement first-party EVM owner-signing sessions for bounded agent transfers
+where no onchain delegation contract is available. The MVP must support a
+session that can send up to a configured daily USDC amount to a configured
+recipient on a configured chain after one hardened Sealed Approval ceremony.
+
+This implementation must:
+
+- keep owner signing material in daemon memory only;
+- persist only non-secret session metadata, frozen caps, counters, and audit;
+- deny after daemon restart, sleep, lock, crash recovery, expiry, revoke, or
+  budget exhaustion;
+- enforce exact token, recipient, chain, method, TTL, fee policy, and rolling
+  daily cap before each signature;
+- audit every attempted and successful session use;
+- require a new Sealed Approval for any cap, recipient, token, chain, method, or
+  TTL expansion.
+
 ## 12. Acceptance Criteria
 
 The codebase fully implements this spec when:
 
-1. No command or VFS path can move value or change authority without a central
-   sealed action and signed `approval.json`.
+1. No command or VFS path can move value or change authority without either a
+   central sealed action and signed `approval.json`, or a live standing session
+   that was itself minted by a central sealed action and signed `approval.json`.
 2. No passphrase/local wallet signing path remains.
 3. `write_unlocked` does not exist.
 4. Legacy marker files are neither produced nor consumed.
@@ -1168,32 +1245,40 @@ The codebase fully implements this spec when:
 7. PRF output, decrypted wallet keys, and grants are never written to disk.
 8. Grants are in-memory, short-lived, Petal-scoped, sealed-intent-scoped, and
    auditable.
-9. First-party EVM, paid HTTP, DeFi, Polymarket, and Hyperliquid components are
+9. Owner-signing sessions are in-memory-only for owner key material, bounded by
+   frozen caps, revoked or orphaned on restart/sleep/lock, and audited on every
+   use.
+10. First-party EVM, paid HTTP, DeFi, Polymarket, and Hyperliquid components are
    represented as Petals for authorization purposes.
-10. Venue directories are projections over central `/outbox` actions.
-11. Petals execute from sealed canonical bytes.
-12. Hard policy rules cannot be overridden by Sealed Approval.
-13. Restart cannot replay a consumed approval nonce.
-14. Tests cover replay denial, stale approval denial, wrong Petal denial,
+11. Venue directories are projections over central `/outbox` actions.
+12. Petals execute from sealed canonical bytes.
+13. Hard policy rules cannot be overridden by Sealed Approval.
+14. Restart cannot replay a consumed approval nonce.
+15. Tests cover replay denial, stale approval denial, wrong Petal denial,
    wrong intent denial, expired grant denial, local wallet rejection, and
    absence of legacy marker behavior.
-15. Tests cover PRF output never crossing VFS/projection serialization
+16. Tests cover PRF output never crossing VFS/projection serialization
    boundaries.
-16. Tests cover daemon-terms/petal-policy digest mismatch rejection,
+17. Tests cover daemon-terms/petal-policy digest mismatch rejection,
    disallowed `sign-hash` intent rejection, and attestation rejection when
    attested facts exceed the sealed Petal policy snapshot.
-17. Tests cover plan/challenge/intent binding: changing any sealed intent field
+18. Tests cover plan/challenge/intent binding: changing any sealed intent field
    changes the WebAuthn challenge.
-18. Tests cover multi-passkey credential selection, revoked credential
+19. Tests cover multi-passkey credential selection, revoked credential
    rejection, and per-credential PRF/DEK unwrap.
-19. Tests cover system hard rules being uneditable by wallet policy and wallet
+20. Tests cover system hard rules being uneditable by wallet policy and wallet
    hard-rule weakening requiring hardened policy-update approval.
-20. Tests cover `get-policy()` returning only the sealed, intent-committed
+21. Tests cover `get-policy()` returning only the sealed, intent-committed
    Petal policy snapshot; live policy edits after sealing do not change injected
    bytes.
-21. Tests cover post-execution reconciliation detecting results inconsistent
+22. Tests cover post-execution reconciliation detecting results inconsistent
    with signing attestations and freezing/revoking the offending Petal grant.
-22. Tests document the remaining MVP trust boundary: the daemon validates
+23. Tests cover the EVM owner-signing session use case: one hardened approval
+   mints a session that can send within a `100 USDC/day` configured cap to one
+   configured recipient without another ceremony, while wrong token, wrong
+   recipient, wrong chain, over-budget, expired, restarted, locked, or revoked
+   sessions deny.
+24. Tests document the remaining MVP trust boundary: the daemon validates
    attestations against policy, but trusts approved Petals that attestations
    honestly describe `hash32`.
 
@@ -1207,10 +1292,11 @@ The codebase fully implements this spec when:
 4. Build central `/outbox` and projection plumbing.
 5. Convert one first-party Petal end to end, preferably wallet EVM tx confirm.
 6. Implement one-ceremony passkey assertion + PRF grant minting.
-7. Convert requests, DeFi, Polymarket, and Hyperliquid.
-8. Remove or hard-disable `bloom-chain` and `pipe` signers.
-9. Enforce hard/step-up policy taxonomy across all policy engines.
-10. Update user docs and examples to use Sealed Approval terminology.
+7. Implement EVM owner-signing sessions for bounded agent transfers.
+8. Convert requests, DeFi, Polymarket, and Hyperliquid.
+9. Remove or hard-disable `bloom-chain` and `pipe` signers.
+10. Enforce hard/step-up policy taxonomy across all policy engines.
+11. Update user docs and examples to use Sealed Approval terminology.
 
 ## 14. Current Implementation Anchors
 
