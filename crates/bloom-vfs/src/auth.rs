@@ -51,7 +51,7 @@ impl AuthServices {
 
     pub fn require_approval_verifier(&self) -> Result<&Arc<dyn ApprovalVerifier>, HandlerError> {
         self.approval_verifier.as_ref().ok_or_else(|| {
-            HandlerError::Unsupported("Layer B approval verifier is not wired".into())
+            HandlerError::Unsupported("Sealed Approval verifier is not wired".into())
         })
     }
 
@@ -60,9 +60,9 @@ impl AuthServices {
     }
 
     pub fn require_store(&self) -> Result<&Arc<dyn AuthStoreView>, HandlerError> {
-        self.store
-            .as_ref()
-            .ok_or_else(|| HandlerError::Unsupported("Layer B auth store is not wired".into()))
+        self.store.as_ref().ok_or_else(|| {
+            HandlerError::Unsupported("Sealed Approval auth store is not wired".into())
+        })
     }
 
     pub fn writer(&self) -> Option<&Arc<dyn AuthStoreWriter>> {
@@ -71,7 +71,7 @@ impl AuthServices {
 
     pub fn require_writer(&self) -> Result<&Arc<dyn AuthStoreWriter>, HandlerError> {
         self.writer.as_ref().ok_or_else(|| {
-            HandlerError::Unsupported("Layer B auth store writer is not wired".into())
+            HandlerError::Unsupported("Sealed Approval auth store writer is not wired".into())
         })
     }
 

@@ -228,7 +228,7 @@ fn polymarket_onboard_auth_dir(root: &Path, wallet: &str) -> Result<PathBuf, Han
     Ok(root.join(wallet))
 }
 
-fn polymarket_onboard_entry_id(wallet: &str) -> String {
+fn polymarket_onboard_action_id(wallet: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bloom.polymarket.onboard.entry.v1");
     hasher.update(wallet.as_bytes());
@@ -258,7 +258,7 @@ fn polymarket_onboard_envelope(
             schema: "bloom.intent_header.v1".into(),
             wallet: wallet.to_string(),
             surface: "polymarket".into(),
-            entry_id: polymarket_onboard_entry_id(wallet),
+            action_id: polymarket_onboard_action_id(wallet),
             executor_id: "polymarket-onboard".into(),
             network: "polygon".into(),
             account: wallet.to_string(),
@@ -2054,7 +2054,7 @@ impl PolymarketHandler {
                 geo.country, geo.region
             )));
         }
-        self.prepare_onboard_layer_b(ob, wallet).await?;
+        self.prepare_onboard_sealed(ob, wallet).await?;
         // …and be unlocked: signing (approval batch, ClobAuth) needs the key.
         let signer_arc = self.keystore.signer(wallet).map_err(|e| match e {
             KeystoreError::Locked(_) => HandlerError::invalid(format!(
@@ -2102,7 +2102,7 @@ impl PolymarketHandler {
         Ok(())
     }
 
-    async fn prepare_onboard_layer_b(
+    async fn prepare_onboard_sealed(
         &self,
         ob: &PolymarketOnboarding,
         wallet: &str,
@@ -2133,7 +2133,7 @@ impl PolymarketHandler {
                 .require_approval_verifier()?
                 .verify_and_consume(approval, pm_now_ms_u64())
                 .await
-                .map_err(|e| HandlerError::invalid(format!("Layer B approval rejected: {e}")))?;
+                .map_err(|e| HandlerError::invalid(format!("Sealed Approval rejected: {e}")))?;
             return Ok(());
         }
         let mut nonce_bytes = [0u8; 32];
@@ -2144,7 +2144,7 @@ impl PolymarketHandler {
             .require_writer()?
             .issue_challenge(
                 "polymarket",
-                &staged.entry_id,
+                &staged.action_id,
                 &server_nonce,
                 pm_now_ms_u64().saturating_add(APPROVAL_TTL_MS),
                 pm_now_ms_u64(),

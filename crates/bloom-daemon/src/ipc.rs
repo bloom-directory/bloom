@@ -373,7 +373,7 @@ impl IpcServer {
         let info = keystore
             .info(wallet)
             .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?;
-        let mut layer_b_approval_written = false;
+        let mut sealed_approval_written = false;
         match info.kind {
             WalletKind::PasskeyGated => {
                 // A daemon may have a signer cached from a previous ceremony.
@@ -389,7 +389,7 @@ impl IpcServer {
                     keystore.root().parent().map(|home| home.join("outbox")),
                     keystore.raw_policy(wallet).ok().map(|(p, _)| p).as_deref(),
                 );
-                let reviewed_intent_hash = intent.intent_hash();
+                let _reviewed_intent_hash = intent.intent_hash();
                 if let Some(home) = keystore.root().parent() {
                     persist_outbox_review_intent(wallet, &path, &home.join("outbox"), &intent)
                         .map_err(|e| HandlerError::backend(e.to_string()))?;
@@ -412,8 +412,8 @@ impl IpcServer {
                 if let Some(policy) = edited_policy {
                     bytes = policy.into_bytes();
                 } else {
-                    layer_b_approval_written = self
-                        .maybe_sign_layer_b_approval(
+                    sealed_approval_written = self
+                        .maybe_sign_sealed_approval(
                             keystore,
                             wallet,
                             &path,
@@ -430,21 +430,14 @@ impl IpcServer {
                         .await?;
                 }
                 if !self.auth_services.is_wired()
-                    && !layer_b_approval_written
+                    && !sealed_approval_written
                     && is_outbox_confirm_write(wallet, &path)
                 {
-                    if let Some(home) = keystore.root().parent() {
-                        persist_outbox_review_approved(
-                            wallet,
-                            &path,
-                            &home.join("outbox"),
-                            &reviewed_intent_hash,
-                        )
-                        .map_err(|e| HandlerError::backend(e.to_string()))?;
-                    }
-                    bytes.extend_from_slice(
-                        format!("\nreview_hash={reviewed_intent_hash}").as_bytes(),
-                    );
+                    return Err(HandlerError::Unsupported(
+                        "outbox confirm requires Sealed Approval; \
+                         auth services are not wired (marker fallback removed)"
+                            .into(),
+                    ));
                 }
             }
             _ => {
@@ -453,53 +446,44 @@ impl IpcServer {
                 )?;
                 if self.auth_services.is_wired()
                     && let Some((challenge_path, _approval_path)) =
-                        layer_b_approval_paths(keystore, wallet, &path, &bytes)
+                        sealed_approval_paths(keystore, wallet, &path, &bytes)
                     && challenge_path.exists()
                 {
                     return Err(HandlerError::Unsupported(
-                        "fresh Layer B approval requires a passkey wallet; local password wallets can only auto-confirm actions that remain in policy".into(),
+                        "fresh Sealed Approval requires a passkey wallet; local password wallets can only auto-confirm actions that remain in policy".into(),
                     ));
                 }
             }
         }
-        // For a policy-session mint, persist the one-time reviewed-intent approval
-        // marker the VFS mint handler requires. The passkey branch bound this exact
-        // descriptor in its ceremony; the passphrase branch's unlock is the presence
-        // proof. Either way a real ceremony happened, so the marker is authorized.
+        // For a policy-session mint, require wired Sealed Approval. The old
+        // forgeable marker fallback is removed; fail closed when unwired.
         if is_policy_session_new(wallet, &path)
-            && let Some(home) = keystore.root().parent()
-            && !layer_b_approval_written
+            && !sealed_approval_written
             && !self.auth_services.is_wired()
         {
-            let intent =
-                bloom_proto::policy_session_mint_intent(wallet, &path.to_string_path(), &bytes);
-            bloom_vfs::policy_session_review::persist_review_approved(
-                home,
-                wallet,
-                &intent.intent_hash(),
-            )
-            .map_err(|e| HandlerError::backend(e.to_string()))?;
+            return Err(HandlerError::Unsupported(
+                "policy-session mint requires Sealed Approval; \
+                 auth services are not wired (marker fallback removed)"
+                    .into(),
+            ));
         }
-        // Paid request confirms can sign x402 or Tempo MPP credentials. The VFS
-        // handler consumes this one-time marker so direct mounted writes cannot
-        // reuse a cached signer without passing through write_unlocked.
+        // Paid request confirms can sign x402 or Tempo MPP credentials. The old
+        // forgeable marker fallback is removed; fail closed when unwired.
         if let Some(home) = keystore.root().parent()
-            && let Some(id) = request_confirm_id(home, &path)
-            && !layer_b_approval_written
+            && let Some(_id) = request_confirm_id(home, &path)
+            && !sealed_approval_written
             && !self.auth_services.is_wired()
         {
-            let confirm_value = String::from_utf8_lossy(&bytes).trim().to_ascii_lowercase();
-            bloom_vfs::handlers::requests::persist_request_confirm_approved(
-                home,
-                &id,
-                wallet,
-                &confirm_value,
-            )?;
+            return Err(HandlerError::Unsupported(
+                "request confirm requires Sealed Approval; \
+                 auth services are not wired (marker fallback removed)"
+                    .into(),
+            ));
         }
         self.vfs.write(&path, &bytes).await
     }
 
-    async fn maybe_sign_layer_b_approval(
+    async fn maybe_sign_sealed_approval(
         &self,
         keystore: &Keystore,
         wallet: &str,
@@ -508,7 +492,7 @@ impl IpcServer {
         intent: Option<CeremonyIntent>,
     ) -> Result<bool, HandlerError> {
         let Some((challenge_path, approval_path)) =
-            layer_b_approval_paths(keystore, wallet, path, bytes)
+            sealed_approval_paths(keystore, wallet, path, bytes)
         else {
             return Ok(false);
         };
@@ -531,7 +515,7 @@ impl IpcServer {
                 .issue_review_session(
                     &review_session_id,
                     &challenge.surface,
-                    &challenge.entry_id,
+                    &challenge.action_id,
                     challenge.expiry_ms,
                     ipc_now_ms(),
                 )
@@ -545,7 +529,7 @@ impl IpcServer {
             schema: APPROVAL_SCHEMA_V1.into(),
             wallet: wallet.to_string(),
             surface: challenge.surface.clone(),
-            entry_id: challenge.entry_id.clone(),
+            action_id: challenge.action_id.clone(),
             intent_hash: challenge.intent_hash.clone(),
             executor_id: sealed.envelope.header.executor_id.clone(),
             network: sealed.envelope.header.network.clone(),
@@ -560,12 +544,12 @@ impl IpcServer {
         let signature = keystore
             .sign_approval_with_passkey(wallet, &unsigned, intent)
             .await
-            .map_err(|e| HandlerError::backend(format!("sign Layer B approval: {e}")))?;
+            .map_err(|e| HandlerError::backend(format!("sign Sealed Approval: {e}")))?;
         let approval = Approval {
             schema: unsigned.schema,
             wallet: unsigned.wallet,
             surface: unsigned.surface,
-            entry_id: unsigned.entry_id,
+            action_id: unsigned.action_id,
             intent_hash: unsigned.intent_hash,
             executor_id: unsigned.executor_id,
             network: unsigned.network,
@@ -968,7 +952,7 @@ fn is_outbox_confirm_write(wallet: &str, path: &VfsPath) -> bool {
     )
 }
 
-fn layer_b_approval_paths(
+fn sealed_approval_paths(
     keystore: &Keystore,
     wallet: &str,
     path: &VfsPath,
@@ -989,12 +973,12 @@ fn layer_b_approval_paths(
         ));
     }
     if is_policy_session_new(wallet, path) {
-        let entry_id = policy_session_entry_id(wallet, bytes);
+        let action_id = policy_session_action_id(wallet, bytes);
         let dir = keystore
             .root()
             .join(wallet)
             .join("policy-session")
-            .join(entry_id);
+            .join(action_id);
         return Some((
             dir.join("approval_challenge.json"),
             dir.join("approval.json"),
@@ -1021,7 +1005,7 @@ fn layer_b_approval_paths(
     None
 }
 
-fn policy_session_entry_id(wallet: &str, data: &[u8]) -> String {
+fn policy_session_action_id(wallet: &str, data: &[u8]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bloom.policy_session.entry.v1");
     hasher.update(wallet.as_bytes());
@@ -1058,7 +1042,10 @@ fn polymarket_onboard_dir(home: &Path, wallet: &str, path: &VfsPath) -> Option<P
         return None;
     };
     if root == "polymarket" && action == "onboard" && w == wallet && leaf == "begin" {
-        Some(home.join("polymarket").join(safe_layer_b_segment(wallet)?))
+        Some(
+            home.join("polymarket")
+                .join(safe_sealed_approval_segment(wallet)?),
+        )
     } else {
         None
     }
@@ -1072,8 +1059,8 @@ fn hyperliquid_usd_send_dir(home: &Path, wallet: &str, path: &VfsPath) -> Option
         Some(
             home.join("hyperliquid")
                 .join("exchange")
-                .join(safe_layer_b_segment(network)?)
-                .join(safe_layer_b_segment(wallet)?),
+                .join(safe_sealed_approval_segment(network)?)
+                .join(safe_sealed_approval_segment(wallet)?),
         )
     } else {
         None
@@ -1097,13 +1084,13 @@ fn hyperliquid_agent_session_dir(
     Some(
         home.join("hyperliquid")
             .join("agent_sessions")
-            .join(safe_layer_b_segment(network)?)
-            .join(safe_layer_b_segment(wallet)?)
-            .join(safe_layer_b_segment(session_id)?),
+            .join(safe_sealed_approval_segment(network)?)
+            .join(safe_sealed_approval_segment(wallet)?)
+            .join(safe_sealed_approval_segment(session_id)?),
     )
 }
 
-fn safe_layer_b_segment(raw: &str) -> Option<String> {
+fn safe_sealed_approval_segment(raw: &str) -> Option<String> {
     if raw.is_empty()
         || raw == "."
         || raw == ".."
@@ -1122,7 +1109,7 @@ fn hardened_review_session_id(challenge: &ChallengeRecord) -> String {
     hasher.update(b"bloom.review_session.v1");
     hasher.update(challenge.surface.as_bytes());
     hasher.update(&[0]);
-    hasher.update(challenge.entry_id.as_bytes());
+    hasher.update(challenge.action_id.as_bytes());
     hasher.update(&[0]);
     hasher.update(challenge.intent_hash.as_bytes());
     hasher.update(&[0]);
@@ -1152,25 +1139,6 @@ fn persist_outbox_review_intent(
     std::fs::write(
         dir.join("review_intent.json"),
         serde_json::to_vec_pretty(intent).map_err(|e| std::io::Error::other(e.to_string()))?,
-    )
-}
-
-fn persist_outbox_review_approved(
-    wallet: &str,
-    path: &VfsPath,
-    outbox_root: &Path,
-    intent_hash: &str,
-) -> std::io::Result<()> {
-    let Some(dir) = outbox_confirm_dir(wallet, path, outbox_root) else {
-        return Ok(());
-    };
-    let approved = serde_json::json!({
-        "schema": "bloom.review_approved.v1",
-        "intent_hash": intent_hash,
-    });
-    std::fs::write(
-        dir.join("review_approved.json"),
-        serde_json::to_vec_pretty(&approved).map_err(|e| std::io::Error::other(e.to_string()))?,
     )
 }
 

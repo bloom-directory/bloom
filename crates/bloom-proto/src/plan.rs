@@ -76,6 +76,12 @@ pub struct StagedTx {
     /// dependency is reconciled to `Success`.
     #[serde(default)]
     pub depends_on: Option<String>,
+    /// Central action_id allocated via the central outbox projection.
+    /// Set when the tx is staged with a `CentralOutboxProjection` active,
+    /// so that the daemon-wide `/outbox/` VFS surface can correlate this
+    /// EVM entry to its unified action record.
+    #[serde(default)]
+    pub action_id: Option<String>,
 }
 
 /// Lightweight token reference embedded in a `StagedTx` for display.
@@ -281,6 +287,7 @@ mod tests {
             nft: None,
             usd_value: None,
             depends_on: None,
+            action_id: None,
         }
     }
 

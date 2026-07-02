@@ -34,14 +34,14 @@ use bloom_revert::{
     OpenchainDecoder, boxed,
 };
 use bloom_script::{ChainStateIface, PqSignature, PtbTx};
-use bloom_tx::outbox::Outbox;
+use bloom_tx::outbox::{CentralOutboxProjection, Outbox};
 use bloom_tx::tx_engine::TxEngine;
 use bloom_vfs::handlers::polymarket::{ChainClientReader, PolymarketOnboarding, build_onboarder};
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
-    AddressBookHandler, ChainsHandler, DefiHandler, DocsHandler, EnsHandler, HyperliquidHandler,
-    PolymarketHandler, PricesHandler, RequestsHandler, SimulateHandler, StatusHandler,
-    ToolsHandler, WalletsHandler, WatchHandler,
+    AddressBookHandler, CentralOutbox, ChainsHandler, DefiHandler, DocsHandler, EnsHandler,
+    HyperliquidHandler, OutboxHandler, PolymarketHandler, PricesHandler, RequestsHandler,
+    SimulateHandler, StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
 };
 use bloom_vfs::tx_handler::PtbSubmitter;
 use bloom_vfs::{AuthServices, HandlerError, PathCache, Vfs};
@@ -50,6 +50,71 @@ use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+
+use std::sync::Mutex;
+
+/// Concrete adapter that bridges [`CentralOutbox`] (filesystem) and
+/// [`AuthStore`] (action_id_map) to satisfy [`CentralOutboxProjection`]
+/// for the EVM tx-engine outbox.
+struct EvmOutboxProjection {
+    central: CentralOutbox,
+    auth: Mutex<AuthStore>,
+}
+
+impl EvmOutboxProjection {
+    fn new(central: CentralOutbox, auth: AuthStore) -> Self {
+        Self {
+            central,
+            auth: Mutex::new(auth),
+        }
+    }
+}
+
+impl CentralOutboxProjection for EvmOutboxProjection {
+    fn allocate_action_id(
+        &self,
+        surface: &str,
+        venue_local_id: &str,
+        wallet: &str,
+        staged_at_ms: u64,
+    ) -> Result<String, String> {
+        let mut auth = self.auth.lock().map_err(|e| e.to_string())?;
+        auth.allocate_action_id(surface, venue_local_id, wallet, staged_at_ms)
+            .map_err(|e| e.to_string())
+    }
+
+    fn stage_action(
+        &self,
+        action_id: &str,
+        intent_json: &[u8],
+        plan_md: &str,
+        policy_check_json: &[u8],
+    ) -> Result<(), String> {
+        let intent_hash = sha256_hex(intent_json);
+        self.central
+            .stage(
+                action_id,
+                intent_json,
+                &intent_hash,
+                plan_md,
+                policy_check_json,
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    fn transition_action(&self, action_id: &str, from: &str, to: &str) -> Result<(), String> {
+        self.central
+            .transition(action_id, from, to)
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -244,8 +309,18 @@ impl Daemon {
         let keystore =
             Keystore::new(home.keystore_dir()).map_err(|e| DaemonError::Keystore(e.to_string()))?;
 
-        let outbox =
-            Outbox::new(home.outbox_dir()).map_err(|e| DaemonError::Outbox(e.to_string()))?;
+        // Open auth store early so we can also wire the EVM → central
+        // outbox projection.  Two connections to the same SQLite file:
+        // one for the verifier (owned), one for the projection (behind
+        // a Mutex).
+        let auth_db_path = home.root().join("auth").join("auth.sqlite");
+        let projection_auth = AuthStore::open(&auth_db_path)
+            .map_err(|e| DaemonError::Audit(format!("auth store (projection): {e}")))?;
+        let central = CentralOutbox::new(home.root().join("central_outbox"));
+        let projection: Arc<dyn CentralOutboxProjection> =
+            Arc::new(EvmOutboxProjection::new(central, projection_auth));
+        let outbox = Outbox::new_with_projection(home.outbox_dir(), projection)
+            .map_err(|e| DaemonError::Outbox(e.to_string()))?;
         let mut tx_engine = TxEngine::new(
             outbox,
             config.stage_ttl.as_millis(),
@@ -279,7 +354,7 @@ impl Daemon {
         let audit =
             AuditLog::open(home.audit_path()).map_err(|e| DaemonError::Audit(e.to_string()))?;
         let audit_arc = Arc::new(audit.clone());
-        let auth_store = AuthStore::open(home.root().join("auth").join("auth.sqlite"))
+        let auth_store = AuthStore::open(&auth_db_path)
             .map_err(|e| DaemonError::Audit(format!("auth store: {e}")))?;
         let auth_verifier = Arc::new(StoreApprovalVerifier::new(
             auth_store,
@@ -567,6 +642,12 @@ impl Daemon {
             )
             .mount("ens", Arc::new(EnsHandler::new(ens_client.clone())) as _)
             .mount("prices", Arc::new(PricesHandler::new(prices)) as _)
+            .mount(
+                "outbox",
+                Arc::new(OutboxHandler::new(CentralOutbox::new(
+                    home.root().join("central_outbox"),
+                ))) as _,
+            )
             .mount(
                 "addressbook",
                 Arc::new(
@@ -1671,6 +1752,7 @@ ws_url = "wss://example.invalid"
             nft: None,
             usd_value: None,
             depends_on: None,
+            action_id: None,
         };
         d.tx_engine.outbox.write_pending(&staged, "p").unwrap();
         let n = d.tx_engine.outbox.sweep_expired(2).unwrap();

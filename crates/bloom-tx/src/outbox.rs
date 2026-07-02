@@ -93,6 +93,8 @@ pub enum OutboxError {
     InvalidWallet(String),
     #[error("invalid chain '{0}'")]
     InvalidChain(String),
+    #[error("{0}")]
+    Other(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +197,34 @@ pub struct SameNonceAttemptQuery<'a> {
     pub excluding_kind: BroadcastAttemptKind,
 }
 
+/// Projection interface for the central outbox. When attached to an
+/// [`Outbox`], every staged / transitioned EVM tx is mirrored into the
+/// central action store under a stable `action_id`, giving the daemon a
+/// single unified view across all surfaces.
+pub trait CentralOutboxProjection: Send + Sync {
+    /// Allocate (or look up) a central action_id for the given
+    /// `(surface, venue_local_id)` pair.
+    fn allocate_action_id(
+        &self,
+        surface: &str,
+        venue_local_id: &str,
+        wallet: &str,
+        staged_at_ms: u64,
+    ) -> Result<String, String>;
+
+    /// Create the pending action directory with the standard files.
+    fn stage_action(
+        &self,
+        action_id: &str,
+        intent_json: &[u8],
+        plan_md: &str,
+        policy_check_json: &[u8],
+    ) -> Result<(), String>;
+
+    /// Move the action from one state to another.
+    fn transition_action(&self, action_id: &str, from: &str, to: &str) -> Result<(), String>;
+}
+
 #[derive(Clone)]
 pub struct Outbox {
     inner: Arc<OutboxInner>,
@@ -203,16 +233,34 @@ pub struct Outbox {
 struct OutboxInner {
     root: PathBuf,
     next_id: RwLock<u64>,
+    projection: Option<Arc<dyn CentralOutboxProjection>>,
 }
 
 impl Outbox {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, OutboxError> {
+        Self::new_inner(root, None)
+    }
+
+    /// Create an outbox that mirrors every stage/transition into the
+    /// central action store via `projection`.
+    pub fn new_with_projection(
+        root: impl Into<PathBuf>,
+        projection: Arc<dyn CentralOutboxProjection>,
+    ) -> Result<Self, OutboxError> {
+        Self::new_inner(root, Some(projection))
+    }
+
+    fn new_inner(
+        root: impl Into<PathBuf>,
+        projection: Option<Arc<dyn CentralOutboxProjection>>,
+    ) -> Result<Self, OutboxError> {
         let root = root.into();
         fs::create_dir_all(&root)?;
         Ok(Self {
             inner: Arc::new(OutboxInner {
                 root,
                 next_id: RwLock::new(1),
+                projection,
             }),
         })
     }
@@ -257,12 +305,30 @@ impl Outbox {
 
     /// Persist a staged tx in `pending/<id>/` along with its derived
     /// artefacts. The caller owns plan.md / policy_check.json content.
+    /// When a central outbox projection is attached, also stages a
+    /// central action and stamps the returned `action_id` into
+    /// `intent.json`.
     pub fn write_pending(&self, staged: &StagedTx, plan_md: &str) -> Result<PathBuf, OutboxError> {
+        let mut staged = staged.clone();
+
+        // Project to central outbox if a projection is wired.
+        if let Some(proj) = &self.inner.projection {
+            let action_id = proj
+                .allocate_action_id("evm", &staged.id, &staged.wallet, staged.created_ms as u64)
+                .map_err(OutboxError::Other)?;
+            staged.action_id = Some(action_id.clone());
+
+            let intent_json = serde_json::to_vec_pretty(&staged)?;
+            let policy_check_json = serde_json::to_vec_pretty(&staged.policy_checks)?;
+            proj.stage_action(&action_id, &intent_json, plan_md, &policy_check_json)
+                .map_err(OutboxError::Other)?;
+        }
+
         let dir = self
             .state_dir(&staged.wallet, &staged.chain, OutboxState::Pending)?
             .join(&staged.id);
         fs::create_dir_all(&dir)?;
-        fs::write(dir.join("intent.json"), serde_json::to_vec_pretty(staged)?)?;
+        fs::write(dir.join("intent.json"), serde_json::to_vec_pretty(&staged)?)?;
         fs::write(dir.join("plan.md"), plan_md.as_bytes())?;
         fs::write(
             dir.join("policy_check.json"),
@@ -548,6 +614,8 @@ impl Outbox {
     }
 
     /// Move pending/<id> → <new_state>/<id> (atomic via fs::rename).
+    /// When a central outbox projection is attached and the entry has an
+    /// `action_id`, the central action is transitioned as well.
     pub fn transition(
         &self,
         entry: &OutboxEntry,
@@ -568,6 +636,22 @@ impl Outbox {
                 let _ = fs::remove_file(target.join(kind.raw_name()));
             }
         }
+
+        // Project transition to central outbox.
+        if let (Some(proj), Some(action_id)) = (&self.inner.projection, &entry.staged.action_id) {
+            let from_str = match entry.state {
+                OutboxState::Pending => "pending",
+                OutboxState::Sent => "sent",
+                OutboxState::Failed => "failed",
+            };
+            let to_str = match new_state {
+                OutboxState::Pending => "pending",
+                OutboxState::Sent => "sent",
+                OutboxState::Failed => "failed",
+            };
+            let _ = proj.transition_action(action_id, from_str, to_str);
+        }
+
         Ok(target)
     }
 
@@ -928,6 +1012,7 @@ mod tests {
             nft: None,
             usd_value: None,
             depends_on: None,
+            action_id: None,
         }
     }
 
@@ -1307,5 +1392,103 @@ mod tests {
         let read_body: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(read_body, body);
+    }
+
+    // --- Central outbox projection tests ---
+
+    use std::sync::Mutex;
+
+    struct MockProjection {
+        allocated: Mutex<Vec<(String, String)>>, // (surface, venue_local_id)
+        staged: Mutex<Vec<String>>,              // action_ids staged
+        transitions: Mutex<Vec<(String, String, String)>>, // (id, from, to)
+    }
+
+    impl MockProjection {
+        fn new() -> Self {
+            Self {
+                allocated: Mutex::new(vec![]),
+                staged: Mutex::new(vec![]),
+                transitions: Mutex::new(vec![]),
+            }
+        }
+    }
+
+    impl CentralOutboxProjection for MockProjection {
+        fn allocate_action_id(
+            &self,
+            surface: &str,
+            venue_local_id: &str,
+            _wallet: &str,
+            _staged_at_ms: u64,
+        ) -> Result<String, String> {
+            let mut g = self.allocated.lock().unwrap();
+            let n = g.len();
+            g.push((surface.to_string(), venue_local_id.to_string()));
+            Ok(format!("act-{n:04}"))
+        }
+
+        fn stage_action(
+            &self,
+            action_id: &str,
+            _intent_json: &[u8],
+            _plan_md: &str,
+            _policy_check_json: &[u8],
+        ) -> Result<(), String> {
+            self.staged.lock().unwrap().push(action_id.to_string());
+            Ok(())
+        }
+
+        fn transition_action(&self, action_id: &str, from: &str, to: &str) -> Result<(), String> {
+            self.transitions.lock().unwrap().push((
+                action_id.to_string(),
+                from.to_string(),
+                to.to_string(),
+            ));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn projection_round_trips_stage_and_transition() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockProjection::new());
+        let ob = Outbox::new_with_projection(dir.path(), mock.clone()).unwrap();
+
+        let staged = fake_staged("0001-evm");
+        ob.write_pending(&staged, "# plan").unwrap();
+
+        // action_id should be stamped into intent.json.
+        let entry = ob.read("alice", "anvil", "0001-evm").unwrap();
+        assert_eq!(
+            entry.staged.action_id.as_deref(),
+            Some("act-0000"),
+            "action_id should be stamped into the staged tx"
+        );
+
+        // Mock should have recorded the allocation + stage.
+        assert_eq!(mock.allocated.lock().unwrap().len(), 1);
+        assert_eq!(mock.staged.lock().unwrap().len(), 1);
+
+        // Transition to sent.
+        ob.transition(&entry, OutboxState::Sent).unwrap();
+
+        // Mock should have recorded the transition.
+        let ts = mock.transitions.lock().unwrap();
+        assert_eq!(ts.len(), 1, "one transition should be projected");
+        assert_eq!(ts[0].0, "act-0000");
+        assert_eq!(ts[0].1, "pending");
+        assert_eq!(ts[0].2, "sent");
+    }
+
+    #[test]
+    fn projection_skipped_when_no_action_id() {
+        // Without a projection, no action_id is set.
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let staged = fake_staged("no-proj");
+        ob.write_pending(&staged, "# plan").unwrap();
+        let entry = ob.read("alice", "anvil", "no-proj").unwrap();
+        assert!(entry.staged.action_id.is_none());
     }
 }

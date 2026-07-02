@@ -1,4 +1,4 @@
-//! Concrete Layer B authorization store and verifier.
+//! Concrete Sealed Approval authorization store and verifier.
 //!
 //! The daemon wires [`AuthStore`] and [`StoreApprovalVerifier`] into the VFS
 //! handlers, TX engine, and IPC server at startup. VFS-facing crates depend
@@ -165,7 +165,7 @@ impl AuthStore {
 
             CREATE TABLE IF NOT EXISTS auth_entries (
                 surface TEXT NOT NULL,
-                entry_id TEXT NOT NULL,
+                action_id TEXT NOT NULL,
                 state TEXT NOT NULL,
                 intent_hash TEXT NOT NULL REFERENCES sealed_intents(intent_hash),
                 assurance TEXT NOT NULL,
@@ -174,25 +174,25 @@ impl AuthStore {
                 challenge_expiry_ms INTEGER,
                 reservation_id TEXT,
                 updated_ms INTEGER NOT NULL,
-                PRIMARY KEY(surface, entry_id)
+                PRIMARY KEY(surface, action_id)
             );
 
             CREATE TABLE IF NOT EXISTS approvals (
                 surface TEXT NOT NULL,
-                entry_id TEXT NOT NULL,
+                action_id TEXT NOT NULL,
                 nonce TEXT NOT NULL,
                 approval_json TEXT NOT NULL,
                 signer_kind TEXT NOT NULL,
                 assurance TEXT NOT NULL,
                 expiry_ms INTEGER NOT NULL,
                 consumed_ms INTEGER,
-                PRIMARY KEY(surface, entry_id, nonce)
+                PRIMARY KEY(surface, action_id, nonce)
             );
 
             CREATE TABLE IF NOT EXISTS review_sessions (
                 review_session_id TEXT PRIMARY KEY NOT NULL,
                 surface TEXT NOT NULL,
-                entry_id TEXT NOT NULL,
+                action_id TEXT NOT NULL,
                 intent_hash TEXT NOT NULL REFERENCES sealed_intents(intent_hash),
                 assurance TEXT NOT NULL,
                 expires_ms INTEGER NOT NULL,
@@ -235,9 +235,70 @@ impl AuthStore {
                 record_json TEXT NOT NULL,
                 created_ms INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS action_id_map (
+                surface TEXT NOT NULL,
+                venue_local_id TEXT NOT NULL,
+                action_id TEXT NOT NULL,
+                wallet TEXT NOT NULL,
+                created_ms INTEGER NOT NULL,
+                PRIMARY KEY(surface, venue_local_id)
+            );
             "#,
         )?;
         Ok(())
+    }
+
+    /// Allocate a globally-unique `action_id` and record the
+    /// `(surface, venue_local_id) → action_id` mapping so it survives restart.
+    pub fn allocate_action_id(
+        &mut self,
+        surface: &str,
+        venue_local_id: &str,
+        wallet: &str,
+        now_ms: u64,
+    ) -> Result<String, AuthStoreError> {
+        let tx = self.conn.transaction()?;
+        let existing: Option<String> = tx
+            .query_row(
+                "SELECT action_id FROM action_id_map WHERE surface = ?1 AND venue_local_id = ?2",
+                params![surface, venue_local_id],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+        let action_id = format!(
+            "{}-{:08x}-{:05}",
+            surface,
+            now_ms,
+            (now_ms % 100_000) as u32
+        );
+        tx.execute(
+            "INSERT OR IGNORE INTO action_id_map(surface, venue_local_id, action_id, wallet, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![surface, venue_local_id, &action_id, wallet, now_ms as i64],
+        )?;
+        tx.commit()?;
+        Ok(action_id)
+    }
+
+    /// Look up the central `action_id` for a `(surface, venue_local_id)` pair.
+    pub fn lookup_action_id(
+        &self,
+        surface: &str,
+        venue_local_id: &str,
+    ) -> Result<Option<String>, AuthStoreError> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT action_id FROM action_id_map WHERE surface = ?1 AND venue_local_id = ?2",
+                params![surface, venue_local_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+        Ok(result)
     }
 
     pub fn insert_sealed_intent(
@@ -273,14 +334,14 @@ impl AuthStore {
         )?;
         tx.execute(
             "INSERT OR IGNORE INTO auth_entries(
-                surface, entry_id, state, intent_hash, assurance, nonce, nonce_state,
+                surface, action_id, state, intent_hash, assurance, nonce, nonce_state,
                 reservation_id, updated_ms
              )
              VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, ?7)
             ",
             params![
                 envelope.header.surface,
-                envelope.header.entry_id,
+                envelope.header.action_id,
                 AuthEntryState::Staged.as_str(),
                 intent_hash,
                 assurance.as_str(),
@@ -290,7 +351,7 @@ impl AuthStore {
         )?;
         tx.commit()?;
         let entry = self
-            .auth_entry(&envelope.header.surface, &envelope.header.entry_id)?
+            .auth_entry(&envelope.header.surface, &envelope.header.action_id)?
             .ok_or_else(|| AuthStoreError::Denied("staged entry was not persisted".into()))?;
         if entry.intent_hash != intent_hash || entry.assurance != assurance {
             return Err(AuthStoreError::Denied(
@@ -303,7 +364,7 @@ impl AuthStore {
     pub fn issue_challenge(
         &mut self,
         surface: &str,
-        entry_id: &str,
+        action_id: &str,
         server_nonce: &str,
         expiry_ms: u64,
         now_ms: u64,
@@ -312,8 +373,8 @@ impl AuthStore {
         let (intent_hash, assurance): (String, String) = tx
             .query_row(
                 "SELECT intent_hash, assurance FROM auth_entries
-                 WHERE surface = ?1 AND entry_id = ?2 AND nonce_state = 'unused'",
-                params![surface, entry_id],
+                 WHERE surface = ?1 AND action_id = ?2 AND nonce_state = 'unused'",
+                params![surface, action_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
@@ -321,10 +382,10 @@ impl AuthStore {
         tx.execute(
             "UPDATE auth_entries
              SET state = ?3, nonce = ?4, nonce_state = ?5, challenge_expiry_ms = ?6, updated_ms = ?7
-             WHERE surface = ?1 AND entry_id = ?2 AND nonce_state = 'unused'",
+             WHERE surface = ?1 AND action_id = ?2 AND nonce_state = 'unused'",
             params![
                 surface,
-                entry_id,
+                action_id,
                 AuthEntryState::Challenged.as_str(),
                 server_nonce,
                 NonceState::Unused.as_str(),
@@ -335,7 +396,7 @@ impl AuthStore {
         tx.commit()?;
         Ok(ChallengeRecord {
             surface: surface.to_string(),
-            entry_id: entry_id.to_string(),
+            action_id: action_id.to_string(),
             intent_hash,
             server_nonce: server_nonce.to_string(),
             assurance: parse_assurance(&assurance)?,
@@ -347,7 +408,7 @@ impl AuthStore {
         &mut self,
         review_session_id: &str,
         surface: &str,
-        entry_id: &str,
+        action_id: &str,
         expires_ms: u64,
         now_ms: u64,
     ) -> Result<ReviewSessionRecord, AuthStoreError> {
@@ -355,22 +416,22 @@ impl AuthStore {
         let (intent_hash, assurance): (String, String) = tx
             .query_row(
                 "SELECT intent_hash, assurance FROM auth_entries
-                 WHERE surface = ?1 AND entry_id = ?2",
-                params![surface, entry_id],
+                 WHERE surface = ?1 AND action_id = ?2",
+                params![surface, action_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
             .ok_or_else(|| AuthStoreError::Denied("entry not found".into()))?;
         tx.execute(
             "INSERT INTO review_sessions(
-                review_session_id, surface, entry_id, intent_hash, assurance, expires_ms,
+                review_session_id, surface, action_id, intent_hash, assurance, expires_ms,
                 consumed_ms, created_ms
              )
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
             params![
                 review_session_id,
                 surface,
-                entry_id,
+                action_id,
                 intent_hash,
                 assurance,
                 expires_ms as i64,
@@ -388,12 +449,12 @@ impl AuthStore {
     ) -> Result<Option<ReviewSessionRecord>, AuthStoreError> {
         self.conn
             .query_row(
-                "SELECT surface, entry_id, intent_hash, assurance, expires_ms, consumed_ms, created_ms
+                "SELECT surface, action_id, intent_hash, assurance, expires_ms, consumed_ms, created_ms
                  FROM review_sessions WHERE review_session_id = ?1",
                 params![review_session_id],
                 |row| {
                     let surface: String = row.get(0)?;
-                    let entry_id: String = row.get(1)?;
+                    let action_id: String = row.get(1)?;
                     let intent_hash: String = row.get(2)?;
                     let assurance: String = row.get(3)?;
                     let expires_ms: i64 = row.get(4)?;
@@ -401,7 +462,7 @@ impl AuthStore {
                     let created_ms: i64 = row.get(6)?;
                     Ok((
                         surface,
-                        entry_id,
+                        action_id,
                         intent_hash,
                         assurance,
                         expires_ms,
@@ -412,11 +473,11 @@ impl AuthStore {
             )
             .optional()?
             .map(
-                |(surface, entry_id, intent_hash, assurance, expires_ms, consumed_ms, created_ms)| {
+                |(surface, action_id, intent_hash, assurance, expires_ms, consumed_ms, created_ms)| {
                     Ok(ReviewSessionRecord {
                         review_session_id: review_session_id.to_string(),
                         surface,
-                        entry_id,
+                        action_id,
                         intent_hash,
                         assurance: parse_assurance(&assurance)?,
                         expires_ms: expires_ms as u64,
@@ -520,13 +581,13 @@ impl AuthStore {
     pub fn auth_entry(
         &self,
         surface: &str,
-        entry_id: &str,
+        action_id: &str,
     ) -> Result<Option<AuthEntryRecord>, AuthStoreError> {
         self.conn
             .query_row(
                 "SELECT state, intent_hash, assurance, nonce, nonce_state, reservation_id, updated_ms
-                 FROM auth_entries WHERE surface = ?1 AND entry_id = ?2",
-                params![surface, entry_id],
+                 FROM auth_entries WHERE surface = ?1 AND action_id = ?2",
+                params![surface, action_id],
                 |row| {
                     let state: String = row.get(0)?;
                     let intent_hash: String = row.get(1)?;
@@ -551,7 +612,7 @@ impl AuthStore {
                 |(state, intent_hash, assurance, nonce, nonce_state, reservation_id, updated_ms)| {
                     Ok(AuthEntryRecord {
                         surface: surface.to_string(),
-                        entry_id: entry_id.to_string(),
+                        action_id: action_id.to_string(),
                         state: parse_entry_state(&state)?,
                         intent_hash,
                         assurance: parse_assurance(&assurance)?,
@@ -581,8 +642,8 @@ impl AuthStore {
             .query_row(
                 "SELECT intent_hash, assurance, nonce, nonce_state, challenge_expiry_ms
                  FROM auth_entries
-                 WHERE surface = ?1 AND entry_id = ?2",
-                params![approval.surface, approval.entry_id],
+                 WHERE surface = ?1 AND action_id = ?2",
+                params![approval.surface, approval.action_id],
                 |row| {
                     Ok((
                         row.get(0)?,
@@ -640,14 +701,14 @@ impl AuthStore {
             })?;
             let (
                 session_surface,
-                session_entry_id,
+                session_action_id,
                 session_intent_hash,
                 session_assurance,
                 session_expires_ms,
                 session_consumed_ms,
             ): (String, String, String, String, i64, Option<i64>) = tx
                 .query_row(
-                    "SELECT surface, entry_id, intent_hash, assurance, expires_ms, consumed_ms
+                    "SELECT surface, action_id, intent_hash, assurance, expires_ms, consumed_ms
                      FROM review_sessions WHERE review_session_id = ?1",
                     params![review_session_id],
                     |row| {
@@ -664,7 +725,7 @@ impl AuthStore {
                 .optional()?
                 .ok_or_else(|| AuthStoreError::Denied("review session not found".into()))?;
             if session_surface != approval.surface
-                || session_entry_id != approval.entry_id
+                || session_action_id != approval.action_id
                 || session_intent_hash != approval.intent_hash
                 || parse_assurance(&session_assurance)? != approval.assurance
             {
@@ -694,11 +755,11 @@ impl AuthStore {
         let approval_json = serde_json::to_string(approval)?;
         tx.execute(
             "INSERT INTO approvals(
-                surface, entry_id, nonce, approval_json, signer_kind, assurance, expiry_ms,
+                surface, action_id, nonce, approval_json, signer_kind, assurance, expiry_ms,
                 consumed_ms
              )
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(surface, entry_id, nonce) DO UPDATE SET
+             ON CONFLICT(surface, action_id, nonce) DO UPDATE SET
                 approval_json = excluded.approval_json,
                 signer_kind = excluded.signer_kind,
                 assurance = excluded.assurance,
@@ -706,7 +767,7 @@ impl AuthStore {
                 consumed_ms = excluded.consumed_ms",
             params![
                 approval.surface,
-                approval.entry_id,
+                approval.action_id,
                 approval.server_nonce,
                 approval_json,
                 signer_kind_str(approval.signer_kind),
@@ -718,10 +779,10 @@ impl AuthStore {
         tx.execute(
             "UPDATE auth_entries
              SET state = ?3, nonce_state = ?4, updated_ms = ?5
-             WHERE surface = ?1 AND entry_id = ?2 AND nonce = ?6 AND nonce_state = 'unused'",
+             WHERE surface = ?1 AND action_id = ?2 AND nonce = ?6 AND nonce_state = 'unused'",
             params![
                 approval.surface,
-                approval.entry_id,
+                approval.action_id,
                 AuthEntryState::Approved.as_str(),
                 NonceState::Consumed.as_str(),
                 now_ms as i64,
@@ -733,7 +794,7 @@ impl AuthStore {
         }
         let audit_record = serde_json::json!({
             "surface": approval.surface,
-            "entry_id": approval.entry_id,
+            "action_id": approval.action_id,
             "intent_hash": approval.intent_hash,
             "nonce": approval.server_nonce,
         })
@@ -1039,7 +1100,7 @@ where
     async fn issue_challenge(
         &self,
         surface: &str,
-        entry_id: &str,
+        action_id: &str,
         server_nonce: &str,
         expiry_ms: u64,
         now_ms: u64,
@@ -1048,14 +1109,14 @@ where
             .store
             .lock()
             .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
-        Ok(store.issue_challenge(surface, entry_id, server_nonce, expiry_ms, now_ms)?)
+        Ok(store.issue_challenge(surface, action_id, server_nonce, expiry_ms, now_ms)?)
     }
 
     async fn issue_review_session(
         &self,
         review_session_id: &str,
         surface: &str,
-        entry_id: &str,
+        action_id: &str,
         expires_ms: u64,
         now_ms: u64,
     ) -> Result<ReviewSessionRecord, AuthApiError> {
@@ -1063,7 +1124,15 @@ where
             .store
             .lock()
             .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
-        Ok(store.issue_review_session(review_session_id, surface, entry_id, expires_ms, now_ms)?)
+        Ok(
+            store.issue_review_session(
+                review_session_id,
+                surface,
+                action_id,
+                expires_ms,
+                now_ms,
+            )?,
+        )
     }
 }
 
@@ -1169,7 +1238,7 @@ fn parse_nonce_state(value: &str) -> Result<NonceState, AuthStoreError> {
 
 fn parse_assurance(value: &str) -> Result<AssuranceLevel, AuthStoreError> {
     match value {
-        "convenience" => Ok(AssuranceLevel::Convenience),
+        "standard" => Ok(AssuranceLevel::Standard),
         "hardened" => Ok(AssuranceLevel::Hardened),
         other => Err(AuthStoreError::InvalidAssurance(other.to_string())),
     }
@@ -1246,7 +1315,7 @@ mod tests {
                 schema: "bloom.intent_header.v1".into(),
                 wallet: "my-wallet".into(),
                 surface: "requests".into(),
-                entry_id: "req_1".into(),
+                action_id: "req_1".into(),
                 executor_id: "paid-http".into(),
                 network: "base".into(),
                 account: "default".into(),
@@ -1265,7 +1334,7 @@ mod tests {
             schema: APPROVAL_SCHEMA_V1.into(),
             wallet: sealed.envelope.header.wallet.clone(),
             surface: entry.surface.clone(),
-            entry_id: entry.entry_id.clone(),
+            action_id: entry.action_id.clone(),
             intent_hash: entry.intent_hash.clone(),
             executor_id: sealed.envelope.header.executor_id.clone(),
             network: sealed.envelope.header.network.clone(),
@@ -1313,7 +1382,7 @@ mod tests {
         let mut store = AuthStore::open_in_memory_for_tests().unwrap();
         let env = envelope();
         let staged = store
-            .stage_entry(&env, AssuranceLevel::Convenience, 100)
+            .stage_entry(&env, AssuranceLevel::Standard, 100)
             .unwrap();
         assert_eq!(staged.state, AuthEntryState::Staged);
         assert_eq!(staged.nonce_state, NonceState::Unused);
@@ -1324,7 +1393,7 @@ mod tests {
             .unwrap();
         assert_eq!(challenge.intent_hash, staged.intent_hash);
         assert_eq!(challenge.server_nonce, "nonce-1");
-        assert_eq!(challenge.assurance, AssuranceLevel::Convenience);
+        assert_eq!(challenge.assurance, AssuranceLevel::Standard);
 
         let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
         assert_eq!(entry.state, AuthEntryState::Challenged);
@@ -1337,10 +1406,10 @@ mod tests {
         let mut store = AuthStore::open_in_memory_for_tests().unwrap();
         let env = envelope();
         let first = store
-            .stage_entry(&env, AssuranceLevel::Convenience, 100)
+            .stage_entry(&env, AssuranceLevel::Standard, 100)
             .unwrap();
         let second = store
-            .stage_entry(&env, AssuranceLevel::Convenience, 101)
+            .stage_entry(&env, AssuranceLevel::Standard, 101)
             .unwrap();
         assert_eq!(second.intent_hash, first.intent_hash);
         assert_eq!(second.updated_ms, first.updated_ms);
@@ -1357,7 +1426,7 @@ mod tests {
         );
         assert!(
             store
-                .stage_entry(&changed, AssuranceLevel::Convenience, 103)
+                .stage_entry(&changed, AssuranceLevel::Standard, 103)
                 .is_err()
         );
     }
@@ -1367,7 +1436,7 @@ mod tests {
         let mut store = AuthStore::open_in_memory_for_tests().unwrap();
         let env = envelope();
         store
-            .stage_entry(&env, AssuranceLevel::Convenience, 100)
+            .stage_entry(&env, AssuranceLevel::Standard, 100)
             .unwrap();
         store
             .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
@@ -1404,7 +1473,7 @@ mod tests {
         let mut store = AuthStore::open_in_memory_for_tests().unwrap();
         let env = envelope();
         store
-            .stage_entry(&env, AssuranceLevel::Convenience, 100)
+            .stage_entry(&env, AssuranceLevel::Standard, 100)
             .unwrap();
         store
             .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
@@ -1438,7 +1507,7 @@ mod tests {
             let mut store = AuthStore::open(&path).unwrap();
             let env = envelope();
             store
-                .stage_entry(&env, AssuranceLevel::Convenience, 100)
+                .stage_entry(&env, AssuranceLevel::Standard, 100)
                 .unwrap();
             store
                 .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
@@ -1467,7 +1536,7 @@ mod tests {
         let mut store = AuthStore::open_in_memory_for_tests().unwrap();
         let env = envelope();
         store
-            .stage_entry(&env, AssuranceLevel::Convenience, 100)
+            .stage_entry(&env, AssuranceLevel::Standard, 100)
             .unwrap();
         store
             .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
@@ -1493,7 +1562,7 @@ mod tests {
         let mut store = AuthStore::open(&path).unwrap();
         let env = envelope();
         store
-            .stage_entry(&env, AssuranceLevel::Convenience, 100)
+            .stage_entry(&env, AssuranceLevel::Standard, 100)
             .unwrap();
         store
             .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
@@ -1531,7 +1600,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(staged.surface, "requests");
-        assert_eq!(staged.entry_id, "req_1");
+        assert_eq!(staged.action_id, "req_1");
         assert_eq!(staged.assurance, AssuranceLevel::Hardened);
 
         let challenge =
@@ -1808,5 +1877,36 @@ mod tests {
         assert!(amount_to_usd_micro("not-a-number", 6, 1.0).is_err());
         assert!(amount_to_usd_micro("1000000", 6, f64::NAN).is_err());
         assert!(amount_to_usd_micro("1000000", 6, -1.0).is_err());
+    }
+
+    #[test]
+    fn action_id_map_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("auth.sqlite");
+
+        let id1 = {
+            let mut store = AuthStore::open(&db_path).unwrap();
+            store
+                .allocate_action_id("outbox", "0001-a", "alice", 1_000)
+                .unwrap()
+        };
+        assert!(!id1.is_empty());
+
+        // Reopen the same DB file (simulates daemon restart).
+        let mut store2 = AuthStore::open(&db_path).unwrap();
+        let lookup = store2.lookup_action_id("outbox", "0001-a").unwrap();
+        assert_eq!(lookup.as_deref(), Some(id1.as_str()));
+
+        // Re-allocating the same (surface, venue_local_id) returns the same id.
+        let id1b = store2
+            .allocate_action_id("outbox", "0001-a", "alice", 2_000)
+            .unwrap();
+        assert_eq!(id1, id1b);
+
+        // A different venue_local_id gets a different action_id.
+        let id2 = store2
+            .allocate_action_id("outbox", "0002-b", "alice", 3_000)
+            .unwrap();
+        assert_ne!(id1, id2);
     }
 }

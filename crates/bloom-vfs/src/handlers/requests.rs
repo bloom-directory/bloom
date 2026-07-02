@@ -35,7 +35,6 @@ use crate::auth::AuthServices;
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
 
-const CONFIRM_APPROVAL_FILE: &str = ".confirm_approved.json";
 const APPROVAL_FILE: &str = "approval.json";
 const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
 const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
@@ -431,7 +430,7 @@ impl RequestsHandler {
         };
         let envelope = paid_http_canonical_envelope(subject)?;
         let staged = writer
-            .stage_entry(envelope, AssuranceLevel::Convenience, now_ms())
+            .stage_entry(envelope, AssuranceLevel::Standard, now_ms())
             .await
             .map_err(|e| HandlerError::backend(format!("stage paid-http auth entry: {e}")))?;
         fs::write(
@@ -441,13 +440,17 @@ impl RequestsHandler {
         Ok(())
     }
 
-    async fn require_layer_b_confirm_approval(
+    async fn require_sealed_confirm_approval(
         &self,
         pending: &Path,
         id: &str,
     ) -> Result<(), HandlerError> {
         if !self.auth_services.is_wired() {
-            return Ok(());
+            return Err(HandlerError::Unsupported(
+                "request confirm requires Sealed Approval; \
+                 auth services are not wired (marker fallback removed)"
+                    .into(),
+            ));
         }
         let approval_path = pending.join(APPROVAL_FILE);
         if approval_path.exists() {
@@ -456,16 +459,16 @@ impl RequestsHandler {
                 .require_approval_verifier()?
                 .verify_and_consume(approval, now_ms())
                 .await
-                .map_err(|e| HandlerError::invalid(format!("Layer B approval rejected: {e}")))?;
+                .map_err(|e| HandlerError::invalid(format!("Sealed Approval rejected: {e}")))?;
             return Ok(());
         }
 
-        let challenge = self.issue_layer_b_confirm_challenge(id).await?;
+        let challenge = self.issue_sealed_confirm_challenge(id).await?;
         write_json(pending.join(APPROVAL_CHALLENGE_FILE), &challenge)?;
         Err(HandlerError::PermissionDenied)
     }
 
-    async fn issue_layer_b_confirm_challenge(
+    async fn issue_sealed_confirm_challenge(
         &self,
         id: &str,
     ) -> Result<ChallengeRecord, HandlerError> {
@@ -513,11 +516,7 @@ impl RequestsHandler {
             .as_deref()
             .ok_or_else(|| HandlerError::backend("request.toml missing wallet"))?
             .to_string();
-        if self.auth_services.is_wired() {
-            self.require_layer_b_confirm_approval(&pending, id).await?;
-        } else {
-            consume_request_confirm_approved(&pending, &wallet, &value)?;
-        }
+        self.require_sealed_confirm_approval(&pending, id).await?;
         let host = request.url.host_str().unwrap_or("unknown").to_string();
         let mut challenge: NormalizedChallenge = read_json(pending.join("challenge.json"))?;
         validate_session_state_target(&challenge, id)?;
@@ -686,6 +685,7 @@ impl RequestsHandler {
     }
 }
 
+#[cfg(test)]
 pub fn persist_request_confirm_approved(
     root: &Path,
     id: &str,
@@ -695,7 +695,7 @@ pub fn persist_request_confirm_approved(
     let id = safe_fs_component(id, "request id")?;
     let dir = root.join("requests").join("pending").join(&id);
     fs::write(
-        dir.join(CONFIRM_APPROVAL_FILE),
+        dir.join(".confirm_approved.json"),
         serde_json::to_vec_pretty(&json!({
             "schema": "bloom.requests.confirm_approved.v1",
             "wallet": wallet,
@@ -703,31 +703,6 @@ pub fn persist_request_confirm_approved(
         }))
         .map_err(|e| HandlerError::backend(e.to_string()))?,
     )?;
-    Ok(())
-}
-
-fn consume_request_confirm_approved(
-    pending: &Path,
-    wallet: &str,
-    confirm_value: &str,
-) -> Result<(), HandlerError> {
-    let path = pending.join(CONFIRM_APPROVAL_FILE);
-    let approval: serde_json::Value = read_json(&path).map_err(|e| match e {
-        HandlerError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
-            HandlerError::invalid("request confirm requires write_unlocked approval")
-        }
-        other => other,
-    })?;
-    let ok = approval.get("schema").and_then(|v| v.as_str())
-        == Some("bloom.requests.confirm_approved.v1")
-        && approval.get("wallet").and_then(|v| v.as_str()) == Some(wallet)
-        && approval.get("confirm_value").and_then(|v| v.as_str()) == Some(confirm_value);
-    if !ok {
-        return Err(HandlerError::invalid(
-            "request confirm approval does not match wallet or confirmation text",
-        ));
-    }
-    fs::remove_file(path)?;
     Ok(())
 }
 
@@ -1590,7 +1565,7 @@ fn paid_http_canonical_envelope(
             schema: "bloom.intent_header.v1".into(),
             wallet: input.wallet.to_string(),
             surface: "requests".into(),
-            entry_id: input.id.to_string(),
+            action_id: input.id.to_string(),
             executor_id: "paid-http".into(),
             network,
             account: "default".into(),
@@ -1664,7 +1639,7 @@ mod tests {
             let intent_hash = envelope.intent_hash()?;
             Ok(AuthEntryRecord {
                 surface: envelope.header.surface.clone(),
-                entry_id: envelope.header.entry_id.clone(),
+                action_id: envelope.header.action_id.clone(),
                 state: AuthEntryState::Staged,
                 intent_hash,
                 assurance,
@@ -1678,17 +1653,17 @@ mod tests {
         async fn issue_challenge(
             &self,
             surface: &str,
-            entry_id: &str,
+            action_id: &str,
             server_nonce: &str,
             expiry_ms: u64,
             _now_ms: u64,
         ) -> Result<ChallengeRecord, AuthApiError> {
             Ok(ChallengeRecord {
                 surface: surface.to_string(),
-                entry_id: entry_id.to_string(),
+                action_id: action_id.to_string(),
                 intent_hash: "abc123".to_string(),
                 server_nonce: server_nonce.to_string(),
-                assurance: AssuranceLevel::Convenience,
+                assurance: AssuranceLevel::Standard,
                 expiry_ms,
             })
         }
@@ -1697,16 +1672,16 @@ mod tests {
             &self,
             review_session_id: &str,
             surface: &str,
-            entry_id: &str,
+            action_id: &str,
             expires_ms: u64,
             now_ms: u64,
         ) -> Result<bloom_auth_api::ReviewSessionRecord, AuthApiError> {
             Ok(bloom_auth_api::ReviewSessionRecord {
                 review_session_id: review_session_id.to_string(),
                 surface: surface.to_string(),
-                entry_id: entry_id.to_string(),
+                action_id: action_id.to_string(),
                 intent_hash: "abc123".to_string(),
-                assurance: AssuranceLevel::Convenience,
+                assurance: AssuranceLevel::Standard,
                 expires_ms,
                 consumed_ms: None,
                 created_ms: now_ms,
@@ -1744,31 +1719,6 @@ mod tests {
     }
 
     #[test]
-    fn request_confirm_approval_is_matching_and_one_time() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pending = tmp.path().join("requests").join("pending").join("req_1");
-        std::fs::create_dir_all(&pending).unwrap();
-
-        persist_request_confirm_approved(tmp.path(), "req_1", "alice", "confirm").unwrap();
-        assert!(consume_request_confirm_approved(&pending, "alice", "y").is_err());
-        assert!(consume_request_confirm_approved(&pending, "alice", "confirm").is_ok());
-        assert!(consume_request_confirm_approved(&pending, "alice", "confirm").is_err());
-    }
-
-    #[test]
-    fn request_confirm_approval_rejects_unsafe_request_ids() {
-        let tmp = tempfile::tempdir().unwrap();
-        let pending = tmp.path().join("requests").join("pending").join("req_1");
-        std::fs::create_dir_all(&pending).unwrap();
-
-        let err =
-            persist_request_confirm_approved(tmp.path(), "../pending/req_1", "alice", "confirm")
-                .unwrap_err();
-        assert!(err.to_string().contains("invalid request id"), "{err}");
-        assert!(!pending.join(CONFIRM_APPROVAL_FILE).exists());
-    }
-
-    #[test]
     fn paid_http_canonical_envelope_commits_to_selected_plan() {
         let request = parse_request("GET https://merchant.test/pay wallet=alice").unwrap();
         let challenge = normalize_challenge(
@@ -1790,7 +1740,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(env.header.surface, "requests");
-        assert_eq!(env.header.entry_id, "req_1");
+        assert_eq!(env.header.action_id, "req_1");
         assert_eq!(env.header.executor_id, "paid-http");
         assert_eq!(env.header.network, "base");
         assert_eq!(env.subject_kind, "paid_http");
@@ -2019,6 +1969,7 @@ mod tests {
     #[tokio::test]
     async fn x402_retry_failure_moves_failed_and_does_not_resign() {
         let calls = Arc::new(AtomicUsize::new(0));
+        let verify_calls = Arc::new(AtomicUsize::new(0));
         let f = fixture(Some("alice"));
         let mut policy = Policy::default();
         policy.payments.enabled = true;
@@ -2027,9 +1978,19 @@ mod tests {
             .keystore
             .write_policy("alice", toml::to_string_pretty(&policy).unwrap().as_bytes())
             .unwrap();
-        let handler = f.handler.with_x402_signer(Arc::new(StaticX402Signer {
-            calls: calls.clone(),
-        }));
+        let auth_services = AuthServices::new(
+            Some(Arc::new(AcceptingVerifier {
+                calls: verify_calls.clone(),
+            })),
+            None,
+            Some(Arc::new(ChallengeOnlyWriter)),
+        );
+        let handler = f
+            .handler
+            .with_auth_services(auth_services)
+            .with_x402_signer(Arc::new(StaticX402Signer {
+                calls: calls.clone(),
+            }));
         let pending = handler.requests_root().join("pending/req_retry_fail");
         fs::create_dir_all(&pending).unwrap();
         let challenge = normalize_challenge(
@@ -2052,11 +2013,27 @@ mod tests {
         .unwrap();
         fs::write(pending.join("status"), "pending\n").unwrap();
 
-        persist_request_confirm_approved(
-            handler.root.as_path(),
-            "req_retry_fail",
-            "alice",
-            "confirm",
+        write_json(
+            pending.join(APPROVAL_FILE),
+            &Approval {
+                schema: APPROVAL_SCHEMA_V1.into(),
+                wallet: "alice".into(),
+                surface: "requests".into(),
+                action_id: "req_retry_fail".into(),
+                intent_hash: "abc123".into(),
+                executor_id: "paid-http".into(),
+                network: "base".into(),
+                assurance: AssuranceLevel::Standard,
+                server_nonce: "nonce".into(),
+                caps: ApprovalCaps::default(),
+                expiry_ms: now_ms() + 60_000,
+                signer_kind: SignerKind::Test,
+                credential_id: None,
+                review_session_id: None,
+                signature: ApprovalSignature::Test {
+                    sig_hex: "00".into(),
+                },
+            },
         )
         .unwrap();
         handler.confirm("req_retry_fail", b"confirm").await.unwrap();
@@ -2093,7 +2070,7 @@ mod tests {
             .with_x402_signer(Arc::new(StaticX402Signer {
                 calls: calls.clone(),
             }));
-        let pending = handler.requests_root().join("pending/req_layer_b");
+        let pending = handler.requests_root().join("pending/req_sealed");
         fs::create_dir_all(&pending).unwrap();
         let challenge = normalize_challenge(
             &HeaderMap::new(),
@@ -2115,17 +2092,14 @@ mod tests {
         .unwrap();
         fs::write(pending.join("status"), "pending\n").unwrap();
 
-        persist_request_confirm_approved(handler.root.as_path(), "req_layer_b", "alice", "confirm")
+        persist_request_confirm_approved(handler.root.as_path(), "req_sealed", "alice", "confirm")
             .unwrap();
-        let err = handler
-            .confirm("req_layer_b", b"confirm")
-            .await
-            .unwrap_err();
+        let err = handler.confirm("req_sealed", b"confirm").await.unwrap_err();
         assert!(matches!(err, HandlerError::PermissionDenied), "{err}");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let challenge: ChallengeRecord = read_json(pending.join(APPROVAL_CHALLENGE_FILE)).unwrap();
         assert_eq!(challenge.surface, "requests");
-        assert_eq!(challenge.entry_id, "req_layer_b");
+        assert_eq!(challenge.action_id, "req_sealed");
         assert_eq!(challenge.intent_hash, "abc123");
     }
 
@@ -2154,7 +2128,7 @@ mod tests {
             .with_x402_signer(Arc::new(StaticX402Signer {
                 calls: signer_calls.clone(),
             }));
-        let pending = handler.requests_root().join("pending/req_layer_b_ok");
+        let pending = handler.requests_root().join("pending/req_sealed_ok");
         fs::create_dir_all(&pending).unwrap();
         let challenge = normalize_challenge(
             &HeaderMap::new(),
@@ -2181,11 +2155,11 @@ mod tests {
                 schema: APPROVAL_SCHEMA_V1.into(),
                 wallet: "alice".into(),
                 surface: "requests".into(),
-                entry_id: "req_layer_b_ok".into(),
+                action_id: "req_sealed_ok".into(),
                 intent_hash: "abc123".into(),
                 executor_id: "paid-http".into(),
                 network: "base".into(),
-                assurance: AssuranceLevel::Convenience,
+                assurance: AssuranceLevel::Standard,
                 server_nonce: "nonce-1".into(),
                 caps: ApprovalCaps::default(),
                 expiry_ms: now_ms() + 60_000,
@@ -2199,13 +2173,13 @@ mod tests {
         )
         .unwrap();
 
-        handler.confirm("req_layer_b_ok", b"confirm").await.unwrap();
+        handler.confirm("req_sealed_ok", b"confirm").await.unwrap();
         assert_eq!(verifier_calls.load(Ordering::SeqCst), 1);
         assert_eq!(signer_calls.load(Ordering::SeqCst), 1);
         assert!(
             handler
                 .requests_root()
-                .join("failed/req_layer_b_ok")
+                .join("failed/req_sealed_ok")
                 .exists()
         );
     }

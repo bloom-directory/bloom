@@ -1,4 +1,4 @@
-//! Shared authorization API for Bloom Layer B.
+//! Shared authorization API for Bloom Sealed Approval.
 //!
 //! This crate intentionally contains only stable data types and traits. The
 //! concrete store, verifier, and signer integrations live outside the VFS-facing
@@ -18,14 +18,14 @@ pub const APPROVAL_CHALLENGE_DOMAIN: &[u8] = b"bloom.approval.v1";
 #[serde(rename_all = "snake_case")]
 pub enum AssuranceLevel {
     #[default]
-    Convenience,
+    Standard,
     Hardened,
 }
 
 impl AssuranceLevel {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Convenience => "convenience",
+            Self::Standard => "standard",
             Self::Hardened => "hardened",
         }
     }
@@ -43,7 +43,7 @@ pub enum SignerKind {
 impl SignerKind {
     pub fn satisfies(self, assurance: AssuranceLevel) -> bool {
         match assurance {
-            AssuranceLevel::Convenience => {
+            AssuranceLevel::Standard => {
                 matches!(
                     self,
                     SignerKind::Password | SignerKind::PasskeyBrowser | SignerKind::PasskeyCtap
@@ -61,7 +61,7 @@ pub struct CanonicalIntentHeader {
     pub schema: String,
     pub wallet: String,
     pub surface: String,
-    pub entry_id: String,
+    pub action_id: String,
     pub executor_id: String,
     pub network: String,
     pub account: String,
@@ -119,7 +119,7 @@ pub struct Approval {
     pub schema: String,
     pub wallet: String,
     pub surface: String,
-    pub entry_id: String,
+    pub action_id: String,
     pub intent_hash: String,
     pub executor_id: String,
     pub network: String,
@@ -140,7 +140,7 @@ pub struct UnsignedApproval {
     pub schema: String,
     pub wallet: String,
     pub surface: String,
-    pub entry_id: String,
+    pub action_id: String,
     pub intent_hash: String,
     pub executor_id: String,
     pub network: String,
@@ -161,7 +161,7 @@ impl Approval {
             schema: self.schema.clone(),
             wallet: self.wallet.clone(),
             surface: self.surface.clone(),
-            entry_id: self.entry_id.clone(),
+            action_id: self.action_id.clone(),
             intent_hash: self.intent_hash.clone(),
             executor_id: self.executor_id.clone(),
             network: self.network.clone(),
@@ -204,7 +204,11 @@ impl Approval {
         let checks = [
             ("wallet", self.wallet.as_str(), header.wallet.as_str()),
             ("surface", self.surface.as_str(), header.surface.as_str()),
-            ("entry_id", self.entry_id.as_str(), header.entry_id.as_str()),
+            (
+                "action_id",
+                self.action_id.as_str(),
+                header.action_id.as_str(),
+            ),
             (
                 "executor_id",
                 self.executor_id.as_str(),
@@ -425,7 +429,7 @@ impl NonceState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthEntryRecord {
     pub surface: String,
-    pub entry_id: String,
+    pub action_id: String,
     pub state: AuthEntryState,
     pub intent_hash: String,
     pub assurance: AssuranceLevel,
@@ -438,7 +442,7 @@ pub struct AuthEntryRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChallengeRecord {
     pub surface: String,
-    pub entry_id: String,
+    pub action_id: String,
     pub intent_hash: String,
     pub server_nonce: String,
     pub assurance: AssuranceLevel,
@@ -449,7 +453,7 @@ pub struct ChallengeRecord {
 pub struct ReviewSessionRecord {
     pub review_session_id: String,
     pub surface: String,
-    pub entry_id: String,
+    pub action_id: String,
     pub intent_hash: String,
     pub assurance: AssuranceLevel,
     pub expires_ms: u64,
@@ -629,7 +633,7 @@ pub trait AuthStoreWriter: Send + Sync {
     async fn issue_challenge(
         &self,
         surface: &str,
-        entry_id: &str,
+        action_id: &str,
         server_nonce: &str,
         expiry_ms: u64,
         now_ms: u64,
@@ -639,7 +643,7 @@ pub trait AuthStoreWriter: Send + Sync {
         &self,
         review_session_id: &str,
         surface: &str,
-        entry_id: &str,
+        action_id: &str,
         expires_ms: u64,
         now_ms: u64,
     ) -> Result<ReviewSessionRecord, AuthApiError>;
@@ -704,7 +708,7 @@ mod tests {
             schema: "bloom.intent_header.v1".into(),
             wallet: "my-wallet".into(),
             surface: "requests".into(),
-            entry_id: "req_1".into(),
+            action_id: "req_1".into(),
             executor_id: "paid-http".into(),
             network: "base".into(),
             account: "default".into(),
@@ -735,11 +739,11 @@ mod tests {
             schema: APPROVAL_SCHEMA_V1.into(),
             wallet: "my-wallet".into(),
             surface: "outbox".into(),
-            entry_id: "abc".into(),
+            action_id: "abc".into(),
             intent_hash: "0".repeat(64),
             executor_id: "evm".into(),
             network: "base".into(),
-            assurance: AssuranceLevel::Convenience,
+            assurance: AssuranceLevel::Standard,
             server_nonce: "nonce".into(),
             caps: ApprovalCaps::default(),
             expiry_ms: 42,
@@ -759,7 +763,7 @@ mod tests {
             schema: APPROVAL_SCHEMA_V1.into(),
             wallet: "my-wallet".into(),
             surface: "outbox".into(),
-            entry_id: "abc".into(),
+            action_id: "abc".into(),
             intent_hash: "0".repeat(64),
             executor_id: "evm".into(),
             network: "base".into(),
@@ -799,7 +803,7 @@ mod tests {
             .unwrap();
 
         let mut substituted = unsigned.clone();
-        substituted.entry_id = "other".into();
+        substituted.action_id = "other".into();
         let err = ApprovalSignature::WebAuthnAssertion(webauthn_assertion_for(&unsigned))
             .validate_for_unsigned(&substituted)
             .unwrap_err();
@@ -818,7 +822,7 @@ mod tests {
             schema: APPROVAL_SCHEMA_V1.into(),
             wallet: sealed.envelope.header.wallet.clone(),
             surface: sealed.envelope.header.surface.clone(),
-            entry_id: sealed.envelope.header.entry_id.clone(),
+            action_id: sealed.envelope.header.action_id.clone(),
             intent_hash: sealed.intent_hash.clone(),
             executor_id: sealed.envelope.header.executor_id.clone(),
             network: sealed.envelope.header.network.clone(),
@@ -843,7 +847,7 @@ mod tests {
             envelope: env,
             sealed_at_ms: 1,
         };
-        approval_for(&sealed, AssuranceLevel::Convenience, SignerKind::Password)
+        approval_for(&sealed, AssuranceLevel::Standard, SignerKind::Password)
             .validate_against_sealed(&sealed, 100)
             .unwrap();
 
@@ -852,7 +856,7 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("does not satisfy"), "{err}");
 
-        let mut wrong = approval_for(&sealed, AssuranceLevel::Convenience, SignerKind::Password);
+        let mut wrong = approval_for(&sealed, AssuranceLevel::Standard, SignerKind::Password);
         wrong.network = "wrong".into();
         let err = wrong.validate_against_sealed(&sealed, 100).unwrap_err();
         assert!(err.to_string().contains("network mismatch"), "{err}");
@@ -866,7 +870,7 @@ mod tests {
             envelope: env,
             sealed_at_ms: 1,
         };
-        let err = approval_for(&sealed, AssuranceLevel::Convenience, SignerKind::Password)
+        let err = approval_for(&sealed, AssuranceLevel::Standard, SignerKind::Password)
             .validate_against_sealed(&sealed, 200)
             .unwrap_err();
         assert!(err.to_string().contains("expired"), "{err}");
@@ -874,10 +878,10 @@ mod tests {
 
     #[test]
     fn signer_kind_enforces_assurance_levels() {
-        assert!(SignerKind::Password.satisfies(AssuranceLevel::Convenience));
+        assert!(SignerKind::Password.satisfies(AssuranceLevel::Standard));
         assert!(!SignerKind::Password.satisfies(AssuranceLevel::Hardened));
         assert!(SignerKind::PasskeyBrowser.satisfies(AssuranceLevel::Hardened));
-        assert!(!SignerKind::Test.satisfies(AssuranceLevel::Convenience));
+        assert!(!SignerKind::Test.satisfies(AssuranceLevel::Standard));
     }
 
     #[test]

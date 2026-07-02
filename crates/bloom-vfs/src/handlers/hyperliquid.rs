@@ -581,7 +581,7 @@ impl HyperliquidHandler {
             Some(id) => id,
             None if self.auth_services.is_wired() => {
                 return Err(HandlerError::invalid(
-                    "Hyperliquid Layer B agent-session approval requires an explicit stable id",
+                    "Hyperliquid Sealed Approval agent-session approval requires an explicit stable id",
                 ));
             }
             None => format!("hl-{}", nonce),
@@ -598,7 +598,7 @@ impl HyperliquidHandler {
                 "refusing to create Hyperliquid agent session: wallet [hyperliquid] policy must set allowed_assets, max_notional_usd, max_position_usd, and max_loss_usd",
             ));
         }
-        self.prepare_agent_session_layer_b(network_name, wallet, &id, &req, &policy)
+        self.prepare_agent_session_sealed(network_name, wallet, &id, &req, &policy)
             .await?;
         let owner_signer = self.keystore.signer(wallet).map_err(|e| {
             HandlerError::PermissionDenied
@@ -1808,7 +1808,7 @@ impl HyperliquidHandler {
             )));
         }
         let nonce = self
-            .prepare_usd_send_layer_b(network_name, wallet, &req, &checks)
+            .prepare_usd_send_sealed(network_name, wallet, &req, &checks)
             .await?;
         let signer = self.keystore.signer(wallet).map_err(|e| {
             HandlerError::PermissionDenied
@@ -1826,7 +1826,7 @@ impl HyperliquidHandler {
         Ok(())
     }
 
-    async fn prepare_usd_send_layer_b(
+    async fn prepare_usd_send_sealed(
         &self,
         network: &str,
         wallet: &str,
@@ -1846,7 +1846,7 @@ impl HyperliquidHandler {
         let staged = self
             .auth_services
             .require_writer()?
-            .stage_entry(envelope, AssuranceLevel::Convenience, now_ms_u64())
+            .stage_entry(envelope, AssuranceLevel::Standard, now_ms_u64())
             .await
             .map_err(|e| {
                 HandlerError::backend(format!("stage Hyperliquid usdSend auth entry: {e}"))
@@ -1859,7 +1859,7 @@ impl HyperliquidHandler {
                 .require_approval_verifier()?
                 .verify_and_consume(approval, now_ms_u64())
                 .await
-                .map_err(|e| HandlerError::invalid(format!("Layer B approval rejected: {e}")))?;
+                .map_err(|e| HandlerError::invalid(format!("Sealed Approval rejected: {e}")))?;
             return Ok(pending.nonce);
         }
         let mut nonce_bytes = [0u8; 32];
@@ -1870,7 +1870,7 @@ impl HyperliquidHandler {
             .require_writer()?
             .issue_challenge(
                 "hyperliquid",
-                &staged.entry_id,
+                &staged.action_id,
                 &server_nonce,
                 now_ms_u64().saturating_add(APPROVAL_TTL_MS),
                 now_ms_u64(),
@@ -1883,7 +1883,7 @@ impl HyperliquidHandler {
         Err(HandlerError::PermissionDenied)
     }
 
-    async fn prepare_agent_session_layer_b(
+    async fn prepare_agent_session_sealed(
         &self,
         network: &str,
         wallet: &str,
@@ -1914,7 +1914,7 @@ impl HyperliquidHandler {
                 .require_approval_verifier()?
                 .verify_and_consume(approval, now_ms_u64())
                 .await
-                .map_err(|e| HandlerError::invalid(format!("Layer B approval rejected: {e}")))?;
+                .map_err(|e| HandlerError::invalid(format!("Sealed Approval rejected: {e}")))?;
             return Ok(());
         }
         let mut nonce_bytes = [0u8; 32];
@@ -1925,7 +1925,7 @@ impl HyperliquidHandler {
             .require_writer()?
             .issue_challenge(
                 "hyperliquid",
-                &staged.entry_id,
+                &staged.action_id,
                 &server_nonce,
                 now_ms_u64().saturating_add(APPROVAL_TTL_MS),
                 now_ms_u64(),
@@ -3989,7 +3989,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Result<T, 
     serde_json::from_slice(&bytes).map_err(err_json)
 }
 
-fn hyperliquid_usd_send_entry_id(network: &str, wallet: &str, pending: &PendingUsdSend) -> String {
+fn hyperliquid_usd_send_action_id(network: &str, wallet: &str, pending: &PendingUsdSend) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bloom.hyperliquid.usd_send.entry.v1");
     hasher.update(network.as_bytes());
@@ -4025,7 +4025,7 @@ fn hyperliquid_usd_send_envelope(
             schema: "bloom.intent_header.v1".into(),
             wallet: wallet.to_string(),
             surface: "hyperliquid".into(),
-            entry_id: hyperliquid_usd_send_entry_id(network, wallet, pending),
+            action_id: hyperliquid_usd_send_action_id(network, wallet, pending),
             executor_id: "hyperliquid-usd-send".into(),
             network: network.to_string(),
             account: wallet.to_string(),
@@ -4039,7 +4039,7 @@ fn hyperliquid_usd_send_envelope(
     ))
 }
 
-fn hyperliquid_agent_session_entry_id(network: &str, wallet: &str, session_id: &str) -> String {
+fn hyperliquid_agent_session_action_id(network: &str, wallet: &str, session_id: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bloom.hyperliquid.agent_session.entry.v1");
     hasher.update(network.as_bytes());
@@ -4072,7 +4072,7 @@ fn hyperliquid_agent_session_envelope(
             schema: "bloom.intent_header.v1".into(),
             wallet: wallet.to_string(),
             surface: "hyperliquid".into(),
-            entry_id: hyperliquid_agent_session_entry_id(network, wallet, session_id),
+            action_id: hyperliquid_agent_session_action_id(network, wallet, session_id),
             executor_id: "hyperliquid-agent-session".into(),
             network: network.to_string(),
             account: wallet.to_string(),

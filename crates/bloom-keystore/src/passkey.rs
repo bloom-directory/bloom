@@ -178,7 +178,7 @@ fn patch_request_challenge_json(
 /// `start_passkey_authentication` hardcodes `UserVerificationPolicy::Required`),
 /// but that is an implementation detail of the dependency. This gate makes the
 /// hardened-requires-UV invariant explicit in bloom so it survives library
-/// upgrades or a future decision to relax convenience-level ceremonies.
+/// upgrades or a future decision to relax standard-level ceremonies.
 fn require_user_verification_for_assurance(
     assurance: AssuranceLevel,
     user_verified: bool,
@@ -2118,10 +2118,8 @@ mod ceremony_gate_tests {
     #[test]
     fn hardened_assurance_requires_user_verified_flag() {
         assert!(require_user_verification_for_assurance(AssuranceLevel::Hardened, true).is_ok());
-        assert!(
-            require_user_verification_for_assurance(AssuranceLevel::Convenience, false).is_ok()
-        );
-        assert!(require_user_verification_for_assurance(AssuranceLevel::Convenience, true).is_ok());
+        assert!(require_user_verification_for_assurance(AssuranceLevel::Standard, false).is_ok());
+        assert!(require_user_verification_for_assurance(AssuranceLevel::Standard, true).is_ok());
         let err =
             require_user_verification_for_assurance(AssuranceLevel::Hardened, false).unwrap_err();
         assert!(err.contains("user-verified"), "{err}");
@@ -2435,7 +2433,7 @@ mod approval_uv_tests {
             schema: APPROVAL_SCHEMA_V1.into(),
             wallet: wallet.into(),
             surface: "outbox".into(),
-            entry_id: "tx_1".into(),
+            action_id: "tx_1".into(),
             intent_hash: "0".repeat(64),
             executor_id: "evm".into(),
             network: "base".into(),
@@ -2563,16 +2561,16 @@ mod approval_uv_tests {
     }
 
     #[tokio::test]
-    async fn convenience_verification_currently_rejects_presence_only_assertion() {
+    async fn standard_verification_currently_rejects_presence_only_assertion() {
         let td = tempfile::tempdir().unwrap();
         let ks = crate::Keystore::new(td.path()).unwrap();
         let signing = wallet_with_software_credential(td.path(), "uv-wallet");
-        let unsigned = unsigned_approval("uv-wallet", AssuranceLevel::Convenience);
+        let unsigned = unsigned_approval("uv-wallet", AssuranceLevel::Standard);
         let signature = assertion_with_flags(&signing, &unsigned, UP);
-        // Stricter than the Decision 4 minimum (convenience may accept
-        // presence-only): the shared ceremony policy requires UV for every
-        // assertion. Relaxing convenience is a deliberate future change; this
-        // test makes sure it doesn't happen by accident.
+        // Stricter than the spec floor (standard may accept presence-only):
+        // the shared ceremony policy requires UV for every assertion. Relaxing
+        // standard to UP-only is a deliberate future change; this test makes
+        // sure it doesn't happen by accident.
         let err = ks
             .verify_approval_signature_with_passkey(&unsigned, &signature)
             .await
@@ -2581,11 +2579,11 @@ mod approval_uv_tests {
     }
 
     #[tokio::test]
-    async fn convenience_verification_accepts_user_verified_assertion() {
+    async fn standard_verification_accepts_user_verified_assertion() {
         let td = tempfile::tempdir().unwrap();
         let ks = crate::Keystore::new(td.path()).unwrap();
         let signing = wallet_with_software_credential(td.path(), "uv-wallet");
-        let unsigned = unsigned_approval("uv-wallet", AssuranceLevel::Convenience);
+        let unsigned = unsigned_approval("uv-wallet", AssuranceLevel::Standard);
         let signature = assertion_with_flags(&signing, &unsigned, UP | UV);
         ks.verify_approval_signature_with_passkey(&unsigned, &signature)
             .await
@@ -2597,7 +2595,7 @@ mod approval_uv_tests {
         let td = tempfile::tempdir().unwrap();
         let ks = crate::Keystore::new(td.path()).unwrap();
         let signing = wallet_with_software_credential(td.path(), "uv-wallet");
-        let unsigned = unsigned_approval("uv-wallet", AssuranceLevel::Convenience);
+        let unsigned = unsigned_approval("uv-wallet", AssuranceLevel::Standard);
         let other = unsigned_approval("uv-wallet", AssuranceLevel::Hardened);
         // Assertion minted for a different approval payload must not verify,
         // even though it is a valid signature from the right credential.

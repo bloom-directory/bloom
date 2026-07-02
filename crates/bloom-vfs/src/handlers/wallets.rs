@@ -402,30 +402,8 @@ impl WalletsHandler {
             ));
         }
         let path = format!("/wallets/{wallet}/policy-session/new");
-        if self.auth_services.is_wired() {
-            self.require_layer_b_policy_session_approval(wallet, &path, data)
-                .await?;
-        } else {
-            // Legacy/unwired test mode only. Production daemon wiring must use
-            // the signed Layer-B approval above, not this marker.
-            let intent = bloom_proto::policy_session_mint_intent(wallet, &path, data);
-            let home = self
-                .keystore
-                .root()
-                .parent()
-                .ok_or_else(|| HandlerError::backend("keystore root has no parent home dir"))?
-                .to_path_buf();
-            if !crate::policy_session_review::consume_review_approved(
-                &home,
-                wallet,
-                &intent.intent_hash(),
-            ) {
-                return Err(HandlerError::invalid(
-                    "policy-session mint requires a fresh reviewed-intent approval; \
-                     mint through the IPC ceremony lane (bloom wallet ... policy-session)",
-                ));
-            }
-        }
+        self.require_sealed_policy_session_approval(wallet, &path, data)
+            .await?;
         // Chains are derived from the authorized pairs; the allowlist holds
         // chain-qualified keys so a same-id tx on another chain can't slip in.
         let chains = d.pending_ids.iter().map(|p| p.chain_id).collect();
@@ -450,14 +428,14 @@ impl WalletsHandler {
         Ok(())
     }
 
-    async fn require_layer_b_policy_session_approval(
+    async fn require_sealed_policy_session_approval(
         &self,
         wallet: &str,
         path: &str,
         data: &[u8],
     ) -> Result<(), HandlerError> {
-        let entry_id = policy_session_entry_id(wallet, data);
-        let envelope = policy_session_canonical_envelope(wallet, path, &entry_id, data)?;
+        let action_id = policy_session_action_id(wallet, data);
+        let envelope = policy_session_canonical_envelope(wallet, path, &action_id, data)?;
         self.auth_services
             .require_writer()?
             .stage_entry(envelope, AssuranceLevel::Hardened, now_ms_u64())
@@ -468,7 +446,7 @@ impl WalletsHandler {
             .root()
             .join(wallet)
             .join("policy-session")
-            .join(&entry_id)
+            .join(&action_id)
             .join(APPROVAL_FILE);
         if approval_path.exists() {
             let approval: Approval = read_json(&approval_path)?;
@@ -476,10 +454,10 @@ impl WalletsHandler {
                 .require_approval_verifier()?
                 .verify_and_consume(approval, now_ms_u64())
                 .await
-                .map_err(|e| HandlerError::invalid(format!("Layer B approval rejected: {e}")))?;
+                .map_err(|e| HandlerError::invalid(format!("Sealed Approval rejected: {e}")))?;
             return Ok(());
         }
-        let challenge = self.issue_policy_session_challenge(&entry_id).await?;
+        let challenge = self.issue_policy_session_challenge(&action_id).await?;
         let challenge_path = approval_path.with_file_name(APPROVAL_CHALLENGE_FILE);
         if let Some(parent) = challenge_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -490,7 +468,7 @@ impl WalletsHandler {
 
     async fn issue_policy_session_challenge(
         &self,
-        entry_id: &str,
+        action_id: &str,
     ) -> Result<ChallengeRecord, HandlerError> {
         let now = now_ms_u64();
         let mut nonce = [0u8; 32];
@@ -500,7 +478,7 @@ impl WalletsHandler {
             .require_writer()?
             .issue_challenge(
                 "policy-session",
-                entry_id,
+                action_id,
                 &nonce,
                 now.saturating_add(APPROVAL_TTL_MS),
                 now,
@@ -575,7 +553,7 @@ fn read_json<T: for<'de> serde::Deserialize<'de>>(
     serde_json::from_slice(&bytes).map_err(|e| HandlerError::backend(e.to_string()))
 }
 
-fn policy_session_entry_id(wallet: &str, data: &[u8]) -> String {
+fn policy_session_action_id(wallet: &str, data: &[u8]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bloom.policy_session.entry.v1");
     hasher.update(wallet.as_bytes());
@@ -587,7 +565,7 @@ fn policy_session_entry_id(wallet: &str, data: &[u8]) -> String {
 fn policy_session_canonical_envelope(
     wallet: &str,
     path: &str,
-    entry_id: &str,
+    action_id: &str,
     data: &[u8],
 ) -> Result<CanonicalEnvelope, HandlerError> {
     let descriptor: serde_json::Value = serde_json::from_slice(data)
@@ -605,7 +583,7 @@ fn policy_session_canonical_envelope(
             schema: "bloom.intent_header.v1".into(),
             wallet: wallet.to_string(),
             surface: "policy-session".into(),
-            entry_id: entry_id.to_string(),
+            action_id: action_id.to_string(),
             executor_id: "wallet-policy-session".into(),
             network: "multi-chain".into(),
             account: "default".into(),
@@ -1794,7 +1772,7 @@ mod tests {
             let intent_hash = envelope.intent_hash()?;
             Ok(AuthEntryRecord {
                 surface: envelope.header.surface.clone(),
-                entry_id: envelope.header.entry_id.clone(),
+                action_id: envelope.header.action_id.clone(),
                 state: AuthEntryState::Staged,
                 intent_hash,
                 assurance,
@@ -1808,14 +1786,14 @@ mod tests {
         async fn issue_challenge(
             &self,
             surface: &str,
-            entry_id: &str,
+            action_id: &str,
             server_nonce: &str,
             expiry_ms: u64,
             _now_ms: u64,
         ) -> Result<ChallengeRecord, AuthApiError> {
             Ok(ChallengeRecord {
                 surface: surface.to_string(),
-                entry_id: entry_id.to_string(),
+                action_id: action_id.to_string(),
                 intent_hash: "policy-session-intent".to_string(),
                 server_nonce: server_nonce.to_string(),
                 assurance: AssuranceLevel::Hardened,
@@ -1827,14 +1805,14 @@ mod tests {
             &self,
             review_session_id: &str,
             surface: &str,
-            entry_id: &str,
+            action_id: &str,
             expires_ms: u64,
             now_ms: u64,
         ) -> Result<bloom_auth_api::ReviewSessionRecord, AuthApiError> {
             Ok(bloom_auth_api::ReviewSessionRecord {
                 review_session_id: review_session_id.to_string(),
                 surface: surface.to_string(),
-                entry_id: entry_id.to_string(),
+                action_id: action_id.to_string(),
                 intent_hash: "policy-session-intent".to_string(),
                 assurance: AssuranceLevel::Hardened,
                 expires_ms,
@@ -1945,6 +1923,7 @@ mod tests {
             nft: None,
             usd_value: None,
             depends_on: None,
+            action_id: None,
         };
         f.handler
             .tx_engine
@@ -2217,13 +2196,48 @@ mod tests {
 
     #[tokio::test]
     async fn policy_session_mint_list_revoke() {
-        let f = make_handler();
+        let mut f = make_handler();
+        f.handler = f.handler.with_auth_services(AuthServices::new(
+            Some(Arc::new(AcceptingVerifier)),
+            None,
+            Some(Arc::new(ChallengeOnlyWriter)),
+        ));
         let new_p = VfsPath::parse("/alice/policy-session/new").unwrap();
         let body = br#"{"max_usd":10,"ttl_secs":600,"pending_ids":[{"chain_id":42161,"id":"0001-a"},{"chain_id":8453,"id":"0001-b"}]}"#;
-        // Mint requires a reviewed-intent approval marker (normally written by the
-        // IPC ceremony lane); a write without one is refused.
+        // Mint requires a sealed approval; a write without one is refused.
         assert!(f.handler.write(&new_p, body).await.is_err());
-        approve_mint(&f, "alice", body);
+        let action_id = policy_session_action_id("alice", body);
+        let approval_dir = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-session")
+            .join(&action_id);
+        std::fs::create_dir_all(&approval_dir).unwrap();
+        write_json(
+            approval_dir.join(APPROVAL_FILE),
+            &Approval {
+                schema: APPROVAL_SCHEMA_V1.into(),
+                wallet: "alice".into(),
+                surface: "policy-session".into(),
+                action_id: action_id.clone(),
+                intent_hash: "policy-session-intent".into(),
+                executor_id: "wallet-policy-session".into(),
+                network: "multi-chain".into(),
+                assurance: AssuranceLevel::Hardened,
+                server_nonce: "nonce-1".into(),
+                caps: ApprovalCaps::default(),
+                expiry_ms: now_ms_u64() + 60_000,
+                signer_kind: SignerKind::Test,
+                credential_id: None,
+                review_session_id: None,
+                signature: ApprovalSignature::Test {
+                    sig_hex: "00".into(),
+                },
+            },
+        )
+        .unwrap();
         f.handler.write(&new_p, body).await.unwrap();
 
         let active_p = VfsPath::parse("/alice/policy-session/active.json").unwrap();
@@ -2279,18 +2293,18 @@ mod tests {
                 .any(|session| session.wallet == "alice")
         );
 
-        let entry_id = policy_session_entry_id("alice", body);
+        let action_id = policy_session_action_id("alice", body);
         let challenge_path = f
             .handler
             .keystore
             .root()
             .join("alice")
             .join("policy-session")
-            .join(&entry_id)
+            .join(&action_id)
             .join(APPROVAL_CHALLENGE_FILE);
         let challenge: ChallengeRecord = read_json(challenge_path).unwrap();
         assert_eq!(challenge.surface, "policy-session");
-        assert_eq!(challenge.entry_id, entry_id);
+        assert_eq!(challenge.action_id, action_id);
         assert_eq!(challenge.intent_hash, "policy-session-intent");
         assert_eq!(challenge.assurance, AssuranceLevel::Hardened);
     }
@@ -2306,14 +2320,14 @@ mod tests {
         let new_p = VfsPath::parse("/alice/policy-session/new").unwrap();
         let body =
             br#"{"max_usd":10,"ttl_secs":600,"pending_ids":[{"chain_id":42161,"id":"0001-a"}]}"#;
-        let entry_id = policy_session_entry_id("alice", body);
+        let action_id = policy_session_action_id("alice", body);
         let approval_dir = f
             .handler
             .keystore
             .root()
             .join("alice")
             .join("policy-session")
-            .join(&entry_id);
+            .join(&action_id);
         std::fs::create_dir_all(&approval_dir).unwrap();
         write_json(
             approval_dir.join(APPROVAL_FILE),
@@ -2321,7 +2335,7 @@ mod tests {
                 schema: APPROVAL_SCHEMA_V1.into(),
                 wallet: "alice".into(),
                 surface: "policy-session".into(),
-                entry_id: entry_id.clone(),
+                action_id: action_id.clone(),
                 intent_hash: "policy-session-intent".into(),
                 executor_id: "wallet-policy-session".into(),
                 network: "multi-chain".into(),
@@ -2348,7 +2362,12 @@ mod tests {
 
     #[tokio::test]
     async fn capability_confirm_path_uses_real_chain_segment() {
-        let f = make_handler();
+        let mut f = make_handler();
+        f.handler = f.handler.with_auth_services(AuthServices::new(
+            Some(Arc::new(AcceptingVerifier)),
+            None,
+            Some(Arc::new(ChallengeOnlyWriter)),
+        ));
         // Register arbitrum so chain-id 42161 resolves to its path segment.
         let spec = bloom_proto::ChainSpec {
             name: "arbitrum".into(),
@@ -2369,7 +2388,38 @@ mod tests {
         let new_p = VfsPath::parse("/alice/policy-session/new").unwrap();
         let body =
             br#"{"max_usd":10,"ttl_secs":600,"pending_ids":[{"chain_id":42161,"id":"0001-a"}]}"#;
-        approve_mint(&f, "alice", body);
+        let action_id = policy_session_action_id("alice", body);
+        let approval_dir = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-session")
+            .join(&action_id);
+        std::fs::create_dir_all(&approval_dir).unwrap();
+        write_json(
+            approval_dir.join(APPROVAL_FILE),
+            &Approval {
+                schema: APPROVAL_SCHEMA_V1.into(),
+                wallet: "alice".into(),
+                surface: "policy-session".into(),
+                action_id: action_id.clone(),
+                intent_hash: "policy-session-intent".into(),
+                executor_id: "wallet-policy-session".into(),
+                network: "multi-chain".into(),
+                assurance: AssuranceLevel::Hardened,
+                server_nonce: "nonce-1".into(),
+                caps: ApprovalCaps::default(),
+                expiry_ms: now_ms_u64() + 60_000,
+                signer_kind: SignerKind::Test,
+                credential_id: None,
+                review_session_id: None,
+                signature: ApprovalSignature::Test {
+                    sig_hex: "00".into(),
+                },
+            },
+        )
+        .unwrap();
         f.handler.write(&new_p, body).await.unwrap();
 
         let views = f.handler.evm_capability_views_for("alice");

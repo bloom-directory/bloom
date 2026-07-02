@@ -1131,6 +1131,7 @@ impl TxEngine {
             nft: nft_for_plan,
             usd_value: policy_ctx.usd_value,
             depends_on: None,
+            action_id: None,
         };
         staged.policy_checks = policy_engine::evaluate(
             policy,
@@ -1763,7 +1764,7 @@ impl TxEngine {
         entry: &crate::outbox::OutboxEntry,
         staged: &StagedTx,
         policy: &Policy,
-        reviewed_intent_hash: Option<&str>,
+        _reviewed_intent_hash: Option<&str>,
         surface: bloom_proto::AuthorizationSurface,
     ) -> Result<(), TxEngineError> {
         let budget = self.budget_snapshot(&staged.wallet)?;
@@ -1790,12 +1791,14 @@ impl TxEngine {
             bloom_proto::AutonomyDecision::NeedsFreshReview { .. } => {}
         }
 
-        let reviewed_intent_hash = if self.approval_verifier.is_some() || self.auth_writer.is_some()
-        {
-            Some(self.ensure_layer_b_outbox_approval(entry, staged).await?)
-        } else {
-            self.verified_reviewed_intent_hash(staged, reviewed_intent_hash)?
-        };
+        if self.approval_verifier.is_none() && self.auth_writer.is_none() {
+            return Err(TxEngineError::BroadcastApprovalRequired(
+                "outbox confirm requires Sealed Approval; \
+                 auth services are not wired (marker fallback removed)"
+                    .into(),
+            ));
+        }
+        let reviewed_intent_hash = Some(self.ensure_sealed_outbox_approval(entry, staged).await?);
         match bloom_proto::evaluate_action_authorization(
             policy,
             &staged.policy_checks,
@@ -1822,24 +1825,22 @@ impl TxEngine {
         }
     }
 
-    async fn ensure_layer_b_outbox_approval(
+    async fn ensure_sealed_outbox_approval(
         &self,
         entry: &crate::outbox::OutboxEntry,
         staged: &StagedTx,
     ) -> Result<String, TxEngineError> {
         let verifier = self.approval_verifier.as_ref().ok_or_else(|| {
-            TxEngineError::BroadcastApprovalRequired(
-                "Layer B approval verifier is not wired".into(),
-            )
+            TxEngineError::BroadcastApprovalRequired("Sealed Approval verifier is not wired".into())
         })?;
         let writer = self.auth_writer.as_ref().ok_or_else(|| {
             TxEngineError::BroadcastApprovalRequired(
-                "Layer B auth store writer is not wired".into(),
+                "Sealed Approval auth store writer is not wired".into(),
             )
         })?;
         let envelope = outbox_canonical_envelope(staged)?;
         let auth_entry = writer
-            .stage_entry(envelope, AssuranceLevel::Convenience, now_ms() as u64)
+            .stage_entry(envelope, AssuranceLevel::Standard, now_ms() as u64)
             .await
             .map_err(|e| {
                 TxEngineError::BroadcastApprovalRequired(format!(
@@ -1868,7 +1869,7 @@ impl TxEngine {
                 .await
                 .map_err(|e| {
                     TxEngineError::BroadcastApprovalRequired(format!(
-                        "Layer B approval rejected: {e}"
+                        "Sealed Approval rejected: {e}"
                     ))
                 })?;
             return Ok(auth_entry.intent_hash);
@@ -1880,7 +1881,7 @@ impl TxEngine {
         let challenge = writer
             .issue_challenge(
                 "outbox",
-                &auth_entry.entry_id,
+                &auth_entry.action_id,
                 &nonce,
                 (now_ms() as u64).saturating_add(OUTBOX_APPROVAL_TTL_MS),
                 now_ms() as u64,
@@ -1902,65 +1903,8 @@ impl TxEngine {
             TxEngineError::BroadcastApprovalRequired(format!("write approval challenge: {e}"))
         })?;
         Err(TxEngineError::BroadcastApprovalRequired(
-            "outbox confirm requires signed Layer B approval; local password wallets can only auto-confirm actions that remain in policy".into(),
+            "outbox confirm requires signed Sealed Approval; local password wallets can only auto-confirm actions that remain in policy".into(),
         ))
-    }
-
-    fn verified_reviewed_intent_hash(
-        &self,
-        staged: &StagedTx,
-        reviewed_intent_hash: Option<&str>,
-    ) -> Result<Option<String>, TxEngineError> {
-        let Some(hash) = reviewed_intent_hash
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        else {
-            return Ok(None);
-        };
-        let entry = self
-            .outbox
-            .read(&staged.wallet, &staged.chain, &staged.id)?;
-        let path = entry.dir.join("review_intent.json");
-        let body = std::fs::read(&path).map_err(|_| {
-            TxEngineError::BroadcastApprovalRequired(
-                "review hash supplied but no review_intent.json is stored for this outbox entry"
-                    .into(),
-            )
-        })?;
-        let intent: bloom_proto::CeremonyIntent = serde_json::from_slice(&body).map_err(|e| {
-            TxEngineError::BroadcastApprovalRequired(format!(
-                "stored review_intent.json is invalid: {e}"
-            ))
-        })?;
-        let expected = intent.intent_hash();
-        if hash != expected {
-            return Err(TxEngineError::BroadcastApprovalRequired(
-                "review hash does not match the stored review intent for this outbox entry".into(),
-            ));
-        }
-        let approved_path = entry.dir.join("review_approved.json");
-        let approved_body = std::fs::read(&approved_path).map_err(|_| {
-            TxEngineError::BroadcastApprovalRequired(
-                "review hash supplied but no passkey approval marker is stored for this outbox entry"
-                    .into(),
-            )
-        })?;
-        let approved: serde_json::Value = serde_json::from_slice(&approved_body).map_err(|e| {
-            TxEngineError::BroadcastApprovalRequired(format!(
-                "stored review_approved.json is invalid: {e}"
-            ))
-        })?;
-        if approved
-            .get("intent_hash")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            != Some(hash)
-        {
-            return Err(TxEngineError::BroadcastApprovalRequired(
-                "passkey approval marker does not match the reviewed intent hash".into(),
-            ));
-        }
-        Ok(Some(hash.to_string()))
     }
 
     fn authorization_subject(&self, staged: &StagedTx) -> bloom_proto::AuthorizationSubject {
@@ -2349,7 +2293,7 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
-fn outbox_entry_id(staged: &StagedTx) -> String {
+fn outbox_action_id(staged: &StagedTx) -> String {
     format!("{}:{}", staged.chain_id, staged.id)
 }
 
@@ -2364,7 +2308,7 @@ fn outbox_canonical_envelope(staged: &StagedTx) -> Result<CanonicalEnvelope, TxE
             schema: "bloom.intent_header.v1".into(),
             wallet: staged.wallet.clone(),
             surface: "outbox".into(),
-            entry_id: outbox_entry_id(staged),
+            action_id: outbox_action_id(staged),
             executor_id: "evm-broadcast".into(),
             network: staged.chain.clone(),
             account: staged.from.clone(),
@@ -2583,7 +2527,7 @@ mod tests {
         ) -> Result<AuthEntryRecord, AuthApiError> {
             Ok(AuthEntryRecord {
                 surface: envelope.header.surface.clone(),
-                entry_id: envelope.header.entry_id.clone(),
+                action_id: envelope.header.action_id.clone(),
                 state: AuthEntryState::Staged,
                 intent_hash: envelope.intent_hash()?,
                 assurance,
@@ -2597,17 +2541,17 @@ mod tests {
         async fn issue_challenge(
             &self,
             surface: &str,
-            entry_id: &str,
+            action_id: &str,
             server_nonce: &str,
             expiry_ms: u64,
             _now_ms: u64,
         ) -> Result<ChallengeRecord, AuthApiError> {
             Ok(ChallengeRecord {
                 surface: surface.to_string(),
-                entry_id: entry_id.to_string(),
+                action_id: action_id.to_string(),
                 intent_hash: "outbox-intent".to_string(),
                 server_nonce: server_nonce.to_string(),
-                assurance: AssuranceLevel::Convenience,
+                assurance: AssuranceLevel::Standard,
                 expiry_ms,
             })
         }
@@ -2616,16 +2560,16 @@ mod tests {
             &self,
             review_session_id: &str,
             surface: &str,
-            entry_id: &str,
+            action_id: &str,
             expires_ms: u64,
             now_ms: u64,
         ) -> Result<bloom_auth_api::ReviewSessionRecord, AuthApiError> {
             Ok(bloom_auth_api::ReviewSessionRecord {
                 review_session_id: review_session_id.to_string(),
                 surface: surface.to_string(),
-                entry_id: entry_id.to_string(),
+                action_id: action_id.to_string(),
                 intent_hash: "outbox-intent".to_string(),
-                assurance: AssuranceLevel::Convenience,
+                assurance: AssuranceLevel::Standard,
                 expires_ms,
                 consumed_ms: None,
                 created_ms: now_ms,
@@ -2645,7 +2589,7 @@ mod tests {
         ) -> Result<AuthEntryRecord, AuthApiError> {
             Ok(AuthEntryRecord {
                 surface: envelope.header.surface.clone(),
-                entry_id: envelope.header.entry_id.clone(),
+                action_id: envelope.header.action_id.clone(),
                 state: AuthEntryState::Approved,
                 intent_hash: envelope.intent_hash()?,
                 assurance,
@@ -2659,7 +2603,7 @@ mod tests {
         async fn issue_challenge(
             &self,
             _surface: &str,
-            _entry_id: &str,
+            _action_id: &str,
             _server_nonce: &str,
             _expiry_ms: u64,
             _now_ms: u64,
@@ -2673,7 +2617,7 @@ mod tests {
             &self,
             _review_session_id: &str,
             _surface: &str,
-            _entry_id: &str,
+            _action_id: &str,
             _expires_ms: u64,
             _now_ms: u64,
         ) -> Result<bloom_auth_api::ReviewSessionRecord, AuthApiError> {
@@ -2707,6 +2651,7 @@ mod tests {
             nft: None,
             usd_value: None,
             depends_on: None,
+            action_id: None,
         }
     }
 
@@ -3873,6 +3818,8 @@ mod tests {
         staged.expires_ms = now_ms() + 60_000;
         engine.outbox.write_pending(&staged, "p").unwrap();
 
+        // Without auth services wired, confirm must fail closed instead of
+        // accepting forgeable marker files (M1: marker fallback removed).
         let r = engine
             .confirm(
                 &permit,
@@ -3887,10 +3834,11 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(_))),
-            "expected approval refusal, got {r:?}"
+            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(ref e)) if e.contains("not wired")),
+            "expected fail-closed when unwired, got {r:?}"
         );
 
+        // Supplying a review hash no longer helps without wired auth services.
         let r = engine
             .confirm(
                 &permit,
@@ -3905,67 +3853,9 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(ref e)) if e.contains("review_intent")),
-            "expected missing review artifact refusal, got {r:?}"
+            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(ref e)) if e.contains("not wired")),
+            "expected fail-closed when unwired even with review hash, got {r:?}"
         );
-
-        let entry = engine
-            .outbox
-            .read("alice", "anvil", "0001-approval")
-            .unwrap();
-        let intent = bloom_proto::CeremonyIntent::new(
-            "alice",
-            "Approve anvil Transaction",
-            bloom_proto::CeremonyIntentKind::EvmTransaction,
-        )
-        .subject(serde_json::json!({
-            "kind": "outbox_confirm",
-            "wallet": "alice",
-            "chain": "anvil",
-            "outbox_id": "0001-approval",
-        }));
-        let review_hash = intent.intent_hash();
-        engine
-            .outbox
-            .write_artefact(
-                &entry.dir,
-                "review_intent.json",
-                &serde_json::to_vec_pretty(&intent).unwrap(),
-            )
-            .unwrap();
-        engine
-            .outbox
-            .write_artefact(
-                &entry.dir,
-                "review_approved.json",
-                &serde_json::to_vec_pretty(&serde_json::json!({
-                    "schema": "bloom.review_approved.v1",
-                    "intent_hash": review_hash,
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-
-        let r = engine
-            .confirm(
-                &permit,
-                "alice",
-                "anvil",
-                "0001-approval",
-                &chain,
-                &signer,
-                &policy,
-                "y",
-                Some(&review_hash),
-            )
-            .await;
-        match r {
-            Err(TxEngineError::BroadcastApprovalRequired(_)) => {
-                panic!("review hash should satisfy approval gate")
-            }
-            Ok(_) => panic!("unexpected broadcast success on unreachable RPC"),
-            Err(_) => {}
-        }
     }
 
     #[tokio::test]
@@ -3981,7 +3871,7 @@ mod tests {
         let mut policy = bloom_proto::Policy::default();
         policy.approval.require_broadcast_approval = true;
 
-        let mut staged = fake_staged_1559("0001-layer-b");
+        let mut staged = fake_staged_1559("0001-sealed-approval");
         staged.value_wei = "1".into();
         staged.usd_value = Some(0.01);
         staged.expires_ms = now_ms() + 60_000;
@@ -3989,7 +3879,7 @@ mod tests {
 
         let entry = engine
             .outbox
-            .read("alice", "anvil", "0001-layer-b")
+            .read("alice", "anvil", "0001-sealed-approval")
             .unwrap();
         let legacy_hash = "legacy-reviewed-hash";
         engine
@@ -4014,7 +3904,7 @@ mod tests {
                 &permit,
                 "alice",
                 "anvil",
-                "0001-layer-b",
+                "0001-sealed-approval",
                 &chain,
                 &signer,
                 &policy,
@@ -4023,15 +3913,15 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(ref e)) if e.contains("Layer B")),
-            "expected Layer B challenge refusal, got {r:?}"
+            matches!(r, Err(TxEngineError::BroadcastApprovalRequired(ref e)) if e.contains("Sealed Approval")),
+            "expected Sealed Approval challenge refusal, got {r:?}"
         );
         let challenge: ChallengeRecord = serde_json::from_slice(
             &std::fs::read(entry.dir.join(OUTBOX_APPROVAL_CHALLENGE_FILE)).unwrap(),
         )
         .unwrap();
         assert_eq!(challenge.surface, "outbox");
-        assert_eq!(challenge.entry_id, outbox_entry_id(&staged));
+        assert_eq!(challenge.action_id, outbox_action_id(&staged));
         assert_eq!(challenge.intent_hash, "outbox-intent");
     }
 
@@ -4048,14 +3938,14 @@ mod tests {
         let mut policy = bloom_proto::Policy::default();
         policy.approval.require_broadcast_approval = true;
 
-        let mut staged = fake_staged_1559("0001-layer-b-ok");
+        let mut staged = fake_staged_1559("0001-sealed-approval-ok");
         staged.value_wei = "1".into();
         staged.usd_value = Some(0.01);
         staged.expires_ms = now_ms() + 60_000;
         engine.outbox.write_pending(&staged, "p").unwrap();
         let entry = engine
             .outbox
-            .read("alice", "anvil", "0001-layer-b-ok")
+            .read("alice", "anvil", "0001-sealed-approval-ok")
             .unwrap();
         engine
             .outbox
@@ -4066,11 +3956,11 @@ mod tests {
                     schema: APPROVAL_SCHEMA_V1.into(),
                     wallet: "alice".into(),
                     surface: "outbox".into(),
-                    entry_id: outbox_entry_id(&staged),
+                    action_id: outbox_action_id(&staged),
                     intent_hash: "outbox-intent".into(),
                     executor_id: "evm-broadcast".into(),
                     network: "anvil".into(),
-                    assurance: AssuranceLevel::Convenience,
+                    assurance: AssuranceLevel::Standard,
                     server_nonce: "nonce-1".into(),
                     caps: ApprovalCaps::default(),
                     expiry_ms: now_ms() as u64 + 60_000,
@@ -4090,7 +3980,7 @@ mod tests {
                 &permit,
                 "alice",
                 "anvil",
-                "0001-layer-b-ok",
+                "0001-sealed-approval-ok",
                 &chain,
                 &signer,
                 &policy,
@@ -4107,7 +3997,7 @@ mod tests {
         }
         let entry = engine
             .outbox
-            .read("alice", "anvil", "0001-layer-b-ok")
+            .read("alice", "anvil", "0001-sealed-approval-ok")
             .unwrap();
         assert!(
             engine
@@ -4129,7 +4019,7 @@ mod tests {
         let mut policy = bloom_proto::Policy::default();
         policy.approval.require_broadcast_approval = true;
 
-        let mut staged = fake_staged_1559("0001-layer-b-retry");
+        let mut staged = fake_staged_1559("0001-sealed-approval-retry");
         staged.value_wei = "1".into();
         staged.usd_value = Some(0.01);
         staged.expires_ms = now_ms() + 60_000;
@@ -4140,7 +4030,7 @@ mod tests {
                 &permit,
                 "alice",
                 "anvil",
-                "0001-layer-b-retry",
+                "0001-sealed-approval-retry",
                 &chain,
                 &signer,
                 &policy,

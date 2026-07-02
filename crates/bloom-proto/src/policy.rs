@@ -222,7 +222,7 @@ pub struct ApprovalPolicy {
     /// signature is required for broadcasts.
     #[serde(default)]
     pub agent_autonomy: Option<AgentAutonomyMode>,
-    /// Assurance level for approval/session grants. `convenience` allows
+    /// Assurance level for approval/session grants. `standard` allows
     /// password/passphrase or passkey bounded grants. `hardened` requires
     /// passkey/WebAuthn for grant minting and out-of-policy approvals.
     #[serde(default)]
@@ -570,14 +570,14 @@ impl PolicyEditClass {
 }
 
 /// Classify whether a policy edit expands authority and therefore requires
-/// hardened step-up even when the wallet normally uses convenience mode.
+/// hardened step-up even when the wallet normally uses standard mode.
 pub fn classify_policy_edit(before: &Policy, after: &Policy) -> PolicyEditClass {
     let mut reasons = Vec::new();
 
     if before.approval.assurance == AssuranceLevel::Hardened
-        && after.approval.assurance == AssuranceLevel::Convenience
+        && after.approval.assurance == AssuranceLevel::Standard
     {
-        reasons.push("approval.assurance hardened -> convenience".to_string());
+        reasons.push("approval.assurance hardened -> standard".to_string());
     }
 
     if autonomy_rank(after.effective_agent_autonomy())
@@ -1112,7 +1112,7 @@ mod tests {
     fn policy_defaults_when_new_sections_missing() {
         let toml_src = "[caps]\nmax_value_eth = 0.1\n";
         let p: Policy = toml::from_str(toml_src).unwrap();
-        assert_eq!(p.approval.assurance, AssuranceLevel::Convenience);
+        assert_eq!(p.approval.assurance, AssuranceLevel::Standard);
         assert!(!p.approval.step_up.enabled);
         assert_eq!(p.approval.step_up.ttl_secs, 120);
         assert!(!p.private.enabled);
@@ -1437,7 +1437,7 @@ uv_above_usd = "1.0000001"
         );
 
         let mut after = before.clone();
-        after.approval.assurance = AssuranceLevel::Convenience;
+        after.approval.assurance = AssuranceLevel::Standard;
         after.limits.max_tx_usd = Some("20".into());
         after.allowlists.recipients.insert("bob".into());
         after
@@ -1453,9 +1453,7 @@ uv_above_usd = "1.0000001"
             panic!("expected authority expansion");
         };
         assert!(
-            reasons
-                .iter()
-                .any(|r| r.contains("hardened -> convenience")),
+            reasons.iter().any(|r| r.contains("hardened -> standard")),
             "{reasons:?}"
         );
         assert!(
@@ -1477,7 +1475,7 @@ uv_above_usd = "1.0000001"
     #[test]
     fn policy_edit_classifier_allows_tightening() {
         let mut before = Policy::default();
-        before.approval.assurance = AssuranceLevel::Convenience;
+        before.approval.assurance = AssuranceLevel::Standard;
         before.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
         before.limits.max_tx_usd = Some("10".into());
         before.limits.max_day_usd = Some("100".into());
