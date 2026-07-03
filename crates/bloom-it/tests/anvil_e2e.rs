@@ -2,11 +2,10 @@
 //!
 //! End-to-end integration test for the bloom stage-confirm flow.
 //!
-//! Runs against a real `anvil` instance spawned as a child process. Marked
-//! `#[ignore]` so it only runs when explicitly requested:
+//! Runs against a real `anvil` instance spawned as a child process:
 //!
 //! ```text
-//! cargo test -p bloom-it -- --ignored
+//! cargo test -p bloom-it --test anvil_e2e
 //! ```
 //!
 //! Requires the `anvil` and `cast` binaries from Foundry to be available
@@ -17,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use bloom_daemon::Daemon;
-use bloom_it::{cast_send, spawn_anvil};
+use bloom_it::{cast_send, mint_evm_test_grant, spawn_anvil};
 use bloom_proto::{ChainSpec, Config, HomeDir, HomeWritePermit};
 use bloom_vfs::VfsPath;
 use bloom_vfs::handler::Handler;
@@ -46,8 +45,15 @@ fn write_config(home_root: &std::path::Path, rpc_url: &str) -> Result<()> {
     Ok(())
 }
 
+fn now_ms_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn anvil_full_stage_confirm_flow() -> Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -77,9 +83,8 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
         .map_err(|e| anyhow!("create_local: {e}"))?;
     let alice_addr = format!("{:#x}", info.address);
 
-    // Write a permissive under_policy policy so the value-moving send
-    // below is auto-approved without Sealed Approval (which requires a
-    // passkey — unavailable in integration tests).
+    // Keep the staged transaction inside ordinary policy limits. Broadcast
+    // still requires a pre-minted Sealed Approval grant below.
     let wallet_dir = tmp.path().join("keystore").join("alice");
     std::fs::write(
         wallet_dir.join("policy.toml"),
@@ -163,14 +168,30 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     let _: serde_json::Value =
         serde_json::from_slice(&policy_bytes).context("policy_check.json must be valid JSON")?;
 
-    // 8. Unlock the wallet, then write `confirm` to broadcast.
-    // The wallet's policy.toml has agent_autonomy=under_policy with
-    // generous limits, so value-moving actions within budget are
-    // auto-approved without Sealed Approval.
+    // 8. Unlock the wallet, mint the same in-memory grant that a successful
+    // Sealed Approval ceremony would mint, then write `confirm` to broadcast.
+    // The Anvil test does not have a browser/WebAuthn device, but this still
+    // exercises the production grant-gated KeystorePetalHost sign_hash path
+    // and raw transaction broadcast.
     daemon
         .keystore
         .unlock("alice", passphrase)
         .map_err(|e| anyhow!("unlock: {e}"))?;
+    let grant_store = daemon
+        .auth_services
+        .require_grant_store()
+        .map_err(|e| anyhow!("grant store: {e}"))?;
+    mint_evm_test_grant(
+        grant_store.as_ref(),
+        "alice",
+        &format!("31337:{pending_id}"),
+        "confirm",
+        31337,
+        &alice_addr,
+        now_ms_u64(),
+    )
+    .await
+    .map_err(|e| anyhow!("mint confirm grant: {e}"))?;
     let confirm_path = VfsPath::parse(&format!(
         "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/confirm"
     ))

@@ -28,6 +28,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use bloom_auth_api::{ApprovalChallenge, SignedApproval, SignerTransport, UnsignedApproval};
+use bloom_keystore::petal_host::SignerCache;
 use bloom_keystore::{Keystore, WalletKind};
 use bloom_petals::{Capability, PetalError, PetalRunner, RunOptions, VfsHost};
 use bloom_proto::{CeremonyIntent, CeremonyIntentKind};
@@ -124,6 +125,7 @@ pub struct IpcServer {
     keystore: Option<Keystore>,
     petals: Option<PetalRunner>,
     auth_services: AuthServices,
+    signer_cache: Option<Arc<SignerCache>>,
     /// Pre-wrapped `Arc<Vfs>` for building [`VfsHost`] per `petals.run`.
     /// We keep it next to the bare `vfs` clone so the existing handler
     /// surface stays untouched.
@@ -141,6 +143,7 @@ impl IpcServer {
             keystore: None,
             petals: None,
             auth_services: AuthServices::default(),
+            signer_cache: None,
             vfs_arc,
             shutdown: Arc::new(Notify::new()),
         }
@@ -163,6 +166,11 @@ impl IpcServer {
 
     pub fn with_auth_services(mut self, auth_services: AuthServices) -> Self {
         self.auth_services = auth_services;
+        self
+    }
+
+    pub fn with_signer_cache(mut self, signer_cache: Arc<SignerCache>) -> Self {
+        self.signer_cache = Some(signer_cache);
         self
     }
 
@@ -569,6 +577,19 @@ impl IpcServer {
             None,
             review_session_id,
         );
+        if is_policy_session_new(wallet, path)
+            && let Some(signer_cache) = self.signer_cache.as_ref()
+        {
+            crate::sealed_ceremony::run_sealed_approval_ceremony(
+                keystore,
+                &self.auth_services,
+                unsigned,
+                ipc_now_ms(),
+                signer_cache.as_ref(),
+            )
+            .await?;
+            return Ok(true);
+        }
         let signature = keystore
             .sign_approval_with_passkey(wallet, &unsigned, intent)
             .await

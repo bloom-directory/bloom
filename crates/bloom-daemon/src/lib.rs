@@ -144,6 +144,7 @@ pub struct Daemon {
     pub address_book: Arc<AddressBook>,
     pub audit: Arc<AuditLog>,
     pub auth_services: AuthServices,
+    pub signer_cache: Arc<bloom_keystore::petal_host::SignerCache>,
     pub vfs: Vfs,
     pub petals: PetalRunner,
     pub watch_registry: Arc<WatchRegistry>,
@@ -372,13 +373,17 @@ impl Daemon {
             Arc::new(bloom_auth::grant_store::InMemoryGrantStore::default());
         let attestation_registry: Arc<dyn bloom_auth_api::SigningAttestationSchemaRegistry> =
             Arc::new(bloom_auth_api::DefaultAttestationRegistry::new());
-        let petal_host: Arc<dyn bloom_auth_api::PetalHost> =
-            Arc::new(bloom_keystore::petal_host::KeystorePetalHost::new(
+        let signer_cache = Arc::new(bloom_keystore::petal_host::SignerCache::new());
+        let petal_host: Arc<dyn bloom_auth_api::PetalHost> = Arc::new(
+            bloom_keystore::petal_host::KeystorePetalHost::new(
                 Arc::new(keystore.clone()),
                 grant_store.clone(),
                 attestation_registry.clone(),
                 audit_arc.clone(),
-            ));
+            )
+            .with_signer_cache(signer_cache.clone()),
+        );
+        tx_engine = tx_engine.with_host_signing_services(grant_store.clone(), petal_host.clone());
         let auth_services = auth_services
             .with_grant_store(grant_store)
             .with_attestation_registry(attestation_registry)
@@ -1162,6 +1167,7 @@ impl Daemon {
             address_book: address_book_arc,
             audit: audit_arc,
             auth_services,
+            signer_cache,
             vfs,
             petals,
             watch_registry,

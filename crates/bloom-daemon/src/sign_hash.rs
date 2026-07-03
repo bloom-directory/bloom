@@ -353,6 +353,47 @@ mod tests {
                 "petal_id": PETAL_ID_EVM_WALLET,
                 "petal_digest": PLACEHOLDER_DIGEST_EVM_WALLET,
                 "intent": "evm.tx.sign",
+                "facts": {
+                    "facts_schema": bloom_auth_api::EVM_SIGNING_ATTESTATION_FACTS_SCHEMA_V1,
+                    "action_id": "act-1",
+                    "wallet": "my-wallet",
+                    "surface": "outbox",
+                    "petal_id": PETAL_ID_EVM_WALLET,
+                    "petal_digest": PLACEHOLDER_DIGEST_EVM_WALLET,
+                    "petal_version": FIRST_PARTY_PETAL_VERSION_V0,
+                    "action_kind": "confirm",
+                    "chain_id": 31337,
+                    "account": "0x0000000000000000000000000000000000000001",
+                    "to": "0x0000000000000000000000000000000000000002",
+                    "recipient": "0x0000000000000000000000000000000000000002",
+                    "value": {
+                        "native_value_wei": "1",
+                        "valuation_usd_micro": 1
+                    },
+                    "token": null,
+                    "method": "native_transfer",
+                    "calldata_hash": format!("0x{}", "2".repeat(64)),
+                    "nonce_intent": {
+                        "mode": "exact",
+                        "nonce": 0
+                    },
+                    "fee_facts": {
+                        "tx_type": "eip1559",
+                        "gas_limit": "21000",
+                        "max_fee_per_gas_wei": "100",
+                        "max_priority_fee_per_gas_wei": "10",
+                        "max_total_fee_wei": "2100000"
+                    },
+                    "replacement_fee_facts": null,
+                    "unsigned_envelope": {
+                        "envelope_kind": "eip1559",
+                        "unsigned_tx_bytes_hash": format!("0x{}", "3".repeat(64)),
+                        "signing_hash": format!("0x{}", "1".repeat(64))
+                    },
+                    "signing_hash": format!("0x{}", "1".repeat(64)),
+                    "policy_snapshot_digest": "4".repeat(64),
+                    "daemon_terms_digest": "5".repeat(64)
+                }
             },
         })
     }
@@ -412,6 +453,52 @@ mod tests {
         assert_eq!(live.consumed_signature_count, 1);
     }
 
+    #[tokio::test]
+    async fn sign_hash_one_shot_grant_consumes_and_replay_denies() {
+        let ks_dir = tempfile::tempdir().unwrap();
+        let TestServices {
+            services,
+            store,
+            audit_log,
+            ..
+        } = make_test_services(ks_dir.path()).await;
+        let grant =
+            mint_evm_tx_grant(store.as_ref(), "act-1", &["evm.tx.sign"], 1, 1_000, 120).await;
+        let mut params = base_params();
+        params["now_ms"] = json!(grant.issued_ms.saturating_add(500));
+
+        handle_sign_hash(&services, &params)
+            .await
+            .expect("first one-shot signature succeeds");
+        assert!(
+            store
+                .get_active(
+                    "my-wallet",
+                    "act-1",
+                    PETAL_ID_EVM_WALLET,
+                    PLACEHOLDER_DIGEST_EVM_WALLET,
+                    grant.issued_ms.saturating_add(500),
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "exhausted one-shot grant must leave no live grant for replay"
+        );
+
+        let err = handle_sign_hash(&services, &params)
+            .await
+            .expect_err("replay after one-shot consume must deny");
+        let msg = err.to_string();
+        assert!(msg.contains("no live grant"), "unexpected denial: {msg}");
+
+        let log = audit_log.tail(10).unwrap();
+        assert_eq!(log.iter().filter(|r| r.kind == "petal.sign.ok").count(), 1);
+        assert_eq!(
+            log.iter().filter(|r| r.kind == "petal.sign.deny").count(),
+            1
+        );
+    }
+
     // ── denial paths ──────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -426,6 +513,38 @@ mod tests {
             msg.contains("no live grant"),
             "denial should mention 'no live grant'; got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn sign_hash_denies_wrong_action_id_without_consuming_matching_grant() {
+        let ks_dir = tempfile::tempdir().unwrap();
+        let TestServices {
+            services, store, ..
+        } = make_test_services(ks_dir.path()).await;
+        let grant =
+            mint_evm_tx_grant(store.as_ref(), "act-1", &["evm.tx.sign"], 1, 1_000, 120).await;
+        let mut params = base_params();
+        params["action_id"] = json!("act-2");
+        params["now_ms"] = json!(grant.issued_ms.saturating_add(500));
+
+        let err = handle_sign_hash(&services, &params)
+            .await
+            .expect_err("grant for act-1 must not authorize act-2");
+        let msg = err.to_string();
+        assert!(msg.contains("no live grant"), "unexpected denial: {msg}");
+
+        let still_live = store
+            .get_active(
+                "my-wallet",
+                "act-1",
+                PETAL_ID_EVM_WALLET,
+                PLACEHOLDER_DIGEST_EVM_WALLET,
+                grant.issued_ms.saturating_add(500),
+            )
+            .await
+            .unwrap()
+            .expect("grant for original action remains live");
+        assert_eq!(still_live.consumed_signature_count, 0);
     }
 
     #[tokio::test]

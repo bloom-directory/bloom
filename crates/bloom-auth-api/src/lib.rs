@@ -28,6 +28,15 @@ pub const APPROVAL_CHALLENGE_SCHEMA_V1: &str = "bloom.approval_challenge.v1";
 pub const SEALED_ACTION_SCHEMA_V1: &str = "bloom.sealed_action.v1";
 /// Schema tag for [`SigningAttestation`] envelopes.
 pub const SIGNING_ATTESTATION_SCHEMA_V1: &str = "bloom.signing_attestation.v1";
+/// Canonical subject schema for EVM wallet sealed actions.
+pub const EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1: &str = "bloom.evm.sealed_intent.v1";
+/// Canonical subject kind for EVM wallet sealed actions.
+pub const EVM_SEALED_INTENT_SUBJECT_KIND: &str = "evm_wallet_tx";
+/// Typed facts schema embedded in [`SigningAttestation::facts`] for
+/// `(petal_id=evm-wallet, intent=evm.tx.sign)`.
+pub const EVM_SIGNING_ATTESTATION_FACTS_SCHEMA_V1: &str = "bloom.evm.signing_facts.v1";
+/// EVM wallet signing intent.
+pub const EVM_TX_SIGN_INTENT: &str = "evm.tx.sign";
 /// Schema tag for [`CanonicalEnvelope`].
 ///
 /// v2: the canonical header gained Petal identity (`petal_id`, `petal_digest`,
@@ -52,6 +61,17 @@ pub const PETAL_POLICY_DIGEST_DOMAIN: &[u8] = b"bloom.petal_policy.v1";
 
 /// Hard ceiling on Sealed Approval Grant lifetime (§6.4 recommended default).
 pub const GRANT_MAX_TTL_MS: u64 = 120_000;
+
+/// Standing-session kind for bounded EVM owner-signing sessions.
+pub const EVM_OWNER_SIGNING_SESSION_KIND: &str = "evm_owner_signing.v1";
+/// Sealed action kind for minting an EVM owner-signing session.
+pub const EVM_OWNER_SESSION_MINT_ACTION_KIND: &str = "evm_owner_session_mint";
+/// Sealed action kind for using an EVM owner-signing session.
+pub const EVM_OWNER_SESSION_USE_ACTION_KIND: &str = "evm_owner_session_use";
+/// MVP session method: ERC-20 `transfer(address,uint256)`.
+pub const EVM_ERC20_TRANSFER_METHOD: &str = "erc20_transfer";
+/// ERC-20 `transfer(address,uint256)` selector.
+pub const EVM_ERC20_TRANSFER_SELECTOR: &str = "0xa9059cbb";
 
 /// First-party Petal identity constants and placeholder digests (spec §11.10).
 pub mod petal_identity {
@@ -1397,6 +1417,606 @@ impl SigningAttestation {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvmSealedActionKind {
+    Confirm,
+    Replace,
+    Cancel,
+    OwnerSessionUse,
+}
+
+impl EvmSealedActionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirm => "confirm",
+            Self::Replace => "replace",
+            Self::Cancel => "cancel",
+            Self::OwnerSessionUse => "owner_session_use",
+        }
+    }
+
+    fn is_one_shot(self) -> bool {
+        matches!(self, Self::Confirm | Self::Replace | Self::Cancel)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvmTokenFact {
+    pub chain_id: u64,
+    pub token_address: String,
+    pub symbol: String,
+    pub decimals: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvmValueFact {
+    /// Native ETH value in wei as a decimal string.
+    pub native_value_wei: String,
+    /// Token amount in base units as a decimal string, if this action moves a
+    /// token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_amount_base_units: Option<String>,
+    /// Frozen valuation used by policy/budget checks, if computed at seal
+    /// time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valuation_usd_micro: Option<i128>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvmCallFact {
+    /// Transaction target (`to`) or contract target.
+    pub to: String,
+    /// End-recipient when the target is a token/contract method.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<String>,
+    /// Calldata bytes as `0x`-prefixed lowercase hex. Empty calldata is `0x`.
+    pub calldata_hex: String,
+    /// `0x` + lowercase 32-byte hash of `calldata_hex`.
+    pub calldata_hash: String,
+    /// Human/action method label, e.g. `native_transfer`, `erc20.transfer`.
+    pub method: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvmNonceIntent {
+    /// Deterministic nonce mode, e.g. `exact`, `next`, or `same_as_original`.
+    pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_action_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvmFeeFacts {
+    /// EVM transaction type, e.g. `eip1559` or `legacy`.
+    pub tx_type: String,
+    pub gas_limit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fee_per_gas_wei: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_priority_fee_per_gas_wei: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gas_price_wei: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_fee_wei: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvmUnsignedEnvelopeFacts {
+    /// Raw unsigned transaction/envelope kind, e.g. `eip1559_rlp`.
+    pub envelope_kind: String,
+    /// `0x` + lowercase 32-byte hash of the raw unsigned transaction bytes.
+    pub unsigned_tx_bytes_hash: String,
+    /// `0x` + lowercase 32-byte EVM signing hash recomputed from the sealed
+    /// unsigned envelope.
+    pub signing_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvmOriginalTxFact {
+    pub original_action_id: String,
+    pub original_tx_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_nonce: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvmOwnerSessionUseFact {
+    pub session_id: String,
+    pub reservation_id: String,
+    pub token_address: String,
+    pub recipient: String,
+    pub daily_cap_base_units: String,
+    pub expires_ms: u64,
+    pub max_signature_count: u32,
+}
+
+/// Deterministic EVM sealed subject used as the canonical intent subject for
+/// confirm, replace, cancel, and bounded owner-session-use actions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvmSealedIntentSubject {
+    pub schema: String,
+    pub action_id: String,
+    pub wallet: String,
+    pub surface: String,
+    pub petal_id: String,
+    pub petal_digest: String,
+    pub petal_version: String,
+    pub action_kind: EvmSealedActionKind,
+    pub chain_id: u64,
+    pub account: String,
+    pub call: EvmCallFact,
+    pub value: EvmValueFact,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<EvmTokenFact>,
+    pub nonce_intent: EvmNonceIntent,
+    pub fee_facts: EvmFeeFacts,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_fee_facts: Option<EvmFeeFacts>,
+    pub unsigned_envelope: EvmUnsignedEnvelopeFacts,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_tx: Option<EvmOriginalTxFact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_session_use: Option<EvmOwnerSessionUseFact>,
+    pub policy_snapshot_digest: String,
+    pub policy_snapshot: PetalPolicySnapshot,
+    pub daemon_terms: DaemonGrantTerms,
+    pub daemon_terms_digest: String,
+    #[serde(default)]
+    pub authority_change: bool,
+}
+
+impl EvmSealedIntentSubject {
+    pub fn validate_evm(&self) -> Result<(), AuthApiError> {
+        if self.schema != EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1 {
+            return Err(AuthApiError::InvalidSubject(format!(
+                "unsupported EVM sealed intent schema {}",
+                self.schema
+            )));
+        }
+        validate_required("action_id", &self.action_id)?;
+        validate_required("wallet", &self.wallet)?;
+        validate_required("surface", &self.surface)?;
+        validate_required("account", &self.account)?;
+        if self.petal_id != petal_identity::PETAL_ID_EVM_WALLET {
+            return Err(AuthApiError::InvalidSubject(
+                "EVM sealed intent petal_id must be evm-wallet".into(),
+            ));
+        }
+        if self.petal_digest.trim().is_empty() || self.petal_version.trim().is_empty() {
+            return Err(AuthApiError::InvalidSubject(
+                "EVM sealed intent is missing Petal identity".into(),
+            ));
+        }
+        if self.chain_id == 0 {
+            return Err(AuthApiError::InvalidSubject(
+                "EVM sealed intent chain_id is zero".into(),
+            ));
+        }
+        self.call.validate()?;
+        self.value.validate()?;
+        if let Some(token) = &self.token {
+            token.validate(self.chain_id)?;
+        }
+        self.nonce_intent.validate()?;
+        self.fee_facts.validate("fee_facts")?;
+        if let Some(fee) = &self.replacement_fee_facts {
+            fee.validate("replacement_fee_facts")?;
+        }
+        self.unsigned_envelope.validate()?;
+        if let Some(original) = &self.original_tx {
+            original.validate()?;
+        }
+        if let Some(session_use) = &self.owner_session_use {
+            session_use.validate()?;
+        }
+        let computed_policy_digest = self.policy_snapshot.petal_policy_digest()?;
+        if self.policy_snapshot_digest != computed_policy_digest {
+            return Err(AuthApiError::InvalidSubject(
+                "EVM policy_snapshot_digest does not match policy_snapshot".into(),
+            ));
+        }
+        if self.policy_snapshot.wallet != self.wallet
+            || self.policy_snapshot.petal_id != self.petal_id
+            || self.policy_snapshot.petal_digest != self.petal_digest
+        {
+            return Err(AuthApiError::InvalidSubject(
+                "EVM policy snapshot identity mismatch".into(),
+            ));
+        }
+        if !self
+            .daemon_terms
+            .allowed_sign_intents
+            .iter()
+            .any(|intent| intent == EVM_TX_SIGN_INTENT)
+        {
+            return Err(AuthApiError::InvalidSubject(
+                "EVM daemon terms must allow evm.tx.sign".into(),
+            ));
+        }
+        if self.action_kind.is_one_shot() && self.daemon_terms.max_signatures != 1 {
+            return Err(AuthApiError::InvalidSubject(
+                "EVM one-shot actions must allow exactly one signature".into(),
+            ));
+        }
+        if self.daemon_terms_digest != self.daemon_terms.daemon_terms_digest()? {
+            return Err(AuthApiError::InvalidSubject(
+                "EVM daemon_terms_digest does not match daemon_terms".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn canonical_header(&self, expires_ms: u64) -> CanonicalIntentHeader {
+        CanonicalIntentHeader {
+            schema: CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            wallet: self.wallet.clone(),
+            surface: self.surface.clone(),
+            action_id: self.action_id.clone(),
+            petal_id: self.petal_id.clone(),
+            petal_digest: self.petal_digest.clone(),
+            petal_version: self.petal_version.clone(),
+            executor_kind: ExecutorKind::FirstParty,
+            network: format!("eip155:{}", self.chain_id),
+            account: self.account.clone(),
+            action_kind: self.action_kind.as_str().into(),
+            value_movement: self.value.has_value_movement(),
+            authority_change: self.authority_change,
+            expires_ms,
+        }
+    }
+
+    pub fn canonical_envelope(&self, expires_ms: u64) -> Result<CanonicalEnvelope, AuthApiError> {
+        Ok(CanonicalEnvelope::new(
+            self.canonical_header(expires_ms),
+            self.subject_kind(),
+            self.subject_schema(),
+            self.canonical_subject_bytes()?,
+        ))
+    }
+
+    pub fn signing_attestation_facts(&self) -> EvmSigningAttestationFacts {
+        EvmSigningAttestationFacts {
+            facts_schema: EVM_SIGNING_ATTESTATION_FACTS_SCHEMA_V1.into(),
+            action_id: self.action_id.clone(),
+            wallet: self.wallet.clone(),
+            surface: self.surface.clone(),
+            petal_id: self.petal_id.clone(),
+            petal_digest: self.petal_digest.clone(),
+            petal_version: self.petal_version.clone(),
+            action_kind: self.action_kind,
+            chain_id: self.chain_id,
+            account: self.account.clone(),
+            to: self.call.to.clone(),
+            recipient: self.call.recipient.clone(),
+            value: self.value.clone(),
+            token: self.token.clone(),
+            method: self.call.method.clone(),
+            calldata_hash: self.call.calldata_hash.clone(),
+            nonce_intent: self.nonce_intent.clone(),
+            fee_facts: self.fee_facts.clone(),
+            replacement_fee_facts: self.replacement_fee_facts.clone(),
+            unsigned_envelope: self.unsigned_envelope.clone(),
+            signing_hash: self.unsigned_envelope.signing_hash.clone(),
+            policy_snapshot_digest: self.policy_snapshot_digest.clone(),
+            daemon_terms_digest: self.daemon_terms_digest.clone(),
+        }
+    }
+}
+
+impl CanonicalSubject for EvmSealedIntentSubject {
+    fn subject_kind(&self) -> &'static str {
+        EVM_SEALED_INTENT_SUBJECT_KIND
+    }
+
+    fn subject_schema(&self) -> &'static str {
+        EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1
+    }
+
+    fn validate(&self) -> Result<(), AuthApiError> {
+        self.validate_evm()
+    }
+
+    fn canonical_subject_bytes(&self) -> Result<Vec<u8>, AuthApiError> {
+        self.validate_evm()?;
+        serde_json::to_vec(self).map_err(AuthApiError::Json)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvmSigningAttestationFacts {
+    pub facts_schema: String,
+    pub action_id: String,
+    pub wallet: String,
+    pub surface: String,
+    pub petal_id: String,
+    pub petal_digest: String,
+    pub petal_version: String,
+    pub action_kind: EvmSealedActionKind,
+    pub chain_id: u64,
+    pub account: String,
+    pub to: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<String>,
+    pub value: EvmValueFact,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<EvmTokenFact>,
+    pub method: String,
+    pub calldata_hash: String,
+    pub nonce_intent: EvmNonceIntent,
+    pub fee_facts: EvmFeeFacts,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_fee_facts: Option<EvmFeeFacts>,
+    pub unsigned_envelope: EvmUnsignedEnvelopeFacts,
+    pub signing_hash: String,
+    pub policy_snapshot_digest: String,
+    pub daemon_terms_digest: String,
+}
+
+impl EvmSigningAttestationFacts {
+    pub fn to_facts_map(&self) -> Result<BTreeMap<String, serde_json::Value>, AuthApiError> {
+        match serde_json::to_value(self).map_err(AuthApiError::Json)? {
+            serde_json::Value::Object(map) => Ok(map.into_iter().collect()),
+            _ => Err(AuthApiError::InvalidSubject(
+                "EVM attestation facts did not serialize as an object".into(),
+            )),
+        }
+    }
+
+    pub fn from_facts_map(
+        facts: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<Self, AuthApiError> {
+        let map: serde_json::Map<String, serde_json::Value> = facts.clone().into_iter().collect();
+        serde_json::from_value(serde_json::Value::Object(map)).map_err(AuthApiError::Json)
+    }
+
+    pub fn signing_attestation(&self) -> Result<SigningAttestation, AuthApiError> {
+        self.validate()?;
+        Ok(SigningAttestation {
+            schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
+            petal_id: self.petal_id.clone(),
+            petal_digest: self.petal_digest.clone(),
+            intent: EVM_TX_SIGN_INTENT.into(),
+            facts: self.to_facts_map()?,
+        })
+    }
+
+    pub fn from_attestation(attestation: &SigningAttestation) -> Result<Self, AuthApiError> {
+        if attestation.schema != SIGNING_ATTESTATION_SCHEMA_V1 {
+            return Err(AuthApiError::Denied(format!(
+                "unsupported attestation schema {}",
+                attestation.schema
+            )));
+        }
+        if attestation.intent != EVM_TX_SIGN_INTENT {
+            return Err(AuthApiError::Denied(
+                "EVM attestation intent mismatch".into(),
+            ));
+        }
+        if attestation.petal_id != petal_identity::PETAL_ID_EVM_WALLET {
+            return Err(AuthApiError::Denied(
+                "EVM attestation petal_id mismatch".into(),
+            ));
+        }
+        let typed = Self::from_facts_map(&attestation.facts)?;
+        typed.validate()?;
+        if typed.petal_id != attestation.petal_id {
+            return Err(AuthApiError::Denied(
+                "EVM attestation fact petal_id mismatch".into(),
+            ));
+        }
+        if typed.petal_digest != attestation.petal_digest {
+            return Err(AuthApiError::Denied(
+                "EVM attestation fact petal_digest mismatch".into(),
+            ));
+        }
+        Ok(typed)
+    }
+
+    pub fn validate(&self) -> Result<(), AuthApiError> {
+        if self.facts_schema != EVM_SIGNING_ATTESTATION_FACTS_SCHEMA_V1 {
+            return Err(AuthApiError::Denied(format!(
+                "unsupported EVM attestation facts schema {}",
+                self.facts_schema
+            )));
+        }
+        validate_required("action_id", &self.action_id).map_err(denied_from_invalid)?;
+        validate_required("wallet", &self.wallet).map_err(denied_from_invalid)?;
+        validate_required("surface", &self.surface).map_err(denied_from_invalid)?;
+        validate_required("account", &self.account).map_err(denied_from_invalid)?;
+        validate_required("to", &self.to).map_err(denied_from_invalid)?;
+        validate_required("method", &self.method).map_err(denied_from_invalid)?;
+        if self.petal_id != petal_identity::PETAL_ID_EVM_WALLET {
+            return Err(AuthApiError::Denied(
+                "EVM attestation petal_id must be evm-wallet".into(),
+            ));
+        }
+        validate_required("petal_digest", &self.petal_digest).map_err(denied_from_invalid)?;
+        validate_required("petal_version", &self.petal_version).map_err(denied_from_invalid)?;
+        if self.chain_id == 0 {
+            return Err(AuthApiError::Denied(
+                "EVM attestation chain_id is zero".into(),
+            ));
+        }
+        self.value.validate().map_err(denied_from_invalid)?;
+        if let Some(token) = &self.token {
+            token.validate(self.chain_id).map_err(denied_from_invalid)?;
+        }
+        self.nonce_intent.validate().map_err(denied_from_invalid)?;
+        self.fee_facts
+            .validate("fee_facts")
+            .map_err(denied_from_invalid)?;
+        if let Some(fee) = &self.replacement_fee_facts {
+            fee.validate("replacement_fee_facts")
+                .map_err(denied_from_invalid)?;
+        }
+        self.unsigned_envelope
+            .validate()
+            .map_err(denied_from_invalid)?;
+        validate_hash32_hex("calldata_hash", &self.calldata_hash).map_err(denied_from_invalid)?;
+        validate_hash32_hex("signing_hash", &self.signing_hash).map_err(denied_from_invalid)?;
+        validate_digest_hex("policy_snapshot_digest", &self.policy_snapshot_digest)
+            .map_err(denied_from_invalid)?;
+        validate_digest_hex("daemon_terms_digest", &self.daemon_terms_digest)
+            .map_err(denied_from_invalid)?;
+        if self.signing_hash != self.unsigned_envelope.signing_hash {
+            return Err(AuthApiError::Denied(
+                "EVM attestation signing_hash mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_against_subject(
+        &self,
+        subject: &EvmSealedIntentSubject,
+    ) -> Result<(), AuthApiError> {
+        self.validate()?;
+        subject.validate_evm()?;
+        let expected = subject.signing_attestation_facts();
+        if self != &expected {
+            return Err(AuthApiError::Denied(
+                "EVM attestation facts do not match sealed intent".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl EvmTokenFact {
+    fn validate(&self, chain_id: u64) -> Result<(), AuthApiError> {
+        if self.chain_id != chain_id {
+            return Err(AuthApiError::InvalidSubject(
+                "EVM token chain_id mismatch".into(),
+            ));
+        }
+        validate_required("token_address", &self.token_address)?;
+        validate_required("token_symbol", &self.symbol)?;
+        Ok(())
+    }
+}
+
+impl EvmValueFact {
+    fn validate(&self) -> Result<(), AuthApiError> {
+        validate_decimal_string("native_value_wei", &self.native_value_wei)?;
+        if let Some(amount) = &self.token_amount_base_units {
+            validate_decimal_string("token_amount_base_units", amount)?;
+        }
+        Ok(())
+    }
+
+    fn has_value_movement(&self) -> bool {
+        self.native_value_wei != "0"
+            || self
+                .token_amount_base_units
+                .as_ref()
+                .is_some_and(|amount| amount != "0")
+    }
+}
+
+impl EvmCallFact {
+    fn validate(&self) -> Result<(), AuthApiError> {
+        validate_required("to", &self.to)?;
+        validate_required("calldata_hex", &self.calldata_hex)?;
+        validate_required("method", &self.method)?;
+        if !self.calldata_hex.starts_with("0x") {
+            return Err(AuthApiError::InvalidSubject(
+                "calldata_hex must be 0x-prefixed".into(),
+            ));
+        }
+        validate_hash32_hex("calldata_hash", &self.calldata_hash)?;
+        Ok(())
+    }
+}
+
+impl EvmNonceIntent {
+    fn validate(&self) -> Result<(), AuthApiError> {
+        validate_required("nonce_mode", &self.mode)?;
+        if self.mode == "same_as_original" && self.original_action_id.is_none() {
+            return Err(AuthApiError::InvalidSubject(
+                "same_as_original nonce intent requires original_action_id".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl EvmFeeFacts {
+    fn validate(&self, field: &str) -> Result<(), AuthApiError> {
+        validate_required("fee tx_type", &self.tx_type)?;
+        validate_decimal_string("gas_limit", &self.gas_limit)?;
+        match self.tx_type.as_str() {
+            "eip1559" => {
+                let max_fee = self.max_fee_per_gas_wei.as_ref().ok_or_else(|| {
+                    AuthApiError::InvalidSubject(format!("{field} missing max_fee_per_gas_wei"))
+                })?;
+                let priority = self.max_priority_fee_per_gas_wei.as_ref().ok_or_else(|| {
+                    AuthApiError::InvalidSubject(format!(
+                        "{field} missing max_priority_fee_per_gas_wei"
+                    ))
+                })?;
+                validate_decimal_string("max_fee_per_gas_wei", max_fee)?;
+                validate_decimal_string("max_priority_fee_per_gas_wei", priority)?;
+            }
+            "legacy" => {
+                let gas_price = self.gas_price_wei.as_ref().ok_or_else(|| {
+                    AuthApiError::InvalidSubject(format!("{field} missing gas_price_wei"))
+                })?;
+                validate_decimal_string("gas_price_wei", gas_price)?;
+            }
+            other => {
+                return Err(AuthApiError::InvalidSubject(format!(
+                    "{field} has unsupported tx_type {other}"
+                )));
+            }
+        }
+        if let Some(total) = &self.max_total_fee_wei {
+            validate_decimal_string("max_total_fee_wei", total)?;
+        }
+        Ok(())
+    }
+}
+
+impl EvmUnsignedEnvelopeFacts {
+    fn validate(&self) -> Result<(), AuthApiError> {
+        validate_required("envelope_kind", &self.envelope_kind)?;
+        validate_hash32_hex("unsigned_tx_bytes_hash", &self.unsigned_tx_bytes_hash)?;
+        validate_hash32_hex("signing_hash", &self.signing_hash)?;
+        Ok(())
+    }
+}
+
+impl EvmOriginalTxFact {
+    fn validate(&self) -> Result<(), AuthApiError> {
+        validate_required("original_action_id", &self.original_action_id)?;
+        validate_hash32_hex("original_tx_hash", &self.original_tx_hash)?;
+        Ok(())
+    }
+}
+
+impl EvmOwnerSessionUseFact {
+    fn validate(&self) -> Result<(), AuthApiError> {
+        validate_required("session_id", &self.session_id)?;
+        validate_required("reservation_id", &self.reservation_id)?;
+        validate_required("token_address", &self.token_address)?;
+        validate_required("recipient", &self.recipient)?;
+        validate_decimal_string("daily_cap_base_units", &self.daily_cap_base_units)?;
+        if self.expires_ms == 0 {
+            return Err(AuthApiError::InvalidSubject(
+                "owner session expires_ms is zero".into(),
+            ));
+        }
+        if self.max_signature_count == 0 {
+            return Err(AuthApiError::InvalidSubject(
+                "owner session max_signature_count is zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Registry hook for per-`(petal_id, intent)` attestation schema validation.
 ///
 /// The daemon consults this before signing: the attestation's `schema` must
@@ -1475,6 +2095,11 @@ impl SigningAttestationSchemaRegistry for DefaultAttestationRegistry {
                 "unsupported attestation schema for ({}, {})",
                 attestation.petal_id, attestation.intent
             )));
+        }
+        if attestation.petal_id == petal_identity::PETAL_ID_EVM_WALLET
+            && attestation.intent == EVM_TX_SIGN_INTENT
+        {
+            EvmSigningAttestationFacts::from_attestation(attestation)?;
         }
         Ok(())
     }
@@ -1736,6 +2361,77 @@ pub struct StandingSessionRecord {
     pub created_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct EvmFeePolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fee_per_gas_wei: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_priority_fee_per_gas_wei: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_fee_wei: Option<String>,
+}
+
+/// Non-secret scope sealed into an EVM owner-signing standing session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvmOwnerSigningSessionScope {
+    pub wallet: String,
+    pub chain_id: u64,
+    pub token_contract: String,
+    pub recipient: String,
+    pub method: String,
+    pub daily_cap_base_units: String,
+    pub ttl_ms: u64,
+    pub fee_policy: EvmFeePolicy,
+    pub max_signature_count: u32,
+    pub autonomy_classification: String,
+    pub policy_snapshot_digest: String,
+    pub petal_id: String,
+    pub petal_digest: String,
+    pub petal_version: String,
+    pub reason: String,
+    #[serde(default)]
+    pub native_transfers_allowed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvmOwnerSigningSessionCounters {
+    pub daily_window_start_ms: u64,
+    pub spent_base_units: String,
+    pub reserved_base_units: String,
+    pub signature_count: u32,
+    #[serde(default)]
+    pub pending_reservations: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvmOwnerSigningSessionUse {
+    pub wallet: String,
+    pub chain_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<String>,
+    pub token_contract: String,
+    pub recipient: String,
+    pub method: String,
+    pub calldata_hex: String,
+    pub amount_base_units: String,
+    #[serde(default = "default_zero_wei")]
+    pub value_wei: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gas_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_fee_per_gas_wei: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_priority_fee_per_gas_wei: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_fee_wei: Option<String>,
+}
+
+fn default_zero_wei() -> String {
+    "0".to_string()
+}
+
 /// Deterministic, machine-comparable reasons for denying a standing-session
 /// request. The stable string form ([`Self::as_deterministic_str`]) is what
 /// callers compare on; never reorder or reword without a migration.
@@ -1746,10 +2442,17 @@ pub enum SessionDenialReason {
     ScopeMismatch,
     Expired,
     Revoked,
+    WrongWallet,
     WrongToken,
     WrongRecipient,
     WrongChain,
     WrongMethod,
+    WrongCalldata,
+    WrongAmount,
+    FeePolicy,
+    NativeTransfer,
+    SignatureCount,
+    MissingSignerMaterial,
     Halted,
 }
 
@@ -1761,10 +2464,17 @@ impl SessionDenialReason {
             Self::ScopeMismatch => "session_scope_mismatch",
             Self::Expired => "session_expired",
             Self::Revoked => "session_revoked",
+            Self::WrongWallet => "session_wrong_wallet",
             Self::WrongToken => "session_wrong_token",
             Self::WrongRecipient => "session_wrong_recipient",
             Self::WrongChain => "session_wrong_chain",
             Self::WrongMethod => "session_wrong_method",
+            Self::WrongCalldata => "session_wrong_calldata",
+            Self::WrongAmount => "session_wrong_amount",
+            Self::FeePolicy => "session_fee_policy_mismatch",
+            Self::NativeTransfer => "session_native_transfer_not_scoped",
+            Self::SignatureCount => "session_signature_count_exhausted",
+            Self::MissingSignerMaterial => "session_missing_signer_material",
             Self::Halted => "session_halted",
         }
     }
@@ -1902,6 +2612,28 @@ pub struct SealedIntentRecord {
 #[async_trait]
 pub trait AuthStoreView: Send + Sync {
     async fn sealed_intent(&self, intent_hash: &str) -> Result<SealedIntentRecord, AuthApiError>;
+
+    async fn standing_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<StandingSessionRecord>, AuthApiError> {
+        let _ = session_id;
+        Err(AuthApiError::Store(
+            "standing_session is not supported by this auth store view".into(),
+        ))
+    }
+
+    async fn active_standing_sessions(
+        &self,
+        wallet: &str,
+        session_kind: Option<&str>,
+        now_ms: u64,
+    ) -> Result<Vec<StandingSessionRecord>, AuthApiError> {
+        let _ = (wallet, session_kind, now_ms);
+        Err(AuthApiError::Store(
+            "active_standing_sessions is not supported by this auth store view".into(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -1950,6 +2682,94 @@ pub trait AuthStoreWriter: Send + Sync {
         expires_ms: u64,
         now_ms: u64,
     ) -> Result<ReviewSessionRecord, AuthApiError>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_standing_session(
+        &self,
+        session_id: &str,
+        wallet: &str,
+        petal_id: &str,
+        session_kind: &str,
+        scope: serde_json::Value,
+        counters: serde_json::Value,
+        frozen_policy_version: u64,
+        frozen_petal_policy_digest: &str,
+        issued_ms: u64,
+        expires_ms: u64,
+        now_ms: u64,
+    ) -> Result<StandingSessionRecord, AuthApiError> {
+        let _ = (
+            session_id,
+            wallet,
+            petal_id,
+            session_kind,
+            scope,
+            counters,
+            frozen_policy_version,
+            frozen_petal_policy_digest,
+            issued_ms,
+            expires_ms,
+            now_ms,
+        );
+        Err(AuthApiError::Store(
+            "create_standing_session is not supported by this auth store writer".into(),
+        ))
+    }
+
+    async fn revoke_standing_session(
+        &self,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Result<(), AuthApiError> {
+        let _ = (session_id, now_ms);
+        Err(AuthApiError::Store(
+            "revoke_standing_session is not supported by this auth store writer".into(),
+        ))
+    }
+
+    async fn reserve_evm_owner_session_use(
+        &self,
+        session_id: &str,
+        reservation_id: &str,
+        request: EvmOwnerSigningSessionUse,
+        signer_material_available: bool,
+        now_ms: u64,
+    ) -> Result<StandingSessionRecord, AuthApiError> {
+        let _ = (
+            session_id,
+            reservation_id,
+            request,
+            signer_material_available,
+            now_ms,
+        );
+        Err(AuthApiError::Store(
+            "reserve_evm_owner_session_use is not supported by this auth store writer".into(),
+        ))
+    }
+
+    async fn commit_evm_owner_session_use(
+        &self,
+        session_id: &str,
+        reservation_id: &str,
+        now_ms: u64,
+    ) -> Result<StandingSessionRecord, AuthApiError> {
+        let _ = (session_id, reservation_id, now_ms);
+        Err(AuthApiError::Store(
+            "commit_evm_owner_session_use is not supported by this auth store writer".into(),
+        ))
+    }
+
+    async fn release_evm_owner_session_use(
+        &self,
+        session_id: &str,
+        reservation_id: &str,
+        now_ms: u64,
+    ) -> Result<StandingSessionRecord, AuthApiError> {
+        let _ = (session_id, reservation_id, now_ms);
+        Err(AuthApiError::Store(
+            "release_evm_owner_session_use is not supported by this auth store writer".into(),
+        ))
+    }
 }
 
 #[async_trait]
@@ -2029,6 +2849,56 @@ fn decode_b64_any(value: &str) -> Result<Vec<u8>, AuthApiError> {
         .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(value))
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(value))
         .map_err(|e| AuthApiError::Denied(format!("invalid base64 field: {e}")))
+}
+
+fn denied_from_invalid(err: AuthApiError) -> AuthApiError {
+    match err {
+        AuthApiError::InvalidSubject(message) => AuthApiError::Denied(message),
+        other => other,
+    }
+}
+
+fn validate_required(field: &str, value: &str) -> Result<(), AuthApiError> {
+    if value.trim().is_empty() {
+        return Err(AuthApiError::InvalidSubject(format!("{field} is empty")));
+    }
+    Ok(())
+}
+
+fn validate_decimal_string(field: &str, value: &str) -> Result<(), AuthApiError> {
+    validate_required(field, value)?;
+    if value.len() > 1 && value.starts_with('0') {
+        return Err(AuthApiError::InvalidSubject(format!(
+            "{field} must use canonical decimal form"
+        )));
+    }
+    if !value.as_bytes().iter().all(u8::is_ascii_digit) {
+        return Err(AuthApiError::InvalidSubject(format!(
+            "{field} must be a decimal string"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_digest_hex(field: &str, value: &str) -> Result<(), AuthApiError> {
+    if value.len() != 64 || !value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return Err(AuthApiError::InvalidSubject(format!(
+            "{field} must be 64 lowercase hex chars"
+        )));
+    }
+    if value != value.to_lowercase() {
+        return Err(AuthApiError::InvalidSubject(format!(
+            "{field} must be lowercase"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_hash32_hex(field: &str, value: &str) -> Result<(), AuthApiError> {
+    let hex = value
+        .strip_prefix("0x")
+        .ok_or_else(|| AuthApiError::InvalidSubject(format!("{field} must be 0x-prefixed")))?;
+    validate_digest_hex(field, hex)
 }
 
 #[cfg(test)]
@@ -2891,6 +3761,456 @@ mod tests {
         assert!(att.validate().is_err());
     }
 
+    fn evm_signing_attestation() -> SigningAttestation {
+        let mut facts = BTreeMap::new();
+        facts.insert("action_id".into(), serde_json::json!("31337:0001-send"));
+        facts.insert("wallet".into(), serde_json::json!("my-wallet"));
+        facts.insert("chain_id".into(), serde_json::json!(31337));
+        facts.insert(
+            "account".into(),
+            serde_json::json!("0x0000000000000000000000000000000000000001"),
+        );
+        facts.insert(
+            "to".into(),
+            serde_json::json!("0x0000000000000000000000000000000000000002"),
+        );
+        facts.insert("value_wei".into(), serde_json::json!("0"));
+        facts.insert(
+            "token".into(),
+            serde_json::json!({
+                "address": "0x0000000000000000000000000000000000000003",
+                "symbol": "USDC",
+                "amount": "1000000",
+                "decimals": 6,
+            }),
+        );
+        facts.insert("method".into(), serde_json::json!("erc20.transfer"));
+        facts.insert("action_kind".into(), serde_json::json!("evm_confirm"));
+        facts.insert("calldata_hash".into(), serde_json::json!("a".repeat(64)));
+        facts.insert("signing_hash".into(), serde_json::json!("b".repeat(64)));
+        facts.insert(
+            "fee_facts".into(),
+            serde_json::json!({
+                "gas_limit": 21000,
+                "max_fee_per_gas": "100",
+                "max_priority_fee_per_gas": "10",
+            }),
+        );
+        facts.insert(
+            "policy_snapshot_digest".into(),
+            serde_json::json!("c".repeat(64)),
+        );
+        SigningAttestation {
+            schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
+            petal_id: PETAL_ID_EVM_WALLET.into(),
+            petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+            intent: "evm.tx.sign".into(),
+            facts,
+        }
+    }
+
+    #[test]
+    fn evm_signing_attestation_serializes_deterministically() {
+        let att = evm_signing_attestation();
+        att.validate().unwrap();
+        let first = serde_json::to_vec(&att).unwrap();
+
+        let mut facts_reinserted = BTreeMap::new();
+        for key in att.facts.keys().rev() {
+            facts_reinserted.insert(key.clone(), att.facts[key].clone());
+        }
+        let reordered = SigningAttestation {
+            facts: facts_reinserted,
+            ..att.clone()
+        };
+        let second = serde_json::to_vec(&reordered).unwrap();
+        assert_eq!(first, second);
+
+        let value: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(value["petal_id"], PETAL_ID_EVM_WALLET);
+        assert_eq!(value["petal_digest"], PLACEHOLDER_DIGEST_EVM_WALLET);
+        assert_eq!(value["intent"], "evm.tx.sign");
+        assert_eq!(value["facts"]["action_id"], "31337:0001-send");
+        assert_eq!(value["facts"]["chain_id"], 31337);
+        assert_eq!(value["facts"]["method"], "erc20.transfer");
+        assert_eq!(value["facts"]["policy_snapshot_digest"], "c".repeat(64));
+    }
+
+    #[test]
+    fn evm_signing_attestation_binds_ws4_critical_facts() {
+        let base = serde_json::to_vec(&evm_signing_attestation()).unwrap();
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            ("action_id", serde_json::json!("31337:0002-replace")),
+            ("wallet", serde_json::json!("other-wallet")),
+            ("chain_id", serde_json::json!(8453)),
+            (
+                "account",
+                serde_json::json!("0x0000000000000000000000000000000000000004"),
+            ),
+            (
+                "to",
+                serde_json::json!("0x0000000000000000000000000000000000000005"),
+            ),
+            ("value_wei", serde_json::json!("1")),
+            (
+                "token",
+                serde_json::json!({
+                    "address": "0x0000000000000000000000000000000000000006",
+                    "symbol": "USDC",
+                    "amount": "1000000",
+                    "decimals": 6,
+                }),
+            ),
+            ("method", serde_json::json!("native.transfer")),
+            ("action_kind", serde_json::json!("evm_cancel")),
+            ("calldata_hash", serde_json::json!("d".repeat(64))),
+            ("signing_hash", serde_json::json!("e".repeat(64))),
+            (
+                "fee_facts",
+                serde_json::json!({
+                    "gas_limit": 21000,
+                    "max_fee_per_gas": "200",
+                    "max_priority_fee_per_gas": "20",
+                }),
+            ),
+            ("policy_snapshot_digest", serde_json::json!("f".repeat(64))),
+        ];
+
+        for (field, replacement) in cases {
+            let mut changed = evm_signing_attestation();
+            changed.facts.insert(field.into(), replacement);
+            assert_ne!(
+                serde_json::to_vec(&changed).unwrap(),
+                base,
+                "mutating EVM attestation fact {field} must change serialized preimage"
+            );
+        }
+    }
+
+    #[test]
+    fn evm_owner_session_record_is_metadata_only_and_exact_scope() {
+        let scope = serde_json::json!({
+            "wallet": "my-wallet",
+            "chain_id": 31337,
+            "token_contract": "0x0000000000000000000000000000000000000003",
+            "recipient": "0x0000000000000000000000000000000000000002",
+            "method": "erc20.transfer",
+            "daily_cap_micro_usd": 100_000_000,
+            "ttl_ms": 3_600_000,
+            "fee_policy": {"max_fee_per_gas": "200", "max_priority_fee_per_gas": "20"},
+            "max_signature_count": 10,
+            "autonomy_classification": "bounded_owner_signing"
+        });
+        let counters = serde_json::json!({
+            "spent_micro_usd": 0,
+            "signature_count": 0,
+            "window_started_ms": 1_000
+        });
+        let record = StandingSessionRecord {
+            session_id: "evm-session-1".into(),
+            wallet: "my-wallet".into(),
+            petal_id: PETAL_ID_EVM_WALLET.into(),
+            session_kind: "evm_owner_signing".into(),
+            scope: scope.clone(),
+            counters,
+            frozen_policy_version: 7,
+            frozen_petal_policy_digest: "c".repeat(64),
+            issued_ms: 1_000,
+            expires_ms: 3_601_000,
+            revoked_ms: None,
+            orphan: false,
+            created_ms: 1_000,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"session_kind\":\"evm_owner_signing\""));
+        assert!(json.contains("\"method\":\"erc20.transfer\""));
+        assert!(json.contains("\"daily_cap_micro_usd\":100000000"));
+        assert!(!json.contains("private_key"));
+        assert!(!json.contains("passphrase"));
+        assert!(!json.contains("mnemonic"));
+        assert!(!json.contains("recovery_phrase"));
+
+        let roundtrip: StandingSessionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.scope, scope);
+        assert_eq!(roundtrip.petal_id, PETAL_ID_EVM_WALLET);
+        assert_eq!(roundtrip.frozen_policy_version, 7);
+        assert!(!roundtrip.orphan);
+    }
+
+    fn evm_typed_subject() -> EvmSealedIntentSubject {
+        let wallet = "my-wallet".to_string();
+        let petal_id = PETAL_ID_EVM_WALLET.to_string();
+        let petal_digest = PLACEHOLDER_DIGEST_EVM_WALLET.to_string();
+        let policy_snapshot = PetalPolicySnapshot {
+            policy_version: 7,
+            wallet: wallet.clone(),
+            petal_id: petal_id.clone(),
+            petal_digest: petal_digest.clone(),
+            caps: BTreeMap::from([(
+                "daily_usdc_cap_base_units".into(),
+                serde_json::json!("100000000"),
+            )]),
+            hard_rules: Vec::new(),
+            step_up_rules: Vec::new(),
+            config: BTreeMap::from([("chain_id".into(), serde_json::json!(8453_u64))]),
+            budget_state: BTreeMap::from([(
+                "spent_today_base_units".into(),
+                serde_json::json!("0"),
+            )]),
+            session_scope: None,
+        };
+        let daemon_terms = DaemonGrantTerms {
+            max_ttl_secs: 120,
+            max_signatures: 1,
+            allowed_sign_intents: vec![EVM_TX_SIGN_INTENT.into()],
+            assurance: AssuranceLevel::Hardened,
+            extra: BTreeMap::from([(
+                "required.intent".into(),
+                serde_json::json!(EVM_TX_SIGN_INTENT),
+            )]),
+        };
+        EvmSealedIntentSubject {
+            schema: EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1.into(),
+            action_id: "act_evm_1".into(),
+            wallet,
+            surface: "outbox".into(),
+            petal_id,
+            petal_digest,
+            petal_version: FIRST_PARTY_PETAL_VERSION_V0.into(),
+            action_kind: EvmSealedActionKind::Confirm,
+            chain_id: 8453,
+            account: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            call: EvmCallFact {
+                to: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                recipient: Some("0xcccccccccccccccccccccccccccccccccccccccc".into()),
+                calldata_hex: "0xa9059cbb".into(),
+                calldata_hash: format!("0x{}", "1".repeat(64)),
+                method: "erc20.transfer".into(),
+            },
+            value: EvmValueFact {
+                native_value_wei: "0".into(),
+                token_amount_base_units: Some("1000000".into()),
+                valuation_usd_micro: Some(1_000_000),
+            },
+            token: Some(EvmTokenFact {
+                chain_id: 8453,
+                token_address: "0xdddddddddddddddddddddddddddddddddddddddd".into(),
+                symbol: "USDC".into(),
+                decimals: 6,
+            }),
+            nonce_intent: EvmNonceIntent {
+                mode: "exact".into(),
+                nonce: Some(12),
+                original_action_id: None,
+            },
+            fee_facts: EvmFeeFacts {
+                tx_type: "eip1559".into(),
+                gas_limit: "21000".into(),
+                max_fee_per_gas_wei: Some("1000000000".into()),
+                max_priority_fee_per_gas_wei: Some("1000000".into()),
+                gas_price_wei: None,
+                max_total_fee_wei: Some("21000000000000".into()),
+            },
+            replacement_fee_facts: None,
+            unsigned_envelope: EvmUnsignedEnvelopeFacts {
+                envelope_kind: "eip1559_rlp".into(),
+                unsigned_tx_bytes_hash: format!("0x{}", "2".repeat(64)),
+                signing_hash: format!("0x{}", "3".repeat(64)),
+            },
+            original_tx: None,
+            owner_session_use: None,
+            policy_snapshot_digest: policy_snapshot.petal_policy_digest().unwrap(),
+            policy_snapshot,
+            daemon_terms_digest: daemon_terms.daemon_terms_digest().unwrap(),
+            daemon_terms,
+            authority_change: false,
+        }
+    }
+
+    fn assert_evm_typed_subject_hash_changes<F: FnOnce(&mut EvmSealedIntentSubject)>(mutate: F) {
+        let original = evm_typed_subject()
+            .canonical_envelope(20_000)
+            .unwrap()
+            .intent_hash()
+            .unwrap();
+        let mut modified = evm_typed_subject();
+        mutate(&mut modified);
+        let modified_hash = modified
+            .canonical_envelope(20_000)
+            .unwrap()
+            .intent_hash()
+            .unwrap();
+        assert_ne!(original, modified_hash);
+    }
+
+    #[test]
+    fn evm_typed_subject_serialization_is_deterministic() {
+        let subject = evm_typed_subject();
+        let first = subject.canonical_subject_bytes().unwrap();
+        let second = subject.canonical_subject_bytes().unwrap();
+        assert_eq!(first, second);
+
+        let envelope = subject.canonical_envelope(20_000).unwrap();
+        assert_eq!(envelope.subject_kind, EVM_SEALED_INTENT_SUBJECT_KIND);
+        assert_eq!(envelope.subject_schema, EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1);
+        assert_eq!(envelope.header.petal_id, PETAL_ID_EVM_WALLET);
+        assert_eq!(envelope.header.action_kind, "confirm");
+        assert_eq!(envelope.header.network, "eip155:8453");
+    }
+
+    #[test]
+    fn evm_typed_subject_hash_binds_critical_fields() {
+        assert_evm_typed_subject_hash_changes(|s| s.action_id = "act_evm_2".into());
+        assert_evm_typed_subject_hash_changes(|s| {
+            s.wallet = "other-wallet".into();
+            s.policy_snapshot.wallet = s.wallet.clone();
+            s.policy_snapshot_digest = s.policy_snapshot.petal_policy_digest().unwrap();
+        });
+        assert_evm_typed_subject_hash_changes(|s| s.surface = "wallets".into());
+        assert_evm_typed_subject_hash_changes(|s| {
+            s.petal_digest = "first-party-placeholder:evm-wallet:v1".into();
+            s.policy_snapshot.petal_digest = s.petal_digest.clone();
+            s.policy_snapshot_digest = s.policy_snapshot.petal_policy_digest().unwrap();
+        });
+        assert_evm_typed_subject_hash_changes(|s| s.action_kind = EvmSealedActionKind::Cancel);
+        assert_evm_typed_subject_hash_changes(|s| {
+            s.chain_id = 1;
+            s.token.as_mut().unwrap().chain_id = 1;
+        });
+        assert_evm_typed_subject_hash_changes(|s| {
+            s.account = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".into()
+        });
+        assert_evm_typed_subject_hash_changes(|s| {
+            s.call.to = "0xffffffffffffffffffffffffffffffffffffffff".into()
+        });
+        assert_evm_typed_subject_hash_changes(|s| s.call.recipient = None);
+        assert_evm_typed_subject_hash_changes(|s| {
+            s.value.token_amount_base_units = Some("2000000".into())
+        });
+        assert_evm_typed_subject_hash_changes(|s| {
+            s.token.as_mut().unwrap().token_address =
+                "0x1111111111111111111111111111111111111111".into()
+        });
+        assert_evm_typed_subject_hash_changes(|s| {
+            s.call.calldata_hash = format!("0x{}", "4".repeat(64))
+        });
+        assert_evm_typed_subject_hash_changes(|s| s.nonce_intent.nonce = Some(13));
+        assert_evm_typed_subject_hash_changes(|s| {
+            s.fee_facts.max_fee_per_gas_wei = Some("2000000000".into())
+        });
+        assert_evm_typed_subject_hash_changes(|s| {
+            s.unsigned_envelope.signing_hash = format!("0x{}", "5".repeat(64))
+        });
+        assert_evm_typed_subject_hash_changes(|s| {
+            s.policy_snapshot
+                .budget_state
+                .insert("spent_today_base_units".into(), serde_json::json!("1"));
+            s.policy_snapshot_digest = s.policy_snapshot.petal_policy_digest().unwrap();
+        });
+        assert_evm_typed_subject_hash_changes(|s| {
+            s.daemon_terms.max_ttl_secs = 60;
+            s.daemon_terms_digest = s.daemon_terms.daemon_terms_digest().unwrap();
+        });
+    }
+
+    #[test]
+    fn evm_typed_subject_validation_requires_terms_and_policy_binding() {
+        evm_typed_subject().validate_evm().unwrap();
+
+        let mut subject = evm_typed_subject();
+        subject.daemon_terms.allowed_sign_intents.clear();
+        let err = subject.validate_evm().unwrap_err();
+        assert!(err.to_string().contains("evm.tx.sign"), "{err}");
+
+        let mut subject = evm_typed_subject();
+        subject.policy_snapshot_digest = "0".repeat(64);
+        let err = subject.validate_evm().unwrap_err();
+        assert!(err.to_string().contains("policy_snapshot_digest"), "{err}");
+
+        let mut subject = evm_typed_subject();
+        subject.daemon_terms.max_signatures = 2;
+        subject.daemon_terms_digest = subject.daemon_terms.daemon_terms_digest().unwrap();
+        let err = subject.validate_evm().unwrap_err();
+        assert!(err.to_string().contains("one-shot"), "{err}");
+    }
+
+    #[test]
+    fn evm_typed_attestation_round_trips_and_registry_accepts() {
+        let subject = evm_typed_subject();
+        let facts = subject.signing_attestation_facts();
+        let attestation = facts.signing_attestation().unwrap();
+        let parsed = EvmSigningAttestationFacts::from_attestation(&attestation).unwrap();
+        assert_eq!(parsed, facts);
+        parsed.validate_against_subject(&subject).unwrap();
+
+        DefaultAttestationRegistry::new()
+            .validate_attestation(&attestation)
+            .unwrap();
+    }
+
+    #[test]
+    fn evm_typed_attestation_rejects_missing_or_mismatched_facts() {
+        let subject = evm_typed_subject();
+        let valid = subject
+            .signing_attestation_facts()
+            .signing_attestation()
+            .unwrap();
+
+        let mut missing = valid.clone();
+        missing.facts.remove("signing_hash");
+        let err = DefaultAttestationRegistry::new()
+            .validate_attestation(&missing)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("missing field") || err.to_string().contains("signing_hash"),
+            "{err}"
+        );
+
+        let mut digest_mismatch = valid.clone();
+        digest_mismatch.petal_digest = "first-party-placeholder:evm-wallet:other".into();
+        let err = DefaultAttestationRegistry::new()
+            .validate_attestation(&digest_mismatch)
+            .unwrap_err();
+        assert!(err.to_string().contains("petal_digest mismatch"), "{err}");
+
+        let mut signing_hash_mismatch = subject.signing_attestation_facts();
+        signing_hash_mismatch.signing_hash = format!("0x{}", "6".repeat(64));
+        let err = signing_hash_mismatch.validate().unwrap_err();
+        assert!(err.to_string().contains("signing_hash mismatch"), "{err}");
+
+        let mut field_mismatch = subject.signing_attestation_facts();
+        field_mismatch.wallet = "other-wallet".into();
+        let err = field_mismatch
+            .validate_against_subject(&subject)
+            .unwrap_err();
+        assert!(err.to_string().contains("sealed intent"), "{err}");
+    }
+
+    #[test]
+    fn evm_owner_session_subject_carries_exact_scope_without_secret_material() {
+        let mut subject = evm_typed_subject();
+        subject.action_kind = EvmSealedActionKind::OwnerSessionUse;
+        subject.owner_session_use = Some(EvmOwnerSessionUseFact {
+            session_id: "evm-session-1".into(),
+            reservation_id: "evm-reservation-1".into(),
+            token_address: "0xdddddddddddddddddddddddddddddddddddddddd".into(),
+            recipient: "0xcccccccccccccccccccccccccccccccccccccccc".into(),
+            daily_cap_base_units: "100000000".into(),
+            expires_ms: 3_601_000,
+            max_signature_count: 10,
+        });
+        subject.daemon_terms.max_signatures = 10;
+        subject.daemon_terms_digest = subject.daemon_terms.daemon_terms_digest().unwrap();
+
+        let json = String::from_utf8(subject.canonical_subject_bytes().unwrap()).unwrap();
+        assert!(json.contains("\"action_kind\":\"owner_session_use\""));
+        assert!(json.contains("\"daily_cap_base_units\":\"100000000\""));
+        assert!(!json.contains("private_key"));
+        assert!(!json.contains("passphrase"));
+        assert!(!json.contains("mnemonic"));
+        assert!(!json.contains("recovery_phrase"));
+    }
+
     // ------------------------------------------------------------------
     // Valuation (unchanged behavior)
     // ------------------------------------------------------------------
@@ -2969,6 +4289,60 @@ mod tests {
     // SealedSignature / AuditEvent / PetalHost (WS-1 host signing API)
     // ------------------------------------------------------------------
 
+    fn typed_evm_attestation_for_registry() -> SigningAttestation {
+        EvmSigningAttestationFacts {
+            facts_schema: EVM_SIGNING_ATTESTATION_FACTS_SCHEMA_V1.into(),
+            action_id: "31337:0001-send".into(),
+            wallet: "my-wallet".into(),
+            surface: "outbox".into(),
+            petal_id: PETAL_ID_EVM_WALLET.into(),
+            petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+            petal_version: FIRST_PARTY_PETAL_VERSION_V0.into(),
+            action_kind: EvmSealedActionKind::Confirm,
+            chain_id: 31337,
+            account: "0x0000000000000000000000000000000000000001".into(),
+            to: "0x0000000000000000000000000000000000000002".into(),
+            recipient: Some("0x0000000000000000000000000000000000000002".into()),
+            value: EvmValueFact {
+                native_value_wei: "0".into(),
+                token_amount_base_units: Some("1000000".into()),
+                valuation_usd_micro: Some(1_000_000),
+            },
+            token: Some(EvmTokenFact {
+                chain_id: 31337,
+                token_address: "0x0000000000000000000000000000000000000003".into(),
+                symbol: "USDC".into(),
+                decimals: 6,
+            }),
+            method: EVM_ERC20_TRANSFER_METHOD.into(),
+            calldata_hash: format!("0x{}", "a".repeat(64)),
+            nonce_intent: EvmNonceIntent {
+                mode: "exact".into(),
+                nonce: Some(7),
+                original_action_id: None,
+            },
+            fee_facts: EvmFeeFacts {
+                tx_type: "eip1559".into(),
+                gas_limit: "21000".into(),
+                max_fee_per_gas_wei: Some("100".into()),
+                max_priority_fee_per_gas_wei: Some("10".into()),
+                gas_price_wei: None,
+                max_total_fee_wei: Some("2100000".into()),
+            },
+            replacement_fee_facts: None,
+            unsigned_envelope: EvmUnsignedEnvelopeFacts {
+                envelope_kind: "eip1559_rlp".into(),
+                unsigned_tx_bytes_hash: format!("0x{}", "b".repeat(64)),
+                signing_hash: format!("0x{}", "c".repeat(64)),
+            },
+            signing_hash: format!("0x{}", "c".repeat(64)),
+            policy_snapshot_digest: "d".repeat(64),
+            daemon_terms_digest: "e".repeat(64),
+        }
+        .signing_attestation()
+        .unwrap()
+    }
+
     #[test]
     fn default_registry_accepts_first_party_pairs() {
         let r = DefaultAttestationRegistry::new();
@@ -2993,12 +4367,16 @@ mod tests {
                 r.is_allowed(petal_id, intent, SIGNING_ATTESTATION_SCHEMA_V1),
                 "({petal_id}, {intent}) must be allowed"
             );
-            let att = SigningAttestation {
-                schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
-                petal_id: petal_id.into(),
-                petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
-                intent: intent.into(),
-                facts: BTreeMap::new(),
+            let att = if petal_id == PETAL_ID_EVM_WALLET && intent == EVM_TX_SIGN_INTENT {
+                typed_evm_attestation_for_registry()
+            } else {
+                SigningAttestation {
+                    schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
+                    petal_id: petal_id.into(),
+                    petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+                    intent: intent.into(),
+                    facts: BTreeMap::new(),
+                }
             };
             r.validate_attestation(&att).unwrap();
         }

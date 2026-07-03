@@ -1587,7 +1587,6 @@ async fn run(cli: Cli) -> Result<()> {
                     "path": path,
                     "bytes_b64": B64.encode(&body),
                     "wallet": &wallet,
-                    "passphrase": passphrase.as_deref(),
                 }),
             )
             .await
@@ -2062,7 +2061,7 @@ async fn run(cli: Cli) -> Result<()> {
             wallet,
             chain,
             id,
-            passphrase,
+            passphrase: _,
             text,
         }) => {
             let path = format!("/wallets/{wallet}/chains/{chain}/outbox/pending/{id}/confirm");
@@ -2076,7 +2075,6 @@ async fn run(cli: Cli) -> Result<()> {
                     "path": path,
                     "bytes_b64": B64.encode(&body),
                     "wallet": &wallet,
-                    "passphrase": passphrase.as_deref(),
                 }),
             )
             .await
@@ -2091,73 +2089,59 @@ async fn run(cli: Cli) -> Result<()> {
             let info = d.keystore.info(&wallet)?;
             let passkey_wallet = info.kind == bloom_keystore::WalletKind::PasskeyGated;
             let mut approval_intent: Option<CeremonyIntent> = None;
-            match info.kind {
-                bloom_keystore::WalletKind::PasskeyGated => {
-                    // Build the review intent from the staged outbox entry. An
-                    // EVM staged tx is byte-immutable for the user-risking
-                    // fields (chain/to/value/data/nonce fixed at stage time),
-                    // so the intent faithfully reflects what will be signed.
-                    let intent = d
-                        .tx_engine
-                        .outbox
-                        .read(&wallet, &chain, &id)
-                        .ok()
-                        .map(|entry| {
-                            let s = &entry.staged;
-                            let data_hash = blake3::hash(s.data_hex.as_bytes()).to_hex();
-                            let mut it = CeremonyIntent::new(
-                                &wallet,
-                                format!("Sign {} Transaction", s.chain),
-                                CeremonyIntentKind::EvmTransaction,
-                            )
-                            .with_address(&s.from)
-                            .summary(format!("Chain: {} (id {})", s.chain, s.chain_id))
-                            .summary(format!("To: {}", s.to))
-                            .summary(format!("Value: {} wei", s.value_wei))
-                            .summary(format!(
-                                "Nonce: {}  data: {}B",
-                                s.nonce,
-                                s.data_hex.len() / 2
-                            ))
-                            .summary(format!("Outbox id: {}", s.id))
-                            .risk("Broadcasts this exact staged transaction.")
-                            .subject(serde_json::json!({
-                                "action": "evm_transaction",
-                                "chain_id": s.chain_id,
-                                "from": s.from,
-                                "to": s.to,
-                                "value_wei": s.value_wei,
-                                "nonce": s.nonce,
-                                "data_blake3": data_hash.to_string(),
-                            }));
-                            for c in &s.policy_checks {
-                                it = it
-                                    .policy(format!("[{:?}] {}: {}", c.outcome, c.rule, c.message));
-                            }
-                            // Persist the full reviewed intent into the staged
-                            // tx's outbox dir; the pending → sent transition is a
-                            // dir rename, so it rides along to the sent record.
-                            if let Ok(bytes) = serde_json::to_vec_pretty(&it) {
-                                let _ = d.tx_engine.outbox.write_artefact(
-                                    &entry.dir,
-                                    "review_intent.json",
-                                    &bytes,
-                                );
-                            }
-                            approval_intent = Some(it.clone());
-                            it
-                        });
-                    d.keystore.lock(&wallet);
-                    d.keystore
-                        .unlock_passkey_with_intent(&wallet, intent)
-                        .await?;
-                }
-                _ => {
-                    d.keystore
-                        .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
-                }
+            if passkey_wallet {
+                // Build the review intent from the staged outbox entry. An
+                // EVM staged tx is byte-immutable for the user-risking fields
+                // (chain/to/value/data/nonce fixed at stage time), so the
+                // intent faithfully reflects what will be signed.
+                let intent = d
+                    .tx_engine
+                    .outbox
+                    .read(&wallet, &chain, &id)
+                    .ok()
+                    .map(|entry| {
+                        let s = &entry.staged;
+                        let data_hash = blake3::hash(s.data_hex.as_bytes()).to_hex();
+                        let mut it = CeremonyIntent::new(
+                            &wallet,
+                            format!("Sign {} Transaction", s.chain),
+                            CeremonyIntentKind::EvmTransaction,
+                        )
+                        .with_address(&s.from)
+                        .summary(format!("Chain: {} (id {})", s.chain, s.chain_id))
+                        .summary(format!("To: {}", s.to))
+                        .summary(format!("Value: {} wei", s.value_wei))
+                        .summary(format!(
+                            "Nonce: {}  data: {}B",
+                            s.nonce,
+                            s.data_hex.len() / 2
+                        ))
+                        .summary(format!("Outbox id: {}", s.id))
+                        .risk("Broadcasts this exact staged transaction.")
+                        .subject(serde_json::json!({
+                            "action": "evm_transaction",
+                            "chain_id": s.chain_id,
+                            "from": s.from,
+                            "to": s.to,
+                            "value_wei": s.value_wei,
+                            "nonce": s.nonce,
+                            "data_blake3": data_hash.to_string(),
+                        }));
+                        for c in &s.policy_checks {
+                            it = it.policy(format!("[{:?}] {}: {}", c.outcome, c.rule, c.message));
+                        }
+                        if let Ok(bytes) = serde_json::to_vec_pretty(&it) {
+                            let _ = d.tx_engine.outbox.write_artefact(
+                                &entry.dir,
+                                "review_intent.json",
+                                &bytes,
+                            );
+                        }
+                        approval_intent = Some(it.clone());
+                        it
+                    });
+                let _ = intent;
             }
-            let signer = d.keystore.signer(&wallet)?;
             let info = d.keystore.info(&wallet)?;
             let client = d
                 .chains
@@ -2170,7 +2154,6 @@ async fn run(cli: Cli) -> Result<()> {
                     &chain,
                     &id,
                     &client,
-                    &signer,
                     &info.policy,
                     &text,
                 )
@@ -2254,7 +2237,7 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Wallet(WalletCmd::ConfirmBatch {
             wallet,
             txs,
-            passphrase,
+            passphrase: _,
             text,
             policy_session,
         }) => {
@@ -2288,88 +2271,77 @@ async fn run(cli: Cli) -> Result<()> {
 
             let mut approval_intent: Option<CeremonyIntent> = None;
             let passkey_wallet = info.kind == bloom_keystore::WalletKind::PasskeyGated;
-            match info.kind {
-                bloom_keystore::WalletKind::PasskeyGated => {
-                    if !policy_session {
-                        bail!(
-                            "passkey confirm-batch requires --policy-session so the one ceremony is explicit"
-                        );
-                    }
-                    let mut intent = CeremonyIntent::new(
-                        &wallet,
-                        "Authorize Batch Transaction Session",
-                        CeremonyIntentKind::EvmTransaction,
-                    )
-                    .with_address(bloom_proto::checksum_address(&info.address))
-                    .summary(format!(
-                        "Broadcast {} staged transaction(s).",
-                        entries.len()
-                    ))
-                    .summary("Policy is rechecked for every transaction before broadcast.")
-                    .risk("One passkey approval unlocks this process to sign this exact batch.")
-                    .risk("If a transaction fails, later transactions are not attempted.");
+            if info.kind == bloom_keystore::WalletKind::PasskeyGated {
+                if !policy_session {
+                    bail!(
+                        "passkey confirm-batch requires --policy-session so the one ceremony is explicit"
+                    );
+                }
+                let mut intent = CeremonyIntent::new(
+                    &wallet,
+                    "Authorize Batch Transaction Session",
+                    CeremonyIntentKind::EvmTransaction,
+                )
+                .with_address(bloom_proto::checksum_address(&info.address))
+                .summary(format!(
+                    "Broadcast {} staged transaction(s).",
+                    entries.len()
+                ))
+                .summary("Policy is rechecked for every transaction before broadcast.")
+                .risk("One passkey approval unlocks this process to sign this exact batch.")
+                .risk("If a transaction fails, later transactions are not attempted.");
 
-                    let mut subjects = Vec::new();
-                    for entry in &entries {
-                        let s = &entry.staged;
-                        let data_hash = blake3::hash(s.data_hex.as_bytes()).to_hex().to_string();
-                        intent = intent
-                            .summary(format!(
-                                "{}:{} chain={} nonce={} to={} value={} wei data={}B",
-                                s.chain,
-                                s.id,
-                                s.chain_id,
-                                s.nonce,
-                                s.to,
-                                s.value_wei,
-                                s.data_hex.len() / 2
-                            ))
-                            .artifact(entry.dir.display().to_string());
-                        for c in &s.policy_checks {
-                            intent = intent.policy(format!(
-                                "{}:{} [{:?}] {}: {}",
-                                s.chain, s.id, c.outcome, c.rule, c.message
-                            ));
-                        }
-                        subjects.push(serde_json::json!({
-                            "id": s.id,
-                            "chain": s.chain,
-                            "chain_id": s.chain_id,
-                            "from": s.from,
-                            "to": s.to,
-                            "value_wei": s.value_wei,
-                            "nonce": s.nonce,
-                            "data_blake3": data_hash,
-                        }));
+                let mut subjects = Vec::new();
+                for entry in &entries {
+                    let s = &entry.staged;
+                    let data_hash = blake3::hash(s.data_hex.as_bytes()).to_hex().to_string();
+                    intent = intent
+                        .summary(format!(
+                            "{}:{} chain={} nonce={} to={} value={} wei data={}B",
+                            s.chain,
+                            s.id,
+                            s.chain_id,
+                            s.nonce,
+                            s.to,
+                            s.value_wei,
+                            s.data_hex.len() / 2
+                        ))
+                        .artifact(entry.dir.display().to_string());
+                    for c in &s.policy_checks {
+                        intent = intent.policy(format!(
+                            "{}:{} [{:?}] {}: {}",
+                            s.chain, s.id, c.outcome, c.rule, c.message
+                        ));
                     }
-                    intent = intent.subject(serde_json::json!({
-                        "action": "evm_transaction_batch",
-                        "wallet": wallet,
-                        "txs": subjects,
-                        "confirm_text": text,
+                    subjects.push(serde_json::json!({
+                        "id": s.id,
+                        "chain": s.chain,
+                        "chain_id": s.chain_id,
+                        "from": s.from,
+                        "to": s.to,
+                        "value_wei": s.value_wei,
+                        "nonce": s.nonce,
+                        "data_blake3": data_hash,
                     }));
+                }
+                intent = intent.subject(serde_json::json!({
+                    "action": "evm_transaction_batch",
+                    "wallet": wallet,
+                    "txs": subjects,
+                    "confirm_text": text,
+                }));
 
-                    let review_bytes = serde_json::to_vec_pretty(&intent)?;
-                    for entry in &entries {
-                        let _ = d.tx_engine.outbox.write_artefact(
-                            &entry.dir,
-                            "review_intent.json",
-                            &review_bytes,
-                        );
-                    }
-                    d.keystore.lock(&wallet);
-                    d.keystore
-                        .unlock_passkey_with_intent(&wallet, Some(intent.clone()))
-                        .await?;
-                    approval_intent = Some(intent);
+                let review_bytes = serde_json::to_vec_pretty(&intent)?;
+                for entry in &entries {
+                    let _ = d.tx_engine.outbox.write_artefact(
+                        &entry.dir,
+                        "review_intent.json",
+                        &review_bytes,
+                    );
                 }
-                _ => {
-                    d.keystore
-                        .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
-                }
+                approval_intent = Some(intent);
             }
 
-            let signer = d.keystore.signer(&wallet)?;
             let info = d.keystore.info(&wallet)?;
             for (chain, id) in refs {
                 let client = d
@@ -2383,7 +2355,6 @@ async fn run(cli: Cli) -> Result<()> {
                         &chain,
                         &id,
                         &client,
-                        &signer,
                         &info.policy,
                         &text,
                     )
@@ -2448,7 +2419,8 @@ async fn run(cli: Cli) -> Result<()> {
             let server = IpcServer::new(d.vfs.clone(), env!("CARGO_PKG_VERSION"), chains)
                 .with_keystore(d.keystore.clone())
                 .with_petals(d.petals.clone())
-                .with_auth_services(d.auth_services.clone());
+                .with_auth_services(d.auth_services.clone())
+                .with_signer_cache(d.signer_cache.clone());
             let server2 = server.clone();
             // Trigger graceful shutdown on Ctrl-C or SIGTERM.
             let shutdown = tokio::spawn(async move {

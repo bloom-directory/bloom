@@ -14,13 +14,15 @@ use async_trait::async_trait;
 use bloom_auth_api::{
     APPROVAL_CHALLENGE_SCHEMA_V1, ApprovalChallenge, ApprovalCredentialRecord,
     ApprovalSignatureVerifier, ApprovalVerifier, AssuranceLevel, AuthApiError, AuthEntryRecord,
-    AuthEntryState, AuthStoreView, AuthStoreWriter, CanonicalEnvelope, GrantStore, NonceState,
-    PriceOracle, ReservationRecord, ReservationState, ReviewSessionRecord, SealedAction,
-    SealedApprovalGrant, SealedIntentRecord, SignedApproval, SignerKind, StandingSessionRecord,
+    AuthEntryState, AuthStoreView, AuthStoreWriter, CanonicalEnvelope, EVM_ERC20_TRANSFER_METHOD,
+    EVM_ERC20_TRANSFER_SELECTOR, EVM_OWNER_SIGNING_SESSION_KIND, EvmOwnerSigningSessionCounters,
+    EvmOwnerSigningSessionScope, EvmOwnerSigningSessionUse, GrantStore, NonceState, PriceOracle,
+    ReservationRecord, ReservationState, ReviewSessionRecord, SealedAction, SealedApprovalGrant,
+    SealedIntentRecord, SessionDenialReason, SignedApproval, SignerKind, StandingSessionRecord,
     UnsignedApproval, ValuationPolicy, ValuationQuote, WebAuthnAssertionRecord,
 };
 use bloom_prices::{CoinId, PricesClient};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -1527,7 +1529,8 @@ impl AuthStore {
         expires_ms: u64,
         now_ms: u64,
     ) -> Result<(), AuthStoreError> {
-        self.conn.execute(
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "INSERT INTO standing_sessions(
                 session_id, wallet, petal_id, session_kind, scope_json, counters_json,
                 frozen_policy_version, frozen_petal_policy_digest,
@@ -1547,6 +1550,19 @@ impl AuthStore {
                 now_ms as i64,
             ],
         )?;
+        append_audit_tx(
+            &tx,
+            "standing_session_minted",
+            &serde_json::json!({
+                "session_id": session_id,
+                "wallet": wallet,
+                "petal_id": petal_id,
+                "session_kind": session_kind,
+                "expires_ms": expires_ms,
+            }),
+            now_ms,
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1698,6 +1714,130 @@ impl AuthStore {
         Ok(changed as u64)
     }
 
+    pub fn reserve_evm_owner_session_use(
+        &mut self,
+        session_id: &str,
+        reservation_id: &str,
+        request: &EvmOwnerSigningSessionUse,
+        signer_material_available: bool,
+        now_ms: u64,
+    ) -> Result<StandingSessionRecord, AuthStoreError> {
+        let tx = self.conn.transaction()?;
+        let Some(record) = standing_session_tx(&tx, session_id)? else {
+            append_session_denial_audit_tx(
+                &tx,
+                session_id,
+                request.wallet.as_str(),
+                "session_not_found",
+                now_ms,
+            )?;
+            tx.commit()?;
+            return Err(AuthStoreError::Denied("session_not_found".into()));
+        };
+        let result = validate_and_reserve_evm_owner_session(
+            &record,
+            reservation_id,
+            request,
+            signer_material_available,
+            now_ms,
+        );
+        let counters = match result {
+            Ok(counters) => counters,
+            Err(reason) => {
+                let reason = reason.as_deterministic_str();
+                append_session_denial_audit_tx(&tx, session_id, &record.wallet, reason, now_ms)?;
+                tx.commit()?;
+                return Err(AuthStoreError::Denied(reason.into()));
+            }
+        };
+        let counters_json = serde_json::to_string(&counters)?;
+        tx.execute(
+            "UPDATE standing_sessions SET counters_json = ?2 WHERE session_id = ?1",
+            params![session_id, counters_json],
+        )?;
+        append_audit_tx(
+            &tx,
+            "evm_owner_session_use_reserved",
+            &serde_json::json!({
+                "session_id": session_id,
+                "reservation_id": reservation_id,
+                "wallet": record.wallet,
+                "amount_base_units": request.amount_base_units,
+            }),
+            now_ms,
+        )?;
+        tx.commit()?;
+        self.standing_session(session_id)?
+            .ok_or_else(|| AuthStoreError::Denied("standing session disappeared".into()))
+    }
+
+    pub fn commit_evm_owner_session_use(
+        &mut self,
+        session_id: &str,
+        reservation_id: &str,
+        now_ms: u64,
+    ) -> Result<StandingSessionRecord, AuthStoreError> {
+        self.finish_evm_owner_session_use(session_id, reservation_id, true, now_ms)
+    }
+
+    pub fn release_evm_owner_session_use(
+        &mut self,
+        session_id: &str,
+        reservation_id: &str,
+        now_ms: u64,
+    ) -> Result<StandingSessionRecord, AuthStoreError> {
+        self.finish_evm_owner_session_use(session_id, reservation_id, false, now_ms)
+    }
+
+    fn finish_evm_owner_session_use(
+        &mut self,
+        session_id: &str,
+        reservation_id: &str,
+        commit: bool,
+        now_ms: u64,
+    ) -> Result<StandingSessionRecord, AuthStoreError> {
+        let tx = self.conn.transaction()?;
+        let record = standing_session_tx(&tx, session_id)?
+            .ok_or_else(|| AuthStoreError::Denied("session_not_found".into()))?;
+        let mut counters: EvmOwnerSigningSessionCounters =
+            serde_json::from_value(record.counters.clone())?;
+        let amount = counters
+            .pending_reservations
+            .remove(reservation_id)
+            .ok_or_else(|| AuthStoreError::Denied("session_reservation_not_found".into()))?;
+        let amount_u128 = parse_u128_decimal("amount_base_units", &amount)?;
+        let reserved = parse_u128_decimal("reserved_base_units", &counters.reserved_base_units)?;
+        counters.reserved_base_units = reserved.saturating_sub(amount_u128).to_string();
+        if commit {
+            let spent = parse_u128_decimal("spent_base_units", &counters.spent_base_units)?;
+            counters.spent_base_units = spent.saturating_add(amount_u128).to_string();
+            counters.signature_count = counters.signature_count.saturating_add(1);
+        }
+        let counters_json = serde_json::to_string(&counters)?;
+        tx.execute(
+            "UPDATE standing_sessions SET counters_json = ?2 WHERE session_id = ?1",
+            params![session_id, counters_json],
+        )?;
+        append_audit_tx(
+            &tx,
+            if commit {
+                "evm_owner_session_use_committed"
+            } else {
+                "evm_owner_session_use_released"
+            },
+            &serde_json::json!({
+                "session_id": session_id,
+                "reservation_id": reservation_id,
+                "wallet": record.wallet,
+                "amount_base_units": amount,
+            }),
+            now_ms,
+        )?;
+        tx.commit()?;
+        self.standing_session(session_id)?
+            .ok_or_else(|| AuthStoreError::Denied("standing session disappeared".into()))
+    }
+
     pub fn pragma_string(&self, name: &str) -> Result<String, AuthStoreError> {
         let sql = format!("PRAGMA {name}");
         Ok(self.conn.query_row(&sql, [], |row| row.get(0))?)
@@ -1786,6 +1926,30 @@ where
             .sealed_intent(intent_hash)?
             .ok_or_else(|| AuthApiError::NotFound(format!("sealed intent {intent_hash}")))
     }
+
+    async fn standing_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<StandingSessionRecord>, AuthApiError> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
+        Ok(store.standing_session(session_id)?)
+    }
+
+    async fn active_standing_sessions(
+        &self,
+        wallet: &str,
+        session_kind: Option<&str>,
+        now_ms: u64,
+    ) -> Result<Vec<StandingSessionRecord>, AuthApiError> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
+        Ok(store.active_standing_sessions(wallet, session_kind, now_ms)?)
+    }
 }
 
 #[async_trait]
@@ -1854,6 +2018,101 @@ where
                 now_ms,
             )?,
         )
+    }
+
+    async fn create_standing_session(
+        &self,
+        session_id: &str,
+        wallet: &str,
+        petal_id: &str,
+        session_kind: &str,
+        scope: serde_json::Value,
+        counters: serde_json::Value,
+        frozen_policy_version: u64,
+        frozen_petal_policy_digest: &str,
+        issued_ms: u64,
+        expires_ms: u64,
+        now_ms: u64,
+    ) -> Result<StandingSessionRecord, AuthApiError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
+        store.create_standing_session(
+            session_id,
+            wallet,
+            petal_id,
+            session_kind,
+            &serde_json::to_string(&scope)?,
+            &serde_json::to_string(&counters)?,
+            frozen_policy_version,
+            frozen_petal_policy_digest,
+            issued_ms,
+            expires_ms,
+            now_ms,
+        )?;
+        Ok(store
+            .standing_session(session_id)?
+            .ok_or_else(|| AuthApiError::Store("standing session was not persisted".into()))?)
+    }
+
+    async fn revoke_standing_session(
+        &self,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Result<(), AuthApiError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
+        Ok(store.revoke_standing_session(session_id, now_ms)?)
+    }
+
+    async fn reserve_evm_owner_session_use(
+        &self,
+        session_id: &str,
+        reservation_id: &str,
+        request: EvmOwnerSigningSessionUse,
+        signer_material_available: bool,
+        now_ms: u64,
+    ) -> Result<StandingSessionRecord, AuthApiError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
+        Ok(store.reserve_evm_owner_session_use(
+            session_id,
+            reservation_id,
+            &request,
+            signer_material_available,
+            now_ms,
+        )?)
+    }
+
+    async fn commit_evm_owner_session_use(
+        &self,
+        session_id: &str,
+        reservation_id: &str,
+        now_ms: u64,
+    ) -> Result<StandingSessionRecord, AuthApiError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
+        Ok(store.commit_evm_owner_session_use(session_id, reservation_id, now_ms)?)
+    }
+
+    async fn release_evm_owner_session_use(
+        &self,
+        session_id: &str,
+        reservation_id: &str,
+        now_ms: u64,
+    ) -> Result<StandingSessionRecord, AuthApiError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
+        Ok(store.release_evm_owner_session_use(session_id, reservation_id, now_ms)?)
     }
 }
 
@@ -1985,6 +2244,286 @@ fn parse_i128(field: &'static str, value: &str) -> Result<i128, AuthStoreError> 
         })
 }
 
+fn standing_session_tx(
+    tx: &Transaction<'_>,
+    session_id: &str,
+) -> Result<Option<StandingSessionRecord>, AuthStoreError> {
+    let mut stmt = tx.prepare(
+        "SELECT session_id, wallet, petal_id, session_kind, scope_json, counters_json,
+                frozen_policy_version, frozen_petal_policy_digest,
+                issued_ms, expires_ms, revoked_ms, orphan, created_ms
+         FROM standing_sessions WHERE session_id = ?1",
+    )?;
+    let row = stmt
+        .query_row(params![session_id], |row| {
+            let session_id: String = row.get(0)?;
+            let wallet: String = row.get(1)?;
+            let petal_id: String = row.get(2)?;
+            let session_kind: String = row.get(3)?;
+            let scope_json: String = row.get(4)?;
+            let counters_json: String = row.get(5)?;
+            let frozen_policy_version: i64 = row.get(6)?;
+            let frozen_petal_policy_digest: String = row.get(7)?;
+            let issued_ms: i64 = row.get(8)?;
+            let expires_ms: i64 = row.get(9)?;
+            let revoked_ms: Option<i64> = row.get(10)?;
+            let orphan: i64 = row.get(11)?;
+            let created_ms: i64 = row.get(12)?;
+            Ok((
+                session_id,
+                wallet,
+                petal_id,
+                session_kind,
+                scope_json,
+                counters_json,
+                frozen_policy_version,
+                frozen_petal_policy_digest,
+                issued_ms,
+                expires_ms,
+                revoked_ms,
+                orphan,
+                created_ms,
+            ))
+        })
+        .optional()?;
+    row.map(
+        |(
+            session_id,
+            wallet,
+            petal_id,
+            session_kind,
+            scope_json,
+            counters_json,
+            frozen_policy_version,
+            frozen_petal_policy_digest,
+            issued_ms,
+            expires_ms,
+            revoked_ms,
+            orphan,
+            created_ms,
+        )| {
+            Ok(StandingSessionRecord {
+                session_id,
+                wallet,
+                petal_id,
+                session_kind,
+                scope: serde_json::from_str(&scope_json)?,
+                counters: serde_json::from_str(&counters_json)?,
+                frozen_policy_version: frozen_policy_version as u64,
+                frozen_petal_policy_digest,
+                issued_ms: issued_ms as u64,
+                expires_ms: expires_ms as u64,
+                revoked_ms: revoked_ms.map(|v| v as u64),
+                orphan: orphan != 0,
+                created_ms: created_ms as u64,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn validate_and_reserve_evm_owner_session(
+    record: &StandingSessionRecord,
+    reservation_id: &str,
+    request: &EvmOwnerSigningSessionUse,
+    signer_material_available: bool,
+    now_ms: u64,
+) -> Result<EvmOwnerSigningSessionCounters, SessionDenialReason> {
+    if record.orphan {
+        return Err(SessionDenialReason::Orphan);
+    }
+    if record.revoked_ms.is_some() {
+        return Err(SessionDenialReason::Revoked);
+    }
+    if now_ms >= record.expires_ms {
+        return Err(SessionDenialReason::Expired);
+    }
+    if record.session_kind != EVM_OWNER_SIGNING_SESSION_KIND {
+        return Err(SessionDenialReason::ScopeMismatch);
+    }
+    if !signer_material_available {
+        return Err(SessionDenialReason::MissingSignerMaterial);
+    }
+    let scope: EvmOwnerSigningSessionScope = serde_json::from_value(record.scope.clone())
+        .map_err(|_| SessionDenialReason::ScopeMismatch)?;
+    let mut counters: EvmOwnerSigningSessionCounters =
+        serde_json::from_value(record.counters.clone())
+            .map_err(|_| SessionDenialReason::ScopeMismatch)?;
+    if record.wallet != request.wallet || scope.wallet != request.wallet {
+        return Err(SessionDenialReason::WrongWallet);
+    }
+    if scope.chain_id != request.chain_id {
+        return Err(SessionDenialReason::WrongChain);
+    }
+    if normalize_hex_address(&scope.token_contract).ok_or(SessionDenialReason::WrongToken)?
+        != normalize_hex_address(&request.token_contract).ok_or(SessionDenialReason::WrongToken)?
+    {
+        return Err(SessionDenialReason::WrongToken);
+    }
+    if scope.method != EVM_ERC20_TRANSFER_METHOD || request.method != EVM_ERC20_TRANSFER_METHOD {
+        return Err(SessionDenialReason::WrongMethod);
+    }
+    if !scope.native_transfers_allowed && parse_u128_decimal_lossy(&request.value_wei) != Some(0) {
+        return Err(SessionDenialReason::NativeTransfer);
+    }
+    if !fee_within_policy(
+        &scope.fee_policy.max_fee_per_gas_wei,
+        &request.max_fee_per_gas_wei,
+    ) || !fee_within_policy(
+        &scope.fee_policy.max_priority_fee_per_gas_wei,
+        &request.max_priority_fee_per_gas_wei,
+    ) || !fee_within_policy(
+        &scope.fee_policy.max_total_fee_wei,
+        &request.max_total_fee_wei,
+    ) {
+        return Err(SessionDenialReason::FeePolicy);
+    }
+    let decoded = decode_erc20_transfer(&request.calldata_hex)?;
+    let scope_recipient =
+        normalize_hex_address(&scope.recipient).ok_or(SessionDenialReason::WrongRecipient)?;
+    let request_recipient =
+        normalize_hex_address(&request.recipient).ok_or(SessionDenialReason::WrongRecipient)?;
+    if decoded.0 != scope_recipient || request_recipient != scope_recipient {
+        return Err(SessionDenialReason::WrongRecipient);
+    }
+    let request_amount = parse_u128_decimal_lossy(&request.amount_base_units)
+        .ok_or(SessionDenialReason::WrongAmount)?;
+    if decoded.1 != request_amount {
+        return Err(SessionDenialReason::WrongAmount);
+    }
+
+    let day_ms = 86_400_000;
+    if now_ms.saturating_sub(counters.daily_window_start_ms) >= day_ms {
+        counters.daily_window_start_ms = now_ms;
+        counters.spent_base_units = "0".into();
+        counters.reserved_base_units = "0".into();
+        counters.pending_reservations.clear();
+    }
+    if counters
+        .signature_count
+        .saturating_add(counters.pending_reservations.len() as u32)
+        >= scope.max_signature_count
+    {
+        return Err(SessionDenialReason::SignatureCount);
+    }
+    let cap = parse_u128_decimal_lossy(&scope.daily_cap_base_units)
+        .ok_or(SessionDenialReason::BudgetExhausted)?;
+    let spent = parse_u128_decimal_lossy(&counters.spent_base_units)
+        .ok_or(SessionDenialReason::BudgetExhausted)?;
+    let reserved = parse_u128_decimal_lossy(&counters.reserved_base_units)
+        .ok_or(SessionDenialReason::BudgetExhausted)?;
+    if spent
+        .saturating_add(reserved)
+        .saturating_add(request_amount)
+        > cap
+    {
+        return Err(SessionDenialReason::BudgetExhausted);
+    }
+    counters.reserved_base_units = reserved.saturating_add(request_amount).to_string();
+    counters
+        .pending_reservations
+        .insert(reservation_id.to_string(), request_amount.to_string());
+    Ok(counters)
+}
+
+fn normalize_hex_address(value: &str) -> Option<String> {
+    let raw = value.strip_prefix("0x").unwrap_or(value);
+    if raw.len() != 40 || !raw.as_bytes().iter().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!("0x{}", raw.to_ascii_lowercase()))
+}
+
+fn decode_erc20_transfer(calldata_hex: &str) -> Result<(String, u128), SessionDenialReason> {
+    let raw = calldata_hex.strip_prefix("0x").unwrap_or(calldata_hex);
+    if raw.len() != 8 + 64 + 64 || !raw.as_bytes().iter().all(|b| b.is_ascii_hexdigit()) {
+        return Err(SessionDenialReason::WrongCalldata);
+    }
+    if !raw[..8].eq_ignore_ascii_case(EVM_ERC20_TRANSFER_SELECTOR.trim_start_matches("0x")) {
+        return Err(SessionDenialReason::WrongMethod);
+    }
+    let recipient_word = &raw[8..72];
+    let amount_word = &raw[72..136];
+    let recipient =
+        normalize_hex_address(&recipient_word[24..]).ok_or(SessionDenialReason::WrongCalldata)?;
+    let amount =
+        u128::from_str_radix(amount_word, 16).map_err(|_| SessionDenialReason::WrongAmount)?;
+    Ok((recipient, amount))
+}
+
+fn fee_within_policy(scope: &Option<String>, requested: &Option<String>) -> bool {
+    match (scope, requested) {
+        (Some(max), Some(value)) => {
+            match (
+                parse_u128_decimal_lossy(max),
+                parse_u128_decimal_lossy(value),
+            ) {
+                (Some(max), Some(value)) => value <= max,
+                _ => false,
+            }
+        }
+        (Some(_), None) => false,
+        (None, None) => true,
+        (None, Some(_)) => false,
+    }
+}
+
+fn parse_u128_decimal(field: &'static str, value: &str) -> Result<u128, AuthStoreError> {
+    value
+        .parse::<u128>()
+        .map_err(|_| AuthStoreError::InvalidInteger {
+            field,
+            value: value.to_string(),
+        })
+}
+
+fn parse_u128_decimal_lossy(value: &str) -> Option<u128> {
+    value.parse::<u128>().ok()
+}
+
+fn append_session_denial_audit_tx(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    wallet: &str,
+    reason: &str,
+    now_ms: u64,
+) -> Result<(), AuthStoreError> {
+    append_audit_tx(
+        tx,
+        "evm_owner_session_use_denied",
+        &serde_json::json!({
+            "session_id": session_id,
+            "wallet": wallet,
+            "reason": reason,
+        }),
+        now_ms,
+    )
+}
+
+fn append_audit_tx(
+    tx: &Transaction<'_>,
+    event: &str,
+    record: &serde_json::Value,
+    now_ms: u64,
+) -> Result<(), AuthStoreError> {
+    let record_json = record.to_string();
+    let prev_digest: String = tx
+        .query_row(
+            "SELECT digest FROM audit ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| "0".repeat(64));
+    let digest = audit_digest(&prev_digest, event, &record_json, now_ms);
+    tx.execute(
+        "INSERT INTO audit(prev_digest, digest, event, record_json, created_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![prev_digest, digest, event, record_json, now_ms as i64],
+    )?;
+    Ok(())
+}
+
 /// Map a `standing_sessions` row (in the canonical 13-column SELECT order
 /// used by [`AuthStore::standing_session`] and [`AuthStore::active_standing_sessions`])
 /// into a [`StandingSessionRecord`].
@@ -2079,10 +2618,11 @@ mod tests {
     use super::*;
     use base64::Engine as _;
     use bloom_auth_api::{
-        CANONICAL_INTENT_HEADER_SCHEMA_V2, CanonicalEnvelope, CanonicalIntentHeader, ExecutorKind,
-        SignerTransport,
+        CANONICAL_INTENT_HEADER_SCHEMA_V2, CanonicalEnvelope, CanonicalIntentHeader, EvmFeePolicy,
+        ExecutorKind, SignerTransport,
         petal_identity::{
-            FIRST_PARTY_PETAL_VERSION_V0, PETAL_ID_PAID_HTTP, PLACEHOLDER_DIGEST_PAID_HTTP,
+            FIRST_PARTY_PETAL_VERSION_V0, PETAL_ID_EVM_WALLET, PETAL_ID_PAID_HTTP,
+            PLACEHOLDER_DIGEST_EVM_WALLET, PLACEHOLDER_DIGEST_PAID_HTTP,
         },
     };
 
@@ -3547,6 +4087,309 @@ mod tests {
             .unwrap()
             .flatten();
         assert_eq!(reason.as_deref(), Some("settled"));
+    }
+
+    #[test]
+    fn evm_outbox_reservation_commit_and_release_are_budget_visible() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        store
+            .create_reservation("evm_res_active", "my-wallet", "evm-outbox", 25, 100)
+            .unwrap();
+        let committed = store
+            .create_reservation("evm_res_commit", "my-wallet", "evm-outbox", 40, 101)
+            .unwrap();
+        store
+            .transition_reservation(
+                &committed.reservation_id,
+                ReservationState::Active,
+                ReservationState::Committed,
+                120,
+            )
+            .unwrap();
+        let released = store
+            .create_reservation("evm_res_release", "my-wallet", "evm-outbox", 60, 102)
+            .unwrap();
+        store
+            .release_reservation(&released.reservation_id, "evm submit failed", 130)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .reserved_plus_committed_total("my-wallet", Some("evm-outbox"), 1_000, 200)
+                .unwrap(),
+            65,
+            "active and committed EVM reservations count; released rows do not"
+        );
+        assert_eq!(
+            store
+                .active_reservation_total("my-wallet", Some("evm-outbox"))
+                .unwrap(),
+            25,
+            "committed rows leave the active-only total"
+        );
+
+        let released_reason: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT release_reason FROM reservations WHERE reservation_id = ?1",
+                params![released.reservation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        assert_eq!(released_reason.as_deref(), Some("evm submit failed"));
+    }
+
+    #[test]
+    fn evm_owner_standing_session_persists_exact_metadata_scope() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        let scope = serde_json::json!({
+            "wallet": "my-wallet",
+            "chain_id": 31337,
+            "token_contract": "0x0000000000000000000000000000000000000003",
+            "recipient": "0x0000000000000000000000000000000000000002",
+            "method": "erc20.transfer",
+            "daily_cap_micro_usd": 100_000_000,
+            "ttl_ms": 3_600_000,
+            "fee_policy": {"max_fee_per_gas": "200", "max_priority_fee_per_gas": "20"},
+            "max_signature_count": 10
+        });
+        let counters = serde_json::json!({
+            "spent_micro_usd": 0,
+            "signature_count": 0,
+            "window_started_ms": 1_000
+        });
+        store
+            .create_standing_session(
+                "evm_sess_1",
+                "my-wallet",
+                PETAL_ID_EVM_WALLET,
+                "evm_owner_signing",
+                &scope.to_string(),
+                &counters.to_string(),
+                9,
+                PLACEHOLDER_DIGEST_EVM_WALLET,
+                1_000,
+                3_601_000,
+                1_000,
+            )
+            .unwrap();
+
+        let got = store.standing_session("evm_sess_1").unwrap().unwrap();
+        assert_eq!(got.wallet, "my-wallet");
+        assert_eq!(got.petal_id, PETAL_ID_EVM_WALLET);
+        assert_eq!(got.session_kind, "evm_owner_signing");
+        assert_eq!(got.scope, scope);
+        assert_eq!(got.counters, counters);
+        assert_eq!(got.frozen_policy_version, 9);
+        assert_eq!(
+            got.frozen_petal_policy_digest,
+            PLACEHOLDER_DIGEST_EVM_WALLET
+        );
+        assert!(!got.orphan);
+
+        store
+            .orphan_standing_sessions("my-wallet", 2_000)
+            .expect("orphan wallet sessions");
+        assert!(
+            store
+                .active_standing_sessions("my-wallet", Some("evm_owner_signing"), 2_000)
+                .unwrap()
+                .is_empty(),
+            "orphaned owner session must not remain active"
+        );
+    }
+
+    fn erc20_transfer_calldata(recipient: &str, amount: u128) -> String {
+        format!(
+            "0xa9059cbb{:0>64}{:064x}",
+            recipient.trim_start_matches("0x"),
+            amount
+        )
+    }
+
+    fn evm_scope(max_signature_count: u32) -> EvmOwnerSigningSessionScope {
+        EvmOwnerSigningSessionScope {
+            wallet: "my-wallet".into(),
+            chain_id: 31337,
+            token_contract: "0x0000000000000000000000000000000000000003".into(),
+            recipient: "0x0000000000000000000000000000000000000002".into(),
+            method: EVM_ERC20_TRANSFER_METHOD.into(),
+            daily_cap_base_units: "100000000".into(),
+            ttl_ms: 3_600_000,
+            fee_policy: EvmFeePolicy {
+                max_fee_per_gas_wei: Some("200".into()),
+                max_priority_fee_per_gas_wei: Some("20".into()),
+                max_total_fee_wei: Some("1000000".into()),
+            },
+            max_signature_count,
+            autonomy_classification: "bounded_owner_signing".into(),
+            policy_snapshot_digest: "policy-digest-placeholder".into(),
+            petal_id: PETAL_ID_EVM_WALLET.into(),
+            petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+            petal_version: "v0".into(),
+            reason: "test bounded USDC payments".into(),
+            native_transfers_allowed: false,
+        }
+    }
+
+    fn evm_counters(now_ms: u64) -> EvmOwnerSigningSessionCounters {
+        EvmOwnerSigningSessionCounters {
+            daily_window_start_ms: now_ms,
+            spent_base_units: "0".into(),
+            reserved_base_units: "0".into(),
+            signature_count: 0,
+            pending_reservations: BTreeMap::new(),
+        }
+    }
+
+    fn evm_use(amount: u128) -> EvmOwnerSigningSessionUse {
+        let recipient = "0x0000000000000000000000000000000000000002";
+        EvmOwnerSigningSessionUse {
+            wallet: "my-wallet".into(),
+            chain_id: 31337,
+            chain: None,
+            token_contract: "0x0000000000000000000000000000000000000003".into(),
+            recipient: recipient.into(),
+            method: EVM_ERC20_TRANSFER_METHOD.into(),
+            calldata_hex: erc20_transfer_calldata(recipient, amount),
+            amount_base_units: amount.to_string(),
+            value_wei: "0".into(),
+            nonce: None,
+            gas_limit: None,
+            max_fee_per_gas_wei: Some("200".into()),
+            max_priority_fee_per_gas_wei: Some("20".into()),
+            max_total_fee_wei: Some("1000000".into()),
+        }
+    }
+
+    fn create_evm_owner_session(
+        store: &mut AuthStore,
+        session_id: &str,
+        max_signature_count: u32,
+        now_ms: u64,
+    ) {
+        store
+            .create_standing_session(
+                session_id,
+                "my-wallet",
+                PETAL_ID_EVM_WALLET,
+                EVM_OWNER_SIGNING_SESSION_KIND,
+                &serde_json::to_string(&evm_scope(max_signature_count)).unwrap(),
+                &serde_json::to_string(&evm_counters(now_ms)).unwrap(),
+                1,
+                PLACEHOLDER_DIGEST_EVM_WALLET,
+                now_ms,
+                now_ms + 3_600_000,
+                now_ms,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn evm_owner_session_reserve_commit_release_and_denials() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        create_evm_owner_session(&mut store, "evm_sess_use", 10, 1_000);
+
+        let request = evm_use(60_000_000);
+        let reserved = store
+            .reserve_evm_owner_session_use("evm_sess_use", "res_1", &request, true, 1_100)
+            .unwrap();
+        assert_eq!(reserved.counters["reserved_base_units"], "60000000");
+        assert_eq!(reserved.counters["spent_base_units"], "0");
+
+        let committed = store
+            .commit_evm_owner_session_use("evm_sess_use", "res_1", 1_200)
+            .unwrap();
+        assert_eq!(committed.counters["reserved_base_units"], "0");
+        assert_eq!(committed.counters["spent_base_units"], "60000000");
+        assert_eq!(committed.counters["signature_count"], 1);
+
+        let request_2 = evm_use(10_000_000);
+        store
+            .reserve_evm_owner_session_use("evm_sess_use", "res_2", &request_2, true, 1_300)
+            .unwrap();
+        let released = store
+            .release_evm_owner_session_use("evm_sess_use", "res_2", 1_400)
+            .unwrap();
+        assert_eq!(released.counters["reserved_base_units"], "0");
+        assert_eq!(released.counters["spent_base_units"], "60000000");
+
+        let mut wrong_recipient = evm_use(1);
+        wrong_recipient.recipient = "0x0000000000000000000000000000000000000004".into();
+        let err = store
+            .reserve_evm_owner_session_use(
+                "evm_sess_use",
+                "res_wrong",
+                &wrong_recipient,
+                true,
+                1_500,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("session_wrong_recipient"), "{err}");
+
+        let mut native = evm_use(1);
+        native.value_wei = "1".into();
+        let err = store
+            .reserve_evm_owner_session_use("evm_sess_use", "res_native", &native, true, 1_600)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("session_native_transfer_not_scoped"),
+            "{err}"
+        );
+
+        let err = store
+            .reserve_evm_owner_session_use("evm_sess_use", "res_cache", &evm_use(1), false, 1_700)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("session_missing_signer_material"),
+            "{err}"
+        );
+
+        let over_cap = evm_use(40_000_001);
+        let err = store
+            .reserve_evm_owner_session_use("evm_sess_use", "res_cap", &over_cap, true, 1_800)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("session_budget_exhausted"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn evm_owner_session_rejects_arbitrary_calldata_and_signature_exhaustion() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        create_evm_owner_session(&mut store, "evm_sess_count", 1, 1_000);
+
+        let mut arbitrary = evm_use(1);
+        arbitrary.calldata_hex = "0x12345678".into();
+        let err = store
+            .reserve_evm_owner_session_use(
+                "evm_sess_count",
+                "res_bad_call",
+                &arbitrary,
+                true,
+                1_100,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("session_wrong_calldata"), "{err}");
+
+        store
+            .reserve_evm_owner_session_use("evm_sess_count", "res_1", &evm_use(1), true, 1_200)
+            .unwrap();
+        store
+            .commit_evm_owner_session_use("evm_sess_count", "res_1", 1_300)
+            .unwrap();
+        let err = store
+            .reserve_evm_owner_session_use("evm_sess_count", "res_2", &evm_use(1), true, 1_400)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("session_signature_count_exhausted"),
+            "{err}"
+        );
     }
 
     fn create_test_standing_session(

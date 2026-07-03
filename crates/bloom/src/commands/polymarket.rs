@@ -1933,7 +1933,6 @@ pub async fn fund(d: &Daemon, args: FundArgs) -> Result<()> {
         }
     }
     unlock_wallet_with_intent(d, &args.wallet, args.passphrase.as_deref(), Some(intent)).await?;
-    let signer = d.keystore.signer(&args.wallet)?;
     let confirm_text = if any_warn {
         info.policy.override_sentinel().to_string()
     } else {
@@ -1949,7 +1948,6 @@ pub async fn fund(d: &Daemon, args: FundArgs) -> Result<()> {
                 &chain_name,
                 id,
                 &chain,
-                &signer,
                 &info.policy,
                 &confirm_text,
             )
@@ -2139,7 +2137,6 @@ async fn transfer_pusd_to_funding(
             .write_artefact(&entry.dir, "review_intent.json", &bytes);
     }
     unlock_wallet_with_intent(d, &args.wallet, args.passphrase.as_deref(), Some(intent)).await?;
-    let signer = d.keystore.signer(&args.wallet)?;
     let confirm_text = if any_warn {
         info.policy.override_sentinel().to_string()
     } else {
@@ -2153,7 +2150,6 @@ async fn transfer_pusd_to_funding(
             chain_name,
             &staged.id,
             chain,
-            &signer,
             &info.policy,
             &confirm_text,
         )

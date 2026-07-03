@@ -396,15 +396,45 @@ impl PetalHost for KeystorePetalHost {
         // (set by the daemon after `sealed_approval_ceremony`) lets us reuse
         // the decrypted signer without re-running a WebAuthn ceremony; on a
         // cache miss we fall back to the keystore unlock path.
+        let cache_required = grant
+            .daemon_terms
+            .extra
+            .get("signer_cache_required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let signer = if let Some(cache) = &self.signer_cache {
             if let Some(cached) = cache.get(&grant.grant_id) {
                 cached
+            } else if cache_required {
+                return self
+                    .deny(
+                        "petal.sign.deny",
+                        Some(request.wallet.clone()),
+                        Some(request.action_id.clone()),
+                        "session_missing_signer_material",
+                        Some(serde_json::json!({
+                            "grant_id": grant.grant_id.clone(),
+                        })),
+                    )
+                    .await;
             } else {
                 // Cache miss — fall back to keystore unlock (e.g. daemon
-                // restart between ceremony and sign). This runs an extra
-                // ceremony.
+                // restart between ceremony and one-shot sign). Owner sessions
+                // opt out via `signer_cache_required`.
                 self.keystore_unlock_signer(&request.wallet).await?
             }
+        } else if cache_required {
+            return self
+                .deny(
+                    "petal.sign.deny",
+                    Some(request.wallet.clone()),
+                    Some(request.action_id.clone()),
+                    "session_missing_signer_material",
+                    Some(serde_json::json!({
+                        "grant_id": grant.grant_id.clone(),
+                    })),
+                )
+                .await;
         } else {
             // No cache wired — legacy path.
             self.keystore_unlock_signer(&request.wallet).await?
@@ -571,8 +601,10 @@ mod tests {
     use bloom_auth::InMemoryGrantStore;
     use bloom_auth_api::{
         AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, DaemonGrantTerms,
-        DefaultAttestationRegistry, ExecutorKind, PetalPolicySnapshot,
-        SIGNING_ATTESTATION_SCHEMA_V1, SealedAction, SigningAttestation,
+        DefaultAttestationRegistry, EVM_SIGNING_ATTESTATION_FACTS_SCHEMA_V1, EvmFeeFacts,
+        EvmNonceIntent, EvmSealedActionKind, EvmSigningAttestationFacts, EvmUnsignedEnvelopeFacts,
+        EvmValueFact, ExecutorKind, PetalPolicySnapshot, SIGNING_ATTESTATION_SCHEMA_V1,
+        SealedAction, SigningAttestation,
         petal_identity::{
             FIRST_PARTY_PETAL_VERSION_V0, PETAL_ID_EVM_WALLET, PLACEHOLDER_DIGEST_EVM_WALLET,
         },
@@ -634,12 +666,64 @@ mod tests {
             petal_digest: &str,
             intent: &str,
         ) -> SigningAttestation {
+            let facts = if petal_id == PETAL_ID_EVM_WALLET
+                && intent == bloom_auth_api::EVM_TX_SIGN_INTENT
+            {
+                EvmSigningAttestationFacts {
+                    facts_schema: EVM_SIGNING_ATTESTATION_FACTS_SCHEMA_V1.into(),
+                    action_id: "req_1".into(),
+                    wallet: "my-wallet".into(),
+                    surface: "outbox".into(),
+                    petal_id: petal_id.into(),
+                    petal_digest: petal_digest.into(),
+                    petal_version: FIRST_PARTY_PETAL_VERSION_V0.into(),
+                    action_kind: EvmSealedActionKind::Confirm,
+                    chain_id: 1,
+                    account: "0x0000000000000000000000000000000000000001".into(),
+                    to: "0x0000000000000000000000000000000000000002".into(),
+                    recipient: Some("0x0000000000000000000000000000000000000002".into()),
+                    value: EvmValueFact {
+                        native_value_wei: "1".into(),
+                        token_amount_base_units: None,
+                        valuation_usd_micro: Some(1),
+                    },
+                    token: None,
+                    method: "native_transfer".into(),
+                    calldata_hash: format!("0x{}", "0".repeat(64)),
+                    nonce_intent: EvmNonceIntent {
+                        mode: "exact".into(),
+                        nonce: Some(0),
+                        original_action_id: None,
+                    },
+                    fee_facts: EvmFeeFacts {
+                        tx_type: "eip1559".into(),
+                        gas_limit: "21000".into(),
+                        max_fee_per_gas_wei: Some("100".into()),
+                        max_priority_fee_per_gas_wei: Some("10".into()),
+                        gas_price_wei: None,
+                        max_total_fee_wei: None,
+                    },
+                    replacement_fee_facts: None,
+                    unsigned_envelope: EvmUnsignedEnvelopeFacts {
+                        envelope_kind: "eip1559".into(),
+                        unsigned_tx_bytes_hash: format!("0x{}", "2".repeat(64)),
+                        signing_hash: format!("0x{}", "1".repeat(64)),
+                    },
+                    signing_hash: format!("0x{}", "1".repeat(64)),
+                    policy_snapshot_digest: "0".repeat(64),
+                    daemon_terms_digest: "0".repeat(64),
+                }
+                .to_facts_map()
+                .unwrap()
+            } else {
+                BTreeMap::new()
+            };
             SigningAttestation {
                 schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
                 petal_id: petal_id.into(),
                 petal_digest: petal_digest.into(),
                 intent: intent.into(),
-                facts: BTreeMap::new(),
+                facts,
             }
         }
 
