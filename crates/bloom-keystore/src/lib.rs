@@ -30,6 +30,7 @@
 
 pub mod ephemeral;
 pub(crate) mod passkey;
+pub mod petal_host;
 pub mod xdsa;
 #[cfg(test)]
 mod xdsa_tests;

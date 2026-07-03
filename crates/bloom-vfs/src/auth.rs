@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use bloom_auth_api::{ApprovalVerifier, AuthStoreView, AuthStoreWriter};
+use bloom_auth_api::{
+    ApprovalVerifier, AuthStoreView, AuthStoreWriter, GrantStore, PetalHost,
+    SigningAttestationSchemaRegistry,
+};
 
 use crate::handler::HandlerError;
 
@@ -15,6 +18,12 @@ pub struct AuthServices {
     approval_verifier: Option<Arc<dyn ApprovalVerifier>>,
     store: Option<Arc<dyn AuthStoreView>>,
     writer: Option<Arc<dyn AuthStoreWriter>>,
+    /// WS-1: in-memory [`GrantStore`] backing [`PetalHost::sign_hash`].
+    grant_store: Option<Arc<dyn GrantStore>>,
+    /// WS-1: host signing API exposed to first-party Petals.
+    petal_host: Option<Arc<dyn PetalHost>>,
+    /// WS-1: per-`(petal_id, intent)` attestation schema registry.
+    attestation_registry: Option<Arc<dyn SigningAttestationSchemaRegistry>>,
 }
 
 impl AuthServices {
@@ -27,6 +36,9 @@ impl AuthServices {
             approval_verifier,
             store,
             writer,
+            grant_store: None,
+            petal_host: None,
+            attestation_registry: None,
         }
     }
 
@@ -42,6 +54,24 @@ impl AuthServices {
 
     pub fn with_writer(mut self, writer: Arc<dyn AuthStoreWriter>) -> Self {
         self.writer = Some(writer);
+        self
+    }
+
+    pub fn with_grant_store(mut self, grant_store: Arc<dyn GrantStore>) -> Self {
+        self.grant_store = Some(grant_store);
+        self
+    }
+
+    pub fn with_petal_host(mut self, petal_host: Arc<dyn PetalHost>) -> Self {
+        self.petal_host = Some(petal_host);
+        self
+    }
+
+    pub fn with_attestation_registry(
+        mut self,
+        registry: Arc<dyn SigningAttestationSchemaRegistry>,
+    ) -> Self {
+        self.attestation_registry = Some(registry);
         self
     }
 
@@ -75,7 +105,44 @@ impl AuthServices {
         })
     }
 
+    pub fn grant_store(&self) -> Option<&Arc<dyn GrantStore>> {
+        self.grant_store.as_ref()
+    }
+
+    pub fn require_grant_store(&self) -> Result<&Arc<dyn GrantStore>, HandlerError> {
+        self.grant_store.as_ref().ok_or_else(|| {
+            HandlerError::Unsupported("Sealed Approval grant store is not wired".into())
+        })
+    }
+
+    pub fn petal_host(&self) -> Option<&Arc<dyn PetalHost>> {
+        self.petal_host.as_ref()
+    }
+
+    pub fn require_petal_host(&self) -> Result<&Arc<dyn PetalHost>, HandlerError> {
+        self.petal_host.as_ref().ok_or_else(|| {
+            HandlerError::Unsupported("Sealed Approval Petal host is not wired".into())
+        })
+    }
+
+    pub fn attestation_registry(&self) -> Option<&Arc<dyn SigningAttestationSchemaRegistry>> {
+        self.attestation_registry.as_ref()
+    }
+
+    pub fn require_attestation_registry(
+        &self,
+    ) -> Result<&Arc<dyn SigningAttestationSchemaRegistry>, HandlerError> {
+        self.attestation_registry.as_ref().ok_or_else(|| {
+            HandlerError::Unsupported("Sealed Approval attestation registry is not wired".into())
+        })
+    }
+
     pub fn is_wired(&self) -> bool {
-        self.approval_verifier.is_some() || self.store.is_some() || self.writer.is_some()
+        self.approval_verifier.is_some()
+            || self.store.is_some()
+            || self.writer.is_some()
+            || self.grant_store.is_some()
+            || self.petal_host.is_some()
+            || self.attestation_registry.is_some()
     }
 }

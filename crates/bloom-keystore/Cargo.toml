@@ -38,3 +38,7 @@ url.workspace = true
 tempfile.workspace = true
 reqwest.workspace = true
 sha2.workspace = true
+# WS-1: tests construct an `InMemoryGrantStore` directly. The store impl
+# lives in `bloom-auth`; this is a dev-only dep that does not leak into
+# production builds of `bloom-keystore`.
+bloom-auth = { workspace = true }
