@@ -1957,6 +1957,20 @@ impl<S> AuthStoreWriter for StoreApprovalVerifier<S>
 where
     S: Send + Sync,
 {
+    async fn allocate_action_id(
+        &self,
+        surface: &str,
+        venue_local_id: &str,
+        wallet: &str,
+        now_ms: u64,
+    ) -> Result<String, AuthApiError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
+        Ok(store.allocate_action_id(surface, venue_local_id, wallet, now_ms)?)
+    }
+
     async fn stage_entry(
         &self,
         envelope: CanonicalEnvelope,

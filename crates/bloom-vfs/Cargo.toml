@@ -53,6 +53,7 @@ rand.workspace = true
 mpp.workspace = true
 
 [dev-dependencies]
+bloom-auth.workspace = true
 bloom-petal-fungible.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["process", "rt-multi-thread", "macros", "time", "io-util"] }

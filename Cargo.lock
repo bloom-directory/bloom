@@ -3148,6 +3148,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "blake3",
+ "bloom-auth",
  "bloom-auth-api",
  "bloom-chain",
  "bloom-chain-types",

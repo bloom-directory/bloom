@@ -2638,6 +2638,24 @@ pub trait AuthStoreView: Send + Sync {
 
 #[async_trait]
 pub trait AuthStoreWriter: Send + Sync {
+    /// Allocate or retrieve the durable central action id for a venue-local id.
+    ///
+    /// Converted venue handlers use this before sealing so the central action id
+    /// is the value bound into the canonical envelope, approval challenge, and
+    /// grant tuple.
+    async fn allocate_action_id(
+        &self,
+        surface: &str,
+        venue_local_id: &str,
+        wallet: &str,
+        now_ms: u64,
+    ) -> Result<String, AuthApiError> {
+        let _ = (surface, venue_local_id, wallet, now_ms);
+        Err(AuthApiError::Store(
+            "allocate_action_id is not supported by this auth store writer".into(),
+        ))
+    }
+
     /// Stage an envelope with restrictive default daemon terms and an empty
     /// Petal policy snapshot ([`SealedAction::seal_with_default_terms`]).
     // TODO(ws-F..ws-K): converted venues should stage via `stage_action` with

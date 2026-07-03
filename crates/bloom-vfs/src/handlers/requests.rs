@@ -10,7 +10,8 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bloom_auth_api::{
-    ApprovalChallenge, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, ExecutorKind,
+    ApprovalChallenge, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, DaemonGrantTerms,
+    ExecutorKind, PolicyCheckClass, PolicyCheckResult, SealedAction, SealedApprovalGrant,
     SignedApproval, petal_identity,
 };
 use bloom_keystore::Keystore;
@@ -39,6 +40,8 @@ use crate::path::VfsPath;
 const APPROVAL_FILE: &str = "approval.json";
 const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
 const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
+const PAID_HTTP_X402_SIGN_INTENT: &str = "x402.sign";
+const PAID_HTTP_MPP_SIGN_INTENT: &str = "paid-http.mpp.sign";
 
 #[derive(Clone)]
 pub struct RequestsHandler {
@@ -425,20 +428,32 @@ impl RequestsHandler {
         Ok(())
     }
 
-    async fn stage_auth_entry(&self, subject: PaidHttpAuthSubject<'_>) -> Result<(), HandlerError> {
+    async fn stage_auth_entry(
+        &self,
+        subject: PaidHttpAuthSubject<'_>,
+    ) -> Result<String, HandlerError> {
         let Some(writer) = self.auth_services.writer() else {
-            return Ok(());
+            return Ok(subject.id.to_string());
         };
-        let envelope = paid_http_canonical_envelope(subject)?;
-        let staged = writer
-            .stage_entry(envelope, AssuranceLevel::Standard, now_ms())
+        let action_id = writer
+            .allocate_action_id("requests", subject.id, subject.wallet, now_ms())
             .await
-            .map_err(|e| HandlerError::backend(format!("stage paid-http auth entry: {e}")))?;
+            .map_err(|e| HandlerError::backend(format!("allocate paid-http action id: {e}")))?;
+        let envelope = paid_http_canonical_envelope(subject, &action_id)?;
+        let action = paid_http_sealed_action(envelope, subject, now_ms())?;
+        let staged = writer
+            .stage_action(action, now_ms())
+            .await
+            .map_err(|e| HandlerError::backend(format!("stage paid-http sealed action: {e}")))?;
         fs::write(
             self.req_dir("pending", subject.id).join("intent_hash"),
             format!("{}\n", staged.intent_hash),
         )?;
-        Ok(())
+        fs::write(
+            self.req_dir("pending", subject.id).join("action_id"),
+            format!("{action_id}\n"),
+        )?;
+        Ok(action_id)
     }
 
     async fn ensure_sealed_confirm_approval(
@@ -453,7 +468,20 @@ impl RequestsHandler {
                     .into(),
             ));
         }
+        if self.active_paid_http_grant(id).await?.is_some() {
+            return Ok(());
+        }
         if pending.join(APPROVAL_FILE).exists() {
+            let approval: SignedApproval = read_json(pending.join(APPROVAL_FILE))?;
+            self.auth_services
+                .require_approval_verifier()?
+                .verify_and_mint_grant(
+                    approval,
+                    self.auth_services.require_grant_store()?.as_ref(),
+                    now_ms(),
+                )
+                .await
+                .map_err(|e| HandlerError::invalid(format!("Sealed Approval rejected: {e}")))?;
             return Ok(());
         }
 
@@ -462,13 +490,73 @@ impl RequestsHandler {
         Err(HandlerError::PermissionDenied)
     }
 
-    async fn consume_sealed_confirm_approval(&self, pending: &Path) -> Result<(), HandlerError> {
-        let approval: SignedApproval = read_json(pending.join(APPROVAL_FILE))?;
-        self.auth_services
-            .require_approval_verifier()?
-            .verify_and_consume(approval, now_ms())
+    async fn active_paid_http_grant(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<SealedApprovalGrant>, HandlerError> {
+        let Some(store) = self.auth_services.grant_store() else {
+            return Ok(None);
+        };
+        let pending = self.req_dir("pending", request_id);
+        let request = parsed_request_from_dir(&pending)?;
+        let wallet = request
+            .wallet
+            .as_deref()
+            .ok_or_else(|| HandlerError::backend("request.toml missing wallet"))?;
+        let action_id = self.request_action_id(request_id).await?;
+        store
+            .get_active(
+                wallet,
+                &action_id,
+                petal_identity::PETAL_ID_PAID_HTTP,
+                petal_identity::PLACEHOLDER_DIGEST_PAID_HTTP,
+                now_ms(),
+            )
             .await
-            .map_err(|e| HandlerError::invalid(format!("Sealed Approval rejected: {e}")))
+            .map_err(|e| HandlerError::backend(format!("lookup paid-http grant: {e}")))
+    }
+
+    async fn request_action_id(&self, request_id: &str) -> Result<String, HandlerError> {
+        let Some(writer) = self.auth_services.writer() else {
+            return Ok(request_id.to_string());
+        };
+        let pending = self.req_dir("pending", request_id);
+        let request = parsed_request_from_dir(&pending)?;
+        let wallet = request
+            .wallet
+            .as_deref()
+            .ok_or_else(|| HandlerError::backend("request.toml missing wallet"))?;
+        writer
+            .allocate_action_id("requests", request_id, wallet, now_ms())
+            .await
+            .map_err(|e| HandlerError::backend(format!("lookup paid-http action id: {e}")))
+    }
+
+    async fn consume_paid_http_grant(
+        &self,
+        request_id: &str,
+        wallet: &str,
+        intent: &str,
+    ) -> Result<SealedApprovalGrant, HandlerError> {
+        let action_id = self.request_action_id(request_id).await?;
+        let grant = self
+            .auth_services
+            .require_grant_store()?
+            .get_active(
+                wallet,
+                &action_id,
+                petal_identity::PETAL_ID_PAID_HTTP,
+                petal_identity::PLACEHOLDER_DIGEST_PAID_HTTP,
+                now_ms(),
+            )
+            .await
+            .map_err(|e| HandlerError::backend(format!("lookup paid-http grant: {e}")))?
+            .ok_or_else(|| HandlerError::invalid("paid-http grant is not active"))?;
+        self.auth_services
+            .require_grant_store()?
+            .consume_signature(&grant.grant_id, intent, now_ms())
+            .await
+            .map_err(|e| HandlerError::invalid(format!("consume paid-http grant: {e}")))
     }
 
     async fn issue_sealed_confirm_challenge(
@@ -476,6 +564,7 @@ impl RequestsHandler {
         id: &str,
     ) -> Result<ApprovalChallenge, HandlerError> {
         let now = now_ms();
+        let action_id = self.request_action_id(id).await?;
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
         let nonce = URL_SAFE_NO_PAD.encode(nonce);
@@ -483,7 +572,7 @@ impl RequestsHandler {
             .require_writer()?
             .issue_challenge(
                 "requests",
-                id,
+                &action_id,
                 &nonce,
                 now.saturating_add(APPROVAL_TTL_MS),
                 now,
@@ -519,7 +608,6 @@ impl RequestsHandler {
             .as_deref()
             .ok_or_else(|| HandlerError::backend("request.toml missing wallet"))?
             .to_string();
-        self.ensure_sealed_confirm_approval(&pending, id).await?;
         let host = request.url.host_str().unwrap_or("unknown").to_string();
         let mut challenge: NormalizedChallenge = read_json(pending.join("challenge.json"))?;
         validate_session_state_target(&challenge, id)?;
@@ -570,7 +658,10 @@ impl RequestsHandler {
                 },
             );
             checks.extend(evaluate_session_policy(&policy, &challenge, already_spent));
-            self.consume_sealed_confirm_approval(&pending).await?;
+            self.ensure_sealed_confirm_approval(&pending, id).await?;
+            let _grant = self
+                .consume_paid_http_grant(id, &wallet, PAID_HTTP_MPP_SIGN_INTENT)
+                .await?;
             let backend = RealMppBackend {
                 keystore: self.keystore.clone(),
                 client: self.client.clone(),
@@ -631,7 +722,10 @@ impl RequestsHandler {
                 "payment policy warning requires override sentinel '{sentinel}'"
             )));
         }
-        self.consume_sealed_confirm_approval(&pending).await?;
+        self.ensure_sealed_confirm_approval(&pending, id).await?;
+        let _grant = self
+            .consume_paid_http_grant(id, &wallet, PAID_HTTP_X402_SIGN_INTENT)
+            .await?;
         let credential = self
             .x402_signer
             .sign_x402_payment(&X402SignContext {
@@ -1543,6 +1637,7 @@ struct PaidHttpAuthSubject<'a> {
 
 fn paid_http_canonical_envelope(
     input: PaidHttpAuthSubject<'_>,
+    action_id: &str,
 ) -> Result<CanonicalEnvelope, HandlerError> {
     let network = input
         .requirement
@@ -1570,7 +1665,7 @@ fn paid_http_canonical_envelope(
             schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
             wallet: input.wallet.to_string(),
             surface: "requests".into(),
-            action_id: input.id.to_string(),
+            action_id: action_id.to_string(),
             petal_id: petal_identity::PETAL_ID_PAID_HTTP.into(),
             petal_digest: petal_identity::PLACEHOLDER_DIGEST_PAID_HTTP.into(),
             petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
@@ -1591,13 +1686,94 @@ fn paid_http_canonical_envelope(
     ))
 }
 
+fn paid_http_sealed_action(
+    envelope: CanonicalEnvelope,
+    input: PaidHttpAuthSubject<'_>,
+    now: u64,
+) -> Result<SealedAction, HandlerError> {
+    let mut extra = std::collections::BTreeMap::new();
+    extra.insert(
+        "request_id".to_string(),
+        serde_json::Value::String(input.id.to_string()),
+    );
+    extra.insert(
+        "protocol".to_string(),
+        serde_json::Value::String(input.challenge.protocol.clone()),
+    );
+    let intent = paid_http_sign_intent(input.challenge);
+    let terms = DaemonGrantTerms {
+        max_ttl_secs: APPROVAL_TTL_MS / 1_000,
+        max_signatures: 1,
+        allowed_sign_intents: vec![intent.to_string()],
+        assurance: AssuranceLevel::Standard,
+        extra,
+    };
+    let mut snapshot = bloom_auth_api::PetalPolicySnapshot::minimal(&envelope.header);
+    snapshot.caps.insert(
+        "request_max_amount_usd".to_string(),
+        input
+            .request
+            .max_amount_usd
+            .map(serde_json::Value::from)
+            .unwrap_or(serde_json::Value::Null),
+    );
+    snapshot.config.insert(
+        "host".to_string(),
+        serde_json::Value::String(input.host.to_string()),
+    );
+    snapshot.config.insert(
+        "selected_requirement".to_string(),
+        serde_json::to_value(input.requirement)
+            .map_err(|e| HandlerError::backend(e.to_string()))?,
+    );
+    let checks = input
+        .checks
+        .iter()
+        .map(|check| PolicyCheckResult {
+            rule_id: check.rule.clone(),
+            rule_class: match check.class {
+                bloom_paid_http::PolicyRuleClass::Hard => PolicyCheckClass::Hard,
+                bloom_paid_http::PolicyRuleClass::Soft => PolicyCheckClass::StepUp,
+                bloom_paid_http::PolicyRuleClass::Informational => PolicyCheckClass::Informational,
+            },
+            outcome: check.result.clone(),
+            message: check.detail.clone(),
+            step_up_ceiling: None,
+        })
+        .collect::<Vec<_>>();
+    SealedAction::new(
+        envelope,
+        render_plan(
+            input.request,
+            input.wallet,
+            input.host,
+            Some(input.challenge),
+            input.checks,
+            input.dry_run,
+        ),
+        checks,
+        terms,
+        snapshot,
+        now,
+    )
+    .map_err(|e| HandlerError::backend(format!("seal paid-http action: {e}")))
+}
+
+fn paid_http_sign_intent(challenge: &NormalizedChallenge) -> &'static str {
+    if challenge.protocol == "mpp" {
+        PAID_HTTP_MPP_SIGN_INTENT
+    } else {
+        PAID_HTTP_X402_SIGN_INTENT
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::path::VfsPath;
     use bloom_auth_api::{
         APPROVAL_CHALLENGE_SCHEMA_V1, APPROVAL_SCHEMA_V1, ApprovalVerifier, AuthApiError,
-        AuthEntryRecord, AuthEntryState, AuthStoreWriter, NonceState, SignerTransport,
+        AuthEntryRecord, AuthEntryState, AuthStoreWriter, GrantStore, NonceState, SignerTransport,
         WebAuthnAssertionRecord,
     };
     use bloom_paid_mpp::PaymentExecution;
@@ -1626,6 +1802,19 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    fn request_auth_services(verifier_calls: Arc<AtomicUsize>) -> AuthServices {
+        AuthServices::new(
+            Some(Arc::new(AcceptingVerifier {
+                calls: verifier_calls,
+            })),
+            None,
+            Some(Arc::new(ChallengeOnlyWriter)),
+        )
+        .with_grant_store(Arc::new(
+            bloom_auth::grant_store::InMemoryGrantStore::default(),
+        ))
+    }
+
     #[async_trait]
     impl ApprovalVerifier for AcceptingVerifier {
         async fn verify_and_consume(
@@ -1639,10 +1828,88 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+
+        async fn verify_and_mint_grant(
+            &self,
+            approval: SignedApproval,
+            grant_store: &dyn GrantStore,
+            now_ms: u64,
+        ) -> Result<SealedApprovalGrant, AuthApiError> {
+            if approval.surface != "requests" {
+                return Err(AuthApiError::Denied("wrong surface".into()));
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let envelope = CanonicalEnvelope::new(
+                CanonicalIntentHeader {
+                    schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+                    wallet: approval.wallet.clone(),
+                    surface: approval.surface.clone(),
+                    action_id: approval.action_id.clone(),
+                    petal_id: approval.petal_id.clone(),
+                    petal_digest: approval.petal_digest.clone(),
+                    petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+                    executor_kind: ExecutorKind::FirstParty,
+                    network: "base".into(),
+                    account: "default".into(),
+                    action_kind: "paid_http_confirm".into(),
+                    value_movement: true,
+                    authority_change: false,
+                    expires_ms: approval.expiry_ms,
+                },
+                "paid_http",
+                "bloom.paid_http_subject.v1",
+                serde_json::to_vec(&json!({
+                    "schema": "bloom.paid_http_subject.v1",
+                    "test": true,
+                }))
+                .unwrap(),
+            );
+            let mut extra = BTreeMap::new();
+            extra.insert("test".into(), json!(true));
+            let action = SealedAction::new(
+                envelope,
+                "test paid-http approval".into(),
+                Vec::new(),
+                DaemonGrantTerms {
+                    max_ttl_secs: APPROVAL_TTL_MS / 1_000,
+                    max_signatures: 1,
+                    allowed_sign_intents: vec![
+                        PAID_HTTP_X402_SIGN_INTENT.into(),
+                        PAID_HTTP_MPP_SIGN_INTENT.into(),
+                    ],
+                    assurance: approval.assurance,
+                    extra,
+                },
+                bloom_auth_api::PetalPolicySnapshot {
+                    policy_version: approval.policy_version,
+                    wallet: approval.wallet.clone(),
+                    petal_id: approval.petal_id.clone(),
+                    petal_digest: approval.petal_digest.clone(),
+                    caps: BTreeMap::new(),
+                    hard_rules: Vec::new(),
+                    step_up_rules: Vec::new(),
+                    config: BTreeMap::new(),
+                    budget_state: BTreeMap::new(),
+                    session_scope: None,
+                },
+                now_ms,
+            )?;
+            grant_store.mint(&action, approval.expiry_ms, now_ms).await
+        }
     }
 
     #[async_trait]
     impl AuthStoreWriter for ChallengeOnlyWriter {
+        async fn allocate_action_id(
+            &self,
+            _surface: &str,
+            venue_local_id: &str,
+            _wallet: &str,
+            _now_ms: u64,
+        ) -> Result<String, AuthApiError> {
+            Ok(venue_local_id.to_string())
+        }
+
         async fn stage_entry(
             &self,
             envelope: CanonicalEnvelope,
@@ -1656,6 +1923,25 @@ mod tests {
                 state: AuthEntryState::Staged,
                 intent_hash,
                 assurance,
+                nonce: None,
+                nonce_state: NonceState::Unused,
+                reservation_id: None,
+                updated_ms: now_ms,
+            })
+        }
+
+        async fn stage_action(
+            &self,
+            action: SealedAction,
+            now_ms: u64,
+        ) -> Result<AuthEntryRecord, AuthApiError> {
+            let intent_hash = action.intent_hash()?;
+            Ok(AuthEntryRecord {
+                surface: action.envelope.header.surface.clone(),
+                action_id: action.envelope.header.action_id.clone(),
+                state: AuthEntryState::Staged,
+                intent_hash,
+                assurance: action.daemon_terms.assurance,
                 nonce: None,
                 nonce_state: NonceState::Unused,
                 reservation_id: None,
@@ -1748,19 +2034,22 @@ mod tests {
         );
         let requirement = challenge.accepts[0].clone();
         let checks: Vec<PolicyCheck> = vec![];
-        let env = paid_http_canonical_envelope(PaidHttpAuthSubject {
-            id: "req_1",
-            request: &request,
-            wallet: "alice",
-            host: "merchant.test",
-            challenge: &challenge,
-            requirement: &requirement,
-            checks: &checks,
-            dry_run: false,
-        })
+        let env = paid_http_canonical_envelope(
+            PaidHttpAuthSubject {
+                id: "req_1",
+                request: &request,
+                wallet: "alice",
+                host: "merchant.test",
+                challenge: &challenge,
+                requirement: &requirement,
+                checks: &checks,
+                dry_run: false,
+            },
+            "requests-0001",
+        )
         .unwrap();
         assert_eq!(env.header.surface, "requests");
-        assert_eq!(env.header.action_id, "req_1");
+        assert_eq!(env.header.action_id, "requests-0001");
         assert_eq!(env.header.petal_id, petal_identity::PETAL_ID_PAID_HTTP);
         assert_eq!(
             env.header.petal_digest,
@@ -1772,16 +2061,19 @@ mod tests {
 
         let mut other_req = requirement;
         other_req.network = Some("polygon".into());
-        let other = paid_http_canonical_envelope(PaidHttpAuthSubject {
-            id: "req_1",
-            request: &request,
-            wallet: "alice",
-            host: "merchant.test",
-            challenge: &challenge,
-            requirement: &other_req,
-            checks: &checks,
-            dry_run: false,
-        })
+        let other = paid_http_canonical_envelope(
+            PaidHttpAuthSubject {
+                id: "req_1",
+                request: &request,
+                wallet: "alice",
+                host: "merchant.test",
+                challenge: &challenge,
+                requirement: &other_req,
+                checks: &checks,
+                dry_run: false,
+            },
+            "requests-0001",
+        )
         .unwrap();
         assert_ne!(hash1, other.intent_hash().unwrap());
     }
@@ -2002,13 +2294,7 @@ mod tests {
             .keystore
             .write_policy("alice", toml::to_string_pretty(&policy).unwrap().as_bytes())
             .unwrap();
-        let auth_services = AuthServices::new(
-            Some(Arc::new(AcceptingVerifier {
-                calls: verify_calls.clone(),
-            })),
-            None,
-            Some(Arc::new(ChallengeOnlyWriter)),
-        );
+        let auth_services = request_auth_services(verify_calls.clone());
         let handler = f
             .handler
             .with_auth_services(auth_services)
@@ -2146,13 +2432,7 @@ mod tests {
             .keystore
             .write_policy("alice", toml::to_string_pretty(&policy).unwrap().as_bytes())
             .unwrap();
-        let auth_services = AuthServices::new(
-            Some(Arc::new(AcceptingVerifier {
-                calls: verifier_calls.clone(),
-            })),
-            None,
-            None,
-        );
+        let auth_services = request_auth_services(verifier_calls.clone());
         let handler = f
             .handler
             .with_auth_services(auth_services)
@@ -2233,13 +2513,7 @@ mod tests {
             .keystore
             .write_policy("alice", toml::to_string_pretty(&policy).unwrap().as_bytes())
             .unwrap();
-        let auth_services = AuthServices::new(
-            Some(Arc::new(AcceptingVerifier {
-                calls: verifier_calls.clone(),
-            })),
-            None,
-            None,
-        );
+        let auth_services = request_auth_services(verifier_calls.clone());
         let handler = f
             .handler
             .with_auth_services(auth_services)
