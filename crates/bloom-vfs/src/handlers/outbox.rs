@@ -204,6 +204,11 @@ impl Handler for OutboxHandler {
         match segs.as_slice() {
             [state, action_id, file] if STATES.contains(state) => {
                 validate_action_id(action_id)?;
+                if !ACTION_FILES.contains(file) {
+                    return Err(HandlerError::NotFound(format!(
+                        "/outbox/{state}/{action_id}/{file}"
+                    )));
+                }
                 let fpath = self.outbox.action_dir(state, action_id).join(file);
                 std::fs::read(&fpath).map_err(|e| {
                     if e.kind() == std::io::ErrorKind::NotFound {
@@ -328,6 +333,20 @@ mod tests {
         let p = VfsPath::parse("pending/act-001/intent_hash").unwrap();
         let data = h.read(&p).await.unwrap();
         assert!(String::from_utf8_lossy(&data).contains("abc123"));
+    }
+
+    #[tokio::test]
+    async fn read_rejects_unadvertised_action_files() {
+        let h = handler();
+        h.outbox
+            .stage("act-extra", b"{}", "hash", "plan", b"[]")
+            .unwrap();
+        let dir = h.outbox.action_dir("pending", "act-extra");
+        std::fs::write(dir.join("debug-secret.txt"), b"hidden").unwrap();
+
+        let p = VfsPath::parse("pending/act-extra/debug-secret.txt").unwrap();
+        let err = h.read(&p).await.unwrap_err();
+        assert!(matches!(err, HandlerError::NotFound(_)), "{err}");
     }
 
     #[tokio::test]

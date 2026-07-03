@@ -441,7 +441,7 @@ impl RequestsHandler {
         Ok(())
     }
 
-    async fn require_sealed_confirm_approval(
+    async fn ensure_sealed_confirm_approval(
         &self,
         pending: &Path,
         id: &str,
@@ -453,20 +453,22 @@ impl RequestsHandler {
                     .into(),
             ));
         }
-        let approval_path = pending.join(APPROVAL_FILE);
-        if approval_path.exists() {
-            let approval: SignedApproval = read_json(&approval_path)?;
-            self.auth_services
-                .require_approval_verifier()?
-                .verify_and_consume(approval, now_ms())
-                .await
-                .map_err(|e| HandlerError::invalid(format!("Sealed Approval rejected: {e}")))?;
+        if pending.join(APPROVAL_FILE).exists() {
             return Ok(());
         }
 
         let challenge = self.issue_sealed_confirm_challenge(id).await?;
         write_json(pending.join(APPROVAL_CHALLENGE_FILE), &challenge)?;
         Err(HandlerError::PermissionDenied)
+    }
+
+    async fn consume_sealed_confirm_approval(&self, pending: &Path) -> Result<(), HandlerError> {
+        let approval: SignedApproval = read_json(pending.join(APPROVAL_FILE))?;
+        self.auth_services
+            .require_approval_verifier()?
+            .verify_and_consume(approval, now_ms())
+            .await
+            .map_err(|e| HandlerError::invalid(format!("Sealed Approval rejected: {e}")))
     }
 
     async fn issue_sealed_confirm_challenge(
@@ -517,7 +519,7 @@ impl RequestsHandler {
             .as_deref()
             .ok_or_else(|| HandlerError::backend("request.toml missing wallet"))?
             .to_string();
-        self.require_sealed_confirm_approval(&pending, id).await?;
+        self.ensure_sealed_confirm_approval(&pending, id).await?;
         let host = request.url.host_str().unwrap_or("unknown").to_string();
         let mut challenge: NormalizedChallenge = read_json(pending.join("challenge.json"))?;
         validate_session_state_target(&challenge, id)?;
@@ -568,6 +570,7 @@ impl RequestsHandler {
                 },
             );
             checks.extend(evaluate_session_policy(&policy, &challenge, already_spent));
+            self.consume_sealed_confirm_approval(&pending).await?;
             let backend = RealMppBackend {
                 keystore: self.keystore.clone(),
                 client: self.client.clone(),
@@ -628,6 +631,7 @@ impl RequestsHandler {
                 "payment policy warning requires override sentinel '{sentinel}'"
             )));
         }
+        self.consume_sealed_confirm_approval(&pending).await?;
         let credential = self
             .x402_signer
             .sign_x402_payment(&X402SignContext {
@@ -2215,6 +2219,91 @@ mod tests {
                 .join("failed/req_sealed_ok")
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_confirm_text_does_not_consume_sealed_approval() {
+        let signer_calls = Arc::new(AtomicUsize::new(0));
+        let verifier_calls = Arc::new(AtomicUsize::new(0));
+        let f = fixture(Some("alice"));
+        let mut policy = Policy::default();
+        policy.payments.enabled = true;
+        policy.payments.require_plan = true;
+        f.handler
+            .keystore
+            .write_policy("alice", toml::to_string_pretty(&policy).unwrap().as_bytes())
+            .unwrap();
+        let auth_services = AuthServices::new(
+            Some(Arc::new(AcceptingVerifier {
+                calls: verifier_calls.clone(),
+            })),
+            None,
+            None,
+        );
+        let handler = f
+            .handler
+            .with_auth_services(auth_services)
+            .with_x402_signer(Arc::new(StaticX402Signer {
+                calls: signer_calls.clone(),
+            }));
+        let pending = handler.requests_root().join("pending/req_bad_confirm");
+        fs::create_dir_all(&pending).unwrap();
+        let challenge = normalize_challenge(
+            &HeaderMap::new(),
+            br#"{"x402Version":1,"accepts":[{"network":"base","asset":"USDC"}]}"#,
+            &Url::parse("http://127.0.0.1:9/pay").unwrap(),
+        );
+        write_json(pending.join("challenge.json"), &challenge).unwrap();
+        write_json(
+            pending.join("payment_method.json"),
+            &challenge.payment_method(),
+        )
+        .unwrap();
+        let empty_checks: Vec<PolicyCheck> = vec![];
+        write_json(pending.join("policy_check.json"), &empty_checks).unwrap();
+        write_json(
+            pending.join("request.toml"),
+            &json!({"method":"GET","url":"http://127.0.0.1:9/pay","wallet":"alice","headers":{},"dry_run":false}),
+        )
+        .unwrap();
+        fs::write(pending.join("status"), "pending\n").unwrap();
+        write_json(
+            pending.join(APPROVAL_FILE),
+            &SignedApproval {
+                schema: APPROVAL_SCHEMA_V1.into(),
+                wallet: "alice".into(),
+                surface: "requests".into(),
+                action_id: "req_bad_confirm".into(),
+                intent_hash: "abc123".into(),
+                petal_id: petal_identity::PETAL_ID_PAID_HTTP.into(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_PAID_HTTP.into(),
+                assurance: AssuranceLevel::Standard,
+                server_nonce: "nonce-1".into(),
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
+                expiry_ms: now_ms() + 60_000,
+                signer_transport: SignerTransport::BrowserWebauthn,
+                credential_id: "cred-1".into(),
+                review_session_id: None,
+                webauthn_assertion: WebAuthnAssertionRecord {
+                    credential_id: "cred-1".into(),
+                    authenticator_data_b64: "AA".into(),
+                    client_data_json_b64: "e30".into(),
+                    signature_b64: "AA".into(),
+                    user_handle_b64: None,
+                },
+            },
+        )
+        .unwrap();
+
+        let err = handler
+            .confirm("req_bad_confirm", b"not-confirm")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("confirm accepts"), "{err}");
+        assert_eq!(verifier_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(signer_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

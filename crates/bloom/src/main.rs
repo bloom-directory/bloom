@@ -35,7 +35,10 @@ use bloom_hyperliquid::{
 };
 use bloom_proto::{AuditRecord, CeremonyIntent, CeremonyIntentKind, HomeDir, HomeWritePermit};
 use bloom_tx::TxEngineError;
-use bloom_vfs::{VfsPath, handler::Handler};
+use bloom_vfs::{
+    VfsPath,
+    handler::{Handler, HandlerError},
+};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use tracing::{debug, info, trace};
@@ -1596,6 +1599,7 @@ async fn run(cli: Cli) -> Result<()> {
             debug!("cli.request.confirm.via_inproc: no daemon socket present");
             let (_home_permit, d) = build_write_daemon(home)?;
             let info = d.keystore.info(&wallet)?;
+            let passkey_wallet = matches!(info.kind, bloom_keystore::WalletKind::PasskeyGated);
             match info.kind {
                 bloom_keystore::WalletKind::PasskeyGated => {
                     let intent = vfs_write_unlock_intent(
@@ -1619,7 +1623,36 @@ async fn run(cli: Cli) -> Result<()> {
                         .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
                 }
             }
-            d.vfs.write(&p, &body).await.context("request confirm")?;
+            match d.vfs.write(&p, &body).await {
+                Ok(()) => {}
+                Err(first_err)
+                    if passkey_wallet && matches!(first_err, HandlerError::PermissionDenied) =>
+                {
+                    let intent = vfs_write_unlock_intent(
+                        &wallet,
+                        &p,
+                        &body,
+                        Some(bloom_proto::checksum_address(&info.address)),
+                        Some(&d.home.outbox_dir()),
+                        d.keystore
+                            .raw_policy(&wallet)
+                            .ok()
+                            .map(|(p, _)| p)
+                            .as_deref(),
+                    );
+                    if sign_request_sealed_approval_if_challenged(&d, &wallet, &id, Some(intent))
+                        .await?
+                    {
+                        d.vfs
+                            .write(&p, &body)
+                            .await
+                            .context("request confirm after Sealed Approval")?;
+                    } else {
+                        return Err(first_err).context("request confirm");
+                    }
+                }
+                Err(e) => return Err(e).context("request confirm"),
+            }
             Ok(())
         }
         Cmd::Request(RequestCmd::Body { id }) => {
@@ -3115,6 +3148,95 @@ async fn sign_outbox_sealed_approval_if_challenged(
     )
     .with_context(|| format!("write {}", approval_path.display()))?;
     Ok(true)
+}
+
+async fn sign_request_sealed_approval_if_challenged(
+    d: &Daemon,
+    wallet: &str,
+    id: &str,
+    intent: Option<CeremonyIntent>,
+) -> Result<bool> {
+    let id = resolve_pending_request_id(d.home.root(), id)
+        .with_context(|| format!("resolve pending request id {id}"))?;
+    let dir = d.home.root().join("requests").join("pending").join(&id);
+    let challenge_path = dir.join("approval_challenge.json");
+    if !challenge_path.exists() {
+        return Ok(false);
+    }
+
+    let challenge: ApprovalChallenge = serde_json::from_slice(
+        &std::fs::read(&challenge_path)
+            .with_context(|| format!("read {}", challenge_path.display()))?,
+    )
+    .with_context(|| format!("parse {}", challenge_path.display()))?;
+    let sealed = d
+        .auth_services
+        .require_store()
+        .context("Sealed Approval auth store is not wired")?
+        .sealed_intent(&challenge.intent_hash)
+        .await
+        .context("read sealed intent for request approval challenge")?;
+    anyhow::ensure!(
+        sealed.envelope.header.wallet == wallet,
+        "approval challenge wallet mismatch: sealed action belongs to '{}'",
+        sealed.envelope.header.wallet
+    );
+
+    let review_session_id = if challenge.assurance == AssuranceLevel::Hardened {
+        let review_session_id = sealed_review_session_id(&challenge);
+        d.auth_services
+            .require_writer()
+            .context("Sealed Approval auth store writer is not wired")?
+            .issue_review_session(
+                &review_session_id,
+                &challenge.surface,
+                &challenge.action_id,
+                challenge.expiry_ms,
+                cli_now_ms(),
+            )
+            .await
+            .context("issue hardened request review session")?;
+        Some(review_session_id)
+    } else {
+        None
+    };
+
+    let unsigned = UnsignedApproval::for_challenge(
+        &challenge,
+        SignerTransport::BrowserWebauthn,
+        None,
+        review_session_id,
+    );
+    let signature = d
+        .keystore
+        .sign_approval_with_passkey(wallet, &unsigned, intent)
+        .await
+        .context("sign request Sealed Approval with passkey")?;
+    let approval: SignedApproval = unsigned.into_signed(signature);
+    let approval_path = dir.join("approval.json");
+    std::fs::write(
+        &approval_path,
+        serde_json::to_vec_pretty(&approval).context("encode request Sealed Approval")?,
+    )
+    .with_context(|| format!("write {}", approval_path.display()))?;
+    Ok(true)
+}
+
+fn resolve_pending_request_id(home: &Path, id: &str) -> Result<String> {
+    if id != "latest" {
+        return Ok(id.to_string());
+    }
+    let latest_path = home.join("requests").join("latest");
+    let latest = std::fs::read_to_string(&latest_path)
+        .with_context(|| format!("read {}", latest_path.display()))?;
+    let (state, id) = latest
+        .trim()
+        .split_once('/')
+        .context("requests/latest should be formatted as state/id")?;
+    if state != "pending" {
+        bail!("latest request is {state}/{id}, not pending");
+    }
+    Ok(id.to_string())
 }
 
 fn sealed_review_session_id(challenge: &ApprovalChallenge) -> String {

@@ -631,11 +631,6 @@ impl Outbox {
             fs::remove_dir_all(&target)?;
         }
         fs::rename(&entry.dir, &target)?;
-        if matches!(new_state, OutboxState::Sent | OutboxState::Failed) {
-            for kind in BroadcastAttemptKind::ALL {
-                let _ = fs::remove_file(target.join(kind.raw_name()));
-            }
-        }
 
         // Project transition to central outbox.
         if let (Some(proj), Some(action_id)) = (&self.inner.projection, &entry.staged.action_id) {
@@ -649,7 +644,22 @@ impl Outbox {
                 OutboxState::Sent => "sent",
                 OutboxState::Failed => "failed",
             };
-            let _ = proj.transition_action(action_id, from_str, to_str);
+            if let Err(e) = proj.transition_action(action_id, from_str, to_str) {
+                let rollback = fs::rename(&target, &entry.dir);
+                let rollback_detail = match rollback {
+                    Ok(()) => "wallet outbox transition rolled back".to_string(),
+                    Err(err) => format!("wallet outbox rollback failed: {err}"),
+                };
+                return Err(OutboxError::Other(format!(
+                    "central outbox transition failed for action {action_id} ({from_str}->{to_str}): {e}; {rollback_detail}"
+                )));
+            }
+        }
+
+        if matches!(new_state, OutboxState::Sent | OutboxState::Failed) {
+            for kind in BroadcastAttemptKind::ALL {
+                let _ = fs::remove_file(target.join(kind.raw_name()));
+            }
         }
 
         Ok(target)
@@ -1402,6 +1412,7 @@ mod tests {
         allocated: Mutex<Vec<(String, String)>>, // (surface, venue_local_id)
         staged: Mutex<Vec<String>>,              // action_ids staged
         transitions: Mutex<Vec<(String, String, String)>>, // (id, from, to)
+        fail_transition: Mutex<Option<String>>,
     }
 
     impl MockProjection {
@@ -1410,6 +1421,7 @@ mod tests {
                 allocated: Mutex::new(vec![]),
                 staged: Mutex::new(vec![]),
                 transitions: Mutex::new(vec![]),
+                fail_transition: Mutex::new(None),
             }
         }
     }
@@ -1440,6 +1452,9 @@ mod tests {
         }
 
         fn transition_action(&self, action_id: &str, from: &str, to: &str) -> Result<(), String> {
+            if let Some(err) = self.fail_transition.lock().unwrap().clone() {
+                return Err(err);
+            }
             self.transitions.lock().unwrap().push((
                 action_id.to_string(),
                 from.to_string(),
@@ -1490,5 +1505,31 @@ mod tests {
         ob.write_pending(&staged, "# plan").unwrap();
         let entry = ob.read("alice", "anvil", "no-proj").unwrap();
         assert!(entry.staged.action_id.is_none());
+    }
+
+    #[test]
+    fn projection_transition_failure_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockProjection::new());
+        *mock.fail_transition.lock().unwrap() = Some("projection store offline".into());
+        let ob = Outbox::new_with_projection(dir.path(), mock).unwrap();
+
+        let staged = fake_staged("0001-evm");
+        ob.write_pending(&staged, "# plan").unwrap();
+        let entry = ob.read("alice", "anvil", "0001-evm").unwrap();
+        let err = ob.transition(&entry, OutboxState::Sent).unwrap_err();
+
+        assert!(
+            err.to_string().contains("central outbox transition failed"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("projection store offline"),
+            "{err}"
+        );
+        assert!(
+            ob.read("alice", "anvil", "0001-evm").is_ok(),
+            "wallet outbox should remain retryable in pending after projection failure"
+        );
     }
 }

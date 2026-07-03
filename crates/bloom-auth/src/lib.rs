@@ -18,6 +18,7 @@ use bloom_prices::{CoinId, PricesClient};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthStoreError {
@@ -133,6 +134,7 @@ impl AuthStore {
     }
 
     fn configure_connection(conn: &Connection) -> Result<(), AuthStoreError> {
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
@@ -639,6 +641,54 @@ impl AuthStore {
             )
             .optional()?
             .ok_or_else(|| AuthStoreError::Denied("entry not found".into()))?;
+        let existing: Option<ReviewSessionRecord> = tx
+            .query_row(
+                "SELECT review_session_id, surface, action_id, intent_hash, assurance, expires_ms,
+                        consumed_ms, created_ms
+                 FROM review_sessions WHERE review_session_id = ?1",
+                params![review_session_id],
+                |row| {
+                    let assurance: String = row.get(4)?;
+                    Ok(ReviewSessionRecord {
+                        review_session_id: row.get(0)?,
+                        surface: row.get(1)?,
+                        action_id: row.get(2)?,
+                        intent_hash: row.get(3)?,
+                        assurance: parse_assurance(&assurance).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                4,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?,
+                        expires_ms: row.get::<_, i64>(5)? as u64,
+                        consumed_ms: row.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+                        created_ms: row.get::<_, i64>(7)? as u64,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing.surface == surface
+                && existing.action_id == action_id
+                && existing.intent_hash == intent_hash
+                && existing.assurance == parse_assurance(&assurance)?
+                && existing.expires_ms == expires_ms
+            {
+                if existing.consumed_ms.is_some() {
+                    return Err(AuthStoreError::Denied(
+                        "review session already consumed".into(),
+                    ));
+                }
+                if now_ms >= existing.expires_ms {
+                    return Err(AuthStoreError::Denied("review session expired".into()));
+                }
+                return Ok(existing);
+            }
+            return Err(AuthStoreError::Denied(
+                "review session id already exists for a different approval".into(),
+            ));
+        }
         tx.execute(
             "INSERT INTO review_sessions(
                 review_session_id, surface, action_id, intent_hash, assurance, expires_ms,
@@ -1693,6 +1743,7 @@ mod tests {
             store.pragma_string("journal_mode").unwrap().to_lowercase(),
             "wal"
         );
+        assert_eq!(store.pragma_i64("busy_timeout").unwrap(), 5_000);
     }
 
     #[test]
@@ -2176,6 +2227,50 @@ mod tests {
 
         let replay = store.consume_verified_approval_transactionally(&approval, 151);
         assert!(replay.is_err());
+    }
+
+    #[test]
+    fn issue_review_session_retries_existing_unconsumed_match() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        let env = envelope();
+        store
+            .stage_entry(&env, AssuranceLevel::Hardened, 100)
+            .unwrap();
+        store
+            .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
+            .unwrap();
+
+        let first = store
+            .issue_review_session("review-1", "requests", "req_1", 220, 102)
+            .unwrap();
+        let retry = store
+            .issue_review_session("review-1", "requests", "req_1", 220, 150)
+            .unwrap();
+
+        assert_eq!(retry.review_session_id, first.review_session_id);
+        assert_eq!(retry.created_ms, first.created_ms);
+        assert_eq!(retry.consumed_ms, None);
+    }
+
+    #[test]
+    fn issue_review_session_retry_rejects_consumed_match() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        stage_and_challenge(&mut store, "requests", "req_1", "n1", "sess-1");
+        store
+            .conn
+            .execute(
+                "UPDATE review_sessions SET consumed_ms = 150 WHERE review_session_id = 'sess-1'",
+                [],
+            )
+            .unwrap();
+
+        let err = store
+            .issue_review_session("sess-1", "requests", "req_1", 500, 200)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("review session already consumed"),
+            "{err}"
+        );
     }
 
     // -------------------------------------------------------
