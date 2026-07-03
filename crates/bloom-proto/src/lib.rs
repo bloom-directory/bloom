@@ -8,6 +8,7 @@
 
 pub mod address;
 pub mod audit;
+pub mod audit_ext;
 pub mod capability;
 pub mod ceremony;
 pub mod chain;
@@ -28,6 +29,7 @@ pub mod units;
 
 pub use address::{AddressBook, AddressBookError, checksum_address, parse_address};
 pub use audit::{AuditLog, AuditRecord};
+pub use audit_ext::{append_auth_event, auth_event};
 pub use capability::{CapabilityStatus, CapabilityViewEntry, SigningModel, Venue};
 pub use ceremony::{CeremonyIntent, CeremonyIntentKind, policy_session_mint_intent};
 pub use chain::{ChainId, ChainRef, ChainSpec, EndpointSpec, default_endpoint_weight};

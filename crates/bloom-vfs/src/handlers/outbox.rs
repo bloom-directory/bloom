@@ -14,6 +14,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use bloom_auth_api::petal_identity::label_petal_digest;
 
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
@@ -37,6 +38,27 @@ pub struct CentralOutbox {
     root: PathBuf,
 }
 
+/// Petal identity attached to a staged central action.
+///
+/// Forwarded by callers (EVM/Hyperliquid/Polymarket/Wallets/Requests) once
+/// WS-4..9 wires them up. Today, every first-party `petal_digest` is a
+/// placeholder; once reproducible build/source digests land, the same field
+/// can carry a real `build`-labelled digest without changing this struct.
+#[derive(Debug, Clone, Default)]
+pub struct StagedPetalIdentity {
+    pub petal_id: String,
+    pub petal_digest: String,
+    pub petal_version: String,
+}
+
+impl StagedPetalIdentity {
+    /// True iff the identity carries a non-empty `petal_id`. The
+    /// fail-closed behaviour in `stage_with_identity` keys off this check.
+    pub fn is_present(&self) -> bool {
+        !self.petal_id.is_empty()
+    }
+}
+
 impl CentralOutbox {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
@@ -51,6 +73,11 @@ impl CentralOutbox {
     }
 
     /// Create a new pending action with the provided projection files.
+    ///
+    /// Backwards-compatible thin wrapper around [`CentralOutbox::stage_with_identity`]
+    /// that stages the action with an empty `StagedPetalIdentity`. The resulting
+    /// `status.json` carries `"petal_digest_kind": null` and omits the digest
+    /// and version fields — see the fail-closed note on `stage_with_identity`.
     pub fn stage(
         &self,
         action_id: &str,
@@ -59,19 +86,79 @@ impl CentralOutbox {
         plan_md: &str,
         policy_check_json: &[u8],
     ) -> std::io::Result<()> {
+        self.stage_with_identity(
+            action_id,
+            intent_json,
+            intent_hash,
+            plan_md,
+            policy_check_json,
+            &StagedPetalIdentity::default(),
+        )
+    }
+
+    /// Create a new pending action with the provided projection files and
+    /// Petal identity. The `status.json` written alongside the action
+    /// includes Petal identity fields so operators can correlate the staged
+    /// action with the Petal that produced it.
+    ///
+    /// `petal_digest_kind` is derived from `petal_digest` via
+    /// [`bloom_auth_api::petal_identity::label_petal_digest`] and is either
+    /// `"placeholder"` (current first-party reality) or `"build"` (planned
+    /// for reproducible-build/source digests). Spec §11.10 requires that
+    /// placeholder digests are surfaced as such so they are not mistaken
+    /// for code attestation.
+    ///
+    /// **Fail-closed when identity is empty.** If `identity.petal_id` is
+    /// empty (the default `StagedPetalIdentity`), the resulting
+    /// `status.json` is written with:
+    /// - `"petal_id": ""`
+    /// - `"petal_digest_kind": null`
+    /// - `petal_digest` and `petal_version` are OMITTED (not faked).
+    ///
+    /// Existing WS-4..9 callers will start passing real identities; until
+    /// then, every staged action records `null` kind and no digest/version.
+    pub fn stage_with_identity(
+        &self,
+        action_id: &str,
+        intent_json: &[u8],
+        intent_hash: &str,
+        plan_md: &str,
+        policy_check_json: &[u8],
+        identity: &StagedPetalIdentity,
+    ) -> std::io::Result<()> {
         let dir = self.action_dir("pending", action_id);
         std::fs::create_dir_all(&dir)?;
         std::fs::write(dir.join("intent.json"), intent_json)?;
         std::fs::write(dir.join("intent_hash"), format!("{intent_hash}\n"))?;
         std::fs::write(dir.join("plan.md"), plan_md)?;
         std::fs::write(dir.join("policy_check.json"), policy_check_json)?;
-        std::fs::write(
-            dir.join("status.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
+
+        let status_json = if identity.is_present() {
+            serde_json::json!({
                 "action_id": action_id,
                 "state": "pending",
-            }))
-            .unwrap_or_default(),
+                "petal_id": identity.petal_id,
+                "petal_digest": identity.petal_digest,
+                "petal_digest_kind": label_petal_digest(&identity.petal_digest),
+                "petal_version": identity.petal_version,
+            })
+        } else {
+            // Fail-closed: empty petal_id means no Petal identity was
+            // supplied. Record `petal_id: ""` and `petal_digest_kind: null`,
+            // and OMIT `petal_digest` / `petal_version` so the record does
+            // not pretend to know which build or version of a Petal
+            // produced the action.
+            serde_json::json!({
+                "action_id": action_id,
+                "state": "pending",
+                "petal_id": "",
+                "petal_digest_kind": serde_json::Value::Null,
+            })
+        };
+
+        std::fs::write(
+            dir.join("status.json"),
+            serde_json::to_vec_pretty(&status_json).unwrap_or_default(),
         )?;
         Ok(())
     }
@@ -514,5 +601,91 @@ mod tests {
             result.is_err(),
             "latest must not return actions that have transitioned out of pending"
         );
+    }
+
+    fn read_status(outbox: &CentralOutbox, action_id: &str) -> serde_json::Value {
+        let path = outbox.action_dir("pending", action_id).join("status.json");
+        let bytes = std::fs::read(&path).unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn status_json_labels_placeholder_petal_digest() {
+        let h = handler();
+        let identity = StagedPetalIdentity {
+            petal_id: "evm-wallet".into(),
+            petal_digest: "first-party-placeholder:evm-wallet:v0".into(),
+            petal_version: "v0".into(),
+        };
+        h.outbox
+            .stage_with_identity("act-pp", b"{}", "h1", "p1", b"[]", &identity)
+            .unwrap();
+
+        let status = read_status(&h.outbox, "act-pp");
+        assert_eq!(status["action_id"], "act-pp");
+        assert_eq!(status["state"], "pending");
+        assert_eq!(status["petal_id"], "evm-wallet");
+        assert_eq!(
+            status["petal_digest"],
+            "first-party-placeholder:evm-wallet:v0"
+        );
+        assert_eq!(status["petal_digest_kind"], "placeholder");
+        assert_eq!(status["petal_version"], "v0");
+    }
+
+    #[tokio::test]
+    async fn status_json_labels_build_petal_digest() {
+        let h = handler();
+        let identity = StagedPetalIdentity {
+            petal_id: "evm-wallet".into(),
+            petal_digest: "sha256:abcdef0123456789".into(),
+            petal_version: "v1".into(),
+        };
+        h.outbox
+            .stage_with_identity("act-build", b"{}", "h1", "p1", b"[]", &identity)
+            .unwrap();
+
+        let status = read_status(&h.outbox, "act-build");
+        assert_eq!(status["action_id"], "act-build");
+        assert_eq!(status["state"], "pending");
+        assert_eq!(status["petal_id"], "evm-wallet");
+        assert_eq!(status["petal_digest"], "sha256:abcdef0123456789");
+        assert_eq!(status["petal_digest_kind"], "build");
+        assert_eq!(status["petal_version"], "v1");
+    }
+
+    #[tokio::test]
+    async fn stage_with_empty_identity_writes_null_kind() {
+        let h = handler();
+        // Existing `stage(...)` path with default identity.
+        h.outbox
+            .stage("act-empty", b"{}", "h1", "p1", b"[]")
+            .unwrap();
+        let status = read_status(&h.outbox, "act-empty");
+        assert_eq!(status["action_id"], "act-empty");
+        assert_eq!(status["state"], "pending");
+        assert_eq!(status["petal_id"], "");
+        assert!(status["petal_digest_kind"].is_null());
+        // The digest and version keys are omitted in the fail-closed branch.
+        assert!(
+            status.get("petal_digest").is_none(),
+            "petal_digest must be omitted when petal_id is empty: {status}"
+        );
+        assert!(
+            status.get("petal_version").is_none(),
+            "petal_version must be omitted when petal_id is empty: {status}"
+        );
+
+        // Also exercise the explicit `stage_with_identity` with default.
+        let id = StagedPetalIdentity::default();
+        assert!(!id.is_present());
+        h.outbox
+            .stage_with_identity("act-empty-2", b"{}", "h2", "p2", b"[]", &id)
+            .unwrap();
+        let status2 = read_status(&h.outbox, "act-empty-2");
+        assert_eq!(status2["petal_id"], "");
+        assert!(status2["petal_digest_kind"].is_null());
+        assert!(status2.get("petal_digest").is_none());
+        assert!(status2.get("petal_version").is_none());
     }
 }
