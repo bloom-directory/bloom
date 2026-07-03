@@ -138,6 +138,74 @@ pub mod petal_identity {
             _ => None,
         }
     }
+
+    /// Diagnostic label for a `petal_digest` value: either a first-party
+    /// placeholder or, eventually, a reproducible build/source digest.
+    /// Spec §11.10 requires audit and status output to label placeholder
+    /// digests so operators do not mistake them for code attestation.
+    ///
+    /// Today every first-party digest is a placeholder, so this returns
+    /// `"placeholder"`; once reproducible build/source digests land, those
+    /// non-placeholder digests will surface as `"build"`.
+    pub fn label_petal_digest(digest: &str) -> &'static str {
+        if is_placeholder_digest(digest) {
+            "placeholder"
+        } else {
+            "build"
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn placeholder_digest_returns_placeholder() {
+            assert_eq!(
+                label_petal_digest(PLACEHOLDER_DIGEST_EVM_WALLET),
+                "placeholder"
+            );
+            assert_eq!(
+                label_petal_digest(PLACEHOLDER_DIGEST_PAID_HTTP),
+                "placeholder"
+            );
+            assert_eq!(
+                label_petal_digest(PLACEHOLDER_DIGEST_POLYMARKET),
+                "placeholder"
+            );
+            assert_eq!(
+                label_petal_digest(PLACEHOLDER_DIGEST_HYPERLIQUID),
+                "placeholder"
+            );
+            assert_eq!(label_petal_digest(PLACEHOLDER_DIGEST_DEFI), "placeholder");
+            assert_eq!(
+                label_petal_digest(PLACEHOLDER_DIGEST_WALLET_POLICY),
+                "placeholder"
+            );
+            // The prefix is sufficient — any string starting with the
+            // placeholder prefix is labelled as such.
+            assert_eq!(
+                label_petal_digest("first-party-placeholder:custom-petal:v1"),
+                "placeholder"
+            );
+            // Empty digest is not a placeholder (it fails closed elsewhere).
+            assert_eq!(label_petal_digest(""), "build");
+        }
+
+        #[test]
+        fn build_digest_returns_build() {
+            // Anything that doesn't start with the placeholder prefix is
+            // labelled "build" — even malformed values, because the audit
+            // and status layers are responsible for surfacing the kind so
+            // operators do not mistake it for code attestation.
+            assert_eq!(label_petal_digest("sha256:abcdef0123456789"), "build");
+            assert_eq!(
+                label_petal_digest("blake3:00112233445566778899aabbccddeeff"),
+                "build"
+            );
+            assert_eq!(label_petal_digest("a"), "build");
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1254,6 +1322,10 @@ pub struct SigningAttestation {
     /// [`SIGNING_ATTESTATION_SCHEMA_V1`] or a venue-specific tag.
     pub schema: String,
     pub petal_id: String,
+    /// Exact Petal build/source digest this attestation claims to come from.
+    /// Bound into every host-side grant lookup so a Petal cannot borrow a
+    /// grant minted for a different build.
+    pub petal_digest: String,
     /// The `sign-hash` intent string this attestation accompanies.
     pub intent: String,
     /// Policy-relevant facts (amount, asset, destination, network,
@@ -1272,6 +1344,11 @@ impl SigningAttestation {
         if self.petal_id.trim().is_empty() {
             return Err(AuthApiError::InvalidSubject(
                 "attestation petal_id is empty".into(),
+            ));
+        }
+        if self.petal_digest.trim().is_empty() {
+            return Err(AuthApiError::InvalidSubject(
+                "attestation petal_digest is empty".into(),
             ));
         }
         if self.intent.trim().is_empty() {
@@ -1297,6 +1374,162 @@ pub trait SigningAttestationSchemaRegistry: Send + Sync {
     /// Validate the attestation's schema registration and fact shape.
     /// Must fail closed for unknown `(petal_id, intent, schema)` tuples.
     fn validate_attestation(&self, attestation: &SigningAttestation) -> Result<(), AuthApiError>;
+}
+
+/// Default allow-list implementation of [`SigningAttestationSchemaRegistry`].
+///
+/// Covers the first-party `(petal_id, intent)` pairs already named as
+/// constants in [`petal_identity`]. Each pair accepts
+/// [`SIGNING_ATTESTATION_SCHEMA_V1`]; per-venue rule semantics land in WS-4..9
+/// so the per-(petal_id, intent) `facts` shape validation is intentionally
+/// minimal in this wave.
+#[derive(Debug, Default, Clone)]
+pub struct DefaultAttestationRegistry;
+
+impl DefaultAttestationRegistry {
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn allowed_pair(petal_id: &str, intent: &str) -> bool {
+        use petal_identity::{
+            PETAL_ID_DEFI, PETAL_ID_EVM_WALLET, PETAL_ID_HYPERLIQUID, PETAL_ID_PAID_HTTP,
+            PETAL_ID_POLYMARKET, PETAL_ID_WALLET_POLICY,
+        };
+        matches!(
+            (petal_id, intent),
+            (PETAL_ID_EVM_WALLET, "evm.tx.sign")
+                | (PETAL_ID_PAID_HTTP, "x402.sign")
+                | (PETAL_ID_PAID_HTTP, "paid-http.mpp.sign")
+                | (PETAL_ID_POLYMARKET, "polymarket.order.v2")
+                | (PETAL_ID_POLYMARKET, "polymarket.onboarding")
+                | (PETAL_ID_POLYMARKET, "polymarket.funding")
+                | (PETAL_ID_POLYMARKET, "polymarket.redemption")
+                | (PETAL_ID_POLYMARKET, "polymarket.withdrawal")
+                | (PETAL_ID_POLYMARKET, "polymarket.builder_key")
+                | (PETAL_ID_HYPERLIQUID, "hyperliquid.approve_agent")
+                | (PETAL_ID_HYPERLIQUID, "hyperliquid.usd_send")
+                | (PETAL_ID_HYPERLIQUID, "hyperliquid.order")
+                | (PETAL_ID_HYPERLIQUID, "hyperliquid.cancel")
+                | (PETAL_ID_WALLET_POLICY, "wallet_policy.sign")
+                | (PETAL_ID_DEFI, "defi.route.sign")
+        )
+    }
+}
+
+impl SigningAttestationSchemaRegistry for DefaultAttestationRegistry {
+    fn is_allowed(&self, petal_id: &str, intent: &str, schema: &str) -> bool {
+        if schema != SIGNING_ATTESTATION_SCHEMA_V1 {
+            return false;
+        }
+        Self::allowed_pair(petal_id, intent)
+    }
+
+    fn validate_attestation(&self, attestation: &SigningAttestation) -> Result<(), AuthApiError> {
+        attestation.validate()?;
+        if attestation.schema != SIGNING_ATTESTATION_SCHEMA_V1 {
+            return Err(AuthApiError::Denied(format!(
+                "unsupported attestation schema {}",
+                attestation.schema
+            )));
+        }
+        if !Self::allowed_pair(&attestation.petal_id, &attestation.intent) {
+            return Err(AuthApiError::Denied(format!(
+                "unsupported attestation schema for ({}, {})",
+                attestation.petal_id, attestation.intent
+            )));
+        }
+        Ok(())
+    }
+}
+
+// ── PetalHost (WS-1 host signing API) ────────────────────────────────────────
+
+/// The daemon-cut, host-side view of a Petal context: the canonical bytes the
+/// Petal commits to, plus the daemon-owned policy/terms digests that bind
+/// any signature back to a specific sealed action snapshot.
+///
+/// Produced by [`PetalHost::seal_context`] and shown to the user as part of
+/// the plan / ceremony.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedPetalContext {
+    /// Lowercase, full-length, untruncated hex BLAKE3 of the canonical intent
+    /// envelope bytes (the same bytes that produce `intent_hash`).
+    pub canonical_intent_bytes_hash: String,
+    /// Same as the canonical hash, but explicitly tagged with the
+    /// `bloom.intent.v2` domain (== `intent_hash_of(canonical_bytes)`).
+    pub intent_hash: String,
+    pub daemon_terms_digest: String,
+    pub petal_policy_digest: String,
+    pub policy_version: u64,
+    pub petal_id: String,
+}
+
+/// `sign-hash` request body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignHashRequest {
+    pub wallet: String,
+    pub action_id: String,
+    pub intent: String,
+    /// `0x` + 64 lowercase hex chars — the 32-byte hash the wallet key signs.
+    pub hash_hex: String,
+}
+
+/// Sealed signature returned by [`PetalHost::sign_hash`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedSignature {
+    pub intent_hash: String,
+    pub signature_b64: String,
+    pub signed_at_ms: u64,
+}
+
+/// Structured event the host appends to its audit log via [`PetalHost::audit`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallet: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
+    pub message: String,
+}
+
+/// Host signing API for first-party Petals (WS-1, §7).
+///
+/// `PetalHost` is the seam through which a Petal obtains a wallet signature
+/// for an arbitrary 32-byte hash. Every call is gated on a live
+/// [`SealedApprovalGrant`] for `(wallet, action_id, petal_id, petal_digest)`
+/// and on a [`SigningAttestation`] whose schema is registered for
+/// `(petal_id, intent)` by the wired [`SigningAttestationSchemaRegistry`].
+#[async_trait]
+pub trait PetalHost: Send + Sync {
+    /// Build the sealed Petal context for a given Petal id (audit/plan view).
+    async fn seal_context(&self, petal_id: &str) -> Result<SealedPetalContext, AuthApiError>;
+
+    /// Daemon-cut snapshot of the wallet's policy for a Petal (the same
+    /// snapshot that gets bound into a sealed action and the approval
+    /// challenge). Returned verbatim so a Petal can render its policy view.
+    async fn sealed_policy_snapshot(
+        &self,
+        wallet: &str,
+        petal_id: &str,
+    ) -> Result<PetalPolicySnapshot, AuthApiError>;
+
+    /// Sign a 32-byte hash with the wallet key under an active grant.
+    ///
+    /// The grant is consumed atomically; the signature is returned alongside
+    /// the `intent_hash` of the sealed action the grant was minted for, so a
+    /// caller can correlate the signature back to the originating sealed
+    /// action in audit.
+    async fn sign_hash(
+        &self,
+        request: SignHashRequest,
+        attestation: &SigningAttestation,
+        now_ms: u64,
+    ) -> Result<SealedSignature, AuthApiError>;
+
+    /// Append a structured audit event to the host audit log.
+    async fn audit(&self, event: AuditEvent) -> Result<(), AuthApiError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1643,6 +1876,25 @@ pub trait ApprovalVerifier: Send + Sync {
         approval: SignedApproval,
         now_ms: u64,
     ) -> Result<(), AuthApiError>;
+
+    /// Verify a signed approval, burn its nonce, and mint a
+    /// [`SealedApprovalGrant`] for the same sealed action.
+    ///
+    /// The default implementation fails closed so existing implementations
+    /// keep compiling; production verifiers (e.g. the store-backed
+    /// implementation in `bloom-auth`) override it to hold both the verifier
+    /// store mutex and the [`GrantStore`] mutex end-to-end, ensuring the
+    /// nonce burn and the grant mint happen atomically.
+    async fn verify_and_mint_grant(
+        &self,
+        _approval: SignedApproval,
+        _grant_store: &dyn GrantStore,
+        _now_ms: u64,
+    ) -> Result<SealedApprovalGrant, AuthApiError> {
+        Err(AuthApiError::Store(
+            "verify_and_mint_grant not implemented".into(),
+        ))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2531,6 +2783,7 @@ mod tests {
         let mut att = SigningAttestation {
             schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
             petal_id: PETAL_ID_EVM_WALLET.into(),
+            petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
             intent: "evm.tx.sign".into(),
             facts: BTreeMap::new(),
         };
@@ -2539,6 +2792,9 @@ mod tests {
         assert!(att.validate().is_err());
         att.schema = SIGNING_ATTESTATION_SCHEMA_V1.into();
         att.intent = String::new();
+        assert!(att.validate().is_err());
+        att.intent = "evm.tx.sign".into();
+        att.petal_digest = String::new();
         assert!(att.validate().is_err());
     }
 
@@ -2613,5 +2869,138 @@ mod tests {
             ..ValuationPolicy::default()
         };
         assert!(quote.validate_for_authorization(&policy, 60_000).is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // DefaultAttestationRegistry + SealedPetalContext / SignHashRequest /
+    // SealedSignature / AuditEvent / PetalHost (WS-1 host signing API)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn default_registry_accepts_first_party_pairs() {
+        let r = DefaultAttestationRegistry::new();
+        for (petal_id, intent) in [
+            (PETAL_ID_EVM_WALLET, "evm.tx.sign"),
+            (PETAL_ID_PAID_HTTP, "x402.sign"),
+            (PETAL_ID_PAID_HTTP, "paid-http.mpp.sign"),
+            (PETAL_ID_POLYMARKET, "polymarket.order.v2"),
+            (PETAL_ID_POLYMARKET, "polymarket.onboarding"),
+            (PETAL_ID_POLYMARKET, "polymarket.funding"),
+            (PETAL_ID_POLYMARKET, "polymarket.redemption"),
+            (PETAL_ID_POLYMARKET, "polymarket.withdrawal"),
+            (PETAL_ID_POLYMARKET, "polymarket.builder_key"),
+            (PETAL_ID_HYPERLIQUID, "hyperliquid.approve_agent"),
+            (PETAL_ID_HYPERLIQUID, "hyperliquid.usd_send"),
+            (PETAL_ID_HYPERLIQUID, "hyperliquid.order"),
+            (PETAL_ID_HYPERLIQUID, "hyperliquid.cancel"),
+            (PETAL_ID_WALLET_POLICY, "wallet_policy.sign"),
+            (PETAL_ID_DEFI, "defi.route.sign"),
+        ] {
+            assert!(
+                r.is_allowed(petal_id, intent, SIGNING_ATTESTATION_SCHEMA_V1),
+                "({petal_id}, {intent}) must be allowed"
+            );
+            let att = SigningAttestation {
+                schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
+                petal_id: petal_id.into(),
+                petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+                intent: intent.into(),
+                facts: BTreeMap::new(),
+            };
+            r.validate_attestation(&att).unwrap();
+        }
+    }
+
+    #[test]
+    fn default_registry_denies_unknown_pair_or_unknown_schema() {
+        let r = DefaultAttestationRegistry::new();
+        // Unknown pair.
+        assert!(!r.is_allowed(
+            PETAL_ID_EVM_WALLET,
+            "x402.sign",
+            SIGNING_ATTESTATION_SCHEMA_V1
+        ));
+        // Known pair, unknown schema.
+        assert!(!r.is_allowed(PETAL_ID_EVM_WALLET, "evm.tx.sign", "bloom.foo.bar"));
+        // validate_attestation errors with a deterministic message.
+        let att = SigningAttestation {
+            schema: "bloom.foo.bar".into(),
+            petal_id: PETAL_ID_EVM_WALLET.into(),
+            petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+            intent: "evm.tx.sign".into(),
+            facts: BTreeMap::new(),
+        };
+        let err = r.validate_attestation(&att).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported attestation schema"),
+            "{err}"
+        );
+        let att = SigningAttestation {
+            schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
+            petal_id: PETAL_ID_EVM_WALLET.into(),
+            petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+            intent: "x402.sign".into(),
+            facts: BTreeMap::new(),
+        };
+        let err = r.validate_attestation(&att).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unsupported attestation schema for"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn host_signing_data_types_round_trip_through_serde() {
+        let ctx = SealedPetalContext {
+            canonical_intent_bytes_hash: "a".repeat(64),
+            intent_hash: "b".repeat(64),
+            daemon_terms_digest: "c".repeat(64),
+            petal_policy_digest: "d".repeat(64),
+            policy_version: 3,
+            petal_id: PETAL_ID_EVM_WALLET.into(),
+        };
+        let json = serde_json::to_string(&ctx).unwrap();
+        let back: SealedPetalContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(ctx, back);
+
+        let req = SignHashRequest {
+            wallet: "my-wallet".into(),
+            action_id: "req_1".into(),
+            intent: "evm.tx.sign".into(),
+            hash_hex: format!("0x{}", "0".repeat(64)),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let back: SignHashRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, back);
+
+        let sig = SealedSignature {
+            intent_hash: "1".repeat(64),
+            signature_b64: "AAAA".into(),
+            signed_at_ms: 100,
+        };
+        let json = serde_json::to_string(&sig).unwrap();
+        let back: SealedSignature = serde_json::from_str(&json).unwrap();
+        assert_eq!(sig, back);
+
+        let ev = AuditEvent {
+            kind: "petal.sign.ok".into(),
+            wallet: Some("my-wallet".into()),
+            action_id: Some("req_1".into()),
+            message: "signed".into(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let back: AuditEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(ev, back);
+        // The default-less fields are skipped in serialization (spec §4.1).
+        let ev_bare = AuditEvent {
+            kind: "host.note".into(),
+            wallet: None,
+            action_id: None,
+            message: "msg".into(),
+        };
+        let json = serde_json::to_string(&ev_bare).unwrap();
+        assert!(!json.contains("wallet"));
+        assert!(!json.contains("action_id"));
     }
 }

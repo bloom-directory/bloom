@@ -5,14 +5,18 @@
 //! only on `bloom-auth-api`; this crate stays daemon-side so NFS/petal
 //! surfaces never pull in the authorization TCB.
 
+pub mod grant_store;
+
+pub use grant_store::InMemoryGrantStore;
+
 use async_trait::async_trait;
 use bloom_auth_api::{
     APPROVAL_CHALLENGE_SCHEMA_V1, ApprovalChallenge, ApprovalCredentialRecord,
     ApprovalSignatureVerifier, ApprovalVerifier, AssuranceLevel, AuthApiError, AuthEntryRecord,
-    AuthEntryState, AuthStoreView, AuthStoreWriter, CanonicalEnvelope, NonceState, PriceOracle,
-    ReservationRecord, ReservationState, ReviewSessionRecord, SealedAction, SealedIntentRecord,
-    SignedApproval, SignerKind, UnsignedApproval, ValuationPolicy, ValuationQuote,
-    WebAuthnAssertionRecord,
+    AuthEntryState, AuthStoreView, AuthStoreWriter, CanonicalEnvelope, GrantStore, NonceState,
+    PriceOracle, ReservationRecord, ReservationState, ReviewSessionRecord, SealedAction,
+    SealedApprovalGrant, SealedIntentRecord, SignedApproval, SignerKind, UnsignedApproval,
+    ValuationPolicy, ValuationQuote, WebAuthnAssertionRecord,
 };
 use bloom_prices::{CoinId, PricesClient};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -72,6 +76,13 @@ pub struct StoreApprovalVerifier<S> {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RejectingApprovalSignatureVerifier;
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+/// Test-only [`ApprovalSignatureVerifier`] that accepts every assertion. Use
+/// to exercise verifier + grant-mint flows that don't depend on a real
+/// WebAuthn implementation; never wire this into a production code path.
+pub struct AcceptingApprovalSignatureVerifier;
+
 #[derive(Debug, Clone)]
 pub struct BloomPricesOracle {
     client: PricesClient,
@@ -112,6 +123,19 @@ impl ApprovalSignatureVerifier for RejectingApprovalSignatureVerifier {
         Err(AuthApiError::Denied(
             "production approval signature verifier is not installed".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl ApprovalSignatureVerifier for AcceptingApprovalSignatureVerifier {
+    async fn verify_signature(
+        &self,
+        _unsigned: &UnsignedApproval,
+        _webauthn_assertion: &WebAuthnAssertionRecord,
+        _now_ms: u64,
+    ) -> Result<(), AuthApiError> {
+        Ok(())
     }
 }
 
@@ -1417,6 +1441,46 @@ where
             .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
         store.consume_verified_approval_transactionally(&approval, now_ms)?;
         Ok(())
+    }
+
+    async fn verify_and_mint_grant(
+        &self,
+        approval: SignedApproval,
+        grant_store: &dyn GrantStore,
+        now_ms: u64,
+    ) -> Result<SealedApprovalGrant, AuthApiError> {
+        let unsigned = approval.unsigned_payload();
+        self.signature_verifier
+            .verify_signature(&unsigned, &approval.webauthn_assertion, now_ms)
+            .await?;
+        // Hold the auth store mutex just long enough to burn the nonce and
+        // load the sealed action. Releasing the lock before calling
+        // `grant_store.mint` avoids holding both mutexes at once.
+        let sealed_action = {
+            let mut store = self
+                .store
+                .lock()
+                .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
+            store.consume_verified_approval_transactionally(&approval, now_ms)?;
+            let sealed = store.sealed_intent(&approval.intent_hash)?.ok_or_else(|| {
+                AuthApiError::NotFound(format!(
+                    "sealed intent {} for approved action",
+                    approval.intent_hash
+                ))
+            })?;
+            sealed.action.ok_or_else(|| {
+                AuthApiError::Denied(format!(
+                    "sealed action is missing for intent_hash {}; re-stage the action",
+                    approval.intent_hash
+                ))
+            })?
+        };
+        // The nonce has now been burned. Even if `grant_store.mint` fails
+        // (e.g. a live grant for the tuple already exists), the caller
+        // cannot replay this approval — by design.
+        grant_store
+            .mint(&sealed_action, approval.expiry_ms, now_ms)
+            .await
     }
 }
 
@@ -2855,5 +2919,177 @@ mod tests {
         store
             .consume_verified_approval_transactionally(&approval_for(&challenge), 400)
             .unwrap();
+    }
+
+    // -------------------------------------------------------
+    // verify_and_mint_grant: end-to-end grant service flow
+    // -------------------------------------------------------
+
+    use bloom_auth_api::{DaemonGrantTerms, PetalPolicySnapshot, SealedAction};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    /// Build a sealed action whose daemon terms allow `evm.tx.sign` (so the
+    /// minted grant can actually be consumed) and accept up to 2 signatures.
+    fn multi_sig_action() -> SealedAction {
+        let env = envelope_for("requests", "req_grant");
+        let mut snapshot = PetalPolicySnapshot::minimal(&env.header);
+        snapshot.policy_version = 0;
+        SealedAction::new(
+            env,
+            "plan".into(),
+            Vec::new(),
+            DaemonGrantTerms {
+                max_ttl_secs: 60,
+                max_signatures: 2,
+                allowed_sign_intents: vec!["evm.tx.sign".into()],
+                assurance: AssuranceLevel::Standard,
+                extra: BTreeMap::new(),
+            },
+            snapshot,
+            100,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn verify_and_mint_grant_happy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let mut store = AuthStore::open(&path).unwrap();
+        let action = multi_sig_action();
+        store.stage_action(&action, 100).unwrap();
+        let challenge = store
+            .issue_challenge("requests", "req_grant", "nonce-grant", 500, 101)
+            .unwrap();
+        let approval = approval_for(&challenge);
+
+        let verifier = StoreApprovalVerifier::new(store, AcceptingApprovalSignatureVerifier);
+        let grant_store: Arc<dyn GrantStore> = Arc::new(InMemoryGrantStore::new());
+        let grant = verifier
+            .verify_and_mint_grant(approval, grant_store.as_ref(), 200)
+            .await
+            .unwrap();
+        assert_eq!(grant.action_id, "req_grant");
+        assert_eq!(grant.wallet, "my-wallet");
+        assert_eq!(grant.max_signatures, 2);
+        assert_eq!(grant.consumed_signature_count, 0);
+        assert!(!grant.revoked);
+        assert!(grant.expiry_ms > 200);
+
+        // The minted grant can drive a real signature consume.
+        let snapshot = grant_store
+            .consume_signature(&grant.grant_id, "evm.tx.sign", 250)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.consumed_signature_count, 1);
+        assert_eq!(snapshot.max_signatures, 2);
+    }
+
+    #[tokio::test]
+    async fn verify_and_mint_grant_denied_if_signature_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let mut store = AuthStore::open(&path).unwrap();
+        let action = multi_sig_action();
+        store.stage_action(&action, 100).unwrap();
+        let challenge = store
+            .issue_challenge("requests", "req_grant", "nonce-grant", 500, 101)
+            .unwrap();
+        let approval = approval_for(&challenge);
+
+        let verifier = StoreApprovalVerifier::new(store, RejectingApprovalSignatureVerifier);
+        let grant_store: Arc<dyn GrantStore> = Arc::new(InMemoryGrantStore::new());
+        let err = verifier
+            .verify_and_mint_grant(approval, grant_store.as_ref(), 200)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("signature verifier is not installed"),
+            "{err}"
+        );
+
+        // Nonce must NOT be burned when signature verification fails.
+        drop(verifier);
+        let reopened = AuthStore::open(&path).unwrap();
+        let entry = reopened
+            .auth_entry("requests", "req_grant")
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.nonce_state, NonceState::Unused);
+        // The grant store has no rows.
+        let active = reopened_grant(&grant_store, 250).await;
+        assert!(active.is_none());
+    }
+
+    #[tokio::test]
+    async fn verify_and_mint_grant_denies_if_grant_tuple_already_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        let mut store = AuthStore::open(&path).unwrap();
+        let action = multi_sig_action();
+        store.stage_action(&action, 100).unwrap();
+        let challenge1 = store
+            .issue_challenge("requests", "req_grant", "nonce-1", 500, 101)
+            .unwrap();
+        let approval1 = approval_for(&challenge1);
+
+        let verifier = StoreApprovalVerifier::new(store, AcceptingApprovalSignatureVerifier);
+        let grant_store: Arc<dyn GrantStore> = Arc::new(InMemoryGrantStore::new());
+        let first = verifier
+            .verify_and_mint_grant(approval1, grant_store.as_ref(), 200)
+            .await
+            .unwrap();
+        assert_eq!(first.action_id, "req_grant");
+        assert_eq!(first.consumed_signature_count, 0);
+
+        // Manually roll the auth entry back to "challenged" with a fresh
+        // nonce so we can re-issue a challenge and observe the
+        // grant-store-side "live grant" rejection (the verify-and-mint path
+        // is otherwise blocked at the nonce-consume step).
+        drop(verifier);
+        {
+            let raw = AuthStore::open(&path).unwrap();
+            raw.conn
+                .execute(
+                    "UPDATE auth_entries
+                     SET state = 'challenged', nonce = 'nonce-2', nonce_state = 'unused',
+                         challenge_expiry_ms = 900, updated_ms = 300
+                     WHERE surface = 'requests' AND action_id = 'req_grant'",
+                    [],
+                )
+                .unwrap();
+        }
+        let mut store2 = AuthStore::open(&path).unwrap();
+        let challenge2 = store2
+            .issue_challenge("requests", "req_grant", "nonce-2", 900, 301)
+            .unwrap();
+        let approval2 = approval_for(&challenge2);
+        let verifier2 = StoreApprovalVerifier::new(store2, AcceptingApprovalSignatureVerifier);
+        let err = verifier2
+            .verify_and_mint_grant(approval2, grant_store.as_ref(), 400)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("live grant"),
+            "mint must fail closed with a 'live grant' message: {err}"
+        );
+    }
+
+    async fn reopened_grant(
+        grant_store: &Arc<dyn GrantStore>,
+        now_ms: u64,
+    ) -> Option<SealedApprovalGrant> {
+        grant_store
+            .get_active(
+                "my-wallet",
+                "req_grant",
+                bloom_auth_api::petal_identity::PETAL_ID_PAID_HTTP,
+                bloom_auth_api::petal_identity::PLACEHOLDER_DIGEST_PAID_HTTP,
+                now_ms,
+            )
+            .await
+            .unwrap()
     }
 }

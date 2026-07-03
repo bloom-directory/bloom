@@ -11,6 +11,7 @@ async-trait.workspace = true
 blake3.workspace = true
 bloom-auth-api.workspace = true
 bloom-prices.workspace = true
+parking_lot.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -18,4 +19,4 @@ thiserror.workspace = true
 [dev-dependencies]
 base64.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
