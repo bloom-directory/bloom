@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ipc;
+pub mod sealed_ceremony;
 pub mod sign_hash;
 
 mod ens_resolver;

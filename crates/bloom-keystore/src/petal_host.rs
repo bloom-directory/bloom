@@ -18,10 +18,12 @@
 //! failure along the way is logged with `petal.sign.deny` and surfaced as
 //! [`AuthApiError::Denied`] so the caller never receives a partial signature.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use alloy::primitives::B256;
 use alloy::signers::SignerSync;
+use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use base64::Engine as _;
 
@@ -35,12 +37,84 @@ use bloom_proto::audit::AuditRecord;
 
 use crate::Keystore;
 
+/// Per-grant cache of decrypted passkey signers. Set by the daemon after
+/// `sealed_approval_ceremony` completes; consumed by `sign_hash` to avoid
+/// re-running a WebAuthn ceremony on every signature request within the
+/// same grant.
+///
+/// The signer is dropped when:
+/// - `drop_on_completion` is called (after the last `consume_signature`),
+/// - `prune_expired` sweeps entries past their grant expiry,
+/// - the daemon process restarts (cache is in-memory only).
+pub struct SignerCache {
+    inner: parking_lot::Mutex<HashMap<String, SignerEntry>>,
+}
+
+struct SignerEntry {
+    signer: Arc<PrivateKeySigner>,
+    expires_ms: u64,
+    wallet: String,
+}
+
+impl Default for SignerCache {
+    fn default() -> Self {
+        Self {
+            inner: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl SignerCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Look up a cached signer by grant_id (clone of the Arc, does NOT remove).
+    pub fn get(&self, grant_id: &str) -> Option<Arc<PrivateKeySigner>> {
+        self.inner.lock().get(grant_id).map(|e| e.signer.clone())
+    }
+
+    /// Insert a signer for a grant. Called by the daemon after ceremony.
+    pub fn insert(
+        &self,
+        grant_id: String,
+        signer: Arc<PrivateKeySigner>,
+        wallet: String,
+        expires_ms: u64,
+    ) {
+        self.inner.lock().insert(
+            grant_id,
+            SignerEntry {
+                signer,
+                expires_ms,
+                wallet,
+            },
+        );
+    }
+
+    /// Remove a signer after the grant's last signature is consumed.
+    pub fn drop_on_completion(&self, grant_id: &str) {
+        self.inner.lock().remove(grant_id);
+    }
+
+    /// Sweep entries past their expiry. Called opportunistically.
+    pub fn prune_expired(&self, now_ms: u64) {
+        self.inner.lock().retain(|_, e| e.expires_ms > now_ms);
+    }
+
+    /// Remove all entries for a wallet (e.g. on grant revocation).
+    pub fn revoke_for_wallet(&self, wallet: &str) {
+        self.inner.lock().retain(|_, e| e.wallet != wallet);
+    }
+}
+
 /// Local signer backed by an unlocked wallet in the [`Keystore`].
 pub struct KeystorePetalHost {
     keystore: Arc<Keystore>,
     grant_store: Arc<dyn GrantStore>,
     registry: Arc<dyn SigningAttestationSchemaRegistry>,
     audit_log: Arc<AuditLog>,
+    signer_cache: Option<Arc<SignerCache>>,
 }
 
 impl KeystorePetalHost {
@@ -55,7 +129,16 @@ impl KeystorePetalHost {
             grant_store,
             registry,
             audit_log,
+            signer_cache: None,
         }
+    }
+
+    /// Wire a per-grant signer cache so `sign_hash` can reuse a decrypted
+    /// signer set by `run_sealed_approval_ceremony` without re-running a
+    /// WebAuthn ceremony on every signature within the same grant.
+    pub fn with_signer_cache(mut self, cache: Arc<SignerCache>) -> Self {
+        self.signer_cache = Some(cache);
+        self
     }
 
     pub fn keystore(&self) -> &Arc<Keystore> {
@@ -309,21 +392,22 @@ impl PetalHost for KeystorePetalHost {
                 .await;
         }
 
-        // Step 7: ensure the signer is in memory. Passkey wallets require a
-        // ceremony first; local wallets are already cached after `unlock`.
-        let signer = match self.keystore.signer(&request.wallet) {
-            Ok(s) => s,
-            Err(_) => {
-                self.keystore
-                    .unlock_passkey_with_intent(&request.wallet, None)
-                    .await
-                    .map_err(|e| {
-                        AuthApiError::Denied(format!("keystore.unlock_passkey_with_intent: {e}"))
-                    })?;
-                self.keystore.signer(&request.wallet).map_err(|e| {
-                    AuthApiError::Denied(format!("keystore.signer after unlock: {e}"))
-                })?
+        // Step 7: ensure the signer is in memory. A per-grant signer cache
+        // (set by the daemon after `sealed_approval_ceremony`) lets us reuse
+        // the decrypted signer without re-running a WebAuthn ceremony; on a
+        // cache miss we fall back to the keystore unlock path.
+        let signer = if let Some(cache) = &self.signer_cache {
+            if let Some(cached) = cache.get(&grant.grant_id) {
+                cached
+            } else {
+                // Cache miss — fall back to keystore unlock (e.g. daemon
+                // restart between ceremony and sign). This runs an extra
+                // ceremony.
+                self.keystore_unlock_signer(&request.wallet).await?
             }
+        } else {
+            // No cache wired — legacy path.
+            self.keystore_unlock_signer(&request.wallet).await?
         };
 
         // Step 8: sign the hash.
@@ -337,6 +421,12 @@ impl PetalHost for KeystorePetalHost {
             .grant_store
             .consume_signature(&grant.grant_id, &request.intent, now_ms)
             .await?;
+
+        if updated_grant.consumed_signature_count >= updated_grant.max_signatures
+            && let Some(cache) = &self.signer_cache
+        {
+            cache.drop_on_completion(&grant.grant_id);
+        }
 
         // Step 10: audit.
         let intent_hash = updated_grant.intent_hash.clone();
@@ -389,6 +479,29 @@ impl PetalHost for KeystorePetalHost {
 }
 
 impl KeystorePetalHost {
+    /// Resolve a signer from the keystore, running an `unlock_passkey_with_intent`
+    /// ceremony first if the wallet is not yet decrypted. This is the fallback
+    /// path for `sign_hash` when no per-grant cache entry exists.
+    async fn keystore_unlock_signer(
+        &self,
+        wallet: &str,
+    ) -> Result<Arc<PrivateKeySigner>, AuthApiError> {
+        match self.keystore.signer(wallet) {
+            Ok(s) => Ok(s),
+            Err(_) => {
+                self.keystore
+                    .unlock_passkey_with_intent(wallet, None)
+                    .await
+                    .map_err(|e| {
+                        AuthApiError::Denied(format!("keystore.unlock_passkey_with_intent: {e}"))
+                    })?;
+                self.keystore
+                    .signer(wallet)
+                    .map_err(|e| AuthApiError::Denied(format!("keystore.signer after unlock: {e}")))
+            }
+        }
+    }
+
     /// Internal: log a denial event and return the deterministic [`AuthApiError`].
     ///
     /// Used by `sign_hash` so every denial surface produces an audit trail;

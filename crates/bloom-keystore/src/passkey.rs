@@ -1777,6 +1777,110 @@ impl super::Keystore {
         Ok(assertion)
     }
 
+    /// One-ceremony sealed approval: a single WebAuthn get() that simultaneously
+    /// (a) binds the assertion to the approval challenge hash, and (b) derives the
+    /// PRF output needed to decrypt the wallet signing key. Returns both the
+    /// assertion (for grant verification) and the decrypted signer (for the daemon
+    /// to cache per-grant so subsequent `sign_hash` calls skip re-ceremony).
+    ///
+    /// Counter is NOT persisted here — the daemon re-verifies the assertion in
+    /// `verify_approval_signature_with_passkey` and owns the authoritative counter
+    /// update (same rationale as `sign_approval_with_passkey`, see comment at
+    /// line 1759).
+    pub async fn sealed_approval_ceremony(
+        &self,
+        name: &str,
+        unsigned: &UnsignedApproval,
+    ) -> Result<(WebAuthnAssertionRecord, Arc<PrivateKeySigner>), KeystoreError> {
+        Self::validate_name(name)?;
+        let dir = self.wallet_path(name);
+        if !dir.exists() {
+            return Err(KeystoreError::NotFound(name.into()));
+        }
+        let kind_str = read_trim(&dir.join("kind"))?;
+        if kind_str != "passkey" {
+            return Err(KeystoreError::PasskeyCredential(format!(
+                "sealed ceremony requires a passkey wallet (wallet '{name}' is '{kind_str}')"
+            )));
+        }
+        if unsigned.wallet != name {
+            return Err(KeystoreError::PasskeyCredential(format!(
+                "approval wallet '{}' does not match passkey wallet '{name}'",
+                unsigned.wallet
+            )));
+        }
+
+        let passkey_json = std::fs::read_to_string(dir.join("passkey.json")).map_err(|source| {
+            KeystoreError::Io {
+                path: dir.join("passkey.json"),
+                source,
+            }
+        })?;
+        let credential: Passkey = serde_json::from_str(&passkey_json)
+            .map_err(|e| KeystoreError::PasskeyCredential(e.to_string()))?;
+
+        let prf_salt_hex = read_trim(&dir.join("prf.salt"))?;
+        let prf_salt_bytes = hex::decode(&prf_salt_hex)
+            .map_err(|e| KeystoreError::Malformed(format!("prf.salt: {e}")))?;
+        let prf_salt: [u8; 32] = prf_salt_bytes
+            .try_into()
+            .map_err(|_| KeystoreError::Malformed("prf.salt length != 32".into()))?;
+
+        let challenge = unsigned.challenge_hash().map_err(Self::from_auth_api)?;
+        let require_uv = unsigned.assurance == AssuranceLevel::Hardened;
+
+        let ceremony = auth_ceremony(
+            &credential,
+            Some(&prf_salt),
+            None,
+            None,
+            Some(challenge),
+            require_uv,
+        )
+        .await
+        .map_err(KeystoreError::PasskeyCeremony)?;
+
+        // Deliberately no credential write-back here: the daemon re-verifies this
+        // exact assertion in `verify_approval_signature_with_passkey` and owns the
+        // authoritative counter update. Persisting the bump now would make the
+        // stored counter equal the assertion's, which webauthn-rs treats as a
+        // cloned authenticator — denying every approval from hardware keys with
+        // real signature counters.
+        require_user_verification_for_assurance(
+            unsigned.assurance,
+            ceremony.auth_result.user_verified(),
+        )
+        .map_err(KeystoreError::PasskeyCredential)?;
+
+        let assertion = webauthn_assertion_record(&ceremony.credential)
+            .map_err(KeystoreError::PasskeyCredential)?;
+        assertion
+            .validate_challenge(unsigned)
+            .map_err(Self::from_auth_api)?;
+
+        let mut prf_output = ceremony
+            .prf_output
+            .ok_or_else(|| KeystoreError::PasskeyCeremony(PRF_NOT_SUPPORTED_MSG.into()))?;
+
+        let enc_blob =
+            std::fs::read(dir.join("encrypted.key")).map_err(|source| KeystoreError::Io {
+                path: dir.join("encrypted.key"),
+                source,
+            })?;
+        let enc: PasskeyEncrypted = serde_json::from_slice(&enc_blob)
+            .map_err(|e| KeystoreError::Malformed(format!("encrypted.key parse: {e}")))?;
+
+        let result = decrypt_passkey_key(&enc, &prf_output);
+        prf_output.zeroize();
+        let mut key_bytes = result?;
+
+        let signer = PrivateKeySigner::from_bytes(&key_bytes.into())
+            .map_err(|e| KeystoreError::Signer(e.to_string()))?;
+        key_bytes.zeroize();
+
+        Ok((assertion, Arc::new(signer)))
+    }
+
     pub async fn verify_approval_signature_with_passkey(
         &self,
         unsigned: &UnsignedApproval,
@@ -2664,5 +2768,130 @@ mod approval_uv_tests {
                 || err.to_string().contains("finish_passkey_authentication"),
             "{err}"
         );
+    }
+
+    // ── sealed_approval_ceremony: fail-closed logic paths ───────────────────
+    //
+    // The happy path (and the no-PRF / missing-UV cases) drives `auth_ceremony`,
+    // which binds a real socket and launches a browser — not unit-testable
+    // headlessly. Those cases live below as `#[ignore]` integration tests gated
+    // on `BLOOM_TEST_BROWSER=1`. The three pure-logic tests that follow exercise
+    // the validation gates that fire BEFORE the ceremony, so they need no
+    // authenticator.
+
+    #[tokio::test]
+    async fn sealed_approval_ceremony_fails_when_wallet_not_found() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = crate::Keystore::new(td.path()).unwrap();
+        let unsigned = unsigned_approval("my-wallet", AssuranceLevel::Hardened);
+        let err = ks
+            .sealed_approval_ceremony("my-wallet", &unsigned)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KeystoreError::NotFound(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn sealed_approval_ceremony_fails_when_wallet_is_not_passkey() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = crate::Keystore::new(td.path()).unwrap();
+        // Lay down a non-passkey wallet (kind = "local").
+        let dir = td.path().join("my-wallet");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("kind"), b"local\n").unwrap();
+        let unsigned = unsigned_approval("my-wallet", AssuranceLevel::Hardened);
+        let err = ks
+            .sealed_approval_ceremony("my-wallet", &unsigned)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sealed ceremony requires a passkey wallet")
+                && msg.contains("my-wallet")
+                && msg.contains("local"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sealed_approval_ceremony_fails_when_wallet_name_mismatch() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = crate::Keystore::new(td.path()).unwrap();
+        // Create a real passkey-shaped wallet named "wallet-a".
+        let _ = wallet_with_software_credential(td.path(), "wallet-a");
+        // But pass an unsigned approval whose wallet field is "wallet-b".
+        let unsigned = unsigned_approval("wallet-b", AssuranceLevel::Hardened);
+        let err = ks
+            .sealed_approval_ceremony("wallet-a", &unsigned)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not match passkey wallet")
+                && msg.contains("wallet-b")
+                && msg.contains("wallet-a"),
+            "{msg}"
+        );
+    }
+
+    // ── sealed_approval_ceremony: browser-gated integration tests ───────────
+    //
+    // These need a real authenticator (the ceremony binds port 18734 and opens
+    // a browser). Run with: `BLOOM_TEST_BROWSER=1 cargo test -p bloom-keystore
+    // -- --ignored sealed_approval`. They are compiled but skipped by default.
+
+    #[tokio::test]
+    #[ignore = "requires a real authenticator; set BLOOM_TEST_BROWSER=1"]
+    async fn sealed_approval_ceremony_returns_assertion_and_signer() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = crate::Keystore::new(td.path()).unwrap();
+        // NOTE: this fixture does NOT create a wallet; a maintainer must first
+        // run `bloom wallet new --kind passkey my-wallet` against this tempdir
+        // (pointing BLOOM_KEYSTORE_DIR at td) to plant the passkey credential,
+        // prf.salt, and encrypted.key before running this test. Kept here as a
+        // runnable skeleton for manual end-to-end verification.
+        let unsigned = unsigned_approval("my-wallet", AssuranceLevel::Hardened);
+        let (assertion, signer) = ks
+            .sealed_approval_ceremony("my-wallet", &unsigned)
+            .await
+            .expect("ceremony succeeds and returns both assertion and signer");
+        // The returned assertion must verify against the same approval.
+        ks.verify_approval_signature_with_passkey(&unsigned, &assertion)
+            .await
+            .expect("assertion verifies");
+        // The signer must be a usable secp256k1 key.
+        let _addr = signer.address();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real authenticator; set BLOOM_TEST_BROWSER=1"]
+    async fn sealed_approval_ceremony_fails_when_no_prf_output() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = crate::Keystore::new(td.path()).unwrap();
+        // Same plant-a-wallet caveat as above; this asserts that an
+        // authenticator which does not return a PRF output fails with the
+        // PRF_NOT_SUPPORTED_MSG contract rather than silently decrypting.
+        let unsigned = unsigned_approval("my-wallet", AssuranceLevel::Hardened);
+        let err = ks
+            .sealed_approval_ceremony("my-wallet", &unsigned)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(PRF_NOT_SUPPORTED_MSG), "{}", err);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real authenticator; set BLOOM_TEST_BROWSER=1"]
+    async fn sealed_approval_ceremony_fails_when_uv_missing_for_hardened() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = crate::Keystore::new(td.path()).unwrap();
+        // Same plant-a-wallet caveat. A hardened approval must require user
+        // verification; an authenticator returning only UP (not UV) must be
+        // rejected after the ceremony completes.
+        let unsigned = unsigned_approval("my-wallet", AssuranceLevel::Hardened);
+        let err = ks
+            .sealed_approval_ceremony("my-wallet", &unsigned)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("verified"), "{}", err);
     }
 }
