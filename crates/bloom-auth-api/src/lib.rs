@@ -560,6 +560,43 @@ impl PetalPolicySnapshot {
     }
 }
 
+/// Result of evaluating policy checks against a sealed snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyDecision {
+    /// A Hard rule was violated — non-escalatable, always deny.
+    pub hard_violation: bool,
+    /// A Soft/StepUp rule was violated — step-up ceremony required to proceed.
+    pub step_up_required: bool,
+    /// A step-up rule's ceiling was exceeded — non-escalatable. Contains a
+    /// deterministic denial string: `"rule {rule_id} exceeds ceiling"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exceeded_ceiling: Option<String>,
+}
+
+impl PolicyDecision {
+    pub fn pass_through() -> Self {
+        Self {
+            hard_violation: false,
+            step_up_required: false,
+            exceeded_ceiling: None,
+        }
+    }
+    pub fn is_denied(&self) -> bool {
+        self.hard_violation || self.exceeded_ceiling.is_some()
+    }
+}
+
+/// Evaluates policy checks against a sealed snapshot to produce a decision.
+#[async_trait]
+pub trait PolicyEvaluator: Send + Sync {
+    async fn evaluate(
+        &self,
+        snapshot: &PetalPolicySnapshot,
+        checks: &[PolicyCheckResult],
+        now_ms: u64,
+    ) -> Result<PolicyDecision, AuthApiError>;
+}
+
 /// The sealed action record persisted in daemon-controlled storage (§6.1).
 ///
 /// The wrapped [`CanonicalEnvelope`] remains the sole intent-hash preimage
@@ -1675,6 +1712,62 @@ pub struct ReservationRecord {
     pub state: ReservationState,
     pub created_ms: u64,
     pub updated_ms: u64,
+}
+
+/// Cross-Bloom standing session metadata (spec §6.4).
+///
+/// This record holds only non-secret session bookkeeping — wallet, scope,
+/// frozen caps/counters, and audit trail. Owner key material stays in-memory
+/// only and is never persisted here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StandingSessionRecord {
+    pub session_id: String,
+    pub wallet: String,
+    pub petal_id: String,
+    pub session_kind: String,
+    pub scope: serde_json::Value,
+    pub counters: serde_json::Value,
+    pub frozen_policy_version: u64,
+    pub frozen_petal_policy_digest: String,
+    pub issued_ms: u64,
+    pub expires_ms: u64,
+    pub revoked_ms: Option<u64>,
+    pub orphan: bool,
+    pub created_ms: u64,
+}
+
+/// Deterministic, machine-comparable reasons for denying a standing-session
+/// request. The stable string form ([`Self::as_deterministic_str`]) is what
+/// callers compare on; never reorder or reword without a migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionDenialReason {
+    Orphan,
+    BudgetExhausted,
+    ScopeMismatch,
+    Expired,
+    Revoked,
+    WrongToken,
+    WrongRecipient,
+    WrongChain,
+    WrongMethod,
+    Halted,
+}
+
+impl SessionDenialReason {
+    pub fn as_deterministic_str(self) -> &'static str {
+        match self {
+            Self::Orphan => "session_orphaned_requires_reapproval",
+            Self::BudgetExhausted => "session_budget_exhausted",
+            Self::ScopeMismatch => "session_scope_mismatch",
+            Self::Expired => "session_expired",
+            Self::Revoked => "session_revoked",
+            Self::WrongToken => "session_wrong_token",
+            Self::WrongRecipient => "session_wrong_recipient",
+            Self::WrongChain => "session_wrong_chain",
+            Self::WrongMethod => "session_wrong_method",
+            Self::Halted => "session_halted",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3002,5 +3095,49 @@ mod tests {
         let json = serde_json::to_string(&ev_bare).unwrap();
         assert!(!json.contains("wallet"));
         assert!(!json.contains("action_id"));
+    }
+
+    #[test]
+    fn session_denial_reason_strings_are_stable() {
+        assert_eq!(
+            SessionDenialReason::Orphan.as_deterministic_str(),
+            "session_orphaned_requires_reapproval"
+        );
+        assert_eq!(
+            SessionDenialReason::BudgetExhausted.as_deterministic_str(),
+            "session_budget_exhausted"
+        );
+        assert_eq!(
+            SessionDenialReason::ScopeMismatch.as_deterministic_str(),
+            "session_scope_mismatch"
+        );
+        assert_eq!(
+            SessionDenialReason::Expired.as_deterministic_str(),
+            "session_expired"
+        );
+        assert_eq!(
+            SessionDenialReason::Revoked.as_deterministic_str(),
+            "session_revoked"
+        );
+        assert_eq!(
+            SessionDenialReason::WrongToken.as_deterministic_str(),
+            "session_wrong_token"
+        );
+        assert_eq!(
+            SessionDenialReason::WrongRecipient.as_deterministic_str(),
+            "session_wrong_recipient"
+        );
+        assert_eq!(
+            SessionDenialReason::WrongChain.as_deterministic_str(),
+            "session_wrong_chain"
+        );
+        assert_eq!(
+            SessionDenialReason::WrongMethod.as_deterministic_str(),
+            "session_wrong_method"
+        );
+        assert_eq!(
+            SessionDenialReason::Halted.as_deterministic_str(),
+            "session_halted"
+        );
     }
 }

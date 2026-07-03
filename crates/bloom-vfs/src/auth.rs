@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bloom_auth_api::{
-    ApprovalVerifier, AuthStoreView, AuthStoreWriter, GrantStore, PetalHost,
+    ApprovalVerifier, AuthStoreView, AuthStoreWriter, GrantStore, PetalHost, PolicyEvaluator,
     SigningAttestationSchemaRegistry,
 };
 
@@ -24,6 +24,8 @@ pub struct AuthServices {
     petal_host: Option<Arc<dyn PetalHost>>,
     /// WS-1: per-`(petal_id, intent)` attestation schema registry.
     attestation_registry: Option<Arc<dyn SigningAttestationSchemaRegistry>>,
+    /// WS-3: policy taxonomy evaluator (Hard / StepUp / Informational).
+    policy_evaluator: Option<Arc<dyn PolicyEvaluator>>,
 }
 
 impl AuthServices {
@@ -39,6 +41,7 @@ impl AuthServices {
             grant_store: None,
             petal_host: None,
             attestation_registry: None,
+            policy_evaluator: None,
         }
     }
 
@@ -72,6 +75,11 @@ impl AuthServices {
         registry: Arc<dyn SigningAttestationSchemaRegistry>,
     ) -> Self {
         self.attestation_registry = Some(registry);
+        self
+    }
+
+    pub fn with_policy_evaluator(mut self, policy_evaluator: Arc<dyn PolicyEvaluator>) -> Self {
+        self.policy_evaluator = Some(policy_evaluator);
         self
     }
 
@@ -137,6 +145,16 @@ impl AuthServices {
         })
     }
 
+    pub fn policy_evaluator(&self) -> Option<&Arc<dyn PolicyEvaluator>> {
+        self.policy_evaluator.as_ref()
+    }
+
+    pub fn require_policy_evaluator(&self) -> Result<&Arc<dyn PolicyEvaluator>, HandlerError> {
+        self.policy_evaluator
+            .as_ref()
+            .ok_or_else(|| HandlerError::Unsupported("Policy evaluator is not wired".into()))
+    }
+
     pub fn is_wired(&self) -> bool {
         self.approval_verifier.is_some()
             || self.store.is_some()
@@ -144,5 +162,6 @@ impl AuthServices {
             || self.grant_store.is_some()
             || self.petal_host.is_some()
             || self.attestation_registry.is_some()
+            || self.policy_evaluator.is_some()
     }
 }

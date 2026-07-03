@@ -6,6 +6,7 @@
 //! surfaces never pull in the authorization TCB.
 
 pub mod grant_store;
+pub mod policy_evaluator;
 
 pub use grant_store::InMemoryGrantStore;
 
@@ -15,8 +16,8 @@ use bloom_auth_api::{
     ApprovalSignatureVerifier, ApprovalVerifier, AssuranceLevel, AuthApiError, AuthEntryRecord,
     AuthEntryState, AuthStoreView, AuthStoreWriter, CanonicalEnvelope, GrantStore, NonceState,
     PriceOracle, ReservationRecord, ReservationState, ReviewSessionRecord, SealedAction,
-    SealedApprovalGrant, SealedIntentRecord, SignedApproval, SignerKind, UnsignedApproval,
-    ValuationPolicy, ValuationQuote, WebAuthnAssertionRecord,
+    SealedApprovalGrant, SealedIntentRecord, SignedApproval, SignerKind, StandingSessionRecord,
+    UnsignedApproval, ValuationPolicy, ValuationQuote, WebAuthnAssertionRecord,
 };
 use bloom_prices::{CoinId, PricesClient};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -287,12 +288,33 @@ impl AuthStore {
                 PRIMARY KEY(surface, venue_local_id),
                 UNIQUE(action_id)
             );
+
+            CREATE TABLE IF NOT EXISTS standing_sessions (
+                session_id TEXT PRIMARY KEY NOT NULL,
+                wallet TEXT NOT NULL,
+                petal_id TEXT NOT NULL,
+                session_kind TEXT NOT NULL,
+                scope_json TEXT NOT NULL,
+                counters_json TEXT NOT NULL,
+                frozen_policy_version INTEGER NOT NULL,
+                frozen_petal_policy_digest TEXT NOT NULL,
+                issued_ms INTEGER NOT NULL,
+                expires_ms INTEGER NOT NULL,
+                revoked_ms INTEGER,
+                orphan INTEGER NOT NULL DEFAULT 0,
+                created_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS standing_sessions_wallet_kind_idx
+                ON standing_sessions(wallet, session_kind, expires_ms);
             "#,
         )?;
         // Upgrade pre-sealed-action databases in place. `CREATE TABLE IF NOT
         // EXISTS` above only covers fresh databases; existing tables gain the
         // new columns here (NULL for legacy rows → fail closed, re-stageable).
         Self::add_column_if_missing(conn, "sealed_intents", "sealed_action_json", "TEXT")?;
+        // WS-3: release_reason tracks why a reservation left the active/committed
+        // set (released via `release_reservation`). NULL for legacy rows.
+        Self::add_column_if_missing(conn, "reservations", "release_reason", "TEXT")?;
         for (column, decl) in [
             ("wallet", "TEXT"),
             ("petal_id", "TEXT"),
@@ -1377,6 +1399,86 @@ impl AuthStore {
         Ok(total)
     }
 
+    /// Sum of all `active` AND `committed` reservation amounts for a wallet
+    /// (optionally restricted to a venue), counting only rows whose
+    /// `updated_ms` is within `[now_ms - window_ms, now_ms]`.
+    ///
+    /// Unlike [`Self::active_reservation_total`], this includes `committed`
+    /// reservations so budget checks see in-flight commitments against the
+    /// same time window. `Released`/`failed` rows are never counted.
+    pub fn reserved_plus_committed_total(
+        &self,
+        wallet: &str,
+        venue: Option<&str>,
+        window_ms: u64,
+        now_ms: u64,
+    ) -> Result<i128, AuthStoreError> {
+        let floor_ms = now_ms.saturating_sub(window_ms) as i64;
+        let mut total = 0i128;
+        if let Some(venue) = venue {
+            let mut stmt = self.conn.prepare(
+                "SELECT amount_micro_usd FROM reservations
+                 WHERE wallet = ?1 AND venue = ?2
+                   AND state IN ('active', 'committed')
+                   AND updated_ms >= ?3",
+            )?;
+            let mut rows = stmt.query(params![wallet, venue, floor_ms])?;
+            while let Some(row) = rows.next()? {
+                let amount: String = row.get(0)?;
+                total += parse_i128("amount_micro_usd", &amount)?;
+            }
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT amount_micro_usd FROM reservations
+                 WHERE wallet = ?1
+                   AND state IN ('active', 'committed')
+                   AND updated_ms >= ?2",
+            )?;
+            let mut rows = stmt.query(params![wallet, floor_ms])?;
+            while let Some(row) = rows.next()? {
+                let amount: String = row.get(0)?;
+                total += parse_i128("amount_micro_usd", &amount)?;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Release a reservation from either the `active` or `committed` state,
+    /// storing a human-readable `release_reason` for the audit trail.
+    ///
+    /// First attempts `active → released`; if that transition does not apply
+    /// (the row is not `active`), it retries `committed → released`. If
+    /// neither applies, the underlying `transition_reservation` error is
+    /// surfaced. The reason is persisted to the `release_reason` column added
+    /// by [`Self::migrate`].
+    pub fn release_reservation(
+        &mut self,
+        reservation_id: &str,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<ReservationRecord, AuthStoreError> {
+        let result = self.transition_reservation(
+            reservation_id,
+            ReservationState::Active,
+            ReservationState::Released,
+            now_ms,
+        );
+        let record = match result {
+            Ok(r) => r,
+            Err(_) => self.transition_reservation(
+                reservation_id,
+                ReservationState::Committed,
+                ReservationState::Released,
+                now_ms,
+            )?,
+        };
+        self.conn.execute(
+            "UPDATE reservations SET release_reason = ?1 WHERE reservation_id = ?2",
+            params![reason, reservation_id],
+        )?;
+        Ok(record)
+    }
+
     pub fn sealed_intent(
         &self,
         intent_hash: &str,
@@ -1408,6 +1510,192 @@ impl AuthStore {
                 })
             })
             .transpose()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_standing_session(
+        &mut self,
+        session_id: &str,
+        wallet: &str,
+        petal_id: &str,
+        session_kind: &str,
+        scope_json: &str,
+        counters_json: &str,
+        frozen_policy_version: u64,
+        frozen_petal_policy_digest: &str,
+        issued_ms: u64,
+        expires_ms: u64,
+        now_ms: u64,
+    ) -> Result<(), AuthStoreError> {
+        self.conn.execute(
+            "INSERT INTO standing_sessions(
+                session_id, wallet, petal_id, session_kind, scope_json, counters_json,
+                frozen_policy_version, frozen_petal_policy_digest,
+                issued_ms, expires_ms, revoked_ms, orphan, created_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, 0, ?11)",
+            params![
+                session_id,
+                wallet,
+                petal_id,
+                session_kind,
+                scope_json,
+                counters_json,
+                frozen_policy_version as i64,
+                frozen_petal_policy_digest,
+                issued_ms as i64,
+                expires_ms as i64,
+                now_ms as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn standing_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<StandingSessionRecord>, AuthStoreError> {
+        self.conn
+            .query_row(
+                "SELECT session_id, wallet, petal_id, session_kind, scope_json, counters_json,
+                        frozen_policy_version, frozen_petal_policy_digest,
+                        issued_ms, expires_ms, revoked_ms, orphan, created_ms
+                 FROM standing_sessions WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    let session_id: String = row.get(0)?;
+                    let wallet: String = row.get(1)?;
+                    let petal_id: String = row.get(2)?;
+                    let session_kind: String = row.get(3)?;
+                    let scope_json: String = row.get(4)?;
+                    let counters_json: String = row.get(5)?;
+                    let frozen_policy_version: i64 = row.get(6)?;
+                    let frozen_petal_policy_digest: String = row.get(7)?;
+                    let issued_ms: i64 = row.get(8)?;
+                    let expires_ms: i64 = row.get(9)?;
+                    let revoked_ms: Option<i64> = row.get(10)?;
+                    let orphan: i64 = row.get(11)?;
+                    let created_ms: i64 = row.get(12)?;
+                    Ok((
+                        session_id,
+                        wallet,
+                        petal_id,
+                        session_kind,
+                        scope_json,
+                        counters_json,
+                        frozen_policy_version,
+                        frozen_petal_policy_digest,
+                        issued_ms,
+                        expires_ms,
+                        revoked_ms,
+                        orphan,
+                        created_ms,
+                    ))
+                },
+            )
+            .optional()?
+            .map(
+                |(
+                    session_id,
+                    wallet,
+                    petal_id,
+                    session_kind,
+                    scope_json,
+                    counters_json,
+                    frozen_policy_version,
+                    frozen_petal_policy_digest,
+                    issued_ms,
+                    expires_ms,
+                    revoked_ms,
+                    orphan,
+                    created_ms,
+                )| {
+                    Ok(StandingSessionRecord {
+                        session_id,
+                        wallet,
+                        petal_id,
+                        session_kind,
+                        scope: serde_json::from_str(&scope_json)?,
+                        counters: serde_json::from_str(&counters_json)?,
+                        frozen_policy_version: frozen_policy_version as u64,
+                        frozen_petal_policy_digest,
+                        issued_ms: issued_ms as u64,
+                        expires_ms: expires_ms as u64,
+                        revoked_ms: revoked_ms.map(|v| v as u64),
+                        orphan: orphan != 0,
+                        created_ms: created_ms as u64,
+                    })
+                },
+            )
+            .transpose()
+    }
+
+    pub fn active_standing_sessions(
+        &self,
+        wallet: &str,
+        session_kind: Option<&str>,
+        now_ms: u64,
+    ) -> Result<Vec<StandingSessionRecord>, AuthStoreError> {
+        let mut records = Vec::new();
+        if let Some(session_kind) = session_kind {
+            let mut stmt = self.conn.prepare(
+                "SELECT session_id, wallet, petal_id, session_kind, scope_json, counters_json,
+                        frozen_policy_version, frozen_petal_policy_digest,
+                        issued_ms, expires_ms, revoked_ms, orphan, created_ms
+                 FROM standing_sessions
+                 WHERE wallet = ?1 AND session_kind = ?2
+                   AND revoked_ms IS NULL AND orphan = 0 AND expires_ms > ?3",
+            )?;
+            let mut rows = stmt.query(params![wallet, session_kind, now_ms as i64])?;
+            while let Some(row) = rows.next()? {
+                records.push(row_to_standing_session(row)?);
+            }
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT session_id, wallet, petal_id, session_kind, scope_json, counters_json,
+                        frozen_policy_version, frozen_petal_policy_digest,
+                        issued_ms, expires_ms, revoked_ms, orphan, created_ms
+                 FROM standing_sessions
+                 WHERE wallet = ?1
+                   AND revoked_ms IS NULL AND orphan = 0 AND expires_ms > ?2",
+            )?;
+            let mut rows = stmt.query(params![wallet, now_ms as i64])?;
+            while let Some(row) = rows.next()? {
+                records.push(row_to_standing_session(row)?);
+            }
+        }
+        Ok(records)
+    }
+
+    pub fn revoke_standing_session(
+        &mut self,
+        session_id: &str,
+        now_ms: u64,
+    ) -> Result<(), AuthStoreError> {
+        let changed = self.conn.execute(
+            "UPDATE standing_sessions SET revoked_ms = ?1
+             WHERE session_id = ?2 AND revoked_ms IS NULL",
+            params![now_ms as i64, session_id],
+        )?;
+        if changed != 1 {
+            return Err(AuthStoreError::Denied(
+                "standing session was not revoked".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn orphan_standing_sessions(
+        &mut self,
+        wallet: &str,
+        now_ms: u64,
+    ) -> Result<u64, AuthStoreError> {
+        let _ = now_ms;
+        let changed = self.conn.execute(
+            "UPDATE standing_sessions SET orphan = 1
+             WHERE wallet = ?1 AND orphan = 0 AND revoked_ms IS NULL",
+            params![wallet],
+        )?;
+        Ok(changed as u64)
     }
 
     pub fn pragma_string(&self, name: &str) -> Result<String, AuthStoreError> {
@@ -1695,6 +1983,42 @@ fn parse_i128(field: &'static str, value: &str) -> Result<i128, AuthStoreError> 
             field,
             value: value.to_string(),
         })
+}
+
+/// Map a `standing_sessions` row (in the canonical 13-column SELECT order
+/// used by [`AuthStore::standing_session`] and [`AuthStore::active_standing_sessions`])
+/// into a [`StandingSessionRecord`].
+fn row_to_standing_session(
+    row: &rusqlite::Row<'_>,
+) -> Result<StandingSessionRecord, AuthStoreError> {
+    let session_id: String = row.get(0)?;
+    let wallet: String = row.get(1)?;
+    let petal_id: String = row.get(2)?;
+    let session_kind: String = row.get(3)?;
+    let scope_json: String = row.get(4)?;
+    let counters_json: String = row.get(5)?;
+    let frozen_policy_version: i64 = row.get(6)?;
+    let frozen_petal_policy_digest: String = row.get(7)?;
+    let issued_ms: i64 = row.get(8)?;
+    let expires_ms: i64 = row.get(9)?;
+    let revoked_ms: Option<i64> = row.get(10)?;
+    let orphan: i64 = row.get(11)?;
+    let created_ms: i64 = row.get(12)?;
+    Ok(StandingSessionRecord {
+        session_id,
+        wallet,
+        petal_id,
+        session_kind,
+        scope: serde_json::from_str(&scope_json)?,
+        counters: serde_json::from_str(&counters_json)?,
+        frozen_policy_version: frozen_policy_version as u64,
+        frozen_petal_policy_digest,
+        issued_ms: issued_ms as u64,
+        expires_ms: expires_ms as u64,
+        revoked_ms: revoked_ms.map(|v| v as u64),
+        orphan: orphan != 0,
+        created_ms: created_ms as u64,
+    })
 }
 
 fn signer_kind_str(value: bloom_auth_api::SignerKind) -> &'static str {
@@ -3091,5 +3415,295 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn reserved_plus_committed_total_counts_active_and_committed() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        store
+            .create_reservation("res_active", "my-wallet", "requests", 10, 100)
+            .unwrap();
+        // Move res_committed out of the active set; only active+committed count.
+        store
+            .create_reservation("res_committed", "my-wallet", "requests", 20, 101)
+            .unwrap();
+        store
+            .transition_reservation(
+                "res_committed",
+                ReservationState::Active,
+                ReservationState::Committed,
+                102,
+            )
+            .unwrap();
+        store
+            .create_reservation("res_released", "my-wallet", "requests", 40, 103)
+            .unwrap();
+        store
+            .transition_reservation(
+                "res_released",
+                ReservationState::Active,
+                ReservationState::Released,
+                104,
+            )
+            .unwrap();
+        // Wide window so recency is not a factor here.
+        let total = store
+            .reserved_plus_committed_total("my-wallet", None, 100_000, 200)
+            .unwrap();
+        assert_eq!(total, 30, "active(10) + committed(20), released excluded");
+        // active_reservation_total must not see the committed row.
+        assert_eq!(
+            store.active_reservation_total("my-wallet", None).unwrap(),
+            10
+        );
+    }
+
+    #[test]
+    fn reserved_plus_committed_total_respects_window() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        // Old reservation: updated_ms = 100, below the window floor.
+        store
+            .create_reservation("res_old", "my-wallet", "requests", 10, 100)
+            .unwrap();
+        // Recent reservation: updated_ms = 900, within the window.
+        store
+            .create_reservation("res_recent", "my-wallet", "requests", 25, 900)
+            .unwrap();
+        // now=1000, window=500 → floor=500.
+        let total = store
+            .reserved_plus_committed_total("my-wallet", None, 500, 1000)
+            .unwrap();
+        assert_eq!(
+            total, 25,
+            "only the recent reservation is within the window"
+        );
+        // Venue filter must also honour the window.
+        let total_venue = store
+            .reserved_plus_committed_total("my-wallet", Some("requests"), 500, 1000)
+            .unwrap();
+        assert_eq!(total_venue, 25);
+        // A wide window sees both.
+        let total_wide = store
+            .reserved_plus_committed_total("my-wallet", None, 100_000, 1000)
+            .unwrap();
+        assert_eq!(total_wide, 35);
+    }
+
+    #[test]
+    fn release_reservation_from_active() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        store
+            .create_reservation("res_1", "my-wallet", "requests", 10, 100)
+            .unwrap();
+        let released = store
+            .release_reservation("res_1", "order filled", 110)
+            .unwrap();
+        assert_eq!(released.state, ReservationState::Released);
+        assert_eq!(released.updated_ms, 110);
+        // The release_reason must be persisted to the new column.
+        let reason: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT release_reason FROM reservations WHERE reservation_id = ?1",
+                params!["res_1"],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        assert_eq!(reason.as_deref(), Some("order filled"));
+        // And the reservation no longer counts towards active totals.
+        assert_eq!(
+            store.active_reservation_total("my-wallet", None).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn release_reservation_from_committed() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        store
+            .create_reservation("res_1", "my-wallet", "requests", 10, 100)
+            .unwrap();
+        store
+            .transition_reservation(
+                "res_1",
+                ReservationState::Active,
+                ReservationState::Committed,
+                110,
+            )
+            .unwrap();
+        // Active→Released transition will not apply; fall back to Committed→Released.
+        let released = store.release_reservation("res_1", "settled", 120).unwrap();
+        assert_eq!(released.state, ReservationState::Released);
+        let reason: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT release_reason FROM reservations WHERE reservation_id = ?1",
+                params!["res_1"],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        assert_eq!(reason.as_deref(), Some("settled"));
+    }
+
+    fn create_test_standing_session(
+        store: &mut AuthStore,
+        session_id: &str,
+        wallet: &str,
+        session_kind: &str,
+        expires_ms: u64,
+        now_ms: u64,
+    ) {
+        store
+            .create_standing_session(
+                session_id,
+                wallet,
+                PETAL_ID_PAID_HTTP,
+                session_kind,
+                r#"{"methods":["POST"]}"#,
+                r#"{"spent_micro_usd":0}"#,
+                1,
+                PLACEHOLDER_DIGEST_PAID_HTTP,
+                now_ms,
+                expires_ms,
+                now_ms,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn standing_session_crud_lifecycle() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        create_test_standing_session(&mut store, "sess_1", "my-wallet", "trading", 500, 100);
+
+        let got = store.standing_session("sess_1").unwrap().unwrap();
+        assert_eq!(got.session_id, "sess_1");
+        assert_eq!(got.wallet, "my-wallet");
+        assert_eq!(got.petal_id, PETAL_ID_PAID_HTTP);
+        assert_eq!(got.session_kind, "trading");
+        assert_eq!(got.scope, serde_json::json!({"methods":["POST"]}));
+        assert_eq!(got.counters, serde_json::json!({"spent_micro_usd":0}));
+        assert_eq!(got.frozen_policy_version, 1);
+        assert_eq!(got.frozen_petal_policy_digest, PLACEHOLDER_DIGEST_PAID_HTTP);
+        assert_eq!(got.issued_ms, 100);
+        assert_eq!(got.expires_ms, 500);
+        assert_eq!(got.revoked_ms, None);
+        assert!(!got.orphan);
+        assert_eq!(got.created_ms, 100);
+
+        // Active before revocation.
+        let active = store
+            .active_standing_sessions("my-wallet", None, 200)
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].session_id, "sess_1");
+        // Kind-filtered list also returns it.
+        let active_kind = store
+            .active_standing_sessions("my-wallet", Some("trading"), 200)
+            .unwrap();
+        assert_eq!(active_kind.len(), 1);
+        // Wrong kind returns none.
+        assert!(
+            store
+                .active_standing_sessions("my-wallet", Some("payments"), 200)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Revoke.
+        store.revoke_standing_session("sess_1", 300).unwrap();
+        let got = store.standing_session("sess_1").unwrap().unwrap();
+        assert_eq!(got.revoked_ms, Some(300));
+        // Revoked sessions drop out of the active list.
+        assert!(
+            store
+                .active_standing_sessions("my-wallet", None, 350)
+                .unwrap()
+                .is_empty()
+        );
+        // Double-revoke fails closed (no row changed).
+        assert!(store.revoke_standing_session("sess_1", 360).is_err());
+    }
+
+    #[test]
+    fn orphan_standing_sessions_marks_wallet_only() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        create_test_standing_session(&mut store, "sess_a1", "wallet-a", "trading", 500, 100);
+        create_test_standing_session(&mut store, "sess_a2", "wallet-a", "payments", 500, 100);
+        create_test_standing_session(&mut store, "sess_b1", "wallet-b", "trading", 500, 100);
+
+        let orphaned = store.orphan_standing_sessions("wallet-a", 200).unwrap();
+        assert_eq!(orphaned, 2);
+
+        assert!(store.standing_session("sess_a1").unwrap().unwrap().orphan);
+        assert!(store.standing_session("sess_a2").unwrap().unwrap().orphan);
+        assert!(!store.standing_session("sess_b1").unwrap().unwrap().orphan);
+        // wallet-a active list is now empty; wallet-b still has its session.
+        assert!(
+            store
+                .active_standing_sessions("wallet-a", None, 300)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .active_standing_sessions("wallet-b", None, 300)
+                .unwrap()
+                .len(),
+            1
+        );
+        // Re-orphaning wallet-a is a no-op (already orphaned).
+        assert_eq!(store.orphan_standing_sessions("wallet-a", 400).unwrap(), 0);
+    }
+
+    #[test]
+    fn active_standing_sessions_excludes_expired_revoked_orphaned() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        create_test_standing_session(&mut store, "sess_live", "my-wallet", "trading", 1_000, 100);
+        // Expired: expires before now=500.
+        create_test_standing_session(&mut store, "sess_expired", "my-wallet", "trading", 200, 100);
+        // Revoked.
+        create_test_standing_session(
+            &mut store,
+            "sess_revoked",
+            "my-wallet",
+            "trading",
+            1_000,
+            100,
+        );
+        store.revoke_standing_session("sess_revoked", 150).unwrap();
+        // Orphaned. `orphan_standing_sessions` is wallet-wide, so mark just this
+        // row to keep a live sibling for the same wallet.
+        create_test_standing_session(
+            &mut store,
+            "sess_orphan",
+            "my-wallet",
+            "trading",
+            1_000,
+            100,
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE standing_sessions SET orphan = 1 WHERE session_id = ?1",
+                params!["sess_orphan"],
+            )
+            .unwrap();
+        assert!(
+            store
+                .standing_session("sess_orphan")
+                .unwrap()
+                .unwrap()
+                .orphan
+        );
+
+        let active = store
+            .active_standing_sessions("my-wallet", None, 500)
+            .unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].session_id, "sess_live");
     }
 }
