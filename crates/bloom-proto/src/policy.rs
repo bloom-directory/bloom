@@ -469,48 +469,6 @@ fn parse_decimal_micro(raw: &str) -> Result<i128, String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BroadcastApprovalDecision {
-    ApprovedFreshReview,
-    /// Legacy variant retained for API compatibility. The evaluator no longer
-    /// returns it: broadcasts require fresh review or the newer autonomy
-    /// evaluator.
-    ApprovedPolicyOptOut,
-    NeedsFreshReview {
-        reason: String,
-    },
-    Denied {
-        reason: String,
-    },
-}
-
-pub fn evaluate_broadcast_approval(
-    policy: &Policy,
-    reviewed_intent_hash: Option<&str>,
-) -> BroadcastApprovalDecision {
-    match reviewed_intent_hash
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(_) => BroadcastApprovalDecision::ApprovedFreshReview,
-        None => BroadcastApprovalDecision::NeedsFreshReview {
-            reason: match policy.effective_agent_autonomy() {
-                AgentAutonomyMode::UnderPolicy => {
-                    "legacy approval evaluator cannot grant under-policy autonomy; use \
-                     evaluate_action_authorization"
-                        .into()
-                }
-                AgentAutonomyMode::Disabled => {
-                    "agent_autonomy=disabled; fresh reviewed user signature required".into()
-                }
-                AgentAutonomyMode::PromptAll => {
-                    "agent_autonomy=prompt_all; fresh reviewed user signature required".into()
-                }
-            },
-        },
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthorizationSurface {
     Cli,
     Vfs,
@@ -737,7 +695,7 @@ pub fn evaluate_action_authorization(
     policy_checks: &[PolicyCheck],
     subject: &AuthorizationSubject,
     budget: Option<&BudgetSnapshot>,
-    reviewed_intent_hash: Option<&str>,
+    fresh_review_intent_hash: Option<&str>,
     _surface: AuthorizationSurface,
 ) -> AutonomyDecision {
     if let Some(deny) = policy_checks.iter().find(|c| c.is_hard_violation()) {
@@ -746,7 +704,7 @@ pub fn evaluate_action_authorization(
         };
     }
 
-    if let Some(hash) = reviewed_intent_hash
+    if let Some(hash) = fresh_review_intent_hash
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
@@ -1290,30 +1248,6 @@ uv_above_usd = "1.0000001"
     }
 
     #[test]
-    fn broadcast_approval_false_is_not_an_opt_out() {
-        let p = Policy::default();
-        assert!(matches!(
-            evaluate_broadcast_approval(&p, None),
-            BroadcastApprovalDecision::NeedsFreshReview { reason }
-                if reason.contains("agent_autonomy=disabled")
-        ));
-    }
-
-    #[test]
-    fn broadcast_approval_requires_review_regardless_of_legacy_bool() {
-        let mut p = Policy::default();
-        p.approval.require_broadcast_approval = true;
-        assert!(matches!(
-            evaluate_broadcast_approval(&p, None),
-            BroadcastApprovalDecision::NeedsFreshReview { .. }
-        ));
-        assert_eq!(
-            evaluate_broadcast_approval(&p, Some("abc123")),
-            BroadcastApprovalDecision::ApprovedFreshReview
-        );
-    }
-
-    #[test]
     fn generated_disabled_policy_omits_legacy_approval_booleans() {
         let mut p = Policy::default();
         p.approval.agent_autonomy = Some(AgentAutonomyMode::Disabled);
@@ -1418,6 +1352,188 @@ uv_above_usd = "1.0000001"
                 AuthorizationSurface::Vfs,
             ),
             AutonomyDecision::Denied { reason } if reason.contains("max_day")
+        ));
+    }
+
+    #[test]
+    fn under_policy_denies_unverified_calldata() {
+        let mut p = Policy::default();
+        p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
+        p.limits.max_tx_usd = Some("3".into());
+        p.limits.max_day_usd = Some("10".into());
+        let subject = AuthorizationSubject {
+            calldata_verified: false,
+            ..auth_subject(Some(1_000_000))
+        };
+        assert!(matches!(
+            evaluate_action_authorization(
+                &p, &[], &subject, Some(&budget()), None,
+                AuthorizationSurface::Vfs,
+            ),
+            AutonomyDecision::Denied { reason }
+                if reason.contains("calldata/order facts")
+        ));
+    }
+
+    #[test]
+    fn under_policy_denies_missing_budget() {
+        let mut p = Policy::default();
+        p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
+        p.limits.max_tx_usd = Some("3".into());
+        p.limits.max_day_usd = Some("10".into());
+        assert!(matches!(
+            evaluate_action_authorization(
+                &p, &[], &auth_subject(Some(1_000_000)), None, None,
+                AuthorizationSurface::Vfs,
+            ),
+            AutonomyDecision::Denied { reason }
+                if reason.contains("budget ledger")
+        ));
+    }
+
+    #[test]
+    fn under_policy_denies_missing_max_tx_usd() {
+        let mut p = Policy::default();
+        p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
+        p.limits.max_day_usd = Some("10".into());
+        assert!(matches!(
+            evaluate_action_authorization(
+                &p, &[], &auth_subject(Some(1_000_000)), Some(&budget()), None,
+                AuthorizationSurface::Vfs,
+            ),
+            AutonomyDecision::Denied { reason }
+                if reason.contains("max_tx_usd is required")
+        ));
+    }
+
+    #[test]
+    fn under_policy_denies_missing_max_day_usd() {
+        let mut p = Policy::default();
+        p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
+        p.limits.max_tx_usd = Some("3".into());
+        assert!(matches!(
+            evaluate_action_authorization(
+                &p, &[], &auth_subject(Some(1_000_000)), Some(&budget()), None,
+                AuthorizationSurface::Vfs,
+            ),
+            AutonomyDecision::Denied { reason }
+                if reason.contains("max_day_usd is required")
+        ));
+    }
+
+    #[test]
+    fn under_policy_denies_week_cap_exceeded() {
+        let mut p = Policy::default();
+        p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
+        p.limits.max_tx_usd = Some("3".into());
+        p.limits.max_day_usd = Some("100".into());
+        p.limits.max_week_usd = Some("10".into());
+        let b = BudgetSnapshot {
+            spent_week_micro_usd: 9_000_000,
+            ..budget()
+        };
+        assert!(matches!(
+            evaluate_action_authorization(
+                &p, &[], &auth_subject(Some(2_000_000)), Some(&b), None,
+                AuthorizationSurface::Vfs,
+            ),
+            AutonomyDecision::Denied { reason }
+                if reason.contains("max_week_usd exceeded")
+        ));
+    }
+
+    #[test]
+    fn under_policy_denies_month_cap_exceeded() {
+        let mut p = Policy::default();
+        p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
+        p.limits.max_tx_usd = Some("3".into());
+        p.limits.max_day_usd = Some("100".into());
+        p.limits.max_week_usd = Some("100".into());
+        p.limits.max_month_usd = Some("10".into());
+        let b = BudgetSnapshot {
+            spent_month_micro_usd: 9_000_000,
+            ..budget()
+        };
+        assert!(matches!(
+            evaluate_action_authorization(
+                &p, &[], &auth_subject(Some(2_000_000)), Some(&b), None,
+                AuthorizationSurface::Vfs,
+            ),
+            AutonomyDecision::Denied { reason }
+                if reason.contains("max_month_usd exceeded")
+        ));
+    }
+
+    #[test]
+    fn under_policy_denies_hard_violation() {
+        let mut p = Policy::default();
+        p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
+        p.limits.max_tx_usd = Some("3".into());
+        p.limits.max_day_usd = Some("10".into());
+        let checks = vec![PolicyCheck::hard(
+            "denylist.recipients",
+            PolicyOutcome::Deny,
+            "recipient is on denylist",
+        )];
+        assert!(matches!(
+            evaluate_action_authorization(
+                &p, &checks, &auth_subject(Some(1_000_000)),
+                Some(&budget()), None,
+                AuthorizationSurface::Vfs,
+            ),
+            AutonomyDecision::Denied { reason }
+                if reason.contains("policy denied")
+        ));
+    }
+
+    #[test]
+    fn fresh_review_intent_hash_short_circuits_to_approved_fresh_review() {
+        let mut p = Policy::default();
+        p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
+        p.limits.max_tx_usd = Some("3".into());
+        p.limits.max_day_usd = Some("10".into());
+        // Even with no budget and no USD value, a verified fresh-review hash approves.
+        assert!(matches!(
+            evaluate_action_authorization(
+                &p, &[], &auth_subject(None), None,
+                Some("abc123"),
+                AuthorizationSurface::Vfs,
+            ),
+            AutonomyDecision::ApprovedFreshReview { review_hash }
+                if review_hash == "abc123"
+        ));
+    }
+
+    #[test]
+    fn non_value_moving_auto_approves() {
+        let mut p = Policy::default();
+        p.approval.agent_autonomy = Some(AgentAutonomyMode::UnderPolicy);
+        p.limits.max_tx_usd = Some("3".into());
+        p.limits.max_day_usd = Some("10".into());
+        let subject = AuthorizationSubject {
+            value_moving: false,
+            ..auth_subject(None)
+        };
+        assert!(matches!(
+            evaluate_action_authorization(&p, &[], &subject, None, None, AuthorizationSurface::Vfs,),
+            AutonomyDecision::ApprovedAutonomous { .. }
+        ));
+    }
+
+    #[test]
+    fn prompt_all_needs_review() {
+        let mut p = Policy::default();
+        p.approval.agent_autonomy = Some(AgentAutonomyMode::PromptAll);
+        p.limits.max_tx_usd = Some("3".into());
+        p.limits.max_day_usd = Some("10".into());
+        assert!(matches!(
+            evaluate_action_authorization(
+                &p, &[], &auth_subject(Some(1_000_000)),
+                Some(&budget()), None,
+                AuthorizationSurface::Vfs,
+            ),
+            AutonomyDecision::NeedsFreshReview { reason }
+                if reason.contains("prompt_all")
         ));
     }
 

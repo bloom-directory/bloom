@@ -1920,7 +1920,6 @@ pub async fn fund(d: &Daemon, args: FundArgs) -> Result<()> {
         "signing the staged funding tx(s) above (passkey review hash {}).",
         intent.intent_hash()
     );
-    let reviewed_intent_hash = intent.intent_hash();
     // Persist the full reviewed intent into each staged tx's outbox dir; the
     // pending → sent transition renames the dir, so the artifact rides along.
     if let Ok(bytes) = serde_json::to_vec_pretty(&intent) {
@@ -1953,7 +1952,6 @@ pub async fn fund(d: &Daemon, args: FundArgs) -> Result<()> {
                 &signer,
                 &info.policy,
                 &confirm_text,
-                Some(&reviewed_intent_hash),
             )
             .await
             .with_context(|| format!("confirm staged tx {id}"))
@@ -2127,7 +2125,6 @@ async fn transfer_pusd_to_funding(
         "signing the staged pUSD transfer above (passkey review hash {}).",
         intent.intent_hash()
     );
-    let reviewed_intent_hash = intent.intent_hash();
     // Persist the full reviewed intent into the staged tx's outbox dir so it
     // rides the pending → sent rename alongside the durable tx record.
     if let Ok(bytes) = serde_json::to_vec_pretty(&intent)
@@ -2159,7 +2156,6 @@ async fn transfer_pusd_to_funding(
             &signer,
             &info.policy,
             &confirm_text,
-            Some(&reviewed_intent_hash),
         )
         .await
         .with_context(|| format!("confirm staged tx {}", staged.id))

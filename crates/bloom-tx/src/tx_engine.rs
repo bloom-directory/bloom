@@ -1174,7 +1174,6 @@ impl TxEngine {
         signer: &PrivateKeySigner,
         policy: &Policy,
         confirm_text: &str,
-        reviewed_intent_hash: Option<&str>,
     ) -> Result<StagedTx, TxEngineError> {
         self.assert_write_permit(permit)?;
         let entry = self
@@ -1187,7 +1186,7 @@ impl TxEngine {
             .read_broadcast_attempt(&entry, BroadcastAttemptKind::Confirm)?
         {
             return self
-                .reconcile_confirm_attempt(&entry, attempt, chain, policy, reviewed_intent_hash)
+                .reconcile_confirm_attempt(&entry, attempt, chain, policy)
                 .await;
         }
 
@@ -1293,7 +1292,6 @@ impl TxEngine {
                 &entry,
                 &staged,
                 policy,
-                reviewed_intent_hash,
                 bloom_proto::AuthorizationSurface::Cli,
             )
             .await?;
@@ -1352,7 +1350,6 @@ impl TxEngine {
         attempt: BroadcastAttempt,
         chain: &ChainClient,
         policy: &Policy,
-        reviewed_intent_hash: Option<&str>,
     ) -> Result<StagedTx, TxEngineError> {
         let tx_hash: B256 = attempt
             .tx_hash
@@ -1442,7 +1439,6 @@ impl TxEngine {
                     entry,
                     &entry.staged,
                     policy,
-                    reviewed_intent_hash,
                     bloom_proto::AuthorizationSurface::Cli,
                 )
                 .await?;
@@ -1764,7 +1760,6 @@ impl TxEngine {
         entry: &crate::outbox::OutboxEntry,
         staged: &StagedTx,
         policy: &Policy,
-        _reviewed_intent_hash: Option<&str>,
         surface: bloom_proto::AuthorizationSurface,
     ) -> Result<(), TxEngineError> {
         let budget = self.budget_snapshot(&staged.wallet)?;
@@ -1798,13 +1793,14 @@ impl TxEngine {
                     .into(),
             ));
         }
-        let reviewed_intent_hash = Some(self.ensure_sealed_outbox_approval(entry, staged).await?);
+        let sealed_approval_intent_hash =
+            Some(self.ensure_sealed_outbox_approval(entry, staged).await?);
         match bloom_proto::evaluate_action_authorization(
             policy,
             &staged.policy_checks,
             &subject,
             Some(&budget),
-            reviewed_intent_hash.as_deref(),
+            sealed_approval_intent_hash.as_deref(),
             surface,
         ) {
             bloom_proto::AutonomyDecision::ApprovedFreshReview { .. }
@@ -1902,9 +1898,11 @@ impl TxEngine {
         .map_err(|e| {
             TxEngineError::BroadcastApprovalRequired(format!("write approval challenge: {e}"))
         })?;
-        Err(TxEngineError::BroadcastApprovalRequired(
-            "outbox confirm requires signed Sealed Approval; local password wallets can only auto-confirm actions that remain in policy".into(),
-        ))
+        Err(TxEngineError::BroadcastApprovalRequired(format!(
+            "outbox confirm requires signed Sealed Approval; wrote {} in {}; rerun the foreground confirm/write command with the passkey wallet to sign approval.json. local password wallets can only auto-confirm actions that remain in policy",
+            OUTBOX_APPROVAL_CHALLENGE_FILE,
+            entry.dir.display()
+        )))
     }
 
     fn authorization_subject(&self, staged: &StagedTx) -> bloom_proto::AuthorizationSubject {
@@ -2023,7 +2021,6 @@ impl TxEngine {
         signer: &PrivateKeySigner,
         bump_pct: u32,
         policy: &Policy,
-        reviewed_intent_hash: Option<&str>,
     ) -> Result<StagedTx, TxEngineError> {
         self.replace_with_intent(
             permit,
@@ -2036,7 +2033,6 @@ impl TxEngine {
             None,
             None,
             policy,
-            reviewed_intent_hash,
         )
         .await
     }
@@ -2061,7 +2057,6 @@ impl TxEngine {
         substitute: Option<RawIntent>,
         address_book: Option<&AddressBook>,
         policy: &Policy,
-        reviewed_intent_hash: Option<&str>,
     ) -> Result<StagedTx, TxEngineError> {
         self.assert_write_permit(permit)?;
         let bump = bump_pct.max(10);
@@ -2101,7 +2096,6 @@ impl TxEngine {
             &entry,
             &bumped,
             policy,
-            reviewed_intent_hash,
             bloom_proto::AuthorizationSurface::Cli,
         )
         .await?;
@@ -2155,7 +2149,6 @@ impl TxEngine {
         signer: &PrivateKeySigner,
         bump_pct: u32,
         policy: &Policy,
-        reviewed_intent_hash: Option<&str>,
     ) -> Result<StagedTx, TxEngineError> {
         self.assert_write_permit(permit)?;
         let bump = bump_pct.max(10);
@@ -2174,7 +2167,6 @@ impl TxEngine {
             &entry,
             &cancel_tx,
             policy,
-            reviewed_intent_hash,
             bloom_proto::AuthorizationSurface::Cli,
         )
         .await?;
@@ -2985,7 +2977,6 @@ mod tests {
                 &signer,
                 &policy,
                 "y",
-                None,
             )
             .await;
         match r {
@@ -3022,7 +3013,6 @@ mod tests {
                 &signer,
                 &policy,
                 "y",
-                None,
             )
             .await;
         match r {
@@ -3055,7 +3045,6 @@ mod tests {
                 &signer,
                 &policy,
                 "y",
-                None,
             )
             .await;
         assert!(r.is_err(), "unreachable public RPC should fail");
@@ -3112,7 +3101,6 @@ mod tests {
                 &signer,
                 &policy,
                 "y",
-                None,
             )
             .await;
         assert!(r.is_err(), "unreachable public RPC should fail");
@@ -3146,7 +3134,6 @@ mod tests {
                 &signer,
                 10,
                 &policy,
-                None,
             )
             .await;
         assert!(r.is_err(), "unreachable public RPC should fail");
@@ -3182,7 +3169,6 @@ mod tests {
                 &signer,
                 10,
                 &policy,
-                None,
             )
             .await;
         assert!(r.is_err(), "unreachable public RPC should fail");
@@ -3228,7 +3214,6 @@ mod tests {
                 &signer,
                 10,
                 &policy,
-                None,
             )
             .await;
         assert!(matches!(r, Err(TxEngineError::BroadcastDisabled(_))));
@@ -3264,7 +3249,6 @@ mod tests {
                 &signer,
                 10,
                 &policy,
-                None,
             )
             .await;
         assert!(matches!(r, Err(TxEngineError::BroadcastDisabled(_))));
@@ -3636,7 +3620,6 @@ mod tests {
                 &signer,
                 &policy,
                 "y",
-                None,
             )
             .await;
         assert!(matches!(r, Err(TxEngineError::PolicyDenied)));
@@ -3653,7 +3636,6 @@ mod tests {
                 &signer,
                 &policy,
                 "override",
-                None,
             )
             .await;
         assert!(matches!(r, Err(TxEngineError::PolicyDenied)));
@@ -3672,7 +3654,6 @@ mod tests {
                 &signer,
                 &policy,
                 "yolo",
-                None,
             )
             .await;
         match r {
@@ -3713,7 +3694,6 @@ mod tests {
                 &signer,
                 &policy,
                 "y",
-                None,
             )
             .await;
         assert!(
@@ -3764,7 +3744,6 @@ mod tests {
                 &signer,
                 &policy,
                 "y",
-                None,
             )
             .await;
         assert!(
@@ -3793,7 +3772,6 @@ mod tests {
                 &signer,
                 &policy,
                 "override",
-                None,
             )
             .await;
         match r {
@@ -3830,7 +3808,6 @@ mod tests {
                 &signer,
                 &policy,
                 "y",
-                None,
             )
             .await;
         assert!(
@@ -3849,7 +3826,6 @@ mod tests {
                 &signer,
                 &policy,
                 "y",
-                Some("reviewed"),
             )
             .await;
         assert!(
@@ -3909,7 +3885,6 @@ mod tests {
                 &signer,
                 &policy,
                 "y",
-                Some(legacy_hash),
             )
             .await;
         assert!(
@@ -3985,7 +3960,6 @@ mod tests {
                 &signer,
                 &policy,
                 "y",
-                None,
             )
             .await;
         match r {
@@ -4035,7 +4009,6 @@ mod tests {
                 &signer,
                 &policy,
                 "y",
-                None,
             )
             .await;
         match r {
@@ -4073,7 +4046,6 @@ mod tests {
                 &signer,
                 &policy,
                 "y",
-                None,
             )
             .await;
         assert!(
@@ -4097,7 +4069,6 @@ mod tests {
                 &signer,
                 &policy,
                 "y",
-                None,
             )
             .await;
         match r {
@@ -4301,5 +4272,34 @@ mod tests {
     fn enso_quote_age_none_for_missing_timestamp() {
         let hex = enso_hex(r#"{"Source":"Enso","Route":"0x1234"}"#);
         assert_eq!(enso_quote_age_secs(&hex, 1700000000), None);
+    }
+
+    #[test]
+    fn f64_to_micro_usd_normal() {
+        assert_eq!(f64_to_micro_usd(0.0), Some(0));
+        assert_eq!(f64_to_micro_usd(1.0), Some(1_000_000));
+        assert_eq!(f64_to_micro_usd(1.5), Some(1_500_000));
+    }
+
+    #[test]
+    fn f64_to_micro_usd_rejects_nan() {
+        assert_eq!(f64_to_micro_usd(f64::NAN), None);
+    }
+
+    #[test]
+    fn f64_to_micro_usd_rejects_infinity() {
+        assert_eq!(f64_to_micro_usd(f64::INFINITY), None);
+        assert_eq!(f64_to_micro_usd(f64::NEG_INFINITY), None);
+    }
+
+    #[test]
+    fn f64_to_micro_usd_rejects_negative() {
+        assert_eq!(f64_to_micro_usd(-1.0), None);
+        assert_eq!(f64_to_micro_usd(-0.001), None);
+    }
+
+    #[test]
+    fn f64_to_micro_usd_rejects_overflow() {
+        assert_eq!(f64_to_micro_usd(f64::MAX), None);
     }
 }

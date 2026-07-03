@@ -373,6 +373,7 @@ impl IpcServer {
         let info = keystore
             .info(wallet)
             .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?;
+        let passkey_wallet = info.kind == WalletKind::PasskeyGated;
         let mut sealed_approval_written = false;
         match info.kind {
             WalletKind::PasskeyGated => {
@@ -389,7 +390,6 @@ impl IpcServer {
                     keystore.root().parent().map(|home| home.join("outbox")),
                     keystore.raw_policy(wallet).ok().map(|(p, _)| p).as_deref(),
                 );
-                let _reviewed_intent_hash = intent.intent_hash();
                 if let Some(home) = keystore.root().parent() {
                     persist_outbox_review_intent(wallet, &path, &home.join("outbox"), &intent)
                         .map_err(|e| HandlerError::backend(e.to_string()))?;
@@ -480,7 +480,33 @@ impl IpcServer {
                     .into(),
             ));
         }
-        self.vfs.write(&path, &bytes).await
+        match self.vfs.write(&path, &bytes).await {
+            Ok(()) => Ok(()),
+            Err(first_err) if passkey_wallet && !sealed_approval_written => {
+                let signed = self
+                    .maybe_sign_sealed_approval(
+                        keystore,
+                        wallet,
+                        &path,
+                        &bytes,
+                        Some(write_unlocked_intent(
+                            wallet,
+                            &path,
+                            &bytes,
+                            Some(bloom_proto::checksum_address(&info.address)),
+                            keystore.root().parent().map(|home| home.join("outbox")),
+                            keystore.raw_policy(wallet).ok().map(|(p, _)| p).as_deref(),
+                        )),
+                    )
+                    .await?;
+                if signed {
+                    self.vfs.write(&path, &bytes).await
+                } else {
+                    Err(first_err)
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     async fn maybe_sign_sealed_approval(

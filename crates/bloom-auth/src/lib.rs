@@ -1504,6 +1504,89 @@ mod tests {
     }
 
     #[test]
+    fn challenge_cannot_be_reissued_after_nonce_consumed() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        let env = envelope();
+        store
+            .stage_entry(&env, AssuranceLevel::Standard, 100)
+            .unwrap();
+        store
+            .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
+            .unwrap();
+        let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
+        let sealed = store.sealed_intent(&entry.intent_hash).unwrap().unwrap();
+        let approval = approval_for(&entry, &sealed);
+        store
+            .consume_verified_approval_transactionally(&approval, 150)
+            .unwrap();
+
+        // After consumption the nonce is burned — re-challenging must fail.
+        let err = store
+            .issue_challenge("requests", "req_1", "nonce-2", 300, 200)
+            .unwrap_err();
+        assert!(err.to_string().contains("not challengeable"), "{err}");
+    }
+
+    #[test]
+    fn audit_log_chains_multiple_events() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+
+        // First entry + consume → genesis audit event.
+        let env_a = envelope_for("requests", "req_a");
+        store
+            .stage_entry(&env_a, AssuranceLevel::Standard, 100)
+            .unwrap();
+        store
+            .issue_challenge("requests", "req_a", "n-a", 500, 101)
+            .unwrap();
+        let entry_a = store.auth_entry("requests", "req_a").unwrap().unwrap();
+        let sealed_a = store.sealed_intent(&entry_a.intent_hash).unwrap().unwrap();
+        let mut approval_a = approval_for(&entry_a, &sealed_a);
+        approval_a.expiry_ms = 500;
+        store
+            .consume_verified_approval_transactionally(&approval_a, 150)
+            .unwrap();
+
+        // Second entry + consume → chained audit event.
+        let env_b = envelope_for("requests", "req_b");
+        store
+            .stage_entry(&env_b, AssuranceLevel::Standard, 200)
+            .unwrap();
+        store
+            .issue_challenge("requests", "req_b", "n-b", 500, 201)
+            .unwrap();
+        let entry_b = store.auth_entry("requests", "req_b").unwrap().unwrap();
+        let sealed_b = store.sealed_intent(&entry_b.intent_hash).unwrap().unwrap();
+        let mut approval_b = approval_for(&entry_b, &sealed_b);
+        approval_b.server_nonce = "n-b".into();
+        approval_b.expiry_ms = 500;
+        store
+            .consume_verified_approval_transactionally(&approval_b, 250)
+            .unwrap();
+
+        // Verify chain integrity.
+        let rows: Vec<(i64, String, String)> = store
+            .conn
+            .prepare("SELECT seq, prev_digest, digest FROM audit ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2, "expected two audit events");
+        assert_eq!(
+            rows[0].1,
+            "0".repeat(64),
+            "genesis prev_digest must be zero"
+        );
+        assert_eq!(
+            rows[1].1, rows[0].2,
+            "second event's prev_digest must chain to first event's digest"
+        );
+        assert_ne!(rows[0].2, rows[1].2);
+    }
+
+    #[test]
     fn inflated_expiry_approval_is_denied_and_does_not_burn_nonce() {
         let mut store = AuthStore::open_in_memory_for_tests().unwrap();
         let env = envelope();
@@ -1767,6 +1850,188 @@ mod tests {
 
         let replay = store.consume_verified_approval_transactionally(&approval, 151);
         assert!(replay.is_err());
+    }
+
+    // -------------------------------------------------------
+    // Cross-action replay: a review session issued for one
+    // action must NOT validate an approval for a different one.
+    // -------------------------------------------------------
+
+    fn envelope_for(surface: &str, action_id: &str) -> CanonicalEnvelope {
+        CanonicalEnvelope::new(
+            CanonicalIntentHeader {
+                schema: "bloom.intent_header.v1".into(),
+                wallet: "my-wallet".into(),
+                surface: surface.into(),
+                action_id: action_id.into(),
+                executor_id: "paid-http".into(),
+                network: "base".into(),
+                account: "default".into(),
+                action_kind: "x402_payment".into(),
+                value_movement: true,
+                authority_change: false,
+            },
+            "paid_http",
+            "paid_http.v1",
+            br#"{"amount":"1.00"}"#.to_vec(),
+        )
+    }
+
+    /// Stage a hardened entry, issue a challenge, and issue a review session.
+    fn stage_and_challenge(
+        store: &mut AuthStore,
+        surface: &str,
+        action_id: &str,
+        nonce: &str,
+        session_id: &str,
+    ) {
+        let env = envelope_for(surface, action_id);
+        store
+            .stage_entry(&env, AssuranceLevel::Hardened, 100)
+            .unwrap();
+        store
+            .issue_challenge(surface, action_id, nonce, 500, 101)
+            .unwrap();
+        store
+            .issue_review_session(session_id, surface, action_id, 500, 102)
+            .unwrap();
+    }
+
+    /// Build a hardened approval for the given entry + sealed intent.
+    fn hardened_approval(entry: &AuthEntryRecord, sealed: &SealedIntentRecord) -> Approval {
+        let mut a = approval_for(entry, sealed);
+        a.signer_kind = SignerKind::PasskeyCtap;
+        a.review_session_id = None;
+        a
+    }
+
+    #[test]
+    fn cross_action_replay_via_action_id_mismatch_rejected() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        // Action A gets a review session.
+        stage_and_challenge(&mut store, "requests", "req_1", "n1", "sess-A");
+        // Action B is a different action_id on the same surface.
+        stage_and_challenge(&mut store, "requests", "req_2", "n2", "sess-B");
+
+        let entry_b = store.auth_entry("requests", "req_2").unwrap().unwrap();
+        let sealed_b = store.sealed_intent(&entry_b.intent_hash).unwrap().unwrap();
+        let mut approval_b = hardened_approval(&entry_b, &sealed_b);
+        approval_b.expiry_ms = 500;
+        // Attacker: attach A's session to B's approval.
+        approval_b.review_session_id = Some("sess-A".into());
+
+        let err = store
+            .consume_verified_approval_transactionally(&approval_b, 200)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("review session does not match approval"),
+            "{err}"
+        );
+        // Session A must NOT be consumed.
+        assert_eq!(
+            store.review_session("sess-A").unwrap().unwrap().consumed_ms,
+            None
+        );
+    }
+
+    #[test]
+    fn cross_action_replay_via_surface_mismatch_rejected() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        stage_and_challenge(&mut store, "requests", "req_1", "n1", "sess-A");
+        stage_and_challenge(&mut store, "outbox", "tx_1", "n2", "sess-B");
+
+        let entry_b = store.auth_entry("outbox", "tx_1").unwrap().unwrap();
+        let sealed_b = store.sealed_intent(&entry_b.intent_hash).unwrap().unwrap();
+        let mut approval_b = hardened_approval(&entry_b, &sealed_b);
+        approval_b.expiry_ms = 500;
+        approval_b.review_session_id = Some("sess-A".into());
+
+        let err = store
+            .consume_verified_approval_transactionally(&approval_b, 200)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("review session does not match approval"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn review_session_expired_rejected() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        // Challenge TTL = 1000, but session TTL = 300.
+        let env = envelope_for("requests", "req_1");
+        store
+            .stage_entry(&env, AssuranceLevel::Hardened, 100)
+            .unwrap();
+        store
+            .issue_challenge("requests", "req_1", "n1", 1000, 101)
+            .unwrap();
+        store
+            .issue_review_session("sess-1", "requests", "req_1", 300, 102)
+            .unwrap();
+
+        let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
+        let sealed = store.sealed_intent(&entry.intent_hash).unwrap().unwrap();
+        let mut approval = hardened_approval(&entry, &sealed);
+        approval.expiry_ms = 1000;
+        approval.review_session_id = Some("sess-1".into());
+
+        // Consume at t=400 — approval is valid (400 < 1000) but session expired (400 >= 300).
+        let err = store
+            .consume_verified_approval_transactionally(&approval, 400)
+            .unwrap_err();
+        assert!(err.to_string().contains("review session expired"), "{err}");
+    }
+
+    #[test]
+    fn review_session_already_consumed_rejected() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        stage_and_challenge(&mut store, "requests", "req_1", "n1", "sess-1");
+
+        // Simulate a prior consume of the session (e.g. concurrent tx won the race).
+        store
+            .conn
+            .execute(
+                "UPDATE review_sessions SET consumed_ms = 150 WHERE review_session_id = 'sess-1'",
+                [],
+            )
+            .unwrap();
+
+        let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
+        let sealed = store.sealed_intent(&entry.intent_hash).unwrap().unwrap();
+        let mut approval = hardened_approval(&entry, &sealed);
+        approval.expiry_ms = 500;
+        approval.review_session_id = Some("sess-1".into());
+
+        let err = store
+            .consume_verified_approval_transactionally(&approval, 200)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("review session already consumed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn review_session_not_found_rejected() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        stage_and_challenge(&mut store, "requests", "req_1", "n1", "sess-1");
+
+        let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
+        let sealed = store.sealed_intent(&entry.intent_hash).unwrap().unwrap();
+        let mut approval = hardened_approval(&entry, &sealed);
+        approval.expiry_ms = 500;
+        approval.review_session_id = Some("nonexistent".into());
+
+        let err = store
+            .consume_verified_approval_transactionally(&approval, 200)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("review session not found"),
+            "{err}"
+        );
     }
 
     #[test]

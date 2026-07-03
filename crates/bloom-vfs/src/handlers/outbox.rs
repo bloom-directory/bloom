@@ -25,6 +25,7 @@ const ACTION_FILES: &[&str] = &[
     "plan.md",
     "policy_check.json",
     "challenge.json",
+    "approval_challenge.json",
     "approval.json",
     "status.json",
     "result.json",
@@ -159,7 +160,7 @@ impl Handler for OutboxHandler {
                             .map(|mtime| (mtime, e.file_name()))
                     })
                     .collect();
-                entries.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+                entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
                 let (_, name) = entries
                     .first()
                     .ok_or_else(|| HandlerError::NotFound("no pending actions".into()))?;
@@ -188,7 +189,11 @@ impl Handler for OutboxHandler {
                         "/outbox/{state}/{action_id}/{file}"
                     )));
                 }
-                Ok(Entry::writable_file(file))
+                if *file == "approval.json" && *state == "pending" {
+                    Ok(Entry::writable_file(file))
+                } else {
+                    Ok(Entry::file(file))
+                }
             }
             _ => Err(HandlerError::NotFound(path.to_string_path())),
         }
@@ -260,11 +265,23 @@ impl Handler for OutboxHandler {
                         "/outbox/{state}/{action_id}"
                     )));
                 }
-                let entries: Vec<Entry> = ACTION_FILES
-                    .iter()
-                    .filter(|f| dir.join(*f).exists())
-                    .map(|f| Entry::writable_file(f))
+                let mut entries: Vec<Entry> = std::fs::read_dir(&dir)
+                    .map_err(|e| HandlerError::backend(e.to_string()))?
+                    .filter_map(|e| e.ok())
+                    .map(|e| {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                            if state == &"pending" && name == "approval.json" {
+                                Entry::writable_file(&name)
+                            } else {
+                                Entry::file(&name)
+                            }
+                        } else {
+                            Entry::dir(&name)
+                        }
+                    })
                     .collect();
+                entries.sort_by(|a, b| a.name.cmp(&b.name));
                 Ok(entries)
             }
             _ => Err(HandlerError::NotADir(path.to_string_path())),
@@ -332,6 +349,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_challenge_is_visible_and_read_only() {
+        let h = handler();
+        h.outbox
+            .stage("act-approval", b"{}", "hash", "plan", b"[]")
+            .unwrap();
+        let dir = h.outbox.action_dir("pending", "act-approval");
+        std::fs::write(dir.join("approval_challenge.json"), b"{\"challenge\":true}").unwrap();
+        std::fs::write(dir.join("approval.json"), b"{}").unwrap();
+
+        let entries = h
+            .list(&VfsPath::parse("pending/act-approval").unwrap())
+            .await
+            .unwrap();
+        let challenge = entries
+            .iter()
+            .find(|entry| entry.name == "approval_challenge.json")
+            .expect("approval_challenge.json is listed");
+        assert_eq!(challenge.mode, 0o444);
+
+        let approval = entries
+            .iter()
+            .find(|entry| entry.name == "approval.json")
+            .expect("approval.json is listed");
+        assert_eq!(approval.mode, 0o644);
+
+        let p = VfsPath::parse("pending/act-approval/approval_challenge.json").unwrap();
+        let entry = h.lookup(&p).await.unwrap();
+        assert_eq!(entry.mode, 0o444);
+        assert!(h.write(&p, b"{}").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn approval_json_is_writable_only_while_pending() {
+        let h = handler();
+        h.outbox
+            .stage("act-sent", b"{}", "hash", "plan", b"[]")
+            .unwrap();
+        let pending_dir = h.outbox.action_dir("pending", "act-sent");
+        std::fs::write(pending_dir.join("approval.json"), b"{}").unwrap();
+        h.outbox.transition("act-sent", "pending", "sent").unwrap();
+
+        let p = VfsPath::parse("sent/act-sent/approval.json").unwrap();
+        let entry = h.lookup(&p).await.unwrap();
+        assert_eq!(entry.mode, 0o444);
+        assert!(h.write(&p, b"{}").await.is_err());
+    }
+
+    #[tokio::test]
     async fn transition_moves_action() {
         let h = handler();
         h.outbox
@@ -389,5 +454,46 @@ mod tests {
         let h = handler();
         let result = h.lookup(&VfsPath::parse("latest").unwrap()).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn latest_deterministic_on_same_mtime() {
+        let h = handler();
+        h.outbox
+            .stage("act-zeta", b"{}", "h1", "p1", b"[]")
+            .unwrap();
+        h.outbox
+            .stage("act-alpha", b"{}", "h2", "p2", b"[]")
+            .unwrap();
+
+        // Force identical mtimes so the secondary sort key (lexicographic
+        // ascending action_id) is the sole discriminator.
+        let fixed = std::time::SystemTime::UNIX_EPOCH;
+        for id in ["act-zeta", "act-alpha"] {
+            let p = h.outbox.action_dir("pending", id).join("intent.json");
+            let times = std::fs::FileTimes::new().set_modified(fixed);
+            if let Ok(f) = std::fs::File::open(&p) {
+                let _ = f.set_times(times);
+            }
+        }
+
+        let entry = h.lookup(&VfsPath::parse("latest").unwrap()).await.unwrap();
+        assert_eq!(
+            entry.name, "act-alpha",
+            "on identical mtime, tie-breaker is lexicographic ascending action_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_excludes_sent_and_failed() {
+        let h = handler();
+        h.outbox.stage("act-a", b"{}", "h1", "p1", b"[]").unwrap();
+        h.outbox.transition("act-a", "pending", "sent").unwrap();
+
+        let result = h.lookup(&VfsPath::parse("latest").unwrap()).await;
+        assert!(
+            result.is_err(),
+            "latest must not return actions that have transitioned out of pending"
+        );
     }
 }

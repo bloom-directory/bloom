@@ -603,16 +603,8 @@ fn parse_state_seg(s: &str) -> Result<OutboxState, HandlerError> {
     OutboxState::parse(s).ok_or_else(|| HandlerError::not_found(format!("outbox state '{}'", s)))
 }
 
-fn split_confirm_review_hash(confirm_text: &str) -> (&str, Option<&str>) {
-    let mut lines = confirm_text.lines();
-    let first = lines.next().unwrap_or(confirm_text).trim();
-    let review_hash = lines.find_map(|line| {
-        line.trim()
-            .strip_prefix("review_hash=")
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-    });
-    (first, review_hash)
+fn first_confirm_line(confirm_text: &str) -> &str {
+    confirm_text.lines().next().unwrap_or(confirm_text).trim()
 }
 
 #[async_trait]
@@ -1311,7 +1303,7 @@ impl WalletsHandler {
                         .map_err(err_be)?;
                     return Ok(());
                 }
-                let (confirm_text, reviewed_intent_hash) = split_confirm_review_hash(confirm_text);
+                let confirm_text = first_confirm_line(confirm_text);
                 let signer = self.keystore.signer(wallet).map_err(|e| {
                     HandlerError::invalid(format!(
                         "wallet '{wallet}' is locked.\n\
@@ -1324,8 +1316,8 @@ impl WalletsHandler {
                          For one-off actions:\n\
                          Daemon (bloom serve): unlock the wallet first, then write:\n\
                            bloom wallet unlock {wallet}\n\
-                         One-shot CLI: pass --unlock-wallet or --passphrase to the command:\n\
-                           bloom wallet confirm {wallet} <chain> <id> --unlock-wallet {wallet}\n\
+                         One-shot CLI: use wallet confirm or pass --unlock-wallet to vfs write:\n\
+                           bloom wallet confirm {wallet} <chain> <id>\n\
                            bloom vfs write /wallets/{wallet}/... --unlock-wallet {wallet}\n\
                          \n\
                          Underlying error: {e}"
@@ -1342,7 +1334,6 @@ impl WalletsHandler {
                         &signer,
                         &info.policy,
                         confirm_text,
-                        reviewed_intent_hash,
                     )
                     .await
                     .map_err(|e| match e {
@@ -1376,8 +1367,9 @@ impl WalletsHandler {
                           For one-off actions:\n\
                          Daemon (bloom serve): unlock the wallet first, then write:\n\
                            bloom wallet unlock {wallet}\n\
-                         One-shot CLI: pass --unlock-wallet or --passphrase to the command:\n\
-                           bloom wallet cancel {wallet} <chain> <id> --unlock-wallet {wallet}\n\
+                         One-shot CLI: use wallet cancel or pass --unlock-wallet to vfs write:\n\
+                           bloom wallet cancel {wallet} <chain> <id>\n\
+                           bloom vfs write /wallets/{wallet}/... --unlock-wallet {wallet}\n\
                          \n\
                          Underlying error: {e}"
                     ))
@@ -1393,7 +1385,6 @@ impl WalletsHandler {
                         &signer,
                         10,
                         &info.policy,
-                        None,
                     )
                     .await
                     .map_err(err_be)?;
@@ -1425,7 +1416,7 @@ impl WalletsHandler {
                          For one-off actions:\n\
                          Daemon (bloom serve): unlock the wallet first, then write:\n\
                            bloom wallet unlock {wallet}\n\
-                         One-shot CLI: pass --unlock-wallet or --passphrase to the command:\n\
+                         One-shot CLI: pass --unlock-wallet or --passphrase to vfs write:\n\
                            bloom vfs write /wallets/{wallet}/... --unlock-wallet {wallet}\n\
                          \n\
                          Underlying error: {e}"
@@ -1449,7 +1440,6 @@ impl WalletsHandler {
                         Some(intent),
                         Some(self.address_book.as_ref()),
                         &info.policy,
-                        None,
                     )
                     .await
                     .map_err(err_be)?;
@@ -1758,6 +1748,19 @@ mod tests {
                 return Err(AuthApiError::Denied("wrong surface".into()));
             }
             Ok(())
+        }
+    }
+
+    struct RejectingVerifier;
+
+    #[async_trait]
+    impl ApprovalVerifier for RejectingVerifier {
+        async fn verify_and_consume(
+            &self,
+            _approval: Approval,
+            _now_ms: u64,
+        ) -> Result<(), AuthApiError> {
+            Err(AuthApiError::Denied("test verifier rejects".into()))
         }
     }
 
@@ -2361,6 +2364,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_session_mint_fails_closed_when_verifier_rejects() {
+        let mut f = make_handler();
+        f.handler = f.handler.with_auth_services(AuthServices::new(
+            Some(Arc::new(RejectingVerifier)),
+            None,
+            Some(Arc::new(ChallengeOnlyWriter)),
+        ));
+        let new_p = VfsPath::parse("/alice/policy-session/new").unwrap();
+        let body =
+            br#"{"max_usd":10,"ttl_secs":600,"pending_ids":[{"chain_id":42161,"id":"0001-a"}]}"#;
+        let action_id = policy_session_action_id("alice", body);
+        let approval_dir = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-session")
+            .join(&action_id);
+        std::fs::create_dir_all(&approval_dir).unwrap();
+        write_json(
+            approval_dir.join(APPROVAL_FILE),
+            &Approval {
+                schema: APPROVAL_SCHEMA_V1.into(),
+                wallet: "alice".into(),
+                surface: "policy-session".into(),
+                action_id: action_id.clone(),
+                intent_hash: "policy-session-intent".into(),
+                executor_id: "wallet-policy-session".into(),
+                network: "multi-chain".into(),
+                assurance: AssuranceLevel::Hardened,
+                server_nonce: "nonce-1".into(),
+                caps: ApprovalCaps::default(),
+                expiry_ms: now_ms_u64() + 60_000,
+                signer_kind: SignerKind::Test,
+                credential_id: None,
+                review_session_id: None,
+                signature: ApprovalSignature::Test {
+                    sig_hex: "00".into(),
+                },
+            },
+        )
+        .unwrap();
+
+        // Verifier rejects → write must error and NO session is minted.
+        let err = f.handler.write(&new_p, body).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Sealed Approval rejected"),
+            "{err}"
+        );
+        let sessions = f.handler.tx_engine.session_store().active(now_ms());
+        assert!(
+            sessions.iter().all(|s| s.wallet != "alice"),
+            "no session should be minted when the verifier rejects"
+        );
+    }
+
+    #[tokio::test]
     async fn capability_confirm_path_uses_real_chain_segment() {
         let mut f = make_handler();
         f.handler = f.handler.with_auth_services(AuthServices::new(
@@ -2520,14 +2580,9 @@ mod tests {
     }
 
     #[test]
-    fn confirm_review_hash_metadata_is_split_from_confirm_text() {
-        let (confirm, hash) = split_confirm_review_hash("y\nreview_hash=abc123\n");
-        assert_eq!(confirm, "y");
-        assert_eq!(hash, Some("abc123"));
-
-        let (confirm, hash) = split_confirm_review_hash("override");
-        assert_eq!(confirm, "override");
-        assert_eq!(hash, None);
+    fn confirm_text_uses_first_line_only() {
+        assert_eq!(first_confirm_line("y\nreview_hash=abc123\n"), "y");
+        assert_eq!(first_confirm_line("override"), "override");
     }
 
     /// Fix #2 + #10: writing `outbox/sent/<id>/confirm` is not a valid

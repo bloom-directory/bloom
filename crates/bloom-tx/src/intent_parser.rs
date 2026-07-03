@@ -527,4 +527,27 @@ chain = "ethereum"
             _ => panic!("wrong variant"),
         }
     }
+
+    #[test]
+    fn json_intent_preserves_usd_value_hint() {
+        let r = parse(r#"{"to":"0xabc","usd_value_hint":"5.0","chain":"base"}"#).unwrap();
+        assert_eq!(r.usd_value_hint.as_deref(), Some("5.0"));
+    }
+
+    #[test]
+    fn toml_intent_preserves_usd_value_hint() {
+        let r = parse(
+            r#"to = "0xabc"
+chain = "base"
+usd_value_hint = "42.5""#,
+        )
+        .unwrap();
+        assert_eq!(r.usd_value_hint.as_deref(), Some("42.5"));
+    }
+
+    #[test]
+    fn shell_send_has_no_usd_value_hint() {
+        let r = parse("send 1 eth to 0xabc on base").unwrap();
+        assert!(r.usd_value_hint.is_none());
+    }
 }

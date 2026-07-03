@@ -18,10 +18,15 @@ mod commands {
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use bloom_auth_api::{
+    APPROVAL_SCHEMA_V1, Approval, ApprovalCaps, AssuranceLevel, ChallengeRecord, SignerKind,
+    UnsignedApproval,
+};
 use bloom_daemon::Daemon;
 use bloom_daemon::ipc::{IpcClient, IpcServer, default_socket_path};
 use bloom_hyperliquid::{
@@ -30,6 +35,7 @@ use bloom_hyperliquid::{
     sign_submit_payload,
 };
 use bloom_proto::{AuditRecord, CeremonyIntent, CeremonyIntentKind, HomeDir, HomeWritePermit};
+use bloom_tx::TxEngineError;
 use bloom_vfs::{VfsPath, handler::Handler};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
@@ -2051,7 +2057,8 @@ async fn run(cli: Cli) -> Result<()> {
             let text = String::from_utf8(body).expect("wallet confirm text originated as UTF-8");
             let (home_permit, d) = build_write_daemon(home)?;
             let info = d.keystore.info(&wallet)?;
-            let mut reviewed_intent_hash: Option<String> = None;
+            let passkey_wallet = info.kind == bloom_keystore::WalletKind::PasskeyGated;
+            let mut approval_intent: Option<CeremonyIntent> = None;
             match info.kind {
                 bloom_keystore::WalletKind::PasskeyGated => {
                     // Build the review intent from the staged outbox entry. An
@@ -2068,7 +2075,7 @@ async fn run(cli: Cli) -> Result<()> {
                             let data_hash = blake3::hash(s.data_hex.as_bytes()).to_hex();
                             let mut it = CeremonyIntent::new(
                                 &wallet,
-                                "Sign Polygon Transaction",
+                                format!("Sign {} Transaction", s.chain),
                                 CeremonyIntentKind::EvmTransaction,
                             )
                             .with_address(&s.from)
@@ -2105,7 +2112,7 @@ async fn run(cli: Cli) -> Result<()> {
                                     &bytes,
                                 );
                             }
-                            reviewed_intent_hash = Some(it.intent_hash());
+                            approval_intent = Some(it.clone());
                             it
                         });
                     d.keystore.lock(&wallet);
@@ -2124,9 +2131,8 @@ async fn run(cli: Cli) -> Result<()> {
                 .chains
                 .get(&chain)
                 .with_context(|| format!("chain '{}'", chain))?;
-            let staged = d
-                .tx_engine
-                .confirm(
+            let confirm_once = || {
+                d.tx_engine.confirm(
                     &home_permit,
                     &wallet,
                     &chain,
@@ -2135,9 +2141,27 @@ async fn run(cli: Cli) -> Result<()> {
                     &signer,
                     &info.policy,
                     &text,
-                    reviewed_intent_hash.as_deref(),
                 )
-                .await?;
+            };
+            let staged = match confirm_once().await {
+                Ok(staged) => staged,
+                Err(TxEngineError::BroadcastApprovalRequired(reason)) if passkey_wallet => {
+                    if sign_outbox_sealed_approval_if_challenged(
+                        &d,
+                        &wallet,
+                        &chain,
+                        &id,
+                        approval_intent.clone(),
+                    )
+                    .await?
+                    {
+                        confirm_once().await?
+                    } else {
+                        return Err(TxEngineError::BroadcastApprovalRequired(reason).into());
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            };
             println!(
                 "broadcast {} hash={}",
                 staged.id,
@@ -2230,7 +2254,8 @@ async fn run(cli: Cli) -> Result<()> {
                 entries.push(entry);
             }
 
-            let mut reviewed_intent_hash: Option<String> = None;
+            let mut approval_intent: Option<CeremonyIntent> = None;
+            let passkey_wallet = info.kind == bloom_keystore::WalletKind::PasskeyGated;
             match info.kind {
                 bloom_keystore::WalletKind::PasskeyGated => {
                     if !policy_session {
@@ -2293,7 +2318,6 @@ async fn run(cli: Cli) -> Result<()> {
                     }));
 
                     let review_bytes = serde_json::to_vec_pretty(&intent)?;
-                    let hash = intent.intent_hash();
                     for entry in &entries {
                         let _ = d.tx_engine.outbox.write_artefact(
                             &entry.dir,
@@ -2303,9 +2327,9 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                     d.keystore.lock(&wallet);
                     d.keystore
-                        .unlock_passkey_with_intent(&wallet, Some(intent))
+                        .unlock_passkey_with_intent(&wallet, Some(intent.clone()))
                         .await?;
-                    reviewed_intent_hash = Some(hash);
+                    approval_intent = Some(intent);
                 }
                 _ => {
                     d.keystore
@@ -2320,9 +2344,8 @@ async fn run(cli: Cli) -> Result<()> {
                     .chains
                     .get(&chain)
                     .with_context(|| format!("chain '{}'", chain))?;
-                let staged = d
-                    .tx_engine
-                    .confirm(
+                let confirm_once = || {
+                    d.tx_engine.confirm(
                         &home_permit,
                         &wallet,
                         &chain,
@@ -2331,10 +2354,33 @@ async fn run(cli: Cli) -> Result<()> {
                         &signer,
                         &info.policy,
                         &text,
-                        reviewed_intent_hash.as_deref(),
                     )
-                    .await
-                    .with_context(|| format!("confirm {chain}:{id}"))?;
+                };
+                let staged = match confirm_once().await {
+                    Ok(staged) => staged,
+                    Err(TxEngineError::BroadcastApprovalRequired(reason)) if passkey_wallet => {
+                        if sign_outbox_sealed_approval_if_challenged(
+                            &d,
+                            &wallet,
+                            &chain,
+                            &id,
+                            approval_intent.clone(),
+                        )
+                        .await
+                        .with_context(|| format!("sign Sealed Approval for {chain}:{id}"))?
+                        {
+                            confirm_once()
+                                .await
+                                .with_context(|| format!("confirm {chain}:{id}"))?
+                        } else {
+                            return Err(TxEngineError::BroadcastApprovalRequired(reason).into());
+                        }
+                    }
+                    Err(e) => {
+                        return Err(anyhow::Error::from(e))
+                            .with_context(|| format!("confirm {chain}:{id}"));
+                    }
+                };
                 println!(
                     "broadcast {}:{} hash={}",
                     chain,
@@ -2991,6 +3037,122 @@ fn outbox_confirm_unlock_intent(
         "defi_plan_blake3": defi_review.as_ref().map(|review| review.plan_hash.as_str()),
     });
     Some(intent)
+}
+
+async fn sign_outbox_sealed_approval_if_challenged(
+    d: &Daemon,
+    wallet: &str,
+    chain: &str,
+    id: &str,
+    intent: Option<CeremonyIntent>,
+) -> Result<bool> {
+    let entry = d
+        .tx_engine
+        .outbox
+        .read(wallet, chain, id)
+        .with_context(|| format!("read pending outbox entry {wallet}/{chain}/{id}"))?;
+    let challenge_path = entry.dir.join("approval_challenge.json");
+    if !challenge_path.exists() {
+        return Ok(false);
+    }
+
+    let challenge: ChallengeRecord = serde_json::from_slice(
+        &std::fs::read(&challenge_path)
+            .with_context(|| format!("read {}", challenge_path.display()))?,
+    )
+    .with_context(|| format!("parse {}", challenge_path.display()))?;
+    let sealed = d
+        .auth_services
+        .require_store()
+        .context("Sealed Approval auth store is not wired")?
+        .sealed_intent(&challenge.intent_hash)
+        .await
+        .context("read sealed intent for approval challenge")?;
+
+    let review_session_id = if challenge.assurance == AssuranceLevel::Hardened {
+        let review_session_id = sealed_review_session_id(&challenge);
+        d.auth_services
+            .require_writer()
+            .context("Sealed Approval auth store writer is not wired")?
+            .issue_review_session(
+                &review_session_id,
+                &challenge.surface,
+                &challenge.action_id,
+                challenge.expiry_ms,
+                cli_now_ms(),
+            )
+            .await
+            .context("issue hardened review session")?;
+        Some(review_session_id)
+    } else {
+        None
+    };
+
+    let unsigned = UnsignedApproval {
+        schema: APPROVAL_SCHEMA_V1.into(),
+        wallet: wallet.to_string(),
+        surface: challenge.surface.clone(),
+        action_id: challenge.action_id.clone(),
+        intent_hash: challenge.intent_hash.clone(),
+        executor_id: sealed.envelope.header.executor_id.clone(),
+        network: sealed.envelope.header.network.clone(),
+        assurance: challenge.assurance,
+        server_nonce: challenge.server_nonce.clone(),
+        caps: ApprovalCaps::default(),
+        expiry_ms: challenge.expiry_ms,
+        signer_kind: SignerKind::PasskeyBrowser,
+        credential_id: None,
+        review_session_id,
+    };
+    let signature = d
+        .keystore
+        .sign_approval_with_passkey(wallet, &unsigned, intent)
+        .await
+        .context("sign Sealed Approval with passkey")?;
+    let approval = Approval {
+        schema: unsigned.schema,
+        wallet: unsigned.wallet,
+        surface: unsigned.surface,
+        action_id: unsigned.action_id,
+        intent_hash: unsigned.intent_hash,
+        executor_id: unsigned.executor_id,
+        network: unsigned.network,
+        assurance: unsigned.assurance,
+        server_nonce: unsigned.server_nonce,
+        caps: unsigned.caps,
+        expiry_ms: unsigned.expiry_ms,
+        signer_kind: unsigned.signer_kind,
+        credential_id: unsigned.credential_id,
+        review_session_id: unsigned.review_session_id,
+        signature,
+    };
+    let approval_path = entry.dir.join("approval.json");
+    std::fs::write(
+        &approval_path,
+        serde_json::to_vec_pretty(&approval).context("encode Sealed Approval")?,
+    )
+    .with_context(|| format!("write {}", approval_path.display()))?;
+    Ok(true)
+}
+
+fn sealed_review_session_id(challenge: &ChallengeRecord) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.review_session.v1");
+    hasher.update(challenge.surface.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(challenge.action_id.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(challenge.intent_hash.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(challenge.server_nonce.as_bytes());
+    format!("review-{}", hasher.finalize().to_hex())
+}
+
+fn cli_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[derive(Debug, Clone)]

@@ -219,7 +219,7 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
 
     let confirmed = engine
         .confirm(
-            &permit, "alice", "anvil", &staged.id, &chain, &signer, &policy, "y", None,
+            &permit, "alice", "anvil", &staged.id, &chain, &signer, &policy, "y",
         )
         .await
         .map_err(|e| anyhow!("confirm: {e}"))?;
@@ -228,7 +228,7 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
     // Replace with +15% fees.
     let replaced = engine
         .replace(
-            &permit, "alice", "anvil", &staged.id, &chain, &signer, 15, &policy, None,
+            &permit, "alice", "anvil", &staged.id, &chain, &signer, 15, &policy,
         )
         .await
         .map_err(|e| anyhow!("replace: {e}"))?;

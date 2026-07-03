@@ -2656,4 +2656,30 @@ mod approval_uv_tests {
             "{err}"
         );
     }
+
+    #[tokio::test]
+    async fn cross_wallet_approval_reuse_rejected() {
+        let td = tempfile::tempdir().unwrap();
+        let ks = crate::Keystore::new(td.path()).unwrap();
+        let signing_a = wallet_with_software_credential(td.path(), "wallet-a");
+        let _signing_b = wallet_with_software_credential(td.path(), "wallet-b");
+
+        // Sign an approval for wallet-a.
+        let unsigned_a = unsigned_approval("wallet-a", AssuranceLevel::Hardened);
+        let signature_a = assertion_with_flags(&signing_a, &unsigned_a, UP | UV);
+
+        // Attempt to verify it against wallet-b — the challenge hash is derived
+        // from the unsigned payload (which includes the wallet name), so the
+        // assertion must not cross-verify.
+        let unsigned_b = unsigned_approval("wallet-b", AssuranceLevel::Hardened);
+        let err = ks
+            .verify_approval_signature_with_passkey(&unsigned_b, &signature_a)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("challenge does not match")
+                || err.to_string().contains("finish_passkey_authentication"),
+            "{err}"
+        );
+    }
 }

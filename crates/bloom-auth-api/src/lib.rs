@@ -773,6 +773,109 @@ mod tests {
         assert_ne!(with_domain, no_domain.finalize().to_hex().to_string());
     }
 
+    // ------------------------------------------------------------------
+    // Field-binding tests: mutating every header / envelope field must
+    // produce a different intent_hash.
+    // ------------------------------------------------------------------
+
+    /// Build a baseline envelope for mutation tests.
+    fn baseline_envelope() -> CanonicalEnvelope {
+        CanonicalEnvelope::new(
+            header(),
+            "paid_http",
+            "paid_http.v1",
+            br#"{"a":1}"#.to_vec(),
+        )
+    }
+
+    /// Assert that mutating exactly one header field changes the hash.
+    fn assert_hash_changes<F: FnOnce(&mut CanonicalIntentHeader)>(mutate: F) {
+        let original = baseline_envelope();
+        let mut h = header();
+        mutate(&mut h);
+        let modified =
+            CanonicalEnvelope::new(h, "paid_http", "paid_http.v1", br#"{"a":1}"#.to_vec());
+        assert_ne!(
+            original.intent_hash().unwrap(),
+            modified.intent_hash().unwrap(),
+        );
+    }
+
+    #[test]
+    fn intent_hash_binds_wallet() {
+        assert_hash_changes(|h| h.wallet = "other-wallet".into());
+    }
+
+    #[test]
+    fn intent_hash_binds_surface() {
+        assert_hash_changes(|h| h.surface = "outbox".into());
+    }
+
+    #[test]
+    fn intent_hash_binds_action_id() {
+        assert_hash_changes(|h| h.action_id = "req_2".into());
+    }
+
+    #[test]
+    fn intent_hash_binds_executor_id() {
+        assert_hash_changes(|h| h.executor_id = "evm".into());
+    }
+
+    #[test]
+    fn intent_hash_binds_network() {
+        assert_hash_changes(|h| h.network = "ethereum".into());
+    }
+
+    #[test]
+    fn intent_hash_binds_account() {
+        assert_hash_changes(|h| h.account = "trading".into());
+    }
+
+    #[test]
+    fn intent_hash_binds_action_kind() {
+        assert_hash_changes(|h| h.action_kind = "erc20_transfer".into());
+    }
+
+    #[test]
+    fn intent_hash_binds_value_movement() {
+        assert_hash_changes(|h| h.value_movement = false);
+    }
+
+    #[test]
+    fn intent_hash_binds_authority_change() {
+        assert_hash_changes(|h| h.authority_change = true);
+    }
+
+    #[test]
+    fn intent_hash_binds_subject_bytes() {
+        let original = baseline_envelope();
+        let modified = CanonicalEnvelope::new(
+            header(),
+            "paid_http",
+            "paid_http.v1",
+            br#"{"a":2}"#.to_vec(),
+        );
+        assert_ne!(
+            original.intent_hash().unwrap(),
+            modified.intent_hash().unwrap(),
+        );
+    }
+
+    #[test]
+    fn intent_hash_binds_subject_schema() {
+        let original = baseline_envelope();
+        let modified = CanonicalEnvelope::new(
+            header(),
+            "paid_http",
+            "paid_http.v2",
+            br#"{"a":1}"#.to_vec(),
+        );
+        assert_ne!(
+            original.intent_hash().unwrap(),
+            modified.intent_hash().unwrap(),
+        );
+    }
+
     #[test]
     fn approval_challenge_commits_to_assurance() {
         let mut a = UnsignedApproval {
