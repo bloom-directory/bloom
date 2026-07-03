@@ -28,7 +28,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use bloom_auth_api::{
-    APPROVAL_SCHEMA_V1, Approval, ApprovalCaps, ChallengeRecord, SignerKind, UnsignedApproval,
+    ApprovalChallenge, SignedApproval, SignerTransport, UnsignedApproval,
 };
 use bloom_keystore::{Keystore, WalletKind};
 use bloom_petals::{Capability, PetalError, PetalRunner, RunOptions, VfsHost};
@@ -526,14 +526,22 @@ impl IpcServer {
             return Ok(false);
         }
         let challenge_body = std::fs::read(&challenge_path)?;
-        let challenge: ChallengeRecord = serde_json::from_slice(&challenge_body)
+        let challenge: ApprovalChallenge = serde_json::from_slice(&challenge_body)
             .map_err(|e| HandlerError::backend(format!("read approval challenge: {e}")))?;
+        // Fail fast if the challenge does not refer to a real sealed action
+        // for this wallet; full binding is re-verified at consume time.
         let sealed = self
             .auth_services
             .require_store()?
             .sealed_intent(&challenge.intent_hash)
             .await
             .map_err(|e| HandlerError::backend(format!("read sealed intent: {e}")))?;
+        if sealed.envelope.header.wallet != wallet {
+            return Err(HandlerError::backend(format!(
+                "approval challenge wallet mismatch: sealed action belongs to '{}'",
+                sealed.envelope.header.wallet
+            )));
+        }
         let review_session_id = if challenge.assurance == bloom_auth_api::AssuranceLevel::Hardened {
             let review_session_id = hardened_review_session_id(&challenge);
             self.auth_services
@@ -551,43 +559,19 @@ impl IpcServer {
         } else {
             None
         };
-        let unsigned = UnsignedApproval {
-            schema: APPROVAL_SCHEMA_V1.into(),
-            wallet: wallet.to_string(),
-            surface: challenge.surface.clone(),
-            action_id: challenge.action_id.clone(),
-            intent_hash: challenge.intent_hash.clone(),
-            executor_id: sealed.envelope.header.executor_id.clone(),
-            network: sealed.envelope.header.network.clone(),
-            assurance: challenge.assurance,
-            server_nonce: challenge.server_nonce.clone(),
-            caps: ApprovalCaps::default(),
-            expiry_ms: challenge.expiry_ms,
-            signer_kind: SignerKind::PasskeyBrowser,
-            credential_id: None,
+        // Echo every daemon-issued challenge field faithfully (§5.7 step 10);
+        // any drift is rejected at consume time.
+        let unsigned = UnsignedApproval::for_challenge(
+            &challenge,
+            SignerTransport::BrowserWebauthn,
+            None,
             review_session_id,
-        };
+        );
         let signature = keystore
             .sign_approval_with_passkey(wallet, &unsigned, intent)
             .await
             .map_err(|e| HandlerError::backend(format!("sign Sealed Approval: {e}")))?;
-        let approval = Approval {
-            schema: unsigned.schema,
-            wallet: unsigned.wallet,
-            surface: unsigned.surface,
-            action_id: unsigned.action_id,
-            intent_hash: unsigned.intent_hash,
-            executor_id: unsigned.executor_id,
-            network: unsigned.network,
-            assurance: unsigned.assurance,
-            server_nonce: unsigned.server_nonce,
-            caps: unsigned.caps,
-            expiry_ms: unsigned.expiry_ms,
-            signer_kind: unsigned.signer_kind,
-            credential_id: unsigned.credential_id,
-            review_session_id: unsigned.review_session_id,
-            signature,
-        };
+        let approval: SignedApproval = unsigned.into_signed(signature);
         if let Some(parent) = approval_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -1130,7 +1114,7 @@ fn safe_sealed_approval_segment(raw: &str) -> Option<String> {
     Some(raw.to_string())
 }
 
-fn hardened_review_session_id(challenge: &ChallengeRecord) -> String {
+fn hardened_review_session_id(challenge: &ApprovalChallenge) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bloom.review_session.v1");
     hasher.update(challenge.surface.as_bytes());

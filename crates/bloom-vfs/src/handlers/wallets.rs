@@ -28,7 +28,8 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bloom_auth_api::{
-    Approval, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, ChallengeRecord,
+    ApprovalChallenge, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, ExecutorKind,
+    SignedApproval, petal_identity,
 };
 use bloom_chain::ChainRegistry;
 use bloom_keystore::Keystore;
@@ -449,7 +450,7 @@ impl WalletsHandler {
             .join(&action_id)
             .join(APPROVAL_FILE);
         if approval_path.exists() {
-            let approval: Approval = read_json(&approval_path)?;
+            let approval: SignedApproval = read_json(&approval_path)?;
             self.auth_services
                 .require_approval_verifier()?
                 .verify_and_consume(approval, now_ms_u64())
@@ -469,7 +470,7 @@ impl WalletsHandler {
     async fn issue_policy_session_challenge(
         &self,
         action_id: &str,
-    ) -> Result<ChallengeRecord, HandlerError> {
+    ) -> Result<ApprovalChallenge, HandlerError> {
         let now = now_ms_u64();
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
@@ -580,16 +581,25 @@ fn policy_session_canonical_envelope(
     .map_err(|e| HandlerError::backend(e.to_string()))?;
     Ok(CanonicalEnvelope::new(
         CanonicalIntentHeader {
-            schema: "bloom.intent_header.v1".into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
             wallet: wallet.to_string(),
             surface: "policy-session".into(),
             action_id: action_id.to_string(),
-            executor_id: "wallet-policy-session".into(),
+            petal_id: petal_identity::PETAL_ID_WALLET_POLICY.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_WALLET_POLICY.into(),
+            petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+            executor_kind: ExecutorKind::FirstParty,
             network: "multi-chain".into(),
             account: "default".into(),
             action_kind: "policy_session_mint".into(),
             value_movement: false,
             authority_change: true,
+            // Staged on every write attempt for the same descriptor bytes, so
+            // this must stay deterministic (a clock-derived expiry would make
+            // re-sealing collide with the already-sealed entry).
+            // TODO(ws-K): commit a real expiry when the wallet-policy petal
+            // computes venue terms.
+            expires_ms: 0,
         },
         "policy_session",
         "bloom.policy_session_subject.v1",
@@ -1717,8 +1727,9 @@ mod tests {
     use super::*;
     use alloy::primitives::{Address, B256, Signature};
     use bloom_auth_api::{
-        APPROVAL_SCHEMA_V1, ApprovalCaps, ApprovalSignature, ApprovalVerifier, AuthApiError,
-        AuthEntryRecord, AuthEntryState, AuthStoreWriter, NonceState, SignerKind,
+        APPROVAL_CHALLENGE_SCHEMA_V1, APPROVAL_SCHEMA_V1, ApprovalSignature, ApprovalVerifier,
+        AuthApiError, AuthEntryRecord, AuthEntryState, AuthStoreWriter, NonceState,
+        SignerTransport,
     };
     use bloom_proto::AddressBook;
     use bloom_tx::outbox::Outbox;
@@ -1741,7 +1752,7 @@ mod tests {
     impl ApprovalVerifier for AcceptingVerifier {
         async fn verify_and_consume(
             &self,
-            approval: Approval,
+            approval: SignedApproval,
             _now_ms: u64,
         ) -> Result<(), AuthApiError> {
             if approval.surface != "policy-session" {
@@ -1757,7 +1768,7 @@ mod tests {
     impl ApprovalVerifier for RejectingVerifier {
         async fn verify_and_consume(
             &self,
-            _approval: Approval,
+            _approval: SignedApproval,
             _now_ms: u64,
         ) -> Result<(), AuthApiError> {
             Err(AuthApiError::Denied("test verifier rejects".into()))
@@ -1793,13 +1804,20 @@ mod tests {
             server_nonce: &str,
             expiry_ms: u64,
             _now_ms: u64,
-        ) -> Result<ChallengeRecord, AuthApiError> {
-            Ok(ChallengeRecord {
-                surface: surface.to_string(),
+        ) -> Result<ApprovalChallenge, AuthApiError> {
+            Ok(ApprovalChallenge {
+                schema: APPROVAL_CHALLENGE_SCHEMA_V1.to_string(),
                 action_id: action_id.to_string(),
+                wallet: "alice".to_string(),
+                surface: surface.to_string(),
+                petal_id: petal_identity::PETAL_ID_WALLET_POLICY.to_string(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_WALLET_POLICY.to_string(),
                 intent_hash: "policy-session-intent".to_string(),
                 server_nonce: server_nonce.to_string(),
                 assurance: AssuranceLevel::Hardened,
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
                 expiry_ms,
             })
         }
@@ -2220,19 +2238,21 @@ mod tests {
         std::fs::create_dir_all(&approval_dir).unwrap();
         write_json(
             approval_dir.join(APPROVAL_FILE),
-            &Approval {
+            &SignedApproval {
                 schema: APPROVAL_SCHEMA_V1.into(),
                 wallet: "alice".into(),
                 surface: "policy-session".into(),
                 action_id: action_id.clone(),
                 intent_hash: "policy-session-intent".into(),
-                executor_id: "wallet-policy-session".into(),
-                network: "multi-chain".into(),
+                petal_id: petal_identity::PETAL_ID_WALLET_POLICY.into(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_WALLET_POLICY.into(),
                 assurance: AssuranceLevel::Hardened,
                 server_nonce: "nonce-1".into(),
-                caps: ApprovalCaps::default(),
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
                 expiry_ms: now_ms_u64() + 60_000,
-                signer_kind: SignerKind::Test,
+                signer_transport: SignerTransport::BrowserWebauthn,
                 credential_id: None,
                 review_session_id: None,
                 signature: ApprovalSignature::Test {
@@ -2305,7 +2325,7 @@ mod tests {
             .join("policy-session")
             .join(&action_id)
             .join(APPROVAL_CHALLENGE_FILE);
-        let challenge: ChallengeRecord = read_json(challenge_path).unwrap();
+        let challenge: ApprovalChallenge = read_json(challenge_path).unwrap();
         assert_eq!(challenge.surface, "policy-session");
         assert_eq!(challenge.action_id, action_id);
         assert_eq!(challenge.intent_hash, "policy-session-intent");
@@ -2334,19 +2354,21 @@ mod tests {
         std::fs::create_dir_all(&approval_dir).unwrap();
         write_json(
             approval_dir.join(APPROVAL_FILE),
-            &Approval {
+            &SignedApproval {
                 schema: APPROVAL_SCHEMA_V1.into(),
                 wallet: "alice".into(),
                 surface: "policy-session".into(),
                 action_id: action_id.clone(),
                 intent_hash: "policy-session-intent".into(),
-                executor_id: "wallet-policy-session".into(),
-                network: "multi-chain".into(),
+                petal_id: petal_identity::PETAL_ID_WALLET_POLICY.into(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_WALLET_POLICY.into(),
                 assurance: AssuranceLevel::Hardened,
                 server_nonce: "nonce-1".into(),
-                caps: ApprovalCaps::default(),
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
                 expiry_ms: now_ms_u64() + 60_000,
-                signer_kind: SignerKind::Test,
+                signer_transport: SignerTransport::BrowserWebauthn,
                 credential_id: None,
                 review_session_id: None,
                 signature: ApprovalSignature::Test {
@@ -2385,19 +2407,21 @@ mod tests {
         std::fs::create_dir_all(&approval_dir).unwrap();
         write_json(
             approval_dir.join(APPROVAL_FILE),
-            &Approval {
+            &SignedApproval {
                 schema: APPROVAL_SCHEMA_V1.into(),
                 wallet: "alice".into(),
                 surface: "policy-session".into(),
                 action_id: action_id.clone(),
                 intent_hash: "policy-session-intent".into(),
-                executor_id: "wallet-policy-session".into(),
-                network: "multi-chain".into(),
+                petal_id: petal_identity::PETAL_ID_WALLET_POLICY.into(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_WALLET_POLICY.into(),
                 assurance: AssuranceLevel::Hardened,
                 server_nonce: "nonce-1".into(),
-                caps: ApprovalCaps::default(),
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
                 expiry_ms: now_ms_u64() + 60_000,
-                signer_kind: SignerKind::Test,
+                signer_transport: SignerTransport::BrowserWebauthn,
                 credential_id: None,
                 review_session_id: None,
                 signature: ApprovalSignature::Test {
@@ -2459,19 +2483,21 @@ mod tests {
         std::fs::create_dir_all(&approval_dir).unwrap();
         write_json(
             approval_dir.join(APPROVAL_FILE),
-            &Approval {
+            &SignedApproval {
                 schema: APPROVAL_SCHEMA_V1.into(),
                 wallet: "alice".into(),
                 surface: "policy-session".into(),
                 action_id: action_id.clone(),
                 intent_hash: "policy-session-intent".into(),
-                executor_id: "wallet-policy-session".into(),
-                network: "multi-chain".into(),
+                petal_id: petal_identity::PETAL_ID_WALLET_POLICY.into(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_WALLET_POLICY.into(),
                 assurance: AssuranceLevel::Hardened,
                 server_nonce: "nonce-1".into(),
-                caps: ApprovalCaps::default(),
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
                 expiry_ms: now_ms_u64() + 60_000,
-                signer_kind: SignerKind::Test,
+                signer_transport: SignerTransport::BrowserWebauthn,
                 credential_id: None,
                 review_session_id: None,
                 signature: ApprovalSignature::Test {

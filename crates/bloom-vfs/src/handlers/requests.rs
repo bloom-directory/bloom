@@ -10,7 +10,8 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bloom_auth_api::{
-    Approval, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, ChallengeRecord,
+    ApprovalChallenge, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, ExecutorKind,
+    SignedApproval, petal_identity,
 };
 use bloom_keystore::Keystore;
 use bloom_paid_http::{
@@ -454,7 +455,7 @@ impl RequestsHandler {
         }
         let approval_path = pending.join(APPROVAL_FILE);
         if approval_path.exists() {
-            let approval: Approval = read_json(&approval_path)?;
+            let approval: SignedApproval = read_json(&approval_path)?;
             self.auth_services
                 .require_approval_verifier()?
                 .verify_and_consume(approval, now_ms())
@@ -471,7 +472,7 @@ impl RequestsHandler {
     async fn issue_sealed_confirm_challenge(
         &self,
         id: &str,
-    ) -> Result<ChallengeRecord, HandlerError> {
+    ) -> Result<ApprovalChallenge, HandlerError> {
         let now = now_ms();
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
@@ -1562,16 +1563,23 @@ fn paid_http_canonical_envelope(
     .map_err(|e| HandlerError::backend(e.to_string()))?;
     Ok(CanonicalEnvelope::new(
         CanonicalIntentHeader {
-            schema: "bloom.intent_header.v1".into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
             wallet: input.wallet.to_string(),
             surface: "requests".into(),
             action_id: input.id.to_string(),
-            executor_id: "paid-http".into(),
+            petal_id: petal_identity::PETAL_ID_PAID_HTTP.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_PAID_HTTP.into(),
+            petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+            executor_kind: ExecutorKind::FirstParty,
             network,
             account: "default".into(),
             action_kind: "paid_http_confirm".into(),
             value_movement: true,
             authority_change: false,
+            // Must stay deterministic if the same request is re-sealed.
+            // TODO(ws-G): commit a real confirm expiry when paid-http staging
+            // computes venue terms.
+            expires_ms: 0,
         },
         "paid_http",
         "bloom.paid_http_subject.v1",
@@ -1584,8 +1592,9 @@ mod tests {
     use super::*;
     use crate::path::VfsPath;
     use bloom_auth_api::{
-        APPROVAL_SCHEMA_V1, ApprovalCaps, ApprovalSignature, ApprovalVerifier, AuthApiError,
-        AuthEntryRecord, AuthEntryState, AuthStoreWriter, NonceState, SignerKind,
+        APPROVAL_CHALLENGE_SCHEMA_V1, APPROVAL_SCHEMA_V1, ApprovalSignature, ApprovalVerifier,
+        AuthApiError, AuthEntryRecord, AuthEntryState, AuthStoreWriter, NonceState,
+        SignerTransport,
     };
     use bloom_paid_mpp::PaymentExecution;
     use bloom_paid_x402::X402PaymentCredential;
@@ -1617,7 +1626,7 @@ mod tests {
     impl ApprovalVerifier for AcceptingVerifier {
         async fn verify_and_consume(
             &self,
-            approval: Approval,
+            approval: SignedApproval,
             _now_ms: u64,
         ) -> Result<(), AuthApiError> {
             if approval.surface != "requests" {
@@ -1657,13 +1666,20 @@ mod tests {
             server_nonce: &str,
             expiry_ms: u64,
             _now_ms: u64,
-        ) -> Result<ChallengeRecord, AuthApiError> {
-            Ok(ChallengeRecord {
-                surface: surface.to_string(),
+        ) -> Result<ApprovalChallenge, AuthApiError> {
+            Ok(ApprovalChallenge {
+                schema: APPROVAL_CHALLENGE_SCHEMA_V1.to_string(),
                 action_id: action_id.to_string(),
+                wallet: "alice".to_string(),
+                surface: surface.to_string(),
+                petal_id: petal_identity::PETAL_ID_PAID_HTTP.to_string(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_PAID_HTTP.to_string(),
                 intent_hash: "abc123".to_string(),
                 server_nonce: server_nonce.to_string(),
                 assurance: AssuranceLevel::Standard,
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
                 expiry_ms,
             })
         }
@@ -1741,7 +1757,11 @@ mod tests {
         .unwrap();
         assert_eq!(env.header.surface, "requests");
         assert_eq!(env.header.action_id, "req_1");
-        assert_eq!(env.header.executor_id, "paid-http");
+        assert_eq!(env.header.petal_id, petal_identity::PETAL_ID_PAID_HTTP);
+        assert_eq!(
+            env.header.petal_digest,
+            petal_identity::PLACEHOLDER_DIGEST_PAID_HTTP
+        );
         assert_eq!(env.header.network, "base");
         assert_eq!(env.subject_kind, "paid_http");
         let hash1 = env.intent_hash().unwrap();
@@ -2015,19 +2035,21 @@ mod tests {
 
         write_json(
             pending.join(APPROVAL_FILE),
-            &Approval {
+            &SignedApproval {
                 schema: APPROVAL_SCHEMA_V1.into(),
                 wallet: "alice".into(),
                 surface: "requests".into(),
                 action_id: "req_retry_fail".into(),
                 intent_hash: "abc123".into(),
-                executor_id: "paid-http".into(),
-                network: "base".into(),
+                petal_id: petal_identity::PETAL_ID_PAID_HTTP.into(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_PAID_HTTP.into(),
                 assurance: AssuranceLevel::Standard,
                 server_nonce: "nonce".into(),
-                caps: ApprovalCaps::default(),
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
                 expiry_ms: now_ms() + 60_000,
-                signer_kind: SignerKind::Test,
+                signer_transport: SignerTransport::BrowserWebauthn,
                 credential_id: None,
                 review_session_id: None,
                 signature: ApprovalSignature::Test {
@@ -2097,7 +2119,8 @@ mod tests {
         let err = handler.confirm("req_sealed", b"confirm").await.unwrap_err();
         assert!(matches!(err, HandlerError::PermissionDenied), "{err}");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        let challenge: ChallengeRecord = read_json(pending.join(APPROVAL_CHALLENGE_FILE)).unwrap();
+        let challenge: ApprovalChallenge =
+            read_json(pending.join(APPROVAL_CHALLENGE_FILE)).unwrap();
         assert_eq!(challenge.surface, "requests");
         assert_eq!(challenge.action_id, "req_sealed");
         assert_eq!(challenge.intent_hash, "abc123");
@@ -2151,19 +2174,21 @@ mod tests {
         fs::write(pending.join("status"), "pending\n").unwrap();
         write_json(
             pending.join(APPROVAL_FILE),
-            &Approval {
+            &SignedApproval {
                 schema: APPROVAL_SCHEMA_V1.into(),
                 wallet: "alice".into(),
                 surface: "requests".into(),
                 action_id: "req_sealed_ok".into(),
                 intent_hash: "abc123".into(),
-                executor_id: "paid-http".into(),
-                network: "base".into(),
+                petal_id: petal_identity::PETAL_ID_PAID_HTTP.into(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_PAID_HTTP.into(),
                 assurance: AssuranceLevel::Standard,
                 server_nonce: "nonce-1".into(),
-                caps: ApprovalCaps::default(),
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
                 expiry_ms: now_ms() + 60_000,
-                signer_kind: SignerKind::Test,
+                signer_transport: SignerTransport::BrowserWebauthn,
                 credential_id: None,
                 review_session_id: None,
                 signature: ApprovalSignature::Test {

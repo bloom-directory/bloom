@@ -16,8 +16,8 @@ use alloy::sol_types::SolCall;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bloom_auth_api::{
-    Approval, ApprovalVerifier, AssuranceLevel, AuthEntryState, AuthStoreWriter, CanonicalEnvelope,
-    CanonicalIntentHeader, NonceState,
+    ApprovalVerifier, AssuranceLevel, AuthEntryState, AuthStoreWriter, CanonicalEnvelope,
+    CanonicalIntentHeader, ExecutorKind, NonceState, SignedApproval, petal_identity,
 };
 use bloom_chain::{ChainClient, ChainError, IERC20, NftKind};
 
@@ -1855,7 +1855,7 @@ impl TxEngine {
             let approval_body = std::fs::read(&approval_path).map_err(|e| {
                 TxEngineError::BroadcastApprovalRequired(format!("read approval.json: {e}"))
             })?;
-            let approval: Approval = serde_json::from_slice(&approval_body).map_err(|e| {
+            let approval: SignedApproval = serde_json::from_slice(&approval_body).map_err(|e| {
                 TxEngineError::BroadcastApprovalRequired(format!(
                     "stored approval.json is invalid: {e}"
                 ))
@@ -2297,16 +2297,23 @@ fn outbox_canonical_envelope(staged: &StagedTx) -> Result<CanonicalEnvelope, TxE
     .map_err(|e| TxEngineError::BroadcastApprovalRequired(format!("encode outbox subject: {e}")))?;
     Ok(CanonicalEnvelope::new(
         CanonicalIntentHeader {
-            schema: "bloom.intent_header.v1".into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
             wallet: staged.wallet.clone(),
             surface: "outbox".into(),
             action_id: outbox_action_id(staged),
-            executor_id: "evm-broadcast".into(),
+            petal_id: petal_identity::PETAL_ID_EVM_WALLET.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+            petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+            executor_kind: ExecutorKind::FirstParty,
             network: staged.chain.clone(),
             account: staged.from.clone(),
             action_kind: "evm_confirm".into(),
             value_movement: true,
             authority_change: false,
+            // Deterministic per staged tx (persisted at staging), so
+            // re-sealing on a retried confirm reproduces the same envelope
+            // bytes. `0` = staged without an explicit expiry.
+            expires_ms: u64::try_from(staged.expires_ms).unwrap_or(u64::MAX),
         },
         "outbox",
         "bloom.outbox_subject.v1",
@@ -2473,8 +2480,8 @@ mod tests {
 
     use super::*;
     use bloom_auth_api::{
-        APPROVAL_SCHEMA_V1, ApprovalCaps, ApprovalSignature, AuthApiError, AuthEntryRecord,
-        AuthEntryState, ChallengeRecord, NonceState, SignerKind,
+        APPROVAL_CHALLENGE_SCHEMA_V1, APPROVAL_SCHEMA_V1, ApprovalChallenge, ApprovalSignature,
+        AuthApiError, AuthEntryRecord, AuthEntryState, NonceState, SignerTransport,
     };
     use bloom_proto::TxStatus;
 
@@ -2484,7 +2491,7 @@ mod tests {
     impl ApprovalVerifier for RejectingTestVerifier {
         async fn verify_and_consume(
             &self,
-            _approval: Approval,
+            _approval: SignedApproval,
             _now_ms: u64,
         ) -> Result<(), AuthApiError> {
             Err(AuthApiError::Denied("test verifier rejects".into()))
@@ -2497,7 +2504,7 @@ mod tests {
     impl ApprovalVerifier for AcceptingTestVerifier {
         async fn verify_and_consume(
             &self,
-            approval: Approval,
+            approval: SignedApproval,
             _now_ms: u64,
         ) -> Result<(), AuthApiError> {
             if approval.surface != "outbox" {
@@ -2537,13 +2544,20 @@ mod tests {
             server_nonce: &str,
             expiry_ms: u64,
             _now_ms: u64,
-        ) -> Result<ChallengeRecord, AuthApiError> {
-            Ok(ChallengeRecord {
-                surface: surface.to_string(),
+        ) -> Result<ApprovalChallenge, AuthApiError> {
+            Ok(ApprovalChallenge {
+                schema: APPROVAL_CHALLENGE_SCHEMA_V1.to_string(),
                 action_id: action_id.to_string(),
+                wallet: "alice".to_string(),
+                surface: surface.to_string(),
+                petal_id: petal_identity::PETAL_ID_EVM_WALLET.to_string(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_EVM_WALLET.to_string(),
                 intent_hash: "outbox-intent".to_string(),
                 server_nonce: server_nonce.to_string(),
                 assurance: AssuranceLevel::Standard,
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
                 expiry_ms,
             })
         }
@@ -2599,7 +2613,7 @@ mod tests {
             _server_nonce: &str,
             _expiry_ms: u64,
             _now_ms: u64,
-        ) -> Result<ChallengeRecord, AuthApiError> {
+        ) -> Result<ApprovalChallenge, AuthApiError> {
             Err(AuthApiError::Denied(
                 "pre-approved retry must not issue a new challenge".into(),
             ))
@@ -3891,7 +3905,7 @@ mod tests {
             matches!(r, Err(TxEngineError::BroadcastApprovalRequired(ref e)) if e.contains("Sealed Approval")),
             "expected Sealed Approval challenge refusal, got {r:?}"
         );
-        let challenge: ChallengeRecord = serde_json::from_slice(
+        let challenge: ApprovalChallenge = serde_json::from_slice(
             &std::fs::read(entry.dir.join(OUTBOX_APPROVAL_CHALLENGE_FILE)).unwrap(),
         )
         .unwrap();
@@ -3927,19 +3941,21 @@ mod tests {
             .write_artefact(
                 &entry.dir,
                 OUTBOX_APPROVAL_FILE,
-                &serde_json::to_vec_pretty(&Approval {
+                &serde_json::to_vec_pretty(&SignedApproval {
                     schema: APPROVAL_SCHEMA_V1.into(),
+                    action_id: outbox_action_id(&staged),
                     wallet: "alice".into(),
                     surface: "outbox".into(),
-                    action_id: outbox_action_id(&staged),
+                    petal_id: petal_identity::PETAL_ID_EVM_WALLET.into(),
+                    petal_digest: petal_identity::PLACEHOLDER_DIGEST_EVM_WALLET.into(),
                     intent_hash: "outbox-intent".into(),
-                    executor_id: "evm-broadcast".into(),
-                    network: "anvil".into(),
-                    assurance: AssuranceLevel::Standard,
                     server_nonce: "nonce-1".into(),
-                    caps: ApprovalCaps::default(),
+                    assurance: AssuranceLevel::Standard,
+                    daemon_terms_digest: "1".repeat(64),
+                    petal_policy_digest: "2".repeat(64),
+                    policy_version: 0,
                     expiry_ms: now_ms() as u64 + 60_000,
-                    signer_kind: SignerKind::Test,
+                    signer_transport: SignerTransport::BrowserWebauthn,
                     credential_id: None,
                     review_session_id: None,
                     signature: ApprovalSignature::Test {

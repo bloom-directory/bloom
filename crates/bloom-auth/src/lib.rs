@@ -7,11 +7,11 @@
 
 use async_trait::async_trait;
 use bloom_auth_api::{
-    Approval, ApprovalCredentialRecord, ApprovalSignature, ApprovalSignatureVerifier,
-    ApprovalVerifier, AssuranceLevel, AuthApiError, AuthEntryRecord, AuthEntryState, AuthStoreView,
-    AuthStoreWriter, CanonicalEnvelope, ChallengeRecord, NonceState, PriceOracle,
-    ReservationRecord, ReservationState, ReviewSessionRecord, SealedIntentRecord, SignerKind,
-    UnsignedApproval, ValuationPolicy, ValuationQuote,
+    APPROVAL_CHALLENGE_SCHEMA_V1, ApprovalChallenge, ApprovalCredentialRecord, ApprovalSignature,
+    ApprovalSignatureVerifier, ApprovalVerifier, AssuranceLevel, AuthApiError, AuthEntryRecord,
+    AuthEntryState, AuthStoreView, AuthStoreWriter, CanonicalEnvelope, NonceState, PriceOracle,
+    ReservationRecord, ReservationState, ReviewSessionRecord, SealedAction, SealedIntentRecord,
+    SignedApproval, SignerKind, UnsignedApproval, ValuationPolicy, ValuationQuote,
 };
 use bloom_prices::{CoinId, PricesClient};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -154,13 +154,22 @@ impl AuthStore {
         Ok(())
     }
 
+    /// Create/upgrade the schema.
+    ///
+    /// The sealed-action columns were added for `bloom.sealed_action.v1`
+    /// (WS-0). Upgrading an existing database adds them as NULL: legacy
+    /// pending rows become void by design (challenge issuance and approval
+    /// consumption fail closed on NULL sealed-action metadata; the action is
+    /// simply re-stageable), while consumed-nonce history is untouched so
+    /// replay denial survives the migration.
     fn migrate(conn: &Connection) -> Result<(), AuthStoreError> {
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS sealed_intents (
                 intent_hash TEXT PRIMARY KEY NOT NULL,
                 envelope_json TEXT NOT NULL,
-                sealed_at_ms INTEGER NOT NULL
+                sealed_at_ms INTEGER NOT NULL,
+                sealed_action_json TEXT
             );
 
             CREATE TABLE IF NOT EXISTS auth_entries (
@@ -174,6 +183,12 @@ impl AuthStore {
                 challenge_expiry_ms INTEGER,
                 reservation_id TEXT,
                 updated_ms INTEGER NOT NULL,
+                wallet TEXT,
+                petal_id TEXT,
+                petal_digest TEXT,
+                daemon_terms_digest TEXT,
+                petal_policy_digest TEXT,
+                policy_version INTEGER,
                 PRIMARY KEY(surface, action_id)
             );
 
@@ -247,6 +262,38 @@ impl AuthStore {
             );
             "#,
         )?;
+        // Upgrade pre-sealed-action databases in place. `CREATE TABLE IF NOT
+        // EXISTS` above only covers fresh databases; existing tables gain the
+        // new columns here (NULL for legacy rows → fail closed, re-stageable).
+        Self::add_column_if_missing(conn, "sealed_intents", "sealed_action_json", "TEXT")?;
+        for (column, decl) in [
+            ("wallet", "TEXT"),
+            ("petal_id", "TEXT"),
+            ("petal_digest", "TEXT"),
+            ("daemon_terms_digest", "TEXT"),
+            ("petal_policy_digest", "TEXT"),
+            ("policy_version", "INTEGER"),
+        ] {
+            Self::add_column_if_missing(conn, "auth_entries", column, decl)?;
+        }
+        Ok(())
+    }
+
+    fn add_column_if_missing(
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        decl: &str,
+    ) -> Result<(), AuthStoreError> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(());
+            }
+        }
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
         Ok(())
     }
 
@@ -337,26 +384,56 @@ impl AuthStore {
         Ok(intent_hash)
     }
 
+    /// Stage an envelope with restrictive default daemon terms and an empty
+    /// Petal policy snapshot.
+    // TODO(ws-F..ws-K): converted venue staging should call [`Self::stage_action`]
+    // with real plan/policy_checks/terms/snapshot instead.
     pub fn stage_entry(
         &mut self,
         envelope: &CanonicalEnvelope,
         assurance: AssuranceLevel,
         now_ms: u64,
     ) -> Result<AuthEntryRecord, AuthStoreError> {
+        let action = SealedAction::seal_with_default_terms(envelope.clone(), assurance, now_ms)
+            .map_err(AuthStoreError::from_api)?;
+        self.stage_action(&action, now_ms)
+    }
+
+    /// Stage a fully-populated [`SealedAction`] (schema
+    /// `bloom.sealed_action.v1`) and its auth entry.
+    ///
+    /// Idempotent for a byte-identical re-stage of the same
+    /// `(surface, action_id)`; fails closed when an entry already exists for
+    /// a different intent, assurance, or sealed daemon context.
+    pub fn stage_action(
+        &mut self,
+        action: &SealedAction,
+        now_ms: u64,
+    ) -> Result<AuthEntryRecord, AuthStoreError> {
+        action.validate().map_err(AuthStoreError::from_api)?;
+        let envelope = &action.envelope;
         let intent_hash = envelope.intent_hash().map_err(AuthStoreError::from_api)?;
+        let assurance = action.daemon_terms.assurance;
+        let daemon_terms_digest = action
+            .daemon_terms_digest()
+            .map_err(AuthStoreError::from_api)?;
         let envelope_json = serde_json::to_string(envelope)?;
+        let action_json = serde_json::to_string(action)?;
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT OR IGNORE INTO sealed_intents(intent_hash, envelope_json, sealed_at_ms)
-             VALUES (?1, ?2, ?3)",
-            params![intent_hash, envelope_json, now_ms as i64],
+            "INSERT OR IGNORE INTO sealed_intents(
+                intent_hash, envelope_json, sealed_at_ms, sealed_action_json
+             )
+             VALUES (?1, ?2, ?3, ?4)",
+            params![intent_hash, envelope_json, now_ms as i64, action_json],
         )?;
         tx.execute(
             "INSERT OR IGNORE INTO auth_entries(
                 surface, action_id, state, intent_hash, assurance, nonce, nonce_state,
-                reservation_id, updated_ms
+                reservation_id, updated_ms, wallet, petal_id, petal_digest,
+                daemon_terms_digest, petal_policy_digest, policy_version
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, ?7)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ",
             params![
                 envelope.header.surface,
@@ -366,8 +443,35 @@ impl AuthStore {
                 assurance.as_str(),
                 NonceState::Unused.as_str(),
                 now_ms as i64,
+                envelope.header.wallet,
+                envelope.header.petal_id,
+                envelope.header.petal_digest,
+                daemon_terms_digest,
+                action.petal_policy_digest,
+                action.policy_version as i64,
             ],
         )?;
+        // Fail closed if the same (surface, action_id) is already staged with
+        // a different sealed daemon context (INSERT OR IGNORE keeps the first
+        // writer; a divergent re-stage must not silently alias it).
+        let (existing_terms_digest, existing_policy_digest, existing_policy_version): (
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+        ) = tx.query_row(
+            "SELECT daemon_terms_digest, petal_policy_digest, policy_version
+             FROM auth_entries WHERE surface = ?1 AND action_id = ?2",
+            params![envelope.header.surface, envelope.header.action_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        if existing_terms_digest.as_deref() != Some(daemon_terms_digest.as_str())
+            || existing_policy_digest.as_deref() != Some(action.petal_policy_digest.as_str())
+            || existing_policy_version != Some(action.policy_version as i64)
+        {
+            return Err(AuthStoreError::Denied(
+                "auth entry already exists for different sealed daemon context".into(),
+            ));
+        }
         tx.commit()?;
         let entry = self
             .auth_entry(&envelope.header.surface, &envelope.header.action_id)?
@@ -380,6 +484,10 @@ impl AuthStore {
         Ok(entry)
     }
 
+    /// Issue the full §5.7 [`ApprovalChallenge`] preimage for a staged entry.
+    ///
+    /// Fails closed for entries staged before the sealed-action schema (NULL
+    /// petal/digest columns): those actions are void and must be re-staged.
     pub fn issue_challenge(
         &mut self,
         surface: &str,
@@ -387,17 +495,70 @@ impl AuthStore {
         server_nonce: &str,
         expiry_ms: u64,
         now_ms: u64,
-    ) -> Result<ChallengeRecord, AuthStoreError> {
+    ) -> Result<ApprovalChallenge, AuthStoreError> {
         let tx = self.conn.transaction()?;
-        let (intent_hash, assurance): (String, String) = tx
+        type PendingEntryRow = (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+        );
+        let row: PendingEntryRow = tx
             .query_row(
-                "SELECT intent_hash, assurance FROM auth_entries
+                "SELECT intent_hash, assurance, wallet, petal_id, petal_digest,
+                        daemon_terms_digest, petal_policy_digest, policy_version
+                 FROM auth_entries
                  WHERE surface = ?1 AND action_id = ?2 AND nonce_state = 'unused'",
                 params![surface, action_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
             )
             .optional()?
             .ok_or_else(|| AuthStoreError::Denied("entry is not challengeable".into()))?;
+        let (
+            intent_hash,
+            assurance,
+            wallet,
+            petal_id,
+            petal_digest,
+            daemon_terms_digest,
+            petal_policy_digest,
+            policy_version,
+        ) = row;
+        let (
+            Some(wallet),
+            Some(petal_id),
+            Some(petal_digest),
+            Some(daemon_terms_digest),
+            Some(petal_policy_digest),
+            Some(policy_version),
+        ) = (
+            wallet,
+            petal_id,
+            petal_digest,
+            daemon_terms_digest,
+            petal_policy_digest,
+            policy_version,
+        )
+        else {
+            return Err(AuthStoreError::Denied(
+                "entry predates the sealed-action schema and is void; re-stage the action".into(),
+            ));
+        };
         tx.execute(
             "UPDATE auth_entries
              SET state = ?3, nonce = ?4, nonce_state = ?5, challenge_expiry_ms = ?6, updated_ms = ?7
@@ -413,12 +574,19 @@ impl AuthStore {
             ],
         )?;
         tx.commit()?;
-        Ok(ChallengeRecord {
-            surface: surface.to_string(),
+        Ok(ApprovalChallenge {
+            schema: APPROVAL_CHALLENGE_SCHEMA_V1.to_string(),
             action_id: action_id.to_string(),
+            wallet,
+            surface: surface.to_string(),
+            petal_id,
+            petal_digest,
             intent_hash,
             server_nonce: server_nonce.to_string(),
             assurance: parse_assurance(&assurance)?,
+            daemon_terms_digest,
+            petal_policy_digest,
+            policy_version: policy_version as u64,
             expiry_ms,
         })
     }
@@ -647,19 +815,28 @@ impl AuthStore {
 
     pub fn consume_verified_approval_transactionally(
         &mut self,
-        approval: &Approval,
+        approval: &SignedApproval,
         now_ms: u64,
     ) -> Result<(), AuthStoreError> {
         let tx = self.conn.transaction()?;
-        let (entry_intent_hash, entry_assurance, entry_nonce, nonce_state, challenge_expiry_ms): (
+        #[allow(clippy::type_complexity)]
+        let row: (
             String,
             String,
             Option<String>,
             String,
             Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
         ) = tx
             .query_row(
-                "SELECT intent_hash, assurance, nonce, nonce_state, challenge_expiry_ms
+                "SELECT intent_hash, assurance, nonce, nonce_state, challenge_expiry_ms,
+                        wallet, petal_id, petal_digest, daemon_terms_digest,
+                        petal_policy_digest, policy_version
                  FROM auth_entries
                  WHERE surface = ?1 AND action_id = ?2",
                 params![approval.surface, approval.action_id],
@@ -670,11 +847,30 @@ impl AuthStore {
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
                     ))
                 },
             )
             .optional()?
             .ok_or_else(|| AuthStoreError::Denied("entry not found".into()))?;
+        let (
+            entry_intent_hash,
+            entry_assurance,
+            entry_nonce,
+            nonce_state,
+            challenge_expiry_ms,
+            entry_wallet,
+            entry_petal_id,
+            entry_petal_digest,
+            entry_daemon_terms_digest,
+            entry_petal_policy_digest,
+            entry_policy_version,
+        ) = row;
         if entry_intent_hash != approval.intent_hash {
             return Err(AuthStoreError::Denied("entry intent_hash mismatch".into()));
         }
@@ -693,24 +889,75 @@ impl AuthStore {
         // exactly the expiry that was persisted when the challenge was minted,
         // otherwise a compromised client could inflate the window and bank a
         // signed approval for later execution.
-        if challenge_expiry_ms != Some(approval.expiry_ms as i64) {
+        let Some(challenge_expiry_ms) = challenge_expiry_ms else {
+            return Err(AuthStoreError::Denied(
+                "entry has no issued challenge".into(),
+            ));
+        };
+        if challenge_expiry_ms != approval.expiry_ms as i64 {
             return Err(AuthStoreError::Denied(
                 "approval expiry does not match issued challenge".into(),
             ));
         }
-        let (envelope_json, sealed_at_ms): (String, i64) = tx.query_row(
-            "SELECT envelope_json, sealed_at_ms FROM sealed_intents WHERE intent_hash = ?1",
-            params![approval.intent_hash],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        // Rebuild the exact daemon-issued challenge (§5.7 step 3). Entries
+        // staged before the sealed-action schema have NULL petal/digest
+        // metadata and fail closed here; they are re-stageable by design.
+        let (
+            Some(wallet),
+            Some(petal_id),
+            Some(petal_digest),
+            Some(daemon_terms_digest),
+            Some(petal_policy_digest),
+            Some(policy_version),
+        ) = (
+            entry_wallet,
+            entry_petal_id,
+            entry_petal_digest,
+            entry_daemon_terms_digest,
+            entry_petal_policy_digest,
+            entry_policy_version,
+        )
+        else {
+            return Err(AuthStoreError::Denied(
+                "entry predates the sealed-action schema and is void; re-stage the action".into(),
+            ));
+        };
+        let issued = ApprovalChallenge {
+            schema: APPROVAL_CHALLENGE_SCHEMA_V1.to_string(),
+            action_id: approval.action_id.clone(),
+            wallet,
+            surface: approval.surface.clone(),
+            petal_id,
+            petal_digest,
+            intent_hash: entry_intent_hash,
+            server_nonce: approval.server_nonce.clone(),
+            assurance: parse_assurance(&entry_assurance)?,
+            daemon_terms_digest,
+            petal_policy_digest,
+            policy_version: policy_version as u64,
+            expiry_ms: challenge_expiry_ms as u64,
+        };
+        let (envelope_json, sealed_at_ms, sealed_action_json): (String, i64, Option<String>) = tx
+            .query_row(
+                "SELECT envelope_json, sealed_at_ms, sealed_action_json
+                 FROM sealed_intents WHERE intent_hash = ?1",
+                params![approval.intent_hash],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
         let envelope: CanonicalEnvelope = serde_json::from_str(&envelope_json)?;
+        let action: Option<SealedAction> = sealed_action_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?;
         approval
             .validate_against_sealed(
                 &SealedIntentRecord {
                     intent_hash: approval.intent_hash.clone(),
                     envelope,
                     sealed_at_ms: sealed_at_ms as u64,
+                    action,
                 },
+                &issued,
                 now_ms,
             )
             .map_err(AuthStoreError::from_api)?;
@@ -772,6 +1019,10 @@ impl AuthStore {
             }
         }
         let approval_json = serde_json::to_string(approval)?;
+        // The `signer_kind` column now records the approval's transport
+        // (`browser_webauthn` | `native_ctap2`).
+        // TODO(ws-L): rename the column to `signer_transport` once legacy
+        // signer-kind rows no longer need to be readable in place.
         tx.execute(
             "INSERT INTO approvals(
                 surface, action_id, nonce, approval_json, signer_kind, assurance, expiry_ms,
@@ -789,7 +1040,7 @@ impl AuthStore {
                 approval.action_id,
                 approval.server_nonce,
                 approval_json,
-                signer_kind_str(approval.signer_kind),
+                approval.signer_transport.as_str(),
                 approval.assurance.as_str(),
                 approval.expiry_ms as i64,
                 now_ms as i64,
@@ -1028,21 +1279,28 @@ impl AuthStore {
     ) -> Result<Option<SealedIntentRecord>, AuthStoreError> {
         self.conn
             .query_row(
-                "SELECT envelope_json, sealed_at_ms FROM sealed_intents WHERE intent_hash = ?1",
+                "SELECT envelope_json, sealed_at_ms, sealed_action_json
+                 FROM sealed_intents WHERE intent_hash = ?1",
                 params![intent_hash],
                 |row| {
                     let envelope_json: String = row.get(0)?;
                     let sealed_at_ms: i64 = row.get(1)?;
-                    Ok((envelope_json, sealed_at_ms))
+                    let sealed_action_json: Option<String> = row.get(2)?;
+                    Ok((envelope_json, sealed_at_ms, sealed_action_json))
                 },
             )
             .optional()?
-            .map(|(envelope_json, sealed_at_ms)| {
+            .map(|(envelope_json, sealed_at_ms, sealed_action_json)| {
                 let envelope: CanonicalEnvelope = serde_json::from_str(&envelope_json)?;
+                let action: Option<SealedAction> = sealed_action_json
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()?;
                 Ok(SealedIntentRecord {
                     intent_hash: intent_hash.to_string(),
                     envelope,
                     sealed_at_ms: sealed_at_ms as u64,
+                    action,
                 })
             })
             .transpose()
@@ -1066,7 +1324,7 @@ where
 {
     async fn verify_and_consume(
         &self,
-        approval: Approval,
+        approval: SignedApproval,
         now_ms: u64,
     ) -> Result<(), AuthApiError> {
         let unsigned = approval.unsigned_payload();
@@ -1116,6 +1374,18 @@ where
         Ok(store.stage_entry(&envelope, assurance, now_ms)?)
     }
 
+    async fn stage_action(
+        &self,
+        action: SealedAction,
+        now_ms: u64,
+    ) -> Result<AuthEntryRecord, AuthApiError> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
+        Ok(store.stage_action(&action, now_ms)?)
+    }
+
     async fn issue_challenge(
         &self,
         surface: &str,
@@ -1123,7 +1393,7 @@ where
         server_nonce: &str,
         expiry_ms: u64,
         now_ms: u64,
-    ) -> Result<ChallengeRecord, AuthApiError> {
+    ) -> Result<ApprovalChallenge, AuthApiError> {
         let mut store = self
             .store
             .lock()
@@ -1340,52 +1610,23 @@ impl AuthStoreError {
 mod tests {
     use super::*;
     use bloom_auth_api::{
-        APPROVAL_SCHEMA_V1, ApprovalCaps, ApprovalSignature, CanonicalEnvelope,
-        CanonicalIntentHeader, SignerKind,
+        ApprovalSignature, CanonicalEnvelope, CanonicalIntentHeader,
+        CANONICAL_INTENT_HEADER_SCHEMA_V2, ExecutorKind, SignerTransport,
+        petal_identity::{FIRST_PARTY_PETAL_VERSION_V0, PETAL_ID_PAID_HTTP,
+            PLACEHOLDER_DIGEST_PAID_HTTP},
     };
 
     fn envelope() -> CanonicalEnvelope {
-        CanonicalEnvelope::new(
-            CanonicalIntentHeader {
-                schema: "bloom.intent_header.v1".into(),
-                wallet: "my-wallet".into(),
-                surface: "requests".into(),
-                action_id: "req_1".into(),
-                executor_id: "paid-http".into(),
-                network: "base".into(),
-                account: "default".into(),
-                action_kind: "x402_payment".into(),
-                value_movement: true,
-                authority_change: false,
-            },
-            "paid_http",
-            "paid_http.v1",
-            br#"{"amount":"1.00"}"#.to_vec(),
-        )
+        envelope_for("requests", "req_1")
     }
 
-    fn approval_for(entry: &AuthEntryRecord, sealed: &SealedIntentRecord) -> Approval {
-        Approval {
-            schema: APPROVAL_SCHEMA_V1.into(),
-            wallet: sealed.envelope.header.wallet.clone(),
-            surface: entry.surface.clone(),
-            action_id: entry.action_id.clone(),
-            intent_hash: entry.intent_hash.clone(),
-            executor_id: sealed.envelope.header.executor_id.clone(),
-            network: sealed.envelope.header.network.clone(),
-            assurance: entry.assurance,
-            server_nonce: entry.nonce.clone().unwrap(),
-            caps: ApprovalCaps::default(),
-            // Matches the expiry every test issues its challenge with; consume
-            // requires equality with the persisted challenge_expiry_ms.
-            expiry_ms: 220,
-            signer_kind: SignerKind::Password,
-            credential_id: None,
-            review_session_id: None,
-            signature: ApprovalSignature::PasswordMac {
-                mac_hex: "test-only".into(),
-            },
-        }
+    /// Build a faithful signed approval for a daemon-issued challenge, the way
+    /// a real client would (echoing every daemon-issued field).
+    fn approval_for(challenge: &ApprovalChallenge) -> SignedApproval {
+        UnsignedApproval::for_challenge(challenge, SignerTransport::BrowserWebauthn, None, None)
+            .into_signed(ApprovalSignature::Test {
+                sig_hex: "00".into(),
+            })
     }
 
     #[test]
@@ -1426,9 +1667,18 @@ mod tests {
         let challenge = store
             .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
             .unwrap();
+        assert_eq!(challenge.schema, APPROVAL_CHALLENGE_SCHEMA_V1);
         assert_eq!(challenge.intent_hash, staged.intent_hash);
         assert_eq!(challenge.server_nonce, "nonce-1");
         assert_eq!(challenge.assurance, AssuranceLevel::Standard);
+        // The full §5.7 preimage is daemon-issued from the staged entry.
+        assert_eq!(challenge.wallet, "my-wallet");
+        assert_eq!(challenge.petal_id, PETAL_ID_PAID_HTTP);
+        assert_eq!(challenge.petal_digest, PLACEHOLDER_DIGEST_PAID_HTTP);
+        assert_eq!(challenge.daemon_terms_digest.len(), 64);
+        assert_eq!(challenge.petal_policy_digest.len(), 64);
+        assert_eq!(challenge.policy_version, 0);
+        assert_eq!(challenge.expiry_ms, 220);
 
         let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
         assert_eq!(entry.state, AuthEntryState::Challenged);
@@ -1473,12 +1723,10 @@ mod tests {
         store
             .stage_entry(&env, AssuranceLevel::Standard, 100)
             .unwrap();
-        store
+        let challenge = store
             .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
             .unwrap();
-        let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
-        let sealed = store.sealed_intent(&entry.intent_hash).unwrap().unwrap();
-        let approval = approval_for(&entry, &sealed);
+        let approval = approval_for(&challenge);
 
         store
             .consume_verified_approval_transactionally(&approval, 150)
@@ -1510,12 +1758,10 @@ mod tests {
         store
             .stage_entry(&env, AssuranceLevel::Standard, 100)
             .unwrap();
-        store
+        let challenge = store
             .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
             .unwrap();
-        let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
-        let sealed = store.sealed_intent(&entry.intent_hash).unwrap().unwrap();
-        let approval = approval_for(&entry, &sealed);
+        let approval = approval_for(&challenge);
         store
             .consume_verified_approval_transactionally(&approval, 150)
             .unwrap();
@@ -1536,15 +1782,11 @@ mod tests {
         store
             .stage_entry(&env_a, AssuranceLevel::Standard, 100)
             .unwrap();
-        store
+        let challenge_a = store
             .issue_challenge("requests", "req_a", "n-a", 500, 101)
             .unwrap();
-        let entry_a = store.auth_entry("requests", "req_a").unwrap().unwrap();
-        let sealed_a = store.sealed_intent(&entry_a.intent_hash).unwrap().unwrap();
-        let mut approval_a = approval_for(&entry_a, &sealed_a);
-        approval_a.expiry_ms = 500;
         store
-            .consume_verified_approval_transactionally(&approval_a, 150)
+            .consume_verified_approval_transactionally(&approval_for(&challenge_a), 150)
             .unwrap();
 
         // Second entry + consume → chained audit event.
@@ -1552,16 +1794,11 @@ mod tests {
         store
             .stage_entry(&env_b, AssuranceLevel::Standard, 200)
             .unwrap();
-        store
+        let challenge_b = store
             .issue_challenge("requests", "req_b", "n-b", 500, 201)
             .unwrap();
-        let entry_b = store.auth_entry("requests", "req_b").unwrap().unwrap();
-        let sealed_b = store.sealed_intent(&entry_b.intent_hash).unwrap().unwrap();
-        let mut approval_b = approval_for(&entry_b, &sealed_b);
-        approval_b.server_nonce = "n-b".into();
-        approval_b.expiry_ms = 500;
         store
-            .consume_verified_approval_transactionally(&approval_b, 250)
+            .consume_verified_approval_transactionally(&approval_for(&challenge_b), 250)
             .unwrap();
 
         // Verify chain integrity.
@@ -1593,12 +1830,10 @@ mod tests {
         store
             .stage_entry(&env, AssuranceLevel::Standard, 100)
             .unwrap();
-        store
+        let challenge = store
             .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
             .unwrap();
-        let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
-        let sealed = store.sealed_intent(&entry.intent_hash).unwrap().unwrap();
-        let mut approval = approval_for(&entry, &sealed);
+        let mut approval = approval_for(&challenge);
         // A compromised client extends the window it signs over; the daemon
         // must hold it to the expiry persisted at challenge issuance.
         approval.expiry_ms = u64::MAX;
@@ -1611,10 +1846,59 @@ mod tests {
         assert_eq!(still_unused.nonce_state, NonceState::Unused);
 
         // The honest approval (matching issued expiry) still consumes.
-        let approval = approval_for(&entry, &sealed);
+        let approval = approval_for(&challenge);
         store
             .consume_verified_approval_transactionally(&approval, 150)
             .unwrap();
+    }
+
+    #[test]
+    fn approval_with_drifted_daemon_issued_field_is_denied_without_nonce_burn() {
+        // §5.7 step 10: every daemon-issued challenge value must be echoed
+        // byte-for-byte; any drift denies and must not burn the nonce.
+        type DriftCase = (&'static str, Box<dyn Fn(&mut SignedApproval)>);
+        let cases: Vec<DriftCase> = vec![
+            ("wallet", Box::new(|a| a.wallet = "other-wallet".into())),
+            ("petal_id", Box::new(|a| a.petal_id = "evm-wallet".into())),
+            (
+                "petal_digest",
+                Box::new(|a| a.petal_digest = "first-party-placeholder:evm-wallet:v0".into()),
+            ),
+            (
+                "daemon_terms_digest",
+                Box::new(|a| a.daemon_terms_digest = "9".repeat(64)),
+            ),
+            (
+                "petal_policy_digest",
+                Box::new(|a| a.petal_policy_digest = "9".repeat(64)),
+            ),
+            ("policy_version", Box::new(|a| a.policy_version = 42)),
+        ];
+        for (field, mutate) in cases {
+            let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+            let env = envelope();
+            store
+                .stage_entry(&env, AssuranceLevel::Standard, 100)
+                .unwrap();
+            let challenge = store
+                .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
+                .unwrap();
+            let mut approval = approval_for(&challenge);
+            mutate(&mut approval);
+            let err = store
+                .consume_verified_approval_transactionally(&approval, 150)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("mismatch") || err.to_string().contains("does not match"),
+                "{field}: {err}"
+            );
+            let still_unused = store.auth_entry("requests", "req_1").unwrap().unwrap();
+            assert_eq!(still_unused.nonce_state, NonceState::Unused, "{field}");
+            // The faithful echo still consumes.
+            store
+                .consume_verified_approval_transactionally(&approval_for(&challenge), 150)
+                .unwrap();
+        }
     }
 
     #[test]
@@ -1627,12 +1911,10 @@ mod tests {
             store
                 .stage_entry(&env, AssuranceLevel::Standard, 100)
                 .unwrap();
-            store
+            let challenge = store
                 .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
                 .unwrap();
-            let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
-            let sealed = store.sealed_intent(&entry.intent_hash).unwrap().unwrap();
-            let approval = approval_for(&entry, &sealed);
+            let approval = approval_for(&challenge);
             store
                 .consume_verified_approval_transactionally(&approval, 150)
                 .unwrap();
@@ -1656,12 +1938,10 @@ mod tests {
         store
             .stage_entry(&env, AssuranceLevel::Standard, 100)
             .unwrap();
-        store
+        let challenge = store
             .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
             .unwrap();
-        let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
-        let sealed = store.sealed_intent(&entry.intent_hash).unwrap().unwrap();
-        let mut approval = approval_for(&entry, &sealed);
+        let mut approval = approval_for(&challenge);
         approval.intent_hash = "f".repeat(64);
 
         assert!(
@@ -1682,12 +1962,10 @@ mod tests {
         store
             .stage_entry(&env, AssuranceLevel::Standard, 100)
             .unwrap();
-        store
+        let challenge = store
             .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
             .unwrap();
-        let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
-        let sealed = store.sealed_intent(&entry.intent_hash).unwrap().unwrap();
-        let approval = approval_for(&entry, &sealed);
+        let approval = approval_for(&challenge);
         let verifier = StoreApprovalVerifier::new(store, RejectingApprovalSignatureVerifier);
 
         let err = verifier
@@ -1803,13 +2081,10 @@ mod tests {
         store
             .stage_entry(&env, AssuranceLevel::Hardened, 100)
             .unwrap();
-        store
+        let challenge = store
             .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
             .unwrap();
-        let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
-        let sealed = store.sealed_intent(&entry.intent_hash).unwrap().unwrap();
-        let mut approval = approval_for(&entry, &sealed);
-        approval.signer_kind = SignerKind::PasskeyCtap;
+        let approval = approval_for(&challenge);
 
         let err = store
             .consume_verified_approval_transactionally(&approval, 150)
@@ -1826,7 +2101,7 @@ mod tests {
         store
             .stage_entry(&env, AssuranceLevel::Hardened, 100)
             .unwrap();
-        store
+        let challenge = store
             .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
             .unwrap();
         let session = store
@@ -1834,10 +2109,7 @@ mod tests {
             .unwrap();
         assert_eq!(session.consumed_ms, None);
 
-        let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
-        let sealed = store.sealed_intent(&entry.intent_hash).unwrap().unwrap();
-        let mut approval = approval_for(&entry, &sealed);
-        approval.signer_kind = SignerKind::PasskeyCtap;
+        let mut approval = approval_for(&challenge);
         approval.review_session_id = Some("review-1".into());
 
         store
@@ -1860,16 +2132,20 @@ mod tests {
     fn envelope_for(surface: &str, action_id: &str) -> CanonicalEnvelope {
         CanonicalEnvelope::new(
             CanonicalIntentHeader {
-                schema: "bloom.intent_header.v1".into(),
+                schema: CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
                 wallet: "my-wallet".into(),
                 surface: surface.into(),
                 action_id: action_id.into(),
-                executor_id: "paid-http".into(),
+                petal_id: PETAL_ID_PAID_HTTP.into(),
+                petal_digest: PLACEHOLDER_DIGEST_PAID_HTTP.into(),
+                petal_version: FIRST_PARTY_PETAL_VERSION_V0.into(),
+                executor_kind: ExecutorKind::FirstParty,
                 network: "base".into(),
                 account: "default".into(),
                 action_kind: "x402_payment".into(),
                 value_movement: true,
                 authority_change: false,
+                expires_ms: 600_000,
             },
             "paid_http",
             "paid_http.v1",
@@ -1884,25 +2160,18 @@ mod tests {
         action_id: &str,
         nonce: &str,
         session_id: &str,
-    ) {
+    ) -> ApprovalChallenge {
         let env = envelope_for(surface, action_id);
         store
             .stage_entry(&env, AssuranceLevel::Hardened, 100)
             .unwrap();
-        store
+        let challenge = store
             .issue_challenge(surface, action_id, nonce, 500, 101)
             .unwrap();
         store
             .issue_review_session(session_id, surface, action_id, 500, 102)
             .unwrap();
-    }
-
-    /// Build a hardened approval for the given entry + sealed intent.
-    fn hardened_approval(entry: &AuthEntryRecord, sealed: &SealedIntentRecord) -> Approval {
-        let mut a = approval_for(entry, sealed);
-        a.signer_kind = SignerKind::PasskeyCtap;
-        a.review_session_id = None;
-        a
+        challenge
     }
 
     #[test]
@@ -1911,12 +2180,9 @@ mod tests {
         // Action A gets a review session.
         stage_and_challenge(&mut store, "requests", "req_1", "n1", "sess-A");
         // Action B is a different action_id on the same surface.
-        stage_and_challenge(&mut store, "requests", "req_2", "n2", "sess-B");
+        let challenge_b = stage_and_challenge(&mut store, "requests", "req_2", "n2", "sess-B");
 
-        let entry_b = store.auth_entry("requests", "req_2").unwrap().unwrap();
-        let sealed_b = store.sealed_intent(&entry_b.intent_hash).unwrap().unwrap();
-        let mut approval_b = hardened_approval(&entry_b, &sealed_b);
-        approval_b.expiry_ms = 500;
+        let mut approval_b = approval_for(&challenge_b);
         // Attacker: attach A's session to B's approval.
         approval_b.review_session_id = Some("sess-A".into());
 
@@ -1939,12 +2205,9 @@ mod tests {
     fn cross_action_replay_via_surface_mismatch_rejected() {
         let mut store = AuthStore::open_in_memory_for_tests().unwrap();
         stage_and_challenge(&mut store, "requests", "req_1", "n1", "sess-A");
-        stage_and_challenge(&mut store, "outbox", "tx_1", "n2", "sess-B");
+        let challenge_b = stage_and_challenge(&mut store, "outbox", "tx_1", "n2", "sess-B");
 
-        let entry_b = store.auth_entry("outbox", "tx_1").unwrap().unwrap();
-        let sealed_b = store.sealed_intent(&entry_b.intent_hash).unwrap().unwrap();
-        let mut approval_b = hardened_approval(&entry_b, &sealed_b);
-        approval_b.expiry_ms = 500;
+        let mut approval_b = approval_for(&challenge_b);
         approval_b.review_session_id = Some("sess-A".into());
 
         let err = store
@@ -1965,17 +2228,14 @@ mod tests {
         store
             .stage_entry(&env, AssuranceLevel::Hardened, 100)
             .unwrap();
-        store
+        let challenge = store
             .issue_challenge("requests", "req_1", "n1", 1000, 101)
             .unwrap();
         store
             .issue_review_session("sess-1", "requests", "req_1", 300, 102)
             .unwrap();
 
-        let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
-        let sealed = store.sealed_intent(&entry.intent_hash).unwrap().unwrap();
-        let mut approval = hardened_approval(&entry, &sealed);
-        approval.expiry_ms = 1000;
+        let mut approval = approval_for(&challenge);
         approval.review_session_id = Some("sess-1".into());
 
         // Consume at t=400 — approval is valid (400 < 1000) but session expired (400 >= 300).
@@ -1988,7 +2248,7 @@ mod tests {
     #[test]
     fn review_session_already_consumed_rejected() {
         let mut store = AuthStore::open_in_memory_for_tests().unwrap();
-        stage_and_challenge(&mut store, "requests", "req_1", "n1", "sess-1");
+        let challenge = stage_and_challenge(&mut store, "requests", "req_1", "n1", "sess-1");
 
         // Simulate a prior consume of the session (e.g. concurrent tx won the race).
         store
@@ -1999,10 +2259,7 @@ mod tests {
             )
             .unwrap();
 
-        let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
-        let sealed = store.sealed_intent(&entry.intent_hash).unwrap().unwrap();
-        let mut approval = hardened_approval(&entry, &sealed);
-        approval.expiry_ms = 500;
+        let mut approval = approval_for(&challenge);
         approval.review_session_id = Some("sess-1".into());
 
         let err = store
@@ -2017,12 +2274,9 @@ mod tests {
     #[test]
     fn review_session_not_found_rejected() {
         let mut store = AuthStore::open_in_memory_for_tests().unwrap();
-        stage_and_challenge(&mut store, "requests", "req_1", "n1", "sess-1");
+        let challenge = stage_and_challenge(&mut store, "requests", "req_1", "n1", "sess-1");
 
-        let entry = store.auth_entry("requests", "req_1").unwrap().unwrap();
-        let sealed = store.sealed_intent(&entry.intent_hash).unwrap().unwrap();
-        let mut approval = hardened_approval(&entry, &sealed);
-        approval.expiry_ms = 500;
+        let mut approval = approval_for(&challenge);
         approval.review_session_id = Some("nonexistent".into());
 
         let err = store
@@ -2245,5 +2499,166 @@ mod tests {
             store.lookup_action_id("evm", "0002-b").unwrap().as_deref(),
             Some(b.as_str())
         );
+    }
+
+    // -------------------------------------------------------
+    // Sealed actions (bloom.sealed_action.v1) and migration
+    // -------------------------------------------------------
+
+    #[test]
+    fn stage_action_persists_full_sealed_action_and_challenge_digests_match() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        let action =
+            SealedAction::seal_with_default_terms(envelope(), AssuranceLevel::Standard, 100)
+                .unwrap();
+        let staged = store.stage_action(&action, 100).unwrap();
+
+        let sealed = store.sealed_intent(&staged.intent_hash).unwrap().unwrap();
+        assert_eq!(sealed.action.as_ref(), Some(&action));
+        assert_eq!(sealed.envelope, action.envelope);
+
+        let challenge = store
+            .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
+            .unwrap();
+        assert_eq!(
+            challenge.daemon_terms_digest,
+            action.daemon_terms_digest().unwrap()
+        );
+        assert_eq!(challenge.petal_policy_digest, action.petal_policy_digest);
+        assert_eq!(challenge.policy_version, action.policy_version);
+        assert_eq!(challenge.petal_id, action.petal_id());
+        assert_eq!(challenge.petal_digest, action.petal_digest());
+        assert_eq!(challenge.wallet, action.wallet());
+
+        // A faithful client echo of the issued challenge consumes.
+        store
+            .consume_verified_approval_transactionally(&approval_for(&challenge), 150)
+            .unwrap();
+    }
+
+    #[test]
+    fn restaging_same_action_id_with_different_daemon_context_is_denied() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        let action =
+            SealedAction::seal_with_default_terms(envelope(), AssuranceLevel::Standard, 100)
+                .unwrap();
+        store.stage_action(&action, 100).unwrap();
+
+        // Same envelope, wider daemon terms: must not silently alias the
+        // already-sealed entry.
+        let mut widened = action.clone();
+        widened.daemon_terms.allowed_sign_intents = vec!["evm.tx.sign".into()];
+        let err = store.stage_action(&widened, 101).unwrap_err();
+        assert!(
+            err.to_string().contains("different sealed daemon context"),
+            "{err}"
+        );
+    }
+
+    /// Simulate a database created before the sealed-action schema, then open
+    /// it with the current code: consumed-nonce history (replay denial) must
+    /// survive, while legacy pending rows become void and re-stageable.
+    #[test]
+    fn migration_from_pre_sealed_action_schema_preserves_replay_denial() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE sealed_intents (
+                    intent_hash TEXT PRIMARY KEY NOT NULL,
+                    envelope_json TEXT NOT NULL,
+                    sealed_at_ms INTEGER NOT NULL
+                );
+                CREATE TABLE auth_entries (
+                    surface TEXT NOT NULL,
+                    action_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    intent_hash TEXT NOT NULL REFERENCES sealed_intents(intent_hash),
+                    assurance TEXT NOT NULL,
+                    nonce TEXT,
+                    nonce_state TEXT NOT NULL DEFAULT 'unused',
+                    challenge_expiry_ms INTEGER,
+                    reservation_id TEXT,
+                    updated_ms INTEGER NOT NULL,
+                    PRIMARY KEY(surface, action_id)
+                );
+                INSERT INTO sealed_intents(intent_hash, envelope_json, sealed_at_ms)
+                VALUES ('legacy-hash-consumed', '{"legacy":"v1-envelope"}', 100);
+                INSERT INTO sealed_intents(intent_hash, envelope_json, sealed_at_ms)
+                VALUES ('legacy-hash-pending', '{"legacy":"v1-envelope-2"}', 100);
+                INSERT INTO auth_entries(
+                    surface, action_id, state, intent_hash, assurance, nonce, nonce_state,
+                    challenge_expiry_ms, reservation_id, updated_ms
+                )
+                VALUES ('requests', 'req_old_consumed', 'approved', 'legacy-hash-consumed',
+                        'standard', 'old-nonce', 'consumed', 220, NULL, 150);
+                INSERT INTO auth_entries(
+                    surface, action_id, state, intent_hash, assurance, nonce, nonce_state,
+                    challenge_expiry_ms, reservation_id, updated_ms
+                )
+                VALUES ('requests', 'req_old_pending', 'challenged', 'legacy-hash-pending',
+                        'standard', 'pending-nonce', 'unused', 220, NULL, 150);
+                "#,
+            )
+            .unwrap();
+        }
+
+        let mut store = AuthStore::open(&path).unwrap();
+
+        // 1. Consumed-nonce history survives: the entry still reads as
+        //    consumed and any replay attempt is denied.
+        let consumed = store
+            .auth_entry("requests", "req_old_consumed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(consumed.nonce_state, NonceState::Consumed);
+        let replay = SignedApproval {
+            schema: bloom_auth_api::APPROVAL_SCHEMA_V1.into(),
+            action_id: "req_old_consumed".into(),
+            wallet: "my-wallet".into(),
+            surface: "requests".into(),
+            petal_id: PETAL_ID_PAID_HTTP.into(),
+            petal_digest: PLACEHOLDER_DIGEST_PAID_HTTP.into(),
+            intent_hash: "legacy-hash-consumed".into(),
+            server_nonce: "old-nonce".into(),
+            assurance: AssuranceLevel::Standard,
+            daemon_terms_digest: "0".repeat(64),
+            petal_policy_digest: "0".repeat(64),
+            policy_version: 0,
+            expiry_ms: 220,
+            signer_transport: SignerTransport::BrowserWebauthn,
+            credential_id: None,
+            review_session_id: None,
+            signature: ApprovalSignature::Test {
+                sig_hex: "00".into(),
+            },
+        };
+        let err = store
+            .consume_verified_approval_transactionally(&replay, 151)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already consumed"),
+            "replay must stay denied after migration: {err}"
+        );
+
+        // 2. Legacy pending rows are void: challenge issuance fails closed.
+        let err = store
+            .issue_challenge("requests", "req_old_pending", "n-new", 500, 200)
+            .unwrap_err();
+        assert!(err.to_string().contains("re-stage"), "{err}");
+
+        // 3. New actions stage and consume normally on the migrated database.
+        let env = envelope_for("requests", "req_new");
+        store
+            .stage_entry(&env, AssuranceLevel::Standard, 300)
+            .unwrap();
+        let challenge = store
+            .issue_challenge("requests", "req_new", "n-1", 900, 301)
+            .unwrap();
+        store
+            .consume_verified_approval_transactionally(&approval_for(&challenge), 400)
+            .unwrap();
     }
 }

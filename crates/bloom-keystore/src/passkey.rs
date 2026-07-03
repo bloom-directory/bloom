@@ -39,7 +39,7 @@ use url::Url;
 use webauthn_rs::prelude::*;
 
 use bloom_auth_api::{
-    ApprovalSignature, AssuranceLevel, SignerKind, UnsignedApproval, WebAuthnAssertionRecord,
+    ApprovalSignature, AssuranceLevel, UnsignedApproval, WebAuthnAssertionRecord,
 };
 use bloom_proto::CeremonyIntent;
 
@@ -1739,15 +1739,10 @@ impl super::Keystore {
                 unsigned.wallet
             )));
         }
-        if !matches!(
-            unsigned.signer_kind,
-            SignerKind::PasskeyBrowser | SignerKind::PasskeyCtap
-        ) {
-            return Err(KeystoreError::PasskeyCredential(format!(
-                "approval signer_kind {:?} is not a passkey signer",
-                unsigned.signer_kind
-            )));
-        }
+        // `signer_transport` is transport/audit metadata only (§6.3): every
+        // variant is a WebAuthn/CTAP2 authenticator transport, and assurance
+        // is enforced from authenticator flags below, so no transport gate is
+        // needed here.
 
         let passkey_json = std::fs::read_to_string(dir.join("passkey.json")).map_err(|source| {
             KeystoreError::Io {
@@ -2421,7 +2416,7 @@ mod ceremony_gate_tests {
 #[cfg(test)]
 mod approval_uv_tests {
     use super::*;
-    use bloom_auth_api::{APPROVAL_SCHEMA_V1, ApprovalCaps};
+    use bloom_auth_api::{APPROVAL_SCHEMA_V1, SignerTransport, petal_identity};
     use ed25519_dalek::Signer as _;
     use sha2::{Digest, Sha256};
 
@@ -2431,17 +2426,19 @@ mod approval_uv_tests {
     fn unsigned_approval(wallet: &str, assurance: AssuranceLevel) -> UnsignedApproval {
         UnsignedApproval {
             schema: APPROVAL_SCHEMA_V1.into(),
+            action_id: "tx_1".into(),
             wallet: wallet.into(),
             surface: "outbox".into(),
-            action_id: "tx_1".into(),
+            petal_id: petal_identity::PETAL_ID_EVM_WALLET.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_EVM_WALLET.into(),
             intent_hash: "0".repeat(64),
-            executor_id: "evm".into(),
-            network: "base".into(),
-            assurance,
             server_nonce: "nonce-1".into(),
-            caps: ApprovalCaps::default(),
+            assurance,
+            daemon_terms_digest: "1".repeat(64),
+            petal_policy_digest: "2".repeat(64),
+            policy_version: 0,
             expiry_ms: u64::MAX,
-            signer_kind: SignerKind::PasskeyBrowser,
+            signer_transport: SignerTransport::BrowserWebauthn,
             credential_id: None,
             review_session_id: None,
         }

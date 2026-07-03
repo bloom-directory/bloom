@@ -9,7 +9,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use bloom_auth_api::{Approval, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader};
+use bloom_auth_api::{
+    AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, ExecutorKind, SignedApproval,
+    petal_identity,
+};
 use bloom_hyperliquid::{
     CancelWire, ExchangeAction, Grouping, HyperliquidClient, HyperliquidNetwork, HyperliquidSigner,
     LimitOrderType, OrderTypeWire, OrderWire, SignSubmit, SignedSubmit, TimeInForce,
@@ -1854,7 +1857,7 @@ impl HyperliquidHandler {
         let dir = self.usd_send_auth_dir(network, wallet)?;
         let approval_path = dir.join(APPROVAL_FILE);
         if approval_path.exists() {
-            let approval: Approval = read_json(&approval_path)?;
+            let approval: SignedApproval = read_json(&approval_path)?;
             self.auth_services
                 .require_approval_verifier()?
                 .verify_and_consume(approval, now_ms_u64())
@@ -1909,7 +1912,7 @@ impl HyperliquidHandler {
         std::fs::create_dir_all(&dir)?;
         let approval_path = dir.join(APPROVAL_FILE);
         if approval_path.exists() {
-            let approval: Approval = read_json(&approval_path)?;
+            let approval: SignedApproval = read_json(&approval_path)?;
             self.auth_services
                 .require_approval_verifier()?
                 .verify_and_consume(approval, now_ms_u64())
@@ -4022,16 +4025,22 @@ fn hyperliquid_usd_send_envelope(
     .map_err(err_json)?;
     Ok(CanonicalEnvelope::new(
         CanonicalIntentHeader {
-            schema: "bloom.intent_header.v1".into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
             wallet: wallet.to_string(),
             surface: "hyperliquid".into(),
             action_id: hyperliquid_usd_send_action_id(network, wallet, pending),
-            executor_id: "hyperliquid-usd-send".into(),
+            petal_id: petal_identity::PETAL_ID_HYPERLIQUID.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_HYPERLIQUID.into(),
+            petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+            executor_kind: ExecutorKind::FirstParty,
             network: network.to_string(),
             account: wallet.to_string(),
             action_kind: "usdSend".into(),
             value_movement: true,
             authority_change: false,
+            // `pending.nonce` is the staging-time HL timestamp, so this stays
+            // deterministic when the same pending send is re-sealed on retry.
+            expires_ms: pending.nonce.saturating_add(APPROVAL_TTL_MS),
         },
         "hyperliquid_usd_send",
         "bloom.hyperliquid_usd_send_subject.v1",
@@ -4069,16 +4078,24 @@ fn hyperliquid_agent_session_envelope(
     let subject = serde_json::to_vec(&subject).map_err(err_json)?;
     Ok(CanonicalEnvelope::new(
         CanonicalIntentHeader {
-            schema: "bloom.intent_header.v1".into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
             wallet: wallet.to_string(),
             surface: "hyperliquid".into(),
             action_id: hyperliquid_agent_session_action_id(network, wallet, session_id),
-            executor_id: "hyperliquid-agent-session".into(),
+            petal_id: petal_identity::PETAL_ID_HYPERLIQUID.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_HYPERLIQUID.into(),
+            petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+            executor_kind: ExecutorKind::FirstParty,
             network: network.to_string(),
             account: wallet.to_string(),
             action_kind: "approveAgent".into(),
             value_movement: false,
             authority_change: true,
+            // Must stay deterministic across repeated staging of the same
+            // session (re-sealing must reproduce identical bytes).
+            // TODO(ws-I): commit the session TTL as the sealed expiry when
+            // Hyperliquid staging computes venue terms.
+            expires_ms: 0,
         },
         "hyperliquid_agent_session",
         "bloom.hyperliquid_agent_session_subject.v1",

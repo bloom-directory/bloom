@@ -11,7 +11,10 @@ use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use bloom_auth_api::{Approval, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader};
+use bloom_auth_api::{
+    AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, ExecutorKind, SignedApproval,
+    petal_identity,
+};
 use bloom_chain::ChainClient;
 use bloom_keystore::{Keystore, KeystoreError};
 use bloom_polymarket::eip712::{PUSD, PUSD_DECIMALS};
@@ -255,16 +258,24 @@ fn polymarket_onboard_envelope(
     .map_err(|e| HandlerError::backend(format!("encode Polymarket onboarding intent: {e}")))?;
     Ok(CanonicalEnvelope::new(
         CanonicalIntentHeader {
-            schema: "bloom.intent_header.v1".into(),
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
             wallet: wallet.to_string(),
             surface: "polymarket".into(),
             action_id: polymarket_onboard_action_id(wallet),
-            executor_id: "polymarket-onboard".into(),
+            petal_id: petal_identity::PETAL_ID_POLYMARKET.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_POLYMARKET.into(),
+            petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+            executor_kind: ExecutorKind::FirstParty,
             network: "polygon".into(),
             account: wallet.to_string(),
             action_kind: "onboard".into(),
             value_movement: false,
             authority_change: true,
+            // Must stay deterministic across repeated staging of the same
+            // onboarding (re-sealing must reproduce identical bytes).
+            // TODO(ws-H): commit a real onboarding expiry when Polymarket
+            // staging computes venue terms.
+            expires_ms: 0,
         },
         "polymarket_onboard",
         "bloom.polymarket_onboard_subject.v1",
@@ -2128,7 +2139,7 @@ impl PolymarketHandler {
         fs::create_dir_all(&dir)?;
         let approval_path = dir.join(APPROVAL_FILE);
         if approval_path.exists() {
-            let approval: Approval = read_json(&approval_path)?;
+            let approval: SignedApproval = read_json(&approval_path)?;
             self.auth_services
                 .require_approval_verifier()?
                 .verify_and_consume(approval, pm_now_ms_u64())

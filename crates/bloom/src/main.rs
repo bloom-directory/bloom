@@ -24,8 +24,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use bloom_auth_api::{
-    APPROVAL_SCHEMA_V1, Approval, ApprovalCaps, AssuranceLevel, ChallengeRecord, SignerKind,
-    UnsignedApproval,
+    ApprovalChallenge, AssuranceLevel, SignedApproval, SignerTransport, UnsignedApproval,
 };
 use bloom_daemon::Daemon;
 use bloom_daemon::ipc::{IpcClient, IpcServer, default_socket_path};
@@ -3056,11 +3055,13 @@ async fn sign_outbox_sealed_approval_if_challenged(
         return Ok(false);
     }
 
-    let challenge: ChallengeRecord = serde_json::from_slice(
+    let challenge: ApprovalChallenge = serde_json::from_slice(
         &std::fs::read(&challenge_path)
             .with_context(|| format!("read {}", challenge_path.display()))?,
     )
     .with_context(|| format!("parse {}", challenge_path.display()))?;
+    // Fail fast if the challenge does not refer to a real sealed action for
+    // this wallet; full binding is re-verified daemon-side at consume time.
     let sealed = d
         .auth_services
         .require_store()
@@ -3068,6 +3069,11 @@ async fn sign_outbox_sealed_approval_if_challenged(
         .sealed_intent(&challenge.intent_hash)
         .await
         .context("read sealed intent for approval challenge")?;
+    anyhow::ensure!(
+        sealed.envelope.header.wallet == wallet,
+        "approval challenge wallet mismatch: sealed action belongs to '{}'",
+        sealed.envelope.header.wallet
+    );
 
     let review_session_id = if challenge.assurance == AssuranceLevel::Hardened {
         let review_session_id = sealed_review_session_id(&challenge);
@@ -3088,44 +3094,20 @@ async fn sign_outbox_sealed_approval_if_challenged(
         None
     };
 
-    let unsigned = UnsignedApproval {
-        schema: APPROVAL_SCHEMA_V1.into(),
-        wallet: wallet.to_string(),
-        surface: challenge.surface.clone(),
-        action_id: challenge.action_id.clone(),
-        intent_hash: challenge.intent_hash.clone(),
-        executor_id: sealed.envelope.header.executor_id.clone(),
-        network: sealed.envelope.header.network.clone(),
-        assurance: challenge.assurance,
-        server_nonce: challenge.server_nonce.clone(),
-        caps: ApprovalCaps::default(),
-        expiry_ms: challenge.expiry_ms,
-        signer_kind: SignerKind::PasskeyBrowser,
-        credential_id: None,
+    // Echo every daemon-issued challenge field faithfully (§5.7 step 10);
+    // any drift is rejected at consume time.
+    let unsigned = UnsignedApproval::for_challenge(
+        &challenge,
+        SignerTransport::BrowserWebauthn,
+        None,
         review_session_id,
-    };
+    );
     let signature = d
         .keystore
         .sign_approval_with_passkey(wallet, &unsigned, intent)
         .await
         .context("sign Sealed Approval with passkey")?;
-    let approval = Approval {
-        schema: unsigned.schema,
-        wallet: unsigned.wallet,
-        surface: unsigned.surface,
-        action_id: unsigned.action_id,
-        intent_hash: unsigned.intent_hash,
-        executor_id: unsigned.executor_id,
-        network: unsigned.network,
-        assurance: unsigned.assurance,
-        server_nonce: unsigned.server_nonce,
-        caps: unsigned.caps,
-        expiry_ms: unsigned.expiry_ms,
-        signer_kind: unsigned.signer_kind,
-        credential_id: unsigned.credential_id,
-        review_session_id: unsigned.review_session_id,
-        signature,
-    };
+    let approval: SignedApproval = unsigned.into_signed(signature);
     let approval_path = entry.dir.join("approval.json");
     std::fs::write(
         &approval_path,
@@ -3135,7 +3117,7 @@ async fn sign_outbox_sealed_approval_if_challenged(
     Ok(true)
 }
 
-fn sealed_review_session_id(challenge: &ChallengeRecord) -> String {
+fn sealed_review_session_id(challenge: &ApprovalChallenge) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bloom.review_session.v1");
     hasher.update(challenge.surface.as_bytes());
