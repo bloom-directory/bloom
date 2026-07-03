@@ -27,9 +27,7 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
-use bloom_auth_api::{
-    ApprovalChallenge, SignedApproval, SignerTransport, UnsignedApproval,
-};
+use bloom_auth_api::{ApprovalChallenge, SignedApproval, SignerTransport, UnsignedApproval};
 use bloom_keystore::{Keystore, WalletKind};
 use bloom_petals::{Capability, PetalError, PetalRunner, RunOptions, VfsHost};
 use bloom_proto::{CeremonyIntent, CeremonyIntentKind};

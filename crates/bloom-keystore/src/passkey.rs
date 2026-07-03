@@ -38,9 +38,7 @@ use rand::RngCore;
 use url::Url;
 use webauthn_rs::prelude::*;
 
-use bloom_auth_api::{
-    ApprovalSignature, AssuranceLevel, UnsignedApproval, WebAuthnAssertionRecord,
-};
+use bloom_auth_api::{AssuranceLevel, UnsignedApproval, WebAuthnAssertionRecord};
 use bloom_proto::CeremonyIntent;
 
 // ── constants ────────────────────────────────────────────────────────────────
@@ -1721,7 +1719,7 @@ impl super::Keystore {
         name: &str,
         unsigned: &UnsignedApproval,
         intent: Option<bloom_proto::CeremonyIntent>,
-    ) -> Result<ApprovalSignature, KeystoreError> {
+    ) -> Result<WebAuthnAssertionRecord, KeystoreError> {
         Self::validate_name(name)?;
         let dir = self.wallet_path(name);
         if !dir.exists() {
@@ -1773,25 +1771,20 @@ impl super::Keystore {
 
         let assertion = webauthn_assertion_record(&ceremony.credential)
             .map_err(KeystoreError::PasskeyCredential)?;
-        ApprovalSignature::WebAuthnAssertion(assertion.clone())
-            .validate_for_unsigned(unsigned)
+        assertion
+            .validate_challenge(unsigned)
             .map_err(Self::from_auth_api)?;
-        Ok(ApprovalSignature::WebAuthnAssertion(assertion))
+        Ok(assertion)
     }
 
     pub async fn verify_approval_signature_with_passkey(
         &self,
         unsigned: &UnsignedApproval,
-        signature: &ApprovalSignature,
+        assertion: &WebAuthnAssertionRecord,
     ) -> Result<(), KeystoreError> {
-        signature
-            .validate_for_unsigned(unsigned)
+        assertion
+            .validate_challenge(unsigned)
             .map_err(Self::from_auth_api)?;
-        let ApprovalSignature::WebAuthnAssertion(assertion) = signature else {
-            return Err(KeystoreError::PasskeyCredential(
-                "approval signature is not a WebAuthn assertion".into(),
-            ));
-        };
         Self::validate_name(&unsigned.wallet)?;
         let dir = self.wallet_path(&unsigned.wallet);
         let passkey_json = std::fs::read_to_string(dir.join("passkey.json")).map_err(|source| {
@@ -2439,7 +2432,7 @@ mod approval_uv_tests {
             policy_version: 0,
             expiry_ms: u64::MAX,
             signer_transport: SignerTransport::BrowserWebauthn,
-            credential_id: None,
+            credential_id: Some("cred-uv-test".into()),
             review_session_id: None,
         }
     }
@@ -2494,7 +2487,7 @@ mod approval_uv_tests {
         signing: &ed25519_dalek::SigningKey,
         unsigned: &UnsignedApproval,
         flags: u8,
-    ) -> ApprovalSignature {
+    ) -> WebAuthnAssertionRecord {
         assertion_with_flags_and_counter(signing, unsigned, flags, 0)
     }
 
@@ -2503,7 +2496,7 @@ mod approval_uv_tests {
         unsigned: &UnsignedApproval,
         flags: u8,
         counter: u32,
-    ) -> ApprovalSignature {
+    ) -> WebAuthnAssertionRecord {
         let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
         let challenge = unsigned.challenge_hash().unwrap();
         let client_data = serde_json::json!({
@@ -2520,13 +2513,13 @@ mod approval_uv_tests {
         let mut signed = auth_data.clone();
         signed.extend_from_slice(&Sha256::digest(&client_data_bytes));
         let signature = signing.sign(&signed);
-        ApprovalSignature::WebAuthnAssertion(WebAuthnAssertionRecord {
+        WebAuthnAssertionRecord {
             credential_id: b64(b"cred-uv-test"),
             authenticator_data_b64: b64(&auth_data),
             client_data_json_b64: b64(&client_data_bytes),
             signature_b64: b64(&signature.to_bytes()),
             user_handle_b64: None,
-        })
+        }
     }
 
     #[tokio::test]
@@ -2596,11 +2589,7 @@ mod approval_uv_tests {
         let other = unsigned_approval("uv-wallet", AssuranceLevel::Hardened);
         // Assertion minted for a different approval payload must not verify,
         // even though it is a valid signature from the right credential.
-        let ApprovalSignature::WebAuthnAssertion(mut record) =
-            assertion_with_flags(&signing, &other, UP | UV)
-        else {
-            unreachable!()
-        };
+        let mut record = assertion_with_flags(&signing, &other, UP | UV);
         let challenge = unsigned.challenge_hash().unwrap();
         let client_data = serde_json::json!({
             "type": "webauthn.get",
@@ -2611,10 +2600,7 @@ mod approval_uv_tests {
         record.client_data_json_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(serde_json::to_vec(&client_data).unwrap());
         let err = ks
-            .verify_approval_signature_with_passkey(
-                &unsigned,
-                &ApprovalSignature::WebAuthnAssertion(record),
-            )
+            .verify_approval_signature_with_passkey(&unsigned, &record)
             .await
             .unwrap_err();
         assert!(

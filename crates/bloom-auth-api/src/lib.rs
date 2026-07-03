@@ -566,7 +566,14 @@ impl SealedAction {
     ) -> Result<Self, AuthApiError> {
         let terms = DaemonGrantTerms::minimal(assurance);
         let snapshot = PetalPolicySnapshot::minimal(&envelope.header);
-        Self::new(envelope, String::new(), Vec::new(), terms, snapshot, created_ms)
+        Self::new(
+            envelope,
+            String::new(),
+            Vec::new(),
+            terms,
+            snapshot,
+            created_ms,
+        )
     }
 
     /// Internal consistency checks: schema tags, Petal identity agreement
@@ -586,6 +593,12 @@ impl SealedAction {
             )));
         }
         let header = &self.envelope.header;
+        if header.schema != CANONICAL_INTENT_HEADER_SCHEMA_V2 {
+            return Err(AuthApiError::InvalidSubject(format!(
+                "unsupported canonical intent header schema {}",
+                header.schema
+            )));
+        }
         if header.petal_id.trim().is_empty() || header.petal_digest.trim().is_empty() {
             return Err(AuthApiError::InvalidSubject(
                 "sealed action is missing petal identity".into(),
@@ -731,12 +744,11 @@ pub struct SignedApproval {
     pub expiry_ms: u64,
     /// Transport/audit metadata; not an authority level.
     pub signer_transport: SignerTransport,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credential_id: Option<String>,
+    pub credential_id: String,
     /// Transitional hardened review-session binding (daemon-side record).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_session_id: Option<String>,
-    pub signature: ApprovalSignature,
+    pub webauthn_assertion: WebAuthnAssertionRecord,
 }
 
 /// [`SignedApproval`] without its signature: the payload a ceremony signs.
@@ -826,7 +838,10 @@ impl UnsignedApproval {
         Ok(hex_lower(&self.challenge_hash()?))
     }
 
-    pub fn into_signed(self, signature: ApprovalSignature) -> SignedApproval {
+    pub fn into_signed(self, webauthn_assertion: WebAuthnAssertionRecord) -> SignedApproval {
+        let credential_id = self
+            .credential_id
+            .unwrap_or_else(|| webauthn_assertion.credential_id.clone());
         SignedApproval {
             schema: self.schema,
             action_id: self.action_id,
@@ -842,9 +857,9 @@ impl UnsignedApproval {
             policy_version: self.policy_version,
             expiry_ms: self.expiry_ms,
             signer_transport: self.signer_transport,
-            credential_id: self.credential_id,
+            credential_id,
             review_session_id: self.review_session_id,
-            signature,
+            webauthn_assertion,
         }
     }
 }
@@ -866,7 +881,7 @@ impl SignedApproval {
             policy_version: self.policy_version,
             expiry_ms: self.expiry_ms,
             signer_transport: self.signer_transport,
-            credential_id: self.credential_id.clone(),
+            credential_id: Some(self.credential_id.clone()),
             review_session_id: self.review_session_id.clone(),
         }
     }
@@ -899,6 +914,16 @@ impl SignedApproval {
         }
         if now_ms >= self.expiry_ms {
             return Err(AuthApiError::Denied("approval expired".into()));
+        }
+        if self.credential_id.trim().is_empty() {
+            return Err(AuthApiError::Denied(
+                "approval credential_id is empty".into(),
+            ));
+        }
+        if self.credential_id != self.webauthn_assertion.credential_id {
+            return Err(AuthApiError::Denied(
+                "approval credential_id does not match WebAuthn assertion".into(),
+            ));
         }
         // §5.7 steps 9–10: every daemon-issued value must be echoed exactly.
         let echoed = self.unsigned_payload().approval_challenge();
@@ -950,6 +975,49 @@ impl SignedApproval {
                 "issued challenge does not match sealed intent_hash".into(),
             ));
         }
+        let action = sealed.action.as_ref().ok_or_else(|| {
+            AuthApiError::Denied("sealed action record is missing; re-stage the action".into())
+        })?;
+        action.validate()?;
+        if action.intent_hash()? != sealed.intent_hash {
+            return Err(AuthApiError::Denied(
+                "sealed action intent_hash does not match stored key".into(),
+            ));
+        }
+        let action_daemon_terms_digest = action.daemon_terms_digest()?;
+        let action_checks = [
+            ("wallet", issued.wallet.as_str(), action.wallet()),
+            ("surface", issued.surface.as_str(), action.surface()),
+            ("action_id", issued.action_id.as_str(), action.action_id()),
+            ("petal_id", issued.petal_id.as_str(), action.petal_id()),
+            (
+                "petal_digest",
+                issued.petal_digest.as_str(),
+                action.petal_digest(),
+            ),
+            (
+                "daemon_terms_digest",
+                issued.daemon_terms_digest.as_str(),
+                action_daemon_terms_digest.as_str(),
+            ),
+            (
+                "petal_policy_digest",
+                issued.petal_policy_digest.as_str(),
+                action.petal_policy_digest.as_str(),
+            ),
+        ];
+        for (field, challenge, sealed_value) in action_checks {
+            if challenge != sealed_value {
+                return Err(AuthApiError::Denied(format!(
+                    "sealed action {field} mismatch"
+                )));
+            }
+        }
+        if issued.policy_version != action.policy_version {
+            return Err(AuthApiError::Denied(
+                "sealed action policy_version mismatch".into(),
+            ));
+        }
         let header = &sealed.envelope.header;
         let sealed_checks = [
             ("wallet", issued.wallet.as_str(), header.wallet.as_str()),
@@ -977,19 +1045,12 @@ impl SignedApproval {
                 )));
             }
         }
-        // Challenge binding: the signature (when it is a WebAuthn assertion)
-        // must commit to this exact preimage.
-        self.signature
-            .validate_for_unsigned(&self.unsigned_payload())?;
+        // Challenge binding: the WebAuthn assertion must commit to this exact
+        // preimage.
+        self.webauthn_assertion
+            .validate_challenge(&self.unsigned_payload())?;
         Ok(())
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ApprovalSignature {
-    WebAuthnAssertion(WebAuthnAssertionRecord),
-    Test { sig_hex: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1000,17 +1061,6 @@ pub struct WebAuthnAssertionRecord {
     pub signature_b64: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_handle_b64: Option<String>,
-}
-
-impl ApprovalSignature {
-    pub fn validate_for_unsigned(&self, unsigned: &UnsignedApproval) -> Result<(), AuthApiError> {
-        match self {
-            ApprovalSignature::WebAuthnAssertion(assertion) => {
-                assertion.validate_challenge(unsigned)
-            }
-            ApprovalSignature::Test { .. } => Ok(()),
-        }
-    }
 }
 
 impl WebAuthnAssertionRecord {
@@ -1177,11 +1227,8 @@ pub trait GrantStore: Send + Sync {
     async fn revoke(&self, grant_id: &str, now_ms: u64) -> Result<(), AuthApiError>;
 
     /// Revoke every live grant for a wallet; returns how many were revoked.
-    async fn revoke_all_for_wallet(
-        &self,
-        wallet: &str,
-        now_ms: u64,
-    ) -> Result<usize, AuthApiError>;
+    async fn revoke_all_for_wallet(&self, wallet: &str, now_ms: u64)
+    -> Result<usize, AuthApiError>;
 
     /// The live grant for `(wallet, action_id, petal_id, petal_digest)`,
     /// if any.
@@ -1249,10 +1296,7 @@ pub trait SigningAttestationSchemaRegistry: Send + Sync {
 
     /// Validate the attestation's schema registration and fact shape.
     /// Must fail closed for unknown `(petal_id, intent, schema)` tuples.
-    fn validate_attestation(
-        &self,
-        attestation: &SigningAttestation,
-    ) -> Result<(), AuthApiError>;
+    fn validate_attestation(&self, attestation: &SigningAttestation) -> Result<(), AuthApiError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1587,7 +1631,7 @@ pub trait ApprovalSignatureVerifier: Send + Sync {
     async fn verify_signature(
         &self,
         unsigned: &UnsignedApproval,
-        signature: &ApprovalSignature,
+        webauthn_assertion: &WebAuthnAssertionRecord,
         now_ms: u64,
     ) -> Result<(), AuthApiError>;
 }
@@ -2029,13 +2073,18 @@ mod tests {
     }
 
     #[test]
+    fn sealed_action_rejects_wrong_header_schema() {
+        let mut action = sealed_action();
+        action.envelope.header.schema = "bloom.intent_header.v1".into();
+        let err = action.validate().unwrap_err();
+        assert!(err.to_string().contains("intent header schema"), "{err}");
+    }
+
+    #[test]
     fn seal_with_default_terms_is_restrictive() {
-        let action = SealedAction::seal_with_default_terms(
-            baseline_envelope(),
-            AssuranceLevel::Hardened,
-            7,
-        )
-        .unwrap();
+        let action =
+            SealedAction::seal_with_default_terms(baseline_envelope(), AssuranceLevel::Hardened, 7)
+                .unwrap();
         assert_eq!(action.daemon_terms.max_signatures, 1);
         assert!(action.daemon_terms.allowed_sign_intents.is_empty());
         assert_eq!(action.daemon_terms.assurance, AssuranceLevel::Hardened);
@@ -2078,10 +2127,7 @@ mod tests {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"bloom.approval.v1");
         hasher.update(&c.canonical_bytes().unwrap());
-        assert_eq!(
-            c.challenge_hash().unwrap(),
-            *hasher.finalize().as_bytes()
-        );
+        assert_eq!(c.challenge_hash().unwrap(), *hasher.finalize().as_bytes());
     }
 
     #[test]
@@ -2195,14 +2241,14 @@ mod tests {
             Some("cred-1".into()),
             None,
         );
-        ApprovalSignature::WebAuthnAssertion(webauthn_assertion_for(&unsigned))
-            .validate_for_unsigned(&unsigned)
+        webauthn_assertion_for(&unsigned)
+            .validate_challenge(&unsigned)
             .unwrap();
 
         let mut substituted = unsigned.clone();
         substituted.action_id = "other".into();
-        let err = ApprovalSignature::WebAuthnAssertion(webauthn_assertion_for(&unsigned))
-            .validate_for_unsigned(&substituted)
+        let err = webauthn_assertion_for(&unsigned)
+            .validate_challenge(&substituted)
             .unwrap_err();
         assert!(
             err.to_string().contains("challenge does not match"),
@@ -2242,10 +2288,14 @@ mod tests {
     }
 
     fn approval_for(issued: &ApprovalChallenge) -> SignedApproval {
-        UnsignedApproval::for_challenge(issued, SignerTransport::BrowserWebauthn, None, None)
-            .into_signed(ApprovalSignature::Test {
-                sig_hex: "00".into(),
-            })
+        let unsigned = UnsignedApproval::for_challenge(
+            issued,
+            SignerTransport::BrowserWebauthn,
+            Some("cred-1".into()),
+            None,
+        );
+        let assertion = webauthn_assertion_for(&unsigned);
+        unsigned.into_signed(assertion)
     }
 
     #[test]
@@ -2307,10 +2357,7 @@ mod tests {
             let err = approval
                 .validate_against_sealed(&sealed, &issued, 100)
                 .unwrap_err();
-            assert!(
-                err.to_string().contains("does not match"),
-                "{field}: {err}"
-            );
+            assert!(err.to_string().contains("does not match"), "{field}: {err}");
         }
     }
 
@@ -2322,6 +2369,26 @@ mod tests {
             .validate_against_sealed(&sealed, &issued, 100)
             .unwrap_err();
         assert!(err.to_string().contains("sealed"), "{err}");
+    }
+
+    #[test]
+    fn approval_validation_requires_stored_sealed_action() {
+        let (mut sealed, issued) = sealed_record_and_challenge();
+        sealed.action = None;
+        let err = approval_for(&issued)
+            .validate_against_sealed(&sealed, &issued, 100)
+            .unwrap_err();
+        assert!(err.to_string().contains("sealed action record"), "{err}");
+    }
+
+    #[test]
+    fn signed_approval_serializes_as_spec_webauthn_record() {
+        let (_sealed, issued) = sealed_record_and_challenge();
+        let approval = approval_for(&issued);
+        let value = serde_json::to_value(&approval).unwrap();
+        assert_eq!(value["credential_id"], "cred-1");
+        assert!(value.get("webauthn_assertion").is_some());
+        assert!(value.get("signature").is_none());
     }
 
     // ------------------------------------------------------------------
@@ -2413,7 +2480,10 @@ mod tests {
             serde_json::to_string(&SignerTransport::NativeCtap2).unwrap(),
             "\"native_ctap2\""
         );
-        assert_eq!(SignerTransport::BrowserWebauthn.as_str(), "browser_webauthn");
+        assert_eq!(
+            SignerTransport::BrowserWebauthn.as_str(),
+            "browser_webauthn"
+        );
         assert_eq!(SignerTransport::NativeCtap2.as_str(), "native_ctap2");
     }
 
@@ -2423,7 +2493,10 @@ mod tests {
             serde_json::to_string(&ExecutorKind::FirstParty).unwrap(),
             "\"first_party\""
         );
-        assert_eq!(serde_json::to_string(&ExecutorKind::Wasm).unwrap(), "\"wasm\"");
+        assert_eq!(
+            serde_json::to_string(&ExecutorKind::Wasm).unwrap(),
+            "\"wasm\""
+        );
     }
 
     #[test]

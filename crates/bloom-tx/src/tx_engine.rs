@@ -2480,8 +2480,8 @@ mod tests {
 
     use super::*;
     use bloom_auth_api::{
-        APPROVAL_CHALLENGE_SCHEMA_V1, APPROVAL_SCHEMA_V1, ApprovalChallenge, ApprovalSignature,
-        AuthApiError, AuthEntryRecord, AuthEntryState, NonceState, SignerTransport,
+        APPROVAL_CHALLENGE_SCHEMA_V1, APPROVAL_SCHEMA_V1, ApprovalChallenge, AuthApiError,
+        AuthEntryRecord, AuthEntryState, NonceState, SignerTransport, WebAuthnAssertionRecord,
     };
     use bloom_proto::TxStatus;
 
@@ -3956,10 +3956,14 @@ mod tests {
                     policy_version: 0,
                     expiry_ms: now_ms() as u64 + 60_000,
                     signer_transport: SignerTransport::BrowserWebauthn,
-                    credential_id: None,
+                    credential_id: "cred-1".into(),
                     review_session_id: None,
-                    signature: ApprovalSignature::Test {
-                        sig_hex: "00".into(),
+                    webauthn_assertion: WebAuthnAssertionRecord {
+                        credential_id: "cred-1".into(),
+                        authenticator_data_b64: "AA".into(),
+                        client_data_json_b64: "e30".into(),
+                        signature_b64: "AA".into(),
+                        user_handle_b64: None,
                     },
                 })
                 .unwrap(),

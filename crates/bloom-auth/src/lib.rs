@@ -7,11 +7,12 @@
 
 use async_trait::async_trait;
 use bloom_auth_api::{
-    APPROVAL_CHALLENGE_SCHEMA_V1, ApprovalChallenge, ApprovalCredentialRecord, ApprovalSignature,
+    APPROVAL_CHALLENGE_SCHEMA_V1, ApprovalChallenge, ApprovalCredentialRecord,
     ApprovalSignatureVerifier, ApprovalVerifier, AssuranceLevel, AuthApiError, AuthEntryRecord,
     AuthEntryState, AuthStoreView, AuthStoreWriter, CanonicalEnvelope, NonceState, PriceOracle,
     ReservationRecord, ReservationState, ReviewSessionRecord, SealedAction, SealedIntentRecord,
     SignedApproval, SignerKind, UnsignedApproval, ValuationPolicy, ValuationQuote,
+    WebAuthnAssertionRecord,
 };
 use bloom_prices::{CoinId, PricesClient};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -104,7 +105,7 @@ impl ApprovalSignatureVerifier for RejectingApprovalSignatureVerifier {
     async fn verify_signature(
         &self,
         _unsigned: &UnsignedApproval,
-        _signature: &ApprovalSignature,
+        _webauthn_assertion: &WebAuthnAssertionRecord,
         _now_ms: u64,
     ) -> Result<(), AuthApiError> {
         Err(AuthApiError::Denied(
@@ -506,13 +507,16 @@ impl AuthStore {
             Option<String>,
             Option<String>,
             Option<i64>,
+            Option<String>,
         );
         let row: PendingEntryRow = tx
             .query_row(
-                "SELECT intent_hash, assurance, wallet, petal_id, petal_digest,
-                        daemon_terms_digest, petal_policy_digest, policy_version
-                 FROM auth_entries
-                 WHERE surface = ?1 AND action_id = ?2 AND nonce_state = 'unused'",
+                "SELECT ae.intent_hash, ae.assurance, ae.wallet, ae.petal_id, ae.petal_digest,
+                        ae.daemon_terms_digest, ae.petal_policy_digest, ae.policy_version,
+                        si.sealed_action_json
+                 FROM auth_entries ae
+                 JOIN sealed_intents si ON si.intent_hash = ae.intent_hash
+                 WHERE ae.surface = ?1 AND ae.action_id = ?2 AND ae.nonce_state = 'unused'",
                 params![surface, action_id],
                 |row| {
                     Ok((
@@ -524,6 +528,7 @@ impl AuthStore {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -538,6 +543,7 @@ impl AuthStore {
             daemon_terms_digest,
             petal_policy_digest,
             policy_version,
+            sealed_action_json,
         ) = row;
         let (
             Some(wallet),
@@ -546,6 +552,7 @@ impl AuthStore {
             Some(daemon_terms_digest),
             Some(petal_policy_digest),
             Some(policy_version),
+            Some(sealed_action_json),
         ) = (
             wallet,
             petal_id,
@@ -553,12 +560,35 @@ impl AuthStore {
             daemon_terms_digest,
             petal_policy_digest,
             policy_version,
+            sealed_action_json,
         )
         else {
             return Err(AuthStoreError::Denied(
                 "entry predates the sealed-action schema and is void; re-stage the action".into(),
             ));
         };
+        let action: SealedAction = serde_json::from_str(&sealed_action_json)?;
+        action.validate().map_err(AuthStoreError::from_api)?;
+        let action_intent_hash = action.intent_hash().map_err(AuthStoreError::from_api)?;
+        if action_intent_hash != intent_hash {
+            return Err(AuthStoreError::Denied(
+                "sealed action intent_hash does not match auth entry".into(),
+            ));
+        }
+        let action_daemon_terms_digest = action
+            .daemon_terms_digest()
+            .map_err(AuthStoreError::from_api)?;
+        if wallet != action.wallet()
+            || petal_id != action.petal_id()
+            || petal_digest != action.petal_digest()
+            || daemon_terms_digest != action_daemon_terms_digest
+            || petal_policy_digest != action.petal_policy_digest
+            || policy_version as u64 != action.policy_version
+        {
+            return Err(AuthStoreError::Denied(
+                "auth entry sealed metadata does not match sealed action".into(),
+            ));
+        }
         tx.execute(
             "UPDATE auth_entries
              SET state = ?3, nonce = ?4, nonce_state = ?5, challenge_expiry_ms = ?6, updated_ms = ?7
@@ -576,17 +606,17 @@ impl AuthStore {
         tx.commit()?;
         Ok(ApprovalChallenge {
             schema: APPROVAL_CHALLENGE_SCHEMA_V1.to_string(),
-            action_id: action_id.to_string(),
-            wallet,
-            surface: surface.to_string(),
-            petal_id,
-            petal_digest,
-            intent_hash,
+            action_id: action.action_id().to_string(),
+            wallet: action.wallet().to_string(),
+            surface: action.surface().to_string(),
+            petal_id: action.petal_id().to_string(),
+            petal_digest: action.petal_digest().to_string(),
+            intent_hash: action_intent_hash,
             server_nonce: server_nonce.to_string(),
             assurance: parse_assurance(&assurance)?,
-            daemon_terms_digest,
-            petal_policy_digest,
-            policy_version: policy_version as u64,
+            daemon_terms_digest: action_daemon_terms_digest,
+            petal_policy_digest: action.petal_policy_digest.clone(),
+            policy_version: action.policy_version,
             expiry_ms,
         })
     }
@@ -939,11 +969,11 @@ impl AuthStore {
         };
         let (envelope_json, sealed_at_ms, sealed_action_json): (String, i64, Option<String>) = tx
             .query_row(
-                "SELECT envelope_json, sealed_at_ms, sealed_action_json
+            "SELECT envelope_json, sealed_at_ms, sealed_action_json
                  FROM sealed_intents WHERE intent_hash = ?1",
-                params![approval.intent_hash],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
+            params![approval.intent_hash],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
         let envelope: CanonicalEnvelope = serde_json::from_str(&envelope_json)?;
         let action: Option<SealedAction> = sealed_action_json
             .as_deref()
@@ -1329,7 +1359,7 @@ where
     ) -> Result<(), AuthApiError> {
         let unsigned = approval.unsigned_payload();
         self.signature_verifier
-            .verify_signature(&unsigned, &approval.signature, now_ms)
+            .verify_signature(&unsigned, &approval.webauthn_assertion, now_ms)
             .await?;
         let mut store = self
             .store
@@ -1609,11 +1639,13 @@ impl AuthStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use bloom_auth_api::{
-        ApprovalSignature, CanonicalEnvelope, CanonicalIntentHeader,
-        CANONICAL_INTENT_HEADER_SCHEMA_V2, ExecutorKind, SignerTransport,
-        petal_identity::{FIRST_PARTY_PETAL_VERSION_V0, PETAL_ID_PAID_HTTP,
-            PLACEHOLDER_DIGEST_PAID_HTTP},
+        CANONICAL_INTENT_HEADER_SCHEMA_V2, CanonicalEnvelope, CanonicalIntentHeader, ExecutorKind,
+        SignerTransport,
+        petal_identity::{
+            FIRST_PARTY_PETAL_VERSION_V0, PETAL_ID_PAID_HTTP, PLACEHOLDER_DIGEST_PAID_HTTP,
+        },
     };
 
     fn envelope() -> CanonicalEnvelope {
@@ -1623,10 +1655,32 @@ mod tests {
     /// Build a faithful signed approval for a daemon-issued challenge, the way
     /// a real client would (echoing every daemon-issued field).
     fn approval_for(challenge: &ApprovalChallenge) -> SignedApproval {
-        UnsignedApproval::for_challenge(challenge, SignerTransport::BrowserWebauthn, None, None)
-            .into_signed(ApprovalSignature::Test {
-                sig_hex: "00".into(),
-            })
+        let unsigned = UnsignedApproval::for_challenge(
+            challenge,
+            SignerTransport::BrowserWebauthn,
+            Some("cred-1".into()),
+            None,
+        );
+        let assertion = webauthn_assertion_for(&unsigned);
+        unsigned.into_signed(assertion)
+    }
+
+    fn webauthn_assertion_for(unsigned: &UnsignedApproval) -> WebAuthnAssertionRecord {
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(unsigned.challenge_hash().unwrap());
+        let client_data_json = serde_json::json!({
+            "type": "webauthn.get",
+            "challenge": challenge,
+            "origin": "http://localhost:18734",
+        });
+        WebAuthnAssertionRecord {
+            credential_id: "cred-1".into(),
+            authenticator_data_b64: "AA".into(),
+            client_data_json_b64: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&client_data_json).unwrap()),
+            signature_b64: "AA".into(),
+            user_handle_b64: None,
+        }
     }
 
     #[test]
@@ -2537,6 +2591,48 @@ mod tests {
     }
 
     #[test]
+    fn issue_challenge_requires_stored_sealed_action() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        let action =
+            SealedAction::seal_with_default_terms(envelope(), AssuranceLevel::Standard, 100)
+                .unwrap();
+        let staged = store.stage_action(&action, 100).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sealed_intents SET sealed_action_json = NULL WHERE intent_hash = ?1",
+                params![staged.intent_hash],
+            )
+            .unwrap();
+
+        let err = store
+            .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
+            .unwrap_err();
+        assert!(err.to_string().contains("re-stage"), "{err}");
+    }
+
+    #[test]
+    fn issue_challenge_rejects_auth_entry_metadata_drift_from_sealed_action() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        let action =
+            SealedAction::seal_with_default_terms(envelope(), AssuranceLevel::Standard, 100)
+                .unwrap();
+        store.stage_action(&action, 100).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE auth_entries SET daemon_terms_digest = ?3 WHERE surface = ?1 AND action_id = ?2",
+                params!["requests", "req_1", "9".repeat(64)],
+            )
+            .unwrap();
+
+        let err = store
+            .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
+            .unwrap_err();
+        assert!(err.to_string().contains("sealed metadata"), "{err}");
+    }
+
+    #[test]
     fn restaging_same_action_id_with_different_daemon_context_is_denied() {
         let mut store = AuthStore::open_in_memory_for_tests().unwrap();
         let action =
@@ -2629,10 +2725,14 @@ mod tests {
             policy_version: 0,
             expiry_ms: 220,
             signer_transport: SignerTransport::BrowserWebauthn,
-            credential_id: None,
+            credential_id: "cred-1".into(),
             review_session_id: None,
-            signature: ApprovalSignature::Test {
-                sig_hex: "00".into(),
+            webauthn_assertion: WebAuthnAssertionRecord {
+                credential_id: "cred-1".into(),
+                authenticator_data_b64: "AA".into(),
+                client_data_json_b64: "e30".into(),
+                signature_b64: "AA".into(),
+                user_handle_b64: None,
             },
         };
         let err = store

@@ -1727,9 +1727,9 @@ mod tests {
     use super::*;
     use alloy::primitives::{Address, B256, Signature};
     use bloom_auth_api::{
-        APPROVAL_CHALLENGE_SCHEMA_V1, APPROVAL_SCHEMA_V1, ApprovalSignature, ApprovalVerifier,
-        AuthApiError, AuthEntryRecord, AuthEntryState, AuthStoreWriter, NonceState,
-        SignerTransport,
+        APPROVAL_CHALLENGE_SCHEMA_V1, APPROVAL_SCHEMA_V1, ApprovalVerifier, AuthApiError,
+        AuthEntryRecord, AuthEntryState, AuthStoreWriter, NonceState, SignerTransport,
+        WebAuthnAssertionRecord,
     };
     use bloom_proto::AddressBook;
     use bloom_tx::outbox::Outbox;
@@ -2253,10 +2253,14 @@ mod tests {
                 policy_version: 0,
                 expiry_ms: now_ms_u64() + 60_000,
                 signer_transport: SignerTransport::BrowserWebauthn,
-                credential_id: None,
+                credential_id: "cred-1".into(),
                 review_session_id: None,
-                signature: ApprovalSignature::Test {
-                    sig_hex: "00".into(),
+                webauthn_assertion: WebAuthnAssertionRecord {
+                    credential_id: "cred-1".into(),
+                    authenticator_data_b64: "AA".into(),
+                    client_data_json_b64: "e30".into(),
+                    signature_b64: "AA".into(),
+                    user_handle_b64: None,
                 },
             },
         )
@@ -2369,10 +2373,14 @@ mod tests {
                 policy_version: 0,
                 expiry_ms: now_ms_u64() + 60_000,
                 signer_transport: SignerTransport::BrowserWebauthn,
-                credential_id: None,
+                credential_id: "cred-1".into(),
                 review_session_id: None,
-                signature: ApprovalSignature::Test {
-                    sig_hex: "00".into(),
+                webauthn_assertion: WebAuthnAssertionRecord {
+                    credential_id: "cred-1".into(),
+                    authenticator_data_b64: "AA".into(),
+                    client_data_json_b64: "e30".into(),
+                    signature_b64: "AA".into(),
+                    user_handle_b64: None,
                 },
             },
         )
@@ -2422,10 +2430,14 @@ mod tests {
                 policy_version: 0,
                 expiry_ms: now_ms_u64() + 60_000,
                 signer_transport: SignerTransport::BrowserWebauthn,
-                credential_id: None,
+                credential_id: "cred-1".into(),
                 review_session_id: None,
-                signature: ApprovalSignature::Test {
-                    sig_hex: "00".into(),
+                webauthn_assertion: WebAuthnAssertionRecord {
+                    credential_id: "cred-1".into(),
+                    authenticator_data_b64: "AA".into(),
+                    client_data_json_b64: "e30".into(),
+                    signature_b64: "AA".into(),
+                    user_handle_b64: None,
                 },
             },
         )
@@ -2498,10 +2510,14 @@ mod tests {
                 policy_version: 0,
                 expiry_ms: now_ms_u64() + 60_000,
                 signer_transport: SignerTransport::BrowserWebauthn,
-                credential_id: None,
+                credential_id: "cred-1".into(),
                 review_session_id: None,
-                signature: ApprovalSignature::Test {
-                    sig_hex: "00".into(),
+                webauthn_assertion: WebAuthnAssertionRecord {
+                    credential_id: "cred-1".into(),
+                    authenticator_data_b64: "AA".into(),
+                    client_data_json_b64: "e30".into(),
+                    signature_b64: "AA".into(),
+                    user_handle_b64: None,
                 },
             },
         )

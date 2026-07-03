@@ -50,7 +50,7 @@ use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 use bloom_auth_api::{
-    ApprovalSignature, ApprovalSignatureVerifier, AuthApiError, UnsignedApproval,
+    ApprovalSignatureVerifier, AuthApiError, UnsignedApproval, WebAuthnAssertionRecord,
 };
 use bloom_proto::{Policy, checksum_address};
 
@@ -950,12 +950,12 @@ impl ApprovalSignatureVerifier for KeystoreApprovalSignatureVerifier {
     async fn verify_signature(
         &self,
         unsigned: &UnsignedApproval,
-        signature: &ApprovalSignature,
+        webauthn_assertion: &WebAuthnAssertionRecord,
         _now_ms: u64,
     ) -> Result<(), AuthApiError> {
         match self
             .keystore
-            .verify_approval_signature_with_passkey(unsigned, signature)
+            .verify_approval_signature_with_passkey(unsigned, webauthn_assertion)
             .await
         {
             Ok(()) => Ok(()),
