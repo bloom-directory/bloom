@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ipc;
+pub mod sign_hash;
 
 mod ens_resolver;
 mod price_oracle;
@@ -359,6 +360,28 @@ impl Daemon {
             Some(auth_verifier.clone()),
             Some(auth_verifier),
         );
+        // WS-1 wiring: in-memory grant store + first-party attestation
+        // registry + keystore-backed PetalHost. All three live behind the
+        // existing `AuthServices` so VFS handlers and the new `sign_hash`
+        // IPC method can call them without going through the old
+        // verifier/nfc paths. The concrete store / registry / host impls
+        // can be swapped (test doubles, post-MVP venues) by replacing
+        // the `Arc<dyn ...>` references.
+        let grant_store: Arc<dyn bloom_auth_api::GrantStore> =
+            Arc::new(bloom_auth::grant_store::InMemoryGrantStore::default());
+        let attestation_registry: Arc<dyn bloom_auth_api::SigningAttestationSchemaRegistry> =
+            Arc::new(bloom_auth_api::DefaultAttestationRegistry::new());
+        let petal_host: Arc<dyn bloom_auth_api::PetalHost> =
+            Arc::new(bloom_keystore::petal_host::KeystorePetalHost::new(
+                Arc::new(keystore.clone()),
+                grant_store.clone(),
+                attestation_registry.clone(),
+                audit_arc.clone(),
+            ));
+        let auth_services = auth_services
+            .with_grant_store(grant_store)
+            .with_attestation_registry(attestation_registry)
+            .with_petal_host(petal_host);
         let path_cache = Arc::new(PathCache::new());
 
         let watch_registry = Arc::new(
