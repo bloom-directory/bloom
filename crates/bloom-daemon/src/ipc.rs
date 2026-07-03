@@ -387,6 +387,34 @@ impl IpcServer {
         let mut sealed_approval_written = false;
         match info.kind {
             WalletKind::PasskeyGated => {
+                if is_wallet_policy_write(wallet, &path) {
+                    return match self.vfs.write(&path, &bytes).await {
+                        Ok(()) => Ok(()),
+                        Err(first_err) => {
+                            let signed = self
+                                .maybe_sign_sealed_approval(
+                                    keystore,
+                                    wallet,
+                                    &path,
+                                    &bytes,
+                                    Some(write_unlocked_intent(
+                                        wallet,
+                                        &path,
+                                        &bytes,
+                                        Some(bloom_proto::checksum_address(&info.address)),
+                                        keystore.root().parent().map(|home| home.join("outbox")),
+                                        keystore.raw_policy(wallet).ok().map(|(p, _)| p).as_deref(),
+                                    )),
+                                )
+                                .await?;
+                            if signed {
+                                self.vfs.write(&path, &bytes).await
+                            } else {
+                                Err(first_err)
+                            }
+                        }
+                    };
+                }
                 // A daemon may have a signer cached from a previous ceremony.
                 // `write_unlocked` is the explicit "fresh user present" lane
                 // for VFS writes that sign or broadcast, so force the browser
@@ -577,7 +605,7 @@ impl IpcServer {
             None,
             review_session_id,
         );
-        if is_policy_session_new(wallet, path)
+        if (is_policy_session_new(wallet, path) || is_wallet_policy_write(wallet, path))
             && let Some(signer_cache) = self.signer_cache.as_ref()
         {
             crate::sealed_ceremony::run_sealed_approval_ceremony(
@@ -1025,6 +1053,19 @@ fn sealed_approval_paths(
             dir.join("approval.json"),
         ));
     }
+    if is_wallet_policy_write(wallet, path) {
+        let old_policy = keystore.raw_policy(wallet).ok()?.0;
+        let action_id = wallet_policy_action_id(wallet, old_policy.as_bytes(), bytes);
+        let dir = keystore
+            .root()
+            .join(wallet)
+            .join("policy-updates")
+            .join(action_id);
+        return Some((
+            dir.join("approval_challenge.json"),
+            dir.join("approval.json"),
+        ));
+    }
     if let Some(dir) = polymarket_onboard_dir(home, wallet, path) {
         return Some((
             dir.join("approval_challenge.json"),
@@ -1053,6 +1094,21 @@ fn policy_session_action_id(wallet: &str, data: &[u8]) -> String {
     hasher.update(&[0]);
     hasher.update(data);
     format!("ps-{}", hasher.finalize().to_hex())
+}
+
+fn wallet_policy_hash_hex(policy: &[u8]) -> String {
+    blake3::hash(policy).to_hex().to_string()
+}
+
+fn wallet_policy_action_id(wallet: &str, old_policy: &[u8], proposed_policy: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.wallet_policy.update.v1");
+    hasher.update(wallet.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(wallet_policy_hash_hex(old_policy).as_bytes());
+    hasher.update(&[0]);
+    hasher.update(wallet_policy_hash_hex(proposed_policy).as_bytes());
+    format!("policy-update-{}", hasher.finalize().to_hex())
 }
 
 fn outbox_confirm_dir(wallet: &str, path: &VfsPath, outbox_root: &Path) -> Option<PathBuf> {

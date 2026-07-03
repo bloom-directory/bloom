@@ -27,20 +27,20 @@ use std::sync::Arc;
 use alloy::signers::SignerSync;
 use async_trait::async_trait;
 use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD as B64_STANDARD, URL_SAFE_NO_PAD};
 use bloom_auth_api::{
     ApprovalChallenge, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, DaemonGrantTerms,
     EVM_ERC20_TRANSFER_METHOD, EVM_OWNER_SESSION_MINT_ACTION_KIND,
     EVM_OWNER_SESSION_USE_ACTION_KIND, EVM_OWNER_SIGNING_SESSION_KIND, EVM_TX_SIGN_INTENT,
     EvmFeePolicy, EvmOwnerSigningSessionCounters, EvmOwnerSigningSessionScope,
-    EvmOwnerSigningSessionUse, ExecutorKind, PetalPolicySnapshot, SealedAction, SignedApproval,
-    petal_identity,
+    EvmOwnerSigningSessionUse, ExecutorKind, PetalPolicySnapshot, SIGNING_ATTESTATION_SCHEMA_V1,
+    SealedAction, SignHashRequest, SignedApproval, SigningAttestation, petal_identity,
 };
 use bloom_chain::ChainRegistry;
 use bloom_keystore::Keystore;
 use bloom_proto::{
-    AddressBook, CapabilityStatus, CapabilityViewEntry, HomeWritePermit, Policy, RawIntent,
-    SigningModel, Venue,
+    AddressBook, CapabilityStatus, CapabilityViewEntry, HomeWritePermit, Policy, PolicyEditClass,
+    RawIntent, SigningModel, Venue, classify_policy_edit,
 };
 use bloom_tx::{
     intent_parser,
@@ -55,6 +55,10 @@ use crate::path::VfsPath;
 const APPROVAL_FILE: &str = "approval.json";
 const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
 const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
+const WALLET_POLICY_SURFACE: &str = "wallet-policy";
+const WALLET_POLICY_ACTION_KIND: &str = "policy_update";
+const WALLET_POLICY_SUBJECT_SCHEMA: &str = "bloom.wallet_policy_update_subject.v1";
+const WALLET_POLICY_SIGN_INTENT: &str = "wallet_policy.sign";
 
 #[derive(Clone)]
 pub struct WalletsHandler {
@@ -653,6 +657,174 @@ impl WalletsHandler {
         Err(HandlerError::PermissionDenied)
     }
 
+    async fn write_wallet_policy_update(
+        &self,
+        wallet: &str,
+        path: &str,
+        data: &[u8],
+    ) -> Result<(), HandlerError> {
+        let proposed_policy_toml = std::str::from_utf8(data)
+            .map_err(|e| HandlerError::invalid(format!("policy must be UTF-8: {e}")))?;
+        let proposed_policy: Policy = toml::from_str(proposed_policy_toml)
+            .map_err(|e| HandlerError::invalid(format!("invalid policy TOML: {e}")))?;
+        let (old_policy_toml, kind) = self.keystore.raw_policy(wallet).map_err(err_be)?;
+        if kind != bloom_keystore::WalletKind::PasskeyGated {
+            self.keystore.write_policy(wallet, data).map_err(err_be)?;
+            return Ok(());
+        }
+        if old_policy_toml.as_bytes() == data {
+            return Ok(());
+        }
+        let old_policy: Policy = toml::from_str(&old_policy_toml)
+            .map_err(|e| HandlerError::backend(format!("existing policy TOML is invalid: {e}")))?;
+        let now = now_ms_u64();
+        let action = wallet_policy_sealed_action(
+            wallet,
+            path,
+            old_policy_toml.as_bytes(),
+            data,
+            &old_policy,
+            &proposed_policy,
+            now,
+        )?;
+        let action_id = action.action_id().to_string();
+        let petal_id = action.petal_id().to_string();
+        let petal_digest = action.petal_digest().to_string();
+        self.auth_services
+            .require_writer()?
+            .stage_action(action, now)
+            .await
+            .map_err(|e| HandlerError::backend(format!("stage wallet-policy action: {e}")))?;
+        if self
+            .auth_services
+            .require_grant_store()?
+            .get_active(wallet, &action_id, &petal_id, &petal_digest, now)
+            .await
+            .map_err(|e| HandlerError::backend(format!("lookup wallet-policy grant: {e}")))?
+            .is_none()
+        {
+            let approval_path = self
+                .keystore
+                .root()
+                .join(wallet)
+                .join("policy-updates")
+                .join(&action_id)
+                .join(APPROVAL_FILE);
+            if approval_path.exists() {
+                let approval: SignedApproval = read_json(&approval_path)?;
+                self.auth_services
+                    .require_approval_verifier()?
+                    .verify_and_mint_grant(
+                        approval,
+                        self.auth_services.require_grant_store()?.as_ref(),
+                        now_ms_u64(),
+                    )
+                    .await
+                    .map_err(|e| HandlerError::invalid(format!("Sealed Approval rejected: {e}")))?;
+            } else {
+                let challenge = self.issue_wallet_policy_challenge(&action_id).await?;
+                let challenge_path = approval_path.with_file_name(APPROVAL_CHALLENGE_FILE);
+                if let Some(parent) = challenge_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                write_json(challenge_path, &challenge)?;
+                return Err(HandlerError::PermissionDenied);
+            }
+        }
+        self.execute_wallet_policy_update(wallet, &action_id, &old_policy_toml, data)
+            .await
+    }
+
+    async fn issue_wallet_policy_challenge(
+        &self,
+        action_id: &str,
+    ) -> Result<ApprovalChallenge, HandlerError> {
+        let now = now_ms_u64();
+        let mut nonce = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+        let nonce = URL_SAFE_NO_PAD.encode(nonce);
+        self.auth_services
+            .require_writer()?
+            .issue_challenge(
+                WALLET_POLICY_SURFACE,
+                action_id,
+                &nonce,
+                now + APPROVAL_TTL_MS,
+                now,
+            )
+            .await
+            .map_err(|e| HandlerError::backend(format!("issue wallet-policy challenge: {e}")))
+    }
+
+    async fn execute_wallet_policy_update(
+        &self,
+        wallet: &str,
+        action_id: &str,
+        old_policy_toml: &str,
+        proposed_policy: &[u8],
+    ) -> Result<(), HandlerError> {
+        let current = std::fs::read(self.keystore.root().join(wallet).join("policy.toml"))?;
+        if current != old_policy_toml.as_bytes() {
+            return Err(HandlerError::invalid(
+                "wallet policy changed after approval; restage the policy update",
+            ));
+        }
+        let proposed_policy_toml = std::str::from_utf8(proposed_policy)
+            .map_err(|e| HandlerError::invalid(format!("policy must be UTF-8: {e}")))?;
+        let policy_hash = blake3::hash(format!("{wallet}:{proposed_policy_toml}").as_bytes());
+        let policy_hash_hex = hex::encode(policy_hash.as_bytes());
+        let hash_hex = format!("0x{policy_hash_hex}");
+        let mut facts = BTreeMap::new();
+        facts.insert("wallet".into(), serde_json::json!(wallet));
+        facts.insert("action_id".into(), serde_json::json!(action_id));
+        facts.insert("policy_hash_hex".into(), serde_json::json!(hash_hex));
+        facts.insert(
+            "proposed_policy_blake3".into(),
+            serde_json::json!(wallet_policy_hash_hex(proposed_policy)),
+        );
+        facts.insert(
+            "installation_target".into(),
+            serde_json::json!(format!("/wallets/{wallet}/policy.toml")),
+        );
+        let sealed_sig = self
+            .auth_services
+            .require_petal_host()?
+            .sign_hash(
+                SignHashRequest {
+                    wallet: wallet.to_string(),
+                    action_id: action_id.to_string(),
+                    intent: WALLET_POLICY_SIGN_INTENT.into(),
+                    hash_hex,
+                },
+                &SigningAttestation {
+                    schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
+                    petal_id: petal_identity::PETAL_ID_WALLET_POLICY.into(),
+                    petal_digest: petal_identity::PLACEHOLDER_DIGEST_WALLET_POLICY.into(),
+                    intent: WALLET_POLICY_SIGN_INTENT.into(),
+                    facts,
+                },
+                now_ms_u64(),
+            )
+            .await
+            .map_err(|e| HandlerError::invalid(format!("wallet-policy signing denied: {e}")))?;
+        let sig_raw = B64_STANDARD
+            .decode(sealed_sig.signature_b64.as_bytes())
+            .map_err(|e| HandlerError::backend(format!("decode wallet-policy signature: {e}")))?;
+        let sig = alloy::primitives::Signature::from_raw(&sig_raw)
+            .map_err(|e| HandlerError::backend(format!("wallet-policy signature: {e}")))?;
+        let sig_json = serde_json::json!({
+            "blake3_hex": policy_hash_hex,
+            "sig_hex": sig.to_string(),
+        });
+        let wallet_dir = self.keystore.root().join(wallet);
+        write_atomic_file(
+            &wallet_dir.join("policy.toml.sig"),
+            sig_json.to_string().as_bytes(),
+        )?;
+        write_atomic_file(&wallet_dir.join("policy.toml"), proposed_policy)?;
+        Ok(())
+    }
+
     async fn require_sealed_evm_owner_session_approval(
         &self,
         wallet: &str,
@@ -791,6 +963,20 @@ fn write_json(path: impl AsRef<Path>, v: &impl serde::Serialize) -> Result<(), H
     Ok(())
 }
 
+fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<(), HandlerError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| HandlerError::backend("atomic write target has no file name"))?;
+    let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", now_ms_u64()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn read_json<T: for<'de> serde::Deserialize<'de>>(
     path: impl AsRef<Path>,
 ) -> Result<T, HandlerError> {
@@ -850,6 +1036,179 @@ fn evm_owner_session_action_id(wallet: &str, data: &[u8]) -> String {
     hasher.update(&[0]);
     hasher.update(data);
     format!("evm-ownersess-{}", hasher.finalize().to_hex())
+}
+
+fn wallet_policy_hash_hex(policy: &[u8]) -> String {
+    blake3::hash(policy).to_hex().to_string()
+}
+
+fn wallet_policy_action_id(wallet: &str, old_policy: &[u8], proposed_policy: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.wallet_policy.update.v1");
+    hasher.update(wallet.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(wallet_policy_hash_hex(old_policy).as_bytes());
+    hasher.update(&[0]);
+    hasher.update(wallet_policy_hash_hex(proposed_policy).as_bytes());
+    format!("policy-update-{}", hasher.finalize().to_hex())
+}
+
+fn wallet_policy_diff_summary(
+    before: &Policy,
+    after: &Policy,
+    old_policy: &[u8],
+    proposed_policy: &[u8],
+) -> Result<serde_json::Value, HandlerError> {
+    let class = classify_policy_edit(before, after);
+    let (classification, reasons) = match class {
+        PolicyEditClass::NotExpanding => ("not_expanding", Vec::new()),
+        PolicyEditClass::AuthorityExpanding { reasons } => ("authority_expanding", reasons),
+    };
+    Ok(serde_json::json!({
+        "schema": "bloom.wallet_policy_diff.v1",
+        "classification": classification,
+        "reasons": reasons,
+        "old_policy_blake3": wallet_policy_hash_hex(old_policy),
+        "proposed_policy_blake3": wallet_policy_hash_hex(proposed_policy),
+        "old_line_count": String::from_utf8_lossy(old_policy).lines().count(),
+        "proposed_line_count": String::from_utf8_lossy(proposed_policy).lines().count(),
+    }))
+}
+
+fn wallet_policy_assurance(before: &Policy, after: &Policy) -> AssuranceLevel {
+    if classify_policy_edit(before, after).is_authority_expanding() {
+        AssuranceLevel::Hardened
+    } else {
+        AssuranceLevel::Standard
+    }
+}
+
+fn wallet_policy_canonical_envelope(
+    wallet: &str,
+    path: &str,
+    action_id: &str,
+    old_policy: &[u8],
+    proposed_policy: &[u8],
+    before: &Policy,
+    after: &Policy,
+) -> Result<CanonicalEnvelope, HandlerError> {
+    let diff = wallet_policy_diff_summary(before, after, old_policy, proposed_policy)?;
+    let subject = serde_json::to_vec(&serde_json::json!({
+        "schema": WALLET_POLICY_SUBJECT_SCHEMA,
+        "wallet": wallet,
+        "path": path,
+        "action_kind": WALLET_POLICY_ACTION_KIND,
+        "installation_target": format!("/wallets/{wallet}/policy.toml"),
+        "policy_version": 0,
+        "old_policy_blake3": wallet_policy_hash_hex(old_policy),
+        "proposed_policy_blake3": wallet_policy_hash_hex(proposed_policy),
+        "proposed_policy_toml_b64": B64_STANDARD.encode(proposed_policy),
+        "normalized_diff": diff,
+    }))
+    .map_err(|e| HandlerError::backend(e.to_string()))?;
+    Ok(CanonicalEnvelope::new(
+        CanonicalIntentHeader {
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            wallet: wallet.to_string(),
+            surface: WALLET_POLICY_SURFACE.into(),
+            action_id: action_id.to_string(),
+            petal_id: petal_identity::PETAL_ID_WALLET_POLICY.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_WALLET_POLICY.into(),
+            petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+            executor_kind: ExecutorKind::FirstParty,
+            network: "wallet-policy".into(),
+            account: wallet.into(),
+            action_kind: WALLET_POLICY_ACTION_KIND.into(),
+            value_movement: false,
+            authority_change: true,
+            expires_ms: 0,
+        },
+        "wallet_policy_update",
+        WALLET_POLICY_SUBJECT_SCHEMA,
+        subject,
+    ))
+}
+
+fn wallet_policy_sealed_action(
+    wallet: &str,
+    path: &str,
+    old_policy: &[u8],
+    proposed_policy: &[u8],
+    before: &Policy,
+    after: &Policy,
+    now_ms: u64,
+) -> Result<SealedAction, HandlerError> {
+    let action_id = wallet_policy_action_id(wallet, old_policy, proposed_policy);
+    let assurance = wallet_policy_assurance(before, after);
+    let envelope = wallet_policy_canonical_envelope(
+        wallet,
+        path,
+        &action_id,
+        old_policy,
+        proposed_policy,
+        before,
+        after,
+    )?;
+    let diff = wallet_policy_diff_summary(before, after, old_policy, proposed_policy)?;
+    let mut extra = BTreeMap::new();
+    extra.insert(
+        "action_kind".to_string(),
+        serde_json::json!(WALLET_POLICY_ACTION_KIND),
+    );
+    extra.insert(
+        "old_policy_blake3".to_string(),
+        serde_json::json!(wallet_policy_hash_hex(old_policy)),
+    );
+    extra.insert(
+        "proposed_policy_blake3".to_string(),
+        serde_json::json!(wallet_policy_hash_hex(proposed_policy)),
+    );
+    extra.insert("classification".to_string(), diff["classification"].clone());
+    let terms = DaemonGrantTerms {
+        max_ttl_secs: APPROVAL_TTL_MS / 1_000,
+        max_signatures: 1,
+        allowed_sign_intents: vec![WALLET_POLICY_SIGN_INTENT.into()],
+        assurance,
+        extra,
+    };
+    let mut config = BTreeMap::new();
+    config.insert(
+        "installation_target".to_string(),
+        serde_json::json!(format!("/wallets/{wallet}/policy.toml")),
+    );
+    config.insert(
+        "old_policy_blake3".to_string(),
+        serde_json::json!(wallet_policy_hash_hex(old_policy)),
+    );
+    config.insert(
+        "proposed_policy_blake3".to_string(),
+        serde_json::json!(wallet_policy_hash_hex(proposed_policy)),
+    );
+    config.insert("normalized_diff".to_string(), diff.clone());
+    let snapshot = PetalPolicySnapshot {
+        policy_version: 0,
+        wallet: wallet.to_string(),
+        petal_id: petal_identity::PETAL_ID_WALLET_POLICY.into(),
+        petal_digest: petal_identity::PLACEHOLDER_DIGEST_WALLET_POLICY.into(),
+        caps: BTreeMap::new(),
+        hard_rules: Vec::new(),
+        step_up_rules: Vec::new(),
+        config,
+        budget_state: BTreeMap::new(),
+        session_scope: None,
+    };
+    SealedAction::new(
+        envelope,
+        format!(
+            "Update wallet policy for {wallet} ({})",
+            diff["classification"].as_str().unwrap_or("unknown")
+        ),
+        Vec::new(),
+        terms,
+        snapshot,
+        now_ms,
+    )
+    .map_err(err_be)
 }
 
 fn evm_owner_session_sealed_action(
@@ -1236,8 +1595,10 @@ impl WalletsHandler {
             return self.write_sign(wallet, &segs[2], data).await;
         }
         if segs.len() == 2 && segs[1] == "policy.toml" {
-            self.keystore.write_policy(wallet, data).map_err(err_be)?;
-            return Ok(());
+            self.write_permit()?;
+            return self
+                .write_wallet_policy_update(wallet, &path.to_string_path(), data)
+                .await;
         }
         // PasskeyGated wallet: browser WebAuthn authentication ceremony.
         if segs.len() == 2 && segs[1] == "unlock-passkey" {
@@ -2094,8 +2455,8 @@ mod tests {
     use bloom_auth_api::{
         APPROVAL_CHALLENGE_SCHEMA_V1, APPROVAL_SCHEMA_V1, ApprovalVerifier, AuthApiError,
         AuthEntryRecord, AuthEntryState, AuthStoreView, AuthStoreWriter, DaemonGrantTerms,
-        GrantStore, NonceState, SealedAction, SealedApprovalGrant, SignerTransport,
-        StandingSessionRecord, WebAuthnAssertionRecord,
+        GrantStore, NonceState, PetalHost, SealedAction, SealedApprovalGrant, SealedPetalContext,
+        SealedSignature, SignerTransport, StandingSessionRecord, WebAuthnAssertionRecord,
     };
     use bloom_proto::AddressBook;
     use bloom_tx::outbox::Outbox;
@@ -2114,6 +2475,10 @@ mod tests {
     struct ChallengeOnlyWriter;
 
     struct AcceptingVerifier;
+
+    struct SigningPetalHost {
+        keystore: Keystore,
+    }
 
     struct UnusedGrantStore;
 
@@ -2172,7 +2537,7 @@ mod tests {
             approval: SignedApproval,
             _now_ms: u64,
         ) -> Result<(), AuthApiError> {
-            if approval.surface != "policy-session" {
+            if approval.surface != "policy-session" && approval.surface != WALLET_POLICY_SURFACE {
                 return Err(AuthApiError::Denied("wrong surface".into()));
             }
             Ok(())
@@ -2186,7 +2551,8 @@ mod tests {
         ) -> Result<SealedApprovalGrant, AuthApiError> {
             self.verify_and_consume(approval.clone(), now_ms).await?;
             let mut daemon_terms = DaemonGrantTerms::minimal(AssuranceLevel::Hardened);
-            daemon_terms.allowed_sign_intents = vec![EVM_TX_SIGN_INTENT.into()];
+            daemon_terms.allowed_sign_intents =
+                vec![EVM_TX_SIGN_INTENT.into(), WALLET_POLICY_SIGN_INTENT.into()];
             daemon_terms.max_signatures = 5;
             Ok(SealedApprovalGrant {
                 grant_id: format!("test-grant-{}", approval.action_id),
@@ -2205,6 +2571,56 @@ mod tests {
                 consumed_signature_count: 0,
                 revoked: false,
             })
+        }
+    }
+
+    #[async_trait]
+    impl PetalHost for SigningPetalHost {
+        async fn seal_context(&self, _petal_id: &str) -> Result<SealedPetalContext, AuthApiError> {
+            Err(AuthApiError::Store("test seal_context unused".into()))
+        }
+
+        async fn sealed_policy_snapshot(
+            &self,
+            _wallet: &str,
+            _petal_id: &str,
+        ) -> Result<PetalPolicySnapshot, AuthApiError> {
+            Err(AuthApiError::Store(
+                "test sealed_policy_snapshot unused".into(),
+            ))
+        }
+
+        async fn sign_hash(
+            &self,
+            request: SignHashRequest,
+            attestation: &SigningAttestation,
+            now_ms: u64,
+        ) -> Result<SealedSignature, AuthApiError> {
+            if request.intent != WALLET_POLICY_SIGN_INTENT
+                || attestation.intent != WALLET_POLICY_SIGN_INTENT
+                || attestation.petal_id != petal_identity::PETAL_ID_WALLET_POLICY
+            {
+                return Err(AuthApiError::Denied("unexpected wallet-policy sign".into()));
+            }
+            let hash = hex::decode(request.hash_hex.trim_start_matches("0x"))
+                .map_err(|e| AuthApiError::Denied(format!("hash hex: {e}")))?;
+            let hash = B256::from_slice(&hash);
+            let signer = self
+                .keystore
+                .signer(&request.wallet)
+                .map_err(|e| AuthApiError::Denied(format!("test signer: {e}")))?;
+            let sig = signer
+                .sign_hash_sync(&hash)
+                .map_err(|e| AuthApiError::Denied(format!("test sign: {e}")))?;
+            Ok(SealedSignature {
+                intent_hash: "test-wallet-policy-intent".into(),
+                signature_b64: B64_STANDARD.encode(sig.as_bytes()),
+                signed_at_ms: now_ms,
+            })
+        }
+
+        async fn audit(&self, _event: bloom_auth_api::AuditEvent) -> Result<(), AuthApiError> {
+            Ok(())
         }
     }
 
@@ -2241,6 +2657,15 @@ mod tests {
                 reservation_id: None,
                 updated_ms: now_ms,
             })
+        }
+
+        async fn stage_action(
+            &self,
+            action: SealedAction,
+            now_ms: u64,
+        ) -> Result<AuthEntryRecord, AuthApiError> {
+            self.stage_entry(action.envelope, action.daemon_terms.assurance, now_ms)
+                .await
         }
 
         async fn issue_challenge(
@@ -3660,6 +4085,52 @@ mod tests {
         info.address
     }
 
+    fn convert_wallet_to_passkey(f: &Fixture, name: &str) {
+        let wallet_dir = f._tmp.path().join("keystore").join(name);
+        std::fs::write(wallet_dir.join("kind"), b"passkey").unwrap();
+        f.handler.keystore.sign_policy(name).unwrap();
+    }
+
+    fn wallet_policy_auth_services(f: &Fixture) -> AuthServices {
+        AuthServices::new(
+            Some(Arc::new(AcceptingVerifier)),
+            None,
+            Some(Arc::new(ChallengeOnlyWriter)),
+        )
+        .with_grant_store(Arc::new(UnusedGrantStore))
+        .with_petal_host(Arc::new(SigningPetalHost {
+            keystore: f.handler.keystore.clone(),
+        }))
+    }
+
+    fn signed_wallet_policy_approval(challenge: &ApprovalChallenge) -> SignedApproval {
+        SignedApproval {
+            schema: APPROVAL_SCHEMA_V1.into(),
+            wallet: challenge.wallet.clone(),
+            surface: challenge.surface.clone(),
+            action_id: challenge.action_id.clone(),
+            intent_hash: challenge.intent_hash.clone(),
+            petal_id: challenge.petal_id.clone(),
+            petal_digest: challenge.petal_digest.clone(),
+            assurance: challenge.assurance,
+            server_nonce: challenge.server_nonce.clone(),
+            daemon_terms_digest: challenge.daemon_terms_digest.clone(),
+            petal_policy_digest: challenge.petal_policy_digest.clone(),
+            policy_version: challenge.policy_version,
+            expiry_ms: challenge.expiry_ms,
+            signer_transport: SignerTransport::BrowserWebauthn,
+            credential_id: "cred-1".into(),
+            review_session_id: None,
+            webauthn_assertion: WebAuthnAssertionRecord {
+                credential_id: "cred-1".into(),
+                authenticator_data_b64: "AA".into(),
+                client_data_json_b64: "e30".into(),
+                signature_b64: "AA".into(),
+                user_handle_b64: None,
+            },
+        }
+    }
+
     /// Passkey wallet: dir lists `unlock-passkey`, lookup gives writable file,
     /// and `kind` reads "passkey".
     #[tokio::test]
@@ -3692,6 +4163,166 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&bytes).trim(), "passkey");
+    }
+
+    #[tokio::test]
+    async fn wallet_policy_noop_write_does_not_stage_update() {
+        let mut f = make_handler();
+        convert_wallet_to_passkey(&f, "alice");
+        let services = wallet_policy_auth_services(&f);
+        f.handler = f.handler.with_auth_services(services);
+        let (policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
+        let p = VfsPath::parse("/alice/policy.toml").unwrap();
+        f.handler.write(&p, policy.as_bytes()).await.unwrap();
+        assert!(
+            !f.handler
+                .keystore
+                .root()
+                .join("alice")
+                .join("policy-updates")
+                .exists(),
+            "no-op policy write should not stage an approval challenge"
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_policy_expanding_edit_requires_hardened_sealed_approval_and_installs_signature()
+    {
+        let mut f = make_handler();
+        convert_wallet_to_passkey(&f, "alice");
+        let services = wallet_policy_auth_services(&f);
+        f.handler = f.handler.with_auth_services(services);
+        let (old_policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
+        let mut proposed: Policy = toml::from_str(&old_policy).unwrap();
+        proposed.approval.agent_autonomy = Some(bloom_proto::AgentAutonomyMode::UnderPolicy);
+        proposed.limits.max_tx_usd = Some("10".into());
+        proposed.limits.max_day_usd = Some("100".into());
+        let proposed = toml::to_string_pretty(&proposed).unwrap();
+        let action_id =
+            wallet_policy_action_id("alice", old_policy.as_bytes(), proposed.as_bytes());
+        let p = VfsPath::parse("/alice/policy.toml").unwrap();
+
+        let err = f.handler.write(&p, proposed.as_bytes()).await.unwrap_err();
+        assert!(matches!(err, HandlerError::PermissionDenied), "{err}");
+        let dir = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-updates")
+            .join(&action_id);
+        let challenge: ApprovalChallenge = read_json(dir.join(APPROVAL_CHALLENGE_FILE)).unwrap();
+        assert_eq!(challenge.surface, WALLET_POLICY_SURFACE);
+        assert_eq!(challenge.assurance, AssuranceLevel::Hardened);
+        let on_disk =
+            std::fs::read_to_string(f.handler.keystore.root().join("alice/policy.toml")).unwrap();
+        assert_eq!(on_disk, old_policy);
+
+        write_json(
+            dir.join(APPROVAL_FILE),
+            &signed_wallet_policy_approval(&challenge),
+        )
+        .unwrap();
+        f.handler.write(&p, proposed.as_bytes()).await.unwrap();
+        let on_disk =
+            std::fs::read_to_string(f.handler.keystore.root().join("alice/policy.toml")).unwrap();
+        assert_eq!(on_disk, proposed);
+        f.handler.keystore.info("alice").unwrap();
+    }
+
+    #[tokio::test]
+    async fn wallet_policy_tampered_retry_bytes_do_not_reuse_approval() {
+        let mut f = make_handler();
+        convert_wallet_to_passkey(&f, "alice");
+        let services = wallet_policy_auth_services(&f);
+        f.handler = f.handler.with_auth_services(services);
+        let (old_policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
+        let mut proposed: Policy = toml::from_str(&old_policy).unwrap();
+        proposed.denylists.recipients.insert("0x1111".into());
+        let proposed = toml::to_string_pretty(&proposed).unwrap();
+        let mut tampered: Policy = toml::from_str(&old_policy).unwrap();
+        tampered.approval.agent_autonomy = Some(bloom_proto::AgentAutonomyMode::UnderPolicy);
+        tampered.limits.max_tx_usd = Some("1000".into());
+        tampered.limits.max_day_usd = Some("1000".into());
+        let tampered = toml::to_string_pretty(&tampered).unwrap();
+        let action_id =
+            wallet_policy_action_id("alice", old_policy.as_bytes(), proposed.as_bytes());
+        let p = VfsPath::parse("/alice/policy.toml").unwrap();
+
+        assert!(matches!(
+            f.handler.write(&p, proposed.as_bytes()).await.unwrap_err(),
+            HandlerError::PermissionDenied
+        ));
+        let dir = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-updates")
+            .join(&action_id);
+        let challenge: ApprovalChallenge = read_json(dir.join(APPROVAL_CHALLENGE_FILE)).unwrap();
+        write_json(
+            dir.join(APPROVAL_FILE),
+            &signed_wallet_policy_approval(&challenge),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            f.handler.write(&p, tampered.as_bytes()).await.unwrap_err(),
+            HandlerError::PermissionDenied
+        ));
+        let on_disk =
+            std::fs::read_to_string(f.handler.keystore.root().join("alice/policy.toml")).unwrap();
+        assert_eq!(on_disk, old_policy);
+
+        f.handler.write(&p, proposed.as_bytes()).await.unwrap();
+        let on_disk =
+            std::fs::read_to_string(f.handler.keystore.root().join("alice/policy.toml")).unwrap();
+        assert_eq!(on_disk, proposed);
+    }
+
+    #[tokio::test]
+    async fn wallet_policy_tightening_edit_uses_standard_assurance() {
+        let mut f = make_handler();
+        let mut initial = Policy::default();
+        initial.approval.agent_autonomy = Some(bloom_proto::AgentAutonomyMode::UnderPolicy);
+        initial.limits.max_tx_usd = Some("10".into());
+        initial.limits.max_day_usd = Some("100".into());
+        f.handler
+            .keystore
+            .write_policy(
+                "alice",
+                toml::to_string_pretty(&initial).unwrap().as_bytes(),
+            )
+            .unwrap();
+        convert_wallet_to_passkey(&f, "alice");
+        let services = wallet_policy_auth_services(&f);
+        f.handler = f.handler.with_auth_services(services);
+        let (old_policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
+        let mut proposed: Policy = toml::from_str(&old_policy).unwrap();
+        proposed.approval.assurance = AssuranceLevel::Hardened;
+        proposed.limits.max_tx_usd = Some("5".into());
+        proposed.denylists.recipients.insert("0x2222".into());
+        let proposed = toml::to_string_pretty(&proposed).unwrap();
+        let old_parsed: Policy = toml::from_str(&old_policy).unwrap();
+        let proposed_parsed: Policy = toml::from_str(&proposed).unwrap();
+        let action = wallet_policy_sealed_action(
+            "alice",
+            "/alice/policy.toml",
+            old_policy.as_bytes(),
+            proposed.as_bytes(),
+            &old_parsed,
+            &proposed_parsed,
+            now_ms_u64(),
+        )
+        .unwrap();
+        assert_eq!(action.daemon_terms.assurance, AssuranceLevel::Standard);
+        let p = VfsPath::parse("/alice/policy.toml").unwrap();
+
+        assert!(matches!(
+            f.handler.write(&p, proposed.as_bytes()).await.unwrap_err(),
+            HandlerError::PermissionDenied
+        ));
     }
 
     /// Local wallet: `kind` reads "local", `unlock-passkey` is not exposed
