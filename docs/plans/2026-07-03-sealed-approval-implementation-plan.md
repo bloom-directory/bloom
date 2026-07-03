@@ -1,6 +1,7 @@
 # Sealed Approval Implementation Plan (Parallel-Agent Edition)
 
-**Date:** 2026-07-03
+**Status:** superseded for status tracking — see **[`2026-07-03-auth-hardening-pr-finish-plan.md`](2026-07-03-auth-hardening-pr-finish-plan.md)** for the current operative checklist
+**Date:** 2026-07-03 (superseded 2026-07-03)
 **Spec:** `docs/specs/2026-07-02-sealed-approval.md` (definitive target)
 **Branch baseline:** `auth-architecture-hardening` @ `5181169`
 **Owner goal (acceptance):** transactions can be executed from every Petal
@@ -8,9 +9,20 @@ component — `/requests` (x402/MPP), Polymarket, Hyperliquid, and EVM wallet tx
 with an **identical UX and security flow**: one passkey ceremony per action,
 same file layout, same verification spine, grant-gated signing everywhere.
 
+> **Note:** This document is kept for context on the parallel-agent dispatch
+> history. Do **not** treat its §1 "Current state" table, "Missing / violating"
+> list, or its unfinished milestone bullets as the source of truth — those are
+> now stale. The current PR completion checklist lives in
+> `2026-07-03-auth-hardening-pr-finish-plan.md`, and the current code inventory
+> lives in that plan's Workstream 0 (Baseline Audit) section.
+
 ---
 
 ## 1. Current state (audited 2026-07-03)
+
+> **Stale.** Use the finish plan's Workstream 0 + the updated Legacy Inventory
+> in [`2026-07-03-auth-hardening-pr-finish-plan.md`](2026-07-03-auth-hardening-pr-finish-plan.md)
+> for current status.
 
 Solid and reusable (do NOT rebuild):
 
