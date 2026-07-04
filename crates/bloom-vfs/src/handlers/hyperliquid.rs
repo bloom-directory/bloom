@@ -250,7 +250,6 @@ impl HyperliquidHandler {
 
     pub fn with_store_root(mut self, root: PathBuf) -> Self {
         self.store_root = Some(root);
-        self.warn_pre_approval_markers();
         self
     }
 
@@ -629,13 +628,6 @@ impl HyperliquidHandler {
             .await
             .map_err(err_be)?;
         let payload = user_signed_payload(action.clone(), nonce, signature.clone());
-        self.write_pre_approval_marker(
-            network_name,
-            wallet,
-            &id,
-            &format!("{agent_address:#x}"),
-            &agent_name,
-        )?;
         let approve_response = match client.exchange(payload.clone()).await {
             Ok(response) => response,
             Err(e) => {
@@ -723,7 +715,6 @@ impl HyperliquidHandler {
                 "agent_key_persisted": agent_key_persisted,
             }),
         )?;
-        self.clear_pre_approval_marker(network_name, wallet, &id)?;
         Ok(())
     }
 
@@ -2268,51 +2259,6 @@ impl HyperliquidHandler {
             .join(safe_segment(session)?))
     }
 
-    fn write_pre_approval_marker(
-        &self,
-        network: &str,
-        wallet: &str,
-        session: &str,
-        agent_address: &str,
-        agent_name: &str,
-    ) -> Result<(), HandlerError> {
-        let Some(_) = &self.store_root else {
-            return Ok(());
-        };
-        let dir = self.session_store_dir(network, wallet, session)?;
-        std::fs::create_dir_all(&dir)?;
-        let body = json!({
-            "network": network,
-            "wallet": wallet,
-            "session": session,
-            "agent_address": agent_address,
-            "agent_name": agent_name,
-            "created_ms": bloom_hyperliquid::now_ms(),
-            "note": "Bloom wrote this immediately before submitting approveAgent. If session.json is missing, verify/revoke this agent on Hyperliquid."
-        });
-        std::fs::write(dir.join(".pre_approval.json"), pretty_json(&body))?;
-        Ok(())
-    }
-
-    fn clear_pre_approval_marker(
-        &self,
-        network: &str,
-        wallet: &str,
-        session: &str,
-    ) -> Result<(), HandlerError> {
-        let Some(_) = &self.store_root else {
-            return Ok(());
-        };
-        let path = self
-            .session_store_dir(network, wallet, session)?
-            .join(".pre_approval.json");
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(HandlerError::Io(e)),
-        }
-    }
-
     fn agent_key_kek_path(&self) -> Result<PathBuf, HandlerError> {
         let Some(root) = &self.store_root else {
             return Err(HandlerError::NotFound("agent key store".into()));
@@ -2426,35 +2372,6 @@ impl HyperliquidHandler {
             Err(HandlerError::invalid(format!(
                 "sealed Hyperliquid agent key address {actual_address} does not match persisted session agent {expected_address}",
             )))
-        }
-    }
-
-    fn warn_pre_approval_markers(&self) {
-        let Some(root) = &self.store_root else {
-            return;
-        };
-        let sessions_root = root.join("agent_sessions");
-        let Ok(networks) = std::fs::read_dir(&sessions_root) else {
-            return;
-        };
-        for network in networks.flatten() {
-            let Ok(wallets) = std::fs::read_dir(network.path()) else {
-                continue;
-            };
-            for wallet in wallets.flatten() {
-                let Ok(sessions) = std::fs::read_dir(wallet.path()) else {
-                    continue;
-                };
-                for session in sessions.flatten() {
-                    let marker = session.path().join(".pre_approval.json");
-                    if marker.exists() {
-                        tracing::warn!(
-                            marker = %marker.display(),
-                            "hyperliquid.agent_sessions.pre_approval_marker_found"
-                        );
-                    }
-                }
-            }
         }
     }
 
