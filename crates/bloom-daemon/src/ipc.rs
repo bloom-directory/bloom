@@ -27,7 +27,6 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
-use bloom_auth_api::{ApprovalChallenge, SignedApproval, SignerTransport, UnsignedApproval};
 use bloom_keystore::petal_host::SignerCache;
 use bloom_keystore::{Keystore, WalletKind};
 use bloom_petals::{Capability, PetalError, PetalRunner, RunOptions, VfsHost};
@@ -131,6 +130,18 @@ pub struct IpcServer {
     /// surface stays untouched.
     vfs_arc: Arc<Vfs>,
     shutdown: Arc<Notify>,
+}
+
+const PASSKEY_WRITE_UNLOCKED_DISABLED: &str = "write_unlocked is disabled for passkey wallets; \
+stage a Sealed Approval action and sign through PetalHost::sign_hash";
+
+fn reject_passkey_write_unlocked(kind: WalletKind) -> Result<(), HandlerError> {
+    if kind == WalletKind::PasskeyGated {
+        return Err(HandlerError::Unsupported(
+            PASSKEY_WRITE_UNLOCKED_DISABLED.into(),
+        ));
+    }
+    Ok(())
 }
 
 impl IpcServer {
@@ -370,7 +381,7 @@ impl IpcServer {
 
     async fn do_write_unlocked(&self, params: &Value) -> Result<(), HandlerError> {
         let path = parse_path(params)?;
-        let mut bytes = parse_write_bytes(params)?;
+        let bytes = parse_write_bytes(params)?;
         let wallet = params
             .get("wallet")
             .and_then(|v| v.as_str())
@@ -383,100 +394,9 @@ impl IpcServer {
         let info = keystore
             .info(wallet)
             .map_err(|e: bloom_keystore::KeystoreError| HandlerError::backend(e.to_string()))?;
-        let passkey_wallet = info.kind == WalletKind::PasskeyGated;
-        let mut sealed_approval_written = false;
         match info.kind {
             WalletKind::PasskeyGated => {
-                if is_wallet_policy_write(wallet, &path) {
-                    return match self.vfs.write(&path, &bytes).await {
-                        Ok(()) => Ok(()),
-                        Err(first_err) => {
-                            let signed = self
-                                .maybe_sign_sealed_approval(
-                                    keystore,
-                                    wallet,
-                                    &path,
-                                    &bytes,
-                                    Some(write_unlocked_intent(
-                                        wallet,
-                                        &path,
-                                        &bytes,
-                                        Some(bloom_proto::checksum_address(&info.address)),
-                                        keystore.root().parent().map(|home| home.join("outbox")),
-                                        keystore.raw_policy(wallet).ok().map(|(p, _)| p).as_deref(),
-                                    )),
-                                )
-                                .await?;
-                            if signed {
-                                self.vfs.write(&path, &bytes).await
-                            } else {
-                                Err(first_err)
-                            }
-                        }
-                    };
-                }
-                // A daemon may have a signer cached from a previous ceremony.
-                // `write_unlocked` is the explicit "fresh user present" lane
-                // for VFS writes that sign or broadcast, so force the browser
-                // review instead of reusing that cached signer.
-                keystore.lock(wallet);
-                let intent = write_unlocked_intent(
-                    wallet,
-                    &path,
-                    &bytes,
-                    Some(bloom_proto::checksum_address(&info.address)),
-                    keystore.root().parent().map(|home| home.join("outbox")),
-                    keystore.raw_policy(wallet).ok().map(|(p, _)| p).as_deref(),
-                );
-                if let Some(home) = keystore.root().parent() {
-                    persist_outbox_review_intent(wallet, &path, &home.join("outbox"), &intent)
-                        .map_err(|e| HandlerError::backend(e.to_string()))?;
-                }
-                let editable_policy = if is_wallet_policy_write(wallet, &path) {
-                    Some(String::from_utf8_lossy(&bytes).to_string())
-                } else {
-                    None
-                };
-                let edited_policy = keystore
-                    .unlock_passkey_with_intent_and_policy_edit(
-                        wallet,
-                        Some(intent),
-                        editable_policy,
-                    )
-                    .await
-                    .map_err(|e: bloom_keystore::KeystoreError| {
-                        HandlerError::backend(e.to_string())
-                    })?;
-                if let Some(policy) = edited_policy {
-                    bytes = policy.into_bytes();
-                } else {
-                    sealed_approval_written = self
-                        .maybe_sign_sealed_approval(
-                            keystore,
-                            wallet,
-                            &path,
-                            &bytes,
-                            Some(write_unlocked_intent(
-                                wallet,
-                                &path,
-                                &bytes,
-                                Some(bloom_proto::checksum_address(&info.address)),
-                                keystore.root().parent().map(|home| home.join("outbox")),
-                                keystore.raw_policy(wallet).ok().map(|(p, _)| p).as_deref(),
-                            )),
-                        )
-                        .await?;
-                }
-                if !self.auth_services.is_wired()
-                    && !sealed_approval_written
-                    && is_outbox_confirm_write(wallet, &path)
-                {
-                    return Err(HandlerError::Unsupported(
-                        "outbox confirm requires Sealed Approval; \
-                         auth services are not wired (marker fallback removed)"
-                            .into(),
-                    ));
-                }
+                reject_passkey_write_unlocked(info.kind)?;
             }
             _ => {
                 keystore.unlock(wallet, passphrase.unwrap_or("")).map_err(
@@ -495,10 +415,7 @@ impl IpcServer {
         }
         // For a policy-session mint, require wired Sealed Approval. The old
         // forgeable marker fallback is removed; fail closed when unwired.
-        if is_policy_session_new(wallet, &path)
-            && !sealed_approval_written
-            && !self.auth_services.is_wired()
-        {
+        if is_policy_session_new(wallet, &path) && !self.auth_services.is_wired() {
             return Err(HandlerError::Unsupported(
                 "policy-session mint requires Sealed Approval; \
                  auth services are not wired (marker fallback removed)"
@@ -509,7 +426,6 @@ impl IpcServer {
         // forgeable marker fallback is removed; fail closed when unwired.
         if let Some(home) = keystore.root().parent()
             && let Some(_id) = request_confirm_id(home, &path)
-            && !sealed_approval_written
             && !self.auth_services.is_wired()
         {
             return Err(HandlerError::Unsupported(
@@ -520,118 +436,8 @@ impl IpcServer {
         }
         match self.vfs.write(&path, &bytes).await {
             Ok(()) => Ok(()),
-            Err(first_err) if passkey_wallet && !sealed_approval_written => {
-                let signed = self
-                    .maybe_sign_sealed_approval(
-                        keystore,
-                        wallet,
-                        &path,
-                        &bytes,
-                        Some(write_unlocked_intent(
-                            wallet,
-                            &path,
-                            &bytes,
-                            Some(bloom_proto::checksum_address(&info.address)),
-                            keystore.root().parent().map(|home| home.join("outbox")),
-                            keystore.raw_policy(wallet).ok().map(|(p, _)| p).as_deref(),
-                        )),
-                    )
-                    .await?;
-                if signed {
-                    self.vfs.write(&path, &bytes).await
-                } else {
-                    Err(first_err)
-                }
-            }
             Err(e) => Err(e),
         }
-    }
-
-    async fn maybe_sign_sealed_approval(
-        &self,
-        keystore: &Keystore,
-        wallet: &str,
-        path: &VfsPath,
-        bytes: &[u8],
-        intent: Option<CeremonyIntent>,
-    ) -> Result<bool, HandlerError> {
-        let Some((challenge_path, approval_path)) =
-            sealed_approval_paths(keystore, wallet, path, bytes)
-        else {
-            return Ok(false);
-        };
-        if !challenge_path.exists() {
-            return Ok(false);
-        }
-        let challenge_body = std::fs::read(&challenge_path)?;
-        let challenge: ApprovalChallenge = serde_json::from_slice(&challenge_body)
-            .map_err(|e| HandlerError::backend(format!("read approval challenge: {e}")))?;
-        // Fail fast if the challenge does not refer to a real sealed action
-        // for this wallet; full binding is re-verified at consume time.
-        let sealed = self
-            .auth_services
-            .require_store()?
-            .sealed_intent(&challenge.intent_hash)
-            .await
-            .map_err(|e| HandlerError::backend(format!("read sealed intent: {e}")))?;
-        if sealed.envelope.header.wallet != wallet {
-            return Err(HandlerError::backend(format!(
-                "approval challenge wallet mismatch: sealed action belongs to '{}'",
-                sealed.envelope.header.wallet
-            )));
-        }
-        let review_session_id = if challenge.assurance == bloom_auth_api::AssuranceLevel::Hardened {
-            let review_session_id = hardened_review_session_id(&challenge);
-            self.auth_services
-                .require_writer()?
-                .issue_review_session(
-                    &review_session_id,
-                    &challenge.surface,
-                    &challenge.action_id,
-                    challenge.expiry_ms,
-                    ipc_now_ms(),
-                )
-                .await
-                .map_err(|e| HandlerError::backend(format!("issue review session: {e}")))?;
-            Some(review_session_id)
-        } else {
-            None
-        };
-        // Echo every daemon-issued challenge field faithfully (§5.7 step 10);
-        // any drift is rejected at consume time.
-        let unsigned = UnsignedApproval::for_challenge(
-            &challenge,
-            SignerTransport::BrowserWebauthn,
-            None,
-            review_session_id,
-        );
-        if (is_policy_session_new(wallet, path) || is_wallet_policy_write(wallet, path))
-            && let Some(signer_cache) = self.signer_cache.as_ref()
-        {
-            crate::sealed_ceremony::run_sealed_approval_ceremony(
-                keystore,
-                &self.auth_services,
-                unsigned,
-                ipc_now_ms(),
-                signer_cache.as_ref(),
-            )
-            .await?;
-            return Ok(true);
-        }
-        let signature = keystore
-            .sign_approval_with_passkey(wallet, &unsigned, intent)
-            .await
-            .map_err(|e| HandlerError::backend(format!("sign Sealed Approval: {e}")))?;
-        let approval: SignedApproval = unsigned.into_signed(signature);
-        if let Some(parent) = approval_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(
-            approval_path,
-            serde_json::to_vec_pretty(&approval)
-                .map_err(|e| HandlerError::backend(format!("encode approval: {e}")))?,
-        )?;
-        Ok(true)
     }
 
     /// WS-1 IPC delegate for `sign_hash`. Thin wrapper that hands off
@@ -1008,19 +814,6 @@ fn is_policy_session_new(wallet: &str, path: &VfsPath) -> bool {
     )
 }
 
-fn is_outbox_confirm_write(wallet: &str, path: &VfsPath) -> bool {
-    matches!(
-        path.segments(),
-        [root, w, chains, _chain, outbox, pending, _id, confirm]
-            if root == "wallets"
-                && w == wallet
-                && chains == "chains"
-                && outbox == "outbox"
-                && pending == "pending"
-                && confirm == "confirm"
-    )
-}
-
 fn sealed_approval_paths(
     keystore: &Keystore,
     wallet: &str,
@@ -1201,44 +994,7 @@ fn safe_sealed_approval_segment(raw: &str) -> Option<String> {
     Some(raw.to_string())
 }
 
-fn hardened_review_session_id(challenge: &ApprovalChallenge) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"bloom.review_session.v1");
-    hasher.update(challenge.surface.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(challenge.action_id.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(challenge.intent_hash.as_bytes());
-    hasher.update(&[0]);
-    hasher.update(challenge.server_nonce.as_bytes());
-    format!("review-{}", hasher.finalize().to_hex())
-}
-
-fn ipc_now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
-
-fn persist_outbox_review_intent(
-    wallet: &str,
-    path: &VfsPath,
-    outbox_root: &Path,
-    intent: &CeremonyIntent,
-) -> std::io::Result<()> {
-    let Some(dir) = outbox_confirm_dir(wallet, path, outbox_root) else {
-        return Ok(());
-    };
-    std::fs::write(
-        dir.join("review_intent.json"),
-        serde_json::to_vec_pretty(intent).map_err(|e| std::io::Error::other(e.to_string()))?,
-    )
-}
-
+#[cfg(test)]
 fn write_unlocked_intent(
     wallet: &str,
     path: &VfsPath,
@@ -1386,6 +1142,7 @@ fn write_unlocked_intent(
     intent
 }
 
+#[cfg(test)]
 fn outbox_confirm_unlock_intent(
     wallet: &str,
     path_s: &str,
@@ -1485,6 +1242,7 @@ fn outbox_confirm_unlock_intent(
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct DefiReview {
     id: String,
     plan_md: String,
@@ -1493,6 +1251,7 @@ struct DefiReview {
     risk_lines: Vec<String>,
 }
 
+#[cfg(test)]
 fn find_defi_review_for_outbox(
     outbox_root: &Path,
     wallet: &str,
@@ -1800,6 +1559,22 @@ mod tests {
             let p = VfsPath::parse(path).unwrap();
             assert!(write_path_uses_wallet_signer(&p), "{path}");
         }
+    }
+
+    #[test]
+    fn passkey_write_unlocked_is_hard_disabled() {
+        let err = reject_passkey_write_unlocked(WalletKind::PasskeyGated).unwrap_err();
+        let HandlerError::Unsupported(msg) = err else {
+            panic!("expected unsupported error");
+        };
+        assert!(msg.contains("write_unlocked is disabled"), "{msg}");
+        assert!(msg.contains("Sealed Approval"), "{msg}");
+        assert!(msg.contains("PetalHost::sign_hash"), "{msg}");
+    }
+
+    #[test]
+    fn local_write_unlocked_lane_is_retained() {
+        reject_passkey_write_unlocked(WalletKind::Local).unwrap();
     }
 
     #[test]

@@ -54,6 +54,8 @@ const DEFAULT_MOUNT_PATH: &str = "/Volumes/bloom";
 const DEFAULT_MOUNT_PATH: &str = "/bloom";
 
 const ALPHA_DISCLOSURE: &str = "⚠️  Bloom is experimental, unaudited alpha software. Do not use with funds you cannot afford to lose. Review every generated transaction plan before signing.";
+const PASSKEY_WRITE_UNLOCKED_DISABLED: &str = "write_unlocked is disabled for passkey wallets; \
+stage a Sealed Approval action and sign through PetalHost::sign_hash";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EndpointSource {
@@ -1318,7 +1320,7 @@ async fn run(cli: Cli) -> Result<()> {
             passphrase,
         }) => {
             let p = VfsPath::parse(&path).context("parse path")?;
-            let mut body = match data {
+            let body = match data {
                 Some(s) => s.into_bytes(),
                 None => {
                     let mut buf = Vec::new();
@@ -1416,35 +1418,7 @@ async fn run(cli: Cli) -> Result<()> {
                 let info = d.keystore.info(&wallet)?;
                 match info.kind {
                     bloom_keystore::WalletKind::PasskeyGated => {
-                        let intent = vfs_write_unlock_intent(
-                            &wallet,
-                            &p,
-                            &body,
-                            Some(bloom_proto::checksum_address(&info.address)),
-                            Some(&d.home.outbox_dir()),
-                            d.keystore
-                                .raw_policy(&wallet)
-                                .ok()
-                                .map(|(p, _)| p)
-                                .as_deref(),
-                        );
-                        persist_outbox_review_intent(&wallet, &p, &d.home.outbox_dir(), &intent)?;
-                        let editable_policy = if is_wallet_policy_write(&wallet, &p) {
-                            Some(String::from_utf8_lossy(&body).to_string())
-                        } else {
-                            None
-                        };
-                        let edited_policy = d
-                            .keystore
-                            .unlock_passkey_with_intent_and_policy_edit(
-                                &wallet,
-                                Some(intent),
-                                editable_policy,
-                            )
-                            .await?;
-                        if let Some(policy) = edited_policy {
-                            body = policy.into_bytes();
-                        }
+                        bail!(PASSKEY_WRITE_UNLOCKED_DISABLED);
                     }
                     _ => {
                         d.keystore
@@ -1601,21 +1575,7 @@ async fn run(cli: Cli) -> Result<()> {
             let passkey_wallet = matches!(info.kind, bloom_keystore::WalletKind::PasskeyGated);
             match info.kind {
                 bloom_keystore::WalletKind::PasskeyGated => {
-                    let intent = vfs_write_unlock_intent(
-                        &wallet,
-                        &p,
-                        &body,
-                        Some(bloom_proto::checksum_address(&info.address)),
-                        Some(&d.home.outbox_dir()),
-                        d.keystore
-                            .raw_policy(&wallet)
-                            .ok()
-                            .map(|(p, _)| p)
-                            .as_deref(),
-                    );
-                    d.keystore
-                        .unlock_passkey_with_intent_and_policy_edit(&wallet, Some(intent), None)
-                        .await?;
+                    bail!(PASSKEY_WRITE_UNLOCKED_DISABLED);
                 }
                 _ => {
                     d.keystore
@@ -3328,13 +3288,6 @@ fn find_defi_review_for_outbox(
     None
 }
 
-fn is_wallet_policy_write(wallet: &str, path: &VfsPath) -> bool {
-    matches!(
-        path.segments(),
-        [root, w, file] if root == "wallets" && w == wallet && file == "policy.toml"
-    )
-}
-
 fn is_policy_session_new(wallet: &str, path: &VfsPath) -> bool {
     matches!(
         path.segments(),
@@ -3397,21 +3350,7 @@ async fn wallet_outbox_action_vfs_write(input: WalletOutboxActionWrite<'_>) -> R
     let info = d.keystore.info(&wallet)?;
     match info.kind {
         bloom_keystore::WalletKind::PasskeyGated => {
-            let intent = vfs_write_unlock_intent(
-                &wallet,
-                &p,
-                &body,
-                Some(bloom_proto::checksum_address(&info.address)),
-                Some(&d.home.outbox_dir()),
-                d.keystore
-                    .raw_policy(&wallet)
-                    .ok()
-                    .map(|(p, _)| p)
-                    .as_deref(),
-            );
-            d.keystore
-                .unlock_passkey_with_intent(&wallet, Some(intent))
-                .await?;
+            bail!(PASSKEY_WRITE_UNLOCKED_DISABLED);
         }
         _ => {
             d.keystore
@@ -3773,45 +3712,6 @@ fn validate_polymarket_artifact_id(id: &str, label: &str) -> Result<()> {
     if id.is_empty() || id.contains('/') || id.contains('\\') || id == "." || id == ".." {
         bail!("invalid Polymarket {label} id '{id}'");
     }
-    Ok(())
-}
-
-fn outbox_confirm_dir(wallet: &str, path: &VfsPath, outbox_root: &Path) -> Option<PathBuf> {
-    let [root, w, chains, chain, outbox, pending, id, confirm] = path.segments() else {
-        return None;
-    };
-    if root == "wallets"
-        && w == wallet
-        && chains == "chains"
-        && outbox == "outbox"
-        && pending == "pending"
-        && confirm == "confirm"
-    {
-        Some(
-            outbox_root
-                .join(wallet)
-                .join(chain)
-                .join("pending")
-                .join(id),
-        )
-    } else {
-        None
-    }
-}
-
-fn persist_outbox_review_intent(
-    wallet: &str,
-    path: &VfsPath,
-    outbox_root: &Path,
-    intent: &CeremonyIntent,
-) -> Result<()> {
-    let Some(dir) = outbox_confirm_dir(wallet, path, outbox_root) else {
-        return Ok(());
-    };
-    std::fs::write(
-        dir.join("review_intent.json"),
-        serde_json::to_vec_pretty(intent)?,
-    )?;
     Ok(())
 }
 
