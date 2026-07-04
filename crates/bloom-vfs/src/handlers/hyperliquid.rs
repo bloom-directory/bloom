@@ -1736,6 +1736,13 @@ impl HyperliquidHandler {
         file: &str,
         req: SignSubmit,
     ) -> Result<(), HandlerError> {
+        if self.auth_services.is_wired() {
+            return Err(HandlerError::Unsupported(
+                "Hyperliquid exchange writes require Sealed Approval; direct owner signing for \
+                 order/cancel/scheduleCancel/updateLeverage is disabled when auth services are wired"
+                    .into(),
+            ));
+        }
         // Policy boundary: no exchange action signs just because the wallet is
         // unlocked. Evaluate the verified per-wallet [hyperliquid] policy first.
         self.enforce_hyperliquid_policy(
@@ -4462,6 +4469,22 @@ mod tests {
         let p = VfsPath::parse("/testnet/exchange/trader/last_response.json").unwrap();
         let entry = h.lookup(&p).await.unwrap();
         assert_eq!(entry.mode, 0o444);
+    }
+
+    #[tokio::test]
+    async fn wired_auth_disables_direct_exchange_sign_submit() {
+        let h = handler().with_auth_services(crate::AuthServices::default().with_grant_store(
+            Arc::new(bloom_auth::grant_store::InMemoryGrantStore::default()),
+        ));
+        let err = h
+            .write(
+                &VfsPath::parse("/testnet/exchange/trader/schedule_cancel.json").unwrap(),
+                br#"{"action":{"type":"scheduleCancel","time":1700000000000}}"#,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandlerError::Unsupported(_)), "{err}");
+        assert!(err.to_string().contains("Sealed Approval"), "{err}");
     }
 
     #[tokio::test]
