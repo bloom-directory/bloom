@@ -24,7 +24,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use alloy::signers::SignerSync;
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD as B64_STANDARD, URL_SAFE_NO_PAD};
@@ -1591,8 +1590,21 @@ impl WalletsHandler {
         if segs.len() >= 4 && segs[1] == "chains" && segs[3] == "outbox" {
             return self.write_outbox(wallet, &segs[2], &segs[4..], data).await;
         }
+        // WS-11a: arbitrary-bytes wallet signing oracle closed. Signing
+        // caller-supplied message/hash/typed_data (e.g. a draining ERC-20
+        // permit's EIP-712 TypedData) straight from the cached signer is an
+        // unbounded surface with no action binding, grant, or staged Sealed
+        // Approval. Value/authority signing must be staged as an action and
+        // signed via PetalHost::sign_hash. Applies to every wallet kind and
+        // every write lane (plain IPC write and the write_unlocked ceremony
+        // lane both land here).
         if segs.len() == 3 && segs[1] == "sign" {
-            return self.write_sign(wallet, &segs[2], data).await;
+            return Err(HandlerError::Unsupported(
+                "arbitrary wallet signing via /<wallet>/sign/{message,hash,typed_data} \
+                 is removed; stage a sealed approval action and sign via \
+                 PetalHost::sign_hash"
+                    .into(),
+            ));
         }
         if segs.len() == 2 && segs[1] == "policy.toml" {
             self.write_permit()?;
@@ -2185,57 +2197,6 @@ impl WalletsHandler {
         }
     }
 
-    async fn write_sign(&self, wallet: &str, kind: &str, data: &[u8]) -> Result<(), HandlerError> {
-        let signer = self
-            .keystore
-            .signer(wallet)
-            .map_err(|_| HandlerError::PermissionDenied)?;
-        let sig_hex = match kind {
-            "message" => {
-                let msg = std::str::from_utf8(data)
-                    .map_err(|_| HandlerError::invalid("non-utf8 message"))?
-                    .trim_end_matches('\n');
-                let sig = signer.sign_message_sync(msg.as_bytes()).map_err(err_be)?;
-                hex_signature(&sig)
-            }
-            "hash" => {
-                let s = std::str::from_utf8(data)
-                    .map_err(|_| HandlerError::invalid("non-utf8 hash"))?
-                    .trim();
-                let bytes =
-                    decode_hex(s).map_err(|e| HandlerError::invalid(format!("hex: {e}")))?;
-                if bytes.len() != 32 {
-                    return Err(HandlerError::invalid("hash must be 32 bytes"));
-                }
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                let h = alloy::primitives::B256::from(arr);
-                let sig = signer.sign_hash_sync(&h).map_err(err_be)?;
-                hex_signature(&sig)
-            }
-            "typed_data" => {
-                let body = std::str::from_utf8(data)
-                    .map_err(|_| HandlerError::invalid("non-utf8 typed_data"))?;
-                let typed: alloy_dyn_abi::eip712::TypedData = serde_json::from_str(body)
-                    .map_err(|e| HandlerError::invalid(format!("typed_data json: {e}")))?;
-                let hash = typed
-                    .eip712_signing_hash()
-                    .map_err(|e| HandlerError::invalid(format!("typed_data hash: {e}")))?;
-                let sig = signer.sign_hash_sync(&hash).map_err(err_be)?;
-                hex_signature(&sig)
-            }
-            _ => return Err(HandlerError::PermissionDenied),
-        };
-        // Persist last-signature on disk so callers can read it back via the
-        // companion `.sig` path. Living next to the writable file keeps the
-        // surface stateless from the daemon's point of view.
-        let dir = self.keystore.root().join(wallet).join("sign");
-        std::fs::create_dir_all(&dir).map_err(HandlerError::Io)?;
-        std::fs::write(dir.join(format!("{kind}.sig")), &sig_hex).map_err(HandlerError::Io)?;
-        tracing::info!(wallet, kind, "wallet.signed");
-        Ok(())
-    }
-
     async fn write_new_wallet(&self, data: &[u8]) -> Result<(), HandlerError> {
         let body = std::str::from_utf8(data)
             .map_err(|_| HandlerError::invalid("wallets/new body must be utf-8"))?
@@ -2435,23 +2396,11 @@ fn parse_new_wallet_spec(body: &str) -> Result<NewWalletSpec, HandlerError> {
     })
 }
 
-fn hex_signature(sig: &alloy::primitives::Signature) -> String {
-    let bytes = sig.as_bytes();
-    let mut s = String::with_capacity(2 + bytes.len() * 2);
-    s.push_str("0x");
-    s.push_str(&hex::encode(bytes));
-    s.push('\n');
-    s
-}
-
-fn decode_hex(s: &str) -> Result<Vec<u8>, hex::FromHexError> {
-    hex::decode(s.trim_start_matches("0x"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::{Address, B256, Signature};
+    use alloy::primitives::{Address, B256};
+    use alloy::signers::SignerSync;
     use bloom_auth_api::{
         APPROVAL_CHALLENGE_SCHEMA_V1, APPROVAL_SCHEMA_V1, ApprovalVerifier, AuthApiError,
         AuthEntryRecord, AuthEntryState, AuthStoreView, AuthStoreWriter, DaemonGrantTerms,
@@ -2461,7 +2410,6 @@ mod tests {
     use bloom_proto::AddressBook;
     use bloom_tx::outbox::Outbox;
     use bloom_tx::tx_engine::TxEngine;
-    use std::str::FromStr;
     use std::sync::Mutex;
 
     struct Fixture {
@@ -2469,7 +2417,6 @@ mod tests {
         handler: WalletsHandler,
         wallet_name: String,
         wallet_addr: Address,
-        sign_dir: std::path::PathBuf,
     }
 
     struct ChallengeOnlyWriter;
@@ -3025,13 +2972,11 @@ mod tests {
         let permit = Arc::new(HomeWritePermit::acquire(&home).unwrap());
         let handler = WalletsHandler::new(keystore, chains, tx_engine, address_book)
             .with_home_write_permit(permit);
-        let sign_dir = ks_root.join("alice").join("sign");
         Fixture {
             _tmp: tmp,
             handler,
             wallet_name: "alice".to_string(),
             wallet_addr: info.address,
-            sign_dir,
         }
     }
 
@@ -3086,48 +3031,33 @@ mod tests {
             .unwrap();
     }
 
-    fn read_sig_file(path: &std::path::Path) -> Signature {
-        let raw = std::fs::read_to_string(path).unwrap();
-        Signature::from_str(raw.trim()).unwrap()
-    }
-
     #[tokio::test]
-    async fn personal_sign_recovers_to_wallet_address() {
+    async fn local_wallet_sign_message_is_denied() {
         let f = make_handler();
         let p = VfsPath::parse(&format!("/{}/sign/message", f.wallet_name)).unwrap();
-        let msg = b"hello world";
-        f.handler.write(&p, msg).await.unwrap();
-
-        let sig = read_sig_file(&f.sign_dir.join("message.sig"));
-        let bytes: [u8; 65] = sig.into();
-        assert_eq!(bytes.len(), 65);
-
-        let recovered = sig.recover_address_from_msg(msg).unwrap();
-        assert_eq!(recovered, f.wallet_addr);
+        let r = f.handler.write(&p, b"hello world").await;
+        assert_denied_oracle(r);
+        assert_no_sig_file(&f, "message");
     }
 
     #[tokio::test]
-    async fn sign_hash_with_known_digest_recovers_to_wallet_address() {
+    async fn local_wallet_sign_hash_is_denied() {
         let f = make_handler();
-        // Precomputed digest = keccak256("hello") (just any deterministic 32-byte value).
+        // A valid 32-byte digest: the write must still be refused, since the
+        // oracle is closed regardless of input shape.
         let digest_hex = "0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8";
-        let digest = B256::from_str(digest_hex).unwrap();
-
         let p = VfsPath::parse(&format!("/{}/sign/hash", f.wallet_name)).unwrap();
-        f.handler.write(&p, digest_hex.as_bytes()).await.unwrap();
-
-        let sig = read_sig_file(&f.sign_dir.join("hash.sig"));
-        let bytes: [u8; 65] = sig.into();
-        assert_eq!(bytes.len(), 65);
-
-        let recovered = sig.recover_address_from_prehash(&digest).unwrap();
-        assert_eq!(recovered, f.wallet_addr);
+        let r = f.handler.write(&p, digest_hex.as_bytes()).await;
+        assert_denied_oracle(r);
+        assert_no_sig_file(&f, "hash");
     }
 
     #[tokio::test]
-    async fn typed_data_signature_recovers_to_wallet_address() {
+    async fn local_wallet_sign_typed_data_is_denied() {
         let f = make_handler();
         let addr_hex = bloom_proto::checksum_address(&f.wallet_addr);
+        // A draining ERC-20 permit looks exactly like this shape; the oracle
+        // must refuse to sign it straight from the cached signer.
         let json = serde_json::json!({
             "types": {
                 "EIP712Domain": [
@@ -3142,42 +3072,61 @@ mod tests {
                 ]
             },
             "primaryType": "Mail",
-            "domain": {
-                "name": "Test",
-                "version": "1",
-                "chainId": 1
-            },
-            "message": {
-                "from": addr_hex,
-                "to": addr_hex,
-                "contents": "hi"
-            }
+            "domain": {"name": "Test", "version": "1", "chainId": 1},
+            "message": {"from": addr_hex, "to": addr_hex, "contents": "hi"}
         });
         let body = serde_json::to_vec(&json).unwrap();
-
-        // Compute the expected signing hash for recovery on our side.
-        let typed: alloy_dyn_abi::eip712::TypedData = serde_json::from_slice(&body).unwrap();
-        let expected_hash = typed.eip712_signing_hash().unwrap();
-
         let p = VfsPath::parse(&format!("/{}/sign/typed_data", f.wallet_name)).unwrap();
-        f.handler.write(&p, &body).await.unwrap();
-
-        let sig = read_sig_file(&f.sign_dir.join("typed_data.sig"));
-        let recovered = sig.recover_address_from_prehash(&expected_hash).unwrap();
-        assert_eq!(recovered, f.wallet_addr);
+        let r = f.handler.write(&p, &body).await;
+        assert_denied_oracle(r);
+        assert_no_sig_file(&f, "typed_data");
     }
 
     #[tokio::test]
-    async fn invalid_hex_hash_returns_invalid() {
+    async fn passkey_wallet_sign_paths_are_denied() {
         let f = make_handler();
-        let p = VfsPath::parse(&format!("/{}/sign/hash", f.wallet_name)).unwrap();
-        // Not valid hex.
-        let r = f.handler.write(&p, b"0xZZZZ").await;
-        assert!(matches!(r, Err(HandlerError::Invalid(_))), "got: {:?}", r);
+        seed_passkey_wallet(&f, "pk-wallet");
+        for (kind, body) in [
+            ("message", &b"hello world"[..]),
+            ("hash", b"0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8"),
+            ("typed_data", br#"{"types":{"EIP712Domain":[]},"primaryType":"EIP712Domain","domain":{},"message":{}}"#),
+        ] {
+            let p = VfsPath::parse(&format!("/pk-wallet/sign/{kind}")).unwrap();
+            let r = f.handler.write(&p, body).await;
+            assert_denied_oracle(r);
+            let sig_path = f
+                ._tmp
+                .path()
+                .join("keystore")
+                .join("pk-wallet")
+                .join("sign")
+                .join(format!("{kind}.sig"));
+            assert!(!sig_path.exists(), "{kind}.sig should not be written");
+        }
+    }
 
-        // Valid hex but wrong length (should also be Invalid).
-        let r2 = f.handler.write(&p, b"0xdeadbeef").await;
-        assert!(matches!(r2, Err(HandlerError::Invalid(_))), "got: {:?}", r2);
+    fn assert_denied_oracle(r: Result<(), HandlerError>) {
+        match r {
+            Err(HandlerError::Unsupported(msg)) => {
+                assert!(
+                    msg.contains("arbitrary wallet signing")
+                        && msg.contains("PetalHost::sign_hash"),
+                    "migration message, got: {msg}"
+                );
+            }
+            ref other => panic!("expected Unsupported oracle-closed error, got: {other:?}"),
+        }
+    }
+
+    fn assert_no_sig_file(f: &Fixture, kind: &str) {
+        let sig_path = f
+            ._tmp
+            .path()
+            .join("keystore")
+            .join(&f.wallet_name)
+            .join("sign")
+            .join(format!("{kind}.sig"));
+        assert!(!sig_path.exists(), "{kind}.sig should not be written");
     }
 
     #[tokio::test]
