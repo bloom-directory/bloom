@@ -723,9 +723,6 @@ impl RequestsHandler {
             )));
         }
         self.ensure_sealed_confirm_approval(&pending, id).await?;
-        let _grant = self
-            .consume_paid_http_grant(id, &wallet, PAID_HTTP_X402_SIGN_INTENT)
-            .await?;
         let credential = self
             .x402_signer
             .sign_x402_payment(&X402SignContext {
@@ -738,6 +735,9 @@ impl RequestsHandler {
             })
             .await
             .map_err(HandlerError::backend)?;
+        let _grant = self
+            .consume_paid_http_grant(id, &wallet, PAID_HTTP_X402_SIGN_INTENT)
+            .await?;
 
         let credential_metadata = json!({
             "redacted": true,
@@ -1796,6 +1796,10 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct FailingX402Signer {
+        calls: Arc<AtomicUsize>,
+    }
+
     struct ChallengeOnlyWriter;
 
     struct AcceptingVerifier {
@@ -2007,6 +2011,17 @@ mod tests {
                 header_value: "signed-x402".into(),
                 public_metadata: json!({"test": true}),
             })
+        }
+    }
+
+    #[async_trait]
+    impl X402PaymentSigner for FailingX402Signer {
+        async fn sign_x402_payment(
+            &self,
+            _ctx: &X402SignContext<'_>,
+        ) -> Result<X402PaymentCredential, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err("x402 signer unavailable".into())
         }
     }
 
@@ -2498,6 +2513,93 @@ mod tests {
                 .requests_root()
                 .join("failed/req_sealed_ok")
                 .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn x402_signer_failure_does_not_consume_paid_http_grant() {
+        let signer_calls = Arc::new(AtomicUsize::new(0));
+        let verifier_calls = Arc::new(AtomicUsize::new(0));
+        let f = fixture(Some("alice"));
+        let mut policy = Policy::default();
+        policy.payments.enabled = true;
+        policy.payments.require_plan = true;
+        f.handler
+            .keystore
+            .write_policy("alice", toml::to_string_pretty(&policy).unwrap().as_bytes())
+            .unwrap();
+        let auth_services = request_auth_services(verifier_calls.clone());
+        let handler = f
+            .handler
+            .with_auth_services(auth_services)
+            .with_x402_signer(Arc::new(FailingX402Signer {
+                calls: signer_calls.clone(),
+            }));
+        let pending = handler.requests_root().join("pending/req_signer_fail");
+        fs::create_dir_all(&pending).unwrap();
+        let challenge = normalize_challenge(
+            &HeaderMap::new(),
+            br#"{"x402Version":1,"accepts":[{"network":"base","asset":"USDC","maxAmountRequired":"1000"}]}"#,
+            &Url::parse("http://127.0.0.1:9/pay").unwrap(),
+        );
+        write_json(pending.join("challenge.json"), &challenge).unwrap();
+        write_json(
+            pending.join("payment_method.json"),
+            &challenge.payment_method(),
+        )
+        .unwrap();
+        let empty_checks: Vec<PolicyCheck> = vec![];
+        write_json(pending.join("policy_check.json"), &empty_checks).unwrap();
+        write_json(
+            pending.join("request.toml"),
+            &json!({"method":"GET","url":"http://127.0.0.1:9/pay","wallet":"alice","headers":{},"dry_run":false}),
+        )
+        .unwrap();
+        fs::write(pending.join("status"), "pending\n").unwrap();
+        write_json(
+            pending.join(APPROVAL_FILE),
+            &SignedApproval {
+                schema: APPROVAL_SCHEMA_V1.into(),
+                wallet: "alice".into(),
+                surface: "requests".into(),
+                action_id: "req_signer_fail".into(),
+                intent_hash: "abc123".into(),
+                petal_id: petal_identity::PETAL_ID_PAID_HTTP.into(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_PAID_HTTP.into(),
+                assurance: AssuranceLevel::Standard,
+                server_nonce: "nonce-1".into(),
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
+                expiry_ms: now_ms() + 60_000,
+                signer_transport: SignerTransport::BrowserWebauthn,
+                credential_id: "cred-1".into(),
+                review_session_id: None,
+                webauthn_assertion: WebAuthnAssertionRecord {
+                    credential_id: "cred-1".into(),
+                    authenticator_data_b64: "AA".into(),
+                    client_data_json_b64: "e30".into(),
+                    signature_b64: "AA".into(),
+                    user_handle_b64: None,
+                },
+            },
+        )
+        .unwrap();
+
+        let err = handler
+            .confirm("req_signer_fail", b"confirm")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("x402 signer unavailable"), "{err}");
+        assert_eq!(verifier_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(signer_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            handler
+                .active_paid_http_grant("req_signer_fail")
+                .await
+                .unwrap()
+                .is_some(),
+            "failed credential preparation must not consume the grant"
         );
     }
 
