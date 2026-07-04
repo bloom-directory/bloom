@@ -2846,6 +2846,20 @@ mod approval_uv_tests {
         );
     }
 
+    fn browser_tests_enabled() -> bool {
+        std::env::var("BLOOM_TEST_BROWSER").as_deref() == Ok("1")
+    }
+
+    fn skip_browser_test_if_disabled(test_name: &str) -> bool {
+        if browser_tests_enabled() {
+            return false;
+        }
+        eprintln!(
+            "skipping {test_name}: set BLOOM_TEST_BROWSER=1 and plant a real passkey wallet to run this manual ceremony test"
+        );
+        true
+    }
+
     // ── sealed_approval_ceremony: browser-gated integration tests ───────────
     //
     // These need a real authenticator (the ceremony binds port 18734 and opens
@@ -2855,6 +2869,9 @@ mod approval_uv_tests {
     #[tokio::test]
     #[ignore = "requires a real authenticator; set BLOOM_TEST_BROWSER=1"]
     async fn sealed_approval_ceremony_returns_assertion_and_signer() {
+        if skip_browser_test_if_disabled("sealed_approval_ceremony_returns_assertion_and_signer") {
+            return;
+        }
         let td = tempfile::tempdir().unwrap();
         let ks = crate::Keystore::new(td.path()).unwrap();
         // NOTE: this fixture does NOT create a wallet; a maintainer must first
@@ -2878,6 +2895,9 @@ mod approval_uv_tests {
     #[tokio::test]
     #[ignore = "requires a real authenticator; set BLOOM_TEST_BROWSER=1"]
     async fn sealed_approval_ceremony_fails_when_no_prf_output() {
+        if skip_browser_test_if_disabled("sealed_approval_ceremony_fails_when_no_prf_output") {
+            return;
+        }
         let td = tempfile::tempdir().unwrap();
         let ks = crate::Keystore::new(td.path()).unwrap();
         // Same plant-a-wallet caveat as above; this asserts that an
@@ -2894,6 +2914,11 @@ mod approval_uv_tests {
     #[tokio::test]
     #[ignore = "requires a real authenticator; set BLOOM_TEST_BROWSER=1"]
     async fn sealed_approval_ceremony_fails_when_uv_missing_for_hardened() {
+        if skip_browser_test_if_disabled(
+            "sealed_approval_ceremony_fails_when_uv_missing_for_hardened",
+        ) {
+            return;
+        }
         let td = tempfile::tempdir().unwrap();
         let ks = crate::Keystore::new(td.path()).unwrap();
         // Same plant-a-wallet caveat. A hardened approval must require user
