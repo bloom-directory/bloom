@@ -600,6 +600,13 @@ impl HyperliquidHandler {
                 "refusing to create Hyperliquid agent session: wallet [hyperliquid] policy must set allowed_assets, max_notional_usd, max_position_usd, and max_loss_usd",
             ));
         }
+        if self.auth_services.is_wired() {
+            return Err(HandlerError::Unsupported(
+                "Hyperliquid approveAgent requires grant-backed Sealed Approval host signing; \
+                 direct owner signing is disabled when auth services are wired"
+                    .into(),
+            ));
+        }
         self.prepare_agent_session_sealed(network_name, wallet, &id, &req, &policy)
             .await?;
         let owner_signer = self.keystore.signer(wallet).map_err(|e| {
@@ -1150,6 +1157,13 @@ impl HyperliquidHandler {
         wallet: &str,
         id: &str,
     ) -> Result<HyperliquidSigner, HandlerError> {
+        if self.auth_services.is_wired() {
+            return Err(HandlerError::Unsupported(
+                "Hyperliquid orphan recovery requires grant-backed Sealed Approval host signing; \
+                 direct owner signing is disabled when auth services are wired"
+                    .into(),
+            ));
+        }
         if self.active_session(network_name, wallet, id).is_ok() {
             return Err(HandlerError::invalid(
                 "session is still active; use cancel_all/close_all — orphan recovery is only for \
@@ -1807,6 +1821,13 @@ impl HyperliquidHandler {
                 "Hyperliquid policy denied [{}]: {}",
                 deny.rule, deny.message
             )));
+        }
+        if self.auth_services.is_wired() {
+            return Err(HandlerError::Unsupported(
+                "Hyperliquid usdSend requires grant-backed Sealed Approval host signing; \
+                 direct owner signing is disabled when auth services are wired"
+                    .into(),
+            ));
         }
         let nonce = self
             .prepare_usd_send_sealed(network_name, wallet, &req, &checks)
@@ -4277,8 +4298,9 @@ mod tests {
 
     fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "{}-{}",
+            "{}-{}-{}",
             prefix,
+            std::process::id(),
             NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
         ))
     }
@@ -4412,6 +4434,29 @@ mod tests {
         )
     }
 
+    fn wired_auth_services() -> crate::AuthServices {
+        crate::AuthServices::default().with_grant_store(Arc::new(
+            bloom_auth::grant_store::InMemoryGrantStore::default(),
+        ))
+    }
+
+    fn handler_with_hyperliquid_policy(
+        wallet: &str,
+        hyperliquid: HyperliquidPolicy,
+    ) -> HyperliquidHandler {
+        let h = handler().with_auth_services(wired_auth_services());
+        h.keystore.create_local(wallet, "pw").unwrap();
+        h.keystore.unlock(wallet, "pw").unwrap();
+        let policy = bloom_proto::Policy {
+            hyperliquid,
+            ..Default::default()
+        };
+        h.keystore
+            .write_policy(wallet, toml::to_string_pretty(&policy).unwrap().as_bytes())
+            .unwrap();
+        h
+    }
+
     #[test]
     fn persisted_agent_key_round_trips_and_rejects_wrong_address() {
         let h = handler().with_store_root(unique_test_dir("bloom-hl-key-store"));
@@ -4473,9 +4518,7 @@ mod tests {
 
     #[tokio::test]
     async fn wired_auth_disables_direct_exchange_sign_submit() {
-        let h = handler().with_auth_services(crate::AuthServices::default().with_grant_store(
-            Arc::new(bloom_auth::grant_store::InMemoryGrantStore::default()),
-        ));
+        let h = handler().with_auth_services(wired_auth_services());
         let err = h
             .write(
                 &VfsPath::parse("/testnet/exchange/trader/schedule_cancel.json").unwrap(),
@@ -4484,6 +4527,83 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, HandlerError::Unsupported(_)), "{err}");
+        assert!(err.to_string().contains("Sealed Approval"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn wired_auth_disables_direct_approve_agent_signing() {
+        let h = handler_with_hyperliquid_policy(
+            "trader",
+            HyperliquidPolicy {
+                allowed_assets: std::collections::BTreeSet::from(["BTC".to_string()]),
+                max_notional_usd: Some(100_000_000),
+                max_position_usd: Some(500_000_000),
+                max_loss_usd: Some(50_000_000),
+                ..Default::default()
+            },
+        );
+        let err = h
+            .create_agent_session(
+                h.client("testnet").unwrap(),
+                HyperliquidNetwork::Testnet,
+                "testnet",
+                "trader",
+                AgentSessionCreate {
+                    id: Some("session-1".into()),
+                    agent_name: Some("bloom-session".into()),
+                    vault_address: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandlerError::Unsupported(_)), "{err}");
+        assert!(err.to_string().contains("approveAgent"), "{err}");
+        assert!(err.to_string().contains("Sealed Approval"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn wired_auth_disables_direct_usd_send_signing() {
+        let h = handler_with_hyperliquid_policy(
+            "trader",
+            HyperliquidPolicy {
+                transfer_cap_usd: Some(100_000_000),
+                allowed_usd_send_destinations: std::collections::BTreeSet::from([
+                    "0x0000000000000000000000000000000000000001".to_string(),
+                ]),
+                ..Default::default()
+            },
+        );
+        let err = h
+            .submit_usd_send(
+                h.client("testnet").unwrap(),
+                HyperliquidNetwork::Testnet,
+                "testnet",
+                "trader",
+                UsdSendRequest {
+                    destination: "0x0000000000000000000000000000000000000001".into(),
+                    amount: "1".into(),
+                    nonce: Some(1),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandlerError::Unsupported(_)), "{err}");
+        assert!(err.to_string().contains("usdSend"), "{err}");
+        assert!(err.to_string().contains("Sealed Approval"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn wired_auth_disables_direct_orphan_recovery_signing() {
+        let h = handler().with_auth_services(wired_auth_services());
+        let err = match h
+            .orphan_owner_signer("testnet", "trader", "session-1")
+            .await
+        {
+            Ok(_) => panic!("wired auth unexpectedly allowed direct orphan recovery signing"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, HandlerError::Unsupported(_)), "{err}");
+        assert!(err.to_string().contains("orphan recovery"), "{err}");
         assert!(err.to_string().contains("Sealed Approval"), "{err}");
     }
 
