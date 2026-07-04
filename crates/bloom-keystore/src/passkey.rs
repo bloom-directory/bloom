@@ -2122,7 +2122,7 @@ impl super::Keystore {
             KeystoreError::Policy(format!("refusing to sign unparseable policy.toml: {e}"))
         })?;
 
-        let signer = self.signer(name)?; // must be unlocked
+        let signer = self.cached_signer(name)?; // must be unlocked
         write_policy_sig(&dir, name, &content, &signer)?;
         tracing::debug!(wallet = name, "keystore.policy_signed");
         Ok(())

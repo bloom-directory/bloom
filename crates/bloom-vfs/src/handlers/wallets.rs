@@ -2424,7 +2424,7 @@ mod tests {
     struct AcceptingVerifier;
 
     struct SigningPetalHost {
-        keystore: Keystore,
+        signer: Arc<alloy::signers::local::PrivateKeySigner>,
     }
 
     struct UnusedGrantStore;
@@ -2552,11 +2552,8 @@ mod tests {
             let hash = hex::decode(request.hash_hex.trim_start_matches("0x"))
                 .map_err(|e| AuthApiError::Denied(format!("hash hex: {e}")))?;
             let hash = B256::from_slice(&hash);
-            let signer = self
-                .keystore
-                .signer(&request.wallet)
-                .map_err(|e| AuthApiError::Denied(format!("test signer: {e}")))?;
-            let sig = signer
+            let sig = self
+                .signer
                 .sign_hash_sync(&hash)
                 .map_err(|e| AuthApiError::Denied(format!("test sign: {e}")))?;
             Ok(SealedSignature {
@@ -4048,7 +4045,11 @@ mod tests {
         )
         .with_grant_store(Arc::new(UnusedGrantStore))
         .with_petal_host(Arc::new(SigningPetalHost {
-            keystore: f.handler.keystore.clone(),
+            signer: f
+                .handler
+                .keystore
+                .signer(&f.wallet_name)
+                .expect("fixture local signer before passkey conversion"),
         }))
     }
 
@@ -4117,8 +4118,8 @@ mod tests {
     #[tokio::test]
     async fn wallet_policy_noop_write_does_not_stage_update() {
         let mut f = make_handler();
-        convert_wallet_to_passkey(&f, "alice");
         let services = wallet_policy_auth_services(&f);
+        convert_wallet_to_passkey(&f, "alice");
         f.handler = f.handler.with_auth_services(services);
         let (policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
         let p = VfsPath::parse("/alice/policy.toml").unwrap();
@@ -4138,8 +4139,8 @@ mod tests {
     async fn wallet_policy_expanding_edit_requires_hardened_sealed_approval_and_installs_signature()
     {
         let mut f = make_handler();
-        convert_wallet_to_passkey(&f, "alice");
         let services = wallet_policy_auth_services(&f);
+        convert_wallet_to_passkey(&f, "alice");
         f.handler = f.handler.with_auth_services(services);
         let (old_policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
         let mut proposed: Policy = toml::from_str(&old_policy).unwrap();
@@ -4182,8 +4183,8 @@ mod tests {
     #[tokio::test]
     async fn wallet_policy_tampered_retry_bytes_do_not_reuse_approval() {
         let mut f = make_handler();
-        convert_wallet_to_passkey(&f, "alice");
         let services = wallet_policy_auth_services(&f);
+        convert_wallet_to_passkey(&f, "alice");
         f.handler = f.handler.with_auth_services(services);
         let (old_policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
         let mut proposed: Policy = toml::from_str(&old_policy).unwrap();
@@ -4244,8 +4245,8 @@ mod tests {
                 toml::to_string_pretty(&initial).unwrap().as_bytes(),
             )
             .unwrap();
-        convert_wallet_to_passkey(&f, "alice");
         let services = wallet_policy_auth_services(&f);
+        convert_wallet_to_passkey(&f, "alice");
         f.handler = f.handler.with_auth_services(services);
         let (old_policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
         let mut proposed: Policy = toml::from_str(&old_policy).unwrap();

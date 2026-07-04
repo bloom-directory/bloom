@@ -516,7 +516,7 @@ impl KeystorePetalHost {
         &self,
         wallet: &str,
     ) -> Result<Arc<PrivateKeySigner>, AuthApiError> {
-        match self.keystore.signer(wallet) {
+        match self.keystore.cached_signer(wallet) {
             Ok(s) => Ok(s),
             Err(_) => {
                 self.keystore
@@ -526,7 +526,7 @@ impl KeystorePetalHost {
                         AuthApiError::Denied(format!("keystore.unlock_passkey_with_intent: {e}"))
                     })?;
                 self.keystore
-                    .signer(wallet)
+                    .cached_signer(wallet)
                     .map_err(|e| AuthApiError::Denied(format!("keystore.signer after unlock: {e}")))
             }
         }

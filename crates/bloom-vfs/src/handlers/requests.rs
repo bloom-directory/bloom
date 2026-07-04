@@ -3368,7 +3368,7 @@ inline = '{"prompt":"hi"}'
     }
 
     #[tokio::test]
-    async fn locked_passkey_wallet_error_points_to_foreground_unlock_passkey_flow() {
+    async fn locked_passkey_wallet_error_points_to_sealed_approval_flow() {
         let dir = tempfile::tempdir().unwrap();
         let keystore = Keystore::new(dir.path().join("keystore")).unwrap();
         keystore.create_local("passkey_alice", "secret").unwrap();
@@ -3411,8 +3411,8 @@ inline = '{"prompt":"hi"}'
             Err(err) => err.to_string(),
         };
         assert!(msg.contains("passkey wallet"), "{msg}");
-        assert!(msg.contains("unlock-passkey"), "{msg}");
-        assert!(msg.contains("foreground"), "{msg}");
+        assert!(msg.contains("Sealed Approval"), "{msg}");
+        assert!(msg.contains("PetalHost::sign_hash"), "{msg}");
     }
 
     #[tokio::test]
