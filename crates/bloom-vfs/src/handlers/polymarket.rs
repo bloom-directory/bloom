@@ -2065,6 +2065,13 @@ impl PolymarketHandler {
                 geo.country, geo.region
             )));
         }
+        if self.auth_services.is_wired() {
+            return Err(HandlerError::Unsupported(
+                "Polymarket onboarding requires grant-backed Sealed Approval host signing; \
+                 direct owner signing is disabled when auth services are wired"
+                    .into(),
+            ));
+        }
         self.prepare_onboard_sealed(ob, wallet).await?;
         // …and be unlocked: signing (approval batch, ClobAuth) needs the key.
         let signer_arc = self.keystore.signer(wallet).map_err(|e| match e {
@@ -2432,6 +2439,12 @@ mod tests {
 
     fn clob_unreachable() -> ClobClient {
         ClobClient::default().with_base_url(Url::parse("http://127.0.0.1:1").unwrap())
+    }
+
+    fn wired_auth_services() -> crate::AuthServices {
+        crate::AuthServices::default().with_grant_store(Arc::new(
+            bloom_auth::grant_store::InMemoryGrantStore::default(),
+        ))
     }
 
     fn p(s: &str) -> VfsPath {
@@ -3139,6 +3152,21 @@ key = "builder-key-2"
                 .contains("could not verify region availability"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn wired_auth_disables_direct_onboarding_signing() {
+        let (addr, _s) = spawn_scripted(vec![geo_ok()]).await;
+        let f = onboard_fixture(addr, true).await;
+        let handler = f.handler.clone().with_auth_services(wired_auth_services());
+
+        let err = handler
+            .write(&p("/onboard/alice/begin"), b"x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandlerError::Unsupported(_)), "{err}");
+        assert!(err.to_string().contains("Polymarket onboarding"), "{err}");
+        assert!(err.to_string().contains("Sealed Approval"), "{err}");
     }
 
     #[tokio::test]
