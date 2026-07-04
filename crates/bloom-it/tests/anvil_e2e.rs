@@ -168,11 +168,12 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     let _: serde_json::Value =
         serde_json::from_slice(&policy_bytes).context("policy_check.json must be valid JSON")?;
 
-    // 8. Unlock the wallet, mint the same in-memory grant that a successful
-    // Sealed Approval ceremony would mint, then write `confirm` to broadcast.
-    // The Anvil test does not have a browser/WebAuthn device, but this still
-    // exercises the production grant-gated KeystorePetalHost sign_hash path
-    // and raw transaction broadcast.
+    // 8. First confirm must fail closed and emit a Sealed Approval challenge.
+    // Then mint the same in-memory grant that a successful ceremony would mint
+    // for the emitted central action id and retry confirm to broadcast. The
+    // Anvil test does not have a browser/WebAuthn device, but this still
+    // exercises the mounted denial boundary, challenge projection, production
+    // grant-gated KeystorePetalHost sign_hash path, and raw tx broadcast.
     daemon
         .keystore
         .unlock("alice", passphrase)
@@ -181,10 +182,48 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
         .auth_services
         .require_grant_store()
         .map_err(|e| anyhow!("grant store: {e}"))?;
+    let confirm_path = VfsPath::parse(&format!(
+        "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/confirm"
+    ))
+    .unwrap();
+    let confirm_body = "y\n";
+    let first_confirm = daemon
+        .vfs
+        .write(&confirm_path, confirm_body.as_bytes())
+        .await;
+    assert!(
+        first_confirm.is_err(),
+        "initial confirm unexpectedly succeeded without Sealed Approval"
+    );
+
+    let challenge_path = VfsPath::parse(&format!(
+        "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/approval_challenge.json"
+    ))
+    .unwrap();
+    let challenge_bytes = daemon
+        .vfs
+        .read(&challenge_path)
+        .await
+        .map_err(|e| anyhow!("read approval_challenge.json: {e}"))?;
+    let challenge: serde_json::Value = serde_json::from_slice(&challenge_bytes)
+        .context("approval_challenge.json must be valid JSON")?;
+    let action_id = challenge
+        .get("action_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("approval_challenge.json missing action_id: {challenge}"))?;
+    assert!(
+        challenge
+            .get("ceremony_url")
+            .and_then(|v| v.as_str())
+            .map(|url| url.starts_with("http://localhost") || url.starts_with("http://127.0.0.1"))
+            .unwrap_or(false),
+        "approval_challenge.json missing local ceremony_url: {challenge}"
+    );
+
     mint_evm_test_grant(
         grant_store.as_ref(),
         "alice",
-        &format!("31337:{pending_id}"),
+        action_id,
         "confirm",
         31337,
         &alice_addr,
@@ -192,16 +231,11 @@ async fn anvil_full_stage_confirm_flow() -> Result<()> {
     )
     .await
     .map_err(|e| anyhow!("mint confirm grant: {e}"))?;
-    let confirm_path = VfsPath::parse(&format!(
-        "/wallets/alice/chains/anvil/outbox/pending/{pending_id}/confirm"
-    ))
-    .unwrap();
-    let confirm_body = "y\n";
     daemon
         .vfs
         .write(&confirm_path, confirm_body.as_bytes())
         .await
-        .map_err(|e| anyhow!("confirm write: {e}"))?;
+        .map_err(|e| anyhow!("confirm retry write: {e}"))?;
 
     // 9. Verify the entry now lives in `sent/` with a tx_hash artefact.
     let sent_dir = VfsPath::parse("/wallets/alice/chains/anvil/outbox/sent").unwrap();
