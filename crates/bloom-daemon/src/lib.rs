@@ -36,7 +36,7 @@ use bloom_revert::{
     OpenchainDecoder, boxed,
 };
 use bloom_script::{ChainStateIface, PqSignature, PtbTx};
-use bloom_tx::outbox::{CentralOutboxProjection, Outbox};
+use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox};
 use bloom_tx::tx_engine::TxEngine;
 use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::polymarket::{ChainClientReader, PolymarketOnboarding, build_onboarder};
@@ -92,9 +92,7 @@ impl CentralOutboxProjection for EvmOutboxProjection {
         intent_json: &[u8],
         plan_md: &str,
         policy_check_json: &[u8],
-        petal_id: &str,
-        petal_digest: &str,
-        petal_version: &str,
+        identity: CentralActionIdentity<'_>,
     ) -> Result<(), String> {
         let intent_hash = bloom_auth_api::intent_hash_of(intent_json);
         self.central
@@ -105,9 +103,9 @@ impl CentralOutboxProjection for EvmOutboxProjection {
                 plan_md,
                 policy_check_json,
                 &StagedPetalIdentity {
-                    petal_id: petal_id.to_string(),
-                    petal_digest: petal_digest.to_string(),
-                    petal_version: petal_version.to_string(),
+                    petal_id: identity.petal_id.to_string(),
+                    petal_digest: identity.petal_digest.to_string(),
+                    petal_version: identity.petal_version.to_string(),
                 },
             )
             .map_err(|e| e.to_string())

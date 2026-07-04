@@ -263,8 +263,8 @@ Prereqs: `anvil`, `cast`, `forge`, `jq`, and a built `target/release/bloom`
 
 | # | Scenario | Skipped when |
 |---|----------|--------------|
-| 1 | Native ETH send on a local anvil | (always runs) |
-| 2 | ERC-20 transfer (deploys `MockERC20` via `forge`) | (always runs) |
+| 1 | Native ETH send staged on local Anvil; initial confirm must deny and write central `approval_challenge.json` with `ceremony_url` | (always runs) |
+| 2 | ERC-20 transfer staged with deployed `MockERC20`; initial confirm must deny and write central `approval_challenge.json` with `ceremony_url` | (always runs) |
 | 3 | Uniswap V2 swap on a mainnet fork | `BLOOM_MAINNET_RPC` unset |
 | 4 | Enso intent on a mainnet fork | `BLOOM_MAINNET_RPC` or `BLOOM_ENSO_KEY` unset |
 

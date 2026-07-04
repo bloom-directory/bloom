@@ -206,6 +206,16 @@ pub struct SealedActionExecution {
     pub signing_hash: B256,
 }
 
+struct EvmCentralResult<'a> {
+    action_id: &'a str,
+    state: OutboxState,
+    outcome: &'a str,
+    tx_hash: B256,
+    nonce: u64,
+    signing_hash: &'a B256,
+    action_kind: &'a str,
+}
+
 struct SubmitResult {
     transport: BroadcastTransport,
     returned_hash: Option<B256>,
@@ -1436,15 +1446,15 @@ impl TxEngine {
             staged.tx_hash.as_ref().unwrap().as_bytes(),
         )?;
         if let Some(action_id) = staged.action_id.as_deref() {
-            self.write_central_evm_result(
+            self.write_central_evm_result(EvmCentralResult {
                 action_id,
-                OutboxState::Sent,
-                "sent",
+                state: OutboxState::Sent,
+                outcome: "sent",
                 tx_hash,
-                staged.nonce,
-                &signing_hash,
-                EvmOutboxActionKind::Confirm.action_kind(),
-            )?;
+                nonce: staged.nonce,
+                signing_hash: &signing_hash,
+                action_kind: EvmOutboxActionKind::Confirm.action_kind(),
+            })?;
         }
 
         Ok(staged)
@@ -1599,56 +1609,47 @@ impl TxEngine {
             let signing_hash = self
                 .build_unsigned_evm_tx(&staged, chain)
                 .map(|unsigned| Self::unsigned_signing_hash(&unsigned))?;
-            self.write_central_evm_result(
+            self.write_central_evm_result(EvmCentralResult {
                 action_id,
-                OutboxState::Sent,
-                "sent",
+                state: OutboxState::Sent,
+                outcome: "sent",
                 tx_hash,
-                staged.nonce,
-                &signing_hash,
-                EvmOutboxActionKind::Confirm.action_kind(),
-            )?;
+                nonce: staged.nonce,
+                signing_hash: &signing_hash,
+                action_kind: EvmOutboxActionKind::Confirm.action_kind(),
+            })?;
         }
         Ok(staged)
     }
 
-    fn write_central_evm_result(
-        &self,
-        action_id: &str,
-        state: OutboxState,
-        outcome: &str,
-        tx_hash: B256,
-        nonce: u64,
-        signing_hash: &B256,
-        action_kind: &str,
-    ) -> Result<(), TxEngineError> {
+    fn write_central_evm_result(&self, central: EvmCentralResult<'_>) -> Result<(), TxEngineError> {
         let result = serde_json::json!({
             "schema": "bloom.evm_execution_result.v1",
-            "action_id": action_id,
-            "state": state.dirname(),
-            "outcome": outcome,
-            "action_kind": action_kind,
-            "tx_hash": format!("{:#x}", tx_hash),
-            "nonce": nonce,
-            "signing_hash": format!("{:#x}", signing_hash),
+            "action_id": central.action_id,
+            "state": central.state.dirname(),
+            "outcome": central.outcome,
+            "action_kind": central.action_kind,
+            "tx_hash": format!("{:#x}", central.tx_hash),
+            "nonce": central.nonce,
+            "signing_hash": format!("{:#x}", central.signing_hash),
             "created_ms": now_ms(),
         });
         let status = serde_json::json!({
-            "action_id": action_id,
-            "state": state.dirname(),
-            "outcome": outcome,
-            "tx_hash": format!("{:#x}", tx_hash),
-            "action_kind": action_kind,
+            "action_id": central.action_id,
+            "state": central.state.dirname(),
+            "outcome": central.outcome,
+            "tx_hash": format!("{:#x}", central.tx_hash),
+            "action_kind": central.action_kind,
         });
         self.outbox.write_central_action_artifact(
-            action_id,
-            state,
+            central.action_id,
+            central.state,
             "result.json",
             &serde_json::to_vec_pretty(&result).unwrap(),
         )?;
         self.outbox.write_central_action_artifact(
-            action_id,
-            state,
+            central.action_id,
+            central.state,
             "status.json",
             &serde_json::to_vec_pretty(&status).unwrap(),
         )?;
@@ -2194,15 +2195,15 @@ impl TxEngine {
             OutboxState::Pending,
             OutboxState::Sent,
         )?;
-        self.write_central_evm_result(
-            &subject.action_id,
-            OutboxState::Sent,
-            "sent",
-            signed.hash,
+        self.write_central_evm_result(EvmCentralResult {
+            action_id: &subject.action_id,
+            state: OutboxState::Sent,
+            outcome: "sent",
+            tx_hash: signed.hash,
             nonce,
-            &signing_hash,
-            subject.action_kind.as_str(),
-        )?;
+            signing_hash: &signing_hash,
+            action_kind: subject.action_kind.as_str(),
+        })?;
         Ok(SealedActionExecution {
             action_id: subject.action_id,
             petal_id: subject.petal_id,

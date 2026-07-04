@@ -140,6 +140,13 @@ pub struct OutboxEntry {
     pub dir: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct CentralActionIdentity<'a> {
+    pub petal_id: &'a str,
+    pub petal_digest: &'a str,
+    pub petal_version: &'a str,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BroadcastTransport {
@@ -222,9 +229,7 @@ pub trait CentralOutboxProjection: Send + Sync {
         intent_json: &[u8],
         plan_md: &str,
         policy_check_json: &[u8],
-        petal_id: &str,
-        petal_digest: &str,
-        petal_version: &str,
+        identity: CentralActionIdentity<'_>,
     ) -> Result<(), String>;
 
     /// Move the action from one state to another.
@@ -388,9 +393,11 @@ impl Outbox {
                 &intent_json,
                 plan_md,
                 &policy_check_json,
-                PETAL_ID_EVM_WALLET,
-                PLACEHOLDER_DIGEST_EVM_WALLET,
-                FIRST_PARTY_PETAL_VERSION_V0,
+                CentralActionIdentity {
+                    petal_id: PETAL_ID_EVM_WALLET,
+                    petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET,
+                    petal_version: FIRST_PARTY_PETAL_VERSION_V0,
+                },
             )
             .map_err(OutboxError::Other)?;
         }
@@ -1519,12 +1526,11 @@ mod tests {
             _intent_json: &[u8],
             _plan_md: &str,
             _policy_check_json: &[u8],
-            petal_id: &str,
-            petal_digest: &str,
-            petal_version: &str,
+            identity: CentralActionIdentity<'_>,
         ) -> Result<(), String> {
             self.staged.lock().unwrap().push(format!(
-                "{action_id}:{petal_id}:{petal_digest}:{petal_version}"
+                "{}:{}:{}:{}",
+                action_id, identity.petal_id, identity.petal_digest, identity.petal_version
             ));
             Ok(())
         }
