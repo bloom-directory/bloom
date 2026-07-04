@@ -3067,12 +3067,16 @@ async fn sign_outbox_sealed_approval_if_challenged(
         None,
         review_session_id,
     );
-    let signature = d
-        .keystore
-        .sign_approval_with_passkey(wallet, &unsigned, intent)
-        .await
-        .context("sign Sealed Approval with passkey")?;
-    let approval: SignedApproval = unsigned.into_signed(signature);
+    let (_grant, approval) = bloom_daemon::sealed_ceremony::run_sealed_approval_ceremony(
+        &d.keystore,
+        &d.auth_services,
+        unsigned,
+        intent,
+        cli_now_ms(),
+        d.signer_cache.as_ref(),
+    )
+    .await
+    .context("run sealed approval browser ceremony")?;
     let approval_path = entry.dir.join("approval.json");
     std::fs::write(
         &approval_path,

@@ -1792,6 +1792,18 @@ impl super::Keystore {
         name: &str,
         unsigned: &UnsignedApproval,
     ) -> Result<(WebAuthnAssertionRecord, Arc<PrivateKeySigner>), KeystoreError> {
+        self.sealed_approval_ceremony_with_intent(name, unsigned, None)
+            .await
+    }
+
+    /// As [`Self::sealed_approval_ceremony`], but renders the supplied review
+    /// intent in the browser page before the WebAuthn prompt.
+    pub async fn sealed_approval_ceremony_with_intent(
+        &self,
+        name: &str,
+        unsigned: &UnsignedApproval,
+        intent: Option<bloom_proto::CeremonyIntent>,
+    ) -> Result<(WebAuthnAssertionRecord, Arc<PrivateKeySigner>), KeystoreError> {
         Self::validate_name(name)?;
         let dir = self.wallet_path(name);
         if !dir.exists() {
@@ -1832,7 +1844,7 @@ impl super::Keystore {
         let ceremony = auth_ceremony(
             &credential,
             Some(&prf_salt),
-            None,
+            intent,
             None,
             Some(challenge),
             require_uv,

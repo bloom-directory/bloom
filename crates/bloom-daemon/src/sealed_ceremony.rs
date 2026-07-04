@@ -2,8 +2,9 @@
 //! mints a grant AND caches the decrypted signer so subsequent `sign_hash`
 //! calls within the same grant skip the WebAuthn ceremony.
 
-use bloom_auth_api::{AuditEvent, SealedApprovalGrant, UnsignedApproval};
+use bloom_auth_api::{AuditEvent, SealedApprovalGrant, SignedApproval, UnsignedApproval};
 use bloom_keystore::petal_host::SignerCache;
+use bloom_proto::CeremonyIntent;
 use bloom_vfs::{AuthServices, HandlerError};
 
 /// Run the one-ceremony sealed approval flow:
@@ -11,7 +12,7 @@ use bloom_vfs::{AuthServices, HandlerError};
 /// 2. Build `SignedApproval` from the assertion via `into_signed`.
 /// 3. Call `verify_and_mint_grant` to mint the grant.
 /// 4. Cache the signer keyed by `grant_id`.
-/// 5. Return the grant.
+/// 5. Return the grant plus the persisted approval artifact.
 ///
 /// The caller (daemon IPC handler) must have already staged the unsigned
 /// approval and constructed the [`UnsignedApproval`]. The `signer_cache` must
@@ -21,14 +22,15 @@ pub async fn run_sealed_approval_ceremony(
     keystore: &bloom_keystore::Keystore,
     services: &AuthServices,
     unsigned: UnsignedApproval,
+    intent: Option<CeremonyIntent>,
     now_ms: u64,
     signer_cache: &SignerCache,
-) -> Result<SealedApprovalGrant, HandlerError> {
+) -> Result<(SealedApprovalGrant, SignedApproval), HandlerError> {
     let wallet = unsigned.wallet.clone();
 
     // 1. Run the single ceremony.
     let (assertion, signer) = keystore
-        .sealed_approval_ceremony(&wallet, &unsigned)
+        .sealed_approval_ceremony_with_intent(&wallet, &unsigned, intent)
         .await
         .map_err(|e| HandlerError::Backend(format!("sealed_approval_ceremony: {e}")))?;
 
@@ -38,7 +40,11 @@ pub async fn run_sealed_approval_ceremony(
     // 3. Verify + mint the grant.
     let grant = services
         .require_approval_verifier()?
-        .verify_and_mint_grant(signed, services.require_grant_store()?.as_ref(), now_ms)
+        .verify_and_mint_grant(
+            signed.clone(),
+            services.require_grant_store()?.as_ref(),
+            now_ms,
+        )
         .await
         .map_err(|e| HandlerError::Backend(format!("verify_and_mint_grant: {e}")))?;
 
@@ -63,7 +69,7 @@ pub async fn run_sealed_approval_ceremony(
             .await;
     }
 
-    Ok(grant)
+    Ok((grant, signed))
 }
 
 #[cfg(test)]
