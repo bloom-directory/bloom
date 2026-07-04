@@ -1,0 +1,34 @@
+name: PR Checklist
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  checklist:
+    name: checklist-complete
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all checklist items are checked
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          total=$(printf '%s\n' "$PR_BODY" | grep -Ec '^[[:space:]]*[-*] \[[ xX]\]' || true)
+          unchecked=$(printf '%s\n' "$PR_BODY" | grep -Ec '^[[:space:]]*[-*] \[ \]' || true)
+
+          if [ "$total" -eq 0 ]; then
+            echo "::error::PR description contains no checklist. Use the pull request template (.github/pull_request_template.md)."
+            exit 1
+          fi
+
+          if [ "$unchecked" -gt 0 ]; then
+            echo "Unchecked items:"
+            printf '%s\n' "$PR_BODY" | grep -E '^[[:space:]]*[-*] \[ \]' || true
+            echo "::error::$unchecked of $total checklist item(s) unchecked. Check every item (mark non-applicable items as N/A) before merge."
+            exit 1
+          fi
+
+          echo "All $total checklist items checked."

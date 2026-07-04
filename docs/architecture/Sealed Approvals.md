@@ -99,10 +99,13 @@ Approvals bind concrete action ids. They must never bind `latest`.
 The `approval_challenge.json` artifact also carries a `ceremony_url` for the
 browser ceremony bound to the same challenge. The URL token is single-use,
 derived from the challenge's `server_nonce`, and valid until the challenge's
-existing `expiry_ms`; there is no separate URL expiry field. The URL is not
-part of the challenge hash input. Whether the URL is reachable only on
-localhost or over the open internet is described in
+existing `expiry_ms`; there is no separate URL expiry field. Whether the URL
+is reachable only on localhost or over the open internet is described in
 [`Open-Internet Sealed Approval Ceremony.md`](./Open-Internet%20Sealed%20Approval%20Ceremony.md).
+
+The URL is not part of the challenge hash input. How agents discover this
+contract is described in
+[`Agent-native Documentation.md`](./Agent-native%20Documentation.md).
 
 **Signed approval**
 
@@ -275,7 +278,28 @@ execution
 
 The path names may differ by Petal. The lifecycle may not.
 
-## Petal Responsibilities
+## Runtime and Petal Responsibilities
+
+The sealed-approval machinery is core Bloom runtime, not Petal code. Petals
+supply domain facts; the runtime owns the authorization mechanics. The split
+is structural, not a convention: the Petal API does not expose challenge
+issuance, ceremony URLs, browser launching, PRF output, or grant minting, so
+a Petal cannot violate these rules even if it tries.
+
+The Bloom runtime owns, identically for every Petal:
+
+- sealing actions and validating concrete action ids;
+- issuing approval challenges and minting ceremony URLs;
+- writing `approval_challenge.json`, including `ceremony_url`, into the
+  pending projection before failing the triggering write;
+- serving the ceremony page and API, including the grant / grant + execute
+  choice and the exposure mode
+  ([`Open-Internet Sealed Approval Ceremony.md`](./Open-Internet%20Sealed%20Approval%20Ceremony.md));
+- never opening a browser itself;
+- receiving PRF output into daemon memory, verifying approvals, and minting
+  and enforcing grants;
+- reusing an unexpired challenge and URL idempotently across retries;
+- central audit and result recording.
 
 Each Petal must provide:
 
@@ -286,8 +310,13 @@ Each Petal must provide:
 - daemon grant terms with exact allowed signing/authority intents;
 - structured attestation for every generic signing request;
 - execution from sealed bytes, not mutable projection files;
-- central audit events and result projection;
+- audit events and result projection through the central runtime surfaces;
 - interaction-mode support as defined in `Interaction Modes.md`.
+
+When a Petal handler determines that approval is required, it reports
+approval-required to the runtime and stops. Everything from that point until
+a grant exists — challenge, URL, ceremony, verification, grant — is runtime
+behavior.
 
 Petals must not:
 

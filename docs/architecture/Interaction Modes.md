@@ -143,6 +143,14 @@ forwarded to the user stays valid. Whether the URL is reachable only on
 localhost or over the open internet is described in
 [`Open-Internet Sealed Approval Ceremony.md`](./Open-Internet%20Sealed%20Approval%20Ceremony.md).
 
+### Discoverability
+
+The contract above must be self-documenting; an agent must not need prior
+knowledge of Bloom to complete it. Bloom's agent-facing documentation
+surfaces, and the requirement to document this lifecycle in them, are
+described in
+[`Agent-native Documentation.md`](./Agent-native%20Documentation.md).
+
 ## Foreground Command Shape
 
 The default foreground command should be the same command users already run to
@@ -190,11 +198,16 @@ budget, or consume bounded session authority must provide:
 - a Petal identity: `petal_id`, `petal_digest`, and `petal_version`;
 - a sealed policy snapshot;
 - daemon grant terms, including allowed signing intents and signature count;
-- a foreground ceremony path for CLI-only and daemon-mounted operation;
-- passive mounted-VFS behavior that stages challenges and exposes the
-  `ceremony_url` in `approval_challenge.json` but never opens a browser;
+- a confirm command/path wired to the shared runtime action state machine;
 - audit/result artifacts visible through the central outbox and any Petal
   projection.
+
+Challenge issuance, `ceremony_url` projection, ceremony serving,
+browser policy, approval verification, and grant minting are Bloom runtime
+behavior, identical for every Petal. A Petal handler reports approval-required
+and stops; it has no API to mint a URL or open a browser. See the "Runtime and
+Petal Responsibilities" section of
+[`Sealed Approvals.md`](./Sealed%20Approvals.md).
 
 Petal-specific names are allowed. The authorization behavior is not.
 
