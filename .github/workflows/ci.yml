@@ -56,6 +56,10 @@ jobs:
         run: rustup show
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
       - name: Free runner disk space
         run: |
           df -h
