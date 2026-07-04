@@ -558,12 +558,14 @@ impl AuthStore {
             Option<String>,
             Option<i64>,
             Option<String>,
+            Option<String>,
+            Option<i64>,
         );
         let row: PendingEntryRow = tx
             .query_row(
                 "SELECT ae.intent_hash, ae.assurance, ae.wallet, ae.petal_id, ae.petal_digest,
                         ae.daemon_terms_digest, ae.petal_policy_digest, ae.policy_version,
-                        si.sealed_action_json
+                        si.sealed_action_json, ae.nonce, ae.challenge_expiry_ms
                  FROM auth_entries ae
                  JOIN sealed_intents si ON si.intent_hash = ae.intent_hash
                  WHERE ae.surface = ?1 AND ae.action_id = ?2 AND ae.nonce_state = 'unused'",
@@ -579,6 +581,8 @@ impl AuthStore {
                         row.get(6)?,
                         row.get(7)?,
                         row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
                     ))
                 },
             )
@@ -594,6 +598,8 @@ impl AuthStore {
             petal_policy_digest,
             policy_version,
             sealed_action_json,
+            existing_nonce,
+            existing_expiry_ms,
         ) = row;
         let (
             Some(wallet),
@@ -639,20 +645,35 @@ impl AuthStore {
                 "auth entry sealed metadata does not match sealed action".into(),
             ));
         }
-        tx.execute(
-            "UPDATE auth_entries
+        let (effective_nonce, effective_expiry_ms, should_update_challenge) =
+            if let (Some(existing_nonce), Some(existing_expiry_ms)) =
+                (existing_nonce, existing_expiry_ms)
+            {
+                let existing_expiry_ms = existing_expiry_ms as u64;
+                if existing_expiry_ms > now_ms {
+                    (existing_nonce, existing_expiry_ms, false)
+                } else {
+                    (server_nonce.to_string(), expiry_ms, true)
+                }
+            } else {
+                (server_nonce.to_string(), expiry_ms, true)
+            };
+        if should_update_challenge {
+            tx.execute(
+                "UPDATE auth_entries
              SET state = ?3, nonce = ?4, nonce_state = ?5, challenge_expiry_ms = ?6, updated_ms = ?7
              WHERE surface = ?1 AND action_id = ?2 AND nonce_state = 'unused'",
-            params![
-                surface,
-                action_id,
-                AuthEntryState::Challenged.as_str(),
-                server_nonce,
-                NonceState::Unused.as_str(),
-                expiry_ms as i64,
-                now_ms as i64,
-            ],
-        )?;
+                params![
+                    surface,
+                    action_id,
+                    AuthEntryState::Challenged.as_str(),
+                    &effective_nonce,
+                    NonceState::Unused.as_str(),
+                    effective_expiry_ms as i64,
+                    now_ms as i64,
+                ],
+            )?;
+        }
         tx.commit()?;
         Ok(ApprovalChallenge {
             schema: APPROVAL_CHALLENGE_SCHEMA_V1.to_string(),
@@ -662,12 +683,13 @@ impl AuthStore {
             petal_id: action.petal_id().to_string(),
             petal_digest: action.petal_digest().to_string(),
             intent_hash: action_intent_hash,
-            server_nonce: server_nonce.to_string(),
+            server_nonce: effective_nonce,
             assurance: parse_assurance(&assurance)?,
             daemon_terms_digest: action_daemon_terms_digest,
             petal_policy_digest: action.petal_policy_digest.clone(),
             policy_version: action.policy_version,
-            expiry_ms,
+            expiry_ms: effective_expiry_ms,
+            ceremony_url: None,
         })
     }
 
@@ -1064,6 +1086,7 @@ impl AuthStore {
             petal_policy_digest,
             policy_version: policy_version as u64,
             expiry_ms: challenge_expiry_ms as u64,
+            ceremony_url: None,
         };
         let (envelope_json, sealed_at_ms, sealed_action_json): (String, i64, Option<String>) = tx
             .query_row(
@@ -3625,6 +3648,46 @@ mod tests {
         store
             .consume_verified_approval_transactionally(&approval_for(&challenge), 150)
             .unwrap();
+    }
+
+    #[test]
+    fn issue_challenge_reuses_unexpired_nonce_and_expiry() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        let action =
+            SealedAction::seal_with_default_terms(envelope(), AssuranceLevel::Standard, 100)
+                .unwrap();
+        store.stage_action(&action, 100).unwrap();
+
+        let first = store
+            .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
+            .unwrap();
+        let second = store
+            .issue_challenge("requests", "req_1", "nonce-2", 400, 150)
+            .unwrap();
+        assert_eq!(second.server_nonce, first.server_nonce);
+        assert_eq!(second.expiry_ms, first.expiry_ms);
+        assert_eq!(
+            second.challenge_hash().unwrap(),
+            first.challenge_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn issue_challenge_rotates_after_expiry() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        let action =
+            SealedAction::seal_with_default_terms(envelope(), AssuranceLevel::Standard, 100)
+                .unwrap();
+        store.stage_action(&action, 100).unwrap();
+
+        let first = store
+            .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
+            .unwrap();
+        let second = store
+            .issue_challenge("requests", "req_1", "nonce-2", 400, 221)
+            .unwrap();
+        assert_ne!(second.server_nonce, first.server_nonce);
+        assert_ne!(second.expiry_ms, first.expiry_ms);
     }
 
     #[test]

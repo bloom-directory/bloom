@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use bloom_auth_api::petal_identity::{
+    FIRST_PARTY_PETAL_VERSION_V0, PETAL_ID_EVM_WALLET, PLACEHOLDER_DIGEST_EVM_WALLET,
+};
 use bloom_proto::{StagedTx, TxStatus};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -219,10 +222,22 @@ pub trait CentralOutboxProjection: Send + Sync {
         intent_json: &[u8],
         plan_md: &str,
         policy_check_json: &[u8],
+        petal_id: &str,
+        petal_digest: &str,
+        petal_version: &str,
     ) -> Result<(), String>;
 
     /// Move the action from one state to another.
     fn transition_action(&self, action_id: &str, from: &str, to: &str) -> Result<(), String>;
+
+    /// Write a runtime-generated artifact under a central action directory.
+    fn write_action_file(
+        &self,
+        action_id: &str,
+        state: &str,
+        file: &str,
+        data: &[u8],
+    ) -> Result<(), String>;
 }
 
 #[derive(Clone)]
@@ -267,6 +282,54 @@ impl Outbox {
 
     pub fn root(&self) -> &Path {
         &self.inner.root
+    }
+
+    /// Mirror a runtime-generated action artifact into the central outbox
+    /// projection, when one is attached.
+    pub fn write_central_action_artifact(
+        &self,
+        action_id: &str,
+        state: OutboxState,
+        file: &str,
+        data: &[u8],
+    ) -> Result<(), OutboxError> {
+        if file != "approval_challenge.json" && file != "result.json" && file != "status.json" {
+            return Err(OutboxError::Other(format!(
+                "central artifact '{file}' is not runtime-writable"
+            )));
+        }
+        if let Some(projection) = &self.inner.projection {
+            projection
+                .write_action_file(action_id, state.dirname(), file, data)
+                .map_err(OutboxError::Other)?;
+        }
+        Ok(())
+    }
+
+    /// Mirror a runtime-generated pending action artifact into the central
+    /// outbox projection, when one is attached.
+    pub fn write_central_pending_artifact(
+        &self,
+        action_id: &str,
+        file: &str,
+        data: &[u8],
+    ) -> Result<(), OutboxError> {
+        self.write_central_action_artifact(action_id, OutboxState::Pending, file, data)
+    }
+
+    /// Move the central projected action, if a projection is attached.
+    pub fn transition_central_action(
+        &self,
+        action_id: &str,
+        from: OutboxState,
+        to: OutboxState,
+    ) -> Result<(), OutboxError> {
+        if let Some(projection) = &self.inner.projection {
+            projection
+                .transition_action(action_id, from.dirname(), to.dirname())
+                .map_err(OutboxError::Other)?;
+        }
+        Ok(())
     }
 
     fn validate_segment(seg: &str) -> Result<(), OutboxError> {
@@ -320,8 +383,16 @@ impl Outbox {
 
             let intent_json = serde_json::to_vec_pretty(&staged)?;
             let policy_check_json = serde_json::to_vec_pretty(&staged.policy_checks)?;
-            proj.stage_action(&action_id, &intent_json, plan_md, &policy_check_json)
-                .map_err(OutboxError::Other)?;
+            proj.stage_action(
+                &action_id,
+                &intent_json,
+                plan_md,
+                &policy_check_json,
+                PETAL_ID_EVM_WALLET,
+                PLACEHOLDER_DIGEST_EVM_WALLET,
+                FIRST_PARTY_PETAL_VERSION_V0,
+            )
+            .map_err(OutboxError::Other)?;
         }
 
         let dir = self
@@ -1413,6 +1484,7 @@ mod tests {
         staged: Mutex<Vec<String>>,              // action_ids staged
         transitions: Mutex<Vec<(String, String, String)>>, // (id, from, to)
         fail_transition: Mutex<Option<String>>,
+        action_files: Mutex<Vec<(String, String, String)>>,
     }
 
     impl MockProjection {
@@ -1422,6 +1494,7 @@ mod tests {
                 staged: Mutex::new(vec![]),
                 transitions: Mutex::new(vec![]),
                 fail_transition: Mutex::new(None),
+                action_files: Mutex::new(vec![]),
             }
         }
     }
@@ -1446,8 +1519,13 @@ mod tests {
             _intent_json: &[u8],
             _plan_md: &str,
             _policy_check_json: &[u8],
+            petal_id: &str,
+            petal_digest: &str,
+            petal_version: &str,
         ) -> Result<(), String> {
-            self.staged.lock().unwrap().push(action_id.to_string());
+            self.staged.lock().unwrap().push(format!(
+                "{action_id}:{petal_id}:{petal_digest}:{petal_version}"
+            ));
             Ok(())
         }
 
@@ -1459,6 +1537,21 @@ mod tests {
                 action_id.to_string(),
                 from.to_string(),
                 to.to_string(),
+            ));
+            Ok(())
+        }
+
+        fn write_action_file(
+            &self,
+            action_id: &str,
+            state: &str,
+            file: &str,
+            _data: &[u8],
+        ) -> Result<(), String> {
+            self.action_files.lock().unwrap().push((
+                action_id.to_string(),
+                state.to_string(),
+                file.to_string(),
             ));
             Ok(())
         }
@@ -1483,7 +1576,15 @@ mod tests {
 
         // Mock should have recorded the allocation + stage.
         assert_eq!(mock.allocated.lock().unwrap().len(), 1);
-        assert_eq!(mock.staged.lock().unwrap().len(), 1);
+        let staged_actions = mock.staged.lock().unwrap();
+        assert_eq!(staged_actions.len(), 1);
+        assert_eq!(
+            staged_actions[0],
+            format!(
+                "act-0000:{PETAL_ID_EVM_WALLET}:{PLACEHOLDER_DIGEST_EVM_WALLET}:{FIRST_PARTY_PETAL_VERSION_V0}"
+            )
+        );
+        drop(staged_actions);
 
         // Transition to sent.
         ob.transition(&entry, OutboxState::Sent).unwrap();
@@ -1505,6 +1606,22 @@ mod tests {
         ob.write_pending(&staged, "# plan").unwrap();
         let entry = ob.read("alice", "anvil", "no-proj").unwrap();
         assert!(entry.staged.action_id.is_none());
+    }
+
+    #[test]
+    fn projection_writes_runtime_artifacts_in_final_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mock = Arc::new(MockProjection::new());
+        let ob = Outbox::new_with_projection(dir.path(), mock.clone()).unwrap();
+
+        ob.write_central_action_artifact("act-final", OutboxState::Sent, "result.json", b"{}")
+            .unwrap();
+
+        let files = mock.action_files.lock().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "act-final");
+        assert_eq!(files[0].1, "sent");
+        assert_eq!(files[0].2, "result.json");
     }
 
     #[test]

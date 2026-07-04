@@ -822,13 +822,69 @@ pub struct ApprovalChallenge {
     pub policy_version: u64,
     /// Daemon-issued challenge expiry.
     pub expiry_ms: u64,
+    /// Browser ceremony URL for mounted/daemon flows. Projection metadata only:
+    /// it is intentionally excluded from the WebAuthn challenge hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceremony_url: Option<String>,
 }
 
 impl ApprovalChallenge {
-    /// Canonical preimage bytes. Deterministic: fields serialize in
-    /// declaration order.
+    /// Deterministic local ceremony URL for mounted daemon demos.
+    ///
+    /// The token is derived from `server_nonce` and therefore remains stable
+    /// for an unexpired reused challenge. Full internet relay exposure can
+    /// swap the base URL without changing the signed challenge preimage.
+    pub fn local_ceremony_url(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"bloom.ceremony_url.v1");
+        hasher.update(self.server_nonce.as_bytes());
+        let token =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize().as_bytes());
+        format!("http://localhost:18734/ceremony/{token}")
+    }
+
+    pub fn with_local_ceremony_url(mut self) -> Self {
+        self.ceremony_url = Some(self.local_ceremony_url());
+        self
+    }
+
+    /// Canonical preimage bytes. Deterministic: fields serialize in declaration
+    /// order. Projection metadata such as `ceremony_url` is deliberately not
+    /// part of this preimage.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, AuthApiError> {
-        serde_json::to_vec(self).map_err(AuthApiError::Json)
+        #[derive(Serialize)]
+        struct ApprovalChallengeHashPreimage<'a> {
+            schema: &'a str,
+            action_id: &'a str,
+            wallet: &'a str,
+            surface: &'a str,
+            petal_id: &'a str,
+            petal_digest: &'a str,
+            intent_hash: &'a str,
+            server_nonce: &'a str,
+            assurance: AssuranceLevel,
+            daemon_terms_digest: &'a str,
+            petal_policy_digest: &'a str,
+            policy_version: u64,
+            expiry_ms: u64,
+        }
+
+        serde_json::to_vec(&ApprovalChallengeHashPreimage {
+            schema: &self.schema,
+            action_id: &self.action_id,
+            wallet: &self.wallet,
+            surface: &self.surface,
+            petal_id: &self.petal_id,
+            petal_digest: &self.petal_digest,
+            intent_hash: &self.intent_hash,
+            server_nonce: &self.server_nonce,
+            assurance: self.assurance,
+            daemon_terms_digest: &self.daemon_terms_digest,
+            petal_policy_digest: &self.petal_policy_digest,
+            policy_version: self.policy_version,
+            expiry_ms: self.expiry_ms,
+        })
+        .map_err(AuthApiError::Json)
     }
 
     /// The 32-byte WebAuthn challenge:
@@ -948,6 +1004,7 @@ impl UnsignedApproval {
             petal_policy_digest: self.petal_policy_digest.clone(),
             policy_version: self.policy_version,
             expiry_ms: self.expiry_ms,
+            ceremony_url: None,
         }
     }
 
@@ -3344,6 +3401,7 @@ mod tests {
             petal_policy_digest: "2".repeat(64),
             policy_version: 3,
             expiry_ms: 10_000,
+            ceremony_url: None,
         }
     }
 
@@ -3429,6 +3487,29 @@ mod tests {
     }
 
     #[test]
+    fn ceremony_url_is_projected_but_not_signed() {
+        let base = challenge();
+        let mut with_url = base.clone().with_local_ceremony_url();
+        assert!(with_url.ceremony_url.is_some());
+        assert_eq!(
+            base.challenge_hash().unwrap(),
+            with_url.challenge_hash().unwrap()
+        );
+        with_url.ceremony_url = Some("https://relay.example/ceremony/changed".into());
+        assert_eq!(
+            base.challenge_hash().unwrap(),
+            with_url.challenge_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn local_ceremony_url_is_stable_for_nonce() {
+        let first = challenge().with_local_ceremony_url();
+        let second = challenge().with_local_ceremony_url();
+        assert_eq!(first.ceremony_url, second.ceremony_url);
+    }
+
+    #[test]
     fn unsigned_approval_challenge_hash_matches_issued_challenge() {
         let c = challenge();
         let unsigned =
@@ -3510,6 +3591,7 @@ mod tests {
             petal_policy_digest: action.petal_policy_digest.clone(),
             policy_version: action.policy_version,
             expiry_ms: 10_000,
+            ceremony_url: None,
         };
         let sealed = SealedIntentRecord {
             intent_hash,

@@ -174,7 +174,26 @@ impl CentralOutbox {
             ));
         }
         std::fs::create_dir_all(self.state_dir(to))?;
-        std::fs::rename(&from_dir, &to_dir)
+        std::fs::rename(&from_dir, &to_dir)?;
+        self.write_status_state(action_id, to)?;
+        Ok(())
+    }
+
+    fn write_status_state(&self, action_id: &str, state: &str) -> std::io::Result<()> {
+        let path = self.action_dir(state, action_id).join("status.json");
+        let mut status = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                .unwrap_or_else(|_| serde_json::json!({})),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(e) => return Err(e),
+        };
+        if !status.is_object() {
+            status = serde_json::json!({});
+        }
+        let obj = status.as_object_mut().expect("status is object");
+        obj.insert("action_id".to_string(), serde_json::json!(action_id));
+        obj.insert("state".to_string(), serde_json::json!(state));
+        std::fs::write(path, serde_json::to_vec_pretty(&status).unwrap_or_default())
     }
 
     /// Write a result file for an action.
@@ -186,6 +205,37 @@ impl CentralOutbox {
     ) -> std::io::Result<()> {
         let dir = self.action_dir(state, action_id);
         std::fs::write(dir.join("result.json"), result_json)
+    }
+
+    /// Write a runtime-generated artifact into an existing central action
+    /// directory. This is intentionally allowlisted so callers cannot use the
+    /// projection as an arbitrary file writer.
+    pub fn write_action_file(
+        &self,
+        action_id: &str,
+        state: &str,
+        file: &str,
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        validate_action_id(action_id)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        if !matches!(
+            file,
+            "approval_challenge.json" | "result.json" | "status.json"
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("runtime artifact '{file}' is not writable"),
+            ));
+        }
+        let dir = self.action_dir(state, action_id);
+        if !dir.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("action {action_id} not found in {state}"),
+            ));
+        }
+        std::fs::write(dir.join(file), data)
     }
 
     /// Find which state an action is in, scanning all states.
@@ -515,6 +565,25 @@ mod tests {
 
         let p = VfsPath::parse("sent/act-003/intent.json").unwrap();
         assert!(h.read(&p).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn transition_updates_canonical_status_state() {
+        let h = handler();
+        h.outbox
+            .stage("act-status", b"{}", "hash", "plan", b"[]")
+            .unwrap();
+
+        h.outbox
+            .transition("act-status", "pending", "sent")
+            .unwrap();
+
+        let status_path = VfsPath::parse("sent/act-status/status.json").unwrap();
+        let status: serde_json::Value =
+            serde_json::from_slice(&h.read(&status_path).await.unwrap())
+                .expect("status.json parses");
+        assert_eq!(status["action_id"], "act-status");
+        assert_eq!(status["state"], "sent");
     }
 
     #[tokio::test]
