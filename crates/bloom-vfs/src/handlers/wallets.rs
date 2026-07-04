@@ -1619,7 +1619,7 @@ impl WalletsHandler {
                     "unlock-passkey only applies to passkey wallets",
                 ));
             }
-            if self.keystore.signer(wallet).is_ok() {
+            if self.keystore.is_unlocked(wallet) {
                 return Ok(()); // already unlocked — ceremony not needed
             }
             self.keystore.unlock_passkey(wallet).await.map_err(err_be)?;
@@ -4113,6 +4113,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&bytes).trim(), "passkey");
+    }
+
+    #[tokio::test]
+    async fn unlock_passkey_write_is_noop_when_passkey_signer_is_cached() {
+        let f = make_handler();
+        seed_passkey_wallet(&f, "pk");
+        assert!(f.handler.keystore.is_unlocked("pk"));
+
+        f.handler
+            .write(&VfsPath::parse("/pk/unlock-passkey").unwrap(), b"")
+            .await
+            .unwrap();
+
+        assert!(f.handler.keystore.is_unlocked("pk"));
     }
 
     #[tokio::test]
