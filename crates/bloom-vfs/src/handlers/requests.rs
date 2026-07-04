@@ -672,9 +672,12 @@ impl RequestsHandler {
                 id,
                 data,
                 &backend,
-                Some(&policy),
-                Some(checks),
-                Some(&sentinel),
+                ConfirmBackendOptions {
+                    grant_consumer: Some((self, &wallet, PAID_HTTP_MPP_SIGN_INTENT)),
+                    policy_override: Some(&policy),
+                    checks_override: Some(checks),
+                    sentinel_override: Some(&sentinel),
+                },
             )
             .await?;
             if !matches!(result.final_state.as_str(), "sent" | "failed") {
@@ -984,17 +987,26 @@ struct ConfirmResult {
     final_state: String,
 }
 
+#[derive(Default)]
+struct ConfirmBackendOptions<'a> {
+    grant_consumer: Option<(&'a RequestsHandler, &'a str, &'a str)>,
+    policy_override: Option<&'a Policy>,
+    checks_override: Option<Vec<PolicyCheck>>,
+    sentinel_override: Option<&'a str>,
+}
+
 async fn confirm_with_backend(
     root: &Path,
     id: &str,
     data: &[u8],
     backend: &dyn PaymentBackend,
-    policy_override: Option<&Policy>,
-    checks_override: Option<Vec<PolicyCheck>>,
-    sentinel_override: Option<&str>,
+    options: ConfirmBackendOptions<'_>,
 ) -> Result<ConfirmResult, HandlerError> {
     let value = String::from_utf8_lossy(data).trim().to_ascii_lowercase();
-    let sentinel = sentinel_override.unwrap_or("override").to_ascii_lowercase();
+    let sentinel = options
+        .sentinel_override
+        .unwrap_or("override")
+        .to_ascii_lowercase();
     if !matches!(value.as_str(), "y" | "yes" | "confirm") && value != sentinel.as_str() {
         return Err(HandlerError::invalid(format!(
             "confirm accepts y, yes, confirm, or policy override sentinel '{sentinel}'"
@@ -1005,7 +1017,7 @@ async fn confirm_with_backend(
     if !pending.exists() {
         return Err(HandlerError::NotFound(format!("/requests/pending/{id}")));
     }
-    let checks: Vec<PolicyCheck> = match checks_override {
+    let checks: Vec<PolicyCheck> = match options.checks_override {
         Some(checks) => checks,
         None => read_json(pending.join("policy_check.json"))?,
     };
@@ -1043,7 +1055,7 @@ async fn confirm_with_backend(
         .ok_or_else(|| HandlerError::backend("request artifact missing wallet"))?
         .to_string();
     let fallback_policy;
-    let policy = match policy_override {
+    let policy = match options.policy_override {
         Some(policy) => policy,
         None => {
             fallback_policy = backend_policy_for_wallet(root, &wallet).unwrap_or_default();
@@ -1054,6 +1066,11 @@ async fn confirm_with_backend(
         .prepare(&challenge, &request, &wallet, policy, id)
         .await
         .map_err(HandlerError::backend)?;
+    if let Some((handler, grant_wallet, sign_intent)) = options.grant_consumer {
+        let _grant = handler
+            .consume_paid_http_grant(id, grant_wallet, sign_intent)
+            .await?;
+    }
     write_minted_marker(&pending, id, &execution.credential_metadata)?;
     let retry = retry_paid_request(
         &reqwest::Client::new(),
@@ -3193,9 +3210,7 @@ inline = '{"prompt":"hi"}'
             "req_1",
             b"confirm",
             &StaticMppTestBackend,
-            None,
-            None,
-            None,
+            ConfirmBackendOptions::default(),
         )
         .await
         .unwrap();
@@ -3249,9 +3264,12 @@ inline = '{"prompt":"hi"}'
             "req_policy",
             b"confirm",
             &StaticMppTestBackend,
-            Some(&Policy::default()),
-            Some(current_checks),
-            Some("approve-spend"),
+            ConfirmBackendOptions {
+                policy_override: Some(&Policy::default()),
+                checks_override: Some(current_checks),
+                sentinel_override: Some("approve-spend"),
+                ..Default::default()
+            },
         )
         .await
         .unwrap_err();
@@ -3283,9 +3301,7 @@ inline = '{"prompt":"hi"}'
             "req_escape",
             b"confirm",
             &StaticMppTestBackend,
-            None,
-            None,
-            None,
+            ConfirmBackendOptions::default(),
         )
         .await
         .unwrap_err();
@@ -3344,6 +3360,120 @@ inline = '{"prompt":"hi"}'
         }
     }
 
+    struct PrepareFailingMppTestBackend;
+
+    #[async_trait]
+    impl PaymentBackend for PrepareFailingMppTestBackend {
+        fn name(&self) -> &'static str {
+            "mpp_tempo_test_double_prepare_failing"
+        }
+
+        async fn prepare(
+            &self,
+            _challenge: &NormalizedChallenge,
+            _request: &ParsedRequest,
+            _wallet: &str,
+            _policy: &Policy,
+            _request_id: &str,
+        ) -> Result<PaymentExecution, String> {
+            Err("MPP credential preparation unavailable".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn mpp_prepare_failure_does_not_consume_paid_http_grant() {
+        let verifier_calls = Arc::new(AtomicUsize::new(0));
+        let f = fixture(Some("alice"));
+        let mut policy = Policy::default();
+        policy.payments.enabled = true;
+        policy.payments.require_plan = true;
+        f.handler
+            .keystore
+            .write_policy("alice", toml::to_string_pretty(&policy).unwrap().as_bytes())
+            .unwrap();
+        let handler = f
+            .handler
+            .with_auth_services(request_auth_services(verifier_calls.clone()));
+        let pending = handler.requests_root().join("pending/req_mpp_prepare_fail");
+        fs::create_dir_all(&pending).unwrap();
+        let challenge = normalize_challenge(
+            &HeaderMap::new(),
+            br#"{"protocol":"tempo-mpp","type":"Charge","network":"tempo","asset":"pathUSD","amount":"0.10","amountUsd":0.10}"#,
+            &Url::parse("https://mpp.test/data").unwrap(),
+        );
+        write_json(pending.join("challenge.json"), &challenge).unwrap();
+        let empty_checks: Vec<PolicyCheck> = vec![];
+        write_json(pending.join("policy_check.json"), &empty_checks).unwrap();
+        write_json(
+            pending.join("request.toml"),
+            &json!({"method":"GET","url":"https://mpp.test/data","wallet":"alice","headers":{}}),
+        )
+        .unwrap();
+        fs::write(pending.join("status"), "pending\n").unwrap();
+        write_json(
+            pending.join(APPROVAL_FILE),
+            &SignedApproval {
+                schema: APPROVAL_SCHEMA_V1.into(),
+                wallet: "alice".into(),
+                surface: "requests".into(),
+                action_id: "req_mpp_prepare_fail".into(),
+                intent_hash: "abc123".into(),
+                petal_id: petal_identity::PETAL_ID_PAID_HTTP.into(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_PAID_HTTP.into(),
+                assurance: AssuranceLevel::Standard,
+                server_nonce: "nonce-1".into(),
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
+                expiry_ms: now_ms() + 60_000,
+                signer_transport: SignerTransport::BrowserWebauthn,
+                credential_id: "cred-1".into(),
+                review_session_id: None,
+                webauthn_assertion: WebAuthnAssertionRecord {
+                    credential_id: "cred-1".into(),
+                    authenticator_data_b64: "AA".into(),
+                    client_data_json_b64: "e30".into(),
+                    signature_b64: "AA".into(),
+                    user_handle_b64: None,
+                },
+            },
+        )
+        .unwrap();
+        handler
+            .ensure_sealed_confirm_approval(&pending, "req_mpp_prepare_fail")
+            .await
+            .unwrap();
+
+        let err = confirm_with_backend(
+            handler.root.as_path(),
+            "req_mpp_prepare_fail",
+            b"confirm",
+            &PrepareFailingMppTestBackend,
+            ConfirmBackendOptions {
+                grant_consumer: Some((&handler, "alice", PAID_HTTP_MPP_SIGN_INTENT)),
+                policy_override: Some(&policy),
+                checks_override: Some(Vec::new()),
+                sentinel_override: Some("override"),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("MPP credential preparation unavailable"),
+            "{err}"
+        );
+        assert_eq!(verifier_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            handler
+                .active_paid_http_grant("req_mpp_prepare_fail")
+                .await
+                .unwrap()
+                .is_some(),
+            "failed MPP credential preparation must not consume the grant"
+        );
+    }
+
     #[tokio::test]
     async fn mpp_confirm_failed_paid_retry_routes_to_failed_and_skips_session_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -3376,9 +3506,7 @@ inline = '{"prompt":"hi"}'
             "req_fail",
             b"confirm",
             &FailingMppTestBackend,
-            None,
-            None,
-            None,
+            ConfirmBackendOptions::default(),
         )
         .await
         .unwrap();
