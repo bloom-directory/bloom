@@ -96,6 +96,14 @@ daemon terms digest, Petal policy digest, policy version, and expiry.
 
 Approvals bind concrete action ids. They must never bind `latest`.
 
+The `approval_challenge.json` artifact also carries a `ceremony_url` for the
+browser ceremony bound to the same challenge. The URL token is single-use,
+derived from the challenge's `server_nonce`, and valid until the challenge's
+existing `expiry_ms`; there is no separate URL expiry field. The URL is not
+part of the challenge hash input. Whether the URL is reachable only on
+localhost or over the open internet is described in
+[`Open-Internet Sealed Approval Ceremony.md`](./Open-Internet%20Sealed%20Approval%20Ceremony.md).
+
 **Signed approval**
 
 The `approval.json` artifact. It stores the WebAuthn assertion and echoed
@@ -148,6 +156,17 @@ The ceremony UI must render the daemon-produced plan for the same sealed
 action that produced the challenge. It must not reconstruct the plan by reading
 mutable VFS projection files.
 
+The ceremony page and its API must expose two completion modes, and the user
+chooses between them at approval time:
+
+- **grant**: verify the approval and mint the grant only; execution happens
+  when the client retries the action;
+- **grant + execute**: verify the approval, mint the grant, and execute the
+  sealed action immediately in the daemon.
+
+Auto-execution is not a silent daemon default; the user decides how the
+approved action is executed.
+
 ## Interaction Modes
 
 Sealed Approval must work in all Bloom interaction modes described in
@@ -192,23 +211,36 @@ mint the grant, retry the write, and finish.
 ### Mounted VFS With Daemon
 
 The mounted filesystem is passive from a UX perspective. A write to the mount
-may stage an action or expose an approval challenge, but it must not silently
-open a browser prompt.
+may stage an action or expose an approval challenge, but the daemon must never
+open a browser itself. A mounted write is, however, a safe trigger for
+*exposing* the ceremony URL: the client that made the write is expecting the
+challenge, correlates it through the action directory it wrote to, and may
+deliberately open the URL for the user or forward it over another transport.
 
-The foreground user command connects to the running daemon and deliberately
-starts the ceremony. The daemon, not the mounted writer, receives PRF output
-and mints the in-memory grant.
+Regardless of who opens the browser, the daemon receives PRF output into
+daemon memory and mints the in-memory grant.
 
 The normal shape is:
 
 ```text
-agent writes mounted Petal path
-daemon stages sealed action and exposes approval_challenge.json
-user runs foreground Bloom command for the same action
-foreground command asks daemon to run ceremony
-daemon mints grant and executes or enables retry
+agent writes mounted Petal staging path
+agent writes mounted confirm path for <action_id>
+daemon seals action, issues challenge, mints ceremony URL, and writes
+  approval_challenge.json (including ceremony_url) into the pending
+  directory before failing the write
+confirm write returns permission denied
+agent reads approval_challenge.json from the same pending directory,
+  checks action_id and expiry_ms, and opens or forwards ceremony_url
+user completes the ceremony and chooses grant or grant+execute
+grant: daemon mints grant; agent retries the confirm write to execute
+grant+execute: daemon mints grant and executes immediately
 mounted projections show sent/failed/result state
 ```
+
+While an unexpired challenge is pending, repeated confirm writes must return
+the same challenge and the same `ceremony_url`. The daemon must not rotate the
+nonce or URL on retry; a new URL is minted only after the challenge expires or
+is consumed.
 
 ## Generic Petal Outbox Pattern
 

@@ -34,7 +34,7 @@ Every Bloom action surface must support these modes:
 |---|---|---|---|
 | CLI only | The foreground `bloom` process | The foreground `bloom` process | One command may stage, issue a challenge, run the browser ceremony, mint an in-process grant, retry execution, and finish. |
 | VFS with no daemon | The foreground `bloom vfs ...` process | The foreground `bloom` process | The CLI VFS facade may run the same foreground state machine as a domain CLI command. |
-| Mounted VFS with daemon | The daemon serving the mounted filesystem | A deliberate foreground client, normally `bloom`, asks the daemon to run it | Mounted writes stage/challenge or execute already-authorized work. They must not silently pop browser windows from arbitrary filesystem writes. |
+| Mounted VFS with daemon | The daemon serving the mounted filesystem | Any deliberate client that expects the challenge — the writing agent or a foreground `bloom` command — opens or forwards the daemon-minted ceremony URL; the daemon never opens a browser itself | Mounted writes stage/challenge or execute already-authorized work. The challenge exposes a `ceremony_url`; writes must not silently pop browser windows from arbitrary filesystem writes. |
 
 ## Mode 1: CLI Only
 
@@ -93,29 +93,55 @@ filesystem.
 
 Mounted VFS writes may come from an agent, shell tool, editor, file sync tool,
 or any other local process. Therefore a mounted write is not a safe UX trigger
-for opening a browser ceremony.
+for opening a browser ceremony. It is, however, a safe trigger for *exposing*
+the ceremony URL: the writer that requested execution is expecting the
+challenge and can correlate it to the exact action directory it wrote to.
 
 Mounted handlers must follow this rule:
 
 ```text
 mounted write may stage or execute
-mounted write may issue or expose approval challenge
-mounted write must not silently open a browser ceremony
-foreground client must deliberately start the ceremony
+mounted write may issue or expose approval challenge (including ceremony_url)
+mounted write must not open a browser ceremony
+the client that expects the challenge deliberately opens or forwards the URL
 ```
 
-The foreground client can still be `bloom`. The normal pattern is:
+The deliberate client can be the writing agent itself or a foreground `bloom`
+command. The normal pattern for an agent working through the mount is:
 
-1. agent writes to the mounted Petal path to stage an action;
-2. agent writes to the mounted execute/confirm path;
-3. daemon stages a sealed action and exposes `approval_challenge.json`;
-4. user runs the Petal's foreground command, commonly a `confirm` command;
-5. the foreground command connects to the daemon over IPC;
-6. the daemon runs the browser ceremony and receives PRF output into daemon
-   memory;
-7. the daemon verifies approval, mints the grant in daemon memory, and executes
-   or allows a retry;
-8. mounted VFS projections show the final result.
+1. agent writes to the mounted Petal staging path; the pending directory
+   (for example `/outbox/pending/<action_id>/`) materializes, so the agent
+   knows the concrete `action_id`;
+2. agent writes to the mounted execute/confirm path for that action;
+3. the daemon stages the sealed action, issues the approval challenge, mints a
+   ceremony URL bound to the challenge's `server_nonce`, and writes
+   `approval_challenge.json` — including `ceremony_url` — into the same
+   pending directory; the file must be durably visible before the write
+   returns;
+4. the confirm write fails with permission denied;
+5. the agent, having just received permission denied on its own confirm write,
+   reads `approval_challenge.json` from the same pending directory and checks
+   that `action_id` matches the path and `expiry_ms` is in the future — this
+   is the "expecting a challenge" condition: the trigger is the agent's own
+   failed write, and the challenge is read from the directory it wrote to;
+6. the agent opens the browser for the user or sends `ceremony_url` to the
+   user over another transport (chat, notification, and so on);
+7. the user completes the WebAuthn ceremony; PRF output goes into daemon
+   memory only; the ceremony page offers **grant** and **grant + execute**,
+   and the user chooses;
+8. under **grant**, the daemon mints the grant and the agent retries the
+   confirm write, which now executes; under **grant + execute**, the daemon
+   executes immediately after minting the grant;
+9. mounted VFS projections move the action to sent/failed with result
+   artifacts.
+
+The `ceremony_url` is single-use and valid until the challenge's existing
+`expiry_ms`; there is no separate URL expiry. While an unexpired challenge is
+pending, repeated confirm writes return the same challenge and the same URL —
+the daemon must not rotate the nonce or URL on retry, so a URL already
+forwarded to the user stays valid. Whether the URL is reachable only on
+localhost or over the open internet is described in
+[`Open-Internet Sealed Approval Ceremony.md`](./Open-Internet%20Sealed%20Approval%20Ceremony.md).
 
 ## Foreground Command Shape
 
@@ -165,8 +191,8 @@ budget, or consume bounded session authority must provide:
 - a sealed policy snapshot;
 - daemon grant terms, including allowed signing intents and signature count;
 - a foreground ceremony path for CLI-only and daemon-mounted operation;
-- passive mounted-VFS behavior that stages challenges but does not trigger
-  browser prompts by surprise;
+- passive mounted-VFS behavior that stages challenges and exposes the
+  `ceremony_url` in `approval_challenge.json` but never opens a browser;
 - audit/result artifacts visible through the central outbox and any Petal
   projection.
 
