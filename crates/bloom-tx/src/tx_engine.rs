@@ -2265,13 +2265,21 @@ impl TxEngine {
             persisted = true;
         }
         // Central outbox projection, keyed by the sealed action id (same place
-        // the challenge is mirrored). No-op when no projection is attached.
-        let _ = self.outbox.write_central_action_artifact(
+        // the challenge is mirrored). No-op when no projection is attached, but
+        // a real write error must not be swallowed — a silent allowlist reject
+        // is exactly what previously kept approval.json out of the central dir.
+        if let Err(e) = self.outbox.write_central_action_artifact(
             action_id,
             OutboxState::Pending,
             OUTBOX_APPROVAL_FILE,
             &body,
-        );
+        ) {
+            tracing::warn!(
+                err = %e,
+                action_id,
+                "ceremony.approval.central_projection_failed: approval.json not mirrored to the central outbox"
+            );
+        }
         if !persisted {
             tracing::warn!(
                 wallet,

@@ -221,7 +221,7 @@ impl CentralOutbox {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
         if !matches!(
             file,
-            "approval_challenge.json" | "result.json" | "status.json"
+            "approval_challenge.json" | "approval.json" | "result.json" | "status.json"
         ) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -601,6 +601,30 @@ mod tests {
         let entry = h.lookup(&p).await.unwrap();
         assert_eq!(entry.mode, 0o444);
         assert!(h.write(&p, b"{}").await.is_err());
+    }
+
+    #[test]
+    fn write_action_file_allows_approval_json_and_rejects_arbitrary() {
+        let h = handler();
+        h.outbox
+            .stage("act-central-approval", b"{}", "hash", "plan", b"[]")
+            .unwrap();
+
+        // The daemon's Mode 3 ceremony mirrors approval.json into the central
+        // projection through this path — it must be allowlisted (regression: it
+        // was silently rejected, so approval.json never reached the central dir).
+        h.outbox
+            .write_action_file("act-central-approval", "pending", "approval.json", b"{}")
+            .expect("approval.json must be a runtime-writable central artifact");
+        let dir = h.outbox.action_dir("pending", "act-central-approval");
+        assert!(dir.join("approval.json").exists());
+
+        // The allowlist still fails closed for anything else.
+        let err = h
+            .outbox
+            .write_action_file("act-central-approval", "pending", "secrets.json", b"{}")
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[tokio::test]

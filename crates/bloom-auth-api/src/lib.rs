@@ -3527,8 +3527,8 @@ mod tests {
         let mut hasher = blake3::Hasher::new();
         hasher.update(CEREMONY_URL_TOKEN_DOMAIN);
         hasher.update(c.server_nonce.as_bytes());
-        let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(hasher.finalize().as_bytes());
+        let expected =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize().as_bytes());
         assert_eq!(c.ceremony_token(), expected);
         // The URL uses the shared daemon port and embeds the token.
         let url = c.local_ceremony_url();
@@ -3541,7 +3541,10 @@ mod tests {
         assert_ne!(other.ceremony_token(), c.ceremony_token());
         assert_eq!(
             c.challenge_hash_hex().unwrap(),
-            c.clone().with_local_ceremony_url().challenge_hash_hex().unwrap(),
+            c.clone()
+                .with_local_ceremony_url()
+                .challenge_hash_hex()
+                .unwrap(),
         );
     }
 

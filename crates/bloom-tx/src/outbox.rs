@@ -1203,8 +1203,9 @@ mod tests {
     fn highest_pending_nonce_auto_increments_over_all_pending() {
         let dir = tempfile::tempdir().unwrap();
         let ob = Outbox::new(dir.path()).unwrap();
-        let from: alloy::primitives::Address =
-            "0x0000000000000000000000000000000000000001".parse().unwrap();
+        let from: alloy::primitives::Address = "0x0000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
 
         // No pending entries → no reservation (caller falls back to chain nonce).
         assert_eq!(

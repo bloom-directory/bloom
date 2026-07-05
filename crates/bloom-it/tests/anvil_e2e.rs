@@ -438,7 +438,10 @@ async fn anvil_confirm_refuses_nonce_gap() -> Result<()> {
             .map_err(|e| anyhow!("read nonce_gap.json: {e}"))?,
     )
     .context("nonce_gap.json must be valid JSON")?;
-    assert_eq!(advisory.get("staged_nonce").and_then(|v| v.as_u64()), Some(5));
+    assert_eq!(
+        advisory.get("staged_nonce").and_then(|v| v.as_u64()),
+        Some(5)
+    );
     assert_eq!(
         advisory.get("chain_next_nonce").and_then(|v| v.as_u64()),
         Some(0)

@@ -15,12 +15,12 @@ use bloom_auth_api::{
     APPROVAL_CHALLENGE_SCHEMA_V1, ApprovalChallenge, ApprovalCredentialRecord,
     ApprovalSignatureVerifier, ApprovalVerifier, AssuranceLevel, AuthApiError, AuthEntryRecord,
     AuthEntryState, AuthStoreView, AuthStoreWriter, CanonicalEnvelope, CeremonyTokenResolution,
-    EVM_ERC20_TRANSFER_METHOD,
-    EVM_ERC20_TRANSFER_SELECTOR, EVM_OWNER_SIGNING_SESSION_KIND, EvmOwnerSigningSessionCounters,
-    EvmOwnerSigningSessionScope, EvmOwnerSigningSessionUse, GrantStore, NonceState, PriceOracle,
-    ReservationRecord, ReservationState, ReviewSessionRecord, SealedAction, SealedApprovalGrant,
-    SealedIntentRecord, SessionDenialReason, SignedApproval, SignerKind, StandingSessionRecord,
-    UnsignedApproval, ValuationPolicy, ValuationQuote, WebAuthnAssertionRecord,
+    EVM_ERC20_TRANSFER_METHOD, EVM_ERC20_TRANSFER_SELECTOR, EVM_OWNER_SIGNING_SESSION_KIND,
+    EvmOwnerSigningSessionCounters, EvmOwnerSigningSessionScope, EvmOwnerSigningSessionUse,
+    GrantStore, NonceState, PriceOracle, ReservationRecord, ReservationState, ReviewSessionRecord,
+    SealedAction, SealedApprovalGrant, SealedIntentRecord, SessionDenialReason, SignedApproval,
+    SignerKind, StandingSessionRecord, UnsignedApproval, ValuationPolicy, ValuationQuote,
+    WebAuthnAssertionRecord,
 };
 use bloom_prices::{CoinId, PricesClient};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -2933,12 +2933,18 @@ mod tests {
         // challenge carrying the sealed action for plan rendering.
         let resolved = store.resolve_ceremony_token(&token, 200).unwrap();
         match resolved {
-            CeremonyTokenResolution::Live { challenge: c, action } => {
+            CeremonyTokenResolution::Live {
+                challenge: c,
+                action,
+            } => {
                 assert_eq!(c.server_nonce, "nonce-1");
                 assert_eq!(c.intent_hash, challenge.intent_hash);
                 assert_eq!(action.action_id(), challenge.action_id);
                 // The resolved challenge re-exposes the ceremony URL.
-                assert_eq!(c.ceremony_url.as_deref(), Some(challenge.local_ceremony_url().as_str()));
+                assert_eq!(
+                    c.ceremony_url.as_deref(),
+                    Some(challenge.local_ceremony_url().as_str())
+                );
             }
             other => panic!("expected Live, got {other:?}"),
         }

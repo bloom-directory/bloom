@@ -1365,10 +1365,11 @@ fn decrypt_signer_from_prf(
     dir: &Path,
     mut prf_output: [u8; 32],
 ) -> Result<Arc<PrivateKeySigner>, KeystoreError> {
-    let enc_blob = std::fs::read(dir.join("encrypted.key")).map_err(|source| KeystoreError::Io {
-        path: dir.join("encrypted.key"),
-        source,
-    })?;
+    let enc_blob =
+        std::fs::read(dir.join("encrypted.key")).map_err(|source| KeystoreError::Io {
+            path: dir.join("encrypted.key"),
+            source,
+        })?;
     let enc: PasskeyEncrypted = serde_json::from_slice(&enc_blob)
         .map_err(|e| KeystoreError::Malformed(format!("encrypted.key parse: {e}")))?;
     let result = decrypt_passkey_key(&enc, &prf_output);

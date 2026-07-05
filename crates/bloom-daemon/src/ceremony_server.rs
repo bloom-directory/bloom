@@ -32,7 +32,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine as _;
 use bloom_auth_api::{
-    AssuranceLevel, ApprovalChallenge, CeremonyTokenResolution, LOCAL_CEREMONY_PORT, SealedAction,
+    ApprovalChallenge, AssuranceLevel, CeremonyTokenResolution, LOCAL_CEREMONY_PORT, SealedAction,
     SignerTransport, UnsignedApproval, WebAuthnAssertionRecord,
 };
 use serde::Deserialize;
@@ -248,7 +248,10 @@ async fn challenge_json(State(state): State<CeremonyState>, Path(token): Path<St
     }
 }
 
-fn unsigned_for(challenge: &ApprovalChallenge, review_session_id: Option<String>) -> UnsignedApproval {
+fn unsigned_for(
+    challenge: &ApprovalChallenge,
+    review_session_id: Option<String>,
+) -> UnsignedApproval {
     UnsignedApproval::for_challenge(
         challenge,
         SignerTransport::BrowserWebauthn,
@@ -287,7 +290,11 @@ struct CompleteBody {
 }
 
 fn err_json(status: StatusCode, msg: impl Into<String>) -> Response {
-    (status, Json(serde_json::json!({ "ok": false, "error": msg.into() }))).into_response()
+    (
+        status,
+        Json(serde_json::json!({ "ok": false, "error": msg.into() })),
+    )
+        .into_response()
 }
 
 async fn complete(
@@ -324,10 +331,19 @@ async fn complete(
             Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
         if let Err(e) = writer
-            .issue_review_session(&id, &challenge.surface, &challenge.action_id, challenge.expiry_ms, now)
+            .issue_review_session(
+                &id,
+                &challenge.surface,
+                &challenge.action_id,
+                challenge.expiry_ms,
+                now,
+            )
             .await
         {
-            return err_json(StatusCode::INTERNAL_SERVER_ERROR, format!("issue review session: {e}"));
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("issue review session: {e}"),
+            );
         }
         Some(id)
     } else {
@@ -346,7 +362,10 @@ async fn complete(
         user_handle_b64: body.credential.response.user_handle.clone(),
     };
     if let Err(e) = assertion.validate_challenge(&unsigned) {
-        return err_json(StatusCode::BAD_REQUEST, format!("assertion challenge mismatch: {e}"));
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            format!("assertion challenge mismatch: {e}"),
+        );
     }
 
     // Bind the PRF output to the same ceremony: its clientDataJSON challenge
@@ -355,8 +374,7 @@ async fn complete(
         Ok(h) => base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h),
         Err(_) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "hash approval challenge"),
     };
-    let prf_challenge =
-        bloom_keystore::client_data_challenge_b64(&body.prf_client_data_json_b64);
+    let prf_challenge = bloom_keystore::client_data_challenge_b64(&body.prf_client_data_json_b64);
     if prf_challenge.as_deref() != Some(expected_challenge_b64.as_str()) {
         return err_json(
             StatusCode::FORBIDDEN,
@@ -365,12 +383,16 @@ async fn complete(
     }
 
     // Decode PRF output and decrypt the signer (PRF stays in daemon memory).
-    let prf_bytes = match base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(body.prf_output_b64.trim())
-    {
-        Ok(b) if b.len() == 32 => b,
-        _ => return err_json(StatusCode::UNPROCESSABLE_ENTITY, "prf_output must be 32 bytes"),
-    };
+    let prf_bytes =
+        match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(body.prf_output_b64.trim()) {
+            Ok(b) if b.len() == 32 => b,
+            _ => {
+                return err_json(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "prf_output must be 32 bytes",
+                );
+            }
+        };
     let mut prf_arr = [0u8; 32];
     prf_arr.copy_from_slice(&prf_bytes);
     let signer = match daemon
@@ -402,9 +424,12 @@ async fn complete(
 
     // Cache the decrypted signer under the grant so the sign_hash path can use
     // it without a fresh ceremony.
-    daemon
-        .signer_cache
-        .insert(grant.grant_id.clone(), signer, wallet.clone(), grant.expiry_ms);
+    daemon.signer_cache.insert(
+        grant.grant_id.clone(),
+        signer,
+        wallet.clone(),
+        grant.expiry_ms,
+    );
     daemon.signer_cache.prune_expired(now);
 
     // Persist approval.json as an audit artifact beside the challenge.
@@ -479,7 +504,7 @@ async fn complete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bloom_auth::{RejectingApprovalSignatureVerifier, AuthStore, StoreApprovalVerifier};
+    use bloom_auth::{AuthStore, RejectingApprovalSignatureVerifier, StoreApprovalVerifier};
     use bloom_auth_api::petal_identity::{
         FIRST_PARTY_PETAL_VERSION_V0, PETAL_ID_EVM_WALLET, PLACEHOLDER_DIGEST_EVM_WALLET,
     };
