@@ -32,6 +32,7 @@ use bloom_polymarket::{
 };
 use bloom_proto::HomeWritePermit;
 use bloom_proto::polymarket_policy::{self as pm_policy, PolicySide, PolymarketOrderCtx};
+use bloom_tx::TxEngineError;
 
 fn now_ms() -> u128 {
     std::time::SystemTime::now()
@@ -1932,7 +1933,16 @@ pub async fn fund(d: &Daemon, args: FundArgs) -> Result<()> {
             }
         }
     }
-    unlock_wallet_with_intent(d, &args.wallet, args.passphrase.as_deref(), Some(intent)).await?;
+    let passkey_wallet = info.kind == bloom_keystore::WalletKind::PasskeyGated;
+    // For passkey wallets, skip the standalone unlock ceremony — the in-band
+    // sealed-approval ceremony in the confirm loop below self-unlocks via
+    // WebAuthn (matching the `wallet confirm` path at main.rs:2121). For local
+    // wallets, the passphrase unlock is the mechanism that enables in-policy
+    // auto-broadcast.
+    if !passkey_wallet {
+        unlock_wallet_with_intent(d, &args.wallet, args.passphrase.as_deref(), Some(intent.clone())).await?;
+    }
+    let approval_intent = Some(intent);
     let confirm_text = if any_warn {
         info.policy.override_sentinel().to_string()
     } else {
@@ -1952,14 +1962,52 @@ pub async fn fund(d: &Daemon, args: FundArgs) -> Result<()> {
                 &confirm_text,
             )
             .await
-            .with_context(|| format!("confirm staged tx {id}"))
         {
             Ok(s) => s,
+            Err(TxEngineError::BroadcastApprovalRequired(_)) if passkey_wallet => {
+                // In-band sealed-approval ceremony, mirroring `wallet confirm`
+                // (main.rs): the confirm path wrote an approval_challenge.json;
+                // run the browser ceremony to sign it, then retry the confirm.
+                // Without this arm the catch-all below would cancel the staged
+                // tx, forcing a full re-stage and re-ceremony.
+                if crate::sign_outbox_sealed_approval_if_challenged(
+                    d,
+                    &args.wallet,
+                    &chain_name,
+                    id,
+                    approval_intent.clone(),
+                )
+                .await
+                .with_context(|| format!("sign sealed approval for staged tx {id}"))?
+                {
+                    d.tx_engine
+                        .confirm(
+                            home_write_permit(d)?,
+                            &args.wallet,
+                            &chain_name,
+                            id,
+                            &chain,
+                            &info.policy,
+                            &confirm_text,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("confirm staged tx {id} after sealed approval")
+                        })?
+                } else {
+                    discard(&staged_ids[i..]);
+                    bail!(
+                        "broadcast approval required for staged tx {id} but no \
+                         approval_challenge.json was written"
+                    );
+                }
+            }
             Err(e) => {
                 // Discard this entry if it never broadcast, plus everything
                 // not yet confirmed, so stale pendings can't poison nonces.
                 discard(&staged_ids[i..]);
-                return Err(e);
+                return Err(anyhow::Error::new(e)
+                    .context(format!("confirm staged tx {id}")));
             }
         };
         let hash: alloy::primitives::B256 = staged

@@ -2130,8 +2130,14 @@ impl super::Keystore {
 
         // Never sign a policy the engine cannot parse — a signed-but-broken
         // policy.toml would brick every wallet operation behind a valid sig.
-        toml::from_str::<bloom_proto::Policy>(&content).map_err(|e| {
+        let policy = toml::from_str::<bloom_proto::Policy>(&content).map_err(|e| {
             KeystoreError::Policy(format!("refusing to sign unparseable policy.toml: {e}"))
+        })?;
+        // Refuse to sign a policy whose autonomy mode is inconsistent with its
+        // limits — a signed-but-unbroadcastable policy would fail at every
+        // confirm with an opaque "broadcast approval required" error.
+        policy.validate_autonomy_limits().map_err(|e| {
+            KeystoreError::Policy(format!("refusing to sign policy.toml: {e}"))
         })?;
 
         let signer = self.cached_signer(name)?; // must be unlocked

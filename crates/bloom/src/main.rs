@@ -3003,7 +3003,7 @@ fn outbox_confirm_unlock_intent(
     Some(intent)
 }
 
-async fn sign_outbox_sealed_approval_if_challenged(
+pub(crate) async fn sign_outbox_sealed_approval_if_challenged(
     d: &Daemon,
     wallet: &str,
     chain: &str,
