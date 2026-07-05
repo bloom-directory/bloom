@@ -298,7 +298,11 @@ impl Outbox {
         file: &str,
         data: &[u8],
     ) -> Result<(), OutboxError> {
-        if file != "approval_challenge.json" && file != "result.json" && file != "status.json" {
+        if file != "approval_challenge.json"
+            && file != "approval.json"
+            && file != "result.json"
+            && file != "status.json"
+        {
             return Err(OutboxError::Other(format!(
                 "central artifact '{file}' is not runtime-writable"
             )));

@@ -2095,6 +2095,67 @@ impl TxEngine {
         }
     }
 
+    /// Locate the per-wallet pending outbox entry whose sealed action id
+    /// matches `action_id`, if any. Used by the daemon Mode 3 ceremony server
+    /// to persist `approval.json` beside the projected challenge.
+    pub fn find_pending_entry_dir_for_action(
+        &self,
+        wallet: &str,
+        chain: &str,
+        action_id: &str,
+    ) -> Option<std::path::PathBuf> {
+        let ids = self.outbox.list(wallet, chain, OutboxState::Pending).ok()?;
+        for id in ids {
+            let Ok(entry) = self.outbox.read(wallet, chain, &id) else {
+                continue;
+            };
+            let staged = &entry.staged;
+            let matches = staged.action_id.as_deref() == Some(action_id)
+                || format!("{}:{}", staged.chain_id, staged.id) == action_id;
+            if matches {
+                return Some(entry.dir);
+            }
+        }
+        None
+    }
+
+    /// Persist `approval.json` for a completed daemon-owned Interaction Mode 3
+    /// ceremony beside the projected challenge — the per-wallet pending dir and
+    /// the central outbox projection, the same places the challenge is written.
+    ///
+    /// This is an audit/projection artifact only; it carries the WebAuthn
+    /// assertion and echoed challenge fields, never PRF output or key material
+    /// (that invariant lives in the [`SignedApproval`] type). The grant is
+    /// minted in daemon memory by the caller, not from this file.
+    pub fn persist_outbox_ceremony_approval(
+        &self,
+        sealed: &SealedAction,
+        approval: &SignedApproval,
+    ) -> Result<(), TxEngineError> {
+        let action_id = sealed.action_id();
+        let wallet = sealed.wallet();
+        let chain_name = &sealed.envelope.header.network;
+        let body = serde_json::to_vec_pretty(approval).map_err(|e| {
+            TxEngineError::BroadcastApprovalRequired(format!("encode approval.json: {e}"))
+        })?;
+        // Per-wallet pending projection (best effort: the entry may already
+        // have transitioned or the challenge may have come from another mode).
+        if let Some(dir) = self.find_pending_entry_dir_for_action(wallet, chain_name, action_id) {
+            std::fs::write(dir.join(OUTBOX_APPROVAL_FILE), &body).map_err(|e| {
+                TxEngineError::BroadcastApprovalRequired(format!("write approval.json: {e}"))
+            })?;
+        }
+        // Central outbox projection, keyed by the sealed action id (same place
+        // the challenge is mirrored). No-op when no projection is attached.
+        let _ = self.outbox.write_central_action_artifact(
+            action_id,
+            OutboxState::Pending,
+            OUTBOX_APPROVAL_FILE,
+            &body,
+        );
+        Ok(())
+    }
+
     async fn execute_evm_wallet_sealed_subject(
         &self,
         sealed: &SealedAction,

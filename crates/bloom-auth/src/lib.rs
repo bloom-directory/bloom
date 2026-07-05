@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use bloom_auth_api::{
     APPROVAL_CHALLENGE_SCHEMA_V1, ApprovalChallenge, ApprovalCredentialRecord,
     ApprovalSignatureVerifier, ApprovalVerifier, AssuranceLevel, AuthApiError, AuthEntryRecord,
-    AuthEntryState, AuthStoreView, AuthStoreWriter, CanonicalEnvelope, EVM_ERC20_TRANSFER_METHOD,
+    AuthEntryState, AuthStoreView, AuthStoreWriter, CanonicalEnvelope, CeremonyTokenResolution,
+    EVM_ERC20_TRANSFER_METHOD,
     EVM_ERC20_TRANSFER_SELECTOR, EVM_OWNER_SIGNING_SESSION_KIND, EvmOwnerSigningSessionCounters,
     EvmOwnerSigningSessionScope, EvmOwnerSigningSessionUse, GrantStore, NonceState, PriceOracle,
     ReservationRecord, ReservationState, ReviewSessionRecord, SealedAction, SealedApprovalGrant,
@@ -1537,6 +1538,89 @@ impl AuthStore {
             .transpose()
     }
 
+    /// Resolve a deterministic ceremony URL token
+    /// ([`ApprovalChallenge::ceremony_token`]) to a stored challenge for the
+    /// daemon-owned Mode 3 ceremony server.
+    ///
+    /// The token is `base64url(BLAKE3(domain || server_nonce))`, so lookup is a
+    /// scan over every entry that ever carried a nonce, recomputing the token
+    /// for each and matching. A match that is expired or has a consumed nonce
+    /// resolves to [`CeremonyTokenResolution::Gone`] (single-use / expired,
+    /// 410); no match resolves to [`CeremonyTokenResolution::Unknown`] (404).
+    ///
+    /// Entries that predate the sealed-action schema (NULL sealed metadata)
+    /// cannot produce a challenge and are skipped — they are unreachable via a
+    /// ceremony URL anyway.
+    pub fn resolve_ceremony_token(
+        &self,
+        token: &str,
+        now_ms: u64,
+    ) -> Result<CeremonyTokenResolution, AuthStoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ae.assurance, ae.nonce, ae.nonce_state, ae.challenge_expiry_ms,
+                    si.sealed_action_json
+             FROM auth_entries ae
+             JOIN sealed_intents si ON si.intent_hash = ae.intent_hash
+             WHERE ae.nonce IS NOT NULL AND ae.challenge_expiry_ms IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let assurance: String = row.get(0)?;
+            let nonce: String = row.get(1)?;
+            let nonce_state: String = row.get(2)?;
+            let challenge_expiry_ms: i64 = row.get(3)?;
+            let sealed_action_json: Option<String> = row.get(4)?;
+            Ok((
+                assurance,
+                nonce,
+                nonce_state,
+                challenge_expiry_ms,
+                sealed_action_json,
+            ))
+        })?;
+
+        for row in rows {
+            let (assurance, nonce, nonce_state, challenge_expiry_ms, sealed_action_json) = row?;
+            let Some(sealed_action_json) = sealed_action_json else {
+                continue;
+            };
+            let action: SealedAction = serde_json::from_str(&sealed_action_json)?;
+            // Rebuild the daemon-issued challenge exactly as `issue_challenge`
+            // produced it, so its recomputed token matches the URL.
+            let challenge = ApprovalChallenge {
+                schema: APPROVAL_CHALLENGE_SCHEMA_V1.to_string(),
+                action_id: action.action_id().to_string(),
+                wallet: action.wallet().to_string(),
+                surface: action.surface().to_string(),
+                petal_id: action.petal_id().to_string(),
+                petal_digest: action.petal_digest().to_string(),
+                intent_hash: action.intent_hash().map_err(AuthStoreError::from_api)?,
+                server_nonce: nonce,
+                assurance: parse_assurance(&assurance)?,
+                daemon_terms_digest: action
+                    .daemon_terms_digest()
+                    .map_err(AuthStoreError::from_api)?,
+                petal_policy_digest: action.petal_policy_digest.clone(),
+                policy_version: action.policy_version,
+                expiry_ms: challenge_expiry_ms as u64,
+                ceremony_url: None,
+            };
+            if challenge.ceremony_token() != token {
+                continue;
+            }
+            // Single-use / expiry: a burned nonce or a past expiry is Gone.
+            if parse_nonce_state(&nonce_state)? != NonceState::Unused
+                || (challenge_expiry_ms as u64) <= now_ms
+            {
+                return Ok(CeremonyTokenResolution::Gone);
+            }
+            return Ok(CeremonyTokenResolution::Live {
+                challenge: Box::new(challenge.with_local_ceremony_url()),
+                action: Box::new(action),
+            });
+        }
+        Ok(CeremonyTokenResolution::Unknown)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_standing_session(
         &mut self,
@@ -1948,6 +2032,18 @@ where
         store
             .sealed_intent(intent_hash)?
             .ok_or_else(|| AuthApiError::NotFound(format!("sealed intent {intent_hash}")))
+    }
+
+    async fn resolve_ceremony_token(
+        &self,
+        token: &str,
+        now_ms: u64,
+    ) -> Result<CeremonyTokenResolution, AuthApiError> {
+        let store = self
+            .store
+            .lock()
+            .map_err(|_| AuthApiError::Store("auth store mutex poisoned".into()))?;
+        Ok(store.resolve_ceremony_token(token, now_ms)?)
     }
 
     async fn standing_session(
@@ -2819,6 +2915,97 @@ mod tests {
         assert_eq!(prev_digest, "0".repeat(64));
         assert_eq!(digest.len(), 64);
         assert_ne!(digest, "0".repeat(64));
+    }
+
+    #[test]
+    fn resolve_ceremony_token_live_stable_and_carries_action() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        let env = envelope();
+        store
+            .stage_entry(&env, AssuranceLevel::Standard, 100)
+            .unwrap();
+        let challenge = store
+            .issue_challenge("requests", "req_1", "nonce-1", 5_000, 101)
+            .unwrap();
+        let token = challenge.ceremony_token();
+
+        // The token derived from the daemon-issued challenge resolves to a live
+        // challenge carrying the sealed action for plan rendering.
+        let resolved = store.resolve_ceremony_token(&token, 200).unwrap();
+        match resolved {
+            CeremonyTokenResolution::Live { challenge: c, action } => {
+                assert_eq!(c.server_nonce, "nonce-1");
+                assert_eq!(c.intent_hash, challenge.intent_hash);
+                assert_eq!(action.action_id(), challenge.action_id);
+                // The resolved challenge re-exposes the ceremony URL.
+                assert_eq!(c.ceremony_url.as_deref(), Some(challenge.local_ceremony_url().as_str()));
+            }
+            other => panic!("expected Live, got {other:?}"),
+        }
+
+        // Stable: resolving again yields the same live challenge (idempotent).
+        assert!(matches!(
+            store.resolve_ceremony_token(&token, 201).unwrap(),
+            CeremonyTokenResolution::Live { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_ceremony_token_unknown_returns_unknown() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        let env = envelope();
+        store
+            .stage_entry(&env, AssuranceLevel::Standard, 100)
+            .unwrap();
+        store
+            .issue_challenge("requests", "req_1", "nonce-1", 5_000, 101)
+            .unwrap();
+        // A token that matches no stored nonce is unknown (404).
+        assert_eq!(
+            store
+                .resolve_ceremony_token("not-a-real-token", 200)
+                .unwrap(),
+            CeremonyTokenResolution::Unknown
+        );
+    }
+
+    #[test]
+    fn resolve_ceremony_token_expired_is_gone() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        let env = envelope();
+        store
+            .stage_entry(&env, AssuranceLevel::Standard, 100)
+            .unwrap();
+        let challenge = store
+            .issue_challenge("requests", "req_1", "nonce-1", 220, 101)
+            .unwrap();
+        let token = challenge.ceremony_token();
+        // now_ms past the challenge expiry: Gone (410), not Unknown.
+        assert_eq!(
+            store.resolve_ceremony_token(&token, 500).unwrap(),
+            CeremonyTokenResolution::Gone
+        );
+    }
+
+    #[test]
+    fn resolve_ceremony_token_consumed_is_gone() {
+        let mut store = AuthStore::open_in_memory_for_tests().unwrap();
+        let env = envelope();
+        store
+            .stage_entry(&env, AssuranceLevel::Standard, 100)
+            .unwrap();
+        let challenge = store
+            .issue_challenge("requests", "req_1", "nonce-1", 5_000, 101)
+            .unwrap();
+        let token = challenge.ceremony_token();
+        store
+            .consume_verified_approval_transactionally(&approval_for(&challenge), 150)
+            .unwrap();
+        // Single-use: once the nonce is burned the URL is Gone (410).
+        assert_eq!(
+            store.resolve_ceremony_token(&token, 200).unwrap(),
+            CeremonyTokenResolution::Gone
+        );
     }
 
     #[test]

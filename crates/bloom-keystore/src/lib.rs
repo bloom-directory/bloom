@@ -30,6 +30,7 @@
 
 pub mod ephemeral;
 pub(crate) mod passkey;
+pub use passkey::{SealedCeremonyChallenge, client_data_challenge_b64};
 pub mod petal_host;
 pub mod xdsa;
 #[cfg(test)]

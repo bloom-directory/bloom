@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ceremony_server;
 pub mod ipc;
 pub mod sealed_ceremony;
 pub mod sign_hash;
