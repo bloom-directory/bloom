@@ -797,6 +797,20 @@ impl SealedAction {
     pub fn petal_digest(&self) -> &str {
         &self.envelope.header.petal_digest
     }
+
+    /// The human-readable chain name (e.g. `"base"`) this action targets, as
+    /// carried in the sealed Petal policy snapshot at seal time.
+    ///
+    /// Prefer this over [`PetalPolicySnapshot`]'s `network` header, which is the
+    /// CAIP-2 form (`"eip155:<chain_id>"`): the outbox directory layout and the
+    /// daemon `ChainRegistry` are both keyed by this human name, so lookups that
+    /// use the CAIP-2 header silently miss.
+    pub fn chain_name(&self) -> Option<&str> {
+        self.petal_policy
+            .config
+            .get("chain_name")
+            .and_then(|v| v.as_str())
+    }
 }
 
 /// The daemon-issued approval challenge preimage (§5.7, §6.2).
@@ -3378,6 +3392,31 @@ mod tests {
             5,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn chain_name_reads_human_name_not_caip2_header() {
+        // Absent from the policy snapshot → None (callers must not silently fall
+        // back to the CAIP-2 `network` header, which the outbox/registry can't key).
+        let bare = sealed_action();
+        assert_eq!(bare.chain_name(), None);
+
+        // Present → the human chain name the outbox and ChainRegistry key on.
+        let mut snapshot = PetalPolicySnapshot::minimal(&header());
+        snapshot.policy_version = 3;
+        snapshot
+            .config
+            .insert("chain_name".into(), serde_json::json!("base"));
+        let action = SealedAction::new(
+            baseline_envelope(),
+            "plan".into(),
+            vec![],
+            terms(),
+            snapshot,
+            5,
+        )
+        .unwrap();
+        assert_eq!(action.chain_name(), Some("base"));
     }
 
     #[test]

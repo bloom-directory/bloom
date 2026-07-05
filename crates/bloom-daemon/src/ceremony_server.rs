@@ -419,7 +419,18 @@ async fn complete(
     let mut executed = false;
     let mut tx_hash: Option<String> = None;
     if execute {
-        let chain_name = action.envelope.header.network.clone();
+        // The chain registry is keyed by the human chain name ("base"), not the
+        // CAIP-2 `network` header ("eip155:8453"), so resolve it from the sealed
+        // policy snapshot rather than the header.
+        let chain_name = match action.chain_name() {
+            Some(name) => name.to_string(),
+            None => {
+                return err_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "grant minted but sealed action is missing chain_name for execute".to_string(),
+                );
+            }
+        };
         let client = match daemon.chains.get(&chain_name) {
             Some(c) => c,
             None => {

@@ -131,6 +131,14 @@ pub enum TxEngineError {
     DependencyNotSatisfied { dep_id: String, reason: String },
     #[error("pre-broadcast simulation reverted: {reason} — write 'override' to broadcast anyway")]
     SimulationReverted { reason: String },
+    #[error(
+        "nonce gap: tx for {from} uses nonce {staged} but the account's next on-chain nonce is {chain_next} — the node would queue it behind the missing nonce(s) and it could never mine. Broadcast nonce {chain_next} first, or restage with an explicit `nonce` to fill the gap deliberately."
+    )]
+    NonceGap {
+        from: String,
+        staged: u64,
+        chain_next: u64,
+    },
 }
 
 /// In-memory cache for ERC-20 metadata keyed by `(chain_id, address)`.
@@ -1695,6 +1703,85 @@ impl TxEngine {
         Ok(())
     }
 
+    /// Refuse to broadcast a tx whose nonce is ahead of the account's next
+    /// on-chain nonce with nothing filling the gap.
+    ///
+    /// The auto-increment nonce default ([`Outbox::highest_pending_nonce`]) is
+    /// optimistic: a pending entry reserves its slot before it broadcasts, so a
+    /// staged-but-never-broadcast (or later-abandoned) entry can push a
+    /// subsequent tx one nonce past a gap that never fills. The RPC accepts such
+    /// a tx into its *queued* set and returns a hash — it looks broadcast — but
+    /// it can never mine, silently stranding it. This is the broadcast-time
+    /// backstop for that hazard.
+    ///
+    /// The `pending` nonce tag already reflects every tx the node has accepted,
+    /// including our own in-flight ones, so a *strictly greater* staged nonce is
+    /// a genuine gap. Bundles stay safe: a dependent's `depends_on` gate holds it
+    /// until its predecessor mines, by which point the chain nonce has advanced
+    /// to meet it. Callers that intend to queue ahead override the default with
+    /// an explicit intent `nonce`.
+    async fn assert_nonce_not_ahead_of_chain(
+        &self,
+        chain: &ChainClient,
+        from: Address,
+        nonce: u64,
+    ) -> Result<(), TxEngineError> {
+        // Only refuse on *positive* evidence of a gap. A failed nonce read (RPC
+        // down, transient error) is not evidence the tx is ahead of the chain —
+        // fail open and let the actual broadcast surface any real RPC error,
+        // rather than blocking a broadcast on a flaky preflight.
+        let chain_next = match chain.nonce(from).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    from = %bloom_proto::checksum_address(&from),
+                    nonce,
+                    "nonce_gap_guard: could not read chain nonce; proceeding with broadcast"
+                );
+                return Ok(());
+            }
+        };
+        if nonce > chain_next {
+            return Err(TxEngineError::NonceGap {
+                from: bloom_proto::checksum_address(&from),
+                staged: nonce,
+                chain_next,
+            });
+        }
+        Ok(())
+    }
+
+    /// Persist a machine-readable advisory beside a pending entry when its
+    /// broadcast was refused by [`Self::assert_nonce_not_ahead_of_chain`], so an
+    /// agent can see the exact gap and how to resolve it without re-deriving it.
+    fn write_nonce_gap_advisory(
+        &self,
+        entry: &crate::outbox::OutboxEntry,
+        staged: u64,
+        chain_next: u64,
+    ) -> Result<(), TxEngineError> {
+        let body = serde_json::json!({
+            "schema": "bloom.nonce_gap.v1",
+            "id": entry.staged.id,
+            "wallet": entry.staged.wallet,
+            "chain": entry.staged.chain,
+            "from": entry.staged.from,
+            "staged_nonce": staged,
+            "chain_next_nonce": chain_next,
+            "advice": format!(
+                "broadcast nonce {chain_next} first, or restage with an explicit `nonce` to fill the gap deliberately"
+            ),
+            "created_ms": now_ms(),
+        });
+        self.outbox.write_artefact(
+            &entry.dir,
+            "nonce_gap.json",
+            &serde_json::to_vec_pretty(&body).unwrap(),
+        )?;
+        Ok(())
+    }
+
     fn build_unsigned_evm_tx(
         &self,
         staged: &StagedTx,
@@ -1878,6 +1965,27 @@ impl TxEngine {
             return Err(TxEngineError::PrivateNotSupportedOnChain(
                 chain.spec().name.clone(),
             ));
+        }
+        // Refuse to broadcast into a nonce gap (would be queued and never mine).
+        // Do this before signing/marker writes so a refused attempt leaves no
+        // half-broadcast state — just an advisory beside the pending entry.
+        let from: Address = staged
+            .from
+            .parse()
+            .map_err(|e: alloy::hex::FromHexError| TxEngineError::Address(e.to_string()))?;
+        if let Err(e) = self
+            .assert_nonce_not_ahead_of_chain(chain, from, staged.nonce)
+            .await
+        {
+            if let TxEngineError::NonceGap {
+                staged: s,
+                chain_next,
+                ..
+            } = &e
+            {
+                let _ = self.write_nonce_gap_advisory(entry, *s, *chain_next);
+            }
+            return Err(e);
         }
         let signature = self
             .host_sign_evm_hash(staged, action_kind, prepared.signing_hash)
@@ -2134,16 +2242,27 @@ impl TxEngine {
     ) -> Result<(), TxEngineError> {
         let action_id = sealed.action_id();
         let wallet = sealed.wallet();
-        let chain_name = &sealed.envelope.header.network;
+        // The outbox is keyed by the human chain name ("base"), not the CAIP-2
+        // `network` header ("eip155:8453"). Using the header here silently missed
+        // the per-wallet entry and dropped approval.json.
+        let chain_name = sealed.chain_name().ok_or_else(|| {
+            TxEngineError::BroadcastApprovalRequired(
+                "sealed action is missing chain_name in its policy snapshot".into(),
+            )
+        })?;
         let body = serde_json::to_vec_pretty(approval).map_err(|e| {
             TxEngineError::BroadcastApprovalRequired(format!("encode approval.json: {e}"))
         })?;
-        // Per-wallet pending projection (best effort: the entry may already
-        // have transitioned or the challenge may have come from another mode).
+        // Per-wallet pending projection. The entry may legitimately be absent
+        // (already transitioned, or the challenge came from another interaction
+        // mode) — but a silent miss is what hid the earlier chain-key bug, so we
+        // warn loudly when nothing was written here.
+        let mut persisted = false;
         if let Some(dir) = self.find_pending_entry_dir_for_action(wallet, chain_name, action_id) {
             std::fs::write(dir.join(OUTBOX_APPROVAL_FILE), &body).map_err(|e| {
                 TxEngineError::BroadcastApprovalRequired(format!("write approval.json: {e}"))
             })?;
+            persisted = true;
         }
         // Central outbox projection, keyed by the sealed action id (same place
         // the challenge is mirrored). No-op when no projection is attached.
@@ -2153,6 +2272,14 @@ impl TxEngine {
             OUTBOX_APPROVAL_FILE,
             &body,
         );
+        if !persisted {
+            tracing::warn!(
+                wallet,
+                chain = %chain_name,
+                action_id,
+                "ceremony.approval.no_pending_entry: approval.json not written to a per-wallet pending dir"
+            );
+        }
         Ok(())
     }
 
@@ -2254,6 +2381,10 @@ impl TxEngine {
             .host_sign_evm_sealed_subject_hash(&subject, &signing_hash)
             .await?;
         let signed = self.assemble_signed_raw_tx(&staged, unsigned, signature)?;
+        // Same broadcast-time nonce-gap guard as the confirm path: never emit a
+        // sealed tx that the node would queue behind a missing nonce.
+        self.assert_nonce_not_ahead_of_chain(chain, from, nonce)
+            .await?;
         let submitted = self
             .submit_signed_raw(&staged, chain, policy, &signed)
             .await?;

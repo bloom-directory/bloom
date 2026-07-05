@@ -583,8 +583,18 @@ impl Outbox {
     /// directory is empty or doesn't exist yet (no staged txs for this sender).
     ///
     /// Called by `TxEngine::stage()` under a per-(wallet, chain, from) async mutex
-    /// to compute the correct next nonce when multiple txs are staged before any
-    /// are broadcast.
+    /// to compute the auto-increment next nonce when multiple txs are staged
+    /// before any are broadcast (e.g. a DeFi `approve` → `swap` bundle, which
+    /// must occupy consecutive nonces).
+    ///
+    /// This counts *every* pending entry for `addr`, whether or not it has
+    /// broadcast yet — that is what keeps sequential staging contiguous. The
+    /// hazard it creates (a staged-but-never-broadcast entry reserving a slot,
+    /// so a later tx broadcasts into a gap that never fills and is stranded) is
+    /// caught at broadcast time by the nonce-gap guard in
+    /// [`TxEngine::assert_nonce_not_ahead_of_chain`], not here — reservation
+    /// stays optimistic, broadcast stays safe. Callers that need an exact nonce
+    /// bypass this entirely via the intent `nonce` override.
     ///
     /// Scans all pending entries for `addr` on each call — acceptable for
     /// single-user CLI where the pending queue is small.
@@ -1187,6 +1197,38 @@ mod tests {
         let sent_dir = ob.sent_dir("alice", "anvil", "art").unwrap();
         let body = std::fs::read(sent_dir.join("review_intent.json")).unwrap();
         assert_eq!(body, b"{\"title\":\"x\"}");
+    }
+
+    #[test]
+    fn highest_pending_nonce_auto_increments_over_all_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let ob = Outbox::new(dir.path()).unwrap();
+        let from: alloy::primitives::Address =
+            "0x0000000000000000000000000000000000000001".parse().unwrap();
+
+        // No pending entries → no reservation (caller falls back to chain nonce).
+        assert_eq!(
+            ob.highest_pending_nonce("alice", "anvil", from).unwrap(),
+            None
+        );
+
+        // Every pending entry counts, broadcast or not — a bundle staged before
+        // any broadcast (approve at 0, swap at 1) must keep consecutive nonces.
+        let mut a = fake_staged("0001-a");
+        a.nonce = 0;
+        ob.write_pending(&a, "# plan").unwrap();
+        assert_eq!(
+            ob.highest_pending_nonce("alice", "anvil", from).unwrap(),
+            Some(0)
+        );
+        let mut b = fake_staged("0002-b");
+        b.nonce = 1;
+        ob.write_pending(&b, "# plan").unwrap();
+        assert_eq!(
+            ob.highest_pending_nonce("alice", "anvil", from).unwrap(),
+            Some(1),
+            "reservation advances so the next stage gets nonce 2"
+        );
     }
 
     #[test]

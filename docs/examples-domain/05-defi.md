@@ -133,8 +133,11 @@ ls /bloom/wallets/alice/chains/ethereum/outbox/pending/0001-.../
 cat /bloom/wallets/alice/chains/ethereum/outbox/pending/0001-.../plan.md
 # (per-tx plan: signed payload preview, gas, policy notes)
 
-# 11) Second confirm — the actual broadcast. The approve must broadcast and
-#     mine before the swap; review both, then confirm in order.
+# 11) Second confirm — the actual broadcast. The two entries were staged
+#     before either broadcast, so the nonce auto-increment gave them
+#     consecutive slots (approve = N, swap = N+1), and a depends_on link makes
+#     the swap's confirm refuse until the approve mines. The approve must
+#     broadcast and mine before the swap; review both, then confirm in order.
 echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/0001-.../confirm
 echo y > /bloom/wallets/alice/chains/ethereum/outbox/pending/0002-.../confirm
 
