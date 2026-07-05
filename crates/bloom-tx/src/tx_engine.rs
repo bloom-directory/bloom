@@ -646,18 +646,35 @@ impl TxEngine {
                 to,
                 value,
                 token,
+                amount,
                 data,
             } => {
                 let to_addr = self.resolve_recipient_async(to, address_book).await?;
                 if let Some(v) = Self::resolve_native_value(value, token)? {
+                    if !amount.trim().is_empty() {
+                        return Err(TxEngineError::Amount(
+                            "native sends must use value; amount is only for token sends".into(),
+                        ));
+                    }
                     let data = data.clone().unwrap_or_else(|| "0x".into());
                     Ok((to_addr, v, data, None, None))
                 } else {
+                    if amount.trim().is_empty() {
+                        return Err(TxEngineError::Amount(
+                            "token sends require amount; value is only for native sends".into(),
+                        ));
+                    }
+                    if !value.trim().is_empty() && value.trim() != "0" {
+                        return Err(TxEngineError::Amount(
+                            "token sends must use amount; value is reserved for native sends"
+                                .into(),
+                        ));
+                    }
                     let token_str = token.as_deref().unwrap_or("");
                     let (token_addr, sym_hint) = Self::resolve_token_address(token_str, chain_id)?;
                     let meta = self.token_meta(chain, token_addr, &sym_hint).await?;
                     let parsed =
-                        parse_amount(value).map_err(|e| TxEngineError::Amount(e.to_string()))?;
+                        parse_amount(amount).map_err(|e| TxEngineError::Amount(e.to_string()))?;
                     // A native metric unit (wei/gwei/eth) on an ERC-20 amount is
                     // ambiguous — it would be silently rescaled by token
                     // decimals. Reject it and point at the unambiguous forms.
@@ -665,7 +682,7 @@ impl TxEngine {
                     // as a human token amount.
                     if parsed.explicit_unit && parsed.is_native() {
                         return Err(TxEngineError::Amount(format!(
-                            "'{value}' uses a native unit ('{}') for an ERC-20 token; write a human \
+                            "'{amount}' uses a native unit ('{}') for an ERC-20 token; write a human \
                              amount like '10 {}' or raw base units like '10000000 base'",
                             parsed.unit, meta.symbol
                         )));

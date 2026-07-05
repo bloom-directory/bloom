@@ -66,8 +66,8 @@ TO=<recipient_address>
 AMOUNT=1000000000000000000
 
 # Example only: adapt to the mounted staging file advertised by the tree.
-printf 'token=%s\nto=%s\namount=%s\n' "$TOKEN" "$TO" "$AMOUNT" \
-  > /tmp/bloom-mount/wallets/$WALLET/chains/$CHAIN/outbox/new
+printf 'token = "%s"\nto = "%s"\namount = "%s"\n' "$TOKEN" "$TO" "$AMOUNT" \
+  > /tmp/bloom-mount/wallets/$WALLET/chains/$CHAIN/outbox/new.tx
 ```
 
 Expected:

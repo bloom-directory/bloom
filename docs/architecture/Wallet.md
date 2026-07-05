@@ -64,12 +64,14 @@ ceremony. It authorizes a Petal to use bounded signing authority through
 
 ## Target On-Disk Layout
 
-The target wallet directory is:
+The target wallet directory is exactly:
 
 ```text
 wallets/<wallet>/
   kind                         # "passkey" for fund-holding wallets
   address                      # checksummed owner address
+  address.qr.png               # QR code address in PNG format 
+  address.qr.svg               # QR code address in SVG format
   pubkey                       # owner public key
   encrypted.key                # wallet private key encrypted by wallet_dek
   policy.toml                  # wallet policy
@@ -83,6 +85,8 @@ wallets/<wallet>/
       created_ms               # enrollment timestamp
       revoked_ms               # absent/empty when active
 ```
+
+TODO: We need to decide if we want `chains` inside a wallet directory still. Currently it provides endpoints for `balance`, `nonce`, etc. Maybe we allow Petals to project into certain parts of the VFS? Maybe we put it behind a different Petal dir?
 
 Properties:
 

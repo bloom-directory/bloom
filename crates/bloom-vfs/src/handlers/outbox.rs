@@ -255,6 +255,34 @@ impl OutboxHandler {
     pub fn new(outbox: CentralOutbox) -> Self {
         Self { outbox }
     }
+
+    fn latest_pending_action_id(&self) -> Result<Option<String>, HandlerError> {
+        let pending = self.outbox.state_dir("pending");
+        if !pending.exists() {
+            return Ok(None);
+        }
+        let mut entries: Vec<_> = std::fs::read_dir(&pending)
+            .map_err(|e| HandlerError::backend(e.to_string()))?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let intent = e.path().join("intent.json");
+                std::fs::metadata(&intent)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .map(|mtime| (mtime, e.file_name()))
+            })
+            .collect();
+        entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        Ok(entries
+            .first()
+            .map(|(_, name)| name.to_string_lossy().into_owned()))
+    }
+
+    fn latest_target(&self) -> Result<Option<String>, HandlerError> {
+        Ok(self
+            .latest_pending_action_id()?
+            .map(|id| format!("pending/{id}")))
+    }
 }
 
 fn validate_action_id(id: &str) -> Result<(), HandlerError> {
@@ -282,26 +310,27 @@ impl Handler for OutboxHandler {
             [] => Ok(Entry::dir("outbox")),
             [state] if STATES.contains(state) => Ok(Entry::dir(state)),
             ["latest"] => {
-                let pending = self.outbox.state_dir("pending");
-                if !pending.exists() {
-                    return Err(HandlerError::NotFound("outbox/latest".into()));
+                let target = self
+                    .latest_target()?
+                    .ok_or_else(|| HandlerError::NotFound("outbox/latest".into()))?;
+                Ok(Entry::symlink("latest", &target))
+            }
+            ["latest", file] => {
+                let action_id = self
+                    .latest_pending_action_id()?
+                    .ok_or_else(|| HandlerError::NotFound("outbox/latest".into()))?;
+                if !ACTION_FILES.contains(file) {
+                    return Err(HandlerError::NotFound(format!("/outbox/latest/{file}")));
                 }
-                let mut entries: Vec<_> = std::fs::read_dir(&pending)
-                    .map_err(|e| HandlerError::backend(e.to_string()))?
-                    .filter_map(|e| e.ok())
-                    .filter_map(|e| {
-                        let intent = e.path().join("intent.json");
-                        std::fs::metadata(&intent)
-                            .and_then(|m| m.modified())
-                            .ok()
-                            .map(|mtime| (mtime, e.file_name()))
-                    })
-                    .collect();
-                entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-                let (_, name) = entries
-                    .first()
-                    .ok_or_else(|| HandlerError::NotFound("no pending actions".into()))?;
-                Ok(Entry::dir(name.to_string_lossy().as_ref()))
+                let fpath = self.outbox.action_dir("pending", &action_id).join(file);
+                if !fpath.exists() {
+                    return Err(HandlerError::NotFound(format!("/outbox/latest/{file}")));
+                }
+                if *file == "approval.json" {
+                    Ok(Entry::writable_file(file))
+                } else {
+                    Ok(Entry::file(file))
+                }
             }
             [state, action_id] if STATES.contains(state) => {
                 validate_action_id(action_id)?;
@@ -339,6 +368,28 @@ impl Handler for OutboxHandler {
     async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let segs = match_segs(path);
         match segs.as_slice() {
+            ["latest"] => {
+                let target = self
+                    .latest_target()?
+                    .ok_or_else(|| HandlerError::NotFound("outbox/latest".into()))?;
+                Ok(format!("{target}\n").into_bytes())
+            }
+            ["latest", file] => {
+                let action_id = self
+                    .latest_pending_action_id()?
+                    .ok_or_else(|| HandlerError::NotFound("outbox/latest".into()))?;
+                if !ACTION_FILES.contains(file) {
+                    return Err(HandlerError::NotFound(format!("/outbox/latest/{file}")));
+                }
+                let fpath = self.outbox.action_dir("pending", &action_id).join(file);
+                std::fs::read(&fpath).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        HandlerError::NotFound(fpath.to_string_lossy().to_string())
+                    } else {
+                        HandlerError::backend(e.to_string())
+                    }
+                })
+            }
             [state, action_id, file] if STATES.contains(state) => {
                 validate_action_id(action_id)?;
                 if !ACTION_FILES.contains(file) {
@@ -362,6 +413,20 @@ impl Handler for OutboxHandler {
     async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
         let segs = match_segs(path);
         match segs.as_slice() {
+            ["latest", "approval.json"] => {
+                let action_id = self
+                    .latest_pending_action_id()?
+                    .ok_or_else(|| HandlerError::NotFound("outbox/latest".into()))?;
+                let dir = self.outbox.action_dir("pending", &action_id);
+                if !dir.exists() {
+                    return Err(HandlerError::NotFound(format!(
+                        "/outbox/pending/{action_id}"
+                    )));
+                }
+                std::fs::write(dir.join("approval.json"), data)
+                    .map_err(|e| HandlerError::backend(e.to_string()))?;
+                Ok(())
+            }
             ["pending", action_id, "approval.json"] => {
                 validate_action_id(action_id)?;
                 let dir = self.outbox.action_dir("pending", action_id);
@@ -381,11 +446,13 @@ impl Handler for OutboxHandler {
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         let segs = match_segs(path);
         match segs.as_slice() {
-            [] => Ok(STATES
-                .iter()
-                .map(|s| Entry::dir(s))
-                .chain(std::iter::once(Entry::dir("latest")))
-                .collect()),
+            [] => {
+                let mut entries: Vec<Entry> = STATES.iter().map(|s| Entry::dir(s)).collect();
+                if let Some(target) = self.latest_target()? {
+                    entries.push(Entry::symlink("latest", &target));
+                }
+                Ok(entries)
+            }
             [state] if STATES.contains(state) => {
                 let dir = self.outbox.state_dir(state);
                 if !dir.exists() {
@@ -441,14 +508,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lookup_root_lists_states() {
+    async fn lookup_root_lists_states_without_latest_when_empty() {
         let h = handler();
         let entries = h.list(&VfsPath::root()).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"pending"));
         assert!(names.contains(&"sent"));
         assert!(names.contains(&"failed"));
-        assert!(names.contains(&"latest"));
+        assert!(!names.contains(&"latest"));
     }
 
     #[tokio::test]
@@ -600,8 +667,22 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(15));
         h.outbox.stage("act-new", b"{}", "h2", "p2", b"[]").unwrap();
 
+        let entries = h.list(&VfsPath::root()).await.unwrap();
+        let latest = entries
+            .iter()
+            .find(|entry| entry.name == "latest")
+            .expect("latest is listed when there is a pending action");
+        assert_eq!(latest.link_target.as_deref(), Some("pending/act-new"));
+
         let entry = h.lookup(&VfsPath::parse("latest").unwrap()).await.unwrap();
-        assert_eq!(entry.name, "act-new");
+        assert_eq!(entry.name, "latest");
+        assert_eq!(entry.link_target.as_deref(), Some("pending/act-new"));
+
+        let plan = h
+            .read(&VfsPath::parse("latest/plan.md").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(plan, b"p2");
     }
 
     #[tokio::test]
@@ -619,7 +700,8 @@ mod tests {
 
         let entry = h.lookup(&VfsPath::parse("latest").unwrap()).await.unwrap();
         assert_eq!(
-            entry.name, "act-new",
+            entry.link_target.as_deref(),
+            Some("pending/act-new"),
             "latest must reflect staging order, not artefact-write order"
         );
     }
@@ -627,6 +709,12 @@ mod tests {
     #[tokio::test]
     async fn latest_not_found_when_empty() {
         let h = handler();
+        let entries = h.list(&VfsPath::root()).await.unwrap();
+        assert!(
+            entries.iter().all(|entry| entry.name != "latest"),
+            "empty outbox must not advertise a latest entry that lookup cannot resolve"
+        );
+
         let result = h.lookup(&VfsPath::parse("latest").unwrap()).await;
         assert!(result.is_err());
     }
@@ -654,7 +742,8 @@ mod tests {
 
         let entry = h.lookup(&VfsPath::parse("latest").unwrap()).await.unwrap();
         assert_eq!(
-            entry.name, "act-alpha",
+            entry.link_target.as_deref(),
+            Some("pending/act-alpha"),
             "on identical mtime, tie-breaker is lexicographic ascending action_id"
         );
     }
@@ -669,6 +758,11 @@ mod tests {
         assert!(
             result.is_err(),
             "latest must not return actions that have transitioned out of pending"
+        );
+        let entries = h.list(&VfsPath::root()).await.unwrap();
+        assert!(
+            entries.iter().all(|entry| entry.name != "latest"),
+            "latest must not be listed after the only pending action leaves pending"
         );
     }
 
