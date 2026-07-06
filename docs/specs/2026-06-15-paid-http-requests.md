@@ -278,7 +278,17 @@ unpaid HTTP probe
         wait for confirm
                 │
                 ▼
-        sign/pay/open-channel/sign-voucher as required
+        if Sealed Approval is required:
+        write pending/<id>/approval_challenge.json with ceremony_url
+                │
+                ▼
+        foreground/browser ceremony mints a one-shot in-memory grant
+                │
+                ▼
+        execute from sealed subject bytes + sealed policy snapshot
+                │
+                ▼
+        host-sign exact x402/MPP digest under the live grant as required
                 │
                 ▼
         retry HTTP request with payment credential
@@ -460,13 +470,28 @@ or secret token unless it is specifically safe as a receipt/public proof.
 
 ### Wallet signing and passkey unlocks
 
-Tempo MPP confirmation always obtains the signer through Bloom's unlocked
-keystore path (`Keystore::signer(wallet)`). Passkey-gated wallets are supported
-when their foreground `unlock-passkey` / `unlock_passkey` flow has populated the
-same unlocked signer cache; they are not a separate unsupported wallet type.
-Locked local wallets fail before MPP credential creation. Locked passkey wallets
-fail with an explicit instruction to run the foreground passkey unlock flow before
-writing `confirm`.
+x402 and Tempo MPP confirmation both route wallet signatures through Bloom's
+paid-HTTP host signer. The protocol adapters construct the exact digest they
+need, attach structured public `SigningAttestation` facts, and ask the host to
+sign under a live Sealed Approval grant. The host enforces the paid-HTTP Petal
+identity, action id, intent (`x402.sign` or `paid-http.mpp.sign`), signing hash,
+and sealed policy snapshot digest before signing.
+
+For passkey-gated wallets, foreground confirmation follows the Sealed Approval
+ceremony instead of requiring a separate unlocked signer cache. The first
+confirm may write `approval_challenge.json` with `ceremony_url` and deny; the
+foreground command, user, or agent opens that URL, completes WebAuthn, mints a
+short-lived grant, and retries confirmation. The one-shot allowance is consumed
+atomically only when a host signature is produced. Failures before signing do
+not consume the grant.
+
+Confirmation reconstructs request execution from the sealed paid-HTTP subject
+bytes. `request.toml`, `challenge.json`, and `policy_check.json` are projection
+artifacts, not authority. If they differ from the sealed subject, or
+`private/request_body` no longer matches the sealed body hash, confirmation
+fails before signing or credential minting. Execution limits come from the
+sealed policy snapshot; live policy may narrow or deny as defense in depth, but
+it cannot widen the sealed payment terms.
 
 ### `receipt.json`
 
@@ -623,13 +648,10 @@ Implementation note: the Tempo MPP adapter uses the real `mpp` Rust SDK
 charge/session credential creation, and Authorization/Payment-Receipt formatting.
 Tempo MPP charges and sessions are normalized and policy-gated (including
 cumulative session-spend caps) and share the same confirm path as x402: signing
-runs only after confirmation and policy approval, x402 keeps its keystore signer
-with a staged request-id–bound EIP-3009 nonce, the paid retry is a real HTTP
-request, and a failed retry (HTTP >= 400 or a signing/settlement error)
-transitions the request to the `failed` state. Tempo MPP signing uses
-`Keystore::signer(wallet)`, so passkey-gated wallets work after the foreground
-`unlock_passkey` flow has unlocked the signer and locked passkey wallets fail
-before credential creation with an unlock-specific error.
+runs only after confirmation and Sealed Approval, host signing consumes the
+one-shot grant allowance only when the credential digest is signed, the paid
+retry is a real HTTP request, and a failed retry (HTTP >= 400 or a
+signing/settlement error) transitions the request to the `failed` state.
 
 Only redacted credential metadata, receipts, audit entries, and cumulative
 session spend are written; no raw Authorization headers, signed transactions,

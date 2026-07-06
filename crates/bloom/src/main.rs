@@ -23,9 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
-use bloom_auth_api::{
-    ApprovalChallenge, AssuranceLevel, SignedApproval, SignerTransport, UnsignedApproval,
-};
+use bloom_auth_api::{ApprovalChallenge, AssuranceLevel, SignerTransport, UnsignedApproval};
 use bloom_daemon::Daemon;
 use bloom_daemon::ipc::{IpcClient, IpcServer, default_socket_path};
 use bloom_hyperliquid::{
@@ -1574,9 +1572,7 @@ async fn run(cli: Cli) -> Result<()> {
             let info = d.keystore.info(&wallet)?;
             let passkey_wallet = matches!(info.kind, bloom_keystore::WalletKind::PasskeyGated);
             match info.kind {
-                bloom_keystore::WalletKind::PasskeyGated => {
-                    bail!(PASSKEY_WRITE_UNLOCKED_DISABLED);
-                }
+                bloom_keystore::WalletKind::PasskeyGated => {}
                 _ => {
                     d.keystore
                         .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
@@ -3151,12 +3147,16 @@ async fn sign_request_sealed_approval_if_challenged(
         None,
         review_session_id,
     );
-    let signature = d
-        .keystore
-        .sign_approval_with_passkey(wallet, &unsigned, intent)
-        .await
-        .context("sign request Sealed Approval with passkey")?;
-    let approval: SignedApproval = unsigned.into_signed(signature);
+    let (_grant, approval) = bloom_daemon::sealed_ceremony::run_sealed_approval_ceremony(
+        &d.keystore,
+        &d.auth_services,
+        unsigned,
+        intent,
+        cli_now_ms(),
+        d.signer_cache.as_ref(),
+    )
+    .await
+    .context("run request sealed approval browser ceremony")?;
     let approval_path = dir.join("approval.json");
     std::fs::write(
         &approval_path,

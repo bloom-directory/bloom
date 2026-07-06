@@ -88,8 +88,30 @@ action id; do not treat them as separate approval queues.
 
 Paid HTTP requests live under `/requests`. Agents should stage the request,
 read `plan.md`, and confirm only when the quoted cost, network, asset, and
-merchant match the task. Bloom handles x402 internally; agents should not look
-for a separate `/x402` path.
+merchant match the task. Bloom handles x402 and Tempo MPP internally; agents
+should not look for separate `/x402` or `/mpp` paths.
+
+If paid confirmation needs passkey approval, the first confirm write may return
+permission denied after writing
+`/requests/pending/<id>/approval_challenge.json`. Read that file, check
+`action_id`, `expiry_ms`, merchant/payment details in `plan.md`, then open or
+forward `ceremony_url`. The foreground `bloom request confirm` command follows
+the same Sealed Approval ceremony and retry path.
+
+The ceremony mints a short-lived in-memory grant for the sealed request. x402
+and MPP then ask Bloom's host signer to sign the exact payment digest under that
+grant; one allowance is consumed atomically only when a signature is produced.
+Failed policy checks, bad attestations, failed credential preparation, or retry
+failures before signing do not consume the grant. Raw payment authorization
+headers, signed payloads, passkey material, and PRF output are not written to
+VFS artifacts; credential metadata is redacted.
+
+Request confirmation executes from the daemon's sealed paid-HTTP subject bytes
+and sealed policy snapshot. Files such as `request.toml`, `challenge.json`, and
+`policy_check.json` are views for agents. If a pending projection differs from
+the sealed subject, or `private/request_body` no longer matches the sealed body
+hash, confirmation fails before signing or minting credentials. Live policy may
+narrow or deny, but it cannot widen the already sealed payment terms.
 
 Example paid search:
 
