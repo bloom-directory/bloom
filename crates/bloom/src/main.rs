@@ -2364,7 +2364,9 @@ async fn run(cli: Cli) -> Result<()> {
             // ceremony endpoint (`ceremony_url` in approval_challenge.json).
             // The daemon never opens a browser; it only serves the URL a
             // deliberate client opens.
-            let ceremony = bloom_daemon::ceremony_server::spawn(&d).await;
+            let ceremony = bloom_daemon::ceremony_server::spawn(&d)
+                .await
+                .context("bind sealed approval ceremony server")?;
             let mount_handle = mount_bloom(&d, mount.as_deref()).await?;
             let chains: Vec<String> = d.chains.list_names();
             println!(

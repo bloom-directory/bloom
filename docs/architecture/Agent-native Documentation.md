@@ -28,7 +28,7 @@ How it works today:
 - The same content is also readable at `/docs/agent-guidance.md` through the
   docs handler, alongside `/docs/README.md` and `/docs/examples.md`.
 
-Because the content is compiled into the daemon, the documentation an agent
+Because the content is compiled into the Bloom Machine, the documentation an agent
 reads is always the documentation of the exact binary serving the mount.
 There is no runtime templating and no way for the served guidance to drift
 from the release it ships with.
@@ -95,7 +95,7 @@ or explicitly justify why no update is needed.
 ## Extension Points
 
 - The router exposes a `root_dynamic` registration mechanism for dynamic
-  root-level files. The daemon uses it for `/next.md`, a daemon-rendered "what
+  root-level files. The Bloom Machine uses it for `/next.md`, a Bloom Machine-rendered "what
   needs my attention" aggregator for agent workflows.
 - New global agent-facing documents belong at the mount root or under
   `/docs`, embedded at compile time and covered by byte-identity tests, not

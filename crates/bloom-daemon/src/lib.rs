@@ -129,6 +129,17 @@ impl CentralOutboxProjection for EvmOutboxProjection {
             .write_action_file(action_id, state, file, data)
             .map_err(|e| e.to_string())
     }
+
+    fn read_action_file(
+        &self,
+        action_id: &str,
+        state: &str,
+        file: &str,
+    ) -> Result<Vec<u8>, String> {
+        self.central
+            .read_action_file(action_id, state, file)
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[derive(Debug, Error)]

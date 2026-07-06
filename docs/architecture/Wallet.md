@@ -2,14 +2,11 @@
 
 **Status:** target architecture for passkey wallets and Sealed Approval integration
 **Audience:** Bloom engineers, Petal authors, and implementation agents
-**Primary specs:**
-[`../specs/2026-07-02-sealed-approval.md`](../specs/2026-07-02-sealed-approval.md),
-[`../plans/2026-07-03-sealed-approval-implementation-plan.md`](../plans/2026-07-03-sealed-approval-implementation-plan.md)
 
 This document describes Bloom's wallet setup, passkey ceremony model, and
-key-storage layout. It is written around the target **WS-C: Multi-passkey
-credential layout + wallet DEK** architecture, even where the current codebase
-is still migrating from the legacy single-credential layout.
+key-storage layout. It is written around the target **multi-passkey credential
+layout + wallet DEK** architecture, even where the current codebase is still
+migrating from the legacy single-credential layout.
 
 ## Decision Summary
 
@@ -42,7 +39,7 @@ sign.
 
 The secp256k1 key that owns EVM funds and any venue authority derived from that
 owner key. Petals must not receive this key or a raw `PrivateKeySigner`; they
-request bounded signatures through the host signing API.
+request bounded signatures through the Bloom Machine signing API.
 
 **Wallet DEK**
 
@@ -59,8 +56,12 @@ DEK during an approved ceremony.
 **Sealed Approval Grant**
 
 A short-lived in-memory capability minted after a valid Sealed Approval
-ceremony. It authorizes a Petal to use bounded signing authority through
-`PetalHost::sign_hash` or an equivalent host API. It is not persisted.
+ceremony. It authorizes a single Petal to request up to a bounded number of
+signatures, until a fixed expiry, through the Bloom Machine signing API. Within that
+envelope the Petal may propose bytes to sign; the Bloom Machine enforces the
+envelope but does not bind the bytes to the approval (see
+[`Bloom Machine + Petals.md`](./Bloom%20Machine%20+%20Petals.md)). It is not
+persisted.
 
 ## Target On-Disk Layout
 
@@ -143,9 +144,9 @@ Petal stages action
 Bloom seals canonical action bytes
 Bloom issues approval_challenge.json
 browser performs WebAuthn get() with PRF for an enrolled credential
-daemon verifies assertion and unwraps wallet DEK in memory
-daemon mints a short-lived grant and caches only grant-scoped signer material
-Petal signs or executes through host APIs under that grant
+Bloom Machine verifies assertion and unwraps wallet DEK in memory
+Bloom Machine mints a short-lived grant and caches only grant-scoped signer material
+Petal signs or executes through Bloom Machine APIs under that grant
 ```
 
 The browser ceremony must use one `navigator.credentials.get()` call for the
@@ -169,16 +170,23 @@ Allowed path:
 
 ```text
 active Sealed Approval Grant
-  -> host validates wallet/action/petal/digest/intent/terms/policy/expiry/count
-  -> Petal provides structured signing attestation
-  -> host signs the exact hash or performs the exact authority use
-  -> audit event records what was signed and why
+  -> Bloom Machine enforces the grant envelope: wallet, Petal identity,
+     signature count, expiry
+  -> Petal provides a structured signing attestation describing the request
+  -> Bloom Machine signs the hash the Petal presents and binds the attestation
+  -> audit event records what the Petal claimed and that it was signed
 ```
+
+The Bloom Machine does not verify that the signed hash matches the approved
+action; within a live grant the acting Petal is trusted to request only
+signatures consistent with what was approved. This trust boundary is described
+in [`Bloom Machine + Petals.md`](./Bloom%20Machine%20+%20Petals.md).
 
 Forbidden paths:
 
 - raw `PrivateKeySigner` flowing into Petal code;
-- arbitrary `/wallets/<wallet>/sign/{message,hash,typed_data}` signing;
+- any wallet signing outside an active Sealed Approval Grant, including a raw
+  `/wallets/<wallet>/sign/{message,hash,typed_data}` surface;
 - passphrase/password approvals satisfying Sealed Approval assurance;
 - `write_unlocked` as a privileged passkey signing lane;
 - marker files such as `.confirm_approved.json` or `review_approved.json`;
@@ -278,5 +286,5 @@ one wallet-level `passkey.json` and one wallet-level `prf.salt`, with no
 `credentials/<credential_id>/wrapped_dek` directory and no wallet DEK fan-out
 across multiple credentials.
 
-That gap is tracked by WS-C in the sealed-approval implementation plan and must
-be closed before Bloom can claim true multi-passkey wallet support.
+That gap must be closed before Bloom can claim true multi-passkey wallet
+support.

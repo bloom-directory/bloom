@@ -6,8 +6,8 @@
 Bloom actions must work through three interaction modes:
 
 1. CLI only
-2. VFS with no long-running daemon
-3. Mounted VFS with a daemon
+2. VFS with no long-running Bloom Machine
+3. Mounted VFS with a Bloom Machine
 
 This requirement applies to every Petal, including first-party Petals such as
 EVM wallet, paid HTTP, DeFi, Polymarket, Hyperliquid, wallet policy, and future
@@ -33,20 +33,20 @@ Every Bloom action surface must support these modes:
 | Mode | Who owns execution state? | Who may open a browser ceremony? | Expected behavior |
 |---|---|---|---|
 | CLI only | The foreground `bloom` process | The foreground `bloom` process | One command may stage, issue a challenge, run the browser ceremony, mint an in-process grant, retry execution, and finish. |
-| VFS with no daemon | The foreground `bloom vfs ...` process | The foreground `bloom` process | The CLI VFS facade may run the same foreground state machine as a domain CLI command. |
-| Mounted VFS with daemon | The daemon serving the mounted filesystem | Any deliberate client that expects the challenge — the writing agent or a foreground `bloom` command — opens or forwards the daemon-minted ceremony URL; the daemon never opens a browser itself | Mounted writes stage/challenge or execute already-authorized work. The challenge exposes a `ceremony_url`; writes must not silently pop browser windows from arbitrary filesystem writes. |
+| VFS with no Bloom Machine | The foreground `bloom vfs ...` process | The foreground `bloom` process | The CLI VFS facade may run the same foreground state machine as a domain CLI command. |
+| Mounted VFS with Bloom Machine | The Bloom Machine serving the mounted filesystem | Any deliberate client that expects the challenge — the writing agent or a foreground `bloom` command — opens or forwards the Bloom Machine-minted ceremony URL; the Bloom Machine never opens a browser itself | Mounted writes stage/challenge or execute already-authorized work. The challenge exposes a `ceremony_url`; writes must not silently pop browser windows from arbitrary filesystem writes. |
 
 ## Mode 1: CLI Only
 
-In CLI-only mode, there is no separate daemon process. A command such as
+In CLI-only mode, there is no separate Bloom Machine process. A command such as
 `bloom wallet confirm`, `bloom request confirm`, or a Petal-specific foreground
-command builds an in-process daemon and drives the complete action state
+command builds an in-process Bloom Machine and drives the complete action state
 machine.
 
 For any Petal action, the command should:
 
 1. load or stage the action;
-2. render or locate the daemon-produced plan;
+2. render or locate the Bloom Machine-produced plan;
 3. evaluate policy and active capability;
 4. if fresh approval is required, issue a Sealed Approval challenge;
 5. open the browser ceremony from the foreground process;
@@ -60,7 +60,7 @@ For any Petal action, the command should:
 This mode is useful for scripts, tests, and users who do not keep `bloom serve`
 running.
 
-## Mode 2: VFS With No Daemon
+## Mode 2: VFS With No Bloom Machine
 
 In this mode, the user invokes VFS operations through the `bloom vfs` CLI
 facade, for example:
@@ -70,7 +70,7 @@ bloom vfs write /<petal>/<...>/new --data ...
 bloom vfs write /<petal>/<...>/pending/<id>/confirm --data confirm
 ```
 
-There is still no long-running daemon. The foreground CLI owns the process,
+There is still no long-running Bloom Machine. The foreground CLI owns the process,
 therefore it may run the browser ceremony when a write discovers that Sealed
 Approval is needed.
 
@@ -86,9 +86,9 @@ For example, a VFS write to a Petal's confirm/execute file may:
 4. retry the same VFS write;
 5. return success or the final denial.
 
-## Mode 3: Mounted VFS With Daemon
+## Mode 3: Mounted VFS With Bloom Machine
 
-In this mode, `bloom serve --mount` runs a daemon and exposes a mounted
+In this mode, `bloom serve --mount` runs a Bloom Machine and exposes a mounted
 filesystem.
 
 Mounted VFS writes may come from an agent, shell tool, editor, file sync tool,
@@ -113,7 +113,7 @@ command. The normal pattern for an agent working through the mount is:
    (for example `/outbox/pending/<action_id>/`) materializes, so the agent
    knows the concrete `action_id`;
 2. agent writes to the mounted execute/confirm path for that action;
-3. the daemon stages the sealed action, issues the approval challenge, mints a
+3. the Bloom Machine stages the sealed action, issues the approval challenge, mints a
    ceremony URL bound to the challenge's `server_nonce`, and writes
    `approval_challenge.json` — including `ceremony_url` — into the same
    pending directory; the file must be durably visible before the write
@@ -126,11 +126,11 @@ command. The normal pattern for an agent working through the mount is:
    failed write, and the challenge is read from the directory it wrote to;
 6. the agent opens the browser for the user or sends `ceremony_url` to the
    user over another transport (chat, notification, and so on);
-7. the user completes the WebAuthn ceremony; PRF output goes into daemon
+7. the user completes the WebAuthn ceremony; PRF output goes into Bloom Machine
    memory only; the ceremony page offers **grant** and **grant + execute**,
    and the user chooses;
-8. under **grant**, the daemon mints the grant and the agent retries the
-   confirm write, which now executes; under **grant + execute**, the daemon
+8. under **grant**, the Bloom Machine mints the grant and the agent retries the
+   confirm write, which now executes; under **grant + execute**, the Bloom Machine
    executes immediately after minting the grant;
 9. mounted VFS projections move the action to sent/failed with result
    artifacts.
@@ -138,7 +138,7 @@ command. The normal pattern for an agent working through the mount is:
 The `ceremony_url` is single-use and valid until the challenge's existing
 `expiry_ms`; there is no separate URL expiry. While an unexpired challenge is
 pending, repeated confirm writes return the same challenge and the same URL —
-the daemon must not rotate the nonce or URL on retry, so a URL already
+the Bloom Machine must not rotate the nonce or URL on retry, so a URL already
 forwarded to the user stays valid. Whether the URL is reachable only on
 localhost or over the open internet is described in
 [`Open-Internet Sealed Approval Ceremony.md`](./Open-Internet%20Sealed%20Approval%20Ceremony.md).
@@ -193,11 +193,15 @@ Every Petal that can move value, change authority, create credentials, spend a
 budget, or consume bounded session authority must provide:
 
 - a staging path or command that creates a central action;
-- a daemon-rendered review plan derived from sealed bytes;
+- a Bloom Machine-rendered review plan derived from sealed bytes;
 - a concrete action id, never `latest`, for approval binding;
 - a Petal identity: `petal_id`, `petal_digest`, and `petal_version`;
 - a sealed policy snapshot;
-- daemon grant terms, including allowed signing intents and signature count;
+- Bloom Machine grant terms, including allowed signing intents and signature count;
+- enforcement of its own domain limits at execution time, since the Bloom
+  Machine does not interpret the bytes a Petal asks it to sign;
+- a structured signing attestation for each signature, stating what is signed
+  and which approval authorizes it;
 - a confirm command/path wired to the shared runtime action state machine;
 - audit/result artifacts visible through the central outbox and any Petal
   projection.

@@ -96,32 +96,14 @@ impl Drop for CeremonyServer {
 }
 
 /// Bind and spawn the daemon ceremony server on `127.0.0.1:LOCAL_CEREMONY_PORT`.
-///
-/// A bind failure (for example, a foreground passkey ceremony already holding
-/// the port) is logged and yields an inert handle rather than aborting
-/// `bloom serve`: the mounted approval flow degrades to "URL unreachable", not
-/// a dead daemon.
-pub async fn spawn(daemon: &Daemon) -> CeremonyServer {
+pub async fn spawn(daemon: &Daemon) -> std::io::Result<CeremonyServer> {
     let shutdown = Arc::new(Notify::new());
     let state = CeremonyState {
         daemon: daemon.clone(),
     };
     let app = router(state);
     let addr = format!("127.0.0.1:{LOCAL_CEREMONY_PORT}");
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            tracing::warn!(
-                addr = %addr,
-                err = %e,
-                "ceremony.server.bind_failed; mounted Sealed Approval URLs will be unreachable"
-            );
-            return CeremonyServer {
-                shutdown,
-                handle: None,
-            };
-        }
-    };
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(addr = %addr, "ceremony.server.listening");
     let shutdown_signal = shutdown.clone();
     let handle = tokio::spawn(async move {
@@ -129,10 +111,10 @@ pub async fn spawn(daemon: &Daemon) -> CeremonyServer {
             .with_graceful_shutdown(async move { shutdown_signal.notified().await })
             .await;
     });
-    CeremonyServer {
+    Ok(CeremonyServer {
         shutdown,
         handle: Some(handle),
-    }
+    })
 }
 
 fn router(state: CeremonyState) -> Router {
@@ -297,6 +279,22 @@ fn err_json(status: StatusCode, msg: impl Into<String>) -> Response {
         .into_response()
 }
 
+async fn revoke_grant_and_drop_cache(
+    daemon: &Daemon,
+    grant_store: &dyn bloom_auth_api::GrantStore,
+    grant_id: &str,
+    now_ms: u64,
+) {
+    if let Err(e) = grant_store.revoke(grant_id, now_ms).await {
+        tracing::warn!(
+            err = %e,
+            grant_id,
+            "ceremony.approval.grant_revoke_failed"
+        );
+    }
+    daemon.signer_cache.drop_on_completion(grant_id);
+}
+
 async fn complete(
     State(state): State<CeremonyState>,
     Path(token): Path<String>,
@@ -437,7 +435,11 @@ async fn complete(
         .tx_engine
         .persist_outbox_ceremony_approval(&action, &signed)
     {
-        tracing::warn!(err = %e, "ceremony.approval.persist_failed");
+        revoke_grant_and_drop_cache(daemon, grant_store.as_ref(), &grant.grant_id, now).await;
+        return err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("persist approval artifact: {e}"),
+        );
     }
 
     // grant + execute: broadcast immediately from sealed bytes.
@@ -450,6 +452,8 @@ async fn complete(
         let chain_name = match action.chain_name() {
             Some(name) => name.to_string(),
             None => {
+                revoke_grant_and_drop_cache(daemon, grant_store.as_ref(), &grant.grant_id, now)
+                    .await;
                 return err_json(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "grant minted but sealed action is missing chain_name for execute".to_string(),
@@ -459,19 +463,34 @@ async fn complete(
         let client = match daemon.chains.get(&chain_name) {
             Some(c) => c,
             None => {
-                return err_json(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("grant minted but chain '{chain_name}' is not configured for execute"),
-                );
+                let message =
+                    format!("grant minted but chain '{chain_name}' is not configured for execute");
+                revoke_grant_and_drop_cache(daemon, grant_store.as_ref(), &grant.grant_id, now)
+                    .await;
+                if let Err(project_err) = daemon.tx_engine.project_sealed_action_execute_failure(
+                    &action,
+                    &chain_name,
+                    &message,
+                ) {
+                    tracing::warn!(err = %project_err, "ceremony.execute.failure_projection_failed");
+                }
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, message);
             }
         };
         let policy = match daemon.keystore.info(&wallet) {
             Ok(info) => info.policy,
             Err(e) => {
-                return err_json(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("grant minted but wallet policy unavailable: {e}"),
-                );
+                let message = format!("grant minted but wallet policy unavailable: {e}");
+                revoke_grant_and_drop_cache(daemon, grant_store.as_ref(), &grant.grant_id, now)
+                    .await;
+                if let Err(project_err) = daemon.tx_engine.project_sealed_action_execute_failure(
+                    &action,
+                    &chain_name,
+                    &message,
+                ) {
+                    tracing::warn!(err = %project_err, "ceremony.execute.failure_projection_failed");
+                }
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, message);
             }
         };
         match daemon
@@ -484,10 +503,17 @@ async fn complete(
                 tx_hash = Some(format!("{:#x}", exec.tx_hash));
             }
             Err(e) => {
-                return err_json(
-                    StatusCode::BAD_GATEWAY,
-                    format!("grant minted but execute failed: {e}"),
-                );
+                let message = format!("grant minted but execute failed: {e}");
+                revoke_grant_and_drop_cache(daemon, grant_store.as_ref(), &grant.grant_id, now)
+                    .await;
+                if let Err(project_err) = daemon.tx_engine.project_sealed_action_execute_failure(
+                    &action,
+                    &chain_name,
+                    &message,
+                ) {
+                    tracing::warn!(err = %project_err, "ceremony.execute.failure_projection_failed");
+                }
+                return err_json(StatusCode::BAD_GATEWAY, message);
             }
         }
     }

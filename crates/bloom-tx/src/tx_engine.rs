@@ -224,6 +224,13 @@ struct EvmCentralResult<'a> {
     action_kind: &'a str,
 }
 
+struct EvmCentralFailure<'a> {
+    action_id: &'a str,
+    state: OutboxState,
+    outcome: &'a str,
+    reason: &'a str,
+}
+
 struct SubmitResult {
     transport: BroadcastTransport,
     returned_hash: Option<B256>,
@@ -1659,13 +1666,14 @@ impl TxEngine {
             "signing_hash": format!("{:#x}", central.signing_hash),
             "created_ms": now_ms(),
         });
-        let status = serde_json::json!({
-            "action_id": central.action_id,
-            "state": central.state.dirname(),
-            "outcome": central.outcome,
-            "tx_hash": format!("{:#x}", central.tx_hash),
-            "action_kind": central.action_kind,
-        });
+        let mut status = self.central_status_base(central.action_id, central.state)?;
+        let status_obj = status.as_object_mut().expect("central status is object");
+        status_obj.insert("outcome".into(), serde_json::json!(central.outcome));
+        status_obj.insert(
+            "tx_hash".into(),
+            serde_json::json!(format!("{:#x}", central.tx_hash)),
+        );
+        status_obj.insert("action_kind".into(), serde_json::json!(central.action_kind));
         self.outbox.write_central_action_artifact(
             central.action_id,
             central.state,
@@ -1679,6 +1687,54 @@ impl TxEngine {
             &serde_json::to_vec_pretty(&status).unwrap(),
         )?;
         Ok(())
+    }
+
+    fn write_central_evm_failure_result(
+        &self,
+        central: EvmCentralFailure<'_>,
+    ) -> Result<(), TxEngineError> {
+        let result = serde_json::json!({
+            "schema": "bloom.evm_execution_result.v1",
+            "action_id": central.action_id,
+            "state": central.state.dirname(),
+            "outcome": central.outcome,
+            "error": central.reason,
+            "created_ms": now_ms(),
+        });
+        let mut status = self.central_status_base(central.action_id, central.state)?;
+        let status_obj = status.as_object_mut().expect("central status is object");
+        status_obj.insert("outcome".into(), serde_json::json!(central.outcome));
+        status_obj.insert("error".into(), serde_json::json!(central.reason));
+        self.outbox.write_central_action_artifact(
+            central.action_id,
+            central.state,
+            "result.json",
+            &serde_json::to_vec_pretty(&result).unwrap(),
+        )?;
+        self.outbox.write_central_action_artifact(
+            central.action_id,
+            central.state,
+            "status.json",
+            &serde_json::to_vec_pretty(&status).unwrap(),
+        )?;
+        Ok(())
+    }
+
+    fn central_status_base(
+        &self,
+        action_id: &str,
+        state: OutboxState,
+    ) -> Result<serde_json::Value, TxEngineError> {
+        let mut status = self
+            .outbox
+            .read_central_action_artifact(action_id, state, "status.json")?
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .filter(|value| value.is_object())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let status_obj = status.as_object_mut().expect("central status is object");
+        status_obj.insert("action_id".into(), serde_json::json!(action_id));
+        status_obj.insert("state".into(), serde_json::json!(state.dirname()));
+        Ok(status)
     }
 
     fn write_reconcile_ambiguous(
@@ -2212,6 +2268,16 @@ impl TxEngine {
         chain: &str,
         action_id: &str,
     ) -> Option<std::path::PathBuf> {
+        self.find_pending_entry_for_action(wallet, chain, action_id)
+            .map(|entry| entry.dir)
+    }
+
+    fn find_pending_entry_for_action(
+        &self,
+        wallet: &str,
+        chain: &str,
+        action_id: &str,
+    ) -> Option<crate::outbox::OutboxEntry> {
         let ids = self.outbox.list(wallet, chain, OutboxState::Pending).ok()?;
         for id in ids {
             let Ok(entry) = self.outbox.read(wallet, chain, &id) else {
@@ -2221,10 +2287,89 @@ impl TxEngine {
             let matches = staged.action_id.as_deref() == Some(action_id)
                 || format!("{}:{}", staged.chain_id, staged.id) == action_id;
             if matches {
-                return Some(entry.dir);
+                return Some(entry);
             }
         }
         None
+    }
+
+    fn transition_sealed_wallet_entry_sent(
+        &self,
+        wallet: &str,
+        chain: &str,
+        action_id: &str,
+        tx_hash: B256,
+    ) -> Result<bool, TxEngineError> {
+        let Some(entry) = self.find_pending_entry_for_action(wallet, chain, action_id) else {
+            return Ok(false);
+        };
+        let mut staged = entry.staged.clone();
+        staged.status = TxStatus::Sent;
+        staged.tx_hash = Some(format!("{:#x}", tx_hash));
+        let new_dir = self.outbox.transition(&entry, OutboxState::Sent)?;
+        self.outbox.write_artefact(
+            &new_dir,
+            "intent.json",
+            &serde_json::to_vec_pretty(&staged).unwrap(),
+        )?;
+        self.outbox.write_artefact(
+            &new_dir,
+            "tx_hash",
+            staged.tx_hash.as_ref().unwrap().as_bytes(),
+        )?;
+        Ok(true)
+    }
+
+    pub fn project_sealed_action_execute_failure(
+        &self,
+        sealed: &SealedAction,
+        chain_name: &str,
+        reason: impl AsRef<str>,
+    ) -> Result<(), TxEngineError> {
+        let action_id = sealed.action_id();
+        let wallet = sealed.wallet();
+        let reason = reason.as_ref();
+        let transitioned_wallet = if let Some(entry) =
+            self.find_pending_entry_for_action(wallet, chain_name, action_id)
+        {
+            let mut staged = entry.staged.clone();
+            staged.status = TxStatus::Failed;
+            let new_dir = self.outbox.transition(&entry, OutboxState::Failed)?;
+            self.outbox.write_artefact(
+                &new_dir,
+                "intent.json",
+                &serde_json::to_vec_pretty(&staged).unwrap(),
+            )?;
+            self.outbox.write_artefact(
+                &new_dir,
+                "result.json",
+                &serde_json::to_vec_pretty(&serde_json::json!({
+                    "schema": "bloom.evm_execution_result.v1",
+                    "action_id": action_id,
+                    "state": OutboxState::Failed.dirname(),
+                    "outcome": "failed",
+                    "error": reason,
+                    "created_ms": now_ms(),
+                }))
+                .unwrap(),
+            )?;
+            true
+        } else {
+            false
+        };
+        if !transitioned_wallet {
+            self.outbox.transition_central_action(
+                action_id,
+                OutboxState::Pending,
+                OutboxState::Failed,
+            )?;
+        }
+        self.write_central_evm_failure_result(EvmCentralFailure {
+            action_id,
+            state: OutboxState::Failed,
+            outcome: "failed",
+            reason,
+        })
     }
 
     /// Persist `approval.json` for a completed daemon-owned Interaction Mode 3
@@ -2268,18 +2413,12 @@ impl TxEngine {
         // the challenge is mirrored). No-op when no projection is attached, but
         // a real write error must not be swallowed — a silent allowlist reject
         // is exactly what previously kept approval.json out of the central dir.
-        if let Err(e) = self.outbox.write_central_action_artifact(
+        self.outbox.write_central_action_artifact(
             action_id,
             OutboxState::Pending,
             OUTBOX_APPROVAL_FILE,
             &body,
-        ) {
-            tracing::warn!(
-                err = %e,
-                action_id,
-                "ceremony.approval.central_projection_failed: approval.json not mirrored to the central outbox"
-            );
-        }
+        )?;
         if !persisted {
             tracing::warn!(
                 wallet,
@@ -2407,11 +2546,18 @@ impl TxEngine {
                     .unwrap_or_else(|| "<none>".into()),
             });
         }
-        self.outbox.transition_central_action(
+        if !self.transition_sealed_wallet_entry_sent(
+            &subject.wallet,
+            chain_name,
             &subject.action_id,
-            OutboxState::Pending,
-            OutboxState::Sent,
-        )?;
+            signed.hash,
+        )? {
+            self.outbox.transition_central_action(
+                &subject.action_id,
+                OutboxState::Pending,
+                OutboxState::Sent,
+            )?;
+        }
         self.write_central_evm_result(EvmCentralResult {
             action_id: &subject.action_id,
             state: OutboxState::Sent,

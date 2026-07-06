@@ -243,6 +243,10 @@ pub trait CentralOutboxProjection: Send + Sync {
         file: &str,
         data: &[u8],
     ) -> Result<(), String>;
+
+    /// Read a runtime-generated artifact from a central action directory.
+    fn read_action_file(&self, action_id: &str, state: &str, file: &str)
+    -> Result<Vec<u8>, String>;
 }
 
 #[derive(Clone)]
@@ -313,6 +317,34 @@ impl Outbox {
                 .map_err(OutboxError::Other)?;
         }
         Ok(())
+    }
+
+    /// Read a runtime-generated action artifact from the central outbox
+    /// projection, when one is attached.
+    pub fn read_central_action_artifact(
+        &self,
+        action_id: &str,
+        state: OutboxState,
+        file: &str,
+    ) -> Result<Option<Vec<u8>>, OutboxError> {
+        if file != "approval_challenge.json"
+            && file != "approval.json"
+            && file != "result.json"
+            && file != "status.json"
+        {
+            return Err(OutboxError::Other(format!(
+                "central artifact '{file}' is not runtime-readable"
+            )));
+        }
+        if let Some(projection) = &self.inner.projection {
+            match projection.read_action_file(action_id, state.dirname(), file) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(e) if e.contains("not found") => Ok(None),
+                Err(e) => Err(OutboxError::Other(e)),
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     /// Mirror a runtime-generated pending action artifact into the central
@@ -1607,6 +1639,15 @@ mod tests {
                 file.to_string(),
             ));
             Ok(())
+        }
+
+        fn read_action_file(
+            &self,
+            _action_id: &str,
+            _state: &str,
+            _file: &str,
+        ) -> Result<Vec<u8>, String> {
+            Err("not found".into())
         }
     }
 

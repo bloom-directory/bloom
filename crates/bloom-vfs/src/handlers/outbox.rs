@@ -238,6 +238,35 @@ impl CentralOutbox {
         std::fs::write(dir.join(file), data)
     }
 
+    /// Read a runtime-generated artifact from an existing central action
+    /// directory. Uses the same allowlist as [`CentralOutbox::write_action_file`].
+    pub fn read_action_file(
+        &self,
+        action_id: &str,
+        state: &str,
+        file: &str,
+    ) -> std::io::Result<Vec<u8>> {
+        validate_action_id(action_id)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        if !matches!(
+            file,
+            "approval_challenge.json" | "approval.json" | "result.json" | "status.json"
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("runtime artifact '{file}' is not readable"),
+            ));
+        }
+        let dir = self.action_dir(state, action_id);
+        if !dir.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("action {action_id} not found in {state}"),
+            ));
+        }
+        std::fs::read(dir.join(file))
+    }
+
     /// Find which state an action is in, scanning all states.
     pub fn find_state(&self, action_id: &str) -> Option<&str> {
         STATES
