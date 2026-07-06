@@ -44,6 +44,45 @@ fn now_ms() -> u128 {
 /// a `u16` alone would admit 655.35% slippage.
 const MAX_FUND_SLIPPAGE_BPS: u16 = 1000;
 
+fn polymarket_gamma_client(pm_cfg: &bloom_proto::config::PolymarketConfig) -> GammaClient {
+    let mut gamma = GammaClient::new();
+    if let Ok(url) = url::Url::parse(&pm_cfg.gamma_url) {
+        gamma = gamma.with_base_url(url);
+    }
+    gamma
+}
+
+fn polymarket_clob_client(pm_cfg: &bloom_proto::config::PolymarketConfig) -> ClobClient {
+    let mut clob = ClobClient::new(pm_cfg.chain_id);
+    if let Ok(url) = url::Url::parse(&pm_cfg.clob_url) {
+        clob = clob.with_base_url(url);
+    }
+    clob
+}
+
+fn polymarket_data_client(pm_cfg: &bloom_proto::config::PolymarketConfig) -> DataClient {
+    let mut data = DataClient::new();
+    if let Ok(url) = url::Url::parse(&pm_cfg.data_url) {
+        data = data.with_base_url(url);
+    }
+    data
+}
+
+fn polymarket_geoblock_client(pm_cfg: &bloom_proto::config::PolymarketConfig) -> GeoblockClient {
+    let Ok(base) = url::Url::parse(&pm_cfg.gamma_url) else {
+        return GeoblockClient::new();
+    };
+    let host = base.host_str().unwrap_or_default();
+    let is_local = matches!(host, "127.0.0.1" | "localhost" | "::1");
+    if !is_local {
+        return GeoblockClient::new();
+    }
+    match base.join("/api/geoblock") {
+        Ok(url) => GeoblockClient::new().with_base_url_for_tests(url.to_string()),
+        Err(_) => GeoblockClient::new(),
+    }
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -57,34 +96,6 @@ fn home_write_permit(d: &Daemon) -> Result<&HomeWritePermit> {
             "daemon was built without a home write permit; refusing EVM outbox mutation"
         )
     })
-}
-
-fn persist_outbox_review_approved(
-    d: &Daemon,
-    wallet: &str,
-    chain_name: &str,
-    id: &str,
-    review_hash: &str,
-) -> Result<()> {
-    let entry = d
-        .tx_engine
-        .outbox
-        .read(wallet, chain_name, id)
-        .with_context(|| format!("read outbox entry {id} before writing review approval"))?;
-    let approved = serde_json::json!({
-        "schema": "bloom.review_approved.v1",
-        "intent_hash": review_hash,
-        "approved_ms": now_ms(),
-    });
-    d.tx_engine
-        .outbox
-        .write_artefact(
-            &entry.dir,
-            "review_approved.json",
-            &serde_json::to_vec_pretty(&approved)?,
-        )
-        .with_context(|| format!("write review approval marker for staged tx {id}"))?;
-    Ok(())
 }
 
 /// Arguments shared by `order` (buy) and `sell`.
@@ -144,8 +155,8 @@ fn evaluate_policy(
 }
 
 /// Geoblock gate, differentiated by what the operation does to risk.
-async fn geoblock_gate(side: Side) -> Result<()> {
-    match GeoblockClient::new().check().await {
+async fn geoblock_gate(pm_cfg: &bloom_proto::config::PolymarketConfig, side: Side) -> Result<()> {
+    match polymarket_geoblock_client(pm_cfg).check().await {
         Ok(geo) if geo.blocked => {
             // Affirmative block: no new trades, buy or sell. (Cancel has its
             // own warn-only path — retracting an offer is not a trade.)
@@ -288,8 +299,8 @@ pub async fn place(d: &Daemon, args: PlaceArgs) -> Result<()> {
         bail!("GTD orders are not supported (no expiration plumbing)");
     }
 
-    let gamma = GammaClient::new();
-    let clob = ClobClient::new(pm_cfg.chain_id);
+    let gamma = polymarket_gamma_client(pm_cfg);
+    let clob = polymarket_clob_client(pm_cfg);
     let snap = trade::snapshot(&gamma, &clob, &args.slug, &args.outcome).await?;
 
     // Sell-to-close only: never sell more than current holdings. Positions
@@ -384,11 +395,11 @@ async fn execute(
         .context("no [polymarket] block in config.toml")?;
 
     let _lock = store.lock(&draft.wallet)?;
-    geoblock_gate(draft.side).await?;
+    geoblock_gate(pm_cfg, draft.side).await?;
 
     // Revalidate everything against the live market; the draft is a snapshot.
-    let gamma = GammaClient::new();
-    let clob = ClobClient::new(pm_cfg.chain_id);
+    let gamma = polymarket_gamma_client(pm_cfg);
+    let clob = polymarket_clob_client(pm_cfg);
     let snap = trade::snapshot(&gamma, &clob, &draft.slug, &draft.outcome).await?;
     if snap.token_id != draft.token_id {
         bail!("token id changed between draft and confirm — refusing");
@@ -1909,7 +1920,6 @@ pub async fn fund(d: &Daemon, args: FundArgs) -> Result<()> {
         "signing the staged funding tx(s) above (passkey review hash {}).",
         intent.intent_hash()
     );
-    let reviewed_intent_hash = intent.intent_hash();
     // Persist the full reviewed intent into each staged tx's outbox dir; the
     // pending → sent transition renames the dir, so the artifact rides along.
     if let Ok(bytes) = serde_json::to_vec_pretty(&intent) {
@@ -1923,10 +1933,6 @@ pub async fn fund(d: &Daemon, args: FundArgs) -> Result<()> {
         }
     }
     unlock_wallet_with_intent(d, &args.wallet, args.passphrase.as_deref(), Some(intent)).await?;
-    for id in &staged_ids {
-        persist_outbox_review_approved(d, &args.wallet, &chain_name, id, &reviewed_intent_hash)?;
-    }
-    let signer = d.keystore.signer(&args.wallet)?;
     let confirm_text = if any_warn {
         info.policy.override_sentinel().to_string()
     } else {
@@ -1942,10 +1948,8 @@ pub async fn fund(d: &Daemon, args: FundArgs) -> Result<()> {
                 &chain_name,
                 id,
                 &chain,
-                &signer,
                 &info.policy,
                 &confirm_text,
-                Some(&reviewed_intent_hash),
             )
             .await
             .with_context(|| format!("confirm staged tx {id}"))
@@ -2119,7 +2123,6 @@ async fn transfer_pusd_to_funding(
         "signing the staged pUSD transfer above (passkey review hash {}).",
         intent.intent_hash()
     );
-    let reviewed_intent_hash = intent.intent_hash();
     // Persist the full reviewed intent into the staged tx's outbox dir so it
     // rides the pending → sent rename alongside the durable tx record.
     if let Ok(bytes) = serde_json::to_vec_pretty(&intent)
@@ -2134,14 +2137,6 @@ async fn transfer_pusd_to_funding(
             .write_artefact(&entry.dir, "review_intent.json", &bytes);
     }
     unlock_wallet_with_intent(d, &args.wallet, args.passphrase.as_deref(), Some(intent)).await?;
-    persist_outbox_review_approved(
-        d,
-        &args.wallet,
-        chain_name,
-        &staged.id,
-        &reviewed_intent_hash,
-    )?;
-    let signer = d.keystore.signer(&args.wallet)?;
     let confirm_text = if any_warn {
         info.policy.override_sentinel().to_string()
     } else {
@@ -2155,10 +2150,8 @@ async fn transfer_pusd_to_funding(
             chain_name,
             &staged.id,
             chain,
-            &signer,
             &info.policy,
             &confirm_text,
-            Some(&reviewed_intent_hash),
         )
         .await
         .with_context(|| format!("confirm staged tx {}", staged.id))
@@ -2442,7 +2435,7 @@ pub async fn redeem(
         .parse()
         .context("corrupt deposit_wallet in onboarding state")?;
     let funder_s = bloom_proto::checksum_address(&deposit_wallet);
-    let gamma = GammaClient::new();
+    let gamma = polymarket_gamma_client(pm_cfg);
     let market = gamma
         .market_by_slug(slug)
         .await
@@ -2466,7 +2459,7 @@ pub async fn redeem(
         .context("market has no YES token id")?;
     let no = market.no_token_id().context("market has no NO token id")?;
 
-    let data = DataClient::new();
+    let data = polymarket_data_client(pm_cfg);
     let positions = data
         .positions(&funder_s)
         .await
@@ -3060,7 +3053,7 @@ pub async fn cancel(d: &Daemon, wallet: &str, order_id: &str) -> Result<()> {
         .as_ref()
         .context("no [polymarket] block in config.toml")?;
 
-    match GeoblockClient::new().check().await {
+    match polymarket_geoblock_client(pm_cfg).check().await {
         Ok(geo) if geo.blocked => {
             eprintln!("warning: geoblock reports blocked; cancel proceeds (risk-reducing)");
         }
@@ -3075,7 +3068,7 @@ pub async fn cancel(d: &Daemon, wallet: &str, order_id: &str) -> Result<()> {
 
     let store = OrderStore::new(d.home.polymarket_dir());
     let _lock = store.lock(wallet)?;
-    let clob = ClobClient::new(pm_cfg.chain_id);
+    let clob = polymarket_clob_client(pm_cfg);
     let result = clob
         .cancel_order(&creds, info.address, order_id)
         .await

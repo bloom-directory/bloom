@@ -216,8 +216,19 @@ it expire after the configured TTL) cancels the stage.
   owner-signed writes at `/hyperliquid/<network>/exchange/<wallet>/...`
   labeled ADVANCED. Read `/hyperliquid/README.md`.
 - **Polymarket** — prediction-market trading via CLI (`bloom polymarket
-  ...`). VFS staging at `/polymarket/...`. A capability primitive
-  (scoped approve, TTL, caps) is in active development — see
+  ...`). VFS staging at `/polymarket/...`; pUSD funding requests can be
+  confirmed with `bloom vfs write /polymarket/fund/<wallet>/<id>/confirm
+  --unlock-wallet <wallet> --data confirm`, and trade drafts can be posted with
+  `bloom vfs write /polymarket/trade/<wallet>/drafts/<id>/confirm
+  --unlock-wallet <wallet> --data confirm`. Exit actions also have VFS parity:
+  cancel runs directly at `/polymarket/trade/<wallet>/orders/<order-id>/cancel`
+  (no unlock — risk-reducing, CLOB creds only), while redeem, revoke-approvals,
+  and pUSD withdraw are owner-signed and confirm through the foreground path
+  (`/polymarket/redeem/<wallet>/<slug>/confirm`,
+  `/polymarket/revoke-approvals/<wallet>/request/confirm`,
+  `/polymarket/withdraw/<wallet>/pusd/confirm` with
+  `--data '{"confirm":true,"amount":"..."}'`). A capability primitive (scoped
+  approve, TTL, caps) is in active development — see
   `docs/plans/2026-06-20-agent-obvious-capability-model.md`.
   Read `/polymarket/README.md`.
 - **Zero-config chain reads** — Ethereum, Base, Arbitrum, Optimism,
@@ -250,9 +261,11 @@ home. Exit the subshell to tear everything down.
 
 ## End-to-end acceptance
 
-`scripts/acceptance.sh` boots Anvil, imports the funded test key, and
-drives a native ETH send and an ERC-20 transfer through the
-stage-confirm-broadcast loop on a local devnet. Optional Uniswap V2 /
+`scripts/acceptance.sh` boots Anvil, imports the funded test key, stages a
+native ETH send and an ERC-20 transfer, and verifies the mounted Sealed
+Approval gate: initial confirm is denied, `approval_challenge.json` is
+written in both the wallet projection and central `/outbox/pending/<action_id>`
+store, and the challenge includes a local `ceremony_url`. Optional Uniswap V2 /
 Enso scenarios on a mainnet fork run when `BLOOM_MAINNET_RPC` is set.
 
 `tests/docker/run.sh` is the dockerized harness with six modes:

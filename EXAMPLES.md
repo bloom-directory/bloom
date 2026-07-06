@@ -723,13 +723,13 @@ cat <<'EOF' > /bloom/wallets/alice/chains/anvil/outbox/new.tx
 }
 EOF
 
-# ERC-20 transfer (token + value with a unit triggers ERC-20 encoding).
+# ERC-20 transfer (token + amount triggers ERC-20 encoding).
 # Below: send 10 USDC on Base to a test recipient.
 cat <<'EOF' > /bloom/wallets/alice/chains/base/outbox/new.tx
 {
   "kind": "send",
   "to": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-  "value": "10",
+  "amount": "10",
   "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
   "chain": "base"
 }
@@ -1582,9 +1582,13 @@ echo '{"asset":"ETH","is_cross":false,"leverage":5}' \
 
 ## 17. Polymarket trading
 
-Prediction-market trading via the `bloom polymarket ...` CLI. VFS surface
-at `/polymarket/` is staging and read-only review; signing lives in the CLI.
-Read `/polymarket/README.md` for the full safety model.
+Prediction-market trading via the `bloom polymarket ...` CLI plus the
+`/polymarket/` VFS surface. VFS can stage trade drafts and pUSD funding
+requests; funding requests can be confirmed with foreground
+`bloom vfs write --unlock-wallet`. Trade drafts can be posted through the same
+foreground VFS pattern, which dispatches to the same execution path as
+`bloom polymarket confirm`. Read `/polymarket/README.md` for the full safety
+model.
 
 ### Quick path
 
@@ -1595,6 +1599,15 @@ bloom polymarket onboard <wallet>
 # 2) Fund (send pUSD to the deposit wallet)
 bloom polymarket fund <wallet> --target-pusd 10 --max-spend 100
 
+# Or stage/review a funding request through VFS, then execute the same request
+# through the foreground CLI VFS path.
+bloom vfs write /polymarket/fund/<wallet>/new \
+  --data '{"target_pusd":"10","max_spend":"100","from_token":"native","slippage_bps":50}'
+cat /bloom/polymarket/fund/<wallet>/<fund-id>/plan.md
+bloom vfs write /polymarket/fund/<wallet>/<fund-id>/confirm \
+  --unlock-wallet <wallet> \
+  --data confirm
+
 # 3) Stage a draft in the VFS
 echo '{"slug":"will-canada-win-2026-world-cup-755",
   "outcome":"yes","amount":"1","max_price":"0.01"}' \
@@ -1603,7 +1616,32 @@ echo '{"slug":"will-canada-win-2026-world-cup-755",
 cat /bloom/polymarket/trade/<wallet>/drafts/<id>/plan.md
 
 # 4) Confirm (requires unlock or passkey ceremony per trade)
+bloom vfs write /polymarket/trade/<wallet>/drafts/<id>/confirm \
+  --unlock-wallet <wallet> \
+  --data confirm
+
+# Equivalent dedicated CLI command:
 bloom polymarket confirm <wallet> <id>
+
+# 5) Cancel a resting order — risk-reducing, runs directly in the VFS (no unlock)
+bloom vfs write /polymarket/trade/<wallet>/orders/<order-id> \
+  --data confirm
+# Equivalent: bloom polymarket cancel <wallet> <order-id>
+
+# 6) Exit actions after resolution (owner-signed → foreground CLI VFS path)
+bloom polymarket redeem <wallet> <slug> --dry-run        # print the plan first
+bloom vfs write /polymarket/redeem/<wallet>/<slug>/confirm \
+  --unlock-wallet <wallet> --data confirm
+# Equivalent: bloom polymarket redeem <wallet> <slug>
+
+bloom vfs write /polymarket/withdraw/<wallet>/pusd/confirm \
+  --unlock-wallet <wallet> \
+  --data '{"confirm":true,"amount":"all"}'
+# Equivalent: bloom polymarket withdraw-pusd <wallet> all
+
+bloom vfs write /polymarket/revoke-approvals/<wallet>/request/confirm \
+  --unlock-wallet <wallet> --data confirm
+# Equivalent: bloom polymarket revoke-approvals <wallet>
 ```
 
 A Polymarket capability primitive (scoped approve, TTL, caps,

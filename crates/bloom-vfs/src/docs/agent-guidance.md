@@ -40,12 +40,49 @@ bloom gatekeeps every value-moving action through capabilities:
 To see what a wallet can do without a human, check its per-chain state and
 outbox, or its Hyperliquid sessions under `/hyperliquid/<net>/agent_sessions/`.
 A read-only `/wallets/<wallet>/capabilities/` roll-up and a VFS-root `/next.md`
-aggregator are in active development (see
-`docs/plans/2026-06-20-agent-obvious-capability-model.md`).
+aggregator expose the current capability and next-action view when the daemon
+has the relevant handlers mounted.
 
 Read `/hyperliquid/README.md` for Hyperliquid trading (session-first).
 Read `/polymarket/README.md` for prediction-market trading.
 Read `/defi/README.md` for DeFi intents via Enso shortcuts.
+
+## Mounted Sealed Approval flow
+
+When working through a mounted tree, a confirm write that needs fresh owner
+approval does **not** open a browser by itself. The daemon exposes the challenge
+first, then denies the triggering write so the writing agent can deliberately
+open or forward the ceremony URL.
+
+Expected mounted flow for value-moving outbox actions:
+
+```sh
+# 1. Stage a Petal action, then discover its concrete central action id.
+ls /bloom/outbox/pending
+cat /bloom/outbox/pending/<action_id>/plan.md
+
+# 2. Confirm through the Petal projection. This should fail with permission denied
+#    after the daemon writes approval_challenge.json.
+printf 'confirm\n' > /bloom/wallets/<wallet>/chains/<chain>/outbox/pending/<id>/confirm
+
+# 3. Read the challenge from the same central action directory.
+cat /bloom/outbox/pending/<action_id>/approval_challenge.json
+```
+
+Before opening the ceremony, verify that `approval_challenge.json` has the same
+`action_id` as the directory you are acting on and that `expiry_ms` is still in
+the future. Then open or forward `ceremony_url`.
+
+The ceremony page offers two modes:
+
+- **grant**: mints only an in-memory daemon grant. Retry the same mounted
+  confirm write to execute from the sealed bytes.
+- **grant + execute**: mints the grant and executes immediately in the daemon.
+
+After execution, inspect `/outbox/sent/<action_id>/` or
+`/outbox/failed/<action_id>/` for `status.json`, `result.json`, and audit/result
+artifacts. Petal-specific wallet paths are projections of the same central
+action id; do not treat them as separate approval queues.
 
 ## Paid HTTP
 
@@ -123,7 +160,8 @@ Prediction-market trading lives under `/polymarket` and is driven by the
 trades only after `[polymarket] enabled = true` is set in its `policy.toml`, and
 today every value-moving action opens a fresh passkey review ceremony. A
 Polymarket capability primitive (scoped approve, TTL, caps) is in active
-development — see `docs/plans/2026-06-20-agent-obvious-capability-model.md`.
+development; until it lands, treat Polymarket value-moving actions as
+human-gated.
 
 Start at `/docs/examples.md` (the Polymarket section) and read
 `docs/polymarket-integration.md` in the repo for the full spec. Funds move only

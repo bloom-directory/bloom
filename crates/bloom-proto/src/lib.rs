@@ -8,6 +8,7 @@
 
 pub mod address;
 pub mod audit;
+pub mod audit_ext;
 pub mod capability;
 pub mod ceremony;
 pub mod chain;
@@ -28,6 +29,7 @@ pub mod units;
 
 pub use address::{AddressBook, AddressBookError, checksum_address, parse_address};
 pub use audit::{AuditLog, AuditRecord};
+pub use audit_ext::{append_auth_event, auth_event};
 pub use capability::{CapabilityStatus, CapabilityViewEntry, SigningModel, Venue};
 pub use ceremony::{CeremonyIntent, CeremonyIntentKind, policy_session_mint_intent};
 pub use chain::{ChainId, ChainRef, ChainSpec, EndpointSpec, default_endpoint_weight};
@@ -50,9 +52,11 @@ pub use intent::{
 };
 pub use plan::{NftAction, NftRef, PlanRender, StagedTx, TokenRef, TxStatus};
 pub use policy::{
-    AgentAutonomyMode, ApprovalPolicy, AuthorizationSubject, AuthorizationSurface,
-    AutonomyDecision, BroadcastApprovalDecision, BudgetSnapshot, LimitsPolicy, Policy, PolicyCheck,
-    PolicyOutcome, evaluate_action_authorization, evaluate_broadcast_approval, has_deny, has_warn,
+    AgentAutonomyMode, ApprovalPolicy, ApprovalStepUpPolicy, AuthorizationSubject,
+    AuthorizationSurface, AutonomyDecision, BudgetSnapshot, LimitsPolicy, Policy, PolicyCheck,
+    PolicyEditClass, PolicyOutcome, PolicyRuleClass, StepUpRuleCeiling,
+    StepUpRuleCeilingValidation, classify_policy_edit, evaluate_action_authorization, has_deny,
+    has_soft_violation, has_warn, validate_step_up_rule_ceilings,
 };
 pub use polymarket_policy::{
     PolicySide, PolymarketOrderCtx, PolymarketPolicy, evaluate_polymarket_order,

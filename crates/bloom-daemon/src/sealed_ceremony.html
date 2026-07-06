@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bloom Sealed Approval</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         max-width: 640px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.3rem; }
+  .card { border: 1px solid rgba(128,128,128,.35); border-radius: 10px; padding: 1rem 1.2rem; margin: 1rem 0; }
+  .plan { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+          font-size: .9rem; background: rgba(128,128,128,.1); padding: .8rem; border-radius: 8px; }
+  .kv { font-family: ui-monospace, monospace; font-size: .82rem; word-break: break-all; }
+  .kv b { font-family: inherit; }
+  button { font-size: 1rem; padding: .6rem 1rem; border-radius: 8px; border: 1px solid rgba(128,128,128,.5);
+           cursor: pointer; margin-right: .6rem; margin-top: .4rem; }
+  button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { margin-top: 1rem; font-weight: 600; }
+  .ok { color: #16a34a; } .err { color: #dc2626; }
+  .muted { opacity: .7; font-size: .85rem; }
+</style>
+</head>
+<body>
+<h1>Bloom Sealed Approval</h1>
+<p class="muted">Review the daemon-produced plan below. Approving runs a passkey
+ceremony on this device. Bloom never opens this page for you — you opened it
+deliberately from a challenge you were expecting.</p>
+
+<div class="card">
+  <div id="meta" class="kv"></div>
+  <div class="plan" id="plan">Loading plan…</div>
+</div>
+
+<div class="card">
+  <button id="grant" class="primary" disabled>Approve (grant only)</button>
+  <button id="grantExecute" disabled>Approve &amp; execute now</button>
+  <div class="muted">“Approve (grant only)” mints an in-memory grant; the action
+  executes when the client retries. “Approve &amp; execute now” broadcasts
+  immediately after approval.</div>
+  <div id="status"></div>
+</div>
+
+<script>
+const PATH = location.pathname.replace(/\/$/, "");
+function dec(s){ s=s.replace(/-/g,'+').replace(/_/g,'/'); while(s.length%4)s+='='; const b=atob(s); const u=new Uint8Array(b.length); for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i); return u; }
+function enc(buf){ const u=new Uint8Array(buf); let s=''; for(let i=0;i<u.length;i++)s+=String.fromCharCode(u[i]); return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''); }
+
+async function loadPlan(){
+  const r = await fetch(PATH + "/plan.json");
+  if(!r.ok){
+    document.getElementById('plan').textContent =
+      r.status===410 ? "This approval URL has expired or was already used."
+      : r.status===404 ? "Unknown approval URL."
+      : "Could not load the approval plan.";
+    return;
+  }
+  const p = await r.json();
+  document.getElementById('meta').innerHTML =
+    "<div><b>wallet</b>: "+p.wallet+"</div>"+
+    "<div><b>action_id</b>: "+p.action_id+"</div>"+
+    "<div><b>intent_hash</b>: "+p.intent_hash+"</div>"+
+    "<div><b>assurance</b>: "+p.assurance+"</div>";
+  document.getElementById('plan').textContent = p.plan && p.plan.length ? p.plan : "(no plan text)";
+  document.getElementById('grant').disabled = false;
+  document.getElementById('grantExecute').disabled = false;
+}
+
+async function approve(mode){
+  const st = document.getElementById('status');
+  const g = document.getElementById('grant'), ge = document.getElementById('grantExecute');
+  g.disabled = true; ge.disabled = true;
+  st.className = ''; st.textContent = 'Waiting for passkey (Touch ID / security key)…';
+  try{
+    if(!navigator.credentials || !navigator.credentials.get) throw new Error('WebAuthn not available in this browser');
+    const opts = await (await fetch(PATH + "/challenge")).json();
+    opts.publicKey.challenge = dec(opts.publicKey.challenge);
+    if(opts.publicKey.allowCredentials)
+      opts.publicKey.allowCredentials = opts.publicKey.allowCredentials.map(c=>({...c, id:dec(c.id)}));
+    if(opts.publicKey.extensions && opts.publicKey.extensions.prf && opts.publicKey.extensions.prf.eval && opts.publicKey.extensions.prf.eval.first)
+      opts.publicKey.extensions.prf.eval.first = dec(opts.publicKey.extensions.prf.eval.first);
+    const cred = await navigator.credentials.get(opts);
+    const ext = cred.getClientExtensionResults();
+    const prfFirst = ext && ext.prf && ext.prf.results && ext.prf.results.first;
+    if(!prfFirst) throw new Error('PRF output not returned by this authenticator. Supported: Touch ID (macOS/iOS), Windows Hello (Chrome 147+), YubiKey 5+.');
+    const clientDataJSON = enc(cred.response.clientDataJSON);
+    const body = {
+      mode: mode,
+      credential: {
+        id: cred.id, rawId: enc(cred.rawId), type: cred.type,
+        response: {
+          authenticatorData: enc(cred.response.authenticatorData),
+          clientDataJSON: clientDataJSON,
+          signature: enc(cred.response.signature),
+          userHandle: cred.response.userHandle ? enc(cred.response.userHandle) : null
+        }
+      },
+      prf_output_b64: enc(prfFirst),
+      prf_client_data_json_b64: clientDataJSON
+    };
+    const r = await fetch(PATH + "/complete", { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    const out = await r.json().catch(()=>({}));
+    if(!r.ok || !out.ok){
+      st.className = 'err';
+      st.textContent = 'Approval failed: ' + (out.error || ('HTTP '+r.status));
+      g.disabled = false; ge.disabled = false;
+      return;
+    }
+    st.className = 'ok';
+    st.textContent = out.executed
+      ? ('Approved and executed. tx_hash=' + (out.tx_hash || '?') + '. You can close this tab.')
+      : 'Approved. Grant minted — the client can now execute. You can close this tab.';
+  }catch(e){
+    st.className = 'err';
+    st.textContent = 'Error: ' + (e && e.message ? e.message : e);
+    g.disabled = false; ge.disabled = false;
+  }
+}
+document.getElementById('grant').addEventListener('click', ()=>approve('grant'));
+document.getElementById('grantExecute').addEventListener('click', ()=>approve('grant_execute'));
+loadPlan().catch(e=>{ document.getElementById('plan').textContent = 'Error: '+e.message; });
+</script>
+</body>
+</html>

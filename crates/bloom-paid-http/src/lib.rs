@@ -522,7 +522,29 @@ pub fn extract_realm(s: &str) -> Option<String> {
 pub struct PolicyCheck {
     pub rule: String,
     pub result: String,
+    #[serde(default)]
+    pub class: PolicyRuleClass,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyRuleClass {
+    Informational,
+    Soft,
+    #[default]
+    Hard,
+}
+
+impl PolicyRuleClass {
+    fn for_result(result: &str) -> Self {
+        match result {
+            "pass" => Self::Informational,
+            "warn" => Self::Soft,
+            "deny" => Self::Hard,
+            _ => Self::Hard,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -714,16 +736,17 @@ pub fn evaluate_payment_policy(policy: &Policy, input: PolicyEvalInput<'_>) -> V
 }
 
 fn push_check(out: &mut Vec<PolicyCheck>, rule: &str, pass_ok: bool, detail: String, warn: bool) {
+    let result = if pass_ok {
+        "pass"
+    } else if warn {
+        "warn"
+    } else {
+        "deny"
+    };
     out.push(PolicyCheck {
         rule: rule.into(),
-        result: if pass_ok {
-            "pass"
-        } else if warn {
-            "warn"
-        } else {
-            "deny"
-        }
-        .into(),
+        result: result.into(),
+        class: PolicyRuleClass::for_result(result),
         detail,
     });
 }
@@ -732,6 +755,7 @@ fn pass(rule: &str, detail: impl Into<String>) -> PolicyCheck {
     PolicyCheck {
         rule: rule.into(),
         result: "pass".into(),
+        class: PolicyRuleClass::Informational,
         detail: detail.into(),
     }
 }
@@ -739,6 +763,7 @@ fn warn_check(rule: &str, detail: impl Into<String>) -> PolicyCheck {
     PolicyCheck {
         rule: rule.into(),
         result: "warn".into(),
+        class: PolicyRuleClass::Soft,
         detail: detail.into(),
     }
 }
@@ -746,6 +771,7 @@ fn deny(rule: &str, detail: impl Into<String>) -> PolicyCheck {
     PolicyCheck {
         rule: rule.into(),
         result: "deny".into(),
+        class: PolicyRuleClass::Hard,
         detail: detail.into(),
     }
 }
@@ -823,19 +849,23 @@ pub fn evaluate_session_policy(
         out.push(PolicyCheck {
             rule: "payments.sessions.enabled".into(),
             result: "deny".into(),
+            class: PolicyRuleClass::Hard,
             detail: "wallet policy has not enabled payment sessions".into(),
         });
     } else {
         out.push(PolicyCheck {
             rule: "payments.sessions.enabled".into(),
             result: "pass".into(),
+            class: PolicyRuleClass::Informational,
             detail: "payment sessions enabled".into(),
         });
     }
     if let (Some(deposit), Some(cap)) = (challenge.deposit_usd, sessions.max_deposit_usd) {
+        let result = if deposit > cap { "deny" } else { "pass" };
         out.push(PolicyCheck {
             rule: "payments.sessions.max_deposit_usd".into(),
-            result: if deposit > cap { "deny" } else { "pass" }.into(),
+            result: result.into(),
+            class: PolicyRuleClass::for_result(result),
             detail: format!(
                 "{} {} {}",
                 trim_money(deposit),
@@ -846,9 +876,11 @@ pub fn evaluate_session_policy(
     }
     if let (Some(amount), Some(cap)) = (challenge.amount_usd, sessions.max_session_spend_usd) {
         let projected = already_spent_usd + amount;
+        let result = if projected > cap { "deny" } else { "pass" };
         out.push(PolicyCheck {
             rule: "payments.sessions.max_session_spend_usd".into(),
-            result: if projected > cap { "deny" } else { "pass" }.into(),
+            result: result.into(),
+            class: PolicyRuleClass::for_result(result),
             detail: format!(
                 "projected cumulative {} {} {}",
                 trim_money(projected),

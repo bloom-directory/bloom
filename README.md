@@ -155,6 +155,10 @@ A fresh Bloom VFS root exposes these default entries:
 - `requests/` — free and paid HTTP requests. Paid HTTP 402 challenges are
   staged under `pending/`, exposed as `plan.md`, and only signed after a
   confirm write.
+- `polymarket/` — Polymarket market/account reads, onboarding, trade draft
+  review, and pUSD funding request staging. Funding requests can be executed
+  through foreground `bloom vfs write --unlock-wallet`; trade drafts can be
+  posted the same way at `/polymarket/trade/<wallet>/drafts/<id>/confirm`.
 - `status/` — daemon health, chain probes, audit head/count, cache
   counts, policy flags, wallet/outbox counts, and backend declarations.
 - `docs/` — in-tree help, vendored from `crates/bloom-vfs/src/docs/`.
@@ -166,7 +170,9 @@ the wallet outbox.
 
 See [QUICKSTART.md](./QUICKSTART.md) for an Anvil-backed walkthrough
 and [docs/AUDIT.md](./docs/AUDIT.md) for the per-surface implementation
-map and live-network verification log.
+map and live-network verification log. See
+[docs/parity/VFS_CLI_PARITY_LEDGER.md](./docs/parity/VFS_CLI_PARITY_LEDGER.md)
+for the current VFS/CLI workflow parity matrix.
 
 ## Architecture
 

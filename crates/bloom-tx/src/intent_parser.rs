@@ -18,6 +18,8 @@ pub enum ParseError {
     Toml(#[from] toml::de::Error),
     #[error("shell parse: {0}")]
     Shell(String),
+    #[error("invalid intent: {0}")]
+    Invalid(String),
     #[error("ambiguous intent")]
     Ambiguous,
 }
@@ -65,6 +67,8 @@ struct LooseIntent {
     safe: Option<bool>,
     #[serde(default)]
     approved: Option<bool>,
+    #[serde(default)]
+    usd_value_hint: Option<String>,
 }
 
 impl LooseIntent {
@@ -96,12 +100,44 @@ impl LooseIntent {
             })
             .ok_or(ParseError::Ambiguous)?;
         let body = match kind.as_str() {
-            "send" => RawIntentBody::Send {
-                to: self.to.ok_or(ParseError::Ambiguous)?,
-                value: self.value.unwrap_or_default(),
-                token: self.token,
-                data: self.data,
-            },
+            "send" => {
+                let token = self.token;
+                let value = self.value.unwrap_or_default();
+                let amount = self.amount.unwrap_or_default();
+                if token.is_some() {
+                    if amount.trim().is_empty() {
+                        return Err(ParseError::Invalid(
+                            "token sends require amount; value is only for native sends".into(),
+                        ));
+                    }
+                    if !is_empty_or_zero_value(&value) {
+                        return Err(ParseError::Invalid(
+                            "token sends must use amount; value is reserved for native sends"
+                                .into(),
+                        ));
+                    }
+                    RawIntentBody::Send {
+                        to: self.to.ok_or(ParseError::Ambiguous)?,
+                        value: String::new(),
+                        token,
+                        amount,
+                        data: self.data,
+                    }
+                } else {
+                    if !amount.trim().is_empty() {
+                        return Err(ParseError::Invalid(
+                            "native sends must use value; amount is only for token sends".into(),
+                        ));
+                    }
+                    RawIntentBody::Send {
+                        to: self.to.ok_or(ParseError::Ambiguous)?,
+                        value,
+                        token: None,
+                        amount: String::new(),
+                        data: self.data,
+                    }
+                }
+            }
             "call" => RawIntentBody::Call {
                 contract: self.contract.ok_or(ParseError::Ambiguous)?,
                 method: self.method.ok_or(ParseError::Ambiguous)?,
@@ -160,9 +196,14 @@ impl LooseIntent {
             gas,
             nonce: self.nonce,
             gas_limit_hint: None,
-            usd_value_hint: None,
+            usd_value_hint: self.usd_value_hint,
         })
     }
+}
+
+fn is_empty_or_zero_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty() || trimmed == "0"
 }
 
 /// Parse a textual intent in any of the accepted forms.
@@ -180,7 +221,15 @@ pub fn parse(input: &str) -> Result<RawIntent, ParseError> {
         return Ok(RawIntent {
             body: RawIntentBody::Send {
                 to: shell.to,
-                value: format!("{} {}", shell.amount, shell.unit),
+                value: if shell.unit.eq_ignore_ascii_case("eth")
+                    || shell.unit.eq_ignore_ascii_case("ether")
+                    || shell.unit.eq_ignore_ascii_case("wei")
+                    || shell.unit.eq_ignore_ascii_case("gwei")
+                {
+                    format!("{} {}", shell.amount, shell.unit)
+                } else {
+                    String::new()
+                },
                 token: if shell.unit.eq_ignore_ascii_case("eth")
                     || shell.unit.eq_ignore_ascii_case("ether")
                     || shell.unit.eq_ignore_ascii_case("wei")
@@ -189,6 +238,15 @@ pub fn parse(input: &str) -> Result<RawIntent, ParseError> {
                     None
                 } else {
                     Some(shell.unit.clone())
+                },
+                amount: if shell.unit.eq_ignore_ascii_case("eth")
+                    || shell.unit.eq_ignore_ascii_case("ether")
+                    || shell.unit.eq_ignore_ascii_case("wei")
+                    || shell.unit.eq_ignore_ascii_case("gwei")
+                {
+                    String::new()
+                } else {
+                    shell.amount.clone()
                 },
                 data: None,
             },
@@ -343,17 +401,76 @@ mod tests {
         let r = parse(
             r#"
 to = "0xabc"
-value = "10 usdc"
+token = "USDC"
+amount = "10"
 chain = "ethereum"
 "#,
         )
         .unwrap();
         assert_eq!(r.chain.as_deref(), Some("ethereum"));
-        if let RawIntentBody::Send { value, token, .. } = r.body {
-            assert_eq!(value, "10 usdc");
-            assert!(token.is_none());
+        if let RawIntentBody::Send {
+            value,
+            token,
+            amount,
+            ..
+        } = r.body
+        {
+            assert_eq!(value, "");
+            assert_eq!(token.as_deref(), Some("USDC"));
+            assert_eq!(amount, "10");
         } else {
             panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn token_send_rejects_value_without_amount() {
+        let err = parse(
+            r#"
+to = "0xabc"
+token = "USDC"
+value = "10"
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ParseError::Invalid(_)), "{err}");
+    }
+
+    #[test]
+    fn native_send_rejects_amount() {
+        let err = parse(
+            r#"
+to = "0xabc"
+amount = "10"
+"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ParseError::Invalid(_)), "{err}");
+    }
+
+    #[test]
+    fn token_send_allows_explicit_zero_native_value() {
+        let r = parse(
+            r#"
+to = "0xabc"
+token = "USDC"
+amount = "10"
+value = "0"
+"#,
+        )
+        .unwrap();
+        match r.body {
+            RawIntentBody::Send {
+                value,
+                token,
+                amount,
+                ..
+            } => {
+                assert_eq!(value, "");
+                assert_eq!(token.as_deref(), Some("USDC"));
+                assert_eq!(amount, "10");
+            }
+            _ => panic!("wrong variant"),
         }
     }
 
@@ -366,8 +483,9 @@ chain = "ethereum"
     #[test]
     fn shell_token_send_sets_token() {
         let r = parse("send 10 usdc to vitalik.eth").unwrap();
-        if let RawIntentBody::Send { token, .. } = r.body {
+        if let RawIntentBody::Send { token, amount, .. } = r.body {
             assert_eq!(token.as_deref(), Some("usdc"));
+            assert_eq!(amount, "10");
         } else {
             panic!("wrong variant");
         }
@@ -524,5 +642,28 @@ chain = "ethereum"
             RawIntentBody::NftApproveAll { approved, .. } => assert!(!approved),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn json_intent_preserves_usd_value_hint() {
+        let r = parse(r#"{"to":"0xabc","usd_value_hint":"5.0","chain":"base"}"#).unwrap();
+        assert_eq!(r.usd_value_hint.as_deref(), Some("5.0"));
+    }
+
+    #[test]
+    fn toml_intent_preserves_usd_value_hint() {
+        let r = parse(
+            r#"to = "0xabc"
+chain = "base"
+usd_value_hint = "42.5""#,
+        )
+        .unwrap();
+        assert_eq!(r.usd_value_hint.as_deref(), Some("42.5"));
+    }
+
+    #[test]
+    fn shell_send_has_no_usd_value_hint() {
+        let r = parse("send 1 eth to 0xabc on base").unwrap();
+        assert!(r.usd_value_hint.is_none());
     }
 }
