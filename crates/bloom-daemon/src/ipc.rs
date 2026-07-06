@@ -737,31 +737,10 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        // Hyperliquid agent-session creation stages its own Sealed Approval
-        // challenge inside the Hyperliquid handler. Let plain IPC reach that
-        // handler; blocking here would force the disabled passkey
-        // write_unlocked lane and prevent the grant-backed approveAgent flow.
-        [root, _network, branch, _wallet, _session, leaf]
-            if root == "hyperliquid"
-                && branch == "agent_sessions"
-                && matches!(leaf.as_str(), "orphan_cancel_all" | "orphan_close_all") =>
-        {
-            true
-        }
-        [root, _network, branch, _wallet, leaf]
-            if root == "hyperliquid"
-                && branch == "exchange"
-                && matches!(
-                    leaf.as_str(),
-                    "order.json"
-                        | "cancel.json"
-                        | "schedule_cancel.json"
-                        | "update_leverage.json"
-                        | "send_asset.json"
-                ) =>
-        {
-            true
-        }
+        // Hyperliquid writes no longer consume the daemon wallet signer in the
+        // VFS handler. Agent-session creation and usdSend route owner digests
+        // through Sealed Approval host signing; direct exchange/orphan owner-key
+        // fallbacks fail closed in the Hyperliquid handler.
         // Wallet policy writes (policy.toml) redefine what the daemon allows.
         // They must go through write_unlocked so the user reviews the change
         // before the re-sign — never silently re-signed with a cached signer.
@@ -1518,14 +1497,6 @@ mod tests {
             "/requests/latest/confirm",
             "/requests/req_123/confirm",
             "/requests/pending/req_123/confirm",
-            "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_cancel_all",
-            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_close_all",
-            "/hyperliquid/mainnet/exchange/minnow/order.json",
-            "/hyperliquid/mainnet/exchange/minnow/cancel.json",
-            "/hyperliquid/mainnet/exchange/minnow/schedule_cancel.json",
-            "/hyperliquid/mainnet/exchange/minnow/update_leverage.json",
-            "/hyperliquid/mainnet/exchange/minnow/send_asset.json",
         ] {
             let p = VfsPath::parse(path).unwrap();
             assert!(write_path_uses_wallet_signer(&p), "{path}");
@@ -1541,6 +1512,14 @@ mod tests {
             "/hyperliquid/mainnet/agent_sessions/minnow/session-1/schedule_cancel.json",
             "/hyperliquid/mainnet/agent_sessions/minnow/session-1/order.json",
             "/hyperliquid/mainnet/agent_sessions/minnow/session-1/cancel_all",
+            "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_cancel_all",
+            "/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_close_all",
+            "/hyperliquid/mainnet/exchange/minnow/order.json",
+            "/hyperliquid/mainnet/exchange/minnow/cancel.json",
+            "/hyperliquid/mainnet/exchange/minnow/schedule_cancel.json",
+            "/hyperliquid/mainnet/exchange/minnow/update_leverage.json",
+            "/hyperliquid/mainnet/exchange/minnow/send_asset.json",
             "/hyperliquid/mainnet/exchange/minnow/raw_signed.json",
         ] {
             let p = VfsPath::parse(path).unwrap();
