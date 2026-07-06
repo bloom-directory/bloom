@@ -140,18 +140,20 @@ blindly; inspect the wallet policy or ask the human to change it.
 
 ## Hyperliquid (session-first)
 
-Hyperliquid trading has two signing models:
+Hyperliquid trading uses Sealed Approval for owner authority:
 
-- **Agent sessions (RECOMMENDED):** one `approveAgent` ceremony creates an
-  ephemeral trading key. The agent trades inside policy bounds without further
-  human prompts. The session auto-expires and auto-flattens positions on breach.
-  Create at `/hyperliquid/mainnet/agent_sessions/<wallet>/new.json`.
-  Trade through the session at
-  `/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/order.json`.
+- **Agent sessions (RECOMMENDED):** write an explicit session id to
+  `/hyperliquid/mainnet/agent_sessions/<wallet>/new.json`. If the write returns
+  permission denied, read that session directory's `approval_challenge.json`,
+  open or forward its `ceremony_url`, complete the grant ceremony, then retry
+  the same write. The resulting ephemeral API wallet trades inside policy
+  bounds at `/hyperliquid/mainnet/agent_sessions/<wallet>/<session>/order.json`
+  without additional owner prompts until the session expires or is stopped.
 
-- **Direct exchange writes (ADVANCED):** owner-signed one-off actions for
-  emergencies. Requires the wallet to be unlocked. Paths under
-  `/hyperliquid/<network>/exchange/<wallet>/...`.
+- **Owner actions:** `/hyperliquid/<network>/exchange/<wallet>/send_asset.json`
+  follows the same challenge/grant/retry flow and requires `transfer_cap_usd`.
+  Generic owner-signed order/cancel/update-leverage writes are disabled; use
+  agent sessions, or `raw_signed.json` for payloads signed outside Bloom.
 
 ## Polymarket
 

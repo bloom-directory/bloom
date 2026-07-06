@@ -10,10 +10,10 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use bloom_auth_api::{
-    AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, DaemonGrantTerms, ExecutorKind,
-    HYPERLIQUID_APPROVE_AGENT_SIGN_INTENT, HYPERLIQUID_USD_SEND_SIGN_INTENT, PetalPolicySnapshot,
-    SIGNING_ATTESTATION_SCHEMA_V1, SealedAction, SignHashRequest, SigningAttestation,
-    petal_identity,
+    ApprovalChallenge, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, DaemonGrantTerms,
+    ExecutorKind, HYPERLIQUID_APPROVE_AGENT_SIGN_INTENT, HYPERLIQUID_USD_SEND_SIGN_INTENT,
+    PetalPolicySnapshot, SIGNING_ATTESTATION_SCHEMA_V1, SealedAction, SignHashRequest,
+    SigningAttestation, petal_identity,
 };
 use bloom_hyperliquid::{
     CancelWire, ExchangeAction, Grouping, HyperliquidClient, HyperliquidNetwork, HyperliquidSigner,
@@ -1717,9 +1717,15 @@ impl HyperliquidHandler {
             return Ok(pending.nonce);
         }
         let dir = self.usd_send_auth_dir(network, wallet)?;
+        let challenge_path = dir.join(APPROVAL_CHALLENGE_FILE);
+        if reusable_hyperliquid_challenge(&challenge_path, wallet, &staged.action_id, now_ms_u64())?
+        {
+            return Err(HandlerError::PermissionDenied);
+        }
         let mut nonce_bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
         let server_nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
+        let now = now_ms_u64();
         let challenge = self
             .auth_services
             .require_writer()?
@@ -1727,14 +1733,14 @@ impl HyperliquidHandler {
                 "hyperliquid",
                 &staged.action_id,
                 &server_nonce,
-                now_ms_u64().saturating_add(APPROVAL_TTL_MS),
-                now_ms_u64(),
+                now.saturating_add(APPROVAL_TTL_MS),
+                now,
             )
             .await
             .map_err(|e| {
                 HandlerError::backend(format!("issue Hyperliquid usdSend challenge: {e}"))
             })?;
-        write_json(dir.join(APPROVAL_CHALLENGE_FILE), &challenge)?;
+        write_json(challenge_path, &challenge.with_local_ceremony_url())?;
         Err(HandlerError::PermissionDenied)
     }
 
@@ -1781,9 +1787,14 @@ impl HyperliquidHandler {
         }
         let dir = self.session_store_dir(network, wallet, session_id)?;
         std::fs::create_dir_all(&dir)?;
+        let challenge_path = dir.join(APPROVAL_CHALLENGE_FILE);
+        if reusable_hyperliquid_challenge(&challenge_path, wallet, &staged.action_id, now)? {
+            return Err(HandlerError::PermissionDenied);
+        }
         let mut nonce_bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
         let server_nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
+        let now = now_ms_u64();
         let challenge = self
             .auth_services
             .require_writer()?
@@ -1791,14 +1802,14 @@ impl HyperliquidHandler {
                 "hyperliquid",
                 &staged.action_id,
                 &server_nonce,
-                now_ms_u64().saturating_add(APPROVAL_TTL_MS),
-                now_ms_u64(),
+                now.saturating_add(APPROVAL_TTL_MS),
+                now,
             )
             .await
             .map_err(|e| {
                 HandlerError::backend(format!("issue Hyperliquid agent-session challenge: {e}"))
             })?;
-        write_json(dir.join(APPROVAL_CHALLENGE_FILE), &challenge)?;
+        write_json(challenge_path, &challenge.with_local_ceremony_url())?;
         Err(HandlerError::PermissionDenied)
     }
 
@@ -3879,6 +3890,25 @@ fn now_ms_u64() -> u64 {
     bloom_hyperliquid::now_ms()
 }
 
+fn reusable_hyperliquid_challenge(
+    path: &Path,
+    wallet: &str,
+    action_id: &str,
+    now_ms: u64,
+) -> Result<bool, HandlerError> {
+    let challenge: ApprovalChallenge = match read_json(path) {
+        Ok(challenge) => challenge,
+        Err(HandlerError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(HandlerError::Invalid(_)) => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    Ok(challenge.surface == "hyperliquid"
+        && challenge.wallet == wallet
+        && challenge.action_id == action_id
+        && challenge.expiry_ms > now_ms
+        && challenge.ceremony_url.is_some())
+}
+
 fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<(), HandlerError> {
     std::fs::write(path, serde_json::to_vec_pretty(value).map_err(err_json)?)?;
     Ok(())
@@ -4267,6 +4297,43 @@ mod tests {
             std::process::id(),
             NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    fn approval_challenge(wallet: &str, action_id: &str, expiry_ms: u64) -> ApprovalChallenge {
+        ApprovalChallenge {
+            schema: bloom_auth_api::APPROVAL_CHALLENGE_SCHEMA_V1.to_string(),
+            action_id: action_id.to_string(),
+            wallet: wallet.to_string(),
+            surface: "hyperliquid".to_string(),
+            petal_id: petal_identity::PETAL_ID_HYPERLIQUID.to_string(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_HYPERLIQUID.to_string(),
+            intent_hash: "1".repeat(64),
+            server_nonce: "nonce-1".to_string(),
+            assurance: AssuranceLevel::Standard,
+            daemon_terms_digest: "2".repeat(64),
+            petal_policy_digest: "3".repeat(64),
+            policy_version: 0,
+            expiry_ms,
+            ceremony_url: None,
+        }
+    }
+
+    #[test]
+    fn reusable_hyperliquid_challenge_requires_same_live_url_challenge() {
+        let dir = unique_test_dir("bloom-hl-challenge-reuse");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(APPROVAL_CHALLENGE_FILE);
+        let challenge = approval_challenge("trader", "hl-action", 2_000).with_local_ceremony_url();
+        write_json(&path, &challenge).unwrap();
+
+        assert!(reusable_hyperliquid_challenge(&path, "trader", "hl-action", 1_000).unwrap());
+        assert!(!reusable_hyperliquid_challenge(&path, "other", "hl-action", 1_000).unwrap());
+        assert!(!reusable_hyperliquid_challenge(&path, "trader", "other-action", 1_000).unwrap());
+        assert!(!reusable_hyperliquid_challenge(&path, "trader", "hl-action", 2_000).unwrap());
+
+        let without_url = approval_challenge("trader", "hl-action", 3_000);
+        write_json(&path, &without_url).unwrap();
+        assert!(!reusable_hyperliquid_challenge(&path, "trader", "hl-action", 1_000).unwrap());
     }
 
     fn active_for_status(

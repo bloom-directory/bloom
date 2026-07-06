@@ -15,8 +15,9 @@ mod commands {
     pub mod qr;
 }
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3847,7 +3848,7 @@ async fn handle_hyperliquid(
             };
             print_hl_info(&home, &network, body).await
         }
-        HyperliquidCmd::Session { command } => handle_hl_session(endpoint, command).await,
+        HyperliquidCmd::Session { command } => handle_hl_session(&home, endpoint, command).await,
         HyperliquidCmd::SendAsset {
             wallet,
             destination,
@@ -3861,7 +3862,12 @@ async fn handle_hyperliquid(
                 amount,
                 nonce: None,
             })?;
-            hl_session_ipc_write_unlocked(endpoint, &path, body, &wallet, passphrase.as_deref())
+            if passphrase.is_some() {
+                eprintln!(
+                    "warning: --passphrase is ignored for Hyperliquid Sealed Approval; use the browser ceremony"
+                );
+            }
+            hl_session_ipc_write_with_sealed_approval(&home, endpoint, &path, body, &wallet)
                 .await?;
             let last_response =
                 format!("/hyperliquid/{network}/exchange/{wallet}/last_response.json");
@@ -3908,7 +3914,11 @@ async fn handle_hyperliquid(
     }
 }
 
-async fn handle_hl_session(endpoint: &ResolvedEndpoint, cmd: HyperliquidSessionCmd) -> Result<()> {
+async fn handle_hl_session(
+    home: &HomeDir,
+    endpoint: &ResolvedEndpoint,
+    cmd: HyperliquidSessionCmd,
+) -> Result<()> {
     match cmd {
         HyperliquidSessionCmd::Create {
             wallet,
@@ -3924,12 +3934,17 @@ async fn handle_hl_session(endpoint: &ResolvedEndpoint, cmd: HyperliquidSessionC
                 "agent_name": agent_name,
                 "vault_address": vault_address,
             });
-            hl_session_ipc_write_unlocked(
+            if passphrase.is_some() {
+                eprintln!(
+                    "warning: --passphrase is ignored for Hyperliquid Sealed Approval; use the browser ceremony"
+                );
+            }
+            hl_session_ipc_write_with_sealed_approval(
+                home,
                 endpoint,
                 &path,
                 serde_json::to_vec(&body)?,
                 &wallet,
-                passphrase.as_deref(),
             )
             .await?;
             let last_response =
@@ -4088,29 +4103,176 @@ async fn hl_session_ipc_write(
     Ok(())
 }
 
-async fn hl_session_ipc_write_unlocked(
+async fn hl_session_ipc_write_with_sealed_approval(
+    home: &HomeDir,
     endpoint: &ResolvedEndpoint,
     path: &str,
     body: Vec<u8>,
     wallet: &str,
-    passphrase: Option<&str>,
 ) -> Result<()> {
+    match hl_session_ipc_write_once(endpoint, path, &body).await {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("Hyperliquid Sealed Approval requires a running bloom serve daemon");
+        }
+        Err(e) if is_ipc_permission_denied(&e) => {
+            let challenge_path = hyperliquid_challenge_path(home, path, &body)
+                .with_context(|| format!("locate Hyperliquid approval challenge for {path}"))?;
+            let challenge = read_hyperliquid_approval_challenge(&challenge_path)?;
+            ensure_hyperliquid_challenge_matches(&challenge, wallet)?;
+            let url = challenge
+                .ceremony_url
+                .clone()
+                .context("Hyperliquid approval challenge is missing ceremony_url")?;
+            eprintln!("Hyperliquid Sealed Approval required.");
+            eprintln!("Opening ceremony URL: {url}");
+            open_ceremony_url(&url);
+            wait_for_hyperliquid_grant(&url)?;
+        }
+        Err(e) => return Err(e).with_context(|| format!("ipc write via {}", endpoint.display)),
+    }
+
+    match hl_session_ipc_write_once(endpoint, path, &body).await {
+        Ok(()) => Ok(()),
+        Err(e) if is_ipc_permission_denied(&e) => {
+            bail!(
+                "Hyperliquid Sealed Approval grant is not active yet; complete the grant ceremony and rerun the command"
+            )
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!("Hyperliquid Sealed Approval requires a running bloom serve daemon")
+        }
+        Err(e) => Err(e).with_context(|| format!("ipc write via {}", endpoint.display)),
+    }
+}
+
+async fn hl_session_ipc_write_once(
+    endpoint: &ResolvedEndpoint,
+    path: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
     let client = IpcClient::new(&endpoint.socket);
-    let res = try_ipc(
-        &client,
-        endpoint,
-        "write_unlocked",
-        serde_json::json!({
-            "path": path,
-            "bytes_b64": B64.encode(&body),
-            "wallet": wallet,
-            "passphrase": passphrase,
-        }),
-    )
-    .await
-    .with_context(|| format!("ipc unlocked write via {}", endpoint.display))?;
-    if res.is_none() {
-        bail!("Hyperliquid agent sessions require a running bloom serve daemon");
+    client
+        .call(
+            "write",
+            serde_json::json!({
+                "path": path,
+                "bytes_b64": B64.encode(body),
+            }),
+        )
+        .await
+        .map(|_| ())
+}
+
+fn is_ipc_permission_denied(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::PermissionDenied
+        || e.to_string().contains("\"code\":-32007")
+        || e.to_string()
+            .to_ascii_lowercase()
+            .contains("permission denied")
+}
+
+fn hyperliquid_challenge_path(home: &HomeDir, path: &str, body: &[u8]) -> Result<PathBuf> {
+    let vfs_path = VfsPath::parse(path)?;
+    let segments = vfs_path.segments();
+    if segments.len() == 5
+        && segments[0] == "hyperliquid"
+        && segments[2] == "exchange"
+        && segments[4] == "send_asset.json"
+    {
+        return Ok(home
+            .root()
+            .join("hyperliquid")
+            .join("exchange")
+            .join(&segments[1])
+            .join(&segments[3])
+            .join("approval_challenge.json"));
+    }
+    if segments.len() == 5
+        && segments[0] == "hyperliquid"
+        && segments[2] == "agent_sessions"
+        && segments[4] == "new.json"
+    {
+        let request: serde_json::Value =
+            serde_json::from_slice(body).context("parse Hyperliquid session create body")?;
+        let id = request
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .context("Hyperliquid session create requires an explicit stable id")?;
+        return Ok(home
+            .root()
+            .join("hyperliquid")
+            .join("agent_sessions")
+            .join(&segments[1])
+            .join(&segments[3])
+            .join(id)
+            .join("approval_challenge.json"));
+    }
+    bail!("unsupported Hyperliquid Sealed Approval path {path}");
+}
+
+fn read_hyperliquid_approval_challenge(path: &Path) -> Result<ApprovalChallenge> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("read Hyperliquid approval challenge {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse Hyperliquid approval challenge {}", path.display()))
+}
+
+fn ensure_hyperliquid_challenge_matches(challenge: &ApprovalChallenge, wallet: &str) -> Result<()> {
+    if challenge.surface != "hyperliquid" {
+        bail!(
+            "approval challenge surface is {}, expected hyperliquid",
+            challenge.surface
+        );
+    }
+    if challenge.wallet != wallet {
+        bail!(
+            "approval challenge wallet is {}, expected {}",
+            challenge.wallet,
+            wallet
+        );
+    }
+    if challenge.expiry_ms <= cli_now_ms() {
+        bail!("Hyperliquid approval challenge expired; rerun the command to issue a new challenge");
+    }
+    Ok(())
+}
+
+fn open_ceremony_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut cmd = Command::new("open");
+        cmd.arg(url);
+        cmd
+    };
+    #[cfg(target_os = "linux")]
+    let mut cmd = {
+        let mut cmd = Command::new("xdg-open");
+        cmd.arg(url);
+        cmd
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "start", "", url]);
+        cmd
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let mut cmd = { Command::new("true") };
+    let _ = cmd.status();
+}
+
+fn wait_for_hyperliquid_grant(url: &str) -> Result<()> {
+    if std::io::stdin().is_terminal() {
+        eprintln!("Complete the ceremony in grant mode, then press Enter to retry the write.");
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+    } else {
+        eprintln!(
+            "Complete the ceremony in grant mode, then rerun the command if the automatic retry happens before approval."
+        );
+        eprintln!("Ceremony URL: {url}");
     }
     Ok(())
 }

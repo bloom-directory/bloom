@@ -403,8 +403,9 @@ Rollback/non-goals:
 - do not broaden Hyperliquid trading semantics during the audit;
 - do not add generic owner-signed CLI exchange commands unless product direction
   changes;
-- keep owner recovery paths owner-signed and session actions scoped to the
-  approved ephemeral API wallet.
+- keep owner recovery paths disabled unless they are routed through Sealed
+  Approval host signing, and keep session actions scoped to the approved
+  ephemeral API wallet.
 
 ## 4.1. Audited: Hyperliquid USD send parity already wired
 
@@ -423,19 +424,23 @@ Exact VFS path and body:
 /hyperliquid/<network>/exchange/<wallet>/send_asset.json
 ```
 
-The CLI dispatches through `write_unlocked` to the same VFS path with a JSON
-body containing `destination` and `amount`. The VFS handler runs
-`HyperliquidHandler::submit_usd_send`, which:
+The CLI dispatches through plain IPC to the same VFS path with a JSON body
+containing `destination` and `amount`. If the first write returns permission
+denied, the daemon has written `approval_challenge.json`; the CLI opens its
+`ceremony_url`, waits for grant-mode approval, then retries the same write. The
+VFS handler runs `HyperliquidHandler::submit_usd_send`, which:
 
 - requires configured wallet `[hyperliquid]` policy with `transfer_cap_usd`;
 - parses the amount exactly to micro-USDC for cap evaluation;
-- signs owner `usdSend` EIP-712 with the unlocked wallet;
+- stages a sealed `usdSend` action and signs the Hyperliquid hash through
+  PetalHost only while the grant is active;
 - submits through the Hyperliquid exchange endpoint;
 - persists the response to `last_response.json`.
 
 Classification: `parity` / `track_a` under mocked exchange endpoints. This is
-owner-signed by design; agent-session keys cannot authorize Hyperliquid
-`usdSend`.
+owner-authority by design; agent-session keys cannot authorize Hyperliquid
+`usdSend`, so Bloom uses Sealed Approval host signing rather than wallet
+unlocking.
 
 ## 4.2. Implemented: Polymarket builder-key list/revoke VFS parity
 
