@@ -236,9 +236,30 @@ fn build_tx_request(
             to,
             value,
             token,
+            amount,
             data,
         } => {
             let to_addr = resolve_addr(to, addr_book)?;
+            if token.is_some() {
+                if amount.trim().is_empty() {
+                    return Err(HandlerError::invalid(
+                        "token sends require amount; value is only for native sends",
+                    ));
+                }
+                if !value.trim().is_empty() && value.trim() != "0" {
+                    return Err(HandlerError::invalid(
+                        "token sends must use amount; value is reserved for native sends",
+                    ));
+                }
+                return Err(HandlerError::Unsupported(
+                    "ERC-20 token simulation requires a contract-call intent".into(),
+                ));
+            }
+            if !amount.trim().is_empty() {
+                return Err(HandlerError::invalid(
+                    "native sends must use value; amount is only for token sends",
+                ));
+            }
             let v = resolve_value(value, token)?;
             let d = data.clone().unwrap_or_else(|| "0x".into());
             (to_addr, v, d)
@@ -364,15 +385,25 @@ fn render_sim_plan(session: &SimSession) -> String {
         ));
         match &intent.body {
             RawIntentBody::Send {
-                to, value, token, ..
+                to,
+                value,
+                token,
+                amount,
+                ..
             } => {
                 s.push_str("Kind:  send\n");
                 s.push_str(&format!("To:    {}\n", to));
-                s.push_str(&format!(
-                    "Value: {} {}\n",
-                    if value.is_empty() { "0" } else { value },
-                    token.as_deref().unwrap_or("(native)")
-                ));
+                if let Some(token) = token {
+                    s.push_str(&format!("Amount: {} {}\n", amount, token));
+                    if !value.trim().is_empty() && value.trim() != "0" {
+                        s.push_str(&format!("Native value: {}\n", value));
+                    }
+                } else {
+                    s.push_str(&format!(
+                        "Value: {}\n",
+                        if value.is_empty() { "0" } else { value }
+                    ));
+                }
             }
             RawIntentBody::Raw { to, value, data } => {
                 s.push_str("Kind:  raw\n");

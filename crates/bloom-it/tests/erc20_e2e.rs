@@ -428,8 +428,9 @@ async fn erc20_stage_fails_when_decimals_unreadable() -> Result<()> {
     let intent = RawIntent {
         body: RawIntentBody::Send {
             to: ANVIL_ADDR1.to_string(),
-            value: "100".into(),
+            value: String::new(),
             token: Some("USDC".into()),
+            amount: "100".into(),
             data: None,
         },
         chain: Some("anvil".to_string()),
@@ -505,6 +506,7 @@ async fn replace_keeps_nonce_and_bumps_fees() -> Result<()> {
             to: ANVIL_ADDR1.to_string(),
             value: "0.01 eth".into(),
             token: None,
+            amount: String::new(),
             data: None,
         },
         chain: Some("anvil".to_string()),

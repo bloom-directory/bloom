@@ -174,7 +174,26 @@ impl CentralOutbox {
             ));
         }
         std::fs::create_dir_all(self.state_dir(to))?;
-        std::fs::rename(&from_dir, &to_dir)
+        std::fs::rename(&from_dir, &to_dir)?;
+        self.write_status_state(action_id, to)?;
+        Ok(())
+    }
+
+    fn write_status_state(&self, action_id: &str, state: &str) -> std::io::Result<()> {
+        let path = self.action_dir(state, action_id).join("status.json");
+        let mut status = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                .unwrap_or_else(|_| serde_json::json!({})),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(e) => return Err(e),
+        };
+        if !status.is_object() {
+            status = serde_json::json!({});
+        }
+        let obj = status.as_object_mut().expect("status is object");
+        obj.insert("action_id".to_string(), serde_json::json!(action_id));
+        obj.insert("state".to_string(), serde_json::json!(state));
+        std::fs::write(path, serde_json::to_vec_pretty(&status).unwrap_or_default())
     }
 
     /// Write a result file for an action.
@@ -186,6 +205,66 @@ impl CentralOutbox {
     ) -> std::io::Result<()> {
         let dir = self.action_dir(state, action_id);
         std::fs::write(dir.join("result.json"), result_json)
+    }
+
+    /// Write a runtime-generated artifact into an existing central action
+    /// directory. This is intentionally allowlisted so callers cannot use the
+    /// projection as an arbitrary file writer.
+    pub fn write_action_file(
+        &self,
+        action_id: &str,
+        state: &str,
+        file: &str,
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        validate_action_id(action_id)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        if !matches!(
+            file,
+            "approval_challenge.json" | "approval.json" | "result.json" | "status.json"
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("runtime artifact '{file}' is not writable"),
+            ));
+        }
+        let dir = self.action_dir(state, action_id);
+        if !dir.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("action {action_id} not found in {state}"),
+            ));
+        }
+        std::fs::write(dir.join(file), data)
+    }
+
+    /// Read a runtime-generated artifact from an existing central action
+    /// directory. Uses the same allowlist as [`CentralOutbox::write_action_file`].
+    pub fn read_action_file(
+        &self,
+        action_id: &str,
+        state: &str,
+        file: &str,
+    ) -> std::io::Result<Vec<u8>> {
+        validate_action_id(action_id)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        if !matches!(
+            file,
+            "approval_challenge.json" | "approval.json" | "result.json" | "status.json"
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("runtime artifact '{file}' is not readable"),
+            ));
+        }
+        let dir = self.action_dir(state, action_id);
+        if !dir.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("action {action_id} not found in {state}"),
+            ));
+        }
+        std::fs::read(dir.join(file))
     }
 
     /// Find which state an action is in, scanning all states.
@@ -204,6 +283,34 @@ pub struct OutboxHandler {
 impl OutboxHandler {
     pub fn new(outbox: CentralOutbox) -> Self {
         Self { outbox }
+    }
+
+    fn latest_pending_action_id(&self) -> Result<Option<String>, HandlerError> {
+        let pending = self.outbox.state_dir("pending");
+        if !pending.exists() {
+            return Ok(None);
+        }
+        let mut entries: Vec<_> = std::fs::read_dir(&pending)
+            .map_err(|e| HandlerError::backend(e.to_string()))?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let intent = e.path().join("intent.json");
+                std::fs::metadata(&intent)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .map(|mtime| (mtime, e.file_name()))
+            })
+            .collect();
+        entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        Ok(entries
+            .first()
+            .map(|(_, name)| name.to_string_lossy().into_owned()))
+    }
+
+    fn latest_target(&self) -> Result<Option<String>, HandlerError> {
+        Ok(self
+            .latest_pending_action_id()?
+            .map(|id| format!("pending/{id}")))
     }
 }
 
@@ -232,26 +339,27 @@ impl Handler for OutboxHandler {
             [] => Ok(Entry::dir("outbox")),
             [state] if STATES.contains(state) => Ok(Entry::dir(state)),
             ["latest"] => {
-                let pending = self.outbox.state_dir("pending");
-                if !pending.exists() {
-                    return Err(HandlerError::NotFound("outbox/latest".into()));
+                let target = self
+                    .latest_target()?
+                    .ok_or_else(|| HandlerError::NotFound("outbox/latest".into()))?;
+                Ok(Entry::symlink("latest", &target))
+            }
+            ["latest", file] => {
+                let action_id = self
+                    .latest_pending_action_id()?
+                    .ok_or_else(|| HandlerError::NotFound("outbox/latest".into()))?;
+                if !ACTION_FILES.contains(file) {
+                    return Err(HandlerError::NotFound(format!("/outbox/latest/{file}")));
                 }
-                let mut entries: Vec<_> = std::fs::read_dir(&pending)
-                    .map_err(|e| HandlerError::backend(e.to_string()))?
-                    .filter_map(|e| e.ok())
-                    .filter_map(|e| {
-                        let intent = e.path().join("intent.json");
-                        std::fs::metadata(&intent)
-                            .and_then(|m| m.modified())
-                            .ok()
-                            .map(|mtime| (mtime, e.file_name()))
-                    })
-                    .collect();
-                entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-                let (_, name) = entries
-                    .first()
-                    .ok_or_else(|| HandlerError::NotFound("no pending actions".into()))?;
-                Ok(Entry::dir(name.to_string_lossy().as_ref()))
+                let fpath = self.outbox.action_dir("pending", &action_id).join(file);
+                if !fpath.exists() {
+                    return Err(HandlerError::NotFound(format!("/outbox/latest/{file}")));
+                }
+                if *file == "approval.json" {
+                    Ok(Entry::writable_file(file))
+                } else {
+                    Ok(Entry::file(file))
+                }
             }
             [state, action_id] if STATES.contains(state) => {
                 validate_action_id(action_id)?;
@@ -289,6 +397,28 @@ impl Handler for OutboxHandler {
     async fn read(&self, path: &VfsPath) -> Result<Vec<u8>, HandlerError> {
         let segs = match_segs(path);
         match segs.as_slice() {
+            ["latest"] => {
+                let target = self
+                    .latest_target()?
+                    .ok_or_else(|| HandlerError::NotFound("outbox/latest".into()))?;
+                Ok(format!("{target}\n").into_bytes())
+            }
+            ["latest", file] => {
+                let action_id = self
+                    .latest_pending_action_id()?
+                    .ok_or_else(|| HandlerError::NotFound("outbox/latest".into()))?;
+                if !ACTION_FILES.contains(file) {
+                    return Err(HandlerError::NotFound(format!("/outbox/latest/{file}")));
+                }
+                let fpath = self.outbox.action_dir("pending", &action_id).join(file);
+                std::fs::read(&fpath).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        HandlerError::NotFound(fpath.to_string_lossy().to_string())
+                    } else {
+                        HandlerError::backend(e.to_string())
+                    }
+                })
+            }
             [state, action_id, file] if STATES.contains(state) => {
                 validate_action_id(action_id)?;
                 if !ACTION_FILES.contains(file) {
@@ -312,6 +442,20 @@ impl Handler for OutboxHandler {
     async fn write(&self, path: &VfsPath, data: &[u8]) -> Result<(), HandlerError> {
         let segs = match_segs(path);
         match segs.as_slice() {
+            ["latest", "approval.json"] => {
+                let action_id = self
+                    .latest_pending_action_id()?
+                    .ok_or_else(|| HandlerError::NotFound("outbox/latest".into()))?;
+                let dir = self.outbox.action_dir("pending", &action_id);
+                if !dir.exists() {
+                    return Err(HandlerError::NotFound(format!(
+                        "/outbox/pending/{action_id}"
+                    )));
+                }
+                std::fs::write(dir.join("approval.json"), data)
+                    .map_err(|e| HandlerError::backend(e.to_string()))?;
+                Ok(())
+            }
             ["pending", action_id, "approval.json"] => {
                 validate_action_id(action_id)?;
                 let dir = self.outbox.action_dir("pending", action_id);
@@ -331,11 +475,13 @@ impl Handler for OutboxHandler {
     async fn list(&self, path: &VfsPath) -> Result<Vec<Entry>, HandlerError> {
         let segs = match_segs(path);
         match segs.as_slice() {
-            [] => Ok(STATES
-                .iter()
-                .map(|s| Entry::dir(s))
-                .chain(std::iter::once(Entry::dir("latest")))
-                .collect()),
+            [] => {
+                let mut entries: Vec<Entry> = STATES.iter().map(|s| Entry::dir(s)).collect();
+                if let Some(target) = self.latest_target()? {
+                    entries.push(Entry::symlink("latest", &target));
+                }
+                Ok(entries)
+            }
             [state] if STATES.contains(state) => {
                 let dir = self.outbox.state_dir(state);
                 if !dir.exists() {
@@ -391,14 +537,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lookup_root_lists_states() {
+    async fn lookup_root_lists_states_without_latest_when_empty() {
         let h = handler();
         let entries = h.list(&VfsPath::root()).await.unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"pending"));
         assert!(names.contains(&"sent"));
         assert!(names.contains(&"failed"));
-        assert!(names.contains(&"latest"));
+        assert!(!names.contains(&"latest"));
     }
 
     #[tokio::test]
@@ -486,6 +632,30 @@ mod tests {
         assert!(h.write(&p, b"{}").await.is_err());
     }
 
+    #[test]
+    fn write_action_file_allows_approval_json_and_rejects_arbitrary() {
+        let h = handler();
+        h.outbox
+            .stage("act-central-approval", b"{}", "hash", "plan", b"[]")
+            .unwrap();
+
+        // The daemon's Mode 3 ceremony mirrors approval.json into the central
+        // projection through this path — it must be allowlisted (regression: it
+        // was silently rejected, so approval.json never reached the central dir).
+        h.outbox
+            .write_action_file("act-central-approval", "pending", "approval.json", b"{}")
+            .expect("approval.json must be a runtime-writable central artifact");
+        let dir = h.outbox.action_dir("pending", "act-central-approval");
+        assert!(dir.join("approval.json").exists());
+
+        // The allowlist still fails closed for anything else.
+        let err = h
+            .outbox
+            .write_action_file("act-central-approval", "pending", "secrets.json", b"{}")
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
     #[tokio::test]
     async fn approval_json_is_writable_only_while_pending() {
         let h = handler();
@@ -518,6 +688,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transition_updates_canonical_status_state() {
+        let h = handler();
+        h.outbox
+            .stage("act-status", b"{}", "hash", "plan", b"[]")
+            .unwrap();
+
+        h.outbox
+            .transition("act-status", "pending", "sent")
+            .unwrap();
+
+        let status_path = VfsPath::parse("sent/act-status/status.json").unwrap();
+        let status: serde_json::Value =
+            serde_json::from_slice(&h.read(&status_path).await.unwrap())
+                .expect("status.json parses");
+        assert_eq!(status["action_id"], "act-status");
+        assert_eq!(status["state"], "sent");
+    }
+
+    #[tokio::test]
     async fn invalid_action_id_rejected() {
         let h = handler();
         let p = VfsPath::parse("pending/../etc/intent.json").unwrap();
@@ -531,8 +720,22 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(15));
         h.outbox.stage("act-new", b"{}", "h2", "p2", b"[]").unwrap();
 
+        let entries = h.list(&VfsPath::root()).await.unwrap();
+        let latest = entries
+            .iter()
+            .find(|entry| entry.name == "latest")
+            .expect("latest is listed when there is a pending action");
+        assert_eq!(latest.link_target.as_deref(), Some("pending/act-new"));
+
         let entry = h.lookup(&VfsPath::parse("latest").unwrap()).await.unwrap();
-        assert_eq!(entry.name, "act-new");
+        assert_eq!(entry.name, "latest");
+        assert_eq!(entry.link_target.as_deref(), Some("pending/act-new"));
+
+        let plan = h
+            .read(&VfsPath::parse("latest/plan.md").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(plan, b"p2");
     }
 
     #[tokio::test]
@@ -550,7 +753,8 @@ mod tests {
 
         let entry = h.lookup(&VfsPath::parse("latest").unwrap()).await.unwrap();
         assert_eq!(
-            entry.name, "act-new",
+            entry.link_target.as_deref(),
+            Some("pending/act-new"),
             "latest must reflect staging order, not artefact-write order"
         );
     }
@@ -558,6 +762,12 @@ mod tests {
     #[tokio::test]
     async fn latest_not_found_when_empty() {
         let h = handler();
+        let entries = h.list(&VfsPath::root()).await.unwrap();
+        assert!(
+            entries.iter().all(|entry| entry.name != "latest"),
+            "empty outbox must not advertise a latest entry that lookup cannot resolve"
+        );
+
         let result = h.lookup(&VfsPath::parse("latest").unwrap()).await;
         assert!(result.is_err());
     }
@@ -585,7 +795,8 @@ mod tests {
 
         let entry = h.lookup(&VfsPath::parse("latest").unwrap()).await.unwrap();
         assert_eq!(
-            entry.name, "act-alpha",
+            entry.link_target.as_deref(),
+            Some("pending/act-alpha"),
             "on identical mtime, tie-breaker is lexicographic ascending action_id"
         );
     }
@@ -600,6 +811,11 @@ mod tests {
         assert!(
             result.is_err(),
             "latest must not return actions that have transitioned out of pending"
+        );
+        let entries = h.list(&VfsPath::root()).await.unwrap();
+        assert!(
+            entries.iter().all(|entry| entry.name != "latest"),
+            "latest must not be listed after the only pending action leaves pending"
         );
     }
 

@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ceremony_server;
 pub mod ipc;
 pub mod sealed_ceremony;
 pub mod sign_hash;
@@ -36,8 +37,9 @@ use bloom_revert::{
     OpenchainDecoder, boxed,
 };
 use bloom_script::{ChainStateIface, PqSignature, PtbTx};
-use bloom_tx::outbox::{CentralOutboxProjection, Outbox};
+use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox};
 use bloom_tx::tx_engine::TxEngine;
+use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::polymarket::{ChainClientReader, PolymarketOnboarding, build_onboarder};
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
@@ -91,15 +93,21 @@ impl CentralOutboxProjection for EvmOutboxProjection {
         intent_json: &[u8],
         plan_md: &str,
         policy_check_json: &[u8],
+        identity: CentralActionIdentity<'_>,
     ) -> Result<(), String> {
         let intent_hash = bloom_auth_api::intent_hash_of(intent_json);
         self.central
-            .stage(
+            .stage_with_identity(
                 action_id,
                 intent_json,
                 &intent_hash,
                 plan_md,
                 policy_check_json,
+                &StagedPetalIdentity {
+                    petal_id: identity.petal_id.to_string(),
+                    petal_digest: identity.petal_digest.to_string(),
+                    petal_version: identity.petal_version.to_string(),
+                },
             )
             .map_err(|e| e.to_string())
     }
@@ -107,6 +115,29 @@ impl CentralOutboxProjection for EvmOutboxProjection {
     fn transition_action(&self, action_id: &str, from: &str, to: &str) -> Result<(), String> {
         self.central
             .transition(action_id, from, to)
+            .map_err(|e| e.to_string())
+    }
+
+    fn write_action_file(
+        &self,
+        action_id: &str,
+        state: &str,
+        file: &str,
+        data: &[u8],
+    ) -> Result<(), String> {
+        self.central
+            .write_action_file(action_id, state, file, data)
+            .map_err(|e| e.to_string())
+    }
+
+    fn read_action_file(
+        &self,
+        action_id: &str,
+        state: &str,
+        file: &str,
+    ) -> Result<Vec<u8>, String> {
+        self.central
+            .read_action_file(action_id, state, file)
             .map_err(|e| e.to_string())
     }
 }

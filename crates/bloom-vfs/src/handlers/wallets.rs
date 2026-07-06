@@ -2127,6 +2127,9 @@ impl WalletsHandler {
                         TxEngineError::EnsoQuoteStale { .. } => {
                             HandlerError::invalid(e.to_string())
                         }
+                        TxEngineError::BroadcastApprovalRequired(_) => {
+                            HandlerError::PermissionDenied
+                        }
                         other => err_be(other),
                     })?;
                 Ok(())
@@ -2634,6 +2637,7 @@ mod tests {
                 petal_policy_digest: "2".repeat(64),
                 policy_version: 0,
                 expiry_ms,
+                ceremony_url: None,
             })
         }
 
@@ -2757,6 +2761,7 @@ mod tests {
                 petal_policy_digest: "2".repeat(64),
                 policy_version: 0,
                 expiry_ms,
+                ceremony_url: None,
             })
         }
 

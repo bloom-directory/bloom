@@ -2360,6 +2360,13 @@ async fn run(cli: Cli) -> Result<()> {
             // serve command (fix #3). The handle is dropped (and the task
             // signalled to stop) right before the function returns.
             let sweeper = d.spawn_background_tasks();
+            // Interaction Mode 3: own and serve the mounted-VFS Sealed Approval
+            // ceremony endpoint (`ceremony_url` in approval_challenge.json).
+            // The daemon never opens a browser; it only serves the URL a
+            // deliberate client opens.
+            let ceremony = bloom_daemon::ceremony_server::spawn(&d)
+                .await
+                .context("bind sealed approval ceremony server")?;
             let mount_handle = mount_bloom(&d, mount.as_deref()).await?;
             let chains: Vec<String> = d.chains.list_names();
             println!(
@@ -2406,6 +2413,7 @@ async fn run(cli: Cli) -> Result<()> {
             // Stop the outbox expiry sweeper (fix #3) and any other
             // daemon-owned workers (watch executor, etc., fix #6).
             let unmount_result = unmount_bloom(mount_handle).await;
+            ceremony.shutdown().await;
             sweeper.shutdown().await;
             d.shutdown().await;
             serve_result?;

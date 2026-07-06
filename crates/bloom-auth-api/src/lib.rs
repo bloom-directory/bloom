@@ -62,6 +62,16 @@ pub const PETAL_POLICY_DIGEST_DOMAIN: &[u8] = b"bloom.petal_policy.v1";
 /// Hard ceiling on Sealed Approval Grant lifetime (§6.4 recommended default).
 pub const GRANT_MAX_TTL_MS: u64 = 120_000;
 
+/// Loopback port the daemon-owned Sealed Approval ceremony server binds for
+/// Interaction Mode 3 (mounted VFS). The `ceremony_url` written into
+/// `approval_challenge.json` points here, and `bloom serve` binds the same
+/// port; keeping it a single constant guarantees the URL the daemon projects
+/// is the URL the daemon serves.
+pub const LOCAL_CEREMONY_PORT: u16 = 18734;
+
+/// Domain tag for the deterministic ceremony URL token derivation.
+pub const CEREMONY_URL_TOKEN_DOMAIN: &[u8] = b"bloom.ceremony_url.v1";
+
 /// Standing-session kind for bounded EVM owner-signing sessions.
 pub const EVM_OWNER_SIGNING_SESSION_KIND: &str = "evm_owner_signing.v1";
 /// Sealed action kind for minting an EVM owner-signing session.
@@ -787,6 +797,20 @@ impl SealedAction {
     pub fn petal_digest(&self) -> &str {
         &self.envelope.header.petal_digest
     }
+
+    /// The human-readable chain name (e.g. `"base"`) this action targets, as
+    /// carried in the sealed Petal policy snapshot at seal time.
+    ///
+    /// Prefer this over [`PetalPolicySnapshot`]'s `network` header, which is the
+    /// CAIP-2 form (`"eip155:<chain_id>"`): the outbox directory layout and the
+    /// daemon `ChainRegistry` are both keyed by this human name, so lookups that
+    /// use the CAIP-2 header silently miss.
+    pub fn chain_name(&self) -> Option<&str> {
+        self.petal_policy
+            .config
+            .get("chain_name")
+            .and_then(|v| v.as_str())
+    }
 }
 
 /// The daemon-issued approval challenge preimage (§5.7, §6.2).
@@ -822,13 +846,84 @@ pub struct ApprovalChallenge {
     pub policy_version: u64,
     /// Daemon-issued challenge expiry.
     pub expiry_ms: u64,
+    /// Browser ceremony URL for mounted/daemon flows. Projection metadata only:
+    /// it is intentionally excluded from the WebAuthn challenge hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceremony_url: Option<String>,
 }
 
 impl ApprovalChallenge {
-    /// Canonical preimage bytes. Deterministic: fields serialize in
-    /// declaration order.
+    /// Deterministic single-use ceremony URL token derived from `server_nonce`.
+    ///
+    /// `token = base64url(BLAKE3("bloom.ceremony_url.v1" || server_nonce))`.
+    /// Because it is a pure function of the (single-use) nonce, it is stable
+    /// across repeated confirm writes that reuse an unexpired challenge, and
+    /// the daemon can resolve it back to a pending challenge by recomputing the
+    /// same derivation for each stored nonce (BLAKE3 is one-way, so lookup is a
+    /// scan-and-match rather than an inversion). The token is not part of the
+    /// signed challenge preimage.
+    pub fn ceremony_token(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(CEREMONY_URL_TOKEN_DOMAIN);
+        hasher.update(self.server_nonce.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize().as_bytes())
+    }
+
+    /// Deterministic local ceremony URL for mounted daemon flows.
+    ///
+    /// The token is derived from `server_nonce` and therefore remains stable
+    /// for an unexpired reused challenge. Full internet relay exposure can
+    /// swap the base URL without changing the signed challenge preimage.
+    pub fn local_ceremony_url(&self) -> String {
+        format!(
+            "http://localhost:{}/ceremony/{}",
+            LOCAL_CEREMONY_PORT,
+            self.ceremony_token()
+        )
+    }
+
+    pub fn with_local_ceremony_url(mut self) -> Self {
+        self.ceremony_url = Some(self.local_ceremony_url());
+        self
+    }
+
+    /// Canonical preimage bytes. Deterministic: fields serialize in declaration
+    /// order. Projection metadata such as `ceremony_url` is deliberately not
+    /// part of this preimage.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, AuthApiError> {
-        serde_json::to_vec(self).map_err(AuthApiError::Json)
+        #[derive(Serialize)]
+        struct ApprovalChallengeHashPreimage<'a> {
+            schema: &'a str,
+            action_id: &'a str,
+            wallet: &'a str,
+            surface: &'a str,
+            petal_id: &'a str,
+            petal_digest: &'a str,
+            intent_hash: &'a str,
+            server_nonce: &'a str,
+            assurance: AssuranceLevel,
+            daemon_terms_digest: &'a str,
+            petal_policy_digest: &'a str,
+            policy_version: u64,
+            expiry_ms: u64,
+        }
+
+        serde_json::to_vec(&ApprovalChallengeHashPreimage {
+            schema: &self.schema,
+            action_id: &self.action_id,
+            wallet: &self.wallet,
+            surface: &self.surface,
+            petal_id: &self.petal_id,
+            petal_digest: &self.petal_digest,
+            intent_hash: &self.intent_hash,
+            server_nonce: &self.server_nonce,
+            assurance: self.assurance,
+            daemon_terms_digest: &self.daemon_terms_digest,
+            petal_policy_digest: &self.petal_policy_digest,
+            policy_version: self.policy_version,
+            expiry_ms: self.expiry_ms,
+        })
+        .map_err(AuthApiError::Json)
     }
 
     /// The 32-byte WebAuthn challenge:
@@ -948,6 +1043,7 @@ impl UnsignedApproval {
             petal_policy_digest: self.petal_policy_digest.clone(),
             policy_version: self.policy_version,
             expiry_ms: self.expiry_ms,
+            ceremony_url: None,
         }
     }
 
@@ -2609,9 +2705,42 @@ pub struct SealedIntentRecord {
     pub action: Option<SealedAction>,
 }
 
+/// Outcome of resolving a mounted-ceremony URL token to a stored challenge
+/// (Interaction Mode 3). Distinguishes the three HTTP responses the ceremony
+/// server owes a client: serve the page, `410 Gone`, or `404 Not Found`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CeremonyTokenResolution {
+    /// The token maps to a live, unexpired, unconsumed challenge. Carries the
+    /// daemon-issued challenge and the sealed action so the ceremony page can
+    /// render the daemon-produced plan without reading mutable VFS projections.
+    Live {
+        challenge: Box<ApprovalChallenge>,
+        action: Box<SealedAction>,
+    },
+    /// The token maps to a known challenge that is expired or already consumed
+    /// (single-use): the ceremony server must return a 410-style response.
+    Gone,
+    /// The token does not match any stored challenge: 404-style response.
+    Unknown,
+}
+
 #[async_trait]
 pub trait AuthStoreView: Send + Sync {
     async fn sealed_intent(&self, intent_hash: &str) -> Result<SealedIntentRecord, AuthApiError>;
+
+    /// Resolve a deterministic ceremony URL token (see
+    /// [`ApprovalChallenge::ceremony_token`]) to a stored challenge for the
+    /// daemon-owned Mode 3 ceremony server. The default fails closed as
+    /// `Unknown`; the production store overrides it with a scan-and-match over
+    /// challenged entries.
+    async fn resolve_ceremony_token(
+        &self,
+        token: &str,
+        now_ms: u64,
+    ) -> Result<CeremonyTokenResolution, AuthApiError> {
+        let _ = (token, now_ms);
+        Ok(CeremonyTokenResolution::Unknown)
+    }
 
     async fn standing_session(
         &self,
@@ -3266,6 +3395,31 @@ mod tests {
     }
 
     #[test]
+    fn chain_name_reads_human_name_not_caip2_header() {
+        // Absent from the policy snapshot → None (callers must not silently fall
+        // back to the CAIP-2 `network` header, which the outbox/registry can't key).
+        let bare = sealed_action();
+        assert_eq!(bare.chain_name(), None);
+
+        // Present → the human chain name the outbox and ChainRegistry key on.
+        let mut snapshot = PetalPolicySnapshot::minimal(&header());
+        snapshot.policy_version = 3;
+        snapshot
+            .config
+            .insert("chain_name".into(), serde_json::json!("base"));
+        let action = SealedAction::new(
+            baseline_envelope(),
+            "plan".into(),
+            vec![],
+            terms(),
+            snapshot,
+            5,
+        )
+        .unwrap();
+        assert_eq!(action.chain_name(), Some("base"));
+    }
+
+    #[test]
     fn sealed_action_derives_digest_version_and_expiry() {
         let action = sealed_action();
         assert_eq!(action.schema, "bloom.sealed_action.v1");
@@ -3344,6 +3498,7 @@ mod tests {
             petal_policy_digest: "2".repeat(64),
             policy_version: 3,
             expiry_ms: 10_000,
+            ceremony_url: None,
         }
     }
 
@@ -3361,6 +3516,60 @@ mod tests {
         hasher.update(b"bloom.approval.v1");
         hasher.update(&c.canonical_bytes().unwrap());
         assert_eq!(c.challenge_hash().unwrap(), *hasher.finalize().as_bytes());
+    }
+
+    #[test]
+    fn ceremony_token_is_stable_and_url_uses_shared_port() {
+        let c = challenge();
+        // Deterministic function of the (single-use) nonce.
+        assert_eq!(c.ceremony_token(), c.ceremony_token());
+        // Independently recompute the derivation.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(CEREMONY_URL_TOKEN_DOMAIN);
+        hasher.update(c.server_nonce.as_bytes());
+        let expected =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize().as_bytes());
+        assert_eq!(c.ceremony_token(), expected);
+        // The URL uses the shared daemon port and embeds the token.
+        let url = c.local_ceremony_url();
+        assert!(url.contains(&format!(":{LOCAL_CEREMONY_PORT}/ceremony/")));
+        assert!(url.ends_with(&c.ceremony_token()));
+        // A different nonce yields a different token; the token/URL are not part
+        // of the signed challenge preimage.
+        let mut other = challenge();
+        other.server_nonce = "nonce-2".into();
+        assert_ne!(other.ceremony_token(), c.ceremony_token());
+        assert_eq!(
+            c.challenge_hash_hex().unwrap(),
+            c.clone()
+                .with_local_ceremony_url()
+                .challenge_hash_hex()
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn signed_approval_json_carries_assertion_not_prf() {
+        let unsigned = UnsignedApproval::for_challenge(
+            &challenge(),
+            SignerTransport::BrowserWebauthn,
+            Some("cred-1".into()),
+            None,
+        );
+        let assertion = webauthn_assertion_for(&unsigned);
+        let signed = unsigned.into_signed(assertion);
+        let value = serde_json::to_value(&signed).unwrap();
+        let obj = value.as_object().unwrap();
+        // The audit artifact carries the WebAuthn assertion...
+        assert!(obj.contains_key("webauthn_assertion"));
+        // ...and nothing resembling PRF output, decrypted keys, or a grant.
+        let json = serde_json::to_string(&signed).unwrap();
+        for forbidden in ["prf", "grant", "private", "secret", "wrap_key"] {
+            assert!(
+                !json.to_lowercase().contains(forbidden),
+                "approval.json must not contain '{forbidden}': {json}"
+            );
+        }
     }
 
     #[test]
@@ -3426,6 +3635,29 @@ mod tests {
     #[test]
     fn challenge_binds_expiry_ms() {
         assert_challenge_changes(|c| c.expiry_ms = 10_001);
+    }
+
+    #[test]
+    fn ceremony_url_is_projected_but_not_signed() {
+        let base = challenge();
+        let mut with_url = base.clone().with_local_ceremony_url();
+        assert!(with_url.ceremony_url.is_some());
+        assert_eq!(
+            base.challenge_hash().unwrap(),
+            with_url.challenge_hash().unwrap()
+        );
+        with_url.ceremony_url = Some("https://relay.example/ceremony/changed".into());
+        assert_eq!(
+            base.challenge_hash().unwrap(),
+            with_url.challenge_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn local_ceremony_url_is_stable_for_nonce() {
+        let first = challenge().with_local_ceremony_url();
+        let second = challenge().with_local_ceremony_url();
+        assert_eq!(first.ceremony_url, second.ceremony_url);
     }
 
     #[test]
@@ -3510,6 +3742,7 @@ mod tests {
             petal_policy_digest: action.petal_policy_digest.clone(),
             policy_version: action.policy_version,
             expiry_ms: 10_000,
+            ceremony_url: None,
         };
         let sealed = SealedIntentRecord {
             intent_hash,

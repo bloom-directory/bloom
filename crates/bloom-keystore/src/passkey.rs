@@ -127,6 +127,19 @@ fn launch_browser(url: &str) -> Result<(), String> {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+/// Browser WebAuthn options for a daemon-owned Mode 3 sealed-approval ceremony.
+///
+/// Produced by [`Keystore::sealed_ceremony_challenge`]; the daemon ceremony
+/// server serves `challenge_json` to the `/ceremony/{token}` page and uses
+/// `challenge_b64` to bind returned PRF output to the assertion.
+#[derive(Debug, Clone)]
+pub struct SealedCeremonyChallenge {
+    /// The full `navigator.credentials.get` options JSON (challenge + PRF ext).
+    pub challenge_json: String,
+    /// The base64url challenge value embedded in `challenge_json`.
+    pub challenge_b64: String,
+}
+
 /// Inject PRF extension into a WebAuthn challenge JSON value.
 /// Merges into existing extensions rather than replacing them.
 fn inject_prf_into_challenge_json(
@@ -1343,6 +1356,45 @@ pub(super) fn decrypt_passkey_key(
     Ok(out)
 }
 
+/// Decrypt a wallet signing key from a live ceremony's PRF output and return a
+/// ready-to-use signer. The 32-byte PRF output is consumed and zeroized here;
+/// it never leaves this frame. Shared by the foreground browser ceremony and
+/// the daemon-owned Mode 3 ceremony server so signer-decryption semantics stay
+/// identical across interaction modes.
+fn decrypt_signer_from_prf(
+    dir: &Path,
+    mut prf_output: [u8; 32],
+) -> Result<Arc<PrivateKeySigner>, KeystoreError> {
+    let enc_blob =
+        std::fs::read(dir.join("encrypted.key")).map_err(|source| KeystoreError::Io {
+            path: dir.join("encrypted.key"),
+            source,
+        })?;
+    let enc: PasskeyEncrypted = serde_json::from_slice(&enc_blob)
+        .map_err(|e| KeystoreError::Malformed(format!("encrypted.key parse: {e}")))?;
+    let result = decrypt_passkey_key(&enc, &prf_output);
+    prf_output.zeroize();
+    let mut key_bytes = result?;
+    let signer = PrivateKeySigner::from_bytes(&key_bytes.into())
+        .map_err(|e| KeystoreError::Signer(e.to_string()))?;
+    key_bytes.zeroize();
+    Ok(Arc::new(signer))
+}
+
+/// Extract the base64url `challenge` field from a browser `clientDataJSON`
+/// (base64url-encoded). Used by the daemon ceremony server to bind a posted
+/// PRF output to the challenge the assertion actually signed. Returns `None`
+/// if the blob is not valid base64url JSON with a string `challenge`.
+pub fn client_data_challenge_b64(client_data_json_b64: &str) -> Option<String> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(client_data_json_b64.trim())
+        .ok()?;
+    let cdj: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    cdj.get("challenge")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
 /// Verify `policy.toml.sig` for a PasskeyGated wallet. Returns an error if
 /// the hash doesn't match the current content or the recovered signer address
 /// doesn't match the wallet address.
@@ -1870,27 +1922,115 @@ impl super::Keystore {
             .validate_challenge(unsigned)
             .map_err(Self::from_auth_api)?;
 
-        let mut prf_output = ceremony
+        let prf_output = ceremony
             .prf_output
             .ok_or_else(|| KeystoreError::PasskeyCeremony(PRF_NOT_SUPPORTED_MSG.into()))?;
 
-        let enc_blob =
-            std::fs::read(dir.join("encrypted.key")).map_err(|source| KeystoreError::Io {
-                path: dir.join("encrypted.key"),
+        let signer = decrypt_signer_from_prf(&dir, prf_output)?;
+
+        Ok((assertion, signer))
+    }
+
+    /// Build the browser WebAuthn options (with the approval challenge and the
+    /// PRF extension) for a daemon-owned Mode 3 ceremony, without launching a
+    /// browser or binding a server. The daemon ceremony server serves the
+    /// returned `challenge_json` to the page it renders for `/ceremony/{token}`.
+    ///
+    /// This is the browserless front half of [`Self::sealed_approval_ceremony`]:
+    /// it produces exactly the same WebAuthn options the foreground ceremony
+    /// would, but the daemon — not the keystore — owns the HTTP transport.
+    pub async fn sealed_ceremony_challenge(
+        &self,
+        wallet: &str,
+        unsigned: &UnsignedApproval,
+    ) -> Result<SealedCeremonyChallenge, KeystoreError> {
+        Self::validate_name(wallet)?;
+        let dir = self.wallet_path(wallet);
+        if !dir.exists() {
+            return Err(KeystoreError::NotFound(wallet.into()));
+        }
+        let kind_str = read_trim(&dir.join("kind"))?;
+        if kind_str != "passkey" {
+            return Err(KeystoreError::PasskeyCredential(format!(
+                "sealed ceremony requires a passkey wallet (wallet '{wallet}' is '{kind_str}')"
+            )));
+        }
+        if unsigned.wallet != wallet {
+            return Err(KeystoreError::PasskeyCredential(format!(
+                "approval wallet '{}' does not match passkey wallet '{wallet}'",
+                unsigned.wallet
+            )));
+        }
+
+        let passkey_json = std::fs::read_to_string(dir.join("passkey.json")).map_err(|source| {
+            KeystoreError::Io {
+                path: dir.join("passkey.json"),
                 source,
+            }
+        })?;
+        let credential: Passkey = serde_json::from_str(&passkey_json)
+            .map_err(|e| KeystoreError::PasskeyCredential(e.to_string()))?;
+
+        let prf_salt_hex = read_trim(&dir.join("prf.salt"))?;
+        let prf_salt_bytes = hex::decode(&prf_salt_hex)
+            .map_err(|e| KeystoreError::Malformed(format!("prf.salt: {e}")))?;
+        let prf_salt: [u8; 32] = prf_salt_bytes
+            .try_into()
+            .map_err(|_| KeystoreError::Malformed("prf.salt length != 32".into()))?;
+
+        let challenge = unsigned.challenge_hash().map_err(Self::from_auth_api)?;
+        let require_uv = unsigned.assurance == AssuranceLevel::Hardened;
+
+        let webauthn = build_webauthn().map_err(KeystoreError::PasskeyCredential)?;
+        let (rcr, _auth_state) = webauthn
+            .start_passkey_authentication(std::slice::from_ref(&credential))
+            .map_err(|e| {
+                KeystoreError::PasskeyCredential(format!("start_passkey_authentication: {e}"))
             })?;
-        let enc: PasskeyEncrypted = serde_json::from_slice(&enc_blob)
-            .map_err(|e| KeystoreError::Malformed(format!("encrypted.key parse: {e}")))?;
+        let challenge_json = serde_json::to_string(&rcr)
+            .map_err(|e| KeystoreError::Malformed(format!("challenge serialise: {e}")))?;
+        let challenge_json = patch_request_challenge_json(&challenge_json, &challenge, require_uv)
+            .map_err(KeystoreError::PasskeyCredential)?;
+        let v: serde_json::Value = serde_json::from_str(&challenge_json)
+            .map_err(|e| KeystoreError::Malformed(format!("challenge parse: {e}")))?;
+        let v = inject_prf_into_challenge_json(v, &prf_salt);
+        let challenge_json = serde_json::to_string(&v)
+            .map_err(|e| KeystoreError::Malformed(format!("challenge re-serialise: {e}")))?;
+        let challenge_b64 = extract_challenge_b64(&challenge_json);
 
-        let result = decrypt_passkey_key(&enc, &prf_output);
-        prf_output.zeroize();
-        let mut key_bytes = result?;
+        Ok(SealedCeremonyChallenge {
+            challenge_json,
+            challenge_b64,
+        })
+    }
 
-        let signer = PrivateKeySigner::from_bytes(&key_bytes.into())
-            .map_err(|e| KeystoreError::Signer(e.to_string()))?;
-        key_bytes.zeroize();
-
-        Ok((assertion, Arc::new(signer)))
+    /// Decrypt the wallet signer from a daemon-owned Mode 3 ceremony's PRF
+    /// output. The daemon calls this once the browser has returned PRF output
+    /// over the trusted local channel; the 32-byte output is zeroized inside
+    /// and never persisted.
+    ///
+    /// This is the browserless back half of [`Self::sealed_approval_ceremony`].
+    /// Assertion/challenge validation is the caller's responsibility (the
+    /// daemon uses [`bloom_auth_api::WebAuthnAssertionRecord::validate_challenge`]
+    /// and the daemon-side signature verifier); this method only turns PRF
+    /// output into a usable signer.
+    pub async fn sealed_ceremony_decrypt_signer(
+        &self,
+        wallet: &str,
+        prf_output: [u8; 32],
+    ) -> Result<Arc<PrivateKeySigner>, KeystoreError> {
+        Self::validate_name(wallet)?;
+        let dir = self.wallet_path(wallet);
+        if !dir.exists() {
+            return Err(KeystoreError::NotFound(wallet.into()));
+        }
+        let kind_str = read_trim(&dir.join("kind"))?;
+        if kind_str != "passkey" {
+            return Err(KeystoreError::PasskeyCredential(format!(
+                "sealed ceremony requires a passkey wallet (wallet '{wallet}' is '{kind_str}')"
+            )));
+        }
+        decrypt_signer_from_prf(&dir, prf_output)
     }
 
     pub async fn verify_approval_signature_with_passkey(
@@ -2846,6 +2986,20 @@ mod approval_uv_tests {
         );
     }
 
+    fn browser_tests_enabled() -> bool {
+        std::env::var("BLOOM_TEST_BROWSER").as_deref() == Ok("1")
+    }
+
+    fn skip_browser_test_if_disabled(test_name: &str) -> bool {
+        if browser_tests_enabled() {
+            return false;
+        }
+        eprintln!(
+            "skipping {test_name}: set BLOOM_TEST_BROWSER=1 and plant a real passkey wallet to run this manual ceremony test"
+        );
+        true
+    }
+
     // ── sealed_approval_ceremony: browser-gated integration tests ───────────
     //
     // These need a real authenticator (the ceremony binds port 18734 and opens
@@ -2855,6 +3009,9 @@ mod approval_uv_tests {
     #[tokio::test]
     #[ignore = "requires a real authenticator; set BLOOM_TEST_BROWSER=1"]
     async fn sealed_approval_ceremony_returns_assertion_and_signer() {
+        if skip_browser_test_if_disabled("sealed_approval_ceremony_returns_assertion_and_signer") {
+            return;
+        }
         let td = tempfile::tempdir().unwrap();
         let ks = crate::Keystore::new(td.path()).unwrap();
         // NOTE: this fixture does NOT create a wallet; a maintainer must first
@@ -2878,6 +3035,9 @@ mod approval_uv_tests {
     #[tokio::test]
     #[ignore = "requires a real authenticator; set BLOOM_TEST_BROWSER=1"]
     async fn sealed_approval_ceremony_fails_when_no_prf_output() {
+        if skip_browser_test_if_disabled("sealed_approval_ceremony_fails_when_no_prf_output") {
+            return;
+        }
         let td = tempfile::tempdir().unwrap();
         let ks = crate::Keystore::new(td.path()).unwrap();
         // Same plant-a-wallet caveat as above; this asserts that an
@@ -2894,6 +3054,11 @@ mod approval_uv_tests {
     #[tokio::test]
     #[ignore = "requires a real authenticator; set BLOOM_TEST_BROWSER=1"]
     async fn sealed_approval_ceremony_fails_when_uv_missing_for_hardened() {
+        if skip_browser_test_if_disabled(
+            "sealed_approval_ceremony_fails_when_uv_missing_for_hardened",
+        ) {
+            return;
+        }
         let td = tempfile::tempdir().unwrap();
         let ks = crate::Keystore::new(td.path()).unwrap();
         // Same plant-a-wallet caveat. A hardened approval must require user

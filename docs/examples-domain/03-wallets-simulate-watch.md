@@ -173,14 +173,14 @@ cat <<'EOF' > /bloom/wallets/alice/chains/anvil/outbox/new.tx
 }
 EOF
 
-# ERC-20 transfer, JSON. Token + value with a unit triggers ERC-20 encoding.
+# ERC-20 transfer, JSON. Token + amount triggers ERC-20 encoding.
 # The engine resolves the token, encodes transfer(address,uint256),
 # and renders the plan as a token transfer (TokenRef in plan.md).
 cat <<'EOF' > /bloom/wallets/alice/chains/base/outbox/new.tx
 {
   "kind": "send",
   "to": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-  "value": "10",
+  "amount": "10",
   "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
   "chain": "base"
 }
@@ -204,6 +204,47 @@ Staging always: parses the intent, fills nonce + fees, simulates, runs
 policy, and writes `pending/<id>/{intent.json, plan.md, policy_check.json}`.
 A failed simulation or a `Deny` policy outcome surfaces as a write
 error — nothing lands in `pending/`.
+
+### Nonce assignment & overrides
+
+By default the nonce **auto-increments**: staging picks
+`max(chain_pending_nonce, highest_pending_outbox_nonce + 1)`. This is
+what lets you stage a sequence before broadcasting any of it — e.g. a
+DeFi `approve` (nonce N) then `swap` (nonce N+1) — and have them occupy
+consecutive slots. Ordered bundles additionally record a `depends_on`
+link so a dependent's `confirm` is refused until its predecessor mines.
+
+To pin an exact nonce, add a `nonce` field to the `new.tx` body (JSON or
+TOML). Use it to deliberately fill a gap or queue a specific slot:
+
+```sh
+cat <<'EOF' > /bloom/wallets/alice/chains/anvil/outbox/new.tx
+{ "kind": "send", "to": "0x7099…79C8", "value": "0.01 eth", "chain": "anvil", "nonce": 3 }
+EOF
+```
+
+**Broadcast-time nonce-gap guard.** The auto-increment reservation is
+optimistic — a staged entry reserves its slot before it broadcasts — so
+an entry that is staged but never broadcast (an expired Sealed Approval,
+a confirm abandoned at the approval gate) could otherwise push a later tx
+one nonce past a gap that never fills. An RPC *accepts* such a
+future-nonce tx into its queued set and returns a hash, so it looks
+broadcast, but it can never mine. To prevent this silent strand, `confirm`
+refuses at broadcast when the staged nonce is ahead of the account's next
+on-chain nonce with nothing filling the gap. The refusal writes a
+`pending/<id>/nonce_gap.json` advisory:
+
+```json
+{
+  "schema": "bloom.nonce_gap.v1",
+  "staged_nonce": 5,
+  "chain_next_nonce": 0,
+  "advice": "broadcast nonce 0 first, or restage with an explicit `nonce` to fill the gap deliberately"
+}
+```
+
+Resolve it by broadcasting the missing nonce(s) first, or by restaging
+with an explicit `nonce` to fill the gap on purpose.
 
 ### Review
 

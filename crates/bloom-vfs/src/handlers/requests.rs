@@ -1992,6 +1992,7 @@ mod tests {
                 petal_policy_digest: "2".repeat(64),
                 policy_version: 0,
                 expiry_ms,
+                ceremony_url: None,
             })
         }
 

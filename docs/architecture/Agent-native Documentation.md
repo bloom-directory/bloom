@@ -28,7 +28,7 @@ How it works today:
 - The same content is also readable at `/docs/agent-guidance.md` through the
   docs handler, alongside `/docs/README.md` and `/docs/examples.md`.
 
-Because the content is compiled into the daemon, the documentation an agent
+Because the content is compiled into the Bloom Machine, the documentation an agent
 reads is always the documentation of the exact binary serving the mount.
 There is no runtime templating and no way for the served guidance to drift
 from the release it ships with.
@@ -43,18 +43,19 @@ from the release it ships with.
   sessions/capabilities; the owner key is never handed to an agent;
 - the outbox stage/confirm flow;
 - paid HTTP under `/requests` (staging, `plan.md`, `confirm`, spend caps);
+- the mounted Sealed Approval lifecycle for the EVM slice: permission-denied
+  confirm writes, `approval_challenge.json`, `ceremony_url`, grant / grant +
+  execute, and retrying after a grant-only approval;
 - Hyperliquid session-first trading and Polymarket opt-in gating;
 - passkey policy signing and `under_policy` semantics.
 
-When the mounted Sealed Approval flow described in
-[`Interaction Modes.md`](./Interaction%20Modes.md) is implemented, the
-guidance must be extended to document that lifecycle end to end: the
-permission-denied signal on a confirm write, reading
-`approval_challenge.json` from the same pending directory, forwarding or
-opening `ceremony_url`, the grant / grant + execute choice, and retrying the
-confirm write after a grant-only approval. The mount-root guidance is the
-discovery mechanism for that contract; there is no per-action hint file and
-no per-directory README duplication of global contracts.
+As additional Petals adopt the mounted Sealed Approval flow described in
+[`Interaction Modes.md`](./Interaction%20Modes.md), the guidance must stay the
+discovery mechanism for that contract: the permission-denied signal on a confirm
+write, reading `approval_challenge.json` from the same pending directory,
+forwarding or opening `ceremony_url`, the grant / grant + execute choice, and
+retrying the confirm write after a grant-only approval. There is no per-action
+hint file and no per-directory README duplication of global contracts.
 
 ## Per-Petal READMEs
 
@@ -93,10 +94,9 @@ or explicitly justify why no update is needed.
 
 ## Extension Points
 
-- The router exposes a `root_dynamic` registration mechanism for future
-  dynamic root-level files. The guidance references a planned `/next.md`
-  aggregator (a daemon-rendered "what needs my attention" file); it is not
-  yet implemented and `root_dynamic` is where it would attach.
+- The router exposes a `root_dynamic` registration mechanism for dynamic
+  root-level files. The Bloom Machine uses it for `/next.md`, a Bloom Machine-rendered "what
+  needs my attention" aggregator for agent workflows.
 - New global agent-facing documents belong at the mount root or under
   `/docs`, embedded at compile time and covered by byte-identity tests, not
   generated at runtime and not scattered per-directory.

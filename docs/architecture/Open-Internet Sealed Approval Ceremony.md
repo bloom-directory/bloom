@@ -1,6 +1,6 @@
 # Open-Internet Sealed Approval Ceremony
 
-**Status:** architecture proposal — **not implemented**
+**Status:** architecture proposal — relay not implemented
 **Audience:** Bloom engineers, Petal authors, and implementation agents
 
 This document describes how the Sealed Approval ceremony URL becomes reachable
@@ -8,13 +8,17 @@ over the open internet, so an agent can send it to the user over Slack, chat,
 or any other transport and the user can complete the ceremony from another
 device.
 
-Nothing in this document is implemented today. The current ceremony server is
-an ephemeral localhost HTTP server launched in-process by the foreground CLI.
-This document is the target design. The `ceremony_url` contract itself — the
-field in `approval_challenge.json`, single-use token, `expiry_ms` bound — is
-defined in [`Sealed Approvals.md`](./Sealed%20Approvals.md) and
-[`Interaction Modes.md`](./Interaction%20Modes.md) and applies in both
-exposure modes.
+The open-internet relay described here is not implemented today. The current
+mounted-VFS implementation supports Bloom Machine-owned loopback ceremony URLs on
+`http://localhost:18734`: `approval_challenge.json` carries a local
+`ceremony_url`, the token is derived from `server_nonce`, and the Bloom Machine owns
+grant minting for the mounted EVM slice. This document is the target design for
+making that same ceremony reachable from another device over the open internet.
+The `ceremony_url` contract itself — the field in `approval_challenge.json`,
+single-use token, `expiry_ms` bound — is defined in
+[`Sealed Approvals.md`](./Sealed%20Approvals.md) and
+[`Interaction Modes.md`](./Interaction%20Modes.md) and applies in both exposure
+modes.
 
 ## Decision Summary
 
@@ -25,21 +29,21 @@ exposure modes.
 - Exposure is **uniform across assurance levels**. There is no separate
   localhost-only handling for high-assurance actions; hardening means flipping
   the global setting to `localhost`.
-- TLS terminates at the daemon. The relay is a blind forwarder and never sees
+- TLS terminates at the Bloom Machine. The relay is a blind forwarder and never sees
   plaintext.
 - The ceremony page and API expose **grant** and **grant + execute** modes;
   the user decides how the approved action is executed.
 
 ## Relay Architecture
 
-The daemon cannot accept inbound connections from the internet, so
+The Bloom Machine cannot accept inbound connections from the internet, so
 reachability comes from an outbound relay connection:
 
 ```text
-daemon holds a persistent outbound connection to the relay
-relay routes by TLS SNI to the daemon's connection
-daemon terminates TLS with a certificate for its stable hostname
-browser <-- end-to-end TLS --> daemon, through the relay
+Bloom Machine holds a persistent outbound connection to the relay
+relay routes by TLS SNI to the Bloom Machine's connection
+Bloom Machine terminates TLS with a certificate for its stable hostname
+browser <-- end-to-end TLS --> Bloom Machine, through the relay
 ```
 
 Properties:
@@ -47,17 +51,17 @@ Properties:
 - The relay is a dumb SNI-routing TCP forwarder. It does not terminate TLS
   and never sees plaintext.
 - Each installation gets a stable per-install hostname, for example
-  `<node-id>.<relay-domain>`. The daemon holds the certificate and private key
+  `<node-id>.<relay-domain>`. The Bloom Machine holds the certificate and private key
   for that hostname.
 - The ceremony URL shape is
   `https://<node-id>.<relay-domain>/ceremony/<token>`.
 - A first-party hosted relay is the default; the relay endpoint is
   configurable so users can self-host.
 
-**Why TLS must terminate at the daemon.** The ceremony returns PRF output —
-wallet key-unwrap material — from the browser to the daemon. Sealed Approvals
+**Why TLS must terminate at the Bloom Machine.** The ceremony returns PRF output —
+wallet key-unwrap material — from the browser to the Bloom Machine. Sealed Approvals
 requires PRF output to exist only on the trusted ceremony channel and in
-daemon memory. With daemon-terminated TLS, that invariant holds even though
+Bloom Machine memory. With Bloom Machine-terminated TLS, that invariant holds even though
 the bytes transit the internet. A relay that terminated TLS would be in a
 position to read PRF output and to serve tampered ceremony JavaScript that
 exfiltrates it. That design is forbidden.
@@ -84,14 +88,15 @@ exfiltrates it. That design is forbidden.
   action.
 - The URL is valid until the challenge's existing `expiry_ms`. There is no
   separate URL expiry field.
-- The first open claims the ceremony; subsequent opens are rejected with an
-  "already claimed" response.
-- The daemon rate-limits ceremony endpoint traffic.
+- The token is considered used only after successful approval completion
+  consumes the underlying challenge nonce; repeated page/plan/challenge reads
+  before completion remain valid until `expiry_ms`.
+- The Bloom Machine rate-limits ceremony endpoint traffic.
 - Repeated confirm writes while a challenge is pending reuse the same URL; the
   nonce and URL rotate only after expiry or consumption.
 
 **What URL possession gets an attacker — and does not.** Anyone holding the
-link before it is claimed or expired can view the daemon-rendered plan
+link before it is claimed or expired can view the Bloom Machine-rendered plan
 (amounts, destinations). They cannot approve: approval requires a WebAuthn
 assertion with user verification from a passkey enrolled for the wallet. Plan
 visibility to a link holder is the accepted tradeoff of the internet-default
@@ -115,23 +120,24 @@ at approval time:
   when the client (typically the agent that staged the action) retries the
   confirm write or command.
 - **grant + execute**: verify the approval, mint the grant, and execute the
-  sealed action immediately in the daemon. This matters for the remote case,
+  sealed action immediately in the Bloom Machine. This matters for the remote case,
   where the user approving from another device may not have a client available
   to retry.
 
-Auto-execution is never a silent daemon default.
+Auto-execution is never a silent Bloom Machine default.
 
 ## Changes From the Current Implementation
 
-For orientation, the target design differs from today's code in these ways:
+For orientation, the target relay design differs from today's code in these
+ways:
 
-- Today the ceremony server is an ephemeral axum server on
-  `http://localhost:18734` with RP ID `localhost`, launched only when the
-  foreground CLI runs the ceremony in its own in-process daemon. In the target
-  design, the `bloom serve` daemon owns the ceremony endpoint, mints the URL
-  at challenge issuance, and holds the resulting grant in its own memory.
-- Today `approval_challenge.json` carries no URL. In the target design it
-  carries `ceremony_url`, written before the triggering confirm write returns.
-- Today there is no relay, per-install hostname, or daemon-held certificate.
+- Today `bloom serve` binds the Bloom Machine-owned mounted ceremony server on
+  `http://localhost:18734` with RP ID `localhost`; it does not expose that
+  endpoint over the open internet.
+- Today `approval_challenge.json` carries a local loopback `ceremony_url` for
+  the mounted EVM slice. In the target relay design, the same projection points
+  at a per-install HTTPS hostname.
+- Today there is no relay, per-install hostname, internet exposure setting, or
+  Bloom Machine-held public certificate for a relay hostname.
 
-None of this is normative until implemented.
+The relay-specific parts of this document are not normative until implemented.

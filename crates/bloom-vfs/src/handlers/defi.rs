@@ -696,8 +696,9 @@ impl DefiHandler {
         let intent = RawIntent {
             body: RawIntentBody::Send {
                 to: bridge.clone(),
-                value: amount.to_string(),
+                value: String::new(),
                 token: Some("USDC".to_string()),
+                amount: amount.to_string(),
                 data: None,
             },
             chain: Some(chain_name.clone()),
