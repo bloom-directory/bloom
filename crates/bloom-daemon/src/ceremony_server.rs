@@ -440,17 +440,16 @@ async fn complete(
     // Hyperliquid mounted-VFS approvals are grant-backed: the retry path checks
     // the live grant store and signs through PetalHost, so there is no EVM
     // outbox artifact to write here.
-    if action.surface() != "hyperliquid" {
-        if let Err(e) = daemon
+    if action.surface() != "hyperliquid"
+        && let Err(e) = daemon
             .tx_engine
             .persist_outbox_ceremony_approval(&action, &signed)
-        {
-            revoke_grant_and_drop_cache(daemon, grant_store.as_ref(), &grant.grant_id, now).await;
-            return err_json(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("persist approval artifact: {e}"),
-            );
-        }
+    {
+        revoke_grant_and_drop_cache(daemon, grant_store.as_ref(), &grant.grant_id, now).await;
+        return err_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("persist approval artifact: {e}"),
+        );
     }
 
     // grant + execute: broadcast immediately from sealed bytes.
