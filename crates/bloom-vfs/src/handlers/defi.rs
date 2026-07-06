@@ -211,6 +211,7 @@ pub struct DefiHandler {
     /// the daemon may override from `[hyperliquid]` config.
     hl_bridge: Address,
     hl_deposit_chain_id: u64,
+    auth_services: crate::AuthServices,
 }
 
 impl DefiHandler {
@@ -238,7 +239,13 @@ impl DefiHandler {
                 .parse()
                 .expect("valid hyperliquid bridge const"),
             hl_deposit_chain_id: bloom_proto::hyperliquid::DEPOSIT_CHAIN_ID,
+            auth_services: crate::AuthServices::default(),
         }
+    }
+
+    pub fn with_auth_services(mut self, auth_services: crate::AuthServices) -> Self {
+        self.auth_services = auth_services;
+        self
     }
 
     /// Override the Hyperliquid bridge address + deposit chain (from
@@ -689,8 +696,9 @@ impl DefiHandler {
         let intent = RawIntent {
             body: RawIntentBody::Send {
                 to: bridge.clone(),
-                value: amount.to_string(),
+                value: String::new(),
                 token: Some("USDC".to_string()),
+                amount: amount.to_string(),
                 data: None,
             },
             chain: Some(chain_name.clone()),

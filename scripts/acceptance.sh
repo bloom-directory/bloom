@@ -33,6 +33,28 @@ ok()   { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
 
 bloom() { RUST_LOG=error "$BLOOM_BIN" --home "$HOME_DIR" "$@" 2>/dev/null; }
 
+expect_sealed_challenge() {
+  local staged_id=$1 label=$2 err_file central_id challenge
+  err_file="$HOME_DIR/${label// /_}.confirm.err"
+  if BLOOM_PASSPHRASE=acceptance-pass "$BLOOM_BIN" --home "$HOME_DIR" wallet confirm \
+      alice local "$staged_id" --passphrase acceptance-pass --text y --quiet \
+      >"$HOME_DIR/${label// /_}.confirm.out" 2>"$err_file"; then
+    fail "$label: confirm unexpectedly succeeded without Sealed Approval"
+  fi
+  grep -q "broadcast approval required" "$err_file" \
+    || fail "$label: confirm did not report sealed approval requirement"
+  test -f "$HOME_DIR/outbox/alice/local/pending/$staged_id/approval_challenge.json" \
+    || fail "$label: wallet projection missing approval_challenge.json"
+  central_id=$(jq -r '.action_id' "$HOME_DIR/outbox/alice/local/pending/$staged_id/approval_challenge.json")
+  challenge="$HOME_DIR/central_outbox/pending/$central_id/approval_challenge.json"
+  test -f "$challenge" || fail "$label: central outbox missing approval_challenge.json for $central_id"
+  jq -e '.ceremony_url | strings | (startswith("http://localhost") or startswith("http://127.0.0.1"))' "$challenge" >/dev/null \
+    || fail "$label: central approval_challenge.json missing local ceremony_url"
+  jq -e --arg id "$central_id" '.action_id == $id' "$challenge" >/dev/null \
+    || fail "$label: central challenge action_id mismatch"
+  ok "$label staged $staged_id -> central /outbox/pending/$central_id with ceremony_url"
+}
+
 # Anvil's default mnemonic — first account, 10000 ETH.
 ANVIL_KEY=$ANVIL_KEY_0
 ANVIL_ADDR=$ANVIL_ADDR_0
@@ -74,20 +96,22 @@ EOF
 
 # 0b. Import the anvil key.
 log "importing anvil key"
-BLOOM_PASSPHRASE="acceptance-pass" bloom wallet import alice "$ANVIL_KEY" --passphrase acceptance-pass >/dev/null
+PASSPHRASE_FILE="$HOME_DIR/acceptance-passphrase"
+printf '%s\n' "acceptance-pass" > "$PASSPHRASE_FILE"
+chmod 600 "$PASSPHRASE_FILE"
+bloom wallet import alice "$ANVIL_KEY" \
+  --local \
+  --allow-passphrase-wallet \
+  --passphrase-file "$PASSPHRASE_FILE" \
+  >/dev/null
 bloom wallet list
 
 # ============================================================== 1. native
-log "scenario 1: native ETH send"
+log "scenario 1: native ETH send sealed-approval gate"
 INTENT='{"to":"'"$DEST_ADDR"'","value":"0.5 ETH","chain":"local"}'
 STAGED=$(BLOOM_PASSPHRASE=acceptance-pass bloom wallet stage alice local --intent "$INTENT")
 log "staged id: $STAGED"
-BEFORE=$(cast balance "$DEST_ADDR" --rpc-url http://127.0.0.1:8545)
-BLOOM_PASSPHRASE=acceptance-pass bloom wallet confirm alice local "$STAGED" --passphrase acceptance-pass --text y
-sleep 1
-AFTER=$(cast balance "$DEST_ADDR" --rpc-url http://127.0.0.1:8545)
-[ "$AFTER" != "$BEFORE" ] || fail "native send: balance unchanged"
-ok "native send delta: $BEFORE -> $AFTER"
+expect_sealed_challenge "$STAGED" "native send"
 
 # ============================================================== 2. ERC-20
 log "scenario 2: ERC-20 transfer"
@@ -144,11 +168,7 @@ SOL
   ERC20_INTENT='{"chain":"local","token":"'"$TOKEN_ADDR"'","to":"'"$DEST_ADDR"'","value":"100"}'
   STAGED=$(BLOOM_PASSPHRASE=acceptance-pass bloom wallet stage alice local --intent "$ERC20_INTENT")
   log "erc20 staged id: $STAGED"
-  BLOOM_PASSPHRASE=acceptance-pass bloom wallet confirm alice local "$STAGED" --passphrase acceptance-pass --text y
-  sleep 1
-  TOKEN_BAL=$(cast call "$TOKEN_ADDR" "balanceOf(address)(uint256)" "$DEST_ADDR" --rpc-url http://127.0.0.1:8545)
-  [ "$TOKEN_BAL" != "0" ] || fail "erc20: dest balance still zero"
-  ok "erc20 dest balance: $TOKEN_BAL"
+  expect_sealed_challenge "$STAGED" "erc20 transfer"
   rm -rf "$TMPDIR_FORGE"
 fi
 

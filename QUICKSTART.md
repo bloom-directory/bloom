@@ -261,9 +261,11 @@ home. Exit the subshell to tear everything down.
 
 ## End-to-end acceptance
 
-`scripts/acceptance.sh` boots Anvil, imports the funded test key, and
-drives a native ETH send and an ERC-20 transfer through the
-stage-confirm-broadcast loop on a local devnet. Optional Uniswap V2 /
+`scripts/acceptance.sh` boots Anvil, imports the funded test key, stages a
+native ETH send and an ERC-20 transfer, and verifies the mounted Sealed
+Approval gate: initial confirm is denied, `approval_challenge.json` is
+written in both the wallet projection and central `/outbox/pending/<action_id>`
+store, and the challenge includes a local `ceremony_url`. Optional Uniswap V2 /
 Enso scenarios on a mainnet fork run when `BLOOM_MAINNET_RPC` is set.
 
 `tests/docker/run.sh` is the dockerized harness with six modes:

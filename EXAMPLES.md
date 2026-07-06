@@ -723,13 +723,13 @@ cat <<'EOF' > /bloom/wallets/alice/chains/anvil/outbox/new.tx
 }
 EOF
 
-# ERC-20 transfer (token + value with a unit triggers ERC-20 encoding).
+# ERC-20 transfer (token + amount triggers ERC-20 encoding).
 # Below: send 10 USDC on Base to a test recipient.
 cat <<'EOF' > /bloom/wallets/alice/chains/base/outbox/new.tx
 {
   "kind": "send",
   "to": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
-  "value": "10",
+  "amount": "10",
   "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
   "chain": "base"
 }

@@ -19,6 +19,7 @@ bytecode-decompile = ["bloom-daemon/bytecode-decompile"]
 
 [dependencies]
 bloom-proto.workspace = true
+bloom-auth-api.workspace = true
 bloom-daemon.workspace = true
 bloom-chain-node = { path = "../bloom-chain-node" }
 bloom-chain-types = { path = "../bloom-chain-types" }

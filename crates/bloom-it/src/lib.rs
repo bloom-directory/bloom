@@ -13,6 +13,15 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use bloom_auth_api::{
+    AssuranceLevel, CANONICAL_INTENT_HEADER_SCHEMA_V2, CanonicalEnvelope, CanonicalIntentHeader,
+    DaemonGrantTerms, EVM_SEALED_INTENT_SUBJECT_KIND, EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1,
+    EVM_TX_SIGN_INTENT, ExecutorKind, GrantStore, PetalPolicySnapshot, SealedAction,
+    SealedApprovalGrant,
+    petal_identity::{
+        FIRST_PARTY_PETAL_VERSION_V0, PETAL_ID_EVM_WALLET, PLACEHOLDER_DIGEST_EVM_WALLET,
+    },
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
@@ -144,4 +153,60 @@ pub async fn cast_send(rpc_url: &str, args: &[&str]) -> Result<String> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+pub async fn mint_evm_test_grant(
+    grant_store: &dyn GrantStore,
+    wallet: &str,
+    action_id: &str,
+    action_kind: &str,
+    chain_id: u64,
+    account: &str,
+    now_ms: u64,
+) -> Result<SealedApprovalGrant> {
+    let expires_ms = now_ms.saturating_add(120_000);
+    let header = CanonicalIntentHeader {
+        schema: CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+        wallet: wallet.into(),
+        surface: "outbox".into(),
+        action_id: action_id.into(),
+        petal_id: PETAL_ID_EVM_WALLET.into(),
+        petal_digest: PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+        petal_version: FIRST_PARTY_PETAL_VERSION_V0.into(),
+        executor_kind: ExecutorKind::FirstParty,
+        network: format!("eip155:{chain_id}"),
+        account: account.into(),
+        action_kind: action_kind.into(),
+        value_movement: true,
+        authority_change: false,
+        expires_ms,
+    };
+    let envelope = CanonicalEnvelope::new(
+        header.clone(),
+        EVM_SEALED_INTENT_SUBJECT_KIND,
+        EVM_SEALED_INTENT_SUBJECT_SCHEMA_V1,
+        serde_json::to_vec(&serde_json::json!({
+            "schema": "bloom.it.evm_test_grant_subject.v1",
+            "wallet": wallet,
+            "action_id": action_id,
+            "action_kind": action_kind,
+            "chain_id": chain_id,
+            "account": account,
+        }))?,
+    );
+    let mut terms = DaemonGrantTerms::minimal(AssuranceLevel::Standard);
+    terms.allowed_sign_intents = vec![EVM_TX_SIGN_INTENT.into()];
+    terms.max_signatures = 1;
+    let action = SealedAction::new(
+        envelope,
+        format!("integration grant for {action_kind} {action_id}"),
+        Vec::new(),
+        terms,
+        PetalPolicySnapshot::minimal(&header),
+        now_ms,
+    )?;
+    grant_store
+        .mint(&action, expires_ms, now_ms)
+        .await
+        .map_err(Into::into)
 }

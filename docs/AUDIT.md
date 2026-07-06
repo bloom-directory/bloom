@@ -5,9 +5,10 @@
 **Workspace:** 15 crates · `cargo build --workspace` clean ·
 `cargo clippy --workspace --all-targets -- -D warnings` clean.
 **Acceptance:** `scripts/acceptance.sh` passes scenarios 1 (native
-send) + 2 (ERC-20 transfer) end-to-end against Anvil. Scenarios 3 + 4
-(Uniswap V2 + Enso on a mainnet fork) auto-skip without
-`BLOOM_MAINNET_RPC`.
+send) + 2 (ERC-20 transfer) through the mounted Sealed Approval gate
+against Anvil: initial confirm is denied and the central
+`approval_challenge.json` includes a local `ceremony_url`. Scenarios 3 + 4
+(Uniswap V2 + Enso on a mainnet fork) auto-skip without `BLOOM_MAINNET_RPC`.
 **Live:** `tests/docker/run.sh --enso-live` exercises Enso + Aave on
 Base mainnet through the mounted filesystem surface.
 

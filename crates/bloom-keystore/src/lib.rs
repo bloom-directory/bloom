@@ -30,6 +30,8 @@
 
 pub mod ephemeral;
 pub(crate) mod passkey;
+pub use passkey::{SealedCeremonyChallenge, client_data_challenge_b64};
+pub mod petal_host;
 pub mod xdsa;
 #[cfg(test)]
 mod xdsa_tests;
@@ -49,6 +51,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
+use bloom_auth_api::{
+    ApprovalSignatureVerifier, AuthApiError, UnsignedApproval, WebAuthnAssertionRecord,
+};
 use bloom_proto::{Policy, checksum_address};
 
 // ── errors ────────────────────────────────────────────────────────────────────
@@ -828,7 +833,7 @@ impl Keystore {
         // For passkey wallets check the signer is available BEFORE writing
         // anything, so disk stays consistent if the wallet is locked.
         if kind_str == "passkey" {
-            let _ = self.signer(name)?;
+            let _ = self.cached_signer(name)?;
         }
 
         write_atomic(&dir.join("policy.toml"), toml_bytes)?;
@@ -851,6 +856,17 @@ impl Keystore {
     }
 
     pub fn signer(&self, name: &str) -> Result<Arc<PrivateKeySigner>, KeystoreError> {
+        let info = self.info_unverified(name)?;
+        if info.kind == WalletKind::PasskeyGated {
+            return Err(KeystoreError::Signer(
+                "passkey wallet signing requires a Sealed Approval grant via PetalHost::sign_hash"
+                    .into(),
+            ));
+        }
+        self.cached_signer(name)
+    }
+
+    pub(crate) fn cached_signer(&self, name: &str) -> Result<Arc<PrivateKeySigner>, KeystoreError> {
         match self.inner.unlocked.read().get(name).cloned() {
             Some(s) => Ok(s),
             None => {
@@ -928,6 +944,36 @@ impl Keystore {
             policy: default_policy,
             recovery_key: None,
         })
+    }
+}
+
+#[derive(Clone)]
+pub struct KeystoreApprovalSignatureVerifier {
+    keystore: Keystore,
+}
+
+impl KeystoreApprovalSignatureVerifier {
+    pub fn new(keystore: Keystore) -> Self {
+        Self { keystore }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApprovalSignatureVerifier for KeystoreApprovalSignatureVerifier {
+    async fn verify_signature(
+        &self,
+        unsigned: &UnsignedApproval,
+        webauthn_assertion: &WebAuthnAssertionRecord,
+        _now_ms: u64,
+    ) -> Result<(), AuthApiError> {
+        match self
+            .keystore
+            .verify_approval_signature_with_passkey(unsigned, webauthn_assertion)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => Err(AuthApiError::Denied(e.to_string())),
+        }
     }
 }
 
@@ -1102,6 +1148,30 @@ mod tests {
         assert_eq!(s.address(), info.address);
         ks.lock("alice");
         assert!(!ks.is_unlocked("alice"));
+    }
+
+    #[test]
+    fn public_signer_rejects_passkey_wallet_even_when_cached() {
+        let (dir, ks) = temp_store();
+        let (_wallet_dir, _) = setup_passkey_dir(dir.path(), "pk-cached");
+        ks.inner
+            .unlocked
+            .write()
+            .insert("pk-cached".into(), Arc::new(PrivateKeySigner::random()));
+
+        let err = ks.signer("pk-cached").unwrap_err();
+        assert!(
+            matches!(err, KeystoreError::Signer(_)),
+            "expected passkey signer migration error, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("PetalHost::sign_hash"),
+            "error should point to grant-backed host signing: {err}"
+        );
+        assert!(
+            ks.cached_signer("pk-cached").is_ok(),
+            "internal sealed/passkey paths can still use the cached signer"
+        );
     }
 
     #[test]

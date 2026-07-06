@@ -5,7 +5,10 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ceremony_server;
 pub mod ipc;
+pub mod sealed_ceremony;
+pub mod sign_hash;
 
 mod ens_resolver;
 mod price_oracle;
@@ -13,6 +16,7 @@ mod price_oracle;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bloom_auth::{AuthStore, StoreApprovalVerifier};
 use bloom_chain::{ChainClient, ChainRegistry};
 use bloom_chain_node::rpc::{RpcChainAdapter, RpcClient};
 use bloom_chain_types::ssz::Encode;
@@ -22,7 +26,7 @@ use bloom_defi::EnsoClient;
 use bloom_ens::EnsClient;
 use bloom_etherscan::EtherscanClient;
 use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork};
-use bloom_keystore::Keystore;
+use bloom_keystore::{Keystore, KeystoreApprovalSignatureVerifier};
 use bloom_paid_http::PaidHttpChainRpcResolver;
 use bloom_petals::{NameRegistry, PetalRunner, PetalStore, PetalVm, PetalsHandler};
 use bloom_polymarket::{ClobClient, CredentialStore, DataClient, GammaClient, GeoblockClient};
@@ -33,22 +37,110 @@ use bloom_revert::{
     OpenchainDecoder, boxed,
 };
 use bloom_script::{ChainStateIface, PqSignature, PtbTx};
-use bloom_tx::outbox::Outbox;
+use bloom_tx::outbox::{CentralActionIdentity, CentralOutboxProjection, Outbox};
 use bloom_tx::tx_engine::TxEngine;
+use bloom_vfs::handlers::outbox::StagedPetalIdentity;
 use bloom_vfs::handlers::polymarket::{ChainClientReader, PolymarketOnboarding, build_onboarder};
 use bloom_vfs::handlers::status::{MempoolBackendStatus, PrivateRpcBackendStatus};
 use bloom_vfs::handlers::{
-    AddressBookHandler, ChainsHandler, DefiHandler, DocsHandler, EnsHandler, HyperliquidHandler,
-    PolymarketHandler, PricesHandler, RequestsHandler, SimulateHandler, StatusHandler,
-    ToolsHandler, WalletsHandler, WatchHandler,
+    AddressBookHandler, CentralOutbox, ChainsHandler, DefiHandler, DocsHandler, EnsHandler,
+    HyperliquidHandler, OutboxHandler, PolymarketHandler, PricesHandler, RequestsHandler,
+    SimulateHandler, StatusHandler, ToolsHandler, WalletsHandler, WatchHandler,
 };
 use bloom_vfs::tx_handler::PtbSubmitter;
-use bloom_vfs::{HandlerError, PathCache, Vfs};
+use bloom_vfs::{AuthServices, HandlerError, PathCache, Vfs};
 use bloom_watch::{WatchExecutor, WatchRegistry};
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+
+use std::sync::Mutex;
+
+/// Concrete adapter that bridges [`CentralOutbox`] (filesystem) and
+/// [`AuthStore`] (action_id_map) to satisfy [`CentralOutboxProjection`]
+/// for the EVM tx-engine outbox.
+struct EvmOutboxProjection {
+    central: CentralOutbox,
+    auth: Mutex<AuthStore>,
+}
+
+impl EvmOutboxProjection {
+    fn new(central: CentralOutbox, auth: AuthStore) -> Self {
+        Self {
+            central,
+            auth: Mutex::new(auth),
+        }
+    }
+}
+
+impl CentralOutboxProjection for EvmOutboxProjection {
+    fn allocate_action_id(
+        &self,
+        surface: &str,
+        venue_local_id: &str,
+        wallet: &str,
+        staged_at_ms: u64,
+    ) -> Result<String, String> {
+        let mut auth = self.auth.lock().map_err(|e| e.to_string())?;
+        auth.allocate_action_id(surface, venue_local_id, wallet, staged_at_ms)
+            .map_err(|e| e.to_string())
+    }
+
+    fn stage_action(
+        &self,
+        action_id: &str,
+        intent_json: &[u8],
+        plan_md: &str,
+        policy_check_json: &[u8],
+        identity: CentralActionIdentity<'_>,
+    ) -> Result<(), String> {
+        let intent_hash = bloom_auth_api::intent_hash_of(intent_json);
+        self.central
+            .stage_with_identity(
+                action_id,
+                intent_json,
+                &intent_hash,
+                plan_md,
+                policy_check_json,
+                &StagedPetalIdentity {
+                    petal_id: identity.petal_id.to_string(),
+                    petal_digest: identity.petal_digest.to_string(),
+                    petal_version: identity.petal_version.to_string(),
+                },
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    fn transition_action(&self, action_id: &str, from: &str, to: &str) -> Result<(), String> {
+        self.central
+            .transition(action_id, from, to)
+            .map_err(|e| e.to_string())
+    }
+
+    fn write_action_file(
+        &self,
+        action_id: &str,
+        state: &str,
+        file: &str,
+        data: &[u8],
+    ) -> Result<(), String> {
+        self.central
+            .write_action_file(action_id, state, file, data)
+            .map_err(|e| e.to_string())
+    }
+
+    fn read_action_file(
+        &self,
+        action_id: &str,
+        state: &str,
+        file: &str,
+    ) -> Result<Vec<u8>, String> {
+        self.central
+            .read_action_file(action_id, state, file)
+            .map_err(|e| e.to_string())
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -82,6 +174,8 @@ pub struct Daemon {
     pub home_write_permit: Option<Arc<HomeWritePermit>>,
     pub address_book: Arc<AddressBook>,
     pub audit: Arc<AuditLog>,
+    pub auth_services: AuthServices,
+    pub signer_cache: Arc<bloom_keystore::petal_host::SignerCache>,
     pub vfs: Vfs,
     pub petals: PetalRunner,
     pub watch_registry: Arc<WatchRegistry>,
@@ -242,8 +336,18 @@ impl Daemon {
         let keystore =
             Keystore::new(home.keystore_dir()).map_err(|e| DaemonError::Keystore(e.to_string()))?;
 
-        let outbox =
-            Outbox::new(home.outbox_dir()).map_err(|e| DaemonError::Outbox(e.to_string()))?;
+        // Open auth store early so we can also wire the EVM → central
+        // outbox projection.  Two connections to the same SQLite file:
+        // one for the verifier (owned), one for the projection (behind
+        // a Mutex).
+        let auth_db_path = home.root().join("auth").join("auth.sqlite");
+        let projection_auth = AuthStore::open(&auth_db_path)
+            .map_err(|e| DaemonError::Audit(format!("auth store (projection): {e}")))?;
+        let central = CentralOutbox::new(home.root().join("central_outbox"));
+        let projection: Arc<dyn CentralOutboxProjection> =
+            Arc::new(EvmOutboxProjection::new(central, projection_auth));
+        let outbox = Outbox::new_with_projection(home.outbox_dir(), projection)
+            .map_err(|e| DaemonError::Outbox(e.to_string()))?;
         let mut tx_engine = TxEngine::new(
             outbox,
             config.stage_ttl.as_millis(),
@@ -277,6 +381,44 @@ impl Daemon {
         let audit =
             AuditLog::open(home.audit_path()).map_err(|e| DaemonError::Audit(e.to_string()))?;
         let audit_arc = Arc::new(audit.clone());
+        let auth_store = AuthStore::open(&auth_db_path)
+            .map_err(|e| DaemonError::Audit(format!("auth store: {e}")))?;
+        let auth_verifier = Arc::new(StoreApprovalVerifier::new(
+            auth_store,
+            KeystoreApprovalSignatureVerifier::new(keystore.clone()),
+        ));
+        tx_engine = tx_engine.with_auth_services(auth_verifier.clone(), auth_verifier.clone());
+        let auth_services = AuthServices::new(
+            Some(auth_verifier.clone()),
+            Some(auth_verifier.clone()),
+            Some(auth_verifier),
+        );
+        // WS-1 wiring: in-memory grant store + first-party attestation
+        // registry + keystore-backed PetalHost. All three live behind the
+        // existing `AuthServices` so VFS handlers and the new `sign_hash`
+        // IPC method can call them without going through the old
+        // verifier/nfc paths. The concrete store / registry / host impls
+        // can be swapped (test doubles, post-MVP venues) by replacing
+        // the `Arc<dyn ...>` references.
+        let grant_store: Arc<dyn bloom_auth_api::GrantStore> =
+            Arc::new(bloom_auth::grant_store::InMemoryGrantStore::default());
+        let attestation_registry: Arc<dyn bloom_auth_api::SigningAttestationSchemaRegistry> =
+            Arc::new(bloom_auth_api::DefaultAttestationRegistry::new());
+        let signer_cache = Arc::new(bloom_keystore::petal_host::SignerCache::new());
+        let petal_host: Arc<dyn bloom_auth_api::PetalHost> = Arc::new(
+            bloom_keystore::petal_host::KeystorePetalHost::new(
+                Arc::new(keystore.clone()),
+                grant_store.clone(),
+                attestation_registry.clone(),
+                audit_arc.clone(),
+            )
+            .with_signer_cache(signer_cache.clone()),
+        );
+        tx_engine = tx_engine.with_host_signing_services(grant_store.clone(), petal_host.clone());
+        let auth_services = auth_services
+            .with_grant_store(grant_store)
+            .with_attestation_registry(attestation_registry)
+            .with_petal_host(petal_host);
         let path_cache = Arc::new(PathCache::new());
 
         let watch_registry = Arc::new(
@@ -490,6 +632,7 @@ impl Daemon {
             debug!("daemon.hyperliquid_mounted");
             let handler = Arc::new(
                 HyperliquidHandler::new(mainnet, testnet, keystore.clone())
+                    .with_auth_services(auth_services.clone())
                     .with_store_root(home.root().join("hyperliquid")),
             );
             handler.clone().start_monitoring();
@@ -513,6 +656,7 @@ impl Daemon {
                         tx_engine.clone(),
                         address_book.clone(),
                     )
+                    .with_auth_services(auth_services.clone())
                     .with_home_write_permit_opt(home_write_permit.clone())
                     .with_mempool_indexes(mempool_indexes.clone())
                     .with_polymarket_root(home.polymarket_dir())
@@ -528,6 +672,7 @@ impl Daemon {
                         keystore.clone(),
                         config.default_wallet.clone(),
                     )
+                    .with_auth_services(auth_services.clone())
                     .with_paid_http_rpc_resolver(paid_http_rpc_resolver.clone()),
                 ) as _,
             )
@@ -550,6 +695,12 @@ impl Daemon {
             )
             .mount("ens", Arc::new(EnsHandler::new(ens_client.clone())) as _)
             .mount("prices", Arc::new(PricesHandler::new(prices)) as _)
+            .mount(
+                "outbox",
+                Arc::new(OutboxHandler::new(CentralOutbox::new(
+                    home.root().join("central_outbox"),
+                ))) as _,
+            )
             .mount(
                 "addressbook",
                 Arc::new(
@@ -618,6 +769,7 @@ impl Daemon {
                         tx_engine.clone(),
                         address_book_arc.clone(),
                     )
+                    .with_auth_services(auth_services.clone())
                     .with_home_write_permit_opt(home_write_permit.clone())
                     .with_default_chain(config.default_chain.clone())
                     .with_store_root(home.root().join("defi"))
@@ -658,6 +810,7 @@ impl Daemon {
             }
 
             let mut handler = PolymarketHandler::new(gamma, data, clob.clone(), keystore.clone())
+                .with_auth_services(auth_services.clone())
                 .with_order_store(bloom_polymarket::OrderStore::new(home.polymarket_dir()))
                 .with_fund_store(home.polymarket_dir())
                 .with_builder_key_store(bloom_polymarket::BuilderCredentialStore::new(
@@ -701,6 +854,7 @@ impl Daemon {
                                     None => GeoblockClient::new(),
                                 }
                             }),
+                            auth_dir: state_dir.clone(),
                             creds: CredentialStore::new(&state_dir),
                             chain,
                         })
@@ -1043,6 +1197,8 @@ impl Daemon {
             home_write_permit,
             address_book: address_book_arc,
             audit: audit_arc,
+            auth_services,
+            signer_cache,
             vfs,
             petals,
             watch_registry,
@@ -1650,6 +1806,7 @@ ws_url = "wss://example.invalid"
             nft: None,
             usd_value: None,
             depends_on: None,
+            action_id: None,
         };
         d.tx_engine.outbox.write_pending(&staged, "p").unwrap();
         let n = d.tx_engine.outbox.sweep_expired(2).unwrap();

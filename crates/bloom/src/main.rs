@@ -18,10 +18,14 @@ mod commands {
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use bloom_auth_api::{
+    ApprovalChallenge, AssuranceLevel, SignedApproval, SignerTransport, UnsignedApproval,
+};
 use bloom_daemon::Daemon;
 use bloom_daemon::ipc::{IpcClient, IpcServer, default_socket_path};
 use bloom_hyperliquid::{
@@ -30,7 +34,11 @@ use bloom_hyperliquid::{
     sign_submit_payload,
 };
 use bloom_proto::{AuditRecord, CeremonyIntent, CeremonyIntentKind, HomeDir, HomeWritePermit};
-use bloom_vfs::{VfsPath, handler::Handler};
+use bloom_tx::TxEngineError;
+use bloom_vfs::{
+    VfsPath,
+    handler::{Handler, HandlerError},
+};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use tracing::{debug, info, trace};
@@ -46,6 +54,8 @@ const DEFAULT_MOUNT_PATH: &str = "/Volumes/bloom";
 const DEFAULT_MOUNT_PATH: &str = "/bloom";
 
 const ALPHA_DISCLOSURE: &str = "⚠️  Bloom is experimental, unaudited alpha software. Do not use with funds you cannot afford to lose. Review every generated transaction plan before signing.";
+const PASSKEY_WRITE_UNLOCKED_DISABLED: &str = "write_unlocked is disabled for passkey wallets; \
+stage a Sealed Approval action and sign through PetalHost::sign_hash";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EndpointSource {
@@ -1310,7 +1320,7 @@ async fn run(cli: Cli) -> Result<()> {
             passphrase,
         }) => {
             let p = VfsPath::parse(&path).context("parse path")?;
-            let mut body = match data {
+            let body = match data {
                 Some(s) => s.into_bytes(),
                 None => {
                     let mut buf = Vec::new();
@@ -1408,72 +1418,12 @@ async fn run(cli: Cli) -> Result<()> {
                 let info = d.keystore.info(&wallet)?;
                 match info.kind {
                     bloom_keystore::WalletKind::PasskeyGated => {
-                        let intent = vfs_write_unlock_intent(
-                            &wallet,
-                            &p,
-                            &body,
-                            Some(bloom_proto::checksum_address(&info.address)),
-                            Some(&d.home.outbox_dir()),
-                            d.keystore
-                                .raw_policy(&wallet)
-                                .ok()
-                                .map(|(p, _)| p)
-                                .as_deref(),
-                        );
-                        let reviewed_intent_hash = intent.intent_hash();
-                        persist_outbox_review_intent(&wallet, &p, &d.home.outbox_dir(), &intent)?;
-                        let editable_policy = if is_wallet_policy_write(&wallet, &p) {
-                            Some(String::from_utf8_lossy(&body).to_string())
-                        } else {
-                            None
-                        };
-                        let edited_policy = d
-                            .keystore
-                            .unlock_passkey_with_intent_and_policy_edit(
-                                &wallet,
-                                Some(intent),
-                                editable_policy,
-                            )
-                            .await?;
-                        if let Some(policy) = edited_policy {
-                            body = policy.into_bytes();
-                        } else if is_outbox_confirm_write(&wallet, &p) {
-                            persist_outbox_review_approved(
-                                &wallet,
-                                &p,
-                                &d.home.outbox_dir(),
-                                &reviewed_intent_hash,
-                            )?;
-                            body.extend_from_slice(
-                                format!("\nreview_hash={reviewed_intent_hash}").as_bytes(),
-                            );
-                        }
+                        bail!(PASSKEY_WRITE_UNLOCKED_DISABLED);
                     }
                     _ => {
                         d.keystore
                             .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
                     }
-                }
-                if is_policy_session_new(&wallet, &p) {
-                    let intent = bloom_proto::policy_session_mint_intent(
-                        &wallet,
-                        &p.to_string_path(),
-                        &body,
-                    );
-                    bloom_vfs::policy_session_review::persist_review_approved(
-                        d.home.root(),
-                        &wallet,
-                        &intent.intent_hash(),
-                    )?;
-                }
-                if let Some(id) = request_confirm_id(d.home.root(), &p) {
-                    let confirm_value = String::from_utf8_lossy(&body).trim().to_ascii_lowercase();
-                    bloom_vfs::handlers::requests::persist_request_confirm_approved(
-                        d.home.root(),
-                        &id,
-                        &wallet,
-                        &confirm_value,
-                    )?;
                 }
                 d.vfs.write(&p, &body).await.context("vfs write")?;
 
@@ -1611,7 +1561,6 @@ async fn run(cli: Cli) -> Result<()> {
                     "path": path,
                     "bytes_b64": B64.encode(&body),
                     "wallet": &wallet,
-                    "passphrase": passphrase.as_deref(),
                 }),
             )
             .await
@@ -1623,8 +1572,21 @@ async fn run(cli: Cli) -> Result<()> {
             debug!("cli.request.confirm.via_inproc: no daemon socket present");
             let (_home_permit, d) = build_write_daemon(home)?;
             let info = d.keystore.info(&wallet)?;
+            let passkey_wallet = matches!(info.kind, bloom_keystore::WalletKind::PasskeyGated);
             match info.kind {
                 bloom_keystore::WalletKind::PasskeyGated => {
+                    bail!(PASSKEY_WRITE_UNLOCKED_DISABLED);
+                }
+                _ => {
+                    d.keystore
+                        .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
+                }
+            }
+            match d.vfs.write(&p, &body).await {
+                Ok(()) => {}
+                Err(first_err)
+                    if passkey_wallet && matches!(first_err, HandlerError::PermissionDenied) =>
+                {
                     let intent = vfs_write_unlock_intent(
                         &wallet,
                         &p,
@@ -1637,24 +1599,19 @@ async fn run(cli: Cli) -> Result<()> {
                             .map(|(p, _)| p)
                             .as_deref(),
                     );
-                    d.keystore
-                        .unlock_passkey_with_intent_and_policy_edit(&wallet, Some(intent), None)
-                        .await?;
+                    if sign_request_sealed_approval_if_challenged(&d, &wallet, &id, Some(intent))
+                        .await?
+                    {
+                        d.vfs
+                            .write(&p, &body)
+                            .await
+                            .context("request confirm after Sealed Approval")?;
+                    } else {
+                        return Err(first_err).context("request confirm");
+                    }
                 }
-                _ => {
-                    d.keystore
-                        .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
-                }
+                Err(e) => return Err(e).context("request confirm"),
             }
-            let approval_id = request_confirm_id(d.home.root(), &p)
-                .context("request confirm path does not target a pending paid request")?;
-            bloom_vfs::handlers::requests::persist_request_confirm_approved(
-                d.home.root(),
-                &approval_id,
-                &wallet,
-                &String::from_utf8_lossy(&body).trim().to_ascii_lowercase(),
-            )?;
-            d.vfs.write(&p, &body).await.context("request confirm")?;
             Ok(())
         }
         Cmd::Request(RequestCmd::Body { id }) => {
@@ -2064,7 +2021,7 @@ async fn run(cli: Cli) -> Result<()> {
             wallet,
             chain,
             id,
-            passphrase,
+            passphrase: _,
             text,
         }) => {
             let path = format!("/wallets/{wallet}/chains/{chain}/outbox/pending/{id}/confirm");
@@ -2078,7 +2035,6 @@ async fn run(cli: Cli) -> Result<()> {
                     "path": path,
                     "bytes_b64": B64.encode(&body),
                     "wallet": &wallet,
-                    "passphrase": passphrase.as_deref(),
                 }),
             )
             .await
@@ -2091,106 +2047,96 @@ async fn run(cli: Cli) -> Result<()> {
             let text = String::from_utf8(body).expect("wallet confirm text originated as UTF-8");
             let (home_permit, d) = build_write_daemon(home)?;
             let info = d.keystore.info(&wallet)?;
-            let mut reviewed_intent_hash: Option<String> = None;
-            match info.kind {
-                bloom_keystore::WalletKind::PasskeyGated => {
-                    // Build the review intent from the staged outbox entry. An
-                    // EVM staged tx is byte-immutable for the user-risking
-                    // fields (chain/to/value/data/nonce fixed at stage time),
-                    // so the intent faithfully reflects what will be signed.
-                    let intent = d
-                        .tx_engine
-                        .outbox
-                        .read(&wallet, &chain, &id)
-                        .ok()
-                        .map(|entry| {
-                            let s = &entry.staged;
-                            let data_hash = blake3::hash(s.data_hex.as_bytes()).to_hex();
-                            let mut it = CeremonyIntent::new(
-                                &wallet,
-                                "Sign Polygon Transaction",
-                                CeremonyIntentKind::EvmTransaction,
-                            )
-                            .with_address(&s.from)
-                            .summary(format!("Chain: {} (id {})", s.chain, s.chain_id))
-                            .summary(format!("To: {}", s.to))
-                            .summary(format!("Value: {} wei", s.value_wei))
-                            .summary(format!(
-                                "Nonce: {}  data: {}B",
-                                s.nonce,
-                                s.data_hex.len() / 2
-                            ))
-                            .summary(format!("Outbox id: {}", s.id))
-                            .risk("Broadcasts this exact staged transaction.")
-                            .subject(serde_json::json!({
-                                "action": "evm_transaction",
-                                "chain_id": s.chain_id,
-                                "from": s.from,
-                                "to": s.to,
-                                "value_wei": s.value_wei,
-                                "nonce": s.nonce,
-                                "data_blake3": data_hash.to_string(),
-                            }));
-                            for c in &s.policy_checks {
-                                it = it
-                                    .policy(format!("[{:?}] {}: {}", c.outcome, c.rule, c.message));
-                            }
-                            // Persist the full reviewed intent into the staged
-                            // tx's outbox dir; the pending → sent transition is a
-                            // dir rename, so it rides along to the sent record.
-                            if let Ok(bytes) = serde_json::to_vec_pretty(&it) {
-                                let _ = d.tx_engine.outbox.write_artefact(
-                                    &entry.dir,
-                                    "review_intent.json",
-                                    &bytes,
-                                );
-                            }
-                            reviewed_intent_hash = Some(it.intent_hash());
-                            it
-                        });
-                    d.keystore.lock(&wallet);
-                    d.keystore
-                        .unlock_passkey_with_intent(&wallet, intent)
-                        .await?;
-                    if let Some(hash) = &reviewed_intent_hash
-                        && let Ok(entry) = d.tx_engine.outbox.read(&wallet, &chain, &id)
-                    {
-                        let approved = serde_json::json!({
-                            "schema": "bloom.review_approved.v1",
-                            "intent_hash": hash,
-                        });
-                        let _ = d.tx_engine.outbox.write_artefact(
-                            &entry.dir,
-                            "review_approved.json",
-                            &serde_json::to_vec_pretty(&approved)?,
-                        );
-                    }
-                }
-                _ => {
-                    d.keystore
-                        .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
-                }
+            let passkey_wallet = info.kind == bloom_keystore::WalletKind::PasskeyGated;
+            let mut approval_intent: Option<CeremonyIntent> = None;
+            if passkey_wallet {
+                // Build the review intent from the staged outbox entry. An
+                // EVM staged tx is byte-immutable for the user-risking fields
+                // (chain/to/value/data/nonce fixed at stage time), so the
+                // intent faithfully reflects what will be signed.
+                let intent = d
+                    .tx_engine
+                    .outbox
+                    .read(&wallet, &chain, &id)
+                    .ok()
+                    .map(|entry| {
+                        let s = &entry.staged;
+                        let data_hash = blake3::hash(s.data_hex.as_bytes()).to_hex();
+                        let mut it = CeremonyIntent::new(
+                            &wallet,
+                            format!("Sign {} Transaction", s.chain),
+                            CeremonyIntentKind::EvmTransaction,
+                        )
+                        .with_address(&s.from)
+                        .summary(format!("Chain: {} (id {})", s.chain, s.chain_id))
+                        .summary(format!("To: {}", s.to))
+                        .summary(format!("Value: {} wei", s.value_wei))
+                        .summary(format!(
+                            "Nonce: {}  data: {}B",
+                            s.nonce,
+                            s.data_hex.len() / 2
+                        ))
+                        .summary(format!("Outbox id: {}", s.id))
+                        .risk("Broadcasts this exact staged transaction.")
+                        .subject(serde_json::json!({
+                            "action": "evm_transaction",
+                            "chain_id": s.chain_id,
+                            "from": s.from,
+                            "to": s.to,
+                            "value_wei": s.value_wei,
+                            "nonce": s.nonce,
+                            "data_blake3": data_hash.to_string(),
+                        }));
+                        for c in &s.policy_checks {
+                            it = it.policy(format!("[{:?}] {}: {}", c.outcome, c.rule, c.message));
+                        }
+                        if let Ok(bytes) = serde_json::to_vec_pretty(&it) {
+                            let _ = d.tx_engine.outbox.write_artefact(
+                                &entry.dir,
+                                "review_intent.json",
+                                &bytes,
+                            );
+                        }
+                        approval_intent = Some(it.clone());
+                        it
+                    });
+                let _ = intent;
             }
-            let signer = d.keystore.signer(&wallet)?;
             let info = d.keystore.info(&wallet)?;
             let client = d
                 .chains
                 .get(&chain)
                 .with_context(|| format!("chain '{}'", chain))?;
-            let staged = d
-                .tx_engine
-                .confirm(
+            let confirm_once = || {
+                d.tx_engine.confirm(
                     &home_permit,
                     &wallet,
                     &chain,
                     &id,
                     &client,
-                    &signer,
                     &info.policy,
                     &text,
-                    reviewed_intent_hash.as_deref(),
                 )
-                .await?;
+            };
+            let staged = match confirm_once().await {
+                Ok(staged) => staged,
+                Err(TxEngineError::BroadcastApprovalRequired(reason)) if passkey_wallet => {
+                    if sign_outbox_sealed_approval_if_challenged(
+                        &d,
+                        &wallet,
+                        &chain,
+                        &id,
+                        approval_intent.clone(),
+                    )
+                    .await?
+                    {
+                        confirm_once().await?
+                    } else {
+                        return Err(TxEngineError::BroadcastApprovalRequired(reason).into());
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            };
             println!(
                 "broadcast {} hash={}",
                 staged.id,
@@ -2251,7 +2197,7 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Wallet(WalletCmd::ConfirmBatch {
             wallet,
             txs,
-            passphrase,
+            passphrase: _,
             text,
             policy_session,
         }) => {
@@ -2283,124 +2229,121 @@ async fn run(cli: Cli) -> Result<()> {
                 entries.push(entry);
             }
 
-            let mut reviewed_intent_hash: Option<String> = None;
-            match info.kind {
-                bloom_keystore::WalletKind::PasskeyGated => {
-                    if !policy_session {
-                        bail!(
-                            "passkey confirm-batch requires --policy-session so the one ceremony is explicit"
-                        );
-                    }
-                    let mut intent = CeremonyIntent::new(
-                        &wallet,
-                        "Authorize Batch Transaction Session",
-                        CeremonyIntentKind::EvmTransaction,
-                    )
-                    .with_address(bloom_proto::checksum_address(&info.address))
-                    .summary(format!(
-                        "Broadcast {} staged transaction(s).",
-                        entries.len()
-                    ))
-                    .summary("Policy is rechecked for every transaction before broadcast.")
-                    .risk("One passkey approval unlocks this process to sign this exact batch.")
-                    .risk("If a transaction fails, later transactions are not attempted.");
+            let mut approval_intent: Option<CeremonyIntent> = None;
+            let passkey_wallet = info.kind == bloom_keystore::WalletKind::PasskeyGated;
+            if info.kind == bloom_keystore::WalletKind::PasskeyGated {
+                if !policy_session {
+                    bail!(
+                        "passkey confirm-batch requires --policy-session so the one ceremony is explicit"
+                    );
+                }
+                let mut intent = CeremonyIntent::new(
+                    &wallet,
+                    "Authorize Batch Transaction Session",
+                    CeremonyIntentKind::EvmTransaction,
+                )
+                .with_address(bloom_proto::checksum_address(&info.address))
+                .summary(format!(
+                    "Broadcast {} staged transaction(s).",
+                    entries.len()
+                ))
+                .summary("Policy is rechecked for every transaction before broadcast.")
+                .risk("One passkey approval unlocks this process to sign this exact batch.")
+                .risk("If a transaction fails, later transactions are not attempted.");
 
-                    let mut subjects = Vec::new();
-                    for entry in &entries {
-                        let s = &entry.staged;
-                        let data_hash = blake3::hash(s.data_hex.as_bytes()).to_hex().to_string();
-                        intent = intent
-                            .summary(format!(
-                                "{}:{} chain={} nonce={} to={} value={} wei data={}B",
-                                s.chain,
-                                s.id,
-                                s.chain_id,
-                                s.nonce,
-                                s.to,
-                                s.value_wei,
-                                s.data_hex.len() / 2
-                            ))
-                            .artifact(entry.dir.display().to_string());
-                        for c in &s.policy_checks {
-                            intent = intent.policy(format!(
-                                "{}:{} [{:?}] {}: {}",
-                                s.chain, s.id, c.outcome, c.rule, c.message
-                            ));
-                        }
-                        subjects.push(serde_json::json!({
-                            "id": s.id,
-                            "chain": s.chain,
-                            "chain_id": s.chain_id,
-                            "from": s.from,
-                            "to": s.to,
-                            "value_wei": s.value_wei,
-                            "nonce": s.nonce,
-                            "data_blake3": data_hash,
-                        }));
+                let mut subjects = Vec::new();
+                for entry in &entries {
+                    let s = &entry.staged;
+                    let data_hash = blake3::hash(s.data_hex.as_bytes()).to_hex().to_string();
+                    intent = intent
+                        .summary(format!(
+                            "{}:{} chain={} nonce={} to={} value={} wei data={}B",
+                            s.chain,
+                            s.id,
+                            s.chain_id,
+                            s.nonce,
+                            s.to,
+                            s.value_wei,
+                            s.data_hex.len() / 2
+                        ))
+                        .artifact(entry.dir.display().to_string());
+                    for c in &s.policy_checks {
+                        intent = intent.policy(format!(
+                            "{}:{} [{:?}] {}: {}",
+                            s.chain, s.id, c.outcome, c.rule, c.message
+                        ));
                     }
-                    intent = intent.subject(serde_json::json!({
-                        "action": "evm_transaction_batch",
-                        "wallet": wallet,
-                        "txs": subjects,
-                        "confirm_text": text,
+                    subjects.push(serde_json::json!({
+                        "id": s.id,
+                        "chain": s.chain,
+                        "chain_id": s.chain_id,
+                        "from": s.from,
+                        "to": s.to,
+                        "value_wei": s.value_wei,
+                        "nonce": s.nonce,
+                        "data_blake3": data_hash,
                     }));
+                }
+                intent = intent.subject(serde_json::json!({
+                    "action": "evm_transaction_batch",
+                    "wallet": wallet,
+                    "txs": subjects,
+                    "confirm_text": text,
+                }));
 
-                    let review_bytes = serde_json::to_vec_pretty(&intent)?;
-                    let hash = intent.intent_hash();
-                    for entry in &entries {
-                        let _ = d.tx_engine.outbox.write_artefact(
-                            &entry.dir,
-                            "review_intent.json",
-                            &review_bytes,
-                        );
-                    }
-                    d.keystore.lock(&wallet);
-                    d.keystore
-                        .unlock_passkey_with_intent(&wallet, Some(intent))
-                        .await?;
-                    let approved = serde_json::json!({
-                        "schema": "bloom.review_approved.v1",
-                        "intent_hash": hash,
-                        "scope": "batch",
-                    });
-                    let approved_bytes = serde_json::to_vec_pretty(&approved)?;
-                    for entry in &entries {
-                        let _ = d.tx_engine.outbox.write_artefact(
-                            &entry.dir,
-                            "review_approved.json",
-                            &approved_bytes,
-                        );
-                    }
-                    reviewed_intent_hash = Some(hash);
+                let review_bytes = serde_json::to_vec_pretty(&intent)?;
+                for entry in &entries {
+                    let _ = d.tx_engine.outbox.write_artefact(
+                        &entry.dir,
+                        "review_intent.json",
+                        &review_bytes,
+                    );
                 }
-                _ => {
-                    d.keystore
-                        .unlock(&wallet, passphrase.as_deref().unwrap_or(""))?;
-                }
+                approval_intent = Some(intent);
             }
 
-            let signer = d.keystore.signer(&wallet)?;
             let info = d.keystore.info(&wallet)?;
             for (chain, id) in refs {
                 let client = d
                     .chains
                     .get(&chain)
                     .with_context(|| format!("chain '{}'", chain))?;
-                let staged = d
-                    .tx_engine
-                    .confirm(
+                let confirm_once = || {
+                    d.tx_engine.confirm(
                         &home_permit,
                         &wallet,
                         &chain,
                         &id,
                         &client,
-                        &signer,
                         &info.policy,
                         &text,
-                        reviewed_intent_hash.as_deref(),
                     )
-                    .await
-                    .with_context(|| format!("confirm {chain}:{id}"))?;
+                };
+                let staged = match confirm_once().await {
+                    Ok(staged) => staged,
+                    Err(TxEngineError::BroadcastApprovalRequired(reason)) if passkey_wallet => {
+                        if sign_outbox_sealed_approval_if_challenged(
+                            &d,
+                            &wallet,
+                            &chain,
+                            &id,
+                            approval_intent.clone(),
+                        )
+                        .await
+                        .with_context(|| format!("sign Sealed Approval for {chain}:{id}"))?
+                        {
+                            confirm_once()
+                                .await
+                                .with_context(|| format!("confirm {chain}:{id}"))?
+                        } else {
+                            return Err(TxEngineError::BroadcastApprovalRequired(reason).into());
+                        }
+                    }
+                    Err(e) => {
+                        return Err(anyhow::Error::from(e))
+                            .with_context(|| format!("confirm {chain}:{id}"));
+                    }
+                };
                 println!(
                     "broadcast {}:{} hash={}",
                     chain,
@@ -2417,6 +2360,13 @@ async fn run(cli: Cli) -> Result<()> {
             // serve command (fix #3). The handle is dropped (and the task
             // signalled to stop) right before the function returns.
             let sweeper = d.spawn_background_tasks();
+            // Interaction Mode 3: own and serve the mounted-VFS Sealed Approval
+            // ceremony endpoint (`ceremony_url` in approval_challenge.json).
+            // The daemon never opens a browser; it only serves the URL a
+            // deliberate client opens.
+            let ceremony = bloom_daemon::ceremony_server::spawn(&d)
+                .await
+                .context("bind sealed approval ceremony server")?;
             let mount_handle = mount_bloom(&d, mount.as_deref()).await?;
             let chains: Vec<String> = d.chains.list_names();
             println!(
@@ -2435,7 +2385,9 @@ async fn run(cli: Cli) -> Result<()> {
             info!(home = %d.home.root().display(), chains = ?chains, endpoint = %endpoint.display, socket = %socket.display(), mount = ?mount, "cli.serve.starting");
             let server = IpcServer::new(d.vfs.clone(), env!("CARGO_PKG_VERSION"), chains)
                 .with_keystore(d.keystore.clone())
-                .with_petals(d.petals.clone());
+                .with_petals(d.petals.clone())
+                .with_auth_services(d.auth_services.clone())
+                .with_signer_cache(d.signer_cache.clone());
             let server2 = server.clone();
             // Trigger graceful shutdown on Ctrl-C or SIGTERM.
             let shutdown = tokio::spawn(async move {
@@ -2461,6 +2413,7 @@ async fn run(cli: Cli) -> Result<()> {
             // Stop the outbox expiry sweeper (fix #3) and any other
             // daemon-owned workers (watch executor, etc., fix #6).
             let unmount_result = unmount_bloom(mount_handle).await;
+            ceremony.shutdown().await;
             sweeper.shutdown().await;
             d.shutdown().await;
             serve_result?;
@@ -3058,6 +3011,198 @@ fn outbox_confirm_unlock_intent(
     Some(intent)
 }
 
+async fn sign_outbox_sealed_approval_if_challenged(
+    d: &Daemon,
+    wallet: &str,
+    chain: &str,
+    id: &str,
+    intent: Option<CeremonyIntent>,
+) -> Result<bool> {
+    let entry = d
+        .tx_engine
+        .outbox
+        .read(wallet, chain, id)
+        .with_context(|| format!("read pending outbox entry {wallet}/{chain}/{id}"))?;
+    let challenge_path = entry.dir.join("approval_challenge.json");
+    if !challenge_path.exists() {
+        return Ok(false);
+    }
+
+    let challenge: ApprovalChallenge = serde_json::from_slice(
+        &std::fs::read(&challenge_path)
+            .with_context(|| format!("read {}", challenge_path.display()))?,
+    )
+    .with_context(|| format!("parse {}", challenge_path.display()))?;
+    // Fail fast if the challenge does not refer to a real sealed action for
+    // this wallet; full binding is re-verified daemon-side at consume time.
+    let sealed = d
+        .auth_services
+        .require_store()
+        .context("Sealed Approval auth store is not wired")?
+        .sealed_intent(&challenge.intent_hash)
+        .await
+        .context("read sealed intent for approval challenge")?;
+    anyhow::ensure!(
+        sealed.envelope.header.wallet == wallet,
+        "approval challenge wallet mismatch: sealed action belongs to '{}'",
+        sealed.envelope.header.wallet
+    );
+
+    let review_session_id = if challenge.assurance == AssuranceLevel::Hardened {
+        let review_session_id = sealed_review_session_id(&challenge);
+        d.auth_services
+            .require_writer()
+            .context("Sealed Approval auth store writer is not wired")?
+            .issue_review_session(
+                &review_session_id,
+                &challenge.surface,
+                &challenge.action_id,
+                challenge.expiry_ms,
+                cli_now_ms(),
+            )
+            .await
+            .context("issue hardened review session")?;
+        Some(review_session_id)
+    } else {
+        None
+    };
+
+    // Echo every daemon-issued challenge field faithfully (§5.7 step 10);
+    // any drift is rejected at consume time.
+    let unsigned = UnsignedApproval::for_challenge(
+        &challenge,
+        SignerTransport::BrowserWebauthn,
+        None,
+        review_session_id,
+    );
+    let (_grant, approval) = bloom_daemon::sealed_ceremony::run_sealed_approval_ceremony(
+        &d.keystore,
+        &d.auth_services,
+        unsigned,
+        intent,
+        cli_now_ms(),
+        d.signer_cache.as_ref(),
+    )
+    .await
+    .context("run sealed approval browser ceremony")?;
+    let approval_path = entry.dir.join("approval.json");
+    std::fs::write(
+        &approval_path,
+        serde_json::to_vec_pretty(&approval).context("encode Sealed Approval")?,
+    )
+    .with_context(|| format!("write {}", approval_path.display()))?;
+    Ok(true)
+}
+
+async fn sign_request_sealed_approval_if_challenged(
+    d: &Daemon,
+    wallet: &str,
+    id: &str,
+    intent: Option<CeremonyIntent>,
+) -> Result<bool> {
+    let id = resolve_pending_request_id(d.home.root(), id)
+        .with_context(|| format!("resolve pending request id {id}"))?;
+    let dir = d.home.root().join("requests").join("pending").join(&id);
+    let challenge_path = dir.join("approval_challenge.json");
+    if !challenge_path.exists() {
+        return Ok(false);
+    }
+
+    let challenge: ApprovalChallenge = serde_json::from_slice(
+        &std::fs::read(&challenge_path)
+            .with_context(|| format!("read {}", challenge_path.display()))?,
+    )
+    .with_context(|| format!("parse {}", challenge_path.display()))?;
+    let sealed = d
+        .auth_services
+        .require_store()
+        .context("Sealed Approval auth store is not wired")?
+        .sealed_intent(&challenge.intent_hash)
+        .await
+        .context("read sealed intent for request approval challenge")?;
+    anyhow::ensure!(
+        sealed.envelope.header.wallet == wallet,
+        "approval challenge wallet mismatch: sealed action belongs to '{}'",
+        sealed.envelope.header.wallet
+    );
+
+    let review_session_id = if challenge.assurance == AssuranceLevel::Hardened {
+        let review_session_id = sealed_review_session_id(&challenge);
+        d.auth_services
+            .require_writer()
+            .context("Sealed Approval auth store writer is not wired")?
+            .issue_review_session(
+                &review_session_id,
+                &challenge.surface,
+                &challenge.action_id,
+                challenge.expiry_ms,
+                cli_now_ms(),
+            )
+            .await
+            .context("issue hardened request review session")?;
+        Some(review_session_id)
+    } else {
+        None
+    };
+
+    let unsigned = UnsignedApproval::for_challenge(
+        &challenge,
+        SignerTransport::BrowserWebauthn,
+        None,
+        review_session_id,
+    );
+    let signature = d
+        .keystore
+        .sign_approval_with_passkey(wallet, &unsigned, intent)
+        .await
+        .context("sign request Sealed Approval with passkey")?;
+    let approval: SignedApproval = unsigned.into_signed(signature);
+    let approval_path = dir.join("approval.json");
+    std::fs::write(
+        &approval_path,
+        serde_json::to_vec_pretty(&approval).context("encode request Sealed Approval")?,
+    )
+    .with_context(|| format!("write {}", approval_path.display()))?;
+    Ok(true)
+}
+
+fn resolve_pending_request_id(home: &Path, id: &str) -> Result<String> {
+    if id != "latest" {
+        return Ok(id.to_string());
+    }
+    let latest_path = home.join("requests").join("latest");
+    let latest = std::fs::read_to_string(&latest_path)
+        .with_context(|| format!("read {}", latest_path.display()))?;
+    let (state, id) = latest
+        .trim()
+        .split_once('/')
+        .context("requests/latest should be formatted as state/id")?;
+    if state != "pending" {
+        bail!("latest request is {state}/{id}, not pending");
+    }
+    Ok(id.to_string())
+}
+
+fn sealed_review_session_id(challenge: &ApprovalChallenge) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.review_session.v1");
+    hasher.update(challenge.surface.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(challenge.action_id.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(challenge.intent_hash.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(challenge.server_nonce.as_bytes());
+    format!("review-{}", hasher.finalize().to_hex())
+}
+
+fn cli_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 #[derive(Debug, Clone)]
 struct DefiReview {
     id: String,
@@ -3155,55 +3300,11 @@ fn find_defi_review_for_outbox(
     None
 }
 
-fn is_wallet_policy_write(wallet: &str, path: &VfsPath) -> bool {
-    matches!(
-        path.segments(),
-        [root, w, file] if root == "wallets" && w == wallet && file == "policy.toml"
-    )
-}
-
 fn is_policy_session_new(wallet: &str, path: &VfsPath) -> bool {
     matches!(
         path.segments(),
         [root, w, ps, leaf]
             if root == "wallets" && w == wallet && ps == "policy-session" && leaf == "new"
-    )
-}
-
-fn request_confirm_id(home: &std::path::Path, path: &VfsPath) -> Option<String> {
-    match path.segments() {
-        [root, reference, action] if root == "requests" && action == "confirm" => {
-            if reference == "latest" {
-                latest_pending_request_id(home)
-            } else {
-                Some(reference.to_string())
-            }
-        }
-        [root, state, id, action]
-            if root == "requests" && state == "pending" && action == "confirm" =>
-        {
-            Some(id.to_string())
-        }
-        _ => None,
-    }
-}
-
-fn latest_pending_request_id(home: &std::path::Path) -> Option<String> {
-    let latest = std::fs::read_to_string(home.join("requests").join("latest")).ok()?;
-    let (state, id) = latest.trim().split_once('/')?;
-    (state == "pending").then(|| id.to_string())
-}
-
-fn is_outbox_confirm_write(wallet: &str, path: &VfsPath) -> bool {
-    matches!(
-        path.segments(),
-        [root, w, chains, _chain, outbox, pending, _id, confirm]
-            if root == "wallets"
-                && w == wallet
-                && chains == "chains"
-                && outbox == "outbox"
-                && pending == "pending"
-                && confirm == "confirm"
     )
 }
 
@@ -3261,21 +3362,7 @@ async fn wallet_outbox_action_vfs_write(input: WalletOutboxActionWrite<'_>) -> R
     let info = d.keystore.info(&wallet)?;
     match info.kind {
         bloom_keystore::WalletKind::PasskeyGated => {
-            let intent = vfs_write_unlock_intent(
-                &wallet,
-                &p,
-                &body,
-                Some(bloom_proto::checksum_address(&info.address)),
-                Some(&d.home.outbox_dir()),
-                d.keystore
-                    .raw_policy(&wallet)
-                    .ok()
-                    .map(|(p, _)| p)
-                    .as_deref(),
-            );
-            d.keystore
-                .unlock_passkey_with_intent(&wallet, Some(intent))
-                .await?;
+            bail!(PASSKEY_WRITE_UNLOCKED_DISABLED);
         }
         _ => {
             d.keystore
@@ -3637,65 +3724,6 @@ fn validate_polymarket_artifact_id(id: &str, label: &str) -> Result<()> {
     if id.is_empty() || id.contains('/') || id.contains('\\') || id == "." || id == ".." {
         bail!("invalid Polymarket {label} id '{id}'");
     }
-    Ok(())
-}
-
-fn outbox_confirm_dir(wallet: &str, path: &VfsPath, outbox_root: &Path) -> Option<PathBuf> {
-    let [root, w, chains, chain, outbox, pending, id, confirm] = path.segments() else {
-        return None;
-    };
-    if root == "wallets"
-        && w == wallet
-        && chains == "chains"
-        && outbox == "outbox"
-        && pending == "pending"
-        && confirm == "confirm"
-    {
-        Some(
-            outbox_root
-                .join(wallet)
-                .join(chain)
-                .join("pending")
-                .join(id),
-        )
-    } else {
-        None
-    }
-}
-
-fn persist_outbox_review_intent(
-    wallet: &str,
-    path: &VfsPath,
-    outbox_root: &Path,
-    intent: &CeremonyIntent,
-) -> Result<()> {
-    let Some(dir) = outbox_confirm_dir(wallet, path, outbox_root) else {
-        return Ok(());
-    };
-    std::fs::write(
-        dir.join("review_intent.json"),
-        serde_json::to_vec_pretty(intent)?,
-    )?;
-    Ok(())
-}
-
-fn persist_outbox_review_approved(
-    wallet: &str,
-    path: &VfsPath,
-    outbox_root: &Path,
-    intent_hash: &str,
-) -> Result<()> {
-    let Some(dir) = outbox_confirm_dir(wallet, path, outbox_root) else {
-        return Ok(());
-    };
-    let approved = serde_json::json!({
-        "schema": "bloom.review_approved.v1",
-        "intent_hash": intent_hash,
-    });
-    std::fs::write(
-        dir.join("review_approved.json"),
-        serde_json::to_vec_pretty(&approved)?,
-    )?;
     Ok(())
 }
 

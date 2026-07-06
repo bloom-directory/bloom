@@ -46,6 +46,8 @@ pub enum RawIntentBody {
         #[serde(default)]
         token: Option<String>,
         #[serde(default)]
+        amount: String,
+        #[serde(default)]
         data: Option<String>,
     },
     /// Contract method call.

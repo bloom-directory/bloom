@@ -20,16 +20,26 @@
 //! - `wallets/<wallet>/chains/<chain>/outbox/sent/<id>/<file>`      — read sent
 //! - `wallets/<wallet>/chains/<chain>/outbox/failed/<id>/<file>`    — read failed
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use alloy::signers::SignerSync;
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::{STANDARD as B64_STANDARD, URL_SAFE_NO_PAD};
+use bloom_auth_api::{
+    ApprovalChallenge, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, DaemonGrantTerms,
+    EVM_ERC20_TRANSFER_METHOD, EVM_OWNER_SESSION_MINT_ACTION_KIND,
+    EVM_OWNER_SESSION_USE_ACTION_KIND, EVM_OWNER_SIGNING_SESSION_KIND, EVM_TX_SIGN_INTENT,
+    EvmFeePolicy, EvmOwnerSigningSessionCounters, EvmOwnerSigningSessionScope,
+    EvmOwnerSigningSessionUse, ExecutorKind, PetalPolicySnapshot, SIGNING_ATTESTATION_SCHEMA_V1,
+    SealedAction, SignHashRequest, SignedApproval, SigningAttestation, petal_identity,
+};
 use bloom_chain::ChainRegistry;
 use bloom_keystore::Keystore;
 use bloom_proto::{
-    AddressBook, CapabilityStatus, CapabilityViewEntry, HomeWritePermit, RawIntent, SigningModel,
-    Venue,
+    AddressBook, CapabilityStatus, CapabilityViewEntry, HomeWritePermit, Policy, PolicyEditClass,
+    RawIntent, SigningModel, Venue, classify_policy_edit,
 };
 use bloom_tx::{
     intent_parser,
@@ -37,8 +47,17 @@ use bloom_tx::{
     tx_engine::{TxEngine, TxEngineError},
 };
 
+use crate::auth::AuthServices;
 use crate::handler::{Entry, Handler, HandlerError};
 use crate::path::VfsPath;
+
+const APPROVAL_FILE: &str = "approval.json";
+const APPROVAL_CHALLENGE_FILE: &str = "approval_challenge.json";
+const APPROVAL_TTL_MS: u64 = 5 * 60 * 1000;
+const WALLET_POLICY_SURFACE: &str = "wallet-policy";
+const WALLET_POLICY_ACTION_KIND: &str = "policy_update";
+const WALLET_POLICY_SUBJECT_SCHEMA: &str = "bloom.wallet_policy_update_subject.v1";
+const WALLET_POLICY_SIGN_INTENT: &str = "wallet_policy.sign";
 
 #[derive(Clone)]
 pub struct WalletsHandler {
@@ -54,6 +73,9 @@ pub struct WalletsHandler {
     pub polymarket_onboard: Option<bloom_polymarket::OnboardStore>,
     /// Optional Hyperliquid handler for capability roll-up aggregation.
     pub hyperliquid_handler: Option<Arc<crate::handlers::hyperliquid::HyperliquidHandler>>,
+    /// Optional Layer-B auth services. Migrated signer paths must use this
+    /// instead of marker files; absent means legacy behavior remains explicit.
+    pub auth_services: AuthServices,
 }
 
 impl WalletsHandler {
@@ -72,7 +94,13 @@ impl WalletsHandler {
             mempool_indexes: Arc::new(std::collections::BTreeMap::new()),
             polymarket_onboard: None,
             hyperliquid_handler: None,
+            auth_services: AuthServices::default(),
         }
+    }
+
+    pub fn with_auth_services(mut self, auth_services: AuthServices) -> Self {
+        self.auth_services = auth_services;
+        self
     }
 
     /// Attach the Polymarket state root so `addresses.json` can surface the
@@ -331,8 +359,8 @@ impl WalletsHandler {
     }
 
     /// List this wallet's live policy sessions.
-    fn policy_session_active_json(&self, wallet: &str) -> Result<Vec<u8>, HandlerError> {
-        let sessions: Vec<serde_json::Value> = self
+    async fn policy_session_active_json(&self, wallet: &str) -> Result<Vec<u8>, HandlerError> {
+        let mut sessions: Vec<serde_json::Value> = self
             .tx_engine
             .session_store()
             .active(now_ms())
@@ -349,6 +377,33 @@ impl WalletsHandler {
                 })
             })
             .collect();
+        if let Some(store) = self.auth_services.store()
+            && let Ok(standing) = store
+                .active_standing_sessions(
+                    wallet,
+                    Some(EVM_OWNER_SIGNING_SESSION_KIND),
+                    now_ms_u64(),
+                )
+                .await
+        {
+            sessions.extend(standing.into_iter().map(|s| {
+                serde_json::json!({
+                    "id": s.session_id,
+                    "wallet": s.wallet,
+                    "petal_id": s.petal_id,
+                    "session_kind": s.session_kind,
+                    "scope": s.scope,
+                    "counters": s.counters,
+                    "frozen_policy_version": s.frozen_policy_version,
+                    "frozen_petal_policy_digest": s.frozen_petal_policy_digest,
+                    "issued_ms": s.issued_ms,
+                    "expires_ms": s.expires_ms,
+                    "revoked_ms": s.revoked_ms,
+                    "orphan": s.orphan,
+                    "created_ms": s.created_ms,
+                })
+            }));
+        }
         let mut out = serde_json::to_vec_pretty(&serde_json::json!({ "sessions": sessions }))
             .map_err(err_be)?;
         out.push(b'\n');
@@ -358,7 +413,10 @@ impl WalletsHandler {
     /// Mint a bounded policy session from a descriptor written to
     /// `policy-session/new`. The descriptor is the security envelope: the
     /// chains, total USD cap, TTL, and the exact pending-tx ids it authorizes.
-    fn mint_policy_session(&self, wallet: &str, data: &[u8]) -> Result<(), HandlerError> {
+    async fn mint_policy_session(&self, wallet: &str, data: &[u8]) -> Result<(), HandlerError> {
+        if looks_like_evm_owner_session_descriptor(data) {
+            return self.mint_evm_owner_session(wallet, data).await;
+        }
         // Each authorized tx is a (chain_id, outbox id) pair — outbox ids are
         // unique only within a chain, so the allowlist must be chain-qualified.
         #[derive(serde::Deserialize)]
@@ -382,29 +440,9 @@ impl WalletsHandler {
                  ttl_secs > 0, and max_usd > 0",
             ));
         }
-        // Minting creates future signing authority, so it must prove the exact
-        // descriptor was human-reviewed — not merely that the daemon is unlocked.
-        // The IPC ceremony lane persists a one-time approval marker keyed by the
-        // reviewed-intent hash of this descriptor; require and consume it here so
-        // the VFS layer is safe regardless of how the write arrives.
         let path = format!("/wallets/{wallet}/policy-session/new");
-        let intent = bloom_proto::policy_session_mint_intent(wallet, &path, data);
-        let home = self
-            .keystore
-            .root()
-            .parent()
-            .ok_or_else(|| HandlerError::backend("keystore root has no parent home dir"))?
-            .to_path_buf();
-        if !crate::policy_session_review::consume_review_approved(
-            &home,
-            wallet,
-            &intent.intent_hash(),
-        ) {
-            return Err(HandlerError::invalid(
-                "policy-session mint requires a fresh reviewed-intent approval; \
-                 mint through the IPC ceremony lane (bloom wallet ... policy-session)",
-            ));
-        }
+        self.require_sealed_policy_session_approval(wallet, &path, data)
+            .await?;
         // Chains are derived from the authorized pairs; the allowlist holds
         // chain-qualified keys so a same-id tx on another chain can't slip in.
         let chains = d.pending_ids.iter().map(|p| p.chain_id).collect();
@@ -427,6 +465,442 @@ impl WalletsHandler {
         self.tx_engine.session_store().mint(session);
         tracing::info!(wallet, session = %id, "wallet.policy_session.minted");
         Ok(())
+    }
+
+    async fn mint_evm_owner_session(&self, wallet: &str, data: &[u8]) -> Result<(), HandlerError> {
+        let d: EvmOwnerSessionMintDescriptor = serde_json::from_slice(data)
+            .map_err(|e| HandlerError::invalid(format!("evm owner-session descriptor: {e}")))?;
+        if d.ttl_secs == 0
+            || d.max_signature_count == 0
+            || d.daily_cap_base_units.trim().is_empty()
+            || d.token_contract.trim().is_empty()
+            || d.recipient.trim().is_empty()
+            || d.reason.trim().is_empty()
+        {
+            return Err(HandlerError::invalid(
+                "evm owner-session requires token_contract, recipient, reason, \
+                 daily_cap_base_units, ttl_secs > 0, and max_signature_count > 0",
+            ));
+        }
+        if d.method != EVM_ERC20_TRANSFER_METHOD || d.native_transfers_allowed {
+            return Err(HandlerError::invalid(
+                "evm owner-session MVP supports only ERC-20 transfer and no native transfer",
+            ));
+        }
+        let now = now_ms_u64();
+        let scope = EvmOwnerSigningSessionScope {
+            wallet: wallet.to_string(),
+            chain_id: d.chain_id,
+            token_contract: d.token_contract,
+            recipient: d.recipient,
+            method: d.method,
+            daily_cap_base_units: d.daily_cap_base_units,
+            ttl_ms: d.ttl_secs.saturating_mul(1000),
+            fee_policy: d.fee_policy,
+            max_signature_count: d.max_signature_count,
+            autonomy_classification: d
+                .autonomy_classification
+                .unwrap_or_else(|| "bounded_owner_signing".into()),
+            policy_snapshot_digest: d
+                .policy_snapshot_digest
+                .unwrap_or_else(|| "pending-sealed-policy-digest".into()),
+            petal_id: petal_identity::PETAL_ID_EVM_WALLET.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+            petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+            reason: d.reason,
+            native_transfers_allowed: false,
+        };
+        let path = format!("/wallets/{wallet}/policy-session/new");
+        self.require_sealed_evm_owner_session_approval(wallet, &path, data, &scope, now)
+            .await?;
+        let id = evm_owner_session_action_id(wallet, data);
+        let counters = EvmOwnerSigningSessionCounters {
+            daily_window_start_ms: now,
+            spent_base_units: "0".into(),
+            reserved_base_units: "0".into(),
+            signature_count: 0,
+            pending_reservations: BTreeMap::new(),
+        };
+        let expires_ms = now.saturating_add(scope.ttl_ms);
+        let action = evm_owner_session_sealed_action(wallet, &path, data, &scope, now)?;
+        let stored = self
+            .auth_services
+            .require_writer()?
+            .create_standing_session(
+                &id,
+                wallet,
+                petal_identity::PETAL_ID_EVM_WALLET,
+                EVM_OWNER_SIGNING_SESSION_KIND,
+                serde_json::to_value(&scope).map_err(err_be)?,
+                serde_json::to_value(&counters).map_err(err_be)?,
+                action.policy_version,
+                &action.petal_policy_digest,
+                now,
+                expires_ms,
+                now,
+            )
+            .await
+            .map_err(|e| HandlerError::backend(format!("create evm owner-session: {e}")))?;
+        tracing::info!(wallet, session = %stored.session_id, "wallet.evm_owner_session.minted");
+        Ok(())
+    }
+
+    async fn use_evm_owner_session(
+        &self,
+        wallet: &str,
+        session_id: &str,
+        data: &[u8],
+    ) -> Result<(), HandlerError> {
+        let mut value: serde_json::Value = serde_json::from_slice(data)
+            .map_err(|e| HandlerError::invalid(format!("evm owner-session use: {e}")))?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.entry("wallet".to_string())
+                .or_insert_with(|| serde_json::Value::String(wallet.to_string()));
+        }
+        let request: EvmOwnerSigningSessionUse =
+            serde_json::from_value(value).map_err(|e| HandlerError::invalid(e.to_string()))?;
+        let now = now_ms_u64();
+        let reservation_id = format!("evmuse-{session_id}-{now:x}");
+        let writer = self.auth_services.require_writer()?;
+        let reserved = writer
+            .reserve_evm_owner_session_use(session_id, &reservation_id, request.clone(), true, now)
+            .await
+            .map_err(|e| HandlerError::invalid(format!("evm owner-session denied: {e}")))?;
+        let chain_name = match request.chain.as_deref().filter(|s| !s.trim().is_empty()) {
+            Some(name) => name.to_string(),
+            None => self
+                .chains
+                .name_for_chain_id(request.chain_id)
+                .ok_or_else(|| HandlerError::not_found(format!("chain id {}", request.chain_id)))?,
+        };
+        let chain = self
+            .chains
+            .get(&chain_name)
+            .ok_or_else(|| HandlerError::not_found(format!("chain '{chain_name}'")))?;
+        let info = self.keystore.info(wallet).map_err(err_be)?;
+        let execution = self
+            .tx_engine
+            .execute_evm_owner_session_use(
+                wallet,
+                session_id,
+                &reservation_id,
+                &request,
+                &reserved,
+                &chain_name,
+                &chain,
+                info.address,
+                &Policy::permissive(),
+            )
+            .await;
+        let execution = match execution {
+            Ok(execution) => execution,
+            Err(err) => {
+                let _ = writer
+                    .release_evm_owner_session_use(session_id, &reservation_id, now_ms_u64())
+                    .await;
+                return Err(HandlerError::invalid(format!(
+                    "evm owner-session execution failed: {err}"
+                )));
+            }
+        };
+        writer
+            .commit_evm_owner_session_use(session_id, &reservation_id, now)
+            .await
+            .map_err(|e| HandlerError::backend(format!("commit evm owner-session use: {e}")))?;
+        tracing::info!(
+            wallet,
+            session = %session_id,
+            tx_hash = %format!("{:#x}", execution.tx_hash),
+            nonce = execution.nonce,
+            signing_hash = %format!("{:#x}", execution.signing_hash),
+            "wallet.evm_owner_session.use.broadcast"
+        );
+        Ok(())
+    }
+
+    async fn require_sealed_policy_session_approval(
+        &self,
+        wallet: &str,
+        path: &str,
+        data: &[u8],
+    ) -> Result<(), HandlerError> {
+        let action_id = policy_session_action_id(wallet, data);
+        let envelope = policy_session_canonical_envelope(wallet, path, &action_id, data)?;
+        self.auth_services
+            .require_writer()?
+            .stage_entry(envelope, AssuranceLevel::Hardened, now_ms_u64())
+            .await
+            .map_err(|e| HandlerError::backend(format!("stage policy-session auth entry: {e}")))?;
+        let approval_path = self
+            .keystore
+            .root()
+            .join(wallet)
+            .join("policy-session")
+            .join(&action_id)
+            .join(APPROVAL_FILE);
+        if approval_path.exists() {
+            let approval: SignedApproval = read_json(&approval_path)?;
+            self.auth_services
+                .require_approval_verifier()?
+                .verify_and_consume(approval, now_ms_u64())
+                .await
+                .map_err(|e| HandlerError::invalid(format!("Sealed Approval rejected: {e}")))?;
+            return Ok(());
+        }
+        let challenge = self.issue_policy_session_challenge(&action_id).await?;
+        let challenge_path = approval_path.with_file_name(APPROVAL_CHALLENGE_FILE);
+        if let Some(parent) = challenge_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_json(challenge_path, &challenge)?;
+        Err(HandlerError::PermissionDenied)
+    }
+
+    async fn write_wallet_policy_update(
+        &self,
+        wallet: &str,
+        path: &str,
+        data: &[u8],
+    ) -> Result<(), HandlerError> {
+        let proposed_policy_toml = std::str::from_utf8(data)
+            .map_err(|e| HandlerError::invalid(format!("policy must be UTF-8: {e}")))?;
+        let proposed_policy: Policy = toml::from_str(proposed_policy_toml)
+            .map_err(|e| HandlerError::invalid(format!("invalid policy TOML: {e}")))?;
+        let (old_policy_toml, kind) = self.keystore.raw_policy(wallet).map_err(err_be)?;
+        if kind != bloom_keystore::WalletKind::PasskeyGated {
+            self.keystore.write_policy(wallet, data).map_err(err_be)?;
+            return Ok(());
+        }
+        if old_policy_toml.as_bytes() == data {
+            return Ok(());
+        }
+        let old_policy: Policy = toml::from_str(&old_policy_toml)
+            .map_err(|e| HandlerError::backend(format!("existing policy TOML is invalid: {e}")))?;
+        let now = now_ms_u64();
+        let action = wallet_policy_sealed_action(
+            wallet,
+            path,
+            old_policy_toml.as_bytes(),
+            data,
+            &old_policy,
+            &proposed_policy,
+            now,
+        )?;
+        let action_id = action.action_id().to_string();
+        let petal_id = action.petal_id().to_string();
+        let petal_digest = action.petal_digest().to_string();
+        self.auth_services
+            .require_writer()?
+            .stage_action(action, now)
+            .await
+            .map_err(|e| HandlerError::backend(format!("stage wallet-policy action: {e}")))?;
+        if self
+            .auth_services
+            .require_grant_store()?
+            .get_active(wallet, &action_id, &petal_id, &petal_digest, now)
+            .await
+            .map_err(|e| HandlerError::backend(format!("lookup wallet-policy grant: {e}")))?
+            .is_none()
+        {
+            let approval_path = self
+                .keystore
+                .root()
+                .join(wallet)
+                .join("policy-updates")
+                .join(&action_id)
+                .join(APPROVAL_FILE);
+            if approval_path.exists() {
+                let approval: SignedApproval = read_json(&approval_path)?;
+                self.auth_services
+                    .require_approval_verifier()?
+                    .verify_and_mint_grant(
+                        approval,
+                        self.auth_services.require_grant_store()?.as_ref(),
+                        now_ms_u64(),
+                    )
+                    .await
+                    .map_err(|e| HandlerError::invalid(format!("Sealed Approval rejected: {e}")))?;
+            } else {
+                let challenge = self.issue_wallet_policy_challenge(&action_id).await?;
+                let challenge_path = approval_path.with_file_name(APPROVAL_CHALLENGE_FILE);
+                if let Some(parent) = challenge_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                write_json(challenge_path, &challenge)?;
+                return Err(HandlerError::PermissionDenied);
+            }
+        }
+        self.execute_wallet_policy_update(wallet, &action_id, &old_policy_toml, data)
+            .await
+    }
+
+    async fn issue_wallet_policy_challenge(
+        &self,
+        action_id: &str,
+    ) -> Result<ApprovalChallenge, HandlerError> {
+        let now = now_ms_u64();
+        let mut nonce = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+        let nonce = URL_SAFE_NO_PAD.encode(nonce);
+        self.auth_services
+            .require_writer()?
+            .issue_challenge(
+                WALLET_POLICY_SURFACE,
+                action_id,
+                &nonce,
+                now + APPROVAL_TTL_MS,
+                now,
+            )
+            .await
+            .map_err(|e| HandlerError::backend(format!("issue wallet-policy challenge: {e}")))
+    }
+
+    async fn execute_wallet_policy_update(
+        &self,
+        wallet: &str,
+        action_id: &str,
+        old_policy_toml: &str,
+        proposed_policy: &[u8],
+    ) -> Result<(), HandlerError> {
+        let current = std::fs::read(self.keystore.root().join(wallet).join("policy.toml"))?;
+        if current != old_policy_toml.as_bytes() {
+            return Err(HandlerError::invalid(
+                "wallet policy changed after approval; restage the policy update",
+            ));
+        }
+        let proposed_policy_toml = std::str::from_utf8(proposed_policy)
+            .map_err(|e| HandlerError::invalid(format!("policy must be UTF-8: {e}")))?;
+        let policy_hash = blake3::hash(format!("{wallet}:{proposed_policy_toml}").as_bytes());
+        let policy_hash_hex = hex::encode(policy_hash.as_bytes());
+        let hash_hex = format!("0x{policy_hash_hex}");
+        let mut facts = BTreeMap::new();
+        facts.insert("wallet".into(), serde_json::json!(wallet));
+        facts.insert("action_id".into(), serde_json::json!(action_id));
+        facts.insert("policy_hash_hex".into(), serde_json::json!(hash_hex));
+        facts.insert(
+            "proposed_policy_blake3".into(),
+            serde_json::json!(wallet_policy_hash_hex(proposed_policy)),
+        );
+        facts.insert(
+            "installation_target".into(),
+            serde_json::json!(format!("/wallets/{wallet}/policy.toml")),
+        );
+        let sealed_sig = self
+            .auth_services
+            .require_petal_host()?
+            .sign_hash(
+                SignHashRequest {
+                    wallet: wallet.to_string(),
+                    action_id: action_id.to_string(),
+                    intent: WALLET_POLICY_SIGN_INTENT.into(),
+                    hash_hex,
+                },
+                &SigningAttestation {
+                    schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
+                    petal_id: petal_identity::PETAL_ID_WALLET_POLICY.into(),
+                    petal_digest: petal_identity::PLACEHOLDER_DIGEST_WALLET_POLICY.into(),
+                    intent: WALLET_POLICY_SIGN_INTENT.into(),
+                    facts,
+                },
+                now_ms_u64(),
+            )
+            .await
+            .map_err(|e| HandlerError::invalid(format!("wallet-policy signing denied: {e}")))?;
+        let sig_raw = B64_STANDARD
+            .decode(sealed_sig.signature_b64.as_bytes())
+            .map_err(|e| HandlerError::backend(format!("decode wallet-policy signature: {e}")))?;
+        let sig = alloy::primitives::Signature::from_raw(&sig_raw)
+            .map_err(|e| HandlerError::backend(format!("wallet-policy signature: {e}")))?;
+        let sig_json = serde_json::json!({
+            "blake3_hex": policy_hash_hex,
+            "sig_hex": sig.to_string(),
+        });
+        let wallet_dir = self.keystore.root().join(wallet);
+        write_atomic_file(
+            &wallet_dir.join("policy.toml.sig"),
+            sig_json.to_string().as_bytes(),
+        )?;
+        write_atomic_file(&wallet_dir.join("policy.toml"), proposed_policy)?;
+        Ok(())
+    }
+
+    async fn require_sealed_evm_owner_session_approval(
+        &self,
+        wallet: &str,
+        path: &str,
+        data: &[u8],
+        scope: &EvmOwnerSigningSessionScope,
+        now: u64,
+    ) -> Result<(), HandlerError> {
+        let action_id = evm_owner_session_action_id(wallet, data);
+        let action = evm_owner_session_sealed_action(wallet, path, data, scope, now)?;
+        let petal_id = action.petal_id().to_string();
+        let petal_digest = action.petal_digest().to_string();
+        self.auth_services
+            .require_writer()?
+            .stage_action(action, now)
+            .await
+            .map_err(|e| {
+                HandlerError::backend(format!("stage evm owner-session auth entry: {e}"))
+            })?;
+        if self
+            .auth_services
+            .require_grant_store()?
+            .get_active(wallet, &action_id, &petal_id, &petal_digest, now)
+            .await
+            .map_err(|e| HandlerError::backend(format!("lookup owner-session grant: {e}")))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let approval_path = self
+            .keystore
+            .root()
+            .join(wallet)
+            .join("policy-session")
+            .join(&action_id)
+            .join(APPROVAL_FILE);
+        if approval_path.exists() {
+            let approval: SignedApproval = read_json(&approval_path)?;
+            self.auth_services
+                .require_approval_verifier()?
+                .verify_and_mint_grant(
+                    approval,
+                    self.auth_services.require_grant_store()?.as_ref(),
+                    now_ms_u64(),
+                )
+                .await
+                .map_err(|e| HandlerError::invalid(format!("Sealed Approval rejected: {e}")))?;
+            return Ok(());
+        }
+        let challenge = self.issue_policy_session_challenge(&action_id).await?;
+        let challenge_path = approval_path.with_file_name(APPROVAL_CHALLENGE_FILE);
+        if let Some(parent) = challenge_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_json(challenge_path, &challenge)?;
+        Err(HandlerError::PermissionDenied)
+    }
+
+    async fn issue_policy_session_challenge(
+        &self,
+        action_id: &str,
+    ) -> Result<ApprovalChallenge, HandlerError> {
+        let now = now_ms_u64();
+        let mut nonce = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+        let nonce = URL_SAFE_NO_PAD.encode(nonce);
+        self.auth_services
+            .require_writer()?
+            .issue_challenge(
+                "policy-session",
+                action_id,
+                &nonce,
+                now.saturating_add(APPROVAL_TTL_MS),
+                now,
+            )
+            .await
+            .map_err(|e| HandlerError::backend(format!("issue policy-session challenge: {e}")))
     }
 
     fn wallet_dir_entries(kind: bloom_keystore::WalletKind) -> Vec<Entry> {
@@ -476,22 +950,438 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
+fn now_ms_u64() -> u64 {
+    now_ms().min(u128::from(u64::MAX)) as u64
+}
+
+fn write_json(path: impl AsRef<Path>, v: &impl serde::Serialize) -> Result<(), HandlerError> {
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(v).map_err(|e| HandlerError::backend(e.to_string()))?,
+    )?;
+    Ok(())
+}
+
+fn write_atomic_file(path: &Path, bytes: &[u8]) -> Result<(), HandlerError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| HandlerError::backend("atomic write target has no file name"))?;
+    let tmp = path.with_file_name(format!(".{file_name}.tmp-{}", now_ms_u64()));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+fn read_json<T: for<'de> serde::Deserialize<'de>>(
+    path: impl AsRef<Path>,
+) -> Result<T, HandlerError> {
+    let bytes = std::fs::read(path)?;
+    serde_json::from_slice(&bytes).map_err(|e| HandlerError::backend(e.to_string()))
+}
+
+fn policy_session_action_id(wallet: &str, data: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.policy_session.entry.v1");
+    hasher.update(wallet.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(data);
+    format!("ps-{}", hasher.finalize().to_hex())
+}
+
+#[derive(serde::Deserialize)]
+struct EvmOwnerSessionMintDescriptor {
+    chain_id: u64,
+    token_contract: String,
+    recipient: String,
+    #[serde(default = "default_evm_owner_session_method")]
+    method: String,
+    daily_cap_base_units: String,
+    ttl_secs: u64,
+    #[serde(default)]
+    fee_policy: EvmFeePolicy,
+    max_signature_count: u32,
+    #[serde(default)]
+    autonomy_classification: Option<String>,
+    #[serde(default)]
+    policy_snapshot_digest: Option<String>,
+    reason: String,
+    #[serde(default)]
+    native_transfers_allowed: bool,
+}
+
+fn default_evm_owner_session_method() -> String {
+    EVM_ERC20_TRANSFER_METHOD.to_string()
+}
+
+fn looks_like_evm_owner_session_descriptor(data: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(data)
+        .ok()
+        .map(|v| {
+            v.get("token_contract").is_some()
+                || v.get("recipient").is_some()
+                || v.get("daily_cap_base_units").is_some()
+        })
+        .unwrap_or(false)
+}
+
+fn evm_owner_session_action_id(wallet: &str, data: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.evm_owner_session.entry.v1");
+    hasher.update(wallet.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(data);
+    format!("evm-ownersess-{}", hasher.finalize().to_hex())
+}
+
+fn wallet_policy_hash_hex(policy: &[u8]) -> String {
+    blake3::hash(policy).to_hex().to_string()
+}
+
+fn wallet_policy_action_id(wallet: &str, old_policy: &[u8], proposed_policy: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bloom.wallet_policy.update.v1");
+    hasher.update(wallet.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(wallet_policy_hash_hex(old_policy).as_bytes());
+    hasher.update(&[0]);
+    hasher.update(wallet_policy_hash_hex(proposed_policy).as_bytes());
+    format!("policy-update-{}", hasher.finalize().to_hex())
+}
+
+fn wallet_policy_diff_summary(
+    before: &Policy,
+    after: &Policy,
+    old_policy: &[u8],
+    proposed_policy: &[u8],
+) -> Result<serde_json::Value, HandlerError> {
+    let class = classify_policy_edit(before, after);
+    let (classification, reasons) = match class {
+        PolicyEditClass::NotExpanding => ("not_expanding", Vec::new()),
+        PolicyEditClass::AuthorityExpanding { reasons } => ("authority_expanding", reasons),
+    };
+    Ok(serde_json::json!({
+        "schema": "bloom.wallet_policy_diff.v1",
+        "classification": classification,
+        "reasons": reasons,
+        "old_policy_blake3": wallet_policy_hash_hex(old_policy),
+        "proposed_policy_blake3": wallet_policy_hash_hex(proposed_policy),
+        "old_line_count": String::from_utf8_lossy(old_policy).lines().count(),
+        "proposed_line_count": String::from_utf8_lossy(proposed_policy).lines().count(),
+    }))
+}
+
+fn wallet_policy_assurance(before: &Policy, after: &Policy) -> AssuranceLevel {
+    if classify_policy_edit(before, after).is_authority_expanding() {
+        AssuranceLevel::Hardened
+    } else {
+        AssuranceLevel::Standard
+    }
+}
+
+fn wallet_policy_canonical_envelope(
+    wallet: &str,
+    path: &str,
+    action_id: &str,
+    old_policy: &[u8],
+    proposed_policy: &[u8],
+    before: &Policy,
+    after: &Policy,
+) -> Result<CanonicalEnvelope, HandlerError> {
+    let diff = wallet_policy_diff_summary(before, after, old_policy, proposed_policy)?;
+    let subject = serde_json::to_vec(&serde_json::json!({
+        "schema": WALLET_POLICY_SUBJECT_SCHEMA,
+        "wallet": wallet,
+        "path": path,
+        "action_kind": WALLET_POLICY_ACTION_KIND,
+        "installation_target": format!("/wallets/{wallet}/policy.toml"),
+        "policy_version": 0,
+        "old_policy_blake3": wallet_policy_hash_hex(old_policy),
+        "proposed_policy_blake3": wallet_policy_hash_hex(proposed_policy),
+        "proposed_policy_toml_b64": B64_STANDARD.encode(proposed_policy),
+        "normalized_diff": diff,
+    }))
+    .map_err(|e| HandlerError::backend(e.to_string()))?;
+    Ok(CanonicalEnvelope::new(
+        CanonicalIntentHeader {
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            wallet: wallet.to_string(),
+            surface: WALLET_POLICY_SURFACE.into(),
+            action_id: action_id.to_string(),
+            petal_id: petal_identity::PETAL_ID_WALLET_POLICY.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_WALLET_POLICY.into(),
+            petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+            executor_kind: ExecutorKind::FirstParty,
+            network: "wallet-policy".into(),
+            account: wallet.into(),
+            action_kind: WALLET_POLICY_ACTION_KIND.into(),
+            value_movement: false,
+            authority_change: true,
+            expires_ms: 0,
+        },
+        "wallet_policy_update",
+        WALLET_POLICY_SUBJECT_SCHEMA,
+        subject,
+    ))
+}
+
+fn wallet_policy_sealed_action(
+    wallet: &str,
+    path: &str,
+    old_policy: &[u8],
+    proposed_policy: &[u8],
+    before: &Policy,
+    after: &Policy,
+    now_ms: u64,
+) -> Result<SealedAction, HandlerError> {
+    let action_id = wallet_policy_action_id(wallet, old_policy, proposed_policy);
+    let assurance = wallet_policy_assurance(before, after);
+    let envelope = wallet_policy_canonical_envelope(
+        wallet,
+        path,
+        &action_id,
+        old_policy,
+        proposed_policy,
+        before,
+        after,
+    )?;
+    let diff = wallet_policy_diff_summary(before, after, old_policy, proposed_policy)?;
+    let mut extra = BTreeMap::new();
+    extra.insert(
+        "action_kind".to_string(),
+        serde_json::json!(WALLET_POLICY_ACTION_KIND),
+    );
+    extra.insert(
+        "old_policy_blake3".to_string(),
+        serde_json::json!(wallet_policy_hash_hex(old_policy)),
+    );
+    extra.insert(
+        "proposed_policy_blake3".to_string(),
+        serde_json::json!(wallet_policy_hash_hex(proposed_policy)),
+    );
+    extra.insert("classification".to_string(), diff["classification"].clone());
+    let terms = DaemonGrantTerms {
+        max_ttl_secs: APPROVAL_TTL_MS / 1_000,
+        max_signatures: 1,
+        allowed_sign_intents: vec![WALLET_POLICY_SIGN_INTENT.into()],
+        assurance,
+        extra,
+    };
+    let mut config = BTreeMap::new();
+    config.insert(
+        "installation_target".to_string(),
+        serde_json::json!(format!("/wallets/{wallet}/policy.toml")),
+    );
+    config.insert(
+        "old_policy_blake3".to_string(),
+        serde_json::json!(wallet_policy_hash_hex(old_policy)),
+    );
+    config.insert(
+        "proposed_policy_blake3".to_string(),
+        serde_json::json!(wallet_policy_hash_hex(proposed_policy)),
+    );
+    config.insert("normalized_diff".to_string(), diff.clone());
+    let snapshot = PetalPolicySnapshot {
+        policy_version: 0,
+        wallet: wallet.to_string(),
+        petal_id: petal_identity::PETAL_ID_WALLET_POLICY.into(),
+        petal_digest: petal_identity::PLACEHOLDER_DIGEST_WALLET_POLICY.into(),
+        caps: BTreeMap::new(),
+        hard_rules: Vec::new(),
+        step_up_rules: Vec::new(),
+        config,
+        budget_state: BTreeMap::new(),
+        session_scope: None,
+    };
+    SealedAction::new(
+        envelope,
+        format!(
+            "Update wallet policy for {wallet} ({})",
+            diff["classification"].as_str().unwrap_or("unknown")
+        ),
+        Vec::new(),
+        terms,
+        snapshot,
+        now_ms,
+    )
+    .map_err(err_be)
+}
+
+fn evm_owner_session_sealed_action(
+    wallet: &str,
+    path: &str,
+    data: &[u8],
+    scope: &EvmOwnerSigningSessionScope,
+    now_ms: u64,
+) -> Result<SealedAction, HandlerError> {
+    let action_id = evm_owner_session_action_id(wallet, data);
+    let envelope = evm_owner_session_canonical_envelope(wallet, path, &action_id, data, scope)?;
+    let mut extra = BTreeMap::new();
+    extra.insert(
+        "action_kind".to_string(),
+        serde_json::json!(EVM_OWNER_SESSION_MINT_ACTION_KIND),
+    );
+    extra.insert(
+        "session_kind".to_string(),
+        serde_json::json!(EVM_OWNER_SIGNING_SESSION_KIND),
+    );
+    extra.insert("signer_cache_required".to_string(), serde_json::json!(true));
+    let terms = DaemonGrantTerms {
+        max_ttl_secs: scope.ttl_ms / 1000,
+        max_signatures: scope.max_signature_count,
+        allowed_sign_intents: vec![EVM_TX_SIGN_INTENT.to_string()],
+        assurance: AssuranceLevel::Hardened,
+        extra,
+    };
+    let scope_value = serde_json::to_value(scope).map_err(err_be)?;
+    let scope_map = scope_value
+        .as_object()
+        .ok_or_else(|| HandlerError::backend("evm owner-session scope is not an object"))?
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut caps = BTreeMap::new();
+    caps.insert(
+        "daily_cap_base_units".to_string(),
+        serde_json::json!(scope.daily_cap_base_units),
+    );
+    caps.insert(
+        "max_signature_count".to_string(),
+        serde_json::json!(scope.max_signature_count),
+    );
+    let mut config = BTreeMap::new();
+    config.insert("chain_id".to_string(), serde_json::json!(scope.chain_id));
+    config.insert(
+        "token_contract".to_string(),
+        serde_json::json!(scope.token_contract),
+    );
+    config.insert("recipient".to_string(), serde_json::json!(scope.recipient));
+    config.insert("method".to_string(), serde_json::json!(scope.method));
+    let snapshot = PetalPolicySnapshot {
+        policy_version: 0,
+        wallet: wallet.to_string(),
+        petal_id: petal_identity::PETAL_ID_EVM_WALLET.into(),
+        petal_digest: petal_identity::PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+        caps,
+        hard_rules: Vec::new(),
+        step_up_rules: Vec::new(),
+        config,
+        budget_state: BTreeMap::new(),
+        session_scope: Some(scope_map),
+    };
+    SealedAction::new(
+        envelope,
+        format!(
+            "Mint bounded EVM owner-signing session for {wallet}: {}",
+            scope.reason
+        ),
+        Vec::new(),
+        terms,
+        snapshot,
+        now_ms,
+    )
+    .map_err(err_be)
+}
+
+fn evm_owner_session_canonical_envelope(
+    wallet: &str,
+    path: &str,
+    action_id: &str,
+    data: &[u8],
+    scope: &EvmOwnerSigningSessionScope,
+) -> Result<CanonicalEnvelope, HandlerError> {
+    let descriptor: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| HandlerError::invalid(format!("evm owner-session descriptor: {e}")))?;
+    let subject = serde_json::to_vec(&serde_json::json!({
+        "schema": "bloom.evm_owner_session_subject.v1",
+        "wallet": wallet,
+        "path": path,
+        "action_kind": EVM_OWNER_SESSION_MINT_ACTION_KIND,
+        "use_action_kind": EVM_OWNER_SESSION_USE_ACTION_KIND,
+        "session_kind": EVM_OWNER_SIGNING_SESSION_KIND,
+        "scope": scope,
+        "descriptor": descriptor,
+        "descriptor_blake3": blake3::hash(data).to_hex().to_string(),
+    }))
+    .map_err(|e| HandlerError::backend(e.to_string()))?;
+    Ok(CanonicalEnvelope::new(
+        CanonicalIntentHeader {
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            wallet: wallet.to_string(),
+            surface: "policy-session".into(),
+            action_id: action_id.to_string(),
+            petal_id: petal_identity::PETAL_ID_EVM_WALLET.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+            petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+            executor_kind: ExecutorKind::FirstParty,
+            network: scope.chain_id.to_string(),
+            account: "owner".into(),
+            action_kind: EVM_OWNER_SESSION_MINT_ACTION_KIND.into(),
+            value_movement: false,
+            authority_change: true,
+            expires_ms: 0,
+        },
+        "policy_session",
+        "bloom.evm_owner_session_subject.v1",
+        subject,
+    ))
+}
+
+fn policy_session_canonical_envelope(
+    wallet: &str,
+    path: &str,
+    action_id: &str,
+    data: &[u8],
+) -> Result<CanonicalEnvelope, HandlerError> {
+    let descriptor: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| HandlerError::invalid(format!("policy-session descriptor: {e}")))?;
+    let subject = serde_json::to_vec(&serde_json::json!({
+        "schema": "bloom.policy_session_subject.v1",
+        "wallet": wallet,
+        "path": path,
+        "descriptor": descriptor,
+        "descriptor_blake3": blake3::hash(data).to_hex().to_string(),
+    }))
+    .map_err(|e| HandlerError::backend(e.to_string()))?;
+    Ok(CanonicalEnvelope::new(
+        CanonicalIntentHeader {
+            schema: bloom_auth_api::CANONICAL_INTENT_HEADER_SCHEMA_V2.into(),
+            wallet: wallet.to_string(),
+            surface: "policy-session".into(),
+            action_id: action_id.to_string(),
+            petal_id: petal_identity::PETAL_ID_WALLET_POLICY.into(),
+            petal_digest: petal_identity::PLACEHOLDER_DIGEST_WALLET_POLICY.into(),
+            petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+            executor_kind: ExecutorKind::FirstParty,
+            network: "multi-chain".into(),
+            account: "default".into(),
+            action_kind: "policy_session_mint".into(),
+            value_movement: false,
+            authority_change: true,
+            // Staged on every write attempt for the same descriptor bytes, so
+            // this must stay deterministic (a clock-derived expiry would make
+            // re-sealing collide with the already-sealed entry).
+            // TODO(ws-K): commit a real expiry when the wallet-policy petal
+            // computes venue terms.
+            expires_ms: 0,
+        },
+        "policy_session",
+        "bloom.policy_session_subject.v1",
+        subject,
+    ))
+}
+
 /// Parse a state segment (`pending` / `sent` / `failed`) into an
 /// [`OutboxState`], rejecting anything else as NotFound.
 fn parse_state_seg(s: &str) -> Result<OutboxState, HandlerError> {
     OutboxState::parse(s).ok_or_else(|| HandlerError::not_found(format!("outbox state '{}'", s)))
 }
 
-fn split_confirm_review_hash(confirm_text: &str) -> (&str, Option<&str>) {
-    let mut lines = confirm_text.lines();
-    let first = lines.next().unwrap_or(confirm_text).trim();
-    let review_hash = lines.find_map(|line| {
-        line.trim()
-            .strip_prefix("review_hash=")
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-    });
-    (first, review_hash)
+fn first_confirm_line(confirm_text: &str) -> &str {
+    confirm_text.lines().next().unwrap_or(confirm_text).trim()
 }
 
 #[async_trait]
@@ -632,6 +1522,7 @@ impl WalletsHandler {
                 3 if segs[2] == "new" => Ok(Entry::writable_file("new")),
                 3 if segs[2] == "active.json" => Ok(Entry::file("active.json")),
                 4 if segs[3] == "revoke" => Ok(Entry::writable_file("revoke")),
+                4 if segs[3] == "use" => Ok(Entry::writable_file("use")),
                 _ => Err(HandlerError::not_found(path.to_string_path())),
             },
             "capabilities" => match segs.len() {
@@ -674,7 +1565,7 @@ impl WalletsHandler {
             }
             "chains" if segs.len() >= 4 => self.read_chain(wallet, &segs[2], &segs[3..]).await,
             "policy-session" if segs.len() == 3 && segs[2] == "active.json" => {
-                self.policy_session_active_json(wallet)
+                self.policy_session_active_json(wallet).await
             }
             "capabilities" if segs.len() == 3 && segs[2] == "active.json" => {
                 self.capabilities_active_json(wallet)
@@ -699,12 +1590,27 @@ impl WalletsHandler {
         if segs.len() >= 4 && segs[1] == "chains" && segs[3] == "outbox" {
             return self.write_outbox(wallet, &segs[2], &segs[4..], data).await;
         }
+        // WS-11a: arbitrary-bytes wallet signing oracle closed. Signing
+        // caller-supplied message/hash/typed_data (e.g. a draining ERC-20
+        // permit's EIP-712 TypedData) straight from the cached signer is an
+        // unbounded surface with no action binding, grant, or staged Sealed
+        // Approval. Value/authority signing must be staged as an action and
+        // signed via PetalHost::sign_hash. Applies to every wallet kind and
+        // every write lane (plain IPC write and the write_unlocked ceremony
+        // lane both land here).
         if segs.len() == 3 && segs[1] == "sign" {
-            return self.write_sign(wallet, &segs[2], data).await;
+            return Err(HandlerError::Unsupported(
+                "arbitrary wallet signing via /<wallet>/sign/{message,hash,typed_data} \
+                 is removed; stage a sealed approval action and sign via \
+                 PetalHost::sign_hash"
+                    .into(),
+            ));
         }
         if segs.len() == 2 && segs[1] == "policy.toml" {
-            self.keystore.write_policy(wallet, data).map_err(err_be)?;
-            return Ok(());
+            self.write_permit()?;
+            return self
+                .write_wallet_policy_update(wallet, &path.to_string_path(), data)
+                .await;
         }
         // PasskeyGated wallet: browser WebAuthn authentication ceremony.
         if segs.len() == 2 && segs[1] == "unlock-passkey" {
@@ -713,7 +1619,7 @@ impl WalletsHandler {
                     "unlock-passkey only applies to passkey wallets",
                 ));
             }
-            if self.keystore.signer(wallet).is_ok() {
+            if self.keystore.is_unlocked(wallet) {
                 return Ok(()); // already unlocked — ceremony not needed
             }
             self.keystore.unlock_passkey(wallet).await.map_err(err_be)?;
@@ -724,7 +1630,7 @@ impl WalletsHandler {
         // write lands for passkey wallets.
         if segs.len() == 3 && segs[1] == "policy-session" && segs[2] == "new" {
             self.write_permit()?;
-            return self.mint_policy_session(wallet, data);
+            return self.mint_policy_session(wallet, data).await;
         }
         if segs.len() == 4 && segs[1] == "policy-session" && segs[3] == "revoke" {
             self.write_permit()?;
@@ -732,12 +1638,26 @@ impl WalletsHandler {
             // wallet's path, so one wallet can't revoke another's session by id.
             return if self.tx_engine.session_store().revoke_for(wallet, &segs[2]) {
                 Ok(())
+            } else if let Some(store) = self.auth_services.store()
+                && let Ok(Some(session)) = store.standing_session(&segs[2]).await
+                && session.wallet == *wallet
+            {
+                self.auth_services
+                    .require_writer()?
+                    .revoke_standing_session(&segs[2], now_ms_u64())
+                    .await
+                    .map_err(|e| HandlerError::backend(format!("revoke standing session: {e}")))?;
+                Ok(())
             } else {
                 Err(HandlerError::not_found(format!(
                     "policy session '{}'",
                     segs[2]
                 )))
             };
+        }
+        if segs.len() == 4 && segs[1] == "policy-session" && segs[3] == "use" {
+            self.write_permit()?;
+            return self.use_evm_owner_session(wallet, &segs[2], data).await;
         }
         Err(HandlerError::PermissionDenied)
     }
@@ -1190,26 +2110,7 @@ impl WalletsHandler {
                         .map_err(err_be)?;
                     return Ok(());
                 }
-                let (confirm_text, reviewed_intent_hash) = split_confirm_review_hash(confirm_text);
-                let signer = self.keystore.signer(wallet).map_err(|e| {
-                    HandlerError::invalid(format!(
-                        "wallet '{wallet}' is locked.\n\
-                         \n\
-                         For automated EVM transactions: create a policy session first.\n\
-                         Create a session at: /wallets/{wallet}/policy-session/new\n\
-                         A policy session lets you confirm listed pending ids without\n\
-                         re-prompting for each one, while the wallet is unlocked.\n\
-                         \n\
-                         For one-off actions:\n\
-                         Daemon (bloom serve): unlock the wallet first, then write:\n\
-                           bloom wallet unlock {wallet}\n\
-                         One-shot CLI: pass --unlock-wallet or --passphrase to the command:\n\
-                           bloom wallet confirm {wallet} <chain> <id> --unlock-wallet {wallet}\n\
-                           bloom vfs write /wallets/{wallet}/... --unlock-wallet {wallet}\n\
-                         \n\
-                         Underlying error: {e}"
-                    ))
-                })?;
+                let confirm_text = first_confirm_line(confirm_text);
                 let _staged = self
                     .tx_engine
                     .confirm(
@@ -1218,15 +2119,16 @@ impl WalletsHandler {
                         chain,
                         id,
                         &client,
-                        &signer,
                         &info.policy,
                         confirm_text,
-                        reviewed_intent_hash,
                     )
                     .await
                     .map_err(|e| match e {
                         TxEngineError::EnsoQuoteStale { .. } => {
                             HandlerError::invalid(e.to_string())
+                        }
+                        TxEngineError::BroadcastApprovalRequired(_) => {
+                            HandlerError::PermissionDenied
                         }
                         other => err_be(other),
                     })?;
@@ -1243,24 +2145,6 @@ impl WalletsHandler {
                         "cancel requires non-empty content (e.g. 'y' or override token)",
                     ));
                 }
-                let signer = self.keystore.signer(wallet).map_err(|e| {
-                    HandlerError::invalid(format!(
-                        "wallet '{wallet}' is locked.\n\
-                         \n\
-                         For automated EVM transactions: create a policy session first.\n\
-                         Create a session at: /wallets/{wallet}/policy-session/new\n\
-                         A policy session lets you cancel listed pending ids without\n\
-                         re-prompting for each one, while the wallet is unlocked.\n\
-                         \n\
-                          For one-off actions:\n\
-                         Daemon (bloom serve): unlock the wallet first, then write:\n\
-                           bloom wallet unlock {wallet}\n\
-                         One-shot CLI: pass --unlock-wallet or --passphrase to the command:\n\
-                           bloom wallet cancel {wallet} <chain> <id> --unlock-wallet {wallet}\n\
-                         \n\
-                         Underlying error: {e}"
-                    ))
-                })?;
                 let _ = self
                     .tx_engine
                     .cancel(
@@ -1269,10 +2153,8 @@ impl WalletsHandler {
                         chain,
                         id,
                         &client,
-                        &signer,
                         10,
                         &info.policy,
-                        None,
                     )
                     .await
                     .map_err(err_be)?;
@@ -1292,24 +2174,6 @@ impl WalletsHandler {
                     ));
                 }
                 let intent: RawIntent = intent_parser::parse(body).map_err(err_be)?;
-                let signer = self.keystore.signer(wallet).map_err(|e| {
-                    HandlerError::invalid(format!(
-                        "wallet '{wallet}' is locked.\n\
-                         \n\
-                         For automated EVM transactions: create a policy session first.\n\
-                         Create a session at: /wallets/{wallet}/policy-session/new\n\
-                         A policy session lets you replace listed pending ids without\n\
-                         re-prompting for each one, while the wallet is unlocked.\n\
-                         \n\
-                         For one-off actions:\n\
-                         Daemon (bloom serve): unlock the wallet first, then write:\n\
-                           bloom wallet unlock {wallet}\n\
-                         One-shot CLI: pass --unlock-wallet or --passphrase to the command:\n\
-                           bloom vfs write /wallets/{wallet}/... --unlock-wallet {wallet}\n\
-                         \n\
-                         Underlying error: {e}"
-                    ))
-                })?;
                 // Bump at >= 10% (mempool floor) and substitute the
                 // calldata derived from the new intent — same nonce,
                 // possibly different to / value / data. Use the
@@ -1323,12 +2187,10 @@ impl WalletsHandler {
                         chain,
                         id,
                         &client,
-                        &signer,
                         10,
                         Some(intent),
                         Some(self.address_book.as_ref()),
                         &info.policy,
-                        None,
                     )
                     .await
                     .map_err(err_be)?;
@@ -1336,57 +2198,6 @@ impl WalletsHandler {
             }
             _ => Err(HandlerError::PermissionDenied),
         }
-    }
-
-    async fn write_sign(&self, wallet: &str, kind: &str, data: &[u8]) -> Result<(), HandlerError> {
-        let signer = self
-            .keystore
-            .signer(wallet)
-            .map_err(|_| HandlerError::PermissionDenied)?;
-        let sig_hex = match kind {
-            "message" => {
-                let msg = std::str::from_utf8(data)
-                    .map_err(|_| HandlerError::invalid("non-utf8 message"))?
-                    .trim_end_matches('\n');
-                let sig = signer.sign_message_sync(msg.as_bytes()).map_err(err_be)?;
-                hex_signature(&sig)
-            }
-            "hash" => {
-                let s = std::str::from_utf8(data)
-                    .map_err(|_| HandlerError::invalid("non-utf8 hash"))?
-                    .trim();
-                let bytes =
-                    decode_hex(s).map_err(|e| HandlerError::invalid(format!("hex: {e}")))?;
-                if bytes.len() != 32 {
-                    return Err(HandlerError::invalid("hash must be 32 bytes"));
-                }
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                let h = alloy::primitives::B256::from(arr);
-                let sig = signer.sign_hash_sync(&h).map_err(err_be)?;
-                hex_signature(&sig)
-            }
-            "typed_data" => {
-                let body = std::str::from_utf8(data)
-                    .map_err(|_| HandlerError::invalid("non-utf8 typed_data"))?;
-                let typed: alloy_dyn_abi::eip712::TypedData = serde_json::from_str(body)
-                    .map_err(|e| HandlerError::invalid(format!("typed_data json: {e}")))?;
-                let hash = typed
-                    .eip712_signing_hash()
-                    .map_err(|e| HandlerError::invalid(format!("typed_data hash: {e}")))?;
-                let sig = signer.sign_hash_sync(&hash).map_err(err_be)?;
-                hex_signature(&sig)
-            }
-            _ => return Err(HandlerError::PermissionDenied),
-        };
-        // Persist last-signature on disk so callers can read it back via the
-        // companion `.sig` path. Living next to the writable file keeps the
-        // surface stateless from the daemon's point of view.
-        let dir = self.keystore.root().join(wallet).join("sign");
-        std::fs::create_dir_all(&dir).map_err(HandlerError::Io)?;
-        std::fs::write(dir.join(format!("{kind}.sig")), &sig_hex).map_err(HandlerError::Io)?;
-        tracing::info!(wallet, kind, "wallet.signed");
-        Ok(())
     }
 
     async fn write_new_wallet(&self, data: &[u8]) -> Result<(), HandlerError> {
@@ -1588,34 +2399,530 @@ fn parse_new_wallet_spec(body: &str) -> Result<NewWalletSpec, HandlerError> {
     })
 }
 
-fn hex_signature(sig: &alloy::primitives::Signature) -> String {
-    let bytes = sig.as_bytes();
-    let mut s = String::with_capacity(2 + bytes.len() * 2);
-    s.push_str("0x");
-    s.push_str(&hex::encode(bytes));
-    s.push('\n');
-    s
-}
-
-fn decode_hex(s: &str) -> Result<Vec<u8>, hex::FromHexError> {
-    hex::decode(s.trim_start_matches("0x"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::{Address, B256, Signature};
+    use alloy::primitives::{Address, B256};
+    use alloy::signers::SignerSync;
+    use bloom_auth_api::{
+        APPROVAL_CHALLENGE_SCHEMA_V1, APPROVAL_SCHEMA_V1, ApprovalVerifier, AuthApiError,
+        AuthEntryRecord, AuthEntryState, AuthStoreView, AuthStoreWriter, DaemonGrantTerms,
+        GrantStore, NonceState, PetalHost, SealedAction, SealedApprovalGrant, SealedPetalContext,
+        SealedSignature, SignerTransport, StandingSessionRecord, WebAuthnAssertionRecord,
+    };
     use bloom_proto::AddressBook;
     use bloom_tx::outbox::Outbox;
     use bloom_tx::tx_engine::TxEngine;
-    use std::str::FromStr;
+    use std::sync::Mutex;
 
     struct Fixture {
         _tmp: tempfile::TempDir,
         handler: WalletsHandler,
         wallet_name: String,
         wallet_addr: Address,
-        sign_dir: std::path::PathBuf,
+    }
+
+    struct ChallengeOnlyWriter;
+
+    struct AcceptingVerifier;
+
+    struct SigningPetalHost {
+        signer: Arc<alloy::signers::local::PrivateKeySigner>,
+    }
+
+    struct UnusedGrantStore;
+
+    #[async_trait]
+    impl GrantStore for UnusedGrantStore {
+        async fn mint(
+            &self,
+            _sealed: &SealedAction,
+            _approval_expiry_ms: u64,
+            _now_ms: u64,
+        ) -> Result<SealedApprovalGrant, AuthApiError> {
+            Err(AuthApiError::Store(
+                "test grant store should not mint directly".into(),
+            ))
+        }
+
+        async fn consume_signature(
+            &self,
+            _grant_id: &str,
+            _intent: &str,
+            _now_ms: u64,
+        ) -> Result<SealedApprovalGrant, AuthApiError> {
+            Err(AuthApiError::Store(
+                "test grant store should not consume".into(),
+            ))
+        }
+
+        async fn revoke(&self, _grant_id: &str, _now_ms: u64) -> Result<(), AuthApiError> {
+            Ok(())
+        }
+
+        async fn revoke_all_for_wallet(
+            &self,
+            _wallet: &str,
+            _now_ms: u64,
+        ) -> Result<usize, AuthApiError> {
+            Ok(0)
+        }
+
+        async fn get_active(
+            &self,
+            _wallet: &str,
+            _action_id: &str,
+            _petal_id: &str,
+            _petal_digest: &str,
+            _now_ms: u64,
+        ) -> Result<Option<SealedApprovalGrant>, AuthApiError> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait]
+    impl ApprovalVerifier for AcceptingVerifier {
+        async fn verify_and_consume(
+            &self,
+            approval: SignedApproval,
+            _now_ms: u64,
+        ) -> Result<(), AuthApiError> {
+            if approval.surface != "policy-session" && approval.surface != WALLET_POLICY_SURFACE {
+                return Err(AuthApiError::Denied("wrong surface".into()));
+            }
+            Ok(())
+        }
+
+        async fn verify_and_mint_grant(
+            &self,
+            approval: SignedApproval,
+            _grant_store: &dyn GrantStore,
+            now_ms: u64,
+        ) -> Result<SealedApprovalGrant, AuthApiError> {
+            self.verify_and_consume(approval.clone(), now_ms).await?;
+            let mut daemon_terms = DaemonGrantTerms::minimal(AssuranceLevel::Hardened);
+            daemon_terms.allowed_sign_intents =
+                vec![EVM_TX_SIGN_INTENT.into(), WALLET_POLICY_SIGN_INTENT.into()];
+            daemon_terms.max_signatures = 5;
+            Ok(SealedApprovalGrant {
+                grant_id: format!("test-grant-{}", approval.action_id),
+                wallet: approval.wallet,
+                action_id: approval.action_id,
+                intent_hash: approval.intent_hash,
+                petal_id: approval.petal_id,
+                petal_digest: approval.petal_digest,
+                petal_version: petal_identity::FIRST_PARTY_PETAL_VERSION_V0.into(),
+                daemon_terms,
+                petal_policy_digest: approval.petal_policy_digest,
+                policy_version: approval.policy_version,
+                issued_ms: now_ms,
+                expiry_ms: approval.expiry_ms,
+                max_signatures: 5,
+                consumed_signature_count: 0,
+                revoked: false,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl PetalHost for SigningPetalHost {
+        async fn seal_context(&self, _petal_id: &str) -> Result<SealedPetalContext, AuthApiError> {
+            Err(AuthApiError::Store("test seal_context unused".into()))
+        }
+
+        async fn sealed_policy_snapshot(
+            &self,
+            _wallet: &str,
+            _petal_id: &str,
+        ) -> Result<PetalPolicySnapshot, AuthApiError> {
+            Err(AuthApiError::Store(
+                "test sealed_policy_snapshot unused".into(),
+            ))
+        }
+
+        async fn sign_hash(
+            &self,
+            request: SignHashRequest,
+            attestation: &SigningAttestation,
+            now_ms: u64,
+        ) -> Result<SealedSignature, AuthApiError> {
+            if request.intent != WALLET_POLICY_SIGN_INTENT
+                || attestation.intent != WALLET_POLICY_SIGN_INTENT
+                || attestation.petal_id != petal_identity::PETAL_ID_WALLET_POLICY
+            {
+                return Err(AuthApiError::Denied("unexpected wallet-policy sign".into()));
+            }
+            let hash = hex::decode(request.hash_hex.trim_start_matches("0x"))
+                .map_err(|e| AuthApiError::Denied(format!("hash hex: {e}")))?;
+            let hash = B256::from_slice(&hash);
+            let sig = self
+                .signer
+                .sign_hash_sync(&hash)
+                .map_err(|e| AuthApiError::Denied(format!("test sign: {e}")))?;
+            Ok(SealedSignature {
+                intent_hash: "test-wallet-policy-intent".into(),
+                signature_b64: B64_STANDARD.encode(sig.as_bytes()),
+                signed_at_ms: now_ms,
+            })
+        }
+
+        async fn audit(&self, _event: bloom_auth_api::AuditEvent) -> Result<(), AuthApiError> {
+            Ok(())
+        }
+    }
+
+    struct RejectingVerifier;
+
+    #[async_trait]
+    impl ApprovalVerifier for RejectingVerifier {
+        async fn verify_and_consume(
+            &self,
+            _approval: SignedApproval,
+            _now_ms: u64,
+        ) -> Result<(), AuthApiError> {
+            Err(AuthApiError::Denied("test verifier rejects".into()))
+        }
+    }
+
+    #[async_trait]
+    impl AuthStoreWriter for ChallengeOnlyWriter {
+        async fn stage_entry(
+            &self,
+            envelope: CanonicalEnvelope,
+            assurance: AssuranceLevel,
+            now_ms: u64,
+        ) -> Result<AuthEntryRecord, AuthApiError> {
+            let intent_hash = envelope.intent_hash()?;
+            Ok(AuthEntryRecord {
+                surface: envelope.header.surface.clone(),
+                action_id: envelope.header.action_id.clone(),
+                state: AuthEntryState::Staged,
+                intent_hash,
+                assurance,
+                nonce: None,
+                nonce_state: NonceState::Unused,
+                reservation_id: None,
+                updated_ms: now_ms,
+            })
+        }
+
+        async fn stage_action(
+            &self,
+            action: SealedAction,
+            now_ms: u64,
+        ) -> Result<AuthEntryRecord, AuthApiError> {
+            self.stage_entry(action.envelope, action.daemon_terms.assurance, now_ms)
+                .await
+        }
+
+        async fn issue_challenge(
+            &self,
+            surface: &str,
+            action_id: &str,
+            server_nonce: &str,
+            expiry_ms: u64,
+            _now_ms: u64,
+        ) -> Result<ApprovalChallenge, AuthApiError> {
+            Ok(ApprovalChallenge {
+                schema: APPROVAL_CHALLENGE_SCHEMA_V1.to_string(),
+                action_id: action_id.to_string(),
+                wallet: "alice".to_string(),
+                surface: surface.to_string(),
+                petal_id: petal_identity::PETAL_ID_WALLET_POLICY.to_string(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_WALLET_POLICY.to_string(),
+                intent_hash: "policy-session-intent".to_string(),
+                server_nonce: server_nonce.to_string(),
+                assurance: AssuranceLevel::Hardened,
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
+                expiry_ms,
+                ceremony_url: None,
+            })
+        }
+
+        async fn issue_review_session(
+            &self,
+            review_session_id: &str,
+            surface: &str,
+            action_id: &str,
+            expires_ms: u64,
+            now_ms: u64,
+        ) -> Result<bloom_auth_api::ReviewSessionRecord, AuthApiError> {
+            Ok(bloom_auth_api::ReviewSessionRecord {
+                review_session_id: review_session_id.to_string(),
+                surface: surface.to_string(),
+                action_id: action_id.to_string(),
+                intent_hash: "policy-session-intent".to_string(),
+                assurance: AssuranceLevel::Hardened,
+                expires_ms,
+                consumed_ms: None,
+                created_ms: now_ms,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct EvmSessionAuth {
+        sessions: Mutex<BTreeMap<String, StandingSessionRecord>>,
+    }
+
+    #[async_trait]
+    impl AuthStoreView for EvmSessionAuth {
+        async fn sealed_intent(
+            &self,
+            intent_hash: &str,
+        ) -> Result<bloom_auth_api::SealedIntentRecord, AuthApiError> {
+            Err(AuthApiError::NotFound(format!(
+                "sealed intent {intent_hash}"
+            )))
+        }
+
+        async fn standing_session(
+            &self,
+            session_id: &str,
+        ) -> Result<Option<StandingSessionRecord>, AuthApiError> {
+            Ok(self.sessions.lock().unwrap().get(session_id).cloned())
+        }
+
+        async fn active_standing_sessions(
+            &self,
+            wallet: &str,
+            session_kind: Option<&str>,
+            now_ms: u64,
+        ) -> Result<Vec<StandingSessionRecord>, AuthApiError> {
+            Ok(self
+                .sessions
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|s| {
+                    s.wallet == wallet
+                        && s.expires_ms > now_ms
+                        && s.revoked_ms.is_none()
+                        && !s.orphan
+                        && session_kind.is_none_or(|kind| s.session_kind == kind)
+                })
+                .cloned()
+                .collect())
+        }
+    }
+
+    #[async_trait]
+    impl AuthStoreWriter for EvmSessionAuth {
+        async fn stage_entry(
+            &self,
+            envelope: CanonicalEnvelope,
+            assurance: AssuranceLevel,
+            now_ms: u64,
+        ) -> Result<AuthEntryRecord, AuthApiError> {
+            let intent_hash = envelope.intent_hash()?;
+            Ok(AuthEntryRecord {
+                surface: envelope.header.surface.clone(),
+                action_id: envelope.header.action_id.clone(),
+                state: AuthEntryState::Staged,
+                intent_hash,
+                assurance,
+                nonce: None,
+                nonce_state: NonceState::Unused,
+                reservation_id: None,
+                updated_ms: now_ms,
+            })
+        }
+
+        async fn stage_action(
+            &self,
+            action: SealedAction,
+            now_ms: u64,
+        ) -> Result<AuthEntryRecord, AuthApiError> {
+            self.stage_entry(action.envelope, action.daemon_terms.assurance, now_ms)
+                .await
+        }
+
+        async fn issue_challenge(
+            &self,
+            surface: &str,
+            action_id: &str,
+            server_nonce: &str,
+            expiry_ms: u64,
+            _now_ms: u64,
+        ) -> Result<ApprovalChallenge, AuthApiError> {
+            Ok(ApprovalChallenge {
+                schema: APPROVAL_CHALLENGE_SCHEMA_V1.to_string(),
+                action_id: action_id.to_string(),
+                wallet: "alice".to_string(),
+                surface: surface.to_string(),
+                petal_id: petal_identity::PETAL_ID_EVM_WALLET.to_string(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_EVM_WALLET.to_string(),
+                intent_hash: "evm-owner-session-intent".to_string(),
+                server_nonce: server_nonce.to_string(),
+                assurance: AssuranceLevel::Hardened,
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
+                expiry_ms,
+                ceremony_url: None,
+            })
+        }
+
+        async fn issue_review_session(
+            &self,
+            review_session_id: &str,
+            surface: &str,
+            action_id: &str,
+            expires_ms: u64,
+            now_ms: u64,
+        ) -> Result<bloom_auth_api::ReviewSessionRecord, AuthApiError> {
+            Ok(bloom_auth_api::ReviewSessionRecord {
+                review_session_id: review_session_id.to_string(),
+                surface: surface.to_string(),
+                action_id: action_id.to_string(),
+                intent_hash: "evm-owner-session-intent".to_string(),
+                assurance: AssuranceLevel::Hardened,
+                expires_ms,
+                consumed_ms: None,
+                created_ms: now_ms,
+            })
+        }
+
+        async fn create_standing_session(
+            &self,
+            session_id: &str,
+            wallet: &str,
+            petal_id: &str,
+            session_kind: &str,
+            scope: serde_json::Value,
+            counters: serde_json::Value,
+            frozen_policy_version: u64,
+            frozen_petal_policy_digest: &str,
+            issued_ms: u64,
+            expires_ms: u64,
+            now_ms: u64,
+        ) -> Result<StandingSessionRecord, AuthApiError> {
+            let record = StandingSessionRecord {
+                session_id: session_id.to_string(),
+                wallet: wallet.to_string(),
+                petal_id: petal_id.to_string(),
+                session_kind: session_kind.to_string(),
+                scope,
+                counters,
+                frozen_policy_version,
+                frozen_petal_policy_digest: frozen_petal_policy_digest.to_string(),
+                issued_ms,
+                expires_ms,
+                revoked_ms: None,
+                orphan: false,
+                created_ms: now_ms,
+            };
+            self.sessions
+                .lock()
+                .unwrap()
+                .insert(session_id.to_string(), record.clone());
+            Ok(record)
+        }
+
+        async fn revoke_standing_session(
+            &self,
+            session_id: &str,
+            now_ms: u64,
+        ) -> Result<(), AuthApiError> {
+            if let Some(session) = self.sessions.lock().unwrap().get_mut(session_id) {
+                session.revoked_ms = Some(now_ms);
+            }
+            Ok(())
+        }
+
+        async fn reserve_evm_owner_session_use(
+            &self,
+            session_id: &str,
+            reservation_id: &str,
+            request: EvmOwnerSigningSessionUse,
+            signer_material_available: bool,
+            _now_ms: u64,
+        ) -> Result<StandingSessionRecord, AuthApiError> {
+            if !signer_material_available {
+                return Err(AuthApiError::Denied(
+                    "session_missing_signer_material".into(),
+                ));
+            }
+            let mut guard = self.sessions.lock().unwrap();
+            let session = guard
+                .get_mut(session_id)
+                .ok_or_else(|| AuthApiError::Denied("session_not_found".into()))?;
+            let scope: EvmOwnerSigningSessionScope =
+                serde_json::from_value(session.scope.clone()).map_err(AuthApiError::Json)?;
+            if scope.wallet != request.wallet
+                || scope.chain_id != request.chain_id
+                || scope.token_contract != request.token_contract
+                || scope.recipient != request.recipient
+                || scope.method != request.method
+                || request.value_wei != "0"
+            {
+                return Err(AuthApiError::Denied("session_scope_mismatch".into()));
+            }
+            let mut counters: EvmOwnerSigningSessionCounters =
+                serde_json::from_value(session.counters.clone()).map_err(AuthApiError::Json)?;
+            let amount: u128 = request
+                .amount_base_units
+                .parse()
+                .map_err(|_| AuthApiError::Denied("session_wrong_amount".into()))?;
+            let reserved: u128 = counters.reserved_base_units.parse().unwrap_or(0);
+            counters.reserved_base_units = reserved.saturating_add(amount).to_string();
+            counters
+                .pending_reservations
+                .insert(reservation_id.to_string(), amount.to_string());
+            session.counters = serde_json::to_value(counters).map_err(AuthApiError::Json)?;
+            Ok(session.clone())
+        }
+
+        async fn commit_evm_owner_session_use(
+            &self,
+            session_id: &str,
+            reservation_id: &str,
+            _now_ms: u64,
+        ) -> Result<StandingSessionRecord, AuthApiError> {
+            let mut guard = self.sessions.lock().unwrap();
+            let session = guard
+                .get_mut(session_id)
+                .ok_or_else(|| AuthApiError::Denied("session_not_found".into()))?;
+            let mut counters: EvmOwnerSigningSessionCounters =
+                serde_json::from_value(session.counters.clone()).map_err(AuthApiError::Json)?;
+            let amount = counters
+                .pending_reservations
+                .remove(reservation_id)
+                .ok_or_else(|| AuthApiError::Denied("session_reservation_not_found".into()))?;
+            let amount: u128 = amount.parse().unwrap();
+            let reserved: u128 = counters.reserved_base_units.parse().unwrap_or(0);
+            let spent: u128 = counters.spent_base_units.parse().unwrap_or(0);
+            counters.reserved_base_units = reserved.saturating_sub(amount).to_string();
+            counters.spent_base_units = spent.saturating_add(amount).to_string();
+            counters.signature_count += 1;
+            session.counters = serde_json::to_value(counters).map_err(AuthApiError::Json)?;
+            Ok(session.clone())
+        }
+
+        async fn release_evm_owner_session_use(
+            &self,
+            session_id: &str,
+            reservation_id: &str,
+            _now_ms: u64,
+        ) -> Result<StandingSessionRecord, AuthApiError> {
+            let mut guard = self.sessions.lock().unwrap();
+            let session = guard
+                .get_mut(session_id)
+                .ok_or_else(|| AuthApiError::Denied("session_not_found".into()))?;
+            let mut counters: EvmOwnerSigningSessionCounters =
+                serde_json::from_value(session.counters.clone()).map_err(AuthApiError::Json)?;
+            let amount = counters
+                .pending_reservations
+                .remove(reservation_id)
+                .ok_or_else(|| AuthApiError::Denied("session_reservation_not_found".into()))?;
+            let amount: u128 = amount.parse().unwrap();
+            let reserved: u128 = counters.reserved_base_units.parse().unwrap_or(0);
+            counters.reserved_base_units = reserved.saturating_sub(amount).to_string();
+            session.counters = serde_json::to_value(counters).map_err(AuthApiError::Json)?;
+            Ok(session.clone())
+        }
     }
 
     fn make_handler() -> Fixture {
@@ -1667,13 +2974,11 @@ mod tests {
         let permit = Arc::new(HomeWritePermit::acquire(&home).unwrap());
         let handler = WalletsHandler::new(keystore, chains, tx_engine, address_book)
             .with_home_write_permit(permit);
-        let sign_dir = ks_root.join("alice").join("sign");
         Fixture {
             _tmp: tmp,
             handler,
             wallet_name: "alice".to_string(),
             wallet_addr: info.address,
-            sign_dir,
         }
     }
 
@@ -1719,6 +3024,7 @@ mod tests {
             nft: None,
             usd_value: None,
             depends_on: None,
+            action_id: None,
         };
         f.handler
             .tx_engine
@@ -1727,48 +3033,33 @@ mod tests {
             .unwrap();
     }
 
-    fn read_sig_file(path: &std::path::Path) -> Signature {
-        let raw = std::fs::read_to_string(path).unwrap();
-        Signature::from_str(raw.trim()).unwrap()
-    }
-
     #[tokio::test]
-    async fn personal_sign_recovers_to_wallet_address() {
+    async fn local_wallet_sign_message_is_denied() {
         let f = make_handler();
         let p = VfsPath::parse(&format!("/{}/sign/message", f.wallet_name)).unwrap();
-        let msg = b"hello world";
-        f.handler.write(&p, msg).await.unwrap();
-
-        let sig = read_sig_file(&f.sign_dir.join("message.sig"));
-        let bytes: [u8; 65] = sig.into();
-        assert_eq!(bytes.len(), 65);
-
-        let recovered = sig.recover_address_from_msg(msg).unwrap();
-        assert_eq!(recovered, f.wallet_addr);
+        let r = f.handler.write(&p, b"hello world").await;
+        assert_denied_oracle(r);
+        assert_no_sig_file(&f, "message");
     }
 
     #[tokio::test]
-    async fn sign_hash_with_known_digest_recovers_to_wallet_address() {
+    async fn local_wallet_sign_hash_is_denied() {
         let f = make_handler();
-        // Precomputed digest = keccak256("hello") (just any deterministic 32-byte value).
+        // A valid 32-byte digest: the write must still be refused, since the
+        // oracle is closed regardless of input shape.
         let digest_hex = "0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8";
-        let digest = B256::from_str(digest_hex).unwrap();
-
         let p = VfsPath::parse(&format!("/{}/sign/hash", f.wallet_name)).unwrap();
-        f.handler.write(&p, digest_hex.as_bytes()).await.unwrap();
-
-        let sig = read_sig_file(&f.sign_dir.join("hash.sig"));
-        let bytes: [u8; 65] = sig.into();
-        assert_eq!(bytes.len(), 65);
-
-        let recovered = sig.recover_address_from_prehash(&digest).unwrap();
-        assert_eq!(recovered, f.wallet_addr);
+        let r = f.handler.write(&p, digest_hex.as_bytes()).await;
+        assert_denied_oracle(r);
+        assert_no_sig_file(&f, "hash");
     }
 
     #[tokio::test]
-    async fn typed_data_signature_recovers_to_wallet_address() {
+    async fn local_wallet_sign_typed_data_is_denied() {
         let f = make_handler();
         let addr_hex = bloom_proto::checksum_address(&f.wallet_addr);
+        // A draining ERC-20 permit looks exactly like this shape; the oracle
+        // must refuse to sign it straight from the cached signer.
         let json = serde_json::json!({
             "types": {
                 "EIP712Domain": [
@@ -1783,42 +3074,61 @@ mod tests {
                 ]
             },
             "primaryType": "Mail",
-            "domain": {
-                "name": "Test",
-                "version": "1",
-                "chainId": 1
-            },
-            "message": {
-                "from": addr_hex,
-                "to": addr_hex,
-                "contents": "hi"
-            }
+            "domain": {"name": "Test", "version": "1", "chainId": 1},
+            "message": {"from": addr_hex, "to": addr_hex, "contents": "hi"}
         });
         let body = serde_json::to_vec(&json).unwrap();
-
-        // Compute the expected signing hash for recovery on our side.
-        let typed: alloy_dyn_abi::eip712::TypedData = serde_json::from_slice(&body).unwrap();
-        let expected_hash = typed.eip712_signing_hash().unwrap();
-
         let p = VfsPath::parse(&format!("/{}/sign/typed_data", f.wallet_name)).unwrap();
-        f.handler.write(&p, &body).await.unwrap();
-
-        let sig = read_sig_file(&f.sign_dir.join("typed_data.sig"));
-        let recovered = sig.recover_address_from_prehash(&expected_hash).unwrap();
-        assert_eq!(recovered, f.wallet_addr);
+        let r = f.handler.write(&p, &body).await;
+        assert_denied_oracle(r);
+        assert_no_sig_file(&f, "typed_data");
     }
 
     #[tokio::test]
-    async fn invalid_hex_hash_returns_invalid() {
+    async fn passkey_wallet_sign_paths_are_denied() {
         let f = make_handler();
-        let p = VfsPath::parse(&format!("/{}/sign/hash", f.wallet_name)).unwrap();
-        // Not valid hex.
-        let r = f.handler.write(&p, b"0xZZZZ").await;
-        assert!(matches!(r, Err(HandlerError::Invalid(_))), "got: {:?}", r);
+        seed_passkey_wallet(&f, "pk-wallet");
+        for (kind, body) in [
+            ("message", &b"hello world"[..]),
+            ("hash", b"0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8"),
+            ("typed_data", br#"{"types":{"EIP712Domain":[]},"primaryType":"EIP712Domain","domain":{},"message":{}}"#),
+        ] {
+            let p = VfsPath::parse(&format!("/pk-wallet/sign/{kind}")).unwrap();
+            let r = f.handler.write(&p, body).await;
+            assert_denied_oracle(r);
+            let sig_path = f
+                ._tmp
+                .path()
+                .join("keystore")
+                .join("pk-wallet")
+                .join("sign")
+                .join(format!("{kind}.sig"));
+            assert!(!sig_path.exists(), "{kind}.sig should not be written");
+        }
+    }
 
-        // Valid hex but wrong length (should also be Invalid).
-        let r2 = f.handler.write(&p, b"0xdeadbeef").await;
-        assert!(matches!(r2, Err(HandlerError::Invalid(_))), "got: {:?}", r2);
+    fn assert_denied_oracle(r: Result<(), HandlerError>) {
+        match r {
+            Err(HandlerError::Unsupported(msg)) => {
+                assert!(
+                    msg.contains("arbitrary wallet signing")
+                        && msg.contains("PetalHost::sign_hash"),
+                    "migration message, got: {msg}"
+                );
+            }
+            ref other => panic!("expected Unsupported oracle-closed error, got: {other:?}"),
+        }
+    }
+
+    fn assert_no_sig_file(f: &Fixture, kind: &str) {
+        let sig_path = f
+            ._tmp
+            .path()
+            .join("keystore")
+            .join(&f.wallet_name)
+            .join("sign")
+            .join(format!("{kind}.sig"));
+        assert!(!sig_path.exists(), "{kind}.sig should not be written");
     }
 
     #[tokio::test]
@@ -1991,13 +3301,54 @@ mod tests {
 
     #[tokio::test]
     async fn policy_session_mint_list_revoke() {
-        let f = make_handler();
+        let mut f = make_handler();
+        f.handler = f.handler.with_auth_services(AuthServices::new(
+            Some(Arc::new(AcceptingVerifier)),
+            None,
+            Some(Arc::new(ChallengeOnlyWriter)),
+        ));
         let new_p = VfsPath::parse("/alice/policy-session/new").unwrap();
         let body = br#"{"max_usd":10,"ttl_secs":600,"pending_ids":[{"chain_id":42161,"id":"0001-a"},{"chain_id":8453,"id":"0001-b"}]}"#;
-        // Mint requires a reviewed-intent approval marker (normally written by the
-        // IPC ceremony lane); a write without one is refused.
+        // Mint requires a sealed approval; a write without one is refused.
         assert!(f.handler.write(&new_p, body).await.is_err());
-        approve_mint(&f, "alice", body);
+        let action_id = policy_session_action_id("alice", body);
+        let approval_dir = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-session")
+            .join(&action_id);
+        std::fs::create_dir_all(&approval_dir).unwrap();
+        write_json(
+            approval_dir.join(APPROVAL_FILE),
+            &SignedApproval {
+                schema: APPROVAL_SCHEMA_V1.into(),
+                wallet: "alice".into(),
+                surface: "policy-session".into(),
+                action_id: action_id.clone(),
+                intent_hash: "policy-session-intent".into(),
+                petal_id: petal_identity::PETAL_ID_WALLET_POLICY.into(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_WALLET_POLICY.into(),
+                assurance: AssuranceLevel::Hardened,
+                server_nonce: "nonce-1".into(),
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
+                expiry_ms: now_ms_u64() + 60_000,
+                signer_transport: SignerTransport::BrowserWebauthn,
+                credential_id: "cred-1".into(),
+                review_session_id: None,
+                webauthn_assertion: WebAuthnAssertionRecord {
+                    credential_id: "cred-1".into(),
+                    authenticator_data_b64: "AA".into(),
+                    client_data_json_b64: "e30".into(),
+                    signature_b64: "AA".into(),
+                    user_handle_b64: None,
+                },
+            },
+        )
+        .unwrap();
         f.handler.write(&new_p, body).await.unwrap();
 
         let active_p = VfsPath::parse("/alice/policy-session/active.json").unwrap();
@@ -2030,8 +3381,296 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wired_auth_policy_session_mint_ignores_legacy_marker_and_issues_challenge() {
+        let mut f = make_handler();
+        f.handler = f.handler.with_auth_services(AuthServices::new(
+            None,
+            None,
+            Some(Arc::new(ChallengeOnlyWriter)),
+        ));
+        let new_p = VfsPath::parse("/alice/policy-session/new").unwrap();
+        let body =
+            br#"{"max_usd":10,"ttl_secs":600,"pending_ids":[{"chain_id":42161,"id":"0001-a"}]}"#;
+        approve_mint(&f, "alice", body);
+
+        let err = f.handler.write(&new_p, body).await.unwrap_err();
+        assert!(matches!(err, HandlerError::PermissionDenied), "{err}");
+        assert!(
+            !f.handler
+                .tx_engine
+                .session_store()
+                .active(now_ms())
+                .iter()
+                .any(|session| session.wallet == "alice")
+        );
+
+        let action_id = policy_session_action_id("alice", body);
+        let challenge_path = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-session")
+            .join(&action_id)
+            .join(APPROVAL_CHALLENGE_FILE);
+        let challenge: ApprovalChallenge = read_json(challenge_path).unwrap();
+        assert_eq!(challenge.surface, "policy-session");
+        assert_eq!(challenge.action_id, action_id);
+        assert_eq!(challenge.intent_hash, "policy-session-intent");
+        assert_eq!(challenge.assurance, AssuranceLevel::Hardened);
+    }
+
+    #[tokio::test]
+    async fn wired_auth_policy_session_mint_accepts_approval_without_legacy_marker() {
+        let mut f = make_handler();
+        f.handler = f.handler.with_auth_services(AuthServices::new(
+            Some(Arc::new(AcceptingVerifier)),
+            None,
+            Some(Arc::new(ChallengeOnlyWriter)),
+        ));
+        let new_p = VfsPath::parse("/alice/policy-session/new").unwrap();
+        let body =
+            br#"{"max_usd":10,"ttl_secs":600,"pending_ids":[{"chain_id":42161,"id":"0001-a"}]}"#;
+        let action_id = policy_session_action_id("alice", body);
+        let approval_dir = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-session")
+            .join(&action_id);
+        std::fs::create_dir_all(&approval_dir).unwrap();
+        write_json(
+            approval_dir.join(APPROVAL_FILE),
+            &SignedApproval {
+                schema: APPROVAL_SCHEMA_V1.into(),
+                wallet: "alice".into(),
+                surface: "policy-session".into(),
+                action_id: action_id.clone(),
+                intent_hash: "policy-session-intent".into(),
+                petal_id: petal_identity::PETAL_ID_WALLET_POLICY.into(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_WALLET_POLICY.into(),
+                assurance: AssuranceLevel::Hardened,
+                server_nonce: "nonce-1".into(),
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
+                expiry_ms: now_ms_u64() + 60_000,
+                signer_transport: SignerTransport::BrowserWebauthn,
+                credential_id: "cred-1".into(),
+                review_session_id: None,
+                webauthn_assertion: WebAuthnAssertionRecord {
+                    credential_id: "cred-1".into(),
+                    authenticator_data_b64: "AA".into(),
+                    client_data_json_b64: "e30".into(),
+                    signature_b64: "AA".into(),
+                    user_handle_b64: None,
+                },
+            },
+        )
+        .unwrap();
+
+        f.handler.write(&new_p, body).await.unwrap();
+        let sessions = f.handler.tx_engine.session_store().active(now_ms());
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].wallet, "alice");
+        assert_eq!(sessions[0].max_micro_usd, 10_000_000);
+    }
+
+    #[tokio::test]
+    async fn evm_owner_session_mint_active_and_use_surface() {
+        let mut f = make_handler_with_chain(true);
+        let auth = Arc::new(EvmSessionAuth::default());
+        f.handler = f.handler.with_auth_services(
+            AuthServices::new(
+                Some(Arc::new(AcceptingVerifier)),
+                Some(auth.clone()),
+                Some(auth),
+            )
+            .with_grant_store(Arc::new(UnusedGrantStore)),
+        );
+        let new_p = VfsPath::parse("/alice/policy-session/new").unwrap();
+        let body = br#"{
+            "chain_id": 31337,
+            "token_contract": "0x0000000000000000000000000000000000000003",
+            "recipient": "0x0000000000000000000000000000000000000002",
+            "daily_cap_base_units": "100000000",
+            "ttl_secs": 600,
+            "fee_policy": {
+                "max_fee_per_gas_wei": "200",
+                "max_priority_fee_per_gas_wei": "20",
+                "max_total_fee_wei": "1000000"
+            },
+            "max_signature_count": 5,
+            "reason": "test bounded payments"
+        }"#;
+
+        let err = f.handler.write(&new_p, body).await.unwrap_err();
+        assert!(matches!(err, HandlerError::PermissionDenied), "{err}");
+        let action_id = evm_owner_session_action_id("alice", body);
+        let approval_dir = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-session")
+            .join(&action_id);
+        std::fs::create_dir_all(&approval_dir).unwrap();
+        write_json(
+            approval_dir.join(APPROVAL_FILE),
+            &SignedApproval {
+                schema: APPROVAL_SCHEMA_V1.into(),
+                wallet: "alice".into(),
+                surface: "policy-session".into(),
+                action_id,
+                intent_hash: "evm-owner-session-intent".into(),
+                petal_id: petal_identity::PETAL_ID_EVM_WALLET.into(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_EVM_WALLET.into(),
+                assurance: AssuranceLevel::Hardened,
+                server_nonce: "nonce-1".into(),
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
+                expiry_ms: now_ms_u64() + 60_000,
+                signer_transport: SignerTransport::BrowserWebauthn,
+                credential_id: "cred-1".into(),
+                review_session_id: None,
+                webauthn_assertion: WebAuthnAssertionRecord {
+                    credential_id: "cred-1".into(),
+                    authenticator_data_b64: "AA".into(),
+                    client_data_json_b64: "e30".into(),
+                    signature_b64: "AA".into(),
+                    user_handle_b64: None,
+                },
+            },
+        )
+        .unwrap();
+
+        f.handler.write(&new_p, body).await.unwrap();
+        let active_p = VfsPath::parse("/alice/policy-session/active.json").unwrap();
+        let active: serde_json::Value =
+            serde_json::from_slice(&f.handler.read(&active_p).await.unwrap()).unwrap();
+        let session = active["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["session_kind"] == EVM_OWNER_SIGNING_SESSION_KIND)
+            .expect("standing EVM owner session");
+        let session_id = session["id"].as_str().unwrap();
+
+        let recipient = "0000000000000000000000000000000000000002";
+        let calldata = format!("0xa9059cbb{recipient:0>64}{:064x}", 1_000_000u128);
+        let use_body = serde_json::json!({
+            "chain_id": 31337,
+            "token_contract": "0x0000000000000000000000000000000000000003",
+            "recipient": "0x0000000000000000000000000000000000000002",
+            "method": EVM_ERC20_TRANSFER_METHOD,
+            "calldata_hex": calldata,
+            "amount_base_units": "1000000",
+            "value_wei": "0",
+            "chain": "anvil",
+            "nonce": 0,
+            "gas_limit": 65000,
+            "max_fee_per_gas_wei": "200",
+            "max_priority_fee_per_gas_wei": "20",
+            "max_total_fee_wei": "1000000"
+        });
+        let use_p = VfsPath::parse(&format!("/alice/policy-session/{session_id}/use")).unwrap();
+        let err = f
+            .handler
+            .write(&use_p, serde_json::to_string(&use_body).unwrap().as_bytes())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Sealed Approval Petal host is not wired"),
+            "{err}"
+        );
+
+        let active_after: serde_json::Value =
+            serde_json::from_slice(&f.handler.read(&active_p).await.unwrap()).unwrap();
+        let session_after = active_after["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == session_id)
+            .unwrap();
+        assert_eq!(session_after["counters"]["spent_base_units"], "0");
+        assert_eq!(session_after["counters"]["reserved_base_units"], "0");
+        assert_eq!(session_after["counters"]["signature_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn policy_session_mint_fails_closed_when_verifier_rejects() {
+        let mut f = make_handler();
+        f.handler = f.handler.with_auth_services(AuthServices::new(
+            Some(Arc::new(RejectingVerifier)),
+            None,
+            Some(Arc::new(ChallengeOnlyWriter)),
+        ));
+        let new_p = VfsPath::parse("/alice/policy-session/new").unwrap();
+        let body =
+            br#"{"max_usd":10,"ttl_secs":600,"pending_ids":[{"chain_id":42161,"id":"0001-a"}]}"#;
+        let action_id = policy_session_action_id("alice", body);
+        let approval_dir = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-session")
+            .join(&action_id);
+        std::fs::create_dir_all(&approval_dir).unwrap();
+        write_json(
+            approval_dir.join(APPROVAL_FILE),
+            &SignedApproval {
+                schema: APPROVAL_SCHEMA_V1.into(),
+                wallet: "alice".into(),
+                surface: "policy-session".into(),
+                action_id: action_id.clone(),
+                intent_hash: "policy-session-intent".into(),
+                petal_id: petal_identity::PETAL_ID_WALLET_POLICY.into(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_WALLET_POLICY.into(),
+                assurance: AssuranceLevel::Hardened,
+                server_nonce: "nonce-1".into(),
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
+                expiry_ms: now_ms_u64() + 60_000,
+                signer_transport: SignerTransport::BrowserWebauthn,
+                credential_id: "cred-1".into(),
+                review_session_id: None,
+                webauthn_assertion: WebAuthnAssertionRecord {
+                    credential_id: "cred-1".into(),
+                    authenticator_data_b64: "AA".into(),
+                    client_data_json_b64: "e30".into(),
+                    signature_b64: "AA".into(),
+                    user_handle_b64: None,
+                },
+            },
+        )
+        .unwrap();
+
+        // Verifier rejects → write must error and NO session is minted.
+        let err = f.handler.write(&new_p, body).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Sealed Approval rejected"),
+            "{err}"
+        );
+        let sessions = f.handler.tx_engine.session_store().active(now_ms());
+        assert!(
+            sessions.iter().all(|s| s.wallet != "alice"),
+            "no session should be minted when the verifier rejects"
+        );
+    }
+
+    #[tokio::test]
     async fn capability_confirm_path_uses_real_chain_segment() {
-        let f = make_handler();
+        let mut f = make_handler();
+        f.handler = f.handler.with_auth_services(AuthServices::new(
+            Some(Arc::new(AcceptingVerifier)),
+            None,
+            Some(Arc::new(ChallengeOnlyWriter)),
+        ));
         // Register arbitrum so chain-id 42161 resolves to its path segment.
         let spec = bloom_proto::ChainSpec {
             name: "arbitrum".into(),
@@ -2052,7 +3691,44 @@ mod tests {
         let new_p = VfsPath::parse("/alice/policy-session/new").unwrap();
         let body =
             br#"{"max_usd":10,"ttl_secs":600,"pending_ids":[{"chain_id":42161,"id":"0001-a"}]}"#;
-        approve_mint(&f, "alice", body);
+        let action_id = policy_session_action_id("alice", body);
+        let approval_dir = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-session")
+            .join(&action_id);
+        std::fs::create_dir_all(&approval_dir).unwrap();
+        write_json(
+            approval_dir.join(APPROVAL_FILE),
+            &SignedApproval {
+                schema: APPROVAL_SCHEMA_V1.into(),
+                wallet: "alice".into(),
+                surface: "policy-session".into(),
+                action_id: action_id.clone(),
+                intent_hash: "policy-session-intent".into(),
+                petal_id: petal_identity::PETAL_ID_WALLET_POLICY.into(),
+                petal_digest: petal_identity::PLACEHOLDER_DIGEST_WALLET_POLICY.into(),
+                assurance: AssuranceLevel::Hardened,
+                server_nonce: "nonce-1".into(),
+                daemon_terms_digest: "1".repeat(64),
+                petal_policy_digest: "2".repeat(64),
+                policy_version: 0,
+                expiry_ms: now_ms_u64() + 60_000,
+                signer_transport: SignerTransport::BrowserWebauthn,
+                credential_id: "cred-1".into(),
+                review_session_id: None,
+                webauthn_assertion: WebAuthnAssertionRecord {
+                    credential_id: "cred-1".into(),
+                    authenticator_data_b64: "AA".into(),
+                    client_data_json_b64: "e30".into(),
+                    signature_b64: "AA".into(),
+                    user_handle_b64: None,
+                },
+            },
+        )
+        .unwrap();
         f.handler.write(&new_p, body).await.unwrap();
 
         let views = f.handler.evm_capability_views_for("alice");
@@ -2153,14 +3829,9 @@ mod tests {
     }
 
     #[test]
-    fn confirm_review_hash_metadata_is_split_from_confirm_text() {
-        let (confirm, hash) = split_confirm_review_hash("y\nreview_hash=abc123\n");
-        assert_eq!(confirm, "y");
-        assert_eq!(hash, Some("abc123"));
-
-        let (confirm, hash) = split_confirm_review_hash("override");
-        assert_eq!(confirm, "override");
-        assert_eq!(hash, None);
+    fn confirm_text_uses_first_line_only() {
+        assert_eq!(first_confirm_line("y\nreview_hash=abc123\n"), "y");
+        assert_eq!(first_confirm_line("override"), "override");
     }
 
     /// Fix #2 + #10: writing `outbox/sent/<id>/confirm` is not a valid
@@ -2365,6 +4036,56 @@ mod tests {
         info.address
     }
 
+    fn convert_wallet_to_passkey(f: &Fixture, name: &str) {
+        let wallet_dir = f._tmp.path().join("keystore").join(name);
+        std::fs::write(wallet_dir.join("kind"), b"passkey").unwrap();
+        f.handler.keystore.sign_policy(name).unwrap();
+    }
+
+    fn wallet_policy_auth_services(f: &Fixture) -> AuthServices {
+        AuthServices::new(
+            Some(Arc::new(AcceptingVerifier)),
+            None,
+            Some(Arc::new(ChallengeOnlyWriter)),
+        )
+        .with_grant_store(Arc::new(UnusedGrantStore))
+        .with_petal_host(Arc::new(SigningPetalHost {
+            signer: f
+                .handler
+                .keystore
+                .signer(&f.wallet_name)
+                .expect("fixture local signer before passkey conversion"),
+        }))
+    }
+
+    fn signed_wallet_policy_approval(challenge: &ApprovalChallenge) -> SignedApproval {
+        SignedApproval {
+            schema: APPROVAL_SCHEMA_V1.into(),
+            wallet: challenge.wallet.clone(),
+            surface: challenge.surface.clone(),
+            action_id: challenge.action_id.clone(),
+            intent_hash: challenge.intent_hash.clone(),
+            petal_id: challenge.petal_id.clone(),
+            petal_digest: challenge.petal_digest.clone(),
+            assurance: challenge.assurance,
+            server_nonce: challenge.server_nonce.clone(),
+            daemon_terms_digest: challenge.daemon_terms_digest.clone(),
+            petal_policy_digest: challenge.petal_policy_digest.clone(),
+            policy_version: challenge.policy_version,
+            expiry_ms: challenge.expiry_ms,
+            signer_transport: SignerTransport::BrowserWebauthn,
+            credential_id: "cred-1".into(),
+            review_session_id: None,
+            webauthn_assertion: WebAuthnAssertionRecord {
+                credential_id: "cred-1".into(),
+                authenticator_data_b64: "AA".into(),
+                client_data_json_b64: "e30".into(),
+                signature_b64: "AA".into(),
+                user_handle_b64: None,
+            },
+        }
+    }
+
     /// Passkey wallet: dir lists `unlock-passkey`, lookup gives writable file,
     /// and `kind` reads "passkey".
     #[tokio::test]
@@ -2397,6 +4118,180 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&bytes).trim(), "passkey");
+    }
+
+    #[tokio::test]
+    async fn unlock_passkey_write_is_noop_when_passkey_signer_is_cached() {
+        let f = make_handler();
+        seed_passkey_wallet(&f, "pk");
+        assert!(f.handler.keystore.is_unlocked("pk"));
+
+        f.handler
+            .write(&VfsPath::parse("/pk/unlock-passkey").unwrap(), b"")
+            .await
+            .unwrap();
+
+        assert!(f.handler.keystore.is_unlocked("pk"));
+    }
+
+    #[tokio::test]
+    async fn wallet_policy_noop_write_does_not_stage_update() {
+        let mut f = make_handler();
+        let services = wallet_policy_auth_services(&f);
+        convert_wallet_to_passkey(&f, "alice");
+        f.handler = f.handler.with_auth_services(services);
+        let (policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
+        let p = VfsPath::parse("/alice/policy.toml").unwrap();
+        f.handler.write(&p, policy.as_bytes()).await.unwrap();
+        assert!(
+            !f.handler
+                .keystore
+                .root()
+                .join("alice")
+                .join("policy-updates")
+                .exists(),
+            "no-op policy write should not stage an approval challenge"
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_policy_expanding_edit_requires_hardened_sealed_approval_and_installs_signature()
+    {
+        let mut f = make_handler();
+        let services = wallet_policy_auth_services(&f);
+        convert_wallet_to_passkey(&f, "alice");
+        f.handler = f.handler.with_auth_services(services);
+        let (old_policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
+        let mut proposed: Policy = toml::from_str(&old_policy).unwrap();
+        proposed.approval.agent_autonomy = Some(bloom_proto::AgentAutonomyMode::UnderPolicy);
+        proposed.limits.max_tx_usd = Some("10".into());
+        proposed.limits.max_day_usd = Some("100".into());
+        let proposed = toml::to_string_pretty(&proposed).unwrap();
+        let action_id =
+            wallet_policy_action_id("alice", old_policy.as_bytes(), proposed.as_bytes());
+        let p = VfsPath::parse("/alice/policy.toml").unwrap();
+
+        let err = f.handler.write(&p, proposed.as_bytes()).await.unwrap_err();
+        assert!(matches!(err, HandlerError::PermissionDenied), "{err}");
+        let dir = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-updates")
+            .join(&action_id);
+        let challenge: ApprovalChallenge = read_json(dir.join(APPROVAL_CHALLENGE_FILE)).unwrap();
+        assert_eq!(challenge.surface, WALLET_POLICY_SURFACE);
+        assert_eq!(challenge.assurance, AssuranceLevel::Hardened);
+        let on_disk =
+            std::fs::read_to_string(f.handler.keystore.root().join("alice/policy.toml")).unwrap();
+        assert_eq!(on_disk, old_policy);
+
+        write_json(
+            dir.join(APPROVAL_FILE),
+            &signed_wallet_policy_approval(&challenge),
+        )
+        .unwrap();
+        f.handler.write(&p, proposed.as_bytes()).await.unwrap();
+        let on_disk =
+            std::fs::read_to_string(f.handler.keystore.root().join("alice/policy.toml")).unwrap();
+        assert_eq!(on_disk, proposed);
+        f.handler.keystore.info("alice").unwrap();
+    }
+
+    #[tokio::test]
+    async fn wallet_policy_tampered_retry_bytes_do_not_reuse_approval() {
+        let mut f = make_handler();
+        let services = wallet_policy_auth_services(&f);
+        convert_wallet_to_passkey(&f, "alice");
+        f.handler = f.handler.with_auth_services(services);
+        let (old_policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
+        let mut proposed: Policy = toml::from_str(&old_policy).unwrap();
+        proposed.denylists.recipients.insert("0x1111".into());
+        let proposed = toml::to_string_pretty(&proposed).unwrap();
+        let mut tampered: Policy = toml::from_str(&old_policy).unwrap();
+        tampered.approval.agent_autonomy = Some(bloom_proto::AgentAutonomyMode::UnderPolicy);
+        tampered.limits.max_tx_usd = Some("1000".into());
+        tampered.limits.max_day_usd = Some("1000".into());
+        let tampered = toml::to_string_pretty(&tampered).unwrap();
+        let action_id =
+            wallet_policy_action_id("alice", old_policy.as_bytes(), proposed.as_bytes());
+        let p = VfsPath::parse("/alice/policy.toml").unwrap();
+
+        assert!(matches!(
+            f.handler.write(&p, proposed.as_bytes()).await.unwrap_err(),
+            HandlerError::PermissionDenied
+        ));
+        let dir = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-updates")
+            .join(&action_id);
+        let challenge: ApprovalChallenge = read_json(dir.join(APPROVAL_CHALLENGE_FILE)).unwrap();
+        write_json(
+            dir.join(APPROVAL_FILE),
+            &signed_wallet_policy_approval(&challenge),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            f.handler.write(&p, tampered.as_bytes()).await.unwrap_err(),
+            HandlerError::PermissionDenied
+        ));
+        let on_disk =
+            std::fs::read_to_string(f.handler.keystore.root().join("alice/policy.toml")).unwrap();
+        assert_eq!(on_disk, old_policy);
+
+        f.handler.write(&p, proposed.as_bytes()).await.unwrap();
+        let on_disk =
+            std::fs::read_to_string(f.handler.keystore.root().join("alice/policy.toml")).unwrap();
+        assert_eq!(on_disk, proposed);
+    }
+
+    #[tokio::test]
+    async fn wallet_policy_tightening_edit_uses_standard_assurance() {
+        let mut f = make_handler();
+        let mut initial = Policy::default();
+        initial.approval.agent_autonomy = Some(bloom_proto::AgentAutonomyMode::UnderPolicy);
+        initial.limits.max_tx_usd = Some("10".into());
+        initial.limits.max_day_usd = Some("100".into());
+        f.handler
+            .keystore
+            .write_policy(
+                "alice",
+                toml::to_string_pretty(&initial).unwrap().as_bytes(),
+            )
+            .unwrap();
+        let services = wallet_policy_auth_services(&f);
+        convert_wallet_to_passkey(&f, "alice");
+        f.handler = f.handler.with_auth_services(services);
+        let (old_policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
+        let mut proposed: Policy = toml::from_str(&old_policy).unwrap();
+        proposed.approval.assurance = AssuranceLevel::Hardened;
+        proposed.limits.max_tx_usd = Some("5".into());
+        proposed.denylists.recipients.insert("0x2222".into());
+        let proposed = toml::to_string_pretty(&proposed).unwrap();
+        let old_parsed: Policy = toml::from_str(&old_policy).unwrap();
+        let proposed_parsed: Policy = toml::from_str(&proposed).unwrap();
+        let action = wallet_policy_sealed_action(
+            "alice",
+            "/alice/policy.toml",
+            old_policy.as_bytes(),
+            proposed.as_bytes(),
+            &old_parsed,
+            &proposed_parsed,
+            now_ms_u64(),
+        )
+        .unwrap();
+        assert_eq!(action.daemon_terms.assurance, AssuranceLevel::Standard);
+        let p = VfsPath::parse("/alice/policy.toml").unwrap();
+
+        assert!(matches!(
+            f.handler.write(&p, proposed.as_bytes()).await.unwrap_err(),
+            HandlerError::PermissionDenied
+        ));
     }
 
     /// Local wallet: `kind` reads "local", `unlock-passkey` is not exposed
