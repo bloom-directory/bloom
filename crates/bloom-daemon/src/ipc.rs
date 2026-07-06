@@ -767,10 +767,13 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        // Wallet policy writes (policy.toml) redefine what the daemon allows.
-        // They must go through write_unlocked so the user reviews the change
-        // before the re-sign — never silently re-signed with a cached signer.
-        [root, _wallet, file] if root == "wallets" && file == "policy.toml" => true,
+        // Wallet policy writes (policy.toml) are handled by the VFS wallets
+        // handler as a first-party Sealed Approval action: passkey wallets stage
+        // a challenge and install only under a grant-gated PetalHost signature;
+        // local wallets write immediately (their policy is unsigned). Neither
+        // path silently consumes a cached signer, so the plain write lane must
+        // forward these through to `vfs.write` rather than deny them here — the
+        // old write_unlocked re-sign lane is disabled for passkey wallets.
         _ => false,
     }
 }
@@ -1518,7 +1521,6 @@ mod tests {
             "/wallets/minnow/sign/message",
             "/wallets/minnow/sign/hash",
             "/wallets/minnow/sign/typed_data",
-            "/wallets/minnow/policy.toml",
             "/polymarket/onboard/minnow/begin",
             "/requests/latest/confirm",
             "/requests/req_123/confirm",
@@ -1539,6 +1541,9 @@ mod tests {
         for path in [
             "/defi/intents/minnow/0001/confirm",
             "/polymarket/trade/minnow/new",
+            // policy.toml now reaches the VFS handler, which stages a Sealed
+            // Approval for passkey wallets rather than being denied at the lane.
+            "/wallets/minnow/policy.toml",
             "/wallets/minnow/chains/polygon/outbox/new.tx",
             "/wallets/minnow/chains/polygon/outbox/pending/0001/confirm",
             "/requests/new",

@@ -84,6 +84,51 @@ After execution, inspect `/outbox/sent/<action_id>/` or
 artifacts. Petal-specific wallet paths are projections of the same central
 action id; do not treat them as separate approval queues.
 
+## Editing a passkey wallet policy
+
+For a passkey (WebAuthn-gated) wallet, `policy.toml` is signed authorization
+state (`policy.toml.sig`). Editing it through the mount is a Sealed Approval
+action — the daemon installs both the new `policy.toml` and its matching
+signature only after owner approval. Local (passphrase) wallets keep their
+old behavior: the write applies immediately.
+
+```sh
+# 1. Read the current signed policy and edit it locally.
+cat /bloom/wallets/<wallet>/policy.toml
+
+# 2. Write the proposed policy. For a passkey wallet the first write fails with
+#    permission denied after the daemon stages a Sealed Approval challenge.
+printf '%s' "$edited_policy" > /bloom/wallets/<wallet>/policy.toml
+
+# 3. Discover and read the challenge through the mount (no BLOOM_HOME access).
+ls /bloom/wallets/<wallet>/policy-updates
+cat /bloom/wallets/<wallet>/policy-updates/<action_id>/status.json
+cat /bloom/wallets/<wallet>/policy-updates/<action_id>/approval_challenge.json
+
+# 4. Open or forward ceremony_url, approve, then retry the identical write.
+printf '%s' "$edited_policy" > /bloom/wallets/<wallet>/policy.toml
+```
+
+The retry must send the **same** proposed bytes: the action id (and therefore
+the grant) is bound to `blake3(old_policy)` and `blake3(proposed_policy)`.
+Different retry bytes re-derive a fresh action id and start a new challenge
+rather than reusing the prior approval. On the approved retry Bloom also
+re-checks that the current on-disk policy still matches the sealed baseline,
+signs the approved proposed policy through the host signer, writes
+`policy.toml.sig`, then installs `policy.toml` — so the wallet is never left with
+a new policy that lacks its matching signature.
+
+`status.json` and `approval_challenge.json` are read-only views: they carry
+bounded challenge metadata and `ceremony_url` only, never the signed approval or
+any key/PRF/grant material.
+
+Direct edits to `BLOOM_HOME/keystore/<wallet>/policy.toml` are **unsupported**
+for this flow. If a policy is mutated out of band and its `policy.toml.sig` goes
+stale, the passkey wallet fails closed on every signed path (including the first
+VFS policy write) with the signed-policy error; the mounted flow does not repair
+it. Recovering an externally-broken policy needs the admin helper
+`bloom wallet sign-policy <wallet>`, not this edit surface.
+
 ## Paid HTTP
 
 Paid HTTP requests live under `/requests`. Agents should stage the request,

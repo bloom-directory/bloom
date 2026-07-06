@@ -2390,6 +2390,12 @@ impl TxEngine {
         // The outbox is keyed by the human chain name ("base"), not the CAIP-2
         // `network` header ("eip155:8453"). Using the header here silently missed
         // the per-wallet entry and dropped approval.json.
+        //
+        // This method persists into the EVM outbox and is only meaningful for a
+        // broadcast action. Callers must not invoke it for non-broadcast
+        // first-party actions (wallet-policy updates, policy-session mints),
+        // which have no chain and no outbox entry — a missing chain_name here is
+        // a caller error, not a routine case.
         let chain_name = sealed.chain_name().ok_or_else(|| {
             TxEngineError::BroadcastApprovalRequired(
                 "sealed action is missing chain_name in its policy snapshot".into(),
@@ -4779,6 +4785,54 @@ mod tests {
         let outbox = crate::outbox::Outbox::new(dir.path()).unwrap();
         let engine = TxEngine::new(outbox, 60_000, false);
         (engine, dir)
+    }
+
+    /// `persist_outbox_ceremony_approval` is an outbox-only method: it requires
+    /// a broadcast action's `chain_name`. Non-broadcast first-party actions
+    /// (wallet-policy updates, policy-session mints) must not be routed here by
+    /// the ceremony server — this test pins the contract so the caller-side gate
+    /// (which skips this call for non-broadcast actions) stays load-bearing.
+    #[test]
+    fn persist_ceremony_approval_requires_broadcast_chain_name() {
+        let (engine, _dir) = nonce_conflict_engine();
+        let staged = fake_staged_1559("0001-policy-like");
+        let mut action = sealed_action_from_staged(&staged);
+        action.petal_policy.config.remove("chain_name");
+        assert_eq!(action.chain_name(), None, "precondition: no chain_name");
+
+        let approval = SignedApproval {
+            schema: APPROVAL_SCHEMA_V1.into(),
+            action_id: action.action_id().to_string(),
+            wallet: action.wallet().to_string(),
+            surface: "wallet-policy".into(),
+            petal_id: action.petal_id().to_string(),
+            petal_digest: action.petal_digest().to_string(),
+            intent_hash: "policy-intent".into(),
+            server_nonce: "nonce-1".into(),
+            assurance: AssuranceLevel::Standard,
+            daemon_terms_digest: "1".repeat(64),
+            petal_policy_digest: "2".repeat(64),
+            policy_version: 0,
+            expiry_ms: now_ms() as u64 + 60_000,
+            signer_transport: SignerTransport::BrowserWebauthn,
+            credential_id: "cred-1".into(),
+            review_session_id: None,
+            webauthn_assertion: WebAuthnAssertionRecord {
+                credential_id: "cred-1".into(),
+                authenticator_data_b64: "AA".into(),
+                client_data_json_b64: "e30".into(),
+                signature_b64: "AA".into(),
+                user_handle_b64: None,
+            },
+        };
+
+        let err = engine
+            .persist_outbox_ceremony_approval(&action, &approval)
+            .expect_err("outbox persistence must reject a non-broadcast action");
+        assert!(
+            matches!(err, TxEngineError::BroadcastApprovalRequired(_)),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

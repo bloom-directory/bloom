@@ -752,6 +752,11 @@ impl WalletsHandler {
                 now,
             )
             .await
+            // Project the stable local ceremony URL so the mounted flow can open
+            // the approval page without touching BLOOM_HOME. Same convention as
+            // the paid-http/outbox confirm challenges; the token derives from the
+            // (single-use) server_nonce and is not part of the signed preimage.
+            .map(|challenge| challenge.with_local_ceremony_url())
             .map_err(|e| HandlerError::backend(format!("issue wallet-policy challenge: {e}")))
     }
 
@@ -822,6 +827,100 @@ impl WalletsHandler {
         )?;
         write_atomic_file(&wallet_dir.join("policy.toml"), proposed_policy)?;
         Ok(())
+    }
+
+    /// On-disk root for staged wallet-policy update artifacts (challenges and,
+    /// once approved, the signed approval). These are *views* of a pending
+    /// Sealed Approval — the canonical proposed policy lives in the sealed
+    /// action subject, never in these side files.
+    fn policy_updates_dir(&self, wallet: &str) -> std::path::PathBuf {
+        self.keystore.root().join(wallet).join("policy-updates")
+    }
+
+    /// Sorted list of staged policy-update action ids that have on-disk
+    /// artifacts, for the `policy-updates/` VFS listing.
+    fn policy_update_action_ids(&self, wallet: &str) -> Vec<String> {
+        let mut ids = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(self.policy_updates_dir(wallet)) {
+            for ent in rd.flatten() {
+                if ent.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    && let Some(name) = ent.file_name().to_str()
+                {
+                    ids.push(name.to_string());
+                }
+            }
+        }
+        ids.sort();
+        ids
+    }
+
+    /// Raw approval challenge JSON for a staged policy update, surfaced through
+    /// the mount so an agent can discover the ceremony (including `ceremony_url`)
+    /// without reading `BLOOM_HOME`. Contains only bounded challenge metadata —
+    /// no signatures, grants, or key material.
+    fn read_policy_update_challenge(
+        &self,
+        wallet: &str,
+        action_id: &str,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let path = self
+            .policy_updates_dir(wallet)
+            .join(action_id)
+            .join(APPROVAL_CHALLENGE_FILE);
+        if !path.exists() {
+            return Err(HandlerError::not_found(format!(
+                "policy-updates/{action_id}/{APPROVAL_CHALLENGE_FILE}"
+            )));
+        }
+        Ok(std::fs::read(&path)?)
+    }
+
+    /// Human/agent-facing status view for a staged policy update. Derives its
+    /// `status` from which artifacts exist on disk (a challenge alone means the
+    /// ceremony is still pending; an approval means the one-shot grant can be
+    /// minted by re-writing the same proposed policy). Exposes `ceremony_url`
+    /// and the exact retry path; never exposes the signed approval itself.
+    fn policy_update_status_json(
+        &self,
+        wallet: &str,
+        action_id: &str,
+    ) -> Result<Vec<u8>, HandlerError> {
+        let action_dir = self.policy_updates_dir(wallet).join(action_id);
+        if !action_dir.is_dir() {
+            return Err(HandlerError::not_found(format!(
+                "policy-updates/{action_id}"
+            )));
+        }
+        let challenge_path = action_dir.join(APPROVAL_CHALLENGE_FILE);
+        let challenge: Option<ApprovalChallenge> = if challenge_path.exists() {
+            Some(read_json(&challenge_path)?)
+        } else {
+            None
+        };
+        let approved = action_dir.join(APPROVAL_FILE).exists();
+        let status = if approved { "approved" } else { "challenged" };
+        let next_step = if approved {
+            "re-write the same proposed policy to /wallets/<wallet>/policy.toml to install"
+        } else {
+            "open ceremony_url, approve, then re-write the same proposed policy.toml"
+        };
+        let body = serde_json::json!({
+            "schema": "bloom.wallet_policy_update_view.v1",
+            "wallet": wallet,
+            "action_id": action_id,
+            "surface": WALLET_POLICY_SURFACE,
+            "status": status,
+            "write_path": format!("/wallets/{wallet}/policy.toml"),
+            "installation_target": format!("/wallets/{wallet}/policy.toml"),
+            "challenge_path": format!("/wallets/{wallet}/policy-updates/{action_id}/{APPROVAL_CHALLENGE_FILE}"),
+            "assurance": challenge.as_ref().map(|c| c.assurance),
+            "ceremony_url": challenge.as_ref().and_then(|c| c.ceremony_url.clone()),
+            "expiry_ms": challenge.as_ref().map(|c| c.expiry_ms),
+            "next_step": next_step,
+        });
+        let mut out = serde_json::to_vec_pretty(&body).map_err(err_be)?;
+        out.push(b'\n');
+        Ok(out)
     }
 
     async fn require_sealed_evm_owner_session_approval(
@@ -913,6 +1012,7 @@ impl WalletsHandler {
             Entry::dir("chains"),
             Entry::dir("sign"),
             Entry::dir("policy-session"),
+            Entry::dir("policy-updates"),
             Entry::dir("capabilities"),
         ];
         if kind == bloom_keystore::WalletKind::PasskeyGated {
@@ -1525,6 +1625,16 @@ impl WalletsHandler {
                 4 if segs[3] == "use" => Ok(Entry::writable_file("use")),
                 _ => Err(HandlerError::not_found(path.to_string_path())),
             },
+            "policy-updates" => match segs.len() {
+                2 => Ok(Entry::dir("policy-updates")),
+                3 if self.policy_updates_dir(wallet).join(&segs[2]).is_dir() => {
+                    Ok(Entry::dir(&segs[2]))
+                }
+                4 if matches!(segs[3].as_str(), "approval_challenge.json" | "status.json") => {
+                    Ok(Entry::file(&segs[3]))
+                }
+                _ => Err(HandlerError::not_found(path.to_string_path())),
+            },
             "capabilities" => match segs.len() {
                 2 => Ok(Entry::dir("capabilities")),
                 3 if segs[2] == "active.json" => Ok(Entry::file("active.json")),
@@ -1566,6 +1676,12 @@ impl WalletsHandler {
             "chains" if segs.len() >= 4 => self.read_chain(wallet, &segs[2], &segs[3..]).await,
             "policy-session" if segs.len() == 3 && segs[2] == "active.json" => {
                 self.policy_session_active_json(wallet).await
+            }
+            "policy-updates" if segs.len() == 4 && segs[3] == "approval_challenge.json" => {
+                self.read_policy_update_challenge(wallet, &segs[2])
+            }
+            "policy-updates" if segs.len() == 4 && segs[3] == "status.json" => {
+                self.policy_update_status_json(wallet, &segs[2])
             }
             "capabilities" if segs.len() == 3 && segs[2] == "active.json" => {
                 self.capabilities_active_json(wallet)
@@ -1682,6 +1798,23 @@ impl WalletsHandler {
                 .collect()),
             2 if segs[1] == "sign" => Ok(Self::sign_dir_entries()),
             2 if segs[1] == "policy-session" => Ok(Self::policy_session_dir_entries()),
+            2 if segs[1] == "policy-updates" => Ok(self
+                .policy_update_action_ids(wallet)
+                .iter()
+                .map(|id| Entry::dir(id))
+                .collect()),
+            3 if segs[1] == "policy-updates" => {
+                let dir = self.policy_updates_dir(wallet).join(&segs[2]);
+                if !dir.is_dir() {
+                    return Err(HandlerError::not_found(path.to_string_path()));
+                }
+                let mut out = Vec::new();
+                if dir.join(APPROVAL_CHALLENGE_FILE).exists() {
+                    out.push(Entry::file("approval_challenge.json"));
+                }
+                out.push(Entry::file("status.json"));
+                Ok(out)
+            }
             n if n >= 3 && segs[1] == "chains" => {
                 self.list_chain(wallet, &segs[2], &segs[3..]).await
             }
@@ -4330,6 +4463,220 @@ mod tests {
             .unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(!names.contains(&"unlock-passkey"), "names={names:?}");
+    }
+
+    /// The staged challenge is discoverable and readable through the mount:
+    /// `policy-updates/` lists the action, its `approval_challenge.json` carries
+    /// a `ceremony_url`, `status.json` renders the retry guidance, and none of it
+    /// leaks the signed approval or any secret material.
+    #[tokio::test]
+    async fn wallet_policy_challenge_is_visible_and_secret_free_via_vfs() {
+        let mut f = make_handler();
+        let services = wallet_policy_auth_services(&f);
+        convert_wallet_to_passkey(&f, "alice");
+        f.handler = f.handler.with_auth_services(services);
+        let (old_policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
+        let mut proposed: Policy = toml::from_str(&old_policy).unwrap();
+        proposed.approval.agent_autonomy = Some(bloom_proto::AgentAutonomyMode::UnderPolicy);
+        proposed.limits.max_tx_usd = Some("10".into());
+        proposed.limits.max_day_usd = Some("100".into());
+        let proposed = toml::to_string_pretty(&proposed).unwrap();
+        let action_id =
+            wallet_policy_action_id("alice", old_policy.as_bytes(), proposed.as_bytes());
+        let p = VfsPath::parse("/alice/policy.toml").unwrap();
+        assert!(matches!(
+            f.handler.write(&p, proposed.as_bytes()).await.unwrap_err(),
+            HandlerError::PermissionDenied
+        ));
+
+        // policy-updates/ lists the staged action.
+        let listed = f
+            .handler
+            .list(&VfsPath::parse("/alice/policy-updates").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            listed.iter().any(|e| e.name == action_id),
+            "policy-updates listing missing action id: {listed:?}"
+        );
+
+        // The action dir advertises its readable artifacts.
+        let artifacts = f
+            .handler
+            .list(&VfsPath::parse(&format!("/alice/policy-updates/{action_id}")).unwrap())
+            .await
+            .unwrap();
+        let names: Vec<&str> = artifacts.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"approval_challenge.json"), "{names:?}");
+        assert!(names.contains(&"status.json"), "{names:?}");
+
+        // The raw challenge parses and carries a ceremony_url.
+        let challenge_bytes = f
+            .handler
+            .read(
+                &VfsPath::parse(&format!(
+                    "/alice/policy-updates/{action_id}/approval_challenge.json"
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let challenge: ApprovalChallenge = serde_json::from_slice(&challenge_bytes).unwrap();
+        assert_eq!(challenge.surface, WALLET_POLICY_SURFACE);
+        assert!(
+            challenge.ceremony_url.is_some(),
+            "challenge should project a ceremony_url"
+        );
+
+        // status.json renders the retry guidance and the same ceremony_url.
+        let status_bytes = f
+            .handler
+            .read(
+                &VfsPath::parse(&format!("/alice/policy-updates/{action_id}/status.json")).unwrap(),
+            )
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&status_bytes).unwrap();
+        assert_eq!(status["status"], "challenged");
+        assert_eq!(status["write_path"], "/wallets/alice/policy.toml");
+        assert!(status["ceremony_url"].is_string());
+
+        // Approve, then confirm the signed approval is NOT reachable through the
+        // mount — only bounded challenge/status views are.
+        write_json(
+            f.handler
+                .keystore
+                .root()
+                .join("alice")
+                .join("policy-updates")
+                .join(&action_id)
+                .join(APPROVAL_FILE),
+            &signed_wallet_policy_approval(&challenge),
+        )
+        .unwrap();
+        let approval_read = f
+            .handler
+            .read(
+                &VfsPath::parse(&format!(
+                    "/alice/policy-updates/{action_id}/{APPROVAL_FILE}"
+                ))
+                .unwrap(),
+            )
+            .await;
+        assert!(
+            approval_read.is_err(),
+            "signed approval.json must not be readable via VFS"
+        );
+        // The challenge bytes carry no key/PRF/grant material.
+        let challenge_str = String::from_utf8_lossy(&challenge_bytes);
+        for needle in ["private_key", "prf", "webauthn_assertion", "signature_b64"] {
+            assert!(
+                !challenge_str.contains(needle),
+                "challenge leaked `{needle}`: {challenge_str}"
+            );
+        }
+    }
+
+    /// A validly-signed on-disk policy that changes after the update is staged
+    /// invalidates the prior approval: the approved retry re-derives a fresh
+    /// action id (bound to the new baseline), finds no matching grant/approval,
+    /// and fails closed asking for a restage — the proposed policy is not
+    /// installed.
+    #[tokio::test]
+    async fn wallet_policy_on_disk_change_after_staging_requires_restage() {
+        let mut f = make_handler();
+        let services = wallet_policy_auth_services(&f);
+        convert_wallet_to_passkey(&f, "alice");
+        f.handler = f.handler.with_auth_services(services);
+        let (old_policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
+        let mut proposed: Policy = toml::from_str(&old_policy).unwrap();
+        proposed.denylists.recipients.insert("0x1234".into());
+        let proposed = toml::to_string_pretty(&proposed).unwrap();
+        let action_id =
+            wallet_policy_action_id("alice", old_policy.as_bytes(), proposed.as_bytes());
+        let p = VfsPath::parse("/alice/policy.toml").unwrap();
+
+        assert!(matches!(
+            f.handler.write(&p, proposed.as_bytes()).await.unwrap_err(),
+            HandlerError::PermissionDenied
+        ));
+        let dir = f
+            .handler
+            .keystore
+            .root()
+            .join("alice")
+            .join("policy-updates")
+            .join(&action_id);
+        let challenge: ApprovalChallenge = read_json(dir.join(APPROVAL_CHALLENGE_FILE)).unwrap();
+        write_json(
+            dir.join(APPROVAL_FILE),
+            &signed_wallet_policy_approval(&challenge),
+        )
+        .unwrap();
+
+        // Out-of-band but still validly-signed change to the current policy.
+        let mut baseline_shift: Policy = toml::from_str(&old_policy).unwrap();
+        baseline_shift.denylists.recipients.insert("0x9999".into());
+        let baseline_shift = toml::to_string_pretty(&baseline_shift).unwrap();
+        f.handler
+            .keystore
+            .write_policy("alice", baseline_shift.as_bytes())
+            .unwrap();
+
+        // Approved retry now re-baselines and must restage rather than install.
+        assert!(matches!(
+            f.handler.write(&p, proposed.as_bytes()).await.unwrap_err(),
+            HandlerError::PermissionDenied
+        ));
+        let on_disk =
+            std::fs::read_to_string(f.handler.keystore.root().join("alice/policy.toml")).unwrap();
+        assert_eq!(
+            on_disk, baseline_shift,
+            "proposed policy must not be installed"
+        );
+    }
+
+    /// A passkey wallet whose `policy.toml.sig` is already stale (out-of-band
+    /// edit outside the VFS/sandbox) fails closed on the first VFS write: the
+    /// signed-policy check in `info` rejects it and no repair/challenge is
+    /// attempted.
+    #[tokio::test]
+    async fn wallet_policy_stale_signature_fails_closed_without_repair() {
+        let mut f = make_handler();
+        let services = wallet_policy_auth_services(&f);
+        convert_wallet_to_passkey(&f, "alice");
+        f.handler = f.handler.with_auth_services(services);
+        let (old_policy, _) = f.handler.keystore.raw_policy("alice").unwrap();
+
+        // Break the signed-policy invariant out of band (as a hand edit to
+        // BLOOM_HOME would): mutate policy.toml but leave the old signature.
+        let mut tampered: Policy = toml::from_str(&old_policy).unwrap();
+        tampered.denylists.recipients.insert("0xdead".into());
+        let tampered = toml::to_string_pretty(&tampered).unwrap();
+        std::fs::write(
+            f.handler.keystore.root().join("alice/policy.toml"),
+            tampered.as_bytes(),
+        )
+        .unwrap();
+
+        let mut proposed: Policy = toml::from_str(&old_policy).unwrap();
+        proposed.limits.max_tx_usd = Some("5".into());
+        let proposed = toml::to_string_pretty(&proposed).unwrap();
+        let p = VfsPath::parse("/alice/policy.toml").unwrap();
+        let err = f.handler.write(&p, proposed.as_bytes()).await.unwrap_err();
+        assert!(
+            !matches!(err, HandlerError::PermissionDenied),
+            "stale policy must fail closed with the signed-policy error, not a challenge: {err}"
+        );
+        assert!(
+            !f.handler
+                .keystore
+                .root()
+                .join("alice")
+                .join("policy-updates")
+                .exists(),
+            "stale-signature write must not stage or repair a policy update"
+        );
     }
 
     #[tokio::test]

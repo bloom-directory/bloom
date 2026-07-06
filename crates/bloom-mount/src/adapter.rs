@@ -189,12 +189,11 @@ fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        [root, _wallet, leaf] if root == "wallets" && leaf == "policy.toml" => true,
-        [root, _wallet, chains, _chain, leaf]
-            if root == "wallets" && chains == "chains" && leaf == "policy.toml" =>
-        {
-            true
-        }
+        // policy.toml writes flow through to the VFS wallets handler, which
+        // stages a first-party Sealed Approval for passkey wallets (challenge +
+        // grant-gated install) and writes local policy immediately. They no
+        // longer route through the disabled write_unlocked re-sign lane, so the
+        // mount must forward them to `vfs.write` rather than deny on flush.
         _ => false,
     }
 }
