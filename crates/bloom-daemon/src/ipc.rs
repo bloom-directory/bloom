@@ -737,15 +737,10 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        // Hyperliquid owner-signer writes either approve a standing API wallet
-        // or sign actions directly with the owner wallet. They require the
-        // write_unlocked ceremony; already-approved agent-session actions stay
-        // available to plain IPC because they use the bounded API wallet.
-        [root, _network, branch, _wallet, leaf]
-            if root == "hyperliquid" && branch == "agent_sessions" && leaf == "new.json" =>
-        {
-            true
-        }
+        // Hyperliquid agent-session creation stages its own Sealed Approval
+        // challenge inside the Hyperliquid handler. Let plain IPC reach that
+        // handler; blocking here would force the disabled passkey
+        // write_unlocked lane and prevent the grant-backed approveAgent flow.
         [root, _network, branch, _wallet, _session, leaf]
             if root == "hyperliquid"
                 && branch == "agent_sessions"
