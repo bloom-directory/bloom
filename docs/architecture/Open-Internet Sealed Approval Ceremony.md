@@ -1,6 +1,6 @@
 # Open-Internet Sealed Approval Ceremony
 
-**Status:** architecture proposal — **not implemented**
+**Status:** architecture proposal — relay not implemented
 **Audience:** Bloom engineers, Petal authors, and implementation agents
 
 This document describes how the Sealed Approval ceremony URL becomes reachable
@@ -8,13 +8,17 @@ over the open internet, so an agent can send it to the user over Slack, chat,
 or any other transport and the user can complete the ceremony from another
 device.
 
-Nothing in this document is implemented today. The current ceremony server is
-an ephemeral localhost HTTP server launched in-process by the foreground CLI.
-This document is the target design. The `ceremony_url` contract itself — the
-field in `approval_challenge.json`, single-use token, `expiry_ms` bound — is
-defined in [`Sealed Approvals.md`](./Sealed%20Approvals.md) and
-[`Interaction Modes.md`](./Interaction%20Modes.md) and applies in both
-exposure modes.
+The open-internet relay described here is not implemented today. The current
+mounted-VFS implementation supports daemon-owned loopback ceremony URLs on
+`http://localhost:18734`: `approval_challenge.json` carries a local
+`ceremony_url`, the token is derived from `server_nonce`, and the daemon owns
+grant minting for the mounted EVM slice. This document is the target design for
+making that same ceremony reachable from another device over the open internet.
+The `ceremony_url` contract itself — the field in `approval_challenge.json`,
+single-use token, `expiry_ms` bound — is defined in
+[`Sealed Approvals.md`](./Sealed%20Approvals.md) and
+[`Interaction Modes.md`](./Interaction%20Modes.md) and applies in both exposure
+modes.
 
 ## Decision Summary
 
@@ -123,15 +127,16 @@ Auto-execution is never a silent daemon default.
 
 ## Changes From the Current Implementation
 
-For orientation, the target design differs from today's code in these ways:
+For orientation, the target relay design differs from today's code in these
+ways:
 
-- Today the ceremony server is an ephemeral axum server on
-  `http://localhost:18734` with RP ID `localhost`, launched only when the
-  foreground CLI runs the ceremony in its own in-process daemon. In the target
-  design, the `bloom serve` daemon owns the ceremony endpoint, mints the URL
-  at challenge issuance, and holds the resulting grant in its own memory.
-- Today `approval_challenge.json` carries no URL. In the target design it
-  carries `ceremony_url`, written before the triggering confirm write returns.
-- Today there is no relay, per-install hostname, or daemon-held certificate.
+- Today `bloom serve` binds the daemon-owned mounted ceremony server on
+  `http://localhost:18734` with RP ID `localhost`; it does not expose that
+  endpoint over the open internet.
+- Today `approval_challenge.json` carries a local loopback `ceremony_url` for
+  the mounted EVM slice. In the target relay design, the same projection points
+  at a per-install HTTPS hostname.
+- Today there is no relay, per-install hostname, internet exposure setting, or
+  daemon-held public certificate for a relay hostname.
 
-None of this is normative until implemented.
+The relay-specific parts of this document are not normative until implemented.

@@ -40,8 +40,8 @@ bloom gatekeeps every value-moving action through capabilities:
 To see what a wallet can do without a human, check its per-chain state and
 outbox, or its Hyperliquid sessions under `/hyperliquid/<net>/agent_sessions/`.
 A read-only `/wallets/<wallet>/capabilities/` roll-up and a VFS-root `/next.md`
-aggregator are in active development (see
-`docs/plans/2026-06-20-agent-obvious-capability-model.md`).
+aggregator expose the current capability and next-action view when the daemon
+has the relevant handlers mounted.
 
 Read `/hyperliquid/README.md` for Hyperliquid trading (session-first).
 Read `/polymarket/README.md` for prediction-market trading.
@@ -160,7 +160,8 @@ Prediction-market trading lives under `/polymarket` and is driven by the
 trades only after `[polymarket] enabled = true` is set in its `policy.toml`, and
 today every value-moving action opens a fresh passkey review ceremony. A
 Polymarket capability primitive (scoped approve, TTL, caps) is in active
-development — see `docs/plans/2026-06-20-agent-obvious-capability-model.md`.
+development; until it lands, treat Polymarket value-moving actions as
+human-gated.
 
 Start at `/docs/examples.md` (the Polymarket section) and read
 `docs/polymarket-integration.md` in the repo for the full spec. Funds move only
