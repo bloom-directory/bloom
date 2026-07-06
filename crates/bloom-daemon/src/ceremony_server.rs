@@ -318,6 +318,12 @@ async fn complete(
         }
         Err(status) => return err_json(status, "could not resolve approval URL"),
     };
+    if execute && action.surface() == "hyperliquid" {
+        return err_json(
+            StatusCode::BAD_REQUEST,
+            "Hyperliquid approvals support grant mode only; approve the grant, then retry the Bloom VFS write to sign and submit",
+        );
+    }
     let wallet = challenge.wallet.clone();
 
     // Hardened challenges require a daemon-side review session, minted the same
@@ -430,16 +436,21 @@ async fn complete(
     );
     daemon.signer_cache.prune_expired(now);
 
-    // Persist approval.json as an audit artifact beside the challenge.
-    if let Err(e) = daemon
-        .tx_engine
-        .persist_outbox_ceremony_approval(&action, &signed)
-    {
-        revoke_grant_and_drop_cache(daemon, grant_store.as_ref(), &grant.grant_id, now).await;
-        return err_json(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("persist approval artifact: {e}"),
-        );
+    // Persist approval.json as an audit artifact beside EVM outbox challenges.
+    // Hyperliquid mounted-VFS approvals are grant-backed: the retry path checks
+    // the live grant store and signs through PetalHost, so there is no EVM
+    // outbox artifact to write here.
+    if action.surface() != "hyperliquid" {
+        if let Err(e) = daemon
+            .tx_engine
+            .persist_outbox_ceremony_approval(&action, &signed)
+        {
+            revoke_grant_and_drop_cache(daemon, grant_store.as_ref(), &grant.grant_id, now).await;
+            return err_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persist approval artifact: {e}"),
+            );
+        }
     }
 
     // grant + execute: broadcast immediately from sealed bytes.

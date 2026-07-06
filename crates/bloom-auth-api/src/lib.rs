@@ -37,6 +37,10 @@ pub const EVM_SEALED_INTENT_SUBJECT_KIND: &str = "evm_wallet_tx";
 pub const EVM_SIGNING_ATTESTATION_FACTS_SCHEMA_V1: &str = "bloom.evm.signing_facts.v1";
 /// EVM wallet signing intent.
 pub const EVM_TX_SIGN_INTENT: &str = "evm.tx.sign";
+/// Hyperliquid owner approval intent for authorizing an API-wallet agent.
+pub const HYPERLIQUID_APPROVE_AGENT_SIGN_INTENT: &str = "hyperliquid.approve_agent";
+/// Hyperliquid owner transfer intent for `usdSend`.
+pub const HYPERLIQUID_USD_SEND_SIGN_INTENT: &str = "hyperliquid.usd_send";
 /// Schema tag for [`CanonicalEnvelope`].
 ///
 /// v2: the canonical header gained Petal identity (`petal_id`, `petal_digest`,
@@ -2160,8 +2164,8 @@ impl DefaultAttestationRegistry {
                 | (PETAL_ID_POLYMARKET, "polymarket.redemption")
                 | (PETAL_ID_POLYMARKET, "polymarket.withdrawal")
                 | (PETAL_ID_POLYMARKET, "polymarket.builder_key")
-                | (PETAL_ID_HYPERLIQUID, "hyperliquid.approve_agent")
-                | (PETAL_ID_HYPERLIQUID, "hyperliquid.usd_send")
+                | (PETAL_ID_HYPERLIQUID, HYPERLIQUID_APPROVE_AGENT_SIGN_INTENT)
+                | (PETAL_ID_HYPERLIQUID, HYPERLIQUID_USD_SEND_SIGN_INTENT)
                 | (PETAL_ID_HYPERLIQUID, "hyperliquid.order")
                 | (PETAL_ID_HYPERLIQUID, "hyperliquid.cancel")
                 | (PETAL_ID_WALLET_POLICY, "wallet_policy.sign")

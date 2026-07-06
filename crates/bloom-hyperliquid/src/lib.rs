@@ -275,23 +275,12 @@ impl HyperliquidSigner {
         amount: &str,
         nonce: u64,
     ) -> Result<(Value, SignatureJson)> {
-        let typed = usd_send_typed_data(network, destination, amount, nonce)?;
-        let hash = typed
-            .eip712_signing_hash()
-            .map_err(|e| HyperliquidError::signing(format!("eip712: {e}")))?;
+        let (action, hash) = usd_send_action_and_hash(network, destination, amount, nonce)?;
         let sig = self
             .signer
             .sign_hash(&hash)
             .await
             .map_err(|e| HyperliquidError::signing(e.to_string()))?;
-        let action = json!({
-            "type": "usdSend",
-            "hyperliquidChain": network.chain_name(),
-            "signatureChainId": format!("0x{:x}", network.signature_chain_id()),
-            "destination": format!("{destination:#x}"),
-            "amount": amount,
-            "time": nonce,
-        });
         Ok((action, SignatureJson::from_signature(&sig)))
     }
 
@@ -307,26 +296,63 @@ impl HyperliquidSigner {
         agent_name: Option<&str>,
         nonce: u64,
     ) -> Result<(Value, SignatureJson)> {
-        let agent_name = agent_name.unwrap_or("");
-        let typed = approve_agent_typed_data(network, agent_address, agent_name, nonce)?;
-        let hash = typed
-            .eip712_signing_hash()
-            .map_err(|e| HyperliquidError::signing(format!("eip712: {e}")))?;
+        let (action, hash) =
+            approve_agent_action_and_hash(network, agent_address, agent_name, nonce)?;
         let sig = self
             .signer
             .sign_hash(&hash)
             .await
             .map_err(|e| HyperliquidError::signing(e.to_string()))?;
-        let action = json!({
-            "type": "approveAgent",
-            "hyperliquidChain": network.chain_name(),
-            "signatureChainId": format!("0x{:x}", network.signature_chain_id()),
-            "agentAddress": format!("{agent_address:#x}"),
-            "agentName": agent_name,
-            "nonce": nonce,
-        });
         Ok((action, SignatureJson::from_signature(&sig)))
     }
+}
+
+pub fn usd_send_action_and_hash(
+    network: HyperliquidNetwork,
+    destination: Address,
+    amount: &str,
+    nonce: u64,
+) -> Result<(Value, B256)> {
+    let typed = usd_send_typed_data(network, destination, amount, nonce)?;
+    let hash = typed
+        .eip712_signing_hash()
+        .map_err(|e| HyperliquidError::signing(format!("eip712: {e}")))?;
+    let action = json!({
+        "type": "usdSend",
+        "hyperliquidChain": network.chain_name(),
+        "signatureChainId": format!("0x{:x}", network.signature_chain_id()),
+        "destination": format!("{destination:#x}"),
+        "amount": amount,
+        "time": nonce,
+    });
+    Ok((action, hash))
+}
+
+pub fn approve_agent_action_and_hash(
+    network: HyperliquidNetwork,
+    agent_address: Address,
+    agent_name: Option<&str>,
+    nonce: u64,
+) -> Result<(Value, B256)> {
+    let agent_name = agent_name.unwrap_or("");
+    let typed = approve_agent_typed_data(network, agent_address, agent_name, nonce)?;
+    let hash = typed
+        .eip712_signing_hash()
+        .map_err(|e| HyperliquidError::signing(format!("eip712: {e}")))?;
+    let action = json!({
+        "type": "approveAgent",
+        "hyperliquidChain": network.chain_name(),
+        "signatureChainId": format!("0x{:x}", network.signature_chain_id()),
+        "agentAddress": format!("{agent_address:#x}"),
+        "agentName": agent_name,
+        "nonce": nonce,
+    });
+    Ok((action, hash))
+}
+
+pub fn signature_json_from_raw(raw: &[u8]) -> Result<SignatureJson> {
+    let sig = Signature::from_raw(raw).map_err(|e| HyperliquidError::signing(e.to_string()))?;
+    Ok(SignatureJson::from_signature(&sig))
 }
 
 /// EIP-712 typed data for a user-signed `approveAgent` action.
