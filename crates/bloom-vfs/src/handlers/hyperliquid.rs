@@ -10,10 +10,10 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use bloom_auth_api::{
-    ApprovalChallenge, AssuranceLevel, CanonicalEnvelope, CanonicalIntentHeader, DaemonGrantTerms,
-    ExecutorKind, HYPERLIQUID_APPROVE_AGENT_SIGN_INTENT, HYPERLIQUID_USD_SEND_SIGN_INTENT,
-    PetalPolicySnapshot, SIGNING_ATTESTATION_SCHEMA_V1, SealedAction, SignHashRequest,
-    SigningAttestation, petal_identity,
+    ApprovalChallenge, AssuranceLevel, AuthApiError, CanonicalEnvelope, CanonicalIntentHeader,
+    CeremonyTokenResolution, DaemonGrantTerms, ExecutorKind, HYPERLIQUID_APPROVE_AGENT_SIGN_INTENT,
+    HYPERLIQUID_USD_SEND_SIGN_INTENT, PetalPolicySnapshot, SIGNING_ATTESTATION_SCHEMA_V1,
+    SealedAction, SignHashRequest, SigningAttestation, petal_identity,
 };
 use bloom_hyperliquid::{
     CancelWire, ExchangeAction, Grouping, HyperliquidClient, HyperliquidNetwork, HyperliquidSigner,
@@ -92,6 +92,24 @@ struct PendingUsdSend {
     destination: String,
     amount: String,
     nonce: u64,
+}
+
+enum UsdSendPrepareError {
+    PermissionDenied,
+    RotatePending,
+    Handler(HandlerError),
+}
+
+impl From<HandlerError> for UsdSendPrepareError {
+    fn from(value: HandlerError) -> Self {
+        Self::Handler(value)
+    }
+}
+
+enum HyperliquidChallengeReuse {
+    Missing,
+    Live,
+    Stale,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1670,7 +1688,13 @@ impl HyperliquidHandler {
             )
             .await?;
         let payload = user_signed_payload(action, nonce, signature);
-        let response = client.exchange(payload).await.map_err(err_be)?;
+        let response = match client.exchange(payload).await {
+            Ok(response) => response,
+            Err(e) => {
+                let _ = self.clear_usd_send_pending(network_name, wallet);
+                return Err(err_be(e));
+            }
+        };
         self.persist_response(network_name, wallet, "send_asset.json", &response)?;
         let _ = self.clear_usd_send_pending(network_name, wallet);
         Ok(())
@@ -1689,13 +1713,44 @@ impl HyperliquidHandler {
                     .into(),
             ));
         }
-        let pending = self.load_or_create_usd_send_pending(network, wallet, req)?;
-        if pending.destination != req.destination || pending.amount != req.amount {
-            return Err(HandlerError::invalid(
-                "a different Hyperliquid usdSend is already pending approval; approve/cancel it before staging another",
-            ));
+        let mut rotated_pending = false;
+        loop {
+            let pending = self.load_or_create_usd_send_pending(network, wallet, req)?;
+            if pending.destination != req.destination || pending.amount != req.amount {
+                return Err(HandlerError::invalid(
+                    "a different Hyperliquid usdSend is already pending approval; approve/cancel it before staging another",
+                ));
+            }
+            match self
+                .prepare_usd_send_pending_sealed(network, wallet, &pending, checks)
+                .await
+            {
+                Ok(nonce) => return Ok(nonce),
+                Err(UsdSendPrepareError::PermissionDenied) => {
+                    return Err(HandlerError::PermissionDenied);
+                }
+                Err(UsdSendPrepareError::RotatePending) if !rotated_pending => {
+                    self.replace_usd_send_pending(network, wallet, req, pending.nonce)?;
+                    rotated_pending = true;
+                }
+                Err(UsdSendPrepareError::RotatePending) => {
+                    return Err(HandlerError::backend(
+                        "Hyperliquid usdSend approval could not be restaged with a fresh action id",
+                    ));
+                }
+                Err(UsdSendPrepareError::Handler(err)) => return Err(err),
+            }
         }
-        let envelope = hyperliquid_usd_send_envelope(network, wallet, &pending, checks)?;
+    }
+
+    async fn prepare_usd_send_pending_sealed(
+        &self,
+        network: &str,
+        wallet: &str,
+        pending: &PendingUsdSend,
+        checks: &[bloom_proto::PolicyCheck],
+    ) -> Result<u64, UsdSendPrepareError> {
+        let envelope = hyperliquid_usd_send_envelope(network, wallet, pending, checks)?;
         let action = hyperliquid_sealed_action(
             envelope,
             AssuranceLevel::Standard,
@@ -1718,15 +1773,28 @@ impl HyperliquidHandler {
         }
         let dir = self.usd_send_auth_dir(network, wallet)?;
         let challenge_path = dir.join(APPROVAL_CHALLENGE_FILE);
-        if reusable_hyperliquid_challenge(&challenge_path, wallet, &staged.action_id, now_ms_u64())?
+        match self
+            .hyperliquid_challenge_reuse_state(
+                &challenge_path,
+                wallet,
+                &staged.action_id,
+                now_ms_u64(),
+            )
+            .await?
         {
-            return Err(HandlerError::PermissionDenied);
+            HyperliquidChallengeReuse::Live => {
+                return Err(UsdSendPrepareError::PermissionDenied);
+            }
+            HyperliquidChallengeReuse::Stale => {
+                return Err(UsdSendPrepareError::RotatePending);
+            }
+            HyperliquidChallengeReuse::Missing => {}
         }
         let mut nonce_bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
         let server_nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
         let now = now_ms_u64();
-        let challenge = self
+        let challenge = match self
             .auth_services
             .require_writer()?
             .issue_challenge(
@@ -1737,11 +1805,20 @@ impl HyperliquidHandler {
                 now,
             )
             .await
-            .map_err(|e| {
-                HandlerError::backend(format!("issue Hyperliquid usdSend challenge: {e}"))
-            })?;
+        {
+            Ok(challenge) => challenge,
+            Err(e) if auth_entry_not_challengeable(&e) => {
+                return Err(UsdSendPrepareError::RotatePending);
+            }
+            Err(e) => {
+                return Err(HandlerError::backend(format!(
+                    "issue Hyperliquid usdSend challenge: {e}"
+                ))
+                .into());
+            }
+        };
         write_json(challenge_path, &challenge.with_local_ceremony_url())?;
-        Err(HandlerError::PermissionDenied)
+        Err(UsdSendPrepareError::PermissionDenied)
     }
 
     async fn prepare_agent_session_sealed(
@@ -1831,6 +1908,51 @@ impl HyperliquidHandler {
             .await
             .map_err(|e| HandlerError::backend(format!("lookup Hyperliquid grant: {e}")))?;
         Ok(grant.is_some())
+    }
+
+    async fn hyperliquid_challenge_reuse_state(
+        &self,
+        path: &Path,
+        wallet: &str,
+        action_id: &str,
+        now_ms: u64,
+    ) -> Result<HyperliquidChallengeReuse, HandlerError> {
+        let challenge: ApprovalChallenge = match read_json(path) {
+            Ok(challenge) => challenge,
+            Err(HandlerError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(HyperliquidChallengeReuse::Missing);
+            }
+            Err(HandlerError::Invalid(_)) => return Ok(HyperliquidChallengeReuse::Stale),
+            Err(err) => return Err(err),
+        };
+        if challenge.surface != "hyperliquid"
+            || challenge.wallet != wallet
+            || challenge.action_id != action_id
+            || challenge.expiry_ms <= now_ms
+            || challenge.ceremony_url.is_none()
+        {
+            return Ok(HyperliquidChallengeReuse::Stale);
+        }
+        let Some(store) = self.auth_services.store() else {
+            return Ok(HyperliquidChallengeReuse::Live);
+        };
+        match store
+            .resolve_ceremony_token(&challenge.ceremony_token(), now_ms)
+            .await
+            .map_err(|e| HandlerError::backend(format!("resolve Hyperliquid challenge: {e}")))?
+        {
+            CeremonyTokenResolution::Live {
+                challenge: issued, ..
+            } if issued.wallet == wallet
+                && issued.surface == "hyperliquid"
+                && issued.action_id == action_id =>
+            {
+                Ok(HyperliquidChallengeReuse::Live)
+            }
+            CeremonyTokenResolution::Live { .. }
+            | CeremonyTokenResolution::Gone
+            | CeremonyTokenResolution::Unknown => Ok(HyperliquidChallengeReuse::Stale),
+        }
     }
 
     async fn host_sign_hyperliquid_hash(
@@ -2121,6 +2243,32 @@ impl HyperliquidHandler {
             }
         }
         Ok(())
+    }
+
+    fn replace_usd_send_pending(
+        &self,
+        network: &str,
+        wallet: &str,
+        req: &UsdSendRequest,
+        previous_nonce: u64,
+    ) -> Result<PendingUsdSend, HandlerError> {
+        let dir = self.usd_send_auth_dir(network, wallet)?;
+        std::fs::create_dir_all(&dir)?;
+        for file in [APPROVAL_FILE, APPROVAL_CHALLENGE_FILE] {
+            match std::fs::remove_file(dir.join(file)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(HandlerError::Io(e)),
+            }
+        }
+        let requested_nonce = req.nonce.unwrap_or_else(bloom_hyperliquid::now_ms);
+        let pending = PendingUsdSend {
+            destination: req.destination.clone(),
+            amount: req.amount.clone(),
+            nonce: requested_nonce.max(previous_nonce.saturating_add(1)),
+        };
+        write_json(dir.join(USD_SEND_PENDING_FILE), &pending)?;
+        Ok(pending)
     }
 
     fn persist_session_response(
@@ -3909,6 +4057,10 @@ fn reusable_hyperliquid_challenge(
         && challenge.ceremony_url.is_some())
 }
 
+fn auth_entry_not_challengeable(err: &AuthApiError) -> bool {
+    matches!(err, AuthApiError::Denied(msg) if msg == "entry is not challengeable")
+}
+
 fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> Result<(), HandlerError> {
     std::fs::write(path, serde_json::to_vec_pretty(value).map_err(err_json)?)?;
     Ok(())
@@ -4285,6 +4437,8 @@ fn err_invalid(e: bloom_hyperliquid::HyperliquidError) -> HandlerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bloom_auth::{AuthStore, RejectingApprovalSignatureVerifier, StoreApprovalVerifier};
+    use bloom_auth_api::{ApprovalVerifier, AuthStoreView, AuthStoreWriter};
     use bloom_hyperliquid::{MAINNET_API_URL, TESTNET_API_URL};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -4471,11 +4625,43 @@ mod tests {
         ))
     }
 
+    fn auth_store_services() -> crate::AuthServices {
+        let store = AuthStore::open_in_memory_for_tests().unwrap();
+        let verifier = Arc::new(StoreApprovalVerifier::new(
+            store,
+            RejectingApprovalSignatureVerifier,
+        ));
+        let approval_verifier: Arc<dyn ApprovalVerifier> = verifier.clone();
+        let store_view: Arc<dyn AuthStoreView> = verifier.clone();
+        let writer: Arc<dyn AuthStoreWriter> = verifier;
+        crate::AuthServices::new(Some(approval_verifier), Some(store_view), Some(writer))
+            .with_grant_store(Arc::new(
+                bloom_auth::grant_store::InMemoryGrantStore::default(),
+            ))
+    }
+
     fn handler_with_hyperliquid_policy(
         wallet: &str,
         hyperliquid: HyperliquidPolicy,
     ) -> HyperliquidHandler {
         let h = handler().with_auth_services(wired_auth_services());
+        h.keystore.create_local(wallet, "pw").unwrap();
+        h.keystore.unlock(wallet, "pw").unwrap();
+        let policy = bloom_proto::Policy {
+            hyperliquid,
+            ..Default::default()
+        };
+        h.keystore
+            .write_policy(wallet, toml::to_string_pretty(&policy).unwrap().as_bytes())
+            .unwrap();
+        h
+    }
+
+    fn handler_with_auth_store_and_hyperliquid_policy(
+        wallet: &str,
+        hyperliquid: HyperliquidPolicy,
+    ) -> HyperliquidHandler {
+        let h = handler().with_auth_services(auth_store_services());
         h.keystore.create_local(wallet, "pw").unwrap();
         h.keystore.unlock(wallet, "pw").unwrap();
         let policy = bloom_proto::Policy {
@@ -4621,6 +4807,57 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, HandlerError::Unsupported(_)), "{err}");
         assert!(err.to_string().contains("Sealed Approval"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn usd_send_stale_challenge_rotates_pending_action_id() {
+        let h = handler_with_auth_store_and_hyperliquid_policy(
+            "trader",
+            HyperliquidPolicy {
+                transfer_cap_usd: Some(100_000_000),
+                allowed_usd_send_destinations: std::collections::BTreeSet::from([
+                    "0x0000000000000000000000000000000000000001".to_string(),
+                ]),
+                ..Default::default()
+            },
+        )
+        .with_store_root(unique_test_dir("bloom-hl-auth-usd-send-rotate-store"));
+        let req = UsdSendRequest {
+            destination: "0x0000000000000000000000000000000000000001".into(),
+            amount: "1".into(),
+            nonce: None,
+        };
+
+        let err = h
+            .prepare_usd_send_sealed("testnet", "trader", &req, &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandlerError::PermissionDenied), "{err}");
+        let dir = h.usd_send_auth_dir("testnet", "trader").unwrap();
+        let first_pending: PendingUsdSend = read_json(dir.join(USD_SEND_PENDING_FILE)).unwrap();
+        let first_action = hyperliquid_usd_send_action_id("testnet", "trader", &first_pending);
+        let mut first_challenge: ApprovalChallenge =
+            read_json(dir.join(APPROVAL_CHALLENGE_FILE)).unwrap();
+        assert_eq!(first_challenge.action_id, first_action);
+        assert!(first_challenge.ceremony_url.is_some());
+
+        first_challenge.expiry_ms = 0;
+        write_json(dir.join(APPROVAL_CHALLENGE_FILE), &first_challenge).unwrap();
+
+        let err = h
+            .prepare_usd_send_sealed("testnet", "trader", &req, &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandlerError::PermissionDenied), "{err}");
+        let second_pending: PendingUsdSend = read_json(dir.join(USD_SEND_PENDING_FILE)).unwrap();
+        let second_action = hyperliquid_usd_send_action_id("testnet", "trader", &second_pending);
+        let second_challenge: ApprovalChallenge =
+            read_json(dir.join(APPROVAL_CHALLENGE_FILE)).unwrap();
+
+        assert!(second_pending.nonce > first_pending.nonce);
+        assert_ne!(second_action, first_action);
+        assert_eq!(second_challenge.action_id, second_action);
+        assert!(second_challenge.ceremony_url.is_some());
     }
 
     #[tokio::test]
