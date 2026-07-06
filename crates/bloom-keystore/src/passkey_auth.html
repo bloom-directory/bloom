@@ -242,6 +242,7 @@
 var TK=new URLSearchParams(location.search).get('t')||'';
 var CURRENT_INTENT=null;
 var EDITABLE_POLICY=false;
+var PASSKEY_FLOW_ACTIVE=false;
 function dec(s){
   s=s.replace(/-/g,'+').replace(/_/g,'/');
   while(s.length%4)s+='=';
@@ -661,6 +662,7 @@ async function run(){
     approve.textContent=normalLabel;
     return;
   }
+  PASSKEY_FLOW_ACTIVE=true;
   try{
     await fetch('/reviewed',{method:'POST',headers:{'x-bloom-token':TK}});
     const opts=await(await fetch('/challenge')).json();
@@ -726,6 +728,8 @@ async function run(){
     }else{
       approve.textContent=normalLabel;
     }
+  }finally{
+    PASSKEY_FLOW_ACTIVE=false;
   }
 }
 document.getElementById('approve').addEventListener('click',function(){
@@ -783,6 +787,7 @@ document.querySelectorAll('[data-autonomy-mode]').forEach(function(btn){
   });
 });
 window.addEventListener('unhandledrejection',function(e){
+  if(!PASSKEY_FLOW_ACTIVE) return;
   const st=document.getElementById('status');
   st.className='err';
   st.textContent='Error: '+classifyWebauthnError(e.reason||e);

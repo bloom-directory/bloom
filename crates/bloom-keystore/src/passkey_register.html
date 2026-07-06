@@ -75,6 +75,7 @@
 
 <script>
 var TK=new URLSearchParams(location.search).get('t')||'';
+var PASSKEY_FLOW_ACTIVE=false;
 function dec(s){
   s=s.replace(/-/g,'+').replace(/_/g,'/');
   while(s.length%4)s+='=';
@@ -142,6 +143,7 @@ async function register(){
     return;
   }
   st.textContent='Waiting for passkey interaction (Touch ID / security key)…';
+  PASSKEY_FLOW_ACTIVE=true;
   try{
     var opts=await(await fetch('/challenge')).json();
     opts.publicKey.challenge=dec(opts.publicKey.challenge);
@@ -213,10 +215,13 @@ async function register(){
     }else{
       st.textContent='Error: '+m;
     }
+  }finally{
+    PASSKEY_FLOW_ACTIVE=false;
   }
 }
 document.getElementById('btn').addEventListener('click',function(){
   register().catch(function(e){
+    PASSKEY_FLOW_ACTIVE=false;
     var st=document.getElementById('status');
     st.className='err';
     st.textContent='Error: '+e.message;
@@ -224,9 +229,11 @@ document.getElementById('btn').addEventListener('click',function(){
   });
 });
 window.addEventListener('unhandledrejection',function(e){
+  if(!PASSKEY_FLOW_ACTIVE) return;
   var st=document.getElementById('status');
+  var msg=(e.reason&&e.reason.message)?e.reason.message:String(e.reason||'unknown error');
   st.className='err';
-  st.textContent='Error: '+e.reason.message+' (if a browser extension is interfering, disable its passkey management in extension settings)';
+  st.textContent='Error: '+msg+' (during passkey registration)';
   e.preventDefault();
 });
 init().catch(function(e){
