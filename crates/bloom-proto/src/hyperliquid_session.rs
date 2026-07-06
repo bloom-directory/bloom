@@ -1,9 +1,9 @@
 //! Pure data model + lifecycle for a bounded Hyperliquid trading session.
 //!
 //! A session is minted by one passkey ceremony that approves an ephemeral API
-//! ("agent") wallet (see `bloom_hyperliquid::sign_approve_agent`). This module
-//! is the **pure** core: no signer, no network. The daemon holds the agent key
-//! and feeds in clearinghouse snapshots; this type decides when the session has
+//! ("agent") wallet from the `approveAgent` action hash. This module is the
+//! **pure** core: no signer, no network. The daemon holds the agent key and
+//! feeds in clearinghouse snapshots; this type decides when the session has
 //! expired or breached its risk envelope and what to do about it.
 //!
 //! It is the real drawdown stop that the per-action policy gate

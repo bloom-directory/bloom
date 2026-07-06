@@ -136,7 +136,7 @@ Signed writes:
 - /hyperliquid/<network>/exchange/<wallet>/schedule_cancel.json
 - /hyperliquid/<network>/exchange/<wallet>/update_leverage.json
 - /hyperliquid/<network>/exchange/<wallet>/raw_signed.json
-- /hyperliquid/<network>/exchange/<wallet>/send_asset.json  (usdSend: internal USDC transfer, owner-signed)
+- /hyperliquid/<network>/exchange/<wallet>/send_asset.json  (usdSend: internal USDC transfer, Sealed Approval)
 
 Agent sessions:
 - /hyperliquid/<network>/agent_sessions/<wallet>/new.json
@@ -147,16 +147,16 @@ Agent sessions:
 - /hyperliquid/<network>/agent_sessions/<wallet>/<session>/stop
 - /hyperliquid/<network>/agent_sessions/<wallet>/<session>/cancel_all
 - /hyperliquid/<network>/agent_sessions/<wallet>/<session>/close_all
-- /hyperliquid/<network>/agent_sessions/<wallet>/<session>/orphan_cancel_all  (owner-signed recovery)
-- /hyperliquid/<network>/agent_sessions/<wallet>/<session>/orphan_close_all   (owner-signed recovery)
+- /hyperliquid/<network>/agent_sessions/<wallet>/<session>/orphan_cancel_all  (unsupported without host signing)
+- /hyperliquid/<network>/agent_sessions/<wallet>/<session>/orphan_close_all   (unsupported without host signing)
 
-Writes submit immediately. Use an unlocked Bloom wallet. For sub-accounts or
-vaults, include vaultAddress; the master wallet signs and Hyperliquid applies
-the action to that account.
+Writes submit immediately after Sealed Approval or with an explicitly supplied
+`raw_signed.json` signature. For sub-accounts or vaults, include vaultAddress;
+Hyperliquid applies the action to that account.
 
 Safety model:
 - Read-only paths never need wallet unlock.
-- Signed exchange writes submit immediately after signing.
+- Signed exchange writes submit immediately after approved signing.
 - Bounded test writes have in-code caps and cleanup checks, but they are not a
   general policy engine.
 - Policy sessions and ephemeral API wallets should grant a short-lived agent
@@ -182,10 +182,9 @@ Known limitations (this is a functional integration, not a hardened surface):
     - `stale_since_ms`: unix-ms when the current stale streak began (null when
       fresh). These are observability only -- behavior is unchanged.
 - After a daemon restart/crash an in-flight session is orphaned (its ephemeral
-  agent key was in memory). Active-session cleanup is automatic via the agent;
-  ORPHAN cleanup requires an explicit owner action -- write to the orphaned
-  session's `orphan_cancel_all` / `orphan_close_all` with the owner wallet
-  unlocked, which cancels/flattens using the owner key.
+  agent key was in memory). Active-session cleanup is automatic via the agent.
+  Direct owner-key orphan recovery is disabled until it can be routed through
+  Sealed Approval host signing.
 "#;
 
 const ASSET_IDS: &[u8] = br#"# Hyperliquid Asset IDs
@@ -603,6 +602,12 @@ impl HyperliquidHandler {
                 "refusing to create Hyperliquid agent session: wallet [hyperliquid] policy must set allowed_assets, max_notional_usd, max_position_usd, and max_loss_usd",
             ));
         }
+        if !self.auth_services.is_wired() {
+            return Err(HandlerError::Unsupported(
+                "Hyperliquid approveAgent requires Sealed Approval host signing; direct owner signing is disabled"
+                    .into(),
+            ));
+        }
         let (agent, agent_key_persisted) =
             self.load_or_create_pending_agent_key(network_name, wallet, &id)?;
         let agent_address = agent.address();
@@ -631,8 +636,8 @@ impl HyperliquidHandler {
         let (action, hash) =
             approve_agent_action_and_hash(network, agent_address, Some(&agent_name), nonce)
                 .map_err(err_be)?;
-        let signature = if self.auth_services.is_wired() {
-            self.host_sign_hyperliquid_hash(
+        let signature = self
+            .host_sign_hyperliquid_hash(
                 wallet,
                 &hyperliquid_agent_session_action_id(network_name, wallet, &id),
                 HYPERLIQUID_APPROVE_AGENT_SIGN_INTENT,
@@ -649,19 +654,7 @@ impl HyperliquidHandler {
                     "signing_hash": format!("{hash:#x}"),
                 }),
             )
-            .await?
-        } else {
-            let owner_signer = self.keystore.signer(wallet).map_err(|e| {
-                HandlerError::PermissionDenied
-                    .with_context(format!("wallet '{wallet}' is locked or unavailable: {e}"))
-            })?;
-            let owner = HyperliquidSigner::new(owner_signer);
-            owner
-                .sign_approve_agent(network, agent_address, Some(&agent_name), nonce)
-                .await
-                .map_err(err_be)?
-                .1
-        };
+            .await?;
         let payload = user_signed_payload(action.clone(), nonce, signature.clone());
         let approve_response = match client.exchange(payload.clone()).await {
             Ok(response) => response,
@@ -1038,7 +1031,7 @@ impl HyperliquidHandler {
     }
 
     /// Build `CancelWire`s for every open order on `user`'s account. Shared by
-    /// the agent-session and owner-signed orphan cleanup paths.
+    /// agent-session cleanup and future host-signed orphan cleanup.
     async fn collect_cancel_wires(
         &self,
         client: &HyperliquidClient,
@@ -1085,7 +1078,8 @@ impl HyperliquidHandler {
     }
 
     /// Build reduce-only IOC close orders for every open position on `user`'s
-    /// account. Shared by the agent-session and owner-signed orphan paths.
+    /// account. Shared by agent-session cleanup and future host-signed orphan
+    /// cleanup.
     async fn collect_reduce_only_closes(
         &self,
         client: &HyperliquidClient,
@@ -1169,125 +1163,28 @@ impl HyperliquidHandler {
         Ok(closes)
     }
 
-    // ── owner-signed orphan recovery ──────────────────────────────────────────
+    // ── orphan recovery boundary ──────────────────────────────────────────────
     // A bounded session's ephemeral agent key lives only in daemon memory, so
-    // after a restart/crash an orphaned session can no longer self-clean. These
-    // entry points let the **owner** key cancel/flatten the orphaned exposure.
-    // Deliberately narrow: only when the session is orphaned, owner-unlocked, and
-    // only `Cancel` / reduce-only-close actions are constructible here — there is
-    // no generic owner-signed action route.
+    // after a restart/crash an orphaned session can no longer self-clean. Direct
+    // owner-key fallback is disabled; this boundary fails closed until orphan
+    // cleanup is routed through Sealed Approval host signing.
 
-    /// Owner L1 signer for orphan recovery; rejects unless the session is
-    /// orphaned (persisted but not in the in-memory map) and the owner is unlocked.
+    /// Owner L1 signer for orphan recovery.
+    ///
+    /// Direct owner signing is disabled; this function remains as the explicit
+    /// fail-closed boundary for orphan cleanup until that flow is routed through
+    /// Sealed Approval host signing.
     async fn orphan_owner_signer(
         &self,
         network_name: &str,
         wallet: &str,
         id: &str,
     ) -> Result<HyperliquidSigner, HandlerError> {
-        if self.auth_services.is_wired() {
-            return Err(HandlerError::Unsupported(
-                "Hyperliquid orphan recovery requires grant-backed Sealed Approval host signing; \
-                 direct owner signing is disabled when auth services are wired"
-                    .into(),
-            ));
-        }
-        if self.active_session(network_name, wallet, id).is_ok() {
-            return Err(HandlerError::invalid(
-                "session is still active; use cancel_all/close_all — orphan recovery is only for \
-                 sessions left behind by a daemon restart",
-            ));
-        }
-        let session_path = self
-            .session_store_dir(network_name, wallet, id)?
-            .join("session.json");
-        if !session_path.exists() {
-            return Err(HandlerError::NotFound(format!("agent session {id}")));
-        }
-        let session = persisted_orphan_recovery_session(&session_path, id)?;
-        tracing::debug!(
-            network = network_name,
-            wallet,
-            session = id,
-            agent_address = %session.agent_address,
-            "hyperliquid.orphan_recovery_owner_signer"
-        );
-        let signer = self.keystore.signer(wallet).map_err(|e| {
-            HandlerError::PermissionDenied.with_context(format!(
-                "owner wallet '{wallet}' must be unlocked for orphan recovery: {e}"
-            ))
-        })?;
-        Ok(HyperliquidSigner::new(signer))
-    }
-
-    /// The vault/subaccount a persisted (orphaned) session traded on, recovered
-    /// from its `session.json` so owner-signed cleanup flattens the right account.
-    fn orphan_session_vault(
-        &self,
-        network_name: &str,
-        wallet: &str,
-        id: &str,
-    ) -> Result<Option<String>, HandlerError> {
-        let session_path = self
-            .session_store_dir(network_name, wallet, id)?
-            .join("session.json");
-        Ok(persisted_orphan_recovery_session(&session_path, id)?.vault_address)
-    }
-
-    /// Account address to query for orphan recovery: the session's vault when
-    /// set, else the owner wallet (address-only → unverified accessor).
-    fn orphan_recovery_user(
-        &self,
-        wallet: &str,
-        vault_address: Option<&str>,
-    ) -> Result<String, HandlerError> {
-        match vault_address {
-            Some(v) => Ok(v.to_string()),
-            None => Ok(format!(
-                "{:#x}",
-                self.keystore
-                    .info_unverified(wallet)
-                    .map_err(|e| HandlerError::backend(e.to_string()))?
-                    .address
-            )),
-        }
-    }
-
-    /// Sign a Cancel / reduce-only-close action with the OWNER key and submit,
-    /// recording an explicit owner-recovery audit event.
-    #[allow(clippy::too_many_arguments)]
-    async fn submit_owner_orphan(
-        &self,
-        client: &HyperliquidClient,
-        network: HyperliquidNetwork,
-        network_name: &str,
-        wallet: &str,
-        id: &str,
-        owner: &HyperliquidSigner,
-        action: ExchangeAction,
-        vault_address: Option<String>,
-        event: &str,
-    ) -> Result<Value, HandlerError> {
-        let payload = sign_submit_payload(
-            owner,
-            network,
-            SignSubmit {
-                action,
-                nonce: Some(bloom_hyperliquid::now_ms()),
-                vault_address,
-                expires_after: Some(bloom_hyperliquid::now_ms() + 60_000),
-            },
-        )
-        .await
-        .map_err(err_be)?;
-        let response = client.exchange(payload.clone()).await.map_err(err_be)?;
-        self.append_session_audit(
-            network_name,
-            wallet,
-            id,
-            &json!({"event": event, "recovery": "owner_signed_orphan_recovery", "response": response}),
-        )?;
-        Ok(response)
+        let _ = (network_name, wallet, id);
+        Err(HandlerError::Unsupported(
+            "Hyperliquid orphan recovery requires Sealed Approval host signing; direct owner signing is disabled"
+                .into(),
+        ))
     }
 
     async fn orphan_cancel_all(
@@ -1298,42 +1195,12 @@ impl HyperliquidHandler {
         wallet: &str,
         id: &str,
     ) -> Result<Value, HandlerError> {
-        let owner_signer = self.orphan_owner_signer(network_name, wallet, id).await?;
-        let vault_address = self.orphan_session_vault(network_name, wallet, id)?;
-        let user = self.orphan_recovery_user(wallet, vault_address.as_deref())?;
-        let cancels = self.collect_cancel_wires(client, &user).await?;
-        if cancels.is_empty() {
-            let response = json!({"status": "noop", "reason": "no open orders"});
-            self.append_session_audit(
-                network_name,
-                wallet,
-                id,
-                &json!({"event": "orphan_cancel_all", "recovery": "owner_signed_orphan_recovery", "response": response}),
-            )?;
-            self.finish_persisted_orphan_recovery(network_name, wallet, id, "orphan_cancel_all")?;
-            return Ok(response);
-        }
-        let action = ExchangeAction::Cancel {
-            cancels,
-            fast: Some(true),
-        };
-        let response = self
-            .submit_owner_orphan(
-                client,
-                network,
-                network_name,
-                wallet,
-                id,
-                &owner_signer,
-                action,
-                vault_address,
-                "orphan_cancel_all",
-            )
-            .await?;
-        self.finish_persisted_orphan_recovery(network_name, wallet, id, "orphan_cancel_all")?;
-        Ok(response)
+        let _ = (client, network);
+        self.orphan_owner_signer(network_name, wallet, id).await?;
+        unreachable!("orphan_owner_signer always returns Unsupported")
     }
 
+    #[cfg(test)]
     fn finish_persisted_orphan_recovery(
         &self,
         network: &str,
@@ -1369,7 +1236,7 @@ impl HyperliquidHandler {
         obj.insert("last_cleanup_error".into(), Value::Null);
         obj.insert(
             "recovery".into(),
-            Value::String("owner_signed_orphan_recovery".into()),
+            Value::String("sealed_orphan_recovery".into()),
         );
         obj.insert("recovery_action".into(), Value::String(recovery.into()));
         obj.insert(
@@ -1388,62 +1255,9 @@ impl HyperliquidHandler {
         wallet: &str,
         id: &str,
     ) -> Result<Value, HandlerError> {
-        let owner_signer = self.orphan_owner_signer(network_name, wallet, id).await?;
-        let vault_address = self.orphan_session_vault(network_name, wallet, id)?;
-        let user = self.orphan_recovery_user(wallet, vault_address.as_deref())?;
-        // Cancel resting orders first, then reduce-only-close positions.
-        let cancels = self.collect_cancel_wires(client, &user).await?;
-        let cancel_response = if cancels.is_empty() {
-            json!({"status": "noop", "reason": "no open orders"})
-        } else {
-            self.submit_owner_orphan(
-                client,
-                network,
-                network_name,
-                wallet,
-                id,
-                &owner_signer,
-                ExchangeAction::Cancel {
-                    cancels,
-                    fast: Some(true),
-                },
-                vault_address.clone(),
-                "orphan_cancel_all",
-            )
-            .await?
-        };
-        let closes = self.collect_reduce_only_closes(client, &user).await?;
-        if closes.is_empty() {
-            let response = json!({"status": "noop", "reason": "no open positions", "cancel_all": cancel_response});
-            self.append_session_audit(
-                network_name,
-                wallet,
-                id,
-                &json!({"event": "orphan_close_all", "recovery": "owner_signed_orphan_recovery", "response": response}),
-            )?;
-            self.finish_persisted_orphan_recovery(network_name, wallet, id, "orphan_close_all")?;
-            return Ok(response);
-        }
-        let action = ExchangeAction::Order {
-            orders: closes,
-            grouping: Grouping::Na,
-            builder: None,
-        };
-        let response = self
-            .submit_owner_orphan(
-                client,
-                network,
-                network_name,
-                wallet,
-                id,
-                &owner_signer,
-                action,
-                vault_address,
-                "orphan_close_all",
-            )
-            .await?;
-        self.finish_persisted_orphan_recovery(network_name, wallet, id, "orphan_close_all")?;
-        Ok(response)
+        let _ = (client, network);
+        self.orphan_owner_signer(network_name, wallet, id).await?;
+        unreachable!("orphan_owner_signer always returns Unsupported")
     }
 
     /// `forced` = monitor-initiated safety cleanup (expiry/breach). A forced
@@ -1778,39 +1592,16 @@ impl HyperliquidHandler {
         file: &str,
         req: SignSubmit,
     ) -> Result<(), HandlerError> {
-        if self.auth_services.is_wired() {
-            return Err(HandlerError::Unsupported(
-                "Hyperliquid exchange writes require Sealed Approval; direct owner signing for \
-                 order/cancel/scheduleCancel/updateLeverage is disabled when auth services are wired"
-                    .into(),
-            ));
-        }
-        // Policy boundary: no exchange action signs just because the wallet is
-        // unlocked. Evaluate the verified per-wallet [hyperliquid] policy first.
-        self.enforce_hyperliquid_policy(
-            client,
-            wallet,
-            &req.action,
-            req.vault_address.as_deref(),
-            None,
-        )
-        .await?;
-        let signer = self.keystore.signer(wallet).map_err(|e| {
-            HandlerError::PermissionDenied
-                .with_context(format!("wallet '{wallet}' is locked or unavailable: {e}"))
-        })?;
-        let signer = HyperliquidSigner::new(signer);
-        let payload = sign_submit_payload(&signer, network, req)
-            .await
-            .map_err(err_be)?;
-        let response = client.exchange(payload).await.map_err(err_be)?;
-        self.persist_response(network_name, wallet, file, &response)?;
-        Ok(())
+        let _ = (client, network, network_name, wallet, file, req);
+        Err(HandlerError::Unsupported(
+            "Hyperliquid exchange writes require Sealed Approval via an approved agent session or raw_signed.json; direct owner signing for order/cancel/scheduleCancel/updateLeverage is disabled"
+                .into(),
+        ))
     }
 
-    /// Sign and submit a `usdSend` (internal USDC transfer) using the **owner**
-    /// wallet key — user-signed EIP-712, not an L1 action. Agent session keys
-    /// cannot authorize `usdSend` on the Hyperliquid side.
+    /// Sign and submit a `usdSend` (internal USDC transfer) through Sealed
+    /// Approval host signing. Agent session keys cannot authorize `usdSend` on
+    /// the Hyperliquid side.
     async fn submit_usd_send(
         &self,
         client: &HyperliquidClient,
@@ -1855,13 +1646,13 @@ impl HyperliquidHandler {
             .await?;
         let (action, hash) =
             usd_send_action_and_hash(network, dest, &req.amount, nonce).map_err(err_be)?;
-        let signature = if self.auth_services.is_wired() {
-            let pending = PendingUsdSend {
-                destination: req.destination.clone(),
-                amount: req.amount.clone(),
-                nonce,
-            };
-            self.host_sign_hyperliquid_hash(
+        let pending = PendingUsdSend {
+            destination: req.destination.clone(),
+            amount: req.amount.clone(),
+            nonce,
+        };
+        let signature = self
+            .host_sign_hyperliquid_hash(
                 wallet,
                 &hyperliquid_usd_send_action_id(network_name, wallet, &pending),
                 HYPERLIQUID_USD_SEND_SIGN_INTENT,
@@ -1877,19 +1668,7 @@ impl HyperliquidHandler {
                     "signing_hash": format!("{hash:#x}"),
                 }),
             )
-            .await?
-        } else {
-            let signer = self.keystore.signer(wallet).map_err(|e| {
-                HandlerError::PermissionDenied
-                    .with_context(format!("wallet '{wallet}' is locked or unavailable: {e}"))
-            })?;
-            let signer = HyperliquidSigner::new(signer);
-            signer
-                .sign_usd_send(network, dest, &req.amount, nonce)
-                .await
-                .map_err(err_be)?
-                .1
-        };
+            .await?;
         let payload = user_signed_payload(action, nonce, signature);
         let response = client.exchange(payload).await.map_err(err_be)?;
         self.persist_response(network_name, wallet, "send_asset.json", &response)?;
@@ -1905,7 +1684,10 @@ impl HyperliquidHandler {
         checks: &[bloom_proto::PolicyCheck],
     ) -> Result<u64, HandlerError> {
         if !self.auth_services.is_wired() {
-            return Ok(req.nonce.unwrap_or_else(bloom_hyperliquid::now_ms));
+            return Err(HandlerError::Unsupported(
+                "Hyperliquid usdSend requires Sealed Approval host signing; direct owner signing is disabled"
+                    .into(),
+            ));
         }
         let pending = self.load_or_create_usd_send_pending(network, wallet, req)?;
         if pending.destination != req.destination || pending.amount != req.amount {
@@ -2102,9 +1884,9 @@ impl HyperliquidHandler {
         // For agent sessions, the security envelope is the bounds approved at the
         // session ceremony (persisted on the session) — NOT the wallet's current
         // [hyperliquid] policy, which an operator could widen after approval. The
-        // one-shot owner-signed paths pass `None` and use the verified live
-        // policy (a passkey wallet's unsigned/tampered policy must not authorize
-        // trades).
+        // externally signed one-shot paths pass `None` and use the verified
+        // live policy (a passkey wallet's unsigned/tampered policy must not
+        // authorize trades).
         let policy: HyperliquidPolicy = match bounds {
             Some(b) => b.clone(),
             None => {
@@ -2684,7 +2466,7 @@ impl HyperliquidHandler {
             obj.insert(
                 "orphan_reason".into(),
                 Value::String(if sealed_key_present && !has_bounds {
-                    "sealed agent key is present, but this session was created before policy bounds were persisted; owner-signed orphan cleanup is required".into()
+                    "sealed agent key is present, but this session was created before policy bounds were persisted; Sealed Approval orphan cleanup is required".into()
                 } else if sealed_key_present {
                     "sealed agent key is present, but Bloom could not verify recovery; check daemon KEK and Hyperliquid extraAgents".into()
                 } else {
@@ -2744,7 +2526,7 @@ impl HyperliquidHandler {
         };
         // Address-only: a safety-cleanup / recovery path needs the identity, not
         // the trading policy. Use the unverified accessor so a stale/edited
-        // passkey policy signature can't block owner-signed cancel/close.
+        // passkey policy signature can't block agent-key cancel/close.
         let owner = self
             .keystore
             .info_unverified(wallet)
@@ -3546,13 +3328,15 @@ fn parse_usdc_micro_amount(amount: &str) -> Result<u64, HandlerError> {
         .map_err(|_| HandlerError::invalid(format!("USDC amount '{amount}' is too large")))
 }
 
+#[cfg(test)]
 struct PersistedOrphanRecoverySession {
     agent_address: String,
-    /// Vault/subaccount the session traded on, recovered so owner-signed cleanup
-    /// flattens the right account.
+    /// Vault/subaccount the session traded on, recovered so host-signed cleanup
+    /// can flatten the right account.
     vault_address: Option<String>,
 }
 
+#[cfg(test)]
 fn persisted_orphan_recovery_session(
     path: &std::path::Path,
     id: &str,
@@ -3939,7 +3723,7 @@ fn format_hl_close_price(value: f64) -> Result<String, HandlerError> {
 fn exchange_hint(file: &str) -> Vec<u8> {
     let value = match file {
         "send_asset.json" => json!({
-            "description": "internal USDC transfer (usdSend): owner-signed EIP-712, requires transfer_cap_usd in [hyperliquid] policy",
+            "description": "internal USDC transfer (usdSend): Sealed Approval EIP-712 host signing, requires transfer_cap_usd in [hyperliquid] policy",
             "required": ["destination", "amount"],
             "optional": ["nonce"],
             "example": {
@@ -3953,7 +3737,7 @@ fn exchange_hint(file: &str) -> Vec<u8> {
             "optional": ["vaultAddress", "expiresAfter"]
         }),
         _ => json!({
-            "description": "write JSON with action, optional nonce, optional vaultAddress, optional expiresAfter; Bloom signs with this wallet and submits immediately",
+            "description": "direct owner signing is disabled; use an approved agent session for order/cancel writes or raw_signed.json for externally signed payloads",
             "example": {
                 "action": {
                     "type": "order",
@@ -3983,7 +3767,7 @@ fn agent_session_new_hint() -> Vec<u8> {
             "agent_name": "bloom-session"
         },
         "requirements": [
-            "the owner wallet must be unlocked for this one approveAgent signature",
+            "Sealed Approval host signing must be configured for the approveAgent signature",
             "the wallet policy must include a configured [hyperliquid] boundary"
         ],
         "notes": [
@@ -4050,10 +3834,10 @@ fn agent_session_file_hint(file: &str) -> Vec<u8> {
             json!({"description": "write anything to cancel open orders and close positions reduce-only using the API wallet"})
         }
         "orphan_cancel_all" => {
-            json!({"description": "owner-signed recovery: cancel all open orders for an ORPHANED session (after daemon restart); requires the owner wallet unlocked"})
+            json!({"description": "orphan recovery is disabled until routed through Sealed Approval host signing"})
         }
         "orphan_close_all" => {
-            json!({"description": "owner-signed recovery: cancel orders + reduce-only close positions for an ORPHANED session; requires the owner wallet unlocked"})
+            json!({"description": "orphan recovery is disabled until routed through Sealed Approval host signing"})
         }
         _ => json!({"description": "agent session file"}),
     };
@@ -4466,19 +4250,6 @@ impl HlSnapshot {
 
 fn err_invalid(e: bloom_hyperliquid::HyperliquidError) -> HandlerError {
     HandlerError::invalid(e.to_string())
-}
-
-trait HandlerErrorContext {
-    fn with_context(self, context: String) -> Self;
-}
-
-impl HandlerErrorContext for HandlerError {
-    fn with_context(self, context: String) -> Self {
-        match self {
-            HandlerError::PermissionDenied => HandlerError::invalid(context),
-            other => other,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -5184,7 +4955,7 @@ mod tests {
         assert_eq!(value["stopped"], true);
         assert_eq!(value["orphaned"], false);
         assert_eq!(value["tradable"], false);
-        assert_eq!(value["recovery"], "owner_signed_orphan_recovery");
+        assert_eq!(value["recovery"], "sealed_orphan_recovery");
         assert_eq!(value["recovery_action"], "orphan_close_all");
     }
 
@@ -5200,6 +4971,7 @@ mod tests {
         .unwrap();
         let session = persisted_orphan_recovery_session(&path, "session-1").unwrap();
         assert_eq!(session.agent_address, "0xabc");
+        assert_eq!(session.vault_address, None);
 
         std::fs::write(
             &path,

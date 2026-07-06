@@ -28,11 +28,7 @@ use bloom_auth_api::{
 };
 use bloom_daemon::Daemon;
 use bloom_daemon::ipc::{IpcClient, IpcServer, default_socket_path};
-use bloom_hyperliquid::{
-    CancelWire, ExchangeAction, Grouping, HyperliquidClient, HyperliquidNetwork, HyperliquidSigner,
-    LimitOrderType, OrderTypeWire, OrderWire, SignSubmit, TimeInForce, UsdSendRequest, pretty_json,
-    sign_submit_payload,
-};
+use bloom_hyperliquid::{HyperliquidClient, HyperliquidNetwork, UsdSendRequest, pretty_json};
 use bloom_proto::{AuditRecord, CeremonyIntent, CeremonyIntentKind, HomeDir, HomeWritePermit};
 use bloom_tx::TxEngineError;
 use bloom_vfs::{
@@ -647,7 +643,7 @@ enum HyperliquidCmd {
         #[arg(long, default_value = "mainnet")]
         network: String,
     },
-    /// Transfer USDC internally between Hyperliquid accounts (usdSend, owner-signed).
+    /// Transfer USDC internally between Hyperliquid accounts (usdSend, Sealed Approval).
     /// Requires transfer_cap_usd in the wallet [hyperliquid] policy.
     SendAsset {
         wallet: String,
@@ -4245,198 +4241,28 @@ struct TestPostOnlyCancelArgs {
     network: String,
 }
 
-async fn test_hl_post_only_cancel(home: HomeDir, args: TestPostOnlyCancelArgs) -> Result<()> {
-    if !args.danger_accept_live_orders {
+async fn test_hl_post_only_cancel(_home: HomeDir, args: TestPostOnlyCancelArgs) -> Result<()> {
+    let TestPostOnlyCancelArgs {
+        wallet: _wallet,
+        coin: _coin,
+        asset: _asset,
+        price: _price,
+        size: _size,
+        max_notional_usd,
+        policy_session: _policy_session,
+        danger_accept_live_orders,
+        passphrase: _passphrase,
+        network: _network,
+    } = args;
+    if !danger_accept_live_orders {
         bail!("refusing live Hyperliquid test order without --danger-accept-live-orders");
     }
-    if args.max_notional_usd <= 0.0 {
+    if max_notional_usd <= 0.0 {
         bail!("--max-notional-usd must be positive");
     }
-    let network = hl_network(&args.network)?;
-    let client = hl_client(&home, &args.network)?;
-    let (price, size, notional) =
-        resolve_post_only_test_order(&client, &args.coin, args.price, args.size).await?;
-    if notional > args.max_notional_usd {
-        bail!(
-            "refusing test order notional ${notional:.4}; cap is ${:.4}",
-            args.max_notional_usd
-        );
-    }
-
-    let (_home_permit, d) = build_write_daemon(home)?;
-    let info = d.keystore.info(&args.wallet)?;
-    match info.kind {
-        bloom_keystore::WalletKind::PasskeyGated => {
-            if !args.policy_session {
-                bail!("passkey Hyperliquid signed test requires --policy-session");
-            }
-            let mut intent = CeremonyIntent::new(
-                &args.wallet,
-                "Authorize Hyperliquid Test Session",
-                CeremonyIntentKind::Other,
-            )
-            .with_address(bloom_proto::checksum_address(&info.address))
-            .summary(format!("Network: {}", args.network))
-            .summary(format!("Place one post-only {} perp order.", args.coin))
-            .summary(format!(
-                "Asset: {} price={} size={} notional≈${notional:.4}",
-                args.asset, price, size
-            ))
-            .summary("Cancel the order immediately if Hyperliquid accepts it as resting.")
-            .risk("This is a signed Hyperliquid Exchange action.")
-            .risk("The order is ALO/post-only and should not take liquidity.")
-            .risk(
-                "If Hyperliquid rejects the order, Bloom stops without trying a riskier fallback.",
-            )
-            .subject(serde_json::json!({
-                "action": "hyperliquid_post_only_cancel_test",
-                "network": args.network,
-                "wallet": args.wallet,
-                "asset": args.asset,
-                "coin": args.coin,
-                "price": price,
-                "size": size,
-                "max_notional_usd": args.max_notional_usd,
-            }));
-            intent = intent.policy("Denied in this test: withdrawals, market orders, third-party transfers, leverage changes, builder fees, vault/subaccount changes.");
-            d.keystore.lock(&args.wallet);
-            d.keystore
-                .unlock_passkey_with_intent(&args.wallet, Some(intent))
-                .await?;
-        }
-        _ => {
-            d.keystore
-                .unlock(&args.wallet, args.passphrase.as_deref().unwrap_or(""))?;
-        }
-    }
-
-    let signer = d.keystore.signer(&args.wallet)?;
-    let signer = HyperliquidSigner::new(signer);
-    let order = ExchangeAction::Order {
-        orders: vec![OrderWire {
-            asset: args.asset,
-            is_buy: true,
-            price: price.clone(),
-            size: size.clone(),
-            reduce_only: false,
-            order_type: OrderTypeWire {
-                limit: Some(LimitOrderType {
-                    tif: TimeInForce::Alo,
-                }),
-                trigger: None,
-            },
-            cloid: None,
-        }],
-        grouping: Grouping::Na,
-        builder: None,
-    };
-    let order_payload = sign_submit_payload(
-        &signer,
-        network,
-        SignSubmit {
-            action: order,
-            nonce: Some(bloom_hyperliquid::now_ms()),
-            vault_address: None,
-            expires_after: Some(bloom_hyperliquid::now_ms() + 60_000),
-        },
+    bail!(
+        "direct owner-key Hyperliquid test orders are disabled; create a Sealed Approval agent session and submit through /hyperliquid/<network>/agent_sessions/<wallet>/<session>/order.json"
     )
-    .await?;
-    let order_response = client
-        .exchange(order_payload)
-        .await
-        .context("submit post-only order")?;
-    let Some(oid) = order_response
-        .pointer("/response/data/statuses/0/resting/oid")
-        .and_then(serde_json::Value::as_u64)
-    else {
-        let result = serde_json::json!({
-            "order": order_response,
-            "cancel": null,
-            "note": "order did not rest, so no cancel was submitted",
-        });
-        std::io::Write::write_all(&mut std::io::stdout(), &pretty_json(&result))?;
-        return Ok(());
-    };
-
-    let cancel = ExchangeAction::Cancel {
-        cancels: vec![CancelWire {
-            asset: args.asset,
-            oid,
-        }],
-        fast: None,
-    };
-    let cancel_payload = sign_submit_payload(
-        &signer,
-        network,
-        SignSubmit {
-            action: cancel,
-            nonce: Some(bloom_hyperliquid::now_ms() + 1),
-            vault_address: None,
-            expires_after: Some(bloom_hyperliquid::now_ms() + 60_000),
-        },
-    )
-    .await?;
-    let cancel_response = client
-        .exchange(cancel_payload)
-        .await
-        .context("submit cancel")?;
-    let result = serde_json::json!({
-        "order": order_response,
-        "cancel": cancel_response,
-    });
-    std::io::Write::write_all(&mut std::io::stdout(), &pretty_json(&result))?;
-    Ok(())
-}
-
-async fn resolve_post_only_test_order(
-    client: &HyperliquidClient,
-    coin: &str,
-    price: Option<String>,
-    size: Option<String>,
-) -> Result<(String, String, f64)> {
-    let price = match price {
-        Some(price) => price,
-        None => {
-            let mids = client.info(serde_json::json!({"type": "allMids"})).await?;
-            let mid = mids
-                .get(coin)
-                .and_then(serde_json::Value::as_str)
-                .with_context(|| format!("allMids did not include coin '{coin}'"))?
-                .parse::<f64>()
-                .with_context(|| format!("parse {coin} mid"))?;
-            // Far below the current mid: valid post-only smoke test, not a
-            // marketable buy under normal conditions.
-            format_decimal((mid * 0.5).floor(), 0)
-        }
-    };
-    let price_f = price.parse::<f64>().context("parse test price")?;
-    let size = match size {
-        Some(size) => size,
-        None => format_decimal((10.5 / price_f * 100_000.0).ceil() / 100_000.0, 5),
-    };
-    let size_f = size.parse::<f64>().context("parse test size")?;
-    let notional = price_f * size_f;
-    if notional < 10.0 {
-        bail!("test order notional ${notional:.4} is below Hyperliquid's documented $10 minimum");
-    }
-    Ok((price, size, notional))
-}
-
-fn format_decimal(value: f64, decimals: usize) -> String {
-    let mut s = if decimals == 0 {
-        format!("{value:.0}")
-    } else {
-        format!("{value:.decimals$}")
-    };
-    if s.contains('.') {
-        while s.ends_with('0') {
-            s.pop();
-        }
-        if s.ends_with('.') {
-            s.pop();
-        }
-    }
-    s
 }
 
 #[cfg(not(feature = "mount"))]
