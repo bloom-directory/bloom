@@ -1136,6 +1136,17 @@ impl Handler for RequestsHandler {
             [state, id] if matches!(state.as_str(), "pending" | "sent" | "failed" | "sessions") => {
                 Ok(Entry::dir(id))
             }
+            [state, _id, name]
+                if matches!(state.as_str(), "pending" | "sent" | "failed")
+                    && name == "response" =>
+            {
+                // `response` is a subdirectory (its files are handled by the
+                // 4-segment arm below and listed by `list`). Without this the
+                // generic file arm reports it as a 0-byte file, so a mounted
+                // client caches it as a file and descending into it fails with
+                // ENOTDIR.
+                Ok(Entry::dir("response"))
+            }
             [state, _id, name] if matches!(state.as_str(), "pending" | "sent" | "failed") => {
                 if matches!(name.as_str(), "confirm" | "cancel") {
                     Ok(Entry::writable_file(name))
@@ -1185,7 +1196,21 @@ impl Handler for RequestsHandler {
                 list_dirs(self.requests_root().join(state))
             }
             [state, id] if matches!(state.as_str(), "pending" | "sent" | "failed") => {
-                list_entries(self.req_dir(state, id))
+                let mut entries = list_entries(self.req_dir(state, id))?;
+                // Always advertise the pending control files even before
+                // they've been written, so agents can `printf y > confirm`
+                // (mirrors the EVM ln pending listing in wallets.rs). These
+                // are virtual write-only sinks that never exist on disk, so
+                // without this they'd be invisible to `ls`.
+                if state.as_str() == "pending" {
+                    for ctrl in ["cancel", "confirm"] {
+                        if !entries.iter().any(|e| e.name == ctrl) {
+                            entries.push(Entry::writable_file(ctrl));
+                        }
+                    }
+                    entries.sort_by(|a, b| a.name.cmp(&b.name));
+                }
+                Ok(entries)
             }
             [state, id] if state == "sessions" => {
                 list_entries(self.requests_root().join("sessions").join(id))
@@ -3118,6 +3143,77 @@ mod tests {
         assert_eq!(headers["set-cookie"], "redacted");
         assert_eq!(headers["payment-receipt"], "redacted");
         assert_eq!(headers["content-type"], "application/json");
+    }
+
+    #[tokio::test]
+    async fn response_resolves_as_a_directory_via_lookup() {
+        let f = fixture(Some("alice"));
+        let (url, _hits) = mock_server(200, &[("content-type", "application/json")], b"{}").await;
+        let id = f
+            .handler
+            .create_request(format!("GET {url}").as_bytes(), false)
+            .await
+            .unwrap();
+        // `response` must resolve as a directory, not a 0-byte file — otherwise a
+        // mounted client caches it as a file and descending into it is ENOTDIR.
+        let entry = f
+            .handler
+            .lookup(&VfsPath::parse(&format!("/sent/{id}/response")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(entry.kind, crate::handler::EntryKind::Dir);
+        // And a file inside it still resolves as a file.
+        let body = f
+            .handler
+            .lookup(&VfsPath::parse(&format!("/sent/{id}/response/body")).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(body.kind, crate::handler::EntryKind::File);
+    }
+
+    #[tokio::test]
+    async fn pending_request_listing_advertises_confirm_and_cancel() {
+        let f = fixture(Some("alice"));
+        let pending = f.handler.requests_root().join("pending/req_ctrl");
+        fs::create_dir_all(&pending).unwrap();
+        fs::write(pending.join("status"), "pending\n").unwrap();
+        write_json(
+            pending.join("request.toml"),
+            &json!({"method":"GET","url":"http://127.0.0.1:9/pay","wallet":"alice","headers":{},"dry_run":false}),
+        )
+        .unwrap();
+
+        let entries = f
+            .handler
+            .list(&VfsPath::parse("/pending/req_ctrl").unwrap())
+            .await
+            .unwrap();
+        for ctrl in ["confirm", "cancel"] {
+            let e = entries
+                .iter()
+                .find(|e| e.name == ctrl)
+                .unwrap_or_else(|| panic!("pending listing must advertise {ctrl}"));
+            // Control files are writable sinks, not read-only metadata.
+            assert!(e.mode & 0o200 != 0, "{ctrl} must be writable");
+        }
+
+        // Non-pending states must NOT advertise control files (they can
+        // no longer be confirmed or cancelled).
+        let sent = f.handler.requests_root().join("sent/req_ctrl");
+        fs::create_dir_all(&sent).unwrap();
+        fs::write(sent.join("status"), "sent\n").unwrap();
+        let sent_entries = f
+            .handler
+            .list(&VfsPath::parse("/sent/req_ctrl").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            !sent_entries
+                .iter()
+                .any(|e| e.name == "confirm" || e.name == "cancel"),
+            "sent request must not advertise control files: {:?}",
+            sent_entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

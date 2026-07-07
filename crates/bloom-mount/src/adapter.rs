@@ -152,12 +152,10 @@ fn mount_write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        [root, _reference, action] if root == "requests" && action == "confirm" => true,
-        [root, state, _id, action]
-            if root == "requests" && state == "pending" && action == "confirm" =>
-        {
-            true
-        }
+        // Confirming a paid HTTP request is a first-party Sealed Approval action:
+        // the requests handler stages an approval challenge on the first write and
+        // only signs under a grant-gated PetalHost signature, so it must reach the
+        // VFS handler rather than be denied at the mount lane (mirrors policy.toml).
         [root, _wallet, ps, leaf]
             if root == "wallets" && ps == "policy-session" && leaf == "new" =>
         {

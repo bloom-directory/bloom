@@ -720,15 +720,13 @@ fn write_path_uses_wallet_signer(path: &VfsPath) -> bool {
         {
             true
         }
-        // Confirming a paid HTTP request can sign x402 or Tempo MPP payment
-        // credentials. It must go through write_unlocked rather than plain IPC
-        // so a cached daemon signer is not consumed silently.
-        [root, _reference, action] if root == "requests" && action == "confirm" => true,
-        [root, state, _id, action]
-            if root == "requests" && state == "pending" && action == "confirm" =>
-        {
-            true
-        }
+        // Confirming a paid HTTP request is a first-party Sealed Approval action:
+        // the requests handler stages an approval challenge on the first write and
+        // only signs the x402/Tempo MPP credential under a grant-gated PetalHost
+        // signature. It therefore never consumes a cached signer silently, so the
+        // plain write lane must forward it through to `vfs.write` rather than deny
+        // it here — the old write_unlocked confirm lane is disabled for passkey
+        // wallets, which would otherwise leave mounted confirm with no working path.
         // Minting a bounded policy session authorizes many future broadcasts; gate
         // it behind the same human-presence ceremony as a signature so an agent
         // cannot silently mint a broad batch-signing session.
@@ -1522,9 +1520,6 @@ mod tests {
             "/wallets/minnow/sign/hash",
             "/wallets/minnow/sign/typed_data",
             "/polymarket/onboard/minnow/begin",
-            "/requests/latest/confirm",
-            "/requests/req_123/confirm",
-            "/requests/pending/req_123/confirm",
             "/hyperliquid/mainnet/agent_sessions/minnow/new.json",
             "/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_cancel_all",
             "/hyperliquid/mainnet/agent_sessions/minnow/session-1/orphan_close_all",
@@ -1546,6 +1541,12 @@ mod tests {
             "/wallets/minnow/policy.toml",
             "/wallets/minnow/chains/polygon/outbox/new.tx",
             "/wallets/minnow/chains/polygon/outbox/pending/0001/confirm",
+            // Paid-request confirm likewise reaches the VFS handler: the first
+            // write stages a Sealed Approval challenge and signing only happens
+            // under a grant-gated PetalHost signature.
+            "/requests/latest/confirm",
+            "/requests/req_123/confirm",
+            "/requests/pending/req_123/confirm",
             "/requests/new",
             "/requests/pending/req_123/cancel",
             "/hyperliquid/mainnet/agent_sessions/minnow/session-1/schedule_cancel.json",
