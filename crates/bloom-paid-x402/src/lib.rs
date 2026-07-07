@@ -1,17 +1,32 @@
 //! x402 protocol adapter for Bloom paid HTTP requests.
+//!
+//! This adapter never touches wallet key material. It selects the matching
+//! x402 payment candidate and asks the Bloom runtime's host signing seam
+//! ([`PaidHttpHostSigner`]) to sign the exact EIP-712 digest under a live
+//! Sealed Approval grant. The upstream x402 clients are generic over
+//! [`SignerLike`], so injecting a host-backed signer reuses all of the
+//! crate's EIP-712 construction and header assembly without a
+//! `PrivateKeySigner` ever entering this crate.
 
-use alloy::primitives::U256;
+use std::sync::Arc;
+
+use alloy::primitives::{Address, FixedBytes, Signature, U256};
 use async_trait::async_trait;
-use bloom_keystore::{Keystore, KeystoreError, WalletKind};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use bloom_paid_http::{
-    NormalizedChallenge, PaidHttpChainRpcResolver, ParsedRequest, PaymentRequirement,
-    networks_equivalent,
+    NormalizedChallenge, PaidHttpChainRpcResolver, PaidHttpHostSigner, PaidHttpSigningFacts,
+    ParsedRequest, PaymentRequirement, networks_equivalent,
 };
 use serde_json::json;
+use x402_chain_eip155::v1_eip155_exact::SignerLike;
 use x402_chain_eip155::{V1Eip155ExactClient, V2Eip155ExactClient};
 use x402_types::proto::{self, OriginalJson};
 use x402_types::scheme::client::X402SchemeClient;
 use x402_types::util::Base64Bytes;
+
+/// The `sign-hash` intent string every x402 host signature is authorized under.
+pub const X402_SIGN_INTENT: &str = "x402.sign";
 
 #[async_trait]
 pub trait X402PaymentSigner: Send + Sync {
@@ -28,6 +43,13 @@ pub struct X402SignContext<'a> {
     pub challenge: &'a NormalizedChallenge,
     pub requirement: &'a PaymentRequirement,
     pub rpc_resolver: &'a dyn PaidHttpChainRpcResolver,
+    /// EVM owner address of `wallet` (public; fills the x402 `from` field).
+    pub wallet_address: Address,
+    /// Host signing seam. Signing is gated on a live paid-HTTP Sealed Approval
+    /// grant and never exposes key material to this crate.
+    pub host_signer: &'a Arc<dyn PaidHttpHostSigner>,
+    /// Secret-free facts recorded in the host `SigningAttestation`.
+    pub facts: &'a PaidHttpSigningFacts,
 }
 
 pub struct X402PaymentCredential {
@@ -39,39 +61,72 @@ pub struct X402PaymentCredential {
     pub public_metadata: serde_json::Value,
 }
 
-pub struct KeystoreX402PaymentSigner {
-    keystore: Keystore,
+/// Adapter that satisfies the upstream x402 [`SignerLike`] contract by routing
+/// the EIP-712 digest through the Bloom host signing seam. Cloneable (the x402
+/// clients require `Clone`); the clone is a cheap `Arc` bump.
+#[derive(Clone)]
+struct HostSignerAdapter {
+    host: Arc<dyn PaidHttpHostSigner>,
+    address: Address,
+    facts: Arc<PaidHttpSigningFacts>,
 }
 
-impl KeystoreX402PaymentSigner {
-    pub fn new(keystore: Keystore) -> Self {
-        Self { keystore }
+#[async_trait]
+impl SignerLike for HostSignerAdapter {
+    fn address(&self) -> Address {
+        self.address
+    }
+
+    async fn sign_hash(&self, hash: &FixedBytes<32>) -> Result<Signature, alloy::signers::Error> {
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(hash.as_slice());
+        let sig65 = self
+            .host
+            .sign_paid_http_hash(X402_SIGN_INTENT, digest, &self.facts)
+            .await
+            .map_err(alloy::signers::Error::message)?;
+        Signature::from_raw(&sig65).map_err(alloy::signers::Error::message)
+    }
+}
+
+/// x402 payment signer backed by the Bloom host signing seam.
+///
+/// Stateless: the per-request host signer, wallet address, and attestation
+/// facts arrive on the [`X402SignContext`], so the same instance serves every
+/// request without holding a keystore or any key material.
+#[derive(Default)]
+pub struct HostX402PaymentSigner;
+
+impl HostX402PaymentSigner {
+    pub fn new() -> Self {
+        Self
     }
 }
 
 #[async_trait]
-impl X402PaymentSigner for KeystoreX402PaymentSigner {
+impl X402PaymentSigner for HostX402PaymentSigner {
     async fn sign_x402_payment(
         &self,
         ctx: &X402SignContext<'_>,
     ) -> Result<X402PaymentCredential, String> {
-        let signer = self
-            .keystore
-            .signer(ctx.wallet)
-            .map_err(|e| x402_keystore_signer_error(ctx.wallet, &self.keystore, e))?;
-        let info = self
-            .keystore
-            .info(ctx.wallet)
-            .map_err(|e| format!("x402 signer wallet metadata unavailable: {e}"))?;
         let payment_required = parse_payment_required(ctx.challenge)?;
+        let adapter = HostSignerAdapter {
+            host: ctx.host_signer.clone(),
+            address: ctx.wallet_address,
+            facts: Arc::new(ctx.facts.clone()),
+        };
         let candidate =
-            select_candidate(&payment_required, signer, ctx.requirement)?.ok_or_else(|| {
+            select_candidate(&payment_required, adapter, ctx.requirement)?.ok_or_else(|| {
                 "x402 upstream signer found no matching selected payment option".to_string()
             })?;
+        // `candidate.sign()` computes the EIP-712 digest and calls back into the
+        // host seam (which enforces the grant and consumes exactly one signature
+        // allowance), then assembles the header value from the returned
+        // signature.
         let header_value = candidate
             .sign()
             .await
-            .map_err(|e| format!("x402 upstream signing failed: {e}"))?;
+            .map_err(|e| format!("x402 host signing failed: {e}"))?;
         let header_name = match payment_required {
             proto::PaymentRequired::V1(_) => "X-Payment",
             proto::PaymentRequired::V2(_) => "Payment-Signature",
@@ -83,10 +138,9 @@ impl X402PaymentSigner for KeystoreX402PaymentSigner {
             header_name,
             header_value,
             public_metadata: json!({
-                "signer_backend": "x402-chain-eip155",
+                "signer_backend": "x402-chain-eip155/host-signing",
                 "wallet": ctx.wallet,
-                "wallet_kind": wallet_kind_label(info.kind),
-                "address": info.address.to_string(),
+                "address": ctx.wallet_address.to_string(),
                 "scheme": candidate.scheme,
                 "x402_version": candidate.x402_version,
                 "network": candidate.chain_id.to_string(),
@@ -100,6 +154,15 @@ impl X402PaymentSigner for KeystoreX402PaymentSigner {
             }),
         })
     }
+}
+
+/// Decode a base64 secp256k1 signature returned by the host into 65 raw bytes.
+pub fn decode_host_signature_b64(signature_b64: &str) -> Result<[u8; 65], String> {
+    let bytes = B64
+        .decode(signature_b64)
+        .map_err(|e| format!("decode host signature: {e}"))?;
+    <[u8; 65]>::try_from(bytes.as_slice())
+        .map_err(|_| format!("host signature is {} bytes, expected 65", bytes.len()))
 }
 
 fn parse_payment_required(
@@ -123,11 +186,14 @@ fn parse_payment_required(
     Ok(proto::PaymentRequired::V1(parsed))
 }
 
-fn select_candidate(
+fn select_candidate<S>(
     payment_required: &proto::PaymentRequired,
-    signer: std::sync::Arc<alloy::signers::local::PrivateKeySigner>,
+    signer: S,
     requirement: &PaymentRequirement,
-) -> Result<Option<x402_types::scheme::client::PaymentCandidate>, String> {
+) -> Result<Option<x402_types::scheme::client::PaymentCandidate>, String>
+where
+    S: SignerLike + Clone + Send + Sync + 'static,
+{
     let mut candidates = V2Eip155ExactClient::new(signer.clone()).accept(payment_required);
     candidates.extend(V1Eip155ExactClient::new(signer).accept(payment_required));
     for candidate in candidates {
@@ -178,28 +244,6 @@ fn eip155_chain_id_u64(chain_id: &x402_types::chain::ChainId) -> Option<u64> {
     (chain_id.namespace() == "eip155")
         .then(|| chain_id.reference().parse().ok())
         .flatten()
-}
-
-fn wallet_kind_label(kind: WalletKind) -> &'static str {
-    match kind {
-        WalletKind::Local => "local",
-        WalletKind::Watch => "watch",
-        WalletKind::PasskeyGated => "passkey",
-    }
-}
-
-fn x402_keystore_signer_error(wallet: &str, keystore: &Keystore, err: KeystoreError) -> String {
-    match err {
-        KeystoreError::Locked(_) => match keystore.info(wallet).map(|i| i.kind) {
-            Ok(WalletKind::PasskeyGated) => format!(
-                "wallet '{wallet}' is locked; passkey wallets must be foreground-unlocked with unlock_passkey before confirming this paid request"
-            ),
-            _ => format!(
-                "wallet '{wallet}' is locked; unlock the wallet before confirming this paid request"
-            ),
-        },
-        other => format!("x402 keystore signer unavailable for wallet '{wallet}': {other}"),
-    }
 }
 
 #[cfg(test)]

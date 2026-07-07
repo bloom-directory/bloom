@@ -721,20 +721,14 @@ impl HyperliquidHandler {
                 return Err(HandlerError::backend(msg));
             }
         };
-        let now = u128::from(approve_agent.nonce);
-        let mut session = HyperliquidSession::new(
-            id.clone(),
-            wallet.to_string(),
-            approve_agent.agent_address.clone(),
+        let session_started_ms = bloom_hyperliquid::now_ms();
+        let session = hyperliquid_session_after_approval(
+            &id,
+            wallet,
+            &approve_agent,
             policy,
-            snapshot.account_value,
-            now,
-        );
-        session.update_risk(
-            snapshot.account_value,
-            snapshot.unrealized_loss.unwrap_or(0),
-            snapshot.open_orders,
-            snapshot.open_positions,
+            &snapshot,
+            session_started_ms,
         );
         let active = ActiveHlSession {
             network: network_name.to_string(),
@@ -746,7 +740,7 @@ impl HyperliquidHandler {
             cleanup_started_ms: None,
             cleanup_completed_ms: None,
             last_cleanup_error: None,
-            last_snapshot_ok_ms: Some(approve_agent.nonce),
+            last_snapshot_ok_ms: Some(session_started_ms),
             stale_since_ms: None,
             agent_key_persisted,
         };
@@ -4687,6 +4681,31 @@ fn approve_agent_action_and_hash_for_pending(
     Ok((action, hash))
 }
 
+fn hyperliquid_session_after_approval(
+    id: &str,
+    wallet: &str,
+    approve_agent: &PendingApproveAgent,
+    policy: HyperliquidPolicy,
+    snapshot: &HlSnapshot,
+    session_started_ms: u64,
+) -> HyperliquidSession {
+    let mut session = HyperliquidSession::new(
+        id,
+        wallet,
+        approve_agent.agent_address.clone(),
+        policy,
+        snapshot.account_value,
+        u128::from(session_started_ms),
+    );
+    session.update_risk(
+        snapshot.account_value,
+        snapshot.unrealized_loss.unwrap_or(0),
+        snapshot.open_orders,
+        snapshot.open_positions,
+    );
+    session
+}
+
 fn extend_safe_dir_names(
     names: &mut BTreeSet<String>,
     dir: &std::path::Path,
@@ -5393,6 +5412,54 @@ mod tests {
             action.daemon_terms.extra["hyperliquid.expected_signing_facts"],
             binding.facts
         );
+    }
+
+    #[test]
+    fn agent_session_lifecycle_starts_after_approval_completion() {
+        let approve_agent = PendingApproveAgent {
+            schema: APPROVE_AGENT_PENDING_SCHEMA.into(),
+            network: "testnet".into(),
+            wallet: "trader".into(),
+            session_id: "session-1".into(),
+            agent_address: "0x000000000000000000000000000000000000a9e7".into(),
+            agent_name: "desk-bot".into(),
+            vault_address: None,
+            nonce: 1_000,
+            hyperliquid_chain: "Testnet".into(),
+            signature_chain_id: "0x66eee".into(),
+        };
+        let policy = HyperliquidPolicy {
+            allowed_assets: std::collections::BTreeSet::from(["BTC".to_string()]),
+            max_notional_usd: Some(100_000_000),
+            max_position_usd: Some(500_000_000),
+            max_loss_usd: Some(50_000_000),
+            max_session_secs: Some(60),
+            ..Default::default()
+        };
+        let snapshot = HlSnapshot {
+            account_value: Some(1_000_000_000),
+            unrealized_loss: Some(2_000_000),
+            positions: std::collections::HashMap::new(),
+            positions_readable: true,
+            resting_notional: Some(std::collections::HashMap::new()),
+            open_orders: 1,
+            open_positions: 2,
+        };
+
+        let session = hyperliquid_session_after_approval(
+            "session-1",
+            "trader",
+            &approve_agent,
+            policy,
+            &snapshot,
+            300_000,
+        );
+
+        assert_eq!(session.created_ms, 300_000);
+        assert_eq!(session.expires_ms, 360_000);
+        assert_eq!(session.unrealized_loss_micro, 2_000_000);
+        assert_eq!(session.open_orders, 1);
+        assert_eq!(session.open_positions, 2);
     }
 
     #[tokio::test]

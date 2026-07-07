@@ -392,6 +392,68 @@ impl PetalHost for KeystorePetalHost {
                 )
                 .await;
         }
+        if attestation.petal_id == bloom_auth_api::petal_identity::PETAL_ID_PAID_HTTP {
+            if attestation.intent != request.intent {
+                return self
+                    .deny(
+                        "petal.sign.deny",
+                        Some(request.wallet.clone()),
+                        Some(request.action_id.clone()),
+                        "attestation intent does not match sign-hash request intent",
+                        Some(serde_json::json!({
+                            "request_intent": request.intent,
+                            "attestation_intent": attestation.intent,
+                        })),
+                    )
+                    .await;
+            }
+            if attestation_fact_str(attestation, "wallet") != Some(request.wallet.as_str()) {
+                return self
+                    .deny(
+                        "petal.sign.deny",
+                        Some(request.wallet.clone()),
+                        Some(request.action_id.clone()),
+                        "attestation wallet does not match sign-hash request wallet",
+                        None,
+                    )
+                    .await;
+            }
+            if attestation_fact_str(attestation, "action_id") != Some(request.action_id.as_str()) {
+                return self
+                    .deny(
+                        "petal.sign.deny",
+                        Some(request.wallet.clone()),
+                        Some(request.action_id.clone()),
+                        "attestation action_id does not match sign-hash request action_id",
+                        None,
+                    )
+                    .await;
+            }
+            if !attestation_signing_hash_matches(attestation, &request.hash_hex) {
+                return self
+                    .deny(
+                        "petal.sign.deny",
+                        Some(request.wallet.clone()),
+                        Some(request.action_id.clone()),
+                        "attestation signing_hash does not match sign-hash request hash",
+                        None,
+                    )
+                    .await;
+            }
+            if attestation_fact_str(attestation, "policy_snapshot_digest")
+                != Some(grant.petal_policy_digest.as_str())
+            {
+                return self
+                    .deny(
+                        "petal.sign.deny",
+                        Some(request.wallet.clone()),
+                        Some(request.action_id.clone()),
+                        "attestation policy_snapshot_digest does not match the sealed grant",
+                        None,
+                    )
+                    .await;
+            }
+        }
         if let Err(message) =
             validate_required_grant_terms(&grant.daemon_terms, &request, attestation)
         {
@@ -641,6 +703,23 @@ fn validate_required_grant_terms(
         }
     }
     Ok(())
+}
+
+fn attestation_fact_str<'a>(attestation: &'a SigningAttestation, key: &str) -> Option<&'a str> {
+    attestation.facts.get(key).and_then(|v| v.as_str())
+}
+
+fn attestation_signing_hash_matches(attestation: &SigningAttestation, request_hash: &str) -> bool {
+    let Some(attested) = attestation_fact_str(attestation, "signing_hash") else {
+        return false;
+    };
+    strip_0x(attested).eq_ignore_ascii_case(strip_0x(request_hash))
+}
+
+fn strip_0x(s: &str) -> &str {
+    s.strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s)
 }
 
 // `SealedApprovalGrant` must remain in scope for downstream use (the host

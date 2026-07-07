@@ -436,11 +436,18 @@ async fn complete(
     );
     daemon.signer_cache.prune_expired(now);
 
-    // Persist approval.json as an audit artifact beside EVM outbox challenges.
-    // Hyperliquid mounted-VFS approvals are grant-backed: the retry path checks
-    // the live grant store and signs through PetalHost, so there is no EVM
-    // outbox artifact to write here.
-    if action.surface() != "hyperliquid"
+    // Whether this sealed action broadcasts an EVM transaction. Only broadcast
+    // actions have a chain, a per-wallet outbox entry, and a tx to execute.
+    // Non-broadcast first-party actions (wallet-policy updates, policy-session
+    // mints) have none of these — the minted grant is their authorization, and
+    // they are installed by retrying their own mounted write. So we route the
+    // outbox-only tx-engine persistence/execution below only for broadcasts;
+    // calling into the tx engine for a non-tx action would be a layering error
+    // (and previously failed with "missing chain_name", revoking the grant).
+    let is_broadcast = action.chain_name().is_some();
+
+    // Persist approval.json into the outbox projection — broadcast actions only.
+    if is_broadcast
         && let Err(e) = daemon
             .tx_engine
             .persist_outbox_ceremony_approval(&action, &signed)
@@ -455,7 +462,18 @@ async fn complete(
     // grant + execute: broadcast immediately from sealed bytes.
     let mut executed = false;
     let mut tx_hash: Option<String> = None;
-    if execute {
+    // For a non-broadcast action, "approve + execute" is equivalent to "approve":
+    // mint the grant and let the caller retry the write. Failing here would
+    // revoke the valid grant.
+    let broadcastable = execute && is_broadcast;
+    if execute && !broadcastable {
+        tracing::info!(
+            wallet = %wallet,
+            action_id = %action.action_id(),
+            "ceremony.execute.non_broadcast_action: grant minted, install happens on write retry"
+        );
+    }
+    if broadcastable {
         // The chain registry is keyed by the human chain name ("base"), not the
         // CAIP-2 `network` header ("eip155:8453"), so resolve it from the sealed
         // policy snapshot rather than the header.
