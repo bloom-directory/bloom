@@ -1778,11 +1778,12 @@ impl HyperliquidHandler {
         checks: &[bloom_proto::PolicyCheck],
     ) -> Result<u64, UsdSendPrepareError> {
         let envelope = hyperliquid_usd_send_envelope(network, wallet, pending, checks)?;
+        let plan = hyperliquid_usd_send_plan(network, wallet, pending, checks);
         let action = hyperliquid_sealed_action(
             envelope,
             AssuranceLevel::Standard,
             HYPERLIQUID_USD_SEND_SIGN_INTENT,
-            "Approve Hyperliquid usdSend",
+            &plan,
         )?;
         let staged = self
             .auth_services
@@ -1915,11 +1916,12 @@ impl HyperliquidHandler {
         policy: &HyperliquidPolicy,
     ) -> Result<(), AgentSessionPrepareError> {
         let envelope = hyperliquid_agent_session_envelope(pending, policy)?;
+        let plan = hyperliquid_agent_session_plan(pending, policy);
         let action = hyperliquid_sealed_action(
             envelope,
             AssuranceLevel::Hardened,
             HYPERLIQUID_APPROVE_AGENT_SIGN_INTENT,
-            "Approve Hyperliquid agent session",
+            &plan,
         )?;
         let now = now_ms_u64();
         let staged = self
@@ -4366,6 +4368,86 @@ fn hyperliquid_usd_send_envelope(
     ))
 }
 
+fn hyperliquid_usd_send_plan(
+    network: &str,
+    wallet: &str,
+    pending: &PendingUsdSend,
+    checks: &[bloom_proto::PolicyCheck],
+) -> String {
+    let mut plan = format!(
+        "Approve Hyperliquid usdSend\n\nNetwork: {network}\nWallet: {wallet}\nDestination: {}\nAmount: {} USDC\nNonce: {}",
+        pending.destination, pending.amount, pending.nonce
+    );
+
+    if !checks.is_empty() {
+        plan.push_str("\n\nPolicy checks:");
+        for check in checks {
+            plan.push_str(&format!(
+                "\n- {}: {:?} - {}",
+                check.rule, check.outcome, check.message
+            ));
+        }
+    }
+
+    plan
+}
+
+fn hyperliquid_agent_session_plan(
+    pending: &PendingApproveAgent,
+    policy: &HyperliquidPolicy,
+) -> String {
+    let trading_target = pending.vault_address.as_deref().unwrap_or("master wallet");
+    format!(
+        "Approve Hyperliquid agent session\n\nNetwork: {}\nWallet: {}\nSession id: {}\nAgent address: {}\nAgent name: {}\nTrading target: {}\nNonce: {}\nHyperliquid chain: {}\nSignature chain id: {}\n\nApproved bounds:\n- Allowed assets: {}\n- Allowed order types: {}\n- Max order notional: {}\n- Max position per asset: {}\n- Max loss: {}\n- Max leverage: {}\n- Max session duration: {}\n- Vault/subaccount writes: {}\n- Reduce-only orders: {}\n- Trigger orders: {}\n- TWAP orders: {}\n- Builder fees: {}",
+        pending.network,
+        pending.wallet,
+        pending.session_id,
+        pending.agent_address,
+        pending.agent_name,
+        trading_target,
+        pending.nonce,
+        pending.hyperliquid_chain,
+        pending.signature_chain_id,
+        format_set_or_unrestricted(&policy.allowed_assets),
+        format_set_or_unrestricted(&policy.allowed_order_types),
+        format_micro_usd(policy.max_notional_usd),
+        format_micro_usd(policy.max_position_usd),
+        format_micro_usd(policy.max_loss_usd),
+        policy
+            .max_leverage
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unset".to_string()),
+        policy
+            .max_session_secs
+            .map(|value| format!("{value} seconds"))
+            .unwrap_or_else(|| "unset".to_string()),
+        permission_label(policy.allow_vault_or_subaccount),
+        permission_label(policy.allow_reduce_only),
+        permission_label(policy.allow_trigger_orders),
+        permission_label(policy.allow_twap),
+        permission_label(policy.allow_builder_fees),
+    )
+}
+
+fn format_set_or_unrestricted(values: &BTreeSet<String>) -> String {
+    if values.is_empty() {
+        "unrestricted".to_string()
+    } else {
+        values.iter().cloned().collect::<Vec<_>>().join(", ")
+    }
+}
+
+fn format_micro_usd(value: Option<u64>) -> String {
+    match value {
+        Some(value) => format!("{}.{:06} USD", value / 1_000_000, value % 1_000_000),
+        None => "unset".to_string(),
+    }
+}
+
+fn permission_label(allowed: bool) -> &'static str {
+    if allowed { "allowed" } else { "denied" }
+}
+
 fn hyperliquid_sealed_action(
     envelope: CanonicalEnvelope,
     assurance: AssuranceLevel,
@@ -5059,6 +5141,83 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, HandlerError::Unsupported(_)), "{err}");
         assert!(err.to_string().contains("Sealed Approval"), "{err}");
+    }
+
+    #[test]
+    fn usd_send_plan_includes_concrete_review_details() {
+        let pending = PendingUsdSend {
+            destination: "0x0000000000000000000000000000000000000001".into(),
+            amount: "16".into(),
+            nonce: 1_234,
+        };
+        let checks = [bloom_proto::PolicyCheck::for_venue(
+            "hyperliquid",
+            "usd_send.destination_allowlist",
+            bloom_proto::PolicyOutcome::Pass,
+            "destination is allowed",
+        )];
+
+        let plan = hyperliquid_usd_send_plan("mainnet", "trader", &pending, &checks);
+
+        assert!(plan.contains("Approve Hyperliquid usdSend"));
+        assert!(plan.contains("Network: mainnet"));
+        assert!(plan.contains("Wallet: trader"));
+        assert!(plan.contains(&pending.destination));
+        assert!(plan.contains("Amount: 16 USDC"));
+        assert!(plan.contains("Nonce: 1234"));
+        assert!(plan.contains("hyperliquid.usd_send.destination_allowlist"));
+        assert!(plan.contains("destination is allowed"));
+    }
+
+    #[test]
+    fn agent_session_plan_includes_authority_and_bounds() {
+        let pending = PendingApproveAgent {
+            schema: APPROVE_AGENT_PENDING_SCHEMA.into(),
+            network: "testnet".into(),
+            wallet: "trader".into(),
+            session_id: "session-1".into(),
+            agent_address: "0x000000000000000000000000000000000000a9e7".into(),
+            agent_name: "desk-bot".into(),
+            vault_address: Some("0x0000000000000000000000000000000000000002".into()),
+            nonce: 9_876,
+            hyperliquid_chain: "Testnet".into(),
+            signature_chain_id: "0x66eee".into(),
+        };
+        let policy = HyperliquidPolicy {
+            allowed_assets: std::collections::BTreeSet::from([
+                "BTC".to_string(),
+                "ETH".to_string(),
+            ]),
+            allowed_order_types: std::collections::BTreeSet::from(["limit".to_string()]),
+            max_notional_usd: Some(100_000_000),
+            max_position_usd: Some(500_000_000),
+            max_loss_usd: Some(50_000_000),
+            max_leverage: Some(3),
+            max_session_secs: Some(600),
+            allow_trigger_orders: false,
+            ..Default::default()
+        };
+
+        let plan = hyperliquid_agent_session_plan(&pending, &policy);
+
+        assert!(plan.contains("Approve Hyperliquid agent session"));
+        assert!(plan.contains("Network: testnet"));
+        assert!(plan.contains("Wallet: trader"));
+        assert!(plan.contains("Session id: session-1"));
+        assert!(plan.contains(&pending.agent_address));
+        assert!(plan.contains("Agent name: desk-bot"));
+        assert!(plan.contains("Trading target: 0x0000000000000000000000000000000000000002"));
+        assert!(plan.contains("Nonce: 9876"));
+        assert!(plan.contains("Hyperliquid chain: Testnet"));
+        assert!(plan.contains("Signature chain id: 0x66eee"));
+        assert!(plan.contains("Allowed assets: BTC, ETH"));
+        assert!(plan.contains("Allowed order types: limit"));
+        assert!(plan.contains("Max order notional: 100.000000 USD"));
+        assert!(plan.contains("Max position per asset: 500.000000 USD"));
+        assert!(plan.contains("Max loss: 50.000000 USD"));
+        assert!(plan.contains("Max leverage: 3"));
+        assert!(plan.contains("Max session duration: 600 seconds"));
+        assert!(plan.contains("Trigger orders: denied"));
     }
 
     #[tokio::test]
