@@ -320,8 +320,7 @@ a mix.
 
 ## Current Implementation Notes
 
-The current `feat/mounted-sealed-approval-demo` branch does not yet fully match
-this target layout. In particular, the current passkey keystore path still uses
+The current codebase does not yet fully match this target layout. In particular, the current passkey keystore path still uses
 one wallet-level `passkey.json` and one wallet-level `prf.salt`, with no
 `credentials/<credential_id>/wrapped_dek` directory and no wallet DEK fan-out
 across multiple credentials.

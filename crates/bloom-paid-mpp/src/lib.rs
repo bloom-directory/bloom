@@ -273,32 +273,30 @@ async fn prepare_session_credential(
         .map_err(|_| mpp::MppError::InvalidConfig("invalid RPC URL".to_string()))?;
     let provider = ProviderBuilder::new_with_network::<TempoNetwork>().connect_http(rpc_url);
 
-    if let Some(cid_str) = session_req.channel_id() {
-        if let Ok(channel_id) = cid_str.parse::<B256>() {
-            if let Some(mut recovered) = try_recover_channel(
-                &provider,
-                escrow_contract,
-                channel_id,
-                chain_id,
-                payer,
-                payee,
-                currency,
-                payer,
-            )
-            .await
-            {
-                recovered.cumulative_amount += amount;
-                let payload = create_voucher_payload(
-                    signer,
-                    recovered.channel_id,
-                    recovered.cumulative_amount,
-                    escrow_contract,
-                    chain_id,
-                )
-                .await?;
-                return Ok(build_credential(challenge, payload, chain_id, payer));
-            }
-        }
+    if let Some(cid_str) = session_req.channel_id()
+        && let Ok(channel_id) = cid_str.parse::<B256>()
+        && let Some(mut recovered) = try_recover_channel(
+            &provider,
+            escrow_contract,
+            channel_id,
+            chain_id,
+            payer,
+            payee,
+            currency,
+            payer,
+        )
+        .await
+    {
+        recovered.cumulative_amount += amount;
+        let payload = create_voucher_payload(
+            signer,
+            recovered.channel_id,
+            recovered.cumulative_amount,
+            escrow_contract,
+            chain_id,
+        )
+        .await?;
+        return Ok(build_credential(challenge, payload, chain_id, payer));
     }
 
     let deposit = resolve_session_deposit(session_req.suggested_deposit.as_deref(), max_deposit)?;
