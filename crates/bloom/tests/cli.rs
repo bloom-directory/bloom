@@ -294,7 +294,7 @@ fn vfs_ls_status_lists_known_files() {
         .assert()
         .success();
     let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
-    for required in ["version", "uptime", "started_at", "home", "chains", "audit"] {
+    for required in ["version", "uptime", "started_at", "chains", "audit"] {
         assert!(
             out.lines().any(|l| l.starts_with(required)),
             "expected `{required}` in vfs ls /status, got:\n{out}"

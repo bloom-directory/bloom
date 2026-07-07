@@ -185,7 +185,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Show daemon status (chains configured, version, home dir).
+    /// Show daemon status (chains configured, version, uptime).
     Status,
     /// VFS path operations (no NFS mount required).
     #[command(subcommand)]
