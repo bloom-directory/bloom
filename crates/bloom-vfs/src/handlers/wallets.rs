@@ -1630,8 +1630,24 @@ impl WalletsHandler {
                 3 if self.policy_updates_dir(wallet).join(&segs[2]).is_dir() => {
                     Ok(Entry::dir(&segs[2]))
                 }
-                4 if matches!(segs[3].as_str(), "approval_challenge.json" | "status.json") => {
-                    Ok(Entry::file(&segs[3]))
+                4 if segs[3] == "status.json" => {
+                    let action_dir = self.policy_updates_dir(wallet).join(&segs[2]);
+                    if action_dir.is_dir() {
+                        Ok(Entry::file("status.json"))
+                    } else {
+                        Err(HandlerError::not_found(path.to_string_path()))
+                    }
+                }
+                4 if segs[3] == APPROVAL_CHALLENGE_FILE => {
+                    let challenge_path = self
+                        .policy_updates_dir(wallet)
+                        .join(&segs[2])
+                        .join(APPROVAL_CHALLENGE_FILE);
+                    if challenge_path.is_file() {
+                        Ok(Entry::file(APPROVAL_CHALLENGE_FILE))
+                    } else {
+                        Err(HandlerError::not_found(path.to_string_path()))
+                    }
                 }
                 _ => Err(HandlerError::not_found(path.to_string_path())),
             },
@@ -4510,6 +4526,17 @@ mod tests {
         assert!(names.contains(&"approval_challenge.json"), "{names:?}");
         assert!(names.contains(&"status.json"), "{names:?}");
 
+        for leaf in ["status.json", APPROVAL_CHALLENGE_FILE] {
+            let entry = f
+                .handler
+                .lookup(
+                    &VfsPath::parse(&format!("/alice/policy-updates/{action_id}/{leaf}")).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(entry.name, leaf);
+        }
+
         // The raw challenge parses and carries a ceremony_url.
         let challenge_bytes = f
             .handler
@@ -4575,6 +4602,58 @@ mod tests {
                 "challenge leaked `{needle}`: {challenge_str}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn wallet_policy_update_lookup_rejects_missing_action_artifacts() {
+        let f = make_handler();
+
+        for leaf in ["status.json", APPROVAL_CHALLENGE_FILE] {
+            let path = VfsPath::parse(&format!("/alice/policy-updates/missing/{leaf}")).unwrap();
+            let result = f.handler.lookup(&path).await;
+            assert!(
+                matches!(result, Err(HandlerError::NotFound(_))),
+                "lookup should reject missing action artifact {leaf}: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wallet_policy_update_lookup_requires_challenge_file() {
+        let f = make_handler();
+        let action_id = "policy-no-challenge";
+        std::fs::create_dir_all(
+            f.handler
+                .keystore
+                .root()
+                .join("alice")
+                .join("policy-updates")
+                .join(action_id),
+        )
+        .unwrap();
+
+        let status = f
+            .handler
+            .lookup(
+                &VfsPath::parse(&format!("/alice/policy-updates/{action_id}/status.json")).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.name, "status.json");
+
+        let challenge = f
+            .handler
+            .lookup(
+                &VfsPath::parse(&format!(
+                    "/alice/policy-updates/{action_id}/{APPROVAL_CHALLENGE_FILE}"
+                ))
+                .unwrap(),
+            )
+            .await;
+        assert!(
+            matches!(challenge, Err(HandlerError::NotFound(_))),
+            "lookup should reject missing challenge file: {challenge:?}"
+        );
     }
 
     /// A validly-signed on-disk policy that changes after the update is staged
