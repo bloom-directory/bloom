@@ -192,6 +192,46 @@ Forbidden paths:
 - marker files such as `.confirm_approved.json` or `review_approved.json`;
 - persisting grants, PRF output, wallet DEK, or decrypted owner key bytes.
 
+## Wallet Policy Editing (mounted, Sealed Approval)
+
+For a passkey wallet, `policy.toml` is signed authorization state guarded by
+`policy.toml.sig`. The first-party edit surface is the mounted VFS path
+`/wallets/<wallet>/policy.toml`; editing it is a Sealed Approval action.
+
+Flow:
+
+1. The agent writes proposed policy bytes to `/wallets/<wallet>/policy.toml`.
+   The write first passes the standard signed-policy check (`Keystore::info`),
+   so a wallet whose current signature is already stale fails closed here and is
+   never used as a baseline for a new edit.
+2. Bloom stages a canonical `policy_update` Sealed Approval action whose subject
+   carries the wallet, VFS path, current signed policy bytes, proposed policy
+   bytes, and a normalized authority diff. The action id is bound to
+   `blake3(old_policy)` and `blake3(proposed_policy)`; authority-expanding edits
+   require hardened assurance.
+3. With no live grant, the first write issues an `approval_challenge.json` (with
+   a projected `ceremony_url`) and returns permission denied.
+4. The challenge and a `status.json` view are reachable through the mount at
+   `/wallets/<wallet>/policy-updates/<action_id>/`, so the agent never needs
+   `BLOOM_HOME` access. These are read-only views: bounded challenge metadata and
+   `ceremony_url` only — never the signed approval, grant, or key/PRF material.
+5. Approval mints a one-shot grant. The grant is keyed to the sealed action id,
+   which is bound to `blake3(proposed_policy)`, so only the exact approved
+   proposed bytes can consume it — a retry with different bytes re-derives a new
+   action id and finds no grant. On the approved retry Bloom also requires the
+   current on-disk policy to still match the sealed baseline (otherwise it
+   refuses and requires a fresh edit), signs through the host signer, writes
+   `policy.toml.sig`, then installs `policy.toml` — the wallet is never left with
+   a new policy lacking a matching signature.
+
+Local (passphrase) wallets keep immediate policy writes with no ceremony.
+
+Out of scope: direct edits to `BLOOM_HOME/keystore/<wallet>/policy.toml` are
+unsupported by this flow. If such an edit breaks `policy.toml.sig`, the wallet
+fails closed on every signed path and is not repaired here; recovery uses the
+admin helper `bloom wallet sign-policy <wallet>`. `write_unlocked` remains
+disabled as a passkey signing lane.
+
 ## Multi-Passkey Operations
 
 Credential changes are authority changes. They must be staged as Sealed Approval
@@ -280,8 +320,7 @@ a mix.
 
 ## Current Implementation Notes
 
-The current `feat/mounted-sealed-approval-demo` branch does not yet fully match
-this target layout. In particular, the current passkey keystore path still uses
+The current codebase does not yet fully match this target layout. In particular, the current passkey keystore path still uses
 one wallet-level `passkey.json` and one wallet-level `prf.salt`, with no
 `credentials/<credential_id>/wrapped_dek` directory and no wallet DEK fan-out
 across multiple credentials.

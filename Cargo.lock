@@ -2689,6 +2689,7 @@ dependencies = [
 name = "bloom-paid-http"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "bloom-proto",
  "mpp",
@@ -2703,14 +2704,15 @@ dependencies = [
 name = "bloom-paid-mpp"
 version = "0.1.0"
 dependencies = [
+ "alloy 2.0.5",
  "async-trait",
- "bloom-keystore",
  "bloom-paid-http",
  "bloom-proto",
  "bloom-tools",
  "mpp",
  "reqwest 0.12.28",
  "serde_json",
+ "tempo-alloy",
  "tokio",
 ]
 
@@ -2720,7 +2722,7 @@ version = "0.1.0"
 dependencies = [
  "alloy 2.0.5",
  "async-trait",
- "bloom-keystore",
+ "base64 0.22.1",
  "bloom-paid-http",
  "reqwest 0.12.28",
  "serde_json",

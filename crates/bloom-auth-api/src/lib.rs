@@ -37,6 +37,13 @@ pub const EVM_SEALED_INTENT_SUBJECT_KIND: &str = "evm_wallet_tx";
 pub const EVM_SIGNING_ATTESTATION_FACTS_SCHEMA_V1: &str = "bloom.evm.signing_facts.v1";
 /// EVM wallet signing intent.
 pub const EVM_TX_SIGN_INTENT: &str = "evm.tx.sign";
+/// Typed facts schema embedded in [`SigningAttestation::facts`] for the
+/// paid-HTTP (`paid-http`) signing intents (`x402.sign`, `paid-http.mpp.sign`).
+pub const PAID_HTTP_SIGNING_ATTESTATION_FACTS_SCHEMA_V1: &str = "bloom.paid_http.signing_facts.v1";
+/// Paid-HTTP x402 signing intent.
+pub const PAID_HTTP_X402_SIGN_INTENT: &str = "x402.sign";
+/// Paid-HTTP Tempo MPP signing intent.
+pub const PAID_HTTP_MPP_SIGN_INTENT: &str = "paid-http.mpp.sign";
 /// Schema tag for [`CanonicalEnvelope`].
 ///
 /// v2: the canonical header gained Petal identity (`petal_id`, `petal_digest`,
@@ -2197,8 +2204,129 @@ impl SigningAttestationSchemaRegistry for DefaultAttestationRegistry {
         {
             EvmSigningAttestationFacts::from_attestation(attestation)?;
         }
+        if attestation.petal_id == petal_identity::PETAL_ID_PAID_HTTP
+            && matches!(
+                attestation.intent.as_str(),
+                PAID_HTTP_X402_SIGN_INTENT | PAID_HTTP_MPP_SIGN_INTENT
+            )
+        {
+            validate_paid_http_signing_facts(&attestation.intent, &attestation.facts)?;
+        }
         Ok(())
     }
+}
+
+/// Fetch a required, non-empty string fact for a paid-HTTP attestation.
+fn paid_http_required_str<'a>(
+    facts: &'a BTreeMap<String, serde_json::Value>,
+    key: &str,
+) -> Result<&'a str, AuthApiError> {
+    match facts.get(key) {
+        Some(serde_json::Value::String(s)) if !s.trim().is_empty() => Ok(s.as_str()),
+        _ => Err(AuthApiError::Denied(format!(
+            "paid-http attestation facts must include non-empty string {key}"
+        ))),
+    }
+}
+
+/// Assert an optional paid-HTTP string fact is either absent, null, or a string.
+fn paid_http_optional_str(
+    facts: &BTreeMap<String, serde_json::Value>,
+    key: &str,
+) -> Result<(), AuthApiError> {
+    match facts.get(key) {
+        None | Some(serde_json::Value::Null) | Some(serde_json::Value::String(_)) => Ok(()),
+        Some(_) => Err(AuthApiError::Denied(format!(
+            "paid-http attestation fact {key} must be a string when present"
+        ))),
+    }
+}
+
+/// Shape validation for `(paid-http, x402.sign|paid-http.mpp.sign)` attestation
+/// `facts` (spec §8). This is a trust-boundary shape check only: it asserts the
+/// fact map projected by `RequestsHandler` is well formed and internally
+/// consistent (protocol matches the intent, hashes/digests are well formed). It
+/// does NOT reconstruct the sealed subject or protocol signing digest — that
+/// trust boundary stays with the handler.
+fn validate_paid_http_signing_facts(
+    intent: &str,
+    facts: &BTreeMap<String, serde_json::Value>,
+) -> Result<(), AuthApiError> {
+    let schema = paid_http_required_str(facts, "facts_schema")?;
+    if schema != PAID_HTTP_SIGNING_ATTESTATION_FACTS_SCHEMA_V1 {
+        return Err(AuthApiError::Denied(format!(
+            "unsupported paid-http attestation facts schema {schema}"
+        )));
+    }
+    for key in ["action_id", "wallet", "request_id", "method", "url", "host"] {
+        paid_http_required_str(facts, key)?;
+    }
+    let signing_hash = paid_http_required_str(facts, "signing_hash")?;
+    validate_hash32_hex("signing_hash", signing_hash).map_err(denied_from_invalid)?;
+
+    // `protocol` must be present and must match the signing intent.
+    let protocol = paid_http_required_str(facts, "protocol")?;
+    let expected_protocol = match intent {
+        PAID_HTTP_X402_SIGN_INTENT => "x402",
+        PAID_HTTP_MPP_SIGN_INTENT => "mpp",
+        other => {
+            return Err(AuthApiError::Denied(format!(
+                "unsupported paid-http signing intent {other}"
+            )));
+        }
+    };
+    if protocol != expected_protocol {
+        return Err(AuthApiError::Denied(format!(
+            "paid-http attestation protocol {protocol} does not match intent {intent}"
+        )));
+    }
+
+    // Sealed `/requests` always projects the policy snapshot digest, so require
+    // it as a well-formed digest string.
+    let digest = paid_http_required_str(facts, "policy_snapshot_digest")?;
+    validate_digest_hex("policy_snapshot_digest", digest).map_err(denied_from_invalid)?;
+
+    for key in [
+        "network",
+        "asset",
+        "amount",
+        "pay_to",
+        "resource",
+        "scheme",
+        "charge_id",
+        "session_id",
+        "channel_id",
+    ] {
+        paid_http_optional_str(facts, key)?;
+    }
+
+    match facts.get("chain_id") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Number(n)) if n.as_u64().is_some_and(|v| v > 0) => {}
+        Some(_) => {
+            return Err(AuthApiError::Denied(
+                "paid-http attestation chain_id must be a positive integer when present".into(),
+            ));
+        }
+    }
+
+    // The selected payment requirement is bound for legibility; accept the
+    // staged requirement JSON (object) or an explicit null, but reject an
+    // obviously invalid scalar echo.
+    match facts.get("selected_requirement") {
+        Some(serde_json::Value::Object(_)) | Some(serde_json::Value::Null) => {}
+        None => {
+            return Err(AuthApiError::Denied(
+                "paid-http attestation is missing selected_requirement".into(),
+            ));
+        }
+        Some(_) => {
+            return Err(AuthApiError::Denied(
+                "paid-http attestation selected_requirement must be an object or null".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ── PetalHost (WS-1 host signing API) ────────────────────────────────────────
@@ -4620,6 +4748,14 @@ mod tests {
             );
             let att = if petal_id == PETAL_ID_EVM_WALLET && intent == EVM_TX_SIGN_INTENT {
                 typed_evm_attestation_for_registry()
+            } else if petal_id == PETAL_ID_PAID_HTTP {
+                SigningAttestation {
+                    schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
+                    petal_id: petal_id.into(),
+                    petal_digest: PLACEHOLDER_DIGEST_PAID_HTTP.into(),
+                    intent: intent.into(),
+                    facts: paid_http_facts_for_intent(intent),
+                }
             } else {
                 SigningAttestation {
                     schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
@@ -4670,6 +4806,133 @@ mod tests {
                 .contains("unsupported attestation schema for"),
             "{err}"
         );
+    }
+
+    /// A structurally valid paid-HTTP facts map for the given signing intent,
+    /// mirroring what `RequestsHandler` projects.
+    fn paid_http_facts_for_intent(intent: &str) -> BTreeMap<String, serde_json::Value> {
+        let protocol = if intent == PAID_HTTP_MPP_SIGN_INTENT {
+            "mpp"
+        } else {
+            "x402"
+        };
+        let mut facts = BTreeMap::new();
+        facts.insert(
+            "facts_schema".into(),
+            serde_json::json!(PAID_HTTP_SIGNING_ATTESTATION_FACTS_SCHEMA_V1),
+        );
+        facts.insert("action_id".into(), serde_json::json!("req_1"));
+        facts.insert("wallet".into(), serde_json::json!("my-wallet"));
+        facts.insert("request_id".into(), serde_json::json!("req_1"));
+        facts.insert("method".into(), serde_json::json!("GET"));
+        facts.insert(
+            "url".into(),
+            serde_json::json!("https://api.example.com/paid"),
+        );
+        facts.insert("host".into(), serde_json::json!("api.example.com"));
+        facts.insert("protocol".into(), serde_json::json!(protocol));
+        facts.insert("network".into(), serde_json::json!("base"));
+        facts.insert("chain_id".into(), serde_json::json!(8453));
+        facts.insert("asset".into(), serde_json::json!("USDC"));
+        facts.insert("amount".into(), serde_json::json!("1000000"));
+        facts.insert(
+            "pay_to".into(),
+            serde_json::json!("0x0000000000000000000000000000000000000009"),
+        );
+        facts.insert(
+            "resource".into(),
+            serde_json::json!("https://api.example.com/paid"),
+        );
+        facts.insert("scheme".into(), serde_json::json!("exact"));
+        facts.insert("charge_id".into(), serde_json::Value::Null);
+        facts.insert("session_id".into(), serde_json::Value::Null);
+        facts.insert("channel_id".into(), serde_json::Value::Null);
+        facts.insert(
+            "signing_hash".into(),
+            serde_json::json!(format!("0x{}", "a".repeat(64))),
+        );
+        facts.insert(
+            "policy_snapshot_digest".into(),
+            serde_json::json!("d".repeat(64)),
+        );
+        facts.insert(
+            "selected_requirement".into(),
+            serde_json::json!({"scheme": "exact", "network": protocol}),
+        );
+        facts
+    }
+
+    fn paid_http_attestation_for_intent(intent: &str) -> SigningAttestation {
+        SigningAttestation {
+            schema: SIGNING_ATTESTATION_SCHEMA_V1.into(),
+            petal_id: PETAL_ID_PAID_HTTP.into(),
+            petal_digest: PLACEHOLDER_DIGEST_PAID_HTTP.into(),
+            intent: intent.into(),
+            facts: paid_http_facts_for_intent(intent),
+        }
+    }
+
+    #[test]
+    fn paid_http_registry_accepts_valid_x402_and_mpp_facts() {
+        let r = DefaultAttestationRegistry::new();
+        r.validate_attestation(&paid_http_attestation_for_intent(
+            PAID_HTTP_X402_SIGN_INTENT,
+        ))
+        .unwrap();
+        r.validate_attestation(&paid_http_attestation_for_intent(PAID_HTTP_MPP_SIGN_INTENT))
+            .unwrap();
+    }
+
+    #[test]
+    fn paid_http_registry_rejects_malformed_facts() {
+        let r = DefaultAttestationRegistry::new();
+
+        // Missing required string.
+        let mut att = paid_http_attestation_for_intent(PAID_HTTP_X402_SIGN_INTENT);
+        att.facts.remove("url");
+        let err = r.validate_attestation(&att).unwrap_err();
+        assert!(err.to_string().contains("url"), "{err}");
+
+        // Wrong facts schema.
+        let mut att = paid_http_attestation_for_intent(PAID_HTTP_X402_SIGN_INTENT);
+        att.facts
+            .insert("facts_schema".into(), serde_json::json!("bloom.wrong.v1"));
+        let err = r.validate_attestation(&att).unwrap_err();
+        assert!(err.to_string().contains("facts schema"), "{err}");
+
+        // Protocol does not match the signing intent (x402 facts under the MPP
+        // intent).
+        let mut att = paid_http_attestation_for_intent(PAID_HTTP_MPP_SIGN_INTENT);
+        att.facts
+            .insert("protocol".into(), serde_json::json!("x402"));
+        let err = r.validate_attestation(&att).unwrap_err();
+        assert!(err.to_string().contains("does not match intent"), "{err}");
+
+        // signing_hash is not a 32-byte hex hash.
+        let mut att = paid_http_attestation_for_intent(PAID_HTTP_X402_SIGN_INTENT);
+        att.facts
+            .insert("signing_hash".into(), serde_json::json!("0xdeadbeef"));
+        let err = r.validate_attestation(&att).unwrap_err();
+        assert!(err.to_string().contains("signing_hash"), "{err}");
+
+        // Optional string field present as a non-string.
+        let mut att = paid_http_attestation_for_intent(PAID_HTTP_X402_SIGN_INTENT);
+        att.facts.insert("asset".into(), serde_json::json!(42));
+        let err = r.validate_attestation(&att).unwrap_err();
+        assert!(err.to_string().contains("asset"), "{err}");
+
+        // chain_id present but not a positive integer.
+        let mut att = paid_http_attestation_for_intent(PAID_HTTP_X402_SIGN_INTENT);
+        att.facts.insert("chain_id".into(), serde_json::json!(0));
+        let err = r.validate_attestation(&att).unwrap_err();
+        assert!(err.to_string().contains("chain_id"), "{err}");
+
+        // selected_requirement echoed as a scalar.
+        let mut att = paid_http_attestation_for_intent(PAID_HTTP_X402_SIGN_INTENT);
+        att.facts
+            .insert("selected_requirement".into(), serde_json::json!("nope"));
+        let err = r.validate_attestation(&att).unwrap_err();
+        assert!(err.to_string().contains("selected_requirement"), "{err}");
     }
 
     #[test]

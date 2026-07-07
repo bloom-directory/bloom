@@ -27,15 +27,18 @@ to approve.
 ## The Grant Envelope
 
 A Sealed Approval grant authorizes a single Petal to use bounded signing
-authority. The Bloom Machine structurally enforces the *envelope* of that grant:
+authority for a single sealed action. The Bloom Machine structurally enforces
+the *envelope* of that grant:
 
  - the **wallet** whose key may be used;
  - the **Petal identity** allowed to consume the grant;
+ - the **sealed action** the grant is bound to;
+ - the allowed **signing intents** a request may declare;
  - the maximum **signature count**, `N`;
  - the **expiry**, `T`.
 
 Within a live grant the acting Petal may request up to `N` signatures until `T`.
-These four bounds are the guarantees the Bloom Machine makes, and that no Petal
+These bounds are the guarantees the Bloom Machine makes, and that no Petal
 can exceed.
 
 ## Trust Boundary

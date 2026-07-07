@@ -10,6 +10,62 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use url::Url;
 
+/// Protocol-neutral, secret-free facts describing a single paid-HTTP signing
+/// request. The Bloom runtime turns these into the structured
+/// `SigningAttestation` it records for every host signature (see the Sealed
+/// Approvals architecture). No credential material, PRF output, or raw
+/// signatures are ever carried here — only public request/payment metadata and
+/// digests.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PaidHttpSigningFacts {
+    pub request_id: String,
+    pub method: String,
+    pub url: String,
+    pub host: String,
+    /// `"x402"` or `"mpp"`.
+    pub protocol: String,
+    pub network: Option<String>,
+    pub chain_id: Option<u64>,
+    pub asset: Option<String>,
+    pub amount: Option<String>,
+    pub pay_to: Option<String>,
+    /// The paid resource URL/id if distinct from `url`.
+    pub resource: Option<String>,
+    pub scheme: Option<String>,
+    pub charge_id: Option<String>,
+    pub session_id: Option<String>,
+    pub channel_id: Option<String>,
+    /// Digest of the sealed Petal policy snapshot the action was approved under.
+    pub policy_snapshot_digest: Option<String>,
+    /// The selected payment requirement (redacted/public JSON) chosen for this
+    /// signature, bound into the attestation for legibility and later
+    /// verification.
+    pub selected_requirement: Option<serde_json::Value>,
+}
+
+/// Host signing seam for paid-HTTP protocol adapters.
+///
+/// x402 and MPP adapters must never touch wallet key material or a
+/// `PrivateKeySigner`. Instead they present the exact 32-byte hash they need
+/// signed to this seam; the Bloom runtime enforces the live Sealed Approval
+/// grant, records a `SigningAttestation` built from `facts`, atomically
+/// consumes one signature allowance, and returns the 65-byte secp256k1
+/// signature (`r || s || v`). The concrete implementation lives in the Bloom
+/// runtime (it wraps the host `PetalHost::sign_hash`), keeping key custody and
+/// grant enforcement out of the protocol crates.
+#[async_trait::async_trait]
+pub trait PaidHttpHostSigner: Send + Sync {
+    /// Sign `signing_hash` under the live paid-HTTP grant for `intent`
+    /// (e.g. `"x402.sign"` or `"paid-http.mpp.sign"`). Returns the 65-byte
+    /// secp256k1 signature, or an error string if no live grant authorizes it.
+    async fn sign_paid_http_hash(
+        &self,
+        intent: &str,
+        signing_hash: [u8; 32],
+        facts: &PaidHttpSigningFacts,
+    ) -> Result<[u8; 65], String>;
+}
+
 pub trait PaidHttpChainRpcResolver: Send + Sync {
     fn http_rpc_urls_for_chain_id(&self, chain_id: u64) -> Vec<String>;
 
