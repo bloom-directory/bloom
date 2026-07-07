@@ -62,6 +62,8 @@ pub const APPROVAL_CHALLENGE_DOMAIN: &[u8] = b"bloom.approval.v1";
 pub const DAEMON_TERMS_DIGEST_DOMAIN: &[u8] = b"bloom.daemon_terms.v1";
 /// Domain tag for [`PetalPolicySnapshot::petal_policy_digest`].
 pub const PETAL_POLICY_DIGEST_DOMAIN: &[u8] = b"bloom.petal_policy.v1";
+/// Domain tag for binding structured signing facts into daemon grant terms.
+pub const SIGNING_ATTESTATION_FACTS_DIGEST_DOMAIN: &[u8] = b"bloom.signing_attestation.facts.v1";
 
 /// Hard ceiling on Sealed Approval Grant lifetime (§6.4 recommended default).
 pub const GRANT_MAX_TTL_MS: u64 = 120_000;
@@ -1515,6 +1517,15 @@ impl SigningAttestation {
         }
         Ok(())
     }
+}
+
+/// Collision-resistant, domain-tagged digest of a signing attestation facts
+/// map. The map is ordered so serde JSON output is deterministic.
+pub fn signing_attestation_facts_digest(
+    facts: &BTreeMap<String, serde_json::Value>,
+) -> Result<String, AuthApiError> {
+    let bytes = serde_json::to_vec(facts).map_err(AuthApiError::Json)?;
+    Ok(digest_hex(SIGNING_ATTESTATION_FACTS_DIGEST_DOMAIN, &bytes))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
